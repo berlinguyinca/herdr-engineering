@@ -1,13 +1,12 @@
 # ADR-0008 — Independent Herdr-server federation
 
-**Status:** Proposed — awaiting approval; no implementation until approved
+**Status:** Accepted 2026-10-25 — owner accepted the recommended answers to D1–D10 (see "Owner decisions: resolved"). Implementation proceeds phase by phase (P1 first), each its own reviewed PR; P4 needs a separate approval.
 
 Program task: T17 of `herdr-federated-engineering-20261022` (`docs/specs/herdr-federated-engineering-20261022/SPEC.md`,
 "Server-to-server federation separate later gated feature, not implied by external agent participation").
 Grounded in the merged control plane at `a838757` (main, after T16). Code is cited as `file:Symbol`, never by line.
 
-This ADR changes no code, no configuration and no behaviour. Merging it records a proposal; it does not authorise building anything.
-Every "must" below is a requirement on a future implementation PR, to be written only after the decisions in "Owner decisions" are made.
+This ADR changes no code, no configuration and no behaviour. Every "must" below is a requirement on a future implementation PR (P1 onward), one phase per PR.
 
 ## Context
 
@@ -191,7 +190,7 @@ Server A (authoritative for A's rooms)                 Server B
 | Peer registry, signed export, puller, mirror room | NEW | none exists |
 | Implementation and tests for this task | **Justified no-op** | an ADR is the deliverable; approval gate pending (T00-AUDIT row 30, "NEW (ADR only)") |
 
-## Owner decisions requested
+## Owner decisions requested (original questions)
 
 * **D1 Topology.** Bilateral only (recommended) or also a hub? Hub changes the trust model (Decision 1).
 * **D2 Consent.** Is "operator YAML on both sides plus a room owner on the sharing side" the right consent (Decision 3), or must a room owner
@@ -209,6 +208,26 @@ Server A (authoritative for A's rooms)                 Server B
 * **D9 Scope of P4.** Are typed cross-boundary requests wanted at all, or is read-only federation the whole feature?
 * **D10 Where it runs.** In the combined server only, or also in the isolated `--collab-only` process (which has no graph, so lineage
   federation cannot run there)?
+
+## Owner decisions: resolved
+
+Recorded 2026-10-25: the owner accepted the recommendation for every decision below.
+
+| # | Decision |
+|---|---|
+| D1 | Bilateral only; no hub. |
+| D2 | Operator YAML on both sides plus a room owner on the sharing side only. |
+| D3 | Pinned-key signing of requests and exports; rotation cadence about 90 days; revocation by removing the peer in YAML. |
+| D4 | Remote humans are shadow `peer-user` principals, read and post only. |
+| D5 | Remote reviews never count toward local quorum. Any change needs the shared vectors changed in AutoSpec first. |
+| D6 | On unlink or revocation the mirror is hidden by default; an operator purge command deletes it. The exporter cannot enforce deletion on the peer. |
+| D7 | `ORG_ID` stays `"default"`; peers get a separate namespace. |
+| D8 | Stay on envelope v2; origin is carried as `claimed_*` provenance. |
+| D9 | Read-only federation first. Typed cross-server writes (message, artifact proposal) are phase P4 and need a separate approval. |
+| D10 | Combined server only; not `--collab-only`. |
+
+Additional P1 requirement: a mirrored `peer:` node or edge must never mark a local gate stale. The fork-promotion staleness derivation
+(`control_plane/graph.py`, herdr#264) reads `supersession` edges; P1 adds a test that a mirrored edge cannot trigger it.
 
 ## Consequences
 
