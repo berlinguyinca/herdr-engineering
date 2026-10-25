@@ -227,7 +227,8 @@ function routeSkeleton(match, parts) {
 // ------------------------------------------------------------- views
 // ------------------------------------------------------------- topology
 async function viewTopology() {
-  return ownPolling(mountTopology(root, client, {status: route().query.get('status') || 'current'}));
+  // Keeps its own 5 s poll per source; live events refresh it too.
+  return mountTopology(root, client, {status: route().query.get('status') || 'current'});
 }
 
 async function viewOverview() {

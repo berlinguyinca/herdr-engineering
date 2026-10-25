@@ -208,3 +208,50 @@ test('Missions: identical refresh writes nothing; tabs, counts and host filter k
  assert.equal(await page.locator('#mc-search').inputValue(),'mission','typed filter survives');
  assert.equal(await page.locator('#mc-host').inputValue(),'beast','host filter survives');
 }));
+
+// ---------------------------------------------------------------- Topology
+function topologyApi(state){
+ return p=>{
+  if(p==='/api/v1/hosts')return {hosts:[{host_id:'beast',host_name:'Beast',status:'healthy',last_seen:T0}]};
+  if(p==='/api/v1/services')return {services:structuredClone(state.services)};
+  if(p==='/api/v1/sessions')return {sessions:[]};
+  if(p==='/api/v1/missions')return {missions:[]};
+  if(p==='/api/v1/mission-activity')return {activities:[]};
+  if(p==='/api/v1/ci')return {available:true,status:'connected',pipelines:{}};
+  return {};
+ };
+}
+
+test('Topology: identical refresh writes nothing; one changed service rewrites only its row; open groups, focus and search survive; Collapse still closes',async()=>withPage(async(page,base)=>{
+ const state={services:[svc('s1'),svc('s2'),svc('s3')]};
+ const reads=await boot(page,base,'/topology',topologyApi(state));
+ await until(()=>page.locator('details[data-tx-disclosure="host:beast"]').count().then(n=>n===1),'beast group');
+ await page.locator('details[data-tx-disclosure="host:beast"] > summary').click();
+ // Service subgroups start closed; open the one under beast.
+ await until(()=>page.locator('details.tx-subgroup').count().then(n=>n>0),'service subgroup');
+ await page.locator('details.tx-subgroup > summary').first().click();
+ await until(()=>page.locator('[data-topology-entry]').count().then(n=>n===3),'service rows');
+ await page.locator('[data-tx-type]').selectOption('service');
+ await page.locator('[data-topology-entry="service:s1"] [data-entry-link]').focus();
+ await liveRefresh(page,{event_id:'t0',event_type:'ServiceUpdated'});
+ await page.evaluate(()=>{window.__rows=[...document.querySelectorAll('[data-topology-entry],details[data-tx-disclosure]')];});
+
+ const before=reads['/api/v1/services'];
+ await observe(page);
+ await liveRefresh(page,{event_id:'t1',event_type:'ServiceUpdated'});
+ assert.ok(reads['/api/v1/services']>before,'refresh fetched services again');
+ assert.deepEqual(await writes(page),[],'identical refresh performs no DOM writes');
+
+ state.services[1].service_name='Service s2 renamed';
+ await observe(page);
+ await liveRefresh(page,{event_id:'t2',event_type:'ServiceUpdated'});
+ await until(()=>page.locator('[data-topology-entry="service:s2"] [data-entry-link]').innerText().then(t=>t==='Service s2 renamed'),'renamed service');
+ assert.equal(await page.evaluate(()=>[...document.querySelectorAll('[data-topology-entry],details[data-tx-disclosure]')].every((n,i)=>n===window.__rows[i])),true,'groups and rows keep their nodes');
+ assert.deepEqual(await writes(page,'[data-topology-entry="service:s2"]'),[],'nothing outside the changed row was written');
+ assert.equal(await page.evaluate(()=>document.activeElement?.closest('[data-topology-entry]')?.dataset.topologyEntry),'service:s1','focus stays on its row');
+ assert.equal(await page.locator('[data-tx-type]').inputValue(),'service','type filter survives');
+ assert.equal(await page.locator('details[data-tx-disclosure="host:beast"]').evaluate(d=>d.open),true,'the open group stays open');
+
+ await page.locator('[data-tx-collapse]').click();
+ await until(()=>page.locator('details[data-tx-disclosure="host:beast"]').evaluate(d=>!d.open),'Collapse groups closes the group');
+}));

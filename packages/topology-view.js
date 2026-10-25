@@ -6,6 +6,7 @@ import {serviceState,serviceScope,safeServiceUrl} from './services-view.js';
 import {missionEntries} from './mission-catalog-view.js';
 import {integrationOutcome} from './integrations-view.js';
 import {snapshotText,animateChanges,skeleton} from './motion.js';
+import {morph,handOff,patchText,patchAttr} from './patch.js';
 import { freshnessSources } from './freshness.js';
 
 const text=value=>typeof value==='string'?value.trim():'';
@@ -83,7 +84,7 @@ export function topologyRow(row,now=Date.now()) {
   const context=row.type==='service'?[row.categoryLabel,text(r.owner)&&`Process: ${r.owner}`,r.catalog?.source_port!=null?`Source :${r.catalog.source_port}`:null,r.port!=null?`${(r.catalog?.endpoint_scope==='local_only'||r.endpoint_scope==='local_only')?'Observed':'Exposed'} :${r.port}`:null,(r.catalog?.endpoint_scope==='local_only'||r.endpoint_scope==='local_only')?'Local only':null].filter(Boolean).join(' · '):row.type==='session'?[r.agent_role,r.branch,r.model].filter(Boolean).join(' · '):row.description;
   const workspace=row.type==='service'?text(r.catalog?.project):row.type==='session'?text(r.cwd):'';
   const source=row.type==='service'?text(r.catalog?.project_source):'agent cwd';
-  return `<article class="tx-row" data-topology-entry="${esc(row.id)}"><div class="tx-main"><a data-entry-link href="${esc(row.href)}">${esc(short(row.title))}</a>${context?`<p>${esc(short(context,220))}</p>`:''}${workspace?`<p class="tx-context">Workspace: ${esc(short(workspace))}${source?` · ${esc(source)}`:''}</p>`:''}<div class="tx-links">${row.host?`<span>${esc(row.host)}</span>`:''}${row.endpoint?`<a href="${esc(row.endpoint)}" target="_blank" rel="noopener noreferrer">${row.type==='ci'?'Upstream run':'Open endpoint'} ↗</a>`:''}</div></div><div class="tx-state"><strong class="${row.attention?'tx-warning':''}">${row.visibility==='current'?`<span class="tx-dot" data-tone="${row.attention?'attention':'ok'}" aria-hidden="true"></span>`:''}${esc(row.status)}</strong><span>Report ${age(row.stamp,now)}</span></div></article>`;
+  return `<article class="tx-row" data-key="${esc(row.id)}" data-topology-entry="${esc(row.id)}"><div class="tx-main"><a data-entry-link href="${esc(row.href)}">${esc(short(row.title))}</a>${context?`<p>${esc(short(context,220))}</p>`:''}${workspace?`<p class="tx-context">Workspace: ${esc(short(workspace))}${source?` · ${esc(source)}`:''}</p>`:''}<div class="tx-links">${row.host?`<span>${esc(row.host)}</span>`:''}${row.endpoint?`<a href="${esc(row.endpoint)}" target="_blank" rel="noopener noreferrer">${row.type==='ci'?'Upstream run':'Open endpoint'} ↗</a>`:''}</div></div><div class="tx-state"><strong class="${row.attention?'tx-warning':''}">${row.visibility==='current'?`<span class="tx-dot" data-tone="${row.attention?'attention':'ok'}" aria-hidden="true"></span>`:''}${esc(row.status)}</strong><span>Report ${age(row.stamp,now)}</span></div></article>`;
 }
 const counts=entries=>Object.keys(TYPES).map(type=>[type,entries.filter(e=>e.type===type).length]).filter(([,n])=>n);
 function subgroupEntries(entries) {
@@ -97,8 +98,8 @@ const styles=`<style>
 
 export function mountTopology(container,client,{status='current'}={}) {
   const state={status:TABS.some(([key])=>key===status)?status:'current',search:'',type:'',host:'',group:'host',groupLimit:12};
-  let disposed=false,clock=null,lastSignature='',hostSignature='';
-  const data={},received={},sourceStates={},requests=new Map(),timers=new Map(),opened=new Map(),limits=new Map();
+  let disposed=false,clock=null;
+  const data={},received={},sourceStates={},requests=new Map(),timers=new Map(),opened=new Map(),limits=new Map(),toggling=new Map();
   const listeners=new AbortController();
   const chip=freshnessSources(()=>container.querySelector('herdr-freshness'));
   const sources={hosts:{label:'Hosts',field:'hosts',read:signal=>client.listHosts({signal})},sessions:{label:'Agents',field:'sessions',read:signal=>client.listSessions(undefined,{signal})},services:{label:'Services',field:'services',read:signal=>client.listServices({signal})},missions:{label:'Recorded missions',field:'missions',read:signal=>client.listMissions(undefined,{signal})},projections:{label:'Live missions',field:'activities',read:signal=>client.listMissionActivity({signal})},ci:{label:'CI',read:signal=>client.getCi({signal})}};
@@ -115,24 +116,22 @@ export function mountTopology(container,client,{status='current'}={}) {
     const summary=counts(group.entries).map(([type,n])=>`${n} ${TYPES[type].toLowerCase()}`).join(' · ')||'No matching records';
     const host=group.host;
     const hostStamp=host?.last_seen||host?.last_heartbeat||host?.updated_at;
-    return `<details class="tx-group" data-tx-disclosure="${esc(group.key)}" ${open?'open':''}><summary>${esc(short(group.label,180))}<span>${esc(summary)}</span></summary>${open?`<div class="tx-group-body">${host?`<div class="tx-host-context"><a href="#/hosts/${esc(encodeURIComponent(host.host_id))}">Inspect host</a><span>Last reported ${esc(human(host.status)||'unknown')} · ${age(hostStamp,now)}${reportFreshness(hostStamp,now)!=='current'?' · Host report unconfirmed':''}</span></div>`:`<p class="tx-note">${esc(group.evidence||'')}</p>`}${subgroupEntries(group.entries).map(sub=>{
+    return `<details class="tx-group" data-key="${esc(group.key)}" data-tx-disclosure="${esc(group.key)}" data-want-open="${open}" ${open?'open':''}><summary>${esc(short(group.label,180))}<span>${esc(summary)}</span></summary>${open?`<div class="tx-group-body">${host?`<div class="tx-host-context"><a href="#/hosts/${esc(encodeURIComponent(host.host_id))}">Inspect host</a><span>Last reported ${esc(human(host.status)||'unknown')} · ${age(hostStamp,now)}${reportFreshness(hostStamp,now)!=='current'?' · Host report unconfirmed':''}</span></div>`:`<p class="tx-note">${esc(group.evidence||'')}</p>`}${subgroupEntries(group.entries).map(sub=>{
       const key=`${group.key}/${sub.key}`,subOpen=isOpen(key,!!state.search||!sub.key.startsWith('service:')),limit=limits.get(key)||6;
-      return `<details class="tx-subgroup" data-tx-disclosure="${esc(key)}" ${subOpen?'open':''}><summary>${esc(sub.label)}<span>${sub.entries.length}</span></summary>${subOpen?sub.entries.slice(0,limit).map(row=>topologyRow(row,now)).join('')+(sub.entries.length>limit?`<div class="tx-more"><button type="button" class="hd-btn" data-tx-more="${esc(key)}">Show ${Math.min(6,sub.entries.length-limit)} more · ${sub.entries.length-limit} remaining</button></div>`:''):''}</details>`;
+      return `<details class="tx-subgroup" data-key="${esc(key)}" data-tx-disclosure="${esc(key)}" data-want-open="${subOpen}" ${subOpen?'open':''}><summary>${esc(sub.label)}<span>${sub.entries.length}</span></summary>${subOpen?sub.entries.slice(0,limit).map(row=>topologyRow(row,now)).join('')+(sub.entries.length>limit?`<div class="tx-more"><button type="button" class="hd-btn" data-tx-more="${esc(key)}">Show ${Math.min(6,sub.entries.length-limit)} more · ${sub.entries.length-limit} remaining</button></div>`:''):''}</details>`;
     }).join('')||'<p class="tx-note">No records match the selected view for this host.</p>'}</div>`:''}</details>`;
   }
   let motionSettled=false,motionView='';
   const metricKey=node=>node.nextElementSibling?.textContent||null;
   const entryKey=node=>node.closest('[data-topology-entry]')?.dataset.topologyEntry;
-  function tick(){for(const stamp of container.querySelectorAll('[data-topology-time]'))stamp.textContent=formatDuration(Math.max(0,Date.now()-Number(stamp.dataset.topologyTime)));}
+  function tick(){for(const stamp of container.querySelectorAll('[data-topology-time]'))patchText(stamp,formatDuration(Math.max(0,Date.now()-Number(stamp.dataset.topologyTime))));}
   function draw() {
     if(disposed||document.hidden)return;
     const now=Date.now(),all=allEntries(),selected=selectTopology(all,state);
-    const signature=JSON.stringify([data,sourceStates,state,[...opened],[...limits],all.map(e=>[e.id,e.visibility,e.status])]);
-    if(signature===lastSignature){tick();return;}lastSignature=signature;
     const hosts=records(data.hosts),groups=groupTopology(selected,hosts,{group:state.group,includeEmptyHosts:!state.search&&!state.type&&!state.host});
     const sourceReady=kind=>kind==='ci'?sourceStates.ci?.loaded && data.ci?.available!==false:kind==='mission'?sourceStates.projections?.loaded&&sourceStates.missions?.loaded:sourceStates[{service:'services',session:'sessions',ci:'ci'}[kind]]?.loaded;
-    // Panels are rebuilt with innerHTML (Task 19 moves them onto the patcher); motion pairs old and
-    // new nodes by key: metric tiles by label, rows by data-topology-entry (status change = flash).
+    // Panels are morphed (groups, subgroups and rows keyed by data-key): unchanged data writes nothing
+    // and focus stays. Motion pairs metric tiles by label, rows by data-topology-entry (status change = flash).
     // Motion only for data-driven changes: not while sources are still landing on first load and
     // not when the user changed the tab, search, grouping, type, host or opened/expanded something.
     const settled=Object.keys(sources).every(key=>sourceStates[key]?.loaded);
@@ -140,41 +139,35 @@ export function mountTopology(container,client,{status='current'}={}) {
     motionSettled=settled;motionView=view;
     const metricsBefore=live?snapshotText(el('[data-tx-metrics]'),'strong',metricKey):null,tabsBefore=live?snapshotText(container,'[data-tab-count]'):null;
     const rowsBefore=live?snapshotText(el('#tx-results'),'[data-topology-entry] .tx-state strong',entryKey):null;
-    el('[data-tx-metrics]').innerHTML=Object.entries(TYPES).map(([kind,label])=>`<div><strong>${sourceReady(kind)?all.filter(e=>e.type===kind&&e.visibility==='current').length:'—'}</strong><span>${label==='Services'?'recently healthy HerdR services':label==='CI runs'?'current CI runs':`current ${label.toLowerCase()}`}</span></div>`).join('');
+    morph(el('[data-tx-metrics]'),Object.entries(TYPES).map(([kind,label])=>`<div><strong>${sourceReady(kind)?all.filter(e=>e.type===kind&&e.visibility==='current').length:'—'}</strong><span>${label==='Services'?'recently healthy HerdR services':label==='CI runs'?'current CI runs':`current ${label.toLowerCase()}`}</span></div>`).join(''));
     animateChanges(el('[data-tx-metrics]'),'strong',metricsBefore,metricKey);
-    for(const [key] of TABS){const button=el(`[data-tx-tab="${key}"]`);button.setAttribute('aria-selected',String(state.status===key));button.tabIndex=state.status===key?0:-1;el(`[data-tab-count="${key}"]`).textContent=Object.values(sourceStates).some(s=>s.loaded)?selectTopology(all,{...state,status:key}).length:'…';}
+    for(const [key] of TABS){const button=el(`[data-tx-tab="${key}"]`);patchAttr(button,'aria-selected',String(state.status===key));patchAttr(button,'tabindex',state.status===key?'0':'-1');patchText(el(`[data-tab-count="${key}"]`),Object.values(sourceStates).some(s=>s.loaded)?selectTopology(all,{...state,status:key}).length:'…');}
     const hostIds=[...new Set([...hosts.map(h=>text(h.host_id)),...all.map(e=>e.host),state.host].filter(Boolean))].sort();
-    if(JSON.stringify(hostIds)!==hostSignature){hostSignature=JSON.stringify(hostIds);el('[data-tx-host]').innerHTML='<option value="">All hosts</option>'+hostIds.map(id=>`<option value="${esc(id)}">${esc(id)}</option>`).join('');el('[data-tx-host]').value=state.host;}
+    morph(el('[data-tx-host]'),'<option value="">All hosts</option>'+hostIds.map(id=>`<option value="${esc(id)}"${id===state.host?' selected':''}>${esc(id)}</option>`).join(''));
     const unavailable=Object.entries(sources).filter(([key])=>!sourceStates[key]?.loaded).map(([,source])=>source.label),anyLoaded=unavailable.length<Object.keys(sources).length,anyFailed=Object.keys(sources).some(key=>sourceStates[key]?.error);
-    el('[data-tx-result]').textContent=`${selected.length} matching ${state.status==='current'?'current ':''}records · ${groups.length} ${state.group==='host'?'host / provider':'project / repository'} groups${unavailable.length?' · Partial view':''}`;
+    patchText(el('[data-tx-result]'),`${selected.length} matching ${state.status==='current'?'current ':''}records · ${groups.length} ${state.group==='host'?'host / provider':'project / repository'} groups${unavailable.length?' · Partial view':''}`);
     const notices=Object.entries(sources).map(([key,source])=>sourceStates[key]?.error?`${source.label} could not refresh.${sourceStates[key].loaded?' Showing last received records.':' Retrying automatically.'}`:!sourceStates[key]?.loaded&&anyLoaded?`${source.label}: waiting for the first report.`:null).filter(Boolean);
     if(data.ci?.status==='auth_error')notices.push('Woodpecker authentication needs attention.');
     else if(data.ci?.available===false)notices.push(data.ci.status==='syncing'?'Woodpecker is discovering repositories and runs.':'CI reports are unavailable.');
     if(data.ci?.stale)notices.push('CI reports are stale; open runs are shown under Unconfirmed.');
     if(data.ci?.project_mapping_error)notices.push(data.ci.project_mapping_error);
-    el('[data-tx-feedback]').innerHTML=notices.map(note=>`<p class="tx-note tx-warning">${esc(note)}</p>`).join('');
-    el('[data-tx-policy]').textContent=state.group==='project'?'Only explicit project or repository identities connect records. Inferred workspace folders remain context in Project not established.':state.status==='current'?'Current includes recent positive observations and fresh mission attention. Unavailable, stopped and finished records stay in History; old or unknown reports stay in Unconfirmed.':state.status==='history'?'History includes stopped, failed, finished, unavailable and archived records. Nothing is deleted.':'Unconfirmed reports retain their last known state; missing updates do not mean a process stopped.';
-    const results=el('#tx-results'),focused=document.activeElement;
-    const focusDisclosure=results.contains(focused)&&focused.tagName==='SUMMARY'?focused.closest('[data-tx-disclosure]')?.dataset.txDisclosure:null;
-    const focusMore=results.contains(focused)?focused.closest('[data-tx-more]')?.dataset.txMore:null;
-    const focusHref=results.contains(focused)&&focused.tagName==='A'?focused.getAttribute('href'):null;
-    const focusGroupPager=container.contains(focused)&&focused.hasAttribute('data-tx-more-groups-button');
-    const previousGroups=focusGroupPager?new Set([...results.children].map(group=>group.dataset.txDisclosure)):null;
-    const scroll={x:window.scrollX,y:window.scrollY};
-    results.setAttribute('aria-labelledby',`tx-tab-${state.status}`);
-    results.innerHTML=!anyLoaded&&!anyFailed?skeleton('observations',{rows:4}):!anyLoaded?'<div class="tx-group tx-empty">No reports could be loaded yet. The failing sources are listed above; retrying automatically.</div>':groups.slice(0,state.groupLimit).map(g=>groupMarkup(g,now)).join('')||`<div class="tx-group tx-empty">${unavailable.length?'Waiting for matching reports. Source availability is shown above.':'No records match this view. Change the filters or open Unconfirmed / History to inspect previous observations.'}</div>`;
+    morph(el('[data-tx-feedback]'),notices.map(note=>`<p class="tx-note tx-warning">${esc(note)}</p>`).join(''));
+    patchText(el('[data-tx-policy]'),state.group==='project'?'Only explicit project or repository identities connect records. Inferred workspace folders remain context in Project not established.':state.status==='current'?'Current includes recent positive observations and fresh mission attention. Unavailable, stopped and finished records stay in History; old or unknown reports stay in Unconfirmed.':state.status==='history'?'History includes stopped, failed, finished, unavailable and archived records. Nothing is deleted.':'Unconfirmed reports retain their last known state; missing updates do not mean a process stopped.');
+    const results=el('#tx-results');
+    const previousGroups=new Set([...results.children].map(group=>group.dataset.txDisclosure));
+    patchAttr(results,'aria-labelledby',`tx-tab-${state.status}`);
+    const stranded=morph(results,!anyLoaded&&!anyFailed?skeleton('observations',{rows:4}):!anyLoaded?'<div class="tx-group tx-empty">No reports could be loaded yet. The failing sources are listed above; retrying automatically.</div>':groups.slice(0,state.groupLimit).map(g=>groupMarkup(g,now)).join('')||`<div class="tx-group tx-empty">${unavailable.length?'Waiting for matching reports. Source availability is shown above.':'No records match this view. Change the filters or open Unconfirmed / History to inspect previous observations.'}</div>`);
+    // Disclosures follow the model (the user's toggles, Collapse groups, the search default): morph
+    // never writes `open`, so data-want-open carries the wanted state.
+    for(const d of results.querySelectorAll('details[data-want-open]')){if(Date.now()-(toggling.get(d.dataset.txDisclosure)??-Infinity)<1000)continue;const want=d.dataset.wantOpen==='true';if(d.open!==want)d.open=want;}
+    // A focused row or "Show more" that left hands focus to a neighbouring row, else the current tab.
+    const tab=()=>el(`[data-tx-tab="${state.status}"]`);
+    handOff(stranded,node=>{for(const near of [node.nextElementSibling,node.previousElementSibling]){const link=near?.matches?.('[data-topology-entry]')&&near.querySelector('[data-entry-link]');if(link)return link;}return tab();});
     animateChanges(container,'[data-tab-count]',tabsBefore);
     animateChanges(results,'[data-topology-entry] .tx-state strong',rowsBefore,entryKey,{count:false,target:node=>node.closest('[data-topology-entry]')});
-    el('[data-tx-more-groups]').innerHTML=groups.length>state.groupLimit?`<button type="button" class="hd-btn" data-tx-more-groups-button>Show ${Math.min(12,groups.length-state.groupLimit)} more groups · ${groups.length-state.groupLimit} remaining</button>`:'';
-    if(focusGroupPager){
-      const pager=el('[data-tx-more-groups-button]');
-      const added=[...results.children].find(group=>!previousGroups.has(group.dataset.txDisclosure));
-      (pager||added?.querySelector('summary')||results.lastElementChild?.querySelector('summary'))?.focus({preventScroll:true});
-    }
-    if(focusDisclosure)[...results.querySelectorAll('[data-tx-disclosure]')].find(e=>e.dataset.txDisclosure===focusDisclosure)?.querySelector('summary')?.focus({preventScroll:true});
-    if(focusMore)[...results.querySelectorAll('[data-tx-more]')].find(e=>e.dataset.txMore===focusMore)?.focus({preventScroll:true});
-    if(focusHref)[...results.querySelectorAll('a')].find(e=>e.getAttribute('href')===focusHref)?.focus({preventScroll:true});
-    if(focusDisclosure||focusMore||focusHref||focusGroupPager){if(document.activeElement===document.body)el(`[data-tx-tab="${state.status}"]`).focus({preventScroll:true});window.scrollTo(scroll.x,scroll.y);}tick();
+    // The pager, once all groups show, hands focus to the first group it revealed.
+    handOff(morph(el('[data-tx-more-groups]'),groups.length>state.groupLimit?`<button type="button" class="hd-btn" data-tx-more-groups-button>Show ${Math.min(12,groups.length-state.groupLimit)} more groups · ${groups.length-state.groupLimit} remaining</button>`:''),()=>{const added=[...results.children].find(group=>!previousGroups.has(group.dataset.txDisclosure));return (added||results.lastElementChild)?.querySelector('summary')||tab();});
+    tick();
   }
   async function poll(key) {
     if(disposed||document.hidden||requests.has(key))return;
@@ -187,7 +180,10 @@ export function mountTopology(container,client,{status='current'}={}) {
     finally{clearTimeout(deadline);if(requests.get(key)===controller)requests.delete(key);if(!disposed&&!document.hidden)timers.set(key,setTimeout(()=>poll(key),5000));}
   }
   const refresh=()=>Object.keys(sources).forEach(key=>poll(key));
-  container.addEventListener('toggle',event=>{const element=event.target;if(disposed||!element.isConnected||!element.hasAttribute?.('data-tx-disclosure'))return;const key=element.dataset.txDisclosure;if(opened.get(key)===element.open)return;opened.set(key,element.open);draw();},{capture:true,signal:listeners.signal});
+  // A summary click toggles its <details> before the toggle event is delivered; a draw in between
+  // must not undo it, so the key is left alone until its toggle event lands.
+  container.addEventListener('click',event=>{const d=event.target.closest?.('summary')?.parentElement;if(d?.hasAttribute('data-tx-disclosure'))toggling.set(d.dataset.txDisclosure,Date.now());},{capture:true,signal:listeners.signal});
+  container.addEventListener('toggle',event=>{const element=event.target;if(disposed||!element.isConnected||!element.hasAttribute?.('data-tx-disclosure'))return;const key=element.dataset.txDisclosure;toggling.delete(key);if(opened.get(key)===element.open)return;opened.set(key,element.open);draw();},{capture:true,signal:listeners.signal});
   container.addEventListener('click',event=>{const button=event.target.closest('button');if(!button||disposed)return;
     if(button.dataset.txTab){state.status=button.dataset.txTab;state.groupLimit=12;draw();}
     if(button.hasAttribute('data-tx-collapse')){for(const d of container.querySelectorAll('[data-tx-disclosure]'))opened.set(d.dataset.txDisclosure,false);draw();}
