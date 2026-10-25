@@ -3009,9 +3009,20 @@ def _collab_file_target(workdir: str, name: str):
         raise SystemExit(f"collab file: refusing the name {name!r}: {getattr(exc, 'message', exc)}") from None
     if clean != name:
         raise SystemExit(f"collab file: refusing the name {name!r}")
-    folder = Path(workdir).resolve() / STABLE_DIR
+    import os
+    import stat
+    root = Path(workdir).resolve()
+    folder = root / STABLE_DIR
     target = folder / clean
-    if target.parent != folder:
+    # .collab, .collab/files and the file itself must be real entries: a planted symlink could aim the write
+    # anywhere the agent can write.
+    for part in (root / ".collab", folder, target):
+        try:
+            if stat.S_ISLNK(os.lstat(part).st_mode):
+                raise SystemExit(f"collab file: refusing to write through the symlink {part}")
+        except FileNotFoundError:
+            pass
+    if target.parent != folder or not str(target.resolve()).startswith(str(root) + os.sep):
         raise SystemExit(f"collab file: refusing the name {name!r}")
     return target
 
@@ -3046,11 +3057,16 @@ def _cmd_collab_file(args) -> int:
     root = f"{base}/api/v1/collab/rooms/{room}/files"
     auth = {"Authorization": f"Agent {cred}", "X-Herdr-Device": device}
 
+    class _NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *a, **k):       # never carry the credential to wherever a 3xx points
+            return None
+    opener = urllib.request.build_opener(_NoRedirect)
+
     def call(method, url, data=None, ctype=None):
         req = urllib.request.Request(url, data=data, method=method,
                                      headers={**auth, **({"Content-Type": ctype} if ctype else {})})
         try:
-            with urllib.request.urlopen(req, timeout=120) as resp:   # noqa: S310 (operator-given site)
+            with opener.open(req, timeout=120) as resp:   # noqa: S310 (operator-given site)
                 return resp.read(), resp.headers
         except urllib.error.HTTPError as exc:
             try:
@@ -3081,14 +3097,27 @@ def _cmd_collab_file(args) -> int:
         target = _collab_file_target(args.dir, hit["name"])
         query = f"?v={args.version}" if args.version else ""
         data, headers = call("GET", f"{root}/{urllib.parse.quote(hit['id'], safe='')}{query}")
-        want = headers.get("X-Herdr-File-Sha256")
-        if want and hashlib.sha256(data).hexdigest() != want:
+        # the shelf's hash for that version and the server's header must both match the bytes: never skipped
+        listed = hit.get("sha256") if not args.version else next(
+            (v.get("sha256") for v in hit.get("versions") or [] if v.get("version") == args.version), None)
+        want, got = headers.get("X-Herdr-File-Sha256"), hashlib.sha256(data).hexdigest()
+        if not want or not listed or got != want or got != listed:
             raise SystemExit("collab file: the download does not match its sha256; nothing was written")
         target.parent.mkdir(parents=True, exist_ok=True)
+        _collab_file_target(args.dir, hit["name"])          # re-check after creating the folders
         fd, tmp = tempfile.mkstemp(dir=target.parent, prefix=".get-")
-        with os.fdopen(fd, "wb") as fh:
-            fh.write(data)
-        os.replace(tmp, target)
+        try:
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(data)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, target)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
         print(json.dumps({"path": str(target), "id": hit["id"], "version": int(headers.get("X-Herdr-File-Version") or 0),
                           "sha256": want}))
         return 0
