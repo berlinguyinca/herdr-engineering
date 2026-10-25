@@ -817,7 +817,17 @@ Alternative implementations reuse the existing vocabulary; there is no second st
 
 Unmet or partial against the spec, stated plainly: a fork prepares an isolated worktree and records it but does not
 start an agent in it; "invalidates stale reviews" is done by binding evidence to the exact head (a moved head makes
-evidence stale at read time and blocks promotion) and no gate node is rewritten; promotion is unreachable until the
+evidence stale at read time and blocks promotion) and, since the fork decision, by the decision itself: a `reviewed` /
+`validated` edge is `stale` for a reader when its subject is, or transitively depends on (`dependency`, at most 6 hops
+and 200 nodes), a node that a live, visible `supersession` edge from an `approach:` node replaced AFTER the evidence was
+admitted (the walk is breadth-first and examines at most 5000 edge keys per subject; past that it under-marks rather than
+guess). Gates on unrelated subjects, evidence admitted after the decision, the winner's own evidence (a winner that is part
+of the subject's dependency closure is what the subject rests on) and plain retries (a supersession whose winner is not an
+approach) are untouched; a hidden decision or dependency edge changes nothing for a reader who cannot see it. Who may write
+the decision is the graph's usual rule (a writer of the winner, or an operator). Because progress and promotion count only
+non-stale evidence, a task validated before the decision drops out of those counts until it is validated again.
+It is derived at read time, so no gate node or edge is rewritten and undoing the decision (removing the edge) restores
+the evidence. Promotion is unreachable until the
 operator lists `evidence_writers` and something writes `validated` edges for the fork head.
 
 Limitations: the T06 review quorum is per pull request head and not per approach (comparison reports `quorum: unavailable`); independent

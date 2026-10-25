@@ -298,8 +298,6 @@ def test_downstream_is_a_read_only_report_that_invalidates_nothing(failed):
     assert gate["node"]["state"] == "done"
 
 
-@pytest.mark.xfail(strict=True, reason="GAP: Herdr reports downstream evidence left on another head but never marks "
-                                       "a dependent gate/review stale or invalidated after a fork is promoted")
 def test_promoting_a_fork_marks_only_the_dependent_gate_stale(failed):
     w = failed
     w.node("pi", "task:A", state="done")
