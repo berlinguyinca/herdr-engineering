@@ -34,6 +34,7 @@ from . import collab_delegation as dlg
 from . import collab_external as ext
 from . import collab_mentions as mentions
 from . import collab_models, ids, logfile_lock
+from . import collab_refs as issue_refs
 from .collab_attention import AttentionMixin
 from .collab_context import ContextMixin
 from .collab_files import FilesMixin
@@ -102,11 +103,17 @@ AGENT_ACTIONS = frozenset({"read", "post", "instruct", "execute", "spawn_helpers
 PROJECT_ROLES = frozenset({"manager", "contributor"})
 
 MAX_TEXT = 8000
+# the `#` menu (C4): per principal, at most REF_SEARCH_BURST searches per REF_SEARCH_WINDOW seconds
+REF_SEARCH_BURST = 30
+REF_SEARCH_WINDOW = 10.0
+REF_SEARCH_MIN = 2           # characters a search needs; an empty query lists REF_RECENT for owners/approvers
+REF_RECENT = 8
+REF_READ_WAIT = 0.05         # seconds a read (under the room lock) waits for the GitHub monitor's lock
 MAX_BODY = 64 * 1024
 _PANE_LINK = re.compile(r"pane:[a-z0-9][a-z0-9._-]{0,62}:[A-Za-z0-9][A-Za-z0-9:_.-]{0,39}")
 _KEY_RE = re.compile(r"[A-Za-z0-9._:\-]{1,128}\Z")
 _MESSAGE_FIELDS = frozenset({"text", "idempotency_key", "in_reply_to", "context", "files"})
-_MESSAGE_DERIVED = frozenset({"mentions"})   # the server derives these from the text; a client's copy is dropped
+_MESSAGE_DERIVED = frozenset({"mentions", "refs"})   # the server derives these from the text; a client's copy is dropped
 _CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")   # C0, DEL and C1 (8-bit CSI)
 _NAME_BAD = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]")
 _EMAIL_RE = re.compile(r"^[^@\s]{1,64}@[^@\s]{1,255}\.[^@\s]{2,}$")
@@ -414,6 +421,9 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FilesMixin):
         self._streams: dict[str, int] = defaultdict(int)
         self._denied_at: dict[tuple, float] = {}
         self.public_config = dict(public_config or {})
+        # `#` references (C4): the GitHub monitor (``ref_catalog()``, ``search_issues()``), wired by the
+        # control-plane server; None = no GitHub cache, so no message carries refs and the menu is "not ready"
+        self.github = None
         self._email_user: dict[str, str] = {}   # email -> user id (linked at sign-in)
         self._user_email: dict[str, str] = {}
         self._user_handle: dict[str, str] = {}  # user id -> @handle, assigned once from the first linked email
@@ -5066,6 +5076,87 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FilesMixin):
                 raise CollabError(404, "not found")
             return self._resolve_mentions(room_id, text)
 
+    # -- `#` issue references (C4)
+    def _ref_catalog(self, cache: dict | None = None, wait: float = REF_READ_WAIT):
+        """The GitHub cache as it is now (memory only, never a network or store call), once per read.
+        Under the room lock (reads) it waits at most REF_READ_WAIT for the monitor; a post fetches it
+        before taking the room lock."""
+        if cache is not None and "github_refs" in cache:
+            return cache["github_refs"]
+        try:
+            catalog = self.github.ref_catalog(wait=wait) if self.github is not None else None
+        except Exception:
+            catalog = None                    # a broken cache never breaks a post or a read
+        if cache is not None:
+            cache["github_refs"] = catalog
+        return catalog
+
+    def _resolve_refs(self, text: str, private: bool, catalog) -> list[dict]:
+        """`[{kind, owner, repo, number, forms}]` for the cached, in-scope issues `text` names (at most
+        MAX_REFS); private repositories only when the poster may see them (`private`)."""
+        if catalog is None or "#" not in text:
+            return []
+        try:
+            return catalog.resolve(issue_refs.tokens(text), issue_refs.MAX_REFS, private=private)
+        except Exception:
+            return []
+
+    def _restricted(self, viewer, room_id: str | None) -> bool:
+        """True unless `viewer` may see private repositories' issue titles here (`issue_refs.may_see_private`)."""
+        room = self._rooms.get(room_id)
+        role = None
+        if viewer is not None and not viewer.is_agent and room is not None:
+            role = (self._member(room, viewer.id) or {}).get("role")
+        return not issue_refs.may_see_private(viewer, role)
+
+    def _refs_for(self, p: dict, viewer, cache: dict) -> list[dict]:
+        """A message's refs as `viewer` may see them, with title and state read from the cache now."""
+        refs = p.get("refs") or []
+        catalog = self._ref_catalog(cache)
+        details = []
+        for ref in refs:
+            try:
+                details.append(catalog.detail(ref) if catalog is not None else None)
+            except Exception:
+                details.append(None)
+        return issue_refs.for_viewer(refs, details, self._restricted(viewer, p.get("room_id")))
+
+    def search_refs(self, pr: Principal, room_id: str, query: str) -> dict:
+        """The `#` menu for one room member: `{ready, items}`. Who may not see private repositories
+        (`issue_refs.may_see_private`) is offered public repositories' issues only. A search needs
+        REF_SEARCH_MIN characters; an empty one lists REF_RECENT issues, for owners and approvers only.
+        Rate-limited per principal; read-only; the GitHub cache is searched outside the room lock."""
+        if not isinstance(query, str) or len(query) > 160:
+            raise CollabError(400, "q must be at most 160 characters")
+        with self._lock:
+            self._authorize(pr, room_id, "read", "refs.search")
+            restricted = self._restricted(pr, room_id)
+            now, bucket = self._now(), "refs:" + pr.key
+            hits = [t for t in self._hits[bucket] if now - t < REF_SEARCH_WINDOW]
+            if len(hits) >= REF_SEARCH_BURST:
+                self._hits[bucket] = hits
+                self.stats["rate_limited"] += 1
+                raise CollabError(429, "issue search rate limit exceeded")
+            hits.append(now)
+            self._hits[bucket] = hits
+        if self.github is None:
+            return {"ready": False, "items": []}
+        typed = query.strip().removeprefix("#")
+        if typed and len(typed) < REF_SEARCH_MIN or (not typed and restricted):
+            limit = 0
+        else:
+            limit = REF_RECENT if not typed else issue_refs.MAX_REFS
+        try:
+            if not limit:                     # too short (or not for this reader): readiness only, no search
+                return {"ready": bool(self.github.cache_ready(start=False)), "items": []}
+            found = self.github.search_issues(query, limit=limit, public_only=restricted, start=False)
+        except Exception:
+            return {"ready": False, "items": []}
+        keep = ("kind", "owner", "repo", "number", "title", "state", "insert", "url")
+        items = [{k: i.get(k) for k in keep} for i in found.get("items", [])
+                 if not (restricted and i.get("private"))]
+        return {"ready": bool(found.get("ready")), "items": items}
+
     def _mark_seen(self, room_id: str, pr: Principal) -> None:
         self._seen[room_id][("agent" if pr.is_agent else "person", pr.id)] = self._now()
 
@@ -5076,6 +5167,9 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FilesMixin):
 
     # -- messages
     def post_message(self, pr: Principal, room_id: str, body: dict) -> tuple[int, dict]:
+        # `#` references: the GitHub cache is read before the room lock (the monitor may be busy)
+        text_in = body.get("text") if isinstance(body, dict) else None
+        catalog = self._ref_catalog(wait=0.5) if isinstance(text_in, str) and "#" in text_in else None
         with self._lock:
             room, first = self._authorize(pr, room_id, "post", "message.post")
             if any(k in body for k in _MESSAGE_DERIVED):     # never trusted: the server resolves the text itself
@@ -5147,12 +5241,13 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FilesMixin):
                 pr, project_id=room["project_id"], room_id=room_id, sender_key=pr.key,
                 sender_kind=pr.kind, sender_id=pr.id, sender_external=pr.external, idempotency_key=key, fingerprint=fp,
                 text=stored, mentions=self._resolve_mentions(room_id, stored), in_reply_to=reply, trust="untrusted",
+                **({"refs": refs} if (refs := self._resolve_refs(stored, not self._restricted(pr, room_id), catalog)) else {}),
                 **({"context": ctx} if ctx else {}), **({"files": files} if files else {}),
                 visibility_scope="room", action="message.post", outcome="allowed",
                 project_ids=[room["project_id"]], resource_id=room_id))
         self.stats["messages"] += 1
-        with self._lock:
-            return 201, {"event": self._view(ev, viewer=pr)}
+        with self._lock:                     # the same catalog: no second lookup under the room lock
+            return 201, {"event": self._view(ev, viewer=pr, _ctx_cache={"github_refs": catalog})}
 
     # -- reads
     def _view(self, ev: dict, viewer=None, _ctx_cache: dict | None = None, **extra) -> dict:
@@ -5171,6 +5266,8 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FilesMixin):
             out["mentions"], mine = self._mentions_for(p, viewer)
             if mine is not None:                   # wake on the long-poll, act if addressed
                 out["mentions_me"] = mine
+            if p.get("refs"):
+                out["refs"] = self._refs_for(p, viewer, {} if _ctx_cache is None else _ctx_cache)
             if p.get("files"):
                 out["files"] = [dict(f) for f in p["files"]]
             if p.get("context"):
@@ -5444,6 +5541,8 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FilesMixin):
                         return 200, self.list_tasks(pr, rid)
                     if parts[2:] == ["files"]:
                         return 200, self.list_files(pr, rid)
+                    if parts[2:] == ["refs"]:
+                        return 200, self.search_refs(pr, rid, query.get("q", ""))
                     if parts[2:] == ["consultations"]:
                         return 200, self.list_consultations(pr, rid)
                     if parts[2:] == ["xlinks"]:

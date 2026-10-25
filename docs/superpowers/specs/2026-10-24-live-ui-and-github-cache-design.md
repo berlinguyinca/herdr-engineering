@@ -332,3 +332,12 @@ Operator-confirmed (2026-10-24, "as proposed"):
 - **Commands.** `/summarize` posts a request that an online agent fulfils (no server-side LLM
   call). `/decide` is stored as a room event that can be listed later. `/assign` maps people to
   GitHub logins in YAML `collab.people.<name>.github`.
+
+Author's call, pending operator confirmation (C4 review, 2026-10-24):
+- **Private repositories in `#` references.** Titles and states of private repositories' issues reach
+  room owners and network approvers only. Everyone else (contributors, viewers, guests, every agent,
+  external agents) sees such a reference as coordinates only (`owner/repo#n`). Their `#` menu lists
+  only public repositories' issues, and a reference they post to a private repository is not resolved
+  into `refs`. One policy function (`collab_refs.may_see_private`) holds this rule, so it is easy to
+  relax. The `#` menu needs at least 2 characters; an empty query lists a short recent list for
+  owners and approvers only; the menu is rate-limited per principal.

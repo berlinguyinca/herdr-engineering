@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { completionAt, providers, applyCompletion, ROOM_COMMANDS, unresolvedMentions, mentionChips, filterItems, resolvesTo, resolveToken, findAgent, ambiguousMentions, mentionTokens } from '../collab-mention.js';
+import { completionAt, providers, applyCompletion, ROOM_COMMANDS, unresolvedMentions, mentionChips, refChips, filterItems, resolvesTo, resolveToken, findAgent, ambiguousMentions, mentionTokens } from '../collab-mention.js';
 
 const ctx = {
   people: [{ user_id: 'u1', handle: 'gert', online: true }, { user_id: 'u2', handle: 'ana' }],
@@ -128,4 +128,59 @@ test('an external agent\'s chip says it is external, from the server\'s mention 
 
 test('names inside ~~~ fences are not mentions either', () => {
   assert.deepEqual(mentionTokens('~~~\n@gert\n~~~ @ana ~~~py\n@x'), ['ana']);
+});
+
+// ---- # issue references (C4) --------------------------------------------------------------------
+const issues = [
+  { kind: 'issue', owner: 'acme', repo: 'binview', number: 44, title: 'Fix <b>chart</b>', state: 'open', insert: '#binview-44' },
+  { kind: 'issue', owner: 'acme', repo: 'app', number: 3, title: 'A', state: 'open', insert: 'acme/app#3' },
+  { kind: 'issue', owner: 'other', repo: 'app', number: 3, title: 'B', state: 'closed', insert: 'other/app#3' },
+];
+
+test('# lists cached issues with the shortest unambiguous insert, title and state', () => {
+  const items = providers['#']('binv', { issues, issuesReady: true });
+  assert.deepEqual(items.map((i) => i.insert), ['#binview-44']);
+  assert.equal(items[0].section, 'Issues');
+  assert.equal(items[0].icon, 'issue');
+  assert.match(items[0].detail, /Fix <b>chart<\/b> · open/);                     // the composer escapes it
+  assert.deepEqual(providers['#']('app-3', { issues, issuesReady: true }).map((i) => i.insert).sort(), ['acme/app#3', 'other/app#3']);
+  assert.deepEqual(providers['#']('other/app', { issues, issuesReady: true }).map((i) => i.insert), ['other/app#3']);
+});
+
+test('# says "GitHub cache not ready" when there is no cache, as a row that inserts nothing', () => {
+  const items = providers['#']('binv', { issues: [], issuesReady: false });
+  assert.equal(items.length, 1);
+  assert.equal(items[0].label, 'GitHub cache not ready');
+  assert.equal(items[0].notice, true);
+  assert.equal(items[0].insert, '');
+});
+
+test('refChips turns only the server-resolved references into escaped chips, outside code and links', () => {
+  const refs = [{ kind: 'issue', owner: 'acme', repo: 'binview', number: 44, forms: ['short'], title: 'Fix <b>chart</b>"><img src=x>', state: 'closed' },
+    { kind: 'issue', owner: 'acme', repo: 'secret', number: 7, forms: ['long'] }];
+  const html = refChips('<p>fixes #binview-44, acme/secret#7 and #other-1 <code>#binview-44</code> <a href="#">#binview-44</a></p>', refs);
+  assert.equal((html.match(/class="cx-mention cx-ref/g) || []).length, 2);
+  assert.ok(!html.includes('<img'));
+  assert.match(html, /data-ref-state="closed"/);
+  assert.match(html, /Fix &lt;b&gt;chart&lt;\/b&gt;&quot;&gt;&lt;img src=x&gt;/);
+  assert.match(html, /#other-1 <code>#binview-44<\/code> <a href="#">#binview-44<\/a>/);
+  assert.match(html, /acme\/secret#7<\/span>/);                                    // no title or state: coordinates only
+  assert.equal(refChips('<p>#binview-44</p>', []), '<p>#binview-44</p>');
+  assert.equal(refChips('<p>abc#binview-44 &amp;#binview-44</p>', refs), '<p>abc#binview-44 &amp;#binview-44</p>');
+});
+
+test('a short #repo-n is a chip only when the server resolved that short form (an ambiguous one stays text)', () => {
+  // 'ambiguous #app-3 but other/app#3 is clear': only the long form resolved
+  const refs = [{ kind: 'issue', owner: 'other', repo: 'app', number: 3, forms: ['long'], title: 'B', state: 'open' }];
+  const html = refChips('<p>ambiguous #app-3 but other/app#3 is clear</p>', refs);
+  assert.equal((html.match(/class="cx-mention cx-ref/g) || []).length, 1);
+  assert.match(html, /ambiguous #app-3 but <span/);
+  assert.match(refChips('<p>#app-3</p>', [{ ...refs[0], forms: ['short', 'long'] }]), /cx-ref/);
+  assert.equal(refChips('<p>acme/app#3</p>', refs), '<p>acme/app#3</p>');            // another owner: text
+});
+
+test('refChips and the server agree on what may precede a reference: brackets yes, quotes no', () => {
+  const refs = [{ kind: 'issue', owner: 'acme', repo: 'app', number: 1, forms: ['short', 'long'] }];
+  const html = refChips('<p>(#app-1) &quot;#app-1&quot; &#39;#app-1&#39; "acme/app#1"</p>', refs);
+  assert.equal((html.match(/class="cx-mention cx-ref/g) || []).length, 1);
 });

@@ -131,6 +131,8 @@ export class CollabApi {
     return res;
   }
   files(room) { return this.call('GET', `/rooms/${encodeURIComponent(room)}/files`); }
+  // `#` menu (C4): issues of in-scope owners from the GitHub cache, `{ready, items}`; read-only.
+  refs(room, q, signal) { return this.call('GET', `/rooms/${encodeURIComponent(room)}/refs?q=${encodeURIComponent(q)}`, undefined, signal); }
   async uploadFile(room, file, parent) {
     const r = encodeURIComponent(room);
     const path = parent ? `/rooms/${r}/files/${encodeURIComponent(parent)}/versions` : `/rooms/${r}/files?name=${encodeURIComponent(file.name)}`;
