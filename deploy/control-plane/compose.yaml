@@ -242,9 +242,6 @@ services:
     environment:
       HERDR_ENGINEERING_STATE: /state
       HERDR_ENGINEERING_CONFIG: /app/config.yaml
-      # Secret-free; used by this host's agent so it reaches the gateway via
-      # the new dev.lan name. (Other hosts get this from Ansible.)
-      HERDR_ENGINEERING_FABRIC_URL: "http://dev.lan:29999"
     command:
       - "devfabric"
       - "gateway"

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {createRefreshBus, liveRefresher} from '../refresh-bus.js';
+import {createRefreshBus, liveRefresher, pollWhileVisible} from '../refresh-bus.js';
 
 function harness(){
   let t=0;const timers=[];
@@ -108,4 +108,15 @@ test('liveRefresher: a disposed view applies nothing and does not rerun',async()
   const p=live.refresh();live.refresh();live.dispose();
   gates[0]('x');await p;await new Promise(r=>setImmediate(r));
   assert.deepEqual([calls,applied],[1,[]]);
+});
+
+test('pollWhileVisible fires on a quiet stream, skips hidden ticks, and stops',()=>{
+  let tick=null,cleared=false,hidden=false,calls=0;
+  const stop=pollWhileVisible(()=>calls++,15000,{setTimer:(fn,ms)=>{assert.equal(ms,15000);tick=fn;return 'h';},clearTimer:h=>{assert.equal(h,'h');cleared=true;},hidden:()=>hidden});
+  tick();tick();
+  assert.equal(calls,2,'no event needed: every visible tick refreshes');
+  hidden=true;tick();
+  assert.equal(calls,2,'a hidden tab does not poll');
+  stop();
+  assert.equal(cleared,true);
 });

@@ -1016,3 +1016,39 @@ def test_failing_fresh_read_means_no_merge_and_back_off():
     clock.t += 51
     svc.tick()
     assert app.named("merge_pr") == [("merge_pr", REPO, 7, A)]
+
+
+class RecordingMain:
+    def __init__(self, raises=False):
+        self.raises = raises
+        self.calls = []
+
+    def observe(self, enrollment, rows, stale):
+        self.calls.append((enrollment.repo, [r["revision"] for r in rows], stale))
+        if self.raises:
+            raise RuntimeError("boom")
+
+
+def test_main_verifier_runs_each_tick_and_a_fault_does_not_stop_pr_handling():
+    svc, app, store, _, _, ci = make(repos=(REPO, OTHER))
+    main = RecordingMain()
+    svc._main_verifier = main
+    app.prs[REPO] = [pr()]
+    ci.set(ci_row(A, "success"))
+    counts = svc.tick()
+    assert counts["main_errors"] == 0 and counts["prs"] == 1
+    assert main.calls == [(REPO, [A], False), (OTHER, [], False)]
+    svc.tick()
+    assert len(main.calls) == 4
+    # a fault is counted per repo and never stops PR handling or the other repos
+    main.raises = True
+    app.prs[REPO] = [pr(sha=B)]
+    ci.set(ci_row(B, "success"))
+    counts = svc.tick()
+    assert counts["main_errors"] == 2 and counts["errors"] == 0
+    assert store.snapshot(KEY).head_sha == B
+    # also when listing the PRs failed
+    app.fail_open_prs.add(REPO)
+    counts = svc.tick()
+    assert counts["errors"] == 1 and counts["main_errors"] == 2
+    assert [c[0] for c in main.calls[-2:]] == [REPO, OTHER]

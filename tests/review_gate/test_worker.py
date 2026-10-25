@@ -1154,3 +1154,48 @@ def test_default_transport_enforces_a_total_deadline_between_reads():
         _Drip.release.set()
         srv.shutdown()
         srv.server_close()
+
+
+# ------------------------------------------------------------------ run hooks
+def test_run_calls_hooks_around_each_cycle(tmp_path):
+    worker = ReviewWorker(make_config(tmp_path, poll=1))
+    stop = threading.Event()
+    events = []
+    results = iter([True, False, False])
+
+    def run_once():
+        events.append("run")
+        return next(results)
+
+    worker.run_once = run_once
+    worker.backoff_seconds = 0
+
+    def before():
+        events.append("before")
+        return True
+
+    def after(claimed):
+        events.append(("after", claimed))
+        if len([e for e in events if e == "run"]) == 3:
+            stop.set()
+
+    worker.run(stop, before_cycle=before, after_cycle=after)
+    assert events == [
+        "before",
+        "run",
+        ("after", True),
+        "before",
+        "run",
+        ("after", False),
+        "before",
+        "run",
+        ("after", False),
+    ]
+
+
+def test_before_cycle_false_exits_without_claiming(tmp_path):
+    worker = ReviewWorker(make_config(tmp_path))
+    worker.run_once = lambda: pytest.fail("must not claim")
+    calls = []
+    worker.run(threading.Event(), before_cycle=lambda: False, after_cycle=calls.append)
+    assert calls == []

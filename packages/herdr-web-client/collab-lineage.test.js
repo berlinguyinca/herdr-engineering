@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   EDGE_STYLE, MAX_RENDER_NODES, buildGantt, filterGraph, fmtDuration, layoutGraph, mergePages, nextNode,
-  renderGanttSvg, focusKey, focusSelector, renderGanttTable, renderGraphSvg, renderGraphTable, renderInspector, renderLineage, renderReplay,
+  renderGanttSvg, focusKey, focusSelector, renderGanttTable, renderGraphSvg, renderGraphTable, renderGraphLegend, renderInspector, renderLineage, renderReplay,
   nodeLabel, replayTarget, replayText, shapeOf, stateLook,
 } from '../collab-lineage.js';
 
@@ -23,6 +23,14 @@ test('pages merge by identity and later pages win; bad edges are dropped', () =>
   assert.equal(m.nodes.find((n) => n.id === 'agent:a').label, 'new');
   assert.equal(m.edges.length, 1);
   assert.deepEqual(mergePages(null), { nodes: [], edges: [] });
+});
+
+test('system-intelligence edge kinds are not dropped by mergePages', () => {
+  const m = mergePages([{ nodes: [node('service:api', { label: 'API' }), node('host:h1', { label: 'H1' }),
+    node('repository:acme/api', { label: 'api' }), node('request:req-1', { label: 'R1' }), node('span:s0', { label: 'S0' })],
+    edges: [edge('serves', 'service:api', 'host:h1'), edge('runs_on', 'service:api', 'host:h1'),
+      edge('belongs_to', 'repository:acme/api', 'service:api'), edge('observed_in', 'request:req-1', 'service:api'), edge('calls', 'span:s0', 'service:api')] }]);
+  assert.deepEqual(m.edges.map((e) => e.edge_type).sort(), ['belongs_to', 'calls', 'observed_in', 'runs_on', 'serves']);
 });
 
 test('reviewed edges for different commits are distinct edges', () => {
@@ -86,11 +94,30 @@ test('the SVG graph is escaped, labelled, keyboard operable and not colour-only'
   assert.match(html, /role="group" aria-label="Lineage graph: 2 nodes and 1 links/);
 });
 
+test('the graph legend is data-derived and names the new spec kinds', () => {
+  const html = renderGraphLegend();
+  for (const t of ['repository', 'package', 'host', 'request', 'model']) {
+    assert.ok(html.includes(t), `legend names node kind ${t}`);
+  }
+  for (const t of ['calls', 'queued-on', 'routes-to', 'blocked-by']) {
+    assert.ok(html.includes(t), `legend names edge tag ${t}`);
+  }
+});
+
 test('every link type has a distinct dash/tag pair and node types map to shapes', () => {
   const pairs = Object.values(EDGE_STYLE).map((s) => `${s.dash}|${s.tag}`);
   assert.equal(new Set(pairs).size, pairs.length);
   assert.equal(new Set(Object.values(EDGE_STYLE).map((s) => s.tag)).size, Object.keys(EDGE_STYLE).length);
   assert.deepEqual(['agent', 'task', 'pr', 'review', 'handoff', 'nothing'].map(shapeOf), ['round', 'rect', 'tag', 'diamond', 'hex', 'rect']);
+  // system-intelligence kinds (spec 02) must be drawn, not dropped or generic.
+  assert.ok(EDGE_STYLE.calls && EDGE_STYLE.calls.word === 'calls');
+  assert.ok(EDGE_STYLE.blocked_by && EDGE_STYLE.blocked_by.word === 'blocked by');
+  assert.ok(EDGE_STYLE.runs_on && EDGE_STYLE.runs_on.word === 'runs on');
+  assert.equal(shapeOf('repository'), 'round');
+  assert.equal(shapeOf('host'), 'hex');
+  assert.equal(shapeOf('request'), 'tag');
+  assert.equal(shapeOf('model'), 'round');
+  assert.equal(shapeOf('package'), 'tag', 'package is a tag, not a rect/round');
   assert.equal(stateLook('running').glyph, '●');
   assert.equal(stateLook(null).word, 'no state recorded');
   assert.equal(stateLook('weird').kind, 'other');

@@ -481,3 +481,27 @@ def test_notices_route_survives_a_malformed_notice(gate_server):
     status, notices = request(gate_server, "review-gate/notices")
     assert status == 200 and len(notices) == 2
     assert notices[0]["at"] == 5.0 and notices[1]["at"] is None
+
+
+def test_main_route_viewer_ok_and_404_when_disabled(tmp_path, monkeypatch, monitor_starts,
+                                                    plain_server):
+    assert request(plain_server, "review-gate/main")[0] == 404
+    monkeypatch.setattr(github_app, "GitHubAppClient", FakeApp)
+    section = gate_section(tmp_path, repos=[{"repo": REPO, "main_pipeline": "push"}])
+    server = ControlPlaneServer(ControlPlaneRepo(), api_keys={"read": "viewer", "write": "operator"},
+                                fleet_config=FakeFleet(section))
+    start(server)
+    try:
+        server.gate_service.tick()  # FakeApp cannot read the default branch: state unknown
+        status, body = request(server, "review-gate/main/")
+        assert status == 200
+        assert [(r["repo"], r["state"]) for r in body["repos"]] == [(REPO, "unknown")]
+        assert request(server, "review-gate/main", key="write")[0] == 200
+    finally:
+        server.shutdown()
+
+
+def test_main_route_requires_a_key(gate_server):
+    for key in ("", "wrong"):
+        assert request(gate_server, "review-gate/main", key=key)[0] in (401, 403)
+    assert request(gate_server, "review-gate/main")[1] == {"repos": []}

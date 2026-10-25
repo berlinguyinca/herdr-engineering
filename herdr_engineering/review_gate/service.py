@@ -80,6 +80,10 @@ Decisions and limits:
 - The author is resolved once per (key, head SHA) and cached in memory.
 - Statuses are posted only when (state, description) changes for a SHA (kept
   in memory); the first ``pending`` for a new head SHA is always posted.
+- Main verification: when a ``main_verifier`` is given, each enrolled repo's
+  ``observe(enrollment, rows, stale)`` runs after its PR loop (also when the PR
+  listing failed), in its own try/except: a fault there is counted in
+  ``main_errors`` and never stops PR handling.
 - ``tick`` never raises. Errors are counted per repo / per PR and the loop goes
   on with the next one.
 """
@@ -152,9 +156,11 @@ class GateService:
         ci_snapshot: Callable[[], dict],
         now: Callable[[], float] = time.time,
         notifier=None,
+        main_verifier=None,
     ):
         self._config = config
         self._notifier = notifier
+        self._main_verifier = main_verifier
         self._app = app
         self._store = store
         self._queue = queue
@@ -211,6 +217,7 @@ class GateService:
             "merged": 0,
             "errors": 0,
             "skipped_drafts": 0,
+            "main_errors": 0,
         }
         with self._tick_lock:
             try:
@@ -262,6 +269,7 @@ class GateService:
                 self._note_error(exc)
                 log.warning("review gate: listing PRs failed for %s", enrollment.repo)
                 counts["errors"] += 1
+                self._observe_main(enrollment, snapshot, stale, counts)
                 continue
             rows = _rows_for(snapshot, enrollment.repo)
             self._forget_closed(enrollment.repo, prs)
@@ -276,6 +284,16 @@ class GateService:
                     self._note_error(exc)
                     log.warning("review gate: %s#%s failed", enrollment.repo, pr.number)
                     counts["errors"] += 1
+            self._observe_main(enrollment, snapshot, stale, counts)
+
+    def _observe_main(self, enrollment, snapshot: dict, stale: bool, counts: dict) -> None:
+        if self._main_verifier is None:
+            return
+        try:
+            self._main_verifier.observe(enrollment, _rows_for(snapshot, enrollment.repo), stale)
+        except Exception:  # noqa: BLE001 - a main-verification fault never stops PR handling
+            log.warning("review gate: main verification failed for %s", enrollment.repo)
+            counts["main_errors"] += 1
 
     def _forget_closed(self, repo: str, prs: list[PrInfo]) -> None:
         """Cancel reviews of PRs that left the open list; drop memos of old heads."""

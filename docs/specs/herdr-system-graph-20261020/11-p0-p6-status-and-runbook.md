@@ -117,13 +117,47 @@ restored.
 
 ## 5. Honest open items (not invented)
 
-- **Archify license/API** — unverified upstream; P5 uses the safe renderer
-  until pinned.
-- **Live ingest wiring** — the emitters are unit-tested; wiring them into the
-  live ingest path (`api.py` `/api/v1/ingest`) so mission/repo/trace events
-  flow into the running graph is a follow-up integration task.
-- **Dashboard UI** — the projection modules are unit-tested; wiring the new
-  kinds into the running web UI (topology-view.js) is a follow-up.
+- **Archify — VERIFIED + formally dropped (follow-up PR); P5 narrowed.**
+  Upstream `tt-a1i/archify` (the only real Archify) was verified against its
+  pinned source: MIT license (LICENSE + npm), actively maintained (88k+ stars,
+  stable v3.2.0, pushed 2026-10-24), a deterministic JSON-IR→HTML renderer
+  driven by an AI agent via `node bin/archify.mjs finalize <type>
+  <candidate.json> <output.html> --quality showcase --json`, covering
+  architecture/workflow/sequence/dataflow/lifecycle/erd/class/tree/timeline/
+  waterfall — so the diagram families the spec asks to confirm are genuinely
+  supported. **Decision: not vendored.** Archify is a large Node ≥18
+  agent-skill package (~7.3MB, per-family renderers, sidecar/delivery/
+  browser-check machinery) intended to be driven by an AI agent, not a
+  lightweight library; the spec forbids parallel/duplicate implementations,
+  and the deterministic safe renderer (`graph_artifact.py`) already satisfies
+  the narrower P5 security/determinism gate (deterministic snapshot + CSP +
+  sanitization, 4 tests). Vendoring Archify would duplicate that gate with a
+  heavy dependency and no gating value. **Re-scope, honestly stated:** the
+  P5 deliverables that Archify would have enabled — validated snapshots in the
+  Libre WebUI, click-through source links, sharing/annotation, and the
+  `/artifact <family>` slash commands for every family — are NOT implemented
+  and remain OPEN. Only the deterministic/security gate is closed; re-pin
+  Archify if an interactive canvas or the WebUI artifact surface is later
+  required.
+- **Live ingest wiring — DONE (follow-up PR).** `GraphIngestAdapter`
+  (`graph_ingest.py`) translates mission/session/repository/request/span
+  lifecycle events into lineage envelopes and routes them through the real
+  `repo.ingest` path (admit + persist + apply). Opt-in via
+  `--system-graph` / fleet config `control_plane.system_graph`; off by
+  default. 8 tests.
+- **Dashboard UI — DONE (follow-up PR).** The live lineage renderer
+  (`packages/collab-lineage.js`) now draws the spec-02 kinds: new node kinds get
+  distinct shapes (repository/service/model/worker/deployment/branch/module =
+  round, host/gpu = hex, request/span/trace/queue/dataset/symbol/package =
+  tag); the node-shape legend is data-derived
+  and the 14 new edge kinds (`calls`, `observed_in`, `belongs_to`, `blocked_by`,
+  `implements`, `references`, `runs_on`, `serves`, `deploys_to`, `assigned_to`,
+  `precedes`, `imports`, `routes_to`, `queued_on`) get dash/tag/word styles.
+  Previously `mergePages` silently DROPPED any edge kind not in the style table,
+  so these edges never reached the canvas; now they render and appear in the
+  data-derived filters/legend. 23 collab-lineage client tests pass; full client
+  suite 513 pass. (The main `topology-view.js` is a record-based view of
+  services/sessions/CI, separate from the lineage canvas; it needs no graph kinds.)
 
 ## 6. Feature acceptance tally
 
@@ -135,7 +169,9 @@ restored.
 | Request/trace slice (P4) | ✅ complete | 2 tests |
 | Artifact renderer + CLI (P5) | ✅ complete | 4 tests + CLI |
 | History/scale/runbook (P6) | ✅ complete | 6 tests |
-| Live ingest + UI wiring | ⏳ follow-up | requires integration task |
+| Live ingest wiring | ✅ complete | graph_ingest.py + --system-graph opt-in, 8 tests |
+| Dashboard UI wiring | ✅ complete | collab-lineage.js renders spec-02 node/edge kinds, 23 client tests |
+| Archify (P5) | ⚠️ narrowed | upstream verified (MIT, active, JSON-IR renderer, `finalize` CLI); not vendored — deterministic/security gate closed; WebUI render, source links, sharing, annotation, `/artifact` slash commands remain OPEN |
 
 *Progress is tracked by passing tests and linked evidence, not generated-file
 counts (spec 08).*

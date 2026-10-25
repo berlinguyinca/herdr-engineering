@@ -137,3 +137,23 @@ test('every var(--token) used in packages is defined',()=>{
  const missing=sharedUsed.filter(([n])=>!themeDefs.has(n)).map(([n,f])=>`${n} (${[...new Set(f)].join(', ')})`);
  assert.deepEqual(missing,[]);
 });
+
+test('a quiet fleet keeps the chip green while stream keepalives arrive; silence turns it amber',async()=>withPage(async(page,base)=>{
+ await open(page,base);
+ await page.evaluate(async()=>{
+  const m=await import('/freshness.js');window.contact=m.noteStreamContact;
+  document.body.innerHTML='<herdr-freshness id="f" interval="5000"></herdr-freshness>';
+  window.f=document.getElementById('f');f.touch(true);contact(true);
+ });
+ const state=()=>page.evaluate(()=>f.dataset.state);
+ // One minute without a single event: only the 10 s keepalive.
+ for(let i=0;i<6;i++){await page.clock.runFor(10000);await page.evaluate(()=>contact(true));}
+ assert.equal(await state(),'fresh','nothing changed, the stream is alive: not stale');
+ assert.match(await page.evaluate(()=>f.textContent),/updated 1m ago/);
+ await page.clock.runFor(26000);
+ assert.equal(await state(),'stale','the stream fell silent');
+ await page.evaluate(()=>contact(true));await page.clock.runFor(1000);
+ assert.equal(await state(),'fresh');
+ await page.evaluate(()=>contact(false));await page.clock.runFor(1000);
+ assert.equal(await state(),'stale','a dropped stream falls back to the refresh age');
+}));

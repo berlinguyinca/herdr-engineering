@@ -163,9 +163,25 @@ def _parity(status: dict, expected: list[str], revision: str,
             "invalid_hosts": invalid}
 
 
+DEFAULT_GATEWAY = "http://dev.lan:29999"
+GATEWAY_IGNORED_MSG = (
+    "--gateway is IGNORED for the fabric agent: it no longer reads a gateway from the "
+    "command line or fabric.env. Set fabric.url in fleet-config.yaml (or "
+    "fabric.gateway_url in config.yaml) instead."
+)
+
+
+def warn_gateway_ignored(gateway: str | None) -> bool:
+    """Loudly tell the operator an explicit --gateway has no effect on the fabric agent."""
+    if gateway is None:
+        return False
+    print(f"warning: {GATEWAY_IGNORED_MSG}", file=sys.stderr)
+    return True
+
+
 def fleet_join(*, ssh_target: str, label: str | None = None, os_name: str = "linux",
                user: str | None = None, ansible_host: str | None = None,
-               gateway: str = "http://dev.lan:29999", herdr_bin: str = "herdr",
+               gateway: str = DEFAULT_GATEWAY, herdr_bin: str = "herdr",
                attach: bool = True, provision: bool = True,
                inventory: Path | None = None, host_vars_dir: Path | None = None,
                fleet_config: Path | None = None, roles: list[str] | None = None,
@@ -254,7 +270,7 @@ def fleet_join(*, ssh_target: str, label: str | None = None, os_name: str = "lin
     return report
 
 
-def fleet_update(*, host: str | None = None, gateway: str = "http://dev.lan:29999",
+def fleet_update(*, host: str | None = None, gateway: str = DEFAULT_GATEWAY,
                  inventory: Path | None = None, pull_controller: bool = True,
                  reinstall_local: bool = True, revision: str | None = None,
                  pi_revision: str | None = None) -> dict:

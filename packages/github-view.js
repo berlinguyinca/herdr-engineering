@@ -3,6 +3,7 @@ import {escapeHtml as esc} from './herdr-web-components/util.js';
 import {formatDuration,formatTimestamp} from './herdr-web-components/format.js';
 import {safeServiceUrl} from './services-view.js';
 import {snapshotText,animateChanges} from './motion.js';
+import {mountRelated} from './related-panel.js';
 
 const text=value=>typeof value==='string'?value:'';
 const short=(value,max=160)=>text(value).replace(/\s+/g,' ').trim().slice(0,max);
@@ -95,10 +96,13 @@ export function mountGithub(container,client) {
  const requests=new Map(),cache=new Map(),signatures=new Map(),listeners=new AbortController();
  container.innerHTML=`${styles}<h1>GitHub projects</h1><p class="gh-intro">Repositories ranked by open issues. Find work to inspect and review its AutoSpec labels, preparation needs and reported progress.</p><div data-gh-health role="status"></div><p data-gh-repo-error class="gh-warning" role="status"></p>
   <div class="gh-layout"><details class="gh-repositories" ${window.matchMedia('(min-width:851px)').matches?'open':''}><summary>Repositories · most open issues first</summary><div class="gh-repository-content"><div class="gh-controls"><label>Search repositories<input type="search" data-gh-repo-search placeholder="Owner or repository"></label></div><button type="button" class="hd-btn gh-all-repos" data-gh-all-repositories>All repositories</button><p class="gh-note" data-gh-repo-count></p><ul class="gh-repo-list" data-gh-repositories></ul><div class="gh-pages" data-gh-repo-pages><button type="button" class="hd-btn" data-gh-repo-page="previous">Previous</button><span data-gh-repo-page-label></span><button type="button" class="hd-btn" data-gh-repo-page="next">Next</button></div></div></details>
-  <section class="gh-main"><div class="gh-heading"><h2 data-gh-scope>All repositories</h2></div><div class="gh-tabs" role="tablist" aria-label="Issue classification">${tabs.map(([key,label])=>`<button type="button" role="tab" id="gh-tab-${key}" data-gh-tab="${key}" aria-controls="gh-issue-panel" aria-selected="${key==='all'}" tabindex="${key==='all'?0:-1}">${label}<small data-gh-tab-count="${key}">…</small></button>`).join('')}</div><div class="gh-controls"><label>Search open issues<input type="search" data-gh-issue-search placeholder="Issue title or number"></label></div><p class="gh-section-label" data-gh-issue-count role="status"></p><p class="gh-warning" data-gh-issue-error role="status"></p><div class="gh-issue-layout"><div class="gh-issue-list" id="gh-issue-panel" role="tabpanel" aria-labelledby="gh-tab-all"></div><aside class="gh-inspector" data-gh-inspector aria-label="Issue inspector" hidden></aside></div><div class="gh-pages" data-gh-issue-pages><button type="button" class="hd-btn" data-gh-issue-page="previous">Previous</button><span data-gh-issue-page-label></span><button type="button" class="hd-btn" data-gh-issue-page="next">Next</button></div></section></div>`;
+  <section class="gh-main"><div class="gh-heading"><h2 data-gh-scope>All repositories</h2></div><div data-gh-related></div><div class="gh-tabs" role="tablist" aria-label="Issue classification">${tabs.map(([key,label])=>`<button type="button" role="tab" id="gh-tab-${key}" data-gh-tab="${key}" aria-controls="gh-issue-panel" aria-selected="${key==='all'}" tabindex="${key==='all'?0:-1}">${label}<small data-gh-tab-count="${key}">…</small></button>`).join('')}</div><div class="gh-controls"><label>Search open issues<input type="search" data-gh-issue-search placeholder="Issue title or number"></label></div><p class="gh-section-label" data-gh-issue-count role="status"></p><p class="gh-warning" data-gh-issue-error role="status"></p><div class="gh-issue-layout"><div class="gh-issue-list" id="gh-issue-panel" role="tabpanel" aria-labelledby="gh-tab-all"></div><aside class="gh-inspector" data-gh-inspector aria-label="Issue inspector" hidden></aside></div><div class="gh-pages" data-gh-issue-pages><button type="button" class="hd-btn" data-gh-issue-page="previous">Previous</button><span data-gh-issue-page-label></span><button type="button" class="hd-btn" data-gh-issue-page="next">Next</button></div></section></div>`;
  const el=selector=>container.querySelector(selector);
  const narrowViewport=window.matchMedia('(max-width:1249px)');
  const narrow=()=>narrowViewport.matches;
+ // A selected repository links to its agents, missions, CI runs and pull requests (cross-linking).
+ let disposeRelated=null;
+ function showProject(){disposeRelated?.();disposeRelated=null;const slot=el('[data-gh-related]');if(slot)slot.replaceChildren();if(state.repository&&slot&&typeof client.related==='function')disposeRelated=mountRelated(slot,client,'project',state.repository,{footer:`<nav class="hd-inline" style="font-size:13px"><a href="#/ci?repository=${encodeURIComponent(state.repository)}">All CI for this repository</a></nav>`});}
  function sizeWorkspace(){const layout=el('.gh-layout');layout.style.setProperty('--gh-workspace-top',`${Math.max(16,layout.getBoundingClientRect().top+window.scrollY)}px`);layout.style.setProperty('--gh-repository-heading',`${el('.gh-repositories>summary').getBoundingClientRect().height}px`);}
  window.addEventListener('resize',sizeWorkspace,{signal:listeners.signal});
  narrowViewport.addEventListener('change',event=>{
@@ -196,7 +200,7 @@ export function mountGithub(container,client) {
   const nextAccount=text(response.account?.login||response.account)||null,nextGeneration=response.connection_generation;
   const changed=(account&&nextAccount&&account!==nextAccount)||(connectionGeneration!==null&&nextGeneration!==undefined&&connectionGeneration!==nextGeneration);
   const disconnected=['not_configured','auth_error'].includes(response.status);
-  if(changed||disconnected){clearSelection();cache.clear();cancel('issues');issues=null;issueError='';state.repository='';state.repositoryLabel='All repositories';state.issuePage=1;}
+  if(changed||disconnected){clearSelection();cache.clear();cancel('issues');issues=null;issueError='';state.repository='';state.repositoryLabel='All repositories';state.issuePage=1;showProject();}
   account=disconnected?null:nextAccount;if(nextGeneration!==undefined)connectionGeneration=nextGeneration;
   repositories=response;repoError='';if(changed||disconnected)readIssues();
  },()=>{repoError=`Repositories could not refresh.${repositories?' Showing last received repositories.':' Retrying automatically.'}`;});}
@@ -213,7 +217,7 @@ export function mountGithub(container,client) {
  container.addEventListener('click',event=>{
   if(disposed)return;const button=event.target.closest('button');if(!button)return;
   if(button.hasAttribute('data-gh-all-repositories')||button.hasAttribute('data-gh-repository')){
-   state.repository=button.dataset.ghRepository||'';state.repositoryLabel=repositories?.repositories?.find(r=>r.repository_id===state.repository)?.name_with_owner||state.repository||'All repositories';state.issuePage=1;clearSelection();changeIssues();
+   state.repository=button.dataset.ghRepository||'';state.repositoryLabel=repositories?.repositories?.find(r=>r.repository_id===state.repository)?.name_with_owner||state.repository||'All repositories';state.issuePage=1;clearSelection();showProject();changeIssues();
   }
   if(button.dataset.ghTab){state.tab=button.dataset.ghTab;state.issuePage=1;changeIssues();}
   if(button.dataset.ghRepoPage){state.repositoryPage+=button.dataset.ghRepoPage==='next'?1:-1;cancel('repos');repositories=null;readRepositories();draw();}
@@ -232,5 +236,5 @@ export function mountGithub(container,client) {
  container.querySelector('.gh-tabs').addEventListener('keydown',event=>{if(!['ArrowLeft','ArrowRight','Home','End'].includes(event.key))return;const i=tabs.findIndex(([key])=>key===state.tab);state.tab=tabs[event.key==='Home'?0:event.key==='End'?tabs.length-1:(i+(event.key==='ArrowRight'?1:tabs.length-1))%tabs.length][0];state.issuePage=1;event.preventDefault();changeIssues();el(`[data-gh-tab="${state.tab}"]`).focus();},{signal:listeners.signal});
  function visibility(){clearInterval(clock);clearInterval(pollTimer);if(document.hidden){for(const controller of requests.values())controller.abort();requests.clear();detailLoading=false;return;}refresh();if(selected&&!detail)loadDetail();clock=setInterval(tick,1000);pollTimer=setInterval(refresh,5000);}
  document.addEventListener('visibilitychange',visibility,{signal:listeners.signal});draw();visibility();
- return {refresh,dispose(){disposed=true;listeners.abort();clearInterval(clock);clearInterval(pollTimer);clearTimeout(repositoryDebounce);clearTimeout(issueDebounce);for(const controller of requests.values())controller.abort();requests.clear();}};
+ return {refresh,dispose(){disposed=true;disposeRelated?.();listeners.abort();clearInterval(clock);clearInterval(pollTimer);clearTimeout(repositoryDebounce);clearTimeout(issueDebounce);for(const controller of requests.values())controller.abort();requests.clear();}};
 }

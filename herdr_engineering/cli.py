@@ -172,8 +172,9 @@ def _build_parser() -> argparse.ArgumentParser:
     pj.add_argument("--user", default=None, help="fleet ssh user for ansible host_vars")
     pj.add_argument("--ansible-host", default=None,
                     help="tailnet MagicDNS/ip for ansible (defaults to ssh_target)")
-    pj.add_argument("--gateway", default="http://dev.lan:29999",
-                    help="fabric gateway URL the agent registers with")
+    pj.add_argument("--gateway", default=None,
+                    help="IGNORED for the fabric agent (warns); set fabric.url in "
+                         "fleet-config.yaml or fabric.gateway_url in config.yaml")
     pj.add_argument("--no-attach", action="store_true",
                     help="skip the herdr machine add step")
     pj.add_argument("--no-provision", action="store_true",
@@ -228,8 +229,9 @@ def _build_parser() -> argparse.ArgumentParser:
     pu = fsub.add_parser("update", help="self-update controller + every host, then "
                                         "report parity (one command)")
     pu.add_argument("--host", default=None, help="update only this host (default: all)")
-    pu.add_argument("--gateway", default="http://dev.lan:29999",
-                    help="fabric gateway URL the agent registers with")
+    pu.add_argument("--gateway", default=None,
+                    help="IGNORED for the fabric agent (warns); set fabric.url in "
+                         "fleet-config.yaml or fabric.gateway_url in config.yaml")
     pu.add_argument("--no-pull", action="store_true", help="skip controller git pull")
     pu.add_argument("--no-reinstall", action="store_true",
                     help="skip controller local pip reinstall")
@@ -471,6 +473,13 @@ def _build_parser() -> argparse.ArgumentParser:
     p2.add_argument("--config", required=True, help="worker YAML config file")
     p2.add_argument("--once", action="store_true", help="run one claim cycle and exit")
     p2.set_defaults(func=_cmd_review_gate_worker)
+    p2 = gsub.add_parser("pool", help="run a pool of reviewer workers sized by the review queue")
+    p2.add_argument("--config", required=True, help="pool YAML config file")
+    p2.set_defaults(func=_cmd_review_gate_pool)
+    p2 = gsub.add_parser("check-skips", help="fail when a test is skipped outside the disabled-tests file")
+    p2.add_argument("--junit", action="append", required=True, help="junit XML file or directory (repeatable)")
+    p2.add_argument("--disabled", required=True, help="disabled-tests YAML file")
+    p2.set_defaults(func=_cmd_review_gate_check_skips)
 
     # candidates -----------------------------------------------------------
     p = sub.add_parser("candidates", help="multi-agent worktree comparison (spec 0140)")
@@ -512,6 +521,9 @@ def _build_parser() -> argparse.ArgumentParser:
     p2.add_argument("--pg-dsn", default=None,
                     help="optional Postgres DSN to hydrate the repo from "
                          "durable state on startup (Spec §106)")
+    p2.add_argument("--system-graph", action="store_true",
+                    help="opt-in: reflect mission/session/repo/trace lifecycle events "
+                         "into the running lineage graph (system-graph spec P2-P4)")
     p2.add_argument("--seed-demo", action="store_true",
                     help="seed a fresh in-memory repo with demo data so the "
                          "UI is populated (useful when no Postgres is present)")
@@ -820,14 +832,15 @@ def _cmd_machines(args) -> int:
 
 def _cmd_fleet_join(args) -> int:
     from pathlib import Path
-    from .fleet import fleet_join
+    from .fleet import DEFAULT_GATEWAY, fleet_join, warn_gateway_ignored
+    warn_gateway_ignored(args.gateway)
     report = fleet_join(
         ssh_target=args.ssh_target,
         label=args.label,
         os_name=args.os,
         user=args.user,
         ansible_host=args.ansible_host or args.ssh_target,
-        gateway=args.gateway,
+        gateway=DEFAULT_GATEWAY,
         attach=not args.no_attach,
         provision=not args.no_provision,
         fleet_config=None if args.no_credentials else Path(args.fleet_config).expanduser(),
@@ -906,10 +919,11 @@ def _cmd_fleet_config(args) -> int:
 
 
 def _cmd_fleet_update(args) -> int:
-    from .fleet import fleet_update
+    from .fleet import DEFAULT_GATEWAY, fleet_update, warn_gateway_ignored
+    warn_gateway_ignored(args.gateway)
     report = fleet_update(
         host=args.host,
-        gateway=args.gateway,
+        gateway=DEFAULT_GATEWAY,
         pull_controller=not args.no_pull,
         reinstall_local=not args.no_reinstall,
     )
@@ -1176,8 +1190,8 @@ def _local_fabric_client():
 
 
 def _gateway_configured_or_reachable() -> bool:
-    """True when a gateway URL is configured (env HERDR_ENGINEERING_FABRIC_URL
-    or fabric.gateway_url in config) OR a gateway is currently reachable.
+    """True when a gateway URL is configured (fabric.url in the central host
+    config or fabric.gateway_url in config.yaml) OR a gateway is currently reachable.
     Used to warn about silent local-registry degradation (issue #77b)."""
     from .config import load_config
     from .errors import InvalidError
@@ -1929,8 +1943,8 @@ def _cmd_dev_agent(args) -> int:
     if not base:
         _print_json({
             "code": "config",
-            "message": "no gateway configured: set fabric.gateway_url or "
-                       "HERDR_ENGINEERING_FABRIC_URL",
+            "message": "no gateway configured: set fabric.url in the central "
+                       "fleet-config.yaml, or fabric.gateway_url in config.yaml",
         })
         return 1
     tailnet_ip = tailnet_ipv4()
@@ -2278,6 +2292,55 @@ def _cmd_review_gate_worker(args) -> int:
         return 2
 
 
+def _cmd_review_gate_pool(args) -> int:
+    """Same exit codes and fixed-text messages as ``review-gate worker``."""
+    from .review_gate import pool as rgp
+    from .review_gate import worker as rgw
+
+    if not logging.getLogger().handlers:
+        logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    try:
+        pool = rgp.ReviewPool(rgp.load_pool_config(args.config))
+        stop = threading.Event()
+
+        def _request_stop(_signum, _frame):
+            stop.set()
+
+        signal.signal(signal.SIGINT, _request_stop)
+        signal.signal(signal.SIGTERM, _request_stop)
+        pool.run(stop)
+        return 0
+    except rgw.WorkerAuthError:
+        print("review-gate pool: the control plane refused the reviewer key", file=sys.stderr)
+        return 1
+    except rgw.WorkerConfigError as exc:
+        print(f"review-gate pool: config error: {exc}", file=sys.stderr)
+        return 2
+    except Exception as exc:  # noqa: BLE001 - restartable: not a refused key or bad config
+        print(f"review-gate pool: internal error: {type(exc).__name__}", file=sys.stderr)
+        return 3
+
+
+def _cmd_review_gate_check_skips(args) -> int:
+    """Exit 0 clean, 1 when a skipped test is not in the disabled file, 2 on bad input."""
+    from .review_gate import skips
+
+    try:
+        report = skips.check_junit(args.junit, skips.load_disabled(args.disabled))
+    except skips.SkipsError as exc:
+        print(f"review-gate check-skips: {exc}", file=sys.stderr)
+        return 2
+    for name in report.unused_disabled:
+        print(f"warning: listed as disabled but not skipped: {name}", file=sys.stderr)
+    if report.skipped_unlisted:
+        print(f"{len(report.skipped_unlisted)} test(s) skipped outside the disabled-tests file:")
+        for name in report.skipped_unlisted:
+            print(f"- {name}")
+        return 1
+    print(f"ok: {report.total} testcases, no unlisted skips")
+    return 0
+
+
 def _cmd_review_request(args) -> int:
     from .browser import PlannotatorAdapter
     review = PlannotatorAdapter().request_review(
@@ -2470,6 +2533,9 @@ def _cmd_cp_web(args) -> int:
             raise SystemExit("fleet config control_plane.lineage_key_scopes: an entry names an operator-role key; operator keys "
                              "are not restricted, so the entry would silently do nothing. Remove it or use a non-operator key")
         lineage_key_scopes = {str(k): v for k, v in raw_scopes.items()}
+    # Opt-in: reflect mission/session/repo/trace lifecycle events into the running
+    # lineage graph (system-graph spec P2-P4). Off by default.
+    system_graph = bool(cp.get("system_graph")) or bool(getattr(args, "system_graph", False))
     if args.collab_cognito_group is None:
         args.collab_cognito_group = "local.dev"
     # The Postgres DSN comes from the fleet file's control_plane section (the
@@ -2481,6 +2547,21 @@ def _cmd_cp_web(args) -> int:
     from .control_plane.retention import usage_retention_config
     try:
         usage_retention = usage_retention_config(cp.get("llm_proxy"))
+    except ValueError as exc:
+        raise SystemExit(f"fleet config {exc}") from None
+    from .control_plane.attention_inbox import attention_config
+    try:
+        attention = attention_config(cp.get("attention"))
+    except ValueError as exc:
+        raise SystemExit(f"fleet config {exc}") from None
+    from .control_plane.mission_outcome import missions_config
+    try:
+        missions = missions_config(cp.get("missions"))
+    except ValueError as exc:
+        raise SystemExit(f"fleet config {exc}") from None
+    from .control_plane.ci_fix import ci_fix_config
+    try:
+        ci_fix = ci_fix_config(cp.get("ci_fix"))
     except ValueError as exc:
         raise SystemExit(f"fleet config {exc}") from None
     _require_durable_review_gate(cp, dsn)
@@ -2589,6 +2670,7 @@ def _cmd_cp_web(args) -> int:
                 return ((section.get("collab") or {}) if isinstance(section.get("collab"), dict) else {}).get("insights")
             collab.insights_source = _insights_from_yaml
     svr = ControlPlaneServer(repo, api_keys=api_keys, lineage_key_scopes=lineage_key_scopes,
+                             system_graph=system_graph,
                              host=args.host, port=args.port, source=source,
                              web_root=args.web_root,
                              # collab-only has no operator listener, so nothing is left open
@@ -2599,7 +2681,8 @@ def _cmd_cp_web(args) -> int:
                              fleet_config=fleet_store, ci_actions=cp.get("ci_actions") is True,
                              summary_config=cp.get("agent_summaries") or {},
                              review_quorum=_review_quorum_config(cp),
-                             usage_retention=usage_retention,
+                             usage_retention=usage_retention, attention=attention,
+                             ci_fix=ci_fix, missions=missions,
                              public_port=args.collab_public_port,
                              public_host=args.collab_public_host,
                              collab_only=args.collab_only,
