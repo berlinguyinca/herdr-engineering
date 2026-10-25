@@ -361,3 +361,14 @@ def test_a_handoff_names_who_posted_it_when_that_is_not_the_from_party(w):
     assert got and "posted by @bob" in got[0]["text"] and "from @bob.codex" in got[0]["text"]
     own = say(w, w.bob, "/handoff @alice take it")
     assert "posted_by" not in own["handoff"]                     # from is the poster: nothing extra
+
+
+def test_reading_marks_read_only_up_to_the_last_event_returned(w):
+    w.s.message_limit = 1000
+    for i in range(210):
+        say(w, w.alice, f"@bob {i}")
+    page = w.s.room_state(w.bob, w.room, -1, 0, 0)                 # one page: at most 200 events come back
+    assert page["has_more"] is True
+    assert unread(w, w.bob)[w.room] > 0                           # the rest are still unread
+    w.s.room_state(w.bob, w.room, -1, page["next_cursor"], 0)
+    assert unread(w, w.bob)[w.room] == 0

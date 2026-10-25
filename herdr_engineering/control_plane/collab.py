@@ -3290,7 +3290,7 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FilesMixin, Co
                 raise CollabError(429, "too many open room views")
             self._state_waiters[pr.key] += 1
             self._mark_seen(room_id, pr)
-            self._mark_read(room_id, pr)
+        read_upto = cursor                    # what the reader already has; raised to what this reply sends
         try:
             with self._cv:
                 while True:
@@ -3310,6 +3310,7 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FilesMixin, Co
             m = self._member(self._rooms[room_id], pr.id) if not pr.is_agent else None
             guest = bool(m and m["role"] == "guest")
             out: dict[str, Any] = {"seq": cur, "changed": True, **self.read_events(pr, room_id, cursor, 200)}
+            read_upto = out["next_cursor"]
             out["agents"] = [] if guest else self.list_room_agents(pr, room_id)["agents"]
             with self._lock:                      # handles only, never emails; a guest gets no roster
                 out["people"] = [] if guest else self._room_people(room_id)
@@ -3331,7 +3332,7 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FilesMixin, Co
             with self._cv:
                 self._state_waiters[pr.key] -= 1
                 self._mark_seen(room_id, pr)
-                self._mark_read(room_id, pr)
+                self._mark_read(room_id, pr, read_upto)
 
     FLOW_TASKS = 60
 

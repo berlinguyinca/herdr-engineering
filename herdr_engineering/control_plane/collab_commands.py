@@ -545,9 +545,11 @@ class CommandsMixin:
                     break
         return n
 
-    def _mark_read(self, room_id: str, pr) -> None:
-        if not pr.is_agent:
-            self._read_upto[(room_id, pr.id)] = self._seq
+    def _mark_read(self, room_id: str, pr, upto: int) -> None:
+        """The reader has seen this room up to `upto` (the last event they were actually sent); never backwards."""
+        if not pr.is_agent and upto > 0:
+            key = (room_id, pr.id)
+            self._read_upto[key] = max(self._read_upto.get(key, 0), upto)
 
     # ---------------------------------------------------------------- C7: mentions that wake an agent
     def _wake_targets(self, pr, room: dict, room_id: str, found: list[dict]) -> list[str]:
