@@ -1682,6 +1682,19 @@ def _make_handler(server, public=False, operator=False):
                     story = build(r, parts[4], outcomes=server.mission_outcomes, inbox=server.attention,
                                   config=server.missions_config)
                     return self._json(story) if story is not None else self._json({"error": "not found"}, 404)
+                if len(parts) == 6 and parts[5] in ("tests", "builds", "reviews", "pulls"):
+                    if r.get_mission(parts[4]) is None:
+                        return self._json({"error": "not found"}, 404)
+                    sub = parts[5]
+                    if sub == "tests":
+                        items = r.list_test_runs(mission_id=parts[4], kind="test")
+                    elif sub == "builds":
+                        items = r.list_test_runs(mission_id=parts[4], kind="build")
+                    elif sub == "reviews":
+                        items = r.list_reviews(mission_id=parts[4])
+                    else:  # pulls
+                        items = r.list_pull_requests(mission_id=parts[4])
+                    return self._json({sub: [redact_payload(item) for item in items]})
                 if len(parts) > 5 and parts[5] == "timeline":
                     timeline = r.mission_timeline(parts[4])
                     return self._json({"timeline": _with_collab_tasks(server, r, parts[4], timeline)})
