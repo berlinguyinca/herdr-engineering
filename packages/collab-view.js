@@ -516,9 +516,12 @@ export function mountCollab(root, { fabricSessions = null, onFreshness = () => {
     pick(0);
   }
 
-  async function renderAgents() {
+  // force: the rename form itself asks for the redraw (it closed). Otherwise an open rename form holds
+  // the list, so the fleet cycle's 2 s refresh never eats a handle being typed.
+  async function renderAgents(force = false) {
     const box = $('hcn-agents');
     if (!box) return;
+    if (!force && box.querySelector('form.cx-rename')) return;
     const { agents } = await api.agents();
     const live = agents.filter((a) => a.status === 'active');
     // On the dashboard the owner can tie an agent to a running fabric session (the join key is the session id).
@@ -530,7 +533,8 @@ export function mountCollab(root, { fabricSessions = null, onFreshness = () => {
       return list.map((x) => `<option value="${esc(x.session_id)}"${x.session_id === cur ? ' selected' : ''}>${esc(`${x.display_name || x.agent_role || 'agent'} · ${x.host_id || ''} · ${String(x.cwd || x.session_id).split('/').filter(Boolean).pop()}`)}</option>`).join('');
     };
     const knownSessions = new Set((sessions || []).map((session) => session.session_id));
-    box.innerHTML = live.length ? `<div class="hd-grid">${live.map((a) => `<div class="hd-card cx-stack cx-agentcard" data-agent-card="${esc(a.agent_id)}" tabindex="-1"${a.agent_id === linkedAgent ? ' style="outline:2px solid var(--accent);outline-offset:2px"' : ''}>
+    if (!force && box.querySelector('form.cx-rename')) return;   // a rename opened while we fetched
+    handOff(morph(box, live.length ? `<div class="hd-grid">${live.map((a) => `<div class="hd-card cx-stack cx-agentcard" data-key="${esc(a.agent_id)}" data-agent-card="${esc(a.agent_id)}" tabindex="-1"${a.agent_id === linkedAgent ? ' style="outline:2px solid var(--accent);outline-offset:2px"' : ''}>
         <div class="cx-row cx-row--between"><span class="hd-card__title">${agentTitle({ ...a, name: a.name || a.harness_type, display_name: sessions?.find(s=>s.session_id===a.instance_id)?.display_name }, true)}</span>${pill('Active', 'var(--status-ok)')}</div>
         <span class="hd-ident">${esc(a.harness_type)} · ${esc(a.agent_id)}</span>
         ${a.instance_id ? '<span class="hd-card__sub">Linked to a HerdR agent. The readable name is shared; the @ handle routes Collaboration tasks.</span>' : ''}
@@ -538,12 +542,12 @@ export function mountCollab(root, { fabricSessions = null, onFreshness = () => {
         <span class="hd-card__sub">Expires ${esc(new Date(a.expires_at * 1000).toLocaleDateString())} · ${a.rooms.length ? `in ${esc(a.rooms.map((r) => r.name).join(', '))}` : 'not in any room yet'}</span>
         ${sessions ? `<label class="cx-msg">Fabric agent <select data-link="${esc(a.agent_id)}"><option value="">not linked</option>${sessionOptions(a.instance_id)}</select></label>` : ''}
         <div><button type="button" class="hd-btn hd-btn--danger hd-btn--sm" data-revoke="${esc(a.agent_id)}">Revoke</button></div></div>`).join('')}</div>`
-      : '<div class="hd-empty">No connected agents yet.</div>';
+      : '<div class="hd-empty">No connected agents yet.</div>'));
     if (focusLinkedAgent) {
       const selected = [...box.querySelectorAll('[data-agent-card]')].find((card) => card.dataset.agentCard === linkedAgent);
       if (selected) { selected.focus({ preventScroll: true }); selected.scrollIntoView({ block: 'center' }); focusLinkedAgent = false; }
     }
-    wireRename(box, renderAgents);
+    wireRename(box, () => renderAgents(true));
     box.querySelectorAll('[data-link]').forEach((sel) => { sel.onchange = async () => { try { await api.linkAgent(sel.dataset.link, sel.value); } catch (e) { alert(e.message); } }; });
     box.querySelectorAll('[data-revoke]').forEach((b) => { b.onclick = async () => { await api.revokeAgent(b.dataset.revoke); renderAgents(); }; });
   }

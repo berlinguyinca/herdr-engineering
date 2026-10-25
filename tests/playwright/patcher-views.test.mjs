@@ -503,3 +503,36 @@ test('Collab people: a focused Remove button keeps its member when another membe
  assert.equal(await page.evaluate(()=>document.activeElement?.dataset.rm),'carol','the focused Remove button still removes carol');
  await page.evaluate(()=>window.collab.dispose());
 }));
+
+test('Collab agents: an open rename form survives the 2 s refresh during a fleet start',async()=>withPage(async(page,base)=>{
+ const m={agentReads:0,spawnReads:0};
+ await page.route('**/api/v1/collab/**',async route=>{
+  const url=new URL(route.request().url());const path=url.pathname.replace('/api/v1/collab','');
+  let body={};
+  if(path==='/config')body={client_id:'test',hosted_ui_domain:'test',public_url:'https://example.test',operator:{user_id:'owner',email:'owner@example.test'}};
+  else if(path==='/rooms')body={rooms:[{room_id:'room-one',name:'Review',role:'owner'}]};
+  else if(path==='/admin/users')body={users:[]};
+  else if(path==='/agents'){m.agentReads++;body={agents:[{agent_id:'agent_1',name:'coder',harness_type:'pi',status:'active',expires_at:1893456000,rooms:[]}]};}
+  else if(path==='/fleet/hosts')body={hosts:[]};
+  else if(path==='/fleet/spawns')m.spawnReads++,body={spawns:[{name_prefix:'fleet',harness_type:'pi',count:2,status:'requested',placements:[]}]};
+  else if(path==='/agents/join-tokens')body={tokens:[]};
+  await route.fulfill({json:body});
+ });
+ await page.goto(`${base}/__blank`);
+ await page.evaluate(async()=>{
+  document.body.innerHTML='<div id="host"></div>';
+  const {mountCollab}=await import('/collab-view.js');window.collab=mountCollab(document.querySelector('#host'));
+ });
+ await page.locator('[data-go="/agents"]').click();
+ await page.locator('#hcn-agents [data-rename="agent_1"]').click();
+ const input=page.locator('#hcn-agents form.cx-rename input');
+ await input.fill('renamed');
+ const cycles=m.spawnReads;
+ await until(()=>m.spawnReads>=cycles+2,'two fleet cycles (busy: every 2 s)',10000);
+ assert.equal(await input.count(),1,'the rename form is still open');
+ assert.equal(await input.inputValue(),'renamed','the typed handle is kept');
+ await page.locator('#hcn-agents form.cx-rename [data-x]').click();
+ await until(()=>page.locator('#hcn-agents form.cx-rename').count().then(n=>n===0),'cancel closes the form',4000);
+ assert.equal(await page.locator('#hcn-agents [data-rename="agent_1"]').count(),1,'the title is back');
+ await page.evaluate(()=>window.collab.dispose());
+}));
