@@ -1446,3 +1446,19 @@ def test_project_delta_rows_are_read_after_the_store_delta_so_a_new_item_is_neve
     delta = monitor.changes(kind="project_items", since=since, project_id=p1, start=False)
     assert added and added[0] in {row["item_id"] for row in delta["upserted"]}
     assert all(row["key"] != added[0] for row in delta["removed"])
+
+
+def test_without_an_allowlist_an_owner_no_longer_listed_loses_its_projects():
+    fake, p1, p2, p3 = projects_seeded()
+    shared = {}
+    monitor = monitor_for(fake, shared, projects=ON)
+    monitor.refresh()
+    assert p3 in {p["project_id"] for p in monitor.projects(start=False)["projects"]}
+    del fake.repos["other/tool"]  # the viewer no longer sees any repository of "other"
+    fake.log.clear()
+    monitor._retry_at = 0
+    monitor.refresh()
+    assert not [entry for entry in fake.log if entry[0] in {"projects", "items"} and "other" in str(entry[1])]
+    assert {p["project_id"] for p in monitor.projects(start=False)["projects"]} == {p1, p2}
+    stored = MemoryGitHubStore(identity="fingerprint-one", viewer="fixture-user", shared=shared).load()
+    assert set(stored.projects) == {p1, p2} and set(stored.project_items) == {p1, p2}

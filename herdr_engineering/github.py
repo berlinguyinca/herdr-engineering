@@ -1096,7 +1096,9 @@ class GitHubMonitor:
                     continue
                 if exc.reason in {"authentication", "capacity"}:
                     raise
-        self._sync_projects(provider, store, projects, self._project_owners(allow, owners), limited=limited is not None)
+        # the owner set is complete when it is the allowlist or comes from this pass's full listing
+        self._sync_projects(provider, store, projects, self._project_owners(allow, owners), limited=limited is not None,
+                            authoritative=bool(allow) or owners is not None)
         if limited is not None:
             raise limited  # the resume state stays: the next pass continues with the deferred
         if over_budget:
@@ -1207,7 +1209,7 @@ class GitHubMonitor:
                 target.apply_project(row, items, stored - {i["item_id"] for i in items}, watermark)
         self._write_projects(store, flush)
 
-    def _sync_projects(self, provider, store, settings, owners, *, limited):
+    def _sync_projects(self, provider, store, settings, owners, *, limited, authoritative=False):
         """List each in-scope owner's projects, then read the items of the projects whose
         (``updatedAt``, item count) probe changed or whose staggered full read is due.
 
@@ -1226,6 +1228,19 @@ class GitHubMonitor:
             return
         if self._projects_unsaved:
             self._flush_projects(store)
+        if authoritative:
+            # an owner out of scope (no longer listed, or dropped from the allowlist) keeps no
+            # projects: not in memory, not in the store
+            with self._lock:
+                self._check_generation()
+                gone_owners = {row["owner"] for row in self._projects.values()} - set(owners)
+                for pid in [pid for pid, row in self._projects.items() if row["owner"] in gone_owners]:
+                    for table in self._project_tables():
+                        table.pop(pid, None)
+                if gone_owners:
+                    self._touch()
+            if gone_owners:
+                self._write_projects(store, lambda target: target.replace_projects([], gone_owners))
         errors, listed, deferred, limit_hit = [], {}, [], None
         for owner in owners:
             if self._stop.is_set():
