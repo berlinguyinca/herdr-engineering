@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   EDGE_STYLE, MAX_RENDER_NODES, buildGantt, filterGraph, fmtDuration, layoutGraph, mergePages, nextNode,
-  renderGanttSvg, focusKey, focusSelector, renderGanttTable, renderGraphSvg, renderGraphTable, renderInspector, renderLineage, renderReplay,
+  renderGanttSvg, renderGanttTable, renderGraphSvg, renderGraphTable, renderInspector, renderLineage, renderReplay,
   nodeLabel, replayTarget, replayText, shapeOf, stateLook,
 } from '../collab-lineage.js';
 
@@ -262,23 +262,6 @@ test('the lineage calls are one room, read-only GETs on the collab route', async
   assert.equal(calls[3][1], '/api/v1/collab/graph/lineage?room_id=room+1&at=2026-10-22T10%3A00%3A00Z&limit=200');
   assert.equal(calls[4][1], '/api/v1/collab/graph/lineage/timeline?room_id=room+1&step=7');
   assert.equal(calls[5][1], '/api/v1/collab/graph/lineage/events?room_id=room+1&limit=100&cursor=200');
-});
-
-test('focus keys round-trip to a selector for every control kind', () => {
-  const el = (a) => ({ getAttribute: (k) => (k in a ? a[k] : null) });
-  for (const [attrs, key, sel] of [
-    [{ 'data-replay': 'prev' }, 'replay:prev', '[data-replay="prev"]'],
-    [{ 'data-node': 'task:a"b' }, 'node:task:a"b', '[data-node="task:a\\"b"]'],
-    [{ 'data-view': 'gantt' }, 'view:gantt', '[data-view="gantt"]'],
-    [{ 'data-mode': 'table' }, 'mode:', '[data-mode]'],
-    [{ 'data-filter': 'type', value: 'task' }, 'filter:type:task', '[data-filter="type"][value="task"]'],
-    [{ 'data-filter': 'q' }, 'filter:q:', '[data-filter="q"]'],
-    [{ 'data-clock': '' }, 'clock:', '[data-clock]'],
-    [{ 'data-more': '1' }, 'more:', '[data-more]'],
-    [{ 'data-retry': '1' }, 'retry:', '[data-retry]'],
-  ]) { assert.equal(focusKey(el(attrs)), key); assert.equal(focusSelector(key), sel); }
-  assert.equal(focusKey(el({})), null);
-  assert.equal(focusSelector('nonsense:x'), null);
 });
 
 test('an error still renders the replay controls and a Retry button; no false "will be retried" claim', () => {

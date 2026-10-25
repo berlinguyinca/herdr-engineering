@@ -339,3 +339,62 @@ test('Reviews: identical refresh writes nothing; one changed review rewrites onl
  assert.equal(result.focus,'SUMMARY','focus stays on the summary');
  assert.equal(await page.locator('[data-ig-search]').inputValue(),'review','typed search survives');
 }));
+
+// ---------------------------------------------------------------- Collaboration room
+// The real collab-view.js over a mocked collab API whose room state always reports "changed", so
+// every long-poll round re-applies the same data (as a live event's re-ask does).
+test('Collab: repeated identical room state writes nothing; one changed task rewrites only its row; refresh re-asks the room',async()=>withPage(async(page,base)=>{
+ const T='2026-10-23T10:00:00+00:00';
+ const task=(id,status)=>({task_id:id,target_agent_id:'agent_1',target_name:'coder',text:`Task ${id}`,status,created_at:T});
+ const m={tasks:[task('t1','pending'),task('t2','pending')],reads:0};
+ await page.route('**/api/v1/collab/**',async route=>{
+  const url=new URL(route.request().url());const path=url.pathname.replace('/api/v1/collab','');
+  let body={};
+  if(path==='/config')body={client_id:'test',hosted_ui_domain:'test',public_url:'https://example.test',operator:{user_id:'owner',email:'owner@example.test'}};
+  else if(path==='/rooms')body={rooms:[{room_id:'room-one',name:'Review',role:'owner'}]};
+  else if(path==='/admin/users')body={users:[]};
+  else if(path==='/rooms/room-one')body={room_id:'room-one',name:'Review',role:'owner',members:[]};
+  else if(path==='/rooms/room-one/state'){
+   m.reads++;await new Promise(r=>setTimeout(r,100));
+   const cursor=Number(url.searchParams.get('cursor')||0);
+   body={changed:true,seq:1,next_cursor:1,agents:[{agent_id:'agent_1',name:'coder',harness_type:'pi',owner_user_id:'owner',actions:['execute']}],tasks:structuredClone(m.tasks),
+    events:cursor<1?[{sequence:1,event_id:'e1',event_type:'message',created_at:T,room_id:'room-one',sender:{type:'user',id:'bob',owner_user_id:'bob'},text:'first'}]:[],flow:{nodes:[],edges:[],tasks:[]}};
+  }
+  await route.fulfill({json:body});
+ });
+ await page.goto(`${base}/__blank`);
+ await page.evaluate(async()=>{
+  document.documentElement.dataset.calm='off';
+  await Promise.all(['/motion.css','/collab.css'].map(href=>new Promise(resolve=>{const link=document.createElement('link');link.rel='stylesheet';link.href=href;link.onload=resolve;document.head.append(link);})));
+  document.body.innerHTML='<div id="host"></div>';
+  const {mountCollab}=await import('/collab-view.js');window.collab=mountCollab(document.querySelector('#host'));
+ });
+ await page.locator('[data-room="room-one"]').click();
+ await page.locator('#hcn-log .cx-m').first().waitFor();
+ await page.locator('[data-sub="tasks"]').click();
+ await until(()=>page.locator('#hcn-tasks li').count().then(n=>n===2),'task rows');
+ await sleep(400);
+ const watch=()=>page.evaluate(()=>{
+  window.__muts=[];window.__obs?.disconnect();
+  window.__obs=new MutationObserver(rs=>window.__muts.push(...rs));
+  window.__obs.observe(document.getElementById('host'),{subtree:true,childList:true,attributes:true,characterData:true});
+  window.__rows=[...document.querySelectorAll('#hcn-tasks li')];
+ });
+ const outside=sel=>page.evaluate(sel=>{const box=sel&&document.querySelector(sel);return window.__muts.filter(r=>!box||!box.contains(r.target)).map(r=>`${r.type}:${r.attributeName||''}:${(r.target.nodeType===1?r.target:r.target.parentElement)?.outerHTML.slice(0,80)}`);},sel);
+
+ await watch();
+ const before=m.reads;
+ await sleep(1200);
+ assert.ok(m.reads>before+2,'the room re-applied its state several times');
+ assert.deepEqual(await outside(null),[],'identical room state performs no DOM writes');
+
+ m.tasks[1].status='accepted';
+ await until(()=>page.locator('#hcn-tasks li[data-key="t2"]').innerText().then(t=>/accepted/i.test(t)),'changed task');
+ await sleep(300);
+ assert.equal(await page.evaluate(()=>[...document.querySelectorAll('#hcn-tasks li')].every((n,i)=>n===window.__rows[i])),true,'task rows keep their nodes');
+ assert.deepEqual(await outside('#hcn-tasks li[data-key="t2"]'),[],'nothing outside the changed task was written');
+
+ assert.equal(typeof (await page.evaluate(()=>typeof window.collab.refresh)),'string');
+ assert.equal(await page.evaluate(()=>typeof window.collab.refresh),'function','collab registers a refresh with the bus');
+ await page.evaluate(()=>window.collab.dispose());
+}));

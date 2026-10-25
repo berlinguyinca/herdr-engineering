@@ -58,8 +58,9 @@ It may add `interests: ['EventType', …]`.
 - `dispose()` stops the view's timers and requests. The router calls it on the next route change.
 - A view function that returns nothing (an error or not-found page) is retried in place on the
   next event.
-- A dashboard that polls its own data wraps itself in `ownPolling(view)`. SSE then leaves its
-  filters and focus alone.
+- A dashboard that polls its own data keeps its timer and returns its own `{refresh, dispose}`:
+  a live event re-reads its sources at once. Its panels patch in place (`morph`/`patchList`), so
+  filters, focus and open disclosures survive; a refresh never shows a loader.
 - `liveRefresher(load, apply, chip)` (`refresh-bus.js`) is the usual body for `refresh`. It
   fetches with `load(hint)` and applies the result unless the view was disposed meanwhile. A
   refresh requested mid-flight runs once more afterwards. A failure keeps the page and turns the
@@ -104,7 +105,8 @@ drops the text selection.
     a search default) sets `open` itself after the morph.
   - A node the fresh markup no longer has, but that holds focus or the selection, stays. `morph`
     returns these stranded nodes; `handOff(stranded, fallback)` moves focus to `fallback(node)` and
-    removes them, so a row that left does not linger while focused.
+    removes them, so a row that left does not linger while focused. Without a fallback, focus returns
+    to the document, as a wholesale replace did.
 
 ### Motion (`motion.js`, `motion.css`)
 

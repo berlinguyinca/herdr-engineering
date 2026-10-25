@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { ACTION_LABEL, STATUS_LOOK, commentBody, freshDraft, proposalBody, renderDiscussion, renderSteering, renderWorkbench, statusLook } from '../collab-workbench.js';
-import { focusKey, focusSelector, renderInspector, renderLineage } from '../collab-lineage.js';
+import { renderInspector, renderLineage } from '../collab-lineage.js';
 
 const HOSTILE = '<img src=x onerror="window.__xss=1">"onmouseover="x\'><script>alert(1)</script>';
 const comment = (extra = {}) => ({ kind: 'comment', trust: 'untrusted', comment_id: 'collab_1', room_id: 'r', anchor: { kind: 'node', node_id: 'attempt:a1' }, author: { type: 'user', id: 'bob' },
@@ -123,12 +123,6 @@ test('the lineage inspector offers per-link discussion and the panel hosts the w
   assert.ok(panel.includes('Comments and steering') && panel.includes('aria-label="Inspector"'));
 });
 
-test('focus keys survive a re-render for workbench controls', () => {
-  const el = (attrs) => ({ getAttribute: (k) => (k in attrs ? attrs[k] : null) });
-  assert.equal(focusKey(el({ 'data-wb-field': 'comment' })), 'wbf:comment:');
-  assert.equal(focusSelector('wbf:comment:'), '[data-wb-field="comment"]');
-  assert.equal(focusSelector(focusKey(el({ 'data-wb-field': 'action', value: 'redirect' }))), '[data-wb-field="action"][value="redirect"]');
-  assert.equal(focusSelector(focusKey(el({ 'data-wb-act': 'edit', 'data-wb-id': 'collab_1' }))), '[data-wb-act="edit"][data-wb-id="collab_1"]');
-  assert.equal(focusSelector(focusKey(el({ 'data-wb-act': 'confirm-cancel' }))), '[data-wb-act="confirm-cancel"]');
+test('every workbench action has a label', () => {
   assert.ok(ACTION_LABEL.pause);
 });

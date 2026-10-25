@@ -115,8 +115,6 @@ const ROUTES = {
 // View contract: a view* function may return {refresh(hint), dispose()}; one that
 // returns nothing (an error or not-found page) is retried in place by rerenderView.
 const NO_REFRESH = { refresh() {}, dispose() {} };
-// These dashboards own their polling; SSE must preserve their filters and focus.
-const ownPolling = (view) => ({ refresh() {}, dispose: () => view.dispose() });
 
 // Same throttle as before: SSE-driven refreshes re-fetch view data, so at most
 // one per LIVE_REFRESH_MS per view keeps clear of the API's per-IP rate limit.
@@ -241,10 +239,11 @@ async function viewCollab() {
   // The chip sits outside the collab root: collab redraws its whole frame on every page change.
   root.innerHTML = `${liveHead('', 30000)}<div id="collab-root">${skeleton('collaboration', { rows: 8, height: 64 })}</div>`;
   const chip = chipIn(root);
-  return ownPolling(mountCollab(document.getElementById('collab-root'), {
+  // The open room long-polls; live events make it re-ask at once.
+  return mountCollab(document.getElementById('collab-root'), {
     fabricSessions: () => client.listSessions('active'),
     onFreshness: (ok, message) => chip()?.touch(ok, message),
-  }));
+  });
 }
 
 async function viewGithub() {

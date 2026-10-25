@@ -2,13 +2,14 @@
 // people by email. Remote messages use the shared safe Markdown renderer.
 import { escapeHtml as esc } from './herdr-web-components/util.js';
 import { enter, isCalm } from './motion.js';
+import { morph, handOff, patchAttr, patchText } from './patch.js';
 import { bundleScript, filesFromBulk, shq, workerScript } from './collab-scripts.js';
 import { renderFlow } from './collab-flow.js';
 import { renderLinks } from './collab-links.js';
 import { buildTabsPanes, nextTab, renderTabsPanes } from './collab-tabs.js';
 import { decisionBody, delegationBody, renderDelegations, renderProposalList, renderReview } from './collab-proposals.js';
 import {
-  filterGraph, focusKey, focusSelector, layoutGraph, mergePages, nextNode, renderLineage, replayTarget,
+  filterGraph, layoutGraph, mergePages, nextNode, renderLineage, replayTarget,
 } from './collab-lineage.js';
 import { answerBody, askBody, contextBody, declineBody, linkBody, renderContextChip, renderContextPanel, renderInbox } from './collab-context.js';
 import { ackBody, renderAnalytics, renderInbox as renderAttention, renderProgress, restoreBody, snoozeBody } from './collab-attention.js';
@@ -102,6 +103,7 @@ const GUIDE = `<div class="hd-card">
 export function mountCollab(root, { fabricSessions = null, onFreshness = () => {} } = {}) {
   ensureConversationStyles(root.ownerDocument);
   let teardown = null;      // stops the open room's live loop
+  let poke = null;          // re-asks the open room's live loop now (a live event elsewhere hinted at news)
   let cursor = 0;
   let lastCfg = null;
   let me = null;
@@ -430,8 +432,7 @@ export function mountCollab(root, { fabricSessions = null, onFreshness = () => {
     let hosts;
     try { hosts = (await api.fleetHosts()).hosts; } catch { return; }
     const html = hosts.length ? `<ul class="cx-list">${hosts.map((h) => `<li><span class="grow"><b>${esc(h.host)}</b> ${pill(h.online ? 'online' : 'offline', h.online ? 'var(--status-ok)' : 'var(--text-muted)')}${h.kind === 'local' ? ' <span class="hd-ident">this machine</span>' : ''}${h.online ? ` <span class="hd-ident">${h.families && h.families.length ? esc(h.families.join(', ')) : 'no agent CLIs found'}</span>` : ''}</span><label class="cx-check"><input type="checkbox" data-auto="${esc(h.host)}"${h.auto_agents ? ' checked' : ''}> Automatic agents</label></li>`).join('')}</ul>` : '<div class="hd-empty">No hosts reported yet. The host runner reports every few seconds.</div>';
-    if (box.dataset.h === html) return;
-    box.dataset.h = html; box.innerHTML = html;
+    morph(box, html);                         // unchanged hosts write nothing; a toggled box keeps focus
     box.querySelectorAll('[data-auto]').forEach((c) => { c.onchange = async () => { try { await api.setFleetHost(c.dataset.auto, c.checked); } catch (e) { alert(e.message); } renderHosts(); }; });
   }
   async function renderSpawns() {
@@ -442,7 +443,7 @@ export function mountCollab(root, { fabricSessions = null, onFreshness = () => {
     const busy = list.some((s) => ['requested', 'claimed'].includes(s.status));
     const colour = { requested: 'var(--status-attention)', claimed: 'var(--accent)', done: 'var(--status-ok)', stalled: 'var(--status-failed)', expired: 'var(--text-muted)' };
     const html = list.length ? `<h3>Recent fleet starts</h3><ul class="cx-list">${list.map((s) => `<li><span class="grow"><b>${esc(s.name_prefix)}-N</b> ${esc(s.harness_type)} × ${s.count}${s.error ? `<br><span class="cx-msg" role="alert">${esc(s.error)}</span>` : ''}${s.placements.length ? `<br>${s.placements.map((p) => `<span class="hd-ident" title="${esc(p.error || '')}">${esc(p.name)} → ${esc(p.host)}${p.status === 'failed' ? ' ✗' : ''}</span>`).join(' ')}` : ''}</span>${pill(s.status === 'done' && s.placements.some((p) => p.status === 'failed') ? 'partly started' : s.status, colour[s.status] || 'var(--text-muted)')}</li>`).join('')}</ul>` : '';
-    if (box.dataset.h !== html) { box.dataset.h = html; box.innerHTML = html; }
+    morph(box, html);
     return busy;
   }
 
@@ -647,20 +648,26 @@ export function mountCollab(root, { fabricSessions = null, onFreshness = () => {
     const stale = new Set();               // panels whose redraw was held back because you were typing in them
     const onVisible = () => { if (!document.hidden) { since = -1; if (wake) { wake(); wake = null; } } };
     document.addEventListener('visibilitychange', onVisible);
-    teardown = () => { alive = false; composer?.dispose(); unbindHelpers(); ctl?.abort(); document.removeEventListener('visibilitychange', onVisible); if (wake) wake(); };
+    teardown = () => { alive = false; poke = null; composer?.dispose(); unbindHelpers(); ctl?.abort(); document.removeEventListener('visibilitychange', onVisible); if (wake) wake(); };
+    poke = () => { ctl?.abort(); };       // the loop re-asks from the same position: unchanged rooms write nothing
     const kick = () => { since = -1; ctl?.abort(); };       // an action just happened: refetch now
 
-    // Replace a container's markup only when it changed and you are not typing in it.
+    // Patch a container (morph) when its markup changed and you are not typing in it: unchanged
+    // rows, focus, scroll and open disclosures keep their nodes. The panel is held while you type
+    // because morph would reset another, unfocused field of the same form. Returns whether it patched,
+    // so a caller binds handlers on any new controls.
+    const shown = new Map();
+    const forget = (id) => { shown.delete(id); };
     const put = (id, html) => {
       const el = $(id);
-      if (!el || el.dataset.h === html) return false;
+      if (!el || (shown.get(id) === html && el.firstChild)) return false;
       if (el.contains(document.activeElement) && document.activeElement.matches('input,textarea,select')) { stale.add(id); return false; }
-      el.dataset.h = html; el.innerHTML = html; stale.delete(id);
+      shown.set(id, html); handOff(morph(el, html)); stale.delete(id);
       return true;
     };
     root.addEventListener('focusout', () => setTimeout(() => { if (stale.size && alive) paint(); }, 0));
     // after an inline edit the panel's markup no longer matches what `put` remembers: forget it and refetch
-    const redraw = (id) => () => { const el = $(id); if (el) delete el.dataset.h; stale.delete(id); kick(); };
+    const redraw = (id) => () => { forget(id); stale.delete(id); kick(); };
 
     // ---- chat
     let lastKey = null;
@@ -731,7 +738,7 @@ export function mountCollab(root, { fabricSessions = null, onFreshness = () => {
     const namedAgent = a => ({...a,display_name:S.flow?.nodes?.find(n=>n.agent_id===a.agent_id)?.fabric?.display_name});
     const drawRoomAgents = () => {
       const mine = new Set(S.mine.map((a) => a.agent_id));
-      const html = S.agents.length ? `<ul class="cx-list">${S.agents.map((a) => `<li class="cx-agentrow"><span class="grow">${agentTitle(namedAgent(a), mine.has(a.agent_id) || operator)}<span class="cx-sub1">${esc(a.harness_type)} · ${esc(names.get(a.owner_user_id) || shortId(a.owner_user_id))}</span></span><span class="cx-pills">${permPills(a.actions)}</span>${(canInvite || mine.has(a.agent_id)) ? `<button type="button" class="hd-btn hd-btn--danger hd-btn--sm" data-rmagent="${esc(a.agent_id)}">Remove</button>` : ''}</li>`).join('')}</ul>` : '<div class="hd-empty">No agents in this room yet.</div>';
+      const html = S.agents.length ? `<ul class="cx-list">${S.agents.map((a) => `<li class="cx-agentrow" data-key="${esc(a.agent_id)}"><span class="grow">${agentTitle(namedAgent(a), mine.has(a.agent_id) || operator)}<span class="cx-sub1">${esc(a.harness_type)} · ${esc(names.get(a.owner_user_id) || shortId(a.owner_user_id))}</span></span><span class="cx-pills">${permPills(a.actions)}</span>${(canInvite || mine.has(a.agent_id)) ? `<button type="button" class="hd-btn hd-btn--danger hd-btn--sm" data-rmagent="${esc(a.agent_id)}">Remove</button>` : ''}</li>`).join('')}</ul>` : '<div class="hd-empty">No agents in this room yet.</div>';
       if (put('hcn-roomagents', html)) { $('hcn-roomagents').querySelectorAll('[data-rmagent]').forEach((b) => { b.onclick = () => act(() => api.removeAgent(roomId, b.dataset.rmagent)); }); wireRename($('hcn-roomagents'), redraw('hcn-roomagents')); }
     };
     const drawTaskTargets = () => {
@@ -739,7 +746,7 @@ export function mountCollab(root, { fabricSessions = null, onFreshness = () => {
       put('hcn-task-target', can.length ? can.map((a) => `<option value="${esc(a.agent_id)}">${esc(namedAgent(a).display_name || `@${a.name}`)}</option>`).join('') : '<option value="">No agent accepts tasks yet</option>');
     };
     const drawTasks = () => {
-      const html = S.tasks.length ? `<ul class="cx-list">${S.tasks.slice(0, 30).map((t) => `<li><span class="grow"><b>@${esc(t.target_name || shortId(t.target_agent_id))}</b> ${esc(t.text)}${t.result ? `<br><span class="hd-ident">→ ${esc(t.result)}</span>` : ''}</span>${taskChip(t.status)}${(['pending', 'accepted'].includes(t.status) && canPost) ? `<button type="button" class="hd-btn hd-btn--ghost hd-btn--sm" data-cancel-task="${esc(t.task_id)}">Cancel</button>` : ''}</li>`).join('')}</ul>` : '<div class="hd-empty">No tasks yet.</div>';
+      const html = S.tasks.length ? `<ul class="cx-list">${S.tasks.slice(0, 30).map((t) => `<li data-key="${esc(t.task_id)}"><span class="grow"><b>@${esc(t.target_name || shortId(t.target_agent_id))}</b> ${esc(t.text)}${t.result ? `<br><span class="hd-ident">→ ${esc(t.result)}</span>` : ''}</span>${taskChip(t.status)}${(['pending', 'accepted'].includes(t.status) && canPost) ? `<button type="button" class="hd-btn hd-btn--ghost hd-btn--sm" data-cancel-task="${esc(t.task_id)}">Cancel</button>` : ''}</li>`).join('')}</ul>` : '<div class="hd-empty">No tasks yet.</div>';
       if (put('hcn-tasks', html)) $('hcn-tasks').querySelectorAll('[data-cancel-task]').forEach((b) => { b.onclick = () => act(() => api.cancelTask(roomId, b.dataset.cancelTask)); });
       drawTaskTargets();
     };
@@ -854,8 +861,8 @@ export function mountCollab(root, { fabricSessions = null, onFreshness = () => {
         const html = `<ul class="cx-list">${room.members.map((m) => `<li><span class="grow">${esc(m.email || shortId(m.user_id))}</span>${pill(roleLabel(m.role), m.role === 'owner' ? 'var(--accent)' : 'var(--status-active)')}${m.role !== 'owner' ? `<button type="button" class="hd-btn hd-btn--danger hd-btn--sm" data-rm="${esc(m.user_id)}">Remove</button>` : ''}</li>`).join('')}
           ${inv.invites.map((i) => `<li><span class="grow">${esc(i.email)}</span>${pill('Invited', 'var(--status-attention)')}<button type="button" class="hd-btn hd-btn--ghost hd-btn--sm" data-cancel="${esc(i.invite_id)}">Cancel</button></li>`).join('')}</ul>`;
         if (put('hcn-people', html)) {
-          $('hcn-people').querySelectorAll('[data-rm]').forEach((b) => { b.onclick = () => act(async () => { await api.removeMember(roomId, b.dataset.rm); $('hcn-people').dataset.h = ''; }); });
-          $('hcn-people').querySelectorAll('[data-cancel]').forEach((b) => { b.onclick = () => act(async () => { await api.cancelInvite(roomId, b.dataset.cancel); $('hcn-people').dataset.h = ''; }); });
+          $('hcn-people').querySelectorAll('[data-rm]').forEach((b) => { b.onclick = () => act(async () => { await api.removeMember(roomId, b.dataset.rm); forget('hcn-people'); }); });
+          $('hcn-people').querySelectorAll('[data-cancel]').forEach((b) => { b.onclick = () => act(async () => { await api.cancelInvite(roomId, b.dataset.cancel); forget('hcn-people'); }); });
         }
       } catch { /* keep what is shown */ } finally { peopleBusy = false; }
     };
@@ -882,20 +889,20 @@ export function mountCollab(root, { fabricSessions = null, onFreshness = () => {
         if (!box) return;
         const pend = (S.externals && S.externals.invites) || [];
         put('hcn-ext-invites', pend.length ? `<ul class="cx-list" aria-label="Open remote-agent invites">${pend.map((i) => `<li><span class="grow"><b>${esc(i.label)}</b> <span class="cx-msg">invited, not yet used · may ${esc((i.actions || []).join(', '))}${i.lineage ? ', report lineage' : ''}</span></span>${pill('Invited', 'var(--status-attention)')}<button type="button" class="hd-btn hd-btn--ghost hd-btn--sm" data-cancel-ext="${esc(i.invite_id)}">Cancel</button></li>`).join('')}</ul>` : '');
-        $('hcn-ext-invites')?.querySelectorAll('[data-cancel-ext]').forEach((b) => { b.onclick = () => act(async () => { await api.revokeExternalInvite(roomId, b.dataset.cancelExt); S.tabsAt = 0; $('hcn-ext-invites').dataset.h = ''; }); });
+        $('hcn-ext-invites')?.querySelectorAll('[data-cancel-ext]').forEach((b) => { b.onclick = () => act(async () => { await api.revokeExternalInvite(roomId, b.dataset.cancelExt); S.tabsAt = 0; forget('hcn-ext-invites'); }); });
         if (put('hcn-tabs', renderTabsPanes(S.tabs || { tabs: [], hidden_by_grant: 0 }, S.tabSel, { canManage: canInvite }))) {
           const ids = (S.tabs?.tabs || []).map((t) => t.agent_id);
           box.querySelectorAll('[data-revoke]').forEach((b) => {
             b.onclick = () => {
               if (!window.confirm('Revoke this remote agent? It is cut off at once; what it already did stays visible.')) return;
-              act(async () => { await api.revokeExternal(roomId, b.dataset.revoke); S.tabsAt = 0; box.dataset.h = ''; });
+              act(async () => { await api.revokeExternal(roomId, b.dataset.revoke); S.tabsAt = 0; forget('hcn-tabs'); });
             };
           });
           box.querySelectorAll('[data-tab]').forEach((b) => {
-            b.onclick = () => { S.tabSel = b.dataset.tab; box.dataset.h = ''; drawTabs(); };
+            b.onclick = () => { S.tabSel = b.dataset.tab; forget('hcn-tabs'); drawTabs(); };
             b.onkeydown = (e) => {
               const to = nextTab(ids, b.dataset.tab, e.key);
-              if (to) { e.preventDefault(); S.tabSel = to; box.dataset.h = ''; drawTabs(); box.querySelector(`[data-tab="${CSS.escape(to)}"]`)?.focus(); }
+              if (to) { e.preventDefault(); S.tabSel = to; forget('hcn-tabs'); drawTabs(); box.querySelector(`[data-tab="${CSS.escape(to)}"]`)?.focus(); }
             };
           });
         }
@@ -919,10 +926,10 @@ export function mountCollab(root, { fabricSessions = null, onFreshness = () => {
         const targets = ((S.externals && S.externals.externals) || []).filter((x) => x.proposals && x.state === 'active');
         put('hcn-deleg-target', targets.length ? targets.map((x) => `<option value="${esc(x.agent_id)}">${esc(x.label)}</option>`).join('') : '<option value="">No remote agent was invited for bounded tasks</option>');
         if (put('hcn-delegs', renderDelegations(S.deleg))) {
-          $('hcn-delegs').querySelectorAll('[data-cancel-deleg]').forEach((b) => { b.onclick = () => act(async () => { await api.cancelDelegation(roomId, b.dataset.cancelDeleg); $('hcn-delegs').dataset.h = ''; }); });
+          $('hcn-delegs').querySelectorAll('[data-cancel-deleg]').forEach((b) => { b.onclick = () => act(async () => { await api.cancelDelegation(roomId, b.dataset.cancelDeleg); forget('hcn-delegs'); }); });
         }
         if (put('hcn-props', renderProposalList(S.props, S.propSel))) {
-          $('hcn-props').querySelectorAll('[data-proposal]').forEach((b) => { b.onclick = () => { S.propSel = b.dataset.proposal; $('hcn-props').dataset.h = ''; $('hcn-review').dataset.h = ''; loadProposals().then(show); }; });
+          $('hcn-props').querySelectorAll('[data-proposal]').forEach((b) => { b.onclick = () => { S.propSel = b.dataset.proposal; forget('hcn-props'); forget('hcn-review'); loadProposals().then(show); }; });
         }
         if (put('hcn-review', renderReview(S.propOne))) {
           $('hcn-review').querySelectorAll('[data-decide]').forEach((b) => {
@@ -930,7 +937,7 @@ export function mountCollab(root, { fabricSessions = null, onFreshness = () => {
               const ask = b.dataset.decide === 'accept' ? 'Record this proposal in the graph as accepted? Nothing is applied or run.' : 'Reject this proposal?';
               if (!window.confirm(ask)) return;
               await api.decideProposal(roomId, b.dataset.pid, decisionBody(b.dataset.decide, b.dataset.digest, ($('hcn-prop-reason') || {}).value));
-              ['hcn-props', 'hcn-review', 'hcn-delegs'].forEach((id) => { $(id).dataset.h = ''; });
+              ['hcn-props', 'hcn-review', 'hcn-delegs'].forEach(forget);
               await loadProposals();
             });
           });
@@ -1019,7 +1026,7 @@ export function mountCollab(root, { fabricSessions = null, onFreshness = () => {
         });
       }
       const html = renderInbox({ ...ctxModel(), enabled: CTX.features.consultation });
-      if (h.dataset.h !== html) { h.dataset.h = html; h.innerHTML = html; }
+      handOff(morph(h, html));
     }
     const LIN = { step: null, view: 'graph', mode: 'visual', clock: 'recorded', sel: null, focus: null, pages: [], total: 0, next: null,
       truncated: null, asOf: null, timeline: null, error: null, timelineError: null, html: '', pending: null, fails: 0, notice: null, busy: false, at: 0, seq: 0, bound: false, layout: null,
@@ -1157,14 +1164,8 @@ export function mountCollab(root, { fabricSessions = null, onFreshness = () => {
       LIN.layout = layoutGraph(m.filtered);
       const html = renderLineage(m);
       drawConsults();
-      if (LIN.html === html && box.innerHTML !== '') return;
-      const a = document.activeElement;
-      const key = a && box.contains(a) ? focusKey(a) : null;
-      const pos = key && typeof a.selectionStart === 'number' ? a.selectionStart : null;
-      LIN.html = html; box.innerHTML = html;
-      const sel = key && focusSelector(key);
-      const el = sel && box.querySelector(sel);
-      if (el) { el.focus({ preventScroll: true }); if (pos !== null && el.setSelectionRange && (el.type === 'search' || el.type === 'textarea' || el.type === 'text')) try { el.setSelectionRange(pos, pos); } catch { /* not selectable */ } }
+      // Morphed: focus, the caret and typed text stay with their nodes; handlers are delegated (bindLineage).
+      LIN.html = html; handOff(morph(box, html));
     }
     function bindLineage(box) {
       LIN.bound = true;
@@ -1289,7 +1290,7 @@ export function mountCollab(root, { fabricSessions = null, onFreshness = () => {
       put('hcn-progress', renderProgress({ data: ATT.prog, error: ATT.progError }));
       put('hcn-analytics', renderAnalytics({ data: ATT.stats, error: ATT.statsError }));
     }
-    const setBadge = (k, n) => { const b = $(`hcn-b-${k}`); if (!b) return; b.hidden = !n; b.textContent = n > 99 ? '99+' : String(n); };
+    const setBadge = (k, n) => { const b = $(`hcn-b-${k}`); if (!b) return; patchAttr(b, 'hidden', !n); patchText(b, n > 99 ? '99+' : String(n)); };
     const loadMine = async () => { try { S.mine = (await api.agents()).agents.filter((x) => !x.external); }   // a remote agent is bound to its invite: nothing to grant
        catch { /* keep the old list */ } };
     function paint() {
@@ -1399,7 +1400,7 @@ export function mountCollab(root, { fabricSessions = null, onFreshness = () => {
         try {
           await api.invite(roomId, f.get('email'), f.get('role'));
           msg.textContent = 'Invited. They get access when they sign in here.';
-          ev.target.reset(); $('hcn-people').dataset.h = ''; paintPanel();
+          ev.target.reset(); forget('hcn-people'); paintPanel();
         } catch (e) { msg.textContent = e.message; }
       };
     }
@@ -1419,7 +1420,7 @@ export function mountCollab(root, { fabricSessions = null, onFreshness = () => {
           box.innerHTML = `<div class="cx-msg">Give this one-time code to your coworker. It is shown only now, works once and expires ${esc(new Date(out.expires_at * 1000).toISOString())}.</div>`
             + `<code class="cx-code" id="hcn-ext-codeval" tabindex="0">${esc(out.code)}</code>`
             + `<div class="cx-msg">Their bridge redeems it with <code>POST /api/v1/collab/agents/join</code> (<code>{"token": "…"}</code>) and then reports with the credential it receives. See docs/operations/external-agents.md.</div>`;
-          ev.target.reset(); S.tabsAt = 0; $('hcn-ext-invites').dataset.h = ''; drawTabs();
+          ev.target.reset(); S.tabsAt = 0; forget('hcn-ext-invites'); drawTabs();
         } catch (e) { msg.textContent = e.message; box.textContent = ''; }
       };
     }
@@ -1434,7 +1435,7 @@ export function mountCollab(root, { fabricSessions = null, onFreshness = () => {
             target: f.get('target'), text: f.get('text'), paths: f.get('paths'), nodes: f.get('nodes'), questions: f.get('questions'),
             kinds: f.getAll('kind'), maxProposals: f.get('maxProposals'), maxSteps: f.get('maxSteps'), maxBytes: f.get('maxBytes'), expires: f.get('expires') }));
           msg.textContent = 'Delegated.';
-          ev.target.reset(); $('hcn-delegs').dataset.h = ''; drawProposals();
+          ev.target.reset(); forget('hcn-delegs'); drawProposals();
         } catch (e) { msg.textContent = e.message; }
       };
     }
@@ -1443,5 +1444,7 @@ export function mountCollab(root, { fabricSessions = null, onFreshness = () => {
 
   if (standalone) window.addEventListener('hashchange', onHash);
   start();
-  return { dispose: () => { dispose(); window.removeEventListener('hashchange', onHash); } };
+  // refresh: the dashboard's refresh bus. The open room's long-poll is already live; an event only
+  // makes it re-ask at once. Lists outside a room are left alone (no remount, no loader).
+  return { refresh: () => { poke?.(); }, dispose: () => { dispose(); window.removeEventListener('hashchange', onHash); } };
 }

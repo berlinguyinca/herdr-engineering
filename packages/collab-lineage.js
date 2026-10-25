@@ -248,7 +248,7 @@ export function renderGraphSvg(graph, layout, { sel = null, focus = null, match 
     const on = n.id === sel ? ' lin-node--sel' : '';
     const nb = sel && n.id !== sel && !neighbours.has(n.id) ? ' lin-dim' : '';
     const hit = match.has(n.id) ? ' lin-node--hit' : '';
-    return `<g class="lin-node lin-node--${esc(look.kind)}${on}${nb}${hit}" role="button" tabindex="${n.id === tabId ? 0 : -1}" data-node="${esc(n.id)}" aria-pressed="${n.id === sel}" aria-label="${esc(nodeLabel(n, layout.degree.get(n.id)))}">`
+    return `<g class="lin-node lin-node--${esc(look.kind)}${on}${nb}${hit}" data-key="${esc(n.id)}" role="button" tabindex="${n.id === tabId ? 0 : -1}" data-node="${esc(n.id)}" aria-pressed="${n.id === sel}" aria-label="${esc(nodeLabel(n, layout.degree.get(n.id)))}">`
       + `${nodeShape(p, 'lin-box')}`
       + `<text class="lin-name" x="${p.x + 16}" y="${p.y + 18}"><tspan aria-hidden="true">${look.glyph} </tspan>${esc(clip(text(n.label, idTail(n.id)), 22))}</text>`
       + `<text class="lin-sub" x="${p.x + 16}" y="${p.y + 33}">${esc(clip(`${n.node_type} · ${look.word}`, 30))}</text></g>`;
@@ -264,7 +264,7 @@ export function renderGraphTable(graph, { sel = null } = {}) {
   const nrows = graph.nodes.slice(0, MAX_TABLE_ROWS).map((n) => {
     const look = stateLook(n.state);
     const d = deg.get(n.id) || { in: 0, out: 0 };
-    return `<tr${n.id === sel ? ' aria-current="true"' : ''}><th scope="row"><button type="button" class="hd-btn hd-btn--ghost hd-btn--sm" data-node="${esc(n.id)}">${esc(text(n.label, idTail(n.id)))}</button></th>`
+    return `<tr data-key="${esc(n.id)}"${n.id === sel ? ' aria-current="true"' : ''}><th scope="row"><button type="button" class="hd-btn hd-btn--ghost hd-btn--sm" data-node="${esc(n.id)}">${esc(text(n.label, idTail(n.id)))}</button></th>`
       + `<td>${esc(n.node_type)}</td><td><code>${esc(n.id)}</code></td><td>${look.glyph} ${esc(look.word)}</td><td>${d.out}</td><td>${d.in}</td></tr>`;
   }).join('');
   const erows = graph.edges.slice(0, MAX_TABLE_ROWS).map((e) => {
@@ -315,44 +315,6 @@ export function renderReplay(asOf, { busy = false, queued = false } = {}) {
     + `<button type="button" class="hd-btn hd-btn--ghost hd-btn--sm" data-replay="last"${dis}>End ⏭</button>`
     + `<button type="button" class="hd-btn hd-btn--sm" data-replay="live"${asOf && asOf.head ? ' aria-pressed="true"' : ''}>Live</button>`
     + `<output class="lin-replay__status" role="status" aria-live="polite">${busy ? (queued ? 'Loading. Your latest choice will load next.' : 'Loading the position.') : esc(replayText(asOf))}</output>${trimmed}</div>`;
-}
-
-// Re-rendering replaces the panel's HTML, so the focused control is remembered by a stable key and found again.
-const attr = (el, k) => (el && el.getAttribute ? el.getAttribute(k) : null);
-export function focusKey(el) {
-  if (!el || !el.getAttribute) return null;
-  const f = attr(el, 'data-filter');
-  if (attr(el, 'data-node') !== null) return `node:${attr(el, 'data-node')}`;
-  if (attr(el, 'data-replay') !== null) return `replay:${attr(el, 'data-replay')}`;
-  if (attr(el, 'data-view') !== null) return `view:${attr(el, 'data-view')}`;
-  if (attr(el, 'data-mode') !== null) return 'mode:';
-  if (attr(el, 'data-clock') !== null) return 'clock:';
-  if (attr(el, 'data-more') !== null) return 'more:';
-  if (attr(el, 'data-retry') !== null) return 'retry:';
-  if (f !== null) return (f === 'type' || f === 'etype') ? `filter:${f}:${attr(el, 'value')}` : `filter:${f}:`;
-  const wf = attr(el, 'data-wb-field');
-  if (wf !== null) return wf === 'action' ? `wbf:action:${attr(el, 'value')}` : `wbf:${wf}:`;
-  const wa = attr(el, 'data-wb-act');
-  if (wa !== null) return `wba:${wa}:${attr(el, 'data-wb-id') || ''}`;
-  return null;
-}
-export function focusSelector(key) {
-  const q = (v) => String(v).replace(/["\\]/g, '\\$&');
-  const [kind, ...rest] = String(key || '').split(':');
-  const v = rest.join(':');
-  switch (kind) {
-    case 'node': return `[data-node="${q(v)}"]`;
-    case 'replay': return `[data-replay="${q(v)}"]`;
-    case 'view': return `[data-view="${q(v)}"]`;
-    case 'mode': return '[data-mode]';
-    case 'clock': return '[data-clock]';
-    case 'more': return '[data-more]';
-    case 'retry': return '[data-retry]';
-    case 'filter': { const [name, ...val] = rest; return val.join(':') ? `[data-filter="${q(name)}"][value="${q(val.join(':'))}"]` : `[data-filter="${q(name)}"]`; }
-    case 'wbf': { const [name, ...val] = rest; return val.join(':') ? `[data-wb-field="${q(name)}"][value="${q(val.join(':'))}"]` : `[data-wb-field="${q(name)}"]`; }
-    case 'wba': { const [act, ...id] = rest; return id.join(':') ? `[data-wb-act="${q(act)}"][data-wb-id="${q(id.join(':'))}"]` : `[data-wb-act="${q(act)}"]`; }
-    default: return null;
-  }
 }
 
 // Where a replay control moves to (pure; the caller fetches). Returns a step number or 'live'.
