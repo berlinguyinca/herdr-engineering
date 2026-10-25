@@ -25,7 +25,8 @@ import { mountHosts, loadHosts } from './hosts-view.js';
 import { mountHostDetail, loadHostDetail } from './host-detail-view.js';
 import { mountActivity, loadActivity } from './activity-view.js';
 import { mountAnalytics, loadAnalytics } from './analytics-view.js';
-import { morph } from './patch.js';
+import { morph, patchList, patchText } from './patch.js';
+import { flash } from './motion.js';
 import { noteStreamContact } from './freshness.js';
 import { mountServices, mountServiceDetails } from './services-view.js';
 import { mountCollab, completeSignInIfRedirected } from './collab-view.js';
@@ -379,6 +380,13 @@ async function viewSessions() {
   return ownPolling(mountSessionsView(root, client, {tab: route().query.get('tab') || 'current'}));
 }
 
+function sessionStatusText(s) {
+  const outcome = recordOutcome(s);
+  const terminal = outcome === 'failed' || outcome === 'finished';
+  const reportedStatus = terminal && statusOutcome(s.status) !== outcome ? s.stage : s.status;
+  return reportedStatus ? `Last reported ${String(reportedStatus).replaceAll('_',' ').toLowerCase()}` : 'Status unknown';
+}
+
 async function viewSession(parts, revision) {
   const id = decodeURIComponent(parts[parts.length - 1]);
   const controller = new AbortController();
@@ -390,14 +398,13 @@ async function viewSession(parts, revision) {
     if (!s) { root.innerHTML = '<herdr-error message="Agent not found"></herdr-error>'; return; }
     const outcome = recordOutcome(s);
     const terminal = outcome === 'failed' || outcome === 'finished';
-    const reportedStatus = terminal && statusOutcome(s.status) !== outcome ? s.stage : s.status;
     const clip = value => typeof value === 'string' ? value.slice(0, 180) : '';
     const project = typeof s.cwd === 'string' ? s.cwd.replace(/\\/g, '/').split('/').filter(Boolean).pop() : '';
     const fields = [['Agent ID',s.session_id],['Last reported status',s.status],['Stage',s.stage],['Directory',s.cwd],['Git branch',s.branch],['PID',s.pid],['Command line',s.cmdline],['Model',s.model],['Last reported',formatTimestamp(s.updated_at)]].filter(([,v])=>v != null && v !== '');
     root.innerHTML = `<style>.sd-head{display:flex;flex-wrap:wrap;gap:12px;align-items:center;margin:14px 0}.sd-meta{color:var(--text-secondary);line-height:1.6;overflow-wrap:anywhere}.sd-details{margin:14px 0;overflow-wrap:anywhere}.sd-details summary{cursor:pointer;font-weight:600}.sd-details dl{display:grid;grid-template-columns:minmax(100px,auto) minmax(0,1fr);gap:8px 16px}.sd-details dt{color:var(--text-secondary)}.sd-details dd{margin:0;white-space:pre-wrap;overflow-wrap:anywhere}.sd-title{overflow-wrap:anywhere}@media(max-width:600px){.sd-details dl{display:block}.sd-details dd{margin:4px 0 12px}}</style>
       <a href="#/herd?tab=${terminal ? outcome : 'current'}">← Agents</a>
       <h1 class="sd-title">${esc(clip(s.display_name || s.agent_role) || 'Agent')}${project ? ` · ${esc(clip(project))}` : ''}</h1>
-      <div class="sd-head"><strong>${esc(reportedStatus ? `Last reported ${String(reportedStatus).replaceAll('_',' ').toLowerCase()}` : 'Status unknown')} · ${esc(formatTimestamp(s.updated_at))}</strong><span class="sd-meta">${esc(s.host_id || 'Host not reported')} · ${esc(s.model || 'Model not reported')}</span></div>
+      <div class="sd-head"><strong data-session-head><span data-session-status>${esc(sessionStatusText(s))}</span> · <span data-session-updated>${esc(formatTimestamp(s.updated_at))}</span></strong><span class="sd-meta">${esc(s.host_id || 'Host not reported')} · ${esc(s.model || 'Model not reported')}</span></div>
       <p class="sd-meta">${terminal ? `${outcome === 'failed' ? 'Failed' : 'Finished'} agent · recorded inspection remains available.` : 'Agent status reflects the last report; it is not a live process check.'}</p>
       ${s.summary ? `<p style="overflow-wrap:anywhere">${esc(clip(s.summary))}</p>` : ''}
       ${s.mission_id || s.mission_key ? `<p class="sd-meta" id="session-mission">Mission association not resolved · ${esc(s.mission_key || s.mission_id)}</p>` : ''}
@@ -432,14 +439,29 @@ async function viewSession(parts, revision) {
       });
     }
     const stream = document.getElementById('session-stream');
-    streamList('session',s.session_id).then(html=>{if(stream.isConnected && revision===renderRevision)stream.innerHTML=html;}).catch(()=>{if(stream.isConnected)stream.innerHTML='<span class="muted">Recorded events could not load.</span>';});
-    // The page streams its own detail; a live event refreshes only the (cheap) recorded event list.
+    const head = root.querySelector('[data-session-head]');
+    let headRequest = null;
+    streamItems('session',s.session_id).then(items=>{if(stream.isConnected && revision===renderRevision)paintStream(stream,items,{initial:true});}).catch(()=>{if(stream.isConnected)stream.innerHTML='<span class="muted">Recorded events could not load.</span>';});
+    // The page streams its own detail; a live event refreshes the recorded event list (new events
+    // are appended) and the head status line, in place.
     return {
       async refresh() {
         if (!stream.isConnected) return;
-        try { const html = await streamList('session', s.session_id); if (stream.isConnected) stream.innerHTML = html; } catch { /* keep last */ }
+        headRequest?.abort();
+        const request = new AbortController(); headRequest = request;
+        const [items, latest] = await Promise.all([
+          streamItems('session', s.session_id).catch(() => null),
+          client.getSession(id, { signal: request.signal }).catch(() => null),
+        ]);
+        if (headRequest === request) headRequest = null;
+        if (!stream.isConnected || request.signal.aborted) return;
+        if (items) paintStream(stream, items);
+        if (!latest || !head.isConnected) return;
+        // A heartbeat moves the report time only; the head flashes when the status itself changes.
+        patchText(head.querySelector('[data-session-updated]'), formatTimestamp(latest.updated_at));
+        if (patchText(head.querySelector('[data-session-status]'), sessionStatusText(latest))) flash(head);
       },
-      dispose: disposeSession,
+      dispose() { headRequest?.abort(); disposeSession(); },
     };
   } catch (error) {
     if (revision !== renderRevision) return;
@@ -573,19 +595,38 @@ async function viewLlmSession(parts, revision) {
   return NO_REFRESH;
 }
 
-async function streamList(entityType, entityId) {
+const NO_STREAM_EVENTS = '<herdr-empty message="No events for this entity yet"></herdr-empty>';
+
+// Recorded events for one entity as keyed cards ({key, html}); keyed by sequence so a refresh
+// keeps the cards already shown (morph pairs data-key, patchList appends only the new ones).
+async function streamItems(entityType, entityId) {
   const { events } = await client.request(
     `/api/v1/events?entity_type=${encodeURIComponent(entityType)}&entity_id=${encodeURIComponent(entityId)}`);
-  if (!events.length) return '<herdr-empty message="No events for this entity yet"></herdr-empty>';
+  if (!events.length) return [];
   const t = titles(await missionTitles());
   return events.map((e) => {
     const d = describeEvent(e, { missionTitles: t });
-    return `<div class="hd-card">
+    const key = String(e.sequence ?? e.event_id ?? '');
+    return { key, html: `<div class="hd-card" data-key="${esc(key)}">
       <div class="hd-card__title">${esc(d.title)}</div>
       <div class="hd-card__sub">${esc(d.detail)}</div>
       <div class="hd-card__sub">seq ${e.sequence} · ${formatTimestamp(e.source_timestamp)}</div>
-    </div>`;
-  }).join('');
+    </div>` };
+  });
+}
+
+async function streamList(entityType, entityId) {
+  const items = await streamItems(entityType, entityId);
+  return items.length ? items.map((item) => item.html).join('') : NO_STREAM_EVENTS;
+}
+
+// Paints recorded events into a container in place: new events are appended (and enter, unless
+// calm), cards already shown keep their nodes, and the container itself is never replaced.
+function paintStream(container, items, { initial = false } = {}) {
+  if (!items.length) { if (container.innerHTML !== NO_STREAM_EVENTS) container.innerHTML = NO_STREAM_EVENTS; return; }
+  for (const child of [...container.children]) if (!child.hasAttribute('data-key')) child.remove();
+  patchList(container, items, { key: (item) => item.key, render: (item) => item.html, animate: !initial });
+  if (initial) for (const el of container.querySelectorAll('[data-entering]')) el.removeAttribute('data-entering');
 }
 
 // Live updates (Spec §52, §85): SSE events feed the refresh bus, which calls

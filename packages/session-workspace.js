@@ -9,6 +9,21 @@ import {selectEvents, linkedAgents, githubLinks, referenceSuggestions, pendingOp
 import {randomString} from './herdr-web-client/collab.js';
 import {recordOutcome} from './record-state.js';
 import {fixOutcome, fixError, FIX_LABELS, FIX_LOCKED} from './summary-fix-status.js';
+import {morph} from './patch.js';
+import {enter} from './motion.js';
+
+// Rows carry data-key="<seq>". morph keeps every shown row's node (open disclosures, focus and
+// text selection survive) and writes only what changed. A row enters with the shared transition
+// (not under calm) only when the stream brought it: its seq is above the newest record received
+// before this paint, and the filters did not change. A filter change, an older page or the first
+// paint show their rows without motion, even rows that are new to this pane.
+function patchRows(container,html,newestBefore){
+  morph(container,html);
+  for(const row of container.children){
+    const key=row.getAttribute('data-key');
+    if(key && Number(key)>newestBefore)enter(row);
+  }
+}
 
 const MAX_EVENTS=2000;
 const PAGE=200;
@@ -74,8 +89,14 @@ export function mountSessionWorkspace(host,client,session,{connect=connectEvents
     },
   });
 
+  let shownConversation=null,shownActivity=null,paintedNewest=Infinity,paintedFilters=null;
   function paint() {
     if(disposed)return;
+    // Newest record received so far; rows above the previous paint's value arrived by stream.
+    const newest=Math.max(-Infinity,...events.map(e=>e.seq),...conversationEvents.map(e=>e.seq));
+    const filters=JSON.stringify([state,selection]);
+    const streamNewest=filters===paintedFilters?paintedNewest:Infinity;
+    paintedFilters=filters;
     const health=telemetryHealth(data?.summary,data?.telemetry);
     const capture=session.transcript?.status;
     const captureNote=capture==='identity_unavailable'?' · Waiting for this agent to identify its transcript.':capture==='unreadable'?' · The agent transcript could not be read.':capture==='unsupported'?' · Recording is unavailable for this agent.':'';
@@ -85,10 +106,11 @@ export function mountSessionWorkspace(host,client,session,{connect=connectEvents
     const agentNames=new Map((data?.summary?.agents || []).map(a=>[a.agent_id,a.display_name || a.agent_id]));
     agentNames.set('main',session.display_name || agentNames.get('main') || 'Assistant');
     const rows=selectEvents(conversationEvents,{...state,pane:'conversation'});
-    const html=rows.map(e=>`<article class="sw-message conversation-markdown sw-message--${esc(e.data.role)}" data-message-seq="${e.seq}"><header><strong>${esc(e.data.role==='user'?'You':agentNames.get(e.agent_id || 'main') || e.agent_id)}</strong><time>${esc(e.ts || '')}</time><button type="button" data-related-turn="${e.seq}" aria-label="Show activity for this turn">Activity ↗</button></header>${e.data.withheld?'<p>Message withheld.</p>':renderMarkdown(e.data.text || '',markdown)}${e.data.text_more?`<button type="button" data-expand-message="${e.seq}">Show full message</button>`:''}${e.truncated?'<p class="sw-note">Message truncated by recording limits.</p>':''}</article>`).join('') || '<p class="sw-empty">No conversation messages recorded for these filters.</p>';
-    if(conversation.innerHTML!==html){
-      const previousNewest=Number(conversation.lastElementChild?.dataset.messageSeq || 0);
-      conversation.innerHTML=html;
+    const html=rows.map(e=>`<article class="sw-message conversation-markdown sw-message--${esc(e.data.role)}" data-message-seq="${e.seq}" data-key="${e.seq}"><header><strong>${esc(e.data.role==='user'?'You':agentNames.get(e.agent_id || 'main') || e.agent_id)}</strong><time>${esc(e.ts || '')}</time><button type="button" data-related-turn="${e.seq}" aria-label="Show activity for this turn">Activity ↗</button></header>${e.data.withheld?'<p>Message withheld.</p>':renderMarkdown(e.data.text || '',markdown)}${e.data.text_more?`<button type="button" data-expand-message="${e.seq}">Show full message</button>`:''}${e.truncated?'<p class="sw-note">Message truncated by recording limits.</p>':''}</article>`).join('') || '<p class="sw-empty">No conversation messages recorded for these filters.</p>';
+    if(shownConversation!==html){
+      shownConversation=html;
+      const previousNewest=Math.max(0,...[...conversation.querySelectorAll(':scope > [data-message-seq]')].map(row=>Number(row.dataset.messageSeq)));
+      patchRows(conversation,html,streamNewest);
       if(bottom)conversation.scrollTop=conversation.scrollHeight;
       else {
         const prepended=rows.length && rows[rows.length-1].seq<=previousNewest;
@@ -97,15 +119,15 @@ export function mountSessionWorkspace(host,client,session,{connect=connectEvents
       }
     }
     const open=new Set([...activity.querySelectorAll('details[open]')].map(d=>d.dataset.activitySeq));
-    const treeState=new Map([...activity.querySelectorAll('[data-activity-seq]')].map(row=>[row.dataset.activitySeq,[...row.querySelectorAll('details')].map(node=>node.open)]));
-    const scroll=activity.scrollTop;
     let activityRows=selectEvents(events,{...state,pane:'activity'});
     if(selection!=null){
       const next=conversationEvents.filter(e=>e.seq>selection).sort((a,b)=>a.seq-b.seq)[0]?.seq ?? Infinity;
       activityRows=activityRows.filter(e=>e.seq>selection && e.seq<next);
     }
-    const activityHtml=activityRows.map(e=>`<details class="sw-event" data-activity-seq="${e.seq}"${open.has(String(e.seq))?' open':''}><summary>${esc(e.data?.tool || e.data?.path || e.kind)} <span>${esc(agentNames.get(e.agent_id || 'main') || e.agent_id || 'main')} · ${esc(e.data?.status || '')}</span></summary>${activityEvent(e)}</details>`).join('') || '<p class="sw-empty">No coding activity recorded for these filters.</p>';
-    if(activity.innerHTML!==activityHtml){activity.innerHTML=activityHtml;activity.scrollTop=scroll;for(const row of activity.querySelectorAll('[data-activity-seq]')){const previous=treeState.get(row.dataset.activitySeq);if(previous)[...row.querySelectorAll('details')].forEach((node,index)=>{if(index<previous.length)node.open=previous[index];});}}
+    const activityHtml=activityRows.map(e=>`<details class="sw-event" data-activity-seq="${e.seq}" data-key="${e.seq}"${open.has(String(e.seq))?' open':''}><summary>${esc(e.data?.tool || e.data?.path || e.kind)} <span>${esc(agentNames.get(e.agent_id || 'main') || e.agent_id || 'main')} · ${esc(e.data?.status || '')}</span></summary>${activityEvent(e)}</details>`).join('') || '<p class="sw-empty">No coding activity recorded for these filters.</p>';
+    // Rows keep their nodes, so open disclosures (and nested ones) and the scroll position stay as they are.
+    if(shownActivity!==activityHtml){shownActivity=activityHtml;patchRows(activity,activityHtml,streamNewest);}
+    paintedNewest=Number.isFinite(newest)?newest:Infinity;// nothing received yet: the first history is not "new"
     const agents=linkedAgents({...session,parent_session_id:session.parent_session_id || data?.summary?.association?.parent_session_id},data?.summary?.agents || [],sessions,collaborators);
     const agentIds=[...new Set([...agents.map(a=>a.agent_id).filter(Boolean),...[...events,...conversationEvents].map(e=>e.agent_id || 'main')])];
     const options='<option value="">All agents</option>'+agentIds.map(id=>`<option value="${esc(id)}">${esc(agentNames.get(id) || id)}</option>`).join('');

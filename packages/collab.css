@@ -203,7 +203,15 @@ textarea.cx-input { resize: vertical; font: inherit; }
 .cx-flow-pulse { animation: cx-flow-pulse 1.2s ease-out 1; }
 @keyframes cx-flow-move { to { stroke-dashoffset: -26; } }
 @keyframes cx-flow-pulse { 0% { opacity: 1; filter: drop-shadow(0 0 6px currentColor); } 100% { opacity: 0.85; } }
-@media (prefers-reduced-motion: reduce) { .cx-flow-edge--live, .cx-flow-pulse { animation: none; } .cx-log { scroll-behavior: auto; } }
+/* A live task card that slides in and glows runs both animations together (the attribute rule
+ * alone would replace one with the other). */
+.cx-flow-pulse[data-entering] { animation: hd-enter var(--motion-normal, 200ms) ease-out, cx-flow-pulse 1.2s ease-out 1; }
+/* OS reduced motion stops these unless the viewer explicitly chose calm "off"; calm "on" is
+ * handled for every element by motion.css. */
+@media (prefers-reduced-motion: reduce) {
+  html:not([data-calm="off"]) .cx-flow-edge--live, html:not([data-calm="off"]) .cx-flow-pulse { animation: none; }
+  html:not([data-calm="off"]) .cx-log { scroll-behavior: auto; }
+}
 
 /* ---- public guide page */
 .cx-guide { max-width: 860px; margin: 0 auto; padding: 24px 16px 64px; line-height: 1.55; }

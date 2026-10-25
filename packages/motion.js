@@ -29,19 +29,82 @@ export function loadCalm(){
 }
 
 const tweens=new WeakMap();
+// element -> the text a running tween ends on; cleared when it ends or is superseded.
+const targets=new WeakMap();
 
-export function tween(el,from,to,{format=v=>String(Math.round(v)),duration=300}={}){
- const write=text=>{if(el.textContent!==text)el.textContent=text};
- const token={};tweens.set(el,token);// a later call on the same element supersedes this one
+// write: where each formatted step goes (default: the element's text; e.g. v=>{bar.value=v} for <progress>).
+export function tween(el,from,to,{format=v=>String(Math.round(v)),duration=300,write=text=>{if(el.textContent!==text)el.textContent=text}}={}){
+ const token={};tweens.set(el,token);targets.delete(el);// a later call on the same element supersedes this one
  if(isCalm()||from===to||!(duration>0)||typeof requestAnimationFrame!=='function'){write(format(to));return}
+ const end=format(to);
+ if(typeof end==='string')targets.set(el,end);
  const start=performance.now();
  const step=()=>{
   if(tweens.get(el)!==token)return;
   const p=Math.min(1,(performance.now()-start)/duration);
   write(format(p>=1?to:from+(to-from)*p));
-  if(p<1)requestAnimationFrame(step);
+  if(p<1)requestAnimationFrame(step);else targets.delete(el);
  };
  requestAnimationFrame(step);
+}
+
+// Changed-value motion for views whose update path rewrites text (morph or innerHTML).
+// snapshotText() before the write, animateChanges() after it: a value that differs flashes, and a
+// single number with the same prefix/suffix (e.g. "10%" -> "20%") counts up from the old value.
+// With count (the default) a value replacing a placeholder without digits is first data: no motion.
+// keyOf pairs old and new nodes; the default (node identity) suits morph, a stable attribute
+// (an href, a data-key) suits innerHTML swaps. Under calm, the new text simply stays.
+const NUM=/^(\D*?)(-?\d+(?:\.\d+)?)(\D*)$/;
+const identity=el=>el;
+
+export function snapshotText(root,selector,keyOf=identity){
+ const out=new Map();
+ if(!root)return out;
+ // A value still counting up is read as the number it is heading for, so a redraw mid-tween
+ // compares against the real old value instead of an in-between one.
+ for(const el of root.querySelectorAll(selector)){const k=keyOf(el);if(k!=null&&!out.has(k))out.set(k,targets.get(el)??el.textContent);}
+ return out;
+}
+
+export function animateChanges(root,selector,before,keyOf=identity,{target=identity,count=true}={}){
+ const changed=[];
+ if(!root||!before?.size)return changed;
+ for(const el of root.querySelectorAll(selector)){
+  const k=keyOf(el);
+  if(k==null||!before.has(k))continue;
+  const old=before.get(k),now=el.textContent;
+  if(old===now)continue;
+  if(count&&!/\d/.test(old))continue;// a placeholder ("…", "—") becoming a number is first data, not a change
+  changed.push(el);
+  if(isCalm()){tweens.delete(el);targets.delete(el);continue;}
+  const a=count&&old.trim().match(NUM),b=now.trim().match(NUM);
+  if(count&&a&&b&&a[1]===b[1]&&a[3]===b[3]&&now===now.trim()){
+   const places=(b[2].split('.')[1]||'').length;
+   const format=v=>`${b[1]}${(Math.abs(v)<1e-9?0:v).toFixed(places)}${b[3]}`;
+   el.textContent=format(+a[2]);// start from the old value in the same task: no jump to the end and back
+   tween(el,+a[2],+b[2],{format});
+  }else{tweens.delete(el);targets.delete(el);}// a non-numeric value stops a running count-up
+  flash(target(el));
+ }
+ return changed;
+}
+
+// Eases a <progress> (or any element with a numeric .value) from its old value to a new one.
+// Call after the markup already holds the new value; under calm it stays there.
+export function easeValue(el,from,to){
+ if(!el||!Number.isFinite(from)||!Number.isFinite(to)||from===to||isCalm())return;
+ el.value=from;
+ tween(el,from,to,{format:v=>Math.round(v*10)/10,write:v=>{if(el.value!==v)el.value=v;}});
+}
+
+// Marks a node that was just added so it plays the shared enter transition ([data-entering]);
+// nothing under calm. The marker clears itself when the animation ends.
+export function enter(el){
+ if(!el||isCalm())return;
+ el.setAttribute('data-entering','');
+ const clear=e=>{if(e&&e.target!==el)return;el.removeAttribute('data-entering');};
+ el.addEventListener('animationend',clear,{once:true});
+ setTimeout(()=>clear(),1000);
 }
 
 // Note: under calm, [data-leaving] runs no transition, so no transitionend fires; patch.js removes

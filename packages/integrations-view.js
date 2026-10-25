@@ -8,6 +8,7 @@ import {ciChartModel,renderCiCharts,ciChartStyles} from './ci-charts.js';
 import {ciInsightsModel,renderCiInsights,ciInsightStyles,renderCiRunReports} from './ci-insights.js';
 import {renderCiPipeline,ciPipelineStyles,pipelineZoom,sameCiRepository,ciComparisonModel,renderCiComparison} from './ci-pipeline.js';
 import {mountCiHealth} from './ci-health-view.js';
+import {snapshotText,animateChanges} from './motion.js';
 import {renderCiFix,ciFixStyles,fixRunKey,latestFix,fixIsActive,fixError} from './ci-fix-view.js';
 import {attachError,attachForms} from './terminal-attach.js';
 import {renderRelated} from './related-panel.js';
@@ -84,7 +85,8 @@ export function integrationRow(entry,kind='ci') {
   const r=entry.record;
   const status=human(stateOf(r)) || 'status unknown';
   const title=short(r.title) || (kind==='ci' ? `Run #${r.run_number ?? 'unknown'}` : `${r.kind==='code'?'Code':'Plan'} review`);
-  return `<article class="ig-row" data-entry="${esc(entry.id)}"><div class="ig-main">
+  const running=kind==='ci'&&entry.tab==='current'&&['running','pending','started'].includes(stateOf(r));
+  return `<article class="ig-row" data-entry="${esc(entry.id)}"${running?' data-state="running"':''}><div class="ig-main">
     ${kind==='ci' ? `<button type="button" class="ig-title" data-run="${esc(entry.id)}">${esc(title)}</button>` : `<strong class="ig-title">${esc(title)}</strong>`}
     <p class="ig-note">${esc(short(r.repository)||'Repository not reported')}${r.branch ? ` · ${esc(short(r.branch,80))}` : ''}${r.revision ? ` · <code>${esc(short(r.revision,12))}</code>` : ''}</p>
     ${kind==='reviews' ? `<div class="ig-links">${entry.tab==='current' ? external(r.review_url || r.url,'Open in Plannotator') : '<span class="ig-note">Recorded review</span>'}${r.mission_key || r.mission_id ? `<a href="#/missions/${esc(encodeURIComponent(r.mission_key || r.mission_id))}">Mission</a>` : ''}${r.session_id ? `<a href="#/herd/session/${esc(encodeURIComponent(r.session_id))}">Agent</a>` : ''}</div>${r.summary ? `<p class="ig-summary">${esc(short(r.summary))}</p>` : ''}${r.stale ? '<p class="ig-warning">Review launcher report is stale; open upstream to check its state.</p>' : ''}<details class="ig-review-details" data-review-details="${esc(entry.id)}"><summary>Plan and feedback</summary>${r._detailsError ? `<p class="ig-warning" role="status">${esc(r._detailsError)}</p>` : ''}${r.plan ? `<pre class="ig-log">${esc(text(r.plan).slice(0,50000))}${text(r.plan).length>50000?'\n… Plan display truncated.':''}</pre>` : ''}${r.feedback ? `<p class="ig-review-feedback">${esc(text(r.feedback).slice(0,10000))}</p>` : ''}${!r.plan && !r.feedback ? `<p class="ig-note">${r._detailsLoaded?'No plan text or feedback was recorded.':r._detailsError?'Close and reopen to retry.':'Loading review details…'}</p>` : ''}</details>` : ''}
@@ -208,6 +210,8 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
     const cached=reviewCache.get(String(summary.review_id));
     return cached && cached.version===reviewVersion(summary) ? {...cached.record,...summary,_detailsError:cached.error,_detailsLoaded:!!cached.record} : summary;
   })} : data||{},kind);
+  const entryKey=node=>node.closest('[data-entry]')?.dataset.entry;
+  let chartsDrawn=false,motionSettled=false,motionView='';
   function replace(element,html) {
     const focused=document.activeElement;
     const focusKey=element.contains(focused) ? ['data-run','data-step','data-close-inspector','data-ci-action','data-ci-test-search','data-ci-test-page','data-collapse-success','data-pipeline-zoom','data-ci-compare','data-fix-sandbox','data-fix-cancel','data-fix-terminal','data-fix-copy'].find(k=>focused.hasAttribute(k)) : null;
@@ -270,6 +274,15 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
     }
     if(signature!==nextSignature) {
       signature=nextSignature;
+      // Rows and charts are rebuilt with innerHTML (Task 19 moves them onto the patcher); motion pairs
+      // old and new nodes by key: tab counts by node, rows by data-entry (state change = flash).
+      // Motion only for data-driven changes: not before the reports have landed (CI counts include
+      // retained observations) and not when the user changed the tab, a filter, the search or page.
+      const settled=!!data&&(!isCi||reportData!==null||!!reportsError), view=JSON.stringify(state);
+      const live=settled&&motionSettled&&view===motionView;
+      motionSettled=settled;motionView=view;
+      const tabCounts=live?snapshotText(container,'[data-tab] strong'):null;
+      const rowStates=live?snapshotText(el('#ig-results'),'[data-entry] .ig-state strong',entryKey):null;
       for(const [key] of tabs) {
         const button=el(`[data-tab="${key}"]`),active=state.tab===key;
         button.setAttribute('aria-selected',String(active));button.tabIndex=active?0:-1;
@@ -286,6 +299,8 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
           const open=disclosure?.open, focused=disclosure?.querySelector('summary')===document.activeElement;
           const focusedTable=chart.contains(document.activeElement)&&document.activeElement.classList.contains('ci-chart-table')?document.activeElement.getAttribute('aria-label'):null;
           chart.innerHTML=html;
+          // Charts draw in on their first paint only; later refreshes replace them without motion.
+          if(!chartsDrawn&&chart.querySelector('svg')){chartsDrawn=true;for(const mark of chart.querySelectorAll('.ci-chart-card svg :is(rect,polyline,circle)'))mark.setAttribute('data-drawn','');}
           const next=chart.querySelector('[data-ci-chart-data]');
           if(next && open)next.open=true;
           if(focused)next?.querySelector('summary')?.focus({preventScroll:true});
@@ -299,6 +314,8 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
       }
       const result=el('#ig-results');result.setAttribute('aria-labelledby',`ig-tab-${state.tab}`);
       replace(result,[...groups].map(([name,rows])=>`<div class="ig-group"><h2>${esc(name)}</h2>${rows.map(e=>integrationRow(e,kind)).join('')}</div>`).join('') || `<div class="ig-group ig-empty">${!data ? 'Waiting for reports…' : isCi && data.available===false && !all.length ? 'No CI reports available. Connection details are shown above.' : `No ${state.tab==='current'?'current ':''}${isCi?'runs':'reviews'} match this view.`}</div>`);
+      animateChanges(container,'[data-tab] strong',tabCounts);
+      animateChanges(result,'[data-entry] .ig-state strong',rowStates,entryKey,{count:false,target:node=>node.closest('[data-entry]')});
       el('[data-ig-count]').textContent=data ? `${filtered.length} matching ${isCi?'runs':'reviews'}${isCi?reportData?' in retained observations':' in the recent pipeline window':data.has_more?` · Showing the latest ${records(data.reviews).length}${Number.isFinite(data.total)?` of ${data.total}`:''} reviews; older records are outside this window`:''}` : '';
       el('.ig-pages').hidden=filtered.length<=pageSize;
       el('[data-ig-page]').textContent=`Page ${state.page+1} of ${Math.max(1,Math.ceil(filtered.length/pageSize))}`;

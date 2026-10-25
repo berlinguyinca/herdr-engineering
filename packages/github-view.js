@@ -2,6 +2,7 @@
 import {escapeHtml as esc} from './herdr-web-components/util.js';
 import {formatDuration,formatTimestamp} from './herdr-web-components/format.js';
 import {safeServiceUrl} from './services-view.js';
+import {snapshotText,animateChanges} from './motion.js';
 import {mountRelated} from './related-panel.js';
 
 const text=value=>typeof value==='string'?value:'';
@@ -141,13 +142,21 @@ export function mountGithub(container,client) {
   el(`[data-gh-${kind}-page-label]`).textContent=`Page ${current}${total!==null?` · ${total} total`:''}`;
  }
  function tick(){for(const node of container.querySelectorAll('[data-gh-time]'))node.textContent=formatDuration(Math.max(0,Date.now()-Number(node.dataset.ghTime)));}
+ let motionView='';
  function draw() {
   if(disposed)return;
   replace(el('[data-gh-health]'),renderGithubHealth(repositories),'health',JSON.stringify(repositories&&[repositories.status,repositories.refreshing,repositories.progress,repositories.partial,repositories.stale,repositories.account,repositories.last_success_at,repositories.error,repositories.rate_limit]));
   el('[data-gh-repo-error]').textContent=repoError;
   el('[data-gh-issue-error]').textContent=[issueError,issues?.error,issues?.partial?'Issue coverage is partial; additional open issues may not have been read.':'',issues?.stale?'Showing previously synchronized issue summaries.':''].filter(Boolean).join(' ');
+  // Lists are rebuilt with innerHTML (Task 19 moves them onto the patcher); motion pairs old and new
+  // nodes by key: a repository or issue whose text changed flashes, tab counts count up.
+  const repoKey=node=>node.dataset.ghRepository,issueRowKey=node=>node.dataset.ghIssueRow;
+  // Only data-driven changes animate: not the first load, not a change of repository, tab, search or page.
+  const view=JSON.stringify(state),live=!!repositories&&!!issues&&motionView===view;motionView=repositories&&issues?view:'';
+  const reposBefore=live?snapshotText(el('[data-gh-repositories]'),'[data-gh-repository]',repoKey):null,issuesBefore=live?snapshotText(el('#gh-issue-panel'),'[data-gh-issue-row]',issueRowKey):null,countsBefore=live?snapshotText(container,'[data-gh-tab-count]'):null;
   const repos=rankGithubRepositories(repositories?.repositories);
   replace(el('[data-gh-repositories]'),repos.map(repo=>renderGithubRepository(repo,repo.repository_id===state.repository)).join('')||`<li class="gh-empty">${!repositories?'Loading repositories…':repositories.available===false?'Repository data is unavailable. Connection details appear above.':'No repositories match this search.'}</li>`,'repos',JSON.stringify([repositories,state.repository]));
+  animateChanges(el('[data-gh-repositories]'),'[data-gh-repository]',reposBefore,repoKey,{count:false});
   el('[data-gh-repo-count]').textContent=repositories?`${repos.length} repositories on this page${integer(repositories.pagination?.total)?` · ${repositories.pagination.total} matching`:''}`:'';
   el('[data-gh-all-repositories]').setAttribute('aria-pressed',String(!state.repository));
   el('[data-gh-scope]').textContent=state.repositoryLabel;
@@ -155,6 +164,8 @@ export function mountGithub(container,client) {
   const rows=records(issues?.issues);
   el('#gh-issue-panel').setAttribute('aria-labelledby',`gh-tab-${state.tab}`);
   replace(el('#gh-issue-panel'),rows.map(issue=>renderGithubIssue(issue,selected?.key===issueKey(issue))).join('')||`<p class="gh-empty">${!issues?'Loading open issues…':issues.available===false?'Issue data is unavailable.':'No open issues match this view.'}${issues?.partial?' Synchronization is incomplete.':''}</p>`,'issues',JSON.stringify([issues,selected?.key]));
+  animateChanges(el('#gh-issue-panel'),'[data-gh-issue-row]',issuesBefore,issueRowKey,{count:false});
+  animateChanges(container,'[data-gh-tab-count]',countsBefore);
   el('[data-gh-issue-count]').textContent=issues?`${rows.length} issues on this page${integer(issues.pagination?.total)?` · ${issues.pagination.total} matching open issues`:''}`:'';
   pages('repo',repositories,state.repositoryPage);pages('issue',issues,state.issuePage);
   el('.gh-layout').classList.toggle('gh-detail-open',!!selected);

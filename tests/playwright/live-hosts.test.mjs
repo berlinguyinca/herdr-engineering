@@ -97,6 +97,7 @@ test('host detail keeps an open outdated-packages disclosure across a live refre
 
  state.hosts[0].latest.cpu=77;state.hosts[0].updates.outdated=3;
  await pollRefresh(page,POLL);
+ await page.clock.runFor(400);await sleep(30);// the gauge value counts up (Task 10 motion)
  const after=await page.evaluate(()=>({
   same:document.querySelector('[data-section=updates] details')===window.__details,
   open:window.__details.open,h1:document.querySelector('#view h1')===window.__h1,

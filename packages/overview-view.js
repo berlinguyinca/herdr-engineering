@@ -5,6 +5,7 @@ import { missionEntries } from './mission-catalog-view.js';
 import { recordOutcome, recordVisibility, reportFreshness } from './record-state.js';
 import { serviceState, serviceScope } from './services-view.js';
 import { integrationEntries, integrationTimestamp } from './integrations-view.js';
+import { isCalm, snapshotText, animateChanges } from './motion.js';
 
 const records = value => Array.isArray(value) ? value.filter(v => v && typeof v === 'object' && !Array.isArray(v)) : [];
 const text = value => typeof value === 'string' ? value : '';
@@ -122,7 +123,7 @@ function availability(keys, states) {
     const state = states[key];
     const label = {projections:'Live mission reports',missions:'Recorded missions',sessions:'Agents',services:'Services',hosts:'Hosts',activity:'Recent activity',health:'Control plane',ci:'CI',reviews:'Reviews'}[key];
     if (state?.error) return `<p class="ov-warning" role="status">${esc(label)}: Could not refresh.${state.loaded ? ' Showing last received records.' : ' Data is unavailable; retrying automatically.'}</p>`;
-    if (!state?.loaded) return `<p class="ov-note" role="status">Loading ${esc(label.toLowerCase())}…</p>`;
+    if (!state?.loaded) return `<div class="hd-skeleton ov-skeleton" role="status" aria-label="Loading ${esc(label.toLowerCase())}"></div>`;
     return '';
   }).join('');
 }
@@ -141,7 +142,7 @@ export function renderOverviewSection(section, data = {}, states = {}, received 
   const model = overviewModel(data,received,now);
   if (section === 'attention') {
     const mode=states.attention===undefined ? 'browser' : states.attention.error ? 'fallback' : states.attention.loaded && data.attention ? 'server' : states.attention.disabled ? 'browser' : states.attention.loaded ? 'browser' : 'loading';
-    if(mode==='loading')return `<div class="ov-heading"><h2 tabindex="-1">Attention</h2></div><p class="ov-note" role="status">Loading attention…</p>`;
+    if(mode==='loading')return `<div class="ov-heading"><h2 tabindex="-1">Attention</h2></div><div class="hd-skeleton ov-skeleton" role="status" aria-label="Loading attention"></div>`;
     const attention=mode==='server' ? serverAttention(data.attention,now) : overviewAttention(data,states,received,now),expanded=data.attentionExpanded===true,limit=6;
     const visible=expanded?attention.items:attention.items.slice(0,limit);
     return `<div class="ov-heading"><h2 tabindex="-1">Attention</h2><span class="ov-tag">${attention.items.length ? `${attention.items.length}${attention.complete?'':'+'}` : attention.complete?'0':'—'} ${attention.server?'open':'observed'} items</span></div>
@@ -149,7 +150,7 @@ export function renderOverviewSection(section, data = {}, states = {}, received 
       ${attention.server ? `<p class="ov-note">${link('#/attention','Open the Attention page →')}${attention.acknowledged || attention.snoozed ? ` · ${attention.acknowledged} acknowledged, ${attention.snoozed} snoozed` : ''}</p>` : ''}
       ${!attention.complete ? `<p class="ov-warning" role="status">Partial coverage: ${esc(attention.unavailable.map(key=>CARD_LABELS[key] || {projections:'Live missions',health:'Control plane'}[key] || key).join(', '))}. Loading, unavailable, or stale sources may contain more items; retained reports remain visible.</p>` : ''}
       ${attention.items.length>limit ? `<div class="ov-attention-controls"><span class="ov-note">Showing ${visible.length} of ${attention.items.length} observed items</span><button type="button" data-attention-toggle aria-expanded="${expanded}" aria-controls="ov-attention-items">${expanded?'Show fewer':`Show all ${attention.items.length}`}</button></div>` : ''}
-      ${attention.items.length ? `<ul id="ov-attention-items" class="ov-list ov-attention-list${expanded?' is-expanded':''}" aria-label="Attention items"${expanded?' tabindex="0"':''}>${visible.map(item=>`<li class="ov-row" data-attention-key="${esc(item.key)}"><div>${link(item.href,item.title)}<p>${esc(item.detail)}</p></div><span class="ov-tag ov-alert">${esc(item.severity)}${item.updated?`<br>${ageMarkup(new Date(item.updated).toISOString(),now)}`:''}</span></li>`).join('')}</ul>` : empty(attention.complete?'No attention items in the received reports.':'Attention is not yet fully known.')}`;
+      ${attention.items.length ? `<ul id="ov-attention-items" class="ov-list ov-attention-list${expanded?' is-expanded':''}" aria-label="Attention items"${expanded?' tabindex="0"':''}>${visible.map(item=>`<li class="ov-row" data-attention-key="${esc(item.key)}"${attention.server?' data-attention-origin="server"':''}><div>${link(item.href,item.title)}<p>${esc(item.detail)}</p></div><span class="ov-tag ov-alert">${esc(item.severity)}${item.updated?`<br>${ageMarkup(new Date(item.updated).toISOString(),now)}`:''}</span></li>`).join('')}</ul>` : empty(attention.complete?'No attention items in the received reports.':'Attention is not yet fully known.')}`;
   }
   if (section === 'missions') {
     const m = model.missions;
@@ -220,7 +221,7 @@ export function renderOverviewSection(section, data = {}, states = {}, received 
 }
 
 const styles = `<style>
-.ov-sub{font-size:13px;margin:14px 0 0}.ov-snooze{font:inherit;font-size:11px;margin-top:6px;padding:2px 8px;border:1px solid var(--border);border-radius:var(--radius-sm);background:var(--surface);color:var(--text-secondary);cursor:pointer}.ov-intro,.ov-note{color:var(--text-secondary);font-size:13px;line-height:1.6}.ov-intro{max-width:75ch;margin:0 0 18px}.ov-layout{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px;align-items:start}.ov-panel{min-width:0;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:16px;overflow-wrap:anywhere}.ov-panel[data-overview=missions]{grid-column:span 2}.ov-panel[data-overview=fleet]{grid-column:auto}.ov-heading{display:flex;justify-content:space-between;align-items:baseline;gap:12px;margin-bottom:12px}.ov-heading h2{font-size:17px;margin:0}.ov-heading>a{font-size:12px;white-space:nowrap}.ov-metrics{display:flex;flex-wrap:wrap;gap:10px;margin:10px 0}.ov-metric{display:flex;flex-direction:column;gap:4px;padding:9px 12px;background:var(--bg);border:1px solid var(--border-subtle);border-radius:var(--radius-sm);font-size:12px;color:var(--text);text-decoration:none}.ov-metric strong{font-size:23px;line-height:1.2}.ov-list{list-style:none;padding:0;margin:0}.ov-row{display:flex;justify-content:space-between;align-items:start;gap:14px;padding:9px 0;border-top:1px solid var(--border-subtle);font-size:13px;line-height:1.45}.ov-row>div{min-width:0;flex:1}.ov-row>div>a{font-weight:600;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}.ov-row p{margin:3px 0 0;color:var(--text-secondary);font-size:12px;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}.ov-tag{font-size:12px;color:var(--text-secondary);max-width:45%;text-align:right}.ov-alert,.ov-warning{color:var(--status-attention)}.ov-warning{font-size:12px;line-height:1.6}.ov-history{display:flex;flex-wrap:wrap;gap:14px;border-top:1px solid var(--border-subtle);padding-top:10px;margin-top:10px;font-size:12px}.ov-health{display:flex;flex-wrap:wrap;gap:16px;color:var(--text-secondary);font-size:12px;margin:18px 0}.ov-health p{margin:0}
+.ov-sub{font-size:13px;margin:14px 0 0}.ov-skeleton{height:58px;margin:10px 0}.ov-health .ov-skeleton{height:1em;width:16em;margin:0}.ov-snooze{font:inherit;font-size:11px;margin-top:6px;padding:2px 8px;border:1px solid var(--border);border-radius:var(--radius-sm);background:var(--surface);color:var(--text-secondary);cursor:pointer}.ov-intro,.ov-note{color:var(--text-secondary);font-size:13px;line-height:1.6}.ov-intro{max-width:75ch;margin:0 0 18px}.ov-layout{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px;align-items:start}.ov-panel{min-width:0;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:16px;overflow-wrap:anywhere}.ov-panel[data-overview=missions]{grid-column:span 2}.ov-panel[data-overview=fleet]{grid-column:auto}.ov-heading{display:flex;justify-content:space-between;align-items:baseline;gap:12px;margin-bottom:12px}.ov-heading h2{font-size:17px;margin:0}.ov-heading>a{font-size:12px;white-space:nowrap}.ov-metrics{display:flex;flex-wrap:wrap;gap:10px;margin:10px 0}.ov-metric{display:flex;flex-direction:column;gap:4px;padding:9px 12px;background:var(--bg);border:1px solid var(--border-subtle);border-radius:var(--radius-sm);font-size:12px;color:var(--text);text-decoration:none}.ov-metric strong{font-size:23px;line-height:1.2}.ov-list{list-style:none;padding:0;margin:0}.ov-row{display:flex;justify-content:space-between;align-items:start;gap:14px;padding:9px 0;border-top:1px solid var(--border-subtle);font-size:13px;line-height:1.45}.ov-row>div{min-width:0;flex:1}.ov-row>div>a{font-weight:600;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}.ov-row p{margin:3px 0 0;color:var(--text-secondary);font-size:12px;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}.ov-tag{font-size:12px;color:var(--text-secondary);max-width:45%;text-align:right}.ov-alert,.ov-warning{color:var(--status-attention)}.ov-warning{font-size:12px;line-height:1.6}.ov-history{display:flex;flex-wrap:wrap;gap:14px;border-top:1px solid var(--border-subtle);padding-top:10px;margin-top:10px;font-size:12px}.ov-health{display:flex;flex-wrap:wrap;gap:16px;color:var(--text-secondary);font-size:12px;margin:18px 0}.ov-health p{margin:0}
 @media(min-width:2200px){.ov-layout{grid-template-columns:repeat(4,minmax(0,1fr))}.ov-panel[data-overview=missions],.ov-panel[data-overview=fleet],.ov-panel[data-overview=hosts],.ov-panel[data-overview=activity]{grid-column:span 2}}
 @media(max-width:1180px){.ov-layout{grid-template-columns:repeat(2,minmax(0,1fr))}.ov-panel[data-overview=missions]{grid-column:1/-1;grid-row:auto}.ov-panel[data-overview=fleet]{grid-column:1/-1}}
 @media(max-width:960px){.ov-layout{grid-template-columns:minmax(0,1fr)}.ov-panel[data-overview=missions],.ov-panel[data-overview=fleet]{grid-column:auto}.ov-panel{padding:14px}.ov-row{gap:10px}.ov-tag{max-width:42%}.ov-metric{padding:9px}.ov-metrics{gap:8px}.ov-heading{gap:8px}}
@@ -278,8 +279,48 @@ export function mountOverview(container, client) {
     }
   }
   applyPreferences();
+  // Motion without the patcher (Overview still swaps panels with innerHTML, Task 19 migrates it):
+  // metric tiles are paired across the swap by link + label, attention rows by data-attention-key.
+  const metricKey=el=>{const a=el.closest('.ov-metric');return a?`${a.getAttribute('href')}|${a.querySelector('span')?.textContent}`:null;};
+  const PULSE_MS=6000;
+  const pulseUntil=new Map();
+  const ATTENTION_SOURCES={mission:'projections',session:'sessions',ci:'ci',reviews:'reviews',service:'services',host:'hosts',health:'health',fleet:'fleet'};
+  let shownCritical=null, loadedAtLastAttention=new Set();
+  function markNewCritical(element) {
+    const now=Date.now();
+    const rows=[...element.querySelectorAll('[data-attention-key]')].filter(row=>row.querySelector('.ov-alert')?.textContent.startsWith('critical'));
+    const critical=rows.map(row=>row.getAttribute('data-attention-key'));
+    // A critical item is "new" only when its source had already loaded at the previous render:
+    // everything on first load, and items arriving with a source's first response, stay still.
+    // Server inbox items (any key shape) come from the attention source itself.
+    if(shownCritical && !isCalm())for(const row of rows){
+      const key=row.getAttribute('data-attention-key');
+      const source=row.hasAttribute('data-attention-origin') ? 'attention' : ATTENTION_SOURCES[key.split(':')[0]];
+      if(!shownCritical.has(key) && loadedAtLastAttention.has(source))pulseUntil.set(key,now+PULSE_MS);
+    }
+    shownCritical=new Set(critical);
+    loadedAtLastAttention=new Set(Object.keys(states).filter(key=>states[key]?.loaded));
+  }
+  function applyPulses() {
+    const now=Date.now();
+    for(const [key,until] of pulseUntil)if(until<=now || isCalm())pulseUntil.delete(key);
+    container.querySelectorAll('[data-overview="attention"] [data-attention-key]').forEach(row=>{
+      const alert=row.querySelector('.ov-alert');
+      if(!alert)return;
+      if(pulseUntil.has(row.getAttribute('data-attention-key'))){if(alert.getAttribute('data-pulse')!=='once')alert.setAttribute('data-pulse','once');}
+      else if(alert.hasAttribute('data-pulse'))alert.removeAttribute('data-pulse');
+    });
+  }
+  // Tiles count up only for data-driven changes: not while sources are still landing on first load,
+  // and not right after the user snoozed or restored missions.
+  let motionSettled=false, userChange=false;
   function draw() {
     if(disposed || document.hidden)return;
+    // Settled = every source has answered once, with data or an error: a source that keeps failing
+    // must not hold the counters still for ever.
+    const settled=Object.keys(sources).every(key=>states[key]?.loaded || states[key]?.error);
+    const live=settled&&motionSettled&&!userChange;
+    motionSettled=settled;userChange=false;
     for(const panel of panels) {
       const element=container.querySelector(`[data-overview="${panel}"]`);
       const html=renderOverviewSection(panel,data,states,received);
@@ -294,7 +335,10 @@ export function mountOverview(container, client) {
       const attentionToggle=hadFocus && focused.hasAttribute('data-attention-toggle');
       const attentionList=hadFocus && focused.id==='ov-attention-items';
       const attentionScroll=element.querySelector('.ov-attention-list.is-expanded')?.scrollTop || 0;
+      const metrics=live?snapshotText(element,'.ov-metric strong',metricKey):null;
       element.innerHTML=html;
+      animateChanges(element,'.ov-metric strong',metrics,metricKey);
+      if(panel==='attention')markNewCritical(element);
       const expandedList=element.querySelector('.ov-attention-list.is-expanded');
       if(expandedList)expandedList.scrollTop=attentionScroll;
       if(hadFocus) {
@@ -304,6 +348,7 @@ export function mountOverview(container, client) {
         (target || fallback)?.focus({preventScroll:true});
       }
     }
+    applyPulses();
     tickClocks();
   }
   function tickClocks() {
@@ -357,7 +402,7 @@ export function mountOverview(container, client) {
     if(!button)return;
     if(button.hasAttribute('data-snooze'))data.snoozed.set(button.dataset.snooze,Date.now()+SNOOZE_MS);
     else data.snoozed.clear();
-    saveSnoozed(data.snoozed);signatures.delete('missions');draw();
+    saveSnoozed(data.snoozed);signatures.delete('missions');userChange=true;draw();
   });
   document.addEventListener('visibilitychange',visibility);visibility();
   return {refresh,dispose(){disposed=true;clearInterval(clock);for(const timer of timers.values())clearTimeout(timer);for(const controller of controllers.values())controller.abort();document.removeEventListener('visibilitychange',visibility);}};
