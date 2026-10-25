@@ -2719,6 +2719,7 @@ def _cmd_cp_web(args) -> int:
                              review_quorum=_review_quorum_config(cp),
                              usage_retention=usage_retention, attention=attention,
                              ci_fix=ci_fix,
+                             github_pg_dsn=dsn,
                              public_port=args.collab_public_port,
                              public_host=args.collab_public_host,
                              collab_only=args.collab_only,
