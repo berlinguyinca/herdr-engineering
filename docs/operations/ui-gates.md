@@ -120,7 +120,7 @@ there and their canary is asserted on screen; `progress` is drawn only as the nu
 is not a number; the other 12 (`bindings`, `categories`, `category`, `changed_files`, `diff_summary`, `head`, `means`, `order`,
 `review_quorum`, `self_reports`, `touched_paths`, `value`) are server objects that no page source reads, which a source scan asserts
 (it fails the day a renderer reads one, and it has its own known-bad lines; `head` and `value` are matched by pattern: a `.head` other than the live-view flag, and `.value` inside an `esc()` call, so it is a heuristic, not a proof). The same file renders the pane that reports itself as
-remote and every proposal kind. Three placements from before are still asserted directly: the lineage an external agent reported,
+remote and every proposal kind. A consultation's asker/target reference nodes carry `attrs.consultation` (the id of their thread node); the inspector lists every attribute, so the canary is asserted visible and inert once such a node is opened (this was the one tainted field no placement reached). Three placements from before are still asserted directly: the lineage an external agent reported,
 a milestone label (the proxy adds a milestone to an empty progress response, because a real one needs a linked mission; the states
 test does the same), and the target of a bounded task. The payload also breaks out of attributes (a quote, an event handler and a marker attribute first).
 
