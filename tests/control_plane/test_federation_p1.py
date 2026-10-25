@@ -16,7 +16,8 @@ from herdr_engineering.control_plane.repo import ControlPlaneRepo
 
 ROOM = "room_" + "0123456789abcdefghjkmnpqrs"            # the peer's one mirror room
 OTHER_ROOM = "room_" + "sqrnmkjhgfedcba9876543210z"[:26]
-FP = "ab" * 8                                              # 16 hex chars
+PUB = "ab" * 32                                            # a raw public key as the YAML pins it (P2: hex)
+FP = fed.key_fingerprint_of(PUB)                           # the FULL 64-hex fingerprint the principal carries
 PEER = fed.peer_principal("acme", FP)
 OP = {"kind": "operator", "id": "key:op", "authenticated_by": "api_key"}
 OPEN = {"kind": "operator", "id": "open-listener", "authenticated_by": "open_listener"}
@@ -34,8 +35,8 @@ class _Anyone:
         return {"rooms": ("*",), "missions": ("*",)}
 
 
-def cfg(enabled=True, peer_enabled=True, room=ROOM, fp=FP, peer="acme"):
-    return {"enabled": enabled, "peers": {peer: {"enabled": peer_enabled, "key_fingerprint": fp, "mirror_room": room}}}
+def cfg(enabled=True, peer_enabled=True, room=ROOM, pub=PUB, peer="acme"):
+    return {"enabled": enabled, "peers": {peer: {"enabled": peer_enabled, "public_key": pub, "mirror_room": room}}}
 
 
 class World:
@@ -214,7 +215,7 @@ def test_a_wildcard_key_scope_never_opens_a_peer(w):
 
 def test_peer_enabled_requires_federation_the_peer_and_the_pinned_key(w):
     w.node("peer:acme.ok")
-    for section in (None, {}, cfg(enabled=False), cfg(peer_enabled=False), cfg(fp="cd" * 8), cfg(peer="other"),
+    for section in (None, {}, cfg(enabled=False), cfg(peer_enabled=False), cfg(pub="cd" * 32), cfg(peer="other"),
                     cfg(enabled="yes"), {"enabled": True, "peers": {"acme": {"enabled": True}}}, cfg(room="*")):
         w.section = section
         refused(w.node, "peer:acme.later")
@@ -248,20 +249,19 @@ def test_loader_defaults_to_off():
 
 @pytest.mark.parametrize("section", [
     "yes", [], {"enabled": "true"}, {"enabled": 1}, {"enabled": True, "surprise": 1}, {"peers": []},
-    {"peers": {"acme": "x"}}, {"peers": {"*": {"enabled": True, "key_fingerprint": FP, "mirror_room": ROOM}}},
-    {"peers": {"a.b": {"enabled": True, "key_fingerprint": FP, "mirror_room": ROOM}}},
-    {"peers": {"a:b": {"enabled": True, "key_fingerprint": FP, "mirror_room": ROOM}}},
-    {"peers": {"Acme": {"enabled": True, "key_fingerprint": FP, "mirror_room": ROOM}}},
-    {"peers": {"acme": {"enabled": True, "key_fingerprint": FP, "mirror_room": "*"}}},
-    {"peers": {"acme": {"enabled": True, "key_fingerprint": FP, "mirror_room": ["*"]}}},
-    {"peers": {"acme": {"enabled": True, "key_fingerprint": FP, "mirror_room": ROOM + "*"}}},
-    {"peers": {"acme": {"enabled": True, "key_fingerprint": FP, "mirror_room": "room_short"}}},
-    {"peers": {"acme": {"enabled": True, "key_fingerprint": FP}}},
-    {"peers": {"acme": {"enabled": True, "mirror_room": ROOM}}},
+    {"peers": {"acme": "x"}}, {"peers": {"*": {"enabled": True, "public_key": PUB, "mirror_room": ROOM}}},
+    {"peers": {"a.b": {"enabled": True, "public_key": PUB, "mirror_room": ROOM}}},
+    {"peers": {"a:b": {"enabled": True, "public_key": PUB, "mirror_room": ROOM}}},
+    {"peers": {"Acme": {"enabled": True, "public_key": PUB, "mirror_room": ROOM}}},
+    {"peers": {"acme": {"enabled": True, "public_key": PUB, "mirror_room": "*"}}},
+    {"peers": {"acme": {"enabled": True, "public_key": PUB, "mirror_room": ["*"]}}},
+    {"peers": {"acme": {"enabled": True, "public_key": PUB, "mirror_room": ROOM + "*"}}},
+    {"peers": {"acme": {"enabled": True, "public_key": PUB, "mirror_room": "room_short"}}},
+    {"peers": {"acme": {"enabled": True, "mirror_room": ROOM}}},                                       # no key at all
     {"peers": {"acme": {"enabled": True, "key_fingerprint": "zz", "mirror_room": ROOM}}},
-    {"peers": {"acme": {"enabled": "on", "key_fingerprint": FP, "mirror_room": ROOM}}},
-    {"peers": {"acme": {"enabled": True, "key_fingerprint": FP, "mirror_room": ROOM, "rooms": ["*"]}}},
-    {"peers": {"acme": {"enabled": True, "key_fingerprint": FP, "mirror_room": ROOM, "missions": ["*"]}}},
+    {"peers": {"acme": {"enabled": "on", "public_key": PUB, "mirror_room": ROOM}}},
+    {"peers": {"acme": {"enabled": True, "public_key": PUB, "mirror_room": ROOM, "rooms": ["*"]}}},
+    {"peers": {"acme": {"enabled": True, "public_key": PUB, "mirror_room": ROOM, "missions": ["*"]}}},
 ])
 def test_loader_rejects_wildcards_and_anything_malformed(section):
     with pytest.raises(fed.FederationConfigError):

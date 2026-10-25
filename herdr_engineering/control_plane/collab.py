@@ -36,6 +36,7 @@ from . import collab_mentions as mentions
 from . import collab_models, ids, logfile_lock
 from .collab_attention import AttentionMixin
 from .collab_context import ContextMixin
+from .collab_federation import FederationMixin
 from .collab_workbench import WorkbenchMixin
 from .redact import redact_text
 
@@ -59,19 +60,23 @@ STREAM_ID = "log"
 SAFETY_EVENTS = frozenset({
     "member_removed", "agent_revoked", "user_decided", "join_token_revoked",
     "xlink_revoked", "workspace_unlinked", "mission_unlinked", "agent_grant_revoked",
-    "helpers_paused", "helper_cancelled", "egress_removed"})
+    "helpers_paused", "helper_cancelled", "egress_removed",
+    # ADR-0008 P2: the pre-paid revocations of a room share and of an enabled federation peer
+    "federation_share_revoked", "federation_peer_disabled"})
 BULK_EVENTS = frozenset({"message", "comment_added", "comment_revised", "audit_denied", "task_progress",
                          "steer_proposed", "consult_asked", "proposal_submitted", "external_status_changed"})
 # creation event -> kind (what is outstanding is recomputed from state, see _recount)
 REVOCABLE_CREATE = {"member_added": "member", "agent_granted": "grant", "agent_enrolled": "agent",
                     "join_token_created": "join", "xlink_created": "xlink", "workspace_linked": "workspace",
                     "mission_linked": "mission", "helper_requested": "helper",
-                    "egress_decided": "egress", "egress_promoted": "egress", "room_profile_set": "egress"}
+                    "egress_decided": "egress", "egress_promoted": "egress", "room_profile_set": "egress",
+                    "federation_share_granted": "fedshare", "federation_peer_enabled": "fedpeer"}
 # every event that can change what _recount() returns (the cache is cleared when one is committed)
 COUNT_EVENTS = frozenset(REVOCABLE_CREATE) | {
     "member_removed", "agent_grant_revoked", "agent_grant_expired", "agent_revoked", "join_token_revoked",
     "xlink_revoked", "workspace_unlinked", "mission_unlinked",
-    "helper_started", "helper_finished", "helper_cancelled", "helper_expired", "egress_removed"}
+    "helper_started", "helper_finished", "helper_cancelled", "helper_expired", "egress_removed",
+    "federation_share_revoked", "federation_peer_disabled"}
 ORG_ID = "default"  # single-organization deployment (spec: no federation in v1)
 
 # "task" is the human right to give an agent work; the agent-side rights are "instruct"
@@ -344,7 +349,7 @@ class FileEventLog:
     record = record_required
 
 
-class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin):
+class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixin):
     def __init__(self, authenticator: UserAuthenticator, *, sink: Any = None,
                  now=None, enrollment_ttl: float = 600.0, credential_ttl: float = 12 * 3600.0,
                  stream_poll_seconds: float = 1.0, message_limit: int = 60,
@@ -469,6 +474,7 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin):
         self._init_workbench()
         self._init_context()
         self._init_attention()
+        self._init_federation()
 
     # ------------------------------------------------------------ plumbing
     @property
@@ -544,6 +550,7 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin):
                  for hp in ((room.get("profile") or {}).get("permanent_hosts") or ())}
         hosts |= {(r["room_id"], r["host_port"]) for r in self._egress.values() if r["state"] == "approved"}
         out["egress"] = len(hosts)
+        out.update(self._fed_recount())
         return out
 
     def _outstanding(self) -> int:
@@ -700,7 +707,8 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin):
     # --------------------------------------------------------- state fold
     def _apply(self, ev: dict) -> None:
         t, p, seq = ev["event_type"], ev["payload"], ev["sequence"]
-        if self._apply_workbench(ev) or self._apply_context(ev) or self._apply_attention(ev):
+        if (self._apply_workbench(ev) or self._apply_context(ev) or self._apply_attention(ev)
+                or self._apply_federation(ev)):
             return
         if t == "external_usage_reserved":
             k = (p["scope"], p["key"])
@@ -5398,6 +5406,8 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin):
                         return 200, self.list_consultations(pr, rid)
                     if parts[2:] == ["xlinks"]:
                         return 200, self.list_links(pr, rid)
+                    if parts[2:] == ["federation", "shares"]:
+                        return 200, self.list_shares(pr, rid)
                     if parts[2:] == ["comments"]:
                         return 200, self.list_comments(pr, rid, query)
                     if n == 5 and parts[2] == "comments" and parts[4] == "history":
@@ -5570,6 +5580,10 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin):
                         return 200, self.answer_consultation(pr, rid, parts[3], body)
                     if n == 5 and parts[2] == "consultations" and parts[4] == "cancel":
                         return 200, self.cancel_consultation(pr, rid, parts[3])
+                    if parts[2:] == ["federation", "shares"]:
+                        return self.grant_share(pr, rid, body)
+                    if n == 6 and parts[2:3] == ["federation"] and parts[3] == "shares" and parts[5] == "revoke":
+                        return 200, self.revoke_share(pr, rid, parts[4])
                     if parts[2:] == ["xlinks"]:
                         return self.create_link(pr, rid, body)
                     if n == 5 and parts[2] == "xlinks" and parts[4] == "revoke":
