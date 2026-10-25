@@ -111,6 +111,18 @@ test('keyboard: graph nodes are focusable and Enter drills; table is a real tabl
   assert.ok(await page.locator('table.arch-table caption').innerText());
 }));
 
+// A live refresh can replace an element between locating it and reading its style; getComputedStyle of a
+// detached node returns '' for every property. Retry until the value is a real colour (it never is a
+// permanent state: the view always has these elements once rendered).
+async function styleOf(page, selector, prop) {
+  for (let i = 0; i < 20; i++) {
+    const v = await page.locator(selector).first().evaluate((e, p) => getComputedStyle(e)[p], prop);
+    if (/\d/.test(v)) return v;
+    await page.waitForTimeout(100);
+  }
+  throw new Error(`${selector} never reported a computed ${prop}`);
+}
+
 for (const [name, ctx] of [['dark-wide', {colorScheme: 'dark', viewport: {width: 1440, height: 900}}],
   ['light-mobile', {colorScheme: 'light', viewport: {width: 390, height: 844}}],
   ['dark-mobile', {colorScheme: 'dark', viewport: {width: 390, height: 844}}],
@@ -122,17 +134,17 @@ for (const [name, ctx] of [['dark-wide', {colorScheme: 'dark', viewport: {width:
     await page.locator('[data-node="module:app.core"]').waitFor();
     const over = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
     assert.ok(over <= 1, `horizontal overflow ${over}px`);
-    const bg = await page.locator('.arch').evaluate(e => getComputedStyle(e).backgroundColor);
+    const bg = await styleOf(page, '.arch', 'backgroundColor');
     if (ctx.colorScheme === 'dark') assert.equal(bg, 'rgb(22, 24, 29)'); else assert.equal(bg, 'rgb(255, 255, 255)');
     // headings must actually be readable on the view's own surface (WCAG AA 4.5:1)
     const lum = c => { const [r, g, b] = c.match(/\d+/g).slice(0, 3).map(Number).map(v => { v /= 255; return v <= .03928 ? v / 12.92 : ((v + .055) / 1.055) ** 2.4; }); return .2126 * r + .7152 * g + .0722 * b; };
     const ratio = (x, y) => { const [hi, lo] = [lum(x), lum(y)].sort((m, n) => n - m); return (hi + .05) / (lo + .05); };
     for (const sel of ['.arch h1', '.arch .arch-meta', '.arch-table td', '.arch-activity h2', '.arch-activity h3', '.arch-activity li', '.arch-timeline h3', '.arch-timeline small', '.arch-request label', '.arch-note']) {
-      const fg = await page.locator(sel).first().evaluate(e => getComputedStyle(e).color);
+      const fg = await styleOf(page, sel, 'color');
       assert.ok(ratio(fg, bg) >= 4.5, `${sel} contrast ${ratio(fg, bg).toFixed(2)} on ${name}: ${fg} vs ${bg}`);
     }
-    const nodeFill = await page.locator('.arch-node rect').first().evaluate(e => getComputedStyle(e).fill);
-    const nodeText = await page.locator('.arch-node .t1').first().evaluate(e => getComputedStyle(e).fill);
+    const nodeFill = await styleOf(page, '.arch-node rect', 'fill');
+    const nodeText = await styleOf(page, '.arch-node .t1', 'fill');
     assert.ok(ratio(nodeText, nodeFill) >= 4.5, `node label contrast on ${name}: ${nodeText} vs ${nodeFill}`);
     await shot(page, `architecture-${name}.png`);
   }, ctx));
