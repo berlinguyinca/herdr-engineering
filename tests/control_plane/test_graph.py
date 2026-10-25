@@ -669,6 +669,36 @@ def test_fork_dependency_walk_is_bounded_and_survives_cycles():
     assert _stale_by_gate(repo, VIEWER, ("task:t0",)) == {"gate:far": True}
 
 
+OTHER = {"kind": "agent", "id": "key:other", "authenticated_by": "api_key"}
+
+
+def test_a_stranger_cannot_decide_and_the_winner_keeps_its_own_evidence():
+    repo, svc, f = make()
+    _fork_world(f)
+    with pytest.raises(PermissionError):                                          # not a writer of the winner: refused at write
+        f.edge("supersession", "approach:fk-1", "attempt:a1", principal=OTHER)
+    assert _stale_by_gate(repo, VIEWER, ("task:A", "task:B", "task:C")) == {"gate:A": False, "gate:B": False, "gate:C": False}
+    # the winner rests on the very node it replaces (its origin); its own evidence is not what it lost
+    f.edge("dependency", "approach:fk-1", "attempt:a1")
+    f.edge("validated", "gate:W", "approach:fk-1", {"commit": "b" * 40})
+    f.edge("supersession", "approach:fk-1", "attempt:a1")
+    got = _stale_by_gate(repo, VIEWER, ("task:A", "task:B", "approach:fk-1"))
+    assert got == {"gate:A": True, "gate:B": False, "gate:W": False}
+
+
+def test_fork_dependency_walk_finds_the_shortest_path_whatever_the_edge_order():
+    repo, svc, f = make()
+    f.edge("validated", "gate:x", "task:t0", {"commit": "c0"})
+    f.edge("dependency", "task:t0", "task:s1")                # the short way: t0 -> s1 -> t9
+    chain = ["task:t0", "task:c1", "task:c2", "task:c3", "task:c4", "task:c5", "task:t9"]
+    for a, b in zip(chain, chain[1:]):                          # the long way: six hops to t9
+        f.edge("dependency", a, b)
+    f.edge("dependency", "task:s1", "task:t9")
+    f.edge("dependency", "task:t9", "task:t10")
+    f.edge("supersession", "approach:fk-1", "task:t10")        # reached only through the short way (3 hops)
+    assert _stale_by_gate(repo, VIEWER, ("task:t0",)) == {"gate:x": True}
+
+
 def test_wildcard_remove_is_commutative_and_does_not_leak_reason():
     repo, svc, clock = make_clocked()
     f = Feed(svc)

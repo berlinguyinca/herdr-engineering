@@ -80,6 +80,7 @@ BOUND_EDGE_TYPES = frozenset({"reviewed", "validated"})
 # How far a fork decision reaches through `dependency` edges when marking evidence stale (bounded, per read).
 FORK_DEPENDENCY_DEPTH = 6
 FORK_DEPENDENCY_NODES = 200
+FORK_SCAN_BUDGET = 5000                 # edge keys examined per subject
 LINEAGE_EVENT_TYPES = ("node.upsert", "node.state", "edge.add", "edge.remove")
 # COMMONS kinds are shared identities that several independent emitters legitimately
 # mention (a commit, a PR, an issue, a CI run, a published artifact): anyone may create
@@ -1219,27 +1220,35 @@ class GraphProjection:
         evidence admitted after the decision is current. Plain retries (a supersession whose winner is not an
         approach) keep their old behaviour. Derived per caller over the edges the caller can see; nothing is written.
         """
-        ck = ("fork-decision", edge.to_id)
+        ck = ("\0fork-decision", edge.to_id)
         if ck not in ctx:
-            best, seen, todo = None, {edge.to_id}, [(edge.to_id, 0)]
-            while todo:
-                nid, depth = todo.pop()
+            # Breadth-first, so every node is first reached at its minimum depth; the number of keys looked at is
+            # budgeted (a hub with thousands of edges must not make one read expensive).
+            depth_of, todo, budget = {edge.to_id: 0}, deque([edge.to_id]), FORK_SCAN_BUDGET
+            decisions = []                      # (winner, loser, add)
+            while todo and budget > 0:
+                nid = todo.popleft()
                 for key in self._in.get(nid, ()):
+                    budget -= 1
+                    if key[0] != "supersession" or not key[1].startswith("approach:"):
+                        continue
                     e = self._edges[key]
-                    if (key[0] == "supersession" and key[1].startswith("approach:") and self._live(e)
-                            and not self._is_removed(e) and self._edge_visible(principal, e)):
-                        add = e.adds.best()
-                        if best is None or add[2] > best[2]:
-                            best = add
-                if depth >= FORK_DEPENDENCY_DEPTH:
+                    # who may write the edge is the graph's own rule: only a writer of the winner (or an operator)
+                    if self._live(e) and not self._is_removed(e) and self._edge_visible(principal, e):
+                        decisions.append((key[1], nid, e.adds.best()))
+                if depth_of[nid] >= FORK_DEPENDENCY_DEPTH:
                     continue
                 for key in self._out.get(nid, ()):
+                    budget -= 1
+                    if key[0] != "dependency" or key[2] in depth_of or len(depth_of) >= FORK_DEPENDENCY_NODES:
+                        continue
                     e = self._edges[key]
-                    if (key[0] == "dependency" and key[2] not in seen and len(seen) < FORK_DEPENDENCY_NODES
-                            and self._live(e) and not self._is_removed(e) and self._edge_visible(principal, e)):
-                        seen.add(key[2])
-                        todo.append((key[2], depth + 1))
-            ctx[ck] = best
+                    if self._live(e) and not self._is_removed(e) and self._edge_visible(principal, e):
+                        depth_of[key[2]] = depth_of[nid] + 1
+                        todo.append(key[2])
+            # a winner that is itself part of the subject's closure is what the subject rests on, not what it lost
+            adds = [add for winner, _, add in decisions if winner not in depth_of]
+            ctx[ck] = max(adds, key=lambda t: t[2]) if adds else None
         best = ctx[ck]
         return best is not None and _after(best, my_add)
 
