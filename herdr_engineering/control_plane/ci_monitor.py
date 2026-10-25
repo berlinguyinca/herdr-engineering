@@ -71,12 +71,17 @@ def bound_ci_provider(factory, provider_url=None):
 class CIMonitor:
     def __init__(self, *, provider_factory=None, interval=30, repo_limit=500,
                  budget=120, now=None, on_transition=None, actions_enabled=False,
-                 on_observation=None):
+                 on_observation=None, max_in_flight=4, max_reads_per_refresh=600):
+        from ..ci import _ProviderReadScheduler
+        self._scheduler = _ProviderReadScheduler(max_in_flight)
+        self._max_reads_per_refresh = max(0, min(2400, max_reads_per_refresh))
+        self._cursor = 0
         self._measurements = _Measurements()
         self._factory = provider_factory or _provider
         from .ci_history import CIHistory
         self._history = CIHistory(provider_factory=self._factory, interval=interval,
-                                  budget=budget, now=now, repo_limit=repo_limit)
+                                  budget=budget, now=now, repo_limit=repo_limit,
+                                  scheduler=self._scheduler, max_reads_per_refresh=max_reads_per_refresh)
         #: control_plane.ci_actions in the fleet file; retry/cancel are off unless set.
         self.actions_enabled = bool(actions_enabled)
         self._interval = max(5, interval)
@@ -117,6 +122,9 @@ class CIMonitor:
     def history(self, *, start=True):
         return self._history.snapshot(start=start)
 
+    def summary_snapshot(self, *, start=True):
+        return self._history.summary_snapshot(start=start)
+
     def start(self):
         with self._lock:
             if self._thread is None and not self._stop.is_set():
@@ -126,6 +134,7 @@ class CIMonitor:
 
     def close(self):
         self._stop.set()
+        self._scheduler.close()
         self._history.close()
         if self._thread:
             self._thread.join(timeout=1)
@@ -144,32 +153,33 @@ class CIMonitor:
             return
         started = self._now()
         try:
-            self._collect()
+            reads = self._scheduler.refresh(budget=self._budget, max_reads=self._max_reads_per_refresh,
+                                            now=self._now, measurements=self._measurements)
+            self._collect(reads)
         finally:
             self._update(refreshing=False, checked_at=_stamp())
             self._measurements.refreshed(self._now() - started)
             self._refresh_lock.release()
 
-    def _collect(self):
-        self._update(refreshing=True, error=None,
+    def _collect(self, reads):
+        self._update(refreshing=True, stale=bool(self._view['pipelines']), error=None,
                      progress={'completed': 0, 'total': None, 'current': 'Discovering repositories'})
         started = self._now()
         try:
             provider = self._factory()
             if not provider.available:
-                self._update(available=False, status='not_configured', stale=bool(self._last_success),
+                self._update(available=False, status='not_configured', stale=bool(self._view['pipelines']) or self._last_success is not None,
                              error='Configure a server-side Woodpecker token to connect CI.')
                 return
             repos = []
             page = 1
             seen = set()
             while len(repos) < self._repo_limit:
-                self._measurements.provider_call()
-                batch = provider.repos(page=page, per_page=50)
+                batch = reads.call(provider.repos, page=page, per_page=50)
                 unique = [row for row in batch if str(row.get('id', row.get('repository'))) not in seen]
                 seen.update(str(row.get('id', row.get('repository'))) for row in unique)
                 repos.extend(unique[:self._repo_limit - len(repos)])
-                if len(batch) != 50 or not unique:
+                if getattr(provider, 'repos_are_snapshot', False) or len(batch) != 50 or not unique:
                     break
                 page += 1
                 if self._now() - started > self._budget:
@@ -179,7 +189,13 @@ class CIMonitor:
             pipelines, errors = {}, {}
             successful_repos = set()
             counts = Counter(row.get('repository') for row in repos)
-            for index, repo in enumerate(repos):
+            from ..ci import _ReadBudgetExceeded
+            if repos:
+                self._cursor %= len(repos)
+            order = repos[self._cursor:] + repos[:self._cursor]
+            attempted = set()
+            for index, (repo, rows, read_error) in enumerate(reads.map(
+                    lambda repo: provider.pipelines(str(repo['id']), per_page=20), order)):
                 name = repo.get('repository')
                 if not isinstance(name, str) or not name:
                     continue
@@ -188,22 +204,29 @@ class CIMonitor:
                 if self._stop.is_set():
                     return
                 try:
-                    if self._now() - started > self._budget:
-                        raise TimeoutError('refresh budget exceeded')
-                    self._measurements.provider_call()
-                    rows = provider.pipelines(str(repo['id']), per_page=20)
+                    if read_error is not None:
+                        raise read_error
                     successful_repos.add(str(repo['id']))
                     pipelines[group] = [redact_payload({**_dict(row), 'repository': name,
                                          'provider_repo_id': repo['id'], 'provider_url': provider.base_url.rstrip('/')}) for row in rows]
                 except Exception as exc:
-                    pipelines[group] = previous.get(group, [])
+                    pipelines[group] = [row for row in previous.get(group, [])
+                                        if row.get('provider_url') == provider.base_url.rstrip('/')
+                                        and str(row.get('provider_repo_id')) == str(repo['id'])
+                                        and row.get('repository') == name]
                     errors[group] = _error(exc)[1]
+                if not isinstance(read_error, _ReadBudgetExceeded):
+                    attempted.add(str(repo['id']))
                 self._update(pipelines=copy.deepcopy({**previous, **pipelines}), repos=redact_payload(repos),
                              progress={'completed': index + 1, 'total': len(repos), 'current': name})
+            # Completion order is nondeterministic; fairness follows submission
+            # order and skips reads that could not acquire a budget/capacity slot.
+            for repo in order:
+                if str(repo['id']) in attempted:
+                    self._cursor = (repos.index(repo) + 1) % len(repos)
             agents, agents_error = [], None
             try:
-                self._measurements.provider_call()
-                agents = redact_payload(provider.agents())
+                agents = redact_payload(reads.call(provider.agents))
             except Exception:
                 agents_error = 'Runner inventory requires provider permission or is unavailable.'
             # A full page at the safety cap must never look like a complete inventory.
@@ -223,7 +246,7 @@ class CIMonitor:
                          error=None)
         except Exception as exc:
             status, message = _error(exc)
-            self._update(available=False, status=status, stale=bool(self._last_success), error=message)
+            self._update(available=False, status=status, stale=bool(self._view['pipelines']) or self._last_success is not None, error=message)
 
     def _persist_observations(self, pipelines):
         """Deduplicate the poll inventory independently of retained history.

@@ -345,12 +345,23 @@ def test_monitor_reports_history_failure_and_recovers_against_real_provider_serv
     from herdr_engineering.ci import WoodpeckerProvider
     from herdr_engineering.control_plane.ci_monitor import CIMonitor
 
+    requests = []
+    history_mode = [False]
+
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
+            requests.append(self.path)
             if self.path.startswith('/api/user/repos'):
                 body = [{'id': 17, 'full_name': 'org/app'}]
             elif self.path.startswith('/api/repos/17/pipelines'):
                 body = [{'id': 1, 'number': 1, 'status': 'success', 'branch': 'main', 'commit': 'abc'}]
+                if history_mode[0]:
+                    from urllib.parse import parse_qs, urlsplit
+                    query = parse_qs(urlsplit(self.path).query)
+                    page, per_page = int(query.get('page', ['1'])[0]), int(query.get('perPage', ['50'])[0])
+                    rows = [{'id': n, 'number': n, 'status': 'success', 'branch': 'main',
+                             'commit': 'abc', 'created': 1792627200 + n} for n in range(75, 0, -1)]
+                    body = rows[(page - 1) * per_page:page * per_page]
             else:
                 body = []
             value = json.dumps(body).encode()
@@ -391,6 +402,22 @@ def test_monitor_reports_history_failure_and_recovers_against_real_provider_serv
         assert monitor.snapshot(start=False)['status'] == 'connected'
         assert repo.ci_reports()['pipelines'][0]['state'] == 'success'
         assert len(disk_event_journal.events()) == 1
+        history_mode[0] = True
+        requests.clear()
+        monitor._history.refresh()
+        full = monitor.history(start=False)
+        compact = monitor.summary_snapshot(start=False)
+        assert compact['projects'][0]['pipeline_count'] == 75
+        assert len(requests) == 6  # inventory, two pages, three validation reads
+        assert len(json.dumps(compact)) < len(json.dumps(full)) / 10
+        requests.clear()
+        monitor._history.refresh()
+        assert len(requests) == 2  # inventory and unchanged head only
+        requests.clear()
+        for _ in range(10):
+            assert monitor.summary_snapshot(start=False)['revision'] == compact['revision']
+        assert requests == []
+        assert len(disk_event_journal.events()) == 1  # backfill never writes reports
     finally:
         monitor.close()
         httpd.shutdown()

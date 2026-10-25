@@ -10,7 +10,7 @@ import copy
 import json
 import threading
 import time
-from collections import deque
+from collections import Counter, deque
 from datetime import UTC, datetime, timedelta
 
 from .ci_observability import _Measurements
@@ -37,7 +37,16 @@ def _coverage():
 class CIHistory:
     def __init__(self, *, provider_factory, interval=30, budget=120, now=None,
                  wall_now=None, repo_limit=500, page_limit=60, run_limit=3000,
-                 total_limit=20000, byte_limit=16 * 1024 * 1024, pages_per_refresh=600):
+                 total_limit=20000, byte_limit=16 * 1024 * 1024, pages_per_refresh=600,
+                 max_in_flight=4, max_reads_per_refresh=600, scheduler=None):
+        from ..ci import _ProviderReadScheduler
+        self._scheduler = scheduler or _ProviderReadScheduler(max_in_flight)
+        self._owns_scheduler = scheduler is None
+        self._max_reads_per_refresh = max(0, min(2400, max_reads_per_refresh))
+        self._reads = None
+        self._summary_projects = []
+        self._summary = None
+        self._summary_revision = 0
         self._measurements = _Measurements()
         self._factory = provider_factory
         self._interval = max(5, interval)
@@ -81,6 +90,35 @@ class CIHistory:
         self._measurements.observe(result, len(result['pipelines']), result['stale'])
         return result
 
+    def summary_snapshot(self, *, start=True):
+        """Detached per-project counts; request work scales with repos, not runs.
+
+        Outcome counts describe retained provider observations, not test results
+        or a complete time window. Routes supplying filters/metrics build on this
+        envelope separately; the legacy snapshot retains its exact shape.
+        """
+        if start:
+            self.start()
+        with self._lock:
+            view = {key: self._view[key] for key in
+                    ('available', 'status', 'refreshing', 'stale', 'error', 'scope')}
+            view['projects'] = [{**project, 'coverage': self._view['coverage'].get(
+                str(project['provider_repo_id']), _coverage())} for project in self._summary_projects]
+            view = copy.deepcopy(view)
+            if self._last_check is not None and self._now() - self._last_check > self._interval * 3:
+                view['stale'] = True
+            # checked_at is poll evidence, not a new observation revision.
+            comparable = copy.deepcopy(view)
+            for project in comparable['projects']:
+                project['coverage'].pop('checked_at', None)
+            if self._summary is None or comparable != self._summary:
+                self._summary = comparable
+                self._summary_revision += 1
+                self._summary_generated_at = self._wall_now().isoformat()
+            view.update(revision=self._summary_revision, generated_at=self._summary_generated_at)
+        self._measurements.observe(view, len(view['projects']), view['stale'])
+        return view
+
     def start(self):
         with self._lock:
             if self._thread is None and not self._stop.is_set():
@@ -90,6 +128,8 @@ class CIHistory:
 
     def close(self):
         self._stop.set()
+        if self._owns_scheduler:
+            self._scheduler.close()
         if self._thread:
             self._thread.join(timeout=1)
 
@@ -109,8 +149,7 @@ class CIHistory:
             if self._stop.is_set() or self._now() - started >= self._budget:
                 error = 'Repository discovery budget exceeded.'
                 break
-            self._measurements.provider_call()
-            batch = provider.repos(page=page, per_page=50)
+            batch = self._reads.call(provider.repos, page=page, per_page=50)
             unique = []
             for row in batch:
                 rid = str(row.get('id', ''))
@@ -152,13 +191,22 @@ class CIHistory:
         with self._lock:
             scope = {**self._view['scope'], 'inventory_complete': inventory_complete,
                      'inventory_error': inventory_error}
-        self._update(available=True, status='partial' if partial else 'syncing' if pending else 'connected',
-                     stale=partial or old_outcomes, error=None, repos=repos, pipelines=rows, coverage=coverage, scope=scope)
+            self._summary_projects = [
+                {'provider_url': self._provider_url, 'provider_repo_id': repo['id'],
+                 'repository': repo['repository'],
+                 'pipeline_count': len(self._states[str(repo['id'])]['rows']),
+                 'outcomes': dict(Counter(row.get('state') or row.get('status') or 'unknown'
+                                         for row in self._states[str(repo['id'])]['rows'].values()))}
+                for repo in repos]
+            self._update(available=True, status='partial' if partial else 'syncing' if pending else 'connected',
+                         stale=partial or old_outcomes, error=None, repos=repos, pipelines=rows, coverage=coverage, scope=scope)
 
     def refresh(self):
         if not self._refresh_lock.acquire(blocking=False):
             return
         started = self._now()
+        self._reads = self._scheduler.refresh(budget=self._budget, max_reads=self._max_reads_per_refresh,
+                                              now=self._now, measurements=self._measurements)
         with self._lock:
             # Retain the visible rows while withholding aging coverage evidence.
             coverage = copy.deepcopy(self._view['coverage'])
@@ -188,6 +236,15 @@ class CIHistory:
             self._states = {}
             self._provider_url = provider_url
         repos, complete, inventory_error = self._inventory(provider, started)
+        if not complete:
+            # An incomplete inventory cannot prove a previously seen repo was
+            # deleted. Retain its rows, but revoke its coverage until rechecked.
+            seen = {str(repo['id']) for repo in repos}
+            with self._lock:
+                repos.extend(repo for repo in self._view['repos']
+                             if str(repo['id']) not in seen
+                             and repo.get('provider_url') == self._provider_url)
+            repos = repos[:self._repo_limit]
         self._states = {str(repo['id']): self._states.get(str(repo['id']), self._new_state()) for repo in repos}
         self._run_count = sum(len(s['rows']) for s in self._states.values())
         self._byte_count = sum(sum(s['sizes'].values()) for s in self._states.values())
@@ -197,13 +254,18 @@ class CIHistory:
             self._publish(repos, complete, inventory_error)
             self._last_check = self._now()
             return
+        self._cursor %= len(repos)
         order = repos[self._cursor:] + repos[:self._cursor]
-        queue = deque(order)
+        # Read the selected repository heads before any mutable-page rechecks or
+        # continuation. The logical page cap remains separate from the I/O cap,
+        # which counts discovery and every boundary/final validation as well.
+        selected = order[:self._pages_per_refresh]
+        heads = {str(repo['id']): (batch, error) for repo, batch, error in self._reads.map(
+            lambda repo: self._fetch(provider, repo, 1), selected)}
+        queue = deque(selected)
         prepared = set()
         pages = 0
         while queue and pages < self._pages_per_refresh and not self._stop.is_set():
-            if self._now() - started >= self._budget:
-                break
             repo = queue.popleft()
             rid = str(repo['id'])
             state = self._states[rid]
@@ -212,7 +274,9 @@ class CIHistory:
                 head = None
                 if rid not in prepared:
                     prepared.add(rid)
-                    head = self._read(provider, repo, 1)
+                    head, error = heads[rid]
+                    if error is not None:
+                        raise error
                     signature = [(_key(r), r.get('created_at')) for r in head]
                     unchanged = signature == state['head']
                     if unchanged:
@@ -271,7 +335,9 @@ class CIHistory:
                 if not isinstance(exc, ValueError) or not state['coverage']['error']:
                     state['coverage']['error'] = _error(exc)[1]
                 state['coverage']['checked_at'] = self._wall_now().isoformat()
-            self._cursor = (repos.index(repo) + 1) % len(repos)
+            from ..ci import _ReadBudgetExceeded
+            if not isinstance(heads[rid][1], _ReadBudgetExceeded):
+                self._cursor = (repos.index(repo) + 1) % len(repos)
         # A provider can change while pages are being read. Never advertise
         # exhaustion or a watermark based solely on the head seen before the scan.
         for repo in repos:
@@ -334,7 +400,9 @@ class CIHistory:
             state['mutable_pages'].discard(page)
 
     def _read(self, provider, repo, page):
-        self._measurements.provider_call()
+        return self._reads.call(self._fetch, provider, repo, page)
+
+    def _fetch(self, provider, repo, page):
         batch = provider.pipelines(str(repo['id']), page=page, per_page=50)
         return [redact_payload({**(r.to_dict() if hasattr(r, 'to_dict') else dict(r)),
                                'provider_url': self._provider_url, 'provider_repo_id': repo['id'],

@@ -469,3 +469,122 @@ def test_failed_history_provider_reads_are_counted_without_error_text():
     assert measured['provider_calls'] == len(provider.reads) + 1
     assert measured['stale'] is True
     assert 'private provider error' not in str(measured)
+
+
+def test_refresh_reads_all_heads_before_mutable_history_continuations():
+    provider = MemoryProvider(runs(70, days=0.01), repositories=[
+        {'id': i, 'repository': f'org/{i}', 'default_branch': 'main'} for i in (17, 18)])
+    provider.rows[60]['state'] = 'running'
+    cache = history(provider)
+    cache.refresh()
+    provider.reads.clear()
+    cache.refresh()
+    assert {rid for rid, page in provider.reads[:2] if page == 1} == {'17', '18'}
+
+
+def test_read_budget_counts_inventory_boundary_and_final_validation_reads():
+    provider = MemoryProvider(runs(200, days=0.01))
+    cache = history(provider, max_reads_per_refresh=4)
+    cache.refresh()
+    assert cache._measurement_snapshot()['provider_calls'] <= 4
+    view = cache.snapshot(start=False)
+    assert view['pipelines']
+    assert view['stale']
+    assert not view['coverage']['17']['exhausted']
+
+
+def test_compact_summary_is_stable_detached_and_does_not_copy_pipeline_rows():
+    import json
+
+    provider = MemoryProvider(runs(300, days=0.01))
+    cache = history(provider)
+    cache.refresh()
+    full = cache.snapshot(start=False)
+    first = cache.summary_snapshot(start=False)
+    assert 'pipelines' not in first
+    assert first['projects'][0]['pipeline_count'] == 300
+    assert first['projects'][0]['outcomes'] == {'success': 300}
+    assert first['projects'][0]['provider_url'] == provider.base_url
+    assert first['projects'][0]['provider_repo_id'] == 17
+    assert len(json.dumps(first)) < len(json.dumps(full)) / 10
+    reads = len(provider.reads)
+    assert cache.summary_snapshot(start=False) == first
+
+    class Uncopyable(dict):
+        def __deepcopy__(self, memo):
+            raise AssertionError('summary traversed compatibility pipeline rows')
+
+    cache._view['pipelines'] = [Uncopyable(row) for row in full['pipelines']]
+    assert cache.summary_snapshot(start=False) == first
+    assert len(provider.reads) == reads
+    provider.rows[0]['state'] = 'failure'
+    cache.refresh()
+    changed = cache.summary_snapshot(start=False)
+    assert changed['revision'] > first['revision']
+    assert changed['projects'][0]['outcomes'] == {'success': 299, 'failure': 1}
+    changed['projects'].clear()
+    assert cache.summary_snapshot(start=False)['projects']
+
+
+def test_slow_history_returns_with_last_valid_rows_stale_and_no_late_publication():
+    import threading
+
+    provider = MemoryProvider(runs(3))
+    cache = history(provider, budget=0.05)
+    cache.refresh()
+    before = cache.snapshot(start=False)['pipelines']
+    entered, release = threading.Event(), threading.Event()
+    original = provider.pipelines
+
+    def blocked(*args, **kwargs):
+        entered.set()
+        release.wait(3)
+        return [{**row, 'state': 'failure'} for row in original(*args, **kwargs)]
+
+    provider.pipelines = blocked
+    worker = threading.Thread(target=cache.refresh)
+    worker.start()
+    try:
+        assert entered.wait(1)
+        worker.join(0.5)
+        assert not worker.is_alive(), 'refresh exceeded its deadline'
+        view = cache.snapshot(start=False)
+        assert view['pipelines'] == before
+        assert view['stale'] and not view['refreshing']
+        assert not view['coverage']['17']['exhausted']
+    finally:
+        release.set()
+        worker.join(3)
+        cache.close()
+    assert cache.snapshot(start=False)['pipelines'] == before
+
+
+def test_partial_inventory_keeps_unseen_retained_repositories_without_coverage_claims():
+    clock = [0.0]
+    provider = MemoryProvider(runs(1), repositories=[
+        {'id': i, 'repository': f'org/{i}', 'default_branch': 'main'} for i in range(1, 52)])
+    cache = history(provider, now=lambda: clock[0])
+    cache.refresh()
+    original = provider.repos
+
+    def slow_inventory(**kwargs):
+        clock[0] += 121
+        return original(**kwargs)
+
+    provider.repos = slow_inventory
+    cache.refresh()
+    view = cache.snapshot(start=False)
+    assert len(view['repos']) == 51
+    assert len(view['pipelines']) == 51
+    assert view['stale'] and not view['scope']['inventory_complete']
+    assert not any(c['exhausted'] for c in view['coverage'].values())
+
+
+def test_noop_refresh_keeps_summary_revision_and_generated_at():
+    cache = history(MemoryProvider(runs(3)))
+    cache.refresh()
+    first = cache.summary_snapshot(start=False)
+    cache.refresh()
+    second = cache.summary_snapshot(start=False)
+    assert second['revision'] == first['revision']
+    assert second['generated_at'] == first['generated_at']

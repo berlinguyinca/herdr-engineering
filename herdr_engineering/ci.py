@@ -6,16 +6,123 @@ import binascii
 import json
 import re
 import socket
+import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from collections import Counter
+from concurrent.futures import FIRST_COMPLETED, Future, wait
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
 from .control_plane.project_links import repository_language
 from .errors import InvalidError, PermissionError_Engineering, UnreachableError
+
+_READ_DEADLINE = ContextVar('ci_read_deadline', default=None)
+
+
+class _ReadBudgetExceeded(TimeoutError):
+    """A read could not be started within this refresh's limits."""
+
+
+class _ProviderReadScheduler:
+    """Shared capacity survives refresh timeouts; late reads never publish state.
+
+    Workers are daemon threads because arbitrary injected providers cannot be
+    interrupted. There is no unbounded executor queue: every started read owns a
+    slot until the actual call finishes, including after a refresh has returned.
+    """
+
+    def __init__(self, max_in_flight=4):
+        if type(max_in_flight) is not int or not 1 <= max_in_flight <= 32:
+            raise ValueError('max_in_flight must be between 1 and 32')
+        self.max_in_flight = max_in_flight
+        self._slots = threading.BoundedSemaphore(max_in_flight)
+        self._closed = threading.Event()
+
+    def refresh(self, *, budget, max_reads, now, measurements):
+        return _ProviderReadBatch(self, budget, max_reads, now, measurements)
+
+    def close(self):
+        self._closed.set()
+
+
+class _ProviderReadBatch:
+    def __init__(self, scheduler, budget, max_reads, now, measurements):
+        self.scheduler = scheduler
+        self.deadline = time.monotonic() + max(0, budget)
+        self._now = now
+        self._logical_deadline = now() + max(0, budget)
+        self._remaining_reads = max(0, max_reads)
+        self._measurements = measurements
+
+    def remaining(self):
+        return max(0, min(self.deadline - time.monotonic(), self._logical_deadline - self._now()))
+
+    def submit(self, callback, *args, **kwargs):
+        if (not self._remaining_reads or not self.remaining() or self.scheduler._closed.is_set()
+                or not self.scheduler._slots.acquire(timeout=self.remaining())):
+            raise _ReadBudgetExceeded('CI provider refresh budget exceeded')
+        if not self.remaining() or self.scheduler._closed.is_set():
+            self.scheduler._slots.release()
+            raise _ReadBudgetExceeded('CI provider refresh budget exceeded')
+        self._remaining_reads -= 1
+        future = Future()
+
+        def read():
+            token = _READ_DEADLINE.set(self.deadline)
+            try:
+                self._measurements.provider_call()
+                future.set_result(callback(*args, **kwargs))
+            except Exception as exc:
+                future.set_exception(exc)
+            finally:
+                _READ_DEADLINE.reset(token)
+                self.scheduler._slots.release()
+
+        threading.Thread(target=read, name='herdr-ci-read', daemon=True).start()
+        return future
+
+    def call(self, callback, *args, **kwargs):
+        return self.submit(callback, *args, **kwargs).result(timeout=self.remaining())
+
+    def map(self, callback, items):
+        """Yield completed heads before refilling a bounded submission window."""
+        iterator, pending = iter(items), {}
+        exhausted = False
+        while pending or not exhausted:
+            while not exhausted and len(pending) < self.scheduler.max_in_flight:
+                try:
+                    item = next(iterator)
+                except StopIteration:
+                    exhausted = True
+                    break
+                try:
+                    pending[self.submit(callback, item)] = item
+                except TimeoutError as exc:
+                    yield item, None, exc
+                    for item in iterator:
+                        yield item, None, exc
+                    exhausted = True
+            if not pending:
+                continue
+            done, _ = wait(pending, timeout=self.remaining(), return_when=FIRST_COMPLETED)
+            if not done:
+                for item in pending.values():
+                    yield item, None, TimeoutError('CI provider refresh budget exceeded')
+                pending.clear()
+                continue
+            for future in done:
+                item = pending.pop(future)
+                try:
+                    result = future.result()
+                except Exception as exc:
+                    yield item, None, exc
+                else:
+                    yield item, result, None
 
 
 @dataclass
@@ -138,7 +245,11 @@ class WoodpeckerProvider:
             "Authorization": f"Bearer {self.token}", "Accept": "application/json"})
         try:
             opener = getattr(self._client, "urlopen", None) or self._client.open
-            with opener(req, timeout=15) as resp:
+            deadline = _READ_DEADLINE.get()
+            timeout = 15 if deadline is None else min(15, deadline - time.monotonic())
+            if timeout <= 0:
+                raise CIProviderError("timeout")
+            with opener(req, timeout=timeout) as resp:
                 # Read enough overlap to redact a credential crossing the preview
                 # boundary, while keeping download reads independent of log size.
                 limit = _MAX_LOG_CHARS + len(self.token or "") if log_preview else _MAX_RESPONSE_BYTES
