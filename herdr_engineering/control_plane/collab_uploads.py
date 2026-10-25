@@ -12,11 +12,13 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import json
 import re
 import time
 from contextvars import copy_context
 from dataclasses import dataclass, field
 from functools import partial
+from urllib.parse import urlsplit
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from boto3.s3.transfer import TransferConfig
@@ -299,30 +301,127 @@ class CollabUploads:
                                self.bucket, expires, len(normalized['files']),
                                sum(f['size_bytes'] for f in normalized['files']), granted, next_cursor)
 
+    async def _status(self, row):
+        files = row.manifest['files']
+        total = sum(f['size_bytes'] for f in files)
+        total_parts = sum(len(f['parts']) for f in files)
+        uploaded = completed = 0
+        if row.status == 'available':
+            uploaded, completed = total, total_parts
+        elif row.status != 'failed':
+            multipart = {p['relative_path']: p['multipart_id'] for p in await self.store.upload_parts(row.upload_id)}
+            for file in files:
+                key = self._key(row, file)
+                head = await self._head(key)
+                if head:
+                    self._verify_head(head, file)
+                    uploaded += file['size_bytes']
+                    completed += len(file['parts'])
+                elif file['relative_path'] in multipart:
+                    parts = await self._parts(key, multipart[file['relative_path']], file)
+                    uploaded += sum(p['Size'] for p in parts)
+                    completed += len(parts)
+        return UploadStatus(row.upload_id, row.room_id, row.status, len(files), total, uploaded, completed, total_parts)
+
     async def get_upload_status(self, principal, upload_id, authorize):
         async with self.store.lifecycle_lock():
             row = await self._owned(principal, upload_id, authorize)
-            files = row.manifest['files']
-            total = sum(f['size_bytes'] for f in files)
-            total_parts = sum(len(f['parts']) for f in files)
-            uploaded = completed = 0
-            if row.status == 'available':
-                uploaded, completed = total, total_parts
-            elif row.status != 'failed':
-                multipart = {p['relative_path']: p['multipart_id'] for p in await self.store.upload_parts(upload_id)}
-                for file in files:
-                    key = self._key(row, file)
-                    head = await self._head(key)
-                    if head:
-                        self._verify_head(head, file)
-                        uploaded += file['size_bytes']
-                        completed += len(file['parts'])
-                    elif file['relative_path'] in multipart:
-                        parts = await self._parts(key, multipart[file['relative_path']], file)
-                        uploaded += sum(p['Size'] for p in parts)
-                        completed += len(parts)
+            status = await self._status(row)
             await authorize(True, row.room_id)
-            return UploadStatus(upload_id, row.room_id, row.status, len(files), total, uploaded, completed, total_parts)
+            return status
+
+    async def get_room_upload_status(self, principal, upload_id, authorize):
+        """Aggregate progress for a person: the owner of the creating principal or the room owner.
+
+        Exact-principal ownership still governs everything that can change or resume an upload;
+        this read exposes only counts, never a grant, provider reference or file path."""
+        if not isinstance(upload_id, str):
+            raise CollabError(400, 'upload_id is required')
+        if principal.is_agent:
+            raise CollabError(403, 'forbidden: agents use their own upload status')
+        async with self.store.lifecycle_lock():
+            row = await self._reviewable(principal, upload_id, authorize)
+            status = await self._status(row)
+            await self._reviewable(principal, upload_id, authorize)
+            return status
+
+    async def _reviewable(self, principal, upload_id, authorize):
+        row = await self.store.get_upload(upload_id)
+        if row is None:
+            raise CollabError(404, 'not found')
+        await authorize(False, row.room_id)             # approved, unexpired, non-guest member of an active room
+        if row.created_by != principal.id:
+            member = await self.store.get_membership(row.room_id, principal.id)
+            if member is None or member.role != 'owner':
+                raise CollabError(404, 'not found')
+        return row
+
+    FILE_PAGE = 100
+    FILE_ACCESS_TTL = 300
+
+    @staticmethod
+    def _cursor(value):
+        if value is None:
+            return None
+        try:
+            if not isinstance(value, str) or len(value) > 2048:
+                raise ValueError
+            decoded = json.loads(base64.urlsafe_b64decode(value + '=' * (-len(value) % 4)))
+            if (not isinstance(decoded, list) or len(decoded) != 2
+                    or not all(isinstance(v, str) for v in decoded)):
+                raise ValueError
+            return decoded[0], decoded[1]
+        except (ValueError, TypeError):
+            raise CollabError(400, 'invalid cursor') from None
+
+    async def list_files(self, principal, room_id, cursor, authorize):
+        """One page of finalized files. Unverified uploads never appear (see CollabStore)."""
+        if principal.is_agent:
+            raise CollabError(403, 'forbidden: agents cannot browse room files over HTTP')
+        after = self._cursor(cursor)
+        async with self.store.lifecycle_lock():
+            await authorize(False, room_id)
+            rows = await self.store.list_room_files(room_id, after, self.FILE_PAGE + 1)
+            await authorize(False, room_id)
+        page, more = rows[:self.FILE_PAGE], len(rows) > self.FILE_PAGE
+        token = None
+        if more:
+            token = base64.urlsafe_b64encode(json.dumps([page[-1].relative_path, page[-1].file_id]).encode()
+                                             ).decode().rstrip('=')
+        return {'files': [{'file_id': f.file_id, 'room_id': f.room_id, 'relative_path': f.relative_path,
+                           'size_bytes': f.size_bytes, 'status': f.status, 'created_at': f.created_at.isoformat()}
+                          for f in page], 'has_more': more, 'next_cursor': token}
+
+    async def file_access(self, principal, room_id, file_id, purpose, authorize):
+        """Short-lived read URL for one finalized file of a room the person may read."""
+        if principal.is_agent:
+            raise CollabError(403, 'forbidden: agents cannot open room files over HTTP')
+        if (not isinstance(purpose, str) or purpose not in {'download', 'preview'}
+                or not isinstance(file_id, str)):
+            raise CollabError(400, 'invalid file access request')
+        async with self.store.lifecycle_lock():
+            await authorize(False, room_id)
+            file = await self.store.get_room_file(room_id, file_id)
+            if file is None:
+                raise CollabError(404, 'not found')
+            params = {'Bucket': self.bucket, 'Key': file.storage_key,
+                      'ResponseContentType': 'application/octet-stream'}     # never rendered as active content
+            if purpose == 'download':
+                name = ''.join(c if c.isalnum() or c in '._-' else '_' for c in file.relative_path.rsplit('/', 1)[-1])
+                params['ResponseContentDisposition'] = f'attachment; filename="{name or "file"}"'
+            expires_at = self.now() + self.FILE_ACCESS_TTL
+            try:
+                url = await self._io(self.s3.generate_presigned_url, 'get_object', Params=params,
+                                     ExpiresIn=self.FILE_ACCESS_TTL)
+                parsed = urlsplit(url)
+                if parsed.scheme != 'https' or not parsed.hostname or parsed.username or parsed.password:
+                    raise ValueError('invalid object URL')
+            except Exception:
+                raise CollabError(503, 'file access unavailable; retry') from None
+            await authorize(False, room_id)
+            await self.store.audit_file_access(file.file_id, principal)
+            return {'url': url, 'expires_at': expires_at, 'file_id': file.file_id, 'room_id': room_id,
+                    'purpose': purpose, 'size_bytes': file.size_bytes}
 
     async def finalize_upload(self, principal, upload_id, checksums, authorize):
         async with self.store.lifecycle_lock():

@@ -349,15 +349,35 @@ class CollabStore:
             "ORDER BY created_at,upload_id LIMIT $2", now, limit)
         return [await self.get_upload(row['upload_id']) for row in rows]
 
-    async def list_room_files(self, room_id: str) -> list[RoomFileRecord]:
+    _AVAILABLE_FILES = (
+        "FROM collab_room_files f "
+        "JOIN collab_rooms r ON r.room_id = f.room_id AND r.status = 'active' "
+        "LEFT JOIN collab_room_uploads u ON u.room_id = f.room_id AND u.upload_id = f.upload_id "
+        "WHERE f.room_id = $1 AND f.status = 'available' "
+        "AND (f.upload_id IS NULL OR u.status = 'available') ")
+
+    async def list_room_files(self, room_id: str, after: tuple[str, str] | None = None,
+                              limit: int | None = None) -> list[RoomFileRecord]:
+        """Finalized files of an active room, in a stable keyset order (path, file id)."""
         rows = await self._conn.fetch(
-            "SELECT f.* FROM collab_room_files f "
-            "JOIN collab_rooms r ON r.room_id = f.room_id AND r.status = 'active' "
-            "LEFT JOIN collab_room_uploads u ON u.room_id = f.room_id AND u.upload_id = f.upload_id "
-            "WHERE f.room_id = $1 AND f.status = 'available' "
-            "AND (f.upload_id IS NULL OR u.status = 'available') "
-            "ORDER BY f.relative_path, f.file_id", room_id)
+            "SELECT f.* " + self._AVAILABLE_FILES +
+            "AND ($2::text IS NULL OR (f.relative_path, f.file_id) > ($2::text, $3::text)) "
+            "ORDER BY f.relative_path, f.file_id LIMIT $4::int",
+            room_id, after[0] if after else None, after[1] if after else None, limit)
         return [_room_file(row) for row in rows]
+
+    async def get_room_file(self, room_id: str, file_id: str) -> RoomFileRecord | None:
+        row = await self._conn.fetchrow(
+            "SELECT f.* " + self._AVAILABLE_FILES + "AND f.file_id = $2", room_id, file_id)
+        return _room_file(row) if row else None
+
+    async def audit_file_access(self, file_id: str, actor) -> None:
+        # Fixed vocabulary only: never persist signed URLs or object keys.
+        from uuid import uuid4
+        await self._conn.execute(
+            'INSERT INTO collab_audit_events(event_id,actor_id,actor_kind,action,entity_type,entity_id,outcome) '
+            "VALUES ($1,$2,'user','file.access_granted','file',$3,'complete')",
+            'file.access_granted:' + file_id + ':' + str(uuid4()), actor.id, file_id)
 
     async def record_archive(self, *, archive_id: str, room_id: str,
                              requested_by: str, manifest_key: str | None = None) -> ArchiveRecord:

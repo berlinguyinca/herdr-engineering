@@ -516,6 +516,37 @@ class CollabService:
     async def get_upload_status(self, principal, upload_id):
         return await self._upload_operation('get_upload_status', principal, upload_id)
 
+    async def get_room_upload_status(self, principal, upload_id):
+        return await self._upload_operation('get_room_upload_status', principal, upload_id)
+
+    async def list_room_files(self, principal, room_id, cursor=None):
+        return await self._upload_operation('list_files', principal, room_id, cursor, room_id=room_id)
+
+    async def open_room_file(self, principal, room_id, file_id, purpose):
+        return await self._upload_operation('file_access', principal, room_id, file_id, purpose, room_id=room_id)
+
+    def _uploads_http(self, method, parts, query, body, principal):
+        """Browser/dashboard adapter over the upload service; authorization stays in the service."""
+        from dataclasses import asdict
+
+        def run(make_operation):
+            return self._backend_run(self.upload_runner, make_operation, "upload")
+        n = len(parts)
+        if method == 'GET' and n == 2 and parts[0] == 'uploads':
+            # A person sees aggregate progress; the exact registered agent keeps its own read.
+            op = self.get_upload_status if principal.is_agent else self.get_room_upload_status
+            return 200, asdict(run(lambda: op(principal, parts[1])))
+        if method == 'GET' and n == 3 and parts[2] == 'files':
+            return 200, run(lambda: self.list_room_files(principal, parts[1], query.get('cursor')))
+        if method == 'POST' and n == 5 and parts[2] == 'files' and parts[4] == 'access':
+            self._only(body, frozenset({'purpose'}))
+            return 200, run(lambda: self.open_room_file(principal, parts[1], parts[3], body.get('purpose')))
+        if method == 'POST' and n == 4 and parts[2] == 'uploads' and parts[3] == 'preview':
+            if set(body) != {'manifest'} or not isinstance(body['manifest'], dict):
+                raise CollabError(400, 'invalid upload preview arguments')
+            return 200, asdict(run(lambda: self.preview_upload(principal, parts[1], body['manifest'])))
+        raise CollabError(404, 'not found')
+
     async def finalize_upload(self, principal, upload_id, checksums):
         return await self._upload_operation('finalize_upload', principal, upload_id, checksums)
 
@@ -583,22 +614,26 @@ class CollabService:
         if set(body) - allowed:
             raise CollabError(400, "unexpected request fields")
 
-    def _archive_run(self, operation):
-        if self.archive_runner is None:
-            operation.close()
-            raise CollabError(503, "archive event-loop runner unavailable")
+    @staticmethod
+    def _backend_run(runner, make_operation, what: str):
+        """Run a relational coroutine on its owning loop; fail closed, never echo internals."""
+        if runner is None:
+            raise CollabError(503, f"{what} event-loop runner unavailable")
         try:
-            return self.archive_runner(operation)
+            return runner(make_operation())
         except CollabError:
             raise
         except Exception:
             # Neither provider endpoints nor SQL detail belong in an HTTP response.
-            raise CollabError(503, "lifecycle operation unavailable; retry") from None
+            raise CollabError(503, f"{what} operation unavailable; retry") from None
+
+    def _archive_run(self, make_operation):
+        return self._backend_run(self.archive_runner, make_operation, "lifecycle")
 
     def _archive_http(self, pr: Principal, room_id: str, body: dict):
         self._only(body)
         try:
-            record = self._archive_run(self.archive_room(room_id, pr))
+            record = self._archive_run(lambda: self.archive_room(room_id, pr))
         except CollabError:
             raise
         view = {"archive_id": record.archive_id, "room_id": record.original_room_id,
@@ -611,7 +646,7 @@ class CollabService:
 
     def _restore_http(self, pr: Principal, archive_id: str, body: dict):
         self._only(body)
-        room = self._archive_run(self.restore_room(archive_id, pr))
+        room = self._archive_run(lambda: self.restore_room(archive_id, pr))
         return 201, {"room_id": room.room_id, "name": room.name, "status": room.status}
 
     def _delete_person_http(self, pr: Principal, uid: str, body: dict):
@@ -619,7 +654,7 @@ class CollabService:
         self._require_user(pr)
         if uid == pr.id:
             raise CollabError(400, "you cannot do this to yourself")
-        report = self._archive_run(self.scrub_deleted_user(uid, pr))
+        report = self._archive_run(lambda: self.scrub_deleted_user(uid, pr))
         return 200, {"status": report.status, "archives_scrubbed": report.archives_scrubbed}
 
     @property
@@ -3809,6 +3844,8 @@ class CollabService:
             if pr.status != "approved" and parts != ["me"]:
                 self.stats["policy_denied"] += 1
                 raise CollabError(403, "waiting for approval")
+            if parts[:1] == ["uploads"] or (n >= 3 and parts[0] == "rooms" and parts[2] in ("files", "uploads")):
+                return self._uploads_http(method, parts, query, body, pr)
             if (parts[:1] in (["analyses"], ["analysis-artifacts"])
                     or (n == 3 and parts[0] == 'rooms' and parts[2] == 'analyses')):
                 return self._analysis_http(method, parts, body, pr)
