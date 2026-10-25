@@ -111,7 +111,7 @@ test('paste and drop use the upload adapter, previews are removable and disabled
   assert.deepEqual(await page.evaluate(() => window.sent), []);
 }));
 
-test('Collaboration uses shared Markdown and composer while preserving authenticated agent task routing', async () => withComposer(async (page) => {
+test('Collaboration uses shared Markdown and composer, routes a leading agent to a task with the verbatim text', async () => withComposer(async (page) => {
   const requests = [];
   let stateCount = 0;
   await page.route('**/api/v1/collab/**', async (route) => {
@@ -144,16 +144,20 @@ test('Collaboration uses shared Markdown and composer while preserving authentic
   assert.equal(await input.inputValue(), '@coder ');
   await input.press('i'); await input.press('Enter');
   await page.getByRole('status').filter({ hasText: 'Task created' }).waitFor();
-  assert.deepEqual(requests[0], { path: '/rooms/room-one/tasks', auth: 'Bearer operator', body: { target_agent_id: 'coder-id', text: 'i' } });
+  // the task carries the text exactly as typed (a harness reads what was written, address included)
+  assert.deepEqual(requests[0], { path: '/rooms/room-one/tasks', auth: 'Bearer operator', body: { target_agent_id: 'coder-id', text: '@coder i' } });
   await input.fill('hello'); await input.press('Enter');
   await page.getByRole('status').filter({ hasText: 'Message posted' }).waitFor();
   assert.equal(requests[1].path, '/rooms/room-one/messages');
   assert.equal(requests[1].auth, 'Bearer operator');
   assert.equal(requests[1].body.text, 'hello');
-  await input.fill('@missing do work'); await input.press('Enter');
-  await page.getByRole('alert').filter({ hasText: 'No agent named @missing' }).waitFor();
-  assert.equal(requests.length, 2);
-  assert.equal(await input.inputValue(), '@missing do work');
+  // an unresolved name is flagged before send, then sent as plain text (never blocked, never rewritten)
+  await input.fill('@missing do work');
+  await page.locator('.conversation-status').filter({ hasText: '@missing addresses nobody' }).waitFor();
+  await input.press('Enter');
+  await page.waitForFunction(() => !document.querySelector('[aria-label="Message"]').value);
+  assert.equal(requests.length, 3);
+  assert.deepEqual([requests[2].path, requests[2].body.text], ['/rooms/room-one/messages', '@missing do work']);
   await page.getByRole('tab', { name: 'Flow', exact: true }).click();
   await page.locator('[data-node="coder-id"]').click();
   assert.equal(await page.getByRole('link', { name: 'Open agent conversation' }).getAttribute('href'), '/#/herd/session/session%3Aone');

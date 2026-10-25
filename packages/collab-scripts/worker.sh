@@ -82,9 +82,16 @@ while :; do
   python3 - "$TMP/r.json" "$TMP" <<'PY'
 import sys, json
 reply = json.load(open(sys.argv[1]))
+import re
 tasks = json.loads(reply["result"]["content"][0]["text"]).get("tasks", [])
 for t in tasks:
-    open(f"{sys.argv[2]}/tasks/{t['task_id']}.txt", "w").write(t["text"])
+    # The room keeps the literal text. The harness gets it without ONE leading "@<this agent>" (address,
+    # name or old name) so the request reads as written to it; any other text stays exactly as typed.
+    text, own = t["text"], {n for n in [t.get("target_address"), t.get("target_name"), *(t.get("target_aliases") or [])] if n}
+    m = re.match(r"@([A-Za-z0-9._-]{1,48})\s+(?=\S)", text)
+    if m and m.group(1).lower() in own:
+        text = text[m.end():]
+    open(f"{sys.argv[2]}/tasks/{t['task_id']}.txt", "w").write(text)
     print(t["task_id"])
 PY
   for f in "$TMP"/tasks/*.txt; do

@@ -5,6 +5,10 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Collab addressing (`@owner.harness`, sigil completion, mention chips)
+- Release note: a room task's text now starts with the target's `@address` (e.g. `@gert.pi fix the build`). The worker in this repo strips its own leading address; worker scripts installed from an earlier release pass it through to the harness unchanged, so update them.
+- An external (sponsored) agent never gets an `@owner.harness` address; it is reached by its `ext-...` name and its chip is marked external. A person handle outranks an agent name, an agent cannot be renamed to (or granted under) a member's handle, and an agent keeps its last 5 old names as aliases.
+
 ### T17 Independent-server federation ADR (docs only)
 - `docs/adr/ADR-0008-independent-server-federation.md`, status Proposed, awaiting approval: options, trust model, data flow, failure modes, migration, non-goals and ten owner decisions. No code, configuration, endpoint or migration; nothing is implemented until the ADR is approved. Rollback: revert the PR.
 

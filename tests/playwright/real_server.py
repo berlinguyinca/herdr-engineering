@@ -234,6 +234,12 @@ class Seeder:
         t = self.svc.steering_target(self.pr["bob"], self.room, "task:long")
         self.svc.propose_steering(self.pr["bob"], self.room, {"action": "redirect", "node_id": "task:long", "instruction": "R" + word,
                                                               "expected_fence": t["fence"], "idempotency_key": "seed-long-s"})
+        # the longest address a chip can show (48 characters: a 27-character handle, ".", a 20-character harness slot), mentioned in chat
+        self.svc._commit("identity_linked", {"actor_user_id": "alice", "actor_agent_id": None, "user_id": "alice",
+                                             "email": "a" * 27 + "@ui-gates.invalid"})
+        out = self.svc.connect_agent(self.pr["alice"], {"harness_type": "h" * 20, "name": "long-address-bot"})
+        self.svc.grant_agent(self.pr["alice"], self.room, {"agent_id": out["agent_id"], "actions": ["read", "post"]})
+        self.svc.post_message(self.pr["bob"], self.room, {"text": f"@{'a' * 27}.{'h' * 20} please look", "idempotency_key": "seed-long-m"})
 
     def close(self) -> None:
         """Remove everything this process wrote (the event log's temp directory)."""

@@ -401,3 +401,17 @@ button.ctx-chip:focus-visible, .ctx-chip:focus-visible { outline: 2px solid curr
    row instead of pushing the page sideways (1.4.10 at 320px). Found by the real-server reflow gate on Attention and Progress. */
 .cx-page .grow, .cx-embed .grow, .cx-attn-item, .cx-attn-item *, .cx-list li, .cx-list li *, .cx-page .cx-msg, .cx-embed .cx-msg { overflow-wrap: anywhere; min-width: 0; }
 .cx-attn-item .hd-btn, .cx-attn-item select { max-width: 100%; }
+
+/* @mentions in sent messages: chips that keep the literal text (copying a message copies "@gert.pi") */
+/* Inline (not inline-flex, no nowrap) so a 48-character address wraps inside a 320px bubble instead of overflowing (1.4.10). */
+.cx-mention { display: inline; padding: 0 4px; border-radius: 999px; font-weight: 600; overflow-wrap: anywhere; word-break: break-word;
+  -webkit-box-decoration-break: clone; box-decoration-break: clone;
+  background: var(--accent-weak, var(--surface-2)); color: var(--accent-strong, var(--text)); border: 1px solid var(--border-subtle); }
+.cx-mention--agent { background: var(--violet-weak, var(--surface-2)); }
+.cx-mention--group { background: var(--surface-2); }
+/* generated text: shown and announced, but not copied, so a copied message keeps its literal "@ext-..." */
+.cx-mention--external { border-style: dashed; }
+.cx-mention--external::after { content: " · external"; font-weight: 400; font-size: .85em; color: var(--text-muted); }
+.cx-m--mine .cx-mention--external::after { color: inherit; }
+.cx-mention__icon { font-size: .8em; margin-right: 2px; }
+.cx-m--mine .cx-mention { background: color-mix(in srgb, var(--text-on-accent) 18%, transparent); color: inherit; border-color: transparent; }
