@@ -6,14 +6,22 @@ import pytest
 from tests.e2e import harness
 
 
+#: Pure-Python harness unit tests that spawn nothing: they stay in the default run, and the acceptance runner selects
+#: them with the `e2e_unit` marker (see scripts/run_acceptance.py, which passes `-m "e2e or e2e_unit"`).
+_UNIT_FILES = {"test_runner_guards.py"}
+
+
 def pytest_configure(config):
-    config.addinivalue_line("markers", "e2e: T16 end-to-end acceptance (real server processes on loopback)")
+    config.addinivalue_line("markers", "e2e: T16 end-to-end acceptance (real server processes on loopback); opt in with -m e2e")
+    config.addinivalue_line("markers", "e2e_unit: T16 harness unit tests (no servers); part of the default run and of the acceptance run")
 
 
 def pytest_collection_modifyitems(items):
     for item in items:
-        if "tests/e2e" in str(item.fspath).replace("\\", "/"):
-            item.add_marker(pytest.mark.e2e)
+        path = str(item.fspath).replace("\\", "/")
+        if "tests/e2e" in path:
+            unit = path.rsplit("/", 1)[-1] in _UNIT_FILES
+            item.add_marker(pytest.mark.e2e_unit if unit else pytest.mark.e2e)
 
 
 @pytest.fixture(scope="session")

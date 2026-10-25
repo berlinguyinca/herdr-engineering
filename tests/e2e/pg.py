@@ -6,15 +6,30 @@ from __future__ import annotations
 
 import asyncio
 import os
+import shutil
 import subprocess
 from pathlib import Path
 
 from tests.e2e import harness
 
 
+def _version_key(d: Path):
+    v = d.parent.name
+    return tuple(int(x) if x.isdigit() else 0 for x in v.split("."))
+
+
+def candidate_dirs(cfg: dict) -> list[Path]:
+    """Configured dirs first, then every /usr/lib/postgresql/<ver>/bin (newest first), then wherever initdb is on PATH."""
+    found = [Path(d) for d in (cfg.get("postgres") or {}).get("bin_dirs") or []]
+    found += sorted(Path("/usr/lib/postgresql").glob("*/bin"), key=_version_key, reverse=True)
+    on_path = shutil.which("initdb")
+    if on_path:
+        found.append(Path(on_path).resolve().parent)
+    return found
+
+
 def find_bins(cfg: dict) -> Path | None:
-    for d in (cfg.get("postgres") or {}).get("bin_dirs", []):
-        p = Path(d)
+    for p in candidate_dirs(cfg):
         if (p / "initdb").exists() and (p / "pg_ctl").exists():
             return p
     return None

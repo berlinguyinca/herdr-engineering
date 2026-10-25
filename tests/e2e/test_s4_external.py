@@ -481,6 +481,17 @@ def collab_routes(w: World, ext: Ext, other: Ext) -> list[tuple[str, list[str], 
         ("POST", ["fleet", "hosts"], {}), ("POST", ["fleet", "hosts", "bender"], {}), ("POST", ["fleet", "host-registry", "bender"], {}),
         ("POST", ["fleet", "spawns"], {}), ("POST", ["fleet", "task-activity"], {}), ("POST", ["fleet", "spawns", "x", "claim"], {}),
         ("POST", ["fleet", "spawns", "x", "done"], {}),
+        # fleet egress / catalogue / helper routes added after the first sweep (the drift guard below names them)
+        ("GET", ["fleet", "egress"], {}), ("GET", ["fleet", "egress", R], {}), ("POST", ["fleet", "egress", "request"], {"room_id": R, "agent_id": AID, "host": "bender", "port": 8080}),
+        ("POST", ["fleet", "egress", "promote"], {"room_id": R, "host_port": "bender:8080"}),
+        ("POST", ["fleet", "egress", "remove"], {"room_id": R, "host_port": "bender:8080"}),
+        ("POST", ["fleet", "egress", "x", "decide"], {"decision": "approve"}),
+        ("POST", ["fleet", "catalogue"], {"models": []}), ("GET", ["fleet", "helpers"], {}), ("POST", ["fleet", "helpers", "pause"], {"paused": True}),
+        ("POST", ["fleet", "helpers", "x", "claim"], {}), ("POST", ["fleet", "helpers", "x", "cancel"], {}),
+        ("POST", ["fleet", "helpers", "x", "finish"], {"status": "done"}),
+        ("GET", ["fleet", "summary-fix", "helpers"], {}), ("POST", ["fleet", "summary-fix", "helper"], {}),
+        ("GET", ["helpers"], {}), ("POST", ["helpers", "x", "cancel"], {}),
+        ("GET", ["rooms", R2, "profile"], {}), ("POST", ["rooms", R, "profile"], {"profile": "x"}),
         ("POST", ["rooms", R, "members"], {"user_id": "mallory", "role": "owner"}),
         ("POST", ["rooms", R, "members", "bob", "remove"], {}),
         ("POST", ["rooms", R, "invites"], {"email": "a@b.cc"}), ("POST", ["rooms", R, "invites", inv_id, "cancel"], {}),
@@ -557,7 +568,7 @@ def test_only_an_exact_allow_list_of_routes_answers_the_external_agent_and_no_te
     assert len(statuses) >= 100
     # EXACT allow-list among all of them: nothing answers 2xx; every refusal is 401/403/404 with a generic body
     assert {k for k, v in statuses.items() if v < 400} == set(), {k: v for k, v in statuses.items() if v < 400}
-    assert set(statuses.values()) <= {401, 403, 404}
+    assert set(statuses.values()) <= {401, 403, 404}, {k: v for k, v in statuses.items() if v not in (401, 403, 404)}
     assert all(set(json.loads(b)) == {"error"} for b in bodies) and len(bodies) <= 6, bodies         # no ids, no counts, no hints
     # the terminal-ish ones specifically (a link that EXISTS, a host that is registered to nobody)
     for key in (("POST", "authorize"), ("POST", "grants"), ("POST", "fleet/spawns"), ("POST", "agents/bulk"), ("POST", "steering")):
@@ -590,6 +601,10 @@ def test_only_an_exact_allow_list_of_routes_answers_the_external_agent_and_no_te
         assert a.status == b.status and a.body == b.body and a.status in (403, 404), (real, a.status, a.body, b.status, b.body)
     # allowed: exactly its own identity, its own room's chat, presence, lineage about itself, and its own task inbox
     assert dana.c("GET", "/agents/external/me").status == 200
+    # the room profile is readable by an agent in ITS room, but only the agent's cut: names, no upstream URLs, no host list
+    prof = dana.c("GET", f"/rooms/{w.room}/profile")
+    assert prof.status == 200 and "permanent_hosts" not in prof.body
+    assert all(set(sv) == {"name"} for sv in prof.body.get("services", [])), prof.body
     assert dana.c("GET", f"/rooms/{w.room}").status == 200 and dana.c("GET", f"/rooms/{w.room}/events?cursor=0&limit=10").status == 200
     assert dana.c("POST", f"/rooms/{w.room}/messages", {"text": "hello from the coworker", "idempotency_key": "m1"}).status in (200, 201)
     assert dana.heartbeat().status == 200 and dana.c("GET", "/delegations/inbox").status == 200
@@ -674,12 +689,20 @@ def test_mcp_and_a2a_reach_only_room_chat_and_the_task_tools_and_a_stream_ends_w
     listed = {t["name"] for t in p.rpc("/mcp", "tools/list", {}, dana.agent).body["result"]["tools"]}
     assert listed >= {"room_post", "room_read", "rooms_list", "delegations_inbox", "delegation_respond", "proposal_submit",
                       "consult_inbox", "consult_answer"}
-    assert not any(re.search(r"shell|terminal|exec|run|spawn|pane|session|workspace|steer", n) for n in listed), listed
+    # (the helper_* tools ARE on the menu, as of main's helper agents: they are advertised but refused for an external agent,
+    # asserted right below, and listed in the menu-gap xfail)
+    assert not any(re.search(r"shell|terminal|exec|run|spawn|pane|session|workspace|steer", n) for n in listed if not n.startswith("helper_")), listed
+    assert {n for n in listed if n.startswith("helper_")} == {"helper_spawn", "helper_wait", "helper_result", "helper_cancel"}
     # the privileged ones on that menu are refused for it, and refusals about other rooms look like missing rooms
     for name, args in (("agents_list", {"room_id": w.room}), ("task_create", {"room_id": w.room, "target_agent_id": dana.id, "text": "x"}),
-                       ("tasks_inbox", {}), ("task_update", {"task_id": "t", "status": "done"})):
+                       ("tasks_inbox", {}), ("task_update", {"task_id": "t", "status": "done"}),
+                       ("helper_spawn", {"room_id": w.room, "role": "x", "task": "y"}),
+                       ("helper_spawn", {"room_id": w.room, "role": "x", "task": "y", "wait": True})):
         st, body = p.tool(dana.agent, name, args)
         assert st == 403, (name, st, body)
+    for name in ("helper_wait", "helper_result", "helper_cancel"):                  # no helper of hers exists: refused as not found
+        st, body = p.tool(dana.agent, name, {"helper_id": "helper_" + "0" * 26})
+        assert st in (403, 404), (name, st, body)
     real, fake = p.tool(dana.agent, "room_read", {"room_id": w.room2}), p.tool(dana.agent, "room_read", {"room_id": "room_" + "0" * 26})
     assert real == fake and real[0] == 404
     assert p.tool(dana.agent, "rooms_list", {})[1]["rooms"] == [{"room_id": w.room, "name": "coworkers", "actions": ["post", "read"]}]
@@ -792,7 +815,7 @@ def test_a_sponsor_can_revoke_their_agent_and_only_an_owner_can_invite_or_revoke
 # Each asserts the DESIRED behaviour and fails today. They turn into failures (XPASS strict) the day the gap closes,
 # which forces the marker to be removed. (Review finding: these were prose in the evidence doc only.)
 @pytest.mark.xfail(strict=True, reason="GAP: tools/list advertises the same fixed menu to every external agent, including tools that are "
-                                       "ALWAYS refused for it (agents_list, task_create, tasks_inbox, task_update) and delegation tools the "
+                                       "ALWAYS refused for it (agents_list, task_create, tasks_inbox, task_update, helper_spawn) and delegation tools the "
                                        "agent was not invited to use. Desired: the menu lists only what the caller may call.")
 def test_gap_mcp_tool_menu_is_per_agent_and_lists_only_callable_tools(world):
     w, p = world, world.p
@@ -802,7 +825,7 @@ def test_gap_mcp_tool_menu_is_per_agent_and_lists_only_callable_tools(world):
     assert p.tool(erin.agent, "delegations_inbox", {})[0] == 403                    # control: erin cannot call it ...
     assert "delegations_inbox" in menu(dana) and p.tool(dana.agent, "delegations_inbox", {})[0] == 200
     assert "delegations_inbox" not in menu(erin)                                    # ... so it must not be advertised to her
-    assert not menu(dana) & {"agents_list", "task_create", "tasks_inbox", "task_update"}
+    assert not menu(dana) & {"agents_list", "task_create", "tasks_inbox", "task_update", "helper_spawn"}
 
 
 @pytest.mark.xfail(strict=True, reason="GAP: a delegation's budget has no turn/hop bound (max_turns, max_hops); the nearest field is "

@@ -1,13 +1,14 @@
 # T16 acceptance configuration. The ONLY configuration of the suite: paths and limits, no environment variables.
 # Relative paths resolve against the herdr-engineering checkout root. To point a run at other checkouts, copy this
-# file to tests/e2e/acceptance.local.yaml (untracked) and edit it; that file wins when present.
+# file to tests/e2e/acceptance.local.yaml (untracked) and name only the keys you change: it is merged over this one.
 version: 1
 pi_repo: auto                                   # `auto` = the sibling checkout that holds src/runtime/herdr/lineage.ts (same -tNN suffix wins);
                                                 # or an explicit path relative to this checkout, e.g. ../pi-t16
-autospec_repo: ../autospec-t06                  # AutoSpec checkout holding the Rust CLI (explicit: several autospec worktrees coexist, `auto` would be ambiguous)
-autospec_bin: ../autospec-t06/target/debug/autospec
+autospec_repo: auto                             # AutoSpec checkout holding the Rust CLI: a sibling directory containing crates/autospec-cli (same -tNN suffix wins,
+                                                # else the one BUILT checkout). Several unbuilt worktrees are ambiguous: set e.g. ../autospec-t06 in the local file
+autospec_bin: auto                              # <autospec_repo>/target/debug/autospec, or an explicit path
 node: node
 startup_timeout_seconds: 30
 request_timeout_seconds: 10
 postgres:                                       # throwaway cluster for the restart/replay scenario (scenario 6)
-  bin_dirs: [/usr/lib/postgresql/18/bin, /usr/lib/postgresql/17/bin, /usr/lib/postgresql/16/bin]
+  bin_dirs: []                                  # extra directories holding initdb/pg_ctl, tried first; then /usr/lib/postgresql/*/bin (newest first), then PATH

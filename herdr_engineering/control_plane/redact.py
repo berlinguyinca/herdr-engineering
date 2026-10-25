@@ -14,6 +14,10 @@ _PATTERNS = [
     # OpenAI-style keys: sk-... (not inside a longer word: "task-s6lease", "disk-image-1" are ids, not keys; found
     # by the T16 acceptance run, which saw a task id stored as "ta[REDACTED]")
     re.compile(r"(?<![A-Za-z0-9])sk-[A-Za-z0-9\-_]{3,}"),
+    # ... but a key-length run is a key wherever it sits: right after an ANSI colour code ("\x1b[32msk-...", the "m" is a word
+    # character) or a URL-encoded "=" ("api_key%3Dsk-..."), which CI logs routinely contain. Ids such as "task-sk-ab" are
+    # far shorter than 20 characters after "sk-" and stay untouched.
+    re.compile(r"sk-[A-Za-z0-9_\-]{20,}"),
     # AWS access key id
     re.compile(r"AKIA[0-9A-Z]{16}"),
     # generic bearer tokens / JWTs (three base64url dot-separated parts)

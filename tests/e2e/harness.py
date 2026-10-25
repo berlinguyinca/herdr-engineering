@@ -24,6 +24,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 import yaml
 
@@ -33,9 +34,19 @@ RUN_DIR = E2E / ".run"
 
 
 # ------------------------------------------------------------------------------------------------ configuration
+def _merge(base: dict, over: dict) -> dict:
+    out = dict(base)
+    for k, v in over.items():
+        out[k] = _merge(out[k], v) if isinstance(v, dict) and isinstance(out.get(k), dict) else v
+    return out
+
+
 def load_acceptance() -> dict:
+    """acceptance.yaml, with acceptance.local.yaml (untracked) merged over it key by key: a local file need only name what it changes."""
+    cfg = yaml.safe_load((E2E / "acceptance.yaml").read_text())
     local = E2E / "acceptance.local.yaml"
-    cfg = yaml.safe_load((local if local.exists() else E2E / "acceptance.yaml").read_text())
+    if local.exists():
+        cfg = _merge(cfg, yaml.safe_load(local.read_text()) or {})
     if not isinstance(cfg, dict) or cfg.get("version") != 1:
         raise RuntimeError("acceptance config must be a mapping with version: 1")
     return cfg
@@ -362,8 +373,22 @@ class Plane:
         for path in ("/attention", "/progress", "/analytics"):
             r = self.c("GET", f"/rooms/{room}{path}", user=owner)
             assert r.status == 200, f"feature probe {path}: {r.status} {r.body} (feature off or broken)"
-        r = self.c("POST", f"/rooms/{room}/steering", {"node_id": "agent:probe", "action": "pause", "instruction": "x"}, user=owner)
-        assert r.status != 403 and r.get("code") != "steering_disabled", f"feature probe steering: {r.status} {r.body} (feature off or broken)"
-        r = self.c("POST", f"/rooms/{room}/comments", {"node_id": "agent:probe", "text": "x"}, user=owner)
-        assert r.status != 403, f"feature probe comments: {r.status} {r.body} (feature off or broken)"
+        # steering and comments: a REAL positive signal on a node that exists in the room (a 400/404/500 must not pass)
+        node = "task:feature-probe"
+        env = self.envelope(source="feature-probe", seq=1, entity_id=node, event_type="node.upsert", scope="room", room_id=room,
+                            payload={"node_type": "task", "node_id": node, "label": "feature probe", "state": "running"})
+        seeded = self.ingest("operator", env)
+        assert seeded.status == 200, f"feature probe seed node: {seeded.status} {seeded.body}"
+        q = quote(node, safe="")
+        tgt = self.c("GET", f"/rooms/{room}/steering/target?node_id={q}", user=owner)
+        assert tgt.status == 200 and tgt.get("fence"), f"feature probe steering target: {tgt.status} {tgt.body} (feature off or broken)"
+        r = self.c("POST", f"/rooms/{room}/steering", {"action": "pause", "node_id": node, "expected_fence": tgt["fence"],
+                                                       "idempotency_key": "feature-probe-steer"}, user=owner)
+        assert r.status == 201 and (r.get("steering") or {}).get("status") == "pending", f"feature probe steering: {r.status} {r.body} (feature off or broken)"
+        r = self.c("POST", f"/rooms/{room}/comments", {"anchor": {"kind": "node", "node_id": node}, "text": "probe",
+                                                       "idempotency_key": "feature-probe-comment"}, user=owner)
+        assert r.status in (200, 201) and (r.get("comment") or {}).get("text") == "probe", \
+            f"feature probe comments: {r.status} {r.body} (feature off or broken)"
+        got = self.c("GET", f"/rooms/{room}/comments?anchor_kind=node&node_id={q}", user=owner)
+        assert got.status == 200 and len(got.get("comments") or []) == 1, f"feature probe comment read-back: {got.status} {got.body}"
         assert self.c("GET", f"/rooms/{room}/state", user=owner).status == 200
