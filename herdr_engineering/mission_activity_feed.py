@@ -35,6 +35,7 @@ MAX_SESSIONS = 64
 MAX_MISSIONS = 20
 MAX_SNAPSHOT_BYTES = 4 * 1024 * 1024
 MAX_REPLY_BYTES = 65536
+MAX_SNAPSHOT_CACHE_ENTRIES = 128
 # A positive field allowlist excludes raw arguments, prompts and hidden reasoning
 # even if a future Pi snapshot starts publishing additional fields.
 FIELDS = set('''progress approximatePercent verifiedComplete basis acceptanceCoverage workflowProgress
@@ -215,13 +216,12 @@ def _sanitize(value, depth=0, field=''):
     return None
 
 
-def _snapshot(cwd: str) -> dict:
-    directory = Path(cwd) / '.pi-eng'
-    _private(directory, 'directory')
-    snapshot = _read_json(directory / 'orchestration-snapshot.json', MAX_SNAPSHOT_BYTES)
-    if snapshot.get('contractVersion') != 3:
-        raise ValueError('unsupported native snapshot')
-    return snapshot
+def _snapshot_signature(path: Path) -> tuple[int, int, int, int, int]:
+    """Return a security-sensitive cache key without following symlinks."""
+    info = path.lstat()
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o002:
+        raise ValueError('unsafe native file')
+    return (info.st_ino, info.st_mtime_ns, info.st_size, info.st_mode, info.st_uid)
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -261,9 +261,33 @@ class MissionActivityFeed:
         self.heartbeat = max(5.0, heartbeat)
         self.known: dict[str, dict] = {}
         self.sent: dict[str, tuple[str, float]] = {}
+        self._snapshot_cache: dict[str, tuple[tuple[int, int, int, int, int], dict]] = {}
+        self._snapshot_reads = 0
+        self._snapshot_cache_hits = 0
+        self._snapshot_bytes = 0
         self._lock = threading.Lock()
         self._http = urllib.request.build_opener(_NoRedirect())
         self.auth_rejected = False
+
+    def _load_snapshot(self, cwd: str) -> dict:
+        """Read one validated snapshot per unchanged file version."""
+        directory = Path(cwd) / '.pi-eng'
+        _private(directory, 'directory')
+        path = directory / 'orchestration-snapshot.json'
+        signature = _snapshot_signature(path)
+        cached = self._snapshot_cache.get(str(path))
+        if cached and cached[0] == signature:
+            self._snapshot_cache_hits += 1
+            return cached[1]
+        snapshot = _read_json(path, MAX_SNAPSHOT_BYTES)
+        self._snapshot_reads += 1
+        self._snapshot_bytes += signature[2]
+        if snapshot.get('contractVersion') != 3:
+            raise ValueError('unsupported native snapshot')
+        self._snapshot_cache[str(path)] = (signature, snapshot)
+        while len(self._snapshot_cache) > MAX_SNAPSHOT_CACHE_ENTRIES:
+            self._snapshot_cache.pop(next(iter(self._snapshot_cache)))
+        return snapshot
 
     def retarget(self, url: str | None, api_key: str | None) -> None:
         if url:
@@ -293,7 +317,7 @@ class MissionActivityFeed:
             raise ValueError('invalid control-plane reply')
         return result
 
-    def _collect(self, descriptor: dict) -> list[dict]:
+    def _collect(self, descriptor: dict, snapshot: dict | None = None) -> list[dict]:
         status = session_status(descriptor, self.timeout)
         if status.get('missionSource') != 'runtime':
             return []
@@ -302,10 +326,11 @@ class MissionActivityFeed:
         if not isinstance(ids, list) or not isinstance(briefs, list):
             return []
         owned = {value for value in ids[:MAX_MISSIONS] if isinstance(value, str)}
-        try:
-            snapshot = _snapshot(descriptor['cwd'])
-        except (OSError, ValueError, TypeError):
-            snapshot = {}
+        if snapshot is None:
+            try:
+                snapshot = self._load_snapshot(descriptor['cwd'])
+            except (OSError, ValueError, TypeError):
+                snapshot = {}
         missions = snapshot.get('missions', [])
         if not isinstance(missions, list):
             missions = []
@@ -355,9 +380,13 @@ class MissionActivityFeed:
         return True
 
     def run_once(self) -> dict:
-        result = {'capable': False, 'sessions': 0, 'posted': 0, 'errors': 0, 'reasons': {}}
+        result = {'capable': False, 'sessions': 0, 'posted': 0, 'errors': 0, 'reasons': {},
+                  'snapshot_reads': 0, 'snapshot_cache_hits': 0, 'snapshot_bytes': 0}
         if not self._lock.acquire(blocking=False):
             return {**result, 'busy': True}
+        self._snapshot_reads = 0
+        self._snapshot_cache_hits = 0
+        self._snapshot_bytes = 0
         try:
             try:
                 capabilities = self._http_json('/api/v1/health').get('capabilities', [])
@@ -372,9 +401,19 @@ class MissionActivityFeed:
             except (OSError, ValueError):
                 descriptors = []
             result['sessions'] = len(descriptors)
+            snapshots = {}
+            for descriptor in descriptors:
+                cwd = descriptor.get('cwd')
+                if not isinstance(cwd, str) or cwd in snapshots:
+                    continue
+                try:
+                    snapshots[cwd] = self._load_snapshot(cwd)
+                except (OSError, ValueError, TypeError):
+                    snapshots[cwd] = {}
             candidates: dict[str, list[dict]] = {}
             with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
-                futures = [pool.submit(self._collect, descriptor) for descriptor in descriptors]
+                futures = [pool.submit(self._collect, descriptor, snapshots.get(descriptor.get('cwd'), {}))
+                           for descriptor in descriptors]
                 for future in futures:
                     try:
                         for payload in future.result():
@@ -400,6 +439,9 @@ class MissionActivityFeed:
                     _record_error(result, error, 'publication_failed')
             return result
         finally:
+            result['snapshot_reads'] = self._snapshot_reads
+            result['snapshot_cache_hits'] = self._snapshot_cache_hits
+            result['snapshot_bytes'] = self._snapshot_bytes
             self._lock.release()
 
 
