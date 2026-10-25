@@ -74,6 +74,7 @@ export function mountComposer(host, options = {}) {
   const drawSuggestions = () => {
     const option = (item, i) => {
       const icon = item.icon ? `<span class="conversation-suggestion-icon" data-icon="${esc(item.icon)}" aria-hidden="true">${ICONS[item.icon] || ''}</span>` : '';
+      if (item.notice) return `<li role="option" id="${id}-option-${i}" data-index="${i}" aria-selected="false" aria-disabled="true" class="conversation-suggestion-notice"${item.section ? ` data-section="${esc(item.section)}"` : ''}>${icon}<b>${esc(item.label)}</b>${item.detail ? `<span>${esc(item.detail)}</span>` : ''}</li>`;
       return `<li role="option" id="${id}-option-${i}" data-index="${i}" aria-selected="${i === selection}"${item.section ? ` data-section="${esc(item.section)}"` : ''}>${icon}<b>${esc(item.label)}</b>${item.detail ? `<span>${esc(item.detail)}</span>` : ''}</li>`;
     };
     // sectioned items (People / Agents / Files …) are listbox groups, each named by its heading
@@ -191,7 +192,7 @@ export function mountComposer(host, options = {}) {
   const choose = (index) => {
     if (options.providers) {             // the item's literal text, nothing else: what a harness reads is what was typed
       const token = sigilAt(input.value, input.selectionStart), item = items[index];
-      if (!token || !item) return close();
+      if (!token || !item || item.notice) return close();      // a notice ("GitHub cache not ready") inserts nothing
       const next = applyCompletion(input.value, input.selectionStart, token.start, item);
       apply(next.text, next.caret); return;
     }
@@ -239,7 +240,10 @@ export function mountComposer(host, options = {}) {
   on(input, 'compositionend', () => { composing = false; save(); suggest(); });
   on(input, 'keydown', (event) => {
     if (composing || event.isComposing || event.keyCode === 229) return;
-    if (items.length && !popup.hidden) {
+    // a menu of notices only is informational: keys pass through, so Enter still sends
+    if (items.length && !popup.hidden && items.every((item) => item.notice)) {
+      if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); close(); return; }
+    } else if (items.length && !popup.hidden) {
       if (event.key === 'ArrowDown' || event.key === 'ArrowUp') { event.preventDefault(); selection = (selection + (event.key === 'ArrowDown' ? 1 : items.length - 1)) % items.length; drawSuggestions(); return; }
       if (event.key === 'Tab' || (event.key === 'Enter' && !event.shiftKey)) { event.preventDefault(); choose(selection); return; }
       if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); close(); return; }
@@ -322,6 +326,8 @@ export function mountComposer(host, options = {}) {
   return {
     focus: () => input.focus(),
     getDraft: () => input.value,
+    // re-read the providers (their context changed, e.g. issue candidates arrived) while the caller types
+    refresh: () => { if (!disposed && doc.activeElement === input) suggest(); },
     setExpanded,
     setDisabled: (value) => { disabled = Boolean(value); controls(); if (disabled) close(); },
     dispose: () => { if (disposed) return; save(); jsonViewer?.dispose(); disposed = true; listeners.forEach((off) => off()); attachments.forEach(revoke); },

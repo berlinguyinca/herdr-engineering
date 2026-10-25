@@ -16,6 +16,7 @@ import urllib.error
 import urllib.request
 from datetime import UTC, datetime, timedelta
 
+from .control_plane.github_store import SEARCH_LIMIT, search_rows
 from .control_plane.project_links import (
     canonical_repository,
     project_for_repository,
@@ -1376,3 +1377,132 @@ class GitHubMonitor:
         if len(self._details) >= 200:
             self._details.pop(next(iter(self._details)))
         self._details[(repository_id, number)] = copy.deepcopy(result)
+
+    # -- `#` references (collab rooms, Task C4)
+
+    def _ref_scope(self):
+        """The owners a reference may name: a lower-case set, ``None`` for every owner (an empty
+        allowlist), or ``False`` when the allowlist is invalid (nothing is in scope)."""
+        try:
+            allow = self._allowlist()
+        except GitHubError:
+            return False
+        return {owner.lower() for owner in allow} or None
+
+    def ref_catalog(self):
+        """A read-only view of the cached catalog for resolving and showing `#` references, or
+        ``None`` when the cache is not ready. Memory only and never a network or store call, so a
+        collab room can use it under its own lock; it never answers for a catalog cached under
+        another credential (the configured token's fingerprint must match the catalog's)."""
+        scope = self._ref_scope()
+        provider = self._factory()
+        # a credential change holds this lock while it loads the store: answer "not ready" rather than wait
+        if not self._lock.acquire(timeout=0.5):
+            return None
+        try:
+            if (scope is False or not provider.available or provider.credential_identity != self._credential
+                    or not self._repos):
+                return None
+            return RefCatalog(dict(self._repos), dict(self._issues),
+                              {key: value.get("issue") for key, value in self._details.items()}, scope)
+        finally:
+            self._lock.release()
+
+    def search_issues(self, query, *, limit=SEARCH_LIMIT, start=True):
+        """`#` menu candidates of in-scope owners: ``{"ready", "items"}`` (at most ``limit``, <= 20).
+
+        The store answers (read-only, bounded); memory answers when the store is not trusted
+        (writes failing) or not reachable. ``ready`` is false while no catalog is cached for the
+        configured credential, and then nothing is listed.
+        """
+        provider = self._sync_credentials()
+        if start:
+            self.start()
+        scope = self._ref_scope()
+        with self._lock:
+            generation = self._generation
+            if (scope is False or not provider.available or provider.credential_identity != self._credential
+                    or not self._repos):
+                return {"ready": False, "items": []}
+            store = None if self._store_dirty or self._revision is None else self._store
+        items = None
+        if store is not None:
+            try:
+                items = store.search_issues(query, scope, limit=limit)
+            except Exception:
+                items = None  # unreachable or not migrated: memory holds the same catalog
+        if items is None:
+            with self._lock:
+                repos, issues = list(self._repos.values()), dict(self._issues)
+            items = search_rows(repos, lambda rid: issues.get(rid, {}).values(), query, scope, limit)
+        with self._lock:
+            if generation != self._generation:  # the token changed meanwhile: answer for nobody
+                return {"ready": False, "items": []}
+        return {"ready": True, "items": items}
+
+
+class RefCatalog:
+    """The cached catalog at one moment, for `#` references (built by ``GitHubMonitor.ref_catalog``).
+
+    The cache keeps open issues only (closed ones leave it on the next pass), so an issue missing
+    from a repository whose issues are fully cached reads as ``closed`` (GitHub closed, deleted or
+    transferred it); its title then comes from an opened detail when there is one.
+    """
+
+    def __init__(self, repos, issues, details, scope):
+        self._repos, self._issues, self._details, self._scope = repos, issues, details, scope
+        self._names, self._by_repo, self._numbers = {}, {}, {}
+        for rid, record in repos.items():
+            owner, _, name = str(record.get("name_with_owner") or "").lower().partition("/")
+            if scope is not None and owner not in scope:
+                continue
+            self._names[(owner, name)] = rid
+            self._by_repo.setdefault(name, []).append(rid)
+
+    def _issue(self, rid, number):
+        if rid not in self._numbers:
+            self._numbers[rid] = {issue["number"]: issue for issue in self._issues.get(rid, {}).values()}
+        return self._numbers[rid].get(number)
+
+    def _rid(self, owner, repo):
+        if owner is None:
+            hits = self._by_repo.get(str(repo).lower(), [])
+            return hits[0] if len(hits) == 1 else None   # unknown, or a name two owners share
+        return self._names.get((str(owner).lower(), str(repo).lower()))
+
+    def resolve(self, wanted, limit=20):
+        """``[{kind, owner, repo, number}]`` for the ``(owner | None, repo, number)`` the text names
+        that are cached issues of in-scope owners; each once, at most ``limit``."""
+        out, seen = [], set()
+        for owner, repo, number in wanted:
+            rid = self._rid(owner, repo)
+            issue = None if rid is None else self._issue(rid, number)
+            if issue is None or (rid, number) in seen:
+                continue
+            seen.add((rid, number))
+            owner_name, _, repo_name = self._repos[rid]["name_with_owner"].partition("/")
+            url = issue.get("url") if isinstance(issue.get("url"), str) else ""
+            out.append({"kind": "pr" if "/pull/" in url else "issue", "owner": owner_name, "repo": repo_name,
+                        "number": number})
+            if len(out) >= limit:
+                break
+        return out
+
+    def detail(self, ref):
+        """``{title, state, url, private}`` of one stored ref as cached now, or ``None`` when its
+        repository is not cached or not in scope (``state`` ``None``: not known yet)."""
+        try:
+            rid = self._rid(ref["owner"], ref["repo"])
+            number = int(ref["number"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        if rid is None:
+            return None
+        record = self._repos[rid]
+        issue = self._issue(rid, number)
+        if issue is not None:
+            return {"title": issue.get("title") or "", "state": str(issue.get("state") or "").lower() or None,
+                    "url": issue.get("url"), "private": bool(record.get("private"))}
+        opened = self._details.get((rid, number)) or {}
+        return {"title": opened.get("title"), "state": "closed" if record.get("issues_complete") else None,
+                "url": opened.get("url"), "private": bool(record.get("private"))}

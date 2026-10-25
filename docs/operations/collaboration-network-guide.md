@@ -157,6 +157,21 @@ What the agent can and cannot do:
   room named by `contextId`; discovery is at `/.well-known/agent-card.json`. It is send-only; reading
   stays on MCP.
 
+### Referencing GitHub issues (`#binview-44`)
+
+Type `#` in the chat box to pick an issue from the GitHub cache: `#binview-44` names issue 44 of the
+repository `binview`; when two owners in scope both have a `binview`, the menu inserts
+`acme/binview#44` instead. Only owners listed in `github.organizations` appear (the cache holds
+nothing else). The message text is sent exactly as typed; the server finds the references in it
+(never inside code, links or words such as `abc#12`) and the chip shows the issue's title and
+open/closed state as the cache knows them when the message is read. The cache keeps open issues,
+so an issue that was closed later shows as closed. If the cache is empty or not configured the
+menu says "GitHub cache not ready" and the message still sends, as plain text.
+
+Guests and external agents see titles and states of public repositories only: a reference to a
+private repository reaches them as `owner/repo#n` without its title, and their `#` menu lists
+public repositories' issues only.
+
 ### The flow of work (live graph)
 
 Every room has a **Flow of work** panel (not shown to guests): people on the left, agents to the right, one line per

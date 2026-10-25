@@ -16,7 +16,7 @@ import {
   createHelpersPanel, renderEgressRequests, renderHelperTree, renderHostsTable, renderPanic, renderProfileEditor, wireHelperHandlers,
 } from './collab-helpers.js';
 import { ensureConversationStyles, mountComposer } from './conversation-composer.js';
-import { providers, ROOM_COMMANDS, unresolvedMentions, ambiguousMentions, mentionChips, resolveToken } from './collab-mention.js';
+import { providers, ROOM_COMMANDS, unresolvedMentions, ambiguousMentions, mentionChips, refChips, resolveToken, quiet } from './collab-mention.js';
 import { renderMarkdown } from './conversation-markdown.js';
 import { mountFilesShelf, fileSize } from './collab-files-view.js';
 import {
@@ -567,7 +567,7 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
     const guest = info.role === 'guest';
     let names = new Map((info.members || []).map((m) => [m.user_id, m.email || shortId(m.user_id)]));
     const agentName = new Map();           // agent id -> handle, for rendering task events
-    const S = { agents: [], people: [], tasks: [], flow: null, requests: null, mine: [], links: null, missions: null, tabs: null, tabsAt: 0, tabSel: null, externals: null, deleg: null, props: null, propSel: null, propOne: null, profile: null, allow: [], egress: [], helpers: [], paused: false, entries: null, files: [] };
+    const S = { agents: [], people: [], tasks: [], flow: null, requests: null, mine: [], links: null, missions: null, tabs: null, tabsAt: 0, tabSel: null, externals: null, deleg: null, props: null, propSel: null, propOne: null, profile: null, allow: [], egress: [], helpers: [], paused: false, entries: null, files: [], issues: [], issuesReady: undefined };
     const tabs = [['chat', 'Chat'], ...(guest ? [] : [['flow', 'Flow']]), ['tasks', 'Tasks'], ...(guest ? [] : [['files', 'Files'], ['agents', 'Agents'], ['tabs', 'Tabs'], ['lineage', 'Lineage'], ['attention', 'Attention'], ['progress', 'Progress'], ['links', 'Workspaces']]), ...(canInvite ? [['proposals', 'Proposals'], ['people', 'People']] : [])];
     let sub = subTab.get(roomId);
     if (!tabs.some(([k]) => k === sub)) sub = 'chat';
@@ -699,7 +699,7 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
         const cont = key === lastKey && at - lastAt < 5 * 60000;
         lastKey = key; lastAt = at.getTime();
         row.className = `cx-m${mine ? ' cx-m--mine' : ''}${agent ? ' cx-m--agent' : ''}${cont ? ' cx-m--cont' : ''}`;
-        row.innerHTML = `${mine ? '' : `<span class="cx-av" style="--h:${hueOf(key)}" aria-hidden="true">${agent ? '🤖' : esc(initials(who))}</span>`}<div class="cx-mbody"><div class="cx-meta"><b>${esc(who)}</b><span>${esc(time)}</span></div><div class="cx-bubble conversation-markdown">${mentionChips(renderMarkdown(e.text), e.mentions, mentionCtx())}</div>${e.files?.length ? `<div class="cx-file-refs">${e.files.map((f) => `<button type="button" class="cx-file-chip" data-file-dl="${esc(f.id)}" data-file-v="${Number(f.version) || ''}" data-file-name="${esc(f.name)}" title="Download ${esc(f.name)} v${Number(f.version) || ''} · .collab/files/${esc(f.name)}">📄 ${esc(f.name)} <small>v${Number(f.version) || ''}</small></button>`).join('')}</div>` : ''}${e.context ? `<div class="ctx-ref">${renderContextChip(e.context)}</div>` : ''}</div>`;
+        row.innerHTML = `${mine ? '' : `<span class="cx-av" style="--h:${hueOf(key)}" aria-hidden="true">${agent ? '🤖' : esc(initials(who))}</span>`}<div class="cx-mbody"><div class="cx-meta"><b>${esc(who)}</b><span>${esc(time)}</span></div><div class="cx-bubble conversation-markdown">${refChips(mentionChips(renderMarkdown(e.text), e.mentions, mentionCtx()), e.refs)}</div>${e.files?.length ? `<div class="cx-file-refs">${e.files.map((f) => `<button type="button" class="cx-file-chip" data-file-dl="${esc(f.id)}" data-file-v="${Number(f.version) || ''}" data-file-name="${esc(f.name)}" title="Download ${esc(f.name)} v${Number(f.version) || ''} · .collab/files/${esc(f.name)}">📄 ${esc(f.name)} <small>v${Number(f.version) || ''}</small></button>`).join('')}</div>` : ''}${e.context ? `<div class="ctx-ref">${renderContextChip(e.context)}</div>` : ''}</div>`;
         return row;
       }
       lastKey = null;
@@ -1332,8 +1332,28 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
       return { people: S.people, commands: ROOM_COMMANDS,
         agents: S.agents.map((a) => ({ ...a, label: namedAgent(a).display_name || '' })),
         // the Files group inserts the stable path an agent's helper fetches to (latest version), never `@file`
-        files: S.files.map((f) => ({ path: f.path, insert: f.path, label: f.name, detail: `v${f.version} · ${fileSize(f.size)}` })) };
+        files: S.files.map((f) => ({ path: f.path, insert: f.path, label: f.name, detail: `v${f.version} · ${fileSize(f.size)}` })),
+        issues: S.issues, issuesReady: S.issuesReady };
     }
+    // `#` candidates come from the server's GitHub cache (in-scope owners only), fetched as the query changes;
+    // the menu redraws when they arrive. No cache (or no answer): the menu says so and the message still sends.
+    let issueQuery = null, issueAbort = null;
+    const fetchIssues = quiet(async (q) => {
+      issueAbort?.abort(); issueAbort = new AbortController();
+      try {
+        const found = await api.refs(roomId, q, issueAbort.signal);
+        if (q !== issueQuery) return;
+        S.issues = Array.isArray(found?.items) ? found.items : []; S.issuesReady = Boolean(found?.ready);
+      } catch (e) {
+        if (e?.name === 'AbortError' || q !== issueQuery) return;
+        S.issues = []; S.issuesReady = false;
+      }
+      composer?.refresh?.();
+    }, 150);
+    const roomProviders = { ...providers, '#'(query, ctx) {
+      if (query !== issueQuery) { issueQuery = query; fetchIssues(query); }
+      return providers['#'](query, ctx);
+    } };
     // ---- one long-poll feeds every panel (replaces five timers); it sleeps while the tab is hidden
     const apply = (s) => {
       if (s.agents) { S.agents = s.agents; S.agents.forEach((a) => agentName.set(a.agent_id, a.name)); }
@@ -1392,7 +1412,7 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
         draftKey: `collab:${me.user_id}:${roomId}`,
         placeholder: 'Message the room… @ people, agents and files · / commands',
         hint: 'Enter sends · Shift+Enter adds a line · @gert.pi … gives that agent a task',
-        providers, context: mentionCtx,
+        providers: roomProviders, context: mentionCtx,
         check: (text) => {
           const ctx = mentionCtx(), notes = [];
           for (const a of ambiguousMentions(text, ctx)) notes.push(`@${a.name} is ambiguous — use ${a.forms.length ? a.forms.join(' or ') : '@owner.harness'}.`);

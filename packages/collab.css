@@ -377,6 +377,13 @@ button.ctx-chip:focus-visible, .ctx-chip:focus-visible { outline: 2px solid curr
 .cx-mention--group { background: var(--surface-2); }
 .cx-mention__icon { font-size: .8em; }
 .cx-m--mine .cx-mention { background: color-mix(in srgb, var(--text-on-accent) 18%, transparent); color: inherit; border-color: transparent; }
+/* C4 #issue references: the mention chip, plus the title and open/closed state read from the GitHub cache */
+.cx-ref { gap: 4px; max-width: 100%; }
+.cx-ref__title { min-width: 0; max-width: 28ch; overflow: hidden; text-overflow: ellipsis; font-weight: 400; }
+.cx-ref__state { font-size: .75em; font-weight: 600; text-transform: uppercase; letter-spacing: .03em; padding: 0 4px; border-radius: 4px;
+  background: var(--status-success-weak, var(--surface-2)); color: var(--status-success, var(--text)); }
+.cx-ref--closed .cx-ref__state, .cx-ref--merged .cx-ref__state { background: var(--violet-weak, var(--surface-2)); color: var(--violet, var(--text-muted)); }
+.cx-ref--closed .cx-ref__title { text-decoration: line-through; opacity: .8; }
 /* C5 room files: the shelf and the file chips a message carries (download only, never opened inline) */
 .cx-files-list { display: grid; gap: var(--space-2, 8px); }
 .cx-file { display: grid; gap: 4px; }

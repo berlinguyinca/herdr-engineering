@@ -121,8 +121,19 @@ export const providers = {
     }
     return rank(rows);
   },
+  // Issues come from the server's GitHub cache (in-scope owners only); `insert` is the shortest unambiguous
+  // form (`#repo-n`, or `owner/repo#n` when two owners share the name). No cache: one row that says so and
+  // inserts nothing, so Enter still sends.
   '#'(query, ctx = {}) {
-    return rank((ctx.issues || []).map((i) => ({ score: score(query, i.insert.replace(/^#/, ''), i.label), item: { section: 'Issues', icon: 'issue', detail: '', ...i } })));
+    if (ctx.issuesReady === false) {
+      return [{ insert: '', label: 'GitHub cache not ready', section: 'Issues', icon: 'issue', notice: true,
+        detail: 'The message still sends; #references resolve once the cache is filled' }];
+    }
+    return rank((ctx.issues || []).map((i) => {
+      const forms = i.repo ? [`${i.repo}-${i.number}`, `${i.owner}/${i.repo}#${i.number}`] : [];
+      const detail = i.detail ?? [i.title, i.state].filter(Boolean).join(' · ');
+      return { score: score(query, i.insert.replace(/^#/, ''), ...forms, i.label), item: { section: 'Issues', icon: 'issue', label: i.insert, ...i, detail } };
+    }));
   },
   '/'(query, ctx = {}) {
     if (ctx.agent) {
@@ -230,6 +241,35 @@ export function mentionChips(html, mentions, ctx = {}) {
       const [icon, glyph] = CHIP_ICON[found.m.kind] || CHIP_ICON.person;
       const label = `${found.m.kind === 'agent' ? 'Agent' : found.m.kind === 'group' ? 'Group' : 'Person'} @${found.m.name}`;
       return `${pre}<span class="cx-mention cx-mention--${escText(found.m.kind)}" data-mention-kind="${escText(found.m.kind)}" data-mention-id="${escText(found.m.id)}" title="${escText(label)}"><span class="cx-mention__icon" data-icon="${icon}" aria-hidden="true">${glyph}</span>@${token.slice(0, found.len)}</span>${token.slice(found.len)}`;
+    });
+  }).join('');
+}
+
+// `#` references in rendered message HTML as chips. Only references the server resolved for this message
+// (its `refs`) become chips; code, links and other text stay as they are. The chip keeps the literal text and
+// shows the title and state the server read from the GitHub cache for this reader (none: coordinates only).
+const REF = /(^|[\s([{])(#([A-Za-z0-9_.-]{1,100}?)-([0-9]{1,10})|([A-Za-z0-9][A-Za-z0-9-]{0,38})\/([A-Za-z0-9_.-]{1,100})#([0-9]{1,10}))(?![A-Za-z0-9_#/-]|\.[A-Za-z0-9_])/g;
+export function refChips(html, refs) {
+  const list = refs || [];
+  if (!list.length) return html;
+  const same = (a, b) => String(a).toLowerCase() === String(b).toLowerCase();
+  let skip = 0;
+  return String(html).split(/(<[^>]*>)/).map((part) => {
+    if (part.startsWith('<')) {
+      const tag = /^<(\/?)(code|pre|a)\b/i.exec(part);
+      if (tag) skip = Math.max(0, skip + (tag[1] ? -1 : 1));
+      return part;
+    }
+    if (skip) return part;
+    return part.replace(REF, (all, pre, text, shortRepo, shortNo, owner, repo, no) => {
+      const ref = shortRepo
+        ? list.find((r) => same(r.repo, shortRepo) && Number(r.number) === Number(shortNo))
+        : list.find((r) => same(r.owner, owner) && same(r.repo, repo) && Number(r.number) === Number(no));
+      if (!ref) return all;
+      const where = `${ref.owner}/${ref.repo}#${Number(ref.number)}`;
+      const state = ref.state === 'open' || ref.state === 'closed' || ref.state === 'merged' ? ref.state : '';
+      const label = [`${ref.kind === 'pr' ? 'Pull request' : 'Issue'} ${where}`, ref.title, state].filter(Boolean).join(' · ');
+      return `${pre}<span class="cx-mention cx-ref${state ? ` cx-ref--${state}` : ''}" data-ref="${escText(where)}"${state ? ` data-ref-state="${state}"` : ''} title="${escText(label)}"><span class="cx-mention__icon" data-icon="issue" aria-hidden="true">${ref.kind === 'pr' ? '⑂' : '◎'}</span>${text}${ref.title ? `<span class="cx-ref__title">${escText(ref.title)}</span>` : ''}${state ? `<span class="cx-ref__state">${state}</span>` : ''}</span>`;
     });
   }).join('');
 }

@@ -302,6 +302,8 @@ class ControlPlaneServer:
         self.fleet_config = fleet_config
         self.review_quorum = review_quorum      # QuorumConfig | None (feature off)
         self.collab = collab
+        if collab is not None and getattr(collab, "github", None) is None:
+            collab.github = self.github_monitor   # `#` references read the same cache (C4)
         self.collab_require_https = collab_require_https
         # Optional second listener that serves ONLY collaboration (API, MCP and its page);
         # it is the only one an internet-facing proxy should be pointed at.
@@ -1642,8 +1644,11 @@ def _make_handler(server, public=False, operator=False):
                                    "entities": ["host", "session", "mission"]})
             if resource == "github":
                 what = parts[4] if len(parts) == 5 else ""
-                if len(parts) > 5 or (len(parts) == 5 and what not in {"issues", "issue"}):
+                if len(parts) > 5 or (len(parts) == 5 and what not in {"issues", "issue", "resolve"}):
                     return self._json({"error": "not found"}, 404)
+                if what == "resolve":
+                    # `#` candidates of in-scope owners from the cache (C4): read-only, bounded, ETag'd
+                    return self._etag_json(server.github_monitor.search_issues(_github_resolve_query(self.path)))
                 query = _github_query(self.path, what)
                 if what == "issue":
                     return self._json(server.github_monitor.issue_detail(
@@ -2389,6 +2394,17 @@ def _if_none_match(header, etag) -> bool:
 
 
 _MAX_REVISION = 2**63 - 1
+
+
+def _github_resolve_query(path):
+    """``q`` of ``/github/resolve``: one value, at most 160 characters, nothing else accepted."""
+    values = parse_qs(urlsplit(path).query, keep_blank_values=True, max_num_fields=5)
+    if values.keys() - {"q"} or any(len(items) != 1 for items in values.values()):
+        raise ValueError("invalid GitHub query")
+    query = values.get("q", [""])[0]
+    if len(query) > 160:
+        raise ValueError("invalid GitHub query")
+    return query
 
 
 def _github_query(path, kind):
