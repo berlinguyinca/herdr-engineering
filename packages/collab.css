@@ -1,6 +1,13 @@
 /* HerdR Collaboration: page styles on top of the shared design tokens (theme.css/base.css).
  * Same look as the dashboard: white cards on a light grey ground, green accent, Inter. */
 .cx-page { color-scheme: light dark; }
+/* WCAG 1.4.3 (T16 UI gate): the shared light tokens in theme.css give 3.2:1 for muted text and for white-on-accent
+ * (below 4.5:1). Darker values for this page only; the dashboard theme is untouched. Dark mode sets its own below. */
+.cx-page, .cx-embed {
+  --accent: #0a7358; --accent-hover: #085f49;
+  --text-secondary: #55556a; --text-muted: #686880;
+  --status-attention: #b45309; --status-blocked: #c2410c;
+}
 @media (prefers-color-scheme: dark) {
   .cx-page {
     --background: #14161a; --surface: #1c1f26; --surface-2: #272b34; --surface-hover: #232730;
@@ -8,6 +15,7 @@
     --text: #e6e8ee; --text-secondary: #aab0bf; --text-muted: #8a91a3;
     --accent: #19c39b; --accent-hover: #14a883; --accent-weak: #16322c; --text-on-accent: #07140f;
     --violet-weak: #2a2447; --status-ok: #34d399; --status-failed: #f87171; --status-attention: #fbbf24;
+    --status-blocked: #fb923c;   /* the light #c2410c is ~3.2:1 here; this is >= 6.2:1 on every dark surface */
     --shadow: 0 1px 2px rgba(0, 0, 0, .4);
   }
   .cx-page .hd-error { background: #3a1d1d; }
@@ -82,6 +90,7 @@
   color: var(--text); border: 1px solid var(--border); border-radius: var(--radius-sm); min-width: 0; }
 .cx-field { display: flex; flex-direction: column; gap: 4px; font-size: .8125rem; color: var(--text-secondary); flex: 1 1 200px; }
 .cx-form { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 10px; }
+.cx-sr { position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0; overflow: hidden; clip: rect(0 0 0 0); clip-path: inset(50%); white-space: nowrap; border: 0; }   /* a heading for the outline, not for the eye */
 .cx-msg { font-size: .8125rem; color: var(--text-secondary); }
 .cx-msg[role=alert] { color: var(--status-failed); }
 
@@ -161,7 +170,7 @@
 .cx-taskcard__head span { color: var(--tc); font-weight: 600; text-transform: uppercase; font-size: .6875rem; letter-spacing: .04em; }
 .cx-taskcard__head time { margin-left: auto; color: var(--text-muted); font-size: .75rem; }
 .cx-event { align-self: center; margin: 6px 0; font-size: .75rem; color: var(--text-muted); background: var(--surface-2); padding: 2px 10px; border-radius: 999px; }
-.cx-jump { position: absolute; right: 18px; bottom: 96px; box-shadow: var(--shadow-lg, 0 4px 12px rgba(0,0,0,.2)); z-index: 2; }
+.cx-jump { position: absolute; right: 18px; bottom: 96px; box-shadow: var(--shadow-lg, 0 4px 12px rgba(0,0,0,.2)); z-index: 10; }
 .cx-jump[hidden] { display: none; }
 .cx-compose { display: flex; gap: 10px; align-items: flex-end; padding: 12px 14px 4px; border-top: 1px solid var(--border-subtle); background: var(--surface); }
 .cx-compose-msg { padding: 2px 16px 10px; background: var(--surface); }
@@ -169,7 +178,7 @@
 .cx-ac-wrap textarea { width: 100%; box-sizing: border-box; resize: none; max-height: 180px; line-height: 1.4; border-radius: 12px; }
 .cx-ac { position: absolute; left: 0; bottom: calc(100% + 6px); min-width: min(320px, 100%); max-width: 100%; margin: 0; padding: 4px; list-style: none;
   background: var(--surface); border: 1px solid var(--border); border-radius: 10px; box-shadow: var(--shadow-lg, 0 8px 24px rgba(0,0,0,.25));
-  max-height: 240px; overflow-y: auto; z-index: 5; }
+  max-height: 240px; overflow-y: auto; z-index: 10; }
 .cx-ac[hidden] { display: none; }
 .cx-ac li { display: flex; justify-content: space-between; gap: 14px; align-items: baseline; padding: 7px 10px; border-radius: 7px; cursor: pointer; }
 .cx-ac li span { color: var(--text-muted); font-size: .75rem; }
@@ -201,9 +210,18 @@ textarea.cx-input { resize: vertical; font: inherit; }
 .cx-flow-edge { cursor: pointer; opacity: 0.85; transition: stroke-width 0.3s; }
 .cx-flow-edge--live { stroke-dasharray: 7 6; animation: cx-flow-move 0.9s linear infinite; }
 .cx-flow-pulse { animation: cx-flow-pulse 1.2s ease-out 1; }
+.cx-still .cx-flow-edge--live, .cx-still .cx-flow-pulse { animation: none; }
 @keyframes cx-flow-move { to { stroke-dashoffset: -26; } }
 @keyframes cx-flow-pulse { 0% { opacity: 1; filter: drop-shadow(0 0 6px currentColor); } 100% { opacity: 0.85; } }
-@media (prefers-reduced-motion: reduce) { .cx-flow-edge--live, .cx-flow-pulse { animation: none; } .cx-log { scroll-behavior: auto; } }
+/* A live task card that slides in and glows runs both animations together (the attribute rule
+ * alone would replace one with the other). */
+.cx-flow-pulse[data-entering] { animation: hd-enter var(--motion-normal, 200ms) ease-out, cx-flow-pulse 1.2s ease-out 1; }
+/* OS reduced motion stops these unless the viewer explicitly chose calm "off"; calm "on" is
+ * handled for every element by motion.css. */
+@media (prefers-reduced-motion: reduce) {
+  html:not([data-calm="off"]) .cx-flow-edge--live, html:not([data-calm="off"]) .cx-flow-pulse { animation: none; }
+  html:not([data-calm="off"]) .cx-log { scroll-behavior: auto; }
+}
 
 /* ---- public guide page */
 .cx-guide { max-width: 860px; margin: 0 auto; padding: 24px 16px 64px; line-height: 1.55; }
@@ -235,7 +253,7 @@ textarea.cx-input { resize: vertical; font: inherit; }
 .cx-table th { color: var(--text-secondary); font-weight: 600; }
 
 /* ---- polish: agent names, rows, cards ---- */
-.cx-page, .cx-embed { --cx-ring: 0 0 0 3px color-mix(in srgb, var(--accent) 28%, transparent); }
+.cx-page, .cx-embed { --cx-ring: 0 0 0 3px var(--accent); }      /* a focus ring needs 3:1 against the page (1.4.11); the old 28% tint measured 1.5:1 */
 .cx-embed h1, .cx-page h1 { letter-spacing: -.01em; }
 .cx-head h1 { font-size: 1.6rem; }
 .cx-section > h2 { font-size: .75rem; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; color: var(--text-muted); margin-bottom: 12px; }
@@ -250,7 +268,7 @@ textarea.cx-input { resize: vertical; font: inherit; }
 .cx-av--sm { width: 26px; height: 26px; flex-basis: 26px; font-size: .6875rem; }
 .cx-ntitle { display: inline-flex; align-items: center; gap: 8px; min-width: 0; max-width: 100%; flex-wrap: wrap; }
 .cx-nname { font-weight: 650; overflow-wrap: anywhere; }
-.cx-edit { border: 0; background: transparent; color: var(--text-muted); cursor: pointer; padding: 2px 6px; border-radius: 6px; font-size: .9rem; line-height: 1; opacity: .55; }
+.cx-edit { border: 0; background: transparent; color: var(--text-secondary); cursor: pointer; padding: 2px 6px; border-radius: 6px; font-size: .9rem; line-height: 1; opacity: 1; }
 .cx-edit:hover, .cx-ntitle:hover .cx-edit { opacity: 1; background: var(--surface-hover); color: var(--accent); }
 .cx-rename { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
 .cx-rename .cx-input { width: 11rem; padding: 4px 8px; }
@@ -278,6 +296,89 @@ textarea.cx-input { resize: vertical; font: inherit; }
 
 .cx-flow-edge--spawn { stroke-dasharray: 3 5; opacity: .6; cursor: default; }
 
+/* ---- lineage graph, Gantt, replay (T09). Nothing is encoded by colour alone: shapes, dashes, glyphs, fill patterns and words. */
+.cx-scroll { overflow: auto; max-width: 100%; }
+.cx-scroll:focus-visible, .lin-svg g[role=button]:focus-visible { outline: 2px solid var(--accent, #1f7ae0); outline-offset: 2px; }
+.lin-scroll { max-height: 70vh; border: 1px solid var(--border-subtle, #d0d4da); border-radius: 8px; }
+.lin-grid2 { display: grid; grid-template-columns: minmax(0, 1fr) minmax(220px, 320px); gap: 16px; align-items: start; }
+@media (max-width: 760px) { .lin-grid2 { grid-template-columns: minmax(0, 1fr); } }
+.lin-svg { display: block; background: var(--surface, #fff); }
+.lin-svg:focus { outline: none; }
+.lin-box { fill: var(--surface-raised, var(--surface, #fff)); stroke: var(--text-secondary, #555); stroke-width: 1.5; }
+.lin-node { cursor: pointer; }
+.lin-node:hover .lin-box, .lin-node:focus .lin-box { stroke: var(--accent, #1f7ae0); stroke-width: 3; }
+.lin-node:focus { outline: none; }
+.lin-node--sel .lin-box { stroke: var(--accent, #1f7ae0); stroke-width: 3.5; stroke-dasharray: none; }
+.lin-node--hit .lin-box { stroke-width: 3; stroke: var(--text, #1b1f24); }
+.lin-node--active .lin-box { fill: color-mix(in srgb, var(--status-active, #1f7ae0) 10%, var(--surface, #fff)); }
+.lin-node--waiting .lin-box { fill: color-mix(in srgb, var(--status-attention, #d89b1d) 12%, var(--surface, #fff)); }
+.lin-node--finished .lin-box { fill: color-mix(in srgb, var(--status-ok, #1a9b6c) 10%, var(--surface, #fff)); }
+.lin-node--failed .lin-box { fill: color-mix(in srgb, var(--status-danger, #c0392b) 10%, var(--surface, #fff)); }
+/* Unrelated nodes recede by fading their shapes, not their words: 35% text opacity measured 1.7:1 (1.4.3). */
+.lin-dim .lin-box, .lin-dim .lin-edge-line, .lin-dim .lin-arrowhead { opacity: .35; }
+.lin-name { font: 600 11px var(--font-sans, system-ui, sans-serif); fill: var(--text, #1b1f24); }
+.lin-sub, .lin-edge-tag { font: 10px var(--font-sans, system-ui, sans-serif); fill: var(--text-secondary, #555); }
+.lin-edge-line { stroke: var(--text-secondary, #555); stroke-width: 1.6; }
+.lin-edge--stale .lin-edge-line { stroke-width: 1; opacity: .7; }
+.lin-edge--stale .lin-edge-tag { text-decoration: line-through; }
+.lin-arrowhead { fill: var(--text-secondary, #555); }
+.lin-grid { stroke: var(--border-subtle, #d0d4da); stroke-dasharray: 2 4; }
+.lin-bar { stroke: var(--text-secondary, #555); stroke-width: 1; }
+.lin-bar-text, .lin-mark-text { font: 600 10px var(--font-sans, system-ui, sans-serif); fill: var(--text, #1b1f24); paint-order: stroke; stroke: var(--surface, #fff); stroke-width: 3px; }
+.lin-fill-active { fill: color-mix(in srgb, var(--status-active, #1f7ae0) 45%, var(--surface, #fff)); }
+.lin-fill-waiting { fill: color-mix(in srgb, var(--status-attention, #d89b1d) 30%, var(--surface, #fff)); }
+.lin-fill-finished { fill: color-mix(in srgb, var(--status-ok, #1a9b6c) 35%, var(--surface, #fff)); }
+.lin-fill-failed { fill: color-mix(in srgb, var(--status-danger, #c0392b) 30%, var(--surface, #fff)); }
+.lin-fill-stopped, .lin-fill-other { fill: color-mix(in srgb, var(--text-muted, #888) 25%, var(--surface, #fff)); }
+.lin-hatch { stroke: var(--text-secondary, #555); }
+.lin-hatch-fill, .lin-dot { fill: var(--text-secondary, #555); }
+.lin-diamond { fill: var(--surface-raised, #fff); stroke: var(--text, #1b1f24); stroke-width: 1.5; }
+.lin-mark--stale .lin-diamond { stroke-dasharray: 3 2; }
+.lin-legend { font-size: .8125rem; }
+.lin-legend__cols { display: flex; flex-wrap: wrap; gap: 8px 24px; }
+.lin-legend ul { list-style: none; margin: 4px 0; padding: 0; }
+.lin-sw { display: inline-block; width: 22px; height: 10px; border: 1px solid var(--text-secondary, #555); vertical-align: middle; }
+.lin-sw--waiting { background: repeating-linear-gradient(45deg, transparent 0 3px, var(--text-secondary, #555) 3px 4px); }
+.lin-sw--finished { background: radial-gradient(var(--text-secondary, #555) 1px, transparent 1.5px) 0 0 / 5px 5px; }
+.lin-sw--failed { background: linear-gradient(45deg, transparent 45%, var(--text-secondary, #555) 45% 55%, transparent 55%), linear-gradient(-45deg, transparent 45%, var(--text-secondary, #555) 45% 55%, transparent 55%); }
+.lin-sw--stopped { background: linear-gradient(transparent 40%, var(--text-secondary, #555) 40% 60%, transparent 60%); }
+.lin-replay { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 8px 0; border-bottom: 1px solid var(--border-subtle, #d0d4da); }
+.lin-slider { display: flex; align-items: center; gap: 8px; flex: 1 1 220px; font-size: .8125rem; }
+.lin-slider input { flex: 1; min-width: 120px; }
+.lin-replay__status { flex: 1 0 100%; font-size: .8125rem; color: var(--text-secondary, #555); }
+.lin-table { border-collapse: collapse; width: 100%; font-size: .8125rem; }
+.lin-table caption { text-align: left; font-weight: 600; padding: 4px 0; }
+.lin-table th, .lin-table td { text-align: left; padding: 4px 8px; border-bottom: 1px solid var(--border-subtle, #d0d4da); vertical-align: top; overflow-wrap: anywhere; }
+.lin-tables { display: grid; gap: 12px; }
+.lin-dl { display: grid; grid-template-columns: max-content 1fr; gap: 2px 12px; margin: 0; font-size: .8125rem; }
+.lin-dl dt { color: var(--text-secondary, #555); }
+.lin-dl dd { margin: 0; overflow-wrap: anywhere; }
+.lin-inspector h4 { margin: 12px 0 4px; font-size: .8125rem; text-transform: none; }
+@media (forced-colors: active) { .lin-box, .lin-bar, .lin-edge-line { stroke: CanvasText; } .lin-node--sel .lin-box { stroke: Highlight; } }
+@media (prefers-reduced-motion: reduce) { .lin-svg * { transition: none; animation: none; } }
+
+/* T12: comments and steering beside the lineage inspector. Text from people is data: keep its line breaks, wrap it. */
+.wb { display: grid; gap: 12px; }
+.wb-section { border-top: 1px solid var(--hd-border, currentColor); padding-top: 8px; }
+.wb-text { white-space: pre-wrap; overflow-wrap: anywhere; margin: 4px 0; }
+.wb-comment, .wb-steer { padding: 6px 0; }
+.wb-comment + .wb-comment, .wb-steer + .wb-steer { border-top: 1px dotted var(--hd-border, currentColor); }
+.wb-fieldset { border: 1px solid var(--hd-border, currentColor); padding: 8px; }
+.wb-radio { display: block; padding: 2px 0; }
+.wb-confirm { border: 2px solid currentColor; padding: 8px; }
+@media (forced-colors: active) { .wb-confirm, .wb-fieldset { border-color: CanvasText; } }
+
+/* T14: context references, questions and cross-workspace links. A state is a glyph plus a word, never colour alone. */
+.ctx-ref { margin-top: 4px; }
+.ctx-chip { display: inline-flex; gap: 6px; align-items: center; max-width: 100%; padding: 2px 10px; border: 1px solid var(--hd-border, currentColor);
+  border-radius: 999px; background: transparent; color: inherit; font: inherit; font-size: 0.85em; overflow-wrap: anywhere; cursor: default; }
+button.ctx-chip { cursor: pointer; }
+button.ctx-chip:focus-visible, .ctx-chip:focus-visible { outline: 2px solid currentColor; outline-offset: 2px; }
+.ctx-chip--hidden { border-style: dashed; }
+.ctx-attached { padding: 4px 0; }
+.ctx-consult, .ctx-link { border-top: 1px solid var(--hd-border, currentColor); padding-top: 8px; }
+.ctx-inbox { border: 1px solid var(--hd-border, currentColor); border-radius: 8px; padding: 8px; }
+@media (prefers-reduced-motion: reduce) { .ctx-chip { transition: none; } }
 /* agent helpers */
 .cx-panic { justify-content: space-between; }
 .cx-table { width: 100%; border-collapse: collapse; font-size: var(--text-sm, 13px); }
@@ -288,3 +389,15 @@ textarea.cx-input { resize: vertical; font: inherit; }
 .cx-helpers-panel .cx-sub1 { display: block; }
 .cx-internal { display: inline-block; margin-left: 6px; padding: 1px 6px; border-radius: 4px; font-size: 0.8em; font-weight: 600; color: var(--status-failed, #b00020); border: 1px solid currentColor; }
 .cx-fix-results .cx-pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 24rem; overflow: auto; margin: .25rem 0 0; font-size: .85em; }
+
+/* Long unbroken labels (ids, URLs) must wrap inside inspector link lists instead of widening the page at 320px. */
+.cx-list li .hd-btn { white-space: normal; overflow-wrap: anywhere; text-align: left; max-width: 100%; height: auto; }
+.cx-list li code { overflow-wrap: anywhere; }
+
+/* The browser's default placeholder grey (#757575) is 3.6:1 on the dark surface; use the muted text token (>= 4.5:1 in both themes). */
+.cx-page ::placeholder, .cx-embed ::placeholder { color: var(--text-muted); opacity: 1; }
+
+/* A 300-character unbroken string (a URL, a hash, a path) in a node label, an instruction or an evidence title must wrap inside its
+   row instead of pushing the page sideways (1.4.10 at 320px). Found by the real-server reflow gate on Attention and Progress. */
+.cx-page .grow, .cx-embed .grow, .cx-attn-item, .cx-attn-item *, .cx-list li, .cx-list li *, .cx-page .cx-msg, .cx-embed .cx-msg { overflow-wrap: anywhere; min-width: 0; }
+.cx-attn-item .hd-btn, .cx-attn-item select { max-width: 100%; }

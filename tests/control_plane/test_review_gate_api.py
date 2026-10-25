@@ -424,3 +424,84 @@ def test_resume_accepts_a_mixed_case_repo(gate_server):
     status, snap = request(gate_server, path, {}, key="write", method="POST")
     assert status == 200 and snap["key"] == str(key)
     assert gate_server.gate_store.snapshot(key).state.value != "escalated"
+
+
+def _notice(sha, channel, at, ok=True, kind="changes_requested"):
+    return {"sha": sha, "kind": kind, "channel": channel, "ok": ok, "detail": "recorded", "at": at}
+
+
+def test_notices_route_lists_recent_notices_for_viewer(gate_server):
+    repo = gate_server.repo
+    for i in range(105):
+        repo.record_event("pr_gate_notice", f"{REPO}#{i % 3 + 1}", "notified",
+                          _notice(f"{i:040x}", "user", float(i)))
+    repo.record_event("pr_gate_notice", f"{REPO}#1", "other", {"at": 999.0})
+    status, notices = request(gate_server, "review-gate/notices")
+    assert status == 200 and len(notices) == 100
+    assert [n["at"] for n in notices] == [float(i) for i in range(104, 4, -1)]
+    assert notices[0] == {"key": f"{REPO}#3", "sha": f"{104:040x}", "kind": "changes_requested",
+                          "channel": "user", "ok": True, "at": 104.0}
+    assert all("detail" not in n for n in notices)
+    assert request(gate_server, "review-gate/notices/")[0] == 200
+
+
+def test_notices_route_is_404_when_disabled(plain_server):
+    assert request(plain_server, "review-gate/notices")[0] == 404
+
+
+def test_gate_service_gets_a_notifier_with_the_server_dispatcher(gate_server):
+    notifier = gate_server.gate_service._notifier
+    assert notifier is not None
+    assert notifier._dispatcher == gate_server.dispatcher
+
+
+@pytest.mark.parametrize("key", ["agent-key", "ingest-key"])
+def test_notice_stream_cannot_be_forged_by_ingest(ingest_gate_server, key):
+    from herdr_engineering.review_gate.models import State
+    from herdr_engineering.review_gate.store import PrSnapshot
+
+    server = ingest_gate_server
+    pr = PrKey(REPO, 7)
+    status, body = request(server, "ingest", {
+        "entity_type": "pr_gate_notice", "entity_id": str(pr), "event_type": "notified",
+        "payload": _notice("a" * 40, "user", 1.0)}, key=key, method="POST")
+    assert status in (400, 403) and "reserved" in body["error"]
+    assert server.repo.stream("pr_gate_notice", str(pr)) == []
+    snap = PrSnapshot(pr, "a" * 40, State.ESCALATED, 0, 1, (), None, None, "ci fix cap reached")
+    server.gate_service._notifier.notify(pr, snap, "feat/x")
+    status, notices = request(server, "review-gate/notices")
+    assert [(n["key"], n["kind"], n["channel"]) for n in notices] == [
+        (str(pr), "escalated", "user")]
+
+
+def test_notices_route_survives_a_malformed_notice(gate_server):
+    repo = gate_server.repo
+    repo.record_event("pr_gate_notice", f"{REPO}#1", "notified", "{not json")
+    repo.record_event("pr_gate_notice", f"{REPO}#1", "notified", _notice("a" * 40, "user", 5.0))
+    status, notices = request(gate_server, "review-gate/notices")
+    assert status == 200 and len(notices) == 2
+    assert notices[0]["at"] == 5.0 and notices[1]["at"] is None
+
+
+def test_main_route_viewer_ok_and_404_when_disabled(tmp_path, monkeypatch, monitor_starts,
+                                                    plain_server):
+    assert request(plain_server, "review-gate/main")[0] == 404
+    monkeypatch.setattr(github_app, "GitHubAppClient", FakeApp)
+    section = gate_section(tmp_path, repos=[{"repo": REPO, "main_pipeline": "push"}])
+    server = ControlPlaneServer(ControlPlaneRepo(), api_keys={"read": "viewer", "write": "operator"},
+                                fleet_config=FakeFleet(section))
+    start(server)
+    try:
+        server.gate_service.tick()  # FakeApp cannot read the default branch: state unknown
+        status, body = request(server, "review-gate/main/")
+        assert status == 200
+        assert [(r["repo"], r["state"]) for r in body["repos"]] == [(REPO, "unknown")]
+        assert request(server, "review-gate/main", key="write")[0] == 200
+    finally:
+        server.shutdown()
+
+
+def test_main_route_requires_a_key(gate_server):
+    for key in ("", "wrong"):
+        assert request(gate_server, "review-gate/main", key=key)[0] in (401, 403)
+    assert request(gate_server, "review-gate/main")[1] == {"repos": []}

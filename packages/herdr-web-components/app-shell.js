@@ -14,6 +14,7 @@ export class HerdrAppShell extends HTMLElement {
     super();
     this._nav = [];
     this._menuOpen = false;
+    this._badges = new Map();
     this._density = 'comfortable';
     this.attachShadow({ mode: 'open' });
   }
@@ -21,6 +22,7 @@ export class HerdrAppShell extends HTMLElement {
   attributeChangedCallback() {
     this._parse();
     this._render();
+    if (this.isConnected) this._syncActive();
   }
 
   connectedCallback() {
@@ -69,11 +71,30 @@ export class HerdrAppShell extends HTMLElement {
     if (returnFocus) menu?.focus();
   };
 
+  // A count shown beside a nav label (for example open attention items). `badge` is
+  // {count, critical}; null or a zero count removes it. Updated in place so focus and an open menu survive.
+  setBadge(path, badge) {
+    const count = badge && Number.isFinite(badge.count) && badge.count > 0 ? Math.floor(badge.count) : 0;
+    if (count) this._badges.set(path, { count, critical: Number(badge.critical) > 0 });
+    else this._badges.delete(path);
+    const link = [...this.shadowRoot.querySelectorAll('.hd-shell__link')].find((a) => a.getAttribute('data-path') === path);
+    if (!link) return;
+    link.querySelector('.hd-shell__badge')?.remove();
+    link.insertAdjacentHTML('beforeend', this._badgeHtml(path));
+  }
+
+  _badgeHtml(path) {
+    const b = this._badges.get(path);
+    if (!b) return '';
+    const label = `${b.count} open${b.critical ? `, ${b.critical} critical` : ''}`;
+    return `<span class="hd-shell__badge" data-tone="${b.critical ? 'critical' : 'normal'}" role="img" aria-label="${escapeAttr(label)}">${b.count > 99 ? '99+' : b.count}</span>`;
+  }
+
   _render() {
     const brand = this.getAttribute('brand') || 'HerdR';
     const links = this._nav.map((n) =>
       `<a class="hd-shell__link" href="#${escapeAttr(n.path)}" ` +
-      `data-path="${escapeAttr(n.path)}">${escapeHtml(n.label)}</a>`).join('');
+      `data-path="${escapeAttr(n.path)}">${escapeHtml(n.label)}${this._badgeHtml(n.path)}</a>`).join('');
     this.shadowRoot.innerHTML = `
       <style>${SHARED}</style>
       <div class="hd-shell">
@@ -82,6 +103,7 @@ export class HerdrAppShell extends HTMLElement {
           <label class="hd-shell__density">Density
             <select aria-label="Density">${DENSITIES.map(value => `<option value="${value}" ${value === this._density ? 'selected' : ''}>${value[0].toUpperCase() + value.slice(1)}</option>`).join('')}</select>
           </label>
+          <slot name="controls"></slot>
           <nav class="hd-shell__nav" id="primary-navigation" data-open="false" aria-label="Primary">${links}</nav>
         </aside>
         <main class="hd-shell__main"><div class="hd-shell__content">
@@ -115,6 +137,8 @@ const SHARED = `
 .hd-shell__nav { display: flex; flex-direction: column; gap: 2px; padding: var(--density-gap, 8px); }
 .hd-shell__link { display: flex; padding: var(--density-row-padding, 8px) 10px; border-radius: var(--radius-sm);
   color: var(--text-secondary); text-decoration: none; font-size: 0.875rem; }
+.hd-shell__badge { margin-left: auto; min-width: 20px; padding: 0 6px; border-radius: 10px; font-size: .75rem; line-height: 20px; text-align: center; background: var(--accent-weak); color: var(--accent); font-weight: 600; }
+.hd-shell__badge[data-tone=critical] { background: var(--status-failed); color: #fff; }
 .hd-shell__link:hover { background: var(--surface-hover); text-decoration: none; }
 .hd-shell__link.active { background: var(--accent-weak); color: var(--accent); font-weight: 500; }
 .hd-shell__density { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 12px 16px; font-size: .8125rem; color: var(--text-secondary); }

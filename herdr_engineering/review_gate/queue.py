@@ -1,8 +1,9 @@
 """Durable, lease-based review queue (event-sourced).
 
 Storage: ONE index stream, entity type ``review_job`` / entity id ``index``,
-holds every ``enqueued`` / ``claimed`` / ``completed`` / ``cancelled`` event
-keyed by ``job_id``, so a single fold yields the whole queue across PRs.
+holds every ``enqueued`` / ``claimed`` / ``renewed`` / ``released`` /
+``completed`` / ``cancelled`` event keyed by ``job_id``, so a single fold
+yields the whole queue across PRs.
 
 Clock: ``now`` is a zero-argument callable returning epoch seconds (float);
 default ``time.time``. Lease expiry is evaluated at fold time, so an expired
@@ -10,7 +11,17 @@ claim is simply offered again (keeping its FIFO position). Invariants: at most
 one live (queued/claimed) job per PrKey; ``complete`` succeeds only for the
 current, unexpired holder.
 
+Lease operations: ``live_claim`` returns the job for its unexpired holder;
+``renew`` (``renewed`` event) extends the holder's lease by ``lease_seconds``
+from now; ``release`` (``released`` event) gives a held job back, queued again
+at its original FIFO position; ``attempts`` counts ``claimed`` events. All
+verify the holder under the lock, like ``complete``, and return False/None for
+a non-holder or an expired lease.
+
 Notes:
+- The fold ignores an ``enqueued`` event whose (key, sha) already has a live
+  (queued/claimed) job, so a duplicate left by a lost durable confirmation is
+  invisible. An earlier done/cancelled job does not trigger this (``rearm``).
 - One ReviewQueue per repo is assumed: the lock is per instance, not per store.
 - ``complete`` returns False for an expired but un-reclaimed lease (lease lost).
 - A sha is superseded once a later job with a different sha exists for the key
@@ -39,6 +50,7 @@ from .models import PrKey
 
 ENTITY = "review_job"
 INDEX = "index"
+_LIVE = ("queued", "claimed")
 
 
 @dataclass(frozen=True)
@@ -77,13 +89,31 @@ class ReviewQueue:
             p = _payload(event)
             kind = event["event_type"]
             if kind == "enqueued":
-                jobs[p["job_id"]] = {**p, "state": "queued", "worker": None, "lease": None}
+                if any(
+                    j["key"] == p["key"] and j["sha"] == p["sha"] and j["state"] in _LIVE
+                    for j in jobs.values()
+                ):
+                    continue  # duplicate of a live job for the same (key, sha)
+                jobs[p["job_id"]] = {
+                    **p,
+                    "state": "queued",
+                    "worker": None,
+                    "lease": None,
+                    "attempts": 0,
+                }
                 continue
             job = jobs.get(p.get("job_id"))
             if job is None:
                 continue
             if kind == "claimed":
                 job.update(state="claimed", worker=p["worker_id"], lease=p["lease_expires_at"])
+                job["attempts"] += 1
+            elif kind == "renewed":
+                if job["state"] == "claimed" and job["worker"] == p["worker_id"]:
+                    job["lease"] = p["lease_expires_at"]
+            elif kind == "released":
+                if job["state"] == "claimed" and job["worker"] == p["worker_id"]:
+                    job.update(state="queued", worker=None, lease=None)
             elif kind == "completed":
                 job["state"] = "done"
             elif kind == "cancelled":
@@ -188,6 +218,49 @@ class ReviewQueue:
                 return False
             self._record("completed", job_id=job_id, worker_id=j["worker"])
             return True
+
+    def _held(self, job_id: str, worker_id: str) -> dict | None:
+        """The record iff ``worker_id`` holds an unexpired lease on it (lock held)."""
+        j = self._fold().get(job_id)
+        if (
+            j is None
+            or j["state"] != "claimed"
+            or j["lease"] <= self._now()
+            or j["worker"] != redact_text(worker_id)
+        ):
+            return None
+        return j
+
+    def live_claim(self, job_id: str, worker_id: str) -> ReviewJob | None:
+        with self._lock:
+            j = self._held(job_id, worker_id)
+            return self._job(j) if j else None
+
+    def renew(self, job_id: str, worker_id: str) -> bool:
+        with self._lock:
+            j = self._held(job_id, worker_id)
+            if j is None:
+                return False
+            self._record(
+                "renewed",
+                job_id=job_id,
+                worker_id=j["worker"],
+                lease_expires_at=self._now() + self._lease,
+            )
+            return True
+
+    def release(self, job_id: str, worker_id: str) -> bool:
+        with self._lock:
+            j = self._held(job_id, worker_id)
+            if j is None:
+                return False
+            self._record("released", job_id=job_id, worker_id=j["worker"])
+            return True
+
+    def attempts(self, job_id: str) -> int:
+        with self._lock:
+            j = self._fold().get(job_id)
+            return j["attempts"] if j else 0
 
     def cancel(self, key: PrKey, *, except_sha: str | None = None) -> int:
         with self._lock:

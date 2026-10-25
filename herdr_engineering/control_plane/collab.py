@@ -11,11 +11,6 @@ is ``grant ∩ owner's room role ∩ agent ceiling`` evaluated on every request,
 and non-members always get 404 so room ids cannot be enumerated. Peer message
 text is untrusted data: it is stored and returned, never executed, never routed
 to a terminal.
-
-The relational data-platform boundary lives in ``collab_store.CollabStore``.
-New upload/archive services must use it for SQL, after authorization here. This
-foundation does not dual-write or replace the acknowledged lifecycle event log;
-backfill and cutover require an explicit migration of existing event state.
 """
 from __future__ import annotations
 
@@ -35,12 +30,47 @@ from datetime import UTC, datetime
 from typing import Any, Protocol
 from urllib.parse import urlparse
 
-from . import collab_models, ids
+from . import collab_delegation as dlg
+from . import collab_external as ext
+from . import collab_models, ids, logfile_lock
+from .collab_attention import AttentionMixin
+from .collab_context import ContextMixin
+from .collab_workbench import WorkbenchMixin
 from .redact import redact_text
 
 SCHEMA_VERSION = 1
 ENTITY = "collab"
 STREAM_ID = "log"
+# T16 H2. The log cap is a lifetime limit, so a full log must never stop a revocation. Design (pre-paid revocation):
+#  * every event that CREATES something revocable (REVOCABLE_CREATE) is admitted only if the log still has room for
+#    its revocation, i.e. len(log) + outstanding + 2 <= the ordinary limit (95 %). "outstanding" is the number of
+#    creations not yet revoked, kept per kind. A user can therefore create and revoke as much as they like without
+#    ever spending a slot that was not already paid for: the revocation is an event the creation reserved.
+#  * every other ordinary write needs len(log) + outstanding + 1 <= its tier (chat/comments/audit noise 90 %,
+#    the rest 95 %), so outstanding revocations are always covered.
+#  * SAFETY_EVENTS (revocations an admin performs) may use the log up to 100 %.
+# Events a member or agent can fire at will without pre-paying (credential rotation, cancelling a consultation,
+# request or invite, steering rejection, a grant lapsing, presence changes) are NOT safety events.
+# helpers_paused is the operator's panic switch (only a PAUSE is a safety write: a resume uses the ordinary tier),
+# helper_cancelled ends a live helper (each one pre-paid by its helper_requested) and egress_removed takes a host off a
+# room's allowlist (each one pre-paid by the approval/promotion/profile entry that put it there). All three commit
+# nothing when repeated, so they cannot fill the log either.
+SAFETY_EVENTS = frozenset({
+    "member_removed", "agent_revoked", "user_decided", "join_token_revoked",
+    "xlink_revoked", "workspace_unlinked", "mission_unlinked", "agent_grant_revoked",
+    "helpers_paused", "helper_cancelled", "egress_removed"})
+BULK_EVENTS = frozenset({"message", "comment_added", "comment_revised", "audit_denied", "task_progress",
+                         "steer_proposed", "consult_asked", "proposal_submitted", "external_status_changed"})
+# creation event -> kind (what is outstanding is recomputed from state, see _recount)
+REVOCABLE_CREATE = {"member_added": "member", "agent_granted": "grant", "agent_enrolled": "agent",
+                    "join_token_created": "join", "xlink_created": "xlink", "workspace_linked": "workspace",
+                    "mission_linked": "mission", "helper_requested": "helper",
+                    "egress_decided": "egress", "egress_promoted": "egress", "room_profile_set": "egress"}
+# every event that can change what _recount() returns (the cache is cleared when one is committed)
+COUNT_EVENTS = frozenset(REVOCABLE_CREATE) | {
+    "member_removed", "agent_grant_revoked", "agent_grant_expired", "agent_revoked", "join_token_revoked",
+    "xlink_revoked", "workspace_unlinked", "mission_unlinked",
+    "helper_started", "helper_finished", "helper_cancelled", "helper_expired", "egress_removed"}
 ORG_ID = "default"  # single-organization deployment (spec: no federation in v1)
 
 # "task" is the human right to give an agent work; the agent-side rights are "instruct"
@@ -73,20 +103,26 @@ MAX_TEXT = 8000
 MAX_BODY = 64 * 1024
 _PANE_LINK = re.compile(r"pane:[a-z0-9][a-z0-9._-]{0,62}:[A-Za-z0-9][A-Za-z0-9:_.-]{0,39}")
 _KEY_RE = re.compile(r"[A-Za-z0-9._:\-]{1,128}\Z")
-_MESSAGE_FIELDS = frozenset({"text", "idempotency_key", "in_reply_to"})
+_MESSAGE_FIELDS = frozenset({"text", "idempotency_key", "in_reply_to", "context"})
 _CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")   # C0, DEL and C1 (8-bit CSI)
 _NAME_BAD = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]")
 _EMAIL_RE = re.compile(r"^[^@\s]{1,64}@[^@\s]{1,255}\.[^@\s]{2,}$")
 INVITE_TTL = 7 * 24 * 3600.0
 MAX_OPEN_INVITES = 50
-_LIFECYCLE_EVENTS = frozenset({"user_approved", "room_member_invited", "room_member_approved",
-                               "room_member_removed", "agent_access_requested", "agent_access_approved",
-                               "agent_access_revoked", "file_upload_permission_changed"})
-_FEED_TYPES = (_LIFECYCLE_EVENTS - {"user_approved", "agent_access_requested"}) | frozenset({"message", "member_added", "member_removed",
+_FEED_TYPES = frozenset({"message", "member_added", "member_removed",
                          "agent_granted", "agent_revoked", "agent_grant_revoked", "agent_renamed",
                          "task_created", "task_updated",
                          "helper_requested", "helper_claimed", "helper_started", "helper_finished",
                          "helper_cancelled", "helper_expired"})
+# Room <-> Herdr workspace links. A link is what room members may SEE of a workspace; the
+# terminal is a separate, explicit grant that is never implied by room membership.
+LINK_VIEW_GRANTS = frozenset({"status", "tabs", "panes"})       # metadata only, never terminal bytes
+LINK_GRANTS = LINK_VIEW_GRANTS | {"terminal"}
+DEFAULT_LINK_GRANTS = ("status",)                               # minimal by default
+MAX_LINKS_PER_ROOM = 50
+MAX_MISSIONS_PER_ROOM = 100
+MAX_TERMINAL_PRINCIPALS = 20
+TERMINAL_ROLES = frozenset({"owner", "contributor"})            # viewers and guests never get a terminal
 MAX_TASK_TEXT = 4000
 TASK_TTL = 24 * 3600.0           # a task nobody finished in a day is expired
 MAX_TASK_DEPTH = 3               # human -> agent -> agent -> agent
@@ -146,11 +182,12 @@ _HELPER_BAD = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f\u2028\u2029]")   # all c
 
 
 class CollabError(Exception):
-    def __init__(self, status: int, message: str, reason: str | None = None):
+    def __init__(self, status: int, message: str, reason: str | None = None, code: str | None = None):
         super().__init__(message)
         self.status = status
         self.message = message
         self.reason = reason          # a stable machine-readable code, for callers that branch on it
+        self.code = code              # a stable machine-readable reason for refusals a client can act on (external agents)
 
 
 # control_plane.collab.summary_fix: the operator's standing room and requester agent that start a
@@ -216,7 +253,7 @@ class StaticTokenAuthenticator:
 
 
 class Principal:
-    __slots__ = ("kind", "id", "owner", "digest", "exp", "status", "approver", "admin")
+    __slots__ = ("kind", "id", "owner", "digest", "exp", "status", "approver", "admin", "external")
 
     def __init__(self, kind: str, id: str, owner: str, digest: str | None = None,
                  exp: float | None = None):
@@ -224,6 +261,7 @@ class Principal:
         self.status = "approved"       # approval mode sets this for people; agents are judged by their owner
         self.approver = False          # may approve or deny people waiting
         self.admin = False             # the operator on the tailnet-only listener: may also disable and remove
+        self.external = False          # an agent a coworker enrolled by invite (T10): bound to one room, never a person
 
     @property
     def key(self) -> str:
@@ -254,7 +292,18 @@ class FileEventLog:
         self.path = path
         self._lock = threading.Lock()
         self._broken = False
-        self._fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        # A shared advisory lock for the life of the writer (see logfile_lock): `collab-repair --apply` needs it
+        # exclusively, so it can never swap the file out from under an open append descriptor.
+        try:
+            self._held = logfile_lock.acquire(path, exclusive=False, create=True)
+        except logfile_lock.Busy as exc:
+            raise OSError(f"the collaboration log {path} is in use by another process ({exc}); "
+                          "stop it (a running server or collab-repair) and retry") from None
+        self._fd = self._held.fd
+        self.lock_mode = self._held.mode
+
+    def close(self) -> None:
+        self._held.release()
 
     def load(self) -> list[dict]:
         rows = []
@@ -292,7 +341,7 @@ class FileEventLog:
     record = record_required
 
 
-class CollabService:
+class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin):
     def __init__(self, authenticator: UserAuthenticator, *, sink: Any = None,
                  now=None, enrollment_ttl: float = 600.0, credential_ttl: float = 12 * 3600.0,
                  stream_poll_seconds: float = 1.0, message_limit: int = 60,
@@ -302,13 +351,30 @@ class CollabService:
                  max_rooms_per_project: int = 50, max_members_per_room: int = 100,
                  max_log_events: int = 200_000, guest_ttl: float = 7 * 24 * 3600.0,
                  default_grant_ttl: float = 30 * 24 * 3600.0,
-                 approval: ApprovalPolicy | None = None, summary_fix: dict | None = None):
+                 approval: ApprovalPolicy | None = None, delegation_enabled: bool = False,
+                 summary_fix: dict | None = None):
         self.auth = authenticator
+        self._revocable: dict[str, int] = {}                   # outstanding revocable things per kind (H2), from state
+        self._outstanding_key = None
+        self.degraded: str | None = None     # set when the durable log failed its startup integrity check
+        # Kill switch for bounded task delegation and artifact proposals (T11), from the fleet YAML
+        # (control_plane.collab.delegation_enabled). Off by default: while off, no delegation can be created,
+        # answered, proposed to or accepted, and the MCP/A2A adapters do not advertise it.
+        self._delegation_enabled = bool(delegation_enabled)
+        self.delegation_source = None     # optional callable -> raw YAML value, read per request (hot kill switch)
+        self.replay_history_source = None
+
         try:
             self.summary_fix = summary_fix_config(summary_fix)
         except ValueError as exc:
             raise CollabError(400, str(exc)) from None
         self.approval = approval
+        # The fabric lineage graph, attached by the combined (non collab-only) server. The graph never
+        # calls back into this service: membership is handed to it as a per-request snapshot.
+        self.graph_source = None      # callable returning the CURRENT projection (a rebuild replaces it)
+        # Writes an external agent's lineage through the ingest path (combined server only; None = refused).
+        # Called with (envelope, principal); the envelope is built here, never taken from the request.
+        self.lineage_sink = None
         self._users: dict[str, dict] = {}       # approval mode: user id -> {status, since, decided_by, decided_at, reason}
         self._sink = sink
         self._now = now or time.time
@@ -322,6 +388,9 @@ class CollabService:
         self.max_rooms_per_project = max_rooms_per_project
         self.max_members_per_room = max_members_per_room
         self.max_log_events = max_log_events
+        # lineage replay for a member starts at their join time ("since_join", default) or covers the whole
+        # room history ("full"). Operator YAML: control_plane.collab.replay_history.
+        self._replay_history = "since_join"
         self.guest_ttl = guest_ttl
         self.default_grant_ttl = default_grant_ttl
         self.max_streams = max_streams_per_principal
@@ -331,14 +400,11 @@ class CollabService:
         self._seq = 0
         self._projects: dict[str, dict] = {}
         self._rooms: dict[str, dict] = {}
-        self._room_memberships: dict[tuple[str, str], dict] = {}
-        self._agent_permissions: dict[tuple[str, str, str], dict] = {}
-        self._file_permissions: dict[tuple[str, str], bool] = {}
-        self._lifecycle_idem: dict[tuple, str] = {}
         self._agents: dict[str, dict] = {}
         self._by_cred: dict[str, str] = {}      # credential digest -> agent id
         self._agent_projects: dict[str, set] = defaultdict(set)  # projects an agent was ever granted into
         self._pending: dict[str, dict] = {}     # enrollment code digest -> record
+        self._quick: dict[str, str] = {}        # exact-resend fingerprint -> proposal id (memory only)
         self._idem: dict[tuple, tuple] = {}     # (principal, room, key) -> (fingerprint, seq)
         self._hits: dict[str, list[float]] = defaultdict(list)
         self._streams: dict[str, int] = defaultdict(int)
@@ -349,6 +415,10 @@ class CollabService:
         self._invites: dict[str, dict] = {}
         self._tasks: dict[str, dict] = {}
         self._tasks_by_target: dict[str, list[str]] = defaultdict(list)
+        self._proposals: dict[str, dict] = {}                # artifact proposals in quarantine / decided (T11)
+        self._proposals_by_task: dict[str, list[str]] = defaultdict(list)
+        self._proposals_by_room: dict[str, list[str]] = defaultdict(list)
+        self._proposals_by_agent: dict[str, list[str]] = defaultdict(list)
         self._requests: dict[str, dict] = {}                 # open agent-access requests
         # Indexes kept only by _apply (so hydrate rebuilds them): they replace whole-state scans.
         self._agents_by_owner: dict[str, set] = defaultdict(set)
@@ -356,6 +426,13 @@ class CollabService:
         self._requests_by_room: dict[str, set] = defaultdict(set)
         self._requests_by_agent: dict[str, set] = defaultdict(set)
         self._rooms_by_agent: dict[str, set] = defaultdict(set)
+        self._links: dict[str, dict] = {}                    # link id -> room/workspace link
+        self._links_by_room: dict[str, list] = defaultdict(list)
+        self._primary: dict[tuple, str] = {}                 # (host, workspace id) -> link id of its primary room
+        self._hosts: dict[str, dict] = {}                    # host registry: host -> {owners, gen}
+        self._term_gate: dict[tuple, tuple] = {}             # (principal, link) -> (last audited allow, fingerprint); memory only
+        self._room_link_seq: dict[str, int] = {}             # room id -> sequence of its latest link change (people only)
+        self._missions: dict[tuple, dict] = {}               # (room id, mission id) -> scoped mission link
         self._housekept = 0.0
         self._room_seq: dict[str, int] = {}                  # room id -> sequence of its latest change
         self._egress: dict[str, dict] = {}                   # request id -> host-access request
@@ -372,9 +449,20 @@ class CollabService:
         self._state_waiters: dict[str, int] = defaultdict(int)
         self._joins: dict[str, dict] = {}                    # token digest -> record
         self._joins_by_id: dict[str, str] = {}               # join id -> digest
+        self._externals_by_room: dict[str, list] = defaultdict(list)   # room id -> external agent ids (T10)
+        self._presence: dict[str, dict] = {}                 # external agent id -> last heartbeat; memory only, by design
+        # Lineage write counters per ("agent"|"sponsor"|"room", id). Each is made durable AHEAD of its value
+        # (reserve-ahead rows in the log), so after a restart a count can be too high by up to
+        # USAGE_RESERVE_STEP-1 but never too low.
+        self._usage: dict[tuple, int] = defaultdict(int)
+        self._usage_reserved: dict[tuple, int] = defaultdict(int)
+        self.redeem_failures: dict[str, int] = {}      # failed invite redemptions per client address (bounded)
         self._by_room: dict[str, list] = defaultdict(list)   # room id -> feed events, in sequence order
         self._msg_room: dict[str, str] = {}                  # message event id -> room id
         self.stats = defaultdict(int)
+        self._init_workbench()
+        self._init_context()
+        self._init_attention()
 
     # ------------------------------------------------------------ plumbing
     @property
@@ -384,20 +472,123 @@ class CollabService:
     def _iso(self, t: float | None = None) -> str:
         return datetime.fromtimestamp(self._now() if t is None else t, UTC).isoformat()
 
+    def hydrate_or_degrade(self, rows) -> bool:
+        """Replay the durable log at startup. ANY failure (a gap, a KeyError from a malformed row...) switches
+        collaboration off with an ERROR instead of stopping the whole process. True = replayed cleanly."""
+        import logging
+        try:
+            self.hydrate(rows() if callable(rows) else rows)      # a callable loads lazily, inside the guard
+            return True
+        except Exception as exc:   # noqa: BLE001
+            self.degraded = f"durable collab log failed its integrity check ({type(exc).__name__}: {exc})"
+            logging.getLogger(__name__).error("collaboration DISABLED at startup: %s; "
+                                              "inspect with `collab-repair`", self.degraded)
+            return False
+
+    @property
+    def delegation_enabled(self) -> bool:
+        """T16 M15: hot like the other switches. A source that fails or returns anything but a real
+        boolean means OFF (fail closed)."""
+        if self.delegation_source is None:
+            return self._delegation_enabled
+        try:
+            return self.delegation_source() is True
+        except Exception:
+            return False
+
+    @delegation_enabled.setter
+    def delegation_enabled(self, value: bool) -> None:
+        self._delegation_enabled = bool(value)
+
+    @property
+    def replay_history(self) -> str:
+        """T16 M15: hot. A failing or invalid source means the STRICTER ``since_join``."""
+        if self.replay_history_source is None:
+            return self._replay_history
+        try:
+            value = self.replay_history_source()
+        except Exception:
+            return "since_join"
+        return value if value in ("full", "since_join") else "since_join"
+
+    @replay_history.setter
+    def replay_history(self, value: str) -> None:
+        self._replay_history = value
+
+    def _recount(self) -> dict:
+        """Things that can still emit a revocation event RIGHT NOW (an expired guest or a used-up token still can),
+        recomputed from state. Counting from state (not by adding on
+        create and subtracting on revoke) makes the figure idempotent: a repeated or no-op revocation, a re-grant,
+        a lapsed guest or a used-up token can never push it above or below what is really outstanding."""
+        out: dict[str, int] = defaultdict(int)
+        for room in self._rooms.values():
+            for uid, m in room["members"].items():
+                if uid != room["created_by"]:         # an expired guest still needs (and may emit) a member_removed
+                    out["member"] += 1
+            out["grant"] += len(room["grants"])
+        out["agent"] = sum(1 for a in self._agents.values() if a["status"] == "active")
+        out["join"] = sum(1 for j in self._joins.values() if not j["revoked"])   # revoking a used-up/expired token is an event
+        out["xlink"] = sum(1 for x in self._xlinks.values() if x["state"] == "active")
+        out["workspace"] = len(self._links)
+        out["mission"] = len(self._missions)
+        out["helper"] = sum(1 for h in self._helpers.values() if h["status"] in _HELPER_LIVE)
+        # every (room, host) an operator Remove would still commit for: permanent hosts and approvals, also lapsed
+        # ones (over-reserving until the next recount is safe; under-reserving is not)
+        hosts = {(rid, hp) for rid, room in self._rooms.items()
+                 for hp in ((room.get("profile") or {}).get("permanent_hosts") or ())}
+        hosts |= {(r["room_id"], r["host_port"]) for r in self._egress.values() if r["state"] == "approved"}
+        out["egress"] = len(hosts)
+        return out
+
+    def _outstanding(self) -> int:
+        key = 1                            # the count changes only with a COUNT_EVENTS commit (which clears the key),
+        if self._outstanding_key != key:   # so a chat flood does not recount the whole state
+            self._revocable = self._recount()
+            self._outstanding_key = key
+        return sum(self._revocable.values())
+
+    @staticmethod
+    def _is_safety(event_type: str, payload: dict | None = None) -> bool:
+        if event_type == "helpers_paused" and payload is not None:
+            return payload.get("paused") is True          # resuming helpers is an ordinary write
+        return event_type in SAFETY_EVENTS
+
+    def _creation_cost(self, event_type: str, payload: dict | None) -> int:
+        """How many future revocations ``event_type`` creates (each one is pre-paid on admission)."""
+        if event_type not in REVOCABLE_CREATE:
+            return 0
+        if payload is None:
+            return 1
+        if event_type == "egress_decided":
+            return 1 if payload.get("state") == "approved" else 0
+        if event_type == "room_profile_set":
+            room = self._rooms.get(payload.get("room_id")) or {}
+            have = set((room.get("profile") or {}).get("permanent_hosts") or ())
+            return len(set((payload.get("profile") or {}).get("permanent_hosts") or ()) - have)
+        return 1
+
+    def _log_limit(self, event_type: str, payload: dict | None = None) -> int:
+        """The log length below which ``event_type`` is still admitted (see SAFETY_EVENTS for the design)."""
+        cap = self.max_log_events
+        if self._is_safety(event_type, payload):
+            return cap
+        if event_type in BULK_EVENTS or event_type.startswith("attn_"):
+            base = cap - max(2, cap // 10)
+        else:
+            base = cap - max(1, cap // 20)
+        paid = self._outstanding() + self._creation_cost(event_type, payload)
+        return max(0, base - paid)
+
     def _commit(self, event_type: str, payload: dict) -> dict:
-        """Persist each event before applying it; expire old grants before replacement."""
+        """Persist first, then apply: a failed write never changes state."""
         with self._lock:
-            if event_type == "agent_granted":
-                self._expire_agent_grant(payload["room_id"], payload["agent_id"])
-            if len(self._log) >= self.max_log_events:
+            if self.degraded:
+                raise CollabError(503, "collaboration is disabled; ask the operator")
+            if len(self._log) >= self._log_limit(event_type, payload):
                 self.stats["log_full"] += 1
+                if not self._is_safety(event_type, payload):
+                    self.stats["log_headroom_refused"] += 1
                 raise CollabError(503, "collaboration log is full; ask the operator")
-            if event_type in _LIFECYCLE_EVENTS:
-                payload.setdefault("idempotency_key", ids.new_id("transition"))
-            if event_type in ("room_created", "room_member_invited", "room_member_approved"):
-                uid = payload["actor_user_id"] if event_type == "room_created" else payload["subject_user_id"]
-                member = self._room_memberships.get((payload["room_id"], uid), {})
-                payload.setdefault("membership_id", member.get("membership_id") or ids.new_id("membership"))
             now = self._iso()
             payload = {"org_id": ORG_ID, "correlation_id": payload.pop("correlation_id", None)
                        or ids.new_id("collab"), "created_at": now, **payload}
@@ -414,12 +605,18 @@ class CollabService:
                     raise CollabError(503, "collaboration log unavailable") from exc
             self._seq += 1
             self._log.append(ev)
+            if event_type in COUNT_EVENTS or event_type in REVOCABLE_CREATE:
+                self._outstanding_key = None
             self._apply(ev)
-            self._touch_rooms(payload, ev["sequence"])
+            self._touch_rooms(payload, ev["sequence"], event_type)
             self._cv.notify_all()
             return ev
 
-    def _touch_rooms(self, p: dict, seq: int) -> None:
+    _LINK_EVENTS = frozenset({"workspace_linked", "workspace_unlinked", "workspace_link_updated",
+                              "workspace_primary_set", "workspace_primary_cleared",
+                              "mission_linked", "mission_unlinked"})
+
+    def _touch_rooms(self, p: dict, seq: int, event_type: str = "") -> None:
         """Remember which rooms an event changed, so a room's long-poll wakes only for its own news."""
         rooms = set()
         if isinstance(p.get("room_id"), str):
@@ -427,8 +624,12 @@ class CollabService:
         rooms.update(r for r in (p.get("room_ids") or ()) if isinstance(r, str))
         if isinstance(p.get("agent_id"), str):
             rooms |= self._rooms_by_agent.get(p["agent_id"], set())
+        if event_type == "workspace_terminal_authorized":
+            return                                  # an audit record only: wakes nobody
+        # Link changes are shown to people only (never guests or agents), so they wake only people's polls.
+        target = self._room_link_seq if event_type in self._LINK_EVENTS else self._room_seq
         for r in rooms:
-            self._room_seq[r] = seq
+            target[r] = seq
 
     @property
     def seq(self) -> int:
@@ -467,7 +668,10 @@ class CollabService:
                 expected += 1
                 self._seq = ev["sequence"]
                 self._log.append(ev)
+                self._outstanding_key = None
                 self._apply(ev)
+            for k, v in self._usage_reserved.items():
+                self._usage[k] = max(self._usage[k], v)      # restart: the durable ceiling, never lower than used
             # helper_task is always committed right before its helper_requested (two commits under one lock):
             # a text still waiting here belongs to a request whose second commit failed. Drop it.
             self._helper_text.clear()
@@ -488,27 +692,34 @@ class CollabService:
     # --------------------------------------------------------- state fold
     def _apply(self, ev: dict) -> None:
         t, p, seq = ev["event_type"], ev["payload"], ev["sequence"]
-        if t == "project_created":
+        if self._apply_workbench(ev) or self._apply_context(ev) or self._apply_attention(ev):
+            return
+        if t == "external_usage_reserved":
+            k = (p["scope"], p["key"])
+            self._usage_reserved[k] = max(self._usage_reserved[k], int(p["reserved"]))
+        elif t == "project_created":
             self._projects[p["project_id"]] = {"name": p["name"], "members": {p["actor_user_id"]: "manager"}}
         elif t == "project_member_added":
             self._projects[p["project_id"]]["members"][p["subject_user_id"]] = p["role"]
         elif t == "room_created":
             self._rooms[p["room_id"]] = {
                 "id": p["room_id"], "project_id": p["project_id"], "name": p["name"], "created_by": p["actor_user_id"],
-                "members": {p["actor_user_id"]: {"role": "owner", "expires_at": None, "joined_seq": seq}},
+                "members": {p["actor_user_id"]: {"role": "owner", "expires_at": None, "joined_seq": seq,
+                                                 "joined_at": p.get("created_at")}},
                 "grants": {}}
         elif t == "room_profile_set":
             self._rooms[p["room_id"]]["profile"] = p["profile"]
         elif t == "user_registered":
             self._users[p["user_id"]] = {"status": p["status"], "since": p["at"], "decided_by": p.get("decided_by"),
                                          "decided_at": p["at"] if p["status"] != "pending" else None, "reason": None}
-        elif t in ("user_decided", "user_approved"):
+        elif t == "user_decided":
             u = self._users.setdefault(p["user_id"], {"since": p["at"]})
             u.update(status=p["status"], decided_by=p["decided_by"], decided_at=p["at"], reason=p.get("reason"))
-        elif t in ("member_added", "room_member_approved"):
+        elif t == "member_added":
             self._rooms[p["room_id"]]["members"][p["subject_user_id"]] = {
-                "role": p["role"], "expires_at": p.get("expires_at"), "joined_seq": seq}
-        elif t in ("member_removed", "room_member_removed"):
+                "role": p["role"], "expires_at": p.get("expires_at"), "joined_seq": seq,
+                "joined_at": p.get("created_at")}
+        elif t == "member_removed":
             room = self._rooms[p["room_id"]]
             room["members"].pop(p["subject_user_id"], None)
             # Agents of a removed member lose their grants for good: re-adding the person
@@ -516,6 +727,9 @@ class CollabService:
             for aid in [a for a in room["grants"] if self._agents.get(a, {}).get("owner") == p["subject_user_id"]]:
                 room["grants"].pop(aid, None)
                 self._rooms_by_agent[aid].discard(p["room_id"])
+            gone = p["subject_user_id"]                # re-adding them later must not restore a terminal right
+            self._prune_terminal(p["room_id"], lambda k: k == f"user:{gone}" or (
+                k.startswith("agent:") and self._agents.get(k[6:], {}).get("owner") == gone))
             for rid in self._requests_by_room.get(p["room_id"], ()):   # their pending requests die with their membership
                 rq = self._requests[rid]
                 if rq["requester"] == p["subject_user_id"]:
@@ -533,9 +747,13 @@ class CollabService:
                 "instance_id": p.get("instance_id"), "status": "active",
                 "name": p.get("name") or _default_handle(p["harness_type"], p["agent_id"]),
                 "parent": p.get("parent_agent_id"), "join": p.get("join_digest"),
-                "cred_digest": p["secret_digest"], "expires_at": p["expires_at_epoch"]}
+                "cred_digest": p["secret_digest"], "expires_at": p["expires_at_epoch"],
+                "external": ({**p["external"], "enrolled_at": p["created_at"], "revoked_at": None}
+                             if isinstance(p.get("external"), dict) else None)}
             self._by_cred[p["secret_digest"]] = p["agent_id"]
             self._agents_by_owner[p["owner_user_id"]].add(p["agent_id"])
+            if isinstance(p.get("external"), dict):
+                self._externals_by_room[p["external"]["room_id"]].append(p["agent_id"])
             if p.get("action") == "helper.agent.create":
                 self._helper_minted.add(p["agent_id"])
             if p.get("join_digest") in self._joins:
@@ -546,7 +764,8 @@ class CollabService:
                 "prefix": p["name_prefix"], "max_uses": p["max_uses"], "uses": 0,
                 "expires_at": p["expires_at_epoch"], "room_id": p.get("room_id"),
                 "actions": list(p.get("actions") or []), "revoked": False, "created_at": p["created_at"],
-                "parent": p.get("parent_agent_id")}
+                "parent": p.get("parent_agent_id"),
+                "external": dict(p["external"]) if isinstance(p.get("external"), dict) else None}
             self._joins_by_id[p["join_id"]] = p["join_digest"]
         elif t == "join_token_revoked":
             if p["join_id"] in self._joins_by_id:
@@ -562,12 +781,18 @@ class CollabService:
             self._by_cred[p["secret_digest"]] = p["agent_id"]
         elif t == "agent_revoked":
             self._agents[p["agent_id"]]["status"] = "revoked"
+            if self._agents[p["agent_id"]].get("external"):
+                self._agents[p["agent_id"]]["external"]["revoked_at"] = p["created_at"]
+                self._agents[p["agent_id"]]["external"]["revoked_by"] = (
+                    "agent:" + p["actor_agent_id"] if p.get("actor_agent_id") else "user:" + str(p.get("actor_user_id")))
+            self._prune_terminal(None, lambda k: k == "agent:" + p["agent_id"])
             for rid in self._requests_by_agent.get(p["agent_id"], ()):
                 self._requests[rid]["open"] = False
         elif t in ("agent_grant_revoked", "agent_grant_expired"):
             self._rooms[p["room_id"]]["grants"].pop(p["agent_id"], None)
             self._rooms_by_agent[p["agent_id"]].discard(p["room_id"])
-        elif t == "agent_access_requested" and "permission_id" not in p:
+            self._prune_terminal(p["room_id"], lambda k: k == "agent:" + p["agent_id"])
+        elif t == "agent_access_requested":
             for rid in self._requests_by_room.get(p["room_id"], ()):       # one open request per agent per room
                 rq = self._requests[rid]
                 if rq["open"] and rq["agent_id"] == p["agent_id"]:
@@ -589,16 +814,117 @@ class CollabService:
                 "status": "pending", "result": None, "depth": p["depth"], "parent": p.get("parent_task_id"),
                 "created_at": p["created_at"], "created_epoch": p["created_epoch"],
                 "updated_at": p["created_at"], "seq": seq}
+            if p.get("bounds"):          # T11: a bounded delegation is this same task plus its bounds
+                self._tasks[p["task_id"]].update(bounds=p["bounds"], version=1, steps=0, tokens=0, proposals=0, turns=0)
+                if p.get("idempotency_key"):
+                    self._idem[(p["actor_agent_id"] or "user:" + p["actor_user_id"], p["room_id"],
+                                "deleg:" + p["idempotency_key"])] = (p["fingerprint"], p["task_id"])
             self._tasks_by_target[p["target_agent_id"]].append(p["task_id"])
         elif t == "task_updated":
             tk = self._tasks.get(p["task_id"])
             if tk:
                 tk.update(status=p["status"], result=p.get("result"), updated_at=p["created_at"])
+                if "bounds" in tk:
+                    tk["version"] += 1
+                    if str(p.get("action") or "").startswith("delegation.") and p.get("action") != "delegation.budget":
+                        tk["turns"] = tk.get("turns", 0) + 1            # the delegate answered (accept, complete, ...)
+                    if p.get("idempotency_key"):
+                        self._idem[(p["actor_agent_id"], p["room_id"], "resp:" + p["idempotency_key"])] = (
+                            p["fingerprint"], tk["version"])
+        elif t == "task_progress":
+            tk = self._tasks.get(p["task_id"])
+            if tk and "bounds" in tk:
+                tk.update(steps=tk["steps"] + 1, tokens=tk["tokens"] + p["tokens"], note=p.get("note"),
+                          updated_at=p["created_at"], version=tk["version"] + 1, turns=tk.get("turns", 0) + 1)
+                if p.get("idempotency_key"):
+                    self._idem[(p["actor_agent_id"], p["room_id"], "resp:" + p["idempotency_key"])] = (
+                        p["fingerprint"], tk["version"])
+        elif t == "proposal_submitted":
+            pid = p["proposal_id"]
+            self._proposals[pid] = {
+                "id": pid, "task_id": p["task_id"], "room_id": p["room_id"], "project_id": p["project_id"],
+                "agent_id": p["actor_agent_id"], "sponsor": p["sponsor"], "kind": p["kind"], "title": p["title"],
+                "content": p["content"], "url": p["url"], "refs": p["refs"], "size": p["size"],
+                "digest": p["digest"], "flags": list(p["flags"]), "state": "quarantined",
+                "supersedes": p.get("supersedes"), "created_epoch": p["created_epoch"], "created_at": p["created_at"],
+                "decided_by": None, "decided_at": None, "reason": None, "promoted": False, "seq": seq}
+            self._proposals_by_task[p["task_id"]].append(pid)
+            self._proposals_by_room[p["room_id"]].append(pid)
+            self._proposals_by_agent[p["actor_agent_id"]].append(pid)
+            prior = self._proposals.get(p.get("supersedes") or "")
+            if prior and prior["state"] == "quarantined":
+                prior.update(state="superseded", decided_at=p["created_at"], reason="superseded by " + pid)
+            tk = self._tasks.get(p["task_id"])
+            if tk and "bounds" in tk:
+                tk.update(proposals=tk["proposals"] + 1, steps=tk["steps"] + 1, version=tk["version"] + 1,
+                          turns=tk.get("turns", 0) + 1)
+            if p.get("idempotency_key"):
+                self._idem[(p["actor_agent_id"], p["room_id"], "prop:" + p["idempotency_key"])] = (p["digest"], pid)
+        elif t == "proposal_decided":
+            pr_ = self._proposals.get(p["proposal_id"])
+            if pr_ and pr_["state"] == "quarantined":
+                pr_.update(state=p["decision"], decided_by=p["actor_agent_id"] or p["actor_user_id"],
+                           decided_at=p["created_at"], reason=p.get("reason"))
+        elif t == "proposal_promoted":
+            pr_ = self._proposals.get(p["proposal_id"])
+            if pr_:
+                pr_["promoted"] = True
         elif t == "agent_granted":
             self._rooms[p["room_id"]]["grants"][p["agent_id"]] = {
                 "actions": list(p["actions"]), "expires_at": p.get("expires_at"), "granted_seq": seq}
             self._agent_projects[p["agent_id"]].add(p["project_id"])
             self._rooms_by_agent[p["agent_id"]].add(p["room_id"])
+        elif t == "workspace_linked":
+            self._links[p["link_id"]] = {
+                "link_id": p["link_id"], "room_id": p["room_id"], "workspace_id": p["workspace_id"],
+                "host": p["host"], "linked_by": p["actor_user_id"], "created_at": p["created_at"],
+                "is_primary": bool(p["is_primary"]), "grants": list(p["grants"]),
+                "terminal_principals": list(p.get("terminal_principals") or []),
+                "host_proof": p.get("host_proof")}
+            self._links_by_room[p["room_id"]].append(p["link_id"])
+            self._demote(p.get("demoted_link_id"))
+            if p["is_primary"]:
+                self._primary[(p["host"], p["workspace_id"])] = p["link_id"]
+        elif t == "workspace_unlinked":
+            lk = self._links.pop(p["link_id"], None)
+            if lk:
+                if p["link_id"] in self._links_by_room.get(lk["room_id"], []):
+                    self._links_by_room[lk["room_id"]].remove(p["link_id"])
+                if self._primary.get((lk["host"], lk["workspace_id"])) == p["link_id"]:
+                    self._primary.pop((lk["host"], lk["workspace_id"]), None)
+        elif t == "workspace_link_updated":
+            lk = self._links.get(p["link_id"])
+            if lk:
+                lk.update(grants=list(p["grants"]), terminal_principals=list(p.get("terminal_principals") or []))
+                if "host_proof" in p:
+                    lk["host_proof"] = p["host_proof"]
+        elif t == "workspace_primary_set":
+            lk = self._links.get(p["link_id"])
+            if lk:
+                self._demote(p.get("demoted_link_id"))
+                lk["is_primary"] = True
+                lk["host_proof"] = p.get("host_proof") or lk.get("host_proof")
+                self._primary[(lk["host"], lk["workspace_id"])] = p["link_id"]
+        elif t == "workspace_primary_cleared":
+            lk = self._links.get(p["link_id"])
+            if lk:
+                lk["is_primary"] = False
+                if self._primary.get((lk["host"], lk["workspace_id"])) == p["link_id"]:
+                    self._primary.pop((lk["host"], lk["workspace_id"]), None)
+        elif t in ("host_registered", "host_unregistered"):
+            if t == "host_registered":
+                self._hosts[p["host"]] = {"owners": list(p["owners"]), "gen": seq}
+            else:
+                self._hosts.pop(p["host"], None)
+            for lk in self._links.values():          # a primary whose host proof no longer holds is gone
+                if lk["host"] == p["host"] and lk["is_primary"] and not self._proof_ok(lk):
+                    self._demote(lk["link_id"])
+        elif t == "mission_linked":
+            self._missions[(p["room_id"], p["mission_id"])] = {
+                "mission_id": p["mission_id"], "room_id": p["room_id"], "members": list(p["members"]),
+                "linked_by": p["actor_user_id"], "created_at": p["created_at"]}
+        elif t == "mission_unlinked":
+            self._missions.pop((p["room_id"], p["mission_id"]), None)
         elif t == "egress_requested":
             self._egress[p["request_id"]] = {
                 "id": p["request_id"], "room_id": p["room_id"], "agent_id": p["agent_id"],
@@ -696,244 +1022,35 @@ class CollabService:
         elif t == "message":
             self._idem[(p["sender_key"], p["room_id"], p["idempotency_key"])] = (p["fingerprint"], seq)
             self._msg_room[ev["event_id"]] = (p["room_id"], seq)
-        self._apply_lifecycle(ev)
-        if t in _FEED_TYPES or (t == "agent_access_requested" and "permission_id" in p):
+        if t in _FEED_TYPES:
             for rid in {p.get("room_id"), *p.get("room_ids", ())} - {None}:
                 self._by_room[rid].append(ev)
 
-    def _apply_lifecycle(self, ev: dict) -> None:
-        """Project explicit records alongside the legacy active-members/attachment indexes."""
-        t, p = ev["event_type"], ev["payload"]
-        rid, uid = p.get("room_id"), p.get("subject_user_id")
-        if "transition_fingerprint" in p:
-            key = (p["transition_actor"], p["transition_operation"], p["transition_resource"],
-                   p["idempotency_key"])
-            self._lifecycle_idem[key] = p["transition_fingerprint"]
-        if t == "room_created":
-            uid = p["actor_user_id"]
-        if t in ("room_created", "member_added", "room_member_approved", "room_member_invited"):
-            key = (rid, uid)
-            previous = self._room_memberships.get(key, {})
-            status = "pending" if t == "room_member_invited" else "approved"
-            self._room_memberships[key] = {
-                "membership_id": p.get("membership_id") or previous.get("membership_id") or ev["event_id"],
-                "room_id": rid, "user_id": uid, "status": status,
-                "role": "owner" if t == "room_created" else p["role"],
-                "expires_at": p.get("expires_at")}
-            if not previous or previous.get("status") == "removed":
-                self._file_permissions[key] = t == "room_created"
-        elif t in ("member_removed", "room_member_removed"):
-            if (rid, uid) in self._room_memberships:
-                self._room_memberships[(rid, uid)]["status"] = "removed"
-            self._file_permissions[(rid, uid)] = False
-            for (room, aid, user), permission in self._agent_permissions.items():
-                if room == rid and (user == uid or self._agents.get(aid, {}).get("owner") == uid):
-                    permission["status"] = "revoked"
-        elif t == "file_upload_permission_changed":
-            self._file_permissions[(rid, uid)] = p["file_upload_permission"]
-        elif t in ("agent_access_requested", "agent_access_approved", "agent_access_revoked") and "permission_id" in p:
-            self._agent_permissions[(rid, p["agent_id"], uid)] = {
-                "permission_id": p["permission_id"], "room_id": rid, "agent_id": p["agent_id"],
-                "user_id": uid, "status": p["agent_permission_status"]}
-        elif t in ("agent_revoked", "agent_grant_revoked", "agent_grant_expired"):
-            for (room, aid, _), permission in self._agent_permissions.items():
-                if aid == p["agent_id"] and (t == "agent_revoked" or room == rid):
-                    permission["status"] = "revoked"
+    def _demote(self, link_id: str | None) -> None:
+        lk = self._links.get(link_id) if link_id else None
+        if lk:
+            lk["is_primary"] = False
+            if self._primary.get((lk["host"], lk["workspace_id"])) == link_id:
+                self._primary.pop((lk["host"], lk["workspace_id"]), None)
 
-    def _lifecycle_retry(self, pr: Principal, operation: str, resource: str,
-                         key: str | None, values: dict) -> tuple[dict, bool]:
-        """Scope retry keys to an actor and operation; rebuild them from committed events."""
-        if key is not None and (not isinstance(key, str) or not _KEY_RE.fullmatch(key)):
-            raise CollabError(400, "invalid idempotency_key")
-        key = key or ids.new_id("transition")
-        fingerprint = _digest(json.dumps(values, sort_keys=True))
-        prior = self._lifecycle_idem.get((pr.key, operation, resource, key))
-        if prior is not None and prior != fingerprint:
-            raise CollabError(409, "idempotency_key already used for a different transition")
-        return {"transition_actor": pr.key, "transition_operation": operation,
-                "transition_resource": resource, "idempotency_key": key,
-                "transition_fingerprint": fingerprint}, prior is not None
-
-    def _confirm_lifecycle(self, pr: Principal, room: dict, transition: dict) -> None:
-        """Remember a new retry key even when the requested state already holds."""
-        self._commit("lifecycle_transition_confirmed", self._actor(pr, room_id=room["id"],
-            project_id=room["project_id"], project_ids=[room["project_id"]], outcome="allowed",
-            action=transition["transition_operation"], resource_id=transition["transition_resource"], **transition))
-
-    def user_status(self, uid: str) -> str:
-        with self._lock:
-            return self._users.get(uid, {}).get("status", "approved" if self.approval is None and self.auth.exists(uid) else "pending")
-
-    def _member_fields(self, room_id: str, uid: str) -> dict:
-        with self._lock:
-            member = self._room_memberships.get((room_id, uid), {})
-            return {"user_status": self.user_status(uid), "room_membership_status": member.get("status", "none"),
-                    "agent_permission_status": {aid: permission["status"]
-                        for (rid, aid, user), permission in self._agent_permissions.items() if rid == room_id and user == uid},
-                    "file_upload_permission": bool(self._member(self._rooms[room_id], uid)
-                        and self._ok(uid) and self._file_permissions.get((room_id, uid), False))}
-
-    def room_member(self, room_id: str, uid: str) -> dict:
-        """Internal lifecycle lookup, including pending and removed membership records."""
-        with self._lock:
-            member = self._room_memberships.get((room_id, uid))
-            if member is None:
-                raise CollabError(404, "not found")
-            return {**member, **self._member_fields(room_id, uid)}
-
-    def _lifecycle_room(self, pr: Principal, room_id: str, *, owner: bool = False) -> dict:
-        self._require_user(pr)
-        if pr.admin:
-            room = self._rooms.get(room_id)
-            if room is None:
-                raise CollabError(404, "not found")
-            return room
-        if not self.still_valid(pr):
-            raise CollabError(403, "platform approval required")
-        return self._authorize(pr, room_id, "invite" if owner else "read", "room.permission")[0]
-
-    def invite_member(self, pr: Principal, room_id: str, body: dict) -> dict:
-        with self._lock:
-            room = self._lifecycle_room(pr, room_id, owner=True)
-            uid, role = body.get("user_id"), body.get("role", "contributor")
-            if not isinstance(uid, str) or not self._ok(uid):
-                raise CollabError(404, "unknown user")
-            if not isinstance(role, str) or role not in INVITABLE_ROLES:
-                raise CollabError(400, "invalid role")
-            transition, replayed = self._lifecycle_retry(pr, "room.member.invite", room_id,
-                body.get("idempotency_key"), {"user_id": uid, "role": role, "expires_at": body.get("expires_at")})
-            if replayed:
-                return self.room_member(room_id, uid)
-            exp = _finite_expiry(body.get("expires_at"), self._now())
-            previous = self._room_memberships.get((room_id, uid))
-            if previous and previous["status"] != "removed":
-                if previous["role"] != role:
-                    raise CollabError(409, "already invited with a different role")
-                if body.get("idempotency_key") is not None:
-                    self._confirm_lifecycle(pr, room, transition)
-                return self.room_member(room_id, uid)
-            pending = sum(1 for (rid, _), member in self._room_memberships.items()
-                          if rid == room_id and member["status"] == "pending")
-            if len(room["members"]) + pending >= self.max_members_per_room:
-                raise CollabError(429, "room member limit reached")
-            if role == "guest" and exp is None:
-                exp = self._now() + self.guest_ttl
-            self._commit("room_member_invited", self._actor(pr, room_id=room_id,
-                project_id=room["project_id"], subject_user_id=uid, role=role, expires_at=exp,
-                membership_id=previous["membership_id"] if previous else ids.new_id("membership"),
-                action="room.member.invite", outcome="allowed", project_ids=[room["project_id"]],
-                resource_id=uid, **transition))
-            return self.room_member(room_id, uid)
-
-    def decide_room_member(self, pr: Principal, room_id: str, uid: str, decision: str,
-                           *, idempotency_key: str | None = None) -> dict:
-        if decision != "approve":
-            raise CollabError(400, "decision must be approve; use room removal to revoke membership")
-        with self._lock:
-            room = self._lifecycle_room(pr, room_id, owner=True)
-            transition, replayed = self._lifecycle_retry(pr, "room.member.approve", room_id,
-                idempotency_key, {"user_id": uid})
-            member = self.room_member(room_id, uid)
-            if replayed or member["status"] == "approved":
-                if not replayed and idempotency_key is not None:
-                    self._confirm_lifecycle(pr, room, transition)
-                return member
-            if member["status"] != "pending" or not self._ok(uid):
-                raise CollabError(409, "member is not awaiting approval")
-            _finite_expiry(member["expires_at"], self._now())
-            self._room_has_space(room)
-            self._commit("room_member_approved", self._actor(pr, room_id=room_id,
-                project_id=room["project_id"], subject_user_id=uid, role=member["role"],
-                expires_at=member["expires_at"], membership_id=member["membership_id"],
-                action="room.member.approve", outcome="allowed", project_ids=[room["project_id"]],
-                resource_id=uid, **transition))
-            return self.room_member(room_id, uid)
-
-    def remove_room_member(self, pr: Principal, room_id: str, uid: str,
-                           *, idempotency_key: str | None = None) -> dict:
-        with self._lock:
-            room = self._lifecycle_room(pr, room_id, owner=True)
-            transition, replayed = self._lifecycle_retry(pr, "room.member.remove", room_id,
-                idempotency_key, {"user_id": uid})
-            member = self.room_member(room_id, uid)
-            if replayed or member["status"] == "removed":
-                if not replayed and idempotency_key is not None:
-                    self._confirm_lifecycle(pr, room, transition)
-                return member
-            if member["role"] == "owner":
-                raise CollabError(400, "cannot remove an owner")
-            self._commit("room_member_removed", self._actor(pr, room_id=room_id,
-                project_id=room["project_id"], subject_user_id=uid, action="member.remove",
-                outcome="allowed", project_ids=[room["project_id"]], resource_id=uid, **transition))
-            self._expire_helpers()
-            return self.room_member(room_id, uid)
-
-    def set_file_upload_permission(self, pr: Principal, room_id: str, uid: str, allowed: bool,
-                                   *, idempotency_key: str | None = None) -> dict:
-        if not isinstance(allowed, bool):
-            raise CollabError(400, "file_upload_permission must be true or false")
-        with self._lock:
-            room = self._lifecycle_room(pr, room_id, owner=True)
-            transition, replayed = self._lifecycle_retry(pr, "file.upload.permission", room_id,
-                idempotency_key, {"user_id": uid, "allowed": allowed})
-            member = self.room_member(room_id, uid)
-            if replayed:
-                return member
-            if not self._member(room, uid) or not self._ok(uid):
-                raise CollabError(409, "an approved room member is required")
-            if member["role"] == "owner" and not allowed:
-                raise CollabError(400, "room owners retain upload permission")
-            if member["file_upload_permission"] == allowed and idempotency_key is None:
-                return member
-            self._commit("file_upload_permission_changed", self._actor(pr, room_id=room_id,
-                project_id=room["project_id"], subject_user_id=uid, file_upload_permission=allowed,
-                action="file.upload.permission", outcome="allowed", project_ids=[room["project_id"]],
-                resource_id=uid, **transition))
-            return self.room_member(room_id, uid)
-
-    def set_agent_permission(self, pr: Principal, room_id: str, agent_id: str, uid: str, status: str,
-                             *, idempotency_key: str | None = None) -> dict:
-        """Record per-member delegation, independently of the agent's room attachment.
-
-        Task submission/request envelopes are wired to these records by the subsequent task.
-        """
-        kinds = {"pending": "agent_access_requested", "approved": "agent_access_approved",
-                 "revoked": "agent_access_revoked"}
-        if not isinstance(status, str) or status not in kinds:
-            raise CollabError(400, "invalid agent permission status")
-        with self._lock:
-            room = self._lifecycle_room(pr, room_id)
-            agent = self._agents.get(agent_id)
-            if not agent or not self._effective(Principal("agent", agent_id, agent["owner"]), room):
-                raise CollabError(404, "no such agent in this room")
-            if status == "pending":
-                if uid != pr.id:
-                    raise CollabError(403, "request access for yourself")
-            elif not pr.admin and agent["owner"] != pr.id:
-                raise CollabError(403, "only the agent owner can decide access")
-            transition, replayed = self._lifecycle_retry(pr, "agent.permission", room_id,
-                idempotency_key, {"agent_id": agent_id, "user_id": uid, "status": status})
-            existing = self._agent_permissions.get((room_id, agent_id, uid))
-            if replayed or (existing and status == "pending" and existing["status"] == "approved"):
-                if not replayed and idempotency_key is not None:
-                    self._confirm_lifecycle(pr, room, transition)
-                return {**existing, "agent_permission_status": existing["status"]}
-            if not self._member(room, uid) or not self._ok(uid):
-                raise CollabError(409, "an approved room member is required")
-            if existing and existing["status"] == status and idempotency_key is None:
-                return {**existing, "agent_permission_status": existing["status"]}
-            self._commit(kinds[status], self._actor(pr, room_id=room_id,
-                project_id=room["project_id"], agent_id=agent_id, subject_user_id=uid,
-                permission_id=existing["permission_id"] if existing else ids.new_id("permission"),
-                agent_permission_status=status, action="agent.access." + status,
-                outcome="allowed", project_ids=[room["project_id"]], resource_id=agent_id, **transition))
-            permission = self._agent_permissions[(room_id, agent_id, uid)]
-            return {**permission, "agent_permission_status": permission["status"]}
+    def _prune_terminal(self, room_id: str | None, gone) -> None:
+        """Drop named terminal principals that no longer qualify; no principals left = no terminal grant."""
+        for lk in self._links.values():
+            if room_id is not None and lk["room_id"] != room_id:
+                continue
+            keep = [k for k in lk["terminal_principals"] if not gone(k)]
+            if len(keep) != len(lk["terminal_principals"]):
+                lk["terminal_principals"] = keep
+                if not keep:
+                    lk["grants"] = [g for g in lk["grants"] if g != "terminal"]
 
     # ------------------------------------------------------ authentication
     def authenticate(self, authorization: str, device: str | None) -> Principal:
         scheme, _, token = (authorization or "").partition(" ")
         token = token.strip()
+        if self.degraded and scheme != "Bearer":
+            self.stats["auth_failures"] += 1       # agents cannot be verified without the log: same 401 as any bad token
+            raise CollabError(401, "unauthorized")
         if not token:
             self.stats["auth_failures"] += 1
             raise CollabError(401, "unauthorized")
@@ -947,6 +1064,8 @@ class CollabService:
             if got is None:
                 self.stats["auth_failures"] += 1
                 raise CollabError(401, "unauthorized")
+            if self.degraded:                      # only a caller with a VALID token learns that collaboration is down
+                raise CollabError(503, "collaboration is disabled; ask the operator")
             pr = Principal("user", got[0], got[0], exp=got[1])
             if self.approval is not None:
                 self._admit(pr, set(groups))
@@ -973,7 +1092,9 @@ class CollabService:
                     self._audit_denied(Principal("agent", aid, agent["owner"]), "auth.agent", reason,
                                        resource_id=aid, agent_id=aid)
                     raise CollabError(401, "unauthorized")
-                return Principal("agent", aid, agent["owner"], digest)
+                pr = Principal("agent", aid, agent["owner"], digest)
+                pr.external = bool(agent.get("external"))
+                return pr
         self.stats["auth_failures"] += 1
         raise CollabError(401, "unauthorized")
 
@@ -992,12 +1113,12 @@ class CollabService:
                         not auto and sum(1 for x in self._users.values() if x["status"] == "pending") >= MAX_PENDING_USERS):
                     self.stats["policy_denied"] += 1
                     raise CollabError(429, "too many people are waiting for approval; ask the operator")
-                self._commit("user_approved" if auto else "user_registered", {
+                self._commit("user_registered", {
                     "actor_user_id": uid, "actor_agent_id": None, "user_id": uid, "at": self._iso(),
                     "status": "approved" if auto else "pending", "decided_by": "auto:group" if auto else None,
                     "action": "user.register", "outcome": "allowed", "project_ids": [], "resource_id": uid})
             elif u["status"] == "pending" and auto:
-                self._commit("user_approved", {
+                self._commit("user_decided", {
                     "actor_user_id": uid, "actor_agent_id": None, "user_id": uid, "at": self._iso(),
                     "status": "approved", "decided_by": "auto:group", "reason": None,
                     "action": "user.approve", "outcome": "allowed", "project_ids": [], "resource_id": uid})
@@ -1012,7 +1133,7 @@ class CollabService:
         """The tailnet-only dashboard owner is always approved: nobody else can lock them out."""
         with self._lock:
             if self._users.get(uid, {}).get("status") != "approved":
-                self._commit("user_approved", {
+                self._commit("user_decided", {
                     "actor_user_id": uid, "actor_agent_id": None, "user_id": uid, "at": self._iso(),
                     "status": "approved", "decided_by": "operator", "reason": None,
                     "action": "user.approve", "outcome": "allowed", "project_ids": [], "resource_id": uid})
@@ -1069,6 +1190,13 @@ class CollabService:
         if not m or not self._ok(agent["owner"]):
             return None  # owner lost membership: the agent loses it too
         allowed = frozenset(grant["actions"]) & ROLE_ACTIONS[m["role"]] & AGENT_ACTIONS
+        bound = agent.get("external")
+        if bound:
+            # An external agent is bound to the room it was invited into: a later grant anywhere else
+            # (by anyone) is inert, and it never holds more than EXTERNAL_ACTIONS.
+            if bound["room_id"] != room["id"] or self._now() >= bound["hard_expiry"]:
+                return None
+            allowed &= ext.EXTERNAL_ACTIONS
         h = self._helper_by_agent.get(pr.id)
         if h is not None and h["parent_agent_id"]:
             # a helper never holds more than the agent it works under holds right now (recursively)
@@ -1120,7 +1248,8 @@ class CollabService:
 
     @staticmethod
     def _actor(pr: Principal, **extra) -> dict:
-        return {"actor_user_id": pr.owner, "actor_agent_id": pr.id if pr.is_agent else None, **extra}
+        return {"actor_user_id": pr.owner, "actor_agent_id": pr.id if pr.is_agent else None,
+                "actor_kind": "external" if pr.external else pr.kind, **extra}
 
     def _require_user(self, pr: Principal) -> None:
         if pr.is_agent:
@@ -1128,6 +1257,13 @@ class CollabService:
             raise CollabError(403, "forbidden: agents cannot perform this operation")
 
     # ------------------------------------------------------------ quotas
+    def _no_external(self, pr: Principal) -> None:
+        """An external agent reads the room's chat and nothing else: not the roster (owner ids and
+        emails), the flow view, the task list or the room bundle."""
+        if pr.external:
+            self.stats["policy_denied"] += 1
+            raise CollabError(403, "forbidden")
+
     def _room_has_space(self, room: dict) -> None:
         if len(room["members"]) >= self.max_members_per_room:
             raise CollabError(429, "room member limit reached")
@@ -1189,8 +1325,7 @@ class CollabService:
             self._commit("room_created", self._actor(
                 pr, project_id=project_id, room_id=rid, name=name, action="room.create",
                 outcome="allowed", project_ids=[project_id], resource_id=rid))
-        return {"room_id": rid, "project_id": project_id, "name": name,
-                **self._member_fields(rid, pr.id)}
+        return {"room_id": rid, "project_id": project_id, "name": name}
 
     def list_rooms(self, pr: Principal) -> dict:
         self._require_user(pr)
@@ -1200,21 +1335,19 @@ class CollabService:
                 m = self._member(room, pr.id)
                 if m:
                     out.append({"room_id": rid, "name": room["name"], "role": m["role"],
-                                "project_id": room["project_id"] if m["role"] != "guest" else None,
-                                **self._member_fields(rid, pr.id)})
+                                "project_id": room["project_id"] if m["role"] != "guest" else None})
         return {"rooms": out}
 
     def get_room(self, pr: Principal, room_id: str) -> dict:
         with self._lock:
             room, _ = self._authorize(pr, room_id, "read", "room.read")
-            out = {"room_id": room_id, "name": room["name"], **self._member_fields(room_id, pr.owner)}
+            out = {"room_id": room_id, "name": room["name"]}
             if not pr.is_agent:
                 m = self._member(room, pr.id)
                 out["role"] = m["role"]
                 if m["role"] == "owner":
-                    out["members"] = [{"user_id": u, "role": v["role"], "email": self._user_email.get(u),
-                                       **self._member_fields(room_id, u)}
-                                      for (rid, u), v in self._room_memberships.items() if rid == room_id]
+                    out["members"] = [{"user_id": u, "role": v["role"], "email": self._user_email.get(u)}
+                                      for u, v in room["members"].items() if self._member(room, u)]
             return out
 
     def add_member(self, pr: Principal, room_id: str, body: dict) -> dict:
@@ -1227,37 +1360,41 @@ class CollabService:
             exp = _finite_expiry(body.get("expires_at"), self._now())
             if not isinstance(uid, str) or not self._ok(uid):
                 raise CollabError(404, "unknown user")
-            transition, replayed = self._lifecycle_retry(pr, "member.add", room_id,
-                body.get("idempotency_key"), {"user_id": uid, "role": role, "expires_at": body.get("expires_at")})
-            if replayed:
-                return {"room_id": room_id, "user_id": uid, "role": role, **self._member_fields(room_id, uid)}
             if self._member(room, uid):
                 raise CollabError(409, "already a member")
             self._room_has_space(room)
             if role == "guest" and exp is None:
                 exp = self._now() + self.guest_ttl
-            self._commit("room_member_approved", self._actor(
+            self._commit("member_added", self._actor(
                 pr, project_id=room["project_id"], room_id=room_id, subject_user_id=uid, role=role,
                 expires_at=exp, action="member.add", outcome="allowed",
-                project_ids=[room["project_id"]], resource_id=room_id, **transition))
-        return {"room_id": room_id, "user_id": uid, "role": role, **self._member_fields(room_id, uid)}
+                project_ids=[room["project_id"]], resource_id=room_id))
+        return {"room_id": room_id, "user_id": uid, "role": role}
 
-    def remove_member(self, pr: Principal, room_id: str, uid: str,
-                      *, idempotency_key: str | None = None) -> dict:
-        self.remove_room_member(pr, room_id, uid, idempotency_key=idempotency_key)
+    def remove_member(self, pr: Principal, room_id: str, uid: str) -> dict:
+        self._require_user(pr)
+        with self._lock:
+            room, _ = self._authorize(pr, room_id, "invite", "member.remove")
+            m = room["members"].get(uid)
+            if m is None:
+                raise CollabError(404, "not found")
+            if m["role"] == "owner":
+                raise CollabError(400, "cannot remove an owner")
+            self._commit("member_removed", self._actor(
+                pr, project_id=room["project_id"], room_id=room_id, subject_user_id=uid,
+                action="member.remove", outcome="allowed", project_ids=[room["project_id"]],
+                resource_id=room_id))
+            self._expire_helpers()                   # their helpers in this room end now and free their slots
+        self._xlink_sweep(room_id)          # T14: links this person made no longer stand
         return {"ok": True}
 
     # -- people: approval, disable, kick
-    def _user_row(self, pr: Principal, uid: str, u: dict) -> dict:
-        row = {"user_id": uid, "email": self._user_email.get(uid), "status": u["status"], "since": u.get("since"),
-               "decided_by": u.get("decided_by"), "decided_at": u.get("decided_at"), "reason": u.get("reason"),
-               "user_status": u["status"]}
-        # Platform approval authority does not confer visibility into private rooms or agents.
-        if pr.admin:
-            row.update(rooms=sum(1 for room in self._rooms.values() if uid in room["members"]),
-                       agents=sum(1 for aid in self._agents_by_owner.get(uid, ()) if self._agents[aid]["status"] == "active"),
-                       memberships=[self.room_member(rid, uid) for rid, user in self._room_memberships if user == uid])
-        return row
+    def _user_row(self, uid: str, u: dict) -> dict:
+        rooms = sum(1 for room in self._rooms.values() if uid in room["members"])
+        agents = sum(1 for aid in self._agents_by_owner.get(uid, ()) if self._agents[aid]["status"] == "active")
+        return {"user_id": uid, "email": self._user_email.get(uid), "status": u["status"], "since": u.get("since"),
+                "decided_by": u.get("decided_by"), "decided_at": u.get("decided_at"), "reason": u.get("reason"),
+                "rooms": rooms, "agents": agents}
 
     def list_users(self, pr: Principal, status: str | None = None) -> dict:
         """The operator sees everyone; an approver sees only the people waiting."""
@@ -1267,7 +1404,7 @@ class CollabService:
         if status is not None and status not in USER_STATUSES:
             raise CollabError(400, "unknown status")
         with self._lock:
-            rows = [self._user_row(pr, uid, u) for uid, u in self._users.items()
+            rows = [self._user_row(uid, u) for uid, u in self._users.items()
                     if (status is None or u["status"] == status) and (pr.admin or u["status"] == "pending")]
             counts: dict[str, int] = defaultdict(int)
             for u in self._users.values():
@@ -1285,7 +1422,7 @@ class CollabService:
             rows = []
             for e in reversed(self._log):
                 p = e["payload"]
-                if e["event_type"] in ("user_registered", "user_decided", "user_approved"):
+                if e["event_type"] in ("user_registered", "user_decided"):
                     rows.append({"at": p.get("at"), "user_id": p["user_id"], "email": self._user_email.get(p["user_id"]),
                                  "action": p.get("action"), "status": p["status"], "by": p.get("decided_by"),
                                  "reason": p.get("reason")})
@@ -1318,14 +1455,6 @@ class CollabService:
             if action == "approve" and not self._user_email.get(uid):
                 # Nobody is approved blind: the pool lets anyone sign up, and the email is what says who it is.
                 raise CollabError(409, "they have not finished signing in yet (no verified email); ask again in a moment")
-            transition, replayed = ({}, False)
-            if action == "approve":
-                transition, replayed = self._lifecycle_retry(
-                    pr, "user.approve", uid, body.get("idempotency_key"), {"reason": reason})
-            if replayed:
-                if u["status"] == "approved" and self._user_email.get(uid):
-                    self._deliver_pending(uid, self._user_email[uid])
-                return self._user_row(pr, uid, u)
             if action in ("approve", "deny"):
                 if not pr.admin and u["status"] != "pending":
                     raise CollabError(403, "approvers only decide people who are waiting")
@@ -1337,15 +1466,16 @@ class CollabService:
                 raise CollabError(409, "only an approved person can be disabled")
             self._throttle("userdecide:" + pr.id, 300, 600.0, "user decision")
             new = USER_ACTIONS[action]
-            self._commit("user_approved" if new == "approved" else "user_decided", self._actor(
-                pr, user_id=uid, at=self._iso(), status=new, decided_by=pr.id, reason=reason,
-                action=f"user.{action}", outcome="allowed", project_ids=[], resource_id=uid, **transition))
+            if u["status"] != new:          # a repeat of the same decision is not a new event (safety events are free)
+                self._commit("user_decided", self._actor(
+                    pr, user_id=uid, at=self._iso(), status=new, decided_by=pr.id, reason=reason,
+                    action=f"user.{action}", outcome="allowed", project_ids=[], resource_id=uid))
             if action == "kick":
                 # Out of every room, and every agent they own stops working for good.
                 for rid, room in list(self._rooms.items()):
                     m = room["members"].get(uid)
                     if m is not None and m["role"] != "owner":      # an owner's room stays; they simply can't get in
-                        self._commit("room_member_removed", self._actor(
+                        self._commit("member_removed", self._actor(
                             pr, project_id=room["project_id"], room_id=rid, subject_user_id=uid,
                             action="member.remove", outcome="allowed", project_ids=[room["project_id"]],
                             resource_id=rid))
@@ -1362,12 +1492,12 @@ class CollabService:
                 self._expire_helpers()                # a disabled person's helpers end now
             elif action in ("approve", "enable") and self._user_email.get(uid):
                 self._deliver_pending(uid, self._user_email[uid])
-            return self._user_row(pr, uid, self._users[uid])
+            return self._user_row(uid, self._users[uid])
 
     # -- people: link email at sign-in, invite by email
     def me(self, pr: Principal) -> dict:
         self._require_user(pr)
-        out = {"user_id": pr.id, "email": self._user_email.get(pr.id), "user_status": self.user_status(pr.id)}
+        out = {"user_id": pr.id, "email": self._user_email.get(pr.id)}
         if self.approval is not None:
             out.update(status=pr.status, approver=pr.approver, admin=pr.admin)
         return out
@@ -1386,7 +1516,7 @@ class CollabService:
                                                  "user_id": pr.id, "email": email})
             if self._approved(pr.id):                  # invitations wait for approval, then arrive
                 self._deliver_pending(pr.id, email)
-        out = {"user_id": pr.id, "email": email, "user_status": self.user_status(pr.id)}
+        out = {"user_id": pr.id, "email": email}
         if self.approval is not None:
             out.update(status=pr.status, approver=pr.approver, admin=pr.admin)
         return out
@@ -1407,7 +1537,7 @@ class CollabService:
                                                "invite_id": iid, "reason": "inviter_unavailable"})
                 continue
             if not self._member(room, user) and len(room["members"]) < self.max_members_per_room:
-                self._commit("room_member_approved", {
+                self._commit("member_added", {
                     "actor_user_id": inv["inviter"], "actor_agent_id": None,
                     "project_id": room["project_id"], "room_id": inv["room_id"],
                     "subject_user_id": user, "role": inv["role"],
@@ -1435,7 +1565,7 @@ class CollabService:
             if user and self._ok(user):
                 if self._member(room, user):
                     return reply   # same answer as a pending invite: no signed-in-or-not oracle
-                self._commit("room_member_approved", self._actor(
+                self._commit("member_added", self._actor(
                     pr, project_id=room["project_id"], room_id=room_id, subject_user_id=user,
                     role=role, expires_at=self._now() + self.guest_ttl if role == "guest" else None, action="member.add", outcome="allowed",
                     project_ids=[room["project_id"]], resource_id=room_id))
@@ -1607,7 +1737,7 @@ class CollabService:
             return {"tokens": [
                 {"join_id": r["id"], "harness_type": r["family"], "name_prefix": r["prefix"],
                  "uses": r["uses"], "max_uses": r["max_uses"], "expires_at": r["expires_at"],
-                 "room_id": r["room_id"], "actions": r["actions"],
+                 "room_id": r["room_id"], "actions": r["actions"], "external": bool(r.get("external")),
                  "status": "revoked" if r["revoked"] else ("expired" if now >= r["expires_at"] else (
                      "used up" if r["uses"] >= r["max_uses"] else "active"))}
                 for r in self._joins.values() if r["owner"] == pr.id and now - r["expires_at"] < 7 * 86400]}
@@ -1624,10 +1754,30 @@ class CollabService:
                     project_ids=[], resource_id=join_id))
         return {"ok": True}
 
-    def redeem_join_token(self, body: dict) -> dict:
+    @staticmethod
+    def _client_label(client: object) -> str:
+        """The address the HTTP layer resolved (its existing proxy convention), or "unknown". Only a
+        parseable IP is kept, so the counter and audit rows cannot be filled with free text."""
+        try:
+            return str(ipaddress.ip_address(str(client).strip())) if client else "unknown"
+        except ValueError:
+            return "unknown"
+
+    def _redeem_failed(self, client: object) -> None:
+        """Count a failed invite redemption per client address. Aggregate only (never one log row per
+        attempt, so unauthenticated traffic cannot grow the log); bounded at 256 addresses."""
+        self.stats["auth_failures"] += 1
+        who = self._client_label(client)
+        if who not in self.redeem_failures and len(self.redeem_failures) >= 256:
+            who = "other"
+        self.redeem_failures[who] = self.redeem_failures.get(who, 0) + 1
+
+    def redeem_join_token(self, body: dict, client: str | None = None) -> dict:
         """Public, token-authenticated: one use = one new agent for the token's owner."""
         token = body.get("token")
         if not isinstance(token, str) or not token.startswith("hcj_") or len(token) > 80:
+            with self._lock:
+                self._redeem_failed(client)
             raise CollabError(401, "unauthorized")
         digest = _digest(token)
         instance = body.get("instance_id")
@@ -1635,9 +1785,11 @@ class CollabService:
             rec = self._joins.get(digest)
             if (rec is None or rec["revoked"] or self._now() >= rec["expires_at"]
                     or rec["uses"] >= rec["max_uses"] or not self._ok(rec["owner"])):
-                self.stats["auth_failures"] += 1
+                self._redeem_failed(client)
                 raise CollabError(401, "unauthorized")
             self._throttle("join:" + digest, 120, 60.0, "join")
+            if rec.get("external"):
+                return self._redeem_external(rec, digest, body, client)
             owner = rec["owner"]
             self._agent_slots(owner)
             name = self._agent_names(owner, rec["prefix"], 1)[0]
@@ -1674,7 +1826,8 @@ class CollabService:
         with self._lock:
             rec, agent = self._joins.get(digest), self._agents.get(aid)
             if (rec is None or rec["revoked"] or self._now() >= rec["expires_at"] or not agent
-                    or agent.get("join") != digest or agent["status"] != "active"):
+                    or agent.get("join") != digest or agent["status"] != "active"
+                    or rec.get("external") or agent.get("external")):     # an external agent has no pane
                 self.stats["auth_failures"] += 1
                 raise CollabError(401, "unauthorized")
             self._throttle("joinlink:" + digest, 120, 60.0, "join link")
@@ -1682,6 +1835,433 @@ class CollabService:
                                           "instance_id": inst, "action": "agent.link", "outcome": "allowed",
                                           "project_ids": [], "resource_id": aid})
         return {"agent_id": aid, "instance_id": inst}
+
+    # ------------------------------------------------- external coworker / remote agents (T10)
+    # An external agent is an HCN agent record with an `external` block: bound to ONE room at invite
+    # time, sponsored (and accountable) by the room owner who invited it, limited to EXTERNAL_ACTIONS,
+    # with a hard credential expiry rotation cannot extend. It never gets a terminal, a task right or a
+    # pane link; its room_id is never taken from a request.
+    def _require_external(self, pr: Principal) -> dict:
+        agent = self._agents.get(pr.id) if pr.is_agent else None
+        if not agent or not agent.get("external"):
+            self.stats["policy_denied"] += 1
+            raise CollabError(403, "forbidden")
+        return agent
+
+    def tool_profile(self, pr: Principal) -> dict:
+        """What the MCP menu may show this agent: ``{"external": bool, "proposals": bool}``. Read-only; a missing or
+        revoked agent is treated as an unprivileged external (the smallest menu)."""
+        with self._lock:
+            agent = self._agents.get(pr.id) if pr.is_agent else None
+            ext = (agent or {}).get("external")
+            return {"external": bool(ext) or agent is None, "proposals": bool(ext and ext.get("proposals"))}
+
+    def _external_load(self, room_id: str) -> int:
+        """Live external agents plus open invites in one room (what the per-room cap counts)."""
+        now = self._now()
+        live = sum(1 for aid in self._externals_by_room.get(room_id, ())
+                   if (a := self._agents[aid])["status"] == "active" and now < a["external"]["hard_expiry"]
+                   and aid in self._rooms[room_id]["grants"])
+        invites = sum(1 for r in self._joins.values()
+                      if r.get("external") and r["external"]["room_id"] == room_id and not r["revoked"]
+                      and now < r["expires_at"] and r["uses"] < r["max_uses"])
+        return live + invites
+
+    def create_external_invite(self, pr: Principal, room_id: str, body: dict) -> dict:
+        """The room owner invites a coworker's agent. The reply carries the one-time invite code (shown
+        once, stored only as a digest); the coworker's bridge redeems it at ``/agents/join``."""
+        self._require_user(pr)
+        unknown = set(body) - {"label", "actions", "lineage", "proposals", "ttl_seconds", "credential_ttl_seconds"}
+        if unknown:
+            raise CollabError(400, "unknown field")
+        label = ext.clean_text(body.get("label"), ext.MAX_LABEL)
+        if not label:
+            raise CollabError(400, f"label is required (1-{ext.MAX_LABEL} printable characters)")
+        actions = body.get("actions", list(ext.DEFAULT_EXTERNAL_ACTIONS))
+        if (not isinstance(actions, list) or not actions
+                or not all(isinstance(a, str) and a in ext.EXTERNAL_ACTIONS for a in actions)):
+            raise CollabError(400, "actions must be a non-empty subset of read, post")
+        lineage = body.get("lineage", False)
+        if not isinstance(lineage, bool):
+            raise CollabError(400, "lineage must be true or false")
+        proposals = body.get("proposals", False)
+        if not isinstance(proposals, bool):
+            raise CollabError(400, "proposals must be true or false")
+
+        def span(name, default, lo, hi):
+            v = body.get(name, default)
+            if not isinstance(v, (int, float)) or isinstance(v, bool) or not lo <= v <= hi:
+                raise CollabError(400, f"{name} must be {int(lo)}-{int(hi)}")
+            return float(v)
+        ttl = span("ttl_seconds", ext.INVITE_TTL_DEFAULT, ext.INVITE_TTL_MIN, ext.INVITE_TTL_MAX)
+        cred_ttl = span("credential_ttl_seconds", ext.CRED_TTL_DEFAULT, ext.CRED_TTL_MIN, ext.CRED_TTL_MAX)
+        with self._lock:
+            room, _ = self._authorize(pr, room_id, "invite", "external.invite")
+            self._throttle("extinvite:" + pr.id, ext.INVITES_PER_HOUR, 3600.0, "external invite")
+            if self._external_load(room_id) >= ext.MAX_EXTERNALS_PER_ROOM:
+                raise CollabError(429, "this room has as many external agents and open invites as it allows")
+            self._agent_slots(pr.id)
+            token, jid = "hcj_" + secrets.token_urlsafe(24), ids.new_id("collab")
+            expires = self._now() + ttl
+            block = {"room_id": room_id, "project_id": room["project_id"], "sponsor": pr.id, "label": label,
+                     "actions": sorted(set(actions)), "lineage": lineage, "proposals": proposals,
+                     "cred_ttl": cred_ttl}
+            self._commit("join_token_created", self._actor(
+                pr, join_id=jid, join_digest=_digest(token), harness_type="external", name_prefix="ext",
+                max_uses=1, expires_at_epoch=expires, room_id=room_id, actions=block["actions"],
+                parent_agent_id=None, external=block, project_id=room["project_id"],
+                action="external.invite", outcome="allowed", project_ids=[room["project_id"]], resource_id=jid))
+        return {"invite_id": jid, "code": token, "expires_at": expires, "room_id": room_id, "label": label,
+                "actions": block["actions"], "lineage": lineage, "proposals": proposals,
+                "credential_ttl_seconds": cred_ttl, "redeem": "POST /api/v1/collab/agents/join"}
+
+    def revoke_external_invite(self, pr: Principal, room_id: str, join_id: str) -> dict:
+        self._require_user(pr)
+        with self._lock:
+            room, _ = self._authorize(pr, room_id, "invite", "external.invite.revoke")
+            digest = self._joins_by_id.get(join_id)
+            rec = self._joins.get(digest) if digest else None
+            if not rec or not rec.get("external") or rec["external"]["room_id"] != room_id:
+                raise CollabError(404, "not found")
+            if not rec["revoked"]:
+                self._commit("join_token_revoked", self._actor(
+                    pr, join_id=join_id, room_id=room_id, project_id=room["project_id"],
+                    action="external.invite.revoke", outcome="allowed",
+                    project_ids=[room["project_id"]], resource_id=join_id))
+        return {"ok": True}
+
+    def _redeem_external(self, rec: dict, digest: str, body: dict, client: str | None = None) -> dict:
+        """Called with the lock held, after the token passed every check. One use = one external agent,
+        bound to the invite's room, granted exactly the invite's actions and no more."""
+        unknown = set(body) - {"token", "harness_type", "instance_id"}
+        if unknown:
+            raise CollabError(400, "unknown field")
+        x, owner = rec["external"], rec["owner"]
+        room = self._rooms.get(x["room_id"])
+        m = self._member(room, owner) if room else None
+        if not m or "invite" not in ROLE_ACTIONS[m["role"]]:
+            self._redeem_failed(client)
+            raise CollabError(401, "unauthorized")          # the sponsor no longer owns the room
+        if self._external_load(x["room_id"]) - 1 >= ext.MAX_EXTERNALS_PER_ROOM:   # this invite is already counted
+            raise CollabError(429, "this room has as many external agents as it allows")
+        self._agent_slots(owner)
+        aid, cred = ids.new_id("agent"), "hca_" + secrets.token_urlsafe(32)
+        device = "remote-" + secrets.token_hex(8)
+        now = self._now()
+        hard = now + x["cred_ttl"]
+        name = f"ext-{ext.slug(x['label'])}-{aid[-4:]}"
+        declared = ext.clean_text(body.get("harness_type"), 40) or "external"
+        block = {**x, "hard_expiry": hard}
+        block.pop("cred_ttl", None)
+        self._commit("agent_enrolled", {
+            "actor_user_id": owner, "actor_agent_id": None, "agent_id": aid, "owner_user_id": owner,
+            "code_digest": None, "join_digest": digest, "device_id": device, "harness_type": declared,
+            "name": name, "parent_agent_id": None, "instance_id": None, "secret_digest": _digest(cred),
+            "expires_at_epoch": hard, "external": block, "room_id": x["room_id"],
+            "actor_kind": "external", "client_ip": self._client_label(client),
+            "action": "external.enroll", "outcome": "allowed",
+            "project_ids": [x["project_id"]], "resource_id": aid})
+        self._commit("agent_granted", {
+            "actor_user_id": owner, "actor_agent_id": None, "project_id": x["project_id"],
+            "room_id": x["room_id"], "agent_id": aid, "actions": list(x["actions"]), "expires_at": hard,
+            "actor_kind": "user", "action": "external.grant", "outcome": "allowed",
+            "project_ids": [x["project_id"]], "resource_id": aid})
+        return {"agent_id": aid, "kind": "external", "name": name, "credential": cred, "device_id": device,
+                "expires_at": hard, "room_id": x["room_id"], "actions": list(x["actions"]),
+                "lineage": x["lineage"], "proposals": bool(x.get("proposals")), "label": x["label"],
+                "status": "active", "terminal": False}
+
+    def _external_state(self, a: dict, room: dict, aid: str) -> str:
+        x = a["external"]
+        if a["status"] != "active":
+            return "revoked"
+        if self._now() >= x["hard_expiry"] or self._now() >= a["expires_at"]:
+            return "expired"
+        if aid not in room["grants"]:
+            return "removed"
+        return "active"
+
+    def _presence_view(self, aid: str, state: str) -> dict:
+        p = self._presence.get(aid)
+        if p is None:
+            return {"state": "none", "status": None, "note": "no heartbeat since this service started"}
+        age = self._now() - p["at"]
+        base = {"last_seen_at": self._iso(p["at"]), "last_activity": p["activity"], "age_seconds": int(age)}
+        if state == "active" and age < ext.PRESENCE_STALE:
+            return {"state": "online", "status": p["status"], **base}
+        return {"state": "stale" if state == "active" else "offline", "status": None,
+                "last_status": p["status"], **base}
+
+    def list_room_externals(self, pr: Principal, room_id: str) -> dict:
+        """The virtual-tab roster: every external agent ever invited into this room (revoked ones stay
+        listed, marked), with server-derived provenance and presence. People only, never guests/agents."""
+        self._require_user(pr)
+        with self._lock:
+            room, _ = self._authorize(pr, room_id, "read", "external.list")
+            self._no_guest(pr, room)
+            owner = "invite" in (self._effective(pr, room) or (frozenset(), 0))[0]
+            rows = []
+            for aid in self._externals_by_room.get(room_id, ()):
+                a = self._agents[aid]
+                x = a["external"]
+                state = self._external_state(a, room, aid)
+                rows.append({
+                    "agent_id": aid, "node_id": "agent:" + aid, "kind": "external", "label": x["label"],
+                    "name": a["name"], "state": state, "invited_by": x["sponsor"],
+                    "invited_by_email": self._user_email.get(x["sponsor"]),
+                    "enrolled_at": x["enrolled_at"], "expires_at": min(a["expires_at"], x["hard_expiry"]),
+                    "revoked_at": x.get("revoked_at"), "revoked_by": x.get("revoked_by"),
+                    "actions": sorted(set(room["grants"].get(aid, {"actions": x["actions"]})["actions"])
+                                      & ext.EXTERNAL_ACTIONS),
+                    "lineage": bool(x["lineage"]), "proposals": bool(x.get("proposals")),
+                    "declared_harness": a["harness_type"], "presence": self._presence_view(aid, state), "terminal": False})
+            invites = []
+            if owner:
+                now = self._now()
+                for r in self._joins.values():
+                    x = r.get("external")
+                    if (x and x["room_id"] == room_id and not r["revoked"] and now < r["expires_at"]
+                            and r["uses"] < r["max_uses"]):
+                        invites.append({"invite_id": r["id"], "label": x["label"], "actions": x["actions"],
+                                        "lineage": x["lineage"], "proposals": bool(x.get("proposals")),
+                                        "invited_by": x["sponsor"], "expires_at": r["expires_at"]})
+        return {"room_id": room_id, "externals": rows, "invites": invites if owner else None,
+                "stale_after_seconds": ext.PRESENCE_STALE, "untrusted_text": True}
+
+    def revoke_external(self, pr: Principal, room_id: str, agent_id: str) -> dict:
+        """Any owner of the room (not only the sponsor) cuts an external agent off. The next request with
+        its credential is a 401; what it already posted or emitted stays visible."""
+        self._require_user(pr)
+        with self._lock:
+            room, _ = self._authorize(pr, room_id, "invite", "external.revoke")
+            a = self._agents.get(agent_id)
+            if not a or not a.get("external") or a["external"]["room_id"] != room_id:
+                raise CollabError(404, "not found")
+            if a["status"] == "active":
+                self._commit("agent_revoked", self._actor(
+                    pr, agent_id=agent_id, room_id=room_id, room_ids=[room_id], project_id=room["project_id"],
+                    action="external.revoke", outcome="allowed",
+                    project_ids=[room["project_id"]], resource_id=agent_id))
+        return {"ok": True, "state": "revoked"}
+
+    def external_me(self, pr: Principal) -> dict:
+        with self._lock:
+            a = self._require_external(pr)
+            x = a["external"]
+            return {"agent_id": pr.id, "kind": "external", "room_id": x["room_id"], "label": x["label"],
+                    "actions": list(x["actions"]), "lineage": bool(x["lineage"]),
+                    "proposals": bool(x.get("proposals")) and self.delegation_enabled,
+                    "expires_at": min(a["expires_at"], x["hard_expiry"]), "terminal": False,
+                    "heartbeat": {"statuses": list(ext.EXTERNAL_STATUSES), "stale_after_seconds": ext.PRESENCE_STALE}}
+
+    def external_leave(self, pr: Principal) -> dict:
+        """The external agent withdraws itself; the same revocation a room owner would apply."""
+        with self._lock:
+            a = self._require_external(pr)
+            x = a["external"]
+            if a["status"] != "active":
+                return {"ok": True}
+            self._commit("agent_revoked", self._actor(
+                pr, agent_id=pr.id, room_id=x["room_id"], room_ids=[x["room_id"]], project_id=x["project_id"],
+                action="external.leave", outcome="allowed", project_ids=[x["project_id"]], resource_id=pr.id))
+        return {"ok": True}
+
+    def external_heartbeat(self, pr: Principal, body: dict) -> dict:
+        """Presence and a status from a fixed list. Kept in memory (a heartbeat is not a log event); only
+        a CHANGE of status is written down, at most STATUS_CHANGES_PER_10_MIN times per agent."""
+        unknown = set(body) - {"status", "activity"}
+        if unknown:
+            raise CollabError(400, "unknown field")
+        status = body.get("status")
+        if not isinstance(status, str) or status not in ext.EXTERNAL_STATUSES:
+            raise CollabError(400, "status must be one of " + ", ".join(ext.EXTERNAL_STATUSES))
+        activity = body.get("activity")
+        if activity is not None and not isinstance(activity, str):
+            raise CollabError(400, "activity must be a string")
+        text = ext.clean_text(activity, ext.MAX_ACTIVITY) if activity else ""
+        with self._lock:
+            a = self._require_external(pr)
+            x = a["external"]
+            room = self._rooms.get(x["room_id"])
+            if room is None or self._effective(pr, room) is None:
+                self._audit_denied(pr, "external.heartbeat", "not_a_member", room_id=x["room_id"],
+                                   project_ids=[x["project_id"]], agent_id=pr.id)
+                raise CollabError(404, "not found")
+            self._throttle("hb:" + pr.id, ext.HEARTBEATS_PER_MINUTE, 60.0, "heartbeat")
+            prev = self._presence.get(pr.id)
+            self._presence[pr.id] = {"status": status, "activity": text, "at": self._now()}
+            if (prev is None or prev["status"] != status) and len(self._log) < self._log_limit("external_status_changed"):
+                # presence stays in memory; a flip is written down only while the log has comfortable room (T16 H2)
+                now = self._now()
+                hits = [t for t in self._hits["extstatus:" + pr.id] if now - t < 600.0]
+                if len(hits) < ext.STATUS_CHANGES_PER_10_MIN:
+                    hits.append(now)
+                    self._hits["extstatus:" + pr.id] = hits
+                    self._commit("external_status_changed", self._actor(
+                        pr, agent_id=pr.id, room_id=x["room_id"], project_id=x["project_id"],
+                        status=status, action="external.status", outcome="allowed",
+                        project_ids=[x["project_id"]], resource_id=pr.id))
+        return {"ok": True, "stale_after_seconds": ext.PRESENCE_STALE}
+
+    def is_external_node(self, node_id: str) -> bool:
+        """Is this lineage node id inside an external agent's namespace? The ingest path reserves those
+        ids for the agent itself (an operator key excepted), so nobody can pre-empt or forge its nodes."""
+        aid = ext.namespace_of(node_id)
+        a = self._agents.get(aid) if aid else None
+        if self.degraded and aid and ids.is_valid_id(aid, "agent") and a is None:
+            # the replay stopped at a gap, so an external agent enrolled after it is unknown here: fail closed
+            # (an agent id this partial state does know keeps its recorded kind; that never changes)
+            return True
+        return bool(a and a.get("external"))
+
+    def _usage_take(self, items: list[tuple]) -> None:
+        """Count one lineage write against each ``(scope, key, cap)`` or refuse the lot. Called with the
+        lock held. A counter is made durable ahead of its value, so what a restart restores is never lower
+        than what was used. All the log rows are written before any counter moves."""
+        for scope, key, cap in items:
+            if self._usage[(scope, key)] >= cap:
+                self.stats["rate_limited"] += 1
+                raise CollabError(429, f"external lineage quota for this {scope} is used up",
+                                  code="external_lineage_quota:" + scope)
+        for scope, key, _ in items:
+            k = (scope, key)
+            if self._usage[k] + 1 > self._usage_reserved[k]:
+                self._commit("external_usage_reserved", {
+                    "actor_user_id": None, "actor_agent_id": None, "scope": scope, "key": key,
+                    "reserved": self._usage[k] + ext.USAGE_RESERVE_STEP})
+        for scope, key, _ in items:
+            self._usage[(scope, key)] += 1
+
+    def _usage_give_back(self, items: list[tuple]) -> None:
+        with self._lock:
+            for scope, key, _ in items:
+                self._usage[(scope, key)] = max(0, self._usage[(scope, key)] - 1)
+
+    def _credential_live(self, aid: str) -> bool:
+        """Is this external agent's credential still good right now? Read without the service lock: it is
+        evaluated inside the ingest ledger lock, and a lock-free read of a status that only ever moves from
+        active to revoked cannot deadlock against it."""
+        a = self._agents.get(aid)
+        return bool(a and a["status"] == "active" and self._now() < a["external"]["hard_expiry"])
+
+    def _refuse_lineage(self, pr: Principal, room_id: str) -> None:
+        with self._lock:
+            x = (self._agents.get(pr.id) or {}).get("external") or {}
+            self._audit_denied(pr, "external.lineage", "forbidden_node", room_id=room_id,
+                               project_ids=[x["project_id"]] if x else [], agent_id=pr.id)
+
+    def external_lineage(self, pr: Principal, body: dict) -> dict:
+        """Lineage an external agent reports about ITSELF. The server builds the envelope: room scope
+        and room id come from the enrollment, the actor from the credential, the source from the agent
+        id; the agent supplies only the event id, sequence and a payload that is re-validated here."""
+        from .graph import validate_lineage
+        unknown = set(body) - ext.LINEAGE_BODY_FIELDS
+        with self._lock:
+            a = self._require_external(pr)
+            x = a["external"]
+            room = self._rooms.get(x["room_id"])
+            if unknown:
+                self._audit_denied(pr, "external.lineage", "forged_identity", room_id=x["room_id"],
+                                   project_ids=[x["project_id"]], agent_id=pr.id)
+                self.stats["forged_identity"] += 1
+                raise CollabError(400, "scope and identity are derived from the enrollment, not the request")
+            if self.lineage_sink is None:
+                raise CollabError(404, "lineage is not accepted by this service")
+            if not x["lineage"]:
+                self._audit_denied(pr, "external.lineage", "forbidden", room_id=x["room_id"],
+                                   project_ids=[x["project_id"]], agent_id=pr.id)
+                raise CollabError(403, "this invite does not allow lineage")
+            if room is None or self._effective(pr, room) is None:
+                raise CollabError(404, "not found")
+            self._throttle("lin:" + pr.id, ext.LINEAGE_PER_MINUTE, 60.0, "lineage")
+            room_id, label, sponsor = x["room_id"], x["label"], x["sponsor"]
+        event_id, seq, etype = body.get("event_id"), body.get("source_sequence"), body.get("event_type")
+        if (not isinstance(event_id, str) or not _KEY_RE.match(event_id)
+                or isinstance(seq, bool) or not isinstance(seq, int) or not 0 <= seq < 2**53):
+            raise CollabError(400, "event_id (1-128 of A-Za-z0-9._:-) and an integer source_sequence are required")
+        payload = body.get("payload")
+        try:
+            op = validate_lineage(etype, payload)
+        except ValueError as exc:
+            raise CollabError(400, str(exc)) from None
+        aid = pr.id
+        attrs_in = payload.get("attrs") if isinstance(payload.get("attrs"), dict) else {}
+        if op["op"] in ("node.upsert", "node.state"):
+            if op["node_type"] not in ext.LINEAGE_NODE_TYPES or not ext.owns_node(aid, op["node_id"]):
+                self._refuse_lineage(pr, room_id)
+                raise CollabError(403, "an external agent may only write its own agent/attempt/session nodes")
+            entity = op["node_id"]
+        else:
+            if (op["edge_type"] not in ext.LINEAGE_EDGE_TYPES or op["from_type"] not in ext.LINEAGE_NODE_TYPES
+                    or op["to_type"] not in ext.LINEAGE_NODE_TYPES
+                    or not (ext.owns_node(aid, op["from_id"]) and ext.owns_node(aid, op["to_id"]))):
+                self._refuse_lineage(pr, room_id)
+                raise CollabError(403, "an external agent may only link its own nodes with spawn edges")
+            entity = op["from_id"]
+        clean_attrs = {}
+        for k, v in attrs_in.items():
+            if len(clean_attrs) >= 16:
+                raise CollabError(400, "too many attrs (16 at most)")
+            if not isinstance(k, str) or not ext.ATTR_KEY.fullmatch(k):
+                raise CollabError(400, "attr names are 1-64 of A-Za-z0-9._-")
+            if k in ext.RESERVED_ATTRS or k.startswith("_"):
+                raise CollabError(400, f"attrs.{k} is not allowed")
+            if isinstance(v, str):
+                v = ext.clean_text(v, 200)
+            elif not (v is None or isinstance(v, (bool, int, float))):
+                raise CollabError(400, f"attrs.{k} must be a short scalar")
+            clean_attrs[k] = v
+        if op["op"] == "edge.add" or op["op"] == "edge.remove":
+            if clean_attrs:
+                raise CollabError(400, "edges from external agents carry no attrs")
+            out_payload = {k: payload[k] for k in ("edge_type", "from_id", "to_id") if k in payload}
+            if op["op"] == "edge.remove":
+                out_payload["reason"] = ext.clean_text(payload.get("reason"), 200) or "removed"
+        elif op["op"] == "node.state":
+            out_payload = {"node_id": op["node_id"], "state": op["state"]}
+            if payload.get("reason") is not None:
+                out_payload["reason"] = ext.clean_text(payload.get("reason"), 200)
+        else:
+            out_payload = {"node_type": op["node_type"], "node_id": op["node_id"],
+                           "attrs": {**clean_attrs, "external": True, "reported_by": label, "invited_by": sponsor}}
+            if payload.get("label") is not None:
+                out_payload["label"] = ext.clean_text(payload.get("label"), 120)
+            if op["state"] is not None:
+                out_payload["state"] = op["state"]
+        envelope = {"schema_version": 2, "event_id": event_id, "source": "ext-" + aid[-12:].lower(),
+                    "source_sequence": seq, "entity_type": "lineage", "entity_id": entity, "event_type": etype,
+                    "payload": out_payload, "visibility_scope": "room", "room_id": room_id}
+        if body.get("occurred_at") is not None:
+            envelope["occurred_at"] = body["occurred_at"]
+        principal = {"kind": "external", "id": "external:" + aid, "authenticated_by": "collab"}
+        items = [("agent", aid, ext.LINEAGE_MAX_EVENTS), ("sponsor", sponsor, ext.LINEAGE_MAX_PER_SPONSOR),
+                 ("room", room_id, ext.LINEAGE_MAX_PER_ROOM)]
+        with self._lock:
+            self._usage_take(items)           # refused here, before the graph sees anything
+        try:
+            res = self.lineage_sink(envelope, principal, lambda: self._credential_live(aid))
+        except PermissionError:
+            self._usage_give_back(items)
+            if not self._credential_live(aid):            # revoked or expired while the request was in flight
+                with self._lock:
+                    self._audit_denied(pr, "external.lineage", "revoked_in_flight", room_id=room_id,
+                                       project_ids=[x["project_id"]], agent_id=aid)
+                raise CollabError(401, "unauthorized") from None
+            self._refuse_lineage(pr, room_id)
+            raise CollabError(403, "not permitted to modify this lineage object") from None
+        except ValueError as exc:
+            self._usage_give_back(items)
+            raise CollabError(400, str(exc)) from None
+        except Exception as exc:
+            self._usage_give_back(items)
+            if type(exc).__name__ == "EnvelopeConflict":
+                raise CollabError(409, str(exc)) from None
+            self.stats["lineage_failures"] += 1
+            raise CollabError(503, "lineage is unavailable") from None
+        dup = bool(((res or {}).get("envelope") or {}).get("duplicate"))
+        if dup:
+            self._usage_give_back(items)      # a replay writes nothing, so it costs nothing
+        return {"accepted": True, "duplicate": dup}
 
     def _file_request(self, owner: str, room_id: str, agent_id: str, actions: list[str]) -> str | None:
         """Ask on a person's behalf (their token was used); None when the room no longer takes it."""
@@ -1954,7 +2534,7 @@ class CollabService:
                            if r and r["open"] and r["room_id"] in self._rooms
                            and self._now() - r["created_epoch"] < REQUEST_TTL]
                 out.append({"agent_id": aid, "name": a["name"], "harness_type": a["harness_type"],
-                            "instance_id": a.get("instance_id"),
+                            "instance_id": a.get("instance_id"), "external": bool(a.get("external")),
                             "status": a["status"], "expires_at": a["expires_at"], "rooms": rooms,
                             "pending": pending})
         return {"agents": out}
@@ -1968,8 +2548,7 @@ class CollabService:
                 room = self._rooms[rid]
                 eff = self._effective(pr, room)
                 if eff and eff[0]:
-                    out.append({"room_id": rid, "name": room["name"], "actions": sorted(eff[0]),
-                                **self._member_fields(rid, pr.owner)})
+                    out.append({"room_id": rid, "name": room["name"], "actions": sorted(eff[0])})
         return {"rooms": out}
 
     def rotate_credential(self, pr: Principal) -> dict:
@@ -1978,13 +2557,18 @@ class CollabService:
         cred = "hca_" + secrets.token_urlsafe(32)
         expires = self._now() + self.credential_ttl
         with self._lock:
+            if (self._agents.get(pr.id) or {}).get("status") != "active":
+                raise CollabError(401, "unauthorized")
+            bound = (self._agents.get(pr.id) or {}).get("external")
+            if bound:                                   # rotation replaces the secret; the life stays the invite's
+                expires = bound["hard_expiry"]
             helper = self._helper_by_agent.get(pr.id)
             if helper is not None:                       # a helper's credential never outlives the helper
                 expires = min(expires, helper["expires_epoch"])
             self._commit("credential_rotated", self._actor(
                 pr, agent_id=pr.id, secret_digest=_digest(cred), expires_at_epoch=expires,
                 action="agent.rotate", outcome="allowed",
-                project_ids=[], resource_id=pr.id))
+                project_ids=[bound["project_id"]] if bound else [], resource_id=pr.id))
         return {"agent_id": pr.id, "credential": cred, "expires_at": expires}
 
     def revoke_agent(self, pr: Principal, agent_id: str) -> dict:
@@ -1993,6 +2577,8 @@ class CollabService:
             agent = self._agents.get(agent_id)
             if not agent or agent["owner"] != pr.id:
                 raise CollabError(404, "not found")
+            if agent["status"] != "active":
+                return {"ok": True}         # already revoked: no second event (a safety event must not be repeatable)
             rooms = [r for r, room in self._rooms.items() if agent_id in room["grants"]]
             self._commit("agent_revoked", self._actor(
                 pr, agent_id=agent_id, room_ids=rooms, action="agent.revoke", outcome="allowed",
@@ -2187,6 +2773,11 @@ class CollabService:
         self._require_operator(pr)
         hp = self._promote_target(room_id, host_port)
         with self._lock:
+            listed = hp in self._profile(room_id)["permanent_hosts"] or any(
+                r["room_id"] == room_id and r["host_port"] == hp and r["state"] == "approved"
+                for r in self._egress.values())
+            if not listed:                     # a safety write commits only when it removes something
+                return {"allowlist": self.egress_allowlist(room_id)}
             self._commit("egress_removed", self._actor(
                 pr, room_id=room_id, host_port=hp, removed_epoch=self._now(), action="egress.remove",
                 outcome="allowed", project_ids=[self._rooms[room_id]["project_id"]], resource_id=room_id))
@@ -2439,11 +3030,16 @@ class CollabService:
 
     def _end_helper(self, actor: dict, r: dict, reason: str, seen: set) -> None:
         if r["status"] in _HELPER_LIVE:
-            self._commit("helper_cancelled", {
-                **actor, "room_id": r["room_id"], "project_id": r["project_id"], "helper_id": r["helper_id"],
-                "role": r["role"], "model": r["model"], "status": "cancelled", "reason": reason,
-                "finished_epoch": self._now(), "action": "helper.cancel", "outcome": "allowed",
-                "project_ids": [r["project_id"]], "resource_id": r["helper_id"]})
+            try:
+                self._commit("helper_cancelled", {
+                    **actor, "room_id": r["room_id"], "project_id": r["project_id"], "helper_id": r["helper_id"],
+                    "role": r["role"], "model": r["model"], "status": "cancelled", "reason": reason,
+                    "finished_epoch": self._now(), "action": "helper.cancel", "outcome": "allowed",
+                    "project_ids": [r["project_id"]], "resource_id": r["helper_id"]})
+            except CollabError as exc:
+                if exc.status != 503 or not r["helper_agent_id"]:
+                    raise
+                # the bookkeeping row did not fit: the revocation below (a safety event) is what stops the helper
         if r["helper_agent_id"]:
             self._end_agent(actor, r["helper_agent_id"], reason, seen)
 
@@ -2690,9 +3286,10 @@ class CollabService:
         if not isinstance(paused, bool):
             raise CollabError(400, "paused must be true or false")
         with self._lock:
-            self._commit("helpers_paused", self._actor(
-                pr, paused=paused, action="helpers.pause" if paused else "helpers.resume", outcome="allowed",
-                project_ids=[], resource_id=None))
+            if paused != self._helpers_paused:      # a repeated press commits nothing (it still ends live helpers)
+                self._commit("helpers_paused", self._actor(
+                    pr, paused=paused, action="helpers.pause" if paused else "helpers.resume", outcome="allowed",
+                    project_ids=[], resource_id=None))
             if paused:
                 seen: set = set()
                 for r in [r for r in self._helpers.values() if r["status"] in _HELPER_LIVE]:
@@ -2710,11 +3307,12 @@ class CollabService:
             agent = self._agents.get(body.get("agent_id")) if isinstance(body.get("agent_id"), str) else None
             if not agent or agent["owner"] != pr.id or agent["status"] != "active":
                 raise CollabError(404, "not found")
+            if agent.get("external"):
+                raise CollabError(403, "an external agent holds only the grant of its invite")
             self._helper_room_only(body["agent_id"], room_id)
             aid = body["agent_id"]
             actions = _actions(body.get("actions"))
             m = self._member(room, pr.id)
-            self._expire_agent_grant(room_id, aid)
             existing = room["grants"].get(aid)
             self._name_free(room, aid, agent["name"])
             narrowing = bool(existing) and set(actions) <= set(existing["actions"])
@@ -2788,6 +3386,8 @@ class CollabService:
             if decision == "approve":
                 if not agent or agent["status"] != "active" or not self._member(room, agent["owner"]):
                     raise CollabError(404, "not found")
+                if agent.get("external"):
+                    raise CollabError(403, "an external agent holds only the grant of its invite")
                 self._helper_room_only(r["agent_id"], room_id)
                 actions = _actions(body["actions"]) if "actions" in body else list(r["actions"])
                 self._name_free(room, r["agent_id"], agent["name"])
@@ -2836,6 +3436,7 @@ class CollabService:
         deadline = time.monotonic() + wait
         with self._cv:
             self._authorize(pr, room_id, "read", "room.state")
+            self._no_external(pr)
             if self._state_waiters[pr.key] >= self.MAX_STATE_WAITERS:
                 raise CollabError(429, "too many open room views")
             self._state_waiters[pr.key] += 1
@@ -2846,6 +3447,9 @@ class CollabService:
                     if not self.still_valid(pr):
                         raise CollabError(401, "unauthorized")
                     cur = self._room_seq.get(room_id, 0)
+                    m_now = None if pr.is_agent else self._member(self._rooms[room_id], pr.id)
+                    if m_now and m_now["role"] != "guest":
+                        cur = max(cur, self._room_link_seq.get(room_id, 0))
                     left = deadline - time.monotonic()
                     if since < 0 or cur != since or left <= 0:
                         break
@@ -2854,11 +3458,15 @@ class CollabService:
                     return {"seq": cur, "changed": False}
             m = self._member(self._rooms[room_id], pr.id) if not pr.is_agent else None
             guest = bool(m and m["role"] == "guest")
-            out: dict[str, Any] = {"seq": cur, "changed": True, **self._member_fields(room_id, pr.owner),
-                                   **self.read_events(pr, room_id, cursor, 200)}
+            out: dict[str, Any] = {"seq": cur, "changed": True, **self.read_events(pr, room_id, cursor, 200)}
             out["agents"] = [] if guest else self.list_room_agents(pr, room_id)["agents"]
             out["tasks"] = self.list_tasks(pr, room_id)["tasks"]
             out["flow"] = None if guest else self.room_flow(pr, room_id)
+            with self._lock:                      # quiet reads: people only, never guests or agents
+                visible = not pr.is_agent and not guest
+                room_now = self._rooms[room_id]
+                out["links"] = self._links_visible(pr, room_now) if visible else None
+                out["missions"] = self._missions_visible(pr, room_now) if visible else None
             with self._lock:                      # ask quietly: a denied call would log an event and wake every waiter
                 eff = self._effective(pr, self._rooms[room_id])
                 may_review = not pr.is_agent and bool(eff and "invite" in eff[0])
@@ -2901,6 +3509,7 @@ class CollabService:
         agent's own owner; everyone else just sees names, families and permissions."""
         with self._lock:
             room, first = self._authorize(pr, room_id, "read", "task.flow")
+            self._no_external(pr)
             if not pr.is_agent and (self._member(room, pr.id) or {}).get("role") == "guest":
                 raise CollabError(403, "forbidden")
             self._housekeeping()
@@ -2916,6 +3525,7 @@ class CollabService:
                         "family": a.get("harness_type"), "owner_user_id": a.get("owner"),
                         "owner_email": self._user_email.get(a.get("owner")),
                         "actions": list(g["actions"]) if g else [],
+                        "external": bool(a.get("external")),
                         "status": "active" if g and a.get("status") == "active" else "removed",
                         "instance_id": a.get("instance_id") if a.get("owner") == pr.id else None,
                         "parent_agent_id": a.get("parent") if a.get("parent") in room["grants"] else None,
@@ -3002,6 +3612,8 @@ class CollabService:
             agent = self._agents.get(agent_id)
             if not agent or agent["owner"] != pr.id or agent["status"] != "active":
                 raise CollabError(404, "not found")
+            if agent.get("external"):
+                raise CollabError(403, "an external agent is not tied to a pane or session")
             self._throttle("link:" + pr.id, 120, 600.0, "agent link")
             self._commit("agent_linked", self._actor(
                 pr, agent_id=agent_id, instance_id=inst, action="agent.link", outcome="allowed",
@@ -3012,6 +3624,7 @@ class CollabService:
         """Capability summaries only: no device ids, hostnames, paths or instance ids."""
         with self._lock:
             room, _ = self._authorize(pr, room_id, "read", "agent.list")
+            self._no_external(pr)
             self._housekeeping()
             # A roster (who owns which agent): never for guests, like the member list.
             if not pr.is_agent and (self._member(room, pr.id) or {}).get("role") == "guest":
@@ -3022,14 +3635,545 @@ class CollabService:
                 if a and a["status"] == "active":
                     out.append({"agent_id": aid, "name": a["name"], "harness_type": a["harness_type"],
                                 "owner_user_id": a["owner"], "actions": g["actions"],
-                                "agent_permission_status": self._agent_permissions.get(
-                                    (room_id, aid, pr.owner), {}).get("status",
-                                        "approved" if a["owner"] == pr.owner else "none")})
+                                "external": bool(a.get("external"))})
         return {"agents": out}
+
+    # -- room <-> workspace and mission links
+    # Room access NEVER implies workspace access. A link only says which metadata scopes room members
+    # may see; the terminal needs its own explicit grant on the link, and the effective permission is
+    # the intersection of user/agent role, room grant, link grant, the named terminal principals and a
+    # proof that the linker controls the host. HOST REGISTRY: the operator maps host -> owning users
+    # (register_host). A link may carry `terminal` and/or `is_primary` only with such a proof (the
+    # linker is a registered owner of the host, or is the operator and the host is registered); with no
+    # registry entry both are refused. The proof (registry generation) is recorded in the link event
+    # and rechecked on every use: unregistering or re-registering the host, or removing the user from
+    # its owners, ends it. Metadata-only links need no proof and are reported `host_verified: false`.
+    def register_host(self, pr: Principal, host: str, body: dict) -> dict:
+        """Operator only. owners = users who control this host's workspaces; an empty list unregisters it."""
+        self._require_user(pr)
+        if not pr.admin:
+            self.stats["policy_denied"] += 1
+            raise CollabError(403, "forbidden")
+        host = self._require_host(host)
+        owners = body.get("owners")
+        if (not isinstance(owners, list) or len(owners) > 20 or not all(isinstance(u, str) for u in owners)):
+            raise CollabError(400, "owners must be a list of at most 20 user ids")
+        owners = sorted(set(owners))
+        with self._lock:
+            self._throttle("hostreg:" + pr.id, 60, 3600.0, "host registry")
+            if not owners:
+                if host not in self._hosts:
+                    raise CollabError(404, "not found")
+                self._commit("host_unregistered", self._actor(
+                    pr, host=host, action="host.unregister", outcome="allowed", project_ids=[], resource_id=host))
+                return {"host": host, "owners": []}
+            if not all(self._ok(u) for u in owners):
+                raise CollabError(404, "unknown user")
+            if len(self._hosts) >= 200 and host not in self._hosts:
+                raise CollabError(429, "too many hosts")
+            self._commit("host_registered", self._actor(
+                pr, host=host, owners=owners, action="host.register", outcome="allowed",
+                project_ids=[], resource_id=host))
+        return {"host": host, "owners": owners}
+
+    def list_host_registry(self, pr: Principal) -> dict:
+        self._require_user(pr)
+        if not pr.admin:
+            raise CollabError(403, "forbidden")
+        with self._lock:
+            return {"hosts": [{"host": h, "owners": list(e["owners"])} for h, e in sorted(self._hosts.items())]}
+
+    def _proof_for(self, pr: Principal, host: str) -> dict | None:
+        entry = self._hosts.get(host)
+        if entry is None or pr.is_agent:
+            return None
+        if pr.admin:
+            return {"user": pr.id, "via": "operator", "gen": entry["gen"]}
+        if pr.id in entry["owners"]:
+            return {"user": pr.id, "via": "owner", "gen": entry["gen"]}
+        return None
+
+    def _proof_ok(self, lk: dict) -> bool:
+        proof, entry = lk.get("host_proof"), self._hosts.get(lk["host"])
+        return bool(proof and entry and proof["gen"] == entry["gen"]
+                    and (proof["via"] == "operator" or proof["user"] in entry["owners"]))
+
+    def _is_link_manager(self, pr: Principal, room: dict) -> bool:
+        m = self._member(room, pr.id) if not pr.is_agent else None
+        return bool(m and m["role"] == "owner")
+
+    def _terminal_ok(self, pr: Principal, room: dict, link: dict) -> bool:
+        """Pure check (no audit): may this principal open the linked workspace's terminal?"""
+        if "terminal" not in link["grants"] or not self._proof_ok(link):
+            return False
+        prover = self._member(room, link["host_proof"]["user"])
+        if not prover or prover["role"] != "owner" or not self._ok(link["host_proof"]["user"]):
+            return False                      # whoever vouched for the host must still own the room
+        eff = self._effective(pr, room)
+        if eff is None or "read" not in eff[0]:
+            return False
+        named = set(link["terminal_principals"])
+        if pr.key not in named:
+            return False
+        if pr.is_agent:
+            agent = self._agents.get(pr.id)
+            m = self._member(room, agent["owner"]) if agent else None
+            return bool(m and m["role"] in TERMINAL_ROLES and "execute" in eff[0]
+                        and f"user:{agent['owner']}" in named)
+        m = self._member(room, pr.id)
+        return bool(m and m["role"] in TERMINAL_ROLES)
+
+    TERMINAL_AUDIT_EVERY = 600.0
+
+    def authorize_workspace(self, pr: Principal, room_id: str, link_id: str, action: str) -> dict:
+        """The one place that answers 'may this principal do `action` on the workspace linked to this room?'
+        action is status, tabs, panes or terminal. Fails closed: a principal who cannot manage links gets one
+        audited 403 for anything not explicitly granted (an unknown link and another room's link look the same);
+        only a link manager is told 404 for an unknown link. Every denial is audited. Allowed terminal use is audited too, at most once
+        per principal and link per TERMINAL_AUDIT_EVERY seconds, and at once after any denial or change."""
+        with self._lock:
+            room, _ = self._authorize(pr, room_id, "read", "workspace.access")
+            if action not in LINK_GRANTS:
+                raise CollabError(400, "unknown workspace action")      # before the lookup: says nothing about the link
+            link = self._links.get(link_id)
+            if link is None or link["room_id"] != room_id:
+                if not self._is_link_manager(pr, room):
+                    # T16 gap D: a caller who cannot manage links gets the SAME answer for an id that does not
+                    # exist as for one that exists but grants them nothing (no existence oracle); both audited.
+                    self._audit_denied(pr, f"workspace.{action}", "no_workspace_grant", room_id=room_id,
+                                       resource_id=str(link_id)[:64], project_ids=[room["project_id"]])
+                    self.stats["policy_denied"] += 1
+                    raise CollabError(403, "forbidden")
+                raise CollabError(404, "not found")                     # an owner lists every link anyway
+            gate = (pr.key, link_id)
+            if action == "terminal":
+                ok = self._terminal_ok(pr, room, link)
+            elif pr.is_agent or (self._member(room, pr.id) or {}).get("role") == "guest":
+                ok = False                                  # same audience as the links in room_state: people, not guests
+            else:
+                ok = action in link["grants"]
+            if not ok:
+                if action == "terminal":
+                    self._term_gate.pop(gate, None)         # only a terminal denial re-arms the allow audit
+                self._audit_denied(pr, f"workspace.{action}", "no_workspace_grant", room_id=room_id,
+                                   resource_id=link_id, project_ids=[room["project_id"]])
+                self.stats["policy_denied"] += 1
+                raise CollabError(403, "forbidden")
+            if action == "terminal":
+                eff = self._effective(pr, room)
+                fp = (tuple(sorted(eff[0])), tuple(link["grants"]), tuple(link["terminal_principals"]),
+                      link["host_proof"]["gen"])
+                last = self._term_gate.get(gate)
+                now = self._now()
+                if last is None or last[1] != fp or now - last[0] >= self.TERMINAL_AUDIT_EVERY:
+                    self._commit("workspace_terminal_authorized", self._actor(
+                        pr, project_id=room["project_id"], room_id=room_id, link_id=link_id,
+                        action="workspace.terminal", outcome="allowed", project_ids=[room["project_id"]],
+                        resource_id=link_id))                  # a log failure raises 503: no audit, no terminal
+                    if len(self._term_gate) > 10_000:
+                        self._term_gate.clear()
+                    self._term_gate[gate] = (now, fp)
+            return {"allowed": True, "link_id": link_id, "workspace_id": link["workspace_id"],
+                    "host": link["host"], "action": action}
+
+    def _link_view(self, pr: Principal, room: dict, lk: dict, manager: bool) -> dict:
+        out = {"link_id": lk["link_id"], "room_id": lk["room_id"], "workspace_id": lk["workspace_id"],
+               "host": lk["host"], "is_primary": lk["is_primary"], "grants": list(lk["grants"]),
+               "linked_by": lk["linked_by"], "created_at": lk["created_at"],
+               "host_verified": self._proof_ok(lk), "can_terminal": self._terminal_ok(pr, room, lk)}
+        if manager:
+            out["terminal_principals"] = list(lk["terminal_principals"])
+        return out
+
+    def _links_visible(self, pr: Principal, room: dict) -> list[dict]:
+        """Links this person may see: owners see all; others only links that grant them something."""
+        manager = self._is_link_manager(pr, room)
+        return [self._link_view(pr, room, lk, manager)
+                for lid in self._links_by_room.get(room["id"], ())
+                if (lk := self._links[lid]) and (manager or lk["grants"])]
+
+    def _missions_visible(self, pr: Principal, room: dict) -> list[dict]:
+        manager = self._is_link_manager(pr, room)
+        out = []
+        for (rid, mid), ms in self._missions.items():
+            if rid != room["id"]:
+                continue
+            if manager or pr.id in ms["members"]:
+                out.append({"mission_id": mid, "room_id": rid, "linked_by": ms["linked_by"],
+                            "created_at": ms["created_at"],
+                            **({"members": list(ms["members"])} if manager else {})})
+        return out
+
+    def _no_guest(self, pr: Principal, room: dict) -> None:
+        if (self._member(room, pr.id) or {}).get("role") == "guest":
+            raise CollabError(403, "forbidden")
+
+    def _link_budget(self, pr: Principal, room_id: str) -> None:
+        """Every mutating link/mission call spends from a per-person and a per-room budget, so one owner
+        cannot fill the shared log."""
+        self._throttle("wslink:" + pr.id, 120, 600.0, "workspace link")
+        self._throttle("wsroom:" + room_id, 300, 3600.0, "workspace link changes for this room")
+
+    def list_workspace_links(self, pr: Principal, room_id: str) -> dict:
+        self._require_user(pr)
+        with self._lock:
+            room, _ = self._authorize(pr, room_id, "read", "workspace.list")
+            self._no_guest(pr, room)
+            return {"links": self._links_visible(pr, room)}
+
+    def _grants_body(self, pr: Principal, room: dict, body: dict) -> tuple[list, list]:
+        grants = body.get("grants", list(DEFAULT_LINK_GRANTS))
+        if (not isinstance(grants, list) or len(grants) > len(LINK_GRANTS)
+                or not all(isinstance(g, str) and g in LINK_GRANTS for g in grants)):
+            raise CollabError(400, "grants must be a subset of status, tabs, panes, terminal")
+        grants = sorted(set(grants))
+        tp = body.get("terminal_principals", [])
+        if (not isinstance(tp, list) or len(tp) > MAX_TERMINAL_PRINCIPALS
+                or not all(isinstance(x, str) and _KEY_RE.fullmatch(x) for x in tp)):
+            raise CollabError(400, "invalid terminal_principals")
+        tp = sorted(set(tp))
+        if ("terminal" in grants) != bool(tp):
+            raise CollabError(400, "terminal needs named terminal_principals, and they need the terminal grant")
+        for key in tp:
+            kind, _, ident = key.partition(":")
+            if kind == "user":
+                m = self._member(room, ident)
+                if not m or m["role"] not in TERMINAL_ROLES:
+                    raise CollabError(400, "terminal principals must be owners or contributors of the room")
+            elif kind == "agent":
+                if ident not in room["grants"] or self._agents.get(ident, {}).get("external"):
+                    raise CollabError(400, "terminal agents must hold a grant in the room, and an external agent never does")
+            else:
+                raise CollabError(400, "invalid terminal_principals")
+        return grants, tp
+
+    PRIMARY_UNAVAILABLE = "primary is not available for this workspace"
+
+    def _claim_primary(self, pr: Principal, host: str, ws: str, own_link_id: str, demote_other: bool):
+        """Decide (no commit) whether `pr` may make (host, ws) primary for this link. Returns the proof and
+        the link to demote in the SAME event, or raises one generic 409 that is identical whether the slot is
+        taken, the host unregistered or the caller not its owner."""
+        proof = self._proof_for(pr, host)
+        if proof is None:
+            raise CollabError(409, self.PRIMARY_UNAVAILABLE)
+        cur_id = self._primary.get((host, ws))
+        if cur_id is None or cur_id == own_link_id:
+            return proof, None
+        orm = self._rooms[self._links[cur_id]["room_id"]]
+        if not demote_other or not (pr.admin or self._is_link_manager(pr, orm)):
+            raise CollabError(409, self.PRIMARY_UNAVAILABLE)
+        return proof, (cur_id, orm)
+
+    def link_workspace(self, pr: Principal, room_id: str, body: dict) -> dict:
+        self._require_user(pr)
+        with self._lock:
+            room, _ = self._authorize(pr, room_id, "invite", "workspace.link")
+            host, ws = body.get("host"), body.get("workspace_id")
+            if not isinstance(host, str) or not _FLEET_HOST.fullmatch(host):
+                raise CollabError(400, "invalid host")
+            if not isinstance(ws, str) or not _KEY_RE.fullmatch(ws):
+                raise CollabError(400, "invalid workspace_id")
+            primary = body.get("is_primary", False)
+            if not isinstance(primary, bool) or not isinstance(body.get("demote_other", False), bool):
+                raise CollabError(400, "is_primary and demote_other must be booleans")
+            grants, tp = self._grants_body(pr, room, body)
+            ids_here = self._links_by_room.get(room_id, ())
+            if any(self._links[i]["host"] == host and self._links[i]["workspace_id"] == ws for i in ids_here):
+                raise CollabError(409, "this workspace is already linked to the room")
+            if len(ids_here) >= MAX_LINKS_PER_ROOM:
+                raise CollabError(429, "workspace link limit reached for this room")
+            self._link_budget(pr, room_id)
+            proof, demote = self._proof_for(pr, host), None
+            if "terminal" in grants and proof is None:
+                raise CollabError(403, "a terminal grant needs a host registered to you")
+            if primary:
+                proof, demote = self._claim_primary(pr, host, ws, "", body.get("demote_other", False))
+            lid = ids.new_id("grant")
+            extra = self._demote_fields(demote)
+            self._commit("workspace_linked", self._actor(
+                pr, project_id=room["project_id"], room_id=room_id, link_id=lid, workspace_id=ws, host=host,
+                is_primary=primary, grants=grants, terminal_principals=tp, host_proof=proof,
+                action="workspace.link", outcome="allowed", resource_id=lid,
+                **extra, project_ids=[room["project_id"], *([extra["demoted_project_id"]] if extra else [])]))
+            return self._link_view(pr, room, self._links[lid], True)
+
+    @staticmethod
+    def _demote_fields(demote) -> dict:
+        if not demote:
+            return {}
+        cur_id, orm = demote
+        return {"demoted_link_id": cur_id, "room_ids": [orm["id"]], "demoted_project_id": orm["project_id"]}
+
+    def _own_link(self, pr: Principal, room_id: str, link_id: str, audit_action: str) -> tuple[dict, dict]:
+        room, _ = self._authorize(pr, room_id, "invite", audit_action)
+        lk = self._links.get(link_id)
+        if lk is None or lk["room_id"] != room_id:
+            raise CollabError(404, "not found")
+        return room, lk
+
+    def unlink_workspace(self, pr: Principal, room_id: str, link_id: str) -> dict:
+        self._require_user(pr)
+        with self._lock:
+            room, lk = self._own_link(pr, room_id, link_id, "workspace.unlink")
+            self._link_budget(pr, room_id)
+            self._commit("workspace_unlinked", self._actor(
+                pr, project_id=room["project_id"], room_id=room_id, link_id=link_id, action="workspace.unlink",
+                outcome="allowed", project_ids=[room["project_id"]], resource_id=link_id))
+        self._xlink_sweep(room_id)          # T14: a cross-workspace link that leaned on this workspace lapses now
+        return {"ok": True}
+
+    def set_workspace_primary(self, pr: Principal, room_id: str, link_id: str, body: dict) -> dict:
+        self._require_user(pr)
+        primary, demote_other = body.get("primary", True), body.get("demote_other", False)
+        if not isinstance(primary, bool) or not isinstance(demote_other, bool):
+            raise CollabError(400, "primary and demote_other must be booleans")
+        with self._lock:
+            room, lk = self._own_link(pr, room_id, link_id, "workspace.primary")
+            if primary and not lk["is_primary"]:
+                self._link_budget(pr, room_id)
+                proof, demote = self._claim_primary(pr, lk["host"], lk["workspace_id"], link_id, demote_other)
+                extra = self._demote_fields(demote)
+                self._commit("workspace_primary_set", self._actor(
+                    pr, project_id=room["project_id"], room_id=room_id, link_id=link_id, host_proof=proof,
+                    action="workspace.primary", outcome="allowed", resource_id=link_id,
+                    **extra, project_ids=[room["project_id"], *([extra["demoted_project_id"]] if extra else [])]))
+            elif not primary and lk["is_primary"]:
+                self._link_budget(pr, room_id)
+                self._commit("workspace_primary_cleared", self._actor(
+                    pr, project_id=room["project_id"], room_id=room_id, link_id=link_id,
+                    action="workspace.demote", outcome="allowed", reason="demoted_by_owner",
+                    project_ids=[room["project_id"]], resource_id=link_id))
+            return self._link_view(pr, room, self._links[link_id], True)
+
+    def set_workspace_grants(self, pr: Principal, room_id: str, link_id: str, body: dict) -> dict:
+        self._require_user(pr)
+        with self._lock:
+            room, lk = self._own_link(pr, room_id, link_id, "workspace.grants")
+            grants, tp = self._grants_body(pr, room, body)
+            self._link_budget(pr, room_id)
+            extra = {}
+            if "terminal" in grants:
+                proof = self._proof_for(pr, lk["host"])
+                if proof is None:
+                    raise CollabError(403, "a terminal grant needs a host registered to you")
+                extra["host_proof"] = proof
+            self._commit("workspace_link_updated", self._actor(
+                pr, project_id=room["project_id"], room_id=room_id, link_id=link_id, grants=grants,
+                terminal_principals=tp, old_grants=list(lk["grants"]), action="workspace.grants",
+                outcome="allowed", project_ids=[room["project_id"]], resource_id=link_id, **extra))
+            out = self._link_view(pr, room, self._links[link_id], True)
+        self._xlink_sweep(room_id)
+        return out
+
+    def graph_access(self, pr: Principal) -> dict | None:
+        """Snapshot of what ``pr`` may read in the lineage graph, taken NOW under the service lock
+        (so a removal, mission unlink or link-grant change is effective on the next request).
+        A person who is a non-guest member of a room sees `room`-scoped lineage that names it; a
+        mission member sees `mission`-scoped lineage that names the mission; an event that also
+        names a workspace additionally needs a link granting status/tabs/panes from that room.
+        Guests, agents and people with no non-guest membership get ``None`` (no graph at all):
+        room access never implies more than the metadata the room's links grant."""
+        if pr.kind != "user":
+            return None
+        with self._lock:
+            if not self._ok(pr.id):
+                return None
+            rooms, room_ws = set(), set()
+            for rid, room in self._rooms.items():
+                m = self._member(room, pr.id)
+                if not m or m["role"] == "guest":
+                    continue
+                rooms.add(rid)
+                for lid in self._links_by_room.get(rid, ()):
+                    lk = self._links[lid]
+                    if set(lk["grants"]) & LINK_VIEW_GRANTS:
+                        room_ws.add((rid, lk["workspace_id"]))
+            if not rooms:
+                return None
+            # a mission is readable only through the room that linked it, by the people that link lists
+            room_missions = {(rid, mid) for (rid, mid), ms in self._missions.items()
+                             if rid in rooms and pr.id in ms["members"]}
+            return {"rooms": frozenset(rooms), "room_ws": frozenset(room_ws),
+                    "room_missions": frozenset(room_missions)}
+
+    def graph_read(self, pr: Principal, parts: list[str], query: dict) -> dict:
+        """Lineage graph read for a signed-in person. Hidden, missing and 'no graph for you' all
+        answer one 404; nothing here lets a read widen what the graph's own checks allow."""
+        graph = self.graph_source() if self.graph_source is not None else None
+        access = self.graph_access(pr) if graph is not None else None
+        if access is None:
+            raise CollabError(404, "not found")
+        principal = {"kind": "member", "id": f"user:{pr.id}", "authenticated_by": "collab", "access": access}
+        room_id = query.get("room_id")
+        self.maintain()                         # T14: retry what the graph was not told about links
+        if room_id in access["rooms"]:
+            self._xlink_sweep(room_id)          # a lapsed link is tombstoned now, not at someone's next list
+        try:
+            out = self._graph_read(pr, graph, access, principal, parts, query, room_id)
+            if parts[:1] != ["lineage"]:                # the lineage views strip by their own replay
+                out = graph.strip_before(out, self._join_times(pr, access))
+            return self.xlink_filter(out)
+        except KeyError:
+            raise CollabError(404, "not found") from None
+
+    def _join_times(self, pr: Principal, access: dict) -> dict | None:
+        """T16 M2: the reader's join time in EVERY room they read through (``None`` = history is not restricted).
+        The graph decides per event which room scopes it; the caller-named ``room_id`` plays no part. A missing
+        join time means history starts now (fail closed)."""
+        if self.replay_history != "since_join":
+            return None
+        out = {}
+        with self._lock:
+            for rid in access["rooms"]:
+                joined = ((self._rooms.get(rid) or {}).get("members", {}).get(pr.id) or {}).get("joined_at")
+                try:
+                    out[rid] = datetime.fromisoformat(joined).timestamp()
+                except (TypeError, ValueError):
+                    out[rid] = self._now()
+        return out
+
+    def _graph_read(self, pr, graph, access, principal, parts, query, room_id):
+        from .graph import read_graph
+        contexts = None
+        if parts[:1] == ["lineage"]:
+            return self._lineage_read(pr, graph, access, parts[1:], query)
+        if parts == ["nodes"]:
+            # a listing is always ONE room's view (its own scope plus the missions it linked that this person
+            # belongs to), so its cost never depends on other rooms' data
+            if room_id is None:
+                raise CollabError(400, "room_id is required")
+            if room_id not in access["rooms"]:
+                raise CollabError(404, "not found")
+            contexts = frozenset({("room", room_id, None), *(("mission", m, r) for r, m in access["room_missions"]
+                                                             if r == room_id)})
+        try:
+            return read_graph(graph, principal, parts, lambda name: query.get(name), contexts=contexts)
+        except KeyError:
+            raise CollabError(404, "not found") from None
+        except ValueError as exc:
+            raise CollabError(400, str(exc)) from None
+
+    def _lineage_read(self, pr: Principal, graph, access: dict, parts: list[str], query: dict) -> dict:
+        """T09 read-only lineage views of ONE room: ``lineage`` (graph, optionally as of a replay position),
+        ``lineage/timeline`` (Gantt data) and ``lineage/events`` (the reader's visible ledger). They sit behind
+        the same access snapshot, the same fail-closed 404 and the same per-room context as the node listing;
+        a replay is filtered by the reader's membership AT THIS REQUEST, never the membership of the past."""
+        from .graph import EDGE_TYPES, NODE_TYPES
+        room_id = query.get("room_id")
+        if room_id is None:
+            raise CollabError(400, "room_id is required")
+        if room_id not in access["rooms"]:
+            raise CollabError(404, "not found")
+        contexts = frozenset({("room", room_id, None), *(("mission", m, r) for r, m in access["room_missions"]
+                                                         if r == room_id)})
+        principal = {"kind": "member", "id": f"user:{pr.id}", "authenticated_by": "collab", "access": access}
+        since = None
+        if self.replay_history == "since_join":
+            with self._lock:
+                joined = ((self._rooms.get(room_id) or {}).get("members", {}).get(pr.id) or {}).get("joined_at")
+            try:
+                since = datetime.fromisoformat(joined).timestamp()
+            except (TypeError, ValueError):
+                since = self._now()        # no recorded join time: fail closed, history starts now
+
+        def num(name, default):
+            raw = query.get(name)
+            if raw in (None, ""):
+                return default
+            if not re.fullmatch(r"[0-9]{1,9}", str(raw)):          # ASCII digits only, bounded
+                raise CollabError(400, f"{name} must be a non-negative integer")
+            return int(raw)
+
+        def token(name):
+            raw = query.get(name)
+            if raw in (None, ""):
+                return None
+            if not re.fullmatch(r"[0-9a-f]{32}", str(raw)):
+                raise CollabError(400, f"{name} is not a valid page token")
+            return str(raw)
+
+        def kinds(name, allowed):
+            raw = query.get(name)
+            if not raw:
+                return None
+            got = {x for x in str(raw).split(",") if x}
+            if not got or not got <= allowed:
+                raise CollabError(400, f"unknown {name}")
+            return got
+        def wanted_edges():
+            got = kinds("edge_types", EDGE_TYPES)
+            if not self._ctx_on(self.ctx_cfg(), "cross_links"):      # T14: switched off = no link in any lineage view
+                got = (set(EDGE_TYPES) if got is None else got) - {"cross_link"}
+            return got
+        step = num("step", None)
+        at = query.get("at") or None
+        with self._lock:                # a replay rebuilds the past: bound how often one person can ask
+            self._throttle(f"lineage:{pr.id}", 240, 60.0, "lineage")
+        try:
+            if parts == []:
+                return graph.room_lineage(principal, contexts, step=step, at=at, since=since,
+                                          node_types=kinds("node_types", NODE_TYPES),
+                                          edge_types=wanted_edges(),
+                                          limit=num("limit", 200), offset=num("offset", 0))
+            if parts == ["timeline"]:
+                return graph.room_timeline(principal, contexts, step=step, at=at, since=since)
+            if parts == ["events"]:
+                return graph.room_ledger(principal, contexts, cursor=token("cursor"), limit=num("limit", 200),
+                                         since=since)
+        except ValueError as exc:
+            raise CollabError(400, str(exc)) from None
+        raise CollabError(404, "not found")
+
+    def list_room_missions(self, pr: Principal, room_id: str) -> dict:
+        self._require_user(pr)
+        with self._lock:
+            room, _ = self._authorize(pr, room_id, "read", "mission.list")
+            self._no_guest(pr, room)
+            return {"missions": self._missions_visible(pr, room)}
+
+    def link_mission(self, pr: Principal, room_id: str, body: dict) -> dict:
+        """Tie a room to a mission id (an opaque string from Pi). Only the listed room members see the link."""
+        self._require_user(pr)
+        with self._lock:
+            room, _ = self._authorize(pr, room_id, "invite", "mission.link")
+            mid, members = body.get("mission_id"), body.get("members", [])
+            if not isinstance(mid, str) or not _KEY_RE.fullmatch(mid):
+                raise CollabError(400, "invalid mission_id")
+            if (not isinstance(members, list) or len(members) > self.max_members_per_room
+                    or not all(isinstance(u, str) for u in members)):
+                raise CollabError(400, "members must be a list of user ids")
+            for u in members:
+                m = self._member(room, u)
+                if not m or m["role"] == "guest":
+                    raise CollabError(400, "mission members must be non-guest members of the room")
+            if (room_id, mid) in self._missions:
+                raise CollabError(409, "this mission is already linked to the room")
+            if sum(1 for r, _ in self._missions if r == room_id) >= MAX_MISSIONS_PER_ROOM:
+                raise CollabError(429, "mission link limit reached for this room")
+            self._link_budget(pr, room_id)
+            self._commit("mission_linked", self._actor(
+                pr, project_id=room["project_id"], room_id=room_id, mission_id=mid, members=sorted(set(members)),
+                action="mission.link", outcome="allowed", project_ids=[room["project_id"]], resource_id=mid))
+            return {"mission_id": mid, "room_id": room_id, "members": sorted(set(members))}
+
+    def unlink_mission(self, pr: Principal, room_id: str, mission_id: str) -> dict:
+        self._require_user(pr)
+        with self._lock:
+            room, _ = self._authorize(pr, room_id, "invite", "mission.unlink")
+            if (room_id, mission_id) not in self._missions:
+                raise CollabError(404, "not found")
+            self._link_budget(pr, room_id)
+            self._commit("mission_unlinked", self._actor(
+                pr, project_id=room["project_id"], room_id=room_id, mission_id=mission_id,
+                action="mission.unlink", outcome="allowed", project_ids=[room["project_id"]],
+                resource_id=mission_id))
+        return {"ok": True}
 
     # -- tasks (work for agents)
     def _task_status(self, t: dict) -> str:
-        if t["status"] in ("pending", "accepted") and self._now() - t["created_epoch"] >= TASK_TTL:
+        if t["status"] in ("pending", "accepted") and (
+                self._now() >= t["bounds"]["expires_at"] if "bounds" in t
+                else self._now() - t["created_epoch"] >= TASK_TTL):
             return "expired"
         return t["status"]
 
@@ -3120,19 +4264,11 @@ class CollabService:
             raise CollabError(400, "expires_at is too far away")
         return exp
 
-    def _expire_agent_grant(self, room_id: str, agent_id: str) -> None:
-        """Under the service lock, durably revoke lapsed access before it can be renewed."""
-        room = self._rooms[room_id]
-        grant = room["grants"].get(agent_id)
-        if grant and grant["expires_at"] is not None and self._now() >= grant["expires_at"]:
-            self._commit("agent_grant_expired", {
-                "actor_user_id": None, "actor_agent_id": None, "room_id": room_id, "agent_id": agent_id,
-                "project_ids": [room["project_id"]], "action": "agent.grant.expire",
-                "outcome": "allowed", "resource_id": agent_id})
-
     def _housekeeping(self) -> None:
         """Prune, and write down grants that lapsed (they were already refused; this keeps the
-        roster and audit honest). Rate-limited: callers are hot paths."""
+        roster and audit honest). Rate-limited: callers are hot paths. Nothing while degraded (partial state)."""
+        if self.degraded:
+            return
         now = self._now()
         if now - self._housekept < 30.0:
             return
@@ -3143,7 +4279,10 @@ class CollabService:
             for aid, g in list(room["grants"].items()):
                 if g["expires_at"] is not None and now >= g["expires_at"]:
                     try:
-                        self._expire_agent_grant(rid, aid)
+                        self._commit("agent_grant_expired", {
+                            "actor_user_id": None, "actor_agent_id": None, "room_id": rid, "agent_id": aid,
+                            "project_ids": [room["project_id"]], "action": "agent.grant.expire",
+                            "outcome": "allowed", "resource_id": aid})
                     except CollabError:
                         return                      # log full / unavailable: the grant is refused anyway
 
@@ -3153,7 +4292,8 @@ class CollabService:
         now = self._now()
         self._prune_egress()
         for tid in [i for i, t in self._tasks.items()
-                    if self._task_status(t) not in ("pending", "accepted") and now - t["created_epoch"] > 7 * 86400]:
+                    if self._task_status(t) not in ("pending", "accepted")
+                    and now - t["created_epoch"] > (14 if "bounds" in t else 7) * 86400]:
             t = self._tasks.pop(tid)
             idx = self._tasks_by_target.get(t["target"])
             if idx and tid in idx:
@@ -3189,22 +4329,26 @@ class CollabService:
         eff = self._effective(Principal("agent", t["by_id"], creator["owner"]), room)
         return bool(eff and "instruct" in eff[0])
 
-    def _task_json(self, tid: str, t: dict) -> dict:
+    def _task_json(self, tid: str, t: dict, *, bounds: bool = False) -> dict:
         a = self._agents.get(t["target"], {})
         return {"task_id": tid, "room_id": t["room_id"], "target_agent_id": t["target"],
                 "target_name": a.get("name"), "text": t["text"], "status": self._task_status(t),
                 "result": t["result"], "depth": t["depth"], "parent_task_id": t["parent"],
                 "requested_by": {"type": t["by_kind"], "id": t["by_id"], "owner_user_id": t["by_owner"]},
                 "started_by_user_id": t["root"],
-                "created_at": t["created_at"], "updated_at": t["updated_at"]}
+                "created_at": t["created_at"], "updated_at": t["updated_at"],
+                **({"bounds": t["bounds"], "version": t["version"]} if bounds and "bounds" in t else {})}
 
     def list_tasks(self, pr: Principal, room_id: str, limit: int = 100) -> dict:
         with self._lock:
             _, first = self._authorize(pr, room_id, "read", "task.list")
+            self._no_external(pr)
+            eff = self._effective(pr, self._rooms[room_id])
+            owner = bool(eff and "invite" in eff[0])        # a delegation's bounds are for owners and its delegate only
             rows = [(t["seq"], tid, t) for tid, t in self._tasks.items()
                     if t["room_id"] == room_id and t["seq"] >= first]
             rows.sort(key=lambda r: r[0], reverse=True)
-            out = [dict(self._task_json(tid, t), untrusted=True) for _, tid, t in rows[:limit]]
+            out = [dict(self._task_json(tid, t, bounds=owner), untrusted=True) for _, tid, t in rows[:limit]]
         return {"tasks": out}
 
     def cancel_task(self, pr: Principal, room_id: str, task_id: str) -> dict:
@@ -3227,14 +4371,14 @@ class CollabService:
 
     def task_inbox(self, pr: Principal, limit: int = 20) -> dict:
         """Open tasks addressed to this agent, only where it STILL holds "execute"."""
-        if not pr.is_agent:
+        if not pr.is_agent or pr.external:
             raise CollabError(403, "forbidden")
         with self._lock:
             out = []
             for tid in list(self._tasks_by_target.get(pr.id, ())):
                 t = self._tasks[tid]
-                if self._task_status(t) not in ("pending", "accepted"):
-                    continue
+                if self._task_status(t) not in ("pending", "accepted") or "bounds" in t:
+                    continue                            # a bounded delegation is never an instruction to execute
                 room = self._rooms.get(t["room_id"])
                 eff = self._effective(pr, room) if room else None
                 # a task made before this agent's current grant never revives; and its requester
@@ -3248,7 +4392,7 @@ class CollabService:
         return {"tasks": out}
 
     def update_task(self, pr: Principal, task_id: str, body: dict) -> dict:
-        if not pr.is_agent:
+        if not pr.is_agent or pr.external:
             raise CollabError(403, "forbidden")
         with self._lock:
             t = self._tasks.get(task_id) if isinstance(task_id, str) else None
@@ -3272,6 +4416,488 @@ class CollabService:
                 resource_id=task_id))
         return {"task_id": task_id, "status": status}
 
+    # -- bounded delegation and artifact proposals (T11)
+    # A delegation is a task in the SAME store with a ``bounds`` block, addressed to an external coworker agent
+    # invited with ``proposals``. The delegate holds no ``execute`` right and no terminal: its only output is a
+    # proposal that sits in quarantine until a room owner accepts it, and even an accepted proposal is only
+    # recorded (graph node + ``produced`` edges), never applied. MCP, A2A and REST call these same methods.
+    def _need_delegation(self) -> None:
+        if not self.delegation_enabled:
+            self.stats["policy_denied"] += 1
+            raise CollabError(403, "bounded delegation is switched off on this service", code="delegation_disabled")
+
+    @staticmethod
+    def _refuse(exc: dlg.DelegationError) -> CollabError:
+        return CollabError(exc.status, exc.message, code=exc.code)
+
+    def is_hcn_node(self, node_id: str) -> bool:
+        """Graph ids only this service writes (delegation tasks and accepted proposals): the ingest path refuses
+        everybody else, so provenance cannot be pre-empted, edited or attached to by an ingest key."""
+        return isinstance(node_id, str) and node_id.startswith(dlg.HCN_NODE_PREFIXES)
+
+    def _delegate_task(self, pr: Principal, task_id: Any) -> tuple[dict, dict, dict]:
+        """(task, room, agent) for a bounded task addressed to THIS external agent, in its bound room, whose
+        requester still has the authority to ask; every miss is the same 404."""
+        a = self._require_external(pr)
+        t = self._tasks.get(task_id) if isinstance(task_id, str) else None
+        room = self._rooms.get(t["room_id"]) if t else None
+        if (not a["external"].get("proposals") or not t or "bounds" not in t or t["target"] != pr.id
+                or not room or room["id"] != a["external"]["room_id"] or self._effective(pr, room) is None
+                or not self._creator_valid(t, room)):
+            raise CollabError(404, "not found")
+        return t, room, a
+
+    def _task_usage(self, t: dict) -> dict:
+        return {"steps": t["steps"], "proposals": t["proposals"], "tokens_reported": t["tokens"],
+                "turns": t.get("turns", 0)}
+
+    @staticmethod
+    def _turns_left(t: dict) -> bool:
+        """May the delegate send one more NON-FINAL answer? ``complete`` (the result), ``fail``, ``decline`` and ``cancel`` are
+        never refused for turns, so a delegate at the ceiling can still deliver its result."""
+        ceiling = t["bounds"]["budget"].get("max_turns")
+        return ceiling is None or t.get("turns", 0) + 1 <= ceiling      # a task stored before max_turns existed has no ceiling
+
+    def _proposal_state(self, p: dict) -> str:
+        if p["state"] == "quarantined" and self._now() - p["created_epoch"] >= dlg.PROPOSAL_TTL:
+            return "expired"
+        return p["state"]
+
+    def _proposal_brief(self, p: dict) -> dict:
+        return {"proposal_id": p["id"], "kind": p["kind"], "state": self._proposal_state(p), "digest": p["digest"],
+                "size": p["size"], "created_at": p["created_at"], "promoted": p["promoted"]}
+
+    def _delegation_view(self, tid: str, t: dict) -> dict:
+        out = self._task_json(tid, t, bounds=True)
+        out.update(usage=self._task_usage(t), delegation=True,
+                   proposals=[self._proposal_brief(self._proposals[i]) for i in self._proposals_by_task.get(tid, ())])
+        return out
+
+    def create_delegation(self, pr: Principal, room_id: str, body: dict) -> dict:
+        """A room owner delegates ONE bounded task to a coworker agent that was invited with ``proposals``."""
+        self._require_user(pr)
+        self._need_delegation()
+        with self._lock:
+            room, _ = self._authorize(pr, room_id, "invite", "delegation.create")
+            allowed = {"target_agent_id", "text", "idempotency_key", "scope", "budget", "expires_in_seconds", "output_kinds"}
+            if set(body) - allowed:
+                raise CollabError(400, "unknown field")
+            if self.lineage_sink is None:
+                # Accepting a proposal records it in the lineage graph; a service without one would only ever
+                # strand proposals in quarantine, so it does not take delegations.
+                raise CollabError(409, "this service has no lineage graph, so it cannot take delegations",
+                                  code="graph_unavailable")
+            aid = body.get("target_agent_id")
+            target = self._agents.get(aid) if isinstance(aid, str) else None
+            x = (target or {}).get("external")
+            if (not x or x["room_id"] != room_id or not x.get("proposals")
+                    or self._external_state(target, room, aid) != "active"):
+                raise CollabError(404, "no such agent in this room")
+            text = self._task_text(body.get("text"), "text")
+            try:
+                bounds = dlg.parse_bounds({k: body[k] for k in ("scope", "budget", "expires_in_seconds", "output_kinds") if k in body},
+                                          self._now(), min(target["expires_at"], x["hard_expiry"]), TASK_TTL)
+            except dlg.DelegationError as exc:
+                raise self._refuse(exc) from None
+            ikey = body.get("idempotency_key")
+            if ikey is not None and (not isinstance(ikey, str) or not _KEY_RE.match(ikey)):
+                raise CollabError(400, "invalid idempotency_key")
+            fp = _digest(json.dumps([room_id, aid, text, {k: body.get(k) for k in sorted(allowed - {"text", "idempotency_key", "target_agent_id"})}],
+                                    sort_keys=True, default=str))
+            if ikey is not None and (prior := self._idem.get(("user:" + pr.id, room_id, "deleg:" + ikey))):
+                if prior[0] != fp:
+                    raise CollabError(409, "idempotency_key already used for a different delegation")
+                return {"task_id": prior[1], "status": "pending", "replayed": True}
+            self._prune()
+            open_now = sum(1 for i in self._tasks_by_target.get(aid, ())
+                           if "bounds" in self._tasks[i] and self._task_status(self._tasks[i]) in ("pending", "accepted"))
+            if open_now >= dlg.MAX_OPEN_BOUNDED_PER_AGENT:
+                raise CollabError(429, "that agent has too many open delegations")
+            self._throttle("deleg:" + pr.key, dlg.DELEGATIONS_PER_10_MIN, 600.0, "delegation")
+            task_id = ids.new_id("grant")
+            ev = self._commit("task_created", self._actor(
+                pr, project_id=room["project_id"], room_id=room_id, task_id=task_id, target_agent_id=aid, text=text,
+                depth=0, parent_task_id=None, created_by_kind="user", created_by_id=pr.id, created_epoch=self._now(),
+                root_user_id=pr.owner, bounds=bounds, idempotency_key=ikey, fingerprint=fp, visibility_scope="room",
+                action="delegation.create", outcome="allowed", project_ids=[room["project_id"]], resource_id=task_id))
+        return {"task_id": task_id, "status": "pending", "version": 1, "bounds": bounds, "event": self._view(ev)}
+
+    def list_delegations(self, pr: Principal, room_id: str) -> dict:
+        """Bounded tasks of a room with their proposals' state (never the proposals' content), to room owners."""
+        self._require_user(pr)
+        with self._lock:
+            self._authorize(pr, room_id, "invite", "delegation.list")
+            rows = [(t["seq"], tid, t) for tid, t in self._tasks.items() if t["room_id"] == room_id and "bounds" in t]
+            rows.sort(key=lambda r: r[0], reverse=True)
+            out = [dict(self._delegation_view(tid, t), untrusted=True) for _, tid, t in rows[:100]]
+        return {"delegations": out, "enabled": self.delegation_enabled}
+
+    def delegations_inbox(self, pr: Principal) -> dict:
+        """The bounded tasks addressed to this external agent that it may still act on."""
+        self._need_delegation()
+        with self._lock:
+            self._delegate_task_check(pr)
+            self._throttle("deleg-inbox:" + pr.id, 120, 60.0, "inbox")
+            out = []
+            for tid in list(self._tasks_by_target.get(pr.id, ())):
+                t = self._tasks[tid]
+                if "bounds" not in t or self._task_status(t) not in ("pending", "accepted"):
+                    continue
+                try:
+                    self._delegate_task(pr, tid)
+                except CollabError:
+                    continue
+                out.append(self._delegation_view(tid, t))
+        return {"delegations": out}
+
+    def _delegate_task_check(self, pr: Principal) -> None:
+        a = self._require_external(pr)
+        if not a["external"].get("proposals"):
+            raise CollabError(403, "forbidden")
+
+    def delegation_status(self, pr: Principal, task_id: Any) -> dict:
+        self._need_delegation()
+        with self._lock:
+            t, _, _ = self._delegate_task(pr, task_id)
+            return self._delegation_view(task_id, t)
+
+    _RESPONSES = {"accept": ("pending", "accepted"), "decline": ("pending", "declined"),
+                  "complete": ("accepted", "done"), "fail": ("pending", "accepted", "failed"),
+                  "cancel": ("pending", "accepted", "cancelled")}
+
+    def delegation_respond(self, pr: Principal, task_id: Any, body: dict) -> dict:
+        """accept | decline | progress | complete | fail | cancel, by the delegate. State-changing calls carry the
+        ``expected_version`` they last saw: a task that changed underneath them (cancelled, expired, already
+        answered) is refused as stale rather than silently overwritten."""
+        self._need_delegation()
+        with self._lock:
+            t, room, a = self._delegate_task(pr, task_id)
+            room_id = room["id"]
+            x = a["external"]
+            if set(body) - {"action", "expected_version", "idempotency_key", "note", "result", "tokens_used"}:
+                self._audit_denied(pr, "delegation.respond", "forged_identity", room_id=room_id,
+                                   project_ids=[x["project_id"]], agent_id=pr.id)
+                raise CollabError(400, "unknown field")
+            action = body.get("action")
+            if not isinstance(action, str) or action not in (*self._RESPONSES, "progress"):
+                raise CollabError(400, "action must be accept, decline, progress, complete, fail or cancel")
+            ikey, ver = body.get("idempotency_key"), body.get("expected_version")
+            if ikey is not None and (not isinstance(ikey, str) or not _KEY_RE.match(ikey)):
+                raise CollabError(400, "invalid idempotency_key")
+            if ver is not None and (isinstance(ver, bool) or not isinstance(ver, int)):
+                raise CollabError(400, "expected_version must be an integer")
+            fp = _digest(json.dumps([task_id, action, body.get("note"), body.get("result"), body.get("tokens_used")]))
+            if ikey is not None and (prior := self._idem.get((pr.id, room_id, "resp:" + ikey))):
+                if prior[0] != fp:
+                    raise CollabError(409, "idempotency_key already used for a different answer")
+                return {"task_id": task_id, "status": self._task_status(t), "version": t["version"], "replayed": True}
+            if ver is None and action not in ("decline", "cancel"):
+                raise CollabError(400, "expected_version is required", code="version_required")
+            status = self._task_status(t)
+            if ver is not None and ver != t["version"]:
+                self._audit_denied(pr, "delegation.respond", "stale_task_state", room_id=room_id,
+                                   project_ids=[x["project_id"]], resource_id=task_id, agent_id=pr.id)
+                raise CollabError(409, f"stale task state: the task is at version {t['version']}", code="stale_task_state")
+            allowed_from = {"progress": ("accepted",), **{k: v[:-1] for k, v in self._RESPONSES.items()}}[action]
+            if status not in allowed_from:
+                raise CollabError(409, f"the task is {status}", code="task_" + status)
+            note = ext.clean_text(body.get("note"), dlg.MAX_NOTE)
+            result = ext.clean_text(body.get("result"), 1000) if body.get("result") is not None else None
+            tokens = body.get("tokens_used", 0)
+            if isinstance(tokens, bool) or not isinstance(tokens, int) or not 0 <= tokens <= dlg.MAX_TOKENS:
+                raise CollabError(400, "tokens_used must be a non-negative integer")
+            self._throttle("deleg-resp:" + pr.key, dlg.RESPONSES_PER_MINUTE, 60.0, "task answer")
+            base = dict(project_id=x["project_id"], room_id=room_id, task_id=task_id, target_agent_id=pr.id,
+                        idempotency_key=ikey, fingerprint=fp, visibility_scope="room", outcome="allowed",
+                        project_ids=[x["project_id"]], resource_id=task_id)
+            b = t["bounds"]["budget"]
+            if action not in ("decline", "cancel", "fail", "complete") and not self._turns_left(t):
+                return self._exhaust(pr, t, task_id, base)          # the turn ceiling: the task is closed
+            if action == "progress":
+                if t["steps"] + 1 > b["max_steps"] or t["tokens"] + tokens > b["max_tokens"]:
+                    return self._exhaust(pr, t, task_id, base)
+                self._commit("task_progress", self._actor(pr, note=note, tokens=tokens, action="delegation.progress", **base))
+            else:
+                new = self._RESPONSES[action][-1]
+                self._commit("task_updated", self._actor(pr, status=new, result=result or note or None,
+                                                         action="delegation." + action, **base))
+            return {"task_id": task_id, "status": self._task_status(t), "version": t["version"]}
+
+    def _exhaust(self, pr: Principal, t: dict, task_id: str, base: dict) -> dict:
+        """The delegate went past its step or token budget: the task is failed, further answers are refused."""
+        self._audit_denied(pr, "delegation.budget", "budget_exhausted", room_id=t["room_id"],
+                           project_ids=base["project_ids"], resource_id=task_id, agent_id=pr.id)
+        self._commit("task_updated", self._actor(pr, status="failed", result="budget exhausted",
+                                                 action="delegation.budget", **{**base, "idempotency_key": None}))
+        raise CollabError(409, "the task's budget is used up; it is closed", code="budget_exhausted")
+
+    def _submit_gate(self, pr: Principal, task_id: Any, body: dict, rec: dict | None):
+        """Every cheap check of a submission, run under the lock. It runs twice: once BEFORE the content is parsed
+        (so a stale, closed, exhausted or replayed submission costs no parsing) and once more with the parsed
+        record, immediately before the commit (so nothing changed while the lock was released for the parse)."""
+        t, room, a = self._delegate_task(pr, task_id)
+        room_id, x = room["id"], a["external"]
+        audit = dict(room_id=room_id, project_ids=[x["project_id"]], resource_id=task_id, agent_id=pr.id)
+        if set(body) - {"kind", "title", "content", "url", "refs", "supersedes", "expected_version", "idempotency_key"}:
+            self._audit_denied(pr, "delegation.proposal", "forged_identity", **audit)
+            self.stats["forged_identity"] += 1
+            raise CollabError(400, "identity and scope are derived from the credential, not the request")
+        ikey, ver, sup = body.get("idempotency_key"), body.get("expected_version"), body.get("supersedes")
+        if ikey is not None and (not isinstance(ikey, str) or not _KEY_RE.match(ikey)):
+            raise CollabError(400, "invalid idempotency_key")
+        if rec is not None:
+            pid = rec["proposal_id"]
+            if ikey is not None and (prior := self._idem.get((pr.id, room_id, "prop:" + ikey))) and prior[0] != rec["digest"]:
+                raise CollabError(409, "idempotency_key already used for a different proposal")
+            same = self._proposals.get(pid)
+            if same and same["task_id"] == task_id:             # the same content again: a replay, costs nothing
+                return {"proposal_id": pid, "state": self._proposal_state(same), "digest": rec["digest"],
+                        "version": t["version"], "replayed": True}
+        else:                                                    # replay of a body already accepted, without parsing it
+            quick = self._quick_key(task_id, body)
+            pid = self._quick.get(quick) if quick else None
+            same = self._proposals.get(pid) if pid else None
+            if same and same["task_id"] == task_id:
+                return {"proposal_id": pid, "state": self._proposal_state(same), "digest": same["digest"],
+                        "version": t["version"], "replayed": True}
+        if isinstance(ver, bool) or not isinstance(ver, int):
+            raise CollabError(400, "expected_version is required", code="version_required")
+        if ver != t["version"]:
+            self._audit_denied(pr, "delegation.proposal", "stale_task_state", **audit)
+            raise CollabError(409, f"stale task state: the task is at version {t['version']}", code="stale_task_state")
+        status = self._task_status(t)
+        if status != "accepted":
+            self._audit_denied(pr, "delegation.proposal", "task_" + status, **audit)
+            raise CollabError(409, f"the task is {status}: accept it first, and only while it is open", code="task_" + status)
+        b = t["bounds"]["budget"]
+        if not self._turns_left(t):
+            # past the turn ceiling: the task is closed, exactly as an overrunning answer closes it (delegation_respond)
+            return self._exhaust(pr, t, task_id, dict(
+                project_id=x["project_id"], room_id=room_id, task_id=task_id, target_agent_id=pr.id,
+                idempotency_key=None, fingerprint=None, visibility_scope="room", outcome="allowed",
+                project_ids=[x["project_id"]], resource_id=task_id))
+        if t["proposals"] >= b["max_proposals"] or t["steps"] + 1 > b["max_steps"]:
+            self._audit_denied(pr, "delegation.proposal", "budget_exhausted", **audit)
+            raise CollabError(409, "the task's proposal or step budget is used up", code="budget_exhausted")
+        mine = self._proposals_by_agent.get(pr.id, ())
+        sponsor_total = sum(len(self._proposals_by_agent.get(i, ())) for i in self._externals_by_sponsor(x["sponsor"]))
+        quarantined = sum(1 for i in self._proposals_by_room.get(room_id, ())
+                          if self._proposal_state(self._proposals[i]) == "quarantined")
+        if (len(mine) >= dlg.MAX_PROPOSALS_PER_AGENT or sponsor_total >= dlg.MAX_PROPOSALS_PER_SPONSOR
+                or quarantined >= dlg.MAX_QUARANTINED_PER_ROOM):
+            self._audit_denied(pr, "delegation.proposal", "quota", **audit)
+            self.stats["rate_limited"] += 1
+            raise CollabError(429, "too many proposals; the room owner must decide the open ones first", code="quota")
+        if sup is not None:
+            prior_p = self._proposals.get(sup) if isinstance(sup, str) else None
+            if (not prior_p or prior_p["task_id"] != task_id or prior_p["agent_id"] != pr.id
+                    or self._proposal_state(prior_p) != "quarantined"):
+                raise CollabError(409, "supersedes must name your own undecided proposal for this task", code="cannot_supersede")
+        return t, x, audit
+
+    @staticmethod
+    def _quick_key(task_id: str, body: dict) -> str | None:
+        """A cheap fingerprint of the submitted fields (no parsing), used only to recognise an exact resend."""
+        try:
+            raw = json.dumps([task_id] + [body.get(k) for k in ("kind", "title", "content", "url", "refs")],
+                             sort_keys=True, separators=(",", ":"))
+        except (TypeError, ValueError):
+            return None
+        return hashlib.sha256(raw.encode("utf-8", "surrogatepass")).hexdigest()
+
+    def submit_proposal(self, pr: Principal, task_id: Any, body: dict) -> dict:
+        """The delegate's ONLY output: a proposal that goes to quarantine. Nothing here touches a workspace or
+        the graph. Every limit (kind, scope, size, count, steps, expiry, rate) is enforced here, once. The
+        cheap checks run first and the content is parsed OUTSIDE the service lock."""
+        self._need_delegation()
+        with self._lock:
+            first = self._submit_gate(pr, task_id, body, None)
+            if isinstance(first, dict):
+                return first
+            bounds = first[0]["bounds"]
+        try:
+            rec = dlg.build_proposal(task_id, bounds, body)
+        except dlg.DelegationError as exc:
+            with self._lock:
+                _, room, a = self._delegate_task(pr, task_id)
+                self._audit_denied(pr, "delegation.proposal", exc.code or "invalid", room_id=room["id"],
+                                   project_ids=[a["external"]["project_id"]], resource_id=task_id, agent_id=pr.id)
+                self.stats["policy_denied"] += 1
+            raise self._refuse(exc) from None
+        with self._lock:
+            second = self._submit_gate(pr, task_id, body, rec)
+            if isinstance(second, dict):
+                return second
+            t, x, audit = second
+            if t["bounds"] != bounds:
+                raise CollabError(409, "the task changed while the proposal was checked", code="stale_task_state")
+            ikey, sup = body.get("idempotency_key"), body.get("supersedes")
+            pid, room_id = rec["proposal_id"], audit["room_id"]
+            self._throttle("prop:" + pr.id, dlg.PROPOSALS_PER_10_MIN, 600.0, "proposal")
+            self._commit("proposal_submitted", self._actor(
+                pr, project_id=x["project_id"], room_id=room_id, task_id=task_id, sponsor=x["sponsor"],
+                supersedes=sup, idempotency_key=ikey, created_epoch=self._now(), visibility_scope="room",
+                action="delegation.proposal", outcome="allowed", project_ids=[x["project_id"]], resource_id=pid,
+                **{k: rec[k] for k in ("proposal_id", "digest", "kind", "title", "content", "url", "refs", "size", "flags")}))
+            if (qk := self._quick_key(task_id, body)):
+                self._quick[qk] = pid
+            return {"proposal_id": pid, "state": "quarantined", "digest": rec["digest"], "version": t["version"]}
+
+    def _externals_by_sponsor(self, sponsor: str) -> list[str]:
+        return [aid for rid_agents in self._externals_by_room.values() for aid in rid_agents
+                if self._agents[aid]["external"]["sponsor"] == sponsor]
+
+    def withdraw_proposal(self, pr: Principal, proposal_id: Any, body: dict) -> dict:
+        self._need_delegation()
+        with self._lock:
+            p = self._proposals.get(proposal_id) if isinstance(proposal_id, str) else None
+            if set(body) - {"idempotency_key"}:
+                raise CollabError(400, "unknown field")
+            a = self._require_external(pr)
+            if not p or p["agent_id"] != pr.id or not a["external"].get("proposals"):
+                raise CollabError(404, "not found")
+            state = self._proposal_state(p)
+            if state == "withdrawn":
+                return {"proposal_id": proposal_id, "state": "withdrawn", "replayed": True}
+            if state != "quarantined":
+                raise CollabError(409, f"the proposal is {state}", code="proposal_" + state)
+            self._commit("proposal_decided", self._actor(
+                pr, project_id=p["project_id"], room_id=p["room_id"], proposal_id=proposal_id, decision="withdrawn",
+                reason=None, visibility_scope="room", action="delegation.withdraw", outcome="allowed",
+                project_ids=[p["project_id"]], resource_id=proposal_id))
+        return {"proposal_id": proposal_id, "state": "withdrawn"}
+
+    # -- owner side: review, accept, reject
+    def list_proposals(self, pr: Principal, room_id: str) -> dict:
+        self._require_user(pr)
+        with self._lock:
+            self._authorize(pr, room_id, "invite", "proposal.list")
+            out = [dict(self._proposal_brief(self._proposals[i]), title=self._proposals[i]["title"],
+                        task_id=self._proposals[i]["task_id"], agent_id=self._proposals[i]["agent_id"],
+                        flags=self._proposals[i]["flags"], untrusted=True)
+                   for i in reversed(self._proposals_by_room.get(room_id, ()))][:200]
+        return {"proposals": out, "enabled": self.delegation_enabled}
+
+    def get_proposal(self, pr: Principal, room_id: str, proposal_id: str) -> dict:
+        """The quarantined content, for a room owner to review. It is data: marked untrusted, not executable
+        and not applied, and the reviewer's accept must echo the digest of exactly this content."""
+        self._require_user(pr)
+        with self._lock:
+            self._authorize(pr, room_id, "invite", "proposal.read")
+            p = self._proposals.get(proposal_id)
+            if not p or p["room_id"] != room_id:
+                raise CollabError(404, "not found")
+            ag = self._agents.get(p["agent_id"], {})
+            return dict(self._proposal_brief(p), task_id=p["task_id"], agent_id=p["agent_id"],
+                        delegate_label=(ag.get("external") or {}).get("label"), title=p["title"], content=p["content"],
+                        url=p["url"], refs=p["refs"], flags=p["flags"], supersedes=p["supersedes"],
+                        decided_by=p["decided_by"], decided_at=p["decided_at"], reason=p["reason"],
+                        trust="untrusted", executable=False, applied=False)
+
+    def decide_proposal(self, pr: Principal, room_id: str, proposal_id: str, body: dict) -> dict:
+        """A room owner accepts or rejects a quarantined proposal. Accepting needs the digest of the content
+        that was reviewed, is terminal, is idempotent, and records the proposal in the lineage graph (it never
+        applies anything). A person only: no agent credential reaches this, over any protocol."""
+        self._require_user(pr)
+        if set(body) - {"decision", "expected_digest", "reason", "idempotency_key"}:
+            raise CollabError(400, "unknown field")
+        decision = body.get("decision")
+        if not isinstance(decision, str) or decision not in ("accept", "reject"):
+            raise CollabError(400, "decision must be accept or reject")
+        if decision == "accept":
+            self._need_delegation()
+        with self._lock:
+            room, _ = self._authorize(pr, room_id, "invite", "proposal.decide")
+            p = self._proposals.get(proposal_id) if isinstance(proposal_id, str) else None
+            if not p or p["room_id"] != room_id:
+                raise CollabError(404, "not found")
+            audit = dict(room_id=room_id, project_ids=[p["project_id"]], resource_id=proposal_id)
+            if body.get("expected_digest") != p["digest"]:
+                self._audit_denied(pr, "proposal.decide", "digest_mismatch", **audit)
+                raise CollabError(409, "expected_digest does not match the proposal you were shown", code="digest_mismatch")
+            state = self._proposal_state(p)
+            want = "accepted" if decision == "accept" else "rejected"
+            if state == want:
+                replay = True                                   # the same decision again: no new event
+            elif state != "quarantined":
+                raise CollabError(409, f"the proposal is {state}", code="proposal_" + state)
+            else:
+                replay = False
+                reason = ext.clean_text(body.get("reason"), dlg.MAX_REASON) or None
+                self._throttle("decide:" + pr.key, dlg.DECISIONS_PER_MINUTE, 60.0, "decision")
+                if decision == "accept":
+                    ag, t = self._agents.get(p["agent_id"]), self._tasks.get(p["task_id"])
+                    # Revocation is distrust: a delegate that was revoked or removed from the room, or a task
+                    # that was cancelled / declined / failed, leaves its quarantined proposals unacceptable.
+                    # (A credential that merely lapsed, or a delegation whose time ran out after the proposal
+                    # was made in budget, does not.)
+                    if not ag or ag["status"] != "active" or p["agent_id"] not in room["grants"]:
+                        self._audit_denied(pr, "proposal.decide", "delegate_revoked", **audit)
+                        raise CollabError(409, "the delegate was revoked or removed; reject this proposal", code="delegate_revoked")
+                    if t is None or t["status"] in ("cancelled", "declined", "failed", "pending"):
+                        self._audit_denied(pr, "proposal.decide", "task_closed", **audit)
+                        raise CollabError(409, "the delegation was cancelled, declined or failed", code="task_closed")
+                    if self.lineage_sink is None:
+                        raise CollabError(409, "this service has no lineage graph", code="graph_unavailable")
+                self._commit("proposal_decided", self._actor(
+                    pr, project_id=p["project_id"], room_id=room_id, proposal_id=proposal_id, decision=want,
+                    reason=reason, digest=p["digest"], visibility_scope="room", action="proposal." + decision,
+                    outcome="allowed", project_ids=[p["project_id"]], resource_id=proposal_id))
+        promoted = self._promote(proposal_id) if decision == "accept" else False
+        out = {"proposal_id": proposal_id, "state": want, "replayed": replay}
+        if decision == "accept":
+            out.update(promoted=promoted, applied=False,
+                       retry="repeat this request to finish recording it in the graph" if not promoted else None)
+        return out
+
+    def _promote(self, proposal_id: str) -> bool:
+        """Record an accepted proposal in the lineage graph: a delegation task node, an artifact node and a
+        ``produced`` edge, written by the SERVICE (principal kind ``collab``), never by the delegate. Event
+        ids and sequences are derived from the proposal id, so a repeat is a harmless duplicate. Returns True
+        once everything is in the graph. Nothing here applies the proposal to anything."""
+        with self._lock:
+            p = self._proposals.get(proposal_id)
+            if not p or p["state"] != "accepted":
+                return False
+            if p["promoted"]:
+                return True
+            sink = self.lineage_sink
+            ag = self._agents.get(p["agent_id"], {})
+            label = (ag.get("external") or {}).get("label", "")
+            t = self._tasks.get(p["task_id"], {})
+            tnode, anode = "task:hcn-delegation." + p["task_id"], "artifact:hcn-proposal." + proposal_id
+            attrs = {"source": "hcn-proposal", "kind": p["kind"], "digest": p["digest"], "bytes": p["size"],
+                     "delegate_agent": p["agent_id"], "delegate_label": label, "delegated_by": p["sponsor"],
+                     "accepted_by": p["decided_by"], "accepted_at": p["decided_at"], "delegation_id": p["task_id"],
+                     "trust": "accepted-untrusted-content", "applied": False, "executable": False}
+            if p["kind"] == "link":
+                attrs["link_host"] = (p["url"] or "").split("/")[2] if p["url"] else None
+            room_id, source = p["room_id"], "hcn-" + proposal_id[4:28]
+            steps = [("node.upsert", tnode, {"node_type": "task", "node_id": tnode, "label": (t.get("text") or "delegation")[:120],
+                                             "state": "accepted", "attrs": {"source": "hcn-delegation", "delegate_agent": p["agent_id"],
+                                                                           "delegated_by": p["sponsor"]}}),
+                     ("node.upsert", anode, {"node_type": "artifact", "node_id": anode, "label": p["title"],
+                                             "state": "accepted", "attrs": attrs}),
+                     # The delegate's own agent node belongs to the delegate (T10 namespace): the service cannot be
+                     # a writer of it, so the edge starts at the delegation task, which names the delegate in attrs.
+                     ("edge.add", tnode, {"edge_type": "produced", "from_id": tnode, "to_id": anode})]
+        principal = {"kind": "collab", "id": "collab:room:" + room_id, "authenticated_by": "collab"}
+        try:
+            for n, (etype, entity, payload) in enumerate(steps, 1):
+                sink({"schema_version": 2, "event_id": f"hcn-{proposal_id}-{n}", "source": source, "source_sequence": n,
+                      "entity_type": "lineage", "entity_id": entity, "event_type": etype, "payload": payload,
+                      "visibility_scope": "room", "room_id": room_id}, principal, None)
+        except Exception:                          # noqa: BLE001 - the decision stands; the owner repeats the request
+            self.stats["lineage_failures"] += 1
+            return False
+        with self._lock:
+            if not self._proposals[proposal_id]["promoted"]:
+                self._commit("proposal_promoted", {
+                    "actor_user_id": None, "actor_agent_id": None, "proposal_id": proposal_id, "room_id": room_id,
+                    "project_id": p["project_id"], "project_ids": [p["project_id"]], "action": "proposal.promote",
+                    "outcome": "allowed", "resource_id": proposal_id})
+        return True
+
     # -- messages
     def post_message(self, pr: Principal, room_id: str, body: dict) -> tuple[int, dict]:
         with self._lock:
@@ -3292,6 +4918,10 @@ class CollabService:
             if not isinstance(text, str):
                 raise CollabError(400, "text must be a string")
             clean = _CONTROL.sub("", text)
+            if pr.external:               # untrusted: no invisible, direction-changing or tag characters
+                if len(text) > MAX_TEXT:
+                    raise CollabError(400, f"text must be 1-{MAX_TEXT} characters")
+                clean = ext.clean_text(text, MAX_TEXT, multiline=True)
             if not clean.strip() or len(clean) > MAX_TEXT:
                 raise CollabError(400, f"text must be 1-{MAX_TEXT} characters")
             reply = body.get("in_reply_to")
@@ -3302,15 +4932,21 @@ class CollabService:
                     reply = False
             if reply is False:
                 raise CollabError(400, "in_reply_to must reference a message in this room")
-            fp = _digest(json.dumps([room_id, clean, reply]))
+            ctx = None
+            if "context" in body:
+                # T14: a reference to a graph node/edge/proposal/comment. Validated, and visible to THIS poster now.
+                ctx = self._wb_call(self._context_for_post, pr, room, room_id, body["context"])
+            fp = _digest(json.dumps([room_id, clean, reply] + ([ctx] if ctx else [])))
             prior = self._idem.get((pr.key, room_id, key))
             if prior:
                 if prior[0] != fp:
                     raise CollabError(409, "idempotency_key already used for a different message")
-                return 200, {"event": self._view(self._log[prior[1] - 1], replayed=True), "replayed": True}
+                return 200, {"event": self._view(self._log[prior[1] - 1], viewer=pr, replayed=True), "replayed": True}
             now = self._now()
             hits = [t for t in self._hits[pr.key] if now - t < 60]
-            if len(hits) >= self.message_limit:
+            # an external agent posts at a third of the rate a person's own agent may; it still draws on
+            # its sponsor's budget below, so inviting more of them never buys more throughput
+            if len(hits) >= (self.message_limit // 3 if pr.external else self.message_limit):
                 self._hits[pr.key] = hits
                 self.stats["rate_limited"] += 1
                 raise CollabError(429, "message rate limit exceeded")
@@ -3328,15 +4964,19 @@ class CollabService:
             self._hits[okey] = ohits
             ev = self._commit("message", self._actor(
                 pr, project_id=room["project_id"], room_id=room_id, sender_key=pr.key,
-                sender_kind=pr.kind, sender_id=pr.id, idempotency_key=key, fingerprint=fp,
+                sender_kind=pr.kind, sender_id=pr.id, sender_external=pr.external, idempotency_key=key, fingerprint=fp,
                 text=redact_text(clean), in_reply_to=reply, trust="untrusted",
+                **({"context": ctx} if ctx else {}),
                 visibility_scope="room", action="message.post", outcome="allowed",
                 project_ids=[room["project_id"]], resource_id=room_id))
         self.stats["messages"] += 1
-        return 201, {"event": self._view(ev)}
+        with self._lock:
+            return 201, {"event": self._view(ev, viewer=pr)}
 
     # -- reads
-    def _view(self, ev: dict, **extra) -> dict:
+    def _view(self, ev: dict, viewer=None, _ctx_cache: dict | None = None, **extra) -> dict:
+        """One feed event as ``viewer`` may see it. A message's context reference is resolved per viewer; with no
+        viewer (an internal caller) it is always hidden."""
         p, t = ev["payload"], ev["event_type"]
         out = {"sequence": ev["sequence"], "event_id": ev["event_id"], "event_type": t,
                "schema_version": ev["schema_version"], "room_id": p.get("room_id"),
@@ -3344,9 +4984,11 @@ class CollabService:
                "correlation_id": p.get("correlation_id"), "causation_id": p.get("causation_id"),
                "visibility_scope": p.get("visibility_scope", "room")}
         if t == "message":
-            out.update(sender={"type": p["sender_kind"], "id": p["sender_id"],
-                               "owner_user_id": p["actor_user_id"]},
+            out.update(sender={"type": "external" if p.get("sender_external") else p["sender_kind"],
+                               "id": p["sender_id"], "owner_user_id": p["actor_user_id"]},
                        text=p["text"], trust="untrusted", in_reply_to=p.get("in_reply_to"))
+            if p.get("context"):
+                out["context"] = self._message_context(p, viewer, {} if _ctx_cache is None else _ctx_cache)
         elif t in ("task_created", "task_updated"):
             out.update(actor_user_id=p.get("actor_user_id"), actor_agent_id=p.get("actor_agent_id"),
                        task={"task_id": p["task_id"], "target_agent_id": p.get("target_agent_id"),
@@ -3364,13 +5006,6 @@ class CollabService:
             elif t.startswith("helper_"):             # ids, role and model: never the task text or result
                 out.update(helper={"helper_id": p.get("helper_id"), "role": p.get("role"), "model": p.get("model"),
                                    "status": p.get("status")})
-        membership_status = {"room_member_invited": "pending", "room_member_approved": "approved",
-                             "room_member_removed": "removed", "member_added": "approved", "member_removed": "removed"}
-        if t in membership_status:
-            out["room_membership_status"] = membership_status[t]
-        for field in ("membership_id", "permission_id", "agent_permission_status", "file_upload_permission"):
-            if field in p:
-                out[field] = p[field]
         out.update(extra)
         return out
 
@@ -3378,10 +5013,12 @@ class CollabService:
         with self._lock:
             room, first = self._authorize(pr, room_id, "read", "events.read")
             guest = not pr.is_agent and (self._member(room, pr.id) or {}).get("role") == "guest"
-            out, more, nxt = [], False, cursor
+            out, more, nxt, cache = [], False, cursor, {}
             feed = self._by_room.get(room_id, [])
             lo = bisect.bisect_right(feed, max(cursor, first - 1), key=lambda e: e["sequence"])
             for ev in feed[lo:]:
+                if pr.external and ev["event_type"] != "message":
+                    continue                    # chat only: no membership, grant or task events
                 if guest and (ev["event_type"].startswith("helper_") or (
                         ev["event_type"].startswith("agent_") and ev["payload"].get("agent_id") in self._helper_minted)):
                     nxt = ev["sequence"]              # a guest never sees helpers, but the cursor moves past them
@@ -3389,7 +5026,7 @@ class CollabService:
                 if len(out) >= limit:
                     more = True
                     break
-                out.append({k: v for k, v in self._view(ev).items() if k != "project_id"})
+                out.append({k: v for k, v in self._view(ev, viewer=pr, _ctx_cache=cache).items() if k != "project_id"})
                 nxt = ev["sequence"]
         return {"events": out, "next_cursor": nxt, "has_more": more}
 
@@ -3417,6 +5054,7 @@ class CollabService:
                 out.append({"sequence": ev["sequence"], "event_type": ev["event_type"],
                             "action": p["action"], "outcome": p["outcome"], "reason": p.get("reason"),
                             "actor_user_id": p.get("actor_user_id"), "actor_agent_id": p.get("actor_agent_id"),
+                            "actor_kind": p.get("actor_kind"), "client_ip": p.get("client_ip"),
                             "room_id": p.get("room_id"), "resource_id": p.get("resource_id"),
                             "created_at": p["created_at"], "correlation_id": p.get("correlation_id")})
                 if ev["event_type"].startswith("helper_"):
@@ -3469,17 +5107,20 @@ class CollabService:
 
     # --------------------------------------------------------------- routing
     def dispatch(self, method: str, parts: list[str], query: dict, body: dict,
-                 authorization: str, device: str | None, operator: str | None = None):
+                 authorization: str, device: str | None, operator: str | None = None,
+                 client: str | None = None):
         """parts: path segments after /api/v1/collab. Returns (status, json) or a Stream."""
         try:
             if parts == ["agents", "enrollment", "complete"] and method == "POST":
                 return 201, self.complete_enrollment(body)
             if parts == ["agents", "join"] and method == "POST":
-                return 201, self.redeem_join_token(body)         # the token IS the authentication
+                return 201, self.redeem_join_token(body, client)  # the token IS the authentication
             if parts == ["agents", "join-link"] and method == "POST":
                 return 200, self.link_joined(body)
             if parts == ["config"] and method == "GET":
                 return 200, self.public_config  # public identifiers only; no auth needed
+            if operator is not None and self.degraded:
+                raise CollabError(503, "collaboration is disabled; ask the operator")   # never serve partial state
             if operator is not None:
                 # Only the operator listener (tailnet-only, Host-checked) ever passes this: the
                 # local owner uses the dashboard without a sign-in, as the same user id they
@@ -3511,6 +5152,8 @@ class CollabService:
                     return 200, self.list_my_agents(pr)
                 if parts == ["agents", "join-tokens"]:
                     return 200, self.list_join_tokens(pr)
+                if parts == ["agents", "external", "me"]:
+                    return 200, self.external_me(pr)
                 if parts[:1] == ["helpers"] and not pr.is_agent:     # agents use MCP; a person sees their agents'
                     if n == 1:
                         return 200, self.list_my_helpers(pr)
@@ -3521,6 +5164,8 @@ class CollabService:
                         raise CollabError(404, "not found")
                     if parts == ["fleet", "hosts"]:
                         return 200, self.list_fleet_hosts(pr)
+                    if parts == ["fleet", "host-registry"]:
+                        return 200, self.list_host_registry(pr)
                     if parts == ["fleet", "agent-links"]:
                         return 200, self.agent_links(pr)
                     if parts == ["fleet", "egress"]:
@@ -3540,8 +5185,14 @@ class CollabService:
                         st = str(query["status"]) if "status" in query else None
                         return 200, self.list_spawns(pr, st)
                     raise CollabError(404, "not found")
+                if parts[:1] == ["graph"]:
+                    return 200, self.graph_read(pr, parts[1:], query)
                 if parts == ["tasks", "inbox"]:
                     return 200, self.task_inbox(pr)
+                if parts == ["delegations", "inbox"]:
+                    return 200, self.delegations_inbox(pr)
+                if n == 2 and parts[0] == "delegations":
+                    return 200, self.delegation_status(pr, parts[1])
                 if parts == ["rooms"]:
                     return 200, self.list_rooms(pr)
                 if parts == ["audit"]:
@@ -3557,12 +5208,44 @@ class CollabService:
                         return 200, self.list_room_agents(pr, rid)
                     if parts[2:] == ["invites"]:
                         return 200, self.list_invites(pr, rid)
+                    if parts[2:] == ["externals"]:
+                        return 200, self.list_room_externals(pr, rid)
                     if parts[2:] == ["agent-requests"]:
                         return 200, self.list_agent_requests(pr, rid)
                     if parts[2:] == ["tasks"]:
                         return 200, self.list_tasks(pr, rid)
+                    if parts[2:] == ["consultations"]:
+                        return 200, self.list_consultations(pr, rid)
+                    if parts[2:] == ["xlinks"]:
+                        return 200, self.list_links(pr, rid)
+                    if parts[2:] == ["comments"]:
+                        return 200, self.list_comments(pr, rid, query)
+                    if n == 5 and parts[2] == "comments" and parts[4] == "history":
+                        return 200, self.comment_history(pr, rid, parts[3])
+                    if parts[2:] == ["steering"]:
+                        return 200, self.list_steering(pr, rid, query)
+                    if parts[2:] == ["forks"]:
+                        return 200, self.fork_comparison(pr, rid, query)
+                    if parts[2:] == ["attention"]:
+                        return 200, self.attention_inbox(pr, rid, query)
+                    if parts[2:] == ["progress"]:
+                        return 200, self.room_progress(pr, rid, query)
+                    if parts[2:] == ["analytics"]:
+                        return 200, self.room_analytics(pr, rid, query)
+                    if parts[2:] == ["steering", "target"]:
+                        return 200, self.steering_target(pr, rid, str(query.get("node_id", "")))
+                    if parts[2:] == ["delegations"]:
+                        return 200, self.list_delegations(pr, rid)
+                    if parts[2:] == ["proposals"]:
+                        return 200, self.list_proposals(pr, rid)
+                    if n == 4 and parts[2] == "proposals":
+                        return 200, self.get_proposal(pr, rid, parts[3])
                     if parts[2:] == ["flow"]:
                         return 200, self.room_flow(pr, rid)
+                    if parts[2:] == ["workspaces"]:
+                        return 200, self.list_workspace_links(pr, rid)
+                    if parts[2:] == ["missions"]:
+                        return 200, self.list_room_missions(pr, rid)
                     if parts[2:] == ["architecture-links"]:
                         return 200, self.architecture_links(pr, rid)
                     if parts[2:] == ["state"]:
@@ -3581,6 +5264,12 @@ class CollabService:
                     return 200, self.link_identity(pr, body)
                 if parts == ["agents", "connect"]:
                     return 201, self.connect_agent(pr, body)
+                if parts == ["agents", "external", "heartbeat"]:
+                    return 200, self.external_heartbeat(pr, body)
+                if parts == ["agents", "external", "lineage"]:
+                    return 200, self.external_lineage(pr, body)
+                if parts == ["agents", "external", "leave"]:
+                    return 200, self.external_leave(pr)
                 if parts == ["agents", "join-tokens"]:
                     return 201, self.create_join_token(pr, body)
                 if n == 4 and parts[:2] == ["agents", "join-tokens"] and parts[3] == "revoke":
@@ -3594,6 +5283,8 @@ class CollabService:
                         return 200, self.report_fleet_hosts(pr, body)
                     if n == 3 and parts[1] == "hosts":
                         return 200, self.set_fleet_host(pr, parts[2], body)
+                    if n == 3 and parts[1] == "host-registry":
+                        return 200, self.register_host(pr, parts[2], body)
                     if parts == ["fleet", "egress", "request"]:
                         return 200, self.request_egress(pr, body.get("room_id"), body.get("agent_id"),
                                                         body.get("host"), body.get("port"))
@@ -3639,6 +5330,12 @@ class CollabService:
                     return 201, self.start_enrollment(pr, body)
                 if n == 3 and parts[0] == "tasks" and parts[2] == "update":
                     return 200, self.update_task(pr, parts[1], body)
+                if n == 3 and parts[0] == "delegations" and parts[2] == "respond":
+                    return 200, self.delegation_respond(pr, parts[1], body)
+                if n == 3 and parts[0] == "delegations" and parts[2] == "proposals":
+                    return 201, self.submit_proposal(pr, parts[1], body)
+                if n == 3 and parts[0] == "proposals" and parts[2] == "withdraw":
+                    return 200, self.withdraw_proposal(pr, parts[1], body)
                 if parts == ["agent", "rotate"]:
                     return 200, self.rotate_credential(pr)
                 if n == 3 and parts[0] == "agents" and parts[2] == "link":
@@ -3656,17 +5353,63 @@ class CollabService:
                     if n == 5 and parts[2] == "invites" and parts[4] == "cancel":
                         return 200, self.cancel_invite(pr, rid, parts[3])
                     if n == 5 and parts[2] == "members" and parts[4] == "remove":
-                        return 200, self.remove_member(pr, rid, parts[3], idempotency_key=body.get("idempotency_key"))
+                        return 200, self.remove_member(pr, rid, parts[3])
                     if parts[2:] == ["agents"]:
                         return 201, self.grant_agent(pr, rid, body)
+                    if parts[2:] == ["externals", "invites"]:
+                        return 201, self.create_external_invite(pr, rid, body)
+                    if n == 6 and parts[2:4] == ["externals", "invites"] and parts[5] == "revoke":
+                        return 200, self.revoke_external_invite(pr, rid, parts[4])
+                    if n == 5 and parts[2] == "externals" and parts[4] == "revoke":
+                        return 200, self.revoke_external(pr, rid, parts[3])
                     if n == 5 and parts[2] == "agents" and parts[4] == "remove":
                         return 200, self.remove_agent_from_room(pr, rid, parts[3])
                     if parts[2:] == ["agent-requests", "approve-all"]:
                         return 200, self.approve_all_requests(pr, rid, body)
                     if n == 5 and parts[2] == "agent-requests" and parts[4] == "decide":
                         return 200, self.decide_agent_request(pr, rid, parts[3], body)
+                    if parts[2:] == ["workspaces"]:
+                        return 201, self.link_workspace(pr, rid, body)
+                    if n == 5 and parts[2] == "workspaces" and parts[4] == "unlink":
+                        return 200, self.unlink_workspace(pr, rid, parts[3])
+                    if n == 5 and parts[2] == "workspaces" and parts[4] == "primary":
+                        return 200, self.set_workspace_primary(pr, rid, parts[3], body)
+                    if n == 5 and parts[2] == "workspaces" and parts[4] == "grants":
+                        return 200, self.set_workspace_grants(pr, rid, parts[3], body)
+                    if n == 5 and parts[2] == "workspaces" and parts[4] == "authorize":
+                        return 200, self.authorize_workspace(pr, rid, parts[3], str(body.get("action", "")))
+                    if parts[2:] == ["missions"]:
+                        return 201, self.link_mission(pr, rid, body)
+                    if n == 5 and parts[2] == "missions" and parts[4] == "unlink":
+                        return 200, self.unlink_mission(pr, rid, parts[3])
                     if parts[2:] == ["tasks"]:
                         return 201, self.create_task(pr, rid, body)
+                    if parts[2:] == ["consultations"]:
+                        return self.ask_consultation(pr, rid, body)
+                    if n == 5 and parts[2] == "consultations" and parts[4] == "answer":
+                        return 200, self.answer_consultation(pr, rid, parts[3], body)
+                    if n == 5 and parts[2] == "consultations" and parts[4] == "cancel":
+                        return 200, self.cancel_consultation(pr, rid, parts[3])
+                    if parts[2:] == ["xlinks"]:
+                        return self.create_link(pr, rid, body)
+                    if n == 5 and parts[2] == "xlinks" and parts[4] == "revoke":
+                        return 200, self.revoke_link(pr, rid, parts[3])
+                    if n == 4 and parts[2] == "attention" and parts[3] in ("ack", "snooze", "restore"):
+                        return 200, getattr(self, "attention_" + parts[3])(pr, rid, body)
+                    if parts[2:] == ["comments"]:
+                        return self.add_comment(pr, rid, body)
+                    if n == 5 and parts[2] == "comments" and parts[4] in ("edit", "retract"):
+                        return 200, self.revise_comment(pr, rid, parts[3], parts[4], body)
+                    if parts[2:] == ["steering"]:
+                        return self.propose_steering(pr, rid, body)
+                    if n == 5 and parts[2] == "steering" and parts[4] == "confirm":
+                        return 200, self.confirm_steering(pr, rid, parts[3], body)
+                    if n == 5 and parts[2] == "steering" and parts[4] == "reject":
+                        return 200, self.reject_steering(pr, rid, parts[3], body)
+                    if parts[2:] == ["delegations"]:
+                        return 201, self.create_delegation(pr, rid, body)
+                    if n == 5 and parts[2] == "proposals" and parts[4] == "decide":
+                        return 200, self.decide_proposal(pr, rid, parts[3], body)
                     if n == 5 and parts[2] == "tasks" and parts[4] == "cancel":
                         return 200, self.cancel_task(pr, rid, parts[3])
                     if parts[2:] == ["architecture-links"]:
@@ -3675,9 +5418,12 @@ class CollabService:
                         return self.post_message(pr, rid, body)
             raise CollabError(404, "not found")
         except CollabError as exc:
-            return exc.status, {"error": exc.message, **({"reason": exc.reason} if exc.reason else {})}
-
-
+            err = {"error": exc.message, **getattr(exc, "extra", {})}
+            if exc.reason:
+                err["reason"] = exc.reason
+            if exc.code:
+                err["code"] = exc.code
+            return exc.status, err
 CATALOGUE_MAX = 500
 
 

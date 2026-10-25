@@ -16,7 +16,9 @@ touched) and every open, non-draft PR in it:
    normal). If that returns ``None`` and no live job exists for (key, sha) the
    status says "cannot queue review" instead of "review queued". The store has
    no event that produces ``REVIEW_QUEUED``, so after enqueueing the state
-   stays ``CI_GREEN``, which ``on_review_started`` accepts.
+   stays ``CI_GREEN``, which ``on_review_started`` accepts. ``REVIEWING``
+   with no live (queued/claimed) job for (key, sha), e.g. a PR closed during
+   its review and reopened at the same head, -> ``queue.rearm``.
 4. ``APPROVED`` -> ``decide_merge``: ``merge`` -> status ``success``, then
    ``app.merge_pr(repo, number, head_sha)``; only a True result records
    ``store.on_merged``. False (head moved / not mergeable) or a raise leaves
@@ -28,6 +30,10 @@ touched) and every open, non-draft PR in it:
    ``reject`` -> ``failure``; ``wait`` -> ``pending``.
 5. ``CHANGES_REQUESTED``, ``CI_RED`` and ``ESCALATED`` hold ``failure`` (the
    description says why); only ``store.resume`` clears an escalation.
+6. In those three states the optional ``notifier`` is called on every tick
+   (it is idempotent per head SHA and channel); its errors are logged by PR
+   key only and never block the gate. Each tick starts with
+   ``notifier.begin_tick()``: at most one external command launch per tick.
 
 Decisions and limits:
 - No approval carry-over. A correct carry-over compares each head's diff
@@ -55,14 +61,29 @@ Decisions and limits:
   when first seen, but only when known (kind != "unknown"): a first-wins pin of
   "unknown" would permanently disable same-model reviewer exclusion.
   ``PrInfo.author_login`` is never used as an identity.
-- Retargeting a PR to a different base keeps an approval for the same head
-  SHA (no new head means no re-review): known limitation.
+- Retargeting: an approval is for the base the reviewer saw (the verdict's
+  ``base_ref``). An APPROVED PR whose current ``base_ref`` differs, or whose
+  approval recorded no base (an old or forged event), is never merged:
+  ``store.on_base_changed`` sends it back to ``CI_GREEN``, the head is
+  re-queued (``queue.rearm``) and the status says "base branch changed,
+  re-reviewing". Otherwise a PR reviewed against branch X (holding unreviewed
+  commits) and then retargeted to main would merge those commits unreviewed.
+  Right before posting ``success`` and merging, the PR is re-read
+  (``app.pr_state``): a retarget since the listing takes the same re-review
+  path, a moved head skips the merge (the next tick handles it), and a closed
+  or draft PR or a failed read skips it with the merge back-off. The remaining
+  window is two GitHub round trips: the ``success`` status post and then
+  ``merge_pr``, both after that read.
 - A PR that leaves the open list (closed, merged elsewhere) has its queued
   review cancelled. Detection uses an in-memory memo of PR numbers per repo,
   so a PR closed while the service was down is not noticed.
 - The author is resolved once per (key, head SHA) and cached in memory.
 - Statuses are posted only when (state, description) changes for a SHA (kept
   in memory); the first ``pending`` for a new head SHA is always posted.
+- Main verification: when a ``main_verifier`` is given, each enrolled repo's
+  ``observe(enrollment, rows, stale)`` runs after its PR loop (also when the PR
+  listing failed), in its own try/except: a fault there is counted in
+  ``main_errors`` and never stops PR handling.
 - ``tick`` never raises. Errors are counted per repo / per PR and the loop goes
   on with the next one.
 """
@@ -134,8 +155,12 @@ class GateService:
         registry: AuthorRegistry,
         ci_snapshot: Callable[[], dict],
         now: Callable[[], float] = time.time,
+        notifier=None,
+        main_verifier=None,
     ):
         self._config = config
+        self._notifier = notifier
+        self._main_verifier = main_verifier
         self._app = app
         self._store = store
         self._queue = queue
@@ -192,6 +217,7 @@ class GateService:
             "merged": 0,
             "errors": 0,
             "skipped_drafts": 0,
+            "main_errors": 0,
         }
         with self._tick_lock:
             try:
@@ -221,6 +247,12 @@ class GateService:
     def _tick(self, counts: dict) -> None:
         if not self._config.enabled:
             return
+        begin_tick = getattr(self._notifier, "begin_tick", None)
+        if callable(begin_tick):
+            try:
+                begin_tick()  # one external launch per tick
+            except Exception:  # noqa: BLE001 - a notifier fault never blocks the gate
+                log.warning("review gate: notifier tick reset failed")
         try:
             snapshot = self._ci_snapshot()
             if not isinstance(snapshot, dict):
@@ -237,6 +269,7 @@ class GateService:
                 self._note_error(exc)
                 log.warning("review gate: listing PRs failed for %s", enrollment.repo)
                 counts["errors"] += 1
+                self._observe_main(enrollment, snapshot, stale, counts)
                 continue
             rows = _rows_for(snapshot, enrollment.repo)
             self._forget_closed(enrollment.repo, prs)
@@ -251,6 +284,16 @@ class GateService:
                     self._note_error(exc)
                     log.warning("review gate: %s#%s failed", enrollment.repo, pr.number)
                     counts["errors"] += 1
+            self._observe_main(enrollment, snapshot, stale, counts)
+
+    def _observe_main(self, enrollment, snapshot: dict, stale: bool, counts: dict) -> None:
+        if self._main_verifier is None:
+            return
+        try:
+            self._main_verifier.observe(enrollment, _rows_for(snapshot, enrollment.repo), stale)
+        except Exception:  # noqa: BLE001 - a main-verification fault never stops PR handling
+            log.warning("review gate: main verification failed for %s", enrollment.repo)
+            counts["main_errors"] += 1
 
     def _forget_closed(self, repo: str, prs: list[PrInfo]) -> None:
         """Cancel reviews of PRs that left the open list; drop memos of old heads."""
@@ -308,6 +351,7 @@ class GateService:
 
         state = snap.state
         rearmed = False
+        failures: tuple[str, ...] = ()
         if state == State.CI_PENDING:
             verdict = ci_verdict_for(sha, rows, enrollment, snapshot_stale=stale)
             if verdict.result == "green":
@@ -321,8 +365,10 @@ class GateService:
                 self._store.on_ci_red(key, sha, verdict.failures)
                 snap = self._store.snapshot(key)
                 state = snap.state
+                failures = tuple(verdict.failures)
                 if state != State.ESCALATED:
                     self._status(repo, sha, "failure", "CI failed: " + ", ".join(verdict.failures))
+                    self._notify(key, snap, pr.head_ref, failures)
                     return
             else:
                 self._status(repo, sha, "pending", "review gate: waiting for CI")
@@ -333,6 +379,11 @@ class GateService:
                 return
             self._status(repo, sha, "pending", "review gate: CI green, review queued")
         elif state == State.REVIEWING:
+            if not any(j["key"] == str(key) and j["sha"] == sha for j in self._queue.snapshot()):
+                # Reopened after its job was cancelled: re-queue the head. A job
+                # enqueued between the snapshot and here is cancelled and replaced.
+                self._queue.rearm(key, sha, self._author_model(key, sha, pr.head_ref))
+                counts["enqueued"] += 1
             self._status(repo, sha, "pending", "review gate: review in progress")
         elif state == State.CI_RED:
             if self._posted.get((repo, sha), ("",))[0] != "failure":  # keep the run list
@@ -347,6 +398,16 @@ class GateService:
             )
         elif state == State.APPROVED:
             self._approved(enrollment, pr, key, snap, rows, stale, counts)
+        if state in (State.CHANGES_REQUESTED, State.CI_RED, State.ESCALATED):
+            self._notify(key, snap, pr.head_ref, failures)
+
+    def _notify(self, key: PrKey, snap: PrSnapshot, head_ref: str, failures) -> None:
+        if self._notifier is None:
+            return
+        try:
+            self._notifier.notify(key, snap, head_ref, failures)
+        except Exception:  # noqa: BLE001 - a notification never blocks the gate
+            log.warning("review gate: notification failed for %s#%s", key.repo, key.number)
 
     def _ensure_queued(self, key: PrKey, sha: str, head_ref: str, counts: dict) -> bool:
         """Plain (deduping) enqueue; False when no live job exists for (key, sha)."""
@@ -367,6 +428,11 @@ class GateService:
     ) -> None:
         repo, sha = enrollment.repo, pr.head_sha
         if pr.draft:  # never merge a draft (drafts are skipped earlier too)
+            return
+        if snap.approved_base_ref is None or pr.base_ref != snap.approved_base_ref:
+            # Approved for another base (retargeted) or for an unknown one: fail
+            # closed and review this head again against the current base.
+            self._rereview_base(key, pr, counts)
             return
         checks = []
         for event in enrollment.required_events:
@@ -391,6 +457,21 @@ class GateService:
         backoff = self._merge_backoff.get((key, sha))
         if backoff is not None and self._now() < backoff[0]:
             return  # the "retrying at" pending status is already posted
+        # Fresh single-PR read right before the merge: the listing may be up to
+        # a tick old. Before ``success`` so a refused merge never shows success.
+        try:
+            fresh = self._app.pr_state(repo, pr.number)
+        except Exception:
+            self._back_off(key, sha, "PR re-read failed")
+            raise
+        if fresh is None or fresh.draft:
+            self._back_off(key, sha, "PR not open or draft")
+            return
+        if fresh.head_sha != sha:
+            return  # head moved: the next tick handles the new head
+        if fresh.base_ref != snap.approved_base_ref:
+            self._rereview_base(key, fresh, counts)
+            return
         self._status(repo, sha, "success", "review gate: approved, CI green")
         try:
             merged = self._app.merge_pr(repo, pr.number, sha)
@@ -409,6 +490,13 @@ class GateService:
         if (key, sha) not in self._update_tried:
             self._update_tried.add((key, sha))
             self._app.update_branch(repo, pr.number, sha)
+
+    def _rereview_base(self, key: PrKey, pr: PrInfo, counts: dict) -> None:
+        sha = pr.head_sha
+        if self._store.on_base_changed(key, sha, pr.base_ref):
+            self._queue.rearm(key, sha, self._author_model(key, sha, pr.head_ref))
+            counts["enqueued"] += 1
+        self._status(key.repo, sha, "pending", "review gate: base branch changed, re-reviewing")
 
     def _back_off(self, key: PrKey, sha: str, why: str) -> None:
         previous = self._merge_backoff.get((key, sha))

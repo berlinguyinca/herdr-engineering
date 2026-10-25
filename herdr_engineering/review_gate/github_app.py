@@ -33,10 +33,18 @@ MAX_PR_PAGES = 20
 COMPARE_FILE_CAP = 300
 REFRESH_MARGIN = 60
 STATUS_DESCRIPTION_MAX = 140
+REVIEW_TITLE_MAX = 500
+REVIEW_BODY_MAX = 20000
+# Files read for a review (3 pages of 100). GitHub lists up to 3000 files per PR;
+# a PR with 300 or more files is marked truncated, so it cannot PASS.
+PR_FILES_CAP = 300
 _NAME = re.compile(r"[A-Za-z0-9_.-]+")
 _SHA = re.compile(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}")
 _BLOB = re.compile(r"[0-9a-fA-F]{40}")
 _HUNK = re.compile(r"^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@.*$", re.MULTILINE)
+SUBJECT_MAX = 200
+_SQUASH_PR = re.compile(r"\(#([0-9]{1,9})\)\s*$")
+_MERGE_PR = re.compile(r"Merge pull request #([0-9]{1,9})(?![0-9])")
 _STATES = ("pending", "success", "failure", "error")
 _MESSAGES = {
     "authentication": "GitHub rejected the App credential.",
@@ -70,6 +78,43 @@ class PrInfo:
     base_ref: str
     author_login: str
     draft: bool
+
+
+@dataclass(frozen=True)
+class ReviewFile:
+    path: str
+    status: str
+    patch: str | None
+
+
+@dataclass(frozen=True)
+class ReviewMaterial:
+    title: str
+    body: str
+    base_ref: str
+    head_sha: str
+    files: tuple[ReviewFile, ...]
+    truncated: bool
+
+
+@dataclass(frozen=True)
+class CommitInfo:
+    sha: str
+    subject: str
+    pr_number: int | None
+
+
+@dataclass(frozen=True)
+class CommitRange:
+    commits: tuple[CommitInfo, ...]
+    total: int
+    truncated: bool
+
+
+def pr_number_from_subject(subject: str) -> int | None:
+    """The PR a commit subject names: a trailing ``(#N)`` (squash) or ``Merge pull request #N``."""
+    match = _MERGE_PR.match(subject) or _SQUASH_PR.search(subject)
+    return int(match.group(1)) if match else None
 
 
 def _repo_path(repo):
@@ -251,6 +296,113 @@ class GitHubAppClient:
             "invalid_response"
         )  # cap reached with a full page: never truncate silently
 
+    def pr_state(self, repo: str, number: int) -> PrInfo | None:
+        """One fresh read of a PR: its PrInfo while open, None otherwise.
+
+        Used right before a merge so a head move or retarget after the tick's
+        listing is seen. Malformed data raises GitHubAppError("invalid_response").
+        """
+        slug, number = _repo_path(repo), _number(number)
+        data = self._send("GET", f"/repos/{slug}/pulls/{number}")
+        try:
+            state = data["state"]
+            info = PrInfo(
+                number=number,
+                head_sha=data["head"]["sha"],
+                head_ref=data["head"]["ref"],
+                base_ref=data["base"]["ref"],
+                author_login=str((data.get("user") or {}).get("login", "")),
+                draft=data.get("draft", False),
+            )
+        except (KeyError, TypeError, AttributeError):
+            raise GitHubAppError("invalid_response") from None
+        if not all(
+            isinstance(v, str) for v in (state, info.head_sha, info.head_ref, info.base_ref)
+        ):
+            raise GitHubAppError("invalid_response")
+        if not isinstance(info.draft, bool):
+            raise GitHubAppError("invalid_response")
+        if state != "open":
+            return None
+        return info
+
+    def _review_pr(self, slug, number, sha):
+        """(title, body, base_ref, base_sha) while the PR is open at ``sha``; None otherwise."""
+        data = self._send("GET", f"/repos/{slug}/pulls/{number}")
+        try:
+            state, head = data["state"], data["head"]["sha"]
+            base_ref, title, body = data["base"]["ref"], data["title"], data.get("body")
+            raw_base_sha = data["base"]["sha"]
+        except (KeyError, TypeError, AttributeError):
+            raise GitHubAppError("invalid_response") from None
+        base_sha = None
+        try:
+            base_sha = _sha(raw_base_sha)
+        except ValueError:
+            pass
+        if base_sha is None:  # raised outside the except block: no chained context
+            raise GitHubAppError("invalid_response")
+        title = "" if title is None else title
+        body = "" if body is None else body
+        if not all(isinstance(v, str) for v in (state, head, base_ref, title, body)):
+            raise GitHubAppError("invalid_response")
+        if state != "open" or head.lower() != sha:
+            return None
+        return title[:REVIEW_TITLE_MAX], body[:REVIEW_BODY_MAX], base_ref, base_sha
+
+    def review_material(
+        self, repo: str, number: int, expected_head_sha: str, *, max_bytes: int
+    ) -> ReviewMaterial | None:
+        """Bounded title/body/patches of an open PR, or None if it moved off ``expected_head_sha``.
+
+        Patches are included until their running UTF-8 size would exceed ``max_bytes``; after
+        that files are only listed. Anything left out sets ``truncated``. The PR is re-read after
+        the files so a push, close or retarget (base change) in between yields None.
+        """
+        slug, number, sha = _repo_path(repo), _number(number), _sha(expected_head_sha)
+        if type(max_bytes) is not int or max_bytes < 0:
+            raise ValueError("max_bytes must be a non-negative integer")
+        first = self._review_pr(slug, number, sha)
+        if first is None:
+            return None
+        files, truncated, used, full = [], False, 0, False
+        for page in range(1, PR_FILES_CAP // 100 + 1):
+            data = self._send("GET", f"/repos/{slug}/pulls/{number}/files?per_page=100&page={page}")
+            if not isinstance(data, list) or len(data) > 100:
+                raise GitHubAppError("invalid_response")
+            for item in data:
+                try:
+                    path, status, patch = item["filename"], item["status"], item.get("patch")
+                except (KeyError, TypeError, AttributeError):
+                    raise GitHubAppError("invalid_response") from None
+                if not isinstance(path, str) or not isinstance(status, str):
+                    raise GitHubAppError("invalid_response")
+                if patch is not None and not isinstance(patch, str):
+                    raise GitHubAppError("invalid_response")
+                if patch is None or full:
+                    truncated = True
+                    patch = None
+                else:
+                    size = len(patch.encode("utf-8", "replace"))
+                    if used + size > max_bytes:
+                        full, truncated, patch = True, True, None
+                    else:
+                        used += size
+                files.append(ReviewFile(path, status, patch))
+            if len(data) < 100:
+                break
+        else:
+            truncated = True  # read PR_FILES_CAP files: there may be more
+        second = self._review_pr(slug, number, sha)
+        # Both the base name AND the base commit must match the first read: a
+        # name-only check misses a retarget main -> X -> main during the file
+        # pages. A normal forward move of the base branch during the fetch also
+        # voids it; the job is then skipped and retried after its lease expires.
+        if second is None or second[2:] != first[2:]:
+            return None  # head moved, closed, retargeted, or base moved during the fetch
+        title, body, base_ref, _base_sha = first
+        return ReviewMaterial(title, body, base_ref, sha, tuple(files), truncated)
+
     def set_status(
         self,
         repo: str,
@@ -296,6 +448,66 @@ class GitHubAppClient:
         self._send(
             "PUT", f"/repos/{slug}/pulls/{number}/update-branch", body={"expected_head_sha": sha}
         )
+
+    def default_branch_head(self, repo: str) -> tuple[str, str]:
+        """(default branch name, its head sha): two reads, malformed data is invalid_response."""
+        slug = _repo_path(repo)
+        info = self._send("GET", f"/repos/{slug}")
+        branch = info.get("default_branch") if isinstance(info, dict) else None
+        if (
+            not isinstance(branch, str)
+            or not branch
+            or len(branch) > 255
+            or any(ord(c) < 33 or ord(c) == 127 for c in branch)
+        ):
+            raise GitHubAppError("invalid_response")
+        data = self._send("GET", f"/repos/{slug}/branches/{urllib.parse.quote(branch, safe='')}")
+        raw = (data.get("commit") or {}).get("sha") if isinstance(data, dict) else None
+        head = None
+        try:
+            head = _sha(raw)
+        except ValueError:
+            pass
+        if head is None:  # raised outside the except block: no chained context
+            raise GitHubAppError("invalid_response")
+        return branch, head
+
+    def head_commit(self, repo: str, sha: str) -> CommitInfo:
+        """One commit's subject and PR number (the range when no green sha is known)."""
+        slug, sha = _repo_path(repo), _sha(sha)
+        data = self._send("GET", f"/repos/{slug}/commits/{sha}")
+        message = (data.get("commit") or {}).get("message") if isinstance(data, dict) else None
+        if not isinstance(message, str):
+            raise GitHubAppError("invalid_response")
+        first = message.split("\n", 1)[0].strip()
+        return CommitInfo(sha, first[:SUBJECT_MAX], pr_number_from_subject(first))
+
+    def commits_between(self, repo: str, base_sha: str, head_sha: str) -> CommitRange:
+        """Commits after ``base_sha`` up to ``head_sha``, oldest first, one compare read.
+
+        GitHub returns at most 250 commits there; ``truncated`` is set when it reports more.
+        """
+        slug, base, head = _repo_path(repo), _sha(base_sha), _sha(head_sha)
+        data = self._send("GET", f"/repos/{slug}/compare/{base}...{head}")
+        raw = data.get("commits") if isinstance(data, dict) else None
+        total = data.get("total_commits") if isinstance(data, dict) else None
+        if not isinstance(raw, list) or type(total) is not int or total < 0 or total < len(raw):
+            raise GitHubAppError("invalid_response")
+        out = []
+        failed = False
+        try:
+            for item in raw:
+                sha = _sha(item["sha"])
+                message = item["commit"]["message"]
+                if not isinstance(message, str):
+                    raise ValueError
+                first = message.split("\n", 1)[0].strip()
+                out.append(CommitInfo(sha, first[:SUBJECT_MAX], pr_number_from_subject(first)))
+        except (KeyError, TypeError, AttributeError, ValueError):
+            failed = True
+        if failed:
+            raise GitHubAppError("invalid_response")
+        return CommitRange(tuple(out), total, total > len(out))
 
     def patch_id(self, repo: str, base_sha: str, head_sha: str) -> str:
         """Hash of the per-file patches between base and head, hunk line offsets ignored.

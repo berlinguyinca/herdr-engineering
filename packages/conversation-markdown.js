@@ -85,32 +85,54 @@ const TOKEN_WITH_LINKS = /`([^`\n]+)`|\[([^\]\n]{1,500})\]\(([^\s)]{1,2100})\)|\
 // same groups, the link alternative can never match (groups 2 and 3 stay undefined)
 const TOKEN_NO_LINKS = /`([^`\n]+)`|(\b\B)()|\*\*([^*\n]+)\*\*|\*([^*\n]+)\*|~~([^~\n]+)~~|(?<![A-Za-z0-9])(https?:\/\/[^\s<>`*"\\]{1,2100})/g;
 
-function inline(text, depth = 0, noLinks = false) {
+// ---- Entity reference tokens (cross-linking) --------------------------------
+// Off unless the caller passes `references` (the operator dashboard does; the public collaboration site never
+// does, and this module imports nothing from the dashboard). A reference is a closed syntax, kind:id, and is
+// linked only when `references.resolve(kind, id)` returns {href, label} for an entity that exists right now;
+// the target comes from the resolver, never from the text, so look-alikes stay plain text.
+const REF_ALTERNATIVE = '|(?<![A-Za-z0-9_/:.%-])(session|mission|host|ci|pr):([A-Za-z0-9_.:%@/#-]{1,300})';
+const WITH_REFS = new RegExp(TOKEN_WITH_LINKS.source + REF_ALTERNATIVE, 'g');
+const NO_LINKS_WITH_REFS = new RegExp(TOKEN_NO_LINKS.source + REF_ALTERNATIVE, 'g');
+
+function referenceLink(kind, raw, references) {
+  const [id, tail] = splitTrailingPunctuation(raw);
+  if (!id) return null;
+  let target = null;
+  try { target = references.resolve(kind, id); } catch { target = null; }
+  if (!target || typeof target.href !== 'string' || !target.href.startsWith('#/')) return null;
+  const label = typeof target.label === 'string' && target.label ? cap(target.label, MAX_DISPLAY) : `${kind}:${cap(id, MAX_DISPLAY)}`;
+  return `<a class="md-entity-ref" href="${esc(target.href)}" title="${esc(`${kind}:${id}`)}">${esc(label)}</a>${esc(tail)}`;
+}
+
+function inline(text, depth = 0, noLinks = false, references = null) {
   if (depth > 4) return esc(text);
   // The markdown-link alternative scans up to ~2600 characters per '[': only try it when a link can exist and the
   // text is of chat size, so a 100k-character "[[[[" message cannot make the page stall.
-  const token = text.length <= LINK_SYNTAX_MAX && text.includes('](') && text.includes(')') ? TOKEN_WITH_LINKS : TOKEN_NO_LINKS;
+  const links = text.length <= LINK_SYNTAX_MAX && text.includes('](') && text.includes(')');
+  const refs = references && !noLinks && /(?:session|mission|host|ci|pr):/.test(text);
+  const token = refs ? (links ? WITH_REFS : NO_LINKS_WITH_REFS) : (links ? TOKEN_WITH_LINKS : TOKEN_NO_LINKS);
   let out = '', end = 0;
   for (const m of text.matchAll(token)) {
     out += esc(text.slice(end, m.index));
     if (m[1] !== undefined) out += `<code>${esc(m[1])}</code>`;
     else if (m[2] !== undefined) out += !noLinks && safeLink(m[3]) ? markdownLink(m[2], m[3], depth) : esc(m[0]);
-    else if (m[4] !== undefined) out += `<strong>${inline(m[4], depth + 1, noLinks)}</strong>`;
-    else if (m[5] !== undefined) out += `<em>${inline(m[5], depth + 1, noLinks)}</em>`;
-    else if (m[6] !== undefined) out += `<del>${inline(m[6], depth + 1, noLinks)}</del>`;
-    else out += (noLinks ? null : linkifyBare(m[7])) ?? esc(m[0]);
+    else if (m[4] !== undefined) out += `<strong>${inline(m[4], depth + 1, noLinks, references)}</strong>`;
+    else if (m[5] !== undefined) out += `<em>${inline(m[5], depth + 1, noLinks, references)}</em>`;
+    else if (m[6] !== undefined) out += `<del>${inline(m[6], depth + 1, noLinks, references)}</del>`;
+    else if (m[7] !== undefined) out += (noLinks ? null : linkifyBare(m[7])) ?? esc(m[0]);
+    else out += referenceLink(m[8], m[9], references) ?? esc(m[0]);
     end = m.index + m[0].length;
   }
   return out + esc(text.slice(end));
 }
 
-export function renderMarkdown(value) {
+export function renderMarkdown(value, { references = null } = {}) {
   const text = String(value ?? '');
   const lines = text.slice(0, 200000).replace(/\r\n?/g, '\n').split('\n');
   const out = [];
   let paragraph = [], list = [], listType = '', fence = null, code = [];
-  const flushParagraph = () => { if (paragraph.length) out.push(`<p>${paragraph.map((s) => inline(s)).join('<br>')}</p>`); paragraph = []; };
-  const flushList = () => { if (list.length) out.push(`<${listType}>${list.map((s) => `<li>${/^\[[ xX]\] /.test(s) ? `<input type="checkbox" disabled${/^\[[xX]\]/.test(s) ? ' checked' : ''}> ${inline(s.slice(4))}` : inline(s)}</li>`).join('')}</${listType}>`); list = []; listType = ''; };
+  const flushParagraph = () => { if (paragraph.length) out.push(`<p>${paragraph.map((s) => inline(s, 0, false, references)).join('<br>')}</p>`); paragraph = []; };
+  const flushList = () => { if (list.length) out.push(`<${listType}>${list.map((s) => `<li>${/^\[[ xX]\] /.test(s) ? `<input type="checkbox" disabled${/^\[[xX]\]/.test(s) ? ' checked' : ''}> ${inline(s.slice(4), 0, false, references)}` : inline(s, 0, false, references)}</li>`).join('')}</${listType}>`); list = []; listType = ''; };
   const cells = (line) => line.trim().replace(/^\|/, '').replace(/\|$/, '').split(/(?<!\\)\|/).map((s) => s.trim().replace(/\\\|/g, '|'));
   for (let index = 0; index < lines.length; index++) {
     const line = lines[index];
@@ -127,17 +149,17 @@ export function renderMarkdown(value) {
     if (separators.length && separators.length <= 64 && separators.every((cell) => /^:?-{3,}:?$/.test(cell)) && cells(line).length === separators.length) {
       flushParagraph(); flushList();
       const align = separators.map((cell) => cell.startsWith(':') && cell.endsWith(':') ? 'center' : cell.endsWith(':') ? 'right' : 'left');
-      const row = (values, tag) => '<tr>' + separators.map((_, i) => `<${tag} style="text-align:${align[i]}">${inline(values[i] || '')}</${tag}>`).join('') + '</tr>';
+      const row = (values, tag) => '<tr>' + separators.map((_, i) => `<${tag} style="text-align:${align[i]}">${inline(values[i] || '', 0, false, references)}</${tag}>`).join('') + '</tr>';
       const rows = []; index++;
       while (rows.length < 500 && index + 1 < lines.length && lines[index + 1].includes('|') && lines[index + 1].trim()) rows.push(row(cells(lines[++index]), 'td'));
       out.push(`<div class="conversation-table"><table><thead>${row(cells(line), 'th')}</thead><tbody>${rows.join('')}</tbody></table></div>`); continue;
     }
     const heading = /^(#{1,6})\s+(.+)$/.exec(line);
-    if (heading) { flushParagraph(); flushList(); out.push(`<h${heading[1].length}>${inline(heading[2])}</h${heading[1].length}>`); continue; }
+    if (heading) { flushParagraph(); flushList(); out.push(`<h${heading[1].length}>${inline(heading[2], 0, false, references)}</h${heading[1].length}>`); continue; }
     const item = /^\s{0,3}(?:([-+*])|\d+[.)])\s+(.+)$/.exec(line);
     if (item) { flushParagraph(); const type = item[1] ? 'ul' : 'ol'; if (type !== listType) flushList(); listType = type; list.push(item[2]); continue; }
     flushList();
-    if (/^>\s?/.test(line)) { flushParagraph(); out.push(`<blockquote>${inline(line.replace(/^>\s?/, ''))}</blockquote>`); }
+    if (/^>\s?/.test(line)) { flushParagraph(); out.push(`<blockquote>${inline(line.replace(/^>\s?/, ''), 0, false, references)}</blockquote>`); }
     else paragraph.push(line);
   }
   if (fence !== null) out.push(`<pre><code>${esc(code.join('\n'))}</code></pre>`);

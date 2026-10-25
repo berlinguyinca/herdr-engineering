@@ -26,7 +26,7 @@ runs the service.
 The per-host **auto-registration agent** is intentionally *not* containerized:
 it must see host listeners via `ss`/`lsof`, so it stays a host service on
 every fleet host (systemd user unit on Linux, launchd LaunchAgent on macOS),
-pointing at the gateway via `HERDR_ENGINEERING_FABRIC_URL=http://dev.lan:29999`.
+pointing at the gateway via `fabric.url` in `fleet-config.yaml` (or `fabric.gateway_url` in `config.yaml`), e.g. `http://dev.lan:29999`.
 Join a machine with `scripts/fabric-agent.sh` (Linux) or
 `scripts/fabric-agent-macos.sh` (macOS); leave with `scripts/fabric-offboard.sh`.
 See [`docs/operations/fleet-lifecycle.md`](../../docs/operations/fleet-lifecycle.md)
