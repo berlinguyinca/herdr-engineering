@@ -1,8 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  EDGE_STYLE, MAX_RENDER_NODES, buildGantt, filterGraph, fmtDuration, layoutGraph, mergePages, nextNode,
-  renderGanttSvg, focusKey, focusSelector, renderGanttTable, renderGraphSvg, renderGraphTable, renderInspector, renderLineage, renderReplay,
+  EDGE_STYLE, MAX_RENDER_NODES, buildGantt, filterGraph, fmtDuration, layoutGraph, mergePages, nextNode, pagesTruncated,
+  renderGanttSvg, focusKey, focusSelector, focusSuccessor, renderGanttTable, renderGraphSvg, renderGraphTable, renderGraphLegend, renderInspector, renderLineage, renderReplay,
   nodeLabel, replayTarget, replayText, shapeOf, stateLook,
 } from '../collab-lineage.js';
 
@@ -23,6 +23,14 @@ test('pages merge by identity and later pages win; bad edges are dropped', () =>
   assert.equal(m.nodes.find((n) => n.id === 'agent:a').label, 'new');
   assert.equal(m.edges.length, 1);
   assert.deepEqual(mergePages(null), { nodes: [], edges: [] });
+});
+
+test('system-intelligence edge kinds are not dropped by mergePages', () => {
+  const m = mergePages([{ nodes: [node('service:api', { label: 'API' }), node('host:h1', { label: 'H1' }),
+    node('repository:acme/api', { label: 'api' }), node('request:req-1', { label: 'R1' }), node('span:s0', { label: 'S0' })],
+    edges: [edge('serves', 'service:api', 'host:h1'), edge('runs_on', 'service:api', 'host:h1'),
+      edge('belongs_to', 'repository:acme/api', 'service:api'), edge('observed_in', 'request:req-1', 'service:api'), edge('calls', 'span:s0', 'service:api')] }]);
+  assert.deepEqual(m.edges.map((e) => e.edge_type).sort(), ['belongs_to', 'calls', 'observed_in', 'runs_on', 'serves']);
 });
 
 test('reviewed edges for different commits are distinct edges', () => {
@@ -86,11 +94,30 @@ test('the SVG graph is escaped, labelled, keyboard operable and not colour-only'
   assert.match(html, /role="group" aria-label="Lineage graph: 2 nodes and 1 links/);
 });
 
+test('the graph legend is data-derived and names the new spec kinds', () => {
+  const html = renderGraphLegend();
+  for (const t of ['repository', 'package', 'host', 'request', 'model']) {
+    assert.ok(html.includes(t), `legend names node kind ${t}`);
+  }
+  for (const t of ['calls', 'queued-on', 'routes-to', 'blocked-by']) {
+    assert.ok(html.includes(t), `legend names edge tag ${t}`);
+  }
+});
+
 test('every link type has a distinct dash/tag pair and node types map to shapes', () => {
   const pairs = Object.values(EDGE_STYLE).map((s) => `${s.dash}|${s.tag}`);
   assert.equal(new Set(pairs).size, pairs.length);
   assert.equal(new Set(Object.values(EDGE_STYLE).map((s) => s.tag)).size, Object.keys(EDGE_STYLE).length);
   assert.deepEqual(['agent', 'task', 'pr', 'review', 'handoff', 'nothing'].map(shapeOf), ['round', 'rect', 'tag', 'diamond', 'hex', 'rect']);
+  // system-intelligence kinds (spec 02) must be drawn, not dropped or generic.
+  assert.ok(EDGE_STYLE.calls && EDGE_STYLE.calls.word === 'calls');
+  assert.ok(EDGE_STYLE.blocked_by && EDGE_STYLE.blocked_by.word === 'blocked by');
+  assert.ok(EDGE_STYLE.runs_on && EDGE_STYLE.runs_on.word === 'runs on');
+  assert.equal(shapeOf('repository'), 'round');
+  assert.equal(shapeOf('host'), 'hex');
+  assert.equal(shapeOf('request'), 'tag');
+  assert.equal(shapeOf('model'), 'round');
+  assert.equal(shapeOf('package'), 'tag', 'package is a tag, not a rect/round');
   assert.equal(stateLook('running').glyph, '●');
   assert.equal(stateLook(null).word, 'no state recorded');
   assert.equal(stateLook('weird').kind, 'other');
@@ -281,6 +308,32 @@ test('focus keys round-trip to a selector for every control kind', () => {
   assert.equal(focusSelector('nonsense:x'), null);
 });
 
+test('a form submit button keeps keyboard focus across a redraw (T16: focus was dropped after Post comment / Propose)', () => {
+  const form = (name, id) => ({ getAttribute: (k) => ({ 'data-wb-form': name, 'data-wb-id': id }[k] ?? null) });
+  const submit = (f) => ({ getAttribute: (k) => (k === 'type' ? 'submit' : null), closest: (sel) => (sel === '[data-wb-form]' ? f : null) });
+  assert.equal(focusKey(submit(form('comment', null))), 'wbs:comment:');
+  assert.equal(focusSelector('wbs:comment:'), '[data-wb-form="comment"] button[type="submit"]');
+  assert.equal(focusKey(submit(form('edit', 'c9'))), 'wbs:edit:c9');
+  assert.equal(focusSelector('wbs:edit:c9'), '[data-wb-form="edit"][data-wb-id="c9"] button[type="submit"]');
+  assert.equal(focusKey({ getAttribute: (k) => (k === 'type' ? 'submit' : null), closest: () => null }), null);
+});
+
+test('a graph the server cut off says so and offers no Load more (T16: it used to look complete)', () => {
+  const base = { graphAll: sample(), filtered: { ...sample(), match: new Set() }, asOf: { step: 5, visible_events: 5, head: true }, filters: { types: new Set(), edgeTypes: new Set() }, total: 3000, mode: 'visual', view: 'graph' };
+  const more = renderLineage({ ...base, graphTruncated: 'scan_budget', graphMore: true });
+  assert.match(more, /data-more/);
+  const last = renderLineage({ ...base, graphTruncated: 'scan_budget', graphMore: false });
+  assert.doesNotMatch(last, /data-more/);
+  assert.match(last, /server stopped reading here/);
+  // an edges-only cut (every node returned, links left out) must NOT claim that nodes are missing
+  for (const reason of ['edge_budget', 'limit', 'response_bytes']) {
+    const edges = renderLineage({ ...base, graphTruncated: reason, graphMore: false });
+    assert.match(edges, /left out some links/, reason);
+    assert.doesNotMatch(edges, /more nodes may exist|data-more/, reason);
+  }
+  assert.doesNotMatch(renderLineage({ ...base, graphTruncated: null }), /stopped reading/);
+});
+
 test('an error still renders the replay controls and a Retry button; no false "will be retried" claim', () => {
   const html = renderLineage({ graphAll: { nodes: [], edges: [] }, filtered: { nodes: [], edges: [], match: new Set() }, asOf: { step: 3, visible_events: 5, head: false }, error: 'Could not load the lineage. Press Retry, or choose Live.', filters: { types: new Set(), edgeTypes: new Set() } });
   assert.match(html, /data-replay="live"/);
@@ -296,4 +349,27 @@ test('the replay status says a choice is queued while loading', () => {
   assert.match(renderReplay({ step: 1, visible_events: 5, head: false }, { busy: true, queued: true }), /latest choice will load next/);
   assert.match(renderReplay({ step: 1, visible_events: 5, head: false }, { busy: true }), /Loading the position/);
   assert.match(renderLineage({ graphAll: { nodes: [], edges: [] }, filtered: { nodes: [], edges: [], match: new Set() }, asOf: { step: 5, visible_events: 5, head: true }, notice: 'That position could not be loaded, so Live is shown.', filters: { types: new Set(), edgeTypes: new Set() } }), /so Live is shown/);
+});
+
+test('focus goes to the logical successor when the focused control is replaced (T16: it used to land on the panel)', () => {
+  assert.deepEqual(focusSuccessor('wba:confirm:collab_s1'), ['[data-wb-act="confirm-go"][data-wb-id="collab_s1"]', '[data-wb-act="confirm-go"]']);
+  assert.deepEqual(focusSuccessor('wba:confirm-cancel:'), ['[data-wb-act="confirm"]']);
+  assert.deepEqual(focusSuccessor('node:attempt:a1'), []);
+  assert.deepEqual(focusSuccessor(null), []);
+  assert.deepEqual(focusSuccessor('wba:confirm-go:collab_s1'), ['[data-wb-act="reject"][data-wb-id="collab_s1"]', '[data-wb-steer="collab_s1"]']);
+  assert.deepEqual(focusSuccessor('wba:history:c1'), []);
+});
+
+test('a truncation reason on any loaded page stays shown after a later, whole page (links incomplete is not forgotten)', () => {
+  assert.equal(pagesTruncated([]), null);
+  assert.equal(pagesTruncated([{ truncated_reason: null }, { truncated_reason: null }]), null);
+  assert.equal(pagesTruncated([{ truncated_reason: 'edge_limit' }, { truncated_reason: null }]), 'edge_limit');
+  assert.equal(pagesTruncated([{ truncated_reason: 'edge_limit' }, { truncated_reason: 'byte_limit' }]), 'byte_limit');
+  assert.equal(pagesTruncated([{ truncated_reason: 'scan_budget' }, { truncated_reason: 'edge_limit' }]), 'scan_budget');
+  // and the panel says so for the merged graph
+  const page = (ids, reason) => ({ nodes: ids.map((id) => ({ id, node_type: 'task', label: id })), edges: [], truncated_reason: reason });
+  const pages = [page(['task:a'], 'edge_limit'), page(['task:b'], null)];
+  const g = mergePages(pages);
+  const html = renderLineage({ graphAll: g, filtered: filterGraph(g, {}), asOf: { step: 1, visible_events: 1, head: true }, timeline: null, error: null, busy: false, view: 'graph', mode: 'visual', clock: 'recorded', sel: null, focus: null, filters: { q: '', types: new Set(), edgeTypes: new Set(), state: '' }, total: 2, graphTruncated: pagesTruncated(pages), graphMore: false, width: 800 });
+  assert.match(html, /left out some links \(edge_limit\)/);
 });

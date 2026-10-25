@@ -118,3 +118,15 @@ test('Services refreshes in place through its own view on SSE',async()=>withPage
  await until(async()=>reads.services===before+1,'services refresh');
  assert.deepEqual(await page.evaluate(()=>({same:document.querySelector('#view h1')===window.__h1,spinners:window.__spinners})),{same:true,spinners:0});
 }));
+
+test('a malformed %-escape in the URL shows an error page instead of an uncaught rejection',async()=>withPage(async(page,base)=>{
+ const errors=[];page.on('pageerror',e=>errors.push(String(e)));
+ await boot(page,base,'/missions/%E0%A4%A');
+ await page.locator('#view herdr-error').waitFor();
+ for(const hash of ['/llm/session/%ZZ','/services/%','/hosts/%E0']){
+  await page.evaluate(h=>{location.hash=h;},hash);
+  await page.locator('#view herdr-error').waitFor();
+ }
+ await sleep(200);
+ assert.deepEqual(errors.filter(e=>/URI/.test(e)),[]);
+}));

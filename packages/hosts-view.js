@@ -3,7 +3,7 @@
 // changed (identical data: zero writes). The ?drift=1 filter is a navigation, so it is fixed per mount.
 import { patchList, morph, patchText } from './patch.js';
 import { snapshotText, animateChanges } from './motion.js';
-import { liveRefresher } from './refresh-bus.js';
+import { liveRefresher, pollWhileVisible } from './refresh-bus.js';
 import { renderFleetMatrix } from './fleet-view.js';
 import { renderHostCard, HOST_CARD_STYLE, staleFor } from './host-view.js';
 import { configNotice, indexConfigStatus } from './fleet-config-badge.js';
@@ -14,7 +14,10 @@ const meterKey = (el) => `${el.closest('[data-host-id]')?.getAttribute('data-hos
 const cellKey = (el) => `${el.parentElement?.querySelector('th[scope=row]')?.textContent}|${el.getAttribute('data-host-id')}`;
 const STALE_TICK_MS = 15000;
 
-export const HOST_INTERESTS = ['HostHeartbeat', 'HostRegistered', 'HostUnavailable'];
+// Host views take every live event (no interest filter) AND poll: the server keeps routine 30 s
+// heartbeats in memory without emitting an event and never emits one for a host that goes silent,
+// so on a quiet fleet only the poll moves telemetry forward and turns a dead host stale.
+export const HOST_POLL_MS = 15000;
 
 export async function loadHosts(client) {
   const [{ hosts }, matrix, configStatus] = await Promise.all([
@@ -67,5 +70,6 @@ export function mountHosts(container, client, { data = null, driftedOnly = false
 
   const live = liveRefresher(() => loadHosts(client), apply, () => container.querySelector('herdr-freshness'));
   if (data) live.applied(data); else live.refresh();
-  return { interests: HOST_INTERESTS, refresh: (hint) => live.refresh(hint), dispose: () => { live.dispose(); clearInterval(tick); } };
+  const stopPoll = pollWhileVisible(() => live.refresh(), HOST_POLL_MS);
+  return { refresh: (hint) => live.refresh(hint), dispose: () => { stopPoll(); live.dispose(); clearInterval(tick); } };
 }

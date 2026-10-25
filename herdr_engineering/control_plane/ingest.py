@@ -10,9 +10,12 @@ to one control-plane entity.
 """
 from __future__ import annotations
 
+import logging
 import re
 
 from ..review_gate.entities import RESERVED_ENTITY_PREFIXES
+
+log = logging.getLogger(__name__)
 from .envelope import ENVELOPE_ONLY_TYPES, EnvelopeConflict, normalize_envelope
 from .events import SequenceCollision
 from .graph import validate_lineage
@@ -37,6 +40,22 @@ def _git_identity(payload):
     return {"repository_id": next(iter(identities), None), "commit_sha": commit_sha}
 
 
+# Entity types an ingest principal may write. Dispatched types have handlers; the generic ones are
+# plain activity records nothing authoritative reads back. Adding a type here is a security decision.
+DISPATCHED_ENTITY_TYPES = frozenset({"lineage", "host", "session", "mission", "service", "inspector",
+                                     "mission_activity"})
+# ledger / platform / lifecycle are the Pi envelope adapters' activity streams (envelopeAdapters.ts)
+# repository / request / span are the opt-in system-graph adapter's lifecycle streams (graph_ingest.py, runbook
+# docs/specs/herdr-system-graph-20261020/11-p0-p6-status-and-runbook.md). They were accepted before T16, nothing
+# authoritative reads them back, and like mission/session they are only reflected into lineage when the operator
+# turned the adapter on.
+GENERIC_ENTITY_TYPES = frozenset({"task", "note", "workspace", "ledger", "platform", "lifecycle",
+                                  "repository", "request", "span"})
+INGEST_ENTITY_TYPES = DISPATCHED_ENTITY_TYPES | GENERIC_ENTITY_TYPES
+# Event types the server itself writes for an allowed entity type: receipts other code trusts as idempotency
+# markers (repo.send_message, ci_debug, bridge). A client may not name them.
+SERVER_OWNED_EVENT_TYPES = {"session": frozenset({"SessionCommandQueued", "SessionCommandSettled"})}
+
 # Sources whose host events prove the host is alive: its fabric agent, and the
 # herdr feed plugin on the host (deploy/herdr-cp-feed-plugin posts host.heartbeat
 # / host.inventory with no source, i.e. the default "herdr"). Any other source
@@ -48,7 +67,7 @@ _AGENT_ONLY_HOST_KEYS = ("telemetry", "cpu", "mem", "disk", "inventory")
 class IngestService:
     """Translates lifecycle event envelopes into idempotent repo mutations."""
 
-    def __init__(self, repo, key_scopes=None):
+    def __init__(self, repo, key_scopes=None, system_graph: bool = False):
         self.repo = repo
         # Per-key room/mission allow-lists for lineage addressed to a room or mission (operator YAML
         # `control_plane.lineage_key_scopes`, resolved by the server to principal ids):
@@ -62,6 +81,13 @@ class IngestService:
         # the HCN service's `is_hcn_node`; checked on EVERY endpoint of an edge, so an ingest key cannot attach
         # a fake `produced` edge to an accepted artifact either.
         self.service_node = None
+        # System-graph live-ingest adapter (system-graph spec P2-P4). When enabled,
+        # mission/session/repository/request/span lifecycle events are ALSO emitted
+        # as lineage envelopes into the running graph. Opt-in; disabled by default.
+        self.system_graph = None
+        if system_graph:
+            from .graph_ingest import GraphIngestAdapter
+            self.system_graph = GraphIngestAdapter(repo, scope="org")
 
     def _check_lineage_scope(self, env: dict) -> None:
         """Fail closed: a non-operator key may address a room or mission only if the operator listed it.
@@ -99,7 +125,8 @@ class IngestService:
                 # the room's service principal) and adds nothing to the endpoint's own namespace
                 actor.get("kind") == "collab" and event_type.startswith("edge.")
                 and payload.get("edge_type") == "cross_link") or (
-                actor.get("kind") == "operator" and actor.get("authenticated_by") not in (None, "none")):
+                # T16 L1: an open listener is no operator here either (it already is not for service nodes)
+                actor.get("kind") == "operator" and actor.get("authenticated_by") not in (None, "none", "open_listener")):
             return
         written = payload.get("from_id") if event_type.startswith("edge.") else payload.get("node_id")
         if isinstance(written, str) and self.reserved_node(written):
@@ -138,15 +165,19 @@ class IngestService:
         if not re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", source):
             raise ValueError("invalid source")
 
-        # Provider-owned observations and review outcomes have dedicated,
-        # authenticated adapters; generic telemetry cannot forge those streams.
-        if entity_type in {"plannotator_review", "ci_pipeline", "agent_identity", "agent_summary",
-                           "custom_model", "llm_key", "token_usage"}:
-            raise ValueError("provider-owned entity type is not accepted by generic ingestion")
-        # The review gate's streams decide merges; a forged verdict/resume/pin
-        # would merge unreviewed code, so they are reserved for the gate itself.
+        # The review gate's streams decide merges; a forged verdict/resume/pin would merge unreviewed code.
+        # Checked first, and as well as the allow-list so a future allow-list entry can never open a reserved prefix.
         if entity_type.strip().lower().startswith(RESERVED_ENTITY_PREFIXES):
             raise ValueError("reserved review-gate entity type is not accepted by generic ingestion")
+        # Architecture snapshots are published through their validating route only.
+        if entity_type.strip().lower().startswith("architecture"):
+            raise ValueError("reserved architecture entity type is not accepted by generic ingestion")
+        # T16 H1/M1/M5: an ALLOW-LIST. Everything else (collab, ci_*, plannotator_review, agent_identity,
+        # token_usage, ...) is owned by a dedicated, authenticated adapter and can never be written here.
+        if entity_type not in INGEST_ENTITY_TYPES:
+            raise ValueError("entity type is not accepted by generic ingestion")
+        if event_type in SERVER_OWNED_EVENT_TYPES.get(entity_type, ()):
+            raise ValueError("event type is reserved for the server")
         env = normalize_envelope(body, principal, self.repo._stamp())
         if env is None and entity_type == "lineage":
             raise ValueError("lineage events require schema_version 2")
@@ -190,7 +221,8 @@ class IngestService:
             except SequenceCollision as exc:
                 if exc.event_id_clash:
                     raise EnvelopeConflict(str(exc)) from None
-                raise EnvelopeConflict("source_sequence is already used by another event") from None
+                raise EnvelopeConflict("source_sequence is already used by another event", reason="sequence_conflict",
+                                       last_sequence=ledger.last_sequence(env.get("actor"), env["source"])) from None
             except EventAlreadyStored:
                 # Durable insert landed earlier but the ack was lost (or the
                 # in-memory index evicted it): same identity => already stored.
@@ -250,6 +282,24 @@ class IngestService:
 
     def _dispatch(self, entity_type, entity_id, event_type, payload, source,
                   record_generic=True) -> dict:
+        # System-graph live-ingest adapter (opt-in): reflect lifecycle events
+        # into the running lineage graph as lineage envelopes. Best-effort: a
+        # failure here is logged inside the adapter and never breaks the source
+        # event's own ingestion.
+        if self.system_graph is not None and entity_type in (
+                "mission", "session", "repository", "request", "span"):
+            # Reflect the lifecycle event into the running graph as lineage
+            # envelopes, re-entering the SAME ingest path (admit + persist +
+            # apply). Best-effort: failures are logged and swallowed so they
+            # never break the source event's own ingestion.
+            for env in self.system_graph.emit(entity_type, entity_id, event_type, payload or {}):
+                try:
+                    self.ingest(env, {"id": self.system_graph.actor,
+                                      "kind": "agent",
+                                      "authenticated_by": "api_key"})
+                except (ValueError, PermissionError) as exc:
+                    log.warning("system-graph ingest skipped %s %s (%s): %s",
+                                entity_type, entity_id, env["event_type"], exc)
         if entity_type == "mission_activity":
             if event_type != "mission_activity.snapshot":
                 raise ValueError("invalid mission activity event_type")

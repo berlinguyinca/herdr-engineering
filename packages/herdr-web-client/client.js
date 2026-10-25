@@ -77,6 +77,22 @@ export class HerdrClient {
     return this.request(`/api/v1/missions/${encodeURIComponent(id)}`);
   }
 
+  missionTests(id, { signal } = {}) {
+    return this.request(`/api/v1/missions/${encodeURIComponent(id)}/tests`, { signal });
+  }
+
+  missionBuilds(id, { signal } = {}) {
+    return this.request(`/api/v1/missions/${encodeURIComponent(id)}/builds`, { signal });
+  }
+
+  missionReviews(id, { signal } = {}) {
+    return this.request(`/api/v1/missions/${encodeURIComponent(id)}/reviews`, { signal });
+  }
+
+  missionPulls(id, { signal } = {}) {
+    return this.request(`/api/v1/missions/${encodeURIComponent(id)}/pulls`, { signal });
+  }
+
   listMissionActivity({ signal } = {}) {
     return this.request('/api/v1/mission-activity', { signal });
   }
@@ -139,6 +155,39 @@ export class HerdrClient {
   // -- activity / analytics ------------------------------------------------
   activity(limit = 50, { signal } = {}) {
     return this.request(`/api/v1/activity?limit=${limit}`, { signal });
+  }
+
+  /** LLM page statistics. `params` are the query filters (window, group, project, model, ...). */
+  llm(what, params = {}) {
+    const q = new URLSearchParams(Object.entries(params).filter(([, v]) => v != null && v !== ''));
+    return this.request(`/api/v1/llm/${encodeURIComponent(what)}${q.size ? `?${q}` : ''}`);
+  }
+
+  /** Stored outcome summaries keyed by mission key, for the mission catalog rows. */
+  missionOutcomes({ signal } = {}) {
+    return this.request('/api/v1/mission-outcomes', { signal });
+  }
+
+  /** One mission's story (header, needs, events, agents, outcome, usage). Rejects with status 404 when unknown. */
+  missionStory(key, { signal } = {}) {
+    return this.request(`/api/v1/missions/${encodeURIComponent(key)}/story`, { signal });
+  }
+
+  /** Neighbours of one entity (cross-linking). Rejects with status 404 for an unknown entity. */
+  related(kind, id, { signal } = {}) {
+    const q = new URLSearchParams({ kind, id });
+    return this.request(`/api/v1/related?${q}`, { signal });
+  }
+
+  /** Fleet attention inbox (derived server-side; ack/snooze are shared by every browser). */
+  attention(params = {}, { signal } = {}) {
+    const q = new URLSearchParams(Object.entries(params).filter(([, v]) => v != null && v !== ''));
+    return this.request(`/api/v1/attention${q.size ? `?${q}` : ''}`, { signal });
+  }
+
+  attentionAct(action, body) {
+    if (!['ack', 'snooze', 'clear'].includes(action)) throw new Error(`unknown attention action: ${action}`);
+    return this.request(`/api/v1/attention/${action}`, { method: 'POST', body });
   }
 
   analytics(kind = 'missions') {
@@ -217,6 +266,39 @@ export class HerdrClient {
     return this.request(`/api/v1/github/issue?${query}`, { signal });
   }
 
+  // -- architecture explorer (immutable commit-keyed snapshots) ----------------
+  _arch(path, params = {}, signal) {
+    const q = new URLSearchParams();
+    for (const [k, v] of Object.entries(params)) if (v != null && v !== '') q.set(k, String(v));
+    return this.request(`/api/v1/architecture/${path}${q.size ? `?${q}` : ''}`, { signal });
+  }
+  listArchitectureSnapshots({ signal, ...params } = {}) { return this._arch('snapshots', params, signal); }
+  listArchitectureAnalyses({ signal, ...params } = {}) { return this._arch('analyses', params, signal); }
+  getArchitectureChildren(sid, { signal, ...params } = {}) { return this._arch(`snapshots/${encodeURIComponent(sid)}/children`, params, signal); }
+  searchArchitectureNodes(sid, { signal, ...params } = {}) { return this._arch(`snapshots/${encodeURIComponent(sid)}/nodes`, params, signal); }
+  getArchitectureNode(sid, nid, { signal } = {}) { return this._arch(`snapshots/${encodeURIComponent(sid)}/nodes/${encodeURIComponent(nid)}`, {}, signal); }
+  expandArchitectureNode(sid, nid, { signal, ...params } = {}) { return this._arch(`snapshots/${encodeURIComponent(sid)}/nodes/${encodeURIComponent(nid)}/edges`, params, signal); }
+  diffArchitecture(base, head, { signal, ...params } = {}) { return this._arch('diff', { base, head, ...params }, signal); }
+  getArchitectureOverlays(sid, { signal } = {}) { return this._arch(`snapshots/${encodeURIComponent(sid)}/overlays`, {}, signal); }
+  getArchitectureCorrelations(sid, { signal, ...params } = {}) { return this._arch(`snapshots/${encodeURIComponent(sid)}/correlations`, params, signal); }
+  getArchitectureNodeRooms(sid, nid, { signal } = {}) { return this._arch(`snapshots/${encodeURIComponent(sid)}/nodes/${encodeURIComponent(nid)}/rooms`, {}, signal); }
+  getArchitectureTimeline(repositoryId, { signal, ...params } = {}) { return this._arch('timeline', { repository_id: repositoryId, ...params }, signal); }
+  getArchitectureCrossRepo(snapshotIds, mappings = [], { signal } = {}) {
+    const q = new URLSearchParams();
+    for (const id of snapshotIds) q.append('snapshot', id);
+    for (const m of mappings) q.append('map', `${m.importer}|${m.package}|${m.provider}`);
+    return this.request(`/api/v1/architecture/cross-repo?${q}`, { signal });
+  }
+  requestArchitectureAnalysis(body, { signal } = {}) {
+    return this.request('/api/v1/architecture/analyses/request', { method: 'POST', body, signal });
+  }
+  cancelArchitectureAnalysis(analysisId, { signal } = {}) {
+    return this.request(`/api/v1/architecture/analyses/${encodeURIComponent(analysisId)}/cancel`, { method: 'POST', body: {}, signal });
+  }
+  explainArchitectureNode(sid, nid, { signal } = {}) {
+    return this.request(`/api/v1/architecture/snapshots/${encodeURIComponent(sid)}/nodes/${encodeURIComponent(nid)}/explain`, { method: 'POST', body: {}, signal });
+  }
+
   // -- ci / test runs (leaf types for the topology view) -------------------
   getCi({ signal } = {}) {
     return this.request('/api/v1/ci', { signal });
@@ -254,10 +336,30 @@ export class HerdrClient {
     });
   }
 
-  debugCi(repository, number, sessionId, operationId, { signal, providerUrl } = {}) {
+  debugCi(repository, number, sessionId, operationId, { signal, providerUrl, mode } = {}) {
     return this.request('/api/v1/ci/debug', {
-      method: 'POST', body: { repository, number, session_id: sessionId, operation_id: operationId, ...(providerUrl!==undefined?{provider_url:providerUrl}:{}) }, signal,
+      method: 'POST', body: { repository, number, session_id: sessionId, operation_id: operationId, ...(providerUrl!==undefined?{provider_url:providerUrl}:{}), ...(mode==='fix'?{mode}:{}) }, signal,
     });
+  }
+
+  // Sandboxed CI fix agent. The control plane only records the request; a runner on a host does the work.
+  ciFix(repository, number, operationId, { signal, providerUrl } = {}) {
+    return this.request('/api/v1/ci/fix', {
+      method: 'POST', body: { repository, number, operation_id: operationId, ...(providerUrl!==undefined?{provider_url:providerUrl}:{}) }, signal,
+    });
+  }
+
+  listCiFix({ run, signal } = {}) {
+    const query = new URLSearchParams(run ? { run } : {});
+    return this.request(`/api/v1/ci/fix${query.size ? `?${query}` : ''}`, { signal });
+  }
+
+  getCiFix(id, { signal } = {}) {
+    return this.request(`/api/v1/ci/fix/${encodeURIComponent(id)}`, { signal });
+  }
+
+  cancelCiFix(id, { signal } = {}) {
+    return this.request(`/api/v1/ci/fix/${encodeURIComponent(id)}/cancel`, { method: 'POST', body: {}, signal });
   }
 
   getReview(id, { signal } = {}) {

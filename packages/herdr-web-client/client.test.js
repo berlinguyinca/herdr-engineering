@@ -22,6 +22,27 @@ test('agent summary and rename requests preserve encoded identity and version', 
   assert.deepEqual(calls[3].body, { list: 'blockers', index: 1, text: 'CI is red' });
 });
 
+test('debugCi sends mode only for a fix request', async () => {
+  const bodies = [];
+  const client = new HerdrClient('', { fetchImpl: async (url, opts) => {
+    bodies.push(JSON.parse(opts.body));
+    return { ok: true, status: 200, text: async () => '{}' };
+  } });
+  await client.debugCi('17', 12, 's', 'op1');
+  await client.debugCi('17', 12, 's', 'op2', { mode: 'fix', providerUrl: 'https://ci.example' });
+  await client.debugCi('17', 12, 's', 'op3', { mode: 'other' });
+  assert.deepEqual(bodies[0], { repository: '17', number: 12, session_id: 's', operation_id: 'op1' });
+  assert.deepEqual(bodies[1], { repository: '17', number: 12, session_id: 's', operation_id: 'op2', provider_url: 'https://ci.example', mode: 'fix' });
+  assert.equal('mode' in bodies[2], false);
+});
+
+test('related encodes the kind and id into the query', async () => {
+  const urls = [];
+  const client = new HerdrClient('', { fetchImpl: async (url) => { urls.push(url); return { ok: true, status: 200, text: async () => '{}' }; } });
+  await client.related('session', 'herdr:b:e:p 1&x');
+  assert.equal(urls[0], '/api/v1/related?kind=session&id=herdr%3Ab%3Ae%3Ap+1%26x');
+});
+
 function fakeFetch(routes) {
   return async (url, opts) => {
     const hit = routes.find((r) => url.endsWith(r.path));
@@ -197,6 +218,25 @@ test('mission activity GETs encode exact namespaces and forward cancellation', a
   await client.missionActivity('pi:MSN/1', {signal});
   assert.equal(calls[0].url, '/api/v1/mission-activity');
   assert.equal(calls[1].url, '/api/v1/missions/pi%3AMSN%2F1/activity');
+  assert.ok(calls.every(c => c.opts.method === 'GET' && c.opts.signal === signal));
+});
+
+test('mission delivery reads encode exact namespaces and forward cancellation', async () => {
+  const calls = [];
+  const client = new HerdrClient('', { fetchImpl: async (url, opts) => {
+    calls.push({url, opts}); return {ok: true, text: async () => '{}'};
+  }});
+  const signal = new AbortController().signal;
+  await client.missionTests('pi:MSN/1', {signal});
+  await client.missionBuilds('pi:MSN/1', {signal});
+  await client.missionReviews('pi:MSN/1', {signal});
+  await client.missionPulls('pi:MSN/1', {signal});
+  assert.deepEqual(calls.map(c => c.url), [
+    '/api/v1/missions/pi%3AMSN%2F1/tests',
+    '/api/v1/missions/pi%3AMSN%2F1/builds',
+    '/api/v1/missions/pi%3AMSN%2F1/reviews',
+    '/api/v1/missions/pi%3AMSN%2F1/pulls',
+  ]);
   assert.ok(calls.every(c => c.opts.method === 'GET' && c.opts.signal === signal));
 });
 

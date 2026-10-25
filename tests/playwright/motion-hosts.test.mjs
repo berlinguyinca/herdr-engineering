@@ -180,6 +180,38 @@ test('overview: critical items present on first load do not pulse',async()=>with
  assert.equal(await page.locator('[data-attention-key="session:broken"] .ov-alert').getAttribute('data-pulse'),null);
 }));
 
+test('overview: a failing source does not hold the counters still for ever',async()=>withPage(async(page,base)=>{
+ const s={sessions:[agent('a'),agent('b')]};
+ await calm(page,'off');
+ const handler=overviewApi(s);
+ // Reviews fail on every poll; the other sources answer. Counters must still count up.
+ await boot(page,base,'/overview',(p,url)=>p==='/api/v1/reviews'?{__status:500}:handler(p,url));
+ const tile=page.locator('[data-overview=sessions] .ov-metric strong');
+ await until(()=>tile.textContent().then(t=>t==='2').catch(()=>false),'2 agents');
+ await page.clock.runFor(5500);await sleep(30);
+ await record(page,'[data-overview=sessions] .ov-metric strong');
+ s.sessions.push(...'cdefghij'.split('').map(id=>agent(id)));
+ await page.clock.runFor(5500);
+ await until(()=>tile.textContent().then(t=>t!=='2'),'tile changed');
+ await page.clock.runFor(400);await sleep(30);
+ const r=await recorded(page);
+ assert.equal(await tile.textContent(),'10');
+ assert.ok(r.texts.some(t=>t!=='2'&&t!=='10'),`counts up despite the failing source, saw ${r.texts}`);
+}));
+
+test('overview: a new critical item from the server inbox pulses (any key shape)',async()=>withPage(async(page,base)=>{
+ const items=[];
+ const inbox=()=>({items:structuredClone(items),counts:{open:items.length,acknowledged:0,snoozed:0}});
+ const handler=overviewApi({sessions:[agent('a')]});
+ await calm(page,'off');
+ await boot(page,base,'/overview',(p,url)=>p==='/api/v1/attention'?inbox():handler(p,url));
+ await page.locator('[data-overview=attention] .ov-tag').filter({hasText:'open items'}).waitFor();
+ items.push({key:'gate-7f3a',state:'open',severity:'critical',title:'Review gate stuck',detail:'d',href:'#/review-gate',first_seen:T0,source:'review_gate'});
+ await page.clock.runFor(5500);
+ await until(()=>page.locator('[data-attention-key="gate-7f3a"]').count().then(n=>n===1),'server critical item');
+ assert.equal(await page.locator('[data-attention-key="gate-7f3a"] .ov-alert').getAttribute('data-pulse'),'once');
+}));
+
 test('sparkline: scaled 2× it is a solid line once drawn, with and without calm (no dash fragments)',async()=>{
  for(const mode of ['off','on'])await withPage(async(page,base)=>{
   const s=state();

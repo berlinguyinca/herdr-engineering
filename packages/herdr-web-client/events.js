@@ -8,6 +8,9 @@ export function connectEvents({
   url,
   onEvent = () => {},
   onError = () => {},
+  // Called on open and on every frame, keepalives included: proof the stream is alive even when
+  // nothing changes (the freshness chip uses it).
+  onContact = () => {},
   createEventSource = (u) => new EventSource(u),
   autoReconnectMs = 3000,
 }) {
@@ -30,14 +33,17 @@ export function connectEvents({
   function open() {
     if (closed) return;
     es = createEventSource(url);
+    es.onopen = () => onContact();
     es.onmessage = (evt) => {
+      onContact();
       let data;
       try {
         data = JSON.parse(evt.data);
       } catch {
         return; // ignore malformed frames; never crash the UI
       }
-      if (data && data.event_type === 'StreamConnected') return;
+      // Stream bookkeeping frames are contact, not events: no view refreshes on them.
+      if (data && (data.event_type === 'StreamConnected' || data.event_type === 'StreamKeepalive')) return;
       if (isDuplicate(data)) return;
       onEvent(data);
     };

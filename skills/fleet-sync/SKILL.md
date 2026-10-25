@@ -68,7 +68,7 @@ flow as `herdr machine add`), then:
 1. Adds `<host>` to the private inventory (`hosts.yml` + `host_vars/<host>.yml`).
 2. Runs `ansible/playbooks/fleet-sync.yml -l <host>` to converge:
    - `herdr-eng` (pulled from `origin/main`, pip-installed into the venv)
-   - `fabric.env` + the auto-registration agent service (registers this host's
+   - the auto-registration agent service (registers this host's
      services → it becomes a fabric site)
    - the pi build-gate extension (`build-gate.ts`)
 3. Verifies registration (`devfabric list`) and reports version parity.
@@ -78,7 +78,7 @@ provisioned), `--json` (machine-readable report).
 
 > The older multi-command path is still available as `scripts/fleet-join.sh`.
 > If you can't reach the host from the controller, run on the host itself
-> `scripts/install.sh` then `scripts/fabric-agent.sh --gateway <url>`, and run
+> `scripts/install.sh` then `scripts/fabric-agent.sh` (gateway = `fabric.url` in fleet-config.yaml), and run
 > `herdr-eng fleet join --no-attach` from the controller once it's reachable.
 
 ### 2. Self-update the whole fleet — ONE command
@@ -91,7 +91,7 @@ herdr-eng fleet update --json
 
 `fleet update` pulls the controller checkout, reinstalls local herdr-eng, runs
 `fleet-sync.yml` across the fleet (or `--host <h>`), then reports version
-parity. Flags: `--no-pull`, `--no-reinstall`, `--gateway <url>`. The older
+parity. Flags: `--no-pull`, `--no-reinstall`, `--gateway <url>` (ignored for the fabric agent, with a warning). The older
 script path is `scripts/fleet-self-update.sh`.
 
 `herdr-eng fleet status` (below) is the read-only parity check.
@@ -118,8 +118,8 @@ ansible-playbook -i ansible/inventory/hosts.yml \
 
 - **Never disrupt running agents** — all playbooks are converge-only and
   idempotent; `fleet-status.yml` is read-only.
-- **No secrets** in the repo — `host_vars/` is gitignored; `fabric.env` holds a
-  tailnet URL, not a credential.
+- **No secrets** in the repo — `host_vars/` is gitignored; the gateway URL comes from
+  `fleet-config.yaml` (`fabric.url`), not a credential file.
 - A host with no `herdr-eng` yet is provisioned by `fabric-agent.yml`; the pi
   build-gate extension no-ops gracefully until then.
 

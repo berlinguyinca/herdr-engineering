@@ -36,6 +36,21 @@ export const EDGE_STYLE = {
   reviewed: { dash: '6 2 2 2', tag: 'reviewed', word: 'reviewed' },
   produced: { dash: '14 3', tag: 'produced', word: 'produced' },
   validated: { dash: '4 2', tag: 'validated', word: 'validated' },
+  // system-intelligence edge kinds (spec 02): observed topology vs static intent.
+  calls: { dash: '1 1', tag: 'calls', word: 'calls' },
+  observed_in: { dash: '1 2', tag: 'seen-in', word: 'observed in' },
+  belongs_to: { dash: '2 2', tag: 'part-of', word: 'belongs to' },
+  blocked_by: { dash: '3 1', tag: 'blocked-by', word: 'blocked by' },
+  implements: { dash: '2 6', tag: 'implements', word: 'implements' },
+  references: { dash: '2 3 6 3', tag: 'references', word: 'references' },
+  runs_on: { dash: '6 1 2 1', tag: 'runs-on', word: 'runs on' },
+  serves: { dash: '5 1', tag: 'serves', word: 'serves' },
+  deploys_to: { dash: '3 3 1 3', tag: 'deploys-to', word: 'deploys to' },
+  assigned_to: { dash: '4 4 1 4', tag: 'assigned-to', word: 'assigned to' },
+  precedes: { dash: '1 5', tag: 'precedes', word: 'precedes' },
+  imports: { dash: '2 2 2 2', tag: 'imports', word: 'imports' },
+  routes_to: { dash: '8 1 2 1', tag: 'routes-to', word: 'routes to' },
+  queued_on: { dash: '3 5', tag: 'queued-on', word: 'queued on' },
 };
 export const EDGE_TYPES = Object.keys(EDGE_STYLE);
 
@@ -45,6 +60,12 @@ const SHAPE = {
   issue: 'tag', pr: 'tag', commit: 'tag', ci: 'tag', artifact: 'tag',
   review: 'diamond', finding: 'diamond', gate: 'diamond', decision: 'diamond',
   handoff: 'hex', thread: 'hex', message: 'hex',
+  // system-intelligence node kinds (spec 02): infrastructure/repo/trace shapes.
+  repository: 'round', branch: 'round', module: 'round', package: 'tag',
+  service: 'round', endpoint: 'round', deployment: 'round', host: 'hex',
+  gpu: 'hex', model: 'round', worker: 'round',
+  request: 'tag', span: 'tag', trace: 'tag', queue: 'tag', dataset: 'tag',
+  memory_reference: 'tag', external_dependency: 'tag', symbol: 'tag',
 };
 export const shapeOf = (type) => SHAPE[type] || 'rect';
 export const NODE_TYPES = Object.keys(SHAPE);
@@ -76,6 +97,14 @@ export function mergePages(pages) {
     }
   }
   return { nodes: [...nodes.values()], edges: [...edges.values()] };
+}
+// Why the merged graph is incomplete, across every page loaded so far. One page leaving out links (an edge or byte budget) keeps
+// the merged view incomplete even when a later page is whole, so the reasons are OR-ed: a scan budget (more nodes may exist) wins,
+// otherwise the most recent reason any page gave; null only when no page was truncated.
+export function pagesTruncated(pages) {
+  const reasons = (pages || []).map((p) => (p && p.truncated_reason) || null).filter(Boolean);
+  if (!reasons.length) return null;
+  return reasons.includes('scan_budget') ? 'scan_budget' : reasons[reasons.length - 1];
 }
 export const edgeKey = (e) => `${e.edge_type}\u0000${e.from_id}\u0000${e.to_id}\u0000${bindingText(e.binding)}`;
 export const bindingText = (b) => (b && typeof b === 'object' ? Object.entries(b).map(([k, v]) => `${k}=${v}`).join(',') : '');
@@ -215,8 +244,12 @@ function edgePath(a, b, back) {
 
 export function renderGraphLegend() {
   const edges = EDGE_TYPES.map((t) => `<li><svg width="46" height="10" aria-hidden="true" focusable="false"><line x1="1" y1="5" x2="45" y2="5" class="lin-edge-line" stroke-dasharray="${esc(EDGE_STYLE[t].dash)}"/></svg> ${esc(EDGE_STYLE[t].tag)}</li>`).join('');
-  const shapes = [['round', 'agent, attempt, session'], ['rect', 'task, plan, mission'], ['tag', 'issue, PR, commit, CI, artifact'],
-    ['diamond', 'review, finding, gate, decision'], ['hex', 'handoff, thread']].map(([s, w]) => `<li>${esc(s)}: ${esc(w)}</li>`).join('');
+  const byShape = new Map();
+  for (const t of NODE_TYPES) byShape.set(shapeOf(t), [...(byShape.get(shapeOf(t)) || []), t]);
+  const shapeOrder = ['round', 'rect', 'tag', 'diamond', 'hex'];
+  const shapes = shapeOrder
+    .filter((s) => byShape.has(s))
+    .map((s) => `<li>${esc(s)}: ${esc(byShape.get(s).sort().join(', '))}</li>`).join('');
   const states = GLYPH.map(([, g, k]) => `<li><span aria-hidden="true">${g}</span> ${esc(k)}</li>`).join('') + '<li><span aria-hidden="true">○</span> no state recorded</li>';
   return `<details class="lin-legend"><summary>Legend</summary><div class="lin-legend__cols"><ul aria-label="Link types">${edges}</ul><ul aria-label="Node shapes">${shapes}</ul><ul aria-label="States">${states}</ul></div></details>`;
 }
@@ -260,7 +293,11 @@ export function renderGraphSvg(graph, layout, { sel = null, focus = null, match 
 
 // The same data as plain tables (the text alternative; also the view for very large graphs).
 export function renderGraphTable(graph, { sel = null } = {}) {
-  const deg = layoutGraph({ nodes: graph.nodes.slice(0, MAX_TABLE_ROWS), edges: graph.edges }).degree;
+  const deg = new Map(graph.nodes.slice(0, MAX_TABLE_ROWS).map((n) => [n.id, { in: 0, out: 0 }]));       // degrees only: no layout needed for a table
+  for (const e of graph.edges) {
+    if (deg.has(e.from_id)) deg.get(e.from_id).out += 1;
+    if (deg.has(e.to_id)) deg.get(e.to_id).in += 1;
+  }
   const nrows = graph.nodes.slice(0, MAX_TABLE_ROWS).map((n) => {
     const look = stateLook(n.state);
     const d = deg.get(n.id) || { in: 0, out: 0 };
@@ -334,6 +371,8 @@ export function focusKey(el) {
   if (wf !== null) return wf === 'action' ? `wbf:action:${attr(el, 'value')}` : `wbf:${wf}:`;
   const wa = attr(el, 'data-wb-act');
   if (wa !== null) return `wba:${wa}:${attr(el, 'data-wb-id') || ''}`;
+  // a form's submit button (Post comment, Propose, Save edit) is rebuilt with the form after the request completes
+  if (attr(el, 'type') === 'submit' && el.closest) { const form = el.closest('[data-wb-form]'); if (form) return `wbs:${attr(form, 'data-wb-form')}:${attr(form, 'data-wb-id') || ''}`; }
   return null;
 }
 export function focusSelector(key) {
@@ -350,9 +389,25 @@ export function focusSelector(key) {
     case 'retry': return '[data-retry]';
     case 'filter': { const [name, ...val] = rest; return val.join(':') ? `[data-filter="${q(name)}"][value="${q(val.join(':'))}"]` : `[data-filter="${q(name)}"]`; }
     case 'wbf': { const [name, ...val] = rest; return val.join(':') ? `[data-wb-field="${q(name)}"][value="${q(val.join(':'))}"]` : `[data-wb-field="${q(name)}"]`; }
+    case 'wbs': { const [form, ...id] = rest; return `[data-wb-form="${q(form)}"]${id.join(':') ? `[data-wb-id="${q(id.join(':'))}"]` : ''} button[type="submit"]`; }
     case 'wba': { const [act, ...id] = rest; return id.join(':') ? `[data-wb-act="${q(act)}"][data-wb-id="${q(id.join(':'))}"]` : `[data-wb-act="${q(act)}"]`; }
     default: return null;
   }
+}
+
+// When the focused control is replaced by a different one (a button that opens a step that has its own buttons), focus goes to the
+// logical successor, not to the container: "Review and confirm" opens the confirm step, so focus lands on "Confirm and send";
+// "Cancel" closes it, so focus returns to "Review and confirm". Returns selectors to try in order; none means "park on the panel".
+export function focusSuccessor(key) {
+  const q = (v) => String(v).replace(/["\\]/g, '\\$&');
+  const [kind, act, ...id] = String(key || '').split(':');
+  const ident = id.join(':');
+  if (kind !== 'wba') return [];
+  if (act === 'confirm') return [ident ? `[data-wb-act="confirm-go"][data-wb-id="${q(ident)}"]` : '', '[data-wb-act="confirm-go"]'].filter(Boolean);
+  if (act === 'confirm-cancel') return ['[data-wb-act="confirm"]'];
+  // the request was sent (or declined): stay on that request, on its remaining action if it has one, else on the row itself
+  if ((act === 'confirm-go' || act === 'reject') && ident) return [`[data-wb-act="reject"][data-wb-id="${q(ident)}"]`, `[data-wb-steer="${q(ident)}"]`];
+  return [];
 }
 
 // Where a replay control moves to (pure; the caller fetches). Returns a step number or 'live'.
@@ -539,10 +594,21 @@ export function renderLineage(m) {
   }
   if (!a.nodes.length && !m.timeline) return `${renderReplay(m.asOf, { busy: m.busy, queued: m.queued })}${notice(m)}<div class="hd-empty">No lineage is shown for this room yet. Lineage appears only from recorded events you are allowed to see.</div>`;
   const view = m.filtered;
-  const layout = layoutGraph(view);
+  // Above the draw cap there is no SVG (renderGraphSvg answers with a message), so do not lay out thousands of nodes on every redraw.
+  const layout = view.nodes.length <= MAX_RENDER_NODES ? layoutGraph(view) : null;
   const graphPane = m.mode === 'table' ? renderGraphTable(view, { sel: m.sel })
     : `<div class="cx-scroll lin-scroll" role="region" tabindex="0" aria-label="Lineage graph">${renderGraphSvg(view, layout, { sel: m.sel, focus: m.focus, match: view.match })}</div>`;
-  const trunc = m.graphTruncated ? `<p class="cx-msg" role="status">Showing ${a.nodes.length} of ${m.total} nodes (${esc(m.graphTruncated)}). <button type="button" class="hd-btn hd-btn--ghost hd-btn--sm" data-more="1">Load more</button></p>` : '';
+  // `graphMore === false` is the last page the server will give. What the server says it ran out of decides what is missing:
+  // `scan_budget` means it stopped reading NODES (more may exist); any other reason with no next page (`edge_budget`,
+  // `limit` on edges, `response_bytes`) means every node was returned but some LINKS were left out. Silence made a cut-off
+  // graph look complete (T16 large-graph gate); a wrong claim ("more nodes") for an edges-only cut would mislead as well.
+  const trunc = m.graphTruncated
+    ? (m.graphMore === false
+      ? (m.graphTruncated === 'scan_budget'
+        ? `<p class="cx-msg" role="status">Showing ${a.nodes.length} nodes (${esc(m.graphTruncated)}). The server stopped reading here, so more nodes may exist that this view cannot load.</p>`
+        : `<p class="cx-msg" role="status">Showing all ${a.nodes.length} nodes, but the server left out some links (${esc(m.graphTruncated)}), so the links drawn may be incomplete.</p>`)
+      : `<p class="cx-msg" role="status">Showing ${a.nodes.length} of ${m.total} nodes (${esc(m.graphTruncated)}). <button type="button" class="hd-btn hd-btn--ghost hd-btn--sm" data-more="1">Load more</button></p>`)
+    : '';
   const gantt = m.timeline ? buildGantt(m.timeline, { clock: m.clock, types: m.filters.types }) : null;
   const tab = (k, l) => `<button type="button" role="tab" class="cx-stab" data-view="${k}" aria-selected="${m.view === k}" tabindex="${m.view === k ? 0 : -1}">${l}</button>`;
   const body = m.view === 'gantt'

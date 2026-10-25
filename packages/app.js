@@ -16,7 +16,10 @@ import { mountMissionCatalog } from './mission-catalog-view.js';
 import { mountOverview } from './overview-view.js';
 import { mountIntegrations } from './integrations-view.js';
 import { mountGithub } from './github-view.js';
+import { mountReviewGate } from './review-gate-view.js';
 import { mountTopology } from './topology-view.js';
+import { mountArchitecture } from './architecture-view.js';
+import { visibleNav } from './nav-capabilities.js';
 import { mountSessionsView, sessionEntries } from './sessions-view.js';
 import { recordOutcome, statusOutcome } from './record-state.js';
 import { RANGES, safeHostId } from './host-view.js';
@@ -26,9 +29,14 @@ import { mountActivity, loadActivity } from './activity-view.js';
 import { mountAnalytics, loadAnalytics } from './analytics-view.js';
 import { morph, patchList, patchText } from './patch.js';
 import { flash, skeleton } from './motion.js';
+import { noteStreamContact, freshnessSources } from './freshness.js';
 import { mountServices, mountServiceDetails } from './services-view.js';
 import { mountCollab, completeSignInIfRedirected } from './collab-view.js';
-import { freshnessSources } from './freshness.js';
+import { mountAttention, attentionBadge, POLL_MS as ATTENTION_POLL_MS } from './attention-view.js';
+import { createAttentionNotifier } from './attention-notify.js';
+import { mountRelated } from './related-panel.js';
+import { mountMissionStory } from './mission-story-view.js';
+import { renderLlm, renderLlmSession, llmQuery, STEP_FOR, WINDOWS } from './llm-view.js';
 
 // Cache of { [mission_id]: title } so activity/session text can resolve
 // cryptic mission ids to their human names. Fetched lazily, best-effort.
@@ -55,7 +63,9 @@ const root = document.getElementById('view');
 
 const NAV = [
   { path: '/overview', label: 'Overview' },
+  { path: '/attention', label: 'Attention' },
   { path: '/topology', label: 'Topology' },
+  { path: '/architecture', label: 'Architecture', capability: 'architecture_v1' },
   { path: '/missions', label: 'Missions' },
   { path: '/herd', label: 'Agents' },
   { path: '/services', label: 'Services' },
@@ -64,15 +74,45 @@ const NAV = [
   { path: '/github', label: 'Projects' },
   { path: '/ci', label: 'CI' },
   { path: '/reviews', label: 'Reviews' },
+  { path: '/review-gate', label: 'Review gate' },
   { path: '/hosts', label: 'Hosts' },
   { path: '/activity', label: 'Activity' },
   { path: '/analytics', label: 'Analytics' },
+  { path: '/llm', label: 'LLM' },
   { path: '/collab', label: 'Collaboration' },
 ];
 
 const SHELL = document.getElementById('shell');
-SHELL.setAttribute('routes', JSON.stringify(NAV));
+SHELL.setAttribute('routes', JSON.stringify(visibleNav(NAV, [])));
+// Optional tabs appear once /api/v1/health advertises their capability; a failed probe keeps them hidden.
+// Re-set only when the list changes: every set re-renders the shell's nav.
+client.health().then((h) => {
+  const routes = JSON.stringify(visibleNav(NAV, h?.capabilities));
+  if (routes !== SHELL.getAttribute('routes')) SHELL.setAttribute('routes', routes);
+}).catch(() => { /* optional tabs stay hidden */ });
 SHELL.setAttribute('brand', 'HerdR Dev Fabric');
+
+// The nav badge follows the server inbox on every page, so a new critical item is visible from anywhere.
+function setAttentionBadge(badge) { SHELL.setBadge?.('/attention', badge); }
+let attentionStorage = null;
+try { attentionStorage = window.localStorage; } catch { /* Notification choices then last for this page only. */ }
+const attentionNotifier = createAttentionNotifier({
+  storage: attentionStorage, NotificationImpl: window.Notification,
+  onClick: (href) => { window.focus(); window.location.hash = href; },
+});
+function handleAttention(body) { setAttentionBadge(attentionBadge(body)); attentionNotifier.handle(body); }
+let attentionBadgeTimer = null;
+async function pollAttentionBadge() {
+  clearTimeout(attentionBadgeTimer);
+  // A hidden tab keeps polling only when browser notifications are on, so a new critical item still reaches the operator.
+  if (!document.hidden || attentionNotifier.active()) {
+    try { handleAttention(await client.attention({ state: 'open' })); }
+    catch { /* The page itself explains an unreachable inbox; the badge just stays as it was. */ }
+  }
+  attentionBadgeTimer = setTimeout(pollAttentionBadge, ATTENTION_POLL_MS * 3);
+}
+document.addEventListener('visibilitychange', () => { if (!document.hidden) pollAttentionBadge(); });
+pollAttentionBadge();
 
 function route() {
   const hash = window.location.hash.replace(/^#/, '') || '/overview';
@@ -83,11 +123,14 @@ function route() {
 
 const ROUTES = {
   '/overview': viewOverview,
+  '/attention': viewAttention,
   '/github': viewGithub,
   '/collab': viewCollab,
   '/ci': viewIntegrations,
   '/reviews': viewIntegrations,
+  '/review-gate': viewReviewGate,
   '/topology': viewTopology,
+  '/architecture': viewArchitecture,
   '/missions': viewMissions,
   '/missions/:id': viewMission,
   '/herd': viewSessions,
@@ -104,6 +147,8 @@ const ROUTES = {
   '/analytics/models': viewAnalytics,
   '/analytics/hosts': viewAnalytics,
   '/analytics/tokens': viewAnalytics,
+  '/llm': viewLlm,
+  '/llm/session/:id': viewLlmSession,
 };
 
 // Router rule: render() runs only on a route change (any hash change, query
@@ -185,7 +230,7 @@ async function render() {
   const match = matchRoute(parts);
   const load = (rev) => ROUTES[match](parts, rev);
   // As before, live events retry a failed or not-found page, except pages that stream their own detail.
-  const streamsOwnDetail = match === '/herd/session/:id' || (match === '/missions/:id' && decodeURIComponent(parts[1]).startsWith('pi:'));
+  const streamsOwnDetail = match === '/herd/session/:id' || (match === '/missions/:id' && (safeDecode(parts[1]) || '').startsWith('pi:'));
   root.innerHTML = routeSkeleton(match, parts);
   let view;
   try {
@@ -219,7 +264,7 @@ function statusPage(html, ok, message) {
 const BACK_LINK_SKELETON = '<div><span class="hd-skeleton hd-skeleton--line" style="display:inline-block;vertical-align:middle">&nbsp;</span></div>';
 function routeSkeleton(match, parts) {
   const back = match === '/missions/:id' || match === '/herd/session/:id' ? BACK_LINK_SKELETON : '';
-  const piMission = match === '/missions/:id' && decodeURIComponent(parts[1] || '').startsWith('pi:');
+  const piMission = match === '/missions/:id' && (safeDecode(parts[1]) || '').startsWith('pi:');
   const rows = piMission ? 1 : match === '/analytics/models' || match === '/analytics/hosts' ? 2 : match === '/herd/session/:id' || match === '/analytics' || match === '/analytics/missions' ? 8 : match.startsWith('/services') || match.endsWith('-services') ? 7 : 5;
   return `<div data-skeleton aria-busy="true" role="status" aria-label="Loading page">${back}<div class="hd-live-head"><div class="hd-skeleton hd-skeleton--title"></div></div>${skeleton('page content', { rows, height: 64, bare: true })}</div>`;
 }
@@ -230,9 +275,18 @@ async function viewTopology() {
   return ownPolling(mountTopology(root, client, {status: route().query.get('status') || 'current'}));
 }
 
+async function viewArchitecture() {
+  const q = route().query;
+  return ownPolling(mountArchitecture(root, client, {snapshot: q.get('snapshot') || '', parent: q.get('parent') || '', q: q.get('q') || ''}));
+}
+
 async function viewOverview() {
   root.innerHTML = `${liveHead('<h1>Overview</h1>')}<div id="overview-dashboard"></div>`;
   return ownPolling(mountOverview(document.getElementById('overview-dashboard'), client, { freshness: chipIn(root) }));
+}
+
+async function viewAttention() {
+  return ownPolling(mountAttention(root, client, { onBody: handleAttention, notifier: attentionNotifier }));
 }
 
 async function viewCollab() {
@@ -247,6 +301,10 @@ async function viewCollab() {
 
 async function viewGithub() {
   return ownPolling(mountGithub(root, client));
+}
+
+async function viewReviewGate() {
+  return ownPolling(mountReviewGate(root, client));
 }
 
 async function viewIntegrations(parts) {
@@ -274,8 +332,28 @@ function relatedIntegrationLinks(record, kind, id) {
   return `<nav class="hd-inline" aria-label="Related reviews and builds" style="margin:14px 0;font-size:13px"><a href="#/reviews?${esc(context)}">Related reviews</a><a href="#/ci?${esc(context)}">Related CI</a>${ci.size ? `<a href="#/ci?${esc(ci)}">CI for this ${revision ? 'revision' : 'repository'}</a>` : ''}</nav>`;
 }
 
+// The Related panel replaces the ad-hoc link rows; the filter links stay as its footer.
+// Returns the panel's disposer; the calling view folds it into its own dispose().
+function showRelated(kind, id, host, footer = '', extra = {}) {
+  const el = host || document.getElementById('related-panel');
+  if (!el) return () => {};
+  const dispose = mountRelated(el, client, kind, id, { footer, ...extra });
+  return typeof dispose === 'function' ? dispose : () => {};
+}
+
+// Runs every disposer once, even if one throws.
+function combineDisposers(...disposers) {
+  return () => { for (const d of disposers) { try { d?.(); } catch { /* the rest still run */ } } };
+}
+
+// A malformed %-escape in the hash is a not-found page, never an uncaught rejection.
+function safeDecode(value) {
+  try { return decodeURIComponent(value ?? ''); } catch { return null; }
+}
+
 async function viewMission(parts, revision) {
-  const key = decodeURIComponent(parts[1]);
+  const key = safeDecode(parts[1]);
+  if (key == null) { statusPage('<herdr-error message="Mission not found"></herdr-error>', true); return; }
   let m;
   try { m = await client.getMission(key); }
   catch (error) { if (error.status !== 404 || !key.startsWith('pi:')) throw error; }
@@ -284,12 +362,18 @@ async function viewMission(parts, revision) {
   const sources = freshnessSources(chipIn(root));
   const onStatus = (ok, message) => ok ? sources.ok('live') : sources.fail('live', `Live activity: ${message}`);
   if (key.startsWith('pi:') && !m) {
-    root.innerHTML = `<a href="#/missions">← Missions</a>${liveHead('<h1>Pi mission</h1>')}${relatedIntegrationLinks({},'mission',key)}<div id="live-mission-detail"></div>`;
-    return { refresh() {}, dispose: mountMissionActivity(document.getElementById('live-mission-detail'), client, key, { onStatus }) };
+    root.innerHTML = `<a href="#/missions">← Missions</a>${liveHead('<h1>Pi mission</h1>')}<div id="related-panel"></div><div id="live-mission-detail"></div>`;
+    const relatedDispose = showRelated('mission', key, null, relatedIntegrationLinks({},'mission',key));
+    const disposeActivity = mountMissionActivity(document.getElementById('live-mission-detail'), client, key, { onStatus });
+    return { refresh() {}, dispose: combineDisposers(relatedDispose, disposeActivity) };
   }
   if (!m) { statusPage('<herdr-error message="Mission not found"></herdr-error>', true); return; }
-  root.innerHTML = `<a href="#/missions">← Missions</a>${liveHead(`<h1 style="overflow-wrap:anywhere">${key.startsWith('pi:') ? 'Pi mission' : esc((m.title || 'Mission').slice(0, 180))}</h1>`)}${key.startsWith('pi:') ? '<div id="live-mission-detail"></div>' : ''}${relatedIntegrationLinks(m,'mission',key)}<div id="mission-history"></div>`;
+  root.innerHTML = `<a href="#/missions">← Missions</a>${liveHead(`<h1 style="overflow-wrap:anywhere">${key.startsWith('pi:') ? 'Pi mission' : esc((m.title || 'Mission').slice(0, 180))}</h1>`)}${key.startsWith('pi:') ? '<div id="live-mission-detail"></div>' : ''}<div id="mission-story"></div><div id="related-panel"></div><div id="mission-history"></div>`;
+  // The story (what happened, how it ended, what needs you) sits above the recorded history; when it is unavailable the page is as before.
+  const story = mountMissionStory(document.getElementById('mission-story'), client, key);
+  const relatedDispose = showRelated('mission', key, null, relatedIntegrationLinks(m,'mission',key));
   const disposeLive = key.startsWith('pi:') ? mountMissionActivity(document.getElementById('live-mission-detail'), client, key, { onStatus }) : null;
+  const disposeMission = combineDisposers(story?.dispose, relatedDispose, disposeLive);
   const history = document.getElementById('mission-history');
   let pending = false;
   let shownTimeline = [null, ''];
@@ -329,9 +413,10 @@ async function viewMission(parts, revision) {
       if (history.isConnected && !history.querySelector('details[data-history-panel]')) history.innerHTML = `<herdr-error message="${esc(error.message)}"></herdr-error>`;
     } finally { pending = false; }
   };
-  await refreshHistory(m);
+  try { await refreshHistory(m); } catch (error) { disposeMission(); throw error; }
+  if (revision !== renderRevision) { disposeMission(); return; }
   // Mission telemetry owns its polling; a live event refreshes only the recorded history, in place.
-  return { refresh: () => refreshHistory(), dispose: disposeLive || (() => {}) };
+  return { refresh: () => refreshHistory(), dispose: disposeMission };
 }
 
 async function missionSessions(m) {
@@ -378,12 +463,13 @@ async function viewSession(parts, revision) {
       <p class="sd-meta">${terminal ? `${outcome === 'failed' ? 'Failed' : 'Finished'} agent · recorded inspection remains available.` : 'Agent status reflects the last report; it is not a live process check.'}</p>
       ${s.summary ? `<p style="overflow-wrap:anywhere">${esc(clip(s.summary))}</p>` : ''}
       ${s.mission_id || s.mission_key ? `<p class="sd-meta" id="session-mission">Mission association not resolved · ${esc(s.mission_key || s.mission_id)}</p>` : ''}
-      ${relatedIntegrationLinks(s,'session',s.session_id)}
+      <div id="related-panel"></div>
       <div id="session-terminal" class="sd-details"></div>
       <details class="hd-card sd-details" id="session-details"><summary>Agent details</summary><dl>${fields.map(([label,value])=>`<dt>${esc(label)}</dt><dd>${esc(value)}</dd>`).join('')}</dl>${s.summary ? `<p>${esc(s.summary)}</p>` : ''}</details>
       <div id="session-workspace-host"></div>
       <details class="hd-card sd-details" id="advanced-inspector"><summary>Advanced inspection</summary><div id="inspector-host"></div></details>
       <details class="hd-card sd-details" id="session-events"><summary>Recorded event stream</summary><div id="session-stream">${skeleton('recorded events', { rows: 2 })}</div></details>`;
+    const relatedDispose = showRelated('session', s.session_id, null, relatedIntegrationLinks(s,'session',s.session_id), { sessionId: s.session_id });
     const disposeWorkspace = mountSessionWorkspace(document.getElementById('session-workspace-host'), client, s, {onRename: profile => { s.display_name = profile.display_name; const title = root.querySelector('.sd-title'); if (title) title.textContent = `${profile.display_name}${project ? ` · ${clip(project)}` : ''}`; }});
     let disposeAdvanced = null;
     const advanced = document.getElementById('advanced-inspector');
@@ -392,7 +478,7 @@ async function viewSession(parts, revision) {
       else if (!advanced.open && disposeAdvanced) { disposeAdvanced(); disposeAdvanced = null; document.getElementById('inspector-host').replaceChildren(); }
     });
     const disposeTerminal = mountTerminalAttach(document.getElementById('session-terminal'), client, s, {copyText});
-    const disposeSession = () => { disposeWorkspace(); disposeTerminal(); if (disposeAdvanced) disposeAdvanced(); };
+    const disposeSession = combineDisposers(relatedDispose, disposeWorkspace, disposeTerminal, () => disposeAdvanced?.());
     const missionElement = document.getElementById('session-mission');
     if (missionElement) {
       const contextController = new AbortController();
@@ -472,7 +558,11 @@ async function viewService(parts, revision) {
   const svc = await client.request(`/api/v1/services/${encodeURIComponent(decodeURIComponent(parts[1]))}`);
   if (revision !== renderRevision) return;
   if (!svc || svc.error) { statusPage('<herdr-error message="Service not found"></herdr-error>', true); return; }
-  return ownPolling(mountServiceDetails(root, client, svc));
+  // The details view rewrites its own container (its chip included), so it gets a child; the Related panel sits beside it.
+  root.innerHTML = '<div data-service-details></div><div id="related-panel"></div>';
+  const details = mountServiceDetails(root.querySelector('[data-service-details]'), client, svc);
+  const relatedDispose = showRelated('service', svc.service_id || safeDecode(parts[1]) || '', root.querySelector('#related-panel'));
+  return { refresh() {}, dispose: combineDisposers(() => details.dispose(), relatedDispose) };
 }
 
 async function viewHosts(_parts, revision) {
@@ -488,7 +578,11 @@ async function viewHost(parts, revision) {
   const range = RANGES.includes(requested) ? requested : '1h';
   const data = await loadHostDetail(client, id, range);
   if (revision !== renderRevision) return;
-  return mountHostDetail(root, client, id, range, { data });
+  const view = mountHostDetail(root, client, id, range, { data });
+  // mountHostDetail morphs only its own body, so a slot appended after it survives refreshes.
+  const slot = document.createElement('div'); slot.id = 'related-panel'; root.appendChild(slot);
+  const relatedDispose = showRelated('host', safeDecode(parts[1]) || '', slot);
+  return { refresh: (hint) => view.refresh(hint), dispose: combineDisposers(() => view.dispose(), relatedDispose) };
 }
 
 async function viewActivity(_parts, revision) {
@@ -503,6 +597,62 @@ async function viewAnalytics(parts, revision) {
   const data = await loadAnalytics(client, sub);
   if (revision !== renderRevision) return;
   return mountAnalytics(root, client, sub, { data });
+}
+
+// The LLM pages fetch ~10 series per render and hold filter focus: they are snapshots, refreshed
+// only by navigation (a filter change rewrites the hash), never by live events.
+async function viewLlm(_parts, revision) {
+  const q = route().query;
+  const window_ = WINDOWS.includes(q.get('window')) ? q.get('window') : '24h';
+  const filters = { project: q.get('project') || '', model: q.get('model') || '' };
+  const f = { window: window_, ...filters };
+  const step = STEP_FOR[window_];
+  const series = (metric) => client.llm('timeseries', { ...f, step, metric });
+  const [total, models, agents, problems, projects, requests, errors, ttft, speed, sessions] = await Promise.all([
+    client.llm('stats', { ...f, group: 'all' }),
+    client.llm('stats', { window: window_, project: filters.project, group: 'model' }),
+    client.llm('stats', { ...f, group: 'session' }),
+    client.llm('errors', f),
+    client.llm('stats', { window: window_, group: 'project' }),
+    series('requests'), series('errors'), series('ttft_p95'), series('speed_p50'),
+    client.listSessions().catch(() => ({ sessions: [] })),
+  ]);
+  if (revision !== renderRevision) return NO_REFRESH;
+  const names = {};
+  for (const s of sessions.sessions || []) if (s.display_name) names[s.session_id] = s.display_name;
+  root.innerHTML = renderLlm({
+    window: window_, filters, names,
+    projects: projects.groups.map((g) => g.key),
+    modelNames: [...new Set(models.groups.map((g) => g.key))],
+  }, { total, models, agents, problems, series: { requests, errors, ttft, speed } });
+  root.querySelectorAll('[data-llm-filter]').forEach((el) => el.addEventListener('change', () => {
+    window.location.hash = `#/llm?${llmQuery({ window: window_, ...filters, [el.dataset.llmFilter]: el.value })}`;
+  }));
+  return NO_REFRESH;
+}
+async function viewLlmSession(parts, revision) {
+  const id = safeDecode(parts[2]);
+  if (id == null) { root.innerHTML = '<herdr-error message="Agent not found"></herdr-error>'; return NO_REFRESH; }
+  const q = route().query;
+  const window_ = WINDOWS.includes(q.get('window')) ? q.get('window') : '24h';
+  const f = { window: window_, session: id };
+  const step = STEP_FOR[window_];
+  const series = (metric) => client.llm('timeseries', { ...f, step, metric });
+  const [total, models, problems, requests, errors, ttft, speed, session] = await Promise.all([
+    client.llm('stats', { ...f, group: 'all' }), client.llm('stats', { ...f, group: 'model' }),
+    client.llm('errors', f), series('requests'), series('errors'), series('ttft_p95'), series('speed_p50'),
+    client.getSession(id).catch(() => null),
+  ]);
+  if (revision !== renderRevision) return NO_REFRESH;
+  root.innerHTML = renderLlmSession({
+    window: window_, sessionId: id, known: Boolean(session), name: session?.display_name || session?.agent_role || '',
+  }, { total, models, problems, series: { requests, errors, ttft, speed } });
+  if (session) {
+    const slot = document.createElement('div'); slot.id = 'related-panel';
+    root.insertBefore(slot, root.children[1] || null);
+    return { refresh() {}, dispose: showRelated('session', id, slot) };
+  }
+  return NO_REFRESH;
 }
 
 const NO_STREAM_EVENTS = '<herdr-empty message="No events for this entity yet"></herdr-empty>';
@@ -546,7 +696,8 @@ function paintStream(container, items, { initial = false } = {}) {
 connectEvents({
   url: '/api/v1/events/stream',
   onEvent: (event) => bus.dispatch(event),
-  onError: () => { /* keep last view; the client auto-reconnects */ },
+  onContact: () => noteStreamContact(true),
+  onError: () => { noteStreamContact(false); /* keep last view; the client auto-reconnects */ },
 });
 
 document.addEventListener('visibilitychange', () => { if (document.hidden) bus.pause(); else bus.resume(); });

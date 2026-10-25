@@ -59,6 +59,11 @@ class AuthorRegistry:
             }
             self._repo.record_event(ENTITY, str(key), "author_pinned", fields, require_durable=True)
 
+    def pinned_author(self, key: PrKey) -> Author | None:
+        """The pinned author of ``key`` or None; never consults live sessions."""
+        with self._lock:
+            return self._pinned(key)
+
     def author_of(self, key: PrKey, head_ref: str) -> Author:
         with self._lock:
             pinned = self._pinned(key)

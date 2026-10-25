@@ -38,7 +38,7 @@ export function measuredProgress(activity = {}) {
   return null;
 }
 
-export function missionEntries(projections, recorded, received, now = Date.now()) {
+export function missionEntries(projections, recorded, received, now = Date.now(), outcomes = null) {
   const byKey = new Map();
   for (const record of records(recorded)) {
     const key = text(record.mission_key) || (record.source && record.source !== 'herdr' ? `${record.source}:${record.mission_id}` : text(record.mission_id));
@@ -77,15 +77,16 @@ export function missionEntries(projections, recorded, received, now = Date.now()
         group = ['failed', 'stalled', 'blocked', 'slow'].includes(health) || health.startsWith('paused') ? 'attention' : 'running';
       }
     }
-    return {...entry, title, status, health, freshness, outcome, tab, group, host: text(p?.host_id || record.host_id),
+    const summary = outcomes && typeof outcomes === 'object' && outcomes[entry.key] && typeof outcomes[entry.key] === 'object' ? outcomes[entry.key] : null;
+    return {...entry, summary, title, status, health, freshness, outcome, tab, group, host: text(p?.host_id || record.host_id),
       search: [title, entry.key, mission.id, a.currentObjective, a.currentActivity?.summary, a.waitingReason,
-        record.purpose, record.cwd, p?.host_id, status, health].filter(Boolean).join(' ').toLocaleLowerCase()};
+        record.purpose, record.cwd, p?.host_id, status, health, summary?.result, summary?.repository, summary?.last_event].filter(Boolean).join(' ').toLocaleLowerCase()};
   }).sort((a,b) => a.title.localeCompare(b.title) || a.key.localeCompare(b.key));
 }
 
-export function filterMissions(entries, {search = '', host = '', status = 'all', tab = 'all'} = {}) {
+export function filterMissions(entries, {search = '', host = '', status = 'all', tab = 'all', result = 'all', repository = ''} = {}) {
   const terms = search.toLocaleLowerCase().trim().split(/\s+/).filter(Boolean);
-  return entries.filter(e => (tab === 'all' || e.tab === tab) && (!host || e.host === host) && (status === 'all' || e.group === status) && terms.every(t => e.search.includes(t)));
+  return entries.filter(e => (tab === 'all' || e.tab === tab) && (!host || e.host === host) && (status === 'all' || e.group === status) && (result === 'all' || e.summary?.result === result) && (!repository || e.summary?.repository === repository) && terms.every(t => e.search.includes(t)));
 }
 
 function freshnessLabel(entry) {
@@ -119,14 +120,24 @@ export function compactMissionRow(entry, now = Date.now()) {
       ${a.waitingReason ? `<p class="mc-wait">Waiting: ${esc(short(human(a.waitingReason), 100))}${Number.isFinite(waitAt) ? ` · <span data-wait-age>${duration((waitReference - waitAt) / 1000)}</span>${current ? '' : ' at last snapshot'}` : ''}</p>` : ''}
       <div class="mc-meta">${esc(entry.host || (p ? 'Host not reported' : record.source || 'HerdR'))}${workers.length ? ` · ${workerCounts}` : ''}${a.lastOutputAt ? ` · Last output <span data-output-age>${age(a.lastOutputAt, now)}</span> ago` : ''}</div>
     </div>
-    <div class="mc-status"><span data-freshness data-state="${esc(entry.freshness?.state || 'recorded')}">${esc(freshnessLabel(entry))}</span>
+    <div class="mc-status">${entry.summary ? resultLine(entry.summary) : ''}<span data-freshness data-state="${esc(entry.freshness?.state || 'recorded')}">${esc(freshnessLabel(entry))}</span>
       ${p ? `<span class="mc-meta">Report age <span data-report-age>${duration(entry.freshness.age)}</span></span>` : `<span class="mc-meta">${record.updated_at ? `Last recorded change <span data-recorded-age>${esc(age(record.updated_at, now))}</span> ago` : 'No live telemetry'}</span>`}
       ${progress ? `<label class="mc-progress">${esc(progress.label)} · ${progress.percent}%<progress aria-label="${esc(progress.label)}" max="100" value="${progress.percent}"></progress></label>` : '<span class="mc-meta">Progress not measured</span>'}
     </div>
   </article>`;
 }
 
-const styles = `<style>
+const RESULT_LABEL = {succeeded: 'Succeeded', failed: 'Failed', cancelled: 'Cancelled', unknown: 'Ended, outcome unknown'};
+const RESULTS = Object.keys(RESULT_LABEL);
+
+// What the stored outcome says: the result, how long, how many agents and the last meaningful event.
+function resultLine(summary) {
+  const label = RESULT_LABEL[summary.result] || RESULT_LABEL.unknown;
+  const bits = [Number.isFinite(summary.duration_s) ? duration(summary.duration_s) : null, Number.isFinite(summary.agent_count) ? `${summary.agent_count} agents` : null].filter(Boolean);
+  return `<span class="mc-result" data-result="${esc(RESULTS.includes(summary.result) ? summary.result : 'unknown')}"><strong>${esc(label)}</strong>${bits.length ? ` · ${esc(bits.join(' · '))}` : ''}</span>${summary.last_event ? `<span class="mc-meta">Last: ${esc(short(summary.last_event, 120))}</span>` : ''}`;
+}
+
+const styles = `<style>.mc-result strong{font-weight:600}.mc-result[data-result=succeeded]{color:var(--status-ok,#1a7f37)}.mc-result[data-result=failed]{color:var(--status-error,#cf222e)}
 .mc-counts[hidden],.mc-controls label[hidden]{display:none}
 .mc-tabs{display:flex;gap:6px;flex-wrap:wrap;margin:10px 0;border-bottom:1px solid var(--border)}.mc-tabs button{font:inherit;background:none;border:0;border-bottom:3px solid transparent;color:var(--text-secondary);padding:9px 11px;cursor:pointer}.mc-tabs button[aria-selected=true]{color:var(--text);border-bottom-color:var(--accent)}.mc-tabs span{font-size:12px;margin-left:5px}.mc-tabs button:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}
 .mc-intro{color:var(--text-secondary);line-height:1.5;max-width:80ch}.mc-counts{display:flex;flex-wrap:wrap;gap:7px;margin:10px 0}
@@ -141,21 +152,23 @@ const styles = `<style>
 
 export function mountMissionCatalog(container, client, {tab = 'current', status = 'all', freshness = () => null} = {}) {
   const chip = freshnessSources(freshness);
-  let disposed = false, projections = [], recorded = [], received = Date.now();
+  let disposed = false, projections = [], recorded = [], received = Date.now(), outcomes = null;
   let liveController = null, pollTimer = null, clockTimer = null, recordedTimer = null, recordedController = null;
   let failures = 0, liveError = '', recordedError = '', lastSignature = '', lastClassification = '', liveLoaded = false, recordedLoaded = false;
-  const state = {search:'',host:'',status:tab==='current'&&GROUPS.some(([key])=>key===status&&currentGroup(key))?status:'all',tab:TABS.some(([key])=>key===tab)?tab:'current'};
+  const state = {search:'',host:'',result:'all',repository:'',status:tab==='current'&&GROUPS.some(([key])=>key===status&&currentGroup(key))?status:'all',tab:TABS.some(([key])=>key===tab)?tab:'current'};
   const opened = new Map(), limits = new Map();
   container.innerHTML = `${styles}<p class="mc-intro">See what needs attention and what is running. Current shows missions with recent reports. Older and missing reports move to Unconfirmed; Failed and Finished retain their outcomes.</p>
     <div class="mc-tabs" id="mc-tabs" role="tablist" aria-label="Mission outcome"></div><div class="mc-counts" id="mc-counts"></div><div class="mc-controls">
       <label class="mc-search">Search missions<input id="mc-search" type="search" placeholder="Title, objective, activity or mission ID"></label>
       <label>Host<select id="mc-host"><option value="">All hosts</option></select></label>
+      <label>Result<select id="mc-result-filter"><option value="all">Any result</option>${RESULTS.map(r=>`<option value="${r}">${RESULT_LABEL[r]}</option>`).join('')}</select></label>
+      <label>Repository<select id="mc-repository"><option value="">All repositories</option></select></label>
       <label>Show<select id="mc-status"><option value="all">All groups</option>${GROUPS.filter(([key])=>currentGroup(key)).map(([key,label])=>`<option value="${key}">${label}</option>`).join('')}</select></label>
     </div><p id="mc-result" class="mc-meta" role="status"></p><p class="ml-connection mc-meta" role="status"></p><div id="mc-groups" role="tabpanel" aria-labelledby="mc-tab-current"></div>`;
   const el = name => container.querySelector(`#mc-${name}`);
   el('status').value = state.status;
   const connection = container.querySelector('.ml-connection');
-  const entries = () => missionEntries(projections, recorded, received);
+  const entries = () => missionEntries(projections, recorded, received, Date.now(), outcomes);
   function capture() {
     el('groups').querySelectorAll('details[data-group]').forEach(d=>opened.set(d.dataset.group,d.open));
   }
@@ -202,7 +215,7 @@ export function mountMissionCatalog(container, client, {tab = 'current', status 
     if(disposed)return;
     const all=entries(), selected=filterMissions(all,state);
     const counts=Object.fromEntries(GROUPS.map(([key])=>[key,all.filter(e=>e.tab===state.tab&&e.group===key).length]));
-    const signature=JSON.stringify([state,liveLoaded,recordedLoaded,!!liveError,!!recordedError,all.map(e=>[e.key,e.tab,e.group,e.freshness?.state,e.projection,e.recorded])]);
+    const signature=JSON.stringify([state,liveLoaded,recordedLoaded,!!liveError,!!recordedError,all.map(e=>[e.key,e.tab,e.group,e.freshness?.state,e.projection,e.recorded,e.summary])]);
     connection.textContent=[liveError,recordedError].filter(Boolean).join(' ');
     if(!force && signature===lastSignature)return;
     lastSignature=signature;
@@ -226,6 +239,8 @@ export function mountMissionCatalog(container, client, {tab = 'current', status 
     animateChanges(el('counts'),'[data-filter] strong',filterCounts,filterKey);
     const hosts=[...new Set(all.map(e=>e.host).filter(Boolean))].sort();
     el('host').innerHTML='<option value="">All hosts</option>'+hosts.map(h=>`<option value="${esc(h)}">${esc(h)}</option>`).join('');el('host').value=state.host;
+    const repositories=[...new Set(all.map(e=>e.summary?.repository).filter(Boolean))].sort();
+    el('repository').innerHTML='<option value="">All repositories</option>'+repositories.map(r=>`<option value="${esc(r)}">${esc(r)}</option>`).join('');el('repository').value=state.repository;el('result-filter').value=state.result;
     el('result').textContent=liveLoaded||recordedLoaded?`${selected.length} matching ${state.tab} missions${liveLoaded&&recordedLoaded?'':' · partial results (+): waiting for remaining source'} · live activity refreshes every 5 seconds`:'';
     const wanted=GROUPS.filter(([key])=>(state.tab==='current'?currentGroup(key):state.tab==='unconfirmed'?['lastknown','recorded'].includes(key):state.tab===key)&&(state.status==='all'||state.status===key));
     patchGroups(wanted,selected,live);
@@ -262,7 +277,7 @@ export function mountMissionCatalog(container, client, {tab = 'current', status 
     connection.textContent=[liveError,recordedError].filter(Boolean).join(' ');
   }
   function changeFilters() {
-    state.search=el('search').value;state.host=el('host').value;state.status=el('status').value;
+    state.search=el('search').value;state.host=el('host').value;state.status=el('status').value;state.result=el('result-filter').value;state.repository=el('repository').value;
     capture();
     for(const [key]of GROUPS)opened.set(key,Boolean(state.tab!=='current'||state.search||state.status!=='all'||key==='attention'||key==='running'));
     limits.clear();
@@ -281,7 +296,7 @@ export function mountMissionCatalog(container, client, {tab = 'current', status 
     const next=event.key==='ArrowRight'?(index+1)%TABS.length:event.key==='ArrowLeft'?(index+TABS.length-1)%TABS.length:event.key==='Home'?0:event.key==='End'?TABS.length-1:-1;
     if(next>=0){event.preventDefault();selectTab(TABS[next][0]);}
   });
-  el('search').addEventListener('input',changeFilters);el('host').addEventListener('change',changeFilters);el('status').addEventListener('change',changeFilters);
+  el('search').addEventListener('input',changeFilters);el('host').addEventListener('change',changeFilters);el('result-filter').addEventListener('change',changeFilters);el('repository').addEventListener('change',changeFilters);el('status').addEventListener('change',changeFilters);
   el('counts').addEventListener('click',event=>{const key=event.target.closest('[data-filter]')?.dataset.filter;if(key){el('status').value=key;changeFilters();}});
   el('groups').addEventListener('click',event=>{const key=event.target.closest('[data-more]')?.dataset.more;if(key){limits.set(key,(limits.get(key)||10)+10);draw(true);tick();}});
   async function refreshRecorded() {
@@ -291,7 +306,10 @@ export function mountMissionCatalog(container, client, {tab = 'current', status 
     try {
       const response=await client.listMissions(undefined,{signal:controller.signal});
       if(disposed||controller.signal.aborted)return;
-      recorded=records(response.missions);recordedLoaded=true;recordedError='';chip.ok('recorded');draw();tick();
+      recorded=records(response.missions);recordedLoaded=true;recordedError='';chip.ok('recorded');
+      // The stored outcomes enrich the rows; a failure keeps the last ones and never blocks the catalog.
+      if(typeof client.missionOutcomes==='function'){try{const o=await client.missionOutcomes({signal:controller.signal});if(!disposed&&!controller.signal.aborted&&o&&typeof o.outcomes==='object')outcomes=o.outcomes;}catch{/* rows stay as they were */}}
+      draw();tick();
     } catch (error) {
       if(!disposed&&(!controller.signal.aborted||timedOut)){chip.fail('recorded',`Recorded missions: ${timedOut?'timed out':error?.message||'request failed'}`);recordedError='Recorded history could not refresh; keeping the last received records.';draw();tick();}
     } finally {clearTimeout(deadline);if(recordedController===controller)recordedController=null;}

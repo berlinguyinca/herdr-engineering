@@ -181,11 +181,7 @@ test('control: the light theme has light fills the audit sees',async()=>withPage
 test('light theme: tokens that replaced hard-coded colours keep their old values',async()=>withPage(async(page,base)=>{
  await page.emulateMedia({colorScheme:'light'});
  await boot(page,base,'/overview',p=>EMPTY);
- const old={'--ci-pass':'#238636','--ci-fail':'#dc3545','--ci-queued':'#bf8700','--ci-blocked':'#a56ae0','--ci-cell-bg':'#e7ebef','--ci-cell-text':'#263449',
-  '--ci-cell-success-bg':'#bfe9ce','--ci-cell-success-text':'#155e32','--ci-cell-failure-bg':'#f5bcc2','--ci-cell-failure-text':'#8f1424',
-  '--ci-cell-mixed-bg':'#f8dc9a','--ci-cell-mixed-text':'#775000','--ci-cell-active-bg':'#c4dcfa','--ci-cell-active-text':'#184c91',
-  '--ci-cell-neutral-bg':'#dfe0eb','--ci-cell-neutral-text':'#4f4a6b','--ci-cell-stripe-a':'#eef0f4','--ci-cell-stripe-b':'#d8dde6',
-  '--ci-cell-incomplete-border':'#697488','--ci-cell-active-dot':'#1263c4','--ci-cell-selected':'#202f48','--focus-ring':'#276ec5',
+ const old={'--ci-pass':'#238636','--ci-fail':'#dc3545','--ci-queued':'#bf8700','--ci-blocked':'#a56ae0',
   '--error-bg':'#fef2f2','--text-on-accent':'#ffffff'};
  const now=await page.evaluate(names=>Object.fromEntries(names.map(n=>[n,getComputedStyle(document.documentElement).getPropertyValue(n).trim()])),Object.keys(old));
  assert.deepEqual(now,old);

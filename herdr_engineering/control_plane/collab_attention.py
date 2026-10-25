@@ -166,7 +166,8 @@ class AttentionMixin:
                 self._throttle("insights-room:" + room_id, cfg["reads_per_minute"] * 10, 60.0, "insights read")
             else:
                 self._throttle("attn-mark:" + pr.key, cfg["acks_per_10min"], 600.0, "acknowledgement")
-            reader = self._room_reader(access, room_id, pr.id)
+            reader = self._room_reader(access, room_id, pr.id,
+                                       keep=(*cfg["evidence_writers"], f"collab:room:{room_id}"))
             contexts = frozenset({("room", room_id, None), *(("mission", m, r) for r, m in access["room_missions"]
                                                              if r == room_id)})
             since = None
@@ -182,7 +183,7 @@ class AttentionMixin:
         """The reader's snapshot of the room, cached per (reader, room, graph state, access): repeated polling by the
         same person costs one scan per change, and a membership or link change is a new key."""
         key = (reader["id"], room_id, id(graph), graph.events_applied, since, frozenset(contexts),
-               frozenset(reader["access"]["room_ws"]), cfg["max_pages"])
+               frozenset(reader["access"]["room_ws"]), cfg["max_pages"], reader.get("keep_writers"))
         with self._lock:
             hit = self._snap_cache.get(key)
             if hit is not None:

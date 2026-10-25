@@ -1,0 +1,10 @@
+# ~/.config/herdr-engineering/architecture-serve.yaml -- read by `herdr-eng architecture serve --config`
+# (deploy/control-plane/herdr-architecture-serve.service). Command-line flags override these values.
+url: http://dev.lan                                    # control-plane base URL
+api_key_file: ~/.config/herdr-engineering/architecture-agent.key   # agent-role key, mode 0600
+host_id: beast                                         # must be listed for that key in control_plane.architecture.agent_hosts
+checkouts:                                             # canonical repository id -> local checkout; nothing else is analysed
+  github.com/berlinguyinca/herdr-engineering: ~/IdeaProjects/herdr-engineering
+poll: 5                                                # seconds between claims while idle
+timeout: 300                                           # wall-clock limit of one analysis, seconds
+# cache_dir: ~/.cache/herdr-engineering/architecture   # facts cache for incremental runs (default shown)

@@ -15,12 +15,14 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import logging
 import re
 import threading
 import time
 from uuid import uuid4
 
 from ..llm_session_id import dashboard_form
+from . import llm_stats
 from .agent_identity import AgentIdentityRegistry
 from .envelope import SourceLedger, envelope_event_fields
 from .graph import GraphProjection
@@ -185,11 +187,14 @@ class ControlPlaneRepo:
         # Envelope v2 idempotency / sequence / freshness state (envelope.py).
         self.ledger = SourceLedger(now=self._now, persist=self._persist_source_state)
         self._listeners = set()  # pub/sub for the SSE live stream (Spec §52)
+        self.collab_quarantine_reasons = []
+        self.collab_quarantine = []  # foreign 'collab' rows found at startup (never replayed)
         self._collab_replay = []  # durable HCN events diverted out of the shared streams
         self.agent_identities = AgentIdentityRegistry(persist=self._persist_agent_projection)
         # Agent inspector (spec 0200): bounded per-session detail projection.
         self.inspector = InspectorStore.from_config(inspector_limits, persist=self._persist_inspector)
         self.mission_activity = MissionActivityStore(now=self._now)
+        self.mission_outcomes = None   # set by the server (control_plane.missions); None writes no outcomes
         # Lineage graph (T02): derived from ``lineage`` envelope events, rebuilt
         # from them on import_state; owns no storage of its own.
         self.graph = GraphProjection()
@@ -259,7 +264,12 @@ class ControlPlaneRepo:
                         and m.get("source", "herdr") == "herdr"):
                     rec = m
                     break
-        return _copy(rec)
+        if rec is None:
+            return None
+        rec = _copy(rec)
+        rec["telemetry_state"] = self._mission_telemetry_state(
+            rec.get("mission_key") or rec["mission_id"])
+        return rec
 
     def _resolve_mission_key(self, mission_id, source="herdr"):
         """Return the stored key for ``mission_id`` under ``source``.
@@ -282,8 +292,34 @@ class ControlPlaneRepo:
             return mission_id
         return None
 
+    def _mission_telemetry_state(self, mission_key: str) -> str:
+        """Derive live/stale/unknown from the bounded mission-activity read model.
+
+        This reflects *collection* freshness of the Pi transport, never worker
+        health: a mission with no collector is ``unknown``, not stalled. It reuses
+        the real freshness the activity store already computes (issue #28); no
+        fabricated heartbeat is ever invented.
+        """
+        try:
+            live = self.mission_activity.get(mission_key)
+        except Exception:  # noqa: BLE001 - one unreadable entry never hides the rest
+            live = None
+        if not live:
+            return "unknown"
+        state = (live.get("freshness") or {}).get("state")
+        if state in ("live", "updating"):
+            return "live"
+        if state in ("stale", "disconnected"):
+            return "stale"
+        return "unknown"
+
     def list_missions(self, status=None):
-        out = [_copy(m) for m in self._missions.values()]
+        out = []
+        for m in self._missions.values():
+            rec = _copy(m)
+            rec["telemetry_state"] = self._mission_telemetry_state(
+                rec.get("mission_key") or rec["mission_id"])
+            out.append(rec)
         if status:
             out = [m for m in out if m["status"] == status]
         return _sort_by(out, "created_at", reverse=True)
@@ -301,6 +337,17 @@ class ControlPlaneRepo:
         m["updated_at"] = self._stamp()
         self.record_event("mission", key, "MissionStageChanged",
                           {"from": old, "to": stage}, mission_id=mission_id)
+        self._mission_stage_changed(key, old, stage)
+
+    def _mission_stage_changed(self, key, old, new):
+        # A durable outcome is written when a mission ends; it can never break the stage change itself.
+        outcomes = self.mission_outcomes
+        if outcomes is None:
+            return
+        try:
+            outcomes.on_stage(key, old, new)
+        except Exception:  # noqa: BLE001
+            pass
 
     # -------------------------------------------------------------- sessions
     def create_session(self, mission_id=None, agent_role="", model="",
@@ -1117,6 +1164,7 @@ class ControlPlaneRepo:
         for field, value in (("repository_id", repository_id), ("commit_sha", commit_sha)):
             if value is not None:
                 existing[field] = value
+        previous_stage = existing.get("stage")
         if stage:
             existing["stage"] = existing["status"] = stage
         self.record_event("mission", key, "MissionUpdated",
@@ -1128,6 +1176,8 @@ class ControlPlaneRepo:
                            "repository_id": existing.get("repository_id"),
                            "commit_sha": existing.get("commit_sha")},
                           mission_id=mission_id)
+        if stage:
+            self._mission_stage_changed(key, previous_stage, stage)
         return _copy(existing)
 
     # --------------------------------------------- CI: test runs / builds
@@ -1974,6 +2024,71 @@ class ControlPlaneRepo:
         return {"total": total, "by_project": by_project, "by_model": by_model,
                 "by_day": dict(sorted(by_day.items())), "by_session": by_session}
 
+    # LLM page (docs/superpowers/specs/2026-10-23-llm-page-design.md, slice 2). Computed from
+    # the retained raw records on each call, like ``token_analytics``; ``retained_since`` says
+    # how far back they go and ``partial`` is true when the window starts before that.
+    def _llm_window(self, window, filters):
+        if window not in llm_stats.WINDOWS:
+            raise ValueError(f"window must be one of {', '.join(llm_stats.WINDOWS)}")
+        now = self._now()
+        since = now - llm_stats.WINDOWS[window]
+        cache = {}
+
+        def resolve(raw):
+            if raw not in cache:
+                cache[raw] = self.resolve_usage_session(raw)
+            return cache[raw]
+
+        project = filters.get("project")
+        source = filters.pop("source", None)
+        if source not in (None, "", "llm-proxy", "transcript"):
+            raise ValueError("source must be llm-proxy or transcript")
+        with self._event_lock:
+            streams = [s for (etype, eid), s in self._events.items()
+                       if etype == "token_usage" and (not project or eid == project)]
+            events = [ev for s in streams for ev in s]
+        oldest = min((llm_stats._parse(s[0]["source_timestamp"]) for s in streams if s), default=None)
+        if source in (None, "", "transcript"):   # the agents' own transcripts (tokens only)
+            events += list(llm_stats.transcript_events(self.inspector.usage_events()))
+        records = [(ts, p) for ts, p in llm_stats.select(events, _payload, since=since, until=now + 1,
+                                                          resolve=resolve, **{k: v for k, v in filters.items() if v})
+                   if not source or (p.get("source") or "llm-proxy") == source]
+        meta = {"window": window, "since": llm_stats._iso(since),
+                "retained_since": llm_stats._iso(oldest),
+                "partial": oldest is None or oldest > since}
+        return records, resolve, meta, since, now
+
+    def llm_stats(self, window="24h", group="model", **filters):
+        if group not in llm_stats.GROUPS:
+            raise ValueError(f"group must be one of {', '.join(llm_stats.GROUPS)}")
+        records, resolve, meta, _, _ = self._llm_window(window, filters)
+        return dict(meta, group=group, groups=llm_stats.stats(records, group, resolve))
+
+    def llm_timeseries(self, window="24h", step="1h", metric="requests", **filters):
+        if step not in llm_stats.STEPS:
+            raise ValueError(f"step must be one of {', '.join(llm_stats.STEPS)}")
+        if metric not in llm_stats.METRICS:
+            raise ValueError(f"metric must be one of {', '.join(llm_stats.METRICS)}")
+        filters.setdefault("source", "llm-proxy")   # a time series is one source, never a sum
+        records, _, meta, since, now = self._llm_window(window, filters)
+        step_s = llm_stats.STEPS[step]
+        points = llm_stats.timeseries(records, metric, since=since, until=now, step=step_s)
+        return dict(meta, step=step, metric=metric, points=points)
+
+    def llm_errors(self, window="24h", error_class=None, **filters):
+        filters["source"] = "llm-proxy"   # a transcript carries no status, so it has no errors
+        records, resolve, meta, _, _ = self._llm_window(window, filters)
+        return dict(meta, problems=llm_stats.errors(records, resolve, error_class=error_class))
+
+    def record_attention(self, event_type, payload):
+        """Store an operator acknowledge/snooze/clear. Private stream: never in the feed or the SSE."""
+        self.record_event("attention", "operator", event_type, payload, feed=False, publish=False)
+
+    def attention_events(self):
+        with self._event_lock:
+            return [{"event_type": e["event_type"], "payload": dict(_payload(e))}
+                    for e in self._events.get(("attention", "operator"), [])]
+
     def create_project_key(self, project, label=""):
         """Mint a gateway key for ``project``; the secret is returned once and only
         its SHA-256 is stored."""
@@ -2150,9 +2265,22 @@ class ControlPlaneRepo:
         self._event_order = [t for t in self._event_order if t[0] != "inspector"]
         # HCN events are private to the collaboration service: they must never sit
         # in the shared streams that /activity and the global SSE feed expose.
+        from .collab_repair import classify
+        stored = []
         for key in [k for k in self._events if k[0] == "collab"]:
-            self._collab_replay.extend(self._events.pop(key))
-        self._event_order = [t for t in self._event_order if t[0] != "collab"]
+            stored.extend(self._events.pop(key))
+        # T16 H1: only rows the collaboration service itself could have written are replayed; the rest are kept
+        # in storage, reported at ERROR and left alone (`collab-repair` moves them aside on request).
+        keep, bad = classify(stored)
+        self._collab_replay.extend(keep)
+        self.collab_quarantine.extend(row for row, _ in bad)
+        self.collab_quarantine_reasons = [why for _, why in bad]
+        if self.collab_quarantine:
+            logging.getLogger(__name__).error(
+                "quarantined %d foreign 'collab' row(s) from the durable log (%s); they are kept in storage and "
+                "were NOT replayed; see `collab-repair`", len(self.collab_quarantine),
+                ", ".join(sorted(set(self.collab_quarantine_reasons))))
+        self._event_order = [t for t in self._event_order if t[0] not in ("collab", "review_request")]
         if durable:
             self.inspector.hydrate(durable)
         # Host telemetry rollups/state ride a private stream: rebuild history and

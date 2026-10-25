@@ -1,5 +1,6 @@
 """Fabric gateway tests (spec 0110 component #3: unified dev:<port> front door)."""
 import http.server
+import math
 import os
 import socket
 import threading
@@ -126,14 +127,29 @@ def test_dead_target_expires_and_unbinds(tmp_path):
 
 
 def test_healthy_target_stays_active_past_ttl(tmp_path):
+    # The probe loop backs off up to 4x when load/core > 4 (FabricGateway._effective_probe_interval), so a
+    # 1 s TTL with a 0.4 s probe expired deterministically on a loaded host (1.6 s between probes). Size the TTL
+    # at 2.5x the worst backed-off interval, then watch the lease over two full TTLs: it must be active at every
+    # sample AND its expiry must have been pushed forward (a renewal really happened, not just a long first TTL).
+    probe_interval = 0.4
+    ttl = math.ceil(probe_interval * 4 * 2.5)
     server, target_port = _http_target(tmp_path)
-    gw, registry, _ = _gateway(tmp_path, ttl=1, probe_interval=0.4)
+    gw, registry, _ = _gateway(tmp_path, ttl=ttl, probe_interval=probe_interval)
     try:
         client = _client(gw)
         lease = client.register(target_machine_id="m", target_host="127.0.0.1",
                                 target_port=target_port)["lease"]
-        time.sleep(2.5)  # several TTL periods
-        assert registry.get(lease["id"]).state == "active"  # renewed by probes
+        first_expiry = registry.get(lease["id"]).expires_at
+        start = time.monotonic()
+        samples = 0
+        while time.monotonic() - start < 2 * ttl:
+            assert registry.get(lease["id"]).state == "active"  # renewed by probes
+            samples += 1
+            time.sleep(0.2)
+        assert samples > 1
+        current = registry.get(lease["id"])
+        assert current.state == "active"
+        assert current.expires_at > first_expiry  # renewed past the original TTL
     finally:
         gw.stop()
         server.shutdown()

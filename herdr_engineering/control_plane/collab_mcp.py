@@ -134,10 +134,32 @@ TOOLS = [
 ]
 
 
-def tools_for(service: CollabService) -> list[dict]:
-    """The tool list this service advertises: delegation tools only while the kill switch is on."""
+# T16 gap D: tools an external agent is ALWAYS refused (the service answers 403 whatever it sends)
+# helper_*: an external agent never holds spawn_helpers (EXTERNAL_ACTIONS is read/post), so it never owns a helper either.
+_NEVER_FOR_EXTERNAL = frozenset({"tasks_inbox", "tasks_wait", "task_update", "task_create", "agents_list",
+                                 "helper_spawn", "helper_wait", "helper_result", "helper_cancel"})
+
+
+def tools_for(service: CollabService, pr=None) -> list[dict]:
+    """The tool list this service advertises: delegation tools only while the kill switch is on.
+
+    With ``pr`` (the authenticated agent) the menu lists only what THAT caller may call: an external agent never
+    sees the task tools it is always refused, and sees the delegation tools only when its enrolment allows
+    proposals; an internal agent never sees the external-only delegation and consultation tools. Without ``pr``
+    it is the service-wide superset (what is switched on at all)."""
     out = TOOLS + _DELEGATION_TOOLS if service.delegation_enabled else list(TOOLS)
-    return out + _CONSULT_TOOLS if service.consultation_enabled() else out
+    out = out + _CONSULT_TOOLS if service.consultation_enabled() else out
+    if pr is None:
+        return out
+    prof = service.tool_profile(pr)
+    drop = set()
+    if prof["external"]:
+        drop |= _NEVER_FOR_EXTERNAL
+        if not prof["proposals"]:
+            drop |= DELEGATION_TOOL_NAMES
+    else:
+        drop |= DELEGATION_TOOL_NAMES | CONSULT_TOOL_NAMES
+    return [t for t in out if t["name"] not in drop]
 
 
 def _result(rid: Any, result: dict) -> dict:
@@ -333,7 +355,7 @@ def handle(service: CollabService, message: Any, authorization: str, device: str
     if method == "ping":
         return 200, _result(rid, {})
     if method == "tools/list":
-        return 200, _result(rid, {"tools": tools_for(service)})
+        return 200, _result(rid, {"tools": tools_for(service, pr)})
     if method == "tools/call":
         params = message.get("params") or {}
         if not isinstance(params, dict):

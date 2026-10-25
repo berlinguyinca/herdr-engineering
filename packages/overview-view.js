@@ -81,6 +81,18 @@ export function overviewAttention(data = {}, states = {}, received = Date.now(),
   return {items:[...items.values()].sort((a,b)=>severity[a.severity]-severity[b.severity] || b.actionability-a.actionability || b.updated-a.updated || a.key.localeCompare(b.key)),complete:!unavailable.length,unavailable};
 }
 
+// The server derives the same items for every browser (design 2026-10-24). A server answer that loaded
+// is the source of truth; before it loads, or when it fails, the browser projection above is the fallback.
+const SERVER_RANK = {critical:0,warning:1,info:2};
+export function serverAttention(body, now = Date.now()) {
+  const items = records(body?.items).filter(item=>item.state==='open' && typeof item.key==='string').map(item=>({
+    key:item.key, severity:SERVER_RANK[item.severity]===undefined ? 'info' : item.severity, title:short(item.title), detail:short(item.detail),
+    href:/^#\/\S*$/.test(item.href || '') ? item.href : '#/attention', updated:Date.parse(item.first_seen) || 0, source:text(item.source), count:Number(item.count) || 1,
+  })).sort((a,b)=>SERVER_RANK[a.severity]-SERVER_RANK[b.severity] || b.updated-a.updated || a.key.localeCompare(b.key));
+  const unavailable = (Array.isArray(body?.unavailable) ? body.unavailable : []).map(text).filter(Boolean);
+  return {items,complete:body?.partial!==true && !unavailable.length,unavailable,server:true,acknowledged:Number(body?.counts?.acknowledged) || 0,snoozed:Number(body?.counts?.snoozed) || 0};
+}
+
 const eventLabels = {
   MissionStarted:'Mission started', MissionEnded:'Mission finished', MissionFailed:'Mission failed',
   MissionCompleted:'Mission finished', MissionCancelled:'Mission canceled',
@@ -107,7 +119,7 @@ function ageMarkup(value, now, label = 'Report') {
 }
 const metric = (value, label, href) => `<a class="ov-metric" href="${esc(href)}"><strong>${value}</strong><span>${esc(label)}</span></a>`;
 const empty = label => `<p class="ov-note">${esc(label)}</p>`;
-const SOURCE_LABELS = {projections:'Live mission reports',missions:'Recorded missions',sessions:'Agents',services:'Services',hosts:'Hosts',fleet:'Fleet versions',activity:'Recent activity',health:'Control plane',ci:'CI',reviews:'Reviews'};
+const SOURCE_LABELS = {projections:'Live mission reports',missions:'Recorded missions',sessions:'Agents',services:'Services',hosts:'Hosts',fleet:'Fleet versions',activity:'Recent activity',health:'Control plane',ci:'CI',reviews:'Reviews',attention:'Attention inbox'};
 function availability(keys, states) {
   return keys.map(key => {
     const state = states[key];
@@ -131,12 +143,16 @@ function missionRow(entry, canSnooze = false) {
 export function renderOverviewSection(section, data = {}, states = {}, received = Date.now(), now = Date.now()) {
   const model = overviewModel(data,received,now);
   if (section === 'attention') {
-    const attention=overviewAttention(data,states,received,now),expanded=data.attentionExpanded===true,limit=6;
+    const mode=states.attention===undefined ? 'browser' : states.attention.error ? 'fallback' : states.attention.loaded && data.attention ? 'server' : states.attention.disabled ? 'browser' : states.attention.loaded ? 'browser' : 'loading';
+    if(mode==='loading')return `<div class="ov-heading"><h2 tabindex="-1">Attention</h2></div><div class="hd-skeleton ov-skeleton" role="status" aria-label="Loading attention"></div>`;
+    const attention=mode==='server' ? serverAttention(data.attention,now) : overviewAttention(data,states,received,now),expanded=data.attentionExpanded===true,limit=6;
     const visible=expanded?attention.items:attention.items.slice(0,limit);
-    return `<div class="ov-heading"><h2 tabindex="-1">Attention</h2><span class="ov-tag">${attention.items.length ? `${attention.items.length}${attention.complete?'':'+'}` : attention.complete?'0':'—'} observed items</span></div>
+    return `<div class="ov-heading"><h2 tabindex="-1">Attention</h2><span class="ov-tag">${attention.items.length ? `${attention.items.length}${attention.complete?'':'+'}` : attention.complete?'0':'—'} ${attention.server?'open':'observed'} items</span></div>
+      ${mode==='fallback' ? '<p class="ov-warning" role="status">The shared attention list could not be loaded, so this list is computed in this browser and may differ from the Attention page.</p>' : ''}
+      ${attention.server ? `<p class="ov-note">${link('#/attention','Open the Attention page →')}${attention.acknowledged || attention.snoozed ? ` · ${attention.acknowledged} acknowledged, ${attention.snoozed} snoozed` : ''}</p>` : ''}
       ${!attention.complete ? `<p class="ov-warning" role="status">Partial coverage: ${esc(attention.unavailable.map(key=>CARD_LABELS[key] || {projections:'Live missions',health:'Control plane'}[key] || key).join(', '))}. Loading, unavailable, or stale sources may contain more items; retained reports remain visible.</p>` : ''}
       ${attention.items.length>limit ? `<div class="ov-attention-controls"><span class="ov-note">Showing ${visible.length} of ${attention.items.length} observed items</span><button type="button" data-attention-toggle aria-expanded="${expanded}" aria-controls="ov-attention-items">${expanded?'Show fewer':`Show all ${attention.items.length}`}</button></div>` : ''}
-      ${attention.items.length ? `<ul id="ov-attention-items" class="ov-list ov-attention-list${expanded?' is-expanded':''}" aria-label="Attention items"${expanded?' tabindex="0"':''}>${visible.map(item=>`<li class="ov-row" data-attention-key="${esc(item.key)}"><div>${link(item.href,item.title)}<p>${esc(item.detail)}</p></div><span class="ov-tag ov-alert">${esc(item.severity)}${item.updated?`<br>${ageMarkup(new Date(item.updated).toISOString(),now)}`:''}</span></li>`).join('')}</ul>` : empty(attention.complete?'No attention items in the received reports.':'Attention is not yet fully known.')}`;
+      ${attention.items.length ? `<ul id="ov-attention-items" class="ov-list ov-attention-list${expanded?' is-expanded':''}" aria-label="Attention items"${expanded?' tabindex="0"':''}>${visible.map(item=>`<li class="ov-row" data-attention-key="${esc(item.key)}"${attention.server?' data-attention-origin="server"':''}><div>${link(item.href,item.title)}<p>${esc(item.detail)}</p></div><span class="ov-tag ov-alert">${esc(item.severity)}${item.updated?`<br>${ageMarkup(new Date(item.updated).toISOString(),now)}`:''}</span></li>`).join('')}</ul>` : empty(attention.complete?'No attention items in the received reports.':'Attention is not yet fully known.')}`;
   }
   if (section === 'missions') {
     const m = model.missions;
@@ -246,7 +262,10 @@ export function mountOverview(container, client, { freshness = () => null } = {}
     health:signal=>client.health({signal}),
     ci:signal=>client.getCi({signal}),
     reviews:signal=>client.listReviews({signal}),
+    // Disabled on the server (404) is not an error: the browser projection stays, with no warning.
+    attention:signal=>client.attention({state:'open'},{signal}).catch(error=>{if(error?.status===404)return {disabled:true};throw error;}),
   };
+  states.attention={loaded:false,error:false};
   container.innerHTML=`${styles}<p class="ov-intro">Current work, recent reports, and changes that matter. Finished, closed, and failed records stay in their respective tabs.</p><details class="ov-customize"><summary>Customize Overview</summary><p class="ov-note">Attention is always visible. Health stays in the footer.</p><div data-overview-controls></div><button type="button" data-overview-reset>Reset layout</button></details><section class="ov-panel ov-attention" data-overview="attention" aria-label="Attention"></section><div class="ov-layout">${OVERVIEW_CARDS.map(key=>`<section class="ov-panel" data-overview="${key}" aria-label="${key}"></section>`).join('')}</div><footer class="ov-health" data-overview="health"></footer>`;
   function applyPreferences() {
     const focused=document.activeElement;
@@ -272,11 +291,14 @@ export function mountOverview(container, client, { freshness = () => null } = {}
   let shownCritical=null, loadedAtLastAttention=new Set();
   function markNewCritical(element) {
     const now=Date.now();
-    const critical=[...element.querySelectorAll('[data-attention-key]')].filter(row=>row.querySelector('.ov-alert')?.textContent.startsWith('critical')).map(row=>row.getAttribute('data-attention-key'));
+    const rows=[...element.querySelectorAll('[data-attention-key]')].filter(row=>row.querySelector('.ov-alert')?.textContent.startsWith('critical'));
+    const critical=rows.map(row=>row.getAttribute('data-attention-key'));
     // A critical item is "new" only when its source had already loaded at the previous render:
     // everything on first load, and items arriving with a source's first response, stay still.
-    if(shownCritical && !isCalm())for(const key of critical){
-      const source=ATTENTION_SOURCES[key.split(':')[0]];
+    // Server inbox items (any key shape) come from the attention source itself.
+    if(shownCritical && !isCalm())for(const row of rows){
+      const key=row.getAttribute('data-attention-key');
+      const source=row.hasAttribute('data-attention-origin') ? 'attention' : ATTENTION_SOURCES[key.split(':')[0]];
       if(!shownCritical.has(key) && loadedAtLastAttention.has(source))pulseUntil.set(key,now+PULSE_MS);
     }
     shownCritical=new Set(critical);
@@ -297,7 +319,9 @@ export function mountOverview(container, client, { freshness = () => null } = {}
   let motionSettled=false, userChange=false;
   function draw() {
     if(disposed || document.hidden)return;
-    const settled=Object.keys(sources).every(key=>states[key]?.loaded);
+    // Settled = every source has answered once, with data or an error: a source that keeps failing
+    // must not hold the counters still for ever.
+    const settled=Object.keys(sources).every(key=>states[key]?.loaded || states[key]?.error);
     const live=settled&&motionSettled&&!userChange;
     motionSettled=settled;userChange=false;
     for(const panel of panels) {
@@ -344,11 +368,12 @@ export function mountOverview(container, client, { freshness = () => null } = {}
       const response=await sources[key](controller.signal);
       if(disposed || controller.signal.aborted)return;
       const field={projections:'activities',activity:'events'}[key] || key;
-      const objectSource=['health','ci','reviews','fleet'].includes(key);
-      if (objectSource ? !response || (key==='health' ? typeof response.status!=='string' : key==='ci' ? typeof response.available!=='boolean' : key==='fleet' ? !Array.isArray(response.components) : !Array.isArray(response.reviews)) : !Array.isArray(response?.[field])) throw new Error('Invalid response');
+      const objectSource=['health','ci','reviews','fleet','attention'].includes(key);
+      if (objectSource ? !response || (key==='attention' ? !response.disabled && !Array.isArray(response.items) : key==='health' ? typeof response.status!=='string' : key==='ci' ? typeof response.available!=='boolean' : key==='fleet' ? !Array.isArray(response.components) : !Array.isArray(response.reviews)) : !Array.isArray(response?.[field])) throw new Error('Invalid response');
       data[key==='activity' ? 'events' : key]=objectSource ? response : records(response?.[field]);
       if(key==='projections')received=Date.now();
-      states[key]={loaded:true,error:false};
+      if(key==='attention' && response.disabled)data.attention=null;
+      states[key]={loaded:true,error:false,...(key==='attention' && response.disabled ? {disabled:true} : {})};
       chip.ok(key);
       draw();
     } catch (error) {

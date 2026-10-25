@@ -76,7 +76,7 @@ export function compactSessionRow(entry,now=Date.now()) {
       ${entry.mission ? `<p class="ss-meta">Mission: <a data-mission-link href="#/missions/${esc(encodeURIComponent(entry.mission.key))}">${esc(short(entry.mission.title,130))}</a></p>` : text(s.mission_id) ? '<p class="ss-meta">Mission association not resolved; see agent details.</p>' : ''}
       <p class="ss-meta ss-id">${esc(short(entry.id,64))}${text(s.branch) ? ` · Branch ${esc(short(s.branch,70))}` : ''}</p>
     </div>
-    <div class="ss-state"><strong data-report>${esc(sessionReport(s,now))}</strong><span>${esc(short(entry.host,90)||'Host not reported')}</span>${text(s.model) ? `
+    <div class="ss-state"><strong data-report>${esc(sessionReport(s,now))}</strong><span>${esc(short(entry.host,90)||'Host not reported')}</span><a class="ss-meta" data-llm-link href="#/llm/session/${esc(encodeURIComponent(entry.id))}">LLM usage</a>${text(s.model) ? `
       <span class="ss-meta">Model: ${esc(short(s.model,120))}</span>` : ''}${runtimeLine(s.runtime) ? `
       <span class="ss-meta" data-runtime>Runtime: ${esc(runtimeLine(s.runtime))}</span>` : ''}</div>
   </article>`;

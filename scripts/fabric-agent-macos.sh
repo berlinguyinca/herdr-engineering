@@ -24,19 +24,17 @@
 #      discover this host's tailnet IPv4. The Homebrew CLI lives at
 #      /opt/homebrew/bin/tailscale (Apple Silicon) or /usr/local/bin/tailscale
 #      (Intel); the first that answers `tailscale ip -4` is symlinked.
-#   4. The gateway control URL written to
-#      ~/.config/herdr-engineering/fabric.env as HERDR_ENGINEERING_FABRIC_URL
-#      (only if not already set there). Machine-local, no secrets.
+#   4. (no env file) The agent finds the gateway in the central
+#      fleet-config.yaml (fabric.url); --gateway/--control-plane are ignored.
 #   5. A launchd LaunchAgent (com.herdr-engineering.fabric-agent) that runs a
-#      wrapper script sourcing fabric.env then `herdr-eng devfabric agent`,
-#      with KeepAlive so it restarts on crash and loads at login.
+#      wrapper script exec'ing `herdr-eng devfabric agent`, with KeepAlive so it restarts on crash and loads at login.
 #
 # Subcommands:
 #   install    (default) ensure everything and start the agent
 #   status     show whether the LaunchAgent is running
 #   uninstall  stop + remove the LaunchAgent and wrapper (leaves the venv,
-#              uv, tailscale symlink and fabric.env in place)
-#   uninstall --purge   also remove the venv, fabric.env, tailscale symlink
+#              uv and tailscale symlink in place)
+#   uninstall --purge   also remove the venv and tailscale symlink
 #
 # Usage:
 #   scripts/fabric-agent-macos.sh [install|status|uninstall] [--gateway <url>]
@@ -48,8 +46,6 @@ LABEL="com.herdr-engineering.fabric-agent"
 LAUNCH_AGENTS_DIR="$HOME/Library/LaunchAgents"
 PLIST="$LAUNCH_AGENTS_DIR/$LABEL.plist"
 WRAPPER="$HOME/bin/herdr-fabric-agent.sh"
-ENV_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/herdr-engineering"
-ENV_FILE="$ENV_DIR/fabric.env"
 VENV="$HOME/.venvs/herdr-engineering"
 VENV_BIN="$VENV/bin"
 HERDR_ENG="$VENV_BIN/herdr-eng"
@@ -108,9 +104,8 @@ if [ "$CMD" = "uninstall" ]; then
   echo "  removed $WRAPPER"
   if [ "$PURGE" = "1" ]; then
     step "purging machine-local agent state"
-    rm -rf "$VENV" "$ENV_FILE" "$TAILSCALE_LINK"
+    rm -rf "$VENV" "$TAILSCALE_LINK"
     echo "  removed venv:     $VENV"
-    echo "  removed fabric.env: $ENV_FILE"
     echo "  removed tailscale symlink: $TAILSCALE_LINK"
   fi
   step "done. This host no longer runs a dev-fabric agent."
@@ -152,32 +147,17 @@ if ! command -v tailscale >/dev/null 2>&1 && [ ! -x "$TAILSCALE_LINK" ]; then
 fi
 "$TAILSCALE_LINK" ip -4 || warn "tailscale not answering; is the Tailscale app running and logged in?"
 
-# --- 4/6 gateway + control-plane URLs -> fabric.env -------------------------
-step "4/6 fabric gateway + control-plane URLs -> $ENV_FILE"
-if ! grep -q '^HERDR_ENGINEERING_FABRIC_URL=' "$ENV_FILE" 2>/dev/null; then
-  mkdir -p "$ENV_DIR"
-  printf 'HERDR_ENGINEERING_FABRIC_URL=%s\n' "$GATEWAY" > "$ENV_FILE"
-  chmod 600 "$ENV_FILE"
-  echo "  wrote HERDR_ENGINEERING_FABRIC_URL=$GATEWAY"
-else
-  echo "  unchanged (already set: $(grep '^HERDR_ENGINEERING_FABRIC_URL=' "$ENV_FILE" | cut -d= -f2-))"
-fi
-if ! grep -q '^HERDR_ENGINEERING_CONTROL_PLANE_URL=' "$ENV_FILE" 2>/dev/null; then
-  printf 'HERDR_ENGINEERING_CONTROL_PLANE_URL=%s\n' "$CONTROL_PLANE" >> "$ENV_FILE"
-  chmod 600 "$ENV_FILE"
-  echo "  wrote HERDR_ENGINEERING_CONTROL_PLANE_URL=$CONTROL_PLANE"
-else
-  echo "  unchanged (control-plane URL already set)"
+# --- 4/6 gateway + control-plane URLs (central config) ---------------------
+step "4/6 gateway + control-plane URLs come from the central fleet-config.yaml"
+if [ "$GATEWAY" != "$DEFAULT_GATEWAY" ] || [ "$CONTROL_PLANE" != "$DEFAULT_CONTROL_PLANE" ]; then
+  warn "--gateway/--control-plane are ignored: set fabric.url in fleet-config.yaml"
 fi
 
-# --- 5/6 wrapper script (mirrors systemd EnvironmentFile) ------------------
+# --- 5/6 wrapper script -----------------------------------------------------
 step "5/6 writing agent wrapper -> $WRAPPER"
 mkdir -p "$HOME/bin"
 cat > "$WRAPPER" <<WRAP
 #!/bin/bash
-set -a
-source "$ENV_FILE"
-set +a
 exec "$HERDR_ENG" devfabric agent
 WRAP
 chmod +x "$WRAPPER"

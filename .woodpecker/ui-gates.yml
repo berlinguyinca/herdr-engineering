@@ -1,0 +1,39 @@
+# Woodpecker CI (ci.metabolomics.us) -- the UI gates of the collaboration page (docs/operations/ui-gates.md).
+#
+# Written to the conventions of the organisation's other pipelines (iw-console-aliases, fsc-chemlake-mcp), read, not run:
+#
+#  * `image:` names an EXECUTABLE on the agent, not a container to pull (`bash`); exec hosts are Slurm jobs, so there is no docker, no
+#    apt and no sudo. The step logic lives in scripts/ci/ui-gates.sh so `bash scripts/ci/ui-gates.sh` reproduces CI from a clean
+#    checkout.
+#  * the clone plugin fails invisibly on this backend: skip_clone plus a plain git checkout with the credential the agent stages.
+#  * pull_request and manual only, filtered to what can change the result, so it does not build twice for a push to a PR branch.
+#
+# STATUS: NOT RUN on any agent. Nobody has checked that an exec host has Chromium's shared libraries and Debian-style
+# /etc/fonts/conf.d, and the screenshots are compared pixel for pixel, so the first run is also the test of whether that host renders
+# like the workstation the baselines came from. If `baselines:check` fails there while every other gate passes, fix the host; do
+# not regenerate the baselines. GitHub Actions is disabled organisation-wide and is not used.
+when:
+  - event: manual
+  - event: pull_request
+    path:
+      include: ['packages/**', 'tests/playwright/**', 'tests/visual/**', 'docs/assets/screenshots/**', 'scripts/ci/ui-gates.sh', 'package.json', 'package-lock.json', 'herdr_engineering/control_plane/**']
+
+skip_clone: true
+
+steps:
+  - name: checkout
+    image: bash
+    commands:
+      - 'set -eu'
+      - 'test -r /etc/woodpecker-git-credentials || { echo "the job staged no forge credential" >&2; exit 1; }'
+      - 'git init -q -b "${CI_COMMIT_BRANCH:-main}" .'
+      - 'git remote add origin "https://github.com/${CI_REPO}.git"'
+      - 'git fetch --no-tags --depth=1 origin "$CI_COMMIT_SHA"'
+      - 'git checkout -q FETCH_HEAD'
+      - 'git --no-pager log --oneline -1'
+
+  - name: ui-gates
+    image: bash
+    commands:
+      - 'set -eu'
+      - 'bash scripts/ci/ui-gates.sh'

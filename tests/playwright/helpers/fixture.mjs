@@ -1,6 +1,7 @@
 import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
+import os from 'node:os';
 import {chromium} from 'playwright';
 
 const root=path.resolve(import.meta.dirname,'../../..');
@@ -18,14 +19,30 @@ function serve(){
  });
 }
 
+// Browsers the playwright CLI installed into its own cache, newest revision first. Used only when the
+// browser matching the installed playwright package is missing (an older/newer browser cached).
+export function cachedChromiums(cache=path.join(os.homedir(),'.cache','ms-playwright')){
+ let dirs=[];
+ try{dirs=fs.readdirSync(cache).filter(d=>/^chromium-\d+$/.test(d));}catch{return [];}
+ return dirs.sort((a,b)=>Number(b.split('-')[1])-Number(a.split('-')[1]))
+  .flatMap(d=>['chrome-linux64/chrome','chrome-linux/chrome','chrome-mac/Chromium.app/Contents/MacOS/Chromium','chrome-win/chrome.exe'].map(f=>path.join(cache,d,f)))
+  .filter(f=>fs.existsSync(f));
+}
+
+async function launchChromium(options){
+ try{return await chromium.launch(options);}
+ catch(error){
+  for(const executablePath of cachedChromiums()){try{return await chromium.launch({...options,executablePath});}catch{/* try the next one */}}
+  throw error;
+ }
+}
+
 export async function withPage(run){
  const server=serve();
  await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
  let browser;
  try{
-  const options={headless:true,args:['--no-sandbox']};
-  if(process.env.PLAYWRIGHT_CHROMIUM)options.executablePath=process.env.PLAYWRIGHT_CHROMIUM;
-  try{browser=await chromium.launch(options);}catch(error){const fallback='/home/wohlgemuth/.cache/ms-playwright/chromium-1243/chrome-linux64/chrome';if(!fs.existsSync(fallback))throw error;browser=await chromium.launch({...options,executablePath:fallback});}
+  browser=await launchChromium({headless:true,args:['--no-sandbox']});
   const page=await browser.newPage();
   await run(page,`http://127.0.0.1:${server.address().port}`);
  }finally{await browser?.close();server.close();}

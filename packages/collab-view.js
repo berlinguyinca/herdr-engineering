@@ -8,7 +8,7 @@ import { renderLinks } from './collab-links.js';
 import { buildTabsPanes, nextTab, renderTabsPanes } from './collab-tabs.js';
 import { decisionBody, delegationBody, renderDelegations, renderProposalList, renderReview } from './collab-proposals.js';
 import {
-  filterGraph, focusKey, focusSelector, layoutGraph, mergePages, nextNode, renderLineage, replayTarget,
+  MAX_RENDER_NODES, filterGraph, focusKey, focusSelector, focusSuccessor, layoutGraph, mergePages, nextNode, pagesTruncated, renderLineage, replayTarget,
 } from './collab-lineage.js';
 import { answerBody, askBody, contextBody, declineBody, linkBody, renderContextChip, renderContextPanel, renderInbox } from './collab-context.js';
 import { ackBody, renderAnalytics, renderInbox as renderAttention, renderProgress, restoreBody, snoozeBody } from './collab-attention.js';
@@ -97,6 +97,27 @@ const GUIDE = `<div class="hd-card">
     <li>The agent can then <b>list rooms, read messages and post</b> as you, in those rooms only. It cannot run commands on your machine through this connection, and everything it reads from others is marked untrusted.</li>
     <li><b>Revoke</b> it here any time; it stops working immediately. Credentials expire after 30 days.</li>
   </ol></div>`;
+
+// Replacing a container's markup drops keyboard focus to <body> when the focused control is rebuilt (WCAG 2.4.3, 3.2.1).
+// stableSelector() names the control by id / data attribute; refocus() finds its replacement, or parks focus on the
+// container itself so a keyboard user keeps their place instead of restarting from the top of the page.
+export function stableSelector(el) {
+  if (!el || !el.tagName) return null;
+  const q = (v) => String(v).replace(/["\\]/g, '\\$&');
+  if (el.id) return `#${CSS.escape(el.id)}`;
+  // Every data-* attribute together: a row's control is told apart from its siblings by its own id (data-pid, data-wb-id, ...),
+  // not just by the shared action name, so focus returns to THE control and not to the first one with the same action.
+  const data = [...el.attributes].filter((a) => a.name.startsWith('data-') && a.name !== 'data-h');
+  if (data.length) return `${el.tagName.toLowerCase()}${data.map((a) => `[${a.name}="${q(a.value)}"]`).join('')}`;
+  if (el.type === 'submit' && el.closest('form')) { const f = el.closest('form'); const fd = [...f.attributes].find((a) => a.name.startsWith('data-')); if (fd) return `form[${fd.name}="${q(fd.value)}"] button[type="submit"]`; }
+  return null;
+}
+export function refocus(container, selector) {
+  let target = null;
+  try { target = selector ? container.querySelector(selector) : null; } catch { target = null; }
+  if (!target) { if (!container.hasAttribute('tabindex')) container.setAttribute('tabindex', '-1'); target = container; }
+  target.focus({ preventScroll: true });
+}
 
 // onFreshness(ok, message) feeds the dashboard route's freshness chip (the standalone page has none).
 export function mountCollab(root, { fabricSessions = null, onFreshness = () => {} } = {}) {
@@ -554,7 +575,7 @@ export function mountCollab(root, { fabricSessions = null, onFreshness = () => {
     let waitingCount = 0;
     if (canManagePeople()) { try { waitingCount = (await api.users('pending')).users.length; } catch { /* not an approver */ } }
     const t = (to, label, on, extra = '') => `<button type="button" class="cx-rtab${extra}" role="tab" data-go="${to}" aria-selected="${on}">${label}</button>`;
-    return `<div class="cx-rtabs" role="tablist" aria-label="Rooms">${roomsCache.map((r) => t(`/room/${encodeURIComponent(r.room_id)}`, esc(r.name), r.room_id === activeRoom)).join('')}${t('/rooms', '＋ New room', activePage === '/rooms', ' cx-rtab--new')}<span class="grow"></span>${canManagePeople() ? t('/people', `People${waitingCount ? ` <span class="cx-badge" title="waiting for approval">${waitingCount}</span>` : ''}`, activePage === '/people') : ''}${t('/agents', 'AI agents', activePage === '/agents')}</div>`;
+    return `<div class="cx-rtabs" role="tablist" aria-label="Rooms">${roomsCache.map((r) => t(`/room/${encodeURIComponent(r.room_id)}`, esc(r.name), r.room_id === activeRoom)).join('')}${t('/rooms', '+ New room', activePage === '/rooms', ' cx-rtab--new')}<span class="grow"></span>${canManagePeople() ? t('/people', `People${waitingCount ? ` <span class="cx-badge" title="waiting for approval">${waitingCount}</span>` : ''}`, activePage === '/people') : ''}${t('/agents', 'AI agents', activePage === '/agents')}</div>`;
   }
 
   const hueOf = (s) => { let h = 0; for (const c of String(s)) h = (h * 31 + c.charCodeAt(0)) % 360; return h; };
@@ -577,14 +598,14 @@ export function mountCollab(root, { fabricSessions = null, onFreshness = () => {
     if (!tabs.some(([k]) => k === sub)) sub = 'chat';
 
     frame('/rooms', `<div class="cx-roomhead"><h1>${esc(info.name)}</h1>${pill(roleLabel(info.role), 'var(--accent)')}</div>
-      <div class="cx-stabs" role="tablist" aria-label="${esc(info.name)}">${tabs.map(([k, l]) => `<button type="button" class="cx-stab" role="tab" data-sub="${k}" aria-selected="${k === sub}">${l}<span class="cx-badge" id="hcn-b-${k}" hidden></span></button>`).join('')}</div>
+      <div class="cx-stabs" role="tablist" aria-label="${esc(info.name)}">${tabs.map(([k, l]) => `<button type="button" class="cx-stab" role="tab" id="hcn-st-${k}" aria-controls="hcn-p-${k}" data-sub="${k}" data-label="${l}" aria-label="${l}" aria-selected="${k === sub}">${l}<span class="cx-badge" id="hcn-b-${k}" aria-hidden="true" hidden></span></button>`).join('')}</div>
       <section class="hd-card cx-chat cx-panel" id="hcn-p-chat" aria-label="Conversation">
         <div id="hcn-log" class="cx-log" role="log" aria-live="polite"><div class="hd-empty" id="hcn-empty">No messages yet.</div></div>
         <button type="button" id="hcn-jump" class="hd-btn hd-btn--sm cx-jump" hidden>↓ New messages</button>
         ${canPost ? '<div id="hcn-ctx-attached" class="ctx-attached" aria-live="polite"></div><div id="hcn-composer"></div>'
         : '<div class="cx-msg" style="padding:12px">Read-only access.</div>'}
       </section>
-      ${guest ? '' : `<section class="hd-card cx-stack cx-panel" id="hcn-p-flow" hidden aria-label="Flow of work"><div class="cx-row cx-row--between"><div class="hd-card__title">Flow of work</div><span class="cx-msg">People and agents; lines are tasks, moving lines are work in progress.</span></div><div id="hcn-flow"></div><div id="hcn-flow-detail" class="cx-msg" role="status"></div></section>`}
+      ${guest ? '' : `<section class="hd-card cx-stack cx-panel" id="hcn-p-flow" hidden aria-label="Flow of work"><div class="cx-row cx-row--between"><div class="hd-card__title">Flow of work</div><span class="cx-msg">People and agents; lines are tasks, moving lines are work in progress.</span><button type="button" id="hcn-flow-still" class="hd-btn hd-btn--ghost hd-btn--sm" aria-pressed="false">Pause motion</button></div><div id="hcn-flow"></div><div id="hcn-flow-detail" class="cx-msg" role="status"></div></section>`}
       <section class="cx-panel cx-cols" id="hcn-p-tasks" hidden>
         ${canPost ? '<div class="hd-card cx-stack"><div class="hd-card__title">Give a task</div><form id="hcn-task" class="cx-stack"><label class="cx-field">To<select name="target" id="hcn-task-target"></select></label><label class="cx-field">What should it do?<textarea class="cx-input" name="text" required maxlength="4000" rows="4"></textarea></label><button class="hd-btn" type="submit">Send task</button><span id="hcn-task-msg" class="cx-msg" role="alert"></span></form></div>' : ''}
         <div class="hd-card cx-stack"><div class="hd-card__title">Tasks</div><div id="hcn-tasks"></div></div></section>
@@ -594,7 +615,7 @@ export function mountCollab(root, { fabricSessions = null, onFreshness = () => {
         ${canPost ? '<div class="hd-card cx-stack"><div class="hd-card__title">Your agents</div><div id="hcn-grant"></div></div>' : ''}
         ${operator ? '<div class="hd-card cx-stack"><div class="hd-card__title">Helpers</div><div id="hcn-panic"></div><div class="hd-card__title">Host access requests</div><div id="hcn-egress"></div><div class="hd-card__title">External hosts</div><div id="hcn-hosts-table"></div></div>' : ''}
         ${canInvite ? '<div class="hd-card cx-stack"><div class="hd-card__title">Helper profile</div><div id="hcn-profile-box"></div></div>' : ''}</section>`}
-      ${guest ? '' : `<section class="hd-card cx-stack cx-panel" id="hcn-p-tabs" hidden aria-label="Primary agents and their subagents">
+      ${guest ? '' : `<section class="hd-card cx-stack cx-panel" id="hcn-p-tabs" hidden aria-label="Primary agents and their subagents"><h2 class="cx-sr">Agents by tab</h2>
         ${canInvite ? `<details class="cx-stack" id="hcn-ext"><summary>Invite a remote agent</summary>
           <form id="hcn-ext-form" class="cx-stack">
             <label class="cx-field">Name shown on its tab<input name="label" required maxlength="40" placeholder="Dana's Claude"></label>
@@ -629,14 +650,29 @@ export function mountCollab(root, { fabricSessions = null, onFreshness = () => {
             <button class="hd-btn" type="submit">Delegate</button><span id="hcn-deleg-msg" class="cx-msg" role="alert"></span></form>
           <div id="hcn-delegs"></div></div>
         <div class="hd-card cx-stack"><div class="hd-card__title">Quarantine</div><div id="hcn-props"></div><div id="hcn-review" aria-live="polite"></div></div></section>` : ''}
-      ${guest ? '' : '<section class="hd-card cx-stack cx-panel" id="hcn-p-attention" hidden aria-label="Attention inbox"><div id="hcn-attention" class="cx-stack"></div></section><section class="hd-card cx-stack cx-panel" id="hcn-p-progress" hidden aria-label="Progress and analytics"><div id="hcn-progress" class="cx-stack"></div><div id="hcn-analytics" class="cx-stack"></div></section>'}
-      ${guest ? '' : '<section class="hd-card cx-stack cx-panel" id="hcn-p-lineage" hidden aria-label="Lineage graph, timeline and replay"><div id="hcn-consults" class="cx-stack"></div><div id="hcn-lineage" class="cx-stack"></div></section>'}
-      ${guest ? '' : '<section class="hd-card cx-stack cx-panel" id="hcn-p-links" hidden aria-label="Linked workspaces and missions"><div id="hcn-links" role="region" aria-live="polite" tabindex="0"></div></section>'}
+      ${guest ? '' : '<section class="hd-card cx-stack cx-panel" id="hcn-p-attention" hidden aria-label="Attention inbox"><div id="hcn-attention" class="cx-stack"></div></section><section class="hd-card cx-stack cx-panel" id="hcn-p-progress" hidden aria-label="Progress and analytics"><h2 class="cx-sr">Progress and analytics</h2><div id="hcn-progress" class="cx-stack"></div><div id="hcn-analytics" class="cx-stack"></div></section>'}
+      ${guest ? '' : '<section class="hd-card cx-stack cx-panel" id="hcn-p-lineage" hidden aria-label="Lineage graph, timeline and replay"><h2 class="cx-sr">Lineage</h2><div id="hcn-consults" class="cx-stack"></div><div id="hcn-lineage" class="cx-stack"></div></section>'}
+      ${guest ? '' : '<section class="hd-card cx-stack cx-panel" id="hcn-p-links" hidden aria-label="Linked workspaces and missions"><h2 class="cx-sr">Linked workspaces and missions</h2><div id="hcn-links" role="region" aria-live="polite" tabindex="0"></div></section>'}
       ${canInvite ? `<section class="cx-panel cx-cols" id="hcn-p-people" hidden><div class="hd-card cx-stack"><div class="hd-card__title">People</div><div id="hcn-people"></div></div>
         <div class="hd-card cx-stack"><div class="hd-card__title">Invite</div><form id="hcn-invite" class="cx-stack"><label class="cx-field">Invite by email<input name="email" type="email" required placeholder="name@example.org"></label>
           <label class="cx-field">Access<select name="role">${ROLES.map(([v, l]) => `<option value="${v}">${esc(l)}</option>`).join('')}</select></label>
           <button class="hd-btn" type="submit">Send invite</button><span id="hcn-invite-msg" class="cx-msg" role="status"></span></form></div></section>` : ''}`, strip);
 
+    const stillBtn = $('hcn-flow-still');      // WCAG 2.2.2: moving lines run for longer than 5 s, so they can be paused
+    if (stillBtn) {
+      // A toggle button keeps ONE label and states its state with aria-pressed; changing the label as well would be read twice
+      // ("Resume motion, pressed"). The choice is remembered per browser; storage may be blocked, so every access is guarded.
+      const KEY = 'hcn.flow.still';
+      const apply = (on, save) => {
+        stillBtn.setAttribute('aria-pressed', String(on));
+        $('hcn-p-flow').classList.toggle('cx-still', on);
+        if (save) { try { if (on) window.localStorage.setItem(KEY, '1'); else window.localStorage.removeItem(KEY); } catch { /* storage blocked: the choice lasts until reload */ } }
+      };
+      let saved = false;
+      try { saved = window.localStorage.getItem(KEY) === '1'; } catch { saved = false; }
+      if (saved) apply(true, false);
+      stillBtn.onclick = () => apply(stillBtn.getAttribute('aria-pressed') !== 'true', true);
+    }
     const log = $('hcn-log');
     let alive = true;
     let composer = null;
@@ -655,7 +691,10 @@ export function mountCollab(root, { fabricSessions = null, onFreshness = () => {
       const el = $(id);
       if (!el || el.dataset.h === html) return false;
       if (el.contains(document.activeElement) && document.activeElement.matches('input,textarea,select')) { stale.add(id); return false; }
+      const had = el.contains(document.activeElement) && document.activeElement !== el ? document.activeElement : null;
+      const again = had ? stableSelector(had) : null;
       el.dataset.h = html; el.innerHTML = html; stale.delete(id);
+      if (had && !el.contains(document.activeElement)) refocus(el, again);
       return true;
     };
     root.addEventListener('focusout', () => setTimeout(() => { if (stale.size && alive) paint(); }, 0));
@@ -931,14 +970,22 @@ export function mountCollab(root, { fabricSessions = null, onFreshness = () => {
               if (!window.confirm(ask)) return;
               await api.decideProposal(roomId, b.dataset.pid, decisionBody(b.dataset.decide, b.dataset.digest, ($('hcn-prop-reason') || {}).value));
               ['hcn-props', 'hcn-review', 'hcn-delegs'].forEach((id) => { $(id).dataset.h = ''; });
+              S.focusProposal = b.dataset.pid;          // the decide buttons go away: focus moves on to this proposal's row, not to <body>
               await loadProposals();
             });
           });
         }
+        landOnDecided();
       };
       show();
       loadTabs().then(() => loadProposals()).then(show);
     }
+    // After a decision the review buttons are gone: land on the decided proposal's own row (its logical successor).
+    const landOnDecided = () => {
+      if (!S.focusProposal) return;
+      const row = $('hcn-props') && $('hcn-props').querySelector(`[data-proposal="${CSS.escape(S.focusProposal)}"]`);
+      if (row) { row.focus({ preventScroll: true }); S.focusProposal = null; }
+    };
 
     // ---- Lineage: graph, Gantt, replay and inspector. Read-only; the server filters every read by your CURRENT
     // membership. Live = the head of your ledger (refreshed while open); a replay position is static.
@@ -1030,7 +1077,7 @@ export function mountCollab(root, { fabricSessions = null, onFreshness = () => {
       return { graphAll, filtered, asOf: LIN.asOf, timeline: LIN.timeline, error: LIN.error, timelineError: LIN.timelineError, queued: LIN.pending !== null, notice: LIN.notice, busy: LIN.busy, view: LIN.view,
         mode: LIN.mode, clock: LIN.clock, sel: LIN.sel, focus: LIN.focus, filters: LIN.filters, total: LIN.total,
         workbench: LIN.sel ? renderWorkbench(wbModel()) + renderContextPanel(ctxModel()) : '',
-        graphTruncated: LIN.next !== null ? (LIN.truncated || 'limit') : null, width: Math.max(640, ($('hcn-lineage')?.clientWidth || 900)) };
+        graphTruncated: LIN.next !== null ? (LIN.truncated || 'limit') : (LIN.truncated || null), graphMore: LIN.next !== null, width: Math.max(640, ($('hcn-lineage')?.clientWidth || 900)) };
     };
     async function loadWorkbench(keep = false) {
       const node = LIN.sel;
@@ -1125,7 +1172,7 @@ export function mountCollab(root, { fabricSessions = null, onFreshness = () => {
           if (my !== LIN.seq || !alive) return;
         }
         LIN.pages = more ? [...LIN.pages, g] : [g];
-        LIN.total = g.total_nodes; LIN.next = g.next_offset; LIN.truncated = g.truncated_reason; LIN.asOf = g.as_of;
+        LIN.total = g.total_nodes; LIN.next = g.next_offset; LIN.truncated = pagesTruncated(LIN.pages); LIN.asOf = g.as_of;
         if (t) LIN.timeline = t;
         LIN.error = null;
         LIN.fails = 0;
@@ -1154,16 +1201,29 @@ export function mountCollab(root, { fabricSessions = null, onFreshness = () => {
       else if (!force && !LIN.at && !LIN.busy) { loadLineage(); return; }
       if (!CTX.busy && Date.now() - CTX.at > 15000) { CTX.at = Date.now(); loadContext(); }
       const m = linModel();
-      LIN.layout = layoutGraph(m.filtered);
+      // the layout feeds the SVG's arrow-key navigation only; above the draw cap there is no SVG, and laying out thousands of
+      // nodes on every keystroke of the filter box cost 0.5-2.4 s per key (T16 large-graph gate)
+      LIN.layout = m.filtered.nodes.length <= MAX_RENDER_NODES && LIN.mode !== 'table' ? layoutGraph(m.filtered) : null;
       const html = renderLineage(m);
       drawConsults();
       if (LIN.html === html && box.innerHTML !== '') return;
       const a = document.activeElement;
-      const key = a && box.contains(a) ? focusKey(a) : null;
-      const pos = key && typeof a.selectionStart === 'number' ? a.selectionStart : null;
+      let key = a && box.contains(a) ? focusKey(a) : null;
+      // While a request is in flight the controls are drawn disabled and a disabled control cannot keep focus, so remember
+      // where focus was when the wait began and give it back when the answer is drawn (keyboard users keep their place).
+      const waiting = Boolean(WB.busy || LIN.busy);
+      if (waiting && !LIN.wasWaiting) LIN.waitFocus = key;
+      if (!waiting && LIN.wasWaiting && !key && (!a || a === document.body) && LIN.waitFocus) key = LIN.waitFocus;
+      if (!waiting) LIN.waitFocus = null;
+      LIN.wasWaiting = waiting;
+      const pos = key && a && box.contains(a) && typeof a.selectionStart === 'number' ? a.selectionStart : null;
       LIN.html = html; box.innerHTML = html;
       const sel = key && focusSelector(key);
       const el = sel && box.querySelector(sel);
+      if (key && !el) {                                                    // the control is gone: its logical successor, else the panel
+        const next = focusSuccessor(key).map((q) => box.querySelector(q)).find(Boolean);
+        if (next) { if (!next.matches('button,a[href],input,select,textarea,[tabindex]')) next.setAttribute('tabindex', '-1'); next.focus({ preventScroll: true }); } else refocus(box, null);
+      }
       if (el) { el.focus({ preventScroll: true }); if (pos !== null && el.setSelectionRange && (el.type === 'search' || el.type === 'textarea' || el.type === 'text')) try { el.setSelectionRange(pos, pos); } catch { /* not selectable */ } }
     }
     function bindLineage(box) {
@@ -1214,7 +1274,13 @@ export function mountCollab(root, { fabricSessions = null, onFreshness = () => {
           return;
         }
         const f = e.target.dataset.filter;
-        if (f === 'q') { LIN.filters.q = e.target.value; drawLineage(true); }
+        if (f === 'q') {
+          LIN.filters.q = e.target.value;
+          // Above the draw cap one redraw rebuilds thousands of table rows: coalesce a burst of keystrokes into one redraw so
+          // typing itself stays responsive. Small graphs redraw at once, as before.
+          const loaded = LIN.pages.reduce((n, p) => n + ((p && p.nodes) || []).length, 0);
+          if (loaded > MAX_RENDER_NODES) { clearTimeout(LIN.qTimer); LIN.qTimer = setTimeout(() => { if (alive) drawLineage(true); }, 250); } else drawLineage(true);
+        }
         else if (e.target.dataset.replay === 'slider') {
           const out = box.querySelector('.lin-replay__status');
           if (out) out.textContent = `Position ${e.target.value} of ${e.target.max}. Release to load.`;
@@ -1289,7 +1355,12 @@ export function mountCollab(root, { fabricSessions = null, onFreshness = () => {
       put('hcn-progress', renderProgress({ data: ATT.prog, error: ATT.progError }));
       put('hcn-analytics', renderAnalytics({ data: ATT.stats, error: ATT.statsError }));
     }
-    const setBadge = (k, n) => { const b = $(`hcn-b-${k}`); if (!b) return; b.hidden = !n; b.textContent = n > 99 ? '99+' : String(n); };
+    // the count is painted (aria-hidden) and spoken as "Tasks, 3 waiting": the button's own name never glues a number onto the word ("Tasks3")
+    const setBadge = (k, n) => {
+      const b = $(`hcn-b-${k}`); if (!b) return;
+      b.hidden = !n; b.textContent = n > 99 ? '99+' : String(n);
+      const tab = b.closest('[role="tab"]'); if (tab) tab.setAttribute('aria-label', n ? `${tab.dataset.label}, ${n > 99 ? 'more than 99' : n} waiting` : tab.dataset.label);
+    };
     const loadMine = async () => { try { S.mine = (await api.agents()).agents.filter((x) => !x.external); }   // a remote agent is bound to its invite: nothing to grant
        catch { /* keep the old list */ } };
     function paint() {
@@ -1318,6 +1389,8 @@ export function mountCollab(root, { fabricSessions = null, onFreshness = () => {
       if (k === 'chat') { log.scrollTop = log.scrollHeight; composer?.focus(); }
       paintPanel();
     };
+    // each sub-tab controls one panel, and the panel says which tab labels it (WAI-ARIA tabs pattern)
+    root.querySelectorAll('[role="tab"][data-sub]').forEach((b) => { const p = $(`hcn-p-${b.dataset.sub}`); if (p) { p.setAttribute('role', 'tabpanel'); p.setAttribute('aria-labelledby', b.id); p.removeAttribute('aria-label'); } });
     root.querySelectorAll('[data-sub]').forEach((b) => { b.onclick = () => showSub(b.dataset.sub); });
     root.querySelectorAll('.cx-panel').forEach((p) => { p.hidden = p.id !== `hcn-p-${sub}`; });
 
