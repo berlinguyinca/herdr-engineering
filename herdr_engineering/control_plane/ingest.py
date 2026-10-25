@@ -251,10 +251,10 @@ class IngestService:
             self._check_peer_namespace(env, event_type, payload, entity_id)
             self._check_lineage_scope(env)
             self._check_reserved_nodes(env, event_type, payload)
+        self._prevalidate(entity_type, entity_id, payload, event_type, source)
         if env is None:
             return self._dispatch(entity_type, entity_id, event_type, payload, source)
         env["entity_type"] = entity_type
-        self._prevalidate(entity_type, entity_id, payload, event_type)
         ledger = self.repo.ledger
         ack = {"event_id": env["event_id"], "source": env["source"],
                "source_sequence": env["source_sequence"]}
@@ -333,9 +333,13 @@ class IngestService:
             raise RuntimeError("durable event identity is unavailable")
         return tuple(found)
 
-    @staticmethod
-    def _prevalidate(entity_type, entity_id, payload, event_type="") -> None:
-        """Reject what a handler would reject BEFORE the envelope is persisted."""
+    def _prevalidate(self, entity_type, entity_id, payload, event_type="", source="herdr") -> None:
+        """Reject what a handler would reject BEFORE the envelope is persisted.
+
+        Runs for both v1 (legacy) and v2 (enveloped) ingest so a malformed
+        report never consumes its event id/sequence: the corrected retry with
+        the same idempotency identity can still be applied.
+        """
         if entity_type == "mission" and ":" in entity_id:
             raise ValueError("invalid mission id")
         if entity_type == "lineage":
@@ -346,6 +350,26 @@ class IngestService:
                 k in payload for k in ("repository_id", "forge_url", "repository_url",
                                        "repo_url", "clone_url", "commit_sha")):
             _git_identity(payload)
+        if entity_type in ("test_run", "build"):
+            self._validate_test_counts(payload)
+            self._delivery_mission_key(payload.get("mission_id"), source)
+        elif entity_type == "review":
+            self._delivery_mission_key(payload.get("mission_id"), source)
+        elif entity_type == "review_finding":
+            severity = payload.get("severity")
+            if not isinstance(severity, str) or not severity:
+                raise ValueError("severity is required")
+            if not isinstance(payload.get("summary"), str):
+                raise ValueError("summary is required")
+        elif entity_type == "pull_request":
+            self._delivery_mission_key(payload.get("mission_id"), source)
+
+    @staticmethod
+    def _validate_test_counts(payload) -> None:
+        for key in ("passed", "failed", "skipped", "total"):
+            value = payload.get(key)
+            if value is not None and (isinstance(value, bool) or not isinstance(value, (int, float))):
+                raise ValueError(f"{key} must be a number")
     def _dispatch(self, entity_type, entity_id, event_type, payload, source,
                   record_generic=True) -> dict:
         # System-graph live-ingest adapter (opt-in): reflect lifecycle events
@@ -427,10 +451,7 @@ class IngestService:
         return mission_id if source == "herdr" else f"{source}:{mission_id}"
 
     def _ingest_test_run(self, entity_id, event_type, payload, source, kind="test") -> dict:
-        for key in ("passed", "failed", "skipped", "total"):
-            value = payload.get(key)
-            if value is not None and (isinstance(value, bool) or not isinstance(value, (int, float))):
-                raise ValueError(f"{key} must be a number")
+        self._validate_test_counts(payload)
         return self.repo.upsert_test_run(
             entity_id, kind=kind,
             mission_id=self._delivery_mission_key(payload.get("mission_id"), source),
@@ -462,11 +483,7 @@ class IngestService:
         # ingest envelope carries in ``entity_id``); the review must already
         # exist so a forged/unknown review can never collect findings.
         severity = payload.get("severity")
-        if not isinstance(severity, str) or not severity:
-            raise ValueError("severity is required")
         summary = payload.get("summary")
-        if not isinstance(summary, str):
-            raise ValueError("summary is required")
         # A client-supplied finding_id is honoured verbatim; when omitted we derive
         # a stable id from the finding content so a replayed envelope updates the
         # original finding in place instead of appending a duplicate (idempotency

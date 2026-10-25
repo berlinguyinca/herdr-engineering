@@ -420,3 +420,45 @@ def test_ingest_review_finding_replay_is_idempotent_without_finding_id():
     reviews = repo.list_reviews(mission_id="m1")
     assert len(reviews[0]["findings"]) == 1
     assert reviews[0]["findings"][0]["summary"] == "crash"
+
+
+def test_v2_delivery_malformed_report_does_not_consume_its_sequence():
+    repo = ControlPlaneRepo()
+    svc = make_svc(repo)
+    # A malformed v2 test_run (bad passed count) is rejected before the envelope
+    # is persisted, so a corrected retry with the same idempotency identity lands.
+    bad = {"schema_version": 2, "event_id": "pi-7", "source": "pi",
+           "source_sequence": 7, "entity_type": "test_run", "entity_id": "r9",
+           "event_type": "test_run.started",
+           "payload": {"mission_id": "M1", "passed": "many", "total": 3}}
+    with pytest.raises(ValueError, match="passed"):
+        svc.ingest(bad, {"id": "agent", "kind": "agent", "authenticated_by": "api_key"})
+    assert repo.list_test_runs(mission_id="pi:M1") == []
+    # Corrected retry with the same event id is accepted.
+    good = {**bad, "payload": {"mission_id": "M1", "passed": 3, "total": 3}}
+    svc.ingest(good, {"id": "agent", "kind": "agent", "authenticated_by": "api_key"})
+    runs = repo.list_test_runs(mission_id="pi:M1")
+    assert len(runs) == 1 and runs[0]["passed"] == 3
+
+
+def test_v2_review_finding_unknown_review_does_not_consume_sequence():
+    repo = ControlPlaneRepo()
+    svc = make_svc(repo)
+    env = {"schema_version": 2, "event_id": "pi-8", "source": "pi",
+           "source_sequence": 8, "entity_type": "review_finding",
+           "entity_id": "missing-review", "event_type": "review_finding.added",
+           "payload": {"severity": "blocker", "summary": "crash"}}
+    # Unknown review must not persist an envelope that a corrected retry can't replay.
+    with pytest.raises(KeyError):
+        svc.ingest(env, {"id": "agent", "kind": "agent", "authenticated_by": "api_key"})
+    # A valid review then finding is accepted and finds exactly one finding.
+    svc.ingest({"schema_version": 2, "event_id": "pi-9", "source": "pi",
+                "source_sequence": 9, "entity_type": "review", "entity_id": "rv-9",
+                "event_type": "review.started",
+                "payload": {"mission_id": "M1", "reviewer": "codex", "status": "completed",
+                            "verdict": "approved"}},
+               {"id": "agent", "kind": "agent", "authenticated_by": "api_key"})
+    svc.ingest({**env, "entity_id": "rv-9", "event_id": "pi-10", "source_sequence": 10},
+               {"id": "agent", "kind": "agent", "authenticated_by": "api_key"})
+    reviews = repo.list_reviews(mission_id="pi:M1")
+    assert len(reviews) == 1 and len(reviews[0]["findings"]) == 1
