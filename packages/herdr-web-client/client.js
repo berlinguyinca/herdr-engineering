@@ -77,6 +77,22 @@ export class HerdrClient {
     return this.request(`/api/v1/missions/${encodeURIComponent(id)}`);
   }
 
+  missionTests(id, { signal } = {}) {
+    return this.request(`/api/v1/missions/${encodeURIComponent(id)}/tests`, { signal });
+  }
+
+  missionBuilds(id, { signal } = {}) {
+    return this.request(`/api/v1/missions/${encodeURIComponent(id)}/builds`, { signal });
+  }
+
+  missionReviews(id, { signal } = {}) {
+    return this.request(`/api/v1/missions/${encodeURIComponent(id)}/reviews`, { signal });
+  }
+
+  missionPulls(id, { signal } = {}) {
+    return this.request(`/api/v1/missions/${encodeURIComponent(id)}/pulls`, { signal });
+  }
+
   listMissionActivity({ signal } = {}) {
     return this.request('/api/v1/mission-activity', { signal });
   }
