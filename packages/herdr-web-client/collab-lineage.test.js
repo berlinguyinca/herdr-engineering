@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  EDGE_STYLE, MAX_RENDER_NODES, buildGantt, filterGraph, fmtDuration, layoutGraph, mergePages, nextNode,
+  EDGE_STYLE, MAX_RENDER_NODES, buildGantt, filterGraph, fmtDuration, layoutGraph, mergePages, nextNode, pagesTruncated,
   renderGanttSvg, focusKey, focusSelector, focusSuccessor, renderGanttTable, renderGraphSvg, renderGraphTable, renderGraphLegend, renderInspector, renderLineage, renderReplay,
   nodeLabel, replayTarget, replayText, shapeOf, stateLook,
 } from '../collab-lineage.js';
@@ -358,4 +358,18 @@ test('focus goes to the logical successor when the focused control is replaced (
   assert.deepEqual(focusSuccessor(null), []);
   assert.deepEqual(focusSuccessor('wba:confirm-go:collab_s1'), ['[data-wb-act="reject"][data-wb-id="collab_s1"]', '[data-wb-steer="collab_s1"]']);
   assert.deepEqual(focusSuccessor('wba:history:c1'), []);
+});
+
+test('a truncation reason on any loaded page stays shown after a later, whole page (links incomplete is not forgotten)', () => {
+  assert.equal(pagesTruncated([]), null);
+  assert.equal(pagesTruncated([{ truncated_reason: null }, { truncated_reason: null }]), null);
+  assert.equal(pagesTruncated([{ truncated_reason: 'edge_limit' }, { truncated_reason: null }]), 'edge_limit');
+  assert.equal(pagesTruncated([{ truncated_reason: 'edge_limit' }, { truncated_reason: 'byte_limit' }]), 'byte_limit');
+  assert.equal(pagesTruncated([{ truncated_reason: 'scan_budget' }, { truncated_reason: 'edge_limit' }]), 'scan_budget');
+  // and the panel says so for the merged graph
+  const page = (ids, reason) => ({ nodes: ids.map((id) => ({ id, node_type: 'task', label: id })), edges: [], truncated_reason: reason });
+  const pages = [page(['task:a'], 'edge_limit'), page(['task:b'], null)];
+  const g = mergePages(pages);
+  const html = renderLineage({ graphAll: g, filtered: filterGraph(g, {}), asOf: { step: 1, visible_events: 1, head: true }, timeline: null, error: null, busy: false, view: 'graph', mode: 'visual', clock: 'recorded', sel: null, focus: null, filters: { q: '', types: new Set(), edgeTypes: new Set(), state: '' }, total: 2, graphTruncated: pagesTruncated(pages), graphMore: false, width: 800 });
+  assert.match(html, /left out some links \(edge_limit\)/);
 });

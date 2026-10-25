@@ -40,8 +40,10 @@ npm run test:client
 
 The browser is whatever Chromium Playwright resolves (`chromium.executablePath()`, 156.0.8078.4 when the baselines were made); no
 path is hardcoded in the gate library. There is no new dependency: no axe-core, no `@playwright/test`, no image library (the pixel
-compare uses the browser's canvas). The visual suite lives in `tests/visual/`, so a plain `npm test` / `npm run test:ui` does not
-run it; `npm run test:ui-gates` does.
+compare uses the browser's canvas). Neither the gates nor the visual suite run in a plain `npm test` / `npm run test:ui`: those
+scripts glob `tests/playwright/!(ui-gates-)*.test.mjs` (the glob is quoted, so Node expands it, not the shell), because the gates
+start real Python servers, launch Chromium and push 10,000-node graphs with 600 s timeouts. Only `npm run test:ui-gates` (and
+`bash scripts/ci/ui-gates.sh`, which calls it) runs `tests/playwright/ui-gates-*.test.mjs` and `tests/visual/`.
 
 ## What is gated, by surface
 

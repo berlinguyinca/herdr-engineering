@@ -15,6 +15,7 @@
     --text: #e6e8ee; --text-secondary: #aab0bf; --text-muted: #8a91a3;
     --accent: #19c39b; --accent-hover: #14a883; --accent-weak: #16322c; --text-on-accent: #07140f;
     --violet-weak: #2a2447; --status-ok: #34d399; --status-failed: #f87171; --status-attention: #fbbf24;
+    --status-blocked: #fb923c;   /* the light #c2410c is ~3.2:1 here; this is >= 6.2:1 on every dark surface */
     --shadow: 0 1px 2px rgba(0, 0, 0, .4);
   }
   .cx-page .hd-error { background: #3a1d1d; }

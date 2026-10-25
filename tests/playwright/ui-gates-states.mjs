@@ -6,7 +6,7 @@
 // what the audit counted when they were set, so a state that renders half of itself, or a scope that slips, fails instead of passing on less.
 //
 // Used by ui-gates-states.test.mjs (accessibility) and ui-gates-xss.test.mjs (inert hostile text).
-import { openSub } from './ui-gates-lib.mjs';
+import { openSub, settled } from './ui-gates-lib.mjs';
 
 /** Type "@" until the list opens: the room's agents arrive after the chat does, and a list asked for too early is simply empty. */
 export async function openMention(page) {
@@ -34,7 +34,7 @@ const nodeSelected = async (page, node = 'attempt:a1') => {
   await page.keyboard.press('Enter');
   await page.locator('.wb-comment').first().waitFor();
   await page.locator('form[data-ctx-form="link"]').waitFor();
-  await page.waitForTimeout(250);
+  await settled(page);
 };
 
 /** @type {{id:string, scope:string, must:string[], min:number, open:(page:any)=>Promise<void>}[]} */
@@ -54,7 +54,7 @@ export const STATES = [
       await page.locator('form[data-wb-form="edit"] button[type="submit"]').click();
       await page.locator('[data-wb-act="history"]').first().waitFor();
       await page.locator('[data-wb-act="history"]').first().click();
-      await page.waitForTimeout(250);
+      await settled(page);
     } },
   { id: 'lineage: a retracted comment with its history', scope: '#hcn-p-lineage', must: ['[data-wb-act="history"]'], min: 60, minText: 180,
     open: async (page) => {
@@ -65,7 +65,7 @@ export const STATES = [
       await page.locator('[data-wb-act="retract"]').first().waitFor();
       await page.locator('[data-wb-act="retract"]').first().click();
       await page.locator('[data-wb-act="history"]').first().waitFor();
-      await page.waitForTimeout(250);
+      await settled(page);
     } },
   { id: 'lineage: fork form (a base commit to fork from)', scope: '#hcn-p-lineage', must: ['select[data-wb-field="base_sha"]'], min: 62, minText: 182,
     open: async (page) => {
@@ -76,7 +76,7 @@ export const STATES = [
   { id: 'lineage: steering confirm step (the request restated before it is sent)', scope: '#hcn-p-lineage', must: ['.wb-confirm', '[data-wb-act="confirm-go"]'], min: 61, minText: 182,
     open: async (page) => { await nodeSelected(page); await page.locator('[data-wb-act="confirm"]').first().click(); await page.locator('.wb-confirm').waitFor(); } },
   { id: 'lineage: Gantt view', scope: '#hcn-p-lineage', must: ['svg.lin-svg[role="img"]', '[data-view="gantt"][aria-selected="true"]'], min: 25, minText: 171,
-    open: async (page) => { await openSub(page, 'lineage'); await page.locator('svg.lin-svg g[data-node]').first().waitFor(); await page.locator('[data-view="gantt"]').click(); await page.locator('svg.lin-svg[role="img"]').waitFor(); await page.waitForTimeout(250); } },
+    open: async (page) => { await openSub(page, 'lineage'); await page.locator('svg.lin-svg g[data-node]').first().waitFor(); await page.locator('[data-view="gantt"]').click(); await page.locator('svg.lin-svg[role="img"]').waitFor(); await settled(page); } },
   { id: 'lineage: replay controls after stepping back', scope: '#hcn-p-lineage', must: ['[data-replay="slider"]', '[data-replay="live"]'], min: 30, minText: 68,
     open: async (page) => { await openSub(page, 'lineage'); await page.locator('svg.lin-svg g[data-node]').first().waitFor(); await page.locator('[data-replay="prev"]').click(); await page.waitForFunction(() => !/^Live/.test(document.querySelector('.lin-replay__status')?.textContent || 'Live')); } },
   { id: 'lineage: table alternative (a node selected, the live view)', scope: '#hcn-p-lineage',
@@ -103,7 +103,7 @@ export const STATES = [
     } },
   { id: 'links: linked workspaces', scope: '#hcn-p-links', must: ['#hcn-links li'], min: 1, minText: 7, open: async (page) => { await openSub(page, 'links'); await page.locator('#hcn-links li').first().waitFor(); } },
   { id: 'chat: expanded message editor (a modal dialog)', scope: '#hcn-p-chat', must: ['form.conversation-composer--expanded[role="dialog"][aria-modal="true"]'], min: 14, minText: 24,
-    open: async (page) => { await openSub(page, 'chat'); await chatReady(page); await page.locator('[data-expand]').click(); await page.locator('form.conversation-composer--expanded').waitFor(); await page.waitForTimeout(200); } },
+    open: async (page) => { await openSub(page, 'chat'); await chatReady(page); await page.locator('[data-expand]').click(); await page.locator('form.conversation-composer--expanded').waitFor(); await settled(page); } },
   { id: 'chat: the @-mention list open (a listbox of agents)', scope: '#hcn-p-chat', must: ['ul[role="listbox"]:not([hidden]) [role="option"]', 'textarea[role="combobox"][aria-expanded="true"]'], min: 15, minText: 25,
     open: async (page) => { await openSub(page, 'chat'); await openMention(page); } },
   { id: 'chat: composer with a menu of agents', scope: '#hcn-p-chat', must: ['#hcn-log[role="log"]'], min: 14, minText: 24, open: async (page) => { await openSub(page, 'chat'); await page.locator('#hcn-log').waitFor(); await logLoaded(page); await chatReady(page); } },
@@ -124,11 +124,11 @@ export const STATES = [
     open: async (page) => { await openSub(page, 'attention'); await page.locator('[aria-label="Items that need attention"]').first().waitFor(); } },
   { id: 'agents: the room agents', scope: '#hcn-p-agents', must: ['#hcn-p-agents [data-rename]', '#hcn-grant form[data-agent]', '#hcn-roomagents li'], min: 8, minText: 24,
     // "Your agents" is fetched after the room's agents: wait for it, or the number of controls depends on which answer came first
-    open: async (page) => { await openSub(page, 'agents'); await page.locator('#hcn-p-agents [data-rename]').first().waitFor(); await page.locator('#hcn-grant form[data-agent]').first().waitFor(); await page.locator('#hcn-roomagents li').first().waitFor(); await page.waitForTimeout(250); } },
+    open: async (page) => { await openSub(page, 'agents'); await page.locator('#hcn-p-agents [data-rename]').first().waitFor(); await page.locator('#hcn-grant form[data-agent]').first().waitFor(); await page.locator('#hcn-roomagents li').first().waitFor(); await settled(page); } },
   { id: 'flow: the diagram and its table', scope: '#hcn-p-flow', must: ['svg.cx-flow [data-node]'], min: 3, minText: 8,
     open: async (page) => { await openSub(page, 'flow'); await page.locator('svg.cx-flow [data-node]').first().waitFor(); } },
   { id: 'tasks: the task list', scope: '#hcn-p-tasks', must: ['#hcn-p-tasks li button'], min: 3, minText: 7,
-    open: async (page) => { await openSub(page, 'tasks'); await page.locator('#hcn-p-tasks li button').first().waitFor(); await page.waitForTimeout(250); } },
+    open: async (page) => { await openSub(page, 'tasks'); await page.locator('#hcn-p-tasks li button').first().waitFor(); await settled(page); } },
 ];
 
 /** Run as the VIEWER (carol): the same panels with fewer controls. A viewer has no composer and cannot steer, and that must be audited too. */
@@ -139,6 +139,6 @@ export const VIEWER_STATES = [
       await openSub(page, 'lineage');
       await page.locator('svg.lin-svg g[data-node]').first().waitFor();
       await page.locator('g[data-node="attempt:a1"]').focus(); await page.keyboard.press('Enter');
-      await page.locator('.wb').waitFor(); await page.waitForTimeout(250);
+      await page.locator('.wb').waitFor(); await settled(page);
     } },
 ];

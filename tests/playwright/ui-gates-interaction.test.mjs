@@ -49,6 +49,35 @@ test('a node of the flow diagram answers Enter and answers Space', async () => {
   }
 });
 
+test('a flow redraw keeps keyboard focus on the remembered node instead of dropping it to <body> (WCAG 2.4.3)', async () => {
+  const { ctx, page } = await session();
+  await openSub(page, 'flow');
+  await page.locator('svg.cx-flow [data-node]').first().waitFor();
+  const nodes = page.locator('svg.cx-flow [data-node]');
+  assert.ok(await nodes.count() >= 2, 'the flow has people and agents');
+  await nodes.first().focus();
+  await page.keyboard.press('ArrowRight');           // the roving stop moves off the first item
+  const stop = await page.evaluate(() => document.activeElement.dataset.node || document.activeElement.dataset.edge);
+  assert.ok(stop, 'focus is on an item of the diagram');
+  // New flow data arrives: redraw through the page's own collab-flow.js module (the same instance the page uses), with every
+  // current node and one new task line, exactly as drawFlow does when a poll changes the flow.
+  const after = await page.evaluate(async () => {
+    const url = performance.getEntriesByType('resource').map((e) => e.name).find((n) => /\/collab-flow\.js(\?|$)/.test(n));
+    const { renderFlow } = await import(url);
+    const box = document.getElementById('hcn-flow');
+    const ids = [...box.querySelectorAll('[data-node]')].map((el) => el.dataset.node);
+    const flow = { nodes: ids.map((id) => ({ id, kind: 'agent', name: id })), edges: [{ from: ids[0], to: ids[1], counts: { pending: 1 }, last: 'now' }], tasks: [] };
+    renderFlow(box, flow, {});
+    const a = document.activeElement;
+    return { inBox: box.contains(a), tag: a.tagName, id: a.dataset?.node || a.dataset?.edge || null, tabindex: a.getAttribute?.('tabindex') };
+  });
+  assert.equal(after.inBox, true, `focus fell out of the diagram to <${after.tag}>`);
+  assert.equal(after.tabindex, '0', 'the focused element is the one Tab stop');
+  // the remembered node exists in the new data, so focus returns to it (an edge key changes with the data, then the first item is right)
+  if (await page.locator(`svg.cx-flow [data-node="${stop}"]`).count()) assert.equal(after.id, stop, 'focus returns to the remembered node');
+  await ctx.close();
+});
+
 test('the disclosure for acknowledged attention items says what it is: aria-expanded false, then true, then false', async () => {
   const { ctx, page } = await session();
   await openSub(page, 'attention');

@@ -5,8 +5,8 @@
   "description": "HerdR Dev Fabric control plane and engineering workspace",
   "type": "module",
   "scripts": {
-    "test": "node --test --test-concurrency=1 packages/herdr-web-client/*.test.js packages/herdr-web-components/*.test.js tests/playwright/*.test.mjs",
-    "test:ui": "node --test --test-concurrency=1 tests/playwright/*.test.mjs",
+    "test": "node --test --test-concurrency=1 packages/herdr-web-client/*.test.js packages/herdr-web-components/*.test.js 'tests/playwright/!(ui-gates-)*.test.mjs'",
+    "test:ui": "node --test --test-concurrency=1 'tests/playwright/!(ui-gates-)*.test.mjs'",
     "test:client": "node --test packages/herdr-web-client/*.test.js packages/herdr-web-components/*.test.js",
     "test:ui-gates": "node --test --test-concurrency=1 tests/playwright/ui-gates-*.test.mjs tests/visual/*.test.mjs",
     "ui-gates:baselines:update": "node tests/playwright/visual-baselines.mjs update",

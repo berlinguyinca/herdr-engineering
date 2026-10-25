@@ -8,7 +8,7 @@ import test, { before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync, existsSync } from 'node:fs';
 import path from 'node:path';
-import { CFG, REPO, launch, openReal, openSub, startRealServer } from './ui-gates-lib.mjs';
+import { CFG, REPO, launch, openReal, openSub, settled, startRealServer } from './ui-gates-lib.mjs';
 import { staticAudit, focusIndicatorAudit, tabTrapAudit, overflowAudit, overflowFailure, motionAudit, liveAnnouncementAudit, summarize } from './a11y-checks.mjs';
 import { STATES } from './ui-gates-states.mjs';
 
@@ -33,7 +33,7 @@ const render = async (page, sub, user = 'alice') => {
   const re = user === 'alice' || ['chat', 'lineage', 'tabs', 'links'].includes(sub) ? PROOF[sub].source : '\\S{3}';
   await page.waitForFunction(([id, re]) => new RegExp(re, 'i').test(document.querySelector(`#hcn-p-${id}`)?.innerText || ''), [sub, re], { timeout: 10000 });
   if (sub === 'lineage') await page.locator('svg.lin-svg g[data-node]').first().waitFor();
-  await page.waitForTimeout(150);
+  await settled(page);
 };
 const noProblems = async (w, label) => {
   await w.collectCsp();
@@ -206,7 +206,7 @@ test('hostile text (HTML, event handlers, script) renders inert in the real page
     if (sub === 'proposals') {
       await page.locator('[data-proposal]').first().focus();
       await page.keyboard.press('Enter');
-      await page.waitForTimeout(500);
+      await settled(page, { quietMs: 300 });
     }
   }
   assert.equal(await page.evaluate(() => window.__xss), undefined, 'no payload executed');
@@ -368,7 +368,7 @@ test('reflow at 320px with 300-character unbroken labels, comments and instructi
     const bad = [];
     for (const sub of SUBS) {
       await openSub(page, sub);
-      await page.waitForTimeout(250);
+      await settled(page);
       const o = await overflowAudit(page);
       if (overflowFailure(o)) bad.push(`[${sub}] ${overflowFailure(o)}`);
     }
@@ -377,7 +377,7 @@ test('reflow at 320px with 300-character unbroken labels, comments and instructi
     await page.locator('svg.lin-svg g[data-node]').first().waitFor();
     for (const node of ['task:long', 'attempt:a1']) {
       await page.locator(`g[data-node="${node}"]`).focus(); await page.keyboard.press('Enter');
-      await page.locator('.wb').waitFor(); await page.waitForTimeout(400);
+      await page.locator('.wb').waitFor(); await settled(page);
       const o = await overflowAudit(page);
       if (overflowFailure(o)) bad.push(`[inspector ${node}] ${overflowFailure(o)}`);
       assert.ok((await page.locator('.wb').innerText()).includes('xxxxxxxxxx'), `the long text of ${node} is on screen (the fixture is doing its job)`);

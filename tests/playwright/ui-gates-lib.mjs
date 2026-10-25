@@ -86,3 +86,21 @@ export async function openSub(page, sub) {
 }
 
 export const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/** Wait until the page stops changing: no DOM mutation for `quietMs` and two animation frames painted, or `timeoutMs` passed.
+ *  A condition wait that replaces fixed sleeps after a click or a fetch: it returns as soon as the page is quiet on a fast host and
+ *  keeps waiting on a loaded one, instead of guessing one duration for both. */
+export async function settled(page, { quietMs = 120, timeoutMs = 5000 } = {}) {
+  await page.evaluate(([quiet, limit]) => new Promise((resolve) => {
+    const t0 = performance.now();
+    let last = t0;
+    const mo = new MutationObserver(() => { last = performance.now(); });
+    mo.observe(document, { subtree: true, childList: true, attributes: true, characterData: true });
+    const tick = () => {
+      const now = performance.now();
+      if (now - last >= quiet || now - t0 >= limit) { mo.disconnect(); requestAnimationFrame(() => requestAnimationFrame(() => resolve())); return; }
+      setTimeout(tick, Math.min(50, quiet));
+    };
+    tick();
+  }), [quietMs, timeoutMs]);
+}

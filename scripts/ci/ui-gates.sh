@@ -14,9 +14,12 @@ need node; need python3; need git
 node -e 'if (Number(process.versions.node.split(".")[0]) < 22) { console.error("Node 22 or newer is required, found " + process.version); process.exit(1); }'
 test -d /etc/fonts/conf.d || { echo "no /etc/fonts/conf.d: the screenshots depend on its rendering settings" >&2; exit 1; }
 
-python3 -m venv "${TMPDIR:-/tmp}/herdr-ui-gates-venv"
-"${TMPDIR:-/tmp}/herdr-ui-gates-venv/bin/pip" install -q -e '.[dev]'
-export PATH="${TMPDIR:-/tmp}/herdr-ui-gates-venv/bin:$PATH"     # the fixture server starts with `python3`
+# a private venv per run: two jobs on one agent must not share (and race on) one fixed path
+venv="$(mktemp -d "${TMPDIR:-/tmp}/herdr-ui-gates-venv.XXXXXX")"
+trap 'rm -rf "$venv"' EXIT
+python3 -m venv "$venv"
+"$venv/bin/pip" install -q -e '.[dev]'
+export PATH="$venv/bin:$PATH"     # the fixture server starts with `python3`
 npm ci --no-audit --no-fund
 npx playwright install chromium         # the build the baselines were made with (Playwright 1.64); a no-op when cached
 npm run test:ui-gates

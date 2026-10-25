@@ -5,7 +5,7 @@
 // Run: node --test --test-concurrency=1 tests/playwright/ui-gates-keyboard.test.mjs
 import test, { before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { launch, openReal, openSub, startRealServer } from './ui-gates-lib.mjs';
+import { launch, openReal, openSub, settled, startRealServer } from './ui-gates-lib.mjs';
 
 let srv; let browser; let info;
 before(async () => { srv = await startRealServer({}); info = srv.info; browser = await launch(); });
@@ -174,7 +174,7 @@ test('an owner reads a quarantined proposal and accepts it: focus returns to its
     page.once('dialog', (d) => d.accept());
     await page.keyboard.press('Enter');
     await page.waitForFunction(() => !document.querySelector('#hcn-review [data-decide="accept"]'), null, { timeout: 8000 }).catch(() => {});
-    await page.waitForTimeout(500);
+    await settled(page, { quietMs: 300 });
     await focusIs(page, `[data-proposal="${pid}"], #hcn-review [data-decide]`, 'after accepting a proposal');
     await pointerFree(page);
     await ctx.close();

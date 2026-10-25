@@ -98,6 +98,14 @@ export function mergePages(pages) {
   }
   return { nodes: [...nodes.values()], edges: [...edges.values()] };
 }
+// Why the merged graph is incomplete, across every page loaded so far. One page leaving out links (an edge or byte budget) keeps
+// the merged view incomplete even when a later page is whole, so the reasons are OR-ed: a scan budget (more nodes may exist) wins,
+// otherwise the most recent reason any page gave; null only when no page was truncated.
+export function pagesTruncated(pages) {
+  const reasons = (pages || []).map((p) => (p && p.truncated_reason) || null).filter(Boolean);
+  if (!reasons.length) return null;
+  return reasons.includes('scan_budget') ? 'scan_budget' : reasons[reasons.length - 1];
+}
 export const edgeKey = (e) => `${e.edge_type}\u0000${e.from_id}\u0000${e.to_id}\u0000${bindingText(e.binding)}`;
 export const bindingText = (b) => (b && typeof b === 'object' ? Object.entries(b).map(([k, v]) => `${k}=${v}`).join(',') : '');
 

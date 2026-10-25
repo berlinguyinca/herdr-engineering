@@ -107,6 +107,10 @@ export function renderFlow(box, flow, { onNode, onEdge, prev = new Map() } = {})
       <text x="24" y="27" class="cx-flow-sub">${esc(clip(sub, 26))}</text>
       <title>${esc(n.fabric?.display_name || n.name)}</title></g>`;
   }).join('');
+  // A redraw replaces every element; if the keyboard was inside the diagram, focus would fall to <body> (WCAG 2.4.3). Note it now and
+  // put it back on the remembered tab stop below.
+  const doc = box.ownerDocument;
+  const hadFocus = !!(doc && doc.activeElement && doc.activeElement !== box && box.contains(doc.activeElement));
   box.innerHTML = `<div class="cx-flow-scroll"><svg class="cx-flow" viewBox="0 0 ${lay.width} ${lay.height}" width="${lay.width}" height="${lay.height}" role="group" aria-label="Flow of tasks between people and agents">${lay.idleLabel ? `<text x="${lay.idleLabel.x}" y="${lay.idleLabel.y}" class="cx-flow-sub">${esc(lay.idleLabel.text)}</text>` : ''}${edgeSvg}${nodeSvg}</svg></div>`;
   box.querySelectorAll('[data-node]').forEach((el) => {
     const act = () => onNode && onNode(lay.nodes.find((n) => n.id === el.dataset.node));
@@ -135,5 +139,6 @@ export function renderFlow(box, flow, { onNode, onEdge, prev = new Map() } = {})
     };
     el.addEventListener('focus', () => { box.dataset.roving = idOf(el); items.forEach((o) => o.setAttribute('tabindex', o === el ? '0' : '-1')); });
   });
+  if (hadFocus && stop) stop.focus({ preventScroll: true });
   return next;
 }

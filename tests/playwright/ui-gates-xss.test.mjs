@@ -13,7 +13,7 @@
 // Run: node --test --test-concurrency=1 tests/playwright/ui-gates-xss.test.mjs
 import test, { before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { launch, openReal, openSub, startRealServer } from './ui-gates-lib.mjs';
+import { launch, openReal, openSub, settled, startRealServer } from './ui-gates-lib.mjs';
 import { STATES } from './ui-gates-states.mjs';
 import { URLS, UNREAD, tag, taint } from './ui-gates-taint.mjs';
 
@@ -59,7 +59,7 @@ test('every surface shows hostile text as text and creates nothing from it', asy
   const bad = [];
   for (const sub of SUBS) {
     await openSub(page, sub);
-    await page.waitForTimeout(700);
+    await settled(page, { quietMs: 300 });
     const d = await damage(page);
     note(sub, await shownKeys(page));
     if (d.executed !== undefined || d.elements.length || d.inlineScripts) bad.push(`[${sub}] executed=${d.executed} elements=${d.elements.join(',')} inlineScripts=${d.inlineScripts}`);
@@ -74,7 +74,7 @@ for (const st of STATES) {
   test(`hostile text is inert in the state: ${st.id}`, async () => {
     const { ctx, page } = await hostile(browser);
     await st.open(page);
-    await page.waitForTimeout(700);
+    await settled(page, { quietMs: 300 });
     for (const sel of st.must) assert.ok(await page.locator(sel).count() > 0, `did not reach the state: "${sel}" is missing`);
     const d = await damage(page);
     note(st.id, await shownKeys(page));
@@ -115,7 +115,7 @@ for (const [, what, sel, canary, open] of PLACEMENTS) {
   test(`a canary is visible, as text, in ${what}`, async () => {
     const { ctx, page } = await hostile(browser);
     await open(page);
-    await page.waitForTimeout(500);
+    await page.waitForFunction(([s, c]) => (document.querySelector(s)?.innerText || '').includes(c), [sel, canary], { timeout: 5000 }).catch(() => {});
     const shown = await page.locator(sel).first().innerText();
     assert.ok(shown.includes(canary), `${canary} is not on screen inside ${sel}: ${shown.slice(0, 120)}`);
     note(`placement: ${what}`, await shownKeys(page));

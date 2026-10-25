@@ -46,3 +46,24 @@ test('design.tokens.spacing-on-scale: off-grid margin/padding/gap values never g
   }
   assert.ok(n <= CFG.tokens.max_off_grid_spacing, `off-grid spacing values: ${n} (ratchet ${CFG.tokens.max_off_grid_spacing})`);
 });
+
+test('design.tokens.status-contrast: the page\'s status text colours reach 4.5:1 on its surfaces in light and dark (WCAG 1.4.3)', () => {
+  const src = css('packages/collab.css');
+  const lum = (h) => {
+    const c = [1, 3, 5].map((i) => parseInt(h.slice(i, i + 2), 16) / 255).map((x) => (x <= 0.03928 ? x / 12.92 : ((x + 0.055) / 1.055) ** 2.4));
+    return 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+  };
+  const ratio = (a, b) => { const [lo, hi] = [lum(a), lum(b)].sort((x, y) => x - y); return (hi + 0.05) / (lo + 0.05); };
+  const tokens = (block) => Object.fromEntries([...block.matchAll(/(--[a-z0-9-]+)\s*:\s*(#[0-9a-f]{6})\b/gi)].map((m) => [m[1], m[2].toLowerCase()]));
+  const light = tokens(src.match(/\.cx-page, \.cx-embed \{([^}]*)\}/)[1]);
+  const darkBlock = src.match(/@media \(prefers-color-scheme: dark\) \{\s*\.cx-page \{([^}]*)\}/);
+  assert.ok(darkBlock, 'collab.css has a dark .cx-page token block');
+  const dark = { ...light, ...tokens(darkBlock[1]) };
+  const bad = [];
+  for (const [name, t, surfaces] of [['light', light, ['#ffffff']], ['dark', dark, [dark['--background'], dark['--surface']]]]) {
+    for (const tok of ['--status-blocked', '--status-attention']) {
+      for (const bg of surfaces) if (t[tok] && ratio(t[tok], bg) < 4.5) bad.push(`${name}: ${tok} ${t[tok]} on ${bg} is ${ratio(t[tok], bg).toFixed(2)}:1`);
+    }
+  }
+  assert.deepEqual(bad, []);
+});

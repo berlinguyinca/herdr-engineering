@@ -15,7 +15,7 @@ import { readFileSync, readdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { UNREAD } from './ui-gates-taint.mjs';
-import { launch } from './ui-gates-lib.mjs';
+import { launch, settled } from './ui-gates-lib.mjs';
 import { payload } from './ui-gates-taint.mjs';
 import { renderInbox, renderProgress, renderAnalytics, renderEstimate } from '../../packages/collab-attention.js';
 import { renderForks } from '../../packages/collab-workbench.js';
@@ -91,7 +91,7 @@ async function check(html) {
   const ctx = await browser.newContext();
   const page = await ctx.newPage();
   await page.setContent(`<!doctype html><html><body>${html}</body></html>`);
-  await page.waitForTimeout(100);
+  await settled(page, { quietMs: 80 });
   const out = await page.evaluate(() => ({
     executed: window.__xss,
     elements: [...document.querySelectorAll('img[src="x"], [data-cx-attr], [id^="cx-canary"], [onerror], [onload], [onmouseover], [onclick], [onfocus], a[href^="javascript:" i], iframe, object, embed, script')].map((e) => e.tagName.toLowerCase()),

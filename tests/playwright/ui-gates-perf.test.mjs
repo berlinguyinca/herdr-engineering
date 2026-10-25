@@ -10,7 +10,7 @@ import assert from 'node:assert/strict';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { CFG, REPO, launch, openReal, startRealServer } from './ui-gates-lib.mjs';
+import { CFG, REPO, launch, openReal, settled, startRealServer } from './ui-gates-lib.mjs';
 
 const SIZES = [2000, 5000, 10000];
 const report = { machine: { cpu: os.cpus()[0].model, threads: os.cpus().length, memGB: Math.round(os.totalmem() / 2 ** 30), platform: `${os.type()} ${os.release()}` }, runs: [] };
@@ -89,7 +89,7 @@ for (const n of SIZES) {
       await page.evaluate(() => { window.__lat.length = 0; });
       await page.locator('[data-filter="q"]').focus();
       await page.keyboard.type('bulk12', { delay: 40 });
-      await page.waitForTimeout(400);
+      await settled(page, { quietMs: 200, timeoutMs: 10000 });
       const lat = await page.evaluate(() => window.__lat.slice());
       const lt = (await page.evaluate(() => window.__lt)).slice(ltBefore);
       const heapMB = await page.evaluate(() => Math.round((performance.memory?.usedJSHeapSize || 0) / 2 ** 20));
@@ -110,7 +110,9 @@ for (const n of SIZES) {
       assert.ok(firstRender <= B(CFG.perf.render_ms), `first render ${firstRender}ms <= ${B(CFG.perf.render_ms)}ms (x${scale.toFixed(1)} slowdown)`);
       assert.ok(run.keyToFrameMs.p95 <= B(CFG.perf.interaction_ms), `filter key-to-frame p95 ${run.keyToFrameMs.p95}ms <= ${B(CFG.perf.interaction_ms)}ms`);
       assert.ok(run.loadMoreMs.p95 <= B(CFG.perf.load_more_p95_ms), `Load more p95 ${run.loadMoreMs.p95}ms <= ${B(CFG.perf.load_more_p95_ms)}ms`);
-      assert.ok(lt.length <= CFG.perf.max_long_tasks, `long tasks ${lt.length} <= ${CFG.perf.max_long_tasks}`);
+      // a slower host splits the same work into more >50 ms tasks, so the count scales with the slowdown like the time budgets
+      const maxLongTasks = Math.ceil(CFG.perf.max_long_tasks * scale);
+      assert.ok(lt.length <= maxLongTasks, `long tasks ${lt.length} <= ${maxLongTasks} (x${scale.toFixed(1)} slowdown)`);
       assert.ok(run.longTasks.maxMs <= B(CFG.perf.max_long_task_ms), `longest task ${run.longTasks.maxMs}ms <= ${B(CFG.perf.max_long_task_ms)}ms`);
       await w.collectCsp();
       assert.deepEqual([w.errors, w.csp, w.failed], [[], [], []], 'no console errors, CSP violations or failed requests at scale');

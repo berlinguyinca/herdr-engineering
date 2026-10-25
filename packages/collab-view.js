@@ -8,7 +8,7 @@ import { renderLinks } from './collab-links.js';
 import { buildTabsPanes, nextTab, renderTabsPanes } from './collab-tabs.js';
 import { decisionBody, delegationBody, renderDelegations, renderProposalList, renderReview } from './collab-proposals.js';
 import {
-  MAX_RENDER_NODES, filterGraph, focusKey, focusSelector, focusSuccessor, layoutGraph, mergePages, nextNode, renderLineage, replayTarget,
+  MAX_RENDER_NODES, filterGraph, focusKey, focusSelector, focusSuccessor, layoutGraph, mergePages, nextNode, pagesTruncated, renderLineage, replayTarget,
 } from './collab-lineage.js';
 import { answerBody, askBody, contextBody, declineBody, linkBody, renderContextChip, renderContextPanel, renderInbox } from './collab-context.js';
 import { ackBody, renderAnalytics, renderInbox as renderAttention, renderProgress, restoreBody, snoozeBody } from './collab-attention.js';
@@ -1167,7 +1167,7 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
           if (my !== LIN.seq || !alive) return;
         }
         LIN.pages = more ? [...LIN.pages, g] : [g];
-        LIN.total = g.total_nodes; LIN.next = g.next_offset; LIN.truncated = g.truncated_reason; LIN.asOf = g.as_of;
+        LIN.total = g.total_nodes; LIN.next = g.next_offset; LIN.truncated = pagesTruncated(LIN.pages); LIN.asOf = g.as_of;
         if (t) LIN.timeline = t;
         LIN.error = null;
         LIN.fails = 0;
