@@ -1091,20 +1091,20 @@ def _make_handler(server, public=False, operator=False):
             return self._json(payload, status)
 
         def _federation(self):
-            """ADR-0008 P2. Main listener only, GET only; every refusal is the same 404 (see federation_export)."""
+            """ADR-0008 P2. Main listener only; every refusal is the same 404 (see federation_export). The response
+            shape does not depend on whether federation is on: the same rate limiter is consumed, the connection is
+            always closed afterwards, and the body is the same bytes."""
             from .federation_export import NOT_FOUND, FederationGateway
             gw = server._fed_gateway
             if gw is None or gw.service is not server.collab:
                 gw = server._fed_gateway = FederationGateway(server.collab, server.federation_source)
-            cl = self.headers.get_all("Content-Length") or []
-            if (not gw.is_on() or len(cl) > 1 or "Transfer-Encoding" in self.headers
-                    or (cl and cl[0].strip() not in ("", "0"))
-                    or (server.collab_require_https
-                        and self.headers.get("X-Forwarded-Proto", "").lower() != "https")):
-                self.close_connection = True          # a body we will not read must not be parsed as the next request
-                return self._fed_send(*NOT_FOUND)
             if self._rate_limit(self._proxied_client()):
                 return None
+            cl = self.headers.get_all("Content-Length") or []
+            if (len(cl) > 1 or "Transfer-Encoding" in self.headers or (cl and cl[0].strip() not in ("", "0"))
+                    or (server.collab_require_https
+                        and self.headers.get("X-Forwarded-Proto", "").lower() != "https")):
+                return self._fed_send(*NOT_FOUND)
             return self._fed_send(*gw.handle(self.command, self.path, self.headers, b""))
 
         def _fed_send(self, status, payload, extra):
@@ -1112,10 +1112,9 @@ def _make_handler(server, public=False, operator=False):
             self.send_header("Content-Type", "application/json")
             self.send_header("Cache-Control", "no-store")
             self.send_header("Content-Length", str(len(payload)))
+            self.send_header("Connection", "close")      # always: an unread body must not become the next request
             for k, v in extra.items():
                 self.send_header(k, v)
-            if self.close_connection:
-                self.send_header("Connection", "close")
             self.end_headers()
             self.wfile.write(payload)
 

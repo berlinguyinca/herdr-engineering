@@ -149,7 +149,8 @@ class IngestService:
             # a peer is checked like a non-operator key, whatever scope it asked for (the clamp made it `room`):
             # its one room comes from the hot YAML policy, never from key_scopes, and "*" is never honoured
             policy = self._peer_policy(actor)
-            if policy is None or scope != "room" or env.get("room_id") != policy.mirror_room:
+            if (policy is None or policy.mirror_room is None or scope != "room"
+                    or env.get("room_id") != policy.mirror_room):
                 raise PermissionError("not permitted to modify this lineage object")
             return
         if scope not in ("room", "mission") or (

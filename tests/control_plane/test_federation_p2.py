@@ -237,11 +237,13 @@ def test_fingerprint_match_is_the_full_key_not_a_twelve_character_prefix():
     p = fed.parse_federation({"enabled": True, "peers": {"lab": peercfg()}}).peer("lab")
     full = p.key_fingerprint
     assert p.matches(full)
-    for fake in (full[:12], full[:63], full + "0", full[:12] + "0" * 52, full.upper(), "", None, 5, b"x"):
+    for fake in (full[:12], full[:63], full + "0", full[:12] + "0" * 52, full.upper(), "", None, 5, b"x", "\u00e9" * 64):
         assert not p.matches(fake), fake
     assert full[:12] + "0" * 52 != full                                  # (the collision case really differs)
     legacy = fed.parse_federation({"enabled": True, "peers": {"lab": {"enabled": True, "key_fingerprint": full[:12]}}})
     assert not legacy.peer("lab").matches(full[:12]) and not legacy.peer("lab").matches(full)   # no key: never matches
+    keyless64 = fed.parse_federation({"enabled": True, "peers": {"lab": {"enabled": True, "key_fingerprint": full}}})
+    assert not keyless64.peer("lab").matches(full)                       # even holding a full fingerprint: no pinned key
 
 
 def test_the_peer_principal_carries_the_full_fingerprint():
@@ -253,6 +255,20 @@ def test_the_peer_principal_carries_the_full_fingerprint():
             fed.peer_principal("lab", bad)
     assert fed.peer_fingerprint({**pr, "fingerprint": full[:12]}) is None
     assert fed.peer_fingerprint({k_: v for k_, v in pr.items() if k_ != "fingerprint"}) is None
+
+
+def test_the_lineage_scope_check_itself_refuses_a_peer_without_a_mirror_room():
+    from tests.control_plane.test_federation_p1 import ROOM, World
+    full = fed.key_fingerprint_of(PEER_PUB)
+    peer = fed.peer_principal("acme", full)
+    w = World({"enabled": True, "peers": {"acme": {"enabled": True, "public_key": PEER_PUB}}})
+    env = {"actor": peer, "visibility_scope": "room", "room_id": None}
+    with pytest.raises(PermissionError):
+        w.svc._check_lineage_scope(env)
+    w.section = {"enabled": True, "peers": {"acme": {"enabled": True, "public_key": PEER_PUB, "mirror_room": ROOM}}}
+    w.svc._check_lineage_scope({**env, "room_id": ROOM})                              # control
+    with pytest.raises(PermissionError):
+        w.svc._check_lineage_scope({**env, "room_id": None})
 
 
 def test_ingest_binds_a_peer_to_its_full_pinned_fingerprint():
@@ -776,6 +792,55 @@ def test_a_kill_switch_alone_does_not_revoke_but_closes_the_export(fx):
     assert fx.events(sid)[0] == 200
 
 
+def test_a_refused_peer_record_does_not_stop_the_revocations(fx):
+    """A creation can be refused on a nearly full log; the pre-paid revocations after it must still be written."""
+    w = fx.w
+    fx.s.maintain()
+    sid = fx.share()
+    fx.section["peers"]["new"] = {"enabled": True, "public_key": OTHER_PUB, "export_rooms": []}      # needs a new record
+    fx.peer(export_rooms=[])                                                                         # un-lists the room
+    ordinary = fx.s._log_limit("federation_peer_enabled", {})
+    fx.s._log.extend([{"sequence": -1}] * (ordinary - len(fx.s._log)))                               # exactly full for it
+    assert fx.s._log_limit("federation_share_revoked", {}) > len(fx.s._log)
+    fx.clock.t += 10
+    fx.s.maintain()
+    assert fx.s._fed_shares[sid]["state"] == "revoked" and fx.s._fed_shares[sid]["revoked_reason"] == "unlisted"
+    assert fx.s._fed_peers.get("new") is None                                                        # refused, retried later
+    fx.peer(export_rooms=[w.room])                                                                   # a re-list revives nothing
+    assert refused_404(fx.get(f"/api/v1/federation/shares/{sid}/events"))
+
+
+def test_one_failed_write_does_not_stop_the_other_revocations(fx):
+    w = fx.w
+    fx.section["peers"]["p2"] = {"enabled": True, "public_key": OTHER_PUB, "export_rooms": [w.room]}
+    a, b = fx.share(), fx.share(peer="p2")
+    fx.section["peers"].clear()                                                       # both peers removed
+    real = fx.s._sink.record
+    calls = []
+
+    def flaky(ev):
+        calls.append(ev["event_type"])
+        if len(calls) == 1:
+            raise OSError("disk hiccup")
+        return real(ev)
+    fx.s._sink.record = fx.s._sink.record_required = flaky
+    fx.clock.t += 10
+    fx.s.maintain()
+    states = sorted(s["state"] for s in fx.s._fed_shares.values())
+    assert states == ["active", "revoked"], states                                    # one failed, the other went through
+    fx.s._sink.record = fx.s._sink.record_required = real
+    fx.clock.t += 10
+    fx.s.maintain()
+    assert {fx.s._fed_shares[a]["state"], fx.s._fed_shares[b]["state"]} == {"revoked"}
+
+
+def test_an_unexpected_error_in_reconcile_never_escapes_maintain(fx, monkeypatch):
+    def boom():
+        raise RuntimeError("unexpected")
+    monkeypatch.setattr(fx.s, "_fed_reconcile_locked", boom)
+    fx.s.maintain()                                                                   # must not raise (nor must a graph read)
+
+
 def test_a_full_log_does_not_break_maintain(fx):
     fx.s.max_log_events = len(fx.s._log)
     fx.s.maintain()                                                                      # must not raise
@@ -1086,6 +1151,7 @@ def test_uniform_404_for_every_way_a_share_can_be_unavailable(fx):
     probe("events_not_last", target=f"/api/v1/federation/shares/{sid}/events/x")
     probe("other_prefix", target="/api/v1/health")
     probe("prefix_lookalike", target="/api/v1/federationx/shares")
+    probe("prefix_shifted", target="/api/v1/federationXshares")                          # same length as the prefix
     probe("double_slash", target="/api/v1/federation//shares")
     probe("shares_with_query", target=SHARES + "?x=1")
     for label, r in results.items():
@@ -1172,7 +1238,7 @@ def test_gateway_preconditions_all_answer_the_same_404(fx, tmp_path):
     assert refused_404(fx.get(url))
     fx.s.degraded = None
     fx.gw.service = None
-    assert refused_404(fx.get(url)) and not fx.gw.is_on()
+    assert refused_404(fx.get(url))
 
 
 def test_a_missing_signing_library_means_off(fx, monkeypatch):
@@ -1399,18 +1465,30 @@ def test_http_requires_https_when_the_collab_proxy_rule_is_on(served):
     fx.srv.collab_require_https = False
 
 
-def test_http_off_does_no_work_not_even_rate_limiting(served):
+def test_http_off_and_on_look_the_same_to_an_unauthenticated_caller(served):
+    """Status, body, headers and limiter use must not tell a prober whether federation is switched on."""
     fx = served
-    fx.section["enabled"] = False
+    sid = fx.share()
     calls = []
     real = fx.srv._limiter.allow
     fx.srv._limiter.allow = lambda who: calls.append(who) or real(who)
-    assert fx.http.signed(SHARES)[0] == 404 and calls == []
+    url = f"/api/v1/federation/shares/{sid}/events"
+
+    def shape(r):
+        status, body, headers = r
+        return status, body, {k: v for k, v in headers.items() if k not in ("Date", "Server")}
+    fx.section["enabled"] = False
+    off = [shape(fx.http.req("GET", url)), shape(fx.http.signed(url))]
+    n_off = len(calls)
     fx.section["enabled"] = True
-    assert fx.http.signed(SHARES)[0] == 200 and len(calls) == 1
+    on = [shape(fx.http.req("GET", url)), shape(fx.http.signed(url, seed=OTHER_SEED)),
+          shape(fx.http.signed("/api/v1/federation/shares/collab_nope/events"))]
+    assert n_off == 2 and len(calls) == 5                                    # the limiter was used in both states
+    assert off[0] == off[1] == on[0] == on[1] == on[2]
+    assert on[0][0] == 404 and on[0][2]["Connection"] == "close"
 
 
-def test_http_without_a_collab_service_does_no_work_either(w, tmp_path):
+def test_http_without_a_collab_service_is_a_404(w, tmp_path):
     fx = Fx(w, tmp_path)
     srv = ControlPlaneServer(ControlPlaneRepo(), host="127.0.0.1", port=0, collab=None, api_keys={"op": "operator"},
                              federation_source=lambda: fx.section)
@@ -1418,20 +1496,21 @@ def test_http_without_a_collab_service_does_no_work_either(w, tmp_path):
     t.start()
     srv.wait_until_ready()
     try:
-        calls = []
-        real = srv._limiter.allow
-        srv._limiter.allow = lambda who: calls.append(who) or real(who)
-        assert Http(srv.port).signed(SHARES)[0] == 404 and calls == []
+        assert Http(srv.port).signed(SHARES)[:2] == (404, NOT_FOUND[1])
     finally:
         srv.shutdown()
         t.join(timeout=5)
 
 
-def test_http_rate_limit_applies_before_any_work(served):
+def test_http_rate_limit_applies_whether_federation_is_on_or_off(served):
+    from herdr_engineering.control_plane.api import _RateLimiter
     fx = served
-    url = SHARES
-    seen = {fx.http.signed(url)[0] for _ in range(5)}
-    assert seen == {200}
+    for on in (True, False):
+        fx.section["enabled"] = on
+        fx.srv._limiter = _RateLimiter(max_requests=2)
+        codes = [fx.http.signed(SHARES)[0] for _ in range(4)]
+        assert codes[2:] == [429, 429], (on, codes)
+        assert codes[:2] == ([200, 200] if on else [404, 404])
 
 
 def test_standalone_collab_without_federation_has_no_new_behaviour(w):

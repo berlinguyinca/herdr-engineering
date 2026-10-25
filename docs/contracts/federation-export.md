@@ -65,12 +65,26 @@ bounded table; a full table refuses.
 * `GET /api/v1/federation/shares/<share_id>/events?cursor=<n>&limit=<n>` -> room chat messages after the share was granted.
   Only `cursor` and `limit` are accepted, once each, as plain digits; anything else is 400 (for an authenticated peer).
 
-Every refusal before authentication, and every refusal of an unshared or unavailable share, is the **same 404** with a
-byte-identical body: federation off or `server_id`/signing key missing or unreadable (group/world-readable file, a
+Every refusal before authentication, and every refusal of an unshared or unavailable share, is the **same 404** (same
+status, body and headers; the same rate limiter is consumed and the connection is closed whether federation is on or off): federation off or `server_id`/signing key missing or unreadable (group/world-readable file, a
 symlink, malformed) or the signing library missing, a degraded collab log, a non-GET verb, a bad/expired/replayed
 signature, an unknown or disabled peer, an unknown, revoked, unlisted or another peer's share. A peer over its
 request or byte quota gets 429 with `Retry-After`. The surface is also 404 on the operator and public listeners and
 when `collab_require_https` is on without the TLS-proxy header. A GET carrying a body is refused.
+
+## 3a. Residual observations (stated, not hidden)
+
+* Peer ids are agreed out of band and are not secrets; an unknown or disabled `X-Herdr-Peer` returns before the Ed25519
+  verification, so a very fine timing probe (about 100 microseconds) can tell a configured, enabled peer id from an unknown one.
+* The replay nonce table and the quotas are in memory. A restart clears them, so a captured request could be replayed once
+  inside `request_window_seconds` (needs a broken TLS channel); the signed timestamp window still bounds it.
+* A peer holding its key can fill its own nonce table (16384 entries, each kept about two windows) and be refused until
+  entries lapse. Only that peer is affected.
+* `origin_sequence` and `next_cursor` are positions in this server's single collab log, so a peer can infer the volume of
+  activity elsewhere on the server. The sequence is not otherwise sensitive; P3 may replace it with a per-share ordinal.
+* Removing the `federation` section, or a peer, from the YAML is a durable decision: the next `maintain()` pass revokes every
+  share of a removed or disabled peer (`peer_disabled`) and owners must grant them again. `enabled: false` is the reversible
+  switch: it closes the export and keeps the shares.
 
 ## 4. Export document and signature
 

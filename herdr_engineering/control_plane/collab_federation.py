@@ -191,12 +191,10 @@ class FederationMixin:
             if policy is None:
                 return
             want = {p.peer_id for p in policy.peers if p.enabled}
-            for peer_id in sorted(want - {k for k, v in self._fed_peers.items() if v}):
-                self._commit("federation_peer_enabled", self._fed_system(
-                    peer_id=peer_id, epoch=now, action="federation.peer_enabled", resource_id=peer_id))
-            for peer_id in sorted(k for k, v in self._fed_peers.items() if v and k not in want):
-                self._commit("federation_peer_disabled", self._fed_system(
-                    peer_id=peer_id, epoch=now, action="federation.peer_disabled", resource_id=peer_id))
+            # Each commit stands alone: a creation (peer enabled) can be refused on a nearly full log, and that refusal
+            # must not stop the pre-paid revocations (share revoked, peer disabled), or a share the YAML un-listed would
+            # stay active and revive on a re-list. Revocations are listed first so they are also tried first.
+            todo = []
             for r in [s for s in self._fed_shares.values() if s["state"] == "active"]:
                 peer = policy.peer(r["peer_id"])
                 room = self._rooms.get(r["room_id"])
@@ -206,9 +204,20 @@ class FederationMixin:
                        else "owner_lapsed" if not owner or owner["role"] != "owner" or not self._ok(r["granted_by"])
                        else None)
                 if why:
-                    self._commit("federation_share_revoked", self._fed_system(
+                    todo.append(("federation_share_revoked", self._fed_system(
                         project_id=r["project_id"], room_id=r["room_id"], share_id=r["id"], revoked_by="system",
-                        reason=why, epoch=now, action="federation.revoke", resource_id=r["id"]))
+                        reason=why, epoch=now, action="federation.revoke", resource_id=r["id"])))
+            for peer_id in sorted(k for k, v in self._fed_peers.items() if v and k not in want):
+                todo.append(("federation_peer_disabled", self._fed_system(
+                    peer_id=peer_id, epoch=now, action="federation.peer_disabled", resource_id=peer_id)))
+            for peer_id in sorted(want - {k for k, v in self._fed_peers.items() if v}):
+                todo.append(("federation_peer_enabled", self._fed_system(
+                    peer_id=peer_id, epoch=now, action="federation.peer_enabled", resource_id=peer_id)))
+            for event_type, payload in todo:
+                try:
+                    self._commit(event_type, payload)
+                except Exception:      # noqa: BLE001 - retried on the next pass
+                    logging.getLogger(__name__).warning("federation reconcile: %s refused", event_type)
 
     # ----------------------------------------------------------------- export (the signed side calls these)
     def _fed_share_for(self, share_id: Any, peer_id: str, policy: FederationPolicy) -> tuple[dict, dict] | None:

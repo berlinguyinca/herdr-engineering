@@ -75,10 +75,6 @@ class FederationGateway:
         self.replay = sign.ReplayGuard()
         self.quota = _Quota()
 
-    def is_on(self) -> bool:
-        """Cheap pre-check (no signature work): is there anything to serve at all? A False answer is the uniform 404."""
-        return self.service is not None and policy_from_source(self.source).enabled
-
     def handle(self, method: str, target: str, headers, body: bytes = b"") -> tuple[int, bytes, dict]:
         """``(status, body bytes, extra headers)``. Never raises."""
         try:

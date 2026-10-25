@@ -206,8 +206,8 @@ class PeerPolicy:
     def matches(self, fingerprint: Any) -> bool:
         """Does ``fingerprint`` equal this peer's pinned key fingerprint, ALL 64 hex characters? Anything shorter,
         longer or not a string is a mismatch (P1 compared 12 characters, so two keys sharing a prefix matched)."""
-        if not (isinstance(fingerprint, str) and _FULL_FINGERPRINT_RE.fullmatch(fingerprint)):
-            return False        # (so a keyless P1-shaped peer, holding only a short value, can never match either)
+        if self.public_key is None or not (isinstance(fingerprint, str) and _FULL_FINGERPRINT_RE.fullmatch(fingerprint)):
+            return False        # a peer with no pinned key (the P1 shape) never matches, whatever fingerprint it holds
         return hmac.compare_digest(self.key_fingerprint, fingerprint)
 
     def accepted_keys(self, now: float) -> tuple:
