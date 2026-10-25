@@ -558,3 +558,72 @@ def test_a_later_joiner_sees_a_drafts_title_but_not_the_history_it_quotes(w):
     assert late["title"] == "Plan" and "body" not in late and "sources" not in late
     early = w.s._view(ev, viewer=w.carol)["draft"]
     assert "secret plan" in early["body"]
+
+
+# ---------------------------------------------------------------- review fix: a crash between GitHub and the log
+
+def test_an_issue_whose_outcome_is_unknown_is_never_created_twice(w, tmp_path):
+    opener = FakeOpener()
+    w.s.github_writer = writer(tmp_path, opener=opener)
+    m = say(w, w.bob, "x")
+    d = say(w, w.alice, "/issue acme/app", selection=[m["event_id"]])["draft"]
+    real = w.s._commit
+
+    def crash(t, p):
+        if t == "github_written":
+            raise CollabError(503, "collaboration log unavailable")      # GitHub replied; recording it failed
+        return real(t, p)
+    w.s._commit = crash
+    with pytest.raises(CollabError):
+        w.s.confirm_draft(w.alice, w.room, d["draft_id"])
+    w.s._commit = real
+    assert f"<!-- herdr-draft:{d['draft_id']} -->" in opener.requests[0]["body"]["body"]
+    with pytest.raises(CollabError) as e:
+        w.s.confirm_draft(w.alice, w.room, d["draft_id"])
+    assert e.value.status == 409 and e.value.code == "github_write_unknown" and "check GitHub" in e.value.message
+    from herdr_engineering.control_plane.collab import (  # noqa: PLC0415
+        CollabService,
+        StaticTokenAuthenticator,
+    )
+    from tests.control_plane.test_collab import _digest  # noqa: PLC0415
+    s2 = CollabService(StaticTokenAuthenticator({u: _digest(t) for u, t in USERS.items()}), now=w.s._now)
+    s2.hydrate(list(w.s._log))                                            # the started mark is durable
+    s2.github_writer = w.s.github_writer
+    assert code(s2.confirm_draft, w.alice, w.room, d["draft_id"]) == 409
+    assert len(opener.requests) == 1
+
+
+def test_a_definite_github_refusal_leaves_the_draft_retryable(w, tmp_path):
+    import urllib.error  # noqa: PLC0415
+    opener = FakeOpener(fail=urllib.error.HTTPError("u", 422, "bad", {}, io.BytesIO(b"{}")))
+    w.s.github_writer = writer(tmp_path, opener=opener)
+    m = say(w, w.bob, "x")
+    d = say(w, w.alice, "/issue acme/app", selection=[m["event_id"]])["draft"]
+    assert code(w.s.confirm_draft, w.alice, w.room, d["draft_id"]) == 502
+    opener.fail = None
+    assert w.s.confirm_draft(w.alice, w.room, d["draft_id"])["status"] == "created"
+
+
+def test_a_secondary_rate_limit_is_reported_as_a_rate_limit(tmp_path):
+    import urllib.error  # noqa: PLC0415
+    from email.message import Message  # noqa: PLC0415
+
+    from herdr_engineering.github import GitHubError  # noqa: PLC0415
+    h = Message()
+    h["Retry-After"] = "60"
+    wr = writer(tmp_path, opener=FakeOpener(fail=urllib.error.HTTPError("u", 403, "slow down", h, io.BytesIO(b"{}"))))
+    with pytest.raises(GitHubError) as e:
+        wr.create_issue("acme", "app", "t", "b")
+    assert e.value.reason == "rate_limited"
+
+
+def test_an_assignment_uses_the_login_the_yaml_holds_at_confirm_time(w, tmp_path):
+    opener = FakeOpener()
+    w.s.github_writer = writer(tmp_path, opener=opener)
+    d = say(w, w.alice, "/assign #binview-44 @bob")["draft"]
+    w.s.people = normalize_people({"bob": {"github": "bob-new"}})
+    w.s.confirm_draft(w.alice, w.room, d["draft_id"])
+    assert opener.requests[0]["body"] == {"assignees": ["bob-new"]}
+    d2 = say(w, w.alice, "/assign acme/app#3 @bob")["draft"]
+    w.s.people = {}
+    assert code(w.s.confirm_draft, w.alice, w.room, d2["draft_id"]) == 400 and len(opener.requests) == 1

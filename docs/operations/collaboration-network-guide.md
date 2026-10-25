@@ -193,7 +193,12 @@ Nothing reaches GitHub until an approver presses **Create issue on GitHub…** /
 and confirms. Writes are off unless the fleet YAML says `github.write.enabled: true`, and they use the token in the
 file `github.write.token_ref` points to (absolute path, mode 0600) — a separate token from the read-only catalog
 token; the same token is refused. Writes go only to owners listed in `github.organizations` (an empty list permits
-no writes), at most 10 per approver per 10 minutes. A second click while the first is running is refused; after
+no writes), at most 10 per approver per 10 minutes. The issue text never mentions or links anyone on GitHub
+(a zero-width joiner follows every `@` and `#`), and the confirm dialog shows its title and opening. Before the
+call the server records that the write started; if it then crashes before recording the result, a later confirm
+answers "outcome unknown – check GitHub" instead of creating a second issue (each issue body ends with a hidden
+`<!-- herdr-draft:<id> -->` marker to search for). `/assign` uses the login the YAML holds when it is confirmed.
+`/summarize` posts a request card only: worker.sh agents are not woken by it (mention an agent to ask one). A second click while the first is running is refused; after
 it, confirm returns the recorded issue number. The public collab container never has the `github` section, so it
 never writes; writes need the combined control plane. Without approval mode only the dashboard operator is an
 approver.

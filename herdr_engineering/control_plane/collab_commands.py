@@ -53,6 +53,10 @@ def github_neutral(text: str) -> str:
 _LOGIN = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})\Z")
 COMMAND_EVENTS = frozenset({"handoff", "handoff_updated", "decision", "summary_request", "issue_draft",
                             "assignment", "github_written"})
+# a write's progress: not feed cards, folded into the draft's state
+WRITE_STATE_EVENTS = frozenset({"github_write_started", "github_write_failed"})
+# GitHub answered and surely made nothing (HTTP refusals before any write); anything else is an unknown outcome
+DEFINITE_REFUSALS = frozenset({"authentication", "permission", "not_found", "rejected", "rate_limited", "redirect"})
 # events a post creates (the poster's idempotency key replays them)
 POSTED_EVENTS = frozenset({"handoff", "decision", "summary_request", "issue_draft", "assignment"})
 MAX_SELECTION = 20
@@ -140,6 +144,12 @@ class CommandsMixin:
             self._decisions_by_room[p["room_id"]].append(ev)
         elif t in ("issue_draft", "assignment"):
             self._drafts[p["draft"]["draft_id"]] = {**p["draft"], "room_id": p["room_id"], "status": "draft"}
+        elif t == "github_write_started":
+            if p["draft_id"] in self._drafts:
+                self._drafts[p["draft_id"]]["status"] = "started"
+        elif t == "github_write_failed":
+            if p["draft_id"] in self._drafts:
+                self._drafts[p["draft_id"]]["status"] = "draft"
         elif t == "github_written":
             d = self._drafts.get(p["github"]["draft_id"])
             if d:
@@ -383,7 +393,10 @@ class CommandsMixin:
     # ---------------------------------------------------------------- GitHub writes
     def confirm_draft(self, pr, room_id: str, draft_id: str) -> dict:
         """An approver's explicit confirm of an `/issue` or `/assign` draft: the one place a room writes to GitHub.
-        Idempotent per draft (a second confirm returns the recorded result; one in flight is refused)."""
+        Idempotent per draft: a second confirm returns the recorded result, one in flight is refused, and an issue
+        whose earlier attempt has no recorded outcome (a crash after `github_write_started`) is never sent again
+        (409 `github_write_unknown`: the issue body carries `<!-- herdr-draft:<id> -->` to look for on GitHub).
+        An assignment re-reads the person's login from the current YAML."""
         from ..github import GitHubError, GitHubWriteError
         from .collab import CollabError
         with self._lock:
@@ -393,37 +406,60 @@ class CommandsMixin:
                 raise CollabError(404, "not found")
             if not self._approver(pr):
                 raise CollabError(403, "only approvers may write to GitHub")
-            if d["status"] != "draft":
-                return {**(d.get("result") or {}), "status": d["status"], "replayed": True}
             if draft_id in self._draft_inflight:
                 raise CollabError(409, "this GitHub write is already in progress")
+            if d["status"] == "started":
+                raise CollabError(409, "the outcome of an earlier attempt is unknown – check GitHub for an issue "
+                                       f"containing herdr-draft:{draft_id} before drafting it again",
+                                  code="github_write_unknown")
+            if d["status"] != "draft":
+                return {**(d.get("result") or {}), "status": d["status"], "replayed": True}
             writer = self.github_writer
             if writer is None or not writer.status()["enabled"]:
                 raise CollabError(409, GitHubWriteError("disabled").args[0], code="github_write_disabled")
             if not writer.in_scope(d["owner"]):
                 raise CollabError(403, GitHubWriteError("out_of_scope").args[0], code="github_out_of_scope")
-            self._throttle("github-write:" + pr.key, GITHUB_WRITES, GITHUB_WRITE_WINDOW, "GitHub write")
-            self._draft_inflight.add(draft_id)
             job = dict(d)
+            if job["kind"] == "assignment":           # the login as the YAML says NOW, not when it was drafted
+                job["login"] = (self._people().get(job["person"]["name"]) or {}).get("github")
+                if not job["login"]:
+                    raise CollabError(400, f"@{job['person']['name']} has no GitHub login: set "
+                                           f"collab.people.{job['person']['name']}.github in the fleet YAML")
+            self._throttle("github-write:" + pr.key, GITHUB_WRITES, GITHUB_WRITE_WINDOW, "GitHub write")
+            if job["kind"] == "issue":                # durable BEFORE the call: a crash cannot lead to a second issue
+                self._commit("github_write_started", self._actor(
+                    pr, project_id=room["project_id"], room_id=room_id, draft_id=draft_id,
+                    action="github.write.start", outcome="allowed", project_ids=[room["project_id"]],
+                    resource_id=draft_id))
+            self._draft_inflight.add(draft_id)
+
+        def settle(definite: bool) -> None:
+            with self._lock:
+                try:
+                    if definite and job["kind"] == "issue":   # GitHub surely made nothing: the draft may be retried
+                        self._commit("github_write_failed", self._actor(
+                            pr, project_id=room["project_id"], room_id=room_id, draft_id=draft_id,
+                            action="github.write.fail", outcome="denied", project_ids=[room["project_id"]],
+                            resource_id=draft_id))
+                finally:
+                    self._draft_inflight.discard(draft_id)
         try:
             if job["kind"] == "issue":
-                result = writer.create_issue(job["owner"], job["repo"], job["title"], job["body"])
+                body = f"{job['body']}\n\n<!-- herdr-draft:{draft_id} -->"
+                result = writer.create_issue(job["owner"], job["repo"], job["title"], body)
             else:
                 writer.assign(job["owner"], job["repo"], job["number"], job["login"])
                 result = {"number": job["number"],
                           "url": f"https://github.com/{job['owner']}/{job['repo']}/issues/{job['number']}"}
-        except GitHubWriteError as exc:
-            with self._lock:
-                self._draft_inflight.discard(draft_id)
+        except GitHubWriteError as exc:               # refused before anything was sent
+            settle(True)
             status = {"disabled": 409, "out_of_scope": 403, "invalid": 400}.get(exc.reason, 503)
             raise CollabError(status, str(exc), code="github_write_" + exc.reason) from None
         except GitHubError as exc:
-            with self._lock:
-                self._draft_inflight.discard(draft_id)
+            settle(exc.reason in DEFINITE_REFUSALS)
             raise CollabError(502, f"GitHub refused the write: {exc}", code="github_" + exc.reason) from None
         except Exception:
-            with self._lock:
-                self._draft_inflight.discard(draft_id)
+            settle(False)
             raise CollabError(502, "GitHub refused the write", code="github_unavailable") from None
         with self._lock:
             try:

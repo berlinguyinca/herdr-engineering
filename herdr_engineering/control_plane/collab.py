@@ -36,7 +36,7 @@ from . import collab_mentions as mentions
 from . import collab_models, ids
 from . import collab_refs as issue_refs
 from .collab_attention import AttentionMixin
-from .collab_commands import COMMAND_EVENTS, CommandsMixin, parse_command
+from .collab_commands import COMMAND_EVENTS, WRITE_STATE_EVENTS, CommandsMixin, parse_command
 from .collab_context import ContextMixin
 from .collab_files import FilesMixin
 from .collab_workbench import WorkbenchMixin
@@ -893,7 +893,7 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FilesMixin, Co
         elif t == "message":
             self._idem[(p["sender_key"], p["room_id"], p["idempotency_key"])] = (p["fingerprint"], seq)
             self._msg_room[ev["event_id"]] = (p["room_id"], seq)
-        elif t in COMMAND_EVENTS:
+        elif t in COMMAND_EVENTS or t in WRITE_STATE_EVENTS:
             self._apply_commands(ev)
         if t in _FEED_TYPES:
             for rid in {p.get("room_id"), *p.get("room_ids", ())} - {None}:

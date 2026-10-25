@@ -105,6 +105,7 @@ class GitHubError(RuntimeError):
             "response_too_large": "The GitHub response exceeded the bounded read limit.",
             "redirect": "GitHub redirected the request; credentials were not forwarded.",
             "capacity": "The configured catalog safety limit was reached; coverage is partial.",
+            "rejected": "GitHub rejected the request as invalid.",
             "invalid_config": "github.organizations must be a list of non-empty GitHub owner logins; fix the YAML configuration.",
         }.get(reason, "GitHub is temporarily unavailable."))
 
@@ -1635,9 +1636,12 @@ class GitHubWriter:
             raise
         except urllib.error.HTTPError as exc:
             reason = {401: "authentication", 403: "permission", 404: "not_found", 410: "not_found",
-                      422: "invalid_response", 429: "rate_limited"}.get(exc.code, "unavailable")
+                      422: "rejected", 429: "rate_limited"}.get(exc.code, "unavailable")
             if 300 <= exc.code < 400:
                 reason = "redirect"
+            # GitHub's secondary rate limit is a 403 with Retry-After (or no remaining quota): not a permission problem
+            if exc.code == 403 and (exc.headers.get("Retry-After") or exc.headers.get("X-RateLimit-Remaining") == "0"):
+                reason = "rate_limited"
             exc.close()
             raise GitHubError(reason) from None
         except (ValueError, TypeError, UnicodeError):
