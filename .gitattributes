@@ -1,0 +1,4 @@
+
+# Screenshot baselines (docs/operations/ui-gates.md, "Baseline policy"): binary, never diffed as text or normalised; total size is capped by the gate.
+docs/assets/screenshots/*.png binary
+tests/playwright/fonts/*.ttf binary

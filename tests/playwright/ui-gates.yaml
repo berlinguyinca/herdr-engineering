@@ -1,0 +1,49 @@
+# T16 UI gates: every threshold the gates enforce. YAML only; no environment variables configure these.
+# Measured on: AMD Ryzen Threadripper PRO 3945WX (24 threads), 503 GB RAM, Linux 6.8, headless Chromium 1243 (chrome-linux64).
+# Budgets are deliberately loose multiples of the measured values (see docs/operations/ui-gates.md) so a loaded CI box does not flake,
+# yet an order-of-magnitude regression (an O(n^2) layout, a main-thread stall) still fails.
+viewports:
+  desktop:
+    width: 1280
+    height: 800
+  tablet:
+    width: 768
+    height: 1024
+  mobile:
+    width: 375
+    height: 667
+  reflow:
+    width: 320
+    height: 568
+screenshots:
+  # autospec ux-ui-workstream allows 0.1%; a whole-page percentage hides small defects (all edges of a graph measured 0.05%, an
+  # invisible inspector 0.09%, a missing logo 0.06%), so the page budget is ten times tighter and every component (graph, node,
+  # inspector, logo, tab bar, review pane) is compared on its own area as well.
+  max_diff_pct: 0.01
+  component_max_diff_pct: 0.05
+  # per-channel difference (0-255) below which a pixel counts as identical (anti-aliasing noise)
+  channel_tolerance: 2
+  # size policy for the committed PNGs (docs/operations/ui-gates.md, "Baseline policy"): total and per file, in KB
+  max_total_kb: 6144
+  max_file_kb: 300
+  fixed_clock: "2026-10-23T10:00:00Z"
+perf:
+  # lineage tab: click to first rendered graph (ms)
+  render_ms: 6000
+  # keypress on a focused node to the inspector showing (ms)
+  interaction_ms: 500
+  # a fixed CPU loop timed in the page on the reference machine (ms); budgets are multiplied by max(1, measured / this)
+  calibration_ref_ms: 100
+  # Load more, p95 (ms): loose on purpose, paging goes through the server and the network
+  load_more_p95_ms: 3000
+  # median redraw after toggling a type checkbox on a graph above the draw cap (ms)
+  toggle_ms: 250
+  # long tasks (>50 ms) tolerated while the graph is rendered and one interaction is made, on the reference host; like the time
+  # budgets it is multiplied by the measured host slowdown (a slower host splits the same work into more >50 ms tasks)
+  max_long_tasks: 25
+  # one long task may not exceed this (ms)
+  max_long_task_ms: 1500
+tokens:
+  # ratchets (the count may fall, never rise); measured on this branch, see docs/operations/ui-gates.md
+  max_raw_hex: 5
+  max_off_grid_spacing: 76     # 72 on the branch; +4 from main's agent-helper rules (.cx-table, .cx-internal, .cx-fix-results)

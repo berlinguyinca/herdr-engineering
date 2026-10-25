@@ -93,13 +93,13 @@ const sig = (e) => `${e.state}:${e.total}:${e.last}`;
 export function renderFlow(box, flow, { onNode, onEdge, prev = new Map() } = {}) {
   const lay = layoutFlow(flow);
   const next = new Map(lay.edges.map((e) => [e.key, sig(e)]));
-  const edgeSvg = lay.edges.map((e) => `<path class="cx-flow-edge${e.spawn ? ' cx-flow-edge--spawn' : ''}${e.live ? ' cx-flow-edge--live' : ''}${prev.size && prev.get(e.key) !== next.get(e.key) ? ' cx-flow-pulse' : ''}" data-edge="${esc(e.key)}" d="${e.d}" fill="none" stroke="${STATUS_COLOR[e.state]}" stroke-width="${e.width.toFixed(1)}" stroke-linecap="round"><title>${esc(e.spawn ? 'started under this agent (same herdr tab)' : Object.entries(e.counts).map(([k, v]) => `${v} ${k}`).join(', '))}</title></path>`).join('');
+  const edgeSvg = lay.edges.map((e) => `<path class="cx-flow-edge${e.spawn ? ' cx-flow-edge--spawn' : ''}${e.live ? ' cx-flow-edge--live' : ''}${prev.size && prev.get(e.key) !== next.get(e.key) ? ' cx-flow-pulse' : ''}" data-edge="${esc(e.key)}" tabindex="-1" role="button" aria-label="${esc(e.spawn ? 'Agent started under another agent' : `Tasks: ${Object.entries(e.counts).map(([k, v]) => `${v} ${k}`).join(', ')}`)}" d="${e.d}" fill="none" stroke="${STATUS_COLOR[e.state]}" stroke-width="${e.width.toFixed(1)}" stroke-linecap="round"><title>${esc(e.spawn ? 'started under this agent (same herdr tab)' : Object.entries(e.counts).map(([k, v]) => `${v} ${k}`).join(', '))}</title></path>`).join('');
   const nodeSvg = lay.nodes.map((n) => {
     const fam = n.kind === 'agent' ? (FAMILY_COLOR[n.family] || 'var(--text-muted, #888)') : 'var(--accent, #1f7ae0)';
     const live = n.fabric && n.fabric.status === 'active';
     const gone = n.status === 'removed';
     const sub = n.kind === 'agent' ? `${n.family || ''}${n.group ? ` · ${n.group}` : ''}${n.fabric ? ` · ${n.fabric.host || 'fabric'}` : ''}` : (n.role || '');
-    return `<g class="cx-flow-node${gone ? ' cx-flow-node--gone' : ''}" data-node="${esc(n.id)}" transform="translate(${n.x},${n.y})" tabindex="0" role="button" aria-label="${esc(n.fabric?.display_name || n.name)}">
+    return `<g class="cx-flow-node${gone ? ' cx-flow-node--gone' : ''}" data-node="${esc(n.id)}" transform="translate(${n.x},${n.y})" tabindex="-1" role="button" aria-label="${esc(n.fabric?.display_name || n.name)}">
       <rect width="${n.w}" height="${n.h}" rx="8" class="cx-flow-box"/>
       <circle cx="12" cy="${n.h / 2}" r="5" fill="${fam}"/>
       ${n.kind === 'agent' && n.fabric ? `<circle cx="${n.w - 12}" cy="10" r="4" fill="${live ? 'var(--status-ok, #1a9b6c)' : 'var(--text-muted, #888)'}"><title>fabric agent ${esc(n.fabric.status || '')}</title></circle>` : ''}
@@ -107,12 +107,38 @@ export function renderFlow(box, flow, { onNode, onEdge, prev = new Map() } = {})
       <text x="24" y="27" class="cx-flow-sub">${esc(clip(sub, 26))}</text>
       <title>${esc(n.fabric?.display_name || n.name)}</title></g>`;
   }).join('');
-  box.innerHTML = `<div class="cx-flow-scroll"><svg class="cx-flow" viewBox="0 0 ${lay.width} ${lay.height}" width="${lay.width}" height="${lay.height}" role="img" aria-label="Flow of tasks between people and agents">${lay.idleLabel ? `<text x="${lay.idleLabel.x}" y="${lay.idleLabel.y}" class="cx-flow-sub">${esc(lay.idleLabel.text)}</text>` : ''}${edgeSvg}${nodeSvg}</svg></div>`;
+  // A redraw replaces every element; if the keyboard was inside the diagram, focus would fall to <body> (WCAG 2.4.3). Note it now and
+  // put it back on the remembered tab stop below.
+  const doc = box.ownerDocument;
+  const hadFocus = !!(doc && doc.activeElement && doc.activeElement !== box && box.contains(doc.activeElement));
+  box.innerHTML = `<div class="cx-flow-scroll"><svg class="cx-flow" viewBox="0 0 ${lay.width} ${lay.height}" width="${lay.width}" height="${lay.height}" role="group" aria-label="Flow of tasks between people and agents">${lay.idleLabel ? `<text x="${lay.idleLabel.x}" y="${lay.idleLabel.y}" class="cx-flow-sub">${esc(lay.idleLabel.text)}</text>` : ''}${edgeSvg}${nodeSvg}</svg></div>`;
   box.querySelectorAll('[data-node]').forEach((el) => {
     const act = () => onNode && onNode(lay.nodes.find((n) => n.id === el.dataset.node));
     el.onclick = act;
     el.onkeydown = (ev) => { if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); act(); } };
   });
-  box.querySelectorAll('[data-edge]').forEach((el) => { el.onclick = () => onEdge && onEdge(lay.edges.find((e) => e.key === el.dataset.edge)); });
+  box.querySelectorAll('[data-edge]').forEach((el) => {            // a task line opens its detail: keyboard users get the same (WCAG 2.1.1)
+    const act = () => onEdge && onEdge(lay.edges.find((e) => e.key === el.dataset.edge));
+    el.onclick = act;
+    el.onkeydown = (ev) => { if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); act(); } };
+  });
+  // The diagram is ONE Tab stop (roving tabindex): arrow keys move between nodes and task lines, Home/End jump to the ends, so a
+  // keyboard user is not made to Tab through every line of a large flow (WCAG 2.1.1, 2.4.3). The stop is remembered across redraws.
+  const items = [...box.querySelectorAll('[data-node], [data-edge]')];
+  const idOf = (el) => (el.dataset.node ? `n:${el.dataset.node}` : `e:${el.dataset.edge}`);
+  const remembered = box.dataset.roving;
+  const stop = items.find((el) => idOf(el) === remembered) || items[0];
+  items.forEach((el) => el.setAttribute('tabindex', el === stop ? '0' : '-1'));
+  const move = (to) => { if (!to) return; items.forEach((el) => el.setAttribute('tabindex', el === to ? '0' : '-1')); box.dataset.roving = idOf(to); to.focus(); };
+  items.forEach((el, i) => {
+    const prior = el.onkeydown;
+    el.onkeydown = (ev) => {
+      const keys = { ArrowRight: i + 1, ArrowDown: i + 1, ArrowLeft: i - 1, ArrowUp: i - 1, Home: 0, End: items.length - 1 };
+      if (ev.key in keys) { ev.preventDefault(); move(items[Math.min(items.length - 1, Math.max(0, keys[ev.key]))]); return; }
+      if (prior) prior(ev);
+    };
+    el.addEventListener('focus', () => { box.dataset.roving = idOf(el); items.forEach((o) => o.setAttribute('tabindex', o === el ? '0' : '-1')); });
+  });
+  if (hadFocus && stop) stop.focus({ preventScroll: true });
   return next;
 }
