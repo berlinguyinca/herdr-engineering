@@ -10,6 +10,7 @@ import {renderCiPipeline,ciPipelineStyles,pipelineZoom,sameCiRepository,ciCompar
 import {mountCiHealth} from './ci-health-view.js';
 import {snapshotText,animateChanges,skeleton} from './motion.js';
 import {freshnessSources} from './freshness.js';
+import {morph,handOff,patchText,patchAttr} from './patch.js';
 
 const text = value => typeof value === 'string' ? value : '';
 const records = value => Array.isArray(value) ? value.filter(v=>v && typeof v==='object' && !Array.isArray(v)) : [];
@@ -84,7 +85,7 @@ export function integrationRow(entry,kind='ci') {
   const status=human(stateOf(r)) || 'status unknown';
   const title=short(r.title) || (kind==='ci' ? `Run #${r.run_number ?? 'unknown'}` : `${r.kind==='code'?'Code':'Plan'} review`);
   const running=kind==='ci'&&entry.tab==='current'&&['running','pending','started'].includes(stateOf(r));
-  return `<article class="ig-row" data-entry="${esc(entry.id)}"${running?' data-state="running"':''}><div class="ig-main">
+  return `<article class="ig-row" data-key="${esc(entry.id)}" data-entry="${esc(entry.id)}"${running?' data-state="running"':''}><div class="ig-main">
     ${kind==='ci' ? `<button type="button" class="ig-title" data-run="${esc(entry.id)}">${esc(title)}</button>` : `<strong class="ig-title">${esc(title)}</strong>`}
     <p class="ig-note">${esc(short(r.repository)||'Repository not reported')}${r.branch ? ` · ${esc(short(r.branch,80))}` : ''}${r.revision ? ` · <code>${esc(short(r.revision,12))}</code>` : ''}</p>
     ${kind==='reviews' ? `<div class="ig-links">${entry.tab==='current' ? external(r.review_url || r.url,'Open in Plannotator') : '<span class="ig-note">Recorded review</span>'}${r.mission_key || r.mission_id ? `<a href="#/missions/${esc(encodeURIComponent(r.mission_key || r.mission_id))}">Mission</a>` : ''}${r.session_id ? `<a href="#/herd/session/${esc(encodeURIComponent(r.session_id))}">Agent</a>` : ''}</div>${r.summary ? `<p class="ig-summary">${esc(short(r.summary))}</p>` : ''}${r.stale ? '<p class="ig-warning">Review launcher report is stale; open upstream to check its state.</p>' : ''}<details class="ig-review-details" data-review-details="${esc(entry.id)}"><summary>Plan and feedback</summary>${r._detailsError ? `<p class="ig-warning" role="status">${esc(r._detailsError)}</p>` : ''}${r.plan ? `<pre class="ig-log">${esc(text(r.plan).slice(0,50000))}${text(r.plan).length>50000?'\n… Plan display truncated.':''}</pre>` : ''}${r.feedback ? `<p class="ig-review-feedback">${esc(text(r.feedback).slice(0,10000))}</p>` : ''}${!r.plan && !r.feedback ? `<p class="ig-note">${r._detailsLoaded?'No plan text or feedback was recorded.':r._detailsError?'Close and reopen to retry.':'Loading review details…'}</p>` : ''}</details>` : ''}
@@ -146,8 +147,8 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
   const tabs=isCi ? [['current','Current'],['failed','Failed'],['finished','Finished']] : [['current','Current'],['changes','Changes requested'],['failed','Failed'],['finished','Finished']];
   const state={tab:tabs.some(([key])=>key===tab)?tab:'current',search,repository,provider,mission,session,page:0,group:'project',branch:'',days:0};
   let disposed=false,data=null,error='',selected=null,pipeline=null,detailError='',log=null,logError='',step='',actionMessage='';
-  let timer=null,clock=null,signature='',detailSignature='',chartSignature='';
-  let reportData=null,reportsError='',insightsSignature='',failurePage=0,testPage=0,testSearch='';
+  let timer=null,clock=null,shownPipeline=null,chartHtml='';
+  let reportData=null,reportsError='',failurePage=0,testPage=0,testSearch='';
   let debugSessions=null,debugSessionId='',debugMessage='',debugOperationId='';
   let healthView=null,workspace=tab==='current'?'health':'runs',collapseSuccess=false,zoom=1,comparisonKey='',listScroll=0,healthOriginKey='';
   const observedDetails=new Map();
@@ -203,70 +204,43 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
   })} : data||{},kind);
   const entryKey=node=>node.closest('[data-entry]')?.dataset.entry;
   let chartsDrawn=false,motionSettled=false,motionView='';
-  function replace(element,html) {
-    const focused=document.activeElement;
-    const focusKey=element.contains(focused) ? ['data-run','data-step','data-close-inspector','data-ci-action','data-ci-test-search','data-ci-test-page','data-collapse-success','data-pipeline-zoom','data-ci-compare'].find(k=>focused.hasAttribute(k)) : null;
-    const focusValue=focusKey ? focused.getAttribute(focusKey) : null;
-    const reviewFocus=element.contains(focused) && focused.tagName==='SUMMARY' ? focused.closest('[data-review-details]')?.dataset.reviewDetails : null;
-    const linkFocus=element.contains(focused) && focused.tagName==='A' ? focused.getAttribute('href') : null;
-    const debugOpen=element.querySelector('[data-debug-disclosure]')?.open;
-    const debugFocus=element.contains(focused) && focused.closest('[data-debug-disclosure]') ? (focused.hasAttribute('data-debug-session')?'select':focused.tagName==='SUMMARY'?'summary':focused.hasAttribute('data-debug-send')?'button':null) : null;
-    const openReviews=new Set([...element.querySelectorAll('[data-review-details][open]')].map(e=>e.dataset.reviewDetails));
-    const testInput=element.querySelector('[data-ci-test-search]'),selection=testInput&&document.activeElement===testInput?[testInput.selectionStart,testInput.selectionEnd]:null;
-    const paneScroll=element.scrollTop;
-    const graphScroll=[...element.querySelectorAll('.ci-pipeline-scroll')].map(node=>[node.scrollLeft,node.scrollTop]);
-    const successOpen=[...element.querySelectorAll('.ci-pipeline-success')].map(node=>node.open);
+  // Panels are morphed: unchanged data writes nothing, and focus, the test-search caret, open
+  // disclosures and scroll positions stay with their nodes. A focused control whose data left
+  // hands focus to fallback(). The step log keeps following its tail when it was scrolled to the end.
+  function replace(element,html,fallback=()=>null) {
     const logElement=element.querySelector('.ig-log');
-    const logScroll=logElement?.scrollTop;
     const atEnd=logElement && logElement.scrollHeight-logElement.clientHeight-logElement.scrollTop<8;
-    element.innerHTML=html;
-    for(const review of element.querySelectorAll('[data-review-details]'))review.open=openReviews.has(review.dataset.reviewDetails);
-    if(focusKey)[...element.querySelectorAll(`[${focusKey}]`)].find(e=>e.getAttribute(focusKey)===focusValue)?.focus({preventScroll:true});
-    const debug=element.querySelector('[data-debug-disclosure]');if(debug && debugOpen)debug.open=true;
-    if(debugFocus)debug?.querySelector(debugFocus)?.focus({preventScroll:true});
-    if(reviewFocus)[...element.querySelectorAll('[data-review-details]')].find(e=>e.dataset.reviewDetails===reviewFocus)?.querySelector('summary')?.focus({preventScroll:true});
-    if(linkFocus)[...element.querySelectorAll('a')].find(e=>e.getAttribute('href')===linkFocus)?.focus({preventScroll:true});
-    if(selection){const input=element.querySelector('[data-ci-test-search]');input?.setSelectionRange(...selection);}
-    element.scrollTop=paneScroll;
-    [...element.querySelectorAll('.ci-pipeline-scroll')].forEach((node,i)=>{if(graphScroll[i]){node.scrollLeft=graphScroll[i][0];node.scrollTop=graphScroll[i][1];}});
-    [...element.querySelectorAll('.ci-pipeline-success')].forEach((node,i)=>node.open=!!successOpen[i]);
+    handOff(morph(element,html),fallback);
     const nextLog=element.querySelector('.ig-log');
-    if(nextLog && logScroll!=null)nextLog.scrollTop=atEnd?nextLog.scrollHeight:logScroll;
+    if(nextLog && atEnd && nextLog.scrollTop<nextLog.scrollHeight-nextLog.clientHeight)nextLog.scrollTop=nextLog.scrollHeight;
   }
   function tick() {
-    for(const element of container.querySelectorAll('[data-integration-time]')) element.textContent=formatDuration(Math.max(0,Date.now()-Number(element.dataset.integrationTime)));
+    for(const element of container.querySelectorAll('[data-integration-time]')) patchText(element,formatDuration(Math.max(0,Date.now()-Number(element.dataset.integrationTime))));
   }
   function draw() {
     if(disposed)return;
-    el('[data-ig-error]').textContent=error;
+    patchText(el('[data-ig-error]'),error);
     const health=integrationHealth(data,kind,{failed:!!error});
     const healthElement=el('[data-ig-health]');
-    const healthKey=JSON.stringify([!data&&!!error,data?.status,data?.refreshing,data?.progress,data?.last_success_at,data?.checked_at,data?.error,data?.stale,data?.repo_errors,data?.project_mapping_error]);
-    if(healthElement.dataset.signature!==healthKey){healthElement.dataset.signature=healthKey;const issuesOpen=healthElement.querySelector('details')?.open;healthElement.innerHTML=health;if(issuesOpen && healthElement.querySelector('details'))healthElement.querySelector('details').open=true;}
+    morph(healthElement,health);
     const all=entries(),filtered=selectIntegrations(all,state),pageSize=20;
     state.page=Math.min(state.page,Math.max(0,Math.ceil(filtered.length/pageSize)-1));
-    const nextSignature=JSON.stringify([state,!!error,data,reportData,performanceData,performanceError,performanceDays,[...reviewCache]]);
     if(isCi) {
       const observations=ciObservations();
       const model=ciInsightsModel(observations,state);
       const html=renderCiInsights(model,{loading:reportData===null&&!reportsError,error:reportsError,failurePage});
-      if(insightsSignature!==html){
-        const host=el('[data-ci-insights]'),disclosures=[...host.querySelectorAll('details')];
-        const open=disclosures.map(d=>d.open),focus=disclosures.findIndex(d=>d.querySelector('summary')===document.activeElement);
-        host.innerHTML=html;const next=[...host.querySelectorAll('details')];next.forEach((d,i)=>d.open=!!open[i]);if(focus>=0)next[focus]?.querySelector('summary')?.focus({preventScroll:true});insightsSignature=html;
-      }
+      replace(el('[data-ci-insights]'),html,()=>el('[data-ci-insights] summary'));
       for(const [selector,field,label] of [['[data-ci-repository]','repository','All repositories'],['[data-ci-branch]','branch','All branches']]){
         const select=el(selector),values=new Map();
         for(const r of [...observations.pipelines,...records(observations.reports),...records(performanceData?.cache_groups),...records(performanceData?.execution_trends)]) {const value=field==='repository'?String(r.provider_repo_id??r.repository_id??r.repository??''):text(r.branch);if(value)values.set(value,field==='repository'?`${r.repository||value} (${value})`:value);}
         if(state[field])values.set(state[field],values.get(state[field])||state[field]);
-        const options=`<option value="">${label}</option>`+[...values].sort((a,b)=>a[1].localeCompare(b[1])).map(([value,label])=>`<option value="${esc(value)}">${esc(label)}</option>`).join('');
-        if(select.innerHTML!==options)select.innerHTML=options;select.value=state[field];
+        const options=`<option value="">${label}</option>`+[...values].sort((a,b)=>a[1].localeCompare(b[1])).map(([value,label])=>`<option value="${esc(value)}"${value===state[field]?' selected':''}>${esc(label)}</option>`).join('');
+        morph(select,options);
       }
     }
-    if(signature!==nextSignature) {
-      signature=nextSignature;
-      // Rows and charts are rebuilt with innerHTML (Task 19 moves them onto the patcher); motion pairs
-      // old and new nodes by key: tab counts by node, rows by data-entry (state change = flash).
+    {
+      // Rows and charts are morphed (rows keyed by data-key); motion pairs old and new text by key:
+      // tab counts by node, rows by data-entry (state change = flash).
       // Motion only for data-driven changes: not before the reports have landed (CI counts include
       // retained observations) and not when the user changed the tab, a filter, the search or page.
       const settled=!!data&&(!isCi||reportData!==null||!!reportsError), view=JSON.stringify(state);
@@ -276,55 +250,50 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
       const rowStates=live?snapshotText(el('#ig-results'),'[data-entry] .ig-state strong',entryKey):null;
       for(const [key] of tabs) {
         const button=el(`[data-tab="${key}"]`),active=state.tab===key;
-        button.setAttribute('aria-selected',String(active));button.tabIndex=active?0:-1;
-        button.querySelector('strong').textContent=data ? all.filter(e=>selectIntegrations([e],{...state,tab:key,search:''}).length).length : '…';
+        patchAttr(button,'aria-selected',String(active));patchAttr(button,'tabindex',active?'0':'-1');
+        patchText(button.querySelector('strong'),data ? all.filter(e=>selectIntegrations([e],{...state,tab:key,search:''}).length).length : '…');
       }
       if(isCi) {
         const chart=el('[data-ci-charts-body]');
         const html=data ? renderCiCharts(ciChartModel(selectIntegrations(all,{...state,tab:'all'}),{data:performanceData,filters:state,loading:performanceData===null&&!performanceError&&typeof client.getCiPerformance==='function',error:performanceError}),{
           retained:!!reportData,days:state.days,scope:reportData?.scope,stale:!!data.stale,partial:data.status==='partial'||Object.keys(data.repo_errors || {}).length>0,
         }) : '<p class="ci-chart-note">Waiting for CI reports…</p>';
-        if(chartSignature!==html) {
-          chartSignature=html;
-          const disclosure=chart.querySelector('[data-ci-chart-data]');
-          const open=disclosure?.open, focused=disclosure?.querySelector('summary')===document.activeElement;
-          const focusedTable=chart.contains(document.activeElement)&&document.activeElement.classList.contains('ci-chart-table')?document.activeElement.getAttribute('aria-label'):null;
-          chart.innerHTML=html;
-          // Charts draw in on their first paint only; later refreshes replace them without motion.
-          if(!chartsDrawn&&chart.querySelector('svg')){chartsDrawn=true;for(const mark of chart.querySelectorAll('.ci-chart-card svg :is(rect,polyline,circle)'))mark.setAttribute('data-drawn','');}
-          const next=chart.querySelector('[data-ci-chart-data]');
-          if(next && open)next.open=true;
-          if(focused)next?.querySelector('summary')?.focus({preventScroll:true});
-          if(focusedTable)[...chart.querySelectorAll('.ci-chart-table')].find(t=>t.getAttribute('aria-label')===focusedTable)?.focus({preventScroll:true});
-        }
+        // A changed chart after the first paint is patched without drawing in again.
+        if(chartsDrawn&&html!==chartHtml)for(const mark of chart.querySelectorAll('[data-drawn]'))mark.removeAttribute('data-drawn');
+        chartHtml=html;
+        replace(chart,html,()=>chart.querySelector('[data-ci-chart-data] summary'));
+        // Charts draw in on their first paint only; later refreshes patch them without motion.
+        if(!chartsDrawn&&chart.querySelector('svg')){chartsDrawn=true;for(const mark of chart.querySelectorAll('.ci-chart-card svg :is(rect,polyline,circle)'))mark.setAttribute('data-drawn','');}
       }
       const groups=new Map();
       for(const entry of filtered.slice(state.page*pageSize,(state.page+1)*pageSize)) {
         const group=state.group==='project'?entry.project:'Most recent';
         if(!groups.has(group))groups.set(group,[]);groups.get(group).push(entry);
       }
-      const result=el('#ig-results');result.setAttribute('aria-labelledby',`ig-tab-${state.tab}`);
-      replace(result,[...groups].map(([name,rows])=>`<div class="ig-group"><h2>${esc(name)}</h2>${rows.map(e=>integrationRow(e,kind)).join('')}</div>`).join('') || `<div class="ig-group ig-empty">${!data ? (error ? `No ${isCi?'runs':'reviews'} could be loaded yet; retrying automatically.` : skeleton(isCi?'runs':'reviews',{rows:isCi?4:2})) : isCi && data.available===false && !all.length ? 'No CI reports available. Connection details are shown above.' : `No ${state.tab==='current'?'current ':''}${isCi?'runs':'reviews'} match this view.`}</div>`);
+      const result=el('#ig-results');patchAttr(result,'aria-labelledby',`ig-tab-${state.tab}`);
+      // A focused run that left the page hands focus to a neighbouring run, else the current tab.
+      replace(result,[...groups].map(([name,rows])=>`<div class="ig-group" data-key="${esc(name)}"><h2>${esc(name)}</h2>${rows.map(e=>integrationRow(e,kind)).join('')}</div>`).join('') || `<div class="ig-group ig-empty">${!data ? (error ? `No ${isCi?'runs':'reviews'} could be loaded yet; retrying automatically.` : skeleton(isCi?'runs':'reviews',{rows:isCi?4:2})) : isCi && data.available===false && !all.length ? 'No CI reports available. Connection details are shown above.' : `No ${state.tab==='current'?'current ':''}${isCi?'runs':'reviews'} match this view.`}</div>`,()=>el(`[data-tab="${state.tab}"]`));
       animateChanges(container,'[data-tab] strong',tabCounts);
       animateChanges(result,'[data-entry] .ig-state strong',rowStates,entryKey,{count:false,target:node=>node.closest('[data-entry]')});
-      el('[data-ig-count]').textContent=data ? `${filtered.length} matching ${isCi?'runs':'reviews'}${isCi?reportData?' in retained observations':' in the recent pipeline window':data.has_more?` · Showing the latest ${records(data.reviews).length}${Number.isFinite(data.total)?` of ${data.total}`:''} reviews; older records are outside this window`:''}` : '';
-      el('.ig-pages').hidden=filtered.length<=pageSize;
-      el('[data-ig-page]').textContent=`Page ${state.page+1} of ${Math.max(1,Math.ceil(filtered.length/pageSize))}`;
-      el('[data-page="previous"]').disabled=state.page===0;el('[data-page="next"]').disabled=(state.page+1)*pageSize>=filtered.length;
+      // An open review stays open (morph keeps it), so no toggle fires when its record changes:
+      // ask the toggle handler, which reloads only a detail whose version is out of date.
+      for(const review of result.querySelectorAll('details[data-review-details][open]'))review.dispatchEvent(new Event('toggle'));
+      patchText(el('[data-ig-count]'),data ? `${filtered.length} matching ${isCi?'runs':'reviews'}${isCi?reportData?' in retained observations':' in the recent pipeline window':data.has_more?` · Showing the latest ${records(data.reviews).length}${Number.isFinite(data.total)?` of ${data.total}`:''} reviews; older records are outside this window`:''}` : '');
+      patchAttr(el('.ig-pages'),'hidden',filtered.length<=pageSize);
+      patchText(el('[data-ig-page]'),`Page ${state.page+1} of ${Math.max(1,Math.ceil(filtered.length/pageSize))}`);
+      patchAttr(el('[data-page="previous"]'),'disabled',state.page===0);patchAttr(el('[data-page="next"]'),'disabled',(state.page+1)*pageSize>=filtered.length);
       if(isCi) {
         const runners=records(data?.agents);
-        const runnersOpen=el('[data-ig-runners]').querySelector('details')?.open;
-        el('[data-ig-runners]').innerHTML=`<details class="ig-runners"><summary>Runner capacity · ${runners.length ? `${runners.length} reported` : 'not available'}</summary>${data?.agents_error ? `<p>${esc(short(data.agents_error,300))}</p>` : ''}${runners.map(r=>`<p>${esc(short(r.name)||'Unnamed runner')} · ${esc(short(r.platform))}${r.capacity!=null ? ` · Capacity ${esc(r.capacity)}` : ''}</p>`).join('') || '<p>The provider has not supplied runner capacity. Repository runs can still be inspected.</p>'}</details>`;
-        if(runnersOpen)el('[data-ig-runners]').querySelector('details').open=true;
+        morph(el('[data-ig-runners]'),`<details class="ig-runners"><summary>Runner capacity · ${runners.length ? `${runners.length} reported` : 'not available'}</summary>${data?.agents_error ? `<p>${esc(short(data.agents_error,300))}</p>` : ''}${runners.map(r=>`<p>${esc(short(r.name)||'Unnamed runner')} · ${esc(short(r.platform))}${r.capacity!=null ? ` · Capacity ${esc(r.capacity)}` : ''}</p>`).join('') || '<p>The provider has not supplied runner capacity. Repository runs can still be inspected.</p>'}</details>`);
       }
     }
-    const inspector=el('.ig-inspector');inspector.hidden=!selected;
+    const inspector=el('.ig-inspector');patchAttr(inspector,'hidden',!selected);
     if(isCi){
-      for(const key of ['health','runs','tests']){el(`#ci-workspace-${key}`).hidden=workspace!==key;const button=el(`[data-ci-workspace="${key}"]`);button.setAttribute('aria-selected',String(workspace===key));button.tabIndex=workspace===key?0:-1;}
+      for(const key of ['health','runs','tests']){patchAttr(el(`#ci-workspace-${key}`),'hidden',workspace!==key);const button=el(`[data-ci-workspace="${key}"]`);patchAttr(button,'aria-selected',String(workspace===key));patchAttr(button,'tabindex',workspace===key?'0':'-1');}
       const target=workspace==='runs'?el('.ig-layout'):el('[data-health-pipeline-slot]');if(target && inspector.parentNode!==target)target.append(inspector);
-      container.dataset.ciFocused=selected?'true':'false';
-      el('.ci-report-filters').hidden=workspace==='health';
-      el('[data-ci-insights]').hidden=false;el('[data-ci-charts]').hidden=false;
+      patchAttr(container,'data-ci-focused',selected?'true':'false');
+      patchAttr(el('.ci-report-filters'),'hidden',workspace==='health');
+      patchAttr(el('[data-ci-insights]'),'hidden',false);patchAttr(el('[data-ci-charts]'),'hidden',false);
     }
     if(selected) {
       const runReports=ciSelectedRunReports(reportData?.reports,ciObservations().pipelines,pipeline);
@@ -332,8 +301,8 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
       const compared=candidates.find(record=>ciRunKey(record)===comparisonKey);
       const comparison=compared?ciComparisonModel(pipeline,{...observedDetails.get(comparisonKey),...compared,tasks:compared.tasks??observedDetails.get(comparisonKey)?.tasks}):null;
       const compareHtml=`<label class="ci-compare-control">Compare observed run<select data-ci-compare aria-label="Compare observed run"><option value="">No comparison</option>${candidates.map(record=>`<option value="${esc(ciRunKey(record))}" ${ciRunKey(record)===comparisonKey?'selected':''}>Run #${esc(record.run_number)} · ${esc(record.state||record.status||'Unknown')} · ${esc(record.branch||'Branch not reported')}</option>`).join('')}</select></label>${comparisonKey&&!compared?'<p class="ig-note">Compared run is no longer in retained observations.</p>':''}${renderCiComparison(comparison)}`;
-      const next=JSON.stringify([collapseSuccess,zoom,compareHtml,testSearch,testPage,runReports,pipeline,detailError,log,logError,step,actionMessage,debugSessions,debugSessionId,debugMessage]);
-      if(detailSignature!==next){detailSignature=next;replace(inspector,'<div class="ig-active-pipeline">'+renderPipeline(pipeline,{loading:true,error:detailError,log,logError,step,actionMessage,debugSessions,debugSessionId,debugMessage,collapseSuccess,zoom})+renderCiRunReports(runReports,{search:testSearch,page:testPage})+'</div><div class="ig-comparison-panel">'+compareHtml+'</div>');healthView?.selectedRun(pipeline);}
+      replace(inspector,'<div class="ig-active-pipeline">'+renderPipeline(pipeline,{loading:true,error:detailError,log,logError,step,actionMessage,debugSessions,debugSessionId,debugMessage,collapseSuccess,zoom})+renderCiRunReports(runReports,{search:testSearch,page:testPage})+'</div><div class="ig-comparison-panel">'+compareHtml+'</div>',()=>inspector.querySelector('[data-close-inspector]'));
+      if(shownPipeline!==pipeline){shownPipeline=pipeline;healthView?.selectedRun(pipeline);}
     }
     tick();
   }
@@ -392,7 +361,7 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
     if(selected?.id===entry.id){el('.ig-inspector').scrollIntoView({block:'nearest',behavior:'smooth'});return;}
     listScroll=window.scrollY;healthOriginKey=document.activeElement?.dataset.healthRun||healthOriginKey;testPage=0;testSearch='';comparisonKey='';cancelDetail();
     selected={id:entry.id,repository:record.repository,providerId:record.provider_repo_id || record.repository,number:record.run_number,providerUrl:JSON.parse(entry.id)[0]};
-    pipeline=selected.providerUrl?record:{...record,can_retry:false,can_cancel:false};debugSessions=null;debugSessionId='';debugMessage='';debugOperationId='';step='';log=null;logError='';detailError='';actionMessage='';detailSignature='';
+    pipeline=selected.providerUrl?record:{...record,can_retry:false,can_cancel:false};debugSessions=null;debugSessionId='';debugMessage='';debugOperationId='';step='';log=null;logError='';detailError='';actionMessage='';
     draw();refreshDetail();el('.ig-inspector').scrollIntoView({block:'nearest',behavior:'smooth'});
   }
   container.addEventListener('click',async event=>{
@@ -409,7 +378,7 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
       const entry=entries().find(e=>e.id===button.dataset.run);if(!entry)return;
       healthView?.setLayout?.('pipeline');openCiRun(entry.record);
     }
-    if(button.hasAttribute('data-close-inspector')){const lastRunId=selected?.id;cancelDetail();selected=null;pipeline=null;healthView?.selectedRun(null);healthView?.setLayout('split');draw();if(isCi && workspace==='health')[...container.querySelectorAll('[data-health-run]')].find(button=>button.dataset.healthRun===healthOriginKey)?.focus({preventScroll:true});window.scrollTo({top:listScroll});if(isCi && workspace==='runs')[...container.querySelectorAll('[data-run]')].find(button=>button.dataset.run===lastRunId)?.focus({preventScroll:true});}
+    if(button.hasAttribute('data-close-inspector')){const lastRunId=selected?.id;cancelDetail();selected=null;pipeline=null;shownPipeline=null;healthView?.selectedRun(null);healthView?.setLayout('split');draw();if(isCi && workspace==='health')[...container.querySelectorAll('[data-health-run]')].find(button=>button.dataset.healthRun===healthOriginKey)?.focus({preventScroll:true});window.scrollTo({top:listScroll});if(isCi && workspace==='runs')[...container.querySelectorAll('[data-run]')].find(button=>button.dataset.run===lastRunId)?.focus({preventScroll:true});}
     if(button.hasAttribute('data-step')){pending.get('log')?.abort();pending.delete('log');step=button.dataset.step;log=null;logError='';draw();refreshDetail();}
     if(button.hasAttribute('data-debug-send') && selected?.providerUrl && debugSessionId && !pending.has('debug')) {
       const target={...selected},sessionId=debugSessionId;

@@ -254,10 +254,11 @@ async function viewGithub() {
 
 async function viewIntegrations(parts) {
   const query = route().query;
-  return ownPolling(mountIntegrations(root, client, {
+  // Keeps its own 5 s poll; live events refresh it (and the CI health map) too.
+  return mountIntegrations(root, client, {
     kind: parts[0], tab: query.get('tab') || 'current', search: query.get('search') || '',
     repository: query.get('repository') || '', provider: query.get('provider') || '', mission: query.get('mission') || '', session: query.get('session') || '',
-  }));
+  });
 }
 
 async function viewMissions() {

@@ -298,3 +298,44 @@ test('Overview: identical refresh writes nothing; one changed agent rewrites onl
  assert.equal(await page.evaluate(()=>document.activeElement.getAttribute('href')),focused,'focus stays on its link');
  assert.equal(await page.locator('.ov-customize').evaluate(d=>d.open),true,'Customize stays open');
 }));
+
+// ---------------------------------------------------------------- Reviews (integrations view)
+const review=(id,extra={})=>({review_id:id,title:`Review ${id}`,kind:'plan',status:'pending',repository:'lab/alpha',updated_at:'2026-01-01T00:00:05Z',...extra});
+function reviewsApi(state){
+ return p=>{
+  if(p==='/api/v1/reviews')return {reviews:structuredClone(state.reviews)};
+  const one=p.match(/^\/api\/v1\/reviews\/(.+)$/);
+  if(one)return {review:{...state.reviews.find(r=>r.review_id===decodeURIComponent(one[1])),plan:'Plan text'}};
+  return {};
+ };
+}
+
+test('Reviews: identical refresh writes nothing; one changed review rewrites only its row; open details, focus and search survive',async()=>withPage(async(page,base)=>{
+ const state={reviews:[review('r1'),review('r2'),review('r3')]};
+ const reads=await boot(page,base,'/reviews',reviewsApi(state));
+ await until(()=>page.locator('[data-entry]').count().then(n=>n===3),'review rows');
+ await page.locator('[data-ig-search]').fill('review');await page.locator('[data-ig-search]').evaluate(e=>e.blur());
+ const first=page.locator('[data-entry]').first();
+ await first.locator('[data-review-details] > summary').click();
+ await first.locator('[data-review-details] > summary').focus();
+ await liveRefresh(page,{event_id:'r0',event_type:'ReviewUpdated'});
+ await page.evaluate(()=>{window.__rows=[...document.querySelectorAll('[data-entry],.ig-group')];});
+
+ const before=reads['/api/v1/reviews'];
+ await observe(page);
+ await liveRefresh(page,{event_id:'r1',event_type:'ReviewUpdated'});
+ assert.ok(reads['/api/v1/reviews']>before,'refresh fetched reviews again');
+ assert.deepEqual(await writes(page),[],'identical refresh performs no DOM writes');
+
+ const target=await page.locator('[data-entry]').nth(2).getAttribute('data-entry');
+ const id=state.reviews.find(r=>target.includes(r.review_id))?.review_id||'r3';
+ state.reviews.find(r=>r.review_id===id).title='Renamed review';
+ await observe(page);
+ await liveRefresh(page,{event_id:'r2',event_type:'ReviewUpdated'});
+ await until(()=>page.locator(`[data-entry="${target}"]`).innerText().then(t=>t.includes('Renamed review')),'changed review');
+ const result=await page.evaluate(()=>({same:[...document.querySelectorAll('[data-entry]')].every(n=>window.__rows.includes(n)),open:document.querySelector('[data-entry] [data-review-details]').open,focus:document.activeElement?.tagName}));
+ assert.equal(result.same,true,'rows keep their nodes');
+ assert.equal(result.open,true,'the open review stays open');
+ assert.equal(result.focus,'SUMMARY','focus stays on the summary');
+ assert.equal(await page.locator('[data-ig-search]').inputValue(),'review','typed search survives');
+}));
