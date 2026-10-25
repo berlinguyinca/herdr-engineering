@@ -46,6 +46,7 @@ _SUMMARY_FIX = re.compile(r"^/api/v1/sessions/[^/]+/summary/fix$")
 _TERMINAL_ATTACH = re.compile(r"^/api/v1/sessions/[^/]+/terminal$")
 _AGENT_POST = re.compile(r"^/api/v1/(?:llm/keys|reviews|llm/keys/[^/]+/revoke"
                         r"|reviews/[^/]+/(?:heartbeat|result|failure)"
+                        r"|architecture/(?:snapshots|analyses|analyses/claim)"
                         # CI fix runner: claim, report state, report result. Never create or cancel.
                         r"|ci/fix/claim|ci/fix/[^/]+/(?:state|result))$")
 # T12: the one POST an ingest key may make besides /api/v1/ingest: acknowledging a steering request addressed to it.
@@ -121,6 +122,8 @@ def _is_loopback(host: str) -> bool:
 _WEB_ROOT = Path(__file__).resolve().parent.parent.parent / "packages"
 _INDEX = "index.html"
 _MAX_JSON_BODY = 4 * 1024 * 1024
+_MAX_ARCHITECTURE_BODY = 64 * 1024 * 1024  # a published graph snapshot; validated by the service
+_ARCHITECTURE_KEYS = frozenset({"enabled", "explain", "cache", "request_ttl_seconds", "agent_hosts"})
 _MAX_SSE_SECONDS = 3600
 _SSE_IDLE_SECONDS = 10  # keep-alive comment cadence while the stream is idle
 
@@ -211,7 +214,8 @@ class ControlPlaneServer:
                  operator_port=None, operator_user=None, operator_email=None,
                  operator_hosts=(), collab_operator_url=None, collab_dashboard_hosts=(),
                  summary_config=None, summary_client=None, usage_retention=None, lineage_key_scopes=None,
-                 review_quorum=None, system_graph: bool = False, attention=None, ci_fix=None, missions=None, github_pg_dsn=None):
+                 review_quorum=None, system_graph: bool = False, attention=None, ci_fix=None, missions=None, github_pg_dsn=None,
+                 architecture_enabled=None, architecture_explain=None, architecture_options=None):
         """
         Auth (Spec §104): either a single `api_key` (all-access) or a mapping
         `api_keys={key: role}` with roles "viewer" (read-only) / "operator"
@@ -369,8 +373,102 @@ class ControlPlaneServer:
         self.gate_service = self.gate_store = self.gate_queue = self.gate_main = None
         self.gate_coordinator = self.gate_reviewer_config = None
         self._start_review_gate(repo, fleet_config)
+        from ..architecture.service import ArchitectureService
+        arch_opts = self._architecture_options(fleet_config, architecture_options)
+        self.architecture = ArchitectureService(
+            repo, enabled=self._architecture_enabled(fleet_config, architecture_enabled),
+            cache_graphs=arch_opts["cache_graphs"], cache_bytes=arch_opts["cache_bytes"],
+            request_ttl=arch_opts["request_ttl"])
+        # control_plane.architecture.agent_hosts: {api key: [host ids]} -> principal id -> allowed host ids.
+        # An agent key listed there may publish / claim / report only for those hosts; an agent key NOT listed
+        # is trusted to name any host_id (keys carry a role only; there is no per-host enrollment).
+        self.architecture_agent_hosts = {}
+        for key, hosts in arch_opts["agent_hosts"].items():
+            if self._keys.get(key) != "agent":
+                raise ValueError("control_plane.architecture.agent_hosts: each entry must name a configured "
+                                 "api key with the agent role")
+            digest = hashlib.sha256(key.encode()).hexdigest()[:12]
+            self.architecture_agent_hosts[f"key:{digest}"] = frozenset(hosts)
+        self.architecture.gate_store_fn = lambda: self.gate_store
+        self._configure_architecture_explain(fleet_config, architecture_explain)
+        if collab is not None:
+            collab.architecture = self.architecture
         # live stream (Spec §52)
         repo.subscribe(self._broadcast)
+
+    @staticmethod
+    def _architecture_enabled(fleet_config, override):
+        """`control_plane.architecture.enabled` in the central fleet config; off unless set."""
+        if override is not None:
+            return bool(override)
+        if fleet_config is None:
+            return False
+        from ..fleet_config import FleetConfigError
+        try:
+            section = fleet_config.current().section("control_plane")
+        except FleetConfigError:
+            return False
+        arch = (section or {}).get("architecture") or {}
+        unknown = set(arch) - _ARCHITECTURE_KEYS
+        if unknown:
+            raise ValueError(f"control_plane.architecture: unknown key(s) {sorted(unknown)}")
+        if not isinstance(arch.get("enabled", False), bool):
+            raise ValueError("control_plane.architecture.enabled must be a boolean")
+        return arch.get("enabled", False)
+
+    @staticmethod
+    def _architecture_options(fleet_config, override):
+        """Validated cache / request-expiry / agent-host settings of `control_plane.architecture` (read once at
+        startup: a change needs a restart). A bad value fails startup with the offending key named."""
+        from ..architecture import service as svc
+        section = {}
+        if fleet_config is not None:
+            from ..fleet_config import FleetConfigError
+            try:
+                section = dict((fleet_config.current().section("control_plane") or {}).get("architecture") or {})
+            except FleetConfigError:
+                section = {}
+        section.update(override or {})
+        unknown = set(section) - _ARCHITECTURE_KEYS
+        if unknown:
+            raise ValueError(f"control_plane.architecture: unknown key(s) {sorted(unknown)}")
+
+        def whole(value, name, low, high):
+            if isinstance(value, bool) or not isinstance(value, int) or not low <= value <= high:
+                raise ValueError(f"control_plane.architecture.{name} must be an integer in [{low}, {high}]")
+            return value
+        cache = section.get("cache") or {}
+        if not isinstance(cache, dict) or set(cache) - {"max_graphs", "max_bytes"}:
+            raise ValueError("control_plane.architecture.cache takes only max_graphs and max_bytes")
+        hosts = section.get("agent_hosts") or {}
+        if not isinstance(hosts, dict) or not all(
+                isinstance(v, list) and v and all(isinstance(h, str) and svc._HOST_ID.fullmatch(h) for h in v)
+                for v in hosts.values()):
+            raise ValueError("control_plane.architecture.agent_hosts must map an api key to a non-empty list of host ids")
+        return {"cache_graphs": whole(cache.get("max_graphs", svc.DEFAULT_CACHE_GRAPHS), "cache.max_graphs", 1, 1000),
+                "cache_bytes": whole(cache.get("max_bytes", svc.DEFAULT_CACHE_BYTES), "cache.max_bytes",
+                                     1024 * 1024, 64 * 1024 ** 3),
+                "request_ttl": whole(section.get("request_ttl_seconds", svc.DEFAULT_REQUEST_TTL),
+                                     "request_ttl_seconds", 60, 7 * 86400),
+                "agent_hosts": {str(k): list(v) for k, v in hosts.items()}}
+
+    def _configure_architecture_explain(self, fleet_config, override):
+        """Optional LLM explanations: only from an explicit, validated `architecture.explain` section."""
+        from ..architecture import explain as ex
+        section = override
+        if section is None and fleet_config is not None:
+            from ..fleet_config import FleetConfigError
+            try:
+                section = ((fleet_config.current().section("control_plane") or {}).get("architecture") or {}).get("explain")
+            except FleetConfigError:
+                section = None
+        cfg = ex.parse_config(section)
+        self.architecture.explain_config = cfg
+        if cfg and cfg.get("api_key_file"):
+            try:
+                self.architecture.explain_key = Path(cfg["api_key_file"]).expanduser().read_text().strip()
+            except OSError as exc:
+                raise ValueError(f"control_plane.architecture.explain.api_key_file is unreadable: {exc.strerror}") from exc
 
     def _external_lineage(self, envelope, principal, valid=None):
         """Ingest one envelope the HCN service built for an external agent. The principal's allowed room is
@@ -489,6 +587,10 @@ class ControlPlaneServer:
         h["capabilities"] = ["mission_activity_v1", "ci_v1", "plannotator_reviews_v1", "github_v1"]
         if self.collab is not None:
             h["capabilities"].append("collab_v1")
+        if self.architecture.enabled:
+            h["capabilities"].append("architecture_v1")
+            if self.architecture.explain_config:
+                h["capabilities"].append("architecture_explain_v1")
         return h
 
     # ------------------------------------------------------- SSE plumbing
@@ -1013,7 +1115,9 @@ def _make_handler(server, public=False, operator=False):
             # prefix test is bypassed by e.g. /api/v1/%72eview-gate/...
             segs = path.split("/")
             res = unquote(segs[3]) if len(segs) > 3 and segs[:3] == ["", "api", "v1"] else ""
-            if res.startswith("reviews") or res == "attention" or (res in {"ci", "review-gate"} and len(segs) > 4) or _SUMMARY_FIX.match(path) or _TERMINAL_ATTACH.match(path) or _STEER_ACK.match(path) or _is_rereview(path):
+            if (res.startswith("reviews") or res == "attention" or res == "architecture"
+                    or (res in {"ci", "review-gate"} and len(segs) > 4) or _SUMMARY_FIX.match(path)
+                    or _TERMINAL_ATTACH.match(path) or _STEER_ACK.match(path) or _is_rereview(path)):
                 origin = self.headers.get("Origin")
                 if origin and (urlsplit(origin).netloc != self.headers.get("Host")
                                or urlsplit(origin).scheme not in {"http", "https"}):
@@ -1356,6 +1460,102 @@ def _make_handler(server, public=False, operator=False):
                 return self._json({"error": "pull request is not escalated"}, 409)
             return self._json(_gate_pr(store.snapshot(key)))
 
+        def _architecture_get(self, parts):
+            """/api/v1/architecture/... — read-only, bounded queries over immutable snapshots."""
+            svc = server.architecture
+            if not svc.enabled:
+                return self._json({"error": "not found"}, 404)
+            q = lambda k: _q(self.path, k) or None  # noqa: E731
+            try:
+                rest = parts[4:]
+                if rest == ["snapshots"]:
+                    return self._json(svc.list_snapshots(q("repository_id"), q("commit_sha"), q("host_id"),
+                                                         q("cursor"), q("limit")))
+                if rest == ["analyses"]:
+                    return self._json(svc.analyses(_qint(self.path, "limit", 50)))
+                if len(rest) == 2 and rest[0] == "analyses":
+                    return self._json(svc.analyses(analysis_id=rest[1]))
+                if len(rest) == 3 and rest[0] == "sessions" and rest[2] == "changes":
+                    return self._json(svc.session_changes(rest[1], _qint(self.path, "limit", 200)))
+                if rest == ["timeline"]:
+                    return self._json(svc.timeline(q("repository_id") or "", _qint(self.path, "limit", 200)))
+                if rest == ["cross-repo"]:
+                    qs = parse_qs(urlsplit(self.path).query)
+                    maps = []
+                    for item in qs.get("map", [])[:50]:
+                        bits = item.split("|")
+                        if len(bits) != 3:
+                            raise ValueError("map must be importer|package|provider")
+                        maps.append(dict(zip(("importer", "package", "provider"), bits)))
+                    return self._json(svc.cross_repo(qs.get("snapshot", [])[:20], maps))
+                if rest == ["diff"]:
+                    if not (q("base") and q("head")):
+                        raise ValueError("base and head are required")
+                    return self._json(svc.diff(q("base"), q("head"), q("cursor"), q("limit")))
+                if len(rest) >= 2 and rest[0] == "snapshots":
+                    sid, tail = rest[1], rest[2:]
+                    if not tail:
+                        return self._json(svc.get_snapshot(sid))
+                    if tail == ["children"]:
+                        return self._json(svc.children(sid, q("parent"), q("cursor"), q("limit")))
+                    if tail == ["overlays"]:
+                        return self._json(svc.overlays(sid))
+                    if tail == ["correlations"]:
+                        return self._json(svc.correlations(sid, q("node"), q("cursor"), q("limit")))
+                    if tail == ["nodes"]:
+                        return self._json(svc.search(sid, q("q") or "", q("kind"), q("cursor"), q("limit")))
+                    if len(tail) == 2 and tail[0] == "nodes":
+                        return self._json(svc.node(sid, tail[1]))
+                    if len(tail) == 3 and tail[0] == "nodes" and tail[2] == "rooms":
+                        if tail[1] not in svc._load(sid).nodes:
+                            raise KeyError(tail[1])
+                        return self._json(svc.node_rooms(sid, tail[1], reveal=self._role() == "operator"))
+                    if len(tail) == 3 and tail[0] == "nodes" and tail[2] == "edges":
+                        return self._json(svc.expand(sid, tail[1], q("direction") or "both", q("kind"),
+                                                     q("cursor"), q("limit")))
+            except KeyError:
+                return self._json({"error": "not found"}, 404)
+            except Exception as exc:
+                from ..architecture.service import ArchitectureError
+                if isinstance(exc, ArchitectureError):
+                    return self._json({"error": str(exc)}, exc.status)
+                raise
+            return self._json({"error": "not found"}, 404)
+
+        def _architecture_post(self, parts):
+            svc = server.architecture
+            if not svc.enabled:
+                return self._json({"error": "not found"}, 404)
+            from ..architecture.service import ArchitectureError
+            # An agent key bound in control_plane.architecture.agent_hosts acts only for its hosts.
+            hosts = (server.architecture_agent_hosts.get(self._principal()["id"])
+                     if self._role() == "agent" else None)
+            try:
+                body = self._read_json(_MAX_ARCHITECTURE_BODY) or {}
+                if parts[4:] == ["snapshots"]:
+                    out = svc.publish(body, allowed_hosts=hosts)
+                    return self._json(out, 200 if out["duplicate"] else 201)
+                if parts[4:] == ["analyses"]:
+                    return self._json(svc.record_analysis(body, allowed_hosts=hosts), 201)
+                if len(parts) == 9 and parts[4] == "snapshots" and parts[6] == "nodes" and parts[8] == "explain":
+                    return self._json(svc.explain(parts[5], parts[7]))
+                if parts[4:] == ["analyses", "claim"]:
+                    return self._json(svc.claim_analysis(body, allowed_hosts=hosts))
+                if len(parts) == 7 and parts[4] == "analyses" and parts[6] == "cancel":
+                    if self._role() != "operator":
+                        return self._json({"error": "operator role required"}, 403)
+                    return self._json(svc.cancel_analysis(parts[5]))
+                if parts[4:] == ["analyses", "request"]:
+                    if self._role() not in ("operator",):
+                        return self._json({"error": "operator role required"}, 403)
+                    out = svc.request_analysis(body)
+                    return self._json(out, 200 if out["deduplicated"] else 201)
+            except ArchitectureError as exc:
+                return self._json({"error": str(exc)}, exc.status)
+            except KeyError:
+                return self._json({"error": "not found"}, 404)
+            return self._json({"error": "not found"}, 404)
+
         def _reviewer_body(self, cap, fields):
             """Read a reviewer route's JSON object body: ``(body, None)`` or ``(None, (status, error))``.
 
@@ -1447,6 +1647,8 @@ def _make_handler(server, public=False, operator=False):
             r = server.repo
             if resource == "health":
                 return self._json(server._health())
+            if resource == "architecture":
+                return self._architecture_get(parts)
             if resource == "mission-activity" and len(parts) == 4:
                 return self._json({"activities": r.mission_activity.list_summaries(),
                                    "server_time": r._stamp()})
@@ -1717,6 +1919,8 @@ def _make_handler(server, public=False, operator=False):
                 if r.get_session(parts[4]) is None and not r.inspector.has_session(parts[4]):
                     return self._json({"error": "session not found"}, 404)
                 return self._inspector_set_prefs(parts[4])
+            if resource == "architecture":
+                return self._architecture_post(parts)
             # artifact upload carries raw bytes, not JSON — handle first
             if resource == "artifacts" and len(parts) == 4:
                 return self._upload_artifact(r, parts)
@@ -2242,12 +2446,12 @@ def _make_handler(server, public=False, operator=False):
             return self._json({"error": "not found"}, 404)
 
         # ---------------------------------------------------------- helpers
-        def _read_json(self):
+        def _read_json(self, limit=_MAX_JSON_BODY):
             try:
                 length = int(self.headers.get("Content-Length") or 0)
                 if not length:
                     return None
-                if length > _MAX_JSON_BODY:
+                if length > limit:
                     raise ValueError("request body too large")
                 try:
                     return json.loads(self.rfile.read(length))

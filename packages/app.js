@@ -18,6 +18,8 @@ import { mountIntegrations } from './integrations-view.js';
 import { mountGithub } from './github-view.js';
 import { mountReviewGate } from './review-gate-view.js';
 import { mountTopology } from './topology-view.js';
+import { mountArchitecture } from './architecture-view.js';
+import { visibleNav } from './nav-capabilities.js';
 import { mountSessionsView, sessionEntries } from './sessions-view.js';
 import { recordOutcome, statusOutcome } from './record-state.js';
 import { RANGES, safeHostId } from './host-view.js';
@@ -63,6 +65,7 @@ const NAV = [
   { path: '/overview', label: 'Overview' },
   { path: '/attention', label: 'Attention' },
   { path: '/topology', label: 'Topology' },
+  { path: '/architecture', label: 'Architecture', capability: 'architecture_v1' },
   { path: '/missions', label: 'Missions' },
   { path: '/herd', label: 'Agents' },
   { path: '/services', label: 'Services' },
@@ -80,7 +83,13 @@ const NAV = [
 ];
 
 const SHELL = document.getElementById('shell');
-SHELL.setAttribute('routes', JSON.stringify(NAV));
+SHELL.setAttribute('routes', JSON.stringify(visibleNav(NAV, [])));
+// Optional tabs appear once /api/v1/health advertises their capability; a failed probe keeps them hidden.
+// Re-set only when the list changes: every set re-renders the shell's nav.
+client.health().then((h) => {
+  const routes = JSON.stringify(visibleNav(NAV, h?.capabilities));
+  if (routes !== SHELL.getAttribute('routes')) SHELL.setAttribute('routes', routes);
+}).catch(() => { /* optional tabs stay hidden */ });
 SHELL.setAttribute('brand', 'HerdR Dev Fabric');
 
 // The nav badge follows the server inbox on every page, so a new critical item is visible from anywhere.
@@ -121,6 +130,7 @@ const ROUTES = {
   '/reviews': viewIntegrations,
   '/review-gate': viewReviewGate,
   '/topology': viewTopology,
+  '/architecture': viewArchitecture,
   '/missions': viewMissions,
   '/missions/:id': viewMission,
   '/herd': viewSessions,
@@ -235,6 +245,11 @@ async function render() {
 // ------------------------------------------------------------- topology
 async function viewTopology() {
   return ownPolling(mountTopology(root, client, {status: route().query.get('status') || 'current'}));
+}
+
+async function viewArchitecture() {
+  const q = route().query;
+  return ownPolling(mountArchitecture(root, client, {snapshot: q.get('snapshot') || '', parent: q.get('parent') || '', q: q.get('q') || ''}));
 }
 
 async function viewOverview() {

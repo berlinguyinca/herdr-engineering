@@ -169,6 +169,9 @@ class IngestService:
         # Checked first, and as well as the allow-list so a future allow-list entry can never open a reserved prefix.
         if entity_type.strip().lower().startswith(RESERVED_ENTITY_PREFIXES):
             raise ValueError("reserved review-gate entity type is not accepted by generic ingestion")
+        # Architecture snapshots are published through their validating route only.
+        if entity_type.strip().lower().startswith("architecture"):
+            raise ValueError("reserved architecture entity type is not accepted by generic ingestion")
         # T16 H1/M1/M5: an ALLOW-LIST. Everything else (collab, ci_*, plannotator_review, agent_identity,
         # token_usage, ...) is owned by a dedicated, authenticated adapter and can never be written here.
         if entity_type not in INGEST_ENTITY_TYPES:

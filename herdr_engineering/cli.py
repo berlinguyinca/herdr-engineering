@@ -493,6 +493,9 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--host", default=None); p.add_argument("--port", type=int, default=None)
     p.set_defaults(func=_cmd_web)
 
+    from .architecture import command as _architecture_command
+    _architecture_command.register(sub)
+
     # control-plane --------------------------------------------------------
     p = sub.add_parser("control-plane",
                        help="HerdR Dev Fabric Control Plane (spec 0190)")
@@ -2837,7 +2840,7 @@ STARTUP_ONLY_COLLAB_KEYS = frozenset(COLLAB_CONFIG_KEYS) - frozenset(HOT_COLLAB_
 
 
 # control_plane keys read ONCE at startup: editing them needs a restart (unlike HOT_COLLAB_SWITCHES)
-RESTART_REQUIRED_KEYS = ("review_quorum", "lineage_key_scopes", "api_keys", "ci_actions", "pg_dsn")
+RESTART_REQUIRED_KEYS = ("review_quorum", "lineage_key_scopes", "api_keys", "ci_actions", "pg_dsn", "architecture")
 
 
 def _wire_collab_switches(collab, store, pinned=frozenset()) -> None:

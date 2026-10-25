@@ -3478,6 +3478,39 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin):
 
     FLOW_TASKS = 60
 
+    # -- architecture annotations: a room discusses a stable graph entity of an immutable snapshot
+    architecture = None          # set by ControlPlaneServer: the ArchitectureService that stores the links
+
+    def architecture_links(self, pr: Principal, room_id: str) -> dict:
+        """Members read the annotations; a guest sees only the notes, never which symbol or snapshot."""
+        with self._lock:
+            room, _ = self._authorize(pr, room_id, "read", "architecture.links")
+            if self.architecture is None or not self.architecture.enabled:
+                raise CollabError(404, "not found")
+            guest = not pr.is_agent and (self._member(room, pr.id) or {}).get("role") == "guest"
+        # Resolving the linked nodes may read graph artifacts: never under the collaboration-wide lock.
+        return self.architecture.room_links(room_id, redact=guest)
+
+    def link_architecture(self, pr: Principal, room_id: str, body: dict) -> dict:
+        """Annotate a node of a snapshot of one of the room's repositories (those of its linked missions'
+        sessions). Authorise under the lock, resolve the target without it, re-authorise and record."""
+        with self._lock:
+            self._authorize(pr, room_id, "post", "architecture.link")
+            if self.architecture is None or not self.architecture.enabled:
+                raise CollabError(404, "not found")
+            mission_ids = [mid for (rid, mid) in self._missions if rid == room_id]
+        from ..architecture.service import ArchitectureError
+        arch = self.architecture
+        try:
+            prepared = arch.prepare_room_link(body, arch.room_repositories(mission_ids))
+            with self._lock:
+                self._authorize(pr, room_id, "post", "architecture.link")   # membership may have changed meanwhile
+                return arch.record_room_link(room_id, prepared, author=pr.id)
+        except ArchitectureError as exc:
+            raise CollabError(exc.status if exc.status in (400, 404, 409, 413) else 400, str(exc)) from exc
+        except KeyError:
+            raise CollabError(404, "snapshot or node not found") from None
+
     def room_flow(self, pr: Principal, room_id: str) -> dict:
         """Who hands work to whom in this room, for the live flow view: people and agents as nodes,
         tasks aggregated into edges. A fabric session id (instance_id) is only ever shown to the
@@ -5221,6 +5254,8 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin):
                         return 200, self.list_workspace_links(pr, rid)
                     if parts[2:] == ["missions"]:
                         return 200, self.list_room_missions(pr, rid)
+                    if parts[2:] == ["architecture-links"]:
+                        return 200, self.architecture_links(pr, rid)
                     if parts[2:] == ["state"]:
                         wait = _int(query, "wait", 0, 0, 10)
                         return 200, self.room_state(pr, rid, _int(query, "since", -1, -1),
@@ -5385,6 +5420,8 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin):
                         return 200, self.decide_proposal(pr, rid, parts[3], body)
                     if n == 5 and parts[2] == "tasks" and parts[4] == "cancel":
                         return 200, self.cancel_task(pr, rid, parts[3])
+                    if parts[2:] == ["architecture-links"]:
+                        return 201, self.link_architecture(pr, rid, body)
                     if parts[2:] == ["messages"]:
                         return self.post_message(pr, rid, body)
             raise CollabError(404, "not found")
