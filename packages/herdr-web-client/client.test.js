@@ -14,9 +14,33 @@ test('agent summary and rename requests preserve encoded identity and version', 
   await client.getAgentSummary('a:b');
   await client.regenerateAgentSummary('a:b');
   await client.renameAgent('a:b', 'Ada', 2);
-  assert.deepEqual(calls.map(c => c.url), ['/api/v1/sessions/a%3Ab/summary', '/api/v1/sessions/a%3Ab/summary', '/api/v1/sessions/a%3Ab/name']);
+  await client.fixSummaryItem('a:b', 'blockers', 1, 'CI is red');
+  assert.deepEqual(calls.map(c => c.url), ['/api/v1/sessions/a%3Ab/summary', '/api/v1/sessions/a%3Ab/summary', '/api/v1/sessions/a%3Ab/name', '/api/v1/sessions/a%3Ab/summary/fix']);
   assert.equal(calls[1].method, 'POST');
   assert.deepEqual(calls[2].body, { name: 'Ada', expected_version: 2 });
+  assert.equal(calls[3].method, 'POST');
+  assert.deepEqual(calls[3].body, { list: 'blockers', index: 1, text: 'CI is red' });
+});
+
+test('debugCi sends mode only for a fix request', async () => {
+  const bodies = [];
+  const client = new HerdrClient('', { fetchImpl: async (url, opts) => {
+    bodies.push(JSON.parse(opts.body));
+    return { ok: true, status: 200, text: async () => '{}' };
+  } });
+  await client.debugCi('17', 12, 's', 'op1');
+  await client.debugCi('17', 12, 's', 'op2', { mode: 'fix', providerUrl: 'https://ci.example' });
+  await client.debugCi('17', 12, 's', 'op3', { mode: 'other' });
+  assert.deepEqual(bodies[0], { repository: '17', number: 12, session_id: 's', operation_id: 'op1' });
+  assert.deepEqual(bodies[1], { repository: '17', number: 12, session_id: 's', operation_id: 'op2', provider_url: 'https://ci.example', mode: 'fix' });
+  assert.equal('mode' in bodies[2], false);
+});
+
+test('related encodes the kind and id into the query', async () => {
+  const urls = [];
+  const client = new HerdrClient('', { fetchImpl: async (url) => { urls.push(url); return { ok: true, status: 200, text: async () => '{}' }; } });
+  await client.related('session', 'herdr:b:e:p 1&x');
+  assert.equal(urls[0], '/api/v1/related?kind=session&id=herdr%3Ab%3Ae%3Ap+1%26x');
 });
 
 function fakeFetch(routes) {
@@ -117,6 +141,51 @@ test('connectEvents dispatches parsed events and disconnects cleanly', () => {
   assert.deepEqual(seen, [{ event_type: 'MissionCreated' }]);
   disconnect();
   assert.equal(fakeES.closed, true);
+});
+
+test('connectEvents swallows StreamConnected and replayed event_ids', () => {
+  const seen = [];
+  const fakeES = { onmessage: null, onerror: null, close() {} };
+  connectEvents({
+    url: '/events',
+    onEvent: (e) => seen.push(e),
+    createEventSource: () => fakeES,
+    autoReconnectMs: 0,
+  });
+  const send = (o) => fakeES.onmessage({ data: JSON.stringify(o) });
+  send({ event_type: 'StreamConnected', entity_type: 'stream', entity_id: 'control-plane', sequence: 0 });
+  send({ event_type: 'A', event_id: 'e1' });
+  send({ event_type: 'A', event_id: 'e1' }); // replay after reconnect
+  send({ event_type: 'B', event_id: 'e2' });
+  assert.deepEqual(seen.map((e) => e.event_id), ['e1', 'e2']);
+});
+
+test('connectEvents does not filter on sequence (sequences restart after a server restart)', () => {
+  const seen = [];
+  const fakeES = { onmessage: null, onerror: null, close() {} };
+  connectEvents({
+    url: '/events', onEvent: (e) => seen.push(e),
+    createEventSource: () => fakeES, autoReconnectMs: 0,
+  });
+  const send = (seq, eid) => fakeES.onmessage({
+    data: JSON.stringify({ event_type: 'X', event_id: eid, entity_type: 'mission', entity_id: 'm1', sequence: seq }),
+  });
+  send(5, 'a'); send(1, 'b'); send(1, 'b');
+  assert.deepEqual(seen.map((e) => e.event_id), ['a', 'b']);
+});
+
+test('connectEvents seen-set is bounded to 500 event_ids', () => {
+  const seen = [];
+  const fakeES = { onmessage: null, onerror: null, close() {} };
+  connectEvents({
+    url: '/events', onEvent: (e) => seen.push(e),
+    createEventSource: () => fakeES, autoReconnectMs: 0,
+  });
+  const send = (id) => fakeES.onmessage({ data: JSON.stringify({ event_type: 'A', event_id: id }) });
+  for (let i = 0; i < 600; i++) send(`e${i}`);
+  send('e599'); // recent: still deduped
+  send('e0');   // evicted: forwarded again
+  assert.equal(seen.length, 601);
 });
 
 test('getCi requests /api/v1/ci', async () => {
@@ -282,4 +351,17 @@ test('CI performance uses bounded-window viewer GET filters and forwards cancell
   assert.equal(calls[0].url,'/api/v1/ci/performance?days=7&repository=org%2Fapp&branch=feature+%26+cache');
   assert.equal(calls[0].options.method,'GET');assert.equal(calls[0].options.signal,controller.signal);
   await client.getCiPerformance();assert.equal(calls[1].url,'/api/v1/ci/performance?days=14');
+});
+
+test('CI reads and mutations bind the expected provider URL without changing legacy requests',async()=>{
+ const calls=[];
+ const client=new HerdrClient('',{fetchImpl:async(url,opts)=>{calls.push({url,opts});return {ok:true,status:200,text:async()=>'{}'};}});
+ const providerUrl='https://ci.example/secondary';
+ await client.getCiPipeline('17',12,{providerUrl});
+ await client.getCiLog('17',12,'4',{providerUrl});
+ await client.ciAction('17',12,'retry',{providerUrl});
+ await client.ciAction('17',12,'cancel',{providerUrl});
+ await client.debugCi('17',12,'session','op',{providerUrl});
+ for(const call of calls.slice(0,2))assert.equal(new URL(call.url,'http://test').searchParams.get('provider_url'),providerUrl);
+ for(const call of calls.slice(2))assert.equal(JSON.parse(call.opts.body).provider_url,providerUrl);
 });

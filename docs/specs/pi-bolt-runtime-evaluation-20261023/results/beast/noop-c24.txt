@@ -1,0 +1,5 @@
+standard-pi  ok=72/72 wall_ms med=16248 p95=22917 ci95=[14703,17973] cpu_s med=0.760 rss_MiB med=122 start=976/1194 prep=10844/17348 ttft=4224/8626 exit=123/187
+pi-bolt      ok=72/72 wall_ms med=15073 p95=22431 ci95=[13040,16665] cpu_s med=0.076 rss_MiB med=110 start=102/154 prep=9828/17787 ttft=4215/8903 exit=4/13
+  wall vs standard-pi: not clearly different
+pi-bolt-jit  ok=72/72 wall_ms med=17821 p95=26104 ci95=[16208,19239] cpu_s med=0.084 rss_MiB med=110 start=104/181 prep=13075/23683 ttft=4068/13176 exit=5/8
+  wall vs standard-pi: not clearly different

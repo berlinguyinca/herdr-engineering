@@ -171,3 +171,53 @@ def test_the_startup_path_alone_quarantines_forgeries_on_real_postgres_without_t
         assert repo.collab_quarantine and not any(r.get("source") for r in repo.collab_quarantine)
     finally:
         srv.shutdown()
+
+
+def test_repair_on_a_database_without_the_envelope_columns_says_to_migrate_first(pg):
+    from herdr_engineering.control_plane.collab_repair import SchemaTooOldError
+
+    async def make(conn):
+        await conn.execute("DROP DATABASE IF EXISTS old_schema")
+        await conn.execute("CREATE DATABASE old_schema")
+    admin = pg.dsn.replace("/" + pg.db + "?", "/postgres?")
+    _run(admin, make)
+    old = pg.dsn.replace("/" + pg.db + "?", "/old_schema?")
+
+    async def table(conn):
+        await conn.execute("CREATE TABLE fabric_events (event_id text, entity_type text, entity_id text, "
+                           "sequence bigint, event_type text, payload jsonb, ingest_timestamp timestamptz)")
+    _run(old, table)
+    for kw in ({}, {"apply": True, "confirmed": True}):
+        with pytest.raises(SchemaTooOldError, match="migrate"):
+            _run(old, lambda conn, kw=kw: repair_postgres(conn, **kw))
+
+    async def none(conn):
+        await conn.execute("DROP TABLE fabric_events")
+    _run(old, none)
+    with pytest.raises(SchemaTooOldError, match="migrate"):
+        _run(old, lambda conn: repair_postgres(conn))
+
+
+def test_apply_locks_the_table_against_writers_for_its_transaction(pg):
+    """A concurrent INSERT must wait until the repair's transaction ends (SHARE ROW EXCLUSIVE conflicts with writers)."""
+    dsn = pg.dsn
+
+    async def go():
+        a, b = await asyncpg.connect(dsn), await asyncpg.connect(dsn)
+        try:
+            await a.execute("TRUNCATE fabric_events")
+            tx = a.transaction()
+            await tx.start()
+            await a.execute("LOCK TABLE fabric_events IN SHARE ROW EXCLUSIVE MODE")
+            blocked = asyncio.ensure_future(b.execute(
+                "INSERT INTO fabric_events (event_id, entity_type, entity_id, sequence, event_type, payload, "
+                "source_timestamp, ingest_timestamp) VALUES ('w1','x','y',0,'t','{}', now(), now())"))
+            await asyncio.sleep(0.5)
+            waited = not blocked.done()
+            await tx.commit()
+            await asyncio.wait_for(blocked, 5)
+            return waited
+        finally:
+            await a.close()
+            await b.close()
+    assert asyncio.run(go()) is True

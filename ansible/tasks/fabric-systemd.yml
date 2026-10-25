@@ -58,14 +58,6 @@
         mode: "0750"
       when: herdr_eng_resolve.stdout | trim != 'not-found'
 
-    - name: "Write fabric gateway URL env file (only if absent; never overwrites)"
-      ansible.builtin.copy:
-        dest: "{{ fleet_home }}/.config/herdr-engineering/fabric.env"
-        content: "HERDR_ENGINEERING_FABRIC_URL={{ fabric_agent_gateway_url }}\n"
-        force: false
-        mode: "0600"
-      when: herdr_eng_resolve.stdout | trim != 'not-found'
-
     - name: "Install fabric enroll-sync systemd user unit"
       ansible.builtin.template:
         src: herdr-eng-fabric-enroll-sync.service.j2

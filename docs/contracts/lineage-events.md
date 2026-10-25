@@ -904,15 +904,19 @@ Fixes for the T16 security audit. Each has a regression test in `tests/control_p
   run reports `contiguous` and lists the rows only that flag would move under `gap_tail` (with the flag to use) instead of reporting nothing.
   **File mode refuses to rewrite a log a server may still be appending to:** `FileEventLog` holds a shared `flock` for its whole life, the repair
   needs it exclusively and also refuses when any other process has the file open (/proc scan, which finds servers older than the lock). Stop
-  the server, repair, start it. **Postgres mode** locks the table against writers for one short transaction, plans inside it, and moves rows by
-  `ctid` bound as (block, offset) tuples; it is covered by a test against a real throwaway PostgreSQL (`test_t16_collab_repair_postgres.py`;
+  the server, repair, start it. **Locking** (`logfile_lock.py`): both sides open the log read-write and re-check after locking that the path still names the locked file.
+  Where `flock` is unsupported (ENOLCK/ENOSYS/EOPNOTSUPP/EBADF on some NFS/FUSE mounts) a cooperative `<log>.lock` pid file takes over with an
+  ERROR log line; if even that cannot be created the server still starts (ERROR: not protected) and the repair refuses ("supports no lock").
+  **Postgres mode** locks the table against writers for one short transaction, plans inside it, and moves rows by
+  `ctid` bound as (block, offset) tuples; on a database without migration 0003 it stops with "run migrate first"; it is covered by a test against a real throwaway PostgreSQL (`test_t16_collab_repair_postgres.py`;
   skipped only if no server binaries are installed). A forger who copied the payload shape AND the log's own sequence beyond its real end
   is caught by the timestamp rule; the allow-list closes new cases.
 * **A full log still revokes (H2).** `max_log_events` is protected by *pre-paid revocation*. Creating something revocable (member, agent, agent
   grant, join token, cross link, workspace link, mission link) is admitted only while `len(log) + outstanding + 2 <= 95 %`, where `outstanding`
-  is the number of revocable things that exist in state right now (members, grants, active agents, usable join tokens, active cross links,
-  workspace and mission links), recomputed from state so it can never drift: a repeated revocation, a re-grant, a lapsed guest or a used-up
-  token cannot over- or under-count it; every other ordinary write needs `len(log) + outstanding + 1 <= 90 %` (chat, comments, audit noise,
+  is the number of things that can still emit a revocation event right now (members INCLUDING expired guests, grants, active agents, every
+  unrevoked join token INCLUDING used-up or expired ones, active cross links, workspace and mission links), recomputed from state so it can
+  never drift: a repeated revocation or a re-grant cannot over- or under-count it, and revoking a used-up token or removing an expired guest
+  was pre-paid; every other ordinary write needs `len(log) + outstanding + 1 <= 90 %` (chat, comments, audit noise,
   presence) or `95 %` (the rest). So every revocation is an event its creation already reserved, and create-then-revoke cycles cannot consume
   the reserve. `SAFETY_EVENTS` (member/agent/grant/join-token/cross-link/workspace/mission revocation, user decision) may use the log up to 100 %.
   Self-triggerable or self-firing events are *not* safety events: credential rotation, cancelling a consultation/request/invite, steering
@@ -922,11 +926,22 @@ Fixes for the T16 security audit. Each has a regression test in `tests/control_p
 * **A revocation is a state change, not a button (H2).** Every safety-event emitter checks that there is something left to revoke:
   `revoke_agent`, `external_leave`, `revoke_external`, the join-token revokes, `remove_member`, `remove_agent_from_room`, unlinking and
   `user_decided` answer idempotently (or 404/409) without committing a second event, so a safety event cannot be repeated to fill the log.
+* **Helpers and host access are covered too (round 5).** `helpers_paused` (a PAUSE; resuming is an ordinary write), `helper_cancelled` and
+  `egress_removed` are safety events; `helper_requested`, an approved `egress_decided`, `egress_promoted` and every new permanent host in
+  `room_profile_set` pre-pay their revocation (live helpers and distinct (room, host) entries are counted from state). A repeated pause or a
+  Remove of a host that is not listed commits nothing. If a helper's `helper_cancelled` row is refused, its agent is still revoked.
+* **Degraded means no side effects.** When the durable collab log fails its replay, the partial state (events before the gap) never drives a
+  write: the link flush/sweep, link (un)publishing and housekeeping do nothing, and any well-formed agent id the partial state does not know is
+  treated as an external agent's reserved namespace (an external agent enrolled after the gap stays protected).
 * **`since_join` applies to every read (M2, L2).** Node, edge, neighbourhood and listing reads and the insights snapshot hide the event id,
   admission time and removal reason of any event admitted before the reader joined. The horizon of an event is the reader's join time in the room
   that SCOPES that event (never the room the caller names in `room_id`); an event with no room, or written from a room the reader has no join time for (a mission shared with the reader's room), uses the reader's
   latest join; no join time at all, an unknown or evicted event id, or an id shared with an earlier event is pre-join (fail closed). An
   edge removed before the reader joined is dropped altogether (`include_removed` shows no endpoints or writer; the edge read answers 404).
+  **Memory cap.** The admission time per event id is kept in memory for the life of the process, at most `FIRST_TS_MAX` = 1,000,000 ids
+  (graph.py; roughly 150-250 MB at the cap). Past it the OLDEST ids are evicted first, and an evicted id is pre-join for every since_join reader:
+  the degradation is fail closed (old events lose their id, admission time and removal reason, and an old removed edge disappears, even for a
+  member who joined before them), never a leak of pre-join history. A restart rebuilds the map from the replayed ledger, under the same cap.
 * **Switches are uniform (M3, M15).** `steering`, `contextual`, `insights`, `delegation_enabled` and `replay_history` are all read per request through
   `FleetConfigStore.secure_section`, also under `web --collab-only`. A missing, unparseable, group/other-accessible or invalid file means the feature
   is OFF (`replay_history`: the stricter `since_join`). `config_failure_mode: last_good` is the one opt-in to the last good value. An explicit

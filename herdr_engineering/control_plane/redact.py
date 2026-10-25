@@ -14,8 +14,12 @@ _PATTERNS = [
     # OpenAI-style keys: sk-... (not inside a longer word: "task-s6lease", "disk-image-1" are ids, not keys; found
     # by the T16 acceptance run, which saw a task id stored as "ta[REDACTED]")
     re.compile(r"(?<![A-Za-z0-9])sk-[A-Za-z0-9\-_]{3,}"),
-    # AWS access key id (and the temporary ASIA form)
-    re.compile(r"(?<![A-Za-z0-9])(?:AKIA|ASIA)[0-9A-Z]{16}"),
+    # ... but a key-length run is a key wherever it sits: right after an ANSI colour code ("\x1b[32msk-...", the "m" is a word
+    # character) or a URL-encoded "=" ("api_key%3Dsk-..."), which CI logs routinely contain. Ids such as "task-sk-ab" are
+    # far shorter than 20 characters after "sk-" and stay untouched.
+    re.compile(r"sk-[A-Za-z0-9_\-]{20,}"),
+    # AWS access key id (and the temporary ASIA form), wherever it sits
+    re.compile(r"(?:AKIA|ASIA)[0-9A-Z]{16}"),
     # AWS secret access key: 40 base64 characters after an aws secret label
     re.compile(r"(?i)aws[_\- ]?secret[_\- ]?(?:access[_\- ]?)?key[\"']?\s*[:=]?\s*[\"']?[A-Za-z0-9/+=]{30,}"),
     # GitHub tokens (classic, fine-grained, OAuth, app, refresh) and Slack tokens
@@ -116,3 +120,36 @@ def redact_payload(payload: Any, *, _seen=None) -> Any:
     if isinstance(payload, tuple):
         return tuple(redact_payload(item, _seen=_seen) for item in payload)
     return payload
+
+
+def redact_values(payload: Any) -> Any:
+    """Like ``redact_payload`` but never by key name: only string values are scanned."""
+    if isinstance(payload, str):
+        return redact_text(payload)
+    if isinstance(payload, dict):
+        return {key: redact_values(value) for key, value in payload.items()}
+    if isinstance(payload, (list, tuple)):
+        return type(payload)(redact_values(item) for item in payload)
+    return payload
+
+
+#: Host state keys whose dict KEYS are data (package / extension / unit names),
+#: so key-name redaction would turn e.g. a pi extension ``auth-helper`` into
+#: "[REDACTED]" and report permanent version drift. Their values are still scanned.
+HOST_STATE_VALUE_ONLY = ("versions", "pins", "updates", "fleet_update")
+
+
+def redact_ingest_body(body: Any) -> Any:
+    """Redaction for a generic ``/api/v1/ingest`` envelope (see ``HOST_STATE_VALUE_ONLY``)."""
+    if not (isinstance(body, dict) and body.get("entity_type") == "host"
+            and isinstance(body.get("payload"), dict)):
+        return redact_payload(body)
+    payload = body["payload"]
+    rest = {k: v for k, v in body.items() if k != "payload"}
+    out = redact_payload(rest)
+    out["payload"] = redact_payload(
+        {k: v for k, v in payload.items() if k not in HOST_STATE_VALUE_ONLY})
+    for key in HOST_STATE_VALUE_ONLY:
+        if key in payload:
+            out["payload"][key] = redact_values(payload[key])
+    return out

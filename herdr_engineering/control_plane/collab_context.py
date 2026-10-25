@@ -758,6 +758,8 @@ class ContextMixin:
         """Tombstone links whose authorization lapsed (a workspace unlinked or its grants dropped, the creator removed).
         Hidden from readers meanwhile by the graph's own endpoint checks; this makes the revocation durable so a later
         re-link of the workspace does not silently resurrect what nobody re-authorized."""
+        if self.degraded:                       # partial state after a failed replay: never act on it
+            return
         with self._lock:
             lapsed = [i for i in self._xlinks_by_room.get(room_id, ())
                       if self._xlinks[i]["state"] == "active" and not self._xlink_valid(self._xlinks[i])]
@@ -780,7 +782,13 @@ class ContextMixin:
     def maintain(self) -> None:
         """Flush what the lineage graph has not yet been told (publish a missed link, retract a revoked one). The
         pending set is derived from the durable link records, so it survives a restart; callers: server start, a
-        periodic loop, and every lineage read (rate limited)."""
+        periodic loop, and every lineage read (rate limited).
+
+        Nothing while collaboration is degraded: a failed replay leaves the state of events 1..k, so a link whose
+        revocation came after the gap looks active and unpublished, and publishing it would put an edge into the
+        fabric graph that the (refused) log can never record or retract."""
+        if self.degraded:
+            return
         with self._lock:
             now = self._now()
             if now - getattr(self, "_xlink_flush_at", 0.0) < 5.0:
@@ -846,6 +854,8 @@ class ContextMixin:
             "payload": payload, "visibility_scope": "room", "room_id": r["room_id"]}, principal, None)
 
     def _xlink_publish(self, link_id: str) -> bool:
+        if self.degraded:                       # see maintain(): no lineage side effects from a partial state
+            return False
         with self._lock:
             r = self._xlinks.get(link_id)
             if r is None or r["state"] != "active" or r["published"] or self.lineage_sink is None:
@@ -868,6 +878,8 @@ class ContextMixin:
         return True
 
     def _xlink_unpublish(self, link_id: str) -> bool:
+        if self.degraded:
+            return False
         with self._lock:
             r = self._xlinks.get(link_id)
             if (r is None or r["state"] != "revoked" or not r["published"] or r["unpublished"]

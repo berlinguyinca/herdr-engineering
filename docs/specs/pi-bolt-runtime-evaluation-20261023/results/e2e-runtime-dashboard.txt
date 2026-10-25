@@ -1,0 +1,11 @@
+End-to-end runtime reporting, 2026-10-23: real Pi-side code -> real control-plane HTTP -> API -> real dashboard renderer.
+Control plane: `herdr-eng control-plane web` (in-memory, local port, stopped afterwards). Pi side: reportRuntimeFacts via ControlPlaneIngest
+(pi-engineering) with env as the launcher sets it. Reporter ran under node (a simulated Pi-Bolt environment; the real extension set does
+not load usefully under Pi-Bolt, see decision.md), so js_engine reads node.
+GET /api/v1/sessions returned:
+  e2e-bolt     reviewer m-e2e  {"runtime_kind":"pi-bolt","runtime_source":"role","js_engine":"node",...,"cpu_s":0.12,"rss_mib":66.6}
+  e2e-fallback planner         {"runtime_kind":"standard-pi",...,"fallback_reason":"verified version 1.0.0 differs from pinned 9.9.9"}
+packages/sessions-view.js rendered:
+  e2e-bolt     -> Runtime: Pi-Bolt · node 22.23.3
+  e2e-fallback -> Runtime: Standard Pi · node 22.23.3 · fell back: verified version 1.0.0 differs from pinned 9.9.9
+PASS for worker -> control plane -> dashboard wiring, role/mission association and fallback visibility.

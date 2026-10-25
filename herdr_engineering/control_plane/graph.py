@@ -56,10 +56,20 @@ from typing import Any
 NODE_TYPES = frozenset(
     "room workspace mission plan task agent attempt session tab pane handoff "
     "thread message decision approach worktree commit pr ci review finding "
-    "artifact gate issue".split())
+    "artifact gate issue "
+    # system-intelligence (spec docs/specs/herdr-system-graph-20261020/02):
+    # repository/host/service/gpu/model/request/span/queue are OWNED kinds; they
+    # default to per-writer ownership exactly like the existing non-commons kinds.
+    "repository branch service endpoint deployment host gpu model worker request "
+    "span queue dataset memory_reference external_dependency module symbol package trace".split())
 EDGE_TYPES = frozenset(
     "spawn handoff delegation consultation dependency issue_link fork "
-    "supersession reviewed produced validated cross_link".split())
+    "supersession reviewed produced validated cross_link "
+    # system-intelligence edge kinds; overlapping spec concepts map onto the
+    # existing kinds above (depends_on->dependency, handoff_to->handoff,
+    # reviews->reviewed, produced->produced, spawned_by->spawn, supersedes->supersession).
+    "calls observed_in belongs_to blocked_by implements references runs_on "
+    "serves deploys_to assigned_to precedes imports routes_to queued_on".split())
 # T14: edge kinds only the HCN service may write (as a `collab` principal, after it has checked the asking person
 # and the room). `cross_link` joins two nodes of different workspaces of one room; a `consultation` edge from a
 # service-written `thread:hcn-consult.*` node records a peer consultation. Everybody else is refused with the one
@@ -1510,69 +1520,6 @@ class GraphProjection:
             ctx: dict = {}
             return {"edges": [self._edge_view(e, principal, ctx) for e in matches[:MAX_NODE_EDGES]]}
 
-    def list_nodes(self, principal, node_type: str, *, edge_type: str | None = None,
-                   limit: int = DEFAULT_NODES, contexts: frozenset | None = None) -> dict:
-        """The nodes of one type the caller may see (first-seen order, at most ``limit``), plus the visible
-        live ``edge_type`` edges between them. This is how a workbench finds its agents when the emitter
-        defines no workspace/mission root node. Visibility is checked per node and per edge; a hidden node
-        is never counted, so ``truncated`` (limit hit, or the ``SCAN_BUDGET`` of examined ids spent) says
-        nothing about hidden items. ``contexts`` (server-built, never from a client) narrows the list to nodes
-        whose visible scope names one of those ``(room|mission, id)`` pairs: one room's view of the graph."""
-        if node_type not in NODE_TYPES:
-            raise ValueError("unknown node_type")
-        if edge_type is not None and edge_type not in EDGE_TYPES:
-            raise ValueError("unknown edge_type")
-        if not isinstance(limit, int) or not 1 <= limit <= MAX_NODES:
-            raise ValueError(f"limit must be between 1 and {MAX_NODES}")
-        with self._lock:
-            views, reason = {}, None
-            if contexts is None:
-                candidates = self._by_type.get(node_type, ())      # keyed API: first-seen order
-            else:                                                  # one room: only what was addressed to it
-                # insertion (admission) order: no sort of the whole set, identical live and after rebuild
-                seen = {}
-                for c in sorted(contexts, key=repr):
-                    seen.update(self._by_ctx.get(c, {}).get(node_type, {}))
-                candidates = seen
-            for scanned, nid in enumerate(candidates):
-                if scanned >= SCAN_BUDGET:
-                    reason = "scan_budget"
-                    break
-                node = self._nodes[nid]
-                if not self._node_visible(principal, node):
-                    continue
-                if contexts is not None:
-                    label = node.eff_scope(principal, internal=False) if node.commons else node.eff_scope()
-                    if not (isinstance(label, tuple) and label[:3] in contexts):
-                        continue
-                if len(views) >= limit:
-                    reason = "limit"
-                    break
-                views[nid] = self._node_view(node, principal)
-            edges, ctx, done = [], {}, set()
-            if edge_type is not None:
-                left = EDGE_SCAN_TOTAL                              # one budget for the whole read
-                for nid in views:
-                    if left <= 0:
-                        reason = reason or "edge_budget"
-                        break
-                    per = min(NEIGHBOR_SCAN_BUDGET, left)
-                    left -= min(len(self._out.get(nid, ())), per)
-                    own, others, exhausted = self._expand(principal, nid, "out", {edge_type}, False, None, per)
-                    if exhausted:
-                        reason = reason or "edge_budget"
-                    for edge in own + others:
-                        if edge.to_id in views and edge.key not in done:
-                            if len(edges) >= MAX_EDGES:
-                                reason = reason or "limit"
-                                continue
-                            done.add(edge.key)
-                            edges.append(self._edge_view(edge, principal, ctx))
-            # `truncated_reason` names the budget that ended the read; it counts only visible items or the size
-            # of the one context asked about, never hidden nodes elsewhere in the graph.
-            return {"node_type": node_type, "nodes": list(views.values()), "edges": edges,
-                    "truncated": reason is not None, "truncated_reason": reason}
-
     @staticmethod
     def _owner_attr(edge: _Edge, owner: str, name: str) -> Any:
         """Newest value of attr ``name`` written by ``owner`` itself.
@@ -1694,6 +1641,69 @@ class GraphProjection:
                     "head_state": head_state, "head_resync_candidate": candidate, "author": author,
                     "head_visible": head_visible,
                     "reviews": reviews, "authors": sorted(authors)}
+
+    def list_nodes(self, principal, node_type: str, *, edge_type: str | None = None,
+                   limit: int = DEFAULT_NODES, contexts: frozenset | None = None) -> dict:
+        """The nodes of one type the caller may see (first-seen order, at most ``limit``), plus the visible
+        live ``edge_type`` edges between them. This is how a workbench finds its agents when the emitter
+        defines no workspace/mission root node. Visibility is checked per node and per edge; a hidden node
+        is never counted, so ``truncated`` (limit hit, or the ``SCAN_BUDGET`` of examined ids spent) says
+        nothing about hidden items. ``contexts`` (server-built, never from a client) narrows the list to nodes
+        whose visible scope names one of those ``(room|mission, id)`` pairs: one room's view of the graph."""
+        if node_type not in NODE_TYPES:
+            raise ValueError("unknown node_type")
+        if edge_type is not None and edge_type not in EDGE_TYPES:
+            raise ValueError("unknown edge_type")
+        if not isinstance(limit, int) or not 1 <= limit <= MAX_NODES:
+            raise ValueError(f"limit must be between 1 and {MAX_NODES}")
+        with self._lock:
+            views, reason = {}, None
+            if contexts is None:
+                candidates = self._by_type.get(node_type, ())      # keyed API: first-seen order
+            else:                                                  # one room: only what was addressed to it
+                # insertion (admission) order: no sort of the whole set, identical live and after rebuild
+                seen = {}
+                for c in sorted(contexts, key=repr):
+                    seen.update(self._by_ctx.get(c, {}).get(node_type, {}))
+                candidates = seen
+            for scanned, nid in enumerate(candidates):
+                if scanned >= SCAN_BUDGET:
+                    reason = "scan_budget"
+                    break
+                node = self._nodes[nid]
+                if not self._node_visible(principal, node):
+                    continue
+                if contexts is not None:
+                    label = node.eff_scope(principal, internal=False) if node.commons else node.eff_scope()
+                    if not (isinstance(label, tuple) and label[:3] in contexts):
+                        continue
+                if len(views) >= limit:
+                    reason = "limit"
+                    break
+                views[nid] = self._node_view(node, principal)
+            edges, ctx, done = [], {}, set()
+            if edge_type is not None:
+                left = EDGE_SCAN_TOTAL                              # one budget for the whole read
+                for nid in views:
+                    if left <= 0:
+                        reason = reason or "edge_budget"
+                        break
+                    per = min(NEIGHBOR_SCAN_BUDGET, left)
+                    left -= min(len(self._out.get(nid, ())), per)
+                    own, others, exhausted = self._expand(principal, nid, "out", {edge_type}, False, None, per)
+                    if exhausted:
+                        reason = reason or "edge_budget"
+                    for edge in own + others:
+                        if edge.to_id in views and edge.key not in done:
+                            if len(edges) >= MAX_EDGES:
+                                reason = reason or "limit"
+                                continue
+                            done.add(edge.key)
+                            edges.append(self._edge_view(edge, principal, ctx))
+            # `truncated_reason` names the budget that ended the read; it counts only visible items or the size
+            # of the one context asked about, never hidden nodes elsewhere in the graph.
+            return {"node_type": node_type, "nodes": list(views.values()), "edges": edges,
+                    "truncated": reason is not None, "truncated_reason": reason}
 
     def neighborhood(self, principal, root: str, *, depth: int = DEFAULT_DEPTH,
                      max_nodes: int = DEFAULT_NODES, max_edges: int = DEFAULT_EDGES,

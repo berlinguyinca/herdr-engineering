@@ -4,7 +4,7 @@ import { formatDuration } from './herdr-web-components/format.js';
 import { missionEntries } from './mission-catalog-view.js';
 import { recordOutcome, recordVisibility, reportFreshness } from './record-state.js';
 import { serviceState, serviceScope } from './services-view.js';
-import { integrationEntries } from './integrations-view.js';
+import { integrationEntries, integrationTimestamp } from './integrations-view.js';
 
 const records = value => Array.isArray(value) ? value.filter(v => v && typeof v === 'object' && !Array.isArray(v)) : [];
 const text = value => typeof value === 'string' ? value : '';
@@ -36,6 +36,59 @@ export function overviewModel(data = {}, received = Date.now(), now = Date.now()
   const services = {current:0,unavailable:0,archived:0,unknown:0};
   for (const service of records(data.services)) if (serviceScope(service) === 'herdr') services[serviceState(service,now)]++;
   return {missions,sessions,services,hosts:records(data.hosts).sort((a,b)=>text(a.host_name || a.host_id).localeCompare(text(b.host_name || b.host_id)))};
+}
+
+const OVERVIEW_CARDS = ['missions','fleet','sessions','ci','reviews','services','hosts','activity'];
+const CARD_LABELS = {missions:'Current missions',fleet:'Fleet health',sessions:'Agents',ci:'CI builds',reviews:'Reviews',services:'HerdR services',hosts:'Hosts',activity:'Recent changes'};
+const PREFERENCES_KEY = 'herdr.overview.layout.v1';
+export function sanitizeOverviewPreferences(value) {
+  const valid = value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+  const order = [...new Set((Array.isArray(valid.order) ? valid.order : []).filter(key=>OVERVIEW_CARDS.includes(key)))];
+  return {order:[...order,...OVERVIEW_CARDS.filter(key=>!order.includes(key))],hidden:[...new Set((Array.isArray(valid.hidden) ? valid.hidden : []).filter(key=>OVERVIEW_CARDS.includes(key)))]};
+}
+
+// Attention is a projection of the same retained observations as the cards.
+export function overviewAttention(data = {}, states = {}, received = Date.now(), now = Date.now()) {
+  const model=overviewModel(data,received,now), items=new Map();
+  const add=(key,severity,actionability,title,detail,href,updated,source)=>{
+    const item={key,severity,actionability,title:short(title),detail:short(detail),href,updated:integrationTimestamp(updated),source};
+    if(!items.has(key) || item.updated>items.get(key).updated)items.set(key,item);
+  };
+  for(const entry of [...model.missions.attention,...model.missions.failed]) {
+    if(snoozedUntil(data,entry.key)>now)continue;
+    add(`mission:${entry.key}`,entry.tab==='failed'?'critical':'warning',2,entry.title,human(entry.health || 'failed'),`#/missions/${encodeURIComponent(entry.key)}`,entry.projection?.activity_snapshot_at || entry.recorded?.updated_at,'projections');
+  }
+  for(const session of model.sessions.failed)if(session.session_id)add(`session:${session.session_id}`,'critical',1,session.display_name || session.title || session.agent_role || 'Failed agent','Agent reported failed',`#/herd/session/${encodeURIComponent(session.session_id)}`,session.updated_at || session.last_activity,'sessions');
+  for(const kind of ['ci','reviews']) {
+   const seen=new Set();
+   for(const entry of integrationEntries(data[kind],kind)) {
+    if(seen.has(entry.id))continue;
+    seen.add(entry.id);
+    if(entry.tab!=='failed' && entry.tab!=='changes')continue;
+    const r=entry.record;
+    add(`${kind}:${entry.id}`,entry.tab==='failed'?'critical':'warning',entry.tab==='changes'?1:2,r.title || r.repository || (kind==='ci'?`CI run #${r.run_number}`:'Review'),`${human(r.state || r.status || r.decision)}${r.repository ? ` · ${r.repository}` : ''}${kind==='ci'?` · Run #${r.run_number}`:''}`,kind==='ci'?`#/ci?tab=failed&repository=${encodeURIComponent(r.provider_repo_id ?? r.repository_id ?? r.repository ?? '')}&provider=${encodeURIComponent(r.provider_url || '')}&search=${encodeURIComponent(r.run_number ?? '')}`:`#/reviews?tab=${entry.tab}&search=${encodeURIComponent(r.review_id || r.id || '')}`,r.updated_at || r.created_at,kind);
+   }
+  }
+  for(const service of records(data.services))if(serviceScope(service)==='herdr' && serviceState(service,now)==='unavailable' && service.service_id)add(`service:${service.service_id}`,'critical',2,service.service_name || service.service_id,'Service reported unavailable',`#/services/${encodeURIComponent(service.service_id)}`,service.updated_at,'services');
+  for(const host of model.hosts)if(host.host_id && (['unavailable','offline','failed'].includes(host.status) || reportFreshness(host.last_seen || host.updated_at,now)!=='current'))add(`host:${host.host_id}`,'warning',0,host.host_name || host.host_id,'No recent healthy host report',`#/hosts/${encodeURIComponent(host.host_id)}`,host.last_seen || host.updated_at,'hosts');
+  if(data.health && data.health.status!=='ok')add('health','critical',2,'Control plane needs attention',human(data.health.status) || 'Status unknown','#/topology',null,'health');
+  if(Number.isFinite(data.fleet?.summary?.drifted) && data.fleet.summary.drifted>0)add('fleet:drift','warning',1,'Fleet versions differ',`${data.fleet.summary.drifted} tool or plugin versions differ across hosts`,'#/hosts?drift=1',null,'fleet');
+  const sources=['projections','missions','sessions','services','hosts','ci','reviews','health','fleet'];
+  const unavailable=sources.filter(key=>!states[key]?.loaded || states[key]?.error || data[key]?.stale || data[key]?.available===false || data[key]?.status==='partial' || data[key]?.partial===true);
+  const severity={critical:0,warning:1};
+  return {items:[...items.values()].sort((a,b)=>severity[a.severity]-severity[b.severity] || b.actionability-a.actionability || b.updated-a.updated || a.key.localeCompare(b.key)),complete:!unavailable.length,unavailable};
+}
+
+// The server derives the same items for every browser (design 2026-10-24). A server answer that loaded
+// is the source of truth; before it loads, or when it fails, the browser projection above is the fallback.
+const SERVER_RANK = {critical:0,warning:1,info:2};
+export function serverAttention(body, now = Date.now()) {
+  const items = records(body?.items).filter(item=>item.state==='open' && typeof item.key==='string').map(item=>({
+    key:item.key, severity:SERVER_RANK[item.severity]===undefined ? 'info' : item.severity, title:short(item.title), detail:short(item.detail),
+    href:/^#\/\S*$/.test(item.href || '') ? item.href : '#/attention', updated:Date.parse(item.first_seen) || 0, source:text(item.source), count:Number(item.count) || 1,
+  })).sort((a,b)=>SERVER_RANK[a.severity]-SERVER_RANK[b.severity] || b.updated-a.updated || a.key.localeCompare(b.key));
+  const unavailable = (Array.isArray(body?.unavailable) ? body.unavailable : []).map(text).filter(Boolean);
+  return {items,complete:body?.partial!==true && !unavailable.length,unavailable,server:true,acknowledged:Number(body?.counts?.acknowledged) || 0,snoozed:Number(body?.counts?.snoozed) || 0};
 }
 
 const eventLabels = {
@@ -86,6 +139,18 @@ function missionRow(entry, canSnooze = false) {
 
 export function renderOverviewSection(section, data = {}, states = {}, received = Date.now(), now = Date.now()) {
   const model = overviewModel(data,received,now);
+  if (section === 'attention') {
+    const mode=states.attention===undefined ? 'browser' : states.attention.error ? 'fallback' : states.attention.loaded && data.attention ? 'server' : states.attention.disabled ? 'browser' : states.attention.loaded ? 'browser' : 'loading';
+    if(mode==='loading')return `<div class="ov-heading"><h2 tabindex="-1">Attention</h2></div><p class="ov-note" role="status">Loading attention…</p>`;
+    const attention=mode==='server' ? serverAttention(data.attention,now) : overviewAttention(data,states,received,now),expanded=data.attentionExpanded===true,limit=6;
+    const visible=expanded?attention.items:attention.items.slice(0,limit);
+    return `<div class="ov-heading"><h2 tabindex="-1">Attention</h2><span class="ov-tag">${attention.items.length ? `${attention.items.length}${attention.complete?'':'+'}` : attention.complete?'0':'—'} ${attention.server?'open':'observed'} items</span></div>
+      ${mode==='fallback' ? '<p class="ov-warning" role="status">The shared attention list could not be loaded, so this list is computed in this browser and may differ from the Attention page.</p>' : ''}
+      ${attention.server ? `<p class="ov-note">${link('#/attention','Open the Attention page →')}${attention.acknowledged || attention.snoozed ? ` · ${attention.acknowledged} acknowledged, ${attention.snoozed} snoozed` : ''}</p>` : ''}
+      ${!attention.complete ? `<p class="ov-warning" role="status">Partial coverage: ${esc(attention.unavailable.map(key=>CARD_LABELS[key] || {projections:'Live missions',health:'Control plane'}[key] || key).join(', '))}. Loading, unavailable, or stale sources may contain more items; retained reports remain visible.</p>` : ''}
+      ${attention.items.length>limit ? `<div class="ov-attention-controls"><span class="ov-note">Showing ${visible.length} of ${attention.items.length} observed items</span><button type="button" data-attention-toggle aria-expanded="${expanded}" aria-controls="ov-attention-items">${expanded?'Show fewer':`Show all ${attention.items.length}`}</button></div>` : ''}
+      ${attention.items.length ? `<ul id="ov-attention-items" class="ov-list ov-attention-list${expanded?' is-expanded':''}" aria-label="Attention items"${expanded?' tabindex="0"':''}>${visible.map(item=>`<li class="ov-row" data-attention-key="${esc(item.key)}"><div>${link(item.href,item.title)}<p>${esc(item.detail)}</p></div><span class="ov-tag ov-alert">${esc(item.severity)}${item.updated?`<br>${ageMarkup(new Date(item.updated).toISOString(),now)}`:''}</span></li>`).join('')}</ul>` : empty(attention.complete?'No attention items in the received reports.':'Attention is not yet fully known.')}`;
+  }
   if (section === 'missions') {
     const m = model.missions;
     const ready = states.projections?.loaded || states.missions?.loaded;
@@ -155,10 +220,12 @@ export function renderOverviewSection(section, data = {}, states = {}, received 
 }
 
 const styles = `<style>
-.ov-sub{font-size:13px;margin:14px 0 0}.ov-snooze{font:inherit;font-size:11px;margin-top:6px;padding:2px 8px;border:1px solid var(--border);border-radius:var(--radius-sm);background:var(--surface);color:var(--text-secondary);cursor:pointer}.ov-intro,.ov-note{color:var(--text-secondary);font-size:13px;line-height:1.6}.ov-intro{max-width:75ch;margin:0 0 18px}.ov-layout{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px;align-items:start}.ov-panel{min-width:0;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:16px;overflow-wrap:anywhere}.ov-panel[data-overview=missions]{grid-column:span 2}.ov-panel[data-overview=fleet]{grid-column:3}.ov-heading{display:flex;justify-content:space-between;align-items:baseline;gap:12px;margin-bottom:12px}.ov-heading h2{font-size:17px;margin:0}.ov-heading>a{font-size:12px;white-space:nowrap}.ov-metrics{display:flex;flex-wrap:wrap;gap:10px;margin:10px 0}.ov-metric{display:flex;flex-direction:column;gap:4px;padding:9px 12px;background:var(--bg);border:1px solid var(--border-subtle);border-radius:var(--radius-sm);font-size:12px;color:var(--text);text-decoration:none}.ov-metric strong{font-size:23px;line-height:1.2}.ov-list{list-style:none;padding:0;margin:0}.ov-row{display:flex;justify-content:space-between;align-items:start;gap:14px;padding:9px 0;border-top:1px solid var(--border-subtle);font-size:13px;line-height:1.45}.ov-row>div{min-width:0;flex:1}.ov-row>div>a{font-weight:600;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}.ov-row p{margin:3px 0 0;color:var(--text-secondary);font-size:12px;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}.ov-tag{font-size:12px;color:var(--text-secondary);max-width:45%;text-align:right}.ov-alert,.ov-warning{color:var(--status-attention)}.ov-warning{font-size:12px;line-height:1.6}.ov-history{display:flex;flex-wrap:wrap;gap:14px;border-top:1px solid var(--border-subtle);padding-top:10px;margin-top:10px;font-size:12px}.ov-health{display:flex;flex-wrap:wrap;gap:16px;color:var(--text-secondary);font-size:12px;margin:18px 0}.ov-health p{margin:0}
+.ov-sub{font-size:13px;margin:14px 0 0}.ov-snooze{font:inherit;font-size:11px;margin-top:6px;padding:2px 8px;border:1px solid var(--border);border-radius:var(--radius-sm);background:var(--surface);color:var(--text-secondary);cursor:pointer}.ov-intro,.ov-note{color:var(--text-secondary);font-size:13px;line-height:1.6}.ov-intro{max-width:75ch;margin:0 0 18px}.ov-layout{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px;align-items:start}.ov-panel{min-width:0;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:16px;overflow-wrap:anywhere}.ov-panel[data-overview=missions]{grid-column:span 2}.ov-panel[data-overview=fleet]{grid-column:auto}.ov-heading{display:flex;justify-content:space-between;align-items:baseline;gap:12px;margin-bottom:12px}.ov-heading h2{font-size:17px;margin:0}.ov-heading>a{font-size:12px;white-space:nowrap}.ov-metrics{display:flex;flex-wrap:wrap;gap:10px;margin:10px 0}.ov-metric{display:flex;flex-direction:column;gap:4px;padding:9px 12px;background:var(--bg);border:1px solid var(--border-subtle);border-radius:var(--radius-sm);font-size:12px;color:var(--text);text-decoration:none}.ov-metric strong{font-size:23px;line-height:1.2}.ov-list{list-style:none;padding:0;margin:0}.ov-row{display:flex;justify-content:space-between;align-items:start;gap:14px;padding:9px 0;border-top:1px solid var(--border-subtle);font-size:13px;line-height:1.45}.ov-row>div{min-width:0;flex:1}.ov-row>div>a{font-weight:600;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}.ov-row p{margin:3px 0 0;color:var(--text-secondary);font-size:12px;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}.ov-tag{font-size:12px;color:var(--text-secondary);max-width:45%;text-align:right}.ov-alert,.ov-warning{color:var(--status-attention)}.ov-warning{font-size:12px;line-height:1.6}.ov-history{display:flex;flex-wrap:wrap;gap:14px;border-top:1px solid var(--border-subtle);padding-top:10px;margin-top:10px;font-size:12px}.ov-health{display:flex;flex-wrap:wrap;gap:16px;color:var(--text-secondary);font-size:12px;margin:18px 0}.ov-health p{margin:0}
 @media(min-width:2200px){.ov-layout{grid-template-columns:repeat(4,minmax(0,1fr))}.ov-panel[data-overview=missions],.ov-panel[data-overview=fleet],.ov-panel[data-overview=hosts],.ov-panel[data-overview=activity]{grid-column:span 2}}
 @media(max-width:1180px){.ov-layout{grid-template-columns:repeat(2,minmax(0,1fr))}.ov-panel[data-overview=missions]{grid-column:1/-1;grid-row:auto}.ov-panel[data-overview=fleet]{grid-column:1/-1}}
 @media(max-width:960px){.ov-layout{grid-template-columns:minmax(0,1fr)}.ov-panel[data-overview=missions],.ov-panel[data-overview=fleet]{grid-column:auto}.ov-panel{padding:14px}.ov-row{gap:10px}.ov-tag{max-width:42%}.ov-metric{padding:9px}.ov-metrics{gap:8px}.ov-heading{gap:8px}}
+.ov-attention{margin-bottom:16px}.ov-attention-list{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,340px),1fr));gap:0 24px}.ov-attention-list.is-expanded{max-height:min(60vh,560px);overflow:auto;overscroll-behavior:contain;scrollbar-gutter:stable}.ov-attention-controls{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:8px}.ov-attention-controls button{font:inherit;font-size:13px;color:var(--text);background:var(--bg);border:1px solid var(--border);border-radius:var(--radius-sm);padding:9px 12px;min-height:44px;cursor:pointer}.ov-attention-controls button:focus-visible,.ov-attention-list:focus-visible{outline:2px solid var(--accent);outline-offset:3px}.ov-panel[hidden]{display:none}.ov-customize{margin:0 0 16px;font-size:13px}.ov-customize>summary{cursor:pointer;width:fit-content;padding:8px 0}.ov-control-row{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin:8px 0}.ov-control-row strong{min-width:145px}.ov-customize button{font:inherit;color:var(--text);background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-sm);padding:7px 10px;cursor:pointer}.ov-customize button:disabled{opacity:.45;cursor:default}.ov-customize button:focus-visible,.ov-customize summary:focus-visible{outline:2px solid var(--accent);outline-offset:3px}.ov-layout:has(>[hidden]){grid-template-columns:repeat(auto-fit,minmax(min(100%,360px),1fr))}.ov-layout:has(>[hidden])>.ov-panel{grid-column:auto}
+@media(max-width:960px){.ov-layout:has(>[hidden]){grid-template-columns:minmax(0,1fr)}.ov-control-row{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));padding-bottom:8px;border-bottom:1px solid var(--border)}.ov-control-row strong{grid-column:1/-1}.ov-customize button{min-height:44px;padding:8px 4px}}
 </style>`;
 
 const SNOOZE_KEY = 'herdr.snoozedMissions';
@@ -177,7 +244,9 @@ function saveSnoozed(map) {
 export function mountOverview(container, client) {
   let disposed=false, clock=null, received=Date.now();
   const data={snoozed:loadSnoozed()}, states={}, controllers=new Map(), timers=new Map(), signatures=new Map();
-  const panels=['missions','fleet','sessions','ci','reviews','services','hosts','activity','health'];
+  const panels=['attention',...OVERVIEW_CARDS,'health'];
+  let preferences;
+  try { preferences=sanitizeOverviewPreferences(JSON.parse(localStorage.getItem(PREFERENCES_KEY) || 'null')); } catch { preferences=sanitizeOverviewPreferences(); }
   const sources={
     projections:signal=>client.listMissionActivity({signal}),
     missions:signal=>client.listMissions(undefined,{signal}),
@@ -189,8 +258,26 @@ export function mountOverview(container, client) {
     health:signal=>client.health({signal}),
     ci:signal=>client.getCi({signal}),
     reviews:signal=>client.listReviews({signal}),
+    // Disabled on the server (404) is not an error: the browser projection stays, with no warning.
+    attention:signal=>client.attention({state:'open'},{signal}).catch(error=>{if(error?.status===404)return {disabled:true};throw error;}),
   };
-  container.innerHTML=`${styles}<p class="ov-intro">Current work, recent reports, and changes that matter. Finished, closed, and failed records stay in their respective tabs.</p><div class="ov-layout">${panels.filter(key=>key!=='health').map(key=>`<section class="ov-panel" data-overview="${key}" aria-label="${key}"></section>`).join('')}</div><footer class="ov-health" data-overview="health"></footer>`;
+  states.attention={loaded:false,error:false};
+  container.innerHTML=`${styles}<p class="ov-intro">Current work, recent reports, and changes that matter. Finished, closed, and failed records stay in their respective tabs.</p><details class="ov-customize"><summary>Customize Overview</summary><p class="ov-note">Attention is always visible. Health stays in the footer.</p><div data-overview-controls></div><button type="button" data-overview-reset>Reset layout</button></details><section class="ov-panel ov-attention" data-overview="attention" aria-label="Attention"></section><div class="ov-layout">${OVERVIEW_CARDS.map(key=>`<section class="ov-panel" data-overview="${key}" aria-label="${key}"></section>`).join('')}</div><footer class="ov-health" data-overview="health"></footer>`;
+  function applyPreferences() {
+    const focused=document.activeElement;
+    const action=focused?.dataset.overviewAction, card=focused?.dataset.card;
+    const layout=container.querySelector('.ov-layout');
+    preferences.order.forEach(key=>{
+      const panel=container.querySelector(`[data-overview="${key}"]`);
+      panel.hidden=preferences.hidden.includes(key);layout.append(panel);
+    });
+    container.querySelector('[data-overview-controls]').innerHTML=preferences.order.map((key,index)=>`<div class="ov-control-row"><strong>${CARD_LABELS[key]}</strong><button type="button" data-overview-action="toggle" data-card="${key}" aria-pressed="${!preferences.hidden.includes(key)}" aria-label="${preferences.hidden.includes(key)?'Show':'Hide'} ${CARD_LABELS[key]}">${preferences.hidden.includes(key)?'Show':'Hide'}</button><button type="button" data-overview-action="up" data-card="${key}" aria-label="Move ${CARD_LABELS[key]} up" ${index===0?'disabled':''}>Move up</button><button type="button" data-overview-action="down" data-card="${key}" aria-label="Move ${CARD_LABELS[key]} down" ${index===preferences.order.length-1?'disabled':''}>Move down</button></div>`).join('');
+    if(action && card) {
+      const target=container.querySelector(`[data-overview-action="${action}"][data-card="${card}"]`);
+      (target?.disabled?container.querySelector(`[data-overview-action="toggle"][data-card="${card}"]`):target)?.focus({preventScroll:true});
+    }
+  }
+  applyPreferences();
   function draw() {
     if(disposed || document.hidden)return;
     for(const panel of panels) {
@@ -201,9 +288,21 @@ export function mountOverview(container, client) {
       if(signature===signatures.get(panel))continue;
       signatures.set(panel,signature);
       const focused=document.activeElement;
-      const href=element.contains(focused) ? focused.closest('a')?.getAttribute('href') : null;
+      const hadFocus=element.contains(focused);
+      const href=hadFocus ? focused.closest('a')?.getAttribute('href') : null;
+      const snooze=hadFocus ? focused.dataset?.snooze : null;
+      const attentionToggle=hadFocus && focused.hasAttribute('data-attention-toggle');
+      const attentionList=hadFocus && focused.id==='ov-attention-items';
+      const attentionScroll=element.querySelector('.ov-attention-list.is-expanded')?.scrollTop || 0;
       element.innerHTML=html;
-      if(href)[...element.querySelectorAll('a')].find(a=>a.getAttribute('href')===href)?.focus({preventScroll:true});
+      const expandedList=element.querySelector('.ov-attention-list.is-expanded');
+      if(expandedList)expandedList.scrollTop=attentionScroll;
+      if(hadFocus) {
+        const target=attentionToggle ? element.querySelector('[data-attention-toggle]') : attentionList ? expandedList : href ? [...element.querySelectorAll('a')].find(a=>a.getAttribute('href')===href) : snooze ? [...element.querySelectorAll('[data-snooze]')].find(button=>button.dataset.snooze===snooze) : null;
+        const fallback=element.querySelector('h2');
+        if(fallback)fallback.tabIndex=-1;
+        (target || fallback)?.focus({preventScroll:true});
+      }
     }
     tickClocks();
   }
@@ -221,11 +320,12 @@ export function mountOverview(container, client) {
       const response=await sources[key](controller.signal);
       if(disposed || controller.signal.aborted)return;
       const field={projections:'activities',activity:'events'}[key] || key;
-      const objectSource=['health','ci','reviews','fleet'].includes(key);
-      if (objectSource ? !response || (key==='health' ? typeof response.status!=='string' : key==='ci' ? typeof response.available!=='boolean' : key==='fleet' ? !Array.isArray(response.components) : !Array.isArray(response.reviews)) : !Array.isArray(response?.[field])) throw new Error('Invalid response');
+      const objectSource=['health','ci','reviews','fleet','attention'].includes(key);
+      if (objectSource ? !response || (key==='attention' ? !response.disabled && !Array.isArray(response.items) : key==='health' ? typeof response.status!=='string' : key==='ci' ? typeof response.available!=='boolean' : key==='fleet' ? !Array.isArray(response.components) : !Array.isArray(response.reviews)) : !Array.isArray(response?.[field])) throw new Error('Invalid response');
       data[key==='activity' ? 'events' : key]=objectSource ? response : records(response?.[field]);
       if(key==='projections')received=Date.now();
-      states[key]={loaded:true,error:false};
+      if(key==='attention' && response.disabled)data.attention=null;
+      states[key]={loaded:true,error:false,...(key==='attention' && response.disabled ? {disabled:true} : {})};
       draw();
     } catch {
       if(!disposed && (!controller.signal.aborted || timedOut)){states[key]={...states[key],error:true};draw();}
@@ -241,6 +341,18 @@ export function mountOverview(container, client) {
     draw();refresh();clock=setInterval(draw,1000);
   }
   container.addEventListener('click',event=>{
+    if(event.target.closest?.('[data-attention-toggle]')){data.attentionExpanded=!data.attentionExpanded;draw();return;}
+    const control=event.target.closest?.('[data-overview-action], [data-overview-reset]');
+    if(control) {
+      if(control.hasAttribute('data-overview-reset'))preferences=sanitizeOverviewPreferences();
+      else {
+        const key=control.dataset.card, action=control.dataset.overviewAction,index=preferences.order.indexOf(key);
+        if(action==='toggle')preferences.hidden=preferences.hidden.includes(key)?preferences.hidden.filter(value=>value!==key):[...preferences.hidden,key];
+        else {const next=index+(action==='up'?-1:1);if(next>=0 && next<preferences.order.length)[preferences.order[index],preferences.order[next]]=[preferences.order[next],preferences.order[index]];}
+      }
+      try {localStorage.setItem(PREFERENCES_KEY,JSON.stringify(preferences));}catch { /* Session preferences remain usable. */ }
+      applyPreferences();return;
+    }
     const button=event.target.closest?.('.ov-snooze');
     if(!button)return;
     if(button.hasAttribute('data-snooze'))data.snoozed.set(button.dataset.snooze,Date.now()+SNOOZE_MS);

@@ -846,3 +846,12 @@ def test_the_asker_target_edge_has_the_subjects_visibility(cx):
     ask_node = "thread:hcn-consult-asker." + c["consult_id"]
     assert ask_node in {n["id"] for n in cx.s.graph_read(cx.alice, ["lineage"], {"room_id": cx.room})["nodes"]}
     assert ask_node not in {n["id"] for n in cx.s.graph_read(cx.alice, ["lineage"], {"room_id": cx.room2})["nodes"]}
+
+
+def test_an_active_cross_link_is_outstanding_until_it_is_revoked(cx):
+    """T16 H2: the revocation reserve counts active cross links."""
+    base = cx.s._recount()["xlink"]
+    lid = mk(cx)[1]["link"]["link_id"]
+    assert cx.s._recount()["xlink"] == base + 1
+    cx.s.revoke_link(cx.bob, cx.room, lid)
+    assert cx.s._recount()["xlink"] == base

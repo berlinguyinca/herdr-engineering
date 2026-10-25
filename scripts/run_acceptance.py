@@ -42,7 +42,9 @@ def sh(cmd, cwd, timeout=1800):
 def run_pytest(selection: str | None, regression: bool) -> dict:
     junit_dir = Path(tempfile.mkdtemp(prefix="t16-junit-"))
     junit = junit_dir / "junit.xml"
-    cmd = [sys.executable, "-m", "pytest", "tests/e2e", "-q", "-p", "no:cacheprovider", f"--junitxml={junit}", "-rxX"]
+    cmd = [sys.executable, "-m", "pytest", "tests/e2e", "-q", "-p", "no:cacheprovider",
+           "-o", "xfail_strict=true", "-m", "e2e or e2e_unit",              # the e2e marker is opt-in: pyproject addopts deselects it by default
+            f"--junitxml={junit}", "-rxX"]
     if selection:
         cmd += ["-k", selection]
     code, out, secs = sh(cmd, ROOT)
@@ -88,6 +90,14 @@ def run_node_file(node: str, pi: Path, rel: str) -> dict:
             "tail": out[-800:] if code else ""}
 
 
+NOTHING_SELECTED = "nothing selected on the herdr side (pytest exit 5): --only picked only Pi-side scenarios, so no herdr test was expected"
+
+
+def herdr_side_empty(manifest: dict, tags: set | None) -> bool:
+    """True when `--only` selects scenarios that have no herdr pytest file, so pytest legitimately collects nothing (exit 5)."""
+    return bool(tags) and not any(spec["scenario"] in tags for spec in manifest["herdr"].values())
+
+
 def judge(manifest: dict, res: dict, pi_results: dict, tags: set | None, pi_files_on_disk: list[str]) -> list[str]:
     """Pure verdict over the collected results (unit-tested in tests/e2e/test_runner_guards.py)."""
     failures: list[str] = []
@@ -107,7 +117,9 @@ def judge(manifest: dict, res: dict, pi_results: dict, tags: set | None, pi_file
     unknown = sorted(set(res["files"]) - {Path(f).name for f in manifest["herdr"]})
     if unknown and not tags:
         failures.append(f"herdr test files not in manifest.yaml: {unknown}")
-    if res["exit"] != 0:
+    if res["exit"] == 5 and herdr_side_empty(manifest, tags) and any(s["scenario"] in tags for s in manifest["pi"].values()):
+        pass                                            # expected: the Pi side is what was selected (main() prints NOTHING_SELECTED)
+    elif res["exit"] != 0:
         failures.append(f"herdr pytest exit {res['exit']}")
     if res.get("regression", {}).get("exit", 0):
         failures.append("herdr regression suite failed")
@@ -135,21 +147,31 @@ def judge(manifest: dict, res: dict, pi_results: dict, tags: set | None, pi_file
 
 
 def xfail_violations(sources: dict[str, str]) -> list[str]:
-    """Every xfail in the Herdr e2e suite must be `strict=True` (so an XPASS fails the run), and neither the imperative
-    `pytest.xfail()` is allowed (skips are caught at run time: any skip fails the run). `sources` maps file name -> python source text."""
+    """Every xfail in the Herdr e2e suite must be the `pytest.mark.xfail(..., strict=True)` call form (so an XPASS fails the
+    run). Rejected: a bare `@pytest.mark.xfail` or `pytestmark = pytest.mark.xfail` (non-strict), a `strict` that is not the
+    literal True, `**kwargs` that could hide it, and the imperative `pytest.xfail()`. Skips are caught at run time: any skip
+    fails the run. `sources` maps file name -> python source text."""
     bad: list[str] = []
     for name, text in sources.items():
-        for node in ast.walk(ast.parse(text)):
-            if not isinstance(node, ast.Call):
+        tree = ast.parse(text)
+        called = {id(n.func): n for n in ast.walk(tree) if isinstance(n, ast.Call)}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Name) and node.id == "xfail" and isinstance(node.ctx, ast.Load):
+                bad.append(f"{name}:{node.lineno}: bare `xfail` name (use pytest.mark.xfail(strict=True))")
                 continue
-            f = node.func
-            attr = f.attr if isinstance(f, ast.Attribute) else f.id if isinstance(f, ast.Name) else ""
-            if attr == "xfail":
-                is_marker = isinstance(f, ast.Attribute) and isinstance(f.value, ast.Attribute) and f.value.attr == "mark"
-                strict = next((k.value for k in node.keywords if k.arg == "strict"), None)
-                if not is_marker:
-                    bad.append(f"{name}:{node.lineno}: imperative pytest.xfail() is not allowed (use the strict marker)")
-                elif not (isinstance(strict, ast.Constant) and strict.value is True):
+            if not (isinstance(node, ast.Attribute) and node.attr == "xfail"):
+                continue
+            is_marker = isinstance(node.value, ast.Attribute) and node.value.attr == "mark"
+            call = called.get(id(node))
+            if not is_marker:
+                bad.append(f"{name}:{node.lineno}: imperative pytest.xfail() is not allowed (use the strict marker)")
+            elif call is None:
+                bad.append(f"{name}:{node.lineno}: xfail marker used without a call, so it is not strict (needs strict=True)")
+            elif any(k.arg is None for k in call.keywords):
+                bad.append(f"{name}:{node.lineno}: xfail(**kwargs) can hide strict=True; spell it out")
+            else:
+                strict = next((k.value for k in call.keywords if k.arg == "strict"), None)
+                if not (isinstance(strict, ast.Constant) and strict.value is True):
                     bad.append(f"{name}:{node.lineno}: xfail without strict=True")
     return bad
 
@@ -184,6 +206,8 @@ def main() -> int:
         selection = " or ".join(Path(f).stem for f in wanted) or "nothing_selected"
     res = run_pytest(selection, args.regression)
     report["herdr"] = res
+    if res["exit"] == 5 and herdr_side_empty(manifest, tags):
+        print(f"[herdr] {NOTHING_SELECTED}")
     node = str(cfg.get("node", "node"))
     on_disk = sorted(p.relative_to(pi).as_posix() for p in (pi / "test/e2e").glob("*.e2e.test.ts"))
     for rel, spec in manifest["pi"].items():
