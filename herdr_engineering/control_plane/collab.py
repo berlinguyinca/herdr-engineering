@@ -4779,26 +4779,26 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FilesMixin):
             cache["github_refs"] = catalog
         return catalog
 
-    def _resolve_refs(self, text: str) -> list[dict]:
-        """`[{kind, owner, repo, number}]` for the cached, in-scope issues `text` names (at most MAX_REFS)."""
+    def _resolve_refs(self, text: str, private: bool) -> list[dict]:
+        """`[{kind, owner, repo, number, forms}]` for the cached, in-scope issues `text` names (at most
+        MAX_REFS); private repositories only when the poster may see them (`private`)."""
         if "#" not in text:                   # most messages: no reference, no cache lookup under the lock
             return []
         catalog = self._ref_catalog()
         if catalog is None:
             return []
         try:
-            return catalog.resolve(issue_refs.tokens(text), issue_refs.MAX_REFS)
+            return catalog.resolve(issue_refs.tokens(text), issue_refs.MAX_REFS, private=private)
         except Exception:
             return []
 
     def _restricted(self, viewer, room_id: str | None) -> bool:
-        """A guest or an external agent: no private repository's issue titles (and no roster)."""
-        if viewer is None:
-            return True
-        if viewer.external:
-            return True
+        """True unless `viewer` may see private repositories' issue titles here (`issue_refs.may_see_private`)."""
         room = self._rooms.get(room_id)
-        return not viewer.is_agent and room is not None and (self._member(room, viewer.id) or {}).get("role") == "guest"
+        role = None
+        if viewer is not None and not viewer.is_agent and room is not None:
+            role = (self._member(room, viewer.id) or {}).get("role")
+        return not issue_refs.may_see_private(viewer, role)
 
     def _refs_for(self, p: dict, viewer, cache: dict) -> list[dict]:
         """A message's refs as `viewer` may see them, with title and state read from the cache now."""
@@ -4912,7 +4912,7 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FilesMixin):
                 pr, project_id=room["project_id"], room_id=room_id, sender_key=pr.key,
                 sender_kind=pr.kind, sender_id=pr.id, sender_external=pr.external, idempotency_key=key, fingerprint=fp,
                 text=stored, mentions=self._resolve_mentions(room_id, stored), in_reply_to=reply, trust="untrusted",
-                **({"refs": refs} if (refs := self._resolve_refs(stored)) else {}),
+                **({"refs": refs} if (refs := self._resolve_refs(stored, not self._restricted(pr, room_id))) else {}),
                 **({"context": ctx} if ctx else {}), **({"files": files} if files else {}),
                 visibility_scope="room", action="message.post", outcome="allowed",
                 project_ids=[room["project_id"]], resource_id=room_id))

@@ -168,9 +168,10 @@ open/closed state as the cache knows them when the message is read. The cache ke
 so an issue that was closed later shows as closed. If the cache is empty or not configured the
 menu says "GitHub cache not ready" and the message still sends, as plain text.
 
-Guests and external agents see titles and states of public repositories only: a reference to a
-private repository reaches them as `owner/repo#n` without its title, and their `#` menu lists
-public repositories' issues only.
+Titles and states of **private** repositories reach room owners and approvers only (pending the
+operator's confirmation). Everyone else, including every agent, sees a private reference as
+`owner/repo#n` without its title. Their `#` menu lists public repositories' issues only, and a
+reference they post to a private repository stays plain text. Public repositories: everyone.
 
 ### The flow of work (live graph)
 

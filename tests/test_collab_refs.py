@@ -237,21 +237,45 @@ def test_refs_are_bounded_and_deduplicated(w, gh):
     assert len(stored(w, ev)) == 1 and stored(w, ev)[0]["forms"] == ["short", "long"]   # which text forms named it
 
 
-def test_guests_and_external_agents_never_see_private_titles(w):
+def last_message(w, viewer):
+    return [e for e in w.s.read_events(viewer, w.room, 0, 50)["events"] if e["event_type"] == "message"][-1]
+
+
+def test_private_titles_reach_room_owners_and_approvers_only(w):
+    """Author's call pending operator confirmation (`collab_refs.may_see_private`)."""
     from tests.control_plane.test_collab_external import enroll
     ext_pr, _, _ = enroll(w)
-    say(w, w.bob, "#secret-7 and #binview-44")
-    member = [e for e in w.s.read_events(w.carol, w.room, 0, 50)["events"] if e["event_type"] == "message"][-1]
-    assert member["refs"][0]["title"] == "Private plans"
-    for viewer in (w.dave, ext_pr):                                    # a guest and an external agent
-        msg = [e for e in w.s.read_events(viewer, w.room, 0, 50)["events"] if e["event_type"] == "message"][-1]
-        secret, public = msg["refs"]
+    owners_agent, _ = w.agent("alice")
+    say(w, w.alice, "#secret-7 and #binview-44")
+    assert last_message(w, w.alice)["refs"][0]["title"] == "Private plans"            # the room owner
+    for viewer in (w.bob, w.carol, w.dave, owners_agent, ext_pr):  # contributor, viewer, guest, an agent, external
+        secret, public = last_message(w, viewer)["refs"]
         assert secret == {"kind": "issue", "owner": "acme", "repo": "secret", "number": 7, "forms": ["short"]}
-        assert "Private plans" not in repr(msg["refs"])
-        assert public["title"] == "Fix the <b>chart</b>" and public["state"] == "open"
-    assert [i["repo"] for i in w.s.search_refs(w.carol, w.room, "secret")["items"]] == ["secret"]
-    assert w.s.search_refs(w.dave, w.room, "secret")["items"] == []
-    assert w.s.search_refs(w.dave, w.room, "binview")["items"][0]["title"] == "Fix the <b>chart</b>"
+        assert "Private plans" not in repr(last_message(w, viewer))
+        assert public["title"] == "Fix the <b>chart</b>" and public["state"] == "open"   # public repos: everyone
+    w.bob.approver = True                                                               # an approver
+    assert last_message(w, w.bob)["refs"][0]["title"] == "Private plans"
+
+
+def test_the_menu_lists_private_issues_for_owners_and_approvers_only(w):
+    from tests.control_plane.test_collab_external import enroll
+    ext_pr, _, _ = enroll(w)
+    assert [i["repo"] for i in w.s.search_refs(w.alice, w.room, "secret")["items"]] == ["secret"]
+    for viewer in (w.bob, w.carol, w.dave, ext_pr):
+        assert w.s.search_refs(viewer, w.room, "secret")["items"] == []
+        assert w.s.search_refs(viewer, w.room, "binview")["items"][0]["title"] == "Fix the <b>chart</b>"
+    w.bob.approver = True
+    assert [i["repo"] for i in w.s.search_refs(w.bob, w.room, "secret")["items"]] == ["secret"]
+
+
+def test_a_post_resolves_refs_with_the_posters_own_view(w):
+    from tests.control_plane.test_collab_external import enroll
+    ext_pr, _, _ = enroll(w, actions=["read", "post"])
+    for poster in (w.bob, ext_pr):                         # no stored ref confirms that a private issue exists
+        ev = say(w, poster, f"is there #secret-7? {poster.id}")
+        assert stored(w, ev) is None
+        assert [r["repo"] for r in stored(w, say(w, poster, f"#binview-44 {poster.id}"))] == ["binview"]
+    assert [r["repo"] for r in stored(w, say(w, w.alice, "#secret-7"))] == ["secret"]
 
 
 def test_the_menu_is_for_room_members_only(w):

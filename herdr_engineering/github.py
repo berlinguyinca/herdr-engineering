@@ -1470,7 +1470,7 @@ class RefCatalog:
             return hits[0] if len(hits) == 1 else None   # unknown, or a name two owners share
         return self._names.get((str(owner).lower(), str(repo).lower()))
 
-    def resolve(self, wanted, limit=20):
+    def resolve(self, wanted, limit=20, *, private=True):
         """``[{kind, owner, repo, number, forms}]`` for the ``(owner | None, repo, number)`` the text names
         that are cached issues of in-scope owners; each once, at most ``limit``. ``forms`` lists which
         text forms resolved to it (``short`` = ``#repo-n``, ``long`` = ``owner/repo#n``)."""
@@ -1478,8 +1478,8 @@ class RefCatalog:
         for owner, repo, number in wanted:
             rid = self._rid(owner, repo)
             issue = None if rid is None else self._issue(rid, number)
-            if issue is None:
-                continue
+            if issue is None or (not private and self._repos[rid].get("private")):
+                continue  # a poster who may not see a private repository learns nothing of it
             form = "short" if owner is None else "long"   # which text named it: a client chips only that form
             if (rid, number) in seen:
                 forms = seen[(rid, number)]["forms"]

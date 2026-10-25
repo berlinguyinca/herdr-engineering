@@ -12,9 +12,12 @@ supply them) and keeps only coordinates: `[{kind: issue|pr, owner, repo, number,
 forms named it, `short` and/or `long`, so a reader chips only those), at most
 `MAX_REFS`. Title and state are read from the cache when a message is read, never stored.
 
-Per-viewer rule: a guest or an external agent sees title and state only for issues of public
-repositories; a private repository's reference reaches them as coordinates only (they are in the
-text already), and their `#` menu lists public repositories' issues only.
+Private repositories (author's call, pending operator confirmation; one function,
+`may_see_private`, to relax it): titles and states of private repositories' issues reach room
+owners and network approvers only. Everyone else (contributors, viewers, guests, every agent,
+external agents) sees such a reference as coordinates only (they are in the text already), their
+`#` menu lists public repositories' issues only, and a reference they post to a private repository
+is not resolved (no stored ref confirms that it exists). Public repositories: everyone.
 """
 from __future__ import annotations
 
@@ -47,10 +50,19 @@ def tokens(text: str) -> Iterator[tuple[str | None, str, int]]:
             yield (owner.lower() if owner else None), repo.lower(), int(number)
 
 
+def may_see_private(principal, room_role: str | None) -> bool:
+    """Whether ``principal`` may learn private repositories' issue titles and states in a room where
+    its role is ``room_role``: a person who owns the room, or a network approver/admin. Never an
+    agent (its own or external). Author's call pending operator confirmation: relax it here."""
+    if principal is None or principal.is_agent or principal.external:
+        return False
+    return room_role == "owner" or bool(principal.approver or principal.admin)
+
+
 def for_viewer(refs: list[dict], details: list[dict | None], restricted: bool) -> list[dict]:
     """Stored refs as one reader sees them: coordinates plus, when the cache knows it and the reader
-    may see it, ``title`` and ``state``. ``restricted`` (a guest or an external agent) hides both
-    for private repositories."""
+    may see it, ``title`` and ``state``. ``restricted`` (``not may_see_private``) hides both for
+    private repositories."""
     out = []
     for ref, info in zip(refs, details, strict=True):
         view = {k: ref[k] for k in ("kind", "owner", "repo", "number")}
