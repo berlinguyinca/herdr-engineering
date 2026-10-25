@@ -29,7 +29,7 @@ const ids=k=>Array.from({length:k},(_,i)=>i+1);
 
 const BASE={mission_id:'m-1',session_id:'s-1',host_id:'h-1',host_name:'h-1',title:'Mission 1',display_name:'Agent 1',updated_at:T0,created_at:T0,stage:'review',status:'ready'};
 // One body every view accepts with lists empty (the "empty" state).
-const EMPTY={...BASE,missions:[],sessions:[],services:[],hosts:[],activities:[],events:[],timeline:[],available:true,reviews:[],repositories:[],issues:[],
+const EMPTY={...BASE,missions:[],sessions:[],services:[],hosts:[],activities:[],events:[],timeline:[],available:true,reviews:[],repositories:[],issues:[],groups:[],points:[],errors:[],
  counts:{},pagination:{},components:[],summary:{},reports:[],pipelines:[],samples:[],total:0,completed:0,completion_rate:0,by_stage:{},models:{},
  total_sessions:0,healthy:0,unavailable:0,sessions_detail:[]};
 const FULL={...EMPTY,missions:ids(4).map(mission),sessions:ids(4).map(session),services:ids(4).map(service),hosts:ids(3).map(host),

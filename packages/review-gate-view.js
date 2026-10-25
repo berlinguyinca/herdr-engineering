@@ -2,6 +2,7 @@
 // Every string from the API is untrusted; it is escaped and clipped before it reaches HTML.
 import {escapeHtml as esc} from './herdr-web-components/util.js';
 import {freshnessSources} from './freshness.js';
+import {skeleton} from './motion.js';
 
 const text=v=>typeof v==='string'?v:'';
 const short=(v,max=160)=>text(v).replace(/\s+/g,' ').trim().slice(0,max);
@@ -109,7 +110,7 @@ export function mountReviewGate(container,client,{intervalMs=5000,timers={setInt
  const panels={};for(const [name] of SOURCES)panels[name]={data:null,at:0,error:''};
  const linked=(a,b)=>{if(typeof AbortSignal.any==='function')return AbortSignal.any([a,b]);const c=new AbortController();for(const x of [a,b]){if(x.aborted)c.abort(x.reason);else x.addEventListener('abort',()=>c.abort(x.reason),{once:true});}return c.signal;};
  let epoch=0;
- let disposed=false,disabled=false,inFlight=false,again=false,controller=null,timer=null,selected='';
+ let disposed=false,disabled=false,inFlight=false,again=false,controller=null,timer=null,selected='',answered=false;
  const resuming=new Map(),resumeErrors=new Map();
 
  // A panel keeps its last good data; a failed read only adds a visible warning.
@@ -127,6 +128,8 @@ export function mountReviewGate(container,client,{intervalMs=5000,timers={setInt
   if(disposed)return;
   const focus=typeof document!=='undefined'&&document.activeElement&&container.contains?.(document.activeElement)?document.activeElement.dataset:null;
   if(disabled){write(`${styles}${heading}<p class="rg-note" role="status">Review gate is not enabled on this control plane.</p>`);return;}
+  // First load in the browser: a skeleton until the first poll answers (data or error).
+  if(live&&!answered){write(`${styles}${skeleton('review gate',{rows:7,height:72})}`);return;}
   const {prs,queue,notices,main}=panels;
   const rows=list(prs.data),jobs={};
   for(const j of list(queue.data&&queue.data.jobs))if(typeof j.key==='string')jobs[j.key]=j;
@@ -150,6 +153,7 @@ export function mountReviewGate(container,client,{intervalMs=5000,timers={setInt
   const results=await Promise.allSettled(SOURCES.map(([,path])=>client.request(path,{signal:linked(ctl.signal,timeout(requestTimeoutMs))})));
   inFlight=false;
   if(disposed||ctl.signal.aborted)return;
+  answered=true;
   results.forEach((r,i)=>{
    const p=panels[SOURCES[i][0]];
    if(r.status==='fulfilled'){chip.ok(SOURCES[i][0]);if(i===0&&gen!==epoch)return;p.data=r.value??(i===0||i===2?[]:{});p.at=Date.now();p.error='';}

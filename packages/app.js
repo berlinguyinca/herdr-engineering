@@ -222,10 +222,13 @@ function statusPage(html, ok, message) {
 // analytics dashboards fill a screen),
 // so the page does not jump on arrival.
 const BACK_LINK_SKELETON = '<div><span class="hd-skeleton hd-skeleton--line" style="display:inline-block;vertical-align:middle">&nbsp;</span></div>';
+// The LLM session page's back link is a .llm-note paragraph (margin 6px 0, 12px/1.6).
+const LLM_BACK_LINK_SKELETON = '<div style="margin:6px 0;font-size:12px;line-height:1.6"><span class="hd-skeleton hd-skeleton--line" style="display:inline-block;vertical-align:middle">&nbsp;</span></div>';
 function routeSkeleton(match, parts) {
-  const back = match === '/missions/:id' || match === '/herd/session/:id' ? BACK_LINK_SKELETON : '';
+  const back = match === '/missions/:id' || match === '/herd/session/:id' ? BACK_LINK_SKELETON
+    : match === '/llm/session/:id' ? LLM_BACK_LINK_SKELETON : '';
   const piMission = match === '/missions/:id' && decodeURIComponent(parts[1] || '').startsWith('pi:');
-  const rows = piMission ? 1 : match === '/analytics/models' || match === '/analytics/hosts' ? 2 : match === '/herd/session/:id' || match === '/analytics' || match === '/analytics/missions' ? 8 : match.startsWith('/services') || match.endsWith('-services') ? 7 : 5;
+  const rows = piMission ? 1 : match === '/analytics/models' || match === '/analytics/hosts' ? 2 : match === '/herd/session/:id' || match === '/analytics' || match === '/analytics/missions' || match.startsWith('/llm') ? 8 : match.startsWith('/services') || match.endsWith('-services') ? 7 : 5;
   return `<div data-skeleton aria-busy="true" role="status" aria-label="Loading page">${back}<div class="hd-live-head"><div class="hd-skeleton hd-skeleton--title"></div></div>${skeleton('page content', { rows, height: 64, bare: true })}</div>`;
 }
 
