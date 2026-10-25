@@ -80,6 +80,20 @@ class TestMissionTelemetryState:
         clock[0] += 130
         assert repo.get_mission("pi:MSN-one")["telemetry_state"] == "stale"
 
+    def test_explicit_disconnected_connection_is_stale(self):
+        repo = ControlPlaneRepo(now=lambda: NOW)
+        self._pi_mission(repo)
+        IngestService(repo).ingest(
+            envelope(connection="disconnected", activity={}, snapshot_at=None))
+        assert repo.get_mission("pi:MSN-one")["telemetry_state"] == "stale"
+
+    def test_updating_connection_is_live(self):
+        repo = ControlPlaneRepo(now=lambda: NOW)
+        self._pi_mission(repo)
+        IngestService(repo).ingest(
+            envelope(connection="updating", activity={}, snapshot_at=None))
+        assert repo.get_mission("pi:MSN-one")["telemetry_state"] == "live"
+
     def test_herdr_mission_ignores_pi_activity_key(self):
         # A herdr mission and a pi mission share the raw id but not the row;
         # the herdr record must not inherit the pi collector's freshness.
