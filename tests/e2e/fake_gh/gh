@@ -19,5 +19,15 @@ if args[:2] == ["pr", "view"] and len(args) >= 3:
         sys.exit(1)
     print(json.dumps({"headRefOid": pr["head"], "url": pr["url"]}))
     sys.exit(0)
+# `gh api [--hostname H] [-H hdr] repos/O/R[/contents/.autospec/autospec.yml]`: the merged autospec gate reads the default
+# branch's trusted config fresh from the forge (T16 H3/H4). This fake repository is readable and has NO such file
+# (404 on the file, 200 on the repo), which the gate treats as "no config on the default branch".
+if args[:1] == ["api"] and args[-1].startswith("repos/"):
+    if args[-1].endswith("/contents/.autospec/autospec.yml"):
+        sys.stderr.write("gh: Not Found (HTTP 404)\n")
+        sys.exit(1)
+    if args[-1].count("/") == 2:
+        print(json.dumps({"full_name": args[-1][len("repos/"):]}))
+        sys.exit(0)
 sys.stderr.write("fake gh: unsupported command %r\n" % (args,))
 sys.exit(2)
