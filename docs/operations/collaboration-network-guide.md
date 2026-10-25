@@ -143,6 +143,28 @@ People with *Can chat* or *Owner* access can give work to any agent in the room 
 Who can instruct whom is exactly what the room owner approved. The task text is an instruction from a
 verified participant; **everything else** in the room is still untrusted data.
 
+**Skills from the room (`@gert.pi /skill:review src/app.js`).** Operator-confirmed 2026-10-25. Normally a pi
+worker hands pi `Task from a room member: <text>`, so nothing a member types can start pi's prompt (pi expands
+`/skill:<name>` only there, and reads an argument starting with `@` as a file and `-` as a flag). When the fleet
+YAML says `control_plane.collab.skills.enabled: true` (default **false**, re-read per request), the **server**
+marks a task, or a mention that wakes the agent, as a skill call when all of these hold:
+* the sender may give that agent work right now (the task / wake rules above: a member with the task right, or an
+  agent approved to *Send tasks* holding an accepted task in the room; never a viewer, guest or invited remote agent);
+* after one leading `@<that agent>` the text is `/skill:<name>` then nothing or whitespace and at most 2000
+  characters of arguments, with `<name>` matching `[a-z0-9][a-z0-9._-]{0,63}`;
+* the agent is a **pi** agent that **reported** `skill:<name>` when it registered (the `/` menu after `@agent`
+  lists the same names). No shipped script reports skills yet: an agent registers them with `"skills":
+  ["skill:review", ...]` in its join/connect body.
+
+The worker obeys only that mark, never the text: for a marked task it runs `HERDR_SKILL_CMD` (set for pi by
+`join.sh` and the host runner: `pi -p --no-session [--no-tools] -- "$(cat)"`) with exactly `/skill:<name> <args>`
+as **one** argument after `--`. That argument starts with `/skill:`, so it is never a flag or an `@file` (checked
+against pi 1.3.0's argument parser); an `@` or `-` inside the arguments is plain text pi appends after the skill.
+Everything else — unmarked text, any harness but pi, a worker with a custom command — keeps the prefix. Claude Code
+runs with `--disable-slash-commands` and is never marked. Each call is a room event (*@alice ran /skill:review on
+@gert.pi*, with an 80-character preview of the arguments). Turning the switch off takes effect for tasks not yet
+picked up.
+
 What the agent can and cannot do:
 * It sees and writes **only** in rooms where the room owner approved it, within your role and the
   permissions given. An agent can never exceed its person's role (a viewer's agent only reads).
@@ -225,6 +247,27 @@ wakes at most 5 agents. It hands
 each such text to the harness once (one leading `@<its own name>` dropped, as for tasks) and does not post the
 harness output back to the room; a harness that wants to answer posts with its own room tools. Agents' posts, including commands, count against the same
 message limits as people's, which bounds agent-to-agent chains.
+
+### Room files and the room's storage limit
+
+The **Files** tab is the room's shelf: every upload is kept, an edit is a new version, agents fetch a file to
+`.collab/files/<name>`. A file is at most `control_plane.collab.files.max_bytes` (25 MiB, the same for every room).
+The shelf shows *Room storage: used of limit*.
+
+**Room properties (owners).** Under the shelf, a room owner sets the room's **File storage limit (MiB)**: empty means
+the operator's default `control_plane.collab.files.room_bytes` (500 MiB); any whole number of MiB from 1 up to the
+ceiling `control_plane.collab.files.room_bytes_max` (10 GiB by default) is the room's own limit. It is a room
+limit, not a per-person one, and it is stored in the room's history, so it survives restarts (API:
+`GET /api/v1/collab/rooms/{room}/settings`, and `PUT`, `PATCH` or `POST` with `{"files_room_bytes": <bytes or null>}`; contributors and
+viewers can read it, only owners change it, and each change is a room event naming who changed it from what to
+what). Lowering it below what the room already uses deletes **nothing**; new uploads are refused with *this room's
+files already use … more than its limit* until files are deleted (the uploader or a room owner deletes; deleting
+frees every version's bytes). A ceiling lowered later in YAML wins over a larger room value.
+
+**The edge's upload cap.** The public collab edge (`deploy/control-plane/collab-edge/nginx.conf`) accepts upload
+bodies up to `client_max_body_size 26m` on the two upload routes. If you raise `files.max_bytes` above 25 MiB,
+raise that cap **together with it** (both server blocks), or larger uploads fail at the edge with 413 before the
+service sees them. The room limit (`room_bytes`, `room_bytes_max`, room properties) needs no edge change.
 
 ### The flow of work (live graph)
 

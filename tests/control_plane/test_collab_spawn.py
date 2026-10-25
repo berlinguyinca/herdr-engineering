@@ -576,3 +576,17 @@ def test_link_targets_are_parsed_strictly():
         assert runner.link_target(bad) is None, bad
     assert runner.label_name("Fresh Name!") == "fresh-name" and runner.label_name("  ") is None
     assert runner.label_name("x" * 40) == "x" * 32 and runner.label_name(None) is None
+
+
+def test_a_pi_worker_also_gets_the_skill_command_and_claude_never_does(rig):
+    rig.r.cmds, rig.r.skill_cmds = runner.FAMILY_CMD_TOOLS, runner.FAMILY_SKILL_CMD_TOOLS
+    ask(rig, harness_type="pi", count=1)
+    ask(rig, harness_type="claude-code", count=1, name_prefix="cc")
+    rig.r.once()
+    runs = [line for line in calls(rig) if " pane run " in f" {line} "]
+    envs = [shlex.split(line.split("pane run ", 1)[1].split(" ", 1)[1]) for line in runs]
+    pi = [e for e in envs if any(x.startswith("HERDR_AGENT_CMD=pi ") for x in e)]
+    cc = [e for e in envs if any(x.startswith("HERDR_AGENT_CMD=claude") for x in e)]
+    assert pi and cc
+    assert "HERDR_SKILL_CMD=" + runner.FAMILY_SKILL_CMD_TOOLS["pi"] in pi[0]
+    assert not any(x.startswith("HERDR_SKILL_CMD=") for x in cc[0])

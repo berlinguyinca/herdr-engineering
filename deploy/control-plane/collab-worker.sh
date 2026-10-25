@@ -10,6 +10,9 @@
 #                                           directory is writable, nothing else on the host is visible
 #   HERDR_AUDIT=/path/NAME.log              append a hash-chained line per task: what ran, how it ended,
 #                                           and which files in the work directory it added, changed or removed
+#   HERDR_SKILL_CMD='pi -p --no-session -- "$(cat)"'   pi only: runs a task the SERVER marked as a skill call
+#                                           (skill: {name}); stdin is then exactly "/skill:<name> <args>". Without
+#                                           it, or for anything unmarked, HERDR_AGENT_CMD runs as usual.
 set -euo pipefail
 BASE='__HERDR_BASE__'
 F="${1:?first argument: the agent file written by register.sh}"
@@ -24,6 +27,7 @@ call() {  # call TOOL JSON_ARGS  -> the MCP JSON-RPC reply on stdout
 }
 
 CMD="${HERDR_AGENT_CMD:-cat >/dev/null; echo acknowledged}"
+SKILL_CMD="${HERDR_SKILL_CMD:-}"
 SANDBOX="${HERDR_SANDBOX:-}"; AUDIT="${HERDR_AUDIT:-}"
 NAME=$(jget name); WORK="$HOME/herdr-agents/work/$NAME"
 TMP=$(mktemp -d); mkdir "$TMP/tasks"; trap 'rm -rf "$TMP" "$HDR"' EXIT
@@ -102,11 +106,24 @@ def own_text(t):
     if m and m.group(1).lower() in own:
         text = text[m.end():]
     return text
+def save(path, t):
+    # Only the SERVER's mark makes a skill call, and only when the text really is "/skill:<that name>" then
+    # whitespace or nothing: pi then gets "/skill:<name> <args>" (one space; pi's name ends at a space). The
+    # whole prompt stays ONE argument after "--", so an "@" or "-" inside the args is never a file or a flag.
+    text, sk = own_text(t), t.get("skill")
+    name = sk.get("name") if isinstance(sk, dict) else None
+    if isinstance(name, str) and re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,63}", name):
+        m = re.fullmatch(r"/skill:" + re.escape(name) + r"(?:\s+(.*))?", text, re.S)
+        if m:
+            args = (m.group(1) or "").strip()
+            text = f"/skill:{name}" + (f" {args}" if args else "")
+            open(path[:-4] + ".skill", "w").write(name)
+    open(path, "w").write(text)
 for t in tasks:
-    open(f"{sys.argv[2]}/tasks/{t['task_id']}.txt", "w").write(own_text(t))
+    save(f"{sys.argv[2]}/tasks/{t['task_id']}.txt", t)
     print(t["task_id"])
 for m in body.get("mentions", []):
-    open(f"{sys.argv[2]}/mentions/{int(m['sequence']):012d}.txt", "w").write(own_text(m))
+    save(f"{sys.argv[2]}/mentions/{int(m['sequence']):012d}.txt", m)
 if isinstance(body.get("mention_cursor"), int) and not isinstance(body.get("mention_cursor"), bool):
     open(f"{sys.argv[2]}/mc", "w").write(str(body["mention_cursor"]))
 PY
@@ -115,15 +132,16 @@ PY
     [ -e "$f" ] || continue
     tid=$(basename "$f" .txt)
     call task_update "$(python3 -c 'import sys,json;print(json.dumps({"task_id":sys.argv[1],"status":"accepted"}))' "$tid")" >/dev/null || true
-    status=done; rc=0
-    audit task_start task_id="$tid" text_sha256="$(sha256sum "$f" | cut -d' ' -f1)" text_bytes="$(wc -c < "$f")"
+    status=done; rc=0; run="$CMD"; skill=""
+    if [ -e "${f%.txt}.skill" ]; then skill=$(cat "${f%.txt}.skill"); rm -f "${f%.txt}.skill"; [ -z "$SKILL_CMD" ] || run="$SKILL_CMD"; fi
+    audit task_start task_id="$tid" text_sha256="$(sha256sum "$f" | cut -d' ' -f1)" text_bytes="$(wc -c < "$f")" skill="$skill"
     [ -z "$SANDBOX" ] || snap "$WORK" "$TMP/before.json"
     started=$(date +%s)
     # a harness whose model never answers must not stall this agent for ever
     if [ -n "$SANDBOX" ]; then
-      timeout "${HERDR_TASK_TIMEOUT:-900}" "$SANDBOX" "$WORK" "$CMD" < "$f" > "$TMP/out.txt" 2>&1 || rc=$?
+      timeout "${HERDR_TASK_TIMEOUT:-900}" "$SANDBOX" "$WORK" "$run" < "$f" > "$TMP/out.txt" 2>&1 || rc=$?
     else
-      timeout "${HERDR_TASK_TIMEOUT:-900}" bash -c "$CMD" < "$f" > "$TMP/out.txt" 2>&1 || rc=$?
+      timeout "${HERDR_TASK_TIMEOUT:-900}" bash -c "$run" < "$f" > "$TMP/out.txt" 2>&1 || rc=$?
     fi
     [ "$rc" -eq 0 ] || status=failed
     changes=""
@@ -136,12 +154,13 @@ PY
   done
   for f in "$TMP"/mentions/*.txt; do      # a mention: the harness reads it once; nothing is posted back
     [ -e "$f" ] || continue
-    seq=$(basename "$f" .txt); rc=0
-    audit mention_start sequence="$seq" text_sha256="$(sha256sum "$f" | cut -d' ' -f1)" text_bytes="$(wc -c < "$f")"
+    seq=$(basename "$f" .txt); rc=0; run="$CMD"; skill=""
+    if [ -e "${f%.txt}.skill" ]; then skill=$(cat "${f%.txt}.skill"); rm -f "${f%.txt}.skill"; [ -z "$SKILL_CMD" ] || run="$SKILL_CMD"; fi
+    audit mention_start sequence="$seq" text_sha256="$(sha256sum "$f" | cut -d' ' -f1)" text_bytes="$(wc -c < "$f")" skill="$skill"
     if [ -n "$SANDBOX" ]; then
-      timeout "${HERDR_TASK_TIMEOUT:-900}" "$SANDBOX" "$WORK" "$CMD" < "$f" > "$TMP/out.txt" 2>&1 || rc=$?
+      timeout "${HERDR_TASK_TIMEOUT:-900}" "$SANDBOX" "$WORK" "$run" < "$f" > "$TMP/out.txt" 2>&1 || rc=$?
     else
-      timeout "${HERDR_TASK_TIMEOUT:-900}" bash -c "$CMD" < "$f" > "$TMP/out.txt" 2>&1 || rc=$?
+      timeout "${HERDR_TASK_TIMEOUT:-900}" bash -c "$run" < "$f" > "$TMP/out.txt" 2>&1 || rc=$?
     fi
     audit mention_end sequence="$seq" exit="$rc" output_bytes="$(wc -c < "$TMP/out.txt")"
     echo "mention $seq exit $rc"

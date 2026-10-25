@@ -86,6 +86,11 @@ FAMILY_CMD_TOOLS = {
     "agent": "",
 }
 FAMILY_CMD = FAMILY_CMD_TOOLS       # every family the runner knows; which are started depends on --allow-tools
+# pi only: the command for a task the SERVER marked as a skill call (`@agent /skill:x args`, YAML
+# collab.skills.enabled). The worker then hands pi exactly "/skill:<name> <args>" as ONE argument after "--": it
+# starts with "/skill:", so it is never a flag or an @file, and pi expands the skill. Everything else keeps the prefix.
+FAMILY_SKILL_CMD_TEXT_ONLY = {"pi": 'pi -p --no-session --no-tools -- "$(cat)"'}
+FAMILY_SKILL_CMD_TOOLS = {"pi": 'pi -p --no-session -- "$(cat)"'}
 FAMILY_ROLE = {"claude-code": "claude", "codex": "codex", "pi": "pi", "agent": "agent"}
 FAMILY_BIN = {"claude-code": "claude", "codex": "codex", "pi": "pi"}
 AGENT_DIR = "herdr-agents"
@@ -394,6 +399,7 @@ class Runner:
         self.targets: dict[str, str | None] = {}          # host label -> ssh target (None = this machine)
         self.public_url = ""
         self.cmds = FAMILY_CMD_TOOLS if allow_tools else FAMILY_CMD_TEXT_ONLY
+        self.skill_cmds = FAMILY_SKILL_CMD_TOOLS if allow_tools else FAMILY_SKILL_CMD_TEXT_ONLY
         # collab-sandbox.sh: every task then runs in a bubblewrap box where only the agent's own work directory
         # is writable. With a sandbox, a host without a working bwrap is not offered any harness family.
         self.sandbox_text = sandbox.read_text(encoding="utf-8") if sandbox else None
@@ -575,9 +581,11 @@ class Runner:
         if not isinstance(pane, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9:_.-]{0,39}", pane):
             raise Failure("herdr returned an unexpected pane id")
         cmd = self.cmds[family]
+        skill_cmd = getattr(self, "skill_cmds", {}).get(family) if cmd else None
         boxed = (f'HERDR_SANDBOX="$HOME/{AGENT_DIR}/collab-sandbox.sh" HERDR_AUDIT="$HOME/{AGENT_DIR}/audit/{name}.log" '
                  if self.sandbox_text is not None else "")
-        line = (f'{boxed}{"HERDR_AGENT_CMD=" + shlex.quote(cmd) + " " if cmd else ""}"$HOME/{AGENT_DIR}/worker.sh" '
+        line = (f'{boxed}{"HERDR_AGENT_CMD=" + shlex.quote(cmd) + " " if cmd else ""}'
+                f'{"HERDR_SKILL_CMD=" + shlex.quote(skill_cmd) + " " if skill_cmd else ""}"$HOME/{AGENT_DIR}/worker.sh" '
                 f'"$HOME/{AGENT_DIR}/{name}.json"')
         self.run(self.herdr_cmd(host, ["pane", "run", pane, line]), timeout=30)
         try:        # tie the agent to its pane so the dashboard can show it with the fabric session

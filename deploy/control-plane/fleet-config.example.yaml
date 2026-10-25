@@ -62,7 +62,14 @@ sections:
         # C5 room files (defaults shown; re-read per request):
         # files:
         #   max_bytes: 26214400            # 25 MiB per file
-        #   room_bytes: 524288000          # 500 MiB per room; deleting a file frees its versions' bytes
+        #   room_bytes: 524288000          # 500 MiB per room by default; deleting a file frees its versions' bytes
+        #   room_bytes_max: 10737418240    # 10 GiB: the most a room owner may set as the room's own limit
+        #                                  # (room properties). max_bytes stays global; raising it also needs the
+        #                                  # collab edge's 26m upload body cap raised (collab-edge/nginx.conf).
+        # `@gert.pi /skill:review args` from the room runs that pi skill (the server checks sender, reported
+        # skill and harness; off by default, re-read per request):
+        # skills:
+        #   enabled: true
       # Variables docker compose itself substitutes; deploy.sh renders exactly this
       # mapping into a transient 0600 env file. The first eight keys are required.
       compose:

@@ -19,7 +19,7 @@ import {
 import { ensureConversationStyles, mountComposer } from './conversation-composer.js';
 import { providers, ROOM_COMMANDS, unresolvedMentions, ambiguousMentions, mentionChips, refChips, resolveToken, quiet } from './collab-mention.js';
 import { renderMarkdown } from './conversation-markdown.js';
-import { mountFilesShelf, fileSize } from './collab-files-view.js';
+import { mountFilesShelf, mountRoomProperties, fileSize } from './collab-files-view.js';
 import { commandCard, isCommandEvent, presenceLabel, unreadBadge } from './collab-cards.js';
 import {
   AuthError, CollabApi, TokenStore, authorizeUrl, exchangeCode, parseRedirect, pkcePair, randomString,
@@ -607,7 +607,7 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
       <section class="cx-panel cx-cols" id="hcn-p-tasks" hidden>
         ${canPost ? '<div class="hd-card cx-stack"><div class="hd-card__title">Give a task</div><form id="hcn-task" class="cx-stack"><label class="cx-field">To<select name="target" id="hcn-task-target"></select></label><label class="cx-field">What should it do?<textarea class="cx-input" name="text" required maxlength="4000" rows="4"></textarea></label><button class="hd-btn" type="submit">Send task</button><span id="hcn-task-msg" class="cx-msg" role="alert"></span></form></div>' : ''}
         <div class="hd-card cx-stack"><div class="hd-card__title">Tasks</div><div id="hcn-tasks"></div></div></section>
-      ${guest ? '' : '<section class="hd-card cx-stack cx-panel" id="hcn-p-files" hidden aria-label="Room files"><div class="hd-card__title">Files</div><div id="hcn-files"></div></section>'}
+      ${guest ? '' : `<section class="cx-stack cx-panel" id="hcn-p-files" hidden><section class="hd-card cx-stack" aria-label="Room files"><div class="hd-card__title">Files</div><div id="hcn-files"></div></section>${canInvite ? '<div id="hcn-room-props"></div>' : ''}</section>`}
       ${guest ? '' : `<section class="cx-panel cx-cols" id="hcn-p-agents" hidden>
         <div class="hd-card cx-stack"><div class="hd-card__title">Agents in this room</div><div id="hcn-roomagents"></div></div>
         ${canInvite ? '<div class="hd-card cx-stack"><div class="hd-card__title">Agent requests</div><div id="hcn-requests"></div></div>' : ''}
@@ -694,6 +694,13 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
         onDelete: (row) => { if (confirm(`Delete ${row.name} and all its versions?`)) shelfAct(() => api.deleteFile(roomId, row.id), `Deleted ${row.name}`); },
       } : {}),
     }) : null;
+    // Room properties (owners): the room's own total file-storage limit; the server holds it to the YAML ceiling
+    let roomSettings = null;
+    const props = $('hcn-room-props') ? mountRoomProperties($('hcn-room-props'), {
+      save: async (body) => { const next = await api.setRoomSettings(roomId, body); if (settingsOk(next)) roomSettings = next; kick(); return roomSettings; },
+    }) : null;
+    const settingsOk = (s) => Number.isFinite(s?.files_room_bytes_effective) && Number.isFinite(s?.files_room_bytes_max);
+    if (props) api.roomSettings(roomId).then((s) => { if (settingsOk(s)) { roomSettings = s; props.update(s); } }).catch(() => { /* not readable: keep */ });
     let since = -1;
     let ctl = null;
     let wake = null;
@@ -769,7 +776,10 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
         return row;
       }
       row.className = 'cx-event';
-      row.textContent = e.event_type === 'agent_renamed' ? `@${e.old_name} is now @${e.name}` : e.event_type.replaceAll('_', ' ');
+      row.textContent = e.event_type === 'agent_renamed' ? `@${e.old_name} is now @${e.name}`
+        : e.event_type === 'skill_invoked' && e.skill ? `${senderName(e.skill.by)} ran /skill:${e.skill.name} on @${tname(e.skill.agent_id)}`
+          : e.event_type === 'room_settings_set' && e.settings ? `${senderName({ type: 'user', id: e.actor_user_id })} set the room's file storage limit to ${e.settings.files_room_bytes == null ? 'the default' : fileSize(e.settings.files_room_bytes)}`
+          : e.event_type.replaceAll('_', ' ');
       return row;
     }
     const addEvents = (events) => {
@@ -1460,6 +1470,10 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
       if (s.agents) { S.agents = s.agents; S.agents.forEach((a) => agentName.set(a.agent_id, a.name)); }
       if (s.people) S.people = s.people;
       if (Array.isArray(s.files)) { S.files = s.files; shelf?.update(S.files); }
+      if (s.files_usage) {
+        shelf?.usage(s.files_usage);
+        if (props && roomSettings && Number.isFinite(s.files_usage.limit_bytes)) props.update({ ...roomSettings, files_used_bytes: s.files_usage.used_bytes, files_room_bytes_effective: s.files_usage.limit_bytes });
+      }
       S.links = s.links ?? null; S.missions = s.missions ?? null;
       S.tasks = s.tasks || []; S.flow = s.flow || null; S.requests = s.requests || null;
       S.agents.forEach(a=>agentName.set(a.agent_id,namedAgent(a).display_name || a.name));

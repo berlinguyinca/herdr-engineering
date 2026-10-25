@@ -185,6 +185,7 @@ COLLAB_KEYS = frozenset({"cognito_pool", "cognito_clients", "cognito_group", "co
                          "open_signup", "approver_groups", "dashboard_hosts", "replay_history", "steering",
                          "contextual", "insights", "files",
                          "people",        # people: {handle: {github: login}} for /assign; public logins only
+                         "skills",        # skills: {enabled} for `@agent /skill:x` from the room; off by default
                          "summary_fix",   # summary_fix: ids of the operator's summary-fix room and agent, no secret
                          "delegation_enabled"})
 
@@ -234,6 +235,12 @@ def collab_values(cfg: FleetConfig) -> dict:
         from .control_plane.collab_files import normalize_files
         try:
             normalize_files(collab["files"])
+        except ValueError as exc:
+            raise FleetConfigError(str(exc)) from None
+    if "skills" in collab:
+        from .control_plane.collab_skills import normalize_skills
+        try:
+            normalize_skills(collab["skills"])
         except ValueError as exc:
             raise FleetConfigError(str(exc)) from None
     if "people" in collab:

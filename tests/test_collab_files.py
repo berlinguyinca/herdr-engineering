@@ -124,7 +124,7 @@ def test_the_room_quota_is_enforced_and_deletion_reclaims_it(w):
 
 
 def test_defaults_and_yaml_validation():
-    assert normalize_files(None) == {"max_bytes": 25 * MiB, "room_bytes": 500 * MiB}
+    assert normalize_files(None) == {"max_bytes": 25 * MiB, "room_bytes": 500 * MiB, "room_bytes_max": 10 * 1024 * MiB}
     for bad in ({"max_bytes": 0}, {"max_bytes": "1"}, {"room_bytes": -1}, {"max_bytes": 10, "room_bytes": 5},
                 {"other": 1}, "x", {"max_bytes": True}):
         with pytest.raises(ValueError):
