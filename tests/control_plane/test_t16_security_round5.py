@@ -179,6 +179,15 @@ def test_a_lock_naming_our_own_pid_is_stale_so_a_container_restarting_as_pid_1_s
     log.close()
 
 
+def test_a_lock_this_process_still_holds_is_not_stale(tmp_path, monkeypatch):
+    _no_flock(monkeypatch)
+    log = FileEventLog(str(tmp_path / "collab.jsonl"))
+    with pytest.raises(OSError, match="held by this process"):
+        FileEventLog(str(tmp_path / "collab.jsonl"))
+    log.close()
+    FileEventLog(str(tmp_path / "collab.jsonl")).close()
+
+
 def test_a_live_local_holder_still_blocks_and_the_message_does_not_claim_a_repair(tmp_path, monkeypatch):
     _no_flock(monkeypatch)
     (tmp_path / "collab.jsonl.lock").write_text(f"{socket.gethostname()} {os.getppid()}")

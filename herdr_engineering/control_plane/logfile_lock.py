@@ -6,7 +6,7 @@ an open append descriptor. Both open the file read-write (NFS lock emulation nee
 and a read-open for a shared one), and re-check after locking that the path still names the file they locked.
 Where ``flock`` is unsupported (some NFS/FUSE mounts: ENOLCK, ENOSYS, EOPNOTSUPP) a cooperative ``<log>.lock`` file
 naming ``<host> <pid>`` takes over, with a loud log line. A lock written on another host is always treated as live (its
-pid cannot be checked from here); one naming this host and this very pid is stale (a containerised server restarts as
+pid cannot be checked from here); one naming this host and this very pid, but not held by this process, is stale (a containerised server restarts as
 PID 1 every time and must start); a legacy pid-only file is read as this host. ``acquire`` never raises for "unsupported": it returns a ``Held`` whose
 ``mode`` says what protection exists, so a server still starts and the repair can decide to refuse.
 """
@@ -20,6 +20,7 @@ import socket
 
 log = logging.getLogger(__name__)
 _flock = fcntl.flock                      # test seam
+_HELD: set[str] = set()                  # lock files THIS process holds (our own pid in one we do not hold is stale)
 UNSUPPORTED = {errno.ENOLCK, errno.ENOSYS, errno.EOPNOTSUPP, errno.ENOTSUP, errno.EINVAL, errno.EBADF}
 
 
@@ -33,6 +34,7 @@ class Held:
 
     def release(self) -> None:
         if self.lockfile:
+            _HELD.discard(self.lockfile)
             try:
                 os.unlink(self.lockfile)
             except OSError:
@@ -83,6 +85,8 @@ def _take_lockfile(path: str) -> str | None:
             if host is not None and host != me:
                 raise Busy(f"{lock} is held by process {pid} on host {host}; if that host is gone, remove the "
                            "file by hand") from None
+            if pid == os.getpid() and lock in _HELD:
+                raise Busy(f"{lock} is held by this process") from None
             if pid and pid != os.getpid() and _alive(pid):
                 raise Busy(f"{lock} is held by running process {pid}") from None
             try:
@@ -94,6 +98,7 @@ def _take_lockfile(path: str) -> str | None:
             return None
         with os.fdopen(fd, "w") as fh:
             fh.write(f"{me} {os.getpid()}")
+        _HELD.add(lock)
         return lock
     return None
 
