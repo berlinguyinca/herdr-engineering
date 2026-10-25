@@ -1597,3 +1597,17 @@ test('mission reviews page lists verdict, findings and PR merge status', async (
     assert.ok(!/merge|approve/i.test(text), 'reviews page must not offer merge/approve controls');
   }, { BURST: '0' });
 });
+
+test('mission detail links to the delivery section pages', async () => {
+  await withApp(async ({ page, base }) => {
+    const key = await alphaMissionKey(page, base);
+    // The mission detail page now carries the section nav (issue #34/#35).
+    await page.goto(`${base}/#/missions/${encodeURIComponent(key)}`);
+    await page.locator('a:has-text("Tests & builds")').first().waitFor({ timeout: 15000 });
+    await page.locator('a:has-text("Reviews & PRs")').first().click();
+    await page.waitForFunction(
+      () => (document.body ? document.body.innerText : '').includes('Pull requests'),
+      null, { timeout: 15000 });
+    assert.ok((await bodyText(page)).includes('PR #7'), 'review section must render via detail nav');
+  }, { BURST: '0' });
+});

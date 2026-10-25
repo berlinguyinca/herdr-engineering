@@ -322,6 +322,33 @@ def test_redact_payload_keeps_author_logins_but_still_redacts_auth_keys():
     assert out["auth"] == out["auth_token"] == out["Authorization"] == "[REDACTED]"
 
 
+def test_redact_delivery_preserves_counts_and_urls_but_scans_values():
+    from herdr_engineering.control_plane.redact import redact_delivery
+    # Delivery records must keep numeric counts, urls and status text, while a
+    # leaked secret anywhere in a string value is redacted.
+    rec = {
+        "test_run_id": "tr1", "passed": 4, "failed": 1, "total": 5,
+        "url": "https://example.com/pr/1", "status": "failed",
+        "results": [{"summary": "runner leaked token abc123xyz789"}],
+        "api_key": "sk-abcDEF123456",
+    }
+    out = redact_delivery(rec)
+    assert out["passed"] == 4 and out["failed"] == 1 and out["total"] == 5
+    assert out["url"] == "https://example.com/pr/1" and out["status"] == "failed"
+    assert out["test_run_id"] == "tr1"
+    assert "abc123xyz789" not in out["results"][0]["summary"]
+    # a key whose NAME hints at a secret is still redacted wholesale
+    assert out["api_key"] == "[REDACTED]"
+
+
+def test_redact_delivery_redacts_a_secret_in_a_passed_value():
+    from herdr_engineering.control_plane.redact import redact_delivery
+    # The 'passed' key must not be blanked merely because it contains 'pass',
+    # but a secret string sitting in that value is still scanned and redacted.
+    out = redact_delivery({"passed": "sk-abcDEF123456"})
+    assert "abcDEF123456" not in out["passed"]
+
+
 def test_redact_does_not_eat_ids_that_merely_end_in_sk_dash_but_still_redacts_real_keys():
     assert redact_text("task-s6lease") == "task-s6lease"
     assert redact_text("disk-image-1 and risk-profile-high") == "disk-image-1 and risk-profile-high"

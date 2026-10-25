@@ -332,7 +332,7 @@ async function viewMission(parts, revision) {
     return { refresh() {}, dispose: combineDisposers(relatedDispose, disposeActivity) };
   }
   if (!m) { root.innerHTML = '<herdr-error message="Mission not found"></herdr-error>'; return; }
-  root.innerHTML = `<a href="#/missions">← Missions</a><h1 style="overflow-wrap:anywhere">${key.startsWith('pi:') ? 'Pi mission' : esc((m.title || 'Mission').slice(0, 180))}</h1>${key.startsWith('pi:') ? '<div id="live-mission-detail"></div>' : ''}<div id="mission-story"></div><div id="related-panel"></div><div id="mission-history"></div>`;
+  root.innerHTML = `<a href="#/missions">← Missions</a><h1 style="overflow-wrap:anywhere">${key.startsWith('pi:') ? 'Pi mission' : esc((m.title || 'Mission').slice(0, 180))}</h1>${missionSectionNav(key)}${key.startsWith('pi:') ? '<div id="live-mission-detail"></div>' : ''}<div id="mission-story"></div><div id="related-panel"></div><div id="mission-history"></div>`;
   // The story (what happened, how it ended, what needs you) sits above the recorded history; when it is unavailable the page is as before.
   const story = mountMissionStory(document.getElementById('mission-story'), client, key);
   const relatedDispose = showRelated('mission', key, null, relatedIntegrationLinks(m,'mission',key));
@@ -408,8 +408,13 @@ function runDuration(run) {
   if (!run.started_at) return null;
   const start = Date.parse(run.started_at);
   if (Number.isNaN(start)) return null;
-  const end = run.ended_at ? Date.parse(run.ended_at) : Date.now();
-  const ms = (Number.isNaN(end) ? start : end) - start;
+  // Only a run that is still in progress uses the current clock; a run without
+  // an end timestamp that is not running has no trustworthy duration. Never
+  // fabricate a duration for a completed run with a missing end.
+  const running = /^(running|in progress|in_progress|active|queued|pending)$/.test((run.status || '').toLowerCase());
+  const end = run.ended_at ? Date.parse(run.ended_at) : (running ? Date.now() : NaN);
+  if (Number.isNaN(end)) return null;
+  const ms = end - start;
   return ms >= 0 ? formatDuration(ms) : null;
 }
 
@@ -422,32 +427,9 @@ function missionSectionNav(key) {
     + `</nav>`;
 }
 
-async function viewMissionTests(parts) {
-  const key = decodeURIComponent(parts[1]);
-  let mission = null;
-  try { mission = await client.getMission(key); } catch (error) { if (error.status !== 404) throw error; }
-  if (!mission) {
-    root.innerHTML = `<a href="#/missions">← Missions</a><herdr-error message="Mission not found"></herdr-error>`;
-    return;
-  }
-  const title = (mission.title || 'Mission').slice(0, 180);
-  root.innerHTML = `<a href="#/missions">← Missions</a><h1 style="overflow-wrap:anywhere">${esc(title)} · Tests & builds</h1>${missionSectionNav(key)}<div id="mission-tests"></div>`;
-  const host = document.getElementById('mission-tests');
-  let tests = [], builds = [];
-  try {
-    const [t, b] = await Promise.all([client.missionTests(key), client.missionBuilds(key)]);
-    tests = (t && t.tests) || []; builds = (b && b.builds) || [];
-  } catch (error) {
-    host.innerHTML = `<herdr-error message="${esc(error.message)}"></herdr-error>`;
-    return;
-  }
-  const runs = [...builds.map((r) => ({ ...r, isBuild: true })), ...tests.map((r) => ({ ...r, isBuild: false }))]
-    .sort((a, b) => (b.started_at || '').localeCompare(a.started_at || ''));
-  if (!runs.length) {
-    host.innerHTML = '<herdr-empty message="No tests or builds recorded for this mission"></herdr-empty>';
-    return;
-  }
-  host.innerHTML = runs.map((run) => {
+function renderDeliveryRuns(runs) {
+  if (!runs.length) return '<herdr-empty message="No tests or builds recorded for this mission"></herdr-empty>';
+  return runs.map((run) => {
     const st = runStatusText(run);
     const counts = ['passed', 'failed', 'skipped', 'total']
       .filter((c) => run[c] != null)
@@ -461,6 +443,41 @@ async function viewMissionTests(parts) {
       + `<div class="hd-card__sub">${duration ? `Duration ${esc(duration)}` : 'Duration not recorded'}${run.started_at ? ` · started ${esc(formatTimestamp(run.started_at))}` : ''}</div>`
       + `</div>`;
   }).join('');
+}
+
+async function viewMissionTests(parts, revision) {
+  const key = decodeURIComponent(parts[1]);
+  let mission = null;
+  try { mission = await client.getMission(key); } catch (error) { if (error.status !== 404) throw error; }
+  if (revision !== renderRevision) return;
+  if (!mission) {
+    root.innerHTML = `<a href="#/missions">← Missions</a><herdr-error message="Mission not found"></herdr-error>`;
+    return;
+  }
+  const title = (mission.title || 'Mission').slice(0, 180);
+  root.innerHTML = `<a href="#/missions">← Missions</a><h1 style="overflow-wrap:anywhere">${esc(title)} · Tests & builds</h1>${missionSectionNav(key)}<div id="mission-tests"></div>`;
+  const host = document.getElementById('mission-tests');
+  let pending = false;
+  const loadRuns = async (initial) => {
+    if (pending || !host.isConnected || document.hidden) return;
+    pending = true;
+    try {
+      let tests = [], builds = [];
+      const [t, b] = await Promise.all([client.missionTests(key), client.missionBuilds(key)]);
+      tests = (t && t.tests) || []; builds = (b && b.builds) || [];
+      if (revision !== renderRevision || !host.isConnected) return;
+      const runs = [...builds.map((r) => ({ ...r, isBuild: true })), ...tests.map((r) => ({ ...r, isBuild: false }))]
+        .sort((a, b) => (b.started_at || '').localeCompare(a.started_at || ''));
+      if (initial) host.innerHTML = renderDeliveryRuns(runs);
+      else morph(host, renderDeliveryRuns(runs));
+    } catch (error) {
+      if (!host.isConnected) return;
+      if (initial) host.innerHTML = `<herdr-error message="${esc(error.message)}"></herdr-error>`;
+    } finally { pending = false; }
+  };
+  try { await loadRuns(true); } catch { /* not-found handled below */ }
+  if (revision !== renderRevision) return;
+  return { refresh: () => loadRuns(false), dispose() {} };
 }
 
 // A review's verdict text and a pull request's merge status, shown as text
@@ -482,25 +499,7 @@ function prStatusText(status) {
   return { label: status || 'Unknown', tone: s || 'unknown' };
 }
 
-async function viewMissionReviews(parts) {
-  const key = decodeURIComponent(parts[1]);
-  let mission;
-  try { mission = await client.getMission(key); } catch (error) { if (error.status !== 404) throw error; }
-  if (!mission) {
-    root.innerHTML = `<a href="#/missions">← Missions</a><herdr-error message="Mission not found"></herdr-error>`;
-    return;
-  }
-  const title = (mission.title || 'Mission').slice(0, 180);
-  root.innerHTML = `<a href="#/missions">← Missions</a><h1 style="overflow-wrap:anywhere">${esc(title)} · Reviews & PRs</h1>${missionSectionNav(key)}<div id="mission-reviews"></div>`;
-  const host = document.getElementById('mission-reviews');
-  let reviews = [], pulls = [];
-  try {
-    const [rv, pr] = await Promise.all([client.missionReviews(key), client.missionPulls(key)]);
-    reviews = (rv && rv.reviews) || []; pulls = (pr && pr.pulls) || [];
-  } catch (error) {
-    host.innerHTML = `<herdr-error message="${esc(error.message)}"></herdr-error>`;
-    return;
-  }
+function renderReviewsAndPulls(reviews, pulls) {
   const sections = [];
   sections.push(`<h2>Reviews</h2>`);
   if (!reviews.length) sections.push('<herdr-empty message="No reviews recorded for this mission"></herdr-empty>');
@@ -528,7 +527,40 @@ async function viewMissionReviews(parts) {
       + `<div class="hd-card__sub"><span>${esc(st.label)}</span>${branch ? ` · ${branch}` : ''}${pr.repository ? ` · ${esc(pr.repository)}` : ''}</div>`
       + `</div>`;
   }).join(''));
-  host.innerHTML = sections.join('');
+  return sections.join('');
+}
+
+async function viewMissionReviews(parts, revision) {
+  const key = decodeURIComponent(parts[1]);
+  let mission;
+  try { mission = await client.getMission(key); } catch (error) { if (error.status !== 404) throw error; }
+  if (revision !== renderRevision) return;
+  if (!mission) {
+    root.innerHTML = `<a href="#/missions">← Missions</a><herdr-error message="Mission not found"></herdr-error>`;
+    return;
+  }
+  const title = (mission.title || 'Mission').slice(0, 180);
+  root.innerHTML = `<a href="#/missions">← Missions</a><h1 style="overflow-wrap:anywhere">${esc(title)} · Reviews & PRs</h1>${missionSectionNav(key)}<div id="mission-reviews"></div>`;
+  const host = document.getElementById('mission-reviews');
+  let pending = false;
+  const loadReviews = async (initial) => {
+    if (pending || !host.isConnected || document.hidden) return;
+    pending = true;
+    try {
+      let reviews = [], pulls = [];
+      const [rv, pr] = await Promise.all([client.missionReviews(key), client.missionPulls(key)]);
+      reviews = (rv && rv.reviews) || []; pulls = (pr && pr.pulls) || [];
+      if (revision !== renderRevision || !host.isConnected) return;
+      if (initial) host.innerHTML = renderReviewsAndPulls(reviews, pulls);
+      else morph(host, renderReviewsAndPulls(reviews, pulls));
+    } catch (error) {
+      if (!host.isConnected) return;
+      if (initial) host.innerHTML = `<herdr-error message="${esc(error.message)}"></herdr-error>`;
+    } finally { pending = false; }
+  };
+  try { await loadReviews(true); } catch { /* handled inside */ }
+  if (revision !== renderRevision) return;
+  return { refresh: () => loadReviews(false), dispose() {} };
 }
 
 async function viewSessions() {

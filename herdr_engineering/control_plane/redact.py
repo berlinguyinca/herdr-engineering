@@ -63,8 +63,7 @@ _SECRET_KEY_HINTS = (
 #: Keys that merely CONTAIN a hint ("author" contains "auth") but carry no secret. The head-bound review quorum
 #: excludes the PR author's own approval by comparing this login (T06), so redacting it to "[REDACTED]" silently let
 #: an author approve their own PR (found by the T16 acceptance run).
-_PLAIN_KEYS = frozenset({"author", "authors", "author_login", "author_name",
-                       "passed", "failed", "skipped", "total"})
+_PLAIN_KEYS = frozenset({"author", "authors", "author_login", "author_name"})
 
 _BEGIN = re.compile(r"-----BEGIN[ A-Z]*PRIVATE KEY-----")
 _END = re.compile(r"-----END[ A-Z]*PRIVATE KEY-----")
@@ -131,6 +130,53 @@ def redact_values(payload: Any) -> Any:
         return {key: redact_values(value) for key, value in payload.items()}
     if isinstance(payload, (list, tuple)):
         return type(payload)(redact_values(item) for item in payload)
+    return payload
+
+
+#: Delivery-record keys whose VALUES are scanned for secrets but that never
+#: themselves carry a secret, so key-name redaction must not blank them. This
+#: is delivery-specific (unlike the global ``_PLAIN_KEYS``): the count fields
+#: ``passed``/``failed``/``skipped``/``total`` and ``url`` stay intact, while
+#: any string value (including a ``passed`` value that happens to be secret
+#: text) is still scanned by ``redact_text``.
+_DELIVERY_VALUE_KEYS = frozenset({
+    "passed", "failed", "skipped", "total", "url", "status", "verdict",
+    "reviewer", "repository", "branch", "base", "number", "severity",
+    "summary", "detail", "label", "kind", "test_run_id", "review_id",
+    "pr_id", "finding_id", "mission_id", "session_id", "started_at",
+    "ended_at", "created_at", "updated_at", "completed_at",
+})
+
+
+def redact_delivery(payload: Any, *, _seen=None) -> Any:
+    """Redact a delivery record (tests/builds/reviews/pulls) for display.
+
+    Numeric counts and structural fields survive; string values are scanned for
+    leaked secrets via ``redact_text``, so a secret in a ``passed`` value or a
+    finding ``summary`` is redacted while the count/url/status text is kept.
+    Keys whose names hint at a secret (e.g. a ``token`` or ``api_key`` field)
+    are redacted wholesale. Unlike ``redact_payload`` this never blanks the
+    ``passed`` count key merely because it contains the substring ``pass``.
+    """
+    _seen = _seen if _seen is not None else set()
+    if id(payload) in _seen:
+        return payload
+    _seen.add(id(payload))
+    if isinstance(payload, str):
+        return redact_text(payload)
+    if isinstance(payload, dict):
+        result = {}
+        for key, value in payload.items():
+            lk = str(key).lower()
+            if any(s in lk for s in _SECRET_KEY_HINTS) and lk not in _DELIVERY_VALUE_KEYS:
+                result[key] = _REDACTED
+            else:
+                result[key] = redact_delivery(value, _seen=_seen)
+        return result
+    if isinstance(payload, list):
+        return [redact_delivery(item, _seen=_seen) for item in payload]
+    if isinstance(payload, tuple):
+        return tuple(redact_delivery(item, _seen=_seen) for item in payload)
     return payload
 
 
