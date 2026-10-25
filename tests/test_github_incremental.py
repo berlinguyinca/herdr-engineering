@@ -1423,3 +1423,26 @@ def test_a_move_that_does_not_bump_the_project_is_caught_by_the_daily_full_read(
     assert {entry[1] for entry in item_calls(fake)} >= {p1}
     assert len([entry for entry in item_calls(fake, p1) if entry[2] is None]) == 1, "one full read of the project"
     assert sorted(i["status"] for i in monitor.project_items(p1, start=False)["items"]) == ["Done", "Done", "Todo"]
+
+
+def test_project_delta_rows_are_read_after_the_store_delta_so_a_new_item_is_never_reported_removed():
+    fake, p1, *_ = projects_seeded()
+    monitor = monitor_for(fake, {}, projects=ON)
+    monitor.refresh()
+    since = monitor.revision()
+    fake.move_item(p1, next(iter(fake._project(p1)["items"])), "Done")
+    monitor.refresh()
+    store = monitor._store
+    original = store.changes_since
+    added = []
+
+    def racing(rev):
+        # a pass commits a new item while the request is between its row listing and the store read
+        added.append(fake.add_item(p1, "Todo"))
+        store.changes_since = original
+        monitor.refresh()
+        return original(rev)
+    store.changes_since = racing
+    delta = monitor.changes(kind="project_items", since=since, project_id=p1, start=False)
+    assert added and added[0] in {row["item_id"] for row in delta["upserted"]}
+    assert all(row["key"] != added[0] for row in delta["removed"])

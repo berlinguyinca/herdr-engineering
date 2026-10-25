@@ -1673,9 +1673,8 @@ class GitHubMonitor:
         if kind not in {"repositories", "issues", "projects", "project_items"} or tab not in TABS:
             raise ValueError("unknown GitHub list")
         projects = kind in {"projects", "project_items"}
-        if projects:
-            # the same delta over the project rows (``projects``) or one project's items
-            listing = self.projects(start=start) if kind == "projects" else self.project_items(project_id, start=start)
+        if kind == "project_items":
+            self.project_items(project_id, start=start)  # not_found before any store read
         with self._lock:
             view = self.snapshot(start=start)
             current_revision = self._revision
@@ -1693,6 +1692,10 @@ class GitHubMonitor:
             except Exception:
                 delta = None
         field = {"projects": "projects", "project_items": "items"}.get(kind, kind)
+        if projects:
+            # the rows are read after the store delta, like the issue rows below: a row is never
+            # older than the revision, so a change committed meanwhile is never reported removed
+            listing = self.projects(start=start) if kind == "projects" else self.project_items(project_id, start=start)
         with self._lock:
             if kind == "projects":
                 rows = listing["projects"]
