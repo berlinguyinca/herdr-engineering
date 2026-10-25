@@ -13,7 +13,7 @@ control_plane:
   collab:
     delegation_enabled: true     # default false; YAML only (no environment variable, no command-line flag)
 ```
-It is a `control_plane.collab` key, so it works for both the combined server and `web --collab-only` (and for
+It is re-read on every request (T16 M15): editing it takes effect without a restart, and a missing, unreadable or non-boolean file means `false`. It is a `control_plane.collab` key, so it works for both the combined server and `web --collab-only` (and for
 `fleet config render-collab`). While it is `false` no delegation can be created, answered, proposed to or accepted; the MCP
 tools and the A2A skill/`tasks/*` methods are not advertised (A2A answers "no task state" as before). Rejecting a proposal,
 cancelling a task and reading what exists stay possible so an owner can clean up. Flipping it back to `false` is the kill switch:

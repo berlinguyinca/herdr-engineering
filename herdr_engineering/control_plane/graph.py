@@ -101,6 +101,7 @@ MAX_BINDINGS = 20                    # bindings listed per edge view
 SCAN_BUDGET = 3000                   # incident edges examined per node per read
 NEIGHBOR_SCAN_BUDGET = 500
 EDGE_SCAN_TOTAL = 20000              # incident edges a whole listing may examine
+FIRST_TS_MAX = 1_000_000            # event ids remembered for since_join stripping
 MAX_CONTRIBUTIONS = 5                # foreign values listed per commons field
 MAX_INSTANCES_PER_TRIPLE = 8         # live per-writer instances of a commons-from edge
 _GENERIC_LIMIT = "lineage object limit reached"
@@ -525,7 +526,7 @@ class _Reg:
         return min(ents, key=lambda t: self.firsts.get(t[4], t[2]))
 
     def contributions(self, primary: tuple | None, limit: int = MAX_CONTRIBUTIONS, *,
-                      owner: str | None = None, caller: str | None = None, vis=None) -> list:
+                      owner: str | None = None, caller: str | None = None, vis=None, keep=()) -> list:
         """Latest visible value of every writer other than the primary's: one per distinct writer,
         operators first, then the owner, then the caller's own, then newest admission first, so
         a flood of principals cannot push a legitimate contribution out of the cap."""
@@ -541,7 +542,11 @@ class _Reg:
 
         def prio(t):
             return (t[5], t[4][1] == owner, caller is not None and t[4][1] == caller, t[2])
-        return sorted(latest.values(), key=prio, reverse=True)[:limit]
+        # T16 M7: the configured trusted writers are selected BEFORE the cap (they are few, operator-listed, and
+        # do not count against it), so other writers can never push their values out of a read.
+        kept = [t for t in latest.values() if t[4][1] in keep]
+        rest = [t for t in latest.values() if t[4][1] not in keep]
+        return sorted(kept, key=prio, reverse=True) + sorted(rest, key=prio, reverse=True)[:limit]
 
 
 def _entry_visible(principal: Any, entry: tuple) -> bool:
@@ -749,6 +754,7 @@ class GraphProjection:
         # the room/mission context its scope names. The projection keeps only winners; replay and the ledger
         # need the events. Derived, never persisted: rebuild refills it exactly as it refills the graph.
         self._keep_log = keep_log
+        self._first_ts: dict[str, tuple] = {}      # event_id -> (earliest admission time, room) for since_join stripping
         self._log_ctx: dict[tuple, list] = {}        # context -> (event, op) in apply order: PER ROOM, so one busy
         self._log_evicted: dict[tuple, int] = {}     # room never costs another room anything
         # a replayed projection reads through the CURRENT projection: nothing is visible in the past
@@ -982,6 +988,17 @@ class GraphProjection:
             if mode == "noop":
                 return
             if self._keep_log:
+                eid = ev.get("event_id")
+                if isinstance(eid, str):          # T16 M2: when an event id was first admitted, and in which room
+                    t = _ts(ev)
+                    room = ev.get("room_id") if isinstance(ev.get("room_id"), str) else None
+                    known = self._first_ts.get(eid)
+                    if known is None:
+                        self._first_ts[eid] = (t, room)
+                        if len(self._first_ts) > FIRST_TS_MAX:        # bounded; an unknown id is stripped (fail closed)
+                            self._first_ts.pop(next(iter(self._first_ts)))
+                    else:                                              # an id reused by another event: keep the strictest
+                        self._first_ts[eid] = (min(t, known[0]), room if room == known[1] else None)
                 label = scope_label(ev)
                 if isinstance(label, tuple):
                     lst = self._log_ctx.setdefault(label[:3], [])
@@ -1225,6 +1242,7 @@ class GraphProjection:
                     return None
                 return live.attrs.get(key) if name == "attrs" else getattr(live, name)
         aid = (principal or {}).get("id")
+        keep = (principal or {}).get("keep_writers") or ()
         owner = None
         if node.commons:
             actors = None
@@ -1242,7 +1260,7 @@ class GraphProjection:
         contrib: dict = {}
         seen_entries = [e for e in (label, state) if e]
         for name, reg, ent, rv in (("label", node.label, label, vlabel), ("state", node.state, state, vstate)):
-            lst = reg.contributions(ent, owner=owner, caller=aid, vis=rv) if node.commons else []
+            lst = reg.contributions(ent, owner=owner, caller=aid, vis=rv, keep=keep) if node.commons else []
             seen_entries += lst
             if lst:
                 contrib[name] = [_prov(e, {"value": e[3][0], "reason": e[3][1]} if name == "state" else None, mem)
@@ -1252,7 +1270,7 @@ class GraphProjection:
         for k, reg in sorted(node.attrs.items()):
             av = mk(lreg("attrs", k)) if mk else None
             ent = node.pick(reg, av, owner)
-            lst = reg.contributions(ent, owner=owner, caller=aid, vis=av) if node.commons else []
+            lst = reg.contributions(ent, owner=owner, caller=aid, vis=av, keep=keep) if node.commons else []
             if ent is None and not lst:
                 continue                      # every writer of this key is hidden from the reader
             attrs[k] = ent[3] if ent else None
@@ -1573,7 +1591,7 @@ class GraphProjection:
                 """
                 reg = node.attrs.get("head_sha")
                 if reg is None:
-                    return None, None, "ok", None
+                    return None, None, "ok", None, None
                 acks = {e[3] for e in (node.attrs["head_resync"].by.values()
                                        if "head_resync" in node.attrs else ()) if e[5]}
                 cands, state, candidate = [], "ok", None
@@ -1591,12 +1609,17 @@ class GraphProjection:
                                 state = "resynced"
                         else:
                             state, candidate = "unverified", last_eid
-                    cands.append((rank, value, eid))
+                    cands.append((rank, value, eid, e[4]))
                 if not cands:
-                    return None, None, "ok", None
-                best = max(cands)
-                return best[1], best[2], state, candidate
-            head, head_event, head_state, candidate = trusted_head()
+                    return None, None, "ok", None, None
+                best = max(cands, key=lambda c: c[:3])
+                return best[1], best[2], state, candidate, best[3]
+            head, head_event, head_state, candidate, head_writer = trusted_head()
+            # T16 M9: the DECISION uses the real head whoever asks, but the head value (and the event ids that
+            # name it) is shown only to a reader who may see the field: it is a hidden value otherwise.
+            hreg = node.attrs.get("head_sha")
+            head_visible = head is None or (
+                hreg is not None and head_writer in hreg.by and _entry_visible(principal, hreg.by[head_writer]))
             author, _ = trusted("author")
             reviews, authors = [], set()
             for rid in sorted(reviewer_ids):
@@ -1616,6 +1639,7 @@ class GraphProjection:
                             "visible": self._edge_visible(principal, e)})
             return {"pr": pr_id, "head": head, "head_event_id": head_event,
                     "head_state": head_state, "head_resync_candidate": candidate, "author": author,
+                    "head_visible": head_visible,
                     "reviews": reviews, "authors": sorted(authors)}
 
     def list_nodes(self, principal, node_type: str, *, edge_type: str | None = None,
@@ -2075,6 +2099,57 @@ class GraphProjection:
                 fix(v)
         return out
 
+    def strip_before(self, out: Any, joins: dict | None) -> Any:
+        """T16 M2: ``replay_history: since_join`` for EVERY read, not just ``/lineage``. ``joins`` maps each room the
+        reader reads through to the reader's join time. The horizon of an event is the join time of the room that
+        SCOPES the event (never a room the caller merely named); an event with no room, or written from a room the
+        reader has no join time for (a mission shared with the reader's room), uses the reader's LATEST join; an
+        unknown event id, or an id shared with an earlier event, is treated as pre-join. Pre-join events lose their id, admission time and removal reason, and an edge that
+        was removed before the reader joined is dropped altogether (no endpoints, no writer). Mutates ``out``."""
+        if joins is None:
+            return out
+        first = self._first_ts
+        latest = max(joins.values()) if joins else None
+
+        def pre(eid):
+            got = first.get(eid) if isinstance(eid, str) else None
+            if got is None or latest is None:
+                return True
+            ts, room = got
+            # a mission event written from a room this reader is not in (shared mission) is still visible to the
+            # reader through THEIR room: fall back to their latest join, never to "everything is pre-join"
+            horizon = joins.get(room, latest) if room is not None else latest
+            return horizon is None or ts < horizon
+
+        def dead(edge):          # removed before the reader joined: its existence is pre-join history
+            return (isinstance(edge, dict) and "edge_type" in edge and edge.get("removed") is True
+                    and isinstance(edge.get("removal"), dict) and pre(edge["removal"].get("event_id")))
+
+        def walk(d, depth=0):
+            if depth > 12:
+                return
+            if isinstance(d, list):
+                d[:] = [x for x in d if not dead(x)]
+                for x in d:
+                    walk(x, depth + 1)
+                return
+            if not isinstance(d, dict):
+                return
+            for k in ("event_id", "first_event_id", "last_event_id"):
+                if d.get(k) is not None and pre(d[k]):
+                    d[k] = None
+                    if k == "event_id":
+                        for extra in ("admitted_at", "reason", "source_sequence"):
+                            if extra in d:
+                                d[extra] = None
+            for v in d.values():
+                walk(v, depth + 1)
+        had_edges = isinstance(out, dict) and bool(out.get("edges"))
+        walk(out)
+        if had_edges and isinstance(out, dict) and not out["edges"] and "node" not in out and "nodes" not in out:
+            raise KeyError("edge")           # the only edge asked for was removed before the reader joined
+        return out
+
     def room_lineage(self, principal, contexts, *, step: int | None = None, at: str | None = None,
                      since: float | None = None, **kw) -> dict:
         """The room graph at a position in the reader's event ledger (default: now)."""
@@ -2086,7 +2161,12 @@ class GraphProjection:
         def finish(state):
             entries, k, trimmed, past = state
             out = {"as_of": self._as_of(entries, k, trimmed), **past.room_graph(principal, contexts, **kw)}
-            return self._strip_pre_join(out, {ev["event_id"] for ev, _ in entries}) if since is not None else out
+            if since is None:
+                return out
+            # L2: the id set alone is fooled by a hostile writer reusing a victim's event id; the earliest-admission
+            # check below is not
+            joins = {r: since for r in {c[1] if c[0] == "room" else c[2] for c in contexts if c[0] in ("room", "mission")}}
+            return self.strip_before(self._strip_pre_join(out, {ev["event_id"] for ev, _ in entries}), joins)
         return self._coherent(compute, finish)
 
     def room_timeline(self, principal, contexts, *, step: int | None = None, at: str | None = None,

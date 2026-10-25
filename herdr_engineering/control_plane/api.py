@@ -33,6 +33,7 @@ from ..version import __version__
 from .envelope import EnvelopeConflict
 from .events import SequenceCollision
 from .graph import read_graph
+from .ingest import INGEST_ENTITY_TYPES
 from .redact import redact_ingest_body, redact_payload
 from .review_quorum import pr_review_quorum
 
@@ -335,7 +336,7 @@ class ControlPlaneServer:
         self.public_host = public_host or host
         self._public_httpd = None
         if collab is not None:
-            collab.hydrate(repo.take_collab_replay())
+            collab.hydrate_or_degrade(repo.take_collab_replay())     # T16 H1: a bad log disables collaboration only
             if not collab_only:
                 # membership-scoped lineage reads (lineage-events.md, "Scope semantics"): the
                 # isolated collab-only process never sees fabric data, so it serves none
@@ -471,6 +472,8 @@ class ControlPlaneServer:
         h["rustfs"] = "s3" if self.rustfs is not None else "memory"
         h["version"] = __version__
         h["commit"] = _COMMIT
+        if self.collab is not None and self.collab.degraded:
+            h["collab_degraded"] = True       # no detail here: the reason is in the server log and the repair command
         h["capabilities"] = ["mission_activity_v1", "ci_v1", "plannotator_reviews_v1", "github_v1"]
         if self.collab is not None:
             h["capabilities"].append("collab_v1")
@@ -1198,7 +1201,7 @@ def _make_handler(server, public=False, operator=False):
 
         def _rate_limit(self, key=None):
             path = self.path.split("?")[0]
-            who = key or self.client_address[0]
+            who = key or self._proxied_client()       # T16 M12: the same client identity on every route
             if self.command == "GET" and path.rstrip("/").endswith("/events/stream"):
                 # SSE is long-lived, so it is not counted like request bursts, but how often a
                 # client may open one is still bounded (it costs a token check each time).
@@ -1239,7 +1242,10 @@ def _make_handler(server, public=False, operator=False):
             except KeyError:
                 return self._send_json(404, {"error": "not found"})
             except EnvelopeConflict as exc:
-                return self._send_json(409, {"error": str(exc), "reason": "conflict"})
+                body = {"error": str(exc), "reason": exc.reason}
+                if exc.last_sequence is not None:
+                    body["last_sequence"] = exc.last_sequence
+                return self._send_json(409, body)
             except SequenceCollision:
                 return self._send_json(409, {"error": "sequence conflict", "reason": "conflict"})
             except PermissionError:
@@ -1574,10 +1580,21 @@ def _make_handler(server, public=False, operator=False):
             if resource == "steering":
                 return self._steering(parts)
             if resource == "ingest" and len(parts) == 5 and parts[4] == "sources":
-                return self._json({"sources": r.ledger.source_states(), "server_time": r._stamp()})
+                # T16 M4: emitter names, actor digests and sequences of other principals are operator
+                # business; every other key sees only the sources it emitted itself.
+                # ``?scope=all`` is the explicit full listing: operator-role keys only (403 otherwise). Without it an
+                # operator key still sees everything and any other key only its own domains.
+                is_operator = self._role() == "operator"
+                scope = (parse_qs(urlsplit(self.path).query).get("scope") or [""])[0]
+                if scope not in ("", "all", "own"):
+                    return self._json({"error": "scope must be all or own"}, 400)
+                if scope == "all" and not is_operator:
+                    return self._json({"error": "forbidden"}, 403)
+                own = None if (is_operator and scope != "own") else (self._principal().get("id") or "")
+                return self._json({"sources": r.ledger.source_states(own), "server_time": r._stamp()})
             if resource == "ingest":
                 return self._json({"endpoint": "POST /api/v1/ingest",
-                                   "entities": ["host", "session", "mission"]})
+                                   "entities": sorted(INGEST_ENTITY_TYPES)})
             if resource == "github":
                 what = parts[4] if len(parts) == 5 else ""
                 if len(parts) > 5 or (len(parts) == 5 and what not in {"issues", "issue"}):
