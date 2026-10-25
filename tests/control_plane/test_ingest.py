@@ -448,17 +448,40 @@ def test_v2_review_finding_unknown_review_does_not_consume_sequence():
            "source_sequence": 8, "entity_type": "review_finding",
            "entity_id": "missing-review", "event_type": "review_finding.added",
            "payload": {"severity": "blocker", "summary": "crash"}}
-    # Unknown review must not persist an envelope that a corrected retry can't replay.
+    # Unknown review must not persist an envelope (and must not consume its
+    # sequence) so a corrected retry with the SAME event id can replay it.
     with pytest.raises(KeyError):
         svc.ingest(env, {"id": "agent", "kind": "agent", "authenticated_by": "api_key"})
-    # A valid review then finding is accepted and finds exactly one finding.
+    # Create the review, then retry the identical pi-8 envelope: it must apply.
     svc.ingest({"schema_version": 2, "event_id": "pi-9", "source": "pi",
                 "source_sequence": 9, "entity_type": "review", "entity_id": "rv-9",
                 "event_type": "review.started",
                 "payload": {"mission_id": "M1", "reviewer": "codex", "status": "completed",
                             "verdict": "approved"}},
                {"id": "agent", "kind": "agent", "authenticated_by": "api_key"})
-    svc.ingest({**env, "entity_id": "rv-9", "event_id": "pi-10", "source_sequence": 10},
+    svc.ingest({**env, "entity_id": "rv-9"},
                {"id": "agent", "kind": "agent", "authenticated_by": "api_key"})
     reviews = repo.list_reviews(mission_id="pi:M1")
     assert len(reviews) == 1 and len(reviews[0]["findings"]) == 1
+
+
+def test_delivery_projections_survive_export_import_restore():
+    repo = ControlPlaneRepo()
+    svc = make_svc(repo)
+    svc.ingest({"entity_type": "test_run", "entity_id": "rt1",
+                "event_type": "test_run.started",
+                "payload": {"mission_id": "m1", "status": "passed", "passed": 4, "total": 4}})
+    svc.ingest({"entity_type": "review", "entity_id": "rvr1",
+                "event_type": "review.started",
+                "payload": {"mission_id": "m1", "reviewer": "codex",
+                            "status": "completed", "verdict": "approved"}})
+    svc.ingest({"entity_type": "pull_request", "entity_id": "prr1",
+                "event_type": "pull_request.opened",
+                "payload": {"mission_id": "m1", "number": 9, "status": "open"}})
+    restored = ControlPlaneRepo()
+    restored.import_state(repo.export_state())
+    assert len(restored.list_test_runs(mission_id="m1")) == 1
+    assert len(restored.list_reviews(mission_id="m1")) == 1
+    assert len(restored.list_pull_requests(mission_id="m1")) == 1
+    # The durable event streams still carry the records after restore.
+    assert [e["event_type"] for e in restored.stream("test_run", "rt1")] == ["TestRunStarted"]

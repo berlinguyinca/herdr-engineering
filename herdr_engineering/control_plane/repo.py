@@ -2215,6 +2215,11 @@ class ControlPlaneRepo:
             "leases": _copy(self._leases),
             "telemetry": {k: [dict(s) for s in v]
                           for k, v in self._telemetry.items()},
+            "delivery": {
+                "test_runs": _copy(self._test_runs),
+                "reviews": _copy(self._reviews),
+                "pull_requests": _copy(self._pull_requests),
+            },
             "events": {f"{t}|{i}": [dict(e) for e in s]
                        for (t, i), s in self._events.items()},
             "event_order": list(self._event_order),
@@ -2234,6 +2239,10 @@ class ControlPlaneRepo:
         self._leases = dict(state.get("leases", {}))
         self._telemetry = {k: [dict(s) for s in v]
                           for k, v in state.get("telemetry", {}).items()}
+        delivery = state.get("delivery", {})
+        self._test_runs = dict(delivery.get("test_runs", {}))
+        self._reviews = dict(delivery.get("reviews", {}))
+        self._pull_requests = dict(delivery.get("pull_requests", {}))
         self._events = {}
         for key, stream in state.get("events", {}).items():
             t, i = key.split("|")

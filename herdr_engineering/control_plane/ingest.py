@@ -361,6 +361,11 @@ class IngestService:
                 raise ValueError("severity is required")
             if not isinstance(payload.get("summary"), str):
                 raise ValueError("summary is required")
+            # The finding attaches to the review named by ``entity_id``; the
+            # review must already exist so a forged/unknown review can never
+            # consume the source sequence of a report that will be rejected.
+            if self.repo.get_review(entity_id) is None:
+                raise KeyError(entity_id)
         elif entity_type == "pull_request":
             self._delivery_mission_key(payload.get("mission_id"), source)
 
