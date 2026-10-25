@@ -19,7 +19,9 @@
 #
 # Flags:
 #   --host <name>    offboard a different host by name (default: this machine)
-#   --gateway <url>  gateway control URL (default: fabric.env, else http://dev.lan:29999)
+#   --gateway <url>  gateway control URL (default: fleet-config fabric.url, then
+#                   config.yaml fabric.gateway_url - the same source the agent uses -
+#                   else http://dev.lan:29999)
 #   --leave-tailnet  also run `tailscale logout` to remove the device from the tailnet
 #   --purge          also remove machine-local agent config + state
 #
@@ -31,14 +33,13 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 INVENTORY="$REPO_ROOT/ansible/inventory/hosts.yml"
-ENV_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/herdr-engineering/fabric.env"
 STATE_DIR="${HERDR_ENGINEERING_STATE:-$HOME/.local/share/herdr-engineering/state}"
 
 step() { printf '\n\033[1;32m==> %s\033[0m\n' "$*"; }
 warn() { printf '\033[1;33m  ! %s\033[0m\n' "$*"; }
 
 HOSTNAME="$(hostname -s 2>/dev/null || hostname)"
-GATEWAY="http://dev.lan:29999"
+GATEWAY=""
 LEAVE_TAILNET=0
 PURGE=0
 while [ $# -gt 0 ]; do
@@ -51,8 +52,17 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-if [ -f "$ENV_FILE" ]; then
-  GATEWAY="$(grep '^HERDR_ENGINEERING_FABRIC_URL=' "$ENV_FILE" | cut -d= -f2- | tr -d '"' || true)"
+# Resolve the gateway exactly as the agent does (gateway_url_from_config):
+# central fleet-config fabric.url, then config.yaml fabric.gateway_url.
+if [ -z "$GATEWAY" ]; then
+  for cand in "$HOME/.venvs/herdr-engineering/bin/python" python3; do
+    command -v "$cand" >/dev/null 2>&1 || continue
+    GATEWAY="$(PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}" "$cand" -c '
+from herdr_engineering.config import load_config
+from herdr_engineering.fabric import gateway_url_from_config
+print(gateway_url_from_config(load_config()) or "")' 2>/dev/null || true)"
+    [ -n "$GATEWAY" ] && break
+  done
   GATEWAY="${GATEWAY:-http://dev.lan:29999}"
 fi
 
@@ -179,9 +189,7 @@ fi
 
 if [ "$PURGE" = "1" ]; then
   step "4/4 purging machine-local agent state"
-  rm -f "$ENV_FILE"
   rm -rf "$STATE_DIR/fabric-agent.json"
-  echo "  removed $ENV_FILE"
   echo "  removed $STATE_DIR/fabric-agent.json"
 fi
 
