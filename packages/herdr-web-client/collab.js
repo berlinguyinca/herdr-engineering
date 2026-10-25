@@ -261,6 +261,9 @@ export class CollabApi {
   // agent helpers: the room profile (names only, never secret values), host-access requests, the panic switch
   roomProfile(id) { return this.call('GET', `/rooms/${encodeURIComponent(id)}/profile`); }
   setRoomProfile(id, profile) { return this.call('POST', `/rooms/${encodeURIComponent(id)}/profile`, profile); }
+  /** The room's properties: its own file-storage limit (null = default), the effective limit, usage, ceiling. */
+  roomSettings(id) { return this.call('GET', `/rooms/${encodeURIComponent(id)}/settings`); }
+  setRoomSettings(id, body) { return this.call('POST', `/rooms/${encodeURIComponent(id)}/settings`, body); }
   egressRequests() { return this.call('GET', '/fleet/egress'); }
   decideEgress(requestId, decision, ttlSeconds) {
     return this.call('POST', `/fleet/egress/${encodeURIComponent(requestId)}/decide`,

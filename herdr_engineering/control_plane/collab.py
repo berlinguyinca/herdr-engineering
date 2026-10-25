@@ -93,7 +93,7 @@ INVITE_TTL = 7 * 24 * 3600.0
 MAX_OPEN_INVITES = 50
 _FEED_TYPES = frozenset({"message", "member_added", "member_removed",
                          "agent_granted", "agent_revoked", "agent_grant_revoked", "agent_renamed",
-                         "task_created", "task_updated", "skill_invoked",
+                         "task_created", "task_updated", "skill_invoked", "room_settings_set",
                          "helper_requested", "helper_claimed", "helper_started", "helper_finished",
                          "helper_cancelled", "helper_expired"}) | COMMAND_EVENTS
 # Room <-> Herdr workspace links. A link is what room members may SEE of a workspace; the
@@ -571,6 +571,8 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FilesMixin, Co
                 "grants": {}}
         elif t == "room_profile_set":
             self._rooms[p["room_id"]]["profile"] = p["profile"]
+        elif t == "room_settings_set":           # the room's properties (its own file limit)
+            self._rooms[p["room_id"]]["settings"] = dict(p["settings"])
         elif t == "user_registered":
             self._users[p["user_id"]] = {"status": p["status"], "since": p["at"], "decided_by": p.get("decided_by"),
                                          "decided_at": p["at"] if p["status"] != "pending" else None, "reason": None}
@@ -3320,6 +3322,8 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FilesMixin, Co
                 out["people"] = [] if guest else self._room_people(room_id)
             out["tasks"] = self.list_tasks(pr, room_id)["tasks"]
             out["files"] = self.room_files(pr, room_id)      # new files reach agents and people on this poll
+            if out["files"] is not None:                     # the shelf shows "used / limit"
+                out["files_usage"] = self.room_files_usage(room_id)
             out["decisions"] = self.list_decisions(pr, room_id)["decisions"]
             out["flow"] = None if guest else self.room_flow(pr, room_id)
             with self._lock:                      # quiet reads: people only, never guests or agents
@@ -5040,6 +5044,8 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FilesMixin, Co
                        agent_id=p.get("agent_id"))
             if t == "agent_renamed":
                 out.update(name=p.get("name"), old_name=p.get("old_name"), source=p.get("source"))
+            elif t == "room_settings_set":         # who changed which room property, from what to what
+                out.update(settings=dict(p.get("settings") or {}), old=dict(p.get("old") or {}))
             elif t == "skill_invoked":             # who ran which skill on which agent; a short preview only
                 out.update(skill={"name": p.get("skill"), "agent_id": p.get("agent_id"), "preview": p.get("preview"),
                                   "by": {"type": p.get("by_kind"), "id": p.get("by_id")},
@@ -5287,6 +5293,8 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FilesMixin, Co
                         return 200, self.get_room(pr, rid)
                     if parts[2:] == ["profile"]:
                         return 200, self.get_room_profile(pr, rid)
+                    if parts[2:] == ["settings"]:
+                        return 200, self.get_room_settings(pr, rid)
                     if parts[2:] == ["agents"]:
                         return 200, self.list_room_agents(pr, rid)
                     if parts[2:] == ["invites"]:
@@ -5346,6 +5354,8 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FilesMixin, Co
                         return self.open_stream(pr, rid, _int(query, "cursor", 0))
             elif method in ("PUT", "POST") and n == 3 and parts[0] == "rooms" and parts[2] == "profile":
                 return 200, self.set_room_profile(pr, parts[1], body)
+            elif method in ("PUT", "PATCH", "POST") and n == 3 and parts[0] == "rooms" and parts[2] == "settings":
+                return 200, self.set_room_settings(pr, parts[1], body)
             elif method == "POST":
                 if parts == ["me"]:
                     return 200, self.link_identity(pr, body)

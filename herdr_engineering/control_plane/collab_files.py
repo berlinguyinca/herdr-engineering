@@ -11,8 +11,10 @@ The same name uploaded again without a parent is a different file and gets a de-
 content-addressed by sha256); with no RustFS wired, a directory store with the same interface keeps
 them next to the collab log. Only metadata enters the event log, so the shelf survives a restart.
 
-Limits are YAML (``control_plane.collab.files``): ``max_bytes`` per file (25 MiB) and ``room_bytes``
-per room (500 MiB). Deleting a file (its uploader or a room admin) removes every version and gives
+Limits are YAML (``control_plane.collab.files``): ``max_bytes`` per file (25 MiB), ``room_bytes`` per room
+(500 MiB, the default) and ``room_bytes_max`` (10 GiB), the ceiling a room's own limit is held to. A room owner sets
+that room's limit in its properties (``files_room_bytes``, a ``room_settings_set`` event; null = the default).
+Lowering it below what the room already uses deletes nothing; it only blocks new uploads. Deleting a file (its uploader or a room admin) removes every version and gives
 its bytes back to the room quota. Files are served for download only: ``application/octet-stream``,
 ``Content-Disposition: attachment`` and ``nosniff``, so nothing (an executable, an archive, an HTML
 page) is ever opened inline.
@@ -33,6 +35,8 @@ from .rustfs import IntegrityError
 MiB = 1024 * 1024
 DEFAULT_MAX_BYTES = 25 * MiB
 DEFAULT_ROOM_BYTES = 500 * MiB
+DEFAULT_ROOM_BYTES_MAX = 10 * 1024 * MiB   # the ceiling for a room's own limit (a typo cannot fill the disk)
+ROOM_SETTINGS = ("files_room_bytes",)
 HARD_MAX_BYTES = 1024 * MiB          # the ceiling any YAML value is held to (one request is read into memory)
 MAX_NAME = 200
 MAX_MESSAGE_FILES = 10
@@ -78,15 +82,16 @@ def _human(n: int) -> str:
 
 
 def normalize_files(value: Any) -> dict:
-    """``control_plane.collab.files`` -> {max_bytes, room_bytes}. Absent = the defaults."""
+    """``control_plane.collab.files`` -> {max_bytes, room_bytes, room_bytes_max}. Absent = the defaults."""
     if value is None:
         value = {}
     if not isinstance(value, dict):
         raise ValueError("control_plane.collab.files must be a mapping")
-    unknown = sorted(str(k) for k in set(value) - {"max_bytes", "room_bytes"})
+    unknown = sorted(str(k) for k in set(value) - {"max_bytes", "room_bytes", "room_bytes_max"})
     if unknown:
         raise ValueError("control_plane.collab.files: unknown keys: " + ", ".join(unknown))
-    out = {"max_bytes": value.get("max_bytes", DEFAULT_MAX_BYTES), "room_bytes": value.get("room_bytes", DEFAULT_ROOM_BYTES)}
+    out = {"max_bytes": value.get("max_bytes", DEFAULT_MAX_BYTES), "room_bytes": value.get("room_bytes", DEFAULT_ROOM_BYTES),
+           "room_bytes_max": value.get("room_bytes_max", DEFAULT_ROOM_BYTES_MAX)}
     for k, v in out.items():
         if not isinstance(v, int) or isinstance(v, bool) or v <= 0:
             raise ValueError(f"control_plane.collab.files.{k} must be a positive number of bytes")
@@ -94,6 +99,8 @@ def normalize_files(value: Any) -> dict:
         raise ValueError(f"control_plane.collab.files.max_bytes may be at most {HARD_MAX_BYTES} bytes")
     if out["room_bytes"] < out["max_bytes"]:
         raise ValueError("control_plane.collab.files.room_bytes must be at least max_bytes")
+    if out["room_bytes_max"] < out["room_bytes"]:
+        raise ValueError("control_plane.collab.files.room_bytes_max must be at least room_bytes")
     return out
 
 
@@ -328,14 +335,22 @@ class FilesMixin:
             out = _numbered(name, n)
         return out
 
+    def _room_limit(self, room_id: str, limits: dict) -> int:
+        """The room's own limit (its properties) or the YAML default, never above the YAML ceiling. Read at call
+        time, so the commit-time re-check of an upload sees a limit changed while its bytes were stored."""
+        own = ((self._rooms.get(room_id) or {}).get("settings") or {}).get("files_room_bytes")
+        return min(own if isinstance(own, int) else limits["room_bytes"], limits["room_bytes_max"])
+
     def _check_size(self, room_id: str, size: int, limits: dict) -> None:
         if size > limits["max_bytes"]:
             raise _error(413, f"the file is {size} bytes; the limit is {_human(limits['max_bytes'])} per file",
                          code="file_too_large")
-        used = self._room_file_bytes.get(room_id, 0)
-        if used + size > limits["room_bytes"]:
-            raise _error(413, f"this room's files would use {used + size} bytes; the room limit is "
-                              f"{_human(limits['room_bytes'])}. Delete files to free space.", code="room_quota_exceeded")
+        used, cap = self._room_file_bytes.get(room_id, 0), self._room_limit(room_id, limits)
+        if used + size > cap:
+            over = (f"this room's files already use {used} bytes, more than its limit of {_human(cap)}"
+                    if used >= cap else f"this room's files would use {used + size} bytes; the room limit is {_human(cap)}")
+            raise _error(413, f"{over}. Delete files to free space, or ask a room owner to raise the limit in the "
+                              "room's properties.", code="room_quota_exceeded")
 
     def _claim_unreferenced(self, keys) -> list[str]:
         """Under the lock: the keys no live version and no in-flight upload uses. They are marked as being deleted
@@ -451,8 +466,62 @@ class FilesMixin:
     def list_files(self, pr, room_id: str) -> dict:
         with self._lock:
             room = self._files_reader(pr, room_id, "file.list")
+            limits = self._files_limits()
             return {"files": self._shelf(pr, room, room_id), "used_bytes": self._room_file_bytes.get(room_id, 0),
-                    **self._files_limits()}
+                    **limits, "room_bytes": self._room_limit(room_id, limits), "room_bytes_default": limits["room_bytes"]}
+
+    # ------------------------------------------------------------------ room properties (the room's file limit)
+    def _settings_view(self, pr, room: dict, room_id: str) -> dict:
+        limits = self._files_limits()
+        eff = self._effective(pr, room)
+        return {"files_room_bytes": (room.get("settings") or {}).get("files_room_bytes"),
+                "files_room_bytes_default": limits["room_bytes"],
+                "files_room_bytes_effective": self._room_limit(room_id, limits),
+                "files_room_bytes_max": limits["room_bytes_max"],
+                "files_used_bytes": self._room_file_bytes.get(room_id, 0), "files_max_bytes": limits["max_bytes"],
+                "can_edit": not pr.is_agent and bool(eff and "invite" in eff[0])}
+
+    def get_room_settings(self, pr, room_id: str) -> dict:
+        """The room's properties as the shelf's readers see them: its own file limit (null = the default), the
+        effective limit, what the room uses, and the ceiling. Guests and external agents have no shelf."""
+        with self._lock:
+            room = self._files_reader(pr, room_id, "settings.get")
+            return self._settings_view(pr, room, room_id)
+
+    def set_room_settings(self, pr, room_id: str, body: Any) -> dict:
+        """Room owners only (the people who hold `invite`, as for the helper profile and deleting others' files).
+        ``files_room_bytes``: a whole number of bytes from 1 to the YAML ceiling, or null for the default."""
+        from .collab import CollabError
+        with self._lock:
+            room = self._rooms.get(room_id)
+            m = self._member(room, pr.id) if room and not pr.is_agent else None
+            eff = self._effective(pr, room) if room else None
+            if not eff:
+                self.stats["policy_denied"] += 1
+                raise CollabError(404, "not found")
+            if pr.is_agent or pr.external or not m or "invite" not in eff[0]:
+                self._audit_denied(pr, "settings.set", "not_owner", room_id=room_id, project_ids=[room["project_id"]])
+                self.stats["policy_denied"] += 1
+                raise CollabError(403, "only a room owner may change the room's properties")
+            if not isinstance(body, dict) or not body or set(body) - set(ROOM_SETTINGS):
+                raise CollabError(400, "room properties: files_room_bytes is the only setting")
+            limits = self._files_limits()
+            v = body["files_room_bytes"]
+            if v is not None and (not isinstance(v, int) or isinstance(v, bool) or not 1 <= v <= limits["room_bytes_max"]):
+                raise CollabError(400, f"files_room_bytes must be a whole number of bytes from 1 to "
+                                       f"{limits['room_bytes_max']} ({_human(limits['room_bytes_max'])}), or null for the default")
+            self._throttle("settings:" + pr.id, 60, 600.0, "room properties")
+            old = {k: (room.get("settings") or {}).get(k) for k in ROOM_SETTINGS}
+            new = {**old, "files_room_bytes": v}
+            self._commit("room_settings_set", self._actor(
+                pr, project_id=room["project_id"], room_id=room_id, settings=new, old=old,
+                action="settings.set", outcome="allowed", project_ids=[room["project_id"]], resource_id=room_id))
+            return self._settings_view(pr, room, room_id)
+
+    def room_files_usage(self, room_id: str) -> dict:
+        with self._lock:
+            return {"used_bytes": self._room_file_bytes.get(room_id, 0),
+                    "limit_bytes": self._room_limit(room_id, self._files_limits())}
 
     def _shelf(self, pr, room: dict, room_id: str) -> list[dict]:
         eff = self._effective(pr, room)

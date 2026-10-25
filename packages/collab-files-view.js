@@ -21,6 +21,7 @@ export function mountFilesShelf(host, opts = {}) {
   host.innerHTML = `<div class="cx-files">
     ${canUpload ? '<div class="cx-row"><button type="button" class="hd-btn hd-btn--sm" data-upload>Upload files</button><input type="file" multiple hidden aria-label="Upload files to the room"></div>' : ''}
     <p class="cx-sub">Agents fetch a file to <code>.collab/files/&lt;name&gt;</code> (the latest version). Every upload is kept; an edit is a new version.</p>
+    <p class="cx-msg" data-usage hidden></p>
     <p class="hd-empty" data-empty>No files yet.</p>
     <ul class="cx-list cx-files-list" aria-label="Room files"></ul>
     <span class="cx-msg" role="status" data-files-msg></span></div>`;
@@ -86,10 +87,76 @@ export function mountFilesShelf(host, opts = {}) {
       patchList(list, next, { key: (f) => f.id, render, update });
       setHidden(empty, next.length > 0);
     },
+    /** usage({used_bytes, limit_bytes}): "used / limit" for the whole room (the room's own limit or the default). */
+    usage(u) {
+      const el = host.querySelector('[data-usage]');
+      const ok = u && Number.isFinite(u.used_bytes) && Number.isFinite(u.limit_bytes);
+      setHidden(el, !ok);
+      if (ok) setText(el, `Room storage: ${fileSize(u.used_bytes)} used of ${fileSize(u.limit_bytes)}${u.used_bytes > u.limit_bytes ? ' (over the limit: delete files to upload more)' : ''}`);
+    },
     message(text, isError = false) {
       setText(msg, text || '');
       if (msg.classList.contains('cx-msg--error') !== isError) msg.classList.toggle('cx-msg--error', isError);
     },
     dispose() { host.removeEventListener('click', onClick); host.removeEventListener('change', onChange); },
+  };
+}
+
+const MIB = 1024 * 1024;
+
+/** mountRoomProperties(host, {save(body) -> settings}) -> {update(settings), dispose()}
+ *  The room's properties panel: its own total file-storage limit, in MiB (empty = the operator's default). Only a
+ *  room owner (settings.can_edit) can change it; the server re-checks that and the ceiling. */
+export function mountRoomProperties(host, opts = {}) {
+  host.innerHTML = `<section class="hd-card cx-stack" aria-label="Room properties"><div class="hd-card__title">Room properties</div>
+    <form class="cx-stack" data-props novalidate>
+      <label class="cx-field">File storage limit (MiB)<input class="cx-input" type="number" name="files_room_mib" min="1" step="1" inputmode="numeric" aria-describedby="hcn-props-usage"></label>
+      <p class="cx-sub" id="hcn-props-usage" data-props-usage></p>
+      <div class="cx-row" data-props-actions><button type="submit" class="hd-btn hd-btn--sm" aria-label="Save room properties">Save</button></div>
+      <span class="cx-msg" role="status" data-props-msg></span></form></section>`;
+  const form = host.querySelector('[data-props]'), field = form.elements.files_room_mib;
+  const msg = host.querySelector('[data-props-msg]'), info = host.querySelector('[data-props-usage]');
+  let cur = null;
+  const doc = () => host.ownerDocument;
+  const say = (text, isError = false) => { setText(msg, text); msg.classList.toggle('cx-msg--error', isError); };
+  const maxMib = () => Math.floor((cur?.files_room_bytes_max || 0) / MIB);
+  const paint = () => {
+    if (!cur) return;
+    const own = cur.files_room_bytes;
+    setText(info, `${fileSize(cur.files_used_bytes || 0)} used · limit ${fileSize(cur.files_room_bytes_effective)}${own == null ? ' (default)' : ''} · at most ${maxMib()} MiB · empty = the default (${fileSize(cur.files_room_bytes_default)})`);
+    field.max = String(maxMib());
+    field.placeholder = `default: ${Math.round(cur.files_room_bytes_default / MIB)}`;
+    if (doc().activeElement !== field) field.value = own == null ? '' : String(Math.round(own / MIB));
+    field.disabled = !cur.can_edit;
+    const actions = host.querySelector('[data-props-actions]');
+    if (!cur.can_edit && actions) actions.remove();
+  };
+  const onSubmit = async (event) => {
+    event.preventDefault();
+    if (!cur?.can_edit) return;
+    const raw = field.value.trim();
+    let bytes = null;
+    if (raw !== '') {
+      const n = Number(raw);
+      if (!/^\d+$/.test(raw) || !Number.isInteger(n) || n < 1 || n > maxMib()) {
+        field.setAttribute('aria-invalid', 'true');
+        say(`Enter a whole number of MiB from 1 to ${maxMib()}, or leave it empty for the default.`, true);
+        return;
+      }
+      bytes = n * MIB;
+    }
+    field.setAttribute('aria-invalid', 'false');
+    try {
+      const next = await opts.save?.({ files_room_bytes: bytes });
+      if (next) cur = next;
+      paint();
+      const below = bytes != null && bytes < (cur.files_used_bytes || 0);
+      say(below ? 'Saved. The room already uses more than this: nothing is deleted, but new uploads are blocked until files are deleted.' : 'Saved.');
+    } catch (e) { say(e.message || 'Could not save.', true); }
+  };
+  form.addEventListener('submit', onSubmit);
+  return {
+    update(settings) { cur = settings; paint(); },
+    dispose() { form.removeEventListener('submit', onSubmit); },
   };
 }

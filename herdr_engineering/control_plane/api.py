@@ -176,6 +176,8 @@ class _RateLimiter:
 
 
 _FLEET_CONFIG_PATH = "/api/v1/fleet/config"
+# Collaboration writes: POST everywhere; PUT/PATCH only for the collab API (room properties), same CSRF checks.
+_COLLAB_WRITES = ("POST", "PUT", "PATCH")
 
 
 def _gate_pr(snap):
@@ -966,6 +968,26 @@ def _make_handler(server, public=False, operator=False):
                 return self._route_api()
             return self._serve_static()
 
+        def do_PUT(self):
+            return self._collab_write_only()
+
+        def do_PATCH(self):
+            return self._collab_write_only()
+
+        def _collab_write_only(self):
+            """PUT and PATCH exist for the collaboration API only (a room's properties); they get the same framing,
+            Origin and application/json checks as a collaboration POST. Everything else stays unknown (404)."""
+            if operator:
+                return self._operator()
+            if public:
+                return self._public()
+            if (len(self.headers.get_all("Content-Length") or []) > 1
+                    or "Transfer-Encoding" in self.headers):
+                return self._deny(400, "ambiguous request framing")
+            if self._is_collab_path():
+                return self._collab()
+            return self._deny(404, "not found")
+
         def do_POST(self):
             if operator:
                 return self._operator()
@@ -1078,7 +1100,7 @@ def _make_handler(server, public=False, operator=False):
             transfer = transfer_route(self.command, [unquote(seg) for seg in
                                                      urlsplit(self.path).path.split("/")[4:] if seg])
             ctype = "application/octet-stream" if transfer else "application/json"
-            if self.command == "POST":
+            if self.command in _COLLAB_WRITES:
                 origin = self.headers.get("Origin")
                 if origin and (urlsplit(origin).netloc != self.headers.get("Host")
                                or urlsplit(origin).scheme not in {"http", "https"}):
@@ -1089,15 +1111,15 @@ def _make_handler(server, public=False, operator=False):
             length = _content_length(self.headers.get("Content-Length"))
             # file bytes: the same YAML per-file limit the collab service applies (control_plane.collab.files)
             cap = self._collab_file_cap() if transfer else MAX_BODY
-            if self.command == "POST" and (length is None or length > cap):
+            if self.command in _COLLAB_WRITES and (length is None or length > cap):
                 self.close_connection = True                     # the unread body must not become a request
                 return self._deny(413, "request body too large")
-            data = self.rfile.read(length) if self.command == "POST" and length else None
-            if self.command == "POST" and data is None:
+            data = self.rfile.read(length) if self.command in _COLLAB_WRITES and length else None
+            if self.command in _COLLAB_WRITES and data is None:
                 data = b""
             req = urllib.request.Request(
                 server.collab_operator_url + self.path, data=data, method=self.command,
-                headers={"Content-Type": ctype} if data is not None or self.command == "POST" else {})
+                headers={"Content-Type": ctype} if data is not None or self.command in _COLLAB_WRITES else {})
             keep = ("Content-Type", "Content-Disposition", "X-Content-Type-Options", "Content-Security-Policy",
                     "X-Herdr-File-Id", "X-Herdr-File-Version", "X-Herdr-File-Sha256")
             # a download may predate a lowered limit: read up to the hard ceiling, never truncate a file
@@ -1145,7 +1167,7 @@ def _make_handler(server, public=False, operator=False):
             parts = [unquote(seg) for seg in split.path.split("/")[4:] if seg]
             query = {k: v[0] for k, v in parse_qs(split.query).items()}
             transfer = transfer_route(self.command, parts)
-            if self.command == "POST":
+            if self.command in _COLLAB_WRITES:
                 origin = self.headers.get("Origin")
                 if origin and (urlsplit(origin).netloc != self.headers.get("Host")
                                or urlsplit(origin).scheme not in {"http", "https"}):
@@ -1158,7 +1180,7 @@ def _make_handler(server, public=False, operator=False):
             if transfer:
                 return self._collab_file(service, parts, query, operator)
             body = {}
-            if self.command == "POST":
+            if self.command in _COLLAB_WRITES:
                 from .collab import MAX_BODY
                 length = _content_length(self.headers.get("Content-Length"))
                 if length is None or length > MAX_BODY:
