@@ -213,11 +213,15 @@ class FederationMixin:
             for peer_id in sorted(want - {k for k, v in self._fed_peers.items() if v}):
                 todo.append(("federation_peer_enabled", self._fed_system(
                     peer_id=peer_id, epoch=now, action="federation.peer_enabled", resource_id=peer_id)))
+            refused = 0
             for event_type, payload in todo:
                 try:
                     self._commit(event_type, payload)
                 except Exception:      # noqa: BLE001 - retried on the next pass
-                    logging.getLogger(__name__).warning("federation reconcile: %s refused", event_type)
+                    refused += 1
+            if refused:
+                logging.getLogger(__name__).warning("federation reconcile: %d of %d writes refused, retrying",
+                                                    refused, len(todo))
 
     # ----------------------------------------------------------------- export (the signed side calls these)
     def _fed_share_for(self, share_id: Any, peer_id: str, policy: FederationPolicy) -> tuple[dict, dict] | None:
