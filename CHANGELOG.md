@@ -9,6 +9,12 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 - Release note: a room task's text now starts with the target's `@address` (e.g. `@gert.pi fix the build`). The worker in this repo strips its own leading address; worker scripts installed from an earlier release pass it through to the harness unchanged, so update them.
 - An external (sponsored) agent never gets an `@owner.harness` address; it is reached by its `ext-...` name and its chip is marked external. A person handle outranks an agent name, an agent cannot be renamed to (or granted under) a member's handle, and an agent keeps its last 5 old names as aliases.
 
+### T17 / ADR-0008 P1: `peer` principal and visibility clamp (flagged dark, no network code)
+- New per-principal visibility clamp in envelope normalisation (`federation.Clamp`, `normalize_envelope(..., clamp=)`): an event from a `peer` principal is rewritten to `visibility_scope: room` in its one local mirror room, never wider, with the sender's origin, requested scope and local ids kept only as `claimed_*` provenance. It cannot be skipped: a peer without a clamp, and any v1 or non-`lineage` peer event, is refused.
+- New `peer` principal kind, never `operator`, `collab` or `external`, and never mintable from an API key. `control_plane.federation` (YAML only, default off, hot-reread, any error means off; `"*"` rejected for a peer) is parsed and enforced; startup refuses a bad section. `_check_lineage_scope` and `_check_reserved_nodes` treat a peer as non-operator.
+- New reserved lineage namespace `peer:<peer>.` (node type `peer`): writable by nobody locally (operator included); a peer may write only inside its own namespace on every edge endpoint. Mirrored edges take no part in local gate staleness (fork promotion, herdr#264).
+- No endpoint, puller, network code, environment variable or migration. Rollback: revert the PR (the kill switch is `control_plane.federation.enabled`, default false). Contract: `docs/contracts/event-envelope-v2.md`.
+
 ### T17 Independent-server federation ADR (docs only)
 - ADR-0008 is now Accepted with the owner's answers to D1–D10 recorded; implementation starts with P1 (visibility clamp and `peer` principal kind), flagged off.
 - `docs/adr/ADR-0008-independent-server-federation.md`, status Proposed, awaiting approval: options, trust model, data flow, failure modes, migration, non-goals and ten owner decisions. No code, configuration, endpoint or migration; nothing is implemented until the ADR is approved. Rollback: revert the PR.

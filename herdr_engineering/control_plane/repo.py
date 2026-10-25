@@ -1782,6 +1782,10 @@ class ControlPlaneRepo:
                     meta["lineage_mode"] = env["lineage_mode"]
                 if env.get("claimed_actor") is not None:
                     meta["claimed_actor"] = _bounded_claim(env["claimed_actor"])
+                # a clamped (peer) principal's claims: evidence of what the sender said, never read as authority
+                for name in ("claimed_origin", "claimed_visibility_scope", "claimed_ids"):
+                    if env.get(name) is not None:
+                        meta[name] = _bounded_claim(env[name])
                 ev["payload"] = {**ev["payload"], "_envelope": meta}
                 require_durable = callable(getattr(self._sink, "record_required", None))
             if require_durable and self._sink is not None:

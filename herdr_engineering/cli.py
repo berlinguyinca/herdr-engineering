@@ -2533,6 +2533,7 @@ def _cmd_cp_web(args) -> int:
     replay_flag = getattr(args, "collab_replay_history", None)      # an explicit --collab-replay-history wins over the YAML
     api_keys = _parse_api_keys(args.api_key, args.api_keys)
     lineage_key_scopes = {}
+    federation_source = None
     if args.collab_only:
         # The public collab container is given only the collab slice of the central
         # file (`fleet config render-collab`): no fleet endpoint, no API keys, no DSN.
@@ -2558,6 +2559,17 @@ def _cmd_cp_web(args) -> int:
         merged = {str(k): str(v) for k, v in file_keys.items()}
         merged.update(api_keys or {})
         api_keys = merged or None
+        from .control_plane.federation import PEER_KINDS, FederationConfigError, parse_federation
+        if any(str(v).strip() in PEER_KINDS for v in (api_keys or {}).values()):
+            raise SystemExit("api_keys: role 'peer'/'peer-user' is not an API key role; a federated peer is configured "
+                             "under control_plane.federation.peers (ADR-0008), never as a key")
+        try:
+            parse_federation(cp.get("federation"))        # startup: refuse a bad section; hot reads fail closed
+        except FederationConfigError as exc:
+            raise SystemExit(f"fleet config {exc}") from None
+
+        def federation_source(_store=fleet_store):
+            return _store.secure_section("control_plane").get("federation")     # raises while the file is unusable
         raw_scopes = cp.get("lineage_key_scopes") or {}
         if not isinstance(raw_scopes, dict):
             raise SystemExit("fleet config control_plane.lineage_key_scopes must map an api key to {rooms: [...], missions: [...]}")
@@ -2689,6 +2701,7 @@ def _cmd_cp_web(args) -> int:
         collab.insights = normalize_insights(getattr(args, "collab_insights", None))
         _wire_collab_switches(collab, switch_store, pinned=frozenset({"replay_history"}) if replay_flag else frozenset())
     svr = ControlPlaneServer(repo, api_keys=api_keys, lineage_key_scopes=lineage_key_scopes,
+                             federation_source=federation_source,
                              system_graph=system_graph,
                              host=args.host, port=args.port, source=source,
                              web_root=args.web_root,

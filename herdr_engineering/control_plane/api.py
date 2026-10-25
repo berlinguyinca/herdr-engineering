@@ -32,6 +32,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 from ..version import __version__
 from .envelope import EnvelopeConflict
 from .events import SequenceCollision
+from .federation import kind_for_role
 from .graph import read_graph
 from .ingest import INGEST_ENTITY_TYPES
 from .redact import redact_ingest_body, redact_payload
@@ -210,7 +211,7 @@ class ControlPlaneServer:
                  port=0, web_root=None, source=None, allow_open=False,
                  rustfs=None, dispatcher=None, github_monitor=None,
                  collab=None, collab_tls_terminated=False,
-                 collab_require_https=False, fleet_config=None, ci_actions=False,
+                 collab_require_https=False, fleet_config=None, ci_actions=False, federation_source=None,
                  public_port=None, public_host=None, collab_only=False,
                  operator_port=None, operator_user=None, operator_email=None,
                  operator_hosts=(), collab_operator_url=None, collab_dashboard_hosts=(),
@@ -287,6 +288,8 @@ class ControlPlaneServer:
             scopes[f"key:{digest}"] = {"rooms": frozenset(allow.get("rooms") or ()),
                                        "missions": frozenset(allow.get("missions") or ())}
         self.ingest = IngestService(repo, key_scopes=scopes, system_graph=system_graph)
+        # ADR-0008 P1: hot `control_plane.federation` section (None = off). Nothing mints a peer principal yet.
+        self.ingest.peer_source = federation_source
         self._limiter = _RateLimiter()
         # Fleet telemetry has a separate bounded budget so bursts cannot starve
         # dashboard reads or operator commands from the same host/proxy IP.
@@ -870,9 +873,10 @@ def _make_handler(server, public=False, operator=False):
             for candidate, role in server._keys.items():
                 if secrets.compare_digest(supplied, candidate):
                     digest = hashlib.sha256(candidate.encode()).hexdigest()[:12]
-                    # "external" and "collab" are principal kinds only the HCN service can mint; a key whose
-                    # configured role spells one of them is an ordinary unprivileged key, never that principal.
-                    kind = "unknown" if role in ("external", "collab") else role
+                    # "external" and "collab" (HCN service) and "peer"/"peer-user" (federation YAML, ADR-0008) are
+                    # principal kinds only the server can mint; a key whose configured role spells one of them is an
+                    # ordinary unprivileged key, never that principal.
+                    kind = kind_for_role(role)
                     return {"kind": kind, "id": f"key:{digest}", "authenticated_by": "api_key"}
             return {"kind": "unknown", "id": None, "authenticated_by": "none"}
 
