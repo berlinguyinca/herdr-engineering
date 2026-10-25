@@ -103,6 +103,9 @@ def test_mission_delivery_routes(server):
     tests = json.loads(body)["tests"]
     assert [t["test_run_id"] for t in tests] == ["tr1", "tr2"]
     assert all(t["mission_id"] == mid for t in tests)
+    # Counts must survive value-only redaction: the ``passed`` key is not a
+    # secret hint (key-name redaction would wrongly turn it into [REDACTED]).
+    assert tests[0]["passed"] == 3 and tests[0]["failed"] == 0
 
     _, _, body = c.get(f"/api/v1/missions/{mid}/builds")
     builds = json.loads(body)["builds"]
@@ -117,6 +120,23 @@ def test_mission_delivery_routes(server):
     pulls = json.loads(body)["pulls"]
     assert [p["pr_id"] for p in pulls] == ["pr1", "pr2"]
     assert all(p["mission_id"] == mid for p in pulls)
+
+
+def test_mission_delivery_redaction_keeps_counts_but_scans_values(server):
+    c, repo = server
+    mid = repo.create_mission("Redaction")
+    repo.upsert_test_run("tr", mission_id=mid, status="failed",
+                         passed=4, failed=1, total=5,
+                         results=[{"name": "runner leaked token abc123xyz789"}])
+    repo.upsert_pull_request("pr", mission_id=mid, number=1, status="open",
+                             url="https://example.com/pr/1")
+    _, _, body = c.get(f"/api/v1/missions/{mid}/tests")
+    tests = json.loads(body)["tests"]
+    assert tests[0]["passed"] == 4 and tests[0]["failed"] == 1
+    # a leaked secret in a string value is redacted, a URL is preserved
+    assert "abc123xyz789" not in body.decode()
+    _, _, body = c.get(f"/api/v1/missions/{mid}/pulls")
+    assert json.loads(body)["pulls"][0]["url"] == "https://example.com/pr/1"
 
 
 def test_mission_delivery_routes_unknown_mission_404(server):

@@ -84,6 +84,25 @@ def _seed(repo):
     repo.upsert_pull_request('pr-1', mission_id='pi:MSN-PI1', number=42,
                              url='https://example.com/pr/42', status='merged',
                              branch='ws/x', base='main')
+    # Delivery sections for mission m1 (Alpha): a failing test run, a build, a
+    # review with a blocking finding and an open pull request.
+    repo.upsert_test_run('alpha-run-fail', mission_id=m1, status='failed',
+                         passed=2, failed=1, skipped=0, total=3,
+                         started_at='2026-10-01T10:00:00+00:00',
+                         ended_at='2026-10-01T10:00:42+00:00')
+    repo.upsert_test_run('alpha-build-1', mission_id=m1, status='ok', kind='build',
+                         started_at='2026-10-01T09:55:00+00:00',
+                         ended_at='2026-10-01T09:55:18+00:00')
+    repo.upsert_review('alpha-review-1', mission_id=m1, reviewer='codex',
+                       status='completed', verdict='changes_requested',
+                       started_at='2026-10-01T11:00:00+00:00',
+                       completed_at='2026-10-01T11:05:00+00:00')
+    repo.add_review_finding('alpha-review-1', severity='blocker',
+                            summary='Parser crashes on empty input',
+                            detail='Reproduce with an empty spectra file.')
+    repo.upsert_pull_request('alpha-pr-1', mission_id=m1, number=7,
+                             url='https://example.com/pr/7', status='open',
+                             branch='ws/alpha', base='main')
     return m1, m2, s1
 
 
