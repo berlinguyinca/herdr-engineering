@@ -1634,7 +1634,6 @@ def test_property_hidden_writers_never_change_what_a_reader_sees_of_commons():
 
 
 def test_neighborhood_stops_rendering_neighbours_once_the_budget_is_spent():
-    import time
     g = GraphProjection()
     hub = P("hub")
     _apply(g, hub, "sh", 0, "task:hub", "org", {}, payload={"node_type": "task", "node_id": "task:hub", "state": "running"})
@@ -1650,13 +1649,18 @@ def test_neighborhood_stops_rendering_neighbours_once_the_budget_is_spent():
         seq += 1
         _apply(g, hub, "sh", seq, nid, "org", {}, et="edge.add",
                payload={"edge_type": "spawn", "from_id": "task:hub", "to_id": nid})
-    best = 9.0
-    for _ in range(3):
-        t = time.perf_counter()
-        r = g.neighborhood(OTHER, "task:hub", depth=1)
-        best = min(best, time.perf_counter() - t)
+    # T16: counted operations, not a wall clock (a loaded CI host made the old 0.3 s bound flaky): once the
+    # response budget is spent the remaining neighbours must not be rendered at all.
+    rendered = []
+    real = g._node_view
+
+    def counting(*a, **kw):
+        rendered.append(1)
+        return real(*a, **kw)
+    g._node_view = counting
+    r = g.neighborhood(OTHER, "task:hub", depth=1)
     assert r["truncated"] is True
-    assert best < 0.3, f"neighborhood took {best:.3f}s"
+    assert len(rendered) <= 60, f"rendered {len(rendered)} nodes for a budget-truncated neighbourhood"
 
 
 def test_admission_limit_errors_do_not_depend_on_hidden_writers():

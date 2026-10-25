@@ -35,6 +35,11 @@ def _parse_dt(value: Any) -> datetime:
     return datetime.now(UTC)
 
 
+def prune_events_sql(table: str) -> str:
+    """The retention DELETE; migration 0003 indexes fabric_events(entity_type, source_timestamp) for it."""
+    return f"DELETE FROM {table} WHERE entity_type=$1 AND source_timestamp < $2"
+
+
 def _dict_to_event(ev: dict) -> Event:
     return Event(
         event_id=ev.get("event_id") or f"ev_{secrets.token_hex(16)}",
@@ -127,3 +132,11 @@ class DurableEventSink:
         except Exception:
             log.exception("durable sink failed to persist source state %s",
                           state.get("source"))
+
+
+    def prune_events_before(self, entity_type: str, cutoff: datetime) -> None:
+        """Delete one entity type's durable events older than ``cutoff`` (retention)."""
+        with self._write_lock:
+            self._ensure_store()
+            self._run(self._store._conn.execute(
+                prune_events_sql(self._events_table), entity_type, cutoff))

@@ -3,10 +3,27 @@ import {escapeHtml as esc} from './herdr-web-components/util.js';
 import {mergeEntry, renderEvent, telemetryHealth} from './herdr-web-components/inspector.js';
 import {mountComposer} from './conversation-composer.js';
 import {renderMarkdown} from './conversation-markdown.js';
+import {createEntityIndex} from './entity-refs.js';
 import {parseJson,renderJson} from './conversation-json.js';
 import {selectEvents, linkedAgents, githubLinks, referenceSuggestions, pendingOperation} from './session-workspace-model.js';
 import {randomString} from './herdr-web-client/collab.js';
 import {recordOutcome} from './record-state.js';
+import {fixOutcome, fixError, FIX_LABELS, FIX_LOCKED} from './summary-fix-status.js';
+import {morph} from './patch.js';
+import {enter} from './motion.js';
+
+// Rows carry data-key="<seq>". morph keeps every shown row's node (open disclosures, focus and
+// text selection survive) and writes only what changed. A row enters with the shared transition
+// (not under calm) only when the stream brought it: its seq is above the newest record received
+// before this paint, and the filters did not change. A filter change, an older page or the first
+// paint show their rows without motion, even rows that are new to this pane.
+function patchRows(container,html,newestBefore){
+  morph(container,html);
+  for(const row of container.children){
+    const key=row.getAttribute('data-key');
+    if(key && Number(key)>newestBefore)enter(row);
+  }
+}
 
 const MAX_EVENTS=2000;
 const PAGE=200;
@@ -16,15 +33,21 @@ export function mountSessionWorkspace(host,client,session,{connect=connectEvents
     const link=document.createElement('link');link.rel='stylesheet';link.href=new URL('./session-workspace.css',import.meta.url).href;
     link.dataset.sessionWorkspaceStyle='';document.head.append(link);
   }
+  // session:/mission:/host: references link only entities the dashboard knows now (cross-linking).
+  const entityIndex=createEntityIndex(client),markdown={references:entityIndex.resolver};
   let disposed=false, data=null, events=[], conversationEvents=[], sessions=[], collaborators=[], epoch=null, request=0, loading=false, error='', streamError=false;
   let renderTimer, refreshTimer, selection=null, split=60;
   let historyGeneration=0,historyReset=false,fullscreen=false,fullscreenFocus=null,agentSummary=null,summaryBusy=false,summaryError='',summarySignature='';
   const expanded=new Map();
+  // "Let the agent fix this" state per exact item text, kept outside paint so polling keeps it.
+  const fixStates=new Map();
+  const fixKey=(list,text)=>`${list}\u0000${text}`;
+  const canFix=()=>Boolean(session.capabilities?.fix_summary_item);
   const pages={all:{before:null,more:false},conversation:{before:null,more:false}};
   const canLoadOlder=view=>pages[view].more && (view==='conversation'?conversationEvents:events).length<MAX_EVENTS;
   const state={agent:'',q:'',type:'',errors:false};
   host.innerHTML=`<section class="sw" data-session-workspace>
-    <header class="sw-workspace-heading"><strong data-agent-name>${esc(session.display_name || session.agent_role || 'Agent')}</strong><button type="button" data-rename-agent${session.capabilities?.rename_agent?'':' hidden'}>Rename agent</button><button type="button" data-fullscreen aria-expanded="false">Fullscreen workspace</button></header>
+    <header class="sw-workspace-heading"><strong data-agent-name>${esc(session.display_name || session.agent_role || 'Agent')}</strong><button type="button" data-rename-agent${session.capabilities?.rename_agent?'':' hidden'}>Rename agent</button><a class="sw-llm-link" data-llm-link href="#/llm/session/${esc(encodeURIComponent(session.session_id))}">LLM usage</a><button type="button" data-fullscreen aria-expanded="false">Fullscreen workspace</button></header>
     <form data-rename-form hidden><label>Agent name <input aria-label="Agent name" name="agent_name" maxlength="64" required></label><button type="submit">Save name</button><button type="button" data-cancel-rename>Cancel</button><p data-rename-status role="status"></p></form>
     <section class="sw-summary-card" aria-label="Agent summary"><div class="sw-summary-heading"><h3>AI-generated summary</h3><button type="button" data-regenerate-summary${session.capabilities?.regenerate_summary?'':' hidden'}>Regenerate summary</button></div><div data-agent-summary role="status">Loading summary…</div></section>
     <div class="sw-status" data-recording-status role="status">Loading recorded conversation…</div>
@@ -66,8 +89,14 @@ export function mountSessionWorkspace(host,client,session,{connect=connectEvents
     },
   });
 
+  let shownConversation=null,shownActivity=null,paintedNewest=Infinity,paintedFilters=null;
   function paint() {
     if(disposed)return;
+    // Newest record received so far; rows above the previous paint's value arrived by stream.
+    const newest=Math.max(-Infinity,...events.map(e=>e.seq),...conversationEvents.map(e=>e.seq));
+    const filters=JSON.stringify([state,selection]);
+    const streamNewest=filters===paintedFilters?paintedNewest:Infinity;
+    paintedFilters=filters;
     const health=telemetryHealth(data?.summary,data?.telemetry);
     const capture=session.transcript?.status;
     const captureNote=capture==='identity_unavailable'?' · Waiting for this agent to identify its transcript.':capture==='unreadable'?' · The agent transcript could not be read.':capture==='unsupported'?' · Recording is unavailable for this agent.':'';
@@ -77,10 +106,11 @@ export function mountSessionWorkspace(host,client,session,{connect=connectEvents
     const agentNames=new Map((data?.summary?.agents || []).map(a=>[a.agent_id,a.display_name || a.agent_id]));
     agentNames.set('main',session.display_name || agentNames.get('main') || 'Assistant');
     const rows=selectEvents(conversationEvents,{...state,pane:'conversation'});
-    const html=rows.map(e=>`<article class="sw-message conversation-markdown sw-message--${esc(e.data.role)}" data-message-seq="${e.seq}"><header><strong>${esc(e.data.role==='user'?'You':agentNames.get(e.agent_id || 'main') || e.agent_id)}</strong><time>${esc(e.ts || '')}</time><button type="button" data-related-turn="${e.seq}" aria-label="Show activity for this turn">Activity ↗</button></header>${e.data.withheld?'<p>Message withheld.</p>':renderMarkdown(e.data.text || '')}${e.data.text_more?`<button type="button" data-expand-message="${e.seq}">Show full message</button>`:''}${e.truncated?'<p class="sw-note">Message truncated by recording limits.</p>':''}</article>`).join('') || '<p class="sw-empty">No conversation messages recorded for these filters.</p>';
-    if(conversation.innerHTML!==html){
-      const previousNewest=Number(conversation.lastElementChild?.dataset.messageSeq || 0);
-      conversation.innerHTML=html;
+    const html=rows.map(e=>`<article class="sw-message conversation-markdown sw-message--${esc(e.data.role)}" data-message-seq="${e.seq}" data-key="${e.seq}"><header><strong>${esc(e.data.role==='user'?'You':agentNames.get(e.agent_id || 'main') || e.agent_id)}</strong><time>${esc(e.ts || '')}</time><button type="button" data-related-turn="${e.seq}" aria-label="Show activity for this turn">Activity ↗</button></header>${e.data.withheld?'<p>Message withheld.</p>':renderMarkdown(e.data.text || '',markdown)}${e.data.text_more?`<button type="button" data-expand-message="${e.seq}">Show full message</button>`:''}${e.truncated?'<p class="sw-note">Message truncated by recording limits.</p>':''}</article>`).join('') || '<p class="sw-empty">No conversation messages recorded for these filters.</p>';
+    if(shownConversation!==html){
+      shownConversation=html;
+      const previousNewest=Math.max(0,...[...conversation.querySelectorAll(':scope > [data-message-seq]')].map(row=>Number(row.dataset.messageSeq)));
+      patchRows(conversation,html,streamNewest);
       if(bottom)conversation.scrollTop=conversation.scrollHeight;
       else {
         const prepended=rows.length && rows[rows.length-1].seq<=previousNewest;
@@ -89,15 +119,15 @@ export function mountSessionWorkspace(host,client,session,{connect=connectEvents
       }
     }
     const open=new Set([...activity.querySelectorAll('details[open]')].map(d=>d.dataset.activitySeq));
-    const treeState=new Map([...activity.querySelectorAll('[data-activity-seq]')].map(row=>[row.dataset.activitySeq,[...row.querySelectorAll('details')].map(node=>node.open)]));
-    const scroll=activity.scrollTop;
     let activityRows=selectEvents(events,{...state,pane:'activity'});
     if(selection!=null){
       const next=conversationEvents.filter(e=>e.seq>selection).sort((a,b)=>a.seq-b.seq)[0]?.seq ?? Infinity;
       activityRows=activityRows.filter(e=>e.seq>selection && e.seq<next);
     }
-    const activityHtml=activityRows.map(e=>`<details class="sw-event" data-activity-seq="${e.seq}"${open.has(String(e.seq))?' open':''}><summary>${esc(e.data?.tool || e.data?.path || e.kind)} <span>${esc(agentNames.get(e.agent_id || 'main') || e.agent_id || 'main')} · ${esc(e.data?.status || '')}</span></summary>${activityEvent(e)}</details>`).join('') || '<p class="sw-empty">No coding activity recorded for these filters.</p>';
-    if(activity.innerHTML!==activityHtml){activity.innerHTML=activityHtml;activity.scrollTop=scroll;for(const row of activity.querySelectorAll('[data-activity-seq]')){const previous=treeState.get(row.dataset.activitySeq);if(previous)[...row.querySelectorAll('details')].forEach((node,index)=>{if(index<previous.length)node.open=previous[index];});}}
+    const activityHtml=activityRows.map(e=>`<details class="sw-event" data-activity-seq="${e.seq}" data-key="${e.seq}"${open.has(String(e.seq))?' open':''}><summary>${esc(e.data?.tool || e.data?.path || e.kind)} <span>${esc(agentNames.get(e.agent_id || 'main') || e.agent_id || 'main')} · ${esc(e.data?.status || '')}</span></summary>${activityEvent(e)}</details>`).join('') || '<p class="sw-empty">No coding activity recorded for these filters.</p>';
+    // Rows keep their nodes, so open disclosures (and nested ones) and the scroll position stay as they are.
+    if(shownActivity!==activityHtml){shownActivity=activityHtml;patchRows(activity,activityHtml,streamNewest);}
+    paintedNewest=Number.isFinite(newest)?newest:Infinity;// nothing received yet: the first history is not "new"
     const agents=linkedAgents({...session,parent_session_id:session.parent_session_id || data?.summary?.association?.parent_session_id},data?.summary?.agents || [],sessions,collaborators);
     const agentIds=[...new Set([...agents.map(a=>a.agent_id).filter(Boolean),...[...events,...conversationEvents].map(e=>e.agent_id || 'main')])];
     const options='<option value="">All agents</option>'+agentIds.map(id=>`<option value="${esc(id)}">${esc(agentNames.get(id) || id)}</option>`).join('');
@@ -120,13 +150,45 @@ export function mountSessionWorkspace(host,client,session,{connect=connectEvents
   function paintSummary(){
     if(disposed)return;
     const value=agentSummary || {state:summaryError?'failed':'pending'};
-    const signature=JSON.stringify([value,summaryError]);if(signature===summarySignature)return;summarySignature=signature;
+    const signature=JSON.stringify([value,summaryError,[...fixStates]]);if(signature===summarySignature)return;summarySignature=signature;
     const states={disabled:'Automatic summaries are not enabled.',pending:'Summary update pending.',ready:'Up to date with recorded conversation.',stale:'Newer conversation or unavailable history: showing the last saved summary.',failed:'Summary update failed. The last saved summary is retained.',no_data:'No recorded conversation is available to summarize.'};
     const fields=[['discussed','Discussed'],['decisions','Decisions'],['completed','Completed'],['next_steps','Next steps'],['blockers','Blockers']];
     const coverage=value.coverage;
     const provenance=coverage ? `${coverage.status==='partial'?'Partial recording':'Recorded window only'} · ${Number(coverage.message_count ?? value.source_message_count ?? 0)} messages${coverage.reasons?.length?` · ${coverage.reasons.join(', ')}`:''}` : 'Recording coverage is unavailable.';
-    $('[data-agent-summary]').innerHTML=`<p class="sw-summary-state">${esc(summaryError || states[value.state] || 'Summary status unknown.')}</p>${value.overview?`<div class="conversation-markdown">${renderMarkdown(value.overview)}</div>`:''}${value.where_left_off?`<h4>Where we left off</h4><div class="conversation-markdown">${renderMarkdown(value.where_left_off)}</div>`:''}${fields.some(([key])=>value[key]?.length)?`<details><summary>Discussion, decisions and next steps</summary>${fields.filter(([key])=>Array.isArray(value[key]) && value[key].length).map(([key,label])=>`<h4>${label}</h4><ul>${value[key].map(item=>`<li>${esc(item)}</li>`).join('')}</ul>`).join('')}</details>`:''}<p class="sw-summary-provenance">${esc(provenance)}${value.generated_at?` · Generated ${esc(value.generated_at)}`:''}${value.model?` · ${esc(value.model)}`:''}</p>`;
+    const fixable=new Set(canFix()?['next_steps','blockers']:[]);
+    const item=(key,text,index)=>{
+      if(!fixable.has(key))return `<li class="conversation-markdown">${renderMarkdown(String(text),markdown)}</li>`;
+      const fix=fixStates.get(fixKey(key,text));
+      const label=FIX_LABELS[fix?.state] || 'Let the agent fix this';
+      const locked=FIX_LOCKED.has(fix?.state);
+      const link=fix?.link?` <a href="${esc(fix.link.href)}">${esc(fix.link.label)}</a>`:'';
+      return `<li class="conversation-markdown">${renderMarkdown(String(text),markdown)} <button type="button" class="sw-summary-fix" data-fix-summary data-list="${key}" data-index="${index}"${locked?' disabled':''}>${label}</button>${fix?.message?`<span class="sw-summary-fix-status" ${fix.state==='error'?'role="alert"':'role="status"'}>${esc(fix.message)}${link}</span>`:''}</li>`;
+    };
+    const summaryHost=$('[data-agent-summary]');
+    const detailsOpen=summaryHost.querySelector('details')?.open;
+    summaryHost.innerHTML=`<p class="sw-summary-state">${esc(summaryError || states[value.state] || 'Summary status unknown.')}</p>${value.overview?`<div class="conversation-markdown">${renderMarkdown(value.overview,markdown)}</div>`:''}${value.where_left_off?`<h4>Where we left off</h4><div class="conversation-markdown">${renderMarkdown(value.where_left_off,markdown)}</div>`:''}${fields.some(([key])=>value[key]?.length)?`<details><summary>Discussion, decisions and next steps</summary>${fields.filter(([key])=>Array.isArray(value[key]) && value[key].length).map(([key,label])=>`<h4>${label}</h4><ul>${value[key].map((text,index)=>item(key,text,index)).join('')}</ul>`).join('')}</details>`:''}<p class="sw-summary-provenance">${esc(provenance)}${value.generated_at?` · Generated ${esc(value.generated_at)}`:''}${value.model?` · ${esc(value.model)}`:''}</p>`;
+    const details=summaryHost.querySelector('details');if(details && detailsOpen)details.open=true;
   }
+  $('[data-agent-summary]').addEventListener('click',async event=>{
+    const button=event.target.closest('[data-fix-summary]');if(!button || button.disabled || !canFix())return;
+    const list=button.dataset.list,index=Number(button.dataset.index);
+    // Send the text the summary holds, never text read back from the page.
+    const text=agentSummary?.[list]?.[index];
+    if(typeof text!=='string' || typeof client.fixSummaryItem!=='function')return;
+    const key=fixKey(list,text);
+    if(FIX_LOCKED.has(fixStates.get(key)?.state))return;
+    fixStates.set(key,{state:'sending',message:''});paintSummary();
+    try{
+      const receipt=await client.fixSummaryItem(session.session_id,list,index,text);
+      if(disposed)return;
+      fixStates.set(key,fixOutcome(receipt));
+    }catch(err){
+      if(disposed)return;
+      const outcome=fixError(err);
+      fixStates.set(key,outcome);
+      if(outcome.reload)loadSummary();
+    }finally{if(!disposed)paintSummary();}
+  });
   async function loadSummary(){
     if(disposed || document.hidden || summaryBusy)return;
     if(typeof client.getAgentSummary!=='function'){agentSummary={state:'disabled'};paintSummary();return;}
@@ -279,6 +341,7 @@ export function mountSessionWorkspace(host,client,session,{connect=connectEvents
     if(frame.type==='event' && frame.event){merge(frame.event);schedulePaint();scheduleRefresh();}
   },onError:()=>{streamError=true;schedulePaint();}});
   client.listSessions().then(result=>{if(!disposed){sessions=result.sessions || [];schedulePaint();}}).catch(()=>{});
+  entityIndex.load().then(changed=>{if(changed && !disposed){summarySignature='';schedulePaint();}}).catch(()=>{});
   client.listCollabAgentLinks?.().then(result=>{if(!disposed){collaborators=result.agents || [];schedulePaint();}}).catch(()=>{});
   load();
   return ()=>{disposed=true;request++;clearInterval(summaryTimer);document.removeEventListener('visibilitychange',onVisibility);clearTimeout(renderTimer);clearTimeout(refreshTimer);stop();composer.dispose();};

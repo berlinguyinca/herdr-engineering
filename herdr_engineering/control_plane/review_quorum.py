@@ -275,6 +275,11 @@ def pr_review_quorum(graph, principal, pr_id: str, config: QuorumConfig) -> dict
         evidence = graph.review_evidence(principal, folded, config.reviewers,
                                          config.trusted_head_writers)
     out = evaluate(evidence, config)
+    if not evidence.get("head_visible", True):
+        # T16 M9: the field is hidden from this reader, so is its value (the status stays truthful)
+        out["head"] = None
+        out["head_hidden"] = True
+        evidence = {**evidence, "head_resync_candidate": None}
     if out["head_unverified"]:
         # once per distinct unverified observation, so a polling consumer cannot flood the log
         warned = getattr(graph, "_quorum_warned", None)

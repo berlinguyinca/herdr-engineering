@@ -36,10 +36,20 @@ ENVELOPE_ONLY_TYPES = frozenset({"host", "session", "mission", "service",
 MAX_SEQUENCE = 2**63 - 1          # PostgreSQL bigint
 MAX_GAPS_PER_SOURCE = 64
 MAX_SOURCES = 1024
+MAX_SOURCES_PER_ACTOR = 32      # T16 M6: one principal can never push another's gap/freshness state out
 
 
 class EnvelopeConflict(Exception):
-    """The envelope contradicts something already stored (HTTP 409)."""
+    """The envelope contradicts something already stored (HTTP 409).
+
+    ``reason`` is the machine-readable cause in the response body (``conflict`` or ``sequence_conflict``);
+    ``last_sequence`` is set only for ``sequence_conflict``: the highest sequence accepted from the CALLER's own
+    (principal, source) domain, so a restarted emitter can resume (never another source's state)."""
+
+    def __init__(self, message: str, *, reason: str = "conflict", last_sequence: int | None = None):
+        super().__init__(message)
+        self.reason = reason
+        self.last_sequence = last_sequence
 
 
 def _opt_str(body: dict, name: str) -> str | None:
@@ -209,8 +219,14 @@ class SourceLedger:
         if owner is not None and owner != env["event_id"]:
             raise EnvelopeConflict(
                 f"sequence {env['source_sequence']} of source {env['source']!r} "
-                f"already belongs to event {owner!r}")
+                f"already belongs to event {owner!r}", reason="sequence_conflict",
+                last_sequence=self.last_sequence(env.get("actor"), env["source"]))
         return "new"
+
+    def last_sequence(self, actor, source: str) -> int | None:
+        """Highest sequence accepted from this principal's own ``source`` (None if nothing is remembered)."""
+        st = self._sources.get((_actor_id(actor), source))
+        return st["last_sequence"] if st else None
 
     def commit(self, env: dict, seen_at: str | None = None, *, persist: bool = True) -> None:
         source, seq, eid = env["source"], env["source_sequence"], env["event_id"]
@@ -222,9 +238,19 @@ class SourceLedger:
             (_, old_id), (_, old_source, old_seq, old_actor) = self._events.popitem(last=False)
             if self._sequences.get((old_actor, old_source, old_seq)) == old_id:
                 del self._sequences[(old_actor, old_source, old_seq)]
-        if domain not in self._sources and len(self._sources) >= MAX_SOURCES:
-            stalest = min(self._sources.values(), key=lambda st: st["last_seen_at"] or "")
-            del self._sources[(stalest["actor"], stalest["source"])]
+        if domain not in self._sources:
+            mine = [st for st in self._sources.values() if st["actor"] == actor]
+            if len(mine) >= MAX_SOURCES_PER_ACTOR:
+                victim = min(mine, key=lambda st: st["last_seen_at"] or "")      # evict your own first
+                del self._sources[(victim["actor"], victim["source"])]
+            elif len(self._sources) >= MAX_SOURCES:
+                counts: dict[str, int] = {}
+                for st in self._sources.values():
+                    counts[st["actor"]] = counts.get(st["actor"], 0) + 1
+                heaviest = max(counts, key=lambda a: (counts[a], a == actor))      # the biggest holder pays
+                victim = min((st for st in self._sources.values() if st["actor"] == heaviest),
+                             key=lambda st: st["last_seen_at"] or "")
+                del self._sources[(victim["actor"], victim["source"])]
         state = self._sources.setdefault(
             domain, {"source": source, "actor": actor, "last_sequence": None,
                      "last_seen_at": None, "gaps": []})
@@ -314,9 +340,11 @@ class SourceLedger:
                 "last_seen_at": None, "gaps": []}
             return self._view(state)
 
-    def source_states(self) -> list[dict]:
+    def source_states(self, actor: str | None = None) -> list[dict]:
+        """Every domain, or (T16 M4) only those of one principal."""
         with self._lock_ctx():
-            return [self._view(s) for _, s in sorted(self._sources.items())]
+            return [self._view(s) for (a, _), s in sorted(self._sources.items())
+                    if actor is None or a == actor]
 
     def _lock_ctx(self):
         return self.lock

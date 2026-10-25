@@ -212,7 +212,15 @@ textarea.cx-input { resize: vertical; font: inherit; }
 .cx-still .cx-flow-edge--live, .cx-still .cx-flow-pulse { animation: none; }
 @keyframes cx-flow-move { to { stroke-dashoffset: -26; } }
 @keyframes cx-flow-pulse { 0% { opacity: 1; filter: drop-shadow(0 0 6px currentColor); } 100% { opacity: 0.85; } }
-@media (prefers-reduced-motion: reduce) { .cx-flow-edge--live, .cx-flow-pulse { animation: none; } .cx-log { scroll-behavior: auto; } }
+/* A live task card that slides in and glows runs both animations together (the attribute rule
+ * alone would replace one with the other). */
+.cx-flow-pulse[data-entering] { animation: hd-enter var(--motion-normal, 200ms) ease-out, cx-flow-pulse 1.2s ease-out 1; }
+/* OS reduced motion stops these unless the viewer explicitly chose calm "off"; calm "on" is
+ * handled for every element by motion.css. */
+@media (prefers-reduced-motion: reduce) {
+  html:not([data-calm="off"]) .cx-flow-edge--live, html:not([data-calm="off"]) .cx-flow-pulse { animation: none; }
+  html:not([data-calm="off"]) .cx-log { scroll-behavior: auto; }
+}
 
 /* ---- public guide page */
 .cx-guide { max-width: 860px; margin: 0 auto; padding: 24px 16px 64px; line-height: 1.55; }
@@ -370,6 +378,16 @@ button.ctx-chip:focus-visible, .ctx-chip:focus-visible { outline: 2px solid curr
 .ctx-consult, .ctx-link { border-top: 1px solid var(--hd-border, currentColor); padding-top: 8px; }
 .ctx-inbox { border: 1px solid var(--hd-border, currentColor); border-radius: 8px; padding: 8px; }
 @media (prefers-reduced-motion: reduce) { .ctx-chip { transition: none; } }
+/* agent helpers */
+.cx-panic { justify-content: space-between; }
+.cx-table { width: 100%; border-collapse: collapse; font-size: var(--text-sm, 13px); }
+.cx-table th, .cx-table td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border, rgba(128,128,128,.25)); overflow-wrap: anywhere; }
+.cx-tree { list-style: none; margin: 4px 0 0; padding-left: 16px; border-left: 1px solid var(--border, rgba(128,128,128,.35)); }
+.cx-helpers { margin-top: 8px; }
+.cx-helpers-panel { margin-top: 18px; }
+.cx-helpers-panel .cx-sub1 { display: block; }
+.cx-internal { display: inline-block; margin-left: 6px; padding: 1px 6px; border-radius: 4px; font-size: 0.8em; font-weight: 600; color: var(--status-failed, #b00020); border: 1px solid currentColor; }
+.cx-fix-results .cx-pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 24rem; overflow: auto; margin: .25rem 0 0; font-size: .85em; }
 
 /* Long unbroken labels (ids, URLs) must wrap inside inspector link lists instead of widening the page at 320px. */
 .cx-list li .hd-btn { white-space: normal; overflow-wrap: anywhere; text-align: left; max-width: 100%; height: auto; }

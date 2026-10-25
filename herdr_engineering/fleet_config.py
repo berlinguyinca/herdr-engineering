@@ -127,6 +127,13 @@ def _parse(data: Any) -> FleetConfig:
             raise FleetConfigError(f"section {name}: values must be a mapping")
         if name == CONTROL_PLANE_SECTION and ALL_ROLE in roles:
             raise FleetConfigError(f"section {name}: must not be readable by role 'all'")
+        if name == CONTROL_PLANE_SECTION and "review_gate" in sec["values"]:
+            from herdr_engineering.review_gate.config import parse_review_gate_section
+
+            try:  # structure only: the key file lives on the control-plane host
+                parse_review_gate_section(sec["values"]["review_gate"], check_key_file=False)
+            except ValueError as exc:
+                raise FleetConfigError(f"section {name}: {exc}") from None
         sections[name] = {"roles": roles, "values": sec["values"]}
 
     hosts: dict[str, dict] = {}

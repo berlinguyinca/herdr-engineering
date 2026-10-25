@@ -2,6 +2,8 @@
 import {escapeHtml as esc} from './herdr-web-components/util.js';
 import {formatDuration} from './herdr-web-components/format.js';
 import {recordOutcome,statusOutcome,recordVisibility} from './record-state.js';
+import {patchList,patchText,morph} from './patch.js';
+import {animateChanges} from './motion.js';
 
 const text = value => typeof value === 'string' ? value.trim() : '';
 const records = value => Array.isArray(value) ? value.filter(v=>v && typeof v==='object' && !Array.isArray(v)) : [];
@@ -57,6 +59,14 @@ export function sessionReport(record,now=Date.now()) {
   return `${state} · ${Number.isFinite(age) ? `${formatDuration(Math.max(0,age))} ago` : 'report time unknown'}`;
 }
 
+const RUNTIME_LABELS={'standard-pi':'Standard Pi','pi-bolt':'Pi-Bolt','pi-bolt-jit':'Pi-Bolt (JIT)'};
+export function runtimeLine(runtime) {
+  if (!runtime || !RUNTIME_LABELS[runtime.runtime_kind]) return '';
+  const engine=text(runtime.js_engine) ? ` · ${text(runtime.js_engine)}${text(runtime.js_engine_version) ? ` ${text(runtime.js_engine_version)}` : ''}` : '';
+  const fallback=text(runtime.fallback_reason) ? ` · fell back: ${short(text(runtime.fallback_reason),120)}` : '';
+  return `${RUNTIME_LABELS[runtime.runtime_kind]}${engine}${fallback}`;
+}
+
 export function compactSessionRow(entry,now=Date.now()) {
   const s=entry.record;
   return `<article class="ss-row" data-session-id="${esc(entry.id)}">
@@ -65,8 +75,9 @@ export function compactSessionRow(entry,now=Date.now()) {
       ${entry.mission ? `<p class="ss-meta">Mission: <a data-mission-link href="#/missions/${esc(encodeURIComponent(entry.mission.key))}">${esc(short(entry.mission.title,130))}</a></p>` : text(s.mission_id) ? '<p class="ss-meta">Mission association not resolved; see agent details.</p>' : ''}
       <p class="ss-meta ss-id">${esc(short(entry.id,64))}${text(s.branch) ? ` · Branch ${esc(short(s.branch,70))}` : ''}</p>
     </div>
-    <div class="ss-state"><strong data-report>${esc(sessionReport(s,now))}</strong><span>${esc(short(entry.host,90)||'Host not reported')}</span>${text(s.model) ? `
-      <span class="ss-meta">Model: ${esc(short(s.model,120))}</span>` : ''}</div>
+    <div class="ss-state"><strong data-report>${esc(sessionReport(s,now))}</strong><span>${esc(short(entry.host,90)||'Host not reported')}</span><a class="ss-meta" data-llm-link href="#/llm/session/${esc(encodeURIComponent(entry.id))}">LLM usage</a>${text(s.model) ? `
+      <span class="ss-meta">Model: ${esc(short(s.model,120))}</span>` : ''}${runtimeLine(s.runtime) ? `
+      <span class="ss-meta" data-runtime>Runtime: ${esc(runtimeLine(s.runtime))}</span>` : ''}</div>
   </article>`;
 }
 
@@ -95,6 +106,29 @@ export function mountSessionsView(container,client,{tab='current'}={}) {
     <div class="ss-pages"><button type="button" class="hd-btn" id="ss-previous">Previous</button><span id="ss-page"></span><button type="button" class="hd-btn" id="ss-next">Next</button></div>`;
   const el=id=>container.querySelector(`#ss-${id}`);
   const entries=()=>sessionEntries(sessions,missions);
+  // Groups and rows keep their nodes: rows are keyed by agent id and enter/leave through patchList.
+  // Only a live update of the same view animates; a tab, filter or page change just shows the rows.
+  let lastView='';
+  const element=html=>{const t=document.createElement('template');t.innerHTML=html.trim();return t.content.firstElementChild;};
+  function patchPanel(panel,visible,groups){
+    const view=JSON.stringify([state.tab,state.search,state.host,state.group,state.page]);
+    const live=view===lastView&&!!panel.querySelector('.ss-group');lastView=view;
+    if(!visible.length){
+      const html=`<p class="ss-empty">${loaded?'No agents match this tab and these filters.':'Loading agents…'}</p>`;
+      if(panel.innerHTML!==html)panel.innerHTML=html;
+      return;
+    }
+    for(const child of [...panel.children])if(!child.matches('.ss-group')||!groups.has(child.dataset.groupName))child.remove();
+    let cursor=panel.firstElementChild;
+    for(const [name,rows] of groups){
+      let group=[...panel.children].find(child=>child.dataset.groupName===name);
+      if(!group){group=document.createElement('div');group.className='ss-group';group.dataset.groupName=name;group.innerHTML=`<h2>${esc(name)}</h2><div data-rows></div>`;}
+      if(group!==cursor)panel.insertBefore(group,cursor);else cursor=group.nextElementSibling;
+      const list=group.querySelector('[data-rows]');
+      patchList(list,rows.map(e=>({id:e.id,html:compactSessionRow(e)})),{key:item=>item.id,render:item=>item.html,update:(row,item)=>morph(row,element(item.html)),inPlace:true,animate:live});
+      if(!live)for(const row of list.querySelectorAll('[data-entering]'))row.removeAttribute('data-entering');
+    }
+  }
   function draw() {
     if(disposed)return;
     const all=entries(), selected=selectSessions(all,state);
@@ -105,13 +139,15 @@ export function mountSessionsView(container,client,{tab='current'}={}) {
     lastSignature=signature;
     const focused=document.activeElement;
     const focusId=focused?.closest('[data-session-id]')?.dataset.sessionId;
-    const focusIndex=[...container.querySelectorAll('[data-session-id]')].findIndex(row=>row.dataset.sessionId===focusId);
+    const focusIndex=[...container.querySelectorAll('[data-session-id]:not([data-leaving])')].findIndex(row=>row.dataset.sessionId===focusId);
     const focusMission=focused?.hasAttribute('data-mission-link');
     const scroll={x:window.scrollX,y:window.scrollY};
     for(const [key] of tabs) {
       const button=el(`tab-${key}`), active=state.tab===key;
       button.setAttribute('aria-selected',String(active));button.tabIndex=active?0:-1;
-      button.querySelector('strong').textContent=loaded ? all.filter(e=>e.tab===key).length : '…';
+      const count=button.querySelector('strong'),before=new Map([[count,count.textContent]]);
+      patchText(count,loaded ? all.filter(e=>e.tab===key).length : '…');
+      animateChanges(button,'strong',before);
       el(`panel-${key}`).hidden=!active;
       if(!active)el(`panel-${key}`).innerHTML='';
     }
@@ -119,14 +155,13 @@ export function mountSessionsView(container,client,{tab='current'}={}) {
     if(JSON.stringify(hosts)!==hostSignature){hostSignature=JSON.stringify(hosts);el('host').innerHTML='<option value="">All hosts</option>'+hosts.map(h=>`<option value="${esc(h)}">${esc(h)}</option>`).join('');el('host').value=state.host;}
     const visible=selected.slice(state.page*pageSize,(state.page+1)*pageSize),groups=new Map();
     for(const entry of visible){const label=state.group==='project'?entry.project:'Recent reports';if(!groups.has(label))groups.set(label,[]);groups.get(label).push(entry);}
-    el(`panel-${state.tab}`).innerHTML=visible.length ? [...groups].map(([name,rows])=>`<div class="ss-group"><h2>${esc(name)}</h2>${rows.map(e=>compactSessionRow(e)).join('')}</div>`).join('')
-      : `<p class="ss-empty">${loaded?'No agents match this tab and these filters.':'Loading agents…'}</p>`;
+    patchPanel(el(`panel-${state.tab}`),visible,groups);
     const noModel=loaded && selected.length>0 && !selected.some(e=>text(e.record.model));
     el('result').textContent=loaded ? `${selected.length} matching ${state.tab} agents${visible.length?` · Showing ${state.page*pageSize+1}–${state.page*pageSize+visible.length}`:''}${noModel?' · None of these agents report which model they use':''}` : 'Loading agents…';
     el('page').textContent=`Page ${state.page+1} of ${Math.max(1,Math.ceil(selected.length/pageSize))}`;
     el('previous').disabled=state.page===0;el('next').disabled=(state.page+1)*pageSize>=selected.length;
     if(focusId){
-      const rows=[...container.querySelectorAll('[data-session-id]')];
+      const rows=[...container.querySelectorAll('[data-session-id]:not([data-leaving])')];
       const row=rows.find(n=>n.dataset.sessionId===focusId)||rows[Math.min(Math.max(focusIndex,0),rows.length-1)];
       const target=(focusMission?row?.querySelector('[data-mission-link]'):null)||row?.querySelector('[data-session-link]')||el('search');
       target.focus({preventScroll:true});window.scrollTo(scroll.x,scroll.y);
