@@ -3,7 +3,7 @@ import { escapeHtml as esc } from './herdr-web-components/util.js';
 import { reportFreshness } from './record-state.js';
 import { formatTimestamp, formatDuration } from './herdr-web-components/format.js';
 import { snapshotText, animateChanges } from './motion.js';
-import { patchText } from './patch.js';
+import { patchText, morph, handOff } from './patch.js';
 import './freshness.js';
 
 const metadataObservation = service => service.catalog?.metadata_observation ?? service.metadata_observation;
@@ -100,7 +100,7 @@ function endpoint(s) {
     : `<span class="sc-meta">Recorded endpoint (not current): ${esc(url)}</span>`;
 }
 function serviceRow(s) {
-  return `<article class="sc-row" data-service-id="${esc(s.service_id)}">
+  return `<article class="sc-row" data-key="${esc(s.service_id)}" data-service-id="${esc(s.service_id)}">
     <div class="sc-identity"><a class="sc-name" href="${esc(serviceLink(s))}">${esc(s.service_name || s.service_id)}</a>
       <p>${esc(s.catalog?.purpose || s.description || 'Purpose not reported.')}</p>
       ${s.description && s.catalog?.purpose && s.description !== s.catalog.purpose ? `<p class="sc-meta">${esc(s.description)}</p>` : ''}
@@ -159,30 +159,17 @@ export function renderServiceDetails(s) {
 
 // Keep an open detail page honest even when the provider stops updating.
 export function mountServiceDetails(page, client, initial) {
-  let service=initial, disposed=false, controller=null, signature='', error='';
-  // The chip sits above the detail body, which is redrawn whenever the report changes.
+  let service=initial, disposed=false, controller=null, error='';
+  // The chip sits above the detail body, which is morphed: unchanged reports write nothing.
   page.innerHTML='<div class="hd-live-head"><herdr-freshness interval="30000"></herdr-freshness></div><div data-service-body></div>';
   const chip=page.querySelector('herdr-freshness'),root=page.querySelector('[data-service-body]');
   chip.touch(true);
   function draw() {
     if(disposed)return;
-    const next=JSON.stringify([service,serviceState(service)]);
-    if(next!==signature) {
-      signature=next;
-      const focused=document.activeElement;
-      const href=root.contains(focused) ? focused.getAttribute('href') : null;
-      const restore=root.contains(focused);
-      const scroll={x:window.scrollX,y:window.scrollY};
-      const before=snapshotText(root,'[data-service-state]',()=> 'state');
-      root.innerHTML=renderServiceDetails(service)+'<p class="sc-meta" data-service-refresh role="status"></p>';
-      animateChanges(root,'[data-service-state]',before,()=> 'state',{count:false});
-      if(restore) {
-        const target=[...root.querySelectorAll('a')].find(anchor=>href && anchor.getAttribute('href')===href) || root.querySelector('[data-service-back]');
-        target?.focus({preventScroll:true});window.scrollTo(scroll.x,scroll.y);
-      }
-    }
-    root.querySelector('[data-service-age]').textContent=lastSeen(service);
-    root.querySelector('[data-service-refresh]').textContent=error;
+    const before=snapshotText(root,'[data-service-state]',()=> 'state');
+    // An endpoint link that expired while focused hands focus to the back link.
+    handOff(morph(root,renderServiceDetails(service)+`<p class="sc-meta" data-service-refresh role="status">${esc(error)}</p>`),()=>root.querySelector('[data-service-back]'));
+    animateChanges(root,'[data-service-state]',before,()=> 'state',{count:false});
   }
   async function refresh() {
     if(disposed||controller||document.hidden)return;
@@ -231,60 +218,43 @@ export function mountServices(root, client, initial, {showAll = false, status, s
   const filterKey=node=>node.closest('[data-filter]')?.dataset.filter;
   const serviceKey=node=>node.closest('[data-service-id]')?.dataset.serviceId;
   function draw() {
-    const focused=document.activeElement;
-    const focusedRow=root.contains(focused) ? focused.closest('[data-service-id]') : null;
-    const focusKey=root.contains(focused) ? {
-      service:focusedRow?.dataset.serviceId,
-      rowIndex:[...root.querySelectorAll('[data-service-id]')].indexOf(focusedRow),
-      href:focused.getAttribute('href'),
-      group:focused.closest('details[data-group]')?.dataset.group,
-      summary:focused.tagName==='SUMMARY',
-      filter:focused.closest('[data-filter]')?.dataset.filter,
-    } : null;
-    const scroll={x:window.scrollX,y:window.scrollY};
     root.querySelectorAll('.sc-group').forEach(d=>openGroups.set(d.dataset.group,d.open));
     const scoped = services.filter(service=>inScope(service,state.scope));
     const counts = {current:0,unavailable:0,archived:0,unknown:0};
     scoped.forEach(s=>counts[serviceState(s)]++);
     const countButton = (key,label) => `<button type="button" data-filter="${key}" aria-pressed="${state.status===key}"><strong>${counts[key]}</strong>${label}</button>`;
-    // The panels are rebuilt with innerHTML (Task 19 moves them onto the patcher), so motion pairs
-    // old and new nodes by key: counts by filter, rows by service id (state label change = flash).
+    // Panels are morphed (groups and rows keyed by data-key): unchanged data writes nothing, and
+    // focus and open groups stay. Motion pairs counts by filter, rows by service id (state change = flash).
     const countsBefore=snapshotText(root,'[data-filter] strong',filterKey);
     const statesBefore=snapshotText(el('results'),'[data-service-id] .sc-health strong',serviceKey);
-    el('counts').innerHTML = countButton('current','Reported healthy');
-    el('history-counts').innerHTML = [['unavailable','Unavailable'],['unknown','Unconfirmed'],['archived','Archived']].map(([key,label])=>countButton(key,label)).join('');
-    el('history-summary').textContent = `${scoped.length-counts.current} history and unconfirmed reports`;
-    if(state.status!=='current')el('history').open=true;
-    el('policy').textContent = 'Current requires a recent healthy report and, when available, a fresh listener observation. Stopped or unconfirmed services leave this view automatically; history remains available below.';
+    morph(el('counts'),countButton('current','Reported healthy'));
+    morph(el('history-counts'),[['unavailable','Unavailable'],['unknown','Unconfirmed'],['archived','Archived']].map(([key,label])=>countButton(key,label)).join(''));
+    patchText(el('history-summary'),`${scoped.length-counts.current} history and unconfirmed reports`);
+    if(state.status!=='current'&&!el('history').open)el('history').open=true;
+    patchText(el('policy'),'Current requires a recent healthy report and, when available, a fresh listener observation. Stopped or unconfirmed services leave this view automatically; history remains available below.');
     const hosts = [...new Set(scoped.map(hostLabel))].sort();
-    el('host').innerHTML = '<option value="">All hosts</option>'+hosts.map(h=>`<option value="${esc(h)}">${esc(h)}</option>`).join('');
-    el('host').value=state.host;
+    morph(el('host'),'<option value="">All hosts</option>'+hosts.map(h=>`<option value="${esc(h)}"${h===state.host?' selected':''}>${esc(h)}</option>`).join(''));
     const selected=selectServices(services,state);
     const groups=groupServices(selected,state.group);
-    el('result').textContent=`${selected.length} matching services · ${groups.length} groups`;
-    el('results').innerHTML=groups.length ? groups.map(g=>{
+    patchText(el('result'),`${selected.length} matching services · ${groups.length} groups`);
+    const stranded=morph(el('results'),groups.length ? groups.map(g=>{
       const key=g.key;
       const open=openGroups.has(key)?openGroups.get(key):groups.length<=3&&selected.length<=12;
       const summary=[...new Set(g.services.map(stateLabel))].map(label=>`${g.services.filter(s=>stateLabel(s)===label).length} ${label.toLowerCase()}`).join(' · ');
-      return `<details class="sc-group" data-group="${esc(key)}" ${open?'open':''}><summary>${esc(g.label)}<span>${g.services.length} services · ${esc(summary)}</span></summary>${g.services.map(serviceRow).join('')}</details>`;
-    }).join(''):`<herdr-empty message="${!scoped.length ? state.scope==='herdr' ? 'No services have a confirmed HerdR launch association yet. Discovered listeners are under Local services.' : state.scope==='system' ? 'No services have been confirmed as system units.' : 'No local services have been reported.' : 'No services match these filters. Choose a status count above, select All statuses, or clear your search to explore the catalog.'}"></herdr-empty>`;
+      return `<details class="sc-group" data-key="${esc(key)}" data-group="${esc(key)}" ${open?'open':''}><summary>${esc(g.label)}<span>${g.services.length} services · ${esc(summary)}</span></summary>${g.services.map(serviceRow).join('')}</details>`;
+    }).join(''):`<herdr-empty message="${!scoped.length ? state.scope==='herdr' ? 'No services have a confirmed HerdR launch association yet. Discovered listeners are under Local services.' : state.scope==='system' ? 'No services have been confirmed as system units.' : 'No local services have been reported.' : 'No services match these filters. Choose a status count above, select All statuses, or clear your search to explore the catalog.'}"></herdr-empty>`);
+    // A focused row (or endpoint) whose service left hands focus to its row's name, a neighbour, else search.
+    handOff(stranded,node=>{
+      const row=node.closest('[data-service-id]');
+      if(row&&row!==node)return row.querySelector('.sc-name');
+      for(const near of [node.nextElementSibling,node.previousElementSibling])if(near?.matches('[data-service-id]'))return near.querySelector('.sc-name');
+      return el('search');
+    });
+    // Focus inside a group the user collapsed moves to its summary.
+    const inGroup=document.activeElement?.closest?.('.sc-group');
+    if(inGroup&&root.contains(inGroup)&&!inGroup.open&&document.activeElement.tagName!=='SUMMARY')inGroup.querySelector('summary').focus({preventScroll:true});
     animateChanges(root,'[data-filter] strong',countsBefore,filterKey);
     animateChanges(el('results'),'[data-service-id] .sc-health strong',statesBefore,serviceKey,{count:false,target:node=>node.closest('[data-service-id]')});
-    root.querySelectorAll('.sc-group').forEach(d=>d.addEventListener('toggle',()=>{if(d.isConnected)openGroups.set(d.dataset.group,d.open);}));
-    if(focusKey && !focused.isConnected) {
-      let target;
-      if(focusKey.service) {
-        const rows=[...root.querySelectorAll('[data-service-id]')];
-        const row=rows.find(node=>node.dataset.serviceId===focusKey.service)
-          || rows[Math.min(Math.max(focusKey.rowIndex,0),rows.length-1)];
-        target=[...(row?.querySelectorAll('a') || [])].find(anchor=>anchor.getAttribute('href')===focusKey.href) || row?.querySelector('.sc-name');
-      } else if(focusKey.filter) target=[...root.querySelectorAll('[data-filter]')].find(button=>button.dataset.filter===focusKey.filter);
-      else if(focusKey.summary) target=[...root.querySelectorAll('.sc-group')].find(group=>group.dataset.group===focusKey.group)?.querySelector('summary');
-      target ||= el('search');
-      const group=target.closest('details');
-      if(group && !group.open && !focusKey.summary)target=group.querySelector('summary');
-      target.focus({preventScroll:true});window.scrollTo(scroll.x,scroll.y);
-    }
   }
   function chooseStatus(event) {
     const key=event.target.closest('button[data-filter]')?.dataset.filter;
@@ -295,6 +265,8 @@ export function mountServices(root, client, initial, {showAll = false, status, s
     draw();
   }
   root.addEventListener('click',chooseStatus);
+  const toggled=event=>{const d=event.target;if(d.matches?.('.sc-group')&&d.isConnected)openGroups.set(d.dataset.group,d.open);};
+  root.addEventListener('toggle',toggled,true);
   for(const name of ['search','host','status','group','archived']) {
     el(name).addEventListener(name==='search'?'input':'change',()=>{
       state[name]=name==='archived'?el(name).checked:el(name).value;
@@ -314,12 +286,12 @@ export function mountServices(root, client, initial, {showAll = false, status, s
       const data=await client.listServices();
       if(disposed)return;
       services=data.services;
-      el('error').textContent='';
+      patchText(el('error'),'');
       chip()?.touch(true);
       // Capture before replacement, including toggles whose queued event has not fired.
       root.querySelectorAll('.sc-group').forEach(d=>openGroups.set(d.dataset.group,d.open));
       draw();
-    } catch (error) { if(!disposed){el('error').textContent='Could not refresh services. Showing the last received catalog.';chip()?.touch(false,error?.message||'request failed');} }
+    } catch (error) { if(!disposed){patchText(el('error'),'Could not refresh services. Showing the last received catalog.');chip()?.touch(false,error?.message||'request failed');} }
     finally {pending=false;}
   }
   draw();
@@ -335,5 +307,5 @@ export function mountServices(root, client, initial, {showAll = false, status, s
     // "Last report N ago" keeps counting between refreshes (written only when the text changes).
     for(const age of root.querySelectorAll('[data-service-seen]'))patchText(age,seenAgo(age.dataset.serviceSeen));
   },1000);
-  return {refresh,dispose(){disposed=true;clearInterval(timer);clearInterval(clock);root.removeEventListener('click',chooseStatus);}};
+  return {refresh,dispose(){disposed=true;clearInterval(timer);clearInterval(clock);root.removeEventListener('click',chooseStatus);root.removeEventListener('toggle',toggled,true);}};
 }

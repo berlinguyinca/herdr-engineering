@@ -116,3 +116,55 @@ test('Agents: identical refresh writes nothing; one changed agent rewrites only 
  assert.equal(await page.locator('#ss-search').inputValue(),'doing','typed filter survives');
  assert.equal(await page.locator('#ss-host').inputValue(),'beast','host filter survives');
 }));
+
+// ---------------------------------------------------------------- Services
+const svc=(id,extra={})=>({service_id:id,service_name:`Service ${id}`,status:'healthy',host_id:'beast',port:8000,updated_at:'2026-01-01T00:00:05Z',catalog:{scope:'herdr',project:'alpha'},...extra});
+function servicesApi(state){
+ return p=>{
+  if(p==='/api/v1/services')return {services:structuredClone(state.services)};
+  const one=p.match(/^\/api\/v1\/services\/(.+)$/);
+  if(one)return structuredClone(state.services.find(x=>x.service_id===decodeURIComponent(one[1])));
+  return {};
+ };
+}
+
+test('Services: a live event refreshes the list; identical data writes nothing; one change rewrites only its row',async()=>withPage(async(page,base)=>{
+ const state={services:[svc('s1'),svc('s2'),svc('s3',{catalog:{scope:'herdr',project:'beta'}})]};
+ const reads=await boot(page,base,'/services',servicesApi(state));
+ await until(()=>page.locator('[data-service-id]').count().then(n=>n===3),'service rows');
+ await page.locator('#sc-search').fill('service');await page.locator('#sc-search').evaluate(e=>e.blur());
+ await page.evaluate(()=>{document.querySelector('.sc-group[data-group]').open=false;});
+ const openBefore=await page.evaluate(()=>[...document.querySelectorAll('.sc-group')].map(d=>d.open));
+ await page.evaluate(()=>{window.__rows=[...document.querySelectorAll('[data-service-id]')];});
+
+ // The page polls every 30 s; a re-read within 6 s of an event comes from the refresh bus.
+ const before=reads['/api/v1/services'];
+ await observe(page);
+ await liveRefresh(page,{event_id:'v1',event_type:'ServiceUpdated'});
+ assert.ok(reads['/api/v1/services']>before,'a live event refreshed the services');
+ assert.deepEqual(await writes(page),[],'identical refresh performs no DOM writes');
+ assert.equal(await page.evaluate(()=>window.__spinners),0,'no loader on a live refresh');
+
+ state.services[1].port=9000;
+ await observe(page);
+ await liveRefresh(page,{event_id:'v2',event_type:'ServiceUpdated'});
+ await until(()=>page.locator('[data-service-id="s2"] .sc-location').textContent().then(t=>t.includes(':9000')),'changed port');
+ assert.equal(await page.evaluate(()=>[...document.querySelectorAll('[data-service-id]')].every((n,i)=>n===window.__rows[i])),true,'every row node survives');
+ assert.deepEqual(await writes(page,'[data-service-id="s2"]'),[],'nothing outside the changed row was written');
+ assert.deepEqual(await page.evaluate(()=>[...document.querySelectorAll('.sc-group')].map(d=>d.open)),openBefore,'open and closed groups stay as the user left them');
+ assert.equal(await page.locator('#sc-search').inputValue(),'service','typed filter survives');
+}));
+
+test('Service detail: a live event refreshes it and identical data writes nothing',async()=>withPage(async(page,base)=>{
+ const state={services:[svc('s1',{url:'http://dev.lan:8000'})]};
+ const reads=await boot(page,base,'/services/s1',servicesApi(state));
+ await until(()=>page.locator('[data-service-state]').count().then(n=>n===1),'service detail');
+ await page.locator('[data-service-back]').focus();
+ // The detail polls every 30 s; a read within 6 s of an event comes from the refresh bus.
+ const before=reads['/api/v1/services']??0;
+ await observe(page);
+ await liveRefresh(page,{event_id:'d1',event_type:'ServiceUpdated'});
+ assert.ok((reads['/api/v1/services']??0)>before,'a live event refreshed the detail');
+ assert.deepEqual(await writes(page),[],'identical refresh performs no DOM writes');
+ assert.equal(await page.evaluate(()=>document.activeElement?.hasAttribute('data-service-back')),true,'focus stays');
+}));
