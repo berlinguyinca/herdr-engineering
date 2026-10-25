@@ -2,12 +2,14 @@ import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {spawn} from 'node:child_process';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import {chromium} from 'playwright';
 
 const root = path.resolve(import.meta.dirname, '../..');
 const python = process.env.PYTHON || (fs.existsSync(path.join(root, '.venv/bin/python')) ? path.join(root, '.venv/bin/python') : 'python3');
-const shots = path.join(root, 'docs/specs/herdr-codeboarding-native-port-2026-10-23/evidence');
+// Review screenshots go to a scratch dir, never the tracked docs tree (two curated ones live in evidence/).
+const shots = fs.mkdtempSync(path.join(os.tmpdir(), 'herdr-architecture-shots-'));
 
 async function withApp(env, fn, ctx = {}) {
   const server = spawn(python, [path.join(root, 'tests/playwright/architecture-server.py')], {env: {...process.env, ...env}, stdio: ['ignore', 'pipe', 'pipe']});

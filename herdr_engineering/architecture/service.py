@@ -6,11 +6,14 @@ is an idempotent no-op, with a different hash a conflict.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 import threading
 import time
 import uuid
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
+from datetime import datetime
 
 from ..control_plane.project_links import canonical_repository
 from . import crossrepo, explain as ex, identity, overlays as ov
@@ -25,8 +28,18 @@ MAX_NODES = 250_000
 MAX_EDGES = 1_000_000
 MAX_LIMIT = 500
 EVENTS = {"requested", "started", "progress", "completed", "failed", "cancelled"}
+FINISHED = frozenset({"completed", "failed", "cancelled", "expired"})
 _JOB_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,95}")
-_REL = re.compile(r"(?!/)(?!.*(?:^|/)\.\.(?:/|$))[^\x00\\]{1,1024}")
+_HOST_ID = re.compile(r"[A-Za-z0-9._-]{1,64}")
+# A repository-relative path: not absolute, no `..` segment, no backslash, no control character (a newline
+# used to end the `.*` lookahead early, so "x\n../y" passed).
+_REL = re.compile(r"(?!/)(?!.*(?:^|/)\.\.(?:/|$))[^\x00-\x1f\x7f\\]{1,1024}", re.DOTALL)
+# Defaults for the YAML-configurable knobs (control_plane.architecture.*).
+DEFAULT_CACHE_GRAPHS = 8
+DEFAULT_CACHE_BYTES = 256 * 1024 * 1024
+DEFAULT_REQUEST_TTL = 3600
+_NODE_FIELDS = ("node_id", "kind", "qualified_name", "parent_id", "relative_path", "line_start", "line_end", "metadata")
+_EDGE_FIELDS = ("edge_id", "kind", "from_id", "to_id", "source_span", "evidence_ref", "extractor", "inferred")
 
 
 class ArchitectureError(ValueError):
@@ -35,7 +48,31 @@ class ArchitectureError(ValueError):
         self.status = status
 
 
+def _opt(value, kind) -> bool:
+    return value is None or (isinstance(value, kind) and not isinstance(value, bool))
+
+
+def _rel_ok(path) -> bool:
+    return path is None or (isinstance(path, str) and _REL.fullmatch(path) is not None)
+
+
+def _check_structure(nodes: dict, children: dict) -> None:
+    """Exactly one root, and every node reachable from it: with all parents existing that also proves no cycle."""
+    roots = children.get(None, [])
+    if len(roots) != 1:
+        raise ArchitectureError("graph must have exactly one root node")
+    seen, stack = {roots[0]}, [roots[0]]
+    while stack:
+        for kid in children.get(stack.pop(), ()):
+            if kid not in seen:
+                seen.add(kid)
+                stack.append(kid)
+    if len(seen) != len(nodes):
+        raise ArchitectureError("graph has a parent cycle")
+
+
 def _validate(snapshot: dict, graph: dict) -> None:
+    """Deep validation; runs before anything is stored, so a malformed snapshot is never persisted."""
     if not isinstance(snapshot, dict) or not isinstance(graph, dict):
         raise ArchitectureError("snapshot and graph must be objects")
     for f in identity.SNAPSHOT_KEY_FIELDS:
@@ -45,6 +82,8 @@ def _validate(snapshot: dict, graph: dict) -> None:
         raise ArchitectureError("commit_sha must be a full 40 or 64 character hexadecimal commit")
     if canonical_repository(snapshot["repository_id"]) != snapshot["repository_id"]:
         raise ArchitectureError("repository_id must be a canonical repository identity")
+    if not _HOST_ID.fullmatch(snapshot["host_id"]):
+        raise ArchitectureError("snapshot.host_id is invalid")
     if graph.get("schema") != identity.GRAPH_SCHEMA:
         raise ArchitectureError("unsupported graph schema")
     nodes, edges = graph.get("nodes"), graph.get("edges")
@@ -52,29 +91,52 @@ def _validate(snapshot: dict, graph: dict) -> None:
         raise ArchitectureError("graph.nodes and graph.edges must be arrays")
     if len(nodes) > MAX_NODES or len(edges) > MAX_EDGES:
         raise ArchitectureError("graph exceeds the size limit", 413)
+    diags = graph.get("diagnostics", [])
+    if not isinstance(diags, list) or not all(isinstance(d, dict) for d in diags):
+        raise ArchitectureError("graph.diagnostics must be an array of objects")
     if snapshot.get("snapshot_id") != identity.snapshot_id(snapshot):
         raise ArchitectureError("snapshot_id does not match its key fields")
     if snapshot.get("graph_hash") != identity.graph_hash(graph):
         raise ArchitectureError("graph_hash does not match the graph")
-    ids = set()
+    by_id: dict = {}
     for n in nodes:
-        if not isinstance(n, dict) or n.get("kind") not in NODE_KINDS or not isinstance(n.get("node_id"), str):
+        if not isinstance(n, dict) or any(f not in n for f in _NODE_FIELDS):
+            raise ArchitectureError("invalid node: " + ", ".join(_NODE_FIELDS) + " are required")
+        if n["kind"] not in NODE_KINDS or not isinstance(n["node_id"], str) or not n["node_id"]:
             raise ArchitectureError("invalid node")
-        if n["node_id"] in ids:
+        if not isinstance(n["qualified_name"], str) or not isinstance(n["metadata"], dict):
+            raise ArchitectureError("invalid node")
+        if not (n["parent_id"] is None or isinstance(n["parent_id"], str)):
+            raise ArchitectureError("invalid node parent_id")
+        if not (_opt(n["line_start"], int) and _opt(n["line_end"], int)):
+            raise ArchitectureError("invalid node line range")
+        if n["node_id"] in by_id:
             raise ArchitectureError("duplicate node_id")
-        ids.add(n["node_id"])
-        p = n.get("relative_path")
-        if p is not None and not (isinstance(p, str) and _REL.fullmatch(p)):
+        by_id[n["node_id"]] = n
+        if not _rel_ok(n["relative_path"]):
             raise ArchitectureError("node path escapes the repository")
+    children: dict = defaultdict(list)
+    for n in nodes:
+        if n["parent_id"] is not None and n["parent_id"] not in by_id:
+            raise ArchitectureError("node parent_id references an unknown node")
+        children[n["parent_id"]].append(n["node_id"])
+    _check_structure(by_id, children)
     for e in edges:
-        if not isinstance(e, dict) or e.get("kind") not in EDGE_KINDS:
+        if not isinstance(e, dict) or any(f not in e for f in _EDGE_FIELDS):
+            raise ArchitectureError("invalid edge: " + ", ".join(_EDGE_FIELDS) + " are required")
+        if e["kind"] not in EDGE_KINDS or not isinstance(e["edge_id"], str) or not e["edge_id"]:
             raise ArchitectureError("invalid edge")
-        if e.get("from_id") not in ids or e.get("to_id") not in ids:
+        if e["from_id"] not in by_id or e["to_id"] not in by_id:
             raise ArchitectureError("edge references an unknown node")
-        if not isinstance(e.get("inferred"), bool):
+        if not isinstance(e["inferred"], bool):
             raise ArchitectureError("edge.inferred must be a boolean")
-        if not e.get("extractor") or not isinstance(e.get("source_span"), dict):
+        span = e["source_span"]
+        if not e["extractor"] or not isinstance(e["extractor"], str) or not isinstance(span, dict):
             raise ArchitectureError("edge needs an extractor and a source span")
+        if "path" not in span or not _rel_ok(span["path"]) or not _opt(span.get("line_start"), int):
+            raise ArchitectureError("invalid edge source span")
+        if not (e["evidence_ref"] is None or isinstance(e["evidence_ref"], str)):
+            raise ArchitectureError("invalid edge evidence_ref")
 
 
 class _Loaded:
@@ -92,9 +154,13 @@ class _Loaded:
         self.graph = graph
 
     def ancestors(self, nid):
-        while nid is not None:
+        # Bounded even though publish rejects cycles: a graph stored before that check must not hang a request.
+        for _ in range(len(self.nodes) + 1):
+            if nid is None:
+                return
             yield nid
             nid = self.nodes[nid]["parent_id"]
+        raise ArchitectureError("snapshot graph has a parent cycle", 500)
 
 
 def _page(items, cursor, limit):
@@ -109,14 +175,19 @@ def _page(items, cursor, limit):
 
 
 class ArchitectureService:
-    def __init__(self, repo, enabled=False):
+    def __init__(self, repo, enabled=False, cache_graphs=DEFAULT_CACHE_GRAPHS, cache_bytes=DEFAULT_CACHE_BYTES,
+                 request_ttl=DEFAULT_REQUEST_TTL):
         self.repo = repo
         self.enabled = bool(enabled)
+        # Loaded graphs are an LRU bounded by count and by stored graph bytes (artifact size; the parsed form is
+        # larger by a roughly constant factor). An evicted graph is re-read from its artifact on demand.
+        self.cache_graphs, self.cache_bytes = int(cache_graphs), int(cache_bytes)
+        self.request_ttl = int(request_ttl)       # a `requested` job nobody claimed expires after this many seconds
         self.gate_store_fn = lambda: None          # set by the server when the review gate is running
         self.explain_config = None                 # set from control_plane.architecture.explain (off by default)
         self.explain_key = None
         self._meta: dict[str, dict] = {}
-        self._graphs: dict[str, _Loaded] = {}
+        self._graphs: OrderedDict[str, tuple[_Loaded, int]] = OrderedDict()
         self._jobs: dict[str, dict] = {}
         self._links: dict[str, list[dict]] = defaultdict(list)       # room_id -> links (annotations)
         self._lock = threading.RLock()
@@ -132,10 +203,19 @@ class ArchitectureService:
                 self._links[eid] = [ev["payload"] for ev in stream if ev["event_type"] == "architecture.link.created"]
 
     # ------------------------------------------------------------ publish
-    def publish(self, body: dict) -> dict:
+    @staticmethod
+    def _check_host(host_id, allowed_hosts) -> None:
+        """`allowed_hosts` is the set an agent key is bound to (control_plane.architecture.agent_hosts), or None
+        for a key with no binding: such agent keys are trusted to name any host_id."""
+        if allowed_hosts is not None and host_id not in allowed_hosts:
+            raise ArchitectureError("this API key is not bound to that host_id", 403)
+
+    def publish(self, body: dict, allowed_hosts=None) -> dict:
         snapshot, graph = (body or {}).get("snapshot"), (body or {}).get("graph")
         _validate(snapshot, graph)
+        self._check_host(snapshot["host_id"], allowed_hosts)
         sid = snapshot["snapshot_id"]
+        loaded = _Loaded(graph)                    # before any durable write: a graph that cannot load is never stored
         with self._lock:
             have = self._meta.get(sid)
             if have:
@@ -156,23 +236,39 @@ class ArchitectureService:
             self.repo.record_event(ENTITY, sid, "architecture.snapshot.published", {"snapshot": meta},
                                    require_durable=True)
             self._meta[sid] = meta
-            self._graphs[sid] = _Loaded(graph)
+            self._cache_put(sid, loaded, art["size_bytes"])
             return {"snapshot": meta, "duplicate": False}
+
+    def _cache_put(self, sid, loaded: _Loaded, size: int) -> None:
+        with self._lock:
+            self._graphs[sid] = (loaded, int(size or 0))
+            self._graphs.move_to_end(sid)
+            total = sum(sz for _, sz in self._graphs.values())
+            while len(self._graphs) > 1 and (len(self._graphs) > self.cache_graphs or total > self.cache_bytes):
+                _, (_, sz) = self._graphs.popitem(last=False)     # least recently used; never the one just added
+                total -= sz
 
     def _load(self, sid) -> _Loaded:
         meta = self._meta.get(sid)
         if meta is None:
             raise KeyError(sid)
-        g = self._graphs.get(sid)
-        if g is None:
-            data = self.repo.get_artifact_data(meta["artifact_ref"]["artifact_id"])
-            if data is None:
-                raise ArchitectureError("snapshot graph artifact is unavailable", 503)
-            import hashlib
-            import json
-            if hashlib.sha256(data).hexdigest() != meta["artifact_ref"]["sha256"]:
-                raise ArchitectureError("snapshot graph artifact failed its integrity check", 503)
-            g = self._graphs[sid] = _Loaded(json.loads(data))
+        with self._lock:
+            hit = self._graphs.get(sid)
+            if hit is not None:
+                self._graphs.move_to_end(sid)
+                return hit[0]
+        # Read and parse outside the lock: a large artifact must not stall every other architecture call.
+        data = self.repo.get_artifact_data(meta["artifact_ref"]["artifact_id"])
+        if data is None:
+            raise ArchitectureError("snapshot graph artifact is unavailable", 503)
+        if hashlib.sha256(data).hexdigest() != meta["artifact_ref"]["sha256"]:
+            raise ArchitectureError("snapshot graph artifact failed its integrity check", 503)
+        g = _Loaded(json.loads(data))
+        try:
+            _check_structure(g.nodes, g.children)  # snapshots stored before deep validation existed
+        except ArchitectureError as exc:
+            raise ArchitectureError(f"stored snapshot graph is malformed: {exc}", 503) from None
+        self._cache_put(sid, g, len(data))
         return g
 
     # -------------------------------------------------------------- query
@@ -218,10 +314,13 @@ class ArchitectureService:
                     return a
             return None
 
-        stack = list(visible)
+        stack, seen = list(visible), set(visible)
         while stack:
             cur = stack.pop()
-            stack.extend(g.children.get(cur, []))
+            for kid in g.children.get(cur, []):
+                if kid not in seen:              # a cyclic legacy graph must not loop forever
+                    seen.add(kid)
+                    stack.append(kid)
             for e in g.out.get(cur, []):
                 if e["kind"] == "contains":
                     continue
@@ -305,9 +404,26 @@ class ArchitectureService:
             job["created_at"] = ev["ingest_timestamp"]
         return job
 
+    def _expires_at(self, job) -> float:
+        """Epoch when a `requested` job lapses. Old events carry no expires_at: derive it from created_at."""
+        if isinstance(job.get("expires_at"), (int, float)):
+            return float(job["expires_at"])
+        try:
+            created = datetime.fromisoformat(str(job.get("created_at")).replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            return 0.0
+        return created + self.request_ttl
+
+    def _expire_stale(self, now: float) -> None:
+        """Requested jobs nobody claimed in time end as `expired` (caller holds the lock)."""
+        for job in list(self._jobs.values()):
+            if job["state"] == "requested" and self._expires_at(job) <= now:
+                self._apply(self.repo.record_event(JOB_ENTITY, job["analysis_id"], "architecture.analysis.expired",
+                                                   {"message": "no host claimed the request before it expired"}))
+
     def _open(self, job) -> bool:
         if job["state"] == "requested":
-            return True
+            return self._expires_at(job) > time.time()
         return job["state"] in ("started", "progress") and job.get("lease_expires_at", 0) > time.time()
 
     @staticmethod
@@ -330,6 +446,7 @@ class ArchitectureService:
             raise ArchitectureError("priority must be interactive or background")
         key = self._request_key(repo_id, host_id, rev)
         with self._lock:
+            self._expire_stale(time.time())
             if identity.is_full_sha(rev):
                 known = [m for m in self._meta.values() if m["repository_id"] == repo_id and m["host_id"] == host_id
                          and m["commit_sha"] == rev]
@@ -341,18 +458,23 @@ class ArchitectureService:
             aid = "an-" + uuid.uuid4().hex[:16]
             ev = self.repo.record_event(JOB_ENTITY, aid, "architecture.analysis.requested",
                                         {"repository_id": repo_id, "host_id": host_id, "rev": rev, "priority": prio,
-                                         "key": key})
+                                         "key": key, "expires_at": time.time() + self.request_ttl})
             self._apply(ev)
             return {"analysis_id": aid, "deduplicated": False, "state": "requested"}
 
-    def claim_analysis(self, body: dict) -> dict:
+    def claim_analysis(self, body: dict, allowed_hosts=None) -> dict:
         """A host takes the oldest requested job for itself (interactive first) under a lease."""
         host_id = (body or {}).get("host_id")
-        if not (isinstance(host_id, str) and re.fullmatch(r"[A-Za-z0-9._-]{1,64}", host_id)):
+        if not (isinstance(host_id, str) and _HOST_ID.fullmatch(host_id)):
             raise ArchitectureError("host_id is required")
-        lease = max(30, min(int((body or {}).get("lease_seconds", 600)), 3600))
+        self._check_host(host_id, allowed_hosts)
+        try:
+            lease = max(30, min(int((body or {}).get("lease_seconds", 600)), 3600))
+        except (TypeError, ValueError):
+            raise ArchitectureError("lease_seconds must be an integer") from None
         with self._lock:
             now = time.time()
+            self._expire_stale(now)
             ready = [j for j in self._jobs.values() if j.get("host_id") == host_id and (
                 j["state"] == "requested" or (j["state"] in ("started", "progress") and j.get("lease_expires_at", 0) <= now))]
             if not ready:
@@ -365,7 +487,19 @@ class ArchitectureService:
             return {"job": {k: job[k] for k in ("analysis_id", "repository_id", "host_id", "rev", "priority") if k in job},
                     "lease_expires_at": now + lease}
 
-    def record_analysis(self, body: dict) -> dict:
+    def cancel_analysis(self, analysis_id: str) -> dict:
+        """Operator cancel: any unfinished job ends as `cancelled`; a running host sees it on its next heartbeat."""
+        with self._lock:
+            job = self._jobs.get(analysis_id)
+            if job is None:
+                raise KeyError(analysis_id)
+            if job["state"] in FINISHED:
+                raise ArchitectureError("analysis already finished", 409)
+            self._apply(self.repo.record_event(JOB_ENTITY, analysis_id, "architecture.analysis.cancelled",
+                                               {"message": "cancelled by an operator"}, require_durable=True))
+            return {"analysis": dict(job)}
+
+    def record_analysis(self, body: dict, allowed_hosts=None) -> dict:
         if not isinstance(body, dict):
             raise ArchitectureError("body must be an object")
         aid, event = body.get("analysis_id"), body.get("event")
@@ -382,9 +516,18 @@ class ArchitectureService:
             raise ArchitectureError("commit_sha must be a full hexadecimal commit")
         if "progress" in payload and not (isinstance(payload["progress"], (int, float)) and 0 <= payload["progress"] <= 1):
             raise ArchitectureError("progress must be between 0 and 1")
+        if "host_id" in payload and not _HOST_ID.fullmatch(payload["host_id"]):
+            raise ArchitectureError("invalid host_id")
         with self._lock:
             cur = self._jobs.get(aid)
-            if cur and cur["state"] in ("completed", "failed", "cancelled"):
+            if allowed_hosts is not None:
+                # a bound key reports only for its own hosts, and only on jobs of those hosts
+                self._check_host(payload.get("host_id"), allowed_hosts)
+                if cur and cur.get("host_id") is not None:
+                    self._check_host(cur.get("host_id"), allowed_hosts)
+            if cur and "host_id" in payload and cur.get("host_id") not in (None, payload["host_id"]):
+                raise ArchitectureError("analysis belongs to another host", 409)
+            if cur and cur["state"] in FINISHED:
                 raise ArchitectureError("analysis already finished", 409)
             if event in ("started", "progress") and "lease_expires_at" not in payload:
                 payload["lease_expires_at"] = time.time() + 600     # a heartbeat extends the lease
@@ -476,40 +619,64 @@ class ArchitectureService:
                 + ["attribution is commit-level, not per-agent authorship"]}
 
     # ----------------------------------------------------------- room annotations
-    def add_room_link(self, room_id: str, body: dict, author: str) -> dict:
-        """Called by CollabService AFTER it authorised the caller for this room. Links, never copies, graph data."""
-        bad = [k for k in (body or {}) if k not in ("snapshot_id", "node_id", "note", "idempotency_key")]
+    def room_repositories(self, mission_ids) -> frozenset:
+        """The repositories a room may annotate: those of the sessions of the missions linked to the room."""
+        mids = set(mission_ids or ())
+        if not mids:
+            return frozenset()
+        return frozenset(r for sess in self.repo.list_sessions()
+                         if (sess.get("mission_key") in mids or sess.get("mission_id") in mids)
+                         and (r := ov.pl._identity(sess)))
+
+    def prepare_room_link(self, body: dict, repositories) -> dict:
+        """Validate a link and resolve its target; takes no collaboration lock (it may read a graph artifact).
+        A snapshot outside the room's repositories is the same 404 as an unknown one: no cross-fleet oracle."""
+        if not isinstance(body, dict):
+            raise ArchitectureError("body must be an object")
+        bad = [k for k in body if k not in ("snapshot_id", "node_id", "note", "idempotency_key")]
         if bad:
             raise ArchitectureError("unknown field")
-        sid, nid, note, key = (body or {}).get("snapshot_id"), body.get("node_id"), body.get("note", ""), body.get("idempotency_key")
+        sid, nid, note, key = body.get("snapshot_id"), body.get("node_id"), body.get("note", ""), body.get("idempotency_key")
         if not (isinstance(sid, str) and isinstance(nid, str)):
             raise ArchitectureError("snapshot_id and node_id are required")
         if not isinstance(note, str) or len(note) > 500:
             raise ArchitectureError("note must be at most 500 characters")
         if key is not None and not (isinstance(key, str) and re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", key)):
             raise ArchitectureError("invalid idempotency_key")
-        g = self._load(sid)                      # KeyError -> 404
-        if nid not in g.nodes:
+        meta = self._meta.get(sid)
+        if meta is None or meta["repository_id"] not in (repositories or ()):
+            raise KeyError(sid)
+        if nid not in self._load(sid).nodes:     # KeyError -> 404
             raise KeyError(nid)
+        return {"snapshot_id": sid, "node_id": nid, "note": _CONTROL.sub("", note).strip(), "idempotency_key": key}
+
+    def record_room_link(self, room_id: str, prepared: dict, author: str) -> dict:
+        """Called by CollabService AFTER it (re)authorised the caller for this room. Links, never copies, graph data."""
+        sid, nid, note, key = (prepared[k] for k in ("snapshot_id", "node_id", "note", "idempotency_key"))
         with self._lock:
             rows = self._links[room_id]
             link_id = "lnk_" + (identity.hash_obj([room_id, author, key])[:24] if key else uuid.uuid4().hex[:24])
             prior = next((r for r in rows if r["link_id"] == link_id), None)
             if prior:
-                if (prior["snapshot_id"], prior["node_id"], prior["note"]) != (sid, nid, _CONTROL.sub("", note).strip()):
+                if (prior["snapshot_id"], prior["node_id"], prior["note"]) != (sid, nid, note):
                     raise ArchitectureError("idempotency_key already used for a different link", 409)
                 return {"link_id": link_id, "replayed": True}
             if len(rows) >= MAX_LINKS_PER_ROOM:
                 raise ArchitectureError("this room has too many architecture links", 400)
-            rec = {"link_id": link_id, "snapshot_id": sid, "node_id": nid, "note": _CONTROL.sub("", note).strip(),
+            rec = {"link_id": link_id, "snapshot_id": sid, "node_id": nid, "note": note,
                    "author": author, "created_at": self.repo._stamp()}
             self.repo.record_event(LINK_ENTITY, room_id, "architecture.link.created", rec, require_durable=True)
             rows.append(rec)
             return {"link_id": link_id, "replayed": False}
 
+    def add_room_link(self, room_id: str, body: dict, author: str, repositories) -> dict:
+        return self.record_room_link(room_id, self.prepare_room_link(body, repositories), author)
+
     def room_links(self, room_id: str, redact: bool = False) -> dict:
         out = []
-        for r in self._links.get(room_id, []):
+        with self._lock:
+            rows = list(self._links.get(room_id, []))
+        for r in rows:
             row = {"link_id": r["link_id"], "note": r["note"], "created_at": r["created_at"]}
             if not redact:
                 meta = self._meta.get(r["snapshot_id"])
@@ -525,10 +692,13 @@ class ArchitectureService:
             out.append(row)
         return {"links": out, "redacted": redact}
 
-    def node_rooms(self, sid: str, nid: str) -> dict:
-        """Which rooms discuss this entity (ids only; the notes stay behind the room's own permissions)."""
-        return {"rooms": sorted({rid for rid, rows in self._links.items() for r in rows
-                                 if r["snapshot_id"] == sid and r["node_id"] == nid})}
+    def node_rooms(self, sid: str, nid: str, reveal: bool = False) -> dict:
+        """Which rooms discuss this entity. Room ids go to operators only (an API key is never a room member);
+        everyone else learns how many rooms do. The notes stay behind each room's own permissions."""
+        with self._lock:
+            rooms = sorted({rid for rid, rows in self._links.items() for r in rows
+                            if r["snapshot_id"] == sid and r["node_id"] == nid})
+        return {"rooms": rooms if reveal else [], "count": len(rooms), "redacted": not reveal}
 
     # ----------------------------------------------------------- cross-repository
     def cross_repo(self, snapshot_ids, mappings=None):

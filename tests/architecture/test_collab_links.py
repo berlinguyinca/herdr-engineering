@@ -3,6 +3,7 @@
 import json
 import os
 import sys
+import threading
 
 import pytest
 
@@ -18,6 +19,16 @@ from tests.control_plane.test_collab_public import H, stack  # noqa: E402,F401
 from tests.control_plane.test_collab_tasks import W, code, svc  # noqa: E402,F401
 
 
+MISSION = "m-arch"
+OTHER_REPO = "github.com/example/elsewhere"
+
+
+def scope_room(svc, owner, room, crepo, mission=MISSION, repository=REPO_ID):
+    """A room annotates the repositories of its linked missions' sessions."""
+    crepo.upsert_session(f"pi:{mission}", host_id="h1", source="pi", repository_id=repository, mission_id=mission)
+    svc.link_mission(owner, room, {"mission_id": mission})
+
+
 @pytest.fixture
 def w(svc, repo):
     crepo = ControlPlaneRepo()
@@ -27,6 +38,7 @@ def w(svc, repo):
     svc.architecture = arch
     world = W(svc)
     world.arch, world.sid, world.crepo = arch, snap["snapshot"]["snapshot_id"], crepo
+    scope_room(svc, world.alice, world.room, crepo)
     return world
 
 
@@ -59,7 +71,60 @@ def test_links_are_room_scoped(w):
     link(w, w.alice)
     assert w.s.architecture_links(w.alice, w.room2)["links"] == []
     assert code(w.s.link_architecture, w.alice, w.room2, {"snapshot_id": w.sid, "node_id": "nope"}) == 404
-    assert w.arch.node_rooms(w.sid, "function:app.core.run") == {"rooms": [w.room]}
+    assert w.arch.node_rooms(w.sid, "function:app.core.run", reveal=True) == {"rooms": [w.room], "count": 1,
+                                                                             "redacted": False}
+    # anyone but an operator learns only how many rooms discuss it, never which
+    assert w.arch.node_rooms(w.sid, "function:app.core.run") == {"rooms": [], "count": 1, "redacted": True}
+
+
+def test_a_room_links_only_its_own_repositories_and_unknown_looks_the_same(w):
+    """No cross-fleet existence oracle: a real snapshot of another repository is the same 404 as a missing one."""
+    body = {"snapshot_id": w.sid, "node_id": "function:app.core.run"}
+    assert code(w.s.link_architecture, w.alice, w.room2, body) == 404          # room2 has no mission: no repository
+    missing = code(w.s.link_architecture, w.alice, w.room2, {**body, "snapshot_id": "arch_missing"})
+    assert missing == 404
+    scope_room(w.s, w.alice, w.room2, w.crepo, mission="m-other", repository=OTHER_REPO)
+    assert code(w.s.link_architecture, w.alice, w.room2, body) == 404          # its repository is a different one
+    scope_room(w.s, w.alice, w.room2, w.crepo, mission="m-same")
+    assert w.s.link_architecture(w.alice, w.room2, body)["link_id"]
+
+
+def test_artifact_reads_happen_outside_the_collaboration_lock(w):
+    """Resolving a link may read a large graph artifact; other rooms must not wait for it."""
+    w.arch._graphs.clear()                                   # force the artifact read
+    entered, release = threading.Event(), threading.Event()
+    real = w.crepo.get_artifact_data
+
+    def slow(aid):
+        entered.set()
+        assert release.wait(10)
+        return real(aid)
+    w.crepo.get_artifact_data = slow
+    out = {}
+    t = threading.Thread(target=lambda: out.setdefault("r", link(w, w.alice)))
+    t.start()
+    try:
+        assert entered.wait(10)
+        done = threading.Event()
+        threading.Thread(target=lambda: (w.s.architecture_links(w.alice, w.room2), done.set())).start()
+        assert done.wait(5), "another collaboration call blocked behind the artifact read"
+    finally:
+        release.set()
+        t.join(10)
+    assert out["r"]["link_id"]
+
+
+def test_membership_is_rechecked_after_the_unlocked_resolve(w):
+    """A member removed while the target was being resolved does not get the link recorded."""
+    real = w.arch.prepare_room_link
+
+    def revoke_then(body, repos):
+        got = real(body, repos)
+        w.s._rooms[w.room]["members"].pop(w.bob.id, None)
+        return got
+    w.arch.prepare_room_link = revoke_then
+    assert code(link, w, w.bob) == 404
+    assert w.arch.room_links(w.room)["links"] == []
 
 
 def test_validation_idempotency_and_forged_identity(w):
@@ -115,6 +180,8 @@ def test_http_routes_enforce_room_roles_end_to_end(stack, repo):
     pub = Https(stack.pub.port)
     _, room = make_room(pub)
     assert invite(pub, room, "carol", "viewer")[0] in (200, 201)
+    stack.srv.repo.upsert_session("pi:m-arch", host_id="h1", source="pi", repository_id=REPO_ID, mission_id=MISSION)
+    assert pub.call("POST", f"{BASE}/rooms/{room}/missions", {"mission_id": MISSION}, user="alice")[0] in (200, 201)
     path = f"{BASE}/rooms/{room}/architecture-links"
     body = {"snapshot_id": sid, "node_id": "function:app.core.run", "note": "hello"}
     assert pub.call("POST", path, body, user="alice", headers=H)[0] == 201

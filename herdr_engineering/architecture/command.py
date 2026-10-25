@@ -58,6 +58,15 @@ def _get(url: str, key: str | None) -> dict:
         return json.loads(resp.read())
 
 
+class ControlPlaneRefused(RuntimeError):
+    """The control plane answered with an HTTP error status."""
+
+
+# Everything a control-plane round trip can fail with: refused, unreachable, or a body that is not JSON.
+TRANSPORT_ERRORS = (ControlPlaneRefused, urllib.error.URLError, OSError, ValueError)
+MAX_BACKOFF = 300.0
+
+
 def _post(url: str, body: dict, key: str | None) -> dict:
     data = json.dumps(body).encode()
     req = urllib.request.Request(url, data=data, method="POST",
@@ -66,7 +75,18 @@ def _post(url: str, body: dict, key: str | None) -> dict:
         with urllib.request.urlopen(req, timeout=120) as resp:  # noqa: S310 - operator-supplied control plane
             return json.loads(resp.read())
     except urllib.error.HTTPError as exc:
-        raise SystemExit(f"control plane refused ({exc.code}): {exc.read()[:300].decode('utf-8', 'replace')}") from exc
+        raise ControlPlaneRefused(f"control plane refused ({exc.code}): "
+                                  f"{exc.read()[:300].decode('utf-8', 'replace')}") from exc
+
+
+def _report(url: str, body: dict, key: str | None) -> bool:
+    """Best-effort job report from the serve loop: a refused or failed post is logged, never fatal."""
+    try:
+        _post(url, body, key)
+        return True
+    except TRANSPORT_ERRORS as exc:
+        print(f"warning: could not report {body.get('event', 'result')}: {exc}", file=sys.stderr)
+        return False
 
 
 def cmd_analyze(args) -> int:
@@ -82,10 +102,7 @@ def cmd_analyze(args) -> int:
 
     def event(name, **extra):
         if base:
-            try:
-                _post(f"{base}/api/v1/architecture/analyses", {**ident, "event": name, **extra}, key)
-            except SystemExit as exc:
-                print(f"warning: could not report {name}: {exc}", file=sys.stderr)
+            _report(f"{base}/api/v1/architecture/analyses", {**ident, "event": name, **extra}, key)
 
     commit = gitsource.resolve_commit(repo, args.rev)
     event("started", commit_sha=commit)
@@ -103,7 +120,11 @@ def cmd_analyze(args) -> int:
     if args.output:
         Path(args.output).write_text(json.dumps({"snapshot": snap, "graph": result["graph"]}))
     if base:
-        out = _post(f"{base}/api/v1/architecture/snapshots", {"snapshot": snap, "graph": result["graph"]}, key)
+        try:
+            out = _post(f"{base}/api/v1/architecture/snapshots", {"snapshot": snap, "graph": result["graph"]}, key)
+        except TRANSPORT_ERRORS as exc:
+            event("failed", commit_sha=commit, message=f"publish failed: {exc}"[:400])
+            raise SystemExit(f"could not publish the snapshot: {exc}") from exc
         event("completed", commit_sha=commit, snapshot_id=snap["snapshot_id"])
         snap = out["snapshot"]
     print(json.dumps({"snapshot_id": snap["snapshot_id"], "commit_sha": snap["commit_sha"],
@@ -119,8 +140,8 @@ def _run_job(base, key, job, checkouts, host_id, timeout, cache_dir) -> None:
     ident = {"analysis_id": aid, "repository_id": rid, "host_id": host_id}
     path = checkouts.get(rid)
     if path is None:
-        _post(f"{base}/api/v1/architecture/analyses", {**ident, "event": "failed",
-              "message": "no checkout is registered on this host for that repository"}, key)
+        _report(f"{base}/api/v1/architecture/analyses", {**ident, "event": "failed",
+                "message": "no checkout is registered on this host for that repository"}, key)
         return
     cancel, done = threading.Event(), threading.Event()
 
@@ -142,13 +163,13 @@ def _run_job(base, key, job, checkouts, host_id, timeout, cache_dir) -> None:
         snap = result["snapshot"]
         _post(f"{base}/api/v1/architecture/snapshots", {"snapshot": snap, "graph": result["graph"]}, key)
         done.set()
-        _post(f"{base}/api/v1/architecture/analyses", {**ident, "event": "completed", "commit_sha": commit,
-                                                       "snapshot_id": snap["snapshot_id"]}, key)
+        _report(f"{base}/api/v1/architecture/analyses", {**ident, "event": "completed", "commit_sha": commit,
+                                                         "snapshot_id": snap["snapshot_id"]}, key)
     except runner.AnalysisCancelled:
         done.set()
-    except (runner.AnalysisError, gitsource.GitSourceError, SystemExit) as exc:
+    except (runner.AnalysisError, gitsource.GitSourceError, *TRANSPORT_ERRORS) as exc:
         done.set()
-        _post(f"{base}/api/v1/architecture/analyses", {**ident, "event": "failed", "message": str(exc)[:400]}, key)
+        _report(f"{base}/api/v1/architecture/analyses", {**ident, "event": "failed", "message": str(exc)[:400]}, key)
     finally:
         done.set()
 
@@ -162,8 +183,22 @@ def cmd_serve(args) -> int:
         if canonical_repository(rid) != rid or not Path(path).is_dir():
             raise SystemExit(f"invalid --checkout {item!r}: need a canonical repository id and an existing directory")
         checkouts[rid] = str(Path(path).resolve())
+    failures = 0
     while True:
-        got = _post(f"{base}/api/v1/architecture/analyses/claim", {"host_id": host_id}, key)
+        try:
+            got = _post(f"{base}/api/v1/architecture/analyses/claim", {"host_id": host_id}, key)
+            if not isinstance(got, dict):
+                raise ValueError("claim answer is not a JSON object")
+        except TRANSPORT_ERRORS as exc:
+            # The control plane being down, restarting or refusing must not end the host's worker: back off.
+            failures += 1
+            delay = min(MAX_BACKOFF, args.poll * (2 ** min(failures, 10)))
+            print(f"warning: claim failed ({exc}); retrying in {delay:.0f}s", file=sys.stderr)
+            if args.once:
+                return 1
+            time.sleep(delay)
+            continue
+        failures = 0
         if got.get("job"):
             _run_job(base, key, got["job"], checkouts, host_id, args.timeout, args.cache_dir)
             if args.once:

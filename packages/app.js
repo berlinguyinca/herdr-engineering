@@ -85,8 +85,11 @@ const NAV = [
 const SHELL = document.getElementById('shell');
 SHELL.setAttribute('routes', JSON.stringify(visibleNav(NAV, [])));
 // Optional tabs appear once /api/v1/health advertises their capability; a failed probe keeps them hidden.
-client.health().then((h) => SHELL.setAttribute('routes', JSON.stringify(visibleNav(NAV, h?.capabilities))))
-  .catch(() => { /* optional tabs stay hidden */ });
+// Re-set only when the list changes: every set re-renders the shell's nav.
+client.health().then((h) => {
+  const routes = JSON.stringify(visibleNav(NAV, h?.capabilities));
+  if (routes !== SHELL.getAttribute('routes')) SHELL.setAttribute('routes', routes);
+}).catch(() => { /* optional tabs stay hidden */ });
 SHELL.setAttribute('brand', 'HerdR Dev Fabric');
 
 // The nav badge follows the server inbox on every page, so a new critical item is visible from anywhere.
