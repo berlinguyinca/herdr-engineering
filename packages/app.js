@@ -4,7 +4,7 @@
 import { HerdrClient } from './herdr-web-client/client.js';
 import { connectEvents } from './herdr-web-client/events.js';
 import { createRefreshBus } from './refresh-bus.js';
-import { formatTimestamp } from './herdr-web-components/format.js';
+import { formatTimestamp, formatDuration } from './herdr-web-components/format.js';
 import { escapeHtml as esc } from './herdr-web-components/util.js';
 import { defineComponents } from './herdr-web-components/index.js';
 import { describeEvent, missionSubtitle, sessionSummary } from './herdr-web-components/humanize.js';
@@ -133,6 +133,8 @@ const ROUTES = {
   '/architecture': viewArchitecture,
   '/missions': viewMissions,
   '/missions/:id': viewMission,
+  '/missions/:id/tests': viewMissionTests,
+  '/missions/:id/reviews': viewMissionReviews,
   '/herd': viewSessions,
   '/herd/session/:id': viewSession,
   '/services': viewServices,
@@ -330,7 +332,7 @@ async function viewMission(parts, revision) {
     return { refresh() {}, dispose: combineDisposers(relatedDispose, disposeActivity) };
   }
   if (!m) { root.innerHTML = '<herdr-error message="Mission not found"></herdr-error>'; return; }
-  root.innerHTML = `<a href="#/missions">← Missions</a><h1 style="overflow-wrap:anywhere">${key.startsWith('pi:') ? 'Pi mission' : esc((m.title || 'Mission').slice(0, 180))}</h1>${key.startsWith('pi:') ? '<div id="live-mission-detail"></div>' : ''}<div id="mission-story"></div><div id="related-panel"></div><div id="mission-history"></div>`;
+  root.innerHTML = `<a href="#/missions">← Missions</a><h1 style="overflow-wrap:anywhere">${key.startsWith('pi:') ? 'Pi mission' : esc((m.title || 'Mission').slice(0, 180))}</h1>${missionSectionNav(key)}${key.startsWith('pi:') ? '<div id="live-mission-detail"></div>' : ''}<div id="mission-story"></div><div id="related-panel"></div><div id="mission-history"></div>`;
   // The story (what happened, how it ended, what needs you) sits above the recorded history; when it is unavailable the page is as before.
   const story = mountMissionStory(document.getElementById('mission-story'), client, key);
   const relatedDispose = showRelated('mission', key, null, relatedIntegrationLinks(m,'mission',key));
@@ -389,6 +391,190 @@ async function missionSessions(m) {
       <div style="margin:6px 0"><herdr-status stage="${esc(s.status)}"></herdr-status></div>
       <div class="hd-card__sub">${esc(sessionSummary(s, t))}</div>
     </div>`).join('');
+}
+
+// A delivery run's own status text. Test runs / builds report statuses like
+// passed/failed/ok/error; these are shown as text (never color alone) with a
+// semantic <herdr-status> for the recognized lifecycle values.
+function runStatusText(run) {
+  const raw = typeof run.status === 'string' ? run.status : '';
+  if (/^pass|^ok|^success|^healthy/.test(raw)) return { label: 'Passed', tone: 'healthy' };
+  if (/^fail|^error|^crash/.test(raw)) return { label: 'Failed', tone: 'failed' };
+  if (raw) return { label: raw, tone: raw.toLowerCase() };
+  return { label: 'Unknown', tone: 'unknown' };
+}
+
+function runDuration(run) {
+  if (!run.started_at) return null;
+  const start = Date.parse(run.started_at);
+  if (Number.isNaN(start)) return null;
+  // Only a run that is still in progress uses the current clock; a run without
+  // an end timestamp that is not running has no trustworthy duration. Never
+  // fabricate a duration for a completed run with a missing end.
+  const running = /^(running|in progress|in_progress|active|queued|pending)$/.test((run.status || '').toLowerCase());
+  const end = run.ended_at ? Date.parse(run.ended_at) : (running ? Date.now() : NaN);
+  if (Number.isNaN(end)) return null;
+  const ms = end - start;
+  return ms >= 0 ? formatDuration(ms) : null;
+}
+
+function missionSectionNav(key) {
+  const e = (s) => encodeURIComponent(s);
+  return `<nav class="hd-inline" aria-label="Mission sections" style="margin:14px 0;font-size:13px">`
+    + `<a href="#/missions/${e(key)}">Mission</a>`
+    + `<a href="#/missions/${e(key)}/tests">Tests & builds</a>`
+    + `<a href="#/missions/${e(key)}/reviews">Reviews & PRs</a>`
+    + `</nav>`;
+}
+
+function renderDeliveryRuns(runs) {
+  if (!runs.length) return '<herdr-empty message="No tests or builds recorded for this mission"></herdr-empty>';
+  return runs.map((run) => {
+    const st = runStatusText(run);
+    const counts = ['passed', 'failed', 'skipped', 'total']
+      .filter((c) => run[c] != null)
+      .map((c) => `${esc(c)} ${esc(String(run[c]))}`)
+      .join(' · ');
+    const duration = runDuration(run);
+    const kind = run.isBuild ? 'Build' : 'Test run';
+    return `<div class="hd-card" style="margin:8px 0">`
+      + `<div class="hd-card__title">${kind} · <herdr-status stage="${esc(st.tone)}"></herdr-status> <span class="hd-card__sub">${esc(st.label)}</span></div>`
+      + (counts ? `<div class="hd-card__sub">${counts}</div>` : `<div class="hd-card__sub">Counts unknown</div>`)
+      + `<div class="hd-card__sub">${duration ? `Duration ${esc(duration)}` : 'Duration not recorded'}${run.started_at ? ` · started ${esc(formatTimestamp(run.started_at))}` : ''}</div>`
+      + `</div>`;
+  }).join('');
+}
+
+async function viewMissionTests(parts, revision) {
+  const key = decodeURIComponent(parts[1]);
+  let mission = null;
+  try { mission = await client.getMission(key); } catch (error) { if (error.status !== 404) throw error; }
+  if (revision !== renderRevision) return;
+  if (!mission) {
+    root.innerHTML = `<a href="#/missions">← Missions</a><herdr-error message="Mission not found"></herdr-error>`;
+    return;
+  }
+  const title = (mission.title || 'Mission').slice(0, 180);
+  root.innerHTML = `<a href="#/missions">← Missions</a><h1 style="overflow-wrap:anywhere">${esc(title)} · Tests & builds</h1>${missionSectionNav(key)}<div id="mission-tests"></div>`;
+  const host = document.getElementById('mission-tests');
+  let pending = false;
+  let trailing = false;
+  const loadRuns = async (initial) => {
+    if (pending) { trailing = true; return; }
+    if (!host.isConnected || document.hidden) return;
+    pending = true;
+    try {
+      // Page-specific loading state: the section is blank until its first data
+      // arrives, so show a spinner rather than an empty flash.
+      if (initial) host.innerHTML = '<herdr-spinner label="Loading tests & builds"></herdr-spinner>';
+      let tests = [], builds = [];
+      const [t, b] = await Promise.all([client.missionTests(key), client.missionBuilds(key)]);
+      tests = (t && t.tests) || []; builds = (b && b.builds) || [];
+      if (revision !== renderRevision || !host.isConnected) return;
+      const runs = [...builds.map((r) => ({ ...r, isBuild: true })), ...tests.map((r) => ({ ...r, isBuild: false }))]
+        .sort((a, b) => (b.started_at || '').localeCompare(a.started_at || ''));
+      if (initial) host.innerHTML = renderDeliveryRuns(runs);
+      else morph(host, renderDeliveryRuns(runs));
+    } catch (error) {
+      if (!host.isConnected) return;
+      if (initial) host.innerHTML = `<herdr-error message="${esc(error.message)}"></herdr-error>`;
+    } finally {
+      pending = false;
+      if (trailing) { trailing = false; loadRuns(false); }
+    }
+  };
+  try { await loadRuns(true); } catch { /* not-found handled below */ }
+  if (revision !== renderRevision) return;
+  return { refresh: () => loadRuns(false), dispose() {} };
+}
+
+// A review's verdict text and a pull request's merge status, shown as text
+// (never color alone). UNKNOWN verdicts render 'unknown', never approved.
+function reviewVerdictText(verdict) {
+  const v = typeof verdict === 'string' ? verdict.trim().toLowerCase() : '';
+  if (!v) return { label: 'Unknown', tone: 'unknown' };
+  if (v === 'approved' || v === 'approve') return { label: 'Approved', tone: 'healthy' };
+  if (v.includes('changes') || v === 'request_changes' || v === 'rejected' || v === 'denied') return { label: 'Changes requested', tone: 'attention' };
+  if (v === 'commented' || v === 'comment') return { label: 'Commented', tone: 'waiting' };
+  return { label: verdict, tone: v };
+}
+
+function prStatusText(status) {
+  const s = typeof status === 'string' ? status.trim().toLowerCase() : '';
+  if (s === 'merged') return { label: 'Merged', tone: 'healthy' };
+  if (s === 'open' || s === 'opened') return { label: 'Open', tone: 'active' };
+  if (s === 'closed' || s === 'rejected') return { label: 'Closed', tone: 'waiting' };
+  return { label: status || 'Unknown', tone: s || 'unknown' };
+}
+
+function renderReviewsAndPulls(reviews, pulls) {
+  const sections = [];
+  sections.push(`<h2>Reviews</h2>`);
+  if (!reviews.length) sections.push('<herdr-empty message="No reviews recorded for this mission"></herdr-empty>');
+  sections.push(reviews.map((review) => {
+    const v = reviewVerdictText(review.verdict);
+    const findings = (review.findings || [])
+      .map((f) => `<li>${esc(f.severity || 'info')}: ${esc(f.summary || '')}${f.detail ? ` — ${esc(f.detail)}` : ''}</li>`)
+      .join('');
+    return `<div class="hd-card" style="margin:8px 0">`
+      + `<div class="hd-card__title"><herdr-status stage="${esc(v.tone)}"></herdr-status> <span>${esc(v.label)}</span></div>`
+      + `<div class="hd-card__sub">${review.reviewer ? `Reviewed by ${esc(review.reviewer)}` : 'Reviewer not recorded'}${review.completed_at ? ` · ${esc(formatTimestamp(review.completed_at))}` : ''}</div>`
+      + (findings ? `<ul style="margin:6px 0 0;padding-left:18px">${findings}</ul>` : '')
+      + `</div>`;
+  }).join(''));
+  sections.push(`<h2>Pull requests</h2>`);
+  if (!pulls.length) sections.push('<herdr-empty message="No pull requests recorded for this mission"></herdr-empty>');
+  sections.push(pulls.map((pr) => {
+    const st = prStatusText(pr.status);
+    const branch = pr.branch ? `${esc(pr.branch)} → ${esc(pr.base || '?')}` : '';
+    const link = typeof pr.url === 'string' && /^https?:\/\//.test(pr.url)
+      ? `<a href="${esc(pr.url)}" target="_blank" rel="noopener noreferrer">PR #${esc(String(pr.number))}</a>`
+      : `PR #${esc(String(pr.number))}`;
+    return `<div class="hd-card" style="margin:8px 0">`
+      + `<div class="hd-card__title"><herdr-status stage="${esc(st.tone)}"></herdr-status> ${link}</div>`
+      + `<div class="hd-card__sub"><span>${esc(st.label)}</span>${branch ? ` · ${branch}` : ''}${pr.repository ? ` · ${esc(pr.repository)}` : ''}</div>`
+      + `</div>`;
+  }).join(''));
+  return sections.join('');
+}
+
+async function viewMissionReviews(parts, revision) {
+  const key = decodeURIComponent(parts[1]);
+  let mission;
+  try { mission = await client.getMission(key); } catch (error) { if (error.status !== 404) throw error; }
+  if (revision !== renderRevision) return;
+  if (!mission) {
+    root.innerHTML = `<a href="#/missions">← Missions</a><herdr-error message="Mission not found"></herdr-error>`;
+    return;
+  }
+  const title = (mission.title || 'Mission').slice(0, 180);
+  root.innerHTML = `<a href="#/missions">← Missions</a><h1 style="overflow-wrap:anywhere">${esc(title)} · Reviews & PRs</h1>${missionSectionNav(key)}<div id="mission-reviews"></div>`;
+  const host = document.getElementById('mission-reviews');
+  let pending = false;
+  let trailing = false;
+  const loadReviews = async (initial) => {
+    if (pending) { trailing = true; return; }
+    if (!host.isConnected || document.hidden) return;
+    pending = true;
+    try {
+      if (initial) host.innerHTML = '<herdr-spinner label="Loading reviews & PRs"></herdr-spinner>';
+      let reviews = [], pulls = [];
+      const [rv, pr] = await Promise.all([client.missionReviews(key), client.missionPulls(key)]);
+      reviews = (rv && rv.reviews) || []; pulls = (pr && pr.pulls) || [];
+      if (revision !== renderRevision || !host.isConnected) return;
+      if (initial) host.innerHTML = renderReviewsAndPulls(reviews, pulls);
+      else morph(host, renderReviewsAndPulls(reviews, pulls));
+    } catch (error) {
+      if (!host.isConnected) return;
+      if (initial) host.innerHTML = `<herdr-error message="${esc(error.message)}"></herdr-error>`;
+    } finally {
+      pending = false;
+      if (trailing) { trailing = false; loadReviews(false); }
+    }
+  };
+  try { await loadReviews(true); } catch { /* handled inside */ }
+  if (revision !== renderRevision) return;
+  return { refresh: () => loadReviews(false), dispose() {} };
 }
 
 async function viewSessions() {

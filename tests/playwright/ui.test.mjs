@@ -1539,3 +1539,77 @@ test('large Overview attention queues keep cards close and expand within a keybo
   assert.deepEqual(await page.evaluate(()=>JSON.parse(localStorage.getItem('herdr.overview.layout.v1'))),{order:['ci'],hidden:['sessions']});
  },{BURST:'0',CI_OFFLINE:'1'});
 });
+
+// Mission delivery sections (#34, #35): the /missions/<id>/tests and
+// /missions/<id>/reviews pages render seeded builds, test runs, reviews and
+// pull requests for a herdr mission, read-only, with honest empty/error states.
+async function alphaMissionKey(page, base) {
+  await page.goto(`${base}/#/missions`);
+  // Recorded herdr missions sit in a collapsed 'recorded' group, so the row
+  // link may be hidden; read its href directly (works whether or not visible).
+  await page.waitForFunction(
+    () => [...document.querySelectorAll('a.mc-title')].some((a) => a.textContent.includes('Alpha')),
+    null, { timeout: 20000 });
+  return await page.evaluate(() => {
+    const link = [...document.querySelectorAll('a.mc-title')].find((a) => a.textContent.includes('Alpha'));
+    const hash = link.getAttribute('href'); // href is #/missions/<encoded key>
+    return decodeURIComponent(hash.replace(/^#\/missions\//, ''));
+  });
+}
+
+test('mission tests page lists builds and test runs read-only', async () => {
+  await withApp(async ({ page, base }) => {
+    const key = await alphaMissionKey(page, base);
+    await page.goto(`${base}/#/missions/${encodeURIComponent(key)}/tests`);
+    // Seeded failing test run and its '1 failed' count.
+    await page.waitForFunction(
+      () => (document.body ? document.body.innerText : '').includes('failed 1'),
+      null, { timeout: 15000 });
+    const text = await bodyText(page);
+    assert.ok(text.includes('failed 1'), 'failed run count missing');
+    assert.ok(text.includes('passed 2'), 'passed run count missing');
+    assert.ok(text.includes('Build'), 'build row missing');
+    assert.ok(text.includes('42s'), 'duration missing');
+    // A build with no recorded counts renders an explicit unknown, never 0.
+    assert.ok(text.includes('Counts unknown'), 'missing counts must show unknown');
+    assert.ok(!text.includes('Failed to fetch') && !text.includes('too many requests'),
+      'delivery page must not error');
+    // No mutation affordances on a read-only page.
+    assert.ok(!/merge|approve|create pull/i.test(text), 'read-only page must not offer mutations');
+  }, { BURST: '0' });
+});
+
+test('mission reviews page lists verdict, findings and PR merge status', async () => {
+  await withApp(async ({ page, base }) => {
+    const key = await alphaMissionKey(page, base);
+    await page.goto(`${base}/#/missions/${encodeURIComponent(key)}/reviews`);
+    // Seeded review verdict and blocking finding.
+    await page.waitForFunction(
+      () => (document.body ? document.body.innerText : '').includes('Changes requested'),
+      null, { timeout: 15000 });
+    const text = await bodyText(page);
+    assert.ok(text.includes('blocker'), 'blocking finding missing');
+    assert.ok(text.includes('Parser crashes on empty input'), 'finding summary missing');
+    assert.ok(text.includes('PR #7'), 'open PR number missing');
+    assert.ok(text.includes('Open'), 'PR status missing');
+    assert.ok(text.includes('ws/alpha → main'), 'branch → base missing');
+    assert.ok(!text.includes('Failed to fetch') && !text.includes('too many requests'),
+      'delivery page must not error');
+    // No merge/approve control: Pi Engineering stays the merge authority (#35).
+    assert.ok(!/merge|approve/i.test(text), 'reviews page must not offer merge/approve controls');
+  }, { BURST: '0' });
+});
+
+test('mission detail links to the delivery section pages', async () => {
+  await withApp(async ({ page, base }) => {
+    const key = await alphaMissionKey(page, base);
+    // The mission detail page now carries the section nav (issue #34/#35).
+    await page.goto(`${base}/#/missions/${encodeURIComponent(key)}`);
+    await page.locator('a:has-text("Tests & builds")').first().waitFor({ timeout: 15000 });
+    await page.locator('a:has-text("Reviews & PRs")').first().click();
+    await page.waitForFunction(
+      () => (document.body ? document.body.innerText : '').includes('Pull requests'),
+      null, { timeout: 15000 });
+    assert.ok((await bodyText(page)).includes('PR #7'), 'review section must render via detail nav');
+  }, { BURST: '0' });
+});

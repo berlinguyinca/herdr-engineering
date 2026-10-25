@@ -34,7 +34,7 @@ from .envelope import EnvelopeConflict
 from .events import SequenceCollision
 from .graph import read_graph
 from .ingest import INGEST_ENTITY_TYPES
-from .redact import redact_ingest_body, redact_payload
+from .redact import redact_delivery, redact_ingest_body, redact_payload
 from .review_quorum import pr_review_quorum
 
 log = logging.getLogger(__name__)
@@ -1694,7 +1694,9 @@ def _make_handler(server, public=False, operator=False):
                         items = r.list_reviews(mission_id=parts[4])
                     else:  # pulls
                         items = r.list_pull_requests(mission_id=parts[4])
-                    return self._json({sub: [redact_payload(item) for item in items]})
+                    # Delivery redaction scans string values for leaked secrets
+                    # while preserving numeric counts, urls and status text.
+                    return self._json({sub: [redact_delivery(item) for item in items]})
                 if len(parts) > 5 and parts[5] == "timeline":
                     timeline = r.mission_timeline(parts[4])
                     return self._json({"timeline": _with_collab_tasks(server, r, parts[4], timeline)})

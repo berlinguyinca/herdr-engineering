@@ -133,6 +133,73 @@ def redact_values(payload: Any) -> Any:
     return payload
 
 
+#: Delivery-record keys whose VALUES are scanned for secrets but that never
+#: themselves carry a secret, so key-name redaction must not blank them. This
+#: is delivery-specific (unlike the global ``_PLAIN_KEYS``): the count fields
+#: ``passed``/``failed``/``skipped``/``total`` and ``url`` stay intact, while
+#: any string value (including a ``passed`` value that happens to be secret
+#: text) is still scanned by ``redact_text``.
+_DELIVERY_VALUE_KEYS = frozenset({
+    "passed", "failed", "skipped", "total", "url", "status", "verdict",
+    "reviewer", "repository", "branch", "base", "number", "severity",
+    "summary", "detail", "label", "kind", "test_run_id", "review_id",
+    "pr_id", "finding_id", "mission_id", "session_id", "started_at",
+    "ended_at", "created_at", "updated_at", "completed_at",
+})
+
+
+def redact_delivery(payload: Any, *, _memo=None, _active=None) -> Any:
+    """Redact a delivery record (tests/builds/reviews/pulls) for display.
+
+    Numeric counts and structural fields survive; string values are scanned for
+    leaked secrets via ``redact_text``, so a secret in a ``passed`` value or a
+    finding ``summary`` is redacted while the count/url/status text is kept.
+    Keys whose names hint at a secret (e.g. a ``token`` or ``api_key`` field)
+    are redacted wholesale. Unlike ``redact_payload`` this never blanks the
+    ``passed`` count key merely because it contains the substring ``pass``.
+
+    A memoized result is returned for a repeated container object (cycle
+    safety), so a shared dict/list never leaks a secret on a later occurrence:
+    the sanitized copy is reused, never the original.
+    """
+    _memo = _memo if _memo is not None else {}
+    _active = _active if _active is not None else set()
+    if isinstance(payload, str):
+        # Redact every occurrence: the same string object may appear more than
+        # once, and a shared string must never bypass scanning because a sibling
+        # occurrence was already visited. Cycle safety is handled per-container.
+        return redact_text(payload)
+    if isinstance(payload, dict):
+        ident = id(payload)
+        if ident in _memo:
+            return _memo[ident]
+        if ident in _active:
+            return payload  # direct cycle; nothing to redact that isn't already
+        _active.add(ident)
+        result = {}
+        for key, value in payload.items():
+            lk = str(key).lower()
+            if any(s in lk for s in _SECRET_KEY_HINTS) and lk not in _DELIVERY_VALUE_KEYS:
+                result[key] = _REDACTED
+            else:
+                result[key] = redact_delivery(value, _memo=_memo, _active=_active)
+        _active.discard(ident)
+        _memo[ident] = result
+        return result
+    if isinstance(payload, (list, tuple)):
+        ident = id(payload)
+        if ident in _memo:
+            return _memo[ident]
+        if ident in _active:
+            return payload  # direct cycle
+        _active.add(ident)
+        result = type(payload)(redact_delivery(item, _memo=_memo, _active=_active) for item in payload)
+        _active.discard(ident)
+        _memo[ident] = result
+        return result
+    return payload
+
+
 #: Host state keys whose dict KEYS are data (package / extension / unit names),
 #: so key-name redaction would turn e.g. a pi extension ``auth-helper`` into
 #: "[REDACTED]" and report permanent version drift. Their values are still scanned.
