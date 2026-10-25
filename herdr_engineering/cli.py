@@ -2715,6 +2715,21 @@ def _cmd_cp_web(args) -> int:
                 section = _store.secure_section("control_plane")
                 return ((section.get("collab") or {}) if isinstance(section.get("collab"), dict) else {}).get("people")
             collab.people_source = _people_from_yaml
+        # `@agent /skill:x` from the room (control_plane.collab.skills.enabled), YAML only, off by default, re-read
+        # per request so switching it off takes effect at once.
+        from .control_plane.collab_skills import normalize_skills
+        raw_skills = getattr(args, "collab_skills", None)
+        if raw_skills is None and isinstance(cp.get("collab"), dict):
+            raw_skills = cp["collab"].get("skills")
+        try:
+            collab.skills_config = normalize_skills(raw_skills)
+        except ValueError as exc:
+            raise SystemExit(f"fleet config {exc}") from None
+        if fleet_store is not None:
+            def _skills_from_yaml(_store=fleet_store):
+                section = _store.secure_section("control_plane")
+                return ((section.get("collab") or {}) if isinstance(section.get("collab"), dict) else {}).get("skills")
+            collab.skills_source = _skills_from_yaml
         if rustfs is not None:
             collab.file_blobs = RoomFileObjectStore(rustfs)     # its own collab-files/ keyspace, never artifacts'
         elif getattr(args, "collab_log_file", None):
@@ -2807,6 +2822,7 @@ COLLAB_CONFIG_KEYS = {
     "insights": ("collab_insights", dict),                # T15 attention inbox, progress, analytics; YAML only, off by default
     "files": ("collab_files", dict),                      # C5 room files: {max_bytes, room_bytes}; YAML only
     "people": ("collab_people", dict),                    # C6 /assign: {handle: {github: login}}; YAML only
+    "skills": ("collab_skills", dict),                    # `@agent /skill:x` from the room: {enabled}; YAML only, off
     # {room_id, requester_agent_id}: the operator's standing summary-fix room (YAML only, no flag)
     "summary_fix": ("collab_summary_fix", dict),
 }
@@ -2843,10 +2859,11 @@ def _apply_collab_config(args, cp) -> None:
             from .control_plane.collab_commands import normalize_people
             from .control_plane.collab_context import normalize_contextual
             from .control_plane.collab_files import normalize_files
+            from .control_plane.collab_skills import normalize_skills
             from .control_plane.collab_workbench import normalize_steering
             try:
-                {"contextual": normalize_contextual, "insights": normalize_insights,
-                 "files": normalize_files, "people": normalize_people}.get(key, normalize_steering)(value)
+                {"contextual": normalize_contextual, "insights": normalize_insights, "files": normalize_files,
+                 "people": normalize_people, "skills": normalize_skills}.get(key, normalize_steering)(value)
             except ValueError as exc:
                 raise SystemExit(f"fleet config {exc}") from None
             setattr(args, dest, dict(value))

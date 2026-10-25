@@ -653,8 +653,11 @@ class CommandsMixin:
                     text = f"Handoff from @{p['from']['name']} to you{by}: {p['note']}".rstrip(": ")
                 else:
                     text = p["text"]
+                mark = (self._skill_mark(pr.id, text, (p.get("skill_calls") or {}).get(pr.id))
+                        if ev["event_type"] == "message" else None)
                 out.append({"event_id": ev["event_id"], "sequence": ev["sequence"], "room_id": p["room_id"],
                             "room_name": room["name"], "kind": ev["event_type"], "text": text,
+                            **({"skill": mark} if mark else {}),
                             "from": self._who(p["sender_kind"], p["sender_id"], p.get("sender_external")),
                             "target_address": self._address(pr.id), "target_name": a.get("name"),
                             "target_aliases": list(a.get("aliases", ())), "untrusted": True})

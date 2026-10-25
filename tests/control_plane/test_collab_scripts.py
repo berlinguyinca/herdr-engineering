@@ -167,3 +167,110 @@ def test_a_mention_wakes_the_worker_which_hands_the_text_to_its_harness_once(sta
     finally:
         proc.terminate()
         proc.wait(5)
+
+
+def _spawn_runner():
+    import importlib.util  # noqa: PLC0415
+    spec = importlib.util.spec_from_file_location("collab_spawn_for_skills", ROOT / "deploy/control-plane/collab-spawn.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_a_skill_the_server_marked_reaches_pi_unprefixed_and_everything_else_keeps_the_prefix(stack, shim, tmp_path):
+    """`@agent /skill:x args` from the room: the server marks it, the worker feeds pi `/skill:x args` as ONE argument
+    after `--` (no 'Task from a room member:' prefix); unmarked work keeps the prefix. Real worker.sh, fake pi."""
+    runner = _spawn_runner()
+    api = main_api(stack)
+    s, p = api.call("POST", f"{BASE}/projects", {"name": "p"}, user="alice")
+    s, r = api.call("POST", f"{BASE}/projects/{p['project_id']}/rooms", {"name": "r"}, user="alice")
+    room = r["room_id"]
+    s, tok = api.call("POST", f"{BASE}/agents/join-tokens", {
+        "harness_type": "pi", "name_prefix": "sk", "count": 1, "room_id": room,
+        "actions": ["read", "post", "execute"]}, user="alice")
+    assert s == 201, tok
+    a = stack.svc.redeem_join_token({"token": tok["token"], "skills": ["skill:review"]})
+    s, reqs = api.call("GET", f"{BASE}/rooms/{room}/agent-requests", user="alice")
+    api.call("POST", f"{BASE}/rooms/{room}/agent-requests/approve-all",
+             {"request_ids": [x["request_id"] for x in reqs["requests"]]}, user="alice")
+    stack.svc.skills_config = {"enabled": True}
+    agents = tmp_path / "agents"
+    agents.mkdir()
+    agent_file = agents / f"{a['name']}.json"
+    agent_file.write_text(json.dumps({k: a[k] for k in ("agent_id", "name", "credential", "device_id", "expires_at")}))
+    base = f"http://127.0.0.1:{stack.srv.public_port}"
+    (agents / "worker.sh").write_text(generate("workerScript", base))
+    log = tmp_path / "pi-argv.jsonl"
+    bindir = tmp_path / "fakebin"
+    bindir.mkdir()
+    (bindir / "pi").write_text(f"#!/usr/bin/env python3\nimport json, sys\nopen({str(log)!r}, 'a').write(json.dumps(sys.argv[1:]) + '\\n')\nprint('ok')\n")
+    (bindir / "pi").chmod(0o755)
+    env = {**shim, "PATH": f"{bindir}:{shim['PATH']}", "HERDR_AGENT_CMD": runner.FAMILY_CMD_TOOLS["pi"],
+           "HERDR_SKILL_CMD": runner.FAMILY_SKILL_CMD_TOOLS["pi"]}
+    name = a["name"]
+
+    def run(texts, worker_env):
+        ids = [api.call("POST", f"{BASE}/rooms/{room}/tasks", {"target_agent_id": a["agent_id"], "text": t},
+                        user="alice")[1]["task_id"] for t in texts]
+        log.unlink(missing_ok=True)
+        proc = subprocess.Popen(["bash", str(agents / "worker.sh"), str(agent_file)], env=worker_env,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, text=True)
+        try:
+            for _ in range(80):
+                s, tasks = api.call("GET", f"{BASE}/rooms/{room}/tasks", user="alice")
+                if all(x["status"] == "done" for x in tasks["tasks"] if x["task_id"] in ids):
+                    break
+                time.sleep(0.5)
+        finally:
+            proc.terminate()
+            proc.wait(5)
+        return [json.loads(line) for line in log.read_text().splitlines()]
+
+    texts = [f"@{name} /skill:review @src/app.js -rf",          # marked: args with @ and - stay inside ONE argument
+             f"@{name}  /skill:review\n  second line ",          # marked: normalised to one space after the name
+             f"@{name} /skill:deploy now",                       # not reported: prefixed
+             "please /skill:review x",                           # not at the start: prefixed
+             "@src/app.js -rf"]                                  # plain work: prefixed (never a file or a flag)
+    got = run(texts, env)
+    assert got == [["-p", "--no-session", "--", "/skill:review @src/app.js -rf"],
+                   ["-p", "--no-session", "--", "/skill:review second line"],
+                   ["-p", "--no-session", "--", "Task from a room member: /skill:deploy now"],
+                   ["-p", "--no-session", "--", "Task from a room member: please /skill:review x"],
+                   ["-p", "--no-session", "--", "Task from a room member: @src/app.js -rf"]]
+    # the switch off: the same text is not marked, the worker keeps the prefix (it never reads the text as a skill)
+    stack.svc.skills_config = {"enabled": False}
+    assert run([f"@{name} /skill:review y"], env) == [["-p", "--no-session", "--", "Task from a room member: /skill:review y"]]
+    # a worker with no skill command (Claude Code, a custom command) runs a marked task with its usual command
+    stack.svc.skills_config = {"enabled": True}
+    plain = {k: v for k, v in env.items() if k != "HERDR_SKILL_CMD"}
+    assert run([f"@{name} /skill:review z"], plain) == [["-p", "--no-session", "--", "Task from a room member: /skill:review z"]]
+    # a mention that wakes the agent takes the same path: marked -> unprefixed, unmarked -> prefixed
+    log.unlink(missing_ok=True)
+    proc = subprocess.Popen(["bash", str(agents / "worker.sh"), str(agent_file)], env=env,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, text=True)
+    try:
+        time.sleep(2)                                                   # the worker takes its mention cursor
+        for i, text in enumerate((f"@{name} /skill:review m -x", f"@{name} hello @src/a")):
+            assert api.call("POST", f"{BASE}/rooms/{room}/messages", {"text": text, "idempotency_key": f"skm{i}"},
+                            user="alice")[0] == 201
+        for _ in range(60):
+            if log.exists() and len(log.read_text().splitlines()) >= 2:
+                break
+            time.sleep(0.5)
+        assert [json.loads(x) for x in log.read_text().splitlines()] == [
+            ["-p", "--no-session", "--", "/skill:review m -x"],
+            ["-p", "--no-session", "--", "Task from a room member: hello @src/a"]]
+    finally:
+        proc.terminate()
+        proc.wait(5)
+
+
+def test_join_and_the_host_runner_give_pi_the_same_skill_commands():
+    runner = _spawn_runner()
+    join = (ROOT / "packages/collab-scripts/join.sh").read_text()
+    for tools, skill in ((runner.FAMILY_CMD_TOOLS, runner.FAMILY_SKILL_CMD_TOOLS),
+                         (runner.FAMILY_CMD_TEXT_ONLY, runner.FAMILY_SKILL_CMD_TEXT_ONLY)):
+        assert skill["pi"] == tools["pi"].replace("Task from a room member: ", "")
+        assert skill["pi"].endswith(' -- "$(cat)"')
+        assert f"SKILL_CMD='{skill['pi']}'" in join
+        assert set(skill) == {"pi"}                                   # Claude Code and codex never get one

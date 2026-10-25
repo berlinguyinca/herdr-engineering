@@ -729,7 +729,9 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
         return row;
       }
       row.className = 'cx-event';
-      row.textContent = e.event_type === 'agent_renamed' ? `@${e.old_name} is now @${e.name}` : e.event_type.replaceAll('_', ' ');
+      row.textContent = e.event_type === 'agent_renamed' ? `@${e.old_name} is now @${e.name}`
+        : e.event_type === 'skill_invoked' && e.skill ? `${senderName(e.skill.by)} ran /skill:${e.skill.name} on @${tname(e.skill.agent_id)}`
+          : e.event_type.replaceAll('_', ' ');
       return row;
     }
     const addEvents = (events) => {

@@ -100,19 +100,21 @@ main() {
   [ "${#NAMES[@]}" -gt 0 ] || return 1
 
   if [ "$START" = 1 ]; then
-    CMD="$CMD_OVERRIDE"
+    CMD="$CMD_OVERRIDE"; SKILL_CMD=""
     if [ -z "$CMD" ]; then
       if [ "$TOOLS" = 1 ]; then
         case "$FAMILY" in
           claude-code) CMD='claude -p' ;;
           codex) CMD='codex exec --skip-git-repo-check -' ;;
-          pi) CMD='pi -p --no-session -- "Task from a room member: $(cat)"' ;;
+          pi) CMD='pi -p --no-session -- "Task from a room member: $(cat)"'
+              SKILL_CMD='pi -p --no-session -- "$(cat)"' ;;   # only for tasks the server marked as a skill call
           *) CMD='' ;;
         esac
       else
         case "$FAMILY" in
           claude-code) CMD="claude -p --tools '' --strict-mcp-config --mcp-config '{\"mcpServers\":{}}' --disable-slash-commands" ;;
-          pi) CMD='pi -p --no-session --no-tools -- "Task from a room member: $(cat)"' ;;
+          pi) CMD='pi -p --no-session --no-tools -- "Task from a room member: $(cat)"'
+              SKILL_CMD='pi -p --no-session --no-tools -- "$(cat)"' ;;
           codex) echo "join.sh: codex cannot be limited to text answers; add --tools to start codex agents (they can then run commands, inside the sandbox when available)." >&2; return 1 ;;
           *) CMD='' ;;
         esac
@@ -131,6 +133,7 @@ except Exception: print("")' </dev/null)
       name="${NAMES[$idx]}"; prefix="${PREFIXES[$idx]}"; parent="${PARENTS[$idx]}"; aid="${IDS[$idx]}"
       f="$DIR/$name.json"; envs=()
       [ -z "$CMD" ] || envs+=("HERDR_AGENT_CMD=$CMD")
+      [ -z "$SKILL_CMD" ] || envs+=("HERDR_SKILL_CMD=$SKILL_CMD")
       if [ "$BOX" = 1 ]; then envs+=("HERDR_SANDBOX=$DIR/collab-sandbox.sh" "HERDR_AUDIT=$DIR/audit/$name.log"); fi
       if [ "$USE_HERDR" = 1 ] && command -v herdr >/dev/null 2>&1 && [ -n "$prefix" ]; then
         # workspace herd-PREFIX; a tab per agent named after it; a helper splits its parent's tab

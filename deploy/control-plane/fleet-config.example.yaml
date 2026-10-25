@@ -63,6 +63,10 @@ sections:
         # files:
         #   max_bytes: 26214400            # 25 MiB per file
         #   room_bytes: 524288000          # 500 MiB per room; deleting a file frees its versions' bytes
+        # `@gert.pi /skill:review args` from the room runs that pi skill (the server checks sender, reported
+        # skill and harness; off by default, re-read per request):
+        # skills:
+        #   enabled: true
       # Variables docker compose itself substitutes; deploy.sh renders exactly this
       # mapping into a transient 0600 env file. The first eight keys are required.
       compose:

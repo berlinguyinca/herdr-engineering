@@ -39,6 +39,7 @@ from .collab_attention import AttentionMixin
 from .collab_commands import COMMAND_EVENTS, WRITE_STATE_EVENTS, CommandsMixin, parse_command
 from .collab_context import ContextMixin
 from .collab_files import FilesMixin
+from .collab_skills import SkillsMixin
 from .collab_workbench import WorkbenchMixin
 from .redact import redact_text
 
@@ -92,7 +93,7 @@ INVITE_TTL = 7 * 24 * 3600.0
 MAX_OPEN_INVITES = 50
 _FEED_TYPES = frozenset({"message", "member_added", "member_removed",
                          "agent_granted", "agent_revoked", "agent_grant_revoked", "agent_renamed",
-                         "task_created", "task_updated",
+                         "task_created", "task_updated", "skill_invoked",
                          "helper_requested", "helper_claimed", "helper_started", "helper_finished",
                          "helper_cancelled", "helper_expired"}) | COMMAND_EVENTS
 # Room <-> Herdr workspace links. A link is what room members may SEE of a workspace; the
@@ -311,7 +312,7 @@ class FileEventLog:
     record = record_required
 
 
-class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FilesMixin, CommandsMixin):
+class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FilesMixin, CommandsMixin, SkillsMixin):
     def __init__(self, authenticator: UserAuthenticator, *, sink: Any = None,
                  now=None, enrollment_ttl: float = 600.0, credential_ttl: float = 12 * 3600.0,
                  stream_poll_seconds: float = 1.0, message_limit: int = 60,
@@ -436,6 +437,7 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FilesMixin, Co
         self._init_attention()
         self._init_files()
         self._init_commands()
+        self._init_skills()
 
     # ------------------------------------------------------------ plumbing
     @property
@@ -683,6 +685,8 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FilesMixin, Co
                 "status": "pending", "result": None, "depth": p["depth"], "parent": p.get("parent_task_id"),
                 "created_at": p["created_at"], "created_epoch": p["created_epoch"],
                 "updated_at": p["created_at"], "seq": seq}
+            if p.get("skill"):           # the server's decision that this task invokes a pi skill
+                self._tasks[p["task_id"]]["skill"] = p["skill"]
             if p.get("bounds"):          # T11: a bounded delegation is this same task plus its bounds
                 self._tasks[p["task_id"]].update(bounds=p["bounds"], version=1, steps=0, tokens=0, proposals=0)
                 if p.get("idempotency_key"):
@@ -4055,14 +4059,18 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FilesMixin, Co
             self._throttle("task:" + pr.key, TASK_RATE, 600.0, "task")
             self._throttle("task-owner:" + pr.owner, TASK_RATE * 2, 600.0, "task")
             task_id = ids.new_id("grant")
+            call = self._skill_call(tid_, text)      # the sender's authority was checked above
             ev = self._commit("task_created", self._actor(
                 pr, project_id=room["project_id"], room_id=room_id, task_id=task_id,
                 target_agent_id=tid_, text=text, depth=depth, parent_task_id=parent,
+                **({"skill": call[0]} if call else {}),
                 created_by_kind=pr.kind, created_by_id=pr.id, created_epoch=now, root_user_id=root,
                 visibility_scope="room", action="task.create", outcome="allowed",
                 project_ids=[room["project_id"]], resource_id=task_id))
             if ikey is not None:
                 self._idem[(pr.key, room_id, "task:" + ikey)] = (_digest(json.dumps([room_id, tid_, text])), task_id)
+            if call:
+                self._skill_audit(pr, room, room_id, tid_, call, task_id=task_id)
         return {"task_id": task_id, "status": "pending", "event": self._view(ev)}
 
     def _grant_expiry(self, body: dict) -> float:
@@ -4196,7 +4204,10 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FilesMixin, Co
                 if (not eff or "execute" not in eff[0] or t["seq"] < eff[1]
                         or not self._creator_valid(t, room)):
                     continue
-                out.append(dict(self._task_json(tid, t), room_name=room["name"]))
+                row = dict(self._task_json(tid, t), room_name=room["name"])
+                if (mark := self._skill_mark(pr.id, t["text"], t.get("skill"))):
+                    row["skill"] = mark                 # the worker feeds pi `/skill:<name> <args>` unprefixed
+                out.append(row)
                 if len(out) >= limit:
                     break
         return {"tasks": out}
@@ -4971,15 +4982,20 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FilesMixin, Co
                 return 201, {"event": self._view(ev, viewer=pr, _ctx_cache={"github_refs": catalog})}
             found = self._resolve_mentions(room_id, stored)
             wakes = self._wake_targets(pr, room, room_id, found)      # C7: which agents' harnesses this may run
+            # an agent this post may wake, addressed first and naming a skill it reported: run that skill
+            calls = {aid: c for aid in wakes if (c := self._skill_call(aid, stored))}
             ev = self._commit("message", self._actor(
                 pr, project_id=room["project_id"], room_id=room_id, sender_key=pr.key,
                 sender_kind=pr.kind, sender_id=pr.id, sender_external=pr.external, idempotency_key=key, fingerprint=fp,
                 text=stored, mentions=found, in_reply_to=reply, trust="untrusted",
                 **({"wakes": wakes} if wakes else {}),
+                **({"skill_calls": {aid: c[0] for aid, c in calls.items()}} if calls else {}),
                 **({"refs": refs} if (refs := self._resolve_refs(stored, not self._restricted(pr, room_id), catalog)) else {}),
                 **({"context": ctx} if ctx else {}), **({"files": files} if files else {}),
                 visibility_scope="room", action="message.post", outcome="allowed",
                 project_ids=[room["project_id"]], resource_id=room_id))
+            for aid, c in calls.items():
+                self._skill_audit(pr, room, room_id, aid, c, event_id=ev["event_id"])
         self.stats["messages"] += 1
         with self._lock:                     # the same catalog: no second lookup under the room lock
             return 201, {"event": self._view(ev, viewer=pr, _ctx_cache={"github_refs": catalog})}
@@ -5024,6 +5040,10 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FilesMixin, Co
                        agent_id=p.get("agent_id"))
             if t == "agent_renamed":
                 out.update(name=p.get("name"), old_name=p.get("old_name"), source=p.get("source"))
+            elif t == "skill_invoked":             # who ran which skill on which agent; a short preview only
+                out.update(skill={"name": p.get("skill"), "agent_id": p.get("agent_id"), "preview": p.get("preview"),
+                                  "by": {"type": p.get("by_kind"), "id": p.get("by_id")},
+                                  **({"task_id": p["task_id"]} if p.get("task_id") else {})})
             elif t.startswith("helper_"):             # ids, role and model: never the task text or result
                 out.update(helper={"helper_id": p.get("helper_id"), "role": p.get("role"), "model": p.get("model"),
                                    "status": p.get("status")})
