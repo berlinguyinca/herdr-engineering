@@ -42,3 +42,7 @@ venv/
 .coverage
 htmlcov/
 .omx/
+
+# T16 acceptance: local overrides and generated run state never enter git
+tests/e2e/acceptance.local.yaml
+tests/e2e/.run/

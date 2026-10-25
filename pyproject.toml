@@ -37,7 +37,10 @@ testpaths = ["tests"]
 # Import test modules by file path (not basename) so nested packages like
 # tests/control_plane/ can share a basename with top-level tests (e.g.
 # test_artifacts.py) without an ``import file mismatch`` collection error.
-addopts = "--import-mode=importlib"
+#
+# The T16 end-to-end acceptance suite (tests/e2e, marker ``e2e``) spawns real servers and needs sibling checkouts, so a
+# plain ``pytest`` / scripts/validate.sh deselects it. Opt in with ``-m e2e`` (scripts/run_acceptance.py does).
+addopts = "--import-mode=importlib -m 'not e2e'"
 
 [tool.setuptools.package-data]
 herdr_engineering = ["*.mjs"]

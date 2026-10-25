@@ -5,6 +5,16 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### T16 end-to-end acceptance harness
+- New `tests/e2e` suite (scenarios S1-S7) driven by `scripts/run_acceptance.py` against real servers, a real Postgres and a fake `gh`.
+  It is opt-in: plain `pytest` and `scripts/validate.sh` deselect everything marked `e2e`; the runner passes `-m e2e`.
+  Local overrides (autospec binary, Pi checkout, Postgres bin dir) go in the git-ignored `tests/e2e/acceptance.local.yaml`; no environment variables.
+- The runner's verdict guards reject non-strict or bare `xfail`, and report "nothing selected on the herdr side" (pytest exit 5)
+  instead of a failure when `--only` picks Pi-only scenarios.
+- Redaction: `author`, `authors`, `author_login` and `author_name` keys are no longer redacted by name (review quorum compares the
+  author login, and a redacted value let an author approve their own PR). The `sk-` pattern now also matches after an ANSI colour
+  code or `%3D` and keeps ids such as `task-sk-ab` intact.
+
 ### Attention inbox, evidence-based progress and optimization analytics (T15, stacked on #174, #173, #168, #169)
 - New read routes `GET /rooms/{id}/attention|progress|analytics` and `POST /rooms/{id}/attention/ack|snooze|restore`, plus Attention and Progress
   tabs. Everything is derived from what the reader can see in the room graph, review quorum (T06), steering/promotion (T12/T13), proposals (T11),
