@@ -72,11 +72,16 @@ export function mountComposer(host, options = {}) {
   };
   const close = () => { items = []; popup.hidden = true; input.setAttribute('aria-expanded', 'false'); input.removeAttribute('aria-activedescendant'); };
   const drawSuggestions = () => {
-    popup.innerHTML = items.map((item, i) => {
-      const heading = item.section && item.section !== items[i - 1]?.section ? `<li role="presentation" class="conversation-suggestions-section">${esc(item.section)}</li>` : '';
+    const option = (item, i) => {
       const icon = item.icon ? `<span class="conversation-suggestion-icon" data-icon="${esc(item.icon)}" aria-hidden="true">${ICONS[item.icon] || ''}</span>` : '';
-      return `${heading}<li role="option" id="${id}-option-${i}" data-index="${i}" aria-selected="${i === selection}"${item.section ? ` data-section="${esc(item.section)}"` : ''}>${icon}<b>${esc(item.label)}</b>${item.detail ? `<span>${esc(item.detail)}</span>` : ''}</li>`;
-    }).join('');
+      return `<li role="option" id="${id}-option-${i}" data-index="${i}" aria-selected="${i === selection}"${item.section ? ` data-section="${esc(item.section)}"` : ''}>${icon}<b>${esc(item.label)}</b>${item.detail ? `<span>${esc(item.detail)}</span>` : ''}</li>`;
+    };
+    // sectioned items (People / Agents / Files …) are listbox groups, each named by its heading
+    const runs = [];
+    items.forEach((item, i) => { if (!runs.length || runs.at(-1).section !== item.section) runs.push({ section: item.section, rows: [] }); runs.at(-1).rows.push(option(item, i)); });
+    popup.innerHTML = runs.map((run) => (run.section
+      ? `<li role="group" class="conversation-suggestions-group" aria-label="${esc(run.section)}"><span class="conversation-suggestions-section" aria-hidden="true">${esc(run.section)}</span><ul role="none">${run.rows.join('')}</ul></li>`
+      : run.rows.join(''))).join('');
     popup.hidden = false; input.setAttribute('aria-expanded', 'true'); input.setAttribute('aria-activedescendant', `${id}-option-${selection}`);
     popup.querySelector(`#${id}-option-${selection}`)?.scrollIntoView({ block: 'nearest' });
   };

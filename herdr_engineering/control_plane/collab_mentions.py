@@ -11,6 +11,8 @@ from collections.abc import Iterator
 
 GROUPS = ("all", "agents", "here")
 MAX_MENTIONS = 32
+HANDLE_MAX = 27        # a person handle, collision suffix included
+SLOT_MAX = 20          # the harness part of an address, slot suffix included: 27 + "." + 20 = 48
 ADDRESS = re.compile(r"[a-z0-9._-]{1,48}\Z")
 # "@" at the start, after whitespace or an opening bracket; never inside a word (mail addresses,
 # paths) and never a prefix of a longer name.
@@ -48,15 +50,18 @@ def handle_base(email: str) -> str:
     """A person's handle from their verified email: the local part, `[a-z0-9-]` only. A `.` becomes
     `-` so a person's handle can never be read as `<owner>.<harness>`."""
     local = str(email or "").split("@", 1)[0].lower()
-    base = re.sub(r"[^a-z0-9]+", "-", local).strip("-")[:40].strip("-")
+    base = re.sub(r"[^a-z0-9]+", "-", local).strip("-")[:HANDLE_MAX].strip("-")
     return base or "user"
 
 
-def first_free(base: str, taken) -> str:
-    """`base`, else `base-2`, `base-3`, ... whichever is not in `taken`."""
-    if base not in taken:
-        return base
+def first_free(base: str, taken, limit: int | None = None) -> str:
+    """`base`, else `base-2`, `base-3`, ... whichever is not in `taken`; never longer than `limit` (the base
+    is shortened to make room for the suffix)."""
+    def fit(stem: str, suffix: str) -> str:
+        return (stem[:limit - len(suffix)].rstrip("-") if limit else stem) + suffix
+    if fit(base, "") not in taken:
+        return fit(base, "")
     n = 2
-    while f"{base}-{n}" in taken:
+    while fit(base, f"-{n}") in taken:
         n += 1
-    return f"{base}-{n}"
+    return fit(base, f"-{n}")

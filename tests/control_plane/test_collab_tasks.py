@@ -234,7 +234,7 @@ def test_task_text_is_cleaned_bounded_and_fields_are_strict(w):
     _, a = w.agent("alice")
     t = w.s.create_task(w.bob, w.room, {"target_agent_id": a["agent_id"], "text": "hi\x1b[31m\x00 there"})
     assert "\x1b" not in json.dumps(t) and "\x00" not in json.dumps(t)
-    for bad in ({"text": "x" * 4001}, {"text": ""}, {"text": "   "}, {"text": 5}, {"text": "ok", "created_by": "alice"},
+    for bad in ({"text": "x" * 8001}, {"text": ""}, {"text": "   "}, {"text": 5}, {"text": "ok", "created_by": "alice"},
                 {"text": "ok", "status": "done"}, {"text": "ok", "depth": 0}):
         assert code(w.s.create_task, w.bob, w.room, {"target_agent_id": a["agent_id"], **bad}) == 400
 

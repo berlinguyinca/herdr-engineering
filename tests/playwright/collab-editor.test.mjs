@@ -95,6 +95,9 @@ test('the @ menu opens, moves with arrows, selects with Enter, closes with Esc a
   const options = menu.getByRole('option');
   assert.deepEqual(await options.locator('b').allTextContents(), ['@gert', '@gert.claude', '@gert.pi']);
   assert.deepEqual(await menu.locator('.conversation-suggestions-section').allTextContents(), ['People', 'Agents']);
+  assert.deepEqual(await menu.getByRole('group', { name: 'People' }).getByRole('option').locator('b').allTextContents(), ['@gert']);
+  assert.equal(await menu.getByRole('group', { name: 'Agents' }).getByRole('option').count(), 2);
+  assert.equal(await input.getAttribute('maxlength'), '8000');
   await input.press('ArrowDown'); await input.press('ArrowDown');
   assert.equal(await options.nth(2).getAttribute('aria-selected'), 'true');
   await input.press('Enter');

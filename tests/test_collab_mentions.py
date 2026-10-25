@@ -233,3 +233,26 @@ def test_a_task_names_its_targets_address_and_aliases_without_touching_the_text(
     w.s.create_task(w.bob, w.room, {"target_agent_id": pid, "text": "@lead /skill:x go"})
     t = w.s.task_inbox(pi)["tasks"][0]
     assert (t["target_address"], t["target_name"], t["target_aliases"], t["text"]) == ("alice.pi", "boss", ["lead"], "@lead /skill:x go")
+
+
+def test_task_and_message_text_share_one_cap_so_an_address_never_eats_into_it(w):
+    from herdr_engineering.control_plane import collab
+    assert collab.MAX_TASK_TEXT == collab.MAX_TEXT == 8000                   # the composer's textarea limit too
+    _, pid = agent(w, "alice", "pi")
+    w.s.create_task(w.bob, w.room, {"target_agent_id": pid, "text": "@alice.pi " + "x" * (8000 - 10)})
+    assert code(w.s.create_task, w.bob, w.room, {"target_agent_id": pid, "text": "x" * 8001}) == 400
+
+
+def test_an_address_is_never_longer_than_48_characters(w):
+    from herdr_engineering.control_plane import collab_mentions as cm
+    link(w.s, "zed", "a" * 60 + "@x.org")
+    link(w.s, "yan", "a" * 60 + "@y.org")                                    # same base: gets a numbered handle
+    assert len(w.s._user_handle["zed"]) <= 27 and len(w.s._user_handle["yan"]) <= 27
+    assert w.s._user_handle["zed"] != w.s._user_handle["yan"]
+    key = cm.harness_key("an-extremely-long-harness-family-name")
+    assert len(cm.first_free(key, {key, *(f"{key}-{n}" for n in range(2, 999))}, cm.SLOT_MAX)) <= cm.SLOT_MAX
+    for _ in range(3):
+        _, aid = agent(w, "alice", "an-extremely-long-harness-family-name")
+    assert all(len(a["address"]) <= 48 for a in w.s.list_room_agents(w.alice, w.room)["agents"])
+    long = cm.HANDLE_MAX * "b" + "." + cm.SLOT_MAX * "c"
+    assert len(long) == 48 and cm.ADDRESS.match(long)

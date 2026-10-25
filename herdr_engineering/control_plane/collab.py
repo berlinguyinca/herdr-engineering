@@ -95,7 +95,7 @@ MAX_LINKS_PER_ROOM = 50
 MAX_MISSIONS_PER_ROOM = 100
 MAX_TERMINAL_PRINCIPALS = 20
 TERMINAL_ROLES = frozenset({"owner", "contributor"})            # viewers and guests never get a terminal
-MAX_TASK_TEXT = 4000
+MAX_TASK_TEXT = MAX_TEXT         # one cap for messages and tasks: the composer's 8000; an address never eats into it
 TASK_TTL = 24 * 3600.0           # a task nobody finished in a day is expired
 MAX_TASK_DEPTH = 3               # human -> agent -> agent -> agent
 TASK_RATE = 20                   # new tasks per creator per 10 minutes
@@ -593,7 +593,7 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin):
             used = {self._agents[a].get("slot") for a in self._agents_by_owner.get(p["owner_user_id"], ())
                     if self._agents[a]["status"] == "active"}
             self._agents[p["agent_id"]] = {
-                "slot": mentions.first_free(hk, used), "aliases": [], "skills": list(p.get("skills") or []),
+                "slot": mentions.first_free(hk, used, mentions.SLOT_MAX), "aliases": [], "skills": list(p.get("skills") or []),
                 "owner": p["owner_user_id"], "device_id": p["device_id"], "harness_type": p["harness_type"],
                 "instance_id": p.get("instance_id"), "status": "active",
                 "name": p.get("name") or _default_handle(p["harness_type"], p["agent_id"]),
@@ -864,7 +864,8 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin):
             self._user_email[p["user_id"]] = p["email"]
             self._email_user[p["email"]] = p["user_id"]
             if p["user_id"] not in self._user_handle:          # frozen: a later email never moves a handle
-                h = mentions.first_free(mentions.handle_base(p["email"]), {*self._handle_user, *mentions.GROUPS})
+                h = mentions.first_free(mentions.handle_base(p["email"]), {*self._handle_user, *mentions.GROUPS},
+                                        mentions.HANDLE_MAX)
                 self._user_handle[p["user_id"]] = h
                 self._handle_user[h] = p["user_id"]
         elif t == "invite_created":
