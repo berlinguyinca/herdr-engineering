@@ -19,6 +19,7 @@ import {
 import { ensureConversationStyles, mountComposer } from './conversation-composer.js';
 import { providers, ROOM_COMMANDS, unresolvedMentions, ambiguousMentions, mentionChips, resolveToken } from './collab-mention.js';
 import { renderMarkdown } from './conversation-markdown.js';
+import { mountFilesShelf, fileSize } from './collab-files-view.js';
 import {
   AuthError, CollabApi, TokenStore, authorizeUrl, exchangeCode, parseRedirect, pkcePair, randomString,
 } from './herdr-web-client/collab.js';
@@ -588,8 +589,8 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
     const guest = info.role === 'guest';
     let names = new Map((info.members || []).map((m) => [m.user_id, m.email || shortId(m.user_id)]));
     const agentName = new Map();           // agent id -> handle, for rendering task events
-    const S = { agents: [], people: [], tasks: [], flow: null, requests: null, mine: [], links: null, missions: null, tabs: null, tabsAt: 0, tabSel: null, externals: null, deleg: null, props: null, propSel: null, propOne: null, profile: null, allow: [], egress: [], helpers: [], paused: false, entries: null };
-    const tabs = [['chat', 'Chat'], ...(guest ? [] : [['flow', 'Flow']]), ['tasks', 'Tasks'], ...(guest ? [] : [['agents', 'Agents'], ['tabs', 'Tabs'], ['lineage', 'Lineage'], ['attention', 'Attention'], ['progress', 'Progress'], ['links', 'Workspaces']]), ...(canInvite ? [['proposals', 'Proposals'], ['people', 'People']] : [])];
+    const S = { agents: [], people: [], tasks: [], flow: null, requests: null, mine: [], links: null, missions: null, tabs: null, tabsAt: 0, tabSel: null, externals: null, deleg: null, props: null, propSel: null, propOne: null, profile: null, allow: [], egress: [], helpers: [], paused: false, entries: null, files: [] };
+    const tabs = [['chat', 'Chat'], ...(guest ? [] : [['flow', 'Flow']]), ['tasks', 'Tasks'], ...(guest ? [] : [['files', 'Files'], ['agents', 'Agents'], ['tabs', 'Tabs'], ['lineage', 'Lineage'], ['attention', 'Attention'], ['progress', 'Progress'], ['links', 'Workspaces']]), ...(canInvite ? [['proposals', 'Proposals'], ['people', 'People']] : [])];
     let sub = subTab.get(roomId);
     if (!tabs.some(([k]) => k === sub)) sub = 'chat';
 
@@ -605,6 +606,7 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
       <section class="cx-panel cx-cols" id="hcn-p-tasks" hidden>
         ${canPost ? '<div class="hd-card cx-stack"><div class="hd-card__title">Give a task</div><form id="hcn-task" class="cx-stack"><label class="cx-field">To<select name="target" id="hcn-task-target"></select></label><label class="cx-field">What should it do?<textarea class="cx-input" name="text" required maxlength="4000" rows="4"></textarea></label><button class="hd-btn" type="submit">Send task</button><span id="hcn-task-msg" class="cx-msg" role="alert"></span></form></div>' : ''}
         <div class="hd-card cx-stack"><div class="hd-card__title">Tasks</div><div id="hcn-tasks"></div></div></section>
+      ${guest ? '' : '<section class="hd-card cx-stack cx-panel" id="hcn-p-files" hidden aria-label="Room files"><div class="hd-card__title">Files</div><div id="hcn-files"></div></section>'}
       ${guest ? '' : `<section class="cx-panel cx-cols" id="hcn-p-agents" hidden>
         <div class="hd-card cx-stack"><div class="hd-card__title">Agents in this room</div><div id="hcn-roomagents"></div></div>
         ${canInvite ? '<div class="hd-card cx-stack"><div class="hd-card__title">Agent requests</div><div id="hcn-requests"></div></div>' : ''}
@@ -672,6 +674,25 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
     const log = $('hcn-log');
     let alive = true;
     let composer = null;
+    // Room files: saved, never opened in the page (the server sends them as attachments).
+    const saveFile = async (row, version) => {
+      try {
+        const blob = await api.downloadFile(roomId, row.id, version);
+        const url = URL.createObjectURL(blob), a = document.createElement('a');
+        a.href = url; a.download = row.name || 'file'; document.body.append(a); a.click(); a.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+      } catch (e) { shelf?.message(e.message, true); }
+    };
+    const shelfAct = async (fn, done) => { try { await fn(); shelf?.message(done); } catch (e) { shelf?.message(e.message, true); } kick(); };
+    const shelf = $('hcn-files') ? mountFilesShelf($('hcn-files'), {
+      names: (by) => (by.type === 'agent' ? agentName.get(by.id) : names.get(by.id)) || by.id,
+      onDownload: (row, version) => saveFile(row, version),
+      ...(canPost ? {
+        onUpload: (file) => shelfAct(() => api.uploadFile(roomId, file), `Uploaded ${file.name}`),
+        onVersion: (row, file) => shelfAct(() => api.uploadFile(roomId, file, row.id), `New version of ${row.name}`),
+        onDelete: (row) => { if (confirm(`Delete ${row.name} and all its versions?`)) shelfAct(() => api.deleteFile(roomId, row.id), `Deleted ${row.name}`); },
+      } : {}),
+    }) : null;
     let since = -1;
     let ctl = null;
     let wake = null;
@@ -718,7 +739,7 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
         const cont = key === lastKey && at - lastAt < 5 * 60000;
         lastKey = key; lastAt = at.getTime();
         row.className = `cx-m${mine ? ' cx-m--mine' : ''}${agent ? ' cx-m--agent' : ''}${cont ? ' cx-m--cont' : ''}`;
-        row.innerHTML = `${mine ? '' : `<span class="cx-av" style="--h:${hueOf(key)}" aria-hidden="true">${agent ? '🤖' : esc(initials(who))}</span>`}<div class="cx-mbody"><div class="cx-meta"><b>${esc(who)}</b><span>${esc(time)}</span></div><div class="cx-bubble conversation-markdown">${mentionChips(renderMarkdown(e.text), e.mentions, mentionCtx())}</div>${e.context ? `<div class="ctx-ref">${renderContextChip(e.context)}</div>` : ''}</div>`;
+        row.innerHTML = `${mine ? '' : `<span class="cx-av" style="--h:${hueOf(key)}" aria-hidden="true">${agent ? '🤖' : esc(initials(who))}</span>`}<div class="cx-mbody"><div class="cx-meta"><b>${esc(who)}</b><span>${esc(time)}</span></div><div class="cx-bubble conversation-markdown">${mentionChips(renderMarkdown(e.text), e.mentions, mentionCtx())}</div>${e.files?.length ? `<div class="cx-file-refs">${e.files.map((f) => `<button type="button" class="cx-file-chip" data-file-dl="${esc(f.id)}" data-file-v="${Number(f.version) || ''}" data-file-name="${esc(f.name)}" title="Download ${esc(f.name)} v${Number(f.version) || ''} · .collab/files/${esc(f.name)}">📄 ${esc(f.name)} <small>v${Number(f.version) || ''}</small></button>`).join('')}</div>` : ''}${e.context ? `<div class="ctx-ref">${renderContextChip(e.context)}</div>` : ''}</div>`;
         return row;
       }
       lastKey = null;
@@ -1392,12 +1413,15 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
 
     function mentionCtx() {
       return { people: S.people, commands: ROOM_COMMANDS,
-        agents: S.agents.map((a) => ({ ...a, label: namedAgent(a).display_name || '' })) };
+        agents: S.agents.map((a) => ({ ...a, label: namedAgent(a).display_name || '' })),
+        // the Files group inserts the stable path an agent's helper fetches to (latest version), never `@file`
+        files: S.files.map((f) => ({ path: f.path, insert: f.path, label: f.name, detail: `v${f.version} · ${fileSize(f.size)}` })) };
     }
     // ---- one long-poll feeds every panel (replaces five timers); it sleeps while the tab is hidden
     const apply = (s) => {
       if (s.agents) { S.agents = s.agents; S.agents.forEach((a) => agentName.set(a.agent_id, a.name)); }
       if (s.people) S.people = s.people;
+      if (Array.isArray(s.files)) { S.files = s.files; shelf?.update(S.files); }
       S.links = s.links ?? null; S.missions = s.missions ?? null;
       S.tasks = s.tasks || []; S.flow = s.flow || null; S.requests = s.requests || null;
       S.agents.forEach(a=>agentName.set(a.agent_id,namedAgent(a).display_name || a.name));
@@ -1440,9 +1464,14 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
     log.addEventListener('click', (ev) => {                       // a reference chip opens the item in the Lineage tab
       const open = ev.target.closest && ev.target.closest('[data-ctx-open]');
       if (open && !guest) { showSub('lineage'); pickNode(open.dataset.ctxOpen); drawLineage(true); }
+      const chip = ev.target.closest && ev.target.closest('[data-file-dl]');
+      if (chip && !guest) void saveFile({ id: chip.dataset.fileDl, name: chip.dataset.fileName }, Number(chip.dataset.fileV) || undefined);
     });
     if ($('hcn-composer')) {
       composer = mountComposer($('hcn-composer'), {
+        // an attachment is held locally and uploaded to the shelf only once the send is accepted (a message,
+        // never a task), so a refused send leaves nothing behind; the message then names the files by id
+        upload: async (file) => ({ pending: file, name: file.name }),
         draftKey: `collab:${me.user_id}:${roomId}`,
         placeholder: 'Message the room… @ people, agents and files · / commands',
         hint: 'Enter sends · Shift+Enter adds a line · @gert.pi … gives that agent a task',
@@ -1454,7 +1483,7 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
           if (missing.length) notes.push(`${missing.map((n) => `@${n}`).join(', ')} addresses nobody here; it will be sent as plain text.`);
           return notes.join(' ');
         },
-        onSend: async (text) => {
+        onSend: async (text, files = []) => {
           // The text goes out exactly as typed: the server derives mentions, and a harness reads what was written.
           const lead = /^@([a-z0-9._-]{1,48})\s+\S/i.exec(text.trim());
           // the same precedence as the server: a group or a person handle is never an agent's task
@@ -1463,9 +1492,20 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
           const hit = found?.hit;
           const target = hit && hit.kind === 'agent' && S.agents.find((a) => a.agent_id === hit.id);
           const mention = target && target.actions.includes('execute');
+          if (mention && files.length) throw new Error('A task carries text only: send the files in a message, or name their .collab/files/ path in the task.');
           if (mention) { // the room's authenticated leading-agent task contract, now with the verbatim text
             await api.createTask(roomId, target.agent_id, text);
-          } else { await api.say(roomId, text, CTX.attach ? contextBody(CTX.attach) : undefined); CTX.attach = null; drawAttach(); }
+          } else {
+            const uploaded = [];
+            try {
+              for (const f of files) uploaded.push(f.pending ? await api.uploadFile(roomId, f.pending) : f);
+              await api.say(roomId, text, CTX.attach ? contextBody(CTX.attach) : undefined, uploaded.map((f) => f.id));
+            } catch (e) {     // nothing half-sent: files uploaded for a message that failed are removed again
+              await Promise.allSettled(uploaded.filter((f, i) => files[i].pending).map((f) => api.deleteFile(roomId, f.id)));
+              throw e;
+            }
+            CTX.attach = null; drawAttach();
+          }
           if (alive) { kick(); log.scrollTop = log.scrollHeight; }
           return { status: 'delivered', message: mention ? 'Task created' : 'Message posted' };
         },

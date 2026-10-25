@@ -56,6 +56,10 @@ sections:
         #   evidence_writers: ["key:ci-service"]   # ONLY these writers' merged/validated marks count as evidence
         #   min_group_size: 5              # aggregates over fewer items are hidden
         #   reads_per_minute: 60
+        # C5 room files (defaults shown; re-read per request):
+        # files:
+        #   max_bytes: 26214400            # 25 MiB per file
+        #   room_bytes: 524288000          # 500 MiB per room; deleting a file frees its versions' bytes
       # Variables docker compose itself substitutes; deploy.sh renders exactly this
       # mapping into a transient 0600 env file. The first eight keys are required.
       compose:

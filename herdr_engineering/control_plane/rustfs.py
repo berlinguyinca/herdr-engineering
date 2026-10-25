@@ -40,9 +40,11 @@ class RustFSClient:
         except Exception:
             self._s3.create_bucket(Bucket=self._bucket)
 
-    def put(self, data: bytes) -> tuple[str, str]:
+    def put(self, data: bytes, prefix: str = "") -> tuple[str, str]:
+        """Store ``data`` under ``<prefix>sha256/aa/bb/<hex>``. Artifacts use no prefix; another owner of objects
+        in the bucket (room files: ``collab-files/``) passes its own, so neither can delete the other's bytes."""
         digest = self._sha(data).hexdigest()
-        key = f"sha256/{digest[:2]}/{digest[2:4]}/{digest}"
+        key = f"{prefix}sha256/{digest[:2]}/{digest[2:4]}/{digest}"
         self._s3.put_object(Bucket=self._bucket, Key=key, Body=data)
         return key, digest
 

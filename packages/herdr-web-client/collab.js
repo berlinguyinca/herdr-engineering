@@ -109,10 +109,38 @@ export class CollabApi {
   createProject(name) { return this.call('POST', '/projects', { name }); }
   createRoom(project, name) { return this.call('POST', `/projects/${encodeURIComponent(project)}/rooms`, { name }); }
   events(id, cursor) { return this.call('GET', `/rooms/${encodeURIComponent(id)}/events?cursor=${cursor}&limit=200`); }
-  say(id, text, context) {
+  say(id, text, context, files) {
     return this.call('POST', `/rooms/${encodeURIComponent(id)}/messages`,
-      { text, idempotency_key: `web-${Date.now().toString(36)}-${randomString(9)}`, ...(context ? { context } : {}) });
+      { text, idempotency_key: `web-${Date.now().toString(36)}-${randomString(9)}`, ...(context ? { context } : {}),
+        ...(files?.length ? { files } : {}) });
   }
+  // Room files (C5): uploads are raw bytes (never a form), downloads come back as a Blob to save, never to display.
+  async rawCall(method, path, body) {
+    const t = this.getTokens();
+    if (!t) throw new AuthError('signed out');
+    const res = await this.fetch(this.base + path, {
+      method, headers: { Authorization: `Bearer ${t.access}`, ...(body !== undefined ? { 'Content-Type': 'application/octet-stream' } : {}) }, body,
+    });
+    if (res.status === 401) throw new AuthError('session expired');
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      const err = new Error(data.error || `request failed (${res.status})`);
+      err.status = res.status; err.code = data.code;
+      throw err;
+    }
+    return res;
+  }
+  files(room) { return this.call('GET', `/rooms/${encodeURIComponent(room)}/files`); }
+  async uploadFile(room, file, parent) {
+    const r = encodeURIComponent(room);
+    const path = parent ? `/rooms/${r}/files/${encodeURIComponent(parent)}/versions` : `/rooms/${r}/files?name=${encodeURIComponent(file.name)}`;
+    return (await (await this.rawCall('POST', path, file)).json()).file;
+  }
+  async downloadFile(room, id, version) {
+    const res = await this.rawCall('GET', `/rooms/${encodeURIComponent(room)}/files/${encodeURIComponent(id)}${version ? `?v=${version}` : ''}`);
+    return res.blob();
+  }
+  deleteFile(room, id) { return this.call('POST', `/rooms/${encodeURIComponent(room)}/files/${encodeURIComponent(id)}/delete`, {}); }
   // Consultation (T14): a question and ONE text answer. Cross-workspace links (T14): both ends are checked by the server.
   attention(room, includeAcked = false) { return this.call('GET', `/rooms/${encodeURIComponent(room)}/attention${includeAcked ? '?include=acked' : ''}`); }
   attentionAck(room, body) { return this.call('POST', `/rooms/${encodeURIComponent(room)}/attention/ack`, body); }
