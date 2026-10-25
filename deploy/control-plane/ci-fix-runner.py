@@ -196,8 +196,22 @@ class HttpControlPlane:
 class Gateway:
     """The model catalogue (`GET /v1/models`), the same source the helper runner posts."""
 
-    def __init__(self, url):
+    def __init__(self, url, pi_config_dir=None):
         self.url = (url or "").rstrip("/")
+        self.pi_config_dir = Path(pi_config_dir) if pi_config_dir else None
+
+    def pi_models(self):
+        """Model ids Pi's own models.json lists for this gateway (no credentials are read)."""
+        try:
+            providers = json.loads((self.pi_config_dir / "models.json").read_text()).get("providers") or {}
+        except (AttributeError, OSError, ValueError):
+            return []
+        found = []
+        for provider in providers.values():
+            base = str(provider.get("baseUrl") or "").rstrip("/") if isinstance(provider, dict) else ""
+            if base == self.url or base == f"{self.url}/v1":
+                found += [m["id"] for m in provider.get("models") or [] if isinstance(m, dict) and isinstance(m.get("id"), str)]
+        return found[:CATALOGUE_MAX]
 
     def models(self):
         if not self.url:
@@ -205,6 +219,10 @@ class Gateway:
         try:
             with urllib.request.urlopen(f"{self.url}/v1/models", timeout=15) as response:    # noqa: S310
                 payload = json.loads(response.read(2_000_000))
+        except urllib.error.HTTPError as exc:
+            if exc.code in (401, 403) and (found := self.pi_models()):
+                return found                       # the gateway wants a bearer; Pi's own catalogue says what it serves
+            raise Failure(f"gateway unreachable: {trim(exc, 120)}") from None
         except (OSError, ValueError) as exc:
             raise Failure(f"gateway unreachable: {trim(exc, 120)}") from None
         rows = payload.get("data") if isinstance(payload, dict) else None
@@ -1383,7 +1401,7 @@ def main(argv):
     runner = Runner(
         host_id=args.host_id, state_dir=Path(args.state_dir), work_root=Path(args.work_root),
         mirror_root=Path(args.mirror_root), control_plane=HttpControlPlane(args.url, args.api_key_file), git=git,
-        forge=HttpsForge(args.forge_host or ("github.com",), args.forge_token_file), gateway=Gateway(args.gateway),
+        forge=HttpsForge(args.forge_host or ("github.com",), args.forge_token_file), gateway=Gateway(args.gateway, args.pi_config_dir),
         launcher=launcher)
     try:
         runner.once()
