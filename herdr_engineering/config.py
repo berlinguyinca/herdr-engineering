@@ -132,6 +132,31 @@ def validate_github(section: Any) -> None:
         raise InvalidError("github must be a mapping")
     github_organizations(section.get("organizations"))
     github_sync(section.get("sync"))
+    github_write(section.get("write"))
+
+
+def github_write(value: Any) -> dict:
+    """Validate ``github.write`` (collab `/issue` and `/assign`): ``{enabled, token_ref}``. Off by default.
+
+    ``token_ref`` is a REFERENCE (an absolute path to a 0600 token file on the server), never the token: a key
+    other than these two is refused so a secret cannot be pasted here."""
+    if value is None:
+        return {"enabled": False, "token_ref": None}
+    if not isinstance(value, dict):
+        raise InvalidError("github.write must be a mapping with enabled and token_ref")
+    unknown = sorted(str(k) for k in set(value) - {"enabled", "token_ref"})
+    if unknown:
+        raise InvalidError("github.write: unknown keys: " + ", ".join(unknown)
+                           + " (only enabled and token_ref; the token itself lives in the token_ref file)")
+    enabled = value.get("enabled", False)
+    if not isinstance(enabled, bool):
+        raise InvalidError("github.write.enabled must be true or false")
+    ref = value.get("token_ref")
+    if ref is not None and (not isinstance(ref, str) or not os.path.isabs(ref)):
+        raise InvalidError("github.write.token_ref must be an absolute path to a 0600 token file")
+    if enabled and ref is None:
+        raise InvalidError("github.write.enabled needs github.write.token_ref (a separate write token file)")
+    return {"enabled": enabled, "token_ref": ref}
 
 
 def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:

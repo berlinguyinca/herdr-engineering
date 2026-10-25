@@ -134,6 +134,14 @@ def _parse(data: Any) -> FleetConfig:
                 parse_review_gate_section(sec["values"]["review_gate"], check_key_file=False)
             except ValueError as exc:
                 raise FleetConfigError(f"section {name}: {exc}") from None
+        if name == "github" and "write" in sec["values"]:
+            from herdr_engineering.config import github_write
+            from herdr_engineering.errors import InvalidError
+
+            try:  # a reference to the write token file, never the token (collab /issue, /assign)
+                github_write(sec["values"]["write"])
+            except InvalidError as exc:
+                raise FleetConfigError(f"section {name}: {exc}") from None
         sections[name] = {"roles": roles, "values": sec["values"]}
 
     hosts: dict[str, dict] = {}

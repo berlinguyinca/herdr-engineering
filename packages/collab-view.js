@@ -19,6 +19,7 @@ import { ensureConversationStyles, mountComposer } from './conversation-composer
 import { providers, ROOM_COMMANDS, unresolvedMentions, ambiguousMentions, mentionChips, refChips, resolveToken, quiet } from './collab-mention.js';
 import { renderMarkdown } from './conversation-markdown.js';
 import { mountFilesShelf, fileSize } from './collab-files-view.js';
+import { commandCard, isCommandEvent } from './collab-cards.js';
 import {
   AuthError, CollabApi, TokenStore, authorizeUrl, exchangeCode, parseRedirect, pkcePair, randomString,
 } from './herdr-web-client/collab.js';
@@ -567,7 +568,7 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
     const guest = info.role === 'guest';
     let names = new Map((info.members || []).map((m) => [m.user_id, m.email || shortId(m.user_id)]));
     const agentName = new Map();           // agent id -> handle, for rendering task events
-    const S = { agents: [], people: [], tasks: [], flow: null, requests: null, mine: [], links: null, missions: null, tabs: null, tabsAt: 0, tabSel: null, externals: null, deleg: null, props: null, propSel: null, propOne: null, profile: null, allow: [], egress: [], helpers: [], paused: false, entries: null, files: [], issues: [], issuesReady: undefined };
+    const S = { agents: [], people: [], tasks: [], flow: null, requests: null, mine: [], links: null, missions: null, tabs: null, tabsAt: 0, tabSel: null, externals: null, deleg: null, props: null, propSel: null, propOne: null, profile: null, allow: [], egress: [], helpers: [], paused: false, entries: null, files: [], issues: [], issuesReady: undefined, selected: new Set() };
     const tabs = [['chat', 'Chat'], ...(guest ? [] : [['flow', 'Flow']]), ['tasks', 'Tasks'], ...(guest ? [] : [['files', 'Files'], ['agents', 'Agents'], ['tabs', 'Tabs'], ['lineage', 'Lineage'], ['attention', 'Attention'], ['progress', 'Progress'], ['links', 'Workspaces']]), ...(canInvite ? [['proposals', 'Proposals'], ['people', 'People']] : [])];
     let sub = subTab.get(roomId);
     if (!tabs.some(([k]) => k === sub)) sub = 'chat';
@@ -684,6 +685,14 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
     const statusColor = { done: 'var(--status-ok)', failed: 'var(--status-failed)', pending: 'var(--status-attention)', accepted: 'var(--accent)', cancelled: 'var(--text-muted)' };
     const HIDDEN_EVENTS = new Set(['audit_denied', 'identity_linked', 'agent_linked']);
     const tname = (id) => agentName.get(id) || shortId(id);
+    const canDraft = canManagePeople();          // approvers: /issue and /assign write to GitHub (the server re-checks)
+    const senderName = (s) => (!s ? 'someone' : s.type === 'agent' ? `@${tname(s.id)}` : s.id === me.user_id ? 'You' : (names.get(s.id) || shortId(s.id)));
+    // A later answer or write settles the card it refers to: its status changes and its buttons go away.
+    const settleCard = (e) => {
+      const settle = (sel, st) => { const card = log.querySelector(sel); if (!card) return; const pillEl = card.querySelector('[data-status]'); if (pillEl) pillEl.textContent = st; card.querySelectorAll('.cx-cmdcard__actions').forEach((x) => x.remove()); };
+      if (e.event_type === 'handoff_updated' && e.handoff) settle(`[data-handoff="${CSS.escape(e.handoff.handoff_id)}"]`, e.handoff.status);
+      if (e.event_type === 'github_written' && e.github) settle(`[data-draft="${CSS.escape(e.github.draft_id)}"]`, e.github.kind === 'issue' ? 'created' : 'assigned');
+    };
     function eventRow(e) {
       const row = document.createElement('div');
       const at = new Date(e.created_at);
@@ -699,10 +708,19 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
         const cont = key === lastKey && at - lastAt < 5 * 60000;
         lastKey = key; lastAt = at.getTime();
         row.className = `cx-m${mine ? ' cx-m--mine' : ''}${agent ? ' cx-m--agent' : ''}${cont ? ' cx-m--cont' : ''}`;
-        row.innerHTML = `${mine ? '' : `<span class="cx-av" style="--h:${hueOf(key)}" aria-hidden="true">${agent ? '🤖' : esc(initials(who))}</span>`}<div class="cx-mbody"><div class="cx-meta"><b>${esc(who)}</b><span>${esc(time)}</span></div><div class="cx-bubble conversation-markdown">${refChips(mentionChips(renderMarkdown(e.text), e.mentions, mentionCtx()), e.refs)}</div>${e.files?.length ? `<div class="cx-file-refs">${e.files.map((f) => `<button type="button" class="cx-file-chip" data-file-dl="${esc(f.id)}" data-file-v="${Number(f.version) || ''}" data-file-name="${esc(f.name)}" title="Download ${esc(f.name)} v${Number(f.version) || ''} · .collab/files/${esc(f.name)}">📄 ${esc(f.name)} <small>v${Number(f.version) || ''}</small></button>`).join('')}</div>` : ''}${e.context ? `<div class="ctx-ref">${renderContextChip(e.context)}</div>` : ''}</div>`;
+        const pick = canDraft && e.event_id ? `<button type="button" class="cx-pick" data-select="${esc(e.event_id)}" aria-pressed="${S.selected.has(e.event_id)}" title="Select for /issue">✓</button>` : '';
+        row.innerHTML = `${mine ? '' : `<span class="cx-av" style="--h:${hueOf(key)}" aria-hidden="true">${agent ? '🤖' : esc(initials(who))}</span>`}<div class="cx-mbody"><div class="cx-meta"><b>${esc(who)}</b><span>${esc(time)}</span>${pick}</div><div class="cx-bubble conversation-markdown">${refChips(mentionChips(renderMarkdown(e.text), e.mentions, mentionCtx()), e.refs)}</div>${e.files?.length ? `<div class="cx-file-refs">${e.files.map((f) => `<button type="button" class="cx-file-chip" data-file-dl="${esc(f.id)}" data-file-v="${Number(f.version) || ''}" data-file-name="${esc(f.name)}" title="Download ${esc(f.name)} v${Number(f.version) || ''} · .collab/files/${esc(f.name)}">📄 ${esc(f.name)} <small>v${Number(f.version) || ''}</small></button>`).join('')}</div>` : ''}${e.context ? `<div class="ctx-ref">${renderContextChip(e.context)}</div>` : ''}</div>`;
         return row;
       }
       lastKey = null;
+      if (isCommandEvent(e.event_type)) {
+        const c = commandCard(e, { who: senderName });
+        row.className = c.className;
+        for (const [k, v] of Object.entries(c.attrs)) row.setAttribute(k, v);
+        row.innerHTML = c.html;
+        settleCard(e);
+        return row;
+      }
       if (e.event_type === 'task_created' || e.event_type === 'task_updated') {
         const st = e.task.status || 'pending';
         row.className = 'cx-taskcard';
@@ -1403,6 +1421,21 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
       if (open && !guest) { showSub('lineage'); pickNode(open.dataset.ctxOpen); drawLineage(true); }
       const chip = ev.target.closest && ev.target.closest('[data-file-dl]');
       if (chip && !guest) void saveFile({ id: chip.dataset.fileDl, name: chip.dataset.fileName }, Number(chip.dataset.fileV) || undefined);
+      const pick = ev.target.closest && ev.target.closest('[data-select]');
+      if (pick) {
+        const id = pick.dataset.select;
+        if (S.selected.has(id)) S.selected.delete(id); else if (S.selected.size < 20) S.selected.add(id);
+        pick.setAttribute('aria-pressed', String(S.selected.has(id)));
+      }
+      const conf = ev.target.closest && ev.target.closest('[data-draft-confirm]');
+      if (conf) {
+        const issue = conf.dataset.draftKind === 'issue';
+        // the explicit confirm: nothing reaches GitHub without it (and the server checks approver + write gate)
+        if (confirm(issue ? `Create this issue in ${conf.dataset.draftWhere.replace(/#$/, '')} on GitHub?` : `Assign ${conf.dataset.draftWhere} on GitHub?`)) {
+          conf.disabled = true;
+          act(() => api.confirmDraft(roomId, conf.dataset.draftConfirm));
+        }
+      }
     });
     if ($('hcn-composer')) {
       composer = mountComposer($('hcn-composer'), {
@@ -1436,7 +1469,9 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
             const uploaded = [];
             try {
               for (const f of files) uploaded.push(f.pending ? await api.uploadFile(roomId, f.pending) : f);
-              await api.say(roomId, text, CTX.attach ? contextBody(CTX.attach) : undefined, uploaded.map((f) => f.id));
+              const selection = /^\/issue(\s|$)/.test(text) ? [...S.selected] : [];
+              await api.say(roomId, text, CTX.attach ? contextBody(CTX.attach) : undefined, uploaded.map((f) => f.id), { selection });
+              if (selection.length) { S.selected.clear(); log.querySelectorAll('[data-select][aria-pressed="true"]').forEach((b) => b.setAttribute('aria-pressed', 'false')); }
             } catch (e) {     // nothing half-sent: files uploaded for a message that failed are removed again
               await Promise.allSettled(uploaded.filter((f, i) => files[i].pending).map((f) => api.deleteFile(roomId, f.id)));
               throw e;

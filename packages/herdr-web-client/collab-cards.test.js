@@ -1,0 +1,66 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { commandCard, isCommandEvent } from '../collab-cards.js';
+import { CollabApi } from './collab.js';
+
+const at = '2026-10-24T10:00:00Z';
+const evil = '<img src=x onerror=alert(1)>';
+
+test('command events are recognised; messages and tasks are not', () => {
+  for (const t of ['handoff', 'handoff_updated', 'decision', 'summary_request', 'issue_draft', 'assignment', 'github_written']) assert.ok(isCommandEvent(t), t);
+  for (const t of ['message', 'task_created', 'member_added']) assert.ok(!isCommandEvent(t), t);
+});
+
+test('a handoff card names both parties and its note, all escaped', () => {
+  const c = commandCard({ event_type: 'handoff', created_at: at, sender: { type: 'user', id: 'bob' },
+    handoff: { handoff_id: 'h1', from: { kind: 'agent', name: 'alice.pi' }, to: { kind: 'person', name: `x${evil}` }, note: evil, status: 'pending', can_answer: false } });
+  assert.match(c.html, /@alice\.pi/);
+  assert.ok(!c.html.includes('<img'), c.html);
+  assert.match(c.html, /&lt;img/);
+  assert.equal(c.attrs['data-handoff'], 'h1');
+  assert.match(c.html, /pending/);
+  assert.ok(!c.html.includes('data-handoff-answer'));
+});
+
+test('a decision, a summary request and a GitHub result render as cards', () => {
+  assert.match(commandCard({ event_type: 'decision', created_at: at, text: `ship ${evil}` }).html, /Decision[\s\S]*ship &lt;img/);
+  assert.match(commandCard({ event_type: 'summary_request', created_at: at, text: '' }, { who: () => '@bob' }).html, /@bob asked for a summary/);
+  const done = commandCard({ event_type: 'github_written', created_at: at,
+    github: { kind: 'issue', owner: 'acme', repo: 'app', number: 7, url: 'javascript:alert(1)' } });
+  assert.match(done.html, /acme\/app#7/);
+  assert.ok(!done.html.includes('javascript:'), 'only https://github.com links');
+});
+
+test('an issue draft shows its body escaped and offers confirm only when the server allows it', () => {
+  const draft = { draft_id: 'd1', kind: 'issue', owner: 'acme', repo: 'app', title: evil, body: `> ${evil}`, status: 'draft', can_confirm: true };
+  const c = commandCard({ event_type: 'issue_draft', created_at: at, draft });
+  assert.ok(!c.html.includes('<img'));
+  assert.match(c.html, /data-draft-confirm="d1"/);
+  assert.equal(c.attrs['data-draft'], 'd1');
+  const no = commandCard({ event_type: 'issue_draft', created_at: at, draft: { ...draft, can_confirm: false } });
+  assert.ok(!no.html.includes('data-draft-confirm'));
+  const made = commandCard({ event_type: 'issue_draft', created_at: at, draft: { ...draft, status: 'created', number: 9, can_confirm: false } });
+  assert.match(made.html, /created/);
+});
+
+test('an assignment card names the person and the issue', () => {
+  const c = commandCard({ event_type: 'assignment', created_at: at,
+    draft: { draft_id: 'd2', kind: 'assignment', owner: 'acme', repo: 'app', number: 3, person: { kind: 'person', name: 'bob' }, login: 'bob-gh', status: 'draft', can_confirm: true } });
+  assert.match(c.html, /acme\/app#3/);
+  assert.match(c.html, /@bob/);
+  assert.match(c.html, /data-draft-confirm="d2"/);
+});
+
+test('the api confirms a draft and lists decisions; a command carries its selection', async () => {
+  const seen = [];
+  const api = new CollabApi(() => ({ access: 'T' }), async (url, init) => { seen.push({ url, ...init }); return { ok: true, status: 200, json: async () => ({}) }; });
+  await api.confirmDraft('r 1', 'd 1');
+  assert.equal(seen[0].url, '/api/v1/collab/rooms/r%201/drafts/d%201/confirm');
+  assert.equal(seen[0].method, 'POST');
+  await api.decisions('r1');
+  assert.equal(seen[1].url, '/api/v1/collab/rooms/r1/decisions');
+  await api.say('r1', '/issue acme/app', undefined, [], { selection: ['e1', 'e2'] });
+  assert.deepEqual(JSON.parse(seen[2].body).selection, ['e1', 'e2']);
+  await api.say('r1', 'hi');
+  assert.ok(!('selection' in JSON.parse(seen[3].body)));
+});

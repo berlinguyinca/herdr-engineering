@@ -109,11 +109,14 @@ export class CollabApi {
   createProject(name) { return this.call('POST', '/projects', { name }); }
   createRoom(project, name) { return this.call('POST', `/projects/${encodeURIComponent(project)}/rooms`, { name }); }
   events(id, cursor) { return this.call('GET', `/rooms/${encodeURIComponent(id)}/events?cursor=${cursor}&limit=200`); }
-  say(id, text, context, files) {
+  say(id, text, context, files, extra) {
     return this.call('POST', `/rooms/${encodeURIComponent(id)}/messages`,
       { text, idempotency_key: `web-${Date.now().toString(36)}-${randomString(9)}`, ...(context ? { context } : {}),
-        ...(files?.length ? { files } : {}) });
+        ...(files?.length ? { files } : {}), ...(extra?.selection?.length ? { selection: extra.selection } : {}) });
   }
+  // Room commands (C6): an approver's explicit confirm is the only way a draft reaches GitHub.
+  confirmDraft(room, draft) { return this.call('POST', `/rooms/${encodeURIComponent(room)}/drafts/${encodeURIComponent(draft)}/confirm`, {}); }
+  decisions(room) { return this.call('GET', `/rooms/${encodeURIComponent(room)}/decisions`); }
   // Room files (C5): uploads are raw bytes (never a form), downloads come back as a Blob to save, never to display.
   async rawCall(method, path, body) {
     const t = this.getTokens();

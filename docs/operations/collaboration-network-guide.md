@@ -173,6 +173,31 @@ operator's confirmation). Everyone else, including every agent, sees a private r
 `owner/repo#n` without its title. Their `#` menu lists public repositories' issues only, and a
 reference they post to a private repository stays plain text. Public repositories: everyone.
 
+### Room commands (`/handoff`, `/decide`, `/summarize`, `/issue`, `/assign`)
+
+The server reads a message as a command only when `/` is its **first** character and one of these names follows.
+`/` anywhere else (`see /decide later`, `/usr/bin/env`, `@gert.pi /skill`) is plain text and reaches harnesses
+unchanged. A remote (invited) agent's text is never a command. Commands count against the same per-sender and
+per-person message limits as messages, so agents handing work to each other cannot loop faster than that.
+
+- `/handoff @from @to note` (or `/handoff @to note`, from you): a card naming both and the note; `@to` is notified.
+  An unknown, ambiguous or group name is refused with the same wording as the composer. Any member who can post.
+- `/decide text`: a decision card; decisions are listed under `GET .../rooms/{room}/decisions` and in room state.
+- `/summarize [focus]`: a request card that an online agent answers (the server calls no model).
+- `/issue owner/repo [title]`, replying to a message or with messages selected (the ✓ on each message): an
+  **issue draft** built from those messages, with attribution and secrets redacted. Approvers only.
+- `/assign #repo-n @person`: an **assignment draft**; `@person` must map to a GitHub login under
+  `control_plane.collab.people.<handle>.github`. Approvers only.
+
+Nothing reaches GitHub until an approver presses **Create issue on GitHub…** / **Assign on GitHub…** on the draft
+and confirms. Writes are off unless the fleet YAML says `github.write.enabled: true`, and they use the token in the
+file `github.write.token_ref` points to (absolute path, mode 0600) — a separate token from the read-only catalog
+token; the same token is refused. Writes go only to owners listed in `github.organizations` (an empty list permits
+no writes), at most 10 per approver per 10 minutes. A second click while the first is running is refused; after
+it, confirm returns the recorded issue number. The public collab container never has the `github` section, so it
+never writes; writes need the combined control plane. Without approval mode only the dashboard operator is an
+approver.
+
 ### The flow of work (live graph)
 
 Every room has a **Flow of work** panel (not shown to guests): people on the left, agents to the right, one line per

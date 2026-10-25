@@ -56,6 +56,9 @@ sections:
         #   evidence_writers: ["key:ci-service"]   # ONLY these writers' merged/validated marks count as evidence
         #   min_group_size: 5              # aggregates over fewer items are hidden
         #   reads_per_minute: 60
+        # C6 /assign maps a person's room handle to a GitHub login (public names only; re-read per request):
+        # people:
+        #   gert: {github: "gert-gh"}
         # C5 room files (defaults shown; re-read per request):
         # files:
         #   max_bytes: 26214400            # 25 MiB per file
@@ -94,6 +97,13 @@ sections:
     roles: [ci]
     values:
       token: "REDACTED"
+      # C6 room commands /issue and /assign. Off by default. token_ref is a REFERENCE: an absolute path to a
+      # 0600 file on the control-plane host holding a SEPARATE token with issue write access (never the
+      # read-only token above). Writes go only to owners listed in github.organizations, after an approver
+      # confirms the draft in the room. The public collab container never sees this section, so it never writes.
+      # write:
+      #   enabled: false
+      #   token_ref: "/home/REDACTED/.config/herdr-engineering/secrets/github-write-token"
 
   # Posted by every host's feeds as the control-plane API key (role ingest).
   # Empty = send no X-API-Key (open control plane, the default).
