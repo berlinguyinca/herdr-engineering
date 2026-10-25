@@ -128,26 +128,58 @@ async function commandCenter(run) {
   assert.equal(upload.status,200);
   browser=await chromium.launch({headless:true,args:['--no-sandbox'],...(process.env.PLAYWRIGHT_CHROMIUM?{executablePath:process.env.PLAYWRIGHT_CHROMIUM}:{})});
   const context=await browser.newContext({viewport:{width:1440,height:1000}});
-  const page=await context.newPage(),errors=[],requests=[];
+  const page=await context.newPage(),errors=[],requests=[],failedRequests=[],httpErrors=[];
   page.on('pageerror',e=>errors.push(e.message));
+  page.on('requestfailed',r=>failedRequests.push({url:r.url(),error:r.failure()?.errorText}));
+  page.on('response',r=>{if(r.status()>=400)httpErrors.push({url:r.url(),status:r.status()});});
   page.on('request',r=>{if(r.url().includes('/api/v1/ci/'))requests.push(new URL(r.url()).pathname);});
-  await page.goto(`${base}/#/ci`);
-  await page.waitForFunction(()=>document.querySelectorAll('[data-ob-project]').length===117);
-  await run({page,context,base,requests});
+  try {
+   await page.goto(`${base}/#/ci`);
+   await page.waitForFunction(()=>document.querySelectorAll('[data-ob-project]').length===117);
+   await run({page,context,base,requests});
+  }
+  catch(error){
+   console.error('CI_BROWSER_FAILURE',JSON.stringify({errors,failedRequests,httpErrors,state:await page.evaluate(()=>({url:location.href,projects:document.querySelectorAll('[data-ob-project]').length,status:document.querySelector('[data-ob-status]')?.textContent,body:document.body.innerText.slice(0,1500)}))}));
+   throw error;
+  }
   assert.deepEqual(errors,[]);
  }finally{await browser?.close();server.kill();}
+}
+// A sample ends only after selected KPIs, charts and test history have all
+// committed to the DOM and had a paint opportunity. Text from one fast request
+// must not hide a slow/failed project summary or be canceled by the next sample.
+async function selectedReady(page) {
+ await page.waitForFunction(()=>{
+  const status=document.querySelector('[data-ob-status]')?.textContent||'';
+  return document.querySelector('[data-ob-project][aria-pressed="true"]') &&
+   !/Refreshing|refresh failed|unavailable/i.test(status) &&
+   document.querySelector('[data-ob-summary] .ci-ob-card') &&
+   document.querySelector('[data-ob-charts] svg') &&
+   document.querySelector('[data-ob-tests]')?.textContent.includes('test_status') &&
+   !/Loading|refresh failed/i.test(document.querySelector('[data-ob-tests]').textContent);
+ });
+ await page.evaluate(()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve))));
+}
+function evidenceResponses(page,status=200,{fleet=true}={}) {
+ return Promise.all([
+  ...(fleet?[page.waitForResponse(r=>{const u=new URL(r.url());return u.pathname==='/api/v1/ci/summary'&&!u.searchParams.has('provider_repo_id')&&r.status()===status;})]:[]),
+  page.waitForResponse(r=>{const u=new URL(r.url());return u.pathname==='/api/v1/ci/summary'&&u.searchParams.get('provider_repo_id')==='17'&&r.status()===status;}),
+  page.waitForResponse(r=>new URL(r.url()).pathname==='/api/v1/ci/tests'&&r.status()===status),
+ ]).then(responses=>Promise.all(responses.map(async r=>assert.equal(await r.finished(),null,`response completed: ${r.url()}`))));
 }
 async function selectApp(page) {
  await page.locator('[data-ob-search]').fill('org/app');
  assert.equal(await page.locator('[data-ob-project]').count(),1);
+ const responses=evidenceResponses(page,200,{fleet:false});
  await page.locator('[data-ob-project]').focus();await page.keyboard.press('Enter');
- await page.waitForFunction(()=>document.querySelector('[data-ob-tests]')?.textContent.includes('test_status'));
+ await responses;await selectedReady(page);
 }
 async function openFailure(page) {
  await page.locator('[data-ci-workspace="runs"]').click();
  await page.getByRole('tab',{name:/^Failed/}).click();
  await page.getByRole('button',{name:'Run #3',exact:true}).click();
  await page.locator('.ci-diagnosis article').waitFor();
+ await page.evaluate(()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve))));
 }
 const p95=values=>[...values].sort((a,b)=>a-b)[Math.ceil(values.length*.95)-1];
 
@@ -170,11 +202,12 @@ test('117-project summary and selection meet cached response and interaction bud
  const selectionMs=[];
  for(let i=0;i<20;i++){
   await page.locator('[data-ob-project]').filter({hasText:'org/app'}).focus();
+  const responses=evidenceResponses(page,200,{fleet:false});
   const start=performance.now();await page.keyboard.press('Enter');
-  await page.waitForFunction(()=>document.querySelector('[data-ob-tests]')?.textContent.includes('test_status'));
+  await responses;await selectedReady(page);
   selectionMs.push(performance.now()-start);
   await page.locator('[data-ob-clear]').click();
-  await page.waitForFunction(()=>!document.querySelector('[data-ob-project][aria-pressed="true"]'));
+  await page.waitForFunction(()=>!document.querySelector('[data-ob-project][aria-pressed="true"]')&&!document.querySelector('[data-ob-status]').textContent.includes('Refreshing'));
  }
  assert.equal(requests.filter(p=>/\/(pipeline|log)$/.test(p)).length,0,'summary refresh and project selection never fetch pipeline details');
  const detailMs=[];
@@ -189,6 +222,34 @@ test('117-project summary and selection meet cached response and interaction bud
  assert.ok(p95(selectionMs)<1000,'project selection p95 < 1s');
  assert.ok(p95(detailMs)<1000,'run selection p95 < 1s, excluding log reads');
  assert.equal(requests.filter(p=>p.endsWith('/log')).length,0);
+}));
+
+for(const slow of ['summary','tests'])test(`project readiness waits for delayed selected ${slow} before clearing`,()=>commandCenter(async({page})=>{
+ let release,started;
+ const gate=new Promise(resolve=>release=resolve),requested=new Promise(resolve=>started=resolve);
+ const pattern=`**/api/v1/ci/${slow}*`;
+ await page.route(pattern,async route=>{
+  const url=new URL(route.request().url());
+  if(slow==='summary'&&!url.searchParams.has('provider_repo_id'))return route.continue();
+  started();await gate;await route.continue();
+ });
+ const aborted=[];page.on('requestfailed',request=>{if(/\/ci\/(summary|tests)/.test(request.url()))aborted.push(request.url());});
+ await page.locator('[data-ob-search]').fill('org/app');
+ await page.locator('[data-ob-project]').click();await requested;
+ let complete=false;
+ const ready=selectedReady(page).then(()=>complete=true);
+ if(slow==='summary')await page.waitForFunction(()=>document.querySelector('[data-ob-tests]').textContent.includes('test_status'));
+ else await page.locator('[data-ob-charts] svg').first().waitFor();
+ // Give the fast region and the readiness observer a full paint opportunity.
+ await page.evaluate(()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(()=>requestAnimationFrame(resolve)))));
+ assert.equal(complete,false,'one ready region cannot complete the selection sample');
+ assert.match(await page.locator('[data-ob-status]').innerText(),/Refreshing/);
+ release();await ready;await page.unroute(pattern);
+ assert.match(await page.locator('[data-ob-summary]').innerText(),/Observed projects/);
+ assert.ok(await page.locator('[data-ob-charts] svg').count()>0);
+ assert.match(await page.locator('[data-ob-tests]').innerText(),/test_status/);
+ await page.locator('[data-ob-clear]').click();
+ assert.deepEqual(aborted,[],'completed selection must not leave an aborted summary/test request');
 }));
 
 test('filtered failing run exposes exact test evidence and keyboard-opened step output and provider link',()=>commandCenter(async({page,context,requests})=>{
@@ -238,8 +299,9 @@ test('failed HTTP refresh retains selected project, run, failed step and expande
  const cards=await page.locator('[data-ob-summary]').innerText(),chart=await disclosure.innerText();
  await page.route('**/api/v1/ci/summary*',route=>route.fulfill({status:503,json:{error:'Fixture outage'}}));
  await page.route('**/api/v1/ci/tests*',route=>route.fulfill({status:503,json:{error:'Fixture outage'}}));
- await page.locator('[data-ob-refresh]').click();
- await page.waitForFunction(()=>document.querySelector('[data-ob-status]')?.textContent.includes('Summary refresh failed'));
+ const failed=evidenceResponses(page,503);
+ await page.locator('[data-ob-refresh]').click();await failed;
+ await page.waitForFunction(()=>{const status=document.querySelector('[data-ob-status]').textContent;return status.includes('Summary refresh failed')&&status.includes('Project refresh failed')&&!status.includes('Refreshing')&&document.querySelector('[data-ob-tests]').textContent.includes('Test history refresh failed');});
  assert.equal(await page.locator('[data-ob-summary]').innerText(),cards);
  assert.equal(await disclosure.innerText(),chart);assert.equal(await disclosure.evaluate(n=>n.open),true);
  assert.equal(await page.locator('[data-ob-project]').getAttribute('aria-pressed'),'true');
@@ -249,7 +311,11 @@ test('failed HTTP refresh retains selected project, run, failed step and expande
  assert.match(await page.locator('[data-ob-tests]').innerText(),/test_status/);
  assert.match(await page.locator('[aria-label="Step output"]').innerText(),/expected 200, got 500/);
  await page.unroute('**/api/v1/ci/summary*');await page.unroute('**/api/v1/ci/tests*');
- await page.locator('[data-ob-refresh]').click();
- await page.waitForFunction(()=>!document.querySelector('[data-ob-status]')?.textContent.includes('Summary refresh failed'));
+ const recovered=evidenceResponses(page);
+ await page.locator('[data-ob-refresh]').click();await recovered;await selectedReady(page);
+ assert.equal(await page.locator('[data-ob-summary]').innerText(),cards);
+ assert.equal(await disclosure.innerText(),chart);assert.equal(await disclosure.evaluate(n=>n.open),true);
+ assert.match(await page.locator('[data-ob-tests]').innerText(),/test_status/);
+ assert.equal(await page.locator('.ci-pipeline-step[data-step="12"]').getAttribute('aria-pressed'),'true');
  assert.equal(await page.locator('[data-ob-project]').getAttribute('aria-pressed'),'true');
 }));

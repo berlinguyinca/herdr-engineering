@@ -453,7 +453,8 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
     listScroll=window.scrollY;healthOriginKey=document.activeElement?.dataset.healthRun||healthOriginKey;testPage=0;testSearch='';comparisonKey='';cancelDetail();
     selected={id:entry.id,repository:record.repository,providerId:record.provider_repo_id || record.repository,number:record.run_number,providerUrl:JSON.parse(entry.id)[0]};
     pipeline=selected.providerUrl?record:{...record,can_retry:false,can_cancel:false};debugSessions=null;debugSessionId='';debugMessage='';debugOperationId='';fixOperationId='';fix=null;fixMessage='';sandboxOperationId='';fixTerminal=null;fixTerminalError='';step='';log=null;logError='';detailError='';actionMessage='';detailSignature='';related=null;relatedFailed=false;
-    draw();refreshDetail();refreshRelated();focusInspector();
+    // Start lazy I/O before rendering the synchronized run/health views.
+    refreshDetail();refreshRelated();draw();focusInspector();
   }
   container.addEventListener('click',async event=>{
     if(disposed)return;

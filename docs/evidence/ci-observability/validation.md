@@ -1,7 +1,9 @@
 # CI command-center verification — 2026-10-25
 
-Scope: Task 6 against implementation through `2f64317`. Local deterministic
-fixtures only; no live-provider, configuration, credential, or timer changes.
+Scope: Task 6 and its focused selection/readiness follow-up from `575d740`.
+Local deterministic fixtures only; no live-provider, configuration, credential,
+dependency, or polling-interval changes. Original Task 6 results are preserved
+below as historical evidence; the follow-up results describe the current code.
 
 ## Method
 
@@ -16,8 +18,12 @@ The browser measures 20 sequential samples per operation. p95 uses nearest rank
 (`ceil(0.95 * n)`). HTTP summary measurements include complete body consumption;
 bytes are UTF-8 JSON body bytes, excluding headers. Render readiness measures
 reload through all 117 project buttons and two animation frames. Project selection
-ends when test history is visible; run selection ends when structured diagnosis is
-visible. Neither interaction measurement includes a requested step log.
+awaits complete selected-project summary and test-history responses, populated KPI
+cards/charts/test history, no pending command-center requests or refresh errors,
+and two animation frames. Only then is the sample recorded and selection cleared.
+Clear also settles before the next sample. Run selection includes Runs/Failed
+navigation, the run click, structured diagnosis, and two animation frames. Neither
+interaction measurement includes a requested step log.
 
 Budgets: cached summary p95 < 2,000 ms; project/run selection p95 < 1,000 ms.
 The specification provides no separate numeric render or response-byte budget;
@@ -40,11 +46,72 @@ fixture URL, proving keyboard anchor navigation without accessing a live provide
   internal horizontal scrolling, desktop sticky inspector, no document overflow.
 - HTTP 503 summary/test refresh retains KPI cards, charts, disclosure, selected
   project/run/step, log and test evidence; status remains explicitly stale/partial.
-  Successful retry preserves the project selection.
+  Both outage and recovery await completed fleet-summary, project-summary and
+  test-history requests and all corresponding UI states; retry preserves selection
+  and retained evidence. Separately held project/test responses prove a fast sibling
+  cannot finish a selection measurement, and clearing a completed sample aborts no
+  selected-evidence requests.
 - Existing model/controller coverage verifies identity collisions, sparse samples,
   stale-response rejection, unavailable evidence, and shared context persistence.
 
-## Results
+## Follow-up results: completed-readiness measurements
+
+The focused 20-sample performance run passed with the original thresholds:
+
+| Measurement | p95 / size | Budget |
+| --- | ---: | ---: |
+| Summary HTTP | 218.32 ms | < 2,000 ms |
+| 117-project render readiness | 1114.23 ms | < 2,000 ms |
+| Completed project selection | 336.15 ms | < 1,000 ms |
+| Run selection with diagnosis and paint | 480.01 ms | < 1,000 ms |
+| Summary body | 74,876 bytes | Recorded only |
+
+Production changes reuse the existing fleet snapshot on project selection/clear,
+while manual refresh and polling still refresh fleet/project/test evidence.
+Project and pipeline I/O now start before synchronous view synchronization/rendering.
+Exact identity, generation/cancellation guards, lazy details, unavailable evidence,
+and retained stale snapshots remain in place.
+
+Verification commands and results:
+
+```sh
+# 347 passed, 0 failed
+node --test --test-concurrency=1 packages/herdr-web-client/*.test.js packages/herdr-web-components/ci-*.test.js packages/herdr-web-components/integrations.test.js
+# 3 passed: delayed summary, delayed tests, full outage/recovery
+node --test --test-concurrency=1 --test-name-pattern='delayed selected|failed HTTP refresh' tests/playwright/ci-insights.test.mjs
+# 1 passed; 20 samples per measurement, values above
+node --test --test-name-pattern='117-project summary' tests/playwright/ci-insights.test.mjs
+```
+
+The fleet-request regression first failed (two fleet requests instead of one),
+then passed. A temporary mutation restoring test-history-only readiness made the
+delayed-summary regression fail; the mutation file was removed. Syntax checks for
+all four modified JS files and `git diff --check` passed. LSP diagnostics returned
+zero diagnostics but explicitly skipped tsc because no tsconfig exists; no
+build/lint/typecheck script is defined. Backend files were unchanged and the
+historical backend suite was not rerun for this follow-up.
+
+Browser request counts in the completed performance run: history 27, summary 50,
+performance 27, reports 27, tests 25, pipeline 23, fix 1, log 0. The separate
+summary HTTP sample count was 20. Polls are included. Summary/project selection
+still caused no eager pipeline or log request.
+
+**Remaining verification caveat:** the first complete browser-suite run was
+14 passed / 1 failed: the performance case timed out waiting for 117 project
+buttons during reload, before selection measurements. This timeout was not
+reproduced in the instrumented focused performance run above; its cause remains
+unresolved. Failure diagnostics now include browser errors, failed requests,
+HTTP error responses, project count and visible status. A subsequent full-suite
+run was stopped at the user's request to finish (six scenarios had passed; the
+performance scenario was still running). There is no claim of a fully green
+final browser suite or a fixed reload flake. No timeout, budget, or retry policy
+was relaxed, and no live service/configuration was touched.
+
+Local evidence: `/tmp/task6-fix-components.log`, `/tmp/task6-fix-readiness.log`,
+`/tmp/task6-fix-mutation.log`, `/tmp/task6-fix-browser.log`,
+`/tmp/task6-fix-reload-diagnostic.log`, `/tmp/task6-fix-browser-final.log`.
+
+## Original Task 6 results
 
 Environment: Node v22.23.3, Python 3.12.3, pytest 9.0.3, local headless Chromium.
 
@@ -90,7 +157,7 @@ Limits: Chromium only; no live provider or production network measurement. The
 logs and screenshots remain untracked outside the evidence document.
 
 
-## Final performance evidence and unresolved gate
+## Original Task 6 performance evidence and unresolved gate
 
 **Test health: NEEDS ATTENTION.** The final complete browser run failed the project
 selection p95 assertion. The same sample set also measured run selection over its

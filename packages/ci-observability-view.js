@@ -110,10 +110,13 @@ export function mountCiObservability(host,client,{repository='',provider='',miss
     }catch(reason){if(!disposed&&version===generation)reject(reason);}
     finally{clearTimeout(timeout);if(pending.get(key)===controller)pending.delete(key);if(!disposed&&version===generation)draw();}
   }
-  async function refresh() {
-    if(disposed||doc.hidden||unsupported)return;
+  async function refresh({selectionOnly=false}={}) {
+    if(disposed||doc.hidden||unsupported){draw();return;}
     clearTimeout(timer);const version=generation;
-    const jobs=[request('summary',signal=>client.getCiSummary({...filters,signal}),data=>{if(!Array.isArray(data?.projects)||!data.kpis)throw Error('Invalid summary');summary=data;error='';},()=>{error=summary?'Summary refresh failed. Showing the last received snapshot (stale).':'CI summary unavailable.';})];
+    // Selection changes do not change the fleet scope. Poll/manual refresh still
+    // refresh all three resources; a missing fleet snapshot must also be fetched.
+    const jobs=[];
+    if(!selectionOnly||!summary)jobs.push(request('summary',signal=>client.getCiSummary({...filters,signal}),data=>{if(!Array.isArray(data?.projects)||!data.kpis)throw Error('Invalid summary');summary=data;error='';},()=>{error=summary?'Summary refresh failed. Showing the last received snapshot (stale).':'CI summary unavailable.';}));
     if(project){
       const context={...filters,repository:project.repository,provider_url:project.provider_url,provider_repo_id:project.provider_repo_id};
       jobs.push(request('project',signal=>client.getCiSummary({...context,signal}),data=>{if(!Array.isArray(data?.charts)||!data.kpis)throw Error('Invalid project summary');detail=data;detailError='';projectCharts.set(ciProjectKey(project),rows(data.charts));},()=>{detailError=detail?'Project refresh failed. Retained charts are stale.':'Project charts unavailable.';}));
@@ -127,7 +130,7 @@ export function mountCiObservability(host,client,{repository='',provider='',miss
     detail=null;tests=null;detailError='';testsError='';
     if(all){summary=null;error='';projectCharts.clear();}
   }
-  function selectProject(next) {invalidate();project=next;notify();draw();refresh();}
+  function selectProject(next) {invalidate();project=next;refresh({selectionOnly:true});notify();}
   host.addEventListener('click',event=>{
     const button=event.target.closest('button');if(!button||!host.contains(button))return;
     if(button.hasAttribute('data-ob-refresh'))refresh();
@@ -151,10 +154,11 @@ export function mountCiObservability(host,client,{repository='',provider='',miss
       const updated={...filters,...Object.fromEntries(['days','scope','branch','repository'].filter(key=>next[key]!==undefined).map(key=>[key,next[key]]))};
       const nextProject=next.project===undefined?project:next.project;
       const changed=JSON.stringify(updated)!==JSON.stringify(filters)||(nextProject?ciProjectKey(nextProject):'')!==(project?ciProjectKey(project):'');
-      if(changed){invalidate({all:JSON.stringify(updated)!==JSON.stringify(filters)});filters=updated;project=nextProject;}
+      const scopeChanged=JSON.stringify(updated)!==JSON.stringify(filters);
+      if(changed){invalidate({all:scopeChanged});filters=updated;project=nextProject;}
       for(const key of ['search','failuresOnly','sort'])if(next[key]!==undefined)view[key]=next[key];
       syncControls();save();
-      draw();if(changed)refresh();
+      if(changed)refresh({selectionOnly:!scopeChanged});else draw();
     },
     dispose(){disposed=true;generation++;clearTimeout(timer);for(const request of pending.values())request.abort();pending.clear();listeners.abort();}
   };

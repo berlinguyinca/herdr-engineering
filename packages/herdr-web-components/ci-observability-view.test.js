@@ -72,6 +72,12 @@ test('command center loads selected evidence lazily, rejects stale responses and
   await page.waitForFunction(()=>document.querySelector('[data-ob-tests]').textContent.includes('broken'));
   assert.equal(await page.evaluate(()=>calls.find(c=>c[0]==='tests')[1].provider_repo_id),'18');
   assert.equal(await page.evaluate(()=>context.project.provider_repo_id),'18');
+  assert.equal(await page.evaluate(()=>calls.filter(([kind,options])=>kind==='summary'&&!options.provider_repo_id).length),1,'selection reuses the fleet snapshot instead of blocking on an unchanged fleet request');
+  await page.locator('[data-ob-clear]').click();
+  assert.equal(await page.locator('[data-ob-summary] .ci-ob-card').count(),5,'clear restores the existing fleet KPIs');
+  assert.equal(await page.evaluate(()=>calls.filter(([kind,options])=>kind==='summary'&&!options.provider_repo_id).length),1,'clear does not refetch the unchanged fleet scope');
+  await page.locator('[data-ob-project]').nth(1).click();
+  await page.waitForFunction(()=>document.querySelector('[data-ob-tests]').textContent.includes('broken'));
   const details=page.locator('[data-ob-charts] details');await details.locator('summary').click();
   await page.locator('[data-ob-project]').nth(1).focus();
   await page.evaluate(async()=>{fail=true;await view.refresh();});
