@@ -451,3 +451,36 @@ def test_peer_edge_predicate():
     assert GraphProjection._peer_edge(E("task:t", "task:u", "peer:a:" + "ab" * 6))
     assert GraphProjection._peer_edge(E("task:t", "task:u", None, ["peer:a:" + "ab" * 6]))
     assert not GraphProjection._peer_edge(E("task:t", "task:u", "key:k", ["key:k"]))
+
+
+# ===================================================================== review findings (PR #269)
+def test_a_peer_cannot_store_a_row_under_a_local_stream(w):
+    body = w.body("node.upsert", {"node_type": "peer", "node_id": "peer:acme.t", "label": "x"},
+                  entity_id="mission:local-1")
+    body["entity_id"] = "mission:local-1"
+    refused(w.svc.ingest, body, PEER)
+    assert w.repo.stream("lineage", "mission:local-1") == []
+    body["entity_id"] = "peer:acme.t"
+    w.svc.ingest(body, PEER)                                               # control: same event, own stream
+
+
+def test_peer_evidence_refs_and_causation_are_claims_not_local_references(w):
+    w.node("peer:acme.t", evidence_refs=[{"kind": "artifact", "uri": "artifact://local/secret"}],
+           causation_id="local-event", correlation_id="local-flow")
+    ev, meta = stored_meta(w, "peer:acme.t")
+    assert not ev.get("evidence_refs") and ev.get("causation_id") is None and ev.get("correlation_id") is None
+    assert meta["claimed_evidence_refs"][0]["uri"] == "artifact://local/secret"
+    assert meta["claimed_ids"]["causation_id"] == "local-event"
+
+
+def test_a_peer_removed_in_yaml_mid_request_does_not_land(w):
+    reads = {"n": 0}
+
+    def source():
+        reads["n"] += 1
+        return cfg() if reads["n"] <= 2 else {"enabled": True, "peers": {}}      # clamp + scope check, then gone
+    w.svc.peer_source = source
+    refused(w.node, "peer:acme.t")
+    assert w.repo.stream("lineage", "peer:acme.t") == []
+    w.svc.peer_source = lambda: cfg()                                             # control: still configured
+    w.node("peer:acme.t")

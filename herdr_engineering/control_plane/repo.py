@@ -1783,7 +1783,7 @@ class ControlPlaneRepo:
                 if env.get("claimed_actor") is not None:
                     meta["claimed_actor"] = _bounded_claim(env["claimed_actor"])
                 # a clamped (peer) principal's claims: evidence of what the sender said, never read as authority
-                for name in ("claimed_origin", "claimed_visibility_scope", "claimed_ids"):
+                for name in ("claimed_origin", "claimed_visibility_scope", "claimed_ids", "claimed_evidence_refs"):
                     if env.get(name) is not None:
                         meta[name] = _bounded_claim(env[name])
                 ev["payload"] = {**ev["payload"], "_envelope": meta}

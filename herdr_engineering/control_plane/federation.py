@@ -47,7 +47,8 @@ _MAX_CLAIM = 512
 # asks for ``org`` is narrowed, one that asks for ``private`` lands in the mirror room as the ADR requires.
 CLAMP_SCOPES = {PEER_KIND: "room"}
 # the sender-claimed local ids a clamped event may not carry into the local namespace
-_LOCAL_ID_FIELDS = ("org_id", "project_id", "workspace_id", "mission_id", "task_id", "agent_id")
+_LOCAL_ID_FIELDS = ("org_id", "project_id", "workspace_id", "mission_id", "task_id", "agent_id",
+                    "correlation_id", "causation_id")
 
 
 class FederationConfigError(ValueError):
@@ -141,7 +142,8 @@ def apply_clamp(env: dict, body: dict, clamp: Clamp) -> dict:
 
     * ``visibility_scope`` becomes ``clamp.scope`` whatever was asked; the ask is kept as ``claimed_visibility_scope``;
     * ``room_id`` becomes ``clamp.room_id``; the sender's room and every other sender-chosen local id
-      (org/project/workspace/mission/task/agent) is dropped to ``claimed_ids`` and the envelope carries None;
+      (org/project/workspace/mission/task/agent, correlation/causation) is dropped to ``claimed_ids`` and the envelope carries None;
+    * ``evidence_refs`` moves to ``claimed_evidence_refs``;
     * the origin block is kept as ``claimed_origin``.
     """
     env["claimed_visibility_scope"] = body.get("visibility_scope") if isinstance(body.get("visibility_scope"), str) else None
@@ -149,6 +151,8 @@ def apply_clamp(env: dict, body: dict, clamp: Clamp) -> dict:
     env["claimed_ids"] = {k: env.get(k) for k in ("room_id", *_LOCAL_ID_FIELDS) if env.get(k) is not None}
     for k in _LOCAL_ID_FIELDS:
         env[k] = None
+    # evidence references name the SENDER's artifacts; a mirrored event must not point at a local one
+    env["claimed_evidence_refs"], env["evidence_refs"] = env.get("evidence_refs"), None
     env["room_id"] = clamp.room_id
     env["claimed_origin"] = origin_claim(body)
     env["clamp"] = clamp.kind

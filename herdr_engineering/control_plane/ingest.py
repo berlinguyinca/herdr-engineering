@@ -118,17 +118,18 @@ class IngestService:
             raise deny
         return clamp_for_principal(principal, bind_room_id=policy.mirror_room)
 
-    def _check_peer_namespace(self, env: dict, event_type: str, payload: dict) -> None:
+    def _check_peer_namespace(self, env: dict, event_type: str, payload: dict, entity_id=None) -> None:
         """The reserved ``peer:<peer>.`` node namespace (Decision 7). Unconditional: it holds for EVERY actor kind
         (an operator, the HCN service and an open listener included), whether or not a collab service is wired.
         Nobody local may write, attach to or edge into it; a peer may write ONLY inside its own namespace, on
-        EVERY endpoint, so a mirrored edge can never touch a local node."""
+        EVERY endpoint, so a mirrored edge can never touch a local node, and its ``entity_id`` (the stream the row
+        is stored under) must lie inside it too."""
         actor = env.get("actor") or {}
         ends = ((payload.get("from_id"), payload.get("to_id")) if event_type.startswith("edge.")
                 else (payload.get("node_id"),))
         found = peer_of(actor)
         if is_peer_actor(actor):
-            if found is None or not all(in_peer_namespace(e, found[0]) for e in ends):
+            if found is None or not all(in_peer_namespace(e, found[0]) for e in (*ends, entity_id)):
                 raise PermissionError("not permitted to modify this lineage object")
         elif any(is_peer_node(e) for e in ends):
             raise PermissionError("not permitted to modify this lineage object")
@@ -231,10 +232,15 @@ class IngestService:
             raise ValueError("event type is reserved for the server")
         clamp = self._peer_clamp(principal, entity_type)
         env = normalize_envelope(body, principal, self.repo._stamp(), clamp=clamp)
+        if clamp is not None:
+            # a peer removed or re-keyed in YAML while its request is in flight must not land: re-read the hot
+            # policy under the ledger lock, immediately before admission (the T10 `valid` hook)
+            outer = valid
+            valid = lambda: (outer is None or outer()) and self._peer_policy(principal) is not None  # noqa: E731
         if env is None and entity_type == "lineage":
             raise ValueError("lineage events require schema_version 2")
         if env is not None and entity_type == "lineage":
-            self._check_peer_namespace(env, event_type, payload)
+            self._check_peer_namespace(env, event_type, payload, entity_id)
             self._check_lineage_scope(env)
             self._check_reserved_nodes(env, event_type, payload)
         if env is None:
