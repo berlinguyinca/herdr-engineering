@@ -5,6 +5,47 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### T16 security fixes, Herdr side (stacked on the T16 release-gate branch)
+- Ingest is an allow-list of entity types; `collab`, `ci_*` and other adapter-owned streams and the server's session receipts can no longer be forged
+  by an ingest key (H1, M1, M5). Foreign `collab` rows already in a database are quarantined at startup, and a corrupt collab log disables collaboration
+  alone with an ERROR instead of stopping the control plane.
+- A full collab log still revokes: creating a revocable thing pre-pays its revocation (cannot be drained by create/revoke cycles or presence flips); chat stops at 90 %, other writes at 95 %, revocations may use 100 % (H2).
+- `collab-repair` (dry run by default) sets aside foreign `collab` rows without deleting; a corrupt log disables collaboration only and shows in `/api/v1/health` (H1).
+- `replay_history: since_join` now also covers node/edge/listing reads and the insights/progress snapshots (M2, L2).
+- All collab feature switches (`steering`, `contextual`, `insights`, `delegation_enabled`, `replay_history`) are hot and fail closed the same way,
+  including under `--collab-only` (M3, M15). One consistency test enumerates them.
+- `/api/v1/ingest/sources` is operator-only for other principals' sources (M4); gap state is partitioned per key (M6); trusted evidence writers are
+  selected before the contribution cap (M7); the quorum route hides a head the reader cannot read (M9); the generic rate limiter keys clients behind a
+  proxy by their forwarded address (M12); an open listener is no operator in a reserved namespace (L1).
+- Test: the graph neighbourhood budget test counts rendered nodes instead of timing a wall clock.
+- Ingest sequence-conflict 409 now says `reason: "sequence_conflict"` and `last_sequence` (the caller's own source only) so a restarted emitter can resume (Pi H6).
+- Round 4: the revocation reserve counts every unrevoked join token and every member including expired guests (revoking those emits an event); repair/server
+  locking works on filesystems without `flock` (lock-file fallback, never a startup crash), re-checks the inode after locking, and refuses when no lock can be proven;
+  repair on a pre-0003 database says to migrate first; degraded operator reads answer 503.
+- Round 3: safety events are idempotent (a repeated `revoke_agent`/`external_leave`/user decision commits nothing, so they cannot fill the log); the
+  revocation reserve is recomputed from state; `collab-repair --apply` works on a real PostgreSQL (tid binding fixed, tested against a throwaway
+  server), refuses to rewrite a log a live server holds, reports a gap tail it cannot fix by default, and also quarantines rows whose
+  timestamps disagree; unauthenticated callers cannot see that collaboration is degraded; a shared-mission event written from another room is shown
+  to the reader after their join.
+- Round 5 (after merging main): main's panic switch, helper cancel and host Remove work on a nearly full log (`helpers_paused`, `helper_cancelled`,
+  `egress_removed` are safety events; helper requests, host approvals/promotions and owner-listed hosts pre-pay their revocation); a degraded start
+  writes nothing into the fabric graph and keeps unknown agent namespaces reserved; ingest still accepts the system-graph adapter's
+  `repository`/`request`/`span` and refuses the review-gate prefixes; the `.lock` fallback records `host pid` (another host's lock is live, our own
+  pid is stale, so a container restarting as PID 1 starts; caveat: a recreated container gets a new hostname, so its predecessor's lock must be
+  removed by hand); `collab-repair` keeps the log's owner and mode. The since_join id map is capped at 1,000,000 ids (oldest evicted first, an
+  evicted id is pre-join: fail closed), see docs/contracts/lineage-events.md.
+- No migration, no environment variable. Rollback: revert the PR.
+
+### T16 end-to-end acceptance harness
+- New `tests/e2e` suite (scenarios S1-S7) driven by `scripts/run_acceptance.py` against real servers, a real Postgres and a fake `gh`.
+  It is opt-in: plain `pytest` and `scripts/validate.sh` deselect everything marked `e2e`; the runner passes `-m e2e`.
+  Local overrides (autospec binary, Pi checkout, Postgres bin dir) go in the git-ignored `tests/e2e/acceptance.local.yaml`; no environment variables.
+- The runner's verdict guards reject non-strict or bare `xfail`, and report "nothing selected on the herdr side" (pytest exit 5)
+  instead of a failure when `--only` picks Pi-only scenarios.
+- Redaction: `author`, `authors`, `author_login` and `author_name` keys are no longer redacted by name (review quorum compares the
+  author login, and a redacted value let an author approve their own PR). The `sk-` pattern now also matches after an ANSI colour
+  code or `%3D` and keeps ids such as `task-sk-ab` intact.
+
 ### Attention inbox, evidence-based progress and optimization analytics (T15, stacked on #174, #173, #168, #169)
 - New read routes `GET /rooms/{id}/attention|progress|analytics` and `POST /rooms/{id}/attention/ack|snooze|restore`, plus Attention and Progress
   tabs. Everything is derived from what the reader can see in the room graph, review quorum (T06), steering/promotion (T12/T13), proposals (T11),

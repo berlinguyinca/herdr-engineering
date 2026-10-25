@@ -1,0 +1,23 @@
+# Expected suites of the T16 acceptance run (scripts/run-acceptance.sh). A file that runs fewer tests than min_tests,
+# zero tests, exceeds max_xfail, or is not listed here fails the run. min_tests counts passed + xfailed.
+# max_xfail / max_gap: strict xfails (Herdr) / tests named `GAP:` (Pi) that document a known product gap; a failing test cannot be
+# renamed GAP without this cap rising in a reviewed diff. Old comment: strict xfails that document a known product gap (see docs/operations/acceptance-evidence.md).
+herdr:
+  tests/e2e/test_smoke_harness.py: {scenario: harness, min_tests: 2}
+  tests/e2e/test_runner_guards.py: {scenario: harness, min_tests: 4}
+  tests/e2e/test_s2_quorum.py: {scenario: s2, min_tests: 19}
+  tests/e2e/test_s3_room_graph.py: {scenario: s3, min_tests: 8}
+  tests/e2e/test_s4_external.py: {scenario: s4, min_tests: 14, max_xfail: 4}
+  tests/e2e/test_s5_steering_forks.py: {scenario: s5, min_tests: 14, max_xfail: 1}
+  tests/e2e/test_s6_chaos.py: {scenario: s6, min_tests: 27}
+  tests/e2e/test_s7_integrity.py: {scenario: s7, min_tests: 23}
+pi:
+  test/e2e/smoke-plane.e2e.test.ts: {scenario: harness, min_tests: 2}
+  test/e2e/s1-standalone-mission.e2e.test.ts: {scenario: s1, min_tests: 16, max_gap: 2}
+  test/e2e/s2-autospec-mission.e2e.test.ts: {scenario: s2, min_tests: 20, max_gap: 5}
+  test/e2e/s3-room-two-workspaces.e2e.test.ts: {scenario: s3, min_tests: 13, max_gap: 1}
+  test/e2e/s4-external-bridge.e2e.test.ts: {scenario: s4, min_tests: 2, max_gap: 1}
+  test/e2e/s5-fork-compare-promote.e2e.test.ts: {scenario: s5, min_tests: 19, max_gap: 3}
+  test/e2e/s6-outbox-chaos.e2e.test.ts: {scenario: s6, min_tests: 6}
+  test/e2e/s6-stale-lease.e2e.test.ts: {scenario: s6, min_tests: 5}
+  test/e2e/s7-cross-repo.e2e.test.ts: {scenario: s7, min_tests: 6, max_gap: 2}

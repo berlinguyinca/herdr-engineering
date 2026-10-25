@@ -209,7 +209,9 @@ vector file `tests/control_plane/fixtures/review-quorum-vectors.json` (byte-iden
    for a head not yet observed waits until a trusted writer reports that head.
 8. Matching is ASCII-only, identical in autospec: whitespace is the six ASCII blanks, case folding touches only A-Z, ids and
    targets must be printable ASCII (`invalid_target` otherwise); no Unicode folding (Kelvin sign, dotted I, NBSP).
-   `rereview_needed` is computed from the approvals the CALLER can see only, so a hidden approval never shifts it.
+   `rereview_needed` is computed from the approvals the CALLER can see only, so a hidden approval never shifts it. (T16 L5: this holds
+   for the count, not at the transition into `satisfied`: a hidden approval that completes the quorum turns `rereview_needed` from 1 to 0 and the
+   status to `satisfied`, which discloses its existence the same way `has_hidden_reviews` does.)
 9. A mistaken verdict is retracted by its owner at the same head: `autospec review-quorum publish --retract` sends an
    `edge.remove` (same key, same edge) which Herdr honours only from the edge's owner.
 10. The decision is computed over ALL matching edges. A caller sees names only of reviewers whose edges it can see; it also gets
@@ -492,8 +494,8 @@ Every id, label, attribute and reason is escaped for text and attribute contexts
 ### Not in this task / limitations
 - Click-to-inspect terminal is NOT offered (needs `authorize_workspace`; the inspector says so). No comments, fork, steer or retry.
 - T05 (canonical GitHub issue/PR linking and reconciliation) is not built: issue/PR nodes and `issue_link` edges are drawn when an
-  emitter sends them, but no canonicalisation or reconciliation exists yet. T06's `review_quorum.py` is on a sibling branch and
-  is not on this stack; stale/head-change come only from the T02 projection's own flags.
+  emitter sends them, but no canonicalisation or reconciliation exists yet. T06's `review_quorum.py` is on this stack
+  (see "Head-bound review quorum"); stale/head-change come from the T02 projection's own flags.
 - Replay cost is the reader's visible prefix (see budgets); beyond 25,000 visible events a past position answers 400. A busy room needs
   the snapshot table mentioned above. Not load-tested at that size. No visual-regression suite exists; layout is checked by
   unit tests and a browser smoke run against a mocked API plus one real-HTTP pytest of the routes, not by screenshots.
@@ -788,7 +790,7 @@ start an agent in it; "invalidates stale reviews" is done by binding evidence to
 evidence stale at read time and blocks promotion) and no gate node is rewritten; promotion is unreachable until the
 operator lists `evidence_writers` and something writes `validated` edges for the fork head.
 
-Limitations: T06 review quorum is not on this stack (comparison reports `quorum: unavailable`); independent
+Limitations: the T06 review quorum is per pull request head and not per approach (comparison reports `quorum: unavailable`); independent
 evidence writers must be keys that can see room-scoped nodes, i.e. operator keys; an older Pi ignores the new actions
 and Herdr re-offers up to 5 times.
 
@@ -860,3 +862,88 @@ Estimates assume a steady pace and are weak for small rooms. Erasing evidence by
 must be keys an agent does not control. Room-scoped pull requests written by a key that cannot see the room, and organization-scope nodes, are outside the
 reader's view and so not counted. T13 fork comparison reports `quorum: unavailable` on purpose: the T06 quorum is decided per pull request head and an approach is not a pull request (its reason text now says so, and the page shows the same wording). No Pi change was needed:
 Pi's ledger and mission adapter already supply the nodes this reads. The client renderers are covered by node tests and a Playwright smoke test (`tests/playwright/attention.test.mjs`); the assembled collab page was not driven end to end.
+
+## T16 security hardening (Herdr side)
+Fixes for the T16 security audit. Each has a regression test in `tests/control_plane/test_t16_security.py`.
+
+* **Ingest is an allow-list (H1, M1, M5).** `POST /api/v1/ingest` accepts only `lineage`, `host`, `session`, `mission`, `service`,
+  `inspector`, `mission_activity` (each has a handler) and the plain activity types `task`, `note`, `workspace` and Pi's `ledger`, `platform`, `lifecycle` streams. Everything else
+  (`collab`, `ci_observation`, `ci_report`, `ci_telemetry`, `plannotator_review`, `agent_identity`, `token_usage`, ...) belongs to a dedicated
+  adapter and answers 400. The session receipts `SessionCommandQueued` / `SessionCommandSettled` are server-owned event names and also answer 400.
+  Adding a type to `INGEST_ENTITY_TYPES` is a security decision.
+* **Collab log startup (H1).** Only rows the collaboration service itself could have written are replayed: stream `collab/log`, no ingest
+  envelope, a payload with `org_id`, `correlation_id` and `created_at`, `source_timestamp == ingest_timestamp == payload.created_at` (the service
+  stamps all three from one clock reading; a forger copying the payload shape cannot reproduce the instant), and the first row at each sequence. Everything else (rows stored before the
+  allow-list, including v1-body forgeries that carry no envelope) is *quarantined*: kept in storage, logged at ERROR with its reason
+  (`foreign_stream`, `ingest_envelope`, `not_collab_schema`, `timestamp_mismatch`, `duplicate_sequence`), never replayed. A log that still fails the contiguity check, or
+  whose replay raises anything, does not stop the control plane (combined server and `--collab-only` alike): collaboration alone is switched off
+  (`CollabService.degraded`; a caller with a VALID token gets a generic 503, any bad or missing token the same 401 as always, so the state is not visible
+  to the unauthenticated; `GET /api/v1/health` shows `collab_degraded: true`, the reason is in the server log). A gap is NOT repaired automatically because dropping the tail could drop a revocation.
+  **Operator repair:** `herdr-engineering cp collab-repair [--log-file F | --fleet-config C]` prints what it would set aside (dry run by default).
+  `--apply --confirm-quarantine` moves the rows to `F.quarantine.jsonl` / table `fabric_events_quarantine` (every column kept, original log
+  backed up as `F.bak-<time>`), never deletes; `--include-gap-tail` also sets aside everything after the first missing sequence. The default dry
+  run reports `contiguous` and lists the rows only that flag would move under `gap_tail` (with the flag to use) instead of reporting nothing.
+  **File mode refuses to rewrite a log a server may still be appending to:** `FileEventLog` holds a shared `flock` for its whole life, the repair
+  needs it exclusively and also refuses when any other process has the file open (/proc scan, which finds servers older than the lock). Stop
+  the server, repair, start it. **Locking** (`logfile_lock.py`): both sides open the log read-write and re-check after locking that the path still names the locked file.
+  Where `flock` is unsupported (ENOLCK/ENOSYS/EOPNOTSUPP/EBADF on some NFS/FUSE mounts) a cooperative `<log>.lock` pid file takes over with an
+  ERROR log line; if even that cannot be created the server still starts (ERROR: not protected) and the repair refuses ("supports no lock").
+  **Postgres mode** locks the table against writers for one short transaction, plans inside it, and moves rows by
+  `ctid` bound as (block, offset) tuples; on a database without migration 0003 it stops with "run migrate first"; it is covered by a test against a real throwaway PostgreSQL (`test_t16_collab_repair_postgres.py`;
+  skipped only if no server binaries are installed). A forger who copied the payload shape AND the log's own sequence beyond its real end
+  is caught by the timestamp rule; the allow-list closes new cases.
+* **A full log still revokes (H2).** `max_log_events` is protected by *pre-paid revocation*. Creating something revocable (member, agent, agent
+  grant, join token, cross link, workspace link, mission link) is admitted only while `len(log) + outstanding + 2 <= 95 %`, where `outstanding`
+  is the number of things that can still emit a revocation event right now (members INCLUDING expired guests, grants, active agents, every
+  unrevoked join token INCLUDING used-up or expired ones, active cross links, workspace and mission links), recomputed from state so it can
+  never drift: a repeated revocation or a re-grant cannot over- or under-count it, and revoking a used-up token or removing an expired guest
+  was pre-paid; every other ordinary write needs `len(log) + outstanding + 1 <= 90 %` (chat, comments, audit noise,
+  presence) or `95 %` (the rest). So every revocation is an event its creation already reserved, and create-then-revoke cycles cannot consume
+  the reserve. `SAFETY_EVENTS` (member/agent/grant/join-token/cross-link/workspace/mission revocation, user decision) may use the log up to 100 %.
+  Self-triggerable or self-firing events are *not* safety events: credential rotation, cancelling a consultation/request/invite, steering
+  rejection, grant lapse, presence. Presence (`external_status_changed`) is logged only while the log is below the 90 % tier and otherwise stays in
+  memory. Costs: outstanding items shorten the room left for chat. Refused ordinary writes count in `stats.log_headroom_refused`. There is still no
+  compaction (a lifetime cap); raise `max_log_events` before it fills.
+* **A revocation is a state change, not a button (H2).** Every safety-event emitter checks that there is something left to revoke:
+  `revoke_agent`, `external_leave`, `revoke_external`, the join-token revokes, `remove_member`, `remove_agent_from_room`, unlinking and
+  `user_decided` answer idempotently (or 404/409) without committing a second event, so a safety event cannot be repeated to fill the log.
+* **Helpers and host access are covered too (round 5).** `helpers_paused` (a PAUSE; resuming is an ordinary write), `helper_cancelled` and
+  `egress_removed` are safety events; `helper_requested`, an approved `egress_decided`, `egress_promoted` and every new permanent host in
+  `room_profile_set` pre-pay their revocation (live helpers and distinct (room, host) entries are counted from state). A repeated pause or a
+  Remove of a host that is not listed commits nothing. If a helper's `helper_cancelled` row is refused, its agent is still revoked.
+* **Degraded means no side effects.** When the durable collab log fails its replay, the partial state (events before the gap) never drives a
+  write: the link flush/sweep, link (un)publishing and housekeeping do nothing, and any well-formed agent id the partial state does not know is
+  treated as an external agent's reserved namespace (an external agent enrolled after the gap stays protected).
+* **`since_join` applies to every read (M2, L2).** Node, edge, neighbourhood and listing reads and the insights snapshot hide the event id,
+  admission time and removal reason of any event admitted before the reader joined. The horizon of an event is the reader's join time in the room
+  that SCOPES that event (never the room the caller names in `room_id`); an event with no room, or written from a room the reader has no join time for (a mission shared with the reader's room), uses the reader's
+  latest join; no join time at all, an unknown or evicted event id, or an id shared with an earlier event is pre-join (fail closed). An
+  edge removed before the reader joined is dropped altogether (`include_removed` shows no endpoints or writer; the edge read answers 404).
+  **Memory cap.** The admission time per event id is kept in memory for the life of the process, at most `FIRST_TS_MAX` = 1,000,000 ids
+  (graph.py; roughly 150-250 MB at the cap). Past it the OLDEST ids are evicted first, and an evicted id is pre-join for every since_join reader:
+  the degradation is fail closed (old events lose their id, admission time and removal reason, and an old removed edge disappears, even for a
+  member who joined before them), never a leak of pre-join history. A restart rebuilds the map from the replayed ledger, under the same cap.
+* **Switches are uniform (M3, M15).** `steering`, `contextual`, `insights`, `delegation_enabled` and `replay_history` are all read per request through
+  `FleetConfigStore.secure_section`, also under `web --collab-only`. A missing, unparseable, group/other-accessible or invalid file means the feature
+  is OFF (`replay_history`: the stricter `since_join`). `config_failure_mode: last_good` is the one opt-in to the last good value. An explicit
+  `--collab-replay-history` flag wins over the file. An invalid block at startup is logged at ERROR (the switch is OFF) but is not a startup error.
+  Keys read ONCE at startup (restart required): `review_quorum`, `lineage_key_scopes`, `api_keys`, `ci_actions`, `pg_dsn`.
+* **A restarted emitter can resume (Pi H6).** A 409 for a sequence that already belongs to another event carries
+  `{"reason": "sequence_conflict", "last_sequence": N}`, N being the highest sequence accepted from the CALLER's own `(principal, source)` domain
+  (omitted when nothing is remembered). It never reveals another key's or source's state; other 409s keep `reason: "conflict"`. The fallback
+  `GET /api/v1/ingest/sources` keeps working for a source's own key (non-operator keys list only their own sources).
+* **`/api/v1/ingest/sources` (M4)** lists every emitter only to operator-role keys; other keys see only their own `(actor, source)` domains.
+  `?scope=all` is the explicit full listing (operator-role keys only, 403 otherwise); `?scope=own` narrows an operator to itself.
+* **Gap/freshness state is per principal (M6).** At most 32 sequence domains per key (the key evicts its own stalest); when the global 1024 is
+  reached the principal holding the most domains pays.
+* **Trusted evidence survives the contribution cap (M7).** Insight and fork reads name the configured `evidence_writers` (and the room's own service
+  principal); their latest visible values are selected before `MAX_CONTRIBUTIONS` is applied, so spam writers cannot push them out.
+* **The quorum route hides a head the reader cannot read (M9).** The decision still uses the real head; `head` is `null` and `head_hidden: true`
+  for a reader who may not see the field.
+* **Rate limiter identity (M12).** Every route uses the same client identity (`X-Forwarded-For` honoured only from a loopback/proxy peer).
+* **L1:** an open listener is not an operator inside a reserved (external agent) namespace.
+
+Not fixed here: a per-API-key ingest limiter (M12's second half); compaction/snapshotting of the collab log and a per-room budget (H2 ships
+pre-paid revocation only); the ids are
+remembered up to `FIRST_TS_MAX`, an evicted id is stripped; L3 (accepted), L4, L6-L9, L13 (a longer principal id would break configured key ids), L14.
+

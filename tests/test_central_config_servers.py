@@ -183,6 +183,7 @@ def test_web_reads_everything_from_the_fleet_file_and_ignores_env(tmp_path, monk
     assert seen["repo"]._host_aliases == {"x": "y"}
     assert seen["repo"].inspector.limits["max_sessions"] == 9
     assert seen["server_kw"]["ci_actions"] is True
+    assert seen["server_kw"]["github_pg_dsn"] == cp["pg_dsn"]  # the GitHub catalog persists there
 
 
 def test_web_reads_usage_retention_from_llm_proxy_section(tmp_path, monkeypatch, old_env, capsys):
@@ -212,6 +213,7 @@ def test_web_refuses_invalid_ci_fix(tmp_path, monkeypatch, old_env, capsys):
 def test_web_without_file_has_no_durable_config_even_with_env(tmp_path, monkeypatch, old_env, capsys):
     seen = _run_web(monkeypatch, tmp_path / "missing.yaml")
     assert "sink_dsn" not in seen and seen["self_report"]["dsn"] is None
+    assert seen["server_kw"]["github_pg_dsn"] is None  # the GitHub catalog stays in memory
     assert seen["self_report"]["rustfs_endpoint"] is None
     assert seen["self_report"]["host_id"] != "env-self"
     assert seen["server_kw"]["ci_actions"] is False
