@@ -117,3 +117,27 @@ test('GitHub and Services: a first load does not flash',async()=>withPage(async(
  await page.clock.runFor(31000);await sleep(50);
  assert.deepEqual(await flashes(page),[]);
 }));
+
+// Positive control for the guards above: with the same recorder and calm off, a data-driven count
+// change after the first load DOES flash. Without this, "no flash" could mean the recorder is blind.
+test('control: a data-driven count change after load is recorded as a flash',async()=>withPage(async(page,base)=>{
+ const s={sessions:[{session_id:'s1',agent_role:'One',status:'working',host_id:'beast',updated_at:T0}]};
+ await recordFlashes(page);
+ await boot(page,base,'/topology',p=>{
+  if(p==='/api/v1/sessions')return {sessions:structuredClone(s.sessions)};
+  if(p==='/api/v1/hosts')return {hosts:[]};
+  if(p==='/api/v1/services')return {services:[]};
+  if(p==='/api/v1/missions')return {missions:[]};
+  if(p==='/api/v1/mission-activity')return {activities:[]};
+  if(p==='/api/v1/ci')return {available:true,pipelines:{}};
+  return {};
+ });
+ await until(()=>page.locator('[data-tab-count="current"]').textContent().then(t=>t==='1'),'one record');
+ await page.clock.runFor(5500);await sleep(50);
+ assert.deepEqual(await flashes(page),[],'settled first load: nothing yet');
+ s.sessions.push({session_id:'s2',agent_role:'Two',status:'working',host_id:'beast',updated_at:T0});
+ await page.clock.runFor(5500);
+ await until(()=>page.locator('[data-tab-count="current"]').textContent().then(t=>t==='2'),'two records');
+ await page.clock.runFor(400);await sleep(50);
+ assert.ok((await flashes(page)).length>0,'the recorder sees a real data-driven flash');
+}));

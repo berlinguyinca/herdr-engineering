@@ -142,7 +142,7 @@ export function renderOverviewSection(section, data = {}, states = {}, received 
   const model = overviewModel(data,received,now);
   if (section === 'attention') {
     const mode=states.attention===undefined ? 'browser' : states.attention.error ? 'fallback' : states.attention.loaded && data.attention ? 'server' : states.attention.disabled ? 'browser' : states.attention.loaded ? 'browser' : 'loading';
-    if(mode==='loading')return `<div class="ov-heading"><h2 tabindex="-1">Attention</h2></div><p class="ov-note" role="status">Loading attention…</p>`;
+    if(mode==='loading')return `<div class="ov-heading"><h2 tabindex="-1">Attention</h2></div><div class="hd-skeleton ov-skeleton" role="status" aria-label="Loading attention"></div>`;
     const attention=mode==='server' ? serverAttention(data.attention,now) : overviewAttention(data,states,received,now),expanded=data.attentionExpanded===true,limit=6;
     const visible=expanded?attention.items:attention.items.slice(0,limit);
     return `<div class="ov-heading"><h2 tabindex="-1">Attention</h2><span class="ov-tag">${attention.items.length ? `${attention.items.length}${attention.complete?'':'+'}` : attention.complete?'0':'—'} ${attention.server?'open':'observed'} items</span></div>
@@ -150,7 +150,7 @@ export function renderOverviewSection(section, data = {}, states = {}, received 
       ${attention.server ? `<p class="ov-note">${link('#/attention','Open the Attention page →')}${attention.acknowledged || attention.snoozed ? ` · ${attention.acknowledged} acknowledged, ${attention.snoozed} snoozed` : ''}</p>` : ''}
       ${!attention.complete ? `<p class="ov-warning" role="status">Partial coverage: ${esc(attention.unavailable.map(key=>CARD_LABELS[key] || {projections:'Live missions',health:'Control plane'}[key] || key).join(', '))}. Loading, unavailable, or stale sources may contain more items; retained reports remain visible.</p>` : ''}
       ${attention.items.length>limit ? `<div class="ov-attention-controls"><span class="ov-note">Showing ${visible.length} of ${attention.items.length} observed items</span><button type="button" data-attention-toggle aria-expanded="${expanded}" aria-controls="ov-attention-items">${expanded?'Show fewer':`Show all ${attention.items.length}`}</button></div>` : ''}
-      ${attention.items.length ? `<ul id="ov-attention-items" class="ov-list ov-attention-list${expanded?' is-expanded':''}" aria-label="Attention items"${expanded?' tabindex="0"':''}>${visible.map(item=>`<li class="ov-row" data-attention-key="${esc(item.key)}"><div>${link(item.href,item.title)}<p>${esc(item.detail)}</p></div><span class="ov-tag ov-alert">${esc(item.severity)}${item.updated?`<br>${ageMarkup(new Date(item.updated).toISOString(),now)}`:''}</span></li>`).join('')}</ul>` : empty(attention.complete?'No attention items in the received reports.':'Attention is not yet fully known.')}`;
+      ${attention.items.length ? `<ul id="ov-attention-items" class="ov-list ov-attention-list${expanded?' is-expanded':''}" aria-label="Attention items"${expanded?' tabindex="0"':''}>${visible.map(item=>`<li class="ov-row" data-attention-key="${esc(item.key)}"${attention.server?' data-attention-origin="server"':''}><div>${link(item.href,item.title)}<p>${esc(item.detail)}</p></div><span class="ov-tag ov-alert">${esc(item.severity)}${item.updated?`<br>${ageMarkup(new Date(item.updated).toISOString(),now)}`:''}</span></li>`).join('')}</ul>` : empty(attention.complete?'No attention items in the received reports.':'Attention is not yet fully known.')}`;
   }
   if (section === 'missions') {
     const m = model.missions;
@@ -288,11 +288,14 @@ export function mountOverview(container, client) {
   let shownCritical=null, loadedAtLastAttention=new Set();
   function markNewCritical(element) {
     const now=Date.now();
-    const critical=[...element.querySelectorAll('[data-attention-key]')].filter(row=>row.querySelector('.ov-alert')?.textContent.startsWith('critical')).map(row=>row.getAttribute('data-attention-key'));
+    const rows=[...element.querySelectorAll('[data-attention-key]')].filter(row=>row.querySelector('.ov-alert')?.textContent.startsWith('critical'));
+    const critical=rows.map(row=>row.getAttribute('data-attention-key'));
     // A critical item is "new" only when its source had already loaded at the previous render:
     // everything on first load, and items arriving with a source's first response, stay still.
-    if(shownCritical && !isCalm())for(const key of critical){
-      const source=ATTENTION_SOURCES[key.split(':')[0]];
+    // Server inbox items (any key shape) come from the attention source itself.
+    if(shownCritical && !isCalm())for(const row of rows){
+      const key=row.getAttribute('data-attention-key');
+      const source=row.hasAttribute('data-attention-origin') ? 'attention' : ATTENTION_SOURCES[key.split(':')[0]];
       if(!shownCritical.has(key) && loadedAtLastAttention.has(source))pulseUntil.set(key,now+PULSE_MS);
     }
     shownCritical=new Set(critical);
@@ -313,7 +316,9 @@ export function mountOverview(container, client) {
   let motionSettled=false, userChange=false;
   function draw() {
     if(disposed || document.hidden)return;
-    const settled=Object.keys(sources).every(key=>states[key]?.loaded);
+    // Settled = every source has answered once, with data or an error: a source that keeps failing
+    // must not hold the counters still for ever.
+    const settled=Object.keys(sources).every(key=>states[key]?.loaded || states[key]?.error);
     const live=settled&&motionSettled&&!userChange;
     motionSettled=settled;userChange=false;
     for(const panel of panels) {
