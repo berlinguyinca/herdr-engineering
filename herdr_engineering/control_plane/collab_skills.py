@@ -13,18 +13,18 @@ that mark, never the text. The mark is set only when:
   ``/skill:<name>`` with the name ``[a-z0-9][a-z0-9._-]{0,63}``, then nothing or whitespace and at most
   SKILL_ARGS_MAX characters of arguments.
 
-Each marked task or mention is also a ``skill_invoked`` room event (who, which agent, which skill and a short
-preview of the arguments). Delivery re-checks the switch, the harness and the reported list, so turning the
-switch off takes effect at once.
+Each marked task or mention is also a ``skill_invoked`` room event (who, which agent, which skill and metadata about
+the arguments). Argument content is never persisted in the audit event. Delivery re-checks the switch, the harness
+and the reported list, so turning the switch off takes effect at once.
 """
 from __future__ import annotations
 
+import hashlib
 import re
 from typing import Any
 
 SKILL_NAME = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}\Z")
 SKILL_ARGS_MAX = 2000
-PREVIEW_MAX = 80
 # the worker's rule (packages/collab-scripts.js): ONE leading "@<own name>" plus whitespace, only if text follows
 _LEADING = re.compile(r"@([A-Za-z0-9._-]{1,48})\s+(?=\S)")
 _INVOKE = re.compile(r"/skill:([^\s]*)(?:\s+(.*))?\Z", re.S)
@@ -103,8 +103,9 @@ class SkillsMixin:
         return {"name": stored} if call and call[0] == stored else None
 
     def _skill_audit(self, pr, room: dict, room_id: str, aid: str, call: tuple[str, str], **ref) -> None:
-        preview = call[1][:PREVIEW_MAX]
+        args = call[1].encode()
         self._commit("skill_invoked", self._actor(
-            pr, project_id=room["project_id"], room_id=room_id, agent_id=aid, skill=call[0], preview=preview,
+            pr, project_id=room["project_id"], room_id=room_id, agent_id=aid, skill=call[0],
+            args_bytes=len(args), args_sha256=hashlib.sha256(args).hexdigest(),
             by_kind=pr.kind, by_id=pr.id, **ref, visibility_scope="room", action="skill.invoke",
             outcome="allowed", project_ids=[room["project_id"]], resource_id=aid))

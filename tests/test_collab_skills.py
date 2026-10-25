@@ -7,9 +7,15 @@ agent work (the create_task / wake rules), the agent is a pi agent, it REPORTED 
 name is `[a-z0-9][a-z0-9._-]{0,63}` and the arguments are bounded. Text can never forge the mark."""
 from __future__ import annotations
 
+import hashlib
+
 import pytest
 
-from herdr_engineering.control_plane.collab_skills import SKILL_ARGS_MAX, normalize_skills, parse_skill
+from herdr_engineering.control_plane.collab_skills import (
+    SKILL_ARGS_MAX,
+    normalize_skills,
+    parse_skill,
+)
 from tests.control_plane.test_collab_tasks import USERS, W, code, svc  # noqa: F401
 
 
@@ -180,7 +186,7 @@ def test_a_mention_of_two_agents_marks_only_the_leading_one(w):
 
 # ---------------------------------------------------------------- audit and restart
 
-def test_each_invocation_is_a_room_event_with_a_bounded_preview(w):
+def test_each_invocation_is_a_room_event_without_argument_content(w):
     pi, aid = agent(w, "bob")
     long_args = "secret-ish " * 50
     tid = task(w, w.alice, aid, f"/skill:review {long_args}")
@@ -189,15 +195,22 @@ def test_each_invocation_is_a_room_event_with_a_bounded_preview(w):
     assert [(e["skill"]["name"], e["skill"]["agent_id"], e["skill"]["by"]["id"]) for e in evs] == [
         ("review", aid, "alice"), ("pdf-tools", aid, "bob")]
     assert evs[0]["skill"]["task_id"] == tid
-    assert len(evs[0]["skill"]["preview"]) <= 80 and evs[0]["skill"]["preview"].startswith("secret-ish")
-    assert evs[1]["skill"]["preview"] == "a.pdf"
+    assert "preview" not in evs[0]["skill"]
+    assert evs[0]["skill"]["args_bytes"] == len(long_args.strip().encode())
+    assert evs[0]["skill"]["args_sha256"] == hashlib.sha256(long_args.strip().encode()).hexdigest()
+    assert "secret-ish" not in str(evs[0])
+    assert evs[1]["skill"]["args_bytes"] == len(b"a.pdf")
+    assert evs[1]["skill"]["args_sha256"] == hashlib.sha256(b"a.pdf").hexdigest()
     # nothing is logged for an unmarked task
     task(w, w.alice, aid, "/skill:unknown x")
     assert len([e for e in w.s._log if e["event_type"] == "skill_invoked"]) == 2
 
 
 def test_the_mark_survives_a_restart(w):
-    from herdr_engineering.control_plane.collab import CollabService, StaticTokenAuthenticator  # noqa: PLC0415
+    from herdr_engineering.control_plane.collab import (  # noqa: PLC0415
+        CollabService,
+        StaticTokenAuthenticator,
+    )
     from tests.control_plane.test_collab import _digest  # noqa: PLC0415
     pi, aid = agent(w, "bob")
     tid = task(w, w.alice, aid, "/skill:review x")

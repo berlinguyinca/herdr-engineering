@@ -5046,8 +5046,9 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FilesMixin, Co
                 out.update(name=p.get("name"), old_name=p.get("old_name"), source=p.get("source"))
             elif t == "room_settings_set":         # who changed which room property, from what to what
                 out.update(settings=dict(p.get("settings") or {}), old=dict(p.get("old") or {}))
-            elif t == "skill_invoked":             # who ran which skill on which agent; a short preview only
-                out.update(skill={"name": p.get("skill"), "agent_id": p.get("agent_id"), "preview": p.get("preview"),
+            elif t == "skill_invoked":             # who ran which skill on which agent; arguments are content-free metadata
+                out.update(skill={"name": p.get("skill"), "agent_id": p.get("agent_id"),
+                                  "args_bytes": p.get("args_bytes"), "args_sha256": p.get("args_sha256"),
                                   "by": {"type": p.get("by_kind"), "id": p.get("by_id")},
                                   **({"task_id": p["task_id"]} if p.get("task_id") else {})})
             elif t.startswith("helper_"):             # ids, role and model: never the task text or result
