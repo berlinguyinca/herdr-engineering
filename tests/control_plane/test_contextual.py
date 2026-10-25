@@ -811,3 +811,12 @@ def test_a_rebuilt_projection_equals_the_live_one_including_links_and_threads(cx
     fresh = ControlPlaneRepo()
     fresh.import_state(json.loads(json.dumps(cx.repo.export_state(), default=str)))
     assert fresh.graph.snapshot() == live and not fresh.graph.events_rejected
+
+
+def test_an_active_cross_link_is_outstanding_until_it_is_revoked(cx):
+    """T16 H2: the revocation reserve counts active cross links."""
+    base = cx.s._recount()["xlink"]
+    lid = mk(cx)[1]["link"]["link_id"]
+    assert cx.s._recount()["xlink"] == base + 1
+    cx.s.revoke_link(cx.bob, cx.room, lid)
+    assert cx.s._recount()["xlink"] == base
