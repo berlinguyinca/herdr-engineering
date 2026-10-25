@@ -333,6 +333,20 @@ def test_ingest_endpoint_upserts_host(server):
     assert [e["event_type"] for e in evs] == ["HostRegistered"]
 
 
+def test_ingest_delivery_entities_via_http_preserves_counts(server):
+    c, repo = server
+    # A numeric ``passed`` count must survive ingest-body redaction (the key
+    # contains the substring ``pass``) so the HTTP path accepts a real report.
+    status, body = c.post("/api/v1/ingest", {
+        "entity_type": "test_run", "entity_id": "http-run-1",
+        "event_type": "test_run.started",
+        "payload": {"mission_id": "m1", "status": "failed",
+                    "passed": 5, "failed": 1, "skipped": 0, "total": 6}})
+    assert status == 200, body
+    runs = repo.list_test_runs(mission_id="m1")
+    assert len(runs) == 1 and runs[0]["passed"] == 5
+
+
 def test_ingest_endpoint_validates_body(server):
     c, _ = server
     status, body = c.post("/api/v1/ingest", {"entity_type": "host"})

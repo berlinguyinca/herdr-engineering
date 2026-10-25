@@ -108,8 +108,11 @@ def test_ingest_refuses_every_entity_type_that_is_not_on_the_allow_list(entity_t
 
 
 def test_the_allow_list_is_exactly_what_the_dispatcher_handles_plus_plain_activity_types():
+    # Delivery entities (issue #32) join the dispatched set; they are validated
+    # and stored, not silently recorded as plain activity.
     assert DISPATCHED_ENTITY_TYPES == {"lineage", "host", "session", "mission", "service", "inspector",
-                                       "mission_activity"}
+                                       "mission_activity", "test_run", "build", "review",
+                                       "review_finding", "pull_request"}
     assert INGEST_ENTITY_TYPES - DISPATCHED_ENTITY_TYPES == {"task", "note", "workspace", "ledger",
                                                                         "platform", "lifecycle",
                                                                         "repository", "request", "span"}

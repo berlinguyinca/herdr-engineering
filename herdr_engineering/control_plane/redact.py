@@ -207,9 +207,21 @@ HOST_STATE_VALUE_ONLY = ("versions", "pins", "updates", "fleet_update")
 
 
 def redact_ingest_body(body: Any) -> Any:
-    """Redaction for a generic ``/api/v1/ingest`` envelope (see ``HOST_STATE_VALUE_ONLY``)."""
-    if not (isinstance(body, dict) and body.get("entity_type") == "host"
-            and isinstance(body.get("payload"), dict)):
+    """Redaction for a generic ``/api/v1/ingest`` envelope.
+
+    Host-state envelopes keep their package/unit/extension dict KEYS intact
+    (their values are still scanned). Delivery envelopes (tests/builds/reviews/
+    pulls) go through the delivery-aware redactor so numeric count fields like
+    ``passed`` survive instead of being blanked because their name contains the
+    substring ``pass``; their string values are still scanned for secrets.
+    Everything else uses the global ``redact_payload``.
+    """
+    if not (isinstance(body, dict) and isinstance(body.get("payload"), dict)):
+        return redact_payload(body)
+    entity_type = body.get("entity_type")
+    if entity_type in ("test_run", "build", "review", "review_finding", "pull_request"):
+        return redact_delivery(body)
+    if entity_type != "host":
         return redact_payload(body)
     payload = body["payload"]
     rest = {k: v for k, v in body.items() if k != "payload"}
