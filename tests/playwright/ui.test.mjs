@@ -1570,6 +1570,8 @@ test('mission tests page lists builds and test runs read-only', async () => {
     assert.ok(text.includes('passed 2'), 'passed run count missing');
     assert.ok(text.includes('Build'), 'build row missing');
     assert.ok(text.includes('42s'), 'duration missing');
+    // A build with no recorded counts renders an explicit unknown, never 0.
+    assert.ok(text.includes('Counts unknown'), 'missing counts must show unknown');
     assert.ok(!text.includes('Failed to fetch') && !text.includes('too many requests'),
       'delivery page must not error');
     // No mutation affordances on a read-only page.

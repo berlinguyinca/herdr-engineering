@@ -359,6 +359,20 @@ def test_redact_delivery_redacts_a_shared_string_object_on_every_occurrence():
     assert "abcDEF123456" not in out["results"][0]["detail"]
 
 
+def test_redact_delivery_redacts_a_shared_container_on_every_occurrence():
+    from herdr_engineering.control_plane.redact import redact_delivery
+    # The same dict/list object reused in several places must be redacted on
+    # every occurrence: the sanitized copy is reused, never the original.
+    shared = {"detail": "sk-abcDEF123456"}
+    out = redact_delivery({"a": shared, "b": shared})
+    assert "abcDEF123456" not in out["a"]["detail"]
+    assert "abcDEF123456" not in out["b"]["detail"]
+    shared_list = ["sk-abcDEF123456"]
+    out2 = redact_delivery({"x": shared_list, "y": shared_list})
+    assert "abcDEF123456" not in out2["x"][0]
+    assert "abcDEF123456" not in out2["y"][0]
+
+
 def test_redact_does_not_eat_ids_that_merely_end_in_sk_dash_but_still_redacts_real_keys():
     assert redact_text("task-s6lease") == "task-s6lease"
     assert redact_text("disk-image-1 and risk-profile-high") == "disk-image-1 and risk-profile-high"

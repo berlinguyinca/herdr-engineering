@@ -439,7 +439,7 @@ function renderDeliveryRuns(runs) {
     const kind = run.isBuild ? 'Build' : 'Test run';
     return `<div class="hd-card" style="margin:8px 0">`
       + `<div class="hd-card__title">${kind} · <herdr-status stage="${esc(st.tone)}"></herdr-status> <span class="hd-card__sub">${esc(st.label)}</span></div>`
-      + (counts ? `<div class="hd-card__sub">${counts}</div>` : `<div class="hd-card__sub">Counts not recorded</div>`)
+      + (counts ? `<div class="hd-card__sub">${counts}</div>` : `<div class="hd-card__sub">Counts unknown</div>`)
       + `<div class="hd-card__sub">${duration ? `Duration ${esc(duration)}` : 'Duration not recorded'}${run.started_at ? ` · started ${esc(formatTimestamp(run.started_at))}` : ''}</div>`
       + `</div>`;
   }).join('');

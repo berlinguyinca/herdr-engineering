@@ -148,7 +148,7 @@ _DELIVERY_VALUE_KEYS = frozenset({
 })
 
 
-def redact_delivery(payload: Any, *, _seen=None) -> Any:
+def redact_delivery(payload: Any, *, _memo=None, _active=None) -> Any:
     """Redact a delivery record (tests/builds/reviews/pulls) for display.
 
     Numeric counts and structural fields survive; string values are scanned for
@@ -157,31 +157,46 @@ def redact_delivery(payload: Any, *, _seen=None) -> Any:
     Keys whose names hint at a secret (e.g. a ``token`` or ``api_key`` field)
     are redacted wholesale. Unlike ``redact_payload`` this never blanks the
     ``passed`` count key merely because it contains the substring ``pass``.
+
+    A memoized result is returned for a repeated container object (cycle
+    safety), so a shared dict/list never leaks a secret on a later occurrence:
+    the sanitized copy is reused, never the original.
     """
-    _seen = _seen if _seen is not None else set()
+    _memo = _memo if _memo is not None else {}
+    _active = _active if _active is not None else set()
     if isinstance(payload, str):
         # Redact every occurrence: the same string object may appear more than
         # once, and a shared string must never bypass scanning because a sibling
-        # occurrence was already visited. Cycle detection below tracks only
-        # containers.
+        # occurrence was already visited. Cycle safety is handled per-container.
         return redact_text(payload)
     if isinstance(payload, dict):
-        if id(payload) in _seen:
-            return payload
-        _seen.add(id(payload))
+        ident = id(payload)
+        if ident in _memo:
+            return _memo[ident]
+        if ident in _active:
+            return payload  # direct cycle; nothing to redact that isn't already
+        _active.add(ident)
         result = {}
         for key, value in payload.items():
             lk = str(key).lower()
             if any(s in lk for s in _SECRET_KEY_HINTS) and lk not in _DELIVERY_VALUE_KEYS:
                 result[key] = _REDACTED
             else:
-                result[key] = redact_delivery(value, _seen=_seen)
+                result[key] = redact_delivery(value, _memo=_memo, _active=_active)
+        _active.discard(ident)
+        _memo[ident] = result
         return result
     if isinstance(payload, (list, tuple)):
-        if id(payload) in _seen:
-            return payload
-        _seen.add(id(payload))
-        return type(payload)(redact_delivery(item, _seen=_seen) for item in payload)
+        ident = id(payload)
+        if ident in _memo:
+            return _memo[ident]
+        if ident in _active:
+            return payload  # direct cycle
+        _active.add(ident)
+        result = type(payload)(redact_delivery(item, _memo=_memo, _active=_active) for item in payload)
+        _active.discard(ident)
+        _memo[ident] = result
+        return result
     return payload
 
 
