@@ -335,6 +335,9 @@ class CommandsMixin:
                 d["person"] = party(d["person"])
             if restricted:
                 d.pop("login", None)
+            if d.get("sources") and not self._saw_sources(viewer, p["room_id"], d["sources"]):
+                d.pop("body", None)                    # it quotes history from before this reader joined
+                d.pop("sources", None)
             d["can_confirm"] = bool(viewer is not None and self._approver(viewer) and d["status"] == "draft")
             out["draft"] = d
         elif t == "github_written":
@@ -342,6 +345,15 @@ class CommandsMixin:
             if restricted:
                 g.pop("login", None)
             out["github"] = g
+
+    def _saw_sources(self, viewer, room_id: str, sources: list) -> bool:
+        """Whether `viewer` could read every message a draft quotes (its join point is at or before the oldest)."""
+        if viewer is None:
+            return True
+        room = self._rooms.get(room_id)
+        eff = self._effective(viewer, room) if room else None
+        seqs = [self._msg_room[s][1] for s in sources if s in self._msg_room]
+        return bool(eff) and len(seqs) == len(sources) and eff[1] <= min(seqs)
 
     def _handoff_state(self, h: dict, viewer) -> dict:
         status = h.get("status", "pending")

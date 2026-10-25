@@ -545,3 +545,16 @@ def test_issue_text_never_mentions_or_backlinks_on_github(w):
         assert not re.search(r"#[0-9]", text), text                   # no #n or owner/repo#n backlink
     assert "https://x.org/a#b" in d["body"]                           # links stay links
     assert "@‍org/team" in d["body"] and "other/repo#‍3" in d["body"]
+
+
+def test_a_later_joiner_sees_a_drafts_title_but_not_the_history_it_quotes(w):
+    m = say(w, w.bob, "secret plan from before you joined")
+    d = say(w, w.alice, "/issue acme/app Plan", selection=[m["event_id"]])["draft"]
+    w.s.add_member(w.alice, w.room, {"user_id": "mallory", "role": "guest"})
+    w.s.post_message(w.alice, w.room, {"text": "/decide later", "idempotency_key": "later-1"})
+    ev = w.s._log[[e["event_id"] for e in w.s._log].index(d and next(
+        e["event_id"] for e in w.s._log if e["event_type"] == "issue_draft"))]
+    late = w.s._view(ev, viewer=w.mallory)["draft"]
+    assert late["title"] == "Plan" and "body" not in late and "sources" not in late
+    early = w.s._view(ev, viewer=w.carol)["draft"]
+    assert "secret plan" in early["body"]

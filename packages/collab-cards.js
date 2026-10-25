@@ -39,7 +39,7 @@ export function commandCard(e, ctx = {}) {
     const confirm = d.can_confirm ? `<div class="cx-row cx-cmdcard__actions"><button type="button" class="hd-btn hd-btn--sm" data-draft-confirm="${esc(d.draft_id)}" data-draft-kind="${issue ? 'issue' : 'assignment'}" data-draft-where="${issueRef(d.owner, d.repo, issue ? '' : d.number)}"${issue ? ` data-draft-title="${esc(d.title || '')}" data-draft-summary="${esc(summarize(d.body))}"` : ''}>${issue ? 'Create issue on GitHub…' : 'Assign on GitHub…'}</button></div>` : '';
     const done = d.number && (d.status === 'created' || d.status === 'assigned') ? ` · ${issueRef(d.owner, d.repo, d.number)}` : '';
     const body = issue
-      ? `<div><b>${esc(d.title || '')}</b> <span class="cx-sub1">${esc(d.owner)}/${esc(d.repo)}${done}</span></div><details><summary>Issue text</summary><pre class="cx-cmdcard__body">${esc(d.body || '')}</pre></details>`
+      ? `<div><b>${esc(d.title || '')}</b> <span class="cx-sub1">${esc(d.owner)}/${esc(d.repo)}${done}</span></div>${typeof d.body === 'string' ? `<details><summary>Issue text</summary><pre class="cx-cmdcard__body">${esc(d.body)}</pre></details>` : '<div class="cx-sub1">It quotes messages from before you joined.</div>'}`
       : `<div>Assign ${issueRef(d.owner, d.repo, d.number)} to ${party(d.person)}${d.login ? ` <span class="cx-sub1">(${esc(d.login)} on GitHub)</span>` : ''}</div>`;
     return card(issue ? 'issue' : 'assign', `${head(issue ? 'Issue draft' : 'Assignment draft', e, status(d.status))}${body}${confirm}`, { 'data-draft': d.draft_id || '' });
   }

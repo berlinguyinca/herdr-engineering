@@ -103,3 +103,9 @@ test('the confirm button carries the title and a body summary for the confirm di
   const summary = /data-draft-summary="([^"]*)"/.exec(c.html)[1];
   assert.ok(summary.length > 100 && summary.length <= 420, String(summary.length));
 });
+
+test('a draft without its body (history before you joined) says so instead of an empty text', () => {
+  const c = commandCard({ event_type: 'issue_draft', created_at: at, draft: { draft_id: 'd1', kind: 'issue', owner: 'acme', repo: 'app', title: 'T', status: 'draft', can_confirm: false } });
+  assert.ok(!c.html.includes('<details>'));
+  assert.match(c.html, /before you joined/);
+});
