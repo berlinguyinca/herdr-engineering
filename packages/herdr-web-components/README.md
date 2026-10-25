@@ -99,7 +99,12 @@ drops the text selection.
   - Children pair by `data-key`, `data-section`, `data-host-id` or `id`, else by position and tag.
   - Form-control state follows the markup, except on the focused control.
   - Custom elements are leaves.
-  - Motion markers (`data-flash`, `data-drawn`, enter and leave) are kept.
+  - Motion markers (`data-flash`, `data-drawn`, `data-pulse`, enter and leave) are kept.
+  - It never writes a `<details>` `open`. A view whose model decides disclosure (Collapse groups,
+    a search default) sets `open` itself after the morph.
+  - A node the fresh markup no longer has, but that holds focus or the selection, stays. `morph`
+    returns these stranded nodes; `handOff(stranded, fallback)` moves focus to `fallback(node)` and
+    removes them, so a row that left does not linger while focused.
 
 ### Motion (`motion.js`, `motion.css`)
 

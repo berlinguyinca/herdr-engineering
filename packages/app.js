@@ -246,7 +246,8 @@ async function viewCollab() {
 }
 
 async function viewGithub() {
-  return ownPolling(mountGithub(root, client));
+  // Keeps its own 5 s poll; live events refresh it too (requests in flight are not duplicated).
+  return mountGithub(root, client);
 }
 
 async function viewIntegrations(parts) {

@@ -117,8 +117,8 @@ export function patchList(container,items,opts){
 // attribute changes and removals are patched when the element observes them, otherwise the
 // element is replaced (herdr-metric and friends render once on connect). Attributes an element
 // stamps on itself (role, data-state) are not markup and are never removed.
-// data-flash / data-drawn are motion state stamped by motion.js and the views, not markup.
-const PRESERVED=new Set(['data-key','data-entering','data-leaving','data-flash','data-drawn']);
+// data-flash / data-drawn / data-pulse are motion state stamped by motion.js and the views, not markup.
+const PRESERVED=new Set(['data-key','data-entering','data-leaving','data-flash','data-drawn','data-pulse']);
 const keyOf=n=>n.nodeType!==1?null:(n.getAttribute('data-key')??n.getAttribute('data-section')??n.getAttribute('data-host-id')??(n.id||null));
 const isCustom=el=>el.localName.includes('-');
 const markupAttrs=new WeakMap();// custom element -> attribute names its markup carried
@@ -197,8 +197,8 @@ function morphChildren(parent,freshParent){
   if(match)used.add(match);
   return [match,f];
  });
- // An unmatched node the user is in (focus, selection) stays until they move on.
- for(const o of olds)if(!used.has(o)&&!guarded(o))o.remove();
+ // An unmatched node the user is in (focus, selection) stays until they move on (see handOff).
+ for(const o of olds)if(!used.has(o)){if(guarded(o))stranded?.push(o);else o.remove();}
  const wanted=pairs.map(([o,f])=>o?morphNode(o,f):importFresh(f));
  const wantedSet=new Set(wanted);
  let cursor=parent.firstChild;
@@ -211,7 +211,25 @@ function morphChildren(parent,freshParent){
  }
 }
 
+// Returns the stranded nodes: ones the fresh markup no longer has, kept only because the user is in
+// them. Pass them to handOff when the view should move focus on instead of waiting.
+let stranded=null;
 export function morph(el,fresh){
- if(typeof fresh==='string'){const t=document.createElement('template');t.innerHTML=fresh;morphChildren(el,t.content);return;}
- morphAttrs(el,fresh);morphChildren(el,fresh);syncControl(el,fresh);
+ const outer=stranded;stranded=[];
+ try{
+  if(typeof fresh==='string'){const t=document.createElement('template');t.innerHTML=fresh;morphChildren(el,t.content);}
+  else{morphAttrs(el,fresh);morphChildren(el,fresh);syncControl(el,fresh);}
+  return stranded;
+ }finally{stranded=outer;}
+}
+
+// A stranded node that holds focus gives it to fallback(node) (looked up while the node is still in
+// place, so a neighbour can be found), then leaves. One that only holds a text selection stays.
+export function handOff(nodes,fallback){
+ for(const node of nodes){
+  if(!node.isConnected)continue;
+  const active=document.activeElement;
+  if(active&&active!==document.body&&node.contains(active)){const next=fallback(node);if(next&&!node.contains(next))next.focus({preventScroll:true});}
+  if(!guarded(node))node.remove();
+ }
 }
