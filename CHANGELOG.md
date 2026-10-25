@@ -5,6 +5,33 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### GitHub Projects: read-only boards with incremental sync (PR-G3)
+- `github.projects.enabled` (default `false`) and `github.projects.item_limit` (default 2000) in the
+  fleet file's `github` section, YAML only. The token needs the `read:project` scope.
+- Each pass lists the Projects v2 of the owners in scope, one call per 50 projects per owner. The
+  owners in scope are the `github.organizations` allowlist; with no allowlist they are the listed
+  owners plus the viewer's own account.
+  - An excluded owner costs no project call, and its stored projects and items are purged.
+  - A project whose `updatedAt` and item count match the stored probe costs nothing more.
+  - A changed project has all its items read. GitHub can order project items only by position, not
+    by update time, so the issue-style watermark read is not possible; unchanged projects are still
+    skipped. Each project is also read in full once per `full_reconcile_interval`.
+  - Item reads share the per-pass point budget. A project that does not fit keeps its earlier items
+    and is read next pass, and so does a project over `item_limit` or one whose read failed.
+- A projects failure never fails the issue pass. A missing `read:project` scope, for example, shows
+  in `projects_sync` with the error.
+- Store: migration `0008_github_projects.sql` adds `github_projects` and `github_project_items`
+  under the shared catalog revision. Removals become tombstones of kind `project` and
+  `project_item`. The web works before the migration: project rows then stay in memory and the
+  issue catalog is unaffected. Rollback: the DOWN block in the migration.
+- API: `GET /api/v1/github/projects` returns the projects, and `?project=<id>` returns one
+  project's items. Both carry an `ETag` and accept `?since=<revision>`.
+- UI: `#/github/projects` ("Project boards") groups cards by the project's Status field, in the
+  field's option order. Empty columns show as empty, and items without a status go to "No status".
+  A flat-list toggle is available, and a project without a Status field shows as a list. Cards are
+  patched in place from deltas. The page is read-only.
+- The sidebar marks only the most specific matching link.
+
 ### GitHub page: conditional requests and since deltas (PR-G3)
 - The web client remembers each GET's `ETag` (per URL, the last 64) and sends `If-None-Match`. A
   `304` hands back the remembered body. GitHub lists, hosts, host detail, services, service detail,

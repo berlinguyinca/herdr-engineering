@@ -1109,3 +1109,247 @@ def test_a_write_landing_during_a_purge_cannot_reinstate_the_old_revision():
     monitor.refresh()
     assert seen[0]["resync"] is True and seen[0]["issues"] == []
     assert monitor.revision() is not None and monitor.revision() > since  # remembered after the purge
+
+
+# ---------------------------------------------------------------- G9 Projects v2
+
+STATUS = [{"id": "opt-todo", "name": "Todo"}, {"id": "opt-doing", "name": "In progress"}, {"id": "opt-done", "name": "Done"}]
+
+
+class FakeProjects(FakeGitHub):
+    """FakeGitHub plus Projects v2: owner -> projects -> items (position order), all with updatedAt."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.projects = {}   # owner -> {pid: project}
+        self.fail_projects = None
+
+    def add_project(self, owner, title="Board", *, status=True):
+        pid = f"PVT_{owner}_{len(self.projects.get(owner, {})) + 1}"
+        self.projects.setdefault(owner, {})[pid] = {
+            "id": pid, "number": len(self.projects.get(owner, {})) + 1, "title": title,
+            "url": f"https://github.com/orgs/{owner}/projects/1", "closed": False,
+            "updatedAt": _iso(self.tick()), "items": {}, "status": status}
+        return pid
+
+    def _project(self, pid):
+        return next(p[pid] for p in self.projects.values() if pid in p)
+
+    def add_item(self, pid, status="Todo", title=None):
+        project = self._project(pid)
+        iid = f"PVTI_{pid}_{len(project['items']) + 1}"
+        project["items"][iid] = {"id": iid, "type": "ISSUE", "isArchived": False, "updatedAt": _iso(self.tick()),
+                                 "status": status, "content": {"title": title or f"Item {iid}", "number": 1,
+                                                               "url": "https://github.com/acme/app/issues/1",
+                                                               "state": "OPEN", "repository": {"nameWithOwner": "acme/app"}}}
+        project["updatedAt"] = _iso(self.clock)
+        return iid
+
+    def move_item(self, pid, iid, status):
+        project = self._project(pid)
+        project["items"][iid].update(status=status, updatedAt=_iso(self.tick()))
+        project["updatedAt"] = _iso(self.clock)
+
+    def remove_item(self, pid, iid):
+        project = self._project(pid)
+        del project["items"][iid]
+        project["updatedAt"] = _iso(self.tick())
+
+    def projects_page(self, login, cursor=None):
+        self.calls["projects"] += 1
+        self.log.append(("projects", login, cursor))
+        if self.fail_projects:
+            from herdr_engineering.github import GitHubError
+            raise GitHubError(self.fail_projects)
+        owned = self.projects.get(login, {})
+        nodes = [{"id": p["id"], "number": p["number"], "title": p["title"], "url": p["url"], "closed": p["closed"],
+                  "updatedAt": p["updatedAt"], "items": {"totalCount": len(p["items"])},
+                  "field": {"id": "F_status", "options": STATUS} if p["status"] else None}
+                 for p in sorted(owned.values(), key=lambda p: p["updatedAt"], reverse=True)]
+        return self._connection(nodes, cursor)
+
+    def project_items_page(self, project_id, cursor=None):
+        self.calls["items"] += 1
+        self.log.append(("items", project_id, cursor))
+        project = self._project(project_id)
+        options = {o["name"]: o["id"] for o in STATUS}
+        nodes = [{"id": i["id"], "type": i["type"], "isArchived": i["isArchived"], "updatedAt": i["updatedAt"],
+                  "status": {"name": i["status"], "optionId": options.get(i["status"])} if i["status"] else None,
+                  "content": i["content"]} for i in project["items"].values()]
+        return self._connection(nodes, cursor)
+
+
+def item_calls(fake, project_id=None):
+    return [entry for entry in fake.log if entry[0] == "items" and (project_id is None or entry[1] == project_id)]
+
+
+def projects_seeded():
+    fake = FakeProjects()
+    fake.add_issue("acme/app")
+    fake.add_issue("other/tool")
+    p1 = fake.add_project("acme", "Roadmap")
+    for status in ("Todo", "Todo", "Done"):
+        fake.add_item(p1, status)
+    p2 = fake.add_project("acme", "Bugs")
+    fake.add_item(p2, "In progress")
+    p3 = fake.add_project("other", "Theirs")
+    fake.add_item(p3)
+    return fake, p1, p2, p3
+
+
+ON = {"enabled": True, "item_limit": 2000}
+
+
+def test_projects_are_off_by_default_and_cost_nothing():
+    fake, *_ = projects_seeded()
+    monitor = monitor_for(fake, {})
+    monitor.refresh()
+    assert fake.calls["projects"] == 0 and fake.calls["items"] == 0
+    view = monitor.projects(start=False)
+    assert view["projects"] == [] and view["projects_sync"]["status"] == "disabled"
+
+
+def test_projects_of_in_scope_owners_are_listed_with_items():
+    fake, p1, p2, p3 = projects_seeded()
+    monitor = monitor_for(fake, {}, projects=ON)
+    monitor.refresh()
+    listed = {p["project_id"]: p for p in monitor.projects(start=False)["projects"]}
+    assert set(listed) == {p1, p2, p3}
+    assert listed[p1]["item_count"] == 3 and [o["name"] for o in listed[p1]["status_options"]] == ["Todo", "In progress", "Done"]
+    items = monitor.project_items(p1, start=False)["items"]
+    assert sorted(i["status"] for i in items) == ["Done", "Todo", "Todo"]
+    assert monitor.projects(start=False)["projects_sync"]["status"] == "ready"
+
+
+def test_an_unchanged_project_costs_zero_item_calls():
+    fake, *_ = projects_seeded()
+    monitor = monitor_for(fake, {}, projects=ON)
+    monitor.refresh()
+    items_before, listings_before = fake.calls["items"], fake.calls["projects"]
+    monitor.refresh()
+    assert fake.calls["items"] == items_before, "no item reads for unchanged projects"
+    # one listing per owner: acme, other and (no allowlist) the viewer's own account
+    assert fake.calls["projects"] == listings_before + 3
+
+
+def test_one_moved_item_fetches_only_its_project():
+    fake, p1, p2, p3 = projects_seeded()
+    monitor = monitor_for(fake, {}, projects=ON)
+    monitor.refresh()
+    since = monitor.revision()
+    moved = next(iter(fake._project(p1)["items"]))
+    fake.log.clear()
+    fake.move_item(p1, moved, "Done")
+    monitor.refresh()
+    assert {entry[1] for entry in item_calls(fake)} == {p1}
+    delta = monitor.changes(kind="project_items", since=since, project_id=p1, start=False)
+    assert [(row["item_id"], row["status"]) for row in delta["upserted"]] == [(moved, "Done")]
+    assert delta["removed"] == []
+
+
+def test_a_removed_item_is_reported_removed():
+    fake, p1, *_ = projects_seeded()
+    monitor = monitor_for(fake, {}, projects=ON)
+    monitor.refresh()
+    since = monitor.revision()
+    gone = next(iter(fake._project(p1)["items"]))
+    fake.remove_item(p1, gone)
+    monitor.refresh()
+    delta = monitor.changes(kind="project_items", since=since, project_id=p1, start=False)
+    assert delta["removed"] == [{"project_id": p1, "key": gone}]
+    assert gone not in {i["item_id"] for i in monitor.project_items(p1, start=False)["items"]}
+
+
+def test_out_of_scope_owners_make_zero_project_calls_and_their_rows_are_purged():
+    fake, p1, p2, p3 = projects_seeded()
+    shared, allow = {}, []
+    monitor = monitor_for(fake, shared, projects=ON, organizations=lambda: allow)
+    monitor.refresh()
+    assert p3 in {p["project_id"] for p in monitor.projects(start=False)["projects"]}
+    allow.append("acme")
+    fake.log.clear()
+    monitor.refresh()
+    assert not [entry for entry in fake.log if entry[0] in {"projects", "items"} and "other" in str(entry[1])]
+    assert {p["project_id"] for p in monitor.projects(start=False)["projects"]} == {p1, p2}
+    stored = MemoryGitHubStore(identity="fingerprint-one", viewer="fixture-user", shared=shared).load()
+    assert set(stored.projects) == {p1, p2} and set(stored.project_items) == {p1, p2}
+
+
+def test_a_projects_failure_never_fails_the_issue_pass():
+    fake, *_ = projects_seeded()
+    fake.fail_projects = "permission"
+    monitor = monitor_for(fake, {}, projects=ON)
+    monitor.refresh()
+    view = monitor.snapshot(start=False)
+    assert view["status"] == "ready" and view["error"] is None
+    sync = monitor.projects(start=False)["projects_sync"]
+    assert sync["status"] == "error" and "read:project" in sync["error"]
+
+
+def test_a_spent_budget_defers_project_items_and_keeps_the_old_rows():
+    fake, p1, *_ = projects_seeded()
+    monitor = monitor_for(fake, {}, projects=ON, point_budget=1000)
+    monitor.refresh()
+    moved = next(iter(fake._project(p1)["items"]))
+    fake.move_item(p1, moved, "Done")
+    monitor._fixed_sync["point_budget"] = 1  # the listing alone spends it
+    fake.log.clear()
+    monitor.refresh()
+    assert item_calls(fake) == []
+    sync = monitor.projects(start=False)["projects_sync"]
+    assert sync["status"] == "partial" and sync["deferred"] >= 1
+    assert sorted(i["status"] for i in monitor.project_items(p1, start=False)["items"]) == ["Done", "Todo", "Todo"]
+    monitor._fixed_sync["point_budget"] = 1000
+    monitor.refresh()
+    assert sorted(i["status"] for i in monitor.project_items(p1, start=False)["items"]) == ["Done", "Done", "Todo"]
+
+
+def test_a_project_over_the_item_limit_keeps_its_old_items():
+    fake, p1, *_ = projects_seeded()
+    monitor = monitor_for(fake, {}, projects={"enabled": True, "item_limit": 3})
+    monitor.refresh()
+    fake.add_item(p1)
+    monitor.refresh()
+    assert len(monitor.project_items(p1, start=False)["items"]) == 3
+    row = next(p for p in monitor.projects(start=False)["projects"] if p["project_id"] == p1)
+    assert row["complete"] is False and "item_limit" in row["error"]
+
+
+def test_a_restart_serves_stored_projects_with_zero_calls():
+    fake, p1, *_ = projects_seeded()
+    shared = {}
+    monitor_for(fake, shared, projects=ON).refresh()
+    fake.log.clear()
+    fresh = monitor_for(fake, shared, projects=ON)
+    assert {p["project_id"] for p in fresh.projects(start=False)["projects"]} >= {p1}
+    assert len(fresh.project_items(p1, start=False)["items"]) == 3
+    assert fake.log == []
+
+
+def test_an_unknown_project_is_not_found():
+    import pytest
+
+    from herdr_engineering.github import GitHubError
+    fake, *_ = projects_seeded()
+    monitor = monitor_for(fake, {}, projects=ON)
+    monitor.refresh()
+    with pytest.raises(GitHubError):
+        monitor.project_items("PVT_nope", start=False)
+
+
+def test_a_restart_with_yaml_enabled_projects_serves_them_and_never_says_sync_is_off(monkeypatch):
+    import herdr_engineering.github as github
+    monkeypatch.setattr(github, "_configured_projects", lambda: {"enabled": True})
+    fake, p1, *_ = projects_seeded()
+    shared = {}
+    monitor_for(fake, shared).refresh()
+    fake.log.clear()
+    fresh = monitor_for(fake, shared)
+    view = fresh.projects(start=False)
+    assert p1 in {p["project_id"] for p in view["projects"]}
+    assert view["projects_sync"]["enabled"] is True and view["projects_sync"]["status"] == "stale"
+    assert len(fresh.project_items(p1, start=False)["items"]) == 3
+    assert fake.log == []
+    monkeypatch.setattr(github, "_configured_projects", lambda: None)
+    empty = monitor_for(FakeProjects(), {})
+    assert empty.projects(start=False)["projects_sync"]["status"] == "disabled"

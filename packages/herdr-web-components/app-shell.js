@@ -55,10 +55,12 @@ export class HerdrAppShell extends HTMLElement {
     const hash = window.location.hash.replace(/^#/, '') || '/';
     const path = hash.split('?')[0];
     const links = this.shadowRoot.querySelectorAll('.hd-shell__link');
+    // The longest matching path wins, so /github/projects marks its own link, not also /github.
+    const matches = (p) => path === p || (path !== '/' && path.startsWith(p + '/'));
+    const best = [...links].map((a) => a.getAttribute('data-path')).filter(matches)
+      .sort((x, y) => y.length - x.length)[0];
     links.forEach((a) => {
-      const active = path === a.getAttribute('data-path') ||
-        (path !== '/' && path.startsWith(a.getAttribute('data-path') + '/'));
-      a.classList.toggle('active', active);
+      a.classList.toggle('active', a.getAttribute('data-path') === best);
     });
     this._menuOpen = false;
     const nav = this.shadowRoot.querySelector('.hd-shell__nav');

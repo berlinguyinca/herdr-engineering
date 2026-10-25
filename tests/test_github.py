@@ -404,3 +404,48 @@ def test_primary_language_cannot_echo_configured_github_token():
     monitor = GitHubMonitor(provider_factory=lambda: GitHubProvider(token='private-token-value', client=client))
     monitor.refresh()
     assert monitor.repository_languages(start=False) == {'github.com/owner/app': None}
+
+
+# ---- G9 Projects v2: provider reads (response shape as documented; not validated live) ----
+
+def test_projects_page_and_items_parse_status_and_mixed_content():
+    from herdr_engineering.github import _project, _project_item
+    listing = {"data": {"repositoryOwner": {"login": "acme", "projectsV2": {
+        "totalCount": 1, "pageInfo": {"hasNextPage": False, "endCursor": None},
+        "nodes": [{"id": "PVT_1", "number": 4, "title": "Roadmap", "url": "https://github.com/orgs/acme/projects/4",
+                   "closed": False, "updatedAt": "2026-10-20T12:00:00Z", "items": {"totalCount": 4},
+                   "field": {"id": "F", "options": [{"id": "o1", "name": "Todo"}, {"id": "o2", "name": "Done"}]}}]}},
+        "rateLimit": {"remaining": 4000, "resetAt": "2026-10-20T15:00:00Z", "cost": 1}}}
+    client = Client(listing)
+    provider = GitHubProvider(token="placeholder-token-value", client=client)
+    connection = provider.projects_page("acme")
+    body = json.loads(client.requests[0].data)
+    assert body["variables"] == {"login": "acme", "cursor": None}
+    assert "orderBy:{field:UPDATED_AT,direction:DESC}" in body["query"]
+    row = _project(connection["nodes"][0], "Acme")
+    assert row["owner"] == "acme" and row["item_count"] == 4
+    assert [o["name"] for o in row["status_options"]] == ["Todo", "Done"]
+    assert _project(dict(connection["nodes"][0], field=None), "acme")["status_options"] is None
+    items = {"data": {"node": {"items": {"totalCount": 4, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [
+        {"id": "I1", "type": "ISSUE", "isArchived": False, "updatedAt": "2026-10-20T12:00:00Z",
+         "status": {"name": "Todo", "optionId": "o1"},
+         "content": {"title": "Fix it", "number": 7, "url": "https://github.com/acme/app/issues/7", "state": "OPEN",
+                     "repository": {"nameWithOwner": "acme/app"}}},
+        {"id": "I2", "type": "DRAFT_ISSUE", "isArchived": False, "updatedAt": "2026-10-20T12:00:00Z", "status": None,
+         "content": {"title": "An idea"}},
+        {"id": "I3", "type": "REDACTED", "isArchived": False, "updatedAt": "2026-10-20T12:00:00Z", "status": {}, "content": None},
+        {"id": "I4", "type": "ISSUE", "isArchived": True, "updatedAt": "2026-10-20T12:00:00Z", "status": None, "content": None}]}},
+        "rateLimit": {"remaining": 3999, "resetAt": "2026-10-20T15:00:00Z", "cost": 1}}}
+    nodes = GitHubProvider(token="placeholder-token-value", client=Client(items)).project_items_page("PVT_1")["nodes"]
+    parsed = [_project_item(node, "PVT_1") for node in nodes]
+    assert parsed[0]["status_option"] == "o1" and parsed[0]["repository"] == "acme/app" and parsed[0]["number"] == 7
+    assert parsed[1]["status"] is None and parsed[1]["title"] == "An idea"
+    assert parsed[2]["title"] is None and parsed[2]["type"] == "REDACTED"
+    assert parsed[3] is None, "archived items are not shown"
+
+
+def test_a_missing_read_project_scope_is_named():
+    payload = {"data": None, "errors": [{"type": "INSUFFICIENT_SCOPES", "message": "needs read:project"}]}
+    with pytest.raises(GitHubError) as caught:
+        GitHubProvider(token="placeholder-token-value", client=Client(payload)).projects_page("acme")
+    assert caught.value.reason == "insufficient_scope" and "read:project" in str(caught.value)

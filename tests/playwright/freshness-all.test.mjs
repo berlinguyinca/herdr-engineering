@@ -15,7 +15,7 @@ const service={service_id:'svc-1',name:'web',host_id:'h-1',status:'running',kind
 const OK={missions:[],sessions:[],services:[service],hosts:[],activities:[],events:[],timeline:[],available:true,reviews:[],
  repositories:[],issues:[],counts:{},pagination:{},status:'ready',components:[],summary:{},reports:[],pipelines:[],samples:[],
  total:0,completed:0,completion_rate:0,by_stage:{},models:{},total_sessions:0,healthy:0,unavailable:0,
- mission_id:'m-1',session_id:'s-1',host_id:'h-1',title:'Mission',display_name:'Agent',groups:[],points:[],errors:[]};
+ mission_id:'m-1',session_id:'s-1',host_id:'h-1',title:'Mission',display_name:'Agent',groups:[],points:[],errors:[],projects:[]};
 
 const chips=page=>page.evaluate(()=>[...document.querySelectorAll('#view herdr-freshness')].map(c=>({state:c.dataset.state,text:c.textContent,last:c._last})));
 

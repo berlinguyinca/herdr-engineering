@@ -451,3 +451,14 @@ test('getGithubConditional passes since and reports notModified', async () => {
   await client.getGithubConditional('issues', { repository: 'github.com/o/r', tab: 'all', since: 7 });
   assert.match(server.calls[2].url, /^\/api\/v1\/github\/issues\?repository=github\.com%2Fo%2Fr&tab=all&since=7$/);
 });
+
+test('getGithubProjects reads the projects list or one project, conditionally', async () => {
+  const server = etagServer([{ revision: 2, projects: [] }]);
+  const client = new HerdrClient('', { fetchImpl: server.fetchImpl });
+  await client.getGithubProjects();
+  const again = await client.getGithubProjects();
+  await client.getGithubProjects({ project: 'PVT_1', since: 2 });
+  assert.equal(server.calls[0].url, '/api/v1/github/projects');
+  assert.equal(again.notModified, true);
+  assert.equal(server.calls[2].url, '/api/v1/github/projects?project=PVT_1&since=2');
+});

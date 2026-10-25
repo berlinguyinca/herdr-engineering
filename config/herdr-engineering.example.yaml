@@ -87,5 +87,13 @@ build_cleanup:
 #                                        # repositories that do not fit are deferred to the
 #                                        # next pass (listed as deferred_repos, stale after 2x
 #                                        # interval) and the cached rows keep being served
-# The catalog persists in control_plane.pg_dsn when it is set (migration 0006),
+#       projects:
+#         enabled: false                 # read-only GitHub Projects v2 of the owners in scope
+#                                        # (the allowlist above; empty = the listed owners plus
+#                                        # your own account). Needs the token's read:project
+#                                        # scope and spends the same point budget. Only projects
+#                                        # whose updatedAt or item count changed are re-read, and
+#                                        # then in full: GitHub orders items by position only.
+#         item_limit: 2000               # a project with more items keeps its earlier items
+# The catalog persists in control_plane.pg_dsn when it is set (migrations 0006-0008),
 # otherwise it lives in memory and a restart re-reads GitHub.

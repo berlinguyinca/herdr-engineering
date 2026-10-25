@@ -29,6 +29,12 @@ Rules (spec "Builder-check rulings" 1 and 2):
   for issues whose detail was opened, with the ``updated_at`` they were fetched
   at. They never bump the revision, and they go with their issue, repository,
   owner and identity like every other row.
+* Projects v2 (migration ``0008``, Task G9) share the family revision and the
+  tombstones (kinds ``project`` and ``project_item``, the project id in the
+  ``repository_id`` column) and go with their owner and identity like every
+  other row. Their tables may be missing mid-roll: project reads then come back
+  empty and project writes raise ``GitHubStoreUnavailable``, while the
+  repository/issue catalog keeps working.
 * Removals are kept as tombstones for ``TOMBSTONE_RETENTION``. ``pruned_through``
   is the newest revision whose tombstone was discarded (or the revision of the
   last purge); ``changes_since(since)`` with ``since`` below it, or above the
@@ -80,6 +86,9 @@ class Snapshot:
     repositories: dict[str, dict] = field(default_factory=dict)
     issues: dict[str, dict[str, dict]] = field(default_factory=dict)
     watermarks: dict[str, str] = field(default_factory=dict)
+    projects: dict[str, dict] = field(default_factory=dict)
+    project_items: dict[str, dict[str, dict]] = field(default_factory=dict)
+    project_watermarks: dict[str, str] = field(default_factory=dict)
 
 
 def _normal(row: dict) -> dict:
@@ -93,6 +102,10 @@ def _owner(row: dict) -> str:
         return name.split("/", 1)[0].lower()
     parts = str(row["repository_id"]).split("/")
     return parts[-2].lower() if len(parts) >= 2 else ""
+
+
+def _project_owner(row: dict) -> str:
+    return str(row.get("owner") or "").lower()
 
 
 def _owners(values: Iterable[str]) -> set[str]:
@@ -162,6 +175,8 @@ class _MemoryState:
         self.issues: dict[tuple, dict] = {}    # (rid, gid) -> {data, rev}
         self.tombstones: dict[tuple, dict] = {}  # (kind, rid, key) -> {rev, removed_at}
         self.details: dict[tuple, dict] = {}     # (rid, gid) -> {number, updated_at, data}
+        self.projects: dict[str, dict] = {}      # pid -> {owner, data, watermark, rev}
+        self.project_items: dict[tuple, dict] = {}  # (pid, item id) -> {data, rev}
 
 
 class MemoryGitHubStore:
@@ -228,6 +243,20 @@ class MemoryGitHubStore:
             for key in [k for k in state.details if k[0] == rid]:
                 del state.details[key]
 
+    def _remove_projects(self, pids: list[str], rev: int) -> None:
+        state = self._state
+        for pid in pids:
+            for key in [k for k in state.project_items if k[0] == pid]:
+                del state.project_items[key]
+                self._tombstone("project_item", pid, key[1], rev)
+            del state.projects[pid]
+            self._tombstone("project", pid, pid, rev)
+
+    def _wipe_rows(self) -> None:
+        state = self._state
+        state.repos, state.issues, state.tombstones, state.details = {}, {}, {}, {}
+        state.projects, state.project_items = {}, {}
+
     # -- interface
 
     def load(self) -> Snapshot | None:
@@ -239,7 +268,7 @@ class MemoryGitHubStore:
                 self._claim()
                 return None
             if not _matches(state.meta, self._identity, self._viewer):
-                state.repos, state.issues, state.tombstones, state.details = {}, {}, {}, {}
+                self._wipe_rows()
                 revision = _note_memory_revision(state.meta["revision"] + 1)
                 state.meta = {"identity": self._identity, "viewer": self._viewer,
                               "revision": revision, "pruned_through": revision}
@@ -248,11 +277,18 @@ class MemoryGitHubStore:
             issues: dict[str, dict[str, dict]] = {}
             for (rid, gid), row in state.issues.items():
                 issues.setdefault(rid, {})[gid] = _normal(row["data"])
+            items: dict[str, dict[str, dict]] = {}
+            for (pid, iid), row in state.project_items.items():
+                items.setdefault(pid, {})[iid] = _normal(row["data"])
             return Snapshot(identity=meta["identity"], viewer=meta["viewer"], revision=meta["revision"],
                             repositories={rid: _normal(r["data"]) for rid, r in state.repos.items()},
                             issues=issues,
                             watermarks={rid: r["watermark"] for rid, r in state.repos.items()
-                                        if r["watermark"] is not None})
+                                        if r["watermark"] is not None},
+                            projects={pid: _normal(p["data"]) for pid, p in state.projects.items()},
+                            project_items=items,
+                            project_watermarks={pid: p["watermark"] for pid, p in state.projects.items()
+                                                if p["watermark"] is not None})
 
     def _lazy_revision(self) -> Callable[[], int]:
         """One revision for one operation, bumped on its first visible change only."""
@@ -340,6 +376,58 @@ class MemoryGitHubStore:
                 state.meta, state.repos, state.issues, state.tombstones, state.details = saved
                 raise
 
+    # -- projects (G9)
+
+    def _put_projects(self, incoming: dict[str, dict], rev: Callable[[], int]) -> None:
+        state = self._state
+        for pid, data in incoming.items():
+            previous = state.projects.get(pid)
+            if previous is None or previous["data"] != data:
+                state.projects[pid] = {"owner": _project_owner(data), "data": data, "rev": rev(),
+                                       "watermark": previous["watermark"] if previous else None}
+                state.tombstones.pop(("project", pid, pid), None)
+
+    def apply_project(self, row: dict, items: Iterable[dict], removed: Iterable[str],
+                      watermark: str | None) -> None:
+        """One project's completed item read, all or nothing: its row (with the ``synced``
+        probe), changed items, removed items and watermark, under one revision."""
+        state = self._state
+        pid = row["project_id"]
+        incoming = {entry["item_id"]: _normal(entry) for entry in items}
+        wanted = list(dict.fromkeys(removed))
+        with state.lock:
+            self._claim()
+            saved = (dict(state.meta), {k: dict(v) for k, v in state.projects.items()},
+                     dict(state.project_items), dict(state.tombstones))
+            try:
+                rev = self._lazy_revision()
+                self._put_projects({pid: _normal(row)}, rev)
+                for iid, data in incoming.items():
+                    if (pid, iid) not in state.project_items or state.project_items[(pid, iid)]["data"] != data:
+                        state.project_items[(pid, iid)] = {"data": data, "rev": rev()}
+                        state.tombstones.pop(("project_item", pid, iid), None)
+                for iid in [iid for iid in wanted if (pid, iid) in state.project_items]:
+                    del state.project_items[(pid, iid)]
+                    self._tombstone("project_item", pid, iid, rev())
+                state.projects[pid]["watermark"] = watermark
+            except BaseException:
+                state.meta, state.projects, state.project_items, state.tombstones = saved
+                raise
+
+    def replace_projects(self, rows: Iterable[dict], owners: set[str]) -> None:
+        """The complete project listing of ``owners``: changed rows are written (items
+        untouched) and their projects missing from it are removed with their items."""
+        state = self._state
+        incoming = {row["project_id"]: _normal(row) for row in rows}
+        listed = _owners(owners)
+        with state.lock:
+            self._claim()
+            rev = self._lazy_revision()
+            self._put_projects(incoming, rev)
+            gone = [pid for pid, p in state.projects.items() if pid not in incoming and p["owner"] in listed]
+            if gone:
+                self._remove_projects(gone, rev())
+
     def purge(self) -> None:
         """Drop this credential's whole catalog, tombstones and details included (a revoked
         token); the revision moves on and every older ``since`` resyncs. Another
@@ -350,9 +438,10 @@ class MemoryGitHubStore:
                 raise GitHubStoreRetired("this GitHub catalog store was replaced")
             if state.meta is None or not _matches(state.meta, self._identity, self._viewer):
                 return
-            if not (state.repos or state.issues or state.tombstones or state.details):
+            if not (state.repos or state.issues or state.tombstones or state.details
+                    or state.projects or state.project_items):
                 return  # nothing left: a repeated 401 must not move the revision
-            state.repos, state.issues, state.tombstones, state.details = {}, {}, {}, {}
+            self._wipe_rows()
             revision = _note_memory_revision(state.meta["revision"] + 1)
             state.meta.update(revision=revision, pruned_through=revision)
 
@@ -368,8 +457,13 @@ class MemoryGitHubStore:
         with state.lock:
             self._claim()
             gone = [rid for rid, r in state.repos.items() if r["owner"] not in allowed]
-            if gone:
-                self._remove_repos(gone, self._bump())
+            projects = [pid for pid, p in state.projects.items() if p["owner"] not in allowed]
+            if gone or projects:
+                rev = self._bump()
+                if gone:
+                    self._remove_repos(gone, rev)
+                if projects:
+                    self._remove_projects(projects, rev)
 
     def put_detail(self, repo_id: str, issue: dict, fetched_at: float | None = None) -> None:
         """Store an opened issue's detail (with its body) as fetched at ``issue["updated_at"]``,
@@ -413,6 +507,9 @@ class MemoryGitHubStore:
             meta = self._claim()
             rows = [_item("repository", rid, rid, r["rev"], _normal(r["data"])) for rid, r in state.repos.items()]
             rows += [_item("issue", rid, gid, r["rev"], _normal(r["data"])) for (rid, gid), r in state.issues.items()]
+            rows += [_item("project", pid, pid, p["rev"], _normal(p["data"])) for pid, p in state.projects.items()]
+            rows += [_item("project_item", pid, iid, r["rev"], _normal(r["data"]))
+                     for (pid, iid), r in state.project_items.items()]
             tombs = [_item(kind, rid, key, t["rev"]) for (kind, rid, key), t in state.tombstones.items()]
             return _delta(meta["revision"], meta["pruned_through"], rev, rows, tombs)
 
@@ -442,6 +539,17 @@ async def _drop_details(conn, sql: str, *args) -> None:
             await conn.execute(sql, *args)
     except asyncpg.exceptions.UndefinedTableError:
         pass
+
+
+async def _optional(conn, work, default=None):
+    """``await work()`` inside a savepoint; ``default`` when a 0008 project table is missing
+    (mid-roll), without aborting the surrounding transaction."""
+    import asyncpg
+    try:
+        async with conn.transaction():
+            return await work()
+    except asyncpg.exceptions.UndefinedTableError:
+        return default
 
 
 class _LazyRevision:
@@ -615,6 +723,22 @@ class GitHubStore:
             "ON CONFLICT (kind, repository_id, key) DO UPDATE SET rev=EXCLUDED.rev, removed_at=EXCLUDED.removed_at",
             rids, rev, now)
 
+    async def _remove_projects(self, conn, pids: list[str], rev: int) -> None:
+        now = self._stamp()
+        await conn.execute(
+            "WITH gone AS (DELETE FROM github_project_items WHERE project_id = ANY($1::text[]) "
+            "RETURNING project_id, item_id) "
+            "INSERT INTO github_catalog_tombstones (kind, repository_id, key, rev, removed_at) "
+            "SELECT 'project_item', project_id, item_id, $2, $3 FROM gone "
+            "ON CONFLICT (kind, repository_id, key) DO UPDATE SET rev=EXCLUDED.rev, removed_at=EXCLUDED.removed_at",
+            pids, rev, now)
+        await conn.execute(
+            "WITH gone AS (DELETE FROM github_projects WHERE project_id = ANY($1::text[]) RETURNING project_id) "
+            "INSERT INTO github_catalog_tombstones (kind, repository_id, key, rev, removed_at) "
+            "SELECT 'project', project_id, project_id, $2, $3 FROM gone "
+            "ON CONFLICT (kind, repository_id, key) DO UPDATE SET rev=EXCLUDED.rev, removed_at=EXCLUDED.removed_at",
+            pids, rev, now)
+
     # -- interface
 
     async def _wipe(self, conn) -> None:
@@ -623,6 +747,8 @@ class GitHubStore:
         await conn.execute("DELETE FROM github_repositories")
         await conn.execute("DELETE FROM github_catalog_tombstones")
         await _drop_details(conn, "DELETE FROM github_issue_details")
+        await _drop_details(conn, "DELETE FROM github_project_items")
+        await _drop_details(conn, "DELETE FROM github_projects")
         await conn.execute(
             "UPDATE github_catalog_meta SET identity=$2, viewer=$3, revision=revision+1, "
             "pruned_through=revision+1, updated_at=now() WHERE family=$1",
@@ -644,7 +770,10 @@ class GitHubStore:
                 with contextlib.suppress(Exception):
                     async with conn.transaction():
                         details = await conn.fetchval("SELECT EXISTS (SELECT 1 FROM github_issue_details)")
-                if stored or details:  # nothing left: a repeated 401 must not move the revision
+                projects = await _optional(conn, lambda: conn.fetchval(
+                    "SELECT EXISTS (SELECT 1 FROM github_projects) OR EXISTS (SELECT 1 FROM github_project_items)"),
+                    False)
+                if stored or details or projects:  # nothing left: a repeated 401 must not move the revision
                     await self._wipe(conn)
         self._call(work)
 
@@ -661,7 +790,17 @@ class GitHubStore:
                 meta = await self._claim(conn)
                 repos = await conn.fetch("SELECT repository_id, data, watermark FROM github_repositories")
                 issues = await conn.fetch("SELECT repository_id, github_id, data FROM github_issues")
+                projects = await _optional(conn, lambda: conn.fetch(
+                    "SELECT project_id, data, watermark FROM github_projects"), [])
+                items = await _optional(conn, lambda: conn.fetch(
+                    "SELECT project_id, item_id, data FROM github_project_items"), [])
             snapshot = Snapshot(identity=meta["identity"], viewer=meta["viewer"], revision=meta["revision"])
+            for row in projects:
+                snapshot.projects[row["project_id"]] = json.loads(row["data"])
+                if row["watermark"] is not None:
+                    snapshot.project_watermarks[row["project_id"]] = row["watermark"]
+            for row in items:
+                snapshot.project_items.setdefault(row["project_id"], {})[row["item_id"]] = json.loads(row["data"])
             for row in repos:
                 snapshot.repositories[row["repository_id"]] = json.loads(row["data"])
                 if row["watermark"] is not None:
@@ -786,7 +925,7 @@ class GitHubStore:
         self._call(work)
 
     def purge_owners_not_in(self, owners: set[str]) -> None:
-        """Drop repositories (and issues) of owners outside the allowlist.
+        """Drop repositories (and issues) and projects (and items) of owners outside the allowlist.
 
         An empty allowlist means "every owner" (config semantics), so it is a no-op.
         """
@@ -801,6 +940,89 @@ class GitHubStore:
                     "SELECT repository_id FROM github_repositories WHERE NOT (owner = ANY($1::text[]))", allowed)]
                 if gone:
                     await self._remove_repos(conn, gone, await self._bump(conn))
+
+                async def projects():
+                    pids = [r["project_id"] for r in await conn.fetch(
+                        "SELECT project_id FROM github_projects WHERE NOT (owner = ANY($1::text[]))", allowed)]
+                    if pids:
+                        await self._remove_projects(conn, pids, await self._bump(conn))
+                await _optional(conn, projects)
+        self._call(work)
+
+    # -- projects (G9)
+
+    async def _put_projects(self, conn, incoming: dict[str, dict], rev) -> None:
+        stored = {r["project_id"]: json.loads(r["data"]) for r in await conn.fetch(
+            "SELECT project_id, data FROM github_projects WHERE project_id = ANY($1::text[])", list(incoming))}
+        changed = [pid for pid, data in incoming.items() if stored.get(pid) != data]
+        if changed:
+            revision = await rev()
+            await conn.executemany(
+                "INSERT INTO github_projects (project_id, owner, data, rev) VALUES ($1,$2,$3::jsonb,$4) "
+                "ON CONFLICT (project_id) DO UPDATE SET owner=EXCLUDED.owner, data=EXCLUDED.data, rev=EXCLUDED.rev",
+                [(pid, _project_owner(incoming[pid]), json.dumps(incoming[pid]), revision) for pid in changed])
+            await conn.execute(
+                "DELETE FROM github_catalog_tombstones WHERE kind='project' AND repository_id = ANY($1::text[])",
+                changed)
+
+    def apply_project(self, row: dict, items: Iterable[dict], removed: Iterable[str],
+                      watermark: str | None) -> None:
+        """One project's completed item read in one transaction: its row (with the ``synced``
+        probe), changed items, removed items and watermark, under one revision.
+        ``GitHubStoreUnavailable`` before migration 0008."""
+        pid = row["project_id"]
+        data = _normal(row)
+        incoming = {entry["item_id"]: _normal(entry) for entry in items}
+        wanted = list(dict.fromkeys(removed))
+
+        async def work(conn):
+            async with conn.transaction():
+                await self._claim(conn)
+                rev = _LazyRevision(conn)
+                await self._put_projects(conn, {pid: data}, rev)
+                stored = {r["item_id"]: json.loads(r["data"]) for r in await conn.fetch(
+                    "SELECT item_id, data FROM github_project_items WHERE project_id=$1 "
+                    "AND item_id = ANY($2::text[])", pid, list(incoming))}
+                changed = [iid for iid, value in incoming.items() if stored.get(iid) != value]
+                if changed:
+                    revision = await rev()
+                    await conn.executemany(
+                        "INSERT INTO github_project_items (project_id, item_id, data, rev) VALUES ($1,$2,$3::jsonb,$4) "
+                        "ON CONFLICT (project_id, item_id) DO UPDATE SET data=EXCLUDED.data, rev=EXCLUDED.rev",
+                        [(pid, iid, json.dumps(incoming[iid]), revision) for iid in changed])
+                    await conn.execute(
+                        "DELETE FROM github_catalog_tombstones WHERE kind='project_item' AND repository_id=$1 "
+                        "AND key = ANY($2::text[])", pid, changed)
+                present = [r["item_id"] for r in await conn.fetch(
+                    "SELECT item_id FROM github_project_items WHERE project_id=$1 AND item_id = ANY($2::text[])",
+                    pid, wanted)] if wanted else []
+                if present:
+                    await conn.execute(
+                        "WITH gone AS (DELETE FROM github_project_items WHERE project_id=$1 "
+                        "AND item_id = ANY($2::text[]) RETURNING item_id) "
+                        "INSERT INTO github_catalog_tombstones (kind, repository_id, key, rev, removed_at) "
+                        "SELECT 'project_item', $1, item_id, $3, $4 FROM gone "
+                        "ON CONFLICT (kind, repository_id, key) DO UPDATE SET rev=EXCLUDED.rev, "
+                        "removed_at=EXCLUDED.removed_at", pid, present, await rev(), self._stamp())
+                await conn.execute("UPDATE github_projects SET watermark=$2 WHERE project_id=$1", pid, watermark)
+        self._call(work)
+
+    def replace_projects(self, rows: Iterable[dict], owners: set[str]) -> None:
+        """The complete project listing of ``owners``: changed rows are written (items
+        untouched) and their projects missing from it are removed with their items."""
+        incoming = {row["project_id"]: _normal(row) for row in rows}
+        listed = sorted(_owners(owners))
+
+        async def work(conn):
+            async with conn.transaction():
+                await self._claim(conn)
+                rev = _LazyRevision(conn)
+                await self._put_projects(conn, incoming, rev)
+                gone = [r["project_id"] for r in await conn.fetch(
+                    "SELECT project_id FROM github_projects WHERE owner = ANY($1::text[]) "
+                    "AND NOT (project_id = ANY($2::text[]))", listed, list(incoming))]
+                if gone:
+                    await self._remove_projects(conn, gone, await rev())
         self._call(work)
 
     def put_detail(self, repo_id: str, issue: dict, fetched_at: float | None = None) -> None:
@@ -862,6 +1084,12 @@ class GitHubStore:
             rows += [_item("issue", r["repository_id"], r["github_id"], r["rev"], json.loads(r["data"]))
                      for r in await conn.fetch(
                          "SELECT repository_id, github_id, data, rev FROM github_issues WHERE rev > $1", floor)]
+            rows += [_item("project", r["project_id"], r["project_id"], r["rev"], json.loads(r["data"]))
+                     for r in await _optional(conn, lambda: conn.fetch(
+                         "SELECT project_id, data, rev FROM github_projects WHERE rev > $1", floor), [])]
+            rows += [_item("project_item", r["project_id"], r["item_id"], r["rev"], json.loads(r["data"]))
+                     for r in await _optional(conn, lambda: conn.fetch(
+                         "SELECT project_id, item_id, data, rev FROM github_project_items WHERE rev > $1", floor), [])]
             tombs = [] if resync else [
                 _item(r["kind"], r["repository_id"], r["key"], r["rev"]) for r in await conn.fetch(
                     "SELECT kind, repository_id, key, rev FROM github_catalog_tombstones "

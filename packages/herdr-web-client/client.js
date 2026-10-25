@@ -276,6 +276,15 @@ export class HerdrClient {
     return this.getConditional(`${path}${query.size ? `?${query}` : ''}`, { signal });
   }
 
+  // GitHub Projects v2 (read-only): the in-scope projects, or one project's items with `project`.
+  // Same contract as getGithubConditional: { body, notModified }, `since` asks for a delta.
+  getGithubProjects({ project, since, signal } = {}) {
+    const query = new URLSearchParams();
+    if (project) query.set('project', String(project));
+    if (since != null) query.set('since', String(since));
+    return this.getConditional(`/api/v1/github/projects${query.size ? `?${query}` : ''}`, { signal });
+  }
+
   getGithubIssue(repository, number, { signal } = {}) {
     const query = new URLSearchParams({ repository, number: String(number) });
     return this.request(`/api/v1/github/issue?${query}`, { signal });
