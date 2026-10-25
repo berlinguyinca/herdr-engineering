@@ -1141,7 +1141,7 @@ class FakeProjects(FakeGitHub):
         project["items"][iid] = {"id": iid, "type": "ISSUE", "isArchived": False, "updatedAt": _iso(self.tick()),
                                  "status": status, "content": {"title": title or f"Item {iid}", "number": 1,
                                                                "url": "https://github.com/acme/app/issues/1",
-                                                               "state": "OPEN", "repository": {"nameWithOwner": "acme/app"}}}
+                                                               "issueState": "OPEN", "repository": {"nameWithOwner": "acme/app"}}}
         project["updatedAt"] = _iso(self.clock)
         return iid
 

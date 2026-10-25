@@ -67,7 +67,10 @@ rateLimit {remaining resetAt cost} }"""
 # and Status options, so a project whose (updatedAt, item count) matches the stored probe costs
 # nothing more. ProjectV2.items can only be ordered by POSITION (ProjectV2ItemOrderField has no
 # UPDATED_AT), so items cannot be read newest first down to a watermark like issues: a changed
-# project's items are read in full (unchanged projects are still skipped).
+# project's items are read in full (unchanged projects are still skipped). Issue.state and
+# PullRequest.state are different enums, so they are aliased (issueState / prState): one response
+# key for both fails GraphQL's SameResponseShape validation. title, number, url and repository
+# have the same type on every content type and share their keys.
 PROJECTS_QUERY = """query($login:String!,$cursor:String) { repositoryOwner(login:$login) { login
 ... on ProjectV2Owner { projectsV2(first:50,after:$cursor,orderBy:{field:UPDATED_AT,direction:DESC}) {
 totalCount pageInfo {hasNextPage endCursor} nodes { id number title url closed updatedAt
@@ -78,8 +81,8 @@ PROJECT_ITEMS_QUERY = """query($id:ID!,$cursor:String) { node(id:$id) { ... on P
 items(first:100,after:$cursor) { totalCount pageInfo {hasNextPage endCursor} nodes {
 id type isArchived updatedAt
 status: fieldValueByName(name:"Status") { ... on ProjectV2ItemFieldSingleSelectValue { name optionId } }
-content { ... on Issue { title number url state repository {nameWithOwner} }
-... on PullRequest { title number url state repository {nameWithOwner} }
+content { ... on Issue { title number url issueState: state repository {nameWithOwner} }
+... on PullRequest { title number url prState: state repository {nameWithOwner} }
 ... on DraftIssue { title } } } } } }
 rateLimit {remaining resetAt cost} }"""
 
@@ -385,7 +388,7 @@ def _project_item(row, project_id):
             "title": redact_text(str(content.get("title") or "")) or None,
             "number": content.get("number") if isinstance(content.get("number"), int) else None,
             "url": content.get("url") if isinstance(content.get("url"), str) else None,
-            "state": content.get("state") if isinstance(content.get("state"), str) else None,
+            "state": next((content[key] for key in ("issueState", "prState") if isinstance(content.get(key), str)), None),
             "repository": repository.get("nameWithOwner") if isinstance(repository.get("nameWithOwner"), str) else None}
 
 

@@ -429,7 +429,10 @@ def test_projects_page_and_items_parse_status_and_mixed_content():
     items = {"data": {"node": {"items": {"totalCount": 4, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [
         {"id": "I1", "type": "ISSUE", "isArchived": False, "updatedAt": "2026-10-20T12:00:00Z",
          "status": {"name": "Todo", "optionId": "o1"},
-         "content": {"title": "Fix it", "number": 7, "url": "https://github.com/acme/app/issues/7", "state": "OPEN",
+         "content": {"title": "Fix it", "number": 7, "url": "https://github.com/acme/app/issues/7", "issueState": "OPEN",
+                     "repository": {"nameWithOwner": "acme/app"}}},
+        {"id": "I5", "type": "PULL_REQUEST", "isArchived": False, "updatedAt": "2026-10-20T12:00:00Z", "status": None,
+         "content": {"title": "Fix PR", "number": 8, "url": "https://github.com/acme/app/pull/8", "prState": "MERGED",
                      "repository": {"nameWithOwner": "acme/app"}}},
         {"id": "I2", "type": "DRAFT_ISSUE", "isArchived": False, "updatedAt": "2026-10-20T12:00:00Z", "status": None,
          "content": {"title": "An idea"}},
@@ -439,9 +442,23 @@ def test_projects_page_and_items_parse_status_and_mixed_content():
     nodes = GitHubProvider(token="placeholder-token-value", client=Client(items)).project_items_page("PVT_1")["nodes"]
     parsed = [_project_item(node, "PVT_1") for node in nodes]
     assert parsed[0]["status_option"] == "o1" and parsed[0]["repository"] == "acme/app" and parsed[0]["number"] == 7
-    assert parsed[1]["status"] is None and parsed[1]["title"] == "An idea"
-    assert parsed[2]["title"] is None and parsed[2]["type"] == "REDACTED"
-    assert parsed[3] is None, "archived items are not shown"
+    assert parsed[0]["state"] == "OPEN" and parsed[1]["state"] == "MERGED" and parsed[1]["type"] == "PULL_REQUEST"
+    assert parsed[2]["status"] is None and parsed[2]["title"] == "An idea"
+    assert parsed[3]["title"] is None and parsed[3]["type"] == "REDACTED"
+    assert parsed[4] is None, "archived items are not shown"
+
+
+def test_project_item_query_aliases_fields_whose_types_differ_across_content_types():
+    """Issue.state (IssueState) and PullRequest.state (PullRequestState) under one response key fail
+    GraphQL's SameResponseShape validation, so every item page would be rejected."""
+    import re
+
+    from herdr_engineering.github import PROJECT_ITEMS_QUERY
+    issue = re.search(r"\.\.\. on Issue \{([^}]*)", PROJECT_ITEMS_QUERY).group(1)
+    pull = re.search(r"\.\.\. on PullRequest \{([^}]*)", PROJECT_ITEMS_QUERY).group(1)
+    assert "issueState: state" in issue and "prState: state" in pull
+    unaliased = re.sub(r"\w+:\s*state\b", "", issue + pull)
+    assert not re.search(r"\bstate\b", unaliased), "state must never appear under its own key"
 
 
 def test_a_missing_read_project_scope_is_named():
