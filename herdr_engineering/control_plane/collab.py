@@ -5007,6 +5007,21 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FilesMixin):
             raise CollabError(403, "waiting for approval")
         return pr
 
+    def file_upload_precheck(self, parts: list[str], query: dict, size: int, authorization: str,
+                             device: str | None, operator: str | None = None) -> tuple[int, dict] | None:
+        """Identity, room, role, name/parent and quota for an upload of ``size`` bytes, BEFORE its body is read:
+        None when it may proceed, else (status, error)."""
+        try:
+            pr = self._request_principal(authorization, device, operator, parts)
+            parent = parts[3] if len(parts) == 5 else query.get("parent")
+            self.upload_precheck(parts[1], pr, query.get("name") if parent is None else None, size, parent)
+            return None
+        except CollabError as exc:
+            err = {"error": exc.message}
+            if exc.code:
+                err["code"] = exc.code
+            return exc.status, err
+
     def file_transfer(self, method: str, parts: list[str], query: dict, data: bytes | None,
                       authorization: str, device: str | None, operator: str | None = None):
         """The raw-bytes file routes (C5): ("json", status, payload) or ("bytes", meta, data)."""

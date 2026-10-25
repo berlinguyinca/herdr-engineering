@@ -24,6 +24,7 @@ import os
 import re
 import tempfile
 import threading
+import unicodedata
 from typing import Any
 
 from . import ids
@@ -38,7 +39,13 @@ MAX_MESSAGE_FILES = 10
 STABLE_DIR = ".collab/files"
 FILE_EVENTS = frozenset({"file_version_added", "file_deleted"})
 _BAD_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f  ]")
-_KEY = re.compile(r"sha256/([0-9a-f]{2})/([0-9a-f]{2})/([0-9a-f]{64})\Z")
+# Room files have their OWN keyspace: the artifact workspace writes `sha256/..` into the same bucket, and a room
+# file's deletion must never be able to remove an artifact's object with equal bytes.
+KEY_PREFIX = "collab-files/"
+_KEY = re.compile(r"collab-files/sha256/([0-9a-f]{2})/([0-9a-f]{2})/([0-9a-f]{64})\Z")
+MEMORY_STORE_CAP = 256 * MiB        # all rooms together, when bytes live only in this process
+_DEVICE_NAMES = frozenset({"con", "prn", "aux", "nul", *(f"com{i}" for i in range(1, 10)),
+                           *(f"lpt{i}" for i in range(1, 10))})
 _EXECUTABLE = frozenset({"exe", "dll", "so", "dylib", "msi", "bat", "cmd", "com", "scr", "ps1", "sh", "bash", "zsh",
                          "vbs", "app", "bin", "run", "jar", "apk", "deb", "rpm", "elf", "pyz", "command", "appimage"})
 _ARCHIVE = frozenset({"zip", "tar", "gz", "tgz", "bz2", "tbz2", "xz", "txz", "7z", "rar", "zst", "lz", "lzma", "cab",
@@ -48,6 +55,20 @@ _ARCHIVE = frozenset({"zip", "tar", "gz", "tgz", "bz2", "tbz2", "xz", "txz", "7z
 def _error(status: int, message: str, code: str | None = None):
     from .collab import CollabError  # collab imports this module; resolve at call time
     return CollabError(status, message, code=code)
+
+
+def content_key(digest: str) -> str:
+    return f"{KEY_PREFIX}sha256/{digest[:2]}/{digest[2:4]}/{digest}"
+
+
+def _room_key(key: str) -> str:
+    if not _KEY.match(key or ""):
+        raise ValueError("not a room-file content key")
+    return key
+
+
+class StoreFull(Exception):
+    """The in-process file store reached its cap."""
 
 
 def _human(n: int) -> str:
@@ -87,9 +108,11 @@ def clean_file_name(raw: Any) -> str:
     segments = re.split(r"[/\\]", raw)
     if any(s.strip() == ".." for s in segments):
         raise _error(400, "file name may not contain '..'")
-    name = segments[-1].strip()
+    name = unicodedata.normalize("NFC", segments[-1].strip())
     if not name or name == ".":
         raise _error(400, "file name is empty")
+    if name.split(".", 1)[0].rstrip(" ").lower() in _DEVICE_NAMES:
+        raise _error(400, "file name is a reserved device name (CON, NUL, COM1, ...)")
     if len(name) > MAX_NAME:
         raise _error(400, f"file name must be at most {MAX_NAME} characters")
     return name
@@ -105,6 +128,11 @@ def file_kind(name: str) -> str:
     return "file"
 
 
+def name_key(name: str) -> str:
+    """Two names that are the same file on macOS or Windows (case, NFC/NFD) are the same name in a room."""
+    return unicodedata.normalize("NFC", name).casefold()
+
+
 def _numbered(name: str, n: int) -> str:
     dot = name.find(".", 1)
     return f"{name} ({n})" if dot < 0 else f"{name[:dot]} ({n}){name[dot:]}"
@@ -116,33 +144,62 @@ def stable_path(name: str) -> str:
 
 # ---------------------------------------------------------------------------------------- blob stores
 class MemoryBlobStore:
-    """In-process stand-in with RustFS's interface (tests and an ephemeral service)."""
+    """In-process stand-in with RustFS's interface. Not durable: a service with a durable event log refuses to
+    upload into it, and its bytes are capped across all rooms."""
 
-    def __init__(self):
+    durable = False
+
+    def __init__(self, max_total: int = MEMORY_STORE_CAP):
         self._data: dict[str, bytes] = {}
         self._lock = threading.Lock()
+        self.max_total = max_total
 
     def put(self, data: bytes) -> tuple[str, str]:
         digest = hashlib.sha256(data).hexdigest()
-        key = f"sha256/{digest[:2]}/{digest[2:4]}/{digest}"
+        key = content_key(digest)
         with self._lock:
-            self._data[key] = bytes(data)
+            if key not in self._data:
+                if sum(len(v) for v in self._data.values()) + len(data) > self.max_total:
+                    raise StoreFull("in-memory file store is full")
+                self._data[key] = bytes(data)
         return key, digest
 
     def get(self, key: str, expected_sha256: str) -> bytes:
-        data = self._data[key]
+        data = self._data[_room_key(key)]
         if hashlib.sha256(data).hexdigest() != expected_sha256:
             raise IntegrityError(f"sha256 mismatch for {key}")
         return data
 
     def delete(self, key: str) -> None:
         with self._lock:
-            self._data.pop(key, None)
+            self._data.pop(_room_key(key), None)
+
+
+class RoomFileObjectStore:
+    """Room files in the artifact object store (RustFS/S3), under their own ``collab-files/`` prefix. It never
+    reads, writes or deletes a key outside that prefix."""
+
+    durable = True
+
+    def __init__(self, client):
+        self.client = client
+
+    def put(self, data: bytes) -> tuple[str, str]:
+        key, digest = self.client.put(data, prefix=KEY_PREFIX)
+        return _room_key(key), digest
+
+    def get(self, key: str, expected_sha256: str) -> bytes:
+        return self.client.get(_room_key(key), expected_sha256)
+
+    def delete(self, key: str) -> None:
+        self.client.delete(_room_key(key))
 
 
 class DirectoryBlobStore:
     """Content-addressed files under one directory, with RustFS's ``put``/``get``/``delete`` interface.
     Used when no RustFS endpoint is configured (the collab-only container keeps them next to its log)."""
+
+    durable = True
 
     def __init__(self, root: str):
         self.root = os.path.abspath(root)
@@ -151,12 +208,12 @@ class DirectoryBlobStore:
     def _path(self, key: str) -> str:
         m = _KEY.match(key or "")
         if not m:
-            raise ValueError("not a content key")
+            raise ValueError("not a room-file content key")
         return os.path.join(self.root, "sha256", m.group(1), m.group(2), m.group(3))
 
     def put(self, data: bytes) -> tuple[str, str]:
         digest = hashlib.sha256(data).hexdigest()
-        key = f"sha256/{digest[:2]}/{digest[2:4]}/{digest}"
+        key = content_key(digest)
         path = self._path(key)
         if not os.path.exists(path):
             os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
@@ -211,6 +268,7 @@ class FilesMixin:
         self._room_file_bytes: dict[str, int] = {}        # room id -> bytes of every live version
         self._blob_refs: dict[str, int] = {}              # storage key -> live versions that use it (any room)
         self._blob_pending: dict[str, int] = {}           # storage key -> uploads in flight (memory only)
+        self._blob_deleting: set[str] = set()             # storage keys being deleted outside the lock
 
     def _files_limits(self) -> dict:
         if self.files_source is not None:
@@ -231,7 +289,7 @@ class FilesMixin:
             if rec is None:
                 rec = self._files[p["file_id"]] = {"id": p["file_id"], "room_id": rid, "name": p["name"],
                                                    "uploader": _by(p), "versions": [], "deleted": False}
-                self._room_file_names.setdefault(rid, {})[p["name"]] = p["file_id"]
+                self._room_file_names.setdefault(rid, {})[name_key(p["name"])] = p["file_id"]
             rec["versions"].append({"version": p["version"], "size": p["size"], "sha256": p["sha256"],
                                     "storage_key": p["storage_key"], "by": _by(p), "created_at": p["created_at"]})
             self._room_file_bytes[rid] = self._room_file_bytes.get(rid, 0) + p["size"]
@@ -242,8 +300,8 @@ class FilesMixin:
                 return True
             rec["deleted"] = True
             names = self._room_file_names.get(rid, {})
-            if names.get(rec["name"]) == rec["id"]:
-                del names[rec["name"]]
+            if names.get(name_key(rec["name"])) == rec["id"]:
+                del names[name_key(rec["name"])]
             for v in rec["versions"]:
                 self._room_file_bytes[rid] = self._room_file_bytes.get(rid, 0) - v["size"]
                 self._blob_refs[v["storage_key"]] = self._blob_refs.get(v["storage_key"], 1) - 1
@@ -265,7 +323,7 @@ class FilesMixin:
     def _free_name(self, room_id: str, name: str) -> str:
         names = self._room_file_names.get(room_id, {})
         n, out = 1, name
-        while out in names:
+        while name_key(out) in names:
             n += 1
             out = _numbered(name, n)
         return out
@@ -279,14 +337,46 @@ class FilesMixin:
             raise _error(413, f"this room's files would use {used + size} bytes; the room limit is "
                               f"{_human(limits['room_bytes'])}. Delete files to free space.", code="room_quota_exceeded")
 
-    def _drop_unreferenced(self, keys) -> None:
+    def _claim_unreferenced(self, keys) -> list[str]:
+        """Under the lock: the keys no live version and no in-flight upload uses. They are marked as being deleted
+        (an upload of the same bytes waits) and are deleted by _delete_blobs, outside the lock."""
+        out = []
         for key in set(keys):
-            if self._blob_refs.get(key, 0) <= 0 and not self._blob_pending.get(key):
+            if self._blob_refs.get(key, 0) <= 0 and not self._blob_pending.get(key) and key not in self._blob_deleting:
                 self._blob_refs.pop(key, None)
-                try:
-                    self.file_blobs.delete(key)
-                except Exception:
-                    self.stats["file_blob_delete_failures"] += 1
+                self._blob_deleting.add(key)
+                out.append(key)
+        return out
+
+    def _delete_blobs(self, keys: list[str]) -> None:
+        """Outside the lock: the store may be across the network."""
+        for key in keys:
+            try:
+                self.file_blobs.delete(key)
+            except Exception:
+                self.stats["file_blob_delete_failures"] += 1
+        if keys:
+            with self._cv:
+                self._blob_deleting.difference_update(keys)
+                self._cv.notify_all()
+
+    def _upload_check(self, room_id: str, author, name: Any, size: int, parent: Any, limits: dict) -> dict:
+        """Everything an upload is refused for, decided before a byte of it is read. Call under the lock."""
+        room, _ = self._authorize(author, room_id, "post", "file.put")
+        self._no_external(author)
+        if self._sink is not None and not getattr(self.file_blobs, "durable", True):
+            raise _error(503, "no durable file store: the operator must configure RustFS or the collab log directory",
+                         code="no_durable_file_store")
+        if parent is not None:
+            self._live_file(room_id, parent)
+        else:
+            clean_file_name(name)
+        self._check_size(room_id, size, limits)
+        return room
+
+    def upload_precheck(self, room_id: str, author, name: Any, size: int, parent: Any = None) -> None:
+        with self._lock:
+            self._upload_check(room_id, author, name, size, parent, self._files_limits())
 
     @staticmethod
     def _version_view(rec: dict, v: dict) -> dict:
@@ -300,20 +390,20 @@ class FilesMixin:
             raise _error(400, "file content must be bytes")
         data = bytes(data)
         limits = self._files_limits()
-        with self._lock:
-            self._authorize(author, room_id, "post", "file.put")
-            self._no_external(author)
-            if parent is not None:
-                self._live_file(room_id, parent)
-            else:
-                clean_file_name(name)
-            self._check_size(room_id, len(data), limits)
+        digest = hashlib.sha256(data).hexdigest()
+        pending = content_key(digest)
+        with self._cv:
+            self._upload_check(room_id, author, name, len(data), parent, limits)
+            while pending in self._blob_deleting:          # the same bytes are being deleted: wait for that
+                self._cv.wait(1.0)
             # An in-flight upload holds its content key, so a concurrent delete of the same bytes keeps the blob.
-            pending = hashlib.sha256(data).hexdigest()
-            pending = f"sha256/{pending[:2]}/{pending[2:4]}/{pending}"
             self._blob_pending[pending] = self._blob_pending.get(pending, 0) + 1
+        committed = False
         try:
-            key, digest = self.file_blobs.put(data)
+            try:
+                key, digest = self.file_blobs.put(data)
+            except StoreFull:
+                raise _error(507, "the file store is full; ask the operator", code="file_store_full") from None
             with self._lock:
                 room, _ = self._authorize(author, room_id, "post", "file.put")
                 if parent is not None:
@@ -326,13 +416,16 @@ class FilesMixin:
                     author, project_id=room["project_id"], room_id=room_id, file_id=file_id, name=final,
                     version=version, size=len(data), sha256=digest, storage_key=key, parent=parent,
                     action="file.put", outcome="allowed", project_ids=[room["project_id"]], resource_id=file_id))
-        finally:       # a refused upload leaves its bytes as an unreferenced, content-addressed blob
+                committed = True
+        finally:
             with self._lock:
                 left = self._blob_pending.get(pending, 1) - 1
                 if left > 0:
                     self._blob_pending[pending] = left
                 else:
                     self._blob_pending.pop(pending, None)
+                orphan = [] if committed else self._claim_unreferenced([pending])   # a refused upload's bytes
+            self._delete_blobs(orphan)
         self.stats["files_put"] += 1
         return {"id": file_id, "name": final, "version": version, "size": len(data), "sha256": digest}
 
@@ -393,7 +486,8 @@ class FilesMixin:
             self._commit("file_deleted", self._actor(
                 pr, project_id=room["project_id"], room_id=room_id, file_id=rec["id"], name=rec["name"],
                 action="file.delete", outcome="allowed", project_ids=[room["project_id"]], resource_id=rec["id"]))
-            self._drop_unreferenced(v["storage_key"] for v in rec["versions"])
+            drop = self._claim_unreferenced(v["storage_key"] for v in rec["versions"])
+        self._delete_blobs(drop)                                   # no lock held across store I/O
         return {"deleted": rec["id"], "freed_bytes": freed}
 
     def _message_files(self, room_id: str, value: Any) -> list[dict]:

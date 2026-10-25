@@ -1062,7 +1062,7 @@ def _make_handler(server, public=False, operator=False):
             # defences as the operator listener: no DNS-rebound names, no cross-site writes.
             if not _dashboard_host_ok(self.headers.get("Host", ""), server.collab_dashboard_hosts):
                 return self._deny(404, "not found")
-            from .collab_files import HARD_MAX_BYTES, transfer_route
+            from .collab_files import transfer_route
             transfer = transfer_route(self.command, [unquote(seg) for seg in
                                                      urlsplit(self.path).path.split("/")[4:] if seg])
             ctype = "application/octet-stream" if transfer else "application/json"
@@ -1075,9 +1075,10 @@ def _make_handler(server, public=False, operator=False):
                     return self._deny(415, f"{'file uploads' if transfer else 'mutations'} require {ctype}")
             from .collab import MAX_BODY
             length = _content_length(self.headers.get("Content-Length"))
-            # file bytes: the collab service applies its own YAML limit; this is only the hard ceiling
-            cap = HARD_MAX_BYTES if transfer else MAX_BODY
+            # file bytes: the same YAML per-file limit the collab service applies (control_plane.collab.files)
+            cap = self._collab_file_cap() if transfer else MAX_BODY
             if self.command == "POST" and (length is None or length > cap):
+                self.close_connection = True                     # the unread body must not become a request
                 return self._deny(413, "request body too large")
             data = self.rfile.read(length) if self.command == "POST" and length else None
             if self.command == "POST" and data is None:
@@ -1087,6 +1088,8 @@ def _make_handler(server, public=False, operator=False):
                 headers={"Content-Type": ctype} if data is not None or self.command == "POST" else {})
             keep = ("Content-Type", "Content-Disposition", "X-Content-Type-Options", "Content-Security-Policy",
                     "X-Herdr-File-Id", "X-Herdr-File-Version", "X-Herdr-File-Sha256")
+            # a download may predate a lowered limit: read up to the hard ceiling, never truncate a file
+            from .collab_files import HARD_MAX_BYTES
             limit = HARD_MAX_BYTES + 1 if transfer == "download" else 2_000_000
             try:
                 with urllib.request.urlopen(req, timeout=60 if transfer else 15) as resp:   # noqa: S310 (operator-configured URL)
@@ -1170,6 +1173,18 @@ def _make_handler(server, public=False, operator=False):
                 return self._json(result[1], result[0])
             return self._collab_sse(service, result)
 
+        def _collab_file_cap(self):
+            """The per-file limit: from the collab service here, else from this server's fleet YAML, else the default."""
+            from .collab_files import DEFAULT_MAX_BYTES, normalize_files
+            if server.collab is not None:
+                return server.collab._files_limits()["max_bytes"]
+            try:
+                section = server.fleet_config.secure_section("control_plane") if server.fleet_config else {}
+                collab = section.get("collab") if isinstance(section, dict) else None
+                return normalize_files((collab or {}).get("files") if isinstance(collab, dict) else None)["max_bytes"]
+            except Exception:
+                return DEFAULT_MAX_BYTES
+
         def _collab_file(self, service, parts, query, operator):
             """Room files (C5): a raw-bytes upload, or a download served for saving only, never for display."""
             from .collab_files import _human as _human_bytes
@@ -1180,8 +1195,19 @@ def _make_handler(server, public=False, operator=False):
                 if length is None:
                     return self._deny(411, "Content-Length required")
                 if length > limit:          # refused before a byte is read
+                    self.close_connection = True                 # the unread body must not become a request
                     return self._json({"error": f"the file is {length} bytes; the limit is "
                                                 f"{_human_bytes(limit)} per file", "code": "file_too_large"}, 413)
+                try:                        # who, which room, which role, which quota: all before the body
+                    refused = service.file_upload_precheck(parts, query, length,
+                                                           self.headers.get("Authorization", ""),
+                                                           self.headers.get("X-Herdr-Device"),
+                                                           operator=server.operator_user if operator else None)
+                except Exception:
+                    refused = (500, {"error": "internal error"})
+                if refused is not None:
+                    self.close_connection = True
+                    return self._json(refused[1], refused[0])
                 data = self.rfile.read(length) if length else b""
             try:
                 kind, a, b = service.file_transfer(self.command, parts, query, data,

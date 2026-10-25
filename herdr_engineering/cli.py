@@ -2688,7 +2688,7 @@ def _cmd_cp_web(args) -> int:
         # C5: room files. Limits are YAML only (control_plane.collab.files), re-read per request. Bytes go to the
         # object store artifacts already use (RustFS) when one is wired; otherwise a content-addressed directory
         # next to the collab log, so a restart keeps them.
-        from .control_plane.collab_files import DirectoryBlobStore, normalize_files
+        from .control_plane.collab_files import DirectoryBlobStore, RoomFileObjectStore, normalize_files
         raw_files = getattr(args, "collab_files", None)
         if raw_files is None and isinstance(cp.get("collab"), dict):
             raw_files = cp["collab"].get("files")
@@ -2702,7 +2702,7 @@ def _cmd_cp_web(args) -> int:
                 return ((section.get("collab") or {}) if isinstance(section.get("collab"), dict) else {}).get("files")
             collab.files_source = _files_from_yaml
         if rustfs is not None:
-            collab.file_blobs = rustfs
+            collab.file_blobs = RoomFileObjectStore(rustfs)     # its own collab-files/ keyspace, never artifacts'
         elif getattr(args, "collab_log_file", None):
             collab.file_blobs = DirectoryBlobStore(args.collab_log_file + ".files")
     svr = ControlPlaneServer(repo, api_keys=api_keys, lineage_key_scopes=lineage_key_scopes,

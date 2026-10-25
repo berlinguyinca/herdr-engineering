@@ -30,7 +30,8 @@ MiB = 1024 * 1024
 
 
 @pytest.fixture
-def w(svc):
+def w(svc, tmp_path):
+    svc.file_blobs = DirectoryBlobStore(str(tmp_path / "files"))
     return W(svc)
 
 
@@ -262,7 +263,7 @@ def test_the_shelf_and_the_bytes_survive_a_restart(tmp_path):
 def test_directory_store_is_content_addressed_and_verifies(tmp_path):
     store = DirectoryBlobStore(str(tmp_path / "b"))
     key, digest = store.put(b"abc")
-    assert digest == sha(b"abc") and key == f"sha256/{digest[:2]}/{digest[2:4]}/{digest}"
+    assert digest == sha(b"abc") and key == f"collab-files/sha256/{digest[:2]}/{digest[2:4]}/{digest}"
     assert store.get(key, digest) == b"abc"
     with pytest.raises(Exception):
         store.get(key, "0" * 64)
@@ -275,7 +276,8 @@ def test_directory_store_is_content_addressed_and_verifies(tmp_path):
 
 # ------------------------------------------------------------------ HTTP
 @pytest.fixture
-def http(svc):
+def http(svc, tmp_path):
+    svc.file_blobs = DirectoryBlobStore(str(tmp_path / "files"))
     from herdr_engineering.control_plane.api import ControlPlaneServer
     from herdr_engineering.control_plane.repo import ControlPlaneRepo
     room = W(svc)
@@ -343,6 +345,7 @@ def test_the_dashboard_proxy_carries_uploads_and_downloads(tmp_path):
     )
     gen = op_stack.__wrapped__(tmp_path)
     st = next(gen)
+    st.svc.file_blobs = DirectoryBlobStore(str(tmp_path / "files"))
     try:
         d = st.dash.port
 
@@ -426,3 +429,297 @@ def test_agent_helper_sends_its_credential_only_over_https_or_to_this_machine(tm
     with pytest.raises(SystemExit) as e:
         cli.main(["collab", "file", "list", "--agent-file", str(af), "--base", base, "--room", "r"])
     assert "--base" in str(e.value)
+
+
+# ------------------------------------------------------------------ review fixes (C5 review)
+class _FakeS3:
+    def __init__(self):
+        self.objects = {}
+
+    def put_object(self, *, Bucket, Key, Body):
+        self.objects[Key] = bytes(Body)
+
+    def get_object(self, *, Bucket, Key):
+        return {"Body": self.objects[Key]}
+
+    def head_object(self, *, Bucket, Key):
+        return Key in self.objects
+
+    def delete_object(self, *, Bucket, Key):
+        self.objects.pop(Key, None)
+
+
+def test_room_files_never_touch_the_artifact_keyspace(svc):
+    from herdr_engineering.control_plane.collab_files import RoomFileObjectStore
+    from herdr_engineering.control_plane.rustfs import RustFSClient
+    s3 = _FakeS3()
+    rustfs = RustFSClient(endpoint="http://x", bucket="b", s3=s3)
+    art_key, art_sha = rustfs.put(b"same bytes")                     # an artifact
+    svc.file_blobs = RoomFileObjectStore(rustfs)
+    w = W(svc)
+    f = svc.put_file(w.room, w.bob, "same.txt", b"same bytes")
+    assert any(k.startswith("collab-files/") for k in s3.objects)
+    svc.delete_file(w.bob, w.room, f["id"])
+    assert rustfs.get(art_key, art_sha) == b"same bytes"              # the artifact is still readable
+    assert not any(k.startswith("collab-files/") for k in s3.objects)
+    with pytest.raises(ValueError):
+        svc.file_blobs.delete(art_key)                                 # the room store refuses artifact keys
+
+
+def test_directory_and_memory_stores_use_their_own_prefix(tmp_path):
+    from herdr_engineering.control_plane.collab_files import MemoryBlobStore
+    for store in (DirectoryBlobStore(str(tmp_path / "d")), MemoryBlobStore()):
+        key, _ = store.put(b"x")
+        assert key.startswith("collab-files/sha256/")
+
+
+def test_a_durable_log_refuses_uploads_without_a_durable_file_store(svc):
+    from herdr_engineering.control_plane.collab_files import MemoryBlobStore
+    svc.file_blobs = MemoryBlobStore()
+    w = W(svc)
+    with pytest.raises(Exception) as e:
+        svc.put_file(w.room, w.bob, "a.txt", b"x")
+    assert e.value.status == 503 and "no durable file store" in e.value.message
+
+
+def test_the_memory_store_has_a_global_cap():
+    from herdr_engineering.control_plane.collab_files import MemoryBlobStore
+    s = CollabService(StaticTokenAuthenticator({u: _digest(t) for u, t in USERS.items()}), now=Clock())
+    s.file_blobs = MemoryBlobStore(max_total=10)
+    w = W(s)
+    s.put_file(w.room, w.bob, "a.txt", b"x" * 8)
+    s.put_file(w.room, w.bob, "dup.txt", b"x" * 8)                     # the same bytes cost nothing more
+    with pytest.raises(Exception) as e:
+        s.put_file(w.room, w.bob, "b.txt", b"y" * 8)
+    assert e.value.status == 507
+
+
+def test_two_simultaneous_uploads_over_the_room_quota_accept_exactly_one(w):
+    import time
+    w.s.files_limits = normalize_files({"max_bytes": 60, "room_bytes": 100})
+    inner = w.s.file_blobs
+
+    class Slow:
+        durable = True
+
+        def put(self, data):
+            time.sleep(0.2)                                             # both pass the pre-check first
+            return inner.put(data)
+
+        def get(self, *a):
+            return inner.get(*a)
+
+        def delete(self, key):
+            return inner.delete(key)
+    w.s.file_blobs = Slow()
+    results = []
+
+    def go(n):
+        try:
+            results.append(w.s.put_file(w.room, w.bob, f"{n}.bin", bytes([n]) * 60))
+        except Exception as exc:
+            results.append(exc.status)
+    ts = [threading.Thread(target=go, args=(n,)) for n in (1, 2)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+    assert sorted(r if isinstance(r, int) else 201 for r in results) == [201, 413]
+    assert w.s.list_files(w.bob, w.room)["used_bytes"] == 60
+    loser = next(n for n in (1, 2) if not any(isinstance(r, dict) and r["name"] == f"{n}.bin" for r in results))
+    digest = hashlib.sha256(bytes([loser]) * 60).hexdigest()
+    with pytest.raises(Exception):                                       # the refused upload left no orphan blob
+        inner.get(f"collab-files/sha256/{digest[:2]}/{digest[2:4]}/{digest}", digest)
+
+
+def test_names_are_nfc_and_case_insensitively_unique(w):
+    a = w.s.put_file(w.room, w.bob, "Report.pdf", b"1")
+    b = w.s.put_file(w.room, w.bob, "report.pdf", b"2")
+    assert (a["name"], b["name"]) == ("Report.pdf", "report (2).pdf")
+    nfd = "Café.txt"
+    c = w.s.put_file(w.room, w.bob, nfd, b"3")
+    assert c["name"] == "Café.txt"
+    d = w.s.put_file(w.room, w.bob, "CAFÉ.TXT", b"4")
+    assert d["name"] == "CAFÉ (2).TXT"
+
+
+@pytest.mark.parametrize("raw", ["CON", "nul.txt", "Com1", "lpt9.log", "aux.tar.gz", "PRN"])
+def test_windows_device_names_are_refused(w, raw):
+    assert code(w.s.put_file, w.room, w.bob, raw, b"x") == 400
+
+
+def test_delete_does_blob_io_without_holding_the_service_lock(w):
+    f = w.s.put_file(w.room, w.bob, "d.txt", b"x")
+    inner, seen = w.s.file_blobs, []
+
+    class Probe:
+        durable = True
+
+        def put(self, data):
+            return inner.put(data)
+
+        def get(self, *a):
+            return inner.get(*a)
+
+        def delete(self, key):
+            def probe():                               # another thread: an RLock held by the caller blocks it
+                got = w.s._lock.acquire(blocking=False)
+                seen.append(got)
+                if got:
+                    w.s._lock.release()
+            t = threading.Thread(target=probe)
+            t.start()
+            t.join()
+            inner.delete(key)
+    w.s.file_blobs = Probe()
+    res = {}
+
+    def run():
+        res["out"] = w.s.delete_file(w.bob, w.room, f["id"])
+    holder = threading.Thread(target=run)
+    holder.start()
+    holder.join()
+    assert res["out"]["deleted"] == f["id"] and seen == [True]
+
+
+def test_http_upload_is_refused_before_the_body_is_read(http):
+    import http.client as hc
+    room = http.room.room
+    host, port = http.base.split("//")[1].split("/")[0].split(":")
+    for headers in ({}, {"Authorization": f"Bearer {USERS['carol']}"}, {"Authorization": f"Bearer {USERS['bob']}"}):
+        conn = hc.HTTPConnection(host, int(port), timeout=5)
+        conn.putrequest("POST", f"/api/v1/collab/rooms/{room}/files?name=big.bin")
+        conn.putheader("Content-Type", "application/octet-stream")
+        conn.putheader("Content-Length", str(25 * MiB + (1 if "bob" in str(headers) else 0)))
+        for k, v in headers.items():
+            conn.putheader(k, v)
+        conn.endheaders()                                   # no body is sent at all
+        try:
+            r = conn.getresponse()
+        except TimeoutError:
+            pytest.fail("the server waited for a body it should have refused")
+        assert r.status in (401, 403, 413), r.status
+        conn.close()
+
+
+def test_dashboard_proxy_caps_uploads_at_the_configured_limit(tmp_path):
+    import http.client
+
+    from tests.control_plane.test_collab_operator import stack as op_stack  # noqa: F401
+    gen = op_stack.__wrapped__(tmp_path)
+    st = next(gen)
+    try:
+        d = st.dash.port
+        conn = http.client.HTTPConnection("127.0.0.1", d, timeout=5)
+        conn.putrequest("POST", "/api/v1/collab/rooms/r/files?name=x")
+        conn.putheader("Host", f"127.0.0.1:{d}")
+        conn.putheader("Content-Type", "application/octet-stream")
+        conn.putheader("Content-Length", str(25 * MiB + 1))
+        conn.endheaders()
+        assert conn.getresponse().status == 413
+        conn.close()
+    finally:
+        gen.close()
+
+
+def test_agent_helper_does_not_follow_redirects_with_its_credential(tmp_path, monkeypatch):
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    from herdr_engineering import cli
+    seen = []
+
+    class Target(BaseHTTPRequestHandler):
+        def do_GET(self):
+            seen.append(self.headers.get("Authorization"))
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"files": []}')
+
+        def log_message(self, *a):
+            pass
+    target = HTTPServer(("127.0.0.1", 0), Target)
+
+    class Bounce(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(302)
+            self.send_header("Location", f"http://127.0.0.1:{target.server_port}{self.path}")
+            self.end_headers()
+
+        def log_message(self, *a):
+            pass
+    bounce = HTTPServer(("127.0.0.1", 0), Bounce)
+    for srv in (target, bounce):
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        af = tmp_path / "agent.json"
+        af.write_text(json.dumps({"credential": "secret-cred", "device_id": "d"}))
+        with pytest.raises(SystemExit):
+            cli.main(["collab", "file", "list", "--agent-file", str(af), "--base", f"http://127.0.0.1:{bounce.server_port}",
+                      "--room", "r"])
+        assert seen == []
+    finally:
+        target.shutdown()
+        bounce.shutdown()
+
+
+def test_agent_helper_refuses_a_symlinked_files_folder(tmp_path):
+    from herdr_engineering.cli import _collab_file_target
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    a = tmp_path / "a"
+    a.mkdir()
+    (a / ".collab").symlink_to(outside)
+    with pytest.raises(SystemExit):
+        _collab_file_target(str(a), "x.txt")
+    b = tmp_path / "b"
+    (b / ".collab").mkdir(parents=True)
+    (b / ".collab" / "files").symlink_to(outside)
+    with pytest.raises(SystemExit):
+        _collab_file_target(str(b), "x.txt")
+    c = tmp_path / "c"
+    (c / ".collab" / "files").mkdir(parents=True)
+    (c / ".collab" / "files" / "x.txt").symlink_to(outside / "x.txt")
+    with pytest.raises(SystemExit):
+        _collab_file_target(str(c), "x.txt")
+
+
+def test_agent_helper_get_requires_a_matching_hash(http, tmp_path, monkeypatch):
+    from herdr_engineering import cli
+    agent, info = http.room.agent("bob")
+    af = tmp_path / "agent.json"
+    af.write_text(json.dumps({"credential": info["credential"], "device_id": info["device_id"]}))
+    work = tmp_path / "work"
+    work.mkdir()
+    monkeypatch.chdir(work)
+    base = http.base.rsplit("/api/v1/collab", 1)[0]
+    common = ["--agent-file", str(af), "--base", base, "--room", http.room.room]
+    http.s.put_file(http.room.room, http.room.alice, "h.txt", b"real")
+    real = http.s.get_file
+    monkeypatch.setattr(http.s, "get_file", lambda *a, **k: (real(*a, **k)[0], b"tampered"))
+    with pytest.raises(SystemExit) as e:
+        cli.main(["collab", "file", "get", "h.txt", *common])
+    assert "sha256" in str(e.value)
+    assert not (work / ".collab" / "files" / "h.txt").exists()
+    folder = work / ".collab" / "files"
+    assert not folder.exists() or not list(folder.iterdir())             # no temp file left behind
+
+
+def test_agent_helper_leaves_no_temp_file_when_the_write_fails(http, tmp_path, monkeypatch):
+    import os
+
+    from herdr_engineering import cli
+    agent, info = http.room.agent("bob")
+    af = tmp_path / "agent.json"
+    af.write_text(json.dumps({"credential": info["credential"], "device_id": info["device_id"]}))
+    work = tmp_path / "work"
+    work.mkdir()
+    monkeypatch.chdir(work)
+    http.s.put_file(http.room.room, http.room.alice, "t.txt", b"t")
+
+    def boom(*a, **k):
+        raise OSError("disk full")
+    monkeypatch.setattr(os, "replace", boom)
+    assert cli.main(["collab", "file", "get", "t.txt", "--agent-file", str(af), "--base",
+                     http.base.rsplit("/api/v1/collab", 1)[0], "--room", http.room.room]) == 1
+    assert list((work / ".collab" / "files").iterdir()) == []
