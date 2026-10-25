@@ -2367,47 +2367,64 @@ class ControlPlaneRepo:
                 stream = self._events.get((entity_type, ids), [])
                 if not stream:
                     continue
-                last = stream[-1]
-                payload = _payload(last)
-                try:
-                    if entity_type in ("test_run", "build"):
-                        self.upsert_test_run(
-                            ids, kind=payload.get("kind") or entity_type,
-                            mission_id=payload.get("mission_id"),
-                            session_id=payload.get("session_id"),
-                            repository=payload.get("repository"),
-                            status=payload.get("status"),
-                            passed=payload.get("passed"),
-                            failed=payload.get("failed"),
-                            skipped=payload.get("skipped"),
-                            total=payload.get("total"),
-                            started_at=payload.get("started_at"),
-                            ended_at=payload.get("ended_at"),
-                            results=payload.get("results"),
-                        )
-                    elif entity_type == "review":
-                        self.upsert_review(
-                            ids, mission_id=payload.get("mission_id"),
-                            session_id=payload.get("session_id"),
-                            reviewer=payload.get("reviewer"),
-                            status=payload.get("status"),
-                            verdict=payload.get("verdict"),
-                            started_at=payload.get("started_at"),
-                            completed_at=payload.get("completed_at"),
-                        )
-                    elif entity_type == "pull_request":
-                        self.upsert_pull_request(
-                            ids, mission_id=payload.get("mission_id"),
-                            repository=payload.get("repository"),
-                            number=payload.get("number"),
-                            url=payload.get("url"),
-                            status=payload.get("status"),
-                            branch=payload.get("branch"),
-                            base=payload.get("base"),
-                            created_at=payload.get("created_at"),
-                        )
-                except (ValueError, KeyError, TypeError):  # a bad row never blocks startup
-                    continue
+                # Replay the whole stream in order: a review's findings are their
+                # own events, and a merged PR ends with a partial merge event, so
+                # rebuilding from only the last event would drop data. Each event
+                # payload carries enough to rebuild (record_event is suppressed, so
+                # nothing is re-persisted and the streams are not duplicated).
+                for ev in stream:
+                    payload = _payload(ev)
+                    event_type = ev.get("event_type", "")
+                    try:
+                        if entity_type in ("test_run", "build"):
+                            self.upsert_test_run(
+                                ids, kind=payload.get("kind") or entity_type,
+                                mission_id=payload.get("mission_id"),
+                                session_id=payload.get("session_id"),
+                                repository=payload.get("repository"),
+                                status=payload.get("status"),
+                                passed=payload.get("passed"),
+                                failed=payload.get("failed"),
+                                skipped=payload.get("skipped"),
+                                total=payload.get("total"),
+                                started_at=payload.get("started_at"),
+                                ended_at=payload.get("ended_at"),
+                                results=payload.get("results"),
+                            )
+                        elif entity_type == "review":
+                            if event_type == "ReviewFindingAdded":
+                                self.add_review_finding(
+                                    ids, severity=payload.get("severity"),
+                                    summary=payload.get("summary"),
+                                    detail=payload.get("detail") or "",
+                                    status=payload.get("status") or "open",
+                                    finding_id=payload.get("finding_id"),
+                                )
+                            else:
+                                self.upsert_review(
+                                    ids, mission_id=payload.get("mission_id"),
+                                    session_id=payload.get("session_id"),
+                                    reviewer=payload.get("reviewer"),
+                                    status=payload.get("status"),
+                                    verdict=payload.get("verdict"),
+                                    started_at=payload.get("started_at"),
+                                    completed_at=payload.get("completed_at"),
+                                )
+                        elif entity_type == "pull_request":
+                            if event_type == "PullRequestMerged":
+                                continue  # subset of the last Opened/Updated event
+                            self.upsert_pull_request(
+                                ids, mission_id=payload.get("mission_id"),
+                                repository=payload.get("repository"),
+                                number=payload.get("number"),
+                                url=payload.get("url"),
+                                status=payload.get("status"),
+                                branch=payload.get("branch"),
+                                base=payload.get("base"),
+                                created_at=payload.get("created_at"),
+                            )
+                    except (ValueError, KeyError, TypeError):  # a bad row never blocks startup
+                        continue
 
     def take_collab_replay(self):
         """Hand the diverted durable HCN events to the collaboration service (once)."""

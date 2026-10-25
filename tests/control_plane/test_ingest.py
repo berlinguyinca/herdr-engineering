@@ -524,3 +524,38 @@ def test_v2_test_run_bad_results_does_not_consume_sequence():
     svc.ingest(good, {"id": "agent", "kind": "agent", "authenticated_by": "api_key"})
     runs = repo.list_test_runs(mission_id="pi:M1")
     assert len(runs) == 1 and len(runs[0]["results"]) == 1
+
+
+def test_delivery_rebuild_preserves_review_findings_and_pr_merge():
+    repo = ControlPlaneRepo()
+    svc = make_svc(repo)
+    svc.ingest({"entity_type": "review", "entity_id": "rvx",
+                "event_type": "review.started",
+                "payload": {"mission_id": "m1", "reviewer": "codex",
+                            "status": "completed", "verdict": "changes"}})
+    svc.ingest({"entity_type": "review_finding", "entity_id": "rvx",
+                "event_type": "review_finding.added",
+                "payload": {"severity": "blocker", "summary": "crash"}})
+    svc.ingest({"entity_type": "pull_request", "entity_id": "prx",
+                "event_type": "pull_request.opened",
+                "payload": {"mission_id": "m1", "number": 3, "status": "open",
+                            "branch": "x", "base": "main"}})
+    svc.ingest({"entity_type": "pull_request", "entity_id": "prx",
+                "event_type": "pull_request.updated",
+                "payload": {"mission_id": "m1", "number": 3, "status": "merged",
+                            "branch": "x", "base": "main"}})
+    state = repo.export_state()
+    del state["delivery"]
+    restored = ControlPlaneRepo()
+    restored.import_state(state)
+    reviews = restored.list_reviews(mission_id="m1")
+    assert len(reviews) == 1
+    assert reviews[0]["verdict"] == "changes"
+    assert len(reviews[0]["findings"]) == 1
+    assert reviews[0]["findings"][0]["summary"] == "crash"
+    pulls = restored.list_pull_requests(mission_id="m1")
+    assert len(pulls) == 1 and pulls[0]["status"] == "merged"
+    assert pulls[0]["branch"] == "x" and pulls[0]["base"] == "main"
+    # Streams are not duplicated by the rebuild.
+    assert len(restored.stream("review", "rvx")) == 2
+    assert len(restored.stream("pull_request", "prx")) == 3
