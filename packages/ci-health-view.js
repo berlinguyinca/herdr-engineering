@@ -26,9 +26,9 @@ export function ciHealthUnavailable(history={},missingClient=false) {
 }
 
 // Persist user preferences per route context; repository/mission/session never become global filters.
-export function mountCiHealth(host,client,{onSelectRun=()=>{},onSelectStep=()=>{},onLayout=()=>{},repository='',mission='',session='',search}={}) {
+export function mountCiHealth(host,client,{onSelectRun=()=>{},onSelectStep=()=>{},onLayout=()=>{},onContext=()=>{},repository='',mission='',session='',search}={}) {
   const doc=host.ownerDocument;
-  let context={repository,mission,session},state,expanded,selection=null,selected=null,selectedKey='',layout='split';
+  let context={repository,mission,session},commandProject=null,state,expanded,selection=null,selected=null,selectedKey='',layout='split';
   let history=null,model=null,orderSignature='',error='',disposed=false,timer=null,pending=null,generation=0;
   const listeners=new AbortController();
   const treeLimits=new Map();
@@ -88,8 +88,9 @@ export function mountCiHealth(host,client,{onSelectRun=()=>{},onSelectStep=()=>{
     return rows(history?.pipelines).some(record=>(context.mission && !['mission_key','mission_id','related_missions'].some(key=>Object.hasOwn(record,key))) || (context.session && !['session_id','related_sessions'].some(key=>Object.hasOwn(record,key))));
   }
   function scopedHistory() {
-    if(!context.mission && !context.session)return history || {};
-    return {...history,...(contextCoverageUnknown()?{coverage:{},status:'partial'}:{}),pipelines:rows(history?.pipelines).filter(record=>(!context.mission || (record.mission_key || record.mission_id)===context.mission || rows(record.related_missions).some(row=>(row.mission_key || row.mission_id)===context.mission)) && (!context.session || record.session_id===context.session || rows(record.related_sessions).some(row=>row.session_id===context.session)))};
+    const projected=ciHealthProjectHistory(history||{},commandProject);
+    if(!context.mission && !context.session)return projected;
+    return {...projected,...(contextCoverageUnknown()?{coverage:{},status:'partial'}:{}),pipelines:rows(projected.pipelines).filter(record=>(!context.mission || (record.mission_key || record.mission_id)===context.mission || rows(record.related_missions).some(row=>(row.mission_key || row.mission_id)===context.mission)) && (!context.session || record.session_id===context.session || rows(record.related_sessions).some(row=>row.session_id===context.session)))};
   }
   function selectedSteps() {
     if(!selected || !Array.isArray(selected.tasks))return '';
@@ -141,12 +142,16 @@ export function mountCiHealth(host,client,{onSelectRun=()=>{},onSelectStep=()=>{
       if(history)history={...history,stale:true};error=`CI history unavailable: ${reason?.message || 'Refresh failed'}. ${history?'Showing the last received snapshot.':''}`;draw();
     } finally {clearTimeout(timeout);if(pending===request)pending=null;if(!disposed && version===generation)schedule();}
   }
+  function notifyContext() {
+    const repo=selection?model?.projects.find(p=>p.key===selection.projectKey)?.repo:commandProject;
+    onContext({...state,project:repo?{...repo,provider_repo_id:repo.provider_repo_id??repo.id}:null});
+  }
   host.addEventListener('change',event=>{
     const target=event.target;
-    for(const name of ['scope','sort'])if(target.matches(`[data-health-${name}]`)){state[name]=target.value;selection=null;state=ciHealthPreferences(state);save();draw();return;}
-    if(target.matches('[data-health-failures]')){state.failuresOnly=target.checked;selection=null;save();draw();}
+    for(const name of ['scope','sort'])if(target.matches(`[data-health-${name}]`)){state[name]=target.value;selection=null;state=ciHealthPreferences(state);save();draw();notifyContext();return;}
+    if(target.matches('[data-health-failures]')){state.failuresOnly=target.checked;selection=null;save();draw();notifyContext();}
   },{signal:listeners.signal});
-  host.addEventListener('input',event=>{for(const name of ['search','branch'])if(event.target.matches(`[data-health-${name}]`)){state[name]=bounded(event.target.value);selection=null;save();draw();}},{signal:listeners.signal});
+  host.addEventListener('input',event=>{for(const name of ['search','branch'])if(event.target.matches(`[data-health-${name}]`)){state[name]=bounded(event.target.value);selection=null;save();draw();notifyContext();}},{signal:listeners.signal});
   host.addEventListener('toggle',event=>{
     const node=event.target;if(disposed || !host.contains(node) || !node.matches('[data-health-disclosure]'))return;
     const key=node.dataset.healthDisclosure;if(expanded.has(key)===node.open)return;
@@ -155,10 +160,10 @@ export function mountCiHealth(host,client,{onSelectRun=()=>{},onSelectStep=()=>{
   },{capture:true,signal:listeners.signal});
   host.addEventListener('click',event=>{
     const button=event.target.closest('button');if(!button || !host.contains(button))return;
-    if(button.hasAttribute('data-health-mode')){state.mode=button.dataset.healthMode;selection=null;syncControls();save();draw();return;}
+    if(button.hasAttribute('data-health-mode')){state.mode=button.dataset.healthMode;selection=null;syncControls();save();draw();notifyContext();return;}
     if(button.hasAttribute('data-health-layout')){layout=button.dataset.healthLayout;applyLayout();return;}
-    if(button.hasAttribute('data-health-clear')){selection=null;save();draw();return;}
-    if(button.hasAttribute('data-health-bucket')){selection={projectKey:button.dataset.healthProject,bucketKey:button.dataset.healthBucket};save();draw();return;}
+    if(button.hasAttribute('data-health-clear')){selection=null;save();draw();notifyContext();return;}
+    if(button.hasAttribute('data-health-bucket')){selection={projectKey:button.dataset.healthProject,bucketKey:button.dataset.healthBucket};save();draw();notifyContext();return;}
     if(button.hasAttribute('data-health-tree-more')){const key=button.dataset.healthTreeMore;treeLimits.set(key,(treeLimits.get(key) || 100)+100);draw();return;}
     if(button.hasAttribute('data-health-run')){const record=model?.selectedRows.find(row=>row.runKey===button.dataset.healthRun);if(record){selected=record;selectedKey=record.runKey;draw();onSelectRun(record);}return;}
     if(button.hasAttribute('data-health-step') && selected)onSelectStep(selected,button.dataset.healthStep);
@@ -175,9 +180,27 @@ export function mountCiHealth(host,client,{onSelectRun=()=>{},onSelectStep=()=>{
   draw();refresh();
   return {
     refresh,
+    setObservabilityContext(next={}) {
+      if(disposed)return;
+      rememberDisclosures();
+      const nextProject=next.project===undefined?commandProject:next.project;
+      if(JSON.stringify(commandProject)!==JSON.stringify(nextProject))selection=null;
+      commandProject=nextProject;
+      const updated={...state,mode:[7,14,30].includes(Number(next.days))?String(next.days):state.mode};
+      for(const key of ['scope','branch','search','failuresOnly'])if(next[key]!==undefined)updated[key]=next[key];
+      if(['mode','scope','branch','search','failuresOnly'].some(key=>updated[key]!==state[key]))selection=null;
+      state=ciHealthPreferences(updated);syncControls();save();draw();
+    },
     setLayout(value){if(disposed || !['split','tree','pipeline'].includes(value))return;layout=value;applyLayout();},
     selectedRun(record){if(disposed)return;selected=record;selectedKey=record?runKey(record):'';draw();},
     setContext(next={}){if(disposed)return;rememberDisclosures();save();context={repository:next.repository || '',mission:next.mission || '',session:next.session || ''};load();for(const name of ['search','branch'])if(typeof next[name]==='string')state[name]=bounded(next[name]);selected=null;selectedKey='';treeLimits.clear();syncControls();draw(false);},
     dispose(){disposed=true;generation++;clearTimeout(timer);pending?.abort();pending=null;listeners.abort();},
   };
+}
+
+
+export function ciHealthProjectHistory(history,project) {
+  if(!project)return history;
+  const same=row=>String(row.provider_url||'').replace(/\/+$/,'')===String(project.provider_url||'').replace(/\/+$/,'') && String(row.provider_repo_id??row.id)===String(project.provider_repo_id) && row.repository===project.repository;
+  return {...history,repos:rows(history.repos).filter(same),pipelines:rows(history.pipelines).filter(same)};
 }

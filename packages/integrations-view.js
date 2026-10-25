@@ -6,7 +6,8 @@ import {recordOutcome} from './record-state.js';
 import {ciRunKey} from './ci-performance.js';
 import {ciChartModel,renderCiCharts,ciChartStyles} from './ci-charts.js';
 import {ciInsightsModel,renderCiInsights,ciInsightStyles,renderCiRunReports} from './ci-insights.js';
-import {renderCiPipeline,ciPipelineStyles,pipelineZoom,sameCiRepository,ciComparisonModel,renderCiComparison} from './ci-pipeline.js';
+import {renderCiPipeline,renderCiDiagnosis,ciPipelineStyles,pipelineZoom,sameCiRepository,ciComparisonModel,renderCiComparison} from './ci-pipeline.js';
+import {mountCiObservability} from './ci-observability-view.js';
 import {mountCiHealth} from './ci-health-view.js';
 import {snapshotText,animateChanges} from './motion.js';
 import {renderCiFix,ciFixStyles,fixRunKey,latestFix,fixIsActive,fixError} from './ci-fix-view.js';
@@ -129,10 +130,11 @@ export function renderPipeline(pipeline,{loading=false,error='',log=null,logErro
   return `<div class="ig-heading"><h2>Run #${esc(pipeline.run_number ?? '')}</h2><button type="button" class="hd-btn" data-close-inspector><span class="ig-back-label">Back to runs</span><span class="ig-close-label">Close</span></button></div>
     <p class="ig-note">${esc(pipeline.repository || '')}${pipeline.branch ? ` · ${esc(pipeline.branch)}` : ''}${pipeline.revision ? ` · <code>${esc(pipeline.revision)}</code>` : ''} · ${esc(human(stateOf(pipeline)) || 'Status unknown')} · ${elapsed(pipeline)}</p>
     <div class="ig-links">${external(pipeline.url,'Open in Woodpecker')}${pipeline.can_retry ? '<button class="hd-btn" type="button" data-ci-action="retry">Retry run</button>' : ''}${pipeline.can_cancel ? '<button class="hd-btn" type="button" data-ci-action="cancel">Cancel run</button>' : ''}</div>
+    <p class="ig-note">Event: ${esc(pipeline.event||'Not reported')} · Created: ${esc(pipeline.created_at||'Not reported')} · Started: ${esc(pipeline.started_at||'Not reported')} · Finished: ${esc(pipeline.finished_at||'Not reported')}</p>
     ${relatedHtml}
     ${error ? `<p class="ig-warning" role="status">${esc(error)} Showing the last received details.</p>` : ''}${actionMessage ? `<p role="status" class="ig-note">${esc(actionMessage)}</p>` : ''}
     ${integrationOutcome(pipeline)==='failed' ? `<details class="ig-debug" data-debug-disclosure><summary>Debug with Pi</summary><p class="ig-note">Send the failed revision, step details and bounded log output to a Pi agent you choose.</p>${debugSessions===null ? '<p class="ig-note">Open this section to load active Pi agents.</p>' : `<label class="ig-note">Target Pi agent<select data-debug-session aria-label="Target Pi agent"><option value="">Choose an agent…</option>${debugSessions.map(s=>`<option value="${esc(s.session_id)}" ${s.session_id===debugSessionId?'selected':''}>${esc(short(s.display_name || s.title || s.summary || s.cwd || s.session_id,100))}${s.host_id?` · ${esc(short(s.host_id,60))}`:''}${pipeline.branch && s.branch===pipeline.branch?' · on this branch':''}</option>`).join('')}</select></label>${!debugSessions.length ? '<p class="ig-note">No active Pi agents with verified messaging are available.</p>' : ''}<button type="button" class="hd-btn" data-debug-send ${!debugSessionId?'disabled':''}>Send to Pi</button> <button type="button" class="hd-btn" data-debug-fix ${!debugSessionId?'disabled':''}>Fix with Pi</button><p class="ig-note">Fix with Pi asks the agent to reproduce the failure in a new worktree at this exact revision, fix it and open a pull request. It never merges.</p>`}${debugMessage ? `<p class="ig-note" role="status">${esc(debugMessage)}</p>` : ''}</details>` : ''}${integrationOutcome(pipeline)==='failed' ? fixHtml : ''}
-    ${tasks.length ? `<p class="ig-note">${completed} of ${tasks.length} steps finished · Select a step for its log</p><progress value="${completed}" max="${tasks.length}" aria-label="Pipeline steps finished"></progress><div class="ci-pipeline-controls" role="group" aria-label="Pipeline display"><button type="button" class="hd-btn" data-collapse-success aria-pressed="${collapseSuccess}">${collapseSuccess?'Expand successful steps':'Collapse successful steps'}</button><button type="button" class="hd-btn" data-pipeline-zoom="out" aria-label="Zoom out" ${zoom<=.75?'disabled':''}>−</button><button type="button" class="hd-btn" data-pipeline-zoom="reset" aria-label="Reset zoom">${Math.round(zoom*100)}%</button><button type="button" class="hd-btn" data-pipeline-zoom="in" aria-label="Zoom in" ${zoom>=1.5?'disabled':''}>+</button></div>${renderCiPipeline(pipeline,{step,collapseSuccess,zoom})}` : (!Array.isArray(pipeline.tasks) && loading && !error ? '<p class="ig-note" role="status">Loading pipeline steps…</p>' : '<p class="ig-note">No steps reported yet. Waiting for Woodpecker.</p>')}
+    ${tasks.length ? `<p class="ig-note">${completed} of ${tasks.length} steps finished · Select a step for its log</p><progress value="${completed}" max="${tasks.length}" aria-label="Pipeline steps finished"></progress><div class="ci-pipeline-controls" role="group" aria-label="Pipeline display"><button type="button" class="hd-btn" data-collapse-success aria-pressed="${collapseSuccess}">${collapseSuccess?'Expand successful steps':'Collapse successful steps'}</button><button type="button" class="hd-btn" data-pipeline-zoom="out" aria-label="Zoom out" ${zoom<=.75?'disabled':''}>−</button><button type="button" class="hd-btn" data-pipeline-zoom="reset" aria-label="Reset zoom">${Math.round(zoom*100)}%</button><button type="button" class="hd-btn" data-pipeline-zoom="in" aria-label="Zoom in" ${zoom>=1.5?'disabled':''}>+</button></div>${renderCiPipeline(pipeline,{step,collapseSuccess,zoom,diagnosis:pipeline.diagnosis})}` : renderCiDiagnosis(pipeline.diagnosis)+(!Array.isArray(pipeline.tasks) && loading && !error ? '<p class="ig-note" role="status">Loading pipeline steps…</p>' : '<p class="ig-note">No steps reported yet. Waiting for Woodpecker.</p>')}
     ${step ? `<h3>Step log</h3>${logError ? `<p class="ig-warning" role="status">${esc(logError)}</p>` : ''}${log===null ? '<p class="ig-note" role="status">Loading step output…</p>' : `<p class="ig-note">${age(log.checked_at,'Log checked')}${log.truncated?' · Output truncated':''}</p>${log.available===false ? `<p class="ig-note">${esc(log.error || 'Log output is not available yet.')}</p>` : `<pre class="ig-log" tabindex="0" aria-label="Step output">${esc(text(log.log)) || 'No output reported yet.'}</pre>`}`}` : ''}`;
 }
 
@@ -160,16 +162,16 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
   let reportData=null,reportsError='',insightsSignature='',failurePage=0,testPage=0,testSearch='';
   let debugSessions=null,debugSessionId='',debugMessage='',debugOperationId='',fixOperationId='';
   let fixAvailable=true,fix=null,fixMessage='',sandboxOperationId='',fixTerminal=null,fixTerminalError='';
-  let healthView=null,workspace=tab==='current'?'health':'runs',collapseSuccess=false,zoom=1,comparisonKey='',listScroll=0,healthOriginKey='';
+  let healthView=null,observabilityView=null,workspace=tab==='current'?'health':'runs',collapseSuccess=false,zoom=1,comparisonKey='',listScroll=0,healthOriginKey='';
   const observedDetails=new Map();
   let performanceData=null,performanceError='',performanceDays=14;
   const pending=new Map();
   const listenerController=new AbortController();
   const reviewCache=new Map();
   const title=isCi?'CI':'Reviews';
-  container.innerHTML=`${styles}${isCi?ciChartStyles+ciInsightStyles+ciPipelineStyles+ciFixStyles:''}<h1>${title}</h1><p class="ig-intro">${isCi?'Follow builds from queue to finished steps. Inspect output and open the original run in Woodpecker.':'Review plans and code in Plannotator, with decisions linked to the mission and revision they belong to.'}</p>
+  container.innerHTML=`${styles}${isCi?ciChartStyles+ciInsightStyles+ciPipelineStyles+'<style>'+ciFixStyles+'</style>':''}<h1>${title}</h1><p class="ig-intro">${isCi?'Follow builds from queue to finished steps. Inspect output and open the original run in Woodpecker.':'Review plans and code in Plannotator, with decisions linked to the mission and revision they belong to.'}</p>
     <div data-ig-health role="status"></div><p data-ig-error class="ig-warning" role="status"></p>
-    ${isCi?'<div data-ci-health></div>':''}
+    ${isCi?'<div data-ci-observability></div><div data-ci-health></div>':''}
     <div class="ig-tabs" role="tablist" aria-label="${title} outcome">${tabs.map(([key,label])=>`<button type="button" role="tab" id="ig-tab-${key}" data-tab="${key}" aria-controls="ig-results" aria-selected="${state.tab===key}" tabindex="${state.tab===key?0:-1}">${label} <strong data-count="${key}">…</strong></button>`).join('')}</div>
     <div class="ig-controls"><label>Search ${isCi?'runs':'reviews'}<input data-ig-search type="search" value="${esc(search)}" placeholder="Project, repository, branch or revision"></label><label>Group by<select data-ig-group><option value="project">Project / repository</option><option value="none">Most recent</option></select></label></div>
     ${isCi ? '<div class="ig-controls ci-report-filters"><label>Repository<select data-ci-repository><option value="">All repositories</option></select></label><label>Branch<select data-ci-branch><option value="">All branches</option></select></label><label>Period<select data-ci-period><option value="0">All retained history</option><option value="7">Last 7 days</option><option value="14">Last 14 days</option><option value="30">Last 30 days</option><option value="90">Last 90 days</option></select></label></div><div data-ci-insights></div>' : ''}
@@ -180,6 +182,7 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
   const el=selector=>container.querySelector(selector);
   if(isCi){
     healthView=mountCiHealth(el('[data-ci-health]'),client,{repository,mission,session,search:search || undefined,
+      onContext:context=>{const next={days:['7','14','30'].includes(context.mode)?Number(context.mode):14,scope:context.scope,branch:context.branch,search:context.search,failuresOnly:context.failuresOnly,project:context.project};observabilityView?.setContext(next);if(observabilityView)applyCiContext(next);},
       onSelectRun:record=>openCiRun(record),
       onSelectStep:(record,stepId)=>{
         if(selected?.id!==ciRunKey(record))openCiRun(record);
@@ -187,6 +190,16 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
       }});
     const slot=el('[data-health-pipeline-slot]');
     if(slot)slot.append(el('.ig-inspector'));
+    if(typeof client.getCiSummary==='function') {
+      state.days=14;el('[data-ci-period]').value='14';
+      healthView.setObservabilityContext({days:14,scope:'all',branch:'',search});
+      observabilityView=mountCiObservability(el('[data-ci-observability]'),client,{repository,provider,mission,session,search,
+        onContext:context=>{
+          healthView?.setObservabilityContext(context);
+          applyCiContext(context);
+        },
+        onSelectRun:record=>openCiRun(record)});
+    }
   }
   if(isCi){
     const panels={};
@@ -199,6 +212,16 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
       const node=el(selector);if(!node)continue;if(selector==='.ci-report-filters'){nav.after(node);continue;}panels[selector==='[data-ci-insights]'?'tests':'runs'].append(node);
     }
     nav.addEventListener('keydown',event=>{if(!['ArrowLeft','ArrowRight','Home','End'].includes(event.key))return;const keys=['health','runs','tests'],i=keys.indexOf(workspace);workspace=keys[event.key==='Home'?0:event.key==='End'?2:(i+(event.key==='ArrowRight'?1:2))%3];event.preventDefault();draw();el(`[data-ci-workspace="${workspace}"]`).focus();},{signal:listenerController.signal});
+  }
+  function applyCiContext(context) {
+    const changed=state.branch!==context.branch||Number(state.days)!==context.days;
+    state.repository=context.project?String(context.project.provider_repo_id):repository;
+    state.provider=context.project?.provider_url||provider;
+    state.branch=context.branch;state.days=context.days;state.search=context.search;state.page=0;
+    el('[data-ig-search]').value=state.search;
+    el('[data-ci-period]').value=String(state.days);
+    if(changed)refreshPerformance(true);
+    draw();
   }
   const reviewVersion=record=>JSON.stringify([record.updated_at,record.status,record.decision]);
   const ciObservations=()=>{
@@ -371,7 +394,7 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
       if(reportedProvider && reportedProvider!==target.providerUrl)throw new Error('Pipeline provider identity mismatch');
       const next=pipelineDetails(response.pipeline,{...pipeline,repository:target.repository,run_number:target.number});
       if(ciRunKey(next)!==key)throw new Error('Pipeline identity mismatch');
-      pipeline=next;detailError='';observedDetails.set(key,pipeline);if(observedDetails.size>30)observedDetails.delete(observedDetails.keys().next().value);
+      pipeline={...next,diagnosis:response.diagnosis??null};detailError='';observedDetails.set(key,pipeline);if(observedDetails.size>30)observedDetails.delete(observedDetails.keys().next().value);
     },()=>{if(selected?.id===key)detailError='Pipeline details could not refresh.';});
     if(fixAvailable && integrationOutcome(pipeline)==='failed' && typeof client.listCiFix==='function'){
       const run=fixRunKey(target.providerId,target.number);
@@ -512,7 +535,7 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
     const index=tabs.findIndex(([key])=>key===state.tab);
     state.tab=tabs[event.key==='Home'?0:event.key==='End'?tabs.length-1:(index+(event.key==='ArrowRight'?1:tabs.length-1))%tabs.length][0];state.page=0;event.preventDefault();draw();el(`[data-tab="${state.tab}"]`).focus();
   });
-  if(isCi)for(const [selector,key] of [['[data-ci-repository]','repository'],['[data-ci-branch]','branch'],['[data-ci-period]','days']])el(selector).addEventListener('change',event=>{state[key]=event.target.value;state.page=0;if(key==='days'&&[7,14].includes(Number(state.days))){performanceDays=Number(state.days);el('[data-ci-performance-window]').value=String(performanceDays);}if(key==='days'||key==='branch')refreshPerformance(true);draw();});
+  if(isCi)for(const [selector,key] of [['[data-ci-repository]','repository'],['[data-ci-branch]','branch'],['[data-ci-period]','days']])el(selector).addEventListener('change',event=>{state[key]=event.target.value;state.page=0;if(key==='days'&&[7,14].includes(Number(state.days))){performanceDays=Number(state.days);el('[data-ci-performance-window]').value=String(performanceDays);}if(key==='days'||key==='branch'){refreshPerformance(true);const context={branch:state.branch,...([7,14,30].includes(Number(state.days))?{days:Number(state.days)}:{})};observabilityView?.setContext(context);healthView?.setObservabilityContext(context);}draw();});
   if(isCi)el('[data-ci-performance-window]').addEventListener('change',event=>{performanceDays=Number(event.target.value);if(Number(state.days)===7&&performanceDays===14){state.days='14';el('[data-ci-period]').value='14';}refreshPerformance(true);});
   container.addEventListener('input',event=>{if(event.target.hasAttribute('data-ci-test-search')){testSearch=event.target.value;testPage=0;draw();}},{signal:listenerController.signal});
   el('[data-ig-search]').addEventListener('input',event=>{state.search=event.target.value;state.page=0;draw();});
@@ -523,5 +546,5 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
     refresh();for(const disclosure of container.querySelectorAll('details[open]'))disclosure.dispatchEvent(new Event('toggle'));timer=setInterval(refresh,5000);clock=setInterval(tick,1000);
   }
   draw();document.addEventListener('visibilitychange',visibility);visibility();
-  return {refresh(){refresh();healthView?.refresh?.();},dispose(){disposed=true;healthView?.dispose();listenerController.abort();clearInterval(timer);clearInterval(clock);for(const controller of pending.values())controller.abort();pending.clear();document.removeEventListener('visibilitychange',visibility);}};
+  return {refresh(){refresh();healthView?.refresh?.();observabilityView?.refresh();},dispose(){disposed=true;healthView?.dispose();observabilityView?.dispose();listenerController.abort();clearInterval(timer);clearInterval(clock);for(const controller of pending.values())controller.abort();pending.clear();document.removeEventListener('visibilitychange',visibility);}};
 }

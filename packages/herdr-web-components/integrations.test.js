@@ -149,3 +149,8 @@ test('a selected CI run shows its related items above the steps',()=>{
   assert.ok(related.indexOf('RELATED-HERE')<related.indexOf('Pipeline')||!related.includes('Pipeline'));
   assert.doesNotMatch(renderPipeline({run_number:12,tasks:[]}),/RELATED-HERE|class="rel"/);
 });
+
+test('inspector includes API diagnosis even when provider supplies no steps',()=>{
+ const html=renderPipeline({run_number:7,state:'failure',event:'push',revision:'abc',created_at:'2026-10-25T10:00:00Z',diagnosis:{evidence_availability:'unavailable',reason:'No validated report matches this exact run.',failed_steps:[],failed_tests:[]}});
+ assert.match(html,/Failure diagnosis/);assert.match(html,/No validated report/);assert.match(html,/push/);assert.match(html,/2026-10-25T10:00:00Z/);
+});
