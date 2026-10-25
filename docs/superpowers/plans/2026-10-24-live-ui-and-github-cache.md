@@ -427,9 +427,10 @@ Spec section: "Collaboration room editor and shared work". Literal text reaches 
 
 ### Task C7: Handoff status, presence, unread mentions
 
-**Files:** Modify `collab.py`, `packages/collab-view.js`; Test: `tests/test_collab_handoff.py`
+**Files:** Modify `collab.py`, `packages/collab-view.js`, the collab worker (`packages/collab-scripts.js` template and its two generated copies `packages/collab-scripts/worker.sh`, `deploy/control-plane/collab-worker.sh`); Test: `tests/test_collab_handoff.py`, `tests/control_plane/test_collab_scripts.py`
 
-- [ ] **Step 1: Write failing tests:** a handoff starts `pending`, recipient accept/decline updates it and posts a card; presence shows "working" while an agent holds an active task; unread mention count per person clears when the room is read. **Steps 2-4. Step 5: Commit** `feat(collab): handoff status, presence and unread mentions`. (Close PR-C3.)
+- A mention wakes the addressed agent: the collab worker waits on `mentions_me` (not only `tasks_wait`) and presents the mention to its harness.
+- [ ] **Step 1: Write failing tests:** a handoff starts `pending`, recipient accept/decline updates it and posts a card; presence shows "working" while an agent holds an active task; unread mention count per person clears when the room is read; a message with `@<agent address>` (no task) reaches that agent's worker, which hands the message text to its harness once, while an unaddressed message does not. **Steps 2-4. Step 5: Commit** `feat(collab): handoff status, presence and unread mentions`. (Close PR-C3.)
 
 ---
 
