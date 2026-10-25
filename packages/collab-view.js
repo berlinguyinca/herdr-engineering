@@ -16,7 +16,7 @@ import {
   createHelpersPanel, renderEgressRequests, renderHelperTree, renderHostsTable, renderPanic, renderProfileEditor, wireHelperHandlers,
 } from './collab-helpers.js';
 import { ensureConversationStyles, mountComposer } from './conversation-composer.js';
-import { providers, ROOM_COMMANDS, unresolvedMentions, mentionChips, resolvesTo } from './collab-mention.js';
+import { providers, ROOM_COMMANDS, unresolvedMentions, ambiguousMentions, mentionChips, resolveToken } from './collab-mention.js';
 import { renderMarkdown } from './conversation-markdown.js';
 import {
   AuthError, CollabApi, TokenStore, authorizeUrl, exchangeCode, parseRedirect, pkcePair, randomString,
@@ -1364,12 +1364,20 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
         placeholder: 'Message the room… @ people, agents and files · / commands',
         hint: 'Enter sends · Shift+Enter adds a line · @gert.pi … gives that agent a task',
         providers, context: mentionCtx,
-        check: (text) => { const missing = unresolvedMentions(text, mentionCtx()); return missing.length ? `${missing.map((n) => `@${n}`).join(', ')} addresses nobody here; it will be sent as plain text.` : ''; },
+        check: (text) => {
+          const ctx = mentionCtx(), notes = [];
+          for (const a of ambiguousMentions(text, ctx)) notes.push(`@${a.name} is ambiguous — use ${a.forms.length ? a.forms.join(' or ') : '@owner.harness'}.`);
+          const missing = unresolvedMentions(text, ctx);
+          if (missing.length) notes.push(`${missing.map((n) => `@${n}`).join(', ')} addresses nobody here; it will be sent as plain text.`);
+          return notes.join(' ');
+        },
         onSend: async (text) => {
           // The text goes out exactly as typed: the server derives mentions, and a harness reads what was written.
           const lead = /^@([a-z0-9._-]{1,48})\s+\S/i.exec(text.trim());
           // the same precedence as the server: a group or a person handle is never an agent's task
-          const hit = lead && resolvesTo(lead[1].toLowerCase(), mentionCtx());
+          const found = lead && resolveToken(lead[1].toLowerCase(), mentionCtx());
+          if (found?.ambiguous) throw new Error(`More than one agent or person is called @${lead[1]}; use ${found.ambiguous.length ? found.ambiguous.join(' or ') : '@owner.harness'}`);
+          const hit = found?.hit;
           const target = hit && hit.kind === 'agent' && S.agents.find((a) => a.agent_id === hit.id);
           const mention = target && target.actions.includes('execute');
           if (mention) { // the room's authenticated leading-agent task contract, now with the verbatim text

@@ -94,10 +94,11 @@ function rank(rows, limit = 12) {
     .slice(0, limit).map((r) => r.item);
 }
 const agentKey = (a) => a.address || a.name;
+// The one agent a name addresses (address, current name or old name), or null when it addresses a person,
+// nobody, or more than one principal (the server's rule: an ambiguous name addresses nobody).
 export function findAgent(agents, name) {
-  const n = String(name || '').toLowerCase();
-  return (agents || []).find((a) => a.address === n) || (agents || []).find((a) => a.name === n)
-    || (agents || []).find((a) => (a.aliases || []).includes(n)) || null;
+  const found = lookup(String(name || '').toLowerCase(), { agents });
+  return found?.hit?.kind === 'agent' ? (agents || []).find((a) => a.agent_id === found.hit.id) || null : null;
 }
 
 export const providers = {
@@ -143,28 +144,53 @@ export function applyCompletion(text, caret, start, item) {
 // a word, trailing punctuation ignored. Each name once, in order.
 const MENTION = /(?<![^\s([{])@([A-Za-z0-9._-]{1,48})(?![A-Za-z0-9._-])/g;
 export function mentionTokens(text) {
-  const plain = String(text).replace(/```[\s\S]*?(?:```|$)/g, ' ').replace(/`[^`\n]*`/g, ' ');
+  const plain = String(text).replace(/(```|~~~)[\s\S]*?(?:\1|$)/g, ' ').replace(/`[^`\n]*`/g, ' ');
   return [...plain.matchAll(MENTION)].map((m) => m[1].toLowerCase());
 }
-// Precedence as on the server: group, agent address, person handle, then an agent's current or old name.
-function resolveName(name, ctx) {
-  if (GROUPS.some((g) => g.name === name)) return { kind: 'group', id: name, name };
-  const agent = (ctx.agents || []).find((a) => a.address === name);
-  if (agent) return { kind: 'agent', id: agent.agent_id, name };
-  const person = (ctx.people || []).find((p) => p.handle === name);
-  if (person) return { kind: 'person', id: person.user_id, name };
-  const alias = findAgent(ctx.agents, name);
-  return alias ? { kind: 'agent', id: alias.agent_id, name: agentKey(alias) } : null;
-}
-export function resolvesTo(token, ctx = {}) {
-  for (const name of [token, token.replace(/[._-]+$/, '')]) {
-    const hit = name && resolveName(name, ctx);
-    if (hit) return hit;
+// Precedence as on the server: groups; agent addresses; person handles together with agents' current
+// names (a collision between the two addresses nobody); then old names. Two principals at one level -> ambiguous.
+function lookup(name, ctx) {
+  if (GROUPS.some((g) => g.name === name)) return { hit: { kind: 'group', id: name, name } };
+  const agents = ctx.agents || [], people = ctx.people || [];
+  const agentHit = (a) => ({ kind: 'agent', id: a.agent_id, name: agentKey(a), agent: a });
+  const levels = [
+    agents.filter((a) => a.address === name).map(agentHit),
+    [...people.filter((p) => p.handle === name).map((p) => ({ kind: 'person', id: p.user_id, name: p.handle })),
+      ...agents.filter((a) => a.name === name).map(agentHit)],
+    agents.filter((a) => (a.aliases || []).includes(name)).map(agentHit),
+  ];
+  for (const level of levels) {
+    const unique = [...new Map(level.map((h) => [`${h.kind}:${h.id}`, h])).values()];
+    if (unique.length === 1) { const { agent, ...hit } = unique[0]; return { hit }; }
+    if (unique.length > 1) {
+      return { ambiguous: unique.filter((h) => h.kind === 'agent' && h.agent.address).map((h) => `@${h.agent.address}`).sort() };
+    }
   }
   return null;
 }
+// The first candidate (token, then token without trailing punctuation) that means anything decides:
+// { hit } | { ambiguous: ['@unambiguous.form', ...] } | null.
+export function resolveToken(token, ctx = {}) {
+  for (const name of [token, token.replace(/[._-]+$/, '')]) {
+    const found = name && lookup(name, ctx);
+    if (found) return found;
+  }
+  return null;
+}
+export function resolvesTo(token, ctx = {}) {
+  return resolveToken(token, ctx)?.hit || null;
+}
+export function ambiguousMentions(text, ctx = {}) {
+  const out = new Map();
+  for (const t of mentionTokens(text)) {
+    const found = resolveToken(t, ctx);
+    const name = t.replace(/[._-]+$/, '');
+    if (found?.ambiguous && !out.has(name)) out.set(name, { name, forms: found.ambiguous });
+  }
+  return [...out.values()];
+}
 export function unresolvedMentions(text, ctx = {}) {
-  return [...new Set(mentionTokens(text).filter((t) => !resolvesTo(t, ctx)))];
+  return [...new Set(mentionTokens(text).filter((t) => !resolveToken(t, ctx)))];
 }
 
 // Generic items (`{insert, label, section, icon, detail}`) filtered and ranked by the typed query.
@@ -184,7 +210,7 @@ export function mentionChips(html, mentions, ctx = {}) {
       if (!name) continue;
       const byName = list.find((m) => m.name === name);
       if (byName) return { m: byName, len: name.length };
-      const r = resolveName(name, ctx);
+      const r = lookup(name, ctx)?.hit;
       const byId = r && list.find((m) => m.kind === r.kind && m.id === r.id);
       if (byId) return { m: byId, len: name.length };
     }

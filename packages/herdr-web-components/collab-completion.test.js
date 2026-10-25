@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { completionAt, providers, applyCompletion, ROOM_COMMANDS, unresolvedMentions, mentionChips, filterItems } from '../collab-mention.js';
+import { completionAt, providers, applyCompletion, ROOM_COMMANDS, unresolvedMentions, mentionChips, filterItems, resolvesTo, resolveToken, findAgent, ambiguousMentions, mentionTokens } from '../collab-mention.js';
 
 const ctx = {
   people: [{ user_id: 'u1', handle: 'gert', online: true }, { user_id: 'u2', handle: 'ana' }],
@@ -90,4 +90,31 @@ test('filterItems ranks generic references by label and insert text', () => {
   const items = [{ insert: '@src/app.js', label: 'src/app.js', section: 'Files' }, { insert: 'https://github.com/o/r/issues/12', label: 'Issue #12', section: 'Issues' }];
   assert.deepEqual(filterItems(items, 'app').map((i) => i.label), ['src/app.js']);
   assert.deepEqual(filterItems(items, '12').map((i) => i.label), ['Issue #12']);
+});
+
+const clash = {
+  people: [{ user_id: 'u1', handle: 'gert' }, { user_id: 'u3', handle: 'coder' }],
+  agents: [
+    { agent_id: 'a1', address: 'gert.pi', name: 'p1', aliases: ['lead'], skills: ['skill:review'] },
+    { agent_id: 'a2', address: 'ana.claude', name: 'p2', aliases: ['lead'], skills: ['deploy'] },
+    { agent_id: 'a3', address: 'ana.codex', name: 'coder', aliases: [], skills: [] },
+  ],
+};
+
+test('a name shared at one level addresses nobody, as on the server, and says which forms to use', () => {
+  assert.equal(resolvesTo('lead', clash), null);
+  assert.deepEqual(resolveToken('lead', clash), { ambiguous: ['@ana.claude', '@gert.pi'] });
+  assert.equal(resolvesTo('coder', clash), null);                                   // person handle = agent name
+  assert.deepEqual(resolveToken('coder', clash), { ambiguous: ['@ana.codex'] });
+  assert.deepEqual(resolvesTo('gert.pi', clash), { kind: 'agent', id: 'a1', name: 'gert.pi' });
+  assert.equal(findAgent(clash.agents, 'lead'), null);
+  assert.deepEqual(providers['/']('', { ...clash, agent: 'lead' }), []);
+  assert.deepEqual(unresolvedMentions('@lead @coder @gert', clash), []);              // not unknown: ambiguous
+  assert.deepEqual(ambiguousMentions('@lead and @coder, @gert @lead.', clash),
+    [{ name: 'lead', forms: ['@ana.claude', '@gert.pi'] }, { name: 'coder', forms: ['@ana.codex'] }]);
+  assert.equal(mentionChips('<p>@lead</p>', [{ kind: 'agent', id: 'a1', name: 'gert.pi' }], clash), '<p>@lead</p>');
+});
+
+test('names inside ~~~ fences are not mentions either', () => {
+  assert.deepEqual(mentionTokens('~~~\n@gert\n~~~ @ana ~~~py\n@x'), ['ana']);
 });

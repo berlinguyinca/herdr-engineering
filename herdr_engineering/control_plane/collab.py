@@ -4681,28 +4681,30 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin):
         return seen is not None and self._now() - seen < self.ONLINE_WINDOW
 
     def _address_book(self, room_id: str) -> dict[str, dict]:
-        """name -> mention for one room, by precedence: group, agent address, person handle, an agent's
-        current name, then its old names. A lower level never overrides a higher one; a name two agents
-        share at the same level addresses nobody."""
+        """name -> mention for one room, by precedence: group, agent address, then person handles and agents'
+        current names (one level), then old names. A lower level never overrides a higher one; a name two
+        principals share at the same level addresses nobody."""
         room = self._rooms[room_id]
         people = [u for u in room["members"] if self._member(room, u)]
         agents = self._room_agents_live(room)
         # a group is stored by name only: who it reaches is worked out when a message is read, for that reader
         book: dict[str, dict] = {g: {"kind": "group", "id": g, "name": g} for g in mentions.GROUPS}
-        levels: list[dict[str, list[dict]]] = [defaultdict(list) for _ in range(4)]
+        # levels: addresses; person handles together with agents' current names (a collision between the two
+        # addresses nobody, so neither silently wins); then old names
+        levels: list[dict[str, list[dict]]] = [defaultdict(list) for _ in range(3)]
         for aid in agents:
             m = {"kind": "agent", "id": aid, "name": self._address(aid) or self._agents[aid]["name"]}
             if self._address(aid):
                 levels[0][self._address(aid)].append(m)
-            levels[2][self._agents[aid]["name"]].append(m)
+            levels[1][self._agents[aid]["name"]].append(m)
             for old in self._agents[aid].get("aliases", ()):
-                levels[3][old].append(m)
+                levels[2][old].append(m)
         for u in people:
             if self._user_handle.get(u):
                 levels[1][self._user_handle[u]].append({"kind": "person", "id": u, "name": self._user_handle[u]})
         for level in levels:
             for name, hits in level.items():
-                if name not in book and len({h["id"] for h in hits}) == 1:
+                if name not in book and len({(h["kind"], h["id"]) for h in hits}) == 1:
                     book[name] = hits[0]
                 elif name not in book:
                     book[name] = None                      # ambiguous: blocks lower levels too

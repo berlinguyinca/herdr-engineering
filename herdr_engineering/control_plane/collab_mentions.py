@@ -15,7 +15,7 @@ ADDRESS = re.compile(r"[a-z0-9._-]{1,48}\Z")
 # "@" at the start, after whitespace or an opening bracket; never inside a word (mail addresses,
 # paths) and never a prefix of a longer name.
 _MENTION = re.compile(r"(?<![^\s(\[{])@([A-Za-z0-9._-]{1,48})(?![A-Za-z0-9._-])")
-_FENCE = re.compile(r"```.*?(?:```|\Z)", re.S)
+_FENCE = re.compile(r"(```|~~~).*?(?:\1|\Z)", re.S)   # both Markdown fence styles
 _INLINE = re.compile(r"`[^`\n]*`")
 _HARNESS_ALIASES = {"claude-code": "claude", "claude_code": "claude", "claudecode": "claude"}
 

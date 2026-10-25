@@ -175,8 +175,8 @@ test('the session workspace composer uses the same menu and sends its text verba
   await page.evaluate(() => window.view.dispose?.() ?? window.view());
 }));
 
-test('a leading name follows the server precedence: a person handle is never an agent task', async () => withPage(async (page) => {
-  const squatter = { agent_id: 'sq-id', name: 'gert', address: 'owner.codex', aliases: [], harness_type: 'codex', owner_user_id: 'owner', actions: ['read', 'post', 'execute'], skills: [] };
+test('a leading name follows the server precedence: an old agent name never beats a person or a group', async () => withPage(async (page) => {
+  const squatter = { agent_id: 'sq-id', name: 'squat', address: 'owner.codex', aliases: ['gert', 'all'], harness_type: 'codex', owner_user_id: 'owner', actions: ['read', 'post', 'execute'], skills: [] };
   const requests = await openRoom(page, [...AGENTS, squatter]);
   const input = page.getByRole('combobox', { name: 'Message' });
   for (const text of ['@gert please review', '@all heads up', '@owner.codex run it']) {
@@ -189,5 +189,25 @@ test('a leading name follows the server precedence: a person handle is never an 
     ['/rooms/room-one/messages', '@gert please review', undefined],
     ['/rooms/room-one/messages', '@all heads up', undefined],
     ['/rooms/room-one/tasks', '@owner.codex run it', 'sq-id']]);
+  await page.evaluate(() => window.collab.dispose());
+}));
+
+test('an ambiguous name is flagged with the unambiguous forms and a leading one is refused as a task', async () => withPage(async (page) => {
+  const twins = [
+    { ...AGENTS[0], name: 'p1', aliases: ['lead'] },
+    { agent_id: 'ana-id', name: 'gert', address: 'ana.codex', aliases: ['lead'], harness_type: 'codex', owner_user_id: 'owner', actions: ['read', 'post', 'execute'], skills: [] },
+  ];
+  const requests = await openRoom(page, twins);
+  const input = page.getByRole('combobox', { name: 'Message' });
+  await input.fill('@lead fix it');
+  await page.locator('.conversation-status').filter({ hasText: '@lead is ambiguous — use @ana.codex or @gert.pi' }).waitFor();
+  await input.press('Enter');
+  await page.getByRole('alert').filter({ hasText: 'More than one agent or person is called @lead' }).waitFor();
+  assert.equal(await input.inputValue(), '@lead fix it');
+  await input.fill('@gert look');                       // person gert and agent "gert": neither silently wins
+  await page.locator('.conversation-status').filter({ hasText: '@gert is ambiguous — use @ana.codex' }).waitFor();
+  await input.press('Enter');
+  await page.getByRole('alert').filter({ hasText: 'More than one agent or person is called @gert' }).waitFor();
+  assert.deepEqual(requests, []);
   await page.evaluate(() => window.collab.dispose());
 }));

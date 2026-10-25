@@ -75,14 +75,29 @@ def test_existing_names_stay_valid_as_aliases(w):
 
 
 def test_an_old_alias_loses_to_a_person_or_an_address(w):
-    _, imp = agent(w, "bob", "pi", name="alice")                                     # an alias that is alice's handle
+    _, imp = agent(w, "bob", "pi", name="alice")
+    w.s.rename_agent(w.bob, imp, {"name": "helper"})                                # "alice" is now an old name
     assert w.s.resolve_mentions(w.room, "@alice") == [{"kind": "person", "id": "alice", "name": "alice"}]
     assert w.s.resolve_mentions(w.room, "@bob.pi")[0]["id"] == imp
 
 
+def test_a_person_handle_equal_to_an_agents_current_name_addresses_nobody(w):
+    _, coder = agent(w, "alice", "codex", name="carol")                           # agent "carol" + person carol
+    assert w.s.resolve_mentions(w.room, "@carol please") == []
+    assert w.s.resolve_mentions(w.room, "@alice.codex")[0]["id"] == coder        # the unambiguous form works
+
+
+def test_an_old_name_two_agents_share_addresses_nobody(w):
+    _, one = agent(w, "alice", "pi", name="lead")
+    w.s.rename_agent(w.alice, one, {"name": "lead2"})
+    _, two = agent(w, "bob", "pi", name="lead")
+    w.s.rename_agent(w.bob, two, {"name": "lead3"})
+    assert w.s.resolve_mentions(w.room, "@lead") == []
+
+
 def test_unknown_names_addresses_and_code_are_not_mentions(w):
     agent(w, "alice", "pi")
-    for text in ("@zzz hello", "mail bob@example.org", "C:\\x\\@bob", "`@bob` in code", "```\n@bob\n```",
+    for text in ("@zzz hello", "mail bob@example.org", "C:\\x\\@bob", "`@bob` in code", "```\n@bob\n```", "~~~\n@bob\n~~~", "~~~py\n@bob",
                  "@mallory", "@" + "b" * 60):
         assert w.s.resolve_mentions(w.room, text) == [], text
 
