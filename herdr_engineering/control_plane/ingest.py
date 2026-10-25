@@ -47,7 +47,8 @@ def _git_identity(payload):
 # Entity types an ingest principal may write. Dispatched types have handlers; the generic ones are
 # plain activity records nothing authoritative reads back. Adding a type here is a security decision.
 DISPATCHED_ENTITY_TYPES = frozenset({"lineage", "host", "session", "mission", "service", "inspector",
-                                     "mission_activity"})
+                                     "mission_activity", "test_run", "build", "review",
+                                     "review_finding", "pull_request"})
 # ledger / platform / lifecycle are the Pi envelope adapters' activity streams (envelopeAdapters.ts)
 # repository / request / span are the opt-in system-graph adapter's lifecycle streams (graph_ingest.py, runbook
 # docs/specs/herdr-system-graph-20261020/11-p0-p6-status-and-runbook.md). They were accepted before T16, nothing
@@ -344,7 +345,6 @@ class IngestService:
                 k in payload for k in ("repository_id", "forge_url", "repository_url",
                                        "repo_url", "clone_url", "commit_sha")):
             _git_identity(payload)
-
     def _dispatch(self, entity_type, entity_id, event_type, payload, source,
                   record_generic=True) -> dict:
         # System-graph live-ingest adapter (opt-in): reflect lifecycle events
@@ -390,12 +390,86 @@ class IngestService:
             res = self.repo.inspector.ingest(entity_id, payload)
             return {"entity_type": "inspector", "entity_id": entity_id,
                     "event_type": event_type, **res}
+        if entity_type in ("test_run", "build"):
+            return self._ingest_test_run(entity_id, event_type, payload,
+                                         kind="test" if entity_type == "test_run" else "build")
+        if entity_type == "review":
+            return self._ingest_review(entity_id, event_type, payload)
+        if entity_type == "review_finding":
+            return self._ingest_review_finding(entity_id, payload)
+        if entity_type == "pull_request":
+            return self._ingest_pull_request(entity_id, event_type, payload)
         # Unknown/other entity types: record the event generically so nothing is
         # silently dropped, and the UI still sees it on the activity stream.
         if record_generic:
             self.repo.record_event(entity_type, entity_id, event_type, payload)
         return {"entity_type": entity_type, "entity_id": entity_id,
                 "event_type": event_type}
+
+    # ------------------------------------------------------ delivery entities
+    # Test runs, builds, reviews, review findings and pull requests are stored
+    # in the repo's delivery collections (issue #32). They mirror the SQL table
+    # shapes, are idempotent on entity_id, and attach to a (namespaced) mission
+    # key exactly like sessions and missions do (issue #26).
+    def _ingest_test_run(self, entity_id, event_type, payload, kind="test") -> dict:
+        for key in ("passed", "failed", "skipped", "total"):
+            value = payload.get(key)
+            if value is not None and (isinstance(value, bool) or not isinstance(value, (int, float))):
+                raise ValueError(f"{key} must be a number")
+        return self.repo.upsert_test_run(
+            entity_id, kind=kind,
+            mission_id=payload.get("mission_id"),
+            session_id=payload.get("session_id"),
+            repository=payload.get("repository"),
+            status=payload.get("status"),
+            passed=payload.get("passed"),
+            failed=payload.get("failed"),
+            skipped=payload.get("skipped"),
+            total=payload.get("total"),
+            started_at=payload.get("started_at"),
+            ended_at=payload.get("ended_at"),
+            results=payload.get("results"),
+        )
+
+    def _ingest_review(self, entity_id, event_type, payload) -> dict:
+        return self.repo.upsert_review(
+            entity_id, mission_id=payload.get("mission_id"),
+            session_id=payload.get("session_id"),
+            reviewer=payload.get("reviewer"),
+            status=payload.get("status"),
+            verdict=payload.get("verdict"),
+            started_at=payload.get("started_at"),
+            completed_at=payload.get("completed_at"),
+        )
+
+    def _ingest_review_finding(self, entity_id, payload) -> dict:
+        # The finding attaches to the review named by ``review_id`` (which the
+        # ingest envelope carries in ``entity_id``); the review must already
+        # exist so a forged/unknown review can never collect findings.
+        severity = payload.get("severity")
+        if not isinstance(severity, str) or not severity:
+            raise ValueError("severity is required")
+        summary = payload.get("summary")
+        if not isinstance(summary, str):
+            raise ValueError("summary is required")
+        return self.repo.add_review_finding(
+            entity_id, severity=payload.get("severity"),
+            summary=payload.get("summary"), detail=payload.get("detail") or "",
+            status=payload.get("status") or "open",
+            finding_id=payload.get("finding_id"),
+        )
+
+    def _ingest_pull_request(self, entity_id, event_type, payload) -> dict:
+        return self.repo.upsert_pull_request(
+            entity_id, mission_id=payload.get("mission_id"),
+            repository=payload.get("repository"),
+            number=payload.get("number"),
+            url=payload.get("url"),
+            status=payload.get("status"),
+            branch=payload.get("branch"),
+            base=payload.get("base"),
+            created_at=payload.get("created_at"),
+        )
 
     def _ingest_host(self, entity_id, event_type, payload, source="herdr") -> dict:
         if source not in LIVENESS_SOURCES:

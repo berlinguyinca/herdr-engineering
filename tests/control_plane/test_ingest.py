@@ -289,3 +289,94 @@ def test_reserved_prefixes_cover_every_gate_stream():
 
     for entity in (store.ENTITY, queue.ENTITY, registry.ENTITY):
         assert entity.startswith(RESERVED_ENTITY_PREFIXES)
+
+
+# ---------------------------------------------------------------------------
+# Delivery entities (issue #32): test_run, build, review, review_finding,
+# pull_request ingest idempotently and filter by (namespaced) mission id.
+# ---------------------------------------------------------------------------
+def test_ingest_test_run_is_idempotent_and_filters_by_mission():
+    repo = ControlPlaneRepo()
+    svc = make_svc(repo)
+    env = {
+        "entity_type": "test_run", "entity_id": "run-1",
+        "event_type": "test_run.started",
+        "payload": {"mission_id": "pi:MSN-1", "status": "failed",
+                    "passed": 2, "failed": 1, "total": 3}}
+    svc.ingest({**env, "payload": {**env["payload"], "passed": 2}})
+    svc.ingest({**env, "payload": {**env["payload"], "failed": 1}})
+    runs = repo.list_test_runs(mission_id="pi:MSN-1")
+    assert len(runs) == 1
+    assert runs[0]["test_run_id"] == "run-1"
+    assert runs[0]["failed"] == 1 and runs[0]["passed"] == 2
+    # A run for another mission never leaks in.
+    assert repo.list_test_runs(mission_id="pi:MSN-2") == []
+
+
+def test_ingest_build_reuses_test_run_collection_with_kind_build():
+    repo = ControlPlaneRepo()
+    svc = make_svc(repo)
+    svc.ingest({"entity_type": "build", "entity_id": "build-1",
+                "event_type": "build.started",
+                "payload": {"mission_id": "m1", "status": "ok"}})
+    svc.ingest({"entity_type": "build", "entity_id": "build-1",
+                "event_type": "build.updated",
+                "payload": {"mission_id": "m1", "status": "ok"}})
+    builds = repo.list_test_runs(mission_id="m1", kind="build")
+    assert len(builds) == 1 and builds[0]["kind"] == "build"
+    assert repo.list_test_runs(mission_id="m1", kind="test") == []
+
+
+def test_ingest_review_is_idempotent_and_holds_findings():
+    repo = ControlPlaneRepo()
+    svc = make_svc(repo)
+    svc.ingest({"entity_type": "review", "entity_id": "rv-1",
+                "event_type": "review.started",
+                "payload": {"mission_id": "m1", "reviewer": "codex",
+                            "status": "completed", "verdict": "approved"}})
+    svc.ingest({"entity_type": "review", "entity_id": "rv-1",
+                "event_type": "review.updated",
+                "payload": {"mission_id": "m1", "reviewer": "codex",
+                            "status": "completed", "verdict": "approved"}})
+    svc.ingest({"entity_type": "review_finding", "entity_id": "rv-1",
+                "event_type": "review_finding.added",
+                "payload": {"severity": "blocker", "summary": "crashes"}})
+    reviews = repo.list_reviews(mission_id="m1")
+    assert len(reviews) == 1 and reviews[0]["verdict"] == "approved"
+    assert [f["summary"] for f in reviews[0]["findings"]] == ["crashes"]
+    assert repo.list_reviews(mission_id="m2") == []
+
+
+def test_ingest_review_finding_requires_existing_review():
+    repo = ControlPlaneRepo()
+    svc = make_svc(repo)
+    with pytest.raises(KeyError):
+        svc.ingest({"entity_type": "review_finding", "entity_id": "nope",
+                    "event_type": "review_finding.added",
+                    "payload": {"severity": "blocker", "summary": "x"}})
+
+
+def test_ingest_pull_request_is_idempotent_and_filters_by_mission():
+    repo = ControlPlaneRepo()
+    svc = make_svc(repo)
+    env = {
+        "entity_type": "pull_request", "entity_id": "pr-1",
+        "event_type": "pull_request.opened",
+        "payload": {"mission_id": "m1", "repository": "acme/w", "number": 7,
+                    "url": "https://github.com/acme/w/pull/7", "status": "open"}}
+    svc.ingest({**env})
+    svc.ingest({**env, "payload": {**env["payload"], "status": "merged"}})
+    pulls = repo.list_pull_requests(mission_id="m1")
+    assert len(pulls) == 1 and pulls[0]["status"] == "merged"
+    assert repo.list_pull_requests(mission_id="m2") == []
+    # A merged PR records a PullRequestMerged event.
+    assert "PullRequestMerged" in [e["event_type"] for e in repo.stream("pull_request", "pr-1")]
+
+
+def test_ingest_delivery_rejects_invalid_counts():
+    repo = ControlPlaneRepo()
+    svc = make_svc(repo)
+    with pytest.raises(ValueError, match="passed"):
+        svc.ingest({"entity_type": "test_run", "entity_id": "r",
+                    "event_type": "test_run.started",
+                    "payload": {"passed": "many"}})
