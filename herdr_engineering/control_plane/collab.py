@@ -413,6 +413,45 @@ class CollabService:
     async def record_skill_installation(self, principal, skill_id, version, sha256):
         return await self._skill_operation('record_installation', principal, skill_id, version, sha256)
 
+    async def get_skill_draft(self, principal, draft_id):
+        return await self._skill_operation('get_skill_draft', principal, draft_id)
+
+    async def list_skill_drafts(self, principal):
+        return await self._skill_operation('list_skill_drafts', principal)
+
+    async def publish_skill_draft(self, principal, draft_id, scope):
+        return await self._skill_operation('publish_skill', principal, draft_id, scope)
+
+    def _skills_http(self, method, parts, query, body, principal):
+        """Browser/dashboard adapter over the signed skill registry. Agents use MCP, where grants
+        are harness-only _meta, so a package URL is never handed to an agent over this surface."""
+        if principal.is_agent:
+            raise CollabError(403, 'forbidden: agents use the skills MCP tools')
+
+        def run(make_operation):
+            return self._backend_run(self.skill_runner, make_operation, 'skill')
+        n = len(parts)
+        if method == 'GET' and n == 1:
+            scope = query.get('scope', 'private')
+            found = run(lambda: self.search_skills(principal, query.get('q', ''), scope))
+            drafts = run(lambda: self.list_skill_drafts(principal)) if scope == 'private' else []
+            return 200, {'skills': [{**item, 'status': 'published'} for item in found], 'drafts': drafts}
+        if method == 'GET' and n == 3 and parts[1] == 'drafts':
+            return 200, run(lambda: self.get_skill_draft(principal, parts[2]))
+        if method == 'POST' and n == 4 and parts[1] == 'drafts' and parts[3] == 'publish':
+            self._only(body, frozenset({'scope'}))
+            if not isinstance(body.get('scope'), str):
+                raise CollabError(400, 'invalid publication scope')
+            version = run(lambda: self.publish_skill_draft(principal, parts[2], body['scope']))
+            return 200, {'skill_id': version.skill_id, 'version': version.version,
+                         'status': 'published', 'sha256': version.sha256}
+        if method == 'POST' and n == 5 and parts[2] == 'versions' and parts[4] == 'download':
+            self._only(body)
+            ref = run(lambda: self.download_skill(principal, parts[1], parts[3]))
+            return 200, {'skill_id': ref.skill_id, 'version': ref.version, 'sha256': ref.sha256,
+                         'size_bytes': ref.size_bytes, 'expires_at': ref.expires_at, 'url': ref.url}
+        raise CollabError(404, 'not found')
+
     async def _analysis_operation(self, name, principal, *args, **kwargs):
         if self.analysis_service is None:
             raise CollabError(503, "relational analysis service unavailable")
@@ -3844,6 +3883,8 @@ class CollabService:
             if pr.status != "approved" and parts != ["me"]:
                 self.stats["policy_denied"] += 1
                 raise CollabError(403, "waiting for approval")
+            if parts[:1] == ["skills"]:
+                return self._skills_http(method, parts, query, body, pr)
             if parts[:1] == ["uploads"] or (n >= 3 and parts[0] == "rooms" and parts[2] in ("files", "uploads")):
                 return self._uploads_http(method, parts, query, body, pr)
             if (parts[:1] in (["analyses"], ["analysis-artifacts"])

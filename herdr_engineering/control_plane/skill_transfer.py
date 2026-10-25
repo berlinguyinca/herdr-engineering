@@ -72,6 +72,15 @@ class SkillTransfer:
     async def get_skill(self, principal, skill_id, version):
         return self._view(await self._package(principal, skill_id, version))
 
+    async def get_skill_draft(self, principal, draft_id):
+        return await self.registry.get_skill_draft(principal, draft_id)
+
+    async def list_skill_drafts(self, principal):
+        return await self.registry.list_skill_drafts(principal)
+
+    async def publish_skill(self, principal, draft_id, scope):
+        return await self.registry.publish_skill(principal, draft_id, scope)
+
     async def search_skills(self, principal, query, scope):
         if (not isinstance(query, str) or len(query) > 200
                 or not isinstance(scope, str) or scope not in {'private', 'room', 'shared'}):

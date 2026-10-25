@@ -432,6 +432,55 @@ class SkillRegistry:
             await self._audit(principal, 'skill.published', f'{draft["skill_id"]}:{draft["version"]}')
             return self._version(row)
 
+    async def _publish_scopes(self, principal: Principal, draft) -> list[str]:
+        """Scopes the registry would accept right now: the same checks publish_skill enforces."""
+        scopes = []
+        for scope in ('private', 'room', 'shared'):
+            try:
+                await self._publication(principal, scope, draft['target_room_id'] if scope == 'room' else None)
+                scopes.append(scope)
+            except CollabError:
+                pass
+        return scopes
+
+    async def _own_draft(self, principal: Principal, draft_id: str):
+        draft = await self.conn.fetchrow('SELECT * FROM collab_skill_drafts WHERE draft_id=$1', draft_id)
+        if draft is None or draft['created_by'] != principal.id:
+            raise CollabError(404, 'not found')
+        skill = await self.conn.fetchrow('SELECT * FROM collab_skills WHERE skill_id=$1 FOR SHARE', draft['skill_id'])
+        if skill is None or skill['owner_id'] != principal.id or skill['status'] == 'revoked':
+            raise CollabError(404, 'not found')
+        return draft
+
+    async def get_skill_draft(self, principal: Principal, draft_id: str) -> dict:
+        """The creator's own unpublished package, re-verified against its signature before review."""
+        async with self.conn.transaction():
+            await self.conn.execute('SELECT pg_advisory_xact_lock_shared($1)', LIFECYCLE_LOCK)
+            await self._principal(principal, human=True)
+            draft = await self._own_draft(principal, draft_id)
+            package = await self._load(draft)
+            scopes = await self._publish_scopes(principal, draft)
+            await self._principal(principal, human=True)
+            return {'draft_id': draft_id, 'skill_id': draft['skill_id'], 'version': draft['version'],
+                    'status': 'draft', 'target_room_id': draft['target_room_id'], 'publish_scopes': scopes,
+                    'manifest': package.manifest, 'sha256': package.sha256, 'key_id': package.key_id}
+
+    async def list_skill_drafts(self, principal: Principal, limit: int = 50) -> list[dict]:
+        """Own unpublished drafts for a library tab. Review re-verifies the signed package."""
+        async with self.conn.transaction():
+            await self.conn.execute('SELECT pg_advisory_xact_lock_shared($1)', LIFECYCLE_LOCK)
+            await self._principal(principal, human=True)
+            rows = await self.conn.fetch(
+                'SELECT d.* FROM collab_skill_drafts d JOIN collab_skills s USING (skill_id) '
+                "WHERE d.created_by=$1 AND s.owner_id=$1 AND s.status != 'revoked' "
+                'AND NOT EXISTS (SELECT 1 FROM collab_skill_versions v WHERE v.source_draft_id=d.draft_id) '
+                'ORDER BY d.created_at DESC, d.draft_id LIMIT $2', principal.id, limit)
+            await self._principal(principal, human=True)
+            return [{'draft_id': r['draft_id'], 'skill_id': r['skill_id'], 'version': r['version'],
+                     'status': 'draft', 'target_room_id': r['target_room_id'], 'sha256': r['sha256'],
+                     'manifest': json.loads(r['manifest']) if isinstance(r['manifest'], str) else r['manifest']}
+                    for r in rows]
+
     @staticmethod
     def _version(row) -> SkillVersion:
         return SkillVersion(*(row[k] for k in ('skill_id', 'version', 'storage_key', 'sha256')))
