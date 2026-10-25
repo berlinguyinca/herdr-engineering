@@ -18,6 +18,9 @@ from ..review_gate.entities import RESERVED_ENTITY_PREFIXES
 log = logging.getLogger(__name__)
 from .envelope import ENVELOPE_ONLY_TYPES, EnvelopeConflict, normalize_envelope
 from .events import SequenceCollision
+from .federation import (
+    clamp_for_principal, in_peer_namespace, is_peer_actor, is_peer_node, peer_of, policy_from_source,
+)
 from .graph import validate_lineage
 from .host_metrics_store import STATE_KEYS, clean_metrics, clean_state
 from .project_links import canonical_repository
@@ -81,6 +84,9 @@ class IngestService:
         # the HCN service's `is_hcn_node`; checked on EVERY endpoint of an edge, so an ingest key cannot attach
         # a fake `produced` edge to an accepted artifact either.
         self.service_node = None
+        # ADR-0008 P1: hot source of the raw `control_plane.federation` YAML section (set by the server; None = no
+        # federation, so no peer event is ever admitted). Read once per ingest; any failure means OFF.
+        self.peer_source = None
         # System-graph live-ingest adapter (system-graph spec P2-P4). When enabled,
         # mission/session/repository/request/span lifecycle events are ALSO emitted
         # as lineage envelopes into the running graph. Opt-in; disabled by default.
@@ -89,12 +95,58 @@ class IngestService:
             from .graph_ingest import GraphIngestAdapter
             self.system_graph = GraphIngestAdapter(repo, scope="org")
 
+    def _peer_policy(self, actor):
+        """The enabled YAML policy of the peer ``actor`` is, or None. The actor must be well formed, federation
+        and that peer switched on, and its pinned key fingerprint must still be the configured one: removing
+        or re-keying a peer in YAML refuses its next event."""
+        found = peer_of(actor)
+        policy = policy_from_source(self.peer_source)
+        if found is None or not policy.enabled:
+            return None
+        peer = policy.peer(found[0])
+        return peer if peer is not None and peer.enabled and peer.matches(found[1]) else None
+
+    def _peer_clamp(self, principal, entity_type):
+        """ADR-0008 Decision 4. None for a non-peer. A peer is admitted only as a v2 ``lineage`` writer bound to
+        its one mirror room; anything else (a v1 body, another entity type, a peer-user, an unknown or disabled
+        peer) is refused with the same 403 as any lineage refusal, before anything is stored."""
+        if not is_peer_actor(principal):
+            return None
+        deny = PermissionError("not permitted to modify this lineage object")
+        policy = self._peer_policy(principal)            # (a peer-user, or any malformed actor, has no policy)
+        if policy is None or entity_type != "lineage":
+            raise deny
+        return clamp_for_principal(principal, bind_room_id=policy.mirror_room)
+
+    def _check_peer_namespace(self, env: dict, event_type: str, payload: dict, entity_id=None) -> None:
+        """The reserved ``peer:<peer>.`` node namespace (Decision 7). Unconditional: it holds for EVERY actor kind
+        (an operator, the HCN service and an open listener included), whether or not a collab service is wired.
+        Nobody local may write, attach to or edge into it; a peer may write ONLY inside its own namespace, on
+        EVERY endpoint, so a mirrored edge can never touch a local node, and its ``entity_id`` (the stream the row
+        is stored under) must lie inside it too."""
+        actor = env.get("actor") or {}
+        ends = ((payload.get("from_id"), payload.get("to_id")) if event_type.startswith("edge.")
+                else (payload.get("node_id"),))
+        found = peer_of(actor)
+        if is_peer_actor(actor):
+            if found is None or not all(in_peer_namespace(e, found[0]) for e in (*ends, entity_id)):
+                raise PermissionError("not permitted to modify this lineage object")
+        elif any(is_peer_node(e) for e in ends):
+            raise PermissionError("not permitted to modify this lineage object")
+
     def _check_lineage_scope(self, env: dict) -> None:
         """Fail closed: a non-operator key may address a room or mission only if the operator listed it.
         Refused with the same PermissionError (HTTP 403, reason lineage_forbidden) as any lineage refusal,
         before anything is persisted or sequenced."""
         scope = env.get("visibility_scope")
         actor = env.get("actor") or {}
+        if is_peer_actor(actor):
+            # a peer is checked like a non-operator key, whatever scope it asked for (the clamp made it `room`):
+            # its one room comes from the hot YAML policy, never from key_scopes, and "*" is never honoured
+            policy = self._peer_policy(actor)
+            if policy is None or scope != "room" or env.get("room_id") != policy.mirror_room:
+                raise PermissionError("not permitted to modify this lineage object")
+            return
         if scope not in ("room", "mission") or (
                 actor.get("kind") == "operator" and actor.get("authenticated_by") not in (None, "none")):
             return
@@ -178,10 +230,17 @@ class IngestService:
             raise ValueError("entity type is not accepted by generic ingestion")
         if event_type in SERVER_OWNED_EVENT_TYPES.get(entity_type, ()):
             raise ValueError("event type is reserved for the server")
-        env = normalize_envelope(body, principal, self.repo._stamp())
+        clamp = self._peer_clamp(principal, entity_type)
+        env = normalize_envelope(body, principal, self.repo._stamp(), clamp=clamp)
+        if clamp is not None:
+            # a peer removed or re-keyed in YAML while its request is in flight must not land: re-read the hot
+            # policy under the ledger lock, immediately before admission (the T10 `valid` hook)
+            outer = valid
+            valid = lambda: (outer is None or outer()) and self._peer_policy(principal) is not None  # noqa: E731
         if env is None and entity_type == "lineage":
             raise ValueError("lineage events require schema_version 2")
         if env is not None and entity_type == "lineage":
+            self._check_peer_namespace(env, event_type, payload, entity_id)
             self._check_lineage_scope(env)
             self._check_reserved_nodes(env, event_type, payload)
         if env is None:
