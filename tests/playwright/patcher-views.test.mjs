@@ -168,3 +168,43 @@ test('Service detail: a live event refreshes it and identical data writes nothin
  assert.deepEqual(await writes(page),[],'identical refresh performs no DOM writes');
  assert.equal(await page.evaluate(()=>document.activeElement?.hasAttribute('data-service-back')),true,'focus stays');
 }));
+
+// ---------------------------------------------------------------- Missions catalog
+function projection(n,extra={}){
+ return {contract_version:1,mission_key:`pi:M${n}`,host_id:'beast',observed_at:T0,snapshot_at:T0,activity_snapshot_at:T0,connection:'connected',
+  mission:{id:`M${n}`,title:`Mission ${n}`,status:'EXECUTING'},
+  freshness:{state:'live',age_seconds:1,stale_after_seconds:3600,disconnect_after_seconds:7200},
+  activity:{health:'active',currentActivity:{summary:`Working ${n}`}},...extra};
+}
+function missionsApi(state){
+ return p=>{
+  if(p==='/api/v1/mission-activity')return {activities:structuredClone(state.projections)};
+  if(p==='/api/v1/missions')return {missions:[]};
+  return {};
+ };
+}
+
+test('Missions: identical refresh writes nothing; tabs, counts and host filter keep their nodes and the typed filter',async()=>withPage(async(page,base)=>{
+ const state={projections:[projection(1),projection(2),projection(3)]};
+ const reads=await boot(page,base,'/missions',missionsApi(state));
+ await until(()=>page.locator('[data-mission-key]').count().then(n=>n===3),'mission rows');
+ await page.locator('#mc-host').selectOption('beast');
+ await page.locator('#mc-search').fill('mission');await page.locator('#mc-search').evaluate(e=>e.blur());
+ await liveRefresh(page,{event_id:'m0',event_type:'MissionUpdated'});
+ await page.evaluate(()=>{window.__nodes=[...document.querySelectorAll('[data-mission-key],#mc-tabs [data-tab],#mc-counts [data-filter],#mc-host option')];});
+
+ const before=reads['/api/v1/missions'];
+ await observe(page);
+ await liveRefresh(page,{event_id:'m1',event_type:'MissionUpdated'});
+ assert.ok(reads['/api/v1/missions']>before,'a live event refreshed recorded missions');
+ assert.deepEqual(await writes(page),[],'identical refresh performs no DOM writes');
+
+ state.projections[1].activity.currentActivity.summary='Working on something new';
+ await observe(page);
+ await liveRefresh(page,{event_id:'m2',event_type:'MissionUpdated'});
+ await until(()=>page.locator('[data-mission-key="pi:M2"]').innerText().then(t=>t.includes('something new')),'changed activity');
+ assert.equal(await page.evaluate(()=>[...document.querySelectorAll('[data-mission-key],#mc-tabs [data-tab],#mc-counts [data-filter],#mc-host option')].every((n,i)=>n===window.__nodes[i])),true,'rows, tabs, counts and options keep their nodes');
+ assert.deepEqual(await writes(page,'[data-mission-key="pi:M2"]'),[],'nothing outside the changed row was written');
+ assert.equal(await page.locator('#mc-search').inputValue(),'mission','typed filter survives');
+ assert.equal(await page.locator('#mc-host').inputValue(),'beast','host filter survives');
+}));

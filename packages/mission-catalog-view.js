@@ -3,7 +3,7 @@ import { cleanTitle } from './herdr-web-components/util.js';
 import { escapeHtml as esc } from './herdr-web-components/util.js';
 import { freshnessAt, missionHealth } from './mission-live-view.js';
 import { recordOutcome, statusOutcome, recordVisibility, reportFreshness, reportTimestamp } from './record-state.js';
-import { patchList, patchText, morph } from './patch.js';
+import { patchList, patchText, patchAttr, morph, handOff } from './patch.js';
 import { snapshotText, animateChanges, easeValue, skeleton } from './motion.js';
 import { freshnessSources } from './freshness.js';
 
@@ -143,7 +143,7 @@ export function mountMissionCatalog(container, client, {tab = 'current', status 
   const chip = freshnessSources(freshness);
   let disposed = false, projections = [], recorded = [], received = Date.now();
   let liveController = null, pollTimer = null, clockTimer = null, recordedTimer = null, recordedController = null;
-  let failures = 0, liveError = '', recordedError = '', lastSignature = '', lastClassification = '', liveLoaded = false, recordedLoaded = false;
+  let failures = 0, liveError = '', recordedError = '', lastClassification = '', liveLoaded = false, recordedLoaded = false;
   const state = {search:'',host:'',status:tab==='current'&&GROUPS.some(([key])=>key===status&&currentGroup(key))?status:'all',tab:TABS.some(([key])=>key===tab)?tab:'current'};
   const opened = new Map(), limits = new Map();
   container.innerHTML = `${styles}<p class="mc-intro">See what needs attention and what is running. Current shows missions with recent reports. Older and missing reports move to Unconfirmed; Failed and Finished retain their outcomes.</p>
@@ -194,22 +194,22 @@ export function mountMissionCatalog(container, client, {tab = 'current', status 
       const list=group.querySelector('[data-rows]');
       patchList(list,rows.slice(0,limit).map(e=>({key:e.key,html:compactMissionRow(e)})),{key:item=>item.key,render:item=>item.html,update:updateRow,inPlace:true,animate:live&&!created});
       if(created||!live)for(const row of list.querySelectorAll('[data-entering]'))row.removeAttribute('data-entering');
-      morph(group.querySelector('[data-group-foot]'),`${rows.length?'':!liveLoaded&&!recordedLoaded&&!liveError&&!recordedError?skeleton('missions',{rows:2}):`<p class="mc-note">${!liveLoaded&&!recordedLoaded?'Missions could not be loaded yet; retrying automatically.':liveLoaded&&recordedLoaded?'No missions in this group match your filters.':'Waiting for the remaining report source.'}</p>`}
-        ${rows.length>limit?`<div class="mc-more"><button class="hd-btn" data-more="${key}">Show ${Math.min(10,rows.length-limit)} more (${rows.length-limit} remaining)</button></div>`:''}`);
+      // A focused "Show more" button that is no longer needed hands focus to its group's summary.
+      handOff(morph(group.querySelector('[data-group-foot]'),`${rows.length?'':!liveLoaded&&!recordedLoaded&&!liveError&&!recordedError?skeleton('missions',{rows:2}):`<p class="mc-note">${!liveLoaded&&!recordedLoaded?'Missions could not be loaded yet; retrying automatically.':liveLoaded&&recordedLoaded?'No missions in this group match your filters.':'Waiting for the remaining report source.'}</p>`}
+        ${rows.length>limit?`<div class="mc-more"><button class="hd-btn" data-more="${key}">Show ${Math.min(10,rows.length-limit)} more (${rows.length-limit} remaining)</button></div>`:''}`),()=>group.querySelector('summary'));
     }
   }
-  function draw(force = false) {
+  // Everything below patches in place (identical data writes nothing), so focus, open groups and
+  // typed filters stay. Only a focused mission row that left its group moves focus on: to the
+  // row's new place, else the tab it moved to, else the search.
+  function draw() {
     if(disposed)return;
     const all=entries(), selected=filterMissions(all,state);
     const counts=Object.fromEntries(GROUPS.map(([key])=>[key,all.filter(e=>e.tab===state.tab&&e.group===key).length]));
-    const signature=JSON.stringify([state,liveLoaded,recordedLoaded,!!liveError,!!recordedError,all.map(e=>[e.key,e.tab,e.group,e.freshness?.state,e.projection,e.recorded])]);
-    connection.textContent=[liveError,recordedError].filter(Boolean).join(' ');
-    if(!force && signature===lastSignature)return;
-    lastSignature=signature;
+    patchText(connection,[liveError,recordedError].filter(Boolean).join(' '));
     capture();
     const focused=document.activeElement;
-    const focusKey=container.contains(focused) ? {mission:focused.closest('[data-mission-key]')?.dataset.missionKey,group:focused.closest('details[data-group]')?.dataset.group,more:focused.dataset.more,tab:focused.closest('[data-tab]')?.dataset.tab,filter:focused.closest('[data-filter]')?.dataset.filter,isSummary:focused.tagName==='SUMMARY'} : null;
-    const scroll={x:window.scrollX,y:window.scrollY};
+    const focusMission=container.contains(focused)?focused.closest('[data-mission-key]')?.dataset.missionKey:null;
     const countLabel=n=>liveLoaded&&recordedLoaded?String(n):liveLoaded||recordedLoaded?`${n}+`:'…';
     // Motion only for data-driven changes: not while the first load is partial (counts read "3+"
     // until both sources land) and not when the user changed the tab, a filter or the search.
@@ -217,32 +217,27 @@ export function mountMissionCatalog(container, client, {tab = 'current', status 
     const live=settled&&motionSettled&&view===motionView;
     motionSettled=settled;motionView=view;
     const tabCounts=live?snapshotText(el('tabs'),'[data-tab] span',tabKey):null, filterCounts=live?snapshotText(el('counts'),'[data-filter] strong',filterKey):null;
-    el('tabs').innerHTML=TABS.map(([key,label])=>`<button type="button" role="tab" id="mc-tab-${key}" aria-controls="mc-groups" aria-selected="${state.tab===key}" tabindex="${state.tab===key?0:-1}" data-tab="${key}">${label} <span>${countLabel(all.filter(e=>e.tab===key).length)}</span></button>`).join('');
-    el('groups').setAttribute('aria-labelledby',`mc-tab-${state.tab}`);
-    el('counts').hidden=state.tab!=='current';
-    el('status').closest('label').hidden=state.tab!=='current';
-    el('counts').innerHTML=GROUPS.filter(([key])=>currentGroup(key)).map(([key,label])=>`<button type="button" data-filter="${key}" aria-pressed="${state.status===key}"><strong>${countLabel(counts[key])}</strong>${label}</button>`).join('');
+    morph(el('tabs'),TABS.map(([key,label])=>`<button type="button" role="tab" id="mc-tab-${key}" aria-controls="mc-groups" aria-selected="${state.tab===key}" tabindex="${state.tab===key?0:-1}" data-tab="${key}">${label} <span>${countLabel(all.filter(e=>e.tab===key).length)}</span></button>`).join(''));
+    patchAttr(el('groups'),'aria-labelledby',`mc-tab-${state.tab}`);
+    patchAttr(el('counts'),'hidden',state.tab!=='current');
+    patchAttr(el('status').closest('label'),'hidden',state.tab!=='current');
+    morph(el('counts'),GROUPS.filter(([key])=>currentGroup(key)).map(([key,label])=>`<button type="button" data-filter="${key}" aria-pressed="${state.status===key}"><strong>${countLabel(counts[key])}</strong>${label}</button>`).join(''));
     animateChanges(el('tabs'),'[data-tab] span',tabCounts,tabKey);
     animateChanges(el('counts'),'[data-filter] strong',filterCounts,filterKey);
     const hosts=[...new Set(all.map(e=>e.host).filter(Boolean))].sort();
-    el('host').innerHTML='<option value="">All hosts</option>'+hosts.map(h=>`<option value="${esc(h)}">${esc(h)}</option>`).join('');el('host').value=state.host;
-    el('result').textContent=liveLoaded||recordedLoaded?`${selected.length} matching ${state.tab} missions${liveLoaded&&recordedLoaded?'':' · partial results (+): waiting for remaining source'} · live activity refreshes every 5 seconds`:'';
+    morph(el('host'),'<option value="">All hosts</option>'+hosts.map(h=>`<option value="${esc(h)}"${h===state.host?' selected':''}>${esc(h)}</option>`).join(''));
+    patchText(el('result'),liveLoaded||recordedLoaded?`${selected.length} matching ${state.tab} missions${liveLoaded&&recordedLoaded?'':' · partial results (+): waiting for remaining source'} · live activity refreshes every 5 seconds`:'');
     const wanted=GROUPS.filter(([key])=>(state.tab==='current'?currentGroup(key):state.tab==='unconfirmed'?['lastknown','recorded'].includes(key):state.tab===key)&&(state.status==='all'||state.status===key));
     patchGroups(wanted,selected,live);
-    if(focusKey){
-      let target;
-      if(focusKey.mission) {
-        target=[...el('groups').querySelectorAll('[data-mission-key]:not([data-leaving])')].find(row=>row.dataset.missionKey===focusKey.mission)?.querySelector('.mc-title');
-        const destination=all.find(entry=>entry.key===focusKey.mission)?.tab;
-        if(!target && destination)target=el('tabs').querySelector(`[data-tab="${destination}"]`);
-      }
-      else if(focusKey.more)target=el('groups').querySelector(`[data-more="${focusKey.more}"]`) || el('groups').querySelector(`[data-group="${focusKey.more}"] > summary`);
-      else if(focusKey.isSummary)target=el('groups').querySelector(`[data-group="${focusKey.group}"] > summary`);
-      else if(focusKey.tab)target=el('tabs').querySelector(`[data-tab="${focusKey.tab}"]`);
-      else if(focusKey.filter)target=el('counts').querySelector(`[data-filter="${focusKey.filter}"]`);
-      if(!target && !focused.isConnected)target=el('search');
-      if(target){const group=target.closest('details');if(group&&!group.open&&!focusKey.isSummary)target=group.querySelector('summary');target.focus({preventScroll:true});window.scrollTo(scroll.x,scroll.y);}
+    if(focusMission&&(!focused.isConnected||focused.closest('[data-mission-key]')?.hasAttribute('data-leaving'))){
+      const destination=all.find(entry=>entry.key===focusMission)?.tab;
+      const target=[...el('groups').querySelectorAll('[data-mission-key]:not([data-leaving])')].find(row=>row.dataset.missionKey===focusMission)?.querySelector('.mc-title')
+        ||(destination&&el('tabs').querySelector(`[data-tab="${destination}"]`))||el('search');
+      target.focus({preventScroll:true});
     }
+    // Focus inside a group the user collapsed moves to its summary.
+    const inGroup=document.activeElement?.closest?.('details[data-group]');
+    if(inGroup&&el('groups').contains(inGroup)&&!inGroup.open&&document.activeElement.tagName!=='SUMMARY')inGroup.querySelector('summary').focus({preventScroll:true});
   }
   function tick() {
     if(disposed||document.hidden)return;
@@ -253,21 +248,23 @@ export function mountMissionCatalog(container, client, {tab = 'current', status 
     const now=Date.now();
     el('groups').querySelectorAll('[data-mission-key]').forEach(row=>{
       const e=byKey.get(row.dataset.missionKey);if(!e)return;
-      const f=row.querySelector('[data-freshness]');f.textContent=freshnessLabel(e);f.dataset.state=e.freshness?.state||'recorded';
-      const report=row.querySelector('[data-report-age]');if(report)report.textContent=duration(e.freshness.age);
-      const recordedAge=row.querySelector('[data-recorded-age]');if(recordedAge)recordedAge.textContent=age(e.recorded.updated_at,now);
-      const a=e.projection?.activity||{}, output=row.querySelector('[data-output-age]');if(output)output.textContent=age(a.lastOutputAt,now);
-      const wait=row.querySelector('[data-wait-age]');if(wait){const reference=e.freshness?.state==='live'&&!isTerminal(e)?now:Date.parse(e.projection.activity_snapshot_at||e.projection.snapshot_at);wait.textContent=duration((reference-Date.parse(a.waitingSince))/1000);}
+      // Written only when the text changes, so a quiet second performs no DOM writes.
+      const f=row.querySelector('[data-freshness]');patchText(f,freshnessLabel(e));patchAttr(f,'data-state',e.freshness?.state||'recorded');
+      const report=row.querySelector('[data-report-age]');if(report)patchText(report,duration(e.freshness.age));
+      const recordedAge=row.querySelector('[data-recorded-age]');if(recordedAge)patchText(recordedAge,age(e.recorded.updated_at,now));
+      const a=e.projection?.activity||{}, output=row.querySelector('[data-output-age]');if(output)patchText(output,age(a.lastOutputAt,now));
+      const wait=row.querySelector('[data-wait-age]');if(wait){const reference=e.freshness?.state==='live'&&!isTerminal(e)?now:Date.parse(e.projection.activity_snapshot_at||e.projection.snapshot_at);patchText(wait,duration((reference-Date.parse(a.waitingSince))/1000));}
     });
-    connection.textContent=[liveError,recordedError].filter(Boolean).join(' ');
+    patchText(connection,[liveError,recordedError].filter(Boolean).join(' '));
   }
   function changeFilters() {
     state.search=el('search').value;state.host=el('host').value;state.status=el('status').value;
     capture();
     for(const [key]of GROUPS)opened.set(key,Boolean(state.tab!=='current'||state.search||state.status!=='all'||key==='attention'||key==='running'));
     limits.clear();
-    // draw captures rendered disclosures; remove them after recording the new defaults.
-    el('groups').innerHTML='';draw(true);tick();
+    // A filter or tab change resets every group to its default disclosure; rows stay keyed.
+    for(const d of el('groups').querySelectorAll('details[data-group]')){const open=opened.get(d.dataset.group);if(d.open!==open)d.open=open;}
+    draw();tick();
   }
   function selectTab(key) {
     if(!TABS.some(([tab])=>tab===key))return;
@@ -283,7 +280,7 @@ export function mountMissionCatalog(container, client, {tab = 'current', status 
   });
   el('search').addEventListener('input',changeFilters);el('host').addEventListener('change',changeFilters);el('status').addEventListener('change',changeFilters);
   el('counts').addEventListener('click',event=>{const key=event.target.closest('[data-filter]')?.dataset.filter;if(key){el('status').value=key;changeFilters();}});
-  el('groups').addEventListener('click',event=>{const key=event.target.closest('[data-more]')?.dataset.more;if(key){limits.set(key,(limits.get(key)||10)+10);draw(true);tick();}});
+  el('groups').addEventListener('click',event=>{const key=event.target.closest('[data-more]')?.dataset.more;if(key){limits.set(key,(limits.get(key)||10)+10);draw();tick();}});
   async function refreshRecorded() {
     if(disposed||document.hidden||recordedController)return;
     const controller=new AbortController();recordedController=controller;let timedOut=false;
