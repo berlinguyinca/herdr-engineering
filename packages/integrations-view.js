@@ -302,7 +302,9 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
       const comparison=compared?ciComparisonModel(pipeline,{...observedDetails.get(comparisonKey),...compared,tasks:compared.tasks??observedDetails.get(comparisonKey)?.tasks}):null;
       const compareHtml=`<label class="ci-compare-control">Compare observed run<select data-ci-compare aria-label="Compare observed run"><option value="">No comparison</option>${candidates.map(record=>`<option value="${esc(ciRunKey(record))}" ${ciRunKey(record)===comparisonKey?'selected':''}>Run #${esc(record.run_number)} · ${esc(record.state||record.status||'Unknown')} · ${esc(record.branch||'Branch not reported')}</option>`).join('')}</select></label>${comparisonKey&&!compared?'<p class="ig-note">Compared run is no longer in retained observations.</p>':''}${renderCiComparison(comparison)}`;
       replace(inspector,'<div class="ig-active-pipeline">'+renderPipeline(pipeline,{loading:true,error:detailError,log,logError,step,actionMessage,debugSessions,debugSessionId,debugMessage,collapseSuccess,zoom})+renderCiRunReports(runReports,{search:testSearch,page:testPage})+'</div><div class="ig-comparison-panel">'+compareHtml+'</div>',()=>inspector.querySelector('[data-close-inspector]'));
-      if(shownPipeline!==pipeline){shownPipeline=pipeline;healthView?.selectedRun(pipeline);}
+      // refreshDetail builds a new pipeline object every poll: compare content, not identity.
+      const shown=JSON.stringify(pipeline);
+      if(shownPipeline!==shown){shownPipeline=shown;healthView?.selectedRun(pipeline);}
     }
     tick();
   }

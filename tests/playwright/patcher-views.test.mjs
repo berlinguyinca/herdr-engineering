@@ -340,6 +340,39 @@ test('Reviews: identical refresh writes nothing; one changed review rewrites onl
  assert.equal(await page.locator('[data-ig-search]').inputValue(),'review','typed search survives');
 }));
 
+// ---------------------------------------------------------------- CI (integrations view + health map)
+const ago=ms=>new Date(Date.parse(T0)-ms).toISOString();
+const ciRun=(n,state)=>({provider_repo_id:7,provider_url:'https://ci.example',repository:'org/app',run_number:n,state,branch:'main',created_at:ago(3600000+n*60000),started_at:ago(3500000+n*60000),finished_at:state==='running'?null:ago(3000000+n*60000),updated_at:ago(1000)});
+function ciApi(state){
+ return p=>{
+  if(p==='/api/v1/ci')return {available:true,status:'connected',pipelines:{'org/app':structuredClone(state.runs)}};
+  if(p==='/api/v1/ci/history')return {available:true,repos:[{id:7,provider_url:'https://ci.example',repository:'org/app',default_branch:'main'}],pipelines:structuredClone(state.runs),coverage:{}};
+  if(p==='/api/v1/ci/reports')return {available:true,pipelines:[],reports:[]};
+  if(p==='/api/v1/ci/pipeline')return {provider_url:'https://ci.example',pipeline:{...structuredClone(state.runs[0]),tasks:[{id:1,pid:1,name:'build',state:'success'}]}};
+  return {};
+ };
+}
+
+test('CI: with a run open in the inspector, an identical refresh writes nothing (list, charts, health map, inspector)',async()=>withPage(async(page,base)=>{
+ const state={runs:[ciRun(1,'success'),ciRun(2,'failure'),ciRun(3,'success')]};
+ const reads=await boot(page,base,'/ci?tab=finished',ciApi(state));
+ await page.setViewportSize({width:1600,height:900});
+ await page.locator('[data-ci-workspace="runs"]').click();
+ await until(()=>page.locator('[data-run]').count().then(n=>n===2),'finished runs');
+ await page.locator('[data-run]').first().click();
+ await until(()=>page.locator('.ig-inspector:not([hidden]) .ig-active-pipeline').count().then(n=>n===1),'inspector');
+ await liveRefresh(page,{event_id:'c0',event_type:'CiUpdated'});
+ await liveRefresh(page,{event_id:'c1',event_type:'CiUpdated'});
+ const before=reads['/api/v1/ci/pipeline'];
+ await observe(page);
+ await liveRefresh(page,{event_id:'c2',event_type:'CiUpdated'});
+ assert.ok(reads['/api/v1/ci/pipeline']>before,'the open pipeline was re-read');
+ // The hours heatmap slides with the clock: its two edge buckets (the one leaving the 24 h window
+ // and the current hour) restate their bounds. That is time passing, not a refresh.
+ const edge=w=>/ci-health-cell[^"]*is-incomplete/.test(w)||/ UTC->/.test(w);
+ assert.deepEqual((await writes(page)).filter(w=>!edge(w)),[],'identical refresh performs no DOM writes');
+}));
+
 // ---------------------------------------------------------------- Collaboration room
 // The real collab-view.js over a mocked collab API whose room state always reports "changed", so
 // every long-poll round re-applies the same data (as a live event's re-ask does).
