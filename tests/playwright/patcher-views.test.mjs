@@ -346,7 +346,7 @@ test('Reviews: identical refresh writes nothing; one changed review rewrites onl
 test('Collab: repeated identical room state writes nothing; one changed task rewrites only its row; refresh re-asks the room',async()=>withPage(async(page,base)=>{
  const T='2026-10-23T10:00:00+00:00';
  const task=(id,status)=>({task_id:id,target_agent_id:'agent_1',target_name:'coder',text:`Task ${id}`,status,created_at:T});
- const m={tasks:[task('t1','pending'),task('t2','pending')],reads:0};
+ const m={tasks:[task('t1','pending'),task('t2','pending')],reads:0,hang:null};
  await page.route('**/api/v1/collab/**',async route=>{
   const url=new URL(route.request().url());const path=url.pathname.replace('/api/v1/collab','');
   let body={};
@@ -356,6 +356,7 @@ test('Collab: repeated identical room state writes nothing; one changed task rew
   else if(path==='/rooms/room-one')body={room_id:'room-one',name:'Review',role:'owner',members:[]};
   else if(path==='/rooms/room-one/state'){
    m.reads++;await new Promise(r=>setTimeout(r,100));
+   if(m.hang)await m.hang;
    const cursor=Number(url.searchParams.get('cursor')||0);
    body={changed:true,seq:1,next_cursor:1,agents:[{agent_id:'agent_1',name:'coder',harness_type:'pi',owner_user_id:'owner',actions:['execute']}],tasks:structuredClone(m.tasks),
     events:cursor<1?[{sequence:1,event_id:'e1',event_type:'message',created_at:T,room_id:'room-one',sender:{type:'user',id:'bob',owner_user_id:'bob'},text:'first'}]:[],flow:{nodes:[],edges:[],tasks:[]}};
@@ -394,7 +395,11 @@ test('Collab: repeated identical room state writes nothing; one changed task rew
  assert.equal(await page.evaluate(()=>[...document.querySelectorAll('#hcn-tasks li')].every((n,i)=>n===window.__rows[i])),true,'task rows keep their nodes');
  assert.deepEqual(await outside('#hcn-tasks li[data-key="t2"]'),[],'nothing outside the changed task was written');
 
- assert.equal(typeof (await page.evaluate(()=>typeof window.collab.refresh)),'string');
- assert.equal(await page.evaluate(()=>typeof window.collab.refresh),'function','collab registers a refresh with the bus');
+ // A long-poll held open by the server: refresh() (the bus hook) makes the room re-ask at once.
+ let release;m.hang=new Promise(r=>{release=r;});
+ await sleep(400);const held=m.reads;
+ await page.evaluate(()=>window.collab.refresh());
+ await until(()=>m.reads>held,'refresh re-asked the room',2000);
+ m.hang=null;release();
  await page.evaluate(()=>window.collab.dispose());
 }));
