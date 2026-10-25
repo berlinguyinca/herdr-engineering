@@ -367,7 +367,9 @@ def _project(row, owner):
     return {"project_id": row["id"], "owner": owner.lower(), "number": row["number"],
             "title": redact_text(str(row.get("title") or "")), "url": row.get("url") if isinstance(row.get("url"), str) else None,
             "closed": bool(row.get("closed")), "updated_at": row.get("updatedAt") if _when(row.get("updatedAt")) else None,
-            "item_count": count, "status_options": options}
+            # listed_item_count is GitHub's totalCount (archived items included): the change probe.
+            # item_count is what the page shows: the items read, archived ones excluded.
+            "listed_item_count": count, "item_count": count, "status_options": options}
 
 
 def _project_item(row, project_id):
@@ -1253,7 +1255,7 @@ class GitHubMonitor:
                 if exc.reason == "rate_limited":
                     limit_hit = exc
                     break
-                errors.append(f"{owner}: {exc}")
+                errors.append((owner, str(exc)))
                 continue
             listed.update({row["project_id"]: row for row in rows})
             with self._lock:
@@ -1264,8 +1266,10 @@ class GitHubMonitor:
                         table.pop(pid, None)
                 for row in rows:
                     previous = self._projects.get(row["project_id"], {})
+                    read = self._project_items.get(row["project_id"])
                     self._projects[row["project_id"]] = dict(row, complete=previous.get("complete", False),
-                                                             error=previous.get("error"))
+                                                             error=previous.get("error"),
+                                                             item_count=len(read) if read is not None else row["item_count"])
                 stored_rows = [self._stored_project(self._projects[row["project_id"]]) for row in rows]
                 self._touch()
             self._write_projects(store, lambda target, rows=stored_rows, owner=owner:
@@ -1282,7 +1286,7 @@ class GitHubMonitor:
         for pid, row in order:
             if self._stop.is_set() or limit_hit is not None:
                 break
-            probe = {"updated_at": row["updated_at"], "item_count": row["item_count"]}
+            probe = {"updated_at": row["updated_at"], "item_count": row.get("listed_item_count", row["item_count"])}
             with self._lock:
                 due = now - self._project_full_at.get(pid, now) >= self._full_interval
                 unchanged = self._project_marks.get(pid) == probe and pid in self._project_items and not due
@@ -1312,8 +1316,12 @@ class GitHubMonitor:
                     continue
                 with self._lock:
                     self._projects[pid].update(complete=False, error=str(exc))
-                errors.append(f"{row['title'] or pid}: {exc}")
-        problems = [*errors]
+                errors.append((row["title"] or pid, str(exc)))
+        # one line per distinct message, naming every owner or project it applies to
+        grouped = {}
+        for who, message in errors:
+            grouped.setdefault(message, []).append(who)
+        problems = [f"{', '.join(who)}: {message}" for message, who in grouped.items()]
         if errors and not listed:
             status = "error"
         elif limit_hit is not None:
@@ -1327,7 +1335,7 @@ class GitHubMonitor:
             problems.append(f"The per-pass point budget ({self._budget}) was spent; "
                             f"{len(deferred)} projects wait for the next pass.")
         error = " ".join(problems) or None
-        if errors and any("scope" in e or "denied" in e for e in errors):
+        if any("scope" in m or "denied" in m for m in grouped) and "read:project" not in error:
             error = f"{error} Projects need the token's read:project scope."
         self._projects_update(status=status, error=error, deferred=len(deferred),
                               **({"last_success_at": _stamp()} if status == "ready" else {}))
@@ -1391,7 +1399,7 @@ class GitHubMonitor:
             self._project_marks[pid] = probe
             self._project_watermarks[pid] = watermark
             self._project_full_at[pid] = self._now()
-            self._projects[pid].update(complete=True, error=None)
+            self._projects[pid].update(complete=True, error=None, item_count=len(items))
             stored = self._stored_project(self._projects[pid])
             self._touch()
         removed = previous - set(items)

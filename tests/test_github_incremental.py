@@ -1152,6 +1152,11 @@ class FakeProjects(FakeGitHub):
         if bump_project:
             project["updatedAt"] = _iso(self.clock)
 
+    def archive_item(self, pid, iid):
+        project = self._project(pid)
+        project["items"][iid].update(isArchived=True, updatedAt=_iso(self.tick()))
+        project["updatedAt"] = _iso(self.clock)
+
     def remove_item(self, pid, iid):
         project = self._project(pid)
         del project["items"][iid]
@@ -1462,3 +1467,29 @@ def test_without_an_allowlist_an_owner_no_longer_listed_loses_its_projects():
     assert {p["project_id"] for p in monitor.projects(start=False)["projects"]} == {p1, p2}
     stored = MemoryGitHubStore(identity="fingerprint-one", viewer="fixture-user", shared=shared).load()
     assert set(stored.projects) == {p1, p2} and set(stored.project_items) == {p1, p2}
+
+
+def test_the_read_project_hint_appears_once():
+    for reason in ("insufficient_scope", "permission"):
+        fake, *_ = projects_seeded()
+        fake.fail_projects = reason
+        monitor = monitor_for(fake, {}, projects=ON)
+        monitor.refresh()
+        error = monitor.projects(start=False)["projects_sync"]["error"]
+        assert error.count("read:project") == 1, error
+
+
+def test_archived_items_are_not_counted():
+    fake, p1, *_ = projects_seeded()
+    monitor = monitor_for(fake, {}, projects=ON)
+    monitor.refresh()
+    fake.archive_item(p1, fake.add_item(p1))
+    monitor._retry_at = 0
+    monitor.refresh()
+    row = next(p for p in monitor.projects(start=False)["projects"] if p["project_id"] == p1)
+    assert len(monitor.project_items(p1, start=False)["items"]) == 3
+    assert row["item_count"] == 3, "GitHub's totalCount includes archived items; the shown count does not"
+    fake.log.clear()
+    monitor._retry_at = 0
+    monitor.refresh()
+    assert item_calls(fake, p1) == [], "the probe still compares GitHub's own count"
