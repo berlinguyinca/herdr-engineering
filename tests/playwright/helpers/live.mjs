@@ -48,12 +48,26 @@ export const observe=page=>page.evaluate(()=>{
 
 export const mutationCount=page=>page.evaluate(()=>window.__muts.length);
 
+const chipLast=page=>page.evaluate(()=>document.querySelector('#view herdr-freshness')?._last??null);
+const chipMoved=(page,before,label)=>until(()=>page.evaluate(b=>{const c=document.querySelector('#view herdr-freshness');return !!c&&c._last!=null&&c._last!==b;},before),label);
+
 // Emits one live event and runs the clock past the refresh throttle until the
-// view's freshness chip records a new successful refresh.
-export async function liveRefresh(page,event={event_id:`e-${Math.random()}`,event_type:'HostHeartbeat'}){
- const before=await page.evaluate(()=>document.querySelector('#view herdr-freshness')?._last??null);
+// view's freshness chip records a new successful refresh. The default event is
+// one the server really broadcasts for agent activity. Never default to
+// HostHeartbeat: routine heartbeats are memory-only on the server, so a test
+// that injects them proves a refresh path production traffic never takes.
+export async function liveRefresh(page,event={event_id:`e-${Math.random()}`,event_type:'SessionUpdated'}){
+ const before=await chipLast(page);
  await page.evaluate(e=>window.__emit(e),event);
  await page.clock.runFor(6000);
- await until(()=>page.evaluate(b=>{const c=document.querySelector('#view herdr-freshness');return !!c&&c._last!=null&&c._last!==b;},before),'live refresh applied');
+ await chipMoved(page,before,'live refresh applied');
+ await sleep(50);
+}
+
+// No event at all (a quiet fleet): only the view's own timer can refresh it.
+export async function pollRefresh(page,ms){
+ const before=await chipLast(page);
+ await page.clock.runFor(ms);
+ await chipMoved(page,before,'poll refresh applied');
  await sleep(50);
 }

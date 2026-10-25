@@ -60,6 +60,14 @@ export function createRefreshBus({
   };
 }
 
+// Timed refresh for a view whose data changes without any SSE event (routine host heartbeats are
+// memory-only on the server, and a dead host never emits anything): calls fn every ms while the
+// tab is visible. Returns the stop function.
+export function pollWhileVisible(fn, ms, { setTimer = setInterval, clearTimer = clearInterval, hidden = () => typeof document !== 'undefined' && document.hidden } = {}) {
+  const handle = setTimer(() => { if (!hidden()) fn(); }, ms);
+  return () => clearTimer(handle);
+}
+
 // One mounted view's refresh: fetch with load(), then apply(data) unless the view was disposed
 // meanwhile. A refresh requested while one is in flight is not swallowed: it runs once more after
 // the current one finishes (any number of mid-flight requests coalesce into that one rerun).

@@ -3,9 +3,9 @@
 // without touching an open outdated-packages <details> or the scroll position. The range tabs
 // are in-page: setRange swaps the series and rewrites the hash without a navigation.
 import { morph } from './patch.js';
-import { liveRefresher } from './refresh-bus.js';
+import { liveRefresher, pollWhileVisible } from './refresh-bus.js';
 import { renderHostDetail, RANGES } from './host-view.js';
-import { HOST_INTERESTS } from './hosts-view.js';
+import { HOST_POLL_MS } from './hosts-view.js';
 
 const NOT_FOUND = '<herdr-error message="Host not found"></herdr-error>';
 
@@ -59,10 +59,11 @@ export function mountHostDetail(container, client, hostId, range, { data = null 
   container.addEventListener('click', onClick);
 
   if (data) live.applied(data); else live.refresh();
+  // Same as the Hosts page: any live event refreshes, and a visible-only poll covers a quiet fleet.
+  const stopPoll = pollWhileVisible(() => live.refresh(), HOST_POLL_MS);
   return {
-    interests: HOST_INTERESTS,
     refresh: (hint) => live.refresh(hint),
     setRange,
-    dispose() { live.dispose(); container.removeEventListener('click', onClick); },
+    dispose() { stopPoll(); live.dispose(); container.removeEventListener('click', onClick); },
   };
 }

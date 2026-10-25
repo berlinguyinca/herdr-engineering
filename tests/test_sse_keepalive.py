@@ -1,4 +1,5 @@
 import http.client
+import json
 import threading
 
 import pytest
@@ -38,9 +39,12 @@ def test_idle_stream_stays_open_and_emits_keepalive_frames(port):
     assert resp.getheader("X-Accel-Buffering") == "no"
     assert resp.readline().startswith(b"data: ")  # StreamConnected
     assert resp.readline() == b"\n"
-    # several idle intervals pass; the stream must keep emitting, not close
+    # several idle intervals pass; the stream must keep emitting, not close. The keepalive is a
+    # data frame (EventSource never surfaces SSE comments) so the UI can see stream contact.
     for _ in range(3):
-        assert resp.readline() == b": keep-alive\n"
+        line = resp.readline()
+        assert line.startswith(b"data: "), line
+        assert json.loads(line[len(b"data: "):])["event_type"] == "StreamKeepalive"
         assert resp.readline() == b"\n"
     conn.close()
 

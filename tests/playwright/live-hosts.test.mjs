@@ -3,7 +3,11 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {withPage} from './helpers/fixture.mjs';
-import {boot,until,observe,mutationCount,liveRefresh,sleep} from './helpers/live.mjs';
+import {boot,until,observe,mutationCount,liveRefresh,pollRefresh,sleep} from './helpers/live.mjs';
+
+// Hosts never get a HostHeartbeat event in production (routine heartbeats are memory-only), so
+// these tests refresh by the view's poll alone, with no SSE traffic.
+const POLL=16000;
 
 const fresh='2026-01-01T00:00:05Z';
 function hostsState(){
@@ -36,13 +40,13 @@ test('a live refresh with one changed host cpu mutates only that card\'s meter a
 
  // Identical data: zero DOM writes.
  await observe(page);
- await liveRefresh(page);
+ await pollRefresh(page,POLL);
  assert.ok(reads['/api/v1/hosts']>=2,'refresh fetched hosts again');
  assert.equal(await mutationCount(page),0,'identical refresh performs no DOM writes');
 
  state.hosts[0].latest.cpu=55;
  await observe(page);
- await liveRefresh(page);
+ await pollRefresh(page,POLL);
  const result=await page.evaluate(()=>{
   const beast=document.querySelector('[data-host-id="beast"][data-host-card]');
   const meter=beast.querySelector('[data-meter=cpu]');
@@ -88,11 +92,11 @@ test('host detail keeps an open outdated-packages disclosure across a live refre
  const y=await page.evaluate(()=>window.scrollY);
 
  await observe(page);
- await liveRefresh(page);
+ await pollRefresh(page,POLL);
  assert.equal(await mutationCount(page),0,'identical refresh performs no DOM writes');
 
  state.hosts[0].latest.cpu=77;state.hosts[0].updates.outdated=3;
- await liveRefresh(page);
+ await pollRefresh(page,POLL);
  const after=await page.evaluate(()=>({
   same:document.querySelector('[data-section=updates] details')===window.__details,
   open:window.__details.open,h1:document.querySelector('#view h1')===window.__h1,
@@ -124,6 +128,36 @@ test('switching range keeps the page and swaps the series without a spinner',asy
  assert.deepEqual(seen,['1h','24h']);
 
  // A later live refresh keeps the selected range.
- await liveRefresh(page);
+ await pollRefresh(page,POLL);
  assert.equal(seen.at(-1),'24h');
+}));
+
+test('a quiet fleet with no events still turns a silent host stale (poll, no SSE traffic)',async()=>withPage(async(page,base)=>{
+ const state=hostsState();
+ const reads=await boot(page,base,'/hosts',api(state));
+ await until(()=>page.locator('[data-host-card]').count().then(n=>n===3),'host cards');
+ assert.equal(await page.locator('[data-host-card][data-host-id="beast"]').getAttribute('data-stale'),null);
+ // beast stops reporting: the server keeps answering with its last report and emits nothing.
+ await page.clock.fastForward(16*60*1000);
+ await pollRefresh(page,POLL);
+ assert.equal(await page.locator('[data-host-card][data-host-id="beast"]').getAttribute('data-stale'),'','silent host marked stale');
+ assert.ok(reads['/api/v1/hosts']>=2);
+}));
+
+test('any live event refreshes the Hosts page, not only host event types',async()=>withPage(async(page,base)=>{
+ const state=hostsState();
+ await boot(page,base,'/hosts',api(state));
+ await until(()=>page.locator('[data-host-card]').count().then(n=>n===3),'host cards');
+ state.hosts[1].latest.cpu=66;
+ await liveRefresh(page,{event_id:'x1',event_type:'MissionUpdated'});
+ assert.equal(await page.locator('[data-host-id="zapp"][data-host-card] [data-meter=cpu] [role=meter]').getAttribute('aria-valuenow'),'66');
+}));
+
+test('host detail refreshes on its own poll with no SSE traffic',async()=>withPage(async(page,base)=>{
+ const state=detailState();
+ await boot(page,base,'/hosts/beast',api(state));
+ await page.locator('[data-section=cpu] .hv-value').waitFor();
+ state.hosts[0].latest.cpu=42;
+ await pollRefresh(page,POLL);
+ assert.equal(await page.locator('[data-section=cpu] .hv-value').textContent(),'42%');
 }));

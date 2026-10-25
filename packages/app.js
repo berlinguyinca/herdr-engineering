@@ -26,6 +26,7 @@ import { mountHostDetail, loadHostDetail } from './host-detail-view.js';
 import { mountActivity, loadActivity } from './activity-view.js';
 import { mountAnalytics, loadAnalytics } from './analytics-view.js';
 import { morph } from './patch.js';
+import { noteStreamContact } from './freshness.js';
 import { mountServices, mountServiceDetails } from './services-view.js';
 import { mountCollab, completeSignInIfRedirected } from './collab-view.js';
 import { mountAttention, attentionBadge, POLL_MS as ATTENTION_POLL_MS } from './attention-view.js';
@@ -594,7 +595,8 @@ async function streamList(entityType, entityId) {
 connectEvents({
   url: '/api/v1/events/stream',
   onEvent: (event) => bus.dispatch(event),
-  onError: () => { /* keep last view; the client auto-reconnects */ },
+  onContact: () => noteStreamContact(true),
+  onError: () => { noteStreamContact(false); /* keep last view; the client auto-reconnects */ },
 });
 
 document.addEventListener('visibilitychange', () => { if (document.hidden) bus.pause(); else bus.resume(); });

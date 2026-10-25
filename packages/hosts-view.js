@@ -2,12 +2,15 @@
 // config notice and the fleet version matrix are morphed, so a live refresh writes only what
 // changed (identical data: zero writes). The ?drift=1 filter is a navigation, so it is fixed per mount.
 import { patchList, morph } from './patch.js';
-import { liveRefresher } from './refresh-bus.js';
+import { liveRefresher, pollWhileVisible } from './refresh-bus.js';
 import { renderFleetMatrix } from './fleet-view.js';
 import { renderHostCard, HOST_CARD_STYLE } from './host-view.js';
 import { configNotice, indexConfigStatus } from './fleet-config-badge.js';
 
-export const HOST_INTERESTS = ['HostHeartbeat', 'HostRegistered', 'HostUnavailable'];
+// Host views take every live event (no interest filter) AND poll: the server keeps routine 30 s
+// heartbeats in memory without emitting an event and never emits one for a host that goes silent,
+// so on a quiet fleet only the poll moves telemetry forward and turns a dead host stale.
+export const HOST_POLL_MS = 15000;
 
 export async function loadHosts(client) {
   const [{ hosts }, matrix, configStatus] = await Promise.all([
@@ -48,5 +51,6 @@ export function mountHosts(container, client, { data = null, driftedOnly = false
 
   const live = liveRefresher(() => loadHosts(client), apply, () => container.querySelector('herdr-freshness'));
   if (data) live.applied(data); else live.refresh();
-  return { interests: HOST_INTERESTS, refresh: (hint) => live.refresh(hint), dispose: () => live.dispose() };
+  const stopPoll = pollWhileVisible(() => live.refresh(), HOST_POLL_MS);
+  return { refresh: (hint) => live.refresh(hint), dispose: () => { stopPoll(); live.dispose(); } };
 }
