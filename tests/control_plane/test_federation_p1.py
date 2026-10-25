@@ -16,7 +16,7 @@ from herdr_engineering.control_plane.repo import ControlPlaneRepo
 
 ROOM = "room_" + "0123456789abcdefghjkmnpqrs"            # the peer's one mirror room
 OTHER_ROOM = "room_" + "sqrnmkjhgfedcba9876543210z"[:26]
-FP = "ab" * 8                                              # 16 hex chars
+FP = "ab" * 32                                             # the FULL 64-hex key fingerprint (P2)
 PEER = fed.peer_principal("acme", FP)
 OP = {"kind": "operator", "id": "key:op", "authenticated_by": "api_key"}
 OPEN = {"kind": "operator", "id": "open-listener", "authenticated_by": "open_listener"}
@@ -256,8 +256,7 @@ def test_loader_defaults_to_off():
     {"peers": {"acme": {"enabled": True, "key_fingerprint": FP, "mirror_room": ["*"]}}},
     {"peers": {"acme": {"enabled": True, "key_fingerprint": FP, "mirror_room": ROOM + "*"}}},
     {"peers": {"acme": {"enabled": True, "key_fingerprint": FP, "mirror_room": "room_short"}}},
-    {"peers": {"acme": {"enabled": True, "key_fingerprint": FP}}},
-    {"peers": {"acme": {"enabled": True, "mirror_room": ROOM}}},
+    {"peers": {"acme": {"enabled": True, "mirror_room": ROOM}}},                                       # no key at all
     {"peers": {"acme": {"enabled": True, "key_fingerprint": "zz", "mirror_room": ROOM}}},
     {"peers": {"acme": {"enabled": "on", "key_fingerprint": FP, "mirror_room": ROOM}}},
     {"peers": {"acme": {"enabled": True, "key_fingerprint": FP, "mirror_room": ROOM, "rooms": ["*"]}}},

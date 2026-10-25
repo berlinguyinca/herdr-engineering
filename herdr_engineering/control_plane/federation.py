@@ -15,8 +15,12 @@ The clamp table is keyed by principal kind so another untrusted kind can be adde
 """
 from __future__ import annotations
 
+import hashlib
+import hmac
+import math
 import re
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any
 
 PEER_KIND = "peer"
@@ -39,6 +43,8 @@ PEER_NODE_TYPE = "peer"
 PEER_NODE_PREFIX = "peer:"             # the whole prefix is reserved; a peer's own part is ``peer:<peer>.``
 PEER_ID_RE = re.compile(r"[a-z][a-z0-9-]{0,31}\Z")      # no '.', ':' or '*': a peer cannot own another's namespace
 _FINGERPRINT_RE = re.compile(r"[0-9a-f]{12,64}\Z")
+_FULL_FINGERPRINT_RE = re.compile(r"[0-9a-f]{64}\Z")
+_KEY_HEX_RE = re.compile(r"[0-9a-f]{64}\Z")          # a raw Ed25519 public key, hex
 _PRINCIPAL_RE = re.compile(r"peer:([a-z][a-z0-9-]{0,31}):([0-9a-f]{12})\Z")
 _ORIGIN_KEYS = ("server", "actor", "event_id", "sequence")
 _MAX_CLAIM = 512
@@ -69,10 +75,14 @@ def in_peer_namespace(node_id: Any, peer_id: str) -> bool:
 
 
 def peer_principal(peer_id: str, fingerprint: str) -> dict:
-    """The one way a peer actor is built (P2/P3 call it after verifying the pinned key)."""
-    if not PEER_ID_RE.fullmatch(peer_id or "") or not _FINGERPRINT_RE.fullmatch(fingerprint or ""):
+    """The one way a peer actor is built (P2/P3 call it after verifying the pinned key).
+
+    ``fingerprint`` is the FULL 64-hex key fingerprint and is carried on the actor; the 12-hex part of the id is a
+    stable display/ledger label only, never compared on its own (ADR-0008 P2: the P1 prefix comparison was a gap)."""
+    if not PEER_ID_RE.fullmatch(peer_id or "") or not _FULL_FINGERPRINT_RE.fullmatch(fingerprint or ""):
         raise ValueError("invalid peer id or key fingerprint")
-    return {"kind": PEER_KIND, "id": f"peer:{peer_id}:{fingerprint[:12]}", "authenticated_by": PEER_AUTH}
+    return {"kind": PEER_KIND, "id": f"peer:{peer_id}:{fingerprint[:12]}", "authenticated_by": PEER_AUTH,
+            "fingerprint": fingerprint}
 
 
 def peer_of(actor: Any) -> tuple[str, str] | None:
@@ -81,6 +91,14 @@ def peer_of(actor: Any) -> tuple[str, str] | None:
         return None
     m = _PRINCIPAL_RE.fullmatch(actor.get("id") or "")
     return (m.group(1), m.group(2)) if m else None
+
+
+def peer_fingerprint(actor: Any) -> str | None:
+    """The full fingerprint a well-formed peer actor carries (None when absent or malformed)."""
+    if peer_of(actor) is None:
+        return None
+    fp = actor.get("fingerprint")
+    return fp if isinstance(fp, str) and _FULL_FINGERPRINT_RE.fullmatch(fp) else None
 
 
 def is_peer_actor(actor: Any) -> bool:
@@ -160,45 +178,130 @@ def apply_clamp(env: dict, body: dict, clamp: Clamp) -> dict:
 
 
 # --------------------------------------------------------------------------- YAML
+def key_fingerprint_of(public_key_hex: str) -> str:
+    """The full 64-hex SHA-256 fingerprint of a raw Ed25519 public key given as 64 hex characters."""
+    return hashlib.sha256(bytes.fromhex(public_key_hex)).hexdigest()
+
+
 @dataclass(frozen=True)
 class PeerPolicy:
+    """One peer from ``control_plane.federation.peers.<id>``.
+
+    ``public_key`` (hex of the raw 32-byte Ed25519 key) is the PINNED identity. Its fingerprint is always the
+    full SHA-256, derived here, never read from a prefix. A peer with no ``public_key`` (the P1 shape) can be
+    configured but can never authenticate. ``mirror_room`` is the INBOUND binding (P1/P3); ``export_rooms`` is the
+    OUTBOUND allowlist (P2): the two are independent and neither implies the other."""
     peer_id: str
     enabled: bool
     key_fingerprint: str
-    mirror_room: str
+    mirror_room: str | None
+    public_key: str | None = None
+    key_expires_at: float | None = None
+    rotate_after: float | None = None
+    next_public_key: str | None = None
+    export_rooms: tuple = ()
+    requests_per_minute: int = 30
+    max_bytes_per_hour: int = 16 * 1024 * 1024
 
-    def matches(self, fingerprint12: str) -> bool:
-        return self.key_fingerprint[:12] == fingerprint12
+    def matches(self, fingerprint: Any) -> bool:
+        """Does ``fingerprint`` equal this peer's pinned key fingerprint, ALL 64 hex characters? Anything shorter,
+        longer or not a string is a mismatch (P1 compared 12 characters, so two keys sharing a prefix matched)."""
+        if not (isinstance(fingerprint, str) and _FULL_FINGERPRINT_RE.fullmatch(fingerprint)):
+            return False        # (so a keyless P1-shaped peer, holding only a short value, can never match either)
+        return hmac.compare_digest(self.key_fingerprint, fingerprint)
+
+    def accepted_keys(self, now: float) -> tuple:
+        """``(public_key_hex, fingerprint)`` pairs a signature may verify against at ``now``: the pinned key until
+        its expiry, and a rotation-overlap ``next_public_key`` (valid as soon as the operator lists it)."""
+        out = []
+        if self.public_key and (self.key_expires_at is None or now < self.key_expires_at):
+            out.append((self.public_key, self.key_fingerprint))
+        if self.next_public_key:
+            out.append((self.next_public_key, key_fingerprint_of(self.next_public_key)))
+        return tuple(out)
+
+    def rotation_due(self, now: float) -> bool:
+        return self.rotate_after is not None and now >= self.rotate_after
 
 
 @dataclass(frozen=True)
 class FederationPolicy:
     enabled: bool = False
     peers: tuple = ()
+    server_id: str | None = None
+    signing_key_file: str | None = None
+    request_window_seconds: int = 120
+    export_validity_seconds: int = 300
+    max_export_events: int = 100
 
     def peer(self, peer_id: str) -> PeerPolicy | None:
         return next((p for p in self.peers if p.peer_id == peer_id), None)
 
 
 OFF = FederationPolicy()
-_PEER_KEYS = frozenset({"enabled", "key_fingerprint", "mirror_room"})
+_SECTION_KEYS = frozenset({"enabled", "peers", "server_id", "signing_key_file", "request_window_seconds",
+                           "export_validity_seconds", "max_export_events"})
+_PEER_KEYS = frozenset({"enabled", "key_fingerprint", "mirror_room", "public_key", "key_expires_at", "rotate_after",
+                        "next_public_key", "export_rooms", "requests_per_minute", "max_bytes_per_hour"})
+_SERVER_ID_RE = re.compile(r"[a-z0-9][a-z0-9.-]{0,62}\Z")
+MAX_EXPORT_ROOMS = 64
+
+
+def _int_in(cfg: dict, key: str, default: int, lo: int, hi: int, where: str) -> int:
+    v = cfg.get(key, default)
+    if isinstance(v, bool) or not isinstance(v, int) or not lo <= v <= hi:
+        raise FederationConfigError(f"{where}.{key} must be an integer from {lo} to {hi}")
+    return v
+
+
+def _when(value: Any, where: str) -> float | None:
+    """An absolute UTC time as epoch seconds: a YAML timestamp, an ISO-8601 string or a finite number."""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise FederationConfigError(f"{where} must be a UTC time")
+    if isinstance(value, datetime):
+        return (value if value.tzinfo else value.replace(tzinfo=UTC)).timestamp()
+    if isinstance(value, (int, float)):
+        if not math.isfinite(value):
+            raise FederationConfigError(f"{where} must be a UTC time")
+        return float(value)
+    if isinstance(value, str):
+        try:
+            dt = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+        except ValueError:
+            raise FederationConfigError(f"{where} must be an ISO-8601 UTC time") from None
+        return (dt if dt.tzinfo else dt.replace(tzinfo=UTC)).timestamp()
+    raise FederationConfigError(f"{where} must be a UTC time")
 
 
 def parse_federation(section: Any) -> FederationPolicy:
     """Validate ``control_plane.federation``. Raises :class:`FederationConfigError`; nothing is repaired.
 
-    ``None`` (absent) is OFF. ``enabled`` must be a real boolean. Every peer id is a plain id; the one value that
-    grants reach (``mirror_room``) is an explicit room id: ``"*"`` (or any glob) is refused outright,
-    because a peer must never hold the operator opt-in that ``lineage_key_scopes`` allows an ordinary key.
+    ``None`` (absent) is OFF. ``enabled`` must be a real boolean. Every peer id is a plain id; every value that
+    grants reach (``mirror_room``, ``export_rooms``) is an explicit room id: ``"*"`` (or any glob) is refused
+    outright, because a peer must never hold the operator opt-in that ``lineage_key_scopes`` allows an ordinary key.
+    ``public_key`` is hex of a raw Ed25519 key; a configured ``key_fingerprint`` must equal ITS full SHA-256.
     """
     from . import ids
     if section is None:
         return OFF
-    if not isinstance(section, dict) or set(section) - {"enabled", "peers"}:
-        raise FederationConfigError("control_plane.federation must hold only enabled and peers")
+    if not isinstance(section, dict) or set(section) - _SECTION_KEYS:
+        raise FederationConfigError(f"control_plane.federation allowed keys are {sorted(_SECTION_KEYS)}")
     enabled = section.get("enabled", False)
     if not isinstance(enabled, bool):
         raise FederationConfigError("control_plane.federation.enabled must be true or false")
+    top = "control_plane.federation"
+    server_id = section.get("server_id")
+    if server_id is not None and (not isinstance(server_id, str) or not _SERVER_ID_RE.fullmatch(server_id)):
+        raise FederationConfigError(f"{top}.server_id must be lowercase letters, digits, '.' and '-'")
+    key_file = section.get("signing_key_file")
+    if key_file is not None and (not isinstance(key_file, str) or not key_file.startswith("/") or len(key_file) > 512
+                                 or "\x00" in key_file):
+        raise FederationConfigError(f"{top}.signing_key_file must be an absolute path")
+    window = _int_in(section, "request_window_seconds", 120, 10, 600, top)
+    validity = _int_in(section, "export_validity_seconds", 300, 30, 3600, top)
+    max_events = _int_in(section, "max_export_events", 100, 1, 500, top)
     raw = section.get("peers", {})
     if raw is None:
         raw = {}
@@ -214,14 +317,34 @@ def parse_federation(section: Any) -> FederationPolicy:
         on = cfg.get("enabled", False)
         if not isinstance(on, bool):
             raise FederationConfigError(f"{where}.enabled must be true or false")
+        pub = cfg.get("public_key")
+        if pub is not None and (not isinstance(pub, str) or not _KEY_HEX_RE.fullmatch(pub)):
+            raise FederationConfigError(f"{where}.public_key must be 64 lowercase hex characters (a raw Ed25519 key)")
+        nxt = cfg.get("next_public_key")
+        if nxt is not None and (pub is None or not isinstance(nxt, str) or not _KEY_HEX_RE.fullmatch(nxt) or nxt == pub):
+            raise FederationConfigError(f"{where}.next_public_key must be a different 64-hex key and needs public_key")
         fp = cfg.get("key_fingerprint")
-        if not isinstance(fp, str) or not _FINGERPRINT_RE.fullmatch(fp):
+        if pub is not None:
+            derived = key_fingerprint_of(pub)
+            if fp is not None and (not isinstance(fp, str) or fp != derived):
+                raise FederationConfigError(f"{where}.key_fingerprint must be the full SHA-256 of public_key")
+            fp = derived
+        elif not isinstance(fp, str) or not _FINGERPRINT_RE.fullmatch(fp):
             raise FederationConfigError(f"{where}.key_fingerprint must be 12-64 lowercase hex characters")
         room = cfg.get("mirror_room")
-        if not isinstance(room, str) or "*" in room or not ids.is_valid_id(room, "room"):
+        if room is not None and (not isinstance(room, str) or "*" in room or not ids.is_valid_id(room, "room")):
             raise FederationConfigError(f"{where}.mirror_room must be one explicit room id (a peer never holds \"*\")")
-        peers.append(PeerPolicy(peer_id, on, fp, room))
-    return FederationPolicy(enabled, tuple(peers))
+        rooms = cfg.get("export_rooms", [])
+        if (not isinstance(rooms, list) or len(rooms) > MAX_EXPORT_ROOMS or len(set(rooms)) != len(rooms)
+                or not all(isinstance(r, str) and ids.is_valid_id(r, "room") for r in rooms)):    # (a glob is no room id)
+            raise FederationConfigError(f"{where}.export_rooms must be a list of explicit room ids (never \"*\")")
+        expires = _when(cfg.get("key_expires_at"), f"{where}.key_expires_at")
+        rotate = _when(cfg.get("rotate_after"), f"{where}.rotate_after")
+        peers.append(PeerPolicy(
+            peer_id, on, fp, room, pub, expires, rotate, nxt, tuple(rooms),
+            _int_in(cfg, "requests_per_minute", 30, 1, 600, where),
+            _int_in(cfg, "max_bytes_per_hour", 16 * 1024 * 1024, 1024, 1 << 30, where)))
+    return FederationPolicy(enabled, tuple(peers), server_id, key_file, window, validity, max_events)
 
 
 def policy_from_source(source) -> FederationPolicy:

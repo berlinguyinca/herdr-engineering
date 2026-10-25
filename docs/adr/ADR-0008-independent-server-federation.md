@@ -154,6 +154,11 @@ Server A (authoritative for A's rooms)                 Server B
 * **P1, prerequisite, separate PR, valuable alone.** Per-principal visibility clamp in `normalize_envelope`/`IngestService` (C2), and
   `peer` principal kind with reserved-prefix and `"*"` rules (C3, C6). Ships dark; no federation code.
 * **P2.** Peer registry from YAML, share events, export endpoints, signed exports. Off by default.
+  *Implemented (contract: `docs/contracts/federation-export.md`).* Notes against the text above: the operator side of Decision 3's
+  `{peer, room}` list is `peers.<id>.export_rooms`; the pre-paid revocation of `federation_peer_enabled` is the additional event
+  `federation_peer_disabled`; the export carries `message` events only (lineage nodes and edges need their own allowlist row and a
+  reviewed reader, a later step); the P1 12-character fingerprint comparison is replaced by the full 64-hex key; request
+  authentication is Ed25519 from `cryptography` (already in the `collab`/`review-gate` extras).
 * **P3.** Importer/puller, mirror room, freshness UI. Read-only.
 * **P4 (optional, separate approval).** Typed requests: message and proposal (Decision 8).
 * Each phase is its own PR with tests and commit-bound evidence, flagged off, rollback by revert plus kill switch. New collab event types

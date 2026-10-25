@@ -19,7 +19,8 @@ log = logging.getLogger(__name__)
 from .envelope import ENVELOPE_ONLY_TYPES, EnvelopeConflict, normalize_envelope
 from .events import SequenceCollision
 from .federation import (
-    clamp_for_principal, in_peer_namespace, is_peer_actor, is_peer_node, peer_of, policy_from_source,
+    clamp_for_principal, in_peer_namespace, is_peer_actor, is_peer_node, peer_fingerprint, peer_of,
+    policy_from_source,
 )
 from .graph import validate_lineage
 from .host_metrics_store import STATE_KEYS, clean_metrics, clean_state
@@ -104,7 +105,11 @@ class IngestService:
         if found is None or not policy.enabled:
             return None
         peer = policy.peer(found[0])
-        return peer if peer is not None and peer.enabled and peer.matches(found[1]) else None
+        full = peer_fingerprint(actor)
+        # the FULL pinned fingerprint, and the id's display label must be its prefix (ADR-0008 P2: P1 matched 12 chars)
+        if peer is None or not peer.enabled or full is None or full[:12] != found[1] or not peer.matches(full):
+            return None
+        return peer
 
     def _peer_clamp(self, principal, entity_type):
         """ADR-0008 Decision 4. None for a non-peer. A peer is admitted only as a v2 ``lineage`` writer bound to

@@ -329,6 +329,12 @@ class ControlPlaneServer:
         self._refusal_logged: dict = {}    # T16 gap C: durable re-review requests (the route 404s when the quorum is off)
         self.collab = collab
         self.collab_require_https = collab_require_https
+        # ADR-0008 P2: signed read-only export endpoints (/api/v1/federation/*). Inert unless the hot YAML switches
+        # `control_plane.federation` on; the gateway is rebuilt if `collab` is swapped (tests do).
+        self.federation_source = federation_source
+        self._fed_gateway = None
+        if collab is not None and federation_source is not None:
+            collab.federation_source = federation_source
         # Optional second listener that serves ONLY collaboration (API, MCP and its page);
         # it is the only one an internet-facing proxy should be pointed at.
         if public_port is not None and collab is None:
@@ -1084,11 +1090,45 @@ def _make_handler(server, public=False, operator=False):
                 return None
             return self._json(payload, status)
 
+        def _federation(self):
+            """ADR-0008 P2. Main listener only, GET only; every refusal is the same 404 (see federation_export)."""
+            from .federation_export import NOT_FOUND, FederationGateway
+            gw = server._fed_gateway
+            if gw is None or gw.service is not server.collab:
+                gw = server._fed_gateway = FederationGateway(server.collab, server.federation_source)
+            cl = self.headers.get_all("Content-Length") or []
+            if (not gw.is_on() or len(cl) > 1 or "Transfer-Encoding" in self.headers
+                    or (cl and cl[0].strip() not in ("", "0"))
+                    or (server.collab_require_https
+                        and self.headers.get("X-Forwarded-Proto", "").lower() != "https")):
+                self.close_connection = True          # a body we will not read must not be parsed as the next request
+                return self._fed_send(*NOT_FOUND)
+            if self._rate_limit(self._proxied_client()):
+                return None
+            return self._fed_send(*gw.handle(self.command, self.path, self.headers, b""))
+
+        def _fed_send(self, status, payload, extra):
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(payload)))
+            for k, v in extra.items():
+                self.send_header(k, v)
+            if self.close_connection:
+                self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def _is_federation_path(self):
+            return self.path.startswith("/api/v1/federation/") or self.path.split("?")[0] == "/api/v1/federation"
+
         def do_GET(self):
             if operator:
                 return self._operator()
             if public:
                 return self._public()
+            if self._is_federation_path():
+                return self._federation()
             if self._is_collab_path():
                 return self._collab()
             if self._path_only() == _FLEET_CONFIG_PATH:
@@ -1110,6 +1150,8 @@ def _make_handler(server, public=False, operator=False):
                 return self._operator()
             if public:
                 return self._public()
+            if self._is_federation_path():
+                return self._federation()        # read-only: answers the same 404 as everything else
             # Unambiguous framing, as on the public/operator listeners: this server reads
             # only Content-Length, so a chunked or doubly-sized body would be parsed as
             # the next request on a keep-alive connection. Applies to collab paths too.
