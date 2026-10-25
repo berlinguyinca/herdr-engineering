@@ -31,8 +31,9 @@ export function createRefreshBus({
   }
 
   return {
-    register(view) {
-      const entry = { view, timer: null, last: -Infinity, hint: undefined };
+    // fresh: the view just loaded its data, so the first event waits out one window.
+    register(view, { fresh = false } = {}) {
+      const entry = { view, timer: null, last: fresh ? now() : -Infinity, hint: undefined };
       entries.add(entry);
       return () => { cancel(entry); entries.delete(entry); };
     },
@@ -56,5 +57,50 @@ export function createRefreshBus({
         entry.timer = setTimer(() => run(entry, undefined), 0);
       }
     },
+  };
+}
+
+// Timed refresh for a view whose data changes without any SSE event (routine host heartbeats are
+// memory-only on the server, and a dead host never emits anything): calls fn every ms while the
+// tab is visible. Returns the stop function.
+export function pollWhileVisible(fn, ms, { setTimer = setInterval, clearTimer = clearInterval, hidden = () => typeof document !== 'undefined' && document.hidden } = {}) {
+  const handle = setTimer(() => { if (!hidden()) fn(); }, ms);
+  return () => clearTimer(handle);
+}
+
+// One mounted view's refresh: fetch with load(), then apply(data) unless the view was disposed
+// meanwhile. A refresh requested while one is in flight is not swallowed: it runs once more after
+// the current one finishes (any number of mid-flight requests coalesce into that one rerun).
+// A failed refresh keeps the page and marks the view's <herdr-freshness> chip (if any) red.
+export function liveRefresher(load, apply, chip = () => null) {
+  let disposed = false;
+  let inflight = null;
+  let again = null;
+  let nextHint;
+  const touch = (ok, message) => { const el = chip(); if (el && typeof el.touch === 'function') el.touch(ok, message); };
+  const run = (hint) => {
+    inflight = (async () => {
+      try {
+        const data = await load(hint);
+        if (disposed) return;
+        apply(data);
+        touch(true);
+      } catch (error) {
+        if (!disposed) touch(false, error?.message || 'refresh failed');
+      } finally { inflight = null; }
+    })();
+    return inflight;
+  };
+  return {
+    applied(data) { apply(data); touch(true); },
+    refresh(hint) {
+      if (disposed) return Promise.resolve();
+      if (!inflight) return run(hint);
+      nextHint = hint;
+      if (!again) again = inflight.then(() => { again = null; return disposed ? undefined : run(nextHint); });
+      return again;
+    },
+    dispose() { disposed = true; },
+    get disposed() { return disposed; },
   };
 }

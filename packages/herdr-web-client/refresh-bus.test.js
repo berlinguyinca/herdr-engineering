@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {createRefreshBus} from '../refresh-bus.js';
+import {createRefreshBus, liveRefresher, pollWhileVisible} from '../refresh-bus.js';
 
 function harness(){
   let t=0;const timers=[];
@@ -76,4 +76,47 @@ test('a throwing view does not block others',()=>{
   bus.register({refresh(){throw new Error('x')}});bus.register(b);
   bus.dispatch({event_type:'X'});advance(0);
   assert.equal(b.calls.length,1);
+});
+
+test('register({fresh:true}) treats registration as a refresh: first event waits out the window',()=>{
+  const {bus,advance}=harness();const a=view(),b=view();
+  bus.register(a,{fresh:true});bus.register(b);
+  bus.dispatch({event_type:'X'});advance(0);
+  assert.equal(a.calls.length,0);assert.equal(b.calls.length,1);
+  advance(4999);assert.equal(a.calls.length,0);
+  advance(1);assert.equal(a.calls.length,1);
+});
+
+test('liveRefresher: a refresh requested mid-flight runs once more after it finishes, with the latest data',async()=>{
+  const gates=[];let calls=0;const applied=[];
+  const live=liveRefresher(()=>{calls++;return new Promise(r=>gates.push(r));},d=>applied.push(d));
+  const first=live.refresh();
+  const second=live.refresh();live.refresh();// both coalesce into one trailing run
+  assert.equal(calls,1);
+  gates[0]('old');await first;
+  await new Promise(r=>setImmediate(r));
+  assert.equal(calls,2,'the swallowed request runs once more');
+  gates[1]('new');await second;
+  assert.deepEqual(applied,['old','new']);
+  await new Promise(r=>setImmediate(r));
+  assert.equal(calls,2,'no extra runs');
+});
+
+test('liveRefresher: a disposed view applies nothing and does not rerun',async()=>{
+  const gates=[];let calls=0;const applied=[];
+  const live=liveRefresher(()=>{calls++;return new Promise(r=>gates.push(r));},d=>applied.push(d));
+  const p=live.refresh();live.refresh();live.dispose();
+  gates[0]('x');await p;await new Promise(r=>setImmediate(r));
+  assert.deepEqual([calls,applied],[1,[]]);
+});
+
+test('pollWhileVisible fires on a quiet stream, skips hidden ticks, and stops',()=>{
+  let tick=null,cleared=false,hidden=false,calls=0;
+  const stop=pollWhileVisible(()=>calls++,15000,{setTimer:(fn,ms)=>{assert.equal(ms,15000);tick=fn;return 'h';},clearTimer:h=>{assert.equal(h,'h');cleared=true;},hidden:()=>hidden});
+  tick();tick();
+  assert.equal(calls,2,'no event needed: every visible tick refreshes');
+  hidden=true;tick();
+  assert.equal(calls,2,'a hidden tab does not poll');
+  stop();
+  assert.equal(cleared,true);
 });

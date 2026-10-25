@@ -230,7 +230,8 @@ export function renderHostDetail(host, history, { range = '1h', now = Date.now()
 export const HOST_CARD_STYLE = `<style>
 ${BADGE_CSS}
 .hv-meters{display:grid;gap:4px;margin:8px 0 2px}.hv-meter{display:grid;grid-template-columns:3.2rem 1fr 2.8rem;gap:6px;align-items:center;font-size:.75rem;color:var(--text-secondary)}
-.hv-meter__bar{height:6px;border-radius:3px;background:var(--surface-2);overflow:hidden}.hv-meter__bar i{display:block;height:100%;background:var(--accent,#2563eb)}.hv-meter span:last-child{text-align:right}
+.hv-meter__bar{height:6px;border-radius:3px;background:var(--surface-2);overflow:hidden}.hv-meter__bar i{display:block;height:100%;background:var(--accent,#2563eb);transition:width var(--motion-normal,200ms)}
+[data-host-card][data-stale]{opacity:.7}.hv-meter span:last-child{text-align:right}
 </style>`;
 
 const clamp100 = (v) => Math.min(100, Math.max(0, num(v)));
@@ -266,7 +267,7 @@ export function renderHostCard(host, { now = Date.now(), cfg = null } = {}) {
     ? [meter('cpu', 'CPU', latest.cpu), meter('mem', 'Memory', latest.mem), meter('disk', 'Disk', disk), gpuUtils.length ? meter('gpu', 'GPU', Math.max(...gpuUtils)) : ''].join('')
     : '';
   const seen = h.last_seen ? esc(formatTimestamp(h.last_seen)) : 'never';
-  return `<div class="hd-card" data-host-card>
+  return `<div class="hd-card" data-host-card data-host-id="${esc(h.host_id ?? '')}"${stage === 'stalled' ? ' data-stale' : ''}>
       <div class="hd-card__title"><a href="#/hosts/${esc(id)}">${show(h.host_name ?? h.host_id, 'Unnamed host')}</a></div>
       <div style="margin:6px 0"><herdr-status stage="${esc(stage)}"></herdr-status> ${latest ? '' : `${NO_TELEMETRY} `}${configBadge(cfg, h)} ${problemBadge(h)}</div>
       <div class="hd-card__sub">${h.tailnet_ip ? `<code>${esc(h.tailnet_ip)}</code>` : 'not reported'} · ${stage === 'stalled' ? `<strong>no report since</strong> ${seen}` : latest ? `seen ${seen}` : `registered, no telemetry · last seen ${seen}`}</div>

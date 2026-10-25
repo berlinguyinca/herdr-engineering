@@ -79,6 +79,7 @@
   --text-primary: var(--text);
   --text-sm: 0.8125rem;
   --status-danger: var(--status-failed);
+  --status-error: var(--status-failed);
   --status-success: var(--status-ok);
   --freshness-warn: #b45309;
   --error-bg: #fef2f2;

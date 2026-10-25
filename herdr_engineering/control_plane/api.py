@@ -2102,8 +2102,14 @@ def _make_handler(server, public=False, operator=False):
                     except queue.Empty:
                         if q not in server._subscribers:
                             break  # dropped as a slow subscriber: close so the client reconnects
-                        # comment frame keeps proxies/EventSource from timing out
-                        self.wfile.write(b": keep-alive\n\n")
+                        # A data frame (not an SSE comment, which EventSource never surfaces)
+                        # keeps proxies from timing out AND tells the UI the stream is alive on
+                        # a quiet fleet; the client filters it out like StreamConnected.
+                        self.wfile.write(_sse_frame({
+                            "event_type": "StreamKeepalive",
+                            "entity_type": "stream", "entity_id": "control-plane",
+                            "sequence": 0, "payload": {},
+                        }))
                         self.wfile.flush()
                         continue
                     self.wfile.write(_sse_frame(ev))
