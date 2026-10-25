@@ -47,6 +47,19 @@ def _dict(row):
     return row.to_dict() if hasattr(row, 'to_dict') else dict(row)
 
 
+def _credential_redactor(token):
+    """Redact output values without changing metric keys or reading the provider."""
+    def scrub(value):
+        if isinstance(value, str):
+            return value.replace(token, '[REDACTED]') if token else value
+        if isinstance(value, dict):
+            return {key: scrub(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [scrub(item) for item in value]
+        return value
+    return scrub
+
+
 def bound_ci_provider(factory, provider_url=None):
     """Resolve once and reject a retained identity before any upstream I/O."""
     provider = factory()
@@ -124,6 +137,11 @@ class CIMonitor:
 
     def summary_snapshot(self, *, start=True):
         return self._history.summary_snapshot(start=start)
+
+    def report_redactor(self):
+        # Provider construction loads local configuration only. No availability
+        # probe, inventory, detail, or log request is needed for report reads.
+        return _credential_redactor(getattr(self._factory(), 'token', None))
 
     def summary(self, repo, **filters):
         # Preserve the existing lazy background-collector startup contract.
@@ -345,26 +363,18 @@ class CIMonitor:
             identities = {(item.get('provider_url', '').rstrip('/'), str(item.get('id')), item.get('repository'))
                           for item in inventory
                           if item.get('provider_url', '').rstrip('/') == row.get('provider_url') and
-                          (str(item.get('id')) == repository or item.get('repository') == repository)}
+                          row.get('provider_repo_id') is not None and
+                          str(item.get('id')) == str(row['provider_repo_id'])}
             if len(identities) == 1:
                 url, rid, name = identities.pop()
                 if (row.get('repository') in (rid, name) and
                         (row.get('provider_repo_id') is None or str(row['provider_repo_id']) == rid)):
                     row.update(provider_url=url, provider_repo_id=rid, repository=name)
             if provider_url is not None:
-                row.update(provider_url=provider.base_url.rstrip('/'),
-                           provider_repo_id=row.get('provider_repo_id', repository), run_number=number)
+                row.update(provider_url=provider.base_url.rstrip('/'), run_number=number)
             if not self.actions_enabled:
                 row.update(can_retry=False, can_cancel=False)
-            token = getattr(provider, 'token', None)
-            def scrub(value):
-                if isinstance(value, str):
-                    return value.replace(token, '[REDACTED]') if token else value
-                if isinstance(value, dict):
-                    return {key: scrub(item) for key, item in value.items()}
-                if isinstance(value, list):
-                    return [scrub(item) for item in value]
-                return value
+            scrub = _credential_redactor(getattr(provider, 'token', None))
             row = redact_payload(scrub(row))
             return {'available': True, 'pipeline': row, 'checked_at': _stamp(),
                     **({'provider_url': provider.base_url.rstrip('/')} if provider_url is not None else {})}

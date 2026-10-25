@@ -370,6 +370,8 @@ def ci_run(number=1, **changes):
 
 
 def seed_ci(server, rows, *, stale=False):
+    from types import SimpleNamespace
+
     server.repo._now = lambda: CI_NOW
     server.ci_monitor.close()  # Freeze publication while exercising cached reads.
     history = server.ci_monitor._history
@@ -384,7 +386,8 @@ def seed_ci(server, rows, *, stale=False):
             for r in repos]
     def forbidden(*args, **kwargs):
         raise AssertionError('Compact reads must not scan, start polling, or load detail/logs')
-    server.ci_monitor._factory = forbidden
+    # Credential context is local configuration; this stub offers no read API.
+    server.ci_monitor._factory = lambda: SimpleNamespace(token=None)
     server.ci_monitor.start = forbidden
     history.snapshot = forbidden
     server.ci_monitor.snapshot = forbidden
@@ -638,3 +641,79 @@ def test_cold_summary_bootstraps_background_history_without_waiting_for_provider
         assert all('process_request' not in name for name in request_threads)
     finally:
         release.set()
+
+
+@pytest.mark.parametrize('route', ['tests', 'pipeline'])
+@pytest.mark.parametrize('field', ['message', 'trace', 'labels'])
+def test_report_output_redacts_opaque_provider_credential_before_limits(server, route, field):
+    from herdr_engineering.ci import WoodpeckerProvider
+    from tests.test_ci import FakeCI
+
+    seed_ci(server, [ci_run()])
+    server.repo.observe_ci_pipeline(ci_run())
+    credential = 'Z9q7V2m4R8t6N3p5L1w0'
+    # Cross diagnosis's 500/1000-character boundaries to catch prefix leaks.
+    message = 'm' * 490 + credential if field == 'message' else 'failure'
+    trace = 't' * 990 + credential if field == 'trace' else 'trace'
+    label = credential if field == 'labels' else 'case'
+    xml = (f'<testsuite name="{label}"><testcase name="{label}" classname="{label}" file="{label}">'
+           f'<failure message="{message}">{trace}</failure></testcase></testsuite>')
+    upload_ci_report(server, xml=xml)
+    transport = FakeCI({'/api/repos/17/pipelines/1': {
+        'number': 1, 'status': 'failure', 'branch': 'main', 'commit': 'abc'},
+        '/api/repos/17/permissions': {'push': False}})
+    provider = WoodpeckerProvider('https://ci.example', credential, client=transport)
+    server.ci_monitor._factory = lambda: provider
+    path = 'ci/tests' if route == 'tests' else 'ci/pipeline?repository=17&number=1'
+    status, view = request(server, path)
+    assert status == 200
+    payload = json.dumps(view)
+    assert payload.find(credential[:8]) == -1
+    assert '[REDACTED]' in payload
+    if route == 'tests':
+        assert len(view['tests']) == 1
+        assert transport.requests == [], 'Credential access must not issue provider reads'
+        assert len(payload.encode()) < 256 * 1024
+    else:
+        assert view['diagnosis']['evidence_availability'] == 'reported'
+        assert len(view['diagnosis']['failed_tests']) == 1
+        assert len(json.dumps(view['diagnosis']).encode()) < 128 * 1024
+        assert all('/pipelines/1' in url or '/permissions' in url for url in transport.requests)
+
+
+def test_named_detail_uses_requested_provider_id_not_stale_recreated_repo_inventory(server):
+    from herdr_engineering.ci import WoodpeckerProvider
+    from tests.test_ci import FakeCI
+
+    seed_ci(server, [ci_run()])  # Old org/app was ID 17.
+    server.repo.observe_ci_pipeline(ci_run())
+    upload_ci_report(server)
+    transport = FakeCI({'/api/user/repos': [{'id': 18, 'full_name': 'org/app'}],
+        '/api/repos/18/pipelines/1': {'number': 1, 'commit': 'abc', 'branch': 'main', 'status': 'failure'},
+        '/api/repos/18/permissions': {'push': False}})
+    provider = WoodpeckerProvider('https://ci.example', 'opaque-value', client=transport)
+    server.ci_monitor._factory = lambda: provider
+    status, view = request(server, 'ci/pipeline?repository=org%2Fapp&number=1')
+    assert status == 200
+    assert 'https://ci.example/api/repos/18/pipelines/1' in transport.requests
+    assert str(view['pipeline']['provider_repo_id']) == '18'
+    assert view['diagnosis']['evidence_availability'] == 'unavailable'
+    assert view['diagnosis']['failed_tests'] == []
+    upload_ci_report(server, provider_repo_id=18)
+    status, view = request(server, 'ci/pipeline?repository=org%2Fapp&number=1')
+    assert status == 200
+    assert view['diagnosis']['evidence_availability'] == 'reported'
+    assert view['diagnosis']['history_scope']['provider_repo_id'] == '18'
+
+
+@pytest.mark.parametrize('bound', ['', '&provider_url=https%3A%2F%2Fci.example'])
+def test_named_detail_without_provider_id_cannot_use_cached_name_as_proof(server, bound):
+    seed_ci(server, [ci_run()])
+    server.repo.observe_ci_pipeline(ci_run())
+    upload_ci_report(server)
+    diagnosis_provider(server, dict(repository='org/app', number=1, commit='abc', branch='main', status='failure'))
+    status, view = request(server, 'ci/pipeline?repository=org%2Fapp&number=1' + bound)
+    assert status == 200
+    assert view['diagnosis']['evidence_availability'] == 'unavailable'
+    assert view['diagnosis']['failed_tests'] == []
+    assert view['diagnosis']['reason']

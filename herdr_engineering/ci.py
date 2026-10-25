@@ -428,6 +428,9 @@ class WoodpeckerProvider:
                 "title", "created", "started", "finished", "ref", "forge_url")
         return {
             **{key: data.get(key) for key in keys}, "repository": repository, "tasks": tasks, "workflows": workflows,
+            # This is the ID actually used in the detail request, not a cached
+            # name attribution supplied by a later consumer.
+            "provider_repo_id": rid,
             "created_at": _timestamp(data.get("created")),
             "started_at": _timestamp(data.get("started")),
             "finished_at": _timestamp(data.get("finished")),

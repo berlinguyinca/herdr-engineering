@@ -1956,11 +1956,12 @@ class ControlPlaneRepo:
         result['generated_at'] = cached.get('generated_at')
         return result
 
-    def ci_tests(self, *, days=14, repository=None, branch=None, test=None,
+    def ci_tests(self, *, redact, days=14, repository=None, branch=None, test=None,
                  provider_url=None, provider_repo_id=None):
         """Bounded HTTP projection; the full retained-history contract is unchanged."""
         view = self.ci_test_history(repository=repository, branch=branch, test=test, days=days,
                                     provider_url=provider_url, provider_repo_id=provider_repo_id)
+        view = redact(view)
         tests = view['tests']
         view['tests'] = []
         budget = 240 * 1024
@@ -1977,7 +1978,7 @@ class ControlPlaneRepo:
                              truncated=view['scope']['truncated'] or limited)
         return view
 
-    def ci_diagnosis(self, pipeline):
+    def ci_diagnosis(self, pipeline, *, redact):
         """Join exact run evidence; never infer a test-to-step edge from labels/logs."""
         from .ci_observability import _identity, _test_cases, bind_report_provider
 
@@ -1992,6 +1993,7 @@ class ControlPlaneRepo:
         budgets = dict(failed_steps=32 * 1024, failed_workflows=16 * 1024, failed_tests=64 * 1024)
 
         def append(target, item):
+            item = redact(item)
             size = len(json.dumps(item).encode()) + 2
             if used[target] + size > budgets[target]:
                 result['truncated'] = True
@@ -2024,7 +2026,7 @@ class ControlPlaneRepo:
                       if (identity := _identity(observed)) is not None and
                       identity[0] == row.get('provider_url', '').rstrip('/') and
                       identity[3] == row['run_number'] and
-                      (row.get('provider_repo_id') is None or identity[1] == str(row['provider_repo_id'])) and
+                      row.get('provider_repo_id') is not None and identity[1] == str(row['provider_repo_id']) and
                       (row.get('repository') == identity[2] or
                        row.get('repository') == identity[1] == str(row.get('provider_repo_id'))) and
                       all(observed.get(key) == row.get(key) for key in ('revision', 'branch'))}
@@ -2050,14 +2052,15 @@ class ControlPlaneRepo:
         history_view = self.ci_test_history(repository=row['repository'], branch=row['branch'], days=30,
                                             provider_url=identity[0], provider_repo_id=identity[1])
         test_history = {test['id']: test for test in history_view['tests']}
-        result['history_scope'] = history_view['scope']
+        result['history_scope'] = redact(history_view['scope'])
         failures = [(report, case) for report, cases in matches for case in cases if case['status'] in ('failed', 'errored')]
         result['failed_test_count'] = len(failures)
         result['truncated'] |= len(failures) > 25
         for report, case in failures[:25]:
+            aggregate = test_history.get(case['id'])
+            case = redact(case)  # Before excerpt limits: never expose a token prefix.
             item = {key: case[key] for key in ('id', 'name', 'suite', 'classname', 'file',
                                               'status', 'duration_ms', 'identity_ambiguous')}
-            aggregate = test_history.get(case['id'])
             item.update(message=case['message'][:500], trace=case['trace'][:1000], report_id=report['report_id'],
                 history={key: aggregate[key] for key in ('failure_count', 'completed_count', 'failure_rate',
                     'first_failure', 'last_pass', 'duration_ms', 'classification', 'inconsistent_count')}

@@ -1917,7 +1917,7 @@ def _make_handler(server, public=False, operator=False):
                     filters = _ci_observability_query(self.path, what)
                     if what == "summary":
                         return self._json(server.ci_monitor.summary(r, **filters))
-                    view = r.ci_tests(**filters)
+                    view = r.ci_tests(redact=server.ci_monitor.report_redactor(), **filters)
                     cached = server.ci_monitor.summary_snapshot(start=False)
                     view['scope']['stale'] |= bool(cached.get('stale'))
                     return self._json(view)
@@ -1951,7 +1951,8 @@ def _make_handler(server, public=False, operator=False):
                     view = server.ci_monitor.detail(
                         _q(self.path, "repository"), _q(self.path, "number"),
                         **({"provider_url": _q(self.path, "provider_url")} if _q(self.path, "provider_url") is not None else {}))
-                    view['diagnosis'] = r.ci_diagnosis(view.get('pipeline'))
+                    view['diagnosis'] = r.ci_diagnosis(view.get('pipeline'),
+                        redact=server.ci_monitor.report_redactor())
                     return self._json(view)
                 if what == "log":
                     return self._json(server.ci_monitor.log(
