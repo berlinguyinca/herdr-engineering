@@ -7,6 +7,7 @@ import { serviceState, serviceScope } from './services-view.js';
 import { integrationEntries, integrationTimestamp } from './integrations-view.js';
 import { isCalm, snapshotText, animateChanges } from './motion.js';
 import { freshnessSources } from './freshness.js';
+import { morph, handOff, patchText } from './patch.js';
 
 const records = value => Array.isArray(value) ? value.filter(v => v && typeof v === 'object' && !Array.isArray(v)) : [];
 const text = value => typeof value === 'string' ? value : '';
@@ -125,7 +126,7 @@ const snoozedUntil = (data, key) => (data.snoozed instanceof Map ? data.snoozed.
 function missionRow(entry, canSnooze = false) {
   const activity = entry.projection?.activity || {};
   const detail = activity.waitingReason ? `Waiting: ${human(activity.waitingReason)}` : activity.currentActivity?.summary;
-  return `<li class="ov-row"><div>${link(`#/missions/${encodeURIComponent(entry.key)}`,short(entry.title))}<p>${esc(short(detail || (entry.group === 'attention' ? entry.health : 'Activity not reported')))}</p></div><span class="ov-tag ${entry.group === 'attention' ? 'ov-alert' : ''}">${esc(human(entry.health))}${entry.host ? ` · ${esc(entry.host)}` : ''}${canSnooze ? `<br><button type="button" class="ov-snooze" data-snooze="${esc(entry.key)}" title="Hide from this list for 24 hours">Snooze 24h</button>` : ''}</span></li>`;
+  return `<li class="ov-row" data-key="${esc(entry.key)}"><div>${link(`#/missions/${encodeURIComponent(entry.key)}`,short(entry.title))}<p>${esc(short(detail || (entry.group === 'attention' ? entry.health : 'Activity not reported')))}</p></div><span class="ov-tag ${entry.group === 'attention' ? 'ov-alert' : ''}">${esc(human(entry.health))}${entry.host ? ` · ${esc(entry.host)}` : ''}${canSnooze ? `<br><button type="button" class="ov-snooze" data-snooze="${esc(entry.key)}" title="Hide from this list for 24 hours">Snooze 24h</button>` : ''}</span></li>`;
 }
 
 export function renderOverviewSection(section, data = {}, states = {}, received = Date.now(), now = Date.now()) {
@@ -136,7 +137,7 @@ export function renderOverviewSection(section, data = {}, states = {}, received 
     return `<div class="ov-heading"><h2 tabindex="-1">Attention</h2><span class="ov-tag">${attention.items.length ? `${attention.items.length}${attention.complete?'':'+'}` : attention.complete?'0':'—'} observed items</span></div>
       ${!attention.complete ? `<p class="ov-warning" role="status">Partial coverage: ${esc(attention.unavailable.map(key=>CARD_LABELS[key] || {projections:'Live missions',health:'Control plane'}[key] || key).join(', '))}. Loading, unavailable, or stale sources may contain more items; retained reports remain visible.</p>` : ''}
       ${attention.items.length>limit ? `<div class="ov-attention-controls"><span class="ov-note">Showing ${visible.length} of ${attention.items.length} observed items</span><button type="button" data-attention-toggle aria-expanded="${expanded}" aria-controls="ov-attention-items">${expanded?'Show fewer':`Show all ${attention.items.length}`}</button></div>` : ''}
-      ${attention.items.length ? `<ul id="ov-attention-items" class="ov-list ov-attention-list${expanded?' is-expanded':''}" aria-label="Attention items"${expanded?' tabindex="0"':''}>${visible.map(item=>`<li class="ov-row" data-attention-key="${esc(item.key)}"><div>${link(item.href,item.title)}<p>${esc(item.detail)}</p></div><span class="ov-tag ov-alert">${esc(item.severity)}${item.updated?`<br>${ageMarkup(new Date(item.updated).toISOString(),now)}`:''}</span></li>`).join('')}</ul>` : empty(attention.complete?'No attention items in the received reports.':'Attention is not yet fully known.')}`;
+      ${attention.items.length ? `<ul id="ov-attention-items" class="ov-list ov-attention-list${expanded?' is-expanded':''}" aria-label="Attention items"${expanded?' tabindex="0"':''}>${visible.map(item=>`<li class="ov-row" data-key="${esc(item.key)}" data-attention-key="${esc(item.key)}"><div>${link(item.href,item.title)}<p>${esc(item.detail)}</p></div><span class="ov-tag ov-alert">${esc(item.severity)}${item.updated?`<br>${ageMarkup(new Date(item.updated).toISOString(),now)}`:''}</span></li>`).join('')}</ul>` : empty(attention.complete?'No attention items in the received reports.':'Attention is not yet fully known.')}`;
   }
   if (section === 'missions') {
     const m = model.missions;
@@ -144,7 +145,7 @@ export function renderOverviewSection(section, data = {}, states = {}, received 
     const awake = m.attention.filter(e => snoozedUntil(data, e.key) <= now);
     const snoozedCount = m.attention.length - awake.length;
     const rows = [...awake,...m.running].slice(0,5);
-    return `<div class="ov-heading"><h2>Current missions</h2>${link('#/missions','All missions →')}</div>${availability(['projections','missions'],states)}
+    return `<div class="ov-heading"><h2 tabindex="-1">Current missions</h2>${link('#/missions','All missions →')}</div>${availability(['projections','missions'],states)}
       ${ready ? `<div class="ov-metrics">${metric(states.projections?.loaded ? awake.length : '—','Need attention','#/missions?tab=current&status=attention')}${metric(states.projections?.loaded ? m.running.length : '—','Running with live reports','#/missions?tab=current&status=running')}</div>
       ${snoozedCount ? `<p class="ov-note">${snoozedCount} snoozed for 24 hours. <button type="button" class="ov-snooze" data-snooze-clear>Show them again</button></p>` : ''}
       ${rows.length ? `<ul class="ov-list">${rows.map(e=>missionRow(e, e.group === 'attention')).join('')}</ul>` : empty(states.projections?.loaded ? 'No missions currently report running or needing attention.' : 'Current mission activity is unavailable.')}
@@ -153,10 +154,10 @@ export function renderOverviewSection(section, data = {}, states = {}, received 
   }
   if (section === 'sessions') {
     const s = model.sessions;
-    return `<div class="ov-heading"><h2>Agents</h2>${link('#/herd','All agents →')}</div>${availability(['sessions'],states)}${states.sessions?.loaded ? `
+    return `<div class="ov-heading"><h2 tabindex="-1">Agents</h2>${link('#/herd','All agents →')}</div>${availability(['sessions'],states)}${states.sessions?.loaded ? `
       <div class="ov-metrics">${metric(s.current.length,'Recently reported agents','#/herd?tab=current')}</div>
       <p class="ov-note">Open agents reported in the last 15 minutes. Older reports are available in Unconfirmed.</p>
-      ${s.current.length ? `<ul class="ov-list">${s.current.slice(0,5).map(session=>`<li class="ov-row"><div>${link(`#/herd/session/${encodeURIComponent(session.session_id)}`,short(session.display_name || session.title || session.summary || session.agent_role || 'Agent'))}<p>${esc(short(session.cwd || session.branch || session.model || 'Workspace not reported'))}</p></div><span class="ov-tag">Last reported ${esc(human(session.status) || 'unknown')}<br>${esc(session.host_id || 'Host unknown')} · ${ageMarkup(session.last_activity || session.updated_at,now)}</span></li>`).join('')}</ul>` : empty('No recently reported open agents.')}
+      ${s.current.length ? `<ul class="ov-list">${s.current.slice(0,5).map(session=>`<li class="ov-row" data-key="${esc(session.session_id)}"><div>${link(`#/herd/session/${encodeURIComponent(session.session_id)}`,short(session.display_name || session.title || session.summary || session.agent_role || 'Agent'))}<p>${esc(short(session.cwd || session.branch || session.model || 'Workspace not reported'))}</p></div><span class="ov-tag">Last reported ${esc(human(session.status) || 'unknown')}<br>${esc(session.host_id || 'Host unknown')} · ${ageMarkup(session.last_activity || session.updated_at,now)}</span></li>`).join('')}</ul>` : empty('No recently reported open agents.')}
       ${s.current.length > 5 ? empty(`Showing 5 of ${s.current.length} current agents.`) : ''}${historyLinks('herd',s)}` : ''}`;
   }
   if (section === 'ci' || section === 'reviews') {
@@ -164,7 +165,7 @@ export function renderOverviewSection(section, data = {}, states = {}, received 
     const current=entries.filter(e=>e.tab==='current'), attention=entries.filter(e=>e.tab===(isCi?'failed':'changes'));
     const ready=states[section]?.loaded;
     const title=isCi?'CI builds':'Plan and code reviews';
-    return `<div class="ov-heading"><h2>${title}</h2>${link(`#/${section}`,isCi?'All CI →':'All reviews →')}</div>${availability([section],states)}${ready ? `
+    return `<div class="ov-heading"><h2 tabindex="-1">${title}</h2>${link(`#/${section}`,isCi?'All CI →':'All reviews →')}</div>${availability([section],states)}${ready ? `
       ${isCi && snapshot.available===false && !entries.length ? `<p class="ov-warning">${esc(snapshot.status==='auth_error'?'Woodpecker authentication needs attention.':snapshot.status==='not_configured'?'Woodpecker is not configured.':'CI reports are unavailable.')}</p>` : `<div class="ov-metrics">${metric(current.length,isCi?'Queued / running / unknown':'Awaiting review',`#/${section}`)}${metric(attention.length,isCi?'Failed':'Changes requested',`#/${section}?tab=${isCi?'failed':'changes'}`)}</div>`}
       ${snapshot.stale ? '<p class="ov-warning">Showing stale reports. Open the catalog for connection details.</p>' : ''}
       ${current.length ? `<ul class="ov-list">${current.slice(0,3).map(e=>`<li class="ov-row"><div>${link(`#/${section}?search=${encodeURIComponent(e.record.repository || e.record.review_id || '')}`,short(e.record.title || e.record.repository || (isCi?'CI run':'Review')))}<p>${esc(isCi?`Run #${e.record.run_number} · ${e.record.branch || 'Branch not reported'}`:e.record.repository || 'Repository not reported')}</p></div><span class="ov-tag">${esc(human(e.record.state || e.record.status) || 'Status unknown')}</span></li>`).join('')}</ul>` : ''}
@@ -173,7 +174,7 @@ export function renderOverviewSection(section, data = {}, states = {}, received 
   }
   if (section === 'services') {
     const s=model.services;
-    return `<div class="ov-heading"><h2>HerdR services</h2>${link('#/services','Service catalog →')}</div>${availability(['services'],states)}${states.services?.loaded ? `
+    return `<div class="ov-heading"><h2 tabindex="-1">HerdR services</h2>${link('#/services','Service catalog →')}</div>${availability(['services'],states)}${states.services?.loaded ? `
       <div class="ov-metrics">${metric(s.current,'Reported healthy','#/services')}</div>
       <p class="ov-note">${link('#/services?status=unavailable',`${s.unavailable} unavailable`)} · ${link('#/services?status=unknown',`${s.unknown} unconfirmed`)} · ${link('#/services?status=archived',`${s.archived} archived`)}. History remains in the catalog. ${link('#/local-services','Local services →')} · ${link('#/system-services','System services →')}</p>` : ''}`;
   }
@@ -181,19 +182,19 @@ export function renderOverviewSection(section, data = {}, states = {}, received 
     const hosts=model.hosts, fleet=data.fleet || {}, sum=fleet.summary || {};
     const stale=hosts.filter(h => reportFreshness(h.last_seen || h.updated_at,now) !== 'current');
     const fresh=hosts.length-stale.length;
-    return `<div class="ov-heading"><h2>Fleet health</h2>${link('#/hosts','Hosts and versions →')}</div>${availability(['hosts'],states)}${states.hosts?.loaded ? `
+    return `<div class="ov-heading"><h2 tabindex="-1">Fleet health</h2>${link('#/hosts','Hosts and versions →')}</div>${availability(['hosts'],states)}${states.hosts?.loaded ? `
       <div class="ov-metrics">${metric(`${fresh} / ${hosts.length}`,'Hosts reporting now','#/hosts')}${metric(states.fleet?.loaded ? (sum.drifted ?? 0) : '—','Versions that differ','#/hosts?drift=1')}${metric(states.fleet?.loaded ? (sum.missing ?? 0) : '—','Not installed on a host','#/hosts?drift=1')}</div>
       ${stale.length ? `<p class="ov-warning">No recent report from ${stale.map(h=>esc(h.host_name || h.host_id)).join(', ')}.</p>` : ''}
       ${states.fleet?.loaded && !(fleet.hosts || []).length ? empty('No host has reported its tool and plugin versions yet.') : ''}` : ''}`;
   }
   if (section === 'hosts') {
-    return `<div class="ov-heading"><h2>Hosts</h2>${link('#/hosts','All hosts →')}</div>${availability(['hosts'],states)}${states.hosts?.loaded ? `
-      ${model.hosts.length ? `<ul class="ov-list">${model.hosts.slice(0,5).map(host=>`<li class="ov-row"><div>${link(`#/hosts/${encodeURIComponent(host.host_id)}`,short(host.host_name || host.host_id || 'Unnamed host'))}<p>${ageMarkup(host.last_seen || host.last_heartbeat || host.updated_at,now)}</p></div><span class="ov-tag">Last reported ${esc(human(host.status) || 'unknown')}</span></li>`).join('')}</ul>` : empty('No host reports received.')}
+    return `<div class="ov-heading"><h2 tabindex="-1">Hosts</h2>${link('#/hosts','All hosts →')}</div>${availability(['hosts'],states)}${states.hosts?.loaded ? `
+      ${model.hosts.length ? `<ul class="ov-list">${model.hosts.slice(0,5).map(host=>`<li class="ov-row" data-key="${esc(host.host_id)}"><div>${link(`#/hosts/${encodeURIComponent(host.host_id)}`,short(host.host_name || host.host_id || 'Unnamed host'))}<p>${ageMarkup(host.last_seen || host.last_heartbeat || host.updated_at,now)}</p></div><span class="ov-tag">Last reported ${esc(human(host.status) || 'unknown')}</span></li>`).join('')}</ul>` : empty('No host reports received.')}
       <p class="ov-note">${model.hosts.length} hosts recorded. Report age shows how recently each host was observed.</p>` : ''}`;
   }
   if (section === 'activity') {
     const events=meaningfulEvents(data.events);
-    return `<div class="ov-heading"><h2>Recent changes</h2>${link('#/activity','All activity →')}</div>${availability(['activity'],states)}${states.activity?.loaded ? events.length ? `<ul class="ov-list">${events.map(event=>{
+    return `<div class="ov-heading"><h2 tabindex="-1">Recent changes</h2>${link('#/activity','All activity →')}</div>${availability(['activity'],states)}${states.activity?.loaded ? events.length ? `<ul class="ov-list">${events.map(event=>{
       const payload=event.payload || {};
       const title=eventLabel(event);
       const name=payload.title || payload.filename || payload.host_name || payload.agent_role || '';
@@ -256,15 +257,15 @@ export function mountOverview(container, client, { freshness = () => null } = {}
       const panel=container.querySelector(`[data-overview="${key}"]`);
       panel.hidden=preferences.hidden.includes(key);layout.append(panel);
     });
-    container.querySelector('[data-overview-controls]').innerHTML=preferences.order.map((key,index)=>`<div class="ov-control-row"><strong>${CARD_LABELS[key]}</strong><button type="button" data-overview-action="toggle" data-card="${key}" aria-pressed="${!preferences.hidden.includes(key)}" aria-label="${preferences.hidden.includes(key)?'Show':'Hide'} ${CARD_LABELS[key]}">${preferences.hidden.includes(key)?'Show':'Hide'}</button><button type="button" data-overview-action="up" data-card="${key}" aria-label="Move ${CARD_LABELS[key]} up" ${index===0?'disabled':''}>Move up</button><button type="button" data-overview-action="down" data-card="${key}" aria-label="Move ${CARD_LABELS[key]} down" ${index===preferences.order.length-1?'disabled':''}>Move down</button></div>`).join('');
+    morph(container.querySelector('[data-overview-controls]'),preferences.order.map((key,index)=>`<div class="ov-control-row" data-key="${key}"><strong>${CARD_LABELS[key]}</strong><button type="button" data-overview-action="toggle" data-card="${key}" aria-pressed="${!preferences.hidden.includes(key)}" aria-label="${preferences.hidden.includes(key)?'Show':'Hide'} ${CARD_LABELS[key]}">${preferences.hidden.includes(key)?'Show':'Hide'}</button><button type="button" data-overview-action="up" data-card="${key}" aria-label="Move ${CARD_LABELS[key]} up" ${index===0?'disabled':''}>Move up</button><button type="button" data-overview-action="down" data-card="${key}" aria-label="Move ${CARD_LABELS[key]} down" ${index===preferences.order.length-1?'disabled':''}>Move down</button></div>`).join(''));
     if(action && card) {
       const target=container.querySelector(`[data-overview-action="${action}"][data-card="${card}"]`);
       (target?.disabled?container.querySelector(`[data-overview-action="toggle"][data-card="${card}"]`):target)?.focus({preventScroll:true});
     }
   }
   applyPreferences();
-  // Motion without the patcher (Overview still swaps panels with innerHTML, Task 19 migrates it):
-  // metric tiles are paired across the swap by link + label, attention rows by data-attention-key.
+  // Panels are morphed (rows keyed by data-key), so focus, the expanded attention list's scroll and
+  // unchanged rows keep their nodes. Motion pairs metric tiles by link + label, attention rows by key.
   const metricKey=el=>{const a=el.closest('.ov-metric');return a?`${a.getAttribute('href')}|${a.querySelector('span')?.textContent}`:null;};
   const PULSE_MS=6000;
   const pulseUntil=new Map();
@@ -303,36 +304,22 @@ export function mountOverview(container, client, { freshness = () => null } = {}
     for(const panel of panels) {
       const element=container.querySelector(`[data-overview="${panel}"]`);
       const html=renderOverviewSection(panel,data,states,received);
-      // Ignore clock text in the signature so an unchanged report keeps DOM/focus.
+      // Panels whose markup (ages aside) is unchanged are skipped: the clock ticks every second.
       const signature=html.replace(/(<span data-overview-stamp="[^"]+">)[^<]*(<\/span>)/g,'$1$2');
       if(signature===signatures.get(panel))continue;
       signatures.set(panel,signature);
-      const focused=document.activeElement;
-      const hadFocus=element.contains(focused);
-      const href=hadFocus ? focused.closest('a')?.getAttribute('href') : null;
-      const snooze=hadFocus ? focused.dataset?.snooze : null;
-      const attentionToggle=hadFocus && focused.hasAttribute('data-attention-toggle');
-      const attentionList=hadFocus && focused.id==='ov-attention-items';
-      const attentionScroll=element.querySelector('.ov-attention-list.is-expanded')?.scrollTop || 0;
       const metrics=live?snapshotText(element,'.ov-metric strong',metricKey):null;
-      element.innerHTML=html;
+      // A focused row that left (resolved, snoozed) hands focus to its panel heading.
+      handOff(morph(element,html),()=>element.querySelector('h2'));
       animateChanges(element,'.ov-metric strong',metrics,metricKey);
       if(panel==='attention')markNewCritical(element);
-      const expandedList=element.querySelector('.ov-attention-list.is-expanded');
-      if(expandedList)expandedList.scrollTop=attentionScroll;
-      if(hadFocus) {
-        const target=attentionToggle ? element.querySelector('[data-attention-toggle]') : attentionList ? expandedList : href ? [...element.querySelectorAll('a')].find(a=>a.getAttribute('href')===href) : snooze ? [...element.querySelectorAll('[data-snooze]')].find(button=>button.dataset.snooze===snooze) : null;
-        const fallback=element.querySelector('h2');
-        if(fallback)fallback.tabIndex=-1;
-        (target || fallback)?.focus({preventScroll:true});
-      }
     }
     applyPulses();
     tickClocks();
   }
   function tickClocks() {
     const now=Date.now();
-    container.querySelectorAll('[data-overview-stamp]').forEach(el=>{el.textContent=formatDuration(Math.max(0,now-Date.parse(el.dataset.overviewStamp)));});
+    container.querySelectorAll('[data-overview-stamp]').forEach(el=>patchText(el,formatDuration(Math.max(0,now-Date.parse(el.dataset.overviewStamp)))));
   }
   async function poll(key) {
     if(disposed || document.hidden || controllers.has(key))return;

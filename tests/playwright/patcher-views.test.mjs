@@ -255,3 +255,46 @@ test('Topology: identical refresh writes nothing; one changed service rewrites o
  await page.locator('[data-tx-collapse]').click();
  await until(()=>page.locator('details[data-tx-disclosure="host:beast"]').evaluate(d=>!d.open),'Collapse groups closes the group');
 }));
+
+// ---------------------------------------------------------------- Overview
+function overviewApi(state){
+ return p=>{
+  if(p==='/api/v1/sessions')return {sessions:structuredClone(state.sessions)};
+  if(p==='/api/v1/hosts')return {hosts:[{host_id:'beast',host_name:'Beast',status:'healthy',last_seen:T0}]};
+  if(p==='/api/v1/fleet/inventory')return {hosts:[],components:[],summary:{drifted:0,missing:0}};
+  if(p==='/api/v1/services')return {services:[]};
+  if(p==='/api/v1/missions')return {missions:[]};
+  if(p==='/api/v1/mission-activity')return {activities:[]};
+  if(p==='/api/v1/events'||p==='/api/v1/activity')return {events:[]};
+  if(p==='/api/v1/health')return {status:'ok'};
+  if(p==='/api/v1/ci')return {available:true,status:'connected',pipelines:{}};
+  if(p==='/api/v1/reviews')return {reviews:[]};
+  return {};
+ };
+}
+
+test('Overview: identical refresh writes nothing; one changed agent rewrites only its row; focus and the open Customize panel survive',async()=>withPage(async(page,base)=>{
+ const state={sessions:[agent('a1'),agent('a2'),agent('b1')]};
+ const reads=await boot(page,base,'/overview',overviewApi(state));
+ await until(()=>page.locator('[data-overview="sessions"] .ov-row').count().then(n=>n===3),'agent rows');
+ await page.locator('.ov-customize > summary').click();
+ await page.locator('[data-overview="sessions"] .ov-row a').first().focus();
+ const focused=await page.evaluate(()=>document.activeElement.getAttribute('href'));
+ await liveRefresh(page,{event_id:'o0',event_type:'SessionUpdated'});
+ await page.evaluate(()=>{window.__rows=[...document.querySelectorAll('.ov-panel,.ov-row')];});
+
+ const before=reads['/api/v1/sessions'];
+ await observe(page);
+ await liveRefresh(page,{event_id:'o1',event_type:'SessionUpdated'});
+ assert.ok(reads['/api/v1/sessions']>before,'refresh fetched agents again');
+ assert.deepEqual(await writes(page),[],'identical refresh performs no DOM writes');
+
+ state.sessions[2].cwd='/work/gamma';
+ await observe(page);
+ await liveRefresh(page,{event_id:'o2',event_type:'SessionUpdated'});
+ await until(()=>page.locator('[data-overview="sessions"] .ov-row[data-key="b1"]').innerText().then(t=>t.includes('/work/gamma')),'changed agent');
+ assert.equal(await page.evaluate(()=>[...document.querySelectorAll('.ov-panel,.ov-row')].every((n,i)=>n===window.__rows[i])),true,'panels and rows keep their nodes');
+ assert.deepEqual(await writes(page,'[data-overview="sessions"] .ov-row[data-key="b1"]'),[],'nothing outside the changed row was written');
+ assert.equal(await page.evaluate(()=>document.activeElement.getAttribute('href')),focused,'focus stays on its link');
+ assert.equal(await page.locator('.ov-customize').evaluate(d=>d.open),true,'Customize stays open');
+}));

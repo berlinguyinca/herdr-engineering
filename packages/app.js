@@ -233,7 +233,8 @@ async function viewTopology() {
 
 async function viewOverview() {
   root.innerHTML = `${liveHead('<h1>Overview</h1>')}<div id="overview-dashboard"></div>`;
-  return ownPolling(mountOverview(document.getElementById('overview-dashboard'), client, { freshness: chipIn(root) }));
+  // Polls each source every 5 s; live events refresh it too (a source already in flight is not re-read).
+  return mountOverview(document.getElementById('overview-dashboard'), client, { freshness: chipIn(root) });
 }
 
 async function viewCollab() {
