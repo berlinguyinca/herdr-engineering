@@ -375,6 +375,11 @@ class IngestService:
             value = payload.get(key)
             if value is not None and (isinstance(value, bool) or not isinstance(value, (int, float))):
                 raise ValueError(f"{key} must be a number")
+        results = payload.get("results")
+        if results is not None:
+            if not isinstance(results, list) or any(
+                    not isinstance(r, dict) for r in results):
+                raise ValueError("results must be a list of objects")
     def _dispatch(self, entity_type, entity_id, event_type, payload, source,
                   record_generic=True) -> dict:
         # System-graph live-ingest adapter (opt-in): reflect lifecycle events

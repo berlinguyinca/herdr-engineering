@@ -485,3 +485,42 @@ def test_delivery_projections_survive_export_import_restore():
     assert len(restored.list_pull_requests(mission_id="m1")) == 1
     # The durable event streams still carry the records after restore.
     assert [e["event_type"] for e in restored.stream("test_run", "rt1")] == ["TestRunStarted"]
+
+
+def test_delivery_projections_rebuilt_on_event_only_reload():
+    repo = ControlPlaneRepo()
+    svc = make_svc(repo)
+    svc.ingest({"entity_type": "test_run", "entity_id": "rr1",
+                "event_type": "test_run.started",
+                "payload": {"mission_id": "m1", "status": "passed", "passed": 4, "total": 4}})
+    svc.ingest({"entity_type": "pull_request", "entity_id": "ppr1",
+                "event_type": "pull_request.opened",
+                "payload": {"mission_id": "m1", "number": 11, "status": "open"}})
+    # The bridge durable-reload path restores event streams but no delivery snapshot.
+    state = repo.export_state()
+    del state["delivery"]
+    restored = ControlPlaneRepo()
+    restored.import_state(state)
+    assert len(restored.list_test_runs(mission_id="m1")) == 1
+    assert len(restored.list_pull_requests(mission_id="m1")) == 1
+    # Rebuilding must not duplicate the durable streams.
+    assert len(restored.stream("test_run", "rr1")) == 1
+    assert len(restored.stream("pull_request", "ppr1")) == 1
+
+
+def test_v2_test_run_bad_results_does_not_consume_sequence():
+    repo = ControlPlaneRepo()
+    svc = make_svc(repo)
+    bad = {"schema_version": 2, "event_id": "pi-20", "source": "pi",
+           "source_sequence": 20, "entity_type": "test_run", "entity_id": "r20",
+           "event_type": "test_run.started",
+           "payload": {"mission_id": "M1", "total": 3, "results": "not-a-list"}}
+    with pytest.raises(ValueError, match="results"):
+        svc.ingest(bad, {"id": "agent", "kind": "agent", "authenticated_by": "api_key"})
+    assert repo.list_test_runs(mission_id="pi:M1") == []
+    # A corrected retry with the same event id applies.
+    good = {**bad, "payload": {"mission_id": "M1", "total": 3,
+                               "results": [{"name": "t1", "status": "passed"}]}}
+    svc.ingest(good, {"id": "agent", "kind": "agent", "authenticated_by": "api_key"})
+    runs = repo.list_test_runs(mission_id="pi:M1")
+    assert len(runs) == 1 and len(runs[0]["results"]) == 1
