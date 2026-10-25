@@ -264,7 +264,12 @@ class ControlPlaneRepo:
                         and m.get("source", "herdr") == "herdr"):
                     rec = m
                     break
-        return _copy(rec)
+        if rec is None:
+            return None
+        rec = _copy(rec)
+        rec["telemetry_state"] = self._mission_telemetry_state(
+            rec.get("mission_key") or rec["mission_id"])
+        return rec
 
     def _resolve_mission_key(self, mission_id, source="herdr"):
         """Return the stored key for ``mission_id`` under ``source``.
@@ -287,8 +292,34 @@ class ControlPlaneRepo:
             return mission_id
         return None
 
+    def _mission_telemetry_state(self, mission_key: str) -> str:
+        """Derive live/stale/unknown from the bounded mission-activity read model.
+
+        This reflects *collection* freshness of the Pi transport, never worker
+        health: a mission with no collector is ``unknown``, not stalled. It reuses
+        the real freshness the activity store already computes (issue #28); no
+        fabricated heartbeat is ever invented.
+        """
+        try:
+            live = self.mission_activity.get(mission_key)
+        except Exception:  # noqa: BLE001 - one unreadable entry never hides the rest
+            live = None
+        if not live:
+            return "unknown"
+        state = (live.get("freshness") or {}).get("state")
+        if state in ("live", "updating"):
+            return "live"
+        if state in ("stale", "disconnected"):
+            return "stale"
+        return "unknown"
+
     def list_missions(self, status=None):
-        out = [_copy(m) for m in self._missions.values()]
+        out = []
+        for m in self._missions.values():
+            rec = _copy(m)
+            rec["telemetry_state"] = self._mission_telemetry_state(
+                rec.get("mission_key") or rec["mission_id"])
+            out.append(rec)
         if status:
             out = [m for m in out if m["status"] == status]
         return _sort_by(out, "created_at", reverse=True)
