@@ -328,3 +328,28 @@ def test_retained_report_identity_survives_missing_current_repository(server, in
     assert row['language'] is None
     assert row['language_source'] == 'unknown'
     assert server.repo.ci_reports()['pipelines'][0] == stored
+
+
+def test_ci_compatibility_response_omits_private_measurements(server):
+    from tests.control_plane.test_ci_monitor import Provider
+
+    server.ci_monitor.close()
+    monitor = CIMonitor(provider_factory=Provider)
+    server.ci_monitor = monitor
+    monitor.refresh()
+    # Freeze background work so the HTTP contract is deterministic.
+    monitor.close()
+    status, view = request(server, 'ci')
+    assert status == 200
+    assert {'available', 'status', 'refreshing', 'stale', 'repos', 'pipelines',
+            'repo_errors', 'agents', 'agents_error', 'error', 'checked_at',
+            'last_success_at', 'progress'} <= view.keys()
+    assert view['pipelines']['org/app'][0]['run_number'] == 2
+    assert view['pipelines']['org/app'][0]['state'] == 'running'
+    assert 'provider_calls' not in json.dumps(view)
+    measured = monitor._measurement_snapshot()
+    assert measured['provider_calls'] == 3  # repos, pipelines, attempted agents
+    assert measured['summary_rows'] == 1
+    assert measured['cache_hits'] == 1
+    assert measured['refresh_duration_seconds'] >= 0
+    assert measured['refresh_finished_at'] is not None

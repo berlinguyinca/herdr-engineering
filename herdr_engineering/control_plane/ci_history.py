@@ -13,6 +13,7 @@ import time
 from collections import deque
 from datetime import UTC, datetime, timedelta
 
+from .ci_observability import _Measurements
 from .redact import redact_payload
 
 
@@ -37,6 +38,7 @@ class CIHistory:
     def __init__(self, *, provider_factory, interval=30, budget=120, now=None,
                  wall_now=None, repo_limit=500, page_limit=60, run_limit=3000,
                  total_limit=20000, byte_limit=16 * 1024 * 1024, pages_per_refresh=600):
+        self._measurements = _Measurements()
         self._factory = provider_factory
         self._interval = max(5, interval)
         self._budget = budget
@@ -66,6 +68,9 @@ class CIHistory:
                                          'runs_per_repository': self._run_limit, 'runs': self._total_limit,
                                          'bytes': self._byte_limit}})
 
+    def _measurement_snapshot(self):
+        return self._measurements.snapshot()
+
     def snapshot(self, *, start=True):
         if start:
             self.start()
@@ -73,6 +78,7 @@ class CIHistory:
             result = copy.deepcopy(self._view)
         if self._last_check is not None and self._now() - self._last_check > self._interval * 3:
             result['stale'] = True
+        self._measurements.observe(result, len(result['pipelines']), result['stale'])
         return result
 
     def start(self):
@@ -103,6 +109,7 @@ class CIHistory:
             if self._stop.is_set() or self._now() - started >= self._budget:
                 error = 'Repository discovery budget exceeded.'
                 break
+            self._measurements.provider_call()
             batch = provider.repos(page=page, per_page=50)
             unique = []
             for row in batch:
@@ -151,6 +158,7 @@ class CIHistory:
     def refresh(self):
         if not self._refresh_lock.acquire(blocking=False):
             return
+        started = self._now()
         with self._lock:
             # Retain the visible rows while withholding aging coverage evidence.
             coverage = copy.deepcopy(self._view['coverage'])
@@ -165,6 +173,7 @@ class CIHistory:
             self._update(available=False, status=status, stale=bool(self._states), error=message)
         finally:
             self._update(refreshing=False)
+            self._measurements.refreshed(self._now() - started)
             self._refresh_lock.release()
 
     def _collect(self):
@@ -325,6 +334,7 @@ class CIHistory:
             state['mutable_pages'].discard(page)
 
     def _read(self, provider, repo, page):
+        self._measurements.provider_call()
         batch = provider.pipelines(str(repo['id']), page=page, per_page=50)
         return [redact_payload({**(r.to_dict() if hasattr(r, 'to_dict') else dict(r)),
                                'provider_url': self._provider_url, 'provider_repo_id': repo['id'],

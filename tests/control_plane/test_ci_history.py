@@ -427,3 +427,45 @@ def test_pending_completed_coverage_cannot_erase_mutable_page_read_failure():
     assert view['coverage']['17']['error']
     assert not view['coverage']['17']['exhausted']
     assert view['stale']
+
+
+def test_history_compatibility_shape_and_private_measurements():
+    import json
+
+    clock = [0.0]
+
+    class TimedProvider(MemoryProvider):
+        def pipelines(self, *args, **kwargs):
+            clock[0] += 0.25
+            return super().pipelines(*args, **kwargs)
+
+    provider = TimedProvider(runs(3))
+    cache = history(provider, now=lambda: clock[0])
+    cache.refresh()
+    view = cache.snapshot(start=False)
+    assert set(view) == {'available', 'status', 'refreshing', 'stale', 'error',
+                         'repos', 'pipelines', 'coverage', 'scope'}
+    assert len(view['pipelines']) == 3
+    measured = cache._measurement_snapshot()
+    assert measured['provider_calls'] == len(provider.reads) + 1
+    assert measured['summary_rows'] == 3
+    assert measured['payload_bytes'] == len(json.dumps(view, separators=(',', ':')).encode())
+    assert measured['refresh_duration_seconds'] == 0.5
+    assert measured['refresh_finished_at'] is not None
+    clock[0] = 100
+    assert cache.snapshot(start=False)['stale']
+    assert cache._measurement_snapshot()['stale'] is True
+    assert cache._measurement_snapshot()['cache_hits'] == 2
+    assert 'provider_calls' not in json.dumps(view)
+
+
+def test_failed_history_provider_reads_are_counted_without_error_text():
+    provider = MemoryProvider(runs(3), failure=('17', 1))
+    cache = history(provider)
+    cache.refresh()
+    view = cache.snapshot(start=False)
+    assert view['status'] == 'partial'
+    measured = cache._measurement_snapshot()
+    assert measured['provider_calls'] == len(provider.reads) + 1
+    assert measured['stale'] is True
+    assert 'private provider error' not in str(measured)

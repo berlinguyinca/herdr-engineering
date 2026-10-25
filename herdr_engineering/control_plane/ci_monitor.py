@@ -14,6 +14,7 @@ from collections import Counter
 from datetime import UTC, datetime
 from urllib.parse import urlsplit
 
+from .ci_observability import _Measurements
 from .redact import redact_payload, redact_text
 
 
@@ -71,6 +72,7 @@ class CIMonitor:
     def __init__(self, *, provider_factory=None, interval=30, repo_limit=500,
                  budget=120, now=None, on_transition=None, actions_enabled=False,
                  on_observation=None):
+        self._measurements = _Measurements()
         self._factory = provider_factory or _provider
         from .ci_history import CIHistory
         self._history = CIHistory(provider_factory=self._factory, interval=interval,
@@ -99,6 +101,9 @@ class CIMonitor:
             'progress': {'completed': 0, 'total': None, 'current': 'Waiting for CI connection'},
         }
 
+    def _measurement_snapshot(self):
+        return self._measurements.snapshot()
+
     def snapshot(self, *, start=True):
         if start:
             self.start()
@@ -106,6 +111,7 @@ class CIMonitor:
             view = copy.deepcopy(self._view)
         if self._last_success is not None and self._now() - self._last_success > self._interval * 3:
             view['stale'] = True
+        self._measurements.observe(view, sum(map(len, view['pipelines'].values())), view['stale'])
         return view
 
     def history(self, *, start=True):
@@ -136,10 +142,12 @@ class CIMonitor:
     def refresh(self):
         if not self._refresh_lock.acquire(blocking=False):
             return
+        started = self._now()
         try:
             self._collect()
         finally:
             self._update(refreshing=False, checked_at=_stamp())
+            self._measurements.refreshed(self._now() - started)
             self._refresh_lock.release()
 
     def _collect(self):
@@ -156,6 +164,7 @@ class CIMonitor:
             page = 1
             seen = set()
             while len(repos) < self._repo_limit:
+                self._measurements.provider_call()
                 batch = provider.repos(page=page, per_page=50)
                 unique = [row for row in batch if str(row.get('id', row.get('repository'))) not in seen]
                 seen.update(str(row.get('id', row.get('repository'))) for row in unique)
@@ -181,6 +190,7 @@ class CIMonitor:
                 try:
                     if self._now() - started > self._budget:
                         raise TimeoutError('refresh budget exceeded')
+                    self._measurements.provider_call()
                     rows = provider.pipelines(str(repo['id']), per_page=20)
                     successful_repos.add(str(repo['id']))
                     pipelines[group] = [redact_payload({**_dict(row), 'repository': name,
@@ -192,6 +202,7 @@ class CIMonitor:
                              progress={'completed': index + 1, 'total': len(repos), 'current': name})
             agents, agents_error = [], None
             try:
+                self._measurements.provider_call()
                 agents = redact_payload(provider.agents())
             except Exception:
                 agents_error = 'Runner inventory requires provider permission or is unavailable.'
@@ -269,6 +280,7 @@ class CIMonitor:
         if not provider.available:
             return {'available': False, 'error': 'Woodpecker is not configured.'}
         try:
+            self._measurements.provider_call()
             row = provider.pipeline(repository, number)
             if row is None:
                 return {'available': False, 'error': 'Pipeline was not found.'}
@@ -289,6 +301,7 @@ class CIMonitor:
             raise ValueError('step is required')
         provider = bound_ci_provider(self._factory, provider_url)
         try:
+            self._measurements.provider_call()
             value = provider.step_log(repository, number, step)
             if value is None:
                 return {'available': False, 'log': '', 'error': 'Step log is unavailable.'}
@@ -308,9 +321,11 @@ class CIMonitor:
         if action not in {'retry', 'cancel'}:
             raise ValueError('unsupported CI action')
         provider = bound_ci_provider(self._factory, provider_url)
+        self._measurements.provider_call()
         detail = provider.pipeline(repository, number)
         if not detail or not detail.get('can_retry' if action == 'retry' else 'can_cancel'):
             raise PermissionError('Woodpecker does not permit this action for this pipeline')
+        self._measurements.provider_call()
         getattr(provider, action)(repository, str(number), authorized=True)
         return {'ok': True, 'action': action, 'repository': repository, 'run_number': number}
 
