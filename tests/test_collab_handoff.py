@@ -349,3 +349,15 @@ def test_a_mention_cursor_far_in_the_past_is_clamped(w):
                                  "actor_user_id": "bob", "actor_agent_id": None})
     out = wait(w, pi, 0)
     assert old["event_id"] not in [m["event_id"] for m in out["mentions"]]
+
+
+def test_a_handoff_names_who_posted_it_when_that_is_not_the_from_party(w):
+    pi, _ = agent(w, "alice", "pi")
+    agent(w, "bob", "codex")
+    c = wait(w, pi, -1)["mention_cursor"]
+    ev = say(w, w.bob, "/handoff @bob.codex @alice.pi finish it")
+    assert ev["handoff"]["posted_by"] == {"kind": "person", "name": "bob"}
+    got = wait(w, pi, c)["mentions"]
+    assert got and "posted by @bob" in got[0]["text"] and "from @bob.codex" in got[0]["text"]
+    own = say(w, w.bob, "/handoff @alice take it")
+    assert "posted_by" not in own["handoff"]                     # from is the poster: nothing extra

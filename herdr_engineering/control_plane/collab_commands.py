@@ -328,6 +328,8 @@ class CommandsMixin:
             h = self._handoffs.get(p["handoff_id"]) or {}
             out["handoff"] = {"handoff_id": p["handoff_id"], "from": party(p["from"]), "to": party(p["to"]),
                               "note": p["note"], **self._handoff_state(h, viewer)}
+            if (poster := self._handoff_poster(p)) is not None:
+                out["handoff"]["posted_by"] = poster       # someone handed over work that was not theirs
         elif t == "handoff_updated":
             out["handoff"] = {"handoff_id": p["handoff_id"], "status": p["status"], "from": party(p["from"]),
                               "to": party(p["to"])}
@@ -364,6 +366,13 @@ class CommandsMixin:
         eff = self._effective(viewer, room) if room else None
         seqs = [self._msg_room[s][1] for s in sources if s in self._msg_room]
         return bool(eff) and len(seqs) == len(sources) and eff[1] <= min(seqs)
+
+    def _handoff_poster(self, p: dict) -> dict | None:
+        """{kind, name} of who posted a handoff when that is not its `from` party, else None."""
+        kind = "agent" if p["sender_kind"] == "agent" else "person"
+        if (kind, p["sender_id"]) == (p["from"]["kind"], p["from"]["id"]):
+            return None
+        return {"kind": kind, "name": self._who(p["sender_kind"], p["sender_id"], p.get("sender_external"))}
 
     def _handoff_state(self, h: dict, viewer) -> dict:
         status = h.get("status", "pending")
@@ -637,7 +646,9 @@ class CommandsMixin:
                     break
                 a = self._agents.get(pr.id) or {}
                 if ev["event_type"] == "handoff":
-                    text = f"Handoff from @{p['from']['name']} to you: {p['note']}".rstrip(": ")
+                    poster = self._handoff_poster(p)
+                    by = f" (posted by @{poster['name']})" if poster else ""
+                    text = f"Handoff from @{p['from']['name']} to you{by}: {p['note']}".rstrip(": ")
                 else:
                     text = p["text"]
                 out.append({"event_id": ev["event_id"], "sequence": ev["sequence"], "room_id": p["room_id"],

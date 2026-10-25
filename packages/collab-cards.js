@@ -23,7 +23,7 @@ export function commandCard(e, ctx = {}) {
   if (e.event_type === 'handoff') {
     const h = e.handoff || {};
     const buttons = h.can_answer ? `<div class="cx-row cx-cmdcard__actions"><button type="button" class="hd-btn hd-btn--sm" data-handoff-answer="accept" data-handoff-id="${esc(h.handoff_id)}">Accept</button><button type="button" class="hd-btn hd-btn--ghost hd-btn--sm" data-handoff-answer="decline" data-handoff-id="${esc(h.handoff_id)}">Decline</button></div>` : '';
-    return card('handoff', `${head('Handoff', e, status(h.status))}<div>${party(h.from)} → ${party(h.to)}</div>${h.note ? `<div class="cx-cmdcard__note">${esc(h.note)}</div>` : ''}${buttons}`, { 'data-handoff': h.handoff_id || '' });
+    return card('handoff', `${head('Handoff', e, status(h.status))}<div>${party(h.from)} → ${party(h.to)}${h.posted_by ? ` <span class="cx-sub1">(posted by ${party(h.posted_by)})</span>` : ''}</div>${h.note ? `<div class="cx-cmdcard__note">${esc(h.note)}</div>` : ''}${buttons}`, { 'data-handoff': h.handoff_id || '' });
   }
   if (e.event_type === 'handoff_updated') {
     const h = e.handoff || {};

@@ -109,3 +109,9 @@ test('a draft without its body (history before you joined) says so instead of an
   assert.ok(!c.html.includes('<details>'));
   assert.match(c.html, /before you joined/);
 });
+
+test('a handoff posted by someone other than its from party says who posted it', () => {
+  const c = commandCard({ event_type: 'handoff', created_at: at, handoff: { handoff_id: 'h1', from: { kind: 'agent', name: 'bob.codex' }, to: { kind: 'agent', name: 'alice.pi' }, posted_by: { kind: 'person', name: 'mallory' }, note: '', status: 'pending' } });
+  assert.match(c.html, /posted by @mallory/);
+  assert.ok(!commandCard({ event_type: 'handoff', created_at: at, handoff: { handoff_id: 'h2', from: { kind: 'person', name: 'bob' }, to: { kind: 'person', name: 'alice' }, status: 'pending' } }).html.includes('posted by'));
+});
