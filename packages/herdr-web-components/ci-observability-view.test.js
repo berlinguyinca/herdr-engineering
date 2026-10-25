@@ -142,3 +142,111 @@ test('CI page shares project context with the existing heatmap and inspector wit
   await page.evaluate(()=>app.dispose());assert.deepEqual(errors,[]);
  }finally{await browser.close();await new Promise(resolve=>server.close(resolve));}
 });
+
+// Review regressions mount the real page and substitute only provider reads.
+async function reviewPage(run) {
+ const root=path.resolve(import.meta.dirname,'../..');
+ const server=createServer(async(req,res)=>{try{res.setHeader('content-type',req.url==='/'?'text/html':'text/javascript');res.end(req.url==='/'?'<main></main>':await readFile(root+req.url));}catch{res.writeHead(404);res.end();}});
+ await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));const browser=await chromium.launch({headless:true});
+ try {
+  const page=await browser.newPage();page.setDefaultTimeout(5000);const errors=[];page.on('pageerror',e=>errors.push(e.message));
+  await page.goto(`http://127.0.0.1:${server.address().port}`);
+  await page.evaluate(async()=>{
+   const {mountIntegrations}=await import('/packages/integrations-view.js');
+   const identity={provider_url:'https://ci.example',provider_repo_id:'17',repository:'org/current'};
+   const now=new Date().toISOString();
+   window.runs=[{...identity,run_number:7,state:'failure',branch:'main',revision:'abc',created_at:now,started_at:now,finished_at:now},{...identity,repository:'org/former',run_number:8,state:'failure',branch:'main',revision:'abc',created_at:now,started_at:now,finished_at:now}];
+   window.calls=[];
+   const projects=runs.map(r=>({...r,success_count:0,failure_count:1,completed_count:1,active_count:0,duration_seconds:{sample_count:0},coverage:{complete:false}}));
+   window.fixture={available:true,projects,kpis:{project_count:2,success_count:0,failure_count:2,completed_count:2,active_count:0},charts:[],scope:{days:14,scope:'all',partial:true}};
+   window.client={
+    getCiSummary:async options=>{calls.push(['summary',options]);return {...fixture,scope:{...fixture.scope,...options}};},
+    getCiTests:async options=>{calls.push(['tests',options]);return {tests:[{id:'case',name:'Current failure',failure_count:1,completed_count:1,representative_runs:[runs[0]]}],scope:{days:options.days}};},
+    getCiHistory:async()=>({available:true,status:'ready',repos:runs.map(r=>({...r,id:17,default_branch:'main'})),pipelines:runs,coverage:{17:{exhausted:true}}}),
+    getCi:async()=>({available:true,status:'ready',pipelines:{history:runs}}),
+    getCiReports:async()=>({pipelines:runs,reports:runs.map((r,i)=>({...r,report_id:String(i),reported_at:now,summary:{passed:0,failed:1,errored:0,skipped:0,total:1},tests:[{id:'case'+i,name:i?'Former failure':'Current failure',status:'failed'}]}))}),
+    getCiPerformance:async({days})=>({schema_version:1,days,cache_groups:runs.map((r,i)=>({...r,kind:i?'Former cache':'Current cache',sample_count:5,restore_count:5,hit_count:3,hit_rate:.6})),execution_trends:[],alerts:[]}),
+    getCiPipeline:async(id,number)=>({pipeline:{...runs.find(r=>r.run_number===number),tasks:[]},diagnosis:{evidence_availability:'unavailable'}})
+   };
+   window.mount=()=>window.app=mountIntegrations(document.querySelector('main'),client);
+  });
+  await run(page);assert.deepEqual(errors,[]);
+ }finally{await browser.close();server.closeAllConnections();await new Promise(resolve=>server.close(resolve));}
+}
+
+test('review: exact project identity reaches Runs, health, report and cache charts after a rename',()=>reviewPage(async page=>{
+ await page.evaluate(()=>mount());await page.locator('[data-ob-project]').first().waitFor();
+ await page.locator('[data-ob-project]').filter({hasText:'org/current'}).click();
+ await page.locator('[data-ci-workspace="runs"]').click();await page.locator('[data-tab="failed"]').click();
+ assert.equal(await page.locator('#ig-results [data-run]').count(),1);
+ assert.match(await page.locator('#ig-results').textContent(),/Run #7/);
+ assert.doesNotMatch(await page.locator('[data-ci-charts-body]').textContent(),/org\/former|Former cache/);
+ assert.doesNotMatch(await page.locator('[data-ci-insights]').textContent(),/Former failure/);
+ assert.deepEqual(await page.locator('th[scope=row].ci-health-project').allTextContents(),['org/current']);
+ const value=await page.locator('[data-ci-repository]').inputValue();
+ assert.deepEqual(JSON.parse(value),['https://ci.example','17','org/current']);
+}));
+
+test('review: Runs repository selection updates command center and health with exact identity in both directions',()=>reviewPage(async page=>{
+ await page.evaluate(()=>mount());await page.locator('[data-ob-project]').first().waitFor();
+ await page.locator('[data-ci-workspace="runs"]').click();
+ const identity=JSON.stringify(['https://ci.example','17','org/former']);
+ assert.ok((await page.locator('[data-ci-repository] option').evaluateAll(nodes=>nodes.map(n=>n.value))).includes(identity));
+ await page.locator('[data-ci-repository]').selectOption(identity);
+ assert.match(await page.locator('[data-ob-selection]').textContent(),/org\/former/);
+ assert.deepEqual(await page.locator('th[scope=row].ci-health-project').allTextContents(),['org/former']);
+ await page.waitForFunction(()=>calls.some(([key,o])=>key==='tests'&&o.repository==='org/former'&&o.provider_repo_id==='17'&&o.provider_url==='https://ci.example'));
+ await page.locator('[data-ci-repository]').selectOption('');
+ assert.equal(await page.locator('[data-ob-clear]').isVisible(),false);
+ await page.locator('[data-ob-project]').filter({hasText:'org/current'}).click();
+ assert.equal(await page.locator('[data-ci-repository]').inputValue(),JSON.stringify(['https://ci.example','17','org/current']));
+}));
+
+test('review: representative runs activate and focus the inspector from every workspace, including reopening the same run',()=>reviewPage(async page=>{
+ await page.evaluate(()=>mount());await page.locator('[data-ob-project]').first().waitFor();
+ await page.locator('[data-ob-project]').filter({hasText:'org/current'}).click();
+ for(const workspace of ['tests','health','runs','tests']) {
+  await page.locator(`[data-ci-workspace="${workspace}"]`).click();
+  await page.locator('[data-ob-run]').click();
+  assert.equal(await page.locator('.ig-inspector').isVisible(),true,workspace);
+  assert.equal(await page.locator('.ig-inspector').evaluate(n=>n.contains(document.activeElement)),true,`${workspace}: inspector receives focus`);
+  assert.match(await page.locator('.ig-inspector').textContent(),/Run #7/);
+ }
+}));
+
+test('review: saved command-center filters and project survive remount and initialize all shared controls',()=>reviewPage(async page=>{
+ await page.evaluate(()=>mount());await page.locator('[data-ob-project]').first().waitFor();
+ await page.locator('[data-ob-days]').selectOption('30');await page.locator('[data-ob-scope]').selectOption('pr');
+ await page.locator('[data-ob-branch]').fill('topic');await page.locator('[data-ob-search]').fill('org/current');
+ await page.locator('[data-ob-sort]').selectOption('duration');await page.locator('[data-ob-failures]').check();
+ await page.locator('[data-ob-project]').filter({hasText:'org/current'}).click();
+ await page.evaluate(()=>{app.dispose();calls=[];mount();});
+ await page.locator('[data-ob-project]').first().waitFor();
+ assert.equal(await page.locator('[data-ob-days]').inputValue(),'30');assert.equal(await page.locator('[data-ob-scope]').inputValue(),'pr');
+ assert.equal(await page.locator('[data-ob-branch]').inputValue(),'topic');assert.equal(await page.locator('[data-ob-search]').inputValue(),'org/current');
+ assert.equal(await page.locator('[data-ob-sort]').inputValue(),'duration');assert.equal(await page.locator('[data-ob-failures]').isChecked(),true);
+ assert.equal(await page.locator('[data-health-mode="30"]').getAttribute('aria-pressed'),'true');assert.equal(await page.locator('[data-health-scope]').inputValue(),'pr');
+ assert.equal(await page.locator('[data-ci-period]').inputValue(),'30');assert.equal(await page.locator('[data-ci-branch]').inputValue(),'topic');
+ assert.match(await page.locator('[data-ob-selection]').textContent(),/org\/current/);
+ assert.deepEqual(await page.evaluate(()=>[calls[0][1].days,calls[0][1].scope,calls[0][1].branch]),[30,'pr','topic']);
+}));
+
+test('review: mounting preserves existing saved health filters when no command-center preferences exist',()=>reviewPage(async page=>{
+ await page.evaluate(()=>{localStorage.setItem('herdr.ci-health.v1:["","",""]',JSON.stringify({mode:'7',scope:'default',branch:'main',search:'org/current',failuresOnly:true}));mount();});
+ await page.locator('[data-ob-project]').first().waitFor();
+ assert.equal(await page.locator('[data-ob-days]').inputValue(),'7');assert.equal(await page.locator('[data-ob-scope]').inputValue(),'default');
+ assert.equal(await page.locator('[data-ob-branch]').inputValue(),'main');assert.equal(await page.locator('[data-ob-search]').inputValue(),'org/current');
+ assert.equal(await page.locator('[data-ob-failures]').isChecked(),true);
+}));
+
+test('review: mounted unavailable summaries show missing coverage instead of observed-zero cards',()=>reviewPage(async page=>{
+ await page.evaluate(()=>{fixture={...fixture,available:false,projects:[],kpis:{project_count:0,success_count:0,failure_count:0,active_count:0},scope:{partial:true}};mount();});
+ await page.waitForFunction(()=>calls.length>0);
+ assert.match(await page.locator('[data-ob-summary]').textContent(),/unavailable/i);
+ assert.match(await page.locator('[data-ob-status]').textContent(),/unavailable.*partial|partial.*unavailable/i);
+ assert.equal(await page.locator('[data-ob-summary] .ci-ob-card').count(),0);
+ await page.evaluate(()=>{fixture.available=true;app.refresh();});
+ await page.locator('[data-ob-summary] .ci-ob-card').first().waitFor();
+ assert.match(await page.locator('[data-ob-summary]').textContent(),/Observed projects0/);
+ assert.doesNotMatch(await page.locator('[data-ob-summary]').textContent(),/unavailable/i);
+}));

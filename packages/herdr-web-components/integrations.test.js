@@ -154,3 +154,13 @@ test('inspector includes API diagnosis even when provider supplies no steps',()=
  const html=renderPipeline({run_number:7,state:'failure',event:'push',revision:'abc',created_at:'2026-10-25T10:00:00Z',diagnosis:{evidence_availability:'unavailable',reason:'No validated report matches this exact run.',failed_steps:[],failed_tests:[]}});
  assert.match(html,/Failure diagnosis/);assert.match(html,/No validated report/);assert.match(html,/push/);assert.match(html,/2026-10-25T10:00:00Z/);
 });
+
+test('selected project filters retain repository name as well as provider and ID after a rename',async()=>{
+ const project={provider_url:'https://ci.example',provider_repo_id:'17',repository:'org/current'};
+ const records=[{...project,run_number:1,state:'failure'},{...project,repository:'org/former',run_number:2,state:'failure'},{...project,provider_url:'https://other.example',run_number:3,state:'failure'}];
+ const entries=integrationEntries({pipelines:{history:records}});
+ assert.deepEqual(selectIntegrations(entries,{tab:'all',project}).map(e=>e.record.run_number),[1]);
+ const {ciSelectedRunReports}=await import('../integrations-view.js');
+ const active={...project,run_number:1};
+ assert.deepEqual(ciSelectedRunReports([{...active,report_id:'exact'},{...active,repository:'org/former',report_id:'renamed'}],records,active).map(r=>r.report_id),['exact']);
+});

@@ -7,7 +7,7 @@ import {ciRunKey} from './ci-performance.js';
 import {ciChartModel,renderCiCharts,ciChartStyles} from './ci-charts.js';
 import {ciInsightsModel,renderCiInsights,ciInsightStyles,renderCiRunReports} from './ci-insights.js';
 import {renderCiPipeline,renderCiDiagnosis,ciPipelineStyles,pipelineZoom,sameCiRepository,ciComparisonModel,renderCiComparison} from './ci-pipeline.js';
-import {mountCiObservability} from './ci-observability-view.js';
+import {mountCiObservability,ciProjectKey} from './ci-observability-view.js';
 import {mountCiHealth} from './ci-health-view.js';
 import {snapshotText,animateChanges} from './motion.js';
 import {renderCiFix,ciFixStyles,fixRunKey,latestFix,fixIsActive,fixError} from './ci-fix-view.js';
@@ -45,9 +45,9 @@ const canonicalProvider = value => {
   try {const url=new URL(provider);return url.origin+url.pathname.replace(/\/+$/,'');}
   catch {return provider;}
 };
-export function selectIntegrations(entries,{tab='current',search='',repository='',provider='',mission='',session='',branch='',days=0}={}) {
+export function selectIntegrations(entries,{tab='current',search='',repository='',provider='',mission='',session='',branch='',days=0,project=null}={}) {
   const terms=search.toLowerCase().trim().split(/\s+/).filter(Boolean),providerKey=canonicalProvider(provider);
-  return entries.filter(e=>(tab==='all' || e.tab===tab) && (!providerKey || canonicalProvider(e.record.provider_url)===providerKey) && (!repository || e.record.repository===repository || e.record.repository_id===repository || String(e.record.provider_repo_id)===repository)
+  return entries.filter(e=>(!project||ciProjectKey(e.record)===ciProjectKey(project)) && (tab==='all' || e.tab===tab) && (!providerKey || canonicalProvider(e.record.provider_url)===providerKey) && (!repository || e.record.repository===repository || e.record.repository_id===repository || String(e.record.provider_repo_id)===repository)
     && (!branch || e.record.branch===branch) && (!Number(days) || (integrationTimestamp(e.record.created_at || e.record.created)>=Date.now()-Number(days)*86400000 && integrationTimestamp(e.record.created_at || e.record.created)<=Date.now()))
     && (!mission || (e.record.mission_key || e.record.mission_id)===mission || records(e.record.related_missions).some(r=>(r.mission_key || r.mission_id)===mission))
     && (!session || e.record.session_id===session || records(e.record.related_sessions).some(r=>r.session_id===session)) && terms.every(t=>e.search.includes(t)));
@@ -109,7 +109,7 @@ export function pipelineDetails(detail, summary={}) {
 export function ciSelectedRunReports(reports,observations,active) {
   const identity=JSON.parse(ciRunKey(active)),provider=identity[0];
   if(!provider)return [];
-  const matches=record=>{const key=JSON.parse(ciRunKey(record));return key[1]===identity[1]&&key[2]===identity[2];};
+  const matches=record=>{const key=JSON.parse(ciRunKey(record));return key[1]===identity[1]&&key[2]===identity[2]&&record.repository===active.repository;};
   const providers=new Set(records(observations).filter(matches).map(record=>JSON.parse(ciRunKey(record))[0]));
   return records(reports).filter(report=>matches(report)&&(JSON.parse(ciRunKey(report))[0]===provider || !JSON.parse(ciRunKey(report))[0]&&providers.size===1&&providers.has(provider)));
 }
@@ -163,7 +163,7 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
   let debugSessions=null,debugSessionId='',debugMessage='',debugOperationId='',fixOperationId='';
   let fixAvailable=true,fix=null,fixMessage='',sandboxOperationId='',fixTerminal=null,fixTerminalError='';
   let healthView=null,observabilityView=null,workspace=tab==='current'?'health':'runs',collapseSuccess=false,zoom=1,comparisonKey='',listScroll=0,healthOriginKey='';
-  const observedDetails=new Map();
+  const observedDetails=new Map(),repositoryChoices=new Map();
   let performanceData=null,performanceError='',performanceDays=14;
   const pending=new Map();
   const listenerController=new AbortController();
@@ -191,14 +191,16 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
     const slot=el('[data-health-pipeline-slot]');
     if(slot)slot.append(el('.ig-inspector'));
     if(typeof client.getCiSummary==='function') {
-      state.days=14;el('[data-ci-period]').value='14';
-      healthView.setObservabilityContext({days:14,scope:'all',branch:'',search});
-      observabilityView=mountCiObservability(el('[data-ci-observability]'),client,{repository,provider,mission,session,search,
+      observabilityView=mountCiObservability(el('[data-ci-observability]'),client,{repository,provider,mission,session,search:search||undefined,
         onContext:context=>{
           healthView?.setObservabilityContext(context);
           applyCiContext(context);
         },
-        onSelectRun:record=>openCiRun(record)});
+        onSelectRun:record=>{
+          workspace='health';healthView?.setLayout('pipeline');openCiRun(record);
+        }});
+      const initial=observabilityView.getContext();
+      healthView.setObservabilityContext(initial);applyCiContext(initial,{render:false});
     }
   }
   if(isCi){
@@ -213,21 +215,22 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
     }
     nav.addEventListener('keydown',event=>{if(!['ArrowLeft','ArrowRight','Home','End'].includes(event.key))return;const keys=['health','runs','tests'],i=keys.indexOf(workspace);workspace=keys[event.key==='Home'?0:event.key==='End'?2:(i+(event.key==='ArrowRight'?1:2))%3];event.preventDefault();draw();el(`[data-ci-workspace="${workspace}"]`).focus();},{signal:listenerController.signal});
   }
-  function applyCiContext(context) {
+  function applyCiContext(context,{render=true}={}) {
     const changed=state.branch!==context.branch||Number(state.days)!==context.days;
-    state.repository=context.project?String(context.project.provider_repo_id):repository;
+    state.project=context.project||null;
+    state.repository=context.project?context.project.repository:(context.repository??repository);
     state.provider=context.project?.provider_url||provider;
     state.branch=context.branch;state.days=context.days;state.search=context.search;state.page=0;
     el('[data-ig-search]').value=state.search;
     el('[data-ci-period]').value=String(state.days);
-    if(changed)refreshPerformance(true);
-    draw();
+    if(render){if(changed)refreshPerformance(true);draw();}
   }
   const reviewVersion=record=>JSON.stringify([record.updated_at,record.status,record.decision]);
-  const ciObservations=()=>{
+  const ciObservations=({scoped=true}={})=>{
     const recent=Object.entries(data?.pipelines||{}).flatMap(([repository,runs])=>records(runs).map(r=>({...r,repository:r.repository||repository})));
-    const map=new Map();for(const r of [...records(reportData?.pipelines),...recent])map.set(ciRunKey(r),r);
-    return {...reportData,pipelines:[...map.values()],stale:!!data?.stale,partial:data?.status==='partial'};
+    const matches=r=>!scoped||!state.project||ciProjectKey(r)===ciProjectKey(state.project);
+    const map=new Map();for(const r of [...records(reportData?.pipelines),...recent].filter(matches))map.set(JSON.stringify([ciRunKey(r),r.repository]),r);
+    return {...reportData,reports:records(reportData?.reports).filter(matches),pipelines:[...map.values()],stale:!!data?.stale,partial:data?.status==='partial'};
   };
   const entries=()=>integrationEntries(isCi ? {pipelines:{retained:ciObservations().pipelines}} : kind==='reviews' && data ? {...data,reviews:records(data.reviews).map(summary=>{
     const cached=reviewCache.get(String(summary.review_id));
@@ -289,10 +292,17 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
       }
       for(const [selector,field,label] of [['[data-ci-repository]','repository','All repositories'],['[data-ci-branch]','branch','All branches']]){
         const select=el(selector),values=new Map();
-        for(const r of [...observations.pipelines,...records(observations.reports),...records(performanceData?.cache_groups),...records(performanceData?.execution_trends)]) {const value=field==='repository'?String(r.provider_repo_id??r.repository_id??r.repository??''):text(r.branch);if(value)values.set(value,field==='repository'?`${r.repository||value} (${value})`:value);}
-        if(state[field])values.set(state[field],values.get(state[field])||state[field]);
+        if(field==='repository')repositoryChoices.clear();
+        const inventory=ciObservations({scoped:false});
+        for(const r of [...inventory.pipelines,...records(inventory.reports),...records(performanceData?.cache_groups),...records(performanceData?.execution_trends),...(state.project?[state.project]:[])]) {
+          const exact=!!r.provider_url&&r.provider_repo_id!=null&&!!r.repository;
+          const value=field==='repository'?(exact?ciProjectKey(r):String(r.provider_repo_id??r.repository_id??r.repository??'')):text(r.branch);
+          if(value){values.set(value,field==='repository'?`${r.repository||value}${exact?` · ${r.provider_url} #${r.provider_repo_id}`:` (${value})`}`:value);if(field==='repository')repositoryChoices.set(value,exact?{provider_url:r.provider_url,provider_repo_id:String(r.provider_repo_id),repository:r.repository}:null);}
+        }
+        const selectedValue=field==='repository'&&state.project?ciProjectKey(state.project):state[field];
+        if(selectedValue)values.set(selectedValue,values.get(selectedValue)||selectedValue);
         const options=`<option value="">${label}</option>`+[...values].sort((a,b)=>a[1].localeCompare(b[1])).map(([value,label])=>`<option value="${esc(value)}">${esc(label)}</option>`).join('');
-        if(select.innerHTML!==options)select.innerHTML=options;select.value=state[field];
+        if(select.innerHTML!==options)select.innerHTML=options;select.value=selectedValue;
       }
     }
     if(signature!==nextSignature) {
@@ -313,7 +323,7 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
       }
       if(isCi) {
         const chart=el('[data-ci-charts-body]');
-        const html=data ? renderCiCharts(ciChartModel(selectIntegrations(all,{...state,tab:'all'}),{data:performanceData,filters:state,loading:performanceData===null&&!performanceError&&typeof client.getCiPerformance==='function',error:performanceError}),{
+        const html=data ? renderCiCharts(ciChartModel(selectIntegrations(all,{...state,tab:'all'}),{data:state.project&&performanceData?{...performanceData,...Object.fromEntries(['cache_groups','execution_trends','alerts'].map(key=>[key,records(performanceData[key]).filter(r=>ciProjectKey(r)===ciProjectKey(state.project))]))}:performanceData,filters:state,loading:performanceData===null&&!performanceError&&typeof client.getCiPerformance==='function',error:performanceError}),{
           retained:!!reportData,days:state.days,scope:reportData?.scope,stale:!!data.stale,partial:data.status==='partial'||Object.keys(data.repo_errors || {}).length>0,
         }) : '<p class="ci-chart-note">Waiting for CI reports…</p>';
         if(chartSignature!==html) {
@@ -432,14 +442,18 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
     refreshDetail();
   }
   function cancelDetail() {for(const key of ['pipeline','log','debug-sessions','fix','related']){pending.get(key)?.abort();pending.delete(key);}}
+  function focusInspector() {
+    const inspector=el('.ig-inspector');inspector.querySelector('[data-close-inspector]')?.focus({preventScroll:true});
+    inspector.scrollIntoView({block:'nearest',behavior:'smooth'});
+  }
   function openCiRun(record){
     const entry=integrationEntries({pipelines:{history:[record]}})[0];
     if(!entry)return;
-    if(selected?.id===entry.id){el('.ig-inspector').scrollIntoView({block:'nearest',behavior:'smooth'});return;}
+    if(selected?.id===entry.id&&selected.repository===record.repository){draw();focusInspector();return;}
     listScroll=window.scrollY;healthOriginKey=document.activeElement?.dataset.healthRun||healthOriginKey;testPage=0;testSearch='';comparisonKey='';cancelDetail();
     selected={id:entry.id,repository:record.repository,providerId:record.provider_repo_id || record.repository,number:record.run_number,providerUrl:JSON.parse(entry.id)[0]};
     pipeline=selected.providerUrl?record:{...record,can_retry:false,can_cancel:false};debugSessions=null;debugSessionId='';debugMessage='';debugOperationId='';fixOperationId='';fix=null;fixMessage='';sandboxOperationId='';fixTerminal=null;fixTerminalError='';step='';log=null;logError='';detailError='';actionMessage='';detailSignature='';related=null;relatedFailed=false;
-    draw();refreshDetail();refreshRelated();el('.ig-inspector').scrollIntoView({block:'nearest',behavior:'smooth'});
+    draw();refreshDetail();refreshRelated();focusInspector();
   }
   container.addEventListener('click',async event=>{
     if(disposed)return;
@@ -535,7 +549,14 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
     const index=tabs.findIndex(([key])=>key===state.tab);
     state.tab=tabs[event.key==='Home'?0:event.key==='End'?tabs.length-1:(index+(event.key==='ArrowRight'?1:tabs.length-1))%tabs.length][0];state.page=0;event.preventDefault();draw();el(`[data-tab="${state.tab}"]`).focus();
   });
-  if(isCi)for(const [selector,key] of [['[data-ci-repository]','repository'],['[data-ci-branch]','branch'],['[data-ci-period]','days']])el(selector).addEventListener('change',event=>{state[key]=event.target.value;state.page=0;if(key==='days'&&[7,14].includes(Number(state.days))){performanceDays=Number(state.days);el('[data-ci-performance-window]').value=String(performanceDays);}if(key==='days'||key==='branch'){refreshPerformance(true);const context={branch:state.branch,...([7,14,30].includes(Number(state.days))?{days:Number(state.days)}:{})};observabilityView?.setContext(context);healthView?.setObservabilityContext(context);}draw();});
+  if(isCi)for(const [selector,key] of [['[data-ci-repository]','repository'],['[data-ci-branch]','branch'],['[data-ci-period]','days']])el(selector).addEventListener('change',event=>{
+    if(key==='repository') {
+      const value=event.target.value,project=repositoryChoices.get(value)||null;
+      if(observabilityView){observabilityView.setContext({project,repository:project?repository:value||repository});const context=observabilityView.getContext();healthView?.setObservabilityContext(context);applyCiContext(context);}
+      else{state.project=project;state.repository=project?.repository||value;state.provider=project?.provider_url||provider;state.page=0;healthView?.setObservabilityContext({project});draw();}
+      return;
+    }
+    state[key]=event.target.value;state.page=0;if(key==='days'&&[7,14].includes(Number(state.days))){performanceDays=Number(state.days);el('[data-ci-performance-window]').value=String(performanceDays);}if(key==='days'||key==='branch'){refreshPerformance(true);const context={branch:state.branch,...([7,14,30].includes(Number(state.days))?{days:Number(state.days)}:{})};observabilityView?.setContext(context);healthView?.setObservabilityContext(context);}draw();});
   if(isCi)el('[data-ci-performance-window]').addEventListener('change',event=>{performanceDays=Number(event.target.value);if(Number(state.days)===7&&performanceDays===14){state.days='14';el('[data-ci-period]').value='14';}refreshPerformance(true);});
   container.addEventListener('input',event=>{if(event.target.hasAttribute('data-ci-test-search')){testSearch=event.target.value;testPage=0;draw();}},{signal:listenerController.signal});
   el('[data-ig-search]').addEventListener('input',event=>{state.search=event.target.value;state.page=0;draw();});

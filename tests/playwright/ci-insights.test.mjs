@@ -45,19 +45,19 @@ test('CI reports publish over HTTP and drive history, pipeline logs and responsi
   await page.getByRole('tab',{name:/^Failed/}).click();
   await page.getByRole('button',{name:'Run #3',exact:true}).click();
   const inspector=page.locator('.ig-inspector');
-  await inspector.locator('[data-step="12"]').waitFor();
+  await inspector.locator('.ci-pipeline-step[data-step="12"]').waitFor();
   await page.locator('[data-ci-workspace="tests"]').click();
   assert.equal(await insights.isVisible(),true);
   await page.locator('[data-ci-workspace="health"]').click();
-  assert.equal(await inspector.locator('[data-step="12"]').evaluate(e=>getComputedStyle(e).borderLeftColor),'rgb(220, 53, 69)');
+  assert.equal(await inspector.locator('.ci-pipeline-step[data-step="12"]').evaluate(e=>getComputedStyle(e).borderLeftColor),'rgb(220, 53, 69)');
   assert.match(await inspector.innerText(),/Test results · 4 tests/);
   const box=await inspector.boundingBox();assert.ok(box.width>900,`Pipeline inspector too narrow: ${box.width}`);
-  await inspector.locator('[data-step="12"]').focus();await page.keyboard.press('Enter');
-  await page.waitForFunction(()=>document.querySelector('.ig-log')?.textContent.includes('expected 200, got 500'));
-  assert.equal(await inspector.locator('[data-step="12"]').getAttribute('aria-pressed'),'true');
+  await inspector.locator('.ci-pipeline-step[data-step="12"]').focus();await page.keyboard.press('Enter');
+  await page.waitForFunction(()=>document.querySelector('.ig-log[aria-label="Step output"]')?.textContent.includes('expected 200, got 500'));
+  assert.equal(await inspector.locator('.ci-pipeline-step[data-step="12"]').getAttribute('aria-pressed'),'true');
   await inspector.locator('[data-collapse-success]').click();
   assert.equal(await inspector.locator('.ci-pipeline-success').count(),1);
-  assert.equal(await inspector.locator('[data-step="12"]').isVisible(),true);
+  assert.equal(await inspector.locator('.ci-pipeline-step[data-step="12"]').isVisible(),true);
   await inspector.locator('.ci-pipeline-success summary').click();
   assert.equal(await inspector.locator('[data-step="11"]').isVisible(),true);
   await inspector.locator('[data-pipeline-zoom="in"]').click();
@@ -70,8 +70,8 @@ test('CI reports publish over HTTP and drive history, pipeline logs and responsi
   assert.ok(compareKey);await compare.selectOption(compareKey);
   assert.match(await inspector.locator('.ci-comparison').innerText(),/Active #3 compared with #2/);
   assert.match(await inspector.locator('.ci-comparison').innerText(),/Step details not reported/);
-  assert.equal(await inspector.locator('[data-step="12"]').getAttribute('aria-pressed'),'true');
-  assert.match(await inspector.locator('.ig-log').innerText(),/expected 200, got 500/);
+  assert.equal(await inspector.locator('.ci-pipeline-step[data-step="12"]').getAttribute('aria-pressed'),'true');
+  assert.match(await inspector.locator('.ig-log[aria-label="Step output"]').innerText(),/expected 200, got 500/);
   await page.locator('[data-ci-workspace="runs"]').click();
   for(const width of [3840,2560,1920,768,390]){
    await page.setViewportSize({width,height:1000});
