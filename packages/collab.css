@@ -8,6 +8,18 @@
   --text-secondary: #55556a; --text-muted: #686880;
   --status-attention: #b45309; --status-blocked: #c2410c;
 }
+/* Embedded in the dashboard, the page follows the dashboard's theme: in its dark theme the darker light values above
+ * would be unreadable, so the embed takes the shared dark tokens from theme.css instead. */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) .cx-embed {
+    --accent: inherit; --accent-hover: inherit; --text-secondary: inherit; --text-muted: inherit;
+    --status-attention: inherit; --status-blocked: inherit;
+  }
+}
+:root[data-theme="dark"] .cx-embed {
+  --accent: inherit; --accent-hover: inherit; --text-secondary: inherit; --text-muted: inherit;
+  --status-attention: inherit; --status-blocked: inherit;
+}
 @media (prefers-color-scheme: dark) {
   .cx-page {
     --background: #14161a; --surface: #1c1f26; --surface-2: #272b34; --surface-hover: #232730;
