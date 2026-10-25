@@ -224,15 +224,17 @@ export function morph(el,fresh){
 }
 
 // A stranded node that holds focus gives it to fallback(node) (looked up while the node is still in
-// place, so a neighbour can be found), then leaves. With no fallback, focus returns to the document,
-// as when the node was replaced wholesale. One that only holds a text selection stays.
+// place, so a neighbour can be found), then leaves. With no fallback, or one that cannot take focus,
+// focus returns to the document, as when the node was replaced wholesale. One that only holds a text selection stays.
 export function handOff(nodes,fallback=()=>null){
  for(const node of nodes){
   if(!node.isConnected)continue;
   const active=document.activeElement;
   if(active&&active!==document.body&&node.contains(active)){
    const next=fallback(node);
-   if(next&&!node.contains(next))next.focus({preventScroll:true});else active.blur();
+   if(next&&!node.contains(next))next.focus({preventScroll:true});
+   // A fallback that cannot take focus (hidden, inside a closed <details>) must not keep the node.
+   if(node.contains(document.activeElement))document.activeElement.blur();
   }
   if(!guarded(node))node.remove();
  }

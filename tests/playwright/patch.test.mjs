@@ -235,3 +235,19 @@ test('morph detects attributes removed from custom elements without dropping sel
  });
  assert.deepEqual(r,{obsKept:true,mode:false,role:'status',replaced:true,text:'none'});
 }));
+
+test('handOff: a fallback that cannot take focus (inside a closed <details>) still releases the stranded node',async()=>withPage(async(page,base)=>{
+ await open(page,base);
+ const r=await page.evaluate(()=>{
+  c.innerHTML='<details><summary>s</summary><input id="hidden-search"></details><div id="list"><div data-key="a"><button id="row-a">A</button></div></div>';
+  const list=document.getElementById('list');
+  document.getElementById('row-a').focus();
+  const stranded=morph(list,'');
+  const kept=stranded.length;
+  handOff(stranded,()=>document.getElementById('hidden-search'));
+  return {kept,rows:list.children.length,active:document.activeElement===document.body};
+ });
+ assert.equal(r.kept,1,'the focused row was stranded');
+ assert.equal(r.rows,0,'the stranded row is removed even though its fallback could not take focus');
+ assert.equal(r.active,true,'focus returns to the document');
+}));
