@@ -667,6 +667,8 @@ _PUBLIC_STATIC = {
     "/collab-lineage.js": ("collab-lineage.js", "text/javascript"),
     "/collab-attention.js": ("collab-attention.js", "text/javascript"),
     "/collab-mention.js": ("collab-mention.js", "text/javascript"),
+    "/collab-files-view.js": ("collab-files-view.js", "text/javascript"),
+    "/keyed-list.js": ("keyed-list.js", "text/javascript"),
     "/conversation-composer.js": ("conversation-composer.js", "text/javascript"),
     "/conversation-markdown.js": ("conversation-markdown.js", "text/javascript"),
     "/conversation-json.js": ("conversation-json.js", "text/javascript"),
@@ -1060,32 +1062,48 @@ def _make_handler(server, public=False, operator=False):
             # defences as the operator listener: no DNS-rebound names, no cross-site writes.
             if not _dashboard_host_ok(self.headers.get("Host", ""), server.collab_dashboard_hosts):
                 return self._deny(404, "not found")
+            from .collab_files import HARD_MAX_BYTES, transfer_route
+            transfer = transfer_route(self.command, [unquote(seg) for seg in
+                                                     urlsplit(self.path).path.split("/")[4:] if seg])
+            ctype = "application/octet-stream" if transfer else "application/json"
             if self.command == "POST":
                 origin = self.headers.get("Origin")
                 if origin and (urlsplit(origin).netloc != self.headers.get("Host")
                                or urlsplit(origin).scheme not in {"http", "https"}):
                     return self._deny(403, "cross-origin mutation refused")
-                if self.headers.get("Content-Type", "").split(";", 1)[0].strip() != "application/json":
-                    return self._deny(415, "mutations require application/json")
+                if self.headers.get("Content-Type", "").split(";", 1)[0].strip() != ctype:
+                    return self._deny(415, f"{'file uploads' if transfer else 'mutations'} require {ctype}")
             from .collab import MAX_BODY
             length = _content_length(self.headers.get("Content-Length"))
-            if self.command == "POST" and (length is None or length > MAX_BODY):
+            # file bytes: the collab service applies its own YAML limit; this is only the hard ceiling
+            cap = HARD_MAX_BYTES if transfer else MAX_BODY
+            if self.command == "POST" and (length is None or length > cap):
                 return self._deny(413, "request body too large")
             data = self.rfile.read(length) if self.command == "POST" and length else None
+            if self.command == "POST" and data is None:
+                data = b""
             req = urllib.request.Request(
                 server.collab_operator_url + self.path, data=data, method=self.command,
-                headers={"Content-Type": "application/json"} if data is not None or self.command == "POST" else {})
+                headers={"Content-Type": ctype} if data is not None or self.command == "POST" else {})
+            keep = ("Content-Type", "Content-Disposition", "X-Content-Type-Options", "Content-Security-Policy",
+                    "X-Herdr-File-Id", "X-Herdr-File-Version", "X-Herdr-File-Sha256")
+            limit = HARD_MAX_BYTES + 1 if transfer == "download" else 2_000_000
             try:
-                with urllib.request.urlopen(req, timeout=15) as resp:   # noqa: S310 (operator-configured URL)
-                    status, payload = resp.status, resp.read(2_000_000)
+                with urllib.request.urlopen(req, timeout=60 if transfer else 15) as resp:   # noqa: S310 (operator-configured URL)
+                    status, payload, headers = resp.status, resp.read(limit), resp.headers
             except urllib.error.HTTPError as exc:
-                status, payload = exc.code, exc.read(2_000_000)
+                status, payload, headers = exc.code, exc.read(2_000_000), exc.headers
             except Exception:
                 return self._json({"error": "collaboration service unavailable"}, 502)
             if status == 200 and self.command == "GET" and urlsplit(self.path).path.endswith(("/flow", "/state")):
                 payload = _fabric_enriched_flow(server.repo, payload)
             self.send_response(status)
-            self.send_header("Content-Type", "application/json")
+            if transfer == "download" and status == 200:
+                for h in keep:
+                    if headers.get(h):
+                        self.send_header(h, headers[h])
+            else:
+                self.send_header("Content-Type", "application/json")
             self.send_header("Cache-Control", "no-store")
             self.send_header("Content-Length", str(len(payload)))
             self.end_headers()
@@ -1107,13 +1125,23 @@ def _make_handler(server, public=False, operator=False):
             if (server.collab_require_https and not operator
                     and self.headers.get("X-Forwarded-Proto", "").lower() != "https"):
                 return self._deny(400, "collaboration is only served over https")
+            from .collab_files import transfer_route
+            split = urlsplit(self.path)
+            parts = [unquote(seg) for seg in split.path.split("/")[4:] if seg]
+            query = {k: v[0] for k, v in parse_qs(split.query).items()}
+            transfer = transfer_route(self.command, parts)
             if self.command == "POST":
                 origin = self.headers.get("Origin")
                 if origin and (urlsplit(origin).netloc != self.headers.get("Host")
                                or urlsplit(origin).scheme not in {"http", "https"}):
                     return self._deny(403, "cross-origin mutation refused")
-                if self.headers.get("Content-Type", "").split(";", 1)[0].strip() != "application/json":
-                    return self._deny(415, "mutations require application/json")
+                # A file upload is raw bytes, never a form: application/octet-stream is not a type a
+                # cross-site form can send without a preflight, so the operator listener stays CSRF-safe.
+                want = "application/octet-stream" if transfer else "application/json"
+                if self.headers.get("Content-Type", "").split(";", 1)[0].strip() != want:
+                    return self._deny(415, f"{'file uploads' if transfer else 'mutations'} require {want}")
+            if transfer:
+                return self._collab_file(service, parts, query, operator)
             body = {}
             if self.command == "POST":
                 from .collab import MAX_BODY
@@ -1127,9 +1155,6 @@ def _make_handler(server, public=False, operator=False):
                         return self._json({"error": "invalid JSON body"}, 400)
                     if not isinstance(body, dict):
                         return self._json({"error": "JSON object required"}, 400)
-            split = urlsplit(self.path)
-            parts = [unquote(seg) for seg in split.path.split("/")[4:] if seg]
-            query = {k: v[0] for k, v in parse_qs(split.query).items()}
             if operator and self.command == "GET" and parts == ["config"]:
                 return self._json({**service.public_config, "operator": {
                     "user_id": server.operator_user, "email": server.operator_email}}, 200)
@@ -1144,6 +1169,46 @@ def _make_handler(server, public=False, operator=False):
             if isinstance(result, tuple):
                 return self._json(result[1], result[0])
             return self._collab_sse(service, result)
+
+        def _collab_file(self, service, parts, query, operator):
+            """Room files (C5): a raw-bytes upload, or a download served for saving only, never for display."""
+            from .collab_files import _human as _human_bytes
+            data = None
+            if self.command == "POST":
+                length = _content_length(self.headers.get("Content-Length"))
+                limit = service._files_limits()["max_bytes"]
+                if length is None:
+                    return self._deny(411, "Content-Length required")
+                if length > limit:          # refused before a byte is read
+                    return self._json({"error": f"the file is {length} bytes; the limit is "
+                                                f"{_human_bytes(limit)} per file", "code": "file_too_large"}, 413)
+                data = self.rfile.read(length) if length else b""
+            try:
+                kind, a, b = service.file_transfer(self.command, parts, query, data,
+                                                   self.headers.get("Authorization", ""),
+                                                   self.headers.get("X-Herdr-Device"),
+                                                   operator=server.operator_user if operator else None)
+            except Exception:
+                return self._json({"error": "internal error"}, 500)  # never echo internals
+            if kind == "json":
+                return self._json(b, a)
+            self._send_file(a, b)
+            return None
+
+        def _send_file(self, meta, data):
+            from .collab_files import content_disposition
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Disposition", content_disposition(meta["name"]))
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Content-Security-Policy", "default-src 'none'; sandbox")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Herdr-File-Id", meta["id"])
+            self.send_header("X-Herdr-File-Version", str(meta["version"]))
+            self.send_header("X-Herdr-File-Sha256", meta["sha256"])
+            self.end_headers()
+            self.wfile.write(data)
 
         def _collab_sse(self, service, stream):
             self.send_response(200)

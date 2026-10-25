@@ -284,6 +284,31 @@ def _build_parser() -> argparse.ArgumentParser:
     asub.add_parser("list", help="list stored artifacts").set_defaults(func=_cmd_art_list)
     p2 = asub.add_parser("retention", help="enforce retention policy")
     p2.set_defaults(func=_cmd_art_retention)
+    # collab room files (C5) ------------------------------------------------
+    p = sub.add_parser("collab", help="collaboration room helpers for agents")
+    csub = p.add_subparsers(dest="collab_command", required=True)
+    pf = csub.add_parser("file", help="room files: list them, fetch one to .collab/files/<name>, "
+                                      "put a new file or a new version")
+    fsub = pf.add_subparsers(dest="collab_file_command", required=True)
+    for verb, helptext in (("list", "list the room's files and their latest versions"),
+                           ("get", "fetch a file into ./.collab/files/<name> (the latest version by default)"),
+                           ("put", "upload a file; one with the same name in the room gets a new version")):
+        p2 = fsub.add_parser(verb, help=helptext)
+        p2.add_argument("--agent-file", required=True,
+                        help="the agent's JSON file (credential, device_id) written when it joined")
+        p2.add_argument("--base", help="collaboration site, e.g. https://collab.example.org "
+                                       "(default: base_url in the agent file)")
+        p2.add_argument("--room", required=True, help="room id")
+        if verb == "get":
+            p2.add_argument("name", help="file name (as listed) or file id")
+            p2.add_argument("--version", type=int, help="a specific version (default: latest)")
+            p2.add_argument("--dir", default=".", help="working directory (default: the current one)")
+        if verb == "put":
+            p2.add_argument("path", help="local file to upload")
+            p2.add_argument("--name", help="name in the room (default: the file's own name)")
+            p2.add_argument("--new", action="store_true",
+                            help="always a new file, even when the room has one with this name")
+        p2.set_defaults(func=_cmd_collab_file)
     # system-graph artifact (P5): deterministic sanitized snapshot renderer.
     ga = sub.add_parser("graph-artifact", help="render a graph snapshot to validated HTML (system-graph P5)")
     gas = ga.add_subparsers(dest="graph_artifact_command", required=True)
@@ -2660,6 +2685,26 @@ def _cmd_cp_web(args) -> int:
                 section = _store.current().section("control_plane")
                 return ((section.get("collab") or {}) if isinstance(section.get("collab"), dict) else {}).get("insights")
             collab.insights_source = _insights_from_yaml
+        # C5: room files. Limits are YAML only (control_plane.collab.files), re-read per request. Bytes go to the
+        # object store artifacts already use (RustFS) when one is wired; otherwise a content-addressed directory
+        # next to the collab log, so a restart keeps them.
+        from .control_plane.collab_files import DirectoryBlobStore, normalize_files
+        raw_files = getattr(args, "collab_files", None)
+        if raw_files is None and isinstance(cp.get("collab"), dict):
+            raw_files = cp["collab"].get("files")
+        try:
+            collab.files_limits = normalize_files(raw_files)
+        except ValueError as exc:
+            raise SystemExit(f"fleet config {exc}") from None
+        if fleet_store is not None:
+            def _files_from_yaml(_store=fleet_store):
+                section = _store.secure_section("control_plane")
+                return ((section.get("collab") or {}) if isinstance(section.get("collab"), dict) else {}).get("files")
+            collab.files_source = _files_from_yaml
+        if rustfs is not None:
+            collab.file_blobs = rustfs
+        elif getattr(args, "collab_log_file", None):
+            collab.file_blobs = DirectoryBlobStore(args.collab_log_file + ".files")
     svr = ControlPlaneServer(repo, api_keys=api_keys, lineage_key_scopes=lineage_key_scopes,
                              system_graph=system_graph,
                              host=args.host, port=args.port, source=source,
@@ -2745,6 +2790,7 @@ COLLAB_CONFIG_KEYS = {
     "steering": ("collab_steering", dict),                # T12 comments + steering; YAML only, off by default
     "contextual": ("collab_contextual", dict),            # T14 context refs, consultation, cross links; YAML only, off by default
     "insights": ("collab_insights", dict),                # T15 attention inbox, progress, analytics; YAML only, off by default
+    "files": ("collab_files", dict),                      # C5 room files: {max_bytes, room_bytes}; YAML only
     # {room_id, requester_agent_id}: the operator's standing summary-fix room (YAML only, no flag)
     "summary_fix": ("collab_summary_fix", dict),
 }
@@ -2779,9 +2825,11 @@ def _apply_collab_config(args, cp) -> None:
         elif kind is dict:
             from .control_plane.collab_attention import normalize_insights
             from .control_plane.collab_context import normalize_contextual
+            from .control_plane.collab_files import normalize_files
             from .control_plane.collab_workbench import normalize_steering
             try:
-                {"contextual": normalize_contextual, "insights": normalize_insights}.get(key, normalize_steering)(value)
+                {"contextual": normalize_contextual, "insights": normalize_insights,
+                 "files": normalize_files}.get(key, normalize_steering)(value)
             except ValueError as exc:
                 raise SystemExit(f"fleet config {exc}") from None
             setattr(args, dest, dict(value))
@@ -2947,6 +2995,108 @@ def _cmd_cp_worker(args) -> int:
         return 130
     if result is not None:
         _print_json({"ok": True, "pass": result})
+    return 0
+
+
+def _collab_file_target(workdir: str, name: str):
+    """``<workdir>/.collab/files/<name>``; a name that would land anywhere else is refused."""
+    from pathlib import Path
+
+    from .control_plane.collab_files import STABLE_DIR, clean_file_name
+    try:
+        clean = clean_file_name(name)
+    except Exception as exc:
+        raise SystemExit(f"collab file: refusing the name {name!r}: {getattr(exc, 'message', exc)}") from None
+    if clean != name:
+        raise SystemExit(f"collab file: refusing the name {name!r}")
+    folder = Path(workdir).resolve() / STABLE_DIR
+    target = folder / clean
+    if target.parent != folder:
+        raise SystemExit(f"collab file: refusing the name {name!r}")
+    return target
+
+
+def _cmd_collab_file(args) -> int:
+    """`herdr-eng collab file list|get|put`: an agent's own credential (from its agent file, never argv)."""
+    import hashlib
+    import os
+    import tempfile
+    import urllib.error
+    import urllib.parse
+    import urllib.request
+    from pathlib import Path
+
+    try:
+        agent = json.loads(Path(args.agent_file).expanduser().read_text(encoding="utf-8"))
+        cred, device = agent["credential"], agent["device_id"]
+    except (OSError, ValueError, KeyError, TypeError):
+        raise SystemExit("collab file: --agent-file must be the agent's JSON file (credential, device_id)") from None
+    base = (args.base or agent.get("base_url") or "").rstrip("/")
+    if not base.startswith(("https://", "http://127.0.0.1", "http://localhost")):
+        raise SystemExit("collab file: --base must be the https:// collaboration site")
+    room = urllib.parse.quote(args.room, safe="")
+    root = f"{base}/api/v1/collab/rooms/{room}/files"
+    auth = {"Authorization": f"Agent {cred}", "X-Herdr-Device": device}
+
+    def call(method, url, data=None, ctype=None):
+        req = urllib.request.Request(url, data=data, method=method,
+                                     headers={**auth, **({"Content-Type": ctype} if ctype else {})})
+        try:
+            with urllib.request.urlopen(req, timeout=120) as resp:   # noqa: S310 (operator-given site)
+                return resp.read(), resp.headers
+        except urllib.error.HTTPError as exc:
+            try:
+                msg = json.loads(exc.read() or b"{}").get("error") or exc.reason
+            except ValueError:
+                msg = exc.reason
+            raise SystemExit(f"collab file: {exc.code} {msg}") from None
+        except urllib.error.URLError as exc:
+            raise SystemExit(f"collab file: cannot reach {base}: {exc.reason}") from None
+
+    def shelf():
+        return json.loads(call("GET", root)[0])["files"]
+
+    cmd = args.collab_file_command
+    if cmd == "list":
+        files = shelf()
+        for f in files:
+            print(f"{f['id']}  v{f['version']}  {f['size']:>10}  {f['path']}")
+        if not files:
+            print("no files in this room")
+        return 0
+    if cmd == "get":
+        files = shelf()
+        hit = next((f for f in files if f["id"] == args.name), None) or next(
+            (f for f in files if f["name"] == args.name), None)
+        if hit is None:
+            raise SystemExit(f"collab file: no file {args.name!r} in this room")
+        target = _collab_file_target(args.dir, hit["name"])
+        query = f"?v={args.version}" if args.version else ""
+        data, headers = call("GET", f"{root}/{urllib.parse.quote(hit['id'], safe='')}{query}")
+        want = headers.get("X-Herdr-File-Sha256")
+        if want and hashlib.sha256(data).hexdigest() != want:
+            raise SystemExit("collab file: the download does not match its sha256; nothing was written")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=target.parent, prefix=".get-")
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+        os.replace(tmp, target)
+        print(json.dumps({"path": str(target), "id": hit["id"], "version": int(headers.get("X-Herdr-File-Version") or 0),
+                          "sha256": want}))
+        return 0
+    path = Path(args.path)
+    try:
+        data = path.read_bytes()
+    except OSError as exc:
+        raise SystemExit(f"collab file: cannot read {args.path}: {exc.strerror}") from None
+    name = args.name or path.name
+    same = None if args.new else next((f for f in shelf() if f["name"] == name), None)
+    if same is not None:               # an edit of a room file is its next version, never an overwrite
+        url = f"{root}/{urllib.parse.quote(same['id'], safe='')}/versions"
+    else:
+        url = f"{root}?name={urllib.parse.quote(name, safe='')}"
+    out = json.loads(call("POST", url, data, "application/octet-stream")[0])["file"]
+    print(json.dumps(out))
     return 0
 
 

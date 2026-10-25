@@ -36,6 +36,7 @@ from . import collab_mentions as mentions
 from . import collab_models, ids
 from .collab_attention import AttentionMixin
 from .collab_context import ContextMixin
+from .collab_files import FilesMixin
 from .collab_workbench import WorkbenchMixin
 from .redact import redact_text
 
@@ -74,7 +75,7 @@ MAX_TEXT = 8000
 MAX_BODY = 64 * 1024
 _PANE_LINK = re.compile(r"pane:[a-z0-9][a-z0-9._-]{0,62}:[A-Za-z0-9][A-Za-z0-9:_.-]{0,39}")
 _KEY_RE = re.compile(r"[A-Za-z0-9._:\-]{1,128}\Z")
-_MESSAGE_FIELDS = frozenset({"text", "idempotency_key", "in_reply_to", "context"})
+_MESSAGE_FIELDS = frozenset({"text", "idempotency_key", "in_reply_to", "context", "files"})
 _MESSAGE_DERIVED = frozenset({"mentions"})   # the server derives these from the text; a client's copy is dropped
 _CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")   # C0, DEL and C1 (8-bit CSI)
 _NAME_BAD = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]")
@@ -302,7 +303,7 @@ class FileEventLog:
     record = record_required
 
 
-class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin):
+class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FilesMixin):
     def __init__(self, authenticator: UserAuthenticator, *, sink: Any = None,
                  now=None, enrollment_ttl: float = 600.0, credential_ttl: float = 12 * 3600.0,
                  stream_poll_seconds: float = 1.0, message_limit: int = 60,
@@ -422,6 +423,7 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin):
         self._init_workbench()
         self._init_context()
         self._init_attention()
+        self._init_files()
 
     # ------------------------------------------------------------ plumbing
     @property
@@ -537,7 +539,7 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin):
     # --------------------------------------------------------- state fold
     def _apply(self, ev: dict) -> None:
         t, p, seq = ev["event_type"], ev["payload"], ev["sequence"]
-        if self._apply_workbench(ev) or self._apply_context(ev) or self._apply_attention(ev):
+        if self._apply_workbench(ev) or self._apply_context(ev) or self._apply_attention(ev) or self._apply_files(ev):
             return
         if t == "external_usage_reserved":
             k = (p["scope"], p["key"])
@@ -3292,6 +3294,7 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin):
             with self._lock:                      # handles only, never emails; a guest gets no roster
                 out["people"] = [] if guest else self._room_people(room_id)
             out["tasks"] = self.list_tasks(pr, room_id)["tasks"]
+            out["files"] = self.room_files(pr, room_id)      # new files reach agents and people on this poll
             out["flow"] = None if guest else self.room_flow(pr, room_id)
             with self._lock:                      # quiet reads: people only, never guests or agents
                 visible = not pr.is_agent and not guest
@@ -4794,7 +4797,8 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin):
                 if len(text) > MAX_TEXT:
                     raise CollabError(400, f"text must be 1-{MAX_TEXT} characters")
                 clean = ext.clean_text(text, MAX_TEXT, multiline=True)
-            if not clean.strip() or len(clean) > MAX_TEXT:
+            files = self._message_files(room_id, body["files"]) if "files" in body else []
+            if (not clean.strip() and not files) or len(clean) > MAX_TEXT:
                 raise CollabError(400, f"text must be 1-{MAX_TEXT} characters")
             reply = body.get("in_reply_to")
             if reply is not None:
@@ -4808,7 +4812,7 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin):
             if "context" in body:
                 # T14: a reference to a graph node/edge/proposal/comment. Validated, and visible to THIS poster now.
                 ctx = self._wb_call(self._context_for_post, pr, room, room_id, body["context"])
-            fp = _digest(json.dumps([room_id, clean, reply] + ([ctx] if ctx else [])))
+            fp = _digest(json.dumps([room_id, clean, reply] + ([ctx] if ctx else []) + ([files] if files else [])))
             prior = self._idem.get((pr.key, room_id, key))
             if prior:
                 if prior[0] != fp:
@@ -4839,7 +4843,7 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin):
                 pr, project_id=room["project_id"], room_id=room_id, sender_key=pr.key,
                 sender_kind=pr.kind, sender_id=pr.id, sender_external=pr.external, idempotency_key=key, fingerprint=fp,
                 text=stored, mentions=self._resolve_mentions(room_id, stored), in_reply_to=reply, trust="untrusted",
-                **({"context": ctx} if ctx else {}),
+                **({"context": ctx} if ctx else {}), **({"files": files} if files else {}),
                 visibility_scope="room", action="message.post", outcome="allowed",
                 project_ids=[room["project_id"]], resource_id=room_id))
         self.stats["messages"] += 1
@@ -4863,6 +4867,8 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin):
             out["mentions"], mine = self._mentions_for(p, viewer)
             if mine is not None:                   # wake on the long-poll, act if addressed
                 out["mentions_me"] = mine
+            if p.get("files"):
+                out["files"] = [dict(f) for f in p["files"]]
             if p.get("context"):
                 out["context"] = self._message_context(p, viewer, {} if _ctx_cache is None else _ctx_cache)
         elif t in ("task_created", "task_updated"):
@@ -4982,6 +4988,49 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin):
                 self._streams["owner:" + stream.principal.owner] -= 1
 
     # --------------------------------------------------------------- routing
+    def _request_principal(self, authorization: str, device: str | None, operator: str | None,
+                           parts: list[str]) -> Principal:
+        if operator is not None:
+            # Only the operator listener (tailnet-only, Host-checked) ever passes this: the
+            # local owner uses the dashboard without a sign-in, as the same user id they
+            # sign in as on the public site. They must still be a current group member.
+            if not self.auth.exists(operator):
+                raise CollabError(403, "operator is not enabled for collaboration")
+            if self.approval is not None:
+                self._ensure_operator(operator)
+            pr = Principal("user", operator, operator)
+            pr.admin = pr.approver = True
+        else:
+            pr = self.authenticate(authorization, device)
+        if pr.status != "approved" and parts != ["me"]:
+            self.stats["policy_denied"] += 1
+            raise CollabError(403, "waiting for approval")
+        return pr
+
+    def file_transfer(self, method: str, parts: list[str], query: dict, data: bytes | None,
+                      authorization: str, device: str | None, operator: str | None = None):
+        """The raw-bytes file routes (C5): ("json", status, payload) or ("bytes", meta, data)."""
+        try:
+            pr = self._request_principal(authorization, device, operator, parts)
+            rid = parts[1]
+            if method == "POST":
+                parent = parts[3] if len(parts) == 5 else query.get("parent")
+                name = query.get("name") if parent is None else None
+                return "json", 201, {"file": self.put_file(rid, pr, name, data or b"", parent=parent)}
+            v = query.get("v")
+            if v is not None:
+                try:
+                    v = int(v)
+                except (TypeError, ValueError):
+                    raise CollabError(404, "no such version") from None
+            meta, blob = self.get_file(pr, rid, parts[3], version=v)
+            return "bytes", meta, blob
+        except CollabError as exc:
+            err = {"error": exc.message}
+            if exc.code:
+                err["code"] = exc.code
+            return "json", exc.status, err
+
     def dispatch(self, method: str, parts: list[str], query: dict, body: dict,
                  authorization: str, device: str | None, operator: str | None = None,
                  client: str | None = None):
@@ -4995,22 +5044,8 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin):
                 return 200, self.link_joined(body)
             if parts == ["config"] and method == "GET":
                 return 200, self.public_config  # public identifiers only; no auth needed
-            if operator is not None:
-                # Only the operator listener (tailnet-only, Host-checked) ever passes this: the
-                # local owner uses the dashboard without a sign-in, as the same user id they
-                # sign in as on the public site. They must still be a current group member.
-                if not self.auth.exists(operator):
-                    raise CollabError(403, "operator is not enabled for collaboration")
-                if self.approval is not None:
-                    self._ensure_operator(operator)
-                pr = Principal("user", operator, operator)
-                pr.admin = pr.approver = True
-            else:
-                pr = self.authenticate(authorization, device)
+            pr = self._request_principal(authorization, device, operator, parts)
             n = len(parts)
-            if pr.status != "approved" and parts != ["me"]:
-                self.stats["policy_denied"] += 1
-                raise CollabError(403, "waiting for approval")
             if parts[:2] == ["admin", "users"]:
                 if method == "GET" and parts == ["admin", "users", "log"]:
                     return 200, self.user_log(pr)
@@ -5088,6 +5123,8 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin):
                         return 200, self.list_agent_requests(pr, rid)
                     if parts[2:] == ["tasks"]:
                         return 200, self.list_tasks(pr, rid)
+                    if parts[2:] == ["files"]:
+                        return 200, self.list_files(pr, rid)
                     if parts[2:] == ["consultations"]:
                         return 200, self.list_consultations(pr, rid)
                     if parts[2:] == ["xlinks"]:
@@ -5286,6 +5323,8 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin):
                         return 200, self.cancel_task(pr, rid, parts[3])
                     if parts[2:] == ["messages"]:
                         return self.post_message(pr, rid, body)
+                    if n == 5 and parts[2] == "files" and parts[4] == "delete":
+                        return 200, self.delete_file(pr, rid, parts[3])
             raise CollabError(404, "not found")
         except CollabError as exc:
             err = {"error": exc.message, **getattr(exc, "extra", {})}
