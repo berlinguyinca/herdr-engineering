@@ -4111,7 +4111,8 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin):
     def _task_json(self, tid: str, t: dict, *, bounds: bool = False) -> dict:
         a = self._agents.get(t["target"], {})
         return {"task_id": tid, "room_id": t["room_id"], "target_agent_id": t["target"],
-                "target_name": a.get("name"), "text": t["text"], "status": self._task_status(t),
+                "target_name": a.get("name"), "target_address": self._address(t["target"]),
+                "target_aliases": list(a.get("aliases", ())), "text": t["text"], "status": self._task_status(t),
                 "result": t["result"], "depth": t["depth"], "parent_task_id": t["parent"],
                 "requested_by": {"type": t["by_kind"], "id": t["by_id"], "owner_user_id": t["by_owner"]},
                 "started_by_user_id": t["root"],

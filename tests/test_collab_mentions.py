@@ -225,3 +225,11 @@ def test_a_task_to_an_agent_keeps_the_literal_text_byte_for_byte(w):
     assert [t["text"] for t in w.s.list_tasks(pi, w.room)["tasks"] if t["task_id"] == tid] == [text]
     created = [e for e in w.s.read_events(pi, w.room, 0, 200)["events"] if e["event_type"] == "task_created"]
     assert created[-1]["task"]["text"] == text
+
+
+def test_a_task_names_its_targets_address_and_aliases_without_touching_the_text(w):
+    pi, pid = agent(w, "alice", "pi", name="lead")
+    w.s.rename_agent(w.alice, pid, {"name": "boss"})
+    w.s.create_task(w.bob, w.room, {"target_agent_id": pid, "text": "@lead /skill:x go"})
+    t = w.s.task_inbox(pi)["tasks"][0]
+    assert (t["target_address"], t["target_name"], t["target_aliases"], t["text"]) == ("alice.pi", "boss", ["lead"], "@lead /skill:x go")
