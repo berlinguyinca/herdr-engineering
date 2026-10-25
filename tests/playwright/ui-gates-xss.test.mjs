@@ -95,6 +95,14 @@ const PLACEMENTS = [
     async (page) => { await openSub(page, 'tabs'); await page.locator('#hcn-tabs [role="tab"]', { hasText: /Virtual agent/ }).first().click(); await page.locator('#hcn-tabpanel', { hasText: 'Virtual tab' }).waitFor(); }],
   ['lineage', 'the reason a node is in its state (state_reason)', '.lin-inspector', 'cx-canary-statereason',
     async (page) => { await openSub(page, 'lineage'); await page.locator('svg.lin-svg g[data-node]').first().waitFor(); await page.locator('g[data-node="attempt:a2"]').focus(); await page.keyboard.press('Enter'); await page.locator('.lin-inspector').waitFor(); }],
+  // The asker/target reference nodes of a consultation carry attrs.consultation (the id of the thread node they belong to).
+  // The inspector lists every attribute of a node, so it IS shown, escaped, once a reference node is opened.
+  ['lineage', 'a consultation reference node: the attribute that names its thread (attrs.consultation)', '.lin-inspector', 'cx-canary-consultation',
+    async (page) => {
+      await openSub(page, 'lineage');
+      const ref = page.locator('svg.lin-svg g[data-node^="thread:hcn-consult-asker."]');
+      await ref.first().waitFor(); await ref.first().focus(); await page.keyboard.press('Enter'); await page.locator('.lin-inspector').waitFor();
+    }],
   ['agents', 'a pending agent request: its owner (owner_email)', '#hcn-requests', 'cx-canary-owneremail',
     async (page) => { await openSub(page, 'agents'); await page.locator('#hcn-requests li').first().waitFor(); }],
   ['flow', 'the detail of an agent node in the flow: its owner (owner_email)', '#hcn-flow-detail', 'cx-canary-owneremail',
