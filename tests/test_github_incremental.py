@@ -1145,10 +1145,12 @@ class FakeProjects(FakeGitHub):
         project["updatedAt"] = _iso(self.clock)
         return iid
 
-    def move_item(self, pid, iid, status):
+    def move_item(self, pid, iid, status, *, bump_project=True):
+        """``bump_project=False``: a move GitHub does not reflect in the project's updatedAt."""
         project = self._project(pid)
         project["items"][iid].update(status=status, updatedAt=_iso(self.tick()))
-        project["updatedAt"] = _iso(self.clock)
+        if bump_project:
+            project["updatedAt"] = _iso(self.clock)
 
     def remove_item(self, pid, iid):
         project = self._project(pid)
@@ -1398,3 +1400,26 @@ def test_a_resumed_project_that_changed_meanwhile_is_read_again_from_page_one():
     monitor.refresh()
     calls = [(entry[1], entry[2]) for entry in item_calls(fake)]
     assert calls and calls[0] == (floor, None), "a changed project restarts at page 1"
+
+
+def test_a_move_that_does_not_bump_the_project_is_caught_by_the_daily_full_read():
+    fake, p1, *_ = projects_seeded()
+    clock = [1_000_000.0]
+    monitor = monitor_for(fake, {}, projects=ON, now=lambda: clock[0], full_reconcile_interval=86400)
+    monitor.refresh()
+    moved = next(iter(fake._project(p1)["items"]))
+    fake.move_item(p1, moved, "Done", bump_project=False)
+    for hours in (1, 12, 23):
+        clock[0] = 1_000_000.0 + hours * 3600
+        fake.log.clear()
+        monitor._retry_at = 0
+        monitor.refresh()
+        assert item_calls(fake, p1) == [], f"no item read {hours} h after the last full read"
+    assert sorted(i["status"] for i in monitor.project_items(p1, start=False)["items"]) == ["Done", "Todo", "Todo"]
+    clock[0] = 1_000_000.0 + 86400 + 60
+    fake.log.clear()
+    monitor._retry_at = 0
+    monitor.refresh()
+    assert {entry[1] for entry in item_calls(fake)} >= {p1}
+    assert len([entry for entry in item_calls(fake, p1) if entry[2] is None]) == 1, "one full read of the project"
+    assert sorted(i["status"] for i in monitor.project_items(p1, start=False)["items"]) == ["Done", "Done", "Todo"]
