@@ -166,9 +166,9 @@ def stored(w, ev):
 
 def test_an_in_scope_issue_resolves_and_its_chip_reads_title_and_state_now(w, gh):
     ev = say(w, w.bob, "fixes #binview-44 and acme/app#3")
-    assert stored(w, ev) == [{"kind": "issue", "owner": "acme", "repo": "binview", "number": 44},
-                             {"kind": "issue", "owner": "acme", "repo": "app", "number": 3}]
-    assert ev["refs"][0] == {"kind": "issue", "owner": "acme", "repo": "binview", "number": 44,
+    assert stored(w, ev) == [{"kind": "issue", "owner": "acme", "repo": "binview", "number": 44, "forms": ["short"]},
+                             {"kind": "issue", "owner": "acme", "repo": "app", "number": 3, "forms": ["long"]}]
+    assert ev["refs"][0] == {"kind": "issue", "owner": "acme", "repo": "binview", "number": 44, "forms": ["short"],
                              "title": "Fix the <b>chart</b>", "state": "open",
                              "url": "https://github.com/acme/binview/issues/44"}
     fake, monitor = gh
@@ -191,7 +191,7 @@ def test_two_owners_with_one_repo_name_need_owner_slash_repo(w):
     menu = w.s.search_refs(w.bob, w.room, "app-3")
     assert {i["insert"] for i in menu["items"]} == {"acme/app#3", "other/app#3"}
     ev = say(w, w.bob, "ambiguous #app-3 but other/app#3 is clear")
-    assert stored(w, ev) == [{"kind": "issue", "owner": "other", "repo": "app", "number": 3}]
+    assert stored(w, ev) == [{"kind": "issue", "owner": "other", "repo": "app", "number": 3, "forms": ["long"]}]
     assert w.s.search_refs(w.bob, w.room, "binview-4")["items"][0]["insert"] == "#binview-44"
 
 
@@ -202,7 +202,7 @@ def test_a_closed_issue_shows_closed(w, gh):
     monitor.refresh()
     seen = [e for e in w.s.read_events(w.bob, w.room, 0, 50)["events"] if e["event_id"] == ev["event_id"]][0]
     assert seen["refs"][0]["state"] == "closed"
-    assert stored(w, ev)[0] == {"kind": "issue", "owner": "acme", "repo": "binview", "number": 44}
+    assert stored(w, ev)[0] == {"kind": "issue", "owner": "acme", "repo": "binview", "number": 44, "forms": ["short"]}
 
 
 def test_cache_not_ready_still_sends_and_the_menu_says_so(svc):
@@ -232,7 +232,7 @@ def test_refs_are_bounded_and_deduplicated(w, gh):
     ev = say(w, w.bob, " ".join(f"#binview-{n}" for n in range(100, 140)) + " #binview-44 #binview-44")
     assert len(stored(w, ev)) == collab_refs.MAX_REFS
     ev = say(w, w.bob, "#binview-44 acme/binview#44 (#binview-44)")
-    assert len(stored(w, ev)) == 1
+    assert len(stored(w, ev)) == 1 and stored(w, ev)[0]["forms"] == ["short", "long"]   # which text forms named it
 
 
 def test_guests_and_external_agents_never_see_private_titles(w):
@@ -244,7 +244,7 @@ def test_guests_and_external_agents_never_see_private_titles(w):
     for viewer in (w.dave, ext_pr):                                    # a guest and an external agent
         msg = [e for e in w.s.read_events(viewer, w.room, 0, 50)["events"] if e["event_type"] == "message"][-1]
         secret, public = msg["refs"]
-        assert secret == {"kind": "issue", "owner": "acme", "repo": "secret", "number": 7}   # coordinates only
+        assert secret == {"kind": "issue", "owner": "acme", "repo": "secret", "number": 7, "forms": ["short"]}
         assert "Private plans" not in repr(msg["refs"])
         assert public["title"] == "Fix the <b>chart</b>" and public["state"] == "open"
     assert [i["repo"] for i in w.s.search_refs(w.carol, w.room, "secret")["items"]] == ["secret"]
@@ -261,7 +261,7 @@ def test_a_rotated_token_serves_nothing_cached_under_the_old_one(w, gh):
     ev = say(w, w.bob, "#binview-44")
     fake.credential_identity = "fingerprint-two"
     seen = [e for e in w.s.read_events(w.bob, w.room, 0, 50)["events"] if e["event_id"] == ev["event_id"]][0]
-    assert seen["refs"] == [{"kind": "issue", "owner": "acme", "repo": "binview", "number": 44}]
+    assert seen["refs"] == [{"kind": "issue", "owner": "acme", "repo": "binview", "number": 44, "forms": ["short"]}]
     assert "refs" not in say(w, w.bob, "now #binview-44 again")
     assert w.s.search_refs(w.bob, w.room, "binview") == {"ready": False, "items": []}
 

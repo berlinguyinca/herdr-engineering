@@ -263,8 +263,10 @@ export function refChips(html, refs) {
     if (skip) return part;
     return part.replace(REF, (all, pre, text, shortRepo, shortNo, owner, repo, no) => {
       const ref = shortRepo
-        ? list.find((r) => same(r.repo, shortRepo) && Number(r.number) === Number(shortNo))
-        : list.find((r) => same(r.owner, owner) && same(r.repo, repo) && Number(r.number) === Number(no));
+        // a short token is a chip only when the server resolved that short form: an ambiguous `#app-3` stays
+        // text even when `other/app#3` in the same message resolved
+        ? list.find((r) => (r.forms || []).includes('short') && same(r.repo, shortRepo) && Number(r.number) === Number(shortNo))
+        : list.find((r) => (r.forms || ['long']).includes('long') && same(r.owner, owner) && same(r.repo, repo) && Number(r.number) === Number(no));
       if (!ref) return all;
       const where = `${ref.owner}/${ref.repo}#${Number(ref.number)}`;
       const state = ref.state === 'open' || ref.state === 'closed' || ref.state === 'merged' ? ref.state : '';

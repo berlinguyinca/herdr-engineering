@@ -145,8 +145,8 @@ test('# says "GitHub cache not ready" when there is no cache, as a row that inse
 });
 
 test('refChips turns only the server-resolved references into escaped chips, outside code and links', () => {
-  const refs = [{ kind: 'issue', owner: 'acme', repo: 'binview', number: 44, title: 'Fix <b>chart</b>"><img src=x>', state: 'closed' },
-    { kind: 'issue', owner: 'acme', repo: 'secret', number: 7 }];
+  const refs = [{ kind: 'issue', owner: 'acme', repo: 'binview', number: 44, forms: ['short'], title: 'Fix <b>chart</b>"><img src=x>', state: 'closed' },
+    { kind: 'issue', owner: 'acme', repo: 'secret', number: 7, forms: ['long'] }];
   const html = refChips('<p>fixes #binview-44, acme/secret#7 and #other-1 <code>#binview-44</code> <a href="#">#binview-44</a></p>', refs);
   assert.equal((html.match(/class="cx-mention cx-ref/g) || []).length, 2);
   assert.ok(!html.includes('<img'));
@@ -156,4 +156,14 @@ test('refChips turns only the server-resolved references into escaped chips, out
   assert.match(html, /acme\/secret#7<\/span>/);                                    // no title or state: coordinates only
   assert.equal(refChips('<p>#binview-44</p>', []), '<p>#binview-44</p>');
   assert.equal(refChips('<p>abc#binview-44 &amp;#binview-44</p>', refs), '<p>abc#binview-44 &amp;#binview-44</p>');
+});
+
+test('a short #repo-n is a chip only when the server resolved that short form (an ambiguous one stays text)', () => {
+  // 'ambiguous #app-3 but other/app#3 is clear': only the long form resolved
+  const refs = [{ kind: 'issue', owner: 'other', repo: 'app', number: 3, forms: ['long'], title: 'B', state: 'open' }];
+  const html = refChips('<p>ambiguous #app-3 but other/app#3 is clear</p>', refs);
+  assert.equal((html.match(/class="cx-mention cx-ref/g) || []).length, 1);
+  assert.match(html, /ambiguous #app-3 but <span/);
+  assert.match(refChips('<p>#app-3</p>', [{ ...refs[0], forms: ['short', 'long'] }]), /cx-ref/);
+  assert.equal(refChips('<p>acme/app#3</p>', refs), '<p>acme/app#3</p>');            // another owner: text
 });

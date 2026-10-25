@@ -34,8 +34,8 @@ async function withPage(run) {
 const PEOPLE = [{ user_id: 'owner', handle: 'owner', online: true }];
 const MESSAGE = { event_type: 'message', sender: { type: 'user', id: 'owner' }, created_at: new Date().toISOString(),
   text: 'fixes #binview-44 and acme/secret#7, not `#binview-44` or #other-1', mentions: [],
-  refs: [{ kind: 'issue', owner: 'acme', repo: 'binview', number: 44, title: 'Fix <img src=x onerror=alert(1)>', state: 'closed' },
-    { kind: 'issue', owner: 'acme', repo: 'secret', number: 7 }] };
+  refs: [{ kind: 'issue', owner: 'acme', repo: 'binview', number: 44, forms: ['short'], title: 'Fix <img src=x onerror=alert(1)>', state: 'closed' },
+    { kind: 'issue', owner: 'acme', repo: 'secret', number: 7, forms: ['long'] }] };
 const ISSUES = [
   { kind: 'issue', owner: 'acme', repo: 'binview', number: 44, title: 'Fix the chart', state: 'open', insert: '#binview-44' },
   { kind: 'issue', owner: 'acme', repo: 'app', number: 3, title: 'A', state: 'open', insert: 'acme/app#3' },

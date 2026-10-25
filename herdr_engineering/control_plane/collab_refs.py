@@ -7,7 +7,8 @@ a code span or fence (backtick or `~~~`), a URL, a word (`abc#12`) or an HTML en
 Markdown heading (`# Title`) has a space after `#` and names nothing.
 
 The server resolves references from the stored text against the GitHub cache (clients cannot
-supply them) and keeps only coordinates: `[{kind: issue|pr, owner, repo, number}]`, at most
+supply them) and keeps only coordinates: `[{kind: issue|pr, owner, repo, number, forms}]` (`forms`: which text
+forms named it, `short` and/or `long`, so a reader chips only those), at most
 `MAX_REFS`. Title and state are read from the cache when a message is read, never stored.
 
 Per-viewer rule: a guest or an external agent sees title and state only for issues of public
@@ -52,6 +53,7 @@ def for_viewer(refs: list[dict], details: list[dict | None], restricted: bool) -
     out = []
     for ref, info in zip(refs, details, strict=True):
         view = {k: ref[k] for k in ("kind", "owner", "repo", "number")}
+        view["forms"] = [f for f in ref.get("forms", ("short", "long")) if f in ("short", "long")]
         if info is not None and not (restricted and info.get("private")):
             view.update(title=info.get("title"), state=info.get("state"))
             if isinstance(info.get("url"), str) and info["url"].startswith("https://github.com/"):

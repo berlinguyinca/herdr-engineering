@@ -1471,21 +1471,28 @@ class RefCatalog:
         return self._names.get((str(owner).lower(), str(repo).lower()))
 
     def resolve(self, wanted, limit=20):
-        """``[{kind, owner, repo, number}]`` for the ``(owner | None, repo, number)`` the text names
-        that are cached issues of in-scope owners; each once, at most ``limit``."""
-        out, seen = [], set()
+        """``[{kind, owner, repo, number, forms}]`` for the ``(owner | None, repo, number)`` the text names
+        that are cached issues of in-scope owners; each once, at most ``limit``. ``forms`` lists which
+        text forms resolved to it (``short`` = ``#repo-n``, ``long`` = ``owner/repo#n``)."""
+        out, seen = [], {}
         for owner, repo, number in wanted:
             rid = self._rid(owner, repo)
             issue = None if rid is None else self._issue(rid, number)
-            if issue is None or (rid, number) in seen:
+            if issue is None:
                 continue
-            seen.add((rid, number))
+            form = "short" if owner is None else "long"   # which text named it: a client chips only that form
+            if (rid, number) in seen:
+                forms = seen[(rid, number)]["forms"]
+                if form not in forms:
+                    forms.append(form)
+                continue
+            if len(out) >= limit:
+                continue
             owner_name, _, repo_name = self._repos[rid]["name_with_owner"].partition("/")
             url = issue.get("url") if isinstance(issue.get("url"), str) else ""
             out.append({"kind": "pr" if "/pull/" in url else "issue", "owner": owner_name, "repo": repo_name,
-                        "number": number})
-            if len(out) >= limit:
-                break
+                        "number": number, "forms": [form]})
+            seen[(rid, number)] = out[-1]
         return out
 
     def detail(self, ref):
