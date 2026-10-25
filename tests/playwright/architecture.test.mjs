@@ -180,6 +180,47 @@ test('request analysis reports queued, then deduplicated', () => withApp({}, asy
   await result.getByText(/^Already queued/).waitFor();
 }));
 
+test('cancel a queued analysis: confirm, in-flight disable, escaped refusal', () => withApp({}, async (page, base) => {
+  await page.goto(`${base}/#/architecture`);
+  await page.locator('[data-request]').waitFor();
+  await page.locator('[data-request] button[type=submit]').click();
+  const jobs = page.locator('[data-testid="arch-jobs"]');
+  const btn = jobs.locator('[data-cancel]').first();
+  await btn.waitFor();
+  const id = await btn.getAttribute('data-cancel');
+  assert.match(await jobs.innerText(), /requested/);
+  // Declining the confirm sends nothing.
+  let posts = 0;
+  page.on('request', r => { if (r.method() === 'POST' && r.url().endsWith('/cancel')) posts++; });
+  page.once('dialog', d => d.dismiss());
+  await btn.click();
+  await page.waitForTimeout(300);
+  assert.equal(posts, 0);
+  // A refusal (as a non-operator key would get) is shown as text, never markup, and the button comes back.
+  let release;
+  const held = new Promise(r => { release = r; });
+  await page.route('**/api/v1/architecture/analyses/*/cancel', async route => {
+    await held;
+    await route.fulfill({status: 403, contentType: 'application/json', body: JSON.stringify({error: '<img src=x onerror="window.__pwned=1">denied'})});
+  });
+  page.once('dialog', d => d.accept());
+  await btn.click();
+  await jobs.locator(`[data-cancel="${id}"][disabled]`).waitFor();             // in flight: disabled
+  release();
+  const err = jobs.locator('[data-cancel-error]');
+  await err.waitFor();
+  assert.equal(await err.innerText(), 'Only an operator key can cancel analyses: <img src=x onerror="window.__pwned=1">denied');
+  assert.equal(await jobs.locator('img').count(), 0);
+  assert.equal(await page.evaluate(() => window.__pwned), undefined);
+  assert.equal(await btn.isDisabled(), false);
+  // The real (open-mode, operator) server cancels it; the job leaves the open list.
+  await page.unroute('**/api/v1/architecture/analyses/*/cancel');
+  page.once('dialog', d => d.accept());
+  await btn.click();
+  await jobs.waitFor({state: 'detached'});
+  assert.equal(posts, 2);
+}));
+
 test('cross-repository lists inferred edges separately and never as verified', () => withApp({}, async (page, base) => {
   await page.goto(`${base}/#/architecture`);
   await page.locator('[data-cross]').click();
