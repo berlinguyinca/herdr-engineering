@@ -3032,7 +3032,15 @@ def _cmd_collab_file(args) -> int:
     except (OSError, ValueError, KeyError, TypeError):
         raise SystemExit("collab file: --agent-file must be the agent's JSON file (credential, device_id)") from None
     base = (args.base or agent.get("base_url") or "").rstrip("/")
-    if not base.startswith(("https://", "http://127.0.0.1", "http://localhost")):
+    try:
+        site = urllib.parse.urlsplit(base)
+        host = site.hostname
+        _ = site.port                       # a malformed port raises here
+    except ValueError:
+        site, host = None, None
+    # the credential only ever travels over https, or in plain http to this very machine
+    if (not host or site.username or site.password or site.query or site.path not in ("", "/")
+            or not (site.scheme == "https" or (site.scheme == "http" and host in ("127.0.0.1", "localhost", "::1")))):
         raise SystemExit("collab file: --base must be the https:// collaboration site")
     room = urllib.parse.quote(args.room, safe="")
     root = f"{base}/api/v1/collab/rooms/{room}/files"

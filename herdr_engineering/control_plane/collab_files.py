@@ -81,8 +81,9 @@ def clean_file_name(raw: Any) -> str:
     control characters are refused, so ``.collab/files/<name>`` can never point outside that folder."""
     if not isinstance(raw, str):
         raise _error(400, "file name must be a string")
-    if _BAD_CHARS.search(raw):
-        raise _error(400, "file name may not contain control characters")
+    from .collab_external import _INVISIBLE
+    if _BAD_CHARS.search(raw) or _INVISIBLE.search(raw):     # incl. bidi overrides: `evil\u202efdp.exe` reads as .pdf
+        raise _error(400, "file name may not contain control or invisible characters")
     segments = re.split(r"[/\\]", raw)
     if any(s.strip() == ".." for s in segments):
         raise _error(400, "file name may not contain '..'")

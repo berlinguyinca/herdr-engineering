@@ -96,7 +96,7 @@ def test_names_lose_their_directories(raw, clean):
 
 
 @pytest.mark.parametrize("raw", ["", "   ", ".", "..", "../etc/passwd", "a/../b", "x\x00y", "tab\there", "nl\nx",
-                                 "a/", "x" * 256, 7])
+                                 "a/", "x" * 256, 7, "evil\u202efdp.exe", "zero\u200bwidth.txt"])
 def test_bad_names_are_refused(w, raw):
     assert code(w.s.put_file, w.room, w.bob, raw, b"x") == 400
 
@@ -415,3 +415,14 @@ def test_agent_helper_never_writes_outside_the_files_folder(tmp_path):
     for bad in ("../x", "..", "a/../../b", "x\x00"):
         with pytest.raises(SystemExit):
             _collab_file_target(str(root), bad)
+
+
+@pytest.mark.parametrize("base", ["http://collab.example.org", "http://localhost.attacker.tld", "http://127.0.0.1.evil.example",
+                                  "https://user:pw@collab.example.org", "ftp://x", "", "https://x/path"])
+def test_agent_helper_sends_its_credential_only_over_https_or_to_this_machine(tmp_path, base):
+    from herdr_engineering import cli
+    af = tmp_path / "agent.json"
+    af.write_text(json.dumps({"credential": "c", "device_id": "d"}))
+    with pytest.raises(SystemExit) as e:
+        cli.main(["collab", "file", "list", "--agent-file", str(af), "--base", base, "--room", "r"])
+    assert "--base" in str(e.value)
