@@ -94,7 +94,8 @@ class Src(DurableSource):
 
 @pytest.mark.parametrize("entity_type", ["collab", "collab_room", "ci_observation", "ci_report", "ci_telemetry",
                                          "plannotator_review", "ci_pipeline", "agent_identity", "agent_summary",
-                                         "custom_model", "llm_key", "token_usage", "artifact", "made-up"])
+                                         "custom_model", "llm_key", "token_usage", "artifact", "made-up",
+                                         "pr_gate", "pr_gate_verdict", "review_job"])
 @pytest.mark.parametrize("schema", [1, 2])
 def test_ingest_refuses_every_entity_type_that_is_not_on_the_allow_list(entity_type, schema):
     svc = IngestService(ControlPlaneRepo())
@@ -110,7 +111,28 @@ def test_the_allow_list_is_exactly_what_the_dispatcher_handles_plus_plain_activi
     assert DISPATCHED_ENTITY_TYPES == {"lineage", "host", "session", "mission", "service", "inspector",
                                        "mission_activity"}
     assert INGEST_ENTITY_TYPES - DISPATCHED_ENTITY_TYPES == {"task", "note", "workspace", "ledger",
-                                                                        "platform", "lifecycle"}
+                                                                        "platform", "lifecycle",
+                                                                        "repository", "request", "span"}
+
+
+@pytest.mark.parametrize("entity_type", ["repository", "request", "span"])
+def test_an_ingest_key_may_still_post_the_system_graph_adapter_streams(entity_type):
+    """main's opt-in system-graph adapter dispatches these through generic ingest (they were accepted before T16)."""
+    svc = IngestService(ControlPlaneRepo(), system_graph=True)
+    out = svc.ingest({"entity_type": entity_type, "entity_id": "r-1", "event_type": "x.observed",
+                      "payload": {"request_id": "r-1"}}, KEY)
+    assert out["entity_type"] == entity_type
+    assert [e["event_type"] for e in svc.repo.stream(entity_type, "r-1")] == ["x.observed"]
+
+
+@pytest.mark.parametrize("entity_type", ["pr_gate", "pr_gate_verdict", "review_job", "Review_Job_resume"])
+def test_reserved_review_gate_prefixes_stay_refused_even_if_the_allow_list_ever_names_them(monkeypatch, entity_type):
+    import herdr_engineering.control_plane.ingest as ingest_mod
+    monkeypatch.setattr(ingest_mod, "INGEST_ENTITY_TYPES", ingest_mod.INGEST_ENTITY_TYPES | {entity_type})
+    svc = IngestService(ControlPlaneRepo())
+    with pytest.raises(ValueError, match="reserved review-gate"):
+        svc.ingest({"entity_type": entity_type, "entity_id": "pr-1", "event_type": "verdict", "payload": {}}, KEY)
+    assert svc.repo.stream(entity_type, "pr-1") == []
 
 
 def test_forged_ci_result_cannot_replace_the_server_written_observation():
@@ -242,7 +264,8 @@ def test_non_safety_writes_stop_before_safety_writes_and_the_tiers_are_ordered()
     assert bulk < ordinary < safety == 1000
     assert "message" in BULK_EVENTS and not (BULK_EVENTS & SAFETY_EVENTS)
     assert SAFETY_EVENTS == {"member_removed", "agent_revoked", "user_decided", "join_token_revoked", "xlink_revoked",
-                             "workspace_unlinked", "mission_unlinked", "agent_grant_revoked"}
+                             "workspace_unlinked", "mission_unlinked", "agent_grant_revoked",
+                             "helpers_paused", "helper_cancelled", "egress_removed"}
     svc._log.extend([{}] * (ordinary - len(svc._log)))        # exactly at the ordinary limit
     with pytest.raises(CollabError):
         svc._commit("room_created", {})

@@ -51,19 +51,26 @@ STREAM_ID = "log"
 #  * SAFETY_EVENTS (revocations an admin performs) may use the log up to 100 %.
 # Events a member or agent can fire at will without pre-paying (credential rotation, cancelling a consultation,
 # request or invite, steering rejection, a grant lapsing, presence changes) are NOT safety events.
+# helpers_paused is the operator's panic switch (only a PAUSE is a safety write: a resume uses the ordinary tier),
+# helper_cancelled ends a live helper (each one pre-paid by its helper_requested) and egress_removed takes a host off a
+# room's allowlist (each one pre-paid by the approval/promotion/profile entry that put it there). All three commit
+# nothing when repeated, so they cannot fill the log either.
 SAFETY_EVENTS = frozenset({
     "member_removed", "agent_revoked", "user_decided", "join_token_revoked",
-    "xlink_revoked", "workspace_unlinked", "mission_unlinked", "agent_grant_revoked"})
+    "xlink_revoked", "workspace_unlinked", "mission_unlinked", "agent_grant_revoked",
+    "helpers_paused", "helper_cancelled", "egress_removed"})
 BULK_EVENTS = frozenset({"message", "comment_added", "comment_revised", "audit_denied", "task_progress",
                          "steer_proposed", "consult_asked", "proposal_submitted", "external_status_changed"})
 # creation event -> kind (what is outstanding is recomputed from state, see _recount)
 REVOCABLE_CREATE = {"member_added": "member", "agent_granted": "grant", "agent_enrolled": "agent",
                     "join_token_created": "join", "xlink_created": "xlink", "workspace_linked": "workspace",
-                    "mission_linked": "mission"}
+                    "mission_linked": "mission", "helper_requested": "helper",
+                    "egress_decided": "egress", "egress_promoted": "egress", "room_profile_set": "egress"}
 # every event that can change what _recount() returns (the cache is cleared when one is committed)
 COUNT_EVENTS = frozenset(REVOCABLE_CREATE) | {
     "member_removed", "agent_grant_revoked", "agent_grant_expired", "agent_revoked", "join_token_revoked",
-    "xlink_revoked", "workspace_unlinked", "mission_unlinked"}
+    "xlink_revoked", "workspace_unlinked", "mission_unlinked",
+    "helper_started", "helper_finished", "helper_cancelled", "helper_expired", "egress_removed"}
 ORG_ID = "default"  # single-organization deployment (spec: no federation in v1)
 
 # "task" is the human right to give an agent work; the agent-side rights are "instruct"
@@ -289,8 +296,9 @@ class FileEventLog:
         # exclusively, so it can never swap the file out from under an open append descriptor.
         try:
             self._held = logfile_lock.acquire(path, exclusive=False, create=True)
-        except logfile_lock.Busy:
-            raise OSError(f"the collaboration log {path} is being repaired; retry when collab-repair has finished") from None
+        except logfile_lock.Busy as exc:
+            raise OSError(f"the collaboration log {path} is in use by another process ({exc}); "
+                          "stop it (a running server or collab-repair) and retry") from None
         self._fd = self._held.fd
         self.lock_mode = self._held.mode
 
@@ -523,6 +531,13 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin):
         out["xlink"] = sum(1 for x in self._xlinks.values() if x["state"] == "active")
         out["workspace"] = len(self._links)
         out["mission"] = len(self._missions)
+        out["helper"] = sum(1 for h in self._helpers.values() if h["status"] in _HELPER_LIVE)
+        # every (room, host) an operator Remove would still commit for: permanent hosts and approvals, also lapsed
+        # ones (over-reserving until the next recount is safe; under-reserving is not)
+        hosts = {(rid, hp) for rid, room in self._rooms.items()
+                 for hp in ((room.get("profile") or {}).get("permanent_hosts") or ())}
+        hosts |= {(r["room_id"], r["host_port"]) for r in self._egress.values() if r["state"] == "approved"}
+        out["egress"] = len(hosts)
         return out
 
     def _outstanding(self) -> int:
@@ -532,16 +547,36 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin):
             self._outstanding_key = key
         return sum(self._revocable.values())
 
-    def _log_limit(self, event_type: str) -> int:
+    @staticmethod
+    def _is_safety(event_type: str, payload: dict | None = None) -> bool:
+        if event_type == "helpers_paused" and payload is not None:
+            return payload.get("paused") is True          # resuming helpers is an ordinary write
+        return event_type in SAFETY_EVENTS
+
+    def _creation_cost(self, event_type: str, payload: dict | None) -> int:
+        """How many future revocations ``event_type`` creates (each one is pre-paid on admission)."""
+        if event_type not in REVOCABLE_CREATE:
+            return 0
+        if payload is None:
+            return 1
+        if event_type == "egress_decided":
+            return 1 if payload.get("state") == "approved" else 0
+        if event_type == "room_profile_set":
+            room = self._rooms.get(payload.get("room_id")) or {}
+            have = set((room.get("profile") or {}).get("permanent_hosts") or ())
+            return len(set((payload.get("profile") or {}).get("permanent_hosts") or ()) - have)
+        return 1
+
+    def _log_limit(self, event_type: str, payload: dict | None = None) -> int:
         """The log length below which ``event_type`` is still admitted (see SAFETY_EVENTS for the design)."""
         cap = self.max_log_events
-        if event_type in SAFETY_EVENTS:
+        if self._is_safety(event_type, payload):
             return cap
         if event_type in BULK_EVENTS or event_type.startswith("attn_"):
             base = cap - max(2, cap // 10)
         else:
             base = cap - max(1, cap // 20)
-        paid = self._outstanding() + (1 if event_type in REVOCABLE_CREATE else 0)
+        paid = self._outstanding() + self._creation_cost(event_type, payload)
         return max(0, base - paid)
 
     def _commit(self, event_type: str, payload: dict) -> dict:
@@ -549,9 +584,9 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin):
         with self._lock:
             if self.degraded:
                 raise CollabError(503, "collaboration is disabled; ask the operator")
-            if len(self._log) >= self._log_limit(event_type):
+            if len(self._log) >= self._log_limit(event_type, payload):
                 self.stats["log_full"] += 1
-                if event_type not in SAFETY_EVENTS:
+                if not self._is_safety(event_type, payload):
                     self.stats["log_headroom_refused"] += 1
                 raise CollabError(503, "collaboration log is full; ask the operator")
             now = self._iso()
@@ -570,7 +605,7 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin):
                     raise CollabError(503, "collaboration log unavailable") from exc
             self._seq += 1
             self._log.append(ev)
-            if event_type in COUNT_EVENTS:
+            if event_type in COUNT_EVENTS or event_type in REVOCABLE_CREATE:
                 self._outstanding_key = None
             self._apply(ev)
             self._touch_rooms(payload, ev["sequence"], event_type)
@@ -2062,6 +2097,10 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin):
         ids for the agent itself (an operator key excepted), so nobody can pre-empt or forge its nodes."""
         aid = ext.namespace_of(node_id)
         a = self._agents.get(aid) if aid else None
+        if self.degraded and aid and ids.is_valid_id(aid, "agent") and a is None:
+            # the replay stopped at a gap, so an external agent enrolled after it is unknown here: fail closed
+            # (an agent id this partial state does know keeps its recorded kind; that never changes)
+            return True
         return bool(a and a.get("external"))
 
     def _usage_take(self, items: list[tuple]) -> None:
@@ -2723,6 +2762,11 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin):
         self._require_operator(pr)
         hp = self._promote_target(room_id, host_port)
         with self._lock:
+            listed = hp in self._profile(room_id)["permanent_hosts"] or any(
+                r["room_id"] == room_id and r["host_port"] == hp and r["state"] == "approved"
+                for r in self._egress.values())
+            if not listed:                     # a safety write commits only when it removes something
+                return {"allowlist": self.egress_allowlist(room_id)}
             self._commit("egress_removed", self._actor(
                 pr, room_id=room_id, host_port=hp, removed_epoch=self._now(), action="egress.remove",
                 outcome="allowed", project_ids=[self._rooms[room_id]["project_id"]], resource_id=room_id))
@@ -2975,11 +3019,16 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin):
 
     def _end_helper(self, actor: dict, r: dict, reason: str, seen: set) -> None:
         if r["status"] in _HELPER_LIVE:
-            self._commit("helper_cancelled", {
-                **actor, "room_id": r["room_id"], "project_id": r["project_id"], "helper_id": r["helper_id"],
-                "role": r["role"], "model": r["model"], "status": "cancelled", "reason": reason,
-                "finished_epoch": self._now(), "action": "helper.cancel", "outcome": "allowed",
-                "project_ids": [r["project_id"]], "resource_id": r["helper_id"]})
+            try:
+                self._commit("helper_cancelled", {
+                    **actor, "room_id": r["room_id"], "project_id": r["project_id"], "helper_id": r["helper_id"],
+                    "role": r["role"], "model": r["model"], "status": "cancelled", "reason": reason,
+                    "finished_epoch": self._now(), "action": "helper.cancel", "outcome": "allowed",
+                    "project_ids": [r["project_id"]], "resource_id": r["helper_id"]})
+            except CollabError as exc:
+                if exc.status != 503 or not r["helper_agent_id"]:
+                    raise
+                # the bookkeeping row did not fit: the revocation below (a safety event) is what stops the helper
         if r["helper_agent_id"]:
             self._end_agent(actor, r["helper_agent_id"], reason, seen)
 
@@ -3226,9 +3275,10 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin):
         if not isinstance(paused, bool):
             raise CollabError(400, "paused must be true or false")
         with self._lock:
-            self._commit("helpers_paused", self._actor(
-                pr, paused=paused, action="helpers.pause" if paused else "helpers.resume", outcome="allowed",
-                project_ids=[], resource_id=None))
+            if paused != self._helpers_paused:      # a repeated press commits nothing (it still ends live helpers)
+                self._commit("helpers_paused", self._actor(
+                    pr, paused=paused, action="helpers.pause" if paused else "helpers.resume", outcome="allowed",
+                    project_ids=[], resource_id=None))
             if paused:
                 seen: set = set()
                 for r in [r for r in self._helpers.values() if r["status"] in _HELPER_LIVE]:
@@ -4172,7 +4222,9 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin):
 
     def _housekeeping(self) -> None:
         """Prune, and write down grants that lapsed (they were already refused; this keeps the
-        roster and audit honest). Rate-limited: callers are hot paths."""
+        roster and audit honest). Rate-limited: callers are hot paths. Nothing while degraded (partial state)."""
+        if self.degraded:
+            return
         now = self._now()
         if now - self._housekept < 30.0:
             return

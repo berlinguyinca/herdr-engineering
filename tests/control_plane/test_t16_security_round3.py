@@ -366,7 +366,7 @@ def test_a_server_cannot_start_writing_while_the_repair_holds_the_log(tmp_path):
     fd = os.open(str(path), os.O_RDONLY)
     fcntl.flock(fd, fcntl.LOCK_EX)                              # what repair_file holds while it rewrites
     try:
-        with pytest.raises(OSError, match="being repaired"):
+        with pytest.raises(OSError, match="in use by another process"):
             FileEventLog(str(path))
     finally:
         os.close(fd)

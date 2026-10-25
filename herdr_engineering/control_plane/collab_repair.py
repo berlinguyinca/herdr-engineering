@@ -9,12 +9,16 @@ operator command moves them to a quarantine file/table that keeps every column.
 from __future__ import annotations
 
 import json
+import logging
 import os
+import stat
 import time
 from datetime import UTC, datetime
 from typing import Any
 
 from . import logfile_lock
+
+log = logging.getLogger(__name__)
 
 REQUIRED_PAYLOAD = ("org_id", "correlation_id", "created_at")
 
@@ -139,6 +143,28 @@ def _report(rows: list[dict], apply: bool, cut_tail: bool) -> tuple[dict, list[t
     return report, bad
 
 
+def _chown_like(path: str, orig: os.stat_result) -> None:
+    """Give ``path`` the original log's owner and group. Only root can change them; anyone else already owns what
+    they create, so a refusal there changes nothing."""
+    if (os.stat(path).st_uid, os.stat(path).st_gid) == (orig.st_uid, orig.st_gid):
+        return
+    try:
+        os.chown(path, orig.st_uid, orig.st_gid)
+    except PermissionError:
+        log.warning("could not give %s the owner of the original log (uid %s)", path, orig.st_uid)
+
+
+def _own_pids() -> set[int]:
+    """This process as /proc names it. In a container whose /proc is the host's (or another pid namespace's), our
+    own descriptor shows under a pid that is not ``os.getpid()``; /proc/self always resolves to the right one."""
+    me = {os.getpid()}
+    try:
+        me.add(int(os.readlink("/proc/self")))
+    except (OSError, ValueError):
+        pass
+    return me
+
+
 def _holders(path: str) -> list[int]:
     """Other processes that have ``path`` open (Linux /proc). Best effort: a server that predates the advisory lock
     is found here; an unreadable /proc entry is skipped."""
@@ -146,13 +172,13 @@ def _holders(path: str) -> list[int]:
         st = os.stat(path)
     except OSError:
         return []
-    me, found = os.getpid(), []
+    me, found = _own_pids(), []
     try:
         pids = [int(x) for x in os.listdir("/proc") if x.isdigit()]
     except OSError:
         return []
     for pid in pids:
-        if pid == me:
+        if pid in me:
             continue
         fddir = f"/proc/{pid}/fd"
         try:
@@ -189,8 +215,8 @@ def repair_file(path: str, *, apply: bool = False, confirmed: bool = False, cut_
         raise PermissionError("--apply needs --confirm-quarantine")
     try:
         held = logfile_lock.acquire(path, exclusive=True)
-    except logfile_lock.Busy:
-        raise LogInUseError(f"refusing to rewrite {path}: a running collaboration server holds it; stop the "
+    except logfile_lock.Busy as exc:
+        raise LogInUseError(f"refusing to rewrite {path}: a running collaboration server holds it ({exc}); stop the "
                             "server first, then repair, then start it again") from None
     except OSError as exc:
         raise LogInUseError(f"refusing to rewrite {path}: cannot lock it ({exc}); stop the server and fix the "
@@ -217,12 +243,15 @@ def repair_file(path: str, *, apply: bool = False, confirmed: bool = False, cut_
                 fh.write((json.dumps({"quarantine_reason": why, "quarantined_at": stamp, "row": r}) + "\n").encode())
             fh.flush()
             os.fsync(fh.fileno())
+        orig = os.stat(path)                    # run as root, the rewritten log must still be the server's to write
         os.chmod(quarantine, 0o600)
+        _chown_like(quarantine, orig)
         with open(path, "rb") as src, open(backup, "xb") as dst:     # a full copy of the original stays
             dst.write(src.read())
             dst.flush()
             os.fsync(dst.fileno())
         os.chmod(backup, 0o600)
+        _chown_like(backup, orig)
         tmp = f"{path}.tmp-{stamp}"
         with open(tmp, "xb") as fh:
             for r in rows:
@@ -230,7 +259,8 @@ def repair_file(path: str, *, apply: bool = False, confirmed: bool = False, cut_
                     fh.write((json.dumps(r, separators=(",", ":")) + "\n").encode())
             fh.flush()
             os.fsync(fh.fileno())
-        os.chmod(tmp, 0o600)
+        os.chmod(tmp, stat.S_IMODE(orig.st_mode))
+        _chown_like(tmp, orig)
         os.replace(tmp, path)       # safe: the exclusive lock + no other opener prove nothing writes the old file
         report.update(quarantine_file=quarantine, backup=backup)
         return report

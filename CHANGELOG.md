@@ -27,6 +27,13 @@ YYYY-MM-DD. The format follows Keep a Changelog.
   server), refuses to rewrite a log a live server holds, reports a gap tail it cannot fix by default, and also quarantines rows whose
   timestamps disagree; unauthenticated callers cannot see that collaboration is degraded; a shared-mission event written from another room is shown
   to the reader after their join.
+- Round 5 (after merging main): main's panic switch, helper cancel and host Remove work on a nearly full log (`helpers_paused`, `helper_cancelled`,
+  `egress_removed` are safety events; helper requests, host approvals/promotions and owner-listed hosts pre-pay their revocation); a degraded start
+  writes nothing into the fabric graph and keeps unknown agent namespaces reserved; ingest still accepts the system-graph adapter's
+  `repository`/`request`/`span` and refuses the review-gate prefixes; the `.lock` fallback records `host pid` (another host's lock is live, our own
+  pid is stale, so a container restarting as PID 1 starts; caveat: a recreated container gets a new hostname, so its predecessor's lock must be
+  removed by hand); `collab-repair` keeps the log's owner and mode. The since_join id map is capped at 1,000,000 ids (oldest evicted first, an
+  evicted id is pre-join: fail closed), see docs/contracts/lineage-events.md.
 - No migration, no environment variable. Rollback: revert the PR.
 
 ### T16 end-to-end acceptance harness

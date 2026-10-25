@@ -907,11 +907,22 @@ Fixes for the T16 security audit. Each has a regression test in `tests/control_p
 * **A revocation is a state change, not a button (H2).** Every safety-event emitter checks that there is something left to revoke:
   `revoke_agent`, `external_leave`, `revoke_external`, the join-token revokes, `remove_member`, `remove_agent_from_room`, unlinking and
   `user_decided` answer idempotently (or 404/409) without committing a second event, so a safety event cannot be repeated to fill the log.
+* **Helpers and host access are covered too (round 5).** `helpers_paused` (a PAUSE; resuming is an ordinary write), `helper_cancelled` and
+  `egress_removed` are safety events; `helper_requested`, an approved `egress_decided`, `egress_promoted` and every new permanent host in
+  `room_profile_set` pre-pay their revocation (live helpers and distinct (room, host) entries are counted from state). A repeated pause or a
+  Remove of a host that is not listed commits nothing. If a helper's `helper_cancelled` row is refused, its agent is still revoked.
+* **Degraded means no side effects.** When the durable collab log fails its replay, the partial state (events before the gap) never drives a
+  write: the link flush/sweep, link (un)publishing and housekeeping do nothing, and any well-formed agent id the partial state does not know is
+  treated as an external agent's reserved namespace (an external agent enrolled after the gap stays protected).
 * **`since_join` applies to every read (M2, L2).** Node, edge, neighbourhood and listing reads and the insights snapshot hide the event id,
   admission time and removal reason of any event admitted before the reader joined. The horizon of an event is the reader's join time in the room
   that SCOPES that event (never the room the caller names in `room_id`); an event with no room, or written from a room the reader has no join time for (a mission shared with the reader's room), uses the reader's
   latest join; no join time at all, an unknown or evicted event id, or an id shared with an earlier event is pre-join (fail closed). An
   edge removed before the reader joined is dropped altogether (`include_removed` shows no endpoints or writer; the edge read answers 404).
+  **Memory cap.** The admission time per event id is kept in memory for the life of the process, at most `FIRST_TS_MAX` = 1,000,000 ids
+  (graph.py; roughly 150-250 MB at the cap). Past it the OLDEST ids are evicted first, and an evicted id is pre-join for every since_join reader:
+  the degradation is fail closed (old events lose their id, admission time and removal reason, and an old removed edge disappears, even for a
+  member who joined before them), never a leak of pre-join history. A restart rebuilds the map from the replayed ledger, under the same cap.
 * **Switches are uniform (M3, M15).** `steering`, `contextual`, `insights`, `delegation_enabled` and `replay_history` are all read per request through
   `FleetConfigStore.secure_section`, also under `web --collab-only`. A missing, unparseable, group/other-accessible or invalid file means the feature
   is OFF (`replay_history`: the stricter `since_join`). `config_failure_mode: last_good` is the one opt-in to the last good value. An explicit

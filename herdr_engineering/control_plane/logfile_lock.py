@@ -4,8 +4,10 @@
 A server holds the log SHARED for its life; the repair needs it EXCLUSIVE, so a repair can never swap the file under
 an open append descriptor. Both open the file read-write (NFS lock emulation needs a write-open for an exclusive lock
 and a read-open for a shared one), and re-check after locking that the path still names the file they locked.
-Where ``flock`` is unsupported (some NFS/FUSE mounts: ENOLCK, ENOSYS, EOPNOTSUPP) a cooperative ``<log>.lock`` pid
-file takes over, with a loud log line. ``acquire`` never raises for "unsupported": it returns a ``Held`` whose
+Where ``flock`` is unsupported (some NFS/FUSE mounts: ENOLCK, ENOSYS, EOPNOTSUPP) a cooperative ``<log>.lock`` file
+naming ``<host> <pid>`` takes over, with a loud log line. A lock written on another host is always treated as live (its
+pid cannot be checked from here); one naming this host and this very pid is stale (a containerised server restarts as
+PID 1 every time and must start); a legacy pid-only file is read as this host. ``acquire`` never raises for "unsupported": it returns a ``Held`` whose
 ``mode`` says what protection exists, so a server still starts and the repair can decide to refuse.
 """
 from __future__ import annotations
@@ -14,6 +16,7 @@ import errno
 import fcntl
 import logging
 import os
+import socket
 
 log = logging.getLogger(__name__)
 _flock = fcntl.flock                      # test seam
@@ -53,17 +56,34 @@ def _alive(pid: int) -> bool:
     return True
 
 
+def _read_owner(lock: str) -> tuple[str | None, int]:
+    """(host, pid) from a lock file; host None = a legacy pid-only file (written on this host)."""
+    try:
+        parts = open(lock).read().split()
+    except OSError:
+        return None, 0
+    try:
+        if len(parts) == 1:
+            return None, int(parts[0])
+        if len(parts) == 2:
+            return parts[0], int(parts[1])
+    except ValueError:
+        pass
+    return None, 0
+
+
 def _take_lockfile(path: str) -> str | None:
     lock = path + ".lock"
+    me = socket.gethostname()
     for _ in range(2):
         try:
             fd = os.open(lock, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         except FileExistsError:
-            try:
-                pid = int(open(lock).read().strip() or 0)
-            except (OSError, ValueError):
-                pid = 0
-            if pid and _alive(pid):
+            host, pid = _read_owner(lock)
+            if host is not None and host != me:
+                raise Busy(f"{lock} is held by process {pid} on host {host}; if that host is gone, remove the "
+                           "file by hand") from None
+            if pid and pid != os.getpid() and _alive(pid):
                 raise Busy(f"{lock} is held by running process {pid}") from None
             try:
                 os.unlink(lock)             # stale
@@ -73,7 +93,7 @@ def _take_lockfile(path: str) -> str | None:
         except OSError:
             return None
         with os.fdopen(fd, "w") as fh:
-            fh.write(str(os.getpid()))
+            fh.write(f"{me} {os.getpid()}")
         return lock
     return None
 

@@ -165,16 +165,16 @@ class IngestService:
         if not re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", source):
             raise ValueError("invalid source")
 
+        # The review gate's streams decide merges; a forged verdict/resume/pin would merge unreviewed code.
+        # Checked first, and as well as the allow-list so a future allow-list entry can never open a reserved prefix.
+        if entity_type.strip().lower().startswith(RESERVED_ENTITY_PREFIXES):
+            raise ValueError("reserved review-gate entity type is not accepted by generic ingestion")
         # T16 H1/M1/M5: an ALLOW-LIST. Everything else (collab, ci_*, plannotator_review, agent_identity,
         # token_usage, ...) is owned by a dedicated, authenticated adapter and can never be written here.
         if entity_type not in INGEST_ENTITY_TYPES:
             raise ValueError("entity type is not accepted by generic ingestion")
         if event_type in SERVER_OWNED_EVENT_TYPES.get(entity_type, ()):
             raise ValueError("event type is reserved for the server")
-        # The review gate's streams decide merges; a forged verdict/resume/pin would merge unreviewed code.
-        # Checked as well as the allow-list so a future allow-list entry can never open a reserved prefix.
-        if entity_type.strip().lower().startswith(RESERVED_ENTITY_PREFIXES):
-            raise ValueError("reserved review-gate entity type is not accepted by generic ingestion")
         env = normalize_envelope(body, principal, self.repo._stamp())
         if env is None and entity_type == "lineage":
             raise ValueError("lineage events require schema_version 2")
