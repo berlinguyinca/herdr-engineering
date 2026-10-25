@@ -57,7 +57,7 @@ entry-point list implies. Forbidden targets (InferWeave/inferweave-dashboard, In
 | 27 | Analytics / ETA | NEW | none. | accepted work per token, handoff latency, … from real events only. (T15) |
 | 28 | Security (intersection of grants, delegation bounds, redaction) | EXTEND | HCN `_effective`; room access ≠ terminal access exists conceptually. | Delegation TTL/budget/hops/cycle detection; traversal/replay/search authz. (T16) |
 | 29 | CI | NEW (infra) | Pi: no CI config. Herdr: only PR/issue templates; CI external (Woodpecker, see docs/ci-and-reviews.md). | Follow each repo's actual gate; document in PRs. |
-| 30 | Federation | NEW (ADR only) | n/a | T17 ADR, no implementation. |
+| 30 | Federation | NEW (ADR only) | n/a | T17 ADR, no implementation: `docs/adr/ADR-0008-independent-server-federation.md` (Proposed, awaiting approval). |
 
 ## Consolidation decisions (no competing services)
 - Single orchestrator: Pi. Single event store: Herdr `fabric_events`. Single collaboration service: HCN `CollabService`. Single dashboard: Herdr native web.

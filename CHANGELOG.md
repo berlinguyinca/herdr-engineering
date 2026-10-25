@@ -5,6 +5,9 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### T17 Independent-server federation ADR (docs only)
+- `docs/adr/ADR-0008-independent-server-federation.md`, status Proposed, awaiting approval: options, trust model, data flow, failure modes, migration, non-goals and ten owner decisions. No code, configuration, endpoint or migration; nothing is implemented until the ADR is approved. Rollback: revert the PR.
+
 ### T16 Herdr-side gaps from the Pi and AutoSpec wiring
 - Steering: an ingest key can read the CURRENT fence and gate digest at apply time: `GET /api/v1/steering/targets/{node_id}` (owner of the node, live
   request, room-scoped nodes included) and `fence`/`digest`/`digests` on `GET /api/v1/graph/nodes/{id}` for nodes the key may read. A `fork` may carry
