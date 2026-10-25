@@ -1353,3 +1353,48 @@ def test_a_restart_with_yaml_enabled_projects_serves_them_and_never_says_sync_is
     monkeypatch.setattr(github, "_configured_projects", lambda: None)
     empty = monitor_for(FakeProjects(), {})
     assert empty.projects(start=False)["projects_sync"]["status"] == "disabled"
+
+
+def test_projects_have_a_progress_floor_and_a_cut_short_read_resumes_at_its_cursor():
+    fake, p1, p2, p3 = projects_seeded()  # p1 has 3 items: two pages at page_size 2
+    monitor = monitor_for(fake, {}, projects=ON, point_budget=1)
+    budget_spent_by_listings = []
+
+    def items_this_pass():
+        fake.log.clear()
+        monitor._retry_at = 0
+        monitor.refresh()
+        budget_spent_by_listings.append(monitor._spent)
+        return [(entry[1], entry[2]) for entry in item_calls(fake)]
+    # pass 1: the repository and project listings spend the budget (listings count); nothing is deferred yet
+    assert items_this_pass() == []
+    assert budget_spent_by_listings[-1] >= 1 + 3, "one repository listing and three owner listings were charged"
+    assert monitor.projects(start=False)["projects_sync"]["deferred"] == 3
+    # pass 2: the longest-deferred project still makes one page (the floor), then stops at its cursor
+    first = items_this_pass()
+    assert len(first) == 1 and first[0][1] is None
+    floor = first[0][0]
+    # pass 3: it resumes at its cursor instead of starting again from page 1
+    second = items_this_pass()
+    assert second[0][0] == floor and second[0][1] is not None
+    assert len(monitor.project_items(floor, start=False)["items"]) == len(fake._project(floor)["items"])
+    # every changed project gets there, one floor read per pass
+    for _ in range(6):
+        items_this_pass()
+    assert monitor.projects(start=False)["projects_sync"]["deferred"] == 0
+    assert {len(monitor.project_items(p, start=False)["items"]) for p in (p1, p2, p3)} == {3, 1}
+
+
+def test_a_resumed_project_that_changed_meanwhile_is_read_again_from_page_one():
+    fake, p1, *_ = projects_seeded()
+    monitor = monitor_for(fake, {}, projects=ON, point_budget=1)
+    for _ in range(2):  # pass 1 defers everything; pass 2 reads one page of the floor project
+        monitor._retry_at = 0
+        monitor.refresh()
+    floor = next(pid for pid, state in monitor._project_resume.items())
+    fake.add_item(floor)  # the project changed: its probe moved
+    fake.log.clear()
+    monitor._retry_at = 0
+    monitor.refresh()
+    calls = [(entry[1], entry[2]) for entry in item_calls(fake)]
+    assert calls and calls[0] == (floor, None), "a changed project restarts at page 1"

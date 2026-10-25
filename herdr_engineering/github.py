@@ -527,6 +527,9 @@ class GitHubMonitor:
         last full read times, and whether project writes failed (memory ahead of the store)."""
         self._projects, self._project_items, self._project_marks = {}, {}, {}
         self._project_watermarks, self._project_full_at = {}, {}
+        # project -> when its item read was first deferred (the longest-waiting one is the pass's
+        # progress floor), and an item read cut short: {probe, cursor, items} to resume from
+        self._project_deferred, self._project_resume = {}, {}
         self._projects_unsaved = False
 
     def _touch(self):
@@ -977,8 +980,7 @@ class GitHubMonitor:
                         table.pop(rid, None)
                 gone = [pid for pid, row in self._projects.items() if row.get("owner") not in allow]
                 for pid in gone:
-                    for table in (self._projects, self._project_items, self._project_marks,
-                                  self._project_watermarks, self._project_full_at):
+                    for table in self._project_tables():
                         table.pop(pid, None)
                 if dropped or gone:
                     self._touch()  # no 304 may still describe the dropped owner's rows
@@ -1153,6 +1155,10 @@ class GitHubMonitor:
             owners.add(account.lower())
         return sorted(owners)
 
+    def _project_tables(self):
+        return (self._projects, self._project_items, self._project_marks, self._project_watermarks,
+                self._project_full_at, self._project_deferred, self._project_resume)
+
     def _projects_update(self, **fields):
         with self._lock:
             self._check_generation()
@@ -1239,8 +1245,7 @@ class GitHubMonitor:
                 self._check_generation()
                 gone = [pid for pid, row in self._projects.items() if row["owner"] == owner and pid not in listed]
                 for pid in gone:
-                    for table in (self._projects, self._project_items, self._project_marks,
-                                  self._project_watermarks, self._project_full_at):
+                    for table in self._project_tables():
                         table.pop(pid, None)
                 for row in rows:
                     previous = self._projects.get(row["project_id"], {})
@@ -1251,7 +1256,15 @@ class GitHubMonitor:
             self._write_projects(store, lambda target, rows=stored_rows, owner=owner:
                                  target.replace_projects(rows, {owner}))
         now = self._now()
-        for pid, row in sorted(listed.items(), key=lambda pair: pair[1]["updated_at"] or "", reverse=True):
+        # progress floor: the longest-deferred project may make one item page even when the
+        # listings spent the budget, so a pass with a small budget still advances a project
+        with self._lock:
+            waiting = sorted((at, pid) for pid, at in self._project_deferred.items() if pid in listed)
+        floor = waiting[0][1] if waiting else None
+        order = [pair for pair in listed.items() if pair[0] == floor] + sorted(
+            (pair for pair in listed.items() if pair[0] != floor),
+            key=lambda pair: pair[1]["updated_at"] or "", reverse=True)
+        for pid, row in order:
             if self._stop.is_set() or limit_hit is not None:
                 break
             probe = {"updated_at": row["updated_at"], "item_count": row["item_count"]}
@@ -1262,13 +1275,19 @@ class GitHubMonitor:
                 with self._lock:
                     self._projects[pid].update(complete=True, error=None)
                 continue
-            if self._spent >= self._budget:
+            if self._spent >= self._budget and pid != floor:
                 deferred.append(pid)
+                with self._lock:
+                    self._project_deferred.setdefault(pid, now)
                 continue
             try:
-                self._read_project(provider, store, row, probe, settings["item_limit"])
+                self._read_project(provider, store, row, probe, settings["item_limit"], floor=pid == floor)
+                with self._lock:
+                    self._project_deferred.pop(pid, None)
             except _OverBudget:
                 deferred.append(pid)
+                with self._lock:
+                    self._project_deferred.setdefault(pid, now)
             except GitHubError as exc:
                 if exc.reason == "authentication":
                     raise
@@ -1311,15 +1330,28 @@ class GitHubMonitor:
                 raise GitHubError("invalid_response")
             cursors.add(cursor)
 
-    def _read_project(self, provider, store, row, probe, item_limit):
+    def _read_project(self, provider, store, row, probe, item_limit, *, floor=False):
         """Read one project's items in full (they cannot be ordered by update time) and
         reconcile: items missing from a complete read are removed. A read cut short (budget,
-        item limit, error) changes nothing: the old items stay and the probe is not advanced."""
+        item limit, error) changes nothing shown: the old items stay and the probe is not advanced.
+        A read the budget cut short resumes at its cursor next pass while the project's probe is
+        unchanged (a changed project starts again at page 1, since positions may have moved).
+        ``floor``: the pass's progress floor, which may read one page over the budget."""
         pid = row["project_id"]
-        items, cursor, cursors = {}, None, set()
+        with self._lock:
+            resume = self._project_resume.pop(pid, None)
+        if resume is not None and resume["probe"] == probe:
+            items, cursor = dict(resume["items"]), resume["cursor"]
+        else:
+            items, cursor = {}, None
+        cursors, pages = set(), 0
         while True:
-            if cursor is not None and self._spent >= self._budget:
+            if self._spent >= self._budget and not (floor and pages == 0):
+                if cursor is not None:
+                    with self._lock:
+                        self._project_resume[pid] = {"probe": probe, "cursor": cursor, "items": items}
                 raise _OverBudget()
+            pages += 1
             connection = provider.project_items_page(pid, cursor)
             self._charge(provider)
             for node in connection["nodes"]:
