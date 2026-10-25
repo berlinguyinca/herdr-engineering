@@ -1277,7 +1277,7 @@ test('failed CI run sends debugging context only to an explicitly chosen active 
     await page.getByText('Delivery unconfirmed; retry checks the same operation.',{exact:true}).waitFor();
     assert.equal(posts.length,1);
     await page.getByRole('button',{name:'Send to Pi',exact:true}).click();
-    await page.getByText('Debugging context delivered to the selected Pi agent.',{exact:true}).waitFor();
+    await page.getByText('The debugging context was delivered to the selected Pi agent.',{exact:true}).waitFor();
     assert.equal(posts.length,2);assert.equal(posts[1].operation_id,posts[0].operation_id);assert.equal(posts[0].session_id,'chosen');assert.equal(posts[0].repository,'7');
     assert.equal(posts[0].number,42);assert.match(posts[0].operation_id,/^[0-9a-f-]{36}$/);
     assert.match(await page.locator('.ig-inspector').innerText(),/Run #42/);
