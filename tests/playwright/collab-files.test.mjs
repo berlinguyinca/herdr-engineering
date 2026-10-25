@@ -67,7 +67,7 @@ test('the shelf lists files and versions and patches rows in place', async () =>
 }));
 
 const PEOPLE = [{ user_id: 'owner', handle: 'owner', online: true }];
-async function openRoom(page) {
+async function openRoom(page, agents = []) {
   const posts = [];
   let files = [];
   let stateCount = 0;
@@ -92,7 +92,7 @@ async function openRoom(page) {
     else if (where === '/rooms/room-one') body = { room_id: 'room-one', name: 'Review', role: 'owner', members: [] };
     else if (where === '/rooms/room-one/state') {
       stateCount++;
-      body = { changed: stateCount === 1, seq: files.length + 1, next_cursor: 0, agents: [], people: PEOPLE, tasks: [], events: [], files };
+      body = { changed: stateCount === 1, seq: files.length + 1, next_cursor: 0, agents, people: PEOPLE, tasks: [], events: [], files };
       if (stateCount > 1) await new Promise((r) => setTimeout(r, 150));
     }
     await route.fulfill({ json: body });
@@ -135,5 +135,21 @@ test('a composer attachment uploads, then the message carries only its id; a lit
   const msg = posts.find((p) => p.path === '/rooms/room-one/messages');
   assert.equal(msg.body.text, 'see @file data');
   assert.deepEqual(msg.body.files, ['f1']);
+  await page.evaluate(() => window.collab.dispose());
+}));
+
+test('a task with an attachment is refused before anything is uploaded', async () => withPage(async (page) => {
+  const pi = { agent_id: 'pi-id', name: 'lead', address: 'owner.pi', aliases: [], harness_type: 'pi', owner_user_id: 'owner', actions: ['read', 'post', 'execute'], skills: [] };
+  const { posts } = await openRoom(page, [pi]);
+  const input = page.getByRole('combobox', { name: 'Message' });
+  await page.locator('#hcn-composer input[type=file]').setInputFiles({ name: 'plan.md', mimeType: 'text/markdown', buffer: Buffer.from('# plan') });
+  await page.locator('.conversation-attachment').filter({ hasText: 'Ready' }).waitFor();
+  assert.deepEqual(posts, []);                                   // attaching uploads nothing yet
+  await input.fill('@owner.pi do this');
+  await input.press('Escape');
+  await input.press('Enter');
+  await page.locator('.conversation-status').filter({ hasText: 'A task carries text only' }).waitFor();
+  assert.deepEqual(posts, []);                                   // refused: no upload, no task
+  assert.equal(await input.inputValue(), '@owner.pi do this');
   await page.evaluate(() => window.collab.dispose());
 }));

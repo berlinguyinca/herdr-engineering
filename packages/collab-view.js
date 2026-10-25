@@ -1386,8 +1386,9 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
     });
     if ($('hcn-composer')) {
       composer = mountComposer($('hcn-composer'), {
-        // an attachment is uploaded to the room shelf first; the message then names it by id
-        upload: async (file) => { const f = await api.uploadFile(roomId, file); kick(); return f; },
+        // an attachment is held locally and uploaded to the shelf only once the send is accepted (a message,
+        // never a task), so a refused send leaves nothing behind; the message then names the files by id
+        upload: async (file) => ({ pending: file, name: file.name }),
         draftKey: `collab:${me.user_id}:${roomId}`,
         placeholder: 'Message the room… @ people, agents and files · / commands',
         hint: 'Enter sends · Shift+Enter adds a line · @gert.pi … gives that agent a task',
@@ -1411,7 +1412,17 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
           if (mention && files.length) throw new Error('A task carries text only: send the files in a message, or name their .collab/files/ path in the task.');
           if (mention) { // the room's authenticated leading-agent task contract, now with the verbatim text
             await api.createTask(roomId, target.agent_id, text);
-          } else { await api.say(roomId, text, CTX.attach ? contextBody(CTX.attach) : undefined, files.map((f) => f.id)); CTX.attach = null; drawAttach(); }
+          } else {
+            const uploaded = [];
+            try {
+              for (const f of files) uploaded.push(f.pending ? await api.uploadFile(roomId, f.pending) : f);
+              await api.say(roomId, text, CTX.attach ? contextBody(CTX.attach) : undefined, uploaded.map((f) => f.id));
+            } catch (e) {     // nothing half-sent: files uploaded for a message that failed are removed again
+              await Promise.allSettled(uploaded.filter((f, i) => files[i].pending).map((f) => api.deleteFile(roomId, f.id)));
+              throw e;
+            }
+            CTX.attach = null; drawAttach();
+          }
           if (alive) { kick(); log.scrollTop = log.scrollHeight; }
           return { status: 'delivered', message: mention ? 'Task created' : 'Message posted' };
         },
