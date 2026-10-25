@@ -343,10 +343,10 @@ test('Reviews: identical refresh writes nothing; one changed review rewrites onl
 // ---------------------------------------------------------------- Collaboration room
 // The real collab-view.js over a mocked collab API whose room state always reports "changed", so
 // every long-poll round re-applies the same data (as a live event's re-ask does).
-test('Collab: repeated identical room state writes nothing; one changed task rewrites only its row; refresh re-asks the room',async()=>withPage(async(page,base)=>{
+test('Collab: repeated identical room state writes nothing; one changed task rewrites only its row',async()=>withPage(async(page,base)=>{
  const T='2026-10-23T10:00:00+00:00';
  const task=(id,status)=>({task_id:id,target_agent_id:'agent_1',target_name:'coder',text:`Task ${id}`,status,created_at:T});
- const m={tasks:[task('t1','pending'),task('t2','pending')],reads:0,hang:null};
+ const m={tasks:[task('t1','pending'),task('t2','pending')],reads:0,hang:null,fail:0};
  await page.route('**/api/v1/collab/**',async route=>{
   const url=new URL(route.request().url());const path=url.pathname.replace('/api/v1/collab','');
   let body={};
@@ -357,6 +357,7 @@ test('Collab: repeated identical room state writes nothing; one changed task rew
   else if(path==='/rooms/room-one/state'){
    m.reads++;await new Promise(r=>setTimeout(r,100));
    if(m.hang)await m.hang;
+   if(m.fail>0){m.fail--;return route.fulfill({status:503,json:{detail:'busy'}});}
    const cursor=Number(url.searchParams.get('cursor')||0);
    body={changed:true,seq:1,next_cursor:1,agents:[{agent_id:'agent_1',name:'coder',harness_type:'pi',owner_user_id:'owner',actions:['execute']}],tasks:structuredClone(m.tasks),
     events:cursor<1?[{sequence:1,event_id:'e1',event_type:'message',created_at:T,room_id:'room-one',sender:{type:'user',id:'bob',owner_user_id:'bob'},text:'first'}]:[],flow:{nodes:[],edges:[],tasks:[]}};
@@ -395,11 +396,21 @@ test('Collab: repeated identical room state writes nothing; one changed task rew
  assert.equal(await page.evaluate(()=>[...document.querySelectorAll('#hcn-tasks li')].every((n,i)=>n===window.__rows[i])),true,'task rows keep their nodes');
  assert.deepEqual(await outside('#hcn-tasks li[data-key="t2"]'),[],'nothing outside the changed task was written');
 
- // A long-poll held open by the server: refresh() (the bus hook) makes the room re-ask at once.
+ // Live events must not abort the held long-poll: it already returns on change, and every
+ // aborted waiter keeps a server slot until its deadline (MAX_STATE_WAITERS per user).
  let release;m.hang=new Promise(r=>{release=r;});
  await sleep(400);const held=m.reads;
- await page.evaluate(()=>window.collab.refresh());
- await until(()=>m.reads>held,'refresh re-asked the room',2000);
+ for(let i=0;i<5;i++)await page.evaluate(()=>window.collab.refresh());
+ await sleep(500);
+ assert.equal(m.reads,held,'live events leave the held long-poll alone');
  m.hang=null;release();
+ // A loop sleeping in error backoff is woken by a live event.
+ m.fail=3;
+ await until(()=>m.fail===0,'three failed reads',15000);
+ const failed=m.reads;await sleep(300);
+ assert.equal(m.reads,failed,'the loop is sleeping in backoff');
+ await page.evaluate(()=>window.collab.refresh());
+ await until(()=>m.reads>failed,'a live event wakes the backoff sleep',1500);
+ assert.deepEqual(await page.evaluate(()=>window.collab.interests),['SessionCreated','SessionStarted','SessionUpdated'],'collab only hears agent events');
  await page.evaluate(()=>window.collab.dispose());
 }));

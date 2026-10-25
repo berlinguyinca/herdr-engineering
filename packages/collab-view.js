@@ -103,7 +103,7 @@ const GUIDE = `<div class="hd-card">
 export function mountCollab(root, { fabricSessions = null, onFreshness = () => {} } = {}) {
   ensureConversationStyles(root.ownerDocument);
   let teardown = null;      // stops the open room's live loop
-  let poke = null;          // re-asks the open room's live loop now (a live event elsewhere hinted at news)
+  let poke = null;          // wakes the open room's loop from its error-backoff sleep (a live event hinted the server is back)
   let cursor = 0;
   let lastCfg = null;
   let me = null;
@@ -649,7 +649,11 @@ export function mountCollab(root, { fabricSessions = null, onFreshness = () => {
     const onVisible = () => { if (!document.hidden) { since = -1; if (wake) { wake(); wake = null; } } };
     document.addEventListener('visibilitychange', onVisible);
     teardown = () => { alive = false; poke = null; composer?.dispose(); unbindHelpers(); ctl?.abort(); document.removeEventListener('visibilitychange', onVisible); if (wake) wake(); };
-    poke = () => { ctl?.abort(); };       // the loop re-asks from the same position: unchanged rooms write nothing
+    // A live event never aborts the held long-poll: it already returns on change, and an aborted
+    // waiter keeps its server slot until its deadline (MAX_STATE_WAITERS per user). It only cuts an
+    // error-backoff sleep short.
+    let wakeBackoff = null;
+    poke = () => { if (wakeBackoff) wakeBackoff(); };
     const kick = () => { since = -1; ctl?.abort(); };       // an action just happened: refetch now
 
     // Patch a container (morph) when its markup changed and you are not typing in it: unchanged
@@ -1332,7 +1336,6 @@ export function mountCollab(root, { fabricSessions = null, onFreshness = () => {
       cursor = s.next_cursor ?? cursor;
       paintPanel();
     };
-    const sleep = (ms) => new Promise((r) => { setTimeout(r, ms); });
     (async () => {
       while (alive) {
         if (document.hidden) { await new Promise((r) => { wake = r; }); continue; }
@@ -1349,7 +1352,8 @@ export function mountCollab(root, { fabricSessions = null, onFreshness = () => {
           if (e instanceof AuthError) { dispose(); store.clear(); start(); return; }
           if (/not found/.test(e.message)) { dispose(); go('/rooms'); return; }
           onFreshness(false, `Room: ${e.message || 'request failed'}`);
-          await sleep(backoff); backoff = Math.min(backoff * 2, 15000);
+          await new Promise((r) => { wakeBackoff = r; setTimeout(r, backoff); }); wakeBackoff = null;
+          backoff = Math.min(backoff * 2, 15000);
         }
       }
     })();
@@ -1446,5 +1450,6 @@ export function mountCollab(root, { fabricSessions = null, onFreshness = () => {
   start();
   // refresh: the dashboard's refresh bus. The open room's long-poll is already live; an event only
   // makes it re-ask at once. Lists outside a room are left alone (no remount, no loader).
-  return { refresh: () => { poke?.(); }, dispose: () => { dispose(); window.removeEventListener('hashchange', onHash); } };
+  // Collab only shows control-plane data in the agents list (fabric sessions); other events skip it.
+  return { interests: ['SessionCreated', 'SessionStarted', 'SessionUpdated'], refresh: () => { poke?.(); }, dispose: () => { dispose(); window.removeEventListener('hashchange', onHash); } };
 }
