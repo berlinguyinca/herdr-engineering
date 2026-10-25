@@ -26,7 +26,9 @@ def test_short_and_long_forms_are_references():
     text = "fixes #binview-44, see (acme/lib#3) and #my-repo-2-7."
     assert list(collab_refs.tokens(text)) == [(None, "binview", 44), ("acme", "lib", 3), (None, "my-repo-2", 7)]
     assert list(collab_refs.tokens("#BinView-44")) == [(None, "binview", 44)]
-    assert list(collab_refs.tokens('"#app-1"')) == [(None, "app", 1)]
+    # the client's grammar (refChips, the composer): start, whitespace or an opening bracket; never a quote
+    assert list(collab_refs.tokens("(#app-1) [#app-2] {#app-3}")) == [(None, "app", 1), (None, "app", 2), (None, "app", 3)]
+    assert list(collab_refs.tokens('"#app-1" \'#app-2\' "acme/app#3"')) == []
 
 
 @pytest.mark.parametrize("text", [

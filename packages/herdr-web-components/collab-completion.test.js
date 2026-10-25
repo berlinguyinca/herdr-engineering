@@ -167,3 +167,9 @@ test('a short #repo-n is a chip only when the server resolved that short form (a
   assert.match(refChips('<p>#app-3</p>', [{ ...refs[0], forms: ['short', 'long'] }]), /cx-ref/);
   assert.equal(refChips('<p>acme/app#3</p>', refs), '<p>acme/app#3</p>');            // another owner: text
 });
+
+test('refChips and the server agree on what may precede a reference: brackets yes, quotes no', () => {
+  const refs = [{ kind: 'issue', owner: 'acme', repo: 'app', number: 1, forms: ['short', 'long'] }];
+  const html = refChips('<p>(#app-1) &quot;#app-1&quot; &#39;#app-1&#39; "acme/app#1"</p>', refs);
+  assert.equal((html.match(/class="cx-mention cx-ref/g) || []).length, 1);
+});

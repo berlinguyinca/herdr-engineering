@@ -2,7 +2,8 @@
 
 `#binview-44` names issue 44 of the in-scope repository called `binview`; `acme/binview#44` names
 it with its owner (needed when two in-scope owners share the repository name). A reference opens
-only at the start of the text, after whitespace or after an opening bracket/quote, and never inside
+only at the start of the text, after whitespace or after an opening bracket (the same rule as
+the client's chips and composer; never after a quote), and never inside
 a code span or fence (backtick or `~~~`), a URL, a word (`abc#12`) or an HTML entity (`&#39;`). A
 Markdown heading (`# Title`) has a space after `#` and names nothing.
 
@@ -24,7 +25,7 @@ from .collab_mentions import _FENCE, _INLINE
 
 MAX_REFS = 20
 _URL = re.compile(r"(?:[a-z][a-z0-9+.-]{1,15}://|www\.)[^\s<>]{0,2048}", re.I)
-_OPEN = r"(?<![^\s(\[{\"'])"                 # start, whitespace, or an opening bracket / quote
+_OPEN = r"(?<![^\s(\[{])"                    # start, whitespace or an opening bracket (as the client)
 _END = r"(?![A-Za-z0-9_#/-]|\.[A-Za-z0-9_])"  # not a longer token (`#a-1x`, `#a-1.5`); a full stop may end it
 _SHORT = re.compile(_OPEN + r"#([A-Za-z0-9_.-]{1,100}?)-([0-9]{1,10})" + _END)
 _LONG = re.compile(_OPEN + r"([A-Za-z0-9][A-Za-z0-9-]{0,38})/([A-Za-z0-9_.-]{1,100})#([0-9]{1,10})" + _END)
