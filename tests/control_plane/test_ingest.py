@@ -301,16 +301,39 @@ def test_ingest_test_run_is_idempotent_and_filters_by_mission():
     env = {
         "entity_type": "test_run", "entity_id": "run-1",
         "event_type": "test_run.started",
-        "payload": {"mission_id": "pi:MSN-1", "status": "failed",
+        "payload": {"mission_id": "MSN-1", "status": "failed",
                     "passed": 2, "failed": 1, "total": 3}}
     svc.ingest({**env, "payload": {**env["payload"], "passed": 2}})
     svc.ingest({**env, "payload": {**env["payload"], "failed": 1}})
-    runs = repo.list_test_runs(mission_id="pi:MSN-1")
+    runs = repo.list_test_runs(mission_id="MSN-1")
     assert len(runs) == 1
     assert runs[0]["test_run_id"] == "run-1"
     assert runs[0]["failed"] == 1 and runs[0]["passed"] == 2
     # A run for another mission never leaks in.
-    assert repo.list_test_runs(mission_id="pi:MSN-2") == []
+    assert repo.list_test_runs(mission_id="MSN-2") == []
+
+
+def test_ingest_delivery_namespaces_mission_id_by_source():
+    repo = ControlPlaneRepo()
+    svc = make_svc(repo)
+    # A pi-sourced report for raw mission_id M1 lands on the namespaced pi:M1
+    # key so it is visible on the pi mission page (issue #26/#32).
+    svc.ingest({"entity_type": "test_run", "entity_id": "run-pi",
+                "event_type": "test_run.started", "source": "pi",
+                "payload": {"mission_id": "M1", "status": "passed", "total": 1}})
+    assert len(repo.list_test_runs(mission_id="pi:M1")) == 1
+    assert repo.list_test_runs(mission_id="M1") == []
+    # The same report under a herdr source stays on the bare M1 key.
+    svc.ingest({"entity_type": "test_run", "entity_id": "run-h",
+                "event_type": "test_run.started",
+                "payload": {"mission_id": "M1", "status": "passed", "total": 1}})
+    assert len(repo.list_test_runs(mission_id="M1")) == 1
+    assert len(repo.list_test_runs(mission_id="pi:M1")) == 1
+    # A prefixed id that conflicts with its source is rejected.
+    with pytest.raises(ValueError, match="conflicts"):
+        svc.ingest({"entity_type": "test_run", "entity_id": "run-bad",
+                    "event_type": "test_run.started", "source": "pi",
+                    "payload": {"mission_id": "herdr-ws:x", "total": 1}})
 
 
 def test_ingest_build_reuses_test_run_collection_with_kind_build():

@@ -392,14 +392,14 @@ class IngestService:
             return {"entity_type": "inspector", "entity_id": entity_id,
                     "event_type": event_type, **res}
         if entity_type in ("test_run", "build"):
-            return self._ingest_test_run(entity_id, event_type, payload,
+            return self._ingest_test_run(entity_id, event_type, payload, source,
                                          kind="test" if entity_type == "test_run" else "build")
         if entity_type == "review":
-            return self._ingest_review(entity_id, event_type, payload)
+            return self._ingest_review(entity_id, event_type, payload, source)
         if entity_type == "review_finding":
-            return self._ingest_review_finding(entity_id, payload)
+            return self._ingest_review_finding(entity_id, payload, source)
         if entity_type == "pull_request":
-            return self._ingest_pull_request(entity_id, event_type, payload)
+            return self._ingest_pull_request(entity_id, event_type, payload, source)
         # Unknown/other entity types: record the event generically so nothing is
         # silently dropped, and the UI still sees it on the activity stream.
         if record_generic:
@@ -410,16 +410,30 @@ class IngestService:
     # ------------------------------------------------------ delivery entities
     # Test runs, builds, reviews, review findings and pull requests are stored
     # in the repo's delivery collections (issue #32). They mirror the SQL table
-    # shapes, are idempotent on entity_id, and attach to a (namespaced) mission
-    # key exactly like sessions and missions do (issue #26).
-    def _ingest_test_run(self, entity_id, event_type, payload, kind="test") -> dict:
+    # shapes, are idempotent on entity_id, and attach to a source-namespaced
+    # mission key exactly like sessions and missions do (issue #26), so a pi
+    # report for raw mission_id ``M1`` lands on ``pi:M1`` and stays visible on
+    # the pi mission page instead of a bare ``M1`` the UI never queries.
+    def _delivery_mission_key(self, mission_id, source):
+        if mission_id is None:
+            return None
+        if not isinstance(mission_id, str) or not mission_id:
+            raise ValueError("mission_id must be a non-empty string")
+        if ":" in mission_id:
+            namespace, raw = mission_id.split(":", 1)
+            if not raw or ":" in raw or (source != "herdr" and namespace != source):
+                raise ValueError("mission identity conflicts with its source")
+            return mission_id
+        return mission_id if source == "herdr" else f"{source}:{mission_id}"
+
+    def _ingest_test_run(self, entity_id, event_type, payload, source, kind="test") -> dict:
         for key in ("passed", "failed", "skipped", "total"):
             value = payload.get(key)
             if value is not None and (isinstance(value, bool) or not isinstance(value, (int, float))):
                 raise ValueError(f"{key} must be a number")
         return self.repo.upsert_test_run(
             entity_id, kind=kind,
-            mission_id=payload.get("mission_id"),
+            mission_id=self._delivery_mission_key(payload.get("mission_id"), source),
             session_id=payload.get("session_id"),
             repository=payload.get("repository"),
             status=payload.get("status"),
@@ -432,9 +446,9 @@ class IngestService:
             results=payload.get("results"),
         )
 
-    def _ingest_review(self, entity_id, event_type, payload) -> dict:
+    def _ingest_review(self, entity_id, event_type, payload, source) -> dict:
         return self.repo.upsert_review(
-            entity_id, mission_id=payload.get("mission_id"),
+            entity_id, mission_id=self._delivery_mission_key(payload.get("mission_id"), source),
             session_id=payload.get("session_id"),
             reviewer=payload.get("reviewer"),
             status=payload.get("status"),
@@ -443,7 +457,7 @@ class IngestService:
             completed_at=payload.get("completed_at"),
         )
 
-    def _ingest_review_finding(self, entity_id, payload) -> dict:
+    def _ingest_review_finding(self, entity_id, payload, source) -> dict:
         # The finding attaches to the review named by ``review_id`` (which the
         # ingest envelope carries in ``entity_id``); the review must already
         # exist so a forged/unknown review can never collect findings.
@@ -469,9 +483,9 @@ class IngestService:
             finding_id=finding_id,
         )
 
-    def _ingest_pull_request(self, entity_id, event_type, payload) -> dict:
+    def _ingest_pull_request(self, entity_id, event_type, payload, source) -> dict:
         return self.repo.upsert_pull_request(
-            entity_id, mission_id=payload.get("mission_id"),
+            entity_id, mission_id=self._delivery_mission_key(payload.get("mission_id"), source),
             repository=payload.get("repository"),
             number=payload.get("number"),
             url=payload.get("url"),
