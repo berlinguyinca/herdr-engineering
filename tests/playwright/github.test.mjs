@@ -7,8 +7,9 @@ import {chromium} from 'playwright';
 
 const root=path.resolve(import.meta.dirname,'../..');
 const python=process.env.PYTHON || (fs.existsSync(path.join(root,'.venv/bin/python'))?path.join(root,'.venv/bin/python'):'python3');
-async function withApp(fn){
- const server=spawn(python,[path.join(root,'tests/playwright/server.py')],{env:{...process.env,BURST:'1'},stdio:['ignore','pipe','pipe']});
+// burst '0': no live event burst, so every list read comes from the 5 s poll (tests that count reads).
+async function withApp(fn,{burst='1'}={}){
+ const server=spawn(python,[path.join(root,'tests/playwright/server.py')],{env:{...process.env,BURST:burst},stdio:['ignore','pipe','pipe']});
  let browser;
  try{
   const port=await new Promise((resolve,reject)=>{let text='';const timeout=setTimeout(()=>reject(new Error('Fixture startup timed out')),20000);server.stdout.on('data',data=>{text+=data;const hit=text.match(/PORT=(\d+)/);if(hit){clearTimeout(timeout);resolve(hit[1]);}});server.once('exit',code=>{clearTimeout(timeout);reject(new Error(`Fixture exited ${code}`));});});
@@ -234,3 +235,38 @@ test('GitHub polls conditionally and applies since deltas row by row',async()=>w
  assert.deepEqual(await page.evaluate(()=>[...document.querySelectorAll('[data-gh-issue-row]:not([data-leaving])')].map(r=>r.dataset.ghIssueRow)),['github.com/lab/busy#8','github.com/lab/busy#7']);
  mode='delta';await poll('issues');assert.equal(seen.issues.at(-1).since,'40');
 }));
+
+// Deltas never carry repository fields no revision covers (issues_loaded, issues_complete, error),
+// so the page reads its lists in full every 12th poll and on the poll after the sync state moved.
+test('GitHub reads in full every 12th poll and after a sync-state change, repairing unrevisioned repository fields',async()=>withApp(async(page,base)=>{
+ const revision=7;let loaded=1,complete=false,repoError=null,status='ready';const reads=[];
+ const repo=()=>({...repository('busy',3),issues_loaded:loaded,issues_complete:complete,error:repoError});
+ await page.route('**/api/v1/github?*',route=>{
+  const since=new URL(route.request().url()).searchParams.get('since');reads.push(since);
+  const state=snapshot({status,last_success_at:'2001-01-01T00:00:00Z'});
+  return route.fulfill({json:since===null?{...state,revision,repositories:[repo()]}:{...state,revision,resync:false,upserted:[],removed:[]}});
+ });
+ await page.route('**/api/v1/github/issues?*',route=>route.fulfill({json:{...snapshot({last_success_at:'2001-01-01T00:00:00Z'}),revision,issues:[issue(1)]}}));
+ await page.clock.install();
+ await page.goto(`${base}/#/github`);await page.locator('[data-gh-repository]').first().waitFor();
+ const poll=async()=>{const n=reads.length;await page.clock.runFor(5000);for(let i=0;i<200&&reads.length===n;i++)await page.waitForTimeout(25);await page.waitForTimeout(100);};
+ const rail=()=>page.locator('[data-gh-repository]').first().innerText();
+ const until=async(test,label)=>{for(let i=0;i<40&&!test();i++)await poll();assert.ok(test(),label);await page.waitForTimeout(150);};
+ // Reads come from the 5 s poll and from live events alike; the rule is per read of the list.
+ assert.deepEqual(reads,[null]);assert.match(await rail(),/1 loaded/);
+ // The fields change on the server, but a delta cannot say so: 11 delta reads keep the old text.
+ loaded=3;complete=true;
+ await until(()=>reads.length>=12,'12 reads');
+ assert.deepEqual(reads.slice(1,12),Array(11).fill('7'),'reads 2-12 ask for a delta');
+ assert.match(await rail(),/1 loaded/);
+ await until(()=>reads.length>=13,'13 reads');
+ assert.equal(reads[12],null,'every 12th read after a full one is full');
+ assert.match(await rail(),/Issue list read/,'issues_complete repaired');
+ // A delta whose sync state moved makes the next read full, which repairs the row's error.
+ const before=reads.length;status='syncing';repoError='Issues could not be read';
+ await until(()=>reads.length>=before+2,'two more reads');
+ assert.deepEqual(reads.slice(before,before+2),['7',null],'the delta carrying the new status, then a full read');
+ assert.match(await rail(),/Issues could not be read/,'error repaired');
+ await until(()=>reads.length>=before+3,'one more read');
+ assert.equal(reads[before+2],'7','deltas resume');
+},{burst:'0'}));

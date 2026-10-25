@@ -12,8 +12,8 @@ const short=(value,max=160)=>text(value).replace(/\s+/g,' ').trim().slice(0,max)
 const records=value=>Array.isArray(value)?value.filter(v=>v&&typeof v==='object'&&!Array.isArray(v)):[];
 const human=value=>text(value).replaceAll('_',' ').toLowerCase();
 const NO_STATUS={id:'',name:'No status'};
-// Every FULL_RELOAD_POLLS-th poll reads in full: project rows carry fields no revision covers
-// (complete, error), so deltas alone could keep them stale.
+// Every FULL_RELOAD_POLLS-th read is full, and so is the read after projects_sync changed: project
+// rows carry fields no revision covers (complete, error), so deltas alone could keep them stale.
 const FULL_RELOAD_POLLS=12;
 const POLL_MS=5000;
 const element=html=>{const t=document.createElement('template');t.innerHTML=html.trim();return t.content.firstElementChild;};
@@ -78,7 +78,8 @@ const styles=`<style>
 
 export function mountGithubProjects(container,client,{project='',layout='board'}={}) {
  let disposed=false,projects=null,items=null,projectsError='',itemsError='',selected=text(project),flat=layout==='list',timer=null;
- const held={projects:{query:null,polls:0},items:{query:null,polls:0}};
+ const held={projects:{query:null,polls:0,full:false},items:{query:null,polls:0,full:false}};
+ const syncSignature=body=>JSON.stringify(body?.projects_sync||null);
  const requests=new Map(),listeners=new AbortController();
  const chipEl=()=>container.querySelector('herdr-freshness'),chip=freshnessSources(chipEl);
  container.innerHTML=`${styles}<div class="hd-live-head"><h1>Project boards</h1><herdr-freshness interval="${POLL_MS}"></herdr-freshness></div><p class="ghp-intro">GitHub Projects of the owners in scope, read-only. Cards follow the project's Status field; open an item on GitHub to change it.</p><p class="ghp-warning" data-ghp-sync role="status"></p><p class="ghp-warning" data-ghp-error role="status"></p>
@@ -141,12 +142,12 @@ export function mountGithubProjects(container,client,{project='',layout='board'}
  async function read(kind,query,signal){
   const mine=held[kind],body=kind==='items'?items:projects;
   const base=mine.query===query&&body&&Number.isInteger(body.revision)?body:null;
-  const full=!base||(++mine.polls%FULL_RELOAD_POLLS===0);
+  const full=!base||mine.full||(++mine.polls%FULL_RELOAD_POLLS===0);
   const params={project:kind==='items'?selected:undefined,signal};
   const first=await client.getGithubProjects({...params,since:full?undefined:base.revision});
   if(first.notModified&&base)return null;
-  if(!full){const merged=applyProjectDelta(kind,base,first.body);if(merged)return merged;}
-  if(full)mine.polls=0;
+  if(!full){const merged=applyProjectDelta(kind,base,first.body);if(merged){mine.full=syncSignature(merged)!==syncSignature(base);return merged;}}
+  mine.polls=0;mine.full=false;
   return (full?first:await client.getGithubProjects(params)).body;
  }
  async function request(key,load,accept,reject){

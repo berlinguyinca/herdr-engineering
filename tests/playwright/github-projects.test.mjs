@@ -9,8 +9,9 @@ import {chromium} from 'playwright';
 
 const root=path.resolve(import.meta.dirname,'../..');
 const python=process.env.PYTHON || (fs.existsSync(path.join(root,'.venv/bin/python'))?path.join(root,'.venv/bin/python'):'python3');
-async function withApp(fn){
- const server=spawn(python,[path.join(root,'tests/playwright/server.py')],{env:{...process.env,BURST:'1'},stdio:['ignore','pipe','pipe']});
+// burst '0': no live event burst, so every list read comes from the 5 s poll (tests that count reads).
+async function withApp(fn,{burst='1'}={}){
+ const server=spawn(python,[path.join(root,'tests/playwright/server.py')],{env:{...process.env,BURST:burst},stdio:['ignore','pipe','pipe']});
  let browser;
  try{
   const port=await new Promise((resolve,reject)=>{let text='';const timeout=setTimeout(()=>reject(new Error('Fixture startup timed out')),20000);server.stdout.on('data',data=>{text+=data;const hit=text.match(/PORT=(\d+)/);if(hit){clearTimeout(timeout);resolve(hit[1]);}});server.once('exit',code=>{clearTimeout(timeout);reject(new Error(`Fixture exited ${code}`));});});
@@ -71,3 +72,31 @@ test('the page says when project sync is off',async()=>withApp(async(page,base)=
  assert.match(await page.locator('[data-ghp-sync]').innerText(),/github\.projects\.enabled/);
  assert.equal(await page.locator('[data-ghp-project]').isDisabled(),true);
 }));
+
+// Project rows carry fields no revision covers (complete, error): the projects list is read in full
+// every 12th read and on the read after projects_sync changed.
+test('the projects list is read in full every 12th read and after the sync state moved',async()=>withApp(async(page,base)=>{
+ let rowError=null,status='ready';const reads=[];
+ await page.route('**/api/v1/github/projects*',route=>{
+  const url=new URL(route.request().url()),project=url.searchParams.get('project'),since=url.searchParams.get('since');
+  const state=sync({projects_sync:{enabled:true,status,error:null,projects:1,deferred:0}});
+  if(project)return route.fulfill({json:{...state,revision:3,project:board('PVT_1'),items:[card('I1','o1',0)]}});
+  reads.push(since);
+  return route.fulfill({json:since===null?{...state,revision:3,projects:[board('PVT_1',{complete:rowError===null,error:rowError})]}:{...state,revision:3,resync:false,upserted:[],removed:[]}});
+ });
+ await page.clock.install();
+ await page.goto(`${base}/#/github/projects`);await page.locator('[data-ghp-item="I1"]').waitFor();
+ const poll=async()=>{const n=reads.length;await page.clock.runFor(5000);for(let i=0;i<200&&reads.length===n;i++)await page.waitForTimeout(25);};
+ const until=async(test,label)=>{for(let i=0;i<40&&!test();i++)await poll();assert.ok(test(),label);await page.waitForTimeout(150);};
+ const summary=()=>page.locator('[data-ghp-summary]').innerText();
+ rowError='The project has more than github.projects.item_limit (2000) items';
+ await until(()=>reads.length>=12,'12 reads');
+ assert.deepEqual(reads.slice(1,12),Array(11).fill('3'));assert.doesNotMatch(await summary(),/item_limit/);
+ await until(()=>reads.length>=13,'13 reads');
+ assert.equal(reads[12],null,'every 12th read is full');
+ assert.match(await summary(),/item_limit/,'the row error is repaired');
+ const before=reads.length;status='partial';rowError=null;
+ await until(()=>reads.length>=before+2,'two more reads');
+ assert.deepEqual(reads.slice(before,before+2),['3',null],'the delta carrying the new sync state, then a full read');
+ assert.doesNotMatch(await summary(),/item_limit/);
+},{burst:'0'}));
