@@ -253,8 +253,8 @@ def test_ingest_endpoint_upserts_host(server):
     # the ingested events are visible to a GET on the same stream
     _, _, stream = c.get("/api/v1/events?entity_type=host&entity_id=bender")
     evs = json.loads(stream)["events"]
-    assert [e["event_type"] for e in evs] == [
-        "HostRegistered", "HostHeartbeat"]
+    # a routine heartbeat (same identity) records no HostHeartbeat event
+    assert [e["event_type"] for e in evs] == ["HostRegistered"]
 
 
 def test_ingest_endpoint_validates_body(server):
@@ -603,6 +603,7 @@ def test_fleet_config_takes_one_snapshot_per_request(tmp_path, acknowledged_sink
 
     store = FlippingStore()
     svr = ControlPlaneServer(ControlPlaneRepo(sink=acknowledged_sink), fleet_config=store)
+    store.calls = 0  # construction reads the review_gate section once; count requests only
     threading.Thread(target=svr.serve, daemon=True).start()
     svr.wait_until_ready()
     try:

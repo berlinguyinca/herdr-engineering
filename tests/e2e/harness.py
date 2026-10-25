@@ -16,6 +16,7 @@ import http.client
 import json
 import os
 import secrets
+import site
 import socket
 import subprocess
 import sys
@@ -23,6 +24,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 import yaml
 
@@ -32,16 +34,58 @@ RUN_DIR = E2E / ".run"
 
 
 # ------------------------------------------------------------------------------------------------ configuration
+def _merge(base: dict, over: dict) -> dict:
+    out = dict(base)
+    for k, v in over.items():
+        out[k] = _merge(out[k], v) if isinstance(v, dict) and isinstance(out.get(k), dict) else v
+    return out
+
+
 def load_acceptance() -> dict:
+    """acceptance.yaml, with acceptance.local.yaml (untracked) merged over it key by key: a local file need only name what it changes."""
+    cfg = yaml.safe_load((E2E / "acceptance.yaml").read_text())
     local = E2E / "acceptance.local.yaml"
-    cfg = yaml.safe_load((local if local.exists() else E2E / "acceptance.yaml").read_text())
+    if local.exists():
+        cfg = _merge(cfg, yaml.safe_load(local.read_text()) or {})
     if not isinstance(cfg, dict) or cfg.get("version") != 1:
         raise RuntimeError("acceptance config must be a mapping with version: 1")
     return cfg
 
 
+def _siblings(marker: str) -> list[Path]:
+    return sorted(d for d in ROOT.parent.iterdir() if d.is_dir() and d != ROOT and (d / marker).exists())
+
+
+def _discover(marker: str, prefer_suffix: str | None = None) -> Path:
+    """Find a sibling checkout by what it CONTAINS (not by its directory name). With several candidates the one whose
+    name ends with this checkout's worktree suffix (herdr-t16 -> *-t16) wins; otherwise the choice must be unambiguous."""
+    found = _siblings(marker)
+    if prefer_suffix:
+        same = [d for d in found if d.name.endswith(prefer_suffix)]
+        if len(same) == 1:
+            return same[0]
+    if len(found) == 1:
+        return found[0]
+    built = [d for d in found if (d / "target" / "debug" / "autospec").exists()]      # AutoSpec: only a built checkout is usable
+    if marker.startswith("crates/") and len(built) == 1:
+        return built[0]
+    raise RuntimeError(f"cannot discover a sibling checkout containing {marker}: candidates {[d.name for d in found]}; "
+                       "set the path in tests/e2e/acceptance.local.yaml")
+
+
 def resolve(cfg: dict, key: str) -> Path:
-    p = Path(str(cfg[key])).expanduser()
+    """A configured path (relative to this checkout), or `auto` = discover the sibling checkout by content."""
+    value = str(cfg[key])
+    suffix = ROOT.name.rsplit("-", 1)[-1] if "-" in ROOT.name else None
+    if value == "auto":
+        if key == "pi_repo":
+            return _discover("src/runtime/herdr/lineage.ts", suffix)
+        if key == "autospec_repo":
+            return _discover("crates/autospec-cli", suffix)
+        if key == "autospec_bin":
+            return resolve(cfg, "autospec_repo") / "target" / "debug" / "autospec"
+        raise RuntimeError(f"{key}: `auto` is not supported")
+    p = Path(value).expanduser()
     return p if p.is_absolute() else (ROOT / p).resolve()
 
 
@@ -185,7 +229,7 @@ class Plane:
     def alive(self) -> bool:
         return self.proc is not None and self.proc.poll() is None
 
-    def start(self) -> "Plane":
+    def start(self) -> Plane:
         assert not self.alive(), "already running"
         fleet, users = self._write_config()
         self.port = free_port()
@@ -194,14 +238,17 @@ class Plane:
         if self.users:
             cmd += ["--collab-users-file", str(users)]
         self._log = open(self.log_path, "ab")
-        # cwd = repo root makes `herdr_engineering` importable without PYTHONPATH; the child inherits no config
-        self.proc = subprocess.Popen(cmd, cwd=ROOT, stdout=self._log, stderr=subprocess.STDOUT)
+        # cwd = repo root makes `herdr_engineering` importable without PYTHONPATH. The child gets an explicit, minimal
+        # environment (PATH to find python/git, HOME inside the scratch dir, PYTHONUSERBASE so the user-site asyncpg is found): no config, no credentials, no proxies.
+        self.proc = subprocess.Popen(cmd, cwd=ROOT, stdout=self._log, stderr=subprocess.STDOUT,
+                                     env={"PATH": os.environ["PATH"], "HOME": str(self.workdir),
+                                          "PYTHONUSERBASE": site.getuserbase()})   # lets python find user-site asyncpg
         deadline = time.time() + self.startup_timeout
         while time.time() < deadline:
             if self.proc.poll() is not None:
                 raise RuntimeError(f"{self.name} exited during startup:\n{self.tail()}")
             try:
-                if self.call("GET", "/api/v1/ingest/sources", key="viewer").status == 200:
+                if self.call("GET", "/api/v1/ingest/sources", key="operator").status == 200:
                     break
             except OSError:
                 pass
@@ -233,7 +280,7 @@ class Plane:
             self.proc.kill()
             self.proc.wait(5)
 
-    def restart(self) -> "Plane":
+    def restart(self) -> Plane:
         self.stop()
         return self.start()
 
@@ -294,7 +341,7 @@ class Plane:
         from urllib.parse import quote, urlencode
         return self.get(f"/api/v1/graph/nodes/{quote(nid, safe='')}/neighborhood?" + urlencode({"depth": depth, **q}), key=key)
 
-    def sources(self, key: str = "viewer") -> dict:
+    def sources(self, key: str = "operator") -> dict:
         return {s["source"]: s for s in self.get("/api/v1/ingest/sources", key=key).body.get("sources", [])}
 
     def edges(self, nid: str, *, key: str = "operator", depth: int = 1) -> list[tuple]:
@@ -326,8 +373,22 @@ class Plane:
         for path in ("/attention", "/progress", "/analytics"):
             r = self.c("GET", f"/rooms/{room}{path}", user=owner)
             assert r.status == 200, f"feature probe {path}: {r.status} {r.body} (feature off or broken)"
-        r = self.c("POST", f"/rooms/{room}/steering", {"node_id": "agent:probe", "action": "pause", "instruction": "x"}, user=owner)
-        assert r.status != 403 and r.get("code") != "steering_disabled", f"feature probe steering: {r.status} {r.body} (feature off or broken)"
-        r = self.c("POST", f"/rooms/{room}/comments", {"node_id": "agent:probe", "text": "x"}, user=owner)
-        assert r.status != 403, f"feature probe comments: {r.status} {r.body} (feature off or broken)"
+        # steering and comments: a REAL positive signal on a node that exists in the room (a 400/404/500 must not pass)
+        node = "task:feature-probe"
+        env = self.envelope(source="feature-probe", seq=1, entity_id=node, event_type="node.upsert", scope="room", room_id=room,
+                            payload={"node_type": "task", "node_id": node, "label": "feature probe", "state": "running"})
+        seeded = self.ingest("operator", env)
+        assert seeded.status == 200, f"feature probe seed node: {seeded.status} {seeded.body}"
+        q = quote(node, safe="")
+        tgt = self.c("GET", f"/rooms/{room}/steering/target?node_id={q}", user=owner)
+        assert tgt.status == 200 and tgt.get("fence"), f"feature probe steering target: {tgt.status} {tgt.body} (feature off or broken)"
+        r = self.c("POST", f"/rooms/{room}/steering", {"action": "pause", "node_id": node, "expected_fence": tgt["fence"],
+                                                       "idempotency_key": "feature-probe-steer"}, user=owner)
+        assert r.status == 201 and (r.get("steering") or {}).get("status") == "pending", f"feature probe steering: {r.status} {r.body} (feature off or broken)"
+        r = self.c("POST", f"/rooms/{room}/comments", {"anchor": {"kind": "node", "node_id": node}, "text": "probe",
+                                                       "idempotency_key": "feature-probe-comment"}, user=owner)
+        assert r.status in (200, 201) and (r.get("comment") or {}).get("text") == "probe", \
+            f"feature probe comments: {r.status} {r.body} (feature off or broken)"
+        got = self.c("GET", f"/rooms/{room}/comments?anchor_kind=node&node_id={q}", user=owner)
+        assert got.status == 200 and len(got.get("comments") or []) == 1, f"feature probe comment read-back: {got.status} {got.body}"
         assert self.c("GET", f"/rooms/{room}/state", user=owner).status == 200

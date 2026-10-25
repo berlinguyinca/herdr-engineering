@@ -328,3 +328,13 @@ def test_redact_does_not_eat_ids_that_merely_end_in_sk_dash_but_still_redacts_re
     assert redact_payload({"task_id": "task-s6lease"})["task_id"] == "task-s6lease"
     for leaked in ("sk-abcDEF123456", "key=sk-abcDEF123456", "OPENAI_API_KEY_sk-abcDEF123456", '"sk-proj-abcDEF123456"', "(sk-abc123)"):
         assert "abc" not in redact_text(leaked).replace("[REDACTED]", ""), leaked
+
+
+def test_redact_text_catches_a_key_after_an_ansi_colour_code_or_a_url_encoded_equals_but_not_short_ids():
+    key = "sk-" + "A" * 40
+    for leaked in ("\x1b[32m" + key, "api_key%3D" + key, "\x1b[1;31m" + key + "\x1b[0m", "x=" + key):
+        out = redact_text(leaked)
+        assert "AAAA" not in out and "[REDACTED]" in out, leaked
+    assert redact_text("task-sk-ab") == "task-sk-ab"
+    assert redact_text("\x1b[32mtask-sk-ab\x1b[0m") == "\x1b[32mtask-sk-ab\x1b[0m"
+    assert redact_payload({"task_id": "task-sk-ab"})["task_id"] == "task-sk-ab"

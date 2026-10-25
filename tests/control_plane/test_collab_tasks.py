@@ -160,6 +160,31 @@ def test_invalid_actions_are_refused(w):
         assert code(w.s.grant_agent, w.alice, w.room, {"agent_id": info["agent_id"], "actions": bad}) == 400
 
 
+def test_spawn_helpers_is_an_owner_approved_agent_action(w):
+    # the room owner grants it to their own agent directly
+    agent, info = w.agent("alice", ("read", "post", "spawn_helpers"))
+    assert w.s.agent_rooms(agent)["rooms"][0]["actions"] == ["post", "read", "spawn_helpers"]
+    # a contributor's agent must wait for the owner, and the owner may approve it
+    binfo = w.s.connect_agent(w.bob, {})
+    bagent = w.s.authenticate(f"Agent {binfo['credential']}", binfo["device_id"])
+    out = w.s.grant_agent(w.bob, w.room, {"agent_id": binfo["agent_id"], "actions": ["read", "spawn_helpers"]})
+    assert out["status"] == "pending"
+    w.s.decide_agent_request(w.alice, w.room, out["request_id"], {"decision": "approve"})
+    assert w.s.agent_rooms(bagent)["rooms"][0]["actions"] == ["read", "spawn_helpers"]
+    # a viewer's agent never gets it: the role intersection drops it even from a stale grant
+    vinfo = w.s.connect_agent(w.carol, {})
+    vagent = w.s.authenticate(f"Agent {vinfo['credential']}", vinfo["device_id"])
+    w.s._commit("agent_granted", {"actor_user_id": "alice", "actor_agent_id": None,
+                                  "project_id": w.s._rooms[w.room]["project_id"], "room_id": w.room,
+                                  "agent_id": vinfo["agent_id"], "actions": ["read", "spawn_helpers"],
+                                  "expires_at": None})
+    assert w.s.agent_rooms(vagent)["rooms"][0]["actions"] == ["read"]
+    # a user token is not an agent: it cannot be the target of an agent grant
+    assert code(w.s.grant_agent, w.alice, w.room, {"agent_id": "alice", "actions": ["spawn_helpers"]}) in (400, 404)
+    # unknown actions still 400
+    assert code(w.s.grant_agent, w.alice, w.room, {"agent_id": info["agent_id"], "actions": ["spawn_helper"]}) == 400
+
+
 def test_request_flood_is_capped_and_one_open_request_per_agent(w):
     info = w.s.connect_agent(w.bob, {})
     for _ in range(5):

@@ -8,8 +8,8 @@
 #
 # Runs as the fleet (connection) user (become: false). herdr-eng is
 # provisioned in managed immutable release directories plus a user venv.
-# The gateway control URL is written to the machine-local
-# ~/.config/herdr-engineering/fabric.env (a tailnet URL, not a secret).
+# The gateway control URL comes from the central fleet-config.yaml
+# (fabric.url, served to every host); no per-host env file is written.
 - name: "Deploy dev-fabric auto-registration agent"
   become: false
   block:
@@ -18,13 +18,6 @@
         path: "{{ fleet_home }}/.config/herdr-engineering"
         state: directory
         mode: "0700"
-
-    - name: "Write the fabric gateway control URL for this host"
-      ansible.builtin.copy:
-        dest: "{{ fleet_home }}/.config/herdr-engineering/fabric.env"
-        owner: "{{ fleet_user }}"
-        mode: "0600"
-        content: "HERDR_ENGINEERING_FABRIC_URL={{ fabric_agent_gateway_url }}\n"
 
     - name: "Select the controller release once for direct playbook invocations"
       ansible.builtin.set_fact:
@@ -52,7 +45,8 @@
           - --revision
           - "{{ herdr_engineering_revision }}"
       register: fabric_agent_provision
-      changed_when: true
+      # stage-release.py prints "changed": false when the release is already staged
+      changed_when: "'\"changed\": false' not in fabric_agent_provision.stdout"
       when: not ansible_check_mode
 
     - name: "Use the immutable checkout for companion installation"
@@ -67,6 +61,9 @@
              + (['--repo', herdr_engineering_checkout] if ansible_facts['system'] == 'Darwin' else []) }}
       environment:
         HERDR_ENGINEERING_CHECKOUT: "{{ herdr_engineering_checkout | default(fleet_home ~ '/herdr-engineering-repo') }}"
+        # fleet-update.yml sets fabric_agent_defer_restart: the script then leaves
+        # a running agent alone and the role restarts it once at the end.
+        HERDR_FABRIC_AGENT_NO_RESTART: "{{ '1' if (fabric_agent_defer_restart | default(false) | bool) else '' }}"
         HOME: "{{ fleet_home }}"
         USER: "{{ fleet_user }}"
         XDG_RUNTIME_DIR: "/run/user/{{ ansible_user_uid }}"

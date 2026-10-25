@@ -302,3 +302,92 @@ def test_kill_switch_is_read_per_request_without_a_restart(failed):
     w.rewrite_steering(cfg)
     assert w.propose("bob", "fork", "attempt:a1", base_sha=H0, label="after").status in (200, 201)
     assert w.p.proc.pid == pid and w.p.alive()
+
+
+# ----------------------------------------------------------------------------- fence checks, one stage at a time
+# These tests change the target ONLY in an attribute that the fence covers (fencing_token) while the node stays
+# `running` and `pause` stays eligible, the instance pin is unchanged and no fork guard applies. Nothing but the fence
+# can notice. (Review finding: the fork tests above change head_sha, which other guards also notice, so removing a
+# fence check was invisible. Each test below fails when exactly its stage's fence check is removed.)
+@pytest.fixture
+def running(w):
+    w.node("pi", "attempt:run1", state="running", label="live attempt", instance_id="inst-a", fencing_token="t1")
+    return w
+
+
+def _move_target(w, token: str) -> None:
+    w.node("pi", "attempt:run1", state="running", label="live attempt", instance_id="inst-a", fencing_token=token)
+
+
+def _steer_status(w, st) -> str:
+    rows = w.p.c("GET", f"/rooms/{w.room}/steering", user="alice").body["steering"]
+    return next(s["status"] for s in rows if s["steering_id"] == st["steering_id"])
+
+
+def test_fence_at_propose_a_target_that_moved_only_in_a_fenced_attribute_is_refused(running):
+    w = running
+    old = w.target("bob", "attempt:run1")["fence"]
+    _move_target(w, "t2")
+    fresh = w.target("bob", "attempt:run1")
+    assert fresh["fence"] != old and fresh["actions"] and "pause" in fresh["actions"] and fresh["state"] == "running"
+    late = w.propose("bob", "pause", "attempt:run1", fence=old)
+    assert late.status == 409 and late.body.get("code") == "stale_fence", late.body
+    ok = w.propose("bob", "pause", "attempt:run1", fence=fresh["fence"])               # positive control: same call, fresh fence
+    assert ok.status in (200, 201), ok.body
+    assert w.pending().body["steering"] == []
+
+
+def test_fence_at_confirm_a_confirmer_who_read_a_different_target_state_is_refused(running):
+    w = running
+    st = w.propose("bob", "pause", "attempt:run1")["steering"]
+    stored = w.target("alice", "attempt:run1")["fence"]
+    bogus = w.p.c("POST", f"/rooms/{w.room}/steering/{st['steering_id']}/confirm",
+                  {"digest": st["digest"], "expected_fence": "0" * len(stored)}, user="alice")
+    assert bogus.status == 409 and bogus.body.get("code") == "stale_fence", bogus.body   # target UNCHANGED: only expected_fence is wrong
+    assert w.pending().body["steering"] == []
+    st2 = w.propose("bob", "pause", "attempt:run1")["steering"]                          # positive control: the right fence confirms
+    assert w.p.c("POST", f"/rooms/{w.room}/steering/{st2['steering_id']}/confirm",
+                 {"digest": st2["digest"], "expected_fence": stored}, user="alice").status == 200
+
+
+def test_fence_at_confirm_a_target_that_moved_after_the_proposal_is_refused_even_with_the_proposals_own_fence(running):
+    w = running
+    st = w.propose("bob", "pause", "attempt:run1")["steering"]
+    stored = w.target("alice", "attempt:run1")["fence"]
+    _move_target(w, "t2")
+    assert "pause" in w.target("alice", "attempt:run1")["actions"]                       # still eligible: only the fence differs
+    late = w.p.c("POST", f"/rooms/{w.room}/steering/{st['steering_id']}/confirm",
+                 {"digest": st["digest"], "expected_fence": stored}, user="alice")
+    assert late.status == 409 and late.body.get("code") == "stale_fence", late.body
+    assert _steer_status(w, st) == "fenced" and w.pending().body["steering"] == []
+
+
+def test_fence_at_delivery_a_confirmed_request_is_not_delivered_once_the_target_moved(running):
+    w = running
+    keep = w.propose("bob", "pause", "attempt:run1")["steering"]                         # control: confirmed and untouched
+    assert w.confirm("alice", keep, "attempt:run1").status == 200
+    assert [s["steering_id"] for s in w.pending(instance="inst-a").body["steering"]] == [keep["steering_id"]]
+    # a second, independent target that moves between confirm and the emitter's poll
+    w.node("pi", "attempt:run2", state="running", label="live attempt 2", instance_id="inst-a", fencing_token="u1")
+    st = w.propose("bob", "pause", "attempt:run2")["steering"]
+    assert w.confirm("alice", st, "attempt:run2").status == 200
+    w.node("pi", "attempt:run2", state="running", label="live attempt 2", instance_id="inst-a", fencing_token="u2")
+    assert "pause" in w.target("alice", "attempt:run2")["actions"]
+    got = [s["steering_id"] for s in w.pending(instance="inst-a").body["steering"]]
+    assert st["steering_id"] not in got, got                                             # delivery re-checks the fence
+    assert _steer_status(w, st) == "fenced"
+
+
+# ----------------------------------------------------------------------------- self-confirmation
+def test_an_owner_cannot_confirm_their_own_proposal_unless_the_operator_allows_it(running):
+    w = running
+    mine = w.propose("alice", "pause", "attempt:run1")["steering"]                       # the owner is allowed to PROPOSE
+    r = w.confirm("alice", mine, "attempt:run1")
+    assert r.status == 403 and r.body.get("code") == "self_confirm", r.body
+    assert w.pending().body["steering"] == [] and _steer_status(w, mine) == "pending"
+    # positive control, same caller/same request: the operator switches self_confirm on (hot config) and it is accepted
+    cfg = {"enabled": True, "self_confirm": True, "actions": ["pause", "redirect", "fork", "promote"],
+           "forks": {"enabled": True, "evidence_writers": [w.p.pid("ci")]}}
+    w.rewrite_steering(cfg)
+    ok = w.confirm("alice", mine, "attempt:run1")
+    assert ok.status == 200, ok.body

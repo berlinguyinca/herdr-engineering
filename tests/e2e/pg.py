@@ -5,15 +5,31 @@ port, and is stopped (fast shutdown) by `stop()`. Migrations are the repo's own 
 from __future__ import annotations
 
 import asyncio
+import os
+import shutil
 import subprocess
 from pathlib import Path
 
 from tests.e2e import harness
 
 
+def _version_key(d: Path):
+    v = d.parent.name
+    return tuple(int(x) if x.isdigit() else 0 for x in v.split("."))
+
+
+def candidate_dirs(cfg: dict) -> list[Path]:
+    """Configured dirs first, then every /usr/lib/postgresql/<ver>/bin (newest first), then wherever initdb is on PATH."""
+    found = [Path(d) for d in (cfg.get("postgres") or {}).get("bin_dirs") or []]
+    found += sorted(Path("/usr/lib/postgresql").glob("*/bin"), key=_version_key, reverse=True)
+    on_path = shutil.which("initdb")
+    if on_path:
+        found.append(Path(on_path).resolve().parent)
+    return found
+
+
 def find_bins(cfg: dict) -> Path | None:
-    for d in (cfg.get("postgres") or {}).get("bin_dirs", []):
-        p = Path(d)
+    for p in candidate_dirs(cfg):
         if (p / "initdb").exists() and (p / "pg_ctl").exists():
             return p
     return None
@@ -25,14 +41,14 @@ class ThrowawayPostgres:
         self.data = self.root / "pgdata"
         # unix socket paths are length-limited, so the socket dir is short and separate
         import tempfile
-        self.sock = Path(tempfile.mkdtemp(prefix="t16pg-"))
+        self.sock = Path(tempfile.mkdtemp(prefix=f"t16pg-{os.getpid()}-"))
         self.started = False
 
     @property
     def dsn(self) -> str:
         return f"postgresql://postgres@/{self.db}?host={self.sock}"
 
-    def start(self) -> "ThrowawayPostgres":
+    def start(self) -> ThrowawayPostgres:
         self.root.mkdir(parents=True, exist_ok=True)
         subprocess.run([str(self.bins / "initdb"), "-D", str(self.data), "-U", "postgres", "--auth=trust", "-E", "UTF8"],
                        check=True, capture_output=True)
@@ -45,7 +61,7 @@ class ThrowawayPostgres:
         asyncio.run(self._migrate())
         return self
 
-    def start_existing(self) -> "ThrowawayPostgres":
+    def start_existing(self) -> ThrowawayPostgres:
         """Bring the same cluster (same data dir, same socket) back after `stop()`."""
         subprocess.run([str(self.bins / "pg_ctl"), "-D", str(self.data), "-w", "-l", str(self.root / "pg.log"),
                         "-o", f"-c listen_addresses='' -c unix_socket_directories='{self.sock}' -c fsync=off",
@@ -78,3 +94,9 @@ class ThrowawayPostgres:
             subprocess.run([str(self.bins / "pg_ctl"), "-D", str(self.data), "-m", "fast", "-w", "stop"],
                            capture_output=True)
             self.started = False
+
+    def close(self) -> None:
+        """Final teardown: stop the cluster and remove the short socket dir this object created (and only that)."""
+        self.stop()
+        import shutil
+        shutil.rmtree(self.sock, ignore_errors=True)

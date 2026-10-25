@@ -10,9 +10,9 @@
 # front of them; leases are closed when a service disappears. No public
 # listeners, ever.
 #
-# The gateway control URL is written to ~/.config/herdr-engineering/fabric.env
-# as HERDR_ENGINEERING_FABRIC_URL (only if not already set there), so the
-# agent knows where the gateway's control API is. Machine-local, no secrets.
+# The agent finds the gateway's control API in the central fleet-config.yaml
+# (fabric.url). No environment file is written; --gateway and --control-plane
+# are accepted for old callers and ignored.
 #
 # Idempotent: safe to re-run (re-renders the unit, daemon-reload, enable
 # --now is a no-op when already enabled, restart converges onto the unit).
@@ -26,8 +26,6 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 UNIT_SRC="$REPO_ROOT/scripts/herdr-eng-fabric-agent.service"
 UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 UNIT_DST="$UNIT_DIR/herdr-eng-fabric-agent.service"
-ENV_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/herdr-engineering"
-ENV_FILE="$ENV_DIR/fabric.env"
 
 step() { printf '\n\033[1;32m==> %s\033[0m\n' "$*"; }
 warn() { printf '\033[1;33m  ! %s\033[0m\n' "$*"; }
@@ -56,23 +54,10 @@ if [ ! -x "$HERDR_ENG" ]; then
 fi
 echo "  herdr-eng: $HERDR_ENG"
 
-# --- 1/4 gateway + control-plane URLs -> env file ---------------------------
-step "1/4 fabric gateway + control-plane URLs -> $ENV_FILE"
-if [ -n "$GATEWAY_URL" ] && ! grep -q '^HERDR_ENGINEERING_FABRIC_URL=' "$ENV_FILE" 2>/dev/null; then
-  mkdir -p "$ENV_DIR"
-  printf 'HERDR_ENGINEERING_FABRIC_URL=%s\n' "$GATEWAY_URL" >> "$ENV_FILE"
-  chmod 600 "$ENV_FILE"
-  echo "  wrote HERDR_ENGINEERING_FABRIC_URL=$GATEWAY_URL"
-else
-  echo "  unchanged (no --gateway given, or already set)"
-fi
-if ! grep -q '^HERDR_ENGINEERING_CONTROL_PLANE_URL=' "$ENV_FILE" 2>/dev/null; then
-  mkdir -p "$ENV_DIR"
-  printf 'HERDR_ENGINEERING_CONTROL_PLANE_URL=%s\n' "$CONTROL_PLANE_URL" >> "$ENV_FILE"
-  chmod 600 "$ENV_FILE"
-  echo "  wrote HERDR_ENGINEERING_CONTROL_PLANE_URL=$CONTROL_PLANE_URL"
-else
-  echo "  unchanged (control-plane URL already set)"
+# --- 1/4 gateway + control-plane URLs (central config) ---------------------
+step "1/4 gateway + control-plane URLs come from the central fleet-config.yaml"
+if [ -n "$GATEWAY_URL" ] || [ "$CONTROL_PLANE_URL" != "http://dev.lan" ]; then
+  warn "--gateway/--control-plane are ignored: set fabric.url in fleet-config.yaml"
 fi
 
 # --- 2/4 render + install the systemd user unit ----------------------------
@@ -101,7 +86,14 @@ fi
 # --- 4/4 enable + (re)start the service ------------------------------------
 step "4/4 enabling + (re)starting herdr-eng-fabric-agent.service"
 systemctl --user enable herdr-eng-fabric-agent.service >/dev/null 2>&1 || true
-systemctl --user restart herdr-eng-fabric-agent.service
+# HERDR_FABRIC_AGENT_NO_RESTART=1 (the Ansible fleet update): leave a running
+# agent alone; the caller restarts it once, after all of its updates succeeded.
+if [ "${HERDR_FABRIC_AGENT_NO_RESTART:-}" = "1" ] \
+    && systemctl --user is-active herdr-eng-fabric-agent.service >/dev/null 2>&1; then
+  echo "  running agent left alone (HERDR_FABRIC_AGENT_NO_RESTART=1; caller restarts it)"
+else
+  systemctl --user restart herdr-eng-fabric-agent.service
+fi
 systemctl --user is-active herdr-eng-fabric-agent.service >/dev/null 2>&1 \
   && echo "  active: herdr-eng-fabric-agent.service" \
   || warn "  service not active yet — check: systemctl --user status herdr-eng-fabric-agent.service"

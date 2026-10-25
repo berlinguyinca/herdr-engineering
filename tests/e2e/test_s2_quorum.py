@@ -13,14 +13,13 @@ import hashlib
 import json
 import os
 import shutil
-import stat
 import subprocess
 import time
 from pathlib import Path
 
 import pytest
 
-from tests.e2e.harness import E2E, ROOT, principal_id, sha40
+from tests.e2e.harness import E2E, sha40
 
 REPO_SLUG, PR_NUM = "acme/widgets", 7
 PR = f"pr:github.com/{REPO_SLUG}#{PR_NUM}"
@@ -160,6 +159,32 @@ def test_author_attr_is_stored_readable_so_the_author_exclusion_can_match_while_
     assert attrs["author"] == "Author-Login" and attrs["head_sha"] == H1
 
 
+def test_an_untrusted_writer_cannot_set_or_blank_the_pr_author(world):
+    p = world.plane
+    world.pi_pr(H1, author="Author-Login")                 # the trusted writer says: `human` (login Author-Login) is the author
+    world.pi_pr(H1, author="someone-else", key="attacker")  # a LATER write by an untrusted key naming a different author
+    world.pi_pr(H1, author="x", key="attacker")             # ... and a later untrusted write that tries to replace it again
+    world.publish("human", H1)
+    world.publish("r1", H1)
+    q = world.quorum()
+    assert q["status"] == "insufficient" and p.pid("human") not in counted(q)       # author exclusion still applies
+    world.publish("r2", H1)                                   # positive control: a distinct reviewer completes it
+    assert world.quorum()["status"] == "satisfied"
+
+
+def test_without_a_trusted_author_nobody_can_be_vetted_and_an_untrusted_writer_cannot_supply_one(world):
+    world.pi_pr(H1, author=None)                              # trusted head, NO trusted author
+    world.publish("r1", H1)
+    world.publish("r2", H1)
+    assert world.quorum()["status"] == "unknown_author" and world.quorum()["counted"] == []
+    world.pi_pr(H1, author="Author-Login", key="attacker")   # an untrusted key "supplies" an author to unlock the quorum
+    q = world.quorum()
+    assert q["status"] == "unknown_author" and q["counted"] == []
+    world.pi_pr(H1, author="Author-Login")                    # positive control: the trusted writer's author unlocks it
+    q = world.quorum()
+    assert q["status"] == "satisfied" and len(counted(q)) == 2
+
+
 def test_a_reviewer_who_produced_the_pr_cannot_approve_it_and_a_distinct_one_can(world):
     p = world.plane
     world.pi_pr(H1)
@@ -199,10 +224,11 @@ def test_head_change_invalidates_old_verdicts_and_the_real_cli_requests_rereview
     p = world.plane
     world.pi_pr(H1)
     world.publish("r1", H1)
-    world.publish("r2", "%s" % H1)
+    world.publish("r2", H1)
     assert world.quorum()["status"] == "satisfied"
-    req = lambda: world.run("request", "--config", world.cfgs["pi"], "--pr-node", PR, "--state-dir", world.tmp / "state",
-                            "--scratch-dir", world.tmp / "scratch")
+    def req():
+        return world.run("request", "--config", world.cfgs["pi"], "--pr-node", PR, "--state-dir", world.tmp / "state",
+                         "--scratch-dir", world.tmp / "scratch")
     r = req()
     assert r.returncode == 0 and json.loads(r.stdout)["outcome"].startswith("not_needed")     # control: nothing stale yet
     assert not world.dispatch_log.exists()
@@ -367,11 +393,11 @@ def test_gate_fails_closed_on_wrong_target_blocked_quorum_and_unreachable_pr(wor
 
 
 def test_an_old_report_is_refused_by_age_and_a_non_pass_evaluation_overwrites_it(world):
-    gate = Gate(world, max_age=1, name="aged")
+    gate = Gate(world, max_age=6, name="aged")   # a 6 s window: the fresh control has 6 s of load slack; the real binary reads the real clock
     _published_at(world, H1)
     assert gate.evaluate(H1, "h1").returncode == 0
     assert gate.verify()[0].returncode == 0                   # control: fresh
-    time.sleep(2.2)
+    time.sleep(7.0)
     r, body = gate.verify()
     assert r.returncode == 1 and any("older than max_report_age_seconds" in x for x in body["reasons"])
     # an evaluation that cannot reach quorum rewrites the report as a non-pass: the older pass is never trusted again

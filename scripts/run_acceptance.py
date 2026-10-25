@@ -15,8 +15,10 @@ failure, never a pass.
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -38,8 +40,11 @@ def sh(cmd, cwd, timeout=1800):
 
 
 def run_pytest(selection: str | None, regression: bool) -> dict:
-    junit = Path(tempfile.mkdtemp(prefix="t16-junit-")) / "junit.xml"
-    cmd = [sys.executable, "-m", "pytest", "tests/e2e", "-q", "-p", "no:cacheprovider", f"--junitxml={junit}", "-rxX"]
+    junit_dir = Path(tempfile.mkdtemp(prefix="t16-junit-"))
+    junit = junit_dir / "junit.xml"
+    cmd = [sys.executable, "-m", "pytest", "tests/e2e", "-q", "-p", "no:cacheprovider",
+           "-o", "xfail_strict=true", "-m", "e2e or e2e_unit",              # the e2e marker is opt-in: pyproject addopts deselects it by default
+            f"--junitxml={junit}", "-rxX"]
     if selection:
         cmd += ["-k", selection]
     code, out, secs = sh(cmd, ROOT)
@@ -49,8 +54,10 @@ def run_pytest(selection: str | None, regression: bool) -> dict:
             # classname is the dotted module path (tests.e2e.test_x[.Class]): normalise to a file name
             mod = case.get("classname", "").split(".")
             fname = next((m + ".py" for m in mod if m.startswith("test_")), case.get("classname", "?"))
-            row = per_file.setdefault(fname, {"tests": 0, "passed": 0, "failed": 0, "xfailed": 0, "skipped": 0, "gaps": []})
+            row = per_file.setdefault(fname, {"tests": 0, "passed": 0, "failed": 0, "xfailed": 0, "skipped": 0, "gaps": [],
+                                              "seconds": 0.0})
             row["tests"] += 1
+            row["seconds"] = round(row["seconds"] + float(case.get("time") or 0), 1)
             skip = case.find("skipped")
             if case.find("failure") is not None or case.find("error") is not None:
                 row["failed"] += 1
@@ -62,6 +69,7 @@ def run_pytest(selection: str | None, regression: bool) -> dict:
                     row["skipped"] += 1
             else:
                 row["passed"] += 1
+    shutil.rmtree(junit_dir, ignore_errors=True)       # the runner's own temp dir, created above
     result = {"runner": "pytest", "exit": code, "seconds": round(secs, 1), "files": per_file, "tail": out[-1500:]}
     if regression:
         code2, out2, secs2 = sh([sys.executable, "-m", "pytest", "tests/control_plane", "tests/test_central_config_servers.py", "-q",
@@ -80,6 +88,14 @@ def run_node_file(node: str, pi: Path, rel: str) -> dict:
     return {"exit": code, "seconds": round(secs, 1), "tests": num("tests"), "passed": num("pass"), "failed": num("fail"),
             "skipped": num("skipped"), "todo": num("todo"), "cancelled": num("cancelled"), "gaps": gaps,
             "tail": out[-800:] if code else ""}
+
+
+NOTHING_SELECTED = "nothing selected on the herdr side (pytest exit 5): --only picked only Pi-side scenarios, so no herdr test was expected"
+
+
+def herdr_side_empty(manifest: dict, tags: set | None) -> bool:
+    """True when `--only` selects scenarios that have no herdr pytest file, so pytest legitimately collects nothing (exit 5)."""
+    return bool(tags) and not any(spec["scenario"] in tags for spec in manifest["herdr"].values())
 
 
 def judge(manifest: dict, res: dict, pi_results: dict, tags: set | None, pi_files_on_disk: list[str]) -> list[str]:
@@ -101,7 +117,9 @@ def judge(manifest: dict, res: dict, pi_results: dict, tags: set | None, pi_file
     unknown = sorted(set(res["files"]) - {Path(f).name for f in manifest["herdr"]})
     if unknown and not tags:
         failures.append(f"herdr test files not in manifest.yaml: {unknown}")
-    if res["exit"] != 0:
+    if res["exit"] == 5 and herdr_side_empty(manifest, tags) and any(s["scenario"] in tags for s in manifest["pi"].values()):
+        pass                                            # expected: the Pi side is what was selected (main() prints NOTHING_SELECTED)
+    elif res["exit"] != 0:
         failures.append(f"herdr pytest exit {res['exit']}")
     if res.get("regression", {}).get("exit", 0):
         failures.append("herdr regression suite failed")
@@ -119,10 +137,43 @@ def judge(manifest: dict, res: dict, pi_results: dict, tags: set | None, pi_file
             failures.append(f"pi {rel}: ran ZERO tests")
         elif r["tests"] < spec["min_tests"]:
             failures.append(f"pi {rel}: ran {r['tests']} tests, expected at least {spec['min_tests']}")
+        if len(r.get("gaps", [])) > spec.get("max_gap", 0):
+            failures.append(f"pi {rel}: {len(r['gaps'])} tests named GAP, manifest allows {spec.get('max_gap', 0)} "
+                            "(a failing test must not be renamed GAP)")
         if r["exit"] or r["failed"] or r["cancelled"] or r["skipped"] or r["todo"]:
             failures.append(f"pi {rel}: exit {r['exit']}, {r['failed']} failed, {r['cancelled']} cancelled, "
                             f"{r['skipped']} skipped, {r['todo']} todo\n{r['tail']}")
     return failures
+
+
+def xfail_violations(sources: dict[str, str]) -> list[str]:
+    """Every xfail in the Herdr e2e suite must be the `pytest.mark.xfail(..., strict=True)` call form (so an XPASS fails the
+    run). Rejected: a bare `@pytest.mark.xfail` or `pytestmark = pytest.mark.xfail` (non-strict), a `strict` that is not the
+    literal True, `**kwargs` that could hide it, and the imperative `pytest.xfail()`. Skips are caught at run time: any skip
+    fails the run. `sources` maps file name -> python source text."""
+    bad: list[str] = []
+    for name, text in sources.items():
+        tree = ast.parse(text)
+        called = {id(n.func): n for n in ast.walk(tree) if isinstance(n, ast.Call)}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Name) and node.id == "xfail" and isinstance(node.ctx, ast.Load):
+                bad.append(f"{name}:{node.lineno}: bare `xfail` name (use pytest.mark.xfail(strict=True))")
+                continue
+            if not (isinstance(node, ast.Attribute) and node.attr == "xfail"):
+                continue
+            is_marker = isinstance(node.value, ast.Attribute) and node.value.attr == "mark"
+            call = called.get(id(node))
+            if not is_marker:
+                bad.append(f"{name}:{node.lineno}: imperative pytest.xfail() is not allowed (use the strict marker)")
+            elif call is None:
+                bad.append(f"{name}:{node.lineno}: xfail marker used without a call, so it is not strict (needs strict=True)")
+            elif any(k.arg is None for k in call.keywords):
+                bad.append(f"{name}:{node.lineno}: xfail(**kwargs) can hide strict=True; spell it out")
+            else:
+                strict = next((k.value for k in call.keywords if k.arg == "strict"), None)
+                if not (isinstance(strict, ast.Constant) and strict.value is True):
+                    bad.append(f"{name}:{node.lineno}: xfail without strict=True")
+    return bad
 
 
 def main() -> int:
@@ -155,6 +206,8 @@ def main() -> int:
         selection = " or ".join(Path(f).stem for f in wanted) or "nothing_selected"
     res = run_pytest(selection, args.regression)
     report["herdr"] = res
+    if res["exit"] == 5 and herdr_side_empty(manifest, tags):
+        print(f"[herdr] {NOTHING_SELECTED}")
     node = str(cfg.get("node", "node"))
     on_disk = sorted(p.relative_to(pi).as_posix() for p in (pi / "test/e2e").glob("*.e2e.test.ts"))
     for rel, spec in manifest["pi"].items():
@@ -162,17 +215,25 @@ def main() -> int:
             continue
         report["pi"][rel] = run_node_file(node, pi, rel) if (pi / rel).exists() else None
     failures += judge(manifest, res, report["pi"], tags, on_disk)
+    failures += xfail_violations({p.name: p.read_text() for p in sorted((harness.E2E).glob("test_*.py"))})
 
-    # ---- table
-    print("\nscenario  runner  file                                              tests  pass  xfail/GAP  seconds")
+    # ---- table: pass / strict-xfail / GAP are separate columns; a GAP test passes by asserting the CURRENT, incomplete behaviour
+    print("\nscenario  runner  file                                              tests  pass  xfail  GAP  seconds")
+    tot = {"pass": 0, "xfail": 0, "gap": 0}
     for fname, spec in manifest["herdr"].items():
         row = res["files"].get(Path(fname).name)
         if row:
-            print(f"{spec['scenario']:<9} pytest  {fname:<48} {row['tests']:>5} {row['passed']:>5} {row['xfailed']:>10} {res['seconds']:>8}")
+            tot["pass"] += row["passed"]
+            tot["xfail"] += row["xfailed"]
+            print(f"{spec['scenario']:<9} pytest  {fname:<48} {row['tests']:>5} {row['passed']:>5} {row['xfailed']:>6} {'-':>4} {row['seconds']:>8}")
     for rel, r in report["pi"].items():
         if r is None:
             continue
-        print(f"{manifest['pi'][rel]['scenario']:<9} node    {rel:<48} {r['tests']:>5} {r['passed']:>5} {len(r['gaps']):>10} {r['seconds']:>8}")
+        g = len(r["gaps"])
+        tot["pass"] += r["passed"] - g
+        tot["gap"] += g
+        print(f"{manifest['pi'][rel]['scenario']:<9} node    {rel:<48} {r['tests']:>5} {r['passed'] - g:>5} {'-':>6} {g:>4} {r['seconds']:>8}")
+    print(f"\nTOTAL: {tot['pass']} pass, {tot['xfail']} strict-xfail, {tot['gap']} GAP")
     out = Path(args.results)
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps({"failures": failures, **report}, indent=1))
@@ -182,7 +243,10 @@ def main() -> int:
         for f in failures:
             print(" -", f)
         return 1
-    print("\nACCEPTANCE RUN COMPLETE: every suite ran its expected tests with no failures or unexplained skips.")
+    known = tot["xfail"] + tot["gap"]
+    print(f"\nACCEPTANCE RUN COMPLETE: no failures, every suite ran its expected tests. {known} KNOWN GAPS remain "
+          f"({tot['xfail']} strict-xfail + {tot['gap']} GAP-named tests): those mark features that are NOT wired, "
+          "not features that work; see docs/operations/acceptance-evidence.md.")
     return 0
 
 

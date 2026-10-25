@@ -29,6 +29,16 @@ YYYY-MM-DD. The format follows Keep a Changelog.
   to the reader after their join.
 - No migration, no environment variable. Rollback: revert the PR.
 
+### T16 end-to-end acceptance harness
+- New `tests/e2e` suite (scenarios S1-S7) driven by `scripts/run_acceptance.py` against real servers, a real Postgres and a fake `gh`.
+  It is opt-in: plain `pytest` and `scripts/validate.sh` deselect everything marked `e2e`; the runner passes `-m e2e`.
+  Local overrides (autospec binary, Pi checkout, Postgres bin dir) go in the git-ignored `tests/e2e/acceptance.local.yaml`; no environment variables.
+- The runner's verdict guards reject non-strict or bare `xfail`, and report "nothing selected on the herdr side" (pytest exit 5)
+  instead of a failure when `--only` picks Pi-only scenarios.
+- Redaction: `author`, `authors`, `author_login` and `author_name` keys are no longer redacted by name (review quorum compares the
+  author login, and a redacted value let an author approve their own PR). The `sk-` pattern now also matches after an ANSI colour
+  code or `%3D` and keeps ids such as `task-sk-ab` intact.
+
 ### Attention inbox, evidence-based progress and optimization analytics (T15, stacked on #174, #173, #168, #169)
 - New read routes `GET /rooms/{id}/attention|progress|analytics` and `POST /rooms/{id}/attention/ack|snooze|restore`, plus Attention and Progress
   tabs. Everything is derived from what the reader can see in the room graph, review quorum (T06), steering/promotion (T12/T13), proposals (T11),
@@ -51,6 +61,12 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 - New YAML `control_plane.collab.contextual` (everything off by default, `kill_switch`). No environment variable, no migration.
 - Rollback: `contextual.enabled: false`, or revert the PR.
 
+### Alternative implementation forks, comparison and promotion (T13, stacked on T12)
+- New steering actions `fork` and `promote` (opt-in via `steering.actions` and `steering.forks.enabled`), a comparison read model
+  `GET /api/v1/collab/rooms/{id}/forks`, and a Forks panel in the room workbench. Fork preserves the original; nothing is deleted.
+- Promotion is two-step and human-confirmed, promotes exactly one fork at an exact head, and never merges. See `docs/contracts/lineage-events.md` ("T13").
+- Rollback: revert the PR (code only; no migration).
+
 ### Bounded task delegation and artifact proposals (T11, stacked on #170, #167, #165, #164)
 - A room owner can delegate one bounded task (scope, budget, expiry, allowed output kinds) to a coworker's external agent invited with
   `proposals: true`. The agent answers only with an artifact proposal (patch, doc, analysis or link) that waits in quarantine; a room owner
@@ -59,15 +75,10 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 - New YAML kill switch `control_plane.collab.delegation_enabled` (default `false`; works for the combined and `--collab-only` servers). No environment variable.
 - Extends the existing task store, event log and external credentials; new log events are additive; no migration. Defence in depth (untested): an API key whose configured
   role is spelled `external` or `collab` is given principal kind `unknown`, never those service-only kinds. See `docs/operations/bounded-delegation.md` and the T11 addendum of the HCN threat model.
+
 - Hardening after independent review: bounded validator regexes, cheap checks before parsing and parsing outside the lock, strict `---`/`+++` names, `/dev/null` vs hunk
   agreement, wider hard-coded deny-list, CRLF refused, task-list `bounds` limited to owners, open ingest listener refused for the reserved node ids.
 - Rollback: `delegation_enabled: false`, or revert the PR.
-
-### Alternative implementation forks, comparison and promotion (T13, stacked on T12)
-- New steering actions `fork` and `promote` (opt-in via `steering.actions` and `steering.forks.enabled`), a comparison read model
-  `GET /api/v1/collab/rooms/{id}/forks`, and a Forks panel in the room workbench. Fork preserves the original; nothing is deleted.
-- Promotion is two-step and human-confirmed, promotes exactly one fork at an exact head, and never merges. See `docs/contracts/lineage-events.md` ("T13").
-- Rollback: revert the PR (code only; no migration).
 
 ### Lineage graph, Gantt timeline and replay (T09, stacked on #167, #165, #164)
 - Room workbench: new read-only "Lineage" panel (`packages/collab-lineage.js`): layered lineage graph, Gantt timeline with
@@ -81,18 +92,7 @@ YYYY-MM-DD. The format follows Keep a Changelog.
   operator YAML `control_plane.collab.replay_history` (`since_join` default | `full`) sets how far back a member may replay.
 - Rollback: revert the PR (code only).
 
-### Tabs/panes and membership-scoped lineage (T08, stacked on #165 and #164)
-- Lineage `room`/`mission` scopes now resolve to HCN membership: an event that names its `room_id` / `mission_id`
-  (and optionally `workspace_id`) is readable by that room's non-guest members / that mission's listed members (T07),
-  through the new `GET /api/v1/collab/graph/...` routes (node, neighborhood, edge and a per-room type listing);
-  everyone else still gets 404, and a signed-in person never reads `org` lineage. Bare `room`/`mission` stay
-  operator-only and the keyed `/api/v1/graph` API is unchanged. No migration; reads only.
-- Room workbench: new read-only "Tabs" panel (`packages/collab-tabs.js`): primary agents as tabs, spawned subagents as
-  panes, from recorded `spawn` lineage only. Closing a pane never changes the agent.
-- Breaking: `GET /api/v1/collab/graph/nodes` (listing) requires `room_id` (400 otherwise); a key with no
-  `control_plane.lineage_key_scopes` entry can no longer write `room`/`mission` scope (403 `lineage_forbidden`; `"*"` opts in);
-  mission scope needs `room_id`, so stored mission events without it become operator-only after rebuild.
-- Rollback: see `docs/contracts/lineage-events.md` ("T08 rollout and rollback").
+
 ### Head-bound review quorum (T06)
 - Review round 4: head handling is conservative. A lower-sequence write after the applied one is ignored only if it repeats
   the applied head or a head that writer already reported earlier; any other head makes the PR `head_unverified`
@@ -107,6 +107,28 @@ YYYY-MM-DD. The format follows Keep a Changelog.
   `tests/control_plane/fixtures/review-quorum-vectors.json`; statuses `unknown_head`, `head_unverified` (emitter sequence
   reset), `unknown_author`; digests are 64-hex and bound; `reviewer_groups`. Contract: `docs/contracts/lineage-events.md`. Rollback: remove the
   block (endpoint answers 404); no schema or event change.
+
+### Tabs/panes and membership-scoped lineage (T08, stacked on #165 and #164)
+- Lineage `room`/`mission` scopes now resolve to HCN membership: an event that names its `room_id` / `mission_id`
+  (and optionally `workspace_id`) is readable by that room's non-guest members / that mission's listed members (T07),
+  through the new `GET /api/v1/collab/graph/...` routes (node, neighborhood, edge and a per-room type listing);
+  everyone else still gets 404, and a signed-in person never reads `org` lineage. Bare `room`/`mission` stay
+  operator-only and the keyed `/api/v1/graph` API is unchanged. No migration; reads only.
+- Room workbench: new read-only "Tabs" panel (`packages/collab-tabs.js`): primary agents as tabs, spawned subagents as
+  panes, from recorded `spawn` lineage only. Closing a pane never changes the agent.
+- Breaking: `GET /api/v1/collab/graph/nodes` (listing) requires `room_id` (400 otherwise); a key with no
+  `control_plane.lineage_key_scopes` entry can no longer write `room`/`mission` scope (403 `lineage_forbidden`; `"*"` opts in);
+  mission scope needs `room_id`, so stored mission events without it become operator-only after rebuild.
+- Rollback: see `docs/contracts/lineage-events.md` ("T08 rollout and rollback").
+
+### Plannotator bridge: digest echo
+- `herdr-plannotator plan` now prints the `plan_digest` (and `review_id`) the receipt was bound to alongside the upstream decision, computed by the bridge and authoritative over upstream output, so a caller can verify a decision belongs to the exact plan bytes it submitted. Code reviews are unchanged.
+
+### YAML-only fabric agent configuration
+- The fabric agent, its install scripts, the enroll-sync/service-metadata units and the Ansible fabric tasks no longer
+  write or read `fabric.env` (`HERDR_ENGINEERING_FABRIC_URL`). The gateway URL is `fabric.url` in the central
+  `fleet-config.yaml` (fallback: `fabric.gateway_url` in `config.yaml`). `--gateway`/`--control-plane` on the install
+  scripts are ignored with a warning. Existing `fabric.env` files are left in place and are harmless.
 
 ### Lineage graph projection (T02, Herdr side)
 - Migration `0004_sequence_domain_per_principal.sql`: the envelope sequence domain is `(actor id, source)`.
@@ -139,8 +161,40 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 - `EventStore.append` no longer reports every error as a duplicate: only an
   existing `event_id` returns False; other failures propagate.
 
-### Plannotator bridge: digest echo
-- `herdr-plannotator plan` now prints the `plan_digest` (and `review_id`) the receipt was bound to alongside the upstream decision, computed by the bridge and authoritative over upstream output, so a caller can verify a decision belongs to the exact plan bytes it submitted. Code reviews are unchanged.
+### Terminal button on agent pages
+- An agent page has a **Terminal** button (operator only). It shows the exact command
+  that attaches a terminal on the viewer's own machine to the agent's HerdR pane:
+  `ssh -t <host> "bash -lc 'herdr --session <s> agent attach <pane>'"` from another machine,
+  or `herdr --session <s> agent attach <pane>` on the agent's host, each with a Copy button.
+  The server builds it from the recorded session only (strict charsets, never client input)
+  and never runs it. `POST /api/v1/sessions/<id>/terminal`; see
+  `docs/operations/terminal-attach.md`. The old "Copy attach command" line
+  (`ssh host && herdr workspace focus ...`, which ran the second half locally) is gone
+  from the page.
+
+### Host telemetry and fleet provisioning
+- Collector (`host_metrics.py`, run by the fabric agent): CPU, memory, swap, disk and
+  mounts, load, uptime, network, GPU (NVIDIA, ROCm, Apple), top consumers and agent
+  count every 30 s, plus an hourly report of package/security updates, reboot-required,
+  failed units and tool versions. Intervals: `fabric.host_report_interval` and
+  `fabric.host_slow_interval` (YAML only). The agent count is the number of agent
+  processes named in `fabric.agent_binaries` (YAML, default `pi`, `claude`, `codex`).
+- Control plane: validated host metrics with 48 h raw history and 7 d of durable
+  5-minute rollups (max 300 points); `GET /api/v1/hosts/<id>/telemetry?range=1h|24h|7d`;
+  server-side `problems`/`problem_count` on host reads (stale, never_reported, disk,
+  memory, GPU, failed units, security updates, reboot, version drift, update age).
+- Pages: host detail page and richer list cards with range picker, gauges,
+  sparklines, GPU, mounts, top consumers, updates, versions with pin drift, a
+  problems strip and a never-reported state.
+- Ansible: `tailscale` role (joins only from `NeedsLogin`, auth key from Vault) and
+  `fleet-update.yml` with the `herdr_fleet_update` role, run daily by cron on the main
+  host: security-only OS updates, busy-host deferral, pinned herdr-eng revision, one
+  host at a time, agent restart once, `maintenance` flag and a forced single-host run.
+  See `ansible/README.md`.
+- Behaviour changes: `GET /api/v1/hosts/<id>/telemetry?limit=` is now honoured
+  (1..500); host events from non-agent sources (e.g. the fleet update) no longer
+  refresh a host's liveness or create hosts; `versions.herdr` is now the herdr binary
+  version and `herdr_eng` is the herdr-engineering package version.
 
 ### Central fleet config: deploy and servers
 - `deploy/control-plane/deploy.sh` renders the compose variables from the central

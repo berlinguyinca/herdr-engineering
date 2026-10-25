@@ -89,3 +89,26 @@
     executable: /bin/bash
   register: fp_cleanup
   changed_when: false
+
+- name: "Capture AutoSpec source revision"
+  become: false
+  ansible.builtin.command:
+    argv:
+      - git
+      - -C
+      - "{{ fleet_home }}/autospec-runtime-main"
+      - rev-parse
+      - HEAD
+  register: fp_autospec_revision
+  changed_when: false
+  failed_when: false
+
+- name: "Capture installed AutoSpec incident command"
+  become: false
+  ansible.builtin.shell: |
+    {{ fleet_home }}/.autospec/bin/autospec --help 2>/dev/null | grep -qE '^    incident[[:space:]]' && echo active || echo missing
+  args:
+    executable: /bin/bash
+  register: fp_autospec_cli
+  changed_when: false
+  failed_when: false
