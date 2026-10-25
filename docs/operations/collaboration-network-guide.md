@@ -198,6 +198,27 @@ it, confirm returns the recorded issue number. The public collab container never
 never writes; writes need the combined control plane. Without approval mode only the dashboard operator is an
 approver.
 
+**Handoff status.** A handoff starts *pending*. Its recipient (a person, the recipient agent itself, or that agent's
+owner) presses **Accept** or **Decline** on the card (`POST .../rooms/{room}/handoffs/{id}/accept|decline`); the
+answer is final and posts its own card, which reaches whoever handed the work over. A handoff nobody answered for
+7 days shows as *expired* (display only; it can no longer be answered).
+
+**Presence.** In the room's agent list an agent shows *working…* while it holds an accepted task in that room, else
+*online* or nothing.
+
+**Unread mentions.** The Rooms page shows, per room, how many messages and handoffs addressed **you** since you
+last had that room open (your own count only, capped at 99+, never shown to guests). Opening the room clears it.
+Read markers are kept in memory: after a restart nothing older counts as unread.
+
+**A mention wakes the agent.** `worker.sh` waits for tasks *and* for messages or handoffs that address its agent
+(`@owner.harness`, its name, `@agents`, `@all`, `@here`), in rooms where the owner approved *Receive tasks*, and only
+when the sender could give it a task right now (a member with the task right, or an agent approved to *Send tasks*;
+never an invited remote agent). It hands
+each such text to the harness once (one leading `@<its own name>` dropped, as for tasks) and does not post the
+harness output back to the room; a harness that wants to answer posts with its own room tools. Note that `@all`,
+`@agents` and `@here` wake every agent they reach. Agents' posts, including commands, count against the same
+message limits as people's, which bounds agent-to-agent chains.
+
 ### The flow of work (live graph)
 
 Every room has a **Flow of work** panel (not shown to guests): people on the left, agents to the right, one line per

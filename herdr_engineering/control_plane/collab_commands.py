@@ -49,6 +49,8 @@ GITHUB_WRITES = 10              # confirmed writes per principal per GITHUB_WRIT
 GITHUB_WRITE_WINDOW = 600.0
 HANDOFF_TTL = 7 * 24 * 3600.0   # a pending handoff older than this is shown as expired (display only)
 HANDOFF_ANSWERS = 30            # accept/decline per principal per minute
+UNREAD_CAP = 99                 # an unread mention count stops counting here
+UNREAD_SCAN = 5000              # and looks at most this many of a room's newest events
 
 
 def parse_command(text: Any) -> tuple[str, str] | None:
@@ -88,6 +90,8 @@ class CommandsMixin:
         self._drafts: dict[str, dict] = {}
         self._decisions_by_room: dict[str, list] = defaultdict(list)
         self._draft_inflight: set[str] = set()
+        self._read_upto: dict[tuple, int] = {}   # (room, person) -> sequence they last read up to; memory only
+        self._read_floor = 0                     # after a restart nothing older counts as unread
 
     def _people(self) -> dict:
         if self.people_source is not None:
@@ -403,3 +407,120 @@ class CommandsMixin:
             finally:
                 self._draft_inflight.discard(draft_id)
             return {**result, "status": self._drafts[draft_id]["status"], "replayed": False}
+
+    # ---------------------------------------------------------------- C7: handoff answers
+    def answer_handoff(self, pr, room_id: str, handoff_id: str, action: str) -> dict:
+        """The recipient (a person, the recipient agent, or that agent's owner) accepts or declines a pending
+        handoff; the answer is final and posts its own card. An expired handoff (display only) cannot be answered."""
+        from .collab import CollabError
+        if action not in ("accept", "decline"):
+            raise CollabError(400, "answer with accept or decline")
+        with self._lock:
+            room, _ = self._authorize(pr, room_id, "read", "handoff.answer")
+            self._no_external(pr)
+            h = self._handoffs.get(handoff_id) if isinstance(handoff_id, str) else None
+            if h is None or h["room_id"] != room_id:
+                raise CollabError(404, "not found")
+            if not self._is_recipient(pr, h["to"]):
+                raise CollabError(403, "only the recipient may answer a handoff")
+            state = self._handoff_state(h, pr)["status"]
+            if state != "pending":
+                raise CollabError(409, f"this handoff is already {state}")
+            self._throttle("handoff-answer:" + pr.key, HANDOFF_ANSWERS, 60.0, "handoff answer")
+            status = "accepted" if action == "accept" else "declined"
+            # the answer reaches who handed the work over and who posted the handoff (when that was someone else)
+            kind, pid = h["by"].split(":", 1)
+            back = [dict(h["from"])]
+            if ("agent" if kind == "agent" else "person", pid) != (h["from"]["kind"], h["from"]["id"]):
+                back += self._mention_of(room_id, kind, pid)
+            self._commit("handoff_updated", self._actor(
+                pr, project_id=room["project_id"], room_id=room_id, handoff_id=handoff_id, status=status,
+                **{"from": h["from"], "to": h["to"]}, answered_by={"kind": pr.kind, "id": pr.id},
+                sender_key=pr.key, sender_kind=pr.kind, sender_id=pr.id, sender_external=False,
+                mentions=back, visibility_scope="room", action="handoff." + action, outcome="allowed",
+                project_ids=[room["project_id"]], resource_id=handoff_id))
+        return {"handoff_id": handoff_id, "status": status}
+
+    def _mention_of(self, room_id: str, kind: str, pid: str) -> list[dict]:
+        """The stored mention for one principal key part ("user"/"agent", id), if it still has a name here."""
+        want = ("agent" if kind == "agent" else "person", pid)
+        hit = next((m for m in self._address_entries(room_id).values()
+                    if isinstance(m, dict) and (m["kind"], m["id"]) == want), None)
+        return [dict(hit)] if hit else []
+
+    # ---------------------------------------------------------------- C7: presence and unread mentions
+    def _working(self, room_id: str, aid: str) -> bool:
+        """True while the agent holds an accepted (unexpired) task in this room."""
+        return any((t := self._tasks.get(tid)) and t["room_id"] == room_id and self._task_status(t) == "accepted"
+                   for tid in self._tasks_by_target.get(aid, ()))
+
+    def _unread_mentions(self, pr, room_id: str, first: int) -> int:
+        """How many events in this room addressed this person since they last read it (capped)."""
+        floor = max(self._read_upto.get((room_id, pr.id), self._read_floor), first - 1)
+        feed = self._by_room.get(room_id, [])
+        n = 0
+        lo = max(bisect.bisect_right(feed, floor, key=lambda e: e["sequence"]), len(feed) - UNREAD_SCAN)
+        for ev in feed[lo:]:                 # bounded: only the newest UNREAD_SCAN events are looked at
+            p = ev["payload"]
+            if not p.get("mentions") or p.get("sender_key") == pr.key:
+                continue
+            if self._mentions_for(p, pr)[1]:
+                n += 1
+                if n >= UNREAD_CAP:
+                    break
+        return n
+
+    def _mark_read(self, room_id: str, pr) -> None:
+        if not pr.is_agent:
+            self._read_upto[(room_id, pr.id)] = self._seq
+
+    # ---------------------------------------------------------------- C7: mentions that wake an agent
+    def _may_wake(self, p: dict, room: dict) -> bool:
+        """A wake-up runs the agent's harness, so its sender needs the authority create_task needs, NOW: a person
+        with the room's "task" right, an agent with "instruct"; never a remote (external) agent."""
+        if p.get("sender_external"):
+            return False
+        return self._creator_valid({"by_kind": "user" if p.get("sender_kind") == "user" else "agent",
+                                    "by_id": p.get("sender_id")}, room)
+
+    def agent_mentions(self, pr, after: int, limit: int = 20) -> dict:
+        """Messages and handoffs addressed to this agent after sequence `after`, in rooms where it holds
+        `execute` (a mention runs its harness, which only the room owner's approval allows), never its own.
+        `after < 0` starts now: `{"mentions": [], "cursor": <now>}` (no history replay)."""
+        from .collab import CollabError
+        if not pr.is_agent or pr.external:
+            raise CollabError(403, "forbidden")
+        with self._lock:
+            now = self._seq
+            if after < 0:
+                return {"mentions": [], "cursor": now}
+            out, cursor = [], now
+            rows = []
+            for rid in sorted(self._rooms_by_agent.get(pr.id, ())):
+                room = self._rooms.get(rid)
+                eff = self._effective(pr, room) if room else None
+                if not eff or "execute" not in eff[0]:
+                    continue
+                feed = self._by_room.get(rid, [])
+                lo = bisect.bisect_right(feed, max(after, eff[1] - 1), key=lambda e: e["sequence"])
+                rows.extend((ev, room) for ev in feed[lo:] if ev["event_type"] in ("message", "handoff"))
+            rows.sort(key=lambda r: r[0]["sequence"])
+            for ev, room in rows:
+                p = ev["payload"]
+                if (p.get("sender_key") == pr.key or not self._mentions_for(p, pr)[1]
+                        or not self._may_wake(p, room)):
+                    continue
+                if len(out) >= limit:
+                    cursor = out[-1]["sequence"]
+                    break
+                a = self._agents.get(pr.id) or {}
+                if ev["event_type"] == "handoff":
+                    text = f"Handoff from @{p['from']['name']} to you: {p['note']}".rstrip(": ")
+                else:
+                    text = p["text"]
+                out.append({"event_id": ev["event_id"], "sequence": ev["sequence"], "room_id": p["room_id"],
+                            "room_name": room["name"], "kind": ev["event_type"], "text": text,
+                            "from": self._who(p["sender_kind"], p["sender_id"], p.get("sender_external")),
+                            "target_address": self._address(pr.id), "target_name": a.get("name"),
+                            "target_aliases": list(a.get("aliases", ())), "untrusted": True})
+            return {"mentions": out, "cursor": cursor}

@@ -43,21 +43,21 @@ const EVENTS = [
     draft: { draft_id: 'draft-1', kind: 'issue', owner: 'acme', repo: 'app', title: 'Chart breaks', body: '> the chart breaks', status: 'draft', can_confirm: true } },
 ];
 
-async function openRoom(page, later = []) {
-  const requests = [];
+async function openRoom(page, later = [], { events = EVENTS, agents = [], unread = undefined } = {}) {
+  const requests = [], events0 = events;
   let stateCount = 0;
   await page.route('**/api/v1/collab/**', async (route) => {
     const request = route.request(), url = new URL(request.url()), where = url.pathname.replace('/api/v1/collab', '');
     if (request.method() === 'POST') { requests.push({ path: where, body: request.postDataJSON() }); await route.fulfill({ json: {} }); return; }
     let body = {};
     if (where === '/config') body = { client_id: 'test', hosted_ui_domain: 'test', public_url: 'https://example.test', operator: { user_id: 'owner', email: 'owner@example.test' } };
-    else if (where === '/rooms') body = { rooms: [{ room_id: 'room-one', name: 'Review', role: 'owner' }] };
+    else if (where === '/rooms') body = { rooms: [{ room_id: 'room-one', name: 'Review', role: 'owner', unread_mentions: unread }] };
     else if (where === '/admin/users') body = { users: [] };
     else if (where === '/rooms/room-one') body = { room_id: 'room-one', name: 'Review', role: 'owner', members: [] };
     else if (where === '/rooms/room-one/state') {
       stateCount++;
-      const events = stateCount === 1 ? EVENTS : (stateCount === 2 ? later : []);
-      body = { changed: stateCount <= 2, seq: stateCount, next_cursor: stateCount, agents: [], people: PEOPLE, tasks: [], events };
+      const events = stateCount === 1 ? events0 : (stateCount === 2 ? later : []);
+      body = { changed: stateCount <= 2, seq: stateCount, next_cursor: stateCount, agents, people: PEOPLE, tasks: [], events };
       if (stateCount > 2) await new Promise((r) => setTimeout(r, 200));
     }
     await route.fulfill({ json: body });
@@ -66,9 +66,11 @@ async function openRoom(page, later = []) {
     const { mountCollab } = await import('/collab-view.js');
     window.collab = mountCollab(document.querySelector('#host'));
   });
+  if (unread !== undefined) await page.locator('[data-room="room-one"]').waitFor();
+  const badge = unread !== undefined ? await page.locator('[data-room="room-one"] .cx-unread').allInnerTexts() : null;
   await page.locator('[data-room="room-one"]').click();
   await page.locator('.cx-bubble').first().waitFor();
-  return { requests };
+  return { requests, badge };
 }
 
 test('command events render as escaped cards; a draft reaches GitHub only after the explicit confirm', async () => withPage(async (page) => {
@@ -121,5 +123,28 @@ test('a GitHub result settles its draft card', async () => withPage(async (page)
   assert.equal(await draft.locator('[data-draft-confirm]').count(), 0);
   assert.match(await draft.locator('[data-status]').innerText(), /created/i);
   assert.equal(await page.locator('.cx-cmdcard--github a').getAttribute('href'), 'https://github.com/acme/app/issues/12');
+  await page.evaluate(() => window.collab.dispose());
+}));
+
+test('the recipient answers a handoff from its card; the rooms list shows your unread mentions', async () => withPage(async (page) => {
+  const mine = { ...EVENTS[2], handoff: { ...EVENTS[2].handoff, handoff_id: 'h2', to: { kind: 'person', name: 'owner' }, can_answer: true } };
+  const { requests, badge } = await openRoom(page, [], { events: [EVENTS[0], mine], unread: 3 });
+  assert.deepEqual(badge, ['3']);
+  const card = page.locator('[data-handoff="h2"]');
+  await card.getByRole('button', { name: 'Accept' }).click();
+  await page.waitForFunction(() => document.querySelector('[data-handoff-answer="decline"]')?.disabled);
+  assert.deepEqual(requests.filter((r) => r.path.includes('/handoffs/')).map((r) => r.path), ['/rooms/room-one/handoffs/h2/accept']);
+  await page.evaluate(() => window.collab.dispose());
+}));
+
+test('an agent holding a task shows as working in the room roster', async () => withPage(async (page) => {
+  const agents = [{ agent_id: 'a1', name: 'owner.pi', harness_type: 'pi', owner_user_id: 'owner', actions: ['read', 'execute'], presence: 'working', working: true, online: true, address: 'owner.pi', aliases: [], skills: [] },
+    { agent_id: 'a2', name: 'bob.codex', harness_type: 'codex', owner_user_id: 'bob', actions: ['read'], presence: 'offline', working: false, online: false, address: 'bob.codex', aliases: [], skills: [] }];
+  await openRoom(page, [], { events: [EVENTS[0]], agents });
+  await page.locator('[data-sub="agents"]').click();
+  const rows = page.locator('#hcn-roomagents .cx-agentrow');
+  await rows.first().waitFor();
+  assert.match(await rows.nth(0).innerText(), /working…/);
+  assert.doesNotMatch(await rows.nth(1).innerText(), /working|online/);
   await page.evaluate(() => window.collab.dispose());
 }));

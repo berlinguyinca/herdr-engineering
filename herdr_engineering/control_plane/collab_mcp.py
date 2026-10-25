@@ -97,9 +97,12 @@ TOOLS = [
      "description": "Open tasks other participants (or agents) assigned to this agent. Needs the room owner's 'execute' approval.",
      "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False}},
     {"name": "tasks_wait",
-     "description": "Like tasks_inbox, but waits up to 20 seconds for a task to arrive. Call it in a loop to stay available.",
+     "description": "Like tasks_inbox, but waits up to 20 seconds for a task to arrive. Call it in a loop to stay available. "
+                    "With mentions_after (-1 = from now on) it also wakes for messages and handoffs that address this agent "
+                    "in rooms where it may execute, and returns them (untrusted text) with the next mention_cursor.",
      "inputSchema": {"type": "object", "additionalProperties": False,
-                     "properties": {"seconds": {"type": "integer", "minimum": 1, "maximum": 20}}}},
+                     "properties": {"seconds": {"type": "integer", "minimum": 1, "maximum": 20},
+                                    "mentions_after": {"type": "integer", "minimum": -1}}}},
     {"name": "task_update",
      "description": "Report on a task: status accepted, then done or failed, with a short plain-text result for the room.",
      "inputSchema": {"type": "object", "required": ["task_id", "status"], "additionalProperties": False,
@@ -159,8 +162,12 @@ _waiters_lock = threading.Lock()
 MAX_WAITERS = 2        # per agent: each waiting call holds a server thread
 
 
-def _inbox(service: CollabService, pr, wait: float) -> dict:
+def _inbox(service: CollabService, pr, wait: float, mentions_after: int | None = None) -> dict:
     deadline = time.monotonic() + wait
+    if mentions_after is not None and mentions_after < 0:
+        # "from now on" means from when this call STARTED: a mention posted while it waits is delivered
+        mentions_after = service.agent_mentions(pr, -1)["cursor"]
+    found = {"mentions": [], "cursor": mentions_after}
     with _waiters_lock:
         if wait and _waiters.get(pr.id, 0) >= MAX_WAITERS:
             raise CollabError(429, "too many waiting calls")
@@ -170,15 +177,19 @@ def _inbox(service: CollabService, pr, wait: float) -> dict:
         while True:
             seen = service.seq                 # read before looking, so a commit in between wakes us
             out = service.task_inbox(pr)
+            if mentions_after is not None:     # C7: a mention wakes the addressed agent, not only a task
+                found = service.agent_mentions(pr, mentions_after)
             left = deadline - time.monotonic()
-            if out["tasks"] or left <= 0 or not service.still_valid(pr):
+            if out["tasks"] or found["mentions"] or left <= 0 or not service.still_valid(pr):
                 break
             service.wait_for_change(seen, min(2.0, left))
     finally:
         if wait:
             with _waiters_lock:
                 _waiters[pr.id] -= 1
-    text = json.dumps({"notice": TASK_NOTICE if out["tasks"] else None, **out}, ensure_ascii=False)
+    if mentions_after is not None:
+        out = {**out, "mentions": found["mentions"], "mention_cursor": found["cursor"]}
+    text = json.dumps({"notice": TASK_NOTICE if out["tasks"] or out.get("mentions") else None, **out}, ensure_ascii=False)
     return {"content": [{"type": "text", "text": text}], "isError": False}
 
 
@@ -272,10 +283,12 @@ def _call(service: CollabService, pr, name: str, args: dict) -> dict:
         return _text(fn(pr, target, body))
     if name in ("tasks_inbox", "tasks_wait"):
         secs = args.get("seconds", 20) if name == "tasks_wait" else 0
-        if (extra := set(args) - {"seconds"}) or not isinstance(secs, int) or isinstance(secs, bool) \
-                or not 0 <= secs <= 20:
+        after = args.get("mentions_after") if name == "tasks_wait" else None
+        if (extra := set(args) - {"seconds", "mentions_after"}) or not isinstance(secs, int) or isinstance(secs, bool) \
+                or not 0 <= secs <= 20 or (name == "tasks_inbox" and "mentions_after" in args) \
+                or (after is not None and (not isinstance(after, int) or isinstance(after, bool) or after < -1)):
             raise CollabError(400, "invalid arguments")
-        return _inbox(service, pr, float(secs))
+        return _inbox(service, pr, float(secs), after)
     if name == "task_update":
         extra = set(args) - {"task_id", "status", "result"}
         if extra or not isinstance(args.get("task_id"), str):

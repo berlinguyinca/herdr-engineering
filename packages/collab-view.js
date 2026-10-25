@@ -19,7 +19,7 @@ import { ensureConversationStyles, mountComposer } from './conversation-composer
 import { providers, ROOM_COMMANDS, unresolvedMentions, ambiguousMentions, mentionChips, refChips, resolveToken, quiet } from './collab-mention.js';
 import { renderMarkdown } from './conversation-markdown.js';
 import { mountFilesShelf, fileSize } from './collab-files-view.js';
-import { commandCard, isCommandEvent } from './collab-cards.js';
+import { commandCard, isCommandEvent, presenceLabel, unreadBadge } from './collab-cards.js';
 import {
   AuthError, CollabApi, TokenStore, authorizeUrl, exchangeCode, parseRedirect, pkcePair, randomString,
 } from './herdr-web-client/collab.js';
@@ -225,7 +225,7 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
     const strip = await tabsStrip(null, '/rooms');
     frame('/rooms', `<div class="cx-head"><div><h1>Rooms</h1><p class="cx-sub">Conversations you and your agents can take part in.</p></div></div>
       ${rooms.length ? `<div class="hd-grid" id="hcn-rooms">${rooms.map((r) => `<button type="button" class="hd-card cx-room" data-room="${esc(r.room_id)}">
-          <span class="hd-card__title">${esc(r.name)}</span>
+          <span class="hd-card__title">${esc(r.name)}${unreadBadge(r)}</span>
           <span class="cx-row cx-row--between">${pill(roleLabel(r.role), r.role === 'owner' ? 'var(--accent)' : 'var(--status-active)')}<span class="hd-card__sub">Open →</span></span></button>`).join('')}</div>`
         : '<div class="hd-empty">No rooms yet. Create your first one below.</div>'}
       ${operator ? '<div id="hcn-helpers-panel"></div>' : ''}
@@ -756,7 +756,7 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
     const namedAgent = a => ({...a,display_name:S.flow?.nodes?.find(n=>n.agent_id===a.agent_id)?.fabric?.display_name});
     const drawRoomAgents = () => {
       const mine = new Set(S.mine.map((a) => a.agent_id));
-      const html = S.agents.length ? `<ul class="cx-list">${S.agents.map((a) => `<li class="cx-agentrow"><span class="grow">${agentTitle(namedAgent(a), mine.has(a.agent_id) || operator)}<span class="cx-sub1">${esc(a.harness_type)} · ${esc(names.get(a.owner_user_id) || shortId(a.owner_user_id))}</span></span><span class="cx-pills">${permPills(a.actions)}</span>${(canInvite || mine.has(a.agent_id)) ? `<button type="button" class="hd-btn hd-btn--danger hd-btn--sm" data-rmagent="${esc(a.agent_id)}">Remove</button>` : ''}</li>`).join('')}</ul>` : '<div class="hd-empty">No agents in this room yet.</div>';
+      const html = S.agents.length ? `<ul class="cx-list">${S.agents.map((a) => `<li class="cx-agentrow"><span class="grow">${agentTitle(namedAgent(a), mine.has(a.agent_id) || operator)}<span class="cx-sub1">${esc(a.harness_type)} · ${esc(names.get(a.owner_user_id) || shortId(a.owner_user_id))}${presenceLabel(a) ? ` · <span class="cx-presence" data-presence="${esc(a.presence || 'online')}">${esc(presenceLabel(a))}</span>` : ''}</span></span><span class="cx-pills">${permPills(a.actions)}</span>${(canInvite || mine.has(a.agent_id)) ? `<button type="button" class="hd-btn hd-btn--danger hd-btn--sm" data-rmagent="${esc(a.agent_id)}">Remove</button>` : ''}</li>`).join('')}</ul>` : '<div class="hd-empty">No agents in this room yet.</div>';
       if (put('hcn-roomagents', html)) { $('hcn-roomagents').querySelectorAll('[data-rmagent]').forEach((b) => { b.onclick = () => act(() => api.removeAgent(roomId, b.dataset.rmagent)); }); wireRename($('hcn-roomagents'), redraw('hcn-roomagents')); }
     };
     const drawTaskTargets = () => {
@@ -1426,6 +1426,11 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
         const id = pick.dataset.select;
         if (S.selected.has(id)) S.selected.delete(id); else if (S.selected.size < 20) S.selected.add(id);
         pick.setAttribute('aria-pressed', String(S.selected.has(id)));
+      }
+      const ans = ev.target.closest && ev.target.closest('[data-handoff-answer]');
+      if (ans) {
+        ans.closest('.cx-cmdcard__actions')?.querySelectorAll('button').forEach((b) => { b.disabled = true; });
+        act(() => api.answerHandoff(roomId, ans.dataset.handoffId, ans.dataset.handoffAnswer));
       }
       const conf = ev.target.closest && ev.target.closest('[data-draft-confirm]');
       if (conf) {

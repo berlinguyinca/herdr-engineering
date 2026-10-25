@@ -123,3 +123,47 @@ def test_fleet_end_to_end_register_approve_work_and_delegate(stack, shim, tmp_pa
     sub = [x for x in tasks["tasks"] if x["target_agent_id"] == ids["fleet-2"]]
     assert sub and sub[0]["text"] == "sub-task; $(touch /tmp/pwned2)" and sub[0]["requested_by"]["type"] == "agent"
     assert not Path("/tmp/pwned2").exists()
+
+
+def test_a_mention_wakes_the_worker_which_hands_the_text_to_its_harness_once(stack, shim, tmp_path):
+    """C7: a message that addresses the agent (no task) reaches worker.sh, which runs the harness on it once;
+    an unaddressed message does not, and the room keeps the literal text."""
+    api = main_api(stack)
+    s, p = api.call("POST", f"{BASE}/projects", {"name": "p"}, user="alice")
+    s, r = api.call("POST", f"{BASE}/projects/{p['project_id']}/rooms", {"name": "r"}, user="alice")
+    room = r["room_id"]
+    s, tok = api.call("POST", f"{BASE}/agents/join-tokens", {
+        "harness_type": "claude-code", "name_prefix": "mw", "count": 1, "room_id": room,
+        "actions": ["read", "post", "execute"]}, user="alice")
+    assert s == 201, tok
+    base = f"http://127.0.0.1:{stack.srv.public_port}"
+    env = {**shim, "HERDR_AGENT_DIR": str(tmp_path / "agents")}
+    bundle = tmp_path / "bundle.sh"
+    bundle.write_text(generate("bundleScript", base, tok["token"], 1, "mw"))
+    assert subprocess.run(["bash", str(bundle)], env=env, capture_output=True, text=True, timeout=60).returncode == 0
+    agent_file = tmp_path / "agents" / "mw-1.json"
+    s, reqs = api.call("GET", f"{BASE}/rooms/{room}/agent-requests", user="alice")
+    api.call("POST", f"{BASE}/rooms/{room}/agent-requests/approve-all",
+             {"request_ids": [x["request_id"] for x in reqs["requests"]]}, user="alice")
+    got = tmp_path / "got.txt"
+    worker_env = {**env, "HERDR_AGENT_CMD": f"{{ cat; echo; echo ==; }} >> '{got}'; echo seen"}
+    proc = subprocess.Popen(["bash", str(tmp_path / "agents" / "worker.sh"), str(agent_file)], env=worker_env,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, text=True)
+    try:
+        time.sleep(2)                                                   # the worker takes its mention cursor
+        say = lambda text, key: api.call("POST", f"{BASE}/rooms/{room}/messages",  # noqa: E731
+                                         {"text": text, "idempotency_key": key}, user="alice")
+        assert say("nobody is addressed here", "m1")[0] == 201
+        assert say("@mw-1 /skill:check the build", "m2")[0] == 201
+        for _ in range(60):
+            if got.exists() and "==" in got.read_text():
+                break
+            time.sleep(0.5)
+        time.sleep(3)                                                   # a second wait must not repeat it
+        assert got.read_text() == "/skill:check the build\n==\n"         # own leading address dropped, once
+        s, ev = api.call("GET", f"{BASE}/rooms/{room}/events?cursor=0", user="alice")
+        assert any(e.get("text") == "@mw-1 /skill:check the build" for e in ev["events"])   # the room keeps it
+        assert not [e for e in ev["events"] if e.get("text") == "seen"]   # the harness output is not posted back
+    finally:
+        proc.terminate()
+        proc.wait(5)

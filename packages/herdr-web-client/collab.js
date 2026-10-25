@@ -117,6 +117,11 @@ export class CollabApi {
   // Room commands (C6): an approver's explicit confirm is the only way a draft reaches GitHub.
   confirmDraft(room, draft) { return this.call('POST', `/rooms/${encodeURIComponent(room)}/drafts/${encodeURIComponent(draft)}/confirm`, {}); }
   decisions(room) { return this.call('GET', `/rooms/${encodeURIComponent(room)}/decisions`); }
+  // C7: the recipient accepts or declines a handoff (the server checks who may)
+  async answerHandoff(room, handoff, answer) {
+    if (answer !== 'accept' && answer !== 'decline') throw new Error('answer with accept or decline');
+    return this.call('POST', `/rooms/${encodeURIComponent(room)}/handoffs/${encodeURIComponent(handoff)}/${answer}`, {});
+  }
   // Room files (C5): uploads are raw bytes (never a form), downloads come back as a Blob to save, never to display.
   async rawCall(method, path, body) {
     const t = this.getTokens();

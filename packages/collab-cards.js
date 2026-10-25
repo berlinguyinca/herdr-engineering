@@ -46,3 +46,15 @@ export function commandCard(e, ctx = {}) {
   const ref = issueRef(g.owner, g.repo, g.number);
   return card('github', `${head(g.kind === 'issue' ? 'Issue created' : 'Issue assigned', e)}<div>${url ? `<a href="${esc(url)}" target="_blank" rel="noopener noreferrer">${ref}</a>` : ref}${g.kind === 'issue' ? '' : `${g.login ? ` → ${esc(g.login)}` : ''}`}</div>`);
 }
+
+// C7: an agent's presence for the roster ("working…" while it holds an accepted task) and a room's unread
+// mention badge (your own count only; the server sends none to a guest).
+export function presenceLabel(a) {
+  if (a?.presence === 'working') return 'working…';
+  if (a?.presence === 'online' || (!a?.presence && a?.online)) return 'online';
+  return '';
+}
+export function unreadBadge(room) {
+  const n = Number(room?.unread_mentions) || 0;
+  return n > 0 ? `<span class="cx-unread" title="${n >= 99 ? '99 or more' : n} unread mention${n === 1 ? '' : 's'}">${n >= 99 ? '99+' : n}</span>` : '';
+}

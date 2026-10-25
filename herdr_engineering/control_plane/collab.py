@@ -531,6 +531,7 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FilesMixin, Co
                 self._apply(ev)
             for k, v in self._usage_reserved.items():
                 self._usage[k] = max(self._usage[k], v)      # restart: the durable ceiling, never lower than used
+            self._read_floor = self._seq                     # read markers are memory only: nothing old is unread
             # helper_task is always committed right before its helper_requested (two commits under one lock):
             # a text still waiting here belongs to a request whose second commit failed. Drop it.
             self._helper_text.clear()
@@ -1201,8 +1202,12 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FilesMixin, Co
             for rid, room in self._rooms.items():
                 m = self._member(room, pr.id)
                 if m:
+                    guest = m["role"] == "guest"
+                    eff = None if guest else self._effective(pr, room)
                     out.append({"room_id": rid, "name": room["name"], "role": m["role"],
-                                "project_id": room["project_id"] if m["role"] != "guest" else None})
+                                "project_id": room["project_id"] if not guest else None,
+                                # your own count only, never for a guest (C7)
+                                "unread_mentions": self._unread_mentions(pr, rid, eff[1]) if eff else None})
         return {"rooms": out}
 
     def get_room(self, pr: Principal, room_id: str) -> dict:
@@ -3285,6 +3290,7 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FilesMixin, Co
                 raise CollabError(429, "too many open room views")
             self._state_waiters[pr.key] += 1
             self._mark_seen(room_id, pr)
+            self._mark_read(room_id, pr)
         try:
             with self._cv:
                 while True:
@@ -3325,6 +3331,7 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FilesMixin, Co
             with self._cv:
                 self._state_waiters[pr.key] -= 1
                 self._mark_seen(room_id, pr)
+                self._mark_read(room_id, pr)
 
     FLOW_TASKS = 60
 
@@ -3462,7 +3469,10 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FilesMixin, Co
                                 "owner_user_id": a["owner"], "actions": g["actions"],
                                 "external": bool(a.get("external")), "address": self._address(aid),
                                 "aliases": list(a.get("aliases", ())), "skills": list(a.get("skills", ())),
-                                "online": self._online(room_id, "agent", aid)})
+                                "online": self._online(room_id, "agent", aid),
+                                "working": (busy := self._working(room_id, aid)),
+                                "presence": "working" if busy else (
+                                    "online" if self._online(room_id, "agent", aid) else "offline")})
         return {"agents": out}
 
     # -- room <-> workspace and mission links
@@ -5471,6 +5481,8 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FilesMixin, Co
                         return 200, self.delete_file(pr, rid, parts[3])
                     if n == 5 and parts[2] == "drafts" and parts[4] == "confirm":
                         return 200, self.confirm_draft(pr, rid, parts[3])
+                    if n == 5 and parts[2] == "handoffs" and parts[4] in ("accept", "decline"):
+                        return 200, self.answer_handoff(pr, rid, parts[3], parts[4])
             raise CollabError(404, "not found")
         except CollabError as exc:
             err = {"error": exc.message, **getattr(exc, "extra", {})}

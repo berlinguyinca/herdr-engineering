@@ -166,6 +166,8 @@
 .cx-cmdcard__note { white-space: pre-wrap; color: var(--text); }
 .cx-cmdcard__body { white-space: pre-wrap; max-height: 240px; overflow: auto; font-size: .75rem; background: var(--surface-2); padding: 6px 8px; border-radius: 6px; }
 .cx-cmdcard__actions { margin-top: 6px; gap: 6px; }
+.cx-unread { margin-left: 8px; min-width: 18px; padding: 0 6px; border-radius: 999px; background: var(--accent); color: var(--text-on-accent); font-size: .6875rem; font-weight: 700; vertical-align: middle; }
+.cx-presence[data-presence="working"] { color: var(--status-attention); font-weight: 600; }
 .cx-pick { margin-left: auto; border: 1px solid var(--border-subtle); background: none; color: var(--text-muted); border-radius: 6px; font-size: .6875rem; padding: 0 6px; cursor: pointer; opacity: .5; }
 .cx-m:hover .cx-pick, .cx-pick:focus-visible, .cx-pick[aria-pressed="true"] { opacity: 1; }
 .cx-pick[aria-pressed="true"] { background: var(--accent); color: var(--text-on-accent); border-color: transparent; }
