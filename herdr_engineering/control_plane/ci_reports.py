@@ -8,6 +8,7 @@ import hashlib
 import json
 import math
 from datetime import datetime
+from urllib.parse import urlsplit
 from xml.etree import ElementTree
 
 from .redact import redact_text
@@ -25,6 +26,23 @@ def _text(value, limit=500):
 
 def _tag(element):
     return element.tag.rsplit('}', 1)[-1]
+
+
+def normalize_provider_url(value):
+    """Accept only credential-free provider base URLs, before persistence."""
+    if (not isinstance(value, str) or not value or len(value) > 1000 or
+            not value.isprintable() or any(c.isspace() for c in value) or
+            redact_text(value) != value or '[REDACTED]' in value):
+        raise ValueError('Invalid provider_url')
+    try:
+        parsed = urlsplit(value)
+        if (parsed.scheme not in {'https', 'http'} or not parsed.hostname or
+                parsed.username or parsed.password or parsed.query or parsed.fragment):
+            raise ValueError()
+        parsed.port
+    except ValueError:
+        raise ValueError('Invalid provider_url') from None
+    return value.rstrip('/')
 
 
 def parse_junit(xml):
@@ -61,8 +79,11 @@ def parse_junit(xml):
             suite = _text(' / '.join(suite_path))
             # Hash full original labels before redaction/truncation so display
             # collisions cannot create false retry or flakiness evidence.
+            labels = [suite_path, node.get('classname', ''), node.get('name', '')]
+            if node.get('file'):
+                labels.append(node.get('file'))
             identity = hashlib.sha256(json.dumps(
-                [suite_path, node.get('classname', ''), node.get('name', '')],
+                labels,
                 ensure_ascii=True).encode()).hexdigest()
             occurrence = identities.get(identity, 0)
             identities[identity] = occurrence + 1
@@ -75,6 +96,8 @@ def parse_junit(xml):
                               duration_ms=round(seconds * 1000),
                               message=_text(detail.get('message'), 2000) if detail is not None else '',
                               trace=_text(''.join(detail.itertext()), 4000) if detail is not None else ''))
+            if node.get('file'):
+                tests[-1]['file'] = _text(node.get('file'))
         else:
             pending.extend((child, suite_path) for child in reversed(list(node)))
     summary = {state: sum(test['status'] == state for test in tests)
@@ -90,6 +113,8 @@ def normalize_report(body, stamp):
     if not isinstance(body, dict):
         raise ValueError('Report must be a JSON object')
     values = {}
+    if body.get('provider_url') is not None:
+        values['provider_url'] = normalize_provider_url(body['provider_url'])
     for key in ('repository', 'branch', 'revision'):
         value = body.get(key)
         if not isinstance(value, str) or not value.strip() or len(value) > 500:
@@ -101,6 +126,8 @@ def normalize_report(body, stamp):
     provider = body.get('provider_repo_id')
     if provider is not None and (isinstance(provider, bool) or not isinstance(provider, (str, int)) or not str(provider) or len(str(provider)) > 300):
         raise ValueError('provider_repo_id must be a string or integer')
+    if isinstance(provider, str):
+        provider = _text(provider)
     reported = body.get('reported_at', stamp)
     try:
         if not isinstance(reported, str) or len(reported) > 80 or datetime.fromisoformat(reported.replace('Z', '+00:00')).tzinfo is None:
@@ -131,7 +158,7 @@ def reconcile_report_identities(reports, pipelines):
                for field in ('repository', 'branch', 'revision')):
             continue
         identity = tuple(pipeline.get(field) for field in fields)
-        candidates.setdefault(identity, {})[str(provider_id)] = provider_id
+        candidates.setdefault(identity, {})[(pipeline.get('provider_url'), str(provider_id))] = provider_id
     for report in reports:
         provided = report.get('provider_repo_id')
         report['uploaded_provider_repo_id'] = provided
@@ -139,6 +166,9 @@ def reconcile_report_identities(reports, pipelines):
             report['identity_status'] = 'provided'
             continue
         matches = candidates.get(tuple(report.get(field) for field in fields), {})
+        if report.get('provider_url') is not None:
+            matches = {key: value for key, value in matches.items()
+                       if key[0] == report['provider_url']}
         if len(matches) == 1:
             report['provider_repo_id'] = next(iter(matches.values()))
             report['identity_status'] = 'matched_observation'
@@ -150,7 +180,8 @@ def reconcile_report_identities(reports, pipelines):
     # then follow actual arrival order, while preserving the original receipt.
     attempts = {}
     for report in reversed(reports):
-        identity = (report['repository'], str(report.get('provider_repo_id')), report['run_number'])
+        identity = (report.get('provider_url'), report['repository'],
+                    str(report.get('provider_repo_id')), report['run_number'])
         uploaded = report.get('attempt', 1)
         report['uploaded_attempt'] = uploaded
         report['attempt'] = max(uploaded, attempts.get(identity, 0) + 1)

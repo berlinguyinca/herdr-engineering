@@ -1669,8 +1669,8 @@ class ControlPlaneRepo:
             projected = copy.deepcopy(report)
             reconcile_report_identities([projected], history["pipelines"])
             attempts = [row.get("attempt", 1) for row in history["reports"]
-                        if (row.get("repository"), str(row.get("provider_repo_id")), row.get("run_number")) ==
-                           (projected["repository"], str(projected["provider_repo_id"]), projected["run_number"])]
+                        if (row.get("provider_url"), row.get("repository"), str(row.get("provider_repo_id")), row.get("run_number")) ==
+                           (projected.get("provider_url"), projected["repository"], str(projected["provider_repo_id"]), projected["run_number"])]
             report["attempt"] = max(attempts, default=0) + 1
             report["ingested_at"] = self._stamp()
             self.record_event("ci_report", report["report_id"], "CITestReportReceived", report,
@@ -1679,8 +1679,14 @@ class ControlPlaneRepo:
             return copy.deepcopy(report)
 
     def observe_ci_pipeline(self, row):
+        from .ci_reports import normalize_provider_url
+        if row.get('provider_url') is not None:
+            row = {**row, 'provider_url': normalize_provider_url(row['provider_url'])}
         row = redact_payload(copy.deepcopy(row))
         key = f"{row.get('provider_repo_id') or row.get('repository')}:{row.get('run_number')}"
+        if row.get('provider_url') is not None:
+            key = json.dumps([row['provider_url'], str(row.get('provider_repo_id')),
+                              row.get('repository'), row.get('run_number')], separators=(',', ':'))
         with self._event_lock:
             previous = self._events.get(("ci_observation", key), [])
             if previous and previous[-1]["payload"] == row:
@@ -1743,6 +1749,35 @@ class ControlPlaneRepo:
                               "byte_limit_per_kind": HISTORY_BYTES,
                               "report_count": len(reports), "pipeline_count": len(pipelines),
                               "description": "Uploaded test reports and observed provider runs only; missing reports do not mean zero tests."}}
+
+    def ci_test_history(self, repository=None, branch=None, test=None, days=30):
+        """Project bounded durable report events; no provider reads or new journal."""
+        from datetime import UTC, datetime
+
+        from .ci_observability import CIObservationStore, bind_report_provider
+        from .ci_performance import _timestamp
+
+        with self._event_lock:
+            history = self.ci_reports()
+            now = datetime.fromtimestamp(self._now(), UTC)
+        store = CIObservationStore(wall_now=lambda: now)
+        for row in reversed(history['pipelines']):
+            store.record_pipeline(row)
+        unjoined = []
+        for row in reversed(history['reports']):
+            if not store.record_report(bind_report_provider(row, history['pipelines'])):
+                unjoined.append(row)
+        view = store.test_summary(repository=repository, branch=branch, test=test, days=days)
+        end = now.timestamp()
+        unjoined_count = sum(
+            (repository is None or row['repository'] == repository) and
+            (branch is None or row['branch'] == branch) and
+            (stamp := _timestamp(row.get('reported_at'))) is not None and
+            end - days * 86400 <= stamp <= end for row in unjoined)
+        view['scope'].update(persistence=history['scope']['persistence'],
+                             memory_only=self._sink is None,
+                             unjoined_report_count=unjoined_count)
+        return view
 
     # --------------------------------------------------------------- events
     def record_event(self, entity_type, entity_id, event_type, payload=None,

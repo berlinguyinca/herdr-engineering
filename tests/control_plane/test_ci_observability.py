@@ -199,3 +199,141 @@ def test_combined_byte_budget_bounds_pipeline_and_report_projections():
     assert store._bytes == sum(len(json.dumps(row, separators=(',', ':')).encode())
                                for row, _ in store._entries.values())
     assert store.summary({})['scope']['truncated'] is True
+
+
+def case_report(*, status='passed', seconds=1, **values):
+    detail = '<failure message="token=synthetic-private">bounded stack</failure>' if status == 'failed' else '<skipped/>' if status == 'skipped' else ''
+    return normalize_report({**pipeline(), 'xml':
+        f'<testsuite name="unit"><testcase classname="Checks" name="works" time="{seconds}">{detail}</testcase></testsuite>',
+        **values}, STAMP)
+
+
+def test_test_history_counts_timestamps_quantiles_and_bounded_evidence(store):
+    for number in range(1, 7):
+        store.record_report(case_report(run_number=number, revision=str(number), seconds=number,
+            status='failed' if number in (1, 3) else 'passed',
+            reported_at=f'2026-10-{18 + number:02d}T12:00:00+00:00'))
+    view = store.test_summary(repository='org/app', branch='main', days=7)
+    row = view['tests'][0]
+    assert row['passed'] == 4 and row['failed'] == 2 and row['completed_count'] == 6
+    assert row['failure_rate'] == pytest.approx(2 / 6)
+    assert row['first_failure'] == '2026-10-19T12:00:00+00:00'
+    assert row['last_pass'] == '2026-10-24T12:00:00+00:00'
+    assert row['last_duration_ms'] == 6000
+    assert row['duration_ms']['sample_count'] == 6
+    assert row['duration_ms']['p50'] == 3000 and row['duration_ms']['p95'] == 6000
+    assert row['classification'] == 'inconsistent_outcomes'
+    assert row['evidence_availability'] == 'reported'
+    assert row['failure_evidence']['message'] == '[REDACTED]'
+    assert row['failure_evidence']['trace'] == 'bounded stack'
+    assert {ref['run_number'] for ref in row['representative_runs']} == {1, 3, 6}
+    assert 'synthetic-private' not in json.dumps(view)
+    row['representative_runs'].clear()
+    assert store.test_summary()['tests'][0]['representative_runs']
+
+
+def test_retry_evidence_is_deduplicated_and_requires_same_revision(store):
+    failed = case_report(status='failed')
+    passed = case_report()
+    store.record_report(failed)
+    store.record_report(failed)
+    store.record_report(passed)
+    store.record_report(passed)
+    row = store.test_summary()['tests'][0]
+    assert row['classification'] == 'proven_flaky'
+    assert row['passed'] == row['failed'] == row['inconsistent_count'] == 1
+    assert row['same_revision_retries'][0]['revision'] == 'abc'
+    assert len(row['same_revision_retries'][0]['runs']) == 2
+    assert row['duration_ms']['p95'] is None
+    assert row['duration_ms']['sample_count'] == 2
+
+
+def test_skipped_reports_and_absent_reports_are_not_success_or_failure(store):
+    store.record_pipeline(pipeline())
+    missing = store.test_summary()
+    assert missing['tests'] == []
+    assert missing['scope']['not_reported_run_count'] == 1
+    assert missing['scope']['evidence_availability'] == 'not_reported'
+    store.record_report(case_report(status='skipped'))
+    row = store.test_summary()['tests'][0]
+    assert row['completed_count'] == 0 and row['failure_rate'] is None
+    assert row['classification'] == 'stable'
+    assert row['first_failure'] is None and row['last_pass'] is None
+    assert row['duration_ms']['sample_count'] == 0
+
+
+def test_test_history_keeps_providers_and_branches_separate(store):
+    store.record_report(case_report(status='failed'))
+    store.record_report(case_report(provider_url='https://other.example'))
+    store.record_report(case_report(provider_repo_id=18))
+    store.record_report(case_report(branch='topic'))
+    rows = store.test_summary()['tests']
+    assert len(rows) == 4
+    assert {row['classification'] for row in rows} == {'stable'}
+    assert len(store.test_summary(branch='main')['tests']) == 3
+    assert store.test_summary(test='nonexistent')['tests'] == []
+    assert len(store.test_summary(test=rows[0]['id'])['tests']) == 4
+
+
+def test_test_history_window_is_utc_inclusive_and_excludes_future_and_unknown_times(store):
+    for number, stamp in enumerate(('2026-10-18T05:00:00-07:00',
+                                   '2026-10-18T11:59:59+00:00', STAMP,
+                                   '2026-10-25T12:00:01+00:00'), 1):
+        store.record_report(case_report(run_number=number, reported_at=stamp))
+    store.record_report({**case_report(run_number=5), 'reported_at': None})
+    row = store.test_summary(days=7)['tests'][0]
+    assert row['passed'] == 2
+    assert store.test_summary(days=7)['scope']['unknown_time_report_count'] == 1
+
+
+@pytest.mark.parametrize('filters', [{'days': True}, {'days': 0}, {'days': 31},
+                                     {'test': ''}, {'branch': []}, {'repository': 'x' * 501}])
+def test_test_history_rejects_invalid_filters(store, filters):
+    with pytest.raises(ValueError):
+        store.test_summary(**filters)
+
+
+def test_test_cases_consume_the_existing_shared_retention_budget():
+    from herdr_engineering.control_plane.ci_observability import CIObservationStore
+    bounded = CIObservationStore(report_limit=2, byte_limit=4096,
+                                 wall_now=lambda: datetime.fromisoformat(STAMP))
+    for number in range(1, 10):
+        bounded.record_report(case_report(run_number=number))
+    view = bounded.test_summary()
+    assert view['tests'][0]['passed'] == 2
+    assert view['scope']['truncated'] is True
+    assert bounded._bytes <= 4096
+
+
+def test_test_history_does_not_echo_secret_filter_values(store):
+    with pytest.raises(ValueError):
+        store.test_summary(repository='token=synthetic-private')
+
+
+def test_invalid_case_projection_cannot_become_test_history(store):
+    invalid = case_report()
+    invalid['tests'][0]['status'] = 'failed'
+    store.record_pipeline(pipeline())
+    store.record_report(invalid)
+    view = store.test_summary()
+    assert view['tests'] == []
+    assert view['scope']['evidence_availability'] == 'not_reported'
+    assert view['scope']['not_reported_run_count'] == 1
+
+
+def test_replayed_equivalent_reports_do_not_erase_first_failure_time(store):
+    first = case_report(status='failed', reported_at='2026-10-20T00:00:00Z')
+    store.record_report(first)
+    store.record_report({**first, 'reported_at': STAMP, 'ingested_at': STAMP})
+    row = store.test_summary()['tests'][0]
+    assert row['failed'] == 1
+    assert row['first_failure'] == '2026-10-20T00:00:00+00:00'
+
+
+def test_latest_run_summary_preserves_retry_outcome_when_old_upload_is_replayed(store):
+    store.record_pipeline(pipeline())
+    first = case_report(status='failed')
+    store.record_report(first)
+    store.record_report(case_report())
+    store.record_report(first)
+    assert store.summary()['pipelines'][0]['test_summary']['passed'] == 1

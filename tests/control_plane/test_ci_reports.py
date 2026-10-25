@@ -433,3 +433,129 @@ def test_late_pipeline_binding_reconciles_retry_ordinals_without_rewriting_uploa
     restored = ControlPlaneRepo()
     restored.import_state(repo.export_state())
     assert [row['attempt'] for row in restored.ci_reports()['reports']] == [3, 2, 1]
+
+
+HISTORY_STAMP = '2026-10-25T12:00:00+00:00'
+
+
+def history_repo(**kwargs):
+    from datetime import datetime
+    return ControlPlaneRepo(now=lambda: datetime.fromisoformat(HISTORY_STAMP).timestamp(), **kwargs)
+
+
+def history_report(*, failed=False, **values):
+    return {**report(), 'provider_url': 'https://ci.example', 'reported_at': HISTORY_STAMP,
+            'xml': '<testsuite><testcase classname="Checks" name="works" time="2">' +
+                   ('<failure message="token=synthetic-private">stack</failure>' if failed else '') +
+                   '</testcase></testsuite>', **values}
+
+
+def test_history_preserves_retries_and_api_shape_through_journal_replay(disk_event_journal):
+    from herdr_engineering.control_plane.bridge import load_into
+    repo = history_repo(sink=disk_event_journal)
+    failed = repo.ingest_ci_report(history_report(failed=True))
+    repo.ingest_ci_report(history_report())
+    repo.ingest_ci_report(history_report(failed=True))
+    before = repo.ci_reports()
+    history = repo.ci_test_history(repository='org/app', branch='main')
+    assert history['tests'][0]['classification'] == 'proven_flaky'
+    assert history['tests'][0]['failed'] == history['tests'][0]['passed'] == 1
+    assert history['scope']['persistence'] == 'durable_sink'
+    assert history['scope']['memory_only'] is False
+    assert repo.ci_reports() == before
+    restored = history_repo(sink=disk_event_journal)
+    load_into(restored, disk_event_journal)
+    assert restored.ci_test_history(repository='org/app', branch='main') == history
+    assert restored.ingest_ci_report(history_report(failed=True))['report_id'] == failed['report_id']
+    assert len(disk_event_journal.events()) == 2
+    assert 'synthetic-private' not in str(disk_event_journal.events())
+    backup = history_repo(sink=disk_event_journal)
+    backup.import_state(restored.export_state())
+    assert backup.ci_test_history(repository='org/app', branch='main') == history
+
+
+def test_history_legacy_provider_binding_requires_one_exact_full_identity():
+    repo = history_repo()
+    body = history_report(provider_url=None, provider_repo_id=None)
+    repo.ingest_ci_report(body)
+    assert repo.ci_test_history()['tests'] == []
+    observed = {key: value for key, value in history_report().items() if key != 'xml'}
+    repo.observe_ci_pipeline({**observed, 'state': 'success'})
+    assert len(repo.ci_test_history()['tests']) == 1
+    repo.observe_ci_pipeline({**observed, 'provider_url': 'https://other.example', 'state': 'failure'})
+    assert len(repo.ci_reports()['pipelines']) == 2
+    view = repo.ci_test_history()
+    assert view['tests'] == []
+    assert view['scope']['unjoined_report_count'] == 1
+    assert view['scope']['not_reported_run_count'] == 2
+
+
+def test_explicit_provider_urls_distinguish_reports_and_attempts():
+    repo = history_repo()
+    first = repo.ingest_ci_report(history_report(failed=True))
+    second = repo.ingest_ci_report(history_report(failed=True, provider_url='https://other.example'))
+    assert first['report_id'] != second['report_id']
+    assert first['attempt'] == second['attempt'] == 1
+    assert {r['attempt'] for r in repo.ci_reports()['reports']} == {1}
+    rows = repo.ci_test_history()['tests']
+    assert len(rows) == 2
+    assert {row['provider_url'] for row in rows} == {'https://ci.example', 'https://other.example'}
+
+
+@pytest.mark.parametrize('url', ['https://user:synthetic-private@ci.example',
+                                 'https://ci.example?access_token=synthetic-private',
+                                 'file:///tmp/report', 'https://ci.example:invalid'])
+def test_provider_url_rejects_unsafe_identity_before_journaling(url, disk_event_journal):
+    repo = history_repo(sink=disk_event_journal)
+    with pytest.raises(ValueError, match='provider_url'):
+        repo.ingest_ci_report(history_report(provider_url=url))
+    assert repo.ci_reports()['reports'] == []
+
+
+def test_junit_file_identity_and_evidence_are_bounded_and_redacted():
+    xml = '<testsuite><testcase name="same" file="a.py"><failure message="' + 'm' * 2500 + '">' + 'x' * 4500 + '</failure></testcase><testcase name="same" file="b.py"/></testsuite>'
+    first = parse_junit(xml)['tests']
+    reordered = parse_junit('<testsuite><testcase name="same" file="b.py"/><testcase name="same" file="a.py"/></testsuite>')['tests']
+    assert first[0]['file'] == 'a.py'
+    assert first[0]['id'] == reordered[1]['id']
+    assert first[1]['id'] == reordered[0]['id']
+    assert len(first[0]['message']) == 2000 and len(first[0]['trace']) == 4000
+
+
+def test_explicit_provider_url_constrains_optional_repository_id_matching():
+    repo = history_repo()
+    repo.ingest_ci_report(history_report(provider_repo_id=None))
+    repo.observe_ci_pipeline(dict(repository='org/app', provider_url='https://other.example',
+        provider_repo_id=18, run_number=1, branch='main', revision='abc', state='success'))
+    assert repo.ci_reports()['reports'][0]['identity_status'] == 'unmatched'
+    assert repo.ci_test_history()['tests'] == []
+
+
+def test_secret_provider_id_is_redacted_before_durable_report_storage(disk_event_journal):
+    repo = history_repo(sink=disk_event_journal)
+    repo.ingest_ci_report(history_report(provider_repo_id='token=synthetic-private'))
+    assert 'synthetic-private' not in str(disk_event_journal.events())
+    assert repo.ci_test_history()['tests'] == []
+
+
+def test_unjoined_report_count_obeys_repository_branch_and_time_window():
+    repo = history_repo()
+    for number, values in enumerate(({}, {'branch': 'topic'}, {'repository': 'other/app'},
+                                    {'reported_at': '2026-09-01T00:00:00Z'}), 1):
+        repo.ingest_ci_report(history_report(provider_url=None, run_number=number, **values))
+    view = repo.ci_test_history(repository='org/app', branch='main', days=7)
+    assert view['scope']['unjoined_report_count'] == 1
+
+
+def test_provider_collisions_survive_disk_replay_without_losing_runs(disk_event_journal):
+    from herdr_engineering.control_plane.bridge import load_into
+    repo = history_repo(sink=disk_event_journal)
+    for url in ('https://ci.example', 'https://other.example'):
+        body = history_report(provider_url=url)
+        repo.ingest_ci_report(body)
+        repo.observe_ci_pipeline({key: value for key, value in body.items() if key != 'xml'})
+    restored = history_repo(sink=disk_event_journal)
+    load_into(restored, disk_event_journal)
+    assert len(restored.ci_reports()['pipelines']) == 2
+    assert len(restored.ci_test_history()['tests']) == 2
+    assert restored.ci_test_history() == repo.ci_test_history()
