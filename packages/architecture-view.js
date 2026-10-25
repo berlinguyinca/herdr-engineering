@@ -2,6 +2,8 @@
 // /api/v1/architecture/*; renders loading / disabled / empty / error / stale / partial states.
 import {escapeHtml as esc} from './herdr-web-components/util.js';
 import {layoutGraph, NODE_W, NODE_H} from './architecture-layout.js';
+import {skeleton} from './motion.js';
+import {freshnessSources} from './freshness.js';
 
 const PAGE = 100;
 const text = v => typeof v === 'string' ? v : '';
@@ -70,12 +72,19 @@ export function mountArchitecture(root, client, opts = {}) {
   let alive = true, ctl = new AbortController();
   const st = {snapshots: [], sid: opts.snapshot || '', parent: opts.parent || '', q: opts.q || '', page: null, detail: null, diff: null,
     analyses: [], cursor: null, caps: [], extras: null, timeline: null, cross: null, explain: null, request: null, corr: null, rooms: null, cancels: {}};
-  root.innerHTML = '<div class="arch"><herdr-spinner></herdr-spinner></div>';
-  const host = root.firstElementChild;
+  // The head (title and freshness chip) is written once; render() and fail() replace only the body.
+  root.innerHTML = `<div class="arch"><div class="hd-live-head"><h1>Architecture</h1><herdr-freshness interval="5000"></herdr-freshness></div><div data-arch-body>${skeleton('architecture snapshots', {rows: 2})}</div></div>`;
+  const host = root.querySelector('[data-arch-body]');
+  const chip = freshnessSources(() => root.querySelector('herdr-freshness'));
   const snap = () => st.snapshots.find(s => s.snapshot_id === st.sid);
-  const fail = e => alive && (host.innerHTML = e.status === 404
-    ? '<herdr-empty message="The Architecture Explorer is not enabled on this control plane (control_plane.architecture.enabled)."></herdr-empty>'
-    : `<herdr-error message="${esc(e.message || 'request failed')}"></herdr-error>`);
+  // A 404 means the explorer is turned off here: the server answered as configured, so the chip stays fresh.
+  const fail = e => {
+    if (!alive) return;
+    if (e.status === 404) chip.ok('architecture'); else chip.fail('architecture', `Architecture: ${e.message || 'request failed'}`);
+    host.innerHTML = e.status === 404
+      ? '<herdr-empty message="The Architecture Explorer is not enabled on this control plane (control_plane.architecture.enabled)."></herdr-empty>'
+      : `<herdr-error message="${esc(e.message || 'request failed')}"></herdr-error>`;
+  };
 
   async function load() {
     try {
@@ -83,6 +92,7 @@ export function mountArchitecture(root, client, opts = {}) {
         client.listArchitectureAnalyses({signal: ctl.signal}).catch(() => ({analyses: []}))]);
       if (!alive) return;
       st.snapshots = s.snapshots; st.analyses = a.analyses;
+      chip.ok('architecture');
       st.caps = (await client.health({signal: ctl.signal}).catch(() => ({}))).capabilities || [];
       if (!st.sid && st.snapshots[0]) st.sid = st.snapshots[0].snapshot_id;
       await browse();
@@ -193,15 +203,14 @@ export function mountArchitecture(root, client, opts = {}) {
     const s = snap();
     if (!st.snapshots.length) {
       const a = st.analyses[0];
-      host.innerHTML = `<h1>Architecture</h1><herdr-empty message="No architecture snapshots yet. Run: herdr-eng architecture analyze --repo . --url &lt;control plane&gt;"></herdr-empty>${a ? `<p class="arch-note">Latest analysis ${esc(a.analysis_id)}: ${esc(a.state)}${a.message ? ' — ' + esc(a.message) : ''}</p>` : ''}${jobsPanel(st.analyses, st.cancels)}`;
+      host.innerHTML = `<herdr-empty message="No architecture snapshots yet. Run: herdr-eng architecture analyze --repo . --url &lt;control plane&gt;"></herdr-empty>${a ? `<p class="arch-note">Latest analysis ${esc(a.analysis_id)}: ${esc(a.state)}${a.message ? ' — ' + esc(a.message) : ''}</p>` : ''}${jobsPanel(st.analyses, st.cancels)}`;
       return;
     }
     const notices = snapshotNotices(s, st.snapshots).map(n => `<p class="arch-notice ${n.kind}" role="status" data-notice="${n.kind}">${esc(n.text)}</p>`).join('');
     const diags = (st.page && s ? '' : '');
     const failed = st.analyses.filter(a => a.state === 'failed').slice(0, 3).map(a => `<p class="arch-notice failed" role="alert">Analysis ${esc(a.analysis_id)} failed${a.message ? ': ' + esc(a.message) : ''}</p>`).join('');
     const running = st.analyses.filter(a => ['started', 'progress'].includes(a.state)).map(a => `<p class="arch-notice running" role="status">Analysis ${esc(a.analysis_id)} ${esc(a.state)}${typeof a.progress === 'number' ? ` ${Math.round(a.progress * 100)}%` : ''}</p>`).join('');
-    host.innerHTML = `<h1>Architecture</h1>
-      <div class="arch-bar"><label>Snapshot <select data-snap>${st.snapshots.map(x => `<option value="${esc(x.snapshot_id)}"${x.snapshot_id === st.sid ? ' selected' : ''}>${esc(label(x))}</option>`).join('')}</select></label>
+    host.innerHTML = `<div class="arch-bar"><label>Snapshot <select data-snap>${st.snapshots.map(x => `<option value="${esc(x.snapshot_id)}"${x.snapshot_id === st.sid ? ' selected' : ''}>${esc(label(x))}</option>`).join('')}</select></label>
       <label>Search symbols <input type="search" data-q value="${esc(st.q)}" placeholder="name or path"></label></div>
       <p class="arch-meta">Commit <code>${esc(s.commit_sha.slice(0, 12))}</code> · ${esc(s.completeness)} · ${s.counts.nodes} nodes, ${s.counts.edges} edges · host ${esc(s.host_id)} · analyzer ${esc(s.analyzer_version)}</p>
       ${notices}${failed}${running}${st.q ? '' : crumbs()}

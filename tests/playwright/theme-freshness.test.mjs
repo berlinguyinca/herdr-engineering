@@ -163,6 +163,7 @@ test('a quiet fleet keeps the chip green while stream keepalives arrive; silence
  for(let i=0;i<6;i++){await page.clock.runFor(10000);await page.evaluate(()=>contact(true));}
  assert.equal(await state(),'fresh','nothing changed, the stream is alive: not stale');
  assert.match(await page.evaluate(()=>f.textContent),/updated (5\ds|1m) ago/,'the age keeps counting; only the colour stays green');
+ assert.match(await page.evaluate(()=>f.textContent),/^live · /,'a quiet fleet with a healthy stream still reads "live", not "stale"');
  await page.clock.runFor(26000);
  assert.equal(await state(),'stale','the stream fell silent');
  await page.evaluate(()=>contact(true));await page.clock.runFor(1000);

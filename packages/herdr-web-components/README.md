@@ -148,7 +148,10 @@ Calm (auto, on, off).
 `<herdr-freshness interval="5000">` sits in every page head (`.hd-live-head`) and shows
 "live · updated Ns ago".
 
-- It turns amber (`data-state="stale"`, text "stale · updated …") past twice the interval, and
+- It turns amber (`data-state="stale"`, text "stale · updated …") past twice the interval, unless
+  the live stream is in contact (`noteStreamContact`, fed by every frame including the 10 s
+  keep-alive; silent for more than `STREAM_SILENCE_MS` counts as gone): a quiet fleet sends no
+  events, so its last refresh is still current. It turns
   red (`error`, text "error · <message> · …") after `touch(false, message)`. `touch(true)`
   records a successful refresh. Before the first one it reads "waiting for first update"; only a
   fresh chip says "live".

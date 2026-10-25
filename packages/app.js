@@ -263,10 +263,14 @@ function statusPage(html, ok, message) {
 // so the page does not jump on arrival.
 const BACK_LINK_SKELETON = '<div><span class="hd-skeleton hd-skeleton--line" style="display:inline-block;vertical-align:middle">&nbsp;</span></div>';
 function routeSkeleton(match, parts) {
-  const back = match === '/missions/:id' || match === '/herd/session/:id' ? BACK_LINK_SKELETON : '';
+  // The LLM session page's back link is a small-print paragraph (llm-view.js .llm-note).
+  const back = match === '/missions/:id' || match === '/herd/session/:id' ? BACK_LINK_SKELETON
+    : match === '/llm/session/:id' ? '<p style="margin:6px 0;font-size:12px;line-height:1.6"><span class="hd-skeleton hd-skeleton--line" style="display:inline-block;vertical-align:middle">&nbsp;</span></p>' : '';
   const piMission = match === '/missions/:id' && (safeDecode(parts[1]) || '').startsWith('pi:');
-  const rows = piMission ? 1 : match === '/analytics/models' || match === '/analytics/hosts' ? 2 : match === '/herd/session/:id' || match === '/analytics' || match === '/analytics/missions' ? 8 : match.startsWith('/services') || match.endsWith('-services') ? 7 : 5;
-  return `<div data-skeleton aria-busy="true" role="status" aria-label="Loading page">${back}<div class="hd-live-head"><div class="hd-skeleton hd-skeleton--title"></div></div>${skeleton('page content', { rows, height: 64, bare: true })}</div>`;
+  const rows = piMission || match === '/architecture' ? 1 : match === '/attention' || match === '/analytics/models' || match === '/analytics/hosts' ? 2 : match === '/missions/:id' || match === '/herd/session/:id' || match === '/analytics' || match === '/analytics/missions' || match.startsWith('/llm') ? 8 : match.startsWith('/services') || match.endsWith('-services') ? 7 : 5;
+  const page = `${back}<div class="hd-live-head"><div class="hd-skeleton hd-skeleton--title"></div></div>${skeleton('page content', { rows, height: 64, bare: true })}`;
+  // The Architecture view paints its own framed surface; its placeholder sits in the same frame.
+  return `<div data-skeleton aria-busy="true" role="status" aria-label="Loading page">${match === '/architecture' ? `<div class="arch">${page}</div>` : page}</div>`;
 }
 
 // ------------------------------------------------------------- views
@@ -304,7 +308,8 @@ async function viewGithub() {
 }
 
 async function viewReviewGate() {
-  return ownPolling(mountReviewGate(root, client));
+  root.innerHTML = `${liveHead('<h1>Review gate</h1>')}<div id="review-gate-body"></div>`;
+  return ownPolling(mountReviewGate(document.getElementById('review-gate-body'), client, { title: false, freshness: chipIn(root) }));
 }
 
 async function viewIntegrations(parts) {
@@ -599,6 +604,20 @@ async function viewAnalytics(parts, revision) {
   return mountAnalytics(root, client, sub, { data });
 }
 
+// The LLM pages render their own h1; it moves into a live head with the page's chip. They are
+// snapshots, so the chip records the one load and then ages (amber without stream contact).
+const LLM_CHIP_MS = 60000;
+function llmHead() {
+  const h1 = root.querySelector('h1');
+  if (!h1) return;
+  const head = document.createElement('div');
+  head.className = 'hd-live-head';
+  h1.replaceWith(head);
+  head.append(h1);
+  head.insertAdjacentHTML('beforeend', CHIP(LLM_CHIP_MS));
+  head.querySelector('herdr-freshness').touch(true);
+}
+
 // The LLM pages fetch ~10 series per render and hold filter focus: they are snapshots, refreshed
 // only by navigation (a filter change rewrites the hash), never by live events.
 async function viewLlm(_parts, revision) {
@@ -625,6 +644,7 @@ async function viewLlm(_parts, revision) {
     projects: projects.groups.map((g) => g.key),
     modelNames: [...new Set(models.groups.map((g) => g.key))],
   }, { total, models, agents, problems, series: { requests, errors, ttft, speed } });
+  llmHead();
   root.querySelectorAll('[data-llm-filter]').forEach((el) => el.addEventListener('change', () => {
     window.location.hash = `#/llm?${llmQuery({ window: window_, ...filters, [el.dataset.llmFilter]: el.value })}`;
   }));
@@ -632,7 +652,7 @@ async function viewLlm(_parts, revision) {
 }
 async function viewLlmSession(parts, revision) {
   const id = safeDecode(parts[2]);
-  if (id == null) { root.innerHTML = '<herdr-error message="Agent not found"></herdr-error>'; return NO_REFRESH; }
+  if (id == null) { statusPage('<herdr-error message="Agent not found"></herdr-error>', true); return NO_REFRESH; }
   const q = route().query;
   const window_ = WINDOWS.includes(q.get('window')) ? q.get('window') : '24h';
   const f = { window: window_, session: id };
@@ -647,9 +667,12 @@ async function viewLlmSession(parts, revision) {
   root.innerHTML = renderLlmSession({
     window: window_, sessionId: id, known: Boolean(session), name: session?.display_name || session?.agent_role || '',
   }, { total, models, problems, series: { requests, errors, ttft, speed } });
+  llmHead();
   if (session) {
+    // Below the page head, as on the other detail pages, so the head keeps its place.
     const slot = document.createElement('div'); slot.id = 'related-panel';
-    root.insertBefore(slot, root.children[1] || null);
+    const head = root.querySelector('.hd-live-head');
+    if (head) head.after(slot); else root.prepend(slot);
     return { refresh() {}, dispose: showRelated('session', id, slot) };
   }
   return NO_REFRESH;

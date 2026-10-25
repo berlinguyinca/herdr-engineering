@@ -16,6 +16,9 @@ YYYY-MM-DD. The format follows Keep a Changelog.
   `motion.js` also has the skeleton placeholder used on first loads.
 - Every page head has a freshness chip. It turns amber when stale and red with the error, and a page
   with several sources names every one that is failing. On GitHub the chip also shows the sync state.
+  Amber still follows the stream-contact rule: while the live stream's keep-alive arrives, a quiet
+  fleet's chip stays "live". Attention, Review gate, Architecture and both LLM pages have a chip and a
+  first-load skeleton too; an inbox, gate or explorer that is turned off on the server is not an error.
 - Theme (auto, light, dark) and Calm (auto, on, off) controls are in the sidebar, stored per browser
   and applied before first paint.
   - Calm, and OS reduced motion unless calm is off, applies every change at once with no animation.

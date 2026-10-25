@@ -130,3 +130,17 @@ test('a malformed %-escape in the URL shows an error page instead of an uncaught
  await sleep(200);
  assert.deepEqual(errors.filter(e=>/URI/.test(e)),[]);
 }));
+
+// The first-load skeleton decodes the mission id too: a malformed escape must not throw before the
+// page is replaced, or the previous page stays on screen under the new URL.
+test('navigating to a malformed mission id replaces the page with "Mission not found"',async()=>withPage(async(page,base)=>{
+ const errors=[];page.on('pageerror',e=>errors.push(String(e)));
+ await boot(page,base,'/overview');
+ await page.locator('#overview-dashboard').waitFor();
+ await page.evaluate(()=>{location.hash='/missions/%E0';});
+ await page.locator('#view herdr-error[message="Mission not found"]').waitFor();
+ await sleep(200);
+ assert.deepEqual(errors,[]);
+ assert.equal(await page.locator('#overview-dashboard').count(),0,'the overview is gone');
+ assert.equal(await page.locator('#view herdr-freshness').count(),1,'the not-found page has one chip');
+}));
