@@ -63,7 +63,8 @@ _SECRET_KEY_HINTS = (
 #: Keys that merely CONTAIN a hint ("author" contains "auth") but carry no secret. The head-bound review quorum
 #: excludes the PR author's own approval by comparing this login (T06), so redacting it to "[REDACTED]" silently let
 #: an author approve their own PR (found by the T16 acceptance run).
-_PLAIN_KEYS = frozenset({"author", "authors", "author_login", "author_name"})
+_PLAIN_KEYS = frozenset({"author", "authors", "author_login", "author_name",
+                       "passed", "failed", "skipped", "total"})
 
 _BEGIN = re.compile(r"-----BEGIN[ A-Z]*PRIVATE KEY-----")
 _END = re.compile(r"-----END[ A-Z]*PRIVATE KEY-----")

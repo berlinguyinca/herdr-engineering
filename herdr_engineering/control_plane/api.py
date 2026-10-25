@@ -1694,6 +1694,10 @@ def _make_handler(server, public=False, operator=False):
                         items = r.list_reviews(mission_id=parts[4])
                     else:  # pulls
                         items = r.list_pull_requests(mission_id=parts[4])
+                    # Redact secret-bearing keys and values, matching the
+                    # _redact_event-style redaction the issue asks for. The
+                    # delivery count fields (passed/failed/skipped/total) are
+                    # plain keys, so their values survive redaction.
                     return self._json({sub: [redact_payload(item) for item in items]})
                 if len(parts) > 5 and parts[5] == "timeline":
                     timeline = r.mission_timeline(parts[4])
