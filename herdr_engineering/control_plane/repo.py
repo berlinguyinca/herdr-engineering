@@ -1769,7 +1769,8 @@ class ControlPlaneRepo:
                               "report_count": len(reports), "pipeline_count": len(pipelines),
                               "description": "Uploaded test reports and observed provider runs only; missing reports do not mean zero tests."}}
 
-    def ci_test_history(self, repository=None, branch=None, test=None, days=30):
+    def ci_test_history(self, repository=None, branch=None, test=None, days=30, *,
+                        provider_url=None, provider_repo_id=None):
         """Project bounded durable report events; no provider reads or new journal."""
         from datetime import UTC, datetime
 
@@ -1779,12 +1780,17 @@ class ControlPlaneRepo:
         with self._event_lock:
             history = self.ci_reports()
             now = datetime.fromtimestamp(self._now(), UTC)
+        def selected(row):
+            return ((provider_url is None or (row.get('provider_url') or '').rstrip('/') == provider_url) and
+                    (provider_repo_id is None or str(row.get('provider_repo_id')) == str(provider_repo_id)))
         store = CIObservationStore(wall_now=lambda: now)
         for row in reversed(history['pipelines']):
-            store.record_pipeline(row)
+            if selected(row):
+                store.record_pipeline(row)
         unjoined = []
         for row in reversed(history['reports']):
-            if not store.record_report(bind_report_provider(row, history['pipelines'])):
+            row = bind_report_provider(row, history['pipelines'])
+            if selected(row) and not store.record_report(row):
                 unjoined.append(row)
         view = store.test_summary(repository=repository, branch=branch, test=test, days=days)
         end = now.timestamp()
@@ -1799,7 +1805,266 @@ class ControlPlaneRepo:
                              projection_truncated=view['scope']['truncated'],
                              truncated=history['scope']['truncated'] or view['scope']['truncated'],
                              unjoined_report_count=unjoined_count)
+        if provider_url is not None or provider_repo_id is not None:
+            view['scope'].update(provider_url=provider_url, provider_repo_id=provider_repo_id)
         return view
+
+    def ci_summary(self, *, pipelines=(), inventory=(), cached=None, days=14,
+                   repository=None, branch=None, scope='all', provider_url=None,
+                   provider_repo_id=None):
+        """Windowed aggregates of cached history and durable observations, never I/O.
+
+        The durable store keeps its existing 2,000-run bound; history's separate
+        20,000-run budget is aggregated in place rather than silently truncated
+        to the durable store's limit. Exact duplicate runs prefer cached history.
+        """
+        from collections import Counter
+        from datetime import UTC, datetime
+
+        from .ci_observability import CIObservationStore, _identity
+        from .ci_performance import _iso, _stats, _timestamp
+
+        cached = cached or {}
+        now = self._now()
+        start = now - days * 86400
+        store = CIObservationStore()
+        with self._event_lock:
+            retained = [stream[-1]['payload'] for (kind, _), stream in self._events.items()
+                        if kind == 'ci_observation' and stream]
+            source_truncated = 'ci_observation' in self._ci_history_truncated
+        for row in retained:
+            store.record_pipeline(row)
+        observed = store.summary()
+        # Event/ref are not part of the observation store projection; retain
+        # only those scope fields from the same exact durable observation.
+        metadata = {_identity(row): row for row in retained}
+        rows = [dict(row, **{key: metadata.get(_identity(row), {}).get(key)
+                            for key in ('event', 'ref')}) for row in observed['pipelines']]
+        rows.extend(pipelines)
+        identities, runs, unjoined = {}, {}, 0
+        for row in rows:
+            key = (row.get('provider_url'), str(row.get('provider_repo_id')), row.get('repository'))
+            if key not in identities:
+                identity = _identity({**dict(zip(('provider_url', 'provider_repo_id', 'repository'), key)),
+                                      'run_number': 1})
+                identities[key] = identity[:3] if identity else None
+            identity = identities[key]
+            number = row.get('run_number')
+            if identity is None or type(number) not in (str, int) or not str(number).isdigit() or int(number) < 1:
+                unjoined += 1
+                continue
+            if ((repository is not None and identity[2] != repository) or
+                    (provider_url is not None and identity[0] != provider_url) or
+                    (provider_repo_id is not None and identity[1] != str(provider_repo_id))):
+                continue
+            runs[(*identity, int(number))] = row
+        defaults = {(r.get('provider_url', '').rstrip('/'), str(r.get('id')), r.get('repository')):
+                    r.get('default_branch') for r in inventory}
+        coverage = {(p['provider_url'].rstrip('/'), str(p['provider_repo_id']), p['repository']):
+                    p.get('coverage', {}) for p in cached.get('projects', [])}
+        groups, daily, selected = {}, {}, []
+        for project in cached.get('projects', []):
+            identity = _identity({**project, 'run_number': 1})
+            if identity is None:
+                continue
+            key = identity[:3]
+            if ((repository is not None and key[2] != repository) or
+                    (provider_url is not None and key[0] != provider_url) or
+                    (provider_repo_id is not None and key[1] != str(provider_repo_id))):
+                continue
+            groups[key] = {'rows': [], 'unknown_time_run_count': 0,
+                           'scope_unavailable': scope == 'default' and not defaults.get(key)}
+        unknown_time = scope_unavailable = 0
+        for key, row in runs.items():
+            if branch is not None and row.get('branch') != branch:
+                continue
+            project = key[:3]
+            group = groups.setdefault(project, {'rows': [], 'unknown_time_run_count': 0,
+                                                'scope_unavailable': False})
+            is_pr = row.get('event') in ('pull_request', 'pull_request_closed') or bool(
+                re.match(r'^refs/(pull|merge-requests)/\d+/(head|merge)$', row.get('ref') or ''))
+            if scope == 'default' and not defaults.get(project):
+                group['scope_unavailable'] = True
+                scope_unavailable += 1
+                continue
+            if ((scope == 'pr' and not is_pr) or
+                    (scope == 'default' and (is_pr or row.get('branch') != defaults[project]))):
+                continue
+            stamp = next((value for field in ('finished_at', 'started_at', 'created_at')
+                          if (value := _timestamp(row.get(field))) is not None), None)
+            if stamp is None:
+                unknown_time += 1
+                group['unknown_time_run_count'] += 1
+                continue
+            if not start <= stamp <= now:
+                continue
+            group['rows'].append(row)
+            selected.append(row)
+            day = datetime.fromtimestamp(stamp, UTC).date().isoformat()
+            daily.setdefault(day, []).append(row)
+
+        def metrics(values):
+            counts = Counter(row.get('state') or row.get('status') or 'unknown' for row in values)
+            success = counts['success'] + counts['passed']
+            failed = sum(counts[state] for state in ('failure', 'failed', 'error', 'errored', 'timed_out', 'crashed'))
+            completed = success + failed
+            durations = []
+            for row in values:
+                if (row.get('state') or row.get('status')) not in (
+                        'success', 'passed', 'failure', 'failed', 'error', 'errored', 'timed_out', 'crashed'):
+                    continue
+                begin, end = (_timestamp(row.get(field)) for field in ('started_at', 'finished_at'))
+                if begin is not None and end is not None and end >= begin:
+                    durations.append(end - begin)
+            return dict(pipeline_count=len(values), outcomes=dict(sorted(counts.items())),
+                        completed_count=completed, success_count=success, failure_count=failed,
+                        pass_rate=success / completed if completed else None,
+                        failure_rate=failed / completed if completed else None,
+                        active_count=sum(counts[state] for state in
+                                         ('running', 'started', 'pending', 'queued', 'waiting', 'blocked')),
+                        duration_seconds=_stats(durations))
+
+        projects = []
+        for key, group in sorted(groups.items()):
+            projects.append(dict(project_id=json.dumps(key, separators=(',', ':')),
+                provider_url=key[0], provider_repo_id=key[1], repository=key[2],
+                **metrics(group['rows']), unknown_time_run_count=group['unknown_time_run_count'],
+                scope_unavailable=group['scope_unavailable'], coverage=coverage.get(key, {'complete': False})))
+        result = dict(projects=projects, kpis=dict(project_count=len(projects), **metrics(selected)),
+            charts=[dict(day=day, **metrics(values)) for day, values in sorted(daily.items())],
+            available=bool(cached.get('available') or rows), status=cached.get('status', 'unknown'),
+            refreshing=cached.get('refreshing', False),
+            scope=dict(kind='retained_observations', complete=False, partial=True,
+                stale=bool(cached.get('stale')) or observed['scope']['stale'],
+                truncated=source_truncated or observed['scope']['truncated'] or
+                          any(p['coverage'].get('truncated') for p in projects),
+                memory_only=self._sink is None, history_memory_only=True,
+                persistence='durable_sink' if self._sink is not None else 'memory_only',
+                days=days, window={'start': _iso(start), 'end': _iso(now)}, repository=repository,
+                branch=branch, scope=scope, provider_url=provider_url, provider_repo_id=provider_repo_id,
+                denominator='successful_or_failed_runs', time_basis='finished_started_created_at',
+                minimum_percentile_samples=5, unknown_time_run_count=unknown_time,
+                scope_unavailable_run_count=scope_unavailable, unjoined_run_count=unjoined,
+                history=cached.get('scope', {})))
+        # A content revision is stable across unchanged reads and changes when
+        # filters, aggregates, or coverage change. Wall time alone isn't data.
+        versioned = copy.deepcopy(result)
+        versioned['scope'].pop('window')
+        for project in versioned['projects']:
+            project['coverage'].pop('checked_at', None)
+        result['revision'] = hashlib.sha256(json.dumps(versioned, sort_keys=True).encode()).hexdigest()
+        result['generated_at'] = cached.get('generated_at')
+        return result
+
+    def ci_tests(self, *, days=14, repository=None, branch=None, test=None,
+                 provider_url=None, provider_repo_id=None):
+        """Bounded HTTP projection; the full retained-history contract is unchanged."""
+        view = self.ci_test_history(repository=repository, branch=branch, test=test, days=days,
+                                    provider_url=provider_url, provider_repo_id=provider_repo_id)
+        tests = view['tests']
+        view['tests'] = []
+        budget = 240 * 1024
+        used = 0
+        for row in tests[:200]:
+            size = len(json.dumps(row).encode())
+            if used + size > budget:
+                break
+            view['tests'].append(row)
+            used += size
+        limited = len(view['tests']) != len(tests)
+        view['scope'].update(test_count=len(tests), returned_test_count=len(view['tests']),
+                             response_truncated=limited, test_limit=200, response_byte_limit=256 * 1024,
+                             truncated=view['scope']['truncated'] or limited)
+        return view
+
+    def ci_diagnosis(self, pipeline):
+        """Join exact run evidence; never infer a test-to-step edge from labels/logs."""
+        from .ci_observability import _identity, _test_cases, bind_report_provider
+
+        result = dict(evidence_availability='unavailable', reason='Pipeline evidence unavailable.',
+                      failed_steps=[], failed_workflows=[], failed_tests=[], truncated=False,
+                      step_test_association='unavailable',
+                      step_test_reason='Uploaded reports do not identify a provider step.',
+                      log={'availability': 'not_loaded', 'route': '/api/v1/ci/log'})
+        if not pipeline:
+            return result
+        used = dict(failed_steps=0, failed_workflows=0, failed_tests=0)
+        budgets = dict(failed_steps=32 * 1024, failed_workflows=16 * 1024, failed_tests=64 * 1024)
+
+        def append(target, item):
+            size = len(json.dumps(item).encode()) + 2
+            if used[target] + size > budgets[target]:
+                result['truncated'] = True
+                return
+            result[target].append(item)
+            used[target] += size
+
+        failed = {'failure', 'failed', 'error', 'errored', 'timed_out', 'crashed'}
+        for source, target in (('tasks', 'failed_steps'), ('workflows', 'failed_workflows')):
+            entries = [row for row in pipeline.get(source, [])
+                       if (row.get('state') or row.get('status')) in failed]
+            result['truncated'] |= len(entries) > 50
+            for row in entries[:50]:
+                item = {key: (value[:500] if isinstance(value, str) else value)
+                        for key, value in row.items() if key in
+                        ('id', 'name', 'state', 'status', 'workflow', 'workflow_id', 'exit_code', 'error')
+                        and type(value) in (str, int, float, bool, type(None))}
+                edges = row.get('depends_on')
+                item['dependency_evidence'] = 'reported' if isinstance(edges, list) else 'unavailable'
+                if isinstance(edges, list):
+                    item['depends_on'] = [str(edge)[:200] for edge in edges[:50]]
+                    result['truncated'] |= len(edges) > 50
+                append(target, item)
+        history = self.ci_reports()
+        row = {**pipeline, 'revision': pipeline.get('revision') or pipeline.get('commit'),
+               'run_number': pipeline.get('run_number') or pipeline.get('number')}
+        # Numeric detail requests report the requested ID as repository. Resolve
+        # the name only from one exact retained identity with matching run metadata.
+        candidates = {identity for observed in history['pipelines']
+                      if (identity := _identity(observed)) is not None and
+                      identity[0] == row.get('provider_url', '').rstrip('/') and
+                      identity[3] == row['run_number'] and
+                      (row.get('provider_repo_id') is None or identity[1] == str(row['provider_repo_id'])) and
+                      (row.get('repository') == identity[2] or
+                       row.get('repository') == identity[1] == str(row.get('provider_repo_id'))) and
+                      all(observed.get(key) == row.get(key) for key in ('revision', 'branch'))}
+        if len(candidates) == 1:
+            identity = candidates.pop()
+            row.update(provider_url=identity[0], provider_repo_id=identity[1], repository=identity[2])
+        identity = _identity(row)
+        if identity is None or row.get('repository') == str(row.get('provider_repo_id')):
+            result['reason'] = 'Exact provider/repository/run identity is unavailable or ambiguous.'
+            return result
+        matches = []
+        for report in reversed(history['reports']):
+            report = bind_report_provider(report, history['pipelines'])
+            if (_identity(report) == identity and row.get('branch') and row.get('revision') and
+                    all(report.get(key) == row[key] for key in ('branch', 'revision'))):
+                cases = _test_cases(report)
+                if cases is not None:
+                    matches.append((report, cases))
+        if not matches:
+            result['reason'] = 'No validated report matches this exact provider, repository, run, branch and revision.'
+            return result
+        result.update(evidence_availability='reported', reason=None, report_count=len(matches))
+        history_view = self.ci_test_history(repository=row['repository'], branch=row['branch'], days=30,
+                                            provider_url=identity[0], provider_repo_id=identity[1])
+        test_history = {test['id']: test for test in history_view['tests']}
+        result['history_scope'] = history_view['scope']
+        failures = [(report, case) for report, cases in matches for case in cases if case['status'] in ('failed', 'errored')]
+        result['failed_test_count'] = len(failures)
+        result['truncated'] |= len(failures) > 25
+        for report, case in failures[:25]:
+            item = {key: case[key] for key in ('id', 'name', 'suite', 'classname', 'file',
+                                              'status', 'duration_ms', 'identity_ambiguous')}
+            aggregate = test_history.get(case['id'])
+            item.update(message=case['message'][:500], trace=case['trace'][:1000], report_id=report['report_id'],
+                history={key: aggregate[key] for key in ('failure_count', 'completed_count', 'failure_rate',
+                    'first_failure', 'last_pass', 'duration_ms', 'classification', 'inconsistent_count')}
+                    if aggregate else None)
+            result['truncated'] |= len(case['message']) > 500 or len(case['trace']) > 1000
+            append('failed_tests', item)
+        return result
 
     # --------------------------------------------------------------- events
     def record_event(self, entity_type, entity_id, event_type, payload=None,

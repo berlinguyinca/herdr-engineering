@@ -384,3 +384,52 @@ test('CI reads and mutations bind the expected provider URL without changing leg
  for(const call of calls.slice(0,2))assert.equal(new URL(call.url,'http://test').searchParams.get('provider_url'),providerUrl);
  for(const call of calls.slice(2))assert.equal(JSON.parse(call.opts.body).provider_url,providerUrl);
 });
+
+test('compact CI reads serialize only supported filters and preserve abort signals', async () => {
+  const calls = [];
+  const client = new HerdrClient('', {fetchImpl: async (url, options) => {
+    calls.push({url, options});
+    return {ok: true, status: 200, text: async () => '{}'};
+  }});
+  const signal = new AbortController().signal;
+  const filters = {days: 30, repository: 'org/app & other', branch: 'feature/test',
+    provider_url: 'https://ci.example', provider_repo_id: '17', signal, token: 'do-not-send'};
+  await client.getCiSummary({...filters, scope: 'pr'});
+  await client.getCiTests({...filters, test: 'test & one'});
+  for (const [index, call] of calls.entries()) {
+    const url = new URL(call.url, 'http://test');
+    assert.equal(url.pathname, index ? '/api/v1/ci/tests' : '/api/v1/ci/summary');
+    assert.equal(url.searchParams.get('repository'), 'org/app & other');
+    assert.equal(url.searchParams.get('branch'), 'feature/test');
+    assert.equal(url.searchParams.get('days'), '30');
+    assert.equal(url.searchParams.get('provider_repo_id'), '17');
+    assert.equal(url.searchParams.get(index ? 'test' : 'scope'), index ? 'test & one' : 'pr');
+    assert.equal(url.searchParams.has('token'), false);
+    assert.equal(url.searchParams.has('signal'), false);
+    assert.equal(call.options.signal, signal);
+    assert.equal(call.options.method, 'GET');
+  }
+  await client.getCiSummary(); await client.getCiTests();
+  assert.equal(calls[2].url, '/api/v1/ci/summary?days=14');
+  assert.equal(calls[3].url, '/api/v1/ci/tests?days=14');
+});
+
+test('compact and lazy CI reads cancel actual in-flight HTTP requests', async () => {
+  let arrived;
+  const server = createServer(() => arrived());
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const client = new HerdrClient(`http://127.0.0.1:${server.address().port}`);
+    for (const read of [signal => client.getCiSummary({signal}),
+      signal => client.getCiTests({signal}),
+      signal => client.getCiPipeline('17', 1, {signal}),
+      signal => client.getCiLog('17', 1, '4', {signal})]) {
+      const received = new Promise(resolve => { arrived = resolve; });
+      const controller = new AbortController();
+      const pending = read(controller.signal);
+      await received;
+      controller.abort();
+      await assert.rejects(pending, {name: 'AbortError'});
+    }
+  } finally { server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); }
+});

@@ -125,6 +125,19 @@ class CIMonitor:
     def summary_snapshot(self, *, start=True):
         return self._history.summary_snapshot(start=start)
 
+    def summary(self, repo, **filters):
+        # Preserve the existing lazy background-collector startup contract.
+        # Provider scans run only on its worker, never on the request thread.
+        self._history.start()
+        # Published history rows are replaced, never mutated. Capture references
+        # under the publication lock without copying raw details or serializing
+        # the full compatibility snapshot. All aggregation is local.
+        with self._history._lock:
+            cached = self.summary_snapshot(start=False)
+            pipelines = tuple(self._history._view['pipelines'])
+            inventory = tuple(self._history._view['repos'])
+        return repo.ci_summary(pipelines=pipelines, inventory=inventory, cached=cached, **filters)
+
     def start(self):
         with self._lock:
             if self._thread is None and not self._stop.is_set():
@@ -307,12 +320,52 @@ class CIMonitor:
             row = provider.pipeline(repository, number)
             if row is None:
                 return {'available': False, 'error': 'Pipeline was not found.'}
-            row = redact_payload(_dict(row))
+            row = _dict(row)
+            # Details carry execution metadata only; logs stay on the lazy route.
+            row = {key: value for key, value in row.items() if key in {
+                'id', 'number', 'run_number', 'repository', 'provider_repo_id', 'provider_url',
+                'revision', 'commit', 'branch', 'state', 'status', 'event', 'ref', 'forge_url',
+                'author', 'message', 'title', 'created', 'started', 'finished',
+                'created_at', 'started_at', 'finished_at', 'url', 'can_retry', 'can_cancel',
+                'tasks', 'workflows'}}
+            for field in ('tasks', 'workflows'):
+                row[field] = [{key: value for key, value in item.items() if key in {
+                    'id', 'name', 'state', 'status', 'exit_code', 'type', 'workflow', 'workflow_id',
+                    'depends_on', 'duration', 'started', 'finished', 'started_at', 'finished_at', 'error'}}
+                    for item in row.get(field, []) or [] if isinstance(item, dict)]
+            if getattr(provider, 'base_url', None):
+                row['provider_url'] = provider.base_url.rstrip('/')
+            row.setdefault('run_number', number)
+            if repository.isdigit():
+                row.setdefault('provider_repo_id', repository)
+            with self._history._lock:
+                inventory = tuple(self._history._view['repos'])
+            with self._lock:
+                inventory += tuple(self._view['repos'])
+            identities = {(item.get('provider_url', '').rstrip('/'), str(item.get('id')), item.get('repository'))
+                          for item in inventory
+                          if item.get('provider_url', '').rstrip('/') == row.get('provider_url') and
+                          (str(item.get('id')) == repository or item.get('repository') == repository)}
+            if len(identities) == 1:
+                url, rid, name = identities.pop()
+                if (row.get('repository') in (rid, name) and
+                        (row.get('provider_repo_id') is None or str(row['provider_repo_id']) == rid)):
+                    row.update(provider_url=url, provider_repo_id=rid, repository=name)
             if provider_url is not None:
                 row.update(provider_url=provider.base_url.rstrip('/'),
                            provider_repo_id=row.get('provider_repo_id', repository), run_number=number)
             if not self.actions_enabled:
                 row.update(can_retry=False, can_cancel=False)
+            token = getattr(provider, 'token', None)
+            def scrub(value):
+                if isinstance(value, str):
+                    return value.replace(token, '[REDACTED]') if token else value
+                if isinstance(value, dict):
+                    return {key: scrub(item) for key, item in value.items()}
+                if isinstance(value, list):
+                    return [scrub(item) for item in value]
+                return value
+            row = redact_payload(scrub(row))
             return {'available': True, 'pipeline': row, 'checked_at': _stamp(),
                     **({'provider_url': provider.base_url.rstrip('/')} if provider_url is not None else {})}
         except Exception as exc:

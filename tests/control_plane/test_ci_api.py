@@ -353,3 +353,288 @@ def test_ci_compatibility_response_omits_private_measurements(server):
     assert measured['cache_hits'] == 1
     assert measured['refresh_duration_seconds'] >= 0
     assert measured['refresh_finished_at'] is not None
+
+
+# Task 4: exercise the real viewer routes against retained, deterministic evidence.
+CI_NOW = 1792929600  # 2026-10-25T12:00:00Z
+
+
+def ci_run(number=1, **changes):
+    from datetime import UTC, datetime
+
+    stamp = datetime.fromtimestamp(CI_NOW - 60, UTC).isoformat()
+    return dict(provider_url='https://ci.example', provider_repo_id=17,
+                repository='org/app', run_number=number, revision='abc', branch='main',
+                state='failure', event='push', created_at=stamp, started_at=stamp,
+                finished_at=datetime.fromtimestamp(CI_NOW, UTC).isoformat(), **changes)
+
+
+def seed_ci(server, rows, *, stale=False):
+    server.repo._now = lambda: CI_NOW
+    server.ci_monitor.close()  # Freeze publication while exercising cached reads.
+    history = server.ci_monitor._history
+    projects = {(r['provider_url'], str(r['provider_repo_id']), r['repository']): r for r in rows}
+    repos = [dict(id=r['provider_repo_id'], repository=r['repository'],
+                  provider_url=r['provider_url'], default_branch='main') for r in projects.values()]
+    with history._lock:
+        history._view.update(available=True, status='connected', stale=stale,
+                             repos=repos, pipelines=rows)
+        history._summary_projects = [dict(provider_url=r['provider_url'],
+            provider_repo_id=r['id'], repository=r['repository'], pipeline_count=0, outcomes={})
+            for r in repos]
+    def forbidden(*args, **kwargs):
+        raise AssertionError('Compact reads must not scan, start polling, or load detail/logs')
+    server.ci_monitor._factory = forbidden
+    server.ci_monitor.start = forbidden
+    history.snapshot = forbidden
+    server.ci_monitor.snapshot = forbidden
+    return history
+
+
+def upload_ci_report(server, *, number=1, xml=None, **changes):
+    body = dict(repository='org/app', provider_url='https://ci.example', provider_repo_id=17,
+                run_number=number, revision='abc', branch='main',
+                xml=xml or '<testsuite><testcase name="broken" file="test.py" time="1"><failure message="token=secret-value">trace</failure></testcase></testsuite>')
+    body.update(changes)
+    assert request(server, 'ci/reports', body, key='write')[0] == 200
+
+
+def test_compact_summary_filters_metrics_scope_and_exact_identity(server):
+    rows = [ci_run(), {**ci_run(2), 'state': 'success'},
+            {**ci_run(3), 'state': 'canceled'}, {**ci_run(4), 'state': 'running'},
+            {**ci_run(5), 'branch': 'topic', 'event': 'pull_request'},
+            {**ci_run(6), 'created_at': None, 'started_at': None, 'finished_at': None},
+            {**ci_run(7), 'finished_at': '2026-09-01T00:00:00Z'},
+            {**ci_run(), 'provider_url': 'https://other.example'},
+            {**ci_run(), 'provider_repo_id': 18},
+            {**ci_run(), 'repository': 'org/renamed'}]
+    seed_ci(server, rows, stale=True)
+    status, view = request(server, 'ci/summary?days=7&repository=org%2Fapp&branch=main&scope=all')
+    assert status == 200
+    assert 'projects' in view, view
+    assert len(view['projects']) == 3
+    assert len({p['project_id'] for p in view['projects']}) == 3
+    assert view['kpis']['pipeline_count'] == 6
+    assert view['kpis']['completed_count'] == 4
+    assert view['kpis']['pass_rate'] == .25
+    assert view['kpis']['failure_count'] == 3
+    assert view['kpis']['active_count'] == 1
+    assert view['kpis']['duration_seconds']['sample_count'] == 4
+    assert view['kpis']['duration_seconds']['p95'] is None
+    assert view['scope']['unknown_time_run_count'] == 1
+    assert view['scope']['partial'] and view['scope']['stale']
+    assert view['scope']['complete'] is False
+    assert view['scope']['denominator'] == 'successful_or_failed_runs'
+    assert view['charts'][0]['completed_count'] == 4
+    assert 'pipelines' not in view and 'reports' not in view
+    for scope, count in [('pr', 1), ('default', 4)]:
+        result = request(server, f'ci/summary?days=7&scope={scope}&provider_url=https%3A%2F%2Fci.example&provider_repo_id=17&repository=org%2Fapp')[1]
+        assert result['kpis']['pipeline_count'] == count
+    assert request(server, 'ci/summary', key='invalid')[0] == 401
+
+
+@pytest.mark.parametrize('route', ['summary', 'tests'])
+@pytest.mark.parametrize('query', ['days=0', 'days=8', 'days=garbage', 'days=7&days=14',
+    'branch=%00', 'repository=' + 'x' * 501, 'repository=token%3Dsecret-value',
+    'provider_url=https%3A%2F%2Fuser%3Asecret%40ci.example', 'token=secret', 'unknown=1'])
+def test_compact_routes_reject_invalid_filters(server, route, query):
+    assert request(server, f'ci/{route}?{query}')[0] == 400
+
+
+def test_compact_routes_validate_scope_and_allow_supported_windows(server):
+    seed_ci(server, [])
+    assert request(server, 'ci/summary?scope=unrecognized')[0] == 400
+    assert request(server, 'ci/tests?scope=all')[0] == 400
+    for route in ('summary', 'tests'):
+        for days in (7, 14, 30):
+            status, view = request(server, f'ci/{route}?days={days}')
+            assert status == 200 and view['scope']['days'] == days
+            assert view['scope']['partial'] is True
+
+
+def test_test_history_route_is_exact_bounded_and_retains_unknown_evidence(server):
+    seed_ci(server, [ci_run()], stale=True)
+    upload_ci_report(server)
+    upload_ci_report(server, provider_url='https://other.example')
+    query = 'ci/tests?days=7&repository=org%2Fapp&branch=main&test=broken&provider_url=https%3A%2F%2Fci.example&provider_repo_id=17'
+    status, view = request(server, query)
+    assert status == 200
+    assert len(view['tests']) == 1
+    assert view['tests'][0]['failure_count'] == 1
+    assert view['tests'][0]['provider_url'] == 'https://ci.example'
+    assert view['scope']['stale'] is True and view['scope']['partial'] is True
+    assert 'secret-value' not in json.dumps(view)
+    assert request(server, 'ci/tests', key='invalid')[0] == 401
+    assert request(server, 'ci/tests?test=missing')[1]['tests'] == []
+
+
+def test_summary_large_cached_history_is_compact_fast_and_does_not_copy_details(server):
+    import time
+
+    class NoCopy:
+        def __deepcopy__(self, memo):
+            raise AssertionError('Full details were copied')
+
+    rows = [{**ci_run(index + 1), 'provider_repo_id': index % 120,
+             'repository': f'org/app-{index % 120}', 'tasks': NoCopy(),
+             'log': 'PRIVATE RAW LOG', 'token': 'NEVER RETURN'} for index in range(20000)]
+    seed_ci(server, rows)
+    elapsed = []
+    for _ in range(3):
+        started = time.monotonic()
+        status, view = request(server, 'ci/summary?days=30&scope=all')
+        elapsed.append(time.monotonic() - started)
+        assert status == 200
+        assert len(view['projects']) == 120
+        assert view['kpis']['pipeline_count'] == 20000
+        assert view['kpis']['duration_seconds']['p95'] == 60
+        payload = json.dumps(view)
+        assert len(payload.encode()) < 256 * 1024
+        assert 'PRIVATE RAW LOG' not in payload and 'NEVER RETURN' not in payload
+    assert max(elapsed) < 2, elapsed
+    print(f'compact summary: 120 projects, 20000 runs, bytes={len(payload.encode())}, seconds={elapsed}')
+
+
+def diagnosis_provider(server, row):
+    calls = []
+    class Provider:
+        available = True
+        base_url = 'https://ci.example'
+        token = 'provider-private-token'
+        def pipeline(self, repository, number):
+            calls.append(('pipeline', repository, number))
+            return row
+        def step_log(self, repository, number, step):
+            calls.append(('log', repository, number, step))
+            return 'lazy log'
+    server.ci_monitor._factory = Provider
+    return calls
+
+
+def test_pipeline_diagnosis_joins_exact_report_without_loading_logs(server):
+    seed_ci(server, [ci_run()])
+    server.repo.observe_ci_pipeline(ci_run())
+    upload_ci_report(server)
+    calls = diagnosis_provider(server, dict(repository='17', number=1, commit='abc', branch='main',
+        status='failure', tasks=[dict(id=4, name='unit', state='failure', workflow='tests',
+        error='token=secret-value')], workflows=[dict(id=2, name='tests', status='failure')]))
+    status, view = request(server, 'ci/pipeline?repository=17&number=1&provider_url=https%3A%2F%2Fci.example')
+    assert status == 200
+    diagnosis = view['diagnosis']
+    assert diagnosis['evidence_availability'] == 'reported'
+    assert diagnosis['failed_steps'][0]['id'] == 4
+    assert diagnosis['failed_steps'][0]['dependency_evidence'] == 'unavailable'
+    assert diagnosis['failed_tests'][0]['name'] == 'broken'
+    assert diagnosis['failed_tests'][0]['history']['failure_count'] == 1
+    assert diagnosis['failed_tests'][0]['history']['first_failure'] is not None
+    assert diagnosis['step_test_association'] == 'unavailable'
+    assert diagnosis['log']['availability'] == 'not_loaded'
+    assert 'secret-value' not in json.dumps(view)
+    assert calls == [('pipeline', '17', 1)]
+    assert request(server, 'ci/log?repository=17&number=1&step=4')[1]['log'] == 'lazy log'
+    assert calls[-1] == ('log', '17', 1, '4')
+
+
+@pytest.mark.parametrize('changes', [dict(provider_url='https://other.example'),
+    dict(provider_repo_id=18), dict(repository='org/other'), dict(branch='topic'),
+    dict(revision='other')])
+def test_diagnosis_does_not_join_colliding_reports(server, changes):
+    seed_ci(server, [ci_run()])
+    server.repo.observe_ci_pipeline(ci_run())
+    upload_ci_report(server, **changes)
+    diagnosis_provider(server, ci_run())
+    status, view = request(server, 'ci/pipeline?repository=17&number=1')
+    assert status == 200
+    assert view['diagnosis']['evidence_availability'] == 'unavailable'
+    assert view['diagnosis']['failed_tests'] == []
+    assert view['diagnosis']['reason']
+
+
+def test_diagnosis_and_tests_enforce_payload_limits(server):
+    seed_ci(server, [ci_run()])
+    server.repo.observe_ci_pipeline(ci_run())
+    cases = ''.join(f'<testcase name="case-{i}"><failure message="failure">{"x" * 2000}</failure></testcase>' for i in range(300))
+    upload_ci_report(server, xml=f'<testsuite>{cases}</testsuite>')
+    diagnosis_provider(server, {**ci_run(), 'log': 'RAW LOG MUST NOT LEAK',
+                               'tasks': [dict(id=i, state='failure', log='RAW LOG MUST NOT LEAK') for i in range(300)]})
+    status, view = request(server, 'ci/pipeline?repository=17&number=1')
+    assert status == 200
+    assert view['diagnosis']['truncated'] is True
+    assert len(view['diagnosis']['failed_tests']) <= 25
+    assert len(view['diagnosis']['failed_steps']) <= 50
+    assert len(json.dumps(view['diagnosis']).encode()) < 128 * 1024
+    assert 'RAW LOG MUST NOT LEAK' not in json.dumps(view)
+    status, tests = request(server, 'ci/tests')
+    assert status == 200
+    assert tests['scope']['truncated'] and tests['scope']['test_count'] == 300
+    assert len(tests['tests']) <= 200
+    assert len(json.dumps(tests).encode()) < 256 * 1024
+
+
+def test_summary_retains_empty_inventory_and_stable_revisions(server):
+    history = seed_ci(server, [ci_run()])
+    with history._lock:
+        history._view['pipelines'] = []
+    status, empty = request(server, 'ci/summary?scope=default')
+    assert status == 200
+    assert empty['kpis']['project_count'] == 1
+    assert empty['projects'][0]['completed_count'] == 0
+    assert empty['projects'][0]['pass_rate'] is None
+    assert empty['projects'][0]['coverage']['exhausted'] is False
+    assert empty['revision'] == request(server, 'ci/summary?scope=default')[1]['revision']
+    server.repo.observe_ci_pipeline(ci_run())
+    observed = request(server, 'ci/summary?scope=default')[1]
+    assert observed['kpis']['failure_count'] == 1
+    assert observed['revision'] != empty['revision']
+    with history._lock:
+        history._view['pipelines'] = [{**ci_run(), 'state': 'success'}]
+    latest = request(server, 'ci/summary?scope=default')[1]
+    assert latest['kpis']['completed_count'] == 1 and latest['kpis']['success_count'] == 1
+
+
+def test_diagnosis_enforces_byte_bound_and_redacts_exact_provider_token(server):
+    seed_ci(server, [ci_run()])
+    tasks = [dict(id=i, state='failure', name='n' * 500, workflow='w' * 500,
+                  error='provider-private-token', depends_on=['d' * 200] * 50) for i in range(50)]
+    diagnosis_provider(server, {**ci_run(), 'message': 'provider-private-token', 'tasks': tasks})
+    status, view = request(server, 'ci/pipeline?repository=17&number=1')
+    assert status == 200
+    assert json.dumps(view).find('provider-private-token') == -1
+    assert len(json.dumps(view['diagnosis']).encode()) < 128 * 1024
+    assert view['diagnosis']['truncated'] is True
+
+
+def test_diagnosis_resolves_numeric_detail_identity_from_cached_inventory(server):
+    seed_ci(server, [ci_run()])
+    upload_ci_report(server)
+    diagnosis_provider(server, dict(repository='17', number=1, commit='abc', branch='main', status='failure'))
+    status, view = request(server, 'ci/pipeline?repository=17&number=1')
+    assert status == 200
+    assert view['diagnosis']['evidence_availability'] == 'reported'
+    assert view['diagnosis']['failed_tests'][0]['name'] == 'broken'
+
+
+def test_cold_summary_bootstraps_background_history_without_waiting_for_provider(server):
+    import time
+
+    entered, release = threading.Event(), threading.Event()
+    request_threads = []
+    class Provider:
+        available = True
+        base_url = 'https://ci.example'
+        def repos(self, **kwargs):
+            request_threads.append(threading.current_thread().name)
+            entered.set()
+            release.wait(3)
+            return []
+    server.ci_monitor.close()
+    server.ci_monitor = CIMonitor(provider_factory=Provider)
+    try:
+        started = time.monotonic()
+        status, view = request(server, 'ci/summary')
+        assert status == 200 and time.monotonic() - started < 1
+        assert view['scope']['partial'] is True
+        assert entered.wait(1), 'Summary must bootstrap the existing background collector'
+        assert all('process_request' not in name for name in request_threads)
+    finally:
+        release.set()
