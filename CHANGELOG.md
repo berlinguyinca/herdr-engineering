@@ -5,6 +5,19 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### GitHub page: conditional requests and since deltas (PR-G3)
+- The web client remembers each GET's `ETag` (per URL, the last 64) and sends `If-None-Match`. A
+  `304` hands back the remembered body. GitHub lists, hosts, host detail, services, service detail,
+  agents, agent detail, missions and mission detail read this way.
+- The GitHub page asks for `?since=<revision>` and applies the delta to the rows it shows (keyed by
+  `github_id`, patched in place). A `304` writes nothing. A delta the page cannot place (a row new
+  to the page, a removal, a later page) reloads the page in full, and a `resync` replaces the list.
+- Every 12th poll (once a minute), and the poll after the sync state changes, reads a list in full.
+  Repository rows carry fields that no revision covers (`issues_loaded`, `issues_complete`,
+  `error`), so deltas alone would keep them stale.
+- The health line names the owners in scope and the number of excluded repositories.
+- Review gate and LLM pages gained the freshness chip every route carries.
+
 ### Live web UI: pages update in place (#218, #221 and the PRs stacked on them)
 - Pages no longer re-render on live events. A route loads once, behind a skeleton, and then returns
   a mounted view `{ refresh(hint), dispose() }`. A shared refresh bus throttles SSE events to one

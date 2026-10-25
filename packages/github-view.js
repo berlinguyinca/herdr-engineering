@@ -3,7 +3,7 @@ import {escapeHtml as esc} from './herdr-web-components/util.js';
 import {formatDuration,formatTimestamp} from './herdr-web-components/format.js';
 import {safeServiceUrl} from './services-view.js';
 import {snapshotText,animateChanges,skeleton} from './motion.js';
-import {morph,handOff,patchText,patchAttr} from './patch.js';
+import {morph,handOff,patchList,patchText,patchAttr} from './patch.js';
 import {freshnessSources} from './freshness.js';
 
 const text=value=>typeof value==='string'?value:'';
@@ -17,6 +17,50 @@ const tabs=[['all','All open issues'],['autospec','AutoSpec candidates'],['prepa
 const stamp=value=>typeof value==='number'?value>0?(value<1e12?value*1000:value):0:Date.parse(value)||0;
 const age=(value,label)=>{const date=stamp(value);return date?`${esc(label)} <span data-gh-time="${date}">${esc(formatDuration(Math.max(0,Date.now()-date)))}</span> ago`:`${esc(label)} time not reported`;};
 const link=(url,label)=>{const safe=safeServiceUrl(url);return safe?`<a href="${esc(safe)}" target="_blank" rel="noopener noreferrer">${esc(label)} ↗</a>`:'';};
+
+// ---- since deltas -------------------------------------------------------------
+// The server's list order (github.py _repository_rows / _issue_order), compared like Python strings.
+const cmp=(a,b)=>a<b?-1:a>b?1:0;
+const repoOrder=(a,b)=>(integer(b.open_issue_count)?b.open_issue_count:-1)-(integer(a.open_issue_count)?a.open_issue_count:-1)||cmp(text(a.name_with_owner).toLowerCase(),text(b.name_with_owner).toLowerCase());
+const issueOrder=(a,b)=>cmp(text(b.updated_at),text(a.updated_at))||(Number(b.number)||0)-(Number(a.number)||0);
+// Delta keys: an issue's github_id, a repository's repository_id (what changes() reports in removed[].key).
+export const githubRowKey=(kind,row)=>kind==='issues'?String(row.github_id??issueKey(row)):String(row.repository_id??'');
+// Merge a list response into the held page. A full list is taken as is. A resync carries the whole,
+// unpaginated list: the current page is cut from it. A delta is applied in place only when the page
+// can place it without the server: every changed row is already on this page (page 1), nothing was
+// removed, and no changed row may now belong to the next page. Otherwise null: reload the page.
+export function applyGithubDelta(kind,held,body,{page=1,perPage=20}={}) {
+ const {upserted,removed,resync,[kind]:list,...state}=body||{};
+ if(resync){
+  const rows=records(list),start=(page-1)*perPage;
+  return {...state,[kind]:rows.slice(start,start+perPage),pagination:{page,per_page:perPage,total:rows.length,has_next:start+perPage<rows.length}};
+ }
+ if(!Array.isArray(upserted)||!Array.isArray(removed))return Array.isArray(list)?body:null;
+ if(!held||!Array.isArray(held[kind]))return null;
+ const rows=records(held[kind]),onPage=new Set(rows.map(r=>githubRowKey(kind,r)));
+ const changed=new Map(records(upserted).map(r=>[githubRowKey(kind,r),r]));
+ if(removed.length||[...changed.keys()].some(k=>!onPage.has(k))||(changed.size&&page>1))return null;
+ const order=kind==='issues'?issueOrder:repoOrder;
+ const next=rows.map(r=>changed.get(githubRowKey(kind,r))||r).sort(order);
+ // The page's boundary is only known by its unchanged rows: a changed row sorted past all of them
+ // may belong to the next page.
+ if(changed.size&&held.pagination?.has_next===true){const last=next[next.length-1];if(last&&changed.has(githubRowKey(kind,last)))return null;}
+ return {...held,...state,[kind]:next};
+}
+// What decides a full reload of the repository rail: repository rows carry fields that are never
+// revisioned (issues_loaded, issues_complete, error), so a delta cannot report their change.
+export function githubSyncSignature(s={}) {
+ const p=s.progress||{};
+ return JSON.stringify([s.status,!!s.refreshing,!!s.stale,!!s.partial,s.error??null,p.phase??null,p.repositories_seen??null,p.issue_repositories_complete??null,p.issues_seen??null,p.current_repository??null]);
+}
+const SCOPE_OWNERS_SHOWN=8;
+function renderScope(scope) {
+ if(!scope||typeof scope!=='object')return '';
+ const owners=strings(scope.owners);if(!owners.length)return '';
+ const excluded=integer(scope.excluded_repositories)?scope.excluded_repositories:0;
+ const shown=owners.slice(0,SCOPE_OWNERS_SHOWN).map(o=>esc(short(o,60))).join(', ');
+ return `<p class="gh-note" data-gh-scope-note>${owners.length} ${owners.length===1?'owner':'owners'} in scope: ${shown}${owners.length>SCOPE_OWNERS_SHOWN?` and ${owners.length-SCOPE_OWNERS_SHOWN} more`:''} · ${excluded} ${excluded===1?'repository':'repositories'} excluded</p>`;
+}
 
 export function rankGithubRepositories(repositories) {
  return records(repositories).slice().sort((a,b)=>(integer(b.open_issue_count)?b.open_issue_count:-1)-(integer(a.open_issue_count)?a.open_issue_count:-1)||text(a.name_with_owner).localeCompare(text(b.name_with_owner)));
@@ -42,7 +86,7 @@ export function renderGithubHealth(snapshot,{failed=false}={}) {
  return `${messages[snapshot.status]?`<p class="gh-warning" role="status">${esc(messages[snapshot.status])}</p>`:''}${snapshot.error?`<p class="gh-warning">${esc(short(snapshot.error,400))}</p>`:''}
   ${busy?`<div class="gh-progress" role="status"><span>${issues?'Reading open issues':'Discovering repositories'}${measured?` · ${Math.min(complete,total)} of ${total} repositories`:''}${progress.current_repository?` · ${esc(short(progress.current_repository))}`:''}</span><progress ${measured?`value="${Math.min(complete,total)}" max="${total}"`:''} aria-label="${issues?'Repositories checked for issues':'Repository discovery'}"></progress>${integer(progress.issues_seen)?`<span>${progress.issues_seen} open issues observed so far</span>`:''}</div>`:''}
   ${snapshot.partial?'<p class="gh-warning">Partial coverage: some repositories or issues have not been read. Counts describe the available catalog.</p>':''}${snapshot.stale?'<p class="gh-warning">Showing previously synchronized data. Issue age does not determine whether an issue is still open.</p>':''}
-  <p class="gh-note">${account?`${esc(account)} · `:''}${age(snapshot.last_success_at,'Last successful sync')}${integer(snapshot.rate_limit?.remaining)?` · ${snapshot.rate_limit.remaining} GraphQL points remaining`:''}</p>`;
+  <p class="gh-note">${account?`${esc(account)} · `:''}${age(snapshot.last_success_at,'Last successful sync')}${integer(snapshot.rate_limit?.remaining)?` · ${snapshot.rate_limit.remaining} GraphQL points remaining`:''}</p>${renderScope(snapshot.scope)}`;
 }
 // The chip's note for the sync snapshot: status (when not ready), stale, partial and deferred
 // repositories (array or count). Any of them keeps the chip amber: a sync problem never reads as live.
@@ -60,7 +104,7 @@ export function renderGithubRepository(repo={},selected=false) {
 }
 export function renderGithubIssue(issue={},selected=false) {
  const labels=strings(issue.labels),assigned=strings(issue.assignees);
- return `<article class="gh-issue" data-key="${esc(issueKey(issue))}" data-gh-issue-row="${esc(issueKey(issue))}"><button type="button" class="gh-issue-title" data-gh-issue="${esc(issueKey(issue))}" aria-pressed="${selected}">${esc(short(issue.title,220)||'Untitled issue')}</button>
+ return `<article class="gh-issue" data-key="${esc(githubRowKey('issues',issue))}" data-gh-issue-row="${esc(issueKey(issue))}"><button type="button" class="gh-issue-title" data-gh-issue="${esc(issueKey(issue))}" aria-pressed="${selected}">${esc(short(issue.title,220)||'Untitled issue')}</button>
   <p class="gh-note">${esc(issue.repository_id||'')} · #${esc(issue.number??'?')}${assigned.length?` · ${esc(assigned.slice(0,3).join(', '))}`:''}</p>
   <p class="gh-state">${esc(githubIssueLabel(issue))}</p>${labels.length?`<div class="gh-labels">${labels.slice(0,6).map(label=>`<span>${esc(short(label,80))}</span>`).join('')}${labels.length>6?`<span>+${labels.length-6} labels</span>`:''}</div>`:''}
   <p class="gh-note">Issue updated ${esc(formatTimestamp(issue.updated_at))}</p></article>`;
@@ -99,11 +143,22 @@ const styles=`<style>
 @media(max-width:850px){.gh-layout{grid-template-columns:minmax(0,1fr)}.gh-repo-list{max-height:280px;overflow:auto}.gh-tabs button{padding:8px}.gh-body{max-height:350px}}
 </style>`;
 
+// Every FULL_RELOAD_POLLS-th poll of a list reads it in full instead of asking for a delta (once a
+// minute at the 5 s poll), as does the poll after the sync state changed: repository rows carry
+// fields no revision covers (issues_loaded, issues_complete, error), so deltas alone could keep
+// them stale.
+const FULL_RELOAD_POLLS=12;
+const PER_PAGE=20;
+const element=html=>{const t=document.createElement('template');t.innerHTML=html.trim();return t.content.firstElementChild;};
+
 export function mountGithub(container,client) {
  const state={repository:'',repositoryLabel:'All repositories',repositorySearch:'',issueSearch:'',tab:'all',repositoryPage:1,issuePage:1};
  let disposed=false,repositories=null,issues=null,repoError='',issueError='',selected=null,detail=null,detailError='',detailLoading=false;
  let clock=null,pollTimer=null,repositoryDebounce=null,issueDebounce=null;
  let account=null,connectionGeneration=null,listScroll=null;
+ // Per list: the query the held body answers, polls since its last full read, and whether the next
+ // read must be full.
+ const held={repositories:{query:null,polls:0,full:false},issues:{query:null,polls:0,full:false}};
  const requests=new Map(),cache=new Map(),listeners=new AbortController();
  const chipEl=()=>container.querySelector('herdr-freshness'),chip=freshnessSources(chipEl);
  container.innerHTML=`${styles}<div class="hd-live-head"><h1>GitHub projects</h1><herdr-freshness interval="5000"></herdr-freshness></div><p class="gh-intro">Repositories ranked by open issues. Find work to inspect and review its AutoSpec labels, preparation needs and reported progress.</p><div data-gh-health role="status"></div><p data-gh-repo-error class="gh-warning" role="status"></p>
@@ -163,8 +218,21 @@ export function mountGithub(container,client) {
   for(const [key] of tabs){const button=el(`[data-gh-tab="${key}"]`);patchAttr(button,'aria-selected',String(state.tab===key));patchAttr(button,'tabindex',state.tab===key?'0':'-1');patchText(el(`[data-gh-tab-count="${key}"]`),integer(issues?.counts?.[key])?issues.counts[key]:'…');}
   const rows=records(issues?.issues);
   patchAttr(el('#gh-issue-panel'),'aria-labelledby',`gh-tab-${state.tab}`);
-  const issueStranded=morph(el('#gh-issue-panel'),rows.map(issue=>renderGithubIssue(issue,selected?.key===issueKey(issue))).join('')||(!issues?(issueError?'<p class="gh-empty">Issues could not be loaded yet; retrying automatically.</p>':skeleton('open issues',{rows:2,height:64})):`<p class="gh-empty">${issues.available===false?'Issue data is unavailable.':'No open issues match this view.'}${issues?.partial?' Synchronization is incomplete.':''}</p>`));
-  handOff(issueStranded,node=>neighbour(node,'[data-gh-issue]')||el('[data-gh-issue-search]'));
+  const panel=el('#gh-issue-panel');
+  if(rows.length){
+   // Rows are keyed by github_id and patched in place, so a delta that changes one issue writes one row.
+   for(const child of [...panel.children])if(!child.hasAttribute('data-key'))child.remove();// skeleton or empty note
+   const wanted=new Set(rows.map(issue=>githubRowKey('issues',issue)));
+   const focused=document.activeElement?.closest?.('[data-gh-issue-row]');
+   // A focused row that leaves hands focus to its neighbour (else the search) before it goes.
+   const fallback=focused&&panel.contains(focused)&&!wanted.has(focused.dataset.key)?(neighbour(focused,'[data-gh-issue]')||el('[data-gh-issue-search]')):null;
+   patchList(panel,rows.map(issue=>({id:githubRowKey('issues',issue),html:renderGithubIssue(issue,selected?.key===issueKey(issue))})),{key:item=>item.id,render:item=>item.html,update:(row,item)=>handOff(morph(row,element(item.html)),()=>row.querySelector('[data-gh-issue]')),inPlace:true,animate:live});
+   if(!live)for(const row of panel.querySelectorAll('[data-entering]'))row.removeAttribute('data-entering');
+   if(fallback)fallback.focus({preventScroll:true});
+  }else{
+   const issueStranded=morph(panel,!issues?(issueError?'<p class="gh-empty">Issues could not be loaded yet; retrying automatically.</p>':skeleton('open issues',{rows:2,height:64})):`<p class="gh-empty">${issues.available===false?'Issue data is unavailable.':'No open issues match this view.'}${issues?.partial?' Synchronization is incomplete.':''}</p>`);
+   handOff(issueStranded,node=>neighbour(node,'[data-gh-issue]')||el('[data-gh-issue-search]'));
+  }
   animateChanges(el('#gh-issue-panel'),'[data-gh-issue-row]',issuesBefore,issueRowKey,{count:false});
   animateChanges(container,'[data-gh-tab-count]',countsBefore);
   patchText(el('[data-gh-issue-count]'),issues?`${rows.length} issues on this page${integer(issues.pagination?.total)?` · ${issues.pagination.total} matching open issues`:''}`:'');
@@ -176,11 +244,12 @@ export function mountGithub(container,client) {
  }
  async function request(key,read,accept,reject) {
   if(disposed||document.hidden||requests.has(key))return;
-  const controller=new AbortController();requests.set(key,controller);let timeout=false;
+  const controller=new AbortController();requests.set(key,controller);let timeout=false,quiet=false;
   const deadline=setTimeout(()=>{timeout=true;controller.abort();},15000);
-  try{const response=await read(controller.signal);if(!disposed&&!controller.signal.aborted&&requests.get(key)===controller)accept(response);}
+  // accept returns false when nothing changed (a 304): no draw, so no DOM writes at all.
+  try{const response=await read(controller.signal);if(!disposed&&!controller.signal.aborted&&requests.get(key)===controller)quiet=accept(response)===false;}
   catch(error){if(!disposed&&requests.get(key)===controller&&(!controller.signal.aborted||timeout))reject(error);}
-  finally{clearTimeout(deadline);if(requests.get(key)===controller)requests.delete(key);draw();}
+  finally{clearTimeout(deadline);if(requests.get(key)===controller)requests.delete(key);if(!quiet)draw();}
  }
  function loadDetail(force=false) {
   if(!selected)return;
@@ -196,8 +265,32 @@ export function mountGithub(container,client) {
    cache.set(current.key,{version:current.summary.updated_at,response});
   },()=>{if(selected?.key===current.key){detailLoading=false;detailError='Issue details could not refresh. Use Refresh issue to retry.';}});
  }
- function readRepositories(){request('repos',signal=>client.getGithub({page:state.repositoryPage,per_page:20,search:state.repositorySearch,signal}),response=>{
+ // One list read. With a held body for the same query (and a revision) it asks since that revision
+ // and merges the delta; a delta the page cannot place, or a due full reload, reads the page in
+ // full. Every read sends the list's ETag. Resolves null when nothing changed (304).
+ async function readList(kind,query,params,signal) {
+  const mine=held[kind],current=kind==='issues'?issues:repositories;
+  const base=mine.query===query&&current&&integer(current.revision)?current:null;
+  const full=!base||mine.full||(++mine.polls%FULL_RELOAD_POLLS===0);
+  const page=kind==='issues'?state.issuePage:state.repositoryPage;
+  const first=await client.getGithubConditional(kind,{...params,since:full?undefined:base.revision,signal});
+  if(first.notModified&&mine.query===query&&current)return null;
+  if(!full){const merged=applyGithubDelta(kind,base,first.body,{page,perPage:PER_PAGE});if(merged)return {response:merged,full:!!first.body?.resync,previous:base};}
+  const again=full?first:await client.getGithubConditional(kind,{...params,signal});
+  return {response:again.body,full:true,previous:current};
+ }
+ // Records the read: a full read restarts the poll count; a delta whose sync state moved makes the next read full.
+ function settle(kind,query,{response,full,previous}){
+  const mine=held[kind];mine.query=query;
+  if(full){mine.polls=0;mine.full=false;}else mine.full=githubSyncSignature(response)!==githubSyncSignature(previous);
+ }
+ const repoQuery=()=>JSON.stringify([state.repositoryPage,state.repositorySearch]);
+ const issueQuery=()=>JSON.stringify([state.repository,state.tab,state.issueSearch,state.issuePage]);
+ function readRepositories(){const query=repoQuery();request('repos',signal=>readList('repositories',query,{page:state.repositoryPage,per_page:PER_PAGE,search:state.repositorySearch},signal),read=>{
+  if(read===null){chip.ok('repos');return false;}
+  const response=read.response;
   if(!Array.isArray(response?.repositories))throw new Error('Invalid repositories response');
+  settle('repositories',query,read);
   const nextAccount=text(response.account?.login||response.account)||null,nextGeneration=response.connection_generation;
   const changed=(account&&nextAccount&&account!==nextAccount)||(connectionGeneration!==null&&nextGeneration!==undefined&&connectionGeneration!==nextGeneration);
   const disconnected=['not_configured','auth_error'].includes(response.status);
@@ -206,8 +299,11 @@ export function mountGithub(container,client) {
   repositories=response;repoError='';if(changed||disconnected)readIssues();
   const note=githubSyncNote(response);chipEl()?.setDetail(note.text,{warn:note.warn});chip.ok('repos');
  },error=>{chip.fail('repos',`Repositories: ${error?.message||'request failed'}`);repoError=`Repositories could not refresh.${repositories?' Showing last received repositories.':' Retrying automatically.'}`;});}
- function readIssues(){request('issues',signal=>client.getGithubIssues(state.repository||undefined,{tab:state.tab,search:state.issueSearch,page:state.issuePage,per_page:20,signal}),response=>{
+ function readIssues(){const query=issueQuery();request('issues',signal=>readList('issues',query,{repository:state.repository||undefined,tab:state.tab,search:state.issueSearch,page:state.issuePage,per_page:PER_PAGE},signal),read=>{
+  if(read===null){chip.ok('issues');return false;}
+  const response=read.response;
   if(!Array.isArray(response?.issues))throw new Error('Invalid issues response');
+  settle('issues',query,read);
   if((connectionGeneration!==null&&response.connection_generation!==undefined&&response.connection_generation!==connectionGeneration)||(account&&text(response.account)&&account!==response.account)){clearSelection();cache.clear();issues=null;issueError='GitHub connection changed. Refreshing account context.';readRepositories();return;}
   issues=response;issueError='';chip.ok('issues');
   const latest=selected&&records(response.issues).find(issue=>issueKey(issue)===selected.key);

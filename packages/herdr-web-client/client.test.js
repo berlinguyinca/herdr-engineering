@@ -358,3 +358,96 @@ test('CI reads and mutations bind the expected provider URL without changing leg
  for(const call of calls.slice(0,2))assert.equal(new URL(call.url,'http://test').searchParams.get('provider_url'),providerUrl);
  for(const call of calls.slice(2))assert.equal(JSON.parse(call.opts.body).provider_url,providerUrl);
 });
+
+// ---- conditional GET (ETag / If-None-Match) ---------------------------------
+// A fake server: answers 304 when If-None-Match matches its current tag, else 200 with the tag.
+function etagServer(bodies) {
+  const calls = [];
+  let current = { tag: 'W/"1-a"', body: bodies[0] };
+  const fetchImpl = async (url, opts) => {
+    calls.push({ url, ifNoneMatch: opts.headers['If-None-Match'] });
+    if (opts.headers['If-None-Match'] === current.tag) {
+      return { ok: false, status: 304, headers: { get: (n) => (n.toLowerCase() === 'etag' ? current.tag : null) }, text: async () => '' };
+    }
+    return { ok: true, status: 200, headers: { get: (n) => (n.toLowerCase() === 'etag' ? current.tag : null) }, text: async () => JSON.stringify(current.body) };
+  };
+  return { calls, fetchImpl, change(tag, body) { current = { tag, body }; } };
+}
+
+test('getConditional stores the ETag, sends If-None-Match and reports a 304 with the stored body', async () => {
+  const server = etagServer([{ hosts: [{ host_id: 'h1' }] }]);
+  const client = new HerdrClient('', { fetchImpl: server.fetchImpl });
+  const first = await client.getConditional('/api/v1/hosts');
+  assert.equal(first.notModified, false);
+  assert.equal(server.calls[0].ifNoneMatch, undefined);
+  const second = await client.getConditional('/api/v1/hosts');
+  assert.equal(server.calls[1].ifNoneMatch, 'W/"1-a"');
+  assert.equal(second.notModified, true);
+  assert.deepEqual(second.body, first.body);
+  // each caller gets its own object: a view that mutates its response cannot corrupt the cache
+  assert.notEqual(second.body, first.body);
+  second.body.hosts.push({ host_id: 'mutated' });
+  const third = await client.getConditional('/api/v1/hosts');
+  assert.deepEqual(third.body, { hosts: [{ host_id: 'h1' }] });
+  server.change('W/"2-b"', { hosts: [] });
+  const fourth = await client.getConditional('/api/v1/hosts');
+  assert.equal(fourth.notModified, false);
+  assert.deepEqual(fourth.body, { hosts: [] });
+});
+
+test('getConditional keys tags by URL and never sends a tag for a response that had none', async () => {
+  const calls = [];
+  const client = new HerdrClient('', { fetchImpl: async (url, opts) => { calls.push(opts.headers['If-None-Match']); return { ok: true, text: async () => '{"a":1}' }; } });
+  await client.getConditional('/api/v1/x');
+  await client.getConditional('/api/v1/x');
+  assert.deepEqual(calls, [undefined, undefined]);
+  const server = etagServer([{ n: 1 }]);
+  const tagged = new HerdrClient('', { fetchImpl: server.fetchImpl });
+  await tagged.getConditional('/api/v1/a');
+  await tagged.getConditional('/api/v1/b');
+  assert.deepEqual(server.calls.map((c) => c.ifNoneMatch), [undefined, undefined]);
+});
+
+test('getConditional retries without a tag when a 304 arrives for a forgotten body', async () => {
+  const calls = [];
+  const client = new HerdrClient('', { fetchImpl: async (url, opts) => {
+    calls.push(opts.headers['If-None-Match']);
+    if (calls.length === 1) return { ok: false, status: 304, headers: { get: () => 'W/"x"' }, text: async () => '' };
+    return { ok: true, status: 200, headers: { get: () => null }, text: async () => '{"ok":true}' };
+  } });
+  const r = await client.getConditional('/api/v1/hosts');
+  assert.deepEqual(r, { body: { ok: true }, notModified: false });
+  assert.equal(calls.length, 2);
+});
+
+test('getConditional bounds its remembered bodies', async () => {
+  const server = etagServer([{ n: 1 }]);
+  const client = new HerdrClient('', { fetchImpl: server.fetchImpl });
+  for (let i = 0; i < 200; i++) await client.getConditional(`/api/v1/github?since=${i}`);
+  assert.ok(client.conditionalSize <= 64, `cache holds ${client.conditionalSize}`);
+});
+
+test('polled list reads and GitHub lists go through conditional requests', async () => {
+  const server = etagServer([{ sessions: [], missions: [], services: [], hosts: [], repositories: [], issues: [] }]);
+  const client = new HerdrClient('', { fetchImpl: server.fetchImpl });
+  const reads = [
+    () => client.listHosts(), () => client.listServices(), () => client.listSessions(), () => client.getSession('s1'),
+    () => client.listMissions(), () => client.getMission('m1'), () => client.getHost('h1'), () => client.getService('svc'),
+    () => client.getGithub({ page: 1 }), () => client.getGithubIssues('', { tab: 'all' }),
+  ];
+  for (const read of reads) { await read(); const body = await read(); assert.ok(body && typeof body === 'object'); }
+  const tagged = server.calls.filter((c, i) => i % 2 === 1).map((c) => c.ifNoneMatch);
+  assert.deepEqual(tagged, reads.map(() => 'W/"1-a"'));
+});
+
+test('getGithubConditional passes since and reports notModified', async () => {
+  const server = etagServer([{ revision: 4, repositories: [] }]);
+  const client = new HerdrClient('', { fetchImpl: server.fetchImpl });
+  const a = await client.getGithubConditional('repositories', { page: 1, per_page: 20, since: 4 });
+  const b = await client.getGithubConditional('repositories', { page: 1, per_page: 20, since: 4 });
+  assert.match(server.calls[0].url, /^\/api\/v1\/github\?.*since=4/);
+  assert.equal(a.notModified, false);
+  assert.equal(b.notModified, true);
+  await client.getGithubConditional('issues', { repository: 'github.com/o/r', tab: 'all', since: 7 });
+  assert.match(server.calls[2].url, /^\/api\/v1\/github\/issues\?repository=github\.com%2Fo%2Fr&tab=all&since=7$/);
+});

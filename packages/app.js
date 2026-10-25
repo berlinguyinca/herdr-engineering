@@ -486,7 +486,7 @@ async function viewServices(_parts, revision) {
 }
 
 async function viewService(parts, revision) {
-  const svc = await client.request(`/api/v1/services/${encodeURIComponent(decodeURIComponent(parts[1]))}`);
+  const svc = await client.getService(decodeURIComponent(parts[1]));
   if (revision !== renderRevision) return;
   if (!svc || svc.error) { statusPage('<herdr-error message="Service not found"></herdr-error>', true); return; }
   // Keeps its own 30 s poll; live events refresh it too.

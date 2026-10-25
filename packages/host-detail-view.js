@@ -14,7 +14,7 @@ const NOT_FOUND = '<herdr-error message="Host not found"></herdr-error>';
 // degrades to empty sparklines. A 404 resolves to host null.
 export async function loadHostDetail(client, hostId, range) {
   const [host, telemetry] = await Promise.all([
-    client.request(`/api/v1/hosts/${hostId}`).catch((err) => { if (err?.status === 404) return null; throw err; }),
+    client.getJson(`/api/v1/hosts/${hostId}`).catch((err) => { if (err?.status === 404) return null; throw err; }),
     loadTelemetry(client, hostId, range),
   ]);
   return { host: host && !host.error ? host : null, telemetry, range };

@@ -13,10 +13,55 @@ export class ApiError extends Error {
   }
 }
 
+const CONDITIONAL_ENTRIES = 64;
+
 export class HerdrClient {
   constructor(baseUrl = '', { fetchImpl = fetch } = {}) {
     this.base = baseUrl.replace(/\/+$/, '');
     this.fetch = fetchImpl;
+    // URL -> { etag, text } for conditional GETs, least recently used first.
+    this.conditional = new Map();
+  }
+
+  get conditionalSize() { return this.conditional.size; }
+
+  // Conditional GET. A response that carried an ETag is remembered (by URL, at most
+  // CONDITIONAL_ENTRIES) and the next read sends If-None-Match. A 304 answers
+  // { body, notModified: true } with the remembered body, parsed afresh so a caller that
+  // mutates its response cannot change what the next caller gets. A 304 for a body this
+  // client no longer holds is retried once without the tag.
+  async getConditional(path, { signal } = {}) {
+    const url = `${this.base}${path}`;
+    const doFetch = this.fetch;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const held = attempt === 0 ? this.conditional.get(url) : undefined;
+      const headers = { Accept: 'application/json' };
+      if (held) headers['If-None-Match'] = held.etag;
+      const res = await doFetch(url, { method: 'GET', headers, signal });
+      if (res.status === 304) {
+        if (!held) { this.conditional.delete(url); continue; }
+        this.conditional.delete(url); this.conditional.set(url, held);
+        return { body: JSON.parse(held.text), notModified: true };
+      }
+      const text = await res.text();
+      let json;
+      try { json = text ? JSON.parse(text) : null; } catch { json = { raw: text }; }
+      if (!res.ok) {
+        throw new ApiError(res.status, json, (json && json.error) || `HTTP ${res.status}`);
+      }
+      const etag = res.headers?.get?.('ETag');
+      this.conditional.delete(url);
+      if (etag && text) {
+        this.conditional.set(url, { etag, text });
+        while (this.conditional.size > CONDITIONAL_ENTRIES) this.conditional.delete(this.conditional.keys().next().value);
+      }
+      return { body: json, notModified: false };
+    }
+    throw new ApiError(304, null, 'Not modified, but no remembered body');
+  }
+
+  async getJson(path, { signal } = {}) {
+    return (await this.getConditional(path, { signal })).body;
   }
 
   async request(path, { method = 'GET', body, signal } = {}) {
@@ -70,11 +115,11 @@ export class HerdrClient {
   // -- missions -----------------------------------------------------------
   listMissions(status, { signal } = {}) {
     const q = status ? `?status=${encodeURIComponent(status)}` : '';
-    return this.request(`/api/v1/missions${q}`, { signal });
+    return this.getJson(`/api/v1/missions${q}`, { signal });
   }
 
-  getMission(id) {
-    return this.request(`/api/v1/missions/${encodeURIComponent(id)}`);
+  getMission(id, { signal } = {}) {
+    return this.getJson(`/api/v1/missions/${encodeURIComponent(id)}`, { signal });
   }
 
   listMissionActivity({ signal } = {}) {
@@ -92,11 +137,11 @@ export class HerdrClient {
   // -- sessions -----------------------------------------------------------
   listSessions(status, { signal } = {}) {
     const q = status ? `?status=${encodeURIComponent(status)}` : '';
-    return this.request(`/api/v1/sessions${q}`, { signal });
+    return this.getJson(`/api/v1/sessions${q}`, { signal });
   }
 
   getSession(id, { signal } = {}) {
-    return this.request(`/api/v1/sessions/${encodeURIComponent(id)}`, { signal });
+    return this.getJson(`/api/v1/sessions/${encodeURIComponent(id)}`, { signal });
   }
 
   getAgentSummary(id, { signal } = {}) {
@@ -128,12 +173,21 @@ export class HerdrClient {
   }
 
   // -- services / hosts ---------------------------------------------------
+  // The polled list and detail reads below send If-None-Match (the API answers 304 when unchanged).
   listServices({ signal } = {}) {
-    return this.request('/api/v1/services', { signal });
+    return this.getJson('/api/v1/services', { signal });
+  }
+
+  getService(id, { signal } = {}) {
+    return this.getJson(`/api/v1/services/${encodeURIComponent(id)}`, { signal });
   }
 
   listHosts({ signal } = {}) {
-    return this.request('/api/v1/hosts', { signal });
+    return this.getJson('/api/v1/hosts', { signal });
+  }
+
+  getHost(id, { signal } = {}) {
+    return this.getJson(`/api/v1/hosts/${encodeURIComponent(id)}`, { signal });
   }
 
   // -- activity / analytics ------------------------------------------------
@@ -203,19 +257,23 @@ export class HerdrClient {
 
   // -- GitHub project and issue inventory ---------------------------------
   getGithub({ page, per_page, search, signal } = {}) {
-    const query = new URLSearchParams();
-    for (const [key, value] of Object.entries({ page, per_page, search })) {
-      if (value != null) query.set(key, String(value));
-    }
-    return this.request(`/api/v1/github${query.size ? `?${query}` : ''}`, { signal });
+    return this.getGithubConditional('repositories', { page, per_page, search, signal }).then((r) => r.body);
   }
 
   getGithubIssues(repository, { tab, search, page, per_page, signal } = {}) {
+    return this.getGithubConditional('issues', { repository, tab, search, page, per_page, signal }).then((r) => r.body);
+  }
+
+  // One GitHub list read as { body, notModified }. `since` (a revision the caller holds) asks for a
+  // delta: { revision, resync:false, upserted, removed }, or { resync:true, <full list> }.
+  getGithubConditional(kind, { repository, tab, search, page, per_page, since, signal } = {}) {
     const query = new URLSearchParams();
-    for (const [key, value] of Object.entries({ repository, tab, search, page, per_page })) {
+    const params = kind === 'issues' ? { repository, tab, search, page, per_page, since } : { page, per_page, search, since };
+    for (const [key, value] of Object.entries(params)) {
       if (value != null && !(key === 'repository' && value === '')) query.set(key, String(value));
     }
-    return this.request(`/api/v1/github/issues${query.size ? `?${query}` : ''}`, { signal });
+    const path = kind === 'issues' ? '/api/v1/github/issues' : '/api/v1/github';
+    return this.getConditional(`${path}${query.size ? `?${query}` : ''}`, { signal });
   }
 
   getGithubIssue(repository, number, { signal } = {}) {
