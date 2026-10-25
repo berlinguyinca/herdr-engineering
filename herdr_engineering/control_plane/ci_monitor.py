@@ -51,6 +51,14 @@ def _credential_redactor(token):
     """Redact output values without changing metric keys or reading the provider."""
     def scrub(value):
         if isinstance(value, str):
+            # Older parser projections may end partway through a credential.
+            # Their lost suffix cannot be recovered. At a parser boundary,
+            # conservatively withhold the field if even one prefix character
+            # matches; never rewrite the retained record or its identity hash.
+            if token and len(value) in (500, 2000, 4000) and any(
+                    value.endswith(token[:length])
+                    for length in range(1, min(len(token), len(value) + 1))):
+                return '[REDACTED]'
             return value.replace(token, '[REDACTED]') if token else value
         if isinstance(value, dict):
             return {key: scrub(item) for key, item in value.items()}

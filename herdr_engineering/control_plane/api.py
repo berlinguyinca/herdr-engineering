@@ -2018,7 +2018,7 @@ def _make_handler(server, public=False, operator=False):
                 return self._json(r.record_ci_telemetry(validate_ci_telemetry(self._read_json())))
             body = self._read_json() or {}
             if resource == "ci" and len(parts) == 5 and parts[4] == "reports":
-                return self._json(r.ingest_ci_report(body))
+                return self._json(r.ingest_ci_report(body, redact=server.ci_monitor.report_redactor()))
             if resource == "ci" and len(parts) == 5 and parts[4] == "debug":
                 from ..errors import HerdrEngineeringError
                 from .ci_debug import debug_ci

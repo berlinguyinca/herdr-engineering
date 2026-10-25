@@ -20,8 +20,11 @@ PIPELINE_LIMIT = 2000
 HISTORY_BYTES = 16 * 1024 * 1024
 
 
-def _text(value, limit=500):
-    return redact_text(str(value or ''))[:limit]
+def _text(value, limit=500, *, redact=None):
+    value = str(value or '')
+    if redact is not None:
+        value = redact(value)
+    return redact_text(value)[:limit]
 
 
 def _tag(element):
@@ -45,7 +48,7 @@ def normalize_provider_url(value):
     return value.rstrip('/')
 
 
-def parse_junit(xml):
+def parse_junit(xml, *, redact=None):
     if not isinstance(xml, str) or len(xml.encode('utf-8')) > MAX_XML_BYTES:
         raise ValueError('JUnit XML must be a string of at most 1 MiB')
     if '<!DOCTYPE' in xml.upper() or '<!ENTITY' in xml.upper():
@@ -75,9 +78,9 @@ def parse_junit(xml):
                 raise ValueError('JUnit case time must be a finite nonnegative number') from None
             if not math.isfinite(seconds) or seconds < 0 or seconds > 31536000:
                 raise ValueError('JUnit case time must be finite and between zero and one year')
-            name = _text(node.get('name')) or '(unnamed test)'
-            classname = _text(node.get('classname'))
-            suite = _text(' / '.join(suite_path))
+            name = _text(node.get('name'), redact=redact) or '(unnamed test)'
+            classname = _text(node.get('classname'), redact=redact)
+            suite = _text(' / '.join(suite_path), redact=redact)
             # Hash full original labels before redaction/truncation so display
             # collisions cannot create false retry or flakiness evidence.
             labels = [suite_path, node.get('classname', ''), node.get('name', '')]
@@ -95,10 +98,10 @@ def parse_junit(xml):
             tests.append(dict(id=case_id, name=name, suite=suite, classname=classname,
                               status={'error': 'errored', 'failure': 'failed'}.get(status, status or 'passed'),
                               duration_ms=round(seconds * 1000),
-                              message=_text(detail.get('message'), 2000) if detail is not None else '',
-                              trace=_text(''.join(detail.itertext()), 4000) if detail is not None else ''))
+                              message=_text(detail.get('message'), 2000, redact=redact) if detail is not None else '',
+                              trace=_text(''.join(detail.itertext()), 4000, redact=redact) if detail is not None else ''))
             if node.get('file'):
-                tests[-1]['file'] = _text(node.get('file'))
+                tests[-1]['file'] = _text(node.get('file'), redact=redact)
             case_groups.setdefault(identity, []).append(tests[-1])
         else:
             pending.extend((child, suite_path) for child in reversed(list(node)))
@@ -117,7 +120,7 @@ def parse_junit(xml):
     return parsed
 
 
-def normalize_report(body, stamp):
+def normalize_report(body, stamp, *, redact=None):
     if not isinstance(body, dict):
         raise ValueError('Report must be a JSON object')
     values = {}
@@ -127,7 +130,7 @@ def normalize_report(body, stamp):
         value = body.get(key)
         if not isinstance(value, str) or not value.strip() or len(value) > 500:
             raise ValueError(f'{key} must be a nonempty string of at most 500 characters')
-        values[key] = _text(value)
+        values[key] = _text(value, redact=redact)
     number = body.get('run_number')
     if isinstance(number, bool) or not isinstance(number, int) or number < 1:
         raise ValueError('run_number must be a positive integer')
@@ -135,14 +138,14 @@ def normalize_report(body, stamp):
     if provider is not None and (isinstance(provider, bool) or not isinstance(provider, (str, int)) or not str(provider) or len(str(provider)) > 300):
         raise ValueError('provider_repo_id must be a string or integer')
     if isinstance(provider, str):
-        provider = _text(provider)
+        provider = _text(provider, redact=redact)
     reported = body.get('reported_at', stamp)
     try:
         if not isinstance(reported, str) or len(reported) > 80 or datetime.fromisoformat(reported.replace('Z', '+00:00')).tzinfo is None:
             raise ValueError()
     except ValueError:
         raise ValueError('reported_at must be an ISO timestamp with timezone') from None
-    values.update(provider_repo_id=provider, run_number=number, **parse_junit(body.get('xml')))
+    values.update(provider_repo_id=provider, run_number=number, **parse_junit(body.get('xml'), redact=redact))
     digest = hashlib.sha256(json.dumps(values, sort_keys=True).encode()).hexdigest()
     return dict(values, report_id=digest, reported_at=reported)
 

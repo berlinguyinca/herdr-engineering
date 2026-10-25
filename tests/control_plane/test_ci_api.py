@@ -717,3 +717,58 @@ def test_named_detail_without_provider_id_cannot_use_cached_name_as_proof(server
     assert view['diagnosis']['evidence_availability'] == 'unavailable'
     assert view['diagnosis']['failed_tests'] == []
     assert view['diagnosis']['reason']
+
+
+@pytest.mark.parametrize('legacy', [False, True], ids=['new-upload', 'retained'])
+@pytest.mark.parametrize('prefix_length', [1, 7])
+@pytest.mark.parametrize('field,limit', [('name', 500), ('suite', 500), ('classname', 500),
+                                       ('file', 500), ('message', 2000), ('trace', 4000)])
+def test_parser_boundary_credentials_are_not_exposed(server, legacy, prefix_length, field, limit):
+    from herdr_engineering.ci import WoodpeckerProvider
+    from herdr_engineering.control_plane.ci_reports import parse_junit
+    from tests.test_ci import FakeCI
+
+    seed_ci(server, [ci_run()])
+    credential = 'Ω9q7V2m4R8t6N3p5L1w0'
+    values = dict(name='case', suite='suite', classname='class', file='test.py', message='failure', trace='trace')
+    values[field] = 'x' * (limit - prefix_length) + credential + ' trailing text'
+    xml = (f'<testsuite name="{values["suite"]}"><testcase name="{values["name"]}" '
+           f'classname="{values["classname"]}" file="{values["file"]}">'
+           f'<failure message="{values["message"]}">{values["trace"]}</failure></testcase></testsuite>')
+    original_id = parse_junit(xml)['tests'][0]['id']
+    body = dict(repository='org/app', provider_url='https://ci.example', provider_repo_id=17,
+                run_number=1, revision='abc', branch='main', xml=xml)
+    transport = FakeCI({'/api/repos/17/pipelines/1': {
+        'number': 1, 'status': 'failure', 'branch': 'main', 'commit': 'abc'},
+        '/api/repos/17/permissions': {'push': False}})
+    provider = WoodpeckerProvider('https://ci.example', credential, client=transport)
+    server.ci_monitor._factory = lambda: provider
+    if legacy:
+        # Exercise existing journal/backup evidence created without credential context.
+        server.repo.ingest_ci_report(body)
+        restored = ControlPlaneRepo(now=lambda: CI_NOW)
+        restored.import_state(server.repo.export_state())
+        server.repo = restored
+        assert server.repo.ci_reports()['reports'][0]['tests'][0][field].endswith(credential[:prefix_length])
+    else:
+        status, receipt = request(server, 'ci/reports', body, key='write')
+        assert status == 200
+        assert receipt['tests'][0]['id'] == original_id
+        assert receipt['tests'][0][field].find('Ω') == -1
+        assert len(receipt['tests'][0][field]) <= limit
+        assert json.dumps(server.repo.export_state(), ensure_ascii=False).find('Ω') == -1
+    before = server.repo.export_state()
+    for route in ('ci/tests', 'ci/pipeline?repository=17&number=1'):
+        status, view = request(server, route)
+        assert status == 200
+        assert json.dumps(view, ensure_ascii=False).find('Ω') == -1
+        if route == 'ci/tests':
+            assert transport.requests == []
+            cases = view['tests']
+            assert cases[0]['failure_count'] == 1
+        else:
+            assert view['diagnosis']['evidence_availability'] == 'reported'
+            cases = view['diagnosis']['failed_tests']
+        assert cases[0]['id'] == original_id
+        assert len(json.dumps(view).encode()) < 256 * 1024
+    assert server.repo.export_state() == before, 'Read-time protection must not rewrite retained evidence'

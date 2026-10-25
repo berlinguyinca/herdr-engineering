@@ -1659,10 +1659,10 @@ class ControlPlaneRepo:
                                persistence='durable_sink' if self._sink is not None else 'memory_only',
                                repository=repository, branch=branch, days=days)
 
-    def ingest_ci_report(self, body):
+    def ingest_ci_report(self, body, *, redact=None):
         from .ci_reports import normalize_report, reconcile_report_identities
         with self._event_lock:
-            report = normalize_report(body, self._stamp())
+            report = normalize_report(body, self._stamp(), redact=redact)
             existing = self._events.get(("ci_report", report["report_id"]))
             if existing:
                 return copy.deepcopy(existing[-1]["payload"])

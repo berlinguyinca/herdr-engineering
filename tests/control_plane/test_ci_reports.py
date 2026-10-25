@@ -702,3 +702,18 @@ def test_byte_eviction_is_source_truncation_even_below_the_report_count_limit(mo
     scope = repo.ci_test_history()['scope']
     assert scope['truncated'] is True and scope['source_truncated'] is True
     assert scope['projection_truncated'] is False
+
+
+def test_exact_redaction_precedes_parser_limits_without_changing_case_identity():
+    from herdr_engineering.control_plane.ci_monitor import _credential_redactor
+
+    credential = 'Ω9q7V2m4R8t6N3p5L1w0'
+    raw = 'x' * 493 + credential
+    xml = (f'<testsuite><testcase name="{raw}"/><testcase name="{raw.replace(credential, "[REDACTED]")}"/>'
+           '</testsuite>')
+    original = parse_junit(xml)
+    protected = parse_junit(xml, redact=_credential_redactor(credential))
+    assert [row['id'] for row in protected['tests']] == [row['id'] for row in original['tests']]
+    assert protected['tests'][0]['id'] != protected['tests'][1]['id']
+    assert protected['tests'][0]['name'] == protected['tests'][1]['name']
+    assert all('Ω' not in row['name'] and len(row['name']) <= 500 for row in protected['tests'])
