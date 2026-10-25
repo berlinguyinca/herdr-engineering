@@ -305,7 +305,8 @@ class CollabService:
                  approval: ApprovalPolicy | None = None, summary_fix: dict | None = None,
                  archive_service: Any = None, upload_service: Any = None, upload_runner: Any = None,
                  analysis_service: Any = None, analysis_runner: Any = None,
-                 skill_service: Any = None, skill_runner: Any = None):
+                 skill_service: Any = None, skill_runner: Any = None, archive_runner: Any = None):
+        self.archive_runner = archive_runner
         self.skill_service = skill_service
         self.skill_runner = skill_runner
         self.analysis_service = analysis_service
@@ -575,6 +576,51 @@ class CollabService:
                     or any(user_id in r['members'] for r in self._rooms.values())):
                 raise CollabError(409, "user requires relational cutover before deletion")
         return await service.scrub_deleted_user(user_id, authorize=authorize)
+
+    # ---- relational lifecycle over HTTP: thin adapters, all authorization stays in the methods above
+    @staticmethod
+    def _only(body: dict, allowed: frozenset = frozenset()) -> None:
+        if set(body) - allowed:
+            raise CollabError(400, "unexpected request fields")
+
+    def _archive_run(self, operation):
+        if self.archive_runner is None:
+            operation.close()
+            raise CollabError(503, "archive event-loop runner unavailable")
+        try:
+            return self.archive_runner(operation)
+        except CollabError:
+            raise
+        except Exception:
+            # Neither provider endpoints nor SQL detail belong in an HTTP response.
+            raise CollabError(503, "lifecycle operation unavailable; retry") from None
+
+    def _archive_http(self, pr: Principal, room_id: str, body: dict):
+        self._only(body)
+        try:
+            record = self._archive_run(self.archive_room(room_id, pr))
+        except CollabError:
+            raise
+        view = {"archive_id": record.archive_id, "room_id": record.original_room_id,
+                "status": record.status, "live_room_id": record.live_room_id}
+        if record.status == "verified" and record.live_room_id is None:
+            return 200, view          # the only state in which the live room is gone
+        if record.status == "failed":
+            return 503, {**view, "error": "archive failed; the live room is intact; retry"}
+        return 202, view
+
+    def _restore_http(self, pr: Principal, archive_id: str, body: dict):
+        self._only(body)
+        room = self._archive_run(self.restore_room(archive_id, pr))
+        return 201, {"room_id": room.room_id, "name": room.name, "status": room.status}
+
+    def _delete_person_http(self, pr: Principal, uid: str, body: dict):
+        self._only(body)
+        self._require_user(pr)
+        if uid == pr.id:
+            raise CollabError(400, "you cannot do this to yourself")
+        report = self._archive_run(self.scrub_deleted_user(uid, pr))
+        return 200, {"status": report.status, "archives_scrubbed": report.archives_scrubbed}
 
     @property
     def durable(self) -> bool:
@@ -3767,6 +3813,8 @@ class CollabService:
                     or (n == 3 and parts[0] == 'rooms' and parts[2] == 'analyses')):
                 return self._analysis_http(method, parts, body, pr)
             if parts[:2] == ["admin", "users"]:
+                if method == "POST" and n == 4 and parts[3] == "delete":
+                    return self._delete_person_http(pr, parts[2], body)
                 if method == "GET" and parts == ["admin", "users", "log"]:
                     return 200, self.user_log(pr)
                 if method == "GET" and n == 2:
@@ -3907,6 +3955,8 @@ class CollabService:
                     return 201, self.add_project_member(pr, parts[1], body)
                 if parts == ["agents", "enrollment", "start"]:
                     return 201, self.start_enrollment(pr, body)
+                if n == 3 and parts[0] == "archives" and parts[2] == "restore":
+                    return self._restore_http(pr, parts[1], body)
                 if n == 3 and parts[0] == "tasks" and parts[2] == "update":
                     result = self.update_task(pr, parts[1], body)
                     return (202 if result.get("access_request_required") else 200), result
@@ -3928,6 +3978,17 @@ class CollabService:
                         return 200, self.cancel_invite(pr, rid, parts[3])
                     if n == 5 and parts[2] == "members" and parts[4] == "remove":
                         return 200, self.remove_member(pr, rid, parts[3], idempotency_key=body.get("idempotency_key"))
+                    if n == 5 and parts[2] == "members" and parts[4] == "approve":
+                        self._only(body, frozenset({"idempotency_key"}))
+                        return 200, self.decide_room_member(pr, rid, parts[3], "approve",
+                                                            idempotency_key=body.get("idempotency_key"))
+                    if n == 5 and parts[2] == "members" and parts[4] == "upload-permission":
+                        self._only(body, frozenset({"file_upload_permission", "idempotency_key"}))
+                        return 200, self.set_file_upload_permission(
+                            pr, rid, parts[3], body.get("file_upload_permission"),
+                            idempotency_key=body.get("idempotency_key"))
+                    if parts[2:] == ["archive"]:
+                        return self._archive_http(pr, rid, body)
                     if parts[2:] == ["agents"]:
                         return 201, self.grant_agent(pr, rid, body)
                     if n == 5 and parts[2] == "agents" and parts[4] == "remove":

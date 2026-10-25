@@ -715,3 +715,28 @@ def test_scrub_removes_stale_restore_job_for_already_published_room(env):
     files = run(store.list_room_files(restored.room_id))
     assert len(files) == 1 and files[0].uploaded_by is None
     assert s3.objects[LIVE, files[0].storage_key] == BLOB
+
+
+def test_http_lifecycle_routes_drive_the_real_archive_service(env):
+    from herdr_engineering.control_plane.collab import CollabService, StaticTokenAuthenticator
+    conn, run, _, _, s3 = env
+    tokens = {u: hashlib.sha256(f'{u}-token'.encode()).hexdigest() for u in ('owner', 'member')}
+    service = CollabService(StaticTokenAuthenticator(tokens), archive_service=lifecycle(env), archive_runner=run)
+
+    def post(parts, who='owner', body=None, **kw):
+        return service.dispatch('POST', parts, {}, body or {}, f'Bearer {who}-token', None, **kw)
+
+    assert post(['rooms', ROOM, 'archive'], 'member')[0] == 404          # a contributor cannot delete the room
+    assert run(conn.fetchval('SELECT count(*) FROM collab_rooms')) == 1 and not s3.events
+    status, archived = post(['rooms', ROOM, 'archive'])
+    assert status == 200 and archived['status'] == 'verified' and archived['live_room_id'] is None
+    assert run(conn.fetchval('SELECT count(*) FROM collab_rooms')) == 0
+    assert post(['rooms', ROOM, 'archive'])[1] == archived               # a retry reports the same verified state
+    status, restored = post(['archives', archived['archive_id'], 'restore'])
+    assert status == 201 and restored['room_id'] != ROOM                 # restore always mints a new room ID
+    assert post(['archives', archived['archive_id'], 'restore'], 'member')[0] == 404
+    assert post(['admin', 'users', 'member', 'delete'], 'owner')[0] == 403          # not an operator
+    status, scrub = post(['admin', 'users', 'member', 'delete'], 'owner', operator='owner')
+    assert status == 200 and scrub['status'] == 'complete'
+    assert run(conn.fetchval("SELECT count(*) FROM collab_users WHERE user_id='member'")) == 0
+    assert run(conn.fetchval("SELECT count(*) FROM collab_room_files WHERE relative_path='data.csv'")) == 1
