@@ -29,7 +29,9 @@ export class HerdrClient {
   // CONDITIONAL_ENTRIES) and the next read sends If-None-Match. A 304 answers
   // { body, notModified: true } with the remembered body, parsed afresh so a caller that
   // mutates its response cannot change what the next caller gets. A 304 for a body this
-  // client no longer holds is retried once without the tag.
+  // client no longer holds is retried once without the tag. Reads may overlap: an answer is
+  // remembered only while the map still holds the entry its request was sent with, so a late
+  // 304 or a late older 200 never replaces a newer body another read already stored.
   async getConditional(path, { signal } = {}) {
     const url = `${this.base}${path}`;
     const doFetch = this.fetch;
@@ -38,9 +40,10 @@ export class HerdrClient {
       const headers = { Accept: 'application/json' };
       if (held) headers['If-None-Match'] = held.etag;
       const res = await doFetch(url, { method: 'GET', headers, signal });
+      const current = () => this.conditional.get(url) === held;
       if (res.status === 304) {
-        if (!held) { this.conditional.delete(url); continue; }
-        this.conditional.delete(url); this.conditional.set(url, held);
+        if (!held) continue;
+        if (current()) { this.conditional.delete(url); this.conditional.set(url, held); }
         return { body: JSON.parse(held.text), notModified: true };
       }
       const text = await res.text();
@@ -50,6 +53,7 @@ export class HerdrClient {
         throw new ApiError(res.status, json, (json && json.error) || `HTTP ${res.status}`);
       }
       const etag = res.headers?.get?.('ETag');
+      if (!current()) return { body: json, notModified: false };
       this.conditional.delete(url);
       if (etag && text) {
         this.conditional.set(url, { etag, text });

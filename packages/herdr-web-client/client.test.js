@@ -462,3 +462,35 @@ test('getGithubProjects reads the projects list or one project, conditionally', 
   assert.equal(again.notModified, true);
   assert.equal(server.calls[2].url, '/api/v1/github/projects?project=PVT_1&since=2');
 });
+
+test('a late 304 or a late older 200 never overwrites the newer remembered body', async () => {
+  const pending = [];
+  const sent = [];
+  const reply = (status, tag, body) => ({ ok: status === 200, status, headers: { get: (n) => (n.toLowerCase() === 'etag' ? tag : null) }, text: async () => (body ? JSON.stringify(body) : '') });
+  const client = new HerdrClient('', { fetchImpl: (url, opts) => { sent.push(opts.headers['If-None-Match']); return new Promise((resolve) => pending.push(resolve)); } });
+  const first = client.getConditional('/api/v1/hosts');
+  pending.shift()(reply(200, 'T1', { v: 1 }));
+  await first;
+  // Two overlapping reads, both sent with T1. The second is answered first with the new body.
+  const a = client.getConditional('/api/v1/hosts');
+  const b = client.getConditional('/api/v1/hosts');
+  const [answerA, answerB] = pending.splice(0);
+  answerB(reply(200, 'T2', { v: 2 }));
+  assert.deepEqual((await b).body, { v: 2 });
+  answerA(reply(304, 'T1'));
+  assert.deepEqual(await a, { body: { v: 1 }, notModified: true });
+  const next = client.getConditional('/api/v1/hosts');
+  assert.equal(sent.at(-1), 'T2', 'the newer tag is kept');
+  pending.shift()(reply(304, 'T2'));
+  assert.deepEqual((await next).body, { v: 2 });
+  // A late, older 200 does not replace a newer one either.
+  const c = client.getConditional('/api/v1/hosts');
+  const d = client.getConditional('/api/v1/hosts');
+  const [answerC, answerD] = pending.splice(0);
+  answerD(reply(200, 'T3', { v: 3 }));
+  await d;
+  answerC(reply(200, 'T2b', { v: 2.5 }));
+  await c;
+  client.getConditional('/api/v1/hosts');
+  assert.equal(sent.at(-1), 'T3');
+});
