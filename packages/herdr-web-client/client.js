@@ -141,6 +141,12 @@ export class HerdrClient {
     return this.request(`/api/v1/activity?limit=${limit}`, { signal });
   }
 
+  /** LLM page statistics. `params` are the query filters (window, group, project, model, ...). */
+  llm(what, params = {}) {
+    const q = new URLSearchParams(Object.entries(params).filter(([, v]) => v != null && v !== ''));
+    return this.request(`/api/v1/llm/${encodeURIComponent(what)}${q.size ? `?${q}` : ''}`);
+  }
+
   analytics(kind = 'missions') {
     return this.request(`/api/v1/analytics/${encodeURIComponent(kind)}`);
   }
@@ -254,9 +260,9 @@ export class HerdrClient {
     });
   }
 
-  debugCi(repository, number, sessionId, operationId, { signal, providerUrl } = {}) {
+  debugCi(repository, number, sessionId, operationId, { signal, providerUrl, mode } = {}) {
     return this.request('/api/v1/ci/debug', {
-      method: 'POST', body: { repository, number, session_id: sessionId, operation_id: operationId, ...(providerUrl!==undefined?{provider_url:providerUrl}:{}) }, signal,
+      method: 'POST', body: { repository, number, session_id: sessionId, operation_id: operationId, ...(providerUrl!==undefined?{provider_url:providerUrl}:{}), ...(mode==='fix'?{mode}:{}) }, signal,
     });
   }
 

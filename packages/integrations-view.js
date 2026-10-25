@@ -129,7 +129,7 @@ export function renderPipeline(pipeline,{loading=false,error='',log=null,logErro
     <p class="ig-note">${esc(pipeline.repository || '')}${pipeline.branch ? ` · ${esc(pipeline.branch)}` : ''}${pipeline.revision ? ` · <code>${esc(pipeline.revision)}</code>` : ''} · ${esc(human(stateOf(pipeline)) || 'Status unknown')} · ${elapsed(pipeline)}</p>
     <div class="ig-links">${external(pipeline.url,'Open in Woodpecker')}${pipeline.can_retry ? '<button class="hd-btn" type="button" data-ci-action="retry">Retry run</button>' : ''}${pipeline.can_cancel ? '<button class="hd-btn" type="button" data-ci-action="cancel">Cancel run</button>' : ''}</div>
     ${error ? `<p class="ig-warning" role="status">${esc(error)} Showing the last received details.</p>` : ''}${actionMessage ? `<p role="status" class="ig-note">${esc(actionMessage)}</p>` : ''}
-    ${integrationOutcome(pipeline)==='failed' ? `<details class="ig-debug" data-debug-disclosure><summary>Debug with Pi</summary><p class="ig-note">Send the failed revision, step details and bounded log output to a Pi agent you choose.</p>${debugSessions===null ? '<p class="ig-note">Open this section to load active Pi agents.</p>' : `<label class="ig-note">Target Pi agent<select data-debug-session aria-label="Target Pi agent"><option value="">Choose an agent…</option>${debugSessions.map(s=>`<option value="${esc(s.session_id)}" ${s.session_id===debugSessionId?'selected':''}>${esc(short(s.display_name || s.title || s.summary || s.cwd || s.session_id,100))}${s.host_id?` · ${esc(short(s.host_id,60))}`:''}</option>`).join('')}</select></label>${!debugSessions.length ? '<p class="ig-note">No active Pi agents with verified messaging are available.</p>' : ''}<button type="button" class="hd-btn" data-debug-send ${!debugSessionId?'disabled':''}>Send to Pi</button>`}${debugMessage ? `<p class="ig-note" role="status">${esc(debugMessage)}</p>` : ''}</details>` : ''}
+    ${integrationOutcome(pipeline)==='failed' ? `<details class="ig-debug" data-debug-disclosure><summary>Debug with Pi</summary><p class="ig-note">Send the failed revision, step details and bounded log output to a Pi agent you choose.</p>${debugSessions===null ? '<p class="ig-note">Open this section to load active Pi agents.</p>' : `<label class="ig-note">Target Pi agent<select data-debug-session aria-label="Target Pi agent"><option value="">Choose an agent…</option>${debugSessions.map(s=>`<option value="${esc(s.session_id)}" ${s.session_id===debugSessionId?'selected':''}>${esc(short(s.display_name || s.title || s.summary || s.cwd || s.session_id,100))}${s.host_id?` · ${esc(short(s.host_id,60))}`:''}${pipeline.branch && s.branch===pipeline.branch?' · on this branch':''}</option>`).join('')}</select></label>${!debugSessions.length ? '<p class="ig-note">No active Pi agents with verified messaging are available.</p>' : ''}<button type="button" class="hd-btn" data-debug-send ${!debugSessionId?'disabled':''}>Send to Pi</button> <button type="button" class="hd-btn" data-debug-fix ${!debugSessionId?'disabled':''}>Fix with Pi</button><p class="ig-note">Fix with Pi asks the agent to reproduce the failure in a new worktree at this exact revision, fix it and open a pull request. It never merges.</p>`}${debugMessage ? `<p class="ig-note" role="status">${esc(debugMessage)}</p>` : ''}</details>` : ''}
     ${tasks.length ? `<p class="ig-note">${completed} of ${tasks.length} steps finished · Select a step for its log</p><progress value="${completed}" max="${tasks.length}" aria-label="Pipeline steps finished"></progress><div class="ci-pipeline-controls" role="group" aria-label="Pipeline display"><button type="button" class="hd-btn" data-collapse-success aria-pressed="${collapseSuccess}">${collapseSuccess?'Expand successful steps':'Collapse successful steps'}</button><button type="button" class="hd-btn" data-pipeline-zoom="out" aria-label="Zoom out" ${zoom<=.75?'disabled':''}>−</button><button type="button" class="hd-btn" data-pipeline-zoom="reset" aria-label="Reset zoom">${Math.round(zoom*100)}%</button><button type="button" class="hd-btn" data-pipeline-zoom="in" aria-label="Zoom in" ${zoom>=1.5?'disabled':''}>+</button></div>${renderCiPipeline(pipeline,{step,collapseSuccess,zoom})}` : (!Array.isArray(pipeline.tasks) && loading && !error ? skeleton('pipeline steps',{rows:3}) : '<p class="ig-note">No steps reported yet. Waiting for Woodpecker.</p>')}
     ${step ? `<h3>Step log</h3>${logError ? `<p class="ig-warning" role="status">${esc(logError)}</p>` : ''}${log===null ? skeleton('step output',{rows:2}) : `<p class="ig-note">${age(log.checked_at,'Log checked')}${log.truncated?' · Output truncated':''}</p>${log.available===false ? `<p class="ig-note">${esc(log.error || 'Log output is not available yet.')}</p>` : `<pre class="ig-log" tabindex="0" aria-label="Step output">${esc(text(log.log)) || 'No output reported yet.'}</pre>`}`}` : ''}`;
 }
@@ -149,7 +149,7 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
   let disposed=false,data=null,error='',selected=null,pipeline=null,detailError='',log=null,logError='',step='',actionMessage='';
   let timer=null,clock=null,shownPipeline=null,chartHtml='';
   let reportData=null,reportsError='',failurePage=0,testPage=0,testSearch='';
-  let debugSessions=null,debugSessionId='',debugMessage='',debugOperationId='';
+  let debugSessions=null,debugSessionId='',debugMessage='',debugOperationId='',fixOperationId='';
   let healthView=null,workspace=tab==='current'?'health':'runs',collapseSuccess=false,zoom=1,comparisonKey='',listScroll=0,healthOriginKey='';
   const observedDetails=new Map();
   let performanceData=null,performanceError='',performanceDays=14;
@@ -363,7 +363,7 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
     if(selected?.id===entry.id){el('.ig-inspector').scrollIntoView({block:'nearest',behavior:'smooth'});return;}
     listScroll=window.scrollY;healthOriginKey=document.activeElement?.dataset.healthRun||healthOriginKey;testPage=0;testSearch='';comparisonKey='';cancelDetail();
     selected={id:entry.id,repository:record.repository,providerId:record.provider_repo_id || record.repository,number:record.run_number,providerUrl:JSON.parse(entry.id)[0]};
-    pipeline=selected.providerUrl?record:{...record,can_retry:false,can_cancel:false};debugSessions=null;debugSessionId='';debugMessage='';debugOperationId='';step='';log=null;logError='';detailError='';actionMessage='';
+    pipeline=selected.providerUrl?record:{...record,can_retry:false,can_cancel:false};debugSessions=null;debugSessionId='';debugMessage='';debugOperationId='';fixOperationId='';step='';log=null;logError='';detailError='';actionMessage='';
     draw();refreshDetail();el('.ig-inspector').scrollIntoView({block:'nearest',behavior:'smooth'});
   }
   container.addEventListener('click',async event=>{
@@ -382,13 +382,13 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
     }
     if(button.hasAttribute('data-close-inspector')){const lastRunId=selected?.id;cancelDetail();selected=null;pipeline=null;shownPipeline=null;healthView?.selectedRun(null);healthView?.setLayout('split');draw();if(isCi && workspace==='health')[...container.querySelectorAll('[data-health-run]')].find(button=>button.dataset.healthRun===healthOriginKey)?.focus({preventScroll:true});window.scrollTo({top:listScroll});if(isCi && workspace==='runs')[...container.querySelectorAll('[data-run]')].find(button=>button.dataset.run===lastRunId)?.focus({preventScroll:true});}
     if(button.hasAttribute('data-step')){pending.get('log')?.abort();pending.delete('log');step=button.dataset.step;log=null;logError='';draw();refreshDetail();}
-    if(button.hasAttribute('data-debug-send') && selected?.providerUrl && debugSessionId && !pending.has('debug')) {
-      const target={...selected},sessionId=debugSessionId;
-      if(!debugOperationId)debugOperationId=newOperationId();
-      const operationId=debugOperationId;debugMessage='Sending debugging context to Pi…';draw();
-      request('debug',signal=>client.debugCi(target.providerId,target.number,sessionId,operationId,{signal,providerUrl:target.providerUrl}),response=>{
+    if((button.hasAttribute('data-debug-send') || button.hasAttribute('data-debug-fix')) && selected?.providerUrl && debugSessionId && !pending.has('debug')) {
+      const fix=button.hasAttribute('data-debug-fix'),target={...selected},sessionId=debugSessionId;
+      if(fix){if(!fixOperationId)fixOperationId=newOperationId();}else if(!debugOperationId)debugOperationId=newOperationId();
+      const operationId=fix?fixOperationId:debugOperationId,noun=fix?'fix request':'debugging context';debugMessage=`Sending ${noun} to Pi…`;draw();
+      request('debug',signal=>client.debugCi(target.providerId,target.number,sessionId,operationId,{signal,providerUrl:target.providerUrl,...(fix?{mode:'fix'}:{})}),response=>{
         if(selected?.id!==target.id || debugSessionId!==sessionId)return;
-        debugMessage=response.status==='delivered'?'Debugging context delivered to the selected Pi agent.':response.status==='queued'?'Debugging context queued for delivery.':response.error || 'Pi did not receive the debugging context.';
+        debugMessage=response.status==='delivered'?`The ${noun} was delivered to the selected Pi agent.`:response.status==='queued'?`The ${noun} is queued for delivery.`:response.error || `Pi did not receive the ${noun}.`;
       },err=>{if(selected?.id===target.id && debugSessionId===sessionId)debugMessage=err.status===403?'Sending to Pi requires operator access.':'Delivery unconfirmed; retry checks the same operation.';});
     }
     if(button.dataset.ciAction && selected?.providerUrl && !pending.has('action')) {
@@ -419,10 +419,10 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
     const key=selected.id;debugMessage='Loading active Pi agents…';
     request('debug-sessions',signal=>client.listSessions(undefined,{signal}),response=>{
       if(selected?.id!==key)return;
-      debugSessions=activePiSessions(response.sessions);debugMessage='';
+      debugSessions=activePiSessions(response.sessions);debugMessage='';{const onBranch=selected?.branch?debugSessions.filter(x=>x.branch===selected.branch):[];if(!debugSessionId && onBranch.length===1){debugSessionId=onBranch[0].session_id;debugOperationId='';fixOperationId='';}}
     },()=>{if(selected?.id===key){debugSessions=[];debugMessage='Pi agents could not load. Reopen this run to retry.';}});
   },{capture:true,signal:listenerController.signal});
-  container.addEventListener('change',event=>{if(event.target.hasAttribute('data-ci-compare')){comparisonKey=event.target.value;draw();}if(event.target.hasAttribute('data-debug-session')){if(debugSessionId!==event.target.value){debugOperationId='';debugMessage='';}debugSessionId=event.target.value;draw();}},{signal:listenerController.signal});
+  container.addEventListener('change',event=>{if(event.target.hasAttribute('data-ci-compare')){comparisonKey=event.target.value;draw();}if(event.target.hasAttribute('data-debug-session')){if(debugSessionId!==event.target.value){debugOperationId='';fixOperationId='';debugMessage='';}debugSessionId=event.target.value;draw();}},{signal:listenerController.signal});
   container.querySelector('.ig-tabs:not(.ci-workspace-tabs)').addEventListener('keydown',event=>{
     if(!['ArrowLeft','ArrowRight','Home','End'].includes(event.key))return;
     const index=tabs.findIndex(([key])=>key===state.tab);

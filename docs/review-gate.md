@@ -37,6 +37,7 @@ sections:
             required_events: [pull_request]           # Woodpecker events that must all be green (default [pull_request])
             review_cap: 4                             # FAIL verdicts before escalation (default 4)
             ci_fix_cap: 3                             # red CI rounds before escalation (default 3)
+            main_pipeline: push                       # Woodpecker event of the full-suite run on the default branch (default: off, section 8)
         reviewer:                                     # optional; every key optional, integers >= 1
           lease_seconds: 900                          # how long a claimed job stays with one worker (default 900; 30..86400)
           max_diff_bytes: 400000                      # diff bytes sent to the reviewer (default 400000; 1000..5000000)
@@ -189,7 +190,7 @@ to 300 s. A recorded result or an idle claim resets the wait.
 Attempts are spent per claim, also when the cause is not the reviewer (GitHub
 unreachable, a worker killed mid-review). An outage longer than about
 `max_attempts x lease_seconds` (about 45 minutes with the defaults) therefore
-escalates every PR it touched, and an operator must `resume` them (section 8).
+escalates every PR it touched, and an operator must `resume` them (section 9).
 
 A model call has a total wall-clock deadline of `model.timeout_seconds`. A
 model endpoint that answers slowly, byte by byte, is abandoned at the deadline
@@ -200,6 +201,75 @@ A stopped worker abandons its job without posting. The job is offered again
 when its lease expires, but the abandoned claim has spent one of its
 `max_attempts`. Restarting workers mid-review again and again can therefore
 escalate a PR.
+
+### Reviewer pool
+
+`review-gate pool` runs several workers in one process and sizes them from the
+review queue, so a burst of PRs is reviewed in parallel and the extra workers
+go away afterwards. Each slot is a thread running the same worker loop under
+its own id, `<worker_id>-<n>`. The pool config is the worker config above plus
+a `pool` mapping; `worker_id` becomes the slot-id prefix.
+
+```yaml
+control_plane_url: https://cp.example.org
+api_key_file: /etc/herdr/reviewer.key
+worker_id: bender-review                       # slots: bender-review-1, bender-review-2, ...
+model:
+  base_url: https://llm.example.org
+  model: qwen3-review
+pool:
+  min_workers: 1                               # 0-64, default 1 (0: no slot while the queue is empty)
+  max_workers: 4                               # 1-64, default 4, at least min_workers
+  idle_seconds: 120                            # a slot idle this long may be retired (10-86400, default 120)
+  interval_seconds: 10                         # how often the queue is read (1-3600, default 10)
+```
+
+```
+herdr-eng review-gate pool --config /etc/herdr/review-pool.yaml   # loop until SIGINT/SIGTERM
+```
+
+**Scaling rule.** Every `interval_seconds` the pool reads
+`GET /api/v1/review-gate/queue` (the `reviewer` key may) and counts the queued
+jobs its model may claim: jobs whose author model differs from the pool's
+`model`, as for a single worker. Idle slots already claim queued jobs, so a
+non-empty count means every slot is busy or backing off. The pool then adds
+`min(count, max_workers - slots)` slots. With nothing eligible it retires one
+slot per evaluation, and only a slot idle longer than `idle_seconds`, down to
+`min_workers`. A slot is retired only between claim cycles, so scaling never
+abandons a claim. A slot in failure back-off counts as busy and can trigger a
+scale-up, bounded by `max_workers`.
+
+**One pool per host and model.** Pool size is per process: two pool processes
+with `max_workers: 4` can run eight workers. Give each process its own
+`worker_id` prefix. Pools are threads, not herdr sessions: a crash of the
+process drops all its slots, and their jobs are offered again when the leases
+expire.
+
+**Failures.** If the queue cannot be read (unreachable, an error status, a
+malformed or over-1-MiB body) the pool keeps its size and waits
+`interval_seconds`, doubling per consecutive failure up to 300 s. A 401/403
+from the queue or from any slot, or a key file that goes bad, stops the whole
+pool; the exit codes are those of `worker` (1 refused key, 2 config error) plus 3 for an unexpected internal error, which systemd
+restarts. With `min_workers: 0` a pool whose queue reads keep failing (an old control plane,
+a proxy error) has no slots and reviews nothing; it logs a warning per failed read, so watch
+for those. The pool never reads or logs key contents; log lines carry counts and class names.
+
+A systemd unit needs no `Environment=` lines:
+
+```ini
+[Unit]
+Description=herdr review gate reviewer pool
+After=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/herdr-eng review-gate pool --config /etc/herdr/review-pool.yaml
+Restart=on-failure
+RestartPreventExitStatus=1 2
+User=herdr-review
+
+[Install]
+WantedBy=multi-user.target
+```
 
 ### What gets reviewed
 
@@ -242,8 +312,12 @@ Read endpoints (any API key role):
 - `GET /api/v1/review-gate/queue`: queue depth, jobs and the last tick summary.
 - `GET /api/v1/review-gate/notices`: the newest 100 notifications, newest
   first, each with `key`, `sha`, `kind` (`changes_requested`, `ci_red`,
-  `escalated`), `channel` (`author`, `fixer`, `user`), `ok` and `at` (epoch
-  seconds). Details such as command output are never shown.
+  `escalated`, `main_red`), `channel` (`author`, `fixer`, `user`), `ok` and
+  `at` (epoch seconds). Details such as command output are never shown.
+- `GET /api/v1/review-gate/main`: `{"repos": [...]}`, one entry per repo with
+  main verification on: `repo`, `branch`, `head_sha`, `state` (`green`, `red`,
+  `pending`, `unknown`), `last_green_sha`, `failures`, `range_total`,
+  `culprits` (PR numbers). It reflects the latest tick only.
 
 **Escalation.** A PR escalates (the `reason` in `/prs`) when:
 
@@ -270,6 +344,32 @@ same head is then reviewed again. A non-escalated PR answers 409, an unknown PR
 404, and a failed durable write 503 (nothing changes). The status "cannot
 queue review; push a commit" means the current head cannot be queued again;
 push a new commit.
+
+### Dashboard
+
+The dashboard has a **Review gate** page (`#/review-gate`, after Reviews in the
+navigation). It reads `/api/v1/review-gate/prs`, `/queue`, `/notices` and
+`/main` every 5 seconds and shows:
+
+- an overview of PR counts per state and the time of the last gate tick;
+- main-branch status per repo: `state`, head and `last_green_sha` (first 12
+  characters), `failures` and the `culprits` PR numbers;
+- every gated PR with its state, review and CI-fix rounds, head SHA and
+  `reason`; select a row to see its `last_findings`;
+- the review queue (`depth`, claimed and queued jobs, the gate's `last_error`);
+- the newest notices with `channel` and whether delivery succeeded.
+
+Selecting an `escalated` PR shows a **Resume review** button. It asks for
+confirmation, then posts to the resume route above, so it needs an operator
+key. Without one the page shows "Only an operator key can resume a pull
+request" and nothing changes; other refusals (for example a 409 when the PR is
+no longer escalated) are shown as the server's message. After a successful
+resume the page refreshes at once.
+
+A "Showing data from <time>" warning on a panel means the latest read of that
+route failed; the panel keeps the last good data until a read succeeds again.
+"Could not load" means it has never succeeded. If any read answers 404 the gate
+is not enabled on this control plane: the page says so and stops polling.
 
 ## 7. Notifications
 
@@ -314,7 +414,79 @@ message. Within one generation each channel is still tried only once.
   that budget are deferred to later ticks, so a backlog drains at one command
   per `poll_seconds`.
 
-## 8. Known limits
+## 8. Main verification
+
+The full suite is an ordinary Woodpecker **push** pipeline in the repo. It never
+blocks a merge; the gate only watches it and, on a red run, tells the likely
+culprits. Turn it on per repo with `main_pipeline: push` (the Woodpecker event
+whose runs on the default branch count; leave it out for off).
+
+Example `.woodpecker/main.yaml` (the last step enforces the disabled-tests
+file):
+
+```yaml
+when:
+  event: push
+  branch: main
+steps:
+  - name: full-suite
+    image: <your ci image>
+    commands:
+      - pytest --junitxml=reports/junit.xml
+      - herdr-eng review-gate check-skips --junit reports --disabled .herdr/disabled-tests.yaml
+```
+
+**One run at a time.** Set this in Woodpecker (project setting: cancel previous
+pipelines on push, or one concurrent build); the gate does not enforce it. The
+gate judges the newest default-branch head only and ignores runs for older
+heads, so a merge that lands during a run is covered by the next run.
+
+**What the gate does.** Each tick it reads the default branch head and the
+Woodpecker runs for that head on that branch. Green: it records the head as the
+last green sha, once. Red: once per failing sha it sends one notice, then
+records the red durably. Pending, a stale CI snapshot and any GitHub failure
+record nothing and are never treated as green. There is no auto-revert and no
+gate status on main.
+
+**The notice** names the failing head, the last green sha, the CI failures
+(run number and state only, never CI log text), the culprit PR numbers and the
+commits since the last green run, oldest first, at most 50 listed with the true
+count stated. Culprit PRs come from `(#N)` at the end of a squash subject and
+`Merge pull request #N` in a merge subject. With no known green sha only the
+failing head is listed, and the notice says so. A range with no PR (direct
+pushes) says "no pull request identified". Commit subjects are untrusted: they
+are flattened to one line, bounded, redacted and marked untrusted. The pinned
+author of each culprit PR gets the message (a PR whose author was never pinned
+is skipped), and the user ALWAYS gets a `user` notice (`kind` `main_red`, key
+`<repo>#0`), after `notify_command` when one is configured. For main notices
+`{number}` is the newest culprit PR (0 when none) and `{branch}` the default
+branch. A later red head notifies again. The `notify_command` launch shares the
+one-launch-per-tick budget, so a deferred notice is retried on a later tick. `notify_command` is
+at-least-once: if the notice cannot be recorded after the command ran, the next
+tick runs it again. If the commit range cannot be read after 3 attempts, the
+notice names the head only and says so (no author messages). A rerun of an
+already-green commit is called out as such, and a cut-short range says the
+culprit list may be partial.
+
+**Disabled-tests file** (YAML in the repo, passed with `--disabled`):
+
+```yaml
+disabled:
+  - test: "tests.test_x.TestY::test_z"      # <classname>::<name> as in the junit XML
+    reason: "flaky on arm, tracked in #123"  # required, non-empty
+```
+
+`herdr-eng review-gate check-skips --junit PATH [--junit PATH ...] --disabled FILE`
+reads junit files (or directories of `*.xml`, non-recursive). A testcase with a
+`<skipped>` child (pytest xfail included) that is not listed fails the step
+(exit 1). A listed test that is not skipped is only reported on stderr. Exit 2
+means the check could not be made, which is never a pass: no testcases at all,
+a missing path, malformed XML, XML with a `<!DOCTYPE`/`<!ENTITY`, or a
+disabled-tests file that is missing, malformed, has a duplicate test or an
+entry without a reason. `disabled_tests_file` in the repo config is validated
+but not read by the gate; the pipeline passes the path itself.
+
+## 9. Known limits
 
 - **One gate per fleet.** Run the gate on one control-plane server only;
   nothing prevents two instances from fighting.
@@ -356,3 +528,9 @@ message. Within one generation each channel is still tried only once.
   (`pending`) instead of merging.
 - In-memory memos (posted statuses, merge back-off) reset on restart, so a
   restart re-posts each status once.
+- **Main verification limits.** Only the newest default-branch head is judged;
+  a red head is never re-notified, and a sha that was red and later reruns
+  green is recorded green. Culprits are the PRs named in commit subjects in the
+  range, not a bisect. The compare read returns at most 250 commits, and a
+  longer range says so. Status shown by `/main` is in memory (a restart shows
+  nothing until the next tick); last-green and the red markers are durable.

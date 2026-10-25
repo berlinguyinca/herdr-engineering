@@ -282,6 +282,13 @@ class InspectorStore:
         self.stats = {"accepted": 0, "duplicates": 0, "rejected": 0,
                       "evicted_events": 0, "evicted_sessions": 0}
 
+    def usage_events(self) -> list[tuple[str, str, dict]]:
+        """``(session_id, ts, data)`` for every usage event still in a session's ring. The
+        ring is bounded, so a long-running session may have older usage already evicted."""
+        with self._lock:
+            return [(sess.session_id, e["ts"], dict(e["data"]))
+                    for sess in self._sessions.values() for e in sess.events if e["kind"] == "usage"]
+
     @classmethod
     def from_config(cls, config=None, **kw) -> InspectorStore:
         """Operator configuration, the fleet file's ``control_plane.inspector_limits``

@@ -22,6 +22,20 @@ test('agent summary and rename requests preserve encoded identity and version', 
   assert.deepEqual(calls[3].body, { list: 'blockers', index: 1, text: 'CI is red' });
 });
 
+test('debugCi sends mode only for a fix request', async () => {
+  const bodies = [];
+  const client = new HerdrClient('', { fetchImpl: async (url, opts) => {
+    bodies.push(JSON.parse(opts.body));
+    return { ok: true, status: 200, text: async () => '{}' };
+  } });
+  await client.debugCi('17', 12, 's', 'op1');
+  await client.debugCi('17', 12, 's', 'op2', { mode: 'fix', providerUrl: 'https://ci.example' });
+  await client.debugCi('17', 12, 's', 'op3', { mode: 'other' });
+  assert.deepEqual(bodies[0], { repository: '17', number: 12, session_id: 's', operation_id: 'op1' });
+  assert.deepEqual(bodies[1], { repository: '17', number: 12, session_id: 's', operation_id: 'op2', provider_url: 'https://ci.example', mode: 'fix' });
+  assert.equal('mode' in bodies[2], false);
+});
+
 function fakeFetch(routes) {
   return async (url, opts) => {
     const hit = routes.find((r) => url.endsWith(r.path));

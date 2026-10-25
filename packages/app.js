@@ -16,6 +16,7 @@ import { mountMissionCatalog } from './mission-catalog-view.js';
 import { mountOverview } from './overview-view.js';
 import { mountIntegrations } from './integrations-view.js';
 import { mountGithub } from './github-view.js';
+import { mountReviewGate } from './review-gate-view.js';
 import { mountTopology } from './topology-view.js';
 import { mountSessionsView, sessionEntries } from './sessions-view.js';
 import { recordOutcome, statusOutcome } from './record-state.js';
@@ -29,6 +30,7 @@ import { flash, skeleton } from './motion.js';
 import { mountServices, mountServiceDetails } from './services-view.js';
 import { mountCollab, completeSignInIfRedirected } from './collab-view.js';
 import { freshnessSources } from './freshness.js';
+import { renderLlm, renderLlmSession, llmQuery, STEP_FOR, WINDOWS } from './llm-view.js';
 
 // Cache of { [mission_id]: title } so activity/session text can resolve
 // cryptic mission ids to their human names. Fetched lazily, best-effort.
@@ -64,9 +66,11 @@ const NAV = [
   { path: '/github', label: 'Projects' },
   { path: '/ci', label: 'CI' },
   { path: '/reviews', label: 'Reviews' },
+  { path: '/review-gate', label: 'Review gate' },
   { path: '/hosts', label: 'Hosts' },
   { path: '/activity', label: 'Activity' },
   { path: '/analytics', label: 'Analytics' },
+  { path: '/llm', label: 'LLM' },
   { path: '/collab', label: 'Collaboration' },
 ];
 
@@ -87,6 +91,7 @@ const ROUTES = {
   '/collab': viewCollab,
   '/ci': viewIntegrations,
   '/reviews': viewIntegrations,
+  '/review-gate': viewReviewGate,
   '/topology': viewTopology,
   '/missions': viewMissions,
   '/missions/:id': viewMission,
@@ -104,6 +109,8 @@ const ROUTES = {
   '/analytics/models': viewAnalytics,
   '/analytics/hosts': viewAnalytics,
   '/analytics/tokens': viewAnalytics,
+  '/llm': viewLlm,
+  '/llm/session/:id': viewLlmSession,
 };
 
 // Router rule: render() runs only on a route change (any hash change, query
@@ -249,6 +256,12 @@ async function viewCollab() {
 async function viewGithub() {
   // Keeps its own 5 s poll; live events refresh it too (requests in flight are not duplicated).
   return mountGithub(root, client);
+}
+
+async function viewReviewGate() {
+  // Keeps its own poll; live events do not refresh it.
+  const view = mountReviewGate(root, client);
+  return { refresh() {}, dispose() { view.dispose(); } };
 }
 
 async function viewIntegrations(parts) {
@@ -511,6 +524,65 @@ async function viewAnalytics(parts, revision) {
 }
 
 const NO_STREAM_EVENTS = '<herdr-empty message="No events for this entity yet"></herdr-empty>';
+
+// The LLM pages load once (a filter change navigates). Their chip records that load and turns
+// amber as it ages, which is the truth: the page does not refresh itself.
+function liveLlmHead() {
+  const h1 = root.querySelector('h1');
+  if (!h1) return;
+  h1.outerHTML = liveHead(h1.outerHTML);
+  root.querySelector('herdr-freshness')?.touch(true);
+}
+async function viewLlm(_parts, revision) {
+  const q = route().query;
+  const window_ = WINDOWS.includes(q.get('window')) ? q.get('window') : '24h';
+  const filters = { project: q.get('project') || '', model: q.get('model') || '' };
+  const f = { window: window_, ...filters };
+  const step = STEP_FOR[window_];
+  const series = (metric) => client.llm('timeseries', { ...f, step, metric });
+  const [total, models, agents, problems, projects, requests, errors, ttft, speed, sessions] = await Promise.all([
+    client.llm('stats', { ...f, group: 'all' }),
+    client.llm('stats', { window: window_, project: filters.project, group: 'model' }),
+    client.llm('stats', { ...f, group: 'session' }),
+    client.llm('errors', f),
+    client.llm('stats', { window: window_, group: 'project' }),
+    series('requests'), series('errors'), series('ttft_p95'), series('speed_p50'),
+    client.listSessions().catch(() => ({ sessions: [] })),
+  ]);
+  if (revision !== renderRevision) return NO_REFRESH;
+  const names = {};
+  for (const s of sessions.sessions || []) if (s.display_name) names[s.session_id] = s.display_name;
+  root.innerHTML = renderLlm({
+    window: window_, filters, names,
+    projects: projects.groups.map((g) => g.key),
+    modelNames: [...new Set(models.groups.map((g) => g.key))],
+  }, { total, models, agents, problems, series: { requests, errors, ttft, speed } });
+  liveLlmHead();
+  root.querySelectorAll('[data-llm-filter]').forEach((el) => el.addEventListener('change', () => {
+    window.location.hash = `#/llm?${llmQuery({ window: window_, ...filters, [el.dataset.llmFilter]: el.value })}`;
+  }));
+  // A static page, as before the router change: a filter change navigates; live events do not redraw it.
+  return NO_REFRESH;
+}
+async function viewLlmSession(parts, revision) {
+  const id = decodeURIComponent(parts[2]);
+  const q = route().query;
+  const window_ = WINDOWS.includes(q.get('window')) ? q.get('window') : '24h';
+  const f = { window: window_, session: id };
+  const step = STEP_FOR[window_];
+  const series = (metric) => client.llm('timeseries', { ...f, step, metric });
+  const [total, models, problems, requests, errors, ttft, speed, session] = await Promise.all([
+    client.llm('stats', { ...f, group: 'all' }), client.llm('stats', { ...f, group: 'model' }),
+    client.llm('errors', f), series('requests'), series('errors'), series('ttft_p95'), series('speed_p50'),
+    client.getSession(id).catch(() => null),
+  ]);
+  if (revision !== renderRevision) return NO_REFRESH;
+  root.innerHTML = renderLlmSession({
+    window: window_, sessionId: id, known: Boolean(session), name: session?.display_name || session?.agent_role || '',
+  }, { total, models, problems, series: { requests, errors, ttft, speed } });
+  liveLlmHead();
+  return NO_REFRESH;
+}
 
 // Recorded events for one entity as keyed cards ({key, html}); keyed by sequence so a refresh
 // keeps the cards already shown (morph pairs data-key, patchList appends only the new ones).
