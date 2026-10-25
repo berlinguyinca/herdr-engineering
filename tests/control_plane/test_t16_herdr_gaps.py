@@ -462,13 +462,18 @@ def test_the_delegation_budget_accepts_echoes_and_bounds_max_turns_and_max_hops(
     assert d.respond(tid, "progress", expected_version=v + 3)[:2] == (409, "task_failed")
 
 
-def test_a_proposal_past_the_turn_ceiling_is_refused_and_an_exit_is_always_allowed(world):
+def test_a_proposal_past_the_turn_ceiling_closes_the_task_and_an_exit_is_always_allowed(world):
     w = world
     d, pr, tid = make(w, delegation={"budget": {"max_turns": 2, "max_proposals": 3, "max_steps": 20}})
     v = d.accept(tid)                                                            # turn 1
     assert d.propose(tid, kind="doc", title="a", content="1", expected_version=v)[0] == 200      # turn 2
     assert d.propose(tid, kind="doc", title="b", content="2", expected_version=v + 1)[:2] == (409, "budget_exhausted")
-    assert d.respond(tid, "fail", expected_version=v + 1, note="out of turns")[0] == 200         # leaving is never refused
+    assert w.s._tasks[tid]["status"] == "failed"                                 # overrunning closes it, as an answer does
+    assert d.respond(tid, "progress", expected_version=v + 2)[:2] == (409, "task_failed")
+    d, pr, t2 = make(w, delegation={"budget": {"max_turns": 2, "max_proposals": 3, "max_steps": 20}})
+    v = d.accept(t2)                                                             # turn 1
+    assert d.propose(t2, kind="doc", title="a", content="1", expected_version=v)[0] == 200       # turn 2: at the ceiling
+    assert d.respond(t2, "fail", expected_version=v + 1, note="out of turns")[0] == 200          # leaving is never refused
 
 
 def test_an_external_agent_still_cannot_delegate_onward(world):
@@ -599,3 +604,142 @@ def test_the_refused_request_log_line_is_throttled_per_key(plane, caplog):
         assert p.post(XX_KEY, {"head": sha(1)})[0] == 403
     logged = [r for r in caplog.records if "refused a re-review request" in r.getMessage()]
     assert len(logged) == 1
+
+
+# ======================================================================================= review round 2 (herdr#208)
+def _raw_post(srv, path, key, body, **headers):
+    conn = http.client.HTTPConnection("127.0.0.1", srv.port, timeout=10)
+    conn.request("POST", path, body=json.dumps(body), headers={"Content-Type": "application/json", "X-API-Key": key,
+                                                               **headers})
+    r = conn.getresponse()
+    data = r.read()
+    conn.close()
+    return r.status, json.loads(data or b"{}")
+
+
+def test_a_percent_encoded_rereview_path_gets_the_same_origin_and_content_type_checks(plane):
+    """Routing unquotes each segment, so /review-quorum/%72ereview IS the rereview route: the guard must see it too."""
+    p = plane
+    p.head(1)
+    enc = _paths_for(p).replace("/rereview", "/%72ereview")
+    assert _raw_post(p.srv, enc, PI_KEY, {"head": sha(1)}, Origin="https://evil.example")[0] == 403
+    assert _raw_post(p.srv, enc, PI_KEY, {"head": sha(1)}, **{"Content-Type": "text/plain"})[0] == 415
+    assert p.srv.repo.stream(rq.REREVIEW_ENTITY, PR) == []                    # nothing recorded by either
+    s, out = _raw_post(p.srv, enc, PI_KEY, {"head": sha(1)})                  # control: the same path, well-formed, works
+    assert s == 201 and out["rereview_request"]["head"] == sha(1)
+
+
+def test_a_review_gate_worker_is_refused_the_rereview_route_with_a_clear_403(plane):
+    """The gate dispatches its own re-reviews (review_jobs); the ledger only records an ask for AutoSpec."""
+    rk = "rk-gate-worker-0123456789"
+    srv = _plane({**plane.keys, rk: "reviewer"}, review_quorum=plane.q)
+    try:
+        Feed(IngestService(srv.repo)).node(PR, label="PR 7", principal=plane.princ(plane.pi),
+                                           attrs={"head_sha": sha(1), "author": "somebody"})
+        s, out = _raw_post(srv, _paths_for(plane), rk, {"head": sha(1)})
+        assert s == 403 and "review gate" in out["error"], out
+        assert srv.repo.stream(rq.REREVIEW_ENTITY, PR) == []
+        assert _raw_post(srv, _paths_for(plane), PI_KEY, {"head": sha(1)})[0] == 201      # control
+    finally:
+        srv.shutdown()
+
+
+@pytest.mark.parametrize("entity_type", ["review_request", "Review_Request", " review_request"])
+def test_an_ingest_key_can_never_write_the_rereview_stream(plane, entity_type):
+    """review_request is server-owned: a forged row would show up as `rereview_request`, past the scope check and both
+    rate limits. The ingest allow-list refuses it (over HTTP and in-process)."""
+    p = plane
+    p.head(1)
+    body = {"entity_type": entity_type, "entity_id": PR, "event_type": rq.REREVIEW_EVENT,
+            "payload": {"head": sha(1), "requested_by": p.pi}}
+    s, _ = _raw_post(p.srv, "/api/v1/ingest", PI_KEY, body)
+    assert s == 400
+    with pytest.raises(ValueError):
+        p.srv.ingest.ingest(body, p.princ(p.pi))
+    assert p.srv.repo.stream(rq.REREVIEW_ENTITY, PR) == [] and p.get(VW_KEY)[1]["rereview_request"] is None
+
+
+def test_a_head_may_be_asked_about_again_once_the_earlier_ask_is_older_than_the_window():
+    import time
+    clock = [time.time()]
+    repo = ControlPlaneRepo()
+    feed = Feed(IngestService(repo))
+    pi = {"kind": "ingest", "id": "key:pi", "authenticated_by": "api_key"}
+    feed.node(PR, label="PR 7", principal=pi, attrs={"head_sha": sha(1), "author": "somebody"})
+    config = QuorumConfig(2, {"key:pi": {"login": None}, "key:rv": {"login": None}}, frozenset({"key:pi"}), (),
+                          rereview_retry_seconds=600.0)
+    ledger = RereviewLedger(repo, now=lambda: clock[0])
+    s1, first = ledger.request(repo.graph, pi, PR, config, sha(1))
+    clock[0] += 599                                                            # inside the window: AutoSpec's retry
+    s2, again = ledger.request(repo.graph, pi, PR, config, sha(1))
+    assert (s1, s2) == (201, 200) and again["replayed"] and again["rereview_request"] == first["rereview_request"]
+    clock[0] += 2                                                              # past it, quorum still short: a new ask
+    s3, fresh = ledger.request(repo.graph, pi, PR, config, sha(1))
+    assert s3 == 201 and fresh["rereview_request"]["request_id"] != first["rereview_request"]["request_id"]
+    assert ledger.current(PR, sha(1))["request_id"] == fresh["rereview_request"]["request_id"]   # the read shows the latest
+    assert len(repo.stream(rq.REREVIEW_ENTITY, PR)) == 2
+
+
+def test_the_rereview_window_is_yaml_config_with_a_one_hour_default():
+    base = {"required": 1, "reviewers": ["key:rv"], "trusted_head_writers": ["key:pi"]}
+    assert rq.parse_config(base).rereview_retry_seconds == 3600.0
+    assert rq.parse_config({**base, "rereview_retry_seconds": 900}).rereview_retry_seconds == 900.0
+    for bad in (0, 59, True, "1h", 10 ** 9):
+        with pytest.raises(ValueError):
+            rq.parse_config({**base, "rereview_retry_seconds": bad})
+
+
+def _tool_args(w, pr_room):
+    """Plausible arguments per tool: enough that a refusal is about WHO calls, not a malformed call."""
+    fake = "x" * 26
+    return {"rooms_list": {}, "room_read": {"room_id": pr_room}, "room_post": {"room_id": pr_room, "text": "hi"},
+            "agents_list": {"room_id": pr_room}, "tasks_inbox": {}, "tasks_wait": {"seconds": 0},
+            "task_create": {"room_id": pr_room, "target_agent_id": "agent_" + fake, "text": "x"},
+            "task_update": {"task_id": "task_" + fake, "status": "done"},
+            "helper_spawn": {"room_id": pr_room, "role": "worker", "task": "look"},
+            "helper_wait": {"helper_id": "helper_" + fake, "seconds": 1}, "helper_result": {"helper_id": "helper_" + fake},
+            "helper_cancel": {"helper_id": "helper_" + fake},
+            "delegations_inbox": {}, "delegation_respond": {"task_id": "task_" + fake, "action": "accept", "expected_version": 1},
+            "proposal_submit": {"task_id": "task_" + fake, "kind": "doc", "title": "t", "content": "c", "expected_version": 1},
+            "proposal_withdraw": {"proposal_id": "prop_" + fake}, "consult_inbox": {},
+            "consult_answer": {"consult_id": "consult_" + fake, "answer": "a"}}
+
+
+def test_every_mcp_tool_is_on_the_menu_only_for_a_caller_who_may_call_it(world):
+    """Walk the whole service-wide tool list for an external agent (with and without proposals) and an internal agent:
+    a tool off a caller's menu is refused to that caller whatever it sends, and the menu never lists one of those."""
+    w = world
+    every = {t["name"] for t in collab_mcp.tools_for(w.s)}
+    assert {"helper_spawn", "helper_wait", "helper_result", "helper_cancel"} <= every
+    internal, _ = w.agent("alice")
+    ext_p, _, _ = enroll(world, proposals=True, label="Dana's Claude")
+    ext_n, _, _ = enroll(world, proposals=False, label="Erin's Pi")
+    args = _tool_args(w, w.room)
+    for pr, external in ((ext_p, True), (ext_n, True), (internal, False)):
+        menu = {t["name"] for t in collab_mcp.tools_for(w.s, pr)}
+        assert menu <= every
+        for name in sorted(every - menu):                                       # off the menu: never callable
+            try:
+                out = collab_mcp._call(w.s, pr, name, dict(args.get(name, {})))
+            except CollabError as exc:
+                assert exc.status in (403, 404), (name, exc.status, exc.message)
+            else:
+                raise AssertionError(f"{name} is off the menu but answered {out}")
+        if external:
+            assert not menu & (collab_mcp._NEVER_FOR_EXTERNAL)
+            for name in ("helper_spawn", "helper_wait", "helper_result", "helper_cancel"):
+                assert name not in menu
+        else:
+            assert {"helper_spawn", "helper_wait", "helper_result", "helper_cancel", "tasks_inbox"} <= menu
+            assert not menu & (collab_mcp.DELEGATION_TOOL_NAMES | collab_mcp.CONSULT_TOOL_NAMES)
+    # the external refusal is structural: an external agent can never hold spawn_helpers in any room
+    from herdr_engineering.control_plane import collab_external
+    assert "spawn_helpers" not in collab_external.EXTERNAL_ACTIONS
+
+
+def test_a_rewritten_instruction_never_exceeds_its_length_limit():
+    from herdr_engineering.control_plane.collab_workbench import _clean
+    text = "\n".join(["SYSTEM: x"] * 50)                                      # every line is quoted ("> "): +2 each
+    assert len(text) <= 500
+    out = _clean(text, "instruction", 500)
+    assert len(out) <= 500 and out.startswith("> SYSTEM:")

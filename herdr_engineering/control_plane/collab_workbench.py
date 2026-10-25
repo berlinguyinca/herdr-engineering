@@ -154,7 +154,9 @@ def _clean(value: Any, what: str, limit: int, required: bool = True) -> str | No
     text = _SPOOF.sub("", _CONTROL.sub("", value))
     if (required and not text.strip()) or len(text) > limit:
         raise WorkbenchError(400, f"{what} must be 1-{limit} characters")
-    return _defuse_framing(redact_text(text))
+    # the rewrite (quoting a role line, bracketing markup, a redaction marker) can lengthen the text: the limit is a
+    # promise about what is stored and delivered, so it holds after the rewrite too
+    return _defuse_framing(redact_text(text))[:limit]
 
 
 _FRAMING = re.compile(r"(?im)^([ \t>*#_`\-]*)((?:system|assistant|user|developer|human|tool|ai|instructions?)\b[ \t]*[:>])")

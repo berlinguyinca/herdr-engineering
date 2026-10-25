@@ -135,7 +135,9 @@ TOOLS = [
 
 
 # T16 gap D: tools an external agent is ALWAYS refused (the service answers 403 whatever it sends)
-_NEVER_FOR_EXTERNAL = frozenset({"tasks_inbox", "tasks_wait", "task_update", "task_create", "agents_list"})
+# helper_*: an external agent never holds spawn_helpers (EXTERNAL_ACTIONS is read/post), so it never owns a helper either.
+_NEVER_FOR_EXTERNAL = frozenset({"tasks_inbox", "tasks_wait", "task_update", "task_create", "agents_list",
+                                 "helper_spawn", "helper_wait", "helper_result", "helper_cancel"})
 
 
 def tools_for(service: CollabService, pr=None) -> list[dict]:

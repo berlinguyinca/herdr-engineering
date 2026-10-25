@@ -687,11 +687,9 @@ def test_mcp_and_a2a_reach_only_room_chat_and_the_task_tools_and_a_stream_ends_w
     listed = {t["name"] for t in p.rpc("/mcp", "tools/list", {}, dana.agent).body["result"]["tools"]}
     assert listed >= {"room_post", "room_read", "rooms_list", "delegations_inbox", "delegation_respond", "proposal_submit",
                       "consult_inbox", "consult_answer"}
-    # (the helper_* tools ARE on the menu, as of main's helper agents: they are advertised but refused for an external agent,
-    # asserted right below, and listed in the menu-gap xfail)
-    assert not any(re.search(r"shell|terminal|exec|run|spawn|pane|session|workspace|steer", n) for n in listed if not n.startswith("helper_")), listed
-    assert {n for n in listed if n.startswith("helper_")} == {"helper_spawn", "helper_wait", "helper_result", "helper_cancel"}
-    # the privileged ones on that menu are refused for it, and refusals about other rooms look like missing rooms
+    # (the helper_* tools are not on an external agent's menu: it can never hold spawn_helpers; they are refused below)
+    assert not any(re.search(r"shell|terminal|exec|run|spawn|pane|session|workspace|steer|helper", n) for n in listed), listed
+    # the privileged tools (off its menu) are refused for it, and refusals about other rooms look like missing rooms
     for name, args in (("agents_list", {"room_id": w.room}), ("task_create", {"room_id": w.room, "target_agent_id": dana.id, "text": "x"}),
                        ("tasks_inbox", {}), ("task_update", {"task_id": "t", "status": "done"}),
                        ("helper_spawn", {"room_id": w.room, "role": "x", "task": "y"}),

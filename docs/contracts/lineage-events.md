@@ -162,13 +162,23 @@ are the re-review need: whoever owns review dispatch (Pi on `github.evidence_sta
 
 `POST /api/v1/graph/nodes/{pr_id}/review-quorum/rereview` `{head?: <full sha>}` (T16 gap C) RECORDS the ask for the PR's CURRENT head
 (ingest-role key; still dispatches nothing). Scope: the PR must be visible to the caller (hidden == absent == 404), and the caller must be a
-configured `trusted_head_writers` or `reviewers` principal or an authenticated operator (otherwise 403 `not_permitted`). 201 new, 200 replay
-(one request per PR head; the same record is returned), 409 `not_required` (status other than `insufficient`), `stale_head` (the supplied
-`head` is not the current one), `head_unknown`; 429 `rate_limited` (60 per principal per hour) or `pr_limit` (64 heads per PR). The record is a
+configured `trusted_head_writers` or `reviewers` principal or an authenticated operator (otherwise 403 `not_permitted`; a review-gate
+worker key, role `reviewer`, is refused with 403 before that). 201 new, 200 replay (one request per PR head per
+`review_quorum.rereview_retry_seconds`, default 3600: inside that window the same record is returned and AutoSpec owns retrying its own
+dispatch; once the latest ask for the head is older and the quorum is still short at that head, e.g. the dispatched review failed, a new
+ask is recorded and the quorum read shows the newest), 409 `not_required` (status other than `insufficient`), `stale_head` (the supplied
+`head` is not the current one), `head_unknown`; 429 `rate_limited` (60 per principal per hour) or `pr_limit` (64 asks per PR per 24 h). The record is a
 server-owned stream (`review_request`, never accepted by ingest, 404 on `/api/v1/events`) written durably before the 201, and carries the
 requesting principal and time. The quorum read then shows `rereview_request: {request_id, head, requested_at, needed}` while the PR is at
 that head and `null` for any other. AutoSpec's `review-quorum request` should dispatch when `rereview_required` OR `rereview_request` is
 set, once per (PR, head).
+
+Two independent re-review mechanisms. This ledger only RECORDS an ask that AutoSpec dispatches. The review gate
+(`docs/review-gate.md`, `herdr_engineering/review_gate/service.py`) re-reviews on its own: it queues its own `review_jobs` for a new head
+or a base change and never reads or writes `review_request`; its worker keys (role `reviewer`) are refused on this route. Neither knows
+about the other, so one PR covered by both (a gate-watched repository that also has a `review_quorum` policy) can be re-reviewed twice
+for the same head: once by a gate job, once by AutoSpec's dispatch. That is by design for now; configure one or the other per repository
+to avoid paying twice.
 
 Producer contract. Each independent reviewer publishes with its OWN ingest key (reviewer identity is server-authenticated;
 a shared emitter key is one identity): `node.upsert review:<id>` then `edge.add reviewed review:<id> -> pr:<id>` with
@@ -187,6 +197,7 @@ review_quorum:
     key:<author-human>: {login: some-login}
   reviewer_groups:                 # optional: ids of ONE person/organisation count once
     - [key:<alice-laptop>, key:<alice-ci>]
+  rereview_retry_seconds: 3600     # optional, 60..604800: a head may be asked about again once its latest ask is this old
 ```
 ONE policy, two implementations: this route (workbench) and `autospec review-quorum` (merge gating) are pinned by the shared
 vector file `tests/control_plane/fixtures/review-quorum-vectors.json` (byte-identical to autospec's

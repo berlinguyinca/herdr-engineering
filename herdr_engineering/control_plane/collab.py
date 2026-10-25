@@ -4645,7 +4645,13 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin):
             self._audit_denied(pr, "delegation.proposal", "task_" + status, **audit)
             raise CollabError(409, f"the task is {status}: accept it first, and only while it is open", code="task_" + status)
         b = t["bounds"]["budget"]
-        if t["proposals"] >= b["max_proposals"] or t["steps"] + 1 > b["max_steps"] or not self._turns_left(t):
+        if not self._turns_left(t):
+            # past the turn ceiling: the task is closed, exactly as an overrunning answer closes it (delegation_respond)
+            return self._exhaust(pr, t, task_id, dict(
+                project_id=x["project_id"], room_id=room_id, task_id=task_id, target_agent_id=pr.id,
+                idempotency_key=None, fingerprint=None, visibility_scope="room", outcome="allowed",
+                project_ids=[x["project_id"]], resource_id=task_id))
+        if t["proposals"] >= b["max_proposals"] or t["steps"] + 1 > b["max_steps"]:
             self._audit_denied(pr, "delegation.proposal", "budget_exhausted", **audit)
             raise CollabError(409, "the task's proposal or step budget is used up", code="budget_exhausted")
         mine = self._proposals_by_agent.get(pr.id, ())

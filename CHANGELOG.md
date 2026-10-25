@@ -5,14 +5,16 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
-### T16 Herdr-side gaps from the Pi and AutoSpec wiring (stacked on #179)
+### T16 Herdr-side gaps from the Pi and AutoSpec wiring
 - Steering: an ingest key can read the CURRENT fence and gate digest at apply time: `GET /api/v1/steering/targets/{node_id}` (owner of the node, live
   request, room-scoped nodes included) and `fence`/`digest`/`digests` on `GET /api/v1/graph/nodes/{id}` for nodes the key may read. A `fork` may carry
   a bounded, redacted `instruction` (the changed requirement), delivered in the pending item like a redirect's.
 - Review quorum: `POST /api/v1/graph/nodes/{pr}/review-quorum/rereview` records a durable, idempotent-per-head, scoped (trusted head writer, reviewer or
   operator), rate-limited, audited re-review request; the quorum read shows it as `rereview_request` for that head.
-- External agents: workspace-link authorize no longer tells a non-owner whether a link id exists; MCP `tools/list` is per agent; delegation budgets accept
-  and enforce `max_turns` (a `complete` answer is always accepted, and a task stored without `max_turns` has no ceiling; and echo `max_hops`, the chain-depth ceiling); a consultation also records `asker -> target` as a graph edge (reference nodes).
+  A head may be asked about again once its latest ask is older than `review_quorum.rereview_retry_seconds` (YAML, default 3600); inside that window
+  AutoSpec owns retries. Review-gate worker keys are refused on the route (403); the gate's own re-reviews are a separate, independent mechanism.
+- External agents: workspace-link authorize no longer tells a non-owner whether a link id exists; MCP `tools/list` is per agent (an external agent is never offered the task or helper tools); delegation budgets accept
+  and enforce `max_turns` (an answer or proposal past it closes the task; a `complete` answer is always accepted, and a task stored without `max_turns` has no ceiling; and echo `max_hops`, the chain-depth ceiling); a consultation also records `asker -> target` as a graph edge (reference nodes).
 - Acceptance: four Herdr strict xfails became real tests; the manifest minimums rise (s2 20, s5 15); no minimum is lowered.
 - No migration, no environment variable. Rollback: revert the PR. Checked by loading rows of this stream into the previous build: it starts and serves normally and the rows do no harm, but it does NOT keep them out of its event feed (it lists them as ordinary events, each carrying only the head and request id); the stored rows stay in the log and are ignored again once this code is back.
 

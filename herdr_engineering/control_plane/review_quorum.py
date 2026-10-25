@@ -38,6 +38,9 @@ class QuorumConfig:
     reviewers: dict           # principal id -> {"login": str | None}
     trusted_head_writers: frozenset
     reviewer_groups: tuple = ()   # tuple of tuples of principal ids
+    # T16 gap C: an ask recorded for a head may be made again once it is this old (the dispatched review may have
+    # failed and the quorum may still be short at the same head). Inside the window AutoSpec owns the retries.
+    rereview_retry_seconds: float = 3600.0
 
 
 # ASCII-only normalisation, identical to autospec's: whitespace is the six ASCII blanks and
@@ -85,7 +88,7 @@ def parse_config(raw) -> QuorumConfig | None:
         return None
     if not isinstance(raw, dict):
         raise ValueError("review_quorum must be a mapping")
-    unknown = set(raw) - {"required", "reviewers", "trusted_head_writers", "reviewer_groups"}
+    unknown = set(raw) - {"required", "reviewers", "trusted_head_writers", "reviewer_groups", "rereview_retry_seconds"}
     if unknown:
         raise ValueError(f"review_quorum: unknown key {sorted(unknown)[0]!r}")
     required = raw.get("required")
@@ -118,7 +121,10 @@ def parse_config(raw) -> QuorumConfig | None:
             raise ValueError("review_quorum.reviewer_groups must not overlap")
         seen |= set(grp)
         groups.append(tuple(grp))
-    return QuorumConfig(required, out, frozenset(w.strip() for w in writers), tuple(groups))
+    retry = raw.get("rereview_retry_seconds", 3600)
+    if isinstance(retry, bool) or not isinstance(retry, (int, float)) or not 60 <= retry <= 7 * 24 * 3600:
+        raise ValueError("review_quorum.rereview_retry_seconds must be a number of seconds between 60 and 604800")
+    return QuorumConfig(required, out, frozenset(w.strip() for w in writers), tuple(groups), float(retry))
 
 
 def _sha(value):
@@ -303,8 +309,17 @@ def pr_review_quorum(graph, principal, pr_id: str, config: QuorumConfig) -> dict
 REREVIEW_ENTITY = "review_request"      # server-owned stream (never in INGEST_ENTITY_TYPES, hidden from /events)
 REREVIEW_EVENT = "ReviewRereviewRequested"
 REREVIEW_PER_HOUR = 60                  # per requesting principal
-REREVIEW_MAX_PER_PR = 64                # distinct heads asked for per PR within REREVIEW_WINDOW (each head is one request at most)
+REREVIEW_MAX_PER_PR = 64                # asks per PR within REREVIEW_WINDOW (one per head per config.rereview_retry_seconds)
 REREVIEW_WINDOW = 24 * 3600.0           # a sliding window: the cap never locks a PR out for good
+
+
+def _epoch(stamp, default: float) -> float:
+    """An ingest timestamp as epoch seconds; ``default`` (i.e. "now": recent, fail closed) when unreadable."""
+    from datetime import datetime
+    try:
+        return datetime.fromisoformat(str(stamp)).timestamp()
+    except ValueError:
+        return default
 
 
 class RereviewError(Exception):
@@ -329,7 +344,7 @@ class RereviewLedger:
         self._times: dict[str, list] = {}
 
     def current(self, pr_id: str, head: str | None) -> dict | None:
-        """The request recorded for exactly this head of this PR (None for any other head)."""
+        """The LATEST request recorded for exactly this head of this PR (None for any other head)."""
         if not head:
             return None
         from .repo import _payload              # a payload hydrated from Postgres arrives as JSON text
@@ -342,16 +357,8 @@ class RereviewLedger:
 
     def _recent(self, pr_id: str, now: float) -> int:
         """Requests for this PR inside the sliding window (an unreadable timestamp counts as recent: fail closed)."""
-        from datetime import datetime
-        n = 0
-        for ev in self.repo.stream(REREVIEW_ENTITY, pr_id):
-            try:
-                at = datetime.fromisoformat(str(ev.get("ingest_timestamp"))).timestamp()
-            except ValueError:
-                at = now
-            if now - at < REREVIEW_WINDOW:
-                n += 1
-        return n
+        return sum(1 for ev in self.repo.stream(REREVIEW_ENTITY, pr_id)
+                   if now - _epoch(ev.get("ingest_timestamp"), now) < REREVIEW_WINDOW)
 
     def request(self, graph, principal: dict, pr_id: str, config: QuorumConfig, head: str | None) -> tuple[int, dict]:
         """201 new, 200 replay. KeyError when the PR is absent/hidden (the caller answers 404, same as the quorum read).
@@ -374,9 +381,11 @@ class RereviewLedger:
                                 head=q["head"])
         with self._lock:
             prior = self.current(real, q["head"])
-            if prior is not None:
-                return 200, {"rereview_request": prior, "replayed": True}
             now = self._now()
+            if prior is not None and now - _epoch(prior.get("requested_at"), now) < config.rereview_retry_seconds:
+                # one ask per head per window: inside it AutoSpec owns retrying its own dispatch; after it the quorum
+                # is still short at the same head (the review failed or never ran), so a new ask is recorded
+                return 200, {"rereview_request": prior, "replayed": True}
             window = [t for t in self._times.get(who or "", ()) if now - t < 3600.0]
             if len(window) >= REREVIEW_PER_HOUR:
                 raise RereviewError(429, "too many re-review requests", "rate_limited")

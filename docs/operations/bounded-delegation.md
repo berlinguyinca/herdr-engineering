@@ -87,7 +87,7 @@ delegate, via `supersedes`) | `expired` (undecided after 3 days). Every decision
 ## Rate limits and quotas
 Delegate: 6 proposals per 10 minutes, 60 answers per minute, 120 inbox polls per minute, 30 proposals lifetime per credential. Sponsor:
 150 proposals lifetime across its delegates. Room: 40 proposals in quarantine at once. Owner: 60 decisions per minute. Task: `max_proposals`,
-`max_steps`, `max_turns`. Overrunning `max_steps`, `max_turns` or the reported-token budget closes the task (`failed`, 409 `budget_exhausted`, audited).
+`max_steps`, `max_turns`. Overrunning `max_steps`, `max_turns` or the reported-token budget closes the task (`failed`, 409 `budget_exhausted`, audited); a proposal submitted past `max_turns` closes it the same way).
 
 ## Audit
 Every create, answer, proposal, withdrawal, decision and promotion is an HCN log event with `actor_kind`, visible in the project audit

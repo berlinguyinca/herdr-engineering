@@ -1018,6 +1018,10 @@ def _make_handler(server, public=False, operator=False):
                     return self._deny(415, "integration mutations require application/json")
             min_role = ("ingest" if path == "/api/v1/ingest" or _STEER_ACK.match(path) or _is_rereview(path)
                        else "operator")
+            if _is_rereview(path) and self._role() == "reviewer":
+                # _require would refuse it too ("read-only"); say why. The review gate dispatches its own re-reviews
+                # (review_jobs); this route only records an ask for AutoSpec, and a gate worker never makes one.
+                return self._deny(403, "a review gate worker may not request a re-review: the gate re-reviews on its own")
             err = self._require(min_role)
             if err:
                 return err
