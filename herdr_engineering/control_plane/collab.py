@@ -4687,10 +4687,8 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin):
         room = self._rooms[room_id]
         people = [u for u in room["members"] if self._member(room, u)]
         agents = self._room_agents_live(room)
-        everyone = [{"kind": "person", "id": u} for u in people] + [{"kind": "agent", "id": a} for a in agents]
-        groups = {"all": everyone, "agents": [t for t in everyone if t["kind"] == "agent"],
-                  "here": [t for t in everyone if self._online(room_id, t["kind"], t["id"])]}
-        book: dict[str, dict] = {g: {"kind": "group", "id": g, "name": g, "targets": groups[g]} for g in mentions.GROUPS}
+        # a group is stored by name only: who it reaches is worked out when a message is read, for that reader
+        book: dict[str, dict] = {g: {"kind": "group", "id": g, "name": g} for g in mentions.GROUPS}
         levels: list[dict[str, list[dict]]] = [defaultdict(list) for _ in range(4)]
         for aid in agents:
             m = {"kind": "agent", "id": aid, "name": self._address(aid) or self._agents[aid]["name"]}
@@ -4710,6 +4708,33 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin):
                     book[name] = None                      # ambiguous: blocks lower levels too
         return {k: v for k, v in book.items() if v is not None}
 
+    def _group_members(self, room_id: str, group: str) -> list[dict]:
+        """Who a group reaches in this room now (internal: never part of a stored or returned message)."""
+        room = self._rooms[room_id]
+        everyone = ([{"kind": "person", "id": u} for u in room["members"] if self._member(room, u)]
+                    + [{"kind": "agent", "id": a} for a in self._room_agents_live(room)])
+        if group == "agents":
+            return [t for t in everyone if t["kind"] == "agent"]
+        if group == "here":
+            return [t for t in everyone if self._online(room_id, t["kind"], t["id"])]
+        return everyone
+
+    def _mentions_for(self, p: dict, viewer) -> tuple[list[dict], bool | None]:
+        """A message's mentions as `viewer` may see them, and whether they address the viewer. A guest or an
+        external agent gets the typed names only (no ids: no roster); a group never lists its members."""
+        stored = p.get("mentions") or []
+        if viewer is None:
+            return [dict(m) for m in stored], None
+        me = ("agent" if viewer.is_agent else "person", viewer.id)
+        # the reader is in the room (it was authorized), so @all and @here include it; @agents only an agent
+        mine = any((m["kind"] == "group" and (m["id"] != "agents" or me[0] == "agent"))
+                   or (m["kind"], m.get("id")) == me for m in stored)
+        room = self._rooms.get(p.get("room_id"))
+        guest = not viewer.is_agent and room is not None and (self._member(room, viewer.id) or {}).get("role") == "guest"
+        if viewer.external or guest:
+            return [{"kind": m["kind"], "name": m["name"]} for m in stored], mine
+        return [{"kind": m["kind"], "id": m["id"], "name": m["name"]} for m in stored], mine
+
     def _resolve_mentions(self, room_id: str, text: str) -> list[dict]:
         book, out, seen = self._address_book(room_id), [], set()
         for token in mentions.tokens(text):
@@ -4724,7 +4749,7 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin):
 
     def resolve_mentions(self, room_id: str, text: str) -> list[dict]:
         """`[{kind: person|agent|group, id, name}]` for the names in `text` that address someone in this
-        room (groups also carry their `targets`). Unknown names are not mentions; the text is unchanged."""
+        room. Unknown or ambiguous names are not mentions; the text is unchanged."""
         with self._lock:
             if room_id not in self._rooms:
                 raise CollabError(404, "not found")
@@ -4830,12 +4855,10 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin):
         if t == "message":
             out.update(sender={"type": "external" if p.get("sender_external") else p["sender_kind"],
                                "id": p["sender_id"], "owner_user_id": p["actor_user_id"]},
-                       text=p["text"], trust="untrusted", in_reply_to=p.get("in_reply_to"),
-                       mentions=copy.deepcopy(p.get("mentions") or []))
-            if viewer is not None and getattr(viewer, "is_agent", False):     # wake on the long-poll, act if addressed
-                me = ("agent", viewer.id)
-                out["mentions_me"] = any((m["kind"], m["id"]) == me or any(
-                    (t["kind"], t["id"]) == me for t in m.get("targets", ())) for m in out["mentions"])
+                       text=p["text"], trust="untrusted", in_reply_to=p.get("in_reply_to"))
+            out["mentions"], mine = self._mentions_for(p, viewer)
+            if mine is not None:                   # wake on the long-poll, act if addressed
+                out["mentions_me"] = mine
             if p.get("context"):
                 out["context"] = self._message_context(p, viewer, {} if _ctx_cache is None else _ctx_cache)
         elif t in ("task_created", "task_updated"):

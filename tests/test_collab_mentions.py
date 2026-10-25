@@ -107,14 +107,30 @@ def test_groups_expand_to_this_rooms_people_and_agents_only(w):
     _, bobs = agent(w, "bob", "codex")
     _, elsewhere = agent(w, "alice", "codex", room=w.room2)
     people = {("person", u) for u in ("alice", "bob", "carol", "dave")}
-    by_id = {m["id"]: m for m in w.s.resolve_mentions(w.room, "@all @agents @here")}
-    targets = lambda g: {(t["kind"], t["id"]) for t in by_id[g]["targets"]}   # noqa: E731
+    targets = lambda g: {(t["kind"], t["id"]) for t in w.s._group_members(w.room, g)}   # noqa: E731
     assert targets("agents") == {("agent", mine), ("agent", bobs)}
     assert targets("all") == people | {("agent", mine), ("agent", bobs)}
     assert ("person", "mallory") not in targets("all") and ("agent", elsewhere) not in targets("all")
     assert targets("here") == set()                                       # nobody has the room open yet
     w.s.room_state(w.bob, w.room, -1, 0, 0)                               # bob opens the room
-    assert {(t["kind"], t["id"]) for t in w.s.resolve_mentions(w.room, "@here")[0]["targets"]} == {("person", "bob")}
+    assert targets("here") == {("person", "bob")}
+    assert w.s.resolve_mentions(w.room, "@all") == [{"kind": "group", "id": "all", "name": "all"}]
+
+
+def test_a_group_mention_never_carries_the_roster_and_storage_stays_bounded(w):
+    from tests.control_plane.test_collab_external import enroll
+    ids = [agent(w, "alice", "pi")[1] for _ in range(5)]
+    ext_pr, _, _ = enroll(w)
+    ev = say(w, w.bob, "@all @agents @here " + " ".join(f"@alice.pi-{n}" for n in range(2, 40)))
+    stored = w.s._log[ev["sequence"] - 1]["payload"]["mentions"]
+    assert len(stored) <= 32 and all(set(m) == {"kind", "id", "name"} for m in stored)
+    assert len(repr(stored)) < 4000
+    for viewer in (w.dave, ext_pr):                                       # a guest and an external agent
+        msgs = [e for e in w.s.read_events(viewer, w.room, 0, 200)["events"] if e["event_type"] == "message"]
+        seen = repr(msgs[-1])
+        assert "targets" not in seen and "carol" not in seen and not any(i in seen for i in ids)
+        assert all(set(m) == {"kind", "name"} for m in msgs[-1]["mentions"])   # names only: they were typed
+    assert [e for e in w.s.read_events(ext_pr, w.room, 0, 200)["events"] if e["event_type"] == "message"][-1]["mentions_me"] is True
 
 
 def test_a_mentioned_agent_sees_that_it_was_addressed(w):
