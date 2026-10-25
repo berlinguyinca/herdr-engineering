@@ -84,7 +84,7 @@ export function mountGithubProjects(container,client,{project='',layout='board'}
  const chipEl=()=>container.querySelector('herdr-freshness'),chip=freshnessSources(chipEl);
  container.innerHTML=`${styles}<div class="hd-live-head"><h1>Project boards</h1><herdr-freshness interval="${POLL_MS}"></herdr-freshness></div><p class="ghp-intro">GitHub Projects of the owners in scope, read-only. Cards follow the project's Status field; open an item on GitHub to change it.</p><p class="ghp-warning" data-ghp-sync role="status"></p><p class="ghp-warning" data-ghp-error role="status"></p>
   <div class="ghp-controls"><label>Project<select data-ghp-project aria-label="Project"></select></label><button type="button" class="hd-btn" data-ghp-layout aria-pressed="${flat}">Flat list</button></div><p class="ghp-note" data-ghp-summary role="status"></p>
-  <div class="ghp-board" data-ghp-board aria-label="Project board"></div><div class="ghp-list" data-ghp-list aria-label="Project items" hidden></div>`;
+  <div class="ghp-board" data-ghp-board role="region" aria-label="Project board"></div><div class="ghp-list" data-ghp-list role="region" aria-label="Project items" hidden></div>`;
  const el=selector=>container.querySelector(selector);
  const current=()=>records(projects?.projects).find(p=>p.project_id===selected)||null;
  function placeholder(target,html){
@@ -114,8 +114,23 @@ export function mountGithubProjects(container,client,{project='',layout='board'}
    if(!patchCards(cards,column.items,renderProjectCard))placeholder(cards,'<p class="ghp-empty">No items</p>');
   }
  }
+ // A focused card that moves column leaves its old node (patchList); focus follows the item to
+ // its new card instead of dropping to the document.
+ function followFocus(id){
+  if(!id)return;
+  const active=document.activeElement,old=active?.closest?.('[data-ghp-item]');
+  if(old&&old.isConnected&&!old.hasAttribute('data-leaving'))return;
+  const card=[...container.querySelectorAll('[data-ghp-item]:not([data-leaving])')].find(n=>n.dataset.ghpItem===id&&n.offsetParent!==null);
+  const target=card?.querySelector('a')||null;
+  if(target){target.focus({preventScroll:true});if(old&&old.hasAttribute('data-leaving'))old.remove();}
+ }
  function draw(){
   if(disposed)return;
+  const focusedItem=document.activeElement?.closest?.('[data-ghp-item]')?.dataset.ghpItem||'';
+  render();
+  followFocus(focusedItem);
+ }
+ function render(){
   const note=projectsSyncNote(projects);
   patchText(el('[data-ghp-sync]'),note.text);
   patchText(el('[data-ghp-error]'),[projectsError,itemsError].filter(Boolean).join(' '));

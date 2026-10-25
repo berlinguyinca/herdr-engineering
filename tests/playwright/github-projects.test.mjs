@@ -100,3 +100,23 @@ test('the projects list is read in full every 12th read and after the sync state
  assert.deepEqual(reads.slice(before,before+2),['3',null],'the delta carrying the new sync state, then a full read');
  assert.doesNotMatch(await summary(),/item_limit/);
 },{burst:'0'}));
+
+test('board and list are labelled regions, and a focused card that moves column keeps focus',async()=>withApp(async(page,base)=>{
+ let revision=5,changed=[];
+ await page.route('**/api/v1/github/projects*',route=>{
+  const url=new URL(route.request().url()),project=url.searchParams.get('project'),since=url.searchParams.get('since');
+  if(!project)return route.fulfill({json:{...sync(),revision,projects:[board('PVT_1')]}});
+  if(since)return route.fulfill({json:{...sync(),revision,resync:false,project:board('PVT_1'),upserted:changed,removed:[]}});
+  return route.fulfill({json:{...sync(),revision,project:board('PVT_1'),items:[card('I1','o1',0),card('I2','o1',1)]}});
+ });
+ await page.clock.install();
+ await page.goto(`${base}/#/github/projects`);await page.locator('[data-ghp-item="I2"]').waitFor();
+ assert.equal(await page.getByRole('region',{name:'Project board'}).count(),1);
+ assert.equal(await page.locator('[data-ghp-list]').getAttribute('role'),'region');
+ await page.locator('[data-ghp-item="I2"] a').focus();
+ revision=6;changed=[card('I2','o3',1)];
+ await page.clock.runFor(5000);
+ await page.locator('[data-ghp-column="o3"] [data-ghp-item="I2"]').waitFor();
+ await page.waitForTimeout(100);
+ assert.equal(await page.evaluate(()=>{const a=document.activeElement;return !!a&&a.matches('[data-ghp-column="o3"] [data-ghp-item="I2"] a');}),true,'focus follows the card to its new column');
+},{burst:'0'}));
