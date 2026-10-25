@@ -78,6 +78,7 @@ REF_SEARCH_BURST = 30
 REF_SEARCH_WINDOW = 10.0
 REF_SEARCH_MIN = 2           # characters a search needs; an empty query lists REF_RECENT for owners/approvers
 REF_RECENT = 8
+REF_READ_WAIT = 0.05         # seconds a read (under the room lock) waits for the GitHub monitor's lock
 MAX_BODY = 64 * 1024
 _PANE_LINK = re.compile(r"pane:[a-z0-9][a-z0-9._-]{0,62}:[A-Za-z0-9][A-Za-z0-9:_.-]{0,39}")
 _KEY_RE = re.compile(r"[A-Za-z0-9._:\-]{1,128}\Z")
@@ -4772,25 +4773,24 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FilesMixin):
             return self._resolve_mentions(room_id, text)
 
     # -- `#` issue references (C4)
-    def _ref_catalog(self, cache: dict | None = None):
-        """The GitHub cache as it is now (memory only, never a network or store call), once per read."""
+    def _ref_catalog(self, cache: dict | None = None, wait: float = REF_READ_WAIT):
+        """The GitHub cache as it is now (memory only, never a network or store call), once per read.
+        Under the room lock (reads) it waits at most REF_READ_WAIT for the monitor; a post fetches it
+        before taking the room lock."""
         if cache is not None and "github_refs" in cache:
             return cache["github_refs"]
         try:
-            catalog = self.github.ref_catalog() if self.github is not None else None
+            catalog = self.github.ref_catalog(wait=wait) if self.github is not None else None
         except Exception:
             catalog = None                    # a broken cache never breaks a post or a read
         if cache is not None:
             cache["github_refs"] = catalog
         return catalog
 
-    def _resolve_refs(self, text: str, private: bool) -> list[dict]:
+    def _resolve_refs(self, text: str, private: bool, catalog) -> list[dict]:
         """`[{kind, owner, repo, number, forms}]` for the cached, in-scope issues `text` names (at most
         MAX_REFS); private repositories only when the poster may see them (`private`)."""
-        if "#" not in text:                   # most messages: no reference, no cache lookup under the lock
-            return []
-        catalog = self._ref_catalog()
-        if catalog is None:
+        if catalog is None or "#" not in text:
             return []
         try:
             return catalog.resolve(issue_refs.tokens(text), issue_refs.MAX_REFS, private=private)
@@ -4863,6 +4863,9 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FilesMixin):
 
     # -- messages
     def post_message(self, pr: Principal, room_id: str, body: dict) -> tuple[int, dict]:
+        # `#` references: the GitHub cache is read before the room lock (the monitor may be busy)
+        text_in = body.get("text") if isinstance(body, dict) else None
+        catalog = self._ref_catalog(wait=0.5) if isinstance(text_in, str) and "#" in text_in else None
         with self._lock:
             room, first = self._authorize(pr, room_id, "post", "message.post")
             if any(k in body for k in _MESSAGE_DERIVED):     # never trusted: the server resolves the text itself
@@ -4934,13 +4937,13 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FilesMixin):
                 pr, project_id=room["project_id"], room_id=room_id, sender_key=pr.key,
                 sender_kind=pr.kind, sender_id=pr.id, sender_external=pr.external, idempotency_key=key, fingerprint=fp,
                 text=stored, mentions=self._resolve_mentions(room_id, stored), in_reply_to=reply, trust="untrusted",
-                **({"refs": refs} if (refs := self._resolve_refs(stored, not self._restricted(pr, room_id))) else {}),
+                **({"refs": refs} if (refs := self._resolve_refs(stored, not self._restricted(pr, room_id), catalog)) else {}),
                 **({"context": ctx} if ctx else {}), **({"files": files} if files else {}),
                 visibility_scope="room", action="message.post", outcome="allowed",
                 project_ids=[room["project_id"]], resource_id=room_id))
         self.stats["messages"] += 1
-        with self._lock:
-            return 201, {"event": self._view(ev, viewer=pr)}
+        with self._lock:                     # the same catalog: no second lookup under the room lock
+            return 201, {"event": self._view(ev, viewer=pr, _ctx_cache={"github_refs": catalog})}
 
     # -- reads
     def _view(self, ev: dict, viewer=None, _ctx_cache: dict | None = None, **extra) -> dict:

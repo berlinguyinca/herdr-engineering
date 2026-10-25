@@ -371,3 +371,40 @@ def test_resolve_route_lists_in_scope_candidates_with_an_etag(gh, tmp_path):
     finally:
         server.shutdown()
         thread.join(timeout=3)
+
+
+def test_an_owner_leaving_the_allowlist_degrades_its_chips_to_coordinates(svc):
+    fake = Fake()
+    fake.put("acme/binview", 44)
+    allow = [["acme"]]
+    monitor = GitHubMonitor(provider_factory=lambda: fake, organizations=lambda: allow[0],
+                            store=lambda identity, viewer=None: MemoryGitHubStore(identity=identity, viewer=viewer,
+                                                                                  shared={}))
+    monitor.start = lambda: None
+    monitor.refresh()
+    room = W(svc)
+    svc.github = monitor
+    ev = say(room, room.alice, "#binview-44")
+    assert last_message(room, room.alice)["refs"][0]["title"] == "acme/binview 44"
+    allow[0] = ["other"]                                   # live: no pass needed
+    assert last_message(room, room.alice)["refs"] == [stored(room, ev)[0]]   # coordinates only
+    assert svc.search_refs(room.alice, room.room, "binview")["items"] == []
+
+
+def test_the_github_cache_is_read_outside_the_room_lock_when_posting(w, gh):
+    monitor, held, waits = gh[1], [], []
+    real = monitor.ref_catalog
+
+    def spy(**kw):
+        held.append(w.s._lock._is_owned())
+        waits.append(kw.get("wait", 0.5))
+        return real(**kw)
+    monitor.ref_catalog = spy
+    say(w, w.alice, "#binview-44")
+    assert held == [False]                                 # a post fetches the catalog before taking the lock
+    held.clear()
+    last_message(w, w.alice)
+    assert held == [True] and waits[-1] <= 0.05            # a read never waits long on the monitor's lock
+    say(w, w.alice, "no reference here")
+    assert held == [True]                                  # no '#': no lookup at all
+    monitor.close()

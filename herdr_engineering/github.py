@@ -1389,7 +1389,7 @@ class GitHubMonitor:
             return False
         return {owner.lower() for owner in allow} or None
 
-    def ref_catalog(self):
+    def ref_catalog(self, *, wait=0.5):
         """A read-only view of the cached catalog for resolving and showing `#` references, or
         ``None`` when the cache is not ready. Memory only and never a network or store call, so a
         collab room can use it under its own lock; it never answers for a catalog cached under
@@ -1397,7 +1397,7 @@ class GitHubMonitor:
         scope = self._ref_scope()
         provider = self._factory()
         # a credential change holds this lock while it loads the store: answer "not ready" rather than wait
-        if not self._lock.acquire(timeout=0.5):
+        if not self._lock.acquire(timeout=wait):
             return None
         try:
             if (scope is False or not provider.available or provider.credential_identity != self._credential
