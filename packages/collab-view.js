@@ -666,7 +666,10 @@ export function mountCollab(root, { fabricSessions = null, onFreshness = () => {
       const el = $(id);
       if (!el || (shown.get(id) === html && el.firstChild)) return false;
       if (el.contains(document.activeElement) && document.activeElement.matches('input,textarea,select')) { stale.add(id); return false; }
-      shown.set(id, html); handOff(morph(el, html)); stale.delete(id);
+      const kept = morph(el, html); handOff(kept); stale.delete(id);
+      // A node kept for a text selection is still on screen: leave the panel unmemoised so the next
+      // paint reconciles it once the selection is gone.
+      if (kept.some((node) => node.isConnected)) shown.delete(id); else shown.set(id, html);
       return true;
     };
     root.addEventListener('focusout', () => setTimeout(() => { if (stale.size && alive) paint(); }, 0));

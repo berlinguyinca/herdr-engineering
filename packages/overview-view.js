@@ -307,10 +307,12 @@ export function mountOverview(container, client, { freshness = () => null } = {}
       // Panels whose markup (ages aside) is unchanged are skipped: the clock ticks every second.
       const signature=html.replace(/(<span data-overview-stamp="[^"]+">)[^<]*(<\/span>)/g,'$1$2');
       if(signature===signatures.get(panel))continue;
-      signatures.set(panel,signature);
       const metrics=live?snapshotText(element,'.ov-metric strong',metricKey):null;
-      // A focused row that left (resolved, snoozed) hands focus to its panel heading.
-      handOff(morph(element,html),()=>element.querySelector('h2'));
+      // A focused row that left (resolved, snoozed) hands focus to its panel heading. A row kept for
+      // a text selection stays; the panel is then not memoised, so a later draw removes it.
+      const stranded=morph(element,html);
+      handOff(stranded,()=>element.querySelector('h2'));
+      if(stranded.some(node=>node.isConnected))signatures.delete(panel);else signatures.set(panel,signature);
       animateChanges(element,'.ov-metric strong',metrics,metricKey);
       if(panel==='attention')markNewCritical(element);
     }

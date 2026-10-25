@@ -299,6 +299,21 @@ test('Overview: identical refresh writes nothing; one changed agent rewrites onl
  assert.equal(await page.locator('.ov-customize').evaluate(d=>d.open),true,'Customize stays open');
 }));
 
+test('Overview: a resolved attention row kept for a text selection goes once the selection is released',async()=>withPage(async(page,base)=>{
+ const state={sessions:[],projections:[projection(1,{activity:{health:'blocked',currentActivity:{summary:'Stuck'}}})]};
+ const api=overviewApi(state);
+ await boot(page,base,'/overview',p=>p==='/api/v1/mission-activity'?{activities:structuredClone(state.projections)}:api(p));
+ const row=page.locator('[data-overview="attention"] [data-attention-key]');
+ await until(()=>row.count().then(n=>n===1),'attention row');
+ await page.evaluate(()=>{const r=document.createRange();r.selectNodeContents(document.querySelector('[data-overview="attention"] [data-attention-key] a'));getSelection().removeAllRanges();getSelection().addRange(r);});
+ state.projections[0].activity.health='active';
+ await liveRefresh(page,{event_id:'a1',event_type:'MissionUpdated'});
+ assert.equal(await row.count(),1,'the selected row stays while the text is selected');
+ await page.evaluate(()=>getSelection().removeAllRanges());
+ await page.clock.runFor(2000);
+ await until(()=>row.count().then(n=>n===0),'the resolved row is removed once the selection is gone',3000);
+}));
+
 // ---------------------------------------------------------------- Reviews (integrations view)
 const review=(id,extra={})=>({review_id:id,title:`Review ${id}`,kind:'plan',status:'pending',repository:'lab/alpha',updated_at:'2026-01-01T00:00:05Z',...extra});
 function reviewsApi(state){
@@ -445,5 +460,13 @@ test('Collab: repeated identical room state writes nothing; one changed task rew
  await page.evaluate(()=>window.collab.refresh());
  await until(()=>m.reads>failed,'a live event wakes the backoff sleep',1500);
  assert.deepEqual(await page.evaluate(()=>window.collab.interests),['SessionCreated','SessionStarted','SessionUpdated'],'collab only hears agent events');
+ // A task row kept for a text selection after its task left is removed once the selection goes,
+ // although the room state (and so the panel markup) no longer changes.
+ await page.evaluate(()=>{const r=document.createRange();r.selectNodeContents(document.querySelector('#hcn-tasks li[data-key="t1"] .grow'));getSelection().removeAllRanges();getSelection().addRange(r);});
+ m.tasks=m.tasks.filter(t=>t.task_id!=='t1');
+ await sleep(600);
+ assert.equal(await page.locator('#hcn-tasks li[data-key="t1"]').count(),1,'kept while selected');
+ await page.evaluate(()=>getSelection().removeAllRanges());
+ await until(()=>page.locator('#hcn-tasks li[data-key="t1"]').count().then(n=>n===0),'removed once the selection is released',3000);
  await page.evaluate(()=>window.collab.dispose());
 }));
