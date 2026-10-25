@@ -2,7 +2,8 @@
 import {escapeHtml as esc} from './herdr-web-components/util.js';
 import {formatDuration,formatTimestamp} from './herdr-web-components/format.js';
 import {safeServiceUrl} from './services-view.js';
-import {snapshotText,animateChanges} from './motion.js';
+import {snapshotText,animateChanges,skeleton} from './motion.js';
+import {freshnessSources} from './freshness.js';
 import {mountRelated} from './related-panel.js';
 
 const text=value=>typeof value==='string'?value:'';
@@ -28,8 +29,9 @@ export function githubIssueLabel(issue={}) {
  if(a.managed)return 'AutoSpec candidate · readiness not verified';
  return 'Open issue';
 }
-export function renderGithubHealth(snapshot) {
- if(!snapshot)return '<p class="gh-note" role="status">Loading GitHub repositories…</p>';
+// failed: the first read failed (its message shows beside the list), so no skeleton is left behind.
+export function renderGithubHealth(snapshot,{failed=false}={}) {
+ if(!snapshot)return failed?'':skeleton('GitHub connection',{rows:1,height:20,inStatus:true});
  const messages={not_configured:'GitHub connection needs server configuration.',auth_error:'GitHub authentication failed. The server credential needs attention.',rate_limited:'GitHub is rate limited. Synchronization will resume when requests are available.',unavailable:'GitHub could not be reached.'};
  const progress=snapshot.progress||{},issues=progress.phase==='issues'||Number(progress.issue_repositories_complete)>0;
  const complete=issues?progress.issue_repositories_complete:progress.repositories_seen;
@@ -41,6 +43,15 @@ export function renderGithubHealth(snapshot) {
   ${busy?`<div class="gh-progress" role="status"><span>${issues?'Reading open issues':'Discovering repositories'}${measured?` · ${Math.min(complete,total)} of ${total} repositories`:''}${progress.current_repository?` · ${esc(short(progress.current_repository))}`:''}</span><progress ${measured?`value="${Math.min(complete,total)}" max="${total}"`:''} aria-label="${issues?'Repositories checked for issues':'Repository discovery'}"></progress>${integer(progress.issues_seen)?`<span>${progress.issues_seen} open issues observed so far</span>`:''}</div>`:''}
   ${snapshot.partial?'<p class="gh-warning">Partial coverage: some repositories or issues have not been read. Counts describe the available catalog.</p>':''}${snapshot.stale?'<p class="gh-warning">Showing previously synchronized data. Issue age does not determine whether an issue is still open.</p>':''}
   <p class="gh-note">${account?`${esc(account)} · `:''}${age(snapshot.last_success_at,'Last successful sync')}${integer(snapshot.rate_limit?.remaining)?` · ${snapshot.rate_limit.remaining} GraphQL points remaining`:''}</p>`;
+}
+// The chip's note for the sync snapshot: status (when not ready), stale, partial and deferred
+// repositories (array or count). Any of them keeps the chip amber: a sync problem never reads as live.
+export function githubSyncNote(snapshot) {
+ if(!snapshot)return {text:'',warn:false};
+ const deferred=Array.isArray(snapshot.deferred_repos)?snapshot.deferred_repos.length:integer(snapshot.deferred_repos)?snapshot.deferred_repos:0;
+ const status=text(snapshot.status);
+ const parts=[status&&status!=='ready'&&status!=='ok'?human(status):'',snapshot.stale===true?'stale':'',snapshot.partial===true&&status!=='partial'?'partial':'',deferred?`${deferred} ${deferred===1?'repository':'repositories'} deferred`:''].filter(Boolean);
+ return {text:parts.join(' · '),warn:parts.length>0};
 }
 export function renderGithubRepository(repo={},selected=false) {
  const count=integer(repo.open_issue_count)?`${repo.open_issue_count} open ${repo.open_issue_count===1?'issue':'issues'}`:'Count not reported';
@@ -94,7 +105,8 @@ export function mountGithub(container,client) {
  let clock=null,pollTimer=null,repositoryDebounce=null,issueDebounce=null;
  let account=null,connectionGeneration=null,listScroll=null;
  const requests=new Map(),cache=new Map(),signatures=new Map(),listeners=new AbortController();
- container.innerHTML=`${styles}<h1>GitHub projects</h1><p class="gh-intro">Repositories ranked by open issues. Find work to inspect and review its AutoSpec labels, preparation needs and reported progress.</p><div data-gh-health role="status"></div><p data-gh-repo-error class="gh-warning" role="status"></p>
+ const chipEl=()=>container.querySelector('herdr-freshness'),chip=freshnessSources(chipEl);
+ container.innerHTML=`${styles}<div class="hd-live-head"><h1>GitHub projects</h1><herdr-freshness interval="5000"></herdr-freshness></div><p class="gh-intro">Repositories ranked by open issues. Find work to inspect and review its AutoSpec labels, preparation needs and reported progress.</p><div data-gh-health role="status"></div><p data-gh-repo-error class="gh-warning" role="status"></p>
   <div class="gh-layout"><details class="gh-repositories" ${window.matchMedia('(min-width:851px)').matches?'open':''}><summary>Repositories · most open issues first</summary><div class="gh-repository-content"><div class="gh-controls"><label>Search repositories<input type="search" data-gh-repo-search placeholder="Owner or repository"></label></div><button type="button" class="hd-btn gh-all-repos" data-gh-all-repositories>All repositories</button><p class="gh-note" data-gh-repo-count></p><ul class="gh-repo-list" data-gh-repositories></ul><div class="gh-pages" data-gh-repo-pages><button type="button" class="hd-btn" data-gh-repo-page="previous">Previous</button><span data-gh-repo-page-label></span><button type="button" class="hd-btn" data-gh-repo-page="next">Next</button></div></div></details>
   <section class="gh-main"><div class="gh-heading"><h2 data-gh-scope>All repositories</h2></div><div data-gh-related></div><div class="gh-tabs" role="tablist" aria-label="Issue classification">${tabs.map(([key,label])=>`<button type="button" role="tab" id="gh-tab-${key}" data-gh-tab="${key}" aria-controls="gh-issue-panel" aria-selected="${key==='all'}" tabindex="${key==='all'?0:-1}">${label}<small data-gh-tab-count="${key}">…</small></button>`).join('')}</div><div class="gh-controls"><label>Search open issues<input type="search" data-gh-issue-search placeholder="Issue title or number"></label></div><p class="gh-section-label" data-gh-issue-count role="status"></p><p class="gh-warning" data-gh-issue-error role="status"></p><div class="gh-issue-layout"><div class="gh-issue-list" id="gh-issue-panel" role="tabpanel" aria-labelledby="gh-tab-all"></div><aside class="gh-inspector" data-gh-inspector aria-label="Issue inspector" hidden></aside></div><div class="gh-pages" data-gh-issue-pages><button type="button" class="hd-btn" data-gh-issue-page="previous">Previous</button><span data-gh-issue-page-label></span><button type="button" class="hd-btn" data-gh-issue-page="next">Next</button></div></section></div>`;
  const el=selector=>container.querySelector(selector);
@@ -145,7 +157,7 @@ export function mountGithub(container,client) {
  let motionView='';
  function draw() {
   if(disposed)return;
-  replace(el('[data-gh-health]'),renderGithubHealth(repositories),'health',JSON.stringify(repositories&&[repositories.status,repositories.refreshing,repositories.progress,repositories.partial,repositories.stale,repositories.account,repositories.last_success_at,repositories.error,repositories.rate_limit]));
+  replace(el('[data-gh-health]'),renderGithubHealth(repositories,{failed:!!repoError}),'health',JSON.stringify([!repositories&&!!repoError,repositories&&[repositories.status,repositories.refreshing,repositories.progress,repositories.partial,repositories.stale,repositories.account,repositories.last_success_at,repositories.error,repositories.rate_limit]]));
   el('[data-gh-repo-error]').textContent=repoError;
   el('[data-gh-issue-error]').textContent=[issueError,issues?.error,issues?.partial?'Issue coverage is partial; additional open issues may not have been read.':'',issues?.stale?'Showing previously synchronized issue summaries.':''].filter(Boolean).join(' ');
   // Lists are rebuilt with innerHTML (Task 19 moves them onto the patcher); motion pairs old and new
@@ -155,7 +167,7 @@ export function mountGithub(container,client) {
   const view=JSON.stringify(state),live=!!repositories&&!!issues&&motionView===view;motionView=repositories&&issues?view:'';
   const reposBefore=live?snapshotText(el('[data-gh-repositories]'),'[data-gh-repository]',repoKey):null,issuesBefore=live?snapshotText(el('#gh-issue-panel'),'[data-gh-issue-row]',issueRowKey):null,countsBefore=live?snapshotText(container,'[data-gh-tab-count]'):null;
   const repos=rankGithubRepositories(repositories?.repositories);
-  replace(el('[data-gh-repositories]'),repos.map(repo=>renderGithubRepository(repo,repo.repository_id===state.repository)).join('')||`<li class="gh-empty">${!repositories?'Loading repositories…':repositories.available===false?'Repository data is unavailable. Connection details appear above.':'No repositories match this search.'}</li>`,'repos',JSON.stringify([repositories,state.repository]));
+  replace(el('[data-gh-repositories]'),repos.map(repo=>renderGithubRepository(repo,repo.repository_id===state.repository)).join('')||(!repositories?(repoError?'<li class="gh-empty">Repositories could not be loaded yet; retrying automatically.</li>':`<li>${skeleton('repositories',{rows:3,height:52})}</li>`):`<li class="gh-empty">${repositories.available===false?'Repository data is unavailable. Connection details appear above.':'No repositories match this search.'}</li>`),'repos',JSON.stringify([repositories,state.repository,!repositories&&!!repoError]));
   animateChanges(el('[data-gh-repositories]'),'[data-gh-repository]',reposBefore,repoKey,{count:false});
   el('[data-gh-repo-count]').textContent=repositories?`${repos.length} repositories on this page${integer(repositories.pagination?.total)?` · ${repositories.pagination.total} matching`:''}`:'';
   el('[data-gh-all-repositories]').setAttribute('aria-pressed',String(!state.repository));
@@ -163,7 +175,7 @@ export function mountGithub(container,client) {
   for(const [key] of tabs){const button=el(`[data-gh-tab="${key}"]`);button.setAttribute('aria-selected',String(state.tab===key));button.tabIndex=state.tab===key?0:-1;el(`[data-gh-tab-count="${key}"]`).textContent=integer(issues?.counts?.[key])?issues.counts[key]:'…';}
   const rows=records(issues?.issues);
   el('#gh-issue-panel').setAttribute('aria-labelledby',`gh-tab-${state.tab}`);
-  replace(el('#gh-issue-panel'),rows.map(issue=>renderGithubIssue(issue,selected?.key===issueKey(issue))).join('')||`<p class="gh-empty">${!issues?'Loading open issues…':issues.available===false?'Issue data is unavailable.':'No open issues match this view.'}${issues?.partial?' Synchronization is incomplete.':''}</p>`,'issues',JSON.stringify([issues,selected?.key]));
+  replace(el('#gh-issue-panel'),rows.map(issue=>renderGithubIssue(issue,selected?.key===issueKey(issue))).join('')||(!issues?(issueError?'<p class="gh-empty">Issues could not be loaded yet; retrying automatically.</p>':skeleton('open issues',{rows:2,height:64})):`<p class="gh-empty">${issues.available===false?'Issue data is unavailable.':'No open issues match this view.'}${issues?.partial?' Synchronization is incomplete.':''}</p>`),'issues',JSON.stringify([issues,selected?.key,!issues&&!!issueError]));
   animateChanges(el('#gh-issue-panel'),'[data-gh-issue-row]',issuesBefore,issueRowKey,{count:false});
   animateChanges(container,'[data-gh-tab-count]',countsBefore);
   el('[data-gh-issue-count]').textContent=issues?`${rows.length} issues on this page${integer(issues.pagination?.total)?` · ${issues.pagination.total} matching open issues`:''}`:'';
@@ -203,14 +215,15 @@ export function mountGithub(container,client) {
   if(changed||disconnected){clearSelection();cache.clear();cancel('issues');issues=null;issueError='';state.repository='';state.repositoryLabel='All repositories';state.issuePage=1;showProject();}
   account=disconnected?null:nextAccount;if(nextGeneration!==undefined)connectionGeneration=nextGeneration;
   repositories=response;repoError='';if(changed||disconnected)readIssues();
- },()=>{repoError=`Repositories could not refresh.${repositories?' Showing last received repositories.':' Retrying automatically.'}`;});}
+  const note=githubSyncNote(response);chipEl()?.setDetail(note.text,{warn:note.warn});chip.ok('repos');
+ },error=>{chip.fail('repos',`Repositories: ${error?.message||'request failed'}`);repoError=`Repositories could not refresh.${repositories?' Showing last received repositories.':' Retrying automatically.'}`;});}
  function readIssues(){request('issues',signal=>client.getGithubIssues(state.repository||undefined,{tab:state.tab,search:state.issueSearch,page:state.issuePage,per_page:20,signal}),response=>{
   if(!Array.isArray(response?.issues))throw new Error('Invalid issues response');
   if((connectionGeneration!==null&&response.connection_generation!==undefined&&response.connection_generation!==connectionGeneration)||(account&&text(response.account)&&account!==response.account)){clearSelection();cache.clear();issues=null;issueError='GitHub connection changed. Refreshing account context.';readRepositories();return;}
-  issues=response;issueError='';
+  issues=response;issueError='';chip.ok('issues');
   const latest=selected&&records(response.issues).find(issue=>issueKey(issue)===selected.key);
   if(latest&&latest.updated_at!==selected.summary.updated_at){selected={key:selected.key,summary:latest};loadDetail();}
- },()=>{issueError=`Open issues could not refresh.${issues?' Showing last received issues.':' Retrying automatically.'}`;});}
+ },error=>{chip.fail('issues',`Open issues: ${error?.message||'request failed'}`);issueError=`Open issues could not refresh.${issues?' Showing last received issues.':' Retrying automatically.'}`;});}
  function refresh(){readRepositories();readIssues();}
  function clearSelection(){cancel('detail');selected=null;el('.gh-layout').classList.remove('gh-detail-open');detail=null;detailError='';detailLoading=false;el('[data-gh-inspector]').innerHTML='';el('[data-gh-inspector]').hidden=true;signatures.delete('detail');}
  function changeIssues(){cancel('issues');issues=null;issueError='';readIssues();draw();}

@@ -44,11 +44,11 @@ async function until(fn,label,ms=5000){
  assert.fail(`timed out waiting for ${label}`);
 }
 
-// Records every herdr-spinner inserted under #view from now on.
+// Records every loader (spinner or first-load skeleton) inserted under #view from now on.
 const watchSpinners=page=>page.evaluate(()=>{
  window.__view=document.getElementById('view');window.__spinners=0;
  new MutationObserver(records=>{for(const r of records)for(const n of r.addedNodes)
-  if(n.nodeType===1&&(n.matches('herdr-spinner')||n.querySelector('herdr-spinner')))window.__spinners++;})
+  if(n.nodeType===1&&(n.matches('herdr-spinner,[data-skeleton]')||n.querySelector('herdr-spinner,[data-skeleton]')))window.__spinners++;})
   .observe(window.__view,{childList:true,subtree:true});
 });
 
@@ -77,7 +77,7 @@ test('same-route SSE refresh keeps #view, scroll position and never shows a spin
  assert.equal(reads.activity,3,'burst yields exactly one refresh');
 
  const after=await page.evaluate(()=>({same:document.getElementById('view')===window.__view,spinners:window.__spinners,y:window.scrollY,
-  spinnerNow:!!document.querySelector('#view herdr-spinner')}));
+  spinnerNow:!!document.querySelector('#view herdr-spinner, #view [data-skeleton]')}));
  assert.deepEqual(after,{same:true,spinners:0,y:scrolled,spinnerNow:false});
 }));
 
@@ -129,4 +129,18 @@ test('a malformed %-escape in the URL shows an error page instead of an uncaught
  }
  await sleep(200);
  assert.deepEqual(errors.filter(e=>/URI/.test(e)),[]);
+}));
+
+// The first-load skeleton decodes the mission id too: a malformed escape must not throw before the
+// page is replaced, or the previous page stays on screen under the new URL.
+test('navigating to a malformed mission id replaces the page with "Mission not found"',async()=>withPage(async(page,base)=>{
+ const errors=[];page.on('pageerror',e=>errors.push(String(e)));
+ await boot(page,base,'/overview');
+ await page.locator('#overview-dashboard').waitFor();
+ await page.evaluate(()=>{location.hash='/missions/%E0';});
+ await page.locator('#view herdr-error[message="Mission not found"]').waitFor();
+ await sleep(200);
+ assert.deepEqual(errors,[]);
+ assert.equal(await page.locator('#overview-dashboard').count(),0,'the overview is gone');
+ assert.equal(await page.locator('#view herdr-freshness').count(),1,'the not-found page has one chip');
 }));

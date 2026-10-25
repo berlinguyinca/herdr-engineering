@@ -5,6 +5,49 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Live web UI: pages update in place (#218, #221 and the PRs stacked on them)
+- Pages no longer re-render on live events. A route loads once, behind a skeleton, and then returns
+  a mounted view `{ refresh(hint), dispose() }`. A shared refresh bus throttles SSE events to one
+  refresh per view every 5 s.
+- A keyed patcher (`patchList`, `morph`, `patchText`, `patchAttr`) writes only what changed. It
+  keeps focus, open `<details>` and the text selection.
+- The SSE stream sends a keep-alive every 10 s and no longer ends when idle.
+- Motion marks data changes: values count up, changed values flash, rows enter and leave.
+  `motion.js` also has the skeleton placeholder used on first loads.
+- Every page head has a freshness chip. It turns amber when stale and red with the error, and a page
+  with several sources names every one that is failing. On GitHub the chip also shows the sync state.
+  Amber still follows the stream-contact rule: while the live stream's keep-alive arrives, a quiet
+  fleet's chip stays "live". Attention, Review gate, Architecture and both LLM pages have a chip and a
+  first-load skeleton too; an inbox, gate or explorer that is turned off on the server is not an error.
+- Theme (auto, light, dark) and Calm (auto, on, off) controls are in the sidebar, stored per browser
+  and applied before first paint.
+  - Calm, and OS reduced motion unless calm is off, applies every change at once with no animation.
+    `tests/playwright/calm.test.mjs` guards this on every route.
+  - The dark palette is token-based. It covers every view, including the CI health map, pipeline
+    steps and test results, which used to hard-code light colours. `tests/playwright/dark-theme.test.mjs`
+    checks 4.5:1 text contrast and no light fills on every route, in the loading, error, empty and
+    populated states.
+  - The light theme looks the same as before.
+- Conventions for new views are in `packages/herdr-web-components/README.md` ("Live views:
+  conventions").
+- UI only; no API, config or migration change beyond the SSE keep-alive. Rollback: revert the PRs.
+
+### T17 Independent-server federation ADR (docs only)
+- `docs/adr/ADR-0008-independent-server-federation.md`, status Proposed, awaiting approval: options, trust model, data flow, failure modes, migration, non-goals and ten owner decisions. No code, configuration, endpoint or migration; nothing is implemented until the ADR is approved. Rollback: revert the PR.
+
+### T16 Herdr-side gaps from the Pi and AutoSpec wiring
+- Steering: an ingest key can read the CURRENT fence and gate digest at apply time: `GET /api/v1/steering/targets/{node_id}` (owner of the node, live
+  request, room-scoped nodes included) and `fence`/`digest`/`digests` on `GET /api/v1/graph/nodes/{id}` for nodes the key may read. A `fork` may carry
+  a bounded, redacted `instruction` (the changed requirement), delivered in the pending item like a redirect's.
+- Review quorum: `POST /api/v1/graph/nodes/{pr}/review-quorum/rereview` records a durable, idempotent-per-head, scoped (trusted head writer, reviewer or
+  operator), rate-limited, audited re-review request; the quorum read shows it as `rereview_request` for that head.
+  A head may be asked about again once its latest ask is older than `review_quorum.rereview_retry_seconds` (YAML, default 3600); inside that window
+  AutoSpec owns retries. Review-gate worker keys are refused on the route (403); the gate's own re-reviews are a separate, independent mechanism.
+- External agents: workspace-link authorize no longer tells a non-owner whether a link id exists; MCP `tools/list` is per agent (an external agent is never offered the task or helper tools); delegation budgets accept
+  and enforce `max_turns` (an answer or proposal past it closes the task; a `complete` answer is always accepted, and a task stored without `max_turns` has no ceiling; and echo `max_hops`, the chain-depth ceiling); a consultation also records `asker -> target` as a graph edge (reference nodes).
+- Acceptance: four Herdr strict xfails became real tests; the manifest minimums rise (s2 20, s5 15); no minimum is lowered.
+- No migration, no environment variable. Rollback: revert the PR. Checked by loading rows of this stream into the previous build: it starts and serves normally and the rows do no harm, but it does NOT keep them out of its event feed (it lists them as ordinary events, each carrying only the head and request id); the stored rows stay in the log and are ignored again once this code is back.
+
 ### T16 security fixes, Herdr side (stacked on the T16 release-gate branch)
 - Ingest is an allow-list of entity types; `collab`, `ci_*` and other adapter-owned streams and the server's session receipts can no longer be forged
   by an ingest key (H1, M1, M5). Foreign `collab` rows already in a database are quarantined at startup, and a corrupt collab log disables collaboration

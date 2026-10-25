@@ -8,7 +8,8 @@ import {ciChartModel,renderCiCharts,ciChartStyles} from './ci-charts.js';
 import {ciInsightsModel,renderCiInsights,ciInsightStyles,renderCiRunReports} from './ci-insights.js';
 import {renderCiPipeline,ciPipelineStyles,pipelineZoom,sameCiRepository,ciComparisonModel,renderCiComparison} from './ci-pipeline.js';
 import {mountCiHealth} from './ci-health-view.js';
-import {snapshotText,animateChanges} from './motion.js';
+import {snapshotText,animateChanges,skeleton} from './motion.js';
+import {freshnessSources} from './freshness.js';
 import {renderCiFix,ciFixStyles,fixRunKey,latestFix,fixIsActive,fixError} from './ci-fix-view.js';
 import {attachError,attachForms} from './terminal-attach.js';
 import {renderRelated} from './related-panel.js';
@@ -67,8 +68,9 @@ const external = (url,label) => {
   const safe=safeServiceUrl(url);
   return safe ? `<a href="${esc(safe)}" target="_blank" rel="noopener noreferrer">${esc(label)} ↗</a>` : '';
 };
-export function integrationHealth(data,kind='ci') {
-  if (!data) return `<p class="ig-note" role="status">Loading ${kind==='ci'?'CI runs':'reviews'}…</p>`;
+// failed: the first load failed (its message shows in [data-ig-error]), so no skeleton is left behind.
+export function integrationHealth(data,kind='ci',{failed=false}={}) {
+  if (!data) return failed ? '' : skeleton(kind==='ci'?'CI runs':'reviews',{rows:1,height:20,inStatus:true});
   const labels={not_configured:'Woodpecker is not configured. Add a CI token to the server configuration.',auth_error:'Woodpecker authentication failed. The server credential needs attention.',unavailable:'Woodpecker could not be reached.',partial:'Some CI repositories could not refresh.',syncing:'Discovering CI repositories and runs…'};
   const error=kind==='ci' ? labels[data.status] || (data.available===false ? 'CI data is unavailable.' : '') : data.error;
   const progress=data.progress;
@@ -123,7 +125,7 @@ export function activePiSessions(sessions) {
     && s.interactive_ready!==false && !s.launch_pending);
 }
 export function renderPipeline(pipeline,{loading=false,error='',log=null,logError='',step='',actionMessage='',debugSessions=null,debugSessionId='',debugMessage='',collapseSuccess=false,zoom=1,fixHtml='',relatedHtml=''}={}) {
-  if (!pipeline) return loading ? '<p class="ig-note" role="status">Loading pipeline steps…</p>' : '<p class="ig-note">Select a run to inspect its steps and logs.</p>';
+  if (!pipeline) return loading ? skeleton('pipeline steps',{rows:3}) : '<p class="ig-note">Select a run to inspect its steps and logs.</p>';
   const tasks=records(pipeline.tasks);
   const completed=tasks.filter(t=>integrationOutcome(t)!=='current').length;
   return `<div class="ig-heading"><h2>Run #${esc(pipeline.run_number ?? '')}</h2><button type="button" class="hd-btn" data-close-inspector><span class="ig-back-label">Back to runs</span><span class="ig-close-label">Close</span></button></div>
@@ -132,8 +134,8 @@ export function renderPipeline(pipeline,{loading=false,error='',log=null,logErro
     ${relatedHtml}
     ${error ? `<p class="ig-warning" role="status">${esc(error)} Showing the last received details.</p>` : ''}${actionMessage ? `<p role="status" class="ig-note">${esc(actionMessage)}</p>` : ''}
     ${integrationOutcome(pipeline)==='failed' ? `<details class="ig-debug" data-debug-disclosure><summary>Debug with Pi</summary><p class="ig-note">Send the failed revision, step details and bounded log output to a Pi agent you choose.</p>${debugSessions===null ? '<p class="ig-note">Open this section to load active Pi agents.</p>' : `<label class="ig-note">Target Pi agent<select data-debug-session aria-label="Target Pi agent"><option value="">Choose an agent…</option>${debugSessions.map(s=>`<option value="${esc(s.session_id)}" ${s.session_id===debugSessionId?'selected':''}>${esc(short(s.display_name || s.title || s.summary || s.cwd || s.session_id,100))}${s.host_id?` · ${esc(short(s.host_id,60))}`:''}${pipeline.branch && s.branch===pipeline.branch?' · on this branch':''}</option>`).join('')}</select></label>${!debugSessions.length ? '<p class="ig-note">No active Pi agents with verified messaging are available.</p>' : ''}<button type="button" class="hd-btn" data-debug-send ${!debugSessionId?'disabled':''}>Send to Pi</button> <button type="button" class="hd-btn" data-debug-fix ${!debugSessionId?'disabled':''}>Fix with Pi</button><p class="ig-note">Fix with Pi asks the agent to reproduce the failure in a new worktree at this exact revision, fix it and open a pull request. It never merges.</p>`}${debugMessage ? `<p class="ig-note" role="status">${esc(debugMessage)}</p>` : ''}</details>` : ''}${integrationOutcome(pipeline)==='failed' ? fixHtml : ''}
-    ${tasks.length ? `<p class="ig-note">${completed} of ${tasks.length} steps finished · Select a step for its log</p><progress value="${completed}" max="${tasks.length}" aria-label="Pipeline steps finished"></progress><div class="ci-pipeline-controls" role="group" aria-label="Pipeline display"><button type="button" class="hd-btn" data-collapse-success aria-pressed="${collapseSuccess}">${collapseSuccess?'Expand successful steps':'Collapse successful steps'}</button><button type="button" class="hd-btn" data-pipeline-zoom="out" aria-label="Zoom out" ${zoom<=.75?'disabled':''}>−</button><button type="button" class="hd-btn" data-pipeline-zoom="reset" aria-label="Reset zoom">${Math.round(zoom*100)}%</button><button type="button" class="hd-btn" data-pipeline-zoom="in" aria-label="Zoom in" ${zoom>=1.5?'disabled':''}>+</button></div>${renderCiPipeline(pipeline,{step,collapseSuccess,zoom})}` : (!Array.isArray(pipeline.tasks) && loading && !error ? '<p class="ig-note" role="status">Loading pipeline steps…</p>' : '<p class="ig-note">No steps reported yet. Waiting for Woodpecker.</p>')}
-    ${step ? `<h3>Step log</h3>${logError ? `<p class="ig-warning" role="status">${esc(logError)}</p>` : ''}${log===null ? '<p class="ig-note" role="status">Loading step output…</p>' : `<p class="ig-note">${age(log.checked_at,'Log checked')}${log.truncated?' · Output truncated':''}</p>${log.available===false ? `<p class="ig-note">${esc(log.error || 'Log output is not available yet.')}</p>` : `<pre class="ig-log" tabindex="0" aria-label="Step output">${esc(text(log.log)) || 'No output reported yet.'}</pre>`}`}` : ''}`;
+    ${tasks.length ? `<p class="ig-note">${completed} of ${tasks.length} steps finished · Select a step for its log</p><progress value="${completed}" max="${tasks.length}" aria-label="Pipeline steps finished"></progress><div class="ci-pipeline-controls" role="group" aria-label="Pipeline display"><button type="button" class="hd-btn" data-collapse-success aria-pressed="${collapseSuccess}">${collapseSuccess?'Expand successful steps':'Collapse successful steps'}</button><button type="button" class="hd-btn" data-pipeline-zoom="out" aria-label="Zoom out" ${zoom<=.75?'disabled':''}>−</button><button type="button" class="hd-btn" data-pipeline-zoom="reset" aria-label="Reset zoom">${Math.round(zoom*100)}%</button><button type="button" class="hd-btn" data-pipeline-zoom="in" aria-label="Zoom in" ${zoom>=1.5?'disabled':''}>+</button></div>${renderCiPipeline(pipeline,{step,collapseSuccess,zoom})}` : (!Array.isArray(pipeline.tasks) && loading && !error ? skeleton('pipeline steps',{rows:3}) : '<p class="ig-note">No steps reported yet. Waiting for Woodpecker.</p>')}
+    ${step ? `<h3>Step log</h3>${logError ? `<p class="ig-warning" role="status">${esc(logError)}</p>` : ''}${log===null ? skeleton('step output',{rows:2}) : `<p class="ig-note">${age(log.checked_at,'Log checked')}${log.truncated?' · Output truncated':''}</p>${log.available===false ? `<p class="ig-note">${esc(log.error || 'Log output is not available yet.')}</p>` : `<pre class="ig-log" tabindex="0" aria-label="Step output">${esc(text(log.log)) || 'No output reported yet.'}</pre>`}`}` : ''}`;
 }
 
 // The filter names the entity it came from and links back to it (cross-linking), never from free text.
@@ -167,7 +169,9 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
   const listenerController=new AbortController();
   const reviewCache=new Map();
   const title=isCi?'CI':'Reviews';
-  container.innerHTML=`${styles}${isCi?ciChartStyles+ciInsightStyles+ciPipelineStyles+ciFixStyles:''}<h1>${title}</h1><p class="ig-intro">${isCi?'Follow builds from queue to finished steps. Inspect output and open the original run in Woodpecker.':'Review plans and code in Plannotator, with decisions linked to the mission and revision they belong to.'}</p>
+  // The chip follows the run list and, on CI, the run history (both poll every 5 s).
+  const chip=freshnessSources(()=>container.querySelector('herdr-freshness'));
+  container.innerHTML=`${styles}${isCi?ciChartStyles+ciInsightStyles+ciPipelineStyles+ciFixStyles:''}<div class="hd-live-head"><h1>${title}</h1><herdr-freshness interval="5000"></herdr-freshness></div><p class="ig-intro">${isCi?'Follow builds from queue to finished steps. Inspect output and open the original run in Woodpecker.':'Review plans and code in Plannotator, with decisions linked to the mission and revision they belong to.'}</p>
     <div data-ig-health role="status"></div><p data-ig-error class="ig-warning" role="status"></p>
     ${isCi?'<div data-ci-health></div>':''}
     <div class="ig-tabs" role="tablist" aria-label="${title} outcome">${tabs.map(([key,label])=>`<button type="button" role="tab" id="ig-tab-${key}" data-tab="${key}" aria-controls="ig-results" aria-selected="${state.tab===key}" tabindex="${state.tab===key?0:-1}">${label} <strong data-count="${key}">…</strong></button>`).join('')}</div>
@@ -248,13 +252,13 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
   function draw() {
     if(disposed)return;
     el('[data-ig-error]').textContent=error;
-    const health=integrationHealth(data,kind);
+    const health=integrationHealth(data,kind,{failed:!!error});
     const healthElement=el('[data-ig-health]');
-    const healthKey=JSON.stringify([data?.status,data?.refreshing,data?.progress,data?.last_success_at,data?.checked_at,data?.error,data?.stale,data?.repo_errors,data?.project_mapping_error]);
+    const healthKey=JSON.stringify([!data&&!!error,data?.status,data?.refreshing,data?.progress,data?.last_success_at,data?.checked_at,data?.error,data?.stale,data?.repo_errors,data?.project_mapping_error]);
     if(healthElement.dataset.signature!==healthKey){healthElement.dataset.signature=healthKey;const issuesOpen=healthElement.querySelector('details')?.open;healthElement.innerHTML=health;if(issuesOpen && healthElement.querySelector('details'))healthElement.querySelector('details').open=true;}
     const all=entries(),filtered=selectIntegrations(all,state),pageSize=20;
     state.page=Math.min(state.page,Math.max(0,Math.ceil(filtered.length/pageSize)-1));
-    const nextSignature=JSON.stringify([state,data,reportData,performanceData,performanceError,performanceDays,[...reviewCache]]);
+    const nextSignature=JSON.stringify([state,!!error,data,reportData,performanceData,performanceError,performanceDays,[...reviewCache]]);
     if(isCi) {
       const observations=ciObservations();
       const model=ciInsightsModel(observations,state);
@@ -313,7 +317,7 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
         if(!groups.has(group))groups.set(group,[]);groups.get(group).push(entry);
       }
       const result=el('#ig-results');result.setAttribute('aria-labelledby',`ig-tab-${state.tab}`);
-      replace(result,[...groups].map(([name,rows])=>`<div class="ig-group"><h2>${esc(name)}</h2>${rows.map(e=>integrationRow(e,kind)).join('')}</div>`).join('') || `<div class="ig-group ig-empty">${!data ? 'Waiting for reports…' : isCi && data.available===false && !all.length ? 'No CI reports available. Connection details are shown above.' : `No ${state.tab==='current'?'current ':''}${isCi?'runs':'reviews'} match this view.`}</div>`);
+      replace(result,[...groups].map(([name,rows])=>`<div class="ig-group"><h2>${esc(name)}</h2>${rows.map(e=>integrationRow(e,kind)).join('')}</div>`).join('') || `<div class="ig-group ig-empty">${!data ? (error ? `No ${isCi?'runs':'reviews'} could be loaded yet; retrying automatically.` : skeleton(isCi?'runs':'reviews',{rows:isCi?4:2})) : isCi && data.available===false && !all.length ? 'No CI reports available. Connection details are shown above.' : `No ${state.tab==='current'?'current ':''}${isCi?'runs':'reviews'} match this view.`}</div>`);
       animateChanges(container,'[data-tab] strong',tabCounts);
       animateChanges(result,'[data-entry] .ig-state strong',rowStates,entryKey,{count:false,target:node=>node.closest('[data-entry]')});
       el('[data-ig-count]').textContent=data ? `${filtered.length} matching ${isCi?'runs':'reviews'}${isCi?reportData?' in retained observations':' in the recent pipeline window':data.has_more?` · Showing the latest ${records(data.reviews).length}${Number.isFinite(data.total)?` of ${data.total}`:''} reviews; older records are outside this window`:''}` : '';
@@ -400,12 +404,12 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
     refreshPerformance();
     if(isCi && typeof client.getCiReports==='function')request('reports',signal=>client.getCiReports({signal}),response=>{
       if(!Array.isArray(response?.reports)||!Array.isArray(response?.pipelines))throw new Error('Invalid CI history response');
-      reportData=response;reportsError='';
-    },()=>{reportsError=`CI history could not refresh.${reportData?' Showing last received reports.':''}`;});
+      reportData=response;reportsError='';chip.ok('reports');
+    },failure=>{chip.fail('reports',`CI history: ${failure?.message||'request failed'}`);reportsError=`CI history could not refresh.${reportData?' Showing last received reports.':''}`;});
     request('list',signal=>isCi ? client.getCi({signal}) : client.listReviews({signal}),response=>{
       if(!response || (isCi ? typeof response.available!=='boolean' : !Array.isArray(response.reviews)))throw new Error('Invalid integration response');
-      data=response;error='';
-    },()=>{error=`${title} could not refresh.${data?' Showing last received records.':' Retrying automatically.'}`;});
+      data=response;error='';chip.ok('list');
+    },failure=>{chip.fail('list',`${title}: ${failure?.message||'request failed'}`);error=`${title} could not refresh.${data?' Showing last received records.':' Retrying automatically.'}`;});
     refreshDetail();
   }
   function cancelDetail() {for(const key of ['pipeline','log','debug-sessions','fix','related']){pending.get(key)?.abort();pending.delete(key);}}

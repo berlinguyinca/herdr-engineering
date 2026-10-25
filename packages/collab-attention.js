@@ -5,6 +5,7 @@
 // Accessibility: severity is always written out as text (never colour alone), actions are real buttons with labels
 // that name the item, the list is a labelled list, and the empty and "insufficient evidence" states are text.
 import { escapeHtml as esc } from './herdr-web-components/util.js';
+import { skeleton } from './motion.js';
 
 const SEVERITY_LABEL = { error: 'Error', warning: 'Warning', notice: 'Notice', info: 'Info' };
 const SNOOZES = [[3600, '1 hour'], [86400, '1 day'], [7 * 86400, '1 week']];
@@ -61,7 +62,7 @@ function itemRow(it, canAct) {
 
 export function renderInbox(m) {
   if (m.error) return `<p class="hd-empty" role="alert">${esc(m.error)}</p>`;
-  if (!m.data) return '<p class="hd-empty" role="status">Loading the attention inbox...</p>';
+  if (!m.data) return skeleton('the attention inbox');
   const d = m.data;
   const items = Array.isArray(d.items) ? d.items : [];
   const quiet = Array.isArray(d.quiet_items) ? d.quiet_items : [];
@@ -116,7 +117,7 @@ function summaryLine(g) {
 
 export function renderProgress(m) {
   if (m.error) return `<p class="hd-empty" role="alert">${esc(m.error)}</p>`;
-  if (!m.data) return '<p class="hd-empty" role="status">Loading progress...</p>';
+  if (!m.data) return skeleton('progress');
   const d = m.data;
   const r = d.room || {};
   const tasks = Array.isArray(d.tasks) ? d.tasks : [];
@@ -144,7 +145,7 @@ function metric(label, v, render) {
 
 export function renderAnalytics(m) {
   if (m.error) return `<p class="hd-empty" role="alert">${esc(m.error)}</p>`;
-  if (!m.data) return '<p class="hd-empty" role="status">Loading analytics...</p>';
+  if (!m.data) return skeleton('analytics');
   const d = m.data;
   const mix = d.state_mix && !d.state_mix.suppressed ? Object.entries(d.state_mix).map(([k, n]) => `${esc(k)} ${Number(n) || 0}`).join(', ') : '';
   return `<section aria-label="Optimization analytics">

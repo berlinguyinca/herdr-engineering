@@ -221,6 +221,25 @@ test('mission activity GETs encode exact namespaces and forward cancellation', a
   assert.ok(calls.every(c => c.opts.method === 'GET' && c.opts.signal === signal));
 });
 
+test('mission delivery reads encode exact namespaces and forward cancellation', async () => {
+  const calls = [];
+  const client = new HerdrClient('', { fetchImpl: async (url, opts) => {
+    calls.push({url, opts}); return {ok: true, text: async () => '{}'};
+  }});
+  const signal = new AbortController().signal;
+  await client.missionTests('pi:MSN/1', {signal});
+  await client.missionBuilds('pi:MSN/1', {signal});
+  await client.missionReviews('pi:MSN/1', {signal});
+  await client.missionPulls('pi:MSN/1', {signal});
+  assert.deepEqual(calls.map(c => c.url), [
+    '/api/v1/missions/pi%3AMSN%2F1/tests',
+    '/api/v1/missions/pi%3AMSN%2F1/builds',
+    '/api/v1/missions/pi%3AMSN%2F1/reviews',
+    '/api/v1/missions/pi%3AMSN%2F1/pulls',
+  ]);
+  assert.ok(calls.every(c => c.opts.method === 'GET' && c.opts.signal === signal));
+});
+
 test('listMissions preserves status filtering while forwarding cancellation', async () => {
  const controller=new AbortController();let request;
  const client=new HerdrClient('',{fetchImpl:async(url,opts)=>{request={url,opts};return{ok:true,status:200,text:async()=>'{}'};}});

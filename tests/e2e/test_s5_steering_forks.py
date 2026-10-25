@@ -208,6 +208,37 @@ def test_delivery_is_pinned_to_the_reporting_key_and_the_nodes_instance(failed):
     assert [s["ack"]["outcome"] for s in shown if s["steering_id"] == sid] == ["applied"]
 
 
+def test_a_fork_carries_its_changed_requirement_and_the_owner_reads_the_current_fence(failed):
+    """T16 gaps A and B. The fork's `instruction` is bounded, redacted and delivered; the owner key can read the node's CURRENT
+    fence at apply time (the node is room scoped, so the key has no graph read of it), and only while it has a live request."""
+    w = failed
+    leaked = "sk-" + secrets.token_hex(12)                                    # built at run time
+    st = w.propose("bob", "fork", "attempt:a1", base_sha=H0, label="queue",
+                   instruction=f"retry through a queue, and never loop; key {leaked}")["steering"]
+    assert leaked not in json.dumps(st) and st["instruction"].startswith("retry through a queue")
+    assert w.propose("bob", "fork", "attempt:a1", base_sha=H0, label="x", instruction="y" * 5000).status == 400
+    assert w.propose("bob", "pause", "attempt:a1", instruction="no").status in (400, 409)         # pause never takes one
+    path = "/api/v1/steering/targets/attempt%3Aa1?instance_id=inst-a"
+    assert w.p.get(path, key="pi").status == 404                                # nothing confirmed yet: nothing to compare
+    assert w.confirm("alice", st, "attempt:a1").status == 200
+    item = w.pending(key="pi", instance="inst-a").body["steering"][0]
+    assert item["instruction"].startswith("retry through a queue") and leaked not in json.dumps(item)
+    assert item["instruction_trust"] == "untrusted_text_from_proposed_by"
+    cur = w.p.get(path, key="pi")
+    assert cur.status == 200 and cur.body["fence"] == item["target"]["fence"] == w.target("alice", "attempt:a1")["fence"]
+    assert cur.body["digest"] == H0                                             # head_sha is the node's gate digest here
+    assert w.p.get(path.replace("inst-a", "inst-b"), key="pi").status == 404          # wrong instance
+    for key in ("other", "rev", "viewer"):
+        assert w.p.get(path, key=key).status == 404                              # not the owner: the one 404
+    assert w.p.get("/api/v1/steering/targets/attempt%3Anope?instance_id=inst-a", key="pi").status == 404
+    w.node("pi", "attempt:a1", state="done", label="attempt 1", head_sha=H1, instance_id="inst-a")    # the node moves
+    moved = w.p.get(path, key="pi")
+    assert moved.status == 200 and moved.body["fence"] != item["target"]["fence"]      # the receiver's compare now refuses
+    ok = w.p.post(f"/api/v1/steering/{st['steering_id']}/ack?instance_id=inst-a", {"outcome": "refused"}, key="pi")
+    assert ok.status == 200
+    assert w.p.get(path, key="pi").status == 404                                 # acked: no live request, no read
+
+
 # ----------------------------------------------------------------------------- comparison (read side)
 def approach(w, n: int, head: str, paths: list[str], origin: str = "attempt:a1") -> str:
     aid = f"approach:fk-{n}"
@@ -267,8 +298,6 @@ def test_downstream_is_a_read_only_report_that_invalidates_nothing(failed):
     assert gate["node"]["state"] == "done"
 
 
-@pytest.mark.xfail(strict=True, reason="GAP: Herdr reports downstream evidence left on another head but never marks "
-                                       "a dependent gate/review stale or invalidated after a fork is promoted")
 def test_promoting_a_fork_marks_only_the_dependent_gate_stale(failed):
     w = failed
     w.node("pi", "task:A", state="done")

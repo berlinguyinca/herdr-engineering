@@ -1,0 +1,28 @@
+# User unit for `herdr-eng architecture serve`: claims Architecture Explorer analysis requests addressed to THIS host
+# from the control plane, analyses the local checkout in an isolated child and publishes only the derived graph.
+# A long-running loop (it backs off by itself while the control plane is down), so there is no timer.
+#
+# Not installed by anything (same as herdr-ci-fix-runner / herdr-ci-report-relay). On each analysing host:
+#   1. install herdr-eng so it is at ~/.local/bin/herdr-eng (scripts/install.sh), or edit ExecStart below;
+#   2. put an `agent` role API key in ~/.config/herdr-engineering/architecture-agent.key (mode 0600) and bind it to
+#      this host in control_plane.architecture.agent_hosts (with require_host_binding: true in production);
+#   3. copy deploy/control-plane/architecture-serve.example.yaml to ~/.config/herdr-engineering/architecture-serve.yaml
+#      and list the control-plane URL, the key file, this host's id and the checkouts it may analyse;
+#   4. cp herdr-architecture-serve.service ~/.config/systemd/user/ && systemctl --user daemon-reload
+#      && systemctl --user enable --now herdr-architecture-serve.service
+# All settings come from that YAML file; no environment variable or environment file is read.
+[Unit]
+Description=HerdR Architecture Explorer analysis worker (claims requests for this host)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+UMask=0077
+NoNewPrivileges=yes
+ExecStart=%h/.local/bin/herdr-eng architecture serve --config %h/.config/herdr-engineering/architecture-serve.yaml
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=default.target

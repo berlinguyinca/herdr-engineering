@@ -465,8 +465,11 @@ class TestGuestExecution:
             r = p.c("POST", f"/rooms/{cast.A}/workspaces/{link}/authorize", {"action": "terminal"}, user=who)
             assert r.status in (403, 404), (who, r.status, r.body)
         assert p.c("POST", f"/rooms/{cast.A}/workspaces/{link}/authorize", {"action": "status"}, user="dave").status == 403
-        # the link id is room-bound: B's member cannot use A's link
-        assert p.c("POST", f"/rooms/{cast.B}/workspaces/{link}/authorize", {"action": "status"}, user="erin").status == 404
+        # the link id is room-bound: B's member cannot use A's link. T16: for a caller who cannot manage links another room's id
+        # answers exactly like an unknown one (403, no existence oracle); it was a 404 before the oracle fix.
+        other = p.c("POST", f"/rooms/{cast.B}/workspaces/{link}/authorize", {"action": "status"}, user="erin")
+        unknown = p.c("POST", f"/rooms/{cast.B}/workspaces/grant_{'0' * 26}/authorize", {"action": "status"}, user="erin")
+        assert (other.status, other.body) == (unknown.status, unknown.body) == (403, {"error": "forbidden"})
 
     def test_forged_identity_fields_are_rejected_not_obeyed(self, cast):
         p = cast.plane

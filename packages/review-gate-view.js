@@ -1,6 +1,8 @@
 // Review gate page: every gated PR, the review queue, main-branch status and recent notices.
 // Every string from the API is untrusted; it is escaped and clipped before it reaches HTML.
 import {escapeHtml as esc} from './herdr-web-components/util.js';
+import {skeleton} from './motion.js';
+import {freshnessSources} from './freshness.js';
 
 const text=v=>typeof v==='string'?v:'';
 const short=(v,max=160)=>text(v).replace(/\s+/g,' ').trim().slice(0,max);
@@ -104,7 +106,11 @@ const styles=`<style>
 const errorText=e=>e&&e.name==='TimeoutError'?'request timed out':short(e&&e.body&&typeof e.body.error==='string'?e.body.error:e&&e.message,300)||'request failed';
 const SOURCES=[['prs','/api/v1/review-gate/prs'],['queue','/api/v1/review-gate/queue'],['notices','/api/v1/review-gate/notices'],['main','/api/v1/review-gate/main']];
 
-export function mountReviewGate(container,client,{intervalMs=5000,timers={setInterval,clearInterval},requestTimeoutMs=10000,timeout=ms=>AbortSignal.timeout(ms)}={}) {
+// The dashboard route owns the page head (title and freshness chip): it passes title:false and
+// freshness, a getter for that chip. The four reads are the chip's four sources.
+export function mountReviewGate(container,client,{intervalMs=5000,timers={setInterval,clearInterval},requestTimeoutMs=10000,timeout=ms=>AbortSignal.timeout(ms),title=true,freshness=()=>null}={}) {
+ const chip=freshnessSources(freshness);
+ const h1=title?'<h1>Review gate</h1>':'';
  const panels={};for(const [name] of SOURCES)panels[name]={data:null,at:0,error:''};
  const linked=(a,b)=>{if(typeof AbortSignal.any==='function')return AbortSignal.any([a,b]);const c=new AbortController();for(const x of [a,b]){if(x.aborted)c.abort(x.reason);else x.addEventListener('abort',()=>c.abort(x.reason),{once:true});}return c.signal;};
  let epoch=0;
@@ -113,18 +119,18 @@ export function mountReviewGate(container,client,{intervalMs=5000,timers={setInt
 
  // A panel keeps its last good data; a failed read only adds a visible warning.
  const warn=p=>!p.error?'':p.data!==null?`<p class="rg-warning" role="status">Showing data from ${esc(when(p.at))||'an earlier read'}: ${esc(p.error)}</p>`:`<p class="rg-warning" role="status">Could not load: ${esc(p.error)}</p>`;
- const panel=(title,p,body)=>`<section class="rg-panel"><h2>${esc(title)}</h2>${warn(p)}${p.data!==null?body:''}</section>`;
+ const panel=(title,p,body)=>`<section class="rg-panel"><h2>${esc(title)}</h2>${warn(p)}${p.data!==null?body:p.error?'':skeleton(title.toLowerCase(),{rows:2})}</section>`;
  let lastHtml=null;
  function write(html){if(html===lastHtml)return false;lastHtml=html;container.innerHTML=html;return true;}
  function draw() {
   if(disposed)return;
   const focus=typeof document!=='undefined'&&document.activeElement&&container.contains?.(document.activeElement)?document.activeElement.dataset:null;
-  if(disabled){write(`${styles}<h1>Review gate</h1><p class="rg-note" role="status">Review gate is not enabled on this control plane.</p>`);return;}
+  if(disabled){write(`${styles}${h1}<p class="rg-note" role="status">Review gate is not enabled on this control plane.</p>`);return;}
   const {prs,queue,notices,main}=panels;
   const rows=list(prs.data),jobs={};
   for(const j of list(queue.data&&queue.data.jobs))if(typeof j.key==='string')jobs[j.key]=j;
   const pr=rows.find(p=>p.key===selected);
-  const changed=write(`${styles}<h1>Review gate</h1>
+  const changed=write(`${styles}${h1}
    ${panel('Overview',queue,renderGateSummary(queue.data,rows))}
    ${panel('Main branch',main,renderMainStatus(main.data))}
    <div class="rg-layout">${panel('Pull requests',prs,renderPrTable(rows,jobs,selected))}<section class="rg-panel" aria-label="Pull request detail">${pr?renderPrDetail(pr,{busy:resuming.has(selected),error:resumeErrors.get(selected)||''}):renderPrDetail(null)}</section></div>
@@ -145,9 +151,11 @@ export function mountReviewGate(container,client,{intervalMs=5000,timers={setInt
   if(disposed||ctl.signal.aborted)return;
   results.forEach((r,i)=>{
    const p=panels[SOURCES[i][0]];
-   if(r.status==='fulfilled'){if(i===0&&gen!==epoch)return;p.data=r.value??(i===0||i===2?[]:{});p.at=Date.now();p.error='';}
-   else if(r.reason&&r.reason.status===404)disabled=true;
-   else p.error=errorText(r.reason);
+   const source=SOURCES[i][0];
+   if(r.status==='fulfilled'){chip.ok(source);if(i===0&&gen!==epoch)return;p.data=r.value??(i===0||i===2?[]:{});p.at=Date.now();p.error='';}
+   // A 404 means the gate is turned off here: the server answered as configured, not a failed read.
+   else if(r.reason&&r.reason.status===404){disabled=true;chip.ok(source);}
+   else{p.error=errorText(r.reason);chip.fail(source,`Review gate ${source}: ${p.error}`);}
   });
   for(const p of list(panels.prs.data))if(p.state!=='escalated')resumeErrors.delete(p.key);
   if(disabled)stop();

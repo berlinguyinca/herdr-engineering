@@ -815,7 +815,7 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin):
                 "created_at": p["created_at"], "created_epoch": p["created_epoch"],
                 "updated_at": p["created_at"], "seq": seq}
             if p.get("bounds"):          # T11: a bounded delegation is this same task plus its bounds
-                self._tasks[p["task_id"]].update(bounds=p["bounds"], version=1, steps=0, tokens=0, proposals=0)
+                self._tasks[p["task_id"]].update(bounds=p["bounds"], version=1, steps=0, tokens=0, proposals=0, turns=0)
                 if p.get("idempotency_key"):
                     self._idem[(p["actor_agent_id"] or "user:" + p["actor_user_id"], p["room_id"],
                                 "deleg:" + p["idempotency_key"])] = (p["fingerprint"], p["task_id"])
@@ -826,6 +826,8 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin):
                 tk.update(status=p["status"], result=p.get("result"), updated_at=p["created_at"])
                 if "bounds" in tk:
                     tk["version"] += 1
+                    if str(p.get("action") or "").startswith("delegation.") and p.get("action") != "delegation.budget":
+                        tk["turns"] = tk.get("turns", 0) + 1            # the delegate answered (accept, complete, ...)
                     if p.get("idempotency_key"):
                         self._idem[(p["actor_agent_id"], p["room_id"], "resp:" + p["idempotency_key"])] = (
                             p["fingerprint"], tk["version"])
@@ -833,7 +835,7 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin):
             tk = self._tasks.get(p["task_id"])
             if tk and "bounds" in tk:
                 tk.update(steps=tk["steps"] + 1, tokens=tk["tokens"] + p["tokens"], note=p.get("note"),
-                          updated_at=p["created_at"], version=tk["version"] + 1)
+                          updated_at=p["created_at"], version=tk["version"] + 1, turns=tk.get("turns", 0) + 1)
                 if p.get("idempotency_key"):
                     self._idem[(p["actor_agent_id"], p["room_id"], "resp:" + p["idempotency_key"])] = (
                         p["fingerprint"], tk["version"])
@@ -854,7 +856,8 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin):
                 prior.update(state="superseded", decided_at=p["created_at"], reason="superseded by " + pid)
             tk = self._tasks.get(p["task_id"])
             if tk and "bounds" in tk:
-                tk.update(proposals=tk["proposals"] + 1, steps=tk["steps"] + 1, version=tk["version"] + 1)
+                tk.update(proposals=tk["proposals"] + 1, steps=tk["steps"] + 1, version=tk["version"] + 1,
+                          turns=tk.get("turns", 0) + 1)
             if p.get("idempotency_key"):
                 self._idem[(p["actor_agent_id"], p["room_id"], "prop:" + p["idempotency_key"])] = (p["digest"], pid)
         elif t == "proposal_decided":
@@ -1844,6 +1847,14 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin):
             self.stats["policy_denied"] += 1
             raise CollabError(403, "forbidden")
         return agent
+
+    def tool_profile(self, pr: Principal) -> dict:
+        """What the MCP menu may show this agent: ``{"external": bool, "proposals": bool}``. Read-only; a missing or
+        revoked agent is treated as an unprivileged external (the smallest menu)."""
+        with self._lock:
+            agent = self._agents.get(pr.id) if pr.is_agent else None
+            ext = (agent or {}).get("external")
+            return {"external": bool(ext) or agent is None, "proposals": bool(ext and ext.get("proposals"))}
 
     def _external_load(self, room_id: str) -> int:
         """Live external agents plus open invites in one room (what the per-room cap counts)."""
@@ -3467,6 +3478,39 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin):
 
     FLOW_TASKS = 60
 
+    # -- architecture annotations: a room discusses a stable graph entity of an immutable snapshot
+    architecture = None          # set by ControlPlaneServer: the ArchitectureService that stores the links
+
+    def architecture_links(self, pr: Principal, room_id: str) -> dict:
+        """Members read the annotations; a guest sees only the notes, never which symbol or snapshot."""
+        with self._lock:
+            room, _ = self._authorize(pr, room_id, "read", "architecture.links")
+            if self.architecture is None or not self.architecture.enabled:
+                raise CollabError(404, "not found")
+            guest = not pr.is_agent and (self._member(room, pr.id) or {}).get("role") == "guest"
+        # Resolving the linked nodes may read graph artifacts: never under the collaboration-wide lock.
+        return self.architecture.room_links(room_id, redact=guest)
+
+    def link_architecture(self, pr: Principal, room_id: str, body: dict) -> dict:
+        """Annotate a node of a snapshot of one of the room's repositories (those of its linked missions'
+        sessions). Authorise under the lock, resolve the target without it, re-authorise and record."""
+        with self._lock:
+            self._authorize(pr, room_id, "post", "architecture.link")
+            if self.architecture is None or not self.architecture.enabled:
+                raise CollabError(404, "not found")
+            mission_ids = [mid for (rid, mid) in self._missions if rid == room_id]
+        from ..architecture.service import ArchitectureError
+        arch = self.architecture
+        try:
+            prepared = arch.prepare_room_link(body, arch.room_repositories(mission_ids))
+            with self._lock:
+                self._authorize(pr, room_id, "post", "architecture.link")   # membership may have changed meanwhile
+                return arch.record_room_link(room_id, prepared, author=pr.id)
+        except ArchitectureError as exc:
+            raise CollabError(exc.status if exc.status in (400, 404, 409, 413) else 400, str(exc)) from exc
+        except KeyError:
+            raise CollabError(404, "snapshot or node not found") from None
+
     def room_flow(self, pr: Principal, room_id: str) -> dict:
         """Who hands work to whom in this room, for the live flow view: people and agents as nodes,
         tasks aggregated into edges. A fabric session id (instance_id) is only ever shown to the
@@ -3691,16 +3735,24 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin):
 
     def authorize_workspace(self, pr: Principal, room_id: str, link_id: str, action: str) -> dict:
         """The one place that answers 'may this principal do `action` on the workspace linked to this room?'
-        action is status, tabs, panes or terminal. Fails closed: anything unknown is a 404, anything not
-        explicitly granted a 403, and both are audited. Allowed terminal use is audited too, at most once
+        action is status, tabs, panes or terminal. Fails closed: a principal who cannot manage links gets one
+        audited 403 for anything not explicitly granted (an unknown link and another room's link look the same);
+        only a link manager is told 404 for an unknown link. Every denial is audited. Allowed terminal use is audited too, at most once
         per principal and link per TERMINAL_AUDIT_EVERY seconds, and at once after any denial or change."""
         with self._lock:
             room, _ = self._authorize(pr, room_id, "read", "workspace.access")
+            if action not in LINK_GRANTS:
+                raise CollabError(400, "unknown workspace action")      # before the lookup: says nothing about the link
             link = self._links.get(link_id)
             if link is None or link["room_id"] != room_id:
-                raise CollabError(404, "not found")
-            if action not in LINK_GRANTS:
-                raise CollabError(400, "unknown workspace action")
+                if not self._is_link_manager(pr, room):
+                    # T16 gap D: a caller who cannot manage links gets the SAME answer for an id that does not
+                    # exist as for one that exists but grants them nothing (no existence oracle); both audited.
+                    self._audit_denied(pr, f"workspace.{action}", "no_workspace_grant", room_id=room_id,
+                                       resource_id=str(link_id)[:64], project_ids=[room["project_id"]])
+                    self.stats["policy_denied"] += 1
+                    raise CollabError(403, "forbidden")
+                raise CollabError(404, "not found")                     # an owner lists every link anyway
             gate = (pr.key, link_id)
             if action == "terminal":
                 ok = self._terminal_ok(pr, room, link)
@@ -4404,7 +4456,15 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin):
         return t, room, a
 
     def _task_usage(self, t: dict) -> dict:
-        return {"steps": t["steps"], "proposals": t["proposals"], "tokens_reported": t["tokens"]}
+        return {"steps": t["steps"], "proposals": t["proposals"], "tokens_reported": t["tokens"],
+                "turns": t.get("turns", 0)}
+
+    @staticmethod
+    def _turns_left(t: dict) -> bool:
+        """May the delegate send one more NON-FINAL answer? ``complete`` (the result), ``fail``, ``decline`` and ``cancel`` are
+        never refused for turns, so a delegate at the ceiling can still deliver its result."""
+        ceiling = t["bounds"]["budget"].get("max_turns")
+        return ceiling is None or t.get("turns", 0) + 1 <= ceiling      # a task stored before max_turns existed has no ceiling
 
     def _proposal_state(self, p: dict) -> str:
         if p["state"] == "quarantined" and self._now() - p["created_epoch"] >= dlg.PROPOSAL_TTL:
@@ -4559,6 +4619,8 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin):
                         idempotency_key=ikey, fingerprint=fp, visibility_scope="room", outcome="allowed",
                         project_ids=[x["project_id"]], resource_id=task_id)
             b = t["bounds"]["budget"]
+            if action not in ("decline", "cancel", "fail", "complete") and not self._turns_left(t):
+                return self._exhaust(pr, t, task_id, base)          # the turn ceiling: the task is closed
             if action == "progress":
                 if t["steps"] + 1 > b["max_steps"] or t["tokens"] + tokens > b["max_tokens"]:
                     return self._exhaust(pr, t, task_id, base)
@@ -4616,6 +4678,12 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin):
             self._audit_denied(pr, "delegation.proposal", "task_" + status, **audit)
             raise CollabError(409, f"the task is {status}: accept it first, and only while it is open", code="task_" + status)
         b = t["bounds"]["budget"]
+        if not self._turns_left(t):
+            # past the turn ceiling: the task is closed, exactly as an overrunning answer closes it (delegation_respond)
+            return self._exhaust(pr, t, task_id, dict(
+                project_id=x["project_id"], room_id=room_id, task_id=task_id, target_agent_id=pr.id,
+                idempotency_key=None, fingerprint=None, visibility_scope="room", outcome="allowed",
+                project_ids=[x["project_id"]], resource_id=task_id))
         if t["proposals"] >= b["max_proposals"] or t["steps"] + 1 > b["max_steps"]:
             self._audit_denied(pr, "delegation.proposal", "budget_exhausted", **audit)
             raise CollabError(409, "the task's proposal or step budget is used up", code="budget_exhausted")
@@ -5186,6 +5254,8 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin):
                         return 200, self.list_workspace_links(pr, rid)
                     if parts[2:] == ["missions"]:
                         return 200, self.list_room_missions(pr, rid)
+                    if parts[2:] == ["architecture-links"]:
+                        return 200, self.architecture_links(pr, rid)
                     if parts[2:] == ["state"]:
                         wait = _int(query, "wait", 0, 0, 10)
                         return 200, self.room_state(pr, rid, _int(query, "since", -1, -1),
@@ -5350,6 +5420,8 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin):
                         return 200, self.decide_proposal(pr, rid, parts[3], body)
                     if n == 5 and parts[2] == "tasks" and parts[4] == "cancel":
                         return 200, self.cancel_task(pr, rid, parts[3])
+                    if parts[2:] == ["architecture-links"]:
+                        return 201, self.link_architecture(pr, rid, body)
                     if parts[2:] == ["messages"]:
                         return self.post_message(pr, rid, body)
             raise CollabError(404, "not found")

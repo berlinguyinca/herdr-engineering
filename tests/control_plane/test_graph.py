@@ -592,6 +592,113 @@ def test_stale_flag_does_not_leak_a_hidden_edge():
     assert mine["c1"]["bindings"] == ["c1", "c2"]
 
 
+def _stale_by_gate(repo, who, subjects):
+    """{gate id: stale} for every validated edge into ``subjects``, as ``who`` sees them."""
+    out = {}
+    for sub in subjects:
+        for e in repo.graph.neighborhood(who, sub, depth=1)["edges"]:
+            if e["edge_type"] == "validated" and e["to_id"] == sub:
+                out[e["from_id"]] = e["stale"]
+    return out
+
+
+def _fork_world(f):
+    """Task A (and C, which depends on A) rest on attempt a1; task B is unrelated. Each has a gate validating it at c0."""
+    for t in ("A", "B", "C"):
+        f.edge("validated", f"gate:{t}", f"task:{t}", {"commit": "c0"})
+    f.edge("dependency", "task:A", "attempt:a1")
+    f.edge("dependency", "task:C", "task:A")                 # two hops from the forked attempt
+    f.node("approach:fk-1", head_sha="b" * 40)
+    f.edge("fork", "attempt:a1", "approach:fk-1")
+
+
+def test_promoting_a_fork_marks_only_the_dependent_evidence_stale():
+    repo, svc, f = make()
+    _fork_world(f)
+    subjects = ("task:A", "task:B", "task:C")
+    assert _stale_by_gate(repo, VIEWER, subjects) == {"gate:A": False, "gate:B": False, "gate:C": False}   # before the decision
+    f.edge("supersession", "approach:fk-1", "attempt:a1")                                                   # the decision
+    assert _stale_by_gate(repo, VIEWER, subjects) == {"gate:A": True, "gate:B": False, "gate:C": True}     # kept, flagged
+    # nothing was rewritten: the evidence edges are all still live
+    live = [e for sub in subjects for e in repo.graph.neighborhood(VIEWER, sub, depth=1)["edges"]
+            if e["edge_type"] == "validated" and not e["removed"]]
+    assert len(live) == 3
+    # evidence admitted AFTER the decision is current; the old edge stays stale
+    f.edge("validated", "gate:A2", "task:A", {"commit": "c0"})
+    assert _stale_by_gate(repo, VIEWER, subjects)["gate:A2"] is False
+    assert _stale_by_gate(repo, VIEWER, subjects)["gate:A"] is True
+
+
+def test_a_retry_or_a_decision_elsewhere_does_not_mark_evidence_stale():
+    repo, svc, f = make()
+    _fork_world(f)
+    f.edge("supersession", "attempt:a2", "attempt:a1")        # a plain retry replaces the attempt: not a fork decision
+    f.node("approach:other", head_sha="c" * 40)
+    f.node("attempt:zz")
+    f.edge("supersession", "approach:other", "attempt:zz")    # a fork decision about something nobody depends on
+    assert _stale_by_gate(repo, VIEWER, ("task:A", "task:B", "task:C")) == {"gate:A": False, "gate:B": False, "gate:C": False}
+    f.edge("supersession", "approach:fk-1", "attempt:a1")
+    f.send("edge.remove", {"edge_type": "supersession", "from_id": "approach:fk-1", "to_id": "attempt:a1", "reason": "undone"})
+    assert _stale_by_gate(repo, VIEWER, ("task:A", "task:B", "task:C")) == {"gate:A": False, "gate:B": False, "gate:C": False}
+
+
+def test_fork_decision_staleness_is_per_caller_and_leaks_nothing():
+    repo, svc, f = make()
+    _fork_world(f)
+    f.edge("supersession", "approach:fk-1", "attempt:a1", scope="private")       # only its writer may see the decision
+    assert _stale_by_gate(repo, VIEWER, ("task:A",)) == {"gate:A": False}
+    assert _stale_by_gate(repo, WRITER, ("task:A",)) == {"gate:A": True}
+    # a dependency link the caller cannot see does not carry staleness to it either
+    f.node("task:H")
+    f.edge("validated", "gate:H", "task:H", {"commit": "c0"})
+    f.edge("dependency", "task:H", "attempt:a1", scope="private")
+    f.edge("supersession", "approach:fk-2", "attempt:a1")
+    assert _stale_by_gate(repo, VIEWER, ("task:H",)) == {"gate:H": False}
+    assert _stale_by_gate(repo, WRITER, ("task:H",)) == {"gate:H": True}
+
+
+def test_fork_dependency_walk_is_bounded_and_survives_cycles():
+    repo, svc, f = make()
+    f.edge("validated", "gate:far", "task:t0", {"commit": "c0"})
+    for i in range(12):                                       # a chain longer than the walk, closed into a cycle
+        f.edge("dependency", f"task:t{i}", f"task:t{i + 1}")
+    f.edge("dependency", "task:t12", "task:t0")
+    f.edge("supersession", "approach:fk-1", "task:t12")
+    assert _stale_by_gate(repo, VIEWER, ("task:t0",)) == {"gate:far": False}     # beyond FORK_DEPENDENCY_DEPTH: not reached
+    f.edge("supersession", "approach:fk-1", "task:t4")
+    assert _stale_by_gate(repo, VIEWER, ("task:t0",)) == {"gate:far": True}
+
+
+OTHER = {"kind": "agent", "id": "key:other", "authenticated_by": "api_key"}
+
+
+def test_a_stranger_cannot_decide_and_the_winner_keeps_its_own_evidence():
+    repo, svc, f = make()
+    _fork_world(f)
+    with pytest.raises(PermissionError):                                          # not a writer of the winner: refused at write
+        f.edge("supersession", "approach:fk-1", "attempt:a1", principal=OTHER)
+    assert _stale_by_gate(repo, VIEWER, ("task:A", "task:B", "task:C")) == {"gate:A": False, "gate:B": False, "gate:C": False}
+    # the winner rests on the very node it replaces (its origin); its own evidence is not what it lost
+    f.edge("dependency", "approach:fk-1", "attempt:a1")
+    f.edge("validated", "gate:W", "approach:fk-1", {"commit": "b" * 40})
+    f.edge("supersession", "approach:fk-1", "attempt:a1")
+    got = _stale_by_gate(repo, VIEWER, ("task:A", "task:B", "approach:fk-1"))
+    assert got == {"gate:A": True, "gate:B": False, "gate:W": False}
+
+
+def test_fork_dependency_walk_finds_the_shortest_path_whatever_the_edge_order():
+    repo, svc, f = make()
+    f.edge("validated", "gate:x", "task:t0", {"commit": "c0"})
+    f.edge("dependency", "task:t0", "task:s1")                # the short way: t0 -> s1 -> t9
+    chain = ["task:t0", "task:c1", "task:c2", "task:c3", "task:c4", "task:c5", "task:t9"]
+    for a, b in zip(chain, chain[1:]):                          # the long way: six hops to t9
+        f.edge("dependency", a, b)
+    f.edge("dependency", "task:s1", "task:t9")
+    f.edge("dependency", "task:t9", "task:t10")
+    f.edge("supersession", "approach:fk-1", "task:t10")        # reached only through the short way (3 hops)
+    assert _stale_by_gate(repo, VIEWER, ("task:t0",)) == {"gate:x": True}
+
+
 def test_wildcard_remove_is_commutative_and_does_not_leak_reason():
     repo, svc, clock = make_clocked()
     f = Feed(svc)

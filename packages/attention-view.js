@@ -3,6 +3,8 @@
 // Remote text is untrusted: every dynamic string is escaped and every href is an internal hash link.
 import { escapeHtml as esc } from './herdr-web-components/util.js';
 import { formatDuration } from './herdr-web-components/format.js';
+import { skeleton } from './motion.js';
+import { freshnessSources } from './freshness.js';
 
 const SEVERITIES = ['critical', 'warning', 'info'];
 const KINDS = {
@@ -101,13 +103,12 @@ const STYLES = `<style>
  * Pure render of one model: {body, error, loading, busy:Set, filters:{kind,severity}, message}.
  * "No items" appears only when the answer is complete; a partial answer says which sources are unknown.
  */
-export function renderAttention(model = {}, now = Date.now()) {
+export function renderAttention(model = {}, now = Date.now(), { head = '<h1 tabindex="-1">Attention</h1>' } = {}) {
   const { body, error, loading, filters = {}, message } = model;
   const busy = model.busy instanceof Set ? model.busy : new Set();
-  const head = '<h1 tabindex="-1">Attention</h1>';
   if (!body) {
     if (error) return `${STYLES}${head}<herdr-error message="${esc(error)}"></herdr-error><p class="at-status" role="status">Could not load the attention inbox; retrying automatically.</p>`;
-    return `${STYLES}${head}<p class="at-status" role="status">${loading === false ? '' : 'Loading attention…'}</p>`;
+    return `${STYLES}${head}${loading === false ? '<p class="at-status" role="status"></p>' : skeleton('attention', { rows: 2, height: 64 })}`;
   }
   const items = records(body.items).filter((i) => (!filters.kind || i.kind === filters.kind)
     && (!filters.severity || i.severity === filters.severity));
@@ -138,17 +139,21 @@ export function renderAttention(model = {}, now = Date.now()) {
 export function mountAttention(container, client, { onBody, notifier } = {}) {
   const model = { body: null, error: '', loading: true, busy: new Set(), filters: {}, message: '' };
   let disposed = false, timer = null, controller = null, last = '';
+  // The head and its freshness chip are written once; every draw replaces only the body below them.
+  container.innerHTML = '<div class="hd-live-head"><h1 tabindex="-1">Attention</h1><herdr-freshness interval="5000"></herdr-freshness></div><div data-attention-body></div>';
+  const bodyEl = container.querySelector('[data-attention-body]');
+  const chip = freshnessSources(() => container.querySelector('herdr-freshness'));
   function draw() {
     if (disposed) return;
     model.notify = notifier ? { status: notifier.status(), policy: model.body?.notify } : null;
-    const html = renderAttention(model, Date.now());
+    const html = renderAttention(model, Date.now(), { head: '' });
     const signature = html.replace(/(<span data-attention-stamp="[^"]*">)[^<]*(<\/span>)/g, '$1$2');
     if (signature === last) return;
     last = signature;
     const focused = container.contains(document.activeElement) ? document.activeElement : null;
     const keep = focused?.dataset ? { key: focused.dataset.key, kind: ['ack', 'clear', 'snooze'].find((k) => k in focused.dataset), filter: focused.dataset.filter } : null;
     const openGroups = [...container.querySelectorAll('details[open] > summary')].map((s) => s.textContent.replace(/\s*\(\d+\)$/, ''));
-    container.innerHTML = html;
+    bodyEl.innerHTML = html;
     container.querySelectorAll('details > summary').forEach((s) => {
       if (openGroups.includes(s.textContent.replace(/\s*\(\d+\)$/, ''))) s.parentElement.open = true;
     });
@@ -167,11 +172,14 @@ export function mountAttention(container, client, { onBody, notifier } = {}) {
       if (disposed) return;
       if (!body || !Array.isArray(body.items)) throw new Error('Invalid response');
       model.body = body; model.error = ''; model.loading = false;
+      chip.ok('attention');
       onBody?.(body);
     } catch (err) {
       if (disposed || controller?.signal.aborted) return;
       model.error = err?.status === 404 ? 'The attention inbox is turned off on this server.' : (err?.message || 'request failed');
       model.loading = false;
+      // A server with the inbox turned off answered as configured: that is not a failed refresh.
+      if (err?.status === 404) chip.ok('attention'); else chip.fail('attention', `Attention inbox: ${model.error}`);
     } finally {
       controller = null;
       draw();

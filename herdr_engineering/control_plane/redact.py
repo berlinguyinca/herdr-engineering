@@ -18,8 +18,14 @@ _PATTERNS = [
     # character) or a URL-encoded "=" ("api_key%3Dsk-..."), which CI logs routinely contain. Ids such as "task-sk-ab" are
     # far shorter than 20 characters after "sk-" and stay untouched.
     re.compile(r"sk-[A-Za-z0-9_\-]{20,}"),
-    # AWS access key id
-    re.compile(r"AKIA[0-9A-Z]{16}"),
+    # AWS access key id (and the temporary ASIA form), wherever it sits
+    re.compile(r"(?:AKIA|ASIA)[0-9A-Z]{16}"),
+    # AWS secret access key: 40 base64 characters after an aws secret label
+    re.compile(r"(?i)aws[_\- ]?secret[_\- ]?(?:access[_\- ]?)?key[\"']?\s*[:=]?\s*[\"']?[A-Za-z0-9/+=]{30,}"),
+    # GitHub tokens (classic, fine-grained, OAuth, app, refresh) and Slack tokens
+    re.compile(r"(?<![A-Za-z0-9])gh[pousr]_[A-Za-z0-9]{20,}"),
+    re.compile(r"(?<![A-Za-z0-9])github_pat_[A-Za-z0-9_]{20,}"),
+    re.compile(r"(?<![A-Za-z0-9])xox[abprse]-[A-Za-z0-9-]{10,}"),
     # generic bearer tokens / JWTs (three base64url dot-separated parts)
     re.compile(r"Bearer\s+[A-Za-z0-9\-._~+/]+=*", re.IGNORECASE),
     re.compile(r"eyJ[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]+"),

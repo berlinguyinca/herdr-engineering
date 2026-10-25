@@ -31,7 +31,7 @@ test('freshness chip goes amber past 2x interval, red after a failed touch',asyn
  assert.match((await st()).text,/updated 5s ago/);
  await page.clock.runFor(6000);
  const stale=await st();
- assert.equal(stale.state,'stale');assert.match(stale.text,/updated 11s ago/);
+ assert.equal(stale.state,'stale');assert.equal(stale.text,'stale · updated 11s ago','a stale chip never reads "live"');
  const amber=await page.evaluate(()=>getComputedStyle(f).color);
  await page.evaluate(()=>f.touch(false,'x'));
  const err=await st();
@@ -39,6 +39,19 @@ test('freshness chip goes amber past 2x interval, red after a failed touch',asyn
  assert.notEqual(await page.evaluate(()=>getComputedStyle(f).color),amber);
  await page.evaluate(()=>f.touch(true));
  assert.equal((await st()).state,'fresh');
+}));
+
+test('a chip that was never updated waits instead of claiming live',async()=>withPage(async(page,base)=>{
+ await open(page,base);
+ await page.evaluate(()=>{document.body.innerHTML='<herdr-freshness id="f" interval="5000"></herdr-freshness>';window.f=document.getElementById('f');});
+ const st=()=>page.evaluate(()=>({state:f.dataset.state,text:f.textContent}));
+ assert.deepEqual(await st(),{state:'fresh',text:'waiting for first update'});
+ await page.evaluate(()=>f.touch(false,'down'));
+ assert.deepEqual(await st(),{state:'error',text:'error · down · not yet updated'});
+ await page.evaluate(()=>f.touch(true));
+ assert.deepEqual(await st(),{state:'fresh',text:'live · updated 0s ago'});
+ await page.evaluate(()=>f.setDetail('partial',{warn:true}));
+ assert.deepEqual(await st(),{state:'stale',text:'stale · updated 0s ago · partial'},'a warned chip never reads "live"');
 }));
 
 test('freshness does not rewrite the DOM when text is unchanged',async()=>withPage(async(page,base)=>{
@@ -150,6 +163,7 @@ test('a quiet fleet keeps the chip green while stream keepalives arrive; silence
  for(let i=0;i<6;i++){await page.clock.runFor(10000);await page.evaluate(()=>contact(true));}
  assert.equal(await state(),'fresh','nothing changed, the stream is alive: not stale');
  assert.match(await page.evaluate(()=>f.textContent),/updated (5\ds|1m) ago/,'the age keeps counting; only the colour stays green');
+ assert.match(await page.evaluate(()=>f.textContent),/^live · /,'a quiet fleet with a healthy stream still reads "live", not "stale"');
  await page.clock.runFor(26000);
  assert.equal(await state(),'stale','the stream fell silent');
  await page.evaluate(()=>contact(true));await page.clock.runFor(1000);

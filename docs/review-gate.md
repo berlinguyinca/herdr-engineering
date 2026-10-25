@@ -494,6 +494,11 @@ but not read by the gate; the pipeline passes the path itself.
   reviewer or notify settings, or the App.
 - **Every new head SHA is re-reviewed.** Approval does not carry over to a new
   SHA, even a rebase or amend with an identical diff.
+- **Independent of the review-quorum re-review ask.** The gate queues its own
+  review jobs; it never reads the `review_request` ledger behind
+  `POST .../review-quorum/rereview` (which only records an ask for AutoSpec),
+  and gate worker keys are refused there. A PR covered by both can be
+  re-reviewed twice for one head (see `docs/contracts/lineage-events.md`).
 - **Reviewer pool size is whatever you start.** Nothing scales workers with
   queue depth yet.
 - **Same-model exclusion uses the original author's model.** A fixer started

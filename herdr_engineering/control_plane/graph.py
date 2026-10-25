@@ -77,6 +77,10 @@ EDGE_TYPES = frozenset(
 CROSS_LINK = "cross_link"
 CONSULT_PREFIX = "thread:hcn-consult."
 BOUND_EDGE_TYPES = frozenset({"reviewed", "validated"})
+# How far a fork decision reaches through `dependency` edges when marking evidence stale (bounded, per read).
+FORK_DEPENDENCY_DEPTH = 6
+FORK_DEPENDENCY_NODES = 200
+FORK_SCAN_BUDGET = 5000                 # edge keys examined per subject
 LINEAGE_EVENT_TYPES = ("node.upsert", "node.state", "edge.add", "edge.remove")
 # COMMONS kinds are shared identities that several independent emitters legitimately
 # mention (a commit, a PR, an issue, a CI run, a published artifact): anyone may create
@@ -1204,7 +1208,49 @@ class GraphProjection:
                     return True
                 if add[2] < my_add[2] or steps >= 16:
                     break
-        return False
+        return self._behind_promoted_fork(edge, my_add, principal, ctx)
+
+    def _behind_promoted_fork(self, edge: _Edge, my_add: tuple, principal: Any, ctx: dict) -> bool:
+        """Does ``edge``'s evidence rest on work a fork decision replaced AFTER the evidence was admitted?
+
+        A fork decision is a ``supersession`` edge from an ``approach:`` node (winner) to the node it replaced
+        (T13). Evidence (``reviewed`` / ``validated``) about a subject that is, or transitively depends on
+        (``dependency``: dependent -> prerequisite), a replaced node described work that no longer stands, so it is
+        stale. Only that dependency closure is affected: a gate about an unrelated subject is untouched, and
+        evidence admitted after the decision is current. Plain retries (a supersession whose winner is not an
+        approach) keep their old behaviour. Derived per caller over the edges the caller can see; nothing is written.
+        """
+        ck = ("\0fork-decision", edge.to_id)
+        if ck not in ctx:
+            # Breadth-first, so every node is first reached at its minimum depth; the number of keys looked at is
+            # budgeted (a hub with thousands of edges must not make one read expensive).
+            depth_of, todo, budget = {edge.to_id: 0}, deque([edge.to_id]), FORK_SCAN_BUDGET
+            decisions = []                      # (winner, loser, add)
+            while todo and budget > 0:
+                nid = todo.popleft()
+                for key in self._in.get(nid, ()):
+                    budget -= 1
+                    if key[0] != "supersession" or not key[1].startswith("approach:"):
+                        continue
+                    e = self._edges[key]
+                    # who may write the edge is the graph's own rule: only a writer of the winner (or an operator)
+                    if self._live(e) and not self._is_removed(e) and self._edge_visible(principal, e):
+                        decisions.append((key[1], nid, e.adds.best()))
+                if depth_of[nid] >= FORK_DEPENDENCY_DEPTH:
+                    continue
+                for key in self._out.get(nid, ()):
+                    budget -= 1
+                    if key[0] != "dependency" or key[2] in depth_of or len(depth_of) >= FORK_DEPENDENCY_NODES:
+                        continue
+                    e = self._edges[key]
+                    if self._live(e) and not self._is_removed(e) and self._edge_visible(principal, e):
+                        depth_of[key[2]] = depth_of[nid] + 1
+                        todo.append(key[2])
+            # a winner that is itself part of the subject's closure is what the subject rests on, not what it lost
+            adds = [add for winner, _, add in decisions if winner not in depth_of]
+            ctx[ck] = max(adds, key=lambda t: t[2]) if adds else None
+        best = ctx[ck]
+        return best is not None and _after(best, my_add)
 
     # ------------------------------------------------------------ renders
     def _node_view(self, node: _Node, principal: Any = None, internal: bool = False) -> dict:
