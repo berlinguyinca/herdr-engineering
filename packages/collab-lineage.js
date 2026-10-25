@@ -98,6 +98,14 @@ export function mergePages(pages) {
   }
   return { nodes: [...nodes.values()], edges: [...edges.values()] };
 }
+// Why the merged graph is incomplete, across every page loaded so far. One page leaving out links (an edge or byte budget) keeps
+// the merged view incomplete even when a later page is whole, so the reasons are OR-ed: a scan budget (more nodes may exist) wins,
+// otherwise the most recent reason any page gave; null only when no page was truncated.
+export function pagesTruncated(pages) {
+  const reasons = (pages || []).map((p) => (p && p.truncated_reason) || null).filter(Boolean);
+  if (!reasons.length) return null;
+  return reasons.includes('scan_budget') ? 'scan_budget' : reasons[reasons.length - 1];
+}
 export const edgeKey = (e) => `${e.edge_type}\u0000${e.from_id}\u0000${e.to_id}\u0000${bindingText(e.binding)}`;
 export const bindingText = (b) => (b && typeof b === 'object' ? Object.entries(b).map(([k, v]) => `${k}=${v}`).join(',') : '');
 
@@ -285,7 +293,11 @@ export function renderGraphSvg(graph, layout, { sel = null, focus = null, match 
 
 // The same data as plain tables (the text alternative; also the view for very large graphs).
 export function renderGraphTable(graph, { sel = null } = {}) {
-  const deg = layoutGraph({ nodes: graph.nodes.slice(0, MAX_TABLE_ROWS), edges: graph.edges }).degree;
+  const deg = new Map(graph.nodes.slice(0, MAX_TABLE_ROWS).map((n) => [n.id, { in: 0, out: 0 }]));       // degrees only: no layout needed for a table
+  for (const e of graph.edges) {
+    if (deg.has(e.from_id)) deg.get(e.from_id).out += 1;
+    if (deg.has(e.to_id)) deg.get(e.to_id).in += 1;
+  }
   const nrows = graph.nodes.slice(0, MAX_TABLE_ROWS).map((n) => {
     const look = stateLook(n.state);
     const d = deg.get(n.id) || { in: 0, out: 0 };
@@ -359,6 +371,8 @@ export function focusKey(el) {
   if (wf !== null) return wf === 'action' ? `wbf:action:${attr(el, 'value')}` : `wbf:${wf}:`;
   const wa = attr(el, 'data-wb-act');
   if (wa !== null) return `wba:${wa}:${attr(el, 'data-wb-id') || ''}`;
+  // a form's submit button (Post comment, Propose, Save edit) is rebuilt with the form after the request completes
+  if (attr(el, 'type') === 'submit' && el.closest) { const form = el.closest('[data-wb-form]'); if (form) return `wbs:${attr(form, 'data-wb-form')}:${attr(form, 'data-wb-id') || ''}`; }
   return null;
 }
 export function focusSelector(key) {
@@ -375,9 +389,25 @@ export function focusSelector(key) {
     case 'retry': return '[data-retry]';
     case 'filter': { const [name, ...val] = rest; return val.join(':') ? `[data-filter="${q(name)}"][value="${q(val.join(':'))}"]` : `[data-filter="${q(name)}"]`; }
     case 'wbf': { const [name, ...val] = rest; return val.join(':') ? `[data-wb-field="${q(name)}"][value="${q(val.join(':'))}"]` : `[data-wb-field="${q(name)}"]`; }
+    case 'wbs': { const [form, ...id] = rest; return `[data-wb-form="${q(form)}"]${id.join(':') ? `[data-wb-id="${q(id.join(':'))}"]` : ''} button[type="submit"]`; }
     case 'wba': { const [act, ...id] = rest; return id.join(':') ? `[data-wb-act="${q(act)}"][data-wb-id="${q(id.join(':'))}"]` : `[data-wb-act="${q(act)}"]`; }
     default: return null;
   }
+}
+
+// When the focused control is replaced by a different one (a button that opens a step that has its own buttons), focus goes to the
+// logical successor, not to the container: "Review and confirm" opens the confirm step, so focus lands on "Confirm and send";
+// "Cancel" closes it, so focus returns to "Review and confirm". Returns selectors to try in order; none means "park on the panel".
+export function focusSuccessor(key) {
+  const q = (v) => String(v).replace(/["\\]/g, '\\$&');
+  const [kind, act, ...id] = String(key || '').split(':');
+  const ident = id.join(':');
+  if (kind !== 'wba') return [];
+  if (act === 'confirm') return [ident ? `[data-wb-act="confirm-go"][data-wb-id="${q(ident)}"]` : '', '[data-wb-act="confirm-go"]'].filter(Boolean);
+  if (act === 'confirm-cancel') return ['[data-wb-act="confirm"]'];
+  // the request was sent (or declined): stay on that request, on its remaining action if it has one, else on the row itself
+  if ((act === 'confirm-go' || act === 'reject') && ident) return [`[data-wb-act="reject"][data-wb-id="${q(ident)}"]`, `[data-wb-steer="${q(ident)}"]`];
+  return [];
 }
 
 // Where a replay control moves to (pure; the caller fetches). Returns a step number or 'live'.
@@ -564,10 +594,21 @@ export function renderLineage(m) {
   }
   if (!a.nodes.length && !m.timeline) return `${renderReplay(m.asOf, { busy: m.busy, queued: m.queued })}${notice(m)}<div class="hd-empty">No lineage is shown for this room yet. Lineage appears only from recorded events you are allowed to see.</div>`;
   const view = m.filtered;
-  const layout = layoutGraph(view);
+  // Above the draw cap there is no SVG (renderGraphSvg answers with a message), so do not lay out thousands of nodes on every redraw.
+  const layout = view.nodes.length <= MAX_RENDER_NODES ? layoutGraph(view) : null;
   const graphPane = m.mode === 'table' ? renderGraphTable(view, { sel: m.sel })
     : `<div class="cx-scroll lin-scroll" role="region" tabindex="0" aria-label="Lineage graph">${renderGraphSvg(view, layout, { sel: m.sel, focus: m.focus, match: view.match })}</div>`;
-  const trunc = m.graphTruncated ? `<p class="cx-msg" role="status">Showing ${a.nodes.length} of ${m.total} nodes (${esc(m.graphTruncated)}). <button type="button" class="hd-btn hd-btn--ghost hd-btn--sm" data-more="1">Load more</button></p>` : '';
+  // `graphMore === false` is the last page the server will give. What the server says it ran out of decides what is missing:
+  // `scan_budget` means it stopped reading NODES (more may exist); any other reason with no next page (`edge_budget`,
+  // `limit` on edges, `response_bytes`) means every node was returned but some LINKS were left out. Silence made a cut-off
+  // graph look complete (T16 large-graph gate); a wrong claim ("more nodes") for an edges-only cut would mislead as well.
+  const trunc = m.graphTruncated
+    ? (m.graphMore === false
+      ? (m.graphTruncated === 'scan_budget'
+        ? `<p class="cx-msg" role="status">Showing ${a.nodes.length} nodes (${esc(m.graphTruncated)}). The server stopped reading here, so more nodes may exist that this view cannot load.</p>`
+        : `<p class="cx-msg" role="status">Showing all ${a.nodes.length} nodes, but the server left out some links (${esc(m.graphTruncated)}), so the links drawn may be incomplete.</p>`)
+      : `<p class="cx-msg" role="status">Showing ${a.nodes.length} of ${m.total} nodes (${esc(m.graphTruncated)}). <button type="button" class="hd-btn hd-btn--ghost hd-btn--sm" data-more="1">Load more</button></p>`)
+    : '';
   const gantt = m.timeline ? buildGantt(m.timeline, { clock: m.clock, types: m.filters.types }) : null;
   const tab = (k, l) => `<button type="button" role="tab" class="cx-stab" data-view="${k}" aria-selected="${m.view === k}" tabindex="${m.view === k ? 0 : -1}">${l}</button>`;
   const body = m.view === 'gantt'

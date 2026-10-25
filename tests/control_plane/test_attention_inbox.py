@@ -509,3 +509,62 @@ def test_disabled_attention_answers_404():
 def test_attention_does_not_exist_on_the_public_listener(stack, method, path):
     status, _ = stack.pub.call(method, path, {"key": "k", "fingerprint": "f"} if method == "POST" else None)
     assert status == 404
+
+
+def _fix_world(**kw):
+    from herdr_engineering.control_plane.ci_fix import CIFixService, ci_fix_config
+    clock = [NOW]
+    repo = ControlPlaneRepo(now=lambda: clock[0], sink=_Sink())
+    service = CIFixService(repo, ci_fix_config({"enabled": True, "hosts": ["bender"]}))
+    inbox = AttentionInbox(repo, ci_snapshot=lambda: {"status": "ok", "pipelines": {}}, ci_fix=service,
+                           config=kw.get("config"), now=lambda: clock[0])
+    return repo, service, inbox, clock
+
+
+def _fix(repo, number, state, *, reason=None, result=None):
+    fid = f"cifix_{number:032x}"
+    first = {"repository": "org/app", "number": number, "run": f"org/app#{number}", "revision": "a" * 40,
+             "ci_url": "https://ci.example/1", "operation_id": f"op{number}", "request": {}, "context": {}}
+    repo.record_event("ci_fix", fid, "CIFixRequested", first)
+    repo.record_event("ci_fix", fid, "CIFixStateChanged", {"state": state, **({"reason": reason} if reason else {})})
+    if result is not None:
+        repo.record_event("ci_fix", fid, "CIFixResult", result)
+    return fid
+
+
+def test_ci_fix_outcomes_become_items_and_active_runs_do_not():
+    repo, _, inbox, _ = _fix_world()
+    _fix(repo, 1, "running")
+    _fix(repo, 2, "failed", reason="sandbox refused the push")
+    _fix(repo, 3, "succeeded", result={"pr_url": "https://github.com/org/app/pull/9", "flags": ["touched CI config"]})
+    _fix(repo, 4, "succeeded", result={"pr_url": "https://github.com/org/app/pull/10"})
+    _fix(repo, 5, "no_change")
+    assert len(_by_kind(inbox)["ci_fix"]) == 4          # the running one is not an item
+    failed = next(i for i in _by_kind(inbox)["ci_fix"] if "failed" in i["title"])
+    assert failed["severity"] == "warning" and "sandbox refused" in failed["detail"] and failed["href"] == "#/ci"
+    drafts = {i["detail"]: i["severity"] for i in _by_kind(inbox)["ci_fix"] if "draft PR" in i["title"]}
+    assert sorted(drafts.values()) == ["info", "warning"] and any("touched CI config" in d for d in drafts)
+    assert all(i["href"].startswith("#/") for i in _by_kind(inbox)["ci_fix"])
+
+
+def test_old_ci_fix_runs_age_out_and_acknowledge_holds():
+    repo, _, inbox, clock = _fix_world(config={"thresholds": {"failed_window_hours": 2}})
+    _fix(repo, 2, "failed", reason="x")
+    (item,) = _by_kind(inbox)["ci_fix"]
+    inbox.acknowledge(item["key"], item["fingerprint"])
+    assert _by_kind(inbox)["ci_fix"][0]["state"] == "acknowledged"
+    clock[0] += 3 * HOUR
+    assert "ci_fix" not in _by_kind(inbox)
+
+
+def test_without_the_ci_fix_service_there_is_no_source_and_a_broken_one_is_partial():
+    _, inbox, _, _ = _world()
+    assert "ci_fix" not in inbox.sources
+    _, service, inbox2, _ = _fix_world()
+
+    def boom(**k):
+        raise RuntimeError("gone")
+
+    service.list = boom
+    body = inbox2.snapshot()
+    assert body["unavailable"] == ["ci_fix"] and body["items"][0]["key"] == "source:ci_fix"

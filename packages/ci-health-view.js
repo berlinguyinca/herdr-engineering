@@ -1,5 +1,6 @@
 import {escapeHtml as esc} from './herdr-web-components/util.js';
 import {ciHealthModel,renderCiHeatmap,renderCiTree,ciHealthStyles} from './ci-health.js';
+import {snapshotText,animateChanges} from './motion.js';
 
 const modes=['hours','runs','7','14','30'];
 const scopes=['default','pr','all'];
@@ -95,6 +96,9 @@ export function mountCiHealth(host,client,{onSelectRun=()=>{},onSelectStep=()=>{
     const groups=new Map();for(const task of rows(selected.tasks)){const key=String(task.workflow ?? task.workflow_id ?? 'Steps');if(!groups.has(key))groups.set(key,[]);groups.get(key).push(task);}
     return `<section class="ci-health-workflows" aria-label="Selected run workflows"><h3>Run #${esc(String(selected.run_number ?? selected.number ?? ''))} · workflows and steps</h3>${[...groups].map(([name,tasks])=>`<details data-health-disclosure="${esc(JSON.stringify(['workflow',selectedKey,name]))}"><summary>${esc(name)}</summary>${tasks.map(task=>`<button type="button" class="hd-btn" data-health-step="${esc(String(task.id ?? ''))}">${esc(task.name || `Step ${task.id ?? '?'}`)} · ${esc(task.state || task.status || 'Unknown')}</button>`).join('')}</details>`).join('')}</section>`;
   }
+  const CELL='[data-health-project][data-health-bucket]';
+  const cellKey=node=>`${node.dataset.healthProject}|${node.dataset.healthBucket}`;
+  let shownCells=null;
   function draw(preserve=true) {
     if(disposed)return;
     if(preserve)rememberDisclosures();
@@ -107,7 +111,12 @@ export function mountCiHealth(host,client,{onSelectRun=()=>{},onSelectStep=()=>{
     const unavailable=history?.available===false;
     const hideHistory=unavailable&&!rows(history?.repos).length;
     el('[data-health-status]').textContent=error || (!history?'Loading CI history…':unavailable?ciHealthUnavailable(history,history.missingClient):`${history.stale?'Stale history · ':''}${history.refreshing?'Refreshing history · ':''}${model.partial?'Partial history: coverage is incomplete. ':''}${state.mode==='runs'?'Last 24 matching runs per project; no date cutoff. ':'UTC timestamps. '}${contextCoverageUnknown()?'Context associations are unavailable for some runs; counts and coverage for this route are incomplete. ':context.mission || context.session?'Counts are limited to the current route context. ':''}Only completed success and failure outcomes contribute to pass/fail totals.`);
+    // The heatmap is rebuilt with innerHTML; a cell whose outcome symbol changed (same project and
+    // bucket) flashes. A mode, scope or filter change re-keys the buckets, so it never flashes.
+    const cellsBefore=nextOrderSignature===shownCells?snapshotText(el('[data-health-map]'),CELL,cellKey):null;
     replace(el('[data-health-map]'),hideHistory?'':renderCiHeatmap(model));
+    animateChanges(el('[data-health-map]'),CELL,cellsBefore,cellKey,{count:false});
+    shownCells=nextOrderSignature;
     replace(el('[data-health-tree]'),hideHistory?'':renderCiTree(model,{selectedRunKey:selectedKey,expanded,limits:treeLimits})+selectedSteps());
     const selectionHtml=selection?`${!model.projects.some(project=>project.key===selection.projectKey && project.cells.some(cell=>cell.key===selection.bucketKey))?'Selected run or bucket is no longer present in this window.':'Selected project and time bucket · latest labels apply within this selection.'} <button type="button" class="hd-btn" data-health-clear>Clear selection</button>`:'';
     const chip=el('[data-health-selection]');if(chip.innerHTML!==selectionHtml)chip.innerHTML=selectionHtml;

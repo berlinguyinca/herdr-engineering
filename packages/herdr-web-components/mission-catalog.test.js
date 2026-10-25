@@ -75,3 +75,29 @@ test('stage-based terminal outcomes display the terminal stage and freeze old wa
  const entry=missionEntries([p],[],now,now+10000)[0];
  assert.match(compactMissionRow(entry,now+10000),/1m 0s<\/span> at last snapshot/);
 });
+
+test('stored outcomes add a result chip, last event, and result and repository filters to catalog rows', () => {
+  const recorded = [{ mission_id: 'a', title: 'Alpha', status: 'complete', stage: 'complete', updated_at: '2026-10-20T10:00:00Z' },
+    { mission_id: 'b', title: 'Beta', status: 'failed', stage: 'failed', updated_at: '2026-10-20T10:00:00Z' },
+    { mission_id: 'c', title: 'Gamma <img src=x>', status: 'implementation', stage: 'implementation', updated_at: '2026-10-20T10:00:00Z' }];
+  const outcomes = {
+    a: { result: 'succeeded', duration_s: 7200, agent_count: 3, repository: 'org/app', last_event: 'PR #214 merged' },
+    b: { result: 'failed', duration_s: null, agent_count: null, repository: 'org/other', last_event: 'Ended: failed' },
+    c: { result: 'weird', duration_s: 5, agent_count: 1, repository: 'org/app', last_event: '<img src=x onerror=1>' },
+  };
+  const entries = missionEntries([], recorded, Date.now(), Date.now(), outcomes);
+  const byKey = Object.fromEntries(entries.map((e) => [e.key, e]));
+  assert.equal(byKey.a.summary.result, 'succeeded');
+  assert.deepEqual(filterMissions(entries, { result: 'succeeded' }).map((e) => e.key), ['a']);
+  assert.deepEqual(filterMissions(entries, { repository: 'org/app' }).map((e) => e.key).sort(), ['a', 'c']);
+  assert.deepEqual(filterMissions(entries, { result: 'failed', repository: 'org/app' }), []);
+  assert.deepEqual(filterMissions(entries, { search: 'merged' }).map((e) => e.key), ['a']);
+  const row = compactMissionRow(byKey.a);
+  assert.match(row, /data-result="succeeded"><strong>Succeeded<\/strong> · 2h 0m · 3 agents/);
+  assert.match(row, /Last: PR #214 merged/);
+  assert.match(compactMissionRow(byKey.b), /data-result="failed"><strong>Failed<\/strong><\/span>/);   // unknown figures are left out, not zero
+  const hostile = compactMissionRow(byKey.c);
+  assert.doesNotMatch(hostile, /<img/);
+  assert.match(hostile, /data-result="unknown"/);
+  assert.doesNotMatch(compactMissionRow(missionEntries([], [recorded[0]], Date.now(), Date.now(), null)[0]), /mc-result/);
+});

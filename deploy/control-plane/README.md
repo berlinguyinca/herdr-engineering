@@ -170,6 +170,23 @@ On the host without a central file the DSN defaults to the local development dat
 `control_plane:` block in the config or `HERDR_ENGINEERING_CONFIG`; with a central
 file its `control_plane.pg_dsn` wins.
 
+## Host-side systemd user units
+
+These ship as templates in this directory; nothing installs them. Copy the unit (and its timer, if any) to
+`~/.config/systemd/user/`, `systemctl --user daemon-reload`, then enable as shown. Each unit's header lists its
+prerequisites. `tests/test_deploy_units.py` checks that every unit parses and that new units read no
+`Environment=`/`EnvironmentFile=`.
+
+| Unit | Kind | Enable |
+|---|---|---|
+| `herdr-ci-fix-runner.service` + `.timer` | oneshot, timer-driven | `systemctl --user enable --now herdr-ci-fix-runner.timer` |
+| `herdr-ci-report-relay.service` + `.timer` | oneshot, timer-driven (see `docs/ci-test-reports.md`) | `systemctl --user enable --now herdr-ci-report-relay.timer` |
+| `herdr-architecture-serve.service` | long-running worker, no timer; config from `~/.config/herdr-engineering/architecture-serve.yaml` (template `architecture-serve.example.yaml`) | `systemctl --user enable --now herdr-architecture-serve.service` |
+
+The Architecture Explorer worker claims analysis requests for its host only; bind its agent key in
+`control_plane.architecture.agent_hosts` and set `require_host_binding: true` in production
+(`docs/specs/herdr-codeboarding-native-port-2026-10-23/REPORT.md`, "Flag and rollback").
+
 ## LLM keys for sessions
 
 Sessions started with `herdr-eng session run --project P -- <cmd>` mint a per-session key at

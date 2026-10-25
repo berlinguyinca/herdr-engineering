@@ -137,3 +137,11 @@ test('coverage diagnostics distinguish provider errors, safety limits and invent
  const m=ciHealthModel(history([],{coverage:{'1':{error:'Rate limited <script>bad</script>',truncated:true}},scope:{inventory_error:'Discovery failed <img src=x>'}}),{},now);
  const html=renderCiHeatmap(m);assert.match(html,/Rate limited &lt;script&gt;bad&lt;\/script&gt;/);assert.match(html,/Provider safety limit reached/);assert.match(html,/Discovery failed &lt;img src=x&gt;/);assert.doesNotMatch(html,/<script>|<img/);assert.match(html,/data-health-disclosure="coverage-issues"/);
 });
+
+test('CI-health styles take every colour from theme tokens, so the dark palette applies', async () => {
+  const { ciHealthStyles } = await import('../ci-health.js');
+  // Strip var(--token, #fallback) fallbacks; whatever hex remains is a hard-coded light colour.
+  const bare = ciHealthStyles.replace(/var\(--[\w-]+,[^)]*\)/g, '');
+  assert.deepEqual(bare.match(/#[0-9a-f]{3,8}\b|rgba?\(/gi) || [], []);
+  assert.match(ciHealthStyles, /\.state-failure\{background:color-mix\(in srgb,var\(--status-failed\)/);
+});

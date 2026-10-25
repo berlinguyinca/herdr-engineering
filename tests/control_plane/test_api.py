@@ -79,6 +79,62 @@ def test_mission_not_found_404(server):
     assert status == 404
 
 
+def test_mission_delivery_routes(server):
+    c, repo = server
+    mid = repo.create_mission("Delivery routes")
+    repo.upsert_test_run("tr1", mission_id=mid, status="passed",
+                         passed=3, failed=0, total=3, kind="test")
+    repo.upsert_test_run("tr2", mission_id=mid, status="passed",
+                         passed=1, failed=0, total=1, kind="test")
+    repo.upsert_test_run("build1", mission_id=mid, status="ok", kind="build")
+    # a run belonging to a different mission must not leak into this one's lists
+    repo.upsert_test_run("other", mission_id="MSN-other", status="failed",
+                         failed=1, total=1, kind="test")
+    repo.upsert_review("rv1", mission_id=mid, reviewer="codex",
+                       status="completed", verdict="approved")
+    repo.upsert_pull_request("pr1", mission_id=mid, repository="acme/w",
+                             number=7, url="https://github.com/acme/w/pull/7",
+                             status="merged")
+    repo.upsert_pull_request("pr2", mission_id=mid, repository="acme/w",
+                             number=8, url="https://github.com/acme/w/pull/8",
+                             status="open")
+
+    _, _, body = c.get(f"/api/v1/missions/{mid}/tests")
+    tests = json.loads(body)["tests"]
+    assert [t["test_run_id"] for t in tests] == ["tr1", "tr2"]
+    assert all(t["mission_id"] == mid for t in tests)
+
+    _, _, body = c.get(f"/api/v1/missions/{mid}/builds")
+    builds = json.loads(body)["builds"]
+    assert [b["test_run_id"] for b in builds] == ["build1"]
+
+    _, _, body = c.get(f"/api/v1/missions/{mid}/reviews")
+    reviews = json.loads(body)["reviews"]
+    assert [rv["review_id"] for rv in reviews] == ["rv1"]
+    assert reviews[0]["verdict"] == "approved"
+
+    _, _, body = c.get(f"/api/v1/missions/{mid}/pulls")
+    pulls = json.loads(body)["pulls"]
+    assert [p["pr_id"] for p in pulls] == ["pr1", "pr2"]
+    assert all(p["mission_id"] == mid for p in pulls)
+
+
+def test_mission_delivery_routes_unknown_mission_404(server):
+    c, _ = server
+    for sub in ("tests", "builds", "reviews", "pulls"):
+        status, _, _ = c.get(f"/api/v1/missions/mission_nope/{sub}")
+        assert status == 404, sub
+
+
+def test_mission_delivery_routes_empty_for_known_mission(server):
+    c, repo = server
+    mid = repo.create_mission("No delivery records")
+    for sub in ("tests", "builds", "reviews", "pulls"):
+        status, _, body = c.get(f"/api/v1/missions/{mid}/{sub}")
+        assert status == 200, sub
+        assert json.loads(body)[sub] == [], sub
+
+
 def test_sessions_and_services(server):
     c, repo = server
     mid = repo.create_mission("m")

@@ -9,6 +9,7 @@ overwrite).
 from __future__ import annotations
 
 import copy
+import logging
 import os
 from pathlib import Path
 from typing import Any
@@ -19,6 +20,7 @@ from .errors import InvalidError
 # seconds between passes, seconds between scheduled full reads of one repository, and
 # the GraphQL points (rateLimit.cost) one pass may spend before deferring the rest.
 # 400 points every 300 s stays under GitHub's 5000/hour even when every pass spends it.
+GITHUB_POINTS_PER_HOUR = 5000  # GitHub GraphQL primary rate limit
 GITHUB_SYNC_DEFAULTS = {"interval": 300, "full_reconcile_interval": 86400, "point_budget": 400}
 
 DEFAULTS: dict[str, Any] = {
@@ -108,6 +110,12 @@ def github_sync(value: Any) -> dict[str, int]:
         if isinstance(item, bool) or not isinstance(item, int) or item <= 0:
             raise InvalidError(f"github.sync.{key} must be a positive whole number")
         settings[key] = item
+    hourly = settings["point_budget"] * 3600 / max(30, settings["interval"])
+    if hourly > GITHUB_POINTS_PER_HOUR:
+        raise InvalidError(
+            f"github.sync.point_budget is spent once per pass: {settings['point_budget']} points every "
+            f"{settings['interval']}s is {hourly:.0f} points per hour, over GitHub's {GITHUB_POINTS_PER_HOUR} "
+            "per-hour GraphQL limit; lower point_budget or raise interval")
     return settings
 
 
@@ -204,6 +212,11 @@ def load_config(paths: list[Path] | None = None) -> dict[str, Any]:
         # supported schema (1). Only an explicitly wrong version is rejected.
         if "version" in data and data["version"] != 1:
             raise InvalidError(f"config file {path} has unsupported version")
+        if data.get("github"):
+            logging.getLogger(__name__).warning(
+                "%s: github.* is validated but not read from this file; control-plane-web reads "
+                "github.organizations and github.sync from the central fleet config (control_plane "
+                "fleet file), so this section has no effect", path)
         cfg = _deep_merge(cfg, data)
     validate_github(cfg.get("github"))
     return _expand_env(cfg)

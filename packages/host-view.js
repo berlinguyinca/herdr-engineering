@@ -67,7 +67,7 @@ export function sparkline(points, { width = 160, height = 32, max } = {}) {
   const area = `${d} L${round1(pad + (vals.length - 1) * step)} ${h - pad} L${pad} ${h - pad} Z`;
   return `<svg class="hv-spark" viewBox="0 0 ${w} ${h}" width="${w}" height="${h}" preserveAspectRatio="none" role="img" aria-label="${vals.length} points, latest ${round1(vals[vals.length - 1])}">`
     + `<path d="${area}" fill="var(--accent-weak, #e8f0fe)" stroke="none"/>`
-    + `<path d="${d}" fill="none" stroke="var(--accent, #2563eb)" stroke-width="1.5" vector-effect="non-scaling-stroke"/></svg>`;
+    + `<path class="hv-spark__line" d="${d}" fill="none" stroke="var(--accent, #2563eb)" stroke-width="1.5" vector-effect="non-scaling-stroke"/></svg>`;
 }
 
 export function historyPoints(history) {
@@ -230,8 +230,18 @@ export function renderHostDetail(host, history, { range = '1h', now = Date.now()
 export const HOST_CARD_STYLE = `<style>
 ${BADGE_CSS}
 .hv-meters{display:grid;gap:4px;margin:8px 0 2px}.hv-meter{display:grid;grid-template-columns:3.2rem 1fr 2.8rem;gap:6px;align-items:center;font-size:.75rem;color:var(--text-secondary)}
-.hv-meter__bar{height:6px;border-radius:3px;background:var(--surface-2);overflow:hidden}.hv-meter__bar i{display:block;height:100%;background:var(--accent,#2563eb)}.hv-meter span:last-child{text-align:right}
+.hv-meter__bar{height:6px;border-radius:3px;background:var(--surface-2);overflow:hidden}.hv-meter__bar i{display:block;height:100%;background:var(--accent,#2563eb);transition:width var(--motion-normal,200ms)}
+[data-host-card][data-stale]{opacity:.7}.hv-meter span:last-child{text-align:right}
 </style>`;
+
+/** "N min" (or "H h M min") since an ISO time, for the stale-host label; minute resolution so a
+ *  per-minute tick writes at most once a minute. */
+export function staleFor(since, now = Date.now()) {
+  const t = reportTimestamp(since);
+  if (!Number.isFinite(t)) return 'an unknown time';
+  const m = Math.max(0, Math.floor((now - t) / 60000));
+  return m < 60 ? `${m} min` : `${Math.floor(m / 60)} h ${m % 60} min`;
+}
 
 const clamp100 = (v) => Math.min(100, Math.max(0, num(v)));
 function meter(key, label, value) {
@@ -266,10 +276,11 @@ export function renderHostCard(host, { now = Date.now(), cfg = null } = {}) {
     ? [meter('cpu', 'CPU', latest.cpu), meter('mem', 'Memory', latest.mem), meter('disk', 'Disk', disk), gpuUtils.length ? meter('gpu', 'GPU', Math.max(...gpuUtils)) : ''].join('')
     : '';
   const seen = h.last_seen ? esc(formatTimestamp(h.last_seen)) : 'never';
-  return `<div class="hd-card" data-host-card>
+  const reportAt = Math.max(...[h.last_seen, latest?.at].map(reportTimestamp).filter(Number.isFinite), -1);
+  return `<div class="hd-card" data-host-card data-host-id="${esc(h.host_id ?? '')}"${stage === 'stalled' ? ' data-stale' : ''}>
       <div class="hd-card__title"><a href="#/hosts/${esc(id)}">${show(h.host_name ?? h.host_id, 'Unnamed host')}</a></div>
       <div style="margin:6px 0"><herdr-status stage="${esc(stage)}"></herdr-status> ${latest ? '' : `${NO_TELEMETRY} `}${configBadge(cfg, h)} ${problemBadge(h)}</div>
-      <div class="hd-card__sub">${h.tailnet_ip ? `<code>${esc(h.tailnet_ip)}</code>` : 'not reported'} · ${stage === 'stalled' ? `<strong>no report since</strong> ${seen}` : latest ? `seen ${seen}` : `registered, no telemetry · last seen ${seen}`}</div>
+      <div class="hd-card__sub">${h.tailnet_ip ? `<code>${esc(h.tailnet_ip)}</code>` : 'not reported'} · ${stage === 'stalled' ? `<strong>no report for <span data-stale-since="${esc(reportAt)}">${esc(staleFor(reportAt, now))}</span></strong> · last seen ${seen}` : latest ? `seen ${seen}` : `registered, no telemetry · last seen ${seen}`}</div>
       ${meters ? `<div class="hv-meters">${meters}</div>` : ''}
     </div>`;
 }

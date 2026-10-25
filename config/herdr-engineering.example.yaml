@@ -23,8 +23,8 @@ dev_fabric:
 # Fabric gateway = the unified dev:<port> front door (spec 0110 component #3).
 # Run `herdr-eng devfabric gateway` on the gateway host (bender today).
 # Registrar commands use it automatically when reachable, and degrade to
-# local mode with a warning when it is not. HERDR_ENGINEERING_FABRIC_URL
-# overrides gateway_url without editing config.
+# local mode with a warning when it is not. There is no env-var override: a
+# central fleet-config.yaml `fabric.url` wins over gateway_url below.
 fabric:
   # full control URL (http://host:port) or bare host/MagicDNS name (given the
   # default control port); empty = local/standalone mode

@@ -75,16 +75,44 @@ def test_existing_names_stay_valid_as_aliases(w):
 
 
 def test_an_old_alias_loses_to_a_person_or_an_address(w):
-    _, imp = agent(w, "bob", "pi", name="alice")
-    w.s.rename_agent(w.bob, imp, {"name": "helper"})                                # "alice" is now an old name
-    assert w.s.resolve_mentions(w.room, "@alice") == [{"kind": "person", "id": "alice", "name": "alice"}]
+    _, imp = agent(w, "bob", "pi", name="mallory")                               # mallory is not a member yet
+    w.s.rename_agent(w.bob, imp, {"name": "helper"})                               # "mallory" is now an old name
+    w.s.add_member(w.alice, w.room, {"user_id": "mallory", "role": "viewer"})
+    assert w.s.resolve_mentions(w.room, "@mallory") == [{"kind": "person", "id": "mallory", "name": "mallory"}]
     assert w.s.resolve_mentions(w.room, "@bob.pi")[0]["id"] == imp
 
 
-def test_a_person_handle_equal_to_an_agents_current_name_addresses_nobody(w):
-    _, coder = agent(w, "alice", "codex", name="carol")                           # agent "carol" + person carol
-    assert w.s.resolve_mentions(w.room, "@carol please") == []
-    assert w.s.resolve_mentions(w.room, "@alice.codex")[0]["id"] == coder        # the unambiguous form works
+def test_an_agent_cannot_take_a_members_handle(w):
+    from herdr_engineering.control_plane.collab import CollabError
+    _, coder = agent(w, "alice", "codex", name="coder")
+    with pytest.raises(CollabError) as e:
+        w.s.rename_agent(w.alice, coder, {"name": "carol"})                      # carol is a member of this room
+    assert e.value.status == 409
+    info = w.s.connect_agent(w.bob, {"harness_type": "pi", "name": "dave"})      # granted into a room with dave
+    with pytest.raises(CollabError) as e:
+        w.s.grant_agent(w.bob, w.room, {"agent_id": info["agent_id"], "actions": ["read"]})
+    assert e.value.status == 409
+    # and "@carol ..." still reaches the person: it is a message to her, not an agent's task
+    assert w.s.resolve_mentions(w.room, "@carol please look") == [{"kind": "person", "id": "carol", "name": "carol"}]
+    ev = say(w, w.bob, "@carol please look")
+    assert ev["mentions"] == [{"kind": "person", "id": "carol", "name": "carol"}]
+
+
+def test_a_person_handle_outranks_an_agents_current_name(w):
+    _, coder = agent(w, "alice", "codex", name="mallory")                         # before mallory joined
+    w.s.add_member(w.alice, w.room, {"user_id": "mallory", "role": "viewer"})
+    assert w.s.resolve_mentions(w.room, "@mallory please") == [{"kind": "person", "id": "mallory", "name": "mallory"}]
+    assert w.s.resolve_mentions(w.room, "@alice.codex")[0]["id"] == coder        # the agent keeps its address
+
+
+def test_aliases_keep_only_the_last_five_names(w):
+    from herdr_engineering.control_plane.collab import MAX_ALIASES
+    _, a = agent(w, "alice", "pi", name="n0")
+    for i in range(1, 9):
+        w.s.rename_agent(w.alice, a, {"name": f"n{i}"})
+    row = next(r for r in w.s.list_room_agents(w.alice, w.room)["agents"] if r["agent_id"] == a)
+    assert MAX_ALIASES == 5 and row["aliases"] == ["n3", "n4", "n5", "n6", "n7"] and row["name"] == "n8"
+    assert w.s.resolve_mentions(w.room, "@n3")[0]["id"] == a and w.s.resolve_mentions(w.room, "@n2") == []
 
 
 def test_an_old_name_two_agents_share_addresses_nobody(w):
@@ -256,3 +284,55 @@ def test_an_address_is_never_longer_than_48_characters(w):
     assert all(len(a["address"]) <= 48 for a in w.s.list_room_agents(w.alice, w.room)["agents"])
     long = cm.HANDLE_MAX * "b" + "." + cm.SLOT_MAX * "c"
     assert len(long) == 48 and cm.ADDRESS.match(long)
+
+
+# ------------------------------------------------- external agents never take their sponsor's owner.harness address
+def external(w, harness="claude-code"):
+    inv = w.s.create_external_invite(w.alice, w.room, {"label": "Dana", "actions": ["read", "post"]})
+    out = w.s.redeem_join_token({"token": inv["code"], "harness_type": harness})
+    return out["agent_id"], out["name"]
+
+
+def test_a_sponsored_external_agent_gets_no_owner_address_and_the_sponsors_own_agent_keeps_it(w):
+    ext_id, ext_name = external(w, "claude-code")                  # alice has no live claude agent yet
+    _, mine = agent(w, "alice", "claude-code")
+    assert addresses(w) == {ext_id: None, mine: "alice.claude"}
+    assert w.s.resolve_mentions(w.room, "@alice.claude do the thing")[0]["id"] == mine
+    # the outsider is reached only by its own ext-... name, and the mention says it is external
+    assert w.s.resolve_mentions(w.room, f"@{ext_name} hi") == [
+        {"kind": "agent", "id": ext_id, "name": ext_name, "external": True}]
+    ev = say(w, w.bob, f"@{ext_name} hi")
+    assert ev["mentions"][0]["external"] is True
+
+
+def test_addresses_are_recorded_and_survive_a_restart_with_externals(w):
+    ext_id, _ = external(w, "claude-code")
+    _, mine = agent(w, "alice", "claude-code")
+    enrolled = [e["payload"] for e in w.s._log if e["event_type"] == "agent_enrolled"]
+    assert {p["agent_id"]: p["slot"] for p in enrolled} == {ext_id: None, mine: "claude"}
+    from herdr_engineering.control_plane.collab import CollabService
+    again = CollabService(w.s.auth, now=w.s.clock)
+    again.hydrate(w.s._log)
+    alice = again.authenticate(f"Bearer {USERS['alice']}", None)
+    assert {a["agent_id"]: a["address"] for a in again.list_room_agents(alice, w.room)["agents"]} == {
+        ext_id: None, mine: "alice.claude"}
+
+
+def test_a_log_written_before_slots_were_recorded_replays_to_the_same_addresses(w):
+    """Rows without a recorded slot re-derive the old rule, so an address handed out then never moves; an
+    external agent from such a log keeps occupying its old slot but is no longer addressed by it."""
+    import copy
+    ext_id, _ = external(w, "claude-code")
+    _, mine = agent(w, "alice", "claude-code")                      # the old rule gave this one "claude-2"
+    _, pi = agent(w, "alice", "pi")
+    legacy = copy.deepcopy(w.s._log)
+    for e in legacy:
+        if e["event_type"] == "agent_enrolled":
+            e["payload"].pop("slot")
+    from herdr_engineering.control_plane.collab import CollabService
+    again = CollabService(w.s.auth, now=w.s.clock)
+    again.hydrate(legacy)
+    alice = again.authenticate(f"Bearer {USERS['alice']}", None)
+    assert {a["agent_id"]: a["address"] for a in again.list_room_agents(alice, w.room)["agents"]} == {
+        ext_id: None, mine: "alice.claude-2", pi: "alice.pi"}
+    assert again.resolve_mentions(w.room, "@alice.claude hi") == []        # nobody: never the outsider

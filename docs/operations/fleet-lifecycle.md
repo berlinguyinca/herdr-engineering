@@ -95,15 +95,16 @@ Android) resolve `dev.lan` fleet-wide. Verify with `tailscale dns status`
 ## 2. Join a machine (fleet host)
 
 On the machine you want to join, from its checkout, install herdr-engineering
-and start the auto-registration agent. The gateway URL defaults to
-`http://dev.lan:29999`; override with `--gateway <url>` if your fleet uses a
-different master.
+and start the auto-registration agent. The gateway URL is read from YAML only: `fabric.url` in the central
+`fleet-config.yaml`, else `fabric.gateway_url` in `config.yaml` (default
+`http://dev.lan:29999` for join/update/offboard when neither is set). There is no
+`fabric.env` and no env-var or `--gateway` override; `--gateway` is ignored with a warning.
 
 ### Linux
 
 ```bash
 scripts/install.sh
-scripts/fabric-agent.sh --gateway http://dev.lan:29999   # systemd user unit + linger
+scripts/fabric-agent.sh   # systemd user unit + linger
 ```
 
 ### macOS
@@ -115,7 +116,7 @@ LaunchAgent — no sudo / Homebrew required:
 
 ```bash
 scripts/install.sh
-scripts/fabric-agent-macos.sh --gateway http://dev.lan:29999   # launchd LaunchAgent
+scripts/fabric-agent-macos.sh   # launchd LaunchAgent
 ```
 
 ### Verify a joined machine
@@ -190,8 +191,8 @@ The CoreDNS + gateway containers are removed; the `herdr-state` named volume
   and web UI all bind loopback / tailnet interfaces only — never `0.0.0.0`,
   never a public address.
 - **No secrets in the repo.** Control-API bearer tokens live only in the
-  environment or a machine-local gitignored file. `fabric.env` holds a tailnet
-  URL, not a credential.
+  environment or a machine-local gitignored file. The gateway URL lives in
+  `fleet-config.yaml` / `config.yaml` (a tailnet URL, not a credential).
 - **The agent is never containerized.** It must see host listeners via
   `ss`/`lsof`, so it stays a host service on every fleet host.
 - **Leases self-heal.** A stopped or crashed host's leases expire via the
