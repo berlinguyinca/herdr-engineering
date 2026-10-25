@@ -2,7 +2,7 @@
 import {escapeHtml as esc} from './herdr-web-components/util.js';
 import {formatDuration} from './herdr-web-components/format.js';
 import {recordOutcome,statusOutcome,recordVisibility} from './record-state.js';
-import {patchList,patchText,morph} from './patch.js';
+import {patchList,patchText,patchAttr,morph} from './patch.js';
 import {animateChanges,skeleton} from './motion.js';
 import { freshnessSources } from './freshness.js';
 
@@ -94,7 +94,7 @@ const styles=`<style>
 export function mountSessionsView(container,client,{tab='current'}={}) {
   const state={tab:tabs.some(([key])=>key===tab)?tab:'current',search:'',host:'',group:'project',page:0};
   const pageSize=20;
-  let disposed=false,sessions=[],missions=[],loaded=false,sessionError='',missionError='',lastSignature='',hostSignature='';
+  let disposed=false,sessions=[],missions=[],loaded=false,sessionError='',missionError='';
   let sessionRequest=null,missionRequest=null;
   const chip=freshnessSources(()=>container.querySelector('herdr-freshness'));
   container.innerHTML=`${styles}<div class="hd-live-head"><h1>Agents</h1><herdr-freshness interval="5000"></herdr-freshness></div>
@@ -117,7 +117,9 @@ export function mountSessionsView(container,client,{tab='current'}={}) {
     const live=view===lastView&&!!panel.querySelector('.ss-group');lastView=view;
     if(!visible.length){
       const html=loaded?'<p class="ss-empty">No agents match this tab and these filters.</p>':sessionError?'<p class="ss-empty">Agents could not be loaded yet; retrying automatically.</p>':skeleton('agents');
-      if(panel.innerHTML!==html)panel.innerHTML=html;
+      // morph keeps a node the user is in, so focus leaves an emptied list first.
+      if(panel.contains(document.activeElement))el('search').focus({preventScroll:true});
+      morph(panel,html);
       return;
     }
     for(const child of [...panel.children])if(!child.matches('.ss-group')||!groups.has(child.dataset.groupName))child.remove();
@@ -135,38 +137,32 @@ export function mountSessionsView(container,client,{tab='current'}={}) {
     if(disposed)return;
     const all=entries(), selected=selectSessions(all,state);
     state.page=Math.min(state.page,Math.max(0,Math.ceil(selected.length/pageSize)-1));
-    el('error').textContent=[sessionError,missionError].filter(Boolean).join(' ');
-    const signature=JSON.stringify([state,sessions,missions,loaded,!!sessionError,all.map(e=>e.tab)]);
-    if(signature===lastSignature)return;
-    lastSignature=signature;
-    const focused=document.activeElement;
-    const focusId=focused?.closest('[data-session-id]')?.dataset.sessionId;
+    patchText(el('error'),[sessionError,missionError].filter(Boolean).join(' '));
+    // Rows patch in place (identical data writes nothing) and keep focus; only a focused row that
+    // leaves (its agent moved tab or out of the filter) hands focus to its neighbour.
+    const focusId=document.activeElement?.closest('[data-session-id]')?.dataset.sessionId;
     const focusIndex=[...container.querySelectorAll('[data-session-id]:not([data-leaving])')].findIndex(row=>row.dataset.sessionId===focusId);
-    const focusMission=focused?.hasAttribute('data-mission-link');
-    const scroll={x:window.scrollX,y:window.scrollY};
     for(const [key] of tabs) {
       const button=el(`tab-${key}`), active=state.tab===key;
-      button.setAttribute('aria-selected',String(active));button.tabIndex=active?0:-1;
+      patchAttr(button,'aria-selected',String(active));patchAttr(button,'tabindex',active?'0':'-1');
       const count=button.querySelector('strong'),before=new Map([[count,count.textContent]]);
       patchText(count,loaded ? all.filter(e=>e.tab===key).length : '…');
       animateChanges(button,'strong',before);
-      el(`panel-${key}`).hidden=!active;
-      if(!active)el(`panel-${key}`).innerHTML='';
+      patchAttr(el(`panel-${key}`),'hidden',!active);
+      if(!active&&el(`panel-${key}`).firstChild)el(`panel-${key}`).replaceChildren();
     }
     const hosts=[...new Set(all.map(e=>e.host).filter(Boolean).concat(state.host?[state.host]:[]))].sort();
-    if(JSON.stringify(hosts)!==hostSignature){hostSignature=JSON.stringify(hosts);el('host').innerHTML='<option value="">All hosts</option>'+hosts.map(h=>`<option value="${esc(h)}">${esc(h)}</option>`).join('');el('host').value=state.host;}
+    morph(el('host'),'<option value="">All hosts</option>'+hosts.map(h=>`<option value="${esc(h)}"${h===state.host?' selected':''}>${esc(h)}</option>`).join(''));
     const visible=selected.slice(state.page*pageSize,(state.page+1)*pageSize),groups=new Map();
     for(const entry of visible){const label=state.group==='project'?entry.project:'Recent reports';if(!groups.has(label))groups.set(label,[]);groups.get(label).push(entry);}
     patchPanel(el(`panel-${state.tab}`),visible,groups);
     const noModel=loaded && selected.length>0 && !selected.some(e=>text(e.record.model));
-    el('result').textContent=loaded ? `${selected.length} matching ${state.tab} agents${visible.length?` · Showing ${state.page*pageSize+1}–${state.page*pageSize+visible.length}`:''}${noModel?' · None of these agents report which model they use':''}` : '';
-    el('page').textContent=`Page ${state.page+1} of ${Math.max(1,Math.ceil(selected.length/pageSize))}`;
-    el('previous').disabled=state.page===0;el('next').disabled=(state.page+1)*pageSize>=selected.length;
+    patchText(el('result'),loaded ? `${selected.length} matching ${state.tab} agents${visible.length?` · Showing ${state.page*pageSize+1}–${state.page*pageSize+visible.length}`:''}${noModel?' · None of these agents report which model they use':''}` : '');
+    patchText(el('page'),`Page ${state.page+1} of ${Math.max(1,Math.ceil(selected.length/pageSize))}`);
+    patchAttr(el('previous'),'disabled',state.page===0);patchAttr(el('next'),'disabled',(state.page+1)*pageSize>=selected.length);
     if(focusId){
       const rows=[...container.querySelectorAll('[data-session-id]:not([data-leaving])')];
-      const row=rows.find(n=>n.dataset.sessionId===focusId)||rows[Math.min(Math.max(focusIndex,0),rows.length-1)];
-      const target=(focusMission?row?.querySelector('[data-mission-link]'):null)||row?.querySelector('[data-session-link]')||el('search');
-      target.focus({preventScroll:true});window.scrollTo(scroll.x,scroll.y);
+      if(!rows.some(n=>n.dataset.sessionId===focusId))(rows[Math.min(Math.max(focusIndex,0),rows.length-1)]?.querySelector('[data-session-link]')||el('search')).focus({preventScroll:true});
     }
   }
   function chooseTab(key){if(!tabs.some(([candidate])=>candidate===key))return;state.tab=key;state.page=0;draw();}
@@ -201,7 +197,7 @@ export function mountSessionsView(container,client,{tab='current'}={}) {
   function visibility(){if(document.hidden){sessionRequest?.abort();missionRequest?.abort();}else refresh();}
   document.addEventListener('visibilitychange',visibility);
   const poll=setInterval(()=>request('sessions'),5000), contextPoll=setInterval(()=>request('missions'),30000);
-  const clock=setInterval(()=>{if(disposed||document.hidden)return;draw();const byId=new Map(entries().map(e=>[e.id,e]));container.querySelectorAll('[data-session-id]').forEach(row=>{const entry=byId.get(row.dataset.sessionId);if(entry)row.querySelector('[data-report]').textContent=sessionReport(entry.record);});},1000);
+  const clock=setInterval(()=>{if(disposed||document.hidden)return;draw();const byId=new Map(entries().map(e=>[e.id,e]));container.querySelectorAll('[data-session-id]').forEach(row=>{const entry=byId.get(row.dataset.sessionId);if(entry)patchText(row.querySelector('[data-report]'),sessionReport(entry.record));});},1000);
   draw();refresh();
   return {refresh,dispose(){disposed=true;sessionRequest?.abort();missionRequest?.abort();clearInterval(poll);clearInterval(contextPoll);clearInterval(clock);document.removeEventListener('visibilitychange',visibility);container.removeEventListener('click',click);container.removeEventListener('keydown',keydown);container.removeEventListener('input',controls);container.removeEventListener('change',controls);}};
 }

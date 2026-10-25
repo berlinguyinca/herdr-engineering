@@ -976,7 +976,8 @@ test('sessions tabs keep closed records separate, retain filters and encode exac
   await page.locator('[data-session-link]').first().focus();
   const focused=await page.evaluate(()=>document.activeElement.closest('[data-session-id]').dataset.sessionId);
   await page.clock.runFor(5500);await refreshed;
-  await page.waitForFunction(()=>document.querySelector('.ss-summary')?.textContent.includes('Report 2'));
+  // Live events refresh the list too (the bus), so any later read counts.
+  await page.waitForFunction(()=>/Report ([2-9]|\d\d)/.test(document.querySelector('.ss-summary')?.textContent||''));
   assert.equal(await page.locator('#ss-search').inputValue(),'open-1');
   assert.equal(await page.evaluate(()=>document.activeElement.closest('[data-session-id]')?.dataset.sessionId),focused);
   await page.locator('#ss-search').fill('');await page.locator('#ss-tab-finished').click();await page.locator('#ss-search').fill('Closed stage');
@@ -1040,16 +1041,17 @@ test('overview keeps healthy panels through partial errors and links to the exac
 
 test('sessions retain keyboard focus when refreshed records leave the filter and stop reads hidden or after navigation',async()=>{
  await withApp(async({page,base})=>{
-  let reads=0;
+  // phase, not the read count, decides the data: live events (the refresh bus) add reads.
+  let reads=0,phase=0;
   await page.route('**/api/v1/sessions',r=>{reads++;return r.fulfill({json:{sessions:[
-   {session_id:'first',agent_role:'agent',status:'active',updated_at:new Date().toISOString(),summary:reads===1?'needlecontext':'removed'},
-   {session_id:'second',agent_role:'agent',status:'active',updated_at:new Date().toISOString(),summary:reads<=2?'needlecontext':'removed'}]}});});
+   {session_id:'first',agent_role:'agent',status:'active',updated_at:new Date().toISOString(),summary:phase===0?'needlecontext':'removed'},
+   {session_id:'second',agent_role:'agent',status:'active',updated_at:new Date().toISOString(),summary:phase<=1?'needlecontext':'removed'}]}});});
   await page.route('**/api/v1/missions',r=>r.fulfill({json:{missions:[]}}));
   await page.clock.install();await page.goto(`${base}/#/herd`);await page.locator('.ss-row').first().waitFor();
   await page.locator('#ss-search').fill('needlecontext');await page.locator('[data-session-id=first] [data-session-link]').focus();
-  await page.clock.runFor(5500);await page.waitForFunction(()=>document.querySelectorAll('.ss-row').length===1);
+  phase=1;await page.clock.runFor(5500);await page.waitForFunction(()=>document.querySelectorAll('.ss-row').length===1);
   assert.equal(await page.evaluate(()=>document.activeElement.closest('[data-session-id]')?.dataset.sessionId),'second');
-  await page.clock.runFor(5500);await page.waitForFunction(()=>document.querySelectorAll('.ss-row').length===0);
+  phase=2;await page.clock.runFor(5500);await page.waitForFunction(()=>document.querySelectorAll('.ss-row').length===0);
   assert.equal(await page.evaluate(()=>document.activeElement.id),'ss-search');
   const before=reads;
   await page.evaluate(()=>{Object.defineProperty(document,'hidden',{configurable:true,get:()=>true});document.dispatchEvent(new Event('visibilitychange'));});

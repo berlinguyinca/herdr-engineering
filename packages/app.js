@@ -348,7 +348,8 @@ async function missionSessions(m) {
 }
 
 async function viewSessions() {
-  return ownPolling(mountSessionsView(root, client, {tab: route().query.get('tab') || 'current'}));
+  // Keeps its own poll; live events refresh it too.
+  return mountSessionsView(root, client, {tab: route().query.get('tab') || 'current'});
 }
 
 function sessionStatusText(s) {

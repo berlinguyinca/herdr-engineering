@@ -79,3 +79,40 @@ test('GitHub: identical refresh writes nothing; one changed issue rewrites only 
  await until(()=>page.locator('[data-gh-inspector] h3').first().innerText().then(t=>t==='Issue 2 renamed'),'inspector updated');
  assert.equal(await page.evaluate(()=>document.activeElement?.hasAttribute('data-gh-refresh-issue')),true,'focus stays on the inspector control');
 }));
+
+// ---------------------------------------------------------------- Agents (sessions)
+const agent=(id,extra={})=>({session_id:id,agent_role:'coder',host_id:'beast',status:'working',cwd:`/work/${id.startsWith('a')?'alpha':'beta'}`,updated_at:'2026-01-01T00:00:05Z',summary:`Doing ${id}`,...extra});
+function sessionsApi(state){
+ return p=>{
+  if(p==='/api/v1/sessions')return {sessions:structuredClone(state.sessions)};
+  if(p==='/api/v1/missions')return {missions:[]};
+  return {};
+ };
+}
+
+test('Agents: identical refresh writes nothing; one changed agent rewrites only its row; focus and filter survive',async()=>withPage(async(page,base)=>{
+ const state={sessions:[agent('a1'),agent('a2'),agent('b1')]};
+ const reads=await boot(page,base,'/herd',sessionsApi(state));
+ await until(()=>page.locator('[data-session-id]').count().then(n=>n===3),'agent rows');
+ await page.locator('#ss-host').selectOption('beast');
+ await page.locator('#ss-search').fill('doing');await page.locator('#ss-search').evaluate(e=>e.blur());
+ await page.locator('[data-session-id="a1"] [data-session-link]').focus();
+ await liveRefresh(page,{event_id:'s0',event_type:'SessionUpdated'});
+ await page.evaluate(()=>{window.__rows=[...document.querySelectorAll('[data-session-id]')];});
+
+ const before=reads['/api/v1/sessions'];
+ await observe(page);
+ await liveRefresh(page,{event_id:'s1',event_type:'SessionUpdated'});
+ assert.ok(reads['/api/v1/sessions']>before,'refresh fetched agents again');
+ assert.deepEqual(await writes(page),[],'identical refresh performs no DOM writes');
+
+ state.sessions[2].summary='Doing something else';
+ await observe(page);
+ await liveRefresh(page,{event_id:'s2',event_type:'SessionUpdated'});
+ await until(()=>page.locator('[data-session-id="b1"] .ss-summary').innerText().then(t=>t==='Doing something else'),'changed summary');
+ assert.equal(await page.evaluate(()=>[...document.querySelectorAll('[data-session-id]')].every((n,i)=>n===window.__rows[i])),true,'every row node survives');
+ assert.deepEqual(await writes(page,'[data-session-id="b1"]'),[],'nothing outside the changed row was written');
+ assert.equal(await page.evaluate(()=>document.activeElement?.closest('[data-session-id]')?.dataset.sessionId),'a1','focus stays on its row');
+ assert.equal(await page.locator('#ss-search').inputValue(),'doing','typed filter survives');
+ assert.equal(await page.locator('#ss-host').inputValue(),'beast','host filter survives');
+}));
