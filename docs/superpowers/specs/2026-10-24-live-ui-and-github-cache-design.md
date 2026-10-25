@@ -341,3 +341,20 @@ Author's call, pending operator confirmation (C4 review, 2026-10-24):
   into `refs`. One policy function (`collab_refs.may_see_private`) holds this rule, so it is easy to
   relax. The `#` menu needs at least 2 characters; an empty query lists a short recent list for
   owners and approvers only; the menu is rate-limited per principal.
+
+Operator-confirmed 2026-10-25: skills from the room enabled.
+- **`@agent /skill:<name> <args>`** reaches a pi agent's skill, server-decided and off unless YAML
+  `collab.skills.enabled: true`. The server marks a task or waking mention `skill: {name}` only when the sender
+  may give that agent work (the `create_task` / wake rules), the agent is pi and reported `skill:<name>` at
+  registration, the name matches `[a-z0-9][a-z0-9._-]{0,63}` and the arguments are at most 2000 characters;
+  delivery re-checks switch, harness and list. The worker obeys only the mark and feeds pi `/skill:<name> <args>`
+  as one argument after `--`, without the "Task from a room member:" prefix (pi 1.3.0 treats only a whole argument
+  starting with `@` as a file); everything else keeps the prefix. Claude Code is unchanged. Each call is a
+  `skill_invoked` room event (who, agent, skill, 80-character preview). This supersedes "the room never makes
+  `/skill` expand" in earlier notes; the literal room text is still never rewritten.
+
+Operator-confirmed 2026-10-25: the room file limit is a room property.
+- **Per-room limit, not per-owner.** A room owner sets `files_room_bytes` in the room's properties (null = the
+  YAML default `collab.files.room_bytes`, 500 MiB), stored as a `room_settings_set` event, held to the YAML ceiling
+  `collab.files.room_bytes_max` (10 GiB). Lowering it below usage deletes nothing and blocks uploads. The per-file
+  `collab.files.max_bytes` stays global, and the edge's 26m upload cap is raised together with it.
