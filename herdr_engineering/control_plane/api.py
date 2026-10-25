@@ -327,6 +327,9 @@ class ControlPlaneServer:
         self.collab = collab
         if collab is not None and getattr(collab, "github", None) is None:
             collab.github = self.github_monitor   # `#` references read the same cache (C4)
+        if collab is not None and getattr(collab, "github_writer", None) is None:
+            from ..github import GitHubWriter      # C6: /issue, /assign; refuses unless github.write.enabled
+            collab.github_writer = GitHubWriter()
         self.collab_require_https = collab_require_https
         # Optional second listener that serves ONLY collaboration (API, MCP and its page);
         # it is the only one an internet-facing proxy should be pointed at.
@@ -819,6 +822,7 @@ _PUBLIC_STATIC = {
     "/collab-workbench.js": ("collab-workbench.js", "text/javascript"),
     "/motion.js": ("motion.js", "text/javascript"),
     "/collab-files-view.js": ("collab-files-view.js", "text/javascript"),
+    "/collab-cards.js": ("collab-cards.js", "text/javascript"),
     "/keyed-list.js": ("keyed-list.js", "text/javascript"),
     "/conversation-composer.js": ("conversation-composer.js", "text/javascript"),
     "/conversation-markdown.js": ("conversation-markdown.js", "text/javascript"),

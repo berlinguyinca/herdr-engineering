@@ -48,6 +48,8 @@ export function workerScript({ base }) {
   return `#!/usr/bin/env bash
 # worker.sh AGENT.json — wait for tasks, run HERDR_AGENT_CMD on each, report the result.
 #   HERDR_AGENT_CMD='claude -p'   # task text arrives on stdin; its stdout becomes the result
+# A room message (or handoff) that addresses this agent wakes it too: the harness gets that text on stdin
+# once (only in rooms where the owner approved "execute"); its output is NOT posted back to the room.
 # Default does nothing but acknowledge. Task text is a request from a verified room member (or an agent
 # they started): it is never spliced into a shell command by this script.
 # Started by the host runner it also gets (set in the environment, never by a task):
@@ -112,23 +114,38 @@ PY
 [ -z "$AUDIT" ] || mkdir -p -m 0700 "$(dirname "$AUDIT")"
 audit worker_start agent="$NAME" sandbox="\${SANDBOX:+yes}" cmd="\${HERDR_AGENT_CMD:-acknowledge}"
 echo "waiting for tasks as $NAME..."
+mkdir -p "$TMP/mentions"
+MC=-1   # mention cursor: -1 = from now on, so a restarted worker never replays old mentions; "off" = old server
 while :; do
-  call tasks_wait '{"seconds":20}' > "$TMP/r.json" || { sleep 5; continue; }
+  case "$MC" in off) ARGS='{"seconds":20}' ;; *[!0-9-]*|'') MC=-1; ARGS='{"seconds":20,"mentions_after":-1}' ;; *) ARGS=$(printf '{"seconds":20,"mentions_after":%d}' "$MC") ;; esac
+  call tasks_wait "$ARGS" > "$TMP/r.json" || { sleep 5; continue; }
   python3 - "$TMP/r.json" "$TMP" <<'PY'
 import sys, json
 reply = json.load(open(sys.argv[1]))
 import re
-tasks = json.loads(reply["result"]["content"][0]["text"]).get("tasks", [])
-for t in tasks:
+result = reply["result"]
+body = json.loads(result["content"][0]["text"])
+if result.get("isError") and "invalid arguments" in str(body.get("error")):
+    open(f"{sys.argv[2]}/mc", "w").write("off")     # a server without mention wake-up: tasks only
+    body = {}
+tasks = body.get("tasks", [])
+def own_text(t):
     # The room keeps the literal text. The harness gets it without ONE leading "@<this agent>" (address,
     # name or old name) so the request reads as written to it; any other text stays exactly as typed.
     text, own = t["text"], {n for n in [t.get("target_address"), t.get("target_name"), *(t.get("target_aliases") or [])] if n}
     m = re.match(r"@([A-Za-z0-9._-]{1,48})\\s+(?=\\S)", text)
     if m and m.group(1).lower() in own:
         text = text[m.end():]
-    open(f"{sys.argv[2]}/tasks/{t['task_id']}.txt", "w").write(text)
+    return text
+for t in tasks:
+    open(f"{sys.argv[2]}/tasks/{t['task_id']}.txt", "w").write(own_text(t))
     print(t["task_id"])
+for m in body.get("mentions", []):
+    open(f"{sys.argv[2]}/mentions/{int(m['sequence']):012d}.txt", "w").write(own_text(m))
+if isinstance(body.get("mention_cursor"), int) and not isinstance(body.get("mention_cursor"), bool):
+    open(f"{sys.argv[2]}/mc", "w").write(str(body["mention_cursor"]))
 PY
+  [ ! -s "$TMP/mc" ] || MC=$(cat "$TMP/mc")
   for f in "$TMP"/tasks/*.txt; do
     [ -e "$f" ] || continue
     tid=$(basename "$f" .txt)
@@ -150,6 +167,19 @@ PY
     args=$(python3 -c 'import sys,json;print(json.dumps({"task_id":sys.argv[1],"status":sys.argv[2],"result":open(sys.argv[3]).read()[:3500]}))' "$tid" "$status" "$TMP/out.txt")
     call task_update "$args" >/dev/null || true
     echo "$tid $status"
+    rm -f "$f"
+  done
+  for f in "$TMP"/mentions/*.txt; do      # a mention: the harness reads it once; nothing is posted back
+    [ -e "$f" ] || continue
+    seq=$(basename "$f" .txt); rc=0
+    audit mention_start sequence="$seq" text_sha256="$(sha256sum "$f" | cut -d' ' -f1)" text_bytes="$(wc -c < "$f")"
+    if [ -n "$SANDBOX" ]; then
+      timeout "\${HERDR_TASK_TIMEOUT:-900}" "$SANDBOX" "$WORK" "$CMD" < "$f" > "$TMP/out.txt" 2>&1 || rc=$?
+    else
+      timeout "\${HERDR_TASK_TIMEOUT:-900}" bash -c "$CMD" < "$f" > "$TMP/out.txt" 2>&1 || rc=$?
+    fi
+    audit mention_end sequence="$seq" exit="$rc" output_bytes="$(wc -c < "$TMP/out.txt")"
+    echo "mention $seq exit $rc"
     rm -f "$f"
   done
 done

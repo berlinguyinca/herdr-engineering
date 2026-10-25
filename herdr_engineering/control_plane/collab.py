@@ -36,6 +36,7 @@ from . import collab_mentions as mentions
 from . import collab_models, ids, logfile_lock
 from . import collab_refs as issue_refs
 from .collab_attention import AttentionMixin
+from .collab_commands import COMMAND_EVENTS, WRITE_STATE_EVENTS, CommandsMixin, parse_command
 from .collab_context import ContextMixin
 from .collab_files import FilesMixin
 from .collab_workbench import WorkbenchMixin
@@ -112,7 +113,7 @@ REF_READ_WAIT = 0.05         # seconds a read (under the room lock) waits for th
 MAX_BODY = 64 * 1024
 _PANE_LINK = re.compile(r"pane:[a-z0-9][a-z0-9._-]{0,62}:[A-Za-z0-9][A-Za-z0-9:_.-]{0,39}")
 _KEY_RE = re.compile(r"[A-Za-z0-9._:\-]{1,128}\Z")
-_MESSAGE_FIELDS = frozenset({"text", "idempotency_key", "in_reply_to", "context", "files"})
+_MESSAGE_FIELDS = frozenset({"text", "idempotency_key", "in_reply_to", "context", "files", "selection"})
 _MESSAGE_DERIVED = frozenset({"mentions", "refs"})   # the server derives these from the text; a client's copy is dropped
 _CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")   # C0, DEL and C1 (8-bit CSI)
 _NAME_BAD = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]")
@@ -123,7 +124,7 @@ _FEED_TYPES = frozenset({"message", "member_added", "member_removed",
                          "agent_granted", "agent_revoked", "agent_grant_revoked", "agent_renamed",
                          "task_created", "task_updated",
                          "helper_requested", "helper_claimed", "helper_started", "helper_finished",
-                         "helper_cancelled", "helper_expired"})
+                         "helper_cancelled", "helper_expired"}) | COMMAND_EVENTS
 # Room <-> Herdr workspace links. A link is what room members may SEE of a workspace; the
 # terminal is a separate, explicit grant that is never implied by room membership.
 LINK_VIEW_GRANTS = frozenset({"status", "tabs", "panes"})       # metadata only, never terminal bytes
@@ -352,7 +353,7 @@ class FileEventLog:
     record = record_required
 
 
-class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FilesMixin):
+class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FilesMixin, CommandsMixin):
     def __init__(self, authenticator: UserAuthenticator, *, sink: Any = None,
                  now=None, enrollment_ttl: float = 600.0, credential_ttl: float = 12 * 3600.0,
                  stream_poll_seconds: float = 1.0, message_limit: int = 60,
@@ -481,6 +482,7 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FilesMixin):
         self._init_context()
         self._init_attention()
         self._init_files()
+        self._init_commands()
 
     # ------------------------------------------------------------ plumbing
     @property
@@ -692,6 +694,7 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FilesMixin):
                 self._apply(ev)
             for k, v in self._usage_reserved.items():
                 self._usage[k] = max(self._usage[k], v)      # restart: the durable ceiling, never lower than used
+            self._read_floor = self._seq                     # read markers are memory only: nothing old is unread
             # helper_task is always committed right before its helper_requested (two commits under one lock):
             # a text still waiting here belongs to a request whose second commit failed. Drop it.
             self._helper_text.clear()
@@ -1065,6 +1068,8 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FilesMixin):
         elif t == "message":
             self._idem[(p["sender_key"], p["room_id"], p["idempotency_key"])] = (p["fingerprint"], seq)
             self._msg_room[ev["event_id"]] = (p["room_id"], seq)
+        elif t in COMMAND_EVENTS or t in WRITE_STATE_EVENTS:
+            self._apply_commands(ev)
         if t in _FEED_TYPES:
             for rid in {p.get("room_id"), *p.get("room_ids", ())} - {None}:
                 self._by_room[rid].append(ev)
@@ -1377,8 +1382,12 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FilesMixin):
             for rid, room in self._rooms.items():
                 m = self._member(room, pr.id)
                 if m:
+                    guest = m["role"] == "guest"
+                    eff = None if guest else self._effective(pr, room)
                     out.append({"room_id": rid, "name": room["name"], "role": m["role"],
-                                "project_id": room["project_id"] if m["role"] != "guest" else None})
+                                "project_id": room["project_id"] if not guest else None,
+                                # your own count only, never for a guest (C7)
+                                "unread_mentions": self._unread_mentions(pr, rid, eff[1]) if eff else None})
         return {"rooms": out}
 
     def get_room(self, pr: Principal, room_id: str) -> dict:
@@ -3494,6 +3503,7 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FilesMixin):
                 raise CollabError(429, "too many open room views")
             self._state_waiters[pr.key] += 1
             self._mark_seen(room_id, pr)
+        read_upto = cursor                    # what the reader already has; raised to what this reply sends
         try:
             with self._cv:
                 while True:
@@ -3513,11 +3523,13 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FilesMixin):
             m = self._member(self._rooms[room_id], pr.id) if not pr.is_agent else None
             guest = bool(m and m["role"] == "guest")
             out: dict[str, Any] = {"seq": cur, "changed": True, **self.read_events(pr, room_id, cursor, 200)}
+            read_upto = out["next_cursor"]
             out["agents"] = [] if guest else self.list_room_agents(pr, room_id)["agents"]
             with self._lock:                      # handles only, never emails; a guest gets no roster
                 out["people"] = [] if guest else self._room_people(room_id)
             out["tasks"] = self.list_tasks(pr, room_id)["tasks"]
             out["files"] = self.room_files(pr, room_id)      # new files reach agents and people on this poll
+            out["decisions"] = self.list_decisions(pr, room_id)["decisions"]
             out["flow"] = None if guest else self.room_flow(pr, room_id)
             with self._lock:                      # quiet reads: people only, never guests or agents
                 visible = not pr.is_agent and not guest
@@ -3533,6 +3545,7 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FilesMixin):
             with self._cv:
                 self._state_waiters[pr.key] -= 1
                 self._mark_seen(room_id, pr)
+                self._mark_read(room_id, pr, read_upto)
 
     FLOW_TASKS = 60
 
@@ -3703,7 +3716,10 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FilesMixin):
                                 "owner_user_id": a["owner"], "actions": g["actions"],
                                 "external": bool(a.get("external")), "address": self._address(aid),
                                 "aliases": list(a.get("aliases", ())), "skills": list(a.get("skills", ())),
-                                "online": self._online(room_id, "agent", aid)})
+                                "online": self._online(room_id, "agent", aid),
+                                "working": (busy := self._working(room_id, aid)),
+                                "presence": "working" if busy else (
+                                    "online" if self._online(room_id, "agent", aid) else "offline")})
         return {"agents": out}
 
     # -- room <-> workspace and mission links
@@ -4997,10 +5013,13 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FilesMixin):
         return seen is not None and self._now() - seen < self.ONLINE_WINDOW
 
     def _address_book(self, room_id: str) -> dict[str, dict]:
-        """name -> mention for one room, by precedence: group, agent address, person handles, agents' current
-        names, then old names. A lower level never overrides a higher one (so `@carol` always reaches the
-        member carol, never an agent someone named "carol"); a name two principals share at one level
-        addresses nobody."""
+        """name -> mention for one room, by precedence: group, agent address, then person handles and agents'
+        current names (one level), then old names. A lower level never overrides a higher one; a name two
+        principals share at the same level addresses nobody."""
+        return {k: v for k, v in self._address_entries(room_id).items() if isinstance(v, dict)}
+
+    def _address_entries(self, room_id: str) -> dict[str, Any]:
+        """The address book with ambiguous names kept: name -> mention, or the list of principals sharing it."""
         room = self._rooms[room_id]
         people = [u for u in room["members"] if self._member(room, u)]
         agents = self._room_agents_live(room)
@@ -5025,8 +5044,8 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FilesMixin):
                 if name not in book and len({(h["kind"], h["id"]) for h in hits}) == 1:
                     book[name] = hits[0]
                 elif name not in book:
-                    book[name] = None                      # ambiguous: blocks lower levels too
-        return {k: v for k, v in book.items() if v is not None}
+                    book[name] = list(hits)                # ambiguous: blocks lower levels too
+        return book
 
     def _group_members(self, room_id: str, group: str) -> list[dict]:
         """Who a group reaches in this room now (internal: never part of a stored or returned message)."""
@@ -5196,6 +5215,16 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FilesMixin):
                     raise CollabError(400, f"text must be 1-{MAX_TEXT} characters")
                 clean = ext.clean_text(text, MAX_TEXT, multiline=True)
             files = self._message_files(room_id, body["files"]) if "files" in body else []
+            # C6: a room command, only when `/` starts the text; a remote agent's text never is one
+            cmd = None if pr.external else parse_command(clean)
+            selection = body.get("selection")
+            if selection is not None and (not isinstance(selection, list) or not 1 <= len(selection) <= 20
+                                          or not all(isinstance(x, str) and len(x) <= 128 for x in selection)):
+                raise CollabError(400, "selection must list 1-20 message ids")
+            if selection is not None and cmd is None:
+                raise CollabError(400, "selection is only used by /issue")
+            if cmd is not None and (files or "context" in body):
+                raise CollabError(400, "a room command carries no files or context")
             if (not clean.strip() and not files) or len(clean) > MAX_TEXT:
                 raise CollabError(400, f"text must be 1-{MAX_TEXT} characters")
             reply = body.get("in_reply_to")
@@ -5210,7 +5239,8 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FilesMixin):
             if "context" in body:
                 # T14: a reference to a graph node/edge/proposal/comment. Validated, and visible to THIS poster now.
                 ctx = self._wb_call(self._context_for_post, pr, room, room_id, body["context"])
-            fp = _digest(json.dumps([room_id, clean, reply] + ([ctx] if ctx else []) + ([files] if files else [])))
+            fp = _digest(json.dumps([room_id, clean, reply] + ([ctx] if ctx else []) + ([files] if files else [])
+                                    + ([selection] if selection else [])))
             prior = self._idem.get((pr.key, room_id, key))
             if prior:
                 if prior[0] != fp:
@@ -5237,10 +5267,18 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FilesMixin):
             self._hits[pr.key] = hits
             self._hits[okey] = ohits
             stored = redact_text(clean)
+            if cmd is not None:      # counted against the same per-sender and per-owner budgets as a message
+                ev = self._command_event(pr, room, room_id, cmd, stored, key=key, fp=fp, reply=reply,
+                                         selection=selection, first=first, catalog=catalog)
+                self.stats["commands"] += 1
+                return 201, {"event": self._view(ev, viewer=pr, _ctx_cache={"github_refs": catalog})}
+            found = self._resolve_mentions(room_id, stored)
+            wakes = self._wake_targets(pr, room, room_id, found)      # C7: which agents' harnesses this may run
             ev = self._commit("message", self._actor(
                 pr, project_id=room["project_id"], room_id=room_id, sender_key=pr.key,
                 sender_kind=pr.kind, sender_id=pr.id, sender_external=pr.external, idempotency_key=key, fingerprint=fp,
-                text=stored, mentions=self._resolve_mentions(room_id, stored), in_reply_to=reply, trust="untrusted",
+                text=stored, mentions=found, in_reply_to=reply, trust="untrusted",
+                **({"wakes": wakes} if wakes else {}),
                 **({"refs": refs} if (refs := self._resolve_refs(stored, not self._restricted(pr, room_id), catalog)) else {}),
                 **({"context": ctx} if ctx else {}), **({"files": files} if files else {}),
                 visibility_scope="room", action="message.post", outcome="allowed",
@@ -5272,6 +5310,9 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FilesMixin):
                 out["files"] = [dict(f) for f in p["files"]]
             if p.get("context"):
                 out["context"] = self._message_context(p, viewer, {} if _ctx_cache is None else _ctx_cache)
+        elif t in COMMAND_EVENTS:
+            out.update(actor_user_id=p.get("actor_user_id"), actor_agent_id=p.get("actor_agent_id"))
+            self._command_view(ev, viewer, out)
         elif t in ("task_created", "task_updated"):
             out.update(actor_user_id=p.get("actor_user_id"), actor_agent_id=p.get("actor_agent_id"),
                        task={"task_id": p["task_id"], "target_agent_id": p.get("target_agent_id"),
@@ -5541,6 +5582,8 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FilesMixin):
                         return 200, self.list_tasks(pr, rid)
                     if parts[2:] == ["files"]:
                         return 200, self.list_files(pr, rid)
+                    if parts[2:] == ["decisions"]:
+                        return 200, self.list_decisions(pr, rid)
                     if parts[2:] == ["refs"]:
                         return 200, self.search_refs(pr, rid, query.get("q", ""))
                     if parts[2:] == ["consultations"]:
@@ -5747,6 +5790,10 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FilesMixin):
                         return self.post_message(pr, rid, body)
                     if n == 5 and parts[2] == "files" and parts[4] == "delete":
                         return 200, self.delete_file(pr, rid, parts[3])
+                    if n == 5 and parts[2] == "drafts" and parts[4] == "confirm":
+                        return 200, self.confirm_draft(pr, rid, parts[3])
+                    if n == 5 and parts[2] == "handoffs" and parts[4] in ("accept", "decline"):
+                        return 200, self.answer_handoff(pr, rid, parts[3], parts[4])
             raise CollabError(404, "not found")
         except CollabError as exc:
             err = {"error": exc.message, **getattr(exc, "extra", {})}

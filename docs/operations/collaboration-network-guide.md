@@ -173,6 +173,59 @@ operator's confirmation). Everyone else, including every agent, sees a private r
 `owner/repo#n` without its title. Their `#` menu lists public repositories' issues only, and a
 reference they post to a private repository stays plain text. Public repositories: everyone.
 
+### Room commands (`/handoff`, `/decide`, `/summarize`, `/issue`, `/assign`)
+
+The server reads a message as a command only when `/` is its **first** character and one of these names follows.
+`/` anywhere else (`see /decide later`, `/usr/bin/env`, `@gert.pi /skill`) is plain text and reaches harnesses
+unchanged. A remote (invited) agent's text is never a command. Commands count against the same per-sender and
+per-person message limits as messages, so agents handing work to each other cannot loop faster than that.
+
+- `/handoff @from @to note` (or `/handoff @to note`, from you): a card naming both and the note; `@to` is notified.
+  An unknown, ambiguous or group name is refused with the same wording as the composer. Any member who can post.
+- `/decide text`: a decision card; decisions are listed under `GET .../rooms/{room}/decisions` and in room state.
+- `/summarize [focus]`: a request card that an online agent answers (the server calls no model).
+- `/issue owner/repo [title]`, replying to a message or with messages selected (the ✓ on each message): an
+  **issue draft** built from those messages, with attribution and secrets redacted. Approvers only.
+- `/assign #repo-n @person`: an **assignment draft**; `@person` must map to a GitHub login under
+  `control_plane.collab.people.<handle>.github`. Approvers only.
+
+Nothing reaches GitHub until an approver presses **Create issue on GitHub…** / **Assign on GitHub…** on the draft
+and confirms. Writes are off unless the fleet YAML says `github.write.enabled: true`, and they use the token in the
+file `github.write.token_ref` points to (absolute path, mode 0600) — a separate token from the read-only catalog
+token; the same token is refused. Writes go only to owners listed in `github.organizations` (an empty list permits
+no writes), at most 10 per approver per 10 minutes. The issue text never mentions or links anyone on GitHub
+(a zero-width joiner follows every `@` and `#`), and the confirm dialog shows its title and opening. Before the
+call the server records that the write started; if it then crashes before recording the result, a later confirm
+answers "outcome unknown – check GitHub" instead of creating a second issue (each issue body ends with a hidden
+`<!-- herdr-draft:<id> -->` marker to search for). `/assign` uses the login the YAML holds when it is confirmed.
+`/summarize` posts a request card only: worker.sh agents are not woken by it (mention an agent to ask one). A second click while the first is running is refused; after
+it, confirm returns the recorded issue number. The public collab container never has the `github` section, so it
+never writes; writes need the combined control plane. Without approval mode only the dashboard operator is an
+approver.
+
+**Handoff status.** A handoff starts *pending*. Its recipient (a person, the recipient agent itself, or that agent's
+owner) presses **Accept** or **Decline** on the card (`POST .../rooms/{room}/handoffs/{id}/accept|decline`); the
+answer is final and posts its own card, which reaches whoever handed the work over. A handoff nobody answered for
+7 days shows as *expired* (display only; it can no longer be answered).
+
+**Presence.** In the room's agent list an agent shows *working…* while it holds an accepted task in that room, else
+*online* or nothing.
+
+**Unread mentions.** The Rooms page shows, per room, how many messages and handoffs addressed **you** since you
+last had that room open (your own count only, capped at 99+, never shown to guests). Opening the room clears it.
+Read markers are kept in memory: after a restart nothing older counts as unread.
+
+**A mention wakes the agent.** `worker.sh` waits for tasks *and* for messages or handoffs that address its agent
+(`@owner.harness`, its name, `@agents`, `@all`, `@here`), in rooms where the owner approved *Receive tasks*, and only
+when the sender could give it a task right now (a member with the task right, or an agent approved to *Send tasks*;
+never an invited remote agent). An agent's mention wakes another agent only while it holds an accepted task in that
+room (as for delegating: not deeper than three steps, never straight back to the agent that gave it the work), and
+wake-ups are budgeted like tasks (20 per sender, 40 per person, 20 per woken agent, per 10 minutes); a group mention
+wakes at most 5 agents. It hands
+each such text to the harness once (one leading `@<its own name>` dropped, as for tasks) and does not post the
+harness output back to the room; a harness that wants to answer posts with its own room tools. Agents' posts, including commands, count against the same
+message limits as people's, which bounds agent-to-agent chains.
+
 ### The flow of work (live graph)
 
 Every room has a **Flow of work** panel (not shown to guests): people on the left, agents to the right, one line per

@@ -11,6 +11,7 @@ import hashlib
 import json
 import logging
 import math
+import re
 import threading
 import time
 import urllib.error
@@ -105,6 +106,7 @@ class GitHubError(RuntimeError):
             "response_too_large": "The GitHub response exceeded the bounded read limit.",
             "redirect": "GitHub redirected the request; credentials were not forwarded.",
             "capacity": "The configured catalog safety limit was reached; coverage is partial.",
+            "rejected": "GitHub rejected the request as invalid.",
             "invalid_config": "github.organizations must be a list of non-empty GitHub owner logins; fix the YAML configuration.",
         }.get(reason, "GitHub is temporarily unavailable."))
 
@@ -1626,3 +1628,148 @@ class RefCatalog:
         opened = self._details.get((rid, number)) or {}
         return {"title": opened.get("title"), "state": "closed" if record.get("issues_complete") else None,
                 "url": opened.get("url"), "private": bool(record.get("private"))}
+
+
+# -- gated GitHub writes (collab `/issue` and `/assign`, Task C6) ---------------------------------------------
+
+
+_OWNER = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})\Z")
+_REPO = re.compile(r"[A-Za-z0-9._-]{1,100}\Z")
+_LOGIN = _OWNER
+WRITE_TITLE_MAX = 256
+WRITE_BODY_MAX = 20000
+
+
+class GitHubWriteError(RuntimeError):
+    """A refused or failed write. The message is fixed text: never a token, a reply body or a path."""
+
+    MESSAGES = {
+        "disabled": "GitHub writes are disabled (github.write.enabled is false).",
+        "not_configured": "github.write.token_ref must name a private (0600) token file on the server.",
+        "same_token": "github.write.token_ref must hold a different token than the read-only catalog token.",
+        "out_of_scope": "That owner is not in github.organizations; writes go to listed owners only.",
+        "invalid": "The repository, issue number or login is not valid.",
+    }
+
+    def __init__(self, reason):
+        self.reason = reason
+        super().__init__(self.MESSAGES.get(reason) or GitHubError(reason).args[0])
+
+
+def _configured_write():
+    from .host_config import host_value
+    return host_value("github.write")
+
+
+def _configured_read_token():
+    from .host_config import host_value
+    return host_value("github.token")
+
+
+class GitHubWriter:
+    """Creates issues and assigns them, nothing else. Every call re-reads YAML ``github.write`` and refuses unless
+    ``enabled`` is true; the token comes from ``token_ref`` (an absolute path to a 0600 file, read fresh per call,
+    the review gate's ``read_key`` rules) and must differ from the read-only catalog token (``github.token``).
+    Owners must be listed in ``github.organizations`` (an empty list permits no writes). The token never reaches
+    a return value, an exception message or a log line."""
+
+    def __init__(self, *, settings=None, organizations=None, read_token=None, client=None):
+        self._settings = settings or _configured_write
+        self._organizations = organizations or _configured_organizations
+        self._read_token = read_token or _configured_read_token
+        self._client = client or urllib.request.build_opener(_NoRedirect())
+
+    def status(self):
+        """``{"enabled": bool}`` from YAML now (no token read, no network)."""
+        try:
+            value = self._settings()
+        except Exception:
+            value = None
+        return {"enabled": isinstance(value, dict) and value.get("enabled") is True}
+
+    def in_scope(self, owner):
+        from .config import github_organizations
+        try:
+            allow = set(github_organizations(self._organizations()))
+        except InvalidError:
+            return False
+        return isinstance(owner, str) and owner.lower() in allow
+
+    def _token(self):
+        if not self.status()["enabled"]:
+            raise GitHubWriteError("disabled")
+        ref = (self._settings() or {}).get("token_ref")
+        from .review_gate.worker import WorkerConfigError, read_key
+        try:
+            token = read_key(ref)
+        except (WorkerConfigError, TypeError, ValueError):
+            raise GitHubWriteError("not_configured") from None
+        try:
+            read = self._read_token()
+        except Exception:
+            read = None
+        if isinstance(read, str) and read.strip() == token:
+            raise GitHubWriteError("same_token")
+        return token
+
+    def _check(self, owner, repo):
+        if not (isinstance(owner, str) and _OWNER.match(owner) and isinstance(repo, str) and _REPO.match(repo)
+                and repo not in (".", "..")):
+            raise GitHubWriteError("invalid")
+        if not self.in_scope(owner):
+            raise GitHubWriteError("out_of_scope")
+
+    def _send(self, path, payload):
+        token = self._token()
+        request = urllib.request.Request("https://api.github.com" + path, data=json.dumps(payload).encode(),
+                                         method="POST", headers={
+                                             "Authorization": f"Bearer {token}", "Content-Type": "application/json",
+                                             "Accept": "application/vnd.github+json",
+                                             "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "herdr-engineering"})
+        try:
+            with self._client.open(request, timeout=20) as response:
+                raw = response.read(MAX_RESPONSE + 1)
+            if len(raw) > MAX_RESPONSE:
+                raise GitHubError("response_too_large")
+            data = json.loads(raw.decode().replace(token, "[REDACTED]"))
+            if not isinstance(data, dict):
+                raise GitHubError("invalid_response")
+            return data
+        except GitHubError:
+            raise
+        except urllib.error.HTTPError as exc:
+            reason = {401: "authentication", 403: "permission", 404: "not_found", 410: "not_found",
+                      422: "rejected", 429: "rate_limited"}.get(exc.code, "unavailable")
+            if 300 <= exc.code < 400:
+                reason = "redirect"
+            # GitHub's secondary rate limit is a 403 with Retry-After (or no remaining quota): not a permission problem
+            if exc.code == 403 and (exc.headers.get("Retry-After") or exc.headers.get("X-RateLimit-Remaining") == "0"):
+                reason = "rate_limited"
+            exc.close()
+            raise GitHubError(reason) from None
+        except (ValueError, TypeError, UnicodeError):
+            raise GitHubError("invalid_response") from None
+        except (OSError, urllib.error.URLError):
+            raise GitHubError("unavailable") from None
+
+    def create_issue(self, owner, repo, title, body):
+        """``{"number", "url"}`` of the new issue in ``owner/repo``."""
+        self._check(owner, repo)
+        if not isinstance(title, str) or not title.strip() or not isinstance(body, str):
+            raise GitHubWriteError("invalid")
+        data = self._send(f"/repos/{owner}/{repo}/issues",
+                          {"title": title[:WRITE_TITLE_MAX], "body": body[:WRITE_BODY_MAX]})
+        number, url = data.get("number"), data.get("html_url")
+        if not isinstance(number, int) or isinstance(number, bool) or not isinstance(url, str):
+            raise GitHubError("invalid_response")
+        return {"number": number, "url": url[:500]}
+
+    def assign(self, owner, repo, number, login):
+        """Add ``login`` to the assignees of issue ``number``; ``{"assignees": [...]}``."""
+        self._check(owner, repo)
+        if (not isinstance(number, int) or isinstance(number, bool) or number <= 0
+                or not isinstance(login, str) or not _LOGIN.match(login)):
+            raise GitHubWriteError("invalid")
+        data = self._send(f"/repos/{owner}/{repo}/issues/{number}/assignees", {"assignees": [login]})
+        names = [a.get("login") for a in data.get("assignees") or () if isinstance(a, dict)]
+        return {"assignees": [n for n in names if isinstance(n, str)][:20]}
