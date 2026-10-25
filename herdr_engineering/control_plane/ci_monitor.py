@@ -72,9 +72,9 @@ class CIMonitor:
     def __init__(self, *, provider_factory=None, interval=30, repo_limit=500,
                  budget=120, now=None, on_transition=None, actions_enabled=False,
                  on_observation=None, max_in_flight=4, max_reads_per_refresh=600):
-        from ..ci import _ProviderReadScheduler
+        from ..ci import _ProviderReadScheduler, _read_allowance
         self._scheduler = _ProviderReadScheduler(max_in_flight)
-        self._max_reads_per_refresh = max(0, min(2400, max_reads_per_refresh))
+        self._max_reads_per_refresh = _read_allowance(max_reads_per_refresh)
         self._cursor = 0
         self._measurements = _Measurements()
         self._factory = provider_factory or _provider

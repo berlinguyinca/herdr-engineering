@@ -340,3 +340,48 @@ def test_provider_switch_does_not_relabel_cached_runs_after_failed_head():
     assert view['stale']
     assert view['pipelines']['org/app'] == []
     monitor.close()
+
+
+def test_read_allowances_reject_fractional_and_noninteger_values_before_io():
+    import pytest
+
+    from herdr_engineering.ci import _ProviderReadScheduler
+    from herdr_engineering.control_plane.ci_history import CIHistory
+    from herdr_engineering.control_plane.ci_observability import _Measurements
+
+    def forbidden_provider():
+        raise AssertionError('invalid allowance performed provider I/O')
+
+    for allowance in (0.5, 1.5, True, False, None, '2', -1, float('nan')):
+        for collector in (CIHistory, CIMonitor):
+            with pytest.raises(ValueError, match='integer'):
+                collector(provider_factory=forbidden_provider, max_reads_per_refresh=allowance)
+        scheduler = _ProviderReadScheduler()
+        try:
+            with pytest.raises(ValueError, match='integer'):
+                scheduler.refresh(budget=1, max_reads=allowance, now=lambda: 0,
+                                  measurements=_Measurements())
+        finally:
+            scheduler.close()
+
+
+def test_scheduler_rejects_nonpositive_remaining_allowances_without_a_call():
+    import pytest
+
+    from herdr_engineering.ci import _ProviderReadScheduler
+    from herdr_engineering.control_plane.ci_observability import _Measurements
+
+    calls = []
+    scheduler = _ProviderReadScheduler()
+    try:
+        for remaining in (0, -1):
+            measurements = _Measurements()
+            batch = scheduler.refresh(budget=1, max_reads=1, now=lambda: 0,
+                                      measurements=measurements)
+            batch._remaining_reads = remaining
+            with pytest.raises(TimeoutError):
+                batch.call(lambda: calls.append('called'))
+            assert measurements.snapshot()['provider_calls'] == 0
+        assert calls == []
+    finally:
+        scheduler.close()

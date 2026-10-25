@@ -588,3 +588,130 @@ def test_noop_refresh_keeps_summary_revision_and_generated_at():
     second = cache.summary_snapshot(start=False)
     assert second['revision'] == first['revision']
     assert second['generated_at'] == first['generated_at']
+
+
+def test_repository_rename_discards_old_pages_and_revalidates_coverage():
+    provider = MemoryProvider(runs(70, days=0.01))
+    provider.rows[60]['state'] = 'failure'
+    cache = history(provider)
+    cache.refresh()
+    assert cache.snapshot(start=False)['coverage']['17']['exhausted']
+    provider.repositories[0]['repository'] = 'org/renamed'
+    provider.rows[60]['state'] = 'success'
+    provider.reads.clear()
+    cache._pages_per_refresh = 1
+    cache.refresh()
+    view = cache.snapshot(start=False)
+    assert len(view['pipelines']) == 50
+    assert {row['repository'] for row in view['pipelines']} == {'org/renamed'}
+    assert not view['coverage']['17']['exhausted']
+    assert view['coverage']['17']['complete_since'] == provider.rows[49]['created_at']
+    project = cache.summary_snapshot(start=False)['projects'][0]
+    assert project['repository'] == 'org/renamed'
+    assert project['pipeline_count'] == 50
+    assert project['outcomes'] == {'success': 50}
+    cache.refresh()
+    view = cache.snapshot(start=False)
+    assert ('17', 2) in provider.reads
+    assert len(view['pipelines']) == 70
+    assert {row['repository'] for row in view['pipelines']} == {'org/renamed'}
+    assert view['coverage']['17']['exhausted']
+    assert cache.summary_snapshot(start=False)['projects'][0]['outcomes'] == {'success': 70}
+    cache.close()
+
+
+def test_repository_rename_with_failed_head_has_no_relabelled_rows_or_coverage():
+    provider = MemoryProvider(runs(70, days=0.01))
+    cache = history(provider)
+    cache.refresh()
+    provider.repositories[0]['repository'] = 'org/renamed'
+    provider.failure = ('17', 1)
+    cache.refresh()
+    view = cache.snapshot(start=False)
+    assert view['pipelines'] == []
+    assert view['stale']
+    assert not view['coverage']['17']['exhausted']
+    assert view['coverage']['17']['complete_since'] is None
+    assert cache.summary_snapshot(start=False)['projects'][0]['pipeline_count'] == 0
+    cache.close()
+
+
+def test_prefetched_head_memory_is_bounded_independently_of_inventory_size():
+    import json
+    import threading
+    import weakref
+
+    byte_limit, concurrency = 500_000, 2
+    for count in (8, 80):
+        lock = threading.Lock()
+        live = peak = largest = 0
+
+        def released(size):
+            nonlocal live
+            with lock:
+                live -= size
+
+        class TrackedHead(list):
+            def __init__(self, rows):
+                nonlocal live, peak, largest
+                super().__init__(rows)
+                size = len(json.dumps(rows, separators=(',', ':')).encode())
+                with lock:
+                    live += size
+                    peak = max(peak, live)
+                    largest = max(largest, size)
+                weakref.finalize(self, released, size)
+
+        provider = MemoryProvider([{**row, 'revision': 'x' * 4096} for row in runs(50)],
+                                  repositories=[{'id': i, 'repository': f'org/{i}',
+                                                 'default_branch': 'main'} for i in range(1, count + 1)])
+        cache = history(provider, byte_limit=byte_limit, max_in_flight=concurrency)
+        original_fetch = cache._fetch
+
+        def tracked_fetch(*args):
+            return TrackedHead(original_fetch(*args))
+
+        cache._fetch = tracked_fetch
+        cache.refresh()
+        # Measure actual live response objects, including completed futures, not
+        # a production counter that could overlook temporary head dictionaries.
+        assert peak <= byte_limit + (concurrency + 2) * largest
+        view = cache.snapshot(start=False)
+        assert view['pipelines'] and view['stale']
+        assert len(view['repos']) == count
+        assert cache._byte_count <= byte_limit
+        assert any(not coverage['exhausted'] for coverage in view['coverage'].values())
+        cache.close()
+
+
+def test_failed_prefetch_does_not_retain_response_payloads_in_tracebacks():
+    import threading
+    import weakref
+
+    lock = threading.Lock()
+    live = weakref.WeakSet()
+    peak = 0
+
+    class Payload:
+        def __init__(self):
+            self.body = b'x' * 100_000
+
+    provider = MemoryProvider([], repositories=[
+        {'id': i, 'repository': f'org/{i}'} for i in range(1, 21)])
+    cache = history(provider, max_in_flight=2, max_reads_per_refresh=21)
+
+    def failed_fetch(*args):
+        nonlocal peak
+        payload = Payload()
+        with lock:
+            live.add(payload)
+            peak = max(peak, len(live))
+        raise RuntimeError('private decode failure')
+
+    cache._fetch = failed_fetch
+    cache.refresh()
+    assert peak <= 4, 'staged errors retained provider response frames'
+    view = cache.snapshot(start=False)
+    assert view['pipelines'] == [] and view['stale']
+    assert 'private decode failure' not in str(view)
+    cache.close()

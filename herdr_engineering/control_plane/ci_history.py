@@ -30,6 +30,10 @@ def _key(row):
     return str(value) if isinstance(value, (int, str)) and str(value).isdigit() and int(value) > 0 else None
 
 
+def _repository_identity(repo):
+    return repo['provider_url'], str(repo['id']), repo['repository']
+
+
 def _coverage():
     return dict(complete_since=None, exhausted=False, truncated=False, error=None, checked_at=None)
 
@@ -39,10 +43,10 @@ class CIHistory:
                  wall_now=None, repo_limit=500, page_limit=60, run_limit=3000,
                  total_limit=20000, byte_limit=16 * 1024 * 1024, pages_per_refresh=600,
                  max_in_flight=4, max_reads_per_refresh=600, scheduler=None):
-        from ..ci import _ProviderReadScheduler
+        from ..ci import _ProviderReadScheduler, _read_allowance
         self._scheduler = scheduler or _ProviderReadScheduler(max_in_flight)
         self._owns_scheduler = scheduler is None
-        self._max_reads_per_refresh = max(0, min(2400, max_reads_per_refresh))
+        self._max_reads_per_refresh = _read_allowance(max_reads_per_refresh)
         self._reads = None
         self._summary_projects = []
         self._summary = None
@@ -75,7 +79,7 @@ class CIHistory:
                               'inventory_complete': False, 'outcome_refresh_seconds': 300,
                               'limits': {'repositories': self._repo_limit, 'pages_per_repository': self._page_limit,
                                          'runs_per_repository': self._run_limit, 'runs': self._total_limit,
-                                         'bytes': self._byte_limit}})
+                                         'bytes': self._byte_limit, 'head_staging_bytes': self._byte_limit}})
 
     def _measurement_snapshot(self):
         return self._measurements.snapshot()
@@ -171,8 +175,8 @@ class CIHistory:
         return repos, complete, error
 
     @staticmethod
-    def _new_state():
-        return dict(rows={}, sizes={}, seen=set(), page=1, head=None, tail=None, done=False,
+    def _new_state(identity):
+        return dict(identity=identity, rows={}, sizes={}, seen=set(), page=1, head=None, tail=None, done=False,
                     verified_at=None, validated_this_cycle=False, signatures={}, mutable_pages=set(),
                     pending_coverage=None, pending_at=None,
                     coverage=_coverage())
@@ -245,7 +249,14 @@ class CIHistory:
                              if str(repo['id']) not in seen
                              and repo.get('provider_url') == self._provider_url)
             repos = repos[:self._repo_limit]
-        self._states = {str(repo['id']): self._states.get(str(repo['id']), self._new_state()) for repo in repos}
+        states = {}
+        for repo in repos:
+            rid, identity = str(repo['id']), _repository_identity(repo)
+            state = self._states.get(rid)
+            # A rename cannot relabel previously retained pages or reuse their
+            # watermark. Only reads for the new exact identity establish proof.
+            states[rid] = state if state and state['identity'] == identity else self._new_state(identity)
+        self._states = states
         self._run_count = sum(len(s['rows']) for s in self._states.values())
         self._byte_count = sum(sum(s['sizes'].values()) for s in self._states.values())
         for state in self._states.values():
@@ -260,8 +271,21 @@ class CIHistory:
         # continuation. The logical page cap remains separate from the I/O cap,
         # which counts discovery and every boundary/final validation as well.
         selected = order[:self._pages_per_refresh]
-        heads = {str(repo['id']): (batch, error) for repo, batch, error in self._reads.map(
-            lambda repo: self._fetch(provider, repo, 1), selected)}
+        from ..ci import _ReadBudgetExceeded
+        heads, staged_bytes = {}, 0
+        for repo, batch, error in self._reads.map(lambda repo: self._fetch(provider, repo, 1), selected):
+            if error is None:
+                size = len(json.dumps(batch, separators=(',', ':')).encode())
+                if staged_bytes + size > self._byte_limit:
+                    # Keep the fast-head phase bounded independently of repo
+                    # count. Rejected heads remain incomplete and are revisited
+                    # by the cursor; futures retain at most max_in_flight reads.
+                    batch = None
+                    error = _ReadBudgetExceeded('CI head staging reached its byte limit')
+                    self._states[str(repo['id'])]['coverage']['truncated'] = True
+                else:
+                    staged_bytes += size
+            heads[str(repo['id'])] = (batch, error)
         queue = deque(selected)
         prepared = set()
         pages = 0
@@ -303,7 +327,7 @@ class CIHistory:
                         if retained is None:
                             self._run_count -= len(state['rows'])
                             self._byte_count -= sum(state['sizes'].values())
-                        state = self._states[rid] = self._new_state()
+                        state = self._states[rid] = self._new_state(state['identity'])
                         if retained is not None:
                             state['rows'] = retained['rows']
                             state['sizes'] = retained['sizes']
@@ -335,7 +359,6 @@ class CIHistory:
                 if not isinstance(exc, ValueError) or not state['coverage']['error']:
                     state['coverage']['error'] = _error(exc)[1]
                 state['coverage']['checked_at'] = self._wall_now().isoformat()
-            from ..ci import _ReadBudgetExceeded
             if not isinstance(heads[rid][1], _ReadBudgetExceeded):
                 self._cursor = (repos.index(repo) + 1) % len(repos)
         # A provider can change while pages are being read. Never advertise
@@ -409,6 +432,8 @@ class CIHistory:
                                'repository': repo['repository']}) for r in batch]
 
     def _retain(self, state, row):
+        if (row.get('provider_url'), str(row.get('provider_repo_id')), row.get('repository')) != state['identity']:
+            return False
         key = _key(row)
         if key is None:
             return False

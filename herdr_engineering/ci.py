@@ -24,6 +24,12 @@ from .errors import InvalidError, PermissionError_Engineering, UnreachableError
 _READ_DEADLINE = ContextVar('ci_read_deadline', default=None)
 
 
+def _read_allowance(value):
+    if type(value) is not int or value < 0:
+        raise ValueError('max_reads_per_refresh must be a nonnegative integer')
+    return min(2400, value)
+
+
 class _ReadBudgetExceeded(TimeoutError):
     """A read could not be started within this refresh's limits."""
 
@@ -56,14 +62,14 @@ class _ProviderReadBatch:
         self.deadline = time.monotonic() + max(0, budget)
         self._now = now
         self._logical_deadline = now() + max(0, budget)
-        self._remaining_reads = max(0, max_reads)
+        self._remaining_reads = _read_allowance(max_reads)
         self._measurements = measurements
 
     def remaining(self):
         return max(0, min(self.deadline - time.monotonic(), self._logical_deadline - self._now()))
 
     def submit(self, callback, *args, **kwargs):
-        if (not self._remaining_reads or not self.remaining() or self.scheduler._closed.is_set()
+        if (self._remaining_reads <= 0 or not self.remaining() or self.scheduler._closed.is_set()
                 or not self.scheduler._slots.acquire(timeout=self.remaining())):
             raise _ReadBudgetExceeded('CI provider refresh budget exceeded')
         if not self.remaining() or self.scheduler._closed.is_set():
@@ -115,14 +121,22 @@ class _ProviderReadBatch:
                     yield item, None, TimeoutError('CI provider refresh budget exceeded')
                 pending.clear()
                 continue
-            for future in done:
+            while done:
+                future = done.pop()
                 item = pending.pop(future)
                 try:
                     result = future.result()
                 except Exception as exc:
+                    # Collectors retain safe error classifications, not provider
+                    # response frames (which may hold a whole decoded page).
+                    exc.__traceback__ = None
+                    exc.__cause__ = None
+                    exc.__context__ = None
                     yield item, None, exc
                 else:
                     yield item, result, None
+                    del result
+                del future
 
 
 @dataclass
