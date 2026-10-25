@@ -253,6 +253,36 @@ def test_head_change_invalidates_old_verdicts_and_the_real_cli_requests_rereview
     assert len(world.dispatch_log.read_text().splitlines()) == 2
 
 
+def test_the_rereview_request_route_records_the_ask_once_per_head_and_the_real_cli_still_reads_the_quorum(world):
+    """T16 gap C. Pi (a trusted head writer) records "this head needs another review" on Herdr; the quorum read then carries
+    `rereview_request` for exactly that head, and the real `autospec review-quorum request` tolerates the new field."""
+    from urllib.parse import quote
+    p = world.plane
+    path = f"/api/v1/graph/nodes/{quote(PR, safe='')}/review-quorum/rereview"
+    world.pi_pr(H1)
+    world.publish("r1", H1)
+    world.publish("r2", H1)
+    assert world.quorum()["status"] == "satisfied"
+    assert p.post(path, {}, key="pi").status == 409                          # control: a satisfied head needs none
+    world.pi_pr(H2)
+    assert world.quorum()["rereview_required"] is True and world.quorum()["rereview_request"] is None
+    assert p.post(path, {}, key="attacker").status == 403                    # an ingest key nobody named
+    assert p.post(path, {}, key="viewer").status == 403                      # a read-only key
+    assert p.post(path, {"head": H1}, key="pi").status == 409                # the old head: stale
+    first = p.post(path, {"head": H2}, key="pi")
+    assert first.status == 201 and first.body["rereview_request"]["head"] == H2
+    again = p.post(path, {}, key="pi")
+    assert again.status == 200 and again.body["replayed"] is True            # one request per head
+    assert again.body["rereview_request"]["request_id"] == first.body["rereview_request"]["request_id"]
+    assert world.quorum(key="r3")["rereview_request"]["request_id"] == first.body["rereview_request"]["request_id"]   # what AutoSpec polls
+    r = world.run("request", "--config", world.cfgs["pi"], "--pr-node", PR, "--state-dir", world.tmp / "state",
+                  "--scratch-dir", world.tmp / "scratch")
+    assert r.returncode == 0 and json.loads(r.stdout)["outcome"] == "requested", (r.stdout, r.stderr)
+    world.pi_pr(H3)                                                           # the head moves again: the old ask is not this head's
+    assert world.quorum()["rereview_request"] is None
+    assert p.post(path, {"head": H3}, key="pi").status == 201
+
+
 def test_a_late_low_sequence_head_write_is_head_unverified_and_the_cli_alerts_with_exit_4(world):
     world.pi_pr(H1, seq=10)
     world.publish("r1", H1)
