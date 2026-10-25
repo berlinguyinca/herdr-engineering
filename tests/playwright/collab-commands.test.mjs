@@ -86,10 +86,14 @@ test('command events render as escaped cards; a draft reaches GitHub only after 
   await button.click();
   await page.waitForTimeout(100);
   assert.equal(requests.filter((r) => r.path.includes('/drafts/')).length, 0);
-  page.once('dialog', (d) => { assert.match(d.message(), /acme\/app/); d.accept(); });
+  let shown = '';
+  page.once('dialog', (d) => { shown = d.message(); d.accept(); });
   await button.click();
   await page.waitForFunction(() => document.querySelector('[data-draft-confirm]')?.disabled);
   assert.deepEqual(requests.filter((r) => r.path.includes('/drafts/')).map((r) => r.path), ['/rooms/room-one/drafts/draft-1/confirm']);
+  assert.match(shown, /acme\/app/);
+  assert.match(shown, /Chart breaks/);                                        // the title
+  assert.match(shown, /the chart breaks/);                                    // and what the issue will say
   await page.evaluate(() => window.collab.dispose());
 }));
 

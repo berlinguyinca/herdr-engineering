@@ -1436,7 +1436,9 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
       if (conf) {
         const issue = conf.dataset.draftKind === 'issue';
         // the explicit confirm: nothing reaches GitHub without it (and the server checks approver + write gate)
-        if (confirm(issue ? `Create this issue in ${conf.dataset.draftWhere.replace(/#$/, '')} on GitHub?` : `Assign ${conf.dataset.draftWhere} on GitHub?`)) {
+        const where = conf.dataset.draftWhere.replace(/#$/, '');
+        const ask = issue ? `Create this issue in ${where} on GitHub?\n\nTitle: ${conf.dataset.draftTitle || ''}\n\n${conf.dataset.draftSummary || ''}` : `Assign ${where} on GitHub?`;
+        if (confirm(ask)) {
           conf.disabled = true;
           act(() => api.confirmDraft(roomId, conf.dataset.draftConfirm));
         }

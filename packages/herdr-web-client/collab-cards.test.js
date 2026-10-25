@@ -95,3 +95,11 @@ test('the api answers a handoff', async () => {
   assert.equal(seen[0].url, '/api/v1/collab/rooms/r1/handoffs/h%201/accept');
   await assert.rejects(() => api.answerHandoff('r1', 'h1', 'maybe'));
 });
+
+test('the confirm button carries the title and a body summary for the confirm dialog', () => {
+  const body = `> ${'x'.repeat(600)}`;
+  const c = commandCard({ event_type: 'issue_draft', created_at: at, draft: { draft_id: 'd1', kind: 'issue', owner: 'acme', repo: 'app', title: `T "${evil}"`, body, status: 'draft', can_confirm: true } });
+  assert.match(c.html, /data-draft-title="T &quot;&lt;img/);
+  const summary = /data-draft-summary="([^"]*)"/.exec(c.html)[1];
+  assert.ok(summary.length > 100 && summary.length <= 420, String(summary.length));
+});

@@ -263,7 +263,7 @@ def test_issue_drafts_only_and_never_calls_github_until_confirmed(w, tmp_path):
     d = ev["draft"]
     assert (d["owner"], d["repo"], d["title"], d["status"]) == ("acme", "binview", "Chart breaks", "draft")
     assert "the chart breaks on empty data" in d["body"] and "and on NaN" in d["body"]
-    assert "@bob" in d["body"] and "@alice" in d["body"]                     # attribution
+    assert "@\u200dbob" in d["body"] and "@\u200dalice" in d["body"]           # attribution that pings nobody
     out = w.s.confirm_draft(w.alice, w.room, d["draft_id"])
     assert out["status"] == "created" and out["number"] == 101
     assert len(opener.requests) == 1 and opener.requests[0]["url"] == "https://api.github.com/repos/acme/binview/issues"
@@ -530,3 +530,18 @@ def test_people_is_an_allowed_collab_key():
     from herdr_engineering.cli import COLLAB_CONFIG_KEYS  # noqa: PLC0415
     from herdr_engineering.fleet_config_cli import COLLAB_KEYS  # noqa: PLC0415
     assert "people" in COLLAB_KEYS and "people" in COLLAB_CONFIG_KEYS
+
+
+# ---------------------------------------------------------------- review fix: an issue body pings nobody
+
+def test_issue_text_never_mentions_or_backlinks_on_github(w):
+    import re  # noqa: PLC0415
+    pi, _ = agent(w, "alice")
+    m1 = say(w, w.bob, "ping @org/team and @alice about #12 and other/repo#3, ask @gert.pi; see https://x.org/a#b")
+    m2 = say(w, pi, "agent note")
+    d = say(w, w.alice, "/issue acme/app Fix #12 for @alice", selection=[m1["event_id"], m2["event_id"]])["draft"]
+    for text in (d["body"], d["title"]):
+        assert not re.search(r"@[A-Za-z0-9]", text), text           # no @mention survives (ZWJ after the sigil)
+        assert not re.search(r"#[0-9]", text), text                   # no #n or owner/repo#n backlink
+    assert "https://x.org/a#b" in d["body"]                           # links stay links
+    assert "@‍org/team" in d["body"] and "other/repo#‍3" in d["body"]

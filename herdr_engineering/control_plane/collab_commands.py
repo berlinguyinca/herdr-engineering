@@ -35,6 +35,21 @@ _COMMAND = re.compile(r"/(handoff|decide|summarize|issue|assign)(?=\s|\Z)")
 _LEADING_NAME = re.compile(r"@([A-Za-z0-9._-]{1,48})(?=\s|\Z)")
 _REPO_ARG = re.compile(r"([A-Za-z0-9](?:[A-Za-z0-9-]{0,38}))/([A-Za-z0-9._-]{1,100})(?=\s|\Z)")
 _HANDLE = re.compile(r"[a-z0-9-]{1,27}\Z")
+_URLS = re.compile(r"(?:[a-z][a-z0-9+.-]{1,15}://|www\.)[^\s<>]{1,2048}", re.I)
+_SIGIL = re.compile(r"([@#])(?=[A-Za-z0-9_./-])")
+ZWJ = "\u200d"
+
+
+def github_neutral(text: str) -> str:
+    """Text for a GitHub issue that mentions and links nobody: a zero-width joiner after every `@` and `#` that
+    starts a name or number (`@alice`, `@org/team`, `#12`, `owner/repo#3`), outside URLs (which stay links)."""
+    out, last = [], 0
+    for m in _URLS.finditer(text):
+        out.append(_SIGIL.sub(r"\1" + ZWJ, text[last:m.start()]))
+        out.append(m.group(0))
+        last = m.end()
+    out.append(_SIGIL.sub(r"\1" + ZWJ, text[last:]))
+    return "".join(out)
 _LOGIN = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})\Z")
 COMMAND_EVENTS = frozenset({"handoff", "handoff_updated", "decision", "summary_request", "issue_draft",
                             "assignment", "github_written"})
@@ -238,12 +253,12 @@ class CommandsMixin:
             quoted = "\n".join("> " + line for line in str(p["text"]).splitlines() or [""])
             parts.append(f"**@{self._who(p['sender_kind'], p['sender_id'], p.get('sender_external'))}** "
                          f"({p['created_at'][:16].replace('T', ' ')} UTC):\n\n{quoted}")
-        footer = f"\n\n---\nDrafted in the collaboration room “{room['name']}” by @{poster}."
-        body = redact_text("\n\n".join(parts))
+        footer = github_neutral(f"\n\n---\nDrafted in the collaboration room “{room['name']}” by @{poster}.")
+        body = github_neutral(redact_text("\n\n".join(parts)))
         if len(body) + len(footer) > ISSUE_BODY_MAX:
             body = body[:ISSUE_BODY_MAX - len(footer) - 20].rstrip() + "\n\n… (truncated)"
         title = rest[m.end():].strip() or str(events[0]["payload"]["text"]).strip().splitlines()[0]
-        title = redact_text(" ".join(title.split()))[:ISSUE_TITLE_MAX] or "Untitled"
+        title = github_neutral(redact_text(" ".join(title.split())))[:ISSUE_TITLE_MAX] or "Untitled"
         return {"draft_id": ids.new_id("draft"), "kind": "issue", "owner": owner, "repo": repo, "title": title,
                 "body": body + footer, "sources": [ev["event_id"] for ev in events]}
 

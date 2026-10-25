@@ -11,6 +11,8 @@ const TONE = { pending: 'var(--status-attention)', accepted: 'var(--status-ok)',
 const party = (p) => (p && p.name ? `@${esc(p.name)}` : 'someone');
 const status = (s) => `<span class="cx-cmdcard__status" data-status style="--tc:${TONE[s] || 'var(--text-muted)'}">${esc(s || '')}</span>`;
 const issueRef = (o, r, n) => `${esc(o)}/${esc(r)}#${Number(n) || ''}`;
+// what the confirm dialog shows of the issue text: the first ~400 characters, ZWJs (anti-mention) removed
+const summarize = (body) => { const t = String(body || '').replaceAll('\u200d', ''); return t.length > 400 ? `${t.slice(0, 400)}…` : t; };
 const safeUrl = (u) => (typeof u === 'string' && /^https:\/\/github\.com\/[A-Za-z0-9._/-]+$/.test(u) ? u : '');
 const head = (title, e, extra = '') => `<div class="cx-taskcard__head"><b>${title}</b>${extra}<time>${esc(new Date(e.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }))}</time></div>`;
 
@@ -34,7 +36,7 @@ export function commandCard(e, ctx = {}) {
   if (e.event_type === 'issue_draft' || e.event_type === 'assignment') {
     const d = e.draft || {};
     const issue = d.kind === 'issue';
-    const confirm = d.can_confirm ? `<div class="cx-row cx-cmdcard__actions"><button type="button" class="hd-btn hd-btn--sm" data-draft-confirm="${esc(d.draft_id)}" data-draft-kind="${issue ? 'issue' : 'assignment'}" data-draft-where="${issueRef(d.owner, d.repo, issue ? '' : d.number)}">${issue ? 'Create issue on GitHub…' : 'Assign on GitHub…'}</button></div>` : '';
+    const confirm = d.can_confirm ? `<div class="cx-row cx-cmdcard__actions"><button type="button" class="hd-btn hd-btn--sm" data-draft-confirm="${esc(d.draft_id)}" data-draft-kind="${issue ? 'issue' : 'assignment'}" data-draft-where="${issueRef(d.owner, d.repo, issue ? '' : d.number)}"${issue ? ` data-draft-title="${esc(d.title || '')}" data-draft-summary="${esc(summarize(d.body))}"` : ''}>${issue ? 'Create issue on GitHub…' : 'Assign on GitHub…'}</button></div>` : '';
     const done = d.number && (d.status === 'created' || d.status === 'assigned') ? ` · ${issueRef(d.owner, d.repo, d.number)}` : '';
     const body = issue
       ? `<div><b>${esc(d.title || '')}</b> <span class="cx-sub1">${esc(d.owner)}/${esc(d.repo)}${done}</span></div><details><summary>Issue text</summary><pre class="cx-cmdcard__body">${esc(d.body || '')}</pre></details>`
