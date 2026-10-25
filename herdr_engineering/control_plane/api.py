@@ -1648,7 +1648,12 @@ def _make_handler(server, public=False, operator=False):
                     return self._json({"error": "not found"}, 404)
                 if what == "resolve":
                     # `#` candidates of in-scope owners from the cache (C4): read-only, bounded, ETag'd
-                    return self._etag_json(server.github_monitor.search_issues(_github_resolve_query(self.path)))
+                    q = _github_resolve_query(self.path)
+                    typed = q.strip().removeprefix("#")
+                    monitor = server.github_monitor
+                    if 0 < len(typed) < 2:   # too short to search: readiness only (a 1-letter prefix sorts nothing)
+                        return self._etag_json({"ready": bool(monitor.cache_ready()), "items": []})
+                    return self._etag_json(monitor.search_issues(q, limit=8 if not typed else 20))
                 query = _github_query(self.path, what)
                 if what == "issue":
                     return self._json(server.github_monitor.issue_detail(

@@ -1408,7 +1408,17 @@ class GitHubMonitor:
         finally:
             self._lock.release()
 
-    def search_issues(self, query, *, limit=SEARCH_LIMIT, start=True):
+    def cache_ready(self, *, start=True):
+        """Whether a catalog is cached for the configured credential (no search, no store call)."""
+        provider = self._sync_credentials()
+        if start:
+            self.start()
+        scope = self._ref_scope()
+        with self._lock:
+            return bool(scope is not False and provider.available
+                        and provider.credential_identity == self._credential and self._repos)
+
+    def search_issues(self, query, *, limit=SEARCH_LIMIT, public_only=False, start=True):
         """`#` menu candidates of in-scope owners: ``{"ready", "items"}`` (at most ``limit``, <= 20).
 
         The store answers (read-only, bounded); memory answers when the store is not trusted
@@ -1428,13 +1438,13 @@ class GitHubMonitor:
         items = None
         if store is not None:
             try:
-                items = store.search_issues(query, scope, limit=limit)
+                items = store.search_issues(query, scope, limit=limit, public_only=public_only)
             except Exception:
                 items = None  # unreachable or not migrated: memory holds the same catalog
         if items is None:
             with self._lock:
                 repos, issues = list(self._repos.values()), dict(self._issues)
-            items = search_rows(repos, lambda rid: issues.get(rid, {}).values(), query, scope, limit)
+            items = search_rows(repos, lambda rid: issues.get(rid, {}).values(), query, scope, limit, public_only)
         with self._lock:
             if generation != self._generation:  # the token changed meanwhile: answer for nobody
                 return {"ready": False, "items": []}

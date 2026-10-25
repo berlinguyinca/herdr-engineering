@@ -129,6 +129,9 @@ def _delta(revision: int, pruned_through: int, since: int, rows: list[dict], tom
 # ---------------------------------------------------------------- issue search (read-only)
 
 SEARCH_LIMIT = 20
+# a search reads the issues of at most this many matching repositories (exact names and numbered
+# matches first, then shorter names), so a one-letter prefix never sorts the whole catalog
+MAX_SEARCH_REPOS = 25
 # what a `#` query may be: `binv`, `binview-4`, `acme/binv`, `acme/binview#4` (lower-cased, `#` optional)
 _QUERY_CHARS = re.compile(r"[a-z0-9_./#-]{0,160}\Z")
 _QUERY_LONG = re.compile(r"([a-z0-9-]{1,39})/([a-z0-9_.-]{0,100})(?:#([0-9]{0,10}))?\Z")
@@ -185,6 +188,21 @@ def ref_insert(owner: str, repo: str, number: int, shared: set[str]) -> str:
     return f"{owner}/{repo}#{number}" if repo.lower() in shared else f"#{repo}-{number}"
 
 
+def _pick_repos(parsed: dict, repos: Iterable[dict], public_only: bool) -> list[tuple[dict, tuple]]:
+    """The matching repositories (``(data, routes)``), best first, at most ``MAX_SEARCH_REPOS``."""
+    picked = []
+    for data in repos:
+        if public_only and data.get("private"):
+            continue
+        owner, name = _split_name(data.get("name_with_owner"))
+        routes = _repo_routes(parsed, owner, name)
+        if routes[0] or routes[1] is not None:
+            rank = 0 if routes[1] is not None else 1 if routes[2] else 2
+            picked.append(((rank, len(name), name.lower(), str(data.get("repository_id"))), data, routes))
+    picked.sort(key=lambda p: p[0])
+    return [(data, routes) for _, data, routes in picked[:MAX_SEARCH_REPOS]]
+
+
 def _search_key(parsed: dict, routes: tuple, issue: dict) -> tuple | None:
     any_issue, prefix, name_exact = routes
     number = str(issue.get("number"))
@@ -206,11 +224,12 @@ def _ref_row(repo_data: dict, issue: dict, shared: set[str]) -> dict:
 
 
 def search_rows(repos: Iterable[dict], issues_of: Callable[[str], Iterable[dict]], query,
-                owners: set[str] | None, limit: int = SEARCH_LIMIT) -> list[dict]:
+                owners: set[str] | None, limit: int = SEARCH_LIMIT, public_only: bool = False) -> list[dict]:
     """The in-memory search both the memory store and the monitor use; the Postgres store orders the same way.
 
     ``owners`` limits the owners searched (``None``: every stored owner). Exact numbers first, then
-    number prefixes, exact names, name prefixes; open before closed; newest first.
+    number prefixes, exact names, name prefixes; open before closed; newest first. Only the issues of
+    ``MAX_SEARCH_REPOS`` matching repositories are read; ``public_only`` skips private repositories.
     """
     parsed = parse_issue_query(query)
     limit = max(1, min(int(limit), SEARCH_LIMIT))
@@ -220,10 +239,7 @@ def search_rows(repos: Iterable[dict], issues_of: Callable[[str], Iterable[dict]
     inside = [r for r in repos if scope is None or _owner(r) in scope]
     shared = _shared_names(_split_name(r.get("name_with_owner")) for r in inside)
     found = []
-    for data in inside:
-        routes = _repo_routes(parsed, *_split_name(data.get("name_with_owner")))
-        if not (routes[0] or routes[1] is not None):
-            continue
+    for data, routes in _pick_repos(parsed, inside, public_only):
         for issue in issues_of(data["repository_id"]):
             key = _search_key(parsed, routes, issue)
             if key is not None:
@@ -508,9 +524,10 @@ class MemoryGitHubStore:
         found = self.stored_detail(repo_id, number)
         return None if found is None else found[0]
 
-    def search_issues(self, query, owners: set[str] | None, *, limit: int = SEARCH_LIMIT) -> list[dict]:
+    def search_issues(self, query, owners: set[str] | None, *, limit: int = SEARCH_LIMIT,
+                      public_only: bool = False) -> list[dict]:
         """Read-only: at most ``limit`` (<= ``SEARCH_LIMIT``) stored issues a `#` query names, of
-        ``owners`` only (``None``: every owner). See ``search_rows`` for the order."""
+        ``owners`` only (``None``: every owner). See ``search_rows`` for the order and bounds."""
         state = self._state
         with state.lock:
             self._claim()
@@ -518,7 +535,7 @@ class MemoryGitHubStore:
             for (rid, _), row in state.issues.items():
                 by_repo.setdefault(rid, []).append(row["data"])
             return _normal(search_rows([r["data"] for r in state.repos.values()],
-                                       lambda rid: by_repo.get(rid, ()), query, owners, limit))
+                                       lambda rid: by_repo.get(rid, ()), query, owners, limit, public_only))
 
     def watermark(self, repo_id: str) -> str | None:
         state = self._state
@@ -959,12 +976,13 @@ class GitHubStore:
         found = self.stored_detail(repo_id, number)
         return None if found is None else found[0]
 
-    def search_issues(self, query, owners: set[str] | None, *, limit: int = SEARCH_LIMIT) -> list[dict]:
+    def search_issues(self, query, owners: set[str] | None, *, limit: int = SEARCH_LIMIT,
+                      public_only: bool = False) -> list[dict]:
         """Read-only (a repeatable-read snapshot that never claims or prunes): at most ``limit``
         (<= ``SEARCH_LIMIT``) stored issues a `#` query names, of ``owners`` only (``None``: every
         owner). Repositories are matched in Python (one owner-filtered read of the small repository
         table); issues are read by ``repository_id`` (the primary key's leading column), ordered and
-        limited in SQL, so a query never scans more than the matching repositories' issues."""
+        limited in SQL, so a query never reads more than ``MAX_SEARCH_REPOS`` repositories' issues."""
         parsed = parse_issue_query(query)
         limit = max(1, min(int(limit), SEARCH_LIMIT))
         if parsed is None:
@@ -977,14 +995,13 @@ class GitHubStore:
                 scope)]
             shared = _shared_names(_split_name(r["data"].get("name_with_owner")) for r in repos)
             anyone, numbered, exact = [], [], []
-            for r in repos:
-                any_issue, prefix, name_exact = _repo_routes(parsed, *_split_name(r["data"].get("name_with_owner")))
+            for data, (any_issue, prefix, name_exact) in _pick_repos(parsed, (r["data"] for r in repos), public_only):
                 if any_issue:
-                    anyone.append(r["repository_id"])
+                    anyone.append(data["repository_id"])
                 if prefix is not None:
-                    numbered.append(r["repository_id"])
+                    numbered.append(data["repository_id"])
                 if name_exact:
-                    exact.append(r["repository_id"])
+                    exact.append(data["repository_id"])
             prefix = parsed["number"] or (parsed["short"][1] if parsed["short"] else "")
             if not anyone and not numbered:
                 return []

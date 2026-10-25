@@ -73,6 +73,11 @@ AGENT_ACTIONS = frozenset({"read", "post", "instruct", "execute", "spawn_helpers
 PROJECT_ROLES = frozenset({"manager", "contributor"})
 
 MAX_TEXT = 8000
+# the `#` menu (C4): per principal, at most REF_SEARCH_BURST searches per REF_SEARCH_WINDOW seconds
+REF_SEARCH_BURST = 30
+REF_SEARCH_WINDOW = 10.0
+REF_SEARCH_MIN = 2           # characters a search needs; an empty query lists REF_RECENT for owners/approvers
+REF_RECENT = 8
 MAX_BODY = 64 * 1024
 _PANE_LINK = re.compile(r"pane:[a-z0-9][a-z0-9._-]{0,62}:[A-Za-z0-9][A-Za-z0-9:_.-]{0,39}")
 _KEY_RE = re.compile(r"[A-Za-z0-9._:\-]{1,128}\Z")
@@ -4813,17 +4818,34 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FilesMixin):
         return issue_refs.for_viewer(refs, details, self._restricted(viewer, p.get("room_id")))
 
     def search_refs(self, pr: Principal, room_id: str, query: str) -> dict:
-        """The `#` menu for one room member: `{ready, items}`. A guest or an external agent is offered
-        public repositories' issues only. Read-only; the GitHub cache is searched outside the room lock."""
+        """The `#` menu for one room member: `{ready, items}`. Who may not see private repositories
+        (`issue_refs.may_see_private`) is offered public repositories' issues only. A search needs
+        REF_SEARCH_MIN characters; an empty one lists REF_RECENT issues, for owners and approvers only.
+        Rate-limited per principal; read-only; the GitHub cache is searched outside the room lock."""
+        if not isinstance(query, str) or len(query) > 160:
+            raise CollabError(400, "q must be at most 160 characters")
         with self._lock:
             self._authorize(pr, room_id, "read", "refs.search")
             restricted = self._restricted(pr, room_id)
-        if not isinstance(query, str) or len(query) > 160:
-            raise CollabError(400, "q must be at most 160 characters")
+            now, bucket = self._now(), "refs:" + pr.key
+            hits = [t for t in self._hits[bucket] if now - t < REF_SEARCH_WINDOW]
+            if len(hits) >= REF_SEARCH_BURST:
+                self._hits[bucket] = hits
+                self.stats["rate_limited"] += 1
+                raise CollabError(429, "issue search rate limit exceeded")
+            hits.append(now)
+            self._hits[bucket] = hits
         if self.github is None:
             return {"ready": False, "items": []}
+        typed = query.strip().removeprefix("#")
+        if typed and len(typed) < REF_SEARCH_MIN or (not typed and restricted):
+            limit = 0
+        else:
+            limit = REF_RECENT if not typed else issue_refs.MAX_REFS
         try:
-            found = self.github.search_issues(query, start=False)
+            if not limit:                     # too short (or not for this reader): readiness only, no search
+                return {"ready": bool(self.github.cache_ready(start=False)), "items": []}
+            found = self.github.search_issues(query, limit=limit, public_only=restricted, start=False)
         except Exception:
             return {"ready": False, "items": []}
         keep = ("kind", "owner", "repo", "number", "title", "state", "insert", "url")

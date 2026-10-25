@@ -95,6 +95,23 @@ def test_search_is_read_only_scoped_bounded_and_ranked(backend):
     assert store.revision() == revision                                                  # reading moved nothing
 
 
+def test_search_bounds_the_repositories_it_reads_and_can_skip_private_ones(backend):
+    from herdr_engineering.control_plane.github_store import MAX_SEARCH_REPOS
+    store = backend.make()
+    store.load()
+    store.upsert_repositories([repo(f"acme/r{n:02d}", private=n % 2 == 1) for n in range(40)] + [repo("acme/r")], None)
+    for n in range(40):
+        store.upsert_issues(f"github.com/acme/r{n:02d}", [issue(f"g{n}", n + 1, state="OPEN")], None)
+    store.upsert_issues("github.com/acme/r", [issue("exact", 5, state="OPEN")], None)
+    found = store.search_issues("r", None)
+    assert len({r["repo"] for r in found}) <= MAX_SEARCH_REPOS and found[0]["repo"] == "r"   # exact name first
+    assert len(found) <= 20
+    public = store.search_issues("r", None, public_only=True, limit=20)
+    assert public and not any(r["private"] for r in public)
+    assert [r["repo"] for r in store.search_issues("r39-40", None, public_only=True)] == []      # r39 is private
+    assert [r["repo"] for r in store.search_issues("r39-40", None)] == ["r39"]
+
+
 def test_search_refuses_a_catalog_of_another_credential(backend):
     from herdr_engineering.control_plane.github_store import GitHubStoreIdentityMismatch
     _seed(backend.make())
@@ -278,6 +295,30 @@ def test_a_post_resolves_refs_with_the_posters_own_view(w):
     assert [r["repo"] for r in stored(w, say(w, w.alice, "#secret-7"))] == ["secret"]
 
 
+def test_the_menu_needs_two_characters_and_an_empty_query_is_short_and_for_owners_only(w, gh):
+    fake, monitor = gh
+    for n in range(100, 120):
+        fake.put("acme/binview", n)
+    monitor.refresh()
+    assert w.s.search_refs(w.alice, w.room, "b") == {"ready": True, "items": []}
+    assert w.s.search_refs(w.alice, w.room, "#b") == {"ready": True, "items": []}
+    assert len(w.s.search_refs(w.alice, w.room, "bi")["items"]) == 20
+    assert 0 < len(w.s.search_refs(w.alice, w.room, "")["items"]) <= 8
+    assert 0 < len(w.s.search_refs(w.alice, w.room, "#")["items"]) <= 8
+    for viewer in (w.bob, w.carol, w.dave):
+        assert w.s.search_refs(viewer, w.room, "")["items"] == []
+
+
+def test_the_menu_is_rate_limited_per_principal(w):
+    from herdr_engineering.control_plane.collab import REF_SEARCH_BURST
+    for _ in range(REF_SEARCH_BURST):
+        w.s.search_refs(w.bob, w.room, "binview")
+    assert code(w.s.search_refs, w.bob, w.room, "binview") == 429
+    w.s.search_refs(w.alice, w.room, "binview")                      # another principal is unaffected
+    w.s.clock.t += 60
+    assert w.s.search_refs(w.bob, w.room, "binview")["items"]
+
+
 def test_the_menu_is_for_room_members_only(w):
     assert code(w.s.search_refs, w.mallory, w.room, "binview") == 404
 
@@ -321,6 +362,9 @@ def test_resolve_route_lists_in_scope_candidates_with_an_etag(gh, tmp_path):
         assert [(i["owner"], i["number"], i["insert"]) for i in body["items"]] == [("acme", 44, "#binview-44")]
         status, _, _ = _get(server.port, "/api/v1/github/resolve?q=binview", {**key, "If-None-Match": headers["ETag"]})
         assert status == 304
+        status, body, _ = _get(server.port, "/api/v1/github/resolve?q=b", key)
+        assert status == 200 and body == {"ready": True, "items": []}              # too short: no search
+        assert 0 < len(_get(server.port, "/api/v1/github/resolve?q=", key)[1]["items"]) <= 8
         assert _get(server.port, "/api/v1/github/resolve?q=x&q=y", key)[0] == 400
         assert _get(server.port, "/api/v1/github/resolve?other=1", key)[0] == 400
         assert _get(server.port, "/api/v1/github/resolve?q=" + "a" * 161, key)[0] == 400
