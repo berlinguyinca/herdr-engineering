@@ -126,8 +126,8 @@ manual registration.**
 
 ## Degraded / local mode
 
-If no gateway is configured (`fabric.gateway_url` /
-`HERDR_ENGINEERING_FABRIC_URL` unset) or unreachable, registrar commands fall
+If no gateway is configured (neither `fabric.url` in the central
+fleet config nor `fabric.gateway_url` in `config.yaml` is set) or unreachable, registrar commands fall
 back to the local registry and `devfabric serve` (per-host forwarder) still
 works standalone. A lease made this way is **not** reachable via the fleet
 front door until the gateway is up; the CLI says so explicitly. Local-mode
@@ -158,9 +158,9 @@ herdr-eng devfabric register --machine beast --host auto --port 5678
 herdr-eng devfabric agent            # foreground loop (Ctrl-C to stop)
 herdr-eng devfabric agent --once     # one scan cycle (cron / smoke test)
 
-# point commands at the gateway without editing config
-HERDR_ENGINEERING_FABRIC_URL=http://bender.tail0c50da.ts.net:29999 \
-  herdr-eng devfabric list
+# point commands at the gateway: fabric.url in fleet-config.yaml, or
+# fabric.gateway_url: http://bender.tail0c50da.ts.net:29999 in config.yaml
+herdr-eng devfabric list
 
 # stop the gateway (leases survive in the store and are re-bound on restart)
 kill <gw-pid>   # SIGTERM is handled: router unbinds, lock releases

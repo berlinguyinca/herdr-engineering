@@ -103,6 +103,7 @@ export class HerdrAppShell extends HTMLElement {
           <label class="hd-shell__density">Density
             <select aria-label="Density">${DENSITIES.map(value => `<option value="${value}" ${value === this._density ? 'selected' : ''}>${value[0].toUpperCase() + value.slice(1)}</option>`).join('')}</select>
           </label>
+          <slot name="controls"></slot>
           <nav class="hd-shell__nav" id="primary-navigation" data-open="false" aria-label="Primary">${links}</nav>
         </aside>
         <main class="hd-shell__main"><div class="hd-shell__content">

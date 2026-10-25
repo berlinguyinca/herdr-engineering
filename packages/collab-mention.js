@@ -158,16 +158,16 @@ export function mentionTokens(text) {
   const plain = String(text).replace(/(```|~~~)[\s\S]*?(?:\1|$)/g, ' ').replace(/`[^`\n]*`/g, ' ');
   return [...plain.matchAll(MENTION)].map((m) => m[1].toLowerCase());
 }
-// Precedence as on the server: groups; agent addresses; person handles together with agents' current
-// names (a collision between the two addresses nobody); then old names. Two principals at one level -> ambiguous.
+// Precedence as on the server: groups; agent addresses; person handles; agents' current names; then old
+// names (so `@carol` always reaches the member carol). Two principals at one level -> ambiguous.
 function lookup(name, ctx) {
   if (GROUPS.some((g) => g.name === name)) return { hit: { kind: 'group', id: name, name } };
   const agents = ctx.agents || [], people = ctx.people || [];
   const agentHit = (a) => ({ kind: 'agent', id: a.agent_id, name: agentKey(a), agent: a });
   const levels = [
     agents.filter((a) => a.address === name).map(agentHit),
-    [...people.filter((p) => p.handle === name).map((p) => ({ kind: 'person', id: p.user_id, name: p.handle })),
-      ...agents.filter((a) => a.name === name).map(agentHit)],
+    people.filter((p) => p.handle === name).map((p) => ({ kind: 'person', id: p.user_id, name: p.handle })),
+    agents.filter((a) => a.name === name).map(agentHit),
     agents.filter((a) => (a.aliases || []).includes(name)).map(agentHit),
   ];
   for (const level of levels) {
@@ -211,7 +211,7 @@ export function filterItems(items, query) {
 
 // Mentions in rendered message HTML as chips. Only names the server resolved for this message (its
 // `mentions`) become chips; code, links and unknown names stay text. The chip keeps the literal text.
-const CHIP_ICON = { person: ['person', '👤'], agent: ['robot', '🤖'], group: ['group', '👥'] };
+const CHIP_ICON = { person: ['person', '👤'], agent: ['robot', '🤖'], group: ['group', '👥'], external: ['external', '🌐'] };
 const escText = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 export function mentionChips(html, mentions, ctx = {}) {
   const list = mentions || [];
@@ -238,9 +238,12 @@ export function mentionChips(html, mentions, ctx = {}) {
     return part.replace(/(^|[\s([{])@([A-Za-z0-9._-]{1,48})(?![A-Za-z0-9._-])/g, (all, pre, token) => {
       const found = hit(token.toLowerCase());
       if (!found) return all;
-      const [icon, glyph] = CHIP_ICON[found.m.kind] || CHIP_ICON.person;
-      const label = `${found.m.kind === 'agent' ? 'Agent' : found.m.kind === 'group' ? 'Group' : 'Person'} @${found.m.name}`;
-      return `${pre}<span class="cx-mention cx-mention--${escText(found.m.kind)}" data-mention-kind="${escText(found.m.kind)}" data-mention-id="${escText(found.m.id)}" title="${escText(label)}"><span class="cx-mention__icon" data-icon="${icon}" aria-hidden="true">${glyph}</span>@${token.slice(0, found.len)}</span>${token.slice(found.len)}`;
+      // an external agent (a sponsor's outside party, never `owner.harness`) is marked as such on the chip itself
+      const external = found.m.kind === 'agent' && (found.m.external
+        || (ctx.agents || []).some((a) => a.agent_id === found.m.id && a.external));
+      const [icon, glyph] = external ? CHIP_ICON.external : CHIP_ICON[found.m.kind] || CHIP_ICON.person;
+      const label = `${external ? 'External agent' : found.m.kind === 'agent' ? 'Agent' : found.m.kind === 'group' ? 'Group' : 'Person'} @${found.m.name}`;
+      return `${pre}<span class="cx-mention cx-mention--${escText(found.m.kind)}${external ? ' cx-mention--external' : ''}" data-mention-kind="${escText(found.m.kind)}" data-mention-id="${escText(found.m.id)}" title="${escText(label)}"><span class="cx-mention__icon" data-icon="${icon}" aria-hidden="true">${glyph}</span>@${token.slice(0, found.len)}</span>${token.slice(found.len)}`;
     });
   }).join('');
 }

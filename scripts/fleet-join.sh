@@ -9,8 +9,9 @@
 #      connection details, if not already present.
 #   2. Runs the fleet-sync playbook against ONLY that host to converge:
 #        - herdr-eng           (pulled from public repo origin/main, pip-installed)
-#        - fabric.env + auto-registration agent (registers this host's services
-#          with the gateway, making it a fabric "site")
+#        - auto-registration agent (registers this host's services
+#          with the gateway, making it a fabric "site";
+#          the gateway comes from fabric.url in fleet-config.yaml, NOT --gateway)
 #        - pi build-gate extension (build-gate.ts)
 #   3. Verifies the host is registered with the fabric gateway (its leases
 #      appear in `herdr-eng devfabric list`) and prints version parity.
@@ -48,7 +49,8 @@ while [ $# -gt 0 ]; do
     --os) OS="${2:?--os needs linux|macos}"; shift 2 ;;
     --ansible-host) ANSIBLE_HOST="${2:?--ansible-host needs a value}"; shift 2 ;;
     --user) USER="${2:?--user needs a value}"; shift 2 ;;
-    --gateway) GATEWAY="${2:?--gateway needs a URL}"; shift 2 ;;
+    --gateway) GATEWAY="${2:?--gateway needs a URL}"; shift 2
+      echo "WARNING: --gateway is IGNORED for the fabric agent; set fabric.url in fleet-config.yaml (or fabric.gateway_url in config.yaml)." >&2 ;;
     -*) echo "unknown option: $1" >&2; exit 2 ;;
     *) [ -z "$HOST" ] && HOST="$1" || { echo "unexpected argument: $1" >&2; exit 2; }; shift ;;
   esac

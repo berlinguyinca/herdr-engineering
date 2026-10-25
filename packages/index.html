@@ -8,6 +8,21 @@
 <link rel="stylesheet" href="herdr-design-system/base.css">
 <link rel="stylesheet" href="herdr-web-components/components.css">
 <link rel="stylesheet" href="collab.css">
+<link rel="stylesheet" href="architecture.css">
+<link rel="stylesheet" href="motion.css">
+<script>
+  // CSP note: this inline script needs 'unsafe-inline' or a hash/nonce if a strict script-src is ever added.
+  // Apply stored theme and calm mode before first paint (same keys as theme-controls.js / motion.js).
+  (function () {
+    try {
+      var r = document.documentElement;
+      var t = localStorage.getItem('herdr.theme');
+      if (t === 'light' || t === 'dark') r.dataset.theme = t;
+      var c = localStorage.getItem('herdr.calm');
+      if (c === 'on' || c === 'off') r.dataset.calm = c;
+    } catch (e) { /* storage unavailable: follow the OS */ }
+  })();
+</script>
 <style>
   .hd-btn {
     background: var(--accent); color: var(--text-on-accent); border: none;
@@ -23,6 +38,14 @@
   <herdr-app-shell id="shell">
     <div id="view"></div>
   </herdr-app-shell>
+  <script type="module">
+    import { loadCalm } from './motion.js';
+    import { loadTheme, mountThemeControls } from './theme-controls.js';
+    import './freshness.js';
+    loadCalm();
+    loadTheme();
+    mountThemeControls(document.getElementById('shell'));
+  </script>
   <script type="module" src="app.js"></script>
 </body>
 </html>

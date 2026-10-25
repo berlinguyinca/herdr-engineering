@@ -358,7 +358,8 @@ class MemoryGitHubStore:
 
     # -- interface
 
-    def load(self) -> Snapshot | None:
+    def load(self, *, rows: bool = True) -> Snapshot | None:
+        """The stored catalog; ``rows=False`` claims/purges the same way but returns only the revision."""
         state = self._state
         with state.lock:
             if self._retired:
@@ -373,6 +374,8 @@ class MemoryGitHubStore:
                               "revision": revision, "pruned_through": revision}
                 return None
             meta = self._claim()
+            if not rows:
+                return Snapshot(identity=meta["identity"], viewer=meta["viewer"], revision=meta["revision"])
             issues: dict[str, dict[str, dict]] = {}
             for (rid, gid), row in state.issues.items():
                 issues.setdefault(rid, {})[gid] = _normal(row["data"])
@@ -548,10 +551,13 @@ class MemoryGitHubStore:
         with self._state.lock:
             return self._claim()["revision"]
 
-    def changes_since(self, rev: int) -> dict:
+    def changes_since(self, rev: int, *, full: bool = True) -> dict:
+        """``full=False``: a ``since`` that cannot be answered returns no rows (the caller pages the catalog itself)."""
         state = self._state
         with state.lock:
             meta = self._claim()
+            if not full and (max(0, int(rev)) < meta["pruned_through"] or max(0, int(rev)) > meta["revision"]):
+                return {"revision": meta["revision"], "resync": True, "upserted": [], "removed": []}
             rows = [_item("repository", rid, rid, r["rev"], _normal(r["data"])) for rid, r in state.repos.items()]
             rows += [_item("issue", rid, gid, r["rev"], _normal(r["data"])) for (rid, gid), r in state.issues.items()]
             tombs = [_item(kind, rid, key, t["rev"]) for (kind, rid, key), t in state.tombstones.items()]
@@ -789,7 +795,7 @@ class GitHubStore:
                     await self._wipe(conn)
         self._call(work)
 
-    def load(self) -> Snapshot | None:
+    def load(self, *, rows: bool = True) -> Snapshot | None:
         async def work(conn):
             async with conn.transaction():
                 meta = await conn.fetchrow(_META_SELECT, FAMILY)
@@ -800,6 +806,8 @@ class GitHubStore:
                     await self._wipe(conn)
                     return None
                 meta = await self._claim(conn)
+                if not rows:
+                    return Snapshot(identity=meta["identity"], viewer=meta["viewer"], revision=meta["revision"])
                 repos = await conn.fetch("SELECT repository_id, data, watermark FROM github_repositories")
                 issues = await conn.fetch("SELECT repository_id, github_id, data FROM github_issues")
             snapshot = Snapshot(identity=meta["identity"], viewer=meta["viewer"], revision=meta["revision"])
@@ -1035,12 +1043,18 @@ class GitHubStore:
             return meta["revision"]
         return self._read(work)
 
-    def changes_since(self, rev: int) -> dict:
-        """Rows and live tombstones newer than ``rev``; the full list when ``rev`` cannot be answered."""
+    def changes_since(self, rev: int, *, full: bool = True) -> dict:
+        """Rows and live tombstones newer than ``rev``; the full list when ``rev`` cannot be answered.
+
+        ``full=False`` skips reading those rows (``resync`` with no rows): a caller that
+        pages the catalog itself must not make Postgres read every jsonb row to discard it.
+        """
         since = max(0, int(rev))
 
         async def work(conn, meta):
             resync = since < meta["pruned_through"] or since > meta["revision"]
+            if resync and not full:
+                return {"revision": meta["revision"], "resync": True, "upserted": [], "removed": []}
             floor = -1 if resync else since
             rows = [_item("repository", r["repository_id"], r["repository_id"], r["rev"], json.loads(r["data"]))
                     for r in await conn.fetch(

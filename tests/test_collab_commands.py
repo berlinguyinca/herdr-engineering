@@ -171,13 +171,14 @@ def test_a_one_target_handoff_comes_from_the_poster(w):
 def test_unknown_ambiguous_or_group_targets_are_refused(w):
     assert "nobody" in refused(w, w.bob, "/handoff @ghost do it").message
     _, cx = agent(w, "bob", "codex")
-    w.s.rename_agent(w.bob, cx, {"name": "carol"})            # an agent's name and a person's handle collide
-    err = refused(w, w.bob, "/handoff @carol take it")
-    assert err.status == 400 and "More than one agent or person is called @carol" in err.message
-    assert "@bob.codex" in err.message
+    with pytest.raises(CollabError) as rename:
+        w.s.rename_agent(w.bob, cx, {"name": "carol"})        # member handles are reserved for people
+    assert rename.value.status == 409
+    event = say(w, w.bob, "/handoff @carol take it")
+    assert event["handoff"]["to"] == {"kind": "person", "id": "carol", "name": "carol"}
     assert refused(w, w.bob, "/handoff @all everyone").status == 400
     assert refused(w, w.bob, "/handoff").status == 400
-    assert not [e for e in w.s._log if e["event_type"] == "handoff"]
+    assert len([e for e in w.s._log if e["event_type"] == "handoff"]) == 1
 
 
 def test_a_viewer_cannot_hand_off_and_a_contributor_can(w):

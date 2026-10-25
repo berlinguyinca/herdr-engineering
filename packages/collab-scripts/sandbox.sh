@@ -65,6 +65,16 @@ for n in claude codex pi node; do
     h="$t"
   done
   case "$r" in "$HOME"/*) bindro "$(dirname "$r")" ;; esac
+  # a managed launcher (for example pi's session-auto-resume wrapper) is a shell script that `exec`s node on files
+  # elsewhere under $HOME; without them the harness dies at once with "Cannot find module". Expose the directories of
+  # the absolute $HOME paths on its exec line, read-only (never the whole home, never anything not named there).
+  case "$r" in "$HOME"/*)
+    if [ -f "$r" ] && [ "$(head -c 2 "$r" 2>/dev/null)" = "#!" ] && [ "$(wc -c < "$r")" -lt 65536 ]; then
+      while IFS= read -r dep; do
+        case "$dep" in "$HOME"/*) [ -e "$dep" ] && bindro "$(dirname "$(readlink -f "$dep")")" ;; esac
+      done < <(grep -E '^[[:space:]]*exec[[:space:]]' "$r" | grep -oE "[\"'][^\"' ]+[\"']" | tr -d "\"'")
+    fi ;;
+  esac
 done
 # Helpers only (set by the runner, never by a task), each fails closed when it does not check out:
 #   HERDR_SANDBOX_RO_BINDS     newline-separated directories under ~/herdr-agents/work/ (a reviewer's view of its

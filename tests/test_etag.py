@@ -224,9 +224,9 @@ def test_since_at_the_current_revision_answers_from_memory_without_a_store_read(
     reads = []
     original = type(monitor._store).changes_since
 
-    def counting(store, since):
+    def counting(store, since, **kw):
         reads.append(since)
-        return original(store, since)
+        return original(store, since, **kw)
     monitor._store.changes_since = counting.__get__(monitor._store)
     monitor._update(progress={**monitor._view["progress"], "phase": "issues"})  # a pass moved the state
     for _ in range(3):

@@ -20,7 +20,7 @@ ENTITY = "attention"
 STREAM = "operator"
 SEVERITIES = ("critical", "warning", "info")
 KINDS = ("mission_attention", "mission_failed", "agent_failed", "agent_blocked", "ci_failed", "review_changes",
-         "service_down", "host_stale", "control_plane", "fleet_drift", "llm_problems", "source_unavailable")
+         "service_down", "host_stale", "control_plane", "fleet_drift", "llm_problems", "ci_fix", "source_unavailable")
 STATES = ("open", "acknowledged", "snoozed")
 MAX_ITEMS = 200
 MAX_PER_KIND = 50
@@ -39,9 +39,9 @@ _CI_DONE = frozenset(("success", "passed", "finished", "complete", "completed", 
                       "skipped", "declined", "approved", "closed", "resolved"))
 _REVIEW_CHANGES = frozenset(("changes_requested", "request_changes", "rejected", "annotated", "denied"))
 _CI_OUTAGE = frozenset(("unavailable", "auth_error", "partial"))
-_SOURCE_PAGES = {"missions": "#/missions", "sessions": "#/herd", "summaries": "#/herd", "llm": "#/llm", "ci": "#/ci", "reviews": "#/reviews",
+_SOURCE_PAGES = {"missions": "#/missions", "sessions": "#/herd", "summaries": "#/herd", "llm": "#/llm", "ci": "#/ci", "ci_fix": "#/ci", "reviews": "#/reviews",
                  "services": "#/services", "hosts": "#/hosts", "health": "#/topology", "fleet": "#/hosts"}
-_SOURCE_LABELS = {"missions": "Missions", "sessions": "Agents", "summaries": "Agent summaries", "llm": "LLM usage", "ci": "CI", "reviews": "Reviews",
+_SOURCE_LABELS = {"missions": "Missions", "sessions": "Agents", "summaries": "Agent summaries", "llm": "LLM usage", "ci": "CI", "ci_fix": "CI fixes", "reviews": "Reviews",
                   "services": "Services", "hosts": "Hosts", "health": "Control plane", "fleet": "Fleet versions"}
 _RANK = {name: index for index, name in enumerate(SEVERITIES)}
 
@@ -195,8 +195,9 @@ def _item(key, kind, severity, title, detail, href, source, condition, *, seen=N
 class AttentionInbox:
     """Derive the open attention items and fold the operator's acknowledge/snooze events."""
 
-    def __init__(self, repo, *, config=None, ci_snapshot=None, health=None, now=None):
+    def __init__(self, repo, *, config=None, ci_snapshot=None, health=None, now=None, ci_fix=None):
         self.repo = repo
+        self._ci_fix = ci_fix
         self.config = attention_config(config)
         self._ci_snapshot = ci_snapshot
         self._health = health or repo.health
@@ -209,6 +210,8 @@ class AttentionInbox:
         self.sources = {"missions": self._missions, "sessions": self._sessions, "summaries": self._blocked, "ci": self._ci,
                         "reviews": self._reviews, "services": self._services, "hosts": self._hosts,
                         "health": self._control_plane, "fleet": self._fleet, "llm": self._llm}
+        if ci_fix is not None:
+            self.sources["ci_fix"] = self._ci_fixes
 
     # ------------------------------------------------------------- sources
     def _missions(self, now):
@@ -381,6 +384,35 @@ class AttentionInbox:
                                f"{entry['count']} failed requests in {window} across {models} model{'s' if models != 1 else ''}",
                                f"#/llm?window={window}", "llm", cls, seen=entry["last_seen"],
                                count=entry["count"], action="Open LLM"))
+        return items
+
+    def _ci_fixes(self, now):
+        """Finished CI fix runs that want a look: failed or expired, a draft PR to review, or nothing to change.
+        Only the bounded outcome fields are shown; the run's own text never becomes a title."""
+        after = now - float(self.config["thresholds"]["failed_window_hours"]) * 3600
+        items = []
+        for fix in self._ci_fix.list(limit=200)["fixes"]:
+            ended = _epoch(fix.get("ended_at"))
+            state = fix["state"]
+            if state not in ("failed", "expired", "succeeded", "no_change") or ended is None or ended < after:
+                continue
+            what = f"{fix['repository']} #{fix['number']}"
+            result = fix.get("result") or {}
+            flags = [f for f in (result.get("flags") or ()) if isinstance(f, str)]
+            if state in ("failed", "expired"):
+                severity, title, detail = "warning", f"CI fix failed · {what}", fix.get("reason") or state
+                condition = state
+            elif state == "no_change":
+                severity, title, detail = "info", f"CI fix found nothing to change · {what}", fix.get("reason") or "No change"
+                condition = state
+            else:
+                severity = "warning" if flags else "info"
+                title = f"CI fix opened a draft PR · {what}"
+                detail = f"Flagged: {flags[0]}" + (f" (+{len(flags) - 1} more)" if len(flags) > 1 else "") if flags \
+                    else "Open it from the CI page, review and merge it yourself."
+                condition = "succeeded:" + "|".join(flags)
+            items.append(_item(f"cifix:{fix['id']}", "ci_fix", severity, title, detail, "#/ci",
+                               "ci_fix", condition, seen=ended, action="Open CI"))
         return items
 
     def _control_plane(self, now):

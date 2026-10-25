@@ -11,10 +11,21 @@ from typing import Any
 
 # Ordered so longer/more specific patterns win over generic ones.
 _PATTERNS = [
-    # OpenAI-style keys: sk-...
-    re.compile(r"sk-[A-Za-z0-9\-_]{3,}"),
-    # AWS access key id
-    re.compile(r"AKIA[0-9A-Z]{16}"),
+    # OpenAI-style keys: sk-... (not inside a longer word: "task-s6lease", "disk-image-1" are ids, not keys; found
+    # by the T16 acceptance run, which saw a task id stored as "ta[REDACTED]")
+    re.compile(r"(?<![A-Za-z0-9])sk-[A-Za-z0-9\-_]{3,}"),
+    # ... but a key-length run is a key wherever it sits: right after an ANSI colour code ("\x1b[32msk-...", the "m" is a word
+    # character) or a URL-encoded "=" ("api_key%3Dsk-..."), which CI logs routinely contain. Ids such as "task-sk-ab" are
+    # far shorter than 20 characters after "sk-" and stay untouched.
+    re.compile(r"sk-[A-Za-z0-9_\-]{20,}"),
+    # AWS access key id (and the temporary ASIA form), wherever it sits
+    re.compile(r"(?:AKIA|ASIA)[0-9A-Z]{16}"),
+    # AWS secret access key: 40 base64 characters after an aws secret label
+    re.compile(r"(?i)aws[_\- ]?secret[_\- ]?(?:access[_\- ]?)?key[\"']?\s*[:=]?\s*[\"']?[A-Za-z0-9/+=]{30,}"),
+    # GitHub tokens (classic, fine-grained, OAuth, app, refresh) and Slack tokens
+    re.compile(r"(?<![A-Za-z0-9])gh[pousr]_[A-Za-z0-9]{20,}"),
+    re.compile(r"(?<![A-Za-z0-9])github_pat_[A-Za-z0-9_]{20,}"),
+    re.compile(r"(?<![A-Za-z0-9])xox[abprse]-[A-Za-z0-9-]{10,}"),
     # generic bearer tokens / JWTs (three base64url dot-separated parts)
     re.compile(r"Bearer\s+[A-Za-z0-9\-._~+/]+=*", re.IGNORECASE),
     re.compile(r"eyJ[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]+"),
@@ -48,6 +59,11 @@ _SECRET_KEY_HINTS = (
     "connection_string",
 )
 
+
+#: Keys that merely CONTAIN a hint ("author" contains "auth") but carry no secret. The head-bound review quorum
+#: excludes the PR author's own approval by comparing this login (T06), so redacting it to "[REDACTED]" silently let
+#: an author approve their own PR (found by the T16 acceptance run).
+_PLAIN_KEYS = frozenset({"author", "authors", "author_login", "author_name"})
 
 _BEGIN = re.compile(r"-----BEGIN[ A-Z]*PRIVATE KEY-----")
 _END = re.compile(r"-----END[ A-Z]*PRIVATE KEY-----")
@@ -94,7 +110,7 @@ def redact_payload(payload: Any, *, _seen=None) -> Any:
         result = {}
         for key, value in payload.items():
             lk = str(key).lower()
-            if any(s in lk for s in _SECRET_KEY_HINTS):
+            if lk not in _PLAIN_KEYS and any(s in lk for s in _SECRET_KEY_HINTS):
                 result[key] = _REDACTED
             else:
                 result[key] = redact_payload(value, _seen=_seen)

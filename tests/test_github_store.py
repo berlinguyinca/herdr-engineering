@@ -770,3 +770,23 @@ def test_a_timeout_inside_apply_repository_commits_nothing_and_the_store_recover
         assert set(store.load().issues[A]) == {"I2"}
     finally:
         backend.close()
+
+
+def test_unanswerable_since_without_rows_reads_nothing(backend):
+    store = backend.make()
+    store.upsert_repositories([repo("acme/app")], scope=None)
+    store.upsert_issues(A, [issue("I1", 1)], watermark="w")
+    beyond = store.changes_since(store.revision() + 1000, full=False)
+    assert beyond["resync"] is True and beyond["upserted"] == [] and beyond["removed"] == []
+    # an answerable since still carries its rows, and the default keeps the full resync list
+    assert store.changes_since(store.revision() - 1, full=False)["resync"] is False
+    assert len(store.changes_since(store.revision() + 1000)["upserted"]) == 2
+
+
+def test_load_without_rows_returns_only_the_revision(backend):
+    store = backend.make()
+    store.upsert_repositories([repo("acme/app")], scope=None)
+    again = backend.make()
+    bare = again.load(rows=False)
+    assert bare.revision == again.revision() and bare.repositories == {} and bare.issues == {}
+    assert backend.make(identity="tok-b").load(rows=False) is None  # same purge as a full load

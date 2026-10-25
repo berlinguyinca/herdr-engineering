@@ -1,0 +1,39 @@
+# Opt-in config for autospec's scripts/autospec-design-gates.sh (run: bash <autospec>/scripts/autospec-design-gates.sh --repo-root <this repo> [--strict]).
+# Maps the baseline pack's `check: auto` rule ids to the commands that decide them for the HerdR collaboration page (T16 UI gates).
+# `check: vlm` and `check: review` rules are emitted as the critic checklist and are NOT executed; passing this file is necessary, not sufficient,
+# for WCAG 2.2 AA (see docs/operations/ui-gates.md, "What is not covered").
+rules_file: .autospec/design/rules.yaml
+ui_paths:
+  - "packages/collab*.js"
+  - "packages/collab*.css"
+  - "packages/collab.html"
+  - "packages/conversation*"
+  - "tests/playwright/ui-gates*"
+gates:
+  design.tokens.no-raw-color:
+    command: "node --test --test-name-pattern='design.tokens.no-raw-color' tests/playwright/ui-gates-tokens.test.mjs"
+  design.tokens.spacing-on-scale:
+    command: "node --test --test-name-pattern='design.tokens.spacing-on-scale' tests/playwright/ui-gates-tokens.test.mjs"
+  design.tokens.zindex-on-scale:
+    command: "node --test --test-name-pattern='design.tokens.zindex-on-scale' tests/playwright/ui-gates-tokens.test.mjs"
+  design.tokens.font-from-tokens:
+    command: "node --test --test-name-pattern='design.tokens.font-from-tokens' tests/playwright/ui-gates-tokens.test.mjs"
+  motion.reduced-motion-fallback:
+    command: "node --test --test-concurrency=1 --test-name-pattern='reduced motion is honoured' tests/playwright/ui-gates-real.test.mjs"
+  motion.no-unstoppable-animation:
+    command: "node --test --test-concurrency=1 --test-name-pattern='motion.no-unstoppable-animation' tests/playwright/ui-gates-real.test.mjs"
+  motion.happens-by-default:
+    command: "node --test --test-concurrency=1 --test-name-pattern='motion happens by default' tests/playwright/ui-gates-real.test.mjs"
+  motion.no-flash:
+    command: "node --test --test-concurrency=1 --test-name-pattern='motion.no-flash' tests/playwright/ui-gates-real.test.mjs"
+  device.zoom-not-blocked:
+    command: "node --test --test-concurrency=1 --test-name-pattern='device.zoom-not-blocked' tests/playwright/ui-gates-real.test.mjs"
+  device.hover-has-equivalent:
+    command: "node --test --test-concurrency=1 --test-name-pattern='accessibility audit of every surface' tests/playwright/ui-gates-real.test.mjs"
+  device.reflow-at-320:
+    command: "node --test --test-concurrency=1 --test-name-pattern='reflow at 320' tests/playwright/ui-gates-real.test.mjs"
+  device.target-size:
+    command: "node --test --test-concurrency=1 --test-name-pattern='accessibility audit of every surface' tests/playwright/ui-gates-real.test.mjs"
+  device.orientation:
+    command: "node --test --test-concurrency=1 --test-name-pattern='device.orientation' tests/playwright/ui-gates-real.test.mjs"
+  # Not mapped on purpose: motion.duration-from-scale (DESIGN.md declares no motion duration scale, so the rule is skipped, not passed).

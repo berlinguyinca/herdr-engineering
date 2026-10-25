@@ -1,0 +1,66 @@
+/* Architecture tab. Tokens come from herdr-design-system/theme.css. The theme has no dark
+   palette yet, so this view scopes its own dark values to .arch (it paints its own surface). */
+.arch {
+  --a-bg: var(--surface, #fff); --a-fg: var(--text, #353740); --a-muted: var(--text-secondary, #6e6e80);
+  --a-border: var(--border, #d9d9e3); --a-node: var(--surface-2, #ececf1); --a-edge: #6e6e80;
+  --a-accent: var(--accent, #10a37f); --a-warn: #92400e; --a-warn-bg: #fef3c7; --a-fail: #b91c1c; --a-fail-bg: #fee2e2;
+  --a-info: #1e40af; --a-info-bg: #dbeafe;
+  background: var(--a-bg); color: var(--a-fg); padding: var(--density-panel-padding, 16px);
+  border: 1px solid var(--a-border); border-radius: var(--radius, 8px); min-width: 0;
+}
+@media (prefers-color-scheme: dark) {
+  .arch { --a-bg: #16181d; --a-fg: #e6e7ea; --a-muted: #a0a4ae; --a-border: #343842; --a-node: #262a33; --a-edge: #8b90a0;
+    --a-accent: #34d3a8; --a-warn: #fcd34d; --a-warn-bg: #3b2a08; --a-fail: #fca5a5; --a-fail-bg: #3b1212; --a-info: #93c5fd; --a-info-bg: #14264a; }
+}
+.arch h1, .arch h3, .arch h4 { color: var(--a-fg); }
+.arch h4 { color: var(--a-muted); }
+.arch h1 { margin: 0 0 8px; font-size: 1.25rem; }
+.arch h3 { margin: 0 0 8px; overflow-wrap: anywhere; font-size: 1rem; }
+.arch h4 { margin: 12px 0 6px; font-size: .85rem; }
+.arch code, .arch .arch-table td:nth-child(3), .arch .arch-edges { font-family: var(--font-mono, monospace); font-size: .8rem; }
+.arch-bar { display: flex; flex-wrap: wrap; gap: 12px; align-items: end; margin-bottom: 8px; }
+.arch-bar label, .arch-diff label { display: flex; flex-direction: column; gap: 4px; font-size: .8rem; color: var(--a-muted); min-width: 0; }
+.arch select, .arch input[type=search], .arch button:not(.link) {
+  background: var(--a-bg); color: var(--a-fg); border: 1px solid var(--a-border); border-radius: var(--radius-sm, 4px);
+  padding: 6px 8px; font: inherit; max-width: 100%; min-height: 32px; }
+.arch button.link { background: none; border: 0; padding: 2px 0; color: var(--a-accent); cursor: pointer; font: inherit; text-align: left; text-decoration: underline; }
+.arch :focus-visible { outline: 2px solid var(--a-accent); outline-offset: 2px; }
+.arch-meta { color: var(--a-muted); font-size: .85rem; margin: 4px 0 8px; overflow-wrap: anywhere; }
+.arch-notice { margin: 6px 0; padding: 6px 10px; border-radius: var(--radius-sm, 4px); font-size: .85rem; border: 1px solid transparent; }
+.arch-notice::before { font-weight: 600; margin-right: 6px; }
+.arch-notice.partial { background: var(--a-warn-bg); color: var(--a-warn); border-color: var(--a-warn); } .arch-notice.partial::before { content: "Partial"; }
+.arch-notice.stale { background: var(--a-info-bg); color: var(--a-info); border-color: var(--a-info); } .arch-notice.stale::before { content: "Stale"; }
+.arch-notice.failed { background: var(--a-fail-bg); color: var(--a-fail); border-color: var(--a-fail); } .arch-notice.failed::before { content: "Failed"; }
+.arch-notice.running { background: var(--a-info-bg); color: var(--a-info); border-color: var(--a-info); } .arch-notice.running::before { content: "Running"; }
+.arch-notice.partial, .arch-notice.stale { font-size: 0; } .arch-notice.partial::before, .arch-notice.stale::before { font-size: .85rem; }
+.arch-main { display: grid; grid-template-columns: minmax(0, 1fr); gap: 16px; }
+@media (min-width: 1100px) { .arch-main:has(.arch-detail) { grid-template-columns: minmax(0, 1fr) minmax(280px, 380px); } }
+.arch-left { min-width: 0; }
+.arch-graph { overflow: auto; border: 1px solid var(--a-border); border-radius: var(--radius-sm, 4px); max-height: 60vh; margin-bottom: 12px; }
+.arch-graph svg { display: block; }
+.arch-edge { fill: none; stroke: var(--a-edge); stroke-width: 1.2; opacity: .7; } .arch-edge.back { stroke-dasharray: 5 3; }
+.arch-graph marker path { fill: var(--a-edge); }
+.arch-node rect { fill: var(--a-node); stroke: var(--a-border); stroke-width: 1; cursor: pointer; }
+.arch-node:hover rect, .arch-node:focus rect { stroke: var(--a-accent); stroke-width: 2; } .arch-node:focus { outline: none; }
+.arch-node .t1 { fill: var(--a-fg); font: 600 12px var(--font-sans, sans-serif); } .arch-node .t2 { fill: var(--a-muted); font: 11px var(--font-sans, sans-serif); }
+.arch-table { width: 100%; border-collapse: collapse; font-size: .85rem; }
+.arch-table caption { text-align: left; color: var(--a-muted); padding: 4px 0; }
+.arch-table th, .arch-table td { text-align: left; padding: var(--density-row-padding, 6px) 8px; border-bottom: 1px solid var(--a-border); overflow-wrap: anywhere; }
+.arch-detail { border: 1px solid var(--a-border); border-radius: var(--radius-sm, 4px); padding: 12px; min-width: 0; }
+.arch-detail dl { display: grid; grid-template-columns: auto 1fr; gap: 4px 12px; margin: 0; font-size: .85rem; } .arch-detail dt { color: var(--a-muted); } .arch-detail dd { margin: 0; overflow-wrap: anywhere; }
+.arch-edges { list-style: none; padding: 0; margin: 0; } .arch-edges li { padding: 4px 0; border-bottom: 1px solid var(--a-border); overflow-wrap: anywhere; } .arch-edges small { display: block; color: var(--a-muted); }
+.arch-note { color: var(--a-muted); font-size: .8rem; }
+.arch-crumbs { margin: 8px 0; font-size: .85rem; }
+.arch-diff { margin-top: 16px; padding-top: 12px; border-top: 1px solid var(--a-border); }
+.arch-diff-list { list-style: none; padding: 0; font-size: .85rem; font-family: var(--font-mono, monospace); } .arch-diff-list li { overflow-wrap: anywhere; }
+.chg-added::before { content: "+ "; color: var(--status-ok, #0d9d6c); } .chg-removed::before { content: "− "; color: var(--status-failed, #dc2626); } .chg-modified::before { content: "~ "; color: var(--status-attention, #d97706); }
+.arch-table td:nth-child(2), .arch-table td:nth-child(4), .arch-table th:nth-child(2), .arch-table th:nth-child(4) { white-space: nowrap; overflow-wrap: normal; }
+.arch section { margin-top: 20px; padding-top: 12px; border-top: 1px solid var(--a-border); }
+.arch section h2 { font-size: 1.05rem; margin: 0 0 6px; color: var(--a-fg); }
+.arch section h3 { font-size: .85rem; margin: 10px 0 4px; color: var(--a-muted); }
+.arch section ul { margin: 0; padding-left: 18px; font-size: .85rem; overflow-wrap: anywhere; }
+.arch-lanes { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 16px; }
+.arch-request form { display: flex; flex-wrap: wrap; gap: 8px; align-items: end; }
+.arch-request label { display: flex; flex-direction: column; gap: 4px; font-size: .8rem; color: var(--a-muted); }
+.arch-explain { border-left: 3px solid var(--a-accent); padding-left: 10px; margin-top: 8px; font-size: .85rem; }
+.arch-request input { background: var(--a-node); color: var(--a-fg); border: 1px solid var(--a-border); border-radius: 4px; padding: 4px 6px; font: inherit; }

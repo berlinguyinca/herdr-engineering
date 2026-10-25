@@ -15,6 +15,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import logging
 import re
 import threading
 import time
@@ -186,11 +187,14 @@ class ControlPlaneRepo:
         # Envelope v2 idempotency / sequence / freshness state (envelope.py).
         self.ledger = SourceLedger(now=self._now, persist=self._persist_source_state)
         self._listeners = set()  # pub/sub for the SSE live stream (Spec §52)
+        self.collab_quarantine_reasons = []
+        self.collab_quarantine = []  # foreign 'collab' rows found at startup (never replayed)
         self._collab_replay = []  # durable HCN events diverted out of the shared streams
         self.agent_identities = AgentIdentityRegistry(persist=self._persist_agent_projection)
         # Agent inspector (spec 0200): bounded per-session detail projection.
         self.inspector = InspectorStore.from_config(inspector_limits, persist=self._persist_inspector)
         self.mission_activity = MissionActivityStore(now=self._now)
+        self.mission_outcomes = None   # set by the server (control_plane.missions); None writes no outcomes
         # Lineage graph (T02): derived from ``lineage`` envelope events, rebuilt
         # from them on import_state; owns no storage of its own.
         self.graph = GraphProjection()
@@ -260,7 +264,12 @@ class ControlPlaneRepo:
                         and m.get("source", "herdr") == "herdr"):
                     rec = m
                     break
-        return _copy(rec)
+        if rec is None:
+            return None
+        rec = _copy(rec)
+        rec["telemetry_state"] = self._mission_telemetry_state(
+            rec.get("mission_key") or rec["mission_id"])
+        return rec
 
     def _resolve_mission_key(self, mission_id, source="herdr"):
         """Return the stored key for ``mission_id`` under ``source``.
@@ -283,8 +292,34 @@ class ControlPlaneRepo:
             return mission_id
         return None
 
+    def _mission_telemetry_state(self, mission_key: str) -> str:
+        """Derive live/stale/unknown from the bounded mission-activity read model.
+
+        This reflects *collection* freshness of the Pi transport, never worker
+        health: a mission with no collector is ``unknown``, not stalled. It reuses
+        the real freshness the activity store already computes (issue #28); no
+        fabricated heartbeat is ever invented.
+        """
+        try:
+            live = self.mission_activity.get(mission_key)
+        except Exception:  # noqa: BLE001 - one unreadable entry never hides the rest
+            live = None
+        if not live:
+            return "unknown"
+        state = (live.get("freshness") or {}).get("state")
+        if state in ("live", "updating"):
+            return "live"
+        if state in ("stale", "disconnected"):
+            return "stale"
+        return "unknown"
+
     def list_missions(self, status=None):
-        out = [_copy(m) for m in self._missions.values()]
+        out = []
+        for m in self._missions.values():
+            rec = _copy(m)
+            rec["telemetry_state"] = self._mission_telemetry_state(
+                rec.get("mission_key") or rec["mission_id"])
+            out.append(rec)
         if status:
             out = [m for m in out if m["status"] == status]
         return _sort_by(out, "created_at", reverse=True)
@@ -302,6 +337,17 @@ class ControlPlaneRepo:
         m["updated_at"] = self._stamp()
         self.record_event("mission", key, "MissionStageChanged",
                           {"from": old, "to": stage}, mission_id=mission_id)
+        self._mission_stage_changed(key, old, stage)
+
+    def _mission_stage_changed(self, key, old, new):
+        # A durable outcome is written when a mission ends; it can never break the stage change itself.
+        outcomes = self.mission_outcomes
+        if outcomes is None:
+            return
+        try:
+            outcomes.on_stage(key, old, new)
+        except Exception:  # noqa: BLE001
+            pass
 
     # -------------------------------------------------------------- sessions
     def create_session(self, mission_id=None, agent_role="", model="",
@@ -1118,6 +1164,7 @@ class ControlPlaneRepo:
         for field, value in (("repository_id", repository_id), ("commit_sha", commit_sha)):
             if value is not None:
                 existing[field] = value
+        previous_stage = existing.get("stage")
         if stage:
             existing["stage"] = existing["status"] = stage
         self.record_event("mission", key, "MissionUpdated",
@@ -1129,6 +1176,8 @@ class ControlPlaneRepo:
                            "repository_id": existing.get("repository_id"),
                            "commit_sha": existing.get("commit_sha")},
                           mission_id=mission_id)
+        if stage:
+            self._mission_stage_changed(key, previous_stage, stage)
         return _copy(existing)
 
     # --------------------------------------------- CI: test runs / builds
@@ -2216,9 +2265,22 @@ class ControlPlaneRepo:
         self._event_order = [t for t in self._event_order if t[0] != "inspector"]
         # HCN events are private to the collaboration service: they must never sit
         # in the shared streams that /activity and the global SSE feed expose.
+        from .collab_repair import classify
+        stored = []
         for key in [k for k in self._events if k[0] == "collab"]:
-            self._collab_replay.extend(self._events.pop(key))
-        self._event_order = [t for t in self._event_order if t[0] != "collab"]
+            stored.extend(self._events.pop(key))
+        # T16 H1: only rows the collaboration service itself could have written are replayed; the rest are kept
+        # in storage, reported at ERROR and left alone (`collab-repair` moves them aside on request).
+        keep, bad = classify(stored)
+        self._collab_replay.extend(keep)
+        self.collab_quarantine.extend(row for row, _ in bad)
+        self.collab_quarantine_reasons = [why for _, why in bad]
+        if self.collab_quarantine:
+            logging.getLogger(__name__).error(
+                "quarantined %d foreign 'collab' row(s) from the durable log (%s); they are kept in storage and "
+                "were NOT replayed; see `collab-repair`", len(self.collab_quarantine),
+                ", ".join(sorted(set(self.collab_quarantine_reasons))))
+        self._event_order = [t for t in self._event_order if t[0] not in ("collab", "review_request")]
         if durable:
             self.inspector.hydrate(durable)
         # Host telemetry rollups/state ride a private stream: rebuild history and

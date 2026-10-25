@@ -151,7 +151,7 @@ def _rebuild_events(rows: list[dict]) -> tuple[dict, list]:
             "mission_id": row.get("mission_id"),
             "session_id": row.get("session_id"),
             "sequence": seq, "event_type": row.get("event_type"),
-            "payload": row.get("payload") or {},
+            "payload": _ev_payload(row),     # asyncpg yields jsonb as str; every consumer expects a dict
             **{name: _v2_value(name, row.get(name))
                for name in V2_COLUMNS if row.get(name) is not None},
         })

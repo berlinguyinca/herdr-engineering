@@ -764,10 +764,10 @@ def test_store_unavailable_at_viewer_bind_keeps_the_cache_and_rereads_nothing():
     monitor_for(fake, shared).refresh()
 
     class BlipOnViewerLoad(MemoryGitHubStore):
-        def load(self):
+        def load(self, **kw):
             if self._viewer is not None:
                 raise GitHubStoreUnavailable("blip")
-            return super().load()
+            return super().load(**kw)
     restarted = GitHubMonitor(provider_factory=lambda: fake, store=lambda identity, viewer=None: BlipOnViewerLoad(
         identity=identity, viewer=viewer, shared=shared))
     assert numbers(restarted) == list(range(1, 9))
@@ -862,12 +862,19 @@ def _revoke(fake):
     fake.repositories_page = fake.issues_page = fake.issue = rejected
 
 
+def _rejected_twice(monitor):
+    """Two consecutive 401 passes: the second purges (one 401 alone leaves the stored catalog)."""
+    monitor.refresh()
+    monitor._retry_at = 0
+    monitor.refresh()
+
+
 def test_a_revoked_token_stops_serving_and_purges_its_private_catalog():
     fake, shared = seeded(), {}
     monitor = monitor_for(fake, shared)
     monitor.refresh()
     _revoke(fake)  # same token, same fingerprint, but GitHub now answers 401
-    monitor.refresh()
+    _rejected_twice(monitor)
     view = monitor.repositories(start=False)
     assert view["status"] == "auth_error" and view["available"] is False and view["stale"] is False
     assert view["repositories"] == [] and numbers(monitor) == []
@@ -885,11 +892,12 @@ def test_a_revoked_token_never_serves_a_cached_issue_body():
     fake.edit("acme/app", next(g for g, i in fake.repos["acme/app"].items() if i["number"] == 2), title="new")
     monitor.refresh()  # the catalog now knows a newer updatedAt: the detail must be refetched
     _revoke(fake)
-    try:
-        monitor.issue_detail("github.com/acme/app", 2)
-        raise AssertionError("served a cached body after a 401")
-    except GitHubError as exc:
-        assert exc.reason in {"authentication", "not_found"}
+    for _ in range(2):
+        try:
+            monitor.issue_detail("github.com/acme/app", 2)
+            raise AssertionError("served a cached body after a 401")
+        except GitHubError as exc:
+            assert exc.reason in {"authentication", "not_found"}
     assert numbers(monitor) == []
     assert MemoryGitHubStore(identity=fake.credential_identity, shared=shared).load().repositories == {}
 
@@ -901,11 +909,11 @@ def test_an_unreadable_viewer_store_is_retried_once_per_pass_not_per_page():
     attempts = []
 
     class Unreadable(MemoryGitHubStore):
-        def load(self):
+        def load(self, **kw):
             if self._viewer is not None:
                 attempts.append(self._viewer)
                 raise GitHubStoreUnavailable("down")
-            return super().load()
+            return super().load(**kw)
     restarted = GitHubMonitor(provider_factory=lambda: fake, store=lambda identity, viewer=None: Unreadable(
         identity=identity, viewer=viewer, shared=shared))
     restarted.refresh()
@@ -939,7 +947,7 @@ def test_a_poll_during_a_purge_never_answers_an_empty_delta():
         original()
     store.purge = purge
     _revoke(fake)
-    monitor.refresh()
+    _rejected_twice(monitor)
     assert seen and seen[0]["resync"] is True and seen[0]["issues"] == []
     after = monitor.changes(kind="issues", since=since, start=False)
     assert after["resync"] is True and after["issues"] == []
@@ -1106,6 +1114,6 @@ def test_a_write_landing_during_a_purge_cannot_reinstate_the_old_revision():
         original()
     store.purge = purge
     _revoke(fake)
-    monitor.refresh()
+    _rejected_twice(monitor)
     assert seen[0]["resync"] is True and seen[0]["issues"] == []
     assert monitor.revision() is not None and monitor.revision() > since  # remembered after the purge

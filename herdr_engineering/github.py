@@ -9,6 +9,7 @@ import contextlib
 import copy
 import hashlib
 import json
+import logging
 import math
 import re
 import threading
@@ -108,6 +109,9 @@ class GitHubError(RuntimeError):
             "rejected": "GitHub rejected the request as invalid.",
             "invalid_config": "github.organizations must be a list of non-empty GitHub owner logins; fix the YAML configuration.",
         }.get(reason, "GitHub is temporarily unavailable."))
+
+
+AUTH_FAILURES_BEFORE_PURGE = 2  # consecutive 401s before the stored catalog is wiped
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -342,6 +346,9 @@ def _tab(issue, tab):
     return tab == "all" or (tab == "autospec" and state["managed"]) or state["state"] == tab
 
 
+RESYNC_PAGE = 100  # rows a ``since`` resync returns; the rest comes from the paginated list
+
+
 def _page(rows, page, per_page):
     if not isinstance(page, int) or not isinstance(per_page, int) or page < 1 or not 1 <= per_page <= 100:
         raise ValueError("page must be positive and per_page must be 1–100")
@@ -426,6 +433,8 @@ class GitHubMonitor:
         self._resume_repos, self._issue_resume, self._resume_passes = None, {}, 0
         self._floor, self._pass_reads = None, 0
         self._store, self._store_viewer, self._store_dirty = None, None, False
+        self._auth_failures = 0  # consecutive 401s: the persisted catalog is purged on the second
+        self._detail_window = [0, 0]  # issue_detail points spent: [window start, points]
         self._bind_failed = False  # this pass already failed to read the viewer store
         self._revision = None  # the store's catalog revision after its last load or write
         self._purging = None  # the store a revoked token is purging: no revision adopted from it meanwhile
@@ -446,9 +455,9 @@ class GitHubMonitor:
                     "issues_seen": 0, "issues_total_known": None, "current_repository": None}}
 
     def start(self):
+        self._sync_credentials()  # opens the store: never under the monitor lock
         with self._lock:
             if self._thread is None and not self._stop.is_set():
-                self._sync_credentials()
                 self._thread = threading.Thread(target=self._loop, daemon=True, name="herdr-github-catalog")
                 self._thread.start()
 
@@ -519,8 +528,9 @@ class GitHubMonitor:
             self._wake.set()
         return self.snapshot(start=False)
 
-    def snapshot(self, *, start=True):
-        self._sync_credentials()
+    def snapshot(self, *, start=True, sync=True):
+        if sync:  # False: the caller synced the credentials before taking the lock
+            self._sync_credentials()
         if start:
             self.start()
         with self._lock:
@@ -537,6 +547,12 @@ class GitHubMonitor:
             view["stale"] = view["stale"] or any(self._now() - since > self._interval * 2 for since, _ in deferred)
             return view
 
+    def _ready(self, start):
+        """Sync credentials (and open the store) and start the worker, before any lock is taken."""
+        self._sync_credentials()
+        if start:
+            self.start()
+
     def repository_languages(self, *, start=True):
         """Return current-generation primary languages without a network read.
 
@@ -550,32 +566,48 @@ class GitHubMonitor:
             return {identity: record.get("language") for identity, record in self._repos.items()}
 
     def _sync_credentials(self):
+        """Follow the credential. The store is opened and read OUTSIDE the monitor lock (a slow or
+        hung database must not stall every request) and swapped in under it."""
+        provider = self._factory()
         with self._lock:
-            provider = self._factory()
-            if provider.credential_identity != self._credential:
-                self._generation += 1
-                self._credential = provider.credential_identity
-                self._retire(self._store)
-                self._reset_catalog()
-                self._retry_at = 0
-                self._view = self._empty()
-                self._view["connection_generation"] = self._generation
-                if provider.available:
-                    self._store, snapshot = self._open_store(self._credential, None)
-                    if snapshot is not _UNREADABLE:
-                        self._remember_revision(self._store, snapshot.revision if snapshot else None)
-                    elif self._store is not None:
-                        # memory cannot know what is stored: the first pass's flush reconciles it
-                        self._store_dirty = True
-                    if snapshot not in (None, _UNREADABLE):
-                        self._hydrate(snapshot)
-                if self._thread is not None and threading.current_thread() is not self._thread:
-                    self._wake.set()
+            if provider.credential_identity == self._credential:
+                return provider
+            self._generation += 1
+            self._credential = provider.credential_identity
+            self._retire(self._store)
+            self._reset_catalog()
+            self._retry_at = 0
+            self._view = self._empty()
+            self._view["connection_generation"] = self._generation
+            generation, credential = self._generation, self._credential
+            if self._thread is not None and threading.current_thread() is not self._thread:
+                self._wake.set()
+        if not provider.available:
+            return provider
+        store, snapshot = self._open_store(credential, None)
+        revision = self._revision_of(store, snapshot)
+        with self._lock:
+            if generation != self._generation:
+                self._retire(store)  # another credential took over while the database was read
+                return provider
+            self._store = store
+            if snapshot is not _UNREADABLE:
+                self._adopt_revision(store, revision)
+            elif store is not None:
+                # memory cannot know what is stored: the first pass's flush reconciles it
+                self._store_dirty = True
+            if snapshot not in (None, _UNREADABLE):
+                if self._repos:
+                    self._store_dirty = True  # a pass filled memory while the store was read: it wins
+                else:
+                    self._hydrate(snapshot)
+            elif self._repos and store is not None:
+                self._store_dirty = True
         return provider
 
     # -- persistent store
 
-    def _open_store(self, identity, viewer):
+    def _open_store(self, identity, viewer, *, rows=True):
         """A store for this credential (and viewer, once known) plus its loaded catalog.
 
         The catalog is a ``Snapshot``, ``None`` when nothing is stored for this
@@ -591,7 +623,7 @@ class GitHubMonitor:
         except Exception:
             return None, _UNREADABLE
         try:
-            return store, store.load()
+            return store, (store.load() if rows else store.load(rows=False))
         except Exception:
             return store, _UNREADABLE
 
@@ -608,12 +640,28 @@ class GitHubMonitor:
             except Exception:
                 revision = None
         with self._lock:
-            if store is not self._store or store is self._purging:
-                return
-            if revision is None or self._revision is None:
-                self._revision = revision
-            else:
-                self._revision = max(self._revision, revision)
+            self._adopt_revision(store, revision)
+
+    def _adopt_revision(self, store, revision):
+        """Lock held, no database access: cache ``revision`` if ``store`` is still the current one."""
+        if store is not self._store or store is self._purging:
+            return
+        if revision is None or self._revision is None:
+            self._revision = revision
+        else:
+            self._revision = max(self._revision, revision)
+
+    @staticmethod
+    def _revision_of(store, snapshot):
+        """The revision a freshly opened store reports (read outside the lock), ``None`` if unknown."""
+        if store is None or snapshot is _UNREADABLE:
+            return None
+        if snapshot is not None:
+            return snapshot.revision
+        try:
+            return store.revision()
+        except Exception:
+            return None
 
     def _allowlist(self):
         """The validated owner allowlist (empty = every owner); ``GitHubError`` when invalid."""
@@ -666,14 +714,22 @@ class GitHubMonitor:
             self._check_generation()
             if self._store is None or self._store_viewer == account or self._bind_failed:
                 return self._store
-            store, snapshot = self._open_store(self._credential, account)
+            generation, credential = self._generation, self._credential
+        # the database is read outside the lock; only the revision is needed (the catalog is in memory)
+        store, snapshot = self._open_store(credential, account, rows=False)
+        revision = self._revision_of(store, snapshot)
+        with self._lock:
+            if generation != self._generation:
+                self._retire(store)
+                self._check_generation()
+                return self._store
             if snapshot is _UNREADABLE:
                 self._retire(store)
                 self._bind_failed = True  # once per pass: each try may wait out a connect timeout
                 return self._store
             self._retire(self._store)
             self._store, self._store_viewer = store, account
-            self._remember_revision(store, snapshot.revision if snapshot else None)
+            self._adopt_revision(store, revision)
             if snapshot is None:
                 # the stored catalog belonged to another viewer and was purged (or was empty)
                 self._issues, self._marks, self._watermarks, self._issue_resume = {}, {}, {}, {}
@@ -772,6 +828,9 @@ class GitHubMonitor:
             self._local.generation = generation
         try:
             self._collect(provider)
+            with self._lock:
+                if generation == self._generation and self._view.get("status") != "advisory_locked":
+                    self._auth_failures = 0
         except _Superseded:
             pass
         except GitHubError as exc:
@@ -801,6 +860,9 @@ class GitHubMonitor:
         with self._lock:
             if generation != self._generation:
                 return
+            self._auth_failures += 1
+            if self._auth_failures < AUTH_FAILURES_BEFORE_PURGE:
+                return  # one 401 can be a blip (or a proxy); the persisted catalog survives it
             store = self._store
             self._repos, self._issues, self._details = {}, {}, {}
             self._marks, self._watermarks, self._full_at, self._deferred = {}, {}, {}, {}
@@ -838,12 +900,22 @@ class GitHubMonitor:
         with self._pass_lock(store) as acquired:
             if acquired:
                 self._collect_pass(provider)
+            else:
+                # another instance holds the catalog's advisory lock: say so instead of silently idling
+                logging.getLogger(__name__).warning(
+                    "GitHub catalog sync skipped: another herdr instance holds the advisory lock")
+                with self._lock:
+                    self._view.update(refreshing=False, checked_at=_stamp(), status="advisory_locked",
+                                      error="Another instance is syncing the GitHub catalog; serving its stored copy.")
+                    self._touch()
 
     def _collect_pass(self, provider):
         self._update(refreshing=True, error=None, status="syncing", partial=True, available=True)
         self._progress(phase="repositories", repositories_seen=0, repositories_total=None,
                        issues_seen=0, issues_total_known=None, issue_repositories_complete=0, current_repository=None)
         self._apply_sync_settings()
+        with self._lock:
+            self._spent = self._detail_spent()  # issue_detail fetches draw on the same budget
         allow = self._allowlist()
         with self._lock:
             self._check_generation()
@@ -1013,11 +1085,23 @@ class GitHubMonitor:
     def _charge(self, provider):
         """Add the last call's GraphQL ``rateLimit.cost`` to this pass: at least 1 per call, and 1
         when GitHub did not report it for this call (never an earlier call's cost)."""
+        self._spent += self._cost(provider)
+
+    @staticmethod
+    def _cost(provider):
         if hasattr(provider, "last_cost"):
             cost = provider.last_cost
         else:  # a provider without per-call costs: its current rate-limit report
             cost = provider.rate_limit.get("cost") if isinstance(provider.rate_limit, dict) else None
-        self._spent += max(1, cost) if isinstance(cost, int) and not isinstance(cost, bool) else 1
+        return max(1, cost) if isinstance(cost, int) and not isinstance(cost, bool) else 1
+
+    def _detail_spent(self):
+        """Points issue_detail fetches spent in the current interval window (lock held)."""
+        start, points = self._detail_window
+        if self._now() - start >= self._interval:
+            self._detail_window = [self._now(), 0]
+            return 0
+        return points
 
     def _due_reconciles(self, discovered):
         """Repositories whose scheduled full read is due, oldest first, at most N this pass."""
@@ -1208,8 +1292,9 @@ class GitHubMonitor:
         return sorted(rows, key=lambda row: (row["updated_at"] or "", row["number"]), reverse=True)
 
     def repositories(self, *, page=1, per_page=50, search="", start=True):
+        self._ready(start)
         with self._lock:
-            view = self.snapshot(start=start)
+            view = self.snapshot(start=False, sync=False)
             rows = self._repository_rows(search)
         view["repositories"], view["pagination"] = _page(rows, page, per_page)
         return view
@@ -1217,8 +1302,9 @@ class GitHubMonitor:
     def issues(self, *, repository_id=None, tab="all", page=1, per_page=50, search="", start=True):
         if tab not in TABS:
             raise ValueError("unknown issue tab")
+        self._ready(start)
         with self._lock:
-            view = self.snapshot(start=start)
+            view = self.snapshot(start=False, sync=False)
             rows = self._issue_rows(repository_id, search)
         view["counts"] = {name: sum(_tab(issue, name) for issue in rows) for name in sorted(TABS)}
         rows = self._issue_order(issue for issue in rows if _tab(issue, tab))
@@ -1239,8 +1325,9 @@ class GitHubMonitor:
         counter, so a 304 never hides a state change. ``None`` when there is no
         trustworthy revision; the caller then hashes the body instead.
         """
+        self._ready(start)
         with self._lock:
-            view = self.snapshot(start=start)
+            view = self.snapshot(start=False, sync=False)
             revision = None if self._store is None or self._store_dirty else self._revision
             epoch = self._epoch
             # the view lists DEFERRED_SHOWN of them; a change past that still changes the tag
@@ -1258,12 +1345,14 @@ class GitHubMonitor:
         matches the filters (repository, search, tab) is reported as removed.
         A ``since`` the store can no longer answer (older than its pruned
         tombstones, newer than its revision) or an untrusted revision answers
-        ``resync: true`` with the full, unpaginated list.
+        ``resync: true`` with the first ``RESYNC_PAGE`` rows only (``pagination`` says how many
+        more; the client reloads the rest through the paginated list), never the whole catalog.
         """
         if kind not in {"repositories", "issues"} or tab not in TABS:
             raise ValueError("unknown GitHub list")
+        self._ready(start)
         with self._lock:
-            view = self.snapshot(start=start)
+            view = self.snapshot(start=False, sync=False)
             current_revision = self._revision
             # no trusted revision (writes failing, or a purge under way): every since resyncs
             store = None if self._store_dirty or current_revision is None else self._store
@@ -1273,7 +1362,7 @@ class GitHubMonitor:
             delta = {"revision": since, "resync": False, "upserted": [], "removed": []}
         elif store is not None:
             try:
-                delta = store.changes_since(since)
+                delta = store.changes_since(since, full=False)
             except Exception:
                 delta = None
         with self._lock:
@@ -1286,7 +1375,9 @@ class GitHubMonitor:
                 rows = self._issue_order(issue for issue in every if _tab(issue, tab))
                 current = {(row["repository_id"], row["github_id"]): row for row in rows}
         if delta is None or delta["resync"]:
-            view.update({"revision": delta["revision"] if delta else None, "resync": True, kind: rows})
+            page, pagination = _page(rows, 1, RESYNC_PAGE)
+            view.update({"revision": delta["revision"] if delta else None, "resync": True, kind: page,
+                         "pagination": pagination})
             return view
         wanted = "repository" if kind == "repositories" else "issue"
         touched = dict.fromkeys((item["repository_id"], item["key"]) for item in delta["upserted"] + delta["removed"]
@@ -1337,15 +1428,27 @@ class GitHubMonitor:
             if cached:
                 return dict(cached, stale=True, error="GitHub requests are temporarily paused.")
             raise GitHubError("rate_limited", retry_at=self._retry_at)
+        with self._lock:
+            over = self._detail_spent() >= self._budget
+            retry_at = self._detail_window[0] + self._interval
+        if over:  # this interval's point budget is spent: no new body until the window rolls over
+            if cached:
+                return dict(cached, stale=True, error="The GitHub point budget for this interval is spent.")
+            raise GitHubError("rate_limited", retry_at=retry_at)
         try:
             fetched_at = self._now()
             issue = _issue(provider.issue(repository_id, number), repository_id)
+            with self._lock:
+                cost = self._cost(provider)
+                self._detail_window[1] += cost
+                self._spent += cost
             result = {"issue": issue, "stale": False, "error": None,
                       "checked_at": datetime.fromtimestamp(fetched_at, UTC).isoformat(),
                       "connection_generation": generation}
             with self._lock:
                 if generation != self._generation:
                     raise GitHubError("not_configured")
+                self._auth_failures = 0
                 self._remember_detail(repository_id, number, result)
             if store is not None:
                 try:
