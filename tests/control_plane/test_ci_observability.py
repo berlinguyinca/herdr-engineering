@@ -337,3 +337,20 @@ def test_latest_run_summary_preserves_retry_outcome_when_old_upload_is_replayed(
     store.record_report(case_report())
     store.record_report(first)
     assert store.summary()['pipelines'][0]['test_summary']['passed'] == 1
+
+
+@pytest.mark.parametrize('legacy', [False, True])
+def test_reordered_duplicate_labels_cannot_prove_flakiness(store, legacy):
+    for reverse in (False, True):
+        cases = ['<testcase name="same"/>', '<testcase name="same"><failure/></testcase>']
+        xml = '<testsuite>' + ''.join(reversed(cases) if reverse else cases) + '</testsuite>'
+        report = case_report(xml=xml)
+        if legacy:
+            for case in report['tests']:
+                case.pop('identity_ambiguous', None)
+        store.record_report(report)
+    rows = store.test_summary()['tests']
+    assert {row['classification'] for row in rows} == {'inconsistent_outcomes'}
+    assert all(row['identity_ambiguous'] is True for row in rows)
+    assert all(row['same_revision_retries'] == [] for row in rows)
+    assert all(row['passed'] == row['failed'] == 1 for row in rows)

@@ -57,6 +57,7 @@ def parse_junit(xml):
     if _tag(root) not in {'testsuites', 'testsuite'}:
         raise ValueError('JUnit root must be testsuite or testsuites')
     tests, identities = [], {}
+    case_groups = {}
     # Iterative traversal also handles nested suites without recursion limits.
     pending = [(root, ())]
     while pending:
@@ -98,8 +99,15 @@ def parse_junit(xml):
                               trace=_text(''.join(detail.itertext()), 4000) if detail is not None else ''))
             if node.get('file'):
                 tests[-1]['file'] = _text(node.get('file'))
+            case_groups.setdefault(identity, []).append(tests[-1])
         else:
             pending.extend((child, suite_path) for child in reversed(list(node)))
+    for cases in case_groups.values():
+        if len(cases) > 1:
+            # Occurrence ordinals keep rows distinct, but do not identify a
+            # physical test across reports when duplicate labels reorder.
+            for case in cases:
+                case['identity_ambiguous'] = True
     summary = {state: sum(test['status'] == state for test in tests)
                for state in ('passed', 'failed', 'errored', 'skipped')}
     summary.update(total=len(tests), duration_ms=sum(test['duration_ms'] for test in tests))

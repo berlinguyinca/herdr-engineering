@@ -184,6 +184,7 @@ class ControlPlaneRepo:
         self._events = {}  # (entity_type, entity_id) -> [event, ...]
         self._event_order = []  # (entity_type, entity_id, seq) chronological
         self._ci_sequence = 0  # one bounded counter survives stream eviction
+        self._ci_history_truncated = set()
         # Envelope v2 idempotency / sequence / freshness state (envelope.py).
         self.ledger = SourceLedger(now=self._now, persist=self._persist_source_state)
         self._listeners = set()  # pub/sub for the SSE live stream (Spec §52)
@@ -1696,6 +1697,7 @@ class ControlPlaneRepo:
             self._trim_ci_history("ci_observation")
 
     def _trim_ci_history(self, kind=None):
+        from .ci_observability import _identity
         from .ci_performance import RECORD_LIMIT
         from .ci_reports import HISTORY_BYTES, PIPELINE_LIMIT, REPORT_LIMIT
         keep = set()
@@ -1713,6 +1715,21 @@ class ControlPlaneRepo:
             keys.sort(key=lambda key: (self._events[key][-1].get("ingest_timestamp", ""),
                                       arrivals.get((*key, self._events[key][-1]["sequence"]), -1)),
                       reverse=True)
+            if kind == 'ci_observation' and any(not key[1].startswith('[') for key in keys):
+                # Upgrade may retain a legacy "repo_id:run" stream alongside
+                # a new provider-scoped stream. Supersede only exact full
+                # identities, newest first; missing provider identity stays
+                # unresolved. Journal events themselves are never rewritten.
+                seen, unique = set(), []
+                for key in keys:
+                    identity = _identity(self._events[key][-1]['payload'])
+                    if identity is not None and identity in seen:
+                        del self._events[key]
+                    else:
+                        unique.append(key)
+                        if identity is not None:
+                            seen.add(identity)
+                keys = unique
             size = 0
             for key in keys[:limit]:
                 latest = self._events[key][-1]
@@ -1723,6 +1740,7 @@ class ControlPlaneRepo:
                 keep.add(key)
             for key in keys:
                 if key not in keep:
+                    self._ci_history_truncated.add(kind)
                     del self._events[key]
         self._event_order = [entry for entry in self._event_order
                              if entry[0] not in kinds
@@ -1744,6 +1762,7 @@ class ControlPlaneRepo:
             reconcile_report_identities(reports, pipelines)
             return {"reports": reports, "pipelines": pipelines,
                     "scope": {"kind": "retained_observations", "complete": False,
+                              "truncated": bool(self._ci_history_truncated & {"ci_report", "ci_observation"}),
                               "persistence": "durable_sink" if self._sink is not None else "memory_only",
                               "report_limit": REPORT_LIMIT, "pipeline_limit": PIPELINE_LIMIT,
                               "byte_limit_per_kind": HISTORY_BYTES,
@@ -1776,6 +1795,9 @@ class ControlPlaneRepo:
             end - days * 86400 <= stamp <= end for row in unjoined)
         view['scope'].update(persistence=history['scope']['persistence'],
                              memory_only=self._sink is None,
+                             source_truncated=history['scope']['truncated'],
+                             projection_truncated=view['scope']['truncated'],
+                             truncated=history['scope']['truncated'] or view['scope']['truncated'],
                              unjoined_report_count=unjoined_count)
         return view
 
@@ -2249,6 +2271,7 @@ class ControlPlaneRepo:
                        for (t, i), s in self._events.items()},
             "event_order": list(self._event_order),
             "ci_sequence": self._ci_sequence,
+            "ci_history_truncated": sorted(self._ci_history_truncated),
             "agent_projections": copy.deepcopy(list(self._agent_records.values())),
         }
 
@@ -2276,6 +2299,7 @@ class ControlPlaneRepo:
                                      for key, stream in self._events.items()
                                      if key[0] in {"ci_report", "ci_observation", "ci_telemetry"}
                                      for event in stream), default=0))
+        self._ci_history_truncated = set(state.get('ci_history_truncated', []))
         self._trim_ci_history()
         # Replay durable naming reservations before any session is presented.
         # Summary continuity lives outside transcript retention and public feeds.

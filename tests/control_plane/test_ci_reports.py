@@ -559,3 +559,119 @@ def test_provider_collisions_survive_disk_replay_without_losing_runs(disk_event_
     assert len(restored.ci_reports()['pipelines']) == 2
     assert len(restored.ci_test_history()['tests']) == 2
     assert restored.ci_test_history() == repo.ci_test_history()
+
+
+def duplicate_label_xml(reverse=False):
+    cases = ['<testcase classname="Checks" name="same"/>',
+             '<testcase classname="Checks" name="same"><failure>bad</failure></testcase>']
+    return '<testsuite name="unit">' + ''.join(reversed(cases) if reverse else cases) + '</testsuite>'
+
+
+def test_duplicate_labels_preserve_ambiguity_through_durable_history(disk_event_journal):
+    from herdr_engineering.control_plane.bridge import load_into
+    repo = history_repo(sink=disk_event_journal)
+    for reverse in (False, True):
+        receipt = repo.ingest_ci_report(history_report(xml=duplicate_label_xml(reverse)))
+        assert all(case.get('identity_ambiguous') is True for case in receipt['tests'])
+    restored = history_repo(sink=disk_event_journal)
+    load_into(restored, disk_event_journal)
+    rows = restored.ci_test_history()['tests']
+    assert len(rows) == 2
+    assert {row['classification'] for row in rows} == {'inconsistent_outcomes'}
+    assert all(row['identity_ambiguous'] and not row['same_revision_retries'] for row in rows)
+    assert all(row['passed'] == row['failed'] == 1 for row in rows)
+
+
+def test_observation_key_upgrade_replaces_legacy_run_and_survives_replay(disk_event_journal):
+    from herdr_engineering.control_plane.bridge import load_into
+    legacy = history_repo(sink=disk_event_journal)
+    row = {key: value for key, value in history_report().items() if key != 'xml'}
+    legacy.record_event('ci_observation', '17:1', 'CIPipelineObserved',
+                        {**row, 'state': 'running'}, require_durable=True)
+    upgraded = history_repo(sink=disk_event_journal)
+    upgraded.import_state(legacy.export_state())
+    upgraded.observe_ci_pipeline({**row, 'state': 'success'})
+    upgraded.observe_ci_pipeline({**row, 'state': 'success'})
+    assert upgraded.ci_reports()['pipelines'] == [{**row, 'state': 'success'}]
+    assert upgraded.ci_reports()['scope']['pipeline_count'] == 1
+    upgraded.observe_ci_pipeline({**row, 'provider_url': 'https://other.example', 'state': 'failure'})
+    restored = history_repo(sink=disk_event_journal)
+    load_into(restored, disk_event_journal)
+    rows = restored.ci_reports()['pipelines']
+    assert {(item['provider_url'], item['state']) for item in rows} == {
+        ('https://ci.example', 'success'), ('https://other.example', 'failure')}
+    assert len(rows) == 2
+    assert len(disk_event_journal.events()) == 3
+
+
+@pytest.mark.parametrize('kind', ['ci_report', 'ci_observation'])
+def test_source_eviction_remains_visible_after_projection_and_restore(kind, monkeypatch, disk_event_journal):
+    from herdr_engineering.control_plane import ci_reports
+    from herdr_engineering.control_plane.bridge import load_into
+    monkeypatch.setattr(ci_reports, 'REPORT_LIMIT' if kind == 'ci_report' else 'PIPELINE_LIMIT', 1)
+    repo = history_repo(sink=disk_event_journal)
+    for number in (1, 2):
+        body = history_report(run_number=number)
+        if kind == 'ci_report':
+            repo.ingest_ci_report(body)
+        else:
+            repo.observe_ci_pipeline({key: value for key, value in body.items() if key != 'xml'})
+    backup = history_repo()
+    backup.import_state(repo.export_state())
+    restored = history_repo(sink=disk_event_journal)
+    load_into(restored, disk_event_journal)
+    for instance in (repo, backup, restored):
+        assert instance.ci_reports()['scope']['truncated'] is True
+        scope = instance.ci_test_history()['scope']
+        assert scope['source_truncated'] is True
+        assert scope['projection_truncated'] is False
+        assert scope['truncated'] is True and scope['partial'] is True
+
+
+@pytest.mark.parametrize('changes', [
+    {'provider_url': 'https://other.example'},
+    {'provider_url': None},
+    {'repository': 'other/app'},
+    {'provider_repo_id': 18},
+])
+def test_observation_upgrade_does_not_merge_unproven_legacy_identity(changes):
+    repo = history_repo()
+    row = {key: value for key, value in history_report().items() if key != 'xml'}
+    repo.record_event('ci_observation', '17:1', 'CIPipelineObserved',
+                      {**row, **changes, 'state': 'running'})
+    repo.observe_ci_pipeline({**row, 'state': 'success'})
+    rows = repo.ci_reports()['pipelines']
+    assert len(rows) == 2
+    assert {item['state'] for item in rows} == {'running', 'success'}
+    assert repo.ci_reports()['scope']['truncated'] is False
+
+
+def test_observation_upgrade_does_not_discard_legacy_run_if_persistence_fails(disk_event_journal, tmp_path):
+    repo = history_repo(sink=disk_event_journal)
+    row = {key: value for key, value in history_report().items() if key != 'xml'}
+    repo.record_event('ci_observation', '17:1', 'CIPipelineObserved', {**row, 'state': 'running'})
+    journal = tmp_path / 'journal.jsonl'
+    journal.rename(tmp_path / 'journal.saved')
+    journal.mkdir()
+    with pytest.raises(IsADirectoryError):
+        repo.observe_ci_pipeline({**row, 'state': 'success'})
+    assert repo.ci_reports()['pipelines'] == [{**row, 'state': 'running'}]
+    journal.rmdir()
+    (tmp_path / 'journal.saved').rename(journal)
+    repo.observe_ci_pipeline({**row, 'state': 'success'})
+    assert repo.ci_reports()['pipelines'] == [{**row, 'state': 'success'}]
+    assert repo.ci_reports()['scope']['truncated'] is False
+
+
+def test_byte_eviction_is_source_truncation_even_below_the_report_count_limit(monkeypatch):
+    from herdr_engineering.control_plane import ci_reports
+    repo = history_repo()
+    repo.ingest_ci_report(history_report())
+    # A byte cap smaller than one existing event must evict that report even
+    # though the repository is far below the count cap.
+    monkeypatch.setattr(ci_reports, 'HISTORY_BYTES', 1)
+    repo.ingest_ci_report(history_report(run_number=2))
+    assert repo.ci_reports()['reports'] == []
+    scope = repo.ci_test_history()['scope']
+    assert scope['truncated'] is True and scope['source_truncated'] is True
+    assert scope['projection_truncated'] is False

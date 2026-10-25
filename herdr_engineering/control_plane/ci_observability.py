@@ -12,7 +12,7 @@ import hashlib
 import json
 import re
 import threading
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 from datetime import UTC, datetime
 from urllib.parse import urlsplit
 
@@ -125,6 +125,7 @@ def _test_cases(report):
             return None
         ids.add(case['id'])
         row = {key: case[key] for key in ('id', 'status', 'duration_ms')}
+        row['identity_ambiguous'] = case.get('identity_ambiguous') is True
         for field, limit in (('name', 500), ('suite', 500), ('classname', 500),
                              ('file', 500), ('message', 2000), ('trace', 4000)):
             value = case.get(field, '')
@@ -132,6 +133,13 @@ def _test_cases(report):
                 return None
             row[field] = redact_text(value)[:limit]
         projected.append(row)
+    # Old journals lack the parser's ambiguity flag. Display-label collisions
+    # cannot prove identity either, so conservatively exclude those from proof.
+    labels = ('suite', 'classname', 'name', 'file')
+    occurrences = Counter(tuple(case[key] for key in labels) for case in projected)
+    for case in projected:
+        if occurrences[tuple(case[key] for key in labels)] > 1:
+            case['identity_ambiguous'] = True
     if (any(sum(case['status'] == state for case in projected) != summary[state]
             for state in _COUNTS[:4]) or
             sum(case['duration_ms'] for case in projected) != summary['duration_ms']):
@@ -180,12 +188,17 @@ def _aggregate_test(observations):
     failures = [item for item in observations if item[2]['status'] in ('failed', 'errored')]
     passes = [item for item in observations if item[2]['status'] == 'passed']
     completed = [item for item in observations if item[2]['status'] != 'skipped']
+    ambiguous = any(item[2]['identity_ambiguous'] for item in observations)
     revisions = {}
     for item in completed:
         revisions.setdefault(item[1]['revision'], []).append(item)
     retries = []
+    inconsistent_count = 0
     for revision, items in revisions.items():
         if {item[2]['status'] == 'passed' for item in items} == {True, False}:
+            inconsistent_count += 1
+            if ambiguous:
+                continue
             # Two opposing attempts are sufficient evidence; avoid an unbounded
             # per-case copy of every run in the report window.
             failed = next(item for item in items if item[2]['status'] != 'passed')
@@ -204,7 +217,7 @@ def _aggregate_test(observations):
         **{key: last_case[key] for key in ('id', 'name', 'suite', 'classname', 'file')},
         **counts, 'completed_count': len(completed), 'failure_count': len(failures),
         'failure_rate': len(failures) / len(completed) if completed else None,
-        'inconsistent_count': len(retries),
+        'inconsistent_count': inconsistent_count, 'identity_ambiguous': ambiguous,
         'classification': 'proven_flaky' if retries else
                           'inconsistent_outcomes' if failures and passes else 'stable',
         'first_failure': _iso(failures[0][0]) if failures else None,
