@@ -458,10 +458,15 @@ async function viewMissionTests(parts, revision) {
   root.innerHTML = `<a href="#/missions">← Missions</a><h1 style="overflow-wrap:anywhere">${esc(title)} · Tests & builds</h1>${missionSectionNav(key)}<div id="mission-tests"></div>`;
   const host = document.getElementById('mission-tests');
   let pending = false;
+  let trailing = false;
   const loadRuns = async (initial) => {
-    if (pending || !host.isConnected || document.hidden) return;
+    if (pending) { trailing = true; return; }
+    if (!host.isConnected || document.hidden) return;
     pending = true;
     try {
+      // Page-specific loading state: the section is blank until its first data
+      // arrives, so show a spinner rather than an empty flash.
+      if (initial) host.innerHTML = '<herdr-spinner label="Loading tests & builds"></herdr-spinner>';
       let tests = [], builds = [];
       const [t, b] = await Promise.all([client.missionTests(key), client.missionBuilds(key)]);
       tests = (t && t.tests) || []; builds = (b && b.builds) || [];
@@ -473,7 +478,10 @@ async function viewMissionTests(parts, revision) {
     } catch (error) {
       if (!host.isConnected) return;
       if (initial) host.innerHTML = `<herdr-error message="${esc(error.message)}"></herdr-error>`;
-    } finally { pending = false; }
+    } finally {
+      pending = false;
+      if (trailing) { trailing = false; loadRuns(false); }
+    }
   };
   try { await loadRuns(true); } catch { /* not-found handled below */ }
   if (revision !== renderRevision) return;
@@ -543,10 +551,13 @@ async function viewMissionReviews(parts, revision) {
   root.innerHTML = `<a href="#/missions">← Missions</a><h1 style="overflow-wrap:anywhere">${esc(title)} · Reviews & PRs</h1>${missionSectionNav(key)}<div id="mission-reviews"></div>`;
   const host = document.getElementById('mission-reviews');
   let pending = false;
+  let trailing = false;
   const loadReviews = async (initial) => {
-    if (pending || !host.isConnected || document.hidden) return;
+    if (pending) { trailing = true; return; }
+    if (!host.isConnected || document.hidden) return;
     pending = true;
     try {
+      if (initial) host.innerHTML = '<herdr-spinner label="Loading reviews & PRs"></herdr-spinner>';
       let reviews = [], pulls = [];
       const [rv, pr] = await Promise.all([client.missionReviews(key), client.missionPulls(key)]);
       reviews = (rv && rv.reviews) || []; pulls = (pr && pr.pulls) || [];
@@ -556,7 +567,10 @@ async function viewMissionReviews(parts, revision) {
     } catch (error) {
       if (!host.isConnected) return;
       if (initial) host.innerHTML = `<herdr-error message="${esc(error.message)}"></herdr-error>`;
-    } finally { pending = false; }
+    } finally {
+      pending = false;
+      if (trailing) { trailing = false; loadReviews(false); }
+    }
   };
   try { await loadReviews(true); } catch { /* handled inside */ }
   if (revision !== renderRevision) return;

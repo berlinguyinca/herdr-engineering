@@ -159,12 +159,16 @@ def redact_delivery(payload: Any, *, _seen=None) -> Any:
     ``passed`` count key merely because it contains the substring ``pass``.
     """
     _seen = _seen if _seen is not None else set()
-    if id(payload) in _seen:
-        return payload
-    _seen.add(id(payload))
     if isinstance(payload, str):
+        # Redact every occurrence: the same string object may appear more than
+        # once, and a shared string must never bypass scanning because a sibling
+        # occurrence was already visited. Cycle detection below tracks only
+        # containers.
         return redact_text(payload)
     if isinstance(payload, dict):
+        if id(payload) in _seen:
+            return payload
+        _seen.add(id(payload))
         result = {}
         for key, value in payload.items():
             lk = str(key).lower()
@@ -173,10 +177,11 @@ def redact_delivery(payload: Any, *, _seen=None) -> Any:
             else:
                 result[key] = redact_delivery(value, _seen=_seen)
         return result
-    if isinstance(payload, list):
-        return [redact_delivery(item, _seen=_seen) for item in payload]
-    if isinstance(payload, tuple):
-        return tuple(redact_delivery(item, _seen=_seen) for item in payload)
+    if isinstance(payload, (list, tuple)):
+        if id(payload) in _seen:
+            return payload
+        _seen.add(id(payload))
+        return type(payload)(redact_delivery(item, _seen=_seen) for item in payload)
     return payload
 
 
