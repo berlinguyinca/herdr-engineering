@@ -276,6 +276,9 @@ export class HerdrClient {
   requestArchitectureAnalysis(body, { signal } = {}) {
     return this.request('/api/v1/architecture/analyses/request', { method: 'POST', body, signal });
   }
+  cancelArchitectureAnalysis(analysisId, { signal } = {}) {
+    return this.request(`/api/v1/architecture/analyses/${encodeURIComponent(analysisId)}/cancel`, { method: 'POST', body: {}, signal });
+  }
   explainArchitectureNode(sid, nid, { signal } = {}) {
     return this.request(`/api/v1/architecture/snapshots/${encodeURIComponent(sid)}/nodes/${encodeURIComponent(nid)}/explain`, { method: 'POST', body: {}, signal });
   }

@@ -33,12 +33,43 @@ export function crossTargets(snapshots, selected, max = 8) {
   }
   return selected ? [selected, ...[...newest.values()].sort((a, b) => a.repository_id.localeCompare(b.repository_id))].slice(0, max) : [];
 }
+// Unfinished analysis jobs (requested / claimed and running) and their Cancel controls. The view cannot know the
+// key's role, so the button is always offered; a non-operator key gets the server's 401/403 refusal, shown escaped.
+const OPEN_STATES = new Set(['requested', 'started', 'progress']);
+export function cancellableJobs(analyses = []) {
+  return analyses.filter(a => a && OPEN_STATES.has(a.state) && typeof a.analysis_id === 'string');
+}
+export function jobsPanel(analyses = [], cancels = {}) {
+  const jobs = cancellableJobs(analyses);
+  if (!jobs.length) return '';
+  const row = a => {
+    const c = cancels[a.analysis_id] || {};
+    const what = [a.repository_id && text(a.repository_id).replace(/^github\.com\//, ''), a.rev && `@ ${text(a.rev)}`, a.host_id && `on ${text(a.host_id)}`].filter(Boolean).join(' ');
+    return `<li data-job="${esc(a.analysis_id)}">${esc(a.analysis_id)} · ${esc(a.state)}${what ? ` · ${esc(what)}` : ''}
+      <button type="button" data-cancel="${esc(a.analysis_id)}" aria-label="Cancel analysis ${esc(a.analysis_id)}"${c.pending ? ' disabled aria-busy="true"' : ''}>${c.pending ? 'Cancelling…' : 'Cancel'}</button>
+      ${c.error ? `<span class="arch-notice failed" role="alert" data-cancel-error>${esc(c.error)}</span>` : ''}</li>`;
+  };
+  return `<section class="arch-jobs" aria-label="Analysis jobs" data-testid="arch-jobs"><h2>Analysis jobs</h2>
+    <p class="arch-note">Cancelling needs an operator key; a running host stops at its next heartbeat.</p><ul>${jobs.map(row).join('')}</ul></section>`;
+}
+// Ask, then cancel. Resolves {cancelled: false} when the operator declines, {analysis} on success, {error} otherwise.
+export async function cancelJob(client, analysisId, {confirm = globalThis.confirm, signal} = {}) {
+  if (!(typeof confirm === 'function' && confirm(`Cancel analysis ${analysisId}?`))) return {cancelled: false};
+  try {
+    const out = await client.cancelArchitectureAnalysis(analysisId, {signal});
+    return {cancelled: true, analysis: out.analysis};
+  } catch (e) {
+    if (e.name === 'AbortError') throw e;
+    const why = e.status === 401 || e.status === 403 ? 'Only an operator key can cancel analyses' : 'Cancel failed';
+    return {cancelled: false, error: `${why}: ${e.message || `HTTP ${e.status}`}`};
+  }
+}
 const label = s => `${text(s.repository_id).replace(/^github\.com\//, '')} @ ${text(s.commit_sha).slice(0, 8)} · ${text(s.host_id)} · wt ${text(s.worktree_id).slice(0, 6)}`;
 
 export function mountArchitecture(root, client, opts = {}) {
   let alive = true, ctl = new AbortController();
   const st = {snapshots: [], sid: opts.snapshot || '', parent: opts.parent || '', q: opts.q || '', page: null, detail: null, diff: null,
-    analyses: [], cursor: null, caps: [], extras: null, timeline: null, cross: null, explain: null, request: null, corr: null, rooms: null};
+    analyses: [], cursor: null, caps: [], extras: null, timeline: null, cross: null, explain: null, request: null, corr: null, rooms: null, cancels: {}};
   root.innerHTML = '<div class="arch"><herdr-spinner></herdr-spinner></div>';
   const host = root.firstElementChild;
   const snap = () => st.snapshots.find(s => s.snapshot_id === st.sid);
@@ -162,7 +193,7 @@ export function mountArchitecture(root, client, opts = {}) {
     const s = snap();
     if (!st.snapshots.length) {
       const a = st.analyses[0];
-      host.innerHTML = `<h1>Architecture</h1><herdr-empty message="No architecture snapshots yet. Run: herdr-eng architecture analyze --repo . --url &lt;control plane&gt;"></herdr-empty>${a ? `<p class="arch-note">Latest analysis ${esc(a.analysis_id)}: ${esc(a.state)}${a.message ? ' — ' + esc(a.message) : ''}</p>` : ''}`;
+      host.innerHTML = `<h1>Architecture</h1><herdr-empty message="No architecture snapshots yet. Run: herdr-eng architecture analyze --repo . --url &lt;control plane&gt;"></herdr-empty>${a ? `<p class="arch-note">Latest analysis ${esc(a.analysis_id)}: ${esc(a.state)}${a.message ? ' — ' + esc(a.message) : ''}</p>` : ''}${jobsPanel(st.analyses, st.cancels)}`;
       return;
     }
     const notices = snapshotNotices(s, st.snapshots).map(n => `<p class="arch-notice ${n.kind}" role="status" data-notice="${n.kind}">${esc(n.text)}</p>`).join('');
@@ -174,7 +205,7 @@ export function mountArchitecture(root, client, opts = {}) {
       <label>Search symbols <input type="search" data-q value="${esc(st.q)}" placeholder="name or path"></label></div>
       <p class="arch-meta">Commit <code>${esc(s.commit_sha.slice(0, 12))}</code> · ${esc(s.completeness)} · ${s.counts.nodes} nodes, ${s.counts.edges} edges · host ${esc(s.host_id)} · analyzer ${esc(s.analyzer_version)}</p>
       ${notices}${failed}${running}${st.q ? '' : crumbs()}
-      <div class="arch-main"><div class="arch-left">${graphSvg()}${table()}</div>${detail()}</div>${diffPanel()}${timelinePanel()}${activityPanel()}${crossPanel()}${requestPanel()}`;
+      <div class="arch-main"><div class="arch-left">${graphSvg()}${table()}</div>${detail()}</div>${diffPanel()}${timelinePanel()}${activityPanel()}${crossPanel()}${jobsPanel(st.analyses, st.cancels)}${requestPanel()}`;
   }
   async function open(id) {
     try {
@@ -186,7 +217,19 @@ export function mountArchitecture(root, client, opts = {}) {
       if (n.node.child_count) { st.parent = id; st.q = ''; await browse(); } else render();
     } catch (err) { if (err.name !== 'AbortError') fail(err); }
   }
+  async function cancelClick(id) {
+    if (st.cancels[id]?.pending) return;
+    st.cancels[id] = {pending: true}; render();
+    let out;
+    try { out = await cancelJob(client, id, {signal: ctl.signal, confirm: opts.confirm}); } catch (e) { if (e.name === 'AbortError') return; out = {error: e.message}; }
+    if (!alive) return;
+    st.cancels[id] = out.error ? {error: out.error} : {};
+    render();
+    if (out.cancelled) client.listArchitectureAnalyses({signal: ctl.signal}).then(a => { st.analyses = a.analyses; render(); }, () => {});
+  }
   host.addEventListener('click', ev => {
+    const cx = ev.target.closest('[data-cancel]');
+    if (cx) return cancelClick(cx.dataset.cancel);
     const ex = ev.target.closest('[data-explain],[data-cross],[data-pick]');
     if (ex) return extraClick(ex);
     const t = ev.target.closest('[data-node],[data-open],[data-crumb],[data-more]');

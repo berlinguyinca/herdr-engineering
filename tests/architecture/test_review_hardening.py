@@ -169,6 +169,32 @@ def test_unbound_agent_keys_are_trusted_for_host_id_bound_keys_are_not(snap):
                            architecture_options={"agent_hosts": {"o": ["h1"]}})
 
 
+def test_require_host_binding_refuses_unbound_agent_keys(snap):
+    """control_plane.architecture.require_host_binding: true (recommended in production) refuses every
+    architecture POST from an agent key with no agent_hosts entry; a bound key still acts only for its hosts."""
+    svr, repo, base = start(api_keys={"o": "operator", "free": "agent", "bound": "agent"}, architecture_enabled=True,
+                            architecture_options={"agent_hosts": {"bound": ["h1"]}, "require_host_binding": True})
+    try:
+        assert svr.architecture_require_host_binding is True
+        call(base, "/api/v1/architecture/analyses/request", {"repository_id": REPO_ID, "rev": "main",
+                                                              "host_id": "h1"}, key="o")
+        unbound = "this API key is not bound to any host (control_plane.architecture.agent_hosts)"
+        for path, body in (("/api/v1/architecture/analyses/claim", {"host_id": "h1"}), (SNAPS, snap),
+                           ("/api/v1/architecture/analyses", {"analysis_id": "an-x", "event": "progress",
+                                                              "host_id": "h1"})):
+            st, out = call(base, path, body, key="free")
+            assert (st, out) == (403, {"error": unbound})
+        assert call(base, "/api/v1/architecture/analyses/claim", {"host_id": "h9"}, key="bound")[0] == 403
+        st, got = call(base, "/api/v1/architecture/analyses/claim", {"host_id": "h1"}, key="bound")
+        assert st == 200 and got["job"]["host_id"] == "h1"
+        assert call(base, SNAPS, snap, key="bound")[0] == 201                          # snapshot names h1
+    finally:
+        svr.shutdown()
+    assert ControlPlaneServer._architecture_options(None, None)["require_host_binding"] is False   # default off
+    with pytest.raises(ValueError, match="require_host_binding must be a boolean"):
+        ControlPlaneServer._architecture_options(None, {"require_host_binding": "yes"})
+
+
 def test_requested_jobs_expire_and_operators_can_cancel():
     svr, repo, base = start(api_keys={"o": "operator", "a": "agent", "v": "viewer"}, architecture_enabled=True,
                             architecture_options={"request_ttl_seconds": 60})

@@ -40,15 +40,18 @@ def register(sub) -> None:
     a.add_argument("--no-cache", action="store_true", help="full baseline: ignore and do not write the facts cache")
     a.set_defaults(func=cmd_analyze)
     sv = asub.add_parser("serve", help="claim analysis requests for this host from the control plane and run them")
-    sv.add_argument("--url", required=True)
-    sv.add_argument("--api-key-file", required=True)
+    sv.add_argument("--config", default=None, metavar="YAML",
+                    help="YAML file with url, api_key_file, host_id, checkouts {repository_id: path}, poll, timeout, "
+                         "cache_dir; command-line flags override it (the systemd unit uses only this)")
+    sv.add_argument("--url", default=None)
+    sv.add_argument("--api-key-file", default=None)
     sv.add_argument("--host-id", default=None)
     sv.add_argument("--checkout", action="append", default=[], metavar="REPOSITORY_ID=PATH",
                     help="local checkout for a canonical repository id (repeatable); only these are ever analysed")
-    sv.add_argument("--poll", type=float, default=5.0)
+    sv.add_argument("--poll", type=float, default=None, help="seconds between claims when idle (default 5)")
     sv.add_argument("--once", action="store_true", help="process at most one request, then exit")
-    sv.add_argument("--timeout", type=float, default=300.0)
-    sv.add_argument("--cache-dir", default=DEFAULT_CACHE)
+    sv.add_argument("--timeout", type=float, default=None, help="analysis wall-clock limit (default 300)")
+    sv.add_argument("--cache-dir", default=None)
     sv.set_defaults(func=cmd_serve)
 
 
@@ -174,7 +177,51 @@ def _run_job(base, key, job, checkouts, host_id, timeout, cache_dir) -> None:
         done.set()
 
 
+SERVE_CONFIG_KEYS = frozenset({"url", "api_key_file", "host_id", "checkouts", "poll", "timeout", "cache_dir"})
+SERVE_DEFAULTS = {"poll": 5.0, "timeout": 300.0, "cache_dir": DEFAULT_CACHE}
+
+
+def resolve_serve_config(args) -> None:
+    """Merge ``--config`` YAML under the command-line flags (flags win), then apply defaults. Strict: an unknown
+    key or a wrongly typed value stops the worker with the key named, before it ever talks to the control plane."""
+    data, config = {}, getattr(args, "config", None)
+    if config:
+        import yaml
+        try:
+            data = yaml.safe_load(Path(config).expanduser().read_text()) or {}
+        except (OSError, yaml.YAMLError) as exc:
+            raise SystemExit(f"cannot read --config {config}: {exc}") from exc
+        if not isinstance(data, dict):
+            raise SystemExit("architecture serve config must be a YAML mapping")
+        unknown = set(data) - SERVE_CONFIG_KEYS
+        if unknown:
+            raise SystemExit(f"architecture serve config: unknown key(s) {sorted(unknown)}")
+    for name in ("url", "api_key_file", "host_id", "cache_dir"):
+        if getattr(args, name) is None and data.get(name) is not None:
+            if not isinstance(data[name], str):
+                raise SystemExit(f"architecture serve config: {name} must be a string")
+            setattr(args, name, os.path.expanduser(data[name]) if name != "url" else data[name])
+    for name in ("poll", "timeout"):
+        if getattr(args, name) is None and data.get(name) is not None:
+            if isinstance(data[name], bool) or not isinstance(data[name], (int, float)) or data[name] <= 0:
+                raise SystemExit(f"architecture serve config: {name} must be a positive number")
+            setattr(args, name, float(data[name]))
+    checkouts = data.get("checkouts") or {}
+    if not isinstance(checkouts, dict) or not all(isinstance(k, str) and isinstance(v, str)
+                                                  for k, v in checkouts.items()):
+        raise SystemExit("architecture serve config: checkouts must map a repository id to a path")
+    given = {item.partition("=")[0] for item in args.checkout}
+    args.checkout = [f"{rid}={os.path.expanduser(path)}" for rid, path in checkouts.items() if rid not in given] \
+        + list(args.checkout)
+    for name, value in SERVE_DEFAULTS.items():
+        if getattr(args, name) is None:
+            setattr(args, name, value)
+    if not args.url or not args.api_key_file:
+        raise SystemExit("architecture serve needs url and api_key_file (flags or --config)")
+
+
 def cmd_serve(args) -> int:
+    resolve_serve_config(args)
     base, key = args.url.rstrip("/"), Path(args.api_key_file).read_text().strip()
     host_id = args.host_id or socket.gethostname()
     checkouts = {}

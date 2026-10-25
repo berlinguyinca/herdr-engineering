@@ -123,7 +123,8 @@ _WEB_ROOT = Path(__file__).resolve().parent.parent.parent / "packages"
 _INDEX = "index.html"
 _MAX_JSON_BODY = 4 * 1024 * 1024
 _MAX_ARCHITECTURE_BODY = 64 * 1024 * 1024  # a published graph snapshot; validated by the service
-_ARCHITECTURE_KEYS = frozenset({"enabled", "explain", "cache", "request_ttl_seconds", "agent_hosts"})
+_ARCHITECTURE_KEYS = frozenset({"enabled", "explain", "cache", "request_ttl_seconds", "agent_hosts",
+                                "require_host_binding"})
 _MAX_SSE_SECONDS = 3600
 _SSE_IDLE_SECONDS = 10  # keep-alive comment cadence while the stream is idle
 
@@ -381,7 +382,10 @@ class ControlPlaneServer:
             request_ttl=arch_opts["request_ttl"])
         # control_plane.architecture.agent_hosts: {api key: [host ids]} -> principal id -> allowed host ids.
         # An agent key listed there may publish / claim / report only for those hosts; an agent key NOT listed
-        # is trusted to name any host_id (keys carry a role only; there is no per-host enrollment).
+        # is trusted to name any host_id (keys carry a role only; there is no per-host enrollment) -- unless
+        # control_plane.architecture.require_host_binding is true (the recommended production setting): then an
+        # unlisted agent key is refused on every architecture POST.
+        self.architecture_require_host_binding = arch_opts["require_host_binding"]
         self.architecture_agent_hosts = {}
         for key, hosts in arch_opts["agent_hosts"].items():
             if self._keys.get(key) != "agent":
@@ -445,7 +449,11 @@ class ControlPlaneServer:
                 isinstance(v, list) and v and all(isinstance(h, str) and svc._HOST_ID.fullmatch(h) for h in v)
                 for v in hosts.values()):
             raise ValueError("control_plane.architecture.agent_hosts must map an api key to a non-empty list of host ids")
-        return {"cache_graphs": whole(cache.get("max_graphs", svc.DEFAULT_CACHE_GRAPHS), "cache.max_graphs", 1, 1000),
+        binding = section.get("require_host_binding", False)
+        if not isinstance(binding, bool):
+            raise ValueError("control_plane.architecture.require_host_binding must be a boolean")
+        return {"require_host_binding": binding,
+                "cache_graphs": whole(cache.get("max_graphs", svc.DEFAULT_CACHE_GRAPHS), "cache.max_graphs", 1, 1000),
                 "cache_bytes": whole(cache.get("max_bytes", svc.DEFAULT_CACHE_BYTES), "cache.max_bytes",
                                      1024 * 1024, 64 * 1024 ** 3),
                 "request_ttl": whole(section.get("request_ttl_seconds", svc.DEFAULT_REQUEST_TTL),
@@ -1530,6 +1538,9 @@ def _make_handler(server, public=False, operator=False):
             # An agent key bound in control_plane.architecture.agent_hosts acts only for its hosts.
             hosts = (server.architecture_agent_hosts.get(self._principal()["id"])
                      if self._role() == "agent" else None)
+            if self._role() == "agent" and hosts is None and server.architecture_require_host_binding:
+                # Body left unread: _deny closes the connection so it cannot be parsed as a next request.
+                return self._deny(403, "this API key is not bound to any host (control_plane.architecture.agent_hosts)")
             try:
                 body = self._read_json(_MAX_ARCHITECTURE_BODY) or {}
                 if parts[4:] == ["snapshots"]:
