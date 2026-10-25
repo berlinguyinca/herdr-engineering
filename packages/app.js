@@ -353,7 +353,9 @@ async function viewMission(parts, revision) {
       // Morphed in place: identical data writes nothing and open disclosures stay open.
       morph(history, `<h2>Recorded history</h2>
     <div style="margin:8px 0"><herdr-status stage="${esc(m.status)}"></herdr-status>
-      <span class="hd-card__sub"> · ${sessions} agents · ${esc(m.stage || 'Stage not recorded')} · created ${esc(formatTimestamp(m.created_at))}</span></div>
+      <span class="hd-card__sub"> · ${sessions} agents · ${esc(m.stage || 'Stage not recorded')} · created ${esc(formatTimestamp(m.created_at))} · last reported change ${esc(formatTimestamp(m.updated_at))}</span></div>
+    <div style="margin:6px 0">${telemetryBadge(m.telemetry_state)}
+      <herdr-metric label="Stall age" value="${esc(stallAge(m))}" hint="${esc(stallHint(m))}"></herdr-metric></div>
     <herdr-mission-activity updated-at="${esc(m.updated_at || '')}" source="${esc(m.source || '')}"></herdr-mission-activity>
     <details class="hd-card" data-history-panel="brief"><summary>Recorded mission brief</summary>
       <p style="white-space:pre-wrap;overflow-wrap:anywhere">${esc(m.title || '')}</p>
@@ -416,6 +418,37 @@ function runDuration(run) {
   if (Number.isNaN(end)) return null;
   const ms = end - start;
   return ms >= 0 ? formatDuration(ms) : null;
+}
+
+// A read-only telemetry-state badge (live/stale/unknown) from the mission
+// record's ``telemetry_state`` (issue #28). Text first, never colour alone:
+// UNKNOWN is its own word so a mission with no collector is never mistaken for
+// live work.
+function telemetryBadge(state) {
+  const s = typeof state === 'string' ? state.toLowerCase() : '';
+  const label = s === 'live' ? 'Live telemetry' : s === 'stale' ? 'Stale telemetry' : 'Telemetry unknown';
+  // Text first, never colour alone. A dedicated element (not herdr-status) so it
+  // can't be mistaken for, or collide with, the mission's own status badge.
+  return `<span class="hd-card__sub" data-telemetry-state>${esc(label)}</span>`;
+}
+
+// Stall age = how long since the mission last reported a change. Only meaningful
+// when a collector is actually attached (telemetry_state is live/stale); for an
+// UNKNOWN mission (no collector) we say so rather than imply a liveness reading
+// from an absent timestamp.
+function stallAge(m) {
+  const s = typeof m?.telemetry_state === 'string' ? m.telemetry_state.toLowerCase() : '';
+  if (s === 'unknown' || (!s && !m?.updated_at)) return 'Unknown';  // no collector / no data
+  if (!m?.updated_at) return 'Unknown';
+  return formatDuration(Date.now() - new Date(m.updated_at).getTime());
+}
+
+function stallHint(m) {
+  const s = typeof m?.telemetry_state === 'string' ? m.telemetry_state.toLowerCase() : '';
+  if (s === 'unknown' || (!s && !m?.updated_at)) return 'No collector attached for this mission';
+  if (s === 'stale') return 'Collector connected but has not reported recently';
+  if (s === 'live') return 'Collector reporting as expected';
+  return 'Since last reported change';
 }
 
 function missionSectionNav(key) {

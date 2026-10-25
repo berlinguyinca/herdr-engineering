@@ -377,6 +377,21 @@ test('mission detail renders the timeline', async () => {
   }, { BURST: '0' });
 });
 
+test('mission detail surfaces telemetry state and stall age (issue #31)', async () => {
+  await withApp(async ({ page, base }) => {
+    // pi:MSN-PI1 has no live collector, so its telemetry_state is UNKNOWN.
+    await page.goto(`${base}/#/missions/pi:MSN-PI1`);
+    await page.waitForSelector('[data-telemetry-state]', { timeout: 15000 });
+    const badge = await page.locator('[data-telemetry-state]').innerText();
+    assert.match(badge, /Telemetry unknown/, `telemetry badge should say unknown (got "${badge}")`);
+    // A Stall age metric is rendered and, for a no-collector mission, is unknown.
+    const metric = page.locator('herdr-metric[label="Stall age"]');
+    await metric.waitFor({ state: 'visible', timeout: 15000 });
+    const value = await metric.locator('.hd-metric__value').innerText();
+    assert.match(value, /Unknown/, `stall age should be unknown for a no-collector mission (got "${value}")`);
+  });
+});
+
 // ---------------------------------------------------------------- agent inspector (spec 0200)
 async function sessionHash(base) {
   const r = await fetch(`${base}/api/v1/sessions`);
