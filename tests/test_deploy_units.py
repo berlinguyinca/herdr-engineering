@@ -1,0 +1,135 @@
+"""Every tracked systemd unit parses; new units take no Environment=/EnvironmentFile= (YAML config only); the
+Architecture Explorer worker unit invokes a command line the real CLI accepts, configured from YAML."""
+import argparse
+import shlex
+import subprocess
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+from herdr_engineering.architecture import command
+
+ROOT = Path(__file__).resolve().parents[1]
+UNITS = sorted(ROOT / p for p in subprocess.run(
+    ["git", "ls-files", "*.service", "*.timer"], cwd=ROOT, capture_output=True, text=True, check=True).stdout.split())
+UNITS = sorted(set(UNITS) | set((ROOT / "deploy").rglob("*.service")) | set((ROOT / "deploy").rglob("*.timer")))
+# Units that predate the "YAML config only, no environment variables" rule. Frozen: do not add to this list.
+LEGACY_ENVIRONMENT = frozenset({
+    "deploy/control-plane/herdr-ci-report-relay.service",   # PYTHONPATH + optional key env file (ci_report_relay)
+    "deploy/herdr-cp-feed-plugin/herdr-cp-sessions.service",
+    "deploy/mission-feed/herdr-eng-mission-feed.service",
+    "deploy/mission-feed/herdr-service-metadata.service",
+    "scripts/herdr-eng-build-cleanup.service",
+    "scripts/herdr-eng-fleet-update.service",
+})
+ARCH_UNIT = ROOT / "deploy/control-plane/herdr-architecture-serve.service"
+
+
+def parse_unit(path: Path) -> dict[str, list[tuple[str, str]]]:
+    """Minimal systemd unit parser: [Section] headers, Key=Value lines, comments, backslash continuations."""
+    sections: dict[str, list[tuple[str, str]]] = {}
+    current = None
+    pending = ""
+    for n, raw in enumerate(path.read_text().splitlines(), 1):
+        line = pending + raw.strip()
+        pending = ""
+        if line.endswith("\\"):
+            pending = line[:-1] + " "
+            continue
+        if not line or line[0] in "#;":
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            current = line[1:-1]
+            sections.setdefault(current, [])
+            continue
+        key, sep, value = line.partition("=")
+        assert sep and key.strip() and " " not in key.strip(), f"{path}:{n}: not Key=Value: {raw!r}"
+        assert current is not None, f"{path}:{n}: setting before any [Section]"
+        sections[current].append((key.strip(), value.strip()))
+    assert not pending, f"{path}: dangling line continuation"
+    return sections
+
+
+def test_units_are_found():
+    assert ARCH_UNIT in UNITS and len(UNITS) >= 10
+
+
+@pytest.mark.parametrize("unit", UNITS, ids=lambda p: str(p.relative_to(ROOT)))
+def test_every_unit_parses(unit):
+    s = parse_unit(unit)
+    assert "Unit" in s, f"{unit} has no [Unit]"
+    if unit.suffix == ".service":
+        assert any(k == "ExecStart" for k, _ in s.get("Service", [])), f"{unit} has no ExecStart"
+    else:
+        assert "Timer" in s, f"{unit} has no [Timer]"
+        target = dict(s["Timer"]).get("Unit", unit.with_suffix(".service").name)
+        assert (unit.parent / target).exists(), f"{unit} triggers missing {target}"
+
+
+@pytest.mark.parametrize("unit", UNITS, ids=lambda p: str(p.relative_to(ROOT)))
+def test_units_read_no_environment(unit):
+    rel = str(unit.relative_to(ROOT))
+    keys = {k for sec in parse_unit(unit).values() for k, _ in sec}
+    uses_env = bool(keys & {"Environment", "EnvironmentFile", "PassEnvironment"})
+    if rel in LEGACY_ENVIRONMENT:
+        return
+    assert not uses_env, f"{rel}: configuration comes from YAML, never Environment=/EnvironmentFile="
+
+
+def test_legacy_environment_list_is_not_stale():
+    assert all((ROOT / p).exists() for p in LEGACY_ENVIRONMENT)
+
+
+def test_architecture_serve_unit_is_a_hardened_long_running_worker():
+    s = parse_unit(ARCH_UNIT)
+    svc = dict(s["Service"])
+    assert svc["Type"] == "simple" and svc["Restart"] == "on-failure"
+    assert svc["NoNewPrivileges"] == "yes" and svc["UMask"] == "0077"
+    assert not ARCH_UNIT.with_suffix(".timer").exists()          # serve is a loop, not a oneshot
+    assert dict(s["Install"])["WantedBy"] == "default.target"
+    argv = shlex.split(svc["ExecStart"])
+    assert argv[0].endswith("/herdr-eng") and argv[1:3] == ["architecture", "serve"]
+    parser = argparse.ArgumentParser()
+    command.register(parser.add_subparsers(dest="command"))
+    args = parser.parse_args(argv[1:])                          # the real CLI accepts the unit's command line
+    assert args.func is command.cmd_serve and args.config.endswith("architecture-serve.yaml")
+    assert args.url is None and args.api_key_file is None        # everything else comes from the YAML file
+
+
+def _serve_args(**kw):
+    base = dict(config=None, url=None, api_key_file=None, host_id=None, checkout=[], poll=None, timeout=None,
+                cache_dir=None, once=True)
+    return SimpleNamespace(**{**base, **kw})
+
+
+def test_serve_config_yaml_example_resolves_and_flags_win(tmp_path):
+    example = ROOT / "deploy/control-plane/architecture-serve.example.yaml"
+    args = _serve_args(config=str(example))
+    command.resolve_serve_config(args)
+    home = str(Path.home())
+    assert args.url == "http://dev.lan" and args.api_key_file.startswith(home)
+    assert args.host_id == "beast" and (args.poll, args.timeout) == (5.0, 300.0)
+    assert args.cache_dir == command.DEFAULT_CACHE
+    assert args.checkout == [f"github.com/berlinguyinca/herdr-engineering={home}/IdeaProjects/herdr-engineering"]
+    over = _serve_args(config=str(example), url="http://cp", host_id="h1", poll=1.0,
+                       checkout=[f"github.com/berlinguyinca/herdr-engineering={tmp_path}"])
+    command.resolve_serve_config(over)
+    assert (over.url, over.host_id, over.poll) == ("http://cp", "h1", 1.0)
+    assert over.checkout == [f"github.com/berlinguyinca/herdr-engineering={tmp_path}"]
+
+
+@pytest.mark.parametrize("body,match", [("bogus: 1\n", "unknown key"), ("poll: -1\n", "poll must be"),
+                                        ("checkouts: [a]\n", "checkouts must"), ("- x\n", "YAML mapping"),
+                                        ("host_id: h1\n", "needs url and api_key_file")])
+def test_serve_config_is_strict(tmp_path, body, match):
+    cfg = tmp_path / "c.yaml"
+    cfg.write_text(body)
+    with pytest.raises(SystemExit, match=match):
+        command.resolve_serve_config(_serve_args(config=str(cfg)))
+
+
+def test_serve_without_config_keeps_flag_defaults():
+    args = _serve_args(url="http://cp", api_key_file="/k")
+    command.resolve_serve_config(args)
+    assert (args.poll, args.timeout, args.cache_dir) == (5.0, 300.0, command.DEFAULT_CACHE)

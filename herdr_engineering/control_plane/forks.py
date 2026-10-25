@@ -157,6 +157,7 @@ def _modules(paths: list[str]) -> list[str]:
 
 def _evidence(graph, reader, approach_id: str, head: str | None, owner: str | None, cfg: dict) -> dict:
     writers = set(cfg["evidence_writers"])
+    reader = {**reader, "keep_writers": frozenset(writers)}     # T16 M7: the contribution cap never hides them
     out = {"validated": [], "reviewed": [], "counted_validations": 0, "counted_reviews": 0, "blocking_reviews": 0,
            "truncated": False}
     for kind in ("validated", "reviewed"):

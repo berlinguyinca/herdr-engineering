@@ -33,6 +33,7 @@ from ..version import __version__
 from .envelope import EnvelopeConflict
 from .events import SequenceCollision
 from .graph import read_graph
+from .ingest import INGEST_ENTITY_TYPES
 from .redact import redact_ingest_body, redact_payload
 from .review_quorum import pr_review_quorum
 
@@ -45,10 +46,20 @@ _SUMMARY_FIX = re.compile(r"^/api/v1/sessions/[^/]+/summary/fix$")
 _TERMINAL_ATTACH = re.compile(r"^/api/v1/sessions/[^/]+/terminal$")
 _AGENT_POST = re.compile(r"^/api/v1/(?:llm/keys|reviews|llm/keys/[^/]+/revoke"
                         r"|reviews/[^/]+/(?:heartbeat|result|failure)"
+                        r"|architecture/(?:snapshots|analyses|analyses/claim)"
                         # CI fix runner: claim, report state, report result. Never create or cancel.
                         r"|ci/fix/claim|ci/fix/[^/]+/(?:state|result))$")
 # T12: the one POST an ingest key may make besides /api/v1/ingest: acknowledging a steering request addressed to it.
 _STEER_ACK = re.compile(r"^/api/v1/steering/[^/]+/ack$")
+# T16 gap C: the second: ask for a re-review of a PR whose head has no quorum (ingest-role key; scoped in the handler).
+# Matched on the DECODED segments, as routing sees them: a raw-path regex let /review-quorum/%72ereview reach the
+# handler without the Origin / Content-Type checks.
+def _is_rereview(path):
+    parts = [unquote(seg) for seg in path.split("/")]
+    return (len(parts) == 8 and parts[:5] == ["", "api", "v1", "graph", "nodes"]
+            and parts[6:] == ["review-quorum", "rereview"])
+
+
 # The only routes the `reviewer` role may POST (review gate workers), and only it:
 # an operator key is refused there too. See `_reviewer_route`.
 _REVIEWER_ROOT = ["", "api", "v1", "review-gate"]
@@ -111,7 +122,11 @@ def _is_loopback(host: str) -> bool:
 _WEB_ROOT = Path(__file__).resolve().parent.parent.parent / "packages"
 _INDEX = "index.html"
 _MAX_JSON_BODY = 4 * 1024 * 1024
+_MAX_ARCHITECTURE_BODY = 64 * 1024 * 1024  # a published graph snapshot; validated by the service
+_ARCHITECTURE_KEYS = frozenset({"enabled", "explain", "cache", "request_ttl_seconds", "agent_hosts",
+                                "require_host_binding"})
 _MAX_SSE_SECONDS = 3600
+_SSE_IDLE_SECONDS = 10  # keep-alive comment cadence while the stream is idle
 
 
 class _DaemonThreadingServer(ThreadingHTTPServer):
@@ -200,7 +215,8 @@ class ControlPlaneServer:
                  operator_port=None, operator_user=None, operator_email=None,
                  operator_hosts=(), collab_operator_url=None, collab_dashboard_hosts=(),
                  summary_config=None, summary_client=None, usage_retention=None, lineage_key_scopes=None,
-                 review_quorum=None, system_graph: bool = False, attention=None, ci_fix=None):
+                 review_quorum=None, system_graph: bool = False, attention=None, ci_fix=None, missions=None, github_pg_dsn=None,
+                 architecture_enabled=None, architecture_explain=None, architecture_options=None):
         """
         Auth (Spec §104): either a single `api_key` (all-access) or a mapping
         `api_keys={key: role}` with roles "viewer" (read-only) / "operator"
@@ -228,15 +244,22 @@ class ControlPlaneServer:
                                     repo.record_event("ci_pipeline", key, event, row),
                                     actions_enabled=ci_actions,
                                     on_observation=repo.observe_ci_pipeline)
+        # control_plane.missions (validated; outcomes are written when a mission ends, on by default).
+        from .mission_outcome import MissionOutcomes, missions_config
+        self.missions_config = missions_config(missions)
+        self.mission_outcomes = MissionOutcomes(repo, self.missions_config)
+        repo.mission_outcomes = self.mission_outcomes
         from .attention_inbox import AttentionInbox, attention_config
         self.attention_config = attention_config(attention)
         self.attention = None
         if self.attention_config["enabled"] and not collab_only:
             self.attention = AttentionInbox(repo, config=self.attention_config, health=self._health,
-                                            ci_snapshot=self.ci_monitor.snapshot)
+                                            ci_snapshot=self.ci_monitor.snapshot, ci_fix=self.ci_fix)
         if github_monitor is None:
-            from ..github import GitHubMonitor
-            github_monitor = GitHubMonitor()
+            # control-plane-web only (the worker never builds a server): the GitHub
+            # catalog persists in control_plane.pg_dsn when set, else in memory.
+            from ..github import build_monitor
+            github_monitor = build_monitor(github_pg_dsn)
         self.github_monitor = github_monitor
         self.dispatcher = dispatcher or self._dispatch_native_message
         if source is not None:
@@ -298,6 +321,9 @@ class ControlPlaneServer:
                 "require TLS)")
         self.fleet_config = fleet_config
         self.review_quorum = review_quorum      # QuorumConfig | None (feature off)
+        from .review_quorum import RereviewLedger
+        self.rereview = RereviewLedger(repo)
+        self._refusal_logged: dict = {}    # T16 gap C: durable re-review requests (the route 404s when the quorum is off)
         self.collab = collab
         self.collab_require_https = collab_require_https
         # Optional second listener that serves ONLY collaboration (API, MCP and its page);
@@ -327,7 +353,7 @@ class ControlPlaneServer:
         self.public_host = public_host or host
         self._public_httpd = None
         if collab is not None:
-            collab.hydrate(repo.take_collab_replay())
+            collab.hydrate_or_degrade(repo.take_collab_replay())     # T16 H1: a bad log disables collaboration only
             if not collab_only:
                 # membership-scoped lineage reads (lineage-events.md, "Scope semantics"): the
                 # isolated collab-only process never sees fabric data, so it serves none
@@ -348,8 +374,109 @@ class ControlPlaneServer:
         self.gate_service = self.gate_store = self.gate_queue = self.gate_main = None
         self.gate_coordinator = self.gate_reviewer_config = None
         self._start_review_gate(repo, fleet_config)
+        from ..architecture.service import ArchitectureService
+        arch_opts = self._architecture_options(fleet_config, architecture_options)
+        self.architecture = ArchitectureService(
+            repo, enabled=self._architecture_enabled(fleet_config, architecture_enabled),
+            cache_graphs=arch_opts["cache_graphs"], cache_bytes=arch_opts["cache_bytes"],
+            request_ttl=arch_opts["request_ttl"])
+        # control_plane.architecture.agent_hosts: {api key: [host ids]} -> principal id -> allowed host ids.
+        # An agent key listed there may publish / claim / report only for those hosts; an agent key NOT listed
+        # is trusted to name any host_id (keys carry a role only; there is no per-host enrollment) -- unless
+        # control_plane.architecture.require_host_binding is true (the recommended production setting): then an
+        # unlisted agent key is refused on every architecture POST.
+        self.architecture_require_host_binding = arch_opts["require_host_binding"]
+        self.architecture_agent_hosts = {}
+        for key, hosts in arch_opts["agent_hosts"].items():
+            if self._keys.get(key) != "agent":
+                raise ValueError("control_plane.architecture.agent_hosts: each entry must name a configured "
+                                 "api key with the agent role")
+            digest = hashlib.sha256(key.encode()).hexdigest()[:12]
+            self.architecture_agent_hosts[f"key:{digest}"] = frozenset(hosts)
+        self.architecture.gate_store_fn = lambda: self.gate_store
+        self._configure_architecture_explain(fleet_config, architecture_explain)
+        if collab is not None:
+            collab.architecture = self.architecture
         # live stream (Spec §52)
         repo.subscribe(self._broadcast)
+
+    @staticmethod
+    def _architecture_enabled(fleet_config, override):
+        """`control_plane.architecture.enabled` in the central fleet config; off unless set."""
+        if override is not None:
+            return bool(override)
+        if fleet_config is None:
+            return False
+        from ..fleet_config import FleetConfigError
+        try:
+            section = fleet_config.current().section("control_plane")
+        except FleetConfigError:
+            return False
+        arch = (section or {}).get("architecture") or {}
+        unknown = set(arch) - _ARCHITECTURE_KEYS
+        if unknown:
+            raise ValueError(f"control_plane.architecture: unknown key(s) {sorted(unknown)}")
+        if not isinstance(arch.get("enabled", False), bool):
+            raise ValueError("control_plane.architecture.enabled must be a boolean")
+        return arch.get("enabled", False)
+
+    @staticmethod
+    def _architecture_options(fleet_config, override):
+        """Validated cache / request-expiry / agent-host settings of `control_plane.architecture` (read once at
+        startup: a change needs a restart). A bad value fails startup with the offending key named."""
+        from ..architecture import service as svc
+        section = {}
+        if fleet_config is not None:
+            from ..fleet_config import FleetConfigError
+            try:
+                section = dict((fleet_config.current().section("control_plane") or {}).get("architecture") or {})
+            except FleetConfigError:
+                section = {}
+        section.update(override or {})
+        unknown = set(section) - _ARCHITECTURE_KEYS
+        if unknown:
+            raise ValueError(f"control_plane.architecture: unknown key(s) {sorted(unknown)}")
+
+        def whole(value, name, low, high):
+            if isinstance(value, bool) or not isinstance(value, int) or not low <= value <= high:
+                raise ValueError(f"control_plane.architecture.{name} must be an integer in [{low}, {high}]")
+            return value
+        cache = section.get("cache") or {}
+        if not isinstance(cache, dict) or set(cache) - {"max_graphs", "max_bytes"}:
+            raise ValueError("control_plane.architecture.cache takes only max_graphs and max_bytes")
+        hosts = section.get("agent_hosts") or {}
+        if not isinstance(hosts, dict) or not all(
+                isinstance(v, list) and v and all(isinstance(h, str) and svc._HOST_ID.fullmatch(h) for h in v)
+                for v in hosts.values()):
+            raise ValueError("control_plane.architecture.agent_hosts must map an api key to a non-empty list of host ids")
+        binding = section.get("require_host_binding", False)
+        if not isinstance(binding, bool):
+            raise ValueError("control_plane.architecture.require_host_binding must be a boolean")
+        return {"require_host_binding": binding,
+                "cache_graphs": whole(cache.get("max_graphs", svc.DEFAULT_CACHE_GRAPHS), "cache.max_graphs", 1, 1000),
+                "cache_bytes": whole(cache.get("max_bytes", svc.DEFAULT_CACHE_BYTES), "cache.max_bytes",
+                                     1024 * 1024, 64 * 1024 ** 3),
+                "request_ttl": whole(section.get("request_ttl_seconds", svc.DEFAULT_REQUEST_TTL),
+                                     "request_ttl_seconds", 60, 7 * 86400),
+                "agent_hosts": {str(k): list(v) for k, v in hosts.items()}}
+
+    def _configure_architecture_explain(self, fleet_config, override):
+        """Optional LLM explanations: only from an explicit, validated `architecture.explain` section."""
+        from ..architecture import explain as ex
+        section = override
+        if section is None and fleet_config is not None:
+            from ..fleet_config import FleetConfigError
+            try:
+                section = ((fleet_config.current().section("control_plane") or {}).get("architecture") or {}).get("explain")
+            except FleetConfigError:
+                section = None
+        cfg = ex.parse_config(section)
+        self.architecture.explain_config = cfg
+        if cfg and cfg.get("api_key_file"):
+            try:
+                self.architecture.explain_key = Path(cfg["api_key_file"]).expanduser().read_text().strip()
+            except OSError as exc:
+                raise ValueError(f"control_plane.architecture.explain.api_key_file is unreadable: {exc.strerror}") from exc
 
     def _external_lineage(self, envelope, principal, valid=None):
         """Ingest one envelope the HCN service built for an external agent. The principal's allowed room is
@@ -463,9 +590,15 @@ class ControlPlaneServer:
         h["rustfs"] = "s3" if self.rustfs is not None else "memory"
         h["version"] = __version__
         h["commit"] = _COMMIT
+        if self.collab is not None and self.collab.degraded:
+            h["collab_degraded"] = True       # no detail here: the reason is in the server log and the repair command
         h["capabilities"] = ["mission_activity_v1", "ci_v1", "plannotator_reviews_v1", "github_v1"]
         if self.collab is not None:
             h["capabilities"].append("collab_v1")
+        if self.architecture.enabled:
+            h["capabilities"].append("architecture_v1")
+            if self.architecture.explain_config:
+                h["capabilities"].append("architecture_explain_v1")
         return h
 
     # ------------------------------------------------------- SSE plumbing
@@ -556,6 +689,18 @@ class ControlPlaneServer:
             except Exception:
                 pass  # Retain continuity notes through temporary storage/model outages.
             self._summary_stop.wait(2)
+
+    def _refusal_log_due(self, key, every: float = 300.0, cap: int = 512) -> bool:
+        """At most one refused-request log line per key per `every` seconds (an unnamed key cannot flood the log)."""
+        import time as _t
+        now = _t.monotonic()
+        last = self._refusal_logged.get(key)
+        if last is not None and now - last < every:
+            return False
+        if len(self._refusal_logged) >= cap:
+            self._refusal_logged.clear()
+        self._refusal_logged[key] = now
+        return True
 
     def shutdown(self):
         if self.gate_service is not None:
@@ -667,6 +812,10 @@ _PUBLIC_STATIC = {
     "/collab-lineage.js": ("collab-lineage.js", "text/javascript"),
     "/collab-attention.js": ("collab-attention.js", "text/javascript"),
     "/collab-mention.js": ("collab-mention.js", "text/javascript"),
+    "/collab-context.js": ("collab-context.js", "text/javascript"),
+    "/collab-helpers.js": ("collab-helpers.js", "text/javascript"),
+    "/collab-workbench.js": ("collab-workbench.js", "text/javascript"),
+    "/motion.js": ("motion.js", "text/javascript"),
     "/conversation-composer.js": ("conversation-composer.js", "text/javascript"),
     "/conversation-markdown.js": ("conversation-markdown.js", "text/javascript"),
     "/conversation-json.js": ("conversation-json.js", "text/javascript"),
@@ -974,15 +1123,21 @@ def _make_handler(server, public=False, operator=False):
             # prefix test is bypassed by e.g. /api/v1/%72eview-gate/...
             segs = path.split("/")
             res = unquote(segs[3]) if len(segs) > 3 and segs[:3] == ["", "api", "v1"] else ""
-            if res.startswith("reviews") or res == "attention" or (res in {"ci", "review-gate"} and len(segs) > 4) or _SUMMARY_FIX.match(path) or _TERMINAL_ATTACH.match(path) or _STEER_ACK.match(path):
+            if (res.startswith("reviews") or res == "attention" or res == "architecture"
+                    or (res in {"ci", "review-gate"} and len(segs) > 4) or _SUMMARY_FIX.match(path)
+                    or _TERMINAL_ATTACH.match(path) or _STEER_ACK.match(path) or _is_rereview(path)):
                 origin = self.headers.get("Origin")
                 if origin and (urlsplit(origin).netloc != self.headers.get("Host")
                                or urlsplit(origin).scheme not in {"http", "https"}):
                     return self._deny(403, "cross-origin integration mutation refused")
                 if self.headers.get("Content-Type", "").split(";", 1)[0].strip() != "application/json":
                     return self._deny(415, "integration mutations require application/json")
-            min_role = ("ingest" if path == "/api/v1/ingest" or _STEER_ACK.match(path)
+            min_role = ("ingest" if path == "/api/v1/ingest" or _STEER_ACK.match(path) or _is_rereview(path)
                        else "operator")
+            if _is_rereview(path) and self._role() == "reviewer":
+                # _require would refuse it too ("read-only"); say why. The review gate dispatches its own re-reviews
+                # (review_jobs); this route only records an ask for AutoSpec, and a gate worker never makes one.
+                return self._deny(403, "a review gate worker may not request a re-review: the gate re-reviews on its own")
             err = self._require(min_role)
             if err:
                 return err
@@ -1190,7 +1345,7 @@ def _make_handler(server, public=False, operator=False):
 
         def _rate_limit(self, key=None):
             path = self.path.split("?")[0]
-            who = key or self.client_address[0]
+            who = key or self._proxied_client()       # T16 M12: the same client identity on every route
             if self.command == "GET" and path.rstrip("/").endswith("/events/stream"):
                 # SSE is long-lived, so it is not counted like request bursts, but how often a
                 # client may open one is still bounded (it costs a token check each time).
@@ -1231,7 +1386,10 @@ def _make_handler(server, public=False, operator=False):
             except KeyError:
                 return self._send_json(404, {"error": "not found"})
             except EnvelopeConflict as exc:
-                return self._send_json(409, {"error": str(exc), "reason": "conflict"})
+                body = {"error": str(exc), "reason": exc.reason}
+                if exc.last_sequence is not None:
+                    body["last_sequence"] = exc.last_sequence
+                return self._send_json(409, body)
             except SequenceCollision:
                 return self._send_json(409, {"error": "sequence conflict", "reason": "conflict"})
             except PermissionError:
@@ -1309,6 +1467,105 @@ def _make_handler(server, public=False, operator=False):
             if not resumed:
                 return self._json({"error": "pull request is not escalated"}, 409)
             return self._json(_gate_pr(store.snapshot(key)))
+
+        def _architecture_get(self, parts):
+            """/api/v1/architecture/... — read-only, bounded queries over immutable snapshots."""
+            svc = server.architecture
+            if not svc.enabled:
+                return self._json({"error": "not found"}, 404)
+            q = lambda k: _q(self.path, k) or None  # noqa: E731
+            try:
+                rest = parts[4:]
+                if rest == ["snapshots"]:
+                    return self._json(svc.list_snapshots(q("repository_id"), q("commit_sha"), q("host_id"),
+                                                         q("cursor"), q("limit")))
+                if rest == ["analyses"]:
+                    return self._json(svc.analyses(_qint(self.path, "limit", 50)))
+                if len(rest) == 2 and rest[0] == "analyses":
+                    return self._json(svc.analyses(analysis_id=rest[1]))
+                if len(rest) == 3 and rest[0] == "sessions" and rest[2] == "changes":
+                    return self._json(svc.session_changes(rest[1], _qint(self.path, "limit", 200)))
+                if rest == ["timeline"]:
+                    return self._json(svc.timeline(q("repository_id") or "", _qint(self.path, "limit", 200)))
+                if rest == ["cross-repo"]:
+                    qs = parse_qs(urlsplit(self.path).query)
+                    maps = []
+                    for item in qs.get("map", [])[:50]:
+                        bits = item.split("|")
+                        if len(bits) != 3:
+                            raise ValueError("map must be importer|package|provider")
+                        maps.append(dict(zip(("importer", "package", "provider"), bits)))
+                    return self._json(svc.cross_repo(qs.get("snapshot", [])[:20], maps))
+                if rest == ["diff"]:
+                    if not (q("base") and q("head")):
+                        raise ValueError("base and head are required")
+                    return self._json(svc.diff(q("base"), q("head"), q("cursor"), q("limit")))
+                if len(rest) >= 2 and rest[0] == "snapshots":
+                    sid, tail = rest[1], rest[2:]
+                    if not tail:
+                        return self._json(svc.get_snapshot(sid))
+                    if tail == ["children"]:
+                        return self._json(svc.children(sid, q("parent"), q("cursor"), q("limit")))
+                    if tail == ["overlays"]:
+                        return self._json(svc.overlays(sid))
+                    if tail == ["correlations"]:
+                        return self._json(svc.correlations(sid, q("node"), q("cursor"), q("limit")))
+                    if tail == ["nodes"]:
+                        return self._json(svc.search(sid, q("q") or "", q("kind"), q("cursor"), q("limit")))
+                    if len(tail) == 2 and tail[0] == "nodes":
+                        return self._json(svc.node(sid, tail[1]))
+                    if len(tail) == 3 and tail[0] == "nodes" and tail[2] == "rooms":
+                        if tail[1] not in svc._load(sid).nodes:
+                            raise KeyError(tail[1])
+                        return self._json(svc.node_rooms(sid, tail[1], reveal=self._role() == "operator"))
+                    if len(tail) == 3 and tail[0] == "nodes" and tail[2] == "edges":
+                        return self._json(svc.expand(sid, tail[1], q("direction") or "both", q("kind"),
+                                                     q("cursor"), q("limit")))
+            except KeyError:
+                return self._json({"error": "not found"}, 404)
+            except Exception as exc:
+                from ..architecture.service import ArchitectureError
+                if isinstance(exc, ArchitectureError):
+                    return self._json({"error": str(exc)}, exc.status)
+                raise
+            return self._json({"error": "not found"}, 404)
+
+        def _architecture_post(self, parts):
+            svc = server.architecture
+            if not svc.enabled:
+                return self._json({"error": "not found"}, 404)
+            from ..architecture.service import ArchitectureError
+            # An agent key bound in control_plane.architecture.agent_hosts acts only for its hosts.
+            hosts = (server.architecture_agent_hosts.get(self._principal()["id"])
+                     if self._role() == "agent" else None)
+            if self._role() == "agent" and hosts is None and server.architecture_require_host_binding:
+                # Body left unread: _deny closes the connection so it cannot be parsed as a next request.
+                return self._deny(403, "this API key is not bound to any host (control_plane.architecture.agent_hosts)")
+            try:
+                body = self._read_json(_MAX_ARCHITECTURE_BODY) or {}
+                if parts[4:] == ["snapshots"]:
+                    out = svc.publish(body, allowed_hosts=hosts)
+                    return self._json(out, 200 if out["duplicate"] else 201)
+                if parts[4:] == ["analyses"]:
+                    return self._json(svc.record_analysis(body, allowed_hosts=hosts), 201)
+                if len(parts) == 9 and parts[4] == "snapshots" and parts[6] == "nodes" and parts[8] == "explain":
+                    return self._json(svc.explain(parts[5], parts[7]))
+                if parts[4:] == ["analyses", "claim"]:
+                    return self._json(svc.claim_analysis(body, allowed_hosts=hosts))
+                if len(parts) == 7 and parts[4] == "analyses" and parts[6] == "cancel":
+                    if self._role() != "operator":
+                        return self._json({"error": "operator role required"}, 403)
+                    return self._json(svc.cancel_analysis(parts[5]))
+                if parts[4:] == ["analyses", "request"]:
+                    if self._role() not in ("operator",):
+                        return self._json({"error": "operator role required"}, 403)
+                    out = svc.request_analysis(body)
+                    return self._json(out, 200 if out["deduplicated"] else 201)
+            except ArchitectureError as exc:
+                return self._json({"error": str(exc)}, exc.status)
+            except KeyError:
+                return self._json({"error": "not found"}, 404)
+            return self._json({"error": "not found"}, 404)
 
         def _reviewer_body(self, cap, fields):
             """Read a reviewer route's JSON object body: ``(body, None)`` or ``(None, (status, error))``.
@@ -1401,21 +1658,60 @@ def _make_handler(server, public=False, operator=False):
             r = server.repo
             if resource == "health":
                 return self._json(server._health())
+            if resource == "architecture":
+                return self._architecture_get(parts)
             if resource == "mission-activity" and len(parts) == 4:
                 return self._json({"activities": r.mission_activity.list_summaries(),
                                    "server_time": r._stamp()})
+            if resource == "mission-outcomes" and len(parts) == 4:
+                from .mission_outcome import outcome_summaries
+                try:
+                    server.mission_outcomes.sweep()
+                except Exception:  # noqa: BLE001
+                    pass
+                return self._json({"outcomes": outcome_summaries(r)})
             if resource == "missions":
+                try:
+                    server.mission_outcomes.sweep()   # throttled; closes missions that went silent
+                except Exception:  # noqa: BLE001 - a sweep must never fail a read
+                    pass
                 if len(parts) == 6 and parts[5] == "activity":
                     return self._json({"activity": r.mission_activity.get(parts[4])})
+                if len(parts) == 6 and parts[5] == "story":
+                    from .mission_story import build
+                    story = build(r, parts[4], outcomes=server.mission_outcomes, inbox=server.attention,
+                                  config=server.missions_config)
+                    return self._json(story) if story is not None else self._json({"error": "not found"}, 404)
+                if len(parts) == 6 and parts[5] in ("tests", "builds", "reviews", "pulls"):
+                    if r.get_mission(parts[4]) is None:
+                        return self._json({"error": "not found"}, 404)
+                    sub = parts[5]
+                    if sub == "tests":
+                        items = r.list_test_runs(mission_id=parts[4], kind="test")
+                    elif sub == "builds":
+                        items = r.list_test_runs(mission_id=parts[4], kind="build")
+                    elif sub == "reviews":
+                        items = r.list_reviews(mission_id=parts[4])
+                    else:  # pulls
+                        items = r.list_pull_requests(mission_id=parts[4])
+                    return self._json({sub: [redact_payload(item) for item in items]})
                 if len(parts) > 5 and parts[5] == "timeline":
                     timeline = r.mission_timeline(parts[4])
                     return self._json({"timeline": _with_collab_tasks(server, r, parts[4], timeline)})
                 if len(parts) > 4:
                     m = r.get_mission(parts[4])
-                    return self._json(m) if m else self._json(
+                    return self._etag_json(m) if m else self._json(
                         {"error": "not found"}, 404)
                 status = _q(self.path, "status")
-                return self._json({"missions": r.list_missions(status)})
+                return self._etag_json({"missions": r.list_missions(status)})
+            if resource == "related" and len(parts) == 4:
+                from .relations import related
+                kind, entity_id = _q(self.path, "kind"), _q(self.path, "id")
+                try:
+                    answer = related(r, kind, entity_id)
+                except ValueError as exc:
+                    return self._json({"error": str(exc)}, 400)
+                return self._json(answer) if answer is not None else self._json({"error": "not found"}, 404)
             if resource == "attention" and len(parts) == 4:
                 if server.attention is None:
                     return self._json({"error": "not found"}, 404)
@@ -1438,14 +1734,14 @@ def _make_handler(server, public=False, operator=False):
                     s = r.get_session(parts[4])
                     if s:
                         s = self._agent_capabilities(s)
-                    return self._json(s) if s else self._json(
+                    return self._etag_json(s) if s else self._json(
                         {"error": "not found"}, 404)
                 status = _q(self.path, "status")
-                return self._json({"sessions": [self._agent_capabilities(s) for s in r.list_sessions(status)]})
+                return self._etag_json({"sessions": [self._agent_capabilities(s) for s in r.list_sessions(status)]})
             if resource == "services":
                 if len(parts) > 4:
                     s = r.get_service(parts[4])
-                    return self._json(s) if s else self._json(
+                    return self._etag_json(s) if s else self._json(
                         {"error": "not found"}, 404)
                 services = r.list_services()
                 host_filter = _q(self.path, "host_id")
@@ -1460,7 +1756,7 @@ def _make_handler(server, public=False, operator=False):
                     # The ownership feed needs identity and proof only; the full
                     # catalog projection is most of the bytes of a large inventory.
                     services = [{k: s.get(k) for k in _FEED_SERVICE_FIELDS} for s in services]
-                return self._json({"services": services, "summary": summary})
+                return self._etag_json({"services": services, "summary": summary})
             if resource == "fleet" and parts[4:] == ["config", "status"]:
                 if server.fleet_config is None:
                     return self._json({"error": "not found"}, 404)
@@ -1477,9 +1773,9 @@ def _make_handler(server, public=False, operator=False):
                     return self._json({"samples": r.list_telemetry(parts[4], limit)})
                 if len(parts) == 5:
                     h = r.get_host(parts[4])
-                    return self._json(h) if h else self._json(
+                    return self._etag_json(h) if h else self._json(
                         {"error": "not found"}, 404)
-                return self._json({"hosts": r.list_hosts()})
+                return self._etag_json({"hosts": r.list_hosts()})
             if resource == "activity":
                 evs = [_redact_event(e) for e in r.recent_events(
                     limit=_qint(self.path, "limit", 50))]
@@ -1505,6 +1801,8 @@ def _make_handler(server, public=False, operator=False):
                     eid = _q(self.path, "entity_id")
                     if etype == "lineage":
                         return self._json({"error": "not found"}, 404)  # read via the scope-checked /api/v1/graph
+                    if etype == "review_request":
+                        return self._json({"error": "not found"}, 404)  # read through the review-quorum route
                     if etype and etype.startswith("collab"):
                         return self._json({"error": "not found"}, 404)  # HCN has its own authenticated API
                     if not etype or not eid:
@@ -1542,22 +1840,30 @@ def _make_handler(server, public=False, operator=False):
             if resource == "steering":
                 return self._steering(parts)
             if resource == "ingest" and len(parts) == 5 and parts[4] == "sources":
-                return self._json({"sources": r.ledger.source_states(), "server_time": r._stamp()})
+                # T16 M4: emitter names, actor digests and sequences of other principals are operator
+                # business; every other key sees only the sources it emitted itself.
+                # ``?scope=all`` is the explicit full listing: operator-role keys only (403 otherwise). Without it an
+                # operator key still sees everything and any other key only its own domains.
+                is_operator = self._role() == "operator"
+                scope = (parse_qs(urlsplit(self.path).query).get("scope") or [""])[0]
+                if scope not in ("", "all", "own"):
+                    return self._json({"error": "scope must be all or own"}, 400)
+                if scope == "all" and not is_operator:
+                    return self._json({"error": "forbidden"}, 403)
+                own = None if (is_operator and scope != "own") else (self._principal().get("id") or "")
+                return self._json({"sources": r.ledger.source_states(own), "server_time": r._stamp()})
             if resource == "ingest":
                 return self._json({"endpoint": "POST /api/v1/ingest",
-                                   "entities": ["host", "session", "mission"]})
+                                   "entities": sorted(INGEST_ENTITY_TYPES)})
             if resource == "github":
                 what = parts[4] if len(parts) == 5 else ""
                 if len(parts) > 5 or (len(parts) == 5 and what not in {"issues", "issue"}):
                     return self._json({"error": "not found"}, 404)
                 query = _github_query(self.path, what)
-                if what == "issues":
-                    repository = query.pop("repository", None)
-                    return self._json(server.github_monitor.issues(repository_id=repository, **query))
                 if what == "issue":
                     return self._json(server.github_monitor.issue_detail(
                         query["repository"], query["number"]))
-                return self._json(server.github_monitor.repositories(**query))
+                return self._github_list(what or "repositories", query)
             if resource == "ci":
                 what = parts[4] if len(parts) > 4 else ""
                 if what == "performance" and len(parts) == 5:
@@ -1637,6 +1943,8 @@ def _make_handler(server, public=False, operator=False):
                 if r.get_session(parts[4]) is None and not r.inspector.has_session(parts[4]):
                     return self._json({"error": "session not found"}, 404)
                 return self._inspector_set_prefs(parts[4])
+            if resource == "architecture":
+                return self._architecture_post(parts)
             # artifact upload carries raw bytes, not JSON — handle first
             if resource == "artifacts" and len(parts) == 4:
                 return self._upload_artifact(r, parts)
@@ -1702,6 +2010,8 @@ def _make_handler(server, public=False, operator=False):
                 return self._json(result)
             if resource == "steering":
                 return self._steering(parts, body)
+            if resource == "graph" and len(parts) == 8 and parts[4] == "nodes" and parts[6:] == ["review-quorum", "rereview"]:
+                return self._rereview(parts[5], body)
             if resource == "reviews":
                 from .reviews import ReviewService
                 reviews = ReviewService(r)
@@ -1843,11 +2153,38 @@ def _make_handler(server, public=False, operator=False):
             try:
                 if body is None and parts[4:] == ["pending"]:
                     return self._json(service.steering_pending(who, inst))
+                if body is None and len(parts) == 6 and parts[4] == "targets":
+                    cur = service.steering_current(who, parts[5], inst)
+                    return self._json(cur) if cur is not None else self._json({"error": "not found"}, 404)
                 if body is not None and len(parts) == 6 and parts[5] == "ack":
                     return self._json(service.steering_ack(who, parts[4], body, inst))
             except CollabError as exc:
                 return self._json({"error": exc.message, **getattr(exc, "extra", {})}, exc.status)
             return self._json({"error": "not found"}, 404)
+
+        def _rereview(self, pr_id, body):
+            """T16 gap C: ``POST /api/v1/graph/nodes/{pr}/review-quorum/rereview`` ``{"head"?: <full sha>}`` records that
+            the PR's CURRENT head needs another review round. Recording only: Herdr dispatches nothing. 201 new, 200 replay
+            (one request per PR head); 404 hidden/absent/feature off; 403 a key the operator did not name for this PR's
+            review evidence; 409 not needed / head moved / head unknown; 429 rate limited."""
+            from .review_quorum import RereviewError
+            if server.review_quorum is None:
+                return self._json({"error": "review quorum is not configured"}, 404)
+            principal = self._principal()
+            if not isinstance(body, dict) or set(body) - {"head"}:
+                return self._json({"error": "body may only carry head"}, 400)
+            head = body.get("head")
+            if head is not None and not (isinstance(head, str) and re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", head)):
+                return self._json({"error": "head must be a full lowercase commit id"}, 400)
+            try:
+                status, out = server.rereview.request(server.repo.graph, principal, pr_id, server.review_quorum, head)
+            except KeyError:
+                return self._json({"error": "not found"}, 404)
+            except RereviewError as exc:
+                if exc.code == "not_permitted" and server._refusal_log_due(principal.get("id")):
+                    logging.getLogger(__name__).warning("review quorum: %s refused a re-review request", principal.get("id"))
+                return self._json({"error": exc.message, "code": exc.code, **exc.extra}, exc.status)
+            return self._json(out, status)
 
         def _llm_stats(self, what):
             """LLM page statistics (operator listener only; a bad parameter is a 400)."""
@@ -1874,12 +2211,21 @@ def _make_handler(server, public=False, operator=False):
                 if server.review_quorum is None:
                     return self._json({"error": "review quorum is not configured"}, 404)
                 try:
-                    return self._json(pr_review_quorum(server.repo.graph, self._principal(), parts[5],
-                                                       server.review_quorum))
+                    out = pr_review_quorum(server.repo.graph, self._principal(), parts[5], server.review_quorum)
+                    # T16 gap C: the recorded ask for THIS head (None for any other), so the dispatcher can poll one read
+                    out["rereview_request"] = server.rereview.current(out["pr"], out.get("head"))
+                    return self._json(out)
                 except KeyError:
                     return self._json({"error": "not found"}, 404)
-            return self._json(read_graph(server.repo.graph, self._principal(), parts[4:],
-                                         lambda name: _q(self.path, name)))
+            out = read_graph(server.repo.graph, self._principal(), parts[4:], lambda name: _q(self.path, name))
+            if len(parts) == 6 and parts[4] == "nodes" and server.collab is not None and not server.collab_only:
+                # T16 gap A: an ingest key can read the node's CURRENT steering fence and gate digest (so a runtime
+                # can fill ResolvedTarget.fence). Only for a node this key could read: read_graph answered 404 for
+                # any other, and the same principal is used again here.
+                view = server.collab.node_steering_view(server.repo.graph, self._principal(), parts[5])
+                if view is not None:
+                    out = {**out, **view}
+            return self._json(out)
 
         def _agent_capabilities(self, session):
             operator = self._role() == "operator"
@@ -2030,6 +2376,7 @@ def _make_handler(server, public=False, operator=False):
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
             self.send_header("Connection", "keep-alive")
+            self.send_header("X-Accel-Buffering", "no")
             self.end_headers()
             q = queue.Queue(maxsize=256)
             with server._lock:
@@ -2046,14 +2393,32 @@ def _make_handler(server, public=False, operator=False):
                 for ev in reversed(server.repo.recent_events(limit=100)):
                     self.wfile.write(_sse_frame(ev))
                     self.wfile.flush()
-                while True:
-                    ev = q.get(timeout=15)
+                started = time.monotonic()
+                # Bounded lifetime frees threads held by half-open clients;
+                # EventSource reconnects and replays.
+                while time.monotonic() - started < _MAX_SSE_SECONDS:
+                    try:
+                        ev = q.get(timeout=_SSE_IDLE_SECONDS)
+                    except queue.Empty:
+                        if q not in server._subscribers:
+                            break  # dropped as a slow subscriber: close so the client reconnects
+                        # A data frame (not an SSE comment, which EventSource never surfaces)
+                        # keeps proxies from timing out AND tells the UI the stream is alive on
+                        # a quiet fleet; the client filters it out like StreamConnected.
+                        self.wfile.write(_sse_frame({
+                            "event_type": "StreamKeepalive",
+                            "entity_type": "stream", "entity_id": "control-plane",
+                            "sequence": 0, "payload": {},
+                        }))
+                        self.wfile.flush()
+                        continue
                     self.wfile.write(_sse_frame(ev))
                     self.wfile.flush()
-            except (queue.Empty, BrokenPipeError, ConnectionResetError):
+            except (BrokenPipeError, ConnectionResetError):
                 pass
             finally:
                 server._subscribers.discard(q)
+                self.close_connection = True
             return None
 
         # ------------------------------------------------------------ static
@@ -2105,12 +2470,12 @@ def _make_handler(server, public=False, operator=False):
             return self._json({"error": "not found"}, 404)
 
         # ---------------------------------------------------------- helpers
-        def _read_json(self):
+        def _read_json(self, limit=_MAX_JSON_BODY):
             try:
                 length = int(self.headers.get("Content-Length") or 0)
                 if not length:
                     return None
-                if length > _MAX_JSON_BODY:
+                if length > limit:
                     raise ValueError("request body too large")
                 try:
                     return json.loads(self.rfile.read(length))
@@ -2122,17 +2487,80 @@ def _make_handler(server, public=False, operator=False):
                 self.close_connection = True
                 raise
 
-        def _json(self, data, status=200):
-            payload = json.dumps(data).encode()
+        def _json(self, data, status=200, *, etag=None, payload=None):
+            payload = json.dumps(data).encode() if payload is None else payload
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
             self.send_header("Cache-Control", "no-store")
             self.send_header("Content-Length", str(len(payload)))
+            if etag and status == 200:
+                self.send_header("ETag", etag)
             if self.close_connection:
                 self.send_header("Connection", "close")
             self.end_headers()
             self.wfile.write(payload)
             return None
+
+        def _not_modified(self, etag):
+            """304: no body (keep-alive safe without Content-Length), same validator."""
+            self.send_response(304)
+            self.send_header("ETag", etag)
+            self.send_header("Cache-Control", "no-store")
+            if self.close_connection:
+                self.send_header("Connection", "close")
+            self.end_headers()
+            return None
+
+        def _fresh(self, etag):
+            return _if_none_match(self.headers.get("If-None-Match"), etag)
+
+        def _etag_json(self, data, status=200):
+            """A read-only body with a content-hash ETag; ``304`` when the client already has it.
+
+            Polled views (hosts, sessions, services, missions) save the transfer
+            and the re-render, not the server work: the body is still built.
+            """
+            if status != 200:
+                return self._json(data, status)
+            payload, etag = etag_json(data)
+            if self._fresh(etag):
+                return self._not_modified(etag)
+            return self._json(data, etag=etag, payload=payload)
+
+        def _github_list(self, kind, query):
+            """``/github`` and ``/github/issues`` with ``revision``, ``ETag`` and ``since`` deltas.
+
+            The ETag is ``W/"<revision>-<hash>"`` where the hash covers the query and
+            the monitor's sync state, taken before the body is built (so it can only
+            be older than the body, never claim a newer one). A monitor without a
+            trustworthy revision falls back to a content hash.
+            """
+            monitor = server.github_monitor
+            since = query.pop("since", None)
+            repository = query.pop("repository", None) if kind == "issues" else None
+            tag_of = getattr(monitor, "list_tag", None)
+            tag = tag_of() if tag_of else None
+            etag = None
+            if tag is not None:
+                material = json.dumps([kind, repository, since, sorted(query.items()), tag["fingerprint"]],
+                                      default=str).encode()
+                etag = f'W/"{tag["revision"]}-{hashlib.sha256(material).hexdigest()[:20]}"'
+                if self._fresh(etag):
+                    return self._not_modified(etag)
+            changes = getattr(monitor, "changes", None)
+            if since is not None and changes is not None:
+                filters = {"repository_id": repository, "tab": query.get("tab", "all")} if kind == "issues" else {}
+                body = changes(kind=kind, since=since, search=query.get("search", ""), **filters)
+            else:
+                extra = {"repository_id": repository} if kind == "issues" else {}
+                body = (monitor.issues(**extra, **query) if kind == "issues" else monitor.repositories(**query))
+                if since is not None:  # a monitor without deltas: always a full resync
+                    body = dict(body, resync=True)
+                if tag is not None:
+                    body = dict(body, revision=tag["revision"])
+            if etag is None:
+                return self._etag_json(body)
+            return self._json(body, etag=etag)
 
         def _bytes(self, data, mime):
             self.send_response(200)
@@ -2213,10 +2641,34 @@ def _qint(path, key, default):
         return default
 
 
+def etag_json(body) -> tuple[bytes, str]:
+    """The JSON payload of ``body`` and its strong content-hash ETag.
+
+    The hash covers the serialized bytes, so it saves bandwidth and client
+    re-render on an unchanged body, not the work of building it (ruling 1).
+    """
+    payload = json.dumps(body).encode()
+    return payload, '"' + hashlib.sha256(payload).hexdigest()[:32] + '"'
+
+
+def _if_none_match(header, etag) -> bool:
+    """RFC 9110 weak comparison of ``If-None-Match`` (a list, ``*``, ``W/`` prefixes) with ``etag``."""
+    if not header or not etag:
+        return False
+    def opaque(tag):
+        tag = tag.strip()
+        return tag[2:] if tag.startswith("W/") else tag
+    wanted = opaque(etag)
+    return any(item.strip() == "*" or opaque(item) == wanted for item in header.split(","))
+
+
+_MAX_REVISION = 2**63 - 1
+
+
 def _github_query(path, kind):
     """Bound local dashboard filters; never forward arbitrary upstream paths."""
     values = parse_qs(urlsplit(path).query, keep_blank_values=True, max_num_fields=20)
-    allowed = {"repository", "number"} if kind == "issue" else {"page", "per_page", "search"}
+    allowed = {"repository", "number"} if kind == "issue" else {"page", "per_page", "search", "since"}
     if kind == "issues":
         allowed |= {"repository", "tab"}
     if values.keys() - allowed or any(len(items) != 1 for items in values.values()):
@@ -2243,6 +2695,10 @@ def _github_query(path, kind):
         if not repository:
             raise ValueError("GitHub repository required")
         return query
+    if "since" in query:
+        if not re.fullmatch(r"[0-9]{1,19}", query["since"]) or int(query["since"]) > _MAX_REVISION:
+            raise ValueError("invalid GitHub revision")
+        query["since"] = int(query["since"])
     query.setdefault("search", "")
     if len(query["search"]) > 300 or any(ord(char) < 32 or ord(char) == 127 for char in query["search"]):
         raise ValueError("invalid GitHub search")

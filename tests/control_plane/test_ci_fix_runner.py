@@ -553,3 +553,29 @@ def test_the_command_line_requires_a_key_file_and_refuses_a_bad_host(capsys):
         runner.main([])
     with pytest.raises(SystemExit):
         runner.main(["--api-key-file", "/nonexistent", "--url", "http://x", "--host-id", "bad host"])
+
+
+def test_gateway_that_wants_a_bearer_falls_back_to_pis_own_catalogue(tmp_path):
+    import http.server
+    import threading
+
+    class Locked(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(401)
+            self.end_headers()
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), Locked)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        base = f"http://127.0.0.1:{server.server_port}"
+        (tmp_path / "models.json").write_text(json.dumps({"providers": {
+            "mine": {"baseUrl": f"{base}/v1", "models": [{"id": "flint-40b"}]},
+            "other": {"baseUrl": "http://elsewhere.example/v1", "models": [{"id": "not-this"}]}}}))
+        assert runner.Gateway(base, tmp_path).models() == ["flint-40b"]
+        with pytest.raises(runner.Failure):
+            runner.Gateway(base, tmp_path / "missing").models()
+    finally:
+        server.shutdown()

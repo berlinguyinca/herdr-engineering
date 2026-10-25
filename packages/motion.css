@@ -1,0 +1,52 @@
+/* Motion rules. All durations come from --motion-fast / --motion-normal.
+ * Calm mode (html[data-calm="on"]) and OS reduced-motion switch every rule off. */
+@keyframes hd-enter { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; transform: none; } }
+@keyframes hd-flash { from { background-color: var(--accent-weak); } to { background-color: transparent; } }
+@keyframes hd-pulse { 0%, 100% { opacity: 1; } 50% { opacity: .45; } }
+/* Draw-in reveals the line left to right with a clip. No dash state exists outside the animation:
+ * with vector-effect: non-scaling-stroke Chromium ignores pathLength, so a stroke-dasharray would
+ * leave the line in dash fragments at any scale other than 1x. */
+@keyframes hd-draw { from { clip-path: inset(0 100% 0 0); } to { clip-path: inset(0 0 0 0); } }
+@keyframes hd-grow { from { transform: scaleY(0); } to { transform: none; } }
+@keyframes hd-fade { from { opacity: 0; } to { opacity: 1; } }
+@keyframes hd-skeleton { 0% { background-position: 100% 0; } 100% { background-position: -100% 0; } }
+
+[data-entering] { animation: hd-enter var(--motion-normal) ease-out; }
+[data-leaving] { opacity: 0; max-height: 0; overflow: hidden; transition: opacity var(--motion-normal), max-height var(--motion-normal); }
+[data-flash] { animation: hd-flash 600ms ease-out; transition: background-color 600ms; }
+[data-pulse] { animation: hd-pulse 2s ease-in-out infinite; }
+/* A finite pulse for "this just appeared" (a new critical item): three beats, then still. */
+[data-pulse="once"] { animation: hd-pulse 2s ease-in-out 3; }
+/* Sparkline draw-in: the base state is the whole line; only the animation clips it, so calm
+ * (animation: none) shows the whole line. */
+.hv-spark__line[data-drawn] { animation: hd-draw 600ms ease-out; }
+/* Running CI rows pulse their state label. */
+.ig-row[data-state="running"] .ig-state strong { animation: hd-pulse 2s ease-in-out infinite; }
+/* CI charts draw in on their first paint only (data-drawn is set once by the view). */
+.ci-chart-card svg polyline[data-drawn] { animation: hd-draw 600ms ease-out; }
+.ci-chart-card svg rect[data-drawn] { transform-box: fill-box; transform-origin: bottom; animation: hd-grow 600ms ease-out; }
+.ci-chart-card svg circle[data-drawn] { animation: hd-fade 600ms ease-out; }
+progress, .hd-meter > *, .hd-stage-bar > *, .hv-meter__bar > i { transition: width var(--motion-normal), inline-size var(--motion-normal); }
+
+.hd-skeleton {
+  min-height: 1em; border-radius: var(--radius-sm);
+  background: linear-gradient(90deg, var(--surface-2) 25%, var(--surface-hover) 50%, var(--surface-2) 75%);
+  background-size: 200% 100%; animation: hd-skeleton 1.4s linear infinite;
+}
+
+herdr-freshness { display: inline-block; font-size: var(--text-sm); color: var(--text-secondary); }
+herdr-freshness[data-state="stale"] { color: var(--freshness-warn); }
+herdr-freshness[data-state="error"] { color: var(--status-failed); }
+
+.hd-controls { display: flex; flex-wrap: wrap; gap: 8px; padding: 8px 16px; font-size: .8125rem; color: var(--text-secondary); }
+.hd-controls label { display: flex; align-items: center; gap: 6px; }
+.hd-controls select { font: inherit; color: var(--text); background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 4px; }
+
+html[data-calm="on"] *, html[data-calm="on"] *::before, html[data-calm="on"] *::after {
+  animation: none !important; transition-duration: 0s !important; transition-delay: 0s !important;
+}
+@media (prefers-reduced-motion: reduce) {
+  html:not([data-calm="off"]) *, html:not([data-calm="off"]) *::before, html:not([data-calm="off"]) *::after {
+    animation: none !important; transition-duration: 0s !important; transition-delay: 0s !important;
+  }
+}

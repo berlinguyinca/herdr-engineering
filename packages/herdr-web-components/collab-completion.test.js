@@ -104,15 +104,26 @@ const clash = {
 test('a name shared at one level addresses nobody, as on the server, and says which forms to use', () => {
   assert.equal(resolvesTo('lead', clash), null);
   assert.deepEqual(resolveToken('lead', clash), { ambiguous: ['@ana.claude', '@gert.pi'] });
-  assert.equal(resolvesTo('coder', clash), null);                                   // person handle = agent name
-  assert.deepEqual(resolveToken('coder', clash), { ambiguous: ['@ana.codex'] });
+  // a person handle outranks an agent's current name (as on the server): "@coder ..." is a message to the person
+  assert.deepEqual(resolvesTo('coder', clash), { kind: 'person', id: 'u3', name: 'coder' });
   assert.deepEqual(resolvesTo('gert.pi', clash), { kind: 'agent', id: 'a1', name: 'gert.pi' });
   assert.equal(findAgent(clash.agents, 'lead'), null);
   assert.deepEqual(providers['/']('', { ...clash, agent: 'lead' }), []);
   assert.deepEqual(unresolvedMentions('@lead @coder @gert', clash), []);              // not unknown: ambiguous
   assert.deepEqual(ambiguousMentions('@lead and @coder, @gert @lead.', clash),
-    [{ name: 'lead', forms: ['@ana.claude', '@gert.pi'] }, { name: 'coder', forms: ['@ana.codex'] }]);
+    [{ name: 'lead', forms: ['@ana.claude', '@gert.pi'] }]);
   assert.equal(mentionChips('<p>@lead</p>', [{ kind: 'agent', id: 'a1', name: 'gert.pi' }], clash), '<p>@lead</p>');
+});
+
+test('an external agent\'s chip says it is external, from the server\'s mention or the roster', () => {
+  const ext = { ...ctx, agents: [...ctx.agents, { agent_id: 'x1', address: null, name: 'ext-dana-ab12', aliases: [], external: true }] };
+  const chip = mentionChips('<p>@ext-dana-ab12 hi</p>', [{ kind: 'agent', id: 'x1', name: 'ext-dana-ab12', external: true }], ext);
+  assert.match(chip, /class="cx-mention cx-mention--agent cx-mention--external"/);
+  assert.match(chip, /title="External agent @ext-dana-ab12"/);
+  assert.match(chip, />@ext-dana-ab12<\/span>/);                                   // the literal text stays
+  const fromRoster = mentionChips('<p>@ext-dana-ab12</p>', [{ kind: 'agent', id: 'x1', name: 'ext-dana-ab12' }], ext);
+  assert.match(fromRoster, /cx-mention--external/);
+  assert.doesNotMatch(mentionChips('<p>@gert.pi</p>', [{ kind: 'agent', id: 'a1', name: 'gert.pi' }], ctx), /external/);
 });
 
 test('names inside ~~~ fences are not mentions either', () => {

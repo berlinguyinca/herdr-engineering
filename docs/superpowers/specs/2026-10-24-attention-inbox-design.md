@@ -230,3 +230,11 @@ All six decisions above were built at their stated defaults: the Overview reads 
 - Both sources are listed in `source_unavailable` handling like every other source: if the summaries or the LLM stats cannot be read the inbox says so and does not resolve their items.
 - **Not built:** the CI-fix outcome source named in the build plan. The CI fix agent is being built in a parallel stream (its request and state machine landed on main in #227); an inbox item for its outcome is one more derivation function to add once that state is readable from the repo, and is left to that stream.
 - Closing summary of deviations from the design: CI coalescing counts consecutive failures per repository and branch and clears on a newer green run; failed missions and agents older than `failed_window_hours` (default 168) are not items; `mission_attention` requires a live report; the baseline rule and the "held, not dropped" quiet-hours rule for notifications; `blocked_window_hours` as a new threshold.
+
+### Built notes: CI fix outcome source
+
+- `ci_fix` items (kind `ci_fix`, key `cifix:<id>`) come from `CIFixService.list()` and exist only when `control_plane.ci_fix.enabled` is true. Active runs are not items.
+- Failed or expired runs are `warning`; a succeeded run with a draft PR is `info`, or `warning` when the result carries flags (the run wants a review); `no_change` is `info`. The fingerprint changes with the outcome and flags, so a changed outcome reopens an acknowledged item.
+- Runs that ended more than `thresholds.failed_window_hours` ago age out (the existing key, no new config).
+- The link is always the internal `#/ci` page, never the external PR URL (the view only allows hash links); the CI page shows the PR. Titles use only repository and run number, never run text.
+- A broken source is reported as `source_unavailable`, like the others.
