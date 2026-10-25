@@ -431,7 +431,7 @@ export function mountCollab(root, { fabricSessions = null, onFreshness = () => {
     if (!box || !operator) return;
     let hosts;
     try { hosts = (await api.fleetHosts()).hosts; } catch { return; }
-    const html = hosts.length ? `<ul class="cx-list">${hosts.map((h) => `<li><span class="grow"><b>${esc(h.host)}</b> ${pill(h.online ? 'online' : 'offline', h.online ? 'var(--status-ok)' : 'var(--text-muted)')}${h.kind === 'local' ? ' <span class="hd-ident">this machine</span>' : ''}${h.online ? ` <span class="hd-ident">${h.families && h.families.length ? esc(h.families.join(', ')) : 'no agent CLIs found'}</span>` : ''}</span><label class="cx-check"><input type="checkbox" data-auto="${esc(h.host)}"${h.auto_agents ? ' checked' : ''}> Automatic agents</label></li>`).join('')}</ul>` : '<div class="hd-empty">No hosts reported yet. The host runner reports every few seconds.</div>';
+    const html = hosts.length ? `<ul class="cx-list">${hosts.map((h) => `<li data-key="${esc(h.host)}"><span class="grow"><b>${esc(h.host)}</b> ${pill(h.online ? 'online' : 'offline', h.online ? 'var(--status-ok)' : 'var(--text-muted)')}${h.kind === 'local' ? ' <span class="hd-ident">this machine</span>' : ''}${h.online ? ` <span class="hd-ident">${h.families && h.families.length ? esc(h.families.join(', ')) : 'no agent CLIs found'}</span>` : ''}</span><label class="cx-check"><input type="checkbox" data-auto="${esc(h.host)}"${h.auto_agents ? ' checked' : ''}> Automatic agents</label></li>`).join('')}</ul>` : '<div class="hd-empty">No hosts reported yet. The host runner reports every few seconds.</div>';
     morph(box, html);                         // unchanged hosts write nothing; a toggled box keeps focus
     box.querySelectorAll('[data-auto]').forEach((c) => { c.onchange = async () => { try { await api.setFleetHost(c.dataset.auto, c.checked); } catch (e) { alert(e.message); } renderHosts(); }; });
   }
@@ -764,7 +764,7 @@ export function mountCollab(root, { fabricSessions = null, onFreshness = () => {
         const g = a.rooms.find((r) => r.room_id === roomId);
         const pend = (a.pending || []).find((r) => r.room_id === roomId);
         const cur = g ? g.actions : (pend ? pend.actions : ['read']);
-        return `<li><form class="cx-stack" data-agent="${esc(a.agent_id)}" style="flex:1 1 100%">
+        return `<li data-key="${esc(a.agent_id)}"><form class="cx-stack" data-agent="${esc(a.agent_id)}" style="flex:1 1 100%">
           <span class="cx-row">${agentTitle(namedAgent(a), true)} <span class="hd-ident">${esc(shortId(a.agent_id))}</span> ${g ? permPills(g.actions) : ''}${pend ? pill('Waiting for the room owner', 'var(--status-attention)') : ''}</span>
           <span class="cx-checks">${permBoxes(cur, 'p')}</span>${canInvite ? ttlSelect() : ''}
           <button type="submit" class="hd-btn hd-btn--sm">${canInvite ? (g ? 'Update permissions' : 'Add to room') : (g ? 'Request change' : 'Request access')}</button></form></li>`;
@@ -783,7 +783,7 @@ export function mountCollab(root, { fabricSessions = null, onFreshness = () => {
     };
     const drawRequests = () => {
       const requests = S.requests || [];
-      const html = requests.length ? `<ul class="cx-list">${requests.map((r) => `<li><form class="cx-stack" data-req="${esc(r.request_id)}" style="flex:1 1 100%">
+      const html = requests.length ? `<ul class="cx-list">${requests.map((r) => `<li data-key="${esc(r.request_id)}"><form class="cx-stack" data-req="${esc(r.request_id)}" style="flex:1 1 100%">
           <span><b>@${esc(r.name)}</b> from ${esc(r.owner_email || shortId(r.owner_user_id))}</span>
           <span class="cx-checks">${permBoxes(r.actions, 'p')}</span>${ttlSelect()}
           <span class="cx-row"><button type="submit" class="hd-btn hd-btn--sm" data-decision="approve">Approve</button><button type="button" class="hd-btn hd-btn--ghost hd-btn--sm" data-deny="1">Deny</button></span></form></li>`).join('')}</ul>` : '<div class="hd-empty">No requests.</div>';
@@ -865,8 +865,8 @@ export function mountCollab(root, { fabricSessions = null, onFreshness = () => {
       try {
         const [room, inv] = await Promise.all([api.room(roomId), api.invites(roomId)]);
         names = new Map((room.members || []).map((m) => [m.user_id, m.email || shortId(m.user_id)]));
-        const html = `<ul class="cx-list">${room.members.map((m) => `<li><span class="grow">${esc(m.email || shortId(m.user_id))}</span>${pill(roleLabel(m.role), m.role === 'owner' ? 'var(--accent)' : 'var(--status-active)')}${m.role !== 'owner' ? `<button type="button" class="hd-btn hd-btn--danger hd-btn--sm" data-rm="${esc(m.user_id)}">Remove</button>` : ''}</li>`).join('')}
-          ${inv.invites.map((i) => `<li><span class="grow">${esc(i.email)}</span>${pill('Invited', 'var(--status-attention)')}<button type="button" class="hd-btn hd-btn--ghost hd-btn--sm" data-cancel="${esc(i.invite_id)}">Cancel</button></li>`).join('')}</ul>`;
+        const html = `<ul class="cx-list">${room.members.map((m) => `<li data-key="member:${esc(m.user_id)}"><span class="grow">${esc(m.email || shortId(m.user_id))}</span>${pill(roleLabel(m.role), m.role === 'owner' ? 'var(--accent)' : 'var(--status-active)')}${m.role !== 'owner' ? `<button type="button" class="hd-btn hd-btn--danger hd-btn--sm" data-rm="${esc(m.user_id)}">Remove</button>` : ''}</li>`).join('')}
+          ${inv.invites.map((i) => `<li data-key="invite:${esc(i.invite_id)}"><span class="grow">${esc(i.email)}</span>${pill('Invited', 'var(--status-attention)')}<button type="button" class="hd-btn hd-btn--ghost hd-btn--sm" data-cancel="${esc(i.invite_id)}">Cancel</button></li>`).join('')}</ul>`;
         if (put('hcn-people', html)) {
           $('hcn-people').querySelectorAll('[data-rm]').forEach((b) => { b.onclick = () => act(async () => { await api.removeMember(roomId, b.dataset.rm); forget('hcn-people'); }); });
           $('hcn-people').querySelectorAll('[data-cancel]').forEach((b) => { b.onclick = () => act(async () => { await api.cancelInvite(roomId, b.dataset.cancel); forget('hcn-people'); }); });
@@ -895,7 +895,7 @@ export function mountCollab(root, { fabricSessions = null, onFreshness = () => {
         const box = $('hcn-tabs');
         if (!box) return;
         const pend = (S.externals && S.externals.invites) || [];
-        put('hcn-ext-invites', pend.length ? `<ul class="cx-list" aria-label="Open remote-agent invites">${pend.map((i) => `<li><span class="grow"><b>${esc(i.label)}</b> <span class="cx-msg">invited, not yet used · may ${esc((i.actions || []).join(', '))}${i.lineage ? ', report lineage' : ''}</span></span>${pill('Invited', 'var(--status-attention)')}<button type="button" class="hd-btn hd-btn--ghost hd-btn--sm" data-cancel-ext="${esc(i.invite_id)}">Cancel</button></li>`).join('')}</ul>` : '');
+        put('hcn-ext-invites', pend.length ? `<ul class="cx-list" aria-label="Open remote-agent invites">${pend.map((i) => `<li data-key="${esc(i.invite_id)}"><span class="grow"><b>${esc(i.label)}</b> <span class="cx-msg">invited, not yet used · may ${esc((i.actions || []).join(', '))}${i.lineage ? ', report lineage' : ''}</span></span>${pill('Invited', 'var(--status-attention)')}<button type="button" class="hd-btn hd-btn--ghost hd-btn--sm" data-cancel-ext="${esc(i.invite_id)}">Cancel</button></li>`).join('')}</ul>` : '');
         $('hcn-ext-invites')?.querySelectorAll('[data-cancel-ext]').forEach((b) => { b.onclick = () => act(async () => { await api.revokeExternalInvite(roomId, b.dataset.cancelExt); S.tabsAt = 0; forget('hcn-ext-invites'); }); });
         if (put('hcn-tabs', renderTabsPanes(S.tabs || { tabs: [], hidden_by_grant: 0 }, S.tabSel, { canManage: canInvite }))) {
           const ids = (S.tabs?.tabs || []).map((t) => t.agent_id);

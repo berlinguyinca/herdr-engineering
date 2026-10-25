@@ -470,3 +470,36 @@ test('Collab: repeated identical room state writes nothing; one changed task rew
  await until(()=>page.locator('#hcn-tasks li[data-key="t1"]').count().then(n=>n===0),'removed once the selection is released',3000);
  await page.evaluate(()=>window.collab.dispose());
 }));
+
+test('Collab people: a focused Remove button keeps its member when another member is listed before it',async()=>withPage(async(page,base)=>{
+ const T='2026-10-23T10:00:00+00:00';
+ const member=(id)=>({user_id:id,email:`${id}@example.test`,role:'member'});
+ const m={members:[{user_id:'owner',email:'owner@example.test',role:'owner'},member('carol')]};
+ await page.route('**/api/v1/collab/**',async route=>{
+  const url=new URL(route.request().url());const path=url.pathname.replace('/api/v1/collab','');
+  let body={};
+  if(path==='/config')body={client_id:'test',hosted_ui_domain:'test',public_url:'https://example.test',operator:{user_id:'owner',email:'owner@example.test'}};
+  else if(path==='/rooms')body={rooms:[{room_id:'room-one',name:'Review',role:'owner'}]};
+  else if(path==='/admin/users')body={users:[]};
+  else if(path==='/rooms/room-one')body={room_id:'room-one',name:'Review',role:'owner',members:structuredClone(m.members)};
+  else if(path==='/rooms/room-one/invites')body={invites:[]};
+  else if(path==='/rooms/room-one/state'){
+   await new Promise(r=>setTimeout(r,150));
+   body={changed:true,seq:1,next_cursor:1,agents:[],tasks:[],events:[],flow:{nodes:[],edges:[],tasks:[]}};
+  }
+  await route.fulfill({json:body});
+ });
+ await page.goto(`${base}/__blank`);
+ await page.evaluate(async()=>{
+  document.body.innerHTML='<div id="host"></div>';
+  const {mountCollab}=await import('/collab-view.js');window.collab=mountCollab(document.querySelector('#host'));
+ });
+ await page.locator('[data-room="room-one"]').click();
+ await page.locator('[data-sub="people"]').click();
+ await page.locator('#hcn-people [data-rm="carol"]').focus();
+ // bob joins and is listed before carol
+ m.members.splice(1,0,member('bob'));
+ await until(()=>page.locator('#hcn-people [data-rm="bob"]').count().then(n=>n===1),'bob listed',8000);
+ assert.equal(await page.evaluate(()=>document.activeElement?.dataset.rm),'carol','the focused Remove button still removes carol');
+ await page.evaluate(()=>window.collab.dispose());
+}));
