@@ -267,7 +267,7 @@ class ControlPlaneRepo:
         if rec is None:
             return None
         rec = _copy(rec)
-        rec["telemetry_state"] = self._mission_telemetry_state(
+        rec["telemetry_state"], rec["report_age_seconds"] = self._mission_telemetry_state(
             rec.get("mission_key") or rec["mission_id"])
         return rec
 
@@ -292,12 +292,15 @@ class ControlPlaneRepo:
             return mission_id
         return None
 
-    def _mission_telemetry_state(self, mission_key: str) -> str:
-        """Derive live/stale/unknown from the bounded mission-activity read model.
+    def _mission_telemetry_state(self, mission_key: str) -> tuple:
+        """Return (telemetry_state, report_age_seconds) from the activity store.
 
-        This reflects *collection* freshness of the Pi transport, never worker
-        health: a mission with no collector is ``unknown``, not stalled. It reuses
-        the real freshness the activity store already computes (issue #28); no
+        telemetry_state is ``live``/``stale``/``unknown`` reflecting *collection*
+        freshness of the Pi transport, never worker health: a mission with no
+        collector is ``unknown``, not stalled. report_age_seconds is the age of the
+        most recent activity report (the stall age) or ``None`` when there is no
+        collector, so the UI never fabricates a liveness reading. Both reuse the
+        real freshness the activity store already computes (issue #28); no
         fabricated heartbeat is ever invented.
         """
         try:
@@ -305,19 +308,21 @@ class ControlPlaneRepo:
         except Exception:  # noqa: BLE001 - one unreadable entry never hides the rest
             live = None
         if not live:
-            return "unknown"
-        state = (live.get("freshness") or {}).get("state")
+            return "unknown", None
+        freshness = live.get("freshness") or {}
+        state = freshness.get("state")
+        age = freshness.get("age_seconds")
         if state in ("live", "updating"):
-            return "live"
+            return "live", age
         if state in ("stale", "disconnected"):
-            return "stale"
-        return "unknown"
+            return "stale", age
+        return "unknown", age
 
     def list_missions(self, status=None):
         out = []
         for m in self._missions.values():
             rec = _copy(m)
-            rec["telemetry_state"] = self._mission_telemetry_state(
+            rec["telemetry_state"], rec["report_age_seconds"] = self._mission_telemetry_state(
                 rec.get("mission_key") or rec["mission_id"])
             out.append(rec)
         if status:

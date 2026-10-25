@@ -432,23 +432,23 @@ function telemetryBadge(state) {
   return `<span class="hd-card__sub" data-telemetry-state>${esc(label)}</span>`;
 }
 
-// Stall age = how long since the mission last reported a change. Only meaningful
-// when a collector is actually attached (telemetry_state is live/stale); for an
-// UNKNOWN mission (no collector) we say so rather than imply a liveness reading
-// from an absent timestamp.
+// Stall age = the age of the most recent activity report (collector freshness),
+// exposed by the server as report_age_seconds from the same activity store that
+// derives telemetry_state (issue #28). For a no-collector mission (telemetry
+// state unknown) report_age_seconds is null and we say so rather than imply a
+// liveness reading from an absent timestamp or the lifecycle record's updated_at.
 function stallAge(m) {
-  const s = typeof m?.telemetry_state === 'string' ? m.telemetry_state.toLowerCase() : '';
-  if (s === 'unknown' || (!s && !m?.updated_at)) return 'Unknown';  // no collector / no data
-  if (!m?.updated_at) return 'Unknown';
-  return formatDuration(Date.now() - new Date(m.updated_at).getTime());
+  const age = m?.report_age_seconds;
+  if (typeof age !== 'number') return 'Unknown';  // no collector / no freshness data
+  return formatDuration(age * 1000);
 }
 
 function stallHint(m) {
   const s = typeof m?.telemetry_state === 'string' ? m.telemetry_state.toLowerCase() : '';
-  if (s === 'unknown' || (!s && !m?.updated_at)) return 'No collector attached for this mission';
+  if (typeof m?.report_age_seconds !== 'number') return 'No collector attached for this mission';
   if (s === 'stale') return 'Collector connected but has not reported recently';
   if (s === 'live') return 'Collector reporting as expected';
-  return 'Since last reported change';
+  return 'Since the most recent activity report';
 }
 
 function missionSectionNav(key) {

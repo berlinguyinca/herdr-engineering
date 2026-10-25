@@ -10,6 +10,7 @@ to one control-plane entity.
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
 
@@ -452,11 +453,20 @@ class IngestService:
         summary = payload.get("summary")
         if not isinstance(summary, str):
             raise ValueError("summary is required")
+        # A client-supplied finding_id is honoured verbatim; when omitted we derive
+        # a stable id from the finding content so a replayed envelope updates the
+        # original finding in place instead of appending a duplicate (idempotency
+        # of the ingest path, independent of the review's current finding count).
+        finding_id = payload.get("finding_id")
+        if not finding_id:
+            content = "|\n".join([severity, summary, payload.get("detail") or "",
+                                  payload.get("status") or "open"])
+            finding_id = hashlib.sha256(content.encode("utf-8")).hexdigest()[:16]
         return self.repo.add_review_finding(
-            entity_id, severity=payload.get("severity"),
-            summary=payload.get("summary"), detail=payload.get("detail") or "",
+            entity_id, severity=severity,
+            summary=summary, detail=payload.get("detail") or "",
             status=payload.get("status") or "open",
-            finding_id=payload.get("finding_id"),
+            finding_id=finding_id,
         )
 
     def _ingest_pull_request(self, entity_id, event_type, payload) -> dict:

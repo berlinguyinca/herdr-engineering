@@ -380,3 +380,20 @@ def test_ingest_delivery_rejects_invalid_counts():
         svc.ingest({"entity_type": "test_run", "entity_id": "r",
                     "event_type": "test_run.started",
                     "payload": {"passed": "many"}})
+
+
+def test_ingest_review_finding_replay_is_idempotent_without_finding_id():
+    repo = ControlPlaneRepo()
+    svc = make_svc(repo)
+    svc.ingest({"entity_type": "review", "entity_id": "rv-2",
+                "event_type": "review.started",
+                "payload": {"mission_id": "m1", "reviewer": "codex",
+                            "status": "completed", "verdict": "approved"}})
+    finding = {"entity_type": "review_finding", "entity_id": "rv-2",
+               "event_type": "review_finding.added",
+               "payload": {"severity": "blocker", "summary": "crash", "detail": "d"}}
+    svc.ingest({**finding})
+    svc.ingest({**finding})  # replay without a finding_id must not append a duplicate
+    reviews = repo.list_reviews(mission_id="m1")
+    assert len(reviews[0]["findings"]) == 1
+    assert reviews[0]["findings"][0]["summary"] == "crash"
