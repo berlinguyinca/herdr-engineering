@@ -165,7 +165,8 @@ export function mountMissionCatalog(container, client, {tab = 'current', status 
   // A row is patched in place (morph); its <progress> eases from the old value to the new one.
   function updateRow(row,item){
     const bar=row.querySelector('progress'), from=bar?Number(bar.getAttribute('value')):NaN;
-    morph(row,element(item.html));
+    // A focused control the row no longer has (a link that went away) hands focus to the row's title.
+    handOff(morph(row,element(item.html)),()=>row.querySelector('.mc-title'));
     const next=row.querySelector('progress');
     if(next&&next===bar&&rowMotion)easeValue(next,from,Number(next.getAttribute('value')));
   }

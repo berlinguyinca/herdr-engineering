@@ -2,7 +2,7 @@
 import {escapeHtml as esc} from './herdr-web-components/util.js';
 import {formatDuration} from './herdr-web-components/format.js';
 import {recordOutcome,statusOutcome,recordVisibility} from './record-state.js';
-import {patchList,patchText,patchAttr,morph} from './patch.js';
+import {patchList,patchText,patchAttr,morph,handOff} from './patch.js';
 import {animateChanges,skeleton} from './motion.js';
 import { freshnessSources } from './freshness.js';
 
@@ -129,7 +129,7 @@ export function mountSessionsView(container,client,{tab='current'}={}) {
       if(!group){group=document.createElement('div');group.className='ss-group';group.dataset.groupName=name;group.innerHTML=`<h2>${esc(name)}</h2><div data-rows></div>`;}
       if(group!==cursor)panel.insertBefore(group,cursor);else cursor=group.nextElementSibling;
       const list=group.querySelector('[data-rows]');
-      patchList(list,rows.map(e=>({id:e.id,html:compactSessionRow(e)})),{key:item=>item.id,render:item=>item.html,update:(row,item)=>morph(row,element(item.html)),inPlace:true,animate:live});
+      patchList(list,rows.map(e=>({id:e.id,html:compactSessionRow(e)})),{key:item=>item.id,render:item=>item.html,update:(row,item)=>handOff(morph(row,element(item.html)),()=>row.querySelector('[data-session-link]')),inPlace:true,animate:live});
       if(!live)for(const row of list.querySelectorAll('[data-entering]'))row.removeAttribute('data-entering');
     }
   }

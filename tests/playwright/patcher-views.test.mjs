@@ -117,6 +117,19 @@ test('Agents: identical refresh writes nothing; one changed agent rewrites only 
  assert.equal(await page.locator('#ss-host').inputValue(),'beast','host filter survives');
 }));
 
+test('Agents: a focused mission link that disappears from its row hands focus to the row link',async()=>withPage(async(page,base)=>{
+ const state={sessions:[agent('a1',{mission_id:'m1'}),agent('a2')],missions:[{mission_id:'m1',title:'Mission one',host_id:'beast',sessions:['a1']}]};
+ await boot(page,base,'/herd',p=>p==='/api/v1/sessions'?{sessions:structuredClone(state.sessions)}:p==='/api/v1/missions'?{missions:structuredClone(state.missions)}:{});
+ const link=page.locator('[data-session-id="a1"] [data-mission-link]');
+ await until(()=>link.count().then(n=>n===1),'mission link');
+ await link.focus();
+ state.missions=[];
+ await liveRefresh(page,{event_id:'s9',event_type:'SessionUpdated'});
+ await until(()=>link.count().then(n=>n===0),'the stale mission link is gone',3000);
+ assert.equal(await page.evaluate(()=>document.activeElement?.closest('[data-session-id]')?.dataset.sessionId),'a1','focus stays in the row');
+ assert.equal(await page.evaluate(()=>document.activeElement?.hasAttribute('data-session-link')),true,'on its main link');
+}));
+
 // ---------------------------------------------------------------- Services
 const svc=(id,extra={})=>({service_id:id,service_name:`Service ${id}`,status:'healthy',host_id:'beast',port:8000,updated_at:'2026-01-01T00:00:05Z',catalog:{scope:'herdr',project:'alpha'},...extra});
 function servicesApi(state){
