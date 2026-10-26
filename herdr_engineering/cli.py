@@ -749,12 +749,13 @@ def _cmd_cp_feed_pi(args) -> int:
             posted = post_envelopes(url, api_key, envelopes)
         except Exception as exc:
             # One-shot mode reports and exits. Continuous mode survives
-            # transient transport/server failures and credential rotation:
-            # mark an auth rejection so ConfigRefresher refreshes, back off, then
-            # refresh config and retry the same snapshot.
-            if interval <= 0 or refresher is None:
+            # transient transport/server failures and credential rotation: mark
+            # an auth rejection (so ConfigRefresher refreshes when present),
+            # back off, then refresh config and retry the same snapshot. Retry
+            # whenever interval > 0, even without host config (explicit url+key).
+            if interval <= 0:
                 raise
-            if isinstance(exc, IngestAuthRejected):
+            if isinstance(exc, IngestAuthRejected) and refresher is not None:
                 refresher.note_auth_rejected()
             print(f"herdr-eng: feed-pi posting failed ({exc}); retrying",
                   file=sys.stderr)
