@@ -35,7 +35,7 @@ from .host_metrics_store import ENTITY_TYPE as HOST_METRICS_ENTITY
 from .host_metrics_store import STATE_KEYS as HOST_STATE_KEYS
 from .host_metrics_store import HostMetricsStore, clean_metrics, clean_state
 from .host_problems import compute_problems
-from .ids import new_id
+from .ids import new_id, validate_mission_id
 from .inspector import REQUIRED_DURABLE_KINDS, InspectorStore
 from .mission_activity import MissionActivityStore
 from .redact import redact_payload
@@ -72,7 +72,8 @@ def _session_mission_identity(mission_id, source):
         namespace, raw_id = mission_id.split(":", 1)
         if not raw_id or ":" in raw_id or (source != "herdr" and namespace != source):
             raise ValueError("mission identity conflicts with its source")
-        return {"mission_key": mission_id, "mission_source": namespace}
+        return {"mission_key": mission_id,
+                "mission_source": "herdr" if namespace == "herdr-ws" else namespace}
     return {"mission_key": mission_id if source == "herdr" else f"{source}:{mission_id}",
             "mission_source": source}
 
@@ -1212,9 +1213,7 @@ class ControlPlaneRepo:
 
     def upsert_mission(self, mission_id, *, title, purpose="", stage="active",
                        cwd=None, source="herdr", repository_id=None, commit_sha=None):
-        if ":" in source or ":" in mission_id:
-            raise ValueError(
-                "mission source and mission_id must not contain ':'")
+        validate_mission_id(mission_id, source)
         key = mission_id if source == "herdr" else f"{source}:{mission_id}"
         stamp = self._stamp()
         existing = self._missions.get(key)
