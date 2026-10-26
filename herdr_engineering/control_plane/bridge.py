@@ -25,8 +25,15 @@ from .service_catalog import normalize_project, normalize_source_port, track_ava
 # These streams are already represented by dedicated structured stores or
 # bounded adapters. Replaying their unbounded history during web startup makes
 # hydration scale with operational noise (bender currently has >1M service
-# events) and can prevent the HTTP listener from binding at all.
-_STARTUP_EVENT_EXCLUDED_TYPES = ("service", "inspector", "collab")
+# events) and can prevent the HTTP listener from binding at all. The allowlist
+# keeps replay-critical projections while leaving current session/host/service
+# state to their structured tables.
+_STARTUP_EVENT_TYPES = (
+    "mission", "test_run", "build", "review", "review_finding", "pull_request",
+    "token_usage", "resource_usage", "ci_report", "ci_observation", "ci_telemetry",
+    "agent_summary", "host_metrics", "mission_activity", "lineage", "artifact",
+    "custom_model", "llm_key",
+)
 
 
 def _iso(value: Any):
@@ -108,9 +115,9 @@ class PostgresSource(DurableSource):
             "services": [dict(r) for r in await conn.fetch("SELECT * FROM services")],
             "hosts": [dict(r) for r in await conn.fetch("SELECT * FROM hosts")],
             "events": [dict(r) for r in await conn.fetch(
-                f"SELECT * FROM {self._events_table} "
-                "WHERE entity_type NOT IN ('service', 'inspector', 'collab') "
-                "ORDER BY ingest_timestamp, sequence")],
+                f"SELECT * FROM {self._events_table} WHERE entity_type IN ("
+                + ", ".join(repr(kind) for kind in _STARTUP_EVENT_TYPES)
+                + ") ORDER BY ingest_timestamp, sequence")],
         }
 
     def missions(self) -> list[dict]:
