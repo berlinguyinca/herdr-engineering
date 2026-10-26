@@ -240,6 +240,15 @@ def test_analytics(server):
     assert json.loads(body)["total"] == 0
 
 
+def test_analytics_tokens_survives_projectless_ingest_row(server):
+    c, repo = server
+    repo.add_token_usage({"mission_id": "m1", "model": "gpt",
+                          "request_id": "req-np", "input_tokens": 3})
+    status, _, body = c.get("/api/v1/analytics/tokens")
+    assert status == 200
+    assert json.loads(body)["total"]["input_tokens"] == 3
+
+
 def test_analytics_stages_and_usage(server):
     c, repo = server
     mid = repo.create_mission("stage-api")

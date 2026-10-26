@@ -927,3 +927,20 @@ def test_v2_resource_usage_missing_kind_does_not_consume_sequence():
     good = {**bad, "payload": {"mission_id": "M1", "kind": "cpu", "value": 1.0}}
     svc.ingest(good, {"id": "agent", "kind": "agent", "authenticated_by": "api_key"})
     assert repo.usage_analytics(mission_id="pi:M1")["resources"]["cpu"]["total"] == 1.0
+
+
+def test_token_analytics_skips_projectless_ingest_rows():
+    """A mission-scoped token_usage envelope (no legacy project field) must not
+    crash token_analytics — /api/v1/analytics/tokens returns a 200, not a 500."""
+    repo = ControlPlaneRepo()
+    svc = make_svc(repo)
+    svc.ingest({"entity_type": "token_usage", "entity_id": "req-np",
+                "event_type": "token_usage.recorded",
+                "payload": {"mission_id": "m1", "model": "gpt",
+                            "request_id": "req-np", "input_tokens": 3}})
+    a = repo.token_analytics()  # must not raise KeyError on missing 'project'
+    assert a["total"]["input_tokens"] == 3
+    assert a["by_project"] == {}  # not grouped under a legacy project
+    assert a["by_model"]["gpt"]["input_tokens"] == 3
+    # And via the API route it returns 200.
+    assert repo.usage_analytics(mission_id="m1")["tokens"]["total"]["input_tokens"] == 3

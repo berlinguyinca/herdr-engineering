@@ -2119,8 +2119,13 @@ class ControlPlaneRepo:
                         continue
                     seen_requests.add(request_id)
                 _accumulate(total, p)
-                add(by_project, p["project"], p)
-                add(by_model, p["model"], p)
+                # The mission-scoped ingest path may record rows without the legacy
+                # project field; skip/normalize them here so /analytics/tokens never
+                # 500s on a missing key (they still count in total and usage).
+                if p.get("project") is not None:
+                    add(by_project, p["project"], p)
+                if p.get("model") is not None:
+                    add(by_model, p["model"], p)
                 add(by_day, ev["source_timestamp"][:10], p)
                 raw = p.get("session_id") or ev.get("session_id")  # v1 rows: envelope only
                 if not raw:
