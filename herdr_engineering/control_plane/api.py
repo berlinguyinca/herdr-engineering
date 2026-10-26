@@ -1234,7 +1234,8 @@ def _make_handler(server, public=False, operator=False):
             super().send_response(code, message)
 
         def end_headers(self):
-            if hasattr(self, '_request_id'):
+            # Federation deliberately makes off/on refusal responses identical.
+            if hasattr(self, '_request_id') and not self._is_federation_path():
                 self.send_header('X-Request-ID', self._request_id)
                 self.send_header('Server-Timing', f'app;dur={(time.monotonic() - self._request_started) * 1000:.2f}')
             super().end_headers()
@@ -2074,9 +2075,13 @@ def _make_handler(server, public=False, operator=False):
                     return self._json({'artifact_id': parts[4], 'reviews': []})
             if resource == "artifact-jobs" and server.artifact_job_manager is not None:
                 if len(parts) == 5:
-                    job = server.artifact_job_manager.get(parts[4])
+                    job = (self._artifact_call('get_job', parts[4]) if server.artifact_store is not None
+                           else server.artifact_job_manager.get(parts[4]))
+                    if job is None:
+                        return self._json({'error': 'not found'}, 404)
                     if not self._artifact_allowed(job['artifact_id'], 'read'):
                         return self._json({'error': 'not found'}, 404)
+                    server.artifact_job_manager.load([job])
                     return self._json(job)
             if resource == "artifact-reviews" and server.artifact_review_manager is not None:
                 if len(parts) == 5:
@@ -2282,9 +2287,14 @@ def _make_handler(server, public=False, operator=False):
                         base_version_id=body.get("base_version_id"), request=body.get("request") or {},
                         requested_by=self._resource_principal()), 201)
                 if len(parts) == 6 and parts[5] == "cancel":
-                    job = server.artifact_job_manager.get(parts[4])
+                    self._read_json()
+                    job = (self._artifact_call('get_job', parts[4]) if server.artifact_store is not None
+                           else server.artifact_job_manager.get(parts[4]))
+                    if job is None:
+                        return self._json({'error': 'not found'}, 404)
                     if not self._artifact_allowed(job['artifact_id'], 'edit'):
                         return self._deny(403, 'forbidden')
+                    server.artifact_job_manager.load([job])
                     return self._json(server.artifact_job_manager.cancel(parts[4]))
             if resource == "artifact-reviews" and server.artifact_review_manager is not None:
                 if len(parts) == 4:
@@ -2295,12 +2305,12 @@ def _make_handler(server, public=False, operator=False):
                         artifact_id=body.get("artifact_id"), version_id=body.get("version_id"),
                         requested_by=self._resource_principal()), 201)
                 if len(parts) == 6 and parts[5] == "complete":
+                    body = self._read_json() or {}
                     review = server.artifact_review_manager.get(parts[4])
                     if review is None:
                         return self._json({'error': 'not found'}, 404)
                     if not self._artifact_allowed(review['artifact_id'], 'review'):
                         return self._deny(403, 'forbidden')
-                    body = self._read_json() or {}
                     return self._json(server.artifact_review_manager.complete(
                         parts[4], reviewer=self._resource_principal(), decision=body.get("decision"),
                         comments=body.get("comments") or []))
@@ -2314,6 +2324,7 @@ def _make_handler(server, public=False, operator=False):
                         requested_by=self._resource_principal(), audience=body.get("audience"),
                         expires_at=float(body.get("expires_at", 0))), 201)
                 if len(parts) == 6 and parts[5] in {"approve", "revoke"}:
+                    self._read_json()
                     publication = server.publication_controller.get(parts[4])
                     if publication is None:
                         return self._json({'error': 'not found'}, 404)
@@ -2790,6 +2801,18 @@ def _make_handler(server, public=False, operator=False):
             storage_key = ""
             sha256 = ""
             if server.artifact_store is not None:
+                session_record = r.get_session(session_id) if session_id else None
+                mission_record = r.get_mission(mission_id) if mission_id else None
+                if session_id and session_record is None:
+                    return self._json({'error': 'session not found'}, 404)
+                if mission_id and mission_record is None:
+                    return self._json({'error': 'mission not found'}, 404)
+                if session_record is not None and mission_record is None:
+                    linked = session_record.get('mission_key') or session_record.get('mission_id')
+                    mission_record = r.get_mission(linked) if linked else None
+                if session_record is not None or mission_record is not None:
+                    self._artifact_call('ensure_binding_context',
+                                        mission=mission_record, session=session_record)
                 artifact_id = self._artifact_call('register', original_filename=filename,
                     mime_type=mime, data=data, created_by=owner,
                     mission_id=mission_id, session_id=session_id)

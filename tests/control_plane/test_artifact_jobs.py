@@ -60,3 +60,42 @@ def test_execute_renders_and_commits_outputs_through_injected_boundaries():
     assert result["status"] == "completed"
     assert result["result_version_id"] == "v2"
     assert committed[0]["base_version_id"] == "v1"
+
+
+@pytest.mark.parametrize("action", ["claimed", "completed", "failed", "cancelled"])
+def test_persistence_rejection_keeps_manager_at_previous_state(action):
+    manager = ArtifactJobManager()
+    job = manager.submit(profile="web", artifact_id="a", base_version_id=None,
+                         request={}, requested_by="owner")
+    if action == "completed":
+        manager.claim(job["job_id"], host_id="host-a")
+    before = manager.get(job["job_id"])
+
+    def reject(event, candidate):
+        assert event == action
+        assert manager.get(job["job_id"]) == before
+        raise RuntimeError("stale durable state")
+
+    manager.on_change = reject
+    with pytest.raises(RuntimeError, match="stale durable state"):
+        if action == "claimed":
+            manager.claim(job["job_id"], host_id="host-a")
+        elif action == "completed":
+            manager.complete(job["job_id"], result_version_id="v", outputs=[], validation={})
+        elif action == "failed":
+            manager.fail(job["job_id"], error="failed")
+        else:
+            manager.cancel(job["job_id"])
+    assert manager.get(job["job_id"]) == before
+
+
+def test_submit_persistence_failure_does_not_cache_or_enqueue_job():
+    queued = []
+    def reject(action, job):
+        raise RuntimeError("database unavailable")
+    manager = ArtifactJobManager(on_change=reject, enqueue=queued.append)
+    with pytest.raises(RuntimeError, match="database unavailable"):
+        manager.submit(profile="web", artifact_id="a", base_version_id=None,
+                       request={}, requested_by="owner")
+    assert manager._jobs == {}
+    assert queued == []

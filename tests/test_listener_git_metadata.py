@@ -3,6 +3,8 @@ import os
 import subprocess
 from unittest.mock import Mock
 
+import pytest
+
 import herdr_engineering.fabric_agent as fa
 
 
@@ -46,6 +48,33 @@ def test_unowned_listener_never_probes_git_or_cwd(monkeypatch):
     assert reader.read(300, None) == {}
     assert reader.read(300, {'kind': 'system_unit'}) == {}
     cwd.assert_not_called()
+
+
+def test_listener_git_metadata_handles_high_numbered_pipe(tmp_path, monkeypatch):
+    fcntl = pytest.importorskip('fcntl')
+    resource = pytest.importorskip('resource')
+    if resource.getrlimit(resource.RLIMIT_NOFILE)[0] <= 1024:
+        pytest.skip('process descriptor limit cannot exercise descriptors above select FD_SETSIZE')
+    repo = tmp_path / 'repo'
+    sha = checkout(repo, 'https://github.com/org/app.git')
+    proof = listener(monkeypatch, repo)
+    popen = subprocess.Popen
+    descriptors = []
+
+    def high_pipe(*args, **kwargs):
+        process = popen(*args, **kwargs)
+        descriptor = fcntl.fcntl(process.stdout.fileno(), fcntl.F_DUPFD, 1024)
+        os.set_inheritable(descriptor, False)
+        process.stdout.close()
+        process.stdout = os.fdopen(descriptor, 'rb')
+        descriptors.append(descriptor)
+        return process
+
+    monkeypatch.setattr(fa.subprocess, 'Popen', high_pipe)
+    assert fa.ListenerGitMetadata().read(300, proof, timeout=1) == {
+        'repository_id': 'github.com/org/app', 'commit_sha': sha,
+    }
+    assert len(descriptors) == 2 and all(descriptor >= 1024 for descriptor in descriptors)
 
 
 def test_missing_git_or_non_checkout_is_optional_metadata(tmp_path, monkeypatch):

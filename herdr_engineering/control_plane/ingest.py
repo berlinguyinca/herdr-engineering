@@ -387,6 +387,8 @@ class IngestService:
         elif entity_type == "pull_request":
             self._delivery_mission_key(payload.get("mission_id"), source)
         elif entity_type == "token_usage":
+            if event_type not in {'token_usage.recorded', 'TokenUsageRecorded'}:
+                raise ValueError('token usage event type is not accepted')
             if not isinstance(payload, dict):
                 raise ValueError("token usage must be an object")
             for k in ("input_tokens", "output_tokens", "reasoning_tokens",

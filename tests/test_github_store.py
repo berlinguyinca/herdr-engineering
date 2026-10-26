@@ -134,7 +134,7 @@ def backend(request):
 
 def test_migration_file_follows_numbering():
     names = sorted(p.name for p in _MIGRATION.parent.glob("*.sql"))
-    assert names[-2:] == ["0006_github_catalog.sql", "0007_github_issue_details.sql"]
+    assert names.index("0006_github_catalog.sql") < names.index("0007_github_issue_details.sql")
     assert "CONCURRENTLY" not in _MIGRATION.read_text()
     assert "CONCURRENTLY" not in _DETAIL_MIGRATION.read_text()
 

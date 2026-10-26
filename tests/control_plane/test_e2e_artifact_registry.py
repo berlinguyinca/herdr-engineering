@@ -77,7 +77,13 @@ def test_upload_catalog_acl_and_bytes_survive_http_server_restart():
             server.wait_until_ready()
             try:
                 if not restart:
-                    status, content = call(server, 'POST', '/api/v1/artifacts?filename=durable.txt', raw=b'durable bytes')
+                    # Runtime entities may exist only in the event projection;
+                    # production does not require pre-seeded SQL session rows.
+                    mission = server.repo.create_mission('Artifact source')
+                    session = server.repo.create_session(mission_id=mission)
+                    status, content = call(server, 'POST',
+                        f'/api/v1/artifacts?filename=durable.txt&session_id={session}&mission_id={mission}',
+                        raw=b'durable bytes')
                     assert status == 200, content
                     artifact_id = json.loads(content)['artifact_id']
                 status, listing = call(server, 'GET', '/api/v1/artifacts')

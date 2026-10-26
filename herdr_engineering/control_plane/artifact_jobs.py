@@ -39,49 +39,43 @@ class ArtifactJobManager:
                "result_version_id": None, "outputs": [], "validation": {},
                "error": None, "created_at": self.now(), "started_at": None,
                "completed_at": None}
-        self._jobs[job_id] = job
-        if self.on_change:
-            self.on_change("created", dict(job))
+        self._persist("created", job)
         if self.enqueue is not None:
             self.enqueue(dict(job))
         return dict(job)
 
     def claim(self, job_id: str, *, host_id: str) -> dict:
-        job = self._job(job_id)
+        job = dict(self._job(job_id))
         self._transition(job, {"queued"}, "running")
         job["assigned_host_id"] = host_id
         job["started_at"] = self.now()
-        if self.on_change:
-            self.on_change("claimed", dict(job))
+        self._persist("claimed", job)
         return dict(job)
 
     def complete(self, job_id: str, *, result_version_id: str,
                  outputs: list[dict], validation: dict) -> dict:
-        job = self._job(job_id)
+        job = dict(self._job(job_id))
         self._transition(job, {"running"}, "completed")
         job["result_version_id"] = result_version_id
         job["outputs"] = list(outputs)
         job["validation"] = dict(validation)
         job["completed_at"] = self.now()
-        if self.on_change:
-            self.on_change("completed", dict(job))
+        self._persist("completed", job)
         return dict(job)
 
     def fail(self, job_id: str, *, error: str) -> dict:
-        job = self._job(job_id)
+        job = dict(self._job(job_id))
         self._transition(job, {"queued", "running"}, "failed")
         job["error"] = str(error)
         job["completed_at"] = self.now()
-        if self.on_change:
-            self.on_change("failed", dict(job))
+        self._persist("failed", job)
         return dict(job)
 
     def cancel(self, job_id: str) -> dict:
-        job = self._job(job_id)
+        job = dict(self._job(job_id))
         self._transition(job, {"queued", "running"}, "cancelled")
         job["completed_at"] = self.now()
-        if self.on_change:
-            self.on_change("cancelled", dict(job))
+        self._persist("cancelled", job)
         return dict(job)
 
     def execute(self, job_id: str, *, host_id: str, renderer, commit) -> dict:
@@ -107,6 +101,12 @@ class ArtifactJobManager:
     def load(self, jobs: list[dict]) -> None:
         for job in jobs:
             self._jobs[job["job_id"]] = dict(job)
+
+    def _persist(self, action: str, job: dict) -> None:
+        # A rejected durable CAS must leave the previous local snapshot intact.
+        if self.on_change:
+            self.on_change(action, dict(job))
+        self._jobs[job["job_id"]] = job
 
     def _job(self, job_id: str) -> dict:
         if job_id not in self._jobs:

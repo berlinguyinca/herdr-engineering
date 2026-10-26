@@ -123,13 +123,13 @@ def test_job_persistence_converts_epoch_and_reloaded_iso_timestamps():
     job = {"job_id": "job_1", "artifact_id": "artifact_1", "base_version_id": None,
            "profile": "web", "request": {}, "status": "completed", "requested_by": "owner",
            "started_at": 1767225600.0, "completed_at": "2026-01-01T00:00:01+00:00"}
+    _run(store.record_job_event("claimed", {**job, "status": "running"}))
+    assert conn.calls[-1][1][1] == datetime(2026, 1, 1, tzinfo=UTC)
     _run(store.record_job_event("completed", job))
-    args = conn.calls[-1][1]
-    assert args[-2] == datetime(2026, 1, 1, tzinfo=UTC)
-    assert args[-1] == datetime(2026, 1, 1, 0, 0, 1, tzinfo=UTC)
-    job.update(started_at=None, completed_at=None)
+    assert conn.calls[-1][1][1] == datetime(2026, 1, 1, 0, 0, 1, tzinfo=UTC)
+    job.update(status="queued", started_at=None, completed_at=None)
     _run(store.record_job_event("created", job))
-    assert conn.calls[-1][1][-2:] == (None, None)
+    assert conn.calls[-1][1][-1] is None
 
 
 def test_acl_persistence_converts_epoch_expiry_and_preserves_datetime():
@@ -144,3 +144,54 @@ def test_acl_persistence_converts_epoch_expiry_and_preserves_datetime():
     grant["expires_at"] = datetime(2026, 2, 1, tzinfo=UTC)
     _run(store.record_acl_event("grant", grant))
     assert conn.calls[-1][1][3] is grant["expires_at"]
+
+
+
+def test_binding_context_uses_observed_canonical_records_without_host_fabrication():
+    from datetime import UTC, datetime
+
+    conn = _JobPersistenceConn()
+    store = artifacts.ArtifactStore(conn, None)
+    mission = {"mission_id": "short", "mission_key": "autospec:short", "title": "Observed",
+               "status": "blocked", "stage": "testing", "created_at": 1767225600.0,
+               "updated_at": "2026-01-01T00:00:01+00:00"}
+    session = {"session_id": "session_seen", "mission_id": "short",
+               "mission_key": "autospec:short", "host_id": "event_only_host", "status": "idle",
+               "created_at": 1767225600.0, "updated_at": "2026-01-01T00:00:01+00:00"}
+    _run(store.ensure_binding_context(mission=mission, session=session))
+    assert len(conn.calls) == 2
+    mission_sql, mission_args = conn.calls[0]
+    session_sql, session_args = conn.calls[1]
+    assert "ON CONFLICT (mission_id) DO NOTHING" in mission_sql
+    assert "ON CONFLICT (session_id) DO NOTHING" in session_sql
+    assert mission_args[0] == "autospec:short"
+    assert "blocked" in mission_args
+    assert datetime(2026, 1, 1, tzinfo=UTC) in mission_args
+    assert session_args[:2] == ("session_seen", "autospec:short")
+    assert "event_only_host" not in session_args
+    assert "idle" in session_args
+    assert datetime(2026, 1, 1, 0, 0, 1, tzinfo=UTC) in session_args
+    conn.calls.clear()
+    _run(store.ensure_binding_context())
+    assert conn.calls == []
+
+
+def test_load_reviews_restores_comments_from_sql_findings_for_manager_restart():
+    from herdr_engineering.control_plane.artifact_reviews import ArtifactReviewManager
+
+    class Conn:
+        async def fetch(self, sql):
+            assert sql == "SELECT * FROM artifact_reviews"
+            return [
+                {"review_id": "review_done", "artifact_id": "artifact_1", "version_id": "v1",
+                 "state": "approved", "findings": '["keep this note", "and this one"]'},
+                {"review_id": "review_requested", "artifact_id": "artifact_1", "version_id": "v1",
+                 "state": "requested", "findings": []},
+            ]
+
+    store = artifacts.ArtifactStore(Conn(), None)
+    manager = ArtifactReviewManager()
+    manager.load(_run(store.load_reviews()))
+    assert manager.get("review_done")["comments"] == ["keep this note", "and this one"]
+    assert manager.get("review_requested")["comments"] == []
+    assert manager.list_for_artifact("artifact_1")[0]["comments"] == ["keep this note", "and this one"]

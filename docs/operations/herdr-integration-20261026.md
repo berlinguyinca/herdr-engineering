@@ -60,4 +60,26 @@ be verified through actual authentication, without exposing credentials.
 - Full Python suite is running; completion is not yet established.
 - Integration has not been deployed.
 
+## Full-history benchmark
+
+The read-only replay against the actual durable database completed in 212.754
+seconds with a 14,644.2 MiB peak RSS. It recovered 70 missions, 389 sessions,
+3,976 services, four hosts, two artifacts, and all 1,788,611 visible events.
+Service and mission projections therefore cannot be omitted merely because the
+corresponding structured tables are empty. Cold-start cost remains a release
+concern and the deployment readiness deadline must accommodate measured replay.
+
+## Subsequent verification
+
+- Initial broad Python run: 7,043 passed, 41 failed, 45 skipped, two xfailed.
+  This ran while reconciliation was active; failures are being repaired and
+  rechecked against the final source. It is not a green release gate.
+- Current UI checks: 667 client/component tests, 13 visual checks and ten fabric
+  browser checks passed. Desktop/mobile screenshots cover light/dark themes.
+- Real isolated Postgres checks: migrations and replay passed; durable artifact
+  uploads, ACLs and bytes survived an HTTP-server restart.
+- Real Postgres testing found a heartbeat renaming bug and missing structured
+  binding rows for artifact contexts; these are addressed through observed data,
+  without fabricated mission/session identities.
+
 The active goal remains incomplete until every acceptance gate is verified.

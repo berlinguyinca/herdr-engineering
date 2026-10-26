@@ -861,7 +861,8 @@ def test_v1_records_and_analytics_shape_are_unchanged():
     out = repo.token_analytics()
     assert set(out) == {"total", "by_project", "by_model", "by_day", "by_session"}
     assert out["total"] == {"requests": 4, "input_tokens": 4, "output_tokens": 6,
-                            "reasoning_tokens": 0, "cache_read_tokens": 0, "failed": 1}
+                            "reasoning_tokens": 0, "cache_read_tokens": 0,
+                            "cache_write_tokens": 0, "failed": 1}
     assert set(out["by_model"]) == {"m", "m2"}
     assert set(out["by_model"]["m"]) == set(out["total"])
 
