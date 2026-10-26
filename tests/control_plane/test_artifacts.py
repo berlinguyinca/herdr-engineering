@@ -82,3 +82,65 @@ def test_download_rejects_tampered_bytes():
         raise AssertionError("expected IntegrityError")
     except artifacts.IntegrityError:
         pass
+
+
+class _JobPersistenceConn:
+    def __init__(self):
+        self.rows = {}
+        self.calls = []
+
+    async def fetchrow(self, sql, job_id):
+        assert "FROM artifact_build_jobs WHERE job_id=$1" in sql
+        return self.rows.get(job_id)
+
+    async def execute(self, sql, *args):
+        self.calls.append((sql, args))
+        return "UPDATE 1"
+
+
+def test_get_job_reads_current_durable_state_and_normalizes_json():
+    from datetime import UTC, datetime
+
+    conn = _JobPersistenceConn()
+    store = artifacts.ArtifactStore(conn, None)
+    assert _run(store.get_job("missing")) is None
+    conn.rows["job_1"] = {"job_id": "job_1", "status": "queued", "request": '{"source":"hi"}'}
+    assert _run(store.get_job("job_1"))["status"] == "queued"
+    conn.rows["job_1"].update(status="completed", result_version_id="version_2",
+                             completed_at=datetime(2026, 1, 1, tzinfo=UTC))
+    job = _run(store.get_job("job_1"))
+    assert job["status"] == "completed"
+    assert job["result_version_id"] == "version_2"
+    assert job["request"] == {"source": "hi"}
+    assert job["completed_at"] == "2026-01-01T00:00:00+00:00"
+
+
+def test_job_persistence_converts_epoch_and_reloaded_iso_timestamps():
+    from datetime import UTC, datetime
+
+    conn = _JobPersistenceConn()
+    store = artifacts.ArtifactStore(conn, None)
+    job = {"job_id": "job_1", "artifact_id": "artifact_1", "base_version_id": None,
+           "profile": "web", "request": {}, "status": "completed", "requested_by": "owner",
+           "started_at": 1767225600.0, "completed_at": "2026-01-01T00:00:01+00:00"}
+    _run(store.record_job_event("completed", job))
+    args = conn.calls[-1][1]
+    assert args[-2] == datetime(2026, 1, 1, tzinfo=UTC)
+    assert args[-1] == datetime(2026, 1, 1, 0, 0, 1, tzinfo=UTC)
+    job.update(started_at=None, completed_at=None)
+    _run(store.record_job_event("created", job))
+    assert conn.calls[-1][1][-2:] == (None, None)
+
+
+def test_acl_persistence_converts_epoch_expiry_and_preserves_datetime():
+    from datetime import UTC, datetime
+
+    conn = _JobPersistenceConn()
+    store = artifacts.ArtifactStore(conn, None)
+    grant = {"artifact_id": "artifact_1", "principal_id": "owner", "permissions": ["read"],
+             "expires_at": 1767225600.0}
+    _run(store.record_acl_event("grant", grant))
+    assert conn.calls[-1][1][3] == datetime(2026, 1, 1, tzinfo=UTC)
+    grant["expires_at"] = datetime(2026, 2, 1, tzinfo=UTC)
+    _run(store.record_acl_event("grant", grant))
+    assert conn.calls[-1][1][3] is grant["expires_at"]

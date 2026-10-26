@@ -18,6 +18,8 @@ import threading
 from collections.abc import Callable
 from typing import Any
 
+from .envelope import ENVELOPE_ONLY_TYPES
+from .events import V2_COLUMNS
 from .service_catalog import normalize_project, normalize_source_port, track_availability
 
 
@@ -94,14 +96,39 @@ class PostgresSource(DurableSource):
             import asyncpg
             self._conn = await asyncpg.connect(self._dsn)
         conn = self._conn
-        return {
+        use_cursor = callable(getattr(conn, "cursor", None)) and callable(getattr(conn, "transaction", None))
+        if use_cursor:
+            # Entity rows and the complete event log must share one snapshot.
+            # asyncpg cursors require a transaction; keep all work on our loop.
+            async with conn.transaction(isolation="repeatable_read", readonly=True):
+                return await self._fetch_snapshot(use_cursor=True)
+        # Lightweight fetch-only connections remain supported by the bridge tests.
+        return await self._fetch_snapshot(use_cursor=False)
+
+    async def _fetch_snapshot(self, *, use_cursor: bool) -> dict:
+        conn = self._conn
+        snapshot = {
             "missions": [dict(r) for r in await conn.fetch("SELECT * FROM missions")],
             "sessions": [dict(r) for r in await conn.fetch("SELECT * FROM sessions")],
             "services": [dict(r) for r in await conn.fetch("SELECT * FROM services")],
             "hosts": [dict(r) for r in await conn.fetch("SELECT * FROM hosts")],
-            "events": [dict(r) for r in await conn.fetch(
-                f"SELECT * FROM {self._events_table} ORDER BY ingest_timestamp, sequence")],
         }
+        query = f"SELECT * FROM {self._events_table} ORDER BY ingest_timestamp, sequence"
+        if use_cursor:
+            events = []
+            async for row in conn.cursor(query, prefetch=1000):
+                event = dict(row)
+                # Decode while each bounded batch is alive so the complete raw
+                # JSON text never coexists with the complete decoded replay.
+                event["payload"] = _ev_payload(event)
+                for name in ("actor", "evidence_refs"):
+                    if name in event:
+                        event[name] = _v2_value(name, event[name])
+                events.append(event)
+        else:
+            events = [dict(row) for row in await conn.fetch(query)]
+        snapshot["events"] = events
+        return snapshot
 
     def missions(self) -> list[dict]:
         return self._load()["missions"]
@@ -116,11 +143,30 @@ class PostgresSource(DurableSource):
         return self._load()["hosts"]
 
     def events(self) -> list[dict]:
-        return self._load()["events"]
+        if "events" not in self._load():
+            # load_into consumes the heavy event cache. Explicit later event
+            # reads get a fresh complete snapshot, never an empty placeholder.
+            self._cache = self._run(self._fetch_all())
+        return self._cache["events"]
+
+    def take_events(self) -> list[dict]:
+        """Transfer event-row ownership to replay; retain cheap resource reads."""
+        self.events()
+        return self._cache.pop("events")
 
 
-def _rebuild_events(rows: list[dict]) -> tuple[dict, list]:
-    """Fold fabric_events rows into repo's {stream: [event]} + chronological order."""
+def _v2_value(name: str, value: Any) -> Any:
+    """Envelope v2 column from a fabric_events row (jsonb arrives as str)."""
+    if name in ("actor", "evidence_refs") and isinstance(value, str):
+        try:
+            return json.loads(value)
+        except ValueError:
+            return None
+    return value
+
+
+def _rebuild_events(rows: list[dict], *, reuse: bool = False) -> tuple[dict, list]:
+    """Fold rows into streams/order; reuse only source-owned, transferred rows."""
     streams: dict = {}
     order: list = []
     for row in rows:
@@ -130,7 +176,7 @@ def _rebuild_events(rows: list[dict]) -> tuple[dict, list]:
         key = f"{etype}|{eid}"
         stream = streams.setdefault(key, [])
         seq = int(row.get("sequence", len(stream)))
-        stream.append({
+        event = {
             "event_id": row.get("event_id"),
             "schema_version": row.get("schema_version") or 1,
             "source_timestamp": _iso(row.get("source_timestamp")),
@@ -139,9 +185,17 @@ def _rebuild_events(rows: list[dict]) -> tuple[dict, list]:
             "mission_id": row.get("mission_id"),
             "session_id": row.get("session_id"),
             "sequence": seq, "event_type": row.get("event_type"),
-            "payload": row.get("payload") or {},
-        })
-        order.append((etype, eid, seq))
+            "payload": _ev_payload(row),     # asyncpg yields jsonb as str; every consumer expects a dict
+            **{name: _v2_value(name, row.get(name))
+               for name in V2_COLUMNS if row.get(name) is not None},
+        }
+        if reuse:
+            row.clear()
+            row.update(event)
+            event = row
+        stream.append(event)
+        if not (row.get("source_sequence") is not None and etype in ENVELOPE_ONLY_TYPES):
+            order.append((etype, eid, seq))
     for stream in streams.values():
         stream.sort(key=lambda e: e["sequence"])
     return streams, order
@@ -181,10 +235,18 @@ def _reconstruct_from_events(streams: dict) -> tuple[dict, dict, dict, dict, dic
         et, eid = ev.get("entity_type"), ev.get("entity_id")
         if not et or not eid:
             continue
+        if ev.get("source_sequence") is not None and et in ENVELOPE_ONLY_TYPES:
+            continue  # envelope-only row; the handler's own events rebuild state
         ts = _iso(ev.get("source_timestamp"))
         p = _ev_payload(ev)
         etype = ev.get("event_type") or ""
         if et == "host":
+            if etype == "HostPolicyChanged":
+                # Policy edits are not evidence that the host is alive.
+                host = hosts.get(eid)
+                if host is not None:
+                    host["scheduler_policy"] = p
+                continue
             h = hosts.setdefault(eid, {
                 "host_id": eid, "host_name": None, "tailnet_ip": None,
                 "cpu": None, "mem": None, "status": "healthy",
@@ -198,11 +260,21 @@ def _reconstruct_from_events(streams: dict) -> tuple[dict, dict, dict, dict, dic
                 h["cpu"] = p["cpu"]
             if p.get("mem") is not None:
                 h["mem"] = p["mem"]
-            h["status"] = "unavailable" if "unavailable" in etype.lower() else "healthy"
+            if isinstance(p.get("inventory"), dict):
+                h["inventory"] = {**p["inventory"], "collected_at": ts}
+            for key in ("host_uid", "aliases", "platform", "scheduler_owned", "scheduler_trusted",
+                        "scheduler_policy", "scheduler_capacity"):
+                if key in p:
+                    h[key] = p[key]
+            h["status"] = "unavailable" if "unavailable" in etype.lower() else p.get("status", "healthy")
+            h["last_seen"] = ts
             h["updated_at"] = ts
         elif et == "mission":
+            source = p.get("source") or (eid.split(":", 1)[0] if ":" in eid else "herdr")
+            mission_id = eid.removeprefix(source + ":") if source != "herdr" else eid
             m = missions.setdefault(eid, {
-                "mission_id": eid, "title": eid, "purpose": "",
+                "mission_id": mission_id, "mission_key": eid, "source": source,
+                "title": eid, "purpose": "",
                 "stage": "active", "status": "active", "created_at": ts,
                 "updated_at": ts, "sessions": [], "cwd": None,
             })
@@ -212,6 +284,9 @@ def _reconstruct_from_events(streams: dict) -> tuple[dict, dict, dict, dict, dic
                 m["purpose"] = p["purpose"]
             if p.get("cwd"):
                 m["cwd"] = p["cwd"]
+            for field in ("repository_id", "commit_sha"):
+                if field in p:
+                    m[field] = p[field]
             if etype == "MissionStageChanged" and p.get("to"):
                 m["stage"] = m["status"] = p["to"]
             elif p.get("stage"):
@@ -237,8 +312,10 @@ def _reconstruct_from_events(streams: dict) -> tuple[dict, dict, dict, dict, dic
                 if p.get(k):
                     s[k] = p[k]
             for k in ("pane_id", "terminal_id", "herdr_session", "machine", "agent_session",
-                      "revision", "interactive_ready", "launch_pending", "state_change_seq"):
-                if p.get(k) is not None:
+                      "revision", "interactive_ready", "launch_pending", "state_change_seq",
+                      "repository_id", "commit_sha", "mission_key", "mission_source",
+                      "transcript", "parent_session_id", "name", "runtime"):
+                if p.get(k) is not None or (k == "commit_sha" and k in p):
                     s[k] = p[k]
             # Command receipts are transport state, never observed agent state.
             if etype in {"SessionStarted", "SessionUpdated"} and p.get("status"):
@@ -256,16 +333,30 @@ def _reconstruct_from_events(streams: dict) -> tuple[dict, dict, dict, dict, dic
                 "original_filename": None, "mime_type": None,
                 "size_bytes": 0, "sha256": None, "storage_key": None,
                 "status": "available", "materializations": 0,
+                "artifact_type": "other",
                 "created_at": ts, "updated_at": ts,
             })
             for k in ("session_id", "mission_id", "mime_type", "size_bytes",
-                      "sha256", "storage_key"):
+                      "sha256", "storage_key", "artifact_type", "created_by"):
                 if p.get(k):
                     a[k] = p[k]
             if p.get("filename"):
                 a["original_filename"] = p["filename"]
             a["updated_at"] = ts
         elif et == "service":
+            if etype == "ServiceRetired":
+                # An operator action, not a report: it must not refresh updated_at.
+                svc = services.setdefault(eid, {"service_id": eid, "created_at": ts, "updated_at": ts})
+                svc["retired_at"] = p.get("retired_at") or ts
+                continue
+            if etype == "ServiceMetadataObserved":
+                svc = services.setdefault(eid, {"service_id": eid,
+                    "created_at": p.get("service_created_at"), "updated_at": p.get("service_updated_at")})
+                for key in ("host_id", "source_port", "ownership", "session_id", "verified_origin",
+                            "repository_id", "commit_sha", "listener_identity", "metadata_observation", "metadata_updated_at"):
+                    if key in p:
+                        svc[key] = p[key]
+                continue
             svc = services.setdefault(eid, {
                 "service_id": eid, "service_name": eid, "host_id": None,
                 "port": 0, "session_id": None, "route": None,
@@ -279,8 +370,18 @@ def _reconstruct_from_events(streams: dict) -> tuple[dict, dict, dict, dict, dic
                 svc["service_name"] = p["service_name"]
             if p.get("port") is not None:
                 svc["port"] = p["port"]
-            if p.get("session_id") or ev.get("session_id"):
-                svc["session_id"] = p.get("session_id") or ev["session_id"]
+            if "session_id" in p:
+                svc["session_id"] = p["session_id"]
+            elif ev.get("session_id"):
+                svc["session_id"] = ev["session_id"]
+            if "ownership" in p:
+                svc["ownership"] = p["ownership"]
+            if "verified_origin" in p:
+                svc["verified_origin"] = p["verified_origin"]
+            for field in ("repository_id", "commit_sha", "listener_identity", "metadata_observation", "metadata_updated_at",
+                          "discovery_source", "endpoint_scope"):
+                if field in p:
+                    svc[field] = p[field]
             if p.get("route"):
                 svc["route"] = p["route"]
             if p.get("description"):
@@ -299,10 +400,10 @@ def _reconstruct_from_events(streams: dict) -> tuple[dict, dict, dict, dict, dic
                 svc["status"] = p["status"]
             svc["status"] = "unavailable" if "unavailable" in etype.lower() \
                 else svc["status"]
-            svc["url"] = svc["route"] or f"http://{svc['host_id']}:{svc['port']}"
+            svc["url"] = None if svc.get("endpoint_scope") == "local_only" else (svc["route"] or f"http://{svc['host_id']}:{svc['port']}")
             svc["updated_at"] = ts
     for sid, s in sessions.items():
-        mid = s.get("mission_id")
+        mid = s.get("mission_key", s.get("mission_id"))
         if mid and mid in missions and sid not in missions[mid]["sessions"]:
             missions[mid]["sessions"].append(sid)
     return missions, sessions, hosts, services, artifacts
@@ -314,6 +415,9 @@ def load_into(repo, source: DurableSource) -> dict:
     Designed for a fresh repo at server startup: replaces all structured state
     with the durable view so the API/UI read exactly what Postgres holds.
     """
+    if isinstance(source, PostgresSource):
+        # Refresh a previously consumed snapshot BEFORE reading its tables.
+        source.events()
     missions: dict = {}
     for row in source.missions():
         mid = row["mission_id"]
@@ -356,11 +460,16 @@ def load_into(repo, source: DurableSource) -> dict:
         services[svcid] = {
             "service_id": svcid, "service_name": row.get("service_name"),
             "host_id": row.get("host_id"), "port": row.get("port"),
-            "session_id": row.get("session_id"),
+            "session_id": row.get("session_id"), "ownership": row.get("ownership"),
+            "repository_id": row.get("repository_id"), "commit_sha": row.get("commit_sha"),
+            "verified_origin": row.get("verified_origin"), "metadata_updated_at": row.get("metadata_updated_at"),
+            "metadata_observation": row.get("metadata_observation"), "listener_identity": row.get("listener_identity"),
+            "source_port": row.get("source_port"), "discovery_source": row.get("discovery_source"),
+            "endpoint_scope": row.get("endpoint_scope"),
             "status": row.get("status") or "healthy",
             "created_at": _iso(row.get("created_at")),
             "updated_at": _iso(row.get("updated_at") or row.get("created_at")),
-            "url": f"http://{row.get('host_id')}:{row.get('port')}",
+            "url": None if row.get("endpoint_scope") == "local_only" else f"http://{row.get('host_id')}:{row.get('port')}",
         }
 
     hosts: dict = {}
@@ -374,7 +483,10 @@ def load_into(repo, source: DurableSource) -> dict:
             "updated_at": _iso(row.get("updated_at") or row.get("created_at")),
         }
 
-    events, event_order = _rebuild_events(source.events())
+    if isinstance(source, PostgresSource):
+        events, event_order = _rebuild_events(source.take_events(), reuse=True)
+    else:
+        events, event_order = _rebuild_events(source.events())
 
     # Reconstruct the ingestion-managed entities from the event log so durable
     # events (the only thing the write-through sink persists) survive restart.
@@ -412,7 +524,18 @@ def load_into(repo, source: DurableSource) -> dict:
             event_is_newer = False
         had_since = "unavailable_since" in base
         row_since = base.get("unavailable_since")
+        try:
+            metadata_is_newer = bool(s.get("metadata_updated_at") and (
+                not base.get("metadata_updated_at") or
+                _dt.datetime.fromisoformat(s["metadata_updated_at"]) >= _dt.datetime.fromisoformat(base["metadata_updated_at"])))
+        except (TypeError, ValueError):
+            metadata_is_newer = False
         _overlay(base, s)
+        if metadata_is_newer:
+            for key in ("ownership", "session_id", "verified_origin", "repository_id", "commit_sha",
+                        "listener_identity", "metadata_observation", "metadata_updated_at"):
+                if key in s:
+                    base[key] = s[key]
         if not event_is_newer:
             if had_since:
                 base["unavailable_since"] = row_since
@@ -433,8 +556,12 @@ def load_into(repo, source: DurableSource) -> dict:
     artifacts: dict = {}
     for aid, a in rartifacts.items():
         artifacts[aid] = a
+    # Rebuild membership after overlaying event-proven session bindings. A
+    # stale structured row must not leave an association in another namespace.
+    for mission in missions.values():
+        mission["sessions"] = []
     for sid, s in sessions.items():
-        mid = s.get("mission_id")
+        mid = s.get("mission_key", s.get("mission_id"))
         if mid in missions and sid not in missions[mid]["sessions"]:
             missions[mid]["sessions"].append(sid)
 

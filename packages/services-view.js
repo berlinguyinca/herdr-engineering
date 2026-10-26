@@ -4,6 +4,7 @@ import { reportFreshness } from './record-state.js';
 import { formatTimestamp, formatDuration } from './herdr-web-components/format.js';
 import { snapshotText, animateChanges } from './motion.js';
 import { patchText } from './patch.js';
+import './freshness.js';
 
 const metadataObservation = service => service.catalog?.metadata_observation ?? service.metadata_observation;
 const localOnly = service => service.endpoint_scope === 'local_only' || service.catalog?.endpoint_scope === 'local_only';
@@ -157,8 +158,12 @@ export function renderServiceDetails(s) {
 }
 
 // Keep an open detail page honest even when the provider stops updating.
-export function mountServiceDetails(root, client, initial) {
+export function mountServiceDetails(page, client, initial) {
   let service=initial, disposed=false, controller=null, signature='', error='';
+  // The chip sits above the detail body, which is redrawn whenever the report changes.
+  page.innerHTML='<div class="hd-live-head"><herdr-freshness interval="30000"></herdr-freshness></div><div data-service-body></div>';
+  const chip=page.querySelector('herdr-freshness'),root=page.querySelector('[data-service-body]');
+  chip.touch(true);
   function draw() {
     if(disposed)return;
     const next=JSON.stringify([service,serviceState(service)]);
@@ -188,9 +193,9 @@ export function mountServiceDetails(root, client, initial) {
       if(disposed||request.signal.aborted)return;
       const found=Array.isArray(data?.services) && data.services.find(item=>item?.service_id===service.service_id);
       if(!found)throw new Error('Service report unavailable');
-      service=found;error='';
-    } catch {
-      if(!disposed)error='Could not refresh this service. Showing its last received report.';
+      service=found;error='';chip.touch(true);
+    } catch (failure) {
+      if(!disposed){error='Could not refresh this service. Showing its last received report.';chip.touch(false,request.signal.aborted?'timed out':failure?.message||'request failed');}
     } finally {clearTimeout(timeout);controller=null;if(!disposed)draw();}
   }
   function visibility(){if(document.hidden)controller?.abort();else{draw();refresh();}}
@@ -207,7 +212,7 @@ export function mountServices(root, client, initial, {showAll = false, status, s
   let pending = false;
   const state = {scope:SCOPE_PAGE[scope] ? scope : 'herdr',search:'',host:'',status:['current','unavailable','unknown','all','archived'].includes(status)?status:showAll?'all':'current',archived:status==='archived',group:SCOPE_PAGE[scope] && scope!=='herdr'?'type':'project'};
   const openGroups = new Map();
-  root.innerHTML = `${styles}<h1>${SCOPE_PAGE[state.scope].title}</h1>
+  root.innerHTML = `${styles}<div class="hd-live-head"><h1>${SCOPE_PAGE[state.scope].title}</h1><herdr-freshness interval="30000"></herdr-freshness></div>
     <p class="sc-intro">${SCOPE_INTRO[state.scope]}</p>
     <p class="sc-meta">${Object.entries(SCOPE_PAGE).filter(([key])=>key!==state.scope).map(([,page])=>`<a href="${page.path}">${page.label} →</a>`).join(' · ')}</p>
     <div class="sc-counts" id="sc-counts"></div><details class="sc-history" id="sc-history"><summary id="sc-history-summary">History and unconfirmed reports</summary><div class="sc-counts" id="sc-history-counts"></div></details>
@@ -310,13 +315,17 @@ export function mountServices(root, client, initial, {showAll = false, status, s
       if(disposed)return;
       services=data.services;
       el('error').textContent='';
+      chip()?.touch(true);
       // Capture before replacement, including toggles whose queued event has not fired.
       root.querySelectorAll('.sc-group').forEach(d=>openGroups.set(d.dataset.group,d.open));
       draw();
-    } catch { if(!disposed)el('error').textContent='Could not refresh services. Showing the last received catalog.'; }
+    } catch (error) { if(!disposed){el('error').textContent='Could not refresh services. Showing the last received catalog.';chip()?.touch(false,error?.message||'request failed');} }
     finally {pending=false;}
   }
   draw();
+  // The catalog arrived with the route; the chip starts fresh and follows each 30 s poll.
+  const chip=()=>root.querySelector('herdr-freshness');
+  chip()?.touch(true);
   const timer=setInterval(refresh,30000);
   let classification=services.map(s=>serviceState(s)).join(',');
   const clock=setInterval(()=>{

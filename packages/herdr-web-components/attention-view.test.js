@@ -26,7 +26,7 @@ test('renders an open item with its evidence link, owner link and controls', () 
 });
 
 test('loading, error and empty states are explicit and an empty list is only claimed when complete', () => {
-  assert.match(renderAttention({ loading: true }, now), /Loading attention…/);
+  assert.match(renderAttention({ loading: true }, now), /data-skeleton aria-busy="true" role="status" aria-label="Loading attention"/);
   assert.match(renderAttention({ error: 'HTTP 500' }, now), /herdr-error message="HTTP 500"/);
   assert.match(renderAttention({ body: body([], { counts: { open: 0 } }) }, now), /No attention items\. Every source was read\./);
   const partial = renderAttention({ body: body([], { partial: true, unavailable: ['ci'], counts: { open: 0 } }) }, now);

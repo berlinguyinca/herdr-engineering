@@ -69,6 +69,8 @@
 
   /* aliases used across views; they follow the base tokens, light or dark */
   --bg: var(--background);
+  --accent-strong: var(--accent-hover);
+  --shadow-sm: var(--shadow);
   --accent-contrast: var(--text-on-accent);
   --surface-alt: var(--surface-2);
   --surface-card: var(--surface);
@@ -241,6 +243,9 @@
 }
 
 /* Shared data table */
+.hd-table-wrap { max-width: 100%; overflow-x: auto; }
+[data-artifact-registry] .hd-inline { flex-wrap: wrap; }
+[data-artifact-registry] .hd-input { min-width: 0; max-width: 100%; padding: 8px; color: var(--text); background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-sm); font: inherit; }
 .hd-table { width: 100%; border-collapse: collapse; font-size: 0.875rem; background: var(--surface); }
 .hd-table th, .hd-table td { padding: var(--density-row-padding, 8px) 12px; text-align: left; border-bottom: 1px solid var(--border-subtle); }
 .hd-table th { color: var(--text-secondary); font-weight: 500; font-size: 0.8125rem; background: var(--surface-alt); }

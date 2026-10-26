@@ -6,6 +6,7 @@ import { recordOutcome, recordVisibility, reportFreshness } from './record-state
 import { serviceState, serviceScope } from './services-view.js';
 import { integrationEntries, integrationTimestamp } from './integrations-view.js';
 import { isCalm, snapshotText, animateChanges } from './motion.js';
+import { freshnessSources } from './freshness.js';
 
 const records = value => Array.isArray(value) ? value.filter(v => v && typeof v === 'object' && !Array.isArray(v)) : [];
 const text = value => typeof value === 'string' ? value : '';
@@ -118,12 +119,13 @@ function ageMarkup(value, now, label = 'Report') {
 }
 const metric = (value, label, href) => `<a class="ov-metric" href="${esc(href)}"><strong>${value}</strong><span>${esc(label)}</span></a>`;
 const empty = label => `<p class="ov-note">${esc(label)}</p>`;
+const SOURCE_LABELS = {projections:'Live mission reports',missions:'Recorded missions',sessions:'Agents',services:'Services',hosts:'Hosts',fleet:'Fleet versions',activity:'Recent activity',health:'Control plane',ci:'CI',reviews:'Reviews',attention:'Attention'};
 function availability(keys, states) {
   return keys.map(key => {
     const state = states[key];
-    const label = {projections:'Live mission reports',missions:'Recorded missions',sessions:'Agents',services:'Services',hosts:'Hosts',activity:'Recent activity',health:'Control plane',ci:'CI',reviews:'Reviews'}[key];
+    const label = SOURCE_LABELS[key];
     if (state?.error) return `<p class="ov-warning" role="status">${esc(label)}: Could not refresh.${state.loaded ? ' Showing last received records.' : ' Data is unavailable; retrying automatically.'}</p>`;
-    if (!state?.loaded) return `<div class="hd-skeleton ov-skeleton" role="status" aria-label="Loading ${esc(label.toLowerCase())}"></div>`;
+    if (!state?.loaded) return `<div class="hd-skeleton ov-skeleton" data-skeleton aria-busy="true" role="status" aria-label="Loading ${esc(label.toLowerCase())}"></div>`;
     return '';
   }).join('');
 }
@@ -242,9 +244,10 @@ function saveSnoozed(map) {
   try { localStorage.setItem(SNOOZE_KEY, JSON.stringify(Object.fromEntries(map))); } catch { /* ignore */ }
 }
 
-export function mountOverview(container, client) {
+export function mountOverview(container, client, { freshness = () => null } = {}) {
   let disposed=false, clock=null, received=Date.now();
   const data={snoozed:loadSnoozed()}, states={}, controllers=new Map(), timers=new Map(), signatures=new Map();
+  const chip=freshnessSources(freshness);
   const panels=['attention',...OVERVIEW_CARDS,'health'];
   let preferences;
   try { preferences=sanitizeOverviewPreferences(JSON.parse(localStorage.getItem(PREFERENCES_KEY) || 'null')); } catch { preferences=sanitizeOverviewPreferences(); }
@@ -371,9 +374,10 @@ export function mountOverview(container, client) {
       if(key==='projections')received=Date.now();
       if(key==='attention' && response.disabled)data.attention=null;
       states[key]={loaded:true,error:false,...(key==='attention' && response.disabled ? {disabled:true} : {})};
+      chip.ok(key);
       draw();
-    } catch {
-      if(!disposed && (!controller.signal.aborted || timedOut)){states[key]={...states[key],error:true};draw();}
+    } catch (error) {
+      if(!disposed && (!controller.signal.aborted || timedOut)){states[key]={...states[key],error:true};chip.fail(key,`${SOURCE_LABELS[key]}: ${timedOut?'timed out':error?.message||'request failed'}`);draw();}
     } finally {
       clearTimeout(timeout);controllers.delete(key);
       if(!disposed && !document.hidden)timers.set(key,setTimeout(()=>poll(key),5000));

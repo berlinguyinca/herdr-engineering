@@ -23,7 +23,7 @@ const payload=n=>{
  const mission=i=>({mission_id:`m-${i}`,title:`Mission ${i}`,status:'EXECUTING',updated_at:T0});
  const event=i=>({event_id:`e${i}`,sequence:i,event_type:'MissionStageChanged',entity_type:'mission',entity_id:'m-1',source_timestamp:T0,payload:{title:'Mission'}});
  const k=n+1;
- return {missions:ids(k).map(mission),sessions:ids(k).map(session),services:ids(k).map(service),hosts:ids(k).map(host),activities:[],
+ return {items:[],groups:[],snapshots:[],analyses:[],artifacts:[],versions:[],publications:[],nodes:[],edges:[],missions:ids(k).map(mission),sessions:ids(k).map(session),services:ids(k).map(service),hosts:ids(k).map(host),activities:[],
   events:ids(k*2).map(event),timeline:[],available:true,reviews:[],repositories:[],issues:[],counts:{},pagination:{},status:'ready',
   components:[],summary:{},reports:[],pipelines:[],samples:[],total:k*10,completed:k*3,completion_rate:k*15,by_stage:{review:k,done:k*2},
   models:{},total_sessions:k,healthy:k,unavailable:n,mission_id:'m-1',session_id:'s-1',host_id:'h-1',host_name:'h-1',title:'Mission 1',

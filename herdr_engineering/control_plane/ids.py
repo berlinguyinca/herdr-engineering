@@ -6,7 +6,7 @@ import time
 from typing import Final
 
 _KINDS: Final[frozenset[str]] = frozenset({
-    "mission", "session", "service", "artifact",
+    "mission", "session", "service", "artifact", "version",
     "host", "agent", "plan", "worktree", "event", "lease", "llmkey",
     "project", "room", "grant", "collab", "cifix",
 })
@@ -21,6 +21,19 @@ _SUFFIX_LEN = 26
 # is lexicographic) matches creation order. Identity is stable; the counter
 # only affects sortability, not the entity's identity.
 _counter = 0
+
+
+def validate_mission_id(mission_id: str, source: str) -> None:
+    """Only HerdR may supply the reserved workspace prefix on a mission ID.
+
+    Other producers supply raw IDs; their source namespace is added by storage.
+    Reserve the source name too, so it cannot alias a HerdR workspace key.
+    """
+    if ":" in source or source == "herdr-ws":
+        raise ValueError("invalid mission id")
+    raw_id = mission_id.removeprefix("herdr-ws:") if source == "herdr" else mission_id
+    if not raw_id or ":" in raw_id:
+        raise ValueError("invalid mission id")
 
 
 def new_id(kind: str) -> str:

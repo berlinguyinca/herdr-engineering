@@ -6,6 +6,9 @@ import urllib.request
 import pytest
 
 from herdr_engineering.control_plane.api import ControlPlaneServer
+from herdr_engineering.control_plane.artifact_acl import ArtifactAcl
+from herdr_engineering.control_plane.artifact_jobs import ArtifactJobManager
+from herdr_engineering.control_plane.publication import FakeExposureProvider, PublicationController
 from herdr_engineering.control_plane.repo import ControlPlaneRepo
 
 
@@ -85,6 +88,29 @@ def test_download_unknown_artifact_404(server):
         assert e.code == 404
 
 
+def test_acl_applies_to_nested_version_and_review_reads():
+    from herdr_engineering.control_plane.artifact_acl import ArtifactAcl
+
+    class PrivateStore:
+        def sync_call(self, *_args, **_kwargs):
+            raise AssertionError('unauthorized read reached the artifact store')
+
+    instance = ControlPlaneServer(ControlPlaneRepo(), api_keys={'reader': 'viewer'},
+                                  artifact_acl=ArtifactAcl(), artifact_store=PrivateStore())
+    threading.Thread(target=instance.serve, daemon=True).start()
+    instance.wait_until_ready()
+    try:
+        for suffix in ('versions', 'versions/private-version', 'reviews', 'download'):
+            req = urllib.request.Request(
+                f'http://127.0.0.1:{instance.port}/api/v1/artifacts/private-artifact/{suffix}',
+                headers={'X-API-Key': 'reader'})
+            with pytest.raises(urllib.error.HTTPError) as denied:
+                urllib.request.urlopen(req, timeout=5)
+            assert denied.value.code == 404
+    finally:
+        instance.shutdown()
+
+
 def test_upload_requires_body(server):
     base, _ = server
     req = urllib.request.Request(f"{base}/api/v1/artifacts?filename=a.txt",
@@ -105,6 +131,25 @@ def test_artifact_recorded_with_sha256_and_session_binding(server):
     assert art["session_id"] == sid
     assert art["sha256"]
     assert art["mime_type"] == "text/plain"
+
+
+def test_artifact_catalog_lists_registered_records(server):
+    base, _ = server
+    upload(base, b"cataloged", filename="catalog.txt", mime="text/plain")
+    with urllib.request.urlopen(f"{base}/api/v1/artifacts") as response:
+        payload = json.loads(response.read())
+    assert len(payload["artifacts"]) == 1
+    assert payload["artifacts"][0]["original_filename"] == "catalog.txt"
+
+
+def test_artifact_catalog_filters_server_side_before_returning_records(server):
+    base, repo = server
+    upload(base, b"one", filename="alpha.html", mime="text/html")
+    upload(base, b"two", filename="beta.pdf", mime="application/pdf")
+    with urllib.request.urlopen(f"{base}/api/v1/artifacts?q=alpha&type=other") as response:
+        payload = json.loads(response.read())
+    assert len(payload["artifacts"]) == 1
+    assert payload["artifacts"][0]["original_filename"] == "alpha.html"
 
 
 # ---- durable object-store wiring -------------------------------------------

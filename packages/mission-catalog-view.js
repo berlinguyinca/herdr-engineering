@@ -4,7 +4,8 @@ import { escapeHtml as esc } from './herdr-web-components/util.js';
 import { freshnessAt, missionHealth } from './mission-live-view.js';
 import { recordOutcome, statusOutcome, recordVisibility, reportFreshness, reportTimestamp } from './record-state.js';
 import { patchList, patchText, morph } from './patch.js';
-import { snapshotText, animateChanges, easeValue } from './motion.js';
+import { snapshotText, animateChanges, easeValue, skeleton } from './motion.js';
+import { freshnessSources } from './freshness.js';
 
 const text = value => typeof value === 'string' ? value : '';
 const records = value => Array.isArray(value) ? value.filter(v => v && typeof v === 'object' && !Array.isArray(v)) : [];
@@ -149,7 +150,8 @@ const styles = `<style>.mc-result strong{font-weight:600}.mc-result[data-result=
 @media(max-width:650px){.mc-row{grid-template-columns:minmax(0,1fr);gap:8px}.mc-controls label{min-width:130px;flex:1}.mc-status{gap:3px}.mc-counts button{padding:8px}.mc-group>summary span{margin-left:4px}}
 </style>`;
 
-export function mountMissionCatalog(container, client, {tab = 'current', status = 'all'} = {}) {
+export function mountMissionCatalog(container, client, {tab = 'current', status = 'all', freshness = () => null} = {}) {
+  const chip = freshnessSources(freshness);
   let disposed = false, projections = [], recorded = [], received = Date.now(), outcomes = null;
   let liveController = null, pollTimer = null, clockTimer = null, recordedTimer = null, recordedController = null;
   let failures = 0, liveError = '', recordedError = '', lastSignature = '', lastClassification = '', liveLoaded = false, recordedLoaded = false;
@@ -162,7 +164,7 @@ export function mountMissionCatalog(container, client, {tab = 'current', status 
       <label>Result<select id="mc-result-filter"><option value="all">Any result</option>${RESULTS.map(r=>`<option value="${r}">${RESULT_LABEL[r]}</option>`).join('')}</select></label>
       <label>Repository<select id="mc-repository"><option value="">All repositories</option></select></label>
       <label>Show<select id="mc-status"><option value="all">All groups</option>${GROUPS.filter(([key])=>currentGroup(key)).map(([key,label])=>`<option value="${key}">${label}</option>`).join('')}</select></label>
-    </div><p id="mc-result" class="mc-meta" role="status">Loading missions…</p><p class="ml-connection mc-meta" role="status"></p><div id="mc-groups" role="tabpanel" aria-labelledby="mc-tab-current"></div>`;
+    </div><p id="mc-result" class="mc-meta" role="status"></p><p class="ml-connection mc-meta" role="status"></p><div id="mc-groups" role="tabpanel" aria-labelledby="mc-tab-current"></div>`;
   const el = name => container.querySelector(`#mc-${name}`);
   el('status').value = state.status;
   const connection = container.querySelector('.ml-connection');
@@ -205,7 +207,7 @@ export function mountMissionCatalog(container, client, {tab = 'current', status 
       const list=group.querySelector('[data-rows]');
       patchList(list,rows.slice(0,limit).map(e=>({key:e.key,html:compactMissionRow(e)})),{key:item=>item.key,render:item=>item.html,update:updateRow,inPlace:true,animate:live&&!created});
       if(created||!live)for(const row of list.querySelectorAll('[data-entering]'))row.removeAttribute('data-entering');
-      morph(group.querySelector('[data-group-foot]'),`${rows.length?'':`<p class="mc-note">${liveLoaded&&recordedLoaded?'No missions in this group match your filters.':'Loading reports…'}</p>`}
+      morph(group.querySelector('[data-group-foot]'),`${rows.length?'':!liveLoaded&&!recordedLoaded&&!liveError&&!recordedError?skeleton('missions',{rows:2}):`<p class="mc-note">${!liveLoaded&&!recordedLoaded?'Missions could not be loaded yet; retrying automatically.':liveLoaded&&recordedLoaded?'No missions in this group match your filters.':'Waiting for the remaining report source.'}</p>`}
         ${rows.length>limit?`<div class="mc-more"><button class="hd-btn" data-more="${key}">Show ${Math.min(10,rows.length-limit)} more (${rows.length-limit} remaining)</button></div>`:''}`);
     }
   }
@@ -213,7 +215,7 @@ export function mountMissionCatalog(container, client, {tab = 'current', status 
     if(disposed)return;
     const all=entries(), selected=filterMissions(all,state);
     const counts=Object.fromEntries(GROUPS.map(([key])=>[key,all.filter(e=>e.tab===state.tab&&e.group===key).length]));
-    const signature=JSON.stringify([state,liveLoaded,recordedLoaded,all.map(e=>[e.key,e.tab,e.group,e.freshness?.state,e.projection,e.recorded,e.summary])]);
+    const signature=JSON.stringify([state,liveLoaded,recordedLoaded,!!liveError,!!recordedError,all.map(e=>[e.key,e.tab,e.group,e.freshness?.state,e.projection,e.recorded,e.summary])]);
     connection.textContent=[liveError,recordedError].filter(Boolean).join(' ');
     if(!force && signature===lastSignature)return;
     lastSignature=signature;
@@ -239,7 +241,7 @@ export function mountMissionCatalog(container, client, {tab = 'current', status 
     el('host').innerHTML='<option value="">All hosts</option>'+hosts.map(h=>`<option value="${esc(h)}">${esc(h)}</option>`).join('');el('host').value=state.host;
     const repositories=[...new Set(all.map(e=>e.summary?.repository).filter(Boolean))].sort();
     el('repository').innerHTML='<option value="">All repositories</option>'+repositories.map(r=>`<option value="${esc(r)}">${esc(r)}</option>`).join('');el('repository').value=state.repository;el('result-filter').value=state.result;
-    el('result').textContent=liveLoaded||recordedLoaded?`${selected.length} matching ${state.tab} missions${liveLoaded&&recordedLoaded?'':' · partial results (+): waiting for remaining source'} · live activity refreshes every 5 seconds`:'Loading missions…';
+    el('result').textContent=liveLoaded||recordedLoaded?`${selected.length} matching ${state.tab} missions${liveLoaded&&recordedLoaded?'':' · partial results (+): waiting for remaining source'} · live activity refreshes every 5 seconds`:'';
     const wanted=GROUPS.filter(([key])=>(state.tab==='current'?currentGroup(key):state.tab==='unconfirmed'?['lastknown','recorded'].includes(key):state.tab===key)&&(state.status==='all'||state.status===key));
     patchGroups(wanted,selected,live);
     if(focusKey){
@@ -304,12 +306,12 @@ export function mountMissionCatalog(container, client, {tab = 'current', status 
     try {
       const response=await client.listMissions(undefined,{signal:controller.signal});
       if(disposed||controller.signal.aborted)return;
-      recorded=records(response.missions);recordedLoaded=true;recordedError='';
+      recorded=records(response.missions);recordedLoaded=true;recordedError='';chip.ok('recorded');
       // The stored outcomes enrich the rows; a failure keeps the last ones and never blocks the catalog.
       if(typeof client.missionOutcomes==='function'){try{const o=await client.missionOutcomes({signal:controller.signal});if(!disposed&&!controller.signal.aborted&&o&&typeof o.outcomes==='object')outcomes=o.outcomes;}catch{/* rows stay as they were */}}
       draw();tick();
-    } catch {
-      if(!disposed&&(!controller.signal.aborted||timedOut)){recordedError='Recorded history could not refresh; keeping the last received records.';tick();}
+    } catch (error) {
+      if(!disposed&&(!controller.signal.aborted||timedOut)){chip.fail('recorded', `Recorded missions: ${timedOut?'timed out':error?.message||'request failed'}`);recordedError='Recorded history could not refresh; keeping the last received records.';draw();tick();}
     } finally {clearTimeout(deadline);if(recordedController===controller)recordedController=null;}
   }
   async function poll() {
@@ -319,10 +321,11 @@ export function mountMissionCatalog(container, client, {tab = 'current', status 
     try {
       const response=await client.listMissionActivity({signal:controller.signal});
       if(disposed||controller.signal.aborted)return;
-      projections=records(response.activities);received=Date.now();liveLoaded=true;failures=0;liveError='';draw();tick();
-    } catch {
+      projections=records(response.activities);received=Date.now();liveLoaded=true;failures=0;liveError='';chip.ok('live');draw();tick();
+    } catch (error) {
       if(disposed||(controller.signal.aborted&&!timedOut))return;
-      failures++;liveError='Activity connection interrupted · showing last known data; retrying automatically.';tick();
+      chip.fail('live',`Live activity: ${timedOut?'timed out':error?.message||'request failed'}`);
+      failures++;liveError='Activity connection interrupted · showing last known data; retrying automatically.';draw();tick();
     } finally {
       clearTimeout(deadline);liveController=null;
       if(!disposed&&!document.hidden)pollTimer=setTimeout(poll,Math.min(30000,5000*2**Math.min(failures,3)));

@@ -3,15 +3,44 @@
 // stream. Views render loading / empty / error / data states (Spec §91).
 import { HerdrClient } from './herdr-web-client/client.js';
 import { connectEvents } from './herdr-web-client/events.js';
-import { formatTimestamp } from './herdr-web-components/format.js';
+import { createRefreshBus } from './refresh-bus.js';
+import { formatTimestamp, formatDuration } from './herdr-web-components/format.js';
 import { escapeHtml as esc } from './herdr-web-components/util.js';
 import { defineComponents } from './herdr-web-components/index.js';
 import { describeEvent, missionSubtitle, sessionSummary } from './herdr-web-components/humanize.js';
-import { statusForStage, statusLabel, tokenVar } from './herdr-web-components/status.js';
 import { mountInspector } from './inspector-view.js';
+import { mountSessionWorkspace } from './session-workspace.js';
+import { mountTerminalAttach } from './terminal-attach.js';
 import { mountMissionActivity } from './mission-live-view.js';
 import { mountMissionCatalog } from './mission-catalog-view.js';
-import { mountServices, renderServiceDetails } from './services-view.js';
+import { mountOverview } from './overview-view.js';
+import { mountIntegrations } from './integrations-view.js';
+import { mountGithub } from './github-view.js';
+import { mountReviewGate } from './review-gate-view.js';
+import { mountTopology } from './topology-view.js';
+import { mountArchitecture } from './architecture-view.js';
+import { visibleNav } from './nav-capabilities.js';
+import { mountSessionsView, sessionEntries } from './sessions-view.js';
+import { recordOutcome, statusOutcome } from './record-state.js';
+import { RANGES, safeHostId } from './host-view.js';
+import { mountHosts, loadHosts } from './hosts-view.js';
+import { mountHostDetail, loadHostDetail } from './host-detail-view.js';
+import { mountActivity, loadActivity } from './activity-view.js';
+import { mountAnalytics, loadAnalytics } from './analytics-view.js';
+import { morph, patchList, patchText } from './patch.js';
+import { flash, skeleton } from './motion.js';
+import { noteStreamContact, freshnessSources } from './freshness.js';
+import { mountServices, mountServiceDetails } from './services-view.js';
+import { mountCollab, completeSignInIfRedirected } from './collab-view.js';
+import { mountAttention, attentionBadge, POLL_MS as ATTENTION_POLL_MS } from './attention-view.js';
+import { createAttentionNotifier } from './attention-notify.js';
+import { mountRelated } from './related-panel.js';
+import { mountMissionStory } from './mission-story-view.js';
+import { renderLlm, renderLlmSession, llmQuery, STEP_FOR, WINDOWS } from './llm-view.js';
+import { mountArtifacts, renderArtifactDetail } from './artifacts-view.js';
+import { mountPublications } from './publications-view.js';
+import { mountHandoffs } from './handoffs-view.js';
+import { mountScheduling } from './scheduler-view.js';
 import { classifyDashboardError, dashboardErrorMessage } from './dashboard-load-state.js';
 
 // Cache of { [mission_id]: title } so activity/session text can resolve
@@ -39,18 +68,60 @@ const root = document.getElementById('view');
 
 const NAV = [
   { path: '/overview', label: 'Overview' },
+  { path: '/attention', label: 'Attention' },
   { path: '/topology', label: 'Topology' },
+  { path: '/architecture', label: 'Architecture', capability: 'architecture_v1' },
   { path: '/missions', label: 'Missions' },
-  { path: '/herd', label: 'Sessions' },
+  { path: '/herd', label: 'Agents' },
   { path: '/services', label: 'Services' },
+  { path: '/local-services', label: 'Local services' },
+  { path: '/system-services', label: 'System services' },
+  { path: '/github', label: 'Projects' },
+  { path: '/ci', label: 'CI' },
+  { path: '/reviews', label: 'Reviews' },
+  { path: '/review-gate', label: 'Review gate' },
   { path: '/hosts', label: 'Hosts' },
   { path: '/activity', label: 'Activity' },
   { path: '/analytics', label: 'Analytics' },
+  { path: '/llm', label: 'LLM' },
+  { path: '/collab', label: 'Collaboration' },
+  { path: '/artifacts', label: 'Artifacts' },
+  { path: '/publications', label: 'Publications' },
+  { path: '/scheduling', label: 'Scheduling' },
+  { path: '/handoffs', label: 'Handoffs' },
 ];
 
 const SHELL = document.getElementById('shell');
-SHELL.setAttribute('routes', JSON.stringify(NAV));
+SHELL.setAttribute('routes', JSON.stringify(visibleNav(NAV, [])));
+// Optional tabs appear once /api/v1/health advertises their capability; a failed probe keeps them hidden.
+// Re-set only when the list changes: every set re-renders the shell's nav.
+client.health().then((h) => {
+  const routes = JSON.stringify(visibleNav(NAV, h?.capabilities));
+  if (routes !== SHELL.getAttribute('routes')) SHELL.setAttribute('routes', routes);
+}).catch(() => { /* optional tabs stay hidden */ });
 SHELL.setAttribute('brand', 'HerdR Dev Fabric');
+
+// The nav badge follows the server inbox on every page, so a new critical item is visible from anywhere.
+function setAttentionBadge(badge) { SHELL.setBadge?.('/attention', badge); }
+let attentionStorage = null;
+try { attentionStorage = window.localStorage; } catch { /* Notification choices then last for this page only. */ }
+const attentionNotifier = createAttentionNotifier({
+  storage: attentionStorage, NotificationImpl: window.Notification,
+  onClick: (href) => { window.focus(); window.location.hash = href; },
+});
+function handleAttention(body) { setAttentionBadge(attentionBadge(body)); attentionNotifier.handle(body); }
+let attentionBadgeTimer = null;
+async function pollAttentionBadge() {
+  clearTimeout(attentionBadgeTimer);
+  // A hidden tab keeps polling only when browser notifications are on, so a new critical item still reaches the operator.
+  if (!document.hidden || attentionNotifier.active()) {
+    try { handleAttention(await client.attention({ state: 'open' })); }
+    catch { /* The page itself explains an unreachable inbox; the badge just stays as it was. */ }
+  }
+  attentionBadgeTimer = setTimeout(pollAttentionBadge, ATTENTION_POLL_MS * 3);
+}
+document.addEventListener('visibilitychange', () => { if (!document.hidden) pollAttentionBadge(); });
+pollAttentionBadge();
 
 function route() {
   const hash = window.location.hash.replace(/^#/, '') || '/overview';
@@ -61,196 +132,282 @@ function route() {
 
 const ROUTES = {
   '/overview': viewOverview,
+  '/attention': viewAttention,
+  '/github': viewGithub,
+  '/collab': viewCollab,
+  '/ci': viewIntegrations,
+  '/reviews': viewIntegrations,
+  '/review-gate': viewReviewGate,
   '/topology': viewTopology,
+  '/architecture': viewArchitecture,
   '/missions': viewMissions,
   '/missions/:id': viewMission,
+  '/missions/:id/tests': viewMissionTests,
+  '/missions/:id/reviews': viewMissionReviews,
   '/herd': viewSessions,
   '/herd/session/:id': viewSession,
   '/services': viewServices,
+  '/system-services': viewServices,
+  '/local-services': viewServices,
   '/services/:id': viewService,
   '/hosts': viewHosts,
   '/hosts/:id': viewHost,
   '/activity': viewActivity,
   '/analytics': viewAnalytics,
-  '/analytics/missions': viewAnalyticsMissions,
-  '/analytics/models': viewAnalyticsModels,
-  '/analytics/hosts': viewAnalyticsHosts,
-  '/analytics/tokens': viewAnalyticsTokens,
+  '/analytics/missions': viewAnalytics,
+  '/analytics/models': viewAnalytics,
+  '/analytics/hosts': viewAnalytics,
+  '/analytics/tokens': viewAnalytics,
+  '/analytics/stages': viewAnalytics,
+  '/analytics/usage': viewAnalytics,
+  '/llm': viewLlm,
+  '/llm/session/:id': viewLlmSession,
+  '/artifacts': viewArtifacts,
+  '/artifacts/:id': viewArtifact,
+  '/publications': viewPublications,
+  '/scheduling': viewScheduling,
+  '/handoffs': viewHandoffs,
 };
 
-// The agent inspector owns a per-session stream; dispose it whenever the view changes.
-let disposeInspector = null;
-let disposeMissionActivity = null;
-let refreshMissionHistory = null;
-let servicesView = null;
+// Router rule: render() runs only on a route change (any hash change, query
+// included, since links like ?tab= / ?drift=1 still navigate). A same-route
+// trigger (SSE event, tab becoming visible) goes through the refresh bus to
+// currentView.refresh(hint) and never replaces the page; the spinner shows only
+// on a route's first load.
+//
+// View contract: a view* function may return {refresh(hint), dispose()}; one that
+// returns nothing (an error or not-found page) is retried in place by rerenderView.
+const NO_REFRESH = { refresh() {}, dispose() {} };
+// These dashboards own their polling; SSE must preserve their filters and focus.
+const ownPolling = (view) => ({ refresh() {}, dispose: () => view.dispose() });
+
+// Same throttle as before: SSE-driven refreshes re-fetch view data, so at most
+// one per LIVE_REFRESH_MS per view keeps clear of the API's per-IP rate limit.
+const LIVE_REFRESH_MS = 5000;
+const bus = createRefreshBus({ throttleMs: LIVE_REFRESH_MS });
+let currentView = null;
+let unregisterView = null;
+let sessionRequest = null;
 let renderRevision = 0;
-const onMissionPage = () => /^#\/missions(?:\/|$)/.test(window.location.hash);
-const onSessionPage = () => /^#\/herd\/session\//.test(window.location.hash);
+
+function matchRoute(parts) {
+  return Object.keys(ROUTES).find((r) => {
+    const rp = r.split('/').filter(Boolean);
+    if (rp.length !== parts.length) return false;
+    return rp.every((rpseg, i) => rpseg.startsWith(':') || rpseg === parts[i]);
+  }) || '/overview';
+}
+
+function mountView(view) {
+  currentView = view;
+  // The view just loaded its data; the first event waits out one throttle window.
+  unregisterView = bus.register(view, { fresh: true });
+}
+
+function unmountView() {
+  if (unregisterView) { unregisterView(); unregisterView = null; }
+  if (currentView) { currentView.dispose(); currentView = null; }
+}
+
+// Retry for a page whose first load failed or found nothing (e.g. "Mission not
+// found"): re-run the route's view function in place on the next event. A failed
+// retry keeps the page; a retry that yields a real view adopts it. A retry that
+// never settles stops blocking new ones after RETRY_TIMEOUT_MS (its late result is
+// discarded, since the next retry bumps the revision).
+const RETRY_TIMEOUT_MS = 15000;
+function rerenderView(load) {
+  let running = false;
+  return {
+    async refresh() {
+      if (running) return;
+      running = true;
+      const revision = ++renderRevision;
+      const unwedge = setTimeout(() => { running = false; }, RETRY_TIMEOUT_MS);
+      try {
+        const view = await load(revision);
+        if (view && revision === renderRevision) { unmountView(); mountView(view); }
+        else if (view && revision !== renderRevision) view.dispose();
+      } catch (err) {
+        // Keep the last page; the next event retries. The page's chip says the retry failed, unless
+        // the user has moved on: a stale retry must not mark the new page's chip.
+        if (revision === renderRevision) root.querySelector('herdr-freshness')?.touch?.(false, err?.message || 'request failed');
+      } finally {
+        clearTimeout(unwedge);
+        if (revision === renderRevision) running = false;
+      }
+    },
+    dispose() {},
+  };
+}
 
 async function render() {
   const revision = ++renderRevision;
   const startedAt = Date.now();
-  refreshMissionHistory = null;
-  if (servicesView) { servicesView.dispose(); servicesView = null; }
-  if (disposeMissionActivity) { disposeMissionActivity(); disposeMissionActivity = null; }
-  if (disposeInspector) { disposeInspector(); disposeInspector = null; }
+  unmountView();
+  if (sessionRequest) { sessionRequest.abort(); sessionRequest = null; }
   const { parts } = route();
-  const seg = parts.length ? parts.join('/') : 'overview';
-  const match = Object.keys(ROUTES).find((r) => {
-    const rp = r.split('/').filter(Boolean);
-    if (rp.length !== parts.length) return false;
-    return rp.every((rpseg, i) => rpseg.startsWith(':') || rpseg === parts[i]);
-  });
-  root.innerHTML = '<herdr-spinner label="Loading"></herdr-spinner>';
+  const match = matchRoute(parts);
+  const load = (rev) => ROUTES[match](parts, rev);
+  // As before, live events retry a failed or not-found page, except pages that stream their own detail.
+  const streamsOwnDetail = match === '/herd/session/:id' || (match === '/missions/:id' && (safeDecode(parts[1]) || '').startsWith('pi:'));
+  root.innerHTML = routeSkeleton(match, parts);
+  let view;
   try {
-    await ROUTES[match || '/overview'](parts, revision);
+    view = await load(revision);
   } catch (err) {
     if (revision !== renderRevision) return;
     const detail = classifyDashboardError(err, Date.now() - startedAt);
-    detail.requestId = err?.requestId || '';
-    root.innerHTML = `<herdr-error message="${esc(dashboardErrorMessage('This page', detail))}"></herdr-error><p class="hd-note">The page could not load completely. <button type="button" data-route-retry>Retry</button>${detail.requestId ? ` Request ${esc(detail.requestId)}` : ''}</p>`;
+    statusPage(`<herdr-error message="${esc(err.message || dashboardErrorMessage('This page', detail))}"></herdr-error><p>${esc(dashboardErrorMessage('This page', detail))} <button type="button" data-route-retry>Retry</button>${err.requestId ? ` Request ${esc(err.requestId)}` : ''}</p>`, false, err.message || 'request failed');
+    if (!streamsOwnDetail) mountView(rerenderView(load));
+    return;
   }
+  if (revision !== renderRevision) { view?.dispose(); return; }
+  mountView(view || (streamsOwnDetail ? NO_REFRESH : rerenderView(load)));
+}
+
+// Every routed page carries one freshness chip (<herdr-freshness>) in its head.
+const CHIP = (interval = LIVE_REFRESH_MS) => `<herdr-freshness interval="${interval}"></herdr-freshness>`;
+const liveHead = (title, interval) => `<div class="hd-live-head">${title}${CHIP(interval)}</div>`;
+const chipIn = (el) => () => el.querySelector('herdr-freshness');
+// Error and not-found pages have a chip too: red with the error, or fresh for a page that loaded
+// and found nothing. A failed retry (rerenderView) marks it red again.
+function statusPage(html, ok, message) {
+  root.innerHTML = liveHead('') + html;
+  root.querySelector('herdr-freshness').touch(ok, message);
+}
+
+// First-load placeholder for a route: its head (title bar, and the back link detail pages put
+// above it) at the real page's position, then content rows sized roughly to the page that follows
+// (a Pi mission without a record is short, as are model and host analytics; agent detail and the
+// analytics dashboards fill a screen),
+// so the page does not jump on arrival.
+const BACK_LINK_SKELETON = '<div><span class="hd-skeleton hd-skeleton--line" style="display:inline-block;vertical-align:middle">&nbsp;</span></div>';
+function routeSkeleton(match, parts) {
+  const back = match.startsWith('/missions/:id') || match === '/herd/session/:id' ? BACK_LINK_SKELETON : match === '/llm/session/:id' ? '<p style="font-size:13px"><span class="hd-skeleton hd-skeleton--line" style="display:inline-block;vertical-align:middle">&nbsp;</span></p>' : '';
+  const piMission = match === '/missions/:id' && (safeDecode(parts[1]) || '').startsWith('pi:');
+  const rows = piMission ? 1 : match === '/missions/:id/tests' || match === '/analytics/models' || match === '/analytics/hosts' ? 2 : match === '/missions/:id/reviews' ? 4 : match === '/missions/:id' || match.startsWith('/llm') || match === '/herd/session/:id' || match === '/analytics' || match === '/analytics/missions' ? 8 : match.startsWith('/services') || match.endsWith('-services') ? 7 : 5;
+  return `<div data-skeleton aria-busy="true" role="status" aria-label="Loading page">${back}<div class="hd-live-head"><div class="hd-skeleton hd-skeleton--title"></div></div>${skeleton('page content', { rows, height: 64, bare: true })}</div>`;
 }
 
 // ------------------------------------------------------------- views
-// ------------------------------------------------------------- topology
-// Fleet tree: hosts -> sessions / services / CI runs / test adapters, with
-// a recent-activity leaf. Reuses the existing /api/v1 data + CI/tests views.
-// Status dots/badges reuse the theme's semantic tokens (theme.css + status.js)
-// so the tree stays consistent with the rest of the control plane.
-function treeRow(label, sub, href, status, accent) {
-  const link = href ? `<a href="${href}">${label}</a>` : esc(label);
-  const st = status ? statusForStage(status) : null;
-  const dotColor = st ? tokenVar(st.token) : (accent || 'var(--text-muted)');
-  const dot = `<span class="tp-dot" style="background:${dotColor}"></span>`;
-  const b = st
-    ? `<span class="tp-badge" style="color:${tokenVar(st.token)};border-color:${tokenVar(st.token)}">${esc(statusLabel(status))}</span>`
-    : '';
-  const subHtml = sub ? `<span class="tp-sub">${esc(sub)}</span>` : '';
-  return `<div class="tp-row">${dot}${link}${subHtml}${b}</div>`;
+async function viewArtifacts() {
+  root.innerHTML = `${liveHead('<h1>Artifacts</h1>')}<div id="artifact-registry"></div>`;
+  return mountArtifacts(root.querySelector('#artifact-registry'), client, { freshness: chipIn(root) });
 }
 
+async function viewArtifact(parts, revision) {
+  const id = decodeURIComponent(parts[1]);
+  root.innerHTML = `<a href="#/artifacts">← Artifacts</a>${liveHead('<h1>Artifact</h1>')}<div id="artifact-detail">${skeleton('artifact', { rows: 8, height: 64 })}</div>`;
+  const container = root.querySelector('#artifact-detail');
+  const controller = new AbortController();
+  const chip = root.querySelector('herdr-freshness');
+  // Mount immediately so navigation can cancel the pending detail read.
+  void renderArtifactDetail(container, client, id, { signal: controller.signal })
+    .then(result => { if (!controller.signal.aborted && revision === renderRevision) chip.touch(!result?.errors?.length, result?.errors?.join('; ')); })
+    .catch(error => { if (!controller.signal.aborted && revision === renderRevision) { container.innerHTML = `<herdr-error message="${esc(error.message)}"></herdr-error><button type="button" data-route-retry>Retry</button>`; chip.touch(false, error.message); } });
+  return { refresh() {}, dispose: () => controller.abort() };
+}
+
+async function viewPublications() {
+  root.innerHTML = `${liveHead('<h1>Publications</h1>')}<div id="publication-registry"></div>`;
+  return mountPublications(root.querySelector('#publication-registry'), client, { freshness: chipIn(root) });
+}
+
+async function viewScheduling() {
+  root.innerHTML = `${liveHead('<h1>Scheduling</h1>')}<div id="scheduler"></div>`;
+  return mountScheduling(root.querySelector('#scheduler'), client, { freshness: chipIn(root) });
+}
+
+async function viewHandoffs() {
+  root.innerHTML = `${liveHead('<h1>Handoffs</h1>')}<div id="handoffs"></div>`;
+  return mountHandoffs(root.querySelector('#handoffs'), client, { freshness: chipIn(root) });
+}
+
+// ------------------------------------------------------------- topology
 async function viewTopology() {
-  const [hostsR, sessR, svcR, actR, ciR, testsR] = await Promise.all([
-    client.listHosts(), client.listSessions(), client.listServices(),
-    client.activity(30), client.getCi(), client.getTests(),
-  ]);
-  const hosts = hostsR.hosts || [];
-  const sessions = sessR.sessions || [];
-  const services = svcR.services || [];
-  const events = actR.events || [];
-  const ci = ciR || {};
-  const tests = testsR || {};
-  const t = titles(await missionTitles());
+  return ownPolling(mountTopology(root, client, {status: route().query.get('status') || 'current'}));
+}
 
-  const hostBlocks = hosts.map((h) => {
-    const hs = sessions.filter((s) => s.host_id === h.host_id);
-    const hsvc = services.filter((s) => s.host_id === h.host_id);
-    const sRows = hs.length ? hs.slice(0, 12).map((s) =>
-      treeRow(sessionSummary(s) || s.session_id, '',
-              `#/herd/session/${esc(s.session_id)}`, s.status,
-              'var(--status-active)')).join('')
-      : '<div class="tp-hint">no sessions</div>';
-    const svRows = hsvc.length ? hsvc.slice(0, 12).map((s) =>
-      treeRow(s.service_name, s.route || '', s.route ? s.route : undefined,
-              s.status, 'var(--accent)')).join('')
-      : '';
-    return `<details class="tp tp-host"><summary>
-        ${esc(h.host_name)}
-        <span class="tp-sub">${esc(h.tailnet_ip || '')} · <herdr-status stage="${esc(h.status)}"></herdr-status></span>
-      </summary>
-      <div class="tp-kids">
-        <div class="tp-h">Sessions (${hs.length})</div>${sRows}
-        ${svRows ? `<div class="tp-h">Services (${hsvc.length})</div>${svRows}` : ''}
-      </div>
-    </details>`;
-  }).join('');
-
-  const ciLeaves = ci.available
-    ? Object.entries(ci.pipelines || {}).map(([repo, runs]) =>
-        `<details class="tp tp-ci"><summary>${esc(repo)}</summary><div class="tp-kids">` +
-        ((runs || []).length ? (runs || []).slice(0, 8).map((r) =>
-            treeRow(`#${r.run_number}`, r.branch || '', r.url, r.state,
-                    'var(--status-pr)')).join('')
-          : '<div class="tp-hint">no runs</div>') +
-        `</div></details>`).join('')
-    : '<div class="tp-row"><span class="tp-dot" style="background:var(--text-muted)"></span>CI <span class="tp-sub">not configured / unavailable</span></div>';
-
-  const testLeaves = (tests.adapters || []).length
-    ? (tests.adapters || []).map((a) =>
-        treeRow(a, 'adapter', undefined, undefined, 'var(--status-testing)')).join('')
-    : '<div class="tp-hint">no adapters discovered</div>';
-
-  const actLeaves = events.slice(0, 8).map((e) => {
-    const d = describeEvent(e, { missionTitles: t });
-    return treeRow(d.title, `${d.kind} · ${formatTimestamp(e.source_timestamp)}`,
-                    undefined, undefined, 'var(--text-muted)');
-  }).join('') || '<div class="tp-hint">no activity</div>';
-
-  root.innerHTML = `
-    <style>
-      .tp{margin:2px 0}
-      .tp summary{display:flex;align-items:center;gap:8px;cursor:pointer;list-style:none;
-        padding:7px 10px;border-radius:var(--radius);background:var(--surface);
-        border:1px solid var(--border-subtle);color:var(--text);font-weight:600;
-        font-size:.86rem;transition:background var(--motion-fast),border-color var(--motion-fast)}
-      .tp summary::-webkit-details-marker{display:none}
-      .tp summary::before{content:'';width:8px;height:8px;border-radius:2px;flex:none;
-        border:1px solid var(--text-muted);opacity:.5;transition:transform var(--motion-fast)}
-      .tp summary:hover{background:var(--surface-hover);border-color:var(--border)}
-      .tp[open] summary::before{background:var(--tp-accent,var(--accent));
-        border-color:var(--tp-accent,var(--accent));transform:rotate(45deg)}
-      .tp-host summary{--tp-accent:var(--status-planning)}
-      .tp-ci summary{--tp-accent:var(--status-pr)}
-      .tp-tests summary{--tp-accent:var(--status-testing)}
-      .tp-act summary{--tp-accent:var(--text-muted)}
-      .tp-kids{margin-left:13px;padding-left:13px;border-left:1px solid var(--border);margin-top:2px}
-      .tp-h{color:var(--text-muted);font-size:.68rem;font-weight:700;letter-spacing:.07em;
-        text-transform:uppercase;margin:12px 0 4px}
-      .tp-hint{color:var(--text-muted);font-size:.76rem;padding:3px 8px}
-      .tp-row{display:flex;align-items:center;gap:8px;padding:4px 8px;border-radius:var(--radius-sm);
-        color:var(--text);font-size:.82rem}
-      .tp-row a{color:inherit;text-decoration:none}
-      .tp-row:hover{background:var(--surface-hover)}
-      .tp-row:hover a{color:var(--accent);text-decoration:underline}
-      .tp-dot{width:7px;height:7px;border-radius:50%;flex:none}
-      .tp-sub{color:var(--text-muted);font-size:.74rem;margin-left:auto;text-align:right;
-        white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:55%}
-      .tp-badge{flex:none;font-size:.62rem;font-weight:700;padding:1px 7px;border-radius:99px;
-        background:color-mix(in srgb, currentColor 9%, var(--surface));border:1px solid}
-      .tp-count{color:var(--text-muted);font-weight:600;font-size:.74rem;margin-left:auto}
-    </style>
-    <h1>Topology</h1>
-    <div class="hd-card muted">${hosts.length} hosts · ${sessions.length} sessions · ${services.length} services · ${(ci.repos || []).length} CI repos · ${(tests.adapters || []).length} test adapters</div>
-    <div class="tp-kids">${hostBlocks}
-      <details class="tp tp-ci" open><summary>CI runs<span class="tp-count">${(ci.repos || []).length || ''}</span></summary><div class="tp-kids">${ciLeaves}</div></details>
-      <details class="tp tp-tests" open><summary>Test adapters<span class="tp-count">${(tests.adapters || []).length || ''}</span></summary><div class="tp-kids">${testLeaves}</div></details>
-      <details class="tp tp-act" open><summary>Recent activity<span class="tp-count">${events.length || ''}</span></summary><div class="tp-kids">${actLeaves}</div></details>
-    </div>`;
+async function viewArchitecture() {
+  const q = route().query;
+  root.innerHTML = `${liveHead('')}<div id="architecture-root"></div>`;
+  const chip = root.querySelector('herdr-freshness');
+  return ownPolling(mountArchitecture(root.querySelector('#architecture-root'), client, {snapshot: q.get('snapshot') || '', parent: q.get('parent') || '', q: q.get('q') || '', onFreshness: (ok, message) => chip.touch(ok, message)}));
 }
 
 async function viewOverview() {
-  const [health, missions, sessions, hosts] = await Promise.all([
-    client.health(), client.listMissions(), client.listSessions(), client.listHosts(),
-  ]);
-  const active = sessions.sessions.filter((s) => s.status === 'active').length;
-  root.innerHTML = `
-    <h1>Overview</h1>
-    <div class="hd-grid">
-      <herdr-metric label="Missions" value="${missions.missions.length}"></herdr-metric>
-      <herdr-metric label="Active sessions" value="${active}"></herdr-metric>
-      <herdr-metric label="Hosts" value="${hosts.hosts.length}"></herdr-metric>
-      <herdr-metric label="Events ingested" value="${health.events.ingested}"></herdr-metric>
-    </div>
-    <h3 style="margin-top:20px">Recent activity</h3>
-    ${await activityList(10)}`;
+  root.innerHTML = `${liveHead('<h1>Overview</h1>')}<div id="overview-dashboard"></div>`;
+  return ownPolling(mountOverview(document.getElementById('overview-dashboard'), client, { freshness: chipIn(root) }));
+}
+
+async function viewAttention() {
+  root.innerHTML = `${liveHead('')}<div id="attention-root"></div>`;
+  const chip = root.querySelector('herdr-freshness');
+  return ownPolling(mountAttention(root.querySelector('#attention-root'), client, { onBody: handleAttention, notifier: attentionNotifier, onFreshness: (ok, message) => chip.touch(ok, message) }));
+}
+
+async function viewCollab() {
+  // The chip sits outside the collab root: collab redraws its whole frame on every page change.
+  root.innerHTML = `${liveHead('', 30000)}<div id="collab-root">${skeleton('collaboration', { rows: 8, height: 64 })}</div>`;
+  const chip = chipIn(root);
+  return ownPolling(mountCollab(document.getElementById('collab-root'), {
+    fabricSessions: () => client.listSessions('active'),
+    onFreshness: (ok, message) => chip()?.touch(ok, message),
+  }));
+}
+
+async function viewGithub() {
+  return ownPolling(mountGithub(root, client));
+}
+
+async function viewReviewGate() {
+  root.innerHTML = `${liveHead('')}<div id="review-gate-root"></div>`;
+  const chip = root.querySelector('herdr-freshness');
+  return ownPolling(mountReviewGate(root.querySelector('#review-gate-root'), client, { onFreshness: (ok, message) => chip.touch(ok, message) }));
+}
+
+async function viewIntegrations(parts) {
+  const query = route().query;
+  return ownPolling(mountIntegrations(root, client, {
+    kind: parts[0], tab: query.get('tab') || 'current', search: query.get('search') || '',
+    repository: query.get('repository') || '', provider: query.get('provider') || '', mission: query.get('mission') || '', session: query.get('session') || '',
+  }));
 }
 
 async function viewMissions() {
-  root.innerHTML = '<h1>Missions</h1><div id="live-missions"></div>';
-  const catalog = mountMissionCatalog(document.getElementById('live-missions'), client);
-  disposeMissionActivity = catalog.dispose;
-  refreshMissionHistory = catalog.refreshRecorded;
+  root.innerHTML = `${liveHead('<h1>Missions</h1>')}<div id="live-missions"></div>`;
+  const catalog = mountMissionCatalog(document.getElementById('live-missions'), client, {tab: route().query.get('tab') || 'current', status: route().query.get('status') || 'all', freshness: chipIn(root)});
+  // Recorded lifecycle data refreshes separately so live telemetry and filters stay put.
+  return { refresh: () => catalog.refreshRecorded(), dispose: () => catalog.dispose() };
+}
+
+function relatedIntegrationLinks(record, kind, id) {
+  const context = new URLSearchParams({[kind]: id});
+  const repository = typeof record.repository === 'string' ? record.repository : '';
+  const revision = typeof record.revision === 'string' ? record.revision : '';
+  const ci = new URLSearchParams();
+  if (repository) ci.set('repository', repository);
+  if (revision) ci.set('search', revision);
+  return `<nav class="hd-inline" aria-label="Related reviews and builds" style="margin:14px 0;font-size:13px"><a href="#/reviews?${esc(context)}">Related reviews</a><a href="#/ci?${esc(context)}">Related CI</a>${ci.size ? `<a href="#/ci?${esc(ci)}">CI for this ${revision ? 'revision' : 'repository'}</a>` : ''}</nav>`;
+}
+
+// The Related panel replaces the ad-hoc link rows; the filter links stay as its footer.
+// Returns the panel's disposer; the calling view folds it into its own dispose().
+function showRelated(kind, id, host, footer = '', extra = {}) {
+  const el = host || document.getElementById('related-panel');
+  if (!el) return () => {};
+  const dispose = mountRelated(el, client, kind, id, { footer, ...extra });
+  return typeof dispose === 'function' ? dispose : () => {};
+}
+
+// Runs every disposer once, even if one throws.
+function combineDisposers(...disposers) {
+  return () => { for (const d of disposers) { try { d?.(); } catch { /* the rest still run */ } } };
+}
+
+// A malformed %-escape in the hash is a not-found page, never an uncaught rejection.
+function safeDecode(value) {
+  try { return decodeURIComponent(value ?? ''); } catch { return null; }
 }
 
 async function viewMission(parts, revision) {
@@ -259,16 +416,25 @@ async function viewMission(parts, revision) {
   try { m = await client.getMission(key); }
   catch (error) { if (error.status !== 404 || !key.startsWith('pi:')) throw error; }
   if (revision !== renderRevision) return;
+  // One chip for the page: the live telemetry and the recorded history are its two sources.
+  const sources = freshnessSources(chipIn(root));
+  const onStatus = (ok, message) => ok ? sources.ok('live') : sources.fail('live', `Live activity: ${message}`);
   if (key.startsWith('pi:') && !m) {
-    root.innerHTML = '<a href="#/missions">← Missions</a><h1>Pi mission</h1><div id="live-mission-detail"></div>';
-    disposeMissionActivity = mountMissionActivity(document.getElementById('live-mission-detail'), client, key);
-    return;
+    root.innerHTML = `<a href="#/missions">← Missions</a>${liveHead('<h1>Pi mission</h1>')}<div id="related-panel"></div><div id="live-mission-detail"></div>`;
+    const relatedDispose = showRelated('mission', key, null, relatedIntegrationLinks({},'mission',key));
+    const disposeActivity = mountMissionActivity(document.getElementById('live-mission-detail'), client, key, { onStatus });
+    return { refresh() {}, dispose: combineDisposers(relatedDispose, disposeActivity) };
   }
-  if (!m) { root.innerHTML = '<herdr-error message="Mission not found"></herdr-error>'; return; }
-  root.innerHTML = `<a href="#/missions">← Missions</a><h1 style="overflow-wrap:anywhere">${key.startsWith('pi:') ? 'Pi mission' : esc((m.title || 'Mission').slice(0, 180))}</h1>${key.startsWith('pi:') ? '<div id="live-mission-detail"></div>' : ''}<div id="mission-history"></div>`;
-  if (key.startsWith('pi:')) disposeMissionActivity = mountMissionActivity(document.getElementById('live-mission-detail'), client, key);
+  if (!m) { statusPage('<herdr-error message="Mission not found"></herdr-error>', true); return; }
+  root.innerHTML = `<a href="#/missions">← Missions</a>${liveHead(`<h1 style="overflow-wrap:anywhere">${key.startsWith('pi:') ? 'Pi mission' : esc((m.title || 'Mission').slice(0, 180))}</h1>`)}${missionSectionNav(key)}${key.startsWith('pi:') ? '<div id="live-mission-detail"></div>' : ''}<div id="mission-story"></div><div id="related-panel"></div><div id="mission-history"></div>`;
+  // The story (what happened, how it ended, what needs you) sits above the recorded history; when it is unavailable the page is as before.
+  const story = mountMissionStory(document.getElementById('mission-story'), client, key);
+  const relatedDispose = showRelated('mission', key, null, relatedIntegrationLinks(m,'mission',key));
+  const disposeLive = key.startsWith('pi:') ? mountMissionActivity(document.getElementById('live-mission-detail'), client, key, { onStatus }) : null;
+  const disposeMission = combineDisposers(story?.dispose, relatedDispose, disposeLive);
   const history = document.getElementById('mission-history');
   let pending = false;
+  let shownTimeline = [null, ''];
   const refreshHistory = async (initial) => {
     if (pending || !history.isConnected || document.hidden) return;
     pending = true;
@@ -278,10 +444,12 @@ async function viewMission(parts, revision) {
       const scope = m.purpose || m.cwd || m.title;
       const [sessionsHtml, streamHtml] = await Promise.all([missionSessions(m), streamList('mission', missionKey(m))]);
       if (revision !== renderRevision || !history.isConnected) return;
-      const open = new Map([...history.querySelectorAll('details[data-history-panel]')].map(el => [el.dataset.historyPanel, el.open]));
-      history.innerHTML = `<h2>Recorded history</h2>
+      // Morphed in place: identical data writes nothing and open disclosures stay open.
+      morph(history, `<h2>Recorded history</h2>
     <div style="margin:8px 0"><herdr-status stage="${esc(m.status)}"></herdr-status>
-      <span class="hd-card__sub"> · ${sessions} sessions · ${esc(m.stage || 'Stage not recorded')} · created ${esc(formatTimestamp(m.created_at))}</span></div>
+      <span class="hd-card__sub"> · ${sessions} agents · ${esc(m.stage || 'Stage not recorded')} · created ${esc(formatTimestamp(m.created_at))} · last reported change ${esc(formatTimestamp(m.updated_at))}</span></div>
+    <div style="margin:6px 0">${telemetryBadge(m.telemetry_state)}
+      <herdr-metric label="Stall age" value="${esc(stallAge(m))}" hint="${esc(stallHint(m))}"></herdr-metric></div>
     <herdr-mission-activity updated-at="${esc(m.updated_at || '')}" source="${esc(m.source || '')}"></herdr-mission-activity>
     <details class="hd-card" data-history-panel="brief"><summary>Recorded mission brief</summary>
       <p style="white-space:pre-wrap;overflow-wrap:anywhere">${esc(m.title || '')}</p>
@@ -289,115 +457,359 @@ async function viewMission(parts, revision) {
       ${m.cwd && m.cwd !== scope ? `<p style="overflow-wrap:anywhere"><code>${esc(m.cwd)}</code></p>` : ''}
       <herdr-ident kind="mission" id="${esc(m.mission_id)}"></herdr-ident>
     </details>
-    <details class="hd-card" data-history-panel="sessions"><summary>Recorded sessions · ${sessions}</summary>${sessionsHtml}</details>
+    <details class="hd-card" data-history-panel="sessions"><summary>Recorded agents · ${sessions}</summary>${sessionsHtml}</details>
     <details class="hd-card" data-history-panel="timeline"><summary>Timeline</summary><herdr-timeline id="mission-timeline"></herdr-timeline></details>
-    <details class="hd-card" data-history-panel="events"><summary>Event stream</summary><div id="mission-stream">${streamHtml}</div></details>`;
-      history.querySelectorAll('details[data-history-panel]').forEach(el => { if (open.has(el.dataset.historyPanel)) el.open = open.get(el.dataset.historyPanel); });
+    <details class="hd-card" data-history-panel="events"><summary>Event stream</summary><div id="mission-stream">${streamHtml}</div></details>`);
 
       const timelineElement = history.querySelector('#mission-timeline');
-      try {
-        const { timeline } = await client.missionTimeline(missionKey(m));
-        timelineElement.items = timeline || [];
-      } catch { timelineElement.items = []; }
+      let items = [];
+      try { items = (await client.missionTimeline(missionKey(m))).timeline || []; } catch { /* empty timeline */ }
+      const itemsKey = JSON.stringify(items);
+      if (timelineElement !== shownTimeline[0] || itemsKey !== shownTimeline[1]) { timelineElement.items = items; shownTimeline = [timelineElement, itemsKey]; }
+      sources.ok('history');
     } catch (error) {
-      if (history.isConnected) history.innerHTML = `<herdr-error message="${esc(error.message)}"></herdr-error>`;
+      if (history.isConnected) sources.fail('history', `Recorded history: ${error.message || 'request failed'}`);
+      // A failed first load shows the error; a failed refresh keeps the last history.
+      if (history.isConnected && !history.querySelector('details[data-history-panel]')) history.innerHTML = `<herdr-error message="${esc(error.message)}"></herdr-error>`;
     } finally { pending = false; }
   };
-  if (key.startsWith('pi:')) refreshMissionHistory = refreshHistory;
-  await refreshHistory(m);
+  try { await refreshHistory(m); } catch (error) { disposeMission(); throw error; }
+  if (revision !== renderRevision) { disposeMission(); return; }
+  // Mission telemetry owns its polling; a live event refreshes only the recorded history, in place.
+  return { refresh: () => refreshHistory(), dispose: disposeMission };
 }
 
 async function missionSessions(m) {
   const list = m.sessions || [];
-  if (!list.length) return '<herdr-empty message="No sessions on this mission yet"></herdr-empty>';
+  if (!list.length) return '<herdr-empty message="No agents on this mission yet"></herdr-empty>';
   const t = titles(await missionTitles());
   return list.map((s) => `
     <div class="hd-card">
-      <div class="hd-card__title"><a href="#/herd/session/${esc(s.session_id)}">${esc(s.agent_role || 'agent session')}</a></div>
+      <div class="hd-card__title"><a href="#/herd/session/${esc(encodeURIComponent(s.session_id))}">${esc(s.display_name || s.agent_role || 'Agent')}</a></div>
       <div style="margin:6px 0"><herdr-status stage="${esc(s.status)}"></herdr-status></div>
       <div class="hd-card__sub">${esc(sessionSummary(s, t))}</div>
     </div>`).join('');
 }
 
-async function viewSessions() {
-  const { sessions } = await client.listSessions();
-  if (!sessions.length) { root.innerHTML = '<herdr-empty message="No sessions yet"></herdr-empty>'; return; }
-  const t = titles(await missionTitles());
-  root.innerHTML = '<h1>Sessions</h1><div class="hd-grid">' + sessions.map((s) => `
-    <div class="hd-card">
-      <div class="hd-card__title"><a href="#/herd/session/${esc(s.session_id)}">${esc(s.agent_role || 'agent session')}</a></div>
-      <div style="margin:6px 0"><herdr-status stage="${esc(s.status)}"></herdr-status></div>
-      <div class="hd-card__sub">${esc(sessionSummary(s, t))}</div>
-    </div>`).join('') + '</div>';
+// A delivery run's own status text. Test runs / builds report statuses like
+// passed/failed/ok/error; these are shown as text (never color alone) with a
+// semantic <herdr-status> for the recognized lifecycle values.
+function runStatusText(run) {
+  const raw = typeof run.status === 'string' ? run.status : '';
+  if (/^pass|^ok|^success|^healthy/.test(raw)) return { label: 'Passed', tone: 'healthy' };
+  if (/^fail|^error|^crash/.test(raw)) return { label: 'Failed', tone: 'failed' };
+  if (raw) return { label: raw, tone: raw.toLowerCase() };
+  return { label: 'Unknown', tone: 'unknown' };
 }
 
-async function viewSession(parts) {
-  const s = await client.getSession(parts[parts.length - 1]);
-  if (!s) { root.innerHTML = '<herdr-error message="Session not found"></herdr-error>'; return; }
-  const t = titles(await missionTitles());
-  const missionTitle = s.mission_id ? (t[s.mission_id] || s.mission_id) : '—';
-  const attach = s.attach || (s.host_id && s.mission_id
-    ? `ssh ${s.host_id} && herdr workspace focus ${s.mission_id}` : '');
-  const rows = [
-    ['What it is doing', s.summary],
-    ['Directory (cwd)', s.cwd],
-    ['Git branch', s.branch],
-    ['PID', s.pid],
-    ['Command line', s.cmdline],
-  ].filter(([, v]) => v);
-  root.innerHTML = `
-    <h1>${esc(s.agent_role || 'Agent session')}</h1>
-    <div style="margin:8px 0"><herdr-status stage="${esc(s.status)}"></herdr-status>
-      <span class="hd-card__sub"> · <herdr-ident kind="session" id="${esc(s.session_id)}"></herdr-ident></span></div>
-    <div class="hd-grid">
-      <herdr-metric label="Agent role" value="${esc(s.agent_role || '—')}"></herdr-metric>
-      <herdr-metric label="Model" value="${esc(s.model || '—')}"></herdr-metric>
-      <herdr-metric label="Mission" value="${esc(missionTitle)}"></herdr-metric>
-      <herdr-metric label="Host" value="${esc(s.host_id || '—')}"></herdr-metric>
-    </div>
-    ${rows.length ? `<div class="hd-card" style="margin-top:12px">
-      <div class="hd-card__sub">Operational detail</div>
-      ${rows.map(([k, v]) => `
-        <div style="margin-top:8px">
-          <div class="hd-card__sub">${esc(k)}</div>
-          <div><code>${esc(v)}</code></div>
-        </div>`).join('')}
-      ${attach ? `<div style="margin-top:10px">
-        <div class="hd-card__sub">Attach</div>
-        <div class="hd-inline">
-          <code style="flex:1">${esc(attach)}</code>
-          <button class="hd-btn" id="copy-attach">Copy</button>
-        </div>
-      </div>` : ''}
-    </div>` : ''}
-    <h3 style="margin-top:20px">Send a message</h3>
-    <div class="hd-card">
-      <form id="msg-form" class="hd-inline">
-        <input id="msg-input" placeholder="steer the session…" style="flex:1;padding:8px 10px;border:1px solid var(--border);border-radius:var(--radius-sm)">
-        <button type="submit" class="hd-btn">Send</button>
-      </form>
-    </div>
-    <div id="inspector-host"></div>
-    <h3 style="margin-top:20px">Event stream</h3>
-    <div id="session-stream">${await streamList('session', s.session_id)}</div>`;
-  disposeInspector = mountInspector(document.getElementById('inspector-host'), client, s.session_id);
+function runDuration(run) {
+  if (!run.started_at) return null;
+  const start = Date.parse(run.started_at);
+  if (Number.isNaN(start)) return null;
+  // Only a run that is still in progress uses the current clock; a run without
+  // an end timestamp that is not running has no trustworthy duration. Never
+  // fabricate a duration for a completed run with a missing end.
+  const running = /^(running|in progress|in_progress|active|queued|pending)$/.test((run.status || '').toLowerCase());
+  const end = run.ended_at ? Date.parse(run.ended_at) : (running ? Date.now() : NaN);
+  if (Number.isNaN(end)) return null;
+  const ms = end - start;
+  return ms >= 0 ? formatDuration(ms) : null;
+}
 
-  const copyBtn = document.getElementById('copy-attach');
-  if (copyBtn) {
-    copyBtn.addEventListener('click', () => copyText(attach, copyBtn));
+// A read-only telemetry-state badge (live/stale/unknown) from the mission
+// record's ``telemetry_state`` (issue #28). Text first, never colour alone:
+// UNKNOWN is its own word so a mission with no collector is never mistaken for
+// live work.
+function telemetryBadge(state) {
+  const s = typeof state === 'string' ? state.toLowerCase() : '';
+  const label = s === 'live' ? 'Live telemetry' : s === 'stale' ? 'Stale telemetry' : 'Telemetry unknown';
+  // Text first, never colour alone. A dedicated element (not herdr-status) so it
+  // can't be mistaken for, or collide with, the mission's own status badge.
+  return `<span class="hd-card__sub" data-telemetry-state>${esc(label)}</span>`;
+}
+
+// Stall age = the age of the most recent activity report (collector freshness),
+// exposed by the server as report_age_seconds from the same activity store that
+// derives telemetry_state (issue #28). For a no-collector mission (telemetry
+// state unknown) report_age_seconds is null and we say so rather than imply a
+// liveness reading from an absent timestamp or the lifecycle record's updated_at.
+function stallAge(m) {
+  const age = m?.report_age_seconds;
+  if (typeof age !== 'number') return 'Unknown';  // no collector / no freshness data
+  return formatDuration(age * 1000);
+}
+
+function stallHint(m) {
+  const s = typeof m?.telemetry_state === 'string' ? m.telemetry_state.toLowerCase() : '';
+  if (typeof m?.report_age_seconds !== 'number') return 'No collector attached for this mission';
+  if (s === 'stale') return 'Collector connected but has not reported recently';
+  if (s === 'live') return 'Collector reporting as expected';
+  return 'Since the most recent activity report';
+}
+
+function missionSectionNav(key) {
+  const e = (s) => encodeURIComponent(s);
+  return `<nav class="hd-inline" aria-label="Mission sections" style="margin:14px 0;font-size:13px">`
+    + `<a href="#/missions/${e(key)}">Mission</a>`
+    + `<a href="#/missions/${e(key)}/tests">Tests & builds</a>`
+    + `<a href="#/missions/${e(key)}/reviews">Reviews & PRs</a>`
+    + `</nav>`;
+}
+
+function renderDeliveryRuns(runs) {
+  if (!runs.length) return '<herdr-empty message="No tests or builds recorded for this mission"></herdr-empty>';
+  return runs.map((run) => {
+    const st = runStatusText(run);
+    const counts = ['passed', 'failed', 'skipped', 'total']
+      .filter((c) => run[c] != null)
+      .map((c) => `${esc(c)} ${esc(String(run[c]))}`)
+      .join(' · ');
+    const duration = runDuration(run);
+    const kind = run.isBuild ? 'Build' : 'Test run';
+    return `<div class="hd-card" style="margin:8px 0">`
+      + `<div class="hd-card__title">${kind} · <herdr-status stage="${esc(st.tone)}"></herdr-status> <span class="hd-card__sub">${esc(st.label)}</span></div>`
+      + (counts ? `<div class="hd-card__sub">${counts}</div>` : `<div class="hd-card__sub">Counts unknown</div>`)
+      + `<div class="hd-card__sub">${duration ? `Duration ${esc(duration)}` : 'Duration not recorded'}${run.started_at ? ` · started ${esc(formatTimestamp(run.started_at))}` : ''}</div>`
+      + `</div>`;
+  }).join('');
+}
+
+async function viewMissionTests(parts, revision) {
+  const key = decodeURIComponent(parts[1]);
+  let mission = null;
+  try { mission = await client.getMission(key); } catch (error) { if (error.status !== 404) throw error; }
+  if (revision !== renderRevision) return;
+  if (!mission) {
+    statusPage(`<a href="#/missions">← Missions</a><herdr-error message="Mission not found"></herdr-error>`, true);
+    return;
   }
-  document.getElementById('msg-form').addEventListener('submit', async (e) => {
-    e.preventDefault();
-    const input = document.getElementById('msg-input');
-    if (!input.value.trim()) return;
+  const title = (mission.title || 'Mission').slice(0, 180);
+  root.innerHTML = `<a href="#/missions">← Missions</a>${liveHead(`<h1 style="overflow-wrap:anywhere">${esc(title)} · Tests & builds</h1>`)}${missionSectionNav(key)}<div id="mission-tests"></div>`;
+  const host = document.getElementById('mission-tests');
+  let pending = false;
+  let trailing = false;
+  const loadRuns = async (initial) => {
+    if (pending) { trailing = true; return; }
+    if (!host.isConnected || document.hidden) return;
+    pending = true;
     try {
-      await client.sendMessage(s.session_id, input.value.trim());
-      input.value = '';
-      document.getElementById('session-stream').innerHTML = await streamList('session', s.session_id);
-    } catch (err) {
-      alert(err.message);
+      // Page-specific loading state: the section is blank until its first data
+      // arrives, so show a spinner rather than an empty flash.
+      if (initial) host.innerHTML = skeleton('tests & builds');
+      let tests = [], builds = [];
+      const [t, b] = await Promise.all([client.missionTests(key), client.missionBuilds(key)]);
+      tests = (t && t.tests) || []; builds = (b && b.builds) || [];
+      if (revision !== renderRevision || !host.isConnected) return;
+      const runs = [...builds.map((r) => ({ ...r, isBuild: true })), ...tests.map((r) => ({ ...r, isBuild: false }))]
+        .sort((a, b) => (b.started_at || '').localeCompare(a.started_at || ''));
+      if (initial) host.innerHTML = renderDeliveryRuns(runs);
+      else morph(host, renderDeliveryRuns(runs));
+      root.querySelector('herdr-freshness')?.touch(true);
+    } catch (error) {
+      if (!host.isConnected) return;
+      root.querySelector('herdr-freshness')?.touch(false, error.message);
+      if (initial) host.innerHTML = `<herdr-error message="${esc(error.message)}"></herdr-error>`;
+    } finally {
+      pending = false;
+      if (trailing) { trailing = false; loadRuns(false); }
     }
-  });
+  };
+  try { await loadRuns(true); } catch { /* not-found handled below */ }
+  if (revision !== renderRevision) return;
+  return { refresh: () => loadRuns(false), dispose() {} };
+}
+
+// A review's verdict text and a pull request's merge status, shown as text
+// (never color alone). UNKNOWN verdicts render 'unknown', never approved.
+function reviewVerdictText(verdict) {
+  const v = typeof verdict === 'string' ? verdict.trim().toLowerCase() : '';
+  if (!v) return { label: 'Unknown', tone: 'unknown' };
+  if (v === 'unknown') return { label: 'Unknown', tone: 'unknown' };
+  if (v === 'approved' || v === 'approve') return { label: 'Approved', tone: 'healthy' };
+  if (v.includes('changes') || v === 'request_changes' || v === 'rejected' || v === 'denied') return { label: 'Changes requested', tone: 'attention' };
+  if (v === 'commented' || v === 'comment') return { label: 'Commented', tone: 'waiting' };
+  return { label: verdict, tone: v };
+}
+
+function prStatusText(status) {
+  const s = typeof status === 'string' ? status.trim().toLowerCase() : '';
+  if (s === 'merged') return { label: 'Merged', tone: 'healthy' };
+  if (s === 'open' || s === 'opened') return { label: 'Open', tone: 'active' };
+  if (s === 'closed' || s === 'rejected') return { label: 'Closed', tone: 'waiting' };
+  return { label: status || 'Unknown', tone: s || 'unknown' };
+}
+
+function renderReviewsAndPulls(reviews, pulls) {
+  const sections = [];
+  sections.push(`<h2>Reviews</h2>`);
+  if (!reviews.length) sections.push('<herdr-empty message="No reviews recorded for this mission"></herdr-empty>');
+  sections.push(reviews.map((review) => {
+    const v = reviewVerdictText(review.verdict);
+    const findings = (review.findings || [])
+      .map((f) => `<li>${esc(f.severity || 'info')}: ${esc(f.summary || '')}${f.detail ? ` — ${esc(f.detail)}` : ''}</li>`)
+      .join('');
+    return `<div class="hd-card" style="margin:8px 0">`
+      + `<div class="hd-card__title"><herdr-status stage="${esc(v.tone)}"></herdr-status> <span>${esc(v.label)}</span></div>`
+      + `<div class="hd-card__sub">${review.reviewer ? `Reviewed by ${esc(review.reviewer)}` : 'Reviewer not recorded'}${review.completed_at ? ` · ${esc(formatTimestamp(review.completed_at))}` : ''}</div>`
+      + (findings ? `<ul style="margin:6px 0 0;padding-left:18px">${findings}</ul>` : '')
+      + `</div>`;
+  }).join(''));
+  sections.push(`<h2>Pull requests</h2>`);
+  if (!pulls.length) sections.push('<herdr-empty message="No pull requests recorded for this mission"></herdr-empty>');
+  sections.push(pulls.map((pr) => {
+    const st = prStatusText(pr.status);
+    const branch = pr.branch ? `${esc(pr.branch)} → ${esc(pr.base || '?')}` : '';
+    const link = typeof pr.url === 'string' && /^https?:\/\//.test(pr.url)
+      ? `<a href="${esc(pr.url)}" target="_blank" rel="noopener noreferrer">PR #${esc(String(pr.number))}</a>`
+      : `PR #${esc(String(pr.number))}`;
+    return `<div class="hd-card" style="margin:8px 0">`
+      + `<div class="hd-card__title"><herdr-status stage="${esc(st.tone)}"></herdr-status> ${link}</div>`
+      + `<div class="hd-card__sub"><span>${esc(st.label)}</span>${branch ? ` · ${branch}` : ''}${pr.repository ? ` · ${esc(pr.repository)}` : ''}</div>`
+      + `</div>`;
+  }).join(''));
+  return sections.join('');
+}
+
+async function viewMissionReviews(parts, revision) {
+  const key = decodeURIComponent(parts[1]);
+  let mission;
+  try { mission = await client.getMission(key); } catch (error) { if (error.status !== 404) throw error; }
+  if (revision !== renderRevision) return;
+  if (!mission) {
+    statusPage(`<a href="#/missions">← Missions</a><herdr-error message="Mission not found"></herdr-error>`, true);
+    return;
+  }
+  const title = (mission.title || 'Mission').slice(0, 180);
+  root.innerHTML = `<a href="#/missions">← Missions</a>${liveHead(`<h1 style="overflow-wrap:anywhere">${esc(title)} · Reviews & PRs</h1>`)}${missionSectionNav(key)}<div id="mission-reviews"></div>`;
+  const host = document.getElementById('mission-reviews');
+  let pending = false;
+  let trailing = false;
+  const loadReviews = async (initial) => {
+    if (pending) { trailing = true; return; }
+    if (!host.isConnected || document.hidden) return;
+    pending = true;
+    try {
+      if (initial) host.innerHTML = '<herdr-spinner label="Loading reviews & PRs"></herdr-spinner>';
+      let reviews = [], pulls = [];
+      const [rv, pr] = await Promise.all([client.missionReviews(key), client.missionPulls(key)]);
+      reviews = (rv && rv.reviews) || []; pulls = (pr && pr.pulls) || [];
+      if (revision !== renderRevision || !host.isConnected) return;
+      if (initial) host.innerHTML = renderReviewsAndPulls(reviews, pulls);
+      else morph(host, renderReviewsAndPulls(reviews, pulls));
+      root.querySelector('herdr-freshness')?.touch(true);
+    } catch (error) {
+      if (!host.isConnected) return;
+      root.querySelector('herdr-freshness')?.touch(false, error.message);
+      if (initial) host.innerHTML = `<herdr-error message="${esc(error.message)}"></herdr-error>`;
+    } finally {
+      pending = false;
+      if (trailing) { trailing = false; loadReviews(false); }
+    }
+  };
+  try { await loadReviews(true); } catch { /* handled inside */ }
+  if (revision !== renderRevision) return;
+  return { refresh: () => loadReviews(false), dispose() {} };
+}
+
+async function viewSessions() {
+  return ownPolling(mountSessionsView(root, client, {tab: route().query.get('tab') || 'current'}));
+}
+
+function sessionStatusText(s) {
+  const outcome = recordOutcome(s);
+  const terminal = outcome === 'failed' || outcome === 'finished';
+  const reportedStatus = terminal && statusOutcome(s.status) !== outcome ? s.stage : s.status;
+  return reportedStatus ? `Last reported ${String(reportedStatus).replaceAll('_',' ').toLowerCase()}` : 'Status unknown';
+}
+
+async function viewSession(parts, revision) {
+  const id = decodeURIComponent(parts[parts.length - 1]);
+  const controller = new AbortController();
+  sessionRequest = controller;
+  const deadline = setTimeout(() => controller.abort(), 15000);
+  try {
+    const s = await client.getSession(id, {signal: controller.signal});
+    if (revision !== renderRevision || controller.signal.aborted) return;
+    if (!s) { statusPage('<herdr-error message="Agent not found"></herdr-error>', true); return; }
+    const outcome = recordOutcome(s);
+    const terminal = outcome === 'failed' || outcome === 'finished';
+    const clip = value => typeof value === 'string' ? value.slice(0, 180) : '';
+    const project = typeof s.cwd === 'string' ? s.cwd.replace(/\\/g, '/').split('/').filter(Boolean).pop() : '';
+    const fields = [['Agent ID',s.session_id],['Last reported status',s.status],['Stage',s.stage],['Directory',s.cwd],['Git branch',s.branch],['PID',s.pid],['Command line',s.cmdline],['Model',s.model],['Last reported',formatTimestamp(s.updated_at)]].filter(([,v])=>v != null && v !== '');
+    root.innerHTML = `<style>.sd-head{display:flex;flex-wrap:wrap;gap:12px;align-items:center;margin:14px 0}.sd-meta{color:var(--text-secondary);line-height:1.6;overflow-wrap:anywhere}.sd-details{margin:14px 0;overflow-wrap:anywhere}.sd-details summary{cursor:pointer;font-weight:600}.sd-details dl{display:grid;grid-template-columns:minmax(100px,auto) minmax(0,1fr);gap:8px 16px}.sd-details dt{color:var(--text-secondary)}.sd-details dd{margin:0;white-space:pre-wrap;overflow-wrap:anywhere}.sd-title{overflow-wrap:anywhere}@media(max-width:600px){.sd-details dl{display:block}.sd-details dd{margin:4px 0 12px}}</style>
+      <a href="#/herd?tab=${terminal ? outcome : 'current'}">← Agents</a>
+      ${liveHead(`<h1 class="sd-title">${esc(clip(s.display_name || s.agent_role) || 'Agent')}${project ? ` · ${esc(clip(project))}` : ''}</h1>`)}
+      <div class="sd-head"><strong data-session-head><span data-session-status>${esc(sessionStatusText(s))}</span> · <span data-session-updated>${esc(formatTimestamp(s.updated_at))}</span></strong><span class="sd-meta">${esc(s.host_id || 'Host not reported')} · ${esc(s.model || 'Model not reported')}</span></div>
+      <p class="sd-meta">${terminal ? `${outcome === 'failed' ? 'Failed' : 'Finished'} agent · recorded inspection remains available.` : 'Agent status reflects the last report; it is not a live process check.'}</p>
+      ${s.summary ? `<p style="overflow-wrap:anywhere">${esc(clip(s.summary))}</p>` : ''}
+      ${s.mission_id || s.mission_key ? `<p class="sd-meta" id="session-mission">Mission association not resolved · ${esc(s.mission_key || s.mission_id)}</p>` : ''}
+      <div id="related-panel"></div>
+      <div id="session-terminal" class="sd-details"></div>
+      <details class="hd-card sd-details" id="session-details"><summary>Agent details</summary><dl>${fields.map(([label,value])=>`<dt>${esc(label)}</dt><dd>${esc(value)}</dd>`).join('')}</dl>${s.summary ? `<p>${esc(s.summary)}</p>` : ''}</details>
+      <div id="session-workspace-host"></div>
+      <details class="hd-card sd-details" id="advanced-inspector"><summary>Advanced inspection</summary><div id="inspector-host"></div></details>
+      <details class="hd-card sd-details" id="session-events"><summary>Recorded event stream</summary><div id="session-stream">${skeleton('recorded events', { rows: 2 })}</div></details>`;
+    const relatedDispose = showRelated('session', s.session_id, null, relatedIntegrationLinks(s,'session',s.session_id), { sessionId: s.session_id });
+    const disposeWorkspace = mountSessionWorkspace(document.getElementById('session-workspace-host'), client, s, {onRename: profile => { s.display_name = profile.display_name; const title = root.querySelector('.sd-title'); if (title) title.textContent = `${profile.display_name}${project ? ` · ${clip(project)}` : ''}`; }});
+    let disposeAdvanced = null;
+    const advanced = document.getElementById('advanced-inspector');
+    advanced.addEventListener('toggle', () => {
+      if (advanced.open && !disposeAdvanced) disposeAdvanced = mountInspector(document.getElementById('inspector-host'), client, s.session_id);
+      else if (!advanced.open && disposeAdvanced) { disposeAdvanced(); disposeAdvanced = null; document.getElementById('inspector-host').replaceChildren(); }
+    });
+    const disposeTerminal = mountTerminalAttach(document.getElementById('session-terminal'), client, s, {copyText});
+    const disposeSession = combineDisposers(relatedDispose, disposeWorkspace, disposeTerminal, () => disposeAdvanced?.());
+    const missionElement = document.getElementById('session-mission');
+    if (missionElement) {
+      const contextController = new AbortController();
+      sessionRequest = contextController;
+      const contextDeadline = setTimeout(() => contextController.abort(), 15000);
+      client.listMissions(undefined, {signal: contextController.signal}).then(response => {
+        if (revision !== renderRevision || !missionElement.isConnected || contextController.signal.aborted) return;
+        const match = sessionEntries([s], response.missions || [])[0]?.mission;
+        if (match) missionElement.innerHTML = `Mission: <a href="#/missions/${esc(encodeURIComponent(match.key))}">${esc(clip(match.title))}</a>`;
+      }).catch(() => { /* The unconfirmed association stays explicit. */ }).finally(() => {
+        clearTimeout(contextDeadline);
+        if (sessionRequest === contextController) sessionRequest = null;
+      });
+    }
+    const stream = document.getElementById('session-stream');
+    const head = root.querySelector('[data-session-head]');
+    let headRequest = null;
+    // The chip follows the two reads this page refreshes: the agent record and its recorded events.
+    const sources = freshnessSources(chipIn(root));
+    sources.ok('agent');
+    streamItems('session',s.session_id).then(items=>{if(stream.isConnected && revision===renderRevision){paintStream(stream,items,{initial:true});sources.ok('events');}}).catch((error)=>{if(stream.isConnected){stream.innerHTML='<span class="muted">Recorded events could not load.</span>';sources.fail('events',`Recorded events: ${error.message || 'request failed'}`);}});
+    // The page streams its own detail; a live event refreshes the recorded event list (new events
+    // are appended) and the head status line, in place.
+    return {
+      async refresh() {
+        if (!stream.isConnected) return;
+        headRequest?.abort();
+        const request = new AbortController(); headRequest = request;
+        const failed = (source, label) => (error) => { if (!request.signal.aborted) sources.fail(source, `${label}: ${error?.message || 'request failed'}`); return null; };
+        const [items, latest] = await Promise.all([
+          streamItems('session', s.session_id).catch(failed('events', 'Recorded events')),
+          client.getSession(id, { signal: request.signal }).catch(failed('agent', 'Agent')),
+        ]);
+        if (headRequest === request) headRequest = null;
+        if (!stream.isConnected || request.signal.aborted) return;
+        if (items) { paintStream(stream, items); sources.ok('events'); }
+        if (latest) sources.ok('agent');
+        if (!latest || !head.isConnected) return;
+        // A heartbeat moves the report time only; the head flashes when the status itself changes.
+        patchText(head.querySelector('[data-session-updated]'), formatTimestamp(latest.updated_at));
+        if (patchText(head.querySelector('[data-session-status]'), sessionStatusText(latest))) flash(head);
+      },
+      dispose() { headRequest?.abort(); disposeSession(); },
+    };
+  } catch (error) {
+    if (revision !== renderRevision) return;
+    throw new Error(controller.signal.aborted ? 'Agent details could not load. Try again.' : error.message);
+  } finally {
+    clearTimeout(deadline);
+    if (sessionRequest === controller) sessionRequest = null;
+  }
 }
 
 async function copyText(text, btn) {
@@ -419,219 +831,168 @@ async function copyText(text, btn) {
 async function viewServices(_parts, revision) {
   const { services } = await client.listServices();
   if (revision !== renderRevision) return;
-  servicesView = mountServices(root, client, services, { showAll: route().query.get('all') === '1' });
+  return mountServices(root, client, services, { scope: ({'system-services':'system','local-services':'local'})[_parts[0]] || 'herdr', showAll: route().query.get('all') === '1', status: route().query.get('status') || undefined });
 }
 
 async function viewService(parts, revision) {
   const svc = await client.request(`/api/v1/services/${encodeURIComponent(decodeURIComponent(parts[1]))}`);
   if (revision !== renderRevision) return;
   if (!svc || svc.error) { root.innerHTML = '<herdr-error message="Service not found"></herdr-error>'; return; }
-  root.innerHTML = renderServiceDetails(svc);
+  // The details view rewrites its own container, so it gets a child; the Related panel sits beside it.
+  root.innerHTML = '<div data-service-details></div><div id="related-panel"></div>';
+  const details = mountServiceDetails(root.querySelector('[data-service-details]'), client, svc);
+  const relatedDispose = showRelated('service', svc.service_id || safeDecode(parts[1]) || '', root.querySelector('#related-panel'));
+  return { refresh() {}, dispose: combineDisposers(() => details.dispose(), relatedDispose) };
 }
 
-async function viewHosts() {
-  const { hosts } = await client.listHosts();
-  if (!hosts.length) { root.innerHTML = '<herdr-empty message="No hosts reporting"></herdr-empty>'; return; }
-  root.innerHTML = '<h1>Hosts</h1><div class="hd-grid">' + hosts.map((h) => `
-    <div class="hd-card">
-      <div class="hd-card__title"><a href="#/hosts/${esc(h.host_id)}">${esc(h.host_name)}</a></div>
-      <div style="margin:6px 0"><herdr-status stage="${esc(h.status)}"></herdr-status></div>
-      <div class="hd-card__sub"><code>${esc(h.tailnet_ip)}</code> · seen ${formatTimestamp(h.last_seen)}</div>
-    </div>`).join('') + '</div>';
+async function viewHosts(_parts, revision) {
+  const data = await loadHosts(client);
+  if (revision !== renderRevision) return;
+  return mountHosts(root, client, { data, driftedOnly: route().query.get('drift') === '1' });
 }
 
-async function viewHost(parts) {
-  const h = await client.request(`/api/v1/hosts/${esc(parts[1])}`);
-  if (!h || h.error) { root.innerHTML = '<herdr-error message="Host not found"></herdr-error>'; return; }
-  let cpu = '—', mem = '—', disk = '—', seen = '—';
-  try {
-    const { samples } = await client.request(`/api/v1/hosts/${esc(parts[1])}/telemetry?limit=1`);
-    if (samples && samples.length) {
-      const s = samples[0];
-      cpu = (s.cpu ?? s.cpu_pct) ?? '—';
-      mem = (s.mem ?? s.mem_pct) ?? '—';
-      disk = s.disk_pct ?? '—';
-      seen = formatTimestamp(s.at ?? h.last_seen);
-    }
-  } catch { /* telemetry optional */ }
-  root.innerHTML = `
-    <h1>${esc(h.host_name)}</h1>
-    <div style="margin:8px 0"><herdr-status stage="${esc(h.status)}"></herdr-status>
-      <span class="hd-card__sub"> · <herdr-ident kind="host" id="${esc(h.host_id)}"></herdr-ident></span></div>
-    <div class="hd-grid">
-      <herdr-metric label="Tailnet IP" value="${esc(h.tailnet_ip)}"></herdr-metric>
-      <herdr-metric label="CPU" value="${esc(cpu)}"></herdr-metric>
-      <herdr-metric label="Memory" value="${esc(mem)}"></herdr-metric>
-      <herdr-metric label="Disk" value="${esc(disk)}"></herdr-metric>
-    </div>
-    <p class="hd-card__sub">last telemetry ${esc(seen)}</p>`;
+async function viewHost(parts, revision) {
+  const id = safeHostId(parts[1]);
+  if (!id) { statusPage('<herdr-error message="Host not found"></herdr-error>', true); return; }
+  const requested = route().query.get('range');
+  const range = RANGES.includes(requested) ? requested : '1h';
+  const data = await loadHostDetail(client, id, range);
+  if (revision !== renderRevision) return;
+  const view = mountHostDetail(root, client, id, range, { data });
+  // mountHostDetail morphs only its own body, so a slot appended after it survives refreshes.
+  const slot = document.createElement('div'); slot.id = 'related-panel'; root.appendChild(slot);
+  const relatedDispose = showRelated('host', safeDecode(parts[1]) || '', slot);
+  return { refresh: (hint) => view.refresh(hint), dispose: combineDisposers(() => view.dispose(), relatedDispose) };
 }
 
-async function viewActivity() {
-  root.innerHTML = '<h1>Activity</h1>' + await activityList(50);
+async function viewActivity(_parts, revision) {
+  const data = await loadActivity(client, missionTitles);
+  if (revision !== renderRevision) return;
+  return mountActivity(root, client, { data, missionTitles });
 }
 
-async function activityList(limit) {
-  const { events } = await client.activity(limit);
-  if (!events.length) return '<herdr-empty message="No activity yet"></herdr-empty>';
-  const t = titles(await missionTitles());
-  return events.map((e) => {
-    const d = describeEvent(e, { missionTitles: t });
-    const meta = `<div class="hd-card__sub">${esc(d.kind)} · ${formatTimestamp(e.source_timestamp)}</div>`;
-    if (d.muted) {
-      // Low-signal events (e.g. heartbeats) get a compact, de-emphasised row.
-      return `<div class="hd-card" style="opacity:.6">
-        <div class="hd-card__title">${esc(d.title)}</div>
-        <div class="hd-card__sub">${esc(d.detail)}</div>${meta}</div>`;
-    }
-    return `<div class="hd-card">
-      <div class="hd-card__title">${esc(d.title)}</div>
-      <div class="hd-card__sub">${esc(d.detail)}</div>${meta}
-    </div>`;
-  }).join('');
+// /analytics and /analytics/{missions,models,tokens,hosts}: one mounted view per sub-page.
+async function viewAnalytics(parts, revision) {
+  const sub = parts[1] || '';
+  const data = await loadAnalytics(client, sub);
+  if (revision !== renderRevision) return;
+  return mountAnalytics(root, client, sub, { data });
 }
 
-async function viewAnalytics() {
-  const [missions, models, hosts] = await Promise.all([
-    client.analytics('missions'), client.analytics('models'), client.analytics('hosts'),
+// The LLM pages fetch ~10 series per render and hold filter focus: they are snapshots, refreshed
+// only by navigation (a filter change rewrites the hash), never by live events.
+function addSnapshotChip() {
+  const title = root.querySelector('h1');
+  const head = document.createElement('div'); head.className = 'hd-live-head';
+  if (title) { title.before(head); head.append(title); } else root.prepend(head);
+  head.insertAdjacentHTML('beforeend', CHIP());
+  head.querySelector('herdr-freshness').touch(true);
+}
+
+async function viewLlm(_parts, revision) {
+  const q = route().query;
+  const window_ = WINDOWS.includes(q.get('window')) ? q.get('window') : '24h';
+  const filters = { project: q.get('project') || '', model: q.get('model') || '' };
+  const f = { window: window_, ...filters };
+  const step = STEP_FOR[window_];
+  const series = (metric) => client.llm('timeseries', { ...f, step, metric });
+  const [total, models, agents, problems, projects, requests, errors, ttft, speed, sessions] = await Promise.all([
+    client.llm('stats', { ...f, group: 'all' }),
+    client.llm('stats', { window: window_, project: filters.project, group: 'model' }),
+    client.llm('stats', { ...f, group: 'session' }),
+    client.llm('errors', f),
+    client.llm('stats', { window: window_, group: 'project' }),
+    series('requests'), series('errors'), series('ttft_p95'), series('speed_p50'),
+    client.listSessions().catch(() => ({ sessions: [] })),
   ]);
-  root.innerHTML = `
-    <h1>Analytics</h1>
-    <div class="hd-grid">
-      <herdr-metric label="Missions" value="${missions.total}"></herdr-metric>
-      <herdr-metric label="Completion rate" value="${missions.completion_rate}%"></herdr-metric>
-      <herdr-metric label="Models" value="${Object.keys(models.models).length}"></herdr-metric>
-      <herdr-metric label="Hosts healthy" value="${hosts.healthy} / ${hosts.total}"></herdr-metric>
-    </div>
-    <p style="margin-top:12px"><a href="#/analytics/tokens">Token usage by project &rarr;</a></p>
-    <h3 style="margin-top:20px">Missions by stage</h3>
-    ${stageBars(missions.by_stage)}`;
+  if (revision !== renderRevision) return NO_REFRESH;
+  const names = {};
+  for (const s of sessions.sessions || []) if (s.display_name) names[s.session_id] = s.display_name;
+  root.innerHTML = renderLlm({
+    window: window_, filters, names,
+    projects: projects.groups.map((g) => g.key),
+    modelNames: [...new Set(models.groups.map((g) => g.key))],
+  }, { total, models, agents, problems, series: { requests, errors, ttft, speed } });
+  addSnapshotChip();
+  root.querySelectorAll('[data-llm-filter]').forEach((el) => el.addEventListener('change', () => {
+    window.location.hash = `#/llm?${llmQuery({ window: window_, ...filters, [el.dataset.llmFilter]: el.value })}`;
+  }));
+  return NO_REFRESH;
+}
+async function viewLlmSession(parts, revision) {
+  const id = safeDecode(parts[2]);
+  if (id == null) { root.innerHTML = '<herdr-error message="Agent not found"></herdr-error>'; return NO_REFRESH; }
+  const q = route().query;
+  const window_ = WINDOWS.includes(q.get('window')) ? q.get('window') : '24h';
+  const f = { window: window_, session: id };
+  const step = STEP_FOR[window_];
+  const series = (metric) => client.llm('timeseries', { ...f, step, metric });
+  const [total, models, problems, requests, errors, ttft, speed, session] = await Promise.all([
+    client.llm('stats', { ...f, group: 'all' }), client.llm('stats', { ...f, group: 'model' }),
+    client.llm('errors', f), series('requests'), series('errors'), series('ttft_p95'), series('speed_p50'),
+    client.getSession(id).catch(() => null),
+  ]);
+  if (revision !== renderRevision) return NO_REFRESH;
+  root.innerHTML = renderLlmSession({
+    window: window_, sessionId: id, known: Boolean(session), name: session?.display_name || session?.agent_role || '',
+  }, { total, models, problems, series: { requests, errors, ttft, speed } });
+  addSnapshotChip();
+  if (session) {
+    const slot = document.createElement('div'); slot.id = 'related-panel';
+    root.querySelector('.hd-live-head').after(slot);
+    return { refresh() {}, dispose: showRelated('session', id, slot) };
+  }
+  return NO_REFRESH;
 }
 
-async function viewAnalyticsMissions() { await viewAnalytics(); }
-async function viewAnalyticsModels() {
-  const { models, total_sessions } = await client.analytics('models');
-  root.innerHTML = `<h1>Model analytics</h1><p>${total_sessions} total sessions</p><div class="hd-grid">` +
-    Object.entries(models).map(([model, u]) => `
-      <div class="hd-card">
-        <div class="hd-card__title">${esc(model)}</div>
-        <div class="hd-card__sub">${u.sessions} session(s) · ${u.messages} messages</div>
-      </div>`).join('') + '</div>';
-}
-async function viewAnalyticsTokens() {
-  const t = await client.analytics('tokens');
-  const fmt = (n) => Number(n || 0).toLocaleString();
-  const rows = (bucket) => Object.entries(bucket).map(([k, u]) => `
-      <tr><td>${esc(k)}</td><td>${fmt(u.requests)}</td><td>${fmt(u.input_tokens)}</td>
-      <td>${fmt(u.output_tokens)}</td><td>${fmt(u.reasoning_tokens)}</td><td>${fmt(u.failed)}</td></tr>`).join('');
-  const table = (title, bucket) => `<h3 style="margin-top:20px">${title}</h3>
-    <table class="hd-table"><thead><tr><th></th><th>Requests</th><th>Input</th><th>Output</th>
-    <th>Reasoning</th><th>Failed</th></tr></thead><tbody>${rows(bucket) ||
-      '<tr><td colspan="6">No usage recorded yet.</td></tr>'}</tbody></table>`;
-  root.innerHTML = `<h1>Token usage</h1>
-    <div class="hd-grid">
-      <herdr-metric label="Requests" value="${fmt(t.total.requests)}"></herdr-metric>
-      <herdr-metric label="Input tokens" value="${fmt(t.total.input_tokens)}"></herdr-metric>
-      <herdr-metric label="Output tokens" value="${fmt(t.total.output_tokens)}"></herdr-metric>
-    </div>` + table('By project', t.by_project) + table('By model', t.by_model) +
-    table('By day', t.by_day);
-}
-async function viewAnalyticsHosts() {
-  const h = await client.analytics('hosts');
-  root.innerHTML = `
-    <h1>Host analytics</h1>
-    <div class="hd-grid">
-      <herdr-metric label="Total" value="${h.total}"></herdr-metric>
-      <herdr-metric label="Healthy" value="${h.healthy}"></herdr-metric>
-      <herdr-metric label="Unavailable" value="${h.unavailable}"></herdr-metric>
-    </div>`;
-}
+const NO_STREAM_EVENTS = '<herdr-empty message="No events for this entity yet"></herdr-empty>';
 
-function stageBars(byStage) {
-  const entries = Object.entries(byStage || {});
-  if (!entries.length) return '<herdr-empty message="No mission data"></herdr-empty>';
-  return entries.map(([stage, n]) => `
-    <div class="hd-card" style="display:flex;align-items:center;gap:12px">
-      <herdr-status stage="${esc(stage)}"></herdr-status>
-      <div style="flex:1;background:var(--surface-2);border-radius:4px;height:10px;overflow:hidden">
-        <div style="width:${Math.min(100, n * 14)}%;height:100%;background:var(--accent)"></div>
-      </div>
-      <span class="hd-card__sub">${n}</span>
-    </div>`).join('');
-}
-
-async function streamList(entityType, entityId) {
+// Recorded events for one entity as keyed cards ({key, html}); keyed by sequence so a refresh
+// keeps the cards already shown (morph pairs data-key, patchList appends only the new ones).
+async function streamItems(entityType, entityId) {
   const { events } = await client.request(
-    `/api/v1/events?entity_type=${entityType}&entity_id=${entityId}`);
-  if (!events.length) return '<herdr-empty message="No events for this entity yet"></herdr-empty>';
+    `/api/v1/events?entity_type=${encodeURIComponent(entityType)}&entity_id=${encodeURIComponent(entityId)}`);
+  if (!events.length) return [];
   const t = titles(await missionTitles());
   return events.map((e) => {
     const d = describeEvent(e, { missionTitles: t });
-    return `<div class="hd-card">
+    const key = String(e.sequence ?? e.event_id ?? '');
+    return { key, html: `<div class="hd-card" data-key="${esc(key)}">
       <div class="hd-card__title">${esc(d.title)}</div>
       <div class="hd-card__sub">${esc(d.detail)}</div>
       <div class="hd-card__sub">seq ${e.sequence} · ${formatTimestamp(e.source_timestamp)}</div>
-    </div>`;
-  }).join('');
+    </div>` };
+  });
 }
 
-// Live updates (Spec §52, §85): subscribe to the SSE stream and refresh the
-// current view when new events arrive. A full re-render re-fetches all data
-// for the view, so refreshing on *every* event (the fleet emits several per
-// second) would trip the API's per-IP rate limit ("too many requests") and
-// exhaust the browser's HTTP/1.1 connection pool ("Failed to fetch"). We
-// therefore throttle the SSE-driven refresh to at most once per
-// LIVE_REFRESH_MS (trailing edge). User navigation still renders immediately.
-let liveTimer = null;
-let lastLiveRender = 0;
-const LIVE_REFRESH_MS = 5000;
+async function streamList(entityType, entityId) {
+  const items = await streamItems(entityType, entityId);
+  return items.length ? items.map((item) => item.html).join('') : NO_STREAM_EVENTS;
+}
+
+// Paints recorded events into a container in place: new events are appended (and enter, unless
+// calm), cards already shown keep their nodes, and the container itself is never replaced.
+function paintStream(container, items, { initial = false } = {}) {
+  if (!items.length) { if (container.innerHTML !== NO_STREAM_EVENTS) container.innerHTML = NO_STREAM_EVENTS; return; }
+  for (const child of [...container.children]) if (!child.hasAttribute('data-key')) child.remove();
+  patchList(container, items, { key: (item) => item.key, render: (item) => item.html, animate: !initial });
+  if (initial) for (const el of container.querySelectorAll('[data-entering]')) el.removeAttribute('data-entering');
+}
+
+// Live updates (Spec §52, §85): SSE events feed the refresh bus, which calls
+// the current view's refresh() at most once per LIVE_REFRESH_MS (first event
+// after idle at once, the rest coalesced to the window's end). A hidden tab
+// pauses the bus; becoming visible refreshes the view once.
 connectEvents({
   url: '/api/v1/events/stream',
-  onEvent: () => {
-    if (servicesView) {
-      if (!liveTimer) liveTimer = setTimeout(() => { liveTimer = null; servicesView?.refresh(); }, LIVE_REFRESH_MS);
-      return;
-    }
-    // Mission telemetry owns its polling; SSE must not reset worker inspection.
-    if (onMissionPage() && (disposeMissionActivity || decodeURIComponent(route().parts[1] || '').startsWith('pi:'))) {
-      // Refresh recorded lifecycle data separately so disclosures stay open.
-      if (refreshMissionHistory && !liveTimer) liveTimer = setTimeout(() => {
-        liveTimer = null;
-        refreshMissionHistory?.();
-      }, LIVE_REFRESH_MS);
-      return;
-    }
-    // The session page streams its own detail; a full re-render would reset it.
-    // Only the (cheap) generic event list below the inspector is refreshed there.
-    if (onSessionPage()) {
-      const el = document.getElementById('session-stream');
-      if (el && !liveTimer) {
-        const sid = decodeURIComponent(window.location.hash.split('/').pop());
-        liveTimer = setTimeout(async () => {
-          liveTimer = null;
-          if (!onSessionPage()) return;
-          try { el.innerHTML = await streamList('session', sid); } catch { /* keep last */ }
-        }, LIVE_REFRESH_MS);
-      }
-      return;
-    }
-    if (liveTimer) clearTimeout(liveTimer);
-    // Fire shortly after the last event, but never more often than once per
-    // LIVE_REFRESH_MS since the previous live refresh.
-    const wait = Math.max(150, LIVE_REFRESH_MS - (Date.now() - lastLiveRender));
-    liveTimer = setTimeout(() => {
-      lastLiveRender = Date.now();
-      render();
-    }, wait);
-  },
-  onError: () => { /* keep last view; the client auto-reconnects */ },
+  onEvent: (event) => bus.dispatch(event),
+  onContact: () => noteStreamContact(true),
+  onError: () => { noteStreamContact(false); /* keep last view; the client auto-reconnects */ },
 });
 
-document.addEventListener('click', event => {
-  if (event.target.closest?.('[data-route-retry]')) render();
-});
-window.addEventListener('hashchange', () => {
-  if (liveTimer) { clearTimeout(liveTimer); liveTimer = null; }
-  lastLiveRender = Date.now(); render();
-});
-render();
+document.addEventListener('visibilitychange', () => { if (document.hidden) bus.pause(); else bus.resume(); });
+if (document.hidden) bus.pause();
+
+window.addEventListener('hashchange', () => render());
+root.addEventListener('click', event => { if (event.target.closest?.('[data-route-retry]')) render(); });
+completeSignInIfRedirected().finally(() => render());

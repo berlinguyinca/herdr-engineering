@@ -19,7 +19,7 @@ export class HerdrClient {
     this.fetch = fetchImpl;
   }
 
-  async request(path, { method = 'GET', body, signal } = {}) {
+  async request(path, { method = 'GET', body, signal = AbortSignal.timeout(15000) } = {}) {
     const startedAt = Date.now();
     const url = `${this.base}${path}`;
     const headers = { Accept: 'application/json' };
@@ -75,6 +75,79 @@ export class HerdrClient {
       if (err instanceof ApiError && err.status === 404) return null;
       throw err;
     }
+  }
+
+  getHandoffTree({ signal } = {}) {
+    return this.request('/api/v1/handoffs/tree', { signal });
+  }
+
+  listHandoffs(state, { signal } = {}) {
+    const query = state ? `?state=${encodeURIComponent(state)}` : '';
+    return this.request(`/api/v1/handoffs${query}`, { signal });
+  }
+
+  listArtifacts({ q, type, status, offset, limit, signal } = {}) {
+    const query = new URLSearchParams();
+    for (const [key, value] of Object.entries({ q, type, status, offset, limit })) {
+      if (value != null && value !== '') query.set(key, String(value));
+    }
+    return this.request(`/api/v1/artifacts${query.size ? `?${query}` : ''}`, { signal });
+  }
+
+  getArtifact(id, { signal } = {}) {
+    return this.request(`/api/v1/artifacts/${encodeURIComponent(id)}`, { signal });
+  }
+
+  artifactDownloadUrl(id) {
+    return `${this.base}/api/v1/artifacts/${encodeURIComponent(id)}/download`;
+  }
+
+  artifactVersions(id, { signal } = {}) {
+    return this.request(`/api/v1/artifacts/${encodeURIComponent(id)}/versions`, { signal });
+  }
+
+  artifactVersion(id, versionId, { signal } = {}) {
+    return this.request(`/api/v1/artifacts/${encodeURIComponent(id)}/versions/${encodeURIComponent(versionId)}`, { signal });
+  }
+
+  artifactReviews(id, { signal } = {}) {
+    return this.request(`/api/v1/artifacts/${encodeURIComponent(id)}/reviews`, { signal });
+  }
+
+  requestArtifactReview(artifactId, versionId, { signal } = {}) {
+    return this.request('/api/v1/artifact-reviews', {
+      method: 'POST', body: { artifact_id: artifactId, version_id: versionId }, signal,
+    });
+  }
+
+  completeArtifactReview(reviewId, decision, comments = [], { signal } = {}) {
+    return this.request(`/api/v1/artifact-reviews/${encodeURIComponent(reviewId)}/complete`, {
+      method: 'POST', body: { decision, comments }, signal,
+    });
+  }
+
+  listPublications({ signal } = {}) {
+    return this.request('/api/v1/publications', { signal });
+  }
+
+  approvePublication(id, { signal } = {}) {
+    return this.request(`/api/v1/publications/${encodeURIComponent(id)}/approve`, {
+      method: 'POST', body: {}, signal,
+    });
+  }
+
+  revokePublication(id, { signal } = {}) {
+    return this.request(`/api/v1/publications/${encodeURIComponent(id)}/revoke`, {
+      method: 'POST', body: {}, signal,
+    });
+  }
+
+  schedulerOverview({ signal } = {}) {
+    return this.request('/api/v1/scheduler', { signal });
+  }
+
+  schedulerPlan(request, { signal } = {}) {
+    return this.request('/api/v1/scheduler/plan', { method: 'POST', body: request, signal });
   }
 
   // -- missions -----------------------------------------------------------

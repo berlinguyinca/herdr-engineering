@@ -1,12 +1,26 @@
 /* HerdR Collaboration: page styles on top of the shared design tokens (theme.css/base.css).
  * Same look as the dashboard: white cards on a light grey ground, green accent, Inter. */
 .cx-page { color-scheme: light dark; }
+.cx-agentcard[hidden] { display: none; }
 /* WCAG 1.4.3 (T16 UI gate): the shared light tokens in theme.css give 3.2:1 for muted text and for white-on-accent
  * (below 4.5:1). Darker values for this page only; the dashboard theme is untouched. Dark mode sets its own below. */
 .cx-page, .cx-embed {
   --accent: #0a7358; --accent-hover: #085f49;
   --text-secondary: #55556a; --text-muted: #686880;
   --status-attention: #b45309; --status-blocked: #c2410c;
+}
+/* Embedded collaboration follows the dashboard's chosen theme, including forced dark on a light OS. */
+:root[data-theme="dark"] .cx-embed {
+  --accent: inherit; --accent-hover: inherit;
+  --text-secondary: inherit; --text-muted: inherit;
+  --status-attention: inherit; --status-blocked: inherit;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) .cx-embed {
+    --accent: inherit; --accent-hover: inherit;
+    --text-secondary: inherit; --text-muted: inherit;
+    --status-attention: inherit; --status-blocked: inherit;
+  }
 }
 @media (prefers-color-scheme: dark) {
   .cx-page {

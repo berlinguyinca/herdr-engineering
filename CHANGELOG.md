@@ -5,29 +5,80 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
-### Live web UI: pages update in place (#218, #221 and the PRs stacked on them)
-- Pages no longer re-render on live events. A route loads once, behind a skeleton, and then returns
-  a mounted view `{ refresh(hint), dispose() }`. A shared refresh bus throttles SSE events to one
-  refresh per view every 5 s.
-- A keyed patcher (`patchList`, `morph`, `patchText`, `patchAttr`) writes only what changed. It
-  keeps focus, open `<details>` and the text selection.
-- The SSE stream sends a keep-alive every 10 s and no longer ends when idle.
-- Motion marks data changes: values count up, changed values flash, rows enter and leave.
-  `motion.js` also has the skeleton placeholder used on first loads.
-- Every page head has a freshness chip. It turns amber when stale and red with the error, and a page
-  with several sources names every one that is failing. On GitHub the chip also shows the sync state.
-- Theme (auto, light, dark) and Calm (auto, on, off) controls are in the sidebar, stored per browser
-  and applied before first paint.
-  - Calm, and OS reduced motion unless calm is off, applies every change at once with no animation.
-    `tests/playwright/calm.test.mjs` guards this on every route.
-  - The dark palette is token-based. It covers every view, including the CI health map, pipeline
-    steps and test results, which used to hard-code light colours. `tests/playwright/dark-theme.test.mjs`
-    checks 4.5:1 text contrast and no light fills on every route, in the loading, error, empty and
-    populated states.
-  - The light theme looks the same as before.
-- Conventions for new views are in `packages/herdr-web-components/README.md` ("Live views:
-  conventions").
-- UI only; no API, config or migration change beyond the SSE keep-alive. Rollback: revert the PRs.
+### Collab addressing (`@owner.harness`, sigil completion, mention chips)
+- Release note: a room task's text now starts with the target's `@address` (e.g. `@gert.pi fix the build`). The worker in this repo strips its own leading address; worker scripts installed from an earlier release pass it through to the harness unchanged, so update them.
+- An external (sponsored) agent never gets an `@owner.harness` address; it is reached by its `ext-...` name and its chip is marked external. A person handle outranks an agent name, an agent cannot be renamed to (or granted under) a member's handle, and an agent keeps its last 5 old names as aliases.
+
+### T17 / ADR-0008 P2: peer registry, room shares and signed read-only export (default off, YAML only)
+- New: `control_plane.federation` gains the peer registry (`public_key` pinned per peer, per-peer `enabled`, `export_rooms`, `requests_per_minute`, `max_bytes_per_hour`, `key_expires_at`, `rotate_after`, `next_public_key` for rotation overlap) plus `server_id`, `signing_key_file` and the validity knobs. Still default off, hot-reread, no environment variable; an unreadable file, an invalid section or a non-boolean `enabled` is off.
+- New collab events `federation_share_granted` (revocable creation), `federation_share_revoked` (in `SAFETY_EVENTS`, pre-paid), and `federation_peer_enabled` / `federation_peer_disabled` (the YAML change record and its pre-paid revocation). A room owner accepts a share (`POST /api/v1/collab/rooms/<room>/federation/shares`); the operator YAML must also list `{peer, room}`; any owner revokes, and the kill switch never blocks a revocation. Members can see that their room is shared.
+- New `GET /api/v1/federation/shares` and `/shares/<id>/events`: read-only, authenticated by an Ed25519 request signature (pinned FULL key, audience, timestamp window, single-use nonce), answered with exports signed over the exact bytes, a bounded validity window, a per-type FIELD ALLOWLIST (`message` only; a pseudonymous sender, no ids, emails, mentions or context) run through `redact.py`. `org`/`private`/`mission` scope and history from before the grant never leave; every unshared, revoked, unlisted or unauthenticated case is one byte-identical 404.
+- Fixed (P1 gap): `PeerPolicy.matches` compared only 12 hex characters of the key fingerprint. It now compares all 64 (`hmac.compare_digest`); the peer principal carries the full fingerprint and a peer ingest event is admitted only for the pinned key. `mirror_room` is now optional (an export-only peer needs none; a peer without one can never write). A P1-shaped YAML (a 12-64 hex `key_fingerprint` and no `public_key`) still parses but can no longer authenticate or ingest: add `public_key`.
+- No puller, importer, mirror room or typed write (P3/P4). Signing uses `cryptography` (already installed with the `collab` and `review-gate` extras; new `federation` extra names it), imported lazily: without it federation is off. Contract: `docs/contracts/federation-export.md`. Rollback: revert the PR (kill switch `control_plane.federation.enabled: false`).
+
+### T17 / ADR-0008 P1: `peer` principal and visibility clamp (flagged dark, no network code)
+- New per-principal visibility clamp in envelope normalisation (`federation.Clamp`, `normalize_envelope(..., clamp=)`): an event from a `peer` principal is rewritten to `visibility_scope: room` in its one local mirror room, never wider, with the sender's origin, requested scope and local ids kept only as `claimed_*` provenance. It cannot be skipped: a peer without a clamp, and any v1 or non-`lineage` peer event, is refused.
+- New `peer` principal kind, never `operator`, `collab` or `external`, and never mintable from an API key. `control_plane.federation` (YAML only, default off, hot-reread, any error means off; `"*"` rejected for a peer) is parsed and enforced; startup refuses a bad section. `_check_lineage_scope` and `_check_reserved_nodes` treat a peer as non-operator.
+- New reserved lineage namespace `peer:<peer>.` (node type `peer`): writable by nobody locally (operator included); a peer may write only inside its own namespace on every edge endpoint. Mirrored edges take no part in local gate staleness (fork promotion, herdr#264).
+- No endpoint, puller, network code, environment variable or migration. Rollback: revert the PR (the kill switch is `control_plane.federation.enabled`, default false). Contract: `docs/contracts/event-envelope-v2.md`.
+
+### T17 Independent-server federation ADR (docs only)
+- ADR-0008 is now Accepted with the owner's answers to D1–D10 recorded; implementation starts with P1 (visibility clamp and `peer` principal kind), flagged off.
+- `docs/adr/ADR-0008-independent-server-federation.md`, status Proposed, awaiting approval: options, trust model, data flow, failure modes, migration, non-goals and ten owner decisions. No code, configuration, endpoint or migration; nothing is implemented until the ADR is approved. Rollback: revert the PR.
+
+### T16 Herdr-side gaps from the Pi and AutoSpec wiring
+- Steering: an ingest key can read the CURRENT fence and gate digest at apply time: `GET /api/v1/steering/targets/{node_id}` (owner of the node, live
+  request, room-scoped nodes included) and `fence`/`digest`/`digests` on `GET /api/v1/graph/nodes/{id}` for nodes the key may read. A `fork` may carry
+  a bounded, redacted `instruction` (the changed requirement), delivered in the pending item like a redirect's.
+- Review quorum: `POST /api/v1/graph/nodes/{pr}/review-quorum/rereview` records a durable, idempotent-per-head, scoped (trusted head writer, reviewer or
+  operator), rate-limited, audited re-review request; the quorum read shows it as `rereview_request` for that head.
+  A head may be asked about again once its latest ask is older than `review_quorum.rereview_retry_seconds` (YAML, default 3600); inside that window
+  AutoSpec owns retries. Review-gate worker keys are refused on the route (403); the gate's own re-reviews are a separate, independent mechanism.
+- External agents: workspace-link authorize no longer tells a non-owner whether a link id exists; MCP `tools/list` is per agent (an external agent is never offered the task or helper tools); delegation budgets accept
+  and enforce `max_turns` (an answer or proposal past it closes the task; a `complete` answer is always accepted, and a task stored without `max_turns` has no ceiling; and echo `max_hops`, the chain-depth ceiling); a consultation also records `asker -> target` as a graph edge (reference nodes).
+- Acceptance: four Herdr strict xfails became real tests; the manifest minimums rise (s2 20, s5 15); no minimum is lowered.
+- No migration, no environment variable. Rollback: revert the PR. Checked by loading rows of this stream into the previous build: it starts and serves normally and the rows do no harm, but it does NOT keep them out of its event feed (it lists them as ordinary events, each carrying only the head and request id); the stored rows stay in the log and are ignored again once this code is back.
+
+### T16 security fixes, Herdr side (stacked on the T16 release-gate branch)
+- Ingest is an allow-list of entity types; `collab`, `ci_*` and other adapter-owned streams and the server's session receipts can no longer be forged
+  by an ingest key (H1, M1, M5). Foreign `collab` rows already in a database are quarantined at startup, and a corrupt collab log disables collaboration
+  alone with an ERROR instead of stopping the control plane.
+- A full collab log still revokes: creating a revocable thing pre-pays its revocation (cannot be drained by create/revoke cycles or presence flips); chat stops at 90 %, other writes at 95 %, revocations may use 100 % (H2).
+- `collab-repair` (dry run by default) sets aside foreign `collab` rows without deleting; a corrupt log disables collaboration only and shows in `/api/v1/health` (H1).
+- `replay_history: since_join` now also covers node/edge/listing reads and the insights/progress snapshots (M2, L2).
+- All collab feature switches (`steering`, `contextual`, `insights`, `delegation_enabled`, `replay_history`) are hot and fail closed the same way,
+  including under `--collab-only` (M3, M15). One consistency test enumerates them.
+- `/api/v1/ingest/sources` is operator-only for other principals' sources (M4); gap state is partitioned per key (M6); trusted evidence writers are
+  selected before the contribution cap (M7); the quorum route hides a head the reader cannot read (M9); the generic rate limiter keys clients behind a
+  proxy by their forwarded address (M12); an open listener is no operator in a reserved namespace (L1).
+- Test: the graph neighbourhood budget test counts rendered nodes instead of timing a wall clock.
+- Ingest sequence-conflict 409 now says `reason: "sequence_conflict"` and `last_sequence` (the caller's own source only) so a restarted emitter can resume (Pi H6).
+- Round 4: the revocation reserve counts every unrevoked join token and every member including expired guests (revoking those emits an event); repair/server
+  locking works on filesystems without `flock` (lock-file fallback, never a startup crash), re-checks the inode after locking, and refuses when no lock can be proven;
+  repair on a pre-0003 database says to migrate first; degraded operator reads answer 503.
+- Round 3: safety events are idempotent (a repeated `revoke_agent`/`external_leave`/user decision commits nothing, so they cannot fill the log); the
+  revocation reserve is recomputed from state; `collab-repair --apply` works on a real PostgreSQL (tid binding fixed, tested against a throwaway
+  server), refuses to rewrite a log a live server holds, reports a gap tail it cannot fix by default, and also quarantines rows whose
+  timestamps disagree; unauthenticated callers cannot see that collaboration is degraded; a shared-mission event written from another room is shown
+  to the reader after their join.
+- Round 5 (after merging main): main's panic switch, helper cancel and host Remove work on a nearly full log (`helpers_paused`, `helper_cancelled`,
+  `egress_removed` are safety events; helper requests, host approvals/promotions and owner-listed hosts pre-pay their revocation); a degraded start
+  writes nothing into the fabric graph and keeps unknown agent namespaces reserved; ingest still accepts the system-graph adapter's
+  `repository`/`request`/`span` and refuses the review-gate prefixes; the `.lock` fallback records `host pid` (another host's lock is live, our own
+  pid is stale, so a container restarting as PID 1 starts; caveat: a recreated container gets a new hostname, so its predecessor's lock must be
+  removed by hand); `collab-repair` keeps the log's owner and mode. The since_join id map is capped at 1,000,000 ids (oldest evicted first, an
+  evicted id is pre-join: fail closed), see docs/contracts/lineage-events.md.
+- No migration, no environment variable. Rollback: revert the PR.
+
+### T16 end-to-end acceptance harness
+- New `tests/e2e` suite (scenarios S1-S7) driven by `scripts/run_acceptance.py` against real servers, a real Postgres and a fake `gh`.
+  It is opt-in: plain `pytest` and `scripts/validate.sh` deselect everything marked `e2e`; the runner passes `-m e2e`.
+  Local overrides (autospec binary, Pi checkout, Postgres bin dir) go in the git-ignored `tests/e2e/acceptance.local.yaml`; no environment variables.
+- The runner's verdict guards reject non-strict or bare `xfail`, and report "nothing selected on the herdr side" (pytest exit 5)
+  instead of a failure when `--only` picks Pi-only scenarios.
+- Redaction: `author`, `authors`, `author_login` and `author_name` keys are no longer redacted by name (review quorum compares the
+  author login, and a redacted value let an author approve their own PR). The `sk-` pattern now also matches after an ANSI colour
+  code or `%3D` and keeps ids such as `task-sk-ab` intact.
 
 ### Attention inbox, evidence-based progress and optimization analytics (T15, stacked on #174, #173, #168, #169)
 - New read routes `GET /rooms/{id}/attention|progress|analytics` and `POST /rooms/{id}/attention/ack|snooze|restore`, plus Attention and Progress
@@ -113,6 +164,12 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ### Plannotator bridge: digest echo
 - `herdr-plannotator plan` now prints the `plan_digest` (and `review_id`) the receipt was bound to alongside the upstream decision, computed by the bridge and authoritative over upstream output, so a caller can verify a decision belongs to the exact plan bytes it submitted. Code reviews are unchanged.
+
+### YAML-only fabric agent configuration
+- The fabric agent, its install scripts, the enroll-sync/service-metadata units and the Ansible fabric tasks no longer
+  write or read `fabric.env` (`HERDR_ENGINEERING_FABRIC_URL`). The gateway URL is `fabric.url` in the central
+  `fleet-config.yaml` (fallback: `fabric.gateway_url` in `config.yaml`). `--gateway`/`--control-plane` on the install
+  scripts are ignored with a warning. Existing `fabric.env` files are left in place and are harmless.
 
 ### Lineage graph projection (T02, Herdr side)
 - Migration `0004_sequence_domain_per_principal.sql`: the envelope sequence domain is `(actor id, source)`.

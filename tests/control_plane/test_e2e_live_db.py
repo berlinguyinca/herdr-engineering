@@ -145,7 +145,7 @@ def test_migrations_applied_and_round_trip_hydration(seeded_db):
     source = PostgresSource(dsn=_PG_DSN)
     counts = load_into(repo, source)
     assert counts == {"missions": 1, "sessions": 1, "services": 1,
-                      "hosts": 1, "events": 2}
+                      "hosts": 1, "events": 2, "artifacts": 0}
 
     m = repo.get_mission("m1")
     assert m["title"] == "e2e mission"

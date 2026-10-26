@@ -20,7 +20,7 @@ const service=id=>({service_id:id,service_name:`Service ${id}`,name:id,host_id:'
 const session=id=>({session_id:id,display_name:`Agent ${id}`,host_id:'h-1',status:'running',cwd:'/work/app',updated_at:T0,last_activity:T0});
 const host=id=>({host_id:id,host_name:id,status:'healthy',last_seen:T0,updated_at:T0});
 const event=n=>({event_id:`e${n}`,sequence:n,event_type:'MissionStageChanged',entity_type:'mission',entity_id:'m-1',source_timestamp:T0,payload:{title:'Mission'}});
-const PAYLOAD={missions:[{mission_id:'m-1',title:'Mission one',status:'EXECUTING',updated_at:T0}],sessions:[session('s-1'),session('s-2')],
+const PAYLOAD={items:[],groups:[],snapshots:[],analyses:[],artifacts:[],versions:[],publications:[],nodes:[],edges:[],missions:[{mission_id:'m-1',title:'Mission one',status:'EXECUTING',updated_at:T0}],sessions:[session('s-1'),session('s-2')],
  services:[service('svc-1'),service('svc-2')],hosts:[host('h-1'),host('h-2')],activities:[],events:[event(1),event(2)],timeline:[],
  available:true,reviews:[],repositories:[],issues:[],counts:{},pagination:{},status:'ready',components:[],summary:{},reports:[],pipelines:[],samples:[],
  total:2,completed:1,completion_rate:50,by_stage:{review:1,done:1},models:{'qwen-27b':{sessions:2,messages:40},'flint':{sessions:1,messages:12},'codex':{sessions:1,messages:7}},total_sessions:2,healthy:2,unavailable:0,

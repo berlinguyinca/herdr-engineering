@@ -2,11 +2,11 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { missionEntries, filterMissions, compactMissionRow, measuredProgress } from '../mission-catalog-view.js';
 const now=Date.parse('2026-10-20T12:00:00Z');
-const projection=(key='pi:MSN-1',overrides={})=>({mission_key:key,host_id:'beast',mission:{id:'MSN-1',title:'Repair spectra parser',status:'EXECUTING'},freshness:{state:'live',age_seconds:2},activity:{health:'active',currentActivity:{summary:'Running parser tests'}},...overrides});
+const projection=(key='pi:MSN-1',overrides={})=>({mission_key:key,activity_snapshot_at:new Date(now-2000).toISOString(),host_id:'beast',mission:{id:'MSN-1',title:'Repair spectra parser',status:'EXECUTING'},freshness:{state:'live',age_seconds:2},activity:{health:'active',currentActivity:{summary:'Running parser tests'}},...overrides});
 test('catalog merges only exact namespaced mission identities and retains missing recorded context',()=>{
  const entries=missionEntries([projection()], [{mission_key:'pi:MSN-1',mission_id:'MSN-1',title:'Recorded title',purpose:'Spectrum format decoder'}, {mission_id:'MSN-1',title:'Independent HerdR mission'}],now,now);
  assert.equal(entries.length,2);assert.equal(entries.find(e=>e.key==='pi:MSN-1').title,'Repair spectra parser');
- assert.equal(entries.find(e=>e.key==='MSN-1').group,'history');
+ assert.equal(entries.find(e=>e.key==='MSN-1').group,'recorded');
  assert.equal(filterMissions(entries,{search:'spectrum decoder'}).length,1);
 });
 test('only current evidence contributes to running or needs-attention groups',()=>{
@@ -15,7 +15,7 @@ test('only current evidence contributes to running or needs-attention groups',()
  const updating=projection('pi:updating',{connection:'updating',freshness:{state:'updating',age_seconds:0}});
  const finished=projection('pi:done',{mission:{id:'done',status:'COMPLETE'}});
  const groups=Object.fromEntries(missionEntries([projection(),stalled,stale,updating,finished],[],now,now).map(e=>[e.key,e.group]));
- assert.deepEqual(groups,{'pi:MSN-1':'running','pi:attention':'attention','pi:stale':'lastknown','pi:updating':'lastknown','pi:done':'history'});
+ assert.deepEqual(groups,{'pi:MSN-1':'running','pi:attention':'attention','pi:stale':'lastknown','pi:updating':'lastknown','pi:done':'finished'});
  assert.equal(missionEntries([projection()],[],now,now+120000)[0].group,'lastknown');
 });
 test('title search uses full mission and objective but compact rows bound untrusted content and worker noise',()=>{
@@ -37,10 +37,10 @@ test('waiting duration and source freshness remain visible without exposing obje
  assert.match(html,/gateway busy/);assert.match(html,/2m 0s/);assert.match(html,/data-report-age/);assert.doesNotMatch(html,/full objective|Heartbeat age|Last progress/);
 });
 
-test('fresh failures need attention while stale failures remain last known',()=>{
+test('failed lifecycle stays in Failed regardless of telemetry freshness',()=>{
  const failed=projection('pi:failed',{mission:{id:'failed',status:'FAILED'}});
- assert.equal(missionEntries([failed],[],now,now)[0].group,'attention');
- assert.equal(missionEntries([failed],[],now,now+120000)[0].group,'lastknown');
+ assert.equal(missionEntries([failed],[],now,now)[0].group,'failed');
+ assert.equal(missionEntries([failed],[],now,now+120000)[0].group,'failed');
 });
 test('queued and unknown workers are not mislabeled finished, and stale counts stay qualified',()=>{
  const p=projection();p.activity.workerDetails=[{state:'queued'},{state:'running'},{state:'failed'},{state:'mystery'}];
@@ -48,4 +48,56 @@ test('queued and unknown workers are not mislabeled finished, and stale counts s
  assert.match(compactMissionRow(entry,now),/1 current · 1 finished · 2 other workers/);
  entry=missionEntries([p],[],now,now+120000)[0];
  assert.match(compactMissionRow(entry,now+120000),/1 active at last report · 1 finished · 2 other/);
+});
+
+test('terminal tabs exclude recorded active or unknown missions and honor lifecycle stage',()=>{
+ const entries=missionEntries([], [
+  {mission_id:'active',status:'active',stage:'implementing'},
+  {mission_id:'unknown'},
+  {mission_id:'closed',status:'closed'},
+  {mission_id:'failed',status:'active',stage:'failed'},
+  {mission_id:'done',status:'active',stage:'completed'},
+ ],now,now);
+ assert.deepEqual(filterMissions(entries,{tab:'unconfirmed'}).map(e=>e.key),['active','unknown']);
+ assert.deepEqual(filterMissions(entries,{tab:'failed'}).map(e=>e.key),['failed']);
+ assert.deepEqual(filterMissions(entries,{tab:'finished'}).map(e=>e.key),['closed','done']);
+});
+test('terminal lifecycle remains visible when disconnected and old worker health says active',()=>{
+ const entry=missionEntries([projection('pi:closed',{mission:{status:'CLOSED'},freshness:{state:'disconnected',age_seconds:900}})],[],now,now)[0];
+ assert.equal(entry.group,'finished');
+ assert.match(compactMissionRow(entry,now),/Closed/);
+});
+
+test('stage-based terminal outcomes display the terminal stage and freeze old waits',()=>{
+ const record=missionEntries([], [{mission_id:'finished-stage',status:'active',stage:'complete'}],now,now)[0];
+ assert.match(compactMissionRow(record,now),/Complete · recorded/);
+ const p=projection('pi:done',{mission:{status:'CLOSED'},activity_snapshot_at:'2026-10-20T12:00:00Z',snapshot_at:'2026-10-20T12:00:00Z',activity:{waitingReason:'gateway_busy',waitingSince:'2026-10-20T11:59:00Z'}});
+ const entry=missionEntries([p],[],now,now+10000)[0];
+ assert.match(compactMissionRow(entry,now+10000),/1m 0s<\/span> at last snapshot/);
+});
+
+test('stored outcomes add a result chip, last event, and result and repository filters to catalog rows', () => {
+  const recorded = [{ mission_id: 'a', title: 'Alpha', status: 'complete', stage: 'complete', updated_at: '2026-10-20T10:00:00Z' },
+    { mission_id: 'b', title: 'Beta', status: 'failed', stage: 'failed', updated_at: '2026-10-20T10:00:00Z' },
+    { mission_id: 'c', title: 'Gamma <img src=x>', status: 'implementation', stage: 'implementation', updated_at: '2026-10-20T10:00:00Z' }];
+  const outcomes = {
+    a: { result: 'succeeded', duration_s: 7200, agent_count: 3, repository: 'org/app', last_event: 'PR #214 merged' },
+    b: { result: 'failed', duration_s: null, agent_count: null, repository: 'org/other', last_event: 'Ended: failed' },
+    c: { result: 'weird', duration_s: 5, agent_count: 1, repository: 'org/app', last_event: '<img src=x onerror=1>' },
+  };
+  const entries = missionEntries([], recorded, Date.now(), Date.now(), outcomes);
+  const byKey = Object.fromEntries(entries.map((e) => [e.key, e]));
+  assert.equal(byKey.a.summary.result, 'succeeded');
+  assert.deepEqual(filterMissions(entries, { result: 'succeeded' }).map((e) => e.key), ['a']);
+  assert.deepEqual(filterMissions(entries, { repository: 'org/app' }).map((e) => e.key).sort(), ['a', 'c']);
+  assert.deepEqual(filterMissions(entries, { result: 'failed', repository: 'org/app' }), []);
+  assert.deepEqual(filterMissions(entries, { search: 'merged' }).map((e) => e.key), ['a']);
+  const row = compactMissionRow(byKey.a);
+  assert.match(row, /data-result="succeeded"><strong>Succeeded<\/strong> · 2h 0m · 3 agents/);
+  assert.match(row, /Last: PR #214 merged/);
+  assert.match(compactMissionRow(byKey.b), /data-result="failed"><strong>Failed<\/strong><\/span>/);   // unknown figures are left out, not zero
+  const hostile = compactMissionRow(byKey.c);
+  assert.doesNotMatch(hostile, /<img/);
+  assert.match(hostile, /data-result="unknown"/);
+  assert.doesNotMatch(compactMissionRow(missionEntries([], [recorded[0]], Date.now(), Date.now(), null)[0]), /mc-result/);
 });

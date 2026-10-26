@@ -41,6 +41,7 @@ test("startup emits a single host.registered envelope", () => {
   const out = mapEvent(env({ HERDR_PLUGIN_EVENT: "startup" }));
   assert.equal(out.length, 1);
   assert.deepEqual(out[0], {
+    source: "herdr",
     entity_type: "host",
     entity_id: HOST,
     event_type: "host.registered",
@@ -68,7 +69,7 @@ test("workspace.created emits mission.started with the resolved human label", ()
   );
   const m = out.find((e) => e.entity_type === "mission");
   assert.ok(m);
-  assert.equal(m.entity_id, "wK");
+  assert.equal(m.entity_id, "herdr-ws:wK");
   assert.equal(m.event_type, "mission.started");
   assert.equal(m.payload.title, "herdr frontend work"); // NOT "wK"
   assert.equal(m.payload.cwd, "/home/wohlgemuth/IdeaProjects");
@@ -112,7 +113,7 @@ test("pane.agent_detected emits session.started with the agent role", () => {
   assert.equal(s.entity_id, `herdr:${HOST}:unknown:wK%3Ap1`);
   assert.equal(s.event_type, "session.started");
   assert.equal(s.payload.host_id, HOST);
-  assert.equal(s.payload.mission_id, "wK");
+  assert.equal(s.payload.mission_id, "herdr-ws:wK");
   assert.equal(s.payload.agent_role, "pi");
   assert.equal(s.payload.status, "active");
 });
@@ -291,4 +292,32 @@ test("sessions on different hosts and named servers cannot collide", () => {
   assert.notEqual(b.entity_id, c.entity_id);
   assert.equal(b.payload.pane_id, "w1:p1");
   assert.equal(b.payload.herdr_session, "eng");
+});
+
+for (const event of ["workspace.created", "workspace.focused", "workspace.renamed", "workspace.closed",
+  "pane.agent_detected", "pane.agent_status_changed", "pane.exited", "pane.closed"]) {
+  test(`${event} emits HerdR source and a namespaced workspace relationship`, () => {
+    const out = mapEvent({ HERDR_PLUGIN_EVENT: event, HERDR_WORKSPACE_ID: "wK", HERDR_PANE_ID: "wK:p1" },
+      { host: HOST, info: INFO });
+    assert.ok(out.length > 0);
+    for (const envelope of out) {
+      assert.equal(envelope.source, "herdr");
+      if (envelope.entity_type === "mission") {
+        assert.equal(envelope.entity_id, "herdr-ws:wK");
+        assert.equal(envelope.payload.title, "herdr frontend work");
+        assert.equal(envelope.payload.cwd, "/home/wohlgemuth/IdeaProjects");
+      } else if (envelope.entity_type === "session") {
+        assert.equal(envelope.payload.mission_id, "herdr-ws:wK");
+        assert.equal(envelope.payload.pane_id, "wK:p1");
+      }
+    }
+  });
+}
+
+test("sessions without a workspace do not invent a mission relationship", () => {
+  for (const workspace of [undefined, ""]) {
+    const [session] = mapEvent({ HERDR_PLUGIN_EVENT: "pane.agent_detected",
+      HERDR_WORKSPACE_ID: workspace, HERDR_PANE_ID: "wK:p1" });
+    assert.equal(session.payload.mission_id, workspace);
+  }
 });

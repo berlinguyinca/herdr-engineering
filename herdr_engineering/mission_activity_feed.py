@@ -380,7 +380,7 @@ class MissionActivityFeed:
         return True
 
     def _publish_many(self, payloads: list[dict]) -> int:
-        """Publish changed mission projections in one bounded ingest request."""
+        """Publish changed mission projections in bounded ingest requests."""
         candidates = []
         fingerprints = []
         now = time.monotonic()
@@ -400,22 +400,26 @@ class MissionActivityFeed:
             fingerprints.append((mid, fingerprint, published))
         if not candidates:
             return 0
-        response = self._http_json('/api/v1/ingest', {'events': candidates})
-        entities = response.get('entities')
-        if response.get('ok') is not True or not isinstance(entities, list) \
-                or len(entities) != len(candidates) \
-                or any(not isinstance(entity, dict)
-                       or entity.get('accepted') is not True
-                       for entity in entities):
-            raise PublicationRejected(None)
-        timestamp = time.monotonic()
-        for mid, fingerprint, published in fingerprints:
-            self.sent[mid] = (fingerprint, timestamp)
-            self.known[mid] = published
-        while len(self.known) > 256:
-            oldest = next(iter(self.known))
-            del self.known[oldest]
-            self.sent.pop(oldest, None)
+        # Match the ingest endpoint's 64-envelope limit, including hosts with
+        # multiple runtime sessions each owning several missions.
+        for start in range(0, len(candidates), 64):
+            batch = candidates[start:start + 64]
+            response = self._http_json('/api/v1/ingest', {'events': batch})
+            entities = response.get('entities')
+            if response.get('ok') is not True or not isinstance(entities, list) \
+                    or len(entities) != len(batch) \
+                    or any(not isinstance(entity, dict)
+                           or entity.get('accepted') is not True
+                           for entity in entities):
+                raise PublicationRejected(None)
+            timestamp = time.monotonic()
+            for mid, fingerprint, published in fingerprints[start:start + 64]:
+                self.sent[mid] = (fingerprint, timestamp)
+                self.known[mid] = published
+            while len(self.known) > 256:
+                oldest = next(iter(self.known))
+                del self.known[oldest]
+                self.sent.pop(oldest, None)
         return len(candidates)
 
     def run_once(self) -> dict:

@@ -83,6 +83,26 @@ def ctx_of(w, who, text):
 NODE = {"kind": "node", "node_id": "task:a"}
 
 
+def test_message_attachments_preserve_context_and_retry_identity(cx):
+    body = {"text": "review this artifact", "idempotency_key": k(),
+            "context": NODE, "artifact_ids": ["artifact-one"]}
+    status, out = cx.s.post_message(cx.bob, cx.room, body)
+    assert status == 201
+    event = out["event"]
+    assert event["artifact_ids"] == ["artifact-one"]
+    assert event["context"]["node_id"] == "task:a"
+    replay_status, replay = cx.s.post_message(cx.bob, cx.room, body)
+    assert replay_status == 200
+    assert replay["replayed"] is True
+    assert replay["event"]["event_id"] == event["event_id"]
+    assert replay["event"]["artifact_ids"] == event["artifact_ids"]
+    assert replay["event"]["context"] == event["context"]
+    assert code(cx.s.post_message, cx.bob, cx.room,
+                {**body, "artifact_ids": ["artifact-two"]}) == 409
+    assert code(cx.s.post_message, cx.bob, cx.room,
+                {**body, "context": {"kind": "node", "node_id": "task:b"}}) == 409
+
+
 # ============================================================ chat context
 def test_a_message_carries_a_node_reference_each_reader_resolves_for_themselves(cx):
     say(cx, cx.bob, "see this", NODE)
