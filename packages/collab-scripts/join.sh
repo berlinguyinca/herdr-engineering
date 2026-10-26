@@ -113,7 +113,8 @@ main() {
         esac
       else
         case "$FAMILY" in
-          claude-code) CMD="claude -p --tools '' --strict-mcp-config --mcp-config '{\"mcpServers\":{}}' --disable-slash-commands" ;;
+          claude-code) CMD="claude -p --tools '' --strict-mcp-config --mcp-config '{\"mcpServers\":{}}' --disable-slash-commands"
+                       SKILL_CMD="claude -p --tools '' --strict-mcp-config --mcp-config '{\"mcpServers\":{}}'" ;;
           opencode) CMD='opencode run --pure'; SKILL_CMD='opencode run --pure' ;;
           pi) CMD='pi -p --no-session --no-tools -- "Task from a room member: $(cat)"'
               SKILL_CMD='pi -p --no-session --no-tools -- "$(cat)"' ;;

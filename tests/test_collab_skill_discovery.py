@@ -23,3 +23,13 @@ def test_discover_skills_deduplicates_roots_and_caps_results(tmp_path):
         (root / name / "SKILL.md").write_text(f"---\nname: {name}\ndescription: x\n---\n")
 
     assert discover_skills([root, root], max_skills=2) == ["skill:one", "skill:three"]
+
+
+def test_discover_skills_supports_nested_manifests_and_flat_markdown_skills(tmp_path):
+    root = tmp_path / "skills"
+    nested = root / "teams" / "release"
+    nested.mkdir(parents=True)
+    (nested / "SKILL.md").write_text("---\ndescription: release\n---\n")
+    (root / "review.md").write_text("---\ndescription: review\n---\n")
+
+    assert discover_skills([root]) == ["skill:release", "skill:review"]

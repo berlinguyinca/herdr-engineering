@@ -1573,10 +1573,12 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FilesMixin, Co
             agent = self._agents.get(pr.id)
             if not agent or agent.get("status") != "active":
                 raise CollabError(401, "agent is not active")
+            if list(agent.get("skills") or []) == normalized:
+                return {"agent_id": pr.id, "skills": normalized, "changed": False}
             self._commit("agent_skills_updated", self._actor(
                 pr, agent_id=pr.id, skills=normalized, action="agent.skills.update", outcome="allowed",
                 project_ids=[], resource_id=pr.id))
-        return {"agent_id": pr.id, "skills": normalized}
+        return {"agent_id": pr.id, "skills": normalized, "changed": True}
 
     # ------------------------------------------------------------ fleets of agents
     def _agent_names(self, owner: str, prefix: str, count: int) -> list[str]:

@@ -248,6 +248,9 @@ def test_an_authenticated_mcp_capability_report_replaces_the_agent_skill_invento
     assert result["content"]
     assert w.s._agents[aid]["skills"] == ["skill:pdf-tools", "skill:review"]
     assert any(e["event_type"] == "agent_skills_updated" for e in w.s._log)
+    before = len(w.s._log)
+    collab_mcp._call(w.s, pi, "agent_capabilities", {"skills": ["skill:review", "skill:pdf-tools"]})
+    assert len(w.s._log) == before
 
 
 def test_reported_skills_survive_log_replay(w):

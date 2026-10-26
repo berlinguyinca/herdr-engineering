@@ -140,21 +140,32 @@ if harness == "opencode":
     roots.append(home / ".config" / "opencode" / "skills")
 seen, out = set(), []
 pattern = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*\\Z")
+def described(text):
+    if not text.startswith("---"):
+        return False
+    end = re.search(r"(?m)^---\\s*$", text[3:])
+    return bool(end and re.search(r"(?m)^description:\\s*\\S", text[3:3 + end.start()]))
 for root in roots:
     try:
-        entries = sorted(root.iterdir(), key=lambda p: p.name)
+        manifests = sorted(
+            [p for p in root.rglob("SKILL.md") if len(p.relative_to(root).parts) <= 6]
+            + list(root.glob("*.md")), key=lambda p: str(p))
     except OSError:
         continue
-    for entry in entries:
-        if entry.name.startswith(".") or not entry.is_dir() or not pattern.fullmatch(entry.name):
+    for manifest in manifests:
+        rel = manifest.relative_to(root)
+        if any(part.startswith(".") or part == "node_modules" for part in rel.parts):
+            continue
+        skill_id = manifest.parent.name if manifest.name == "SKILL.md" else manifest.stem
+        if not pattern.fullmatch(skill_id):
             continue
         try:
-            manifest = (entry / "SKILL.md").read_text(encoding="utf-8")
+            text = manifest.read_text(encoding="utf-8")
         except (OSError, UnicodeError):
             continue
-        if not re.search(r"(?m)^description:\\s*\\S", manifest):
+        if not described(text):
             continue
-        skill = "skill:" + entry.name
+        skill = "skill:" + skill_id
         if skill not in seen:
             seen.add(skill); out.append(skill)
         if len(out) >= 100:
