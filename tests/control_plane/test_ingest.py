@@ -562,3 +562,385 @@ def test_delivery_rebuild_preserves_review_findings_and_pr_merge():
     # Streams are not duplicated by the rebuild.
     assert len(restored.stream("review", "rvx")) == 2
     assert len(restored.stream("pull_request", "prx")) == 3
+
+
+# ---------------------------------------------------------------------------
+# Usage analytics (issue #36): token_usage and resource_usage ingest.
+# ---------------------------------------------------------------------------
+def test_ingest_token_usage_is_idempotent_on_request_id():
+    repo = ControlPlaneRepo()
+    svc = make_svc(repo)
+    rec = {"mission_id": "m1", "model": "gpt-4o", "request_id": "req-1",
+           "input_tokens": 10, "output_tokens": 5, "total": 0}
+    svc.ingest({"entity_type": "token_usage", "entity_id": "req-1",
+                "event_type": "token_usage.recorded", "payload": {**rec, "input_tokens": 10}})
+    # A duplicate request_id is counted once.
+    svc.ingest({"entity_type": "token_usage", "entity_id": "req-1",
+                "event_type": "token_usage.recorded",
+                "payload": {**rec, "input_tokens": 999}})
+    a = repo.usage_analytics(mission_id="m1")
+    assert a["tokens"]["by_model"]["gpt-4o"]["input_tokens"] == 10
+    assert a["tokens"]["total"]["input_tokens"] == 10
+    # Missing token counts stay None (never 0).
+    svc.ingest({"entity_type": "token_usage", "entity_id": "req-2",
+                "event_type": "token_usage.recorded",
+                "payload": {"mission_id": "m2", "model": "gpt-4o", "request_id": "req-2"}})
+    a2 = repo.usage_analytics(mission_id="m2")
+    assert a2["tokens"]["by_model"]["gpt-4o"]["input_tokens"] == 0
+    # Scoping: m1 does not see m2.
+    assert repo.usage_analytics(mission_id="m1")["tokens"]["total"]["input_tokens"] == 10
+
+
+def test_ingest_resource_usage_sums_by_kind_and_scopes_by_mission():
+    repo = ControlPlaneRepo()
+    svc = make_svc(repo)
+    for value in (1.5, 2.5):
+        svc.ingest({"entity_type": "resource_usage", "entity_id": f"r-{value}",
+                    "event_type": "resource_usage.recorded",
+                    "payload": {"mission_id": "m1", "kind": "cpu_seconds",
+                                "value": value, "unit": "s"}})
+    svc.ingest({"entity_type": "resource_usage", "entity_id": "r-other",
+                "event_type": "resource_usage.recorded",
+                "payload": {"mission_id": "m2", "kind": "cpu_seconds", "value": 99}})
+    a = repo.usage_analytics(mission_id="m1")
+    assert a["resources"]["cpu_seconds"]["count"] == 2
+    assert a["resources"]["cpu_seconds"]["total"] == 4.0
+    assert a["resources"]["cpu_seconds"]["unit"] == "s"
+    assert repo.usage_analytics(mission_id="m2")["resources"]["cpu_seconds"]["total"] == 99
+    assert "cpu_seconds" not in repo.usage_analytics(mission_id="m3")["resources"]
+
+
+def test_ingest_usage_rejects_invalid_shapes():
+    repo = ControlPlaneRepo()
+    svc = make_svc(repo)
+    with pytest.raises(ValueError, match="input_tokens"):
+        svc.ingest({"entity_type": "token_usage", "entity_id": "x",
+                    "event_type": "token_usage.recorded",
+                    "payload": {"input_tokens": "many"}})
+    with pytest.raises(ValueError, match="value"):
+        svc.ingest({"entity_type": "resource_usage", "entity_id": "x",
+                    "event_type": "resource_usage.recorded",
+                    "payload": {"kind": "cpu", "value": "many"}})
+
+
+def test_ingest_usage_rejects_nonfinite_and_negative_values():
+    import math
+    repo = ControlPlaneRepo()
+    svc = make_svc(repo)
+    bad_tokens = [float("nan"), float("inf"), float("-inf"), -1, True]
+    for bad in bad_tokens:
+        with pytest.raises(ValueError, match="finite non-negative"):
+            svc.ingest({"entity_type": "token_usage", "entity_id": "x",
+                        "event_type": "token_usage.recorded",
+                        "payload": {"input_tokens": bad}})
+    for bad in bad_tokens:
+        with pytest.raises(ValueError, match="finite non-negative"):
+            svc.ingest({"entity_type": "resource_usage", "entity_id": "x",
+                        "event_type": "resource_usage.recorded",
+                        "payload": {"kind": "cpu", "value": bad}})
+    # The repo methods themselves are safe against non-finite/negative values:
+    # token counts coerce non-finite to None (never OverflowError), while a
+    # resource value that would corrupt the aggregate is rejected outright.
+    rec = repo.add_token_usage({"request_id": "x", "input_tokens": float("inf")})
+    assert rec["input_tokens"] is None
+    with pytest.raises(ValueError):
+        repo.add_resource_usage({"kind": "cpu", "value": -3.0})
+    with pytest.raises(ValueError):
+        repo.add_resource_usage({"kind": "cpu", "value": float("inf")})
+
+
+def test_usage_and_stage_analytics_survive_export_import():
+    clock = {"t": 1_700_000_000.0}
+    repo = ControlPlaneRepo(now=lambda: clock["t"])
+    svc = make_svc(repo)
+    svc.ingest({"entity_type": "token_usage", "entity_id": "req-r1",
+                "event_type": "token_usage.recorded",
+                "payload": {"mission_id": "m1", "model": "gpt-4o",
+                            "request_id": "req-r1", "input_tokens": 7}})
+    svc.ingest({"entity_type": "resource_usage", "entity_id": "res-r1",
+                "event_type": "resource_usage.recorded",
+                "payload": {"mission_id": "m1", "kind": "cpu", "value": 2.0}})
+    mid = repo.create_mission("s")
+    repo.set_mission_stage(mid, "implementation"); clock["t"] += 0.5
+    repo.set_mission_stage(mid, "complete")
+    restored = ControlPlaneRepo(now=lambda: clock["t"])
+    restored.import_state(repo.export_state())
+    a = restored.usage_analytics(mission_id="m1")
+    assert a["tokens"]["by_model"]["gpt-4o"]["input_tokens"] == 7
+    assert a["resources"]["cpu"]["total"] == 2.0
+    st = restored.stage_analytics()
+    assert st["stages"]["implementation"]["p50_ms"] == 500
+    assert "complete" in st["in_progress"][mid]
+
+
+def test_usage_and_stage_analytics_survive_event_only_reload():
+    """Durable bridge reload restores event streams with no delivery snapshot; the
+    rebuild must regenerate usage and stage projections from those events (codex P1)."""
+    import json as _json
+    clock = {"t": 1_700_000_000.0}
+    repo = ControlPlaneRepo(now=lambda: clock["t"])
+    svc = make_svc(repo)
+    svc.ingest({"entity_type": "token_usage", "entity_id": "req-e",
+                "event_type": "token_usage.recorded",
+                "payload": {"mission_id": "m1", "model": "gpt-4o",
+                            "request_id": "req-e", "input_tokens": 5}})
+    svc.ingest({"entity_type": "resource_usage", "entity_id": "res-e",
+                "event_type": "resource_usage.recorded",
+                "payload": {"mission_id": "m1", "kind": "cpu", "value": 3.0}})
+    mid = repo.create_mission("s")
+    repo.set_mission_stage(mid, "implementation"); clock["t"] += 0.4
+    repo.set_mission_stage(mid, "complete")
+    state = repo.export_state()
+    # The bridge durable-reload path drops the delivery snapshot (events only).
+    state.pop("delivery", None)
+    restored = ControlPlaneRepo(now=lambda: clock["t"])
+    restored.import_state(state)
+    a = restored.usage_analytics(mission_id="m1")
+    assert a["tokens"]["by_model"]["gpt-4o"]["input_tokens"] == 5
+    assert a["resources"]["cpu"]["total"] == 3.0
+    st = restored.stage_analytics()
+    assert st["stages"]["implementation"]["p50_ms"] == 400
+    assert "complete" in st["in_progress"][mid]
+    # Re-run must be idempotent (no stream duplication, no double-counting):
+    # importing the same event-only state again must not inflate the counts.
+    a2 = restored.usage_analytics(mission_id="m1")
+    assert a2["tokens"]["by_model"]["gpt-4o"]["input_tokens"] == 5
+    assert a2["resources"]["cpu"]["count"] == 1
+
+
+def test_export_state_serializes_resource_usage_keys_as_json():
+    """Tuple mission/kind keys must serialize cleanly to JSON (codex P1)."""
+    import json as _json
+    clock = {"t": 1_700_000_000.0}
+    repo = ControlPlaneRepo(now=lambda: clock["t"])
+    repo.add_resource_usage({"mission_id": "m1", "kind": "cpu", "value": 2.0})
+    repo.add_resource_usage({"mission_id": "m1", "kind": "cpu", "value": 3.0})
+    dumped = _json.dumps(repo.export_state())  # must not raise TypeError
+    reloaded = _json.loads(dumped)
+    restored = ControlPlaneRepo(now=lambda: clock["t"])
+    restored.import_state(reloaded)
+    a = restored.usage_analytics(mission_id="m1")
+    assert a["resources"]["cpu"]["count"] == 2
+    assert a["resources"]["cpu"]["total"] == 5.0
+
+
+def test_v2_usage_envelope_does_not_duplicate_events():
+    """A schema-v2 envelope persists its row before dispatch; the projection must
+    not record a second event, or an event-only reload would double-count it."""
+    repo = ControlPlaneRepo()
+    svc = make_svc(repo)
+    env = {"schema_version": 2, "event_id": "pi-usage-1", "source": "pi",
+           "source_sequence": 1, "entity_type": "token_usage", "entity_id": "req-u1",
+           "event_type": "token_usage.recorded",
+           "payload": {"mission_id": "M1", "model": "gpt", "request_id": "req-u1",
+                       "input_tokens": 5}}
+    svc.ingest(env, {"id": "agent", "kind": "agent", "authenticated_by": "api_key"})
+    assert repo.usage_analytics(mission_id="pi:M1")["tokens"]["total"]["input_tokens"] == 5
+    # The envelope row is the only durable record for this usage event.
+    assert len(repo.stream("token_usage", "req-u1")) == 1
+    # Event-only reload must not double-count.
+    state = repo.export_state()
+    state.pop("delivery", None)
+    restored = ControlPlaneRepo()
+    restored.import_state(state)
+    assert restored.usage_analytics(mission_id="pi:M1")["tokens"]["total"]["input_tokens"] == 5
+
+
+def test_v2_resource_usage_envelope_not_double_counted():
+    repo = ControlPlaneRepo()
+    svc = make_svc(repo)
+    env = {"schema_version": 2, "event_id": "pi-res-1", "source": "pi",
+           "source_sequence": 1, "entity_type": "resource_usage", "entity_id": "res-u1",
+           "event_type": "resource_usage.recorded",
+           "payload": {"mission_id": "M1", "kind": "cpu", "value": 2.0}}
+    svc.ingest(env, {"id": "agent", "kind": "agent", "authenticated_by": "api_key"})
+    a = repo.usage_analytics(mission_id="pi:M1")
+    assert a["resources"]["cpu"]["total"] == 2.0
+    assert a["resources"]["cpu"]["count"] == 1
+
+
+def test_usage_rejects_malformed_occurred_at():
+    """A garbage occurred_at must not break the retention sweep later."""
+    import datetime as _dt
+    from herdr_engineering.control_plane.retention import sweep_token_usage
+    clock = {"t": _dt.datetime(2026, 10, 23, tzinfo=_dt.UTC).timestamp()}
+    repo = ControlPlaneRepo(now=lambda: clock["t"])
+    rec = repo.add_token_usage({"mission_id": "m1", "model": "gpt",
+                                "request_id": "bad-ts", "input_tokens": 1,
+                                "occurred_at": "not-a-timestamp"})
+    # The malformed timestamp is normalized away (falls back to the wall clock).
+    assert rec["occurred_at"] == repo._stamp()
+    # The retention sweep must not raise on the stored projection.
+    sweep_token_usage(repo, raw_retention_days=1)
+
+
+def test_v2_usage_namespaces_mission_and_preserves_envelope_timestamp():
+    """Usage ingested from a non-herdr source is aggregated under the namespaced
+    mission (pi:M1, not bare M1), and a backdated envelope timestamp is kept so
+    retention ages the projection out (codex P2)."""
+    from herdr_engineering.control_plane.retention import sweep_token_usage
+    import datetime as _dt
+    clock = {"t": _dt.datetime(2026, 10, 23, tzinfo=_dt.UTC).timestamp()}
+    repo = ControlPlaneRepo(now=lambda: clock["t"])
+    svc = make_svc(repo)
+    backdated = _dt.datetime(2026, 10, 1, tzinfo=_dt.UTC).isoformat()
+    env = {"schema_version": 2, "event_id": "pi-usage-ns", "source": "pi",
+           "source_sequence": 1, "entity_type": "token_usage", "entity_id": "req-ns",
+           "event_type": "token_usage.recorded",
+           "occurred_at": backdated,
+           "payload": {"mission_id": "M1", "model": "gpt", "request_id": "req-ns",
+                       "input_tokens": 5}}
+    svc.ingest(env, {"id": "agent", "kind": "agent", "authenticated_by": "api_key"})
+    # Namespaced: pi:M1, not the bare M1.
+    assert repo.usage_analytics(mission_id="pi:M1")["tokens"]["total"]["input_tokens"] == 5
+    assert repo.usage_analytics(mission_id="M1")["tokens"]["total"] == {}
+    # The projection kept the backdated timestamp so a 14-day sweep drops it.
+    assert repo._token_usage["req-ns"]["occurred_at"] == backdated
+    sweep_token_usage(repo, raw_retention_days=14)
+    assert "req-ns" not in repo._token_usage
+
+
+def test_usage_mission_namespacing_matches_delivery():
+    """The repo helper and ingest's _delivery_mission_key namespace identically."""
+    from herdr_engineering.control_plane.repo import _usage_mission_key
+    assert _usage_mission_key("M1", "herdr") == "M1"
+    assert _usage_mission_key("M1", "pi") == "pi:M1"
+    assert _usage_mission_key("pi:M1", "pi") == "pi:M1"
+    assert _usage_mission_key(None, "pi") is None
+
+
+def test_token_analytics_dedupes_by_request_id_like_usage_projection():
+    """Re-recording the same request_id must be counted once by both token_analytics
+    and the usage projection (codex P1)."""
+    repo = ControlPlaneRepo()
+    # The LLM-proxy path (record_token_usage) is the realistic retry scenario.
+    repo.record_token_usage("p", "gpt", input_tokens=9, request_id="req-d1",
+                            mission_id="m1")
+    repo.record_token_usage("p", "gpt", input_tokens=999, request_id="req-d1",
+                            mission_id="m1")
+    # Both views agree the request was counted once.
+    assert repo.token_analytics()["total"]["requests"] == 1
+    assert repo.token_analytics()["total"]["input_tokens"] == 9
+    assert repo.usage_analytics(mission_id="m1")["tokens"]["total"]["input_tokens"] == 9
+
+
+def test_usage_projection_rebuild_keeps_backdated_timestamp():
+    """An event-only reload must keep the backdated envelope timestamp so the
+    rebuilt projection still ages out under retention (codex P1)."""
+    import datetime as _dt
+    from herdr_engineering.control_plane.retention import sweep_token_usage
+    clock = {"t": _dt.datetime(2026, 10, 23, tzinfo=_dt.UTC).timestamp()}
+    repo = ControlPlaneRepo(now=lambda: clock["t"])
+    svc = make_svc(repo)
+    backdated = _dt.datetime(2026, 10, 1, tzinfo=_dt.UTC).isoformat()
+    svc.ingest({"schema_version": 2, "event_id": "pi-ts", "source": "pi",
+                "source_sequence": 1, "entity_type": "token_usage",
+                "entity_id": "req-ts", "event_type": "token_usage.recorded",
+                "occurred_at": backdated,
+                "payload": {"mission_id": "M1", "model": "gpt",
+                            "request_id": "req-ts", "input_tokens": 4}},
+               {"id": "agent", "kind": "agent", "authenticated_by": "api_key"})
+    # Rebuild from events only (no delivery snapshot).
+    state = repo.export_state()
+    state.pop("delivery", None)
+    restored = ControlPlaneRepo(now=lambda: clock["t"])
+    restored.import_state(state)
+    assert restored._token_usage["req-ts"]["occurred_at"] == backdated
+    # A 14-day sweep removes the backdated (expired) record after the reload.
+    sweep_token_usage(restored, raw_retention_days=14)
+    assert "req-ts" not in restored._token_usage
+
+
+def test_usage_rejects_timezone_naive_occurred_at():
+    """A timezone-naive occurred_at must be normalized away so the retention
+    sweep never compares a naive datetime to its aware cutoff (codex P2)."""
+    import datetime as _dt
+    repo = ControlPlaneRepo(now=lambda: _dt.datetime(2026, 10, 23, tzinfo=_dt.UTC).timestamp())
+    rec = repo.add_token_usage({"mission_id": "m1", "model": "gpt",
+                                "request_id": "naive-ts", "input_tokens": 1,
+                                "occurred_at": "2026-10-01T00:00:00"})
+    # Falls back to the (aware) wall clock; never stores a naive timestamp.
+    assert rec["occurred_at"].endswith("+00:00")
+    from herdr_engineering.control_plane.retention import sweep_token_usage
+    sweep_token_usage(repo, raw_retention_days=1)  # must not raise
+
+
+def test_usage_projection_preserves_cache_write_tokens():
+    """/api/v1/token-usage submissions carrying cache_write_tokens must feed the
+    usage projection (codex P1), not report it as zero/unknown."""
+    repo = ControlPlaneRepo()
+    repo.record_token_usage_row({"project": "p", "model": "gpt", "schema": 2,
+                                 "request_id": "cw-1", "mission_id": "m1",
+                                 "cache_write_tokens": 12, "status": 200})
+    a = repo.usage_analytics(mission_id="m1")
+    assert a["tokens"]["by_model"]["gpt"]["cache_write_tokens"] == 12
+    assert a["tokens"]["total"]["cache_write_tokens"] == 12
+
+
+def test_resource_usage_projection_is_pruned_by_event_retention():
+    """The general event retention policy must also age out the resource_usage
+    projection so usage_analytics() stops reporting expired totals (codex P2)."""
+    import datetime as _dt
+    from herdr_engineering.control_plane.retention import apply_retention
+    clock = {"t": _dt.datetime(2026, 10, 23, tzinfo=_dt.UTC).timestamp()}
+    repo = ControlPlaneRepo(now=lambda: clock["t"])
+    repo.add_resource_usage({"mission_id": "m1", "kind": "cpu", "value": 1.0,
+                             "occurred_at": repo._stamp()})  # now (fresh)
+    clock["t"] -= 40 * 86400  # 40 days ago
+    repo.add_resource_usage({"mission_id": "m1", "kind": "cpu", "value": 9.0,
+                             "occurred_at": repo._stamp()})
+    clock["t"] += 40 * 86400
+    assert repo.usage_analytics(mission_id="m1")["resources"]["cpu"]["count"] == 2
+    apply_retention(repo, events_ttl_days=30)
+    a = repo.usage_analytics(mission_id="m1")
+    assert a["resources"]["cpu"]["count"] == 1
+    assert a["resources"]["cpu"]["total"] == 1.0
+
+
+def test_token_analytics_includes_cache_write_tokens():
+    """token_analytics (the legacy /api/v1/analytics/tokens path) must report
+    cache_write_tokens like the usage projection (codex P1)."""
+    repo = ControlPlaneRepo()
+    repo.record_token_usage_row({"project": "p", "model": "gpt", "schema": 2,
+                                 "request_id": "cw-2", "mission_id": "m1",
+                                 "cache_write_tokens": 7, "status": 200})
+    a = repo.token_analytics()
+    assert a["total"]["cache_write_tokens"] == 7
+    assert a["by_model"]["gpt"]["cache_write_tokens"] == 7
+    assert a["by_project"]["p"]["cache_write_tokens"] == 7
+
+
+def test_v2_resource_usage_missing_kind_does_not_consume_sequence():
+    """A schema-v2 resource_usage with a missing/empty kind must be rejected in
+    _prevalidate (before the envelope is persisted), so a corrected retry with
+    the same idempotency identity still lands (codex P1)."""
+    repo = ControlPlaneRepo()
+    svc = make_svc(repo)
+    bad = {"schema_version": 2, "event_id": "pi-res-kind", "source": "pi",
+           "source_sequence": 1, "entity_type": "resource_usage", "entity_id": "res-k",
+           "event_type": "resource_usage.recorded",
+           "payload": {"mission_id": "M1", "value": 1.0}}  # no kind
+    with pytest.raises(ValueError, match="kind"):
+        svc.ingest(bad, {"id": "agent", "kind": "agent", "authenticated_by": "api_key"})
+    # No resource recorded, and the corrected retry is accepted.
+    assert repo.usage_analytics(mission_id="pi:M1")["resources"] == {}
+    good = {**bad, "payload": {"mission_id": "M1", "kind": "cpu", "value": 1.0}}
+    svc.ingest(good, {"id": "agent", "kind": "agent", "authenticated_by": "api_key"})
+    assert repo.usage_analytics(mission_id="pi:M1")["resources"]["cpu"]["total"] == 1.0
+
+
+def test_token_analytics_skips_projectless_ingest_rows():
+    """A mission-scoped token_usage envelope (no legacy project field) must not
+    crash token_analytics — /api/v1/analytics/tokens returns a 200, not a 500."""
+    repo = ControlPlaneRepo()
+    svc = make_svc(repo)
+    svc.ingest({"entity_type": "token_usage", "entity_id": "req-np",
+                "event_type": "token_usage.recorded",
+                "payload": {"mission_id": "m1", "model": "gpt",
+                            "request_id": "req-np", "input_tokens": 3}})
+    a = repo.token_analytics()  # must not raise KeyError on missing 'project'
+    assert a["total"]["input_tokens"] == 3
+    assert a["by_project"] == {}  # not grouped under a legacy project
+    assert a["by_model"]["gpt"]["input_tokens"] == 3
+    # And via the API route it returns 200.
+    assert repo.usage_analytics(mission_id="m1")["tokens"]["total"]["input_tokens"] == 3

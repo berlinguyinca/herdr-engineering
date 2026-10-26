@@ -1850,6 +1850,11 @@ def _make_handler(server, public=False, operator=False):
                 if kind == "tokens":
                     return self._json(r.token_analytics(
                         project=_q(self.path, "project"), since=_q(self.path, "since")))
+                if kind == "stages":
+                    return self._json(r.stage_analytics())
+                if kind == "usage":
+                    return self._json(r.usage_analytics(
+                        mission_id=_q(self.path, "mission")))
                 return self._json({"error": "unknown analytics kind"}, 404)
             if resource == "events":
                 if len(parts) > 4 and parts[4] == "stream":

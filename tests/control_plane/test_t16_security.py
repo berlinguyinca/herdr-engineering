@@ -94,7 +94,7 @@ class Src(DurableSource):
 
 @pytest.mark.parametrize("entity_type", ["collab", "collab_room", "ci_observation", "ci_report", "ci_telemetry",
                                          "plannotator_review", "ci_pipeline", "agent_identity", "agent_summary",
-                                         "custom_model", "llm_key", "token_usage", "artifact", "made-up",
+                                         "custom_model", "llm_key", "artifact", "made-up",
                                          "pr_gate", "pr_gate_verdict", "review_job"])
 @pytest.mark.parametrize("schema", [1, 2])
 def test_ingest_refuses_every_entity_type_that_is_not_on_the_allow_list(entity_type, schema):
@@ -112,7 +112,7 @@ def test_the_allow_list_is_exactly_what_the_dispatcher_handles_plus_plain_activi
     # and stored, not silently recorded as plain activity.
     assert DISPATCHED_ENTITY_TYPES == {"lineage", "host", "session", "mission", "service", "inspector",
                                        "mission_activity", "test_run", "build", "review",
-                                       "review_finding", "pull_request"}
+                                       "review_finding", "pull_request", "token_usage", "resource_usage"}
     assert INGEST_ENTITY_TYPES - DISPATCHED_ENTITY_TYPES == {"task", "note", "workspace", "ledger",
                                                                         "platform", "lifecycle",
                                                                         "repository", "request", "span"}

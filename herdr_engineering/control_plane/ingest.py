@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import math
 import re
 
 from ..review_gate.entities import RESERVED_ENTITY_PREFIXES
@@ -49,7 +50,7 @@ def _git_identity(payload):
 # plain activity records nothing authoritative reads back. Adding a type here is a security decision.
 DISPATCHED_ENTITY_TYPES = frozenset({"lineage", "host", "session", "mission", "service", "inspector",
                                      "mission_activity", "test_run", "build", "review",
-                                     "review_finding", "pull_request"})
+                                     "review_finding", "pull_request", "token_usage", "resource_usage"})
 # ledger / platform / lifecycle are the Pi envelope adapters' activity streams (envelopeAdapters.ts)
 # repository / request / span are the opt-in system-graph adapter's lifecycle streams (graph_ingest.py, runbook
 # docs/specs/herdr-system-graph-20261020/11-p0-p6-status-and-runbook.md). They were accepted before T16, nothing
@@ -233,7 +234,8 @@ class IngestService:
         if entity_type.strip().lower().startswith("architecture"):
             raise ValueError("reserved architecture entity type is not accepted by generic ingestion")
         # T16 H1/M1/M5: an ALLOW-LIST. Everything else (collab, ci_*, plannotator_review, agent_identity,
-        # token_usage, ...) is owned by a dedicated, authenticated adapter and can never be written here.
+        # custom_model, llm_key, ...) is owned by a dedicated, authenticated adapter and can never be
+        # written here. token_usage / resource_usage ARE on the dispatched allow-list (issue #36).
         if entity_type not in INGEST_ENTITY_TYPES:
             raise ValueError("entity type is not accepted by generic ingestion")
         if event_type in SERVER_OWNED_EVENT_TYPES.get(entity_type, ()):
@@ -301,6 +303,12 @@ class IngestService:
                 if entity_type == "lineage":
                     result = self._apply_lineage(entity_id, event_type, payload, env)
                 else:
+                    # Usage projections must keep the envelope's (possibly backdated)
+                    # timestamp so retention ages them out correctly; the durable event
+                    # carries it but add_token_usage/add_resource_usage read payload only.
+                    if entity_type in ("token_usage", "resource_usage") and isinstance(payload, dict) \
+                            and not payload.get("occurred_at"):
+                        payload = {**payload, "occurred_at": env.get("occurred_at") or env.get("received_at")}
                     result = self._dispatch(entity_type, entity_id, event_type, payload, source,
                                             record_generic=False)
             finally:
@@ -368,6 +376,28 @@ class IngestService:
                 raise KeyError(entity_id)
         elif entity_type == "pull_request":
             self._delivery_mission_key(payload.get("mission_id"), source)
+        elif entity_type == "token_usage":
+            if not isinstance(payload, dict):
+                raise ValueError("token usage must be an object")
+            for k in ("input_tokens", "output_tokens", "reasoning_tokens",
+                      "cache_read_tokens", "cache_write_tokens", "duration_ms",
+                      "retry_number"):
+                v = payload.get(k)
+                if v is None:
+                    continue
+                if (isinstance(v, bool) or not isinstance(v, (int, float))
+                        or not math.isfinite(v) or v < 0):
+                    raise ValueError(f"{k} must be a finite non-negative number")
+        elif entity_type == "resource_usage":
+            if not isinstance(payload, dict):
+                raise ValueError("resource usage must be an object")
+            kind = payload.get("kind")
+            if not isinstance(kind, str) or not kind:
+                raise ValueError("resource kind is required")  # rejected pre-persist
+            value = payload.get("value")
+            if (isinstance(value, bool) or not isinstance(value, (int, float))
+                    or not math.isfinite(value) or value < 0):
+                raise ValueError("value must be a finite non-negative number")
 
     @staticmethod
     def _validate_test_counts(payload) -> None:
@@ -441,6 +471,19 @@ class IngestService:
             return self._ingest_review_finding(entity_id, payload, source)
         if entity_type == "pull_request":
             return self._ingest_pull_request(entity_id, event_type, payload, source)
+        if entity_type == "token_usage":
+            # An already-persisted schema-v2 envelope row must not be recorded a
+            # second time by the projection (record_generic is False there), or
+            # an event-only reload would replay (and double-count) both records.
+            payload = {**payload, "mission_id": self._delivery_mission_key(payload.get("mission_id"), source)}
+            rec = self.repo.add_token_usage(payload, record_event=record_generic)
+            return {"entity_type": "token_usage", "entity_id": entity_id,
+                    "event_type": event_type, "usage": rec}
+        if entity_type == "resource_usage":
+            payload = {**payload, "mission_id": self._delivery_mission_key(payload.get("mission_id"), source)}
+            rec = self.repo.add_resource_usage(payload, record_event=record_generic)
+            return {"entity_type": "resource_usage", "entity_id": entity_id,
+                    "event_type": event_type, "usage": rec}
         # Unknown/other entity types: record the event generically so nothing is
         # silently dropped, and the UI still sees it on the activity stream.
         if record_generic:
