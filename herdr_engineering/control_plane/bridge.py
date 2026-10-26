@@ -22,6 +22,12 @@ from .envelope import ENVELOPE_ONLY_TYPES
 from .events import V2_COLUMNS
 from .service_catalog import normalize_project, normalize_source_port, track_availability
 
+# These streams are already represented by dedicated structured stores or
+# bounded adapters. Replaying their unbounded history during web startup makes
+# hydration scale with operational noise (bender currently has >1M service
+# events) and can prevent the HTTP listener from binding at all.
+_STARTUP_EVENT_EXCLUDED_TYPES = ("service", "inspector", "collab")
+
 
 def _iso(value: Any):
     if isinstance(value, _dt.datetime):
@@ -102,7 +108,9 @@ class PostgresSource(DurableSource):
             "services": [dict(r) for r in await conn.fetch("SELECT * FROM services")],
             "hosts": [dict(r) for r in await conn.fetch("SELECT * FROM hosts")],
             "events": [dict(r) for r in await conn.fetch(
-                f"SELECT * FROM {self._events_table} ORDER BY ingest_timestamp, sequence")],
+                f"SELECT * FROM {self._events_table} "
+                "WHERE entity_type NOT IN ('service', 'inspector', 'collab') "
+                "ORDER BY ingest_timestamp, sequence")],
         }
 
     def missions(self) -> list[dict]:
