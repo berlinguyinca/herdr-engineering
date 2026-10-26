@@ -130,6 +130,7 @@ test('CI page shares project context with the existing heatmap and inspector wit
   await page.locator('[data-ob-project]').nth(1).click();
   assert.deepEqual(errors,[]);assert.equal(await page.locator('th[scope=row].ci-health-project').count(),1,await page.locator('[data-health-map]').textContent());
   assert.equal(await page.locator('[data-health-mode="14"]').getAttribute('aria-pressed'),'true');
+  await page.locator('button[data-health-layout="tree"]').click();
   await page.locator('[data-health-tree] [data-health-disclosure] > summary').first().click();
   await page.locator('[data-health-tree] [data-health-disclosure] [data-health-disclosure] > summary').first().click();
   await page.locator('[data-health-run]').click();

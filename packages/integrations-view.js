@@ -156,6 +156,9 @@ const styles=`<style>
 @media(max-width:700px){[data-ci-focused=true] #ci-workspace-runs #ig-results,[data-ci-focused=true] #ci-workspace-runs>.ig-tabs,[data-ci-focused=true] #ci-workspace-runs>.ig-controls,[data-ci-focused=true] #ci-workspace-runs>.ig-pages,[data-ci-focused=true] [data-health-tree],[data-ci-focused=true] [data-health-map],[data-ci-focused=true] .ci-health-controls,[data-ci-focused=true] .ci-health-layout,[data-ci-focused=true] .ci-health-status,[data-ci-focused=true] .ci-health-selection{display:none}.ig-inspector .ig-heading{position:sticky;top:0;background:var(--surface);z-index:4;padding:8px 0}.ig-back-label{display:inline}.ig-close-label{display:none}.ci-pipeline-controls button{min-height:44px}}
 @media(max-width:900px){.ig-layout:has(.ig-inspector:not([hidden])){grid-template-columns:minmax(0,1fr)}.ig-inspector{grid-row:1}}@media(max-width:550px){.ig-row{grid-template-columns:minmax(0,1fr);gap:8px}.ig-state{max-width:none}.ig-tabs button{padding:9px 12px}}
 </style>`;
+const commandCenterStyles=`<style>
+.ci-workspace-tabs{margin:8px 0 20px;padding:5px;background:var(--surface);border:1px solid var(--border);border-radius:12px;box-shadow:var(--shadow-sm,0 2px 8px #0001)}.ci-workspace-tabs button{border:0!important;border-radius:8px!important;font-weight:650}.ci-workspace-tabs button[aria-selected=true]{background:var(--accent);color:#fff;box-shadow:0 2px 8px color-mix(in srgb,var(--accent) 30%,transparent)}.ig-group,.ig-inspector{box-shadow:var(--shadow-sm,0 2px 8px #0001)}.ig-inspector{border-top:3px solid var(--accent)}.ci-slot-detail{animation:ci-slot-in .18s ease-out}@keyframes ci-slot-in{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
+</style>`;
 
 export function mountIntegrations(container,client,{kind='ci',tab='current',search='',repository='',provider='',mission='',session=''}={}) {
   const isCi=kind==='ci';
@@ -174,7 +177,7 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
   const listenerController=new AbortController();
   const reviewCache=new Map();
   const title=isCi?'CI':'Reviews';
-  container.innerHTML=`${styles}${isCi?ciChartStyles+ciInsightStyles+ciPipelineStyles+'<style>'+ciFixStyles+'</style>':''}<h1>${title}</h1><p class="ig-intro">${isCi?'Follow builds from queue to finished steps. Inspect output and open the original run in Woodpecker.':'Review plans and code in Plannotator, with decisions linked to the mission and revision they belong to.'}</p>
+  container.innerHTML=`${styles}${isCi?ciChartStyles+ciInsightStyles+ciPipelineStyles+commandCenterStyles+'<style>'+ciFixStyles+'</style>':''}<h1>${title}</h1><p class="ig-intro">${isCi?'Follow builds from queue to finished steps. Inspect output and open the original run in Woodpecker.':'Review plans and code in Plannotator, with decisions linked to the mission and revision they belong to.'}</p>
     <div data-ig-health role="status"></div><p data-ig-error class="ig-warning" role="status"></p>
     ${isCi?'<div data-ci-observability></div><div data-ci-health></div>':''}
     <div class="ig-tabs" role="tablist" aria-label="${title} outcome">${tabs.map(([key,label])=>`<button type="button" role="tab" id="ig-tab-${key}" data-tab="${key}" aria-controls="ig-results" aria-selected="${state.tab===key}" tabindex="${state.tab===key?0:-1}">${label} <strong data-count="${key}">…</strong></button>`).join('')}</div>
