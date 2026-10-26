@@ -29,6 +29,7 @@
   --accent: #10a37f;
   --accent-hover: #0d8f6f;
   --accent-weak: #d2f0e8;
+  --accent-strong: var(--accent-hover);
 
   /* planator / planning violet accent (subtle) */
   --violet: #7152e3;

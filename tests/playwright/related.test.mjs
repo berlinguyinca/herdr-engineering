@@ -69,6 +69,8 @@ test('a mission links to its agent, host, review, pull request and CI run, and t
     await group(page, 'Host').locator('a').click();
     await page.waitForURL(/#\/hosts\/beast/);
     await group(page, 'Services').waitFor({ timeout: 8000 });
+    await page.locator('[data-host-detail] .hv-head').waitFor({ timeout: 8000 });
+    await page.locator('.rel dl').waitFor({ timeout: 8000 });
     assert.ok(await group(page, 'Agents').locator('a').count() >= 1);
     assert.ok(await group(page, 'Services').locator('a').count() >= 1);
     await group(page, 'Services').locator('a').first().click();
