@@ -8,6 +8,7 @@ import json
 import threading
 import traceback
 import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
@@ -134,3 +135,66 @@ def test_invalid_url_is_sanitized(snapshot, capsys, caplog):
         adapter.post_envelopes("invalid:" + INGEST_KEY, INGEST_KEY, adapter.snapshot_to_envelopes(snapshot))
     output = capsys.readouterr()
     assert INGEST_KEY not in str(error.value) + output.out + output.err + caplog.text
+
+
+@pytest.mark.parametrize("status", [301, 302, 303, 307, 308])
+def test_redirect_never_forwards_credentials_or_counts_as_accepted(snapshot, status, capsys, caplog):
+    forwarded = []
+    posted = []
+
+    class Destination(BaseHTTPRequestHandler):
+        def do_GET(self):
+            forwarded.append((self.command, self.headers.get("X-API-Key")))
+            self.send_response(200)
+            self.end_headers()
+
+        do_POST = do_GET
+
+        def log_message(self, *_args):
+            pass
+
+    destination = ThreadingHTTPServer(("127.0.0.1", 0), Destination)
+
+    class Redirect(BaseHTTPRequestHandler):
+        def do_POST(self):
+            self.rfile.read(int(self.headers["Content-Length"]))
+            posted.append((self.path, self.headers.get("X-API-Key")))
+            # Deliberately reflect the key in untrusted response metadata/body.
+            self.send_response(status, INGEST_KEY)
+            self.send_header("Location", f"http://127.0.0.1:{destination.server_port}/{INGEST_KEY}")
+            self.end_headers()
+            self.wfile.write(INGEST_KEY.encode())
+
+        def log_message(self, *_args):
+            pass
+
+    redirect = ThreadingHTTPServer(("127.0.0.1", 0), Redirect)
+    servers = (destination, redirect)
+    threads = [threading.Thread(target=s.serve_forever, daemon=True) for s in servers]
+    for thread in threads:
+        thread.start()
+    accepted_counts = []
+    error = None
+    try:
+        try:
+            accepted_counts.append(adapter.post_envelopes(
+                f"http://127.0.0.1:{redirect.server_port}", INGEST_KEY,
+                adapter.snapshot_to_envelopes(snapshot),
+            ))
+        except RuntimeError as exc:
+            error = exc
+    finally:
+        for server in servers:
+            server.shutdown()
+            server.server_close()
+        for thread in threads:
+            thread.join(timeout=5)
+
+    assert forwarded == [], "Redirect destination must receive no request or credential"
+    assert accepted_counts == [], "A redirect must not produce a successful accepted count"
+    assert isinstance(error, RuntimeError)
+    assert posted == [("/api/v1/ingest", INGEST_KEY)]  # Stop before the second envelope.
+    output = capsys.readouterr()
+    diagnostic = "".join(traceback.format_exception(error)) + output.out + output.err + caplog.text
+    assert INGEST_KEY not in diagnostic
+    assert "HERDR_CP_INGEST_KEY" in str(error)

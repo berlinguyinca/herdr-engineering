@@ -3,6 +3,8 @@
 Conversion is pure and does not invent liveness from snapshot generation time.
 Call ``post_envelopes(base_url, None, envelopes)`` to read HERDR_CP_INGEST_KEY,
 which must identify an ingest-role principal. CLI polling is intentionally separate.
+Telemetry fields are mapped into envelopes; exposing them in mission projections
+is deferred to the projection workstream.
 """
 from __future__ import annotations
 
@@ -55,12 +57,19 @@ def snapshot_to_envelopes(doc: dict) -> list[dict]:
     return envelopes
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Never send an ingest credential to a server-selected destination."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
 def post_envelopes(base_url: str, api_key: str | None, envelopes: list[dict]) -> int:
     """POST each envelope and return the accepted count; stop on the first error.
 
     The caller may retry the snapshot after a partial failure: mission upserts
     are idempotent. HTTP bodies, URLs, credentials and raw transport exceptions
-    are never included in diagnostics.
+    are never included in diagnostics. Redirects fail without being followed.
     """
     key = os.environ.get("HERDR_CP_INGEST_KEY") if api_key is None else api_key
     if not key or not key.strip():
@@ -72,6 +81,7 @@ def post_envelopes(base_url: str, api_key: str | None, envelopes: list[dict]) ->
         url = base_url.rstrip("/") + "/api/v1/ingest"
     except ValueError:
         raise ValueError("Invalid control-plane base URL for HERDR_CP_INGEST_KEY") from None
+    opener = urllib.request.build_opener(_NoRedirect())
     count = 0
     for envelope in envelopes:
         try:
@@ -79,8 +89,10 @@ def post_envelopes(base_url: str, api_key: str | None, envelopes: list[dict]) ->
                 url, data=json.dumps(envelope).encode("utf-8"), method="POST",
                 headers={"Content-Type": "application/json", "X-API-Key": key},
             )
-            with urllib.request.urlopen(request, timeout=10):
+            with opener.open(request, timeout=10):
                 count += 1
-        except (OSError, ValueError, HTTPException):
+        except (OSError, ValueError, HTTPException) as exc:
+            if isinstance(exc, urllib.error.HTTPError):
+                exc.close()
             raise RuntimeError("Snapshot ingest failed; check endpoint and HERDR_CP_INGEST_KEY") from None
     return count
