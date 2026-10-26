@@ -2002,8 +2002,24 @@ class ControlPlaneRepo:
                    "request_id": request_id, "key_id": key_id, "source": source}
         if v2 is not None:
             payload.update(v2, schema=2, session_id=session_id)
-        return self.record_event("token_usage", project, "token_usage.recorded",
-                                 payload, mission_id=mission_id, session_id=session_id)
+        event = self.record_event("token_usage", project, "token_usage.recorded",
+                                  payload, mission_id=mission_id, session_id=session_id)
+        # The mission-scoped usage projection (issue #36) must reflect the same
+        # record so usage_analytics() is populated during normal runtime, not
+        # only after an event-only reload. The event above is the single durable
+        # record, so the projection is fed without emitting a duplicate event.
+        self.add_token_usage({
+            "request_id": request_id,
+            "mission_id": mission_id,
+            "session_id": session_id,
+            "model": payload.get("model"),
+            "occurred_at": event.get("source_timestamp"),
+            "input_tokens": payload.get("input_tokens"),
+            "output_tokens": payload.get("output_tokens"),
+            "reasoning_tokens": payload.get("reasoning_tokens"),
+            "cache_read_tokens": payload.get("cache_read_tokens"),
+        }, record_event=False)
+        return event
 
     def record_token_usage_row(self, row):
         """Record one usage row as posted to ``/api/v1/token-usage`` (or reported by the
@@ -2128,7 +2144,7 @@ class ControlPlaneRepo:
             raise ValueError("token usage must be an object")
         request_id = _usage_str(rec.get("request_id"), 128)
         if not request_id:
-            request_id = new_id("tusage")
+            request_id = uuid4().hex  # a stable key; never a registered entity id
         clean = {"request_id": request_id,
                  "mission_id": _usage_id(rec.get("mission_id")),
                  "session_id": _usage_id(rec.get("session_id")),
@@ -2544,9 +2560,13 @@ class ControlPlaneRepo:
         for entity_type in ("token_usage", "resource_usage"):
             for ids in self.entity_ids(entity_type):
                 for ev in self._events.get((entity_type, ids), []):
-                    payload = _payload(ev)
+                    payload = dict(_payload(ev))
                     try:
                         if entity_type == "token_usage":
+                            # mission_id/session_id live on the event envelope, not
+                            # in the payload, so merge them back for the projection.
+                            payload.setdefault("mission_id", ev.get("mission_id"))
+                            payload.setdefault("session_id", ev.get("session_id"))
                             self.add_token_usage(payload)
                         else:
                             self.add_resource_usage(payload)
@@ -2565,6 +2585,11 @@ class ControlPlaneRepo:
             for ev in stream:
                 ev_type = ev.get("event_type")
                 p = _payload(ev)
+                if ev_type == "MissionStarted":
+                    # Initial stage is set at creation with no transition: seed the
+                    # running stage without opening a run (matches live upsert).
+                    current = p.get("stage")
+                    continue
                 if ev_type == "MissionStageChanged":
                     old, new = p.get("from"), p.get("to")
                 elif ev_type == "MissionUpdated":

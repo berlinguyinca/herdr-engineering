@@ -470,3 +470,51 @@ def test_stage_analytics_tracks_upsert_mission_stage_changes():
     assert a["stages"]["implementation"]["p50_ms"] == 750
     assert a["bottleneck"] == "implementation"
     assert a["in_progress"] == {"pi:pi-1": ["complete"]}
+
+
+def test_usage_projection_populated_by_legacy_token_usage_writes():
+    """record_token_usage (the /api/v1/token-usage and LLM-proxy path) must feed
+    the usage_analytics projection during normal runtime (codex P1), and the same
+    record must survive an event-only reload without double counting."""
+    clock = {"t": 1_700_000_000.0}
+    r = repo.ControlPlaneRepo(now=lambda: clock["t"])
+    r.record_token_usage("proj", "gpt-4o", input_tokens=4, output_tokens=2,
+                         request_id="legacy-req", mission_id="pi:m1")
+    a = r.usage_analytics(mission_id="pi:m1")
+    assert a["tokens"]["by_model"]["gpt-4o"]["input_tokens"] == 4
+    assert a["tokens"]["total"]["output_tokens"] == 2
+    # Event-only reload rebuilds the projection from the stored event.
+    state = r.export_state()
+    state.pop("delivery", None)
+    restored = repo.ControlPlaneRepo(now=lambda: clock["t"])
+    restored.import_state(state)
+    a2 = restored.usage_analytics(mission_id="pi:m1")
+    assert a2["tokens"]["by_model"]["gpt-4o"]["input_tokens"] == 4
+    assert a2["tokens"]["total"]["output_tokens"] == 2
+
+
+def test_stage_replay_seeds_initial_stage_without_spurious_run():
+    """A mission created via upsert_mission records its initial stage in
+    MissionStarted; an event-only reload must not open a run for that initial
+    stage (codex P1), so a same-stage update stays a no-op."""
+    clock = {"t": 1_700_000_000.0}
+    r = repo.ControlPlaneRepo(now=lambda: clock["t"])
+    r.upsert_mission("pi-1", title="m", stage="ready", source="pi")
+    clock["t"] += 0.1
+    # A same-stage update should NOT open a run in live execution.
+    r.upsert_mission("pi-1", title="m", stage="ready", source="pi")
+    clock["t"] += 0.5
+    r.upsert_mission("pi-1", title="m", stage="implementation", source="pi")
+    clock["t"] += 0.5
+    r.upsert_mission("pi-1", title="m", stage="complete", source="pi")
+    live = r.stage_analytics()
+    # Event-only reload must match: no spurious 'ready' run, one implementation run.
+    state = r.export_state()
+    state.pop("delivery", None)
+    restored = repo.ControlPlaneRepo(now=lambda: clock["t"])
+    restored.import_state(state)
+    replay = restored.stage_analytics()
+    assert "ready" not in live["stages"] and "ready" not in replay["stages"]
+    assert live["stages"]["implementation"]["runs"] == 1
+    assert replay["stages"]["implementation"]["runs"] == 1
+    assert live["stages"]["implementation"]["p50_ms"] == replay["stages"]["implementation"]["p50_ms"]
