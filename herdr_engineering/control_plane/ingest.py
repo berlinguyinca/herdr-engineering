@@ -16,6 +16,7 @@ import math
 import re
 
 from ..review_gate.entities import RESERVED_ENTITY_PREFIXES
+from .ids import validate_mission_id
 
 log = logging.getLogger(__name__)
 from .envelope import ENVELOPE_ONLY_TYPES, EnvelopeConflict, normalize_envelope
@@ -348,8 +349,8 @@ class IngestService:
         report never consumes its event id/sequence: the corrected retry with
         the same idempotency identity can still be applied.
         """
-        if entity_type == "mission" and ":" in entity_id:
-            raise ValueError("invalid mission id")
+        if entity_type == "mission":
+            validate_mission_id(entity_id, source)
         if entity_type == "lineage":
             validate_lineage(event_type, payload)
         if entity_type in ("session", "mission"):
@@ -448,8 +449,7 @@ class IngestService:
             return self._ingest_session(entity_id, event_type, payload,
                                         source)
         if entity_type == "mission":
-            if ":" in entity_id:
-                raise ValueError("invalid mission id")
+            validate_mission_id(entity_id, source)
             return self._ingest_mission(entity_id, event_type, payload,
                                         source)
         if entity_type == "service":
