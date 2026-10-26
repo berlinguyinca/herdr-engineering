@@ -318,6 +318,14 @@
       become: false
       # A rollback failure must never bypass the failure recording / fleet-stop
       # below (serial: 1), so it is best-effort and non-fatal.
+      #
+      # SCOPE: powerpack rollback restores the CONTROLLER's lock/config/plugin
+      # policy only. It does NOT rewind the target's deployed release — that is
+      # governed by fixed pinned revisions (herdr_pinned_version,
+      # fleet_update_herdr_engineering_revision) plus serial=1, deferral, the
+      # pending-restart marker and stop-on-failure. A target left partially
+      # staged at the pinned revision is recovered by re-running, not by this
+      # controller-side rollback.
       ignore_errors: true
       when:
         - not ansible_check_mode

@@ -61,6 +61,24 @@ inventory on a non-gateway host). YAML of the edited `tasks/main.yml` parses.
    snapshot, then the run records the host as failed and (with `fleet_update_stop_on_failure`)
    skips the remaining hosts.
 
+## Rollback scope (powerpack is controller-side)
+
+`powerpack rollback` restores the **controller's** lock, config and plugin policy from the
+pre-update snapshot. It does **not** rewind a target's deployed release. Target deployment
+safety is provided by the fleet-update's own mechanisms, which are unchanged and still active:
+
+- Fixed **pinned revisions** (`herdr_pinned_version: 0.9.1`, `fleet_update_herdr_engineering_revision`);
+  the update stages the pinned release, not an un-pinned HEAD.
+- `serial: 1` — one host at a time, bounded blast radius.
+- The **busy health gate** — a busy host is deferred, never forced without `fleet_update_force`.
+- The **pending-restart marker** — a host that drops mid-update gets its agent restarted by a
+  later run; a target left partially staged at the pinned revision is recovered by re-running.
+- `fleet_update_stop_on_failure` — the first failed host turns the remaining hosts into
+  "skipped: an earlier host failed".
+
+A target-binary rollback (restoring a prior release) is out of powerpack's scope; the operator
+recovers a failed target by re-running at the pinned revision (or pinning an earlier one).
+
 ## Caveat
 
 The dry-run here was validated for syntax and check-mode write-safety from a non-gateway
