@@ -741,17 +741,24 @@ def _cmd_cp_feed_pi(args) -> int:
         if not explicit_key:
             api_key = cfg.api_key or host_value("ingest.api_key") or ""
 
+    retry_delay = interval if interval > 0 else 1.0
     while True:
         doc = read_snapshot(args.snapshot)
         envelopes = snapshot_to_envelopes(doc)
         try:
             posted = post_envelopes(url, api_key, envelopes)
-        except IngestAuthRejected:
-            if refresher is None:
+        except Exception as exc:
+            # One-shot mode reports and exits. Continuous mode survives
+            # transient transport/server failures and credential rotation:
+            # mark an auth rejection so ConfigRefresher refreshes, back off, then
+            # refresh config and retry the same snapshot.
+            if interval <= 0 or refresher is None:
                 raise
-            # Rotated/revoked ingest key: mark it rejected so ConfigRefresher
-            # refreshes on the next pass, then retry this snapshot.
-            refresher.note_auth_rejected()
+            if isinstance(exc, IngestAuthRejected):
+                refresher.note_auth_rejected()
+            print(f"herdr-eng: feed-pi posting failed ({exc}); retrying",
+                  file=sys.stderr)
+            time.sleep(retry_delay)
             _refresh()
             continue
         _print_json({"ok": True, "posted": posted, "missions": len(envelopes),
