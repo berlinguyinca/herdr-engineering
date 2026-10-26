@@ -289,3 +289,276 @@ def test_reserved_prefixes_cover_every_gate_stream():
 
     for entity in (store.ENTITY, queue.ENTITY, registry.ENTITY):
         assert entity.startswith(RESERVED_ENTITY_PREFIXES)
+
+
+# ---------------------------------------------------------------------------
+# Delivery entities (issue #32): test_run, build, review, review_finding,
+# pull_request ingest idempotently and filter by (namespaced) mission id.
+# ---------------------------------------------------------------------------
+def test_ingest_test_run_is_idempotent_and_filters_by_mission():
+    repo = ControlPlaneRepo()
+    svc = make_svc(repo)
+    env = {
+        "entity_type": "test_run", "entity_id": "run-1",
+        "event_type": "test_run.started",
+        "payload": {"mission_id": "MSN-1", "status": "failed",
+                    "passed": 2, "failed": 1, "total": 3}}
+    svc.ingest({**env, "payload": {**env["payload"], "passed": 2}})
+    svc.ingest({**env, "payload": {**env["payload"], "failed": 1}})
+    runs = repo.list_test_runs(mission_id="MSN-1")
+    assert len(runs) == 1
+    assert runs[0]["test_run_id"] == "run-1"
+    assert runs[0]["failed"] == 1 and runs[0]["passed"] == 2
+    # A run for another mission never leaks in.
+    assert repo.list_test_runs(mission_id="MSN-2") == []
+
+
+def test_ingest_delivery_namespaces_mission_id_by_source():
+    repo = ControlPlaneRepo()
+    svc = make_svc(repo)
+    # A pi-sourced report for raw mission_id M1 lands on the namespaced pi:M1
+    # key so it is visible on the pi mission page (issue #26/#32).
+    svc.ingest({"entity_type": "test_run", "entity_id": "run-pi",
+                "event_type": "test_run.started", "source": "pi",
+                "payload": {"mission_id": "M1", "status": "passed", "total": 1}})
+    assert len(repo.list_test_runs(mission_id="pi:M1")) == 1
+    assert repo.list_test_runs(mission_id="M1") == []
+    # The same report under a herdr source stays on the bare M1 key.
+    svc.ingest({"entity_type": "test_run", "entity_id": "run-h",
+                "event_type": "test_run.started",
+                "payload": {"mission_id": "M1", "status": "passed", "total": 1}})
+    assert len(repo.list_test_runs(mission_id="M1")) == 1
+    assert len(repo.list_test_runs(mission_id="pi:M1")) == 1
+    # A prefixed id that conflicts with its source is rejected.
+    with pytest.raises(ValueError, match="conflicts"):
+        svc.ingest({"entity_type": "test_run", "entity_id": "run-bad",
+                    "event_type": "test_run.started", "source": "pi",
+                    "payload": {"mission_id": "herdr-ws:x", "total": 1}})
+
+
+def test_ingest_build_reuses_test_run_collection_with_kind_build():
+    repo = ControlPlaneRepo()
+    svc = make_svc(repo)
+    svc.ingest({"entity_type": "build", "entity_id": "build-1",
+                "event_type": "build.started",
+                "payload": {"mission_id": "m1", "status": "ok"}})
+    svc.ingest({"entity_type": "build", "entity_id": "build-1",
+                "event_type": "build.updated",
+                "payload": {"mission_id": "m1", "status": "ok"}})
+    builds = repo.list_test_runs(mission_id="m1", kind="build")
+    assert len(builds) == 1 and builds[0]["kind"] == "build"
+    assert repo.list_test_runs(mission_id="m1", kind="test") == []
+
+
+def test_ingest_review_is_idempotent_and_holds_findings():
+    repo = ControlPlaneRepo()
+    svc = make_svc(repo)
+    svc.ingest({"entity_type": "review", "entity_id": "rv-1",
+                "event_type": "review.started",
+                "payload": {"mission_id": "m1", "reviewer": "codex",
+                            "status": "completed", "verdict": "approved"}})
+    svc.ingest({"entity_type": "review", "entity_id": "rv-1",
+                "event_type": "review.updated",
+                "payload": {"mission_id": "m1", "reviewer": "codex",
+                            "status": "completed", "verdict": "approved"}})
+    svc.ingest({"entity_type": "review_finding", "entity_id": "rv-1",
+                "event_type": "review_finding.added",
+                "payload": {"severity": "blocker", "summary": "crashes"}})
+    reviews = repo.list_reviews(mission_id="m1")
+    assert len(reviews) == 1 and reviews[0]["verdict"] == "approved"
+    assert [f["summary"] for f in reviews[0]["findings"]] == ["crashes"]
+    assert repo.list_reviews(mission_id="m2") == []
+
+
+def test_ingest_review_finding_requires_existing_review():
+    repo = ControlPlaneRepo()
+    svc = make_svc(repo)
+    with pytest.raises(KeyError):
+        svc.ingest({"entity_type": "review_finding", "entity_id": "nope",
+                    "event_type": "review_finding.added",
+                    "payload": {"severity": "blocker", "summary": "x"}})
+
+
+def test_ingest_pull_request_is_idempotent_and_filters_by_mission():
+    repo = ControlPlaneRepo()
+    svc = make_svc(repo)
+    env = {
+        "entity_type": "pull_request", "entity_id": "pr-1",
+        "event_type": "pull_request.opened",
+        "payload": {"mission_id": "m1", "repository": "acme/w", "number": 7,
+                    "url": "https://github.com/acme/w/pull/7", "status": "open"}}
+    svc.ingest({**env})
+    svc.ingest({**env, "payload": {**env["payload"], "status": "merged"}})
+    pulls = repo.list_pull_requests(mission_id="m1")
+    assert len(pulls) == 1 and pulls[0]["status"] == "merged"
+    assert repo.list_pull_requests(mission_id="m2") == []
+    # A merged PR records a PullRequestMerged event.
+    assert "PullRequestMerged" in [e["event_type"] for e in repo.stream("pull_request", "pr-1")]
+
+
+def test_ingest_delivery_rejects_invalid_counts():
+    repo = ControlPlaneRepo()
+    svc = make_svc(repo)
+    def ingest(passed):
+        svc.ingest({"entity_type": "test_run", "entity_id": "r",
+                    "event_type": "test_run.started",
+                    "payload": {"passed": passed}})
+    for bad in ("many", True, float("nan"), float("inf"), float("-inf"), -3):
+        with pytest.raises(ValueError, match="passed"):
+            ingest(bad)
+
+
+def test_ingest_review_finding_replay_is_idempotent_without_finding_id():
+    repo = ControlPlaneRepo()
+    svc = make_svc(repo)
+    svc.ingest({"entity_type": "review", "entity_id": "rv-2",
+                "event_type": "review.started",
+                "payload": {"mission_id": "m1", "reviewer": "codex",
+                            "status": "completed", "verdict": "approved"}})
+    finding = {"entity_type": "review_finding", "entity_id": "rv-2",
+               "event_type": "review_finding.added",
+               "payload": {"severity": "blocker", "summary": "crash", "detail": "d"}}
+    svc.ingest({**finding})
+    svc.ingest({**finding})  # replay without a finding_id must not append a duplicate
+    reviews = repo.list_reviews(mission_id="m1")
+    assert len(reviews[0]["findings"]) == 1
+    assert reviews[0]["findings"][0]["summary"] == "crash"
+
+
+def test_v2_delivery_malformed_report_does_not_consume_its_sequence():
+    repo = ControlPlaneRepo()
+    svc = make_svc(repo)
+    # A malformed v2 test_run (bad passed count) is rejected before the envelope
+    # is persisted, so a corrected retry with the same idempotency identity lands.
+    bad = {"schema_version": 2, "event_id": "pi-7", "source": "pi",
+           "source_sequence": 7, "entity_type": "test_run", "entity_id": "r9",
+           "event_type": "test_run.started",
+           "payload": {"mission_id": "M1", "passed": "many", "total": 3}}
+    with pytest.raises(ValueError, match="passed"):
+        svc.ingest(bad, {"id": "agent", "kind": "agent", "authenticated_by": "api_key"})
+    assert repo.list_test_runs(mission_id="pi:M1") == []
+    # Corrected retry with the same event id is accepted.
+    good = {**bad, "payload": {"mission_id": "M1", "passed": 3, "total": 3}}
+    svc.ingest(good, {"id": "agent", "kind": "agent", "authenticated_by": "api_key"})
+    runs = repo.list_test_runs(mission_id="pi:M1")
+    assert len(runs) == 1 and runs[0]["passed"] == 3
+
+
+def test_v2_review_finding_unknown_review_does_not_consume_sequence():
+    repo = ControlPlaneRepo()
+    svc = make_svc(repo)
+    env = {"schema_version": 2, "event_id": "pi-8", "source": "pi",
+           "source_sequence": 8, "entity_type": "review_finding",
+           "entity_id": "missing-review", "event_type": "review_finding.added",
+           "payload": {"severity": "blocker", "summary": "crash"}}
+    # Unknown review must not persist an envelope (and must not consume its
+    # sequence) so a corrected retry with the SAME event id can replay it.
+    with pytest.raises(KeyError):
+        svc.ingest(env, {"id": "agent", "kind": "agent", "authenticated_by": "api_key"})
+    # Create the review, then retry the identical pi-8 envelope: it must apply.
+    svc.ingest({"schema_version": 2, "event_id": "pi-9", "source": "pi",
+                "source_sequence": 9, "entity_type": "review", "entity_id": "rv-9",
+                "event_type": "review.started",
+                "payload": {"mission_id": "M1", "reviewer": "codex", "status": "completed",
+                            "verdict": "approved"}},
+               {"id": "agent", "kind": "agent", "authenticated_by": "api_key"})
+    svc.ingest({**env, "entity_id": "rv-9"},
+               {"id": "agent", "kind": "agent", "authenticated_by": "api_key"})
+    reviews = repo.list_reviews(mission_id="pi:M1")
+    assert len(reviews) == 1 and len(reviews[0]["findings"]) == 1
+
+
+def test_delivery_projections_survive_export_import_restore():
+    repo = ControlPlaneRepo()
+    svc = make_svc(repo)
+    svc.ingest({"entity_type": "test_run", "entity_id": "rt1",
+                "event_type": "test_run.started",
+                "payload": {"mission_id": "m1", "status": "passed", "passed": 4, "total": 4}})
+    svc.ingest({"entity_type": "review", "entity_id": "rvr1",
+                "event_type": "review.started",
+                "payload": {"mission_id": "m1", "reviewer": "codex",
+                            "status": "completed", "verdict": "approved"}})
+    svc.ingest({"entity_type": "pull_request", "entity_id": "prr1",
+                "event_type": "pull_request.opened",
+                "payload": {"mission_id": "m1", "number": 9, "status": "open"}})
+    restored = ControlPlaneRepo()
+    restored.import_state(repo.export_state())
+    assert len(restored.list_test_runs(mission_id="m1")) == 1
+    assert len(restored.list_reviews(mission_id="m1")) == 1
+    assert len(restored.list_pull_requests(mission_id="m1")) == 1
+    # The durable event streams still carry the records after restore.
+    assert [e["event_type"] for e in restored.stream("test_run", "rt1")] == ["TestRunStarted"]
+
+
+def test_delivery_projections_rebuilt_on_event_only_reload():
+    repo = ControlPlaneRepo()
+    svc = make_svc(repo)
+    svc.ingest({"entity_type": "test_run", "entity_id": "rr1",
+                "event_type": "test_run.started",
+                "payload": {"mission_id": "m1", "status": "passed", "passed": 4, "total": 4}})
+    svc.ingest({"entity_type": "pull_request", "entity_id": "ppr1",
+                "event_type": "pull_request.opened",
+                "payload": {"mission_id": "m1", "number": 11, "status": "open"}})
+    # The bridge durable-reload path restores event streams but no delivery snapshot.
+    state = repo.export_state()
+    del state["delivery"]
+    restored = ControlPlaneRepo()
+    restored.import_state(state)
+    assert len(restored.list_test_runs(mission_id="m1")) == 1
+    assert len(restored.list_pull_requests(mission_id="m1")) == 1
+    # Rebuilding must not duplicate the durable streams.
+    assert len(restored.stream("test_run", "rr1")) == 1
+    assert len(restored.stream("pull_request", "ppr1")) == 1
+
+
+def test_v2_test_run_bad_results_does_not_consume_sequence():
+    repo = ControlPlaneRepo()
+    svc = make_svc(repo)
+    bad = {"schema_version": 2, "event_id": "pi-20", "source": "pi",
+           "source_sequence": 20, "entity_type": "test_run", "entity_id": "r20",
+           "event_type": "test_run.started",
+           "payload": {"mission_id": "M1", "total": 3, "results": "not-a-list"}}
+    with pytest.raises(ValueError, match="results"):
+        svc.ingest(bad, {"id": "agent", "kind": "agent", "authenticated_by": "api_key"})
+    assert repo.list_test_runs(mission_id="pi:M1") == []
+    # A corrected retry with the same event id applies.
+    good = {**bad, "payload": {"mission_id": "M1", "total": 3,
+                               "results": [{"name": "t1", "status": "passed"}]}}
+    svc.ingest(good, {"id": "agent", "kind": "agent", "authenticated_by": "api_key"})
+    runs = repo.list_test_runs(mission_id="pi:M1")
+    assert len(runs) == 1 and len(runs[0]["results"]) == 1
+
+
+def test_delivery_rebuild_preserves_review_findings_and_pr_merge():
+    repo = ControlPlaneRepo()
+    svc = make_svc(repo)
+    svc.ingest({"entity_type": "review", "entity_id": "rvx",
+                "event_type": "review.started",
+                "payload": {"mission_id": "m1", "reviewer": "codex",
+                            "status": "completed", "verdict": "changes"}})
+    svc.ingest({"entity_type": "review_finding", "entity_id": "rvx",
+                "event_type": "review_finding.added",
+                "payload": {"severity": "blocker", "summary": "crash"}})
+    svc.ingest({"entity_type": "pull_request", "entity_id": "prx",
+                "event_type": "pull_request.opened",
+                "payload": {"mission_id": "m1", "number": 3, "status": "open",
+                            "branch": "x", "base": "main"}})
+    svc.ingest({"entity_type": "pull_request", "entity_id": "prx",
+                "event_type": "pull_request.updated",
+                "payload": {"mission_id": "m1", "number": 3, "status": "merged",
+                            "branch": "x", "base": "main"}})
+    state = repo.export_state()
+    del state["delivery"]
+    restored = ControlPlaneRepo()
+    restored.import_state(state)
+    reviews = restored.list_reviews(mission_id="m1")
+    assert len(reviews) == 1
+    assert reviews[0]["verdict"] == "changes"
+    assert len(reviews[0]["findings"]) == 1
+    assert reviews[0]["findings"][0]["summary"] == "crash"
+    pulls = restored.list_pull_requests(mission_id="m1")
+    assert len(pulls) == 1 and pulls[0]["status"] == "merged"
+    assert pulls[0]["branch"] == "x" and pulls[0]["base"] == "main"
+    # Streams are not duplicated by the rebuild.
+    assert len(restored.stream("review", "rvx")) == 2
+    assert len(restored.stream("pull_request", "prx")) == 3

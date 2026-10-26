@@ -10,6 +10,7 @@ to one control-plane entity.
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
 
@@ -47,7 +48,8 @@ def _git_identity(payload):
 # Entity types an ingest principal may write. Dispatched types have handlers; the generic ones are
 # plain activity records nothing authoritative reads back. Adding a type here is a security decision.
 DISPATCHED_ENTITY_TYPES = frozenset({"lineage", "host", "session", "mission", "service", "inspector",
-                                     "mission_activity"})
+                                     "mission_activity", "test_run", "build", "review",
+                                     "review_finding", "pull_request"})
 # ledger / platform / lifecycle are the Pi envelope adapters' activity streams (envelopeAdapters.ts)
 # repository / request / span are the opt-in system-graph adapter's lifecycle streams (graph_ingest.py, runbook
 # docs/specs/herdr-system-graph-20261020/11-p0-p6-status-and-runbook.md). They were accepted before T16, nothing
@@ -249,10 +251,10 @@ class IngestService:
             self._check_peer_namespace(env, event_type, payload, entity_id)
             self._check_lineage_scope(env)
             self._check_reserved_nodes(env, event_type, payload)
+        self._prevalidate(entity_type, entity_id, payload, event_type, source)
         if env is None:
             return self._dispatch(entity_type, entity_id, event_type, payload, source)
         env["entity_type"] = entity_type
-        self._prevalidate(entity_type, entity_id, payload, event_type)
         ledger = self.repo.ledger
         ack = {"event_id": env["event_id"], "source": env["source"],
                "source_sequence": env["source_sequence"]}
@@ -331,9 +333,13 @@ class IngestService:
             raise RuntimeError("durable event identity is unavailable")
         return tuple(found)
 
-    @staticmethod
-    def _prevalidate(entity_type, entity_id, payload, event_type="") -> None:
-        """Reject what a handler would reject BEFORE the envelope is persisted."""
+    def _prevalidate(self, entity_type, entity_id, payload, event_type="", source="herdr") -> None:
+        """Reject what a handler would reject BEFORE the envelope is persisted.
+
+        Runs for both v1 (legacy) and v2 (enveloped) ingest so a malformed
+        report never consumes its event id/sequence: the corrected retry with
+        the same idempotency identity can still be applied.
+        """
         if entity_type == "mission" and ":" in entity_id:
             raise ValueError("invalid mission id")
         if entity_type == "lineage":
@@ -344,7 +350,43 @@ class IngestService:
                 k in payload for k in ("repository_id", "forge_url", "repository_url",
                                        "repo_url", "clone_url", "commit_sha")):
             _git_identity(payload)
+        if entity_type in ("test_run", "build"):
+            self._validate_test_counts(payload)
+            self._delivery_mission_key(payload.get("mission_id"), source)
+        elif entity_type == "review":
+            self._delivery_mission_key(payload.get("mission_id"), source)
+        elif entity_type == "review_finding":
+            severity = payload.get("severity")
+            if not isinstance(severity, str) or not severity:
+                raise ValueError("severity is required")
+            if not isinstance(payload.get("summary"), str):
+                raise ValueError("summary is required")
+            # The finding attaches to the review named by ``entity_id``; the
+            # review must already exist so a forged/unknown review can never
+            # consume the source sequence of a report that will be rejected.
+            if self.repo.get_review(entity_id) is None:
+                raise KeyError(entity_id)
+        elif entity_type == "pull_request":
+            self._delivery_mission_key(payload.get("mission_id"), source)
 
+    @staticmethod
+    def _validate_test_counts(payload) -> None:
+        for key in ("passed", "failed", "skipped", "total"):
+            value = payload.get(key)
+            if value is None:
+                continue
+            # bool is an int subclass but is not a count; NaN/Infinity are numbers
+            # but cannot be serialized as JSON and would corrupt displayed metrics.
+            if isinstance(value, bool) or not isinstance(value, (int, float)) \
+                    or isinstance(value, float) and (value != value or value in (float('inf'), float('-inf'))):
+                raise ValueError(f"{key} must be a finite number")
+            if value < 0:
+                raise ValueError(f"{key} must be non-negative")
+        results = payload.get("results")
+        if results is not None:
+            if not isinstance(results, list) or any(
+                    not isinstance(r, dict) for r in results):
+                raise ValueError("results must be a list of objects")
     def _dispatch(self, entity_type, entity_id, event_type, payload, source,
                   record_generic=True) -> dict:
         # System-graph live-ingest adapter (opt-in): reflect lifecycle events
@@ -390,12 +432,102 @@ class IngestService:
             res = self.repo.inspector.ingest(entity_id, payload)
             return {"entity_type": "inspector", "entity_id": entity_id,
                     "event_type": event_type, **res}
+        if entity_type in ("test_run", "build"):
+            return self._ingest_test_run(entity_id, event_type, payload, source,
+                                         kind="test" if entity_type == "test_run" else "build")
+        if entity_type == "review":
+            return self._ingest_review(entity_id, event_type, payload, source)
+        if entity_type == "review_finding":
+            return self._ingest_review_finding(entity_id, payload, source)
+        if entity_type == "pull_request":
+            return self._ingest_pull_request(entity_id, event_type, payload, source)
         # Unknown/other entity types: record the event generically so nothing is
         # silently dropped, and the UI still sees it on the activity stream.
         if record_generic:
             self.repo.record_event(entity_type, entity_id, event_type, payload)
         return {"entity_type": entity_type, "entity_id": entity_id,
                 "event_type": event_type}
+
+    # ------------------------------------------------------ delivery entities
+    # Test runs, builds, reviews, review findings and pull requests are stored
+    # in the repo's delivery collections (issue #32). They mirror the SQL table
+    # shapes, are idempotent on entity_id, and attach to a source-namespaced
+    # mission key exactly like sessions and missions do (issue #26), so a pi
+    # report for raw mission_id ``M1`` lands on ``pi:M1`` and stays visible on
+    # the pi mission page instead of a bare ``M1`` the UI never queries.
+    def _delivery_mission_key(self, mission_id, source):
+        if mission_id is None:
+            return None
+        if not isinstance(mission_id, str) or not mission_id:
+            raise ValueError("mission_id must be a non-empty string")
+        if ":" in mission_id:
+            namespace, raw = mission_id.split(":", 1)
+            if not raw or ":" in raw or (source != "herdr" and namespace != source):
+                raise ValueError("mission identity conflicts with its source")
+            return mission_id
+        return mission_id if source == "herdr" else f"{source}:{mission_id}"
+
+    def _ingest_test_run(self, entity_id, event_type, payload, source, kind="test") -> dict:
+        self._validate_test_counts(payload)
+        return self.repo.upsert_test_run(
+            entity_id, kind=kind,
+            mission_id=self._delivery_mission_key(payload.get("mission_id"), source),
+            session_id=payload.get("session_id"),
+            repository=payload.get("repository"),
+            status=payload.get("status"),
+            passed=payload.get("passed"),
+            failed=payload.get("failed"),
+            skipped=payload.get("skipped"),
+            total=payload.get("total"),
+            started_at=payload.get("started_at"),
+            ended_at=payload.get("ended_at"),
+            results=payload.get("results"),
+        )
+
+    def _ingest_review(self, entity_id, event_type, payload, source) -> dict:
+        return self.repo.upsert_review(
+            entity_id, mission_id=self._delivery_mission_key(payload.get("mission_id"), source),
+            session_id=payload.get("session_id"),
+            reviewer=payload.get("reviewer"),
+            status=payload.get("status"),
+            verdict=payload.get("verdict"),
+            started_at=payload.get("started_at"),
+            completed_at=payload.get("completed_at"),
+        )
+
+    def _ingest_review_finding(self, entity_id, payload, source) -> dict:
+        # The finding attaches to the review named by ``review_id`` (which the
+        # ingest envelope carries in ``entity_id``); the review must already
+        # exist so a forged/unknown review can never collect findings.
+        severity = payload.get("severity")
+        summary = payload.get("summary")
+        # A client-supplied finding_id is honoured verbatim; when omitted we derive
+        # a stable id from the finding content so a replayed envelope updates the
+        # original finding in place instead of appending a duplicate (idempotency
+        # of the ingest path, independent of the review's current finding count).
+        finding_id = payload.get("finding_id")
+        if not finding_id:
+            content = "|\n".join([severity, summary, payload.get("detail") or "",
+                                  payload.get("status") or "open"])
+            finding_id = hashlib.sha256(content.encode("utf-8")).hexdigest()[:16]
+        return self.repo.add_review_finding(
+            entity_id, severity=severity,
+            summary=summary, detail=payload.get("detail") or "",
+            status=payload.get("status") or "open",
+            finding_id=finding_id,
+        )
+
+    def _ingest_pull_request(self, entity_id, event_type, payload, source) -> dict:
+        return self.repo.upsert_pull_request(
+            entity_id, mission_id=self._delivery_mission_key(payload.get("mission_id"), source),
+            repository=payload.get("repository"),
+            number=payload.get("number"),
+            url=payload.get("url"),
+            status=payload.get("status"),
+            branch=payload.get("branch"),
+            base=payload.get("base"),
+            created_at=payload.get("created_at"),
+        )
 
     def _ingest_host(self, entity_id, event_type, payload, source="herdr") -> dict:
         if source not in LIVENESS_SOURCES:

@@ -183,6 +183,9 @@ class ControlPlaneRepo:
         self._telemetry = {}  # host_id -> [sample, ...]
         self._events = {}  # (entity_type, entity_id) -> [event, ...]
         self._event_order = []  # (entity_type, entity_id, seq) chronological
+        # Rebuilding delivery projections replays stored events into the upsert
+        # methods, which would otherwise re-record the very events being rebuilt.
+        self._suppress_record_events = False
         self._ci_sequence = 0  # one bounded counter survives stream eviction
         # Envelope v2 idempotency / sequence / freshness state (envelope.py).
         self.ledger = SourceLedger(now=self._now, persist=self._persist_source_state)
@@ -267,7 +270,7 @@ class ControlPlaneRepo:
         if rec is None:
             return None
         rec = _copy(rec)
-        rec["telemetry_state"] = self._mission_telemetry_state(
+        rec["telemetry_state"], rec["report_age_seconds"] = self._mission_telemetry_state(
             rec.get("mission_key") or rec["mission_id"])
         return rec
 
@@ -292,12 +295,15 @@ class ControlPlaneRepo:
             return mission_id
         return None
 
-    def _mission_telemetry_state(self, mission_key: str) -> str:
-        """Derive live/stale/unknown from the bounded mission-activity read model.
+    def _mission_telemetry_state(self, mission_key: str) -> tuple:
+        """Return (telemetry_state, report_age_seconds) from the activity store.
 
-        This reflects *collection* freshness of the Pi transport, never worker
-        health: a mission with no collector is ``unknown``, not stalled. It reuses
-        the real freshness the activity store already computes (issue #28); no
+        telemetry_state is ``live``/``stale``/``unknown`` reflecting *collection*
+        freshness of the Pi transport, never worker health: a mission with no
+        collector is ``unknown``, not stalled. report_age_seconds is the age of the
+        most recent activity report (the stall age) or ``None`` when there is no
+        collector, so the UI never fabricates a liveness reading. Both reuse the
+        real freshness the activity store already computes (issue #28); no
         fabricated heartbeat is ever invented.
         """
         try:
@@ -305,19 +311,21 @@ class ControlPlaneRepo:
         except Exception:  # noqa: BLE001 - one unreadable entry never hides the rest
             live = None
         if not live:
-            return "unknown"
-        state = (live.get("freshness") or {}).get("state")
+            return "unknown", None
+        freshness = live.get("freshness") or {}
+        state = freshness.get("state")
+        age = freshness.get("age_seconds")
         if state in ("live", "updating"):
-            return "live"
+            return "live", age
         if state in ("stale", "disconnected"):
-            return "stale"
-        return "unknown"
+            return "stale", age
+        return "unknown", age
 
     def list_missions(self, status=None):
         out = []
         for m in self._missions.values():
             rec = _copy(m)
-            rec["telemetry_state"] = self._mission_telemetry_state(
+            rec["telemetry_state"], rec["report_age_seconds"] = self._mission_telemetry_state(
                 rec.get("mission_key") or rec["mission_id"])
             out.append(rec)
         if status:
@@ -1751,6 +1759,8 @@ class ControlPlaneRepo:
         """Record one event. ``envelope`` (a normalised v2 envelope) makes it the
         canonical envelope row: emitter event_id, server-set actor/received_at,
         durable before return. ``feed=False`` keeps it out of the global feed."""
+        if self._suppress_record_events:
+            return
         with self._event_lock:
             key = (entity_type, entity_id)
             stream = self._events.setdefault(key, [])
@@ -2210,6 +2220,11 @@ class ControlPlaneRepo:
             "leases": _copy(self._leases),
             "telemetry": {k: [dict(s) for s in v]
                           for k, v in self._telemetry.items()},
+            "delivery": {
+                "test_runs": _copy(self._test_runs),
+                "reviews": _copy(self._reviews),
+                "pull_requests": _copy(self._pull_requests),
+            },
             "events": {f"{t}|{i}": [dict(e) for e in s]
                        for (t, i), s in self._events.items()},
             "event_order": list(self._event_order),
@@ -2229,6 +2244,11 @@ class ControlPlaneRepo:
         self._leases = dict(state.get("leases", {}))
         self._telemetry = {k: [dict(s) for s in v]
                           for k, v in state.get("telemetry", {}).items()}
+        delivery_present = "delivery" in state
+        delivery = state.get("delivery", {})
+        self._test_runs = dict(delivery.get("test_runs", {}))
+        self._reviews = dict(delivery.get("reviews", {}))
+        self._pull_requests = dict(delivery.get("pull_requests", {}))
         self._events = {}
         for key, stream in state.get("events", {}).items():
             t, i = key.split("|")
@@ -2236,6 +2256,11 @@ class ControlPlaneRepo:
         self._event_order = [tuple(x) for x in state.get("event_order", [])]
         self.ledger.hydrate([e for stream in self._events.values() for e in stream])
         self._rebuild_graph()
+        if not delivery_present:
+            # The bridge durable-reload path restores event streams but carries no
+            # delivery snapshot; rebuild the projections from those streams so
+            # tests/builds/reviews/PRs survive a restart instead of going silent.
+            self._rebuild_delivery_from_events()
         self._ci_sequence = max(int(state.get("ci_sequence", 0)),
                                 max((event.get("sequence", -1) + 1
                                      for key, stream in self._events.items()
@@ -2319,6 +2344,87 @@ class ControlPlaneRepo:
         graph._seq = max([graph._seq] + [_graph_lseq(e) for e in rows])
         self.graph = graph
         self._event_order = [t for t in self._event_order if t[0] != "lineage"]
+
+    def _rebuild_delivery_from_events(self):
+        """Replay delivery event streams into their projections.
+
+        Used by the durable reload path (bridge.py) which restores event streams
+        but carries no delivery snapshot: replaying the stored payloads rebuilds
+        the test_run/build/review/pull_request projections so delivery APIs and
+        mission pages show them after a restart. Idempotent — re-runs overwrite
+        the same records in place. Event recording is suppressed so the rebuilt
+        streams are not duplicated by the upsert methods.
+        """
+        self._suppress_record_events = True
+        try:
+            self._rebuild_delivery_from_events_impl()
+        finally:
+            self._suppress_record_events = False
+
+    def _rebuild_delivery_from_events_impl(self):
+        for entity_type in ("test_run", "build", "review", "pull_request"):
+            for ids in self.entity_ids(entity_type):
+                stream = self._events.get((entity_type, ids), [])
+                if not stream:
+                    continue
+                # Replay the whole stream in order: a review's findings are their
+                # own events, and a merged PR ends with a partial merge event, so
+                # rebuilding from only the last event would drop data. Each event
+                # payload carries enough to rebuild (record_event is suppressed, so
+                # nothing is re-persisted and the streams are not duplicated).
+                for ev in stream:
+                    payload = _payload(ev)
+                    event_type = ev.get("event_type", "")
+                    try:
+                        if entity_type in ("test_run", "build"):
+                            self.upsert_test_run(
+                                ids, kind=payload.get("kind") or entity_type,
+                                mission_id=payload.get("mission_id"),
+                                session_id=payload.get("session_id"),
+                                repository=payload.get("repository"),
+                                status=payload.get("status"),
+                                passed=payload.get("passed"),
+                                failed=payload.get("failed"),
+                                skipped=payload.get("skipped"),
+                                total=payload.get("total"),
+                                started_at=payload.get("started_at"),
+                                ended_at=payload.get("ended_at"),
+                                results=payload.get("results"),
+                            )
+                        elif entity_type == "review":
+                            if event_type == "ReviewFindingAdded":
+                                self.add_review_finding(
+                                    ids, severity=payload.get("severity"),
+                                    summary=payload.get("summary"),
+                                    detail=payload.get("detail") or "",
+                                    status=payload.get("status") or "open",
+                                    finding_id=payload.get("finding_id"),
+                                )
+                            else:
+                                self.upsert_review(
+                                    ids, mission_id=payload.get("mission_id"),
+                                    session_id=payload.get("session_id"),
+                                    reviewer=payload.get("reviewer"),
+                                    status=payload.get("status"),
+                                    verdict=payload.get("verdict"),
+                                    started_at=payload.get("started_at"),
+                                    completed_at=payload.get("completed_at"),
+                                )
+                        elif entity_type == "pull_request":
+                            if event_type == "PullRequestMerged":
+                                continue  # subset of the last Opened/Updated event
+                            self.upsert_pull_request(
+                                ids, mission_id=payload.get("mission_id"),
+                                repository=payload.get("repository"),
+                                number=payload.get("number"),
+                                url=payload.get("url"),
+                                status=payload.get("status"),
+                                branch=payload.get("branch"),
+                                base=payload.get("base"),
+                                created_at=payload.get("created_at"),
+                            )
+                    except (ValueError, KeyError, TypeError):  # a bad row never blocks startup
+                        continue
 
     def take_collab_replay(self):
         """Hand the diverted durable HCN events to the collaboration service (once)."""
