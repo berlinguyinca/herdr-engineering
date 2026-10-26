@@ -735,7 +735,7 @@ def test_v2_usage_envelope_does_not_duplicate_events():
            "payload": {"mission_id": "M1", "model": "gpt", "request_id": "req-u1",
                        "input_tokens": 5}}
     svc.ingest(env, {"id": "agent", "kind": "agent", "authenticated_by": "api_key"})
-    assert repo.usage_analytics(mission_id="M1")["tokens"]["total"]["input_tokens"] == 5
+    assert repo.usage_analytics(mission_id="pi:M1")["tokens"]["total"]["input_tokens"] == 5
     # The envelope row is the only durable record for this usage event.
     assert len(repo.stream("token_usage", "req-u1")) == 1
     # Event-only reload must not double-count.
@@ -743,7 +743,7 @@ def test_v2_usage_envelope_does_not_duplicate_events():
     state.pop("delivery", None)
     restored = ControlPlaneRepo()
     restored.import_state(state)
-    assert restored.usage_analytics(mission_id="M1")["tokens"]["total"]["input_tokens"] == 5
+    assert restored.usage_analytics(mission_id="pi:M1")["tokens"]["total"]["input_tokens"] == 5
 
 
 def test_v2_resource_usage_envelope_not_double_counted():
@@ -754,7 +754,7 @@ def test_v2_resource_usage_envelope_not_double_counted():
            "event_type": "resource_usage.recorded",
            "payload": {"mission_id": "M1", "kind": "cpu", "value": 2.0}}
     svc.ingest(env, {"id": "agent", "kind": "agent", "authenticated_by": "api_key"})
-    a = repo.usage_analytics(mission_id="M1")
+    a = repo.usage_analytics(mission_id="pi:M1")
     assert a["resources"]["cpu"]["total"] == 2.0
     assert a["resources"]["cpu"]["count"] == 1
 
@@ -772,3 +772,38 @@ def test_usage_rejects_malformed_occurred_at():
     assert rec["occurred_at"] == repo._stamp()
     # The retention sweep must not raise on the stored projection.
     sweep_token_usage(repo, raw_retention_days=1)
+
+
+def test_v2_usage_namespaces_mission_and_preserves_envelope_timestamp():
+    """Usage ingested from a non-herdr source is aggregated under the namespaced
+    mission (pi:M1, not bare M1), and a backdated envelope timestamp is kept so
+    retention ages the projection out (codex P2)."""
+    from herdr_engineering.control_plane.retention import sweep_token_usage
+    import datetime as _dt
+    clock = {"t": _dt.datetime(2026, 10, 23, tzinfo=_dt.UTC).timestamp()}
+    repo = ControlPlaneRepo(now=lambda: clock["t"])
+    svc = make_svc(repo)
+    backdated = _dt.datetime(2026, 10, 1, tzinfo=_dt.UTC).isoformat()
+    env = {"schema_version": 2, "event_id": "pi-usage-ns", "source": "pi",
+           "source_sequence": 1, "entity_type": "token_usage", "entity_id": "req-ns",
+           "event_type": "token_usage.recorded",
+           "occurred_at": backdated,
+           "payload": {"mission_id": "M1", "model": "gpt", "request_id": "req-ns",
+                       "input_tokens": 5}}
+    svc.ingest(env, {"id": "agent", "kind": "agent", "authenticated_by": "api_key"})
+    # Namespaced: pi:M1, not the bare M1.
+    assert repo.usage_analytics(mission_id="pi:M1")["tokens"]["total"]["input_tokens"] == 5
+    assert repo.usage_analytics(mission_id="M1")["tokens"]["total"] == {}
+    # The projection kept the backdated timestamp so a 14-day sweep drops it.
+    assert repo._token_usage["req-ns"]["occurred_at"] == backdated
+    sweep_token_usage(repo, raw_retention_days=14)
+    assert "req-ns" not in repo._token_usage
+
+
+def test_usage_mission_namespacing_matches_delivery():
+    """The repo helper and ingest's _delivery_mission_key namespace identically."""
+    from herdr_engineering.control_plane.repo import _usage_mission_key
+    assert _usage_mission_key("M1", "herdr") == "M1"
+    assert _usage_mission_key("M1", "pi") == "pi:M1"
+    assert _usage_mission_key("pi:M1", "pi") == "pi:M1"
+    assert _usage_mission_key(None, "pi") is None

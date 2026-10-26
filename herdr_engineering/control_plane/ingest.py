@@ -303,6 +303,12 @@ class IngestService:
                 if entity_type == "lineage":
                     result = self._apply_lineage(entity_id, event_type, payload, env)
                 else:
+                    # Usage projections must keep the envelope's (possibly backdated)
+                    # timestamp so retention ages them out correctly; the durable event
+                    # carries it but add_token_usage/add_resource_usage read payload only.
+                    if entity_type in ("token_usage", "resource_usage") and isinstance(payload, dict) \
+                            and not payload.get("occurred_at"):
+                        payload = {**payload, "occurred_at": env.get("occurred_at") or env.get("received_at")}
                     result = self._dispatch(entity_type, entity_id, event_type, payload, source,
                                             record_generic=False)
             finally:
@@ -466,10 +472,12 @@ class IngestService:
             # An already-persisted schema-v2 envelope row must not be recorded a
             # second time by the projection (record_generic is False there), or
             # an event-only reload would replay (and double-count) both records.
+            payload = {**payload, "mission_id": self._delivery_mission_key(payload.get("mission_id"), source)}
             rec = self.repo.add_token_usage(payload, record_event=record_generic)
             return {"entity_type": "token_usage", "entity_id": entity_id,
                     "event_type": event_type, "usage": rec}
         if entity_type == "resource_usage":
+            payload = {**payload, "mission_id": self._delivery_mission_key(payload.get("mission_id"), source)}
             rec = self.repo.add_resource_usage(payload, record_event=record_generic)
             return {"entity_type": "resource_usage", "entity_id": entity_id,
                     "event_type": event_type, "usage": rec}

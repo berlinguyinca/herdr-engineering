@@ -2564,11 +2564,18 @@ class ControlPlaneRepo:
                     try:
                         if entity_type == "token_usage":
                             # mission_id/session_id live on the event envelope, not
-                            # in the payload, so merge them back for the projection.
-                            payload.setdefault("mission_id", ev.get("mission_id"))
+                            # in the payload, so merge them back for the projection,
+                            # and namespace the mission by the event's source so the
+                            # rebuild matches what live ingest stored.
                             payload.setdefault("session_id", ev.get("session_id"))
+                            payload["mission_id"] = _usage_mission_key(
+                                payload.get("mission_id") or ev.get("mission_id"),
+                                ev.get("source") or "herdr")
                             self.add_token_usage(payload)
                         else:
+                            payload["mission_id"] = _usage_mission_key(
+                                payload.get("mission_id") or ev.get("mission_id"),
+                                ev.get("source") or "herdr")
                             self.add_resource_usage(payload)
                     except (ValueError, KeyError, TypeError):
                         continue
@@ -2743,6 +2750,20 @@ def _usage_int(value):
         return int(value) if math.isfinite(value) and value >= 0 else None
     except (ValueError, OverflowError):  # pragma: no cover - non-finite already caught
         return None
+
+
+def _usage_mission_key(mission_id, source):
+    """Namespace a raw mission_id by its source, mirroring ingest's
+    ``_delivery_mission_key`` so usage projections and their event-only rebuild
+    store the same key (e.g. ``pi:M1``). Already-namespaced ids pass through.
+    """
+    if mission_id is None:
+        return None
+    if not isinstance(mission_id, str) or not mission_id:
+        raise ValueError("mission_id must be a non-empty string")
+    if ":" in mission_id:
+        return mission_id
+    return mission_id if source == "herdr" else f"{source}:{mission_id}"
 
 
 def _normalize_occurred_at(value):
