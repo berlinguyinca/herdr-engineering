@@ -56,4 +56,4 @@
 
     - name: "Report per-host version fingerprint"
       ansible.builtin.debug:
-        msg: "{{ inventory_hostname }} | herdr-eng={{ fp_herdr_version.stdout | default('MISSING') }} | build-gate={{ fp_buildgate_md5.stdout | default('MISSING') }} | agent={{ fp_agent.stdout_lines | last | default('unknown') }} | revision={{ fp_revision | default('MISSING', true) }} | cleanup={{ fp_cleanup.stdout | default('unknown', true) }} | pi-revision={{ fp_pi_revision }} | pi-path={{ fp_pi_path }}"
+        msg: "{{ inventory_hostname }} | herdr-eng={{ fp_herdr_version.stdout | default('MISSING') }} | herdr-path={{ fp_herdr_path.stdout | default('MISSING') }} | release-path={{ fp_herdr_release_path | default('MISSING') }} | build-gate={{ fp_buildgate_md5.stdout | default('MISSING') }} | agent={{ fp_agent.stdout_lines | last | default('unknown') }} | revision={{ fp_revision | default('MISSING', true) }} | cleanup={{ fp_cleanup.stdout | default('unknown', true) }} | pi-revision={{ fp_pi_revision }} | pi-path={{ fp_pi_path }}"
