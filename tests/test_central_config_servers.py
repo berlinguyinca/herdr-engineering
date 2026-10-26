@@ -678,6 +678,13 @@ def test_insights_settings_are_yaml_only_validated_and_off_by_default(tmp_path, 
     with pytest.raises(SystemExit):
         cli._apply_collab_config(argparse.Namespace(), {"collab": {"insights": {"kill_switch": "no"}}})
 
+
+def test_collab_skills_slice_is_accepted_and_forwarded(tmp_path):
+    central = make_file(tmp_path, collab=dict(COLLAB, skills={"enabled": True}))
+    values = fcc.collab_values(fcc.load_fleet_config(central))
+    assert values["skills"] == {"enabled": True}
+    assert "skills" in cli.COLLAB_CONFIG_KEYS
+
 # ------------------------------------------- unreadable fleet file: security switches fail closed (T14 review)
 
 def _contextual_source(store):

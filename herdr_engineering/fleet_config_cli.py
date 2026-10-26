@@ -184,6 +184,7 @@ COLLAB_KEYS = frozenset({"cognito_pool", "cognito_clients", "cognito_group", "co
                          "cognito_domain", "public_url", "operator_user", "operator_email",
                          "open_signup", "approver_groups", "dashboard_hosts", "replay_history", "steering",
                          "contextual", "insights",
+                         "skills",
                          "summary_fix",   # summary_fix: ids of the operator's summary-fix room and agent, no secret
                          "delegation_enabled"})
 
