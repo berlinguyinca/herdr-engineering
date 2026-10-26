@@ -653,6 +653,9 @@ class IngestService:
 
     def _ingest_mission(self, entity_id, event_type, payload,
                         source="herdr") -> dict:
+        # The activity source name and the established mission namespace differ.
+        if source == "pi-engineering":
+            source = "pi"
         if "stop" in event_type.lower():
             stage = "complete"
         elif "start" in event_type.lower():
