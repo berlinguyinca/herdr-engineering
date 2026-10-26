@@ -82,6 +82,19 @@
 - name: "Update this host (OS packages, herdr, pi, extensions, autospec, agent)"
   when: fleet_update_decision.action == 'update'
   block:
+    # Snapshot the controller's powerpack lock/config/plugin policy BEFORE any
+    # step mutates this host, so a failure below can restore the prior known-good
+    # state (convergence 11 fleet-canary-rollout). Runs on the main host.
+    - name: "Fleet update: powerpack snapshot before changing this host"
+      ansible.builtin.command:
+        argv: ["{{ fleet_home }}/.venvs/herdr-engineering/bin/herdr-eng",
+               powerpack, snapshot, "fleet-update-{{ fleet_update_host_id }}"]
+      changed_when: false
+      register: fleet_update_pp_snapshot
+      delegate_to: localhost
+      become: false
+      when: not ansible_check_mode
+
     - name: "Fleet update: OS packages"
       ansible.builtin.include_tasks: os-packages.yml
 
@@ -289,6 +302,17 @@
         fleet_update_outcome: updated
   rescue:
     # Only the failed task's NAME: results/messages may contain secrets.
+    - name: "Fleet update: powerpack rollback on failure"
+      ansible.builtin.command:
+        argv: ["{{ fleet_home }}/.venvs/herdr-engineering/bin/herdr-eng",
+               powerpack, rollback, "fleet-update-{{ fleet_update_host_id }}"]
+      changed_when: false
+      delegate_to: localhost
+      become: false
+      when:
+        - not ansible_check_mode
+        - fleet_update_pp_snapshot is defined
+
     - name: "Fleet update: mark failed"
       ansible.builtin.set_fact:
         fleet_update_outcome: failed
