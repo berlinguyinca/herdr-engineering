@@ -14,6 +14,7 @@ import re
 import threading
 from urllib.parse import urlsplit
 
+from .ci_monitor import _credential_redactor
 from .ids import is_valid_id, new_id
 from .redact import redact_text
 
@@ -42,6 +43,7 @@ _TEXT_CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
 
 _DEFAULTS = {
     "enabled": False,
+    "agent_api_key": "",
     "hosts": [],
     "max_concurrent": {"global": 4, "per_host": 2},
     "models": [],
@@ -156,6 +158,12 @@ def ci_fix_config(raw):
         cfg["pull_request"]["label"] = pull["label"]
     if cfg["enabled"] and not cfg["hosts"]:
         _fail("hosts", "must list at least one host when ci_fix is enabled")
+    key = top.get("agent_api_key", "")
+    if not isinstance(key, str) or not re.fullmatch(r"[!-~]*", key):
+        _fail("agent_api_key", "must be an ASCII string without whitespace or control characters")
+    if cfg["enabled"] and not key:
+        _fail("agent_api_key", "must be nonempty when ci_fix is enabled")
+    cfg["agent_api_key"] = key
     return cfg
 
 
@@ -193,6 +201,7 @@ class CIFixService:
     def __init__(self, repo, config):
         self.repo = repo
         self.config = config
+        self.redact = _credential_redactor(config["agent_api_key"])
         self._lock = threading.RLock()
 
     # ------------------------------------------------------------------ reading
@@ -240,8 +249,7 @@ class CIFixService:
                 continue
         return sorted(records, key=lambda row: row["id"])
 
-    @staticmethod
-    def view(record, *, runner=False):
+    def view(self, record, *, runner=False):
         """The answer for the dashboard; ``runner`` adds the bounded context the agent is told about."""
         keys = ("id", "state", "reason", "repository", "number", "revision", "ci_url", "host", "model",
                 "session_id", "branch", "pr_url", "result", "cancel_requested", "requested_at",
@@ -250,7 +258,7 @@ class CIFixService:
         out["run"] = record["run"]
         if runner:
             out["context"] = record["context"]
-        return out
+        return self.redact(out)
 
     def get(self, fix_id, *, runner=False):
         if not isinstance(fix_id, str) or not is_valid_id(fix_id, "cifix"):
@@ -269,7 +277,7 @@ class CIFixService:
 
     # ------------------------------------------------------------------ writing
     def _event(self, fix_id, event_type, payload):
-        self.repo.record_event(ENTITY, fix_id, event_type, payload)
+        self.repo.record_event(ENTITY, fix_id, event_type, self.redact(payload))
 
     def request(self, monitor, repository, number, operation_id, *, provider_url=None, actor=None):
         """Record one click. Returns ``(view, created)``; a replay or an already-active run returns the
@@ -320,8 +328,8 @@ class CIFixService:
         return None
 
     def runner_config(self):
-        """The settings a runner follows, from the one YAML block. Nothing secret lives in it."""
-        return {key: self.config[key] for key in self.config}
+        """The settings a runner follows, excluding the server's authentication secret."""
+        return self.redact({key: value for key, value in self.config.items() if key != "agent_api_key"})
 
     def _age_minutes(self, record):
         import datetime
@@ -341,7 +349,7 @@ class CIFixService:
         if defer is not None:
             if not isinstance(defer, dict) or defer.get("kind") != "no_model" or set(defer) - {"kind", "reason"}:
                 raise ValueError("defer must be {kind: no_model, reason}")
-            note = _reason(defer.get("reason")) or "no model available"
+            note = _reason(self.redact(defer.get("reason"))) or "no model available"
         with self._lock:
             rows = self._all()
             queued = [row for row in rows if row["state"] == "queued"]
@@ -379,7 +387,7 @@ class CIFixService:
         if not isinstance(state, str) or state not in set(_TRANSITIONS) | TERMINAL:
             raise ValueError("state is not one the runner may set")
         fields = {
-            "reason": _reason(reason),
+            "reason": _reason(self.redact(reason)),
             "host": host, "model": model, "session_id": _session_id(session_id),
             "branch": branch,
         }
@@ -440,12 +448,12 @@ class CIFixService:
                 raise ValueError(f"branch must be a name under {BRANCH_PREFIX}")
             result["branch"] = body["branch"]
         if body.get("summary") is not None:
-            result["summary"] = _text(body["summary"], "summary", 4000)
+            result["summary"] = _text(self.redact(body["summary"]), "summary", 4000)
         if "flags" in body:
             flags = body["flags"]
             if not isinstance(flags, list) or len(flags) > 20:
                 raise ValueError("flags must be a list of at most 20 entries")
-            result["flags"] = [_text(flag, "flag", 200) for flag in flags]
+            result["flags"] = [_text(self.redact(flag), "flag", 200) for flag in flags]
         with self._lock:
             record = self._fold(fix_id)
             if record["state"] != "finishing":

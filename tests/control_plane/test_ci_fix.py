@@ -12,7 +12,8 @@ from herdr_engineering.control_plane.ci_fix import CIFixService, ci_fix_config
 from herdr_engineering.control_plane.repo import ControlPlaneRepo
 
 SHA = "b" * 40
-CONFIG = {"enabled": True, "hosts": ["bender", "beast"], "max_concurrent": {"global": 2, "per_host": 1}}
+AGENT_KEY = "cifix-test-credential-98c2a1"
+CONFIG = {"agent_api_key": AGENT_KEY, "enabled": True, "hosts": ["bender", "beast"], "max_concurrent": {"global": 2, "per_host": 1}}
 
 
 class Provider:
@@ -73,7 +74,7 @@ def test_config_rejects_bad_values(raw):
 
 def test_config_accepts_the_documented_block():
     cfg = ci_fix_config({
-        "enabled": True, "hosts": ["bender"], "models": ["qwen3.8-27b"], "deadline_minutes": 30,
+        "agent_api_key": AGENT_KEY, "enabled": True, "hosts": ["bender"], "models": ["qwen3.8-27b"], "deadline_minutes": 30,
         "egress": {"default": ["gateway"], "per_project": {"org/app": ["pypi.org"]}},
         "limits": {"max_files": 10}, "paths": {"flag": [".woodpecker/**"], "block": [".git*/hooks/**"]},
         "pull_request": {"draft": True, "label": "herdr-ci-fix"}})
@@ -379,7 +380,8 @@ def call(server, path, body=None, key="read", method=None, headers=None):
     req = urllib.request.Request(
         f"http://127.0.0.1:{server.port}/api/v1/{path}", method=method or ("POST" if body is not None else "GET"),
         data=json.dumps(body).encode() if body is not None else None,
-        headers={"X-API-Key": key, "Content-Type": "application/json", **(headers or {})})
+        headers={**({"X-API-Key": key} if key is not None else {}),
+                 "Content-Type": "application/json", **(headers or {})})
     try:
         response = urllib.request.urlopen(req, timeout=3)
     except urllib.error.HTTPError as exc:
@@ -576,3 +578,93 @@ def test_a_session_id_the_inspector_refuses_does_not_fail_the_transition():
     fix = claimed(service, monitor)
     out = service.set_state(fix, "running", session_id="has spaces and !!", branch="herdr-ci-fix/12-bbbbbbb")
     assert out["state"] == "running" and out["session_id"] == "has spaces and !!"
+
+
+@pytest.mark.parametrize("key", [None, "", " ", 42, True, [], {}, "bad\nkey", "bad\tkey", " padded-secret", "padded-secret ", "clé"])
+def test_agent_key_config_rejects_invalid_secret_without_echoing_it(key):
+    with pytest.raises(ValueError, match="ci_fix.agent_api_key") as error:
+        ci_fix_config({**CONFIG, "agent_api_key": key})
+    if isinstance(key, str) and key.strip():
+        assert key not in str(error.value)
+
+
+def test_enabled_ci_fix_requires_an_agent_key():
+    with pytest.raises(ValueError, match="ci_fix.agent_api_key"):
+        ci_fix_config({"enabled": True, "hosts": ["bender"]})
+
+
+@pytest.fixture
+def open_api():
+    server = ControlPlaneServer(ControlPlaneRepo(), api_keys={}, ci_fix=CONFIG)
+    server.ci_monitor._factory = Provider
+    thread = threading.Thread(target=server.serve, daemon=True)
+    thread.start()
+    server.wait_until_ready()
+    try:
+        yield server
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+
+
+def test_open_dashboard_and_browser_create_cancel_remain_available(open_api):
+    for path in ("ci/summary", "ci/tests", "tests", "ci", "ci/fix", "ci/fix/config"):
+        status, body = call(open_api, path, key=None)
+        assert status == 200, path
+        assert AGENT_KEY not in json.dumps(body)
+    status, fix = call(open_api, "ci/fix", {"repository": "17", "number": 12, "operation_id": "open"}, key=None)
+    assert status == 202
+    assert call(open_api, f"ci/fix/{fix['id']}", key=None)[0] == 200
+    assert call(open_api, f"ci/fix/{fix['id']}/cancel", {}, key=None)[1]["state"] == "cancelled"
+
+
+@pytest.mark.parametrize("key", [None, "", "wrong", AGENT_KEY[:-1], AGENT_KEY + "x", AGENT_KEY + " ", AGENT_KEY.upper(), "clé"])
+def test_open_runner_writes_require_exact_agent_key(open_api, key):
+    fix = ask(open_api.ci_fix, open_api.ci_monitor)[0]["id"]
+    assert call(open_api, "ci/fix/claim", {"host": "bender"}, key=key)[0] == 401
+    assert open_api.ci_fix.get(fix)["state"] == "queued"
+    assert call(open_api, "ci/fix/claim", {"host": "bender"}, key=AGENT_KEY)[1]["request"]["id"] == fix
+    assert call(open_api, f"ci/fix/{fix}/state", {"state": "finishing"}, key=key)[0] == 401
+    assert open_api.ci_fix.get(fix)["state"] == "claimed"
+    assert call(open_api, f"ci/fix/{fix}/state", {"state": "finishing"}, key=AGENT_KEY)[0] == 200
+    assert call(open_api, f"ci/fix/{fix}/result", {"summary": "done"}, key=key)[0] == 401
+    assert open_api.ci_fix.get(fix)["result"] is None
+    assert call(open_api, f"ci/fix/{fix}/result", {"summary": "done"}, key=AGENT_KEY)[0] == 200
+    status, final = call(open_api, f"ci/fix/{fix}/state", {"state": "no_change"}, key=AGENT_KEY)
+    assert status == 200 and final["state"] == "no_change"
+
+
+@pytest.mark.parametrize("path", ["ci/%66ix/claim", "ci/fix/anything/%73tate", "%63i/fix/anything/result"])
+def test_encoded_runner_paths_cannot_bypass_auth(open_api, path):
+    assert call(open_api, path, {"host": "bender", "state": "failed"}, key=None)[0] == 401
+
+
+def test_dedicated_key_does_not_override_global_key_policy(api):
+    assert call(api, "ci/fix/claim", {"host": "bender"}, key=AGENT_KEY)[0] == 401
+
+
+def test_agent_key_is_omitted_from_runner_config(open_api):
+    for key in (None, AGENT_KEY):
+        status, config = call(open_api, "ci/fix/config", key=key)
+        assert status == 200
+        assert "agent_api_key" not in config
+        assert AGENT_KEY not in json.dumps(config)
+    assert "agent_api_key" not in open_api.ci_fix.runner_config()
+
+
+def test_agent_key_is_redacted_from_results_events_and_errors(open_api, caplog):
+    service = open_api.ci_fix
+    fix = ask(service, open_api.ci_monitor)[0]["id"]
+    service.claim("bender")
+    # Scrub before truncating, so even a credential crossing a display limit cannot leak.
+    service.set_state(fix, "finishing", reason="x" * 490 + AGENT_KEY)
+    status, body = call(open_api, f"ci/fix/{fix}/result", {"summary": "output " + AGENT_KEY,
+                        "flags": ["x" * 190 + AGENT_KEY]}, key=AGENT_KEY)
+    assert status == 200
+    assert body["reason"] == "x" * 490 + "[REDACTED]"
+    assert body["result"]["summary"] == "output [REDACTED]"
+    assert body["result"]["flags"] == ["x" * 190 + "[REDACTED]"]
+    assert AGENT_KEY not in json.dumps(open_api.repo.stream("ci_fix", fix))
+    status, error = call(open_api, f"ci/fix/{fix}/result", {AGENT_KEY: "bad"}, key=AGENT_KEY)
+    assert status == 400 and AGENT_KEY not in json.dumps(error)
+    assert AGENT_KEY not in caplog.text
