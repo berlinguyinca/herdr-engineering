@@ -30,6 +30,18 @@ def _prune_usage_projection(repo, cutoff, entity_type):
                  if _parse(rec.get("occurred_at") or "") < cutoff]
         for rid in stale:
             projection.pop(rid, None)
+        return
+    if entity_type == "resource_usage":
+        projection = getattr(repo, "_resource_usage", None)
+        if projection is None:
+            return
+        for (mission_id, kind), records in list(projection.items()):
+            kept = [r for r in records
+                    if not _parse(r.get("occurred_at") or "") < cutoff]
+            if kept:
+                projection[(mission_id, kind)] = kept
+            else:
+                projection.pop((mission_id, kind), None)
 
 
 def apply_retention(repo, *, telemetry_ttl_hours=24, events_ttl_days=30,
@@ -74,6 +86,10 @@ def apply_retention(repo, *, telemetry_ttl_hours=24, events_ttl_days=30,
             if occurrences and occurrences.popleft():
                 order.append(reference)
         repo._event_order = order
+    # The mission-scoped resource_usage projection (issue #36) is swept by the
+    # general event policy above; age its in-memory records at the same cutoff so
+    # usage_analytics() never reports resource totals the events already expired.
+    _prune_usage_projection(repo, cutoff_ev, "resource_usage")
 
     cutoff_art = now_dt - _dt.timedelta(days=artifact_ttl_days)
     for aid in list(repo._blobs.keys()):

@@ -863,3 +863,35 @@ def test_usage_rejects_timezone_naive_occurred_at():
     assert rec["occurred_at"].endswith("+00:00")
     from herdr_engineering.control_plane.retention import sweep_token_usage
     sweep_token_usage(repo, raw_retention_days=1)  # must not raise
+
+
+def test_usage_projection_preserves_cache_write_tokens():
+    """/api/v1/token-usage submissions carrying cache_write_tokens must feed the
+    usage projection (codex P1), not report it as zero/unknown."""
+    repo = ControlPlaneRepo()
+    repo.record_token_usage_row({"project": "p", "model": "gpt", "schema": 2,
+                                 "request_id": "cw-1", "mission_id": "m1",
+                                 "cache_write_tokens": 12, "status": 200})
+    a = repo.usage_analytics(mission_id="m1")
+    assert a["tokens"]["by_model"]["gpt"]["cache_write_tokens"] == 12
+    assert a["tokens"]["total"]["cache_write_tokens"] == 12
+
+
+def test_resource_usage_projection_is_pruned_by_event_retention():
+    """The general event retention policy must also age out the resource_usage
+    projection so usage_analytics() stops reporting expired totals (codex P2)."""
+    import datetime as _dt
+    from herdr_engineering.control_plane.retention import apply_retention
+    clock = {"t": _dt.datetime(2026, 10, 23, tzinfo=_dt.UTC).timestamp()}
+    repo = ControlPlaneRepo(now=lambda: clock["t"])
+    repo.add_resource_usage({"mission_id": "m1", "kind": "cpu", "value": 1.0,
+                             "occurred_at": repo._stamp()})  # now (fresh)
+    clock["t"] -= 40 * 86400  # 40 days ago
+    repo.add_resource_usage({"mission_id": "m1", "kind": "cpu", "value": 9.0,
+                             "occurred_at": repo._stamp()})
+    clock["t"] += 40 * 86400
+    assert repo.usage_analytics(mission_id="m1")["resources"]["cpu"]["count"] == 2
+    apply_retention(repo, events_ttl_days=30)
+    a = repo.usage_analytics(mission_id="m1")
+    assert a["resources"]["cpu"]["count"] == 1
+    assert a["resources"]["cpu"]["total"] == 1.0

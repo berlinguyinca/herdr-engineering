@@ -1984,8 +1984,8 @@ class ControlPlaneRepo:
     # All persisted as events (entity types ``token_usage``, ``llm_key``,
     # ``custom_model``) so the existing durable sink and replay carry them.
     def record_token_usage(self, project, model, input_tokens=0, output_tokens=0, *,
-                           reasoning_tokens=0, cache_read_tokens=0, duration_ms=None,
-                           success=True, request_id=None, session_id=None,
+                           reasoning_tokens=0, cache_read_tokens=0, cache_write_tokens=0,
+                           duration_ms=None, success=True, request_id=None, session_id=None,
                            mission_id=None, key_id=None, source="llm-proxy", v2=None):
         """One usage record. ``v2`` (already whitelisted, see ``record_token_usage_row``)
         makes it a schema-2 record whose unreported token fields stay None (unknown);
@@ -1998,6 +1998,7 @@ class ControlPlaneRepo:
         payload = {"project": project, "model": model or "unknown",
                    "input_tokens": tokens[0], "output_tokens": tokens[1],
                    "reasoning_tokens": tokens[2], "cache_read_tokens": tokens[3],
+                   "cache_write_tokens": _usage_int(cache_write_tokens),
                    "duration_ms": duration_ms, "success": bool(success),
                    "request_id": request_id, "key_id": key_id, "source": source}
         if v2 is not None:
@@ -2018,6 +2019,7 @@ class ControlPlaneRepo:
             "output_tokens": payload.get("output_tokens"),
             "reasoning_tokens": payload.get("reasoning_tokens"),
             "cache_read_tokens": payload.get("cache_read_tokens"),
+            "cache_write_tokens": payload.get("cache_write_tokens"),
         }, record_event=False)
         return event
 
@@ -2040,6 +2042,7 @@ class ControlPlaneRepo:
         if row.get("schema") != 2:
             return self.record_token_usage(project, model, *tokens[:2], reasoning_tokens=tokens[2],
                                            cache_read_tokens=tokens[3],
+                                           cache_write_tokens=tokens[4],
                                            success=row.get("success", True), **common)
         status = _usage_int(row.get("status"))
         error_class = row.get("error_class") if row.get("error_class") in USAGE_ERROR_CLASSES else None
@@ -2058,7 +2061,8 @@ class ControlPlaneRepo:
             v2[k] = _usage_int(row.get(k))
         source = row.get("source") if row.get("source") in ("llm-proxy", "transcript") else "llm-proxy"
         return self.record_token_usage(project, model, *tokens[:2], reasoning_tokens=tokens[2],
-                                       cache_read_tokens=tokens[3], success=success,
+                                       cache_read_tokens=tokens[3],
+                                       cache_write_tokens=tokens[4], success=success,
                                        source=source, v2=v2, **common)
 
     def resolve_usage_session(self, value):
@@ -2740,7 +2744,8 @@ def _payload(ev):
     return p if isinstance(p, dict) else {}
 
 
-_TOKEN_FIELDS = ("input_tokens", "output_tokens", "reasoning_tokens", "cache_read_tokens")
+_TOKEN_FIELDS = ("input_tokens", "output_tokens", "reasoning_tokens",
+                  "cache_read_tokens", "cache_write_tokens")
 # The usage-record error taxonomy (docs/superpowers/specs/2026-10-23-llm-page-design.md).
 USAGE_ERROR_CLASSES = frozenset({
     "auth_invalid_key", "request_invalid", "request_too_large", "model_project_mismatch",
