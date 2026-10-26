@@ -22,18 +22,94 @@ from .envelope import ENVELOPE_ONLY_TYPES
 from .events import V2_COLUMNS
 from .service_catalog import normalize_project, normalize_source_port, track_availability
 
-# These streams are already represented by dedicated structured stores or
-# bounded adapters. Replaying their unbounded history during web startup makes
-# hydration scale with operational noise (bender currently has >1M service
-# events) and can prevent the HTTP listener from binding at all. The allowlist
-# keeps replay-critical projections while leaving current session/host/service
-# state to their structured tables.
-_STARTUP_EVENT_TYPES = (
-    "mission", "test_run", "build", "review", "review_finding", "pull_request",
-    "token_usage", "resource_usage", "ci_report", "ci_observation", "ci_telemetry",
-    "agent_summary", "host_metrics", "mission_activity", "lineage", "artifact",
-    "custom_model", "llm_key",
-)
+
+def _recovery_events_sql(table: str) -> str:
+    """Read all streams, eliding only interior, equivalent snapshot heartbeats.
+
+    Latest-per-type alone is unsafe: historical rows can contain partial fields,
+    counter increments, transitions, or replay identities. Instead, retain both
+    ends of each consecutive equivalent snapshot run. Observation clock fields
+    are ignored ONLY in the comparison; the original first/last rows preserve
+    their exact clocks, explicit clears and identity/observation-state changes.
+    Every non-snapshot row is a barrier, including ALL v2 envelopes (ledger hashes, gaps, actor domains).
+    Original rows/IDs/sequences are returned; this never rewrites durable history.
+    Window only identities/signatures, then fetch retained rows by their physical
+    locations within this same MVCC statement. The TID scan avoids sorting wide
+    event/envelope rows or transferring discarded payloads to Python. This query
+    targets the ordinary (non-partitioned) fabric_events table in our migrations.
+
+    Fold complete entity partitions through indexed lateral reads, so a large
+    journal does not require one global window sort. The original stream index
+    supports the lookup; migration 0014 supplies arrival order within each stream.
+    OFFSET 0 keeps signature calculation below the window rather than
+    evaluating JSON normalization separately for lag/lead/current expressions.
+    Other streams bypass the window entirely. This is not a hard startup bound:
+    changing observations and append-only/private histories still cost O(history).
+    Startup is read-only: it must never create an index on production.
+    """
+    return f"""
+        WITH streams AS (
+            SELECT DISTINCT entity_type, entity_id FROM {table}
+            WHERE entity_type IN ('service', 'session', 'host') AND entity_id IS NOT NULL
+        ), neighbors AS (
+            SELECT partition_rows.* FROM streams
+            CROSS JOIN LATERAL (
+                SELECT snapshots.*, lag(recovery_snapshot) OVER arrival AS recovery_previous,
+                       lead(recovery_snapshot) OVER arrival AS recovery_next,
+                       max(sequence) OVER arrival AS recovery_max
+                FROM (
+                    SELECT ctid AS recovery_tid, entity_type, entity_id, ingest_timestamp, sequence, event_id,
+                           CASE WHEN schema_version = 1
+                        AND num_nonnulls({', '.join(V2_COLUMNS)}) = 0
+                        AND (
+                            (entity_type = 'service' AND event_type = 'ServiceUpdated'
+                             AND payload ?& ARRAY['service_name', 'host_id', 'port', 'status',
+                                 'route', 'description', 'owner', 'session_id', 'ownership',
+                                 'unavailable_since', 'metadata_updated_at'])
+                            OR (entity_type = 'service' AND event_type = 'ServiceMetadataObserved'
+                                AND payload ?& ARRAY['host_id', 'source_port', 'ownership', 'session_id',
+                                    'verified_origin', 'repository_id', 'commit_sha', 'listener_identity',
+                                    'metadata_observation', 'metadata_updated_at', 'service_created_at', 'service_updated_at'])
+                            OR (entity_type = 'service' AND event_type = 'ServiceListenerObserved'
+                                AND payload ?& ARRAY['service_id', 'host_id', 'source_port', 'port', 'status',
+                                    'discovery_source', 'endpoint_scope', 'created_at', 'updated_at',
+                                    'ownership', 'session_id', 'verified_origin', 'listener_identity',
+                                    'metadata_observation', 'metadata_updated_at'])
+                            OR (entity_type = 'session' AND event_type = 'SessionUpdated'
+                                AND payload ?& ARRAY['host_id', 'mission_id', 'agent_role', 'model', 'status'])
+                            OR (entity_type = 'host' AND event_type = 'HostHeartbeat'
+                                AND payload ?& ARRAY['host_name', 'tailnet_ip', 'cpu', 'mem'])
+                        ) THEN jsonb_build_array(event_type, mission_id, session_id,
+                            CASE WHEN entity_type = 'service' THEN
+                                payload - ARRAY['metadata_updated_at', 'updated_at']
+                                  #- '{{metadata_observation,observed_at}}'
+                                  #- '{{ownership,observed_at}}'
+                                  #- '{{verified_origin,verified_at}}'
+                                  #- '{{verified_origin,ownership,observed_at}}'
+                                 ELSE payload END)
+                        END AS recovery_snapshot
+                    FROM {table} e
+                    WHERE e.entity_type = streams.entity_type AND e.entity_id = streams.entity_id
+                    ORDER BY ingest_timestamp, sequence, event_id
+                    OFFSET 0
+                ) snapshots
+                WINDOW arrival AS (ORDER BY ingest_timestamp, sequence, event_id
+                                   ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)
+            ) partition_rows
+        )
+        SELECT * FROM {table} WHERE ctid = ANY(ARRAY(
+          SELECT ctid FROM {table}
+          WHERE entity_type NOT IN ('service', 'session', 'host')
+             OR entity_type IS NULL OR entity_id IS NULL
+          UNION ALL
+          SELECT recovery_tid FROM neighbors
+          WHERE recovery_snapshot IS NULL
+           OR recovery_snapshot IS DISTINCT FROM recovery_previous
+           OR recovery_snapshot IS DISTINCT FROM recovery_next
+           OR sequence = recovery_max
+        ))
+        ORDER BY ingest_timestamp, sequence, event_id
+    """
 
 
 def _iso(value: Any):
@@ -109,16 +185,17 @@ class PostgresSource(DurableSource):
             import asyncpg
             self._conn = await asyncpg.connect(self._dsn)
         conn = self._conn
-        return {
-            "missions": [dict(r) for r in await conn.fetch("SELECT * FROM missions")],
-            "sessions": [dict(r) for r in await conn.fetch("SELECT * FROM sessions")],
-            "services": [dict(r) for r in await conn.fetch("SELECT * FROM services")],
-            "hosts": [dict(r) for r in await conn.fetch("SELECT * FROM hosts")],
-            "events": [dict(r) for r in await conn.fetch(
-                f"SELECT * FROM {self._events_table} WHERE entity_type IN ("
-                + ", ".join(repr(kind) for kind in _STARTUP_EVENT_TYPES)
-                + ") ORDER BY ingest_timestamp, sequence")],
-        }
+        # One consistent cut across structured rows and the event log. Concurrent
+        # ingestion must not leave half a recovery or make compaction race a writer.
+        async with conn.transaction(isolation="repeatable_read", readonly=True):
+            return {
+                "missions": [dict(r) for r in await conn.fetch("SELECT * FROM missions")],
+                "sessions": [dict(r) for r in await conn.fetch("SELECT * FROM sessions")],
+                "services": [dict(r) for r in await conn.fetch("SELECT * FROM services")],
+                "hosts": [dict(r) for r in await conn.fetch("SELECT * FROM hosts")],
+                "events": [dict(r) for r in await conn.fetch(
+                    _recovery_events_sql(self._events_table))],
+            }
 
     def missions(self) -> list[dict]:
         return self._load()["missions"]
@@ -321,13 +398,18 @@ def _reconstruct_from_events(streams: dict) -> tuple[dict, dict, dict, dict, dic
                     if key in p:
                         svc[key] = p[key]
                 continue
-            svc = services.setdefault(eid, {
+            defaults = {
                 "service_id": eid, "service_name": eid, "host_id": None,
                 "port": 0, "session_id": None, "route": None,
                 "description": None, "owner": None,
                 "status": "healthy",
                 "created_at": ts, "updated_at": ts,
-            })
+            }
+            svc = services.setdefault(eid, defaults)
+            # A metadata/retirement event may precede the first health report.
+            # Fill its missing shape without overwriting observed metadata.
+            for key, value in defaults.items():
+                svc.setdefault(key, value)
             if p.get("host_id"):
                 svc["host_id"] = p["host_id"]
             if p.get("service_name"):

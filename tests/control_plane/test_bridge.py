@@ -1,6 +1,7 @@
 import asyncio
 import threading
 import urllib.request
+from contextlib import asynccontextmanager
 
 from herdr_engineering.control_plane.api import ControlPlaneServer
 from herdr_engineering.control_plane.bridge import PostgresSource, load_into
@@ -300,6 +301,11 @@ def test_postgres_source_uses_provided_run():
     calls = []
 
     class FakeConn:
+        @asynccontextmanager
+        async def transaction(self, **kwargs):
+            assert kwargs == {"isolation": "repeatable_read", "readonly": True}
+            yield
+
         async def fetch(self, sql, *args):
             if "missions" in sql:
                 return [{"mission_id": "m9", "title": "pg", "status": "active",
@@ -324,10 +330,15 @@ def test_postgres_source_uses_provided_run():
     assert len(calls) == 1  # cached — fetched once, reused for all resources
 
 
-def test_postgres_source_skips_unbounded_high_volume_startup_streams():
+def test_postgres_source_compacts_snapshots_without_an_entity_allowlist():
     calls = []
 
     class FakeConn:
+        @asynccontextmanager
+        async def transaction(self, **kwargs):
+            assert kwargs == {"isolation": "repeatable_read", "readonly": True}
+            yield
+
         async def fetch(self, sql, *args):
             calls.append(sql)
             return []
@@ -337,8 +348,9 @@ def test_postgres_source_skips_unbounded_high_volume_startup_streams():
 
     PostgresSource(FakeConn(), run=fake_run).events()
     event_sql = next(sql for sql in calls if "fabric_events" in sql)
-    assert "entity_type IN" in event_sql
-    assert "'mission'" in event_sql
-    assert "'test_run'" in event_sql
-    assert "'session'" not in event_sql
-    assert "'service'" not in event_sql
+    assert "entity_type NOT IN" in event_sql
+    assert "UNION ALL" in event_sql
+    assert "recovery_snapshot IS NULL" in event_sql
+    assert "lag(recovery_snapshot)" in event_sql
+    assert "'session'" in event_sql
+    assert "'service'" in event_sql
