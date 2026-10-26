@@ -118,7 +118,7 @@ test('CI reports publish over HTTP and drive history, pipeline logs and responsi
 
 // Task 6: real local HTTP API and opt-in retained-observation scale fixture.
 // Each case owns a fresh browser context; no preferences leak between cases.
-async function commandCenter(run) {
+async function commandCenter(run,{invalidateAssetTransport=false}={}) {
  const server=spawn(process.env.PYTHON||'python3',[path.join(root,'tests/playwright/ci-insights-server.py'),'--117-projects'],{cwd:root,stdio:['ignore','pipe','pipe']});
  let browser,stderr='';server.stderr.on('data',d=>stderr+=d);
  try {
@@ -128,6 +128,17 @@ async function commandCenter(run) {
   assert.equal(upload.status,200);
   browser=await chromium.launch({headless:true,args:['--no-sandbox'],...(process.env.PLAYWRIGHT_CHROMIUM?{executablePath:process.env.PLAYWRIGHT_CHROMIUM}:{})});
   const context=await browser.newContext({viewport:{width:1440,height:1000}});
+  // Fault injection stays below the asset transport boundary: no host networking changes.
+  if(invalidateAssetTransport)await context.route(`${base}/**/*.js`,route=>route.abort('internetdisconnected'));
+  const assetReads=[];
+  // Loopback assets must not depend on Chromium's host network-change notifier.
+  // Fetch real HTTP bytes once, retaining failures/status/headers; never retry or
+  // substitute source files. API and document traffic keep their browser transport.
+  await context.route(url=>url.origin===base&&/\.(?:js|css)$/.test(url.pathname),async route=>{
+   assetReads.push(route.request().url());
+   const response=await route.fetch({maxRetries:0,maxRedirects:0});
+   try{await route.fulfill({response});}finally{await response.dispose();}
+  });
   const page=await context.newPage(),errors=[],requests=[],failedRequests=[],httpErrors=[];
   page.on('pageerror',e=>errors.push(e.message));
   page.on('requestfailed',r=>failedRequests.push({url:r.url(),error:r.failure()?.errorText}));
@@ -136,7 +147,7 @@ async function commandCenter(run) {
   try {
    await page.goto(`${base}/#/ci`);
    await page.waitForFunction(()=>document.querySelectorAll('[data-ob-project]').length===117);
-   await run({page,context,base,requests});
+   await run({page,context,base,requests,assetReads});
   }
   catch(error){
    console.error('CI_BROWSER_FAILURE',JSON.stringify({errors,failedRequests,httpErrors,state:await page.evaluate(()=>({url:location.href,projects:document.querySelectorAll('[data-ob-project]').length,status:document.querySelector('[data-ob-status]')?.textContent,body:document.body.innerText.slice(0,1500)}))}));
@@ -319,3 +330,12 @@ test('failed HTTP refresh retains selected project, run, failed step and expande
  assert.equal(await page.locator('.ci-pipeline-step[data-step="12"]').getAttribute('aria-pressed'),'true');
  assert.equal(await page.locator('[data-ob-project]').getAttribute('aria-pressed'),'true');
 }));
+
+
+test('local application modules load once when the browser asset transport is disconnected',()=>commandCenter(async({page,base,assetReads})=>{
+ assert.equal(await page.locator('[data-ob-project]').count(),117);
+ assert.equal(assetReads.filter(url=>url===`${base}/app.js`).length,1,'entry module fetched once, without retries');
+ // API traffic must still use the browser network, not the asset-only bridge.
+ await page.route(`${base}/api/v1/ci/summary*`,route=>route.abort('internetdisconnected'));
+ assert.equal(await page.evaluate(async()=>{try{await fetch('/api/v1/ci/summary');return false;}catch{return true;}}),true);
+},{invalidateAssetTransport:true}));

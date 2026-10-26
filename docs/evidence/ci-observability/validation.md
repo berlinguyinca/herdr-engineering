@@ -1,9 +1,9 @@
 # CI command-center verification — 2026-10-25
 
-Scope: Task 6 and its focused selection/readiness follow-up from `575d740`.
+Scope: Task 6, selection/readiness follow-up `d0d4fd2`, and reload isolation round 2.
 Local deterministic fixtures only; no live-provider, configuration, credential,
 dependency, or polling-interval changes. Original Task 6 results are preserved
-below as historical evidence; the follow-up results describe the current code.
+below as historical evidence; round 2 results describe the current code.
 
 ## Method
 
@@ -54,7 +54,83 @@ fixture URL, proving keyboard anchor navigation without accessing a live provide
 - Existing model/controller coverage verifies identity collisions, sparse samples,
   stale-response rejection, unavailable evidence, and shared context persistence.
 
-## Follow-up results: completed-readiness measurements
+## Round 2: reload transport isolation
+
+Diagnosis: `/tmp/task6-fix-reload-diagnostic.log` contains a passing focused run.
+The complementary `/tmp/task6-fix-browser-final.log` contains the failure:
+13 module requests ended with Chromium `net::ERR_NETWORK_CHANGED`, no HTTP errors,
+zero projects, and only the static shell. Module loading failed before the command
+center mounted. This is a fixture/environment transport failure, not evidence of
+a command-center readiness regression. The originating host network event was not
+identified; no server crash or UI exception is indicated by these diagnostics.
+
+The command-center fixture now forwards only same-origin `.js`/`.css` requests
+through Playwright's HTTP client, once per request, fulfilling the unchanged real
+HTTP status, headers and body. `maxRetries: 0` and `maxRedirects: 0` are explicit;
+responses are disposed after delivery. It never serves source files directly,
+uses a stale/cache fallback, synthesizes success, or retries a failed load.
+Documents and CI APIs retain Chromium transport. No production code changed.
+
+This isolates static-module downloads from Chromium's host-network invalidations.
+It does not claim to fix production connectivity loss. Routing disables browser
+HTTP caching, so reload measurements now include uncached HTTP asset delivery
+through this fixture boundary. Keep that qualification when comparing old samples.
+The original 30-second readiness timeout and 2-second/1-second budgets are unchanged.
+See the official [Route.fetch/fulfill contract](https://playwright.dev/docs/api/class-route#route-fetch)
+and [context routing semantics](https://playwright.dev/docs/api/class-browsercontext#browser-context-route).
+
+Regression: inject `internetdisconnected` below the static-asset boundary without
+changing host networking (Playwright route abort does not expose NETWORK_CHANGED).
+Before the bridge, the test failed at the unchanged readiness timeout with aborted
+entry modules and zero projects. Afterward it passed, checked exactly one `app.js`
+fetch, and proved that an API transport abort still fails. This tests the failed
+module-load boundary rather than pretending to recreate the unknown host event.
+
+```sh
+# RED: 0 passed, 1 failed before asset isolation; GREEN: 1 passed afterward
+node --test --test-name-pattern='local application modules' tests/playwright/ci-insights.test.mjs
+# 347 passed, 0 failed
+node --test --test-concurrency=1 packages/herdr-web-client/*.test.js packages/herdr-web-components/ci-*.test.js packages/herdr-web-components/integrations.test.js
+# Full suite: 16 passed, 0 failed, 0 skipped; completed in 169.875 seconds
+node --test --test-concurrency=1 tests/playwright/ci-*.test.mjs
+```
+
+No backend code/fixture changes in round 2; the 325 backend passes below are
+historical, not a new run. JavaScript syntax and whitespace checks passed.
+
+### Completed round-2 result
+
+**HEALTHY: full browser suite completed — 16 passed, 0 failed, 0 skipped**
+in 169.875 seconds. The command was
+`node --test --test-concurrency=1 tests/playwright/ci-*.test.mjs`.
+The 347 client/component tests also passed (8.093 seconds).
+The full suite includes the fault-injection regression, all 20 reload samples,
+both delayed-evidence scenarios, outage/recovery, and all three viewport widths.
+No retry or threshold/timeout relaxation was used.
+
+| Measurement (20 samples) | p95 / size | Budget | Result |
+| --- | ---: | ---: | --- |
+| Summary HTTP | 194.21 ms | < 2,000 ms | Pass |
+| 117-project reload readiness | 716.85 ms | < 2,000 ms | Pass |
+| Completed project selection | 303.88 ms | < 1,000 ms | Pass |
+| Run selection with diagnosis and paint | 487.44 ms | < 1,000 ms | Pass |
+| Summary body | 74,876 bytes | Recorded only | Recorded |
+
+Browser CI request counts over the full performance scenario: history 27,
+summary 50, performance 27, reports 27, tests 25, pipeline 25, fix 1, log 0.
+There were 20 additional direct HTTP summary samples. Polls are included;
+summary/project selection passed the no-eager-details assertion.
+
+Source results were inspected in `/tmp/task6-round2-browser.log` and
+`/tmp/task6-round2-components.log`. Their durable results are recorded here;
+task-generated temporary logs and screenshots were removed after inspection.
+`node --check tests/playwright/ci-insights.test.mjs` and `git diff --check` passed.
+Only browser verification and this evidence document changed in round 2. No
+production code, backend fixture, live configuration, or credentials changed.
+The historical failures below are superseded by this completed run, while their
+measurement methodology and transport limitations remain documented.
+
+## Round 1 historical results: completed-readiness measurements
 
 The focused 20-sample performance run passed with the original thresholds:
 
@@ -96,7 +172,7 @@ performance 27, reports 27, tests 25, pipeline 23, fix 1, log 0. The separate
 summary HTTP sample count was 20. Polls are included. Summary/project selection
 still caused no eager pipeline or log request.
 
-**Remaining verification caveat:** the first complete browser-suite run was
+**Historical round-1 verification caveat (superseded by round 2 above):** the first complete browser-suite run was
 14 passed / 1 failed: the performance case timed out waiting for 117 project
 buttons during reload, before selection measurements. This timeout was not
 reproduced in the instrumented focused performance run above; its cause remains
