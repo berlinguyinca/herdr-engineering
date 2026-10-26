@@ -1257,7 +1257,7 @@ test('Reviews groups decisions and preserves plan inspection with safe upstream 
 test('failed CI run sends debugging context only to an explicitly chosen active Pi session',async()=>{
   await withApp(async({page,base})=>{
     const posts=[];
-    const failed={provider_url:'https://ci.example',provider_repo_id:'7',repository:'lab/spectra',run_number:42,state:'failure'};
+    const failed={provider_url:'https://ci.example',provider_repo_id:'7',repository:'lab/spectra',run_number:42,state:'failure',created_at:new Date(Date.now()-60000).toISOString(),finished_at:new Date().toISOString()};
     await page.route('**/api/v1/ci',r=>r.fulfill({json:{available:true,status:'connected',pipelines:{'lab/spectra':[failed]}}}));
     await page.route('**/api/v1/ci/pipeline?*',r=>r.fulfill({json:{pipeline:{repository:'7',number:42,status:'failure',commit:'a'.repeat(40),tasks:[{id:1,name:'Tests',state:'failure'}]}}}));
     await page.route('**/api/v1/sessions',r=>r.fulfill({json:{sessions:[{session_id:'chosen',display_name:'Amber Finch',agent_role:'pi',status:'active',title:'Parser agent',host_id:'beast',terminal_id:'term_1',herdr_session:'default',agent_session:{agent:'pi'}},{session_id:'closed',agent_role:'pi',status:'closed'},{session_id:'other',agent_role:'codex',status:'active'}]}}));
@@ -1299,7 +1299,7 @@ test('failed CI run sends debugging context only to an explicitly chosen active 
 
 async function seedFailedRun(page,{fixes,fixStatus=200}={}) {
   const state={fixes:fixes||[],posts:[],cancels:0,terminals:[]};
-  const failed={provider_url:'https://ci.example',provider_repo_id:'7',repository:'lab/spectra',run_number:42,state:'failure'};
+  const failed={provider_url:'https://ci.example',provider_repo_id:'7',repository:'lab/spectra',run_number:42,state:'failure',created_at:new Date(Date.now()-60000).toISOString(),finished_at:new Date().toISOString()};
   await page.route('**/api/v1/ci',r=>r.fulfill({json:{available:true,status:'connected',pipelines:{'lab/spectra':[failed]}}}));
   await page.route('**/api/v1/ci/pipeline?*',r=>r.fulfill({json:{pipeline:{repository:'7',number:42,status:'failure',commit:'a'.repeat(40),tasks:[{id:1,name:'Tests',state:'failure'}]}}}));
   await page.route(/\/api\/v1\/ci\/fix(\/|\?|$)/,r=>{
@@ -1464,7 +1464,7 @@ test('overview attention and saved layout stay keyboard usable through refresh a
 
 test('overview attention opens only the intended CI provider when repository and run IDs collide',async()=>{
  await withApp(async({page,base})=>{
-  const run={provider_repo_id:7,repository:'org/repo',run_number:12,state:'failed',updated_at:new Date().toISOString()};
+  const run={provider_repo_id:7,repository:'org/repo',run_number:12,state:'failed',created_at:new Date(Date.now()-60000).toISOString(),updated_at:new Date().toISOString()};
   const runs=[{...run,provider_url:'https://ci.example'},{...run,provider_url:'https://ci.example/secondary'}];
   await page.route('**/api/v1/attention*',r=>r.fulfill({status:404,json:{error:'not found'}}));   // these tests drive the browser projection
   await page.route('**/api/v1/ci',route=>route.fulfill({json:{available:true,status:'connected',pipelines:{'org/repo':runs}}}));
