@@ -19,7 +19,7 @@ uses explicit `--allow-open` for this fleet's intentionally open Tailnet server;
 remove that option for a keyed deployment. It sends no fabricated API key and
 does not alter server authentication. HTTP redirects are rejected in both modes.
 
-Polling publishes the first snapshot and changed mission payloads. A change to
+Polling publishes the first snapshot and subsequent snapshots whose mission payloads changed. A change to
 `generatedAt` alone does not append mission updates. Missing or malformed files
 fail with a fixed diagnostic and systemd retries after 15 seconds. Heartbeat and
 progress fields remain reported evidence; publication does not infer liveness.
