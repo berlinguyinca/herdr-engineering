@@ -187,8 +187,11 @@ def test_feed_pi_interval_rereads_snapshot(pi_feed_server, pi_feed_snapshot, mon
     base, repo = pi_feed_server
     monkeypatch.setenv("HERDR_CP_INGEST_KEY", "cli-ingest-secret")
     waits = []
+    real_sleep = time.sleep
 
     def next_cycle(seconds):
+        if threading.current_thread() is not threading.main_thread():
+            return real_sleep(seconds)
         waits.append(seconds)
         if len(waits) == 2:
             raise KeyboardInterrupt
