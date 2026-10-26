@@ -807,3 +807,45 @@ def test_usage_mission_namespacing_matches_delivery():
     assert _usage_mission_key("M1", "pi") == "pi:M1"
     assert _usage_mission_key("pi:M1", "pi") == "pi:M1"
     assert _usage_mission_key(None, "pi") is None
+
+
+def test_token_analytics_dedupes_by_request_id_like_usage_projection():
+    """Re-recording the same request_id must be counted once by both token_analytics
+    and the usage projection (codex P1)."""
+    repo = ControlPlaneRepo()
+    # The LLM-proxy path (record_token_usage) is the realistic retry scenario.
+    repo.record_token_usage("p", "gpt", input_tokens=9, request_id="req-d1",
+                            mission_id="m1")
+    repo.record_token_usage("p", "gpt", input_tokens=999, request_id="req-d1",
+                            mission_id="m1")
+    # Both views agree the request was counted once.
+    assert repo.token_analytics()["total"]["requests"] == 1
+    assert repo.token_analytics()["total"]["input_tokens"] == 9
+    assert repo.usage_analytics(mission_id="m1")["tokens"]["total"]["input_tokens"] == 9
+
+
+def test_usage_projection_rebuild_keeps_backdated_timestamp():
+    """An event-only reload must keep the backdated envelope timestamp so the
+    rebuilt projection still ages out under retention (codex P1)."""
+    import datetime as _dt
+    from herdr_engineering.control_plane.retention import sweep_token_usage
+    clock = {"t": _dt.datetime(2026, 10, 23, tzinfo=_dt.UTC).timestamp()}
+    repo = ControlPlaneRepo(now=lambda: clock["t"])
+    svc = make_svc(repo)
+    backdated = _dt.datetime(2026, 10, 1, tzinfo=_dt.UTC).isoformat()
+    svc.ingest({"schema_version": 2, "event_id": "pi-ts", "source": "pi",
+                "source_sequence": 1, "entity_type": "token_usage",
+                "entity_id": "req-ts", "event_type": "token_usage.recorded",
+                "occurred_at": backdated,
+                "payload": {"mission_id": "M1", "model": "gpt",
+                            "request_id": "req-ts", "input_tokens": 4}},
+               {"id": "agent", "kind": "agent", "authenticated_by": "api_key"})
+    # Rebuild from events only (no delivery snapshot).
+    state = repo.export_state()
+    state.pop("delivery", None)
+    restored = ControlPlaneRepo(now=lambda: clock["t"])
+    restored.import_state(state)
+    assert restored._token_usage["req-ts"]["occurred_at"] == backdated
+    # A 14-day sweep removes the backdated (expired) record after the reload.
+    sweep_token_usage(restored, raw_retention_days=14)
+    assert "req-ts" not in restored._token_usage

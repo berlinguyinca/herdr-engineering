@@ -2098,6 +2098,7 @@ class ControlPlaneRepo:
             b = bucket.setdefault(key, {k: 0 for k in total})
             _accumulate(b, p)
 
+        seen_requests = set()
         for (etype, eid), stream in self._events.items():
             if etype != "token_usage" or (project and eid != project):
                 continue
@@ -2105,6 +2106,13 @@ class ControlPlaneRepo:
                 if since and ev["source_timestamp"] < since:
                     continue
                 p = _payload(ev)
+                request_id = p.get("request_id")
+                if request_id:
+                    # The mission-scoped usage projection is idempotent on request_id;
+                    # keep token_analytics consistent so a retried request is counted once.
+                    if request_id in seen_requests:
+                        continue
+                    seen_requests.add(request_id)
                 _accumulate(total, p)
                 add(by_project, p["project"], p)
                 add(by_model, p["model"], p)
@@ -2562,20 +2570,20 @@ class ControlPlaneRepo:
                 for ev in self._events.get((entity_type, ids), []):
                     payload = dict(_payload(ev))
                     try:
+                        # mission_id/session_id/timestamp live on the event envelope,
+                        # not necessarily in the payload, so merge them back for the
+                        # projection (namespace by the event's source so the rebuild
+                        # matches live ingest; keep the backdated occurred_at so
+                        # retention ages the rebuilt record out correctly).
+                        payload.setdefault("session_id", ev.get("session_id"))
+                        if not payload.get("occurred_at") and ev.get("source_timestamp"):
+                            payload["occurred_at"] = ev.get("source_timestamp")
+                        payload["mission_id"] = _usage_mission_key(
+                            payload.get("mission_id") or ev.get("mission_id"),
+                            ev.get("source") or "herdr")
                         if entity_type == "token_usage":
-                            # mission_id/session_id live on the event envelope, not
-                            # in the payload, so merge them back for the projection,
-                            # and namespace the mission by the event's source so the
-                            # rebuild matches what live ingest stored.
-                            payload.setdefault("session_id", ev.get("session_id"))
-                            payload["mission_id"] = _usage_mission_key(
-                                payload.get("mission_id") or ev.get("mission_id"),
-                                ev.get("source") or "herdr")
                             self.add_token_usage(payload)
                         else:
-                            payload["mission_id"] = _usage_mission_key(
-                                payload.get("mission_id") or ev.get("mission_id"),
-                                ev.get("source") or "herdr")
                             self.add_resource_usage(payload)
                     except (ValueError, KeyError, TypeError):
                         continue
