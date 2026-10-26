@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import math
 import re
 
 from ..review_gate.entities import RESERVED_ENTITY_PREFIXES
@@ -376,14 +377,18 @@ class IngestService:
                       "cache_read_tokens", "cache_write_tokens", "duration_ms",
                       "retry_number"):
                 v = payload.get(k)
-                if v is not None and (isinstance(v, bool) or not isinstance(v, (int, float))):
-                    raise ValueError(f"{k} must be a number")
+                if v is None:
+                    continue
+                if (isinstance(v, bool) or not isinstance(v, (int, float))
+                        or not math.isfinite(v) or v < 0):
+                    raise ValueError(f"{k} must be a finite non-negative number")
         elif entity_type == "resource_usage":
             if not isinstance(payload, dict):
                 raise ValueError("resource usage must be an object")
             value = payload.get("value")
-            if isinstance(value, bool) or not isinstance(value, (int, float)):
-                raise ValueError("value must be a number")
+            if (isinstance(value, bool) or not isinstance(value, (int, float))
+                    or not math.isfinite(value) or value < 0):
+                raise ValueError("value must be a finite non-negative number")
 
     @staticmethod
     def _validate_test_counts(payload) -> None:

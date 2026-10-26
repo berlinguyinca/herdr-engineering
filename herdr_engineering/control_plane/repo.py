@@ -2161,8 +2161,10 @@ class ControlPlaneRepo:
                  "value": rec.get("value"), "unit": _usage_str(rec.get("unit"), 32),
                  "payload": rec.get("payload"),
                  "occurred_at": rec.get("occurred_at") or self._stamp()}
-        if isinstance(clean["value"], bool) or not isinstance(clean["value"], (int, float)):
-            raise ValueError("resource value must be a number")
+        value = clean["value"]
+        if (isinstance(value, bool) or not isinstance(value, (int, float))
+                or not math.isfinite(value) or value < 0):
+            raise ValueError("resource value must be a finite non-negative number")
         key = (mission_id, kind)
         bucket = self._resource_usage.setdefault(key, [])
         bucket.append(clean)
@@ -2692,10 +2694,13 @@ _USAGE_ID = re.compile(r"^[A-Za-z0-9\-_.:/]{1,128}$")
 
 
 def _usage_int(value):
-    """A non-negative int, or None (unknown) for anything else (bools included)."""
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or value != value:
+    """A non-negative int, or None (unknown) for anything else (bools, non-finite)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    return int(value) if value >= 0 else None
+    try:
+        return int(value) if math.isfinite(value) and value >= 0 else None
+    except (ValueError, OverflowError):  # pragma: no cover - non-finite already caught
+        return None
 
 
 def _usage_str(value, limit):

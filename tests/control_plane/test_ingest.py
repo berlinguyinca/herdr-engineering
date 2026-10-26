@@ -623,6 +623,32 @@ def test_ingest_usage_rejects_invalid_shapes():
                     "payload": {"kind": "cpu", "value": "many"}})
 
 
+def test_ingest_usage_rejects_nonfinite_and_negative_values():
+    import math
+    repo = ControlPlaneRepo()
+    svc = make_svc(repo)
+    bad_tokens = [float("nan"), float("inf"), float("-inf"), -1, True]
+    for bad in bad_tokens:
+        with pytest.raises(ValueError, match="finite non-negative"):
+            svc.ingest({"entity_type": "token_usage", "entity_id": "x",
+                        "event_type": "token_usage.recorded",
+                        "payload": {"input_tokens": bad}})
+    for bad in bad_tokens:
+        with pytest.raises(ValueError, match="finite non-negative"):
+            svc.ingest({"entity_type": "resource_usage", "entity_id": "x",
+                        "event_type": "resource_usage.recorded",
+                        "payload": {"kind": "cpu", "value": bad}})
+    # The repo methods themselves are safe against non-finite/negative values:
+    # token counts coerce non-finite to None (never OverflowError), while a
+    # resource value that would corrupt the aggregate is rejected outright.
+    rec = repo.add_token_usage({"request_id": "x", "input_tokens": float("inf")})
+    assert rec["input_tokens"] is None
+    with pytest.raises(ValueError):
+        repo.add_resource_usage({"kind": "cpu", "value": -3.0})
+    with pytest.raises(ValueError):
+        repo.add_resource_usage({"kind": "cpu", "value": float("inf")})
+
+
 def test_usage_and_stage_analytics_survive_export_import():
     clock = {"t": 1_700_000_000.0}
     repo = ControlPlaneRepo(now=lambda: clock["t"])
