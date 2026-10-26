@@ -857,6 +857,18 @@ def _make_handler(server, public=False, operator=False):
         # ------------------------------------------------------------ auth
         def _role(self):
             if not server._keys:
+                parts = self._decoded_parts()
+                runner_write = (self.command == "POST" and parts[:5] == ["", "api", "v1", "ci", "fix"]
+                                and ((len(parts) == 6 and parts[5] == "claim")
+                                     or (len(parts) == 7 and parts[6] in {"state", "result"})))
+                if server.ci_fix is not None and runner_write:
+                    # Only these runner writes use the dedicated key. Browser reads and
+                    # create/cancel retain the existing open tailnet posture.
+                    supplied = self.headers.get_all("X-API-Key") or []
+                    if len(supplied) == 1 and secrets.compare_digest(
+                            supplied[0].encode(), server.ci_fix_config["agent_api_key"].encode()):
+                        return "agent"
+                    return None
                 # open — only reachable via loopback or an explicit --allow-open
                 # (Tailnet trust boundary); the fail-closed guard enforces this
                 return "operator"
@@ -2549,6 +2561,8 @@ def _make_handler(server, public=False, operator=False):
                 raise
 
         def _json(self, data, status=200, *, etag=None, payload=None):
+            if server.ci_fix is not None and payload is None:
+                data = server.ci_fix.redact(data)
             payload = json.dumps(data).encode() if payload is None else payload
             self.send_response(status)
             self.send_header("Content-Type", "application/json")

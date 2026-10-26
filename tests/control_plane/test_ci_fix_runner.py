@@ -21,7 +21,7 @@ spec = importlib.util.spec_from_file_location("ci_fix_runner", ROOT / "deploy/co
 runner = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(runner)
 
-CONFIG = {"enabled": True, "hosts": ["bender", "beast"], "models": ["qwen-a", "qwen-b"],
+CONFIG = {"agent_api_key": "test-ci-fix-agent-key", "enabled": True, "hosts": ["bender", "beast"], "models": ["qwen-a", "qwen-b"],
           "max_concurrent": {"global": 4, "per_host": 1}, "deadline_minutes": 30}
 pytestmark = pytest.mark.skipif(not runner.shutil.which("git"), reason="git is required")
 
@@ -350,7 +350,7 @@ def test_per_host_capacity_is_respected_and_the_other_host_takes_the_next(env):
 
 
 def test_disabled_or_unlisted_hosts_do_nothing(tmp_path, forge):
-    env = Env(tmp_path, forge, config={"enabled": True, "hosts": ["beast"], "models": ["qwen-b"]})
+    env = Env(tmp_path, forge, config={"agent_api_key": "test-ci-fix-agent-key", "enabled": True, "hosts": ["beast"], "models": ["qwen-b"]})
     fix = env.ask()
     env.runner("bender").once()                                               # not a listed host
     assert env.service.get(fix)["state"] == "queued"

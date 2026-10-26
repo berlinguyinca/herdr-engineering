@@ -199,7 +199,7 @@ def test_web_refuses_invalid_usage_retention(tmp_path, monkeypatch, old_env, cap
 
 
 def test_web_reads_ci_fix_from_the_fleet_file_disabled_by_default(tmp_path, monkeypatch, old_env, capsys):
-    seen = _run_web(monkeypatch, make_file(tmp_path, ci_fix={"enabled": True, "hosts": ["bender"]}))
+    seen = _run_web(monkeypatch, make_file(tmp_path, ci_fix={"agent_api_key": "test-ci-fix-agent-key", "enabled": True, "hosts": ["bender"]}))
     assert seen["server_kw"]["ci_fix"]["enabled"] is True and seen["server_kw"]["ci_fix"]["hosts"] == ["bender"]
     seen = _run_web(monkeypatch, tmp_path / "missing.yaml")
     assert seen["server_kw"]["ci_fix"]["enabled"] is False
