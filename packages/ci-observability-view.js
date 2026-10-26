@@ -95,7 +95,7 @@ export function mountCiObservability(host,client,{repository='',provider='',miss
     replace(el('[data-ob-projects]'),summary?rail(model,projectCharts):'<p class="ci-chart-note">No project summary received.</p>');
     el('[data-ob-selection]').textContent=project?`${project.repository} · ${project.provider_url} #${project.provider_repo_id} · ${filters.days}-day window`:'All projects · selected window';
     el('[data-ob-clear]').hidden=!project;
-    replace(el('[data-ob-charts]'),selected?`<p class="ci-chart-note">${esc(scopeNote(selected.scope))} Daily grouping uses finish time, then start or creation time. Heatmap cells narrow the run tree; these charts retain the selected day window.</p>${renderCiSummaryCharts(rows(selected.charts))}`:'<p class="ci-chart-note">No chart observations received for this selection.</p>');
+    replace(el('[data-ob-charts]'),selected?`<p class="ci-chart-note">${esc(scopeNote(selected.scope))} Daily grouping uses run creation time (created_at) and UTC calendar days, including today. Heatmap cells narrow the run tree; these charts retain the selected day window.</p>${renderCiSummaryCharts(rows(selected.charts))}`:'<p class="ci-chart-note">No chart observations received for this selection.</p>');
     replace(el('[data-ob-tests]'),renderCiTestHistory(tests,{selected:!!project,loading:pending.has('tests'),error:testsError,sort:testSort}));
   }
   function notify() {save();onContext(context());}

@@ -182,6 +182,40 @@ async function reviewPage(run) {
  }finally{await browser.close();server.closeAllConnections();await new Promise(resolve=>server.close(resolve));}
 }
 
+test('review: selected run report refresh retains evidence with a visible stale warning until recovery',()=>reviewPage(async page=>{
+ await page.evaluate(()=>{
+  const getReports=client.getCiReports;
+  window.reportPhase='success';
+  client.getCiReports=async options=>{
+   if(options.run_number && reportPhase==='failure')throw Error('offline');
+   const response=await getReports(options);
+   if(options.run_number && reportPhase==='recovery')response.reports[0].tests[0].name='Recovered failure';
+   return response;
+  };
+  mount();
+ });
+ await page.locator('[data-ob-project]').filter({hasText:'org/current'}).click();
+ await page.locator('[data-ob-run]').click();
+ const inspector=page.locator('.ig-inspector');
+ const evidence=inspector.locator('.ci-insight-card').filter({hasText:'Test results'});
+ const warning=inspector.locator('[role="status"]').filter({hasText:'Test reports could not refresh.'});
+ await evidence.getByRole('cell',{name:'Current failure',exact:true}).waitFor();
+ assert.equal(await warning.count(),0);
+
+ await page.evaluate(()=>{reportPhase='failure';app.refresh();});
+ await warning.waitFor();
+ assert.equal(await warning.isVisible(),true);
+ assert.match(await warning.textContent(),/retained.*stale/i);
+ assert.equal(await evidence.getByRole('cell',{name:'Current failure',exact:true}).isVisible(),true);
+ assert.doesNotMatch(await evidence.textContent(),/Former failure|Recovered failure/);
+
+ await page.evaluate(()=>{reportPhase='recovery';app.refresh();});
+ await evidence.getByRole('cell',{name:'Recovered failure',exact:true}).waitFor();
+ assert.equal(await warning.count(),0);
+ assert.doesNotMatch(await evidence.textContent(),/Current failure|Former failure/);
+ await page.evaluate(()=>app.dispose());
+}));
+
 test('review: exact project identity reaches Runs, health, report and cache charts after a rename',()=>reviewPage(async page=>{
  await page.evaluate(()=>mount());await page.locator('[data-ob-project]').first().waitFor();
  await page.locator('[data-ob-project]').filter({hasText:'org/current'}).click();

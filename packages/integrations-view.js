@@ -372,7 +372,7 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
     }
     if(selected) {
       const runReports=ciSelectedRunReports(selectedReports?.reports,ciObservations().pipelines,pipeline);
-      const runReportHtml=selectedReports===null?`<p class="ig-note" role="status">${esc(selectedReportsError||'Loading test reports for this run…')}</p>`:renderCiRunReports(runReports,{search:testSearch,page:testPage});
+      const runReportHtml=selectedReports===null?`<p class="ig-note" role="status">${esc(selectedReportsError||'Loading test reports for this run…')}</p>`:`${selectedReportsError?`<p class="ig-warning" role="status">${esc(selectedReportsError)} Showing retained test evidence (stale).</p>`:''}${renderCiRunReports(runReports,{search:testSearch,page:testPage})}`;
       const candidates=ciObservations().pipelines.filter(record=>sameCiRepository(pipeline,record)&&ciRunKey(record)!==selected.id).slice(0,100);
       const compared=candidates.find(record=>ciRunKey(record)===comparisonKey);
       const comparison=compared?ciComparisonModel(pipeline,{...observedDetails.get(comparisonKey),...compared,tasks:compared.tasks??observedDetails.get(comparisonKey)?.tasks}):null;
