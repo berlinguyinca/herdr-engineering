@@ -337,7 +337,8 @@ def test_postgres_source_skips_unbounded_high_volume_startup_streams():
 
     PostgresSource(FakeConn(), run=fake_run).events()
     event_sql = next(sql for sql in calls if "fabric_events" in sql)
-    assert "entity_type NOT IN" in event_sql
-    assert "'service'" in event_sql
-    assert "'inspector'" in event_sql
-    assert "'collab'" in event_sql
+    assert "entity_type IN" in event_sql
+    assert "'mission'" in event_sql
+    assert "'test_run'" in event_sql
+    assert "'session'" not in event_sql
+    assert "'service'" not in event_sql
