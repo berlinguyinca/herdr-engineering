@@ -37,6 +37,14 @@ class IngestService:
     def __init__(self, repo):
         self.repo = repo
 
+    def ingest_batch(self, bodies: list[dict]) -> list[dict]:
+        """Ingest a bounded batch while preserving single-envelope semantics."""
+        if not isinstance(bodies, list):
+            raise ValueError("events must be a list")
+        if len(bodies) > 64:
+            raise ValueError("events must contain at most 64 envelopes")
+        return [self.ingest(body) for body in bodies]
+
     def ingest(self, body: dict) -> dict:
         if not isinstance(body, dict):
             raise ValueError("body must be a JSON object")

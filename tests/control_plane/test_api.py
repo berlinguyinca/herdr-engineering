@@ -50,6 +50,18 @@ def test_health(server):
     assert json.loads(body)["status"] == "ok"
 
 
+def test_server_configures_bounded_request_workers(acknowledged_sink):
+    repo = ControlPlaneRepo(sink=acknowledged_sink)
+    svr = ControlPlaneServer(repo, request_workers=3)
+    thread = threading.Thread(target=svr.serve, daemon=True)
+    thread.start()
+    svr.wait_until_ready()
+    try:
+        assert svr._httpd.request_workers == 3
+    finally:
+        svr.shutdown()
+
+
 def test_health_reports_deployment_context(server):
     c, _ = server
     _, _, body = c.get("/api/v1/health")
@@ -59,6 +71,20 @@ def test_health_reports_deployment_context(server):
     assert h["version"] == "0.1.0"
     assert h["commit"] == "dev"
     assert "missions" in h and "timestamp" in h
+    assert "requests" in h["performance"]
+
+
+def test_ingest_accepts_bounded_batch(server):
+    c, _ = server
+    req = {"events": [
+        {"entity_type": "host", "entity_id": "bender",
+         "event_type": "host.heartbeat", "payload": {"cpu": 10}},
+        {"entity_type": "host", "entity_id": "beast",
+         "event_type": "host.heartbeat", "payload": {"cpu": 20}},
+    ]}
+    status, body = c.post("/api/v1/ingest", req)
+    assert status == 200
+    assert len(json.loads(body)["entities"]) == 2
 
 
 def test_missions_roundtrip(server):

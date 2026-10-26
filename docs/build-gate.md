@@ -61,6 +61,12 @@ under `herdr-eng build-coordinate` (host bender, slot 0).
 4 concurrent gated builds, `slots=2`, each `sleep 6s`:
 
 - **max concurrent builds: 2** (exactly the configured bound)
+
+The automatic default is intentionally conservative: two slots on small hosts
+and at most four on larger hosts. Full-workspace compilers parallelize inside a
+slot, so multiplying slots by CPU count creates a second-level build storm for
+agent-heavy interactive machines. Use `--slots` or `HERDR_BUILD_GATE_SLOTS` for
+an explicit higher-throughput batch host.
 - **wall time: 12.1s** = 2 batches of 6s (builds 2,4 then 1,3) — perfect serialization
 - 2 contention telemetry events recorded
 
