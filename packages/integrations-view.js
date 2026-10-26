@@ -47,8 +47,9 @@ const canonicalProvider = value => {
 };
 export function selectIntegrations(entries,{tab='current',search='',repository='',provider='',mission='',session='',branch='',days=0,project=null}={}) {
   const terms=search.toLowerCase().trim().split(/\s+/).filter(Boolean),providerKey=canonicalProvider(provider);
+  const now=Date.now(),start=Math.floor(now/86400000)*86400000-(Number(days)-1)*86400000;
   return entries.filter(e=>(!project||ciProjectKey(e.record)===ciProjectKey(project)) && (tab==='all' || e.tab===tab) && (!providerKey || canonicalProvider(e.record.provider_url)===providerKey) && (!repository || e.record.repository===repository || e.record.repository_id===repository || String(e.record.provider_repo_id)===repository)
-    && (!branch || e.record.branch===branch) && (!Number(days) || (integrationTimestamp(e.record.created_at || e.record.created)>=Date.now()-Number(days)*86400000 && integrationTimestamp(e.record.created_at || e.record.created)<=Date.now()))
+    && (!branch || e.record.branch===branch) && (!Number(days) || (integrationTimestamp(e.record.created_at || e.record.created)>=start && integrationTimestamp(e.record.created_at || e.record.created)<=now))
     && (!mission || (e.record.mission_key || e.record.mission_id)===mission || records(e.record.related_missions).some(r=>(r.mission_key || r.mission_id)===mission))
     && (!session || e.record.session_id===session || records(e.record.related_sessions).some(r=>r.session_id===session)) && terms.every(t=>e.search.includes(t)));
 }
@@ -159,6 +160,7 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
   const state={tab:tabs.some(([key])=>key===tab)?tab:'current',search,repository,provider,mission,session,page:0,group:'project',branch:'',days:0};
   let related=null,relatedFailed=false,disposed=false,data=null,error='',selected=null,pipeline=null,detailError='',log=null,logError='',step='',actionMessage='';
   let timer=null,clock=null,signature='',detailSignature='',chartSignature='';
+  let selectedReports=null,selectedReportsError='';
   let reportData=null,reportsError='',insightsSignature='',failurePage=0,testPage=0,testSearch='';
   let debugSessions=null,debugSessionId='',debugMessage='',debugOperationId='',fixOperationId='';
   let fixAvailable=true,fix=null,fixMessage='',sandboxOperationId='',fixTerminal=null,fixTerminalError='';
@@ -369,13 +371,14 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
       el('[data-ci-insights]').hidden=false;el('[data-ci-charts]').hidden=false;
     }
     if(selected) {
-      const runReports=ciSelectedRunReports(reportData?.reports,ciObservations().pipelines,pipeline);
+      const runReports=ciSelectedRunReports(selectedReports?.reports,ciObservations().pipelines,pipeline);
+      const runReportHtml=selectedReports===null?`<p class="ig-note" role="status">${esc(selectedReportsError||'Loading test reports for this run…')}</p>`:renderCiRunReports(runReports,{search:testSearch,page:testPage});
       const candidates=ciObservations().pipelines.filter(record=>sameCiRepository(pipeline,record)&&ciRunKey(record)!==selected.id).slice(0,100);
       const compared=candidates.find(record=>ciRunKey(record)===comparisonKey);
       const comparison=compared?ciComparisonModel(pipeline,{...observedDetails.get(comparisonKey),...compared,tasks:compared.tasks??observedDetails.get(comparisonKey)?.tasks}):null;
       const compareHtml=`<label class="ci-compare-control">Compare observed run<select data-ci-compare aria-label="Compare observed run"><option value="">No comparison</option>${candidates.map(record=>`<option value="${esc(ciRunKey(record))}" ${ciRunKey(record)===comparisonKey?'selected':''}>Run #${esc(record.run_number)} · ${esc(record.state||record.status||'Unknown')} · ${esc(record.branch||'Branch not reported')}</option>`).join('')}</select></label>${comparisonKey&&!compared?'<p class="ig-note">Compared run is no longer in retained observations.</p>':''}${renderCiComparison(comparison)}`;
-      const next=JSON.stringify([collapseSuccess,zoom,compareHtml,testSearch,testPage,runReports,pipeline,detailError,log,logError,step,actionMessage,debugSessions,debugSessionId,debugMessage,fixAvailable,fix,fixMessage,fixTerminal,fixTerminalError,related,relatedFailed,fixIsActive(fix)?Math.floor(Date.now()/5000):0]);
-      if(detailSignature!==next){detailSignature=next;replace(inspector,'<div class="ig-active-pipeline">'+renderPipeline(pipeline,{loading:true,error:detailError,log,logError,step,actionMessage,debugSessions,debugSessionId,debugMessage,collapseSuccess,zoom,fixHtml:renderCiFix({available:fixAvailable,fix,message:fixMessage,terminal:fixTerminal,terminalError:fixTerminalError}),relatedHtml:related||relatedFailed?renderRelated(related,{error:relatedFailed?'failed':null}):''})+renderCiRunReports(runReports,{search:testSearch,page:testPage})+'</div><div class="ig-comparison-panel">'+compareHtml+'</div>');healthView?.selectedRun(pipeline);}
+      const next=JSON.stringify([collapseSuccess,zoom,compareHtml,testSearch,testPage,runReportHtml,pipeline,detailError,log,logError,step,actionMessage,debugSessions,debugSessionId,debugMessage,fixAvailable,fix,fixMessage,fixTerminal,fixTerminalError,related,relatedFailed,fixIsActive(fix)?Math.floor(Date.now()/5000):0]);
+      if(detailSignature!==next){detailSignature=next;replace(inspector,'<div class="ig-active-pipeline">'+renderPipeline(pipeline,{loading:true,error:detailError,log,logError,step,actionMessage,debugSessions,debugSessionId,debugMessage,collapseSuccess,zoom,fixHtml:renderCiFix({available:fixAvailable,fix,message:fixMessage,terminal:fixTerminal,terminalError:fixTerminalError}),relatedHtml:related||relatedFailed?renderRelated(related,{error:relatedFailed?'failed':null}):''})+runReportHtml+'</div><div class="ig-comparison-panel">'+compareHtml+'</div>');healthView?.selectedRun(pipeline);}
     }
     tick();
   }
@@ -396,6 +399,11 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
     if(!selected)return;
     if(!selected.providerUrl){detailError='Exact CI provider identity is not reported. Live details, logs and actions are unavailable for this retained run.';draw();return;}
     const target={...selected},key=target.id,selectedStep=step;
+    if(typeof client.getCiReports==='function')request('run-reports',signal=>client.getCiReports({signal,provider_url:target.providerUrl,provider_repo_id:target.providerId,repository:target.repository,run_number:target.number}),response=>{
+      if(selected?.id!==key || selected?.repository!==target.repository)return;
+      if(!Array.isArray(response?.reports))throw new Error('Invalid run report response');
+      selectedReports=response;selectedReportsError='';
+    },()=>{if(selected?.id===key)selectedReportsError='Test reports could not refresh.';});
     request('pipeline',signal=>client.getCiPipeline(target.providerId,target.number,{signal,providerUrl:target.providerUrl}),response=>{
       if(selected?.id!==key)return;
       if(!response?.pipeline)throw new Error('Pipeline response is unavailable');
@@ -431,7 +439,7 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
   }
   function refresh() {
     refreshPerformance();
-    if(isCi && typeof client.getCiReports==='function')request('reports',signal=>client.getCiReports({signal}),response=>{
+    if(isCi && typeof client.getCiReports==='function')request('reports',signal=>client.getCiReports({signal,compact:true}),response=>{
       if(!Array.isArray(response?.reports)||!Array.isArray(response?.pipelines))throw new Error('Invalid CI history response');
       reportData=response;reportsError='';
     },()=>{reportsError=`CI history could not refresh.${reportData?' Showing last received reports.':''}`;});
@@ -441,7 +449,7 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
     },()=>{error=`${title} could not refresh.${data?' Showing last received records.':' Retrying automatically.'}`;});
     refreshDetail();
   }
-  function cancelDetail() {for(const key of ['pipeline','log','debug-sessions','fix','related']){pending.get(key)?.abort();pending.delete(key);}}
+  function cancelDetail() {for(const key of ['pipeline','log','debug-sessions','fix','related','run-reports']){pending.get(key)?.abort();pending.delete(key);}}
   function focusInspector() {
     const inspector=el('.ig-inspector');inspector.querySelector('[data-close-inspector]')?.focus({preventScroll:true});
     inspector.scrollIntoView({block:'nearest',behavior:'smooth'});
@@ -450,7 +458,7 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
     const entry=integrationEntries({pipelines:{history:[record]}})[0];
     if(!entry)return;
     if(selected?.id===entry.id&&selected.repository===record.repository){draw();focusInspector();return;}
-    listScroll=window.scrollY;healthOriginKey=document.activeElement?.dataset.healthRun||healthOriginKey;testPage=0;testSearch='';comparisonKey='';cancelDetail();
+    listScroll=window.scrollY;healthOriginKey=document.activeElement?.dataset.healthRun||healthOriginKey;testPage=0;testSearch='';comparisonKey='';cancelDetail();selectedReports=null;selectedReportsError='';
     selected={id:entry.id,repository:record.repository,providerId:record.provider_repo_id || record.repository,number:record.run_number,providerUrl:JSON.parse(entry.id)[0]};
     pipeline=selected.providerUrl?record:{...record,can_retry:false,can_cancel:false};debugSessions=null;debugSessionId='';debugMessage='';debugOperationId='';fixOperationId='';fix=null;fixMessage='';sandboxOperationId='';fixTerminal=null;fixTerminalError='';step='';log=null;logError='';detailError='';actionMessage='';detailSignature='';related=null;relatedFailed=false;
     // Start lazy I/O before rendering the synchronized run/health views.

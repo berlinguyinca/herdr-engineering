@@ -233,6 +233,33 @@ def _aggregate_test(observations):
     }
 
 
+def project_report(report):
+    """Validate and detach one compact report projection for replay reuse."""
+    identity = _identity(report)
+    if identity is None or any(not _joinable(report.get(key)) for key in ('revision', 'branch')):
+        return None
+    summary = report.get('summary')
+    if (not isinstance(summary, dict) or
+            any(type(summary.get(key)) is not int or summary[key] < 0 for key in _COUNTS) or
+            summary['total'] != sum(summary[key] for key in _COUNTS[:4])):
+        raise ValueError('A validated CI report summary is required')
+    projected = _project(report, _REPORT_FIELDS)
+    projected['provider_url'] = identity[0]
+    projected['run_number'] = identity[3]
+    projected['summary'] = {key: summary[key] for key in _COUNTS}
+    cases = _test_cases(report)
+    projected['tests'] = cases
+    # Content identity makes replay and repeated uploads idempotent even
+    # when optional provider metadata was resolved after ingestion.
+    digest = hashlib.sha256(json.dumps([projected['summary'], cases],
+                                      sort_keys=True).encode()).hexdigest()
+    report_id = report.get('report_id')
+    projected['report_id'] = (report_id if isinstance(report_id, str) and
+                              re.fullmatch(r'[0-9a-f]{64}', report_id) else digest)
+    key = (*identity, projected['branch'], projected['revision'], digest)
+    return key, projected
+
+
 class CIObservationStore:
     """Compact projection reusable by repository replay and observation callbacks.
 
@@ -306,28 +333,14 @@ class CIObservationStore:
 
     def record_report(self, report):
         """Accept normalized counts and bounded parser projections, never XML."""
-        identity = _identity(report)
-        if identity is None or any(not _joinable(report.get(key)) for key in ('revision', 'branch')):
+        return self._record_report_projection(project_report(report))
+
+    def _record_report_projection(self, projection):
+        # Projections are produced only by project_report, and are immutable
+        # inside the store. Shared replay caches never contain raw reports.
+        if projection is None:
             return False
-        summary = report.get('summary')
-        if (not isinstance(summary, dict) or
-                any(type(summary.get(key)) is not int or summary[key] < 0 for key in _COUNTS) or
-                summary['total'] != sum(summary[key] for key in _COUNTS[:4])):
-            raise ValueError('A validated CI report summary is required')
-        projected = _project(report, _REPORT_FIELDS)
-        projected['provider_url'] = identity[0]
-        projected['run_number'] = identity[3]
-        projected['summary'] = {key: summary[key] for key in _COUNTS}
-        cases = _test_cases(report)
-        projected['tests'] = cases
-        # Content identity makes replay and repeated uploads idempotent even
-        # when optional provider metadata was resolved after ingestion.
-        digest = hashlib.sha256(json.dumps([projected['summary'], cases],
-                                          sort_keys=True).encode()).hexdigest()
-        report_id = report.get('report_id')
-        projected['report_id'] = (report_id if isinstance(report_id, str) and
-                                  re.fullmatch(r'[0-9a-f]{64}', report_id) else digest)
-        key = (*identity, projected['branch'], projected['revision'], digest)
+        key, projected = projection
         with self._lock:
             # A replay cannot move the first observation's timestamp or become
             # the latest attempt merely by being delivered again.
@@ -368,7 +381,8 @@ class CIObservationStore:
         self._measurements.observe(view, len(rows), view['scope']['stale'])
         return view
 
-    def test_summary(self, repository=None, branch=None, test=None, days=30):
+    def test_summary(self, repository=None, branch=None, test=None, days=30, *,
+                     provider_url=None, provider_repo_id=None):
         """Aggregate retained parsed cases in an inclusive UTC report-time window.
 
         Rates use reported completed test attempts (passed/failed/errored), never
@@ -387,10 +401,11 @@ class CIObservationStore:
         start = end - days * 86400
         groups, reported_runs = {}, set()
         report_count = unknown_time = 0
-        filters = {'repository': repository, 'branch': branch}
+        filters = {'repository': repository, 'branch': branch, 'provider_url': provider_url,
+                   'provider_repo_id': provider_repo_id}
         with self._lock:
             for (kind, identity), (report, _) in self._entries.items():
-                if kind != 'report' or any(value is not None and report[key] != value
+                if kind != 'report' or any(value is not None and str(report[key]) != str(value)
                                           for key, value in filters.items()):
                     continue
                 stamp = _timestamp(report['reported_at'])
@@ -409,7 +424,7 @@ class CIObservationStore:
             missing = 0
             stale = False
             for (kind, identity), (row, _) in self._entries.items():
-                if kind != 'pipeline' or any(value is not None and row[key] != value
+                if kind != 'pipeline' or any(value is not None and str(row[key]) != str(value)
                                             for key, value in filters.items()):
                     continue
                 stamp = next((_timestamp(row[field]) for field in

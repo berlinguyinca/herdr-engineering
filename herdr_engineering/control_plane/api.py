@@ -1944,7 +1944,8 @@ def _make_handler(server, public=False, operator=False):
                         repository_languages=cached_github_languages(server.github_monitor)))
                 if what == "reports":
                     from .project_links import annotate_ci_history, cached_github_languages
-                    view = {**r.ci_reports(), "repos": server.ci_monitor.snapshot().get("repos", [])}
+                    filters = _ci_reports_query(self.path)
+                    view = {**r.ci_reports(**filters), "repos": server.ci_monitor.snapshot().get("repos", [])}
                     view = annotate_ci_history(view, r,
                         repository_languages=cached_github_languages(server.github_monitor))
                     return self._json(server.ci_monitor.report_redactor()(view))
@@ -2686,6 +2687,31 @@ def _tests_view() -> dict[str, Any]:
 
 _FEED_SERVICE_FIELDS = ("service_id", "service_name", "host_id", "source_port", "session_id",
                         "discovery_source", "verified_origin", "ownership", "listener_identity")
+
+
+def _ci_reports_query(path):
+    from urllib.parse import parse_qs, urlsplit
+
+    from .ci_reports import normalize_provider_url
+    from .redact import redact_text
+
+    query = parse_qs(urlsplit(path).query, keep_blank_values=True, max_num_fields=8)
+    identity = {'provider_url', 'provider_repo_id', 'repository', 'run_number'}
+    if set(query) - (identity | {'compact'}) or any(len(v) != 1 for v in query.values()):
+        raise ValueError('Invalid CI report filters')
+    values = {key: value[0] for key, value in query.items()}
+    if any(not value or len(value) > 500 or not value.isprintable() or redact_text(value) != value
+           for value in values.values()):
+        raise ValueError('Invalid CI report filter')
+    if values.get('compact', '0') not in ('0', '1'):
+        raise ValueError('Invalid compact report option')
+    run = {key: value for key, value in values.items() if key in identity}
+    if run:
+        if set(run) != identity or not run['run_number'].isdigit() or int(run['run_number']) < 1:
+            raise ValueError('Exact CI report run identity is required')
+        run['provider_url'] = normalize_provider_url(run['provider_url'])
+        run['run_number'] = int(run['run_number'])
+    return {'compact': values.get('compact') == '1', 'run': run or None}
 
 
 def _ci_observability_query(path, route):

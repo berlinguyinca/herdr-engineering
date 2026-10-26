@@ -87,3 +87,10 @@ test('server attempt order wins over backdated timestamps and late older runs',a
  assert.equal(model.latestTotal,200);assert.equal(model.failures.length,0);assert.equal(model.groups[0].delta,150);
  assert.match(renderCiRunReports([first,second]),/Latest attempt 2/);
 });
+
+test('counts-only polling never presents omitted case evidence as passing or absent failures',()=>{
+ const html=renderCiInsights(ciInsightsModel({reports:[report(1,10)],scope:{test_details:'omitted'}},{},now));
+ assert.match(html,/Test count over time/);
+ assert.match(html,/Select a project.*test history/i);
+ assert.doesNotMatch(html,/No failed tests|No conflicting outcomes|Failing tests · 0/);
+});

@@ -304,8 +304,13 @@ export class HerdrClient {
     return this.request('/api/v1/ci', { signal });
   }
 
-  getCiReports({ signal } = {}) {
-    return this.request('/api/v1/ci/reports', { signal });
+  getCiReports({ signal, compact = false, provider_url, provider_repo_id, repository, run_number } = {}) {
+    const query = new URLSearchParams();
+    if (compact) query.set('compact', '1');
+    for (const [key, value] of Object.entries({provider_url, provider_repo_id, repository, run_number})) {
+      if (value !== undefined && value !== null) query.set(key, String(value));
+    }
+    return this.request(`/api/v1/ci/reports${query.size ? `?${query}` : ''}`, { signal });
   }
 
   getCiSummary({ days = 14, repository, branch, scope, provider_url, provider_repo_id, signal } = {}) {

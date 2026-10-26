@@ -52,9 +52,23 @@ def test_telemetry_auth_limits_invalid_bundles_and_performance(server):
     assert request(server, 'ci/telemetry', body, key='write')[1]['duplicates'] == 2
     for invalid in [[], {'schema_version': True, 'records': []},
                     {'schema_version': 1, 'records': [cache()] * 201},
-                    {'schema_version': 1, 'records': [cache(2), {'token': 'secret'}]},
-                    {'schema_version': 1, 'records': [], 'padding': 'x' * 1048576}]:
+                    {'schema_version': 1, 'records': [cache(2), {'token': 'secret'}]}]:
         assert request(server, 'ci/telemetry', invalid, key='write')[0] == 400
+    # The server rejects oversized Content-Length before reading the body.
+    # Sending a megabyte concurrently with that early close races into EPIPE
+    # in urllib, hiding the response this assertion is intended to verify.
+    from http.client import HTTPConnection
+    connection = HTTPConnection('127.0.0.1', server.port, timeout=3)
+    try:
+        connection.request('POST', '/api/v1/ci/telemetry', headers={
+            'X-API-Key': 'write', 'Content-Type': 'application/json',
+            'Content-Length': str(1048577),
+        })
+        response = connection.getresponse()
+        assert response.status == 400
+        response.read()
+    finally:
+        connection.close()
     assert request(server, 'ci/performance?days=30')[0] == 400
     assert request(server, 'ci/performance?days=garbage')[0] == 400
     assert request(server, 'ci/performance', key='invalid')[0] == 401
@@ -407,7 +421,8 @@ def test_compact_summary_filters_metrics_scope_and_exact_identity(server):
             {**ci_run(3), 'state': 'canceled'}, {**ci_run(4), 'state': 'running'},
             {**ci_run(5), 'branch': 'topic', 'event': 'pull_request'},
             {**ci_run(6), 'created_at': None, 'started_at': None, 'finished_at': None},
-            {**ci_run(7), 'finished_at': '2026-09-01T00:00:00Z'},
+            {**ci_run(7), 'created_at': '2026-09-01T00:00:00Z',
+             'finished_at': '2026-09-01T00:00:00Z'},
             {**ci_run(), 'provider_url': 'https://other.example'},
             {**ci_run(), 'provider_repo_id': 18},
             {**ci_run(), 'repository': 'org/renamed'}]

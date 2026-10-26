@@ -185,6 +185,7 @@ class ControlPlaneRepo:
         self._event_order = []  # (entity_type, entity_id, seq) chronological
         self._ci_sequence = 0  # one bounded counter survives stream eviction
         self._ci_history_truncated = set()
+        self._ci_test_projection = None
         # Envelope v2 idempotency / sequence / freshness state (envelope.py).
         self.ledger = SourceLedger(now=self._now, persist=self._persist_source_state)
         self._listeners = set()  # pub/sub for the SSE live stream (Spec §52)
@@ -1647,7 +1648,9 @@ class ControlPlaneRepo:
             records = [copy.deepcopy(stream[-1]['payload'])
                        for (kind, _), stream in self._events.items()
                        if kind == 'ci_telemetry' and stream]
-            pipelines = self.ci_reports()['pipelines']
+            pipelines = [copy.deepcopy(stream[-1]['payload'])
+                         for (kind, _), stream in self._events.items()
+                         if kind == 'ci_observation' and stream]
             if inventory is not None:
                 from .project_links import annotate_ci_history
                 # Resolve inventory identities before calculating group membership.
@@ -1759,7 +1762,8 @@ class ControlPlaneRepo:
                              or ((entry[0], entry[1]) in keep and
                                  entry[2] == self._events[(entry[0], entry[1])][-1]["sequence"])]
 
-    def ci_reports(self):
+    def ci_reports(self, *, compact=False, run=None):
+        from .ci_observability import _PIPELINE_FIELDS, _REPORT_FIELDS, bind_report_provider
         from .ci_reports import HISTORY_BYTES, PIPELINE_LIMIT, REPORT_LIMIT
         with self._event_lock:
             arrivals = {tuple(entry): index for index, entry in enumerate(self._event_order)}
@@ -1768,10 +1772,23 @@ class ControlPlaneRepo:
                           if etype == kind and stream]
                 events.sort(key=lambda event: (event.get("ingest_timestamp", ""), arrivals.get(
                     (event["entity_type"], event["entity_id"], event["sequence"]), -1)), reverse=True)
-                return [copy.deepcopy(event["payload"]) for event in events]
-            reports, pipelines = rows("ci_report"), rows("ci_observation")
+                payloads = [event['payload'] for event in events]
+                if kind == 'ci_report' and run is not None:
+                    payloads = [row for row in payloads
+                                if (bound := bind_report_provider(row, pipelines)) and all(
+                                    str(bound.get(key)) == str(value) for key, value in run.items())]
+                if compact:
+                    fields = ((*_REPORT_FIELDS, 'report_id', 'summary', 'attempt') if kind == 'ci_report'
+                              else (*_PIPELINE_FIELDS, 'event', 'ref', 'url', 'coverage', 'stale',
+                                    'project_id', 'language', 'mission_id', 'mission_key', 'session_id'))
+                    payloads = [{key: row[key] for key in fields if key in row} for row in payloads]
+                return copy.deepcopy(payloads)
+            pipelines = rows("ci_observation")
+            reports = rows("ci_report")
             from .ci_reports import reconcile_report_identities
             reconcile_report_identities(reports, pipelines)
+            if compact:
+                reports = [bind_report_provider(row, pipelines) for row in reports]
             return {"reports": reports, "pipelines": pipelines,
                     "scope": {"kind": "retained_observations", "complete": False,
                               "truncated": bool(self._ci_history_truncated & {"ci_report", "ci_observation"}),
@@ -1779,47 +1796,74 @@ class ControlPlaneRepo:
                               "report_limit": REPORT_LIMIT, "pipeline_limit": PIPELINE_LIMIT,
                               "byte_limit_per_kind": HISTORY_BYTES,
                               "report_count": len(reports), "pipeline_count": len(pipelines),
+                              "test_details": "omitted" if compact else "included",
                               "description": "Uploaded test reports and observed provider runs only; missing reports do not mean zero tests."}}
 
     def ci_test_history(self, repository=None, branch=None, test=None, days=30, *,
                         provider_url=None, provider_repo_id=None):
-        """Project bounded durable report events; no provider reads or new journal."""
+        """Reuse compact projections until retained report/observation events change.
+
+        Cache only one bounded store, not arbitrary filter/window responses. Reads
+        reapply the current clock and filters; imports, eviction, new attempts and
+        changed provider bindings invalidate the source signature.
+        """
         from datetime import UTC, datetime
 
-        from .ci_observability import CIObservationStore, bind_report_provider
+        from .ci_observability import (
+            _REPORT_FIELDS,
+            CIObservationStore,
+            _identity,
+            bind_report_provider,
+            project_report,
+        )
         from .ci_performance import _timestamp
 
         with self._event_lock:
-            history = self.ci_reports()
-            now = datetime.fromtimestamp(self._now(), UTC)
-        def selected(row):
-            return ((provider_url is None or (row.get('provider_url') or '').rstrip('/') == provider_url) and
-                    (provider_repo_id is None or str(row.get('provider_repo_id')) == str(provider_repo_id)))
-        store = CIObservationStore(wall_now=lambda: now)
-        for row in reversed(history['pipelines']):
-            if selected(row):
-                store.record_pipeline(row)
-        unjoined = []
-        for row in reversed(history['reports']):
-            row = bind_report_provider(row, history['pipelines'])
-            if selected(row) and not store.record_report(row):
-                unjoined.append(row)
-        view = store.test_summary(repository=repository, branch=branch, test=test, days=days)
-        end = now.timestamp()
-        unjoined_count = sum(
-            (repository is None or row['repository'] == repository) and
-            (branch is None or row['branch'] == branch) and
-            (stamp := _timestamp(row.get('reported_at'))) is not None and
-            end - days * 86400 <= stamp <= end for row in unjoined)
-        view['scope'].update(persistence=history['scope']['persistence'],
-                             memory_only=self._sink is None,
-                             source_truncated=history['scope']['truncated'],
-                             projection_truncated=view['scope']['truncated'],
-                             truncated=history['scope']['truncated'] or view['scope']['truncated'],
-                             unjoined_report_count=unjoined_count)
-        if provider_url is not None or provider_repo_id is not None:
-            view['scope'].update(provider_url=provider_url, provider_repo_id=provider_repo_id)
-        return view
+            events = [stream[-1] for (kind, _), stream in self._events.items()
+                      if kind in ('ci_report', 'ci_observation') and stream]
+            signature = tuple((event['entity_type'], event['entity_id'], event['sequence'])
+                              for event in events)
+            if self._ci_test_projection is None or self._ci_test_projection[0] != signature:
+                arrivals = {tuple(entry): index for index, entry in enumerate(self._event_order)}
+                events.sort(key=lambda event: (event.get('ingest_timestamp', ''), arrivals.get(
+                    (event['entity_type'], event['entity_id'], event['sequence']), -1)))
+                pipelines = [event['payload'] for event in events if event['entity_type'] == 'ci_observation']
+                store = CIObservationStore(wall_now=lambda: datetime.fromtimestamp(self._now(), UTC))
+                for row in pipelines:
+                    store.record_pipeline(row)
+                previous = self._ci_test_projection[3] if self._ci_test_projection else {}
+                projections, unjoined = {}, []
+                for event in events:
+                    if event['entity_type'] != 'ci_report':
+                        continue
+                    row = bind_report_provider(event['payload'], pipelines)
+                    source = (event['entity_id'], event['sequence'], _identity(row))
+                    projection = previous[source] if source in previous else project_report(row)
+                    projections[source] = projection
+                    if not store._record_report_projection(projection):
+                        unjoined.append({key: row.get(key) for key in _REPORT_FIELDS})
+                self._ci_test_projection = (signature, store, unjoined, projections)
+            _, store, unjoined, _ = self._ci_test_projection
+            view = store.test_summary(repository=repository, branch=branch, test=test, days=days,
+                                      provider_url=provider_url, provider_repo_id=provider_repo_id)
+            end = self._now()
+            unjoined_count = sum(
+                (repository is None or row['repository'] == repository) and
+                (branch is None or row['branch'] == branch) and
+                (provider_url is None or (row.get('provider_url') or '').rstrip('/') == provider_url) and
+                (provider_repo_id is None or str(row.get('provider_repo_id')) == str(provider_repo_id)) and
+                (stamp := _timestamp(row.get('reported_at'))) is not None and
+                end - days * 86400 <= stamp <= end for row in unjoined)
+            source_truncated = bool(self._ci_history_truncated & {'ci_report', 'ci_observation'})
+            view['scope'].update(persistence='durable_sink' if self._sink is not None else 'memory_only',
+                                 memory_only=self._sink is None,
+                                 source_truncated=source_truncated,
+                                 projection_truncated=view['scope']['truncated'],
+                                 truncated=source_truncated or view['scope']['truncated'],
+                                 unjoined_report_count=unjoined_count)
+            if provider_url is not None or provider_repo_id is not None:
+                view['scope'].update(provider_url=provider_url, provider_repo_id=provider_repo_id)
+            return view
 
     def ci_summary(self, *, pipelines=(), inventory=(), cached=None, days=14,
                    repository=None, branch=None, scope='all', provider_url=None,
@@ -1838,7 +1882,8 @@ class ControlPlaneRepo:
 
         cached = cached or {}
         now = self._now()
-        start = now - days * 86400
+        # Match the heatmap and run list: UTC calendar days including today.
+        start = now // 86400 * 86400 - (days - 1) * 86400
         store = CIObservationStore()
         with self._event_lock:
             retained = [stream[-1]['payload'] for (kind, _), stream in self._events.items()
@@ -1902,8 +1947,7 @@ class ControlPlaneRepo:
             if ((scope == 'pr' and not is_pr) or
                     (scope == 'default' and (is_pr or row.get('branch') != defaults[project]))):
                 continue
-            stamp = next((value for field in ('finished_at', 'started_at', 'created_at')
-                          if (value := _timestamp(row.get(field))) is not None), None)
+            stamp = _timestamp(row.get('created_at'))
             if stamp is None:
                 unknown_time += 1
                 group['unknown_time_run_count'] += 1
@@ -1954,7 +1998,7 @@ class ControlPlaneRepo:
                 persistence='durable_sink' if self._sink is not None else 'memory_only',
                 days=days, window={'start': _iso(start), 'end': _iso(now)}, repository=repository,
                 branch=branch, scope=scope, provider_url=provider_url, provider_repo_id=provider_repo_id,
-                denominator='successful_or_failed_runs', time_basis='finished_started_created_at',
+                denominator='successful_or_failed_runs', time_basis='created_at', window_basis='utc_calendar_days_including_today',
                 minimum_percentile_samples=5, unknown_time_run_count=unknown_time,
                 scope_unavailable_run_count=scope_unavailable, unjoined_run_count=unjoined,
                 history=cached.get('scope', {})))
@@ -1974,7 +2018,9 @@ class ControlPlaneRepo:
         view = self.ci_test_history(repository=repository, branch=branch, test=test, days=days,
                                     provider_url=provider_url, provider_repo_id=provider_repo_id)
         view = redact(view)
-        tests = view['tests']
+        tests = sorted(view['tests'], key=lambda row: (
+            -row['failure_count'], -(row['duration_ms']['p95'] or row['last_duration_ms'] or 0),
+            row['provider_url'], str(row['provider_repo_id']), row['repository'], row['branch'], row['id']))
         view['tests'] = []
         budget = 240 * 1024
         used = 0
@@ -1986,6 +2032,9 @@ class ControlPlaneRepo:
             used += size
         limited = len(view['tests']) != len(tests)
         view['scope'].update(test_count=len(tests), returned_test_count=len(view['tests']),
+                             omitted_test_count=len(tests) - len(view['tests']),
+                             omitted_failure_test_count=sum(row['failure_count'] > 0 for row in tests[len(view['tests']):]),
+                             ranking='failures_then_duration_then_identity',
                              response_truncated=limited, test_limit=200, response_byte_limit=256 * 1024,
                              truncated=view['scope']['truncated'] or limited)
         return view
@@ -2579,6 +2628,7 @@ class ControlPlaneRepo:
                                      for key, stream in self._events.items()
                                      if key[0] in {"ci_report", "ci_observation", "ci_telemetry"}
                                      for event in stream), default=0))
+        self._ci_test_projection = None
         self._ci_history_truncated = set(state.get('ci_history_truncated', []))
         self._trim_ci_history()
         # Replay durable naming reservations before any session is presented.

@@ -118,7 +118,7 @@ test('CI page shares project context with the existing heatmap and inspector wit
     getCiTests:async options=>{calls.push(['tests',options]);return {tests:[],scope:{not_reported_run_count:1}};},
     getCiHistory:async()=>({available:true,status:'ready',repos,pipelines:[run],coverage:{17:{exhausted:true},18:{exhausted:true}}}),
     getCi:async()=>({available:true,status:'ready',pipelines:{'org/app':[run]}}),
-    getCiReports:async()=>({reports:[],pipelines:[run]}),
+    getCiReports:async options=>{calls.push(['reports',options]);return {reports:[],pipelines:[run]};},
     getCiPipeline:async(id,number)=>{calls.push(['pipeline',id,number]);return {pipeline:{...run,tasks:[{id:9,name:'Unit tests',state:'failure'}]},diagnosis:{evidence_availability:'unavailable',reason:'No validated report matches this run.',failed_steps:[{id:9,name:'Unit tests',state:'failure'}],failed_tests:[]}};},
     getCiLog:async(id,number,step)=>{calls.push(['log',id,number,step]);return {available:true,log:'Exact provider output',truncated:true};}
    });
@@ -126,6 +126,7 @@ test('CI page shares project context with the existing heatmap and inspector wit
   await page.locator('[data-ob-project]').nth(1).waitFor();
   assert.doesNotMatch(await page.locator('main').innerText(),/\.ig-fix\{/,'styles must not leak into visible page text');
   assert.equal(await page.evaluate(()=>calls.filter(c=>['pipeline','log'].includes(c[0])).length),0);
+  assert.equal(await page.evaluate(()=>calls.find(c=>c[0]==='reports')[1].compact),true);
   await page.locator('[data-ob-project]').nth(1).click();
   assert.deepEqual(errors,[]);assert.equal(await page.locator('th[scope=row].ci-health-project').count(),1,await page.locator('[data-health-map]').textContent());
   assert.equal(await page.locator('[data-health-mode="14"]').getAttribute('aria-pressed'),'true');
@@ -133,6 +134,7 @@ test('CI page shares project context with the existing heatmap and inspector wit
   await page.locator('[data-health-tree] [data-health-disclosure] [data-health-disclosure] > summary').first().click();
   await page.locator('[data-health-run]').click();
   await page.locator('.ci-diagnosis').waitFor();
+  assert.deepEqual(await page.evaluate(()=>{const c=calls.find(c=>c[0]==='reports'&&c[1].run_number);return c&&[c[1].provider_url,c[1].provider_repo_id,c[1].repository,c[1].run_number];}),['https://ci.example',18,'org/app',7]);
   assert.match(await page.locator('.ci-diagnosis').textContent(),/Test evidence unavailable/);
   assert.equal(await page.evaluate(()=>calls.filter(c=>c[0]==='log').length),0);
   await page.locator('.ci-diagnosis [data-step="9"]').click();

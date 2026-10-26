@@ -343,6 +343,10 @@ test('CI report history reads use viewer GET and forward cancellation',async()=>
   const client=new HerdrClient(`http://127.0.0.1:${server.address().port}`);
   assert.deepEqual(await client.getCiReports(),{reports:[],pipelines:[]});
   assert.deepEqual(calls[0],{url:'/api/v1/ci/reports',method:'GET'});
+  await client.getCiReports({compact:true});
+  assert.equal(calls[1].url,'/api/v1/ci/reports?compact=1');
+  await client.getCiReports({provider_url:'https://ci.example',provider_repo_id:17,repository:'org/app',run_number:1});
+  assert.equal(new URL(calls[2].url,'http://local').searchParams.get('run_number'),'1');
   const controller=new AbortController();
   const request=client.getCiReports({signal:controller.signal});controller.abort();
   await assert.rejects(request,{name:'AbortError'});

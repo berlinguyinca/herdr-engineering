@@ -20,7 +20,8 @@ test('CI reports publish over HTTP and drive history, pipeline logs and responsi
   const options={headless:true,args:['--no-sandbox']};
   if(process.env.PLAYWRIGHT_CHROMIUM)options.executablePath=process.env.PLAYWRIGHT_CHROMIUM;
   try{browser=await chromium.launch(options);}catch(error){const exe='/home/wohlgemuth/.cache/ms-playwright/chromium-1243/chrome-linux64/chrome';if(!existsSync(exe))throw error;browser=await chromium.launch({...options,executablePath:exe});}
-  const page=await browser.newPage({viewport:{width:1440,height:1000}});const errors=[];page.on('pageerror',e=>errors.push(e.message));
+  const page=await browser.newPage({viewport:{width:1440,height:1000}});const errors=[],reportReads=[];page.on('pageerror',e=>errors.push(e.message));
+  page.on('request',request=>{const url=new URL(request.url());if(request.method()==='GET'&&url.pathname==='/api/v1/ci/reports')reportReads.push(url);});
   await page.goto(`${base}/#/ci`);
   assert.equal(await page.locator('[data-ci-workspace="health"]').getAttribute('aria-selected'),'true');
   assert.equal(await page.locator('.ci-report-filters').isVisible(),false,'Health owns its own history filters');
@@ -31,11 +32,16 @@ test('CI reports publish over HTTP and drive history, pipeline logs and responsi
   await page.locator('[data-ci-workspace="tests"]').click();
   const insights=page.locator('[data-ci-insights]');
   await page.waitForFunction(()=>document.querySelector('[data-ci-insights]')?.textContent.includes('4 test report attempts'));
-  await page.locator('[data-ci-repository]').selectOption('17');
+  const projectOption=await page.locator('[data-ci-repository] option').filter({hasText:'org/app'}).first().getAttribute('value');
+  await page.locator('[data-ci-repository]').selectOption(projectOption);
   await page.locator('[data-ci-branch]').selectOption('main');
   assert.match(await insights.innerText(),/3 retained runs · 3 test report attempts/);
-  assert.match(await insights.innerText(),/33.3%/);assert.match(await insights.innerText(),/2 \/ 3 attempts/);
-  assert.match(await insights.innerText(),/First failure/);assert.match(await insights.innerText(),/Last pass/);
+  assert.match(await insights.innerText(),/33.3%/);
+  assert.match(await insights.innerText(),/Select a project.*test history/);
+  const testHistory=page.locator('[data-ob-tests]');
+  await testHistory.locator('tbody tr').first().waitFor();
+  assert.match(await testHistory.innerText(),/2 \/ 3 reported completed test attempts/);
+  assert.match(await testHistory.innerText(),/First failure \/ last pass/);
   assert.equal(await insights.locator('svg[role="img"]').count(),1);
   await page.locator('[data-ci-period]').selectOption('7');
   assert.match(await insights.innerText(),/3 retained runs/);
@@ -50,7 +56,10 @@ test('CI reports publish over HTTP and drive history, pipeline logs and responsi
   assert.equal(await insights.isVisible(),true);
   await page.locator('[data-ci-workspace="health"]').click();
   assert.equal(await inspector.locator('.ci-pipeline-step[data-step="12"]').evaluate(e=>getComputedStyle(e).borderLeftColor),'rgb(220, 53, 69)');
-  assert.match(await inspector.innerText(),/Test results · 4 tests/);
+  await inspector.getByRole('heading',{name:'Test results · 4 tests',exact:true}).waitFor();
+  assert.ok(reportReads.some(url=>url.searchParams.get('compact')==='1'));
+  assert.ok(reportReads.some(url=>url.searchParams.get('run_number')==='3'));
+  assert.ok(reportReads.every(url=>url.searchParams.get('compact')==='1'||['provider_url','provider_repo_id','repository','run_number'].every(key=>url.searchParams.has(key))));
   const box=await inspector.boundingBox();assert.ok(box.width>900,`Pipeline inspector too narrow: ${box.width}`);
   await inspector.locator('.ci-pipeline-step[data-step="12"]').focus();await page.keyboard.press('Enter');
   await page.waitForFunction(()=>document.querySelector('.ig-log[aria-label="Step output"]')?.textContent.includes('expected 200, got 500'));
