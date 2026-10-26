@@ -75,7 +75,7 @@ class Migrator:
             alias_applied = previous in already if previous else False
             if alias_applied:
                 legacy = Path(migrations_dir, previous)
-                if not legacy.is_file() or legacy.read_text(encoding='utf-8') != sql:
+                if legacy.is_file() and legacy.read_text(encoding='utf-8') != sql:
                     raise ValueError(f'migration alias content differs: {name}')
             await self._conn.execute("BEGIN")
             try:

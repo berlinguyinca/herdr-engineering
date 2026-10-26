@@ -2010,6 +2010,9 @@ def _make_handler(server, public=False, operator=False):
                             {"error": "entity_type and entity_id required"}, 400)
                     return self._json({"events": r.stream(etype, eid)})
             if resource == "artifacts" and len(parts) > 5 and parts[5] == "download":
+                if (server.artifact_acl is not None and
+                        not server.artifact_acl.can(parts[4], self._principal(), "read")):
+                    return self._json({"error": "not found"}, 404)
                 data = r.get_artifact_data(parts[4])
                 a = r.get_artifact(parts[4])
                 if a is None and server.artifact_store is not None:
@@ -2228,7 +2231,7 @@ def _make_handler(server, public=False, operator=False):
             r = server.repo
             if resource == "handoffs":
                 body = self._read_json() or {}
-                actor = self._resource_principal()
+                actor = self._principal()
                 if len(parts) == 4:
                     row, replayed = server.handoffs.create(body, actor)
                     return self._json(row, 200 if replayed else 201)

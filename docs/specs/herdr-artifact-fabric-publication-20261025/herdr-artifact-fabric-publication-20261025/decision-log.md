@@ -17,4 +17,4 @@ To resolve from checked-out code and operator config:
 - Tailscale Funnel restrictions on actual installation; whether Funnel is allowed on controlled gateway host and test tailnet.
 - Existing renderer libraries and resource scheduler capabilities.
 - Public endpoint domain/cert policy; no hardcoding of owner's domain or Mac SSH hostname.
-- Target PostgreSQL version must be used to validate the deferrable current-version foreign key in migration `0003_artifact_registry.sql` before deployment.
+- Target PostgreSQL version must be used to validate the deferrable current-version foreign key in migration `0008_artifact_registry.sql` before deployment.

@@ -5,8 +5,8 @@
 1. Build and deploy the current `herdr-engineering` image containing the
    artifact registry, migration files, renderer sandbox, and gateway modules.
 2. Run the control-plane worker migrations through the existing deployment
-   path. Migrations `0003_artifact_registry.sql` through
-   `0006_artifact_acl.sql` are additive.
+   path. Migrations `0008_artifact_registry.sql` through
+   `0012_artifact_acl.sql` are additive.
 3. Confirm the worker reaches healthy state and the web process reports the
    RustFS and PostgreSQL backends as configured.
 4. Keep public exposure disabled until the isolated gateway health check and

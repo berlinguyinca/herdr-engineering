@@ -1,7 +1,6 @@
 from pathlib import Path
 
-
-_MIGRATION = Path(__file__).parents[2] / "deploy" / "control-plane" / "migrations" / "0003_artifact_registry.sql"
+_MIGRATION = Path(__file__).parents[2] / "deploy" / "control-plane" / "migrations" / "0008_artifact_registry.sql"
 
 
 def test_artifact_registry_migration_adds_versioned_authority_tables():

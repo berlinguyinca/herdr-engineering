@@ -49,8 +49,9 @@ def test_handoff_queue_claim_and_tree_are_idempotent():
         status, claimed = call(instance.port, "POST", "/api/v1/handoffs/handoff_123/claim", {})
         assert status == 200
         assert claimed["state"] == "claimed"
-        assert claimed["history"][-1]["actor"] != "spoofed-agent"
-        assert claimed["history"][-1]["actor"].endswith(":operator")
+        actor = claimed["history"][-1]["actor"]
+        assert actor != "spoofed-agent"
+        assert isinstance(actor, dict) and actor.get("authenticated_by") == "api_key"
         status, tree = call(instance.port, "GET", "/api/v1/handoffs/tree")
         assert status == 200
         assert tree["nodes"]

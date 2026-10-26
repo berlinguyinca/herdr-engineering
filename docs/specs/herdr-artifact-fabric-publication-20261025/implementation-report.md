@@ -11,7 +11,7 @@ Spec root: `docs/specs/herdr-artifact-fabric-publication-20261025/herdr-artifact
 - Added the repository integration audit at `audit.md`.
 - Added the executable implementation plan at
   `docs/superpowers/plans/2026-10-25-herdr-artifact-fabric-publication.md`.
-- Added forward-only migration `0003_artifact_registry.sql` for immutable
+- Added forward-only migration `0008_artifact_registry.sql` for immutable
   versions, scoped blobs, idempotency, reviews/comments, dependencies, build
   jobs, append-only audit, and pinned collections.
 - Extended `RustFSClient` with disk-spooled `put_stream` and verified
@@ -29,7 +29,7 @@ Spec root: `docs/specs/herdr-artifact-fabric-publication-20261025/herdr-artifact
   routes fail closed without an explicit `sync_call` adapter.
 - Added a private-by-default publication controller, fake exposure provider,
   delivery-only gateway, approval/revoke/expiry behavior, and publication
-  migrations `0004_artifact_publications.sql`.
+  migrations `0009_artifact_publications.sql`.
 - Added authenticated control-plane publication request/approve/revoke routes,
   artifact catalog/detail routes, and the first dashboard Artifacts view with
   version-history display.
@@ -82,7 +82,7 @@ Spec root: `docs/specs/herdr-artifact-fabric-publication-20261025/herdr-artifact
   replacement, and materialization audit rows.
 - Exposed artifact build-job submit/get/cancel routes and initialized the job
   manager in control-plane startup.
-- Added migration `0005_artifact_binding_context.sql` and extended the existing
+- Added migration `0010_artifact_binding_context.sql` and extended the existing
   binding writer for explicit workspace, room, issue, and commit context.
 - Added a bounded renderer sandbox primitive with executable allowlisting,
   scrubbed environment, timeout, working-directory isolation, and output caps.
@@ -100,7 +100,7 @@ Spec root: `docs/specs/herdr-artifact-fabric-publication-20261025/herdr-artifact
 - Exposed artifact-scoped review request/completion/read routes and added
   review state to the Artifact Studio detail view.
 - Added private-by-default artifact ACL policy with expiring grants, revoke,
-  migration `0006_artifact_acl.sql`, and catalog/detail/download filtering
+  migration `0012_artifact_acl.sql`, and catalog/detail/download filtering
   before aggregation.
 - Added authenticated-guest publication enforcement: guest audiences carry an
   explicit allowlist and the gateway returns 401/403 for missing or unauthorized

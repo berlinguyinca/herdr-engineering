@@ -20,7 +20,7 @@ python -c "import yaml; d=yaml.safe_load(open('lock/upstreams.yaml')); assert 'd
 echo "== pytest =="
 python -m pytest -q
 
-echo "== doctor (json) =="
-herdr-eng doctor --json | python -c "import sys,json; d=json.load(sys.stdin); print('overall:', d['overall'])"
+echo "== doctor (strict json) =="
+herdr-eng doctor --strict --json | python -c "import sys,json; d=json.load(sys.stdin); h=next(c for c in d['checks'] if c['name']=='handoff'); print('overall:', d['overall'], 'handoff:', h['status']); assert h['status']=='ok'"
 
 echo "VALIDATION PASSED"

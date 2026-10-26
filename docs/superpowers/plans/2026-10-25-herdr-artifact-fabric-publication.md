@@ -44,7 +44,7 @@
 ### Task 2: Add forward-only registry/version/blob schema
 
 **Files:**
-- Create: `deploy/control-plane/migrations/0003_artifact_registry.sql`
+- Create: `deploy/control-plane/migrations/0008_artifact_registry.sql`
 - Modify: `deploy/control-plane/migrations/0001_control_plane.sql` only if a compatibility comment/index correction is required; otherwise leave it unchanged.
 - Test: `tests/control_plane/test_db.py`, `tests/control_plane/test_artifact_registry_migration.py`
 
