@@ -746,17 +746,20 @@ def _cmd_cp_feed_pi(args) -> int:
 
     retry_delay = interval if interval > 0 else 1.0
     while True:
-        doc = read_snapshot(args.snapshot)
-        envelopes = snapshot_to_envelopes(doc)
         try:
+            doc = read_snapshot(args.snapshot)
+            envelopes = snapshot_to_envelopes(doc)
             posted = post_envelopes(url, api_key, envelopes)
         except Exception as exc:
             # One-shot mode reports and exits. Continuous mode survives
-            # transient transport/server failures and credential rotation: mark
-            # an auth rejection (so ConfigRefresher refreshes when present),
-            # back off, then refresh config and retry the same snapshot. Retry
-            # whenever interval > 0, even without host config (explicit url+key).
-            if interval <= 0:
+            # transient snapshot-read/transport/server failures and credential
+            # rotation: mark an auth rejection (so ConfigRefresher refreshes
+            # when present), back off, then refresh config and retry the same
+            # snapshot. Retry whenever interval > 0, even without host config
+            # (explicit url+key). Unsupported contract versions are NOT retried:
+            # they are a permanent contract mismatch, not a transient condition.
+            from .control_plane.pi_snapshot import UnsupportedSnapshotVersion
+            if interval <= 0 or isinstance(exc, UnsupportedSnapshotVersion):
                 raise
             if isinstance(exc, IngestAuthRejected) and refresher is not None:
                 refresher.note_auth_rejected()
