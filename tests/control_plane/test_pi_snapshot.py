@@ -63,7 +63,7 @@ def test_snapshot_to_envelopes_maps_mission_fields():
     assert env["event_type"] == "mission.updated"
     p = env["payload"]
     assert p["title"] == "Add health endpoint"
-    assert p["stage"] == "implementation"  # in_progress -> implementation
+    assert p["stage"] == "implementation"  # EXECUTING -> implementation
     # the snapshot goal is carried as the ingest ``purpose`` so the dashboard
     # shows the intended outcome
     assert p["purpose"] == "Expose a /healthz endpoint"
@@ -102,7 +102,7 @@ def test_snapshot_to_envelopes_stopped_mission_stays_incomplete():
     # A durable stop with a resume condition blocks/pauses the mission; it must
     # NOT be presented as complete (codex P2).
     doc = _load_fixture()
-    doc["missions"][0]["status"] = "in_progress"
+    doc["missions"][0]["status"] = "EXECUTING"
     doc["missions"][0]["stop"] = {
         "reason": "awaiting_approval",
         "attemptedRecoveries": 0,
@@ -116,9 +116,22 @@ def test_snapshot_to_envelopes_stopped_mission_stays_incomplete():
 
 def test_snapshot_to_envelopes_maps_complete_status_to_complete_stage():
     doc = _load_fixture()
-    doc["missions"][0]["status"] = "completed"
+    doc["missions"][0]["status"] = "COMPLETE"
     envelopes = snapshot_to_envelopes(doc)
     assert envelopes[0]["payload"]["stage"] == "complete"
+
+
+def test_snapshot_to_envelopes_maps_pi_lifecycle_stages():
+    # Real Pi MissionStatus values must map to the right mission stages.
+    doc = _load_fixture()
+    cases = {"REVIEWING": "review", "FINAL_VALIDATION": "review",
+             "VALIDATING": "testing", "EXECUTING": "implementation",
+             "PLANNING": "planning", "REPAIRING": "implementation",
+             "WAITING_FOR_USER": "review"}
+    for status, expected in cases.items():
+        doc["missions"][0]["status"] = status
+        envelopes = snapshot_to_envelopes(doc)
+        assert envelopes[0]["payload"]["stage"] == expected, status
 
 
 # ---------------------------------------------------------------------------

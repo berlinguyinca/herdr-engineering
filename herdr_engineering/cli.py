@@ -697,21 +697,33 @@ def _cmd_cp_feed_pi(args) -> int:
     import os
     import time
 
-    from .host_config import HostConfigUnavailable, exit_unavailable, host_value, resolve_control_plane
+    from .host_config import (
+        ConfigRefresher, HostConfigUnavailable, exit_unavailable, host_config_or_none,
+        host_value, resolve_control_plane,
+    )
     from .control_plane.pi_snapshot import (
         read_snapshot, snapshot_to_envelopes, post_envelopes,
     )
 
+    # Explicit ``--url`` and ``HERDR_CP_INGEST_KEY`` override host config and are
+    # never re-resolved; otherwise the URL and key follow host.json so a rotated
+    # central key / URL is picked up in continuous mode (codex P2).
+    explicit_url = bool(args.url)
+    explicit_key = bool(os.environ.get("HERDR_CP_INGEST_KEY"))
     try:
         url = resolve_control_plane(args.url)
     except HostConfigUnavailable as exc:
         return exit_unavailable(exc)
-    api_key = os.environ.get("HERDR_CP_INGEST_KEY") or host_value("ingest.api_key")
+    api_key = (os.environ.get("HERDR_CP_INGEST_KEY")
+               or host_value("ingest.api_key") or "")
     if not api_key:
         print("herdr-eng: HERDR_CP_INGEST_KEY is required to post Pi snapshots",
               file=sys.stderr)
         return 2
     interval = max(0.0, float(args.interval))
+    initial_cfg = host_config_or_none()
+    refresher = (None if interval <= 0 or explicit_url or initial_cfg is None
+                 else ConfigRefresher(initial_cfg))
     while True:
         doc = read_snapshot(args.snapshot)
         envelopes = snapshot_to_envelopes(doc)
@@ -721,6 +733,15 @@ def _cmd_cp_feed_pi(args) -> int:
         if interval <= 0:
             return 0
         time.sleep(interval)
+        if refresher is not None:
+            try:
+                cfg = refresher.current()
+            except HostConfigUnavailable as exc:
+                return exit_unavailable(exc)
+            if not explicit_url:
+                url = cfg.control_plane_url
+            if not explicit_key:
+                api_key = cfg.api_key or host_value("ingest.api_key") or ""
 
 
 def _cmd_cp_llm_proxy(args) -> int:

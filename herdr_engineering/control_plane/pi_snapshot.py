@@ -22,6 +22,14 @@ import urllib.error
 import urllib.request
 from typing import Any
 
+# A redirect (301/302/303) from the ingest endpoint to another origin would have
+# urllib's default handler copy the ``X-API-Key`` header into the redirected
+# request, leaking the ingest credential to the redirect target. This client
+# never follows redirects.
+_NO_REDIRECT = urllib.request.HTTPRedirectHandler()
+_NO_REDIRECT.redirect_request = lambda *args, **kwargs: None
+_OPENER = urllib.request.build_opener(_NO_REDIRECT)
+
 log = logging.getLogger(__name__)
 
 SUPPORTED_CONTRACT_VERSIONS = frozenset({1, 2, 3})
@@ -39,20 +47,28 @@ class UnsupportedSnapshotVersion(ValueError):
 
 
 def _stage_from_status(status: str) -> str:
+    """Map a Pi ``MissionStatus`` value onto a control-plane mission stage.
+
+    The snapshot publishes Pi's lifecycle values verbatim (``EXECUTING``,
+    ``REVIEWING``, ``VALIDATING``, ... see pi-engineering/src/orchestration/
+    types.ts), so map them explicitly rather than substring-matching arbitrary
+    free text."""
     if not status:
         return "active"
-    s = status.lower()
-    if s in _COMPLETE_STATUSES:
+    s = status.strip().upper()
+    if s in {"COMPLETE", "COMPLETED", "DONE", "SUCCESS", "SUCCEEDED"}:
         return "complete"
-    if s in _FAILED_STATUSES:
+    if s in {"FAILED", "ERROR", "CANCELED", "CANCELLED"}:
         return "failed"
-    if s in {"review", "in_review", "awaiting_review", "under_review", "pr", "in_pr"}:
+    # Pi lifecycle states (types.ts)
+    if s in {"REVIEWING", "FINAL_VALIDATION", "WAITING_FOR_USER", "PR"}:
         return "review"
-    if s in {"testing", "in_testing", "running_tests"}:
+    if s in {"VALIDATING", "INTEGRATING", "TESTING"}:
         return "testing"
-    if s in {"implementing", "implementation", "in_progress", "in_progress", "working"}:
+    if s in {"EXECUTING", "REPAIRING", "STARTING", "QUEUED", "NEW", "CLASSIFYING",
+              "IN_PROGRESS", "WORKING", "IMPLEMENTATION"}:
         return "implementation"
-    if s in {"planning", "specification", "ready", "planning", "spec"}:
+    if s in {"PLANNING", "SPECIFICATION", "READY", "SPEC"}:
         return "planning"
     return "active"
 
@@ -120,7 +136,7 @@ def post_envelopes(base_url: str, api_key: str, envelopes: list[dict],
             url, data=body, method="POST",
             headers={"Content-Type": "application/json", "X-API-Key": api_key})
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
+            with _OPENER.open(req, timeout=timeout) as resp:
                 if resp.status not in expected:
                     raise ValueError(f"ingest returned HTTP {resp.status}")
                 posted += 1
