@@ -37,7 +37,7 @@ import json
 import logging
 import os
 import re
-import select
+import selectors
 import shutil
 import socket
 import subprocess
@@ -391,14 +391,16 @@ class ListenerGitMetadata:
             process = subprocess.Popen([executable, *args], cwd=cwd, env=env,
                                        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
             raw = bytearray()
-            while len(raw) <= 4096:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0 or not select.select([process.stdout], [], [], remaining)[0]:
-                    return None
-                chunk = os.read(process.stdout.fileno(), 4097 - len(raw))
-                if not chunk:
-                    break
-                raw.extend(chunk)
+            with selectors.DefaultSelector() as selector:
+                selector.register(process.stdout, selectors.EVENT_READ)
+                while len(raw) <= 4096:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0 or not selector.select(remaining):
+                        return None
+                    chunk = os.read(process.stdout.fileno(), 4097 - len(raw))
+                    if not chunk:
+                        break
+                    raw.extend(chunk)
             if len(raw) > 4096 or process.wait(timeout=max(0.01, deadline - time.monotonic())) != 0:
                 return None
             return raw.decode("utf-8").strip()
