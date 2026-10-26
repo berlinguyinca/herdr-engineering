@@ -65,6 +65,25 @@ _REPORT_FIELDS = ('provider_url', 'provider_repo_id', 'repository', 'run_number'
                   'revision', 'branch', 'reported_at', 'ingested_at')
 _COUNTS = ('passed', 'failed', 'errored', 'skipped', 'total', 'duration_ms')
 _FILTERS = ('provider_url', 'provider_repo_id', 'repository', 'branch')
+_PIPELINE_OUTCOMES = {
+    state: outcome
+    for outcome, states in (
+        ('success', ('success', 'passed')),
+        ('failure', ('failure', 'failed', 'error', 'errored', 'timed_out', 'crashed')),
+        ('running', ('running', 'started')),
+        ('queued', ('queued', 'pending', 'waiting')),
+        ('skipped', ('skipped',)),
+        ('blocked', ('blocked',)),
+        ('canceled', ('canceled', 'cancelled', 'killed', 'declined')),
+    )
+    for state in states
+}
+
+
+def pipeline_outcome(row):
+    """Keep untrusted provider states out of aggregate keys without dropping runs."""
+    state = row.get('state') or row.get('status')
+    return _PIPELINE_OUTCOMES.get(state, 'unknown') if isinstance(state, str) else 'unknown'
 
 
 def run_in_scope(row, scope, default_branch=None):

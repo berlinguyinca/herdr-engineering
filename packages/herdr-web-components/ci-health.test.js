@@ -18,6 +18,24 @@ test('calendar modes include UTC today and last-runs ignores date cutoff after f
  const m=ciHealthModel(history(old),{mode:'runs'},now);assert.equal(m.projects[0].runs.length,24);assert.equal(m.projects[0].cells.length,24);assert.equal(m.projects[0].cells.at(-1).runs.length,1);
  const sparse=ciHealthModel(history([old[5]]),{mode:'runs'},now);assert.equal(sparse.projects[0].cells[0].runs.length,0);assert.equal(sparse.projects[0].cells.at(-1).runs.length,1);
 });
+test('selected current UTC day keeps calendar bounds and includes new runs after refresh',()=>{
+ const data=history([run(1,'failure',{created_at:'2026-10-22T12:00:00Z'}),run(2,'success',{created_at:'2026-10-22T13:00:00Z'}),run(3,'success',{created_at:'2026-10-23T00:00:00Z'})]);
+ for(const mode of ['7','14','30']) {
+  const first=ciHealthModel(data,{mode},now),project=first.projects[0],cell=project.cells.at(-1);
+  assert.deepEqual(cell.runs.map(r=>r.run_number),[1]);
+  assert.equal(cell.start,Date.parse('2026-10-22T00:00:00Z'));
+  assert.equal(cell.end,Date.parse('2026-10-23T00:00:00Z'));
+  const selection={projectKey:project.key,bucketKey:cell.key};
+  const refreshed=ciHealthModel(data,{mode,selection},Date.parse('2026-10-22T14:00:00Z'));
+  assert.deepEqual(refreshed.selectedRows.map(r=>r.run_number),[1,2]);
+  assert.equal(refreshed.projects[0].cells.at(-1).end,cell.end);
+  const midnight=ciHealthModel(data,{mode,selection},Date.parse('2026-10-23T00:00:00Z'));
+  assert.deepEqual(midnight.selectedRows.map(r=>r.run_number),[1,2]);
+  assert.deepEqual(midnight.projects[0].cells.at(-1).runs.map(r=>r.run_number),[3]);
+  const tomorrow=ciHealthModel(data,{mode,selection},Date.parse('2026-10-23T01:00:00Z'));
+  assert.deepEqual(tomorrow.selectedRows.map(r=>r.run_number),[1,2]);
+ }
+});
 test('deduplicates provider identities without conflating providers or repository ids',()=>{
  const m=ciHealthModel(history([run(1,'running'),run(1,'success'),run(1,'failure',{provider_url:'https://other'}),run(1,'failure',{provider_repo_id:2,repository:'org/app2'})],{repos:[repo(),repo(1,{provider_url:'https://other'}),repo(2)]}),{scope:'all'},now);
  assert.equal(m.projects.length,3);assert.equal(m.selectedRows.length,3);assert.equal(new Set(m.selectedRows.map(r=>r.runKey)).size,3);assert.equal(m.counts.running,0);

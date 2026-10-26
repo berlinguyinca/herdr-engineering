@@ -1883,6 +1883,7 @@ class ControlPlaneRepo:
         from .ci_observability import (
             CIObservationStore,
             _identity,
+            pipeline_outcome,
             run_in_scope,
             run_in_window,
             run_window,
@@ -1966,14 +1967,13 @@ class ControlPlaneRepo:
             daily.setdefault(day, []).append(row)
 
         def metrics(values):
-            counts = Counter(row.get('state') or row.get('status') or 'unknown' for row in values)
-            success = counts['success'] + counts['passed']
-            failed = sum(counts[state] for state in ('failure', 'failed', 'error', 'errored', 'timed_out', 'crashed'))
+            counts = Counter(pipeline_outcome(row) for row in values)
+            success = counts['success']
+            failed = counts['failure']
             completed = success + failed
             durations = []
             for row in values:
-                if (row.get('state') or row.get('status')) not in (
-                        'success', 'passed', 'failure', 'failed', 'error', 'errored', 'timed_out', 'crashed'):
+                if pipeline_outcome(row) not in ('success', 'failure'):
                     continue
                 begin, end = (_timestamp(row.get(field)) for field in ('started_at', 'finished_at'))
                 if begin is not None and end is not None and end >= begin:
@@ -1983,7 +1983,7 @@ class ControlPlaneRepo:
                         pass_rate=success / completed if completed else None,
                         failure_rate=failed / completed if completed else None,
                         active_count=sum(counts[state] for state in
-                                         ('running', 'started', 'pending', 'queued', 'waiting', 'blocked')),
+                                         ('running', 'queued', 'blocked')),
                         duration_seconds=_stats(durations))
 
         projects = []

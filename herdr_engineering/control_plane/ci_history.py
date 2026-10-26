@@ -13,7 +13,7 @@ import time
 from collections import Counter, deque
 from datetime import UTC, datetime, timedelta
 
-from .ci_observability import _Measurements
+from .ci_observability import _Measurements, pipeline_outcome
 from .redact import redact_payload
 
 
@@ -199,7 +199,7 @@ class CIHistory:
                 {'provider_url': self._provider_url, 'provider_repo_id': repo['id'],
                  'repository': repo['repository'],
                  'pipeline_count': len(self._states[str(repo['id'])]['rows']),
-                 'outcomes': dict(Counter(row.get('state') or row.get('status') or 'unknown'
+                 'outcomes': dict(Counter(pipeline_outcome(row)
                                          for row in self._states[str(repo['id'])]['rows'].values()))}
                 for repo in repos]
             self._update(available=True, status='partial' if partial else 'syncing' if pending else 'connected',

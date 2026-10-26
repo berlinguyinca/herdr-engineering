@@ -526,6 +526,22 @@ def test_compact_summary_is_stable_detached_and_does_not_copy_pipeline_rows():
     assert cache.summary_snapshot(start=False)['projects']
 
 
+def test_compact_provider_summary_uses_safe_outcome_keys_without_losing_unknown_runs():
+    import json
+
+    credential = 'Z9q7V2m4R8t6N3p5L1w0'
+    states = [credential, f'provider-error-{credential}', 'unknown', 'passed', 'blocked']
+    provider = MemoryProvider([{**row, 'state': state}
+                               for row, state in zip(runs(5), states, strict=True)])
+    cache = history(provider)
+    cache.refresh()
+    view = cache.summary_snapshot(start=False)
+    assert credential not in json.dumps(view)
+    assert view['projects'][0]['outcomes'] == {'unknown': 3, 'success': 1, 'blocked': 1}
+    assert view['projects'][0]['pipeline_count'] == 5
+    assert [row['state'] for row in provider.rows] == states
+
+
 def test_slow_history_returns_with_last_valid_rows_stale_and_no_late_publication():
     import threading
 

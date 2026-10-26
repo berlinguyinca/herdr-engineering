@@ -64,7 +64,8 @@ function windows(mode,now) {
  const hour=3600000,day=86400000;
  if(mode==='hours') {const result=[];let start=now-day;while(start<now){const end=Math.min(now,(Math.floor(start/hour)+1)*hour);result.push({key:`hour:${Math.floor(start/hour)*hour}`,label:iso(start).slice(11,16),start,end});start=end;}return result;}
  const today=Math.floor(now/day)*day;
- return Array.from({length:Number(mode)},(_,i)=>{const start=today-(Number(mode)-1-i)*day;return {key:`day:${iso(start).slice(0,10)}`,label:iso(start).slice(0,10),start,end:Math.min(start+day,now)};});
+ // Selection carries stable calendar bounds; run membership is capped at now below.
+ return Array.from({length:Number(mode)},(_,i)=>{const start=today-(Number(mode)-1-i)*day;return {key:`day:${iso(start).slice(0,10)}`,label:iso(start).slice(0,10),start,end:start+day};});
 }
 function makeCell(bucket,runs,complete) {
  const c=counts(runs),state=c.failure?(c.success?'mixed':'failure'):c.success?'success':c.running||c.queued?'active':runs.length?'neutral':complete?'empty':'incomplete';
@@ -95,7 +96,7 @@ export function ciHealthModel(history={},options={},now=Date.now()) {
   const since=time(coverage.complete_since),exhausted=coverage.exhausted===true;
   const completeAt=start=>!scopeUnavailable&&!unknownTimestamps&&(exhausted||Number.isFinite(since)&&since<=start);
   const runComplete=!scopeUnavailable&&!unknownTimestamps&&(exhausted||runs.length>=24&&completeAt(runs[0].timestamp));
-  const cells=buckets.map((bucket,i)=>{if(mode==='runs'){const offset=24-runs.length,row=runs[i-offset];return makeCell(row?{...bucket,key:`run:${row.runKey}`}:bucket,row?[row]:[],runComplete);}return makeCell(bucket,runs.filter(row=>row.timestamp>=bucket.start&&(row.timestamp<bucket.end||row.timestamp===now&&bucket.end===now)),completeAt(bucket.start));});
+  const cells=buckets.map((bucket,i)=>{if(mode==='runs'){const offset=24-runs.length,row=runs[i-offset];return makeCell(row?{...bucket,key:`run:${row.runKey}`}:bucket,row?[row]:[],runComplete);}return makeCell(bucket,runs.filter(row=>row.timestamp>=bucket.start&&(row.timestamp<bucket.end||mode==='hours'&&row.timestamp===now&&bucket.end===now)),completeAt(bucket.start));});
   const identity=`${repository} · ${instance(repo)||'Provider unavailable'} #${repoId(repo)}`;
   projects.push({key,repo,repository,label:labels.get(key),identity,runs,cells,counts:counts(runs),complete:cells.every(cell=>cell.complete),scopeUnavailable,coverage,unknownTimestamps});
  }

@@ -305,3 +305,43 @@ test('shared selection clears a bucket when Runs switches the exact project',()=
  assert.equal(await page.evaluate(()=>calls.find(([kind,o])=>kind==='tests'&&o.repository==='org/former')[1].start??null),null);
  assert.equal(await page.locator('[data-health-clear]').count(),0);
 }));
+
+test('selected current-day bucket stays shared by Health, Tests and Runs after clock advance',()=>reviewPage(async page=>{
+ await page.clock.setFixedTime(new Date('2026-10-25T12:30:00Z'));
+ await page.evaluate(()=>{
+  runs=[{...runs[0],created_at:'2026-10-25T12:00:00Z'},
+   {...runs[0],run_number:9,created_at:'2026-10-25T13:00:00Z'},
+   {...runs[0],run_number:10,created_at:'2026-10-25T15:00:00Z'},
+   {...runs[0],run_number:11,created_at:'2026-10-26T00:00:00Z'}];
+  const reports=client.getCiReports;
+  client.getCiReports=async options=>{const result=await reports(options);return {...result,reports:result.reports.map(r=>({...r,reported_at:r.created_at}))};};
+  mount();
+ });
+ await page.locator('[data-ob-project]').filter({hasText:'org/current'}).click();
+ await page.locator('[data-health-bucket="day:2026-10-25"]').click();
+ await page.waitForFunction(()=>calls.some(([kind,o])=>kind==='tests'&&o.start));
+ const initial=await page.evaluate(()=>calls.findLast(([kind,o])=>kind==='tests')[1]);
+ await page.locator('[data-ci-workspace="tests"]').click();
+ assert.match(await page.locator('[data-ci-insights]').textContent(),/1 retained runs · 1 test report attempts/);
+ await page.locator('[data-ci-workspace="health"]').click();
+ await page.locator('[data-health-tree] [data-health-disclosure] > summary').first().click();
+ await page.locator('[data-health-tree] [data-health-disclosure] [data-health-disclosure] > summary').first().click();
+ await page.locator('[data-health-tree] [data-health-run]').waitFor();
+ assert.equal(await page.locator('[data-health-tree] [data-health-run]').count(),1);
+
+ await page.clock.setFixedTime(new Date('2026-10-25T14:00:00Z'));
+ await page.evaluate(()=>{calls=[];app.refresh();});
+ await page.waitForFunction(()=>document.querySelectorAll('[data-health-tree] [data-health-run]').length===2);
+ await page.waitForFunction(()=>calls.some(([kind,o])=>kind==='tests'&&o.start));
+ const refreshed=await page.evaluate(()=>calls.filter(([kind])=>kind==='tests'||kind==='summary').map(([,o])=>[o.start,o.end]));
+ assert.ok(refreshed.length>=3);
+ for(const bounds of refreshed)assert.deepEqual(bounds,[initial.start,initial.end]);
+ await page.locator('[data-ci-workspace="tests"]').click();
+ assert.match(await page.locator('[data-ci-insights]').textContent(),/2 retained runs · 2 test report attempts/);
+ await page.locator('[data-ci-workspace="runs"]').click();await page.locator('[data-tab="failed"]').click();
+ assert.equal(await page.locator('#ig-results [data-run]').count(),2);
+ assert.match(await page.locator('#ig-results').textContent(),/Run #9/);
+ assert.doesNotMatch(await page.locator('#ig-results').textContent(),/Run #1[01]/);
+ assert.deepEqual([initial.start,initial.end],['2026-10-25T00:00:00.000Z','2026-10-26T00:00:00.000Z']);
+ await page.evaluate(()=>app.dispose());
+}));
