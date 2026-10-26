@@ -13,9 +13,11 @@ durable Postgres/RustFS path (Phase 1 async stores) is bridged in deployment.
 from __future__ import annotations
 
 import copy
+import datetime as _dt
 import hashlib
 import json
 import logging
+import math
 import re
 import threading
 import time
@@ -180,10 +182,18 @@ class ControlPlaneRepo:
         self._test_runs = {}
         self._reviews = {}
         self._pull_requests = {}
+        self._stage_runs = {}  # mission_key -> [open+closed stage runs, ...]
+        self._token_usage = {}  # request_id -> token usage record (issue #36)
+        self._resource_usage = {}  # (mission_id, kind) -> [resource usage record, ...]
         self._telemetry = {}  # host_id -> [sample, ...]
         self._events = {}  # (entity_type, entity_id) -> [event, ...]
         self._event_order = []  # (entity_type, entity_id, seq) chronological
+        # Rebuilding delivery projections replays stored events into the upsert
+        # methods, which would otherwise re-record the very events being rebuilt.
+        self._suppress_record_events = False
         self._ci_sequence = 0  # one bounded counter survives stream eviction
+        self._ci_history_truncated = set()
+        self._ci_test_projection = None
         # Envelope v2 idempotency / sequence / freshness state (envelope.py).
         self.ledger = SourceLedger(now=self._now, persist=self._persist_source_state)
         self._listeners = set()  # pub/sub for the SSE live stream (Spec §52)
@@ -267,7 +277,7 @@ class ControlPlaneRepo:
         if rec is None:
             return None
         rec = _copy(rec)
-        rec["telemetry_state"] = self._mission_telemetry_state(
+        rec["telemetry_state"], rec["report_age_seconds"] = self._mission_telemetry_state(
             rec.get("mission_key") or rec["mission_id"])
         return rec
 
@@ -292,12 +302,15 @@ class ControlPlaneRepo:
             return mission_id
         return None
 
-    def _mission_telemetry_state(self, mission_key: str) -> str:
-        """Derive live/stale/unknown from the bounded mission-activity read model.
+    def _mission_telemetry_state(self, mission_key: str) -> tuple:
+        """Return (telemetry_state, report_age_seconds) from the activity store.
 
-        This reflects *collection* freshness of the Pi transport, never worker
-        health: a mission with no collector is ``unknown``, not stalled. It reuses
-        the real freshness the activity store already computes (issue #28); no
+        telemetry_state is ``live``/``stale``/``unknown`` reflecting *collection*
+        freshness of the Pi transport, never worker health: a mission with no
+        collector is ``unknown``, not stalled. report_age_seconds is the age of the
+        most recent activity report (the stall age) or ``None`` when there is no
+        collector, so the UI never fabricates a liveness reading. Both reuse the
+        real freshness the activity store already computes (issue #28); no
         fabricated heartbeat is ever invented.
         """
         try:
@@ -305,19 +318,21 @@ class ControlPlaneRepo:
         except Exception:  # noqa: BLE001 - one unreadable entry never hides the rest
             live = None
         if not live:
-            return "unknown"
-        state = (live.get("freshness") or {}).get("state")
+            return "unknown", None
+        freshness = live.get("freshness") or {}
+        state = freshness.get("state")
+        age = freshness.get("age_seconds")
         if state in ("live", "updating"):
-            return "live"
+            return "live", age
         if state in ("stale", "disconnected"):
-            return "stale"
-        return "unknown"
+            return "stale", age
+        return "unknown", age
 
     def list_missions(self, status=None):
         out = []
         for m in self._missions.values():
             rec = _copy(m)
-            rec["telemetry_state"] = self._mission_telemetry_state(
+            rec["telemetry_state"], rec["report_age_seconds"] = self._mission_telemetry_state(
                 rec.get("mission_key") or rec["mission_id"])
             out.append(rec)
         if status:
@@ -337,6 +352,7 @@ class ControlPlaneRepo:
         m["updated_at"] = self._stamp()
         self.record_event("mission", key, "MissionStageChanged",
                           {"from": old, "to": stage}, mission_id=mission_id)
+        self._transition_stage(key, old, stage)
         self._mission_stage_changed(key, old, stage)
 
     def _mission_stage_changed(self, key, old, new):
@@ -348,6 +364,73 @@ class ControlPlaneRepo:
             outcomes.on_stage(key, old, new)
         except Exception:  # noqa: BLE001
             pass
+
+    def _transition_stage(self, mission_key, old, new, when=None):
+        """Record a stage run: close the open run (if any) and open the next.
+
+        Stage durations are derived purely from stage transitions (issue #37).
+        The first observed transition opens the incoming stage's run; a later
+        transition closes the previously open run (``ended_at``/``duration_ms``)
+        and opens the new one. A stage change that repeats the current stage is
+        a no-op so a re-emitted event never truncates an open run.
+
+        ``when`` is the transition timestamp (an ISO string); it defaults to the
+        current clock so live transitions use wall time and event-only replays
+        can supply each event's stored ``source_timestamp``.
+        """
+        if old == new:
+            return
+        now = when or self._stamp()
+        runs = self._stage_runs.setdefault(mission_key, [])
+        if runs and runs[-1].get("ended_at") is None:
+            prev = runs[-1]
+            prev["ended_at"] = now
+            prev["duration_ms"] = max(0, int(
+                (self._epoch_ms(now) - self._epoch_ms(prev["started_at"]))))
+        runs.append({
+            "mission_id": mission_key, "stage": new,
+            "started_at": now, "ended_at": None, "duration_ms": None,
+        })
+
+    @staticmethod
+    def _epoch_ms(iso: str) -> int:
+        return int(_dt.datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp() * 1000)
+
+    def stage_analytics(self):
+        """p50/p95 duration per stage plus the bottleneck stage (issue #37).
+
+        Only closed runs contribute to percentiles; the currently open run of a
+        mission appears under ``in_progress`` and never in a percentile.
+        Bottleneck = stage with the largest total closed-run duration, ties
+        broken by stage name.
+        """
+        closed = {}   # stage -> [duration_ms, ...]
+        total = {}    # stage -> sum(duration_ms)
+        in_progress = {}
+        for mission, runs in self._stage_runs.items():
+            for run in runs:
+                stage = run.get("stage")
+                if run.get("ended_at") is None:
+                    in_progress.setdefault(mission, []).append(stage)
+                    continue
+                dur = run.get("duration_ms")
+                if dur is None:
+                    continue
+                closed.setdefault(stage, []).append(dur)
+                total[stage] = total.get(stage, 0) + dur
+        stages = {}
+        for stage, durations in closed.items():
+            srt = sorted(durations)
+            stages[stage] = {
+                "p50_ms": _percentile(srt, 50),
+                "p95_ms": _percentile(srt, 95),
+                "runs": len(durations),
+            }
+        bottleneck = None
+        if total:
+            bottleneck = max(sorted(total), key=lambda s: total[s])
+        return {"stages": stages, "bottleneck": bottleneck,
+                "in_progress": in_progress}
 
     # -------------------------------------------------------------- sessions
     def create_session(self, mission_id=None, agent_role="", model="",
@@ -1177,6 +1260,7 @@ class ControlPlaneRepo:
                            "commit_sha": existing.get("commit_sha")},
                           mission_id=mission_id)
         if stage:
+            self._transition_stage(key, previous_stage, stage)
             self._mission_stage_changed(key, previous_stage, stage)
         return _copy(existing)
 
@@ -1646,7 +1730,9 @@ class ControlPlaneRepo:
             records = [copy.deepcopy(stream[-1]['payload'])
                        for (kind, _), stream in self._events.items()
                        if kind == 'ci_telemetry' and stream]
-            pipelines = self.ci_reports()['pipelines']
+            pipelines = [copy.deepcopy(stream[-1]['payload'])
+                         for (kind, _), stream in self._events.items()
+                         if kind == 'ci_observation' and stream]
             if inventory is not None:
                 from .project_links import annotate_ci_history
                 # Resolve inventory identities before calculating group membership.
@@ -1658,19 +1744,31 @@ class ControlPlaneRepo:
                                persistence='durable_sink' if self._sink is not None else 'memory_only',
                                repository=repository, branch=branch, days=days)
 
-    def ingest_ci_report(self, body):
-        from .ci_reports import normalize_report, reconcile_report_identities
+    def ingest_ci_report(self, body, *, redact=None):
+        from .ci_reports import matches_legacy_report, normalize_report, reconcile_report_identities
         with self._event_lock:
-            report = normalize_report(body, self._stamp())
+            report = normalize_report(body, self._stamp(), redact=redact)
             existing = self._events.get(("ci_report", report["report_id"]))
             if existing:
                 return copy.deepcopy(existing[-1]["payload"])
+            # Recompute the historical hash from the raw upload, not truncated
+            # or redacted case labels. A match returns the original receipt and
+            # never promotes missing legacy file/provider evidence to certainty.
+            if report.get('provider_url') is None and any(
+                    kind == 'ci_report' and stream and
+                    stream[-1]['payload'].get('identity_version', 1) == 1
+                    for (kind, _), stream in self._events.items()):
+                legacy = normalize_report(body, report['reported_at'], redact=redact,
+                                          _identity_version=1)
+                existing = self._events.get(('ci_report', legacy['report_id']))
+                if existing and matches_legacy_report(existing[-1]['payload'], legacy):
+                    return copy.deepcopy(existing[-1]['payload'])
             history = self.ci_reports()
             projected = copy.deepcopy(report)
             reconcile_report_identities([projected], history["pipelines"])
             attempts = [row.get("attempt", 1) for row in history["reports"]
-                        if (row.get("repository"), str(row.get("provider_repo_id")), row.get("run_number")) ==
-                           (projected["repository"], str(projected["provider_repo_id"]), projected["run_number"])]
+                        if (row.get("provider_url"), row.get("repository"), str(row.get("provider_repo_id")), row.get("run_number")) ==
+                           (projected.get("provider_url"), projected["repository"], str(projected["provider_repo_id"]), projected["run_number"])]
             report["attempt"] = max(attempts, default=0) + 1
             report["ingested_at"] = self._stamp()
             self.record_event("ci_report", report["report_id"], "CITestReportReceived", report,
@@ -1679,8 +1777,14 @@ class ControlPlaneRepo:
             return copy.deepcopy(report)
 
     def observe_ci_pipeline(self, row):
+        from .ci_reports import normalize_provider_url
+        if row.get('provider_url') is not None:
+            row = {**row, 'provider_url': normalize_provider_url(row['provider_url'])}
         row = redact_payload(copy.deepcopy(row))
         key = f"{row.get('provider_repo_id') or row.get('repository')}:{row.get('run_number')}"
+        if row.get('provider_url') is not None:
+            key = json.dumps([row['provider_url'], str(row.get('provider_repo_id')),
+                              row.get('repository'), row.get('run_number')], separators=(',', ':'))
         with self._event_lock:
             previous = self._events.get(("ci_observation", key), [])
             if previous and previous[-1]["payload"] == row:
@@ -1690,6 +1794,7 @@ class ControlPlaneRepo:
             self._trim_ci_history("ci_observation")
 
     def _trim_ci_history(self, kind=None):
+        from .ci_observability import _identity
         from .ci_performance import RECORD_LIMIT
         from .ci_reports import HISTORY_BYTES, PIPELINE_LIMIT, REPORT_LIMIT
         keep = set()
@@ -1707,6 +1812,21 @@ class ControlPlaneRepo:
             keys.sort(key=lambda key: (self._events[key][-1].get("ingest_timestamp", ""),
                                       arrivals.get((*key, self._events[key][-1]["sequence"]), -1)),
                       reverse=True)
+            if kind == 'ci_observation' and any(not key[1].startswith('[') for key in keys):
+                # Upgrade may retain a legacy "repo_id:run" stream alongside
+                # a new provider-scoped stream. Supersede only exact full
+                # identities, newest first; missing provider identity stays
+                # unresolved. Journal events themselves are never rewritten.
+                seen, unique = set(), []
+                for key in keys:
+                    identity = _identity(self._events[key][-1]['payload'])
+                    if identity is not None and identity in seen:
+                        del self._events[key]
+                    else:
+                        unique.append(key)
+                        if identity is not None:
+                            seen.add(identity)
+                keys = unique
             size = 0
             for key in keys[:limit]:
                 latest = self._events[key][-1]
@@ -1717,13 +1837,15 @@ class ControlPlaneRepo:
                 keep.add(key)
             for key in keys:
                 if key not in keep:
+                    self._ci_history_truncated.add(kind)
                     del self._events[key]
         self._event_order = [entry for entry in self._event_order
                              if entry[0] not in kinds
                              or ((entry[0], entry[1]) in keep and
                                  entry[2] == self._events[(entry[0], entry[1])][-1]["sequence"])]
 
-    def ci_reports(self):
+    def ci_reports(self, *, compact=False, run=None):
+        from .ci_observability import _PIPELINE_FIELDS, _REPORT_FIELDS, bind_report_provider
         from .ci_reports import HISTORY_BYTES, PIPELINE_LIMIT, REPORT_LIMIT
         with self._event_lock:
             arrivals = {tuple(entry): index for index, entry in enumerate(self._event_order)}
@@ -1732,17 +1854,379 @@ class ControlPlaneRepo:
                           if etype == kind and stream]
                 events.sort(key=lambda event: (event.get("ingest_timestamp", ""), arrivals.get(
                     (event["entity_type"], event["entity_id"], event["sequence"]), -1)), reverse=True)
-                return [copy.deepcopy(event["payload"]) for event in events]
-            reports, pipelines = rows("ci_report"), rows("ci_observation")
+                payloads = [event['payload'] for event in events]
+                if kind == 'ci_report' and run is not None:
+                    payloads = [row for row in payloads
+                                if (bound := bind_report_provider(row, pipelines)) and all(
+                                    str(bound.get(key)) == str(value) for key, value in run.items())]
+                if compact:
+                    fields = ((*_REPORT_FIELDS, 'report_id', 'summary', 'attempt') if kind == 'ci_report'
+                              else (*_PIPELINE_FIELDS, 'event', 'ref', 'url', 'coverage', 'stale',
+                                    'project_id', 'language', 'mission_id', 'mission_key', 'session_id'))
+                    payloads = [{key: row[key] for key in fields if key in row} for row in payloads]
+                return copy.deepcopy(payloads)
+            pipelines = rows("ci_observation")
+            reports = rows("ci_report")
             from .ci_reports import reconcile_report_identities
             reconcile_report_identities(reports, pipelines)
+            if compact:
+                reports = [bind_report_provider(row, pipelines) for row in reports]
             return {"reports": reports, "pipelines": pipelines,
                     "scope": {"kind": "retained_observations", "complete": False,
+                              "truncated": bool(self._ci_history_truncated & {"ci_report", "ci_observation"}),
                               "persistence": "durable_sink" if self._sink is not None else "memory_only",
                               "report_limit": REPORT_LIMIT, "pipeline_limit": PIPELINE_LIMIT,
                               "byte_limit_per_kind": HISTORY_BYTES,
                               "report_count": len(reports), "pipeline_count": len(pipelines),
+                              "test_details": "omitted" if compact else "included",
                               "description": "Uploaded test reports and observed provider runs only; missing reports do not mean zero tests."}}
+
+    def ci_test_history(self, repository=None, branch=None, test=None, days=30, *,
+                        provider_url=None, provider_repo_id=None, scope='all', start=None, end=None,
+                 mode='days', run_number=None,
+                        pipelines=(), inventory=()):
+        """Reuse compact projections until retained report/observation events change.
+
+        Cache only one bounded store, not arbitrary filter/window responses. Reads
+        reapply the current clock and filters; imports, eviction, new attempts and
+        changed provider bindings invalidate the source signature.
+        """
+        from datetime import UTC, datetime
+
+        from .ci_observability import (
+            _REPORT_FIELDS,
+            CIObservationStore,
+            _identity,
+            bind_report_provider,
+            project_report,
+        )
+        from .ci_performance import _timestamp
+
+        with self._event_lock:
+            events = [stream[-1] for (kind, _), stream in self._events.items()
+                      if kind in ('ci_report', 'ci_observation') and stream]
+            signature = tuple((event['entity_type'], event['entity_id'], event['sequence'])
+                              for event in events)
+            if self._ci_test_projection is None or self._ci_test_projection[0] != signature:
+                arrivals = {tuple(entry): index for index, entry in enumerate(self._event_order)}
+                events.sort(key=lambda event: (event.get('ingest_timestamp', ''), arrivals.get(
+                    (event['entity_type'], event['entity_id'], event['sequence']), -1)))
+                observed_pipelines = [event['payload'] for event in events if event['entity_type'] == 'ci_observation']
+                store = CIObservationStore(wall_now=lambda: datetime.fromtimestamp(self._now(), UTC))
+                for row in observed_pipelines:
+                    store.record_pipeline(row)
+                previous = self._ci_test_projection[3] if self._ci_test_projection else {}
+                projections, unjoined = {}, []
+                for event in events:
+                    if event['entity_type'] != 'ci_report':
+                        continue
+                    row = bind_report_provider(event['payload'], observed_pipelines)
+                    source = (event['entity_id'], event['sequence'], _identity(row))
+                    projection = previous[source] if source in previous else project_report(row)
+                    projections[source] = projection
+                    if not store._record_report_projection(projection):
+                        unjoined.append({key: row.get(key) for key in _REPORT_FIELDS})
+                self._ci_test_projection = (signature, store, unjoined, projections)
+            _, store, unjoined, _ = self._ci_test_projection
+            view = store.test_summary(repository=repository, branch=branch, test=test, days=days,
+                                      provider_url=provider_url, provider_repo_id=provider_repo_id,
+                                      scope=scope, start=start, end=end, mode=mode, run_number=run_number,
+                                      pipelines=pipelines, inventory=inventory)
+            now = self._now()
+            unjoined_count = sum(
+                (repository is None or row['repository'] == repository) and
+                (branch is None or row['branch'] == branch) and
+                (provider_url is None or (row.get('provider_url') or '').rstrip('/') == provider_url) and
+                (provider_repo_id is None or str(row.get('provider_repo_id')) == str(provider_repo_id)) and
+                (stamp := _timestamp(row.get('reported_at'))) is not None and
+                now - days * 86400 <= stamp <= now for row in unjoined
+                if mode == 'days' and run_number is None and scope == 'all' and start is None and end is None)
+            source_truncated = bool(self._ci_history_truncated & {'ci_report', 'ci_observation'})
+            view['scope'].update(persistence='durable_sink' if self._sink is not None else 'memory_only',
+                                 memory_only=self._sink is None,
+                                 source_truncated=source_truncated,
+                                 projection_truncated=view['scope']['truncated'],
+                                 truncated=source_truncated or view['scope']['truncated'],
+                                 unjoined_report_count=unjoined_count)
+            if provider_url is not None or provider_repo_id is not None:
+                view['scope'].update(provider_url=provider_url, provider_repo_id=provider_repo_id)
+            return view
+
+    def ci_summary(self, *, pipelines=(), inventory=(), cached=None, days=14,
+                   repository=None, branch=None, scope='all', provider_url=None,
+                   provider_repo_id=None, start=None, end=None, mode='days', run_number=None):
+        """Windowed aggregates of cached history and durable observations, never I/O.
+
+        The durable store keeps its existing 2,000-run bound; history's separate
+        20,000-run budget is aggregated in place rather than silently truncated
+        to the durable store's limit. Exact duplicate runs prefer cached history.
+        """
+        from collections import Counter
+        from datetime import UTC, datetime
+
+        from .ci_observability import (
+            CIObservationStore,
+            _identity,
+            pipeline_outcome,
+            run_in_scope,
+            run_window,
+            select_run_window,
+        )
+        from .ci_performance import _iso, _stats, _timestamp
+
+        cached = cached or {}
+        now = self._now()
+        # Match the heatmap and run list: UTC calendar days including today.
+        window_start, window_end = run_window(now, days, start, end, mode)
+        store = CIObservationStore()
+        with self._event_lock:
+            retained = [stream[-1]['payload'] for (kind, _), stream in self._events.items()
+                        if kind == 'ci_observation' and stream]
+            source_truncated = 'ci_observation' in self._ci_history_truncated
+        for row in retained:
+            store.record_pipeline(row)
+        observed = store.summary()
+        # Event/ref are not part of the observation store projection; retain
+        # only those scope fields from the same exact durable observation.
+        metadata = {_identity(row): row for row in retained}
+        rows = [dict(row, **{key: metadata.get(_identity(row), {}).get(key)
+                            for key in ('event', 'ref')}) for row in observed['pipelines']]
+        rows.extend(pipelines)
+        identities, runs, unjoined = {}, {}, 0
+        for row in rows:
+            key = (row.get('provider_url'), str(row.get('provider_repo_id')), row.get('repository'))
+            if key not in identities:
+                identity = _identity({**dict(zip(('provider_url', 'provider_repo_id', 'repository'), key)),
+                                      'run_number': 1})
+                identities[key] = identity[:3] if identity else None
+            identity = identities[key]
+            number = row.get('run_number')
+            if identity is None or type(number) not in (str, int) or not str(number).isdigit() or int(number) < 1:
+                unjoined += 1
+                continue
+            if ((repository is not None and identity[2] != repository) or
+                    (provider_url is not None and identity[0] != provider_url) or
+                    (provider_repo_id is not None and identity[1] != str(provider_repo_id))):
+                continue
+            runs[(*identity, int(number))] = row
+        defaults = {(r.get('provider_url', '').rstrip('/'), str(r.get('id')), r.get('repository')):
+                    r.get('default_branch') for r in inventory}
+        coverage = {(p['provider_url'].rstrip('/'), str(p['provider_repo_id']), p['repository']):
+                    p.get('coverage', {}) for p in cached.get('projects', [])}
+        groups, daily, selected = {}, {}, []
+        for project in cached.get('projects', []):
+            identity = _identity({**project, 'run_number': 1})
+            if identity is None:
+                continue
+            key = identity[:3]
+            if ((repository is not None and key[2] != repository) or
+                    (provider_url is not None and key[0] != provider_url) or
+                    (provider_repo_id is not None and key[1] != str(provider_repo_id))):
+                continue
+            groups[key] = {'rows': [], 'unknown_time_run_count': 0,
+                           'scope_unavailable': scope == 'default' and not defaults.get(key)}
+        unknown_time = scope_unavailable = 0
+        scoped_runs = {}
+        for key, row in runs.items():
+            if branch is not None and row.get('branch') != branch:
+                continue
+            project = key[:3]
+            group = groups.setdefault(project, {'rows': [], 'unknown_time_run_count': 0,
+                                                'scope_unavailable': False})
+            if scope == 'default' and not defaults.get(project):
+                group['scope_unavailable'] = True
+                scope_unavailable += 1
+                continue
+            if not run_in_scope(row, scope, defaults.get(project)):
+                continue
+            scoped_runs[key] = row
+            if _timestamp(row.get('created_at')) is None:
+                unknown_time += 1
+                group['unknown_time_run_count'] += 1
+        for key, row in select_run_window(scoped_runs, now, days, start, end, mode, run_number).items():
+            groups[key[:3]]['rows'].append(row)
+            selected.append(row)
+            stamp = _timestamp(row.get('created_at'))
+            if stamp is not None:
+                day = datetime.fromtimestamp(stamp, UTC).date().isoformat()
+                daily.setdefault(day, []).append(row)
+
+        def metrics(values):
+            counts = Counter(pipeline_outcome(row) for row in values)
+            success = counts['success']
+            failed = counts['failure']
+            completed = success + failed
+            durations = []
+            for row in values:
+                if pipeline_outcome(row) not in ('success', 'failure'):
+                    continue
+                begin, end = (_timestamp(row.get(field)) for field in ('started_at', 'finished_at'))
+                if begin is not None and end is not None and end >= begin:
+                    durations.append(end - begin)
+            return dict(pipeline_count=len(values), outcomes=dict(sorted(counts.items())),
+                        completed_count=completed, success_count=success, failure_count=failed,
+                        pass_rate=success / completed if completed else None,
+                        failure_rate=failed / completed if completed else None,
+                        active_count=sum(counts[state] for state in
+                                         ('running', 'queued', 'blocked')),
+                        duration_seconds=_stats(durations))
+
+        projects = []
+        for key, group in sorted(groups.items()):
+            projects.append(dict(project_id=json.dumps(key, separators=(',', ':')),
+                provider_url=key[0], provider_repo_id=key[1], repository=key[2],
+                **metrics(group['rows']), unknown_time_run_count=group['unknown_time_run_count'],
+                scope_unavailable=group['scope_unavailable'], coverage=coverage.get(key, {'complete': False})))
+        result = dict(projects=projects, kpis=dict(project_count=len(projects), **metrics(selected)),
+            charts=[dict(day=day, **metrics(values)) for day, values in sorted(daily.items())],
+            available=bool(cached.get('available') or rows), status=cached.get('status', 'unknown'),
+            refreshing=cached.get('refreshing', False),
+            scope=dict(kind='retained_observations', complete=False, partial=True,
+                stale=bool(cached.get('stale')) or observed['scope']['stale'],
+                truncated=source_truncated or observed['scope']['truncated'] or
+                          any(p['coverage'].get('truncated') for p in projects),
+                memory_only=self._sink is None, history_memory_only=True,
+                persistence='durable_sink' if self._sink is not None else 'memory_only',
+                days=days if mode == 'days' else None, mode=mode, run_number=run_number,
+                window={'start': _iso(window_start), 'end': _iso(window_end)}, repository=repository,
+                start=start, end=end,
+                branch=branch, scope=scope, provider_url=provider_url, provider_repo_id=provider_repo_id,
+                denominator='successful_or_failed_runs', time_basis='created_at', window_basis=('last_24_runs_per_project' if mode == 'runs' else
+                    'trailing_24_hours' if mode == 'hours' else 'utc_calendar_days_including_today'),
+                minimum_percentile_samples=5, unknown_time_run_count=unknown_time,
+                scope_unavailable_run_count=scope_unavailable, unjoined_run_count=unjoined,
+                history=cached.get('scope', {})))
+        # A content revision is stable across unchanged reads and changes when
+        # filters, aggregates, or coverage change. Wall time alone isn't data.
+        versioned = copy.deepcopy(result)
+        versioned['scope'].pop('window')
+        for project in versioned['projects']:
+            project['coverage'].pop('checked_at', None)
+        result['revision'] = hashlib.sha256(json.dumps(versioned, sort_keys=True).encode()).hexdigest()
+        result['generated_at'] = cached.get('generated_at')
+        return result
+
+    def ci_tests(self, *, redact, days=14, repository=None, branch=None, test=None,
+                 provider_url=None, provider_repo_id=None, scope='all', start=None, end=None,
+                 mode='days', run_number=None,
+                 pipelines=(), inventory=()):
+        """Bounded HTTP projection; the full retained-history contract is unchanged."""
+        view = self.ci_test_history(repository=repository, branch=branch, test=test, days=days,
+                                    provider_url=provider_url, provider_repo_id=provider_repo_id,
+                                    scope=scope, start=start, end=end, mode=mode, run_number=run_number,
+                                      pipelines=pipelines, inventory=inventory)
+        view = redact(view)
+        tests = sorted(view['tests'], key=lambda row: (
+            -row['failure_count'], -(row['duration_ms']['p95'] or row['last_duration_ms'] or 0),
+            row['provider_url'], str(row['provider_repo_id']), row['repository'], row['branch'], row['id']))
+        view['tests'] = []
+        budget = 240 * 1024
+        used = 0
+        for row in tests[:200]:
+            size = len(json.dumps(row).encode())
+            if used + size > budget:
+                break
+            view['tests'].append(row)
+            used += size
+        limited = len(view['tests']) != len(tests)
+        view['scope'].update(test_count=len(tests), returned_test_count=len(view['tests']),
+                             omitted_test_count=len(tests) - len(view['tests']),
+                             omitted_failure_test_count=sum(row['failure_count'] > 0 for row in tests[len(view['tests']):]),
+                             ranking='failures_then_duration_then_identity',
+                             response_truncated=limited, test_limit=200, response_byte_limit=256 * 1024,
+                             truncated=view['scope']['truncated'] or limited)
+        return view
+
+    def ci_diagnosis(self, pipeline, *, redact):
+        """Join exact run evidence; never infer a test-to-step edge from labels/logs."""
+        from .ci_observability import _identity, _test_cases, bind_report_provider
+
+        result = dict(evidence_availability='unavailable', reason='Pipeline evidence unavailable.',
+                      failed_steps=[], failed_workflows=[], failed_tests=[], truncated=False,
+                      step_test_association='unavailable',
+                      step_test_reason='Uploaded reports do not identify a provider step.',
+                      log={'availability': 'not_loaded', 'route': '/api/v1/ci/log'})
+        if not pipeline:
+            return result
+        used = dict(failed_steps=0, failed_workflows=0, failed_tests=0)
+        budgets = dict(failed_steps=32 * 1024, failed_workflows=16 * 1024, failed_tests=64 * 1024)
+
+        def append(target, item):
+            item = redact(item)
+            size = len(json.dumps(item).encode()) + 2
+            if used[target] + size > budgets[target]:
+                result['truncated'] = True
+                return
+            result[target].append(item)
+            used[target] += size
+
+        failed = {'failure', 'failed', 'error', 'errored', 'timed_out', 'crashed'}
+        for source, target in (('tasks', 'failed_steps'), ('workflows', 'failed_workflows')):
+            entries = [row for row in pipeline.get(source, [])
+                       if (row.get('state') or row.get('status')) in failed]
+            result['truncated'] |= len(entries) > 50
+            for row in entries[:50]:
+                item = {key: (value[:500] if isinstance(value, str) else value)
+                        for key, value in row.items() if key in
+                        ('id', 'name', 'state', 'status', 'workflow', 'workflow_id', 'exit_code', 'error')
+                        and type(value) in (str, int, float, bool, type(None))}
+                edges = row.get('depends_on')
+                item['dependency_evidence'] = 'reported' if isinstance(edges, list) else 'unavailable'
+                if isinstance(edges, list):
+                    item['depends_on'] = [str(edge)[:200] for edge in edges[:50]]
+                    result['truncated'] |= len(edges) > 50
+                append(target, item)
+        history = self.ci_reports()
+        row = {**pipeline, 'revision': pipeline.get('revision') or pipeline.get('commit'),
+               'run_number': pipeline.get('run_number') or pipeline.get('number')}
+        # Numeric detail requests report the requested ID as repository. Resolve
+        # the name only from one exact retained identity with matching run metadata.
+        candidates = {identity for observed in history['pipelines']
+                      if (identity := _identity(observed)) is not None and
+                      identity[0] == row.get('provider_url', '').rstrip('/') and
+                      identity[3] == row['run_number'] and
+                      row.get('provider_repo_id') is not None and identity[1] == str(row['provider_repo_id']) and
+                      (row.get('repository') == identity[2] or
+                       row.get('repository') == identity[1] == str(row.get('provider_repo_id'))) and
+                      all(observed.get(key) == row.get(key) for key in ('revision', 'branch'))}
+        if len(candidates) == 1:
+            identity = candidates.pop()
+            row.update(provider_url=identity[0], provider_repo_id=identity[1], repository=identity[2])
+        identity = _identity(row)
+        if identity is None or row.get('repository') == str(row.get('provider_repo_id')):
+            result['reason'] = 'Exact provider/repository/run identity is unavailable or ambiguous.'
+            return result
+        matches = []
+        for report in reversed(history['reports']):
+            report = bind_report_provider(report, history['pipelines'])
+            if (_identity(report) == identity and row.get('branch') and row.get('revision') and
+                    all(report.get(key) == row[key] for key in ('branch', 'revision'))):
+                cases = _test_cases(report)
+                if cases is not None:
+                    matches.append((report, cases))
+        if not matches:
+            result['reason'] = 'No validated report matches this exact provider, repository, run, branch and revision.'
+            return result
+        result.update(evidence_availability='reported', reason=None, report_count=len(matches))
+        history_view = self.ci_test_history(repository=row['repository'], branch=row['branch'], days=30,
+                                            provider_url=identity[0], provider_repo_id=identity[1])
+        test_history = {test['id']: test for test in history_view['tests']}
+        result['history_scope'] = redact(history_view['scope'])
+        failures = [(report, case) for report, cases in matches for case in cases if case['status'] in ('failed', 'errored')]
+        result['failed_test_count'] = len(failures)
+        result['truncated'] |= len(failures) > 25
+        for report, case in failures[:25]:
+            aggregate = test_history.get(case['id'])
+            case = redact(case)  # Before excerpt limits: never expose a token prefix.
+            item = {key: case[key] for key in ('id', 'name', 'suite', 'classname', 'file',
+                                              'status', 'duration_ms', 'identity_ambiguous')}
+            item.update(message=case['message'][:500], trace=case['trace'][:1000], report_id=report['report_id'],
+                history={key: aggregate[key] for key in ('failure_count', 'completed_count', 'failure_rate',
+                    'first_failure', 'last_pass', 'duration_ms', 'classification', 'inconsistent_count')}
+                    if aggregate else None)
+            result['truncated'] |= len(case['message']) > 500 or len(case['trace']) > 1000
+            append('failed_tests', item)
+        return result
 
     # --------------------------------------------------------------- events
     def record_event(self, entity_type, entity_id, event_type, payload=None,
@@ -1751,6 +2235,8 @@ class ControlPlaneRepo:
         """Record one event. ``envelope`` (a normalised v2 envelope) makes it the
         canonical envelope row: emitter event_id, server-set actor/received_at,
         durable before return. ``feed=False`` keeps it out of the global feed."""
+        if self._suppress_record_events:
+            return
         with self._event_lock:
             key = (entity_type, entity_id)
             stream = self._events.setdefault(key, [])
@@ -1782,6 +2268,10 @@ class ControlPlaneRepo:
                     meta["lineage_mode"] = env["lineage_mode"]
                 if env.get("claimed_actor") is not None:
                     meta["claimed_actor"] = _bounded_claim(env["claimed_actor"])
+                # a clamped (peer) principal's claims: evidence of what the sender said, never read as authority
+                for name in ("claimed_origin", "claimed_visibility_scope", "claimed_ids", "claimed_evidence_refs"):
+                    if env.get(name) is not None:
+                        meta[name] = _bounded_claim(env[name])
                 ev["payload"] = {**ev["payload"], "_envelope": meta}
                 require_durable = callable(getattr(self._sink, "record_required", None))
             if require_durable and self._sink is not None:
@@ -1896,8 +2386,8 @@ class ControlPlaneRepo:
     # All persisted as events (entity types ``token_usage``, ``llm_key``,
     # ``custom_model``) so the existing durable sink and replay carry them.
     def record_token_usage(self, project, model, input_tokens=0, output_tokens=0, *,
-                           reasoning_tokens=0, cache_read_tokens=0, duration_ms=None,
-                           success=True, request_id=None, session_id=None,
+                           reasoning_tokens=0, cache_read_tokens=0, cache_write_tokens=0,
+                           duration_ms=None, success=True, request_id=None, session_id=None,
                            mission_id=None, key_id=None, source="llm-proxy", v2=None):
         """One usage record. ``v2`` (already whitelisted, see ``record_token_usage_row``)
         makes it a schema-2 record whose unreported token fields stay None (unknown);
@@ -1910,12 +2400,30 @@ class ControlPlaneRepo:
         payload = {"project": project, "model": model or "unknown",
                    "input_tokens": tokens[0], "output_tokens": tokens[1],
                    "reasoning_tokens": tokens[2], "cache_read_tokens": tokens[3],
+                   "cache_write_tokens": _usage_int(cache_write_tokens),
                    "duration_ms": duration_ms, "success": bool(success),
                    "request_id": request_id, "key_id": key_id, "source": source}
         if v2 is not None:
             payload.update(v2, schema=2, session_id=session_id)
-        return self.record_event("token_usage", project, "token_usage.recorded",
-                                 payload, mission_id=mission_id, session_id=session_id)
+        event = self.record_event("token_usage", project, "token_usage.recorded",
+                                  payload, mission_id=mission_id, session_id=session_id)
+        # The mission-scoped usage projection (issue #36) must reflect the same
+        # record so usage_analytics() is populated during normal runtime, not
+        # only after an event-only reload. The event above is the single durable
+        # record, so the projection is fed without emitting a duplicate event.
+        self.add_token_usage({
+            "request_id": request_id,
+            "mission_id": mission_id,
+            "session_id": session_id,
+            "model": payload.get("model"),
+            "occurred_at": event.get("source_timestamp"),
+            "input_tokens": payload.get("input_tokens"),
+            "output_tokens": payload.get("output_tokens"),
+            "reasoning_tokens": payload.get("reasoning_tokens"),
+            "cache_read_tokens": payload.get("cache_read_tokens"),
+            "cache_write_tokens": payload.get("cache_write_tokens"),
+        }, record_event=False)
+        return event
 
     def record_token_usage_row(self, row):
         """Record one usage row as posted to ``/api/v1/token-usage`` (or reported by the
@@ -1936,6 +2444,7 @@ class ControlPlaneRepo:
         if row.get("schema") != 2:
             return self.record_token_usage(project, model, *tokens[:2], reasoning_tokens=tokens[2],
                                            cache_read_tokens=tokens[3],
+                                           cache_write_tokens=tokens[4],
                                            success=row.get("success", True), **common)
         status = _usage_int(row.get("status"))
         error_class = row.get("error_class") if row.get("error_class") in USAGE_ERROR_CLASSES else None
@@ -1954,7 +2463,8 @@ class ControlPlaneRepo:
             v2[k] = _usage_int(row.get(k))
         source = row.get("source") if row.get("source") in ("llm-proxy", "transcript") else "llm-proxy"
         return self.record_token_usage(project, model, *tokens[:2], reasoning_tokens=tokens[2],
-                                       cache_read_tokens=tokens[3], success=success,
+                                       cache_read_tokens=tokens[3],
+                                       cache_write_tokens=tokens[4], success=success,
                                        source=source, v2=v2, **common)
 
     def resolve_usage_session(self, value):
@@ -1986,7 +2496,8 @@ class ControlPlaneRepo:
         when ``resolve_usage_session`` cannot place it; rows without a session id
         count only in the other groupings."""
         total = {"requests": 0, "input_tokens": 0, "output_tokens": 0,
-                 "reasoning_tokens": 0, "cache_read_tokens": 0, "failed": 0}
+                 "reasoning_tokens": 0, "cache_read_tokens": 0, "cache_write_tokens": 0,
+                 "failed": 0}
         by_project, by_model, by_day, by_session = {}, {}, {}, {}
         resolved = {}
 
@@ -1994,6 +2505,7 @@ class ControlPlaneRepo:
             b = bucket.setdefault(key, {k: 0 for k in total})
             _accumulate(b, p)
 
+        seen_requests = set()
         for (etype, eid), stream in self._events.items():
             if etype != "token_usage" or (project and eid != project):
                 continue
@@ -2001,9 +2513,21 @@ class ControlPlaneRepo:
                 if since and ev["source_timestamp"] < since:
                     continue
                 p = _payload(ev)
+                request_id = p.get("request_id")
+                if request_id:
+                    # The mission-scoped usage projection is idempotent on request_id;
+                    # keep token_analytics consistent so a retried request is counted once.
+                    if request_id in seen_requests:
+                        continue
+                    seen_requests.add(request_id)
                 _accumulate(total, p)
-                add(by_project, p["project"], p)
-                add(by_model, p["model"], p)
+                # The mission-scoped ingest path may record rows without the legacy
+                # project field; skip/normalize them here so /analytics/tokens never
+                # 500s on a missing key (they still count in total and usage).
+                if p.get("project") is not None:
+                    add(by_project, p["project"], p)
+                if p.get("model") is not None:
+                    add(by_model, p["model"], p)
                 add(by_day, ev["source_timestamp"][:10], p)
                 raw = p.get("session_id") or ev.get("session_id")  # v1 rows: envelope only
                 if not raw:
@@ -2023,6 +2547,98 @@ class ControlPlaneRepo:
                     b["raw_session_ids"] = sorted([*b["raw_session_ids"], raw])
         return {"total": total, "by_project": by_project, "by_model": by_model,
                 "by_day": dict(sorted(by_day.items())), "by_session": by_session}
+
+    # -------------------------------------------------------------- usage (#36)
+    # Mission-scoped token and resource usage, idempotent on request_id, mirroring
+    # the token_usage / resource_usage tables. Missing fields stay None (never 0).
+    _TOKEN_COUNT_FIELDS = ("input_tokens", "output_tokens", "reasoning_tokens",
+                           "cache_read_tokens", "cache_write_tokens")
+
+    def add_token_usage(self, rec, record_event=True):
+        """Store one mission-scoped token usage record, idempotent on request_id.
+
+        ``record_event`` is False when an envelope already persisted the durable
+        row (schema-v2 ingest), so the projection does not write a duplicate.
+        """
+        if not isinstance(rec, dict):
+            raise ValueError("token usage must be an object")
+        request_id = _usage_str(rec.get("request_id"), 128)
+        if not request_id:
+            request_id = uuid4().hex  # a stable key; never a registered entity id
+        clean = {"request_id": request_id,
+                 "mission_id": _usage_id(rec.get("mission_id")),
+                 "session_id": _usage_id(rec.get("session_id")),
+                 "agent_id": _usage_id(rec.get("agent_id")),
+                 "host_id": _usage_id(rec.get("host_id")),
+                 "model": _usage_str(rec.get("model"), 256),
+                 "provider": _usage_str(rec.get("provider"), 128),
+                 "stage": _usage_str(rec.get("stage"), 128),
+                 "occurred_at": _normalize_occurred_at(rec.get("occurred_at")) or self._stamp(),
+                 "duration_ms": _usage_int(rec.get("duration_ms")),
+                 "retry_number": _usage_int(rec.get("retry_number")),
+                 "success": rec.get("success")
+                     if isinstance(rec.get("success"), bool) else None,
+                 "error_code": _usage_str(rec.get("error_code"), 256)}
+        for k in self._TOKEN_COUNT_FIELDS:
+            clean[k] = _usage_int(rec.get(k))
+        existing = self._token_usage.get(request_id)
+        if existing is not None:
+            return existing
+        self._token_usage[request_id] = clean
+        if record_event:
+            self.record_event("token_usage", request_id, "token_usage.recorded", clean,
+                              mission_id=clean["mission_id"], session_id=clean["session_id"])
+        return clean
+
+    def add_resource_usage(self, rec, record_event=True):
+        """Store one mission-scoped resource usage record."""
+        if not isinstance(rec, dict):
+            raise ValueError("resource usage must be an object")
+        mission_id = _usage_id(rec.get("mission_id"))
+        kind = _usage_str(rec.get("kind"), 128)
+        if not kind:
+            raise ValueError("resource kind is required")
+        clean = {"mission_id": mission_id, "kind": kind,
+                 "session_id": _usage_id(rec.get("session_id")),
+                 "value": rec.get("value"), "unit": _usage_str(rec.get("unit"), 32),
+                 "payload": rec.get("payload"),
+                 "occurred_at": _normalize_occurred_at(rec.get("occurred_at")) or self._stamp()}
+        value = clean["value"]
+        if (isinstance(value, bool) or not isinstance(value, (int, float))
+                or not math.isfinite(value) or value < 0):
+            raise ValueError("resource value must be a finite non-negative number")
+        key = (mission_id, kind)
+        bucket = self._resource_usage.setdefault(key, [])
+        bucket.append(clean)
+        if record_event:
+            self.record_event("resource_usage", f"{mission_id}:{kind}:{len(bucket) - 1}",
+                              "resource_usage.recorded", clean, mission_id=mission_id,
+                              session_id=clean["session_id"])
+        return clean
+
+    def usage_analytics(self, mission_id=None):
+        """Tokens by model and resources by kind, optionally scoped to a mission."""
+        tokens_by_model = {}
+        token_totals = {}
+        for request_id, rec in self._token_usage.items():
+            if mission_id is not None and rec.get("mission_id") != mission_id:
+                continue
+            model = rec.get("model") or "unknown"
+            b = tokens_by_model.setdefault(model, {k: 0 for k in self._TOKEN_COUNT_FIELDS})
+            for k in self._TOKEN_COUNT_FIELDS:
+                b[k] += int(rec.get(k) or 0)
+            for k in self._TOKEN_COUNT_FIELDS:
+                token_totals[k] = token_totals.get(k, 0) + int(rec.get(k) or 0)
+        resources = {}
+        for (mid, kind), recs in self._resource_usage.items():
+            if mission_id is not None and mid != mission_id:
+                continue
+            for rec in recs:
+                b = resources.setdefault(kind, {"count": 0, "total": 0.0, "unit": rec.get("unit")})
+                b["count"] += 1
+                b["total"] += float(rec.get("value") or 0)
+        return {"tokens": {"by_model": tokens_by_model, "total": token_totals},
+                "resources": resources}
 
     # LLM page (docs/superpowers/specs/2026-10-23-llm-page-design.md, slice 2). Computed from
     # the retained raw records on each call, like ``token_analytics``; ``retained_since`` says
@@ -2206,10 +2822,20 @@ class ControlPlaneRepo:
             "leases": _copy(self._leases),
             "telemetry": {k: [dict(s) for s in v]
                           for k, v in self._telemetry.items()},
+            "delivery": {
+                "test_runs": _copy(self._test_runs),
+                "reviews": _copy(self._reviews),
+                "pull_requests": _copy(self._pull_requests),
+                "token_usage": _copy(self._token_usage),
+                "resource_usage": {json.dumps(list(k)): [dict(x) for x in v]
+                                    for k, v in self._resource_usage.items()},
+                "stage_runs": _copy(self._stage_runs),
+            },
             "events": {f"{t}|{i}": [dict(e) for e in s]
                        for (t, i), s in self._events.items()},
             "event_order": list(self._event_order),
             "ci_sequence": self._ci_sequence,
+            "ci_history_truncated": sorted(self._ci_history_truncated),
             "agent_projections": copy.deepcopy(list(self._agent_records.values())),
         }
 
@@ -2225,6 +2851,15 @@ class ControlPlaneRepo:
         self._leases = dict(state.get("leases", {}))
         self._telemetry = {k: [dict(s) for s in v]
                           for k, v in state.get("telemetry", {}).items()}
+        delivery_present = "delivery" in state
+        delivery = state.get("delivery", {})
+        self._test_runs = dict(delivery.get("test_runs", {}))
+        self._reviews = dict(delivery.get("reviews", {}))
+        self._pull_requests = dict(delivery.get("pull_requests", {}))
+        self._token_usage = dict(delivery.get("token_usage", {}))
+        self._resource_usage = {tuple(json.loads(k)): [dict(x) for x in v]
+                                for k, v in delivery.get("resource_usage", {}).items()}
+        self._stage_runs = dict(delivery.get("stage_runs", {}))
         self._events = {}
         for key, stream in state.get("events", {}).items():
             t, i = key.split("|")
@@ -2232,11 +2867,18 @@ class ControlPlaneRepo:
         self._event_order = [tuple(x) for x in state.get("event_order", [])]
         self.ledger.hydrate([e for stream in self._events.values() for e in stream])
         self._rebuild_graph()
+        if not delivery_present:
+            # The bridge durable-reload path restores event streams but carries no
+            # delivery snapshot; rebuild the projections from those streams so
+            # tests/builds/reviews/PRs survive a restart instead of going silent.
+            self._rebuild_delivery_from_events()
         self._ci_sequence = max(int(state.get("ci_sequence", 0)),
                                 max((event.get("sequence", -1) + 1
                                      for key, stream in self._events.items()
                                      if key[0] in {"ci_report", "ci_observation", "ci_telemetry"}
                                      for event in stream), default=0))
+        self._ci_test_projection = None
+        self._ci_history_truncated = set(state.get('ci_history_truncated', []))
         self._trim_ci_history()
         # Replay durable naming reservations before any session is presented.
         # Summary continuity lives outside transcript retention and public feeds.
@@ -2316,6 +2958,144 @@ class ControlPlaneRepo:
         self.graph = graph
         self._event_order = [t for t in self._event_order if t[0] != "lineage"]
 
+    def _rebuild_delivery_from_events(self):
+        """Replay delivery event streams into their projections.
+
+        Used by the durable reload path (bridge.py) which restores event streams
+        but carries no delivery snapshot: replaying the stored payloads rebuilds
+        the test_run/build/review/pull_request projections so delivery APIs and
+        mission pages show them after a restart. Idempotent — re-runs overwrite
+        the same records in place. Event recording is suppressed so the rebuilt
+        streams are not duplicated by the upsert methods.
+        """
+        self._suppress_record_events = True
+        try:
+            self._rebuild_delivery_from_events_impl()
+        finally:
+            self._suppress_record_events = False
+
+    def _rebuild_delivery_from_events_impl(self):
+        # Usage analytics (issue #36) and stage analytics (issue #37) ride the
+        # same durable event log, so an event-only reload must rebuild them too
+        # or they silently vanish after a restart.
+        self._token_usage = {}
+        self._resource_usage = {}
+        for entity_type in ("token_usage", "resource_usage"):
+            for ids in self.entity_ids(entity_type):
+                for ev in self._events.get((entity_type, ids), []):
+                    payload = dict(_payload(ev))
+                    try:
+                        # mission_id/session_id/timestamp live on the event envelope,
+                        # not necessarily in the payload, so merge them back for the
+                        # projection (namespace by the event's source so the rebuild
+                        # matches live ingest; keep the backdated occurred_at so
+                        # retention ages the rebuilt record out correctly).
+                        payload.setdefault("session_id", ev.get("session_id"))
+                        if not payload.get("occurred_at") and ev.get("source_timestamp"):
+                            payload["occurred_at"] = ev.get("source_timestamp")
+                        payload["mission_id"] = _usage_mission_key(
+                            payload.get("mission_id") or ev.get("mission_id"),
+                            ev.get("source") or "herdr")
+                        if entity_type == "token_usage":
+                            self.add_token_usage(payload)
+                        else:
+                            self.add_resource_usage(payload)
+                    except (ValueError, KeyError, TypeError):
+                        continue
+        # Stage transitions: rebuild stage runs from each mission's event stream
+        # so per-stage durations survive a restart. set_mission_stage emits
+        # MissionStageChanged (with from/to); upsert_mission emits MissionUpdated
+        # (with only the current stage), so the running stage is tracked per
+        # mission to detect a change and derive the transition.
+        self._stage_runs = {}
+        for (etype, eid), stream in list(self._events.items()):
+            if etype != "mission":
+                continue
+            current = None
+            for ev in stream:
+                ev_type = ev.get("event_type")
+                p = _payload(ev)
+                if ev_type == "MissionStarted":
+                    # Initial stage is set at creation with no transition: seed the
+                    # running stage without opening a run (matches live upsert).
+                    current = p.get("stage")
+                    continue
+                if ev_type == "MissionStageChanged":
+                    old, new = p.get("from"), p.get("to")
+                elif ev_type == "MissionUpdated":
+                    old, new = current, p.get("stage")
+                else:
+                    continue
+                try:
+                    self._transition_stage(eid, old, new,
+                                           when=ev.get("source_timestamp"))
+                except (ValueError, KeyError, TypeError):
+                    pass
+                current = new
+        for entity_type in ("test_run", "build", "review", "pull_request"):
+            for ids in self.entity_ids(entity_type):
+                stream = self._events.get((entity_type, ids), [])
+                if not stream:
+                    continue
+                # Replay the whole stream in order: a review's findings are their
+                # own events, and a merged PR ends with a partial merge event, so
+                # rebuilding from only the last event would drop data. Each event
+                # payload carries enough to rebuild (record_event is suppressed, so
+                # nothing is re-persisted and the streams are not duplicated).
+                for ev in stream:
+                    payload = _payload(ev)
+                    event_type = ev.get("event_type", "")
+                    try:
+                        if entity_type in ("test_run", "build"):
+                            self.upsert_test_run(
+                                ids, kind=payload.get("kind") or entity_type,
+                                mission_id=payload.get("mission_id"),
+                                session_id=payload.get("session_id"),
+                                repository=payload.get("repository"),
+                                status=payload.get("status"),
+                                passed=payload.get("passed"),
+                                failed=payload.get("failed"),
+                                skipped=payload.get("skipped"),
+                                total=payload.get("total"),
+                                started_at=payload.get("started_at"),
+                                ended_at=payload.get("ended_at"),
+                                results=payload.get("results"),
+                            )
+                        elif entity_type == "review":
+                            if event_type == "ReviewFindingAdded":
+                                self.add_review_finding(
+                                    ids, severity=payload.get("severity"),
+                                    summary=payload.get("summary"),
+                                    detail=payload.get("detail") or "",
+                                    status=payload.get("status") or "open",
+                                    finding_id=payload.get("finding_id"),
+                                )
+                            else:
+                                self.upsert_review(
+                                    ids, mission_id=payload.get("mission_id"),
+                                    session_id=payload.get("session_id"),
+                                    reviewer=payload.get("reviewer"),
+                                    status=payload.get("status"),
+                                    verdict=payload.get("verdict"),
+                                    started_at=payload.get("started_at"),
+                                    completed_at=payload.get("completed_at"),
+                                )
+                        elif entity_type == "pull_request":
+                            if event_type == "PullRequestMerged":
+                                continue  # subset of the last Opened/Updated event
+                            self.upsert_pull_request(
+                                ids, mission_id=payload.get("mission_id"),
+                                repository=payload.get("repository"),
+                                number=payload.get("number"),
+                                url=payload.get("url"),
+                                status=payload.get("status"),
+                                branch=payload.get("branch"),
+                                base=payload.get("base"),
+                                created_at=payload.get("created_at"),
+                            )
+                    except (ValueError, KeyError, TypeError):  # a bad row never blocks startup
+                        continue
+
     def take_collab_replay(self):
         """Hand the diverted durable HCN events to the collaboration service (once)."""
         out, self._collab_replay = self._collab_replay, []
@@ -2375,7 +3155,8 @@ def _payload(ev):
     return p if isinstance(p, dict) else {}
 
 
-_TOKEN_FIELDS = ("input_tokens", "output_tokens", "reasoning_tokens", "cache_read_tokens")
+_TOKEN_FIELDS = ("input_tokens", "output_tokens", "reasoning_tokens",
+                  "cache_read_tokens", "cache_write_tokens")
 # The usage-record error taxonomy (docs/superpowers/specs/2026-10-23-llm-page-design.md).
 USAGE_ERROR_CLASSES = frozenset({
     "auth_invalid_key", "request_invalid", "request_too_large", "model_project_mismatch",
@@ -2386,10 +3167,46 @@ _USAGE_ID = re.compile(r"^[A-Za-z0-9\-_.:/]{1,128}$")
 
 
 def _usage_int(value):
-    """A non-negative int, or None (unknown) for anything else (bools included)."""
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or value != value:
+    """A non-negative int, or None (unknown) for anything else (bools, non-finite)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    return int(value) if value >= 0 else None
+    try:
+        return int(value) if math.isfinite(value) and value >= 0 else None
+    except (ValueError, OverflowError):  # pragma: no cover - non-finite already caught
+        return None
+
+
+def _usage_mission_key(mission_id, source):
+    """Namespace a raw mission_id by its source, mirroring ingest's
+    ``_delivery_mission_key`` so usage projections and their event-only rebuild
+    store the same key (e.g. ``pi:M1``). Already-namespaced ids pass through.
+    """
+    if mission_id is None:
+        return None
+    if not isinstance(mission_id, str) or not mission_id:
+        raise ValueError("mission_id must be a non-empty string")
+    if ":" in mission_id:
+        return mission_id
+    return mission_id if source == "herdr" else f"{source}:{mission_id}"
+
+
+def _normalize_occurred_at(value):
+    """Return a valid ISO timestamp string, or None for anything malformed.
+
+    Guards the retention sweep, which parses ``occurred_at`` with
+    ``datetime.fromisoformat`` and compares it to a timezone-aware cutoff; a
+    garbage value or a timezone-naive timestamp there would fail the sweep with
+    ValueError/TypeError. ``Z`` is normalized to ``+00:00`` (a timezone).
+    """
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = _dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None  # timezone-naive would break the aware cutoff comparison
+    return value
 
 
 def _usage_str(value, limit):
@@ -2401,9 +3218,24 @@ def _usage_id(value):
     return value if isinstance(value, str) and _USAGE_ID.match(value) else None
 
 
+def _percentile(sorted_values, pct):
+    """Nearest-rank percentile of an ascending list (pct in 0..100).
+
+    The nearest-rank method selects ``ceil(pct/100 * n)``-th smallest value
+    (1-indexed); with n=2, p50 is the 1st (index 0) and p95 the 2nd (index 1).
+    """
+    n = len(sorted_values)
+    if n == 0:
+        return None
+    rank = math.ceil(pct / 100.0 * n)
+    idx = max(0, min(n - 1, rank - 1))
+    return sorted_values[idx]
+
+
 def _accumulate(bucket, p):
     bucket["requests"] += 1
-    for k in ("input_tokens", "output_tokens", "reasoning_tokens", "cache_read_tokens"):
+    for k in ("input_tokens", "output_tokens", "reasoning_tokens", "cache_read_tokens",
+              "cache_write_tokens"):
         bucket[k] += int(p.get(k) or 0)
     if not p.get("success", True):
         bucket["failed"] += 1

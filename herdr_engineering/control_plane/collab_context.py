@@ -789,6 +789,7 @@ class ContextMixin:
         fabric graph that the (refused) log can never record or retract."""
         if self.degraded:
             return
+        self._fed_reconcile()                   # ADR-0008 P2: record YAML peer changes, revoke shares it no longer allows
         with self._lock:
             now = self._now()
             if now - getattr(self, "_xlink_flush_at", 0.0) < 5.0:

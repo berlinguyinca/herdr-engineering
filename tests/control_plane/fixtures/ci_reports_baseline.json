@@ -1,0 +1,179 @@
+{
+  "source_commit": "770fe01",
+  "reports": [
+    {
+      "body": {
+        "repository": "org/app",
+        "provider_repo_id": 17,
+        "run_number": 1,
+        "branch": "main",
+        "revision": "abc",
+        "xml": "<testsuite name=\"unit\"><testcase name=\"works\" classname=\"Checks\" file=\"tests/a.py\" time=\"1\"/></testsuite>"
+      },
+      "receipt": {
+        "repository": "org/app",
+        "branch": "main",
+        "revision": "abc",
+        "provider_repo_id": 17,
+        "run_number": 1,
+        "summary": {
+          "passed": 1,
+          "failed": 0,
+          "errored": 0,
+          "skipped": 0,
+          "total": 1,
+          "duration_ms": 1000
+        },
+        "tests": [
+          {
+            "id": "54f45ff44fc5fd2cf30e2409",
+            "name": "works",
+            "suite": "unit",
+            "classname": "Checks",
+            "status": "passed",
+            "duration_ms": 1000,
+            "message": "",
+            "trace": ""
+          }
+        ],
+        "report_id": "73d0762971b14acc587973ba0d13cf23fb54a40b2274f839e73c030fedc71a55",
+        "reported_at": "2026-10-25T12:00:00+00:00",
+        "attempt": 1,
+        "ingested_at": "2026-10-25T12:00:00+00:00"
+      }
+    },
+    {
+      "body": {
+        "repository": "org/app",
+        "provider_repo_id": 17,
+        "run_number": 1,
+        "branch": "main",
+        "revision": "abc",
+        "xml": "<testsuite name=\"unit\"><testcase name=\"works\" classname=\"Checks\" file=\"tests/a.py\" time=\"1\"/><testcase name=\"works\" classname=\"Checks\" file=\"tests/b.py\"><failure message=\"failed\">trace</failure></testcase></testsuite>"
+      },
+      "receipt": {
+        "repository": "org/app",
+        "branch": "main",
+        "revision": "abc",
+        "provider_repo_id": 17,
+        "run_number": 1,
+        "summary": {
+          "passed": 1,
+          "failed": 1,
+          "errored": 0,
+          "skipped": 0,
+          "total": 2,
+          "duration_ms": 1000
+        },
+        "tests": [
+          {
+            "id": "54f45ff44fc5fd2cf30e2409",
+            "name": "works",
+            "suite": "unit",
+            "classname": "Checks",
+            "status": "passed",
+            "duration_ms": 1000,
+            "message": "",
+            "trace": ""
+          },
+          {
+            "id": "b720f9b85766c4467f5b0d2d",
+            "name": "works",
+            "suite": "unit",
+            "classname": "Checks",
+            "status": "failed",
+            "duration_ms": 0,
+            "message": "failed",
+            "trace": "trace"
+          }
+        ],
+        "report_id": "bfdaecf982cc990cec67b5e20dfb15d38a5f6c7f50cd3d0d89d7bf09c9fa19f3",
+        "reported_at": "2026-10-25T12:00:00+00:00",
+        "attempt": 1,
+        "ingested_at": "2026-10-25T12:00:00+00:00"
+      }
+    },
+    {
+      "body": {
+        "repository": "org/app",
+        "provider_repo_id": 17,
+        "run_number": 1,
+        "branch": "main",
+        "revision": "abc",
+        "xml": "<testsuite name=\"unit\"><testcase name=\"token=synthetic-one\" classname=\"Checks\" file=\"tests/a.py\" time=\"1\"/></testsuite>"
+      },
+      "receipt": {
+        "repository": "org/app",
+        "branch": "main",
+        "revision": "abc",
+        "provider_repo_id": 17,
+        "run_number": 1,
+        "summary": {
+          "passed": 1,
+          "failed": 0,
+          "errored": 0,
+          "skipped": 0,
+          "total": 1,
+          "duration_ms": 1000
+        },
+        "tests": [
+          {
+            "id": "8a6ba0ada6ad01af59a1ff45",
+            "name": "[REDACTED]",
+            "suite": "unit",
+            "classname": "Checks",
+            "status": "passed",
+            "duration_ms": 1000,
+            "message": "",
+            "trace": ""
+          }
+        ],
+        "report_id": "d60dd087c266fac390a3dcda3ce7e1fc1d3cabf400716a08b5f2c75b4cfa71dd",
+        "reported_at": "2026-10-25T12:00:00+00:00",
+        "attempt": 1,
+        "ingested_at": "2026-10-25T12:00:00+00:00"
+      }
+    },
+    {
+      "body": {
+        "repository": "org/app",
+        "provider_repo_id": 17,
+        "run_number": 1,
+        "branch": "main",
+        "revision": "abc",
+        "xml": "<testsuite name=\"unit\"><testcase name=\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxA\" classname=\"Checks\" file=\"tests/a.py\" time=\"1\"/></testsuite>"
+      },
+      "receipt": {
+        "repository": "org/app",
+        "branch": "main",
+        "revision": "abc",
+        "provider_repo_id": 17,
+        "run_number": 1,
+        "summary": {
+          "passed": 1,
+          "failed": 0,
+          "errored": 0,
+          "skipped": 0,
+          "total": 1,
+          "duration_ms": 1000
+        },
+        "tests": [
+          {
+            "id": "52509ed60d97984eba19a9cd",
+            "name": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+            "suite": "unit",
+            "classname": "Checks",
+            "status": "passed",
+            "duration_ms": 1000,
+            "message": "",
+            "trace": ""
+          }
+        ],
+        "report_id": "90d9e481c6e6bb7fdf17064b60af80a203a64aa41fc279f7dc200265e9d5b27c",
+        "reported_at": "2026-10-25T12:00:00+00:00",
+        "attempt": 1,
+        "ingested_at": "2026-10-25T12:00:00+00:00"
+      }
+    }
+  ]
+}

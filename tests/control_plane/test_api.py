@@ -240,6 +240,35 @@ def test_analytics(server):
     assert json.loads(body)["total"] == 0
 
 
+def test_analytics_tokens_survives_projectless_ingest_row(server):
+    c, repo = server
+    repo.add_token_usage({"mission_id": "m1", "model": "gpt",
+                          "request_id": "req-np", "input_tokens": 3})
+    status, _, body = c.get("/api/v1/analytics/tokens")
+    assert status == 200
+    assert json.loads(body)["total"]["input_tokens"] == 3
+
+
+def test_analytics_stages_and_usage(server):
+    c, repo = server
+    mid = repo.create_mission("stage-api")
+    repo.set_mission_stage(mid, "implementation")
+    repo.set_mission_stage(mid, "complete")
+    repo.add_token_usage({"mission_id": mid, "model": "gpt-4o",
+                          "request_id": "req-a", "input_tokens": 3})
+    repo.add_resource_usage({"mission_id": mid, "kind": "cpu", "value": 1.0})
+    status, _, body = c.get("/api/v1/analytics/stages")
+    assert status == 200
+    assert json.loads(body)["bottleneck"] == "implementation"
+    status, _, body = c.get("/api/v1/analytics/usage")
+    u = json.loads(body)
+    assert u["tokens"]["by_model"]["gpt-4o"]["input_tokens"] == 3
+    assert u["resources"]["cpu"]["total"] == 1.0
+    # Mission-scoped usage via ?mission=
+    status, _, body = c.get(f"/api/v1/analytics/usage?mission={mid}")
+    assert json.loads(body)["resources"]["cpu"]["total"] == 1.0
+
+
 def test_sse_stream_content_type(server):
     c, _ = server
     conn = http.client.HTTPConnection("127.0.0.1", _port(c))
@@ -331,6 +360,20 @@ def test_ingest_endpoint_upserts_host(server):
     evs = json.loads(stream)["events"]
     # a routine heartbeat (same identity) records no HostHeartbeat event
     assert [e["event_type"] for e in evs] == ["HostRegistered"]
+
+
+def test_ingest_delivery_entities_via_http_preserves_counts(server):
+    c, repo = server
+    # A numeric ``passed`` count must survive ingest-body redaction (the key
+    # contains the substring ``pass``) so the HTTP path accepts a real report.
+    status, body = c.post("/api/v1/ingest", {
+        "entity_type": "test_run", "entity_id": "http-run-1",
+        "event_type": "test_run.started",
+        "payload": {"mission_id": "m1", "status": "failed",
+                    "passed": 5, "failed": 1, "skipped": 0, "total": 6}})
+    assert status == 200, body
+    runs = repo.list_test_runs(mission_id="m1")
+    assert len(runs) == 1 and runs[0]["passed"] == 5
 
 
 def test_ingest_endpoint_validates_body(server):

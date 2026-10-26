@@ -61,7 +61,10 @@ NODE_TYPES = frozenset(
     # repository/host/service/gpu/model/request/span/queue are OWNED kinds; they
     # default to per-writer ownership exactly like the existing non-commons kinds.
     "repository branch service endpoint deployment host gpu model worker request "
-    "span queue dataset memory_reference external_dependency module symbol package trace".split())
+    "span queue dataset memory_reference external_dependency module symbol package trace "
+    # ADR-0008 P1: the reserved `peer:<peer>.` namespace a federated peer's mirror lives in. Ingest lets ONLY that
+    # peer write it (ingest.py:_check_peer_namespace); it never takes part in local gate staleness (_peer_edge).
+    "peer".split())
 EDGE_TYPES = frozenset(
     "spawn handoff delegation consultation dependency issue_link fork "
     "supersession reviewed produced validated cross_link "
@@ -1152,7 +1155,7 @@ class GraphProjection:
         seen: set[str] = set()
         for key in self._subject.get(ck, ()):
             e = self._edges[key]
-            if e.binding is None or not self._live(e) or self._is_removed(e):
+            if e.binding is None or not self._live(e) or self._is_removed(e) or self._peer_edge(e):
                 continue
             if principal is not None and not self._edge_visible(principal, e):
                 continue
@@ -1173,6 +1176,15 @@ class GraphProjection:
         grp.bindings = ordered[:MAX_BINDINGS]
         ctx[ck] = grp
         return grp
+
+    @staticmethod
+    def _peer_edge(edge: _Edge) -> bool:
+        """Is ``edge`` peer-asserted: it touches the reserved ``peer:`` namespace or was written by a peer principal?
+        A mirrored edge is evidence ABOUT the peer's own objects; it never decides anything local, so it takes no
+        part in local gate staleness (ADR-0008 P1). Ingest already confines a peer to its own namespace; this
+        keeps the derivation safe even if such an edge were stored some other way."""
+        return (edge.from_id.startswith("peer:") or edge.to_id.startswith("peer:")
+                or any(isinstance(w, str) and w.startswith("peer:") for w in (edge.writer, *edge.writers())))
 
     def _is_stale(self, edge: _Edge, principal: Any, ctx: dict) -> bool:
         """Is ``edge`` (reviewed/validated) outdated, as seen by ``principal``?
@@ -1234,7 +1246,8 @@ class GraphProjection:
                         continue
                     e = self._edges[key]
                     # who may write the edge is the graph's own rule: only a writer of the winner (or an operator)
-                    if self._live(e) and not self._is_removed(e) and self._edge_visible(principal, e):
+                    if (self._live(e) and not self._is_removed(e) and not self._peer_edge(e)
+                            and self._edge_visible(principal, e)):
                         decisions.append((key[1], nid, e.adds.best()))
                 if depth_of[nid] >= FORK_DEPENDENCY_DEPTH:
                     continue
@@ -1243,7 +1256,8 @@ class GraphProjection:
                     if key[0] != "dependency" or key[2] in depth_of or len(depth_of) >= FORK_DEPENDENCY_NODES:
                         continue
                     e = self._edges[key]
-                    if self._live(e) and not self._is_removed(e) and self._edge_visible(principal, e):
+                    if (self._live(e) and not self._is_removed(e) and not self._peer_edge(e)
+                            and self._edge_visible(principal, e)):
                         depth_of[key[2]] = depth_of[nid] + 1
                         todo.append(key[2])
             # a winner that is itself part of the subject's closure is what the subject rests on, not what it lost

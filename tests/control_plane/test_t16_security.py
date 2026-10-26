@@ -94,7 +94,7 @@ class Src(DurableSource):
 
 @pytest.mark.parametrize("entity_type", ["collab", "collab_room", "ci_observation", "ci_report", "ci_telemetry",
                                          "plannotator_review", "ci_pipeline", "agent_identity", "agent_summary",
-                                         "custom_model", "llm_key", "token_usage", "artifact", "made-up",
+                                         "custom_model", "llm_key", "artifact", "made-up",
                                          "pr_gate", "pr_gate_verdict", "review_job"])
 @pytest.mark.parametrize("schema", [1, 2])
 def test_ingest_refuses_every_entity_type_that_is_not_on_the_allow_list(entity_type, schema):
@@ -108,8 +108,11 @@ def test_ingest_refuses_every_entity_type_that_is_not_on_the_allow_list(entity_t
 
 
 def test_the_allow_list_is_exactly_what_the_dispatcher_handles_plus_plain_activity_types():
+    # Delivery entities (issue #32) join the dispatched set; they are validated
+    # and stored, not silently recorded as plain activity.
     assert DISPATCHED_ENTITY_TYPES == {"lineage", "host", "session", "mission", "service", "inspector",
-                                       "mission_activity"}
+                                       "mission_activity", "test_run", "build", "review",
+                                       "review_finding", "pull_request", "token_usage", "resource_usage"}
     assert INGEST_ENTITY_TYPES - DISPATCHED_ENTITY_TYPES == {"task", "note", "workspace", "ledger",
                                                                         "platform", "lifecycle",
                                                                         "repository", "request", "span"}
@@ -265,7 +268,8 @@ def test_non_safety_writes_stop_before_safety_writes_and_the_tiers_are_ordered()
     assert "message" in BULK_EVENTS and not (BULK_EVENTS & SAFETY_EVENTS)
     assert SAFETY_EVENTS == {"member_removed", "agent_revoked", "user_decided", "join_token_revoked", "xlink_revoked",
                              "workspace_unlinked", "mission_unlinked", "agent_grant_revoked",
-                             "helpers_paused", "helper_cancelled", "egress_removed"}
+                             "helpers_paused", "helper_cancelled", "egress_removed",
+                             "federation_share_revoked", "federation_peer_disabled"}      # ADR-0008 P2
     svc._log.extend([{}] * (ordinary - len(svc._log)))        # exactly at the ordinary limit
     with pytest.raises(CollabError):
         svc._commit("room_created", {})

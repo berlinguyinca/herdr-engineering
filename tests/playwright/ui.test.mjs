@@ -250,7 +250,7 @@ test('analytics composes its existing views into a useful dashboard', async () =
   await withApp(async ({page,base}) => {
     await page.goto(`${base}/#/analytics`);await page.locator('[data-analytics-links]').waitFor();
     const destinations=await page.locator('[data-analytics-links] a').evaluateAll(links=>links.map(link=>link.getAttribute('href')));
-    assert.deepEqual(destinations,['#/analytics/models','#/analytics/hosts','#/analytics/tokens']);
+    assert.deepEqual(destinations,['#/analytics/models','#/analytics/hosts','#/analytics/tokens','#/analytics/stages','#/analytics/usage']);
     const boxes=await page.locator('[data-analytics-links] a').evaluateAll(links=>links.map(link=>link.getBoundingClientRect().width));
     assert.ok(boxes.every(width=>width>200),'analytics destinations should use the available desktop row');
   },{BURST:'0'});
@@ -375,6 +375,21 @@ test('mission detail renders the timeline', async () => {
       fullPage: true,
     });
   }, { BURST: '0' });
+});
+
+test('mission detail surfaces telemetry state and stall age (issue #31)', async () => {
+  await withApp(async ({ page, base }) => {
+    // pi:MSN-PI1 has no live collector, so its telemetry_state is UNKNOWN.
+    await page.goto(`${base}/#/missions/pi:MSN-PI1`);
+    await page.waitForSelector('[data-telemetry-state]', { timeout: 15000 });
+    const badge = await page.locator('[data-telemetry-state]').innerText();
+    assert.match(badge, /Telemetry unknown/, `telemetry badge should say unknown (got "${badge}")`);
+    // A Stall age metric is rendered and, for a no-collector mission, is unknown.
+    const metric = page.locator('herdr-metric[label="Stall age"]');
+    await metric.waitFor({ state: 'visible', timeout: 15000 });
+    const value = await metric.locator('.hd-metric__value').innerText();
+    assert.match(value, /Unknown/, `stall age should be unknown for a no-collector mission (got "${value}")`);
+  });
 });
 
 // ---------------------------------------------------------------- agent inspector (spec 0200)
@@ -1569,56 +1584,13 @@ test('mission tests page lists builds and test runs read-only', async () => {
     assert.ok(text.includes('failed 1'), 'failed run count missing');
     assert.ok(text.includes('passed 2'), 'passed run count missing');
     assert.ok(text.includes('Build'), 'build row missing');
-    assert.ok(text.includes('unknown'), 'build without counts must report unknown');
     assert.ok(text.includes('42s'), 'duration missing');
+    // A build with no recorded counts renders an explicit unknown, never 0.
+    assert.ok(text.includes('Counts unknown'), 'missing counts must show unknown');
     assert.ok(!text.includes('Failed to fetch') && !text.includes('too many requests'),
       'delivery page must not error');
     // No mutation affordances on a read-only page.
     assert.ok(!/merge|approve|create pull/i.test(text), 'read-only page must not offer mutations');
-  }, { BURST: '0' });
-});
-
-test('mission delivery pages escape hostile text and keep UNKNOWN verdict unknown', async () => {
-  await withApp(async ({ page, base }) => {
-    const key = await alphaMissionKey(page, base);
-    const missionUrl = new RegExp(`/api/v1/missions/${encodeURIComponent(key).replace(/[.*+?^${}()|[\\]\\\\]/g, '\\\\$&')}$`);
-    await page.route(missionUrl, async (route) => {
-      const response = await route.fetch();
-      const mission = await response.json();
-      mission.title = '<img src=x onerror=alert(1)> & hostile';
-      await route.fulfill({ response, json: mission });
-    });
-    await page.goto(`${base}/#/missions/${encodeURIComponent(key)}/reviews`);
-    await page.waitForFunction(
-      () => (document.body ? document.body.innerText : '').includes('Changes requested'),
-      null, { timeout: 15000 });
-    const text = await bodyText(page);
-    assert.ok(text.includes('<img src=x onerror=alert(1)> & hostile'), 'hostile title should remain text');
-    assert.equal(await page.locator('img[src="x"]').count(), 0, 'hostile title must not create an image');
-    assert.ok(text.includes('Unknown'), 'UNKNOWN verdict should be shown as unknown');
-    assert.ok(!text.includes('Approved'), 'UNKNOWN verdict must never be shown as approved');
-  }, { BURST: '0' });
-});
-
-test('mission delivery navigation ignores stale delayed responses', async () => {
-  await withApp(async ({ page, base }) => {
-    const key = await alphaMissionKey(page, base);
-    await page.route('**/api/v1/missions/*/tests', async (route) => {
-      await sleep(500);
-      await route.continue();
-    });
-    await page.route('**/api/v1/missions/*/builds', async (route) => {
-      await sleep(500);
-      await route.continue();
-    });
-    await page.goto(`${base}/#/missions/${encodeURIComponent(key)}/tests`);
-    await page.locator('herdr-spinner').waitFor({ state: 'attached' });
-    await page.goto(`${base}/#/overview`);
-    await page.waitForFunction(
-      () => (document.body ? document.body.innerText : '').includes('Overview'),
-      null, { timeout: 15000 });
-    await page.waitForTimeout(700);
-    assert.ok((await bodyText(page)).includes('Overview'), 'stale delivery response replaced the current route');
   }, { BURST: '0' });
 });
 
@@ -1636,6 +1608,8 @@ test('mission reviews page lists verdict, findings and PR merge status', async (
     assert.ok(text.includes('PR #7'), 'open PR number missing');
     assert.ok(text.includes('PR #99'), 'unsafe-url PR should still be visible as text');
     assert.equal(await page.locator('a[href^="javascript:"]').count(), 0, 'unsafe PR URL must not become a link');
+    assert.ok(text.includes('Unknown'), 'UNKNOWN verdict should be shown as unknown');
+    assert.ok(!text.includes('Approved'), 'UNKNOWN verdict must never be shown as approved');
     assert.ok(text.includes('Open'), 'PR status missing');
     assert.ok(text.includes('ws/alpha → main'), 'branch → base missing');
     assert.ok(!text.includes('Failed to fetch') && !text.includes('too many requests'),
@@ -1643,4 +1617,56 @@ test('mission reviews page lists verdict, findings and PR merge status', async (
     // No merge/approve control: Pi Engineering stays the merge authority (#35).
     assert.ok(!/merge|approve/i.test(text), 'reviews page must not offer merge/approve controls');
   }, { BURST: '0' });
+});
+
+test('mission delivery pages escape hostile text and ignore stale delayed responses', async () => {
+  await withApp(async ({ page, base }) => {
+    const key = await alphaMissionKey(page, base);
+    const missionUrl = new RegExp(`/api/v1/missions/${encodeURIComponent(key).replace(/[.*+?^${}()|[\\]\\\\]/g, '\\\\$&')}$`);
+    await page.route(missionUrl, async (route) => {
+      const response = await route.fetch();
+      const mission = await response.json();
+      mission.title = '<img src=x onerror=alert(1)> & hostile';
+      await route.fulfill({ response, json: mission });
+    });
+    await page.goto(`${base}/#/missions/${encodeURIComponent(key)}/reviews`);
+    await page.waitForFunction(() => document.body?.innerText.includes('Changes requested'), null, { timeout: 15000 });
+    assert.ok((await bodyText(page)).includes('<img src=x onerror=alert(1)> & hostile'));
+    assert.equal(await page.locator('img[src="x"]').count(), 0);
+
+    await page.route('**/api/v1/missions/*/tests', async (route) => { await sleep(500); await route.continue(); });
+    await page.route('**/api/v1/missions/*/builds', async (route) => { await sleep(500); await route.continue(); });
+    await page.goto(`${base}/#/missions/${encodeURIComponent(key)}/tests`);
+    await page.locator('herdr-spinner').waitFor({ state: 'attached' });
+    await page.goto(`${base}/#/overview`);
+    await page.waitForFunction(() => document.body?.innerText.includes('Overview'), null, { timeout: 15000 });
+    await page.waitForTimeout(700);
+    assert.ok((await bodyText(page)).includes('Overview'));
+  }, { BURST: '0' });
+});
+
+test('mission detail links to the delivery section pages', async () => {
+  await withApp(async ({ page, base }) => {
+    const key = await alphaMissionKey(page, base);
+    // The mission detail page now carries the section nav (issue #34/#35).
+    await page.goto(`${base}/#/missions/${encodeURIComponent(key)}`);
+    await page.locator('a:has-text("Tests & builds")').first().waitFor({ timeout: 15000 });
+    await page.locator('a:has-text("Reviews & PRs")').first().click();
+    await page.waitForFunction(
+      () => (document.body ? document.body.innerText : '').includes('Pull requests'),
+      null, { timeout: 15000 });
+    assert.ok((await bodyText(page)).includes('PR #7'), 'review section must render via detail nav');
+  }, { BURST: '0' });
+});
+
+test('analytics stages and usage pages render seeded data', async () => {
+  await withApp(async ({page,base}) => {
+    await page.goto(`${base}/#/analytics/stages`);await page.locator('table.hd-table').waitFor();
+    const stageText=await page.locator('body').innerText();
+    assert.ok(stageText.includes('Bottleneck'),'stages page shows bottleneck metric');
+    await page.goto(`${base}/#/analytics/usage`);await page.locator('table.hd-table').first().waitFor();
+    const usageText=await page.locator('body').innerText();
+    assert.ok(usageText.includes('Tokens by model'),'usage page shows token grouping');
+    assert.ok(usageText.includes('Resources by kind'),'usage page shows resource grouping');
+  },{BURST:'0'});
 });

@@ -7,6 +7,7 @@ import sys
 import tempfile
 import threading
 import time
+from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.request import HTTPSHandler, build_opener
@@ -24,6 +25,18 @@ RUNS = [dict(id=i, number=i, status=status, branch=branch, commit='a' * 40,
              finished=NOW-(4-i)*86400+60) for i, status, branch in
         [(1, 'success', 'main'), (2, 'failure', 'main'), (3, 'failure', 'main'),
          (4, 'success', 'feature')]]
+
+if '--selection-contract' in sys.argv:
+    for row in RUNS:
+        row['event'] = 'push' if row['number'] == 2 else 'pull_request'
+        if row['number'] == 1:
+            row['status'] = 'failure'
+
+if '--old-selection-run' in sys.argv:
+    for row in RUNS:
+        if row['number'] in (2, 3):
+            for key in ('created', 'started', 'finished'):
+                row[key] -= 60 * 86400
 
 
 class ProviderHandler(BaseHTTPRequestHandler):
@@ -80,6 +93,20 @@ with tempfile.TemporaryDirectory() as tmp:
     server.ci_monitor.close()
     server.ci_monitor = CIMonitor(provider_factory=factory, on_observation=repo.observe_ci_pipeline)
     server.ci_monitor.refresh()
+    # Opt-in scale fixture: retained observations only, never extra provider I/O.
+    if '--117-projects' in sys.argv:
+        for project in range(116):
+            for number in range(1, 8):
+                started = NOW - number * 86400
+                repo.observe_ci_pipeline(dict(
+                    provider_url=f'https://127.0.0.1:{upstream.server_port}',
+                    provider_repo_id=1000 + project,
+                    repository=f'synthetic/project-{project:03d}', run_number=number,
+                    revision='b' * 40, branch='main', event='push',
+                    state='failure' if number % 3 == 0 else 'success',
+                    created_at=datetime.fromtimestamp(started, UTC).isoformat(),
+                    started_at=datetime.fromtimestamp(started, UTC).isoformat(),
+                    finished_at=datetime.fromtimestamp(started + 60, UTC).isoformat()))
     threading.Thread(target=server.serve, daemon=True).start()
     server.wait_until_ready()
     print(f'PORT={server.port}', flush=True)

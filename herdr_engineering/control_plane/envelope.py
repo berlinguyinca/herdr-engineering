@@ -19,6 +19,8 @@ from collections import OrderedDict
 from datetime import UTC, datetime
 from typing import Any
 
+from .federation import apply_clamp, clamp_required
+
 SCHEMA_VERSION = 2
 VISIBILITY_SCOPES = ("private", "mission", "room", "org")
 DEFAULT_FRESHNESS_SECONDS = 300
@@ -94,21 +96,32 @@ def _utc(value: Any, name: str) -> str:
     return parsed.astimezone(UTC).isoformat()
 
 
-def normalize_envelope(body: dict, principal: dict | None, received_at: str) -> dict | None:
+def normalize_envelope(body: dict, principal: dict | None, received_at: str, *, clamp=None) -> dict | None:
     """Return the trusted v2 envelope for ``body``, or None for a v1 body.
 
     ``principal`` is the authenticated caller (``{kind, id, authenticated_by}``);
     a client-supplied ``actor`` is never trusted and survives only as
     ``claimed_actor``. ``received_at`` always comes from the server clock.
+
+    ``clamp`` (``federation.Clamp``) is the per-principal visibility clamp: an envelope from a clamped principal
+    kind (today: ``peer``) is rewritten to the clamp's scope and room, and the sender's claims survive only as
+    ``claimed_*``. A clamped kind with no clamp, and a v1 body from one, is refused (PermissionError): the clamp
+    cannot be skipped by forgetting to pass it.
     """
+    if clamp_required(principal) and (clamp is None or clamp.kind != principal.get("kind")):
+        raise PermissionError("not permitted to modify this lineage object")
     version = body.get("schema_version")
     if version is None:
+        if clamp is not None:
+            raise PermissionError("not permitted to modify this lineage object")
         return None
     if isinstance(version, bool) or not isinstance(version, int) or version < 1:
         raise ValueError("schema_version must be a positive integer")
     if version > SCHEMA_VERSION:
         raise ValueError(f"unsupported schema_version {version}; this server accepts up to {SCHEMA_VERSION}")
     if version == 1:
+        if clamp is not None:
+            raise PermissionError("not permitted to modify this lineage object")
         return None
 
     event_id = body.get("event_id")
@@ -140,6 +153,8 @@ def normalize_envelope(body: dict, principal: dict | None, received_at: str) -> 
     }
     for name in _ID_FIELDS:
         env[name] = _opt_str(body, name)
+    if clamp is not None:
+        apply_clamp(env, body, clamp)       # BEFORE the hash: a replay of the same event hashes the same
     env["content_hash"] = _content_hash(body, env)
     return env
 

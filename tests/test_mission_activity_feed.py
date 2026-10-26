@@ -115,6 +115,8 @@ def test_collects_only_proven_owned_revision_and_redacts_before_transport(tmp_pa
         collector = feed.MissionActivityFeed(url, host_id='host', control_dir=root)
         result = collector.run_once()
         assert result['posted'] == 1
+        assert result['snapshot_reads'] == 1
+        assert result['snapshot_cache_hits'] == 0
         assert operations == ['ping', 'status']
         assert len(posts) == 1
         body = posts[0]
@@ -193,6 +195,32 @@ def test_unchanged_projection_is_throttled_but_real_changes_publish(tmp_path):
         (project / '.pi-eng/orchestration-snapshot.json').chmod(0o600)
         collector.run_once()
         assert len(posts) == 2
+
+
+def test_snapshot_cache_reuses_unchanged_file_and_invalidates_on_change(tmp_path, monkeypatch):
+    with native_session(tmp_path) as (root, project, _, snapshot, _):
+        collector = feed.MissionActivityFeed('http://127.0.0.1:1', host_id='host', control_dir=root)
+        original = feed._read_json
+        reads = 0
+
+        def counted_read(path, limit, private=False):
+            nonlocal reads
+            reads += 1
+            return original(path, limit, private)
+
+        monkeypatch.setattr(feed, '_read_json', counted_read)
+        first = collector._load_snapshot(str(project))
+        second = collector._load_snapshot(str(project))
+        assert first == second
+        assert reads == 1
+
+        snapshot['missions'][0]['revision'] = 8
+        path = project / '.pi-eng/orchestration-snapshot.json'
+        path.write_text(json.dumps(snapshot))
+        path.chmod(0o600)
+        refreshed = collector._load_snapshot(str(project))
+        assert refreshed['missions'][0]['revision'] == 8
+        assert reads == 2
 
 
 def test_normal_group_writable_snapshot_is_display_data_not_control_authority(tmp_path):

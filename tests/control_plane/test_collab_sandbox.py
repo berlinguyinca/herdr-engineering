@@ -179,3 +179,10 @@ def test_the_verifier_rejects_garbage_and_accepts_an_empty_log(tmp_path):
     assert verify.check(f)[0] is False
     f.write_text("")
     assert verify.check(f)[0] is True
+
+
+def test_sandbox_requests_cpu_containment_and_scope_collection():
+    text = SANDBOX.read_text()
+    assert 'HERDR_SANDBOX_CPU_QUOTA' in text
+    assert 'CPUQuota=' in text
+    assert '--collect' in text

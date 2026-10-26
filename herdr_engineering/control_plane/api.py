@@ -32,9 +32,10 @@ from urllib.parse import parse_qs, unquote, urlsplit
 from ..version import __version__
 from .envelope import EnvelopeConflict
 from .events import SequenceCollision
+from .federation import kind_for_role
 from .graph import read_graph
 from .ingest import INGEST_ENTITY_TYPES
-from .redact import redact_ingest_body, redact_payload
+from .redact import redact_delivery, redact_ingest_body, redact_payload
 from .review_quorum import pr_review_quorum
 
 log = logging.getLogger(__name__)
@@ -210,7 +211,7 @@ class ControlPlaneServer:
                  port=0, web_root=None, source=None, allow_open=False,
                  rustfs=None, dispatcher=None, github_monitor=None,
                  collab=None, collab_tls_terminated=False,
-                 collab_require_https=False, fleet_config=None, ci_actions=False,
+                 collab_require_https=False, fleet_config=None, ci_actions=False, federation_source=None,
                  public_port=None, public_host=None, collab_only=False,
                  operator_port=None, operator_user=None, operator_email=None,
                  operator_hosts=(), collab_operator_url=None, collab_dashboard_hosts=(),
@@ -287,6 +288,8 @@ class ControlPlaneServer:
             scopes[f"key:{digest}"] = {"rooms": frozenset(allow.get("rooms") or ()),
                                        "missions": frozenset(allow.get("missions") or ())}
         self.ingest = IngestService(repo, key_scopes=scopes, system_graph=system_graph)
+        # ADR-0008 P1: hot `control_plane.federation` section (None = off). Nothing mints a peer principal yet.
+        self.ingest.peer_source = federation_source
         self._limiter = _RateLimiter()
         # Fleet telemetry has a separate bounded budget so bursts cannot starve
         # dashboard reads or operator commands from the same host/proxy IP.
@@ -326,6 +329,12 @@ class ControlPlaneServer:
         self._refusal_logged: dict = {}    # T16 gap C: durable re-review requests (the route 404s when the quorum is off)
         self.collab = collab
         self.collab_require_https = collab_require_https
+        # ADR-0008 P2: signed read-only export endpoints (/api/v1/federation/*). Inert unless the hot YAML switches
+        # `control_plane.federation` on; the gateway is rebuilt if `collab` is swapped (tests do).
+        self.federation_source = federation_source
+        self._fed_gateway = None
+        if collab is not None and federation_source is not None:
+            collab.federation_source = federation_source
         # Optional second listener that serves ONLY collaboration (API, MCP and its page);
         # it is the only one an internet-facing proxy should be pointed at.
         if public_port is not None and collab is None:
@@ -848,6 +857,18 @@ def _make_handler(server, public=False, operator=False):
         # ------------------------------------------------------------ auth
         def _role(self):
             if not server._keys:
+                parts = self._decoded_parts()
+                runner_write = (self.command == "POST" and parts[:5] == ["", "api", "v1", "ci", "fix"]
+                                and ((len(parts) == 6 and parts[5] == "claim")
+                                     or (len(parts) == 7 and parts[6] in {"state", "result"})))
+                if server.ci_fix is not None and runner_write:
+                    # Only these runner writes use the dedicated key. Browser reads and
+                    # create/cancel retain the existing open tailnet posture.
+                    supplied = self.headers.get_all("X-API-Key") or []
+                    if len(supplied) == 1 and secrets.compare_digest(
+                            supplied[0].encode(), server.ci_fix_config["agent_api_key"].encode()):
+                        return "agent"
+                    return None
                 # open — only reachable via loopback or an explicit --allow-open
                 # (Tailnet trust boundary); the fail-closed guard enforces this
                 return "operator"
@@ -870,9 +891,10 @@ def _make_handler(server, public=False, operator=False):
             for candidate, role in server._keys.items():
                 if secrets.compare_digest(supplied, candidate):
                     digest = hashlib.sha256(candidate.encode()).hexdigest()[:12]
-                    # "external" and "collab" are principal kinds only the HCN service can mint; a key whose
-                    # configured role spells one of them is an ordinary unprivileged key, never that principal.
-                    kind = "unknown" if role in ("external", "collab") else role
+                    # "external" and "collab" (HCN service) and "peer"/"peer-user" (federation YAML, ADR-0008) are
+                    # principal kinds only the server can mint; a key whose configured role spells one of them is an
+                    # ordinary unprivileged key, never that principal.
+                    kind = kind_for_role(role)
                     return {"kind": kind, "id": f"key:{digest}", "authenticated_by": "api_key"}
             return {"kind": "unknown", "id": None, "authenticated_by": "none"}
 
@@ -1080,11 +1102,44 @@ def _make_handler(server, public=False, operator=False):
                 return None
             return self._json(payload, status)
 
+        def _federation(self):
+            """ADR-0008 P2. Main listener only; every refusal is the same 404 (see federation_export). The response
+            shape does not depend on whether federation is on: the same rate limiter is consumed, the connection is
+            always closed afterwards, and the body is the same bytes."""
+            from .federation_export import NOT_FOUND, FederationGateway
+            gw = server._fed_gateway
+            if gw is None or gw.service is not server.collab:
+                gw = server._fed_gateway = FederationGateway(server.collab, server.federation_source)
+            if self._rate_limit(self._proxied_client()):
+                return None
+            cl = self.headers.get_all("Content-Length") or []
+            if (len(cl) > 1 or "Transfer-Encoding" in self.headers or (cl and cl[0].strip() not in ("", "0"))
+                    or (server.collab_require_https
+                        and self.headers.get("X-Forwarded-Proto", "").lower() != "https")):
+                return self._fed_send(*NOT_FOUND)
+            return self._fed_send(*gw.handle(self.command, self.path, self.headers, b""))
+
+        def _fed_send(self, status, payload, extra):
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(payload)))
+            self.send_header("Connection", "close")      # always: an unread body must not become the next request
+            for k, v in extra.items():
+                self.send_header(k, v)
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def _is_federation_path(self):
+            return self.path.startswith("/api/v1/federation/") or self.path.split("?")[0] == "/api/v1/federation"
+
         def do_GET(self):
             if operator:
                 return self._operator()
             if public:
                 return self._public()
+            if self._is_federation_path():
+                return self._federation()
             if self._is_collab_path():
                 return self._collab()
             if self._path_only() == _FLEET_CONFIG_PATH:
@@ -1106,6 +1161,8 @@ def _make_handler(server, public=False, operator=False):
                 return self._operator()
             if public:
                 return self._public()
+            if self._is_federation_path():
+                return self._federation()        # read-only: answers the same 404 as everything else
             # Unambiguous framing, as on the public/operator listeners: this server reads
             # only Content-Length, so a chunked or doubly-sized body would be parsed as
             # the next request on a keep-alive connection. Applies to collab paths too.
@@ -1694,11 +1751,9 @@ def _make_handler(server, public=False, operator=False):
                         items = r.list_reviews(mission_id=parts[4])
                     else:  # pulls
                         items = r.list_pull_requests(mission_id=parts[4])
-                    # Redact secret-bearing keys and values, matching the
-                    # _redact_event-style redaction the issue asks for. The
-                    # delivery count fields (passed/failed/skipped/total) are
-                    # plain keys, so their values survive redaction.
-                    return self._json({sub: [redact_payload(item) for item in items]})
+                    # Delivery redaction scans string values for leaked secrets
+                    # while preserving numeric counts, urls and status text.
+                    return self._json({sub: [redact_delivery(item) for item in items]})
                 if len(parts) > 5 and parts[5] == "timeline":
                     timeline = r.mission_timeline(parts[4])
                     return self._json({"timeline": _with_collab_tasks(server, r, parts[4], timeline)})
@@ -1795,6 +1850,11 @@ def _make_handler(server, public=False, operator=False):
                 if kind == "tokens":
                     return self._json(r.token_analytics(
                         project=_q(self.path, "project"), since=_q(self.path, "since")))
+                if kind == "stages":
+                    return self._json(r.stage_analytics())
+                if kind == "usage":
+                    return self._json(r.usage_analytics(
+                        mission_id=_q(self.path, "mission")))
                 return self._json({"error": "unknown analytics kind"}, 404)
             if resource == "events":
                 if len(parts) > 4 and parts[4] == "stream":
@@ -1870,6 +1930,14 @@ def _make_handler(server, public=False, operator=False):
                 return self._github_list(what or "repositories", query)
             if resource == "ci":
                 what = parts[4] if len(parts) > 4 else ""
+                if what in {"summary", "tests"} and len(parts) == 5:
+                    filters = _ci_observability_query(self.path, what)
+                    if what == "summary":
+                        return self._json(server.ci_monitor.summary(r, **filters))
+                    view = server.ci_monitor.tests(r, **filters)
+                    cached = server.ci_monitor.summary_snapshot(start=False)
+                    view['scope']['stale'] |= bool(cached.get('stale'))
+                    return self._json(view)
                 if what == "performance" and len(parts) == 5:
                     from .ci_performance import annotate_performance
                     raw_days = _q(self.path, "days") or "14"
@@ -1893,13 +1961,18 @@ def _make_handler(server, public=False, operator=False):
                         repository_languages=cached_github_languages(server.github_monitor)))
                 if what == "reports":
                     from .project_links import annotate_ci_history, cached_github_languages
-                    view = {**r.ci_reports(), "repos": server.ci_monitor.snapshot().get("repos", [])}
-                    return self._json(annotate_ci_history(view, r,
-                        repository_languages=cached_github_languages(server.github_monitor)))
+                    filters = _ci_reports_query(self.path)
+                    view = {**r.ci_reports(**filters), "repos": server.ci_monitor.snapshot().get("repos", [])}
+                    view = annotate_ci_history(view, r,
+                        repository_languages=cached_github_languages(server.github_monitor))
+                    return self._json(server.ci_monitor.report_redactor()(view))
                 if what == "pipeline":
-                    return self._json(server.ci_monitor.detail(
+                    view = server.ci_monitor.detail(
                         _q(self.path, "repository"), _q(self.path, "number"),
-                        **({"provider_url": _q(self.path, "provider_url")} if _q(self.path, "provider_url") is not None else {})))
+                        **({"provider_url": _q(self.path, "provider_url")} if _q(self.path, "provider_url") is not None else {}))
+                    view['diagnosis'] = r.ci_diagnosis(view.get('pipeline'),
+                        redact=server.ci_monitor.report_redactor())
+                    return self._json(view)
                 if what == "log":
                     return self._json(server.ci_monitor.log(
                         _q(self.path, "repository"), _q(self.path, "number"), _q(self.path, "step"),
@@ -1964,7 +2037,8 @@ def _make_handler(server, public=False, operator=False):
                 return self._json(r.record_ci_telemetry(validate_ci_telemetry(self._read_json())))
             body = self._read_json() or {}
             if resource == "ci" and len(parts) == 5 and parts[4] == "reports":
-                return self._json(r.ingest_ci_report(body))
+                redact = server.ci_monitor.report_redactor()
+                return self._json(redact(r.ingest_ci_report(body, redact=redact)))
             if resource == "ci" and len(parts) == 5 and parts[4] == "debug":
                 from ..errors import HerdrEngineeringError
                 from .ci_debug import debug_ci
@@ -2492,6 +2566,8 @@ def _make_handler(server, public=False, operator=False):
                 raise
 
         def _json(self, data, status=200, *, etag=None, payload=None):
+            if server.ci_fix is not None and payload is None:
+                data = server.ci_fix.redact(data)
             payload = json.dumps(data).encode() if payload is None else payload
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
@@ -2630,6 +2706,75 @@ def _tests_view() -> dict[str, Any]:
 
 _FEED_SERVICE_FIELDS = ("service_id", "service_name", "host_id", "source_port", "session_id",
                         "discovery_source", "verified_origin", "ownership", "listener_identity")
+
+
+def _ci_reports_query(path):
+    from urllib.parse import parse_qs, urlsplit
+
+    from .ci_reports import normalize_provider_url
+    from .redact import redact_text
+
+    query = parse_qs(urlsplit(path).query, keep_blank_values=True, max_num_fields=8)
+    identity = {'provider_url', 'provider_repo_id', 'repository', 'run_number'}
+    if set(query) - (identity | {'compact'}) or any(len(v) != 1 for v in query.values()):
+        raise ValueError('Invalid CI report filters')
+    values = {key: value[0] for key, value in query.items()}
+    if any(not value or len(value) > 500 or not value.isprintable() or redact_text(value) != value
+           for value in values.values()):
+        raise ValueError('Invalid CI report filter')
+    if values.get('compact', '0') not in ('0', '1'):
+        raise ValueError('Invalid compact report option')
+    run = {key: value for key, value in values.items() if key in identity}
+    if run:
+        if set(run) != identity or not run['run_number'].isdigit() or int(run['run_number']) < 1:
+            raise ValueError('Exact CI report run identity is required')
+        run['provider_url'] = normalize_provider_url(run['provider_url'])
+        run['run_number'] = int(run['run_number'])
+    return {'compact': values.get('compact') == '1', 'run': run or None}
+
+
+def _ci_observability_query(path, route):
+    from urllib.parse import parse_qs, urlsplit
+
+    from .ci_reports import normalize_provider_url
+    from .redact import redact_text
+
+    query = parse_qs(urlsplit(path).query, keep_blank_values=True, max_num_fields=16)
+    allowed = {'days', 'repository', 'branch', 'provider_url', 'provider_repo_id',
+               'scope', 'start', 'end', 'mode', 'run_number'} | ({'test'} if route == 'tests' else set())
+    if set(query) - allowed or any(len(values) != 1 for values in query.values()):
+        raise ValueError('Invalid CI filters')
+    filters = {key: values[0] for key, values in query.items() if values[0] != ''}
+    for value in filters.values():
+        if len(value) > 500 or not value.isprintable() or redact_text(value) != value:
+            raise ValueError('Invalid CI filter')
+    days = filters.get('days', '14')
+    if days not in ('7', '14', '30'):
+        raise ValueError('CI days must be 7, 14 or 30')
+    filters['days'] = int(days)
+    if filters.get('mode', 'days') not in ('days', 'runs', 'hours'):
+        raise ValueError('Invalid CI window mode')
+    if 'run_number' in filters:
+        number = filters['run_number']
+        if (filters.get('mode') != 'runs' or not number.isascii() or not number.isdigit() or
+                not 0 < int(number) <= 2**63 - 1 or
+                not all(filters.get(key) for key in ('provider_url', 'provider_repo_id', 'repository'))):
+            raise ValueError('CI run selection requires a valid run and exact project identity')
+        filters['run_number'] = int(number)
+    if filters.get('scope', 'all') not in ('all', 'default', 'pr'):
+        raise ValueError('CI scope must be all, default or pr')
+    if 'start' in filters or 'end' in filters:
+        from datetime import datetime
+
+        try:
+            bounds = [datetime.fromisoformat(filters[key].replace('Z', '+00:00')) for key in ('start', 'end')]
+            if any(value.tzinfo is None for value in bounds) or bounds[0] >= bounds[1]:
+                raise ValueError()
+        except (KeyError, ValueError):
+            raise ValueError('CI bucket requires ordered start and end timestamps with time zones') from None
+    if 'provider_url' in filters:
+        filters['provider_url'] = normalize_provider_url(filters['provider_url'])
+    return filters
 
 
 def _q(path, key):

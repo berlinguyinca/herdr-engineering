@@ -8,6 +8,7 @@ import hashlib
 import json
 import math
 from datetime import datetime
+from urllib.parse import urlsplit
 from xml.etree import ElementTree
 
 from .redact import redact_text
@@ -19,26 +20,63 @@ PIPELINE_LIMIT = 2000
 HISTORY_BYTES = 16 * 1024 * 1024
 
 
-def _text(value, limit=500):
-    return redact_text(str(value or ''))[:limit]
+def _text(value, limit=500, *, redact=None):
+    value = str(value or '')
+    if redact is not None:
+        value = redact(value)
+    return redact_text(value)[:limit]
 
 
 def _tag(element):
     return element.tag.rsplit('}', 1)[-1]
 
 
-def parse_junit(xml):
-    if not isinstance(xml, str) or len(xml.encode('utf-8')) > MAX_XML_BYTES:
+def normalize_provider_url(value, *, redact=None):
+    """Accept only credential-free provider base URLs, before persistence."""
+    if (not isinstance(value, str) or not value or len(value) > 1000 or
+            not value.isprintable() or any(c.isspace() for c in value) or
+            redact_text(value) != value or '[REDACTED]' in value or
+            (redact is not None and redact(value) != value)):
+        raise ValueError('Invalid provider_url')
+    try:
+        parsed = urlsplit(value)
+        if (parsed.scheme not in {'https', 'http'} or not parsed.hostname or
+                parsed.username or parsed.password or parsed.query or parsed.fragment):
+            raise ValueError()
+        parsed.port
+    except ValueError:
+        raise ValueError('Invalid provider_url') from None
+    return value.rstrip('/')
+
+
+class _JUnitTreeBuilder(ElementTree.TreeBuilder):
+    def doctype(self, name, pubid, system):
+        # Enforce this at the parser boundary, independently of the text scan.
+        # Reject before any declared entities can be used in the document.
+        raise ValueError('JUnit DTD and entity declarations are forbidden')
+
+
+def parse_junit(xml, *, redact=None, _identity_version=2):
+    if not isinstance(xml, str) or len(xml) > MAX_XML_BYTES:
+        raise ValueError('JUnit XML must be a string of at most 1 MiB')
+    try:
+        encoded = xml.encode('utf-8')
+    except UnicodeError:
+        raise ValueError('JUnit XML must contain valid Unicode') from None
+    if '\x00' in xml:
+        raise ValueError('JUnit XML must not contain NUL characters')
+    if len(encoded) > MAX_XML_BYTES:
         raise ValueError('JUnit XML must be a string of at most 1 MiB')
     if '<!DOCTYPE' in xml.upper() or '<!ENTITY' in xml.upper():
         raise ValueError('JUnit DTD and entity declarations are forbidden')
     try:
-        root = ElementTree.fromstring(xml)
+        root = ElementTree.fromstring(xml, parser=ElementTree.XMLParser(target=_JUnitTreeBuilder()))
     except ElementTree.ParseError:
         raise ValueError('Malformed JUnit XML') from None
     if _tag(root) not in {'testsuites', 'testsuite'}:
         raise ValueError('JUnit root must be testsuite or testsuites')
     tests, identities = [], {}
+    case_groups = {}
     # Iterative traversal also handles nested suites without recursion limits.
     pending = [(root, ())]
     while pending:
@@ -56,13 +94,16 @@ def parse_junit(xml):
                 raise ValueError('JUnit case time must be a finite nonnegative number') from None
             if not math.isfinite(seconds) or seconds < 0 or seconds > 31536000:
                 raise ValueError('JUnit case time must be finite and between zero and one year')
-            name = _text(node.get('name')) or '(unnamed test)'
-            classname = _text(node.get('classname'))
-            suite = _text(' / '.join(suite_path))
+            name = _text(node.get('name'), redact=redact) or '(unnamed test)'
+            classname = _text(node.get('classname'), redact=redact)
+            suite = _text(' / '.join(suite_path), redact=redact)
             # Hash full original labels before redaction/truncation so display
             # collisions cannot create false retry or flakiness evidence.
+            labels = [suite_path, node.get('classname', ''), node.get('name', '')]
+            if _identity_version >= 2 and node.get('file'):
+                labels.append(node.get('file'))
             identity = hashlib.sha256(json.dumps(
-                [suite_path, node.get('classname', ''), node.get('name', '')],
+                labels,
                 ensure_ascii=True).encode()).hexdigest()
             occurrence = identities.get(identity, 0)
             identities[identity] = occurrence + 1
@@ -73,10 +114,19 @@ def parse_junit(xml):
             tests.append(dict(id=case_id, name=name, suite=suite, classname=classname,
                               status={'error': 'errored', 'failure': 'failed'}.get(status, status or 'passed'),
                               duration_ms=round(seconds * 1000),
-                              message=_text(detail.get('message'), 2000) if detail is not None else '',
-                              trace=_text(''.join(detail.itertext()), 4000) if detail is not None else ''))
+                              message=_text(detail.get('message'), 2000, redact=redact) if detail is not None else '',
+                              trace=_text(''.join(detail.itertext()), 4000, redact=redact) if detail is not None else ''))
+            if _identity_version >= 2 and node.get('file'):
+                tests[-1]['file'] = _text(node.get('file'), redact=redact)
+            case_groups.setdefault(identity, []).append(tests[-1])
         else:
             pending.extend((child, suite_path) for child in reversed(list(node)))
+    for cases in case_groups.values():
+        if _identity_version >= 2 and len(cases) > 1:
+            # Occurrence ordinals keep rows distinct, but do not identify a
+            # physical test across reports when duplicate labels reorder.
+            for case in cases:
+                case['identity_ambiguous'] = True
     summary = {state: sum(test['status'] == state for test in tests)
                for state in ('passed', 'failed', 'errored', 'skipped')}
     summary.update(total=len(tests), duration_ms=sum(test['duration_ms'] for test in tests))
@@ -86,30 +136,50 @@ def parse_junit(xml):
     return parsed
 
 
-def normalize_report(body, stamp):
+def normalize_report(body, stamp, *, redact=None, _identity_version=2):
     if not isinstance(body, dict):
         raise ValueError('Report must be a JSON object')
     values = {}
+    if body.get('provider_url') is not None:
+        values['provider_url'] = normalize_provider_url(body['provider_url'], redact=redact)
     for key in ('repository', 'branch', 'revision'):
         value = body.get(key)
         if not isinstance(value, str) or not value.strip() or len(value) > 500:
             raise ValueError(f'{key} must be a nonempty string of at most 500 characters')
-        values[key] = _text(value)
+        values[key] = _text(value, redact=redact)
     number = body.get('run_number')
     if isinstance(number, bool) or not isinstance(number, int) or number < 1:
         raise ValueError('run_number must be a positive integer')
     provider = body.get('provider_repo_id')
     if provider is not None and (isinstance(provider, bool) or not isinstance(provider, (str, int)) or not str(provider) or len(str(provider)) > 300):
         raise ValueError('provider_repo_id must be a string or integer')
+    if isinstance(provider, str):
+        provider = _text(provider, redact=redact)
     reported = body.get('reported_at', stamp)
     try:
         if not isinstance(reported, str) or len(reported) > 80 or datetime.fromisoformat(reported.replace('Z', '+00:00')).tzinfo is None:
             raise ValueError()
     except ValueError:
         raise ValueError('reported_at must be an ISO timestamp with timezone') from None
-    values.update(provider_repo_id=provider, run_number=number, **parse_junit(body.get('xml')))
+    values.update(provider_repo_id=provider, run_number=number,
+                  **parse_junit(body.get('xml'), redact=redact, _identity_version=_identity_version))
     digest = hashlib.sha256(json.dumps(values, sort_keys=True).encode()).hexdigest()
-    return dict(values, report_id=digest, reported_at=reported)
+    # The version is receipt metadata, outside the digest, so already-uploaded
+    # file-aware reports retain their hashes too. Version 1 is lookup-only.
+    return dict(values, report_id=digest, reported_at=reported, identity_version=_identity_version)
+
+
+def matches_legacy_report(receipt, candidate):
+    """Require the complete historical normalization, never display labels alone.
+
+    Legacy reports did not retain files. Returning their original receipts must
+    not imply that we recovered file identity or enrich their case evidence.
+    """
+    if receipt.get('identity_version', 1) != 1 or receipt.get('provider_url') is not None:
+        return False
+    metadata = {'reported_at', 'ingested_at', 'attempt', 'identity_version'}
+    return ({key: value for key, value in receipt.items() if key not in metadata} ==
+            {key: value for key, value in candidate.items() if key not in metadata})
 
 
 def reconcile_report_identities(reports, pipelines):
@@ -131,7 +201,7 @@ def reconcile_report_identities(reports, pipelines):
                for field in ('repository', 'branch', 'revision')):
             continue
         identity = tuple(pipeline.get(field) for field in fields)
-        candidates.setdefault(identity, {})[str(provider_id)] = provider_id
+        candidates.setdefault(identity, {})[(pipeline.get('provider_url'), str(provider_id))] = provider_id
     for report in reports:
         provided = report.get('provider_repo_id')
         report['uploaded_provider_repo_id'] = provided
@@ -139,6 +209,9 @@ def reconcile_report_identities(reports, pipelines):
             report['identity_status'] = 'provided'
             continue
         matches = candidates.get(tuple(report.get(field) for field in fields), {})
+        if report.get('provider_url') is not None:
+            matches = {key: value for key, value in matches.items()
+                       if key[0] == report['provider_url']}
         if len(matches) == 1:
             report['provider_repo_id'] = next(iter(matches.values()))
             report['identity_status'] = 'matched_observation'
@@ -150,7 +223,8 @@ def reconcile_report_identities(reports, pipelines):
     # then follow actual arrival order, while preserving the original receipt.
     attempts = {}
     for report in reversed(reports):
-        identity = (report['repository'], str(report.get('provider_repo_id')), report['run_number'])
+        identity = (report.get('provider_url'), report['repository'],
+                    str(report.get('provider_repo_id')), report['run_number'])
         uploaded = report.get('attempt', 1)
         report['uploaded_attempt'] = uploaded
         report['attempt'] = max(uploaded, attempts.get(identity, 0) + 1)

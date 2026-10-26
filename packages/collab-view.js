@@ -17,6 +17,7 @@ import {
   createHelpersPanel, renderEgressRequests, renderHelperTree, renderHostsTable, renderPanic, renderProfileEditor, wireHelperHandlers,
 } from './collab-helpers.js';
 import { ensureConversationStyles, mountComposer } from './conversation-composer.js';
+import { providers, ROOM_COMMANDS, unresolvedMentions, ambiguousMentions, mentionChips, resolveToken } from './collab-mention.js';
 import { renderMarkdown } from './conversation-markdown.js';
 import {
   AuthError, CollabApi, TokenStore, authorizeUrl, exchangeCode, parseRedirect, pkcePair, randomString,
@@ -355,7 +356,7 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
     frame('/agents', `<div class="cx-head"><div><h1>AI agents</h1><p class="cx-sub">Connect Claude Code, Codex, Pi or any MCP client so it can work in your rooms.</p></div>
         <div class="cx-row"><input id="hcn-agent-name" class="cx-input" maxlength="32" pattern="[a-z0-9]+(-[a-z0-9]+)*" placeholder="name (optional)" aria-label="Agent name" autocomplete="off"><button id="hcn-connect" class="hd-btn" type="button">Connect an AI agent</button></div></div>
       <div id="hcn-connect-out"></div>
-      <section class="cx-section"><h2>Add a fleet of agents</h2><div id="hcn-fleet"></div><div id="hcn-fleet-out"></div><div id="hcn-spawns"></div></section>
+      <details class="cx-section cx-fleet-details"><summary>Add a fleet of agents</summary><div id="hcn-fleet"></div><div id="hcn-fleet-out"></div><div id="hcn-spawns"></div></details>
       ${operator ? '<section class="cx-section"><h2>Hosts</h2><p class="cx-sub">Fleets started from here are spread over these hosts in turn. Untick a host to keep automatic agents off it.</p><div id="hcn-hosts"></div></section>' : ''}
       <section class="cx-section"><h2>Your agents</h2><div id="hcn-agents"></div></section>
       <section class="cx-section">${GUIDE}</section>`, strip);
@@ -545,14 +546,16 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
       return list.map((x) => `<option value="${esc(x.session_id)}"${x.session_id === cur ? ' selected' : ''}>${esc(`${x.display_name || x.agent_role || 'agent'} · ${x.host_id || ''} · ${String(x.cwd || x.session_id).split('/').filter(Boolean).pop()}`)}</option>`).join('');
     };
     const knownSessions = new Set((sessions || []).map((session) => session.session_id));
-    box.innerHTML = live.length ? `<div class="hd-grid">${live.map((a) => `<div class="hd-card cx-stack cx-agentcard" data-agent-card="${esc(a.agent_id)}" tabindex="-1"${a.agent_id === linkedAgent ? ' style="outline:2px solid var(--accent);outline-offset:2px"' : ''}>
+    const families=[...new Set(live.map(a=>a.harness_type).filter(Boolean))].sort();
+    box.innerHTML = live.length ? `<div class="cx-agent-toolbar" aria-label="Agent bulk controls"><strong>${live.length} active agents</strong><label class="cx-msg">Group <select data-agent-family-filter><option value="">All families</option>${families.map(f=>`<option value="${esc(f)}">${esc(f)}</option>`).join('')}</select></label><span class="cx-msg" data-agent-selected-count>0 selected</span><button type="button" class="hd-btn hd-btn--danger hd-btn--sm" data-agent-stop-selected disabled>Stop selected</button><button type="button" class="hd-btn hd-btn--danger hd-btn--sm" data-agent-stop-all>Stop all active</button></div><div class="hd-grid">${live.map((a) => `<div class="hd-card cx-stack cx-agentcard" data-agent-family="${esc(a.harness_type || '')}" data-agent-card="${esc(a.agent_id)}" tabindex="-1"${a.agent_id === linkedAgent ? ' style="outline:2px solid var(--accent);outline-offset:2px"' : ''}>
+        <input class="cx-agent-select" type="checkbox" data-agent-select="${esc(a.agent_id)}" aria-label="Select ${esc(a.name || a.agent_id)}">
         <div class="cx-row cx-row--between"><span class="hd-card__title">${agentTitle({ ...a, name: a.name || a.harness_type, display_name: sessions?.find(s=>s.session_id===a.instance_id)?.display_name }, true)}</span>${pill('Active', 'var(--status-ok)')}</div>
         <span class="hd-ident">${esc(a.harness_type)} · ${esc(a.agent_id)}</span>
         ${a.instance_id ? '<span class="hd-card__sub">Linked to a HerdR agent. The readable name is shared; the @ handle routes Collaboration tasks.</span>' : ''}
         ${knownSessions.has(a.instance_id) ? nativeSessionLink(a.instance_id) : ''}
         <span class="hd-card__sub">Expires ${esc(new Date(a.expires_at * 1000).toLocaleDateString())} · ${a.rooms.length ? `in ${esc(a.rooms.map((r) => r.name).join(', '))}` : 'not in any room yet'}</span>
         ${sessions ? `<label class="cx-msg">Fabric agent <select data-link="${esc(a.agent_id)}"><option value="">not linked</option>${sessionOptions(a.instance_id)}</select></label>` : ''}
-        <div><button type="button" class="hd-btn hd-btn--danger hd-btn--sm" data-revoke="${esc(a.agent_id)}">Revoke</button></div></div>`).join('')}</div>`
+        <div><button type="button" class="hd-btn hd-btn--danger hd-btn--sm" data-revoke="${esc(a.agent_id)}">Stop access</button></div></div>`).join('')}</div>`
       : '<div class="hd-empty">No connected agents yet.</div>';
     if (focusLinkedAgent) {
       const selected = [...box.querySelectorAll('[data-agent-card]')].find((card) => card.dataset.agentCard === linkedAgent);
@@ -560,7 +563,14 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
     }
     wireRename(box, renderAgents);
     box.querySelectorAll('[data-link]').forEach((sel) => { sel.onchange = async () => { try { await api.linkAgent(sel.dataset.link, sel.value); } catch (e) { alert(e.message); } }; });
-    box.querySelectorAll('[data-revoke]').forEach((b) => { b.onclick = async () => { await api.revokeAgent(b.dataset.revoke); renderAgents(); }; });
+    box.querySelectorAll('[data-revoke]').forEach((b) => { b.onclick = async () => { if (!window.confirm('Revoke this agent access and stop it?')) return; await api.revokeAgent(b.dataset.revoke); renderAgents(); }; });
+    const filter=box.querySelector('[data-agent-family-filter]'),countBox=box.querySelector('[data-agent-selected-count]'),selectedButton=box.querySelector('[data-agent-stop-selected]');
+    const syncBulk=()=>{const chosen=[...box.querySelectorAll('[data-agent-select]:checked')];if(countBox)countBox.textContent=`${chosen.length} selected`;if(selectedButton)selectedButton.disabled=!chosen.length;box.querySelectorAll('[data-agent-card]').forEach(card=>{card.hidden=!!(filter?.value&&card.dataset.agentFamily!==filter.value);});};
+    filter?.addEventListener('change',syncBulk);box.querySelectorAll('[data-agent-select]').forEach(input=>input.addEventListener('change',()=>{input.closest('[data-agent-card]')?.classList.toggle('cx-agent-card--selected',input.checked);syncBulk();}));
+    const stop=async(ids)=>{if(!ids.length||!window.confirm(`Revoke access and stop ${ids.length} agent${ids.length===1?'':'s'}?`))return;await Promise.all(ids.map(id=>api.revokeAgent(id)));renderAgents();};
+    selectedButton?.addEventListener('click',()=>stop([...box.querySelectorAll('[data-agent-select]:checked')].map(i=>i.dataset.agentSelect)));
+    box.querySelector('[data-agent-stop-all]')?.addEventListener('click',()=>stop(live.map(a=>a.agent_id)));
+    syncBulk();
   }
 
   // ---- one tab per room, then the AI agents page
@@ -587,7 +597,7 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
     const guest = info.role === 'guest';
     let names = new Map((info.members || []).map((m) => [m.user_id, m.email || shortId(m.user_id)]));
     const agentName = new Map();           // agent id -> handle, for rendering task events
-    const S = { agents: [], tasks: [], flow: null, requests: null, mine: [], links: null, missions: null, tabs: null, tabsAt: 0, tabSel: null, externals: null, deleg: null, props: null, propSel: null, propOne: null, profile: null, allow: [], egress: [], helpers: [], paused: false, entries: null };
+    const S = { agents: [], people: [], tasks: [], flow: null, requests: null, mine: [], links: null, missions: null, tabs: null, tabsAt: 0, tabSel: null, externals: null, deleg: null, props: null, propSel: null, propOne: null, profile: null, allow: [], egress: [], helpers: [], paused: false, entries: null };
     const tabs = [['chat', 'Chat'], ...(guest ? [] : [['flow', 'Flow']]), ['tasks', 'Tasks'], ...(guest ? [] : [['agents', 'Agents'], ['tabs', 'Tabs'], ['lineage', 'Lineage'], ['attention', 'Attention'], ['progress', 'Progress'], ['links', 'Workspaces']]), ...(canInvite ? [['proposals', 'Proposals'], ['people', 'People']] : [])];
     let sub = subTab.get(roomId);
     if (!tabs.some(([k]) => k === sub)) sub = 'chat';
@@ -717,7 +727,7 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
         const cont = key === lastKey && at - lastAt < 5 * 60000;
         lastKey = key; lastAt = at.getTime();
         row.className = `cx-m${mine ? ' cx-m--mine' : ''}${agent ? ' cx-m--agent' : ''}${cont ? ' cx-m--cont' : ''}`;
-        row.innerHTML = `${mine ? '' : `<span class="cx-av" style="--h:${hueOf(key)}" aria-hidden="true">${agent ? '🤖' : esc(initials(who))}</span>`}<div class="cx-mbody"><div class="cx-meta"><b>${esc(who)}</b><span>${esc(time)}</span></div><div class="cx-bubble conversation-markdown">${renderMarkdown(e.text)}</div>${e.context ? `<div class="ctx-ref">${renderContextChip(e.context)}</div>` : ''}</div>`;
+        row.innerHTML = `${mine ? '' : `<span class="cx-av" style="--h:${hueOf(key)}" aria-hidden="true">${agent ? '🤖' : esc(initials(who))}</span>`}<div class="cx-mbody"><div class="cx-meta"><b>${esc(who)}</b><span>${esc(time)}</span></div><div class="cx-bubble conversation-markdown">${mentionChips(renderMarkdown(e.text), e.mentions, mentionCtx())}</div>${e.context ? `<div class="ctx-ref">${renderContextChip(e.context)}</div>` : ''}</div>`;
         return row;
       }
       lastKey = null;
@@ -1389,9 +1399,14 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
     root.querySelectorAll('[data-sub]').forEach((b) => { b.onclick = () => showSub(b.dataset.sub); });
     root.querySelectorAll('.cx-panel').forEach((p) => { p.hidden = p.id !== `hcn-p-${sub}`; });
 
+    function mentionCtx() {
+      return { people: S.people, commands: ROOM_COMMANDS,
+        agents: S.agents.map((a) => ({ ...a, label: namedAgent(a).display_name || '' })) };
+    }
     // ---- one long-poll feeds every panel (replaces five timers); it sleeps while the tab is hidden
     const apply = (s) => {
       if (s.agents) { S.agents = s.agents; S.agents.forEach((a) => agentName.set(a.agent_id, a.name)); }
+      if (s.people) S.people = s.people;
       S.links = s.links ?? null; S.missions = s.missions ?? null;
       S.tasks = s.tasks || []; S.flow = s.flow || null; S.requests = s.requests || null;
       S.agents.forEach(a=>agentName.set(a.agent_id,namedAgent(a).display_name || a.name));
@@ -1438,18 +1453,27 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
     if ($('hcn-composer')) {
       composer = mountComposer($('hcn-composer'), {
         draftKey: `collab:${me.user_id}:${roomId}`,
-        placeholder: 'Message the room… type @ to hand an agent a task',
-        hint: 'Enter sends · Shift+Enter adds a line · @agent … gives that agent a task',
-        suggestions: () => S.agents.filter((a) => a.actions.includes('execute')).map((a) => ({
-          id: a.agent_id, label: namedAgent(a).display_name || `@${a.name}`, insertText: `@${a.name}`,
-          detail: `${a.harness_type} · ${names.get(a.owner_user_id) || shortId(a.owner_user_id)}`,
-        })),
+        placeholder: 'Message the room… @ people, agents and files · / commands',
+        hint: 'Enter sends · Shift+Enter adds a line · @gert.pi … gives that agent a task',
+        providers, context: mentionCtx,
+        check: (text) => {
+          const ctx = mentionCtx(), notes = [];
+          for (const a of ambiguousMentions(text, ctx)) notes.push(`@${a.name} is ambiguous — use ${a.forms.length ? a.forms.join(' or ') : '@owner.harness'}.`);
+          const missing = unresolvedMentions(text, ctx);
+          if (missing.length) notes.push(`${missing.map((n) => `@${n}`).join(', ')} addresses nobody here; it will be sent as plain text.`);
+          return notes.join(' ');
+        },
         onSend: async (text) => {
-          const mention = /^@([a-z0-9-]{1,32})\s+([\s\S]+)$/.exec(text.trim());
-          if (mention) { // Preserve the room's authenticated leading-agent task contract.
-            const hits = S.agents.filter((a) => a.name === mention[1] && a.actions.includes('execute'));
-            if (hits.length !== 1) throw new Error(hits.length ? `More than one agent is called @${mention[1]}; use the Tasks tab` : `No agent named @${mention[1]} in this room accepts tasks`);
-            await api.createTask(roomId, hits[0].agent_id, mention[2]);
+          // The text goes out exactly as typed: the server derives mentions, and a harness reads what was written.
+          const lead = /^@([a-z0-9._-]{1,48})\s+\S/i.exec(text.trim());
+          // the same precedence as the server: a group or a person handle is never an agent's task
+          const found = lead && resolveToken(lead[1].toLowerCase(), mentionCtx());
+          if (found?.ambiguous) throw new Error(`More than one agent or person is called @${lead[1]}; use ${found.ambiguous.length ? found.ambiguous.join(' or ') : '@owner.harness'}`);
+          const hit = found?.hit;
+          const target = hit && hit.kind === 'agent' && S.agents.find((a) => a.agent_id === hit.id);
+          const mention = target && target.actions.includes('execute');
+          if (mention) { // the room's authenticated leading-agent task contract, now with the verbatim text
+            await api.createTask(roomId, target.agent_id, text);
           } else { await api.say(roomId, text, CTX.attach ? contextBody(CTX.attach) : undefined); CTX.attach = null; drawAttach(); }
           if (alive) { kick(); log.scrollTop = log.scrollHeight; }
           return { status: 'delivered', message: mention ? 'Task created' : 'Message posted' };

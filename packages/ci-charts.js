@@ -63,3 +63,48 @@ export function renderCiCharts(model,{stale=false,partial=false,retained=false,d
     <section class="ci-chart-card"><h2>Finished run durations</h2><p class="ci-chart-note">${model.durations.length} of ${model.measured} measured runs, ordered by finish time.</p>${durationPlot(model.durations)}<p class="ci-chart-note">Actual start to finish; queued time is excluded.${model.unmeasured?` ${model.unmeasured} terminal runs lack a valid positive duration.`:''}</p></section></div>
     ${renderCiPerformance(model.performance)}<details class="ci-chart-data" data-ci-chart-data><summary>Chart data</summary><h3>Observed outcomes</h3>${table(['UTC date','Finished','Failed','Open / unknown'],model.days.map(d=>[d.day,d.finished,d.failed,d.current]))}<h3>Measured run durations</h3>${table(['Run','Outcome','Finished (UTC)','Duration'],model.durations.map(p=>[runLabel(p),labels[p.tab],utc(p.finishedAt),formatDuration(p.durationMs)]))}${renderCiPerformanceData(model.performance)}</details>`;
 }
+
+// Compact summary statistics are already windowed server-side. Never average
+// project percentiles or fill missing dates/samples with invented zero values.
+export function ciPercentiles(stats={},minimum=5) {
+  const samples=Number.isFinite(stats?.sample_count)?Math.max(0,stats.sample_count):0;
+  const value=key=>samples>=Math.max(5,minimum)&&Number.isFinite(stats?.[key])&&stats[key]>=0?stats[key]:null;
+  return {samples,p50:value('p50'),p95:value('p95')};
+}
+const compactRate=row=>row.completed_count>0?row.failure_count/row.completed_count:null;
+const exactNumber=value=>Number.isFinite(value)?String(value):'Not reported';
+function summaryLine(days,series,label,{percent=false}={}) {
+  const values=series.flatMap(s=>days.map(s.value)).filter(Number.isFinite);
+  if(!values.length)return '<p class="ci-chart-note">Insufficient data for this trend.</p>';
+  const max=percent?1:Math.max(1,...values);
+  const x=i=>42+(days.length===1?.5:i/(days.length-1))*300;
+  const y=v=>130-v/max*100;
+  const paths=series.map(s=>{
+    let connected=false;
+    const points=days.map((d,i)=>{const v=s.value(d);if(!Number.isFinite(v)){connected=false;return '';}const command=connected?'L':'M';connected=true;return `${command}${number(x(i))} ${number(y(v))}`;}).join(' ');
+    return `<path d="${points}" fill="none" stroke="${s.color}" stroke-width="2"${s.dashed?' stroke-dasharray="5 3"':''}/>${days.map((d,i)=>{const v=s.value(d);return Number.isFinite(v)?`<circle cx="${number(x(i))}" cy="${number(y(v))}" r="3" fill="${s.color}"><title>${esc(d.day)} · ${s.label}: ${percent?number(v*100)+'%':exactNumber(v)+' s'}</title></circle>`:'';}).join('')}`;
+  }).join('');
+  return `<svg viewBox="0 0 360 165" role="img" aria-label="${esc(label)}"><title>${esc(label)}</title><desc>UTC dates, oldest to newest. Gaps mean insufficient observations. Exact values follow in the data table.</desc><line x1="42" y1="130" x2="342" y2="130"/><text x="42" y="20">${percent?'100%':number(max)+' s'}</text>${paths}<text x="42" y="150">${esc(days[0]?.day)}</text><text x="342" y="150" text-anchor="end">${esc(days.at(-1)?.day)}</text></svg>`;
+}
+export function renderCiSparkline(days=[],label='Project') {
+  return summaryLine(days,[{value:compactRate,color:'var(--status-attention)',label:'Failure rate'}],`${label} failure rate`,{percent:true});
+}
+export function renderCiSummaryCharts(days=[],{minimum=5}={}) {
+  if(!days.length)return '<p class="ci-chart-note">No dated observations in this window.</p>';
+  const states=[...new Set(days.flatMap(d=>Object.keys(d.outcomes||{})))].sort();
+  const maximum=Math.max(1,...days.map(d=>Object.values(d.outcomes||{}).reduce((sum,v)=>sum+(Number.isFinite(v)?v:0),0)));
+  const colors=['var(--status-ok)','var(--status-attention)','var(--accent)','var(--text-secondary)'];
+  const color=state=>['success','passed'].includes(state)?colors[0]:['failure','failed','error','errored','timed_out','crashed'].includes(state)?colors[1]:['running','started','pending','queued','waiting','blocked'].includes(state)?colors[2]:colors[3];
+  const bars=days.map((d,i)=>{let y=130;return states.map(state=>{const count=d.outcomes?.[state]||0,height=count/maximum*100;y-=height;return count?`<rect x="${number(42+i*300/days.length)}" y="${number(y)}" width="${number(Math.min(24,240/days.length))}" height="${number(height)}" fill="${color(state)}"><title>${esc(d.day)} · ${esc(state)}: ${count}</title></rect>`:'';}).join('');}).join('');
+  const outcomes=`<svg viewBox="0 0 360 165" role="img" aria-label="Outcomes by UTC day"><title>Outcomes by UTC day</title><desc>Provider outcomes remain distinct. Canceled, skipped and unknown runs never enter pass/fail denominators. Exact values follow.</desc><text x="42" y="20">${maximum} runs</text>${bars}<line x1="42" y1="130" x2="342" y2="130"/><text x="42" y="150">${esc(days[0].day)}</text><text x="342" y="150" text-anchor="end">${esc(days.at(-1).day)}</text></svg>`;
+  const failure=renderCiSparkline(days,'Completed runs');
+  const duration=summaryLine(days,['p50','p95'].map((key,i)=>({label:key,value:d=>ciPercentiles(d.duration_seconds,minimum)[key],color:i?'var(--text-secondary)':'var(--accent)',dashed:!!i})),'Completed-run duration');
+  const exact=table(['UTC date','Provider outcomes','Failed / completed','Failure rate','Duration samples','p50 (seconds)','p95 (seconds)'],days.map(d=>{const p=ciPercentiles(d.duration_seconds,minimum);return [d.day,Object.entries(d.outcomes||{}).map(([key,v])=>`${key}: ${v}`).join(', '),`${d.failure_count} / ${d.completed_count}`,compactRate(d)===null?'Not reported':`${number(compactRate(d)*100)}%`,p.samples,p.p50??'Insufficient data',p.p95??'Insufficient data'];}));
+  return `<div class="ci-chart-grid">${[['Outcomes by UTC day',outcomes,'Success · failure · active · other provider outcomes'],['Failure rate',failure,'Failed / successful or failed runs; canceled and skipped excluded.'],['Completed-run duration',duration,`p50 solid · p95 dashed. At least ${Math.max(5,minimum)} measured completed runs per UTC day.`]].map(([title,plot,note])=>`<section class="ci-chart-card"><h3>${title}</h3>${plot}<p class="ci-chart-note">${note}</p></section>`).join('')}</div><details data-ob-disclosure="chart-data" class="ci-chart-data"><summary>Exact chart data</summary>${exact}</details>`;
+}
+export function renderCiTestPareto(tests=[]) {
+  const sorted=[...tests].filter(t=>t.failure_count>0).sort((a,b)=>b.failure_count-a.failure_count).slice(0,10);
+  if(!sorted.length)return '<p class="ci-chart-note">No reported test failures in this selection.</p>';
+  const max=sorted[0].failure_count;
+  return `<section class="ci-chart-card"><h3>Top failing tests</h3><p class="ci-chart-note">Up to 10 tests, ranked by failed or errored reported attempts. Exact counts are in the test table.</p><svg viewBox="0 0 480 ${sorted.length*30+10}" role="img" aria-label="Top failing tests by reported failure count"><title>Top failing tests</title><desc>Horizontal bars ranked by failure count. Labels and exact counts follow in test history.</desc>${sorted.map((t,i)=>`<text x="0" y="${i*30+20}">${esc((t.name||t.id||'Test').slice(0,24))}</text><rect x="180" y="${i*30+6}" width="${t.failure_count/max*250}" height="18" fill="var(--status-attention)"><title>${esc(t.name||t.id)}: ${t.failure_count} failures</title></rect><text x="440" y="${i*30+20}">${t.failure_count}</text>`).join('')}</svg></section>`;
+}

@@ -515,7 +515,7 @@ def _fix_world(**kw):
     from herdr_engineering.control_plane.ci_fix import CIFixService, ci_fix_config
     clock = [NOW]
     repo = ControlPlaneRepo(now=lambda: clock[0], sink=_Sink())
-    service = CIFixService(repo, ci_fix_config({"enabled": True, "hosts": ["bender"]}))
+    service = CIFixService(repo, ci_fix_config({"agent_api_key": "test-ci-fix-agent-key", "enabled": True, "hosts": ["bender"]}))
     inbox = AttentionInbox(repo, ci_snapshot=lambda: {"status": "ok", "pipelines": {}}, ci_fix=service,
                            config=kw.get("config"), now=lambda: clock[0])
     return repo, service, inbox, clock

@@ -10,7 +10,9 @@ to one control-plane entity.
 """
 from __future__ import annotations
 
+import hashlib
 import logging
+import math
 import re
 
 from ..review_gate.entities import RESERVED_ENTITY_PREFIXES
@@ -18,6 +20,10 @@ from ..review_gate.entities import RESERVED_ENTITY_PREFIXES
 log = logging.getLogger(__name__)
 from .envelope import ENVELOPE_ONLY_TYPES, EnvelopeConflict, normalize_envelope
 from .events import SequenceCollision
+from .federation import (
+    clamp_for_principal, in_peer_namespace, is_peer_actor, is_peer_node, peer_fingerprint, peer_of,
+    policy_from_source,
+)
 from .graph import validate_lineage
 from .host_metrics_store import STATE_KEYS, clean_metrics, clean_state
 from .project_links import canonical_repository
@@ -43,7 +49,8 @@ def _git_identity(payload):
 # Entity types an ingest principal may write. Dispatched types have handlers; the generic ones are
 # plain activity records nothing authoritative reads back. Adding a type here is a security decision.
 DISPATCHED_ENTITY_TYPES = frozenset({"lineage", "host", "session", "mission", "service", "inspector",
-                                     "mission_activity"})
+                                     "mission_activity", "test_run", "build", "review",
+                                     "review_finding", "pull_request", "token_usage", "resource_usage"})
 # ledger / platform / lifecycle are the Pi envelope adapters' activity streams (envelopeAdapters.ts)
 # repository / request / span are the opt-in system-graph adapter's lifecycle streams (graph_ingest.py, runbook
 # docs/specs/herdr-system-graph-20261020/11-p0-p6-status-and-runbook.md). They were accepted before T16, nothing
@@ -81,6 +88,9 @@ class IngestService:
         # the HCN service's `is_hcn_node`; checked on EVERY endpoint of an edge, so an ingest key cannot attach
         # a fake `produced` edge to an accepted artifact either.
         self.service_node = None
+        # ADR-0008 P1: hot source of the raw `control_plane.federation` YAML section (set by the server; None = no
+        # federation, so no peer event is ever admitted). Read once per ingest; any failure means OFF.
+        self.peer_source = None
         # System-graph live-ingest adapter (system-graph spec P2-P4). When enabled,
         # mission/session/repository/request/span lifecycle events are ALSO emitted
         # as lineage envelopes into the running graph. Opt-in; disabled by default.
@@ -89,12 +99,63 @@ class IngestService:
             from .graph_ingest import GraphIngestAdapter
             self.system_graph = GraphIngestAdapter(repo, scope="org")
 
+    def _peer_policy(self, actor):
+        """The enabled YAML policy of the peer ``actor`` is, or None. The actor must be well formed, federation
+        and that peer switched on, and its pinned key fingerprint must still be the configured one: removing
+        or re-keying a peer in YAML refuses its next event."""
+        found = peer_of(actor)
+        policy = policy_from_source(self.peer_source)
+        if found is None or not policy.enabled:
+            return None
+        peer = policy.peer(found[0])
+        full = peer_fingerprint(actor)
+        # the FULL pinned fingerprint, and the id's display label must be its prefix (ADR-0008 P2: P1 matched 12 chars)
+        if peer is None or not peer.enabled or full is None or full[:12] != found[1] or not peer.matches(full):
+            return None
+        return peer
+
+    def _peer_clamp(self, principal, entity_type):
+        """ADR-0008 Decision 4. None for a non-peer. A peer is admitted only as a v2 ``lineage`` writer bound to
+        its one mirror room; anything else (a v1 body, another entity type, a peer-user, an unknown or disabled
+        peer) is refused with the same 403 as any lineage refusal, before anything is stored."""
+        if not is_peer_actor(principal):
+            return None
+        deny = PermissionError("not permitted to modify this lineage object")
+        policy = self._peer_policy(principal)            # (a peer-user, or any malformed actor, has no policy)
+        if policy is None or entity_type != "lineage":
+            raise deny
+        return clamp_for_principal(principal, bind_room_id=policy.mirror_room)
+
+    def _check_peer_namespace(self, env: dict, event_type: str, payload: dict, entity_id=None) -> None:
+        """The reserved ``peer:<peer>.`` node namespace (Decision 7). Unconditional: it holds for EVERY actor kind
+        (an operator, the HCN service and an open listener included), whether or not a collab service is wired.
+        Nobody local may write, attach to or edge into it; a peer may write ONLY inside its own namespace, on
+        EVERY endpoint, so a mirrored edge can never touch a local node, and its ``entity_id`` (the stream the row
+        is stored under) must lie inside it too."""
+        actor = env.get("actor") or {}
+        ends = ((payload.get("from_id"), payload.get("to_id")) if event_type.startswith("edge.")
+                else (payload.get("node_id"),))
+        found = peer_of(actor)
+        if is_peer_actor(actor):
+            if found is None or not all(in_peer_namespace(e, found[0]) for e in (*ends, entity_id)):
+                raise PermissionError("not permitted to modify this lineage object")
+        elif any(is_peer_node(e) for e in ends):
+            raise PermissionError("not permitted to modify this lineage object")
+
     def _check_lineage_scope(self, env: dict) -> None:
         """Fail closed: a non-operator key may address a room or mission only if the operator listed it.
         Refused with the same PermissionError (HTTP 403, reason lineage_forbidden) as any lineage refusal,
         before anything is persisted or sequenced."""
         scope = env.get("visibility_scope")
         actor = env.get("actor") or {}
+        if is_peer_actor(actor):
+            # a peer is checked like a non-operator key, whatever scope it asked for (the clamp made it `room`):
+            # its one room comes from the hot YAML policy, never from key_scopes, and "*" is never honoured
+            policy = self._peer_policy(actor)
+            if (policy is None or policy.mirror_room is None or scope != "room"
+                    or env.get("room_id") != policy.mirror_room):
+                raise PermissionError("not permitted to modify this lineage object")
+            return
         if scope not in ("room", "mission") or (
                 actor.get("kind") == "operator" and actor.get("authenticated_by") not in (None, "none")):
             return
@@ -173,21 +234,29 @@ class IngestService:
         if entity_type.strip().lower().startswith("architecture"):
             raise ValueError("reserved architecture entity type is not accepted by generic ingestion")
         # T16 H1/M1/M5: an ALLOW-LIST. Everything else (collab, ci_*, plannotator_review, agent_identity,
-        # token_usage, ...) is owned by a dedicated, authenticated adapter and can never be written here.
+        # custom_model, llm_key, ...) is owned by a dedicated, authenticated adapter and can never be
+        # written here. token_usage / resource_usage ARE on the dispatched allow-list (issue #36).
         if entity_type not in INGEST_ENTITY_TYPES:
             raise ValueError("entity type is not accepted by generic ingestion")
         if event_type in SERVER_OWNED_EVENT_TYPES.get(entity_type, ()):
             raise ValueError("event type is reserved for the server")
-        env = normalize_envelope(body, principal, self.repo._stamp())
+        clamp = self._peer_clamp(principal, entity_type)
+        env = normalize_envelope(body, principal, self.repo._stamp(), clamp=clamp)
+        if clamp is not None:
+            # a peer removed or re-keyed in YAML while its request is in flight must not land: re-read the hot
+            # policy under the ledger lock, immediately before admission (the T10 `valid` hook)
+            outer = valid
+            valid = lambda: (outer is None or outer()) and self._peer_policy(principal) is not None  # noqa: E731
         if env is None and entity_type == "lineage":
             raise ValueError("lineage events require schema_version 2")
         if env is not None and entity_type == "lineage":
+            self._check_peer_namespace(env, event_type, payload, entity_id)
             self._check_lineage_scope(env)
             self._check_reserved_nodes(env, event_type, payload)
+        self._prevalidate(entity_type, entity_id, payload, event_type, source)
         if env is None:
             return self._dispatch(entity_type, entity_id, event_type, payload, source)
         env["entity_type"] = entity_type
-        self._prevalidate(entity_type, entity_id, payload, event_type)
         ledger = self.repo.ledger
         ack = {"event_id": env["event_id"], "source": env["source"],
                "source_sequence": env["source_sequence"]}
@@ -234,6 +303,12 @@ class IngestService:
                 if entity_type == "lineage":
                     result = self._apply_lineage(entity_id, event_type, payload, env)
                 else:
+                    # Usage projections must keep the envelope's (possibly backdated)
+                    # timestamp so retention ages them out correctly; the durable event
+                    # carries it but add_token_usage/add_resource_usage read payload only.
+                    if entity_type in ("token_usage", "resource_usage") and isinstance(payload, dict) \
+                            and not payload.get("occurred_at"):
+                        payload = {**payload, "occurred_at": env.get("occurred_at") or env.get("received_at")}
                     result = self._dispatch(entity_type, entity_id, event_type, payload, source,
                                             record_generic=False)
             finally:
@@ -266,9 +341,13 @@ class IngestService:
             raise RuntimeError("durable event identity is unavailable")
         return tuple(found)
 
-    @staticmethod
-    def _prevalidate(entity_type, entity_id, payload, event_type="") -> None:
-        """Reject what a handler would reject BEFORE the envelope is persisted."""
+    def _prevalidate(self, entity_type, entity_id, payload, event_type="", source="herdr") -> None:
+        """Reject what a handler would reject BEFORE the envelope is persisted.
+
+        Runs for both v1 (legacy) and v2 (enveloped) ingest so a malformed
+        report never consumes its event id/sequence: the corrected retry with
+        the same idempotency identity can still be applied.
+        """
         if entity_type == "mission" and ":" in entity_id:
             raise ValueError("invalid mission id")
         if entity_type == "lineage":
@@ -279,7 +358,65 @@ class IngestService:
                 k in payload for k in ("repository_id", "forge_url", "repository_url",
                                        "repo_url", "clone_url", "commit_sha")):
             _git_identity(payload)
+        if entity_type in ("test_run", "build"):
+            self._validate_test_counts(payload)
+            self._delivery_mission_key(payload.get("mission_id"), source)
+        elif entity_type == "review":
+            self._delivery_mission_key(payload.get("mission_id"), source)
+        elif entity_type == "review_finding":
+            severity = payload.get("severity")
+            if not isinstance(severity, str) or not severity:
+                raise ValueError("severity is required")
+            if not isinstance(payload.get("summary"), str):
+                raise ValueError("summary is required")
+            # The finding attaches to the review named by ``entity_id``; the
+            # review must already exist so a forged/unknown review can never
+            # consume the source sequence of a report that will be rejected.
+            if self.repo.get_review(entity_id) is None:
+                raise KeyError(entity_id)
+        elif entity_type == "pull_request":
+            self._delivery_mission_key(payload.get("mission_id"), source)
+        elif entity_type == "token_usage":
+            if not isinstance(payload, dict):
+                raise ValueError("token usage must be an object")
+            for k in ("input_tokens", "output_tokens", "reasoning_tokens",
+                      "cache_read_tokens", "cache_write_tokens", "duration_ms",
+                      "retry_number"):
+                v = payload.get(k)
+                if v is None:
+                    continue
+                if (isinstance(v, bool) or not isinstance(v, (int, float))
+                        or not math.isfinite(v) or v < 0):
+                    raise ValueError(f"{k} must be a finite non-negative number")
+        elif entity_type == "resource_usage":
+            if not isinstance(payload, dict):
+                raise ValueError("resource usage must be an object")
+            kind = payload.get("kind")
+            if not isinstance(kind, str) or not kind:
+                raise ValueError("resource kind is required")  # rejected pre-persist
+            value = payload.get("value")
+            if (isinstance(value, bool) or not isinstance(value, (int, float))
+                    or not math.isfinite(value) or value < 0):
+                raise ValueError("value must be a finite non-negative number")
 
+    @staticmethod
+    def _validate_test_counts(payload) -> None:
+        for key in ("passed", "failed", "skipped", "total"):
+            value = payload.get(key)
+            if value is None:
+                continue
+            # bool is an int subclass but is not a count; NaN/Infinity are numbers
+            # but cannot be serialized as JSON and would corrupt displayed metrics.
+            if isinstance(value, bool) or not isinstance(value, (int, float)) \
+                    or isinstance(value, float) and (value != value or value in (float('inf'), float('-inf'))):
+                raise ValueError(f"{key} must be a finite number")
+            if value < 0:
+                raise ValueError(f"{key} must be non-negative")
+        results = payload.get("results")
+        if results is not None:
+            if not isinstance(results, list) or any(
+                    not isinstance(r, dict) for r in results):
+                raise ValueError("results must be a list of objects")
     def _dispatch(self, entity_type, entity_id, event_type, payload, source,
                   record_generic=True) -> dict:
         # System-graph live-ingest adapter (opt-in): reflect lifecycle events
@@ -325,12 +462,115 @@ class IngestService:
             res = self.repo.inspector.ingest(entity_id, payload)
             return {"entity_type": "inspector", "entity_id": entity_id,
                     "event_type": event_type, **res}
+        if entity_type in ("test_run", "build"):
+            return self._ingest_test_run(entity_id, event_type, payload, source,
+                                         kind="test" if entity_type == "test_run" else "build")
+        if entity_type == "review":
+            return self._ingest_review(entity_id, event_type, payload, source)
+        if entity_type == "review_finding":
+            return self._ingest_review_finding(entity_id, payload, source)
+        if entity_type == "pull_request":
+            return self._ingest_pull_request(entity_id, event_type, payload, source)
+        if entity_type == "token_usage":
+            # An already-persisted schema-v2 envelope row must not be recorded a
+            # second time by the projection (record_generic is False there), or
+            # an event-only reload would replay (and double-count) both records.
+            payload = {**payload, "mission_id": self._delivery_mission_key(payload.get("mission_id"), source)}
+            rec = self.repo.add_token_usage(payload, record_event=record_generic)
+            return {"entity_type": "token_usage", "entity_id": entity_id,
+                    "event_type": event_type, "usage": rec}
+        if entity_type == "resource_usage":
+            payload = {**payload, "mission_id": self._delivery_mission_key(payload.get("mission_id"), source)}
+            rec = self.repo.add_resource_usage(payload, record_event=record_generic)
+            return {"entity_type": "resource_usage", "entity_id": entity_id,
+                    "event_type": event_type, "usage": rec}
         # Unknown/other entity types: record the event generically so nothing is
         # silently dropped, and the UI still sees it on the activity stream.
         if record_generic:
             self.repo.record_event(entity_type, entity_id, event_type, payload)
         return {"entity_type": entity_type, "entity_id": entity_id,
                 "event_type": event_type}
+
+    # ------------------------------------------------------ delivery entities
+    # Test runs, builds, reviews, review findings and pull requests are stored
+    # in the repo's delivery collections (issue #32). They mirror the SQL table
+    # shapes, are idempotent on entity_id, and attach to a source-namespaced
+    # mission key exactly like sessions and missions do (issue #26), so a pi
+    # report for raw mission_id ``M1`` lands on ``pi:M1`` and stays visible on
+    # the pi mission page instead of a bare ``M1`` the UI never queries.
+    def _delivery_mission_key(self, mission_id, source):
+        if mission_id is None:
+            return None
+        if not isinstance(mission_id, str) or not mission_id:
+            raise ValueError("mission_id must be a non-empty string")
+        if ":" in mission_id:
+            namespace, raw = mission_id.split(":", 1)
+            if not raw or ":" in raw or (source != "herdr" and namespace != source):
+                raise ValueError("mission identity conflicts with its source")
+            return mission_id
+        return mission_id if source == "herdr" else f"{source}:{mission_id}"
+
+    def _ingest_test_run(self, entity_id, event_type, payload, source, kind="test") -> dict:
+        self._validate_test_counts(payload)
+        return self.repo.upsert_test_run(
+            entity_id, kind=kind,
+            mission_id=self._delivery_mission_key(payload.get("mission_id"), source),
+            session_id=payload.get("session_id"),
+            repository=payload.get("repository"),
+            status=payload.get("status"),
+            passed=payload.get("passed"),
+            failed=payload.get("failed"),
+            skipped=payload.get("skipped"),
+            total=payload.get("total"),
+            started_at=payload.get("started_at"),
+            ended_at=payload.get("ended_at"),
+            results=payload.get("results"),
+        )
+
+    def _ingest_review(self, entity_id, event_type, payload, source) -> dict:
+        return self.repo.upsert_review(
+            entity_id, mission_id=self._delivery_mission_key(payload.get("mission_id"), source),
+            session_id=payload.get("session_id"),
+            reviewer=payload.get("reviewer"),
+            status=payload.get("status"),
+            verdict=payload.get("verdict"),
+            started_at=payload.get("started_at"),
+            completed_at=payload.get("completed_at"),
+        )
+
+    def _ingest_review_finding(self, entity_id, payload, source) -> dict:
+        # The finding attaches to the review named by ``review_id`` (which the
+        # ingest envelope carries in ``entity_id``); the review must already
+        # exist so a forged/unknown review can never collect findings.
+        severity = payload.get("severity")
+        summary = payload.get("summary")
+        # A client-supplied finding_id is honoured verbatim; when omitted we derive
+        # a stable id from the finding content so a replayed envelope updates the
+        # original finding in place instead of appending a duplicate (idempotency
+        # of the ingest path, independent of the review's current finding count).
+        finding_id = payload.get("finding_id")
+        if not finding_id:
+            content = "|\n".join([severity, summary, payload.get("detail") or "",
+                                  payload.get("status") or "open"])
+            finding_id = hashlib.sha256(content.encode("utf-8")).hexdigest()[:16]
+        return self.repo.add_review_finding(
+            entity_id, severity=severity,
+            summary=summary, detail=payload.get("detail") or "",
+            status=payload.get("status") or "open",
+            finding_id=finding_id,
+        )
+
+    def _ingest_pull_request(self, entity_id, event_type, payload, source) -> dict:
+        return self.repo.upsert_pull_request(
+            entity_id, mission_id=self._delivery_mission_key(payload.get("mission_id"), source),
+            repository=payload.get("repository"),
+            number=payload.get("number"),
+            url=payload.get("url"),
+            status=payload.get("status"),
+            branch=payload.get("branch"),
+            base=payload.get("base"),
+            created_at=payload.get("created_at"),
+        )
 
     def _ingest_host(self, entity_id, event_type, payload, source="herdr") -> dict:
         if source not in LIVENESS_SOURCES:

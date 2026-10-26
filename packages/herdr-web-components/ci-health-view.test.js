@@ -32,3 +32,12 @@ test('unavailable history keeps backend cause distinct from a missing history cl
 test('cold background discovery is loading rather than an unavailable provider',()=>{
  assert.equal(ciHealthUnavailable({available:false,status:'syncing',refreshing:true}), 'Loading CI projects and history…');
 });
+
+test('command-center project context filters heatmap inventory and runs by full identity without mutating history',async()=>{
+ const {ciHealthProjectHistory}=await import('../ci-health-view.js');
+ const repos=[{id:17,provider_url:'https://ci.example',repository:'org/app'},{id:17,provider_url:'https://other.example',repository:'org/app'},{id:18,provider_url:'https://ci.example',repository:'org/app'},{id:17,provider_url:'https://ci.example',repository:'org/renamed'}];
+ const history={repos,pipelines:repos.map(r=>({...r,provider_repo_id:r.id,run_number:1})),coverage:{17:{complete:false}},stale:true};
+ const scoped=ciHealthProjectHistory(history,{provider_url:'https://ci.example/',provider_repo_id:'17',repository:'org/app'});
+ assert.equal(scoped.repos.length,1);assert.equal(scoped.pipelines.length,1);assert.equal(scoped.pipelines[0].repository,'org/app');assert.equal(scoped.stale,true);assert.equal(history.repos.length,4);
+ assert.equal(ciHealthProjectHistory(history,null),history);
+});

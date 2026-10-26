@@ -221,3 +221,167 @@ def test_observation_fingerprints_remember_only_successful_persistence(tmp_path)
     journal.write_text(saved)
     assert monitor._persist_observations(snapshot) is None
     assert len(journal.read_text().splitlines()) == 2
+
+
+def test_parallel_heads_respect_shared_limit_across_history_and_repeated_timeouts():
+    import time
+
+    provider = Provider()
+    provider.repos = lambda **kwargs: [{'id': i, 'repository': f'org/{i}'} for i in range(1, 7)]
+    release, saturated = threading.Event(), threading.Event()
+    lock = threading.Lock()
+    active = peak = calls = 0
+
+    def blocked(repository, **kwargs):
+        nonlocal active, peak, calls
+        with lock:
+            active += 1
+            calls += 1
+            peak = max(peak, active)
+            if active == 2:
+                saturated.set()
+        try:
+            release.wait(3)
+            return []
+        finally:
+            with lock:
+                active -= 1
+
+    provider.pipelines = blocked
+    monitor = CIMonitor(provider_factory=lambda: provider, max_in_flight=2, budget=0.1)
+    worker = threading.Thread(target=monitor.refresh)
+    worker.start()
+    try:
+        assert saturated.wait(1), 'repository heads must read concurrently'
+        worker.join(0.5)
+        assert not worker.is_alive()
+        started = time.monotonic()
+        monitor.refresh()
+        monitor._history.refresh()
+        assert time.monotonic() - started < 0.5
+        assert peak == 2 and calls == 2, 'timed-out reads must retain their capacity slots'
+        assert monitor.snapshot(start=False)['stale']
+    finally:
+        release.set()
+        worker.join(3)
+        monitor.close()
+
+
+def test_monitor_request_budget_preserves_repository_cursor():
+    provider = Provider()
+    provider.repos = lambda **kwargs: [{'id': i, 'repository': f'org/{i}'} for i in range(1, 6)]
+    seen = []
+
+    def pipelines(repository, **kwargs):
+        seen.append(repository)
+        return [{'run_number': 1, 'state': 'success'}]
+
+    provider.pipelines = pipelines
+    monitor = CIMonitor(provider_factory=lambda: provider, max_reads_per_refresh=3)
+    try:
+        for _ in range(3):
+            before = monitor._measurement_snapshot()['provider_calls']
+            monitor.refresh()
+            assert monitor._measurement_snapshot()['provider_calls'] - before <= 3
+        assert set(seen) == {'1', '2', '3', '4', '5'}
+        view = monitor.snapshot(start=False)
+        assert view['stale'] and view['status'] == 'partial'
+        assert all(view['pipelines'][f'org/{i}'] for i in range(1, 6))
+    finally:
+        monitor.close()
+
+
+def test_unrelated_http_request_completes_while_provider_is_blocked():
+    import json
+    import urllib.request
+
+    from herdr_engineering.control_plane.api import ControlPlaneServer
+    from herdr_engineering.control_plane.repo import ControlPlaneRepo
+
+    entered, release = threading.Event(), threading.Event()
+    provider = Provider()
+
+    def blocked(**kwargs):
+        entered.set()
+        release.wait(3)
+        return [{'id': 17, 'repository': 'org/app'}]
+
+    provider.repos = blocked
+    monitor = CIMonitor(provider_factory=lambda: provider, budget=0.1)
+    server = ControlPlaneServer(ControlPlaneRepo(), api_keys={'read': 'viewer'})
+    server.ci_monitor.close()
+    server.ci_monitor = monitor
+    thread = threading.Thread(target=server.serve, daemon=True)
+    thread.start()
+    server.wait_until_ready()
+    monitor.snapshot()
+    try:
+        assert entered.wait(1)
+        request = urllib.request.Request(f'http://127.0.0.1:{server.port}/api/v1/ci/reports',
+                                         headers={'X-API-Key': 'read'})
+        with urllib.request.urlopen(request, timeout=0.5) as response:
+            assert response.status == 200
+            assert json.load(response)['reports'] == []
+        assert not release.is_set()
+    finally:
+        release.set()
+        server.shutdown()
+        thread.join(3)
+
+
+def test_provider_switch_does_not_relabel_cached_runs_after_failed_head():
+    provider = Provider()
+    monitor = CIMonitor(provider_factory=lambda: provider)
+    monitor.refresh()
+    provider.base_url = 'https://other.example'
+    provider.pipelines = lambda *a, **k: (_ for _ in ()).throw(RuntimeError('offline'))
+    monitor.refresh()
+    view = monitor.snapshot(start=False)
+    assert view['stale']
+    assert view['pipelines']['org/app'] == []
+    monitor.close()
+
+
+def test_read_allowances_reject_fractional_and_noninteger_values_before_io():
+    import pytest
+
+    from herdr_engineering.ci import _ProviderReadScheduler
+    from herdr_engineering.control_plane.ci_history import CIHistory
+    from herdr_engineering.control_plane.ci_observability import _Measurements
+
+    def forbidden_provider():
+        raise AssertionError('invalid allowance performed provider I/O')
+
+    for allowance in (0.5, 1.5, True, False, None, '2', -1, float('nan')):
+        for collector in (CIHistory, CIMonitor):
+            with pytest.raises(ValueError, match='integer'):
+                collector(provider_factory=forbidden_provider, max_reads_per_refresh=allowance)
+        scheduler = _ProviderReadScheduler()
+        try:
+            with pytest.raises(ValueError, match='integer'):
+                scheduler.refresh(budget=1, max_reads=allowance, now=lambda: 0,
+                                  measurements=_Measurements())
+        finally:
+            scheduler.close()
+
+
+def test_scheduler_rejects_nonpositive_remaining_allowances_without_a_call():
+    import pytest
+
+    from herdr_engineering.ci import _ProviderReadScheduler
+    from herdr_engineering.control_plane.ci_observability import _Measurements
+
+    calls = []
+    scheduler = _ProviderReadScheduler()
+    try:
+        for remaining in (0, -1):
+            measurements = _Measurements()
+            batch = scheduler.refresh(budget=1, max_reads=1, now=lambda: 0,
+                                      measurements=measurements)
+            batch._remaining_reads = remaining
+            with pytest.raises(TimeoutError):
+                batch.call(lambda: calls.append('called'))
+            assert measurements.snapshot()['provider_calls'] == 0
+        assert calls == []
+    finally:
+        scheduler.close()

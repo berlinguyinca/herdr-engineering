@@ -84,3 +84,11 @@ test('comparison matches stable workflow names across run-local IDs and bounds s
  const bounded=ciComparisonModel({...active,tasks:Array.from({length:250},(_,i)=>task(i,`Step ${i}`))},other);
  assert.equal(bounded.steps.length,200);assert.equal(bounded.truncated,true);
 });
+
+test('failure diagnosis renders exact structured evidence and reuses step log actions',()=>{
+ const html=renderCiPipeline({tasks:[{id:9,name:'tests',state:'failure'}]}, {diagnosis:{evidence_availability:'reported',failed_steps:[{id:9,name:'tests',state:'failure',dependency_evidence:'unavailable'}],failed_workflows:[{name:'unit',state:'failure'}],step_test_reason:'Uploaded reports do not identify a provider step.',failed_tests:[{name:'<case>',classname:'Checks',file:'test.js',message:'<bad>',trace:'bounded trace',history:{classification:'inconsistent_outcomes',failure_count:2,completed_count:5,first_failure:'2026-10-20',last_pass:'2026-10-24'}}]}});
+ assert.match(html,/Failure diagnosis/);assert.match(html,/data-step="9"/);assert.match(html,/Ordering not reported/);assert.match(html,/&lt;case&gt;/);assert.match(html,/bounded trace/);assert.match(html,/Inconsistent outcomes observed/);assert.match(html,/Uploaded reports do not identify a provider step/);
+ assert.doesNotMatch(html,/<bad>|Proven flaky/);
+ const missing=renderCiPipeline({}, {diagnosis:{evidence_availability:'unavailable',reason:'No validated report matches this run.',failed_tests:[],failed_steps:[]}});
+ assert.match(missing,/Test evidence unavailable/);assert.match(missing,/No validated report/);assert.doesNotMatch(missing,/0 tests/);
+});

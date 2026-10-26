@@ -10,8 +10,10 @@ test('retained provider collisions preserve display, logs, comparison and reject
  const providerA='https://ci.example/a',providerB='https://ci.example/b';
  let configured=providerA;
  const requests=[],mutations=[];
- const run=(provider,number=12)=>({provider_url:provider,provider_repo_id:17,repository:'org/app',run_number:number,state:'failure',revision:(provider===providerA?'a':'b').repeat(40),branch:'main'});
- const unidentified={provider_repo_id:17,repository:'org/app',run_number:99,state:'failure',can_retry:true,can_cancel:true,tasks:[{id:4,name:'Tests',state:'failure'}]};
+ // The command center defaults to a dated window; these fixtures test provider identity, not unknown timestamps.
+ const created_at=new Date().toISOString();
+ const run=(provider,number=12)=>({created_at,provider_url:provider,provider_repo_id:17,repository:'org/app',run_number:number,state:'failure',revision:(provider===providerA?'a':'b').repeat(40),branch:'main'});
+ const unidentified={created_at,provider_repo_id:17,repository:'org/app',run_number:99,state:'failure',can_retry:true,can_cancel:true,tasks:[{id:4,name:'Tests',state:'failure'}]};
  const retained=[run(providerA),run(providerA,11),run(providerB),unidentified];
  const report=provider=>({...run(provider),summary:{total:provider===providerA?1:9,passed:0,failed:provider===providerA?1:9},cases:[]});
  const server=createServer(async(req,res)=>{

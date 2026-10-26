@@ -128,3 +128,21 @@ def test_v2_record_posted_through_the_api_is_stored_whitelisted():
         assert out["total"]["output_tokens"] == 9 and out["by_model"]["m"]["requests"] == 1
     finally:
         svr.shutdown()
+
+
+def test_sweep_prunes_the_mission_scoped_usage_projection():
+    """sweep_token_usage must also drop _token_usage projection records older than
+    the cutoff so usage_analytics() never reports swept totals (codex P2)."""
+    repo, clock = _clocked_repo()
+    repo.add_token_usage({"mission_id": "m1", "model": "gpt", "request_id": "old-r",
+                          "input_tokens": 7, "occurred_at": repo._stamp()})  # 20 days old
+    clock[0] = NOW - 1 * DAY
+    repo.add_token_usage({"mission_id": "m1", "model": "gpt", "request_id": "fresh-r",
+                          "input_tokens": 3, "occurred_at": repo._stamp()})
+    clock[0] = NOW
+    assert repo.usage_analytics("m1")["tokens"]["total"]["input_tokens"] == 10
+    sweep_token_usage(repo, raw_retention_days=14)
+    a = repo.usage_analytics("m1")
+    assert a["tokens"]["total"]["input_tokens"] == 3
+    assert "old-r" not in repo._token_usage
+    assert "fresh-r" in repo._token_usage

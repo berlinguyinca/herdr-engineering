@@ -209,3 +209,14 @@ test('cache visuals cap groups while Chart data retains every group and exact me
   assert.match(html,/10 of 12 cache groups/);assert.match(html,/2 groups omitted/);assert.match(html,/Cache project 11/);
   assert.equal((html.match(/class="ci-cache-card"/g)||[]).length,10);
 });
+
+test('compact charts preserve exact outcomes and denominators and suppress unsupported percentiles',async()=>{
+ const {renderCiSummaryCharts,renderCiSparkline}=await import('../ci-charts.js');
+ const days=[{day:'2026-10-24',success_count:3,failure_count:1,completed_count:4,outcomes:{success:3,failure:1,canceled:2},duration_seconds:{sample_count:4,p50:10,p95:20}},{day:'2026-10-25',success_count:4,failure_count:1,completed_count:5,outcomes:{success:4,failure:1},duration_seconds:{sample_count:5,p50:12,p95:30}}];
+ const html=renderCiSummaryCharts(days);
+ for(const title of ['Outcomes by UTC day','Failure rate','Completed-run duration','Exact chart data'])assert.ok(html.includes(title));
+ assert.match(html,/canceled: 2/);assert.match(html,/1 \/ 4/);assert.match(html,/Insufficient data/);assert.match(html,/30/);assert.match(html,/role="img"/);
+ assert.doesNotMatch(html,/NaN|Infinity/);
+ assert.match(renderCiSparkline(days,'org/app'),/aria-label="org\/app failure rate/);
+ assert.match(renderCiSummaryCharts([]),/No dated observations/);
+});

@@ -372,6 +372,19 @@ test('reflow at 320px with 300-character unbroken labels, comments and instructi
       const o = await overflowAudit(page);
       if (overflowFailure(o)) bad.push(`[${sub}] ${overflowFailure(o)}`);
     }
+    // the 48-character address mention renders as a chip in chat (and the chat reflow above included it)
+    await openSub(page, 'chat'); await settled(page);
+    const chip = page.locator('.cx-mention', { hasText: `@${'a'.repeat(27)}.${'h'.repeat(20)}` }).first();
+    await chip.waitFor();
+    // it wraps inside its message: never wider than the bubble (a clipped or scrolled-away chip hides who was addressed)
+    const fit = await chip.evaluate((el) => {
+      const msg = el.closest('.cx-bubble'); const box = msg.getBoundingClientRect();
+      const rects = [...el.getClientRects()].map((r) => [Math.round(r.left), Math.round(r.right)]);
+      return { ok: rects.every(([l, r]) => r <= Math.min(box.right, window.innerWidth) + 1 && l >= box.left - 1),
+        rects, box: [Math.round(box.left), Math.round(box.right)], vw: window.innerWidth, cls: msg.className,
+        css: ['display', 'whiteSpace', 'overflowWrap'].map((k) => getComputedStyle(el)[k]), pws: getComputedStyle(el.parentElement).whiteSpace };
+    });
+    assert.equal(fit.ok, true, `the 48-character address chip wraps inside its message at 320px: ${JSON.stringify(fit)}`);
     // the inspector of the node whose label, comments and requests are all 300 unbroken characters
     await openSub(page, 'lineage');
     await page.locator('svg.lin-svg g[data-node]').first().waitFor();

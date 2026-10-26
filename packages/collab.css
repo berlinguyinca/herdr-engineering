@@ -65,6 +65,16 @@
 .cx-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
 .cx-row--between { justify-content: space-between; }
 .cx-stack { display: flex; flex-direction: column; gap: 10px; }
+.cx-agent-toolbar { display:flex; flex-wrap:wrap; align-items:center; gap:10px; padding:12px 14px; margin:0 0 12px; border:1px solid var(--border-subtle); border-radius:var(--radius); background:var(--surface-2); }
+.cx-agent-toolbar strong { font-size:.9rem; }
+.cx-agent-toolbar select { min-width:150px; }
+.cx-agent-card--selected { border-color:var(--accent); box-shadow:0 0 0 2px color-mix(in srgb,var(--accent) 20%,transparent); }
+.cx-agent-select { position:absolute; top:14px; right:14px; width:18px; height:18px; accent-color:var(--accent); }
+.cx-agentcard { position:relative; }
+.cx-fleet-details > summary { cursor:pointer; list-style:none; font-weight:650; }
+.cx-fleet-details > summary::-webkit-details-marker { display:none; }
+.cx-fleet-details > summary::before { content:'▸'; display:inline-block; margin-right:8px; transition:transform .15s; }
+.cx-fleet-details[open] > summary::before { transform:rotate(90deg); }
 
 /* ---- pills (status is always text + colour) ---- */
 .hd-status { display: inline-flex; align-items: center; gap: 6px; padding: 2px 10px; border-radius: 999px;
@@ -401,3 +411,17 @@ button.ctx-chip:focus-visible, .ctx-chip:focus-visible { outline: 2px solid curr
    row instead of pushing the page sideways (1.4.10 at 320px). Found by the real-server reflow gate on Attention and Progress. */
 .cx-page .grow, .cx-embed .grow, .cx-attn-item, .cx-attn-item *, .cx-list li, .cx-list li *, .cx-page .cx-msg, .cx-embed .cx-msg { overflow-wrap: anywhere; min-width: 0; }
 .cx-attn-item .hd-btn, .cx-attn-item select { max-width: 100%; }
+
+/* @mentions in sent messages: chips that keep the literal text (copying a message copies "@gert.pi") */
+/* Inline (not inline-flex, no nowrap) so a 48-character address wraps inside a 320px bubble instead of overflowing (1.4.10). */
+.cx-mention { display: inline; padding: 0 4px; border-radius: 999px; font-weight: 600; overflow-wrap: anywhere; word-break: break-word;
+  -webkit-box-decoration-break: clone; box-decoration-break: clone;
+  background: var(--accent-weak, var(--surface-2)); color: var(--accent-strong, var(--text)); border: 1px solid var(--border-subtle); }
+.cx-mention--agent { background: var(--violet-weak, var(--surface-2)); }
+.cx-mention--group { background: var(--surface-2); }
+/* generated text: shown and announced, but not copied, so a copied message keeps its literal "@ext-..." */
+.cx-mention--external { border-style: dashed; }
+.cx-mention--external::after { content: " · external"; font-weight: 400; font-size: .85em; color: var(--text-muted); }
+.cx-m--mine .cx-mention--external::after { color: inherit; }
+.cx-mention__icon { font-size: .8em; margin-right: 2px; }
+.cx-m--mine .cx-mention { background: color-mix(in srgb, var(--text-on-accent) 18%, transparent); color: inherit; border-color: transparent; }

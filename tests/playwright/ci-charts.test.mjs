@@ -69,7 +69,7 @@ test('native CI charts follow context/search across tabs and preserve focus thro
     assert.match(await page.locator('.ci-performance').innerText(),/No successful runs with valid positive/);
     await page.locator('[data-ci-branch]').selectOption('main');
     await page.evaluate(()=>{
-      window.chartHistory.pipelines.push({run_number:100,state:'success',project_id:'Old project',language:'Rust',repository:'org/app',repository_id:'github.com/org/app',branch:'main',created_at:'2020-01-01T00:00:00Z',started_at:1792497600,finished_at:1792497720});
+      window.chartHistory.pipelines.push({run_number:100,state:'success',project_id:'Old project',language:'Rust',repository:'org/app',repository_id:'github.com/org/app',branch:'main',created_at:new Date(Date.now()-9*86400000).toISOString(),started_at:1792497600,finished_at:1792497720});
       window.chartView.refresh();
     });
     await page.waitForFunction(()=>document.querySelector('.ci-performance')?.textContent.includes('4 successful runs'));

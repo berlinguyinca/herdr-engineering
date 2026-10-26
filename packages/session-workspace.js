@@ -2,6 +2,7 @@ import {connectEvents} from './herdr-web-client/events.js';
 import {escapeHtml as esc} from './herdr-web-components/util.js';
 import {mergeEntry, renderEvent, telemetryHealth} from './herdr-web-components/inspector.js';
 import {mountComposer} from './conversation-composer.js';
+import {filterItems} from './collab-mention.js';
 import {renderMarkdown} from './conversation-markdown.js';
 import {createEntityIndex} from './entity-refs.js';
 import {parseJson,renderJson} from './conversation-json.js';
@@ -27,6 +28,12 @@ function patchRows(container,html,newestBefore){
 
 const MAX_EVENTS=2000;
 const PAGE=200;
+
+const REFERENCE_KINDS={agent:['Agents','robot'],file:['Files','file']};
+function referenceItem(r){
+  const [section,icon]=REFERENCE_KINDS[String(r.id).split(':')[0]] || ['Issues','issue'];
+  return {insert:r.insertText,label:r.label,detail:r.detail || '',section,icon};
+}
 
 export function mountSessionWorkspace(host,client,session,{connect=connectEvents,onRename=()=>{}}={}) {
   if(!document.querySelector('link[data-session-workspace-style]')) {
@@ -77,7 +84,8 @@ export function mountSessionWorkspace(host,client,session,{connect=connectEvents
     draftKey:`session:${session.session_id}`,disabled:terminal,
     placeholder:terminal?'This agent has ended':'Message this agent… type @ for references',
     hint:terminal?'Recorded history remains available.':'Enter sends · Shift+Enter adds a line · @ inserts a file, agent or GitHub reference.',
-    suggestions:()=>referenceSuggestions(session,data,sessions,collaborators),
+    // the same sigil menu as the room: references by kind, literal text inserted, nothing rewritten
+    providers:{'@':query=>filterItems(referenceSuggestions(session,data,sessions,collaborators).map(referenceItem),query)},
     onSend:async(text,attachments)=>{
       if(attachments.length)throw new Error('This agent transport cannot deliver files. Remove attachments before sending.');
       if(!operationId || operationText!==text){operationId=pendingOperation(storage,operationKey,text,()=>randomString(18));operationText=text;}

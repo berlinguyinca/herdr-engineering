@@ -199,7 +199,7 @@ def test_web_refuses_invalid_usage_retention(tmp_path, monkeypatch, old_env, cap
 
 
 def test_web_reads_ci_fix_from_the_fleet_file_disabled_by_default(tmp_path, monkeypatch, old_env, capsys):
-    seen = _run_web(monkeypatch, make_file(tmp_path, ci_fix={"enabled": True, "hosts": ["bender"]}))
+    seen = _run_web(monkeypatch, make_file(tmp_path, ci_fix={"agent_api_key": "test-ci-fix-agent-key", "enabled": True, "hosts": ["bender"]}))
     assert seen["server_kw"]["ci_fix"]["enabled"] is True and seen["server_kw"]["ci_fix"]["hosts"] == ["bender"]
     seen = _run_web(monkeypatch, tmp_path / "missing.yaml")
     assert seen["server_kw"]["ci_fix"]["enabled"] is False
@@ -677,6 +677,13 @@ def test_insights_settings_are_yaml_only_validated_and_off_by_default(tmp_path, 
     assert fcc.collab_values(fcc.load_fleet_config(central))["insights"]["min_group_size"] == 7
     with pytest.raises(SystemExit):
         cli._apply_collab_config(argparse.Namespace(), {"collab": {"insights": {"kill_switch": "no"}}})
+
+
+def test_collab_skills_slice_is_accepted_and_forwarded(tmp_path):
+    central = make_file(tmp_path, collab=dict(COLLAB, skills={"enabled": True}))
+    values = fcc.collab_values(fcc.load_fleet_config(central))
+    assert values["skills"] == {"enabled": True}
+    assert "skills" in cli.COLLAB_CONFIG_KEYS
 
 # ------------------------------------------- unreadable fleet file: security switches fail closed (T14 review)
 
