@@ -1,5 +1,6 @@
 """Final route contracts: detached credentials, event scope and bucket membership."""
 import json
+import subprocess
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from urllib.parse import urlencode
@@ -192,3 +193,55 @@ def test_hour_mode_uses_trailing_24_hours_for_summary_and_tests(server):
     assert status == 200
     assert sorted(row['name'] for row in tests['tests']) == ['hour-2', 'hour-3']
     assert tests['scope']['report_count'] == 2
+
+
+@pytest.mark.parametrize('date,expected', [
+    ('2026-10-25', [[1, 2], [1, 2, 3, 4], [1, 2, 3, 4, 5], [2, 3, 4, 5], []]),
+    ('2026-10-24', [[2, 3, 4, 5], [4, 5], [], [], []]),
+])
+def test_selected_hour_stays_shared_across_refresh_rollover_and_expiry(server, date, expected):
+    rows = [{**api.ci_run(n), 'created_at': f'{date}T{clock}Z'}
+            for n, clock in enumerate(['12:29:00', '12:30:00', '12:40:00',
+                                       '12:45:00', '12:59:59', '13:00:00'], 1)]
+    api.seed_ci(server, rows)
+    for row in rows:
+        api.upload_ci_report(server, number=row['run_number'],
+                             xml=f'<testsuite><testcase name="hour-{row["run_number"]}"/></testsuite>')
+    # Capture actual clicked bounds once; every later consumer retains those bounds.
+    script = """
+      import {ciHealthModel} from './packages/ci-health.js';
+      import {filterCiObservations} from './packages/ci-insights.js';
+      import {integrationEntries,selectIntegrations} from './packages/integrations-view.js';
+      let input=''; for await (const chunk of process.stdin) input+=chunk;
+      const {rows,date}=JSON.parse(input), initial=Date.parse('2026-10-25T12:30:00Z');
+      const history={pipelines:rows,repos:[{id:17,repository:'org/app',provider_url:'https://ci.example',default_branch:'main'}]};
+      const first=ciHealthModel(history,{mode:'hours',scope:'all'},initial),project=first.projects[0];
+      const cell=project.cells.find(c=>c.key===`hour:${Date.parse(date+'T12:00:00Z')}`);
+      const selection={projectKey:project.key,bucketKey:cell.key};
+      const filters={mode:'hours',scope:'all',start:new Date(cell.start).toISOString(),end:new Date(cell.end).toISOString()};
+      const clocks=['2026-10-25T12:30:00Z','2026-10-25T12:45:00Z','2026-10-25T13:00:00Z','2026-10-26T12:30:00Z','2026-10-26T13:00:00Z'];
+      const snapshots=clocks.map(clock=>{
+        const now=Date.parse(clock); Date.now=()=>now;
+        const model=ciHealthModel(history,{mode:'hours',scope:'all',selection},now);
+        return {now:now/1000,health:model.selectedRows.map(r=>r.run_number),
+          tests:filterCiObservations(history,filters,now).pipelines.map(r=>r.run_number),
+          runs:selectIntegrations(integrationEntries({pipelines:{runs:rows}}),{...filters,tab:'all'}).map(e=>e.record.run_number).sort((a,b)=>a-b)};
+      });
+      console.log(JSON.stringify({filters,snapshots}));
+    """
+    result = subprocess.run(['node', '--input-type=module', '-e', script],
+                            input=json.dumps({'rows': rows, 'date': date}),
+                            text=True, capture_output=True, check=True)
+    view = json.loads(result.stdout)
+    query = urlencode(view['filters'])
+    for snapshot, numbers in zip(view['snapshots'], expected, strict=True):
+        server.repo._now = lambda: snapshot['now']
+        status, summary = api.request(server, 'ci/summary?' + query)
+        assert status == 200
+        assert summary['kpis']['pipeline_count'] == len(numbers)
+        status, tests = api.request(server, 'ci/tests?' + query)
+        assert status == 200
+        assert sorted(row['name'] for row in tests['tests']) == [f'hour-{n}' for n in numbers]
+        assert tests['scope']['report_count'] == len(numbers)
+        for consumer in ['health', 'tests', 'runs']:
+            assert snapshot[consumer] == numbers, (date, snapshot['now'], consumer)

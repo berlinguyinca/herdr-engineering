@@ -400,6 +400,101 @@ test('legacy period offers only shared calendar windows and updates all consumer
   await page.evaluate(()=>calls=[]);await page.locator('[data-ci-period]').selectOption(days);
   await page.waitForFunction(days=>calls.some(([kind,o])=>kind==='tests'&&o.days===Number(days)),days);
   assert.equal(await page.locator('[data-ob-days]').inputValue(),days);
+  assert.equal(await page.locator('[data-ci-performance-window]').inputValue(),'14','main period leaves the independent performance window unchanged');
   assert.equal(await page.locator(`[data-health-mode="${days}"]`).getAttribute('aria-pressed'),'true');
  }
+}));
+
+
+for(const days of [7,14,30])test(`performance window stays independent of the shared ${days}-day selection`,()=>reviewPage(async page=>{
+ await page.clock.setFixedTime(new Date('2026-10-25T12:30:00Z'));
+ await page.evaluate(()=>{
+  runs=[{...runs[0],created_at:'2026-10-25T12:00:00Z'},
+   {...runs[0],run_number:9,created_at:'2026-10-16T12:00:00Z'}];
+  const reports=client.getCiReports;
+  client.getCiReports=async options=>{const result=await reports(options);return {...result,reports:result.reports.map(r=>({...r,reported_at:r.created_at}))};};
+  const performance=client.getCiPerformance;
+  client.getCiPerformance=async options=>{calls.push(['performance',options]);return performance(options);};
+  mount();
+ });
+ await page.locator('[data-ob-project]').filter({hasText:'org/current'}).click();
+ await page.locator('[data-ob-days]').selectOption(String(days));
+ await page.waitForFunction(days=>calls.some(([kind,o])=>kind==='tests'&&o.days===days),days);
+ await page.locator('[data-ci-workspace="runs"]').click();await page.locator('[data-tab="failed"]').click();
+ await page.locator('[data-ci-charts]>summary').click();
+ const snapshot=()=>page.evaluate(()=>({
+  period:document.querySelector('[data-ci-period]').value,
+  window:document.querySelector('[data-ob-days]').value,
+  healthMode:document.querySelector('[data-health-mode][aria-pressed=true]').dataset.healthMode,
+  health:document.querySelector('[data-health-map]').textContent,
+  summary:document.querySelector('[data-ob-summary]').textContent,
+  tests:document.querySelector('[data-ob-tests]').textContent,
+  insights:document.querySelector('[data-ci-insights]').textContent,
+  runs:document.querySelector('#ig-results').textContent,
+  preferences:[localStorage.getItem('herdr.ci-observability.v1:["","","",""]'),localStorage.getItem('herdr.ci-health.v1:["","",""]')]
+ }));
+ for(const selectedBucket of [false,true]) {
+  if(selectedBucket){
+   await page.locator('[data-ci-workspace="health"]').click();
+   await page.locator('[data-health-bucket="day:2026-10-25"]').click();
+   await page.waitForFunction(()=>calls.some(([kind,o])=>kind==='tests'&&o.start));
+   await page.locator('[data-ci-workspace="runs"]').click();
+  }
+  const before=await snapshot();
+  assert.equal(await page.locator('#ig-results [data-run]').count(),selectedBucket||days===7?1:2);
+  for(const performanceDays of [7,14]) {
+   await page.evaluate(()=>calls=[]);
+   await page.locator('[data-ci-performance-window]').selectOption(String(performanceDays));
+   await page.waitForFunction(days=>document.querySelector('.ci-cache-performance')?.textContent.includes(`${days}-day observation window`),performanceDays);
+   assert.deepEqual(await snapshot(),before,'performance changes must leave every shared consumer and saved selection unchanged');
+   assert.equal(await page.evaluate(()=>calls.findLast(([kind])=>kind==='performance')[1].days),performanceDays);
+   await page.evaluate(()=>app.refresh());
+   await page.waitForFunction(()=>calls.some(([kind])=>kind==='tests'));
+   for(const kind of ['summary','tests']) {
+    const options=await page.evaluate(kind=>calls.findLast(([k])=>k===kind)[1],kind);
+    assert.equal(options.days,days);assert.equal(options.mode,'days');
+    assert.equal(options.start??null,selectedBucket?'2026-10-25T00:00:00.000Z':null);
+    assert.equal(options.end??null,selectedBucket?'2026-10-26T00:00:00.000Z':null);
+   }
+   assert.deepEqual(await snapshot(),before,'refresh must retain the same shared selection');
+  }
+ }
+ await page.evaluate(()=>app.dispose());
+}));
+
+
+for(const [date,counts] of [['2026-10-25',[2,4,5,4,0]],['2026-10-24',[4,2,0,0,0]]])test(`selected hour ${date} stays shared across clock advance and expiry`,()=>reviewPage(async page=>{
+ await page.clock.setFixedTime(new Date('2026-10-25T12:30:00Z'));
+ await page.evaluate(date=>{
+  runs=['12:29:00','12:30:00','12:40:00','12:45:00','12:59:59','13:00:00'].map((clock,i)=>({...runs[0],run_number:i+1,created_at:`${date}T${clock}Z`}));
+  const reports=client.getCiReports;
+  client.getCiReports=async options=>{const result=await reports(options);return {...result,reports:result.reports.map(r=>({...r,reported_at:r.created_at}))};};
+  mount();
+ },date);
+ await page.locator('[data-ob-project]').filter({hasText:'org/current'}).click();
+ await page.locator('[data-health-mode="hours"]').click();
+ const bucket=`hour:${Date.parse(date+'T12:00:00Z')}`;
+ await page.locator(`[data-health-bucket="${bucket}"]`).click();
+ await page.waitForFunction(()=>calls.some(([kind,o])=>kind==='tests'&&o.start));
+ const initial=await page.evaluate(()=>calls.findLast(([kind])=>kind==='tests')[1]);
+ await page.locator('[data-health-tree] [data-health-disclosure] > summary').first().click();
+ await page.locator('[data-health-tree] [data-health-disclosure] [data-health-disclosure] > summary').first().click();
+ const clocks=['2026-10-25T12:30:00Z','2026-10-25T12:45:00Z','2026-10-25T13:00:00Z','2026-10-26T12:30:00Z','2026-10-26T13:00:00Z'];
+ for(const [i,clock] of clocks.entries()) {
+  await page.clock.setFixedTime(new Date(clock));
+  await page.evaluate(()=>{calls=[];app.refresh();});
+  await page.waitForFunction(count=>document.querySelectorAll('[data-health-tree] [data-health-run]').length===count,counts[i]);
+  await page.waitForFunction(()=>calls.some(([kind])=>kind==='tests'));
+  for(const options of await page.evaluate(()=>calls.filter(([kind])=>kind==='summary'||kind==='tests').map(([,o])=>o))) {
+   assert.equal(options.mode,'hours');assert.equal(options.days,null);
+   assert.deepEqual([options.start,options.end],[initial.start,initial.end]);
+  }
+  await page.locator('[data-ci-workspace="tests"]').click();
+  assert.match(await page.locator('[data-ci-insights]').textContent(),new RegExp(`${counts[i]} retained runs · ${counts[i]} test report attempts`));
+  await page.locator('[data-ci-workspace="runs"]').click();await page.locator('[data-tab="failed"]').click();
+  assert.equal(await page.locator('#ig-results [data-run]').count(),counts[i],clock);
+  await page.locator('[data-ci-workspace="health"]').click();
+ }
+ assert.deepEqual([initial.start,initial.end],[`${date}T12:00:00.000Z`,`${date}T13:00:00.000Z`]);
+ await page.evaluate(()=>app.dispose());
 }));

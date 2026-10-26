@@ -73,7 +73,11 @@ export function ciSelectRunWindow(runs,filters={},now=Date.now()) {
 function windows(mode,now) {
  if(mode==='runs')return Array.from({length:24},(_,i)=>({key:`run:${i}`,label:`${24-i} ${i===23?'(newest)':''}`.trim(),start:null,end:null}));
  const hour=3600000,day=86400000;
- if(mode==='hours') {const result=[];let start=now-day;while(start<now){const end=Math.min(now,(Math.floor(start/hour)+1)*hour);result.push({key:`hour:${Math.floor(start/hour)*hour}`,label:iso(start).slice(11,16),start,end});start=end;}return result;}
+ if(mode==='hours') {
+  // Stable UTC bounds travel with the selection; membership intersects the trailing window below.
+  const start=Math.floor((now-day)/hour)*hour;
+  return Array.from({length:25},(_,i)=>{const boundary=start+i*hour;return {key:`hour:${boundary}`,label:iso(boundary).slice(11,16),start:boundary,end:boundary+hour};});
+ }
  const today=Math.floor(now/day)*day;
  // Selection carries stable calendar bounds; run membership is capped at now below.
  return Array.from({length:Number(mode)},(_,i)=>{const start=today-(Number(mode)-1-i)*day;return {key:`day:${iso(start).slice(0,10)}`,label:iso(start).slice(0,10),start,end:start+day};});
@@ -102,12 +106,12 @@ export function ciHealthModel(history={},options={},now=Date.now()) {
   runs.sort(chronological);
   const unknownTimestamps=runs.some(row=>!Number.isFinite(row.timestamp));
   if(mode==='runs')runs=runs.filter(row=>!Number.isFinite(row.timestamp)||row.timestamp<=now).slice(-24);
-  else runs=runs.filter(row=>row.timestamp>=buckets[0].start&&row.timestamp<=now);
+  else runs=runs.filter(row=>ciRunInWindow(row,{mode:mode==='hours'?'hours':'days',days:Number(mode)},now));
   if(options.failuresOnly&&!runs.some(row=>outcome(row)==='failure'))continue;
   const since=time(coverage.complete_since),exhausted=coverage.exhausted===true;
   const completeAt=start=>!scopeUnavailable&&!unknownTimestamps&&(exhausted||Number.isFinite(since)&&since<=start);
   const runComplete=!scopeUnavailable&&!unknownTimestamps&&(exhausted||runs.length>=24&&completeAt(runs[0].timestamp));
-  const cells=buckets.map((bucket,i)=>{if(mode==='runs'){const offset=24-runs.length,row=runs[i-offset];return makeCell(row?{...bucket,key:`run:${row.runKey}`}:bucket,row?[row]:[],runComplete);}return makeCell(bucket,runs.filter(row=>row.timestamp>=bucket.start&&(row.timestamp<bucket.end||mode==='hours'&&row.timestamp===now&&bucket.end===now)),completeAt(bucket.start));});
+  const cells=buckets.map((bucket,i)=>{if(mode==='runs'){const offset=24-runs.length,row=runs[i-offset];return makeCell(row?{...bucket,key:`run:${row.runKey}`}:bucket,row?[row]:[],runComplete);}return makeCell(bucket,runs.filter(row=>row.timestamp>=bucket.start&&row.timestamp<bucket.end),completeAt(mode==='hours'?Math.max(bucket.start,now-86400000):bucket.start));});
   const identity=`${repository} · ${instance(repo)||'Provider unavailable'} #${repoId(repo)}`;
   projects.push({key,repo,repository,label:labels.get(key),identity,runs,cells,counts:counts(runs),complete:cells.every(cell=>cell.complete),scopeUnavailable,coverage,unknownTimestamps});
  }

@@ -6,11 +6,13 @@ const repo=(id=1,extra={})=>({id,repository:`org/app${id}`,default_branch:'main'
 const run=(n,state='success',extra={})=>({provider_repo_id:1,provider_url:'https://ci.example',repository:'org/app1',run_number:n,branch:'main',state,created_at:'2026-10-22T12:00:00Z',...extra});
 const expandedTree=m=>({expanded:new Set(m.selectedRows.flatMap(row=>[row.projectKey,JSON.stringify([row.projectKey,row.pr?`pr:${row.pr.number}`:row.isPr?'pr:unknown':`branch:${row.branch||''}`])]))});
 const history=(pipelines=[],extra={})=>({repos:[repo()],pipelines,coverage:{'1':{exhausted:true}},...extra});
-test('hours cover exact trailing24h split at UTC boundaries including both partial cells',()=>{
+test('hours use stable UTC bounds intersected with the exact trailing24h window',()=>{
  const m=ciHealthModel(history([run(1,'failure',{created_at:'2026-10-21T12:30:00Z'}),run(2,'success',{created_at:'2026-10-21T12:29:59Z'}),run(3,'success',{created_at:'2026-10-22T12:30:01Z'})]),{mode:'hours'},now);
- assert.equal(m.buckets.length,25);assert.equal(m.buckets[0].start,now-86400000);assert.equal(m.buckets.at(-1).end,now);
+ assert.equal(m.buckets.length,25);assert.equal(m.buckets[0].start,Date.parse('2026-10-21T12:00:00Z'));assert.equal(m.buckets.at(-1).end,Date.parse('2026-10-22T13:00:00Z'));
  assert.equal(m.projects[0].runs.length,1);assert.equal(m.projects[0].cells[0].counts.failure,1);
- assert.equal(ciHealthModel(history(),{mode:'hours'},Date.parse('2026-10-22T12:00Z')).buckets.length,24);
+ const boundary=ciHealthModel(history([run(4)]),{mode:'hours'},Date.parse('2026-10-22T12:00Z'));
+ assert.equal(boundary.buckets.length,25);assert.deepEqual(boundary.projects[0].cells.at(-1).runs.map(r=>r.run_number),[4]);
+ assert.equal(boundary.projects[0].cells.at(-2).counts.total,0);
 });
 test('calendar modes include UTC today and last-runs ignores date cutoff after filters',()=>{
  for(const mode of ['7','14','30']) {const m=ciHealthModel(history(),{mode},now);assert.equal(m.buckets.length,+mode);assert.equal(m.buckets.at(-1).label,'2026-10-22');}
@@ -114,7 +116,7 @@ test('run buttons expose reported duration and PR metadata without inventing rol
 });
 test('partial-hour keys and exact-count disclosure stay stable through polling',()=>{
  const first=ciHealthModel(history(),{mode:'hours'},now),next=ciHealthModel(history(),{mode:'hours'},now+5000);
- assert.deepEqual(next.buckets.map(b=>b.key),first.buckets.map(b=>b.key));
+ assert.deepEqual(next.buckets,first.buckets);
  const html=renderCiHeatmap(first);assert.match(html,/data-health-disclosure="exact-counts"/);assert.equal((html.match(/data-health-grid-scroll/g)||[]).length,2);
 });
 test('missing timestamps keep coverage incomplete while newer contiguous coverage can remain complete',()=>{

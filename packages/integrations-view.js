@@ -8,7 +8,7 @@ import {ciChartModel,renderCiCharts,ciChartStyles} from './ci-charts.js';
 import {ciInsightsModel,renderCiInsights,ciInsightStyles,renderCiRunReports} from './ci-insights.js';
 import {renderCiPipeline,renderCiDiagnosis,ciPipelineStyles,pipelineZoom,sameCiRepository,ciComparisonModel,renderCiComparison} from './ci-pipeline.js';
 import {mountCiObservability,ciProjectKey} from './ci-observability-view.js';
-import {ciRunInScope,ciSelectRunWindow} from './ci-health.js';
+import {ciRunInScope,ciRunInWindow,ciSelectRunWindow} from './ci-health.js';
 import {mountCiHealth} from './ci-health-view.js';
 import {snapshotText,animateChanges} from './motion.js';
 import {renderCiFix,ciFixStyles,fixRunKey,latestFix,fixIsActive,fixError} from './ci-fix-view.js';
@@ -181,7 +181,7 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
     <div class="ig-controls"><label>Search ${isCi?'runs':'reviews'}<input data-ig-search type="search" value="${esc(search)}" placeholder="Project, repository, branch or revision"></label><label>Group by<select data-ig-group><option value="project">Project / repository</option><option value="none">Most recent</option></select></label></div>
     ${isCi ? '<div class="ig-controls ci-report-filters"><label>Repository<select data-ci-repository><option value="">All repositories</option></select></label><label>Branch<select data-ci-branch><option value="">All branches</option></select></label><label>Period<select data-ci-period><option value="7">Last 7 days</option><option value="14" selected>Last 14 days</option><option value="30">Last 30 days</option></select></label></div><div data-ci-insights></div>' : ''}
     ${repository || mission || session ? `<p class="ig-note">Filtered to ${filterLink(repository,mission,session)} · <a href="#/${kind}">Clear context</a></p>` : ''}
-    ${isCi ? '<details class="ci-charts" data-ci-charts><summary>Run durations · project, language & cache health</summary><div class="ig-controls ci-cache-controls"><label>Cache and trend window<select data-ci-performance-window><option value="7">Last 7 days</option><option value="14" selected>Last 14 days</option></select></label><p class="ci-chart-note">Cache and regression windows are limited to 7 or 14 days within the selected period.</p></div><div class="ci-charts-body" data-ci-charts-body></div></details>' : ''}
+    ${isCi ? '<details class="ci-charts" data-ci-charts><summary>Run durations · project, language & cache health</summary><div class="ig-controls ci-cache-controls"><label>Cache and trend window<select data-ci-performance-window><option value="7">Last 7 days</option><option value="14" selected>Last 14 days</option></select></label><p class="ci-chart-note">Cache and regression windows use an independent 7 or 14 days; the main period controls run and test history.</p></div><div class="ci-charts-body" data-ci-charts-body></div></details>' : ''}
     <p class="ig-note" data-ig-count></p><div class="ig-layout"><section id="ig-results" role="tabpanel" aria-labelledby="ig-tab-${state.tab}"></section><aside class="ig-inspector" aria-label="Pipeline inspector" hidden></aside></div>
     <div class="ig-pages"><button type="button" class="hd-btn" data-page="previous">Previous</button><span data-ig-page></span><button type="button" class="hd-btn" data-page="next">Next</button></div><div data-ig-runners></div>${!isCi ? '<details class="ig-runners"><summary>Start a review</summary><p>Start Plannotator from the project workspace with <code>herdr-plannotator --help</code>. Its review link and upstream decision appear here when the launcher is connected to this control plane.</p></details>' : ''}`;
   const el=selector=>container.querySelector(selector);
@@ -286,7 +286,9 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
     if(healthElement.dataset.signature!==healthKey){healthElement.dataset.signature=healthKey;const issuesOpen=healthElement.querySelector('details')?.open;healthElement.innerHTML=health;if(issuesOpen && healthElement.querySelector('details'))healthElement.querySelector('details').open=true;}
     const all=entries(),filtered=selectIntegrations(all,state),pageSize=20;
     state.page=Math.min(state.page,Math.max(0,Math.ceil(filtered.length/pageSize)-1));
-    const nextSignature=JSON.stringify([state,data,reportData,performanceData,performanceError,performanceDays,[...reviewCache]]);
+    // Clock advance can change membership even when every provider payload is unchanged.
+    const windowMembership=isCi?all.map(entry=>ciRunInWindow(entry.record,state)):null;
+    const nextSignature=JSON.stringify([state,data,reportData,performanceData,performanceError,performanceDays,windowMembership,[...reviewCache]]);
     if(isCi) {
       const observations=ciObservations();
       const model=ciInsightsModel(observations,state);
@@ -569,8 +571,8 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
       else{state.project=project;state.repository=project?.repository||value;state.provider=project?.provider_url||provider;state.page=0;healthView?.setObservabilityContext({project});draw();}
       return;
     }
-    state[key]=event.target.value;state.page=0;if(key==='days'&&[7,14].includes(Number(state.days))){performanceDays=Number(state.days);el('[data-ci-performance-window]').value=String(performanceDays);}if(key==='days'||key==='branch'){refreshPerformance(true);const context={branch:state.branch,start:null,end:null,run_number:null,...(key==='days'?{mode:'days'}:{}),...([7,14,30].includes(Number(state.days))?{days:Number(state.days)}:{})};state.start=null;state.end=null;state.run_number=null;if(key==='days')state.mode='days';observabilityView?.setContext(context);healthView?.setObservabilityContext(context);}draw();});
-  if(isCi)el('[data-ci-performance-window]').addEventListener('change',event=>{performanceDays=Number(event.target.value);if(Number(state.days)===7&&performanceDays===14){state.days='14';el('[data-ci-period]').value='14';}refreshPerformance(true);});
+    state[key]=event.target.value;state.page=0;if(key==='days'||key==='branch'){refreshPerformance(true);const context={branch:state.branch,start:null,end:null,run_number:null,...(key==='days'?{mode:'days'}:{}),...([7,14,30].includes(Number(state.days))?{days:Number(state.days)}:{})};state.start=null;state.end=null;state.run_number=null;if(key==='days')state.mode='days';observabilityView?.setContext(context);healthView?.setObservabilityContext(context);}draw();});
+  if(isCi)el('[data-ci-performance-window]').addEventListener('change',event=>{performanceDays=Number(event.target.value);refreshPerformance(true);});
   container.addEventListener('input',event=>{if(event.target.hasAttribute('data-ci-test-search')){testSearch=event.target.value;testPage=0;draw();}},{signal:listenerController.signal});
   el('[data-ig-search]').addEventListener('input',event=>{state.search=event.target.value;state.page=0;draw();});
   el('[data-ig-group]').addEventListener('change',event=>{state.group=event.target.value;draw();});
