@@ -562,3 +562,86 @@ def test_delivery_rebuild_preserves_review_findings_and_pr_merge():
     # Streams are not duplicated by the rebuild.
     assert len(restored.stream("review", "rvx")) == 2
     assert len(restored.stream("pull_request", "prx")) == 3
+
+
+# ---------------------------------------------------------------------------
+# Usage analytics (issue #36): token_usage and resource_usage ingest.
+# ---------------------------------------------------------------------------
+def test_ingest_token_usage_is_idempotent_on_request_id():
+    repo = ControlPlaneRepo()
+    svc = make_svc(repo)
+    rec = {"mission_id": "m1", "model": "gpt-4o", "request_id": "req-1",
+           "input_tokens": 10, "output_tokens": 5, "total": 0}
+    svc.ingest({"entity_type": "token_usage", "entity_id": "req-1",
+                "event_type": "token_usage.recorded", "payload": {**rec, "input_tokens": 10}})
+    # A duplicate request_id is counted once.
+    svc.ingest({"entity_type": "token_usage", "entity_id": "req-1",
+                "event_type": "token_usage.recorded",
+                "payload": {**rec, "input_tokens": 999}})
+    a = repo.usage_analytics(mission_id="m1")
+    assert a["tokens"]["by_model"]["gpt-4o"]["input_tokens"] == 10
+    assert a["tokens"]["total"]["input_tokens"] == 10
+    # Missing token counts stay None (never 0).
+    svc.ingest({"entity_type": "token_usage", "entity_id": "req-2",
+                "event_type": "token_usage.recorded",
+                "payload": {"mission_id": "m2", "model": "gpt-4o", "request_id": "req-2"}})
+    a2 = repo.usage_analytics(mission_id="m2")
+    assert a2["tokens"]["by_model"]["gpt-4o"]["input_tokens"] == 0
+    # Scoping: m1 does not see m2.
+    assert repo.usage_analytics(mission_id="m1")["tokens"]["total"]["input_tokens"] == 10
+
+
+def test_ingest_resource_usage_sums_by_kind_and_scopes_by_mission():
+    repo = ControlPlaneRepo()
+    svc = make_svc(repo)
+    for value in (1.5, 2.5):
+        svc.ingest({"entity_type": "resource_usage", "entity_id": f"r-{value}",
+                    "event_type": "resource_usage.recorded",
+                    "payload": {"mission_id": "m1", "kind": "cpu_seconds",
+                                "value": value, "unit": "s"}})
+    svc.ingest({"entity_type": "resource_usage", "entity_id": "r-other",
+                "event_type": "resource_usage.recorded",
+                "payload": {"mission_id": "m2", "kind": "cpu_seconds", "value": 99}})
+    a = repo.usage_analytics(mission_id="m1")
+    assert a["resources"]["cpu_seconds"]["count"] == 2
+    assert a["resources"]["cpu_seconds"]["total"] == 4.0
+    assert a["resources"]["cpu_seconds"]["unit"] == "s"
+    assert repo.usage_analytics(mission_id="m2")["resources"]["cpu_seconds"]["total"] == 99
+    assert "cpu_seconds" not in repo.usage_analytics(mission_id="m3")["resources"]
+
+
+def test_ingest_usage_rejects_invalid_shapes():
+    repo = ControlPlaneRepo()
+    svc = make_svc(repo)
+    with pytest.raises(ValueError, match="input_tokens"):
+        svc.ingest({"entity_type": "token_usage", "entity_id": "x",
+                    "event_type": "token_usage.recorded",
+                    "payload": {"input_tokens": "many"}})
+    with pytest.raises(ValueError, match="value"):
+        svc.ingest({"entity_type": "resource_usage", "entity_id": "x",
+                    "event_type": "resource_usage.recorded",
+                    "payload": {"kind": "cpu", "value": "many"}})
+
+
+def test_usage_and_stage_analytics_survive_export_import():
+    clock = {"t": 1_700_000_000.0}
+    repo = ControlPlaneRepo(now=lambda: clock["t"])
+    svc = make_svc(repo)
+    svc.ingest({"entity_type": "token_usage", "entity_id": "req-r1",
+                "event_type": "token_usage.recorded",
+                "payload": {"mission_id": "m1", "model": "gpt-4o",
+                            "request_id": "req-r1", "input_tokens": 7}})
+    svc.ingest({"entity_type": "resource_usage", "entity_id": "res-r1",
+                "event_type": "resource_usage.recorded",
+                "payload": {"mission_id": "m1", "kind": "cpu", "value": 2.0}})
+    mid = repo.create_mission("s")
+    repo.set_mission_stage(mid, "implementation"); clock["t"] += 0.5
+    repo.set_mission_stage(mid, "complete")
+    restored = ControlPlaneRepo(now=lambda: clock["t"])
+    restored.import_state(repo.export_state())
+    a = restored.usage_analytics(mission_id="m1")
+    assert a["tokens"]["by_model"]["gpt-4o"]["input_tokens"] == 7
+    assert a["resources"]["cpu"]["total"] == 2.0
+    st = restored.stage_analytics()
+    assert st["stages"]["implementation"]["p50_ms"] == 500
+    assert "complete" in st["in_progress"][mid]

@@ -2376,6 +2376,10 @@ class ControlPlaneRepo:
                 "test_runs": _copy(self._test_runs),
                 "reviews": _copy(self._reviews),
                 "pull_requests": _copy(self._pull_requests),
+                "token_usage": _copy(self._token_usage),
+                "resource_usage": {k: [dict(x) for x in v]
+                                    for k, v in self._resource_usage.items()},
+                "stage_runs": _copy(self._stage_runs),
             },
             "events": {f"{t}|{i}": [dict(e) for e in s]
                        for (t, i), s in self._events.items()},
@@ -2401,6 +2405,10 @@ class ControlPlaneRepo:
         self._test_runs = dict(delivery.get("test_runs", {}))
         self._reviews = dict(delivery.get("reviews", {}))
         self._pull_requests = dict(delivery.get("pull_requests", {}))
+        self._token_usage = dict(delivery.get("token_usage", {}))
+        self._resource_usage = {tuple(k): [dict(x) for x in v]
+                                for k, v in delivery.get("resource_usage", {}).items()}
+        self._stage_runs = dict(delivery.get("stage_runs", {}))
         self._events = {}
         for key, stream in state.get("events", {}).items():
             t, i = key.split("|")

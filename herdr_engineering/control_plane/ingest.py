@@ -368,6 +368,21 @@ class IngestService:
                 raise KeyError(entity_id)
         elif entity_type == "pull_request":
             self._delivery_mission_key(payload.get("mission_id"), source)
+        elif entity_type == "token_usage":
+            if not isinstance(payload, dict):
+                raise ValueError("token usage must be an object")
+            for k in ("input_tokens", "output_tokens", "reasoning_tokens",
+                      "cache_read_tokens", "cache_write_tokens", "duration_ms",
+                      "retry_number"):
+                v = payload.get(k)
+                if v is not None and (isinstance(v, bool) or not isinstance(v, (int, float))):
+                    raise ValueError(f"{k} must be a number")
+        elif entity_type == "resource_usage":
+            if not isinstance(payload, dict):
+                raise ValueError("resource usage must be an object")
+            value = payload.get("value")
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError("value must be a number")
 
     @staticmethod
     def _validate_test_counts(payload) -> None:
@@ -441,6 +456,14 @@ class IngestService:
             return self._ingest_review_finding(entity_id, payload, source)
         if entity_type == "pull_request":
             return self._ingest_pull_request(entity_id, event_type, payload, source)
+        if entity_type == "token_usage":
+            rec = self.repo.add_token_usage(payload)
+            return {"entity_type": "token_usage", "entity_id": entity_id,
+                    "event_type": event_type, "usage": rec}
+        if entity_type == "resource_usage":
+            rec = self.repo.add_resource_usage(payload)
+            return {"entity_type": "resource_usage", "entity_id": entity_id,
+                    "event_type": event_type, "usage": rec}
         # Unknown/other entity types: record the event generically so nothing is
         # silently dropped, and the UI still sees it on the activity stream.
         if record_generic:
