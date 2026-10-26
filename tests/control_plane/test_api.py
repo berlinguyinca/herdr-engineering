@@ -240,6 +240,26 @@ def test_analytics(server):
     assert json.loads(body)["total"] == 0
 
 
+def test_analytics_stages_and_usage(server):
+    c, repo = server
+    mid = repo.create_mission("stage-api")
+    repo.set_mission_stage(mid, "implementation")
+    repo.set_mission_stage(mid, "complete")
+    repo.add_token_usage({"mission_id": mid, "model": "gpt-4o",
+                          "request_id": "req-a", "input_tokens": 3})
+    repo.add_resource_usage({"mission_id": mid, "kind": "cpu", "value": 1.0})
+    status, _, body = c.get("/api/v1/analytics/stages")
+    assert status == 200
+    assert json.loads(body)["bottleneck"] == "implementation"
+    status, _, body = c.get("/api/v1/analytics/usage")
+    u = json.loads(body)
+    assert u["tokens"]["by_model"]["gpt-4o"]["input_tokens"] == 3
+    assert u["resources"]["cpu"]["total"] == 1.0
+    # Mission-scoped usage via ?mission=
+    status, _, body = c.get(f"/api/v1/analytics/usage?mission={mid}")
+    assert json.loads(body)["resources"]["cpu"]["total"] == 1.0
+
+
 def test_sse_stream_content_type(server):
     c, _ = server
     conn = http.client.HTTPConnection("127.0.0.1", _port(c))
