@@ -49,7 +49,7 @@ def _git_identity(payload):
 # plain activity records nothing authoritative reads back. Adding a type here is a security decision.
 DISPATCHED_ENTITY_TYPES = frozenset({"lineage", "host", "session", "mission", "service", "inspector",
                                      "mission_activity", "test_run", "build", "review",
-                                     "review_finding", "pull_request"})
+                                     "review_finding", "pull_request", "token_usage", "resource_usage"})
 # ledger / platform / lifecycle are the Pi envelope adapters' activity streams (envelopeAdapters.ts)
 # repository / request / span are the opt-in system-graph adapter's lifecycle streams (graph_ingest.py, runbook
 # docs/specs/herdr-system-graph-20261020/11-p0-p6-status-and-runbook.md). They were accepted before T16, nothing
