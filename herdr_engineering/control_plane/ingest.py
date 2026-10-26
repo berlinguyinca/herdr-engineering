@@ -373,8 +373,15 @@ class IngestService:
     def _validate_test_counts(payload) -> None:
         for key in ("passed", "failed", "skipped", "total"):
             value = payload.get(key)
-            if value is not None and (isinstance(value, bool) or not isinstance(value, (int, float))):
-                raise ValueError(f"{key} must be a number")
+            if value is None:
+                continue
+            # bool is an int subclass but is not a count; NaN/Infinity are numbers
+            # but cannot be serialized as JSON and would corrupt displayed metrics.
+            if isinstance(value, bool) or not isinstance(value, (int, float)) \
+                    or isinstance(value, float) and (value != value or value in (float('inf'), float('-inf'))):
+                raise ValueError(f"{key} must be a finite number")
+            if value < 0:
+                raise ValueError(f"{key} must be non-negative")
         results = payload.get("results")
         if results is not None:
             if not isinstance(results, list) or any(

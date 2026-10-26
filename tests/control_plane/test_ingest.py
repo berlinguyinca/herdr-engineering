@@ -399,10 +399,13 @@ def test_ingest_pull_request_is_idempotent_and_filters_by_mission():
 def test_ingest_delivery_rejects_invalid_counts():
     repo = ControlPlaneRepo()
     svc = make_svc(repo)
-    with pytest.raises(ValueError, match="passed"):
+    def ingest(passed):
         svc.ingest({"entity_type": "test_run", "entity_id": "r",
                     "event_type": "test_run.started",
-                    "payload": {"passed": "many"}})
+                    "payload": {"passed": passed}})
+    for bad in ("many", True, float("nan"), float("inf"), float("-inf"), -3):
+        with pytest.raises(ValueError, match="passed"):
+            ingest(bad)
 
 
 def test_ingest_review_finding_replay_is_idempotent_without_finding_id():
