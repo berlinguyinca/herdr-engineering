@@ -463,11 +463,14 @@ class IngestService:
         if entity_type == "pull_request":
             return self._ingest_pull_request(entity_id, event_type, payload, source)
         if entity_type == "token_usage":
-            rec = self.repo.add_token_usage(payload)
+            # An already-persisted schema-v2 envelope row must not be recorded a
+            # second time by the projection (record_generic is False there), or
+            # an event-only reload would replay (and double-count) both records.
+            rec = self.repo.add_token_usage(payload, record_event=record_generic)
             return {"entity_type": "token_usage", "entity_id": entity_id,
                     "event_type": event_type, "usage": rec}
         if entity_type == "resource_usage":
-            rec = self.repo.add_resource_usage(payload)
+            rec = self.repo.add_resource_usage(payload, record_event=record_generic)
             return {"entity_type": "resource_usage", "entity_id": entity_id,
                     "event_type": event_type, "usage": rec}
         # Unknown/other entity types: record the event generically so nothing is

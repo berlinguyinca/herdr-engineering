@@ -722,3 +722,53 @@ def test_export_state_serializes_resource_usage_keys_as_json():
     a = restored.usage_analytics(mission_id="m1")
     assert a["resources"]["cpu"]["count"] == 2
     assert a["resources"]["cpu"]["total"] == 5.0
+
+
+def test_v2_usage_envelope_does_not_duplicate_events():
+    """A schema-v2 envelope persists its row before dispatch; the projection must
+    not record a second event, or an event-only reload would double-count it."""
+    repo = ControlPlaneRepo()
+    svc = make_svc(repo)
+    env = {"schema_version": 2, "event_id": "pi-usage-1", "source": "pi",
+           "source_sequence": 1, "entity_type": "token_usage", "entity_id": "req-u1",
+           "event_type": "token_usage.recorded",
+           "payload": {"mission_id": "M1", "model": "gpt", "request_id": "req-u1",
+                       "input_tokens": 5}}
+    svc.ingest(env, {"id": "agent", "kind": "agent", "authenticated_by": "api_key"})
+    assert repo.usage_analytics(mission_id="M1")["tokens"]["total"]["input_tokens"] == 5
+    # The envelope row is the only durable record for this usage event.
+    assert len(repo.stream("token_usage", "req-u1")) == 1
+    # Event-only reload must not double-count.
+    state = repo.export_state()
+    state.pop("delivery", None)
+    restored = ControlPlaneRepo()
+    restored.import_state(state)
+    assert restored.usage_analytics(mission_id="M1")["tokens"]["total"]["input_tokens"] == 5
+
+
+def test_v2_resource_usage_envelope_not_double_counted():
+    repo = ControlPlaneRepo()
+    svc = make_svc(repo)
+    env = {"schema_version": 2, "event_id": "pi-res-1", "source": "pi",
+           "source_sequence": 1, "entity_type": "resource_usage", "entity_id": "res-u1",
+           "event_type": "resource_usage.recorded",
+           "payload": {"mission_id": "M1", "kind": "cpu", "value": 2.0}}
+    svc.ingest(env, {"id": "agent", "kind": "agent", "authenticated_by": "api_key"})
+    a = repo.usage_analytics(mission_id="M1")
+    assert a["resources"]["cpu"]["total"] == 2.0
+    assert a["resources"]["cpu"]["count"] == 1
+
+
+def test_usage_rejects_malformed_occurred_at():
+    """A garbage occurred_at must not break the retention sweep later."""
+    import datetime as _dt
+    from herdr_engineering.control_plane.retention import sweep_token_usage
+    clock = {"t": _dt.datetime(2026, 10, 23, tzinfo=_dt.UTC).timestamp()}
+    repo = ControlPlaneRepo(now=lambda: clock["t"])
+    rec = repo.add_token_usage({"mission_id": "m1", "model": "gpt",
+                                "request_id": "bad-ts", "input_tokens": 1,
+                                "occurred_at": "not-a-timestamp"})
+    # The malformed timestamp is normalized away (falls back to the wall clock).
+    assert rec["occurred_at"] == repo._stamp()
+    # The retention sweep must not raise on the stored projection.
+    sweep_token_usage(repo, raw_retention_days=1)

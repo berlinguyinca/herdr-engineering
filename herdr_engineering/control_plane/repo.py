@@ -2118,8 +2118,12 @@ class ControlPlaneRepo:
     _TOKEN_COUNT_FIELDS = ("input_tokens", "output_tokens", "reasoning_tokens",
                            "cache_read_tokens", "cache_write_tokens")
 
-    def add_token_usage(self, rec):
-        """Store one mission-scoped token usage record, idempotent on request_id."""
+    def add_token_usage(self, rec, record_event=True):
+        """Store one mission-scoped token usage record, idempotent on request_id.
+
+        ``record_event`` is False when an envelope already persisted the durable
+        row (schema-v2 ingest), so the projection does not write a duplicate.
+        """
         if not isinstance(rec, dict):
             raise ValueError("token usage must be an object")
         request_id = _usage_str(rec.get("request_id"), 128)
@@ -2133,7 +2137,7 @@ class ControlPlaneRepo:
                  "model": _usage_str(rec.get("model"), 256),
                  "provider": _usage_str(rec.get("provider"), 128),
                  "stage": _usage_str(rec.get("stage"), 128),
-                 "occurred_at": rec.get("occurred_at") or self._stamp(),
+                 "occurred_at": _normalize_occurred_at(rec.get("occurred_at")) or self._stamp(),
                  "duration_ms": _usage_int(rec.get("duration_ms")),
                  "retry_number": _usage_int(rec.get("retry_number")),
                  "success": rec.get("success")
@@ -2145,11 +2149,12 @@ class ControlPlaneRepo:
         if existing is not None:
             return existing
         self._token_usage[request_id] = clean
-        self.record_event("token_usage", request_id, "token_usage.recorded", clean,
-                          mission_id=clean["mission_id"], session_id=clean["session_id"])
+        if record_event:
+            self.record_event("token_usage", request_id, "token_usage.recorded", clean,
+                              mission_id=clean["mission_id"], session_id=clean["session_id"])
         return clean
 
-    def add_resource_usage(self, rec):
+    def add_resource_usage(self, rec, record_event=True):
         """Store one mission-scoped resource usage record."""
         if not isinstance(rec, dict):
             raise ValueError("resource usage must be an object")
@@ -2161,7 +2166,7 @@ class ControlPlaneRepo:
                  "session_id": _usage_id(rec.get("session_id")),
                  "value": rec.get("value"), "unit": _usage_str(rec.get("unit"), 32),
                  "payload": rec.get("payload"),
-                 "occurred_at": rec.get("occurred_at") or self._stamp()}
+                 "occurred_at": _normalize_occurred_at(rec.get("occurred_at")) or self._stamp()}
         value = clean["value"]
         if (isinstance(value, bool) or not isinstance(value, (int, float))
                 or not math.isfinite(value) or value < 0):
@@ -2169,9 +2174,10 @@ class ControlPlaneRepo:
         key = (mission_id, kind)
         bucket = self._resource_usage.setdefault(key, [])
         bucket.append(clean)
-        self.record_event("resource_usage", f"{mission_id}:{kind}:{len(bucket) - 1}",
-                          "resource_usage.recorded", clean, mission_id=mission_id,
-                          session_id=clean["session_id"])
+        if record_event:
+            self.record_event("resource_usage", f"{mission_id}:{kind}:{len(bucket) - 1}",
+                              "resource_usage.recorded", clean, mission_id=mission_id,
+                              session_id=clean["session_id"])
         return clean
 
     def usage_analytics(self, mission_id=None):
@@ -2712,6 +2718,21 @@ def _usage_int(value):
         return int(value) if math.isfinite(value) and value >= 0 else None
     except (ValueError, OverflowError):  # pragma: no cover - non-finite already caught
         return None
+
+
+def _normalize_occurred_at(value):
+    """Return a valid ISO timestamp string, or None for anything malformed.
+
+    Guards the retention sweep, which parses ``occurred_at`` with
+    ``datetime.fromisoformat``; a garbage value there would fail the sweep.
+    """
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        _dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return value
 
 
 def _usage_str(value, limit):
