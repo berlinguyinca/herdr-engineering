@@ -445,3 +445,14 @@ test('summary and test queries carry the same event scope and bucket bounds',asy
  await client.getCiSummary(selection);await client.getCiTests(selection);
  for(const url of calls)for(const [key,value] of Object.entries(selection))assert.equal(new URL(url,'http://test').searchParams.get(key),value);
 });
+
+test('last-runs summary and test queries preserve mode and exact run without a day cutoff',async()=>{
+ const calls=[];
+ const client=new HerdrClient('',{fetchImpl:async url=>{calls.push(url);return {ok:true,status:200,text:async()=>'{}'};}});
+ const selection={mode:'runs',days:null,provider_url:'https://ci.example',provider_repo_id:17,repository:'org/app',run_number:26};
+ await client.getCiSummary(selection);await client.getCiTests(selection);
+ for(const url of calls){const params=new URL(url,'http://test').searchParams;
+  assert.equal(params.has('days'),false);
+  for(const [key,value] of Object.entries(selection))if(key!=='days')assert.equal(params.get(key),String(value));
+ }
+});

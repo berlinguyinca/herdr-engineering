@@ -32,6 +32,12 @@ if '--selection-contract' in sys.argv:
         if row['number'] == 1:
             row['status'] = 'failure'
 
+if '--old-selection-run' in sys.argv:
+    for row in RUNS:
+        if row['number'] in (2, 3):
+            for key in ('created', 'started', 'finished'):
+                row[key] -= 60 * 86400
+
 
 class ProviderHandler(BaseHTTPRequestHandler):
     def do_GET(self):

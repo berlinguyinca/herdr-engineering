@@ -1801,6 +1801,7 @@ class ControlPlaneRepo:
 
     def ci_test_history(self, repository=None, branch=None, test=None, days=30, *,
                         provider_url=None, provider_repo_id=None, scope='all', start=None, end=None,
+                 mode='days', run_number=None,
                         pipelines=(), inventory=()):
         """Reuse compact projections until retained report/observation events change.
 
@@ -1847,7 +1848,8 @@ class ControlPlaneRepo:
             _, store, unjoined, _ = self._ci_test_projection
             view = store.test_summary(repository=repository, branch=branch, test=test, days=days,
                                       provider_url=provider_url, provider_repo_id=provider_repo_id,
-                                      scope=scope, start=start, end=end, pipelines=pipelines, inventory=inventory)
+                                      scope=scope, start=start, end=end, mode=mode, run_number=run_number,
+                                      pipelines=pipelines, inventory=inventory)
             now = self._now()
             unjoined_count = sum(
                 (repository is None or row['repository'] == repository) and
@@ -1856,7 +1858,7 @@ class ControlPlaneRepo:
                 (provider_repo_id is None or str(row.get('provider_repo_id')) == str(provider_repo_id)) and
                 (stamp := _timestamp(row.get('reported_at'))) is not None and
                 now - days * 86400 <= stamp <= now for row in unjoined
-                if scope == 'all' and start is None and end is None)
+                if mode == 'days' and run_number is None and scope == 'all' and start is None and end is None)
             source_truncated = bool(self._ci_history_truncated & {'ci_report', 'ci_observation'})
             view['scope'].update(persistence='durable_sink' if self._sink is not None else 'memory_only',
                                  memory_only=self._sink is None,
@@ -1870,7 +1872,7 @@ class ControlPlaneRepo:
 
     def ci_summary(self, *, pipelines=(), inventory=(), cached=None, days=14,
                    repository=None, branch=None, scope='all', provider_url=None,
-                   provider_repo_id=None, start=None, end=None):
+                   provider_repo_id=None, start=None, end=None, mode='days', run_number=None):
         """Windowed aggregates of cached history and durable observations, never I/O.
 
         The durable store keeps its existing 2,000-run bound; history's separate
@@ -1885,15 +1887,15 @@ class ControlPlaneRepo:
             _identity,
             pipeline_outcome,
             run_in_scope,
-            run_in_window,
             run_window,
+            select_run_window,
         )
         from .ci_performance import _iso, _stats, _timestamp
 
         cached = cached or {}
         now = self._now()
         # Match the heatmap and run list: UTC calendar days including today.
-        window_start, window_end = run_window(now, days, start, end)
+        window_start, window_end = run_window(now, days, start, end, mode)
         store = CIObservationStore()
         with self._event_lock:
             retained = [stream[-1]['payload'] for (kind, _), stream in self._events.items()
@@ -1942,6 +1944,7 @@ class ControlPlaneRepo:
             groups[key] = {'rows': [], 'unknown_time_run_count': 0,
                            'scope_unavailable': scope == 'default' and not defaults.get(key)}
         unknown_time = scope_unavailable = 0
+        scoped_runs = {}
         for key, row in runs.items():
             if branch is not None and row.get('branch') != branch:
                 continue
@@ -1954,17 +1957,17 @@ class ControlPlaneRepo:
                 continue
             if not run_in_scope(row, scope, defaults.get(project)):
                 continue
-            stamp = _timestamp(row.get('created_at'))
-            if stamp is None:
+            scoped_runs[key] = row
+            if _timestamp(row.get('created_at')) is None:
                 unknown_time += 1
                 group['unknown_time_run_count'] += 1
-                continue
-            if not run_in_window(row, now, days, start, end):
-                continue
-            group['rows'].append(row)
+        for key, row in select_run_window(scoped_runs, now, days, start, end, mode, run_number).items():
+            groups[key[:3]]['rows'].append(row)
             selected.append(row)
-            day = datetime.fromtimestamp(stamp, UTC).date().isoformat()
-            daily.setdefault(day, []).append(row)
+            stamp = _timestamp(row.get('created_at'))
+            if stamp is not None:
+                day = datetime.fromtimestamp(stamp, UTC).date().isoformat()
+                daily.setdefault(day, []).append(row)
 
         def metrics(values):
             counts = Counter(pipeline_outcome(row) for row in values)
@@ -2002,10 +2005,12 @@ class ControlPlaneRepo:
                           any(p['coverage'].get('truncated') for p in projects),
                 memory_only=self._sink is None, history_memory_only=True,
                 persistence='durable_sink' if self._sink is not None else 'memory_only',
-                days=days, window={'start': _iso(window_start), 'end': _iso(window_end)}, repository=repository,
+                days=days if mode == 'days' else None, mode=mode, run_number=run_number,
+                window={'start': _iso(window_start), 'end': _iso(window_end)}, repository=repository,
                 start=start, end=end,
                 branch=branch, scope=scope, provider_url=provider_url, provider_repo_id=provider_repo_id,
-                denominator='successful_or_failed_runs', time_basis='created_at', window_basis='utc_calendar_days_including_today',
+                denominator='successful_or_failed_runs', time_basis='created_at', window_basis=('last_24_runs_per_project' if mode == 'runs' else
+                    'trailing_24_hours' if mode == 'hours' else 'utc_calendar_days_including_today'),
                 minimum_percentile_samples=5, unknown_time_run_count=unknown_time,
                 scope_unavailable_run_count=scope_unavailable, unjoined_run_count=unjoined,
                 history=cached.get('scope', {})))
@@ -2021,11 +2026,13 @@ class ControlPlaneRepo:
 
     def ci_tests(self, *, redact, days=14, repository=None, branch=None, test=None,
                  provider_url=None, provider_repo_id=None, scope='all', start=None, end=None,
+                 mode='days', run_number=None,
                  pipelines=(), inventory=()):
         """Bounded HTTP projection; the full retained-history contract is unchanged."""
         view = self.ci_test_history(repository=repository, branch=branch, test=test, days=days,
                                     provider_url=provider_url, provider_repo_id=provider_repo_id,
-                                    scope=scope, start=start, end=end, pipelines=pipelines, inventory=inventory)
+                                    scope=scope, start=start, end=end, mode=mode, run_number=run_number,
+                                      pipelines=pipelines, inventory=inventory)
         view = redact(view)
         tests = sorted(view['tests'], key=lambda row: (
             -row['failure_count'], -(row['duration_ms']['p95'] or row['last_duration_ms'] or 0),

@@ -2722,7 +2722,7 @@ def _ci_observability_query(path, route):
 
     query = parse_qs(urlsplit(path).query, keep_blank_values=True, max_num_fields=16)
     allowed = {'days', 'repository', 'branch', 'provider_url', 'provider_repo_id',
-               'scope', 'start', 'end'} | ({'test'} if route == 'tests' else set())
+               'scope', 'start', 'end', 'mode', 'run_number'} | ({'test'} if route == 'tests' else set())
     if set(query) - allowed or any(len(values) != 1 for values in query.values()):
         raise ValueError('Invalid CI filters')
     filters = {key: values[0] for key, values in query.items() if values[0] != ''}
@@ -2733,6 +2733,15 @@ def _ci_observability_query(path, route):
     if days not in ('7', '14', '30'):
         raise ValueError('CI days must be 7, 14 or 30')
     filters['days'] = int(days)
+    if filters.get('mode', 'days') not in ('days', 'runs', 'hours'):
+        raise ValueError('Invalid CI window mode')
+    if 'run_number' in filters:
+        number = filters['run_number']
+        if (filters.get('mode') != 'runs' or not number.isascii() or not number.isdigit() or
+                not 0 < int(number) <= 2**63 - 1 or
+                not all(filters.get(key) for key in ('provider_url', 'provider_repo_id', 'repository'))):
+            raise ValueError('CI run selection requires a valid run and exact project identity')
+        filters['run_number'] = int(number)
     if filters.get('scope', 'all') not in ('all', 'default', 'pr'):
         raise ValueError('CI scope must be all, default or pr')
     if 'start' in filters or 'end' in filters:

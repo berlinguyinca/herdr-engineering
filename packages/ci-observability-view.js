@@ -22,7 +22,7 @@ export function ciObservabilityModel(data={},options={}) {
   return {projects,selected:all.find(p=>p.key===options.projectKey)||null,projectKey:options.projectKey||'',kpis:metrics(data.kpis,minimum),projectCount:count(data.kpis?.project_count),scope:data.scope||{},available:data.available,charts:rows(data.charts),minimum,generatedAt:data.generated_at,refreshing:!!data.refreshing};
 }
 function scopeNote(scope={}) {
-  return `${scope.days||14}-day observed window · ${scope.branch||'All branches'} · ${scope.scope||'all'} runs. ${scope.window?`${scope.window.start} → ${scope.window.end}. `:''}Retained observations, not a complete history. ${scope.partial?'Partial coverage. ':''}${scope.stale?'Stale snapshot. ':''}${scope.truncated?'Retention or response limit reached. ':''}${scope.memory_only?'Storage is memory-only. ':''}${scope.history_memory_only?'Provider backfill is memory-only. ':''}`;
+  return `${scope.mode==='runs'?'Last 24 runs per project'+(scope.run_number!=null?` · Run #${scope.run_number}`:''):scope.mode==='hours'?'Last 24 hours':`${scope.days||14}-day observed window`} · ${scope.branch||'All branches'} · ${scope.scope||'all'} runs. ${scope.window?`${scope.window.start} → ${scope.window.end}. `:''}Retained observations, not a complete history. ${scope.partial?'Partial coverage. ':''}${scope.stale?'Stale snapshot. ':''}${scope.truncated?'Retention or response limit reached. ':''}${scope.memory_only?'Storage is memory-only. ':''}${scope.history_memory_only?'Provider backfill is memory-only. ':''}`;
 }
 function cards(model) {
   if(model.available===false)return '<p class="ci-chart-note" role="status">CI summary unavailable. Coverage is partial; observed metrics cannot be established.</p>';
@@ -58,7 +58,7 @@ export function mountCiObservability(host,client,{repository='',provider='',miss
   const health=read(`herdr.ci-health.v1:${JSON.stringify([repository,mission,session])}`);
   const saved=read(storageKey);
   const preferences=ciObservabilityPreferences({...health,days:health?.mode,...saved,...(typeof search==='string'?{search}:{})});
-  let filters={days:preferences.days,scope:preferences.scope,branch:preferences.branch,repository,provider_url:provider||undefined},project=preferences.project,summary=null,detail=null,tests=null;
+  let filters={mode:'days',days:preferences.days,scope:preferences.scope,branch:preferences.branch,repository,provider_url:provider||undefined},project=preferences.project,summary=null,detail=null,tests=null;
   let view={search:preferences.search,sort:preferences.sort,failuresOnly:preferences.failuresOnly},testSort=preferences.testSort,error='',detailError='',testsError='',disposed=false,timer=null,generation=0;
   const context=()=>({...filters,...view,project});
   function save() {try{doc.defaultView.localStorage.setItem(storageKey,JSON.stringify(ciObservabilityPreferences({...view,days:filters.days,scope:filters.scope,branch:filters.branch,project,testSort})));}catch{ /* Storage can be unavailable or full. */ }}
@@ -67,7 +67,7 @@ export function mountCiObservability(host,client,{repository='',provider='',miss
   host.innerHTML=`${ciChartStyles}${styles}<section class="ci-ob" aria-label="CI command center"><h2>CI command center</h2><p class="ci-chart-note">Reliability and runtime across observed projects</p><div class="ci-ob-controls"><label>Window<select data-ob-days>${[7,14,30].map(n=>`<option value="${n}" ${n===14?'selected':''}>${n} days</option>`).join('')}</select></label><label>Scope<select data-ob-scope><option value="all">All runs</option><option value="default">Default branch</option><option value="pr">Pull requests</option></select></label><label>Branch<input data-ob-branch maxlength="500" placeholder="All branches"></label><label>Find projects<input data-ob-search type="search" maxlength="500" value="${esc(view.search)}"></label><label>Sort projects<select data-ob-sort><option value="failure">Failure rate</option><option value="duration">Duration p95</option><option value="name">Project name</option></select></label><label><span>Failures only</span><input data-ob-failures type="checkbox"></label><button type="button" data-ob-refresh>Refresh</button></div><p data-ob-status role="status" aria-live="polite"></p><div data-ob-summary></div><h3>Project comparison</h3><p class="ci-chart-note">Search, failures-only and sorting filter this comparison table. Summary cards describe the selected project, or all projects in the server scope.</p><div data-ob-projects></div><div class="ci-ob-chart-heading"><h3 data-ob-selection>All projects · selected window</h3><button type="button" data-ob-clear hidden>All projects</button></div><div data-ob-charts></div><div class="ci-ob-controls"><h3>Reported test history</h3><label>Sort tests<select data-ob-test-sort><option value="failure">Most failures</option><option value="duration">Slowest last duration</option></select></label></div><div data-ob-tests></div></section>`;
   const el=s=>host.querySelector(s);
   function syncControls() {
-    for(const key of ['days','scope','branch'])el(`[data-ob-${key}]`).value=String(filters[key]);
+    for(const key of ['days','scope','branch'])el(`[data-ob-${key}]`).value=String(filters[key]??'');
     for(const key of ['search','sort'])el(`[data-ob-${key}]`).value=view[key];
     el('[data-ob-failures]').checked=view.failuresOnly;el('[data-ob-test-sort]').value=testSort;
   }
@@ -93,7 +93,7 @@ export function mountCiObservability(host,client,{repository='',provider='',miss
     el('[data-ob-status]').textContent=unsupported?'Compact summaries are unavailable for mission/session context. Use the scoped run tree below.':`${error||''} ${detailError||''} ${summary?.available===false||detail?.available===false?'CI summary unavailable. Coverage is partial. ':''}${pending.size?'Refreshing observations… ':''}${summary?scopeNote(summary.scope):'CI summary unavailable or loading.'}${summary?.generated_at?` Last provider snapshot: ${summary.generated_at}.`:''}`.trim();
     replace(el('[data-ob-summary]'),selected?cards(ciObservabilityModel(selected)):'');
     replace(el('[data-ob-projects]'),summary?rail(model,projectCharts):'<p class="ci-chart-note">No project summary received.</p>');
-    el('[data-ob-selection]').textContent=project?`${project.repository} · ${project.provider_url} #${project.provider_repo_id} · ${filters.days}-day window`:'All projects · selected window';
+    el('[data-ob-selection]').textContent=project?`${project.repository} · ${project.provider_url} #${project.provider_repo_id} · ${filters.mode==='runs'?'Last 24 runs'+(filters.run_number!=null?` · Run #${filters.run_number}`:''):filters.mode==='hours'?'Last 24 hours':`${filters.days}-day window`}`:'All projects · selected window';
     el('[data-ob-clear]').hidden=!project;
     replace(el('[data-ob-charts]'),selected?`<p class="ci-chart-note">${esc(scopeNote(selected.scope))} Daily grouping uses run creation time (created_at) and UTC calendar days, including today. Selected heatmap buckets narrow these charts and run metrics.</p>${renderCiSummaryCharts(rows(selected.charts))}`:'<p class="ci-chart-note">No chart observations received for this selection.</p>');
     replace(el('[data-ob-tests]'),renderCiTestHistory(tests,{selected:!!project,loading:pending.has('tests'),error:testsError,sort:testSort}));
@@ -116,7 +116,7 @@ export function mountCiObservability(host,client,{repository='',provider='',miss
     // Selection changes do not change the fleet scope. Poll/manual refresh still
     // refresh all three resources; a missing fleet snapshot must also be fetched.
     const jobs=[];
-    if(!selectionOnly||!summary)jobs.push(request('summary',signal=>client.getCiSummary({...filters,signal}),data=>{if(!Array.isArray(data?.projects)||!data.kpis)throw Error('Invalid summary');summary=data;error='';},()=>{error=summary?'Summary refresh failed. Showing the last received snapshot (stale).':'CI summary unavailable.';}));
+    if(!selectionOnly||!summary)jobs.push(request('summary',signal=>client.getCiSummary({...filters,...(filters.run_number!=null&&project?{repository:project.repository,provider_url:project.provider_url,provider_repo_id:project.provider_repo_id}:{}),signal}),data=>{if(!Array.isArray(data?.projects)||!data.kpis)throw Error('Invalid summary');summary=data;error='';},()=>{error=summary?'Summary refresh failed. Showing the last received snapshot (stale).':'CI summary unavailable.';}));
     if(project){
       const context={...filters,repository:project.repository,provider_url:project.provider_url,provider_repo_id:project.provider_repo_id};
       jobs.push(request('project',signal=>client.getCiSummary({...context,signal}),data=>{if(!Array.isArray(data?.charts)||!data.kpis)throw Error('Invalid project summary');detail=data;detailError='';projectCharts.set(ciProjectKey(project),rows(data.charts));},()=>{detailError=detail?'Project refresh failed. Retained charts are stale.':'Project charts unavailable.';}));
@@ -130,7 +130,7 @@ export function mountCiObservability(host,client,{repository='',provider='',miss
     detail=null;tests=null;detailError='';testsError='';
     if(all){summary=null;error='';projectCharts.clear();}
   }
-  function selectProject(next) {const bucket=filters.start!=null;filters.start=null;filters.end=null;invalidate({all:bucket});project=next;refresh({selectionOnly:!bucket});notify();}
+  function selectProject(next) {const bucket=filters.start!=null||filters.run_number!=null;filters.start=null;filters.end=null;filters.run_number=null;invalidate({all:bucket});project=next;refresh({selectionOnly:!bucket});notify();}
   host.addEventListener('click',event=>{
     const button=event.target.closest('button');if(!button||!host.contains(button))return;
     if(button.hasAttribute('data-ob-refresh'))refresh();
@@ -141,8 +141,13 @@ export function mountCiObservability(host,client,{repository='',provider='',miss
   function change(event) {
     const target=event.target;
     if(target.hasAttribute('data-ob-test-sort')){testSort=target.value;save();draw();return;}
-    for(const key of ['search','sort','failures'])if(target.hasAttribute(`data-ob-${key}`)){view[key==='failures'?'failuresOnly':key]=key==='failures'?target.checked:text(target.value);notify();draw();return;}
-    for(const key of ['days','scope','branch'])if(target.hasAttribute(`data-ob-${key}`)){filters[key]=key==='days'?Number(target.value):text(target.value);filters.start=null;filters.end=null;invalidate({all:true});notify();draw();refresh();return;}
+    for(const key of ['search','sort','failures'])if(target.hasAttribute(`data-ob-${key}`)){
+      view[key==='failures'?'failuresOnly':key]=key==='failures'?target.checked:text(target.value);
+      const clear=key!=='sort'&&(filters.start!=null||filters.end!=null||filters.run_number!=null);
+      if(clear){filters.start=null;filters.end=null;filters.run_number=null;invalidate({all:true});}
+      notify();draw();if(clear)refresh();return;
+    }
+    for(const key of ['days','scope','branch'])if(target.hasAttribute(`data-ob-${key}`)){filters[key]=key==='days'?Number(target.value):text(target.value);filters.start=null;filters.end=null;filters.run_number=null;if(key==='days')filters.mode='days';invalidate({all:true});notify();draw();refresh();return;}
   }
   host.addEventListener('change',change,{signal:listeners.signal});
   host.addEventListener('input',event=>{if(event.target.matches('[data-ob-search],[data-ob-branch]'))change(event);},{signal:listeners.signal});
@@ -151,9 +156,10 @@ export function mountCiObservability(host,client,{repository='',provider='',miss
   return {refresh,getContext:context,
     setContext(next={}) {
       if(disposed)return;
-      const updated={...filters,...Object.fromEntries(['days','scope','branch','repository','start','end'].filter(key=>next[key]!==undefined).map(key=>[key,next[key]]))};
+      const updated={...filters,...Object.fromEntries(['days','mode','run_number','scope','branch','repository','start','end'].filter(key=>next[key]!==undefined).map(key=>[key,next[key]]))};
       const nextProject=next.project===undefined?project:next.project;
-      if(next.start===undefined&&next.end===undefined&&(['days','scope','branch','repository'].some(key=>updated[key]!==filters[key])||(nextProject?ciProjectKey(nextProject):'')!==(project?ciProjectKey(project):''))){updated.start=null;updated.end=null;}
+      if(next.days!=null&&next.mode===undefined)updated.mode='days';
+      if(next.start===undefined&&next.end===undefined&&next.run_number===undefined&&(['days','mode','scope','branch','repository'].some(key=>updated[key]!==filters[key])||['search','failuresOnly'].some(key=>next[key]!==undefined&&next[key]!==view[key])||(nextProject?ciProjectKey(nextProject):'')!==(project?ciProjectKey(project):''))){updated.start=null;updated.end=null;updated.run_number=null;}
       const changed=JSON.stringify(updated)!==JSON.stringify(filters)||(nextProject?ciProjectKey(nextProject):'')!==(project?ciProjectKey(project):'');
       const scopeChanged=JSON.stringify(updated)!==JSON.stringify(filters);
       if(changed){invalidate({all:scopeChanged});filters=updated;project=nextProject;}

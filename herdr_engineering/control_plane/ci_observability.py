@@ -95,18 +95,36 @@ def run_in_scope(row, scope, default_branch=None):
             scope == 'default' and bool(default_branch) and not is_pr and row.get('branch') == default_branch)
 
 
-def run_window(now, days, start=None, end=None):
+def run_window(now, days, start=None, end=None, mode='days'):
     """UTC creation-day window, intersected with a half-open selected bucket."""
-    return (max(now // 86400 * 86400 - (days - 1) * 86400,
+    lower = 0 if mode == 'runs' else now - 86400 if mode == 'hours' else now // 86400 * 86400 - (days - 1) * 86400
+    return (max(lower,
                 _timestamp(start) if start is not None else float('-inf')),
             min(now, _timestamp(end) if end is not None else now))
 
 
-def run_in_window(row, now, days, start=None, end=None):
-    lower, upper = run_window(now, days, start, end)
+def run_in_window(row, now, days, start=None, end=None, mode='days'):
+    lower, upper = run_window(now, days, start, end, mode)
     stamp = _timestamp(row.get('created_at'))
+    if mode == 'runs' and stamp is None and start is None and end is None:
+        return True
     return (stamp is not None and lower <= stamp <= upper and
             (end is None or stamp < _timestamp(end)))
+
+
+def select_run_window(runs, now, days, start=None, end=None, mode='days', run_number=None):
+    """Apply the shared window after project, branch and event-scope filtering."""
+    selected = {key: row for key, row in runs.items()
+                if run_in_window(row, now, days, start, end, mode)}
+    if mode == 'runs' and run_number is None:
+        groups = {}
+        for key, row in selected.items():
+            groups.setdefault(key[:3], []).append((key, row))
+        selected = dict(item for group in groups.values() for item in sorted(
+            group, key=lambda item: (_timestamp(item[1].get('created_at')) or float('-inf'), item[0][3]))[-24:])
+    if run_number is not None:
+        selected = {key: row for key, row in selected.items() if key[3] == int(run_number)}
+    return selected
 
 
 def _project(row, fields):
@@ -425,7 +443,7 @@ class CIObservationStore:
 
     def test_summary(self, repository=None, branch=None, test=None, days=30, *,
                      provider_url=None, provider_repo_id=None, scope='all', start=None, end=None,
-                     pipelines=(), inventory=()):
+                     mode='days', run_number=None, pipelines=(), inventory=()):
         """Aggregate retained parsed cases in an inclusive UTC report-time window.
 
         Rates use reported completed test attempts (passed/failed/errored), never
@@ -441,7 +459,7 @@ class CIObservationStore:
                                       redact_text(value) != value):
                 raise ValueError('Invalid CI test history filter')
         now = self._wall_now().timestamp()
-        report_start = now - days * 86400
+        report_start = 0 if mode != 'days' else now - days * 86400
         groups, reported_runs = {}, set()
         report_count = unknown_time = 0
         filters = {'repository': repository, 'branch': branch, 'provider_url': provider_url,
@@ -452,12 +470,13 @@ class CIObservationStore:
             runs.update((identity, row) for row in pipelines if (identity := _identity(row)))
             defaults = {(row.get('provider_url', '').rstrip('/'), str(row.get('id')), row.get('repository')):
                         row.get('default_branch') for row in inventory}
-            selected = {(*identity, row['branch'], row['revision']): row for identity, row in runs.items()
+            selected = {identity: row for identity, row in runs.items()
                         if not any(value is not None and str(row.get(key)) != str(value)
                                    for key, value in filters.items())
-                        and run_in_scope(row, scope, defaults.get(identity[:3]))
-                        and run_in_window(row, now, days, start, end)}
-            restrict_reports = scope != 'all' or start is not None or end is not None
+                        and run_in_scope(row, scope, defaults.get(identity[:3]))}
+            selected = select_run_window(selected, now, days, start, end, mode, run_number)
+            selected = {(*identity, row['branch'], row['revision']): row for identity, row in selected.items()}
+            restrict_reports = mode != 'days' or run_number is not None or scope != 'all' or start is not None or end is not None
             for (kind, identity), (report, _) in self._entries.items():
                 if kind != 'report' or any(value is not None and str(report[key]) != str(value)
                                           for key, value in filters.items()):
@@ -487,10 +506,11 @@ class CIObservationStore:
             scope = {'kind': 'retained_observations', 'complete': False, 'partial': True,
                      'memory_only': True, 'persistence': 'memory_only',
                      'truncated': self._truncated, 'stale': stale,
-                     'days': days, 'window': {'start': _iso(report_start), 'end': _iso(now)},
+                     'days': days if mode == 'days' else None, 'mode': mode, 'run_number': run_number,
+                     'window': {'start': _iso(report_start), 'end': _iso(now)},
                      'scope': scope, 'start': start, 'end': end,
-                     'run_window': dict(zip(('start', 'end'), map(_iso, run_window(now, days, start, end)))),
-                     'run_time_basis': 'created_at', 'run_window_basis': 'utc_calendar_days_including_today',
+                     'run_window': dict(zip(('start', 'end'), map(_iso, run_window(now, days, start, end, mode)))),
+                     'run_time_basis': 'created_at', 'run_window_basis': 'last_24_runs_per_project' if mode == 'runs' else 'trailing_24_hours' if mode == 'hours' else 'utc_calendar_days_including_today',
                      'repository': repository, 'branch': branch, 'test': test,
                      'time_basis': 'reported_at', 'denominator': 'reported_completed_test_attempts',
                      'minimum_percentile_samples': 5,

@@ -1,7 +1,7 @@
 // Metrics describe retained observations, never an inferred complete provider history.
 import {escapeHtml as esc} from './herdr-web-components/util.js';
 import {formatDuration} from './herdr-web-components/format.js';
-import {ciRunInScope,ciRunInWindow} from './ci-health.js';
+import {ciRunInScope,ciSelectRunWindow} from './ci-health.js';
 const rows=v=>Array.isArray(v)?v.filter(r=>r&&typeof r==='object'&&!Array.isArray(r)):[];
 const str=v=>typeof v==='string'?v:'';
 const stamp=v=>{const n=typeof v==='number'?(v>0&&v<1e12?v*1000:v):Date.parse(v);return Number.isFinite(n)&&n>0&&n<=8.64e15?n:0;};
@@ -20,11 +20,11 @@ const searchText=r=>[r.repository,r.repository_id,r.provider_repo_id,r.branch,r.
 export function filterCiObservations(data={},filters={},now=Date.now()) {
  const terms=str(filters.search).toLowerCase().trim().split(/\s+/).filter(Boolean);
  const match=r=> (!filters.repository||[r.repository,r.repository_id,String(r.provider_repo_id)].includes(filters.repository))&&(!filters.branch||r.branch===filters.branch)&&(!filters.mission||(r.mission_key||r.mission_id)===filters.mission||rows(r.related_missions).some(m=>(m.mission_key||m.mission_id)===filters.mission))&&(!filters.session||r.session_id===filters.session||rows(r.related_sessions).some(s=>s.session_id===filters.session))&&terms.every(t=>searchText(r).includes(t));
- const pipelines=rows(data.pipelines).filter(r=>match(r)&&ciRunInScope(r,filters.scope||'all',r)&&ciRunInWindow(r,filters,now));
+ const pipelines=ciSelectRunWindow(rows(data.pipelines).filter(r=>match(r)&&ciRunInScope(r,filters.scope||'all',r)),filters,now);
  const identity=r=>JSON.stringify([str(r.provider_url).replace(/\/$/,''),String(r.provider_repo_id??r.repository_id),r.repository,r.run_number,r.branch,r.revision]);
  const selected=new Set(pipelines.map(identity));
- const restricted=filters.scope&&filters.scope!=='all'||filters.start!=null||filters.end!=null;
- return {...data,pipelines,reports:rows(data.reports).filter(r=>match(r)&&(!restricted||selected.has(identity(r)))&&(!Number(filters.days)||(reportTime(r)>0&&reportTime(r)>=now-Number(filters.days)*86400000&&reportTime(r)<=now)))};
+ const restricted=filters.mode==='runs'||filters.mode==='hours'||filters.run_number!=null||filters.scope&&filters.scope!=='all'||filters.start!=null||filters.end!=null;
+ return {...data,pipelines,reports:rows(data.reports).filter(r=>match(r)&&(!restricted||selected.has(identity(r)))&&((filters.mode==='runs'||filters.mode==='hours')?(reportTime(r)>0&&reportTime(r)<=now):!Number(filters.days)||(reportTime(r)>0&&reportTime(r)>=now-Number(filters.days)*86400000&&reportTime(r)<=now)))};
 }
 export function ciInsightsModel(data={},filters={},now=Date.now()) {
  const selected=filterCiObservations(data,filters,now), reports=selected.reports.sort(order);

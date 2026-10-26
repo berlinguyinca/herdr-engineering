@@ -53,10 +53,21 @@ export function ciRunInScope(row,scope='all',repo={}) {
  const {isPr}=pullRequest(row,repo);
  return scope==='all'||scope==='pr'&&isPr||scope==='default'&&!!repo.default_branch&&!isPr&&row.branch===repo.default_branch;
 }
-export function ciRunInWindow(row,{days=0,start=null,end=null}={},now=Date.now()) {
+export function ciRunInWindow(row,{days=0,start=null,end=null,mode='days'}={},now=Date.now()) {
  const stamp=time(row.created_at??row.created);
- const lower=Number(days)?Math.floor(now/86400000)*86400000-(Number(days)-1)*86400000:-Infinity;
- return (!Number(days)&&start==null&&end==null)||Number.isFinite(stamp)&&stamp>=lower&&stamp<=now&&(start==null||stamp>=time(start))&&(end==null||stamp<time(end));
+ if(mode==='runs'&&!Number.isFinite(stamp))return start==null&&end==null;
+ const lower=mode==='runs'?-Infinity:mode==='hours'?now-86400000:Number(days)?Math.floor(now/86400000)*86400000-(Number(days)-1)*86400000:-Infinity;
+ return (mode==='days'&&!Number(days)&&start==null&&end==null)||Number.isFinite(stamp)&&stamp>=lower&&stamp<=now&&(start==null||stamp>=time(start))&&(end==null||stamp<time(end));
+}
+
+export function ciSelectRunWindow(runs,filters={},now=Date.now()) {
+ let selected=runs.filter(row=>ciRunInWindow(row,filters,now));
+ if(filters.mode==='runs'&&filters.run_number==null) {
+  const groups=new Map();
+  for(const row of selected){const key=JSON.stringify([instance(row),repoId(row),row.repository]);if(!groups.has(key))groups.set(key,[]);groups.get(key).push(row);}
+  selected=[...groups.values()].flatMap(group=>group.sort((a,b)=>(time(a.created_at)||-Infinity)-(time(b.created_at)||-Infinity)||Number(a.run_number)-Number(b.run_number)).slice(-24));
+ }
+ return filters.run_number==null?selected:selected.filter(row=>String(row.run_number)===String(filters.run_number));
 }
 
 function windows(mode,now) {

@@ -131,3 +131,64 @@ def test_missing_report_runs_use_creation_calendar_days(server, days):
 def test_selection_routes_reject_invalid_bounds_and_scope(server, route, query):
     api.seed_ci(server, [])
     assert api.request(server, f'ci/{route}?{query}')[0] == 400
+
+
+def test_last_runs_selection_keeps_exact_old_run_and_reports_without_calendar_cutoff(server):
+    rows = [{**api.ci_run(n), 'created_at': '2026-08-01T12:00:00Z'} for n in range(1, 27)]
+    rows += [{**rows[-1], 'provider_repo_id': 99},
+             {**rows[-1], 'provider_url': 'https://other.example'},
+             {**rows[-1], 'repository': 'org/renamed'}]
+    api.seed_ci(server, rows)
+    for n in (25, 26):
+        api.upload_ci_report(server, number=n, reported_at='2026-08-01T13:00:00Z',
+                             xml=f'<testsuite><testcase name="old-{n}"/></testsuite>')
+    identity = {key: rows[0][key] for key in ('provider_url', 'provider_repo_id', 'repository')}
+    query = urlencode(dict(mode='runs', run_number=26, **identity))
+    before = server.repo.export_state()
+    status, summary = api.request(server, 'ci/summary?' + query)
+    assert status == 200
+    assert summary['kpis']['pipeline_count'] == 1
+    assert summary['scope']['mode'] == 'runs'
+    assert summary['scope']['days'] is None
+    status, tests = api.request(server, 'ci/tests?' + query)
+    assert status == 200
+    assert [row['name'] for row in tests['tests']] == ['old-26']
+    assert tests['scope']['report_count'] == 1
+    assert tests['scope']['not_reported_run_count'] == 0
+    assert server.repo.export_state() == before
+    status, summary = api.request(server, 'ci/summary?' + urlencode(dict(mode='runs', **identity)))
+    assert status == 200
+    assert summary['kpis']['pipeline_count'] == 24
+    status, tests = api.request(server, 'ci/tests?' + urlencode(dict(mode='runs', **identity)))
+    assert status == 200
+    assert tests['scope']['not_reported_run_count'] == 22
+    # Search may expose a run outside the unfiltered last 24; exact selection wins.
+    status, summary = api.request(server, 'ci/summary?' + urlencode(dict(mode='runs', run_number=1, **identity)))
+    assert status == 200
+    assert summary['kpis']['pipeline_count'] == 1
+
+
+@pytest.mark.parametrize('route', ['summary', 'tests'])
+@pytest.mark.parametrize('query', ['mode=bogus', 'mode=runs&run_number=1',
+    'mode=runs&run_number=-1', 'mode=runs&run_number=garbage'])
+def test_run_selection_requires_valid_mode_and_exact_identity(server, route, query):
+    api.seed_ci(server, [])
+    assert api.request(server, f'ci/{route}?{query}')[0] == 400
+
+
+def test_hour_mode_uses_trailing_24_hours_for_summary_and_tests(server):
+    rows = [{**api.ci_run(n), 'created_at': datetime.fromtimestamp(stamp, UTC).isoformat()}
+            for n, stamp in enumerate([api.CI_NOW - 86401, api.CI_NOW - 86400,
+                                       api.CI_NOW, api.CI_NOW + 1], 1)]
+    api.seed_ci(server, rows)
+    for row in rows:
+        api.upload_ci_report(server, number=row['run_number'],
+                             xml=f'<testsuite><testcase name="hour-{row["run_number"]}"/></testsuite>')
+    status, summary = api.request(server, 'ci/summary?mode=hours')
+    assert status == 200
+    assert summary['scope']['days'] is None
+    assert summary['kpis']['pipeline_count'] == 2
+    status, tests = api.request(server, 'ci/tests?mode=hours')
+    assert status == 200
+    assert sorted(row['name'] for row in tests['tests']) == ['hour-2', 'hour-3']
+    assert tests['scope']['report_count'] == 2

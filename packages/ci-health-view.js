@@ -145,7 +145,7 @@ export function mountCiHealth(host,client,{onSelectRun=()=>{},onSelectStep=()=>{
   function notifyContext() {
     const repo=selection?model?.projects.find(p=>p.key===selection.projectKey)?.repo:commandProject;
     const cell=selection?model?.projects.find(p=>p.key===selection.projectKey)?.cells.find(c=>c.key===selection.bucketKey):null;
-    onContext({...state,start:cell?.start!=null?new Date(cell.start).toISOString():null,end:cell?.end!=null?new Date(cell.end).toISOString():null,project:repo?{...repo,provider_repo_id:repo.provider_repo_id??repo.id}:null});
+    onContext({...state,run_number:state.mode==='runs'?cell?.runs[0]?.run_number??null:null,start:cell?.start!=null?new Date(cell.start).toISOString():null,end:cell?.end!=null?new Date(cell.end).toISOString():null,project:repo?{...repo,provider_repo_id:repo.provider_repo_id??repo.id}:null});
   }
   host.addEventListener('change',event=>{
     const target=event.target;
@@ -164,7 +164,7 @@ export function mountCiHealth(host,client,{onSelectRun=()=>{},onSelectStep=()=>{
     if(button.hasAttribute('data-health-mode')){state.mode=button.dataset.healthMode;selection=null;syncControls();save();draw();notifyContext();return;}
     if(button.hasAttribute('data-health-layout')){layout=button.dataset.healthLayout;applyLayout();return;}
     if(button.hasAttribute('data-health-clear')){selection=null;save();draw();notifyContext();return;}
-    if(button.hasAttribute('data-health-bucket')){selection={projectKey:button.dataset.healthProject,bucketKey:button.dataset.healthBucket};save();draw();notifyContext();return;}
+    if(button.hasAttribute('data-health-bucket')){if(state.mode==='runs'&&!model?.projects.find(p=>p.key===button.dataset.healthProject)?.cells.find(c=>c.key===button.dataset.healthBucket)?.runs.length)return;selection={projectKey:button.dataset.healthProject,bucketKey:button.dataset.healthBucket};save();draw();notifyContext();return;}
     if(button.hasAttribute('data-health-tree-more')){const key=button.dataset.healthTreeMore;treeLimits.set(key,(treeLimits.get(key) || 100)+100);draw();return;}
     if(button.hasAttribute('data-health-run')){const record=model?.selectedRows.find(row=>row.runKey===button.dataset.healthRun);if(record){selected=record;selectedKey=record.runKey;draw();onSelectRun(record);}return;}
     if(button.hasAttribute('data-health-step') && selected)onSelectStep(selected,button.dataset.healthStep);
@@ -184,11 +184,11 @@ export function mountCiHealth(host,client,{onSelectRun=()=>{},onSelectStep=()=>{
     setObservabilityContext(next={}) {
       if(disposed)return;
       rememberDisclosures();
-      if(next.start===null&&next.end===null)selection=null;
+      if(next.start===null&&next.end===null&&next.run_number==null)selection=null;
       const nextProject=next.project===undefined?commandProject:next.project;
       if(JSON.stringify(commandProject)!==JSON.stringify(nextProject))selection=null;
       commandProject=nextProject;
-      const updated={...state,mode:[7,14,30].includes(Number(next.days))?String(next.days):state.mode};
+      const updated={...state,mode:['runs','hours'].includes(next.mode)?next.mode:[7,14,30].includes(Number(next.days))?String(next.days):state.mode};
       for(const key of ['scope','branch','search','failuresOnly'])if(next[key]!==undefined)updated[key]=next[key];
       if(['mode','scope','branch','search','failuresOnly'].some(key=>updated[key]!==state[key]))selection=null;
       state=ciHealthPreferences(updated);syncControls();save();draw();

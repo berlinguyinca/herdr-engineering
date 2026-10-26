@@ -8,7 +8,7 @@ import {ciChartModel,renderCiCharts,ciChartStyles} from './ci-charts.js';
 import {ciInsightsModel,renderCiInsights,ciInsightStyles,renderCiRunReports} from './ci-insights.js';
 import {renderCiPipeline,renderCiDiagnosis,ciPipelineStyles,pipelineZoom,sameCiRepository,ciComparisonModel,renderCiComparison} from './ci-pipeline.js';
 import {mountCiObservability,ciProjectKey} from './ci-observability-view.js';
-import {ciRunInScope,ciRunInWindow} from './ci-health.js';
+import {ciRunInScope,ciSelectRunWindow} from './ci-health.js';
 import {mountCiHealth} from './ci-health-view.js';
 import {snapshotText,animateChanges} from './motion.js';
 import {renderCiFix,ciFixStyles,fixRunKey,latestFix,fixIsActive,fixError} from './ci-fix-view.js';
@@ -46,13 +46,15 @@ const canonicalProvider = value => {
   try {const url=new URL(provider);return url.origin+url.pathname.replace(/\/+$/,'');}
   catch {return provider;}
 };
-export function selectIntegrations(entries,{tab='current',search='',repository='',provider='',mission='',session='',branch='',days=0,scope='all',start=null,end=null,project=null}={}) {
+export function selectIntegrations(entries,{tab='current',search='',repository='',provider='',mission='',session='',branch='',days=0,scope='all',start=null,end=null,project=null,mode='days',run_number=null}={}) {
   const terms=search.toLowerCase().trim().split(/\s+/).filter(Boolean),providerKey=canonicalProvider(provider);
   const now=Date.now();
-  return entries.filter(e=>(!project||ciProjectKey(e.record)===ciProjectKey(project)) && (tab==='all' || e.tab===tab) && (!providerKey || canonicalProvider(e.record.provider_url)===providerKey) && (!repository || e.record.repository===repository || e.record.repository_id===repository || String(e.record.provider_repo_id)===repository)
-    && (!branch || e.record.branch===branch) && ciRunInScope(e.record,scope,e.record) && ciRunInWindow(e.record,{days,start,end},now)
+  const eligible=entries.filter(e=>(!project||ciProjectKey(e.record)===ciProjectKey(project)) && (!providerKey || canonicalProvider(e.record.provider_url)===providerKey) && (!repository || e.record.repository===repository || e.record.repository_id===repository || String(e.record.provider_repo_id)===repository)
+    && (!branch || e.record.branch===branch) && ciRunInScope(e.record,scope,e.record)
     && (!mission || (e.record.mission_key || e.record.mission_id)===mission || records(e.record.related_missions).some(r=>(r.mission_key || r.mission_id)===mission))
     && (!session || e.record.session_id===session || records(e.record.related_sessions).some(r=>r.session_id===session)) && terms.every(t=>e.search.includes(t)));
+  const selected=new Set(ciSelectRunWindow(eligible.map(e=>e.record),{days,start,end,mode,run_number},now));
+  return eligible.filter(e=>selected.has(e.record)&&(tab==='all'||e.tab===tab));
 }
 const age = (value,label='Updated') => {
   const stamp=integrationTimestamp(value);
@@ -158,7 +160,7 @@ const styles=`<style>
 export function mountIntegrations(container,client,{kind='ci',tab='current',search='',repository='',provider='',mission='',session=''}={}) {
   const isCi=kind==='ci';
   const tabs=isCi ? [['current','Current'],['failed','Failed'],['finished','Finished']] : [['current','Current'],['changes','Changes requested'],['failed','Failed'],['finished','Finished']];
-  const state={tab:tabs.some(([key])=>key===tab)?tab:'current',search,repository,provider,mission,session,page:0,group:'project',branch:'',days:0};
+  const state={tab:tabs.some(([key])=>key===tab)?tab:'current',search,repository,provider,mission,session,page:0,group:'project',branch:'',days:isCi?14:0};
   let related=null,relatedFailed=false,disposed=false,data=null,error='',selected=null,pipeline=null,detailError='',log=null,logError='',step='',actionMessage='';
   let timer=null,clock=null,signature='',detailSignature='',chartSignature='';
   let selectedReports=null,selectedReportsError='';
@@ -177,7 +179,7 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
     ${isCi?'<div data-ci-observability></div><div data-ci-health></div>':''}
     <div class="ig-tabs" role="tablist" aria-label="${title} outcome">${tabs.map(([key,label])=>`<button type="button" role="tab" id="ig-tab-${key}" data-tab="${key}" aria-controls="ig-results" aria-selected="${state.tab===key}" tabindex="${state.tab===key?0:-1}">${label} <strong data-count="${key}">…</strong></button>`).join('')}</div>
     <div class="ig-controls"><label>Search ${isCi?'runs':'reviews'}<input data-ig-search type="search" value="${esc(search)}" placeholder="Project, repository, branch or revision"></label><label>Group by<select data-ig-group><option value="project">Project / repository</option><option value="none">Most recent</option></select></label></div>
-    ${isCi ? '<div class="ig-controls ci-report-filters"><label>Repository<select data-ci-repository><option value="">All repositories</option></select></label><label>Branch<select data-ci-branch><option value="">All branches</option></select></label><label>Period<select data-ci-period><option value="0">All retained history</option><option value="7">Last 7 days</option><option value="14">Last 14 days</option><option value="30">Last 30 days</option><option value="90">Last 90 days</option></select></label></div><div data-ci-insights></div>' : ''}
+    ${isCi ? '<div class="ig-controls ci-report-filters"><label>Repository<select data-ci-repository><option value="">All repositories</option></select></label><label>Branch<select data-ci-branch><option value="">All branches</option></select></label><label>Period<select data-ci-period><option value="7">Last 7 days</option><option value="14" selected>Last 14 days</option><option value="30">Last 30 days</option></select></label></div><div data-ci-insights></div>' : ''}
     ${repository || mission || session ? `<p class="ig-note">Filtered to ${filterLink(repository,mission,session)} · <a href="#/${kind}">Clear context</a></p>` : ''}
     ${isCi ? '<details class="ci-charts" data-ci-charts><summary>Run durations · project, language & cache health</summary><div class="ig-controls ci-cache-controls"><label>Cache and trend window<select data-ci-performance-window><option value="7">Last 7 days</option><option value="14" selected>Last 14 days</option></select></label><p class="ci-chart-note">Cache and regression windows are limited to 7 or 14 days within the selected period.</p></div><div class="ci-charts-body" data-ci-charts-body></div></details>' : ''}
     <p class="ig-note" data-ig-count></p><div class="ig-layout"><section id="ig-results" role="tabpanel" aria-labelledby="ig-tab-${state.tab}"></section><aside class="ig-inspector" aria-label="Pipeline inspector" hidden></aside></div>
@@ -185,7 +187,7 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
   const el=selector=>container.querySelector(selector);
   if(isCi){
     healthView=mountCiHealth(el('[data-ci-health]'),client,{repository,mission,session,search:search || undefined,
-      onContext:context=>{const next={days:['7','14','30'].includes(context.mode)?Number(context.mode):14,scope:context.scope,start:context.start,end:context.end,branch:context.branch,search:context.search,failuresOnly:context.failuresOnly,project:context.project};observabilityView?.setContext(next);if(observabilityView)applyCiContext(next);},
+      onContext:context=>{const next={days:['7','14','30'].includes(context.mode)?Number(context.mode):null,mode:['runs','hours'].includes(context.mode)?context.mode:'days',run_number:context.run_number,scope:context.scope,start:context.start,end:context.end,branch:context.branch,search:context.search,failuresOnly:context.failuresOnly,project:context.project};observabilityView?.setContext(next);if(observabilityView)applyCiContext(next);},
       onSelectRun:record=>openCiRun(record),
       onSelectStep:(record,stepId)=>{
         if(selected?.id!==ciRunKey(record))openCiRun(record);
@@ -223,9 +225,9 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
     state.project=context.project||null;
     state.repository=context.project?context.project.repository:(context.repository??repository);
     state.provider=context.project?.provider_url||provider;
-    state.branch=context.branch;state.days=context.days;state.scope=context.scope;state.start=context.start;state.end=context.end;state.search=context.search;state.page=0;
+    state.branch=context.branch;state.days=context.days;state.mode=context.mode;state.run_number=context.run_number;state.scope=context.scope;state.start=context.start;state.end=context.end;state.search=context.search;state.page=0;
     el('[data-ig-search]').value=state.search;
-    el('[data-ci-period]').value=String(state.days);
+    el('[data-ci-period]').value=state.days==null?'':String(state.days);
     if(render){if(changed)refreshPerformance(true);draw();}
   }
   const reviewVersion=record=>JSON.stringify([record.updated_at,record.status,record.decision]);
@@ -567,7 +569,7 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
       else{state.project=project;state.repository=project?.repository||value;state.provider=project?.provider_url||provider;state.page=0;healthView?.setObservabilityContext({project});draw();}
       return;
     }
-    state[key]=event.target.value;state.page=0;if(key==='days'&&[7,14].includes(Number(state.days))){performanceDays=Number(state.days);el('[data-ci-performance-window]').value=String(performanceDays);}if(key==='days'||key==='branch'){refreshPerformance(true);const context={branch:state.branch,start:null,end:null,...([7,14,30].includes(Number(state.days))?{days:Number(state.days)}:{})};state.start=null;state.end=null;observabilityView?.setContext(context);healthView?.setObservabilityContext(context);}draw();});
+    state[key]=event.target.value;state.page=0;if(key==='days'&&[7,14].includes(Number(state.days))){performanceDays=Number(state.days);el('[data-ci-performance-window]').value=String(performanceDays);}if(key==='days'||key==='branch'){refreshPerformance(true);const context={branch:state.branch,start:null,end:null,run_number:null,...(key==='days'?{mode:'days'}:{}),...([7,14,30].includes(Number(state.days))?{days:Number(state.days)}:{})};state.start=null;state.end=null;state.run_number=null;if(key==='days')state.mode='days';observabilityView?.setContext(context);healthView?.setObservabilityContext(context);}draw();});
   if(isCi)el('[data-ci-performance-window]').addEventListener('change',event=>{performanceDays=Number(event.target.value);if(Number(state.days)===7&&performanceDays===14){state.days='14';el('[data-ci-period]').value='14';}refreshPerformance(true);});
   container.addEventListener('input',event=>{if(event.target.hasAttribute('data-ci-test-search')){testSearch=event.target.value;testPage=0;draw();}},{signal:listenerController.signal});
   el('[data-ig-search]').addEventListener('input',event=>{state.search=event.target.value;state.page=0;draw();});

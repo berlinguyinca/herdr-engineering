@@ -345,3 +345,61 @@ test('selected current-day bucket stays shared by Health, Tests and Runs after c
  assert.deepEqual([initial.start,initial.end],['2026-10-25T00:00:00.000Z','2026-10-26T00:00:00.000Z']);
  await page.evaluate(()=>app.dispose());
 }));
+
+test('last-24-runs cell shares exact old run identity and mode with every consumer',()=>reviewPage(async page=>{
+ await page.evaluate(()=>{
+  runs=[{...runs[0],created_at:'2026-01-01T00:00:00Z'}, {...runs[0],run_number:9,created_at:'2026-01-01T00:00:00Z'}];
+  mount();
+ });
+ await page.locator('[data-ob-project]').filter({hasText:'org/current'}).click();
+ await page.locator('[data-health-mode="runs"]').click();
+ await page.locator('[data-health-bucket]').last().click();
+ await page.waitForFunction(()=>calls.some(([kind,o])=>kind==='tests'&&o.run_number===9));
+ for(const kind of ['summary','tests']) {
+  const options=await page.evaluate(kind=>calls.findLast(([k,o])=>k===kind&&o.provider_repo_id)[1],kind);
+  assert.equal(options.mode,'runs');assert.equal(options.run_number,9);
+  assert.equal(options.days,null);
+  assert.equal(options.provider_url,'https://ci.example');assert.equal(String(options.provider_repo_id),'17');assert.equal(options.repository,'org/current');
+ }
+ await page.locator('[data-ob-refresh]').click();
+ assert.equal(await page.locator('[data-health-mode="runs"]').getAttribute('aria-pressed'),'true');
+ await page.locator('[data-ci-workspace="tests"]').click();
+ assert.match(await page.locator('[data-ci-insights]').textContent(),/1 retained runs · 1 test report attempts/);
+ await page.locator('[data-ci-workspace="runs"]').click();await page.locator('[data-tab="failed"]').click();
+ assert.equal(await page.locator('#ig-results [data-run]').count(),1);
+ assert.match(await page.locator('#ig-results').textContent(),/Run #9/);
+ await page.locator('[data-ci-workspace="health"]').click();await page.locator('[data-health-clear]').click();
+ await page.locator('[data-ci-workspace="tests"]').click();
+ assert.match(await page.locator('[data-ci-insights]').textContent(),/2 retained runs · 2 test report attempts/);
+}));
+
+for(const origin of ['ob','health'])for(const control of ['search','failures'])test(`selection clearing: ${origin} ${control} refreshes every consumer`,()=>reviewPage(async page=>{
+ await page.evaluate(()=>{
+  runs=[runs[0],{...runs[0],run_number:9,created_at:new Date(Date.now()-86400000).toISOString()}];mount();
+ });
+ await page.locator('[data-ob-project]').filter({hasText:'org/current'}).click();
+ await page.locator('[data-health-bucket]').last().click();
+ await page.waitForFunction(()=>calls.some(([kind,o])=>kind==='tests'&&o.start));
+ await page.evaluate(()=>calls=[]);
+ if(control==='search')await page.locator(`[data-${origin}-search]`).fill('org/current');
+ else await page.locator(`[data-${origin}-failures]`).check();
+ await page.waitForFunction(()=>calls.some(([kind,o])=>kind==='tests'&&!o.start&&!o.end));
+ assert.equal(await page.locator('[data-health-clear]').count(),0);
+ for(const kind of ['summary','tests'])assert.equal(await page.evaluate(kind=>calls.findLast(([k])=>k===kind)[1].start??null,kind),null);
+ await page.locator('[data-ci-workspace="tests"]').click();
+ assert.match(await page.locator('[data-ci-insights]').textContent(),/2 retained runs · 2 test report attempts/);
+ await page.locator('[data-ci-workspace="runs"]').click();await page.locator('[data-tab="failed"]').click();
+ assert.equal(await page.locator('#ig-results [data-run]').count(),2);
+}));
+
+test('legacy period offers only shared calendar windows and updates all consumers',()=>reviewPage(async page=>{
+ await page.evaluate(()=>mount());await page.locator('[data-ob-project]').filter({hasText:'org/current'}).click();
+ assert.deepEqual(await page.locator('[data-ci-period] option').evaluateAll(nodes=>nodes.map(n=>n.value)),['7','14','30']);
+ await page.locator('[data-ci-workspace="runs"]').click();
+ for(const days of ['7','30','14']) {
+  await page.evaluate(()=>calls=[]);await page.locator('[data-ci-period]').selectOption(days);
+  await page.waitForFunction(days=>calls.some(([kind,o])=>kind==='tests'&&o.days===Number(days)),days);
+  assert.equal(await page.locator('[data-ob-days]').inputValue(),days);
+  assert.equal(await page.locator(`[data-health-mode="${days}"]`).getAttribute('aria-pressed'),'true');
+ }
+}));

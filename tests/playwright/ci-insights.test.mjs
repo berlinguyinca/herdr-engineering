@@ -127,8 +127,8 @@ test('CI reports publish over HTTP and drive history, pipeline logs and responsi
 
 // Task 6: real local HTTP API and opt-in retained-observation scale fixture.
 // Each case owns a fresh browser context; no preferences leak between cases.
-async function commandCenter(run,{invalidateAssetTransport=false,selectionContract=false}={}) {
- const server=spawn(process.env.PYTHON||'python3',[path.join(root,'tests/playwright/ci-insights-server.py'),'--117-projects',...(selectionContract?['--selection-contract']:[])],{cwd:root,stdio:['ignore','pipe','pipe']});
+async function commandCenter(run,{invalidateAssetTransport=false,selectionContract=false,oldRun=false}={}) {
+ const server=spawn(process.env.PYTHON||'python3',[path.join(root,'tests/playwright/ci-insights-server.py'),'--117-projects',...(selectionContract?['--selection-contract']:[]),...(oldRun?['--old-selection-run']:[])],{cwd:root,stdio:['ignore','pipe','pipe']});
  let browser,stderr='';server.stderr.on('data',d=>stderr+=d);
  try {
   const port=await new Promise((resolve,reject)=>{let output='';const timer=setTimeout(()=>reject(Error(`Fixture timeout: ${stderr}`)),20000);server.stdout.on('data',d=>{output+=d;const match=output.match(/PORT=(\d+)/);if(match){clearTimeout(timer);resolve(match[1]);}});server.once('exit',code=>{clearTimeout(timer);reject(Error(`Fixture exited ${code}: ${stderr}`));});});
@@ -391,3 +391,35 @@ test('shared selection: PR scope and a day bucket narrow summary, Tests and Runs
  await page.locator('[data-ci-workspace="tests"]').click();
  assert.match(await page.locator('[data-ci-insights]').innerText(),/3 retained runs · 3 test report attempts/);
 },{selectionContract:true}));
+
+test('shared selection: last-24-runs exact old run reaches summary, Tests and Runs through real HTTP',()=>commandCenter(async({page})=>{
+ await page.locator('[data-ob-project]').filter({hasText:'org/app'}).click();
+ await page.locator('[data-health-mode="runs"]').click();
+ const responses=Promise.all(['summary','tests'].map(route=>page.waitForResponse(r=>{
+  const u=new URL(r.url());return u.pathname===`/api/v1/ci/${route}`&&u.searchParams.get('run_number')==='3';
+ })));
+ await page.getByRole('button',{name:/org\/app.*Run #3 ·/}).click();
+ for(const response of await responses){
+  assert.equal(response.status(),200);
+  const query=new URL(response.url()).searchParams;
+  assert.equal(query.get('mode'),'runs');assert.equal(query.has('days'),false);
+  assert.equal(query.get('provider_repo_id'),'17');assert.equal(query.get('repository'),'org/app');
+  const data=await response.json();assert.equal(data.scope.mode,'runs');assert.equal(data.scope.days,null);
+  if(data.kpis)assert.equal(data.kpis.pipeline_count,1);
+  else {assert.equal(data.scope.report_count,1);assert.deepEqual(data.tests.map(t=>t.name),['test_status']);}
+ }
+ await page.waitForFunction(()=>document.querySelector('[data-ob-summary] .ci-ob-card:nth-child(3) strong')?.textContent==='1');
+ assert.match(await page.locator('[data-ob-selection]').innerText(),/Last 24 runs.*Run #3/);
+ assert.doesNotMatch(await page.locator('[data-ob-status]').innerText(),/14-day/);
+ await page.locator('[data-ci-workspace="tests"]').click();
+ assert.match(await page.locator('[data-ci-insights]').innerText(),/1 retained runs · 1 test report attempts/);
+ await page.locator('[data-ci-workspace="runs"]').click();await page.locator('[data-tab="failed"]').click();
+ assert.equal(await page.locator('#ig-results [data-run]').count(),1);
+ assert.match(await page.locator('#ig-results').innerText(),/Run #3/);
+ await page.locator('[data-ci-workspace="health"]').click();
+ await page.locator('[data-ob-failures]').check();
+ await page.waitForFunction(()=>!document.querySelector('[data-ob-status]').textContent.includes('Refreshing'));
+ assert.equal(await page.locator('[data-health-clear]').count(),0);
+ await page.locator('[data-ci-workspace="tests"]').click();
+ assert.match(await page.locator('[data-ci-insights]').innerText(),/4 retained runs · 1 test report attempts/);
+},{oldRun:true}));
