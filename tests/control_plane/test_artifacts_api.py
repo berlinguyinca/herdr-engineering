@@ -1,3 +1,4 @@
+import asyncio
 import json
 import threading
 import urllib.error
@@ -7,6 +8,29 @@ import pytest
 
 from herdr_engineering.control_plane.api import ControlPlaneServer
 from herdr_engineering.control_plane.repo import ControlPlaneRepo
+
+
+class _VersionApiStore:
+    def __init__(self):
+        self.commits = []
+
+    async def list_versions(self, artifact_id):
+        return [{"version_id": "ver_1", "artifact_id": artifact_id,
+                 "version_number": 1, "state": "ready"}]
+
+    async def get_version(self, version_id, artifact_id=None):
+        if artifact_id is not None and artifact_id != "artifact_1":
+            return None
+        return {"version_id": version_id, "artifact_id": "artifact_1",
+                "version_number": 1, "state": "ready"}
+
+    async def commit_version(self, artifact_id, **body):
+        self.commits.append((artifact_id, body))
+        return {"version_id": "ver_2", "artifact_id": artifact_id,
+                "version_number": 2, "state": "ready"}
+
+    def sync_call(self, method, *args, **kwargs):
+        return asyncio.run(getattr(self, method)(*args, **kwargs))
 
 
 @pytest.fixture()
@@ -151,3 +175,31 @@ def test_health_reports_memory_backend_without_rustfs(server):
     base, _ = server
     with urllib.request.urlopen(f"{base}/api/v1/health") as r:
         assert json.loads(r.read())["rustfs"] == "memory"
+
+
+def test_version_history_and_commit_use_the_existing_control_plane(server):
+    base, _ = server
+    # This fixture keeps the API contract independent from PostgreSQL; the
+    # production wiring passes the durable ArtifactStore implementation.
+    server_store = _VersionApiStore()
+    # The fixture yields only base/repo, so exercise the route contract through
+    # a server constructed with the injected store.
+    repo = ControlPlaneRepo()
+    svr = ControlPlaneServer(repo, artifact_store=server_store)
+    thread = threading.Thread(target=svr.serve, daemon=True)
+    thread.start()
+    svr.wait_until_ready()
+    api = f"http://127.0.0.1:{svr.port}"
+    try:
+        with urllib.request.urlopen(f"{api}/api/v1/artifacts/artifact_1/versions") as response:
+            assert json.loads(response.read())["versions"][0]["version_id"] == "ver_1"
+        body = json.dumps({"base_version_id": "ver_1", "source_manifest_blob": "sha",
+                           "output_manifest": []}).encode()
+        request = urllib.request.Request(
+            f"{api}/api/v1/artifacts/artifact_1/versions", data=body,
+            method="POST", headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(request) as response:
+            assert response.status == 201
+            assert json.loads(response.read())["version_id"] == "ver_2"
+    finally:
+        svr.shutdown()

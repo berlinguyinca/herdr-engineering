@@ -27,6 +27,7 @@ from typing import Any
 from urllib.parse import parse_qs, unquote, urlsplit
 
 from ..version import __version__
+from .artifacts import ArtifactConflict, ArtifactError
 from .redact import redact_payload
 
 # Routes a host-side tool (session run, plannotator bridge) may POST with the
@@ -122,7 +123,7 @@ class ControlPlaneServer:
 
     def __init__(self, repo, *, api_key=None, api_keys=None, host="127.0.0.1",
                  port=0, web_root=None, source=None, allow_open=False,
-                 rustfs=None, dispatcher=None, github_monitor=None,
+                 rustfs=None, artifact_store=None, dispatcher=None, github_monitor=None,
                  collab=None, collab_tls_terminated=False,
                  collab_require_https=False, fleet_config=None, ci_actions=False,
                  public_port=None, public_host=None, collab_only=False,
@@ -158,6 +159,9 @@ class ControlPlaneServer:
         # payloads are stored content-addressed here instead of the repo's
         # in-memory blob stand-in, so they survive a web restart.
         self.rustfs = rustfs
+        # Optional durable versioned registry. The legacy repo/rustfs path stays
+        # available for compatibility and for installations before migration 0003.
+        self.artifact_store = artifact_store
         from .ingest import IngestService
         self.ingest = IngestService(repo)
         self._limiter = _RateLimiter()
@@ -924,6 +928,15 @@ def _make_handler(server, public=False, operator=False):
             except ValueError as exc:
                 message = "Invalid GitHub query." if resource == "github" else str(exc)
                 return self._send_json(400, {"error": message})
+            except ArtifactConflict as exc:
+                return self._send_json(409, {
+                    "error": str(exc), "code": "artifact_version_conflict",
+                    "artifact_id": exc.artifact_id,
+                    "current_version_id": exc.current_version_id,
+                })
+            except ArtifactError as exc:
+                status = 404 if str(exc).startswith("no artifact") else 400
+                return self._send_json(status, {"error": str(exc)})
             except RuntimeError as exc:
                 if resource == "github":
                     from ..github import GitHubError
@@ -1042,6 +1055,14 @@ def _make_handler(server, public=False, operator=False):
                 if data is None or a is None:
                     return self._json({"error": "not found"}, 404)
                 return self._bytes(data, a.get("mime_type", "application/octet-stream"))
+            if resource == "artifacts" and server.artifact_store is not None:
+                if len(parts) == 6 and parts[5] == "versions":
+                    versions = self._artifact_call("list_versions", parts[4])
+                    return self._json({"artifact_id": parts[4], "versions": versions})
+                if len(parts) == 7 and parts[5] == "versions":
+                    version = self._artifact_call("get_version", parts[6], parts[4])
+                    return self._json(version) if version else self._json(
+                        {"error": "not found"}, 404)
             if resource == "leases":
                 return self._json({"leases": r.list_leases()})
             if resource == "llm":
@@ -1111,6 +1132,24 @@ def _make_handler(server, public=False, operator=False):
             # artifact upload carries raw bytes, not JSON — handle first
             if resource == "artifacts" and len(parts) == 4:
                 return self._upload_artifact(r, parts)
+            if (resource == "artifacts" and server.artifact_store is not None
+                    and len(parts) == 6 and parts[5] == "versions"):
+                body = self._read_json() or {}
+                allowed = {"base_version_id", "source_manifest_blob", "output_manifest",
+                           "provenance", "created_by", "agent_id", "host_id",
+                           "session_id", "mission_id", "job_id", "idempotency_key"}
+                if not isinstance(body, dict) or any(key not in allowed for key in body):
+                    return self._json({"error": "invalid version payload"}, 400)
+                if "created_by" in body:
+                    return self._json({"error": "created_by is derived from authentication"}, 400)
+                principal = self._principal()
+                provenance = body.get("provenance")
+                if provenance is not None and not isinstance(provenance, dict):
+                    return self._json({"error": "provenance must be an object"}, 400)
+                body["created_by"] = principal
+                body["provenance"] = {**(provenance or {}), "principal_id": principal}
+                version = self._artifact_call("commit_version", parts[4], **body)
+                return self._json(version, 201)
             body = self._read_json() or {}
             if resource == "ci" and len(parts) == 5 and parts[4] == "debug":
                 from ..errors import HerdrEngineeringError
@@ -1419,6 +1458,22 @@ def _make_handler(server, public=False, operator=False):
             self.end_headers()
             self.wfile.write(payload)
             return None
+
+        def _principal(self):
+            role = self._role()
+            if not server._keys:
+                return "operator:local"
+            supplied = self.headers.get("X-API-Key", "")
+            digest = __import__("hashlib").sha256(supplied.encode()).hexdigest()[:16]
+            return f"api-key:{digest}:{role or 'unknown'}"
+
+        def _artifact_call(self, method, *args, **kwargs):
+            """Call only through an explicitly thread-safe sync registry adapter."""
+            store = server.artifact_store
+            runner = getattr(store, "sync_call", None)
+            if runner is None:
+                raise RuntimeError("versioned artifact registry adapter is unavailable")
+            return runner(method, *args, **kwargs)
 
         def _bytes(self, data, mime):
             self.send_response(200)
