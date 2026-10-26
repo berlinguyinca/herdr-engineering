@@ -849,3 +849,17 @@ def test_usage_projection_rebuild_keeps_backdated_timestamp():
     # A 14-day sweep removes the backdated (expired) record after the reload.
     sweep_token_usage(restored, raw_retention_days=14)
     assert "req-ts" not in restored._token_usage
+
+
+def test_usage_rejects_timezone_naive_occurred_at():
+    """A timezone-naive occurred_at must be normalized away so the retention
+    sweep never compares a naive datetime to its aware cutoff (codex P2)."""
+    import datetime as _dt
+    repo = ControlPlaneRepo(now=lambda: _dt.datetime(2026, 10, 23, tzinfo=_dt.UTC).timestamp())
+    rec = repo.add_token_usage({"mission_id": "m1", "model": "gpt",
+                                "request_id": "naive-ts", "input_tokens": 1,
+                                "occurred_at": "2026-10-01T00:00:00"})
+    # Falls back to the (aware) wall clock; never stores a naive timestamp.
+    assert rec["occurred_at"].endswith("+00:00")
+    from herdr_engineering.control_plane.retention import sweep_token_usage
+    sweep_token_usage(repo, raw_retention_days=1)  # must not raise

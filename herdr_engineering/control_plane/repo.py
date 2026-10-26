@@ -2778,14 +2778,18 @@ def _normalize_occurred_at(value):
     """Return a valid ISO timestamp string, or None for anything malformed.
 
     Guards the retention sweep, which parses ``occurred_at`` with
-    ``datetime.fromisoformat``; a garbage value there would fail the sweep.
+    ``datetime.fromisoformat`` and compares it to a timezone-aware cutoff; a
+    garbage value or a timezone-naive timestamp there would fail the sweep with
+    ValueError/TypeError. ``Z`` is normalized to ``+00:00`` (a timezone).
     """
     if not isinstance(value, str) or not value:
         return None
     try:
-        _dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+        parsed = _dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError:
         return None
+    if parsed.tzinfo is None:
+        return None  # timezone-naive would break the aware cutoff comparison
     return value
 
 
