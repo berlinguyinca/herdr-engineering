@@ -528,6 +528,7 @@ async function viewMissionTests(parts, revision) {
 function reviewVerdictText(verdict) {
   const v = typeof verdict === 'string' ? verdict.trim().toLowerCase() : '';
   if (!v) return { label: 'Unknown', tone: 'unknown' };
+  if (v === 'unknown') return { label: 'Unknown', tone: 'unknown' };
   if (v === 'approved' || v === 'approve') return { label: 'Approved', tone: 'healthy' };
   if (v.includes('changes') || v === 'request_changes' || v === 'rejected' || v === 'denied') return { label: 'Changes requested', tone: 'attention' };
   if (v === 'commented' || v === 'comment') return { label: 'Commented', tone: 'waiting' };

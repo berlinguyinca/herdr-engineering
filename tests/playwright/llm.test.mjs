@@ -78,8 +78,7 @@ test('switching the window and a filter updates the URL and the figures', async 
     await page.locator('.llm-tile').first().waitFor({ timeout: 8000 });
     await page.locator('a.llm-window', { hasText: '1h' }).click();
     assert.match(page.url(), /#\/llm\?window=1h/);
-    await page.locator('.llm-tile').first().waitFor();
-    assert.equal(await page.locator('a.llm-window[aria-current=page]').textContent(), '1h');
+    await page.locator('a.llm-window[aria-current=page]', { hasText: '1h' }).waitFor();
     await page.locator('[data-llm-filter=model]').selectOption('qwen');
     await page.waitForURL(/model=qwen/);
     await page.locator('.llm-tile').first().waitFor();

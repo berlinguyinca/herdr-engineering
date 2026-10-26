@@ -40,9 +40,11 @@ export function renderRelated(answer, { error = null, footer = '', sessionId = n
   if (!answer) return `${relatedStyles}<section class="rel" aria-label="Related items"><h2>Related</h2><p class="rel-note" role="status">Loading related items…</p>${footer}</section>`;
   const rel = answer.relations || {};
   const more = answer.more || {};
-  const rows = GROUPS.filter(([key]) => Array.isArray(rel[key]) && rel[key].length).map(([key, title, kind]) => {
-    const extra = more[key] ? `<span class="rel-state">+${esc(more[key])} more</span>` : '';
-    return `<dt>${esc(title)}</dt><dd>${rel[key].map((item) => link(key, kind, item)).join('')}${extra}</dd>`;
+  const itemsFor = (key) => (Array.isArray(rel[key]) ? rel[key] : key === 'service' && Array.isArray(rel.services) ? rel.services : []);
+  const moreFor = (key) => more[key] ?? (key === 'service' ? more.services : null);
+  const rows = GROUPS.filter(([key]) => itemsFor(key).length).map(([key, title, kind]) => {
+    const extra = moreFor(key) ? `<span class="rel-state">+${esc(moreFor(key))} more</span>` : '';
+    return `<dt>${esc(title)}</dt><dd>${itemsFor(key).map((item) => link(key, kind, item)).join('')}${extra}</dd>`;
   });
   const llm = llmRow(rel.llm, sessionId);
   const partial = Array.isArray(answer.partial) && answer.partial.length

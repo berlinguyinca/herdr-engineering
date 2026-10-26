@@ -22,8 +22,8 @@ export const storyStyles = `<style>.ms{margin:14px 0}.ms h2{font-size:16px;margi
 .ms-chip{display:inline-block;padding:2px 10px;border-radius:999px;border:1px solid var(--border);font-size:13px;font-weight:600}
 .ms-chip[data-tone=ok]{color:var(--status-ok,#1a7f37)}.ms-chip[data-tone=bad]{color:var(--status-error,#cf222e)}.ms-chip[data-tone=warn]{color:var(--status-attention,#9a6700)}.ms-chip[data-tone=live]{color:var(--accent)}
 .ms-sub{color:var(--text-secondary);font-size:13px;overflow-wrap:anywhere;margin:6px 0}.ms-needs{border:1px solid var(--status-attention,#9a6700);border-radius:var(--radius);padding:10px 14px}
-.ms-needs ul,.ms-events,.ms-agents{list-style:none;margin:0;padding:0}.ms-needs li{margin:4px 0}.ms-events li{display:grid;grid-template-columns:auto 12ch minmax(0,1fr);gap:8px;padding:4px 0;border-bottom:1px solid var(--border)}
-.ms-events time{color:var(--text-secondary);font-size:12px}.ms-events li>span:last-child{overflow-wrap:anywhere;min-width:0}.ms-agent{padding:8px 0;border-bottom:1px solid var(--border);overflow-wrap:anywhere}.ms-agent p{margin:2px 0;color:var(--text-secondary);font-size:13px}
+.ms-needs ul,.ms-events,.ms-agents{list-style:none;margin:0;padding:0}.ms-needs li{margin:4px 0}.ms-events li{display:grid;grid-template-columns:auto 12ch minmax(0,1fr);gap:8px;padding:4px 0;border-bottom:1px solid var(--border);min-width:0}
+.ms-events time{color:var(--text-secondary);font-size:12px;min-width:0;overflow-wrap:anywhere}.ms-events li>span:last-child{overflow-wrap:anywhere;min-width:0}.ms-agent{padding:8px 0;border-bottom:1px solid var(--border);overflow-wrap:anywhere;min-width:0}.ms-agent p{margin:2px 0;color:var(--text-secondary);font-size:13px;overflow-wrap:anywhere}
 .ms-grid{display:grid;grid-template-columns:minmax(80px,auto) minmax(0,1fr);gap:6px 14px;margin:0}.ms-grid dt{color:var(--text-secondary)}.ms-grid dd{margin:0;overflow-wrap:anywhere}
 .ms-note{color:var(--text-secondary);font-size:13px}@media(max-width:600px){.ms-events li{grid-template-columns:auto minmax(0,1fr)}.ms-events time{grid-column:2}.ms-grid{display:block}.ms-grid dd{margin:2px 0 10px}}</style>`;
 

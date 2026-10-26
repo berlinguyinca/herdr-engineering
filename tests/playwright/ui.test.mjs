@@ -1584,6 +1584,7 @@ test('mission tests page lists builds and test runs read-only', async () => {
     assert.ok(text.includes('failed 1'), 'failed run count missing');
     assert.ok(text.includes('passed 2'), 'passed run count missing');
     assert.ok(text.includes('Build'), 'build row missing');
+    assert.ok(text.includes('unknown'), 'build without counts must report unknown');
     assert.ok(text.includes('42s'), 'duration missing');
     // A build with no recorded counts renders an explicit unknown, never 0.
     assert.ok(text.includes('Counts unknown'), 'missing counts must show unknown');
@@ -1591,6 +1592,50 @@ test('mission tests page lists builds and test runs read-only', async () => {
       'delivery page must not error');
     // No mutation affordances on a read-only page.
     assert.ok(!/merge|approve|create pull/i.test(text), 'read-only page must not offer mutations');
+  }, { BURST: '0' });
+});
+
+test('mission delivery pages escape hostile text and keep UNKNOWN verdict unknown', async () => {
+  await withApp(async ({ page, base }) => {
+    const key = await alphaMissionKey(page, base);
+    const missionUrl = new RegExp(`/api/v1/missions/${encodeURIComponent(key).replace(/[.*+?^${}()|[\\]\\\\]/g, '\\\\$&')}$`);
+    await page.route(missionUrl, async (route) => {
+      const response = await route.fetch();
+      const mission = await response.json();
+      mission.title = '<img src=x onerror=alert(1)> & hostile';
+      await route.fulfill({ response, json: mission });
+    });
+    await page.goto(`${base}/#/missions/${encodeURIComponent(key)}/reviews`);
+    await page.waitForFunction(
+      () => (document.body ? document.body.innerText : '').includes('Changes requested'),
+      null, { timeout: 15000 });
+    const text = await bodyText(page);
+    assert.ok(text.includes('<img src=x onerror=alert(1)> & hostile'), 'hostile title should remain text');
+    assert.equal(await page.locator('img[src="x"]').count(), 0, 'hostile title must not create an image');
+    assert.ok(text.includes('Unknown'), 'UNKNOWN verdict should be shown as unknown');
+    assert.ok(!text.includes('Approved'), 'UNKNOWN verdict must never be shown as approved');
+  }, { BURST: '0' });
+});
+
+test('mission delivery navigation ignores stale delayed responses', async () => {
+  await withApp(async ({ page, base }) => {
+    const key = await alphaMissionKey(page, base);
+    await page.route('**/api/v1/missions/*/tests', async (route) => {
+      await sleep(500);
+      await route.continue();
+    });
+    await page.route('**/api/v1/missions/*/builds', async (route) => {
+      await sleep(500);
+      await route.continue();
+    });
+    await page.goto(`${base}/#/missions/${encodeURIComponent(key)}/tests`);
+    await page.locator('herdr-spinner').waitFor({ state: 'attached' });
+    await page.goto(`${base}/#/overview`);
+    await page.waitForFunction(
+      () => (document.body ? document.body.innerText : '').includes('Overview'),
+      null, { timeout: 15000 });
+    await page.waitForTimeout(700);
+    assert.ok((await bodyText(page)).includes('Overview'), 'stale delivery response replaced the current route');
   }, { BURST: '0' });
 });
 
@@ -1606,12 +1651,44 @@ test('mission reviews page lists verdict, findings and PR merge status', async (
     assert.ok(text.includes('blocker'), 'blocking finding missing');
     assert.ok(text.includes('Parser crashes on empty input'), 'finding summary missing');
     assert.ok(text.includes('PR #7'), 'open PR number missing');
+    assert.ok(text.includes('PR #99'), 'unsafe-url PR should still be visible as text');
+    assert.equal(await page.locator('a[href^="javascript:"]').count(), 0, 'unsafe PR URL must not become a link');
+    assert.ok(text.includes('Unknown'), 'UNKNOWN verdict should be shown as unknown');
+    assert.ok(!text.includes('Approved'), 'UNKNOWN verdict must never be shown as approved');
+    assert.ok(text.includes('PR #99'), 'unsafe-url PR should still be visible as text');
+    assert.equal(await page.locator('a[href^="javascript:"]').count(), 0, 'unsafe PR URL must not become a link');
     assert.ok(text.includes('Open'), 'PR status missing');
     assert.ok(text.includes('ws/alpha → main'), 'branch → base missing');
     assert.ok(!text.includes('Failed to fetch') && !text.includes('too many requests'),
       'delivery page must not error');
     // No merge/approve control: Pi Engineering stays the merge authority (#35).
     assert.ok(!/merge|approve/i.test(text), 'reviews page must not offer merge/approve controls');
+  }, { BURST: '0' });
+});
+
+test('mission delivery pages escape hostile text and ignore stale delayed responses', async () => {
+  await withApp(async ({ page, base }) => {
+    const key = await alphaMissionKey(page, base);
+    const missionUrl = new RegExp(`/api/v1/missions/${encodeURIComponent(key).replace(/[.*+?^${}()|[\\]\\\\]/g, '\\\\$&')}$`);
+    await page.route(missionUrl, async (route) => {
+      const response = await route.fetch();
+      const mission = await response.json();
+      mission.title = '<img src=x onerror=alert(1)> & hostile';
+      await route.fulfill({ response, json: mission });
+    });
+    await page.goto(`${base}/#/missions/${encodeURIComponent(key)}/reviews`);
+    await page.waitForFunction(() => document.body?.innerText.includes('Changes requested'), null, { timeout: 15000 });
+    assert.ok((await bodyText(page)).includes('<img src=x onerror=alert(1)> & hostile'));
+    assert.equal(await page.locator('img[src="x"]').count(), 0);
+
+    await page.route('**/api/v1/missions/*/tests', async (route) => { await sleep(500); await route.continue(); });
+    await page.route('**/api/v1/missions/*/builds', async (route) => { await sleep(500); await route.continue(); });
+    await page.goto(`${base}/#/missions/${encodeURIComponent(key)}/tests`);
+    await page.locator('herdr-spinner').waitFor({ state: 'attached' });
+    await page.goto(`${base}/#/overview`);
+    await page.waitForFunction(() => document.body?.innerText.includes('Overview'), null, { timeout: 15000 });
+    await page.waitForTimeout(700);
+    assert.ok((await bodyText(page)).includes('Overview'));
   }, { BURST: '0' });
 });
 
