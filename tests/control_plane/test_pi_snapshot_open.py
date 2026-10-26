@@ -49,3 +49,37 @@ def test_cli_explicit_open_snapshot(tmp_path, monkeypatch):
     finally:
         server.shutdown()
         thread.join(timeout=5)
+
+
+def test_cli_polling_ignores_generation_only_changes(tmp_path, monkeypatch):
+    from herdr_engineering.cli import main
+    import time
+    monkeypatch.delenv('HERDR_CP_INGEST_KEY', raising=False)
+    snapshot = tmp_path / 'snapshot.json'
+    document = {'contractVersion': 3, 'generatedAt': '2026-10-26T00:00:00Z',
+                'missions': [{'id': 'quiet-probe', 'title': 'Quiet probe'}]}
+    snapshot.write_text(json.dumps(document))
+    repo = ControlPlaneRepo()
+    server = ControlPlaneServer(repo)
+    thread = threading.Thread(target=server.serve, daemon=True)
+    thread.start()
+    server.wait_until_ready()
+    real_sleep, waits = time.sleep, []
+
+    def advance(seconds):
+        if threading.current_thread() is not threading.main_thread():
+            return real_sleep(seconds)
+        waits.append(seconds)
+        if len(waits) == 2:
+            raise KeyboardInterrupt
+        document['generatedAt'] = '2026-10-26T00:00:30Z'
+        snapshot.write_text(json.dumps(document))
+
+    monkeypatch.setattr(time, 'sleep', advance)
+    try:
+        assert main(['control-plane', 'feed-pi', '--snapshot', str(snapshot), '--interval', '0.1',
+                     '--url', f'http://127.0.0.1:{server.port}', '--allow-open']) == 130
+        assert len(repo.stream('mission', 'pi:quiet-probe')) == 1
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)

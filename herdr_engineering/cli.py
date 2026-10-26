@@ -700,6 +700,7 @@ def _cmd_cp_feed_pi(args) -> int:
     except HostConfigUnavailable:
         print("Set --url or configure host.json control_plane_url", file=sys.stderr)
         return 2
+    previous_payloads = None
     while True:
         try:
             doc = json.loads(Path(args.snapshot).expanduser().read_text(encoding="utf-8"))
@@ -709,7 +710,11 @@ def _cmd_cp_feed_pi(args) -> int:
             print("Cannot read a valid Pi snapshot; check --snapshot and its schema", file=sys.stderr)
             return 2
         try:
-            posted = post_envelopes(url, None, envelopes, allow_open=args.allow_open)
+            payloads = [{key: value for key, value in envelope.items() if key != 'occurred_at'}
+                        for envelope in envelopes]
+            posted = (0 if previous_payloads == payloads else
+                      post_envelopes(url, None, envelopes, allow_open=args.allow_open))
+            previous_payloads = payloads
         except (ValueError, RuntimeError):
             print("Snapshot ingest failed; check --url and HERDR_CP_INGEST_KEY", file=sys.stderr)
             return 1
