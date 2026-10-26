@@ -1,7 +1,9 @@
 // Session records describe the last observation, not a live process check.
 import {escapeHtml as esc} from './herdr-web-components/util.js';
 import {formatDuration} from './herdr-web-components/format.js';
-import {recordOutcome,statusOutcome} from './record-state.js';
+import {recordOutcome,statusOutcome,recordVisibility} from './record-state.js';
+import {patchList,patchText,morph} from './patch.js';
+import {animateChanges} from './motion.js';
 
 const text = value => typeof value === 'string' ? value.trim() : '';
 const records = value => Array.isArray(value) ? value.filter(v=>v && typeof v==='object' && !Array.isArray(v)) : [];
@@ -9,11 +11,7 @@ const short = (value, max=160) => {
   const normalized=text(value).replace(/\s+/g,' ');
   return normalized.length>max ? `${normalized.slice(0,max)}…` : normalized;
 };
-const tabs = [['current','Current'],['failed','Failed'],['finished','Finished']];
-const tabFor = record => {
-  const outcome=recordOutcome(record);
-  return outcome==='unknown' ? 'current' : outcome;
-};
+const tabs = [['current','Current'],['unconfirmed','Unconfirmed'],['failed','Failed'],['finished','Finished']];
 const missionKey = mission => text(mission.mission_key) || (text(mission.mission_id)
   ? `${text(mission.source) && mission.source!=='herdr' ? `${mission.source}:` : ''}${mission.mission_id}` : '');
 
@@ -32,14 +30,14 @@ function associatedMission(session, missions) {
   return {key:missionKey(mission),title:text(mission.title)||text(mission.mission_id)};
 }
 
-export function sessionEntries(sessions, missions=[]) {
+export function sessionEntries(sessions, missions=[], now=Date.now()) {
   const available=records(missions);
   return records(sessions).filter(s=>text(s.session_id)).map(record=> {
     const project=text(record.cwd).split(/[\\/]/).filter(Boolean).at(-1) || 'Project not reported';
     const mission=associatedMission(record,available);
-    const id=record.session_id, host=text(record.host_id), role=text(record.agent_role)||'Agent session';
-    return {record,id,host,role,project,mission,tab:tabFor(record),
-      search:[id,host,role,project,text(record.cwd),text(record.branch),text(record.model),text(record.summary),
+    const id=record.session_id, host=text(record.host_id), role=text(record.display_name)||text(record.agent_role)||'Agent';
+    return {record,id,host,role,project,mission,tab:recordVisibility(record,now),
+      search:[id,host,role,text(record.agent_handle),text(record.agent_role),project,text(record.cwd),text(record.branch),text(record.model),text(record.summary),
         text(record.status),text(record.mission_id),mission?.title].filter(Boolean).join(' ').toLocaleLowerCase()};
   }).sort((a,b)=> {
     const stamp=s=>Number.isFinite(Date.parse(s.record.updated_at)) ? Date.parse(s.record.updated_at) : 0;
@@ -61,25 +59,35 @@ export function sessionReport(record,now=Date.now()) {
   return `${state} · ${Number.isFinite(age) ? `${formatDuration(Math.max(0,age))} ago` : 'report time unknown'}`;
 }
 
+const RUNTIME_LABELS={'standard-pi':'Standard Pi','pi-bolt':'Pi-Bolt','pi-bolt-jit':'Pi-Bolt (JIT)'};
+export function runtimeLine(runtime) {
+  if (!runtime || !RUNTIME_LABELS[runtime.runtime_kind]) return '';
+  const engine=text(runtime.js_engine) ? ` · ${text(runtime.js_engine)}${text(runtime.js_engine_version) ? ` ${text(runtime.js_engine_version)}` : ''}` : '';
+  const fallback=text(runtime.fallback_reason) ? ` · fell back: ${short(text(runtime.fallback_reason),120)}` : '';
+  return `${RUNTIME_LABELS[runtime.runtime_kind]}${engine}${fallback}`;
+}
+
 export function compactSessionRow(entry,now=Date.now()) {
   const s=entry.record;
   return `<article class="ss-row" data-session-id="${esc(entry.id)}">
     <div class="ss-main"><a class="ss-title" data-session-link href="#/herd/session/${esc(encodeURIComponent(entry.id))}">${esc(short(entry.role,70))} · ${esc(short(entry.project,80))}</a>
       <p class="ss-summary">${esc(short(s.summary)||'Activity not reported.')}</p>
-      ${entry.mission ? `<p class="ss-meta">Mission: <a data-mission-link href="#/missions/${esc(encodeURIComponent(entry.mission.key))}">${esc(short(entry.mission.title,130))}</a></p>` : text(s.mission_id) ? '<p class="ss-meta">Mission association not resolved; see session details.</p>' : ''}
-      <p class="ss-meta">${esc(short(entry.id,64))}${text(s.branch) ? ` · Branch ${esc(short(s.branch,70))}` : ''}</p>
+      ${entry.mission ? `<p class="ss-meta">Mission: <a data-mission-link href="#/missions/${esc(encodeURIComponent(entry.mission.key))}">${esc(short(entry.mission.title,130))}</a></p>` : text(s.mission_id) ? '<p class="ss-meta">Mission association not resolved; see agent details.</p>' : ''}
+      <p class="ss-meta ss-id">${esc(short(entry.id,64))}${text(s.branch) ? ` · Branch ${esc(short(s.branch,70))}` : ''}</p>
     </div>
-    <div class="ss-state"><strong data-report>${esc(sessionReport(s,now))}</strong><span>${esc(short(entry.host,90)||'Host not reported')}</span>
-      <span class="ss-meta">Model: ${esc(short(s.model,120)||'Not reported')}</span></div>
+    <div class="ss-state"><strong data-report>${esc(sessionReport(s,now))}</strong><span>${esc(short(entry.host,90)||'Host not reported')}</span><a class="ss-meta" data-llm-link href="#/llm/session/${esc(encodeURIComponent(entry.id))}">LLM usage</a>${text(s.model) ? `
+      <span class="ss-meta">Model: ${esc(short(s.model,120))}</span>` : ''}${runtimeLine(s.runtime) ? `
+      <span class="ss-meta" data-runtime>Runtime: ${esc(runtimeLine(s.runtime))}</span>` : ''}</div>
   </article>`;
 }
 
 const styles=`<style>
 .ss-intro{max-width:85ch;line-height:1.6;color:var(--text-secondary)}
-.ss-tabs{display:flex;flex-wrap:wrap;gap:8px;margin:20px 0}.ss-tabs button{font:inherit;padding:10px 16px;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);color:var(--text);cursor:pointer}.ss-tabs button[aria-selected=true]{border-color:var(--accent);box-shadow:inset 0 -2px var(--accent)}.ss-tabs strong{margin-left:6px}
-.ss-controls{display:flex;flex-wrap:wrap;gap:12px;margin:18px 0}.ss-controls label{display:flex;flex-direction:column;gap:6px;font-size:13px}.ss-controls .ss-search{flex:1;min-width:180px}.ss-controls input,.ss-controls select{padding:9px;border:1px solid var(--border);border-radius:var(--radius-sm);font:inherit;color:var(--text);background:var(--surface);max-width:100%}
-.ss-group{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);margin:12px 0;overflow:hidden}.ss-group h2{font-size:14px;margin:0;padding:12px 16px;overflow-wrap:anywhere}.ss-row{display:grid;grid-template-columns:minmax(0,1fr) minmax(190px,290px);gap:16px;padding:14px 16px;border-top:1px solid var(--border-subtle);overflow-wrap:anywhere}.ss-main{min-width:0}.ss-title{font-size:14px;font-weight:600;line-height:1.5}.ss-summary{font-size:13px;line-height:1.5;margin:6px 0;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}.ss-meta{font-size:12px;color:var(--text-secondary);line-height:1.5;margin:6px 0}.ss-state{display:flex;flex-direction:column;gap:5px;font-size:12px;line-height:1.5}.ss-state strong{font-weight:500}.ss-pages{display:flex;flex-wrap:wrap;gap:12px;align-items:center;margin:18px 0;font-size:13px}.ss-empty{padding:22px;color:var(--text-secondary)}
-@media(max-width:650px){.ss-row{grid-template-columns:minmax(0,1fr);gap:8px}.ss-controls label{min-width:130px;flex:1}.ss-tabs button{padding:9px 12px}}
+.ss-tabs{display:flex;flex-wrap:wrap;gap:6px;margin:12px 0}.ss-tabs button{font:inherit;padding:8px 13px;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);color:var(--text);cursor:pointer}.ss-tabs button[aria-selected=true]{border-color:var(--accent);box-shadow:inset 0 -2px var(--accent)}.ss-tabs strong{margin-left:6px}
+.ss-controls{display:flex;flex-wrap:wrap;gap:10px;margin:10px 0}.ss-controls label{display:flex;flex-direction:column;gap:4px;font-size:12px}.ss-controls .ss-search{flex:1;min-width:180px}.ss-controls input,.ss-controls select{padding:7px 9px;border:1px solid var(--border);border-radius:var(--radius-sm);font:inherit;color:var(--text);background:var(--surface);max-width:100%}
+.ss-group{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);margin:8px 0;overflow:hidden}.ss-group h2{font-size:13px;margin:0;padding:9px 12px;overflow-wrap:anywhere}.ss-row{display:grid;grid-template-columns:minmax(0,1fr) minmax(190px,290px);gap:14px;padding:9px 12px;border-top:1px solid var(--border-subtle);overflow-wrap:anywhere}.ss-main{min-width:0}.ss-title{font-size:13px;font-weight:600;line-height:1.4}.ss-summary{font-size:12px;line-height:1.4;margin:3px 0;display:-webkit-box;-webkit-line-clamp:1;-webkit-box-orient:vertical;overflow:hidden}.ss-meta{font-size:12px;color:var(--text-secondary);line-height:1.4;margin:3px 0}.ss-id{display:none}.ss-state{display:flex;flex-direction:column;gap:3px;font-size:12px;line-height:1.4}.ss-state strong{font-weight:500}.ss-pages{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin:12px 0;font-size:13px}.ss-empty{padding:18px;color:var(--text-secondary)}
+@media(min-width:2200px){section[id^=ss-panel-]:not([hidden]){display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;align-items:start}.ss-group{margin:0}}
+@media(max-width:650px){.ss-row{grid-template-columns:minmax(0,1fr);gap:8px;padding:12px}.ss-id{display:block}.ss-controls label{min-width:130px;flex:1}.ss-tabs button{padding:9px 12px}}
 </style>`;
 
 export function mountSessionsView(container,client,{tab='current'}={}) {
@@ -87,34 +95,59 @@ export function mountSessionsView(container,client,{tab='current'}={}) {
   const pageSize=20;
   let disposed=false,sessions=[],missions=[],loaded=false,sessionError='',missionError='',lastSignature='',hostSignature='';
   let sessionRequest=null,missionRequest=null;
-  container.innerHTML=`${styles}<h1>Sessions</h1>
-    <p class="ss-intro">Find an agent by project, host or model. Current contains open and unknown session records; Failed and Finished keep previous work together. Status reflects the last report, not a live process check.</p>
-    <div class="ss-tabs" role="tablist" aria-label="Session outcome">${tabs.map(([key,label])=>`<button type="button" role="tab" id="ss-tab-${key}" data-tab="${key}" aria-controls="ss-panel-${key}" aria-selected="${state.tab===key}" tabindex="${state.tab===key?0:-1}">${label} <strong data-count="${key}">…</strong></button>`).join('')}</div>
-    <div class="ss-controls"><label class="ss-search">Search sessions<input id="ss-search" type="search" placeholder="Project, activity, agent, model or ID"></label>
+  container.innerHTML=`${styles}<h1>Agents</h1>
+    <p class="ss-intro">Find an agent by project, host or model. Current shows open agents reported in the last 15 minutes. Older or missing reports move to Unconfirmed automatically; Failed and Finished retain previous work.</p>
+    <div class="ss-tabs" role="tablist" aria-label="Agent outcome">${tabs.map(([key,label])=>`<button type="button" role="tab" id="ss-tab-${key}" data-tab="${key}" aria-controls="ss-panel-${key}" aria-selected="${state.tab===key}" tabindex="${state.tab===key?0:-1}">${label} <strong data-count="${key}">…</strong></button>`).join('')}</div>
+    <div class="ss-controls"><label class="ss-search">Search agents<input id="ss-search" type="search" placeholder="Project, activity, agent, model or ID"></label>
       <label>Host<select id="ss-host"><option value="">All hosts</option></select></label>
       <label>Group by<select id="ss-group"><option value="project">Project folder</option><option value="none">Recent reports</option></select></label></div>
-    <p class="ss-meta" id="ss-result" role="status">Loading sessions…</p><p class="ss-meta" id="ss-error" role="status"></p>
+    <p class="ss-meta" id="ss-result" role="status">Loading agents…</p><p class="ss-meta" id="ss-error" role="status"></p>
     ${tabs.map(([key])=>`<section id="ss-panel-${key}" role="tabpanel" aria-labelledby="ss-tab-${key}" ${state.tab===key?'':'hidden'}></section>`).join('')}
     <div class="ss-pages"><button type="button" class="hd-btn" id="ss-previous">Previous</button><span id="ss-page"></span><button type="button" class="hd-btn" id="ss-next">Next</button></div>`;
   const el=id=>container.querySelector(`#ss-${id}`);
   const entries=()=>sessionEntries(sessions,missions);
+  // Groups and rows keep their nodes: rows are keyed by agent id and enter/leave through patchList.
+  // Only a live update of the same view animates; a tab, filter or page change just shows the rows.
+  let lastView='';
+  const element=html=>{const t=document.createElement('template');t.innerHTML=html.trim();return t.content.firstElementChild;};
+  function patchPanel(panel,visible,groups){
+    const view=JSON.stringify([state.tab,state.search,state.host,state.group,state.page]);
+    const live=view===lastView&&!!panel.querySelector('.ss-group');lastView=view;
+    if(!visible.length){
+      const html=`<p class="ss-empty">${loaded?'No agents match this tab and these filters.':'Loading agents…'}</p>`;
+      if(panel.innerHTML!==html)panel.innerHTML=html;
+      return;
+    }
+    for(const child of [...panel.children])if(!child.matches('.ss-group')||!groups.has(child.dataset.groupName))child.remove();
+    let cursor=panel.firstElementChild;
+    for(const [name,rows] of groups){
+      let group=[...panel.children].find(child=>child.dataset.groupName===name);
+      if(!group){group=document.createElement('div');group.className='ss-group';group.dataset.groupName=name;group.innerHTML=`<h2>${esc(name)}</h2><div data-rows></div>`;}
+      if(group!==cursor)panel.insertBefore(group,cursor);else cursor=group.nextElementSibling;
+      const list=group.querySelector('[data-rows]');
+      patchList(list,rows.map(e=>({id:e.id,html:compactSessionRow(e)})),{key:item=>item.id,render:item=>item.html,update:(row,item)=>morph(row,element(item.html)),inPlace:true,animate:live});
+      if(!live)for(const row of list.querySelectorAll('[data-entering]'))row.removeAttribute('data-entering');
+    }
+  }
   function draw() {
     if(disposed)return;
     const all=entries(), selected=selectSessions(all,state);
     state.page=Math.min(state.page,Math.max(0,Math.ceil(selected.length/pageSize)-1));
     el('error').textContent=[sessionError,missionError].filter(Boolean).join(' ');
-    const signature=JSON.stringify([state,sessions,missions,loaded]);
+    const signature=JSON.stringify([state,sessions,missions,loaded,all.map(e=>e.tab)]);
     if(signature===lastSignature)return;
     lastSignature=signature;
     const focused=document.activeElement;
     const focusId=focused?.closest('[data-session-id]')?.dataset.sessionId;
-    const focusIndex=[...container.querySelectorAll('[data-session-id]')].findIndex(row=>row.dataset.sessionId===focusId);
+    const focusIndex=[...container.querySelectorAll('[data-session-id]:not([data-leaving])')].findIndex(row=>row.dataset.sessionId===focusId);
     const focusMission=focused?.hasAttribute('data-mission-link');
     const scroll={x:window.scrollX,y:window.scrollY};
     for(const [key] of tabs) {
       const button=el(`tab-${key}`), active=state.tab===key;
       button.setAttribute('aria-selected',String(active));button.tabIndex=active?0:-1;
-      button.querySelector('strong').textContent=loaded ? all.filter(e=>e.tab===key).length : '…';
+      const count=button.querySelector('strong'),before=new Map([[count,count.textContent]]);
+      patchText(count,loaded ? all.filter(e=>e.tab===key).length : '…');
+      animateChanges(button,'strong',before);
       el(`panel-${key}`).hidden=!active;
       if(!active)el(`panel-${key}`).innerHTML='';
     }
@@ -122,13 +155,13 @@ export function mountSessionsView(container,client,{tab='current'}={}) {
     if(JSON.stringify(hosts)!==hostSignature){hostSignature=JSON.stringify(hosts);el('host').innerHTML='<option value="">All hosts</option>'+hosts.map(h=>`<option value="${esc(h)}">${esc(h)}</option>`).join('');el('host').value=state.host;}
     const visible=selected.slice(state.page*pageSize,(state.page+1)*pageSize),groups=new Map();
     for(const entry of visible){const label=state.group==='project'?entry.project:'Recent reports';if(!groups.has(label))groups.set(label,[]);groups.get(label).push(entry);}
-    el(`panel-${state.tab}`).innerHTML=visible.length ? [...groups].map(([name,rows])=>`<div class="ss-group"><h2>${esc(name)}</h2>${rows.map(e=>compactSessionRow(e)).join('')}</div>`).join('')
-      : `<p class="ss-empty">${loaded?'No sessions match this tab and these filters.':'Loading sessions…'}</p>`;
-    el('result').textContent=loaded ? `${selected.length} matching ${state.tab} sessions · ${all.length} total records${visible.length?` · Showing ${state.page*pageSize+1}–${state.page*pageSize+visible.length}`:''}` : 'Loading sessions…';
+    patchPanel(el(`panel-${state.tab}`),visible,groups);
+    const noModel=loaded && selected.length>0 && !selected.some(e=>text(e.record.model));
+    el('result').textContent=loaded ? `${selected.length} matching ${state.tab} agents${visible.length?` · Showing ${state.page*pageSize+1}–${state.page*pageSize+visible.length}`:''}${noModel?' · None of these agents report which model they use':''}` : 'Loading agents…';
     el('page').textContent=`Page ${state.page+1} of ${Math.max(1,Math.ceil(selected.length/pageSize))}`;
     el('previous').disabled=state.page===0;el('next').disabled=(state.page+1)*pageSize>=selected.length;
     if(focusId){
-      const rows=[...container.querySelectorAll('[data-session-id]')];
+      const rows=[...container.querySelectorAll('[data-session-id]:not([data-leaving])')];
       const row=rows.find(n=>n.dataset.sessionId===focusId)||rows[Math.min(Math.max(focusIndex,0),rows.length-1)];
       const target=(focusMission?row?.querySelector('[data-mission-link]'):null)||row?.querySelector('[data-session-link]')||el('search');
       target.focus({preventScroll:true});window.scrollTo(scroll.x,scroll.y);
@@ -154,7 +187,7 @@ export function mountSessionsView(container,client,{tab='current'}={}) {
       if(!Array.isArray(data?.[kind]))throw new Error('Invalid response');
       if(kind==='sessions'){sessions=records(data.sessions);loaded=true;sessionError='';}else{missions=records(data.missions);missionError='';}
     } catch {
-      if(!disposed&&!document.hidden){if(kind==='sessions')sessionError=loaded?'Session updates unavailable. Showing last received records.':'Sessions could not be loaded; retrying automatically.';else missionError='Mission context unavailable.';}
+      if(!disposed&&!document.hidden){if(kind==='sessions')sessionError=loaded?'Agent updates unavailable. Showing last received records.':'Agents could not be loaded; retrying automatically.';else missionError='Mission context unavailable.';}
     } finally {
       clearTimeout(timeout);
       if(kind==='sessions')sessionRequest=null;else missionRequest=null;
@@ -165,7 +198,7 @@ export function mountSessionsView(container,client,{tab='current'}={}) {
   function visibility(){if(document.hidden){sessionRequest?.abort();missionRequest?.abort();}else refresh();}
   document.addEventListener('visibilitychange',visibility);
   const poll=setInterval(()=>request('sessions'),5000), contextPoll=setInterval(()=>request('missions'),30000);
-  const clock=setInterval(()=>{if(disposed||document.hidden)return;const byId=new Map(entries().map(e=>[e.id,e]));container.querySelectorAll('[data-session-id]').forEach(row=>{const entry=byId.get(row.dataset.sessionId);if(entry)row.querySelector('[data-report]').textContent=sessionReport(entry.record);});},1000);
+  const clock=setInterval(()=>{if(disposed||document.hidden)return;draw();const byId=new Map(entries().map(e=>[e.id,e]));container.querySelectorAll('[data-session-id]').forEach(row=>{const entry=byId.get(row.dataset.sessionId);if(entry)row.querySelector('[data-report]').textContent=sessionReport(entry.record);});},1000);
   draw();refresh();
   return {refresh,dispose(){disposed=true;sessionRequest?.abort();missionRequest?.abort();clearInterval(poll);clearInterval(contextPoll);clearInterval(clock);document.removeEventListener('visibilitychange',visibility);container.removeEventListener('click',click);container.removeEventListener('keydown',keydown);container.removeEventListener('input',controls);container.removeEventListener('change',controls);}};
 }

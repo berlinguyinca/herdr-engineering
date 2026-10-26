@@ -49,12 +49,38 @@ function pullRequest(row,repo) {
  const event=text(row.event||row.event_type).toLowerCase();
  return {isPr:number!==null||['pull_request','pull_request_target','pull_request_closed','pull_request_opened','pull_request_sync','merge_request'].includes(event)||event.startsWith('pull_request:'),pr:number===null?null:{number,key:JSON.stringify([projectKey(repo),'pr',number]),title:text(row.pull_request?.title||row.pr_title),source:text(row.pull_request?.source_branch||row.source_branch),target:text(row.pull_request?.target_branch||row.target_branch)}};
 }
+export function ciRunInScope(row,scope='all',repo={}) {
+ const {isPr}=pullRequest(row,repo);
+ return scope==='all'||scope==='pr'&&isPr||scope==='default'&&!!repo.default_branch&&!isPr&&row.branch===repo.default_branch;
+}
+export function ciRunInWindow(row,{days=0,start=null,end=null,mode='days'}={},now=Date.now()) {
+ const stamp=time(row.created_at??row.created);
+ if(mode==='runs'&&!Number.isFinite(stamp))return start==null&&end==null;
+ const lower=mode==='runs'?-Infinity:mode==='hours'?now-86400000:Number(days)?Math.floor(now/86400000)*86400000-(Number(days)-1)*86400000:-Infinity;
+ return (mode==='days'&&!Number(days)&&start==null&&end==null)||Number.isFinite(stamp)&&stamp>=lower&&stamp<=now&&(start==null||stamp>=time(start))&&(end==null||stamp<time(end));
+}
+
+export function ciSelectRunWindow(runs,filters={},now=Date.now()) {
+ let selected=runs.filter(row=>ciRunInWindow(row,filters,now));
+ if(filters.mode==='runs'&&filters.run_number==null) {
+  const groups=new Map();
+  for(const row of selected){const key=JSON.stringify([instance(row),repoId(row),row.repository]);if(!groups.has(key))groups.set(key,[]);groups.get(key).push(row);}
+  selected=[...groups.values()].flatMap(group=>group.sort((a,b)=>(time(a.created_at)||-Infinity)-(time(b.created_at)||-Infinity)||Number(a.run_number)-Number(b.run_number)).slice(-24));
+ }
+ return filters.run_number==null?selected:selected.filter(row=>String(row.run_number)===String(filters.run_number));
+}
+
 function windows(mode,now) {
  if(mode==='runs')return Array.from({length:24},(_,i)=>({key:`run:${i}`,label:`${24-i} ${i===23?'(newest)':''}`.trim(),start:null,end:null}));
  const hour=3600000,day=86400000;
- if(mode==='hours') {const result=[];let start=now-day;while(start<now){const end=Math.min(now,(Math.floor(start/hour)+1)*hour);result.push({key:`hour:${Math.floor(start/hour)*hour}`,label:iso(start).slice(11,16),start,end});start=end;}return result;}
+ if(mode==='hours') {
+  // Stable UTC bounds travel with the selection; membership intersects the trailing window below.
+  const start=Math.floor((now-day)/hour)*hour;
+  return Array.from({length:25},(_,i)=>{const boundary=start+i*hour;return {key:`hour:${boundary}`,label:iso(boundary).slice(11,16),start:boundary,end:boundary+hour};});
+ }
  const today=Math.floor(now/day)*day;
- return Array.from({length:Number(mode)},(_,i)=>{const start=today-(Number(mode)-1-i)*day;return {key:`day:${iso(start).slice(0,10)}`,label:iso(start).slice(0,10),start,end:Math.min(start+day,now)};});
+ // Selection carries stable calendar bounds; run membership is capped at now below.
+ return Array.from({length:Number(mode)},(_,i)=>{const start=today-(Number(mode)-1-i)*day;return {key:`day:${iso(start).slice(0,10)}`,label:iso(start).slice(0,10),start,end:start+day};});
 }
 function makeCell(bucket,runs,complete) {
  const c=counts(runs),state=c.failure?(c.success?'mixed':'failure'):c.success?'success':c.running||c.queued?'active':runs.length?'neutral':complete?'empty':'incomplete';
@@ -73,19 +99,19 @@ export function ciHealthModel(history={},options={},now=Date.now()) {
   if(options.repository&&![key,repository,repoId(repo),repo.repository_id].includes(text(options.repository)))continue;
   const coverage=history.coverage?.[key]??history.coverage?.[repoId(repo)]??{};
   const scopeUnavailable=scope==='default'&&!repo.default_branch;
-  let runs=[...dedup.values()].filter(row=>row.projectKey===key).map(row=>({...row,...pullRequest(row,repo)})).filter(row=>!scopeUnavailable&&(scope==='all'||scope==='pr'&&row.isPr||scope==='default'&&!row.isPr&&row.branch===repo.default_branch)&&(!options.branch||row.branch===options.branch));
+  let runs=[...dedup.values()].filter(row=>row.projectKey===key).map(row=>({...row,...pullRequest(row,repo)})).filter(row=>ciRunInScope(row,scope,repo)&&(!options.branch||row.branch===options.branch));
   const projectText=[repository,instance(repo),repoId(repo)].join(' ').toLowerCase();
   runs=runs.filter(row=>terms.every(term=>[projectText,row.branch,row.run_number,row.revision,row.title,row.state,row.pr?.number].map(text).join(' ').toLowerCase().includes(term)));
   if(terms.length&&!runs.length&&!terms.every(term=>projectText.includes(term)))continue;
   runs.sort(chronological);
   const unknownTimestamps=runs.some(row=>!Number.isFinite(row.timestamp));
   if(mode==='runs')runs=runs.filter(row=>!Number.isFinite(row.timestamp)||row.timestamp<=now).slice(-24);
-  else runs=runs.filter(row=>row.timestamp>=buckets[0].start&&row.timestamp<=now);
+  else runs=runs.filter(row=>ciRunInWindow(row,{mode:mode==='hours'?'hours':'days',days:Number(mode)},now));
   if(options.failuresOnly&&!runs.some(row=>outcome(row)==='failure'))continue;
   const since=time(coverage.complete_since),exhausted=coverage.exhausted===true;
   const completeAt=start=>!scopeUnavailable&&!unknownTimestamps&&(exhausted||Number.isFinite(since)&&since<=start);
   const runComplete=!scopeUnavailable&&!unknownTimestamps&&(exhausted||runs.length>=24&&completeAt(runs[0].timestamp));
-  const cells=buckets.map((bucket,i)=>{if(mode==='runs'){const offset=24-runs.length,row=runs[i-offset];return makeCell(row?{...bucket,key:`run:${row.runKey}`}:bucket,row?[row]:[],runComplete);}return makeCell(bucket,runs.filter(row=>row.timestamp>=bucket.start&&(row.timestamp<bucket.end||row.timestamp===now&&bucket.end===now)),completeAt(bucket.start));});
+  const cells=buckets.map((bucket,i)=>{if(mode==='runs'){const offset=24-runs.length,row=runs[i-offset];return makeCell(row?{...bucket,key:`run:${row.runKey}`}:bucket,row?[row]:[],runComplete);}return makeCell(bucket,runs.filter(row=>row.timestamp>=bucket.start&&row.timestamp<bucket.end),completeAt(mode==='hours'?Math.max(bucket.start,now-86400000):bucket.start));});
   const identity=`${repository} · ${instance(repo)||'Provider unavailable'} #${repoId(repo)}`;
   projects.push({key,repo,repository,label:labels.get(key),identity,runs,cells,counts:counts(runs),complete:cells.every(cell=>cell.complete),scopeUnavailable,coverage,unknownTimestamps});
  }
@@ -135,5 +161,5 @@ export function renderCiTree(model,{selectedRunKey='',expanded=new Set(),limits=
  return `<section class="ci-health-tree" aria-label="CI run tree">${model.scope==='default'?'<p class="ci-health-note">Choose Pull requests or All runs to include pull requests.</p>':''}${!projects.size?'<p>No runs in this selection.</p>':''}${projectRows}</section>`;
 }
 export const ciHealthStyles=`
-.ci-health-overview,.ci-health-tree{min-width:0;max-width:100%}.ci-health-note{font-size:.8rem;color:var(--text-muted,#68758a);line-height:1.6}.ci-health-grid-scroll{overflow:auto;max-height:440px;max-width:100%;min-width:0;border:1px solid var(--border,#d6dce5);border-radius:6px}.ci-health-grid{border-collapse:separate;border-spacing:0;table-layout:fixed;width:100%;min-width:max(100%,calc(200px + var(--health-columns,24)*36px));font-size:.7rem}.ci-health-grid th,.ci-health-grid td{padding:2px;text-align:center;min-width:24px;height:32px}.ci-health-grid thead th{position:sticky;top:0;z-index:2;background:var(--surface,#fff);font-weight:500}.ci-health-grid .ci-health-project{position:sticky;left:0;z-index:1;background:var(--surface,#fff);text-align:left;width:200px;min-width:140px;max-width:220px;padding:4px 8px;overflow-wrap:anywhere}.ci-health-grid thead .ci-health-project{z-index:3}.ci-health-project small{display:block;color:var(--warn-text,#9b5d00)}.ci-health-cell{position:relative;display:block;width:100%;min-width:24px;min-height:28px;border:1px solid transparent;border-radius:3px;cursor:pointer;font-size:15px;color:var(--ci-cell-text);background:var(--ci-cell-bg)}.ci-health-cell.state-success{background:var(--ci-cell-success-bg);color:var(--ci-cell-success-text)}.ci-health-cell.state-failure{background:var(--ci-cell-failure-bg);color:var(--ci-cell-failure-text)}.ci-health-cell.state-mixed{background:var(--ci-cell-mixed-bg);color:var(--ci-cell-mixed-text)}.ci-health-cell.state-active{background:var(--ci-cell-active-bg);color:var(--ci-cell-active-text)}.ci-health-cell.state-neutral{background:var(--ci-cell-neutral-bg);color:var(--ci-cell-neutral-text)}.ci-health-cell.state-incomplete{background:repeating-linear-gradient(135deg,var(--ci-cell-stripe-a),var(--ci-cell-stripe-a) 4px,var(--ci-cell-stripe-b) 4px,var(--ci-cell-stripe-b) 6px)}.ci-health-cell.is-incomplete{border-bottom:2px dashed var(--ci-cell-incomplete-border)}.ci-health-active{position:absolute;right:1px;top:-3px;color:var(--ci-cell-active-dot);font-size:10px}.ci-health-cell.is-selected{box-shadow:inset 0 0 0 2px var(--ci-cell-selected)}.ci-health-cell:focus-visible,.ci-health-tree button:focus-visible,.ci-health-tree summary:focus-visible{outline:3px solid var(--focus-ring);outline-offset:2px}.ci-health-tree details{padding:4px 0 4px 12px;max-width:100%}.ci-health-tree summary{cursor:pointer;overflow-wrap:anywhere;font-size:.85rem;line-height:1.6}.ci-health-latest{display:inline-block;font-size:.75rem;margin-left:8px;color:var(--text-muted,#68758a)}.ci-health-tree ul{list-style:none;padding-left:14px;margin:4px 0}.ci-health-tree button{background:none;border:0;color:inherit;cursor:pointer;text-align:left;padding:6px;overflow-wrap:anywhere;max-width:100%}.ci-health-tree button[aria-current]{background:var(--accent-weak,#e0edff);border-radius:4px}.ci-health-exact{margin-top:8px;font-size:.8rem}.ci-health-exact td,.ci-health-exact th{padding:6px;text-align:left}.ci-health-grid-scroll{resize:vertical;min-height:80px}@media(max-width:700px){.ci-health-grid .ci-health-project{width:160px;min-width:140px}.ci-health-grid{width:max-content}.ci-health-grid td,.ci-health-grid thead th:not(.ci-health-project){width:28px;min-width:28px}.ci-health-latest{display:block;margin-left:0}}
+.ci-health-overview,.ci-health-tree{min-width:0;max-width:100%}.ci-health-note{font-size:.8rem;color:var(--text-muted,#68758a);line-height:1.6}.ci-health-grid-scroll{overflow:auto;max-height:440px;max-width:100%;min-width:0;border:1px solid var(--border,#d6dce5);border-radius:6px}.ci-health-grid{border-collapse:separate;border-spacing:0;table-layout:fixed;width:100%;min-width:max(100%,calc(200px + var(--health-columns,24)*36px));font-size:.7rem}.ci-health-grid th,.ci-health-grid td{padding:2px;text-align:center;min-width:24px;height:32px}.ci-health-grid thead th{position:sticky;top:0;z-index:2;background:var(--surface,#fff);font-weight:500}.ci-health-grid .ci-health-project{position:sticky;left:0;z-index:1;background:var(--surface,#fff);text-align:left;width:200px;min-width:140px;max-width:220px;padding:4px 8px;overflow-wrap:anywhere}.ci-health-grid thead .ci-health-project{z-index:3}.ci-health-project small{display:block;color:var(--warn-text,#9b5d00)}.ci-health-cell{position:relative;display:block;width:100%;min-width:24px;min-height:28px;border:1px solid transparent;border-radius:3px;cursor:pointer;font-size:15px;color:var(--text);background:var(--surface-2)}.ci-health-cell.state-success{background:color-mix(in srgb,var(--status-ok) 28%,var(--surface));color:var(--text)}.ci-health-cell.state-failure{background:color-mix(in srgb,var(--status-failed) 30%,var(--surface));color:var(--text)}.ci-health-cell.state-mixed{background:color-mix(in srgb,var(--status-attention) 32%,var(--surface));color:var(--text)}.ci-health-cell.state-active{background:color-mix(in srgb,var(--status-active) 28%,var(--surface));color:var(--text)}.ci-health-cell.state-neutral{background:color-mix(in srgb,var(--status-waiting) 25%,var(--surface));color:var(--text)}.ci-health-cell.state-incomplete{background:repeating-linear-gradient(135deg,var(--surface-2),var(--surface-2) 4px,var(--border) 4px,var(--border) 6px)}.ci-health-cell.is-incomplete{border-bottom:2px dashed var(--text-muted)}.ci-health-active{position:absolute;right:1px;top:-3px;color:var(--status-active);font-size:10px}.ci-health-cell.is-selected{box-shadow:inset 0 0 0 2px var(--text)}.ci-health-cell:focus-visible,.ci-health-tree button:focus-visible,.ci-health-tree summary:focus-visible{outline:3px solid var(--status-active);outline-offset:2px}.ci-health-tree details{padding:4px 0 4px 12px;max-width:100%}.ci-health-tree summary{cursor:pointer;overflow-wrap:anywhere;font-size:.85rem;line-height:1.6}.ci-health-latest{display:inline-block;font-size:.75rem;margin-left:8px;color:var(--text-muted,#68758a)}.ci-health-tree ul{list-style:none;padding-left:14px;margin:4px 0}.ci-health-tree button{background:none;border:0;color:inherit;cursor:pointer;text-align:left;padding:6px;overflow-wrap:anywhere;max-width:100%}.ci-health-tree button[aria-current]{background:var(--accent-weak,#e0edff);border-radius:4px}.ci-health-exact{margin-top:8px;font-size:.8rem}.ci-health-exact td,.ci-health-exact th{padding:6px;text-align:left}.ci-health-grid-scroll{resize:vertical;min-height:80px}@media(max-width:700px){.ci-health-grid .ci-health-project{width:160px;min-width:140px}.ci-health-grid{width:max-content}.ci-health-grid td,.ci-health-grid thead th:not(.ci-health-project){width:28px;min-width:28px}.ci-health-latest{display:block;margin-left:0}}
 `;
