@@ -45,6 +45,16 @@ def test_every_public_static_file_exists():
     assert [name for name, _ in _PUBLIC_STATIC.values() if not (PACKAGES / name).is_file()] == []
 
 
+def test_public_edge_serves_the_complete_public_asset_graph():
+    config = (PACKAGES.parent / 'deploy/control-plane/collab-edge/nginx.conf').read_text()
+    pattern = re.search(r'location ~ (\S+) \{', config).group(1)
+    blocked = [path for path in _PUBLIC_STATIC
+               if f'location = {path} ' not in config and not re.fullmatch(pattern, path)]
+    assert blocked == [], f'Public modules blocked by edge allowlist: {blocked}'
+    assert not re.fullmatch(pattern, '/app.js')
+    assert not re.fullmatch(pattern, '/herdr-web-client/client.js')
+
+
 def test_every_import_of_every_public_module_is_served():
     assert unserved_imports() == []
 
