@@ -717,3 +717,146 @@ def test_exact_redaction_precedes_parser_limits_without_changing_case_identity()
     assert protected['tests'][0]['id'] != protected['tests'][1]['id']
     assert protected['tests'][0]['name'] == protected['tests'][1]['name']
     assert all('Ω' not in row['name'] and len(row['name']) <= 500 for row in protected['tests'])
+
+
+@pytest.mark.parametrize('url', ['https://opaque-provider-credential.example',
+                                 'https://ci.example/opaque-provider-credential'])
+def test_provider_url_rejects_exact_credential_before_persistence(url, disk_event_journal, tmp_path):
+    from herdr_engineering.control_plane.ci_monitor import _credential_redactor
+
+    repo = history_repo(sink=disk_event_journal)
+    with pytest.raises(ValueError, match='provider_url'):
+        repo.ingest_ci_report(history_report(provider_url=url),
+                              redact=_credential_redactor('opaque-provider-credential'))
+    assert repo.ci_reports()['reports'] == []
+    assert not (tmp_path / 'journal.jsonl').exists()
+
+
+@pytest.mark.parametrize('encoding', ['utf-16le', 'utf-16be'])
+def test_junit_rejects_nul_interleaved_dtd_entities(encoding, disk_event_journal, tmp_path):
+    xml = '<!DOCTYPE testsuite [<!ENTITY secret "expanded">]><testsuite><testcase name="&secret;"/></testsuite>'
+    disguised = xml.encode(encoding).decode('latin-1')
+    repo = history_repo(sink=disk_event_journal)
+    with pytest.raises(ValueError, match='JUnit'):
+        repo.ingest_ci_report(history_report(xml=disguised))
+    assert repo.ci_reports()['reports'] == []
+    assert not (tmp_path / 'journal.jsonl').exists()
+
+
+@pytest.mark.parametrize('xml', ['<testsuite>\ud800</testsuite>',
+                                 '<testsuite>\udfff</testsuite>',
+                                 '<testsuite/>\x00'])
+def test_junit_invalid_unicode_is_a_safe_validation_error(xml):
+    with pytest.raises(ValueError, match='JUnit'):
+        parse_junit(xml)
+
+
+@pytest.fixture(params=[0, 1, 2, 3], ids=['single-file-case', 'duplicate-labels-different-files',
+                                        'redacted-label', 'truncated-label'])
+def baseline_report(request):
+    import json
+    from pathlib import Path
+
+    # Frozen output from the pre-file-identity parser at 770fe01, not regenerated
+    # by the implementation under test. Baseline receipts retained no file data.
+    data = json.loads((Path(__file__).parent / 'fixtures/ci_reports_baseline.json').read_text())
+    return data['reports'][request.param]
+
+
+def test_imported_baseline_receipt_remains_idempotent(baseline_report, disk_event_journal):
+    from herdr_engineering.control_plane.bridge import load_into
+
+    receipt = baseline_report['receipt']
+    baseline = history_repo(sink=disk_event_journal)
+    baseline.record_event('ci_report', receipt['report_id'], 'CITestReportReceived', receipt)
+    restored = history_repo(sink=disk_event_journal)
+    restored.import_state(baseline.export_state())
+    replayed = history_repo(sink=disk_event_journal)
+    load_into(replayed, disk_event_journal)
+    for repo in (restored, replayed):
+        before = repo.export_state()
+        for _ in range(2):
+            assert repo.ingest_ci_report(baseline_report['body']) == receipt
+        assert repo.export_state() == before
+        assert repo.ci_reports()['scope']['report_count'] == 1
+        assert repo.ci_reports()['reports'][0]['attempt'] == 1
+    assert len(disk_event_journal.events()) == 1
+
+
+@pytest.mark.parametrize('changes', [
+    {'provider_url': 'https://ci.example'}, {'provider_repo_id': 18},
+    {'provider_repo_id': '17'}, {'provider_repo_id': None},
+    {'repository': 'other/app'}, {'run_number': 2}, {'branch': 'topic'}, {'revision': 'abcd'},
+    {'xml': '<testsuite name="unit"><testcase name="works" classname="Checks" file="tests/a.py" time="2"/></testsuite>'},
+    {'xml': '<testsuite name="unit"><testcase name="other" classname="Checks" file="tests/a.py" time="1"/></testsuite>'},
+])
+def test_baseline_receipt_does_not_match_changed_identity_or_evidence(baseline_report, changes):
+    receipt = baseline_report['receipt']
+    repo = history_repo()
+    repo.record_event('ci_report', receipt['report_id'], 'CITestReportReceived', receipt)
+    uploaded = repo.ingest_ci_report({**baseline_report['body'], **changes})
+    assert uploaded['report_id'] != receipt['report_id']
+    assert len(repo.ci_reports()['reports']) == 2
+
+
+def test_baseline_hash_alone_cannot_reconcile_modified_receipt(baseline_report):
+    import copy
+
+    receipt = copy.deepcopy(baseline_report['receipt'])
+    receipt['tests'][0]['name'] = 'different retained evidence'
+    repo = history_repo()
+    repo.record_event('ci_report', receipt['report_id'], 'CITestReportReceived', receipt)
+    uploaded = repo.ingest_ci_report(baseline_report['body'])
+    assert uploaded['report_id'] != receipt['report_id']
+    assert len(repo.ci_reports()['reports']) == 2
+
+
+@pytest.mark.parametrize('original_has_file', [False, True])
+def test_new_file_identities_never_fall_back_to_legacy_matching(baseline_report, original_has_file):
+    body = {**baseline_report['body']}
+    if not original_has_file:
+        body['xml'] = body['xml'].replace(' file="tests/a.py"', '').replace(' file="tests/b.py"', '')
+    repo = history_repo()
+    first = repo.ingest_ci_report(body)
+    changed = repo.ingest_ci_report({**body, 'xml': baseline_report['body']['xml'].replace('tests/a.py', 'tests/other.py')})
+    assert first['report_id'] != changed['report_id']
+    assert first['tests'][0]['id'] != changed['tests'][0]['id']
+    assert repo.ingest_ci_report(body) == first
+    assert len(repo.ci_reports()['reports']) == 2
+
+
+def test_legacy_matching_uses_raw_labels_not_redacted_or_truncated_display(baseline_report):
+    receipt = baseline_report['receipt']
+    body = baseline_report['body']
+    changed_xml = (body['xml'].replace('works', 'different').replace('synthetic-one', 'synthetic-two')
+                   .replace('x' * 510 + 'A', 'x' * 510 + 'B'))
+    repo = history_repo()
+    repo.record_event('ci_report', receipt['report_id'], 'CITestReportReceived', receipt)
+    uploaded = repo.ingest_ci_report({**body, 'xml': changed_xml})
+    assert uploaded['report_id'] != receipt['report_id']
+    assert len(repo.ci_reports()['reports']) == 2
+
+
+def test_pre_version_file_aware_receipts_keep_their_hashes(baseline_report):
+    repo = history_repo()
+    receipt = repo.ingest_ci_report(baseline_report['body'])
+    receipt.pop('identity_version')
+    previous = history_repo()
+    previous.record_event('ci_report', receipt['report_id'], 'CITestReportReceived', receipt)
+    restored = history_repo()
+    restored.import_state(previous.export_state())
+    before = restored.export_state()
+    assert restored.ingest_ci_report(baseline_report['body']) == receipt
+    assert restored.export_state() == before
+
+
+@pytest.mark.parametrize('declaration', ['<!DOCTYPE testsuite>',
+    '<!DOCTYPE testsuite SYSTEM "file:///must-not-read">',
+    '<!DOCTYPE testsuite [<!ENTITY secret "expanded">]>'])
+def test_junit_parser_boundary_rejects_declarations_without_text_prescan(declaration):
+    class WithoutPrescan(str):
+        def upper(self):
+            return ''
+
+    with pytest.raises(ValueError, match='JUnit DTD'):
+        parse_junit(WithoutPrescan(declaration + '<testsuite/>'))

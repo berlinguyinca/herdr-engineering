@@ -31,11 +31,12 @@ def _tag(element):
     return element.tag.rsplit('}', 1)[-1]
 
 
-def normalize_provider_url(value):
+def normalize_provider_url(value, *, redact=None):
     """Accept only credential-free provider base URLs, before persistence."""
     if (not isinstance(value, str) or not value or len(value) > 1000 or
             not value.isprintable() or any(c.isspace() for c in value) or
-            redact_text(value) != value or '[REDACTED]' in value):
+            redact_text(value) != value or '[REDACTED]' in value or
+            (redact is not None and redact(value) != value)):
         raise ValueError('Invalid provider_url')
     try:
         parsed = urlsplit(value)
@@ -48,13 +49,28 @@ def normalize_provider_url(value):
     return value.rstrip('/')
 
 
-def parse_junit(xml, *, redact=None):
-    if not isinstance(xml, str) or len(xml.encode('utf-8')) > MAX_XML_BYTES:
+class _JUnitTreeBuilder(ElementTree.TreeBuilder):
+    def doctype(self, name, pubid, system):
+        # Enforce this at the parser boundary, independently of the text scan.
+        # Reject before any declared entities can be used in the document.
+        raise ValueError('JUnit DTD and entity declarations are forbidden')
+
+
+def parse_junit(xml, *, redact=None, _identity_version=2):
+    if not isinstance(xml, str) or len(xml) > MAX_XML_BYTES:
+        raise ValueError('JUnit XML must be a string of at most 1 MiB')
+    try:
+        encoded = xml.encode('utf-8')
+    except UnicodeError:
+        raise ValueError('JUnit XML must contain valid Unicode') from None
+    if '\x00' in xml:
+        raise ValueError('JUnit XML must not contain NUL characters')
+    if len(encoded) > MAX_XML_BYTES:
         raise ValueError('JUnit XML must be a string of at most 1 MiB')
     if '<!DOCTYPE' in xml.upper() or '<!ENTITY' in xml.upper():
         raise ValueError('JUnit DTD and entity declarations are forbidden')
     try:
-        root = ElementTree.fromstring(xml)
+        root = ElementTree.fromstring(xml, parser=ElementTree.XMLParser(target=_JUnitTreeBuilder()))
     except ElementTree.ParseError:
         raise ValueError('Malformed JUnit XML') from None
     if _tag(root) not in {'testsuites', 'testsuite'}:
@@ -84,7 +100,7 @@ def parse_junit(xml, *, redact=None):
             # Hash full original labels before redaction/truncation so display
             # collisions cannot create false retry or flakiness evidence.
             labels = [suite_path, node.get('classname', ''), node.get('name', '')]
-            if node.get('file'):
+            if _identity_version >= 2 and node.get('file'):
                 labels.append(node.get('file'))
             identity = hashlib.sha256(json.dumps(
                 labels,
@@ -100,13 +116,13 @@ def parse_junit(xml, *, redact=None):
                               duration_ms=round(seconds * 1000),
                               message=_text(detail.get('message'), 2000, redact=redact) if detail is not None else '',
                               trace=_text(''.join(detail.itertext()), 4000, redact=redact) if detail is not None else ''))
-            if node.get('file'):
+            if _identity_version >= 2 and node.get('file'):
                 tests[-1]['file'] = _text(node.get('file'), redact=redact)
             case_groups.setdefault(identity, []).append(tests[-1])
         else:
             pending.extend((child, suite_path) for child in reversed(list(node)))
     for cases in case_groups.values():
-        if len(cases) > 1:
+        if _identity_version >= 2 and len(cases) > 1:
             # Occurrence ordinals keep rows distinct, but do not identify a
             # physical test across reports when duplicate labels reorder.
             for case in cases:
@@ -120,12 +136,12 @@ def parse_junit(xml, *, redact=None):
     return parsed
 
 
-def normalize_report(body, stamp, *, redact=None):
+def normalize_report(body, stamp, *, redact=None, _identity_version=2):
     if not isinstance(body, dict):
         raise ValueError('Report must be a JSON object')
     values = {}
     if body.get('provider_url') is not None:
-        values['provider_url'] = normalize_provider_url(body['provider_url'])
+        values['provider_url'] = normalize_provider_url(body['provider_url'], redact=redact)
     for key in ('repository', 'branch', 'revision'):
         value = body.get(key)
         if not isinstance(value, str) or not value.strip() or len(value) > 500:
@@ -145,9 +161,25 @@ def normalize_report(body, stamp, *, redact=None):
             raise ValueError()
     except ValueError:
         raise ValueError('reported_at must be an ISO timestamp with timezone') from None
-    values.update(provider_repo_id=provider, run_number=number, **parse_junit(body.get('xml'), redact=redact))
+    values.update(provider_repo_id=provider, run_number=number,
+                  **parse_junit(body.get('xml'), redact=redact, _identity_version=_identity_version))
     digest = hashlib.sha256(json.dumps(values, sort_keys=True).encode()).hexdigest()
-    return dict(values, report_id=digest, reported_at=reported)
+    # The version is receipt metadata, outside the digest, so already-uploaded
+    # file-aware reports retain their hashes too. Version 1 is lookup-only.
+    return dict(values, report_id=digest, reported_at=reported, identity_version=_identity_version)
+
+
+def matches_legacy_report(receipt, candidate):
+    """Require the complete historical normalization, never display labels alone.
+
+    Legacy reports did not retain files. Returning their original receipts must
+    not imply that we recovered file identity or enrich their case evidence.
+    """
+    if receipt.get('identity_version', 1) != 1 or receipt.get('provider_url') is not None:
+        return False
+    metadata = {'reported_at', 'ingested_at', 'attempt', 'identity_version'}
+    return ({key: value for key, value in receipt.items() if key not in metadata} ==
+            {key: value for key, value in candidate.items() if key not in metadata})
 
 
 def reconcile_report_identities(reports, pipelines):

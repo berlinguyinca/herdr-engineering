@@ -772,3 +772,50 @@ def test_parser_boundary_credentials_are_not_exposed(server, legacy, prefix_leng
         assert cases[0]['id'] == original_id
         assert len(json.dumps(view).encode()) < 256 * 1024
     assert server.repo.export_state() == before, 'Read-time protection must not rewrite retained evidence'
+
+
+@pytest.mark.parametrize('url', ['https://opaque-provider-credential.example',
+                                 'https://ci.example/opaque-provider-credential'])
+def test_report_upload_rejects_exact_provider_url_credentials(server, url):
+    from herdr_engineering.ci import WoodpeckerProvider
+    from tests.test_ci import FakeCI
+
+    transport = FakeCI({})
+    provider = WoodpeckerProvider('https://ci.example', 'opaque-provider-credential', client=transport)
+    server.ci_monitor._factory = lambda: provider
+    body = dict(repository='org/app', provider_url=url, provider_repo_id=17,
+                run_number=1, revision='abc', branch='main', xml='<testsuite/>')
+    status, view = request(server, 'ci/reports', body, key='write')
+    assert status == 400
+    assert 'opaque-provider-credential' not in json.dumps(view)
+    assert server.repo.ci_reports()['reports'] == []
+    assert transport.requests == []
+
+
+def test_compatibility_reports_redact_retained_provider_urls_without_mutation(server):
+    from herdr_engineering.ci import WoodpeckerProvider
+    from tests.test_ci import FakeCI
+
+    credential = 'opaque-provider-credential'
+    provider_url = f'https://ci.example/{credential}'
+    body = dict(repository='org/app', provider_url=provider_url, provider_repo_id=17,
+                run_number=1, revision='abc', branch='main',
+                xml=f'<testsuite><testcase name="{credential}"/></testsuite>')
+    receipt = server.repo.ingest_ci_report(body)
+    server.repo.observe_ci_pipeline({key: value for key, value in body.items() if key != 'xml'})
+    restored = ControlPlaneRepo()
+    restored.import_state(server.repo.export_state())
+    server.repo = restored
+    before = server.repo.export_state()
+    transport = FakeCI({})
+    provider = WoodpeckerProvider('https://ci.example', credential, client=transport)
+    server.ci_monitor._factory = lambda: provider
+    server.ci_monitor.snapshot = lambda **kwargs: {'repos': []}
+    status, view = request(server, 'ci/reports')
+    assert status == 200
+    assert credential not in json.dumps(view)
+    assert view['reports'][0]['report_id'] == receipt['report_id']
+    assert view['reports'][0]['tests'][0]['id'] == receipt['tests'][0]['id']
+    assert view['reports'][0]['summary']['passed'] == 1
+    assert server.repo.export_state() == before
+    assert transport.requests == []

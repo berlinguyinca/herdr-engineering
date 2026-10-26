@@ -1945,8 +1945,9 @@ def _make_handler(server, public=False, operator=False):
                 if what == "reports":
                     from .project_links import annotate_ci_history, cached_github_languages
                     view = {**r.ci_reports(), "repos": server.ci_monitor.snapshot().get("repos", [])}
-                    return self._json(annotate_ci_history(view, r,
-                        repository_languages=cached_github_languages(server.github_monitor)))
+                    view = annotate_ci_history(view, r,
+                        repository_languages=cached_github_languages(server.github_monitor))
+                    return self._json(server.ci_monitor.report_redactor()(view))
                 if what == "pipeline":
                     view = server.ci_monitor.detail(
                         _q(self.path, "repository"), _q(self.path, "number"),
@@ -2018,7 +2019,8 @@ def _make_handler(server, public=False, operator=False):
                 return self._json(r.record_ci_telemetry(validate_ci_telemetry(self._read_json())))
             body = self._read_json() or {}
             if resource == "ci" and len(parts) == 5 and parts[4] == "reports":
-                return self._json(r.ingest_ci_report(body, redact=server.ci_monitor.report_redactor()))
+                redact = server.ci_monitor.report_redactor()
+                return self._json(redact(r.ingest_ci_report(body, redact=redact)))
             if resource == "ci" and len(parts) == 5 and parts[4] == "debug":
                 from ..errors import HerdrEngineeringError
                 from .ci_debug import debug_ci

@@ -1660,12 +1660,24 @@ class ControlPlaneRepo:
                                repository=repository, branch=branch, days=days)
 
     def ingest_ci_report(self, body, *, redact=None):
-        from .ci_reports import normalize_report, reconcile_report_identities
+        from .ci_reports import matches_legacy_report, normalize_report, reconcile_report_identities
         with self._event_lock:
             report = normalize_report(body, self._stamp(), redact=redact)
             existing = self._events.get(("ci_report", report["report_id"]))
             if existing:
                 return copy.deepcopy(existing[-1]["payload"])
+            # Recompute the historical hash from the raw upload, not truncated
+            # or redacted case labels. A match returns the original receipt and
+            # never promotes missing legacy file/provider evidence to certainty.
+            if report.get('provider_url') is None and any(
+                    kind == 'ci_report' and stream and
+                    stream[-1]['payload'].get('identity_version', 1) == 1
+                    for (kind, _), stream in self._events.items()):
+                legacy = normalize_report(body, report['reported_at'], redact=redact,
+                                          _identity_version=1)
+                existing = self._events.get(('ci_report', legacy['report_id']))
+                if existing and matches_legacy_report(existing[-1]['payload'], legacy):
+                    return copy.deepcopy(existing[-1]['payload'])
             history = self.ci_reports()
             projected = copy.deepcopy(report)
             reconcile_report_identities([projected], history["pipelines"])
