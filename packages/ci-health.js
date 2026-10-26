@@ -49,12 +49,38 @@ function pullRequest(row,repo) {
  const event=text(row.event||row.event_type).toLowerCase();
  return {isPr:number!==null||['pull_request','pull_request_target','pull_request_closed','pull_request_opened','pull_request_sync','merge_request'].includes(event)||event.startsWith('pull_request:'),pr:number===null?null:{number,key:JSON.stringify([projectKey(repo),'pr',number]),title:text(row.pull_request?.title||row.pr_title),source:text(row.pull_request?.source_branch||row.source_branch),target:text(row.pull_request?.target_branch||row.target_branch)}};
 }
+export function ciRunInScope(row,scope='all',repo={}) {
+ const {isPr}=pullRequest(row,repo);
+ return scope==='all'||scope==='pr'&&isPr||scope==='default'&&!!repo.default_branch&&!isPr&&row.branch===repo.default_branch;
+}
+export function ciRunInWindow(row,{days=0,start=null,end=null,mode='days'}={},now=Date.now()) {
+ const stamp=time(row.created_at??row.created);
+ if(mode==='runs'&&!Number.isFinite(stamp))return start==null&&end==null;
+ const lower=mode==='runs'?-Infinity:mode==='hours'?now-86400000:Number(days)?Math.floor(now/86400000)*86400000-(Number(days)-1)*86400000:-Infinity;
+ return (mode==='days'&&!Number(days)&&start==null&&end==null)||Number.isFinite(stamp)&&stamp>=lower&&stamp<=now&&(start==null||stamp>=time(start))&&(end==null||stamp<time(end));
+}
+
+export function ciSelectRunWindow(runs,filters={},now=Date.now()) {
+ let selected=runs.filter(row=>ciRunInWindow(row,filters,now));
+ if(filters.mode==='runs'&&filters.run_number==null) {
+  const groups=new Map();
+  for(const row of selected){const key=JSON.stringify([instance(row),repoId(row),row.repository]);if(!groups.has(key))groups.set(key,[]);groups.get(key).push(row);}
+  selected=[...groups.values()].flatMap(group=>group.sort((a,b)=>(time(a.created_at)||-Infinity)-(time(b.created_at)||-Infinity)||Number(a.run_number)-Number(b.run_number)).slice(-24));
+ }
+ return filters.run_number==null?selected:selected.filter(row=>String(row.run_number)===String(filters.run_number));
+}
+
 function windows(mode,now) {
  if(mode==='runs')return Array.from({length:24},(_,i)=>({key:`run:${i}`,label:`${24-i} ${i===23?'(newest)':''}`.trim(),start:null,end:null}));
  const hour=3600000,day=86400000;
- if(mode==='hours') {const result=[];let start=now-day;while(start<now){const end=Math.min(now,(Math.floor(start/hour)+1)*hour);result.push({key:`hour:${Math.floor(start/hour)*hour}`,label:iso(start).slice(11,16),start,end});start=end;}return result;}
+ if(mode==='hours') {
+  // Stable UTC bounds travel with the selection; membership intersects the trailing window below.
+  const start=Math.floor((now-day)/hour)*hour;
+  return Array.from({length:25},(_,i)=>{const boundary=start+i*hour;return {key:`hour:${boundary}`,label:iso(boundary).slice(11,16),start:boundary,end:boundary+hour};});
+ }
  const today=Math.floor(now/day)*day;
- return Array.from({length:Number(mode)},(_,i)=>{const start=today-(Number(mode)-1-i)*day;return {key:`day:${iso(start).slice(0,10)}`,label:iso(start).slice(0,10),start,end:Math.min(start+day,now)};});
+ // Selection carries stable calendar bounds; run membership is capped at now below.
+ return Array.from({length:Number(mode)},(_,i)=>{const start=today-(Number(mode)-1-i)*day;return {key:`day:${iso(start).slice(0,10)}`,label:iso(start).slice(0,10),start,end:start+day};});
 }
 function makeCell(bucket,runs,complete) {
  const c=counts(runs),state=c.failure?(c.success?'mixed':'failure'):c.success?'success':c.running||c.queued?'active':runs.length?'neutral':complete?'empty':'incomplete';
@@ -73,19 +99,19 @@ export function ciHealthModel(history={},options={},now=Date.now()) {
   if(options.repository&&![key,repository,repoId(repo),repo.repository_id].includes(text(options.repository)))continue;
   const coverage=history.coverage?.[key]??history.coverage?.[repoId(repo)]??{};
   const scopeUnavailable=scope==='default'&&!repo.default_branch;
-  let runs=[...dedup.values()].filter(row=>row.projectKey===key).map(row=>({...row,...pullRequest(row,repo)})).filter(row=>!scopeUnavailable&&(scope==='all'||scope==='pr'&&row.isPr||scope==='default'&&!row.isPr&&row.branch===repo.default_branch)&&(!options.branch||row.branch===options.branch));
+  let runs=[...dedup.values()].filter(row=>row.projectKey===key).map(row=>({...row,...pullRequest(row,repo)})).filter(row=>ciRunInScope(row,scope,repo)&&(!options.branch||row.branch===options.branch));
   const projectText=[repository,instance(repo),repoId(repo)].join(' ').toLowerCase();
   runs=runs.filter(row=>terms.every(term=>[projectText,row.branch,row.run_number,row.revision,row.title,row.state,row.pr?.number].map(text).join(' ').toLowerCase().includes(term)));
   if(terms.length&&!runs.length&&!terms.every(term=>projectText.includes(term)))continue;
   runs.sort(chronological);
   const unknownTimestamps=runs.some(row=>!Number.isFinite(row.timestamp));
   if(mode==='runs')runs=runs.filter(row=>!Number.isFinite(row.timestamp)||row.timestamp<=now).slice(-24);
-  else runs=runs.filter(row=>row.timestamp>=buckets[0].start&&row.timestamp<=now);
+  else runs=runs.filter(row=>ciRunInWindow(row,{mode:mode==='hours'?'hours':'days',days:Number(mode)},now));
   if(options.failuresOnly&&!runs.some(row=>outcome(row)==='failure'))continue;
   const since=time(coverage.complete_since),exhausted=coverage.exhausted===true;
   const completeAt=start=>!scopeUnavailable&&!unknownTimestamps&&(exhausted||Number.isFinite(since)&&since<=start);
   const runComplete=!scopeUnavailable&&!unknownTimestamps&&(exhausted||runs.length>=24&&completeAt(runs[0].timestamp));
-  const cells=buckets.map((bucket,i)=>{if(mode==='runs'){const offset=24-runs.length,row=runs[i-offset];return makeCell(row?{...bucket,key:`run:${row.runKey}`}:bucket,row?[row]:[],runComplete);}return makeCell(bucket,runs.filter(row=>row.timestamp>=bucket.start&&(row.timestamp<bucket.end||row.timestamp===now&&bucket.end===now)),completeAt(bucket.start));});
+  const cells=buckets.map((bucket,i)=>{if(mode==='runs'){const offset=24-runs.length,row=runs[i-offset];return makeCell(row?{...bucket,key:`run:${row.runKey}`}:bucket,row?[row]:[],runComplete);}return makeCell(bucket,runs.filter(row=>row.timestamp>=bucket.start&&row.timestamp<bucket.end),completeAt(mode==='hours'?Math.max(bucket.start,now-86400000):bucket.start));});
   const identity=`${repository} · ${instance(repo)||'Provider unavailable'} #${repoId(repo)}`;
   projects.push({key,repo,repository,label:labels.get(key),identity,runs,cells,counts:counts(runs),complete:cells.every(cell=>cell.complete),scopeUnavailable,coverage,unknownTimestamps});
  }

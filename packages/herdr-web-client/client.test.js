@@ -343,6 +343,10 @@ test('CI report history reads use viewer GET and forward cancellation',async()=>
   const client=new HerdrClient(`http://127.0.0.1:${server.address().port}`);
   assert.deepEqual(await client.getCiReports(),{reports:[],pipelines:[]});
   assert.deepEqual(calls[0],{url:'/api/v1/ci/reports',method:'GET'});
+  await client.getCiReports({compact:true});
+  assert.equal(calls[1].url,'/api/v1/ci/reports?compact=1');
+  await client.getCiReports({provider_url:'https://ci.example',provider_repo_id:17,repository:'org/app',run_number:1});
+  assert.equal(new URL(calls[2].url,'http://local').searchParams.get('run_number'),'1');
   const controller=new AbortController();
   const request=client.getCiReports({signal:controller.signal});controller.abort();
   await assert.rejects(request,{name:'AbortError'});
@@ -383,4 +387,72 @@ test('CI reads and mutations bind the expected provider URL without changing leg
  await client.debugCi('17',12,'session','op',{providerUrl});
  for(const call of calls.slice(0,2))assert.equal(new URL(call.url,'http://test').searchParams.get('provider_url'),providerUrl);
  for(const call of calls.slice(2))assert.equal(JSON.parse(call.opts.body).provider_url,providerUrl);
+});
+
+test('compact CI reads serialize only supported filters and preserve abort signals', async () => {
+  const calls = [];
+  const client = new HerdrClient('', {fetchImpl: async (url, options) => {
+    calls.push({url, options});
+    return {ok: true, status: 200, text: async () => '{}'};
+  }});
+  const signal = new AbortController().signal;
+  const filters = {days: 30, repository: 'org/app & other', branch: 'feature/test',
+    provider_url: 'https://ci.example', provider_repo_id: '17', signal, token: 'do-not-send'};
+  await client.getCiSummary({...filters, scope: 'pr'});
+  await client.getCiTests({...filters, test: 'test & one'});
+  for (const [index, call] of calls.entries()) {
+    const url = new URL(call.url, 'http://test');
+    assert.equal(url.pathname, index ? '/api/v1/ci/tests' : '/api/v1/ci/summary');
+    assert.equal(url.searchParams.get('repository'), 'org/app & other');
+    assert.equal(url.searchParams.get('branch'), 'feature/test');
+    assert.equal(url.searchParams.get('days'), '30');
+    assert.equal(url.searchParams.get('provider_repo_id'), '17');
+    assert.equal(url.searchParams.get(index ? 'test' : 'scope'), index ? 'test & one' : 'pr');
+    assert.equal(url.searchParams.has('token'), false);
+    assert.equal(url.searchParams.has('signal'), false);
+    assert.equal(call.options.signal, signal);
+    assert.equal(call.options.method, 'GET');
+  }
+  await client.getCiSummary(); await client.getCiTests();
+  assert.equal(calls[2].url, '/api/v1/ci/summary?days=14');
+  assert.equal(calls[3].url, '/api/v1/ci/tests?days=14');
+});
+
+test('compact and lazy CI reads cancel actual in-flight HTTP requests', async () => {
+  let arrived;
+  const server = createServer(() => arrived());
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const client = new HerdrClient(`http://127.0.0.1:${server.address().port}`);
+    for (const read of [signal => client.getCiSummary({signal}),
+      signal => client.getCiTests({signal}),
+      signal => client.getCiPipeline('17', 1, {signal}),
+      signal => client.getCiLog('17', 1, '4', {signal})]) {
+      const received = new Promise(resolve => { arrived = resolve; });
+      const controller = new AbortController();
+      const pending = read(controller.signal);
+      await received;
+      controller.abort();
+      await assert.rejects(pending, {name: 'AbortError'});
+    }
+  } finally { server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); }
+});
+
+test('summary and test queries carry the same event scope and bucket bounds',async()=>{
+ const calls=[];
+ const client=new HerdrClient('',{fetchImpl:async url=>{calls.push(url);return {ok:true,status:200,text:async()=>'{}'};}});
+ const selection={scope:'pr',start:'2026-10-24T00:00:00Z',end:'2026-10-25T00:00:00Z'};
+ await client.getCiSummary(selection);await client.getCiTests(selection);
+ for(const url of calls)for(const [key,value] of Object.entries(selection))assert.equal(new URL(url,'http://test').searchParams.get(key),value);
+});
+
+test('last-runs summary and test queries preserve mode and exact run without a day cutoff',async()=>{
+ const calls=[];
+ const client=new HerdrClient('',{fetchImpl:async url=>{calls.push(url);return {ok:true,status:200,text:async()=>'{}'};}});
+ const selection={mode:'runs',days:null,provider_url:'https://ci.example',provider_repo_id:17,repository:'org/app',run_number:26};
+ await client.getCiSummary(selection);await client.getCiTests(selection);
+ for(const url of calls){const params=new URL(url,'http://test').searchParams;
+  assert.equal(params.has('days'),false);
+  for(const [key,value] of Object.entries(selection))if(key!=='days')assert.equal(params.get(key),String(value));
+ }
 });

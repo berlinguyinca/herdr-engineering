@@ -304,8 +304,29 @@ export class HerdrClient {
     return this.request('/api/v1/ci', { signal });
   }
 
-  getCiReports({ signal } = {}) {
-    return this.request('/api/v1/ci/reports', { signal });
+  getCiReports({ signal, compact = false, provider_url, provider_repo_id, repository, run_number } = {}) {
+    const query = new URLSearchParams();
+    if (compact) query.set('compact', '1');
+    for (const [key, value] of Object.entries({provider_url, provider_repo_id, repository, run_number})) {
+      if (value !== undefined && value !== null) query.set(key, String(value));
+    }
+    return this.request(`/api/v1/ci/reports${query.size ? `?${query}` : ''}`, { signal });
+  }
+
+  getCiSummary({ days = 14, repository, branch, scope, start, end, mode, run_number, provider_url, provider_repo_id, signal } = {}) {
+    const query = new URLSearchParams(mode==='runs'||mode==='hours'?{}:{days:String(days??14)});
+    for (const [key, value] of Object.entries({ repository, branch, scope, start, end, mode, run_number, provider_url, provider_repo_id })) {
+      if (value !== undefined && value !== null && value !== '') query.set(key, String(value));
+    }
+    return this.request(`/api/v1/ci/summary?${query}`, { signal });
+  }
+
+  getCiTests({ days = 14, repository, branch, test, scope, start, end, mode, run_number, provider_url, provider_repo_id, signal } = {}) {
+    const query = new URLSearchParams(mode==='runs'||mode==='hours'?{}:{days:String(days??14)});
+    for (const [key, value] of Object.entries({ repository, branch, test, scope, start, end, mode, run_number, provider_url, provider_repo_id })) {
+      if (value !== undefined && value !== null && value !== '') query.set(key, String(value));
+    }
+    return this.request(`/api/v1/ci/tests?${query}`, { signal });
   }
 
   getCiPerformance({ days = 14, repository, branch, signal } = {}) {

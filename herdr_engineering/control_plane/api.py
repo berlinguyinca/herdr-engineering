@@ -1913,6 +1913,14 @@ def _make_handler(server, public=False, operator=False):
                 return self._github_list(what or "repositories", query)
             if resource == "ci":
                 what = parts[4] if len(parts) > 4 else ""
+                if what in {"summary", "tests"} and len(parts) == 5:
+                    filters = _ci_observability_query(self.path, what)
+                    if what == "summary":
+                        return self._json(server.ci_monitor.summary(r, **filters))
+                    view = server.ci_monitor.tests(r, **filters)
+                    cached = server.ci_monitor.summary_snapshot(start=False)
+                    view['scope']['stale'] |= bool(cached.get('stale'))
+                    return self._json(view)
                 if what == "performance" and len(parts) == 5:
                     from .ci_performance import annotate_performance
                     raw_days = _q(self.path, "days") or "14"
@@ -1936,13 +1944,18 @@ def _make_handler(server, public=False, operator=False):
                         repository_languages=cached_github_languages(server.github_monitor)))
                 if what == "reports":
                     from .project_links import annotate_ci_history, cached_github_languages
-                    view = {**r.ci_reports(), "repos": server.ci_monitor.snapshot().get("repos", [])}
-                    return self._json(annotate_ci_history(view, r,
-                        repository_languages=cached_github_languages(server.github_monitor)))
+                    filters = _ci_reports_query(self.path)
+                    view = {**r.ci_reports(**filters), "repos": server.ci_monitor.snapshot().get("repos", [])}
+                    view = annotate_ci_history(view, r,
+                        repository_languages=cached_github_languages(server.github_monitor))
+                    return self._json(server.ci_monitor.report_redactor()(view))
                 if what == "pipeline":
-                    return self._json(server.ci_monitor.detail(
+                    view = server.ci_monitor.detail(
                         _q(self.path, "repository"), _q(self.path, "number"),
-                        **({"provider_url": _q(self.path, "provider_url")} if _q(self.path, "provider_url") is not None else {})))
+                        **({"provider_url": _q(self.path, "provider_url")} if _q(self.path, "provider_url") is not None else {}))
+                    view['diagnosis'] = r.ci_diagnosis(view.get('pipeline'),
+                        redact=server.ci_monitor.report_redactor())
+                    return self._json(view)
                 if what == "log":
                     return self._json(server.ci_monitor.log(
                         _q(self.path, "repository"), _q(self.path, "number"), _q(self.path, "step"),
@@ -2007,7 +2020,8 @@ def _make_handler(server, public=False, operator=False):
                 return self._json(r.record_ci_telemetry(validate_ci_telemetry(self._read_json())))
             body = self._read_json() or {}
             if resource == "ci" and len(parts) == 5 and parts[4] == "reports":
-                return self._json(r.ingest_ci_report(body))
+                redact = server.ci_monitor.report_redactor()
+                return self._json(redact(r.ingest_ci_report(body, redact=redact)))
             if resource == "ci" and len(parts) == 5 and parts[4] == "debug":
                 from ..errors import HerdrEngineeringError
                 from .ci_debug import debug_ci
@@ -2673,6 +2687,75 @@ def _tests_view() -> dict[str, Any]:
 
 _FEED_SERVICE_FIELDS = ("service_id", "service_name", "host_id", "source_port", "session_id",
                         "discovery_source", "verified_origin", "ownership", "listener_identity")
+
+
+def _ci_reports_query(path):
+    from urllib.parse import parse_qs, urlsplit
+
+    from .ci_reports import normalize_provider_url
+    from .redact import redact_text
+
+    query = parse_qs(urlsplit(path).query, keep_blank_values=True, max_num_fields=8)
+    identity = {'provider_url', 'provider_repo_id', 'repository', 'run_number'}
+    if set(query) - (identity | {'compact'}) or any(len(v) != 1 for v in query.values()):
+        raise ValueError('Invalid CI report filters')
+    values = {key: value[0] for key, value in query.items()}
+    if any(not value or len(value) > 500 or not value.isprintable() or redact_text(value) != value
+           for value in values.values()):
+        raise ValueError('Invalid CI report filter')
+    if values.get('compact', '0') not in ('0', '1'):
+        raise ValueError('Invalid compact report option')
+    run = {key: value for key, value in values.items() if key in identity}
+    if run:
+        if set(run) != identity or not run['run_number'].isdigit() or int(run['run_number']) < 1:
+            raise ValueError('Exact CI report run identity is required')
+        run['provider_url'] = normalize_provider_url(run['provider_url'])
+        run['run_number'] = int(run['run_number'])
+    return {'compact': values.get('compact') == '1', 'run': run or None}
+
+
+def _ci_observability_query(path, route):
+    from urllib.parse import parse_qs, urlsplit
+
+    from .ci_reports import normalize_provider_url
+    from .redact import redact_text
+
+    query = parse_qs(urlsplit(path).query, keep_blank_values=True, max_num_fields=16)
+    allowed = {'days', 'repository', 'branch', 'provider_url', 'provider_repo_id',
+               'scope', 'start', 'end', 'mode', 'run_number'} | ({'test'} if route == 'tests' else set())
+    if set(query) - allowed or any(len(values) != 1 for values in query.values()):
+        raise ValueError('Invalid CI filters')
+    filters = {key: values[0] for key, values in query.items() if values[0] != ''}
+    for value in filters.values():
+        if len(value) > 500 or not value.isprintable() or redact_text(value) != value:
+            raise ValueError('Invalid CI filter')
+    days = filters.get('days', '14')
+    if days not in ('7', '14', '30'):
+        raise ValueError('CI days must be 7, 14 or 30')
+    filters['days'] = int(days)
+    if filters.get('mode', 'days') not in ('days', 'runs', 'hours'):
+        raise ValueError('Invalid CI window mode')
+    if 'run_number' in filters:
+        number = filters['run_number']
+        if (filters.get('mode') != 'runs' or not number.isascii() or not number.isdigit() or
+                not 0 < int(number) <= 2**63 - 1 or
+                not all(filters.get(key) for key in ('provider_url', 'provider_repo_id', 'repository'))):
+            raise ValueError('CI run selection requires a valid run and exact project identity')
+        filters['run_number'] = int(number)
+    if filters.get('scope', 'all') not in ('all', 'default', 'pr'):
+        raise ValueError('CI scope must be all, default or pr')
+    if 'start' in filters or 'end' in filters:
+        from datetime import datetime
+
+        try:
+            bounds = [datetime.fromisoformat(filters[key].replace('Z', '+00:00')) for key in ('start', 'end')]
+            if any(value.tzinfo is None for value in bounds) or bounds[0] >= bounds[1]:
+                raise ValueError()
+        except (KeyError, ValueError):
+            raise ValueError('CI bucket requires ordered start and end timestamps with time zones') from None
+    if 'provider_url' in filters:
+        filters['provider_url'] = normalize_provider_url(filters['provider_url'])
+    return filters
 
 
 def _q(path, key):

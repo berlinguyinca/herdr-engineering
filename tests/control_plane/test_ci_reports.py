@@ -345,12 +345,23 @@ def test_monitor_reports_history_failure_and_recovers_against_real_provider_serv
     from herdr_engineering.ci import WoodpeckerProvider
     from herdr_engineering.control_plane.ci_monitor import CIMonitor
 
+    requests = []
+    history_mode = [False]
+
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
+            requests.append(self.path)
             if self.path.startswith('/api/user/repos'):
                 body = [{'id': 17, 'full_name': 'org/app'}]
             elif self.path.startswith('/api/repos/17/pipelines'):
                 body = [{'id': 1, 'number': 1, 'status': 'success', 'branch': 'main', 'commit': 'abc'}]
+                if history_mode[0]:
+                    from urllib.parse import parse_qs, urlsplit
+                    query = parse_qs(urlsplit(self.path).query)
+                    page, per_page = int(query.get('page', ['1'])[0]), int(query.get('perPage', ['50'])[0])
+                    rows = [{'id': n, 'number': n, 'status': 'success', 'branch': 'main',
+                             'commit': 'abc', 'created': 1792627200 + n} for n in range(75, 0, -1)]
+                    body = rows[(page - 1) * per_page:page * per_page]
             else:
                 body = []
             value = json.dumps(body).encode()
@@ -391,6 +402,22 @@ def test_monitor_reports_history_failure_and_recovers_against_real_provider_serv
         assert monitor.snapshot(start=False)['status'] == 'connected'
         assert repo.ci_reports()['pipelines'][0]['state'] == 'success'
         assert len(disk_event_journal.events()) == 1
+        history_mode[0] = True
+        requests.clear()
+        monitor._history.refresh()
+        full = monitor.history(start=False)
+        compact = monitor.summary_snapshot(start=False)
+        assert compact['projects'][0]['pipeline_count'] == 75
+        assert len(requests) == 6  # inventory, two pages, three validation reads
+        assert len(json.dumps(compact)) < len(json.dumps(full)) / 10
+        requests.clear()
+        monitor._history.refresh()
+        assert len(requests) == 2  # inventory and unchanged head only
+        requests.clear()
+        for _ in range(10):
+            assert monitor.summary_snapshot(start=False)['revision'] == compact['revision']
+        assert requests == []
+        assert len(disk_event_journal.events()) == 1  # backfill never writes reports
     finally:
         monitor.close()
         httpd.shutdown()
@@ -433,3 +460,404 @@ def test_late_pipeline_binding_reconciles_retry_ordinals_without_rewriting_uploa
     restored = ControlPlaneRepo()
     restored.import_state(repo.export_state())
     assert [row['attempt'] for row in restored.ci_reports()['reports']] == [3, 2, 1]
+
+
+HISTORY_STAMP = '2026-10-25T12:00:00+00:00'
+
+
+def history_repo(**kwargs):
+    from datetime import datetime
+    return ControlPlaneRepo(now=lambda: datetime.fromisoformat(HISTORY_STAMP).timestamp(), **kwargs)
+
+
+def history_report(*, failed=False, **values):
+    return {**report(), 'provider_url': 'https://ci.example', 'reported_at': HISTORY_STAMP,
+            'xml': '<testsuite><testcase classname="Checks" name="works" time="2">' +
+                   ('<failure message="token=synthetic-private">stack</failure>' if failed else '') +
+                   '</testcase></testsuite>', **values}
+
+
+def test_history_preserves_retries_and_api_shape_through_journal_replay(disk_event_journal):
+    from herdr_engineering.control_plane.bridge import load_into
+    repo = history_repo(sink=disk_event_journal)
+    failed = repo.ingest_ci_report(history_report(failed=True))
+    repo.ingest_ci_report(history_report())
+    repo.ingest_ci_report(history_report(failed=True))
+    before = repo.ci_reports()
+    history = repo.ci_test_history(repository='org/app', branch='main')
+    assert history['tests'][0]['classification'] == 'proven_flaky'
+    assert history['tests'][0]['failed'] == history['tests'][0]['passed'] == 1
+    assert history['scope']['persistence'] == 'durable_sink'
+    assert history['scope']['memory_only'] is False
+    assert repo.ci_reports() == before
+    restored = history_repo(sink=disk_event_journal)
+    load_into(restored, disk_event_journal)
+    assert restored.ci_test_history(repository='org/app', branch='main') == history
+    assert restored.ingest_ci_report(history_report(failed=True))['report_id'] == failed['report_id']
+    assert len(disk_event_journal.events()) == 2
+    assert 'synthetic-private' not in str(disk_event_journal.events())
+    backup = history_repo(sink=disk_event_journal)
+    backup.import_state(restored.export_state())
+    assert backup.ci_test_history(repository='org/app', branch='main') == history
+
+
+def test_history_legacy_provider_binding_requires_one_exact_full_identity():
+    repo = history_repo()
+    body = history_report(provider_url=None, provider_repo_id=None)
+    repo.ingest_ci_report(body)
+    assert repo.ci_test_history()['tests'] == []
+    observed = {key: value for key, value in history_report().items() if key != 'xml'}
+    observed['created_at'] = HISTORY_STAMP
+    repo.observe_ci_pipeline({**observed, 'state': 'success'})
+    assert len(repo.ci_test_history()['tests']) == 1
+    repo.observe_ci_pipeline({**observed, 'provider_url': 'https://other.example', 'state': 'failure'})
+    assert len(repo.ci_reports()['pipelines']) == 2
+    view = repo.ci_test_history()
+    assert view['tests'] == []
+    assert view['scope']['unjoined_report_count'] == 1
+    assert view['scope']['not_reported_run_count'] == 2
+
+
+def test_explicit_provider_urls_distinguish_reports_and_attempts():
+    repo = history_repo()
+    first = repo.ingest_ci_report(history_report(failed=True))
+    second = repo.ingest_ci_report(history_report(failed=True, provider_url='https://other.example'))
+    assert first['report_id'] != second['report_id']
+    assert first['attempt'] == second['attempt'] == 1
+    assert {r['attempt'] for r in repo.ci_reports()['reports']} == {1}
+    rows = repo.ci_test_history()['tests']
+    assert len(rows) == 2
+    assert {row['provider_url'] for row in rows} == {'https://ci.example', 'https://other.example'}
+
+
+@pytest.mark.parametrize('url', ['https://user:synthetic-private@ci.example',
+                                 'https://ci.example?access_token=synthetic-private',
+                                 'file:///tmp/report', 'https://ci.example:invalid'])
+def test_provider_url_rejects_unsafe_identity_before_journaling(url, disk_event_journal):
+    repo = history_repo(sink=disk_event_journal)
+    with pytest.raises(ValueError, match='provider_url'):
+        repo.ingest_ci_report(history_report(provider_url=url))
+    assert repo.ci_reports()['reports'] == []
+
+
+def test_junit_file_identity_and_evidence_are_bounded_and_redacted():
+    xml = '<testsuite><testcase name="same" file="a.py"><failure message="' + 'm' * 2500 + '">' + 'x' * 4500 + '</failure></testcase><testcase name="same" file="b.py"/></testsuite>'
+    first = parse_junit(xml)['tests']
+    reordered = parse_junit('<testsuite><testcase name="same" file="b.py"/><testcase name="same" file="a.py"/></testsuite>')['tests']
+    assert first[0]['file'] == 'a.py'
+    assert first[0]['id'] == reordered[1]['id']
+    assert first[1]['id'] == reordered[0]['id']
+    assert len(first[0]['message']) == 2000 and len(first[0]['trace']) == 4000
+
+
+def test_explicit_provider_url_constrains_optional_repository_id_matching():
+    repo = history_repo()
+    repo.ingest_ci_report(history_report(provider_repo_id=None))
+    repo.observe_ci_pipeline(dict(repository='org/app', provider_url='https://other.example',
+        provider_repo_id=18, run_number=1, branch='main', revision='abc', state='success'))
+    assert repo.ci_reports()['reports'][0]['identity_status'] == 'unmatched'
+    assert repo.ci_test_history()['tests'] == []
+
+
+def test_secret_provider_id_is_redacted_before_durable_report_storage(disk_event_journal):
+    repo = history_repo(sink=disk_event_journal)
+    repo.ingest_ci_report(history_report(provider_repo_id='token=synthetic-private'))
+    assert 'synthetic-private' not in str(disk_event_journal.events())
+    assert repo.ci_test_history()['tests'] == []
+
+
+def test_unjoined_report_count_obeys_repository_branch_and_time_window():
+    repo = history_repo()
+    for number, values in enumerate(({}, {'branch': 'topic'}, {'repository': 'other/app'},
+                                    {'reported_at': '2026-09-01T00:00:00Z'}), 1):
+        repo.ingest_ci_report(history_report(provider_url=None, run_number=number, **values))
+    view = repo.ci_test_history(repository='org/app', branch='main', days=7)
+    assert view['scope']['unjoined_report_count'] == 1
+
+
+def test_provider_collisions_survive_disk_replay_without_losing_runs(disk_event_journal):
+    from herdr_engineering.control_plane.bridge import load_into
+    repo = history_repo(sink=disk_event_journal)
+    for url in ('https://ci.example', 'https://other.example'):
+        body = history_report(provider_url=url)
+        repo.ingest_ci_report(body)
+        repo.observe_ci_pipeline({key: value for key, value in body.items() if key != 'xml'})
+    restored = history_repo(sink=disk_event_journal)
+    load_into(restored, disk_event_journal)
+    assert len(restored.ci_reports()['pipelines']) == 2
+    assert len(restored.ci_test_history()['tests']) == 2
+    assert restored.ci_test_history() == repo.ci_test_history()
+
+
+def duplicate_label_xml(reverse=False):
+    cases = ['<testcase classname="Checks" name="same"/>',
+             '<testcase classname="Checks" name="same"><failure>bad</failure></testcase>']
+    return '<testsuite name="unit">' + ''.join(reversed(cases) if reverse else cases) + '</testsuite>'
+
+
+def test_duplicate_labels_preserve_ambiguity_through_durable_history(disk_event_journal):
+    from herdr_engineering.control_plane.bridge import load_into
+    repo = history_repo(sink=disk_event_journal)
+    for reverse in (False, True):
+        receipt = repo.ingest_ci_report(history_report(xml=duplicate_label_xml(reverse)))
+        assert all(case.get('identity_ambiguous') is True for case in receipt['tests'])
+    restored = history_repo(sink=disk_event_journal)
+    load_into(restored, disk_event_journal)
+    rows = restored.ci_test_history()['tests']
+    assert len(rows) == 2
+    assert {row['classification'] for row in rows} == {'inconsistent_outcomes'}
+    assert all(row['identity_ambiguous'] and not row['same_revision_retries'] for row in rows)
+    assert all(row['passed'] == row['failed'] == 1 for row in rows)
+
+
+def test_observation_key_upgrade_replaces_legacy_run_and_survives_replay(disk_event_journal):
+    from herdr_engineering.control_plane.bridge import load_into
+    legacy = history_repo(sink=disk_event_journal)
+    row = {key: value for key, value in history_report().items() if key != 'xml'}
+    legacy.record_event('ci_observation', '17:1', 'CIPipelineObserved',
+                        {**row, 'state': 'running'}, require_durable=True)
+    upgraded = history_repo(sink=disk_event_journal)
+    upgraded.import_state(legacy.export_state())
+    upgraded.observe_ci_pipeline({**row, 'state': 'success'})
+    upgraded.observe_ci_pipeline({**row, 'state': 'success'})
+    assert upgraded.ci_reports()['pipelines'] == [{**row, 'state': 'success'}]
+    assert upgraded.ci_reports()['scope']['pipeline_count'] == 1
+    upgraded.observe_ci_pipeline({**row, 'provider_url': 'https://other.example', 'state': 'failure'})
+    restored = history_repo(sink=disk_event_journal)
+    load_into(restored, disk_event_journal)
+    rows = restored.ci_reports()['pipelines']
+    assert {(item['provider_url'], item['state']) for item in rows} == {
+        ('https://ci.example', 'success'), ('https://other.example', 'failure')}
+    assert len(rows) == 2
+    assert len(disk_event_journal.events()) == 3
+
+
+@pytest.mark.parametrize('kind', ['ci_report', 'ci_observation'])
+def test_source_eviction_remains_visible_after_projection_and_restore(kind, monkeypatch, disk_event_journal):
+    from herdr_engineering.control_plane import ci_reports
+    from herdr_engineering.control_plane.bridge import load_into
+    monkeypatch.setattr(ci_reports, 'REPORT_LIMIT' if kind == 'ci_report' else 'PIPELINE_LIMIT', 1)
+    repo = history_repo(sink=disk_event_journal)
+    for number in (1, 2):
+        body = history_report(run_number=number)
+        if kind == 'ci_report':
+            repo.ingest_ci_report(body)
+        else:
+            repo.observe_ci_pipeline({key: value for key, value in body.items() if key != 'xml'})
+    backup = history_repo()
+    backup.import_state(repo.export_state())
+    restored = history_repo(sink=disk_event_journal)
+    load_into(restored, disk_event_journal)
+    for instance in (repo, backup, restored):
+        assert instance.ci_reports()['scope']['truncated'] is True
+        scope = instance.ci_test_history()['scope']
+        assert scope['source_truncated'] is True
+        assert scope['projection_truncated'] is False
+        assert scope['truncated'] is True and scope['partial'] is True
+
+
+@pytest.mark.parametrize('changes', [
+    {'provider_url': 'https://other.example'},
+    {'provider_url': None},
+    {'repository': 'other/app'},
+    {'provider_repo_id': 18},
+])
+def test_observation_upgrade_does_not_merge_unproven_legacy_identity(changes):
+    repo = history_repo()
+    row = {key: value for key, value in history_report().items() if key != 'xml'}
+    repo.record_event('ci_observation', '17:1', 'CIPipelineObserved',
+                      {**row, **changes, 'state': 'running'})
+    repo.observe_ci_pipeline({**row, 'state': 'success'})
+    rows = repo.ci_reports()['pipelines']
+    assert len(rows) == 2
+    assert {item['state'] for item in rows} == {'running', 'success'}
+    assert repo.ci_reports()['scope']['truncated'] is False
+
+
+def test_observation_upgrade_does_not_discard_legacy_run_if_persistence_fails(disk_event_journal, tmp_path):
+    repo = history_repo(sink=disk_event_journal)
+    row = {key: value for key, value in history_report().items() if key != 'xml'}
+    repo.record_event('ci_observation', '17:1', 'CIPipelineObserved', {**row, 'state': 'running'})
+    journal = tmp_path / 'journal.jsonl'
+    journal.rename(tmp_path / 'journal.saved')
+    journal.mkdir()
+    with pytest.raises(IsADirectoryError):
+        repo.observe_ci_pipeline({**row, 'state': 'success'})
+    assert repo.ci_reports()['pipelines'] == [{**row, 'state': 'running'}]
+    journal.rmdir()
+    (tmp_path / 'journal.saved').rename(journal)
+    repo.observe_ci_pipeline({**row, 'state': 'success'})
+    assert repo.ci_reports()['pipelines'] == [{**row, 'state': 'success'}]
+    assert repo.ci_reports()['scope']['truncated'] is False
+
+
+def test_byte_eviction_is_source_truncation_even_below_the_report_count_limit(monkeypatch):
+    from herdr_engineering.control_plane import ci_reports
+    repo = history_repo()
+    repo.ingest_ci_report(history_report())
+    # A byte cap smaller than one existing event must evict that report even
+    # though the repository is far below the count cap.
+    monkeypatch.setattr(ci_reports, 'HISTORY_BYTES', 1)
+    repo.ingest_ci_report(history_report(run_number=2))
+    assert repo.ci_reports()['reports'] == []
+    scope = repo.ci_test_history()['scope']
+    assert scope['truncated'] is True and scope['source_truncated'] is True
+    assert scope['projection_truncated'] is False
+
+
+def test_exact_redaction_precedes_parser_limits_without_changing_case_identity():
+    from herdr_engineering.control_plane.ci_monitor import _credential_redactor
+
+    credential = 'Ω9q7V2m4R8t6N3p5L1w0'
+    raw = 'x' * 493 + credential
+    xml = (f'<testsuite><testcase name="{raw}"/><testcase name="{raw.replace(credential, "[REDACTED]")}"/>'
+           '</testsuite>')
+    original = parse_junit(xml)
+    protected = parse_junit(xml, redact=_credential_redactor(credential))
+    assert [row['id'] for row in protected['tests']] == [row['id'] for row in original['tests']]
+    assert protected['tests'][0]['id'] != protected['tests'][1]['id']
+    assert protected['tests'][0]['name'] == protected['tests'][1]['name']
+    assert all('Ω' not in row['name'] and len(row['name']) <= 500 for row in protected['tests'])
+
+
+@pytest.mark.parametrize('url', ['https://opaque-provider-credential.example',
+                                 'https://ci.example/opaque-provider-credential'])
+def test_provider_url_rejects_exact_credential_before_persistence(url, disk_event_journal, tmp_path):
+    from herdr_engineering.control_plane.ci_monitor import _credential_redactor
+
+    repo = history_repo(sink=disk_event_journal)
+    with pytest.raises(ValueError, match='provider_url'):
+        repo.ingest_ci_report(history_report(provider_url=url),
+                              redact=_credential_redactor('opaque-provider-credential'))
+    assert repo.ci_reports()['reports'] == []
+    assert not (tmp_path / 'journal.jsonl').exists()
+
+
+@pytest.mark.parametrize('encoding', ['utf-16le', 'utf-16be'])
+def test_junit_rejects_nul_interleaved_dtd_entities(encoding, disk_event_journal, tmp_path):
+    xml = '<!DOCTYPE testsuite [<!ENTITY secret "expanded">]><testsuite><testcase name="&secret;"/></testsuite>'
+    disguised = xml.encode(encoding).decode('latin-1')
+    repo = history_repo(sink=disk_event_journal)
+    with pytest.raises(ValueError, match='JUnit'):
+        repo.ingest_ci_report(history_report(xml=disguised))
+    assert repo.ci_reports()['reports'] == []
+    assert not (tmp_path / 'journal.jsonl').exists()
+
+
+@pytest.mark.parametrize('xml', ['<testsuite>\ud800</testsuite>',
+                                 '<testsuite>\udfff</testsuite>',
+                                 '<testsuite/>\x00'])
+def test_junit_invalid_unicode_is_a_safe_validation_error(xml):
+    with pytest.raises(ValueError, match='JUnit'):
+        parse_junit(xml)
+
+
+@pytest.fixture(params=[0, 1, 2, 3], ids=['single-file-case', 'duplicate-labels-different-files',
+                                        'redacted-label', 'truncated-label'])
+def baseline_report(request):
+    import json
+    from pathlib import Path
+
+    # Frozen output from the pre-file-identity parser at 770fe01, not regenerated
+    # by the implementation under test. Baseline receipts retained no file data.
+    data = json.loads((Path(__file__).parent / 'fixtures/ci_reports_baseline.json').read_text())
+    return data['reports'][request.param]
+
+
+def test_imported_baseline_receipt_remains_idempotent(baseline_report, disk_event_journal):
+    from herdr_engineering.control_plane.bridge import load_into
+
+    receipt = baseline_report['receipt']
+    baseline = history_repo(sink=disk_event_journal)
+    baseline.record_event('ci_report', receipt['report_id'], 'CITestReportReceived', receipt)
+    restored = history_repo(sink=disk_event_journal)
+    restored.import_state(baseline.export_state())
+    replayed = history_repo(sink=disk_event_journal)
+    load_into(replayed, disk_event_journal)
+    for repo in (restored, replayed):
+        before = repo.export_state()
+        for _ in range(2):
+            assert repo.ingest_ci_report(baseline_report['body']) == receipt
+        assert repo.export_state() == before
+        assert repo.ci_reports()['scope']['report_count'] == 1
+        assert repo.ci_reports()['reports'][0]['attempt'] == 1
+    assert len(disk_event_journal.events()) == 1
+
+
+@pytest.mark.parametrize('changes', [
+    {'provider_url': 'https://ci.example'}, {'provider_repo_id': 18},
+    {'provider_repo_id': '17'}, {'provider_repo_id': None},
+    {'repository': 'other/app'}, {'run_number': 2}, {'branch': 'topic'}, {'revision': 'abcd'},
+    {'xml': '<testsuite name="unit"><testcase name="works" classname="Checks" file="tests/a.py" time="2"/></testsuite>'},
+    {'xml': '<testsuite name="unit"><testcase name="other" classname="Checks" file="tests/a.py" time="1"/></testsuite>'},
+])
+def test_baseline_receipt_does_not_match_changed_identity_or_evidence(baseline_report, changes):
+    receipt = baseline_report['receipt']
+    repo = history_repo()
+    repo.record_event('ci_report', receipt['report_id'], 'CITestReportReceived', receipt)
+    uploaded = repo.ingest_ci_report({**baseline_report['body'], **changes})
+    assert uploaded['report_id'] != receipt['report_id']
+    assert len(repo.ci_reports()['reports']) == 2
+
+
+def test_baseline_hash_alone_cannot_reconcile_modified_receipt(baseline_report):
+    import copy
+
+    receipt = copy.deepcopy(baseline_report['receipt'])
+    receipt['tests'][0]['name'] = 'different retained evidence'
+    repo = history_repo()
+    repo.record_event('ci_report', receipt['report_id'], 'CITestReportReceived', receipt)
+    uploaded = repo.ingest_ci_report(baseline_report['body'])
+    assert uploaded['report_id'] != receipt['report_id']
+    assert len(repo.ci_reports()['reports']) == 2
+
+
+@pytest.mark.parametrize('original_has_file', [False, True])
+def test_new_file_identities_never_fall_back_to_legacy_matching(baseline_report, original_has_file):
+    body = {**baseline_report['body']}
+    if not original_has_file:
+        body['xml'] = body['xml'].replace(' file="tests/a.py"', '').replace(' file="tests/b.py"', '')
+    repo = history_repo()
+    first = repo.ingest_ci_report(body)
+    changed = repo.ingest_ci_report({**body, 'xml': baseline_report['body']['xml'].replace('tests/a.py', 'tests/other.py')})
+    assert first['report_id'] != changed['report_id']
+    assert first['tests'][0]['id'] != changed['tests'][0]['id']
+    assert repo.ingest_ci_report(body) == first
+    assert len(repo.ci_reports()['reports']) == 2
+
+
+def test_legacy_matching_uses_raw_labels_not_redacted_or_truncated_display(baseline_report):
+    receipt = baseline_report['receipt']
+    body = baseline_report['body']
+    changed_xml = (body['xml'].replace('works', 'different').replace('synthetic-one', 'synthetic-two')
+                   .replace('x' * 510 + 'A', 'x' * 510 + 'B'))
+    repo = history_repo()
+    repo.record_event('ci_report', receipt['report_id'], 'CITestReportReceived', receipt)
+    uploaded = repo.ingest_ci_report({**body, 'xml': changed_xml})
+    assert uploaded['report_id'] != receipt['report_id']
+    assert len(repo.ci_reports()['reports']) == 2
+
+
+def test_pre_version_file_aware_receipts_keep_their_hashes(baseline_report):
+    repo = history_repo()
+    receipt = repo.ingest_ci_report(baseline_report['body'])
+    receipt.pop('identity_version')
+    previous = history_repo()
+    previous.record_event('ci_report', receipt['report_id'], 'CITestReportReceived', receipt)
+    restored = history_repo()
+    restored.import_state(previous.export_state())
+    before = restored.export_state()
+    assert restored.ingest_ci_report(baseline_report['body']) == receipt
+    assert restored.export_state() == before
+
+
+@pytest.mark.parametrize('declaration', ['<!DOCTYPE testsuite>',
+    '<!DOCTYPE testsuite SYSTEM "file:///must-not-read">',
+    '<!DOCTYPE testsuite [<!ENTITY secret "expanded">]>'])
+def test_junit_parser_boundary_rejects_declarations_without_text_prescan(declaration):
+    class WithoutPrescan(str):
+        def upper(self):
+            return ''
+
+    with pytest.raises(ValueError, match='JUnit DTD'):
+        parse_junit(WithoutPrescan(declaration + '<testsuite/>'))

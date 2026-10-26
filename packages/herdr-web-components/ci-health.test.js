@@ -6,17 +6,37 @@ const repo=(id=1,extra={})=>({id,repository:`org/app${id}`,default_branch:'main'
 const run=(n,state='success',extra={})=>({provider_repo_id:1,provider_url:'https://ci.example',repository:'org/app1',run_number:n,branch:'main',state,created_at:'2026-10-22T12:00:00Z',...extra});
 const expandedTree=m=>({expanded:new Set(m.selectedRows.flatMap(row=>[row.projectKey,JSON.stringify([row.projectKey,row.pr?`pr:${row.pr.number}`:row.isPr?'pr:unknown':`branch:${row.branch||''}`])]))});
 const history=(pipelines=[],extra={})=>({repos:[repo()],pipelines,coverage:{'1':{exhausted:true}},...extra});
-test('hours cover exact trailing24h split at UTC boundaries including both partial cells',()=>{
+test('hours use stable UTC bounds intersected with the exact trailing24h window',()=>{
  const m=ciHealthModel(history([run(1,'failure',{created_at:'2026-10-21T12:30:00Z'}),run(2,'success',{created_at:'2026-10-21T12:29:59Z'}),run(3,'success',{created_at:'2026-10-22T12:30:01Z'})]),{mode:'hours'},now);
- assert.equal(m.buckets.length,25);assert.equal(m.buckets[0].start,now-86400000);assert.equal(m.buckets.at(-1).end,now);
+ assert.equal(m.buckets.length,25);assert.equal(m.buckets[0].start,Date.parse('2026-10-21T12:00:00Z'));assert.equal(m.buckets.at(-1).end,Date.parse('2026-10-22T13:00:00Z'));
  assert.equal(m.projects[0].runs.length,1);assert.equal(m.projects[0].cells[0].counts.failure,1);
- assert.equal(ciHealthModel(history(),{mode:'hours'},Date.parse('2026-10-22T12:00Z')).buckets.length,24);
+ const boundary=ciHealthModel(history([run(4)]),{mode:'hours'},Date.parse('2026-10-22T12:00Z'));
+ assert.equal(boundary.buckets.length,25);assert.deepEqual(boundary.projects[0].cells.at(-1).runs.map(r=>r.run_number),[4]);
+ assert.equal(boundary.projects[0].cells.at(-2).counts.total,0);
 });
 test('calendar modes include UTC today and last-runs ignores date cutoff after filters',()=>{
  for(const mode of ['7','14','30']) {const m=ciHealthModel(history(),{mode},now);assert.equal(m.buckets.length,+mode);assert.equal(m.buckets.at(-1).label,'2026-10-22');}
  const old=Array.from({length:30},(_,i)=>run(i,'success',{created_at:`2025-01-${String(i%28+1).padStart(2,'0')}T12:00:00Z`,branch:i<5?'other':'main'}));
  const m=ciHealthModel(history(old),{mode:'runs'},now);assert.equal(m.projects[0].runs.length,24);assert.equal(m.projects[0].cells.length,24);assert.equal(m.projects[0].cells.at(-1).runs.length,1);
  const sparse=ciHealthModel(history([old[5]]),{mode:'runs'},now);assert.equal(sparse.projects[0].cells[0].runs.length,0);assert.equal(sparse.projects[0].cells.at(-1).runs.length,1);
+});
+test('selected current UTC day keeps calendar bounds and includes new runs after refresh',()=>{
+ const data=history([run(1,'failure',{created_at:'2026-10-22T12:00:00Z'}),run(2,'success',{created_at:'2026-10-22T13:00:00Z'}),run(3,'success',{created_at:'2026-10-23T00:00:00Z'})]);
+ for(const mode of ['7','14','30']) {
+  const first=ciHealthModel(data,{mode},now),project=first.projects[0],cell=project.cells.at(-1);
+  assert.deepEqual(cell.runs.map(r=>r.run_number),[1]);
+  assert.equal(cell.start,Date.parse('2026-10-22T00:00:00Z'));
+  assert.equal(cell.end,Date.parse('2026-10-23T00:00:00Z'));
+  const selection={projectKey:project.key,bucketKey:cell.key};
+  const refreshed=ciHealthModel(data,{mode,selection},Date.parse('2026-10-22T14:00:00Z'));
+  assert.deepEqual(refreshed.selectedRows.map(r=>r.run_number),[1,2]);
+  assert.equal(refreshed.projects[0].cells.at(-1).end,cell.end);
+  const midnight=ciHealthModel(data,{mode,selection},Date.parse('2026-10-23T00:00:00Z'));
+  assert.deepEqual(midnight.selectedRows.map(r=>r.run_number),[1,2]);
+  assert.deepEqual(midnight.projects[0].cells.at(-1).runs.map(r=>r.run_number),[3]);
+  const tomorrow=ciHealthModel(data,{mode,selection},Date.parse('2026-10-23T01:00:00Z'));
+  assert.deepEqual(tomorrow.selectedRows.map(r=>r.run_number),[1,2]);
+ }
 });
 test('deduplicates provider identities without conflating providers or repository ids',()=>{
  const m=ciHealthModel(history([run(1,'running'),run(1,'success'),run(1,'failure',{provider_url:'https://other'}),run(1,'failure',{provider_repo_id:2,repository:'org/app2'})],{repos:[repo(),repo(1,{provider_url:'https://other'}),repo(2)]}),{scope:'all'},now);
@@ -96,7 +116,7 @@ test('run buttons expose reported duration and PR metadata without inventing rol
 });
 test('partial-hour keys and exact-count disclosure stay stable through polling',()=>{
  const first=ciHealthModel(history(),{mode:'hours'},now),next=ciHealthModel(history(),{mode:'hours'},now+5000);
- assert.deepEqual(next.buckets.map(b=>b.key),first.buckets.map(b=>b.key));
+ assert.deepEqual(next.buckets,first.buckets);
  const html=renderCiHeatmap(first);assert.match(html,/data-health-disclosure="exact-counts"/);assert.equal((html.match(/data-health-grid-scroll/g)||[]).length,2);
 });
 test('missing timestamps keep coverage incomplete while newer contiguous coverage can remain complete',()=>{
