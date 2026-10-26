@@ -31,20 +31,7 @@ SUPPORTED_CONTRACT_VERSIONS = frozenset({1, 2, 3})
 _COMPLETE_STATUSES = frozenset({"completed", "complete", "done", "success", "succeeded"})
 _FAILED_STATUSES = frozenset({"failed", "error", "cancelled", "canceled"})
 
-# Observability fields mapped onto the mission envelope (issue #28 stall-field
-# names). Only present, non-null values are copied so missing fields stay
-# ``None`` on the server rather than being fabricated.
-_OBSERVABILITY_FIELDS = (
-    "lastHeartbeatAt",
-    "lastOutputAt",
-    "lastMeaningfulProgressAt",
-    "nextAction",
-    "nextActionAt",
-    "currentObjective",
-    "waitingReason",
-    "waitingSince",
-    "completionStatus",
-)
+
 
 
 class UnsupportedSnapshotVersion(ValueError):
@@ -89,25 +76,22 @@ def snapshot_to_envelopes(doc: dict) -> list[dict]:
             continue
         payload: dict[str, Any] = {
             "title": mission.get("title") or mid,
-            "goal": mission.get("goal") or "",
+            # The mission ingest path reads ``purpose`` for the description; map
+            # the snapshot's goal there so the dashboard shows the intended
+            # outcome rather than an empty description.
+            "purpose": mission.get("goal") or "",
             "status": mission.get("status") or "",
             "stage": _stage_from_status(mission.get("status") or ""),
+            "cwd": mission.get("cwd"),
             "workflowClass": mission.get("workflowClass"),
             "riskProfile": mission.get("riskProfile"),
         }
-        # Observability is additive (v2+); copy present non-null stall fields.
-        obs = mission.get("observability") or {}
-        if isinstance(obs, dict):
-            for field in _OBSERVABILITY_FIELDS:
-                value = obs.get(field)
-                if value is not None:
-                    payload[field] = value
-            progress = obs.get("progress")
-            if isinstance(progress, dict) and progress.get("approximatePercent") is not None:
-                payload["progressPercent"] = progress["approximatePercent"]
-        # A stop block means the mission is complete/stalled.
-        if mission.get("stop"):
-            payload["stage"] = "complete"
+        # A durable stop blocks or pauses the mission (resume condition,
+        # preserved work); it does NOT mean the mission completed. Keep the
+        # status-derived stage so interrupted work is never presented as done.
+        # (Observability fields like lastHeartbeatAt live on the separate
+        # mission_activity.snapshot path, not the mission ingest envelope, so
+        # they are intentionally not emitted here.)
         envelopes.append({
             "source": "pi-engineering",
             "entity_type": "mission",

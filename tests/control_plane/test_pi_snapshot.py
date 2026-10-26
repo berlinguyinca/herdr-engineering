@@ -64,10 +64,9 @@ def test_snapshot_to_envelopes_maps_mission_fields():
     p = env["payload"]
     assert p["title"] == "Add health endpoint"
     assert p["stage"] == "implementation"  # in_progress -> implementation
-    # observability fields mapped through (issue #28 stall-field names)
-    assert p["lastHeartbeatAt"] == "2026-01-15T11:59:00.000Z"
-    assert p["lastMeaningfulProgressAt"] == "2026-01-15T11:58:00.000Z"
-    assert p["nextAction"] == "implement:Add endpoint"
+    # the snapshot goal is carried as the ingest ``purpose`` so the dashboard
+    # shows the intended outcome
+    assert p["purpose"] == "Expose a /healthz endpoint"
 
 
 def test_snapshot_to_envelopes_unsupported_version_raises():
@@ -97,6 +96,22 @@ def test_snapshot_to_envelopes_handles_absent_observability():
     # still produces a mission envelope with defaults, no crash
     assert envelopes[0]["entity_type"] == "mission"
     assert envelopes[0]["event_type"] == "mission.updated"
+
+
+def test_snapshot_to_envelopes_stopped_mission_stays_incomplete():
+    # A durable stop with a resume condition blocks/pauses the mission; it must
+    # NOT be presented as complete (codex P2).
+    doc = _load_fixture()
+    doc["missions"][0]["status"] = "in_progress"
+    doc["missions"][0]["stop"] = {
+        "reason": "awaiting_approval",
+        "attemptedRecoveries": 0,
+        "preservedWork": ["w"],
+        "resumeCondition": "approval granted",
+        "stoppedAt": "2026-01-15T12:00:00.000Z",
+    }
+    envelopes = snapshot_to_envelopes(doc)
+    assert envelopes[0]["payload"]["stage"] == "implementation"  # not complete
 
 
 def test_snapshot_to_envelopes_maps_complete_status_to_complete_stage():
