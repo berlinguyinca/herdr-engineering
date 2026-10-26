@@ -895,3 +895,16 @@ def test_resource_usage_projection_is_pruned_by_event_retention():
     a = repo.usage_analytics(mission_id="m1")
     assert a["resources"]["cpu"]["count"] == 1
     assert a["resources"]["cpu"]["total"] == 1.0
+
+
+def test_token_analytics_includes_cache_write_tokens():
+    """token_analytics (the legacy /api/v1/analytics/tokens path) must report
+    cache_write_tokens like the usage projection (codex P1)."""
+    repo = ControlPlaneRepo()
+    repo.record_token_usage_row({"project": "p", "model": "gpt", "schema": 2,
+                                 "request_id": "cw-2", "mission_id": "m1",
+                                 "cache_write_tokens": 7, "status": 200})
+    a = repo.token_analytics()
+    assert a["total"]["cache_write_tokens"] == 7
+    assert a["by_model"]["gpt"]["cache_write_tokens"] == 7
+    assert a["by_project"]["p"]["cache_write_tokens"] == 7

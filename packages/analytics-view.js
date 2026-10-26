@@ -71,11 +71,11 @@ function tokensPage({ tokens: t }) {
   const fmt = (n) => Number(n || 0).toLocaleString();
   const rows = (bucket) => Object.entries(bucket || {}).map(([k, u]) => `
       <tr data-key="${esc(k)}"><td>${esc(k)}</td><td>${fmt(u.requests)}</td><td>${fmt(u.input_tokens)}</td>
-      <td>${fmt(u.output_tokens)}</td><td>${fmt(u.reasoning_tokens)}</td><td>${fmt(u.failed)}</td></tr>`).join('');
+      <td>${fmt(u.output_tokens)}</td><td>${fmt(u.reasoning_tokens)}</td><td>${fmt(u.cache_write_tokens)}</td><td>${fmt(u.failed)}</td></tr>`).join('');
   const table = (title, bucket) => `<h3 style="margin-top:20px">${title}</h3>
     <table class="hd-table"><thead><tr><th></th><th>Requests</th><th>Input</th><th>Output</th>
-    <th>Reasoning</th><th>Failed</th></tr></thead><tbody>${rows(bucket) ||
-      '<tr><td colspan="6">No usage recorded yet.</td></tr>'}</tbody></table>`;
+    <th>Reasoning</th><th>Cache-write</th><th>Failed</th></tr></thead><tbody>${rows(bucket) ||
+      '<tr><td colspan="7">No usage recorded yet.</td></tr>'}</tbody></table>`;
   const total = t.total || {};
   return `<div class="hd-grid">
       <herdr-metric label="Requests" value="${fmt(total.requests)}"></herdr-metric>

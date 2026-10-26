@@ -2094,7 +2094,8 @@ class ControlPlaneRepo:
         when ``resolve_usage_session`` cannot place it; rows without a session id
         count only in the other groupings."""
         total = {"requests": 0, "input_tokens": 0, "output_tokens": 0,
-                 "reasoning_tokens": 0, "cache_read_tokens": 0, "failed": 0}
+                 "reasoning_tokens": 0, "cache_read_tokens": 0, "cache_write_tokens": 0,
+                 "failed": 0}
         by_project, by_model, by_day, by_session = {}, {}, {}, {}
         resolved = {}
 
@@ -2823,7 +2824,8 @@ def _percentile(sorted_values, pct):
 
 def _accumulate(bucket, p):
     bucket["requests"] += 1
-    for k in ("input_tokens", "output_tokens", "reasoning_tokens", "cache_read_tokens"):
+    for k in ("input_tokens", "output_tokens", "reasoning_tokens", "cache_read_tokens",
+              "cache_write_tokens"):
         bucket[k] += int(p.get(k) or 0)
     if not p.get("success", True):
         bucket["failed"] += 1
