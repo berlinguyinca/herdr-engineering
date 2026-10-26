@@ -739,7 +739,10 @@ def _cmd_cp_feed_pi(args) -> int:
         if not explicit_url:
             url = cfg.control_plane_url
         if not explicit_key:
-            api_key = cfg.api_key or host_value("ingest.api_key") or ""
+            # The refreshed config is authoritative, including an emptied key:
+            # do not fall back to the memoized startup value, or a credential
+            # explicitly removed from host config could never be cleared.
+            api_key = cfg.api_key or ""
 
     retry_delay = interval if interval > 0 else 1.0
     while True:
