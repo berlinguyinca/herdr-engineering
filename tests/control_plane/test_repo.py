@@ -426,3 +426,30 @@ def test_recent_events_preserves_distinct_events_with_duplicate_durable_sequence
     assert r.recent_events(1)[0]['sequence'] == 501
     assert [e['event_id'] for e in r.recent_events(10)[1:]] == [
         'fourth', 'third', 'second', 'other', 'first']
+
+
+def test_stage_analytics_percentiles_bottleneck_and_in_progress():
+    clock = {"t": 1_700_000_000.0}
+    r = repo.ControlPlaneRepo(now=lambda: clock["t"])
+    mid = r.create_mission("stage-a")
+    # implementation: 300ms, review: 600ms (bottleneck). The final 'complete'
+    # transition leaves that stage's run open (in_progress), so it is excluded
+    # from percentiles and stages.
+    r.set_mission_stage(mid, "implementation"); clock["t"] += 0.3
+    r.set_mission_stage(mid, "review");        clock["t"] += 0.6
+    r.set_mission_stage(mid, "complete");      clock["t"] += 0.1
+    # A second mission leaves its current stage open (in_progress).
+    mid2 = r.create_mission("stage-b")
+    r.set_mission_stage(mid2, "implementation"); clock["t"] += 0.2
+    r.set_mission_stage(mid2, "review")
+    a = r.stage_analytics()
+    assert a["bottleneck"] == "review"
+    assert a["stages"]["review"]["p50_ms"] == 600
+    assert a["stages"]["implementation"]["runs"] == 2
+    assert a["stages"]["implementation"]["p50_ms"] == 300
+    assert a["stages"]["implementation"]["p95_ms"] == 300  # nearest-rank of [200,300]
+    # 'complete' for mid and 'review' for mid2 remain open (in_progress).
+    assert "complete" not in a["stages"]
+    assert a["stages"]["review"]["runs"] == 1
+    assert mid in a["in_progress"] and a["in_progress"][mid] == ["complete"]
+    assert mid2 in a["in_progress"] and a["in_progress"][mid2] == ["review"]

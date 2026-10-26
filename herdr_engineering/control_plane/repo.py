@@ -13,6 +13,7 @@ durable Postgres/RustFS path (Phase 1 async stores) is bridged in deployment.
 from __future__ import annotations
 
 import copy
+import datetime as _dt
 import hashlib
 import json
 import logging
@@ -180,6 +181,9 @@ class ControlPlaneRepo:
         self._test_runs = {}
         self._reviews = {}
         self._pull_requests = {}
+        self._stage_runs = {}  # mission_key -> [open+closed stage runs, ...]
+        self._token_usage = {}  # request_id -> token usage record (issue #36)
+        self._resource_usage = {}  # (mission_id, kind) -> [resource usage record, ...]
         self._telemetry = {}  # host_id -> [sample, ...]
         self._events = {}  # (entity_type, entity_id) -> [event, ...]
         self._event_order = []  # (entity_type, entity_id, seq) chronological
@@ -345,6 +349,7 @@ class ControlPlaneRepo:
         m["updated_at"] = self._stamp()
         self.record_event("mission", key, "MissionStageChanged",
                           {"from": old, "to": stage}, mission_id=mission_id)
+        self._transition_stage(key, old, stage)
         self._mission_stage_changed(key, old, stage)
 
     def _mission_stage_changed(self, key, old, new):
@@ -356,6 +361,69 @@ class ControlPlaneRepo:
             outcomes.on_stage(key, old, new)
         except Exception:  # noqa: BLE001
             pass
+
+    def _transition_stage(self, mission_key, old, new):
+        """Record a stage run: close the open run (if any) and open the next.
+
+        Stage durations are derived purely from stage transitions (issue #37).
+        The first observed transition opens the incoming stage's run; a later
+        transition closes the previously open run (``ended_at``/``duration_ms``)
+        and opens the new one. A stage change that repeats the current stage is
+        a no-op so a re-emitted event never truncates an open run.
+        """
+        if old == new:
+            return
+        now = self._stamp()
+        runs = self._stage_runs.setdefault(mission_key, [])
+        if runs and runs[-1].get("ended_at") is None:
+            prev = runs[-1]
+            prev["ended_at"] = now
+            prev["duration_ms"] = max(0, int(
+                (self._epoch_ms(now) - self._epoch_ms(prev["started_at"]))))
+        runs.append({
+            "mission_id": mission_key, "stage": new,
+            "started_at": now, "ended_at": None, "duration_ms": None,
+        })
+
+    @staticmethod
+    def _epoch_ms(iso: str) -> int:
+        return int(_dt.datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp() * 1000)
+
+    def stage_analytics(self):
+        """p50/p95 duration per stage plus the bottleneck stage (issue #37).
+
+        Only closed runs contribute to percentiles; the currently open run of a
+        mission appears under ``in_progress`` and never in a percentile.
+        Bottleneck = stage with the largest total closed-run duration, ties
+        broken by stage name.
+        """
+        closed = {}   # stage -> [duration_ms, ...]
+        total = {}    # stage -> sum(duration_ms)
+        in_progress = {}
+        for mission, runs in self._stage_runs.items():
+            for run in runs:
+                stage = run.get("stage")
+                if run.get("ended_at") is None:
+                    in_progress.setdefault(mission, []).append(stage)
+                    continue
+                dur = run.get("duration_ms")
+                if dur is None:
+                    continue
+                closed.setdefault(stage, []).append(dur)
+                total[stage] = total.get(stage, 0) + dur
+        stages = {}
+        for stage, durations in closed.items():
+            srt = sorted(durations)
+            stages[stage] = {
+                "p50_ms": _percentile(srt, 50),
+                "p95_ms": _percentile(srt, 95),
+                "runs": len(durations),
+            }
+        bottleneck = None
+        if total:
+            bottleneck = max(sorted(total), key=lambda s: total[s])
+        return {"stages": stages, "bottleneck": bottleneck,
+                "in_progress": in_progress}
 
     # -------------------------------------------------------------- sessions
     def create_session(self, mission_id=None, agent_role="", model="",
@@ -2038,6 +2106,90 @@ class ControlPlaneRepo:
         return {"total": total, "by_project": by_project, "by_model": by_model,
                 "by_day": dict(sorted(by_day.items())), "by_session": by_session}
 
+    # -------------------------------------------------------------- usage (#36)
+    # Mission-scoped token and resource usage, idempotent on request_id, mirroring
+    # the token_usage / resource_usage tables. Missing fields stay None (never 0).
+    _TOKEN_COUNT_FIELDS = ("input_tokens", "output_tokens", "reasoning_tokens",
+                           "cache_read_tokens", "cache_write_tokens")
+
+    def add_token_usage(self, rec):
+        """Store one mission-scoped token usage record, idempotent on request_id."""
+        if not isinstance(rec, dict):
+            raise ValueError("token usage must be an object")
+        request_id = _usage_str(rec.get("request_id"), 128)
+        if not request_id:
+            request_id = new_id("tusage")
+        clean = {"request_id": request_id,
+                 "mission_id": _usage_id(rec.get("mission_id")),
+                 "session_id": _usage_id(rec.get("session_id")),
+                 "agent_id": _usage_id(rec.get("agent_id")),
+                 "host_id": _usage_id(rec.get("host_id")),
+                 "model": _usage_str(rec.get("model"), 256),
+                 "provider": _usage_str(rec.get("provider"), 128),
+                 "stage": _usage_str(rec.get("stage"), 128),
+                 "occurred_at": rec.get("occurred_at") or self._stamp(),
+                 "duration_ms": _usage_int(rec.get("duration_ms")),
+                 "retry_number": _usage_int(rec.get("retry_number")),
+                 "success": rec.get("success")
+                     if isinstance(rec.get("success"), bool) else None,
+                 "error_code": _usage_str(rec.get("error_code"), 256)}
+        for k in self._TOKEN_COUNT_FIELDS:
+            clean[k] = _usage_int(rec.get(k))
+        existing = self._token_usage.get(request_id)
+        if existing is not None:
+            return existing
+        self._token_usage[request_id] = clean
+        self.record_event("token_usage", request_id, "token_usage.recorded", clean,
+                          mission_id=clean["mission_id"], session_id=clean["session_id"])
+        return clean
+
+    def add_resource_usage(self, rec):
+        """Store one mission-scoped resource usage record."""
+        if not isinstance(rec, dict):
+            raise ValueError("resource usage must be an object")
+        mission_id = _usage_id(rec.get("mission_id"))
+        kind = _usage_str(rec.get("kind"), 128)
+        if not kind:
+            raise ValueError("resource kind is required")
+        clean = {"mission_id": mission_id, "kind": kind,
+                 "session_id": _usage_id(rec.get("session_id")),
+                 "value": rec.get("value"), "unit": _usage_str(rec.get("unit"), 32),
+                 "payload": rec.get("payload"),
+                 "occurred_at": rec.get("occurred_at") or self._stamp()}
+        if isinstance(clean["value"], bool) or not isinstance(clean["value"], (int, float)):
+            raise ValueError("resource value must be a number")
+        key = (mission_id, kind)
+        bucket = self._resource_usage.setdefault(key, [])
+        bucket.append(clean)
+        self.record_event("resource_usage", f"{mission_id}:{kind}:{len(bucket) - 1}",
+                          "resource_usage.recorded", clean, mission_id=mission_id,
+                          session_id=clean["session_id"])
+        return clean
+
+    def usage_analytics(self, mission_id=None):
+        """Tokens by model and resources by kind, optionally scoped to a mission."""
+        tokens_by_model = {}
+        token_totals = {}
+        for request_id, rec in self._token_usage.items():
+            if mission_id is not None and rec.get("mission_id") != mission_id:
+                continue
+            model = rec.get("model") or "unknown"
+            b = tokens_by_model.setdefault(model, {k: 0 for k in self._TOKEN_COUNT_FIELDS})
+            for k in self._TOKEN_COUNT_FIELDS:
+                b[k] += int(rec.get(k) or 0)
+            for k in self._TOKEN_COUNT_FIELDS:
+                token_totals[k] = token_totals.get(k, 0) + int(rec.get(k) or 0)
+        resources = {}
+        for (mid, kind), recs in self._resource_usage.items():
+            if mission_id is not None and mid != mission_id:
+                continue
+            for rec in recs:
+                b = resources.setdefault(kind, {"count": 0, "total": 0.0, "unit": rec.get("unit")})
+                b["count"] += 1
+                b["total"] += float(rec.get("value") or 0)
+        return {"tokens": {"by_model": tokens_by_model, "total": token_totals},
+                "resources": resources}
+
     # LLM page (docs/superpowers/specs/2026-10-23-llm-page-design.md, slice 2). Computed from
     # the retained raw records on each call, like ``token_analytics``; ``retained_since`` says
     # how far back they go and ``partial`` is true when the window starts before that.
@@ -2509,6 +2661,15 @@ def _usage_str(value, limit):
 def _usage_id(value):
     """Session/agent/mission ids: the gateway's metadata charset, else None."""
     return value if isinstance(value, str) and _USAGE_ID.match(value) else None
+
+
+def _percentile(sorted_values, pct):
+    """Nearest-rank percentile of an ascending list (pct in 0..100)."""
+    n = len(sorted_values)
+    if n == 0:
+        return None
+    idx = max(0, min(n - 1, int((pct / 100.0) * n)))
+    return sorted_values[idx]
 
 
 def _accumulate(bucket, p):
