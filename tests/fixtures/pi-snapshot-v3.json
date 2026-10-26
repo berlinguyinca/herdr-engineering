@@ -1,0 +1,330 @@
+{
+  "contractVersion": 3,
+  "generatedAt": "2026-10-14T12:00:00.000Z",
+  "missions": [
+    {
+      "id": "MSN-golden-nulls",
+      "revision": 3,
+      "title": "Nullable fields are null",
+      "goal": "Pin the null form of every nullable field",
+      "workflowClass": "engineering_review",
+      "status": "NEW",
+      "canonicalState": "CREATED",
+      "lifecycleSchemaVersion": 1,
+      "riskProfile": "medium",
+      "constraints": [],
+      "requiredGates": [],
+      "acceptanceCriteria": [],
+      "tasks": [
+        {
+          "id": "TSK-golden-nulls",
+          "kind": "agent",
+          "role": "implementer",
+          "status": "PENDING",
+          "objective": "Add /health",
+          "mutatesRepo": true,
+          "isolation": "worktree",
+          "dependsOn": [],
+          "reliability": {
+            "acceptanceIds": [],
+            "candidateGeneration": 0,
+            "missionGeneration": 0,
+            "fencingToken": 0
+          }
+        }
+      ],
+      "findings": [
+        {
+          "id": "F-golden-0",
+          "severity": "minor",
+          "status": "open",
+          "summary": "mission-level note without a task",
+          "taskId": null,
+          "repaired": false
+        }
+      ],
+      "observability": {
+        "progress": {
+          "approximatePercent": 40,
+          "verifiedComplete": false,
+          "basis": "weighted_dag"
+        },
+        "acceptanceCoverage": {
+          "completed": 1,
+          "total": 2,
+          "approximatePercent": 50
+        },
+        "workflowProgress": {
+          "completed": 1,
+          "total": 3,
+          "approximatePercent": 33,
+          "basis": "weighted_dag"
+        },
+        "health": "active",
+        "currentActivity": null,
+        "workers": {
+          "active": 1,
+          "waiting": 0,
+          "failed": 0
+        },
+        "lastMeaningfulProgressAt": null,
+        "completionStatus": "validating",
+        "progressHistory": [
+          {
+            "at": "2026-10-14T12:00:00.000Z",
+            "approximatePercent": 40,
+            "label": "executing"
+          }
+        ],
+        "tests": {
+          "running": false,
+          "completed": 10,
+          "total": 10,
+          "passed": 9,
+          "failed": 1,
+          "skipped": 0,
+          "failures": [
+            "suite > case"
+          ]
+        },
+        "review": {
+          "status": "running",
+          "blockingOpen": 0,
+          "findings": [
+            {
+              "id": "F-golden-0",
+              "severity": "minor",
+              "status": "open",
+              "summary": "mission-level note without a task",
+              "repaired": false
+            }
+          ]
+        },
+        "workerDetails": [],
+        "activity": [],
+        "errors": [],
+        "recovery": [],
+        "changes": {
+          "changedFiles": [
+            "src/handler.ts"
+          ],
+          "commits": [],
+          "integrationState": "pending"
+        },
+        "artifacts": [],
+        "action": "run_task",
+        "reason": "task ready",
+        "recoveryAttempt": {
+          "attempt": 0,
+          "maxAttempts": 3
+        },
+        "nextAction": "verify",
+        "nextActionAt": null,
+        "owner": null,
+        "repository": null,
+        "task": null,
+        "preservedWork": []
+      },
+      "specApproval": {
+        "phase": "drafting",
+        "revisionNumber": 1,
+        "semanticSpecHash": null,
+        "planHash": null,
+        "semanticRoundsUsed": 0,
+        "semanticRoundsLimit": 5,
+        "activeStage": null,
+        "activeStageDeadlineAt": null,
+        "overallDeadlineAt": null,
+        "approvalId": null,
+        "invalidatedApprovalId": null,
+        "warning": null,
+        "stopReason": null,
+        "resumeCondition": null
+      }
+    },
+    {
+      "id": "MSN-golden-full",
+      "revision": 3,
+      "title": "Nullable fields are filled",
+      "goal": "Pin the populated form of every nullable field",
+      "workflowClass": "engineering_review",
+      "status": "NEW",
+      "canonicalState": "CREATED",
+      "lifecycleSchemaVersion": 1,
+      "riskProfile": "medium",
+      "constraints": [],
+      "requiredGates": [],
+      "acceptanceCriteria": [],
+      "tasks": [
+        {
+          "id": "TSK-golden-full",
+          "kind": "agent",
+          "role": "reviewer",
+          "status": "PENDING",
+          "objective": "Review /health",
+          "mutatesRepo": false,
+          "isolation": "none",
+          "dependsOn": [
+            "TSK-golden-nulls"
+          ],
+          "usage": {
+            "taskId": "TSK-golden-full",
+            "role": "reviewer",
+            "model": null,
+            "promptTokens": 0,
+            "completionTokens": 0,
+            "wall": {
+              "totalMs": 0,
+              "queuedMs": 0,
+              "admittedMs": 0,
+              "inferenceMs": 0,
+              "toolsMs": 0,
+              "verifierMs": 0
+            },
+            "attempts": 0,
+            "streamResumes": 0,
+            "thinking": "off"
+          },
+          "reliability": {
+            "repoId": "repo-full",
+            "acceptanceIds": [
+              "AC-1"
+            ],
+            "candidateGeneration": 0,
+            "missionGeneration": 0,
+            "fencingToken": 0
+          }
+        }
+      ],
+      "findings": [
+        {
+          "id": "F-golden-1",
+          "severity": "blocking",
+          "status": "open",
+          "summary": "crashes on empty body",
+          "taskId": "TSK-golden-full",
+          "repaired": false
+        }
+      ],
+      "modelErrors": [],
+      "verifierStages": [
+        {
+          "name": "typecheck",
+          "durationMs": 1200,
+          "reused": false
+        }
+      ],
+      "observability": {
+        "progress": {
+          "approximatePercent": 40,
+          "verifiedComplete": false,
+          "basis": "weighted_dag"
+        },
+        "acceptanceCoverage": {
+          "completed": 1,
+          "total": 2,
+          "approximatePercent": 50
+        },
+        "workflowProgress": {
+          "completed": 1,
+          "total": 3,
+          "approximatePercent": 33,
+          "basis": "weighted_dag"
+        },
+        "health": "active",
+        "currentActivity": {
+          "type": "running_test",
+          "summary": "running the suite",
+          "workerId": "W-golden"
+        },
+        "workers": {
+          "active": 1,
+          "waiting": 0,
+          "failed": 0
+        },
+        "lastMeaningfulProgressAt": "2026-10-14T11:59:00.000Z",
+        "completionStatus": "validating",
+        "progressHistory": [
+          {
+            "at": "2026-10-14T12:00:00.000Z",
+            "approximatePercent": 40,
+            "label": "executing"
+          }
+        ],
+        "tests": {
+          "running": false,
+          "completed": 10,
+          "total": 10,
+          "passed": 9,
+          "failed": 1,
+          "skipped": 0,
+          "failures": [
+            "suite > case"
+          ]
+        },
+        "review": {
+          "status": "running",
+          "blockingOpen": 1,
+          "findings": [
+            {
+              "id": "F-golden-1",
+              "severity": "blocking",
+              "status": "open",
+              "summary": "crashes on empty body",
+              "repaired": false
+            }
+          ]
+        },
+        "workerDetails": [],
+        "activity": [],
+        "errors": [],
+        "recovery": [],
+        "changes": {
+          "changedFiles": [
+            "src/handler.ts"
+          ],
+          "commits": [],
+          "integrationState": "pending"
+        },
+        "artifacts": [],
+        "action": "run_task",
+        "reason": "task ready",
+        "recoveryAttempt": {
+          "attempt": 0,
+          "maxAttempts": 3
+        },
+        "nextAction": "verify",
+        "nextActionAt": "2026-10-14T12:05:00.000Z",
+        "owner": "host-a:1234",
+        "repository": "repo-full",
+        "task": "TSK-golden-full",
+        "preservedWork": []
+      },
+      "specApproval": {
+        "phase": "approved",
+        "revisionNumber": 2,
+        "semanticSpecHash": "sha256:spec",
+        "planHash": "sha256:plan",
+        "semanticRoundsUsed": 2,
+        "semanticRoundsLimit": 5,
+        "activeStage": "approval",
+        "activeStageDeadlineAt": "2026-10-14T13:00:00.000Z",
+        "overallDeadlineAt": "2026-10-15T12:00:00.000Z",
+        "approvalId": "APR-golden-1",
+        "invalidatedApprovalId": "APR-golden-0",
+        "warning": "approval is close to its deadline",
+        "stopReason": "needs_operator",
+        "resumeCondition": "approval granted"
+      },
+      "stop": {
+        "reason": "waiting for approval",
+        "attemptedRecoveries": [],
+        "preservedWork": [
+          "branch feat/health"
+        ],
+        "resumeCondition": "approval granted",
+        "stoppedAt": "2026-10-14T12:00:00.000Z"
+      }
+    }
+  ]
+}
