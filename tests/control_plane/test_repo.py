@@ -446,8 +446,9 @@ def test_stage_analytics_percentiles_bottleneck_and_in_progress():
     assert a["bottleneck"] == "review"
     assert a["stages"]["review"]["p50_ms"] == 600
     assert a["stages"]["implementation"]["runs"] == 2
-    assert a["stages"]["implementation"]["p50_ms"] == 300
-    assert a["stages"]["implementation"]["p95_ms"] == 300  # nearest-rank of [200,300]
+    # Nearest-rank of [200, 300]: p50 = 1st value (200), p95 = 2nd value (300).
+    assert a["stages"]["implementation"]["p50_ms"] == 200
+    assert a["stages"]["implementation"]["p95_ms"] == 300
     # 'complete' for mid and 'review' for mid2 remain open (in_progress).
     assert "complete" not in a["stages"]
     assert a["stages"]["review"]["runs"] == 1

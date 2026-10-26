@@ -645,3 +645,54 @@ def test_usage_and_stage_analytics_survive_export_import():
     st = restored.stage_analytics()
     assert st["stages"]["implementation"]["p50_ms"] == 500
     assert "complete" in st["in_progress"][mid]
+
+
+def test_usage_and_stage_analytics_survive_event_only_reload():
+    """Durable bridge reload restores event streams with no delivery snapshot; the
+    rebuild must regenerate usage and stage projections from those events (codex P1)."""
+    import json as _json
+    clock = {"t": 1_700_000_000.0}
+    repo = ControlPlaneRepo(now=lambda: clock["t"])
+    svc = make_svc(repo)
+    svc.ingest({"entity_type": "token_usage", "entity_id": "req-e",
+                "event_type": "token_usage.recorded",
+                "payload": {"mission_id": "m1", "model": "gpt-4o",
+                            "request_id": "req-e", "input_tokens": 5}})
+    svc.ingest({"entity_type": "resource_usage", "entity_id": "res-e",
+                "event_type": "resource_usage.recorded",
+                "payload": {"mission_id": "m1", "kind": "cpu", "value": 3.0}})
+    mid = repo.create_mission("s")
+    repo.set_mission_stage(mid, "implementation"); clock["t"] += 0.4
+    repo.set_mission_stage(mid, "complete")
+    state = repo.export_state()
+    # The bridge durable-reload path drops the delivery snapshot (events only).
+    state.pop("delivery", None)
+    restored = ControlPlaneRepo(now=lambda: clock["t"])
+    restored.import_state(state)
+    a = restored.usage_analytics(mission_id="m1")
+    assert a["tokens"]["by_model"]["gpt-4o"]["input_tokens"] == 5
+    assert a["resources"]["cpu"]["total"] == 3.0
+    st = restored.stage_analytics()
+    assert st["stages"]["implementation"]["p50_ms"] == 400
+    assert "complete" in st["in_progress"][mid]
+    # Re-run must be idempotent (no stream duplication, no double-counting):
+    # importing the same event-only state again must not inflate the counts.
+    a2 = restored.usage_analytics(mission_id="m1")
+    assert a2["tokens"]["by_model"]["gpt-4o"]["input_tokens"] == 5
+    assert a2["resources"]["cpu"]["count"] == 1
+
+
+def test_export_state_serializes_resource_usage_keys_as_json():
+    """Tuple mission/kind keys must serialize cleanly to JSON (codex P1)."""
+    import json as _json
+    clock = {"t": 1_700_000_000.0}
+    repo = ControlPlaneRepo(now=lambda: clock["t"])
+    repo.add_resource_usage({"mission_id": "m1", "kind": "cpu", "value": 2.0})
+    repo.add_resource_usage({"mission_id": "m1", "kind": "cpu", "value": 3.0})
+    dumped = _json.dumps(repo.export_state())  # must not raise TypeError
+    reloaded = _json.loads(dumped)
+    restored = ControlPlaneRepo(now=lambda: clock["t"])
+    restored.import_state(reloaded)
+    a = restored.usage_analytics(mission_id="m1")
+    assert a["resources"]["cpu"]["count"] == 2
+    assert a["resources"]["cpu"]["total"] == 5.0

@@ -17,6 +17,7 @@ import datetime as _dt
 import hashlib
 import json
 import logging
+import math
 import re
 import threading
 import time
@@ -362,7 +363,7 @@ class ControlPlaneRepo:
         except Exception:  # noqa: BLE001
             pass
 
-    def _transition_stage(self, mission_key, old, new):
+    def _transition_stage(self, mission_key, old, new, when=None):
         """Record a stage run: close the open run (if any) and open the next.
 
         Stage durations are derived purely from stage transitions (issue #37).
@@ -370,10 +371,14 @@ class ControlPlaneRepo:
         transition closes the previously open run (``ended_at``/``duration_ms``)
         and opens the new one. A stage change that repeats the current stage is
         a no-op so a re-emitted event never truncates an open run.
+
+        ``when`` is the transition timestamp (an ISO string); it defaults to the
+        current clock so live transitions use wall time and event-only replays
+        can supply each event's stored ``source_timestamp``.
         """
         if old == new:
             return
-        now = self._stamp()
+        now = when or self._stamp()
         runs = self._stage_runs.setdefault(mission_key, [])
         if runs and runs[-1].get("ended_at") is None:
             prev = runs[-1]
@@ -2377,7 +2382,7 @@ class ControlPlaneRepo:
                 "reviews": _copy(self._reviews),
                 "pull_requests": _copy(self._pull_requests),
                 "token_usage": _copy(self._token_usage),
-                "resource_usage": {k: [dict(x) for x in v]
+                "resource_usage": {json.dumps(list(k)): [dict(x) for x in v]
                                     for k, v in self._resource_usage.items()},
                 "stage_runs": _copy(self._stage_runs),
             },
@@ -2406,7 +2411,7 @@ class ControlPlaneRepo:
         self._reviews = dict(delivery.get("reviews", {}))
         self._pull_requests = dict(delivery.get("pull_requests", {}))
         self._token_usage = dict(delivery.get("token_usage", {}))
-        self._resource_usage = {tuple(k): [dict(x) for x in v]
+        self._resource_usage = {tuple(json.loads(k)): [dict(x) for x in v]
                                 for k, v in delivery.get("resource_usage", {}).items()}
         self._stage_runs = dict(delivery.get("stage_runs", {}))
         self._events = {}
@@ -2522,6 +2527,37 @@ class ControlPlaneRepo:
             self._suppress_record_events = False
 
     def _rebuild_delivery_from_events_impl(self):
+        # Usage analytics (issue #36) and stage analytics (issue #37) ride the
+        # same durable event log, so an event-only reload must rebuild them too
+        # or they silently vanish after a restart.
+        self._token_usage = {}
+        self._resource_usage = {}
+        for entity_type in ("token_usage", "resource_usage"):
+            for ids in self.entity_ids(entity_type):
+                for ev in self._events.get((entity_type, ids), []):
+                    payload = _payload(ev)
+                    try:
+                        if entity_type == "token_usage":
+                            self.add_token_usage(payload)
+                        else:
+                            self.add_resource_usage(payload)
+                    except (ValueError, KeyError, TypeError):
+                        continue
+        # Stage transitions: rebuild stage runs from each mission's event stream
+        # so per-stage durations survive a restart.
+        self._stage_runs = {}
+        for (etype, eid), stream in list(self._events.items()):
+            if etype != "mission":
+                continue
+            for ev in stream:
+                if ev.get("event_type") != "MissionStageChanged":
+                    continue
+                p = _payload(ev)
+                try:
+                    self._transition_stage(eid, p.get("from"), p.get("to"),
+                                           when=ev.get("source_timestamp"))
+                except (ValueError, KeyError, TypeError):
+                    continue
         for entity_type in ("test_run", "build", "review", "pull_request"):
             for ids in self.entity_ids(entity_type):
                 stream = self._events.get((entity_type, ids), [])
@@ -2672,11 +2708,16 @@ def _usage_id(value):
 
 
 def _percentile(sorted_values, pct):
-    """Nearest-rank percentile of an ascending list (pct in 0..100)."""
+    """Nearest-rank percentile of an ascending list (pct in 0..100).
+
+    The nearest-rank method selects ``ceil(pct/100 * n)``-th smallest value
+    (1-indexed); with n=2, p50 is the 1st (index 0) and p95 the 2nd (index 1).
+    """
     n = len(sorted_values)
     if n == 0:
         return None
-    idx = max(0, min(n - 1, int((pct / 100.0) * n)))
+    rank = math.ceil(pct / 100.0 * n)
+    idx = max(0, min(n - 1, rank - 1))
     return sorted_values[idx]
 
 
