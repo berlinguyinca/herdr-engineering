@@ -731,3 +731,43 @@ def test_fleet_config_takes_one_snapshot_per_request(tmp_path, acknowledged_sink
         assert store.calls == 1
     finally:
         svr.shutdown()
+
+
+def test_scheduler_api_is_readable_and_queues_untrusted_host(server):
+    c, repo = server
+    repo.upsert_host("beast", "beast", "100.0.0.2", host_uid="uid-beast", aliases=["beast"],
+                     platform="linux", scheduler_capacity={"total_cpu": 16, "total_memory_gib": 64})
+    status, _, body = c.get("/api/v1/scheduler")
+    assert status == 200 and json.loads(body)["hosts"][0]["host_uid"] == "uid-beast"
+    status, body = c.post("/api/v1/scheduler/plan", {
+        "request_id": "api-request", "agent_family": "codex", "placement_mode": "automatic",
+        "resource_profile": {"class": "coding", "cpu_cores": 1, "memory_gib": 1},
+    })
+    assert status == 200
+    assert json.loads(body)["state"] == "queued"
+
+
+def test_scheduler_lease_heartbeat_route_renews_and_rejects_stale_token(server):
+    c, repo = server
+    repo.upsert_host("beast", "beast", "100.0.0.2", host_uid="uid-beast", aliases=["beast"],
+                     platform="linux", scheduler_owned=True, scheduler_trusted=True,
+                     scheduler_policy={"mode": "automatic", "revision": 1},
+                     scheduler_capacity={"total_cpu": 4, "total_memory_gib": 8, "total_disk_gib": 20})
+    repo.record_telemetry("beast", {"freshness_seconds": 1, "sequence": 1})
+    base = {"request_id": "api-lease", "agent_family": "codex", "placement_mode": "automatic",
+            "resource_profile": {"class": "coding", "cpu_cores": 1, "memory_gib": 1}}
+    status, body = c.post("/api/v1/scheduler/reservations", base)
+    assert status == 201
+    reservation = json.loads(body)
+    status, body = c.post("/api/v1/scheduler/reservations/commit", {"reservation_id": reservation["reservation_id"]})
+    assert status == 200
+    committed = json.loads(body)
+    lease = repo.list_scheduler_leases()[0]
+    status, body = c.post("/api/v1/scheduler/leases/heartbeat", {
+        "lease_id": lease["lease_id"], "generation": lease["generation"], "token": lease["token"], "ttl": 120,
+    })
+    assert status == 200 and json.loads(body)["lease_id"] == committed["lease_id"]
+    status, body = c.post("/api/v1/scheduler/leases/heartbeat", {
+        "lease_id": lease["lease_id"], "generation": lease["generation"], "token": "wrong", "ttl": 120,
+    })
+    assert status == 409

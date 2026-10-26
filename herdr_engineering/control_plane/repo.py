@@ -23,6 +23,7 @@ import threading
 import time
 from uuid import uuid4
 
+from ..host_policy import HostPolicy, HostSnapshot, PolicyMode, normalize_aliases
 from ..llm_session_id import dashboard_form
 from . import llm_stats
 from .agent_identity import AgentIdentityRegistry
@@ -179,7 +180,11 @@ class ControlPlaneRepo:
         self._hosts = {}
         self._artifacts = {}
         self._blobs = {}  # artifact_id -> bytes (in-memory RustFS stand-in)
+        self._scheduler_reservations = {}
+        self._scheduler_leases = {}
         self._leases = {}
+        self._scheduler_reservations = {}
+        self._scheduler_leases = {}
         self._test_runs = {}
         self._reviews = {}
         self._pull_requests = {}
@@ -964,6 +969,52 @@ class ControlPlaneRepo:
         hosts = [self._with_problems(h) for h in self._merged_hosts().values()]
         return _sort_by(hosts, "host_name")
 
+    def host_snapshot(self, host_id):
+        from datetime import datetime
+        record = self.get_host(host_id)
+        if record is None:
+            return None
+        samples = self.list_telemetry(record.get("host_id"), limit=1)
+        latest = samples[-1] if samples else None
+        at = latest.get("at") if latest else record.get("last_seen")
+        try:
+            telemetry_at = datetime.fromisoformat(at) if at else None
+            if telemetry_at and telemetry_at.tzinfo is None:
+                telemetry_at = telemetry_at.replace(tzinfo=datetime.UTC)
+        except (TypeError, ValueError):
+            telemetry_at = None
+        policy = record.get("scheduler_policy") or {}
+        return HostSnapshot(
+            host_uid=record.get("host_uid") or record.get("host_id"),
+            host_name=record.get("host_name") or record.get("host_id"),
+            aliases=tuple(record.get("aliases") or (record.get("host_name"),)),
+            platform=record.get("platform") or "unknown",
+            owned=record.get("scheduler_owned", False),
+            trusted=record.get("scheduler_trusted", False),
+            reachable=record.get("status") not in {"unavailable", "unknown"},
+            telemetry_at=telemetry_at,
+            telemetry_freshness_seconds=latest.get("freshness_seconds") if latest else None,
+            policy=HostPolicy(mode=PolicyMode(policy.get("mode", PolicyMode.MANUAL_ONLY)),
+                              revision=int(policy.get("revision", 0)),
+                              allow_tags=frozenset(policy.get("allow_tags") or ()),
+                              deny_tags=frozenset(policy.get("deny_tags") or ())),
+        )
+
+    def set_host_policy(self, host_id, *, mode, expected_revision, allow_tags=(), deny_tags=(), reason=None):
+        host = self._hosts.get(host_id)
+        if host is None:
+            raise KeyError(host_id)
+        current = host.get("scheduler_policy") or {"revision": 0, "mode": PolicyMode.MANUAL_ONLY.value}
+        if int(expected_revision) != int(current.get("revision", 0)):
+            raise ValueError("host policy revision conflict")
+        next_policy = {"mode": PolicyMode(mode).value, "revision": int(current.get("revision", 0)) + 1,
+                       "allow_tags": sorted({str(v).strip().lower() for v in allow_tags if str(v).strip()}),
+                       "deny_tags": sorted({str(v).strip().lower() for v in deny_tags if str(v).strip()}),
+                       "reason": str(reason)[:300] if reason else None}
+        host["scheduler_policy"] = next_policy
+        self.record_event("host", host_id, "HostPolicyChanged", next_policy)
+        return _copy(next_policy)
+
     def fleet_inventory(self):
         """Host x component version matrix with drift against the fleet reference.
 
@@ -1082,8 +1133,10 @@ class ControlPlaneRepo:
     # heartbeat. The durable sink persists each recorded event, so re-hydration
     # after a restart reproduces exactly the same stable entities.
 
-    def upsert_host(self, host_id, host_name, tailnet_ip, *,
-                    cpu=None, mem=None, status="healthy", inventory=None):
+    def upsert_host(self, host_id, host_name, tailnet_ip, *, cpu=None, mem=None,
+                    status="healthy", inventory=None, host_uid=None, aliases=None,
+                    platform=None, scheduler_owned=None, scheduler_trusted=None,
+                    scheduler_policy=None, scheduler_capacity=None):
         with self._event_lock:
             stamp = self._stamp()
             inventory = _clean_inventory(inventory)
@@ -1095,6 +1148,13 @@ class ControlPlaneRepo:
                        "last_seen": stamp, "created_at": stamp}
                 if inventory:
                     rec["inventory"] = {**inventory, "collected_at": stamp}
+                if host_uid: rec["host_uid"] = host_uid
+                if aliases: rec["aliases"] = normalize_aliases(aliases)
+                if platform: rec["platform"] = platform
+                if scheduler_owned is not None: rec["scheduler_owned"] = bool(scheduler_owned)
+                if scheduler_trusted is not None: rec["scheduler_trusted"] = bool(scheduler_trusted)
+                if scheduler_policy is not None: rec["scheduler_policy"] = dict(scheduler_policy)
+                if scheduler_capacity is not None: rec["scheduler_capacity"] = dict(scheduler_capacity)
                 self._hosts[host_id] = rec
                 self.record_event("host", host_id, "HostRegistered",
                                   {"host_name": host_name,
@@ -1105,6 +1165,13 @@ class ControlPlaneRepo:
             existing["tailnet_ip"] = tailnet_ip or existing["tailnet_ip"]
             existing["status"] = status
             existing["last_seen"] = stamp
+            if host_uid: existing["host_uid"] = host_uid
+            if aliases: existing["aliases"] = normalize_aliases(aliases)
+            if platform: existing["platform"] = platform
+            if scheduler_owned is not None: existing["scheduler_owned"] = bool(scheduler_owned)
+            if scheduler_trusted is not None: existing["scheduler_trusted"] = bool(scheduler_trusted)
+            if scheduler_policy is not None: existing["scheduler_policy"] = dict(scheduler_policy)
+            if scheduler_capacity is not None: existing["scheduler_capacity"] = dict(scheduler_capacity)
             if cpu is not None:
                 existing["cpu"] = cpu
             if mem is not None:
@@ -1640,6 +1707,7 @@ class ControlPlaneRepo:
             "artifact_id": aid, "session_id": session_id,
             "mission_id": mission_id, "original_filename": original_filename,
             "mime_type": mime_type, "size_bytes": size_bytes, "sha256": sha256,
+            "artifact_type": "other",
             "storage_key": storage_key, "status": "available",
             "materializations": 0, "created_at": self._stamp(),
         }
@@ -1664,6 +1732,25 @@ class ControlPlaneRepo:
 
     def get_artifact(self, artifact_id):
         return _copy(self._artifacts.get(artifact_id))
+
+    def list_artifacts(self, *, query=None, artifact_type=None, status=None,
+                       created_by=None, limit=200, offset=0):
+        rows = []
+        needle = str(query or "").casefold()
+        for record in self._artifacts.values():
+            if artifact_type and record.get("artifact_type") != artifact_type:
+                continue
+            if status and record.get("status") != status:
+                continue
+            if created_by and record.get("created_by") != created_by:
+                continue
+            haystack = " ".join(str(record.get(key) or "")
+                                for key in ("artifact_id", "original_filename", "mime_type"))
+            if needle and needle not in haystack.casefold():
+                continue
+            rows.append(_copy(record))
+        ordered = _sort_by(rows, "created_at", id_key="artifact_id")
+        return ordered[max(0, int(offset)):max(0, int(offset)) + min(500, max(1, int(limit)))]
 
     def materialize_artifact(self, artifact_id, host_id, session_id,
                              local_path):
@@ -2226,6 +2313,32 @@ class ControlPlaneRepo:
             result['truncated'] |= len(case['message']) > 500 or len(case['trace']) > 1000
             append('failed_tests', item)
         return result
+
+    # ------------------------------------------------------- scheduler state
+    def save_scheduler_reservation(self, reservation: dict):
+        reservation_id = str(reservation.get("reservation_id") or "")
+        if not reservation_id:
+            raise ValueError("reservation_id is required")
+        record = _deep_copy(reservation)
+        self._scheduler_reservations[reservation_id] = record
+        self.record_event("scheduler_reservation", reservation_id,
+                          "SchedulerReservationChanged", record)
+        return _deep_copy(record)
+
+    def list_scheduler_reservations(self):
+        return [_deep_copy(row) for row in self._scheduler_reservations.values()]
+
+    def save_scheduler_lease(self, lease: dict):
+        lease_id = str(lease.get("lease_id") or "")
+        if not lease_id:
+            raise ValueError("lease_id is required")
+        record = _deep_copy(lease)
+        self._scheduler_leases[lease_id] = record
+        self.record_event("scheduler_lease", lease_id, "SchedulerLeaseChanged", record)
+        return _deep_copy(record)
+
+    def list_scheduler_leases(self):
+        return [_deep_copy(row) for row in self._scheduler_leases.values()]
 
     # --------------------------------------------------------------- events
     def record_event(self, entity_type, entity_id, event_type, payload=None,
@@ -2819,6 +2932,8 @@ class ControlPlaneRepo:
             "blobs": {k: __import__("base64").b64encode(v).decode()
                       for k, v in self._blobs.items()},
             "leases": _copy(self._leases),
+            "scheduler_reservations": _deep_copy(self._scheduler_reservations),
+            "scheduler_leases": _deep_copy(self._scheduler_leases),
             "telemetry": {k: [dict(s) for s in v]
                           for k, v in self._telemetry.items()},
             "delivery": {
@@ -2848,6 +2963,8 @@ class ControlPlaneRepo:
         self._blobs = {k: __import__("base64").b64decode(v)
                        for k, v in state.get("blobs", {}).items()}
         self._leases = dict(state.get("leases", {}))
+        self._scheduler_reservations = _deep_copy(state.get("scheduler_reservations", {}))
+        self._scheduler_leases = _deep_copy(state.get("scheduler_leases", {}))
         self._telemetry = {k: [dict(s) for s in v]
                           for k, v in state.get("telemetry", {}).items()}
         delivery_present = "delivery" in state
@@ -2864,6 +2981,17 @@ class ControlPlaneRepo:
             t, i = key.split("|")
             self._events[(t, i)] = [dict(e) for e in stream]
         self._event_order = [tuple(x) for x in state.get("event_order", [])]
+        for (etype, entity_id), stream in self._events.items():
+            if etype == "scheduler_reservation":
+                for event in stream:
+                    payload = _payload(event)
+                    if payload:
+                        self._scheduler_reservations[entity_id] = _deep_copy(payload)
+            elif etype == "scheduler_lease":
+                for event in stream:
+                    payload = _payload(event)
+                    if payload:
+                        self._scheduler_leases[entity_id] = _deep_copy(payload)
         self.ledger.hydrate([e for stream in self._events.values() for e in stream])
         self._rebuild_graph()
         if not delivery_present:

@@ -1,0 +1,127 @@
+{
+  "project": "Herdr Fabric Resource Scheduler",
+  "phases": [
+    {
+      "id": "P00",
+      "title": "Audit launch paths and current design",
+      "depends_on": [],
+      "spec": "00-audit.md",
+      "exit_gate": "All acceptance criteria in spec with test evidence; maintain log and link Git issues/PRs"
+    },
+    {
+      "id": "P01",
+      "title": "Host identity, policy migration and opt-out",
+      "depends_on": [
+        "P00"
+      ],
+      "spec": "01-host-policies.md",
+      "exit_gate": "All acceptance criteria in spec with test evidence; maintain log and link Git issues/PRs"
+    },
+    {
+      "id": "P02",
+      "title": "Trusted telemetry and capacity accounting",
+      "depends_on": [
+        "P01"
+      ],
+      "spec": "02-telemetry.md",
+      "exit_gate": "All acceptance criteria in spec with test evidence; maintain log and link Git issues/PRs"
+    },
+    {
+      "id": "P03",
+      "title": "Atomic scheduling/admission",
+      "depends_on": [
+        "P01",
+        "P02"
+      ],
+      "spec": "03-scheduler.md",
+      "exit_gate": "All acceptance criteria in spec with test evidence; maintain log and link Git issues/PRs"
+    },
+    {
+      "id": "P04",
+      "title": "Connect all launch adapters",
+      "depends_on": [
+        "P03"
+      ],
+      "spec": "04-adapters.md",
+      "exit_gate": "All acceptance criteria in spec with test evidence; maintain log and link Git issues/PRs"
+    },
+    {
+      "id": "P05",
+      "title": "Distributed workspace preparation",
+      "depends_on": [
+        "P04"
+      ],
+      "spec": "05-workspaces.md",
+      "exit_gate": "All acceptance criteria in spec with test evidence; maintain log and link Git issues/PRs"
+    },
+    {
+      "id": "P06",
+      "title": "Quotas, envelopes, lifecycle and fair queue",
+      "depends_on": [
+        "P03",
+        "P04"
+      ],
+      "spec": "06-quotas.md",
+      "exit_gate": "All acceptance criteria in spec with test evidence; maintain log and link Git issues/PRs"
+    },
+    {
+      "id": "P07",
+      "title": "Scheduler UX and placement explanations",
+      "depends_on": [
+        "P02",
+        "P03",
+        "P04"
+      ],
+      "spec": "07-ui.md",
+      "exit_gate": "All acceptance criteria in spec with test evidence; maintain log and link Git issues/PRs"
+    },
+    {
+      "id": "P08",
+      "title": "Safe leases/fencing and checkpoint migration",
+      "depends_on": [
+        "P04",
+        "P05",
+        "P06"
+      ],
+      "spec": "08-recovery.md",
+      "exit_gate": "All acceptance criteria in spec with test evidence; maintain log and link Git issues/PRs"
+    },
+    {
+      "id": "P09",
+      "title": "Replay simulation and advisory learning",
+      "depends_on": [
+        "P02",
+        "P03",
+        "P07"
+      ],
+      "spec": "09-simulator.md",
+      "exit_gate": "All acceptance criteria in spec with test evidence; maintain log and link Git issues/PRs"
+    },
+    {
+      "id": "P10",
+      "title": "Progressive rollout and full fault validation",
+      "depends_on": [
+        "P01",
+        "P02",
+        "P03",
+        "P04",
+        "P05",
+        "P06",
+        "P07",
+        "P08",
+        "P09"
+      ],
+      "spec": "10-validation-rollout.md",
+      "exit_gate": "All acceptance criteria in spec with test evidence; maintain log and link Git issues/PRs"
+    }
+  ],
+  "first_release": [
+    "P00",
+    "P01",
+    "P02",
+    "P03",
+    "P04",
+    "P07 essential UI",
+    "P10 rollout gates"
+  ]
+}
