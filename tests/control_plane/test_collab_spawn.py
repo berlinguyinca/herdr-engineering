@@ -264,6 +264,18 @@ def test_worker_template_matches_the_script_the_dashboard_hands_out():
     subprocess.run(["bash", "-n", str(WORKER)], check=True)
 
 
+def test_all_supported_harnesses_have_skill_dispatch_adapters():
+    assert {"pi", "claude-code", "codex", "opencode"} <= set(runner.FAMILY_CMD_TOOLS)
+    assert {"pi", "claude-code", "codex", "opencode"} <= set(runner.FAMILY_SKILL_CMD_TOOLS)
+    assert runner.FAMILY_SKILL_CMD_TOOLS["pi"].endswith(' -- "$(cat)"')
+    assert "claude -p" in runner.FAMILY_SKILL_CMD_TOOLS["claude-code"]
+    assert runner.FAMILY_SKILL_CMD_TOOLS["codex"].startswith("codex exec")
+    assert runner.FAMILY_SKILL_CMD_TOOLS["opencode"].startswith("opencode run")
+    js = "import('./packages/collab-scripts.js').then(m=>process.stdout.write(m.workerScript({base:'x'})))"
+    worker = subprocess.run(["node", "-e", js], cwd=ROOT, capture_output=True, text=True, check=True).stdout
+    assert "agent_capabilities" in worker and '".agents"' in worker and "PI_CODING_AGENT_DIR" in worker
+
+
 @pytest.mark.parametrize("label,target,enabled,ok", [
     ("beast", "beast", True, True), ("Bad Name", "x", True, False), ("-oProxy", "x", True, False),
     ("ok", "-oProxyCommand=x", True, False), ("ok", "user@host", False, False), ("ok", "user@host", True, True)])
@@ -589,4 +601,4 @@ def test_a_pi_worker_also_gets_the_skill_command_and_claude_never_does(rig):
     cc = [e for e in envs if any(x.startswith("HERDR_AGENT_CMD=claude") for x in e)]
     assert pi and cc
     assert "HERDR_SKILL_CMD=" + runner.FAMILY_SKILL_CMD_TOOLS["pi"] in pi[0]
-    assert not any(x.startswith("HERDR_SKILL_CMD=") for x in cc[0])
+    assert "HERDR_SKILL_CMD=" + runner.FAMILY_SKILL_CMD_TOOLS["claude-code"] in cc[0]

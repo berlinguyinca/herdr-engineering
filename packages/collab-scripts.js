@@ -57,13 +57,22 @@ export function workerScript({ base }) {
 #                                           directory is writable, nothing else on the host is visible
 #   HERDR_AUDIT=/path/NAME.log              append a hash-chained line per task: what ran, how it ended,
 #                                           and which files in the work directory it added, changed or removed
-#   HERDR_SKILL_CMD='pi -p --no-session -- "$(cat)"'   pi only: runs a task the SERVER marked as a skill call
-#                                           (skill: {name}); stdin is then exactly "/skill:<name> <args>". Without
-#                                           it, or for anything unmarked, HERDR_AGENT_CMD runs as usual.
+#   HERDR_SKILL_CMD='...'                    runs a task the SERVER marked as a skill call
+#                                           (skill: {name}) using the harness-native prompt. Without it, or for
+#                                           anything unmarked, HERDR_AGENT_CMD runs as usual.
 ${PREAMBLE(base)}
 CMD="\${HERDR_AGENT_CMD:-cat >/dev/null; echo acknowledged}"
 SKILL_CMD="\${HERDR_SKILL_CMD:-}"
 SANDBOX="\${HERDR_SANDBOX:-}"; AUDIT="\${HERDR_AUDIT:-}"
+HARNESS=$(jget harness_type)
+if [ -z "$SKILL_CMD" ]; then
+  case "$HARNESS" in
+    pi) SKILL_CMD='pi -p --no-session -- "$(cat)"' ;;
+    claude-code) SKILL_CMD='claude -p' ;;
+    codex) SKILL_CMD='codex exec --skip-git-repo-check -' ;;
+    opencode) SKILL_CMD='opencode run' ;;
+  esac
+fi
 NAME=$(jget name); WORK="$HOME/herdr-agents/work/$NAME"
 TMP=$(mktemp -d); mkdir "$TMP/tasks"; trap 'rm -rf "$TMP" "$HDR"' EXIT
 audit() {  # audit EVENT [key=value ...]: one line in $AUDIT, each carrying the hash of the line before it
@@ -114,6 +123,61 @@ rows = [f"+{k}" for k in b if k not in a] + [f"~{k}" for k in b if k in a and a[
 print(" ".join(rows[:40]) + (f" (+{len(rows) - 40} more)" if len(rows) > 40 else ""))
 PY
 }
+report_skills() {
+  skills=$(python3 - "$HARNESS" <<'PY'
+import json, os, re, sys
+from pathlib import Path
+harness = sys.argv[1]
+home = Path.home()
+roots = [home / ".agents" / "skills", home / ".claude" / "skills"]
+if harness == "pi" and os.environ.get("PI_CODING_AGENT_DIR"):
+    roots.append(Path(os.environ["PI_CODING_AGENT_DIR"]) / "skills")
+if harness == "codex":
+    roots.append(home / ".codex" / "skills")
+    if os.environ.get("CODEX_HOME"):
+        roots.append(Path(os.environ["CODEX_HOME"]) / "skills")
+if harness == "opencode":
+    roots.append(home / ".config" / "opencode" / "skills")
+seen, out = set(), []
+pattern = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*\\Z")
+def described(text):
+    if not text.startswith("---"):
+        return False
+    end = re.search(r"(?m)^---\\s*$", text[3:])
+    return bool(end and re.search(r"(?m)^description:\\s*\\S", text[3:3 + end.start()]))
+for root in roots:
+    try:
+        manifests = sorted(
+            [p for p in root.rglob("SKILL.md") if len(p.relative_to(root).parts) <= 6]
+            + list(root.glob("*.md")), key=lambda p: str(p))
+    except OSError:
+        continue
+    for manifest in manifests:
+        rel = manifest.relative_to(root)
+        if any(part.startswith(".") or part == "node_modules" for part in rel.parts):
+            continue
+        skill_id = manifest.parent.name if manifest.name == "SKILL.md" else manifest.stem
+        if not pattern.fullmatch(skill_id):
+            continue
+        try:
+            text = manifest.read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            continue
+        if not described(text):
+            continue
+        skill = "skill:" + skill_id
+        if skill not in seen:
+            seen.add(skill); out.append(skill)
+        if len(out) >= 100:
+            break
+    if len(out) >= 100:
+        break
+print(json.dumps({"skills": sorted(out)}, separators=(",", ":")))
+PY
+  )
+  call agent_capabilities "$skills" >/dev/null 2>&1 || true
+}
+report_skills
 [ -z "$SANDBOX" ] || mkdir -p -m 0700 "$WORK"
 [ -z "$AUDIT" ] || mkdir -p -m 0700 "$(dirname "$AUDIT")"
 audit worker_start agent="$NAME" sandbox="\${SANDBOX:+yes}" cmd="\${HERDR_AGENT_CMD:-acknowledge}"
@@ -123,7 +187,7 @@ MC=-1   # mention cursor: -1 = from now on, so a restarted worker never replays 
 while :; do
   case "$MC" in off) ARGS='{"seconds":20}' ;; *[!0-9-]*|'') MC=-1; ARGS='{"seconds":20,"mentions_after":-1}' ;; *) ARGS=$(printf '{"seconds":20,"mentions_after":%d}' "$MC") ;; esac
   call tasks_wait "$ARGS" > "$TMP/r.json" || { sleep 5; continue; }
-  python3 - "$TMP/r.json" "$TMP" <<'PY'
+  python3 - "$TMP/r.json" "$TMP" "$HARNESS" <<'PY'
 import sys, json
 reply = json.load(open(sys.argv[1]))
 import re
@@ -133,6 +197,7 @@ if result.get("isError") and "invalid arguments" in str(body.get("error")):
     open(f"{sys.argv[2]}/mc", "w").write("off")     # a server without mention wake-up: tasks only
     body = {}
 tasks = body.get("tasks", [])
+harness = sys.argv[3]
 def own_text(t):
     # The room keeps the literal text. The harness gets it without ONE leading "@<this agent>" (address,
     # name or old name) so the request reads as written to it; any other text stays exactly as typed.
@@ -143,7 +208,7 @@ def own_text(t):
     return text
 def save(path, t):
     # Only the SERVER's mark makes a skill call, and only when the text really is "/skill:<that name>" then
-    # whitespace or nothing: pi then gets "/skill:<name> <args>" (one space; pi's name ends at a space). The
+    # whitespace or nothing: the worker translates the canonical call to the harness-native skill prompt. The
     # whole prompt stays ONE argument after "--", so an "@" or "-" inside the args is never a file or a flag.
     text, sk = own_text(t), t.get("skill")
     name = sk.get("name") if isinstance(sk, dict) else None
@@ -151,7 +216,9 @@ def save(path, t):
         m = re.fullmatch(r"/skill:" + re.escape(name) + r"(?:\\s+(.*))?", text, re.S)
         if m:
             args = (m.group(1) or "").strip()
-            text = f"/skill:{name}" + (f" {args}" if args else "")
+            prefix = {"pi": f"/skill:{name}", "claude-code": f"/{name}",
+                      "codex": f"\${name}", "opencode": f"@{name}"}.get(harness, f"/skill:{name}")
+            text = prefix + (f" {args}" if args else "")
             open(path[:-4] + ".skill", "w").write(name)
     open(path, "w").write(text)
 for t in tasks:

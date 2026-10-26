@@ -112,9 +112,9 @@ def test_an_unreported_skill_is_not_marked(w):
         assert "skill" not in inbox(w, pi, task(w, w.alice, aid, text))
 
 
-def test_a_claude_code_agent_is_never_marked(w):
+def test_a_supported_harness_agent_is_marked(w):
     cc, aid = agent(w, "bob", harness="claude-code")
-    assert "skill" not in inbox(w, cc, task(w, w.alice, aid, "/skill:review x"))
+    assert inbox(w, cc, task(w, w.alice, aid, "/skill:review x"))["skill"] == {"name": "review"}
 
 
 def test_disabled_config_marks_nothing_and_switching_off_takes_effect_at_delivery(w):
@@ -238,3 +238,34 @@ def test_a_bad_yaml_edit_fails_closed(w):
     pi, aid = agent(w, "bob")
     w.s.skills_source = lambda: {"enabled": "maybe"}
     assert "skill" not in inbox(w, pi, task(w, w.alice, aid, "/skill:review x"))
+
+
+def test_an_authenticated_mcp_capability_report_replaces_the_agent_skill_inventory(w):
+    from herdr_engineering.control_plane import collab_mcp
+
+    pi, aid = agent(w, "bob", skills=())
+    result = collab_mcp._call(w.s, pi, "agent_capabilities", {"skills": ["skill:review", "skill:pdf-tools"]})
+    assert result["content"]
+    assert w.s._agents[aid]["skills"] == ["skill:pdf-tools", "skill:review"]
+    assert any(e["event_type"] == "agent_skills_updated" for e in w.s._log)
+    before = len(w.s._log)
+    collab_mcp._call(w.s, pi, "agent_capabilities", {"skills": ["skill:review", "skill:pdf-tools"]})
+    assert len(w.s._log) == before
+
+
+def test_reported_skills_survive_log_replay(w):
+    from herdr_engineering.control_plane import collab_mcp
+    from herdr_engineering.control_plane.collab import CollabService, StaticTokenAuthenticator
+    from tests.control_plane.test_collab import _digest
+
+    pi, aid = agent(w, "bob", skills=())
+    collab_mcp._call(w.s, pi, "agent_capabilities", {"skills": ["skill:review"]})
+    s2 = CollabService(StaticTokenAuthenticator({u: _digest(t) for u, t in USERS.items()}), now=w.s._now)
+    s2.hydrate(list(w.s._log))
+    assert s2._agents[aid]["skills"] == ["skill:review"]
+
+
+def test_reported_skills_are_accepted_for_all_supported_harnesses(w):
+    for harness in ("pi", "claude-code", "codex", "opencode"):
+        pi, aid = agent(w, "bob", harness=harness, skills=("skill:review",))
+        assert inbox(w, pi, task(w, w.alice, aid, "/skill:review x"))["skill"] == {"name": "review"}

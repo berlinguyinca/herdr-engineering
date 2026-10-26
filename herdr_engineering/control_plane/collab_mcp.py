@@ -81,6 +81,11 @@ _CONSULT_TOOLS = [
 ]
 CONSULT_TOOL_NAMES = frozenset(t["name"] for t in _CONSULT_TOOLS)
 TOOLS = [
+    {"name": "agent_capabilities",
+     "description": "Report the skills discovered locally by this authenticated agent. Replaces the previous skill inventory.",
+     "inputSchema": {"type": "object", "required": ["skills"], "additionalProperties": False,
+                     "properties": {"skills": {"type": "array", "maxItems": 100,
+                                                  "items": {"type": "string", "pattern": r"^[A-Za-z0-9][A-Za-z0-9:._/-]{0,63}$"}}}}},
     {"name": "rooms_list", "description": "List the collaboration rooms this agent may use.",
      "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False}},
     {"name": "room_read",
@@ -275,6 +280,10 @@ def _helper_call(service: CollabService, pr, name: str, args: dict) -> dict:
 
 def _call(service: CollabService, pr, name: str, args: dict) -> dict:
     import secrets
+    if name == "agent_capabilities":
+        if set(args) != {"skills"} or not isinstance(args.get("skills"), list):
+            raise CollabError(400, "skills must be a list")
+        return _text(service.report_agent_skills(pr, args["skills"]))
     if name in ("helper_spawn", "helper_wait", "helper_result", "helper_cancel"):
         return _helper_call(service, pr, name, args)
     if name == "rooms_list":

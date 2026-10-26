@@ -7,8 +7,8 @@ that mark, never the text. The mark is set only when:
 
 - YAML ``control_plane.collab.skills.enabled`` is true (default false; re-read per request),
 - the sender may give that agent work (``create_task`` / the mention wake rules, checked by the callers),
-- the agent is a pi agent (Claude Code runs text-only with slash commands disabled: unchanged),
-- the agent REPORTED ``skill:<name>`` at registration (pi's literal form, the one the `/` menu inserts),
+- the agent uses a supported harness (Pi, Claude Code, Codex or OpenCode),
+- the agent REPORTED ``skill:<name>`` through registration or the authenticated MCP capability hook,
 - the text, after ONE leading ``@<that agent's address|name|old name>`` (the worker's own strip rule), is
   ``/skill:<name>`` with the name ``[a-z0-9][a-z0-9._-]{0,63}``, then nothing or whitespace and at most
   SKILL_ARGS_MAX characters of arguments.
@@ -88,7 +88,7 @@ class SkillsMixin:
         if not self._skills_enabled():
             return None
         a = self._agents.get(aid)
-        if not a or a.get("harness_type") != "pi" or a.get("external"):     # a remote agent's label is its own claim
+        if not a or a.get("harness_type") not in {"pi", "claude-code", "codex", "opencode"} or a.get("external"):
             return None
         call = parse_skill(text, self._own_names(aid))
         if call is None or f"skill:{call[0]}" not in (a.get("skills") or ()):

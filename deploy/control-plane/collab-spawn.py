@@ -77,22 +77,33 @@ SSH_TARGET = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._@-]{0,126}$")
 FAMILY_CMD_TEXT_ONLY = {
     "claude-code": "claude -p --tools '' --strict-mcp-config --mcp-config '{\"mcpServers\":{}}' --disable-slash-commands",
     "pi": 'pi -p --no-session --no-tools -- "Task from a room member: $(cat)"',
+    "opencode": "opencode run --pure",
     "agent": "",                     # no command: the worker acknowledges and reports
 }
 FAMILY_CMD_TOOLS = {
     "claude-code": "claude -p",
     "codex": "codex exec --skip-git-repo-check -",
     "pi": 'pi -p --no-session -- "Task from a room member: $(cat)"',
+    "opencode": "opencode run",
     "agent": "",
 }
 FAMILY_CMD = FAMILY_CMD_TOOLS       # every family the runner knows; which are started depends on --allow-tools
-# pi only: the command for a task the SERVER marked as a skill call (`@agent /skill:x args`, YAML
-# collab.skills.enabled). The worker then hands pi exactly "/skill:<name> <args>" as ONE argument after "--": it
-# starts with "/skill:", so it is never a flag or an @file, and pi expands the skill. Everything else keeps the prefix.
-FAMILY_SKILL_CMD_TEXT_ONLY = {"pi": 'pi -p --no-session --no-tools -- "$(cat)"'}
-FAMILY_SKILL_CMD_TOOLS = {"pi": 'pi -p --no-session -- "$(cat)"'}
-FAMILY_ROLE = {"claude-code": "claude", "codex": "codex", "pi": "pi", "agent": "agent"}
-FAMILY_BIN = {"claude-code": "claude", "codex": "codex", "pi": "pi"}
+# Harness-native commands for tasks the SERVER marked as skill calls (`@agent /skill:x args`, YAML
+# collab.skills.enabled). The worker translates the canonical room form to each harness's native skill prompt;
+# ordinary unmarked work keeps its safety prefix/flags.
+FAMILY_SKILL_CMD_TEXT_ONLY = {
+    "claude-code": "claude -p --tools '' --strict-mcp-config --mcp-config '{\"mcpServers\":{}}'",
+    "pi": 'pi -p --no-session --no-tools -- "$(cat)"',
+    "opencode": "opencode run --pure",
+}
+FAMILY_SKILL_CMD_TOOLS = {
+    "claude-code": "claude -p",
+    "codex": "codex exec --skip-git-repo-check -",
+    "pi": 'pi -p --no-session -- "$(cat)"',
+    "opencode": "opencode run",
+}
+FAMILY_ROLE = {"claude-code": "claude", "codex": "codex", "pi": "pi", "opencode": "opencode", "agent": "agent"}
+FAMILY_BIN = {"claude-code": "claude", "codex": "codex", "pi": "pi", "opencode": "opencode"}
 AGENT_DIR = "herdr-agents"
 PANE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9:_.-]{0,39}$")
 
