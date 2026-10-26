@@ -507,6 +507,7 @@ def test_history_legacy_provider_binding_requires_one_exact_full_identity():
     repo.ingest_ci_report(body)
     assert repo.ci_test_history()['tests'] == []
     observed = {key: value for key, value in history_report().items() if key != 'xml'}
+    observed['created_at'] = HISTORY_STAMP
     repo.observe_ci_pipeline({**observed, 'state': 'success'})
     assert len(repo.ci_test_history()['tests']) == 1
     repo.observe_ci_pipeline({**observed, 'provider_url': 'https://other.example', 'state': 'failure'})

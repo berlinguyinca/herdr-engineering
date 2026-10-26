@@ -144,7 +144,8 @@ export function mountCiHealth(host,client,{onSelectRun=()=>{},onSelectStep=()=>{
   }
   function notifyContext() {
     const repo=selection?model?.projects.find(p=>p.key===selection.projectKey)?.repo:commandProject;
-    onContext({...state,project:repo?{...repo,provider_repo_id:repo.provider_repo_id??repo.id}:null});
+    const cell=selection?model?.projects.find(p=>p.key===selection.projectKey)?.cells.find(c=>c.key===selection.bucketKey):null;
+    onContext({...state,start:cell?.start!=null?new Date(cell.start).toISOString():null,end:cell?.end!=null?new Date(cell.end).toISOString():null,project:repo?{...repo,provider_repo_id:repo.provider_repo_id??repo.id}:null});
   }
   host.addEventListener('change',event=>{
     const target=event.target;
@@ -183,6 +184,7 @@ export function mountCiHealth(host,client,{onSelectRun=()=>{},onSelectStep=()=>{
     setObservabilityContext(next={}) {
       if(disposed)return;
       rememberDisclosures();
+      if(next.start===null&&next.end===null)selection=null;
       const nextProject=next.project===undefined?commandProject:next.project;
       if(JSON.stringify(commandProject)!==JSON.stringify(nextProject))selection=null;
       commandProject=nextProject;

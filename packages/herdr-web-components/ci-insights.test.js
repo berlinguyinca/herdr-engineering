@@ -94,3 +94,21 @@ test('counts-only polling never presents omitted case evidence as passing or abs
  assert.match(html,/Select a project.*test history/i);
  assert.doesNotMatch(html,/No failed tests|No conflicting outcomes|Failing tests · 0/);
 });
+
+test('Tests run metrics use UTC creation days while attempts keep report-time history',()=>{
+ const pipelines=[run(1,'failure',{created_at:'2026-10-15T23:59:59Z'}),run(2,'success',{created_at:'2026-10-16T00:00:00Z'}),run(3,'failure',{created_at:null}),run(4,'failure',{created_at:'2026-10-22T12:00:01Z'})];
+ const reports=[report(1,1,[tc('failed')],{reported_at:'2026-10-15T13:00:00Z'})];
+ const model=ciInsightsModel({pipelines,reports},{days:7},now);
+ assert.deepEqual(model.pipelines.map(r=>r.run_number),[2]);
+ assert.equal(model.successRate,100);assert.equal(model.missingReports,1);
+ assert.equal(model.reports.length,1,'Attempt history keeps its rolling report-time window');
+});
+
+test('PR and bucket selection constrain Tests metrics and late report attempts by exact run identity',()=>{
+ const pipelines=[run(1,'failure',{event:'pull_request'}),run(2,'success',{event:'push'}),run(3,'failure',{event:'pull_request',created_at:'2026-10-22T00:00:00Z'})];
+ const reports=pipelines.map(r=>({...report(r.run_number,1,[tc('failed')]),...r,reported_at:'2026-10-22T11:00:00Z'}));
+ const model=ciInsightsModel({pipelines,reports},{days:7,scope:'pr',start:'2026-10-21T00:00:00Z',end:'2026-10-22T00:00:00Z'},now);
+ assert.deepEqual(model.pipelines.map(r=>r.run_number),[1]);
+ assert.deepEqual(model.reports.map(r=>r.run_number),[1]);
+ assert.equal(model.missingReports,0);
+});

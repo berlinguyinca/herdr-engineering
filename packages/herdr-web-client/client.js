@@ -313,17 +313,17 @@ export class HerdrClient {
     return this.request(`/api/v1/ci/reports${query.size ? `?${query}` : ''}`, { signal });
   }
 
-  getCiSummary({ days = 14, repository, branch, scope, provider_url, provider_repo_id, signal } = {}) {
+  getCiSummary({ days = 14, repository, branch, scope, start, end, provider_url, provider_repo_id, signal } = {}) {
     const query = new URLSearchParams({ days: String(days) });
-    for (const [key, value] of Object.entries({ repository, branch, scope, provider_url, provider_repo_id })) {
+    for (const [key, value] of Object.entries({ repository, branch, scope, start, end, provider_url, provider_repo_id })) {
       if (value !== undefined && value !== null && value !== '') query.set(key, String(value));
     }
     return this.request(`/api/v1/ci/summary?${query}`, { signal });
   }
 
-  getCiTests({ days = 14, repository, branch, test, provider_url, provider_repo_id, signal } = {}) {
+  getCiTests({ days = 14, repository, branch, test, scope, start, end, provider_url, provider_repo_id, signal } = {}) {
     const query = new URLSearchParams({ days: String(days) });
-    for (const [key, value] of Object.entries({ repository, branch, test, provider_url, provider_repo_id })) {
+    for (const [key, value] of Object.entries({ repository, branch, test, scope, start, end, provider_url, provider_repo_id })) {
       if (value !== undefined && value !== null && value !== '') query.set(key, String(value));
     }
     return this.request(`/api/v1/ci/tests?${query}`, { signal });

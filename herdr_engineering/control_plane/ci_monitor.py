@@ -162,7 +162,21 @@ class CIMonitor:
             cached = self.summary_snapshot(start=False)
             pipelines = tuple(self._history._view['pipelines'])
             inventory = tuple(self._history._view['repos'])
-        return repo.ci_summary(pipelines=pipelines, inventory=inventory, cached=cached, **filters)
+        view = self.report_redactor()(repo.ci_summary(
+            pipelines=pipelines, inventory=inventory, cached=cached, **filters))
+        # Derive serialized identities only from scrubbed fields: JSON escaping
+        # can otherwise conceal a configured credential from exact replacement.
+        for project in view['projects']:
+            project['project_id'] = json.dumps([project[key] for key in
+                ('provider_url', 'provider_repo_id', 'repository')], separators=(',', ':'))
+        return view
+
+    def tests(self, repo, **filters):
+        with self._history._lock:
+            pipelines = tuple(self._history._view['pipelines'])
+            inventory = tuple(self._history._view['repos'])
+        return repo.ci_tests(redact=self.report_redactor(), pipelines=pipelines,
+                             inventory=inventory, **filters)
 
     def start(self):
         with self._lock:

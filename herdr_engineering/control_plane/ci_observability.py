@@ -60,11 +60,34 @@ class _Measurements:
 
 
 _PIPELINE_FIELDS = ('provider_url', 'provider_repo_id', 'repository', 'run_number',
-                    'revision', 'branch', 'state', 'created_at', 'started_at', 'finished_at')
+                    'revision', 'branch', 'state', 'created_at', 'started_at', 'finished_at', 'event', 'ref')
 _REPORT_FIELDS = ('provider_url', 'provider_repo_id', 'repository', 'run_number',
                   'revision', 'branch', 'reported_at', 'ingested_at')
 _COUNTS = ('passed', 'failed', 'errored', 'skipped', 'total', 'duration_ms')
 _FILTERS = ('provider_url', 'provider_repo_id', 'repository', 'branch')
+
+
+def run_in_scope(row, scope, default_branch=None):
+    event = row.get('event') or ''
+    is_pr = event in ('pull_request', 'pull_request_target', 'pull_request_closed',
+                     'pull_request_opened', 'pull_request_sync', 'merge_request') or event.startswith('pull_request:') or bool(
+        re.match(r'^refs/(pull|merge-requests)/\d+/(head|merge)$', row.get('ref') or ''))
+    return (scope == 'all' or scope == 'pr' and is_pr or
+            scope == 'default' and bool(default_branch) and not is_pr and row.get('branch') == default_branch)
+
+
+def run_window(now, days, start=None, end=None):
+    """UTC creation-day window, intersected with a half-open selected bucket."""
+    return (max(now // 86400 * 86400 - (days - 1) * 86400,
+                _timestamp(start) if start is not None else float('-inf')),
+            min(now, _timestamp(end) if end is not None else now))
+
+
+def run_in_window(row, now, days, start=None, end=None):
+    lower, upper = run_window(now, days, start, end)
+    stamp = _timestamp(row.get('created_at'))
+    return (stamp is not None and lower <= stamp <= upper and
+            (end is None or stamp < _timestamp(end)))
 
 
 def _project(row, fields):
@@ -382,7 +405,8 @@ class CIObservationStore:
         return view
 
     def test_summary(self, repository=None, branch=None, test=None, days=30, *,
-                     provider_url=None, provider_repo_id=None):
+                     provider_url=None, provider_repo_id=None, scope='all', start=None, end=None,
+                     pipelines=(), inventory=()):
         """Aggregate retained parsed cases in an inclusive UTC report-time window.
 
         Rates use reported completed test attempts (passed/failed/errored), never
@@ -397,22 +421,35 @@ class CIObservationStore:
                                       len(value) > 500 or not value.isprintable() or
                                       redact_text(value) != value):
                 raise ValueError('Invalid CI test history filter')
-        end = self._wall_now().timestamp()
-        start = end - days * 86400
+        now = self._wall_now().timestamp()
+        report_start = now - days * 86400
         groups, reported_runs = {}, set()
         report_count = unknown_time = 0
         filters = {'repository': repository, 'branch': branch, 'provider_url': provider_url,
                    'provider_repo_id': provider_repo_id}
         with self._lock:
+            runs = {identity: row for (kind, identity), (row, _) in self._entries.items()
+                    if kind == 'pipeline'}
+            runs.update((identity, row) for row in pipelines if (identity := _identity(row)))
+            defaults = {(row.get('provider_url', '').rstrip('/'), str(row.get('id')), row.get('repository')):
+                        row.get('default_branch') for row in inventory}
+            selected = {(*identity, row['branch'], row['revision']): row for identity, row in runs.items()
+                        if not any(value is not None and str(row.get(key)) != str(value)
+                                   for key, value in filters.items())
+                        and run_in_scope(row, scope, defaults.get(identity[:3]))
+                        and run_in_window(row, now, days, start, end)}
+            restrict_reports = scope != 'all' or start is not None or end is not None
             for (kind, identity), (report, _) in self._entries.items():
                 if kind != 'report' or any(value is not None and str(report[key]) != str(value)
                                           for key, value in filters.items()):
+                    continue
+                if restrict_reports and identity[:-1] not in selected:
                     continue
                 stamp = _timestamp(report['reported_at'])
                 if stamp is None:
                     unknown_time += 1
                     continue
-                if not start <= stamp <= end or report['tests'] is None:
+                if not report_start <= stamp <= now or report['tests'] is None:
                     continue
                 report_count += 1
                 reported_runs.add(identity[:-1])
@@ -423,23 +460,18 @@ class CIObservationStore:
                     groups.setdefault(key, []).append((stamp, report, case))
             missing = 0
             stale = False
-            for (kind, identity), (row, _) in self._entries.items():
-                if kind != 'pipeline' or any(value is not None and str(row[key]) != str(value)
-                                            for key, value in filters.items()):
-                    continue
-                stamp = next((_timestamp(row[field]) for field in
-                              ('finished_at', 'started_at', 'created_at')
-                              if _timestamp(row[field]) is not None), None)
-                if stamp is not None and not start <= stamp <= end:
-                    continue
-                stale |= row['stale']
-                if (*identity, row['branch'], row['revision']) not in reported_runs:
+            for identity, row in selected.items():
+                stale |= bool(row.get('stale'))
+                if identity not in reported_runs:
                     missing += 1
             tests = [_aggregate_test(groups[key]) for key in sorted(groups)]
             scope = {'kind': 'retained_observations', 'complete': False, 'partial': True,
                      'memory_only': True, 'persistence': 'memory_only',
                      'truncated': self._truncated, 'stale': stale,
-                     'days': days, 'window': {'start': _iso(start), 'end': _iso(end)},
+                     'days': days, 'window': {'start': _iso(report_start), 'end': _iso(now)},
+                     'scope': scope, 'start': start, 'end': end,
+                     'run_window': dict(zip(('start', 'end'), map(_iso, run_window(now, days, start, end)))),
+                     'run_time_basis': 'created_at', 'run_window_basis': 'utc_calendar_days_including_today',
                      'repository': repository, 'branch': branch, 'test': test,
                      'time_basis': 'reported_at', 'denominator': 'reported_completed_test_attempts',
                      'minimum_percentile_samples': 5,

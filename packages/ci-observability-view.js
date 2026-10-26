@@ -43,7 +43,7 @@ export function renderCiTestHistory(data,{loading=false,error='',selected=false,
   if(!data)return `<p class="ci-chart-note" role="status">${error?esc(error):loading?'Loading reported test history…':selected?'Test evidence unavailable.':'Select a project to load test history.'}</p>`;
   const tests=rows(data.tests).sort((a,b)=>sort==='duration'?(b.last_duration_ms??-1)-(a.last_duration_ms??-1):count(b.failure_count)-count(a.failure_count));
   const scope=data.scope||{},minimum=Math.max(5,count(scope.minimum_percentile_samples));
-  const banner=`<p class="ci-chart-note">${esc(scopeNote({...scope,scope:'all event types'}))} Test history is grouped by branch, using report timestamps and reported completed test attempts; skipped attempts are excluded. Event-scope and heatmap-bucket filters are unavailable for test history.</p>${error?`<p role="status">${esc(error)} Showing retained test evidence.</p>`:''}<p class="ci-chart-note">${count(scope.not_reported_run_count)} runs: test evidence not reported. Missing reports are not passing tests.</p>`;
+  const banner=`<p class="ci-chart-note">${esc(scopeNote(scope))} Test history is grouped by branch, using report timestamps and reported completed test attempts; skipped attempts are excluded. Event scope and selected buckets use exact run creation evidence; reports without a matching run are excluded from those selections.</p>${error?`<p role="status">${esc(error)} Showing retained test evidence.</p>`:''}<p class="ci-chart-note">${count(scope.not_reported_run_count)} runs: test evidence not reported. Missing reports are not passing tests.</p>`;
   if(!tests.length)return banner+'<p class="ci-chart-note">No validated test evidence in this selection.</p>';
   return `${banner}${renderCiTestPareto(tests)}<div class="ci-ob-table" tabindex="0" role="region" aria-label="Exact test history"><table><thead><tr>${['Test / branch','Failure rate','Evidence','First failure / last pass','Last / p50 / p95 duration','Representative runs'].map(v=>`<th scope="col">${v}</th>`).join('')}</tr></thead><tbody>${tests.map(t=>{const p=ciPercentiles(t.duration_ms,minimum);return `<tr><th scope="row">${esc(t.name||t.id)}<small>${esc(t.classname||t.suite||'')} · ${esc(t.file||'File not reported')} · ${esc(t.branch||'Branch not reported')}</small><small>${esc(t.id)}</small></th><td>${percent(rate(count(t.failure_count),count(t.completed_count)))}<small>${count(t.failure_count)} / ${count(t.completed_count)} reported completed test attempts</small></td><td>${ciTestClassification(t)}${t.identity_ambiguous?'<small>Reported test identity is ambiguous</small>':''}${t.failure_evidence?`<details data-ob-disclosure="${esc(JSON.stringify([t.id,t.branch]))}"><summary>Failure evidence</summary><pre>${esc(text(t.failure_evidence.message))}\n${esc(String(t.failure_evidence.trace||'').slice(0,2000))}</pre></details>`:''}</td><td>${esc(t.first_failure||'Not observed')}<small>${esc(t.last_pass||'Not observed')}</small></td><td>${Number.isFinite(t.last_duration_ms)?formatDuration(t.last_duration_ms):'Not reported'} / ${duration(p.p50,1)} / ${duration(p.p95,1)}<small>${p.samples} measured attempts</small></td><td>${rows(t.representative_runs).map(r=>`<button type="button" data-ob-run="${esc(JSON.stringify(r))}">Run #${esc(r.run_number)} · ${esc(r.revision||'Revision unavailable')}</button>`).join('')||'Not reported'}</td></tr>`;}).join('')}</tbody></table></div>`;
 }
@@ -95,7 +95,7 @@ export function mountCiObservability(host,client,{repository='',provider='',miss
     replace(el('[data-ob-projects]'),summary?rail(model,projectCharts):'<p class="ci-chart-note">No project summary received.</p>');
     el('[data-ob-selection]').textContent=project?`${project.repository} · ${project.provider_url} #${project.provider_repo_id} · ${filters.days}-day window`:'All projects · selected window';
     el('[data-ob-clear]').hidden=!project;
-    replace(el('[data-ob-charts]'),selected?`<p class="ci-chart-note">${esc(scopeNote(selected.scope))} Daily grouping uses run creation time (created_at) and UTC calendar days, including today. Heatmap cells narrow the run tree; these charts retain the selected day window.</p>${renderCiSummaryCharts(rows(selected.charts))}`:'<p class="ci-chart-note">No chart observations received for this selection.</p>');
+    replace(el('[data-ob-charts]'),selected?`<p class="ci-chart-note">${esc(scopeNote(selected.scope))} Daily grouping uses run creation time (created_at) and UTC calendar days, including today. Selected heatmap buckets narrow these charts and run metrics.</p>${renderCiSummaryCharts(rows(selected.charts))}`:'<p class="ci-chart-note">No chart observations received for this selection.</p>');
     replace(el('[data-ob-tests]'),renderCiTestHistory(tests,{selected:!!project,loading:pending.has('tests'),error:testsError,sort:testSort}));
   }
   function notify() {save();onContext(context());}
@@ -130,7 +130,7 @@ export function mountCiObservability(host,client,{repository='',provider='',miss
     detail=null;tests=null;detailError='';testsError='';
     if(all){summary=null;error='';projectCharts.clear();}
   }
-  function selectProject(next) {invalidate();project=next;refresh({selectionOnly:true});notify();}
+  function selectProject(next) {const bucket=filters.start!=null;filters.start=null;filters.end=null;invalidate({all:bucket});project=next;refresh({selectionOnly:!bucket});notify();}
   host.addEventListener('click',event=>{
     const button=event.target.closest('button');if(!button||!host.contains(button))return;
     if(button.hasAttribute('data-ob-refresh'))refresh();
@@ -142,7 +142,7 @@ export function mountCiObservability(host,client,{repository='',provider='',miss
     const target=event.target;
     if(target.hasAttribute('data-ob-test-sort')){testSort=target.value;save();draw();return;}
     for(const key of ['search','sort','failures'])if(target.hasAttribute(`data-ob-${key}`)){view[key==='failures'?'failuresOnly':key]=key==='failures'?target.checked:text(target.value);notify();draw();return;}
-    for(const key of ['days','scope','branch'])if(target.hasAttribute(`data-ob-${key}`)){filters[key]=key==='days'?Number(target.value):text(target.value);invalidate({all:true});notify();draw();refresh();return;}
+    for(const key of ['days','scope','branch'])if(target.hasAttribute(`data-ob-${key}`)){filters[key]=key==='days'?Number(target.value):text(target.value);filters.start=null;filters.end=null;invalidate({all:true});notify();draw();refresh();return;}
   }
   host.addEventListener('change',change,{signal:listeners.signal});
   host.addEventListener('input',event=>{if(event.target.matches('[data-ob-search],[data-ob-branch]'))change(event);},{signal:listeners.signal});
@@ -151,8 +151,9 @@ export function mountCiObservability(host,client,{repository='',provider='',miss
   return {refresh,getContext:context,
     setContext(next={}) {
       if(disposed)return;
-      const updated={...filters,...Object.fromEntries(['days','scope','branch','repository'].filter(key=>next[key]!==undefined).map(key=>[key,next[key]]))};
+      const updated={...filters,...Object.fromEntries(['days','scope','branch','repository','start','end'].filter(key=>next[key]!==undefined).map(key=>[key,next[key]]))};
       const nextProject=next.project===undefined?project:next.project;
+      if(next.start===undefined&&next.end===undefined&&(['days','scope','branch','repository'].some(key=>updated[key]!==filters[key])||(nextProject?ciProjectKey(nextProject):'')!==(project?ciProjectKey(project):''))){updated.start=null;updated.end=null;}
       const changed=JSON.stringify(updated)!==JSON.stringify(filters)||(nextProject?ciProjectKey(nextProject):'')!==(project?ciProjectKey(project):'');
       const scopeChanged=JSON.stringify(updated)!==JSON.stringify(filters);
       if(changed){invalidate({all:scopeChanged});filters=updated;project=nextProject;}

@@ -26,6 +26,12 @@ RUNS = [dict(id=i, number=i, status=status, branch=branch, commit='a' * 40,
         [(1, 'success', 'main'), (2, 'failure', 'main'), (3, 'failure', 'main'),
          (4, 'success', 'feature')]]
 
+if '--selection-contract' in sys.argv:
+    for row in RUNS:
+        row['event'] = 'push' if row['number'] == 2 else 'pull_request'
+        if row['number'] == 1:
+            row['status'] = 'failure'
+
 
 class ProviderHandler(BaseHTTPRequestHandler):
     def do_GET(self):

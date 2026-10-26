@@ -1,6 +1,7 @@
 // Metrics describe retained observations, never an inferred complete provider history.
 import {escapeHtml as esc} from './herdr-web-components/util.js';
 import {formatDuration} from './herdr-web-components/format.js';
+import {ciRunInScope,ciRunInWindow} from './ci-health.js';
 const rows=v=>Array.isArray(v)?v.filter(r=>r&&typeof r==='object'&&!Array.isArray(r)):[];
 const str=v=>typeof v==='string'?v:'';
 const stamp=v=>{const n=typeof v==='number'?(v>0&&v<1e12?v*1000:v):Date.parse(v);return Number.isFinite(n)&&n>0&&n<=8.64e15?n:0;};
@@ -14,13 +15,16 @@ const groupKey=r=>JSON.stringify([repoKey(r),r.branch||'']);
 const runKey=r=>JSON.stringify([repoKey(r),r.run_number]);
 const reportTime=r=>stamp(r.reported_at);
 const attemptOrder=(a,b)=>(Number(a.attempt)||1)-(Number(b.attempt)||1)||stamp(a.ingested_at)-stamp(b.ingested_at)||reportTime(a)-reportTime(b);
-const runTime=r=>stamp(r.created_at??r.created??r.started_at??r.started);
 const order=(a,b)=>reportTime(a)-reportTime(b)||(Number(a.run_number)||0)-(Number(b.run_number)||0)||(Number(a.attempt)||0)-(Number(b.attempt)||0);
 const searchText=r=>[r.repository,r.repository_id,r.provider_repo_id,r.branch,r.revision,r.run_number,r.title,r.mission_key,r.mission_id,r.session_id,r.state,r.status].filter(v=>v!=null).join(' ').toLowerCase();
 export function filterCiObservations(data={},filters={},now=Date.now()) {
  const terms=str(filters.search).toLowerCase().trim().split(/\s+/).filter(Boolean);
- const match=(r,time)=> (!filters.repository||[r.repository,r.repository_id,String(r.provider_repo_id)].includes(filters.repository))&&(!filters.branch||r.branch===filters.branch)&&(!filters.mission||(r.mission_key||r.mission_id)===filters.mission||rows(r.related_missions).some(m=>(m.mission_key||m.mission_id)===filters.mission))&&(!filters.session||r.session_id===filters.session||rows(r.related_sessions).some(s=>s.session_id===filters.session))&&terms.every(t=>searchText(r).includes(t))&&(!Number(filters.days)||(time>0&&time>=now-Number(filters.days)*86400000&&time<=now));
- return {...data,reports:rows(data.reports).filter(r=>match(r,reportTime(r))),pipelines:rows(data.pipelines).filter(r=>match(r,runTime(r)))};
+ const match=r=> (!filters.repository||[r.repository,r.repository_id,String(r.provider_repo_id)].includes(filters.repository))&&(!filters.branch||r.branch===filters.branch)&&(!filters.mission||(r.mission_key||r.mission_id)===filters.mission||rows(r.related_missions).some(m=>(m.mission_key||m.mission_id)===filters.mission))&&(!filters.session||r.session_id===filters.session||rows(r.related_sessions).some(s=>s.session_id===filters.session))&&terms.every(t=>searchText(r).includes(t));
+ const pipelines=rows(data.pipelines).filter(r=>match(r)&&ciRunInScope(r,filters.scope||'all',r)&&ciRunInWindow(r,filters,now));
+ const identity=r=>JSON.stringify([str(r.provider_url).replace(/\/$/,''),String(r.provider_repo_id??r.repository_id),r.repository,r.run_number,r.branch,r.revision]);
+ const selected=new Set(pipelines.map(identity));
+ const restricted=filters.scope&&filters.scope!=='all'||filters.start!=null||filters.end!=null;
+ return {...data,pipelines,reports:rows(data.reports).filter(r=>match(r)&&(!restricted||selected.has(identity(r)))&&(!Number(filters.days)||(reportTime(r)>0&&reportTime(r)>=now-Number(filters.days)*86400000&&reportTime(r)<=now)))};
 }
 export function ciInsightsModel(data={},filters={},now=Date.now()) {
  const selected=filterCiObservations(data,filters,now), reports=selected.reports.sort(order);

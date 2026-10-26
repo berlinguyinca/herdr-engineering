@@ -1917,7 +1917,7 @@ def _make_handler(server, public=False, operator=False):
                     filters = _ci_observability_query(self.path, what)
                     if what == "summary":
                         return self._json(server.ci_monitor.summary(r, **filters))
-                    view = r.ci_tests(redact=server.ci_monitor.report_redactor(), **filters)
+                    view = server.ci_monitor.tests(r, **filters)
                     cached = server.ci_monitor.summary_snapshot(start=False)
                     view['scope']['stale'] |= bool(cached.get('stale'))
                     return self._json(view)
@@ -2722,7 +2722,7 @@ def _ci_observability_query(path, route):
 
     query = parse_qs(urlsplit(path).query, keep_blank_values=True, max_num_fields=16)
     allowed = {'days', 'repository', 'branch', 'provider_url', 'provider_repo_id',
-               'scope' if route == 'summary' else 'test'}
+               'scope', 'start', 'end'} | ({'test'} if route == 'tests' else set())
     if set(query) - allowed or any(len(values) != 1 for values in query.values()):
         raise ValueError('Invalid CI filters')
     filters = {key: values[0] for key, values in query.items() if values[0] != ''}
@@ -2733,8 +2733,17 @@ def _ci_observability_query(path, route):
     if days not in ('7', '14', '30'):
         raise ValueError('CI days must be 7, 14 or 30')
     filters['days'] = int(days)
-    if route == 'summary' and filters.get('scope', 'all') not in ('all', 'default', 'pr'):
+    if filters.get('scope', 'all') not in ('all', 'default', 'pr'):
         raise ValueError('CI scope must be all, default or pr')
+    if 'start' in filters or 'end' in filters:
+        from datetime import datetime
+
+        try:
+            bounds = [datetime.fromisoformat(filters[key].replace('Z', '+00:00')) for key in ('start', 'end')]
+            if any(value.tzinfo is None for value in bounds) or bounds[0] >= bounds[1]:
+                raise ValueError()
+        except (KeyError, ValueError):
+            raise ValueError('CI bucket requires ordered start and end timestamps with time zones') from None
     if 'provider_url' in filters:
         filters['provider_url'] = normalize_provider_url(filters['provider_url'])
     return filters

@@ -462,7 +462,8 @@ def test_compact_routes_reject_invalid_filters(server, route, query):
 def test_compact_routes_validate_scope_and_allow_supported_windows(server):
     seed_ci(server, [])
     assert request(server, 'ci/summary?scope=unrecognized')[0] == 400
-    assert request(server, 'ci/tests?scope=all')[0] == 400
+    assert request(server, 'ci/tests?scope=unrecognized')[0] == 400
+    assert request(server, 'ci/tests?scope=all')[0] == 200
     for route in ('summary', 'tests'):
         for days in (7, 14, 30):
             status, view = request(server, f'ci/{route}?days={days}')

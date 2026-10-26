@@ -437,3 +437,11 @@ test('compact and lazy CI reads cancel actual in-flight HTTP requests', async ()
     }
   } finally { server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); }
 });
+
+test('summary and test queries carry the same event scope and bucket bounds',async()=>{
+ const calls=[];
+ const client=new HerdrClient('',{fetchImpl:async url=>{calls.push(url);return {ok:true,status:200,text:async()=>'{}'};}});
+ const selection={scope:'pr',start:'2026-10-24T00:00:00Z',end:'2026-10-25T00:00:00Z'};
+ await client.getCiSummary(selection);await client.getCiTests(selection);
+ for(const url of calls)for(const [key,value] of Object.entries(selection))assert.equal(new URL(url,'http://test').searchParams.get(key),value);
+});

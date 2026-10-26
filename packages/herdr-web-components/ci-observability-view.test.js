@@ -292,3 +292,16 @@ test('review: mounted unavailable summaries show missing coverage instead of obs
  assert.match(await page.locator('[data-ob-summary]').textContent(),/Observed projects0/);
  assert.doesNotMatch(await page.locator('[data-ob-summary]').textContent(),/unavailable/i);
 }));
+
+test('shared selection clears a bucket when Runs switches the exact project',()=>reviewPage(async page=>{
+ await page.evaluate(()=>mount());await page.locator('[data-ob-project]').first().waitFor();
+ await page.locator('[data-ob-project]').filter({hasText:'org/current'}).click();
+ await page.locator('[data-health-bucket]').last().click();
+ await page.waitForFunction(()=>calls.some(([kind,o])=>kind==='tests'&&o.start&&o.end));
+ await page.locator('[data-ci-workspace="runs"]').click();
+ await page.evaluate(()=>{calls=[];});
+ await page.locator('[data-ci-repository]').selectOption(JSON.stringify(['https://ci.example','17','org/former']));
+ await page.waitForFunction(()=>calls.some(([kind,o])=>kind==='tests'&&o.repository==='org/former'));
+ assert.equal(await page.evaluate(()=>calls.find(([kind,o])=>kind==='tests'&&o.repository==='org/former')[1].start??null),null);
+ assert.equal(await page.locator('[data-health-clear]').count(),0);
+}));

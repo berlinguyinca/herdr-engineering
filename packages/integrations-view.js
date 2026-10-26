@@ -8,6 +8,7 @@ import {ciChartModel,renderCiCharts,ciChartStyles} from './ci-charts.js';
 import {ciInsightsModel,renderCiInsights,ciInsightStyles,renderCiRunReports} from './ci-insights.js';
 import {renderCiPipeline,renderCiDiagnosis,ciPipelineStyles,pipelineZoom,sameCiRepository,ciComparisonModel,renderCiComparison} from './ci-pipeline.js';
 import {mountCiObservability,ciProjectKey} from './ci-observability-view.js';
+import {ciRunInScope,ciRunInWindow} from './ci-health.js';
 import {mountCiHealth} from './ci-health-view.js';
 import {snapshotText,animateChanges} from './motion.js';
 import {renderCiFix,ciFixStyles,fixRunKey,latestFix,fixIsActive,fixError} from './ci-fix-view.js';
@@ -45,11 +46,11 @@ const canonicalProvider = value => {
   try {const url=new URL(provider);return url.origin+url.pathname.replace(/\/+$/,'');}
   catch {return provider;}
 };
-export function selectIntegrations(entries,{tab='current',search='',repository='',provider='',mission='',session='',branch='',days=0,project=null}={}) {
+export function selectIntegrations(entries,{tab='current',search='',repository='',provider='',mission='',session='',branch='',days=0,scope='all',start=null,end=null,project=null}={}) {
   const terms=search.toLowerCase().trim().split(/\s+/).filter(Boolean),providerKey=canonicalProvider(provider);
-  const now=Date.now(),start=Math.floor(now/86400000)*86400000-(Number(days)-1)*86400000;
+  const now=Date.now();
   return entries.filter(e=>(!project||ciProjectKey(e.record)===ciProjectKey(project)) && (tab==='all' || e.tab===tab) && (!providerKey || canonicalProvider(e.record.provider_url)===providerKey) && (!repository || e.record.repository===repository || e.record.repository_id===repository || String(e.record.provider_repo_id)===repository)
-    && (!branch || e.record.branch===branch) && (!Number(days) || (integrationTimestamp(e.record.created_at || e.record.created)>=start && integrationTimestamp(e.record.created_at || e.record.created)<=now))
+    && (!branch || e.record.branch===branch) && ciRunInScope(e.record,scope,e.record) && ciRunInWindow(e.record,{days,start,end},now)
     && (!mission || (e.record.mission_key || e.record.mission_id)===mission || records(e.record.related_missions).some(r=>(r.mission_key || r.mission_id)===mission))
     && (!session || e.record.session_id===session || records(e.record.related_sessions).some(r=>r.session_id===session)) && terms.every(t=>e.search.includes(t)));
 }
@@ -184,7 +185,7 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
   const el=selector=>container.querySelector(selector);
   if(isCi){
     healthView=mountCiHealth(el('[data-ci-health]'),client,{repository,mission,session,search:search || undefined,
-      onContext:context=>{const next={days:['7','14','30'].includes(context.mode)?Number(context.mode):14,scope:context.scope,branch:context.branch,search:context.search,failuresOnly:context.failuresOnly,project:context.project};observabilityView?.setContext(next);if(observabilityView)applyCiContext(next);},
+      onContext:context=>{const next={days:['7','14','30'].includes(context.mode)?Number(context.mode):14,scope:context.scope,start:context.start,end:context.end,branch:context.branch,search:context.search,failuresOnly:context.failuresOnly,project:context.project};observabilityView?.setContext(next);if(observabilityView)applyCiContext(next);},
       onSelectRun:record=>openCiRun(record),
       onSelectStep:(record,stepId)=>{
         if(selected?.id!==ciRunKey(record))openCiRun(record);
@@ -222,7 +223,7 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
     state.project=context.project||null;
     state.repository=context.project?context.project.repository:(context.repository??repository);
     state.provider=context.project?.provider_url||provider;
-    state.branch=context.branch;state.days=context.days;state.search=context.search;state.page=0;
+    state.branch=context.branch;state.days=context.days;state.scope=context.scope;state.start=context.start;state.end=context.end;state.search=context.search;state.page=0;
     el('[data-ig-search]').value=state.search;
     el('[data-ci-period]').value=String(state.days);
     if(render){if(changed)refreshPerformance(true);draw();}
@@ -231,7 +232,8 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
   const ciObservations=({scoped=true}={})=>{
     const recent=Object.entries(data?.pipelines||{}).flatMap(([repository,runs])=>records(runs).map(r=>({...r,repository:r.repository||repository})));
     const matches=r=>!scoped||!state.project||ciProjectKey(r)===ciProjectKey(state.project);
-    const map=new Map();for(const r of [...records(reportData?.pipelines),...recent].filter(matches))map.set(JSON.stringify([ciRunKey(r),r.repository]),r);
+    const repos=new Map([...records(data?.repos),...records(reportData?.repos)].map(p=>[ciProjectKey({...p,provider_repo_id:p.provider_repo_id??p.id}),p]));
+    const map=new Map();for(const r of [...records(reportData?.pipelines),...recent].filter(matches)){const repo=repos.get(ciProjectKey(r));map.set(JSON.stringify([ciRunKey(r),r.repository]),{...r,default_branch:repo?.default_branch??r.default_branch});}
     return {...reportData,reports:records(reportData?.reports).filter(matches),pipelines:[...map.values()],stale:!!data?.stale,partial:data?.status==='partial'};
   };
   const entries=()=>integrationEntries(isCi ? {pipelines:{retained:ciObservations().pipelines}} : kind==='reviews' && data ? {...data,reviews:records(data.reviews).map(summary=>{
@@ -565,7 +567,7 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
       else{state.project=project;state.repository=project?.repository||value;state.provider=project?.provider_url||provider;state.page=0;healthView?.setObservabilityContext({project});draw();}
       return;
     }
-    state[key]=event.target.value;state.page=0;if(key==='days'&&[7,14].includes(Number(state.days))){performanceDays=Number(state.days);el('[data-ci-performance-window]').value=String(performanceDays);}if(key==='days'||key==='branch'){refreshPerformance(true);const context={branch:state.branch,...([7,14,30].includes(Number(state.days))?{days:Number(state.days)}:{})};observabilityView?.setContext(context);healthView?.setObservabilityContext(context);}draw();});
+    state[key]=event.target.value;state.page=0;if(key==='days'&&[7,14].includes(Number(state.days))){performanceDays=Number(state.days);el('[data-ci-performance-window]').value=String(performanceDays);}if(key==='days'||key==='branch'){refreshPerformance(true);const context={branch:state.branch,start:null,end:null,...([7,14,30].includes(Number(state.days))?{days:Number(state.days)}:{})};state.start=null;state.end=null;observabilityView?.setContext(context);healthView?.setObservabilityContext(context);}draw();});
   if(isCi)el('[data-ci-performance-window]').addEventListener('change',event=>{performanceDays=Number(event.target.value);if(Number(state.days)===7&&performanceDays===14){state.days='14';el('[data-ci-period]').value='14';}refreshPerformance(true);});
   container.addEventListener('input',event=>{if(event.target.hasAttribute('data-ci-test-search')){testSearch=event.target.value;testPage=0;draw();}},{signal:listenerController.signal});
   el('[data-ig-search]').addEventListener('input',event=>{state.search=event.target.value;state.page=0;draw();});

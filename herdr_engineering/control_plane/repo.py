@@ -1800,7 +1800,8 @@ class ControlPlaneRepo:
                               "description": "Uploaded test reports and observed provider runs only; missing reports do not mean zero tests."}}
 
     def ci_test_history(self, repository=None, branch=None, test=None, days=30, *,
-                        provider_url=None, provider_repo_id=None):
+                        provider_url=None, provider_repo_id=None, scope='all', start=None, end=None,
+                        pipelines=(), inventory=()):
         """Reuse compact projections until retained report/observation events change.
 
         Cache only one bounded store, not arbitrary filter/window responses. Reads
@@ -1827,16 +1828,16 @@ class ControlPlaneRepo:
                 arrivals = {tuple(entry): index for index, entry in enumerate(self._event_order)}
                 events.sort(key=lambda event: (event.get('ingest_timestamp', ''), arrivals.get(
                     (event['entity_type'], event['entity_id'], event['sequence']), -1)))
-                pipelines = [event['payload'] for event in events if event['entity_type'] == 'ci_observation']
+                observed_pipelines = [event['payload'] for event in events if event['entity_type'] == 'ci_observation']
                 store = CIObservationStore(wall_now=lambda: datetime.fromtimestamp(self._now(), UTC))
-                for row in pipelines:
+                for row in observed_pipelines:
                     store.record_pipeline(row)
                 previous = self._ci_test_projection[3] if self._ci_test_projection else {}
                 projections, unjoined = {}, []
                 for event in events:
                     if event['entity_type'] != 'ci_report':
                         continue
-                    row = bind_report_provider(event['payload'], pipelines)
+                    row = bind_report_provider(event['payload'], observed_pipelines)
                     source = (event['entity_id'], event['sequence'], _identity(row))
                     projection = previous[source] if source in previous else project_report(row)
                     projections[source] = projection
@@ -1845,15 +1846,17 @@ class ControlPlaneRepo:
                 self._ci_test_projection = (signature, store, unjoined, projections)
             _, store, unjoined, _ = self._ci_test_projection
             view = store.test_summary(repository=repository, branch=branch, test=test, days=days,
-                                      provider_url=provider_url, provider_repo_id=provider_repo_id)
-            end = self._now()
+                                      provider_url=provider_url, provider_repo_id=provider_repo_id,
+                                      scope=scope, start=start, end=end, pipelines=pipelines, inventory=inventory)
+            now = self._now()
             unjoined_count = sum(
                 (repository is None or row['repository'] == repository) and
                 (branch is None or row['branch'] == branch) and
                 (provider_url is None or (row.get('provider_url') or '').rstrip('/') == provider_url) and
                 (provider_repo_id is None or str(row.get('provider_repo_id')) == str(provider_repo_id)) and
                 (stamp := _timestamp(row.get('reported_at'))) is not None and
-                end - days * 86400 <= stamp <= end for row in unjoined)
+                now - days * 86400 <= stamp <= now for row in unjoined
+                if scope == 'all' and start is None and end is None)
             source_truncated = bool(self._ci_history_truncated & {'ci_report', 'ci_observation'})
             view['scope'].update(persistence='durable_sink' if self._sink is not None else 'memory_only',
                                  memory_only=self._sink is None,
@@ -1867,7 +1870,7 @@ class ControlPlaneRepo:
 
     def ci_summary(self, *, pipelines=(), inventory=(), cached=None, days=14,
                    repository=None, branch=None, scope='all', provider_url=None,
-                   provider_repo_id=None):
+                   provider_repo_id=None, start=None, end=None):
         """Windowed aggregates of cached history and durable observations, never I/O.
 
         The durable store keeps its existing 2,000-run bound; history's separate
@@ -1877,13 +1880,19 @@ class ControlPlaneRepo:
         from collections import Counter
         from datetime import UTC, datetime
 
-        from .ci_observability import CIObservationStore, _identity
+        from .ci_observability import (
+            CIObservationStore,
+            _identity,
+            run_in_scope,
+            run_in_window,
+            run_window,
+        )
         from .ci_performance import _iso, _stats, _timestamp
 
         cached = cached or {}
         now = self._now()
         # Match the heatmap and run list: UTC calendar days including today.
-        start = now // 86400 * 86400 - (days - 1) * 86400
+        window_start, window_end = run_window(now, days, start, end)
         store = CIObservationStore()
         with self._event_lock:
             retained = [stream[-1]['payload'] for (kind, _), stream in self._events.items()
@@ -1938,21 +1947,18 @@ class ControlPlaneRepo:
             project = key[:3]
             group = groups.setdefault(project, {'rows': [], 'unknown_time_run_count': 0,
                                                 'scope_unavailable': False})
-            is_pr = row.get('event') in ('pull_request', 'pull_request_closed') or bool(
-                re.match(r'^refs/(pull|merge-requests)/\d+/(head|merge)$', row.get('ref') or ''))
             if scope == 'default' and not defaults.get(project):
                 group['scope_unavailable'] = True
                 scope_unavailable += 1
                 continue
-            if ((scope == 'pr' and not is_pr) or
-                    (scope == 'default' and (is_pr or row.get('branch') != defaults[project]))):
+            if not run_in_scope(row, scope, defaults.get(project)):
                 continue
             stamp = _timestamp(row.get('created_at'))
             if stamp is None:
                 unknown_time += 1
                 group['unknown_time_run_count'] += 1
                 continue
-            if not start <= stamp <= now:
+            if not run_in_window(row, now, days, start, end):
                 continue
             group['rows'].append(row)
             selected.append(row)
@@ -1996,7 +2002,8 @@ class ControlPlaneRepo:
                           any(p['coverage'].get('truncated') for p in projects),
                 memory_only=self._sink is None, history_memory_only=True,
                 persistence='durable_sink' if self._sink is not None else 'memory_only',
-                days=days, window={'start': _iso(start), 'end': _iso(now)}, repository=repository,
+                days=days, window={'start': _iso(window_start), 'end': _iso(window_end)}, repository=repository,
+                start=start, end=end,
                 branch=branch, scope=scope, provider_url=provider_url, provider_repo_id=provider_repo_id,
                 denominator='successful_or_failed_runs', time_basis='created_at', window_basis='utc_calendar_days_including_today',
                 minimum_percentile_samples=5, unknown_time_run_count=unknown_time,
@@ -2013,10 +2020,12 @@ class ControlPlaneRepo:
         return result
 
     def ci_tests(self, *, redact, days=14, repository=None, branch=None, test=None,
-                 provider_url=None, provider_repo_id=None):
+                 provider_url=None, provider_repo_id=None, scope='all', start=None, end=None,
+                 pipelines=(), inventory=()):
         """Bounded HTTP projection; the full retained-history contract is unchanged."""
         view = self.ci_test_history(repository=repository, branch=branch, test=test, days=days,
-                                    provider_url=provider_url, provider_repo_id=provider_repo_id)
+                                    provider_url=provider_url, provider_repo_id=provider_repo_id,
+                                    scope=scope, start=start, end=end, pipelines=pipelines, inventory=inventory)
         view = redact(view)
         tests = sorted(view['tests'], key=lambda row: (
             -row['failure_count'], -(row['duration_ms']['p95'] or row['last_duration_ms'] or 0),

@@ -49,6 +49,16 @@ function pullRequest(row,repo) {
  const event=text(row.event||row.event_type).toLowerCase();
  return {isPr:number!==null||['pull_request','pull_request_target','pull_request_closed','pull_request_opened','pull_request_sync','merge_request'].includes(event)||event.startsWith('pull_request:'),pr:number===null?null:{number,key:JSON.stringify([projectKey(repo),'pr',number]),title:text(row.pull_request?.title||row.pr_title),source:text(row.pull_request?.source_branch||row.source_branch),target:text(row.pull_request?.target_branch||row.target_branch)}};
 }
+export function ciRunInScope(row,scope='all',repo={}) {
+ const {isPr}=pullRequest(row,repo);
+ return scope==='all'||scope==='pr'&&isPr||scope==='default'&&!!repo.default_branch&&!isPr&&row.branch===repo.default_branch;
+}
+export function ciRunInWindow(row,{days=0,start=null,end=null}={},now=Date.now()) {
+ const stamp=time(row.created_at??row.created);
+ const lower=Number(days)?Math.floor(now/86400000)*86400000-(Number(days)-1)*86400000:-Infinity;
+ return (!Number(days)&&start==null&&end==null)||Number.isFinite(stamp)&&stamp>=lower&&stamp<=now&&(start==null||stamp>=time(start))&&(end==null||stamp<time(end));
+}
+
 function windows(mode,now) {
  if(mode==='runs')return Array.from({length:24},(_,i)=>({key:`run:${i}`,label:`${24-i} ${i===23?'(newest)':''}`.trim(),start:null,end:null}));
  const hour=3600000,day=86400000;
@@ -73,7 +83,7 @@ export function ciHealthModel(history={},options={},now=Date.now()) {
   if(options.repository&&![key,repository,repoId(repo),repo.repository_id].includes(text(options.repository)))continue;
   const coverage=history.coverage?.[key]??history.coverage?.[repoId(repo)]??{};
   const scopeUnavailable=scope==='default'&&!repo.default_branch;
-  let runs=[...dedup.values()].filter(row=>row.projectKey===key).map(row=>({...row,...pullRequest(row,repo)})).filter(row=>!scopeUnavailable&&(scope==='all'||scope==='pr'&&row.isPr||scope==='default'&&!row.isPr&&row.branch===repo.default_branch)&&(!options.branch||row.branch===options.branch));
+  let runs=[...dedup.values()].filter(row=>row.projectKey===key).map(row=>({...row,...pullRequest(row,repo)})).filter(row=>ciRunInScope(row,scope,repo)&&(!options.branch||row.branch===options.branch));
   const projectText=[repository,instance(repo),repoId(repo)].join(' ').toLowerCase();
   runs=runs.filter(row=>terms.every(term=>[projectText,row.branch,row.run_number,row.revision,row.title,row.state,row.pr?.number].map(text).join(' ').toLowerCase().includes(term)));
   if(terms.length&&!runs.length&&!terms.every(term=>projectText.includes(term)))continue;
