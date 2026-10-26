@@ -252,6 +252,13 @@ def test_enroll_serve_end_to_end(tmp_path):
         "routes": [{"prefix": "/api", "host": "127.0.0.1", "port": api_port}]}))
     env = os.environ.copy()
     env["HERDR_ENGINEERING_STATE"] = str(tmp_path / "state")
+    env["HOME"] = str(tmp_path / "home")
+    os.makedirs(env["HOME"])
+    # Keep this local-forwarder test independent from the operator's live fabric
+    # gateway configuration on the host running the suite.
+    config = tmp_path / "no-gateway-config.yaml"
+    config.write_text("version: 1\nfabric:\n  gateway_url: ''\n")
+    env["HERDR_ENGINEERING_CONFIG"] = str(config)
     proc = subprocess.Popen(
         [sys.executable, "-m", "herdr_engineering.cli", "devfabric", "enroll",
          "--manifest", str(manifest), "--serve"],

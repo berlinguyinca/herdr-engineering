@@ -238,6 +238,8 @@ class IngestService:
         # written here. token_usage / resource_usage ARE on the dispatched allow-list (issue #36).
         if entity_type not in INGEST_ENTITY_TYPES:
             raise ValueError("entity type is not accepted by generic ingestion")
+        if entity_type in ("token_usage", "resource_usage") and not payload:
+            raise ValueError("token_usage/resource_usage payload is not accepted without usage fields")
         if event_type in SERVER_OWNED_EVENT_TYPES.get(entity_type, ()):
             raise ValueError("event type is reserved for the server")
         clamp = self._peer_clamp(principal, entity_type)

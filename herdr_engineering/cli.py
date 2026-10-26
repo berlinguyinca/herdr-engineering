@@ -16,6 +16,7 @@ import signal
 import socket
 import sys
 import threading
+from pathlib import Path
 from typing import Any
 
 from .version import __version__
@@ -73,6 +74,7 @@ def _build_parser() -> argparse.ArgumentParser:
     # doctor ---------------------------------------------------------------
     p = sub.add_parser("doctor", help="capability/health checks (spec 0050/0170)")
     p.add_argument("--json", action="store_true", help="stable machine-readable output")
+    p.add_argument("--strict", action="store_true", help="fail when required integrations are missing")
     p.set_defaults(func=_cmd_doctor)
 
     # agent-mine -----------------------------------------------------------
@@ -283,6 +285,14 @@ def _build_parser() -> argparse.ArgumentParser:
     p2.add_argument("--machine"); p2.add_argument("--revision"); p2.add_argument("--name")
     p2.add_argument("data", help="path to file to publish")
     p2.set_defaults(func=_cmd_art_publish)
+    p2 = asub.add_parser("upload", help="upload a file to the shared control-plane artifact registry")
+    p2.add_argument("data", help="path to file")
+    p2.add_argument("--control-plane", default=None)
+    p2.add_argument("--filename", default=None)
+    p2.add_argument("--mime", default="application/octet-stream")
+    p2.add_argument("--session", default=None)
+    p2.add_argument("--mission", default=None)
+    p2.set_defaults(func=_cmd_art_upload)
     asub.add_parser("list", help="list stored artifacts").set_defaults(func=_cmd_art_list)
     p2 = asub.add_parser("retention", help="enforce retention policy")
     p2.set_defaults(func=_cmd_art_retention)
@@ -617,6 +627,11 @@ def _build_parser() -> argparse.ArgumentParser:
                     help="assert TLS is terminated in front of this server; required to "
                          "enable collaboration on a non-loopback bind")
     p2.set_defaults(func=_cmd_cp_web)
+    p2 = csub.add_parser("public-gateway", help="serve the isolated approved-artifact delivery gateway")
+    p2.add_argument("--host", default="127.0.0.1")
+    p2.add_argument("--port", type=int, default=0)
+    p2.add_argument("--fleet-config", default=FLEET_CONFIG_DEFAULT)
+    p2.set_defaults(func=_cmd_cp_public_gateway)
     p2 = csub.add_parser("worker", help="run the bounded background worker")
     p2.add_argument("--interval", type=float, default=30.0,
                     help="seconds between passes (default: 30)")
@@ -626,6 +641,7 @@ def _build_parser() -> argparse.ArgumentParser:
                     help="migrations dir (default: bundled deploy/control-plane)")
     p2.add_argument("--fleet-config", default=FLEET_CONFIG_DEFAULT,
                     help="central fleet config file; control_plane.pg_dsn names the database")
+    p2.add_argument("--host-id", default=None, help="worker host identity for artifact job placement")
     p2.set_defaults(func=_cmd_cp_worker)
     p2 = csub.add_parser("mission-feed", help="publish read-only live Pi mission activity")
     p2.add_argument("--control-plane", default=None,
@@ -663,10 +679,10 @@ def _cmd_cp_mission_feed(args) -> int:
         HostConfigUnavailable,
         exit_unavailable,
         host_config,
+        host_config_or_none,
         resolve_control_plane,
     )
     from .mission_activity_feed import run_feed
-    from .host_config import host_config_or_none
     try:
         url = resolve_control_plane(args.control_plane)
         if args.control_plane and args.host_id:
@@ -844,7 +860,6 @@ def _cmd_machines(args) -> int:
 
 
 def _cmd_fleet_join(args) -> int:
-    from pathlib import Path
     from .fleet import DEFAULT_GATEWAY, fleet_join, warn_gateway_ignored
     warn_gateway_ignored(args.gateway)
     report = fleet_join(
@@ -877,6 +892,7 @@ def _cmd_fleet_join(args) -> int:
 
 def _cmd_fleet_config(args) -> int:
     from pathlib import Path
+
     from . import fleet_config_cli as fcc
     from .fleet_config import FleetConfigError, load_fleet_config
     cmd = args.fleet_config_command
@@ -1114,6 +1130,35 @@ def _cmd_art_publish(args) -> int:
     _print_json({"ok": res.ok, "status": res.status, "error": res.error,
                  "artifact": res.artifact.to_dict() if res.artifact else None})
     return 0 if res.ok else 1
+
+
+def _cmd_art_upload(args) -> int:
+    import urllib.request
+    from pathlib import Path
+    from urllib.parse import urlencode
+
+    from .host_config import HostConfigUnavailable, exit_unavailable, resolve_control_plane
+    try:
+        base = resolve_control_plane(args.control_plane)
+    except HostConfigUnavailable as exc:
+        return exit_unavailable(exc)
+    path = Path(args.data)
+    query = {"filename": args.filename or path.name, "mime": args.mime}
+    if args.session:
+        query["session_id"] = args.session
+    if args.mission:
+        query["mission_id"] = args.mission
+    req = urllib.request.Request(f"{base}/api/v1/artifacts?{urlencode(query)}",
+                                 data=path.read_bytes(), method="POST",
+                                 headers={"Content-Type": args.mime})
+    try:
+        with urllib.request.urlopen(req, timeout=60) as response:
+            payload = json.loads(response.read(8 * 1024 * 1024))
+    except (OSError, ValueError) as exc:
+        print(f"artifact upload failed: {exc}", file=sys.stderr)
+        return 1
+    _print_json(payload)
+    return 0
 
 
 def _cmd_graph_artifact_render(args) -> int:
@@ -2628,6 +2673,48 @@ def _cmd_cp_web(args) -> int:
     if args.seed_demo:
         _seed_demo(repo)
     rustfs = _maybe_rustfs_client(cp)
+    artifact_adapter = None
+    if dsn and rustfs is not None:
+        from .control_plane.artifact_adapter import SyncArtifactAdapter
+        from .control_plane.artifacts import ArtifactStore
+
+        async def create_artifact_store():
+            import asyncpg
+            conn = await asyncpg.connect(dsn)
+            return ArtifactStore(conn, rustfs)
+
+        artifact_adapter = SyncArtifactAdapter(create_artifact_store)
+    from .control_plane.artifact_acl import ArtifactAcl
+    from .control_plane.artifact_jobs import ArtifactJobManager
+    from .control_plane.artifact_reviews import ArtifactReviewManager
+    from .control_plane.publication import PrivateOnlyExposureProvider, PublicationController
+    from .exposure_cloudflare import CloudflareTunnelProvider
+    from .exposure_tailscale import TailscaleFunnelProvider
+    persist = (lambda action, payload: artifact_adapter("record_job_event", action, payload)) \
+        if artifact_adapter is not None else None
+    persist_review = (lambda action, payload: artifact_adapter("record_review_event", action, payload)) \
+        if artifact_adapter is not None else None
+    persist_acl = (lambda action, payload: artifact_adapter("record_acl_event", action, payload)) \
+        if artifact_adapter is not None else None
+    persist_publication = (lambda action, payload: artifact_adapter("record_publication_event", action, payload)) \
+        if artifact_adapter is not None else None
+    artifact_jobs = ArtifactJobManager(on_change=persist)
+    artifact_reviews = ArtifactReviewManager(on_change=persist_review)
+    artifact_acl = ArtifactAcl(on_change=persist_acl)
+    provider_name = cp.get("public_exposure_provider", "private_only")
+    if provider_name == "tailscale_funnel":
+        publication_provider = TailscaleFunnelProvider(enabled=True)
+    elif provider_name == "cloudflare_tunnel":
+        publication_provider = CloudflareTunnelProvider(enabled=True)
+    else:
+        publication_provider = PrivateOnlyExposureProvider()
+    publication_controller = PublicationController(
+        provider=publication_provider, on_change=persist_publication,
+        default_local_target=cp.get("public_gateway_target", "http://127.0.0.1:8085"))
+    if artifact_adapter is not None:
+        artifact_acl.load(artifact_adapter("load_acl"))
+        artifact_reviews.load(artifact_adapter("load_reviews"))
+        artifact_jobs.load(artifact_adapter("load_jobs"))
     collab = None
     if args.collab_cognito_pool:
         if args.collab_users_file:
@@ -2707,7 +2794,11 @@ def _cmd_cp_web(args) -> int:
                              web_root=args.web_root,
                              # collab-only has no operator listener, so nothing is left open
                              allow_open=args.allow_open or args.collab_only,
-                             rustfs=rustfs, collab=collab,
+                             rustfs=rustfs, artifact_store=artifact_adapter,
+                             artifact_job_manager=artifact_jobs,
+                             artifact_review_manager=artifact_reviews,
+                             artifact_acl=artifact_acl,
+                             publication_controller=publication_controller, collab=collab,
                              collab_tls_terminated=args.collab_tls_terminated,
                              collab_require_https=args.collab_require_https,
                              fleet_config=fleet_store, ci_actions=cp.get("ci_actions") is True,
@@ -2745,6 +2836,45 @@ def _cmd_cp_web(args) -> int:
         pass
     finally:
         svr.shutdown()
+        if artifact_adapter is not None:
+            artifact_adapter.close()
+    return 0
+
+
+def _cmd_cp_public_gateway(args) -> int:
+    """Serve only approved immutable artifact delivery; no dashboard/API routes."""
+    from .control_plane.artifact_adapter import SyncArtifactAdapter
+    from .durable_public_gateway import DurablePublicGateway
+    from .public_gateway_server import PublicGatewayServer
+
+    _, cp = _load_cp_fleet_config(args.fleet_config)
+    dsn = cp.get("pg_dsn")
+    endpoint = cp.get("rustfs_endpoint")
+    if not dsn or not endpoint:
+        raise SystemExit("public-gateway requires control_plane.pg_dsn and rustfs_endpoint")
+    rustfs = _maybe_rustfs_client(cp)
+    if rustfs is None:
+        raise SystemExit("public-gateway requires configured RustFS-compatible storage")
+    bucket = cp.get("rustfs_bucket", "herdr-artifacts")
+
+    async def create_delivery_store():
+        import asyncpg
+        conn = await asyncpg.connect(dsn)
+        return DurablePublicGateway(conn, rustfs, bucket=bucket)
+
+    adapter = SyncArtifactAdapter(create_delivery_store)
+    gateway = DurablePublicGateway.from_sync(adapter)
+    server = PublicGatewayServer(gateway, host=args.host, port=args.port)
+    _print_json({"ok": True, "serving": "approved artifact delivery only",
+                 "host": args.host, "port": server.server_port})
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.shutdown()
+        server.server_close()
+        adapter.close()
     return 0
 
 
@@ -3034,19 +3164,31 @@ def _cmd_cp_worker(args) -> int:
     import asyncio
     import logging
 
+    from .control_plane.artifact_render_runner import ArtifactRenderRunner
+    from .control_plane.artifact_renderers import RendererRegistry
+    from .control_plane.artifacts import ArtifactStore
     from .control_plane.db import Migrator
     from .control_plane.worker import run_one_pass, run_worker
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
     async def _run():
-        conn = await _cp_connect(_cp_config(getattr(args, "fleet_config", None))["postgres_dsn"])
+        cp = _cp_config(getattr(args, "fleet_config", None))
+        conn = await _cp_connect(cp["postgres_dsn"])
         try:
             migrations = args.migrations or _cp_migrations_dir()
             await Migrator(conn).apply(migrations)
+            rustfs = _maybe_rustfs_client(cp)
+            render_runner = (ArtifactRenderRunner(ArtifactStore(conn, rustfs),
+                                                   RendererRegistry())
+                             if rustfs is not None else None)
+            runner = render_runner if render_runner is not None else None
+            worker_id = args.host_id or socket.gethostname()
             if args.once:
-                return await run_one_pass(conn)
-            await run_worker(conn, interval=args.interval)
+                return await run_one_pass(conn, worker_id=worker_id,
+                                          artifact_job_runner=runner)
+            await run_worker(conn, interval=args.interval, worker_id=worker_id,
+                             artifact_job_runner=runner)
             return None
         finally:
             await conn.close()

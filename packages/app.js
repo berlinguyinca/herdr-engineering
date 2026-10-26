@@ -142,6 +142,7 @@ const ROUTES = {
   '/local-services': viewServices,
   '/services/:id': viewService,
   '/hosts': viewHosts,
+  '/scheduling': viewScheduling,
   '/hosts/:id': viewHost,
   '/activity': viewActivity,
   '/analytics': viewAnalytics,

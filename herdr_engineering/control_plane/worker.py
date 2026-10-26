@@ -3,6 +3,7 @@ snapshots, artifact GC. Bounded, never raises, runs outside the web frontend."""
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -13,11 +14,43 @@ HOST_TTL = 300.0
 ARTIFACT_TTL = 3600.0
 
 
+async def _run_artifact_job_pass(conn, *, worker_id: str,
+                                 runner, max_jobs: int = 1) -> dict:
+    completed = failed = claimed = 0
+    for _ in range(max(0, max_jobs)):
+        job = await conn.fetchrow(
+            "SELECT * FROM artifact_build_jobs WHERE status='queued' "
+            "ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT 1")
+        if job is None:
+            break
+        claimed += 1
+        job_id = job["job_id"]
+        await conn.execute(
+            "UPDATE artifact_build_jobs SET status='running', assigned_host_id=$1, "
+            "started_at=now() WHERE job_id=$2", worker_id, job_id)
+        try:
+            result = await runner(dict(job))
+            await conn.execute(
+                "UPDATE artifact_build_jobs SET status='completed', result_version_id=$1, "
+                "completed_at=now() WHERE job_id=$2", result["version_id"], job_id)
+            completed += 1
+        except Exception as exc:  # noqa: BLE001 - durable failure state is required
+            await conn.execute(
+                "UPDATE artifact_build_jobs SET status='failed', error=$1::jsonb, "
+                "completed_at=now() WHERE job_id=$2",
+                json.dumps({"message": str(exc)}), job_id)
+            failed += 1
+    return {"artifact_jobs_claimed": claimed,
+            "artifact_jobs_completed": completed,
+            "artifact_jobs_failed": failed}
+
+
 async def run_one_pass(conn, *, mission_store=None, session_store=None,
                        service_store=None, host_store=None,
                        snapshot_store=None, artifact_store=None,
                        lease_ttl=LEASE_TTL, host_ttl=HOST_TTL,
-                       artifact_ttl=ARTIFACT_TTL) -> dict:
+                       artifact_ttl=ARTIFACT_TTL, worker_id=None,
+                       artifact_job_runner=None, max_artifact_jobs=1) -> dict:
     summary: dict[str, Any] = {}
 
     # Stale services -> unavailable (never delete).
@@ -60,6 +93,13 @@ async def run_one_pass(conn, *, mission_store=None, session_store=None,
 
     # Artifact GC: Phase 1 scaffold only; real reachability GC in Phase 5.
     summary["artifact_gc"] = 0
+    summary.update({"artifact_jobs_claimed": 0,
+                   "artifact_jobs_completed": 0,
+                   "artifact_jobs_failed": 0})
+    if conn is not None and worker_id and artifact_job_runner is not None:
+        summary.update(await _run_artifact_job_pass(
+            conn, worker_id=worker_id, runner=artifact_job_runner,
+            max_jobs=max_artifact_jobs))
     return summary
 
 

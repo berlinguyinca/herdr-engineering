@@ -6,6 +6,9 @@ import urllib.request
 import pytest
 
 from herdr_engineering.control_plane.api import ControlPlaneServer
+from herdr_engineering.control_plane.artifact_acl import ArtifactAcl
+from herdr_engineering.control_plane.artifact_jobs import ArtifactJobManager
+from herdr_engineering.control_plane.publication import FakeExposureProvider, PublicationController
 from herdr_engineering.control_plane.repo import ControlPlaneRepo
 
 
@@ -105,6 +108,25 @@ def test_artifact_recorded_with_sha256_and_session_binding(server):
     assert art["session_id"] == sid
     assert art["sha256"]
     assert art["mime_type"] == "text/plain"
+
+
+def test_artifact_catalog_lists_registered_records(server):
+    base, _ = server
+    upload(base, b"cataloged", filename="catalog.txt", mime="text/plain")
+    with urllib.request.urlopen(f"{base}/api/v1/artifacts") as response:
+        payload = json.loads(response.read())
+    assert len(payload["artifacts"]) == 1
+    assert payload["artifacts"][0]["original_filename"] == "catalog.txt"
+
+
+def test_artifact_catalog_filters_server_side_before_returning_records(server):
+    base, repo = server
+    upload(base, b"one", filename="alpha.html", mime="text/html")
+    upload(base, b"two", filename="beta.pdf", mime="application/pdf")
+    with urllib.request.urlopen(f"{base}/api/v1/artifacts?q=alpha&type=other") as response:
+        payload = json.loads(response.read())
+    assert len(payload["artifacts"]) == 1
+    assert payload["artifacts"][0]["original_filename"] == "alpha.html"
 
 
 # ---- durable object-store wiring -------------------------------------------
