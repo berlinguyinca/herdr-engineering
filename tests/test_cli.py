@@ -97,3 +97,55 @@ def test_maybe_pg_source_resolves_correct_module():
     assert isinstance(src, PostgresSource)
     assert cli._maybe_pg_source(None) is None
     assert cli._maybe_pg_source("") is None
+
+
+def _cp_server():
+    import threading
+    from herdr_engineering.control_plane.api import ControlPlaneServer
+    repo = ControlPlaneRepo()
+    svr = ControlPlaneServer(repo, api_keys={"ing-1": "ingest"})
+    thread = threading.Thread(target=svr.serve, daemon=True)
+    thread.start()
+    svr.wait_until_ready()
+    return f"http://127.0.0.1:{svr.port}", repo, svr
+
+
+def test_feed_pi_once_posts_snapshot(tmp_path, monkeypatch, capsys):
+    import json as _json
+    base, repo, svr = _cp_server()
+    try:
+        fixture = tmp_path / "snapshot.json"
+        fixture.write_text(_json.dumps({
+            "contractVersion": 3, "generatedAt": "2026-01-15T00:00:00Z",
+            "missions": [{"id": "msn_x", "title": "X", "status": "in_progress",
+                          "goal": "", "workflowClass": "standard",
+                          "riskProfile": "low", "constraints": [],
+                          "requiredGates": [], "acceptanceCriteria": [],
+                          "tasks": [], "findings": []}],
+        }))
+        monkeypatch.setenv("HERDR_CP_INGEST_KEY", "ing-1")
+        rc = main(["control-plane", "feed-pi", "--snapshot", str(fixture),
+                   "--url", base])
+        assert rc == 0
+        m = repo.get_mission("pi-engineering:msn_x")
+        assert m is not None and m["title"] == "X"
+        assert repo.list_missions() and len(repo.list_missions()) == 1
+        out = capsys.readouterr().out
+        assert '"posted": 1' in out
+    finally:
+        svr.shutdown()
+
+
+def test_feed_pi_requires_ingest_key(tmp_path, monkeypatch, capsys):
+    import json as _json
+    base, repo, svr = _cp_server()
+    try:
+        fixture = tmp_path / "snapshot.json"
+        fixture.write_text(_json.dumps({"contractVersion": 3, "missions": []}))
+        monkeypatch.delenv("HERDR_CP_INGEST_KEY", raising=False)
+        rc = main(["control-plane", "feed-pi", "--snapshot", str(fixture),
+                   "--url", base])
+        assert rc == 2
+        assert repo.list_missions() == []
+    finally:
+        svr.shutdown()

@@ -1,0 +1,68 @@
+{
+  "contractVersion": 3,
+  "generatedAt": "2026-01-15T12:00:00.000Z",
+  "missions": [
+    {
+      "id": "msn_alpha",
+      "revision": 4,
+      "title": "Add health endpoint",
+      "goal": "Expose a /healthz endpoint",
+      "workflowClass": "standard",
+      "status": "in_progress",
+      "riskProfile": "low",
+      "constraints": [],
+      "requiredGates": ["review"],
+      "acceptanceCriteria": [
+        { "id": "acc-1", "criterion": "GET /healthz returns 200", "status": "met" }
+      ],
+      "tasks": [
+        {
+          "id": "task-1",
+          "kind": "implement",
+          "role": "coder",
+          "status": "in_progress",
+          "objective": "Add endpoint",
+          "mutatesRepo": true,
+          "isolation": "worktree",
+          "dependsOn": [],
+          "reliability": { "acceptanceIds": ["acc-1"], "candidateGeneration": 1, "missionGeneration": 1, "fencingToken": 1 }
+        }
+      ],
+      "findings": [],
+      "observability": {
+        "progress": { "approximatePercent": 62, "verifiedComplete": false, "basis": "task" },
+        "acceptanceCoverage": { "met": 1, "total": 1 },
+        "workflowProgress": { "stage": "implementation", "step": "writing" },
+        "health": "healthy",
+        "currentObjective": "Add endpoint",
+        "currentActivity": { "type": "implement", "summary": "writing handler" },
+        "workers": { "active": 1, "waiting": 0, "failed": 0 },
+        "lastHeartbeatAt": "2026-01-15T11:59:00.000Z",
+        "lastOutputAt": "2026-01-15T11:58:00.000Z",
+        "currentActivityStartedAt": "2026-01-15T11:50:00.000Z",
+        "lastMeaningfulProgressAt": "2026-01-15T11:58:00.000Z",
+        "completionStatus": "in_progress",
+        "progressHistory": [
+          { "at": "2026-01-15T11:30:00.000Z", "approximatePercent": 10 }
+        ],
+        "tests": { "running": false, "completed": 0, "total": 0, "passed": 0, "failed": 0, "skipped": 0, "failures": [] },
+        "review": { "status": "pending", "blockingOpen": 0, "findings": [] },
+        "workerDetails": [],
+        "activity": {},
+        "errors": {},
+        "recovery": {},
+        "changes": {},
+        "artifacts": [],
+        "action": "continue",
+        "reason": "",
+        "recoveryAttempt": { "attempt": 0, "maxAttempts": 3 },
+        "nextAction": "implement:Add endpoint",
+        "nextActionAt": null,
+        "owner": "pi-eng",
+        "repository": "berlinguyinca/herdr-engineering",
+        "task": "task-1",
+        "preservedWork": []
+      }
+    }
+  ]
+}

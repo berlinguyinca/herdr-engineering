@@ -636,6 +636,14 @@ def _build_parser() -> argparse.ArgumentParser:
     p2.add_argument("--interval", type=float, default=5.0)
     p2.add_argument("--once", action="store_true")
     p2.set_defaults(func=_cmd_cp_mission_feed)
+    p2 = csub.add_parser("feed-pi", help="post a Pi orchestration snapshot as ingest envelopes")
+    p2.add_argument("--snapshot", required=True,
+                    help="path to .pi-eng/orchestration-snapshot.json")
+    p2.add_argument("--url", default=None,
+                    help="control-plane base URL (default: host.json control_plane_url)")
+    p2.add_argument("--interval", type=float, default=0.0,
+                    help="re-post every N seconds (0 = post once and exit)")
+    p2.set_defaults(func=_cmd_cp_feed_pi)
     p2 = csub.add_parser("llm-proxy",
                          help="OpenAI-compatible fabric gateway: project keys, token accounting")
     p2.add_argument("--host", default="127.0.0.1")
@@ -683,6 +691,36 @@ def _cmd_cp_mission_feed(args) -> int:
                     control_dir=Path(args.control_dir) if args.control_dir else None,
                     interval=args.interval, once=args.once, refresher=refresher,
                     follow_url=not args.control_plane)
+
+
+def _cmd_cp_feed_pi(args) -> int:
+    import os
+    import time
+
+    from .host_config import HostConfigUnavailable, exit_unavailable, host_value, resolve_control_plane
+    from .control_plane.pi_snapshot import (
+        read_snapshot, snapshot_to_envelopes, post_envelopes,
+    )
+
+    try:
+        url = resolve_control_plane(args.url)
+    except HostConfigUnavailable as exc:
+        return exit_unavailable(exc)
+    api_key = os.environ.get("HERDR_CP_INGEST_KEY") or host_value("ingest.api_key")
+    if not api_key:
+        print("herdr-eng: HERDR_CP_INGEST_KEY is required to post Pi snapshots",
+              file=sys.stderr)
+        return 2
+    interval = max(0.0, float(args.interval))
+    while True:
+        doc = read_snapshot(args.snapshot)
+        envelopes = snapshot_to_envelopes(doc)
+        posted = post_envelopes(url, api_key, envelopes)
+        _print_json({"ok": True, "posted": posted, "missions": len(envelopes),
+                     "snapshot": args.snapshot})
+        if interval <= 0:
+            return 0
+        time.sleep(interval)
 
 
 def _cmd_cp_llm_proxy(args) -> int:
