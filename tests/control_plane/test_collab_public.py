@@ -131,7 +131,7 @@ def test_mcp_protocol_basics(stack):
     assert UNTRUSTED[:20] in out["result"]["instructions"]
     s, out = rpc(stack.pub, "tools/list", agent=agent)
     assert [t["name"] for t in out["result"]["tools"]] == [
-        "rooms_list", "room_read", "room_post", "tasks_inbox", "tasks_wait", "task_update", "task_create",
+        "agent_capabilities", "rooms_list", "room_read", "room_post", "tasks_inbox", "tasks_wait", "task_update", "task_create",
         "helper_spawn", "helper_wait", "helper_result", "helper_cancel", "agents_list"]
     assert stack.pub.call("POST", "/mcp", {"jsonrpc": "2.0", "method": "notifications/initialized"},
                           headers={**H, "Authorization": f"Agent {agent['credential']}",

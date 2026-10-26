@@ -647,6 +647,9 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FilesMixin, Co
             if a["name"] not in a["aliases"]:                  # an old name keeps working as an alias
                 a["aliases"].append(a["name"])
             a["name"] = p["name"]
+        elif t == "agent_skills_updated":
+            if p["agent_id"] in self._agents:
+                self._agents[p["agent_id"]]["skills"] = list(p.get("skills") or [])
         elif t == "credential_rotated":
             a = self._agents[p["agent_id"]]
             self._by_cred.pop(a["cred_digest"], None)
@@ -1560,6 +1563,20 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FilesMixin, Co
                 "project_ids": [], "resource_id": aid})
         return {"agent_id": aid, "credential": cred, "device_id": device, "expires_at": expires,
                 "name": handle or _default_handle(label, aid)}
+
+    def report_agent_skills(self, pr: Principal, skills: Any) -> dict:
+        """Replace the authenticated agent's local skill inventory after MCP startup discovery."""
+        if not pr.is_agent or pr.external:
+            raise CollabError(403, "only an internal agent may report skills")
+        normalized = _skills(skills) or []
+        with self._lock:
+            agent = self._agents.get(pr.id)
+            if not agent or agent.get("status") != "active":
+                raise CollabError(401, "agent is not active")
+            self._commit("agent_skills_updated", self._actor(
+                pr, agent_id=pr.id, skills=normalized, action="agent.skills.update", outcome="allowed",
+                project_ids=[], resource_id=pr.id))
+        return {"agent_id": pr.id, "skills": normalized}
 
     # ------------------------------------------------------------ fleets of agents
     def _agent_names(self, owner: str, prefix: str, count: int) -> list[str]:

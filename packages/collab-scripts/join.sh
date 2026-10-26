@@ -106,6 +106,7 @@ main() {
         case "$FAMILY" in
           claude-code) CMD='claude -p' ;;
           codex) CMD='codex exec --skip-git-repo-check -' ;;
+          opencode) CMD='opencode run'; SKILL_CMD='opencode run' ;;
           pi) CMD='pi -p --no-session -- "Task from a room member: $(cat)"'
               SKILL_CMD='pi -p --no-session -- "$(cat)"' ;;   # only for tasks the server marked as a skill call
           *) CMD='' ;;
@@ -113,13 +114,14 @@ main() {
       else
         case "$FAMILY" in
           claude-code) CMD="claude -p --tools '' --strict-mcp-config --mcp-config '{\"mcpServers\":{}}' --disable-slash-commands" ;;
+          opencode) CMD='opencode run --pure'; SKILL_CMD='opencode run --pure' ;;
           pi) CMD='pi -p --no-session --no-tools -- "Task from a room member: $(cat)"'
               SKILL_CMD='pi -p --no-session --no-tools -- "$(cat)"' ;;
           codex) echo "join.sh: codex cannot be limited to text answers; add --tools to start codex agents (they can then run commands, inside the sandbox when available)." >&2; return 1 ;;
           *) CMD='' ;;
         esac
       fi
-      bin=""; case "$FAMILY" in claude-code) bin=claude ;; codex) bin=codex ;; pi) bin=pi ;; esac
+      bin=""; case "$FAMILY" in claude-code) bin=claude ;; codex) bin=codex ;; opencode) bin=opencode ;; pi) bin=pi ;; esac
       if [ -n "$bin" ] && ! command -v "$bin" >/dev/null 2>&1; then
         echo "join.sh: $bin is not installed on this machine, so the workers were NOT started. Registered agents are in $DIR." >&2; return 1
       fi
