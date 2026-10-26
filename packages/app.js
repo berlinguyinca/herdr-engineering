@@ -149,6 +149,8 @@ const ROUTES = {
   '/analytics/models': viewAnalytics,
   '/analytics/hosts': viewAnalytics,
   '/analytics/tokens': viewAnalytics,
+  '/analytics/stages': viewAnalytics,
+  '/analytics/usage': viewAnalytics,
   '/llm': viewLlm,
   '/llm/session/:id': viewLlmSession,
 };

@@ -233,7 +233,8 @@ class IngestService:
         if entity_type.strip().lower().startswith("architecture"):
             raise ValueError("reserved architecture entity type is not accepted by generic ingestion")
         # T16 H1/M1/M5: an ALLOW-LIST. Everything else (collab, ci_*, plannotator_review, agent_identity,
-        # token_usage, ...) is owned by a dedicated, authenticated adapter and can never be written here.
+        # custom_model, llm_key, ...) is owned by a dedicated, authenticated adapter and can never be
+        # written here. token_usage / resource_usage ARE on the dispatched allow-list (issue #36).
         if entity_type not in INGEST_ENTITY_TYPES:
             raise ValueError("entity type is not accepted by generic ingestion")
         if event_type in SERVER_OWNED_EVENT_TYPES.get(entity_type, ()):

@@ -250,7 +250,7 @@ test('analytics composes its existing views into a useful dashboard', async () =
   await withApp(async ({page,base}) => {
     await page.goto(`${base}/#/analytics`);await page.locator('[data-analytics-links]').waitFor();
     const destinations=await page.locator('[data-analytics-links] a').evaluateAll(links=>links.map(link=>link.getAttribute('href')));
-    assert.deepEqual(destinations,['#/analytics/models','#/analytics/hosts','#/analytics/tokens']);
+    assert.deepEqual(destinations,['#/analytics/models','#/analytics/hosts','#/analytics/tokens','#/analytics/stages','#/analytics/usage']);
     const boxes=await page.locator('[data-analytics-links] a').evaluateAll(links=>links.map(link=>link.getBoundingClientRect().width));
     assert.ok(boxes.every(width=>width>200),'analytics destinations should use the available desktop row');
   },{BURST:'0'});
@@ -1627,4 +1627,16 @@ test('mission detail links to the delivery section pages', async () => {
       null, { timeout: 15000 });
     assert.ok((await bodyText(page)).includes('PR #7'), 'review section must render via detail nav');
   }, { BURST: '0' });
+});
+
+test('analytics stages and usage pages render seeded data', async () => {
+  await withApp(async ({page,base}) => {
+    await page.goto(`${base}/#/analytics/stages`);await page.locator('table.hd-table').waitFor();
+    const stageText=await page.locator('body').innerText();
+    assert.ok(stageText.includes('Bottleneck'),'stages page shows bottleneck metric');
+    await page.goto(`${base}/#/analytics/usage`);await page.locator('table.hd-table').first().waitFor();
+    const usageText=await page.locator('body').innerText();
+    assert.ok(usageText.includes('Tokens by model'),'usage page shows token grouping');
+    assert.ok(usageText.includes('Resources by kind'),'usage page shows resource grouping');
+  },{BURST:'0'});
 });

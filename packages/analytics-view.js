@@ -5,7 +5,7 @@ import { morph } from './patch.js';
 import { liveRefresher } from './refresh-bus.js';
 import { escapeHtml as esc } from './herdr-web-components/util.js';
 
-const TITLES = { '': 'Analytics', missions: 'Analytics', models: 'Model analytics', tokens: 'Token usage', hosts: 'Host analytics' };
+const TITLES = { '': 'Analytics', missions: 'Analytics', models: 'Model analytics', tokens: 'Token usage', hosts: 'Host analytics', stages: 'Stage analytics', usage: 'Usage' };
 
 const DASHBOARD_STYLE = `<style>
       .an-dashboard{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,280px),1fr));gap:var(--density-gap,16px);align-items:start;width:100%}.an-panel{min-width:0;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:var(--density-panel-padding,16px)}.an-panel h2{font-size:16px;margin:0 0 12px}.an-panel p{font-size:12px;color:var(--text-secondary)}
@@ -19,6 +19,8 @@ export async function loadAnalytics(client, sub = '') {
   if (sub === 'models') return { models: await client.analytics('models') };
   if (sub === 'tokens') return { tokens: await client.analytics('tokens') };
   if (sub === 'hosts') return { hosts: await client.analytics('hosts') };
+  if (sub === 'stages') return { stages: await client.analytics('stages') };
+  if (sub === 'usage') return { usage: await client.analytics('usage') };
   const [missions, models, hosts] = await Promise.all([client.analytics('missions'), client.analytics('models'), client.analytics('hosts')]);
   return { missions, models, hosts };
 }
@@ -51,7 +53,7 @@ function dashboard({ missions, models, hosts }) {
       <section class="an-panel" data-analytics-panel="completion"><h2>Completion</h2><div class="an-value">${field('missions.completion_rate', `${missions.completion_rate}%`)}</div><p>Across recorded missions</p></section>
       <section class="an-panel" data-analytics-panel="fleet"><h2>Fleet health</h2><div class="an-pairs"><div>${field('hosts.healthy', hosts.healthy, 'strong')}<span>healthy</span></div><div>${field('hosts.unavailable', hosts.unavailable, 'strong')}<span>unavailable</span></div></div><p>${field('hosts.total', hosts.total, 'span')} hosts reporting</p></section>
       <section class="an-panel" data-analytics-panel="models"><h2>Model coverage</h2><div class="an-value">${field('models.count', modelEntries.length)} <span>models</span></div><p>${field('models.total_sessions', models.total_sessions, 'span')} agent sessions</p><ul class="an-model-list">${modelEntries.slice(0, 4).map(([model, usage]) => `<li data-key="${esc(model)}"><span>${esc(model)}</span><strong data-field="model.sessions">${esc(usage.sessions)}</strong></li>`).join('') || '<li><span>No model usage recorded</span></li>'}</ul></section>
-      <section class="an-panel" data-analytics-panel="views"><h2>Explore analytics</h2><nav class="an-links" data-analytics-links aria-label="Analytics views"><a href="#/analytics/models"><strong>Models</strong><span>Agent distribution by model</span></a><a href="#/analytics/hosts"><strong>Hosts</strong><span>Reported fleet health</span></a><a href="#/analytics/tokens"><strong>Token usage</strong><span>Requests and tokens by project</span></a></nav></section>
+      <section class="an-panel" data-analytics-panel="views"><h2>Explore analytics</h2><nav class="an-links" data-analytics-links aria-label="Analytics views"><a href="#/analytics/models"><strong>Models</strong><span>Agent distribution by model</span></a><a href="#/analytics/hosts"><strong>Hosts</strong><span>Reported fleet health</span></a><a href="#/analytics/tokens"><strong>Token usage</strong><span>Requests and tokens by project</span></a><a href="#/analytics/stages"><strong>Stage analytics</strong><span>Per-stage p50/p95 and bottleneck</span></a><a href="#/analytics/usage"><strong>Usage</strong><span>Tokens by model and resources by kind</span></a></nav></section>
       <section class="an-panel an-stage" data-analytics-panel="stages"><h2>Missions by stage</h2>${stageBars(missions.by_stage)}</section>
     </div>`;
 }
@@ -90,7 +92,52 @@ function hostsPage({ hosts: h }) {
     </div>`;
 }
 
-const PAGES = { '': dashboard, missions: dashboard, models: modelsPage, tokens: tokensPage, hosts: hostsPage };
+// Per-stage p50/p95 durations, the bottleneck stage, and currently open runs.
+function stagesPage({ stages }) {
+  const entries = Object.entries(stages.stages || {});
+  const bottleneck = stages.bottleneck;
+  const inProgress = Object.entries(stages.in_progress || {});
+  const fmt = (ms) => (typeof ms === 'number' ? `${ms}ms` : '—');
+  const rows = entries.map(([stage, s]) => `
+      <tr data-key="${esc(stage)}"><td>${esc(stage)}</td><td>${fmt(s.p50_ms)}</td>
+      <td>${fmt(s.p95_ms)}</td><td>${esc(s.runs)}</td></tr>`).join('');
+  return `<div class="hd-grid">
+      <herdr-metric label="Bottleneck" value="${esc(bottleneck || 'None')}"></herdr-metric>
+      <herdr-metric label="Stages measured" value="${esc(entries.length)}"></herdr-metric>
+    </div>
+    <h3 style="margin-top:20px">Per-stage duration</h3>
+    <table class="hd-table"><thead><tr><th>Stage</th><th>p50</th><th>p95</th><th>Runs</th></tr></thead>
+    <tbody>${rows || '<tr><td colspan="4">No closed stage runs recorded yet.</td></tr>'}</tbody></table>
+    <h3 style="margin-top:20px">In progress</h3>
+    ${inProgress.length ? `<ul class="an-model-list">${inProgress.map(([mission, stagesList]) => `<li data-key="${esc(mission)}"><span>${esc(mission)}</span><strong>${esc(stagesList.join(', '))}</strong></li>`).join('')}</ul>` : '<p class="hd-card__sub">No mission is currently mid-stage.</p>'}`;
+}
+
+// Token counts by model and resource totals by kind (mission-scoped usage).
+function usagePage({ usage }) {
+  const tokens = usage.tokens || {};
+  const byModel = Object.entries(tokens.by_model || {});
+  const total = tokens.total || {};
+  const fmt = (n) => Number(n || 0).toLocaleString();
+  const modelRows = byModel.map(([model, t]) => `
+      <tr data-key="${esc(model)}"><td>${esc(model)}</td><td>${fmt(t.input_tokens)}</td>
+      <td>${fmt(t.output_tokens)}</td><td>${fmt(t.reasoning_tokens)}</td></tr>`).join('');
+  const resRows = Object.entries(usage.resources || {}).map(([kind, r]) => `
+      <tr data-key="${esc(kind)}"><td>${esc(kind)}</td><td>${fmt(r.count)}</td>
+      <td>${fmt(r.total)}</td><td>${esc(r.unit || '—')}</td></tr>`).join('');
+  return `<div class="hd-grid">
+      <herdr-metric label="Input tokens" value="${fmt(total.input_tokens)}"></herdr-metric>
+      <herdr-metric label="Output tokens" value="${fmt(total.output_tokens)}"></herdr-metric>
+      <herdr-metric label="Resource kinds" value="${esc(Object.keys(usage.resources || {}).length)}"></herdr-metric>
+    </div>
+    <h3 style="margin-top:20px">Tokens by model</h3>
+    <table class="hd-table"><thead><tr><th>Model</th><th>Input</th><th>Output</th><th>Reasoning</th></tr></thead>
+    <tbody>${modelRows || '<tr><td colspan="4">No token usage recorded.</td></tr>'}</tbody></table>
+    <h3 style="margin-top:20px">Resources by kind</h3>
+    <table class="hd-table"><thead><tr><th>Kind</th><th>Count</th><th>Total</th><th>Unit</th></tr></thead>
+    <tbody>${resRows || '<tr><td colspan="4">No resource usage recorded.</td></tr>'}</tbody></table>`;
+}
+
+const PAGES = { '': dashboard, missions: dashboard, models: modelsPage, tokens: tokensPage, hosts: hostsPage, stages: stagesPage, usage: usagePage };
 
 export function mountAnalytics(container, client, sub = '', { data = null } = {}) {
   const page = PAGES[sub] ? sub : '';
