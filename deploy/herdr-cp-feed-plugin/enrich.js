@@ -143,7 +143,7 @@ export function attachCommand(host, server, pane) {
 export function mergeDetail(envelope, detail) {
   if (!envelope || envelope.entity_type !== "session" || !detail) return envelope;
   const payload = { ...(envelope.payload || {}) };
-  for (const k of ["agent_role", "cwd", "branch", "pid", "cmdline", "summary", "attach", "terminal_id", "agent_session", "revision", "interactive_ready", "launch_pending", "state_change_seq", "repository_id", "commit_sha"]) {
+  for (const k of ["agent_role", "workspace_id", "cwd", "branch", "pid", "cmdline", "summary", "attach", "terminal_id", "agent_session", "revision", "interactive_ready", "launch_pending", "state_change_seq", "repository_id", "commit_sha"]) {
     const v = detail[k];
     if (v !== undefined && v !== null && v !== "") {
       if (k === "agent_role" && payload.agent_role) continue; // prefer existing
@@ -151,6 +151,11 @@ export function mergeDetail(envelope, detail) {
     }
   }
   return { ...envelope, payload };
+}
+
+// Keep native workspace identifiers separate from control-plane mission IDs.
+export function rawWorkspace(missionId) {
+  return typeof missionId === "string" ? missionId.replace(/^herdr-ws:/, "") : undefined;
 }
 
 // Fetch live detail for a session envelope and merge it in. Best-effort.
@@ -173,6 +178,7 @@ export async function enrichSession(env, envelope) {
   ]);
   const detail = {
     ...repository,
+    workspace_id: rawWorkspace(envelope.payload?.mission_id),
     agent_role: pane?.agent,
     terminal_id: pane?.terminal_id,
     agent_session: pane?.agent_session,

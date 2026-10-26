@@ -31,10 +31,15 @@ import { readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { readHostJson } from "./host-config.js";
 import { pathToFileURL } from "node:url";
-import { enrichSession, resolveSessionEnv } from "./enrich.js";
+import { enrichSession, rawWorkspace, resolveSessionEnv } from "./enrich.js";
 import { recordSessionBinding } from "./session-helpers.js";
 
 const EVENT_JSON = "HERDR_PLUGIN_EVENT_JSON";
+const WS_PREFIX = "herdr-ws:";
+
+function missionId(ws) {
+  return ws ? WS_PREFIX + ws : ws;
+}
 
 // Host identity: os.hostname() is authoritative; HOSTNAME env (which herdr does
 // not set) is only a fallback override for testing.
@@ -124,6 +129,7 @@ function agentRole(ev, ctx = {}) {
 
 function hostEnvelope(host, eventType, extra = {}) {
   return {
+    source: "herdr",
     entity_type: "host",
     entity_id: host,
     event_type: eventType,
@@ -133,8 +139,9 @@ function hostEnvelope(host, eventType, extra = {}) {
 
 function missionEnvelope(ws, eventType, info, { stage, purpose } = {}) {
   return {
+    source: "herdr",
     entity_type: "mission",
-    entity_id: ws,
+    entity_id: missionId(ws),
     event_type: eventType,
     payload: {
       title: info.title ?? ws,
@@ -147,6 +154,7 @@ function missionEnvelope(ws, eventType, info, { stage, purpose } = {}) {
 
 function sessionEnvelope(pane, eventType, { host, ws, role, status, server, serverKey } = {}) {
   return {
+    source: "herdr",
     entity_type: "session",
     entity_id: ["herdr", host, serverKey, pane].map(encodeURIComponent).join(":"),
     event_type: eventType,
@@ -154,7 +162,7 @@ function sessionEnvelope(pane, eventType, { host, ws, role, status, server, serv
       host_id: host,
       pane_id: pane,
       herdr_session: server,
-      mission_id: ws,
+      mission_id: missionId(ws),
       agent_role: role ?? "",
       status: status ?? "active",
     },
@@ -288,7 +296,7 @@ async function send(url, envelope) {
 function resolveContext(env, envelopes) {
   const envCtx = contextJson(env);
   const ids = [...new Set(
-    envelopes.filter((e) => e.entity_type === "mission").map((e) => e.entity_id))];
+    envelopes.filter((e) => e.entity_type === "mission").map((e) => rawWorkspace(e.entity_id)))];
   const info = {};
   for (const id of ids) info[id] = workspaceInfo(env, id, envCtx);
   return info;

@@ -7,10 +7,10 @@
 // covered via mergeDetail's contract and a live smoke test on the host.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, chmodSync } from "node:fs";
+import { mkdtempSync, writeFileSync, chmodSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { herdrBin, mergeDetail, attachCommand } from "./enrich.js";
+import { herdrBin, mergeDetail, attachCommand, enrichSession } from "./enrich.js";
 
 // ---------------------------------------------------------------------------
 // herdrBin
@@ -127,14 +127,40 @@ console.log(JSON.stringify({ok:true,result:{pane:{terminal_id:'terminal-1',revis
 `);
   chmodSync(binary, 0o755);
   try {
-    const envelope = { entity_type: "session", entity_id: "herdr:beast:eng:w1%3Ap1", payload: { pane_id: "w1:p1", host_id: "beast", herdr_session: "eng" } };
+    const envelope = { entity_type: "session", entity_id: "herdr:beast:eng:w1%3Ap1", source: "herdr", payload: { pane_id: "w1:p1", host_id: "beast", herdr_session: "eng", mission_id: "herdr-ws:w1" } };
     const result = await enrichSession({ HERDR_BIN: binary, HERDR_SESSION_NAME: "eng" }, envelope);
     const args = readFileSync(log, "utf8").trim().split("\n").map(JSON.parse);
     assert.ok(args.some(a => JSON.stringify(a) === JSON.stringify(["--session", "eng", "pane", "get", "w1:p1"])));
     assert.ok(args.every(a => !a.includes(envelope.entity_id)));
+    assert.equal(result.source, "herdr");
+    assert.equal(result.payload.mission_id, "herdr-ws:w1");
+    assert.equal(result.payload.workspace_id, "w1");
     assert.equal(result.payload.terminal_id, "terminal-1");
     assert.equal(result.payload.agent_session.value, "/tmp/conversation.jsonl");
     assert.equal(result.payload.revision, 5);
     assert.equal(result.payload.attach, `ssh -t beast "bash -lc 'herdr --session eng agent attach w1:p1'"`);
   } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+for (const [missionId, workspaceId] of [["herdr-ws:w1", "w1"], ["w1", "w1"], [undefined, undefined]]) {
+  test(`enrichment preserves workspace identity when CLI is unavailable (${missionId})`, async (t) => {
+    const dir = mkdtempSync(join(tmpdir(), "herdr-unavailable-"));
+    t.after(() => rmSync(dir, { recursive: true, force: true }));
+    const envelope = { source: "herdr", entity_type: "session", entity_id: "herdr:beast:eng:w1%3Ap1",
+      payload: { pane_id: "w1:p1", host_id: "beast", herdr_session: "eng", mission_id: missionId } };
+    const result = await enrichSession({ HERDR_BIN: join(dir, "missing-herdr") }, envelope);
+    assert.equal(result.payload.workspace_id, workspaceId);
+    assert.equal(result.payload.mission_id, missionId);
+    assert.equal(result.source, "herdr");
+    assert.equal(result.payload.cwd, undefined);
+    assert.equal(result.payload.attach, `ssh -t beast "bash -lc 'herdr --session eng agent attach w1:p1'"`);
+    assert.equal(envelope.payload.workspace_id, undefined);
+  });
+}
+
+test("namespaced mission does not enable attach without a known server", async () => {
+  const envelope = { entity_type: "session", entity_id: "herdr:beast:unknown:w1%3Ap1",
+    payload: { pane_id: "w1:p1", host_id: "beast", mission_id: "herdr-ws:w1" } };
+  assert.equal(await enrichSession({}, envelope), envelope);
+  assert.equal(envelope.payload.attach, undefined);
 });
