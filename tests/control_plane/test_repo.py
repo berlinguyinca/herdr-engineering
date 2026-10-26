@@ -454,3 +454,19 @@ def test_stage_analytics_percentiles_bottleneck_and_in_progress():
     assert a["stages"]["review"]["runs"] == 1
     assert mid in a["in_progress"] and a["in_progress"][mid] == ["complete"]
     assert mid2 in a["in_progress"] and a["in_progress"][mid2] == ["review"]
+
+
+def test_stage_analytics_tracks_upsert_mission_stage_changes():
+    """Normal ingestion uses upsert_mission; a stage change there must also feed
+    stage analytics (codex P1)."""
+    clock = {"t": 1_700_000_000.0}
+    r = repo.ControlPlaneRepo(now=lambda: clock["t"])
+    r.upsert_mission("pi-1", title="m", stage="ready", source="pi")
+    clock["t"] += 0.25
+    r.upsert_mission("pi-1", title="m", stage="implementation", source="pi")
+    clock["t"] += 0.75
+    r.upsert_mission("pi-1", title="m", stage="complete", source="pi")
+    a = r.stage_analytics()
+    assert a["stages"]["implementation"]["p50_ms"] == 750
+    assert a["bottleneck"] == "implementation"
+    assert a["in_progress"] == {"pi:pi-1": ["complete"]}

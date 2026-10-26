@@ -19,6 +19,19 @@ def _parse(iso: str) -> _dt.datetime:
     return _dt.datetime.fromisoformat(iso)
 
 
+def _prune_usage_projection(repo, cutoff, entity_type):
+    """Drop mission-scoped usage projection records whose occurred_at predates the
+    retention cutoff, so usage_analytics() never reports swept totals."""
+    if entity_type == "token_usage":
+        projection = getattr(repo, "_token_usage", None)
+        if projection is None:
+            return
+        stale = [rid for rid, rec in projection.items()
+                 if _parse(rec.get("occurred_at") or "") < cutoff]
+        for rid in stale:
+            projection.pop(rid, None)
+
+
 def apply_retention(repo, *, telemetry_ttl_hours=24, events_ttl_days=30,
                     artifact_ttl_days=365, now=None):
     """Prune telemetry / old raw events / artifact bytes past their TTL.
@@ -135,6 +148,10 @@ def sweep_token_usage(repo, *, raw_retention_days, now=None) -> int:
                 if occurrences and occurrences.popleft():
                     order.append(reference)
             repo._event_order = order
+    # The mission-scoped usage projection (issue #36) is keyed by request_id, so
+    # its records are not the same rows just swept; prune them by occurred_at so
+    # usage_analytics() never reports totals the retention window already dropped.
+    _prune_usage_projection(repo, cutoff, USAGE_ENTITY_TYPE)
     # Durable I/O outside the event lock; without it a restart would re-hydrate them.
     prune = getattr(getattr(repo, "_sink", None), "prune_events_before", None)
     if callable(prune):

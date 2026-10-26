@@ -1258,6 +1258,7 @@ class ControlPlaneRepo:
                            "commit_sha": existing.get("commit_sha")},
                           mission_id=mission_id)
         if stage:
+            self._transition_stage(key, previous_stage, stage)
             self._mission_stage_changed(key, previous_stage, stage)
         return _copy(existing)
 
@@ -2546,20 +2547,30 @@ class ControlPlaneRepo:
                     except (ValueError, KeyError, TypeError):
                         continue
         # Stage transitions: rebuild stage runs from each mission's event stream
-        # so per-stage durations survive a restart.
+        # so per-stage durations survive a restart. set_mission_stage emits
+        # MissionStageChanged (with from/to); upsert_mission emits MissionUpdated
+        # (with only the current stage), so the running stage is tracked per
+        # mission to detect a change and derive the transition.
         self._stage_runs = {}
         for (etype, eid), stream in list(self._events.items()):
             if etype != "mission":
                 continue
+            current = None
             for ev in stream:
-                if ev.get("event_type") != "MissionStageChanged":
-                    continue
+                ev_type = ev.get("event_type")
                 p = _payload(ev)
+                if ev_type == "MissionStageChanged":
+                    old, new = p.get("from"), p.get("to")
+                elif ev_type == "MissionUpdated":
+                    old, new = current, p.get("stage")
+                else:
+                    continue
                 try:
-                    self._transition_stage(eid, p.get("from"), p.get("to"),
+                    self._transition_stage(eid, old, new,
                                            when=ev.get("source_timestamp"))
                 except (ValueError, KeyError, TypeError):
-                    continue
+                    pass
+                current = new
         for entity_type in ("test_run", "build", "review", "pull_request"):
             for ids in self.entity_ids(entity_type):
                 stream = self._events.get((entity_type, ids), [])
