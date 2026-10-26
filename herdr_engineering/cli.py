@@ -12,10 +12,8 @@ import json
 import logging
 import os
 import re
-import signal
 import socket
 import sys
-import threading
 from typing import Any
 
 from .version import __version__
@@ -73,6 +71,7 @@ def _build_parser() -> argparse.ArgumentParser:
     # doctor ---------------------------------------------------------------
     p = sub.add_parser("doctor", help="capability/health checks (spec 0050/0170)")
     p.add_argument("--json", action="store_true", help="stable machine-readable output")
+    p.add_argument("--strict", action="store_true", help="fail when required integrations are missing")
     p.set_defaults(func=_cmd_doctor)
 
     # agent-mine -----------------------------------------------------------
@@ -172,9 +171,8 @@ def _build_parser() -> argparse.ArgumentParser:
     pj.add_argument("--user", default=None, help="fleet ssh user for ansible host_vars")
     pj.add_argument("--ansible-host", default=None,
                     help="tailnet MagicDNS/ip for ansible (defaults to ssh_target)")
-    pj.add_argument("--gateway", default=None,
-                    help="IGNORED for the fabric agent (warns); set fabric.url in "
-                         "fleet-config.yaml or fabric.gateway_url in config.yaml")
+    pj.add_argument("--gateway", default="http://dev.lan:29999",
+                    help="fabric gateway URL the agent registers with")
     pj.add_argument("--no-attach", action="store_true",
                     help="skip the herdr machine add step")
     pj.add_argument("--no-provision", action="store_true",
@@ -229,9 +227,8 @@ def _build_parser() -> argparse.ArgumentParser:
     pu = fsub.add_parser("update", help="self-update controller + every host, then "
                                         "report parity (one command)")
     pu.add_argument("--host", default=None, help="update only this host (default: all)")
-    pu.add_argument("--gateway", default=None,
-                    help="IGNORED for the fabric agent (warns); set fabric.url in "
-                         "fleet-config.yaml or fabric.gateway_url in config.yaml")
+    pu.add_argument("--gateway", default="http://dev.lan:29999",
+                    help="fabric gateway URL the agent registers with")
     pu.add_argument("--no-pull", action="store_true", help="skip controller git pull")
     pu.add_argument("--no-reinstall", action="store_true",
                     help="skip controller local pip reinstall")
@@ -246,15 +243,6 @@ def _build_parser() -> argparse.ArgumentParser:
     pd.add_argument("--host", help="only this host")
     pd.add_argument("--json", action="store_true")
     pd.set_defaults(func=_cmd_fleet_drift)
-
-    recovery = fsub.add_parser("recover", help="plan or apply staggered outage recovery for Pi sessions")
-    recovery.add_argument("recovery_command", nargs="?", choices=("plan", "apply", "run", "status"), default="plan")
-    recovery.add_argument("--pi-revision", help="opt in to this exact immutable Pi release before recovery (planning only)")
-    recovery.add_argument("--id", help="recovery plan ID (required for apply/status)")
-    recovery.add_argument("--inventory", help="fleet inventory path (planning only)")
-    recovery.add_argument("--host", help="fleet host filter (planning only)")
-    recovery.add_argument("--session", default="default", help="explicit native HerdR server session")
-    recovery.set_defaults(func=_cmd_fleet_recover)
 
     pr = fsub.add_parser("rollout", help="durable Pi runtime update and mission recovery")
     rsub = pr.add_subparsers(dest="rollout_command", required=True)
@@ -283,16 +271,17 @@ def _build_parser() -> argparse.ArgumentParser:
     p2.add_argument("--machine"); p2.add_argument("--revision"); p2.add_argument("--name")
     p2.add_argument("data", help="path to file to publish")
     p2.set_defaults(func=_cmd_art_publish)
+    p2 = asub.add_parser("upload", help="upload a file to the shared control-plane artifact registry")
+    p2.add_argument("data", help="path to file")
+    p2.add_argument("--control-plane", default=None)
+    p2.add_argument("--filename", default=None)
+    p2.add_argument("--mime", default="application/octet-stream")
+    p2.add_argument("--session", default=None)
+    p2.add_argument("--mission", default=None)
+    p2.set_defaults(func=_cmd_art_upload)
     asub.add_parser("list", help="list stored artifacts").set_defaults(func=_cmd_art_list)
     p2 = asub.add_parser("retention", help="enforce retention policy")
     p2.set_defaults(func=_cmd_art_retention)
-    # system-graph artifact (P5): deterministic sanitized snapshot renderer.
-    ga = sub.add_parser("graph-artifact", help="render a graph snapshot to validated HTML (system-graph P5)")
-    gas = ga.add_subparsers(dest="graph_artifact_command", required=True)
-    p2 = gas.add_parser("render", help="render a graph snapshot JSON to a deterministic sanitized HTML artifact")
-    p2.add_argument("graph_json", help="path to a graph snapshot JSON file")
-    p2.add_argument("--out", default=None, help="output .html path (default: <graph_json>.html)")
-    p2.set_defaults(func=_cmd_graph_artifact_render)
 
     # journal --------------------------------------------------------------
     p = sub.add_parser("journal", help="session journal & timeline (spec 0090)")
@@ -466,21 +455,6 @@ def _build_parser() -> argparse.ArgumentParser:
     p2.add_argument("review_id"); p2.add_argument("decision")
     p2.add_argument("--comment"); p2.set_defaults(func=_cmd_review_resolve)
 
-    # review-gate ----------------------------------------------------------
-    p = sub.add_parser("review-gate", help="PR review gate tools")
-    gsub = p.add_subparsers(dest="review_gate_command", required=True)
-    p2 = gsub.add_parser("worker", help="run the reviewer worker (claims jobs, calls the model)")
-    p2.add_argument("--config", required=True, help="worker YAML config file")
-    p2.add_argument("--once", action="store_true", help="run one claim cycle and exit")
-    p2.set_defaults(func=_cmd_review_gate_worker)
-    p2 = gsub.add_parser("pool", help="run a pool of reviewer workers sized by the review queue")
-    p2.add_argument("--config", required=True, help="pool YAML config file")
-    p2.set_defaults(func=_cmd_review_gate_pool)
-    p2 = gsub.add_parser("check-skips", help="fail when a test is skipped outside the disabled-tests file")
-    p2.add_argument("--junit", action="append", required=True, help="junit XML file or directory (repeatable)")
-    p2.add_argument("--disabled", required=True, help="disabled-tests YAML file")
-    p2.set_defaults(func=_cmd_review_gate_check_skips)
-
     # candidates -----------------------------------------------------------
     p = sub.add_parser("candidates", help="multi-agent worktree comparison (spec 0140)")
     csub = p.add_subparsers(dest="candidates_command", required=True)
@@ -493,9 +467,6 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--host", default=None); p.add_argument("--port", type=int, default=None)
     p.set_defaults(func=_cmd_web)
 
-    from .architecture import command as _architecture_command
-    _architecture_command.register(sub)
-
     # control-plane --------------------------------------------------------
     p = sub.add_parser("control-plane",
                        help="HerdR Dev Fabric Control Plane (spec 0190)")
@@ -506,16 +477,6 @@ def _build_parser() -> argparse.ArgumentParser:
     p2.add_argument("--fleet-config", default=FLEET_CONFIG_DEFAULT,
                     help="central fleet config file; control_plane.pg_dsn names the database")
     p2.set_defaults(func=_cmd_cp_migrate)
-    p2 = csub.add_parser("collab-repair", help="set aside foreign rows of the collaboration log (dry run by default; "
-                         "never deletes: rows move to a quarantine file/table)")
-    p2.add_argument("--log-file", default=None, help="a collab-only JSON-lines log; without it the Postgres "
-                    "fabric_events table named by --fleet-config is used")
-    p2.add_argument("--fleet-config", default=FLEET_CONFIG_DEFAULT)
-    p2.add_argument("--apply", action="store_true", help="really move the rows (needs --confirm-quarantine)")
-    p2.add_argument("--confirm-quarantine", action="store_true", help="explicit confirmation for --apply")
-    p2.add_argument("--include-gap-tail", action="store_true",
-                    help="also set aside every row after the first missing sequence (may drop genuine events)")
-    p2.set_defaults(func=_cmd_cp_collab_repair)
     p2 = csub.add_parser("web", help="serve the control-plane UI + /api/v1 + SSE")
     p2.add_argument("--host", default="127.0.0.1",
                     help="bind host (default 127.0.0.1; private-by-default)")
@@ -534,9 +495,6 @@ def _build_parser() -> argparse.ArgumentParser:
     p2.add_argument("--pg-dsn", default=None,
                     help="optional Postgres DSN to hydrate the repo from "
                          "durable state on startup (Spec §106)")
-    p2.add_argument("--system-graph", action="store_true",
-                    help="opt-in: reflect mission/session/repo/trace lifecycle events "
-                         "into the running lineage graph (system-graph spec P2-P4)")
     p2.add_argument("--seed-demo", action="store_true",
                     help="seed a fresh in-memory repo with demo data so the "
                          "UI is populated (useful when no Postgres is present)")
@@ -572,9 +530,6 @@ def _build_parser() -> argparse.ArgumentParser:
                     help="approval mode: any pool account may sign in and ask to join, and nothing works until "
                          "an approver or the operator approves it; --collab-cognito-group members are approved "
                          "on sight instead of being required")
-    p2.add_argument("--collab-replay-history", default=None, choices=["full", "since_join"],
-                    help="lineage replay window for members (default since_join; normally set by "
-                         "control_plane.collab.replay_history in the fleet config)")
     p2.add_argument("--collab-approver-group", action="append", default=[],
                     help="Cognito group whose members may approve new people (repeatable; approval mode)")
     p2.add_argument("--collab-public-port", type=int, default=None,
@@ -597,8 +552,6 @@ def _build_parser() -> argparse.ArgumentParser:
     p2.add_argument("--collab-operator-url", default=None,
                     help="dashboard: forward /api/v1/collab/* to the operator listener of the "
                          "isolated collab service (e.g. http://100.64.0.1:8082)")
-    # No flag on purpose: the T11 delegation kill switch is YAML only (control_plane.collab.delegation_enabled).
-    p2.set_defaults(collab_delegation_enabled=False)
     p2.add_argument("--collab-dashboard-host", action="append", default=[],
                     help="extra DNS name the dashboard may be reached by for collaboration "
                          "(IP literals and localhost always work; repeatable; DNS-rebinding guard)")
@@ -617,6 +570,11 @@ def _build_parser() -> argparse.ArgumentParser:
                     help="assert TLS is terminated in front of this server; required to "
                          "enable collaboration on a non-loopback bind")
     p2.set_defaults(func=_cmd_cp_web)
+    p2 = csub.add_parser("public-gateway", help="serve the isolated approved-artifact delivery gateway")
+    p2.add_argument("--host", default="127.0.0.1")
+    p2.add_argument("--port", type=int, default=0)
+    p2.add_argument("--fleet-config", default=FLEET_CONFIG_DEFAULT)
+    p2.set_defaults(func=_cmd_cp_public_gateway)
     p2 = csub.add_parser("worker", help="run the bounded background worker")
     p2.add_argument("--interval", type=float, default=30.0,
                     help="seconds between passes (default: 30)")
@@ -626,6 +584,7 @@ def _build_parser() -> argparse.ArgumentParser:
                     help="migrations dir (default: bundled deploy/control-plane)")
     p2.add_argument("--fleet-config", default=FLEET_CONFIG_DEFAULT,
                     help="central fleet config file; control_plane.pg_dsn names the database")
+    p2.add_argument("--host-id", default=None, help="worker host identity for artifact job placement")
     p2.set_defaults(func=_cmd_cp_worker)
     p2 = csub.add_parser("mission-feed", help="publish read-only live Pi mission activity")
     p2.add_argument("--control-plane", default=None,
@@ -663,10 +622,10 @@ def _cmd_cp_mission_feed(args) -> int:
         HostConfigUnavailable,
         exit_unavailable,
         host_config,
+        host_config_or_none,
         resolve_control_plane,
     )
     from .mission_activity_feed import run_feed
-    from .host_config import host_config_or_none
     try:
         url = resolve_control_plane(args.control_plane)
         if args.control_plane and args.host_id:
@@ -845,15 +804,15 @@ def _cmd_machines(args) -> int:
 
 def _cmd_fleet_join(args) -> int:
     from pathlib import Path
-    from .fleet import DEFAULT_GATEWAY, fleet_join, warn_gateway_ignored
-    warn_gateway_ignored(args.gateway)
+
+    from .fleet import fleet_join
     report = fleet_join(
         ssh_target=args.ssh_target,
         label=args.label,
         os_name=args.os,
         user=args.user,
         ansible_host=args.ansible_host or args.ssh_target,
-        gateway=DEFAULT_GATEWAY,
+        gateway=args.gateway,
         attach=not args.no_attach,
         provision=not args.no_provision,
         fleet_config=None if args.no_credentials else Path(args.fleet_config).expanduser(),
@@ -877,6 +836,7 @@ def _cmd_fleet_join(args) -> int:
 
 def _cmd_fleet_config(args) -> int:
     from pathlib import Path
+
     from . import fleet_config_cli as fcc
     from .fleet_config import FleetConfigError, load_fleet_config
     cmd = args.fleet_config_command
@@ -932,11 +892,10 @@ def _cmd_fleet_config(args) -> int:
 
 
 def _cmd_fleet_update(args) -> int:
-    from .fleet import DEFAULT_GATEWAY, fleet_update, warn_gateway_ignored
-    warn_gateway_ignored(args.gateway)
+    from .fleet import fleet_update
     report = fleet_update(
         host=args.host,
-        gateway=DEFAULT_GATEWAY,
+        gateway=args.gateway,
         pull_controller=not args.no_pull,
         reinstall_local=not args.no_reinstall,
     )
@@ -958,39 +917,6 @@ def _cmd_fleet_update(args) -> int:
         if fs.get("rc") != 0 and fs.get("stderr"):
             print(f"  !! {fs['stderr']}")
     return 0 if report.get("ok") else 1
-
-
-def _cmd_fleet_recover(args) -> int:
-    from pathlib import Path
-
-    from .fleet import repo_root
-    from .fleet_rollout import inventory_targets
-    from .pi_recovery import RecoveryStore, apply_recovery, create_plan
-
-    store = RecoveryStore()
-    try:
-        if args.recovery_command in ("plan", "run"):
-            inventory_value = args.inventory or os.environ.get("HERDR_PI_RECOVERY_INVENTORY")
-            inventory = Path(inventory_value).expanduser() if inventory_value else repo_root() / "ansible/inventory/hosts.yml"
-            targets = [{**target, "session": args.session} for target in inventory_targets(inventory, args.host)]
-            report = create_plan(store, targets, progress=lambda event: print(event, file=sys.stderr, flush=True), revision=args.pi_revision or os.environ.get("HERDR_PI_RECOVERY_REVISION"), inventory=inventory)
-            if args.recovery_command == "run":
-                print("Recovery plan: " + report["id"], file=sys.stderr, flush=True)
-                report = apply_recovery(store, report["id"], progress=lambda event: print(event, file=sys.stderr, flush=True))
-        elif args.host or args.inventory or args.pi_revision or args.session != "default":
-            raise ValueError("apply/status use the frozen plan targets; planning flags are not allowed")
-        elif not args.id:
-            raise ValueError("--id is required for apply/status")
-        elif args.recovery_command == "apply":
-            report = apply_recovery(store, args.id, progress=lambda event: print(event, file=sys.stderr, flush=True))
-        else:
-            from .pi_recovery_verification import verify_recovery
-            report = verify_recovery(store, args.id, progress=lambda event: print(event, file=sys.stderr, flush=True))
-    except (OSError, ValueError, RuntimeError) as exc:
-        _print_json({"error": str(exc)})
-        return 1
-    _print_json(report)
-    return 2 if report.get("status") == "needs_verification" else 0
 
 
 def _cmd_fleet_rollout(args) -> int:
@@ -1116,22 +1042,33 @@ def _cmd_art_publish(args) -> int:
     return 0 if res.ok else 1
 
 
-def _cmd_graph_artifact_render(args) -> int:
-    """Render a graph snapshot JSON file (GraphProjection.snapshot() shape) to
-    a deterministic sanitized HTML artifact (system-graph P5).
-    """
-    import json as _json
+def _cmd_art_upload(args) -> int:
+    import urllib.request
     from pathlib import Path
+    from urllib.parse import urlencode
 
-    from .control_plane.graph_artifact import GraphArtifactRenderer
+    from .host_config import HostConfigUnavailable, exit_unavailable, resolve_control_plane
 
-    data = _json.loads(Path(args.graph_json).read_text())
-    result = GraphArtifactRenderer(
-        title=data.get("title", "System graph snapshot")).render(data)
-    out = args.out or f"{args.graph_json}.html"
-    Path(out).write_text(result.html)
-    _print_json({"ok": True, "out": out, "digest": result.digest,
-                 "nodes": result.node_count, "edges": result.edge_count})
+    try:
+        base = resolve_control_plane(args.control_plane)
+    except HostConfigUnavailable as exc:
+        return exit_unavailable(exc)
+    path = Path(args.data)
+    query = {"filename": args.filename or path.name, "mime": args.mime}
+    if args.session:
+        query["session_id"] = args.session
+    if args.mission:
+        query["mission_id"] = args.mission
+    req = urllib.request.Request(
+        f"{base}/api/v1/artifacts?{urlencode(query)}", data=path.read_bytes(),
+        method="POST", headers={"Content-Type": args.mime})
+    try:
+        with urllib.request.urlopen(req, timeout=60) as response:
+            payload = json.loads(response.read(8 * 1024 * 1024))
+    except (OSError, ValueError) as exc:
+        print(f"artifact upload failed: {exc}", file=sys.stderr)
+        return 1
+    _print_json(payload)
     return 0
 
 
@@ -1203,8 +1140,8 @@ def _local_fabric_client():
 
 
 def _gateway_configured_or_reachable() -> bool:
-    """True when a gateway URL is configured (fabric.url in the central host
-    config or fabric.gateway_url in config.yaml) OR a gateway is currently reachable.
+    """True when a gateway URL is configured (env HERDR_ENGINEERING_FABRIC_URL
+    or fabric.gateway_url in config) OR a gateway is currently reachable.
     Used to warn about silent local-registry degradation (issue #77b)."""
     from .config import load_config
     from .errors import InvalidError
@@ -1938,7 +1875,7 @@ def _cmd_dev_agent(args) -> int:
 
     from .config import InvalidError, load_config
     from .fabric import FabricClient, gateway_url_from_config, tailnet_ipv4
-    from .fabric_agent import AgentConfig, FabricAgent, parse_agent_binaries
+    from .fabric_agent import AgentConfig, FabricAgent
     from .host_config import ConfigRefresher, HostConfigUnavailable, exit_unavailable, host_config
 
     logging.basicConfig(level=logging.INFO,
@@ -1956,8 +1893,8 @@ def _cmd_dev_agent(args) -> int:
     if not base:
         _print_json({
             "code": "config",
-            "message": "no gateway configured: set fabric.url in the central "
-                       "fleet-config.yaml, or fabric.gateway_url in config.yaml",
+            "message": "no gateway configured: set fabric.gateway_url or "
+                       "HERDR_ENGINEERING_FABRIC_URL",
         })
         return 1
     tailnet_ip = tailnet_ipv4()
@@ -1977,11 +1914,6 @@ def _cmd_dev_agent(args) -> int:
     # extra excluded ports + the dev-port window the agent will register.
     extra_exclude = frozenset(int(p) for p in fabric_cfg.get(
         "agent_exclude_ports", []))
-    try:
-        agent_binaries = parse_agent_binaries(fabric_cfg.get("agent_binaries"))
-    except ValueError as exc:
-        _print_json({"code": "config", "message": str(exc)})
-        return 1
     def control_plane_for(host_cfg):
         return fabric_cfg.get("control_plane_url") or host_cfg.control_plane_url
 
@@ -1996,9 +1928,6 @@ def _cmd_dev_agent(args) -> int:
             web_port_min=int(fabric_cfg.get("agent_web_port_min", 1024)),
             ephemeral_min=int(fabric_cfg.get("agent_ephemeral_min", 32768)),
             control_plane_url=control_plane_for(live),
-            host_report_interval=float(fabric_cfg.get("host_report_interval", 30.0)),
-            host_slow_interval=float(fabric_cfg.get("host_slow_interval", 3600.0)),
-            agent_binaries=agent_binaries,
         ))
     if args.once:
         summary = agent.scan_once()
@@ -2272,88 +2201,6 @@ def _cmd_browser(args) -> int:
     return 0 if cap.ok else 1
 
 
-def _cmd_review_gate_worker(args) -> int:
-    """Exit 0 on a clean stop, 1 when the reviewer key is refused, 2 on a config error.
-
-    Messages are fixed text (config errors carry no key material); nothing from a
-    response, URL or key file is printed.
-    """
-    from .review_gate import worker as rgw
-
-    if not logging.getLogger().handlers:
-        logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    try:
-        config = rgw.load_worker_config(args.config)
-        reviewer = rgw.ReviewWorker(config)
-        if args.once:
-            print("handled" if reviewer.run_once() else "idle")
-            return 0
-        stop = threading.Event()
-
-        def _request_stop(_signum, _frame):
-            stop.set()
-
-        signal.signal(signal.SIGINT, _request_stop)
-        signal.signal(signal.SIGTERM, _request_stop)
-        reviewer.run(stop)
-        return 0
-    except rgw.WorkerAuthError:
-        print("review-gate worker: the control plane refused the reviewer key", file=sys.stderr)
-        return 1
-    except rgw.WorkerConfigError as exc:
-        print(f"review-gate worker: config error: {exc}", file=sys.stderr)
-        return 2
-
-
-def _cmd_review_gate_pool(args) -> int:
-    """Same exit codes and fixed-text messages as ``review-gate worker``."""
-    from .review_gate import pool as rgp
-    from .review_gate import worker as rgw
-
-    if not logging.getLogger().handlers:
-        logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    try:
-        pool = rgp.ReviewPool(rgp.load_pool_config(args.config))
-        stop = threading.Event()
-
-        def _request_stop(_signum, _frame):
-            stop.set()
-
-        signal.signal(signal.SIGINT, _request_stop)
-        signal.signal(signal.SIGTERM, _request_stop)
-        pool.run(stop)
-        return 0
-    except rgw.WorkerAuthError:
-        print("review-gate pool: the control plane refused the reviewer key", file=sys.stderr)
-        return 1
-    except rgw.WorkerConfigError as exc:
-        print(f"review-gate pool: config error: {exc}", file=sys.stderr)
-        return 2
-    except Exception as exc:  # noqa: BLE001 - restartable: not a refused key or bad config
-        print(f"review-gate pool: internal error: {type(exc).__name__}", file=sys.stderr)
-        return 3
-
-
-def _cmd_review_gate_check_skips(args) -> int:
-    """Exit 0 clean, 1 when a skipped test is not in the disabled file, 2 on bad input."""
-    from .review_gate import skips
-
-    try:
-        report = skips.check_junit(args.junit, skips.load_disabled(args.disabled))
-    except skips.SkipsError as exc:
-        print(f"review-gate check-skips: {exc}", file=sys.stderr)
-        return 2
-    for name in report.unused_disabled:
-        print(f"warning: listed as disabled but not skipped: {name}", file=sys.stderr)
-    if report.skipped_unlisted:
-        print(f"{len(report.skipped_unlisted)} test(s) skipped outside the disabled-tests file:")
-        for name in report.skipped_unlisted:
-            print(f"- {name}")
-        return 1
-    print(f"ok: {report.total} testcases, no unlisted skips")
-    return 0
-
-
 def _cmd_review_request(args) -> int:
     from .browser import PlannotatorAdapter
     review = PlannotatorAdapter().request_review(
@@ -2436,29 +2283,6 @@ def _cmd_cp_migrate(args) -> int:
     return 0
 
 
-def _cmd_cp_collab_repair(args) -> int:
-    import asyncio
-
-    from .control_plane import collab_repair
-    try:
-        if args.log_file:
-            report = collab_repair.repair_file(args.log_file, apply=args.apply, confirmed=args.confirm_quarantine,
-                                               cut_tail=args.include_gap_tail)
-        else:
-            async def _run():
-                conn = await _cp_connect(_cp_config(getattr(args, "fleet_config", None))["postgres_dsn"])
-                try:
-                    return await collab_repair.repair_postgres(conn, apply=args.apply, confirmed=args.confirm_quarantine,
-                                                               cut_tail=args.include_gap_tail)
-                finally:
-                    await conn.close()
-            report = asyncio.run(_run())
-    except (PermissionError, collab_repair.LogInUseError, collab_repair.SchemaTooOldError) as exc:
-        raise SystemExit(str(exc)) from None
-    _print_json({"ok": True, **report})
-    return 0
-
-
 def _parse_service_port(endpoint: str | None, default: int) -> int:
     """Best-effort port extraction from a URL/DSN (``http://rustfs:9000``)."""
     if not endpoint:
@@ -2501,22 +2325,6 @@ def _parse_host_aliases(raw: str) -> dict[str, str]:
     return {a.strip(): c.strip() for a, c in pairs if a.strip() and c.strip()}
 
 
-def _require_durable_review_gate(cp: dict, dsn) -> None:
-    """An enabled review gate needs Postgres (``control_plane.pg_dsn``).
-
-    Gate state (PR states, review queue, author pins) is event-sourced and
-    written with ``require_durable=True``. Without a DSN the repo has no sink,
-    those writes would live only in memory and a restart would forget every
-    approval and escalation, so the real server refuses to start. The check
-    lives here, where the DSN is known: a ``ControlPlaneServer`` built directly
-    on an in-memory ``ControlPlaneRepo()`` (tests, embedding) is not refused.
-    """
-    gate = cp.get("review_gate")
-    if not dsn and isinstance(gate, dict) and gate.get("enabled") is True:
-        raise SystemExit("control_plane.review_gate needs durable storage: set "
-                         "control_plane.pg_dsn, or disable the review gate")
-
-
 def _cmd_cp_web(args) -> int:
     """Serve the control-plane UI + structured /api/v1 + SSE (private-by-default).
 
@@ -2529,11 +2337,7 @@ def _cmd_cp_web(args) -> int:
     from .control_plane.sink import DurableEventSink
 
     fleet_store, cp = _load_cp_fleet_config(getattr(args, "fleet_config", None))
-    switch_store = fleet_store
-    replay_flag = getattr(args, "collab_replay_history", None)      # an explicit --collab-replay-history wins over the YAML
     api_keys = _parse_api_keys(args.api_key, args.api_keys)
-    lineage_key_scopes = {}
-    federation_source = None
     if args.collab_only:
         # The public collab container is given only the collab slice of the central
         # file (`fleet config render-collab`): no fleet endpoint, no API keys, no DSN.
@@ -2545,7 +2349,7 @@ def _cmd_cp_web(args) -> int:
         if not (args.collab_log_file and args.collab_public_port and args.collab_cognito_pool):
             raise SystemExit("--collab-only needs --collab-log-file, --collab-public-port and a "
                              "Cognito pool (control_plane.collab.cognito_pool or --collab-cognito-pool)")
-        switch_store, fleet_store = fleet_store, None     # no fleet endpoint here, but the switches still reload
+        fleet_store = None
     elif fleet_store is not None:
         _install_fleet_host_config(fleet_store)
         names = (cp.get("collab") or {}).get("dashboard_hosts") if isinstance(cp.get("collab"), dict) else None
@@ -2559,33 +2363,6 @@ def _cmd_cp_web(args) -> int:
         merged = {str(k): str(v) for k, v in file_keys.items()}
         merged.update(api_keys or {})
         api_keys = merged or None
-        from .control_plane.federation import PEER_KINDS, FederationConfigError, parse_federation
-        if any(str(v).strip() in PEER_KINDS for v in (api_keys or {}).values()):
-            raise SystemExit("api_keys: role 'peer'/'peer-user' is not an API key role; a federated peer is configured "
-                             "under control_plane.federation.peers (ADR-0008), never as a key")
-        try:
-            parse_federation(cp.get("federation"))        # startup: refuse a bad section; hot reads fail closed
-        except FederationConfigError as exc:
-            raise SystemExit(f"fleet config {exc}") from None
-
-        def federation_source(_store=fleet_store):
-            return _store.secure_section("control_plane").get("federation")     # raises while the file is unusable
-        raw_scopes = cp.get("lineage_key_scopes") or {}
-        if not isinstance(raw_scopes, dict):
-            raise SystemExit("fleet config control_plane.lineage_key_scopes must map an api key to {rooms: [...], missions: [...]}")
-        for key, allow in raw_scopes.items():
-            if (str(key) not in (api_keys or {}) or not isinstance(allow, dict) or set(allow) - {"rooms", "missions"}
-                    or not all(isinstance(allow.get(n, []), list) and all(isinstance(v, str) and v for v in allow.get(n, []))
-                               for n in ("rooms", "missions"))):
-                raise SystemExit("fleet config control_plane.lineage_key_scopes: each entry must name a configured api key "
-                                 "and hold only rooms/missions lists of non-empty strings")
-        if any((api_keys or {}).get(str(k)) == "operator" for k in raw_scopes):
-            raise SystemExit("fleet config control_plane.lineage_key_scopes: an entry names an operator-role key; operator keys "
-                             "are not restricted, so the entry would silently do nothing. Remove it or use a non-operator key")
-        lineage_key_scopes = {str(k): v for k, v in raw_scopes.items()}
-    # Opt-in: reflect mission/session/repo/trace lifecycle events into the running
-    # lineage graph (system-graph spec P2-P4). Off by default.
-    system_graph = bool(cp.get("system_graph")) or bool(getattr(args, "system_graph", False))
     if args.collab_cognito_group is None:
         args.collab_cognito_group = "local.dev"
     # The Postgres DSN comes from the fleet file's control_plane section (the
@@ -2594,27 +2371,6 @@ def _cmd_cp_web(args) -> int:
     inspector_limits = cp.get("inspector_limits") or {}
     if not isinstance(inspector_limits, dict):
         raise SystemExit("fleet config control_plane.inspector_limits must be a mapping")
-    from .control_plane.retention import usage_retention_config
-    try:
-        usage_retention = usage_retention_config(cp.get("llm_proxy"))
-    except ValueError as exc:
-        raise SystemExit(f"fleet config {exc}") from None
-    from .control_plane.attention_inbox import attention_config
-    try:
-        attention = attention_config(cp.get("attention"))
-    except ValueError as exc:
-        raise SystemExit(f"fleet config {exc}") from None
-    from .control_plane.mission_outcome import missions_config
-    try:
-        missions = missions_config(cp.get("missions"))
-    except ValueError as exc:
-        raise SystemExit(f"fleet config {exc}") from None
-    from .control_plane.ci_fix import ci_fix_config
-    try:
-        ci_fix = ci_fix_config(cp.get("ci_fix"))
-    except ValueError as exc:
-        raise SystemExit(f"fleet config {exc}") from None
-    _require_durable_review_gate(cp, dsn)
     source = _maybe_pg_source(dsn)
     # When durable storage is wired, attach a write-through sink so every
     # ingested event persists to Postgres instead of dying with the in-memory
@@ -2628,6 +2384,48 @@ def _cmd_cp_web(args) -> int:
     if args.seed_demo:
         _seed_demo(repo)
     rustfs = _maybe_rustfs_client(cp)
+    artifact_adapter = None
+    if dsn and rustfs is not None:
+        from .control_plane.artifact_adapter import SyncArtifactAdapter
+        from .control_plane.artifacts import ArtifactStore
+
+        async def create_artifact_store():
+            import asyncpg
+            conn = await asyncpg.connect(dsn)
+            return ArtifactStore(conn, rustfs)
+
+        artifact_adapter = SyncArtifactAdapter(create_artifact_store)
+    from .control_plane.artifact_acl import ArtifactAcl
+    from .control_plane.artifact_jobs import ArtifactJobManager
+    from .control_plane.artifact_reviews import ArtifactReviewManager
+    from .control_plane.publication import PrivateOnlyExposureProvider, PublicationController
+    from .exposure_cloudflare import CloudflareTunnelProvider
+    from .exposure_tailscale import TailscaleFunnelProvider
+    persist = (lambda action, payload: artifact_adapter("record_job_event", action, payload)) \
+        if artifact_adapter is not None else None
+    persist_review = (lambda action, payload: artifact_adapter("record_review_event", action, payload)) \
+        if artifact_adapter is not None else None
+    persist_acl = (lambda action, payload: artifact_adapter("record_acl_event", action, payload)) \
+        if artifact_adapter is not None else None
+    persist_publication = (lambda action, payload: artifact_adapter("record_publication_event", action, payload)) \
+        if artifact_adapter is not None else None
+    artifact_jobs = ArtifactJobManager(on_change=persist)
+    artifact_reviews = ArtifactReviewManager(on_change=persist_review)
+    artifact_acl = ArtifactAcl(on_change=persist_acl)
+    provider_name = cp.get("public_exposure_provider", "private_only")
+    if provider_name == "tailscale_funnel":
+        publication_provider = TailscaleFunnelProvider(enabled=True)
+    elif provider_name == "cloudflare_tunnel":
+        publication_provider = CloudflareTunnelProvider(enabled=True)
+    else:
+        publication_provider = PrivateOnlyExposureProvider()
+    publication_controller = PublicationController(
+        provider=publication_provider, on_change=persist_publication,
+        default_local_target=cp.get("public_gateway_target", "http://127.0.0.1:8085"))
+    if artifact_adapter is not None:
+        artifact_acl.load(artifact_adapter("load_acl"))
+        artifact_reviews.load(artifact_adapter("load_reviews"))
+        artifact_jobs.load(artifact_adapter("load_jobs"))
     collab = None
     if args.collab_cognito_pool:
         if args.collab_users_file:
@@ -2669,11 +2467,9 @@ def _cmd_cp_web(args) -> int:
             from .control_plane.collab import ApprovalPolicy
             approval = ApprovalPolicy(auto_groups=[args.collab_cognito_group],
                                       approver_groups=args.collab_approver_group)
-        collab = CollabService(auth, sink=sink, public_config=public, approval=approval,
-                               delegation_enabled=_delegation_switch(args, cp),
-                               summary_fix=getattr(args, "collab_summary_fix", None))
+        collab = CollabService(auth, sink=sink, public_config=public, approval=approval)
         if args.collab_only:
-            collab.hydrate_or_degrade(sink.load)       # T16 H1: any replay failure disables collaboration only
+            collab.hydrate(sink.load())
     elif args.collab_users_file:
         from pathlib import Path
 
@@ -2686,35 +2482,20 @@ def _cmd_cp_web(args) -> int:
         if sink is not None and source is None:
             raise SystemExit("collaboration with a durable sink requires the source to load "
                              "existing state; refusing to start empty over an existing log")
-        collab = CollabService(StaticTokenAuthenticator(users), sink=sink,
-                               delegation_enabled=_delegation_switch(args, cp))
-    if collab is not None:
-        history = getattr(args, "collab_replay_history", None) or "since_join"
-        if history not in ("full", "since_join"):
-            raise SystemExit("control_plane.collab.replay_history must be 'full' or 'since_join'")
-        collab.replay_history = history
-        from .control_plane.collab_attention import normalize_insights
-        from .control_plane.collab_context import normalize_contextual
-        from .control_plane.collab_workbench import normalize_steering
-        collab.steering = normalize_steering(getattr(args, "collab_steering", None))
-        collab.contextual = normalize_contextual(getattr(args, "collab_contextual", None))
-        collab.insights = normalize_insights(getattr(args, "collab_insights", None))
-        _wire_collab_switches(collab, switch_store, pinned=frozenset({"replay_history"}) if replay_flag else frozenset())
-    svr = ControlPlaneServer(repo, api_keys=api_keys, lineage_key_scopes=lineage_key_scopes,
-                             federation_source=federation_source,
-                             system_graph=system_graph,
+        collab = CollabService(StaticTokenAuthenticator(users), sink=sink)
+    svr = ControlPlaneServer(repo, api_keys=api_keys,
                              host=args.host, port=args.port, source=source,
                              web_root=args.web_root,
                              # collab-only has no operator listener, so nothing is left open
                              allow_open=args.allow_open or args.collab_only,
-                             rustfs=rustfs, collab=collab,
+                             rustfs=rustfs, artifact_store=artifact_adapter,
+                             artifact_job_manager=artifact_jobs,
+                             artifact_review_manager=artifact_reviews,
+                             artifact_acl=artifact_acl,
+                             publication_controller=publication_controller, collab=collab,
                              collab_tls_terminated=args.collab_tls_terminated,
                              collab_require_https=args.collab_require_https,
                              fleet_config=fleet_store, ci_actions=cp.get("ci_actions") is True,
-                             summary_config=cp.get("agent_summaries") or {},
-                             review_quorum=_review_quorum_config(cp),
-                             usage_retention=usage_retention, attention=attention,
-                             ci_fix=ci_fix, missions=missions, github_pg_dsn=dsn,
                              public_port=args.collab_public_port,
                              public_host=args.collab_public_host,
                              collab_only=args.collab_only,
@@ -2745,6 +2526,45 @@ def _cmd_cp_web(args) -> int:
         pass
     finally:
         svr.shutdown()
+        if artifact_adapter is not None:
+            artifact_adapter.close()
+    return 0
+
+
+def _cmd_cp_public_gateway(args) -> int:
+    """Serve only approved immutable artifact delivery; no dashboard/API routes."""
+    from .control_plane.artifact_adapter import SyncArtifactAdapter
+    from .durable_public_gateway import DurablePublicGateway
+    from .public_gateway_server import PublicGatewayServer
+
+    _, cp = _load_cp_fleet_config(args.fleet_config)
+    dsn = cp.get("pg_dsn")
+    endpoint = cp.get("rustfs_endpoint")
+    if not dsn or not endpoint:
+        raise SystemExit("public-gateway requires control_plane.pg_dsn and rustfs_endpoint")
+    rustfs = _maybe_rustfs_client(cp)
+    if rustfs is None:
+        raise SystemExit("public-gateway requires configured RustFS-compatible storage")
+    bucket = cp.get("rustfs_bucket", "herdr-artifacts")
+
+    async def create_delivery_store():
+        import asyncpg
+        conn = await asyncpg.connect(dsn)
+        return DurablePublicGateway(conn, rustfs, bucket=bucket)
+
+    adapter = SyncArtifactAdapter(create_delivery_store)
+    gateway = DurablePublicGateway.from_sync(adapter)
+    server = PublicGatewayServer(gateway, host=args.host, port=args.port)
+    _print_json({"ok": True, "serving": "approved artifact delivery only",
+                 "host": args.host, "port": server.server_port})
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.shutdown()
+        server.server_close()
+        adapter.close()
     return 0
 
 
@@ -2780,15 +2600,6 @@ COLLAB_CONFIG_KEYS = {
     "open_signup": ("collab_open_signup", bool),
     "approver_groups": ("collab_approver_group", list),
     "dashboard_hosts": ("collab_dashboard_host", list),   # names the private dashboard may be opened by
-    # T11 kill switch: bounded task delegation + artifact proposals. Default false = the feature does not exist.
-    "delegation_enabled": ("collab_delegation_enabled", bool),
-    "replay_history": ("collab_replay_history", str),     # lineage replay: since_join (default) | full
-    "steering": ("collab_steering", dict),                # T12 comments + steering; YAML only, off by default
-    "contextual": ("collab_contextual", dict),            # T14 context refs, consultation, cross links; YAML only, off by default
-    "insights": ("collab_insights", dict),                # T15 attention inbox, progress, analytics; YAML only, off by default
-    "skills": ("collab_skills", dict),                    # public collaboration skill catalog/config
-    # {room_id, requester_agent_id}: the operator's standing summary-fix room (YAML only, no flag)
-    "summary_fix": ("collab_summary_fix", dict),
 }
 
 
@@ -2804,13 +2615,6 @@ def _apply_collab_config(args, cp) -> None:
         if key not in collab:
             continue
         value = collab[key]
-        if kind is dict and key == "summary_fix":
-            from .control_plane.collab import summary_fix_config
-            try:
-                setattr(args, dest, summary_fix_config(value))
-            except ValueError as exc:
-                raise SystemExit(f"fleet config {exc}") from None
-            continue
         if kind is list:
             if isinstance(value, str):
                 value = [value]
@@ -2818,15 +2622,6 @@ def _apply_collab_config(args, cp) -> None:
                 raise SystemExit(f"fleet config control_plane.collab.{key} must be a list of strings")
             if not getattr(args, dest):
                 setattr(args, dest, list(value))
-        elif kind is dict:
-            from .control_plane.collab_attention import normalize_insights
-            from .control_plane.collab_context import normalize_contextual
-            from .control_plane.collab_workbench import normalize_steering
-            try:
-                {"contextual": normalize_contextual, "insights": normalize_insights}.get(key, normalize_steering)(value)
-            except ValueError as exc:
-                raise SystemExit(f"fleet config {exc}") from None
-            setattr(args, dest, dict(value))
         elif kind is bool:
             if not isinstance(value, bool):
                 raise SystemExit(f"fleet config control_plane.collab.{key} must be true or false")
@@ -2836,95 +2631,6 @@ def _apply_collab_config(args, cp) -> None:
                 raise SystemExit(f"fleet config control_plane.collab.{key} must be a non-empty string")
             if getattr(args, dest) is None:
                 setattr(args, dest, value)
-
-
-# T16 M3/M15: EVERY collab feature switch is read per request through FleetConfigStore.secure_section, so a
-# missing, unreadable (unparseable, group/other-accessible) or invalid fleet file turns it OFF (or, for
-# replay_history, to the stricter value) identically. Adding a switch to COLLAB_CONFIG_KEYS without
-# registering it here fails tests/control_plane/test_t16_security.py.
-HOT_COLLAB_SWITCHES = {
-    "steering": ("steering_source", "dict"),
-    "contextual": ("contextual_source", "dict"),
-    "insights": ("insights_source", "dict"),
-    "delegation_enabled": ("delegation_source", "bool"),
-    "replay_history": ("replay_history_source", "str"),
-}
-# collab keys that are not feature switches (identity, listener and URL settings read once at startup)
-STARTUP_ONLY_COLLAB_KEYS = frozenset(COLLAB_CONFIG_KEYS) - frozenset(HOT_COLLAB_SWITCHES)
-
-
-# control_plane keys read ONCE at startup: editing them needs a restart (unlike HOT_COLLAB_SWITCHES)
-RESTART_REQUIRED_KEYS = ("review_quorum", "lineage_key_scopes", "api_keys", "ci_actions", "pg_dsn", "architecture")
-
-
-def _wire_collab_switches(collab, store, pinned=frozenset()) -> None:
-    """Attach the hot, fail-closed sources of every collab switch (no-op without a fleet file). ``pinned`` names
-    switches given on the command line: the flag wins and the file is not consulted for them."""
-    if store is None:
-        return
-
-    def make(key):
-        def source(_store=store):
-            section = _store.secure_section("control_plane")          # raises while the file is unusable
-            collab_section = section.get("collab")
-            return collab_section.get(key) if isinstance(collab_section, dict) else None
-        return source
-    from .control_plane.collab_attention import normalize_insights
-    from .control_plane.collab_context import normalize_contextual
-    from .control_plane.collab_workbench import normalize_steering
-    normalizers = {"steering": normalize_steering, "contextual": normalize_contextual, "insights": normalize_insights}
-
-    def check(key, value):
-        return normalizers[key](value) if key in normalizers else value
-    for key, (attr, kind) in HOT_COLLAB_SWITCHES.items():
-        base = make(key)
-        if kind == "bool":
-            def source(_base=base):
-                value = _base()
-                if value is None:
-                    return False
-                if not isinstance(value, bool):
-                    raise ValueError("delegation_enabled must be true or false")
-                return value
-        elif kind == "str":
-            def source(_base=base):
-                value = _base()
-                if value is None:
-                    return "since_join"
-                if value not in ("full", "since_join"):
-                    raise ValueError("replay_history must be 'full' or 'since_join'")
-                return value
-        else:
-            source = base
-        if key in pinned:
-            continue
-        setattr(collab, attr, source)
-        try:                       # an invalid block is not a startup error (the switch is simply OFF) but it is loud
-            check(key, source())
-        except Exception as exc:   # noqa: BLE001
-            logging.getLogger(__name__).error(
-                "control_plane.collab.%s is unusable (%s): the feature is OFF until the file is fixed", key, exc)
-
-
-def _delegation_switch(args, cp) -> bool:
-    """The T11 kill switch from control_plane.collab.delegation_enabled (YAML only, default off). The
-    collab-only path has already folded it into ``args`` via _apply_collab_config; the combined path reads it here."""
-    if getattr(args, "collab_delegation_enabled", False):
-        return True
-    collab = cp.get("collab") if isinstance(cp, dict) else None
-    value = collab.get("delegation_enabled", False) if isinstance(collab, dict) else False
-    if not isinstance(value, bool):
-        raise SystemExit("fleet config control_plane.collab.delegation_enabled must be true or false")
-    return value
-
-
-def _review_quorum_config(cp):
-    """Parse control_plane.review_quorum (None = off); a bad block stops startup."""
-    from .control_plane.review_quorum import parse_config
-    try:
-        return parse_config(cp.get("review_quorum"))
-    except ValueError as exc:
-        raise SystemExit(f"--fleet-config: {exc}") from None
 
 
 def _load_cp_fleet_config(path_arg):
@@ -3034,19 +2740,31 @@ def _cmd_cp_worker(args) -> int:
     import asyncio
     import logging
 
+    from .control_plane.artifact_render_runner import ArtifactRenderRunner
+    from .control_plane.artifact_renderers import RendererRegistry
+    from .control_plane.artifacts import ArtifactStore
     from .control_plane.db import Migrator
     from .control_plane.worker import run_one_pass, run_worker
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
     async def _run():
-        conn = await _cp_connect(_cp_config(getattr(args, "fleet_config", None))["postgres_dsn"])
+        cp = _cp_config(getattr(args, "fleet_config", None))
+        conn = await _cp_connect(cp["postgres_dsn"])
         try:
             migrations = args.migrations or _cp_migrations_dir()
             await Migrator(conn).apply(migrations)
+            rustfs = _maybe_rustfs_client(cp)
+            render_runner = (ArtifactRenderRunner(ArtifactStore(conn, rustfs),
+                                                   RendererRegistry())
+                             if rustfs is not None else None)
+            runner = render_runner if render_runner is not None else None
+            worker_id = args.host_id or socket.gethostname()
             if args.once:
-                return await run_one_pass(conn)
-            await run_worker(conn, interval=args.interval)
+                return await run_one_pass(conn, worker_id=worker_id,
+                                          artifact_job_runner=runner)
+            await run_worker(conn, interval=args.interval, worker_id=worker_id,
+                             artifact_job_runner=runner)
             return None
         finally:
             await conn.close()

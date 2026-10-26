@@ -12,6 +12,7 @@ import { mountInspector } from './inspector-view.js';
 import { mountMissionActivity } from './mission-live-view.js';
 import { mountMissionCatalog } from './mission-catalog-view.js';
 import { mountServices, renderServiceDetails } from './services-view.js';
+import { classifyDashboardError, dashboardErrorMessage } from './dashboard-load-state.js';
 
 // Cache of { [mission_id]: title } so activity/session text can resolve
 // cryptic mission ids to their human names. Fetched lazily, best-effort.
@@ -88,6 +89,7 @@ const onSessionPage = () => /^#\/herd\/session\//.test(window.location.hash);
 
 async function render() {
   const revision = ++renderRevision;
+  const startedAt = Date.now();
   refreshMissionHistory = null;
   if (servicesView) { servicesView.dispose(); servicesView = null; }
   if (disposeMissionActivity) { disposeMissionActivity(); disposeMissionActivity = null; }
@@ -104,7 +106,9 @@ async function render() {
     await ROUTES[match || '/overview'](parts, revision);
   } catch (err) {
     if (revision !== renderRevision) return;
-    root.innerHTML = `<herdr-error message="${esc(err.message || 'request failed')}"></herdr-error>`;
+    const detail = classifyDashboardError(err, Date.now() - startedAt);
+    detail.requestId = err?.requestId || '';
+    root.innerHTML = `<herdr-error message="${esc(dashboardErrorMessage('This page', detail))}"></herdr-error><p class="hd-note">The page could not load completely. <button type="button" data-route-retry>Retry</button>${detail.requestId ? ` Request ${esc(detail.requestId)}` : ''}</p>`;
   }
 }
 
@@ -623,6 +627,9 @@ connectEvents({
   onError: () => { /* keep last view; the client auto-reconnects */ },
 });
 
+document.addEventListener('click', event => {
+  if (event.target.closest?.('[data-route-retry]')) render();
+});
 window.addEventListener('hashchange', () => {
   if (liveTimer) { clearTimeout(liveTimer); liveTimer = null; }
   lastLiveRender = Date.now(); render();

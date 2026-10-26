@@ -12,6 +12,24 @@ from __future__ import annotations
 
 import re
 
+from .project_links import canonical_repository
+
+
+def _git_identity(payload):
+    """Only explicit forge identity and a dedicated full commit SHA link CI."""
+    fields = ("repository_id", "forge_url", "repository_url", "repo_url", "clone_url")
+    advertised = [payload[k] for k in fields if payload.get(k) is not None]
+    identities = {canonical_repository(value, forge_host=payload.get("forge_host"))
+                  for value in advertised}
+    if None in identities or len(identities) > 1:
+        raise ValueError("repository identity must identify one explicit forge repository")
+    commit_sha = payload.get("commit_sha")
+    if commit_sha is not None:
+        if not isinstance(commit_sha, str) or not re.fullmatch(r"(?:[a-fA-F0-9]{40}|[a-fA-F0-9]{64})", commit_sha):
+            raise ValueError("commit_sha must be a full 40 or 64 character hexadecimal commit")
+        commit_sha = commit_sha.lower()
+    return {"repository_id": next(iter(identities), None), "commit_sha": commit_sha}
+
 
 class IngestService:
     """Translates lifecycle event envelopes into idempotent repo mutations."""
@@ -48,6 +66,10 @@ class IngestService:
         if not re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", source):
             raise ValueError("invalid source")
 
+        # Provider-owned observations and review outcomes have dedicated,
+        # authenticated adapters; generic telemetry cannot forge those streams.
+        if entity_type in {"plannotator_review", "ci_pipeline"}:
+            raise ValueError("provider-owned entity type is not accepted by generic ingestion")
         if entity_type == "mission_activity":
             if event_type != "mission_activity.snapshot":
                 raise ValueError("invalid mission activity event_type")
@@ -82,11 +104,30 @@ class IngestService:
     def _ingest_host(self, entity_id, event_type, payload) -> dict:
         status = ("unavailable" if "unavailable" in event_type.lower()
                   else "healthy")
-        return self.repo.upsert_host(
+        host = self.repo.upsert_host(
             entity_id,
             payload.get("host_name") or payload.get("name") or entity_id,
             payload.get("tailnet_ip") or payload.get("ip"),
-            cpu=payload.get("cpu"), mem=payload.get("mem"), status=status)
+            cpu=payload.get("cpu"), mem=payload.get("mem"), status=status,
+            inventory=payload.get("inventory"),
+            host_uid=payload.get("host_uid"),
+            aliases=payload.get("aliases"),
+            platform=payload.get("platform"),
+            scheduler_owned=payload.get("scheduler_owned"),
+            scheduler_trusted=payload.get("scheduler_trusted"),
+            scheduler_policy=payload.get("scheduler_policy"))
+        sample = {k: payload[k] for k in ("cpu", "mem", "disk")
+                  if isinstance(payload.get(k), (int, float))
+                  and not isinstance(payload.get(k), bool)}
+        if sample:
+            self.repo.record_telemetry(entity_id, {
+                "cpu_pct": sample.get("cpu"), "mem_pct": sample.get("mem"),
+                "disk_pct": sample.get("disk"),
+                "sequence": payload.get("sequence"),
+                "freshness_seconds": payload.get("freshness_seconds"),
+                "confidence": payload.get("confidence", "legacy"),
+            })
+        return host
 
     def _ingest_session(self, entity_id, event_type, payload,
                         source="herdr") -> dict:
@@ -104,10 +145,11 @@ class IngestService:
             cwd=payload.get("cwd"), branch=payload.get("branch"),
             pid=payload.get("pid"), cmdline=payload.get("cmdline"),
             summary=payload.get("summary"), attach=payload.get("attach"),
-            source=source,
+            source=source, **_git_identity(payload),
             **{k: payload.get(k) for k in (
                 "pane_id", "terminal_id", "herdr_session", "machine", "agent_session",
-                "revision", "interactive_ready", "launch_pending", "state_change_seq")})
+                "revision", "interactive_ready", "launch_pending", "state_change_seq",
+                "transcript", "parent_session_id", "name")})
 
     def _ingest_mission(self, entity_id, event_type, payload,
                         source="herdr") -> dict:
@@ -120,7 +162,7 @@ class IngestService:
         return self.repo.upsert_mission(
             entity_id, title=payload.get("title") or "",
             purpose=payload.get("purpose") or "", stage=stage,
-            cwd=payload.get("cwd"), source=source)
+            cwd=payload.get("cwd"), source=source, **_git_identity(payload))
 
     def _ingest_service(self, entity_id, event_type, payload) -> dict:
         """A ``service`` envelope maps idempotently to a (host, name) service.
@@ -132,6 +174,19 @@ class IngestService:
         process) ride along when present; the repo always ensures a
         description so every service is self-explanatory.
         """
+        metadata = {key: payload[key] for key in ("ownership", "session_id") if key in payload}
+        identity_fields = ("repository_id", "forge_url", "repository_url", "repo_url", "clone_url")
+        if any(key in payload for key in (*identity_fields, "commit_sha")):
+            git = _git_identity(payload)
+            if any(key in payload for key in identity_fields):
+                metadata["repository_id"] = git["repository_id"]
+            if "commit_sha" in payload:
+                metadata["commit_sha"] = git["commit_sha"]
+        if event_type in {"service.metadata", "service.listener_observed"}:
+            observer = self.repo.observe_service_metadata if event_type == "service.metadata" else self.repo.observe_service_listener
+            row = observer(entity_id, {**payload, **metadata})
+            return {"entity_type": "service", "entity_id": entity_id, "event_type": event_type,
+                    "metadata_observation": row.get("metadata_observation")}
         status = ("unavailable" if "unavailable" in event_type.lower()
                   else payload.get("status", "healthy"))
         svcid = self.repo.upsert_service(
@@ -139,12 +194,12 @@ class IngestService:
             payload.get("service_name") or entity_id,
             int(payload["port"]) if payload.get("port") is not None else 0,
             status=status,
-            session_id=payload.get("session_id"),
             route=payload.get("route"),
             description=payload.get("description"),
             owner=payload.get("owner"),
             project=payload.get("project"),
             source_port=payload.get("source_port"),
+            **metadata,
         )
         return {"entity_type": "service", "entity_id": svcid,
                 "event_type": event_type}

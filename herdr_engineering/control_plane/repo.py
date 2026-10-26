@@ -19,15 +19,22 @@ import threading
 import time
 from uuid import uuid4
 
+from ..host_policy import HostPolicy, HostSnapshot, PolicyMode, normalize_aliases
 from .ids import new_id
-from .inspector import InspectorStore
+from .inspector import REQUIRED_DURABLE_KINDS, InspectorStore
 from .mission_activity import MissionActivityStore
 from .redact import redact_payload
 from .service_catalog import (
+    INACTIVE,
+    capture_service_origin,
     normalize_project,
+    normalize_service_git,
+    normalize_service_observation,
+    normalize_service_ownership,
     normalize_source_port,
     service_catalog,
     service_lifecycle,
+    service_listener_id,
     track_availability,
     validate_archive_days,
 )
@@ -36,7 +43,23 @@ _STAGES = {
     "planning", "specification", "ready", "implementation", "testing",
     "review", "repair", "validation", "pr", "complete", "failed", "cancelled",
 }
+_SERVICE_UNSET = object()
 _SESSION_ACTIONS = {"steer", "approve", "interrupt", "resume", "stop"}
+
+
+
+def _session_mission_identity(mission_id, source):
+    if mission_id is None:
+        return {"mission_key": None, "mission_source": None}
+    if not isinstance(mission_id, str) or not mission_id:
+        raise ValueError("mission_id must be a non-empty string")
+    if ":" in mission_id:
+        namespace, raw_id = mission_id.split(":", 1)
+        if not raw_id or ":" in raw_id or (source != "herdr" and namespace != source):
+            raise ValueError("mission identity conflicts with its source")
+        return {"mission_key": mission_id, "mission_source": namespace}
+    return {"mission_key": mission_id if source == "herdr" else f"{source}:{mission_id}",
+            "mission_source": source}
 
 
 def _name_prefix(service_name):
@@ -71,12 +94,38 @@ def describe_service(*, service_name=None, host_id=None, port=None,
     return desc
 
 
+def _clean_inventory(raw):
+    """Keep only ``{tools: {name: str}, plugins: {name: str}}`` with bounded sizes."""
+    if not isinstance(raw, dict):
+        return None
+    out = {}
+    for group in ("tools", "plugins"):
+        items = raw.get(group)
+        if isinstance(items, dict):
+            out[group] = {str(k)[:80]: str(v)[:80] for k, v in list(items.items())[:200]
+                          if v not in (None, "")}
+    return out if any(out.values()) else None
+
+
+def _label(value, forbidden=None):
+    """A short opaque label (session id or agent name) from an untrusted emitter, or None when it is not one."""
+    if not isinstance(value, str) or not value or len(value) > 128 or value == forbidden:
+        return None
+    return value if all(c.isprintable() for c in value) else None
+
+
 class ControlPlaneRepo:
     """In-memory structured control-plane state with event sequencing."""
 
-    def __init__(self, *, now=None, sink=None, service_archive_days=7):
+    def __init__(self, *, now=None, sink=None, service_archive_days=7, host_aliases=None,
+                 inspector_limits=None):
         """``sink`` is an optional durable writer (e.g. DurableEventSink) called
-        with each recorded event so ingestion survives a restart."""
+        with each recorded event so ingestion survives a restart.
+
+        ``host_aliases`` maps an alternate host name to the canonical one (one
+        machine that reports under two names). Stored records keep what was
+        reported; every read presents the canonical name."""
+        self._host_aliases = {str(k): str(v) for k, v in (host_aliases or {}).items() if k and v and k != v}
         self._command_lock = threading.RLock()
         self._event_lock = threading.RLock()
         self._sink = sink
@@ -89,6 +138,8 @@ class ControlPlaneRepo:
         self._artifacts = {}
         self._blobs = {}  # artifact_id -> bytes (in-memory RustFS stand-in)
         self._leases = {}
+        self._scheduler_reservations = {}
+        self._scheduler_leases = {}
         self._test_runs = {}
         self._reviews = {}
         self._pull_requests = {}
@@ -96,13 +147,13 @@ class ControlPlaneRepo:
         self._events = {}  # (entity_type, entity_id) -> [event, ...]
         self._event_order = []  # (entity_type, entity_id, seq) chronological
         self._listeners = set()  # pub/sub for the SSE live stream (Spec §52)
+        self._collab_replay = []  # durable HCN events diverted out of the shared streams
         # Agent inspector (spec 0200): bounded per-session detail projection.
-        self.inspector = InspectorStore.from_env(persist=self._persist_inspector)
+        self.inspector = InspectorStore.from_config(inspector_limits, persist=self._persist_inspector)
         self.mission_activity = MissionActivityStore(now=self._now)
 
     def _persist_inspector(self, ev):
-        """Mirror low-volume inspector summaries to the existing durable sink only
-        (never into the in-memory event streams or the global SSE feed)."""
+        """Persist inspector detail outside global streams; require capture ACKs."""
         if self._sink is None:
             return
         ev = dict(ev)
@@ -110,7 +161,13 @@ class ControlPlaneRepo:
         ev.setdefault("schema_version", 1)
         ev["ingest_timestamp"] = self._stamp()
         ev["sequence"] = int(time.time() * 1000)
-        self._sink.record(ev)
+        if ev.get("event_type") in {f"inspector.{kind}" for kind in REQUIRED_DURABLE_KINDS}:
+            required = getattr(self._sink, "record_required", None)
+            if not callable(required):
+                raise RuntimeError("inspector persistence requires an acknowledged sink")
+            required(ev)
+        else:
+            self._sink.record(ev)
 
     # ------------------------------------------------------------------ ids
     def subscribe(self, listener):
@@ -188,26 +245,35 @@ class ControlPlaneRepo:
     def create_session(self, mission_id=None, agent_role="", model="",
                        source="herdr"):
         sid = new_id("session")
+        binding = _session_mission_identity(mission_id, source)
         rec = {
-            "session_id": sid, "mission_id": mission_id, "agent_role": agent_role,
+            "session_id": sid, "mission_id": mission_id, "agent_role": agent_role, **binding,
             "model": model, "status": "active", "created_at": self._stamp(),
             "updated_at": self._stamp(), "messages": 0, "tool_calls": 0,
         }
         self._sessions[sid] = rec
         if mission_id:
-            key = self._resolve_mission_key(mission_id, source=source)
+            key = binding["mission_key"]
             if key in self._missions:
                 self._missions[key]["sessions"].append(sid)
         self.record_event("session", sid, "SessionCreated",
-                          {"mission_id": mission_id, "agent_role": agent_role},
+                          {"mission_id": mission_id, "agent_role": agent_role, **binding},
                           mission_id=mission_id, session_id=sid)
         return sid
 
+    def _canonical_host(self, host_id):
+        return self._host_aliases.get(host_id, host_id)
+
+    def _present_host_id(self, record):
+        if record and record.get("host_id") in self._host_aliases:
+            record["host_id"] = self._host_aliases[record["host_id"]]
+        return record
+
     def get_session(self, session_id):
-        return _copy(self._sessions.get(session_id))
+        return self._present_host_id(_copy(self._sessions.get(session_id)))
 
     def list_sessions(self, status=None):
-        out = [_copy(s) for s in self._sessions.values()]
+        out = [self._present_host_id(_copy(s)) for s in self._sessions.values()]
         if status:
             out = [s for s in out if s["status"] == status]
         return _sort_by(out, "created_at", reverse=True)
@@ -307,7 +373,9 @@ class ControlPlaneRepo:
     # -------------------------------------------------------------- services
     def register_service(self, service_name, host_id, port,
                          session_id=None, status="healthy", route=None,
-                         description=None, owner=None, project=None, source_port=None):
+                         description=None, owner=None, project=None, source_port=None, ownership=None,
+                         repository_id=None, commit_sha=None):
+        git = normalize_service_git(repository_id, commit_sha)
         project = normalize_project(project)
         source_port = normalize_source_port(source_port)
         svcid = new_id("service")
@@ -316,9 +384,12 @@ class ControlPlaneRepo:
             "host_id": host_id, "port": port, "session_id": session_id,
             "status": status, "route": route, "owner": owner,
             "project": project, "source_port": source_port,
+            "ownership": normalize_service_ownership(ownership), **git,
+            "metadata_updated_at": self._stamp(),
             "created_at": self._stamp(), "updated_at": self._stamp(),
             "url": route or f"http://{host_id}:{port}",
         }
+        rec["verified_origin"] = capture_service_origin(rec, self._sessions.get(session_id), rec["created_at"])
         rec["description"] = (description or "").strip() or describe_service(
             service_name=service_name, host_id=host_id, port=port,
             owner=owner, route=rec["url"])
@@ -329,59 +400,179 @@ class ControlPlaneRepo:
                            "port": port, "route": route, "status": status,
                            "description": rec["description"],
                            "owner": owner, "project": project, "source_port": source_port,
+                           "ownership": rec["ownership"], "session_id": session_id, **git,
+                           "verified_origin": rec["verified_origin"], "metadata_updated_at": rec["metadata_updated_at"],
                            "unavailable_since": rec.get("unavailable_since")},
                           session_id=session_id)
         return svcid
 
-    def upsert_service(self, host_id, service_name, port, *,
-                       session_id=None, status="healthy", route=None,
-                       description=None, owner=None, project=None, source_port=None):
-        """Idempotent service registration keyed by ``(host_id, service_name)``.
+    def upsert_service(self, host_id, service_name, port, **kwargs):
+        # Serialize health and metadata observations across the two reporters.
+        with self._event_lock:
+            return self._upsert_service(host_id, service_name, port, **kwargs)
 
-        Re-invoking (e.g. on every web start or repeated ingest) updates the
-        record in place instead of creating a duplicate, so restarts and
-        heartbeats never accumulate service rows. Records ``ServiceRegistered``
-        the first time and ``ServiceUpdated`` thereafter. A human ``description``
-        is always present: an explicit one wins, otherwise it is derived from
-        the name/host/port/process so every service is self-explanatory.
-        """
+    def _upsert_service(self, host_id, service_name, port, *,
+                       session_id=_SERVICE_UNSET, status="healthy", route=None,
+                       description=None, owner=None, project=None, source_port=None,
+                       ownership=_SERVICE_UNSET, repository_id=_SERVICE_UNSET, commit_sha=_SERVICE_UNSET):
+        """Legacy heartbeats preserve omitted metadata; explicit observations replace it."""
+        explicit = any(value is not _SERVICE_UNSET for value in (session_id, ownership, repository_id, commit_sha))
         for svcid, rec in self._services.items():
-            if (rec.get("host_id") == host_id
-                    and rec.get("service_name") == service_name):
-                rec["port"] = port
-                track_availability(rec, status, self._stamp())
-                rec["status"] = status
-                rec["session_id"] = session_id
-                rec["route"] = route if route is not None else rec.get("route")
-                rec["url"] = route or f"http://{host_id}:{port}"
-                if owner is not None:
-                    rec["owner"] = owner
-                if project is not None:
-                    rec["project"] = normalize_project(project)
-                if source_port is not None:
-                    rec["source_port"] = normalize_source_port(source_port)
-                provided = (description or "").strip()
-                rec["description"] = provided or rec.get("description") \
-                    or describe_service(
-                        service_name=service_name, host_id=host_id,
-                        port=port, owner=owner or rec.get("owner"),
-                        route=rec["route"])
-                rec["updated_at"] = self._stamp()
-                self.record_event("service", svcid, "ServiceUpdated",
-                                  {"service_name": service_name,
-                                   "host_id": host_id, "port": port,
-                                   "route": rec["route"], "status": status,
-                                   "description": rec["description"],
-                                   "owner": rec.get("owner"),
-                                   "project": rec.get("project"),
-                                   "source_port": rec.get("source_port"),
-                                   "unavailable_since": rec.get("unavailable_since")},
-                                  session_id=session_id)
-                return svcid
-        return self.register_service(service_name, host_id, port,
-                                     session_id=session_id, status=status,
-                                     route=route, description=description,
-                                     owner=owner, project=project, source_port=source_port)
+            if (rec.get("host_id") != host_id or rec.get("service_name") != service_name
+                    or rec.get("discovery_source") == "native_listener"):
+                continue
+            inactive = str(status).lower() in INACTIVE
+            clear = ownership is None and not inactive
+            old_repository = rec.get("repository_id")
+            resolved_repository = (None if clear else old_repository) if repository_id is _SERVICE_UNSET else repository_id
+            resolved_commit = (None if clear or resolved_repository != old_repository else rec.get("commit_sha")) if commit_sha is _SERVICE_UNSET else commit_sha
+            resolved_session = (None if clear else rec.get("session_id")) if session_id is _SERVICE_UNSET else session_id
+            resolved_ownership = rec.get("ownership") if ownership is _SERVICE_UNSET else ownership
+            if inactive and ownership is None:
+                resolved_ownership = rec.get("ownership")
+                resolved_session = resolved_session or rec.get("session_id")
+                if repository_id in (_SERVICE_UNSET, None) and commit_sha in (_SERVICE_UNSET, None):
+                    resolved_repository, resolved_commit = old_repository, rec.get("commit_sha")
+            git = normalize_service_git(resolved_repository, resolved_commit)
+            rec["port"] = port
+            track_availability(rec, status, self._stamp())
+            rec.update(status=status, session_id=resolved_session,
+                       ownership=normalize_service_ownership(resolved_ownership), **git)
+            rec["route"] = route if route is not None else rec.get("route")
+            rec["url"] = rec["route"] or f"http://{host_id}:{port}"
+            if owner is not None:
+                rec["owner"] = owner
+            if project is not None:
+                rec["project"] = normalize_project(project)
+            if source_port is not None:
+                rec["source_port"] = normalize_source_port(source_port)
+            provided = (description or "").strip()
+            rec["description"] = provided or rec.get("description") or describe_service(
+                service_name=service_name, host_id=host_id, port=port,
+                owner=owner or rec.get("owner"), route=rec["route"])
+            rec["updated_at"] = self._stamp()
+            if explicit:
+                rec["metadata_updated_at"] = rec["updated_at"]
+                rec["verified_origin"] = capture_service_origin(rec, self._sessions.get(resolved_session), rec["updated_at"])
+            self.record_event("service", svcid, "ServiceUpdated", {
+                key: _deep_copy(rec.get(key)) for key in (
+                    "service_name", "host_id", "port", "route", "status", "description", "owner",
+                    "project", "source_port", "ownership", "session_id", "repository_id", "commit_sha",
+                    "verified_origin", "unavailable_since", "metadata_updated_at", "listener_identity", "metadata_observation")},
+                session_id=resolved_session)
+            return svcid
+        values = {key: None if value is _SERVICE_UNSET else value for key, value in (
+            ("session_id", session_id), ("ownership", ownership), ("repository_id", repository_id), ("commit_sha", commit_sha))}
+        return self.register_service(service_name, host_id, port, status=status,
+            route=route, description=description, owner=owner, project=project, source_port=source_port, **values)
+
+    def observe_service_metadata(self, service_id, payload):
+        with self._event_lock:
+            return self._observe_service_metadata(service_id, payload)
+
+    def _observe_service_metadata(self, service_id, payload):
+        """Observe ownership only; never create a listener or refresh its health."""
+        rec = self._services.get(service_id)
+        if rec is None:
+            raise KeyError(service_id)
+        if (payload.get("host_id") != rec.get("host_id")
+                or normalize_source_port(payload.get("source_port")) is None
+                or payload["source_port"] != rec.get("source_port")):
+            raise ValueError("metadata must match the existing service host and source port")
+        if rec.get("discovery_source") == "native_listener":
+            raise ValueError("native listener records require service.listener_observed")
+        observation = normalize_service_observation(payload, self._now(), rec.get("metadata_observation"))
+        state = observation["state"]
+        candidate = _deep_copy(rec)
+        if state == "observed":
+            pid, start = payload.get("listener_pid"), payload.get("listener_start")
+            if (type(pid) is not int or pid < 1 or not isinstance(start, str) or not start
+                    or len(start) > 300 or any(ord(char) < 32 for char in start)):
+                raise ValueError("metadata requires a positive listener PID and process birth identity")
+            instance = {"pid": pid, "start": start}
+            old = rec.get("listener_identity") or {
+                "pid": (rec.get("ownership") or {}).get("listener_pid"),
+                "start": (rec.get("ownership") or {}).get("listener_start")}
+            changed = instance != old
+            proof = normalize_service_ownership(payload.get("ownership")) if "ownership" in payload else (None if changed else rec.get("ownership"))
+            if proof is not None and (proof.get("kind") not in {"herdr_process_ancestry", "system_unit"}
+                    or proof.get("host_id") != rec["host_id"] or proof.get("listener_pid") != pid
+                    or proof.get("listener_start") != start):
+                raise ValueError("ownership proof must match the observed listener instance")
+            clear = changed or ("ownership" in payload and proof is None)
+            candidate.update(listener_identity=instance, ownership=proof,
+                session_id=payload.get("session_id", (proof or {}).get("session_id") or (None if clear else rec.get("session_id"))))
+            repository = payload.get("repository_id", None if clear else rec.get("repository_id"))
+            commit = payload.get("commit_sha", None if clear or repository != rec.get("repository_id") else rec.get("commit_sha"))
+            candidate.update(normalize_service_git(repository, commit))
+            candidate["verified_origin"] = capture_service_origin(candidate,
+                self._sessions.get(candidate.get("session_id")), self._stamp())
+        candidate["metadata_observation"] = observation
+        candidate["metadata_updated_at"] = self._stamp()
+        fields = ("host_id", "source_port", "ownership", "session_id", "verified_origin", "repository_id",
+                  "commit_sha", "listener_identity", "metadata_observation", "metadata_updated_at")
+        self.record_event("service", service_id, "ServiceMetadataObserved", {
+            **{key: _deep_copy(candidate.get(key)) for key in fields},
+            "service_updated_at": rec.get("updated_at"), "service_created_at": rec.get("created_at")},
+            session_id=candidate.get("session_id"), publish=False)
+        rec.update({key: candidate.get(key) for key in fields if key not in {"host_id", "source_port"}})
+        return self.get_service(service_id)
+
+    def observe_service_listener(self, service_id, payload):
+        """Observe an unforwarded native listener without operating the dev fabric."""
+        with self._event_lock:
+            return self._observe_service_listener(service_id, payload)
+
+    def _observe_service_listener(self, service_id, payload):
+        host, pid, birth, port = (payload.get(key) for key in (
+            "host_id", "listener_pid", "listener_start", "source_port"))
+        if service_id != service_listener_id(host, pid, birth, port):
+            raise ValueError("listener advertisement must target its physical instance ID")
+        existing = self._services.get(service_id)
+        if existing is not None and existing.get("discovery_source") != "native_listener":
+            raise ValueError("listener advertisements cannot alter a fabric-managed service")
+        observation = normalize_service_observation(payload, self._now(),
+            existing.get("metadata_observation") if existing else None)
+        stamp = self._stamp()
+        if observation["state"] in {"missing", "unconfirmed"}:
+            if existing is None:
+                raise KeyError(service_id)
+            candidate = _deep_copy(existing)
+            candidate["status"] = "unknown"
+        else:
+            candidate = _deep_copy(existing) if existing else {
+                "service_id": service_id, "host_id": host, "source_port": port, "port": port,
+                "discovery_source": "native_listener", "endpoint_scope": "local_only",
+                "route": None, "url": None, "created_at": stamp,
+                "listener_identity": {"pid": pid, "start": birth}, "unavailable_since": None}
+            advertised = payload.get("ownership")
+            proof = normalize_service_ownership(advertised) if advertised is not None else candidate.get("ownership")
+            if (not proof or proof.get("kind") != "herdr_process_ancestry"
+                    or proof.get("host_id") != host or proof.get("listener_pid") != pid
+                    or proof.get("listener_start") != birth):
+                raise ValueError("new listener requires verified native HerdR process ancestry")
+            candidate.update(ownership=proof, session_id=proof.get("session_id"))
+            candidate["verified_origin"] = capture_service_origin(candidate,
+                self._sessions.get(candidate.get("session_id")), stamp)
+            if candidate["verified_origin"] is None:
+                raise ValueError("listener native ownership could not be verified")
+            candidate.update(normalize_service_git(payload.get("repository_id", candidate.get("repository_id")),
+                payload.get("commit_sha", None if payload.get("repository_id", candidate.get("repository_id")) != candidate.get("repository_id") else candidate.get("commit_sha"))))
+            def label(key, fallback):
+                value = payload.get(key)
+                return value[:200] if isinstance(value, str) and value and all(ord(c) >= 32 for c in value) else fallback
+            candidate["owner"] = label("owner", candidate.get("owner"))
+            candidate["service_name"] = label("service_name", candidate.get("service_name") or f"App on {host} (port {port})")
+            candidate["description"] = f"{candidate.get('owner') or 'Application'} listener on {host}, observed port {port}; no shared route"
+            if "project" in payload:
+                candidate["project"] = normalize_project(payload["project"])
+            candidate["status"] = "healthy"
+        candidate.update(updated_at=stamp, metadata_updated_at=stamp, metadata_observation=observation,
+                         endpoint_scope="local_only", route=None, url=None)
+        self.record_event("service", service_id, "ServiceListenerObserved", _deep_copy(candidate),
+                          session_id=candidate.get("session_id"), publish=False)
+        self._services[service_id] = candidate
+        return self.get_service(service_id)
 
     def _ensure_service_desc(self, rec):
         """Guarantee ``rec`` carries a non-empty human description.
@@ -408,16 +599,48 @@ class ControlPlaneRepo:
         result["project"] = normalize_project(result.get("project"))
         result["source_port"] = normalize_source_port(result.get("source_port"))
         result["catalog"] = service_catalog(result, self._sessions.get(result.get("session_id")))
+        for field in ("repository_id", "commit_sha", "project_id"):
+            result[field] = result["catalog"][field]
         result["lifecycle"] = service_lifecycle(
             result, self._now(), archive_after_days=self._service_archive_days)
-        return result
+        return self._present_host_id(result)
 
     def list_services(self, *, include_archived=True):
         services = [self._service_projection(s) for s in self._services.values()]
         return _sort_by([s for s in services if include_archived
                          or not s["lifecycle"]["archived"]], "created_at", reverse=True)
 
+    def retire_services(self, *, older_than_days=7.0, states=("unknown",), dry_run=True, limit=5000):
+        """Archive services with no report for ``older_than_days`` (operator action).
+
+        Nothing is deleted: each record keeps its history and a later report from
+        the service lifts the retirement. ``dry_run`` only counts."""
+        with self._event_lock:
+            cutoff = float(older_than_days) * 86400
+            matched = []
+            for record in self._services.values():
+                view = self._service_projection(record)
+                life = view["lifecycle"]
+                if (life["state"] in states and not life["archived"]
+                        and (life["age_seconds"] is None or life["age_seconds"] >= cutoff)):
+                    matched.append(record)
+                    if len(matched) >= limit:
+                        break
+            if not dry_run:
+                stamp = self._stamp()
+                for record in matched:
+                    record["retired_at"] = stamp
+                    self.record_event("service", record["service_id"], "ServiceRetired",
+                                      {"retired_at": stamp, "older_than_days": float(older_than_days)})
+            return {"matched": len(matched), "retired": 0 if dry_run else len(matched),
+                    "dry_run": bool(dry_run), "older_than_days": float(older_than_days),
+                    "sample": [r["service_id"] for r in matched[:5]]}
+
     def mark_service_unavailable(self, service_id):
+        with self._event_lock:
+            return self._mark_service_unavailable(service_id)
+
+    def _mark_service_unavailable(self, service_id):
         s = self._services.get(service_id)
         if s is None:
             return False
@@ -446,11 +669,125 @@ class ControlPlaneRepo:
         return hid
 
     def get_host(self, host_id):
-        return _copy(self._hosts.get(host_id))
+        return self._merged_hosts().get(self._canonical_host(host_id))
+
+    def _merged_hosts(self):
+        """Hosts keyed by canonical id; an alias contributes its freshest report."""
+        merged = {}
+        for hid, rec in self._hosts.items():
+            if hid in self._host_aliases:
+                continue
+            merged[hid] = _copy(rec)
+        for alias, canonical in self._host_aliases.items():
+            rec = self._hosts.get(alias)
+            if rec is None:
+                continue
+            base = merged.get(canonical)
+            if base is None:
+                base = merged[canonical] = _copy(rec)
+                base["host_id"] = base["host_name"] = canonical
+                continue
+            if (rec.get("last_seen") or "") > (base.get("last_seen") or ""):
+                for key in ("last_seen", "status", "cpu", "mem"):
+                    if rec.get(key) is not None:
+                        base[key] = rec[key]
+            if rec.get("inventory") and not base.get("inventory"):
+                base["inventory"] = _copy(rec["inventory"])
+        return merged
 
     def list_hosts(self):
-        return _sort_by([_copy(h) for h in self._hosts.values()],
-                        "host_name")
+        return _sort_by(list(self._merged_hosts().values()), "host_name")
+
+    def host_snapshot(self, host_id):
+        """Return the scheduler view of one host, or ``None`` when unknown."""
+        from datetime import datetime
+        record = self.get_host(host_id)
+        if record is None:
+            return None
+        samples = self.list_telemetry(record.get("host_id"), limit=1)
+        latest = samples[-1] if samples else None
+        at = latest.get("at") if latest else record.get("last_seen")
+        try:
+            telemetry_at = datetime.fromisoformat(at) if at else None
+            if telemetry_at and telemetry_at.tzinfo is None:
+                telemetry_at = telemetry_at.replace(tzinfo=datetime.UTC)
+        except (TypeError, ValueError):
+            telemetry_at = None
+        freshness = latest.get("freshness_seconds") if latest else None
+        policy = record.get("scheduler_policy") or {}
+        return HostSnapshot(
+            host_uid=record.get("host_uid") or record.get("host_id"),
+            host_name=record.get("host_name") or record.get("host_id"),
+            aliases=tuple(record.get("aliases") or (record.get("host_name"),)),
+            platform=record.get("platform") or "unknown",
+            owned=record.get("scheduler_owned", False),
+            trusted=record.get("scheduler_trusted", False),
+            reachable=record.get("status") not in {"unavailable", "unknown"},
+            telemetry_at=telemetry_at,
+            telemetry_freshness_seconds=freshness,
+            policy=HostPolicy(
+                mode=PolicyMode(policy.get("mode", PolicyMode.MANUAL_ONLY)),
+                revision=int(policy.get("revision", 0)),
+                allow_tags=frozenset(policy.get("allow_tags") or ()),
+                deny_tags=frozenset(policy.get("deny_tags") or ()),
+            ),
+        )
+
+    def set_host_policy(self, host_id, *, mode, expected_revision, allow_tags=(), deny_tags=(), reason=None):
+        """Update scheduler policy with optimistic concurrency and an audit event."""
+        host = self._hosts.get(host_id)
+        if host is None:
+            raise KeyError(host_id)
+        mode = PolicyMode(mode)
+        current = host.get("scheduler_policy") or {"revision": 0, "mode": PolicyMode.MANUAL_ONLY}
+        if int(expected_revision) != int(current.get("revision", 0)):
+            raise ValueError("host policy revision conflict")
+        next_policy = {
+            "mode": mode.value,
+            "revision": int(current.get("revision", 0)) + 1,
+            "allow_tags": sorted({str(v).strip().lower() for v in allow_tags if str(v).strip()}),
+            "deny_tags": sorted({str(v).strip().lower() for v in deny_tags if str(v).strip()}),
+            "reason": str(reason)[:300] if reason else None,
+        }
+        host["scheduler_policy"] = next_policy
+        self.record_event("host", host_id, "HostPolicyChanged", next_policy)
+        return _copy(next_policy)
+
+    def fleet_inventory(self):
+        """Host x component version matrix with drift against the fleet reference.
+
+        The reference for a component is its most common version across hosts that
+        report it (ties go to the highest version string); a host that reports a
+        different value is ``drifted`` and one that does not report it is ``missing``.
+        """
+        hosts = [h for h in self.list_hosts() if h.get("inventory")]
+        names = sorted(h["host_name"] or h["host_id"] for h in hosts)
+        by_name = {h["host_name"] or h["host_id"]: h["inventory"] for h in hosts}
+        components = []
+        for group in ("tools", "plugins"):
+            keys = sorted({k for inv in by_name.values() for k in inv.get(group, {})})
+            for key in keys:
+                seen = {n: by_name[n].get(group, {}).get(key) for n in names}
+                counts = {}
+                for v in seen.values():
+                    if v:
+                        counts[v] = counts.get(v, 0) + 1
+                ref = max(counts, key=lambda v: (counts[v], v)) if counts else None
+                components.append({
+                    "group": group, "name": key, "reference": ref,
+                    "hosts": {n: {"version": v,
+                                  "state": ("missing" if not v else
+                                            "ok" if v == ref else "drifted")}
+                              for n, v in seen.items()},
+                    "drifted": sum(1 for v in seen.values() if v and v != ref),
+                    "missing": sum(1 for v in seen.values() if not v)})
+        return {"hosts": [{"host": n, "collected_at": by_name[n].get("collected_at")}
+                          for n in names],
+                "components": components,
+                "summary": {"hosts": len(names),
+                            "components": len(components),
+                            "drifted": sum(c["drifted"] for c in components),
+                            "missing": sum(c["missing"] for c in components)}}
 
     def record_heartbeat(self, host_id, tailnet_ip=None, cpu=None, mem=None):
         h = self._hosts.get(host_id)
@@ -476,7 +813,9 @@ class ControlPlaneRepo:
     def record_telemetry(self, host_id, sample):
         """Record a telemetry sample (cpu/mem/disk/network/gpu) for a host."""
         rec = {"host_id": host_id, "at": self._stamp(), **dict(sample or {})}
-        self._telemetry.setdefault(host_id, []).append(rec)
+        samples = self._telemetry.setdefault(host_id, [])
+        samples.append(rec)
+        del samples[:-500]  # a day of 2-minute samples is plenty; keep memory bounded
         return True
 
     def list_telemetry(self, host_id, limit=100):
@@ -490,31 +829,68 @@ class ControlPlaneRepo:
     # after a restart reproduces exactly the same stable entities.
 
     def upsert_host(self, host_id, host_name, tailnet_ip, *,
-                    cpu=None, mem=None, status="healthy"):
+                    cpu=None, mem=None, status="healthy", inventory=None,
+                    host_uid=None, aliases=None, platform=None,
+                    scheduler_owned=None, scheduler_trusted=None,
+                    scheduler_policy=None, scheduler_capacity=None):
         stamp = self._stamp()
+        inventory = _clean_inventory(inventory)
         existing = self._hosts.get(host_id)
         if existing is None:
             rec = {"host_id": host_id, "host_name": host_name,
                    "tailnet_ip": tailnet_ip, "status": status,
                    "cpu": cpu, "mem": mem,
                    "last_seen": stamp, "created_at": stamp}
+            if host_uid:
+                rec["host_uid"] = host_uid
+            if aliases:
+                rec["aliases"] = normalize_aliases(aliases)
+            if platform:
+                rec["platform"] = platform
+            if scheduler_owned is not None:
+                rec["scheduler_owned"] = bool(scheduler_owned)
+            if scheduler_trusted is not None:
+                rec["scheduler_trusted"] = bool(scheduler_trusted)
+            if scheduler_policy:
+                rec["scheduler_policy"] = dict(scheduler_policy)
+            if scheduler_capacity:
+                rec["scheduler_capacity"] = dict(scheduler_capacity)
+            if inventory:
+                rec["inventory"] = {**inventory, "collected_at": stamp}
             self._hosts[host_id] = rec
             self.record_event("host", host_id, "HostRegistered",
                               {"host_name": host_name,
-                               "tailnet_ip": tailnet_ip})
+                               "tailnet_ip": tailnet_ip,
+                               **({"inventory": inventory} if inventory else {})})
             return _copy(rec)
         existing["host_name"] = host_name or existing["host_name"]
         existing["tailnet_ip"] = tailnet_ip or existing["tailnet_ip"]
         existing["status"] = status
         existing["last_seen"] = stamp
+        for key, value in (("host_uid", host_uid), ("platform", platform)):
+            if value:
+                existing[key] = value
+        if aliases:
+            existing["aliases"] = normalize_aliases(aliases)
+        if scheduler_owned is not None:
+            existing["scheduler_owned"] = bool(scheduler_owned)
+        if scheduler_trusted is not None:
+            existing["scheduler_trusted"] = bool(scheduler_trusted)
+        if scheduler_policy is not None:
+            existing["scheduler_policy"] = dict(scheduler_policy)
+        if scheduler_capacity is not None:
+            existing["scheduler_capacity"] = dict(scheduler_capacity)
         if cpu is not None:
             existing["cpu"] = cpu
         if mem is not None:
             existing["mem"] = mem
-        self.record_event("host", host_id, "HostHeartbeat",
-                          {"host_name": existing["host_name"],
-                           "tailnet_ip": existing["tailnet_ip"],
-                           "cpu": cpu, "mem": mem})
+        payload = {"host_name": existing["host_name"],
+                   "tailnet_ip": existing["tailnet_ip"],
+                   "cpu": cpu, "mem": mem}
+        if inventory:
+            existing["inventory"] = {**inventory, "collected_at": stamp}
+            payload["inventory"] = inventory
+        self.record_event("host", host_id, "HostHeartbeat", payload)
         return _copy(existing)
 
     def upsert_session(self, session_id, *, host_id=None, mission_id=None,
@@ -523,19 +899,37 @@ class ControlPlaneRepo:
                        summary=None, attach=None, source="herdr", pane_id=None,
                        terminal_id=None, herdr_session=None, machine=None,
                        agent_session=None, revision=None, interactive_ready=None,
-                       launch_pending=None, state_change_seq=None):
+                       launch_pending=None, state_change_seq=None,
+                       repository_id=None, commit_sha=None,
+                       transcript=None, parent_session_id=None, name=None):
+        if transcript is not None:
+            if (not isinstance(transcript, dict) or transcript.get("status") not in (
+                    "recording", "unsupported", "identity_unavailable", "unreadable", "unavailable") or
+                    not isinstance(transcript.get("truncated", False), bool)):
+                raise ValueError("transcript requires a supported status and boolean truncated flag")
+            repair = transcript.get("identity_repair")
+            if repair is not None and repair not in (
+                    "repaired", "binding_changed", "identity_unavailable", "report_rejected", "report_unverified"):
+                raise ValueError("transcript identity_repair must be a supported status")
+            transcript = {"status": transcript["status"], "truncated": transcript.get("truncated", False),
+                          **({"identity_repair": repair} if repair is not None else {})}
         stamp = self._stamp()
         existing = self._sessions.get(session_id)
         if (existing is not None and host_id is not None
                 and existing.get("host_id") not in (None, host_id)):
             raise ValueError("session host collision; emit a host-namespaced session ID")
-        detail = {"cwd": cwd, "branch": branch, "pid": pid,
+        binding = (_session_mission_identity(mission_id, source)
+                   if mission_id is not None or existing is None else
+                   {field: existing.get(field) for field in ("mission_key", "mission_source")})
+        detail = {"cwd": cwd, "branch": branch, "pid": pid, **binding,
                   "cmdline": cmdline, "summary": summary, "attach": attach,
                   "pane_id": pane_id, "terminal_id": terminal_id,
                   "herdr_session": herdr_session, "machine": machine,
                   "agent_session": agent_session, "revision": revision,
                   "interactive_ready": interactive_ready, "launch_pending": launch_pending,
-                  "state_change_seq": state_change_seq}
+                  "state_change_seq": state_change_seq,
+                  "repository_id": repository_id, "commit_sha": commit_sha,
+                  "transcript": transcript, "parent_session_id": _label(parent_session_id, session_id), "name": _label(name)}
         if existing is None:
             rec = {"session_id": session_id, "mission_id": mission_id,
                    "host_id": host_id, "agent_role": agent_role,
@@ -544,7 +938,7 @@ class ControlPlaneRepo:
                    "messages": 0, "tool_calls": 0, **detail}
             self._sessions[session_id] = rec
             if mission_id:
-                key = self._resolve_mission_key(mission_id, source=source)
+                key = binding["mission_key"]
                 if key in self._missions:
                     self._missions[key]["sessions"].append(session_id)
             self.record_event("session", session_id, "SessionStarted",
@@ -558,29 +952,40 @@ class ControlPlaneRepo:
             existing["host_id"] = host_id
         if mission_id is not None:
             existing["mission_id"] = mission_id
+            # Explicit reassignment replaces reverse membership; a heartbeat
+            # without a mission identity cannot change its namespace.
+            for key, mission in self._missions.items():
+                members = mission["sessions"]
+                if session_id in members and key != binding["mission_key"]:
+                    members.remove(session_id)
+                if key == binding["mission_key"] and session_id not in members:
+                    members.append(session_id)
         if agent_role:
             existing["agent_role"] = agent_role
         if model:
             existing["model"] = model
         existing["status"] = status
+        if repository_id is not None and repository_id != existing.get("repository_id") and commit_sha is None:
+            existing["commit_sha"] = None
         for k, v in detail.items():
             if v is not None:
                 existing[k] = v
         # Carry the full identity state in the delta so event-sourced
         # hydration (bridge._reconstruct_from_events) can rebuild the record.
         self.record_event("session", session_id, "SessionUpdated",
-                          {k: existing[k] for k in (
-                              "host_id", "mission_id", "agent_role", "model",
+                          {"commit_sha": existing.get("commit_sha"), **{k: existing[k] for k in (
+                              "host_id", "mission_id", "mission_key", "mission_source", "agent_role", "model",
                               "status", "cwd", "branch", "pid", "cmdline",
                               "summary", "attach", "pane_id", "terminal_id", "herdr_session",
                               "machine", "agent_session", "revision", "interactive_ready",
-                              "launch_pending", "state_change_seq") if existing.get(k) is not None},
+                              "launch_pending", "state_change_seq", "repository_id", "commit_sha",
+                              "transcript", "parent_session_id", "name") if existing.get(k) is not None}},
                           mission_id=existing["mission_id"],
                           session_id=session_id)
         return _copy(existing)
 
     def upsert_mission(self, mission_id, *, title, purpose="", stage="active",
-                       cwd=None, source="herdr"):
+                       cwd=None, source="herdr", repository_id=None, commit_sha=None):
         if ":" in source or ":" in mission_id:
             raise ValueError(
                 "mission source and mission_id must not contain ':'")
@@ -592,12 +997,16 @@ class ControlPlaneRepo:
             rec = {"mission_id": mission_id, "title": title,
                    "purpose": purpose, "stage": stage, "status": stage,
                    "cwd": cwd, "source": source, "mission_key": key,
-                   "created_at": stamp, "updated_at": stamp, "sessions": []}
+                   "repository_id": repository_id, "commit_sha": commit_sha,
+                   "created_at": stamp, "updated_at": stamp,
+                   "sessions": [sid for sid, session in self._sessions.items()
+                                if session.get("mission_key") == key]}
             self._missions[key] = rec
             self.record_event("mission", key, "MissionStarted",
                               {"title": title, "purpose": purpose,
                                "stage": stage, "cwd": cwd,
-                               "source": source},
+                               "source": source, "repository_id": repository_id,
+                               "commit_sha": commit_sha},
                               mission_id=mission_id)
             return _copy(rec)
         existing["updated_at"] = stamp
@@ -607,6 +1016,11 @@ class ControlPlaneRepo:
             existing["purpose"] = purpose
         if cwd:
             existing["cwd"] = cwd
+        if repository_id is not None and repository_id != existing.get("repository_id") and commit_sha is None:
+            existing["commit_sha"] = None
+        for field, value in (("repository_id", repository_id), ("commit_sha", commit_sha)):
+            if value is not None:
+                existing[field] = value
         if stage:
             existing["stage"] = existing["status"] = stage
         self.record_event("mission", key, "MissionUpdated",
@@ -614,7 +1028,9 @@ class ControlPlaneRepo:
                            "purpose": existing["purpose"],
                            "stage": existing["stage"],
                            "status": existing["status"],
-                           "cwd": existing.get("cwd")},
+                           "cwd": existing.get("cwd"), "source": source,
+                           "repository_id": existing.get("repository_id"),
+                           "commit_sha": existing.get("commit_sha")},
                           mission_id=mission_id)
         return _copy(existing)
 
@@ -995,6 +1411,7 @@ class ControlPlaneRepo:
             "artifact_id": aid, "session_id": session_id,
             "mission_id": mission_id, "original_filename": original_filename,
             "mime_type": mime_type, "size_bytes": size_bytes, "sha256": sha256,
+            "artifact_type": "other",
             "storage_key": storage_key, "status": "available",
             "materializations": 0, "created_at": self._stamp(),
         }
@@ -1019,6 +1436,25 @@ class ControlPlaneRepo:
 
     def get_artifact(self, artifact_id):
         return _copy(self._artifacts.get(artifact_id))
+
+    def list_artifacts(self, *, query=None, artifact_type=None, status=None,
+                       created_by=None, limit=200, offset=0):
+        rows = []
+        needle = str(query or "").casefold()
+        for record in self._artifacts.values():
+            if artifact_type and record.get("artifact_type") != artifact_type:
+                continue
+            if status and record.get("status") != status:
+                continue
+            if created_by and record.get("created_by") != created_by:
+                continue
+            haystack = " ".join(str(record.get(key) or "")
+                                for key in ("artifact_id", "original_filename", "mime_type"))
+            if needle and needle not in haystack.casefold():
+                continue
+            rows.append(_copy(record))
+        ordered = _sort_by(rows, "created_at", id_key="artifact_id")
+        return ordered[max(0, int(offset)):max(0, int(offset)) + min(500, max(1, int(limit)))]
 
     def materialize_artifact(self, artifact_id, host_id, session_id,
                              local_path):
@@ -1051,9 +1487,36 @@ class ControlPlaneRepo:
             return True
         return False
 
+    # ------------------------------------------------------- scheduler state
+    def save_scheduler_reservation(self, reservation: dict):
+        """Persist scheduler reservation/lease state through the existing event sink."""
+        reservation_id = str(reservation.get("reservation_id") or "")
+        if not reservation_id:
+            raise ValueError("reservation_id is required")
+        record = _deep_copy(reservation)
+        self._scheduler_reservations[reservation_id] = record
+        self.record_event("scheduler_reservation", reservation_id,
+                          "SchedulerReservationChanged", record)
+        return _deep_copy(record)
+
+    def list_scheduler_reservations(self):
+        return [_deep_copy(row) for row in self._scheduler_reservations.values()]
+
+    def save_scheduler_lease(self, lease: dict):
+        lease_id = str(lease.get("lease_id") or "")
+        if not lease_id:
+            raise ValueError("lease_id is required")
+        record = _deep_copy(lease)
+        self._scheduler_leases[lease_id] = record
+        self.record_event("scheduler_lease", lease_id, "SchedulerLeaseChanged", record)
+        return _deep_copy(record)
+
+    def list_scheduler_leases(self):
+        return [_deep_copy(row) for row in self._scheduler_leases.values()]
+
     # --------------------------------------------------------------- events
     def record_event(self, entity_type, entity_id, event_type, payload=None,
-                     mission_id=None, session_id=None, require_durable=False):
+                     mission_id=None, session_id=None, require_durable=False, publish=True):
         with self._event_lock:
             key = (entity_type, entity_id)
             stream = self._events.setdefault(key, [])
@@ -1079,11 +1542,12 @@ class ControlPlaneRepo:
                     self._sink.record(ev)
                 except Exception:
                     pass  # a sink must never break event recording
-            for listener in self._listeners:
-                try:
-                    listener(_copy(ev))
-                except Exception:
-                    pass  # a listener must never break event recording
+            if publish:
+                for listener in self._listeners:
+                    try:
+                        listener(_copy(ev))
+                    except Exception:
+                        pass  # a listener must never break event recording
             return _copy(ev)
 
     def mission_timeline(self, mission_key):
@@ -1290,9 +1754,9 @@ class ControlPlaneRepo:
         return {"models": usage, "total_sessions": len(self._sessions)}
 
     def host_analytics(self):
-        healthy = sum(1 for h in self._hosts.values()
-                      if h["status"] == "healthy")
-        total = len(self._hosts)
+        hosts = self._merged_hosts().values()
+        healthy = sum(1 for h in hosts if h["status"] == "healthy")
+        total = len(hosts)
         return {"total": total, "healthy": healthy,
                 "unavailable": total - healthy}
 
@@ -1309,6 +1773,8 @@ class ControlPlaneRepo:
             "blobs": {k: __import__("base64").b64encode(v).decode()
                       for k, v in self._blobs.items()},
             "leases": _copy(self._leases),
+            "scheduler_reservations": _deep_copy(self._scheduler_reservations),
+            "scheduler_leases": _deep_copy(self._scheduler_leases),
             "telemetry": {k: [dict(s) for s in v]
                           for k, v in self._telemetry.items()},
             "events": {f"{t}|{i}": [dict(e) for e in s]
@@ -1326,6 +1792,8 @@ class ControlPlaneRepo:
         self._blobs = {k: __import__("base64").b64decode(v)
                        for k, v in state.get("blobs", {}).items()}
         self._leases = dict(state.get("leases", {}))
+        self._scheduler_reservations = _deep_copy(state.get("scheduler_reservations", {}))
+        self._scheduler_leases = _deep_copy(state.get("scheduler_leases", {}))
         self._telemetry = {k: [dict(s) for s in v]
                           for k, v in state.get("telemetry", {}).items()}
         self._events = {}
@@ -1333,14 +1801,39 @@ class ControlPlaneRepo:
             t, i = key.split("|")
             self._events[(t, i)] = [dict(e) for e in stream]
         self._event_order = [tuple(x) for x in state.get("event_order", [])]
+        # Scheduler reservations are event-sourced, so a restart can recover
+        # even when the structured export contains only the event streams.
+        for (etype, entity_id), stream in self._events.items():
+            if etype != "scheduler_reservation":
+                if etype != "scheduler_lease":
+                    continue
+                for event in stream:
+                    payload = _payload(event)
+                    if payload:
+                        self._scheduler_leases[entity_id] = _deep_copy(payload)
+                continue
+            for event in stream:
+                payload = _payload(event)
+                if payload:
+                    self._scheduler_reservations[entity_id] = _deep_copy(payload)
         # Inspector summaries ride the durable log as ``inspector`` streams;
         # move them into the bounded store instead of the unbounded raw streams.
         durable = []
         for key in [k for k in self._events if k[0] == "inspector"]:
             durable.extend(self._events.pop(key))
         self._event_order = [t for t in self._event_order if t[0] != "inspector"]
+        # HCN events are private to the collaboration service: they must never sit
+        # in the shared streams that /activity and the global SSE feed expose.
+        for key in [k for k in self._events if k[0] == "collab"]:
+            self._collab_replay.extend(self._events.pop(key))
+        self._event_order = [t for t in self._event_order if t[0] != "collab"]
         if durable:
             self.inspector.hydrate(durable)
+
+    def take_collab_replay(self):
+        """Hand the diverted durable HCN events to the collaboration service (once)."""
+        out, self._collab_replay = self._collab_replay, []
+        return out
 
     # --------------------------------------------------------------- health
     def health(self):
