@@ -908,3 +908,22 @@ def test_token_analytics_includes_cache_write_tokens():
     assert a["total"]["cache_write_tokens"] == 7
     assert a["by_model"]["gpt"]["cache_write_tokens"] == 7
     assert a["by_project"]["p"]["cache_write_tokens"] == 7
+
+
+def test_v2_resource_usage_missing_kind_does_not_consume_sequence():
+    """A schema-v2 resource_usage with a missing/empty kind must be rejected in
+    _prevalidate (before the envelope is persisted), so a corrected retry with
+    the same idempotency identity still lands (codex P1)."""
+    repo = ControlPlaneRepo()
+    svc = make_svc(repo)
+    bad = {"schema_version": 2, "event_id": "pi-res-kind", "source": "pi",
+           "source_sequence": 1, "entity_type": "resource_usage", "entity_id": "res-k",
+           "event_type": "resource_usage.recorded",
+           "payload": {"mission_id": "M1", "value": 1.0}}  # no kind
+    with pytest.raises(ValueError, match="kind"):
+        svc.ingest(bad, {"id": "agent", "kind": "agent", "authenticated_by": "api_key"})
+    # No resource recorded, and the corrected retry is accepted.
+    assert repo.usage_analytics(mission_id="pi:M1")["resources"] == {}
+    good = {**bad, "payload": {"mission_id": "M1", "kind": "cpu", "value": 1.0}}
+    svc.ingest(good, {"id": "agent", "kind": "agent", "authenticated_by": "api_key"})
+    assert repo.usage_analytics(mission_id="pi:M1")["resources"]["cpu"]["total"] == 1.0

@@ -391,6 +391,9 @@ class IngestService:
         elif entity_type == "resource_usage":
             if not isinstance(payload, dict):
                 raise ValueError("resource usage must be an object")
+            kind = payload.get("kind")
+            if not isinstance(kind, str) or not kind:
+                raise ValueError("resource kind is required")  # rejected pre-persist
             value = payload.get("value")
             if (isinstance(value, bool) or not isinstance(value, (int, float))
                     or not math.isfinite(value) or value < 0):
