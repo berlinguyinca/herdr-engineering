@@ -18,6 +18,10 @@ import { mountIntegrations } from './integrations-view.js';
 import { mountGithub } from './github-view.js';
 import { mountReviewGate } from './review-gate-view.js';
 import { mountTopology } from './topology-view.js';
+import { mountArtifacts, renderArtifactDetail } from './artifacts-view.js';
+import { mountPublications } from './publications-view.js';
+import { mountHandoffs } from './handoffs-view.js';
+import { renderSchedulingView } from './scheduler-view.js';
 import { mountArchitecture } from './architecture-view.js';
 import { visibleNav } from './nav-capabilities.js';
 import { mountSessionsView, sessionEntries } from './sessions-view.js';
@@ -80,6 +84,10 @@ const NAV = [
   { path: '/analytics', label: 'Analytics' },
   { path: '/llm', label: 'LLM' },
   { path: '/collab', label: 'Collaboration' },
+  { path: '/artifacts', label: 'Artifacts' },
+  { path: '/publications', label: 'Publications' },
+  { path: '/handoffs', label: 'Handoffs' },
+  { path: '/scheduling', label: 'Scheduling' },
 ];
 
 const SHELL = document.getElementById('shell');
@@ -126,6 +134,10 @@ const ROUTES = {
   '/attention': viewAttention,
   '/github': viewGithub,
   '/collab': viewCollab,
+  '/artifacts': viewArtifacts,
+  '/artifacts/:id': viewArtifact,
+  '/publications': viewPublications,
+  '/handoffs': viewHandoffs,
   '/ci': viewIntegrations,
   '/reviews': viewIntegrations,
   '/review-gate': viewReviewGate,
@@ -183,6 +195,44 @@ function matchRoute(parts) {
     if (rp.length !== parts.length) return false;
     return rp.every((rpseg, i) => rpseg.startsWith(':') || rpseg === parts[i]);
   }) || '/overview';
+}
+
+async function viewArtifacts() {
+  root.innerHTML = '<h1>Artifacts</h1><div id="artifact-registry"></div>';
+  return { dispose: mountArtifacts(root.querySelector('#artifact-registry'), client) };
+}
+
+async function viewArtifact(parts) {
+  await renderArtifactDetail(root, client, decodeURIComponent(parts[1]));
+  return { dispose() {} };
+}
+
+async function viewPublications() {
+  return { dispose: mountPublications(root, client) };
+}
+
+async function viewHandoffs() {
+  const view = mountHandoffs(root, client);
+  return { ...view, dispose() {} };
+}
+
+async function viewScheduling() {
+  root.innerHTML = renderSchedulingView(await client.schedulerOverview());
+  const form = root.querySelector('[data-scheduler-plan]');
+  const handler = async event => {
+    event.preventDefault();
+    const fields = new FormData(form);
+    const output = form.querySelector('output');
+    try {
+      output.textContent = JSON.stringify(await client.schedulerPlan({
+        request_id: fields.get('request_id'), agent_family: fields.get('agent_family'),
+        placement_mode: 'automatic', resource_profile: { class: 'coding',
+          cpu_cores: Number(fields.get('cpu_cores')), memory_gib: Number(fields.get('memory_gib')) },
+      }), null, 2);
+    } catch (error) { output.textContent = error.message; }
+  };
+  form.addEventListener('submit', handler);
+  return { dispose() { form.removeEventListener('submit', handler); } };
 }
 
 function mountView(view) {

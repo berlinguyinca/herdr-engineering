@@ -91,3 +91,13 @@ def test_migrator_applies_in_order_and_skips_applied(tmp_path):
     ]
     assert inserted == ["0002_b.sql"]
     assert "0001_a.sql" not in inserted
+
+
+def test_migrator_adopts_renumbered_artifact_receipts_without_recreating_tables(tmp_path):
+    migration = tmp_path / '0008_artifact_registry.sql'
+    migration.write_text('CREATE TABLE artifact_blobs (id int);')
+    conn = _FakeConn()
+    conn._applied = ['0003_artifact_registry.sql']
+    assert _run(db.Migrator(conn).apply(str(tmp_path))) == ['0008_artifact_registry.sql']
+    assert not any(sql == migration.read_text() for _, sql, _ in conn.log)
+    assert any(args == ('0008_artifact_registry.sql',) for _, _, args in conn.log)
