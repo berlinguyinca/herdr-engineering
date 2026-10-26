@@ -274,6 +274,22 @@ def test_is_dev_web_port_filter(tmp_path):
         gw.stop()
 
 
+def test_unchanged_listener_is_not_http_probed_twice(tmp_path, monkeypatch):
+    gw = _FakeGateway()
+    calls = []
+    monkeypatch.setattr(fa, "probe_web",
+                        lambda port, timeout=2.0: calls.append(port) or True)
+    agent = _agent(tmp_path, gw)
+    info = {"addrs": {"127.0.0.1"}, "process": "testapp", "pid": 1}
+    try:
+        assert agent._probe_web_cached(3210, info) is True
+        assert agent._probe_web_cached(3210, info) is True
+        assert calls == [3210]
+    finally:
+        agent.stop()
+        gw.stop()
+
+
 def test_scan_registers_new_http_service(tmp_path, monkeypatch):
     gw = _FakeGateway()
     server, port = _http_target(tmp_path)

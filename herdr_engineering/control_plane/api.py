@@ -48,11 +48,41 @@ _MAX_SSE_SECONDS = 3600
 
 class _DaemonThreadingServer(ThreadingHTTPServer):
     # Handler threads are daemons so a stuck SSE client can never block
-    # server shutdown / process exit.
+    # server shutdown / process exit. A semaphore bounds active handler threads
+    # while preserving the stdlib mixin's daemon-thread behavior.
     daemon_threads = True
     # The stdlib default backlog (5) resets connections when dozens of agents
     # emit at once (60+ agents is the design point).
     request_queue_size = 256
+
+    def __init__(self, server_address, handler, *, request_workers=32,
+                 request_queue=128):
+        self.request_workers = max(1, int(request_workers))
+        self.request_queue = max(0, int(request_queue))
+        self.request_queue_size = max(5, self.request_queue)
+        self._request_slots = threading.BoundedSemaphore(self.request_workers)
+        super().__init__(server_address, handler)
+
+    def process_request(self, request, client_address):
+        if not self._request_slots.acquire(blocking=False):
+            try:
+                request.sendall(
+                    b"HTTP/1.1 503 Service Unavailable\r\n"
+                    b"Connection: close\r\n"
+                    b"Content-Length: 0\r\n\r\n")
+            except OSError:
+                pass
+            finally:
+                self.shutdown_request(request)
+            return
+
+        super().process_request(request, client_address)
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._request_slots.release()
 
 
 class _RateLimiter:
@@ -86,7 +116,8 @@ class ControlPlaneServer:
 
     def __init__(self, repo, *, api_key=None, api_keys=None, host="127.0.0.1",
                  port=0, web_root=None, source=None, allow_open=False,
-                 rustfs=None, dispatcher=None):
+                 rustfs=None, dispatcher=None, request_workers=32,
+                 request_queue=128):
         """
         Auth (Spec §104): either a single `api_key` (all-access) or a mapping
         `api_keys={key: role}` with roles "viewer" (read-only) / "operator"
@@ -132,9 +163,13 @@ class ControlPlaneServer:
                 "Tailnet boundary (Spec §104)")
         self.host = host
         self.port = port
+        self.request_workers = max(1, int(request_workers))
+        self.request_queue = max(0, int(request_queue))
         self.web_root = Path(web_root) if web_root else _WEB_ROOT
         self._subscribers = set()
         self._lock = threading.Lock()
+        self._metrics_lock = threading.Lock()
+        self._metrics = {"requests": 0, "by_path": {}, "total_ms": 0.0}
         self._ready = threading.Event()
         self._httpd = None
         # live stream (Spec §52)
@@ -176,7 +211,23 @@ class ControlPlaneServer:
         h["version"] = __version__
         h["commit"] = _COMMIT
         h["capabilities"] = ["mission_activity_v1"]
+        with self._metrics_lock:
+            h["performance"] = {
+                "requests": self._metrics["requests"],
+                "by_path": dict(self._metrics["by_path"]),
+                "total_ms": round(self._metrics["total_ms"], 2),
+                "request_workers": self.request_workers,
+                "request_queue": self.request_queue,
+            }
         return h
+
+    def _record_request(self, path: str, elapsed_ms: float) -> None:
+        path = path.split("?", 1)[0][:120]
+        with self._metrics_lock:
+            self._metrics["requests"] += 1
+            by_path = self._metrics["by_path"]
+            by_path[path] = by_path.get(path, 0) + 1
+            self._metrics["total_ms"] += elapsed_ms
 
     # ------------------------------------------------------- SSE plumbing
     def _broadcast(self, event):
@@ -192,7 +243,9 @@ class ControlPlaneServer:
     # ------------------------------------------------------------- server
     def serve(self):
         self._httpd = _DaemonThreadingServer(
-            (self.host, self.port), _make_handler(self))
+            (self.host, self.port), _make_handler(self),
+            request_workers=self.request_workers,
+            request_queue=self.request_queue)
         self.port = self._httpd.server_address[1]
         self._ready.set()
         threading.Thread(target=self._sweep_loop, daemon=True).start()
@@ -287,6 +340,13 @@ def _make_handler(server):
 
         # ------------------------------------------------------------ routes
         def do_GET(self):
+            started = time.monotonic()
+            try:
+                return self._do_GET()
+            finally:
+                server._record_request(self.path, (time.monotonic() - started) * 1000)
+
+        def _do_GET(self):
             err = self._require("viewer")
             if err:
                 return err
@@ -295,6 +355,13 @@ def _make_handler(server):
             return self._serve_static()
 
         def do_POST(self):
+            started = time.monotonic()
+            try:
+                return self._do_POST()
+            finally:
+                server._record_request(self.path, (time.monotonic() - started) * 1000)
+
+        def _do_POST(self):
             # The ingest route is reachable by the ingest role; every other
             # POST requires the operator role (Spec §104).
             path = self.path.split("?")[0]
@@ -517,6 +584,20 @@ def _make_handler(server):
             if resource == "ingest" and len(parts) == 4:
                 if not body:
                     return self._json({"error": "empty body"}, 400)
+                events = body.get("events") if isinstance(body, dict) else None
+                if events is not None:
+                    if not isinstance(events, list) or not events:
+                        return self._json({"error": "events must be a non-empty list"}, 400)
+                    if len(events) > 64:
+                        return self._json({"error": "events must contain at most 64 envelopes"}, 400)
+                    entities = []
+                    for event in events:
+                        if (isinstance(event, dict)
+                                and event.get("entity_type") in ("inspector", "mission_activity")):
+                            entities.append(server.ingest.ingest(event))
+                        else:
+                            entities.append(server.ingest.ingest(redact_payload(event)))
+                    return self._json({"ok": True, "entities": entities})
                 # Inspector envelopes are redacted per field by the store: the
                 # blanket key-hint redaction would mangle ``input_tokens`` and
                 # ``passed``.

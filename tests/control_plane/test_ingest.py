@@ -34,6 +34,24 @@ def test_host_upsert_is_idempotent_across_heartbeats():
     assert types == ["HostRegistered"]
 
 
+def test_ingest_batch_returns_one_result_per_envelope():
+    repo = ControlPlaneRepo()
+    svc = make_svc(repo)
+    result = svc.ingest_batch([
+        {"entity_type": "host", "entity_id": "bender",
+         "event_type": "host.heartbeat", "payload": {"cpu": 10}},
+        {"entity_type": "host", "entity_id": "beast",
+         "event_type": "host.heartbeat", "payload": {"cpu": 20}},
+    ])
+    assert len(result) == 2
+    assert {host["host_id"] for host in repo.list_hosts()} == {"bender", "beast"}
+
+
+def test_ingest_batch_rejects_unbounded_payload():
+    with pytest.raises(ValueError, match="at most 64"):
+        make_svc().ingest_batch([{}] * 65)
+
+
 def test_session_upsert_start_then_stop():
     repo = ControlPlaneRepo()
     svc = make_svc(repo)
