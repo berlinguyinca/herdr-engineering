@@ -322,3 +322,22 @@ def test_postgres_source_uses_provided_run():
     missions = src.missions()
     assert missions[0]["mission_id"] == "m9"
     assert len(calls) == 1  # cached — fetched once, reused for all resources
+
+
+def test_postgres_source_skips_unbounded_high_volume_startup_streams():
+    calls = []
+
+    class FakeConn:
+        async def fetch(self, sql, *args):
+            calls.append(sql)
+            return []
+
+    def fake_run(coro):
+        return asyncio.new_event_loop().run_until_complete(coro)
+
+    PostgresSource(FakeConn(), run=fake_run).events()
+    event_sql = next(sql for sql in calls if "fabric_events" in sql)
+    assert "entity_type NOT IN" in event_sql
+    assert "'service'" in event_sql
+    assert "'inspector'" in event_sql
+    assert "'collab'" in event_sql
