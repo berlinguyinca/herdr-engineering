@@ -177,3 +177,14 @@ def test_post_envelopes_rejects_non_ingest_key():
         assert repo.list_missions() == []
     finally:
         svr.shutdown()
+
+
+def test_post_envelopes_auth_rejected_is_distinguishable():
+    base, repo, svr = _server()
+    try:
+        envelopes = snapshot_to_envelopes(_load_fixture())
+        from herdr_engineering.control_plane.pi_snapshot import IngestAuthRejected
+        with pytest.raises(IngestAuthRejected):
+            post_envelopes(base, "view-1", envelopes, expected=(200,))
+    finally:
+        svr.shutdown()

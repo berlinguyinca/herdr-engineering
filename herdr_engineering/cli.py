@@ -702,7 +702,7 @@ def _cmd_cp_feed_pi(args) -> int:
         host_value, resolve_control_plane,
     )
     from .control_plane.pi_snapshot import (
-        read_snapshot, snapshot_to_envelopes, post_envelopes,
+        IngestAuthRejected, read_snapshot, snapshot_to_envelopes, post_envelopes,
     )
 
     # Explicit ``--url`` and ``HERDR_CP_INGEST_KEY`` override host config and are
@@ -722,26 +722,44 @@ def _cmd_cp_feed_pi(args) -> int:
         return 2
     interval = max(0.0, float(args.interval))
     initial_cfg = host_config_or_none()
-    refresher = (None if interval <= 0 or explicit_url or initial_cfg is None
+    # Refresh host config in continuous mode whenever a non-explicit value can
+    # change (URL, key, or both). If both are explicit there is nothing to refresh.
+    refresher = (None if interval <= 0 or initial_cfg is None
+                 or (explicit_url and explicit_key)
                  else ConfigRefresher(initial_cfg))
+
+    def _refresh() -> None:
+        nonlocal url, api_key
+        if refresher is None:
+            return
+        try:
+            cfg = refresher.current()
+        except HostConfigUnavailable as exc:
+            raise SystemExit(exit_unavailable(exc))
+        if not explicit_url:
+            url = cfg.control_plane_url
+        if not explicit_key:
+            api_key = cfg.api_key or host_value("ingest.api_key") or ""
+
     while True:
         doc = read_snapshot(args.snapshot)
         envelopes = snapshot_to_envelopes(doc)
-        posted = post_envelopes(url, api_key, envelopes)
+        try:
+            posted = post_envelopes(url, api_key, envelopes)
+        except IngestAuthRejected:
+            if refresher is None:
+                raise
+            # Rotated/revoked ingest key: mark it rejected so ConfigRefresher
+            # refreshes on the next pass, then retry this snapshot.
+            refresher.note_auth_rejected()
+            _refresh()
+            continue
         _print_json({"ok": True, "posted": posted, "missions": len(envelopes),
                      "snapshot": args.snapshot})
         if interval <= 0:
             return 0
         time.sleep(interval)
-        if refresher is not None:
-            try:
-                cfg = refresher.current()
-            except HostConfigUnavailable as exc:
-                return exit_unavailable(exc)
-            if not explicit_url:
-                url = cfg.control_plane_url
-            if not explicit_key:
-                api_key = cfg.api_key or host_value("ingest.api_key") or ""
+        _refresh()
 
 
 def _cmd_cp_llm_proxy(args) -> int:

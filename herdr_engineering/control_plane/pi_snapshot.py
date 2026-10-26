@@ -46,6 +46,14 @@ class UnsupportedSnapshotVersion(ValueError):
     """Raised when a snapshot's ``contractVersion`` is not supported."""
 
 
+class IngestAuthRejected(ValueError):
+    """Raised when the ingest endpoint answers 401/403 (bad or rotated key).
+
+    Continuous feeders catch this to refresh host config and retry rather than
+    exiting on a temporarily stale credential.
+    """
+
+
 def _stage_from_status(status: str) -> str:
     """Map a Pi ``MissionStatus`` value onto a control-plane mission stage.
 
@@ -141,6 +149,8 @@ def post_envelopes(base_url: str, api_key: str, envelopes: list[dict],
                     raise ValueError(f"ingest returned HTTP {resp.status}")
                 posted += 1
         except urllib.error.HTTPError as exc:
+            if exc.code in (401, 403):
+                raise IngestAuthRejected(f"ingest returned HTTP {exc.code}") from exc
             raise ValueError(f"ingest returned HTTP {exc.code}") from exc
     return posted
 
