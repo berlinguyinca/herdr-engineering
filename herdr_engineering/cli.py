@@ -627,6 +627,14 @@ def _build_parser() -> argparse.ArgumentParser:
     p2.add_argument("--fleet-config", default=FLEET_CONFIG_DEFAULT,
                     help="central fleet config file; control_plane.pg_dsn names the database")
     p2.set_defaults(func=_cmd_cp_worker)
+    p2 = csub.add_parser("feed-pi", help="publish a read-only Pi orchestration snapshot",
+                         description="Post a Pi snapshot using HERDR_CP_INGEST_KEY (ingest-role API key).")
+    p2.add_argument("--snapshot", required=True, help="path to orchestration-snapshot.json")
+    p2.add_argument("--url", default=None,
+                    help="control-plane base URL (default: host.json control_plane_url)")
+    p2.add_argument("--interval", type=float, default=0,
+                    help="seconds between snapshot reads (default: 0 = once)")
+    p2.set_defaults(func=_cmd_cp_feed_pi)
     p2 = csub.add_parser("mission-feed", help="publish read-only live Pi mission activity")
     p2.add_argument("--control-plane", default=None,
                     help="control plane URL (default: host.json control_plane_url)")
@@ -655,6 +663,44 @@ def _build_parser() -> argparse.ArgumentParser:
 # --------------------------------------------------------------------------
 # Command handlers
 # --------------------------------------------------------------------------
+def _cmd_cp_feed_pi(args) -> int:
+    import math
+    import time
+    from pathlib import Path
+
+    from .control_plane.pi_snapshot import post_envelopes, snapshot_to_envelopes
+    from .host_config import HostConfigUnavailable, resolve_control_plane
+
+    if not os.environ.get("HERDR_CP_INGEST_KEY", "").strip():
+        print("Set HERDR_CP_INGEST_KEY to an ingest-role API key", file=sys.stderr)
+        return 2
+    if not math.isfinite(args.interval) or args.interval < 0 or args.interval > 2 ** 31 - 1:
+        print("--interval must be a finite non-negative number of seconds", file=sys.stderr)
+        return 2
+    try:
+        url = resolve_control_plane(args.url)
+    except HostConfigUnavailable:
+        print("Set --url or configure host.json control_plane_url", file=sys.stderr)
+        return 2
+    while True:
+        try:
+            doc = json.loads(Path(args.snapshot).expanduser().read_text(encoding="utf-8"))
+            envelopes = snapshot_to_envelopes(doc)
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            # File paths and malformed snapshot fields can contain secrets.
+            print("Cannot read a valid Pi snapshot; check --snapshot and its schema", file=sys.stderr)
+            return 2
+        try:
+            posted = post_envelopes(url, None, envelopes)
+        except (ValueError, RuntimeError):
+            print("Snapshot ingest failed; check --url and HERDR_CP_INGEST_KEY", file=sys.stderr)
+            return 1
+        _print_json({"ok": True, "posted": posted})
+        if args.interval == 0:
+            return 0
+        time.sleep(args.interval)
+
+
 def _cmd_cp_mission_feed(args) -> int:
     from pathlib import Path
 
