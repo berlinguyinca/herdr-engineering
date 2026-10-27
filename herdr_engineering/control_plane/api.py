@@ -838,6 +838,7 @@ _PUBLIC_STATIC = {
     "/collab-helpers.js": ("collab-helpers.js", "text/javascript"),
     "/collab-workbench.js": ("collab-workbench.js", "text/javascript"),
     "/motion.js": ("motion.js", "text/javascript"),
+    "/patch.js": ("patch.js", "text/javascript"),
     "/conversation-composer.js": ("conversation-composer.js", "text/javascript"),
     "/conversation-markdown.js": ("conversation-markdown.js", "text/javascript"),
     "/conversation-json.js": ("conversation-json.js", "text/javascript"),

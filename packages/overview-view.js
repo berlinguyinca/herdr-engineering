@@ -5,7 +5,8 @@ import { missionEntries } from './mission-catalog-view.js';
 import { recordOutcome, recordVisibility, reportFreshness } from './record-state.js';
 import { serviceState, serviceScope } from './services-view.js';
 import { integrationEntries, integrationTimestamp } from './integrations-view.js';
-import { isCalm, snapshotText, animateChanges } from './motion.js';
+import { isCalm, snapshotText, animateChanges, skeleton } from './motion.js';
+import { morph, handOff, patchText, patchAttr } from './patch.js';
 
 const records = value => Array.isArray(value) ? value.filter(v => v && typeof v === 'object' && !Array.isArray(v)) : [];
 const text = value => typeof value === 'string' ? value : '';
@@ -336,7 +337,12 @@ export function mountOverview(container, client) {
       const attentionList=hadFocus && focused.id==='ov-attention-items';
       const attentionScroll=element.querySelector('.ov-attention-list.is-expanded')?.scrollTop || 0;
       const metrics=live?snapshotText(element,'.ov-metric strong',metricKey):null;
-      element.innerHTML=html;
+      // Morphed in place: unchanged rows and metric tiles keep their nodes (and any focus/scroll),
+      // so a quiet refresh writes nothing. Focus is then restored by the same href/snooze/toggle
+      // lookup as before, so a focused control that left is handed to its equivalent (or the panel
+      // heading) instead of dropping to <body>; handOff cleans up any node morph kept only because
+      // the user was in it.
+      const stranded=morph(element,html);
       animateChanges(element,'.ov-metric strong',metrics,metricKey);
       if(panel==='attention')markNewCritical(element);
       const expandedList=element.querySelector('.ov-attention-list.is-expanded');
@@ -347,6 +353,7 @@ export function mountOverview(container, client) {
         if(fallback)fallback.tabIndex=-1;
         (target || fallback)?.focus({preventScroll:true});
       }
+      handOff(stranded, () => null);
     }
     applyPulses();
     tickClocks();

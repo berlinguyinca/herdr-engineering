@@ -1,6 +1,7 @@
 import {escapeHtml as esc} from './herdr-web-components/util.js';
 import {ciHealthModel,renderCiHeatmap,renderCiTree,ciHealthStyles} from './ci-health.js';
-import {snapshotText,animateChanges} from './motion.js';
+import {snapshotText,animateChanges,skeleton} from './motion.js';
+import {morph,handOff,patchText,patchAttr} from './patch.js';
 
 const modes=['hours','runs','7','14','30'];
 const scopes=['default','pr','all'];
@@ -71,18 +72,24 @@ export function mountCiHealth(host,client,{onSelectRun=()=>{},onSelectStep=()=>{
       const key=node.dataset.healthDisclosure;if(node.open)expanded.add(key);else expanded.delete(key);
     }
   }
+  // Morphed in place: unchanged markup writes nothing, and the grid's scroll, roving focus and
+  // open disclosures keep their nodes (morph never writes the boolean `open`, so it is re-synced
+  // from `expanded` after each draw). A row the user is in that leaves is handed off to a neighbour.
   function replace(element,html) {
-    const active=doc.activeElement,inside=element.contains(active);
-    const attributes=['data-health-run','data-health-project','data-health-bucket','data-health-step','data-health-tree-more'];
-    const scrollFocus=inside?[...element.querySelectorAll('[data-health-grid-scroll]')].indexOf(active):-1;
-    const focus=inside?attributes.filter(key=>active.hasAttribute(key)).map(key=>[key,active.getAttribute(key)]):[];
-    const summary=inside && active.tagName==='SUMMARY'?active.closest('[data-health-disclosure]')?.dataset.healthDisclosure:null;
-    const scroll=[...element.querySelectorAll('[data-health-grid-scroll]')].map(node=>[node.scrollLeft,node.scrollTop]);
-    element.innerHTML=html;
-    for(const node of element.querySelectorAll('[data-health-disclosure]'))node.open=expanded.has(node.dataset.healthDisclosure);
-    if(focus.length)[...element.querySelectorAll(`[${focus[0][0]}]`)].find(node=>focus.every(([key,value])=>node.getAttribute(key)===value))?.focus({preventScroll:true});
-    if(summary)[...element.querySelectorAll('[data-health-disclosure]')].find(node=>node.dataset.healthDisclosure===summary)?.querySelector('summary')?.focus({preventScroll:true});
-    [...element.querySelectorAll('[data-health-grid-scroll]')].forEach((node,i)=>{if(scrollFocus===i)node.focus({preventScroll:true});if(scroll[i]){node.scrollLeft=scroll[i][0];node.scrollTop=scroll[i][1];}});
+    handOff(morph(element,html));
+    for(const node of element.querySelectorAll('[data-health-disclosure]')) {
+      const open=expanded.has(node.dataset.healthDisclosure);if(node.open!==open)node.open=open;
+    }
+  }
+  // The heatmap's roving tabindex (one cell in the tab order: the focused one, else the first) is
+  // stamped into the markup before the morph, so a quiet refresh does not reset and re-set it.
+  function roving(html) {
+    const t=doc.createElement('template');t.innerHTML=html;
+    const cells=[...t.content.querySelectorAll('[data-health-project][data-health-bucket]')];
+    const active=doc.activeElement,key=active?.matches?.('[data-health-project][data-health-bucket]')?cellKey(active):null;
+    const hit=cells.some(cell=>cellKey(cell)===key);
+    cells.forEach((cell,index)=>cell.setAttribute('tabindex',(hit?cellKey(cell)===key:index===0)?'0':'-1'));
+    return t.innerHTML;
   }
   function contextCoverageUnknown() {
     return rows(history?.pipelines).some(record=>(context.mission && !['mission_key','mission_id','related_missions'].some(key=>Object.hasOwn(record,key))) || (context.session && !['session_id','related_sessions'].some(key=>Object.hasOwn(record,key))));
@@ -119,16 +126,16 @@ export function mountCiHealth(host,client,{onSelectRun=()=>{},onSelectStep=()=>{
     orderSignature=nextOrderSignature;
     const unavailable=history?.available===false;
     const hideHistory=unavailable&&!rows(history?.repos).length;
-    el('[data-health-status]').textContent=error || (!history?'Loading CI history…':unavailable?ciHealthUnavailable(history,history.missingClient):`${history.stale?'Stale history · ':''}${history.refreshing?'Refreshing history · ':''}${model.partial?'Partial history: coverage is incomplete. ':''}${state.mode==='runs'?'Last 24 matching runs per project; no date cutoff. ':'UTC timestamps. '}${contextCoverageUnknown()?'Context associations are unavailable for some runs; counts and coverage for this route are incomplete. ':context.mission || context.session?'Counts are limited to the current route context. ':''}Only completed success and failure outcomes contribute to pass/fail totals.`);
+    patchText(el('[data-health-status]'),error || (!history?'Loading CI history…':unavailable?ciHealthUnavailable(history,history.missingClient):`${history.stale?'Stale history · ':''}${history.refreshing?'Refreshing history · ':''}${model.partial?'Partial history: coverage is incomplete. ':''}${state.mode==='runs'?'Last 24 matching runs per project; no date cutoff. ':'UTC timestamps. '}${contextCoverageUnknown()?'Context associations are unavailable for some runs; counts and coverage for this route are incomplete. ':context.mission || context.session?'Counts are limited to the current route context. ':''}Only completed success and failure outcomes contribute to pass/fail totals.`));
     // The heatmap is rebuilt with innerHTML; a cell whose outcome symbol changed (same project and
     // bucket) flashes. A mode, scope or filter change re-keys the buckets, so it never flashes.
     const cellsBefore=nextOrderSignature===shownCells?snapshotText(el('[data-health-map]'),CELL,cellKey):null;
-    replace(el('[data-health-map]'),hideHistory?'':renderCiHeatmap(model));
+    replace(el('[data-health-map]'),!history&&!error?skeleton('CI history',{rows:3}):hideHistory?'':roving(renderCiHeatmap(model)));
     animateChanges(el('[data-health-map]'),CELL,cellsBefore,cellKey,{count:false});
     shownCells=nextOrderSignature;
-    replace(el('[data-health-tree]'),hideHistory?'':selectedSlot()+renderCiTree(model,{selectedRunKey:selectedKey,expanded,limits:treeLimits})+selectedSteps());
+    replace(el('[data-health-tree]'),!history&&!error?skeleton('CI project health',{rows:3,height:40}):hideHistory?'':selectedSlot()+renderCiTree(model,{selectedRunKey:selectedKey,expanded,limits:treeLimits})+selectedSteps());
     const selectionHtml=selection?`${!model.projects.some(project=>project.key===selection.projectKey && project.cells.some(cell=>cell.key===selection.bucketKey))?'Selected run or bucket is no longer present in this window.':'Selected project and time bucket · latest labels apply within this selection.'} <button type="button" class="hd-btn" data-health-clear>Clear selection</button>`:'';
-    const chip=el('[data-health-selection]');if(chip.innerHTML!==selectionHtml)chip.innerHTML=selectionHtml;
+    morph(el('[data-health-selection]'),selectionHtml);
     const cells=[...host.querySelectorAll('[data-health-project][data-health-bucket]')];
     const focused=cells.find(cell=>cell===doc.activeElement);
     cells.forEach((cell,index)=>cell.tabIndex=focused?cell===focused?0:-1:index===0?0:-1);
