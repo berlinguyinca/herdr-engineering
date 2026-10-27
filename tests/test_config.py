@@ -139,6 +139,31 @@ def test_invalid_github_organizations_are_rejected_with_a_clear_error(tmp_path, 
         load_config([p])
 
 
+def test_projects_settings_default_off_and_override():
+    from herdr_engineering.config import github_projects
+    assert DEFAULTS["github"]["projects"] == {"enabled": False, "item_limit": 2000}
+    assert github_projects(None) == {"enabled": False, "item_limit": 2000}
+    assert github_projects({"enabled": True, "item_limit": 50}) == {"enabled": True, "item_limit": 50}
+
+
+@pytest.mark.parametrize(("key", "value"), [("enabled", "yes"), ("enabled", 1), ("item_limit", 0),
+                                            ("item_limit", True), ("item_limit", "many"), ("item_limit", 2.5)])
+def test_invalid_projects_settings_are_rejected(tmp_path, key, value):
+    import yaml
+    p = tmp_path / "bad.yaml"
+    p.write_text(yaml.safe_dump({"version": 1, "github": {"projects": {key: value}}}))
+    with pytest.raises(InvalidError, match=f"github.projects.{key}"):
+        load_config([p])
+
+
+def test_projects_settings_must_be_a_mapping(tmp_path):
+    import yaml
+    p = tmp_path / "bad.yaml"
+    p.write_text(yaml.safe_dump({"version": 1, "github": {"projects": ["acme"]}}))
+    with pytest.raises(InvalidError, match="github.projects must be a mapping"):
+        load_config([p])
+
+
 @pytest.mark.parametrize("value", [0, -5, "daily", True])
 def test_invalid_full_reconcile_interval_is_rejected(tmp_path, value):
     import yaml

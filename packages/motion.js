@@ -114,3 +114,15 @@ export function flash(el){
  el.setAttribute('data-flash','');
  setTimeout(()=>el.removeAttribute('data-flash'),600);
 }
+
+// Skeleton placeholder for a first load: grey rows with a shimmer (static under calm). It is
+// aria-busy and announced as "Loading <label>". Views replace it wholesale when their data arrives.
+// bare: rows only, for a placeholder nested inside an outer [data-skeleton] that announces itself.
+// inStatus: the placeholder sits inside an existing role="status" region, so it adds no second
+// one; a visually hidden "Loading <label>" lets the outer region announce it.
+export function skeleton(label,{rows=3,height=44,bare=false,inStatus=false}={}){
+ const safe=String(label).replace(/[&<>"']/g,c=>`&#${c.charCodeAt(0)};`);
+ const own=bare?'':inStatus?' data-skeleton aria-busy="true"':` data-skeleton aria-busy="true" role="status" aria-label="Loading ${safe}"`;
+ const hidden=!bare&&inStatus?`<span class="visually-hidden">Loading ${safe}</span>`:'';
+ return `<div class="hd-skeleton-group"${own}>${hidden}${`<div class="hd-skeleton" style="height:${Number(height)}px"></div>`.repeat(Math.max(1,rows))}</div>`;
+}

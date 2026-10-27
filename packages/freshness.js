@@ -25,6 +25,23 @@ export function freshnessState({ now, last, error = null, interval = 5000, conta
 
 const Base = typeof HTMLElement === 'undefined' ? class {} : HTMLElement;
 
+// A chip that several independent sources feed: each calls ok/fail and the chip is red as long as
+// any source is failing, green once every source has reported ok (touch(true) also marks it live).
+export function freshnessSources(chip) {
+  const failing = new Map();
+  const report = () => {
+    const el = chip();
+    if (!el || typeof el.touch !== 'function') return;
+    if (failing.size) el.touch(false, [...failing.values()].join('; '));
+    else el.touch(true);
+  };
+  return {
+    ok(source) { failing.delete(source); report(); },
+    fail(source, message) { failing.set(source, String(message || `${source} could not refresh`)); report(); },
+    get failing() { return failing.size > 0; },
+  };
+}
+
 export class HerdrFreshness extends Base {
   static get observedAttributes() { return ['interval']; }
 
@@ -35,6 +52,16 @@ export class HerdrFreshness extends Base {
     this._timer = null;
     this._text = null;
     this._state = null;
+    this._detail = null;
+    this._warn = false;
+  }
+
+  // A source-specific note appended to the chip (e.g. "projects syncing · 2 deferred");
+  // ``warn`` keeps the chip amber instead of green.
+  setDetail(text, { warn } = {}) {
+    this._detail = text || null;
+    this._warn = Boolean(warn);
+    this._render();
   }
 
   get interval() {
@@ -69,8 +96,10 @@ export class HerdrFreshness extends Base {
     const age = this._last == null ? null : Math.max(0, Math.floor((Date.now() - this._last) / 1000));
     const ago = age == null ? 'not yet updated'
       : `updated ${age < 60 ? `${age}s` : age < 3600 ? `${Math.floor(age / 60)}m` : `${Math.floor(age / 3600)}h`} ago`;
-    const state = freshnessState({ now: Date.now(), last: this._last, error: this._error, interval: this.interval });
-    const text = state === 'error' ? `error · ${this._error} · ${ago}` : `live · ${ago}`;
+    let state = freshnessState({ now: Date.now(), last: this._last, error: this._error, interval: this.interval });
+    if (state === 'fresh' && this._warn) state = 'stale';
+    let text = state === 'error' ? `error · ${this._error} · ${ago}` : `live · ${ago}`;
+    if (this._detail) text += ` · ${this._detail}`;
     if (state !== this._state) { this._state = state; this.setAttribute('data-state', state); }
     if (text !== this._text) { this._text = text; this.textContent = text; }
   }

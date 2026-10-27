@@ -22,6 +22,7 @@ from .errors import InvalidError
 # 400 points every 300 s stays under GitHub's 5000/hour even when every pass spends it.
 GITHUB_POINTS_PER_HOUR = 5000  # GitHub GraphQL primary rate limit
 GITHUB_SYNC_DEFAULTS = {"interval": 300, "full_reconcile_interval": 86400, "point_budget": 400}
+GITHUB_PROJECTS_DEFAULTS = {"enabled": False, "item_limit": 2000}
 
 DEFAULTS: dict[str, Any] = {
     "version": 1,
@@ -92,7 +93,9 @@ DEFAULTS: dict[str, Any] = {
     # token sees. Excluded owners cost no issue calls and are purged from the
     # stored catalog on the next pass.
     # sync: interval between passes and between scheduled full reads (seconds).
-    "github": {"organizations": [], "sync": dict(GITHUB_SYNC_DEFAULTS)},
+    # projects: read-only Projects v2 boards of the in-scope owners (off by default).
+    "github": {"organizations": [], "sync": dict(GITHUB_SYNC_DEFAULTS),
+               "projects": dict(GITHUB_PROJECTS_DEFAULTS)},
 }
 
 
@@ -119,6 +122,26 @@ def github_sync(value: Any) -> dict[str, int]:
     return settings
 
 
+def github_projects(value: Any) -> dict[str, Any]:
+    """Validate ``github.projects``; the settings with defaults filled in."""
+    if value is None:
+        value = {}
+    if not isinstance(value, dict):
+        raise InvalidError("github.projects must be a mapping")
+    settings = dict(GITHUB_PROJECTS_DEFAULTS)
+    enabled = value.get("enabled")
+    if enabled is not None:
+        if not isinstance(enabled, bool):
+            raise InvalidError("github.projects.enabled must be true or false")
+        settings["enabled"] = enabled
+    limit = value.get("item_limit")
+    if limit is not None:
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+            raise InvalidError("github.projects.item_limit must be a positive whole number")
+        settings["item_limit"] = limit
+    return settings
+
+
 def github_organizations(value: Any) -> list[str]:
     """Validate ``github.organizations``; the normalised (lower-case, unique) allowlist.
 
@@ -140,6 +163,7 @@ def validate_github(section: Any) -> None:
         raise InvalidError("github must be a mapping")
     github_organizations(section.get("organizations"))
     github_sync(section.get("sync"))
+    github_projects(section.get("projects"))
 
 
 def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:

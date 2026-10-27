@@ -27,6 +27,7 @@ _PG_DSN = os.environ.get("HERDR_E2E_PG_DSN")
 _MIGRATIONS_DIR = Path(__file__).parents[1] / "deploy" / "control-plane" / "migrations"
 _MIGRATION = _MIGRATIONS_DIR / "0006_github_catalog.sql"
 _DETAIL_MIGRATION = _MIGRATIONS_DIR / "0007_github_issue_details.sql"
+_PROJECTS_MIGRATION = _MIGRATIONS_DIR / "0008_github_projects.sql"
 
 
 class Clock:
@@ -80,7 +81,7 @@ class _PgBackend:
     def restart(self):
         """A new process: the database keeps the catalog."""
 
-    def __init__(self, *, migrate=True, details=True):
+    def __init__(self, *, migrate=True, details=True, projects=True):
         import asyncpg
 
         from herdr_engineering.control_plane.bridge import _LoopRunner
@@ -96,6 +97,8 @@ class _PgBackend:
                 self._run(conn.execute(_MIGRATION.read_text(encoding="utf-8")))
                 if details:
                     self._run(conn.execute(_DETAIL_MIGRATION.read_text(encoding="utf-8")))
+                if projects:
+                    self._run(conn.execute(_PROJECTS_MIGRATION.read_text(encoding="utf-8")))
         finally:
             self._run(conn.close())
 
@@ -136,9 +139,11 @@ def test_migration_file_follows_numbering():
     names = sorted(p.name for p in _MIGRATION.parent.glob("*.sql"))
     assert "0006_github_catalog.sql" in names
     assert "0007_github_issue_details.sql" in names
+    assert "0008_github_projects.sql" in names
     assert names[-1] == "0013_handoffs.sql"
     assert "CONCURRENTLY" not in _MIGRATION.read_text()
     assert "CONCURRENTLY" not in _DETAIL_MIGRATION.read_text()
+    assert "CONCURRENTLY" not in _PROJECTS_MIGRATION.read_text()
 
 
 def test_load_is_none_before_anything_is_stored(backend):
@@ -792,3 +797,108 @@ def test_load_without_rows_returns_only_the_revision(backend):
     bare = again.load(rows=False)
     assert bare.revision == again.revision() and bare.repositories == {} and bare.issues == {}
     assert backend.make(identity="tok-b").load(rows=False) is None  # same purge as a full load
+
+
+# ---------------------------------------------------------------- G9 projects
+
+P1, P2, P3 = "PVT_1", "PVT_2", "PVT_3"
+
+
+def project(pid, owner="acme", number=1, **extra):
+    return {"project_id": pid, "owner": owner, "number": number, "title": f"Board {number}",
+            "updated_at": "2026-10-24T00:00:00Z", "item_count": extra.pop("items", 1), **extra}
+
+
+def item(iid, status="Todo", **extra):
+    return {"item_id": iid, "type": "ISSUE", "title": f"item {iid}", "status": status,
+            "updated_at": "2026-10-24T00:00:00Z", **extra}
+
+
+def test_apply_project_round_trips_and_bumps_once(backend):
+    store = backend.make()
+    store.upsert_repositories([repo("acme/app")], scope=None)
+    before = store.revision()
+    store.apply_project(project(P1, synced={"updated_at": "x", "item_count": 2}),
+                        [item("PVTI_1"), item("PVTI_2")], [], "2026-10-24T00:00:00Z")
+    assert store.revision() == before + 1
+    store.apply_project(project(P1, synced={"updated_at": "x", "item_count": 2}),
+                        [item("PVTI_1"), item("PVTI_2")], [], "2026-10-24T00:00:00Z")
+    assert store.revision() == before + 1, "identical data changes nothing"
+    snapshot = backend.make().load()
+    assert snapshot.projects[P1]["title"] == "Board 1"
+    assert snapshot.projects[P1]["synced"] == {"updated_at": "x", "item_count": 2}
+    assert set(snapshot.project_items[P1]) == {"PVTI_1", "PVTI_2"}
+    assert snapshot.project_watermarks[P1] == "2026-10-24T00:00:00Z"
+    assert set(snapshot.repositories) == {A}, "the issue catalog is untouched"
+
+
+def test_project_changes_and_item_removals_are_deltas(backend):
+    store = backend.make()
+    store.apply_project(project(P1), [item("PVTI_1"), item("PVTI_2")], [], None)
+    since = store.revision()
+    store.apply_project(project(P1), [item("PVTI_1", status="Done")], ["PVTI_2"], None)
+    delta = store.changes_since(since)
+    assert delta["resync"] is False
+    assert [(i["kind"], i["repository_id"], i["key"]) for i in delta["upserted"]] == [("project_item", P1, "PVTI_1")]
+    assert delta["upserted"][0]["data"]["status"] == "Done"
+    assert [(i["kind"], i["repository_id"], i["key"]) for i in delta["removed"]] == [("project_item", P1, "PVTI_2")]
+    full = store.changes_since(0)
+    assert {(i["kind"], i["key"]) for i in full["upserted"]} == {("project", P1), ("project_item", "PVTI_1")}
+
+
+def test_replace_projects_removes_missing_projects_of_listed_owners_only(backend):
+    store = backend.make()
+    store.apply_project(project(P1, owner="acme"), [item("PVTI_1")], [], None)
+    store.apply_project(project(P2, owner="acme", number=2), [item("PVTI_2")], [], None)
+    store.apply_project(project(P3, owner="other", number=3), [item("PVTI_3")], [], None)
+    since = store.revision()
+    store.replace_projects([project(P1, owner="acme")], owners={"acme"})
+    snapshot = backend.make().load()
+    assert set(snapshot.projects) == {P1, P3}
+    assert set(snapshot.project_items) == {P1, P3}
+    removed = {(i["kind"], i["repository_id"], i["key"]) for i in store.changes_since(since)["removed"]}
+    assert removed == {("project", P2, P2), ("project_item", P2, "PVTI_2")}
+    rev = store.revision()
+    store.replace_projects([project(P1, owner="acme")], owners={"acme"})
+    assert store.revision() == rev
+
+
+def test_purge_owners_not_in_drops_projects_of_excluded_owners(backend):
+    store = backend.make()
+    store.upsert_repositories([repo("acme/app"), repo("other/tool")], scope=None)
+    store.apply_project(project(P1, owner="acme"), [item("PVTI_1")], [], None)
+    store.apply_project(project(P3, owner="Other", number=3), [item("PVTI_3")], [], None)
+    store.purge_owners_not_in({"acme"})
+    snapshot = backend.make().load()
+    assert set(snapshot.projects) == {P1} and set(snapshot.project_items) == {P1}
+
+
+def test_identity_change_and_purge_drop_projects(backend):
+    store = backend.make()
+    store.apply_project(project(P1), [item("PVTI_1")], [], None)
+    assert backend.make(identity="tok-b").load() is None
+    other = backend.make(identity="tok-b")
+    other.apply_project(project(P2), [item("PVTI_2")], [], None)
+    other.purge()
+    assert backend.make(identity="tok-b").load() is None or not backend.make(identity="tok-b").load().projects
+
+
+@_needs_pg
+def test_missing_projects_table_never_breaks_the_issue_catalog():
+    made = _PgBackend(projects=False)
+    try:
+        store = made.make()
+        store.upsert_repositories([repo("acme/app")], scope=None)
+        store.upsert_issues(A, [issue("I1", 1)], watermark=None)
+        snapshot = made.make().load()
+        assert set(snapshot.repositories) == {A} and snapshot.projects == {}
+        assert {i["key"] for i in store.changes_since(0)["upserted"]} == {A, "I1"}
+        with pytest.raises(GitHubStoreUnavailable):
+            store.apply_project(project(P1), [item("PVTI_1")], [], None)
+        with pytest.raises(GitHubStoreUnavailable):
+            store.replace_projects([project(P1)], owners={"acme"})
+        store.purge_owners_not_in({"acme"})
+        store.purge()
+        assert made.make(identity="tok-b").load() is None
+    finally:
+        made.close()
