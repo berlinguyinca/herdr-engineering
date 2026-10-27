@@ -16,9 +16,11 @@ export class ApiError extends Error {
 const CONDITIONAL_ENTRIES = 64;
 
 export class HerdrClient {
-  constructor(baseUrl = '', { fetchImpl = fetch } = {}) {
+  constructor(baseUrl = '', { fetchImpl = fetch, user = 'operator', tenant = 'default' } = {}) {
     this.base = baseUrl.replace(/\/+$/, '');
     this.fetch = fetchImpl;
+    this.user = user;
+    this.tenant = tenant;
     this.conditional = new Map();  // url -> { etag, text } (bounded by CONDITIONAL_ENTRIES)
   }
 
@@ -62,7 +64,7 @@ export class HerdrClient {
 
   async request(path, { method = 'GET', body, signal } = {}) {
     const url = `${this.base}${path}`;
-    const headers = { Accept: 'application/json' };
+    const headers = { Accept: 'application/json', 'X-Herdr-User': this.user, 'X-Herdr-Tenant': this.tenant };
     let payload;
     if (body !== undefined) {
       headers['Content-Type'] = 'application/json';
@@ -533,5 +535,70 @@ export class HerdrClient {
   // -- health / self-observability -----------------------------------------
   health({ signal } = {}) {
     return this.request('/api/v1/health', { signal });
+  }
+
+  // -- Herdr Personal Assistant (Rakazo integration) -----------------------
+  listAssistants({ signal } = {}) {
+    return this.request('/api/v1/assistants', { signal });
+  }
+  createAssistant(body, { signal } = {}) {
+    return this.request('/api/v1/assistants', { method: 'POST', body, signal });
+  }
+  getAssistant(id, { signal } = {}) {
+    return this.request(`/api/v1/assistants/${encodeURIComponent(id)}`, { signal });
+  }
+  updateAssistant(id, patch, { signal } = {}) {
+    return this.request(`/api/v1/assistants/${encodeURIComponent(id)}`, { method: 'PATCH', body: patch, signal });
+  }
+  archiveAssistant(id) {
+    return this.request(`/api/v1/assistants/${encodeURIComponent(id)}`, { method: 'DELETE' });
+  }
+  listAssistantThreads(assistantId, { signal } = {}) {
+    return this.request(`/api/v1/assistants/${encodeURIComponent(assistantId)}/threads`, { signal });
+  }
+  createThread(assistantId, title, { signal } = {}) {
+    return this.request(`/api/v1/assistants/${encodeURIComponent(assistantId)}/threads`, { method: 'POST', body: { title }, signal });
+  }
+  getThread(assistantId, threadId, { signal } = {}) {
+    return this.request(`/api/v1/assistants/${encodeURIComponent(assistantId)}/threads/${encodeURIComponent(threadId)}`, { signal });
+  }
+  sendAssistantMessage(assistantId, threadId, content) {
+    return this.request(`/api/v1/assistants/${encodeURIComponent(assistantId)}/threads/${encodeURIComponent(threadId)}/messages`, { method: 'POST', body: { content } });
+  }
+  getRun(runId) {
+    return this.request(`/api/v1/assistant-runs/${encodeURIComponent(runId)}`);
+  }
+  cancelRun(runId) {
+    return this.request(`/api/v1/assistant-runs/${encodeURIComponent(runId)}/cancel`, { method: 'POST', body: {} });
+  }
+  getAssistantPermissions(assistantId, { signal } = {}) {
+    return this.request(`/api/v1/assistants/${encodeURIComponent(assistantId)}/permissions`, { signal });
+  }
+  grantTool(assistantId, body, { signal } = {}) {
+    return this.request(`/api/v1/assistants/${encodeURIComponent(assistantId)}/permissions`, { method: 'POST', body, signal });
+  }
+  listApprovals({ signal } = {}) {
+    return this.request('/api/v1/assistant-approvals', { signal });
+  }
+  decideApproval(approvalId, decision) {
+    return this.request(`/api/v1/assistant-approvals/${encodeURIComponent(approvalId)}/decision`, { method: 'POST', body: { decision } });
+  }
+  requestToolAction(runId, body) {
+    return this.request(`/api/v1/assistant-runs/${encodeURIComponent(runId)}/tool`, { method: 'POST', body });
+  }
+  searchMemory(assistantId, query, { signal } = {}) {
+    return this.request(`/api/v1/assistants/${encodeURIComponent(assistantId)}/memory?q=${encodeURIComponent(query)}`, { signal });
+  }
+  storeMemory(assistantId, body) {
+    return this.request(`/api/v1/assistants/${encodeURIComponent(assistantId)}/memory`, { method: 'POST', body });
+  }
+  exportMemory(assistantId) {
+    return this.request(`/api/v1/assistants/${encodeURIComponent(assistantId)}/memory/export`, { method: 'POST', body: {} });
+  }
+  forgetMemory(memoryId) {
+    return this.request(`/api/v1/assistant-memory/${encodeURIComponent(memoryId)}`, { method: 'DELETE' });
+  }
+  assistantDiagnostics(assistantId, { signal } = {}) {
+    return this.request(`/api/v1/assistants/${encodeURIComponent(assistantId)}/diagnostics`, { signal });
   }
 }
