@@ -1081,7 +1081,7 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
         });
       }
       const html = renderInbox({ ...ctxModel(), enabled: CTX.features.consultation });
-      if (h.dataset.h !== html) { h.dataset.h = html; morph(h, html); }
+      if (h.dataset.h !== html) { h.dataset.h = html; handOff(morph(h, html), () => null); }
     }
     const LIN = { step: null, view: 'graph', mode: 'visual', clock: 'recorded', sel: null, focus: null, pages: [], total: 0, next: null,
       truncated: null, asOf: null, timeline: null, error: null, timelineError: null, html: '', pending: null, fails: 0, notice: null, busy: false, at: 0, seq: 0, bound: false, layout: null,
