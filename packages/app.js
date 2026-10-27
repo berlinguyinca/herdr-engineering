@@ -16,6 +16,7 @@ import { mountMissionCatalog } from './mission-catalog-view.js';
 import { mountOverview } from './overview-view.js';
 import { mountIntegrations } from './integrations-view.js';
 import { mountGithub } from './github-view.js';
+import { mountGithubProjects } from './github-projects-view.js';
 import { mountReviewGate } from './review-gate-view.js';
 import { mountTopology } from './topology-view.js';
 import { mountArtifacts, renderArtifactDetail } from './artifacts-view.js';
@@ -75,6 +76,7 @@ const NAV = [
   { path: '/services', label: 'Services' },
   { path: '/local-services', label: 'Local services' },
   { path: '/system-services', label: 'System services' },
+  { path: '/github/projects', label: 'Project boards' },
   { path: '/github', label: 'Projects' },
   { path: '/ci', label: 'CI' },
   { path: '/reviews', label: 'Reviews' },
@@ -132,6 +134,7 @@ function route() {
 const ROUTES = {
   '/overview': viewOverview,
   '/attention': viewAttention,
+  '/github/projects': viewGithubProjects,
   '/github': viewGithub,
   '/collab': viewCollab,
   '/artifacts': viewArtifacts,
@@ -322,6 +325,12 @@ async function viewCollab() {
 
 async function viewGithub() {
   return ownPolling(mountGithub(root, client));
+}
+
+async function viewGithubProjects() {
+  // Read-only Projects v2 boards; keeps its own 5 s poll, live events refresh it too.
+  const query = route().query;
+  return mountGithubProjects(root, client, { project: query.get('project') || '', layout: query.get('layout') || 'board' });
 }
 
 async function viewReviewGate() {

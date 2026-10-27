@@ -64,6 +64,28 @@ nodes {id number updatedAt} } } rateLimit {remaining resetAt cost} }"""
 DETAIL_QUERY = """query($owner:String!,$name:String!,$number:Int!) {
 repository(owner:$owner,name:$name) {issue(number:$number) {""" + ISSUE_FIELDS + """ body}}
 rateLimit {remaining resetAt cost} }"""
+# Projects v2 (G9). An owner's projects are listed newest updatedAt first with their item count
+# and Status options, so a project whose (updatedAt, item count) matches the stored probe costs
+# nothing more. ProjectV2.items can only be ordered by POSITION (ProjectV2ItemOrderField has no
+# UPDATED_AT), so items cannot be read newest first down to a watermark like issues: a changed
+# project's items are read in full (unchanged projects are still skipped). Issue.state and
+# PullRequest.state are different enums, so they are aliased (issueState / prState): one response
+# key for both fails GraphQL's SameResponseShape validation. title, number, url and repository
+# have the same type on every content type and share their keys.
+PROJECTS_QUERY = """query($login:String!,$cursor:String) { repositoryOwner(login:$login) { login
+... on ProjectV2Owner { projectsV2(first:50,after:$cursor,orderBy:{field:UPDATED_AT,direction:DESC}) {
+totalCount pageInfo {hasNextPage endCursor} nodes { id number title url closed updatedAt
+items {totalCount}
+field(name:"Status") { ... on ProjectV2SingleSelectField { id options {id name} } } } } } }
+rateLimit {remaining resetAt cost} }"""
+PROJECT_ITEMS_QUERY = """query($id:ID!,$cursor:String) { node(id:$id) { ... on ProjectV2 {
+items(first:100,after:$cursor) { totalCount pageInfo {hasNextPage endCursor} nodes {
+id type isArchived updatedAt
+status: fieldValueByName(name:"Status") { ... on ProjectV2ItemFieldSingleSelectValue { name optionId } }
+content { ... on Issue { title number url issueState: state repository {nameWithOwner} }
+... on PullRequest { title number url prState: state repository {nameWithOwner} }
+... on DraftIssue { title } } } } } }
+rateLimit {remaining resetAt cost} }"""
 
 
 def _stamp():
@@ -105,6 +127,7 @@ class GitHubError(RuntimeError):
             "redirect": "GitHub redirected the request; credentials were not forwarded.",
             "capacity": "The configured catalog safety limit was reached; coverage is partial.",
             "invalid_config": "github.organizations must be a list of non-empty GitHub owner logins; fix the YAML configuration.",
+            "insufficient_scope": "The GitHub token lacks a scope this read needs (Projects need read:project).",
         }.get(reason, "GitHub is temporarily unavailable."))
 
 
@@ -177,6 +200,8 @@ class GitHubProvider:
                     except (TypeError, KeyError, ValueError):
                         pass
                     raise GitHubError("rate_limited", retry_at=retry)
+                if "INSUFFICIENT_SCOPES" in kinds:
+                    raise GitHubError("insufficient_scope")
                 raise GitHubError("permission" if "FORBIDDEN" in kinds else "invalid_response")
             if not isinstance(data, dict):
                 raise GitHubError("invalid_response")
@@ -248,6 +273,24 @@ class GitHubProvider:
             raise GitHubError("not_found")
         return repository["issue"]
 
+    def projects_page(self, login, cursor=None):
+        """One page of an owner's Projects v2 (organization or user), newest ``updatedAt`` first."""
+        if not isinstance(login, str) or not login:
+            raise ValueError("login must name a GitHub owner")
+        data = self._query(PROJECTS_QUERY, {"login": login, "cursor": cursor})
+        owner = data.get("repositoryOwner")
+        if not isinstance(owner, dict):
+            raise GitHubError("not_found")
+        return self._connection(owner.get("projectsV2"))
+
+    def project_items_page(self, project_id, cursor=None):
+        """One page of a project's items, in board position order."""
+        data = self._query(PROJECT_ITEMS_QUERY, {"id": project_id, "cursor": cursor})
+        node = data.get("node")
+        if not isinstance(node, dict):
+            raise GitHubError("not_found")
+        return self._connection(node.get("items"))
+
 
 def autospec_state(labels, *, complete=True):
     labels = set(labels)
@@ -316,6 +359,49 @@ def _owner(record):
     return record["name_with_owner"].split("/", 1)[0].lower()
 
 
+def _project(row, owner):
+    """A listed Projects v2 row (``owner`` lower-case) with its Status options in column order;
+    ``status_options`` is ``None`` for a project without a single-select Status field."""
+    if not isinstance(row, dict) or not isinstance(row.get("id"), str) or not isinstance(row.get("number"), int):
+        raise GitHubError("invalid_response")
+    count = (row.get("items") or {}).get("totalCount") if isinstance(row.get("items"), dict) else None
+    if type(count) is not int:
+        raise GitHubError("invalid_response")
+    field = row.get("field") if isinstance(row.get("field"), dict) else None
+    options = None
+    if field is not None and isinstance(field.get("options"), list):
+        options = [{"id": o["id"], "name": redact_text(o["name"])} for o in field["options"]
+                   if isinstance(o, dict) and isinstance(o.get("id"), str) and isinstance(o.get("name"), str)]
+    return {"project_id": row["id"], "owner": owner.lower(), "number": row["number"],
+            "title": redact_text(str(row.get("title") or "")), "url": row.get("url") if isinstance(row.get("url"), str) else None,
+            "closed": bool(row.get("closed")), "updated_at": row.get("updatedAt") if _when(row.get("updatedAt")) else None,
+            # listed_item_count is GitHub's totalCount (archived items included): the change probe.
+            # item_count is what the page shows: the items read, archived ones excluded.
+            "listed_item_count": count, "item_count": count, "status_options": options}
+
+
+def _project_item(row, project_id):
+    """One project item, or ``None`` for an archived one (archived items are not shown). Content
+    may be an issue, a pull request, a draft or nothing (redacted for this token)."""
+    if not isinstance(row, dict) or not isinstance(row.get("id"), str):
+        raise GitHubError("invalid_response")
+    if row.get("isArchived"):
+        return None
+    content = row.get("content") if isinstance(row.get("content"), dict) else {}
+    status = row.get("status") if isinstance(row.get("status"), dict) else {}
+    repository = content.get("repository") if isinstance(content.get("repository"), dict) else {}
+    return {"item_id": row["id"], "project_id": project_id,
+            "type": row.get("type") if isinstance(row.get("type"), str) else "UNKNOWN",
+            "updated_at": row.get("updatedAt") if _when(row.get("updatedAt")) else None,
+            "status": redact_text(status["name"]) if isinstance(status.get("name"), str) else None,
+            "status_option": status.get("optionId") if isinstance(status.get("optionId"), str) else None,
+            "title": redact_text(str(content.get("title") or "")) or None,
+            "number": content.get("number") if isinstance(content.get("number"), int) else None,
+            "url": content.get("url") if isinstance(content.get("url"), str) else None,
+            "state": next((content[key] for key in ("issueState", "prState") if isinstance(content.get(key), str)), None),
+            "repository": repository.get("nameWithOwner") if isinstance(repository.get("nameWithOwner"), str) else None}
+
+
 def _configured_organizations():
     """``github.organizations`` from the central fleet file's ``github`` section.
 
@@ -324,6 +410,12 @@ def _configured_organizations():
     """
     from .host_config import host_value
     return host_value("github.organizations")
+
+
+def _configured_projects():
+    """``github.projects`` from the same fleet-file section (live, like the allowlist)."""
+    from .host_config import host_value
+    return host_value("github.projects")
 
 
 def _configured_sync():
@@ -396,7 +488,7 @@ class GitHubMonitor:
 
     def __init__(self, *, provider_factory=None, interval=None, repo_limit=5000, issue_limit=100000, now=None,
                  store=None, full_reconcile_interval=None, reconcile_per_pass=None, organizations=None,
-                 point_budget=None):
+                 point_budget=None, projects=None):
         self._factory = provider_factory or GitHubProvider
         self._repo_limit, self._issue_limit = repo_limit, issue_limit
         self._now = now or time.time
@@ -409,6 +501,8 @@ class GitHubMonitor:
         self._reconcile_per_pass = reconcile_per_pass
         # owner allowlist: a list, a callable returning one, or None = read the YAML each pass
         self._organizations = organizations
+        # github.projects: a mapping wins; None = read the YAML each pass (default: off)
+        self._fixed_projects = projects
         self._lock = threading.RLock()
         self._refresh_lock = threading.Lock()
         self._stop, self._wake = threading.Event(), threading.Event()
@@ -435,7 +529,19 @@ class GitHubMonitor:
         self._bind_failed = False  # this pass already failed to read the viewer store
         self._revision = None  # the store's catalog revision after its last load or write
         self._purging = None  # the store a revoked token is purging: no revision adopted from it meanwhile
+        self._reset_projects()
         self._touch()
+
+    def _reset_projects(self):
+        """Projects v2 (G9): rows by project id (listed fields + volatile ``complete``/``error``),
+        items per project in board order, the probe each was last read in full at, watermarks,
+        last full read times, and whether project writes failed (memory ahead of the store)."""
+        self._projects, self._project_items, self._project_marks = {}, {}, {}
+        self._project_watermarks, self._project_full_at = {}, {}
+        # project -> when its item read was first deferred (the longest-waiting one is the pass's
+        # progress floor), and an item read cut short: {probe, cursor, items} to resume from
+        self._project_deferred, self._project_resume = {}, {}
+        self._projects_unsaved = False
 
     def _touch(self):
         """Count an in-memory change (lock held) so an ETag never outlives what it describes."""
@@ -447,6 +553,8 @@ class GitHubMonitor:
                 "partial": False, "account": None, "checked_at": None, "last_success_at": None,
                 "scope": {"owners": [], "excluded_repositories": 0, "restricted": False}, "deferred_repos": [],
                 "deferred_total": 0,
+                "projects_sync": {"enabled": False, "status": "disabled", "error": None, "projects": 0,
+                                  "deferred": 0, "last_success_at": None},
                 "error": None, "rate_limit": None, "progress": {"phase": "idle", "repositories_seen": 0,
                     "repositories_total": None, "issue_repositories_complete": 0, "issue_repositories_total": None,
                     "issues_seen": 0, "issues_total_known": None, "current_repository": None}}
@@ -600,6 +708,7 @@ class GitHubMonitor:
                     self._hydrate(snapshot)
             elif self._repos and store is not None:
                 self._store_dirty = True
+            self._seed_projects_sync()
         return provider
 
     # -- persistent store
@@ -695,6 +804,21 @@ class GitHubMonitor:
             # not persisted: spread the next full reads over one interval after a restart
             offset = int(hashlib.sha256(rid.encode()).hexdigest()[:8], 16) % int(self._full_interval)
             self._full_at[rid] = self._now() - offset
+        for pid, data in snapshot.projects.items():
+            if allow and data.get("owner") not in allow:
+                continue
+            record = dict(data)
+            synced = record.pop("synced", None)
+            record.update(complete=True, error=None)
+            self._projects[pid] = record
+            self._project_items[pid] = dict(sorted(snapshot.project_items.get(pid, {}).items(),
+                                                   key=lambda pair: pair[1].get("position", 0)))
+            if isinstance(synced, dict):
+                self._project_marks[pid] = synced
+            if pid in snapshot.project_watermarks:
+                self._project_watermarks[pid] = snapshot.project_watermarks[pid]
+            offset = int(hashlib.sha256(pid.encode()).hexdigest()[:8], 16) % int(self._full_interval)
+            self._project_full_at[pid] = self._now() - offset
         self._touch()
         if self._repos:
             self._view.update(available=True, status="stale", stale=True,
@@ -731,6 +855,7 @@ class GitHubMonitor:
                 # the stored catalog belonged to another viewer and was purged (or was empty)
                 self._issues, self._marks, self._watermarks, self._issue_resume = {}, {}, {}, {}
                 self._full_at = {}
+                self._reset_projects()
                 self._store_dirty = False
                 self._touch()
             return store
@@ -864,6 +989,7 @@ class GitHubMonitor:
             self._repos, self._issues, self._details = {}, {}, {}
             self._marks, self._watermarks, self._full_at, self._deferred = {}, {}, {}, {}
             self._resume_repos, self._issue_resume = None, {}
+            self._reset_projects()
             self._revision = None  # until the purge lands, no since can be answered from memory
             self._purging = store
             self._view.update(available=False, status="auth_error", stale=False, partial=False, account=None,
@@ -911,6 +1037,7 @@ class GitHubMonitor:
         self._progress(phase="repositories", repositories_seen=0, repositories_total=None,
                        issues_seen=0, issues_total_known=None, issue_repositories_complete=0, current_repository=None)
         self._apply_sync_settings()
+        projects = self._projects_settings()
         with self._lock:
             self._spent = self._detail_spent()  # issue_detail fetches draw on the same budget
         allow = self._allowlist()
@@ -925,12 +1052,17 @@ class GitHubMonitor:
                     for table in (self._repos, self._issues, self._marks, self._watermarks,
                                   self._issue_resume, self._full_at, self._deferred):
                         table.pop(rid, None)
-                if dropped:
+                gone = [pid for pid, row in self._projects.items() if row.get("owner") not in allow]
+                for pid in gone:
+                    for table in self._project_tables():
+                        table.pop(pid, None)
+                if dropped or gone:
                     self._touch()  # no 304 may still describe the dropped owner's rows
                 if self._resume_repos is not None:
                     self._resume_repos = {rid: r for rid, r in self._resume_repos.items() if _owner(r) in allow}
             relist = self._resume_repos is None or self._resume_passes >= RESUME_PASSES_BEFORE_RELIST
             self._resume_passes = 0 if relist else self._resume_passes + 1
+        owners = None  # owners seen by this pass's listing (None: no listing this pass)
         if relist:
             discovered, cursor, cursors, excluded, owners = {}, None, set(), 0, set()
             while not self._stop.is_set():
@@ -1038,6 +1170,9 @@ class GitHubMonitor:
                     continue
                 if exc.reason in {"authentication", "capacity"}:
                     raise
+        # the owner set is complete when it is the allowlist or comes from this pass's full listing
+        self._sync_projects(provider, store, projects, self._project_owners(allow, owners), limited=limited is not None,
+                            authoritative=bool(allow) or owners is not None)
         if limited is not None:
             raise limited  # the resume state stays: the next pass continues with the deferred
         if over_budget:
@@ -1061,6 +1196,311 @@ class GitHubMonitor:
                      error="Some repository issues could not be refreshed." if errors else None,
                      last_success_at=self._view["last_success_at"] if errors else _stamp())
         self._progress(phase="complete", current_repository=None)
+
+    # -- Projects v2 (G9)
+
+    def _projects_settings(self):
+        """``github.projects`` for this pass; ``GitHubError("invalid_config")`` when invalid."""
+        from .config import github_projects
+        try:
+            return github_projects(self._fixed_projects if self._fixed_projects is not None else _configured_projects())
+        except InvalidError as exc:
+            raise GitHubError("invalid_config", message=f"{exc}; fix the YAML configuration.") from None
+
+    def _seed_projects_sync(self):
+        """After a view reset (start, token change): say whether project sync is on before the
+        first pass does, so hydrated projects are served (``stale``) and the page never claims
+        that sync is off while it is configured on (lock held)."""
+        try:
+            enabled = self._projects_settings()["enabled"]
+        except GitHubError:
+            enabled = False
+        if enabled:
+            self._view["projects_sync"].update(enabled=True, status="stale" if self._projects else "waiting",
+                                               projects=len(self._projects))
+
+    def _project_owners(self, allow, listed):
+        """Whose projects are read: the allowlist when set; otherwise the owners of the listed
+        repositories (or, on a pass without a listing, the last scope) plus the viewer's account."""
+        if allow:
+            return sorted(allow)
+        with self._lock:
+            owners = set(listed if listed is not None else self._view["scope"]["owners"])
+            account = self._view.get("account")
+        if isinstance(account, str) and account:
+            owners.add(account.lower())
+        return sorted(owners)
+
+    def _project_tables(self):
+        return (self._projects, self._project_items, self._project_marks, self._project_watermarks,
+                self._project_full_at, self._project_deferred, self._project_resume)
+
+    def _projects_update(self, **fields):
+        with self._lock:
+            self._check_generation()
+            self._view["projects_sync"].update(fields)
+            self._view["projects_sync"]["projects"] = len(self._projects)
+            self._touch()
+
+    def _write_projects(self, store, work):
+        """Write project rows through; a failure (e.g. migration 0008 not applied yet) leaves
+        the issue catalog alone and marks only the projects unsaved, rewritten next pass."""
+        if store is None:
+            return
+        try:
+            work(store)
+        except Exception:
+            with self._lock:
+                if store is self._store:
+                    self._projects_unsaved = True
+            return
+        if store is self._store:
+            self._remember_revision(store)
+
+    def _stored_project(self, row):
+        data = {key: value for key, value in row.items() if key not in ("complete", "error")}
+        data["synced"] = self._project_marks.get(row["project_id"])
+        return data
+
+    def _flush_projects(self, store):
+        """Rewrite every project in memory after earlier project writes failed."""
+        with self._lock:
+            if store is not self._store or not self._projects_unsaved:
+                return
+            self._projects_unsaved = False
+            by_owner = {}
+            for row in self._projects.values():
+                by_owner.setdefault(row["owner"], []).append(self._stored_project(row))
+            work = [(self._stored_project(row), list(self._project_items.get(pid, {}).values()),
+                     self._project_watermarks.get(pid)) for pid, row in self._projects.items()]
+
+        def flush(target):
+            snapshot = target.load()
+            for owner, rows in by_owner.items():
+                target.replace_projects(rows, {owner})
+            for row, items, watermark in work:
+                stored = set(snapshot.project_items.get(row["project_id"], {}) if snapshot else ())
+                target.apply_project(row, items, stored - {i["item_id"] for i in items}, watermark)
+        self._write_projects(store, flush)
+
+    def _sync_projects(self, provider, store, settings, owners, *, limited, authoritative=False):
+        """List each in-scope owner's projects, then read the items of the projects whose
+        (``updatedAt``, item count) probe changed or whose staggered full read is due.
+
+        The listing of an owner always completes (it is one call per 50 projects); an item
+        read is not started once the pass's point budget is spent, so that project keeps its
+        old items and is read next pass. A failure here never fails the issue pass: only a
+        401 (``authentication``) propagates.
+        """
+        if not settings["enabled"]:
+            self._projects_update(enabled=False, status="disabled", error=None, deferred=0)
+            return
+        self._projects_update(enabled=True)
+        if limited:  # GitHub is rate limiting this pass: nothing more is read
+            self._projects_update(status="rate_limited", deferred=len(self._projects),
+                                  error=str(GitHubError("rate_limited")))
+            return
+        if not hasattr(provider, "projects_page"):
+            # a provider without Projects v2 support never fails the issue pass
+            self._projects_update(status="error", error="This GitHub provider does not support Projects v2.")
+            return
+        if self._projects_unsaved:
+            self._flush_projects(store)
+        if authoritative:
+            # an owner out of scope (no longer listed, or dropped from the allowlist) keeps no
+            # projects: not in memory, not in the store
+            with self._lock:
+                self._check_generation()
+                gone_owners = {row["owner"] for row in self._projects.values()} - set(owners)
+                for pid in [pid for pid, row in self._projects.items() if row["owner"] in gone_owners]:
+                    for table in self._project_tables():
+                        table.pop(pid, None)
+                if gone_owners:
+                    self._touch()
+            if gone_owners:
+                self._write_projects(store, lambda target: target.replace_projects([], gone_owners))
+        errors, listed, deferred, limit_hit = [], {}, [], None
+        for owner in owners:
+            if self._stop.is_set():
+                return
+            try:
+                rows = self._list_projects(provider, owner)
+            except GitHubError as exc:
+                if exc.reason == "authentication":
+                    raise
+                if exc.reason == "rate_limited":
+                    limit_hit = exc
+                    break
+                errors.append((owner, str(exc)))
+                continue
+            listed.update({row["project_id"]: row for row in rows})
+            with self._lock:
+                self._check_generation()
+                gone = [pid for pid, row in self._projects.items() if row["owner"] == owner and pid not in listed]
+                for pid in gone:
+                    for table in self._project_tables():
+                        table.pop(pid, None)
+                for row in rows:
+                    previous = self._projects.get(row["project_id"], {})
+                    read = self._project_items.get(row["project_id"])
+                    self._projects[row["project_id"]] = dict(row, complete=previous.get("complete", False),
+                                                             error=previous.get("error"),
+                                                             item_count=len(read) if read is not None else row["item_count"])
+                stored_rows = [self._stored_project(self._projects[row["project_id"]]) for row in rows]
+                self._touch()
+            self._write_projects(store, lambda target, rows=stored_rows, owner=owner:
+                                 target.replace_projects(rows, {owner}))
+        now = self._now()
+        # progress floor: the longest-deferred project may make one item page even when the
+        # listings spent the budget, so a pass with a small budget still advances a project
+        with self._lock:
+            waiting = sorted((at, pid) for pid, at in self._project_deferred.items() if pid in listed)
+        floor = waiting[0][1] if waiting else None
+        order = [pair for pair in listed.items() if pair[0] == floor] + sorted(
+            (pair for pair in listed.items() if pair[0] != floor),
+            key=lambda pair: pair[1]["updated_at"] or "", reverse=True)
+        for pid, row in order:
+            if self._stop.is_set() or limit_hit is not None:
+                break
+            probe = {"updated_at": row["updated_at"], "item_count": row.get("listed_item_count", row["item_count"])}
+            with self._lock:
+                due = now - self._project_full_at.get(pid, now) >= self._full_interval
+                unchanged = self._project_marks.get(pid) == probe and pid in self._project_items and not due
+            if unchanged:
+                with self._lock:
+                    self._projects[pid].update(complete=True, error=None)
+                continue
+            if self._spent >= self._budget and pid != floor:
+                deferred.append(pid)
+                with self._lock:
+                    self._project_deferred.setdefault(pid, now)
+                continue
+            try:
+                self._read_project(provider, store, row, probe, settings["item_limit"], floor=pid == floor)
+                with self._lock:
+                    self._project_deferred.pop(pid, None)
+            except _OverBudget:
+                deferred.append(pid)
+                with self._lock:
+                    self._project_deferred.setdefault(pid, now)
+            except GitHubError as exc:
+                if exc.reason == "authentication":
+                    raise
+                if exc.reason == "rate_limited":
+                    limit_hit = exc
+                    deferred.append(pid)
+                    continue
+                with self._lock:
+                    self._projects[pid].update(complete=False, error=str(exc))
+                errors.append((row["title"] or pid, str(exc)))
+        # one line per distinct message, naming every owner or project it applies to
+        grouped = {}
+        for who, message in errors:
+            grouped.setdefault(message, []).append(who)
+        problems = [f"{', '.join(who)}: {message}" for message, who in grouped.items()]
+        if errors and not listed:
+            status = "error"
+        elif limit_hit is not None:
+            status = "rate_limited"
+            problems.append(str(limit_hit))
+        elif errors or deferred:
+            status = "partial"
+        else:
+            status = "ready"
+        if deferred:
+            problems.append(f"The per-pass point budget ({self._budget}) was spent; "
+                            f"{len(deferred)} projects wait for the next pass.")
+        error = " ".join(problems) or None
+        if any("scope" in m or "denied" in m for m in grouped) and "read:project" not in error:
+            error = f"{error} Projects need the token's read:project scope."
+        self._projects_update(status=status, error=error, deferred=len(deferred),
+                              **({"last_success_at": _stamp()} if status == "ready" else {}))
+
+    def _list_projects(self, provider, owner):
+        rows, cursor, cursors = [], None, set()
+        while True:
+            connection = provider.projects_page(owner, cursor)
+            self._charge(provider)  # like the repository listing: never cut short, but it counts
+            rows.extend(_project(node, owner) for node in connection["nodes"])
+            if not connection["pageInfo"]["hasNextPage"]:
+                return rows
+            cursor = connection["pageInfo"]["endCursor"]
+            if cursor in cursors:
+                raise GitHubError("invalid_response")
+            cursors.add(cursor)
+
+    def _read_project(self, provider, store, row, probe, item_limit, *, floor=False):
+        """Read one project's items in full (they cannot be ordered by update time) and
+        reconcile: items missing from a complete read are removed. A read cut short (budget,
+        item limit, error) changes nothing shown: the old items stay and the probe is not advanced.
+        A read the budget cut short resumes at its cursor next pass while the project's probe is
+        unchanged (a changed project starts again at page 1, since positions may have moved).
+        ``floor``: the pass's progress floor, which may read one page over the budget."""
+        pid = row["project_id"]
+        with self._lock:
+            resume = self._project_resume.pop(pid, None)
+        if resume is not None and resume["probe"] == probe:
+            items, cursor = dict(resume["items"]), resume["cursor"]
+        else:
+            items, cursor = {}, None
+        cursors, pages = set(), 0
+        while True:
+            if self._spent >= self._budget and not (floor and pages == 0):
+                if cursor is not None:
+                    with self._lock:
+                        self._project_resume[pid] = {"probe": probe, "cursor": cursor, "items": items}
+                raise _OverBudget()
+            pages += 1
+            connection = provider.project_items_page(pid, cursor)
+            self._charge(provider)
+            for node in connection["nodes"]:
+                item = _project_item(node, pid)
+                if item is not None:
+                    items[item["item_id"]] = dict(item, position=len(items))
+            if len(items) > item_limit:
+                raise GitHubError("capacity", message=(
+                    f"The project has more than github.projects.item_limit ({item_limit}) items; "
+                    "showing the items read earlier."))
+            if not connection["pageInfo"]["hasNextPage"]:
+                break
+            cursor = connection["pageInfo"]["endCursor"]
+            if cursor in cursors:
+                raise GitHubError("invalid_response")
+            cursors.add(cursor)
+        watermark = _latest(*(item["updated_at"] for item in items.values()))
+        with self._lock:
+            self._check_generation()
+            previous = set(self._project_items.get(pid, {}))
+            self._project_items[pid] = items
+            self._project_marks[pid] = probe
+            self._project_watermarks[pid] = watermark
+            self._project_full_at[pid] = self._now()
+            self._projects[pid].update(complete=True, error=None, item_count=len(items))
+            stored = self._stored_project(self._projects[pid])
+            self._touch()
+        removed = previous - set(items)
+        self._write_projects(store, lambda target: target.apply_project(stored, items.values(), removed, watermark))
+
+    def projects(self, *, start=True):
+        """The in-scope Projects v2 with the sync state; empty while project sync is off."""
+        view = self.snapshot(start=start)
+        with self._lock:
+            enabled = view["projects_sync"]["enabled"] or (self._fixed_projects or {}).get("enabled", False)
+            rows = [copy.deepcopy(row) for row in self._projects.values()] if enabled else []
+        view["projects"] = sorted(rows, key=lambda r: (r["owner"], r["number"]))
+        return view
+
+    def project_items(self, project_id, *, start=True):
+        """One project and its items in board order; ``GitHubError("not_found")`` when unknown."""
+        view = self.projects(start=start)
+        project = next((row for row in view["projects"] if row["project_id"] == project_id), None)
+        if project is None:
+            raise GitHubError("not_found")
+        with self._lock:
+            items = [copy.deepcopy(item) for item in self._project_items.get(project_id, {}).values()]
+        view.pop("projects")
+        view.update(project=project, items=sorted(items, key=lambda i: i.get("position", 0)))
+        return view
 
     def _defer(self, rids):
         now = self._now()
@@ -1334,7 +1774,7 @@ class GitHubMonitor:
         return {"revision": revision,
                 "fingerprint": json.dumps([view, epoch, self._generation, deferred], sort_keys=True, default=str)}
 
-    def changes(self, *, kind, since, repository_id=None, tab="all", search="", start=True):
+    def changes(self, *, kind, since, repository_id=None, tab="all", search="", project_id=None, start=True):
         """``since`` delta of one list: ``{revision, resync: false, upserted, removed}`` plus the sync state.
 
         Keys come from the store's revisioned rows and tombstones; the rows are
@@ -1345,14 +1785,19 @@ class GitHubMonitor:
         ``resync: true`` with the first ``RESYNC_PAGE`` rows only (``pagination`` says how many
         more; the client reloads the rest through the paginated list), never the whole catalog.
         """
-        if kind not in {"repositories", "issues"} or tab not in TABS:
+        if kind not in {"repositories", "issues", "projects", "project_items"} or tab not in TABS:
             raise ValueError("unknown GitHub list")
+        projects = kind in {"projects", "project_items"}
+        if kind == "project_items":
+            self.project_items(project_id, start=start)  # not_found before any store read
         self._ready(start)
         with self._lock:
             view = self.snapshot(start=False, sync=False)
             current_revision = self._revision
-            # no trusted revision (writes failing, or a purge under way): every since resyncs
-            store = None if self._store_dirty or current_revision is None else self._store
+            # no trusted revision (writes failing, or a purge under way): every since resyncs;
+            # project rows the store missed (_projects_unsaved) resync their lists too
+            untrusted = self._store_dirty or current_revision is None or (projects and self._projects_unsaved)
+            store = None if untrusted else self._store
         delta = None
         if store is not None and since == current_revision:
             # the common poll: nothing written since the client's revision, so no store read
@@ -1362,8 +1807,20 @@ class GitHubMonitor:
                 delta = store.changes_since(since, full=False)
             except Exception:
                 delta = None
+        field = {"projects": "projects", "project_items": "items"}.get(kind, kind)
+        if projects:
+            # the rows are read after the store delta, like the issue rows below: a row is never
+            # older than the revision, so a change committed meanwhile is never reported removed
+            listing = self.projects(start=start) if kind == "projects" else self.project_items(project_id, start=start)
         with self._lock:
-            if kind == "repositories":
+            if kind == "projects":
+                rows = listing["projects"]
+                current = {(row["project_id"], row["project_id"]): row for row in rows}
+            elif kind == "project_items":
+                view["project"] = listing["project"]
+                rows = listing["items"]
+                current = {(project_id, row["item_id"]): row for row in rows}
+            elif kind == "repositories":
                 rows = self._repository_rows(search)
                 current = {(row["repository_id"], row["repository_id"]): row for row in rows}
             else:
@@ -1373,16 +1830,19 @@ class GitHubMonitor:
                 current = {(row["repository_id"], row["github_id"]): row for row in rows}
         if delta is None or delta["resync"]:
             page, pagination = _page(rows, 1, RESYNC_PAGE)
-            view.update({"revision": delta["revision"] if delta else None, "resync": True, kind: page,
+            view.update({"revision": delta["revision"] if delta else None, "resync": True, field: page,
                          "pagination": pagination})
             return view
-        wanted = "repository" if kind == "repositories" else "issue"
+        wanted = {"repositories": "repository", "issues": "issue", "projects": "project",
+                  "project_items": "project_item"}[kind]
+        scope = project_id if kind == "project_items" else repository_id
         touched = dict.fromkeys((item["repository_id"], item["key"]) for item in delta["upserted"] + delta["removed"]
-                                if item["kind"] == wanted and (repository_id is None or item["repository_id"] == repository_id))
+                                if item["kind"] == wanted and (scope is None or item["repository_id"] == scope))
         position = {key: index for index, key in enumerate(current)}
         upserted = sorted((key for key in touched if key in current), key=position.get)
+        owner = "project_id" if projects else "repository_id"
         view.update(revision=delta["revision"], resync=False, upserted=[current[key] for key in upserted],
-                    removed=[{"repository_id": rid, "key": key} for rid, key in touched if (rid, key) not in current])
+                    removed=[{owner: rid, "key": key} for rid, key in touched if (rid, key) not in current])
         return view
 
     def issue_detail(self, repository_id, number):

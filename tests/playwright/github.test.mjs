@@ -7,8 +7,9 @@ import {chromium} from 'playwright';
 
 const root=path.resolve(import.meta.dirname,'../..');
 const python=process.env.PYTHON || (fs.existsSync(path.join(root,'.venv/bin/python'))?path.join(root,'.venv/bin/python'):'python3');
-async function withApp(fn){
- const server=spawn(python,[path.join(root,'tests/playwright/server.py')],{env:{...process.env,BURST:'1'},stdio:['ignore','pipe','pipe']});
+// burst '0': no live event burst, so every list read comes from the 5 s poll (tests that count reads).
+async function withApp(fn,{burst='1'}={}){
+ const server=spawn(python,[path.join(root,'tests/playwright/server.py')],{env:{...process.env,BURST:burst},stdio:['ignore','pipe','pipe']});
  let browser;
  try{
   const port=await new Promise((resolve,reject)=>{let text='';const timeout=setTimeout(()=>reject(new Error('Fixture startup timed out')),20000);server.stdout.on('data',data=>{text+=data;const hit=text.match(/PORT=(\d+)/);if(hit){clearTimeout(timeout);resolve(hit[1]);}});server.once('exit',code=>{clearTimeout(timeout);reject(new Error(`Fixture exited ${code}`));});});
@@ -180,3 +181,92 @@ test('GitHub desktop selection enters narrow detail with focus and returns to a 
   const row=await item.boundingBox();assert.ok(row.y>=0&&row.y+row.height<=844,`selected issue ${number} must return within the viewport: ${JSON.stringify(row)}`);
  }
 }));
+
+// G8: the page polls with If-None-Match and since=<revision>. A 304 writes nothing; a delta with one
+// changed issue patches that one row; a resync replaces the list; the scope line names the owners.
+test('GitHub polls conditionally and applies since deltas row by row',async()=>withApp(async(page,base)=>{
+ let revision=10,mode='delta',rows=[issue(3,{updated_at:'2001-01-03T00:00:00Z'}),issue(2,{updated_at:'2001-01-02T00:00:00Z'}),issue(1,{updated_at:'2001-01-01T00:00:00Z'})],changed=[];
+ const seen={repos:[],issues:[]};
+ const scope={owners:['lab','partner'],excluded_repositories:4,restricted:true};
+ const reply=(route,kind,full,delta)=>{
+  const url=new URL(route.request().url()),since=url.searchParams.get('since'),inm=route.request().headers()['if-none-match']||null;
+  const tag=`W/"${revision}-${kind}-${mode}"`;seen[kind].push({since,inm});
+  if(inm===tag)return route.fulfill({status:304,headers:{etag:tag,'cache-control':'no-store'}});
+  const body=since===null?full():mode==='resync'?{...full(),resync:true,pagination:undefined}:delta();
+  return route.fulfill({status:200,headers:{etag:tag,'cache-control':'no-store'},json:{...snapshot({scope,last_success_at:'2001-01-01T00:00:00Z'}),...body,revision}});
+ };
+ await page.route('**/api/v1/github?*',route=>reply(route,'repos',()=>({repositories:[repository('busy',3)]}),()=>({resync:false,upserted:[],removed:[]})));
+ const counts=()=>({all:rows.length,autospec:rows.length,preparation:0,in_progress:0,blocked:0});
+ await page.route('**/api/v1/github/issues?*',route=>reply(route,'issues',()=>({issues:rows,counts:counts()}),()=>({resync:false,upserted:changed,removed:[],counts:counts()})));
+ await page.clock.install();
+ await page.goto(`${base}/#/github`);await page.getByRole('button',{name:'Issue 1',exact:true}).waitFor();
+ const health=await page.locator('[data-gh-health]').innerText();
+ assert.match(health,/2 owners in scope: lab, partner/);assert.match(health,/4 repositories excluded/);
+ // Mark the row nodes and record every DOM write under the view, except the self-ticking ages and chip.
+ await page.evaluate(()=>{
+  for(const row of document.querySelectorAll('[data-gh-issue-row]'))row.__mark=row.dataset.ghIssueRow;
+  window.__muts=[];new MutationObserver(list=>{for(const m of list){const el=m.target.nodeType===1?m.target:m.target.parentElement;if(el?.closest('[data-gh-time],herdr-freshness'))continue;window.__muts.push({row:el?.closest('[data-gh-issue-row]')?.dataset.ghIssueRow||null,type:m.type,attr:m.attributeName,tag:el?.tagName});}}).observe(document.querySelector('#view'),{subtree:true,childList:true,attributes:true,characterData:true});
+ });
+ const poll=async kind=>{const n=seen[kind].length;await page.clock.runFor(5000);await page.waitForFunction(()=>true);for(let i=0;i<200&&seen[kind].length===n;i++)await page.waitForTimeout(25);await page.waitForTimeout(150);};
+ const muts=()=>page.evaluate(()=>{const m=window.__muts;window.__muts=[];return m;});
+ // 1. Unchanged: the first poll asks since the held revision (a new URL, so no tag yet) and gets an
+ // empty delta; the next sends that answer's ETag and gets 304. Neither writes to the DOM.
+ await muts();await poll('issues');
+ assert.deepEqual(seen.issues.at(-1),{since:'10',inm:null});
+ await poll('issues');
+ assert.deepEqual(seen.issues.at(-1),{since:'10',inm:'W/"10-issues-delta"'});
+ assert.deepEqual(await muts(),[],'an empty delta and a 304 perform no DOM writes');
+ // 2. One issue edited: the delta carries it alone; only its row changes, every row keeps its node.
+ revision=11;rows=[issue(2,{title:'Issue 2 edited',updated_at:'2001-01-05T00:00:00Z'}),rows[0],rows[2]];changed=[rows[0]];
+ await poll('issues');
+ assert.equal(seen.issues.at(-1).since,'10');
+ await page.getByRole('button',{name:'Issue 2 edited',exact:true}).waitFor();
+ const rowsAfter=await page.evaluate(()=>[...document.querySelectorAll('[data-gh-issue-row]')].map(r=>({key:r.dataset.ghIssueRow,mark:r.__mark||null})));
+ assert.deepEqual(rowsAfter.map(r=>r.key),['github.com/lab/busy#2','github.com/lab/busy#3','github.com/lab/busy#1'],'server order: the edited issue moves up');
+ for(const r of rowsAfter)assert.equal(r.mark,r.key,`${r.key} kept its node`);
+ const written=new Set((await muts()).map(m=>m.row).filter(Boolean));
+ assert.deepEqual([...written],['github.com/lab/busy#2'],'only the edited row is written');
+ // 3. The next poll asks from the new revision.
+ changed=[];await poll('issues');assert.equal(seen.issues.at(-1).since,'11');
+ // 4. Resync: the server cannot answer since=11 any more; the list is replaced.
+ mode='resync';revision=40;rows=[issue(8,{updated_at:'2001-02-02T00:00:00Z'}),issue(7,{updated_at:'2001-02-01T00:00:00Z'})];
+ await poll('issues');
+ await page.getByRole('button',{name:'Issue 8',exact:true}).waitFor();
+ assert.deepEqual(await page.evaluate(()=>[...document.querySelectorAll('[data-gh-issue-row]:not([data-leaving])')].map(r=>r.dataset.ghIssueRow)),['github.com/lab/busy#8','github.com/lab/busy#7']);
+ mode='delta';await poll('issues');assert.equal(seen.issues.at(-1).since,'40');
+}));
+
+// Deltas never carry repository fields no revision covers (issues_loaded, issues_complete, error),
+// so the page reads its lists in full every 12th poll and on the poll after the sync state moved.
+test('GitHub reads in full every 12th poll and after a sync-state change, repairing unrevisioned repository fields',async()=>withApp(async(page,base)=>{
+ const revision=7;let loaded=1,complete=false,repoError=null,status='ready';const reads=[];
+ const repo=()=>({...repository('busy',3),issues_loaded:loaded,issues_complete:complete,error:repoError});
+ await page.route('**/api/v1/github?*',route=>{
+  const since=new URL(route.request().url()).searchParams.get('since');reads.push(since);
+  const state=snapshot({status,last_success_at:'2001-01-01T00:00:00Z'});
+  return route.fulfill({json:since===null?{...state,revision,repositories:[repo()]}:{...state,revision,resync:false,upserted:[],removed:[]}});
+ });
+ await page.route('**/api/v1/github/issues?*',route=>route.fulfill({json:{...snapshot({last_success_at:'2001-01-01T00:00:00Z'}),revision,issues:[issue(1)]}}));
+ await page.clock.install();
+ await page.goto(`${base}/#/github`);await page.locator('[data-gh-repository]').first().waitFor();
+ const poll=async()=>{const n=reads.length;await page.clock.runFor(5000);for(let i=0;i<200&&reads.length===n;i++)await page.waitForTimeout(25);await page.waitForTimeout(100);};
+ const rail=()=>page.locator('[data-gh-repository]').first().innerText();
+ const until=async(test,label)=>{for(let i=0;i<40&&!test();i++)await poll();assert.ok(test(),label);await page.waitForTimeout(150);};
+ // Reads come from the 5 s poll and from live events alike; the rule is per read of the list.
+ assert.deepEqual(reads,[null]);assert.match(await rail(),/1 loaded/);
+ // The fields change on the server, but a delta cannot say so: 11 delta reads keep the old text.
+ loaded=3;complete=true;
+ await until(()=>reads.length>=12,'12 reads');
+ assert.deepEqual(reads.slice(1,12),Array(11).fill('7'),'reads 2-12 ask for a delta');
+ assert.match(await rail(),/1 loaded/);
+ await until(()=>reads.length>=13,'13 reads');
+ assert.equal(reads[12],null,'every 12th read after a full one is full');
+ assert.match(await rail(),/Issue list read/,'issues_complete repaired');
+ // A delta whose sync state moved makes the next read full, which repairs the row's error.
+ const before=reads.length;status='syncing';repoError='Issues could not be read';
+ await until(()=>reads.length>=before+2,'two more reads');
+ assert.deepEqual(reads.slice(before,before+2),['7',null],'the delta carrying the new status, then a full read');
+ assert.match(await rail(),/Issues could not be read/,'error repaired');
+ await until(()=>reads.length>=before+3,'one more read');
+ assert.equal(reads[before+2],'7','deltas resume');
+},{burst:'0'}));

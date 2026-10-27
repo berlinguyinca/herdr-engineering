@@ -13,10 +13,51 @@ export class ApiError extends Error {
   }
 }
 
+const CONDITIONAL_ENTRIES = 64;
+
 export class HerdrClient {
   constructor(baseUrl = '', { fetchImpl = fetch } = {}) {
     this.base = baseUrl.replace(/\/+$/, '');
     this.fetch = fetchImpl;
+    this.conditional = new Map();  // url -> { etag, text } (bounded by CONDITIONAL_ENTRIES)
+  }
+
+  get conditionalSize() { return this.conditional.size; }
+
+  async getConditional(path, { signal } = {}) {
+    const url = `${this.base}${path}`;
+    const doFetch = this.fetch;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const held = attempt === 0 ? this.conditional.get(url) : undefined;
+      const headers = { Accept: 'application/json' };
+      if (held) headers['If-None-Match'] = held.etag;
+      const res = await doFetch(url, { method: 'GET', headers, signal });
+      const current = () => this.conditional.get(url) === held;
+      if (res.status === 304) {
+        if (!held) continue;
+        if (current()) { this.conditional.delete(url); this.conditional.set(url, held); }
+        return { body: JSON.parse(held.text), notModified: true };
+      }
+      const text = await res.text();
+      let json;
+      try { json = text ? JSON.parse(text) : null; } catch { json = { raw: text }; }
+      if (!res.ok) {
+        throw new ApiError(res.status, json, (json && json.error) || `HTTP ${res.status}`);
+      }
+      const etag = res.headers?.get?.('ETag');
+      if (!current()) return { body: json, notModified: false };
+      this.conditional.delete(url);
+      if (etag && text) {
+        this.conditional.set(url, { etag, text });
+        while (this.conditional.size > CONDITIONAL_ENTRIES) this.conditional.delete(this.conditional.keys().next().value);
+      }
+      return { body: json, notModified: false };
+    }
+    throw new ApiError(304, null, 'Not modified, but no remembered body');
+  }
+
+  async getJson(path, { signal } = {}) {
+    return (await this.getConditional(path, { signal })).body;
   }
 
   async request(path, { method = 'GET', body, signal } = {}) {
@@ -324,6 +365,27 @@ export class HerdrClient {
       if (value != null) query.set(key, String(value));
     }
     return this.request(`/api/v1/github${query.size ? `?${query}` : ''}`, { signal });
+  }
+
+  // One GitHub list read as { body, notModified }. `since` (a revision the caller holds) asks for a
+  // delta: { revision, resync:false, upserted, removed }, or { resync:true, <full list> }.
+  getGithubConditional(kind, { repository, tab, search, page, per_page, since, signal } = {}) {
+    const query = new URLSearchParams();
+    const params = kind === 'issues' ? { repository, tab, search, page, per_page, since } : { page, per_page, search, since };
+    for (const [key, value] of Object.entries(params)) {
+      if (value != null && !(key === 'repository' && value === '')) query.set(key, String(value));
+    }
+    const path = kind === 'issues' ? '/api/v1/github/issues' : '/api/v1/github';
+    return this.getConditional(`${path}${query.size ? `?${query}` : ''}`, { signal });
+  }
+
+  // GitHub Projects v2 (read-only): the in-scope projects, or one project's items with `project`.
+  // Same contract as getGithubConditional: { body, notModified }, `since` asks for a delta.
+  getGithubProjects({ project, since, signal } = {}) {
+    const query = new URLSearchParams();
+    if (project) query.set('project', String(project));
+    if (since != null) query.set('since', String(since));
+    return this.getConditional(`/api/v1/github/projects${query.size ? `?${query}` : ''}`, { signal });
   }
 
   getGithubIssues(repository, { tab, search, page, per_page, signal } = {}) {

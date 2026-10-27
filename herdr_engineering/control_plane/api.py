@@ -2004,7 +2004,7 @@ def _make_handler(server, public=False, operator=False):
                                    "entities": sorted(INGEST_ENTITY_TYPES)})
             if resource == "github":
                 what = parts[4] if len(parts) == 5 else ""
-                if len(parts) > 5 or (len(parts) == 5 and what not in {"issues", "issue"}):
+                if len(parts) > 5 or (len(parts) == 5 and what not in {"issues", "issue", "projects"}):
                     return self._json({"error": "not found"}, 404)
                 query = _github_query(self.path, what)
                 if what == "issue":
@@ -2727,7 +2727,8 @@ def _make_handler(server, public=False, operator=False):
             return self._json(data, etag=etag, payload=payload)
 
         def _github_list(self, kind, query):
-            """``/github`` and ``/github/issues`` with ``revision``, ``ETag`` and ``since`` deltas.
+            """``/github``, ``/github/issues`` and ``/github/projects[?project=]`` with ``revision``,
+            ``ETag`` and ``since`` deltas.
 
             The ETag is ``W/"<revision>-<hash>"`` where the hash covers the query and
             the monitor's sync state, taken before the body is built (so it can only
@@ -2737,6 +2738,17 @@ def _make_handler(server, public=False, operator=False):
             monitor = server.github_monitor
             since = query.pop("since", None)
             repository = query.pop("repository", None) if kind == "issues" else None
+            project = query.pop("project", None) if kind == "projects" else None
+            if kind == "projects":
+                if not hasattr(monitor, "projects"):  # a monitor without Projects support: sync is off
+                    body = dict(monitor.snapshot(start=False), projects=[],
+                                projects_sync={"enabled": False, "status": "disabled", "error": None,
+                                               "projects": 0, "deferred": 0, "last_success_at": None})
+                    return self._etag_json(body)
+                if project is not None:
+                    kind = "project_items"
+                    monitor.project_items(project, start=False)  # 404 before any ETag for an unknown project
+                    repository = project
             tag_of = getattr(monitor, "list_tag", None)
             tag = tag_of() if tag_of else None
             etag = None
@@ -2748,11 +2760,17 @@ def _make_handler(server, public=False, operator=False):
                     return self._not_modified(etag)
             changes = getattr(monitor, "changes", None)
             if since is not None and changes is not None:
-                filters = {"repository_id": repository, "tab": query.get("tab", "all")} if kind == "issues" else {}
+                filters = ({"repository_id": repository, "tab": query.get("tab", "all")} if kind == "issues"
+                           else {"project_id": project} if kind == "project_items" else {})
                 body = changes(kind=kind, since=since, search=query.get("search", ""), **filters)
             else:
-                extra = {"repository_id": repository} if kind == "issues" else {}
-                body = (monitor.issues(**extra, **query) if kind == "issues" else monitor.repositories(**query))
+                if kind == "projects":
+                    body = monitor.projects()
+                elif kind == "project_items":
+                    body = monitor.project_items(project)
+                else:
+                    extra = {"repository_id": repository} if kind == "issues" else {}
+                    body = (monitor.issues(**extra, **query) if kind == "issues" else monitor.repositories(**query))
                 if since is not None:  # a monitor without deltas: always a full resync
                     body = dict(body, resync=True)
                 if tag is not None:
@@ -2939,9 +2957,19 @@ def _github_query(path, kind):
     allowed = {"repository", "number"} if kind == "issue" else {"page", "per_page", "search", "since"}
     if kind == "issues":
         allowed |= {"repository", "tab"}
+    if kind == "projects":
+        allowed = {"project", "since"}
     if values.keys() - allowed or any(len(items) != 1 for items in values.values()):
         raise ValueError("invalid GitHub query")
     query = {key: items[0] for key, items in values.items()}
+    if kind == "projects":
+        if "project" in query and not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", query["project"]):
+            raise ValueError("invalid GitHub project")
+        if "since" in query:
+            if not re.fullmatch(r"[0-9]{1,19}", query["since"]) or int(query["since"]) > _MAX_REVISION:
+                raise ValueError("invalid GitHub revision")
+            query["since"] = int(query["since"])
+        return query
     repository = query.get("repository")
     if repository is not None:
         name = repository.removeprefix("github.com/")
