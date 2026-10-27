@@ -329,26 +329,31 @@ export function mountOverview(container, client) {
       const signature=html.replace(/(<span data-overview-stamp="[^"]+">)[^<]*(<\/span>)/g,'$1$2');
       if(signature===signatures.get(panel))continue;
       signatures.set(panel,signature);
-      const metrics=live?snapshotText(element,'.ov-metric strong',metricKey):null;
+      const focused=document.activeElement;
+      const hadFocus=element.contains(focused);
+      const href=hadFocus ? focused.closest('a')?.getAttribute('href') : null;
+      const snooze=hadFocus ? focused.dataset?.snooze : null;
+      const attentionToggle=hadFocus && focused.hasAttribute('data-attention-toggle');
+      const attentionList=hadFocus && focused.id==='ov-attention-items';
       const attentionScroll=element.querySelector('.ov-attention-list.is-expanded')?.scrollTop || 0;
+      const metrics=live?snapshotText(element,'.ov-metric strong',metricKey):null;
       // Morphed in place: unchanged rows and metric tiles keep their nodes (and any focus/scroll),
-      // a quiet refresh writes nothing. A row the user is in that leaves is handed to its
-      // equivalent control (or the panel heading) instead of dropping focus.
+      // so a quiet refresh writes nothing. Focus is then restored by the same href/snooze/toggle
+      // lookup as before, so a focused control that left is handed to its equivalent (or the panel
+      // heading) instead of dropping to <body>; handOff cleans up any node morph kept only because
+      // the user was in it.
       const stranded=morph(element,html);
       animateChanges(element,'.ov-metric strong',metrics,metricKey);
       if(panel==='attention')markNewCritical(element);
       const expandedList=element.querySelector('.ov-attention-list.is-expanded');
       if(expandedList)expandedList.scrollTop=attentionScroll;
-      handOff(stranded,node=>{
-        const href=node.closest('a')?.getAttribute('href');
-        const snooze=node.dataset?.snooze;
-        const attentionToggle=node.hasAttribute('data-attention-toggle');
-        const attentionList=node.id==='ov-attention-items';
+      if(hadFocus) {
         const target=attentionToggle ? element.querySelector('[data-attention-toggle]') : attentionList ? expandedList : href ? [...element.querySelectorAll('a')].find(a=>a.getAttribute('href')===href) : snooze ? [...element.querySelectorAll('[data-snooze]')].find(button=>button.dataset.snooze===snooze) : null;
         const fallback=element.querySelector('h2');
         if(fallback)fallback.tabIndex=-1;
-        return target || fallback || null;
-      });
+        (target || fallback)?.focus({preventScroll:true});
+      }
+      handOff(stranded, () => null);
     }
     applyPulses();
     tickClocks();

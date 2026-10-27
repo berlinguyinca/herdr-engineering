@@ -252,15 +252,40 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
   // a text selection, and reuses unchanged nodes (so scroll and form state persist). A node the user
   // is in that leaves the new markup is handed to its equivalent control (or the review summary / a
   // link with the same href) instead of dropping focus.
+  // The results list and inspector are rebuilt with innerHTML (not morphed): the review rows carry
+  // their disclosure open state dynamically, and the visibility handler re-fetches a review detail on
+  // every toggle dispatch for an open disclosure. Rebuilding preserves that interaction exactly. The
+  // signature gate already prevents any DOM write on a quiet poll; the other panels (health, insights,
+  // runners, filters) are morphed.
   function replace(element,html) {
-    const stranded=morph(element,html);
-    handOff(stranded,node=>{
-      const key=['data-run','data-step','data-close-inspector','data-ci-action','data-ci-test-search','data-ci-test-page','data-collapse-success','data-pipeline-zoom','data-ci-compare','data-fix-sandbox','data-fix-cancel','data-fix-terminal','data-fix-copy'].find(k=>node.hasAttribute(k));
-      if(key){const value=node.getAttribute(key);return [...element.querySelectorAll(`[${key}]`)].find(e=>e.getAttribute(key)===value)||null;}
-      if(node.tagName==='SUMMARY' && node.closest('[data-review-details]')){const id=node.closest('[data-review-details]').dataset.reviewDetails;return [...element.querySelectorAll('[data-review-details]')].find(e=>e.dataset.reviewDetails===id)?.querySelector('summary')||null;}
-      if(node.tagName==='A'){const href=node.getAttribute('href');return [...element.querySelectorAll('a')].find(e=>e.getAttribute('href')===href)||null;}
-      return null;
-    });
+    const focused=document.activeElement;
+    const focusKey=element.contains(focused) ? ['data-run','data-step','data-close-inspector','data-ci-action','data-ci-test-search','data-ci-test-page','data-collapse-success','data-pipeline-zoom','data-ci-compare','data-fix-sandbox','data-fix-cancel','data-fix-terminal','data-fix-copy'].find(k=>focused.hasAttribute(k)) : null;
+    const focusValue=focusKey ? focused.getAttribute(focusKey) : null;
+    const reviewFocus=element.contains(focused) && focused.tagName==='SUMMARY' ? focused.closest('[data-review-details]')?.dataset.reviewDetails : null;
+    const linkFocus=element.contains(focused) && focused.tagName==='A' ? focused.getAttribute('href') : null;
+    const debugOpen=element.querySelector('[data-debug-disclosure]')?.open;
+    const debugFocus=element.contains(focused) && focused.closest('[data-debug-disclosure]') ? (focused.hasAttribute('data-debug-session')?'select':focused.tagName==='SUMMARY'?'summary':focused.hasAttribute('data-debug-send')?'button':null) : null;
+    const openReviews=new Set([...element.querySelectorAll('[data-review-details][open]')].map(e=>e.dataset.reviewDetails));
+    const testInput=element.querySelector('[data-ci-test-search]'),selection=testInput&&document.activeElement===testInput?[testInput.selectionStart,testInput.selectionEnd]:null;
+    const paneScroll=element.scrollTop;
+    const graphScroll=[...element.querySelectorAll('.ci-pipeline-scroll')].map(node=>[node.scrollLeft,node.scrollTop]);
+    const successOpen=[...element.querySelectorAll('.ci-pipeline-success')].map(node=>node.open);
+    const logElement=element.querySelector('.ig-log');
+    const logScroll=logElement?.scrollTop;
+    const atEnd=logElement && logElement.scrollHeight-logElement.clientHeight-logElement.scrollTop<8;
+    element.innerHTML=html;
+    for(const review of element.querySelectorAll('[data-review-details]'))review.open=openReviews.has(review.dataset.reviewDetails);
+    if(focusKey)[...element.querySelectorAll(`[${focusKey}]`)].find(e=>e.getAttribute(focusKey)===focusValue)?.focus({preventScroll:true});
+    const debug=element.querySelector('[data-debug-disclosure]');if(debug && debugOpen)debug.open=true;
+    if(debugFocus)debug?.querySelector(debugFocus)?.focus({preventScroll:true});
+    if(reviewFocus)[...element.querySelectorAll('[data-review-details]')].find(e=>e.dataset.reviewDetails===reviewFocus)?.querySelector('summary')?.focus({preventScroll:true});
+    if(linkFocus)[...element.querySelectorAll('a')].find(e=>e.getAttribute('href')===linkFocus)?.focus({preventScroll:true});
+    if(selection){const input=element.querySelector('[data-ci-test-search]');input?.setSelectionRange(...selection);}
+    element.scrollTop=paneScroll;
+    [...element.querySelectorAll('.ci-pipeline-scroll')].forEach((node,i)=>{if(graphScroll[i]){node.scrollLeft=graphScroll[i][0];node.scrollTop=graphScroll[i][1];}});
+    [...element.querySelectorAll('.ci-pipeline-success')].forEach((node,i)=>node.open=!!successOpen[i]);
+    const nextLog=element.querySelector('.ig-log');
+    if(nextLog && logScroll!=null)nextLog.scrollTop=atEnd?nextLog.scrollHeight:logScroll;
   }
   function tick() {
     for(const element of container.querySelectorAll('[data-integration-time]')) element.textContent=formatDuration(Math.max(0,Date.now()-Number(element.dataset.integrationTime)));
