@@ -1227,13 +1227,18 @@ def _make_handler(server, public=False, operator=False):
             return self._send_json(404, {"error": "not found"})
 
         def do_PATCH(self):
-            # PATCH/DELETE reuse the same operator-gated router as POST. The
-            # router dispatches every non-GET verb to _api_post, which branches
-            # on self.command for the assistant PATCH/DELETE routes.
+            # PATCH/DELETE are enabled ONLY for the assistant resource family.
+            # Every other /api/v1 resource keeps its prior 501 behavior: their
+            # _api_post branches do not gate on self.command, so routing an
+            # arbitrary PATCH/DELETE there could trigger an unintended mutation
+            # (e.g. DELETE /api/v1/handoffs must not create a handoff).
             return self._mutate_verb()
 
         def do_DELETE(self):
             return self._mutate_verb()
+
+        _ASSISTANT_MUTABLE_RESOURCES = {"assistants", "assistant-runs",
+                                        "assistant-approvals", "assistant-memory"}
 
         def _mutate_verb(self):
             if operator:
@@ -1249,12 +1254,17 @@ def _make_handler(server, public=False, operator=False):
                 return self._deny(400, "ambiguous request framing")
             if self._path_only() == _FLEET_CONFIG_PATH + "/applied":
                 return self._fleet_config_applied()
+            path = self.path.split("?")[0]
+            segs = path.split("/")
+            resource = unquote(segs[3]) if (len(segs) > 3 and segs[:3] == ["", "api", "v1"]
+                                            and path.startswith("/api/v1/")) else ""
+            if resource not in self._ASSISTANT_MUTABLE_RESOURCES:
+                # preserve the pre-existing 501 for PATCH/DELETE elsewhere
+                return self._send_json(501, {"error": "not implemented"})
             err = self._require("operator")
             if err:
                 return err
-            if self.path.startswith("/api/v1/"):
-                return self._route_api()
-            return self._send_json(404, {"error": "not found"})
+            return self._route_api()
 
         # ------------------------------------------------ fleet config (hosts)
         def _path_only(self):

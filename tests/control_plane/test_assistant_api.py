@@ -199,6 +199,24 @@ def test_memory_store_search_export_forget(server):
     assert json.loads(body)["count"] == 0
 
 
+def test_patch_delete_restricted_to_assistant_resources(server):
+    # PATCH/DELETE are enabled only for the assistant resource family; other
+    # /api/v1 resources must keep their prior 501 behavior so an unintended
+    # verb cannot reach their POST-only _api_post branches.
+    status, body = server.request("/api/v1/handoffs", {"kind": "task", "title": "x", "owner_id": "u1"},
+                                  method="DELETE", headers=_uid())
+    assert status == 501
+    status, body = server.request("/api/v1/scheduler", {"resource_profile": {"class": "cpu"}},
+                                  method="PATCH", headers=_uid())
+    assert status == 501
+    # assistant routes still accept PATCH/DELETE
+    _, body = server.post("/api/v1/assistants", {"name": "Helper"}, headers=_uid())
+    aid = json.loads(body)["assistant_id"]
+    status, _ = server.request(f"/api/v1/assistants/{aid}", {"name": "Renamed"},
+                               method="PATCH", headers=_uid())
+    assert status == 200
+
+
 def test_diagnostics(server):
     _, body = server.post("/api/v1/assistants", {"name": "Helper"}, headers=_uid())
     aid = json.loads(body)["assistant_id"]

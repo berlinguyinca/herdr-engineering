@@ -527,8 +527,7 @@ class AssistantStore:
             hay = m.content.lower()
             score = sum(1 for t in terms if t in hay)
             scored.append((score, m))
-        scored.sort(key=lambda sm: (-sm[0], sm[1].updated_at), reverse=True)
-        # reverse of the above sort for descending relevance
+        # most-relevant first (-score ascending); ties by most-recently-updated
         scored.sort(key=lambda sm: (-sm[0], sm[1].updated_at))
         return [m for _score, m in scored[:limit]]
 

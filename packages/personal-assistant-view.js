@@ -242,10 +242,14 @@ export function mountPersonalAssistant(container, client) {
     </div>`;
 
   let currentThread = null;
+  let currentThreadAssistantId = null;
   const bindChat = async (container, a) => {
     const sendBtn = container.querySelector('[data-send]');
     const input = container.querySelector('[data-msg]');
     if (!sendBtn) return;
+    // a thread belongs to one assistant; reset the selected thread when the
+    // active assistant changes so we never load a foreign assistant's thread
+    if (currentThreadAssistantId !== a.assistant_id) { currentThread = null; currentThreadAssistantId = a.assistant_id; }
     const threadsEl = container.querySelector('#pa-threads');
     const messagesEl = container.querySelector('#pa-messages');
     const statusEl = container.querySelector('#pa-runstatus');
