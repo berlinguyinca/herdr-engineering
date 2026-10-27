@@ -5,7 +5,8 @@ import { missionEntries } from './mission-catalog-view.js';
 import { recordOutcome, recordVisibility, reportFreshness } from './record-state.js';
 import { serviceState, serviceScope } from './services-view.js';
 import { integrationEntries, integrationTimestamp } from './integrations-view.js';
-import { isCalm, snapshotText, animateChanges } from './motion.js';
+import { isCalm, snapshotText, animateChanges, skeleton } from './motion.js';
+import { morph, handOff, patchText, patchAttr } from './patch.js';
 
 const records = value => Array.isArray(value) ? value.filter(v => v && typeof v === 'object' && !Array.isArray(v)) : [];
 const text = value => typeof value === 'string' ? value : '';
@@ -328,25 +329,26 @@ export function mountOverview(container, client) {
       const signature=html.replace(/(<span data-overview-stamp="[^"]+">)[^<]*(<\/span>)/g,'$1$2');
       if(signature===signatures.get(panel))continue;
       signatures.set(panel,signature);
-      const focused=document.activeElement;
-      const hadFocus=element.contains(focused);
-      const href=hadFocus ? focused.closest('a')?.getAttribute('href') : null;
-      const snooze=hadFocus ? focused.dataset?.snooze : null;
-      const attentionToggle=hadFocus && focused.hasAttribute('data-attention-toggle');
-      const attentionList=hadFocus && focused.id==='ov-attention-items';
-      const attentionScroll=element.querySelector('.ov-attention-list.is-expanded')?.scrollTop || 0;
       const metrics=live?snapshotText(element,'.ov-metric strong',metricKey):null;
-      element.innerHTML=html;
+      const attentionScroll=element.querySelector('.ov-attention-list.is-expanded')?.scrollTop || 0;
+      // Morphed in place: unchanged rows and metric tiles keep their nodes (and any focus/scroll),
+      // a quiet refresh writes nothing. A row the user is in that leaves is handed to its
+      // equivalent control (or the panel heading) instead of dropping focus.
+      const stranded=morph(element,html);
       animateChanges(element,'.ov-metric strong',metrics,metricKey);
       if(panel==='attention')markNewCritical(element);
       const expandedList=element.querySelector('.ov-attention-list.is-expanded');
       if(expandedList)expandedList.scrollTop=attentionScroll;
-      if(hadFocus) {
+      handOff(stranded,node=>{
+        const href=node.closest('a')?.getAttribute('href');
+        const snooze=node.dataset?.snooze;
+        const attentionToggle=node.hasAttribute('data-attention-toggle');
+        const attentionList=node.id==='ov-attention-items';
         const target=attentionToggle ? element.querySelector('[data-attention-toggle]') : attentionList ? expandedList : href ? [...element.querySelectorAll('a')].find(a=>a.getAttribute('href')===href) : snooze ? [...element.querySelectorAll('[data-snooze]')].find(button=>button.dataset.snooze===snooze) : null;
         const fallback=element.querySelector('h2');
         if(fallback)fallback.tabIndex=-1;
-        (target || fallback)?.focus({preventScroll:true});
-      }
+        return target || fallback || null;
+      });
     }
     applyPulses();
     tickClocks();
