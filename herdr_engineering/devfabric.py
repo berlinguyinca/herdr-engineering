@@ -202,6 +202,28 @@ class DevServiceRegistry:
         self._prune_expired()
         return True
 
+    def replace_from_peer(self, leases: list[dict]) -> int:
+        """Mirror the active gateway's lease table (standby only). Returns how many leases were taken."""
+        cleaned = [{k: v for k, v in dict(lz).items() if k != "url"} for lz in leases]
+        parsed = _parse_leases({"leases": cleaned})
+        with self._lock:
+            self._leases = parsed
+            self._persist()
+        return len(parsed)
+
+    def renew_all(self) -> int:
+        """Give every active lease a fresh TTL (used on promotion so agents have time to re-heartbeat)."""
+        now = _now_iso()
+        n = 0
+        with self._lock:
+            for lease in self._leases.values():
+                if lease.state == "active":
+                    lease.renewed_at = now
+                    lease.expires_at = _add_seconds(now, self._ttl)
+                    n += 1
+            self._persist()
+        return n
+
     def gc(self) -> dict:
         """Drop expired/failed leases past the retention window and persist.
 

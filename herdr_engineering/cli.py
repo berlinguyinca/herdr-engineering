@@ -393,6 +393,10 @@ def _build_parser() -> argparse.ArgumentParser:
     p2.add_argument("--tls-cert", default=None, help="serve HTTPS on every leased port with this certificate "
                     "(same port as HTTP; issue one with `devfabric ca issue`)")
     p2.add_argument("--tls-key", default=None, help="private key for --tls-cert")
+    p2.add_argument("--peer", default=None, help="control URL of the other gateway: run as an active/standby pair "
+                    "(the standby mirrors leases and promotes itself when the peer stops answering)")
+    p2.add_argument("--node-id", default=None, help="stable name for this gateway in a pair (default: hostname)")
+    p2.add_argument("--promote-after", type=int, default=3, help="missed peer checks before a standby takes over")
     p2.add_argument("--allow-user", action="append", default=[],
                     help="tailnet login allowed to open leased ports (repeatable). With --allow-user/--allow-tag "
                          "every other peer, guests and shared-in devices included, is refused")
@@ -2069,7 +2073,10 @@ def _cmd_dev_gateway(args) -> int:
         url_base=args.url_base or (cfg.get("url_base") or None),
         probe_interval=float(cfg.get("probe_interval_seconds", 15)),
         reset_lock=bool(getattr(args, "reset_lock", False)),
-        rewrite_headers=bool(getattr(args, "rewrite_headers", False)))
+        rewrite_headers=bool(getattr(args, "rewrite_headers", False)),
+        peer_url=getattr(args, "peer", None) or cfg.get("peer_url") or None,
+        node_id=getattr(args, "node_id", None) or cfg.get("node_id") or None,
+        promote_after=int(getattr(args, "promote_after", 3)))
     tls_cert = getattr(args, "tls_cert", None) or cfg.get("tls_cert")
     tls_key = getattr(args, "tls_key", None) or cfg.get("tls_key")
     if bool(tls_cert) != bool(tls_key):
@@ -2089,7 +2096,7 @@ def _cmd_dev_gateway(args) -> int:
         router.access = AccessPolicy(users=frozenset(users), tags=frozenset(tags))
     gateway.start()
     _print_json({
-        "ok": True, "gateway": True, "https": bool(tls_cert), "access_enforced": bool(users or tags),
+        "ok": True, "gateway": True, "https": bool(tls_cert), "role": gateway.role, "peer": gateway.peer_url, "access_enforced": bool(users or tags),
         "control_url": f"http://{gateway.control_host}:{control_port}",
         "url_base": gateway.url_base,
         "bind_hosts": bind_hosts,
