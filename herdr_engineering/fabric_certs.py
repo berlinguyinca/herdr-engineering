@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 import shutil
+import sys
 import ssl
 import subprocess
 import threading
@@ -64,7 +65,7 @@ class AcmeRoute53:
     directory: Path
     staging: bool = False
     email: str | None = None            # None registers without an address (nothing is sent to a third party)
-    certbot: str = "certbot"
+    certbot: str = ""                   # "": the certbot installed next to this Python, else the one on PATH
     runner: Callable[..., subprocess.CompletedProcess] | None = field(default=None, repr=False)   # None: subprocess.run, looked up at call time
 
     def __post_init__(self) -> None:
@@ -87,8 +88,14 @@ class AcmeRoute53:
     def names(self) -> tuple[str, str]:
         return (self.domain, f"*.{self.domain}")
 
+    def _certbot(self) -> str:
+        if self.certbot:
+            return self.certbot
+        beside = Path(sys.executable).parent / "certbot"     # a venv's bin is not on PATH under systemd/cron
+        return str(beside) if beside.exists() else (shutil.which("certbot") or "certbot")
+
     def command(self, *, force: bool = False) -> list[str]:
-        cmd = [self.certbot, "certonly", "--non-interactive", "--agree-tos", "--dns-route53",
+        cmd = [self._certbot(), "certonly", "--non-interactive", "--agree-tos", "--dns-route53",
                "--cert-name", self.domain, "--keep-until-expiring",
                "--config-dir", str(self.directory / "config"), "--work-dir", str(self.directory / "work"),
                "--logs-dir", str(self.directory / "logs")]
@@ -106,7 +113,10 @@ class AcmeRoute53:
         self.directory.mkdir(parents=True, exist_ok=True)
         self.directory.chmod(0o700)
         before = validity(self.fullchain)[1] if self.fullchain.exists() else None
-        proc = (self.runner or subprocess.run)(self.command(force=force), capture_output=True, text=True, timeout=600)
+        try:
+            proc = (self.runner or subprocess.run)(self.command(force=force), capture_output=True, text=True, timeout=600)
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise CertError(f"could not run certbot ({exc}); install it with: pip install 'herdr-engineering[acme]'") from exc
         if proc.returncode != 0:
             tail = (proc.stderr or proc.stdout or "").strip().splitlines()[-3:]
             raise CertError(f"certbot failed ({proc.returncode}): {' | '.join(tail)[:400]}")
@@ -149,7 +159,10 @@ class TailscaleCert:
         self.directory.mkdir(parents=True, exist_ok=True)
         self.directory.chmod(0o700)
         before = validity(self.fullchain)[1] if self.fullchain.exists() else None
-        proc = (self.runner or subprocess.run)(self.command(), capture_output=True, text=True, timeout=120)
+        try:
+            proc = (self.runner or subprocess.run)(self.command(), capture_output=True, text=True, timeout=120)
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise CertError(f"could not run tailscale ({exc})") from exc
         if proc.returncode != 0:
             tail = (proc.stderr or proc.stdout or "").strip().splitlines()[-3:]
             raise CertError(f"tailscale cert failed ({proc.returncode}): {' | '.join(tail)[:400]}")

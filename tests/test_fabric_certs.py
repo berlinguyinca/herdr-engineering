@@ -262,3 +262,21 @@ def test_tailnet_cert_is_not_due_without_a_cli_and_no_runner(tmp_path):
     ts.directory.mkdir(parents=True, exist_ok=True)
     (tmp_path / "n.ts.net.crt").write_bytes((tmp_path / "g" / "fullchain.pem").read_bytes())
     assert ts.due() is False
+
+
+def test_certbot_is_found_beside_the_python_and_a_missing_binary_is_a_clean_error(tmp_path, monkeypatch):
+    fake = tmp_path / "bin"
+    fake.mkdir()
+    (fake / "certbot").write_text("#!/bin/sh\n")
+    monkeypatch.setattr(fc.sys, "executable", str(fake / "python"))
+    assert _acme(tmp_path).command()[0] == str(fake / "certbot")
+    assert _acme(tmp_path, certbot="/opt/cb").command()[0] == "/opt/cb"
+    monkeypatch.setattr(fc.sys, "executable", str(tmp_path / "none" / "python"))
+    monkeypatch.setattr(fc.shutil, "which", lambda n: None)
+
+    def missing(cmd, **kw):
+        raise FileNotFoundError(2, "No such file or directory", cmd[0])
+    a = _acme(tmp_path)
+    a.runner = missing
+    with pytest.raises(fc.CertError, match="could not run certbot"):
+        a.obtain()
