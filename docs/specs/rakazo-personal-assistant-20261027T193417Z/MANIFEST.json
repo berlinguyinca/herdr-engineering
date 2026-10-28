@@ -1,0 +1,21 @@
+{
+  "name": "herdr-rakazo-personal-assistant-spec",
+  "version": "1.0",
+  "generated": "2026-10-27",
+  "files": {
+    "README.md": "34c2dedcc3c6eb6421f393d9202668c61dda61143e22a611df0f553ad5fbe7ed",
+    "01-product-scope.md": "074d54f89d6a1b7e9522faa30f6e76cc9d6a2854200f265d8743c06ee3a38dc8",
+    "02-architecture.md": "93a254810cb08684358f43a3d819a5be1b84e481cb22a7ec0613af26bfd712cc",
+    "03-ux-ui.md": "94249ca21110f1f8d4a587664c4e08bf352194a482ded8c614bec5a9921752d1",
+    "04-data-api-events.md": "6972f893ad941e0b51553deb8df7c21f58232c6c3f926e76c04ef7ed9795247b",
+    "05-security-and-privacy.md": "1f23c175ecfe0a29f18e0bb16f0c31c41fdd79f424b93cb1e59d3ebd277e152e",
+    "06-rakazo-adaptation.md": "70bb6e9cc08ecab0cf3c3534af5a7e3961844ac2a66dacd6ae943bfa3e8a01cd",
+    "07-workflows.md": "d6f4ced736a3f34d4e0be45fffb4f5c17f3c99974ab92b2c1866b487c08e1757",
+    "08-phased-plan.md": "231a49d68491760b6f4707bfbd8c775edefd05447bb84ecf5dd4ccd045290b36",
+    "09-tests-and-acceptance.md": "5433ff00a8a230a3f6a003e803b76a1edb00dcc2712c1f71f78d65534ab5e547",
+    "10-deployment-operations.md": "ff6bd99026746376006ec6cbd66dffba9f37f7ba938fdf6dc61c3d81208d5f42",
+    "11-risk-decisions.md": "217224bfd73ccbafb66c4082557e30476f871dcdd296c6913ac2f6ba0270b706",
+    "12-existing-code-audit.md": "1a8d805707421c29ea249e39acef191fd2be300fcf7a9ecfa18ac84b1ed95950",
+    "START_PROMPT.md": "e1ee9d3c47780490962b9e45c6942412bf13568aa5f4db552627414ae8e459bc"
+  }
+}

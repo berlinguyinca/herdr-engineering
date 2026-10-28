@@ -221,7 +221,8 @@ class ControlPlaneServer:
                  operator_hosts=(), collab_operator_url=None, collab_dashboard_hosts=(),
                  summary_config=None, summary_client=None, usage_retention=None, lineage_key_scopes=None,
                  review_quorum=None, system_graph: bool = False, attention=None, ci_fix=None, missions=None, github_pg_dsn=None,
-                 architecture_enabled=None, architecture_explain=None, architecture_options=None):
+                 architecture_enabled=None, architecture_explain=None, architecture_options=None,
+                 assistant_service=None, assistant_config=None):
         """
         Auth (Spec §104): either a single `api_key` (all-access) or a mapping
         `api_keys={key: role}` with roles "viewer" (read-only) / "operator"
@@ -293,6 +294,13 @@ class ControlPlaneServer:
         self.handoffs = handoff_registry or HandoffRegistry(repo)
         from .scheduler_service import SchedulerService
         self.scheduler = SchedulerService(repo)
+        # Herdr Personal Assistant (Rakazo integration, P1/P2). Canonical owner;
+        # feature-flag gated (off by default) and inert until enabled.
+        if assistant_service is None:
+            from .assistant import AssistantService, assistant_config
+            self.assistant = AssistantService(config=assistant_config(assistant_config or {}))
+        else:
+            self.assistant = assistant_service
         from .ingest import IngestService
         # operator YAML: {api key: {rooms: [...], missions: [...]}} -> principal ids (the key itself is never kept)
         scopes = {}
@@ -617,6 +625,8 @@ class ControlPlaneServer:
         h["capabilities"] = ["mission_activity_v1", "ci_v1", "plannotator_reviews_v1", "github_v1"]
         if self.collab is not None:
             h["capabilities"].append("collab_v1")
+        if getattr(self, "assistant", None) is not None and self.assistant.config.get("enabled"):
+            h["capabilities"].append("assistant_v1")
         if self.architecture.enabled:
             h["capabilities"].append("architecture_v1")
             if self.architecture.explain_config:
@@ -1215,6 +1225,47 @@ def _make_handler(server, public=False, operator=False):
             if self.path.startswith("/api/v1/"):
                 return self._route_api()
             return self._send_json(404, {"error": "not found"})
+
+        def do_PATCH(self):
+            # PATCH/DELETE are enabled ONLY for the assistant resource family.
+            # Every other /api/v1 resource keeps its prior 501 behavior: their
+            # _api_post branches do not gate on self.command, so routing an
+            # arbitrary PATCH/DELETE there could trigger an unintended mutation
+            # (e.g. DELETE /api/v1/handoffs must not create a handoff).
+            return self._mutate_verb()
+
+        def do_DELETE(self):
+            return self._mutate_verb()
+
+        _ASSISTANT_MUTABLE_RESOURCES = {"assistants", "assistant-runs",
+                                        "assistant-approvals", "assistant-memory",
+                                        "assistant-routines"}
+
+        def _mutate_verb(self):
+            if operator:
+                return self._operator()
+            if public:
+                return self._public()
+            if self._is_federation_path():
+                return self._federation()
+            if self._is_collab_path():
+                return self._collab()
+            if (len(self.headers.get_all("Content-Length") or []) > 1
+                    or "Transfer-Encoding" in self.headers):
+                return self._deny(400, "ambiguous request framing")
+            if self._path_only() == _FLEET_CONFIG_PATH + "/applied":
+                return self._fleet_config_applied()
+            path = self.path.split("?")[0]
+            segs = path.split("/")
+            resource = unquote(segs[3]) if (len(segs) > 3 and segs[:3] == ["", "api", "v1"]
+                                            and path.startswith("/api/v1/")) else ""
+            if resource not in self._ASSISTANT_MUTABLE_RESOURCES:
+                # preserve the pre-existing 501 for PATCH/DELETE elsewhere
+                return self._send_json(501, {"error": "not implemented"})
+            err = self._require("operator")
+            if err:
+                return err
+            return self._route_api()
 
         # ------------------------------------------------ fleet config (hosts)
         def _path_only(self):
@@ -2091,6 +2142,8 @@ def _make_handler(server, public=False, operator=False):
                                    "offset": offset, "checked_at": r._stamp()})
             if resource == "review-gate":
                 return self._review_gate_get(parts)
+            if resource in ("assistants", "assistant-runs", "assistant-approvals", "assistant-memory", "assistant-routines"):
+                return self._assistant_get(parts, resource)
             if resource == "tests":
                 return self._json(_tests_view())
             return self._json({"error": "not found"}, 404)
@@ -2329,7 +2382,205 @@ def _make_handler(server, public=False, operator=False):
                     if changed and r.get_session(sid) is not None:
                         server.agent_summaries.request(sid)
                 return self._json({"ok": True, "entity": entity})
+            if resource in ("assistants", "assistant-runs", "assistant-approvals", "assistant-memory", "assistant-routines"):
+                # the body is already read above (line ~2170) into the local
+                # ``body``; pass it in rather than re-reading (keep-alive safety)
+                return self._assistant_post(parts, resource, body)
             return self._json({"error": "not found"}, 404)
+
+        # ------------------------------------------------------------ assistant
+        # Herdr Personal Assistant (P1/P2). Canonical owner: server.assistant.
+        # All routes are additionally scoped by tenant_id + user_id so assistant
+        # data is isolated per user/tenant (acceptance A3, A4). The operating
+        # user defaults to the authenticated API-key principal and may be
+        # overridden for multi-user testing via X-Herdr-User / X-Herdr-Tenant.
+        def _assistant_scope(self):
+            principal = self._principal()
+            uid = self.headers.get("X-Herdr-User") or principal.get("id") or "default-user"
+            tenant = self.headers.get("X-Herdr-Tenant") or "default"
+            return tenant, uid
+
+        def _assistant_get(self, parts, resource):
+            from .assistant import AssistantNotFound, AssistantUnavailable
+            try:
+                tenant_id, user_id = self._assistant_scope()
+                svc = server.assistant
+                if resource == "assistants":
+                    if len(parts) == 4:
+                        return self._json({"assistants": [a.as_dict() for a in
+                                                           svc.list_assistants(tenant_id=tenant_id, user_id=user_id)]})
+                    if len(parts) == 5:
+                        return self._json(svc.get_assistant(parts[4], tenant_id=tenant_id, user_id=user_id).as_dict())
+                    if len(parts) == 6 and parts[5] == "threads":
+                        return self._json({"threads": [t.as_dict() for t in
+                                                        svc.list_threads(tenant_id=tenant_id, user_id=user_id,
+                                                                         assistant_id=parts[4])]})
+                    if len(parts) == 7 and parts[5] == "threads":
+                        thread = svc.get_thread(parts[6], tenant_id=tenant_id, user_id=user_id)
+                        messages = [m.as_dict() for m in
+                                    svc.store.list_messages(thread.thread_id, tenant_id=tenant_id, user_id=user_id)]
+                        return self._json({"thread": thread.as_dict(), "messages": messages})
+                    if len(parts) == 6 and parts[5] == "permissions":
+                        return self._json({"grants": [g.as_dict() for g in
+                                                       svc.store.list_grants(tenant_id=tenant_id, user_id=user_id,
+                                                                             assistant_id=parts[4])],
+                                          "tools": svc.list_tools(tenant_id=tenant_id, user_id=user_id,
+                                                                  assistant_id=parts[4])})
+                    if len(parts) == 6 and parts[5] == "tools":
+                        return self._json({"tools": svc.list_tools(tenant_id=tenant_id, user_id=user_id,
+                                                                   assistant_id=parts[4])})
+                    if len(parts) == 6 and parts[5] == "memory":
+                        query = _q(self.path, "q") or ""
+                        return self._json({"memory": [m.as_dict() for m in
+                                                       svc.search_memory(tenant_id=tenant_id, user_id=user_id,
+                                                                         assistant_id=parts[4], query=query)]})
+                    if len(parts) == 6 and parts[5] == "diagnostics":
+                        return self._json(svc.diagnostics(tenant_id=tenant_id, user_id=user_id,
+                                                          assistant_id=parts[4]))
+                    if len(parts) == 6 and parts[5] == "routines":
+                        return self._json({"routines": [r.as_dict() for r in
+                                                         svc.list_routines(tenant_id=tenant_id, user_id=user_id,
+                                                                           assistant_id=parts[4])]})
+                    if len(parts) == 7 and parts[5] == "routines":
+                        return self._json(svc.get_routine(parts[6], tenant_id=tenant_id, user_id=user_id).as_dict())
+                    if len(parts) == 7 and parts[5] == "routines" and parts[6] == "due":
+                        return self._json({"routines": [r.as_dict() for r in
+                                                         svc.due_routines(tenant_id=tenant_id, user_id=user_id)]})
+                if resource == "assistant-routines" and len(parts) == 4:
+                    return self._json({"routines": [r.as_dict() for r in
+                                                     svc.store.list_routines(tenant_id=tenant_id, user_id=user_id)]})
+                if resource == "assistant-routines" and len(parts) == 5:
+                    return self._json(svc.get_routine(parts[4], tenant_id=tenant_id, user_id=user_id).as_dict())
+                if resource == "assistant-runs" and len(parts) == 5:
+                    return self._json(svc.get_run(parts[4], tenant_id=tenant_id, user_id=user_id).as_dict())
+                if resource == "assistant-approvals" and len(parts) == 4:
+                    state = _q(self.path, "state")
+                    return self._json({"approvals": [a.as_dict() for a in
+                                                      svc.list_approvals(tenant_id=tenant_id, user_id=user_id,
+                                                                         state=state)]})
+                if resource == "assistant-memory" and len(parts) == 5:
+                    return self._json(svc.store.get_memory(parts[4], tenant_id=tenant_id, user_id=user_id).as_dict())
+                return self._json({"error": "not found"}, 404)
+            except AssistantUnavailable as exc:
+                return self._json({"error": str(exc), "code": "unavailable"}, 503)
+            except (KeyError, AssistantNotFound):
+                return self._json({"error": "not found"}, 404)
+            except ValueError as exc:
+                return self._json({"error": str(exc)}, 400)
+
+        def _assistant_post(self, parts, resource, body):
+            from .assistant import (
+                ApprovalRequired,
+                AssistantError,
+                AssistantNotFound,
+                AssistantUnavailable,
+            )
+            try:
+                tenant_id, user_id = self._assistant_scope()
+                svc = server.assistant
+                body = body or {}
+                if resource == "assistants":
+                    if len(parts) == 4 and self.command == "POST":
+                        created = svc.create_assistant(
+                            tenant_id=tenant_id, user_id=user_id,
+                            name=body.get("name", "Personal Assistant"),
+                            persona=body.get("persona", "helpful"),
+                            instructions=body.get("instructions", ""),
+                            model_policy=body.get("model_policy", "auto"),
+                            enabled=bool(body.get("enabled", True)))
+                        return self._json(created.as_dict(), 201)
+                    if len(parts) == 5 and self.command in ("PATCH", "POST"):
+                        if body.get("archive"):
+                            svc.archive_assistant(parts[4], tenant_id=tenant_id, user_id=user_id)
+                            return self._json({"ok": True})
+                        updated = svc.update_assistant(parts[4], tenant_id=tenant_id, user_id=user_id, patch=body)
+                        return self._json(updated.as_dict())
+                    if len(parts) == 5 and self.command == "DELETE":
+                        svc.archive_assistant(parts[4], tenant_id=tenant_id, user_id=user_id)
+                        return self._json({"ok": True})
+                    if len(parts) == 6 and parts[5] == "threads" and self.command == "POST":
+                        thread = svc.create_thread(tenant_id=tenant_id, user_id=user_id,
+                                                  assistant_id=parts[4],
+                                                  title=body.get("title", "New conversation"))
+                        return self._json(thread.as_dict(), 201)
+                    if len(parts) == 8 and parts[5] == "threads" and parts[7] == "messages":
+                        run = svc.send_message(tenant_id=tenant_id, user_id=user_id,
+                                               assistant_id=parts[4], thread_id=parts[6],
+                                               content=body.get("content", ""))
+                        return self._json({"run": run.as_dict()}, 202)
+                    if len(parts) == 6 and parts[5] == "permissions" and self.command == "POST":
+                        grant = svc.grant_tool(tenant_id=tenant_id, user_id=user_id,
+                                               assistant_id=parts[4],
+                                               tool_id=body.get("tool_id", ""),
+                                               scope=body.get("scope", "*"),
+                                               ttl_seconds=body.get("ttl_seconds"),
+                                               preauthorized=bool(body.get("preauthorized", False)))
+                        return self._json(grant.as_dict(), 201)
+                    if len(parts) == 7 and parts[5] == "permissions" and parts[6] == "revoke":
+                        svc.revoke_grant(body.get("grant_id", parts[5]), tenant_id=tenant_id, user_id=user_id)
+                        return self._json({"ok": True})
+                    if len(parts) == 6 and parts[5] == "memory" and self.command == "POST":
+                        memo = svc.store_memory(tenant_id=tenant_id, user_id=user_id,
+                                                assistant_id=parts[4],
+                                                content=body.get("content", ""),
+                                                namespace=body.get("namespace", "private"),
+                                                source_ref=body.get("source_ref", ""),
+                                                classification=body.get("classification", "general"))
+                        return self._json(memo.as_dict(), 201)
+                    if len(parts) == 7 and parts[5] == "memory" and parts[6] == "export":
+                        return self._json(svc.export_memory(tenant_id=tenant_id, user_id=user_id,
+                                                            assistant_id=parts[4]))
+                if resource == "assistant-runs" and len(parts) == 6 and parts[5] == "cancel":
+                    return self._json(svc.cancel_run(parts[4], tenant_id=tenant_id, user_id=user_id).as_dict())
+                if resource == "assistant-runs" and len(parts) == 6 and parts[5] == "tool":
+                    # the assistant is derived from the run (never trusted from the body)
+                    _run = svc.get_run(parts[4], tenant_id=tenant_id, user_id=user_id)
+                    action = svc.request_tool_action(
+                        tenant_id=tenant_id, user_id=user_id,
+                        assistant_id=_run.assistant_id,
+                        tool_id=body.get("tool_id", ""), scope=body.get("scope", "*"),
+                        run_id=parts[4], idempotency_key=body.get("idempotency_key", ""),
+                        request_payload=body.get("payload") or {}, actor=user_id)
+                    return self._json(action.as_dict())
+                if resource == "assistant-approvals" and len(parts) == 6 and parts[5] == "decision":
+                    decision = svc.decide_approval(parts[4], tenant_id=tenant_id, user_id=user_id,
+                                                   decision=body.get("decision", ""),
+                                                   actor=user_id)
+                    return self._json(decision.as_dict())
+                if resource == "assistant-memory" and len(parts) == 5 and self.command == "DELETE":
+                    svc.forget_memory(parts[4], tenant_id=tenant_id, user_id=user_id)
+                    return self._json({"ok": True})
+                if resource == "assistant-memory" and len(parts) == 5 and self.command == "PATCH":
+                    memo = svc.correct_memory(parts[4], tenant_id=tenant_id, user_id=user_id,
+                                              new_content=body.get("content", ""),
+                                              source_ref=body.get("source_ref", "correction"))
+                    return self._json(memo.as_dict())
+                if resource == "assistant-routines" and len(parts) == 4 and self.command == "POST":
+                    routine = svc.create_routine(
+                        tenant_id=tenant_id, user_id=user_id,
+                        assistant_id=body.get("assistant_id", ""),
+                        name=body.get("name", "Routine"),
+                        trigger_type=body.get("trigger_type", "interval"),
+                        trigger_spec=body.get("trigger_spec") or {},
+                        timezone=body.get("timezone", "UTC"),
+                        quiet_hours=body.get("quiet_hours"),
+                        enabled=bool(body.get("enabled", True)))
+                    return self._json(routine.as_dict(), 201)
+                if resource == "assistant-routines" and len(parts) == 6 and parts[5] == "trigger":
+                    return self._json(svc.trigger(parts[4], tenant_id=tenant_id, user_id=user_id).as_dict())
+                if resource == "assistant-routines" and len(parts) == 5 and self.command == "DELETE":
+                    svc.archive_routine(parts[4], tenant_id=tenant_id, user_id=user_id)
+                    return self._json({"ok": True})
+                return self._json({"error": "not found"}, 404)
+            except ApprovalRequired as exc:
+                return self._json({"error": str(exc), "code": "approval_needed",
+                                   "approval_id": exc.approval_id}, 403)
+            except AssistantUnavailable as exc:
+                return self._json({"error": str(exc), "code": "unavailable"}, 503)
+            except AssistantError as exc:
+                return self._json({"error": str(exc)}, 400)
+            except (KeyError, AssistantNotFound):
+                return self._json({"error": "not found"}, 404)
 
         def _steering(self, parts, body=None):
             """T12 delivery to the emitter that owns a steering target (keyed API; no browser, no HCN credential).

@@ -24,6 +24,7 @@ import { mountPublications } from './publications-view.js';
 import { mountHandoffs } from './handoffs-view.js';
 import { renderSchedulingView } from './scheduler-view.js';
 import { mountArchitecture } from './architecture-view.js';
+import { mountPersonalAssistant } from './personal-assistant-view.js';
 import { visibleNav } from './nav-capabilities.js';
 import { mountSessionsView, sessionEntries } from './sessions-view.js';
 import { recordOutcome, statusOutcome } from './record-state.js';
@@ -90,6 +91,7 @@ const NAV = [
   { path: '/publications', label: 'Publications' },
   { path: '/handoffs', label: 'Handoffs' },
   { path: '/scheduling', label: 'Scheduling' },
+  { path: '/personal-assistant', label: 'Personal Assistant', capability: 'assistant_v1' },
 ];
 
 const SHELL = document.getElementById('shell');
@@ -158,6 +160,7 @@ const ROUTES = {
   '/services/:id': viewService,
   '/hosts': viewHosts,
   '/scheduling': viewScheduling,
+  '/personal-assistant': viewPersonalAssistant,
   '/hosts/:id': viewHost,
   '/activity': viewActivity,
   '/analytics': viewAnalytics,
@@ -217,6 +220,11 @@ async function viewPublications() {
 async function viewHandoffs() {
   const view = mountHandoffs(root, client);
   return { ...view, dispose() {} };
+}
+
+async function viewPersonalAssistant() {
+  root.innerHTML = '<div id="personal-assistant"></div>';
+  return { dispose: mountPersonalAssistant(root.querySelector('#personal-assistant'), client) };
 }
 
 async function viewScheduling() {
