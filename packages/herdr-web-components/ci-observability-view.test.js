@@ -230,6 +230,25 @@ test('review: exact project identity reaches Runs, health, report and cache char
  assert.deepEqual(JSON.parse(value),['https://ci.example','17','org/current']);
 }));
 
+test('review: project selection synchronizes unchanged Runs options immediately, including clearing',()=>reviewPage(async page=>{
+ await page.evaluate(()=>mount());
+ await page.locator('[data-ob-project]').first().waitFor();
+ await page.waitForFunction(()=>document.querySelector('[data-ci-repository]').options.length===3);
+ const states=await page.evaluate(()=>{
+  const select=document.querySelector('[data-ci-repository]'),options=select.innerHTML;
+  return ['org/current','org/former',null].map(repository=>{
+   const button=repository?[...document.querySelectorAll('[data-ob-project]')].find(node=>node.textContent===repository):document.querySelector('[data-ob-clear]');
+   button.click();
+   return {value:select.value,sameNode:select===document.querySelector('[data-ci-repository]'),sameOptions:select.innerHTML===options};
+  });
+ });
+ assert.deepEqual(states,[
+  {value:JSON.stringify(['https://ci.example','17','org/current']),sameNode:true,sameOptions:true},
+  {value:JSON.stringify(['https://ci.example','17','org/former']),sameNode:true,sameOptions:true},
+  {value:'',sameNode:true,sameOptions:true},
+ ]);
+}));
+
 test('review: Runs repository selection updates command center and health with exact identity in both directions',()=>reviewPage(async page=>{
  await page.evaluate(()=>mount());await page.locator('[data-ob-project]').first().waitFor();
  await page.locator('[data-ci-workspace="runs"]').click();
