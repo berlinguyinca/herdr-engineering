@@ -591,7 +591,9 @@ def test_a_viewer_never_holds_the_ingest_lock_for_a_whole_scan(fab, monkeypatch)
     stop.set()
     th.join()
     assert total > 0.5 and waits                       # the scan really was slow
-    assert max(waits) < total / 3, (max(waits), total)  # ...yet no single hold was close to it
+    # ...yet the lock was not held for the scan: a hold of the whole scan is one wait of about `total` and almost no samples;
+    # chunked yields give many samples and no wait near `total`. (A tight ratio flaked on loaded CI hosts: one scheduler stall.)
+    assert len(waits) >= 10 and max(waits) < total * 0.75, (len(waits), max(waits), total)
 
 
 def test_a_trimmed_window_has_exact_self_consistent_steps(fab, monkeypatch):
