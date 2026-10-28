@@ -465,11 +465,26 @@ class ControlPlaneServer:
             digest = hashlib.sha256(key.encode()).hexdigest()[:12]
             self.architecture_agent_hosts[f"key:{digest}"] = frozenset(hosts)
         self.architecture.gate_store_fn = lambda: self.gate_store
+        from .project_intelligence_api import IntelligenceRoutes
+        self.intelligence = IntelligenceRoutes(section_fn=lambda: self._intelligence_section(fleet_config))
         self._configure_architecture_explain(fleet_config, architecture_explain)
         if collab is not None:
             collab.architecture = self.architecture
         # live stream (Spec §52)
         repo.subscribe(self._broadcast)
+
+    @staticmethod
+    def _intelligence_section(fleet_config):
+        """`control_plane.project_intelligence` read on every request (hot kill switch); {} when absent."""
+        if fleet_config is None:
+            return {}
+        from ..fleet_config import FleetConfigError
+        try:
+            section = fleet_config.current().section("control_plane")
+        except FleetConfigError:
+            return {}
+        value = (section or {}).get("project_intelligence")
+        return value if isinstance(value, dict) else {}
 
     @staticmethod
     def _architecture_enabled(fleet_config, override):
@@ -1921,6 +1936,11 @@ def _make_handler(server, public=False, operator=False):
                 return self._json(server._health())
             if resource == "architecture":
                 return self._architecture_get(parts)
+            if resource == "intelligence":
+                status, body = server.intelligence.get(
+                    parts[4:], {k: v[0] for k, v in parse_qs(urlsplit(self.path).query).items()},
+                    self._principal(), self._role())
+                return self._json(body, status)
             if resource == "mission-activity" and len(parts) == 4:
                 return self._json({"activities": r.mission_activity.list_summaries(),
                                    "server_time": r._stamp()})
@@ -2336,6 +2356,9 @@ def _make_handler(server, public=False, operator=False):
                 return self._inspector_set_prefs(parts[4])
             if resource == "architecture":
                 return self._architecture_post(parts)
+            if resource == "intelligence":
+                status, body = server.intelligence.post(parts[4:], self._read_json() or {}, self._principal(), self._role())
+                return self._json(body, status)
             # artifact upload carries raw bytes, not JSON — handle first
             if resource == "artifacts" and len(parts) == 4:
                 return self._upload_artifact(r, parts)
