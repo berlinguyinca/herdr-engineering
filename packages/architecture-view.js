@@ -162,6 +162,7 @@ export function mountArchitecture(root, client, opts = {}) {
       <h3>CI runs</h3>${list(o.ci, 'No CI run recorded for this commit.', r => `<li data-ci>${link(r.url, `#${r.run_number ?? '?'}`)} · ${esc(r.state || r.status || 'unknown')}${r.branch ? ' · ' + esc(r.branch) : ''}</li>`)}
       <h3>Pull requests</h3>${list(o.pull_requests, 'No pull request has this commit as its head.', p => `<li data-pr>${link(p.url, p.pr_ref)} · ${esc(p.state)}</li>`)}
       <h3>Agents</h3>${list(o.sessions, 'No agent session recorded at this commit.', x => `<li data-session>${esc(x.session_id)} · ${esc(x.agent_role || 'agent')} · ${esc(x.flow)}${x.parent_session_id ? ' · parent ' + esc(x.parent_session_id) : ''}</li>`)}
+      <h3>Same worktree, other commits <small>(context, not authorship)</small></h3>${list(o.worktree_sessions, 'No other agent recorded in this worktree.', x => `<li data-wt-session>${esc(x.session_id)} · ${esc(x.agent_role || 'agent')} · ${x.commit_sha ? esc(x.commit_sha.slice(0, 8)) : 'no commit recorded'}</li>`)}
       <h3>Missions</h3>${list(o.missions, 'No mission linked.', m => `<li data-mission>${esc(m.mission_key || m.mission_id)}</li>`)}
       <h3>Issue mentions <small>(inferred from mission text)</small></h3>${list(o.issues, 'No explicit issue reference.', i => `<li data-issue>${esc(i.issue_ref)} <small>inferred · ${esc(i.evidence)}</small></li>`)}</section>`;
   }
