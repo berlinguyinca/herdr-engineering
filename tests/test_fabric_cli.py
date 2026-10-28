@@ -85,7 +85,13 @@ def _run_gateway(monkeypatch, capsys, tmp_path, *extra):
     handlers, seen = {}, {}
     monkeypatch.setattr(signal, "signal", lambda sig, fn: handlers.__setitem__(sig, fn))
 
-    def fake_sleep(_):
+    import threading
+    import time as _time
+    real_sleep = _time.sleep
+
+    def fake_sleep(seconds):
+        if threading.current_thread() is not threading.main_thread():
+            return real_sleep(seconds)   # only the command's own wait loop is faked; probe threads keep real timing
         out = capsys.readouterr().out
         seen["banner"] = json.loads(out[out.index("{"):out.index("}\n") + 2])
         seen["hook"]()
