@@ -3,6 +3,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert';
 import { spawn } from 'node:child_process';
+import { once } from 'node:events';
 import fs from 'node:fs';
 import path from 'node:path';
 import { chromium } from 'playwright';
@@ -12,8 +13,8 @@ const PY = process.env.PYTHON
   || (fs.existsSync(path.join(REPO, '.venv', 'bin', 'python'))
     ? path.join(REPO, '.venv', 'bin', 'python') : 'python3');
 
-async function startServer(env = {}) {
-  const proc = spawn(PY, [path.join(REPO, 'tests', 'playwright', 'server.py')], {
+async function startServer(env = {}, spawnServer = spawn) {
+  const proc = spawnServer(PY, [path.join(REPO, 'tests', 'playwright', 'server.py')], {
     env: { ...process.env, ...env }, stdio: ['ignore', 'pipe', 'pipe'],
   });
   const port = await new Promise((resolve, reject) => {
@@ -24,10 +25,57 @@ async function startServer(env = {}) {
       const m = buf.match(/PORT=(\d+)/);
       if (m) { clearTimeout(timer); resolve(Number(m[1])); }
     });
-    proc.on('exit', (c) => reject(new Error(`server exited early (${c})`)));
+    proc.once('exit', (c) => { clearTimeout(timer); reject(new Error(`server exited early (${c})`)); });
+    proc.once('error', (error) => { clearTimeout(timer); reject(error); });
     proc.stderr.on('data', (d) => process.stderr.write(`[srv] ${d}`));
+  }).catch((error) => {
+    // Setup can fail before withApp owns the fixture and reaches its finally block.
+    proc.kill();
+    throw error;
   });
   return { proc, port };
+}
+
+for (const scenario of ['timeout', 'early exit', 'spawn error']) {
+  test(`startupcleanup: ${scenario} leaves no child or pending deadline`, { timeout: 5000 }, async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    const schedule = globalThis.setTimeout;
+    let deadline;
+    t.mock.method(globalThis, 'setTimeout', (callback, delay) => {
+      deadline = t.mock.fn(callback);
+      return schedule(deadline, delay);
+    });
+    let proc;
+    let closed;
+    const starting = startServer({}, (_command, _args, options) => {
+      proc = scenario === 'spawn error'
+        ? spawn(`${process.execPath}-missing-fixture`, [], options)
+        : spawn(process.execPath, ['-e', scenario === 'early exit'
+          ? 'process.exit(23)' : 'setInterval(() => {}, 1000)'], options);
+      closed = new Promise((resolve) => proc.once('close', (code, signal) => resolve({ code, signal })));
+      // Even a failing assertion must not leak the regression's real child.
+      t.after(async () => { proc.kill('SIGKILL'); await closed; });
+      return proc;
+    });
+    const rejected = assert.rejects(starting, scenario === 'timeout'
+      ? /server start timeout/ : scenario === 'early exit'
+        ? /server exited early \(23\)/ : { code: 'ENOENT' });
+    if (scenario === 'timeout') {
+      await once(proc, 'spawn');
+      t.mock.timers.tick(20000);
+    }
+    await rejected;
+    if (scenario === 'timeout') assert.equal(proc.killed, true, 'startup failure must terminate the child');
+    const result = await closed;
+    if (scenario !== 'spawn error') {
+      assert.deepEqual(result, scenario === 'timeout'
+        ? { code: null, signal: 'SIGTERM' } : { code: 23, signal: null });
+      assert.throws(() => process.kill(proc.pid, 0), { code: 'ESRCH' });
+    }
+    // An exit/error must cancel the deadline, not merely settle its promise first.
+    t.mock.timers.tick(20000);
+    assert.equal(deadline.mock.callCount(), scenario === 'timeout' ? 1 : 0);
+  });
 }
 
 async function withApp(fn, env = {}) {
