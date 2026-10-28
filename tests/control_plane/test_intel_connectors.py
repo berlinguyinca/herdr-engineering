@@ -261,3 +261,23 @@ def test_only_accepted_attachments_reach_the_artifact_store():
     assert bad["verdict"] != "accept" and bad["artifact_id"] is None
     assert len(store.calls) == 1
     assert ia.safe_filename("///") == "attachment"
+
+
+def test_zip_whose_header_understates_the_real_size_is_rejected():
+    import io
+    import struct
+    import zipfile
+
+    from herdr_engineering.control_plane import intel_attachments as ia
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("word/document.xml", b"".join(__import__("hashlib").sha256(bytes([i])).hexdigest().encode() for i in range(60)))
+    good = buf.getvalue()
+    assert ia.triage(good, "application/zip").verdict != "reject", ia.triage(good, "application/zip").reasons
+    # patch the central-directory uncompressed size down to 10 bytes (the local header stays honest)
+    cd = good.index(b"PK\x01\x02")
+    bad = bytearray(good)
+    struct.pack_into("<I", bad, cd + 24, 10)
+    t = ia.triage(bytes(bad), "application/zip")
+    assert t.verdict == "reject" and any("declared sizes" in r for r in t.reasons)

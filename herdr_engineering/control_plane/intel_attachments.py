@@ -7,7 +7,9 @@ from __future__ import annotations
 
 import hashlib
 import io
+import struct
 import zipfile
+import zlib
 from dataclasses import dataclass
 
 MAX_BYTES = 25 * 1024 * 1024
@@ -52,6 +54,29 @@ def sniff(data: bytes) -> str:
         return "application/octet-stream"
 
 
+VERIFY_ENTRY_MAX = 8 * 1024 * 1024
+
+
+def _declared_sizes_lie(data: bytes, info: zipfile.ZipInfo) -> bool:
+    """Inflate the raw entry with a hard output cap and compare to the header's ``file_size``.
+
+    Other tools (unzip, office suites) may trust different fields than ``zipfile`` does, so a header that understates
+    the real size is treated as hostile. Entries over ``VERIFY_ENTRY_MAX`` are judged by the ratio check alone.
+    """
+    if info.file_size > VERIFY_ENTRY_MAX or info.compress_type not in (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED):
+        return False
+    try:
+        name_len, extra_len = struct.unpack("<HH", data[info.header_offset + 26:info.header_offset + 30])
+        start = info.header_offset + 30 + name_len + extra_len
+        raw = data[start:start + info.compress_size]
+        if info.compress_type == zipfile.ZIP_STORED:
+            return len(raw) != info.file_size
+        out = zlib.decompressobj(-15).decompress(raw, info.file_size + 1)
+    except (struct.error, zlib.error):
+        return True
+    return len(out) != info.file_size
+
+
 def _zip_findings(data: bytes) -> tuple[list[str], str]:
     reasons: list[str] = []
     kind = "application/zip"
@@ -66,6 +91,8 @@ def _zip_findings(data: bytes) -> tuple[list[str], str]:
             if any((i.compress_size == 0 and i.file_size > 0)
                    or (i.compress_size and i.file_size / i.compress_size > MAX_RATIO) for i in infos):
                 reasons.append("suspicious compression ratio (possible zip bomb)")
+            if len(infos) <= MAX_ARCHIVE_ENTRIES and any(_declared_sizes_lie(data, i) for i in infos):
+                reasons.append("suspicious archive: declared sizes do not match the data")
             for i in infos:
                 n = i.filename.lower()
                 if n.startswith("/") or ".." in n.split("/"):
