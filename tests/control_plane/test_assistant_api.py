@@ -325,3 +325,96 @@ def test_diagnostics(server):
     d = json.loads(body)
     assert d["runner"] == "LocalRunnerAdapter"
     assert d["enabled"] is True
+
+
+class _FakeRepo:
+    def list_hosts(self):
+        return [{"host_name": "bender", "status": "online", "problem_count": 2},
+                {"host_name": "beast", "status": "online"}]
+
+    def list_missions(self):
+        return [{"title": "Add PA", "status": "running", "stage": "implement"}]
+
+    def list_sessions(self):
+        return [{"display_name": "Clever Iris Amber", "host_id": "beast", "status": "active"}]
+
+    def list_services(self, *, include_archived=True):
+        return [{"service_name": "cp-web", "status": "running"}]
+
+    def recent_events(self, limit=50):
+        return [{"type": "session.report"}, {"type": "session.report"}, {"type": "deploy"}]
+
+
+def test_fleet_context_provider_is_bounded_redacted_and_framed():
+    from herdr_engineering.control_plane.assistant import FleetContextProvider
+    ctx = FleetContextProvider(_FakeRepo(), max_chars=6000, per_section=10).render()
+    assert "INFORMATIONAL ONLY" in ctx          # prompt-injection framing
+    assert "host bender" in ctx and "2 problems" in ctx
+    assert "mission Add PA" in ctx and "agent Clever Iris Amber" in ctx
+    assert "session.report: 2" in ctx           # activity summarized, not raw payloads
+
+def test_fleet_context_redacts_secrets_and_truncates():
+    from herdr_engineering.control_plane.assistant import FleetContextProvider
+
+    class _LeakyRepo(_FakeRepo):
+        def list_services(self, *, include_archived=True):
+            return [{"service_name": "svc password=hunter2supersecret", "status": "up"}]
+
+    ctx = FleetContextProvider(_LeakyRepo(), max_chars=6000).render()
+    assert "hunter2supersecret" not in ctx and "REDACTED" in ctx
+    small = FleetContextProvider(_FakeRepo(), max_chars=500).render()
+    assert len(small) <= 500 + len(" ...(truncated)")
+
+def test_http_runner_injects_fleet_context_as_system_message():
+    from herdr_engineering.control_plane.assistant import (
+        AssistantService, FleetContextProvider, HttpModelRunnerAdapter)
+    seen = {}
+
+    def fake_urlopen(url, payload, timeout):
+        seen["payload"] = payload
+        return {"choices": [{"message": {"content": "PA-OK"}}]}
+
+    service = AssistantService(
+        config=assistant_config({"personal_assistant": {
+            "enabled": True,
+            "inference": {"endpoint": "http://proxy.invalid/v1/chat/completions",
+                          "model": "qwen-flash"},
+            "fleet_context": {"enabled": True}}}))
+    service.fleet_context = FleetContextProvider(_FakeRepo())
+    service.runner = HttpModelRunnerAdapter(
+        service.store, endpoint="http://proxy.invalid/v1/chat/completions",
+        model="qwen-flash", context_provider=service.fleet_context, urlopen=fake_urlopen)
+    a = service.create_assistant(tenant_id="t1", user_id="u1", name="A")
+    th = service.create_thread(tenant_id="t1", user_id="u1", assistant_id=a.assistant_id)
+    service.send_message(tenant_id="t1", user_id="u1",
+                         assistant_id=a.assistant_id, thread_id=th.thread_id,
+                         content="what is down?")
+    msgs = seen["payload"]["messages"]
+    assert msgs[0]["role"] == "system" and "host bender" in msgs[0]["content"]
+    assert msgs[-1]["content"] == "what is down?"
+
+def test_read_fleet_tool_requires_enabled_fleet_context():
+    service = AssistantService(
+        config=assistant_config({"personal_assistant": {
+            "enabled": True, "inference": {"endpoint": "http://x.invalid"}}}))
+    a = service.create_assistant(tenant_id="t1", user_id="u1", name="A")
+    from herdr_engineering.control_plane.assistant import AssistantError
+    try:
+        service.execute_tool(tenant_id="t1", user_id="u1", assistant_id=a.assistant_id,
+                             tool_id="read_fleet", payload={}); assert False
+    except AssistantError as exc:
+        assert "not enabled" in str(exc)
+
+def test_read_fleet_tool_returns_context_when_enabled():
+    from herdr_engineering.control_plane.assistant import (
+        AssistantService, FleetContextProvider)
+    service = AssistantService(
+        config=assistant_config({"personal_assistant": {
+            "enabled": True, "inference": {"endpoint": "http://x.invalid"},
+            "fleet_context": {"enabled": True}}}))
+    service.fleet_context = FleetContextProvider(_FakeRepo())
+    a = service.create_assistant(tenant_id="t1", user_id="u1", name="A")
+    out = service.execute_tool(tenant_id="t1", user_id="u1",
+                               assistant_id=a.assistant_id,
+                               tool_id="read_fleet", payload={"sections": ["hosts"]})
+    assert "host bender" in out["context"] and "[missions]" not in out["context"]

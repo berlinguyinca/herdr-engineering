@@ -299,7 +299,8 @@ class ControlPlaneServer:
         if assistant_service is None:
             from .assistant import AssistantService
             from .assistant import assistant_config as _build_assistant_config
-            self.assistant = AssistantService(config=_build_assistant_config(assistant_config or {}))
+            self.assistant = AssistantService(
+                config=_build_assistant_config(assistant_config or {}), repo=repo)
         else:
             self.assistant = assistant_service
         from .ingest import IngestService
