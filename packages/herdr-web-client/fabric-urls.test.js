@@ -105,3 +105,35 @@ test('a gateway without names leaves detection unchanged', async () => {
   await new Promise((r) => setTimeout(r, 10));
   assert.deepEqual(candidateUrls('http://localhost:3188/a'), ['http://localhost:3188/a']);
 });
+
+test('plain-text surfaces escape everything and link only URLs the fabric resolved', async () => {
+  const { linkifyFabricText } = await import('../fabric-urls.js');
+  const o = 'http://localhost:3188/a?b=1&c=2';
+  const resolver = { resolve: (u) => (u === o ? resolved(o, 'https://dev.lan:3188/a?b=1&c=2') : null) };
+  const html = linkifyFabricText(`<img src=x onerror=1> see ${o}. next`, resolver);
+  assert.ok(html.startsWith('&lt;img src=x onerror=1&gt; see '));
+  assert.ok(html.includes('href="https://dev.lan:3188/a?b=1&amp;c=2"') && html.includes(`data-original="${o.replace(/&/g, '&amp;')}"`));
+  assert.ok(html.endsWith('. next'));
+  assert.ok(!html.includes('<img'));
+  assert.equal(linkifyFabricText('a <b> & c', null), 'a &lt;b&gt; &amp; c');
+  assert.equal(linkifyFabricText(undefined, resolver), '');
+});
+
+test('attention detail links a resolved loopback URL and survives a client without the resolver', async () => {
+  const { renderAttention } = await import('../attention-view.js');
+  const o = 'http://localhost:3188/x';
+  const item = { key: 'k', kind: 'ci', severity: 'warning', title: 'T', detail: `open ${o}`, first_seen: '2026-10-28T00:00:00Z', state: 'open', count: 1 };
+  const model = { body: { items: [item], policy: {} }, urls: { resolve: (u) => (u === o ? resolved(o, 'https://dev.lan:3188/x') : null) } };
+  assert.ok(renderAttention(model, Date.parse('2026-10-28T01:00:00Z')).includes('href="https://dev.lan:3188/x"'));
+  const plain = renderAttention({ body: model.body }, Date.parse('2026-10-28T01:00:00Z'));
+  assert.ok(plain.includes(o) && !plain.includes('md-fabric-link'));
+});
+
+test('agents list row links the summary when a resolver is given', async () => {
+  const { compactSessionRow } = await import('../sessions-view.js');
+  const o = 'http://localhost:3188/x';
+  const entry = { id: 's1', role: 'worker', project: 'p', host: 'bender', record: { summary: `serving at ${o}` } };
+  const urls = { resolve: (u) => (u === o ? resolved(o, 'https://dev.lan:3188/x') : null) };
+  assert.ok(compactSessionRow(entry, Date.now(), urls).includes('href="https://dev.lan:3188/x"'));
+  assert.ok(compactSessionRow(entry, Date.now()).includes(o));
+});

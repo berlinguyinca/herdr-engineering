@@ -2,6 +2,8 @@
 // Detection stays in conversation-markdown.js; this module only answers "what is the canonical URL for this
 // exact string?" from a cache that the server (POST /api/v1/fabric/resolve-urls) fills. Rendering is synchronous,
 // so a URL not yet resolved renders as written and is upgraded on the next paint. Stored text is never rewritten.
+import { escapeHtml as esc } from './herdr-web-components/util.js';
+import { linkifyBare } from './conversation-markdown.js';
 const TTL_MS = 30000;
 const MAX_BATCH = 200;
 const URL_TAIL = '(?::\\d{1,5})?[^\\s<>`*"\\\\)\\]]*';
@@ -26,6 +28,20 @@ export function candidateUrls(text, { openEnd = false } = {}) {
     seen.add(m[0].replace(/[.,;:!?'"}>]+$/, ''));
   }
   return [...seen].slice(0, MAX_BATCH);
+}
+
+// Plain-text surfaces (attention detail, agent summaries) show agent output as escaped text, not Markdown. This
+// escapes everything and turns only URLs that the fabric knows about into links, using the same anchors as the chat.
+export function linkifyFabricText(text, urls) {
+  const source = String(text ?? '');
+  if (!urls?.resolve) return esc(source);
+  let out = '', at = 0;
+  for (const m of source.matchAll(new RegExp(CANDIDATE.source, 'gi'))) {
+    const linked = linkifyBare(m[0], urls);
+    out += esc(source.slice(at, m.index)) + (linked ?? esc(m[0]));
+    at = m.index + m[0].length;
+  }
+  return out + esc(source.slice(at));
 }
 
 export function createFabricUrlResolver(client, { sourceMachine = null, now = () => Date.now(), onChange = () => {} } = {}) {

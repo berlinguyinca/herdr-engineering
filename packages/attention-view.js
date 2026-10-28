@@ -5,6 +5,7 @@ import { escapeHtml as esc } from './herdr-web-components/util.js';
 import { formatDuration } from './herdr-web-components/format.js';
 import { skeleton } from './motion.js';
 import { requestErrorDetail } from './dashboard-load-state.js';
+import { createFabricUrlResolver, linkifyFabricText } from './fabric-urls.js';
 
 const SEVERITIES = ['critical', 'warning', 'info'];
 const KINDS = {
@@ -33,7 +34,7 @@ function age(item, now) {
     ? `<span data-attention-stamp="${esc(item.first_seen)}">${esc(formatDuration(Math.max(0, now - at)))}</span> ago` : 'time not reported';
 }
 
-function row(item, now, { busy = false } = {}) {
+function row(item, now, { busy = false, urls = null } = {}) {
   const sev = SEVERITIES.includes(item.severity) ? item.severity : 'info';
   const href = safeHref(item.href);
   const title = href ? `<a href="${esc(href)}">${esc(item.title)}</a>` : esc(item.title);
@@ -49,7 +50,7 @@ function row(item, now, { busy = false } = {}) {
   const until = item.state === 'snoozed' && item.snoozed_until ? ` · until ${esc(new Date(item.snoozed_until).toLocaleString())}` : '';
   return `<li class="at-row at-${sev}" data-attention-row="${esc(item.key)}">
     <div class="at-main"><span class="at-sev">${esc(sev)}</span> <strong>${title}</strong>${count}
-      <p>${esc(item.detail)}</p>
+      <p>${linkifyFabricText(item.detail, urls)}</p>
       <p class="at-meta">${esc(KINDS[item.kind] || text(item.kind))} · first seen ${age(item, now)}${until}</p></div>
     <div class="at-actions">${links}${controls}</div></li>`;
 }
@@ -126,13 +127,13 @@ export function renderAttention(model = {}, now = Date.now()) {
   const stale = error ? '<p class="at-partial" role="status">Could not refresh; showing the last received list.</p>' : '';
   const trunc = body.truncated ? '<p class="at-status">Showing the first items only; the inbox is capped.</p>' : '';
   let list;
-  if (open.length) list = `<ul class="at-list" aria-label="Open attention items">${open.map((i) => row(i, now, { busy: busy.has(i.key) })).join('')}</ul>`;
+  if (open.length) list = `<ul class="at-list" aria-label="Open attention items">${open.map((i) => row(i, now, { busy: busy.has(i.key), urls: model.urls })).join('')}</ul>`;
   else if (partial) list = '<p class="at-status">Nothing is known to be open, but some sources could not be read.</p>';
   else list = '<p class="at-status">No attention items. Every source was read.</p>';
   const resolved = records(body.resolved);
   return `${STYLES}${head}${summary}${message ? `<p class="at-status" role="status">${esc(message)}</p>` : ''}${notifyLine(model.notify)}${stale}${filterRow}${list}${trunc}
-    <div data-state="acknowledged">${group('Acknowledged', acknowledged, (i) => row(i, now, { busy: busy.has(i.key) }))}</div>
-    ${group('Snoozed', snoozed, (i) => row(i, now, { busy: busy.has(i.key) }))}
+    <div data-state="acknowledged">${group('Acknowledged', acknowledged, (i) => row(i, now, { busy: busy.has(i.key), urls: model.urls }))}</div>
+    ${group('Snoozed', snoozed, (i) => row(i, now, { busy: busy.has(i.key), urls: model.urls }))}
     ${group('Recently resolved', resolved, (i) => resolvedRow(i, now))}`;
 }
 
@@ -140,6 +141,10 @@ export function renderAttention(model = {}, now = Date.now()) {
 export function mountAttention(container, client, { onBody, notifier, onFreshness = () => {} } = {}) {
   const model = { body: null, error: '', loading: true, busy: new Set(), filters: {}, message: '' };
   let disposed = false, timer = null, controller = null, last = '';
+  // agent-written detail text may name a loopback service; link it to its fabric address when the gateway knows it
+  const fabric = typeof client.resolveFabricUrls === 'function'
+    ? createFabricUrlResolver(client, { onChange: () => { last = ''; draw(); } }) : null;
+  model.urls = fabric?.resolver || null;
   function draw() {
     if (disposed) return;
     model.notify = notifier ? { status: notifier.status(), policy: model.body?.notify } : null;
@@ -169,6 +174,7 @@ export function mountAttention(container, client, { onBody, notifier, onFreshnes
       if (disposed || request.signal.aborted || controller !== request) return;
       if (!body || !Array.isArray(body.items)) throw new Error('Invalid response');
       model.body = body; model.error = ''; model.loading = false;
+      fabric?.prefetch(...(Array.isArray(body?.items) ? body.items : []).map((i) => i?.detail));
       onBody?.(body);
       onFreshness(true);
     } catch (err) {

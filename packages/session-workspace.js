@@ -87,7 +87,7 @@ export function mountSessionWorkspace(host,client,session,{connect=connectEvents
   try{storage=host.ownerDocument.defaultView.sessionStorage;}catch{/* optional storage */}
   const operationKey=`herdr.conversation.pending:${session.session_id}`;
   const composer=mountComposer($('[data-composer]'),{
-    draftKey:`session:${session.session_id}`,disabled:terminal,
+    draftKey:`session:${session.session_id}`,disabled:terminal,urls:fabric,
     placeholder:terminal?'This agent has ended':'Message this agent… type @ for references',
     hint:terminal?'Recorded history remains available.':'Enter sends · Shift+Enter adds a line · @ inserts a file, agent or GitHub reference.',
     // the same sigil menu as the room: references by kind, literal text inserted, nothing rewritten
