@@ -339,13 +339,23 @@ class FabricGateway:
                  control_port: int = 29999, url_base: str | None = None,
                  probe_interval: float = 15.0, token: str | None = None,
                  reset_lock: bool = False, rewrite_headers: bool = False,
-                 allowed_target_networks: tuple[str, ...] = (), public_scheme: str = "http") -> None:
+                 allowed_target_networks: tuple[str, ...] = (), public_scheme: str = "http",
+                 peer_url: str | None = None, node_id: str | None = None, promote_after: int = 3) -> None:
         self.registry = registry
         # Lease targets are limited to loopback + the tailnet (+ these CIDRs): anything else
         # would let a token holder aim the gateway at arbitrary internal services (SSRF).
         self.allowed_target_networks = tuple(allowed_target_networks)
         # Scheme advertised in canonical URLs. Stays http until a TLS listener is configured.
         self.public_scheme = public_scheme
+        # High availability (active/standby peers). Without ``peer_url`` this gateway is always the active one, as before.
+        # The registry is soft state that the hosts' fabric agents re-register, so a promoted standby needs only a recent
+        # mirror to avoid a gap; correctness never depends on it.
+        self.peer_url = peer_url.rstrip("/") if peer_url else None
+        self.node_id = node_id or socket.gethostname()
+        self.promote_after = max(1, promote_after)
+        self.role = "active"
+        self.epoch = 0
+        self._peer_failures = 0
         # Opt-in: rewrite loopback URLs in Location / CORS / cookie-domain headers
         # of HTTP leases to the fabric address (forces Connection: close).
         self.rewrite_headers = rewrite_headers
@@ -371,6 +381,10 @@ class FabricGateway:
     # -- router sync -------------------------------------------------------
     def _sync_router(self) -> None:
         """Bind all active leases and unbind ports with no active lease."""
+        if self.role != "active":
+            for port in self.router.bound_ports():
+                self.router.unbind(port)
+            return
         active = {lease.external_port: lease for lease in self.registry.active_leases()}
         for port, lease in active.items():
             if not self.router.bind(port, lease.target_host, lease.target_port,
@@ -381,6 +395,67 @@ class FabricGateway:
         for port in self.router.bound_ports():
             if port not in active:
                 self.router.unbind(port)
+
+    # -- high availability ----------------------------------------------------
+    def _peer(self) -> FabricClient:
+        client = FabricClient(self.peer_url, token=self.token)
+        return client
+
+    def _peer_health(self) -> dict[str, Any] | None:
+        try:
+            health = self._peer().healthz()
+        except Exception:
+            return None
+        return health if isinstance(health, dict) and health.get("ok") else None
+
+    def _choose_initial_role(self) -> None:
+        """Start as standby when the peer is already serving; otherwise take over (epoch above anything seen)."""
+        peer = self._peer_health()
+        if peer and peer.get("role") == "active":
+            self.role, self.epoch = "standby", int(peer.get("epoch", 0))
+        else:
+            self.role = "active"
+            self.epoch = int(peer.get("epoch", 0)) + 1 if peer else max(self.epoch, 1)
+
+    def _wins_against(self, peer: dict[str, Any]) -> bool:
+        """Two actives: the higher epoch keeps serving; equal epochs fall back to the smaller node id."""
+        theirs = int(peer.get("epoch", 0))
+        if self.epoch != theirs:
+            return self.epoch > theirs
+        return self.node_id <= str(peer.get("node_id", ""))
+
+    def promote(self) -> None:
+        self.epoch += 1
+        self.role = "active"
+        self._peer_failures = 0
+        self.registry.renew_all()
+        self._sync_router()
+
+    def demote(self) -> None:
+        self.role = "standby"
+        self._sync_router()
+
+    def _ha_step(self) -> None:
+        """One peer check: mirror while standby, promote after ``promote_after`` misses, resolve a double-active."""
+        peer = self._peer_health()
+        if self.role == "standby":
+            if peer is None:
+                self._peer_failures += 1
+                if self._peer_failures >= self.promote_after:
+                    self.promote()
+                return
+            if peer.get("role") == "active":
+                self._peer_failures = 0
+                self.epoch = max(self.epoch, int(peer.get("epoch", 0)))
+                try:
+                    self.registry.replace_from_peer(self._peer().list().get("leases", []))
+                except Exception:
+                    pass
+            elif self.node_id <= str(peer.get("node_id", "")):
+                self.promote()   # both standby (e.g. both restarted): the smaller node id takes over
+            return
+        if peer and peer.get("role") == "active" and not self._wins_against(peer):
+            self.demote()
 
     def _rewrite_target(self, lease) -> str | None:
         if self.rewrite_headers and lease.protocol == "http":
@@ -394,8 +469,10 @@ class FabricGateway:
                 # Pick up store changes made by an overlapping process
                 # (e.g. a register served by a gateway that was mid-shutdown).
                 self.registry.reload_if_changed()
+                if self.peer_url:
+                    self._ha_step()
                 changed = False
-                for lease in self.registry.active_leases():
+                for lease in (self.registry.active_leases() if self.role == "active" else ()):
                     ok, err = _tcp_probe(lease.target_host, lease.target_port)
                     # Batch: update health + renew TTL in memory for every lease,
                     # then persist once below. (The old code persisted per lease,
@@ -479,6 +556,8 @@ class FabricGateway:
 
     def start(self) -> FabricGateway:
         self._acquire_lock()
+        if self.peer_url:
+            self._choose_initial_role()
         self._sync_router()
         handler = _make_handler(self)
         self._httpd = ThreadingHTTPServer((self.control_host, self.control_port), handler)
@@ -665,7 +744,8 @@ def _make_handler(gateway: FabricGateway):
             if self.path == "/healthz":
                 lo, hi = gateway.registry.port_range()
                 self._send(200, {"ok": True, "bound_ports": gateway.router.bound_ports(),
-                                 "url_base": gateway.url_base,
+                                 "url_base": gateway.url_base, "role": gateway.role,
+                                 "epoch": gateway.epoch, "node_id": gateway.node_id,
                                  "port_lo": lo, "port_hi": hi})
                 return
             self._send(404, {"error": "not found"})
@@ -679,6 +759,9 @@ def _make_handler(gateway: FabricGateway):
                 body = json.loads(self.rfile.read(length) or b"{}")
             except (ValueError, json.JSONDecodeError):
                 self._send(400, {"error": "invalid json"})
+                return
+            if gateway.role != "active" and self.path in ("/register", "/heartbeat", "/close"):
+                self._send(503, {"error": "standby", "active": gateway.peer_url})
                 return
             if self.path == "/register":
                 try:
