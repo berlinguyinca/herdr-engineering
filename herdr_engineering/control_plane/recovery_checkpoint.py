@@ -1,7 +1,7 @@
 """Offline, atomic recovery checkpoints; online reads scan keys, not old payloads.
 
 The current journal is authoritative, including retention and quarantine. A generation contains the
-original rows selected by faithful recovery plus the exact (actor_id, event_id)
+original rows selected by faithful recovery plus the exact (actor_id, event_id, insertion instance)
 set visible in the SAME repeatable-read snapshot. No clock, stream sequence or
 transaction-start watermark is used. A late commit, including one with backdated
 clocks or a reused event ID in another actor domain, is therefore always a tail
@@ -12,7 +12,7 @@ from __future__ import annotations
 import time
 import uuid
 
-FORMAT_VERSION = 2
+FORMAT_VERSION = 3
 _BUILD_LOCK = 0x48455244524350  # HERDRCP: serialize builders, never journal writers.
 
 
@@ -40,7 +40,7 @@ def checkpoint_events_sql() -> str:
     MATERIALIZED is deliberate: the anti-join must finish on narrow covered keys
     before looking up payloads. OFFSET 0 keeps the parameterized payload lookup
     from being flattened into another whole-journal heap scan. The covering
-    identity index in migration 0015 supports the raw-key side of the anti-join;
+    identity/instance index in migration 0016 supports both sides of the anti-join;
     MVCC visibility checks can still require heap visits for newly written pages.
     Retention/quarantine removes saved rows too. Deleting a compacted boundary or
     inserting a backdated barrier can expose omitted interior snapshots, so those
@@ -56,6 +56,7 @@ def checkpoint_events_sql() -> str:
                 WHERE c.checkpoint_id = $1
                   AND c.actor_id = COALESCE(e.actor ->> 'id', '')
                   AND c.event_id = e.event_id
+                  AND c.recovery_instance IS NOT DISTINCT FROM e.recovery_instance
             )
         ), deleted_keys AS MATERIALIZED (
             SELECT c.actor_id, c.event_id, c.entity_type, c.entity_id
@@ -63,6 +64,7 @@ def checkpoint_events_sql() -> str:
             WHERE c.checkpoint_id = $1 AND NOT EXISTS (
                 SELECT 1 FROM fabric_events e
                 WHERE COALESCE(e.actor ->> 'id', '') = c.actor_id AND e.event_id = c.event_id
+                  AND c.recovery_instance IS NOT DISTINCT FROM e.recovery_instance
             )
         ), saved_events AS MATERIALIZED (
             SELECT original.* FROM recovery_checkpoint_rows saved
@@ -107,6 +109,7 @@ def checkpoint_events_sql() -> str:
         SELECT original.*, CASE WHEN EXISTS (
             SELECT 1 FROM recovery_checkpoint_covered c WHERE c.checkpoint_id = $1
                 AND c.actor_id = COALESCE(original.actor ->> 'id', '') AND c.event_id = original.event_id
+                AND c.recovery_instance IS NOT DISTINCT FROM original.recovery_instance
         ) THEN 'refold' ELSE 'tail' END AS recovery_origin
         FROM changed_streams s
         CROSS JOIN LATERAL (
@@ -175,8 +178,10 @@ async def build_checkpoint(conn) -> dict:
             VALUES ($1, $2)
         """, checkpoint_id, FORMAT_VERSION)
         covered = await conn.execute("""
-            INSERT INTO recovery_checkpoint_covered (checkpoint_id, actor_id, event_id, entity_type, entity_id)
-            SELECT $1, COALESCE(actor ->> 'id', ''), event_id, entity_type, entity_id FROM fabric_events
+            INSERT INTO recovery_checkpoint_covered
+                (checkpoint_id, actor_id, event_id, entity_type, entity_id, recovery_instance)
+            SELECT $1, COALESCE(actor ->> 'id', ''), event_id, entity_type, entity_id, recovery_instance
+            FROM fabric_events
         """, checkpoint_id)
         selected = await conn.execute("""
             INSERT INTO recovery_checkpoint_rows (checkpoint_id, actor_id, event_id, event_row)

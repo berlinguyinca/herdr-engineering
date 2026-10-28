@@ -9,6 +9,14 @@ identity indexes concurrently using the instructions in migrations0014/0015 and
 verify both `indisvalid` and `indisready` before running the transactional migrator.
 Never build an index or checkpoint automatically during HTTP startup.
 
+Migration0015 also adds an internal nullable `recovery_instance` column and a
+trigger assigning a new UUID on every insert/update. Existing rows keep NULL;
+there is no historical payload backfill or table rewrite. After applying0015,
+build `idx_fabric_events_recovery_instance` CONCURRENTLY with the definition in
+0016, verify it, then apply0016's receipt. The covering index allows checking
+insertion instances without reading every historical payload. No client can
+preserve an old insertion instance when reusing an actor/event identity.
+
 Run the initial builder while the existing server continues serving requests:
 
 ```bash
@@ -22,7 +30,9 @@ identity, format and elapsed time. It never prints credentials or payloads. Use
 offline statement timeout (default1800s). A missing checkpoint schema fails before
 publication. One builder is allowed at a time; ordinary ingestion is not locked.
 
-Coverage and selected rows share a repeatable-read snapshot. The active pointer is
+Coverage includes actor/event identity and insertion instance. Reusing a deleted
+identity or updating a historical row is detected as replacement, including rows
+that predate the migration. Coverage and selected rows share a repeatable-read snapshot. The active pointer is
 published atomically with both sets; errors leave the previous generation active.
 A transaction committed after that snapshot is uncovered even if its timestamp,
 sequence or transaction start predates the builder. Actor domains remain separate.

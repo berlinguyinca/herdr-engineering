@@ -355,3 +355,40 @@ def test_existing_reader_keeps_old_generation_during_successful_publication(db):
             await reader.close()
             await writer.close()
     asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_reinserted_identity_uses_new_journal_content_and_ledger(db, legacy):
+    row = _row("session", "s", "session.updated", {"_envelope": {"content_sha256": "old"}},
+               0, source="reporter", source_sequence=1, actor={"id": "a"})
+    if legacy:
+        db.query("ALTER TABLE fabric_events DISABLE TRIGGER fabric_event_recovery_instance")
+    try:
+        _insert(db, [row])
+    finally:
+        if legacy:
+            db.query("ALTER TABLE fabric_events ENABLE TRIGGER fabric_event_recovery_instance")
+    initial = db.query("SELECT recovery_instance FROM fabric_events")[0]["recovery_instance"]
+    assert (initial is None) == legacy
+    _build(db)
+    db.query("DELETE FROM fabric_events WHERE event_id=$1", row["event_id"])
+    row.update(payload={"_envelope": {"content_sha256": "new"}}, source_sequence=2)
+    _insert(db, [row])
+    assert db.query("SELECT recovery_instance FROM fabric_events")[0]["recovery_instance"] != initial
+    expected, originals = _reference(db)
+    recovered, selected, metrics = _checkpoint_source(db)
+    assert selected == originals
+    assert recovered.ledger._events == expected.ledger._events
+    assert metrics["tail_events"] == 1
+
+
+def test_updated_compacted_interior_is_replayed_from_current_journal(db):
+    rows = [_row("service", "svc", "ServiceUpdated", _snapshot(), n) for n in range(8)]
+    _insert(db, rows)
+    _build(db)
+    db.query("UPDATE fabric_events SET payload = payload || '{\"status\":\"unavailable\"}'::jsonb "
+             "WHERE event_id=$1", rows[3]["event_id"])
+    expected, originals = _reference(db)
+    recovered, selected, _ = _checkpoint_source(db)
+    assert selected == originals
+    assert _projections(recovered) == _projections(expected)
