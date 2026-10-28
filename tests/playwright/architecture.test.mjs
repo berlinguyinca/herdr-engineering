@@ -174,6 +174,12 @@ test('related activity links only by exact commit; timeline has independent lane
   assert.match(await act.locator('[data-pr]').innerText(), /#17|ci_pending/);
   assert.match(await act.locator('[data-session]').innerText(), /pi:s1/);
   assert.equal(await act.locator('[data-session]').count(), 1, 'the branch-only session is not linked');
+  // same worktree, other commit: listed apart, labelled as context, never in the commit-matched Agents list
+  const wt = act.locator('[data-wt-session]');
+  await wt.waitFor();
+  assert.match(await wt.innerText(), /pi:same-tree · reviewer · aaaaaaaa/);
+  assert.match(await act.innerText(), /Same worktree, other commits \(context, not authorship\)/);
+  assert.doesNotMatch(await act.locator('[data-session]').innerText(), /same-tree/);
   const tl = page.locator('[data-testid="arch-timeline"]');
   await tl.locator('[data-tl-snap]').first().waitFor();
   assert.ok(await tl.locator('[data-tl-snap]').count() >= 3);

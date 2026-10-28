@@ -67,6 +67,10 @@ def seed_activity(svr, repo, head):
     repo.upsert_session("branchy", host_id="beast", repository_id=RID, branch="main", cwd="/x")
     repo.observe_ci_pipeline({"provider_repo_id": "9", "repository": "fixture", "run_number": 5, "state": "success", "branch": "main",
                               "repository_id": RID, "commit_sha": head, "url": "https://ci.example/5"})
+    wt = next(m["worktree_id"] for m in svr.architecture.list_snapshots(RID, None, None, None, None)["snapshots"]
+              if m["commit_sha"] == head)
+    repo.upsert_session("pi:same-tree", host_id="beast", agent_role="reviewer", source="pi", repository_id=RID,
+                        commit_sha="a" * 40, worktree_id=wt)
     gate = SimpleNamespace(snapshots=lambda: [SimpleNamespace(key=SimpleNamespace(repo=RID, number=17), head_sha=head,
                                                               state=SimpleNamespace(value="ci_pending"))])
     svr.architecture.gate_store_fn = lambda: gate
