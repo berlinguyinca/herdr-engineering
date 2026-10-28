@@ -187,3 +187,16 @@ def test_proposal_payload_must_name_a_string_project_and_stay_reviewable_in_full
     assert mk({"project": ["p1"]})[0] == 400            # was an unhashable-type 500
     assert mk({"project": "p1", "note": "x" * 5000})[0] == 400
     assert mk({"project": "p1"})[0] == 201
+
+
+def test_approval_executes_only_when_the_execute_flag_is_on():
+    sec = dict(FULL, default_org_id="org1", viewers={"key:abc": {"org_id": "org1", "projects": "*"},
+                                                      "key:def": {"org_id": "org1", "projects": "*"}})
+    other = {"kind": "operator", "id": "key:def", "authenticated_by": "api_key"}
+    body = {"action": "pause_ingestion", "payload": {"project": "p1", "source": "gmail"}, "resource_version": 3}
+    for flag, want in ((False, "approved"), (True, "executed")):
+        r = routes(dict(sec, execute=flag))
+        p = r.post(["proposals"], body, KEY, "operator")[1]
+        ok = {"payload_sha256": p["payload_sha256"], "resource_version": 3}
+        assert r.post(["proposals", p["id"], "approve"], ok, other, "operator")[1]["state"] == want
+        assert (("org1", "gmail") in r.store._paused) is flag

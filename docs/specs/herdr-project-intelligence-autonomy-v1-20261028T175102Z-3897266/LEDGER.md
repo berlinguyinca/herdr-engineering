@@ -112,7 +112,7 @@ Routes: `GET /api/v1/intelligence/{status,projects,investigations,relationships?
 
 ## Remaining work
 1. Live connectors (need you): Gmail client (B1), webhook secret file and public receiver URL (B2), email channel (B3), iPhone auth (B4).
-2. An executor for approved proposals (deliberately absent), and a human audit of `repair_policy.py` / `repair_gate.py` before any auto-merge enablement (B6).
+2. ~~Executor for approved proposals~~ built (pass 5, `intel_executor.py`, behind the `execute` flag, off by default; `propose_issue` has no GitHub issue hook wired yet and reports failed). ~~Audit of repair policy/gate~~ done (pass 5, below). Enabling auto-merge is still your call (B6).
 3. The webhook `ReplayGuard` is in memory (the store still dedupes); the store itself keeps all events in memory after hydration (paged load only).
 4. Deploy, apply migration `0020`, flip flags: yours (B6).
 
@@ -127,3 +127,10 @@ B1 Google OAuth client + consent · B2 GitHub App webhook secret file + public r
 ## Independent review of PR #339 (2026-10-28) and dispositions
 Fixed: repair-gate attempt and open-repair-PR budgets now enforced from the incident board (an untracked incident waits for a human); review pagination fails closed and the PR author's own approval does not count; refused approvals no longer end a proposal, project scope applies to approve/reject, proposal payloads are typed and capped so approvers see all of it; egress gate must allow content on a custom model's own route AND the shared upstream; incident-board rebuild re-arms after ingest was off; tombstones scrub relationship evidence anchors; attachment triage decodes PDF `#xx` names, quarantines PDFs with compressed object streams (cannot be fully inspected), flags OOXML `TargetMode="External"` relationships and backslash/drive-letter traversal.
 Documented limitations (not fixed): reviewer model family is self-reported by the session record; `pr_commits_verified` accepts any GitHub-verified signature, not a trusted-key check; commits' pushers are not excluded from approvers; the egress gate only protects callers that tag `X-Herdr-Data-Class` (untagged requests are not gated); PDF scanning does not open object streams.
+
+## Pass 5: audit of repair_policy.py / repair_gate.py (2026-10-28, by the implementing agent at the owner's request; not an independent reader)
+Findings fixed: any edit under test paths (incl. unverified fixtures) is now high risk, since a repair can turn CI green by weakening the check; `docs/specs/**` is protected (specs steer agents); paths are normalised (`..`, backslashes) before matching; an unknown or malformed head SHA requires a human; `BLOCKED` can no longer jump to `AUTHORIZED` (only `AWAITING_APPROVAL` can); an unknown PR author login means no approval counts.
+Verified, no change needed: ingestion cannot write `pr_gate`/`ci_fix` streams; gate exceptions fail closed; approvals need a person with owner/member/collaborator association on the exact head.
+Limitations: the gate only applies to branches named `herdr-ci-fix/*`; required checks are the checks present (main has no branch protection to compare with); commit signatures are not checked against trusted keys; the circuit breaker is in memory.
+## Pass 5: proposal executor
+`intel_executor.py`: runs only with `enabled` + `execute` and no kill switch; atomic claim (second run refused); payload re-hashed; strict per-action schema; `link_entities` (human_verified relationship), `pause_ingestion`, `request_ci_repair` (existing CI-fix request, idempotent on proposal id) are wired; `propose_issue` needs a hook that does not exist yet.
