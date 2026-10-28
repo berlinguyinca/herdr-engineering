@@ -20,9 +20,12 @@ renew() {
   if [ -r "$ACME_AWS_CREDS" ]; then
     AWS_SHARED_CREDENTIALS_FILE="$ACME_AWS_CREDS" AWS_CONFIG_FILE=/dev/null AWS_DEFAULT_REGION=us-east-1 \
       "$ENG" devfabric cert renew --domain "$DOMAIN"
+  elif [ "${FABRIC_ACME_ALLOW_AMBIENT_AWS:-0}" = 1 ]; then
+    "$ENG" devfabric cert renew --domain "$DOMAIN"        # operator-run install only: the operator's own credentials
   else
-    echo "WARNING: $ACME_AWS_CREDS missing; renewing with whatever AWS credentials the environment has" >&2
-    "$ENG" devfabric cert renew --domain "$DOMAIN"
+    # Fail closed: a timer must never quietly fall back to a personal or broader key.
+    echo "ERROR: $ACME_AWS_CREDS is missing or unreadable; refusing to renew with ambient AWS credentials" >&2
+    return 1
   fi
   if [ -n "$TS_NAME" ]; then
     mkdir -p "$BASE/tailnet-cert"; chmod 700 "$BASE/tailnet-cert"
@@ -63,7 +66,7 @@ case "${1:-}" in
     "$ENG" devfabric ca status | grep -q '"ca": true' || "$ENG" devfabric ca init
     [ -f "$BASE/ca/gateway.pem" ] || "$ENG" devfabric ca issue
     "$ENG" devfabric cert issue --domain "$DOMAIN"
-    renew
+    FABRIC_ACME_ALLOW_AMBIENT_AWS=1 renew
     install_timer
     say "installed. Export the dev.lan root for devices with: $ENG devfabric ca export --out <dir>"
     ;;
