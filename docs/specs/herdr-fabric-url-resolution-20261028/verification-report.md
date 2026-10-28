@@ -38,7 +38,11 @@ Legend: **Automated** = a test in this repo exercises it. **Partial** = automate
 Python fabric suites: 70 tests pass (includes 7 failover, 12 access, 8 TLS gateway, 7 CA, 59 resolver/gateway). JS: client suite 690 pass.
 Pre-existing, unrelated failures (also fail on unrelated PRs): `ci-observability-view.test.js` (missing `playwright` locally) and the CI `ui-gates`
 visual-baseline job (pixel diffs on the collab pages; its own header says it was never validated on an agent). PRs touching `packages/**` merged with that job red for this reason.
-One failover test failed once in a combined local run and did not reproduce in 5 further runs (likely port contention with a concurrent run); watch it.
+Follow-up test pass (branch `test/fabric-url-gaps`): CLI wiring (`tests/test_fabric_cli.py`, including that `control-plane web` hands the fabric helpers to the server),
+Playwright UI tests of the session workspace (`tests/playwright/fabric-links.test.mjs`: canonical link, hover title, clipboard copy, unreachable non-link, stream-settle re-render,
+gateway-down), and a failover test driven by the real background loop. Wiring tests were mutation-checked (breaking the wiring makes them fail).
+The earlier one-off failover failure could not be reproduced in 18 stressed runs; its two plausible causes (the probe thread racing hand-driven steps, and re-binding a released ephemeral port) were removed
+(`auto_ha=False` for hand-driven tests, no port reuse).
 
 ## Rollout
 Everything new is opt-in except one behavior change: lease registration now refuses `target_host` outside loopback/tailnet unless allow-listed.
