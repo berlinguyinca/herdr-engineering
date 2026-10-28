@@ -110,7 +110,7 @@ Routes: `GET /api/v1/intelligence/{status,projects,investigations,relationships?
 ## Blockers needing a user action
 B1 Google OAuth client + consent · B2 GitHub App webhook secret file + public receiver URL · B3 transactional email channel · B4 iPhone device auth scheme / Rakazo compatibility · B5 API key to read live `/api/v1/health` · B6 any deploy, live-DB migration, or flag flip.
 
-## Final verification (2026-10-28, after second pass)
-- Control-plane + root + review-gate suites, 12 parallel shards: 7387 passed, 1 failed under load (`test_ci_monitor.py::test_unrelated_http_request_completes_while_provider_is_blocked`, a timing test; passes alone, 18/18), skips pre-existing. Integration on private Postgres: 13 pass.
-- `npm test` UI contracts re-run for calm, dark-theme, skeletons, freshness-all and project-intelligence (9 tests): all pass except the same 3 that fail on clean origin/main; none involve `/intelligence`.
+## Final verification (2026-10-28, after third pass)
+- Control-plane + root + review-gate suites, 10 parallel shards: 7397 passed, 2 xfailed, skips pre-existing, every shard EXIT=0. Integration on private Postgres: 13 pass.
+- `npm run test:client`: 707 pass. Playwright: all 14 project-intelligence tests pass (including the accessibility audit in 3 themes/sizes); calm, dark-theme, skeletons and freshness-all show the same 3 failures as clean origin/main, none on `/intelligence`.
 - Nothing pushed, merged or deployed. Acceptance criteria are NOT fully met: see Remaining work and blockers B1-B6.
