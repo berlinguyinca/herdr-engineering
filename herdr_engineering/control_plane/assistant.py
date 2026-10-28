@@ -74,6 +74,8 @@ def assistant_config(cfg: dict[str, Any]) -> dict[str, Any]:
     computer = computer if isinstance(computer, dict) else {}
     inference = section.get("inference") if isinstance(section, dict) else None
     inference = inference if isinstance(inference, dict) else {}
+    persistence = section.get("persistence") if isinstance(section, dict) else None
+    persistence = persistence if isinstance(persistence, dict) else {}
     return {
         "enabled": bool(section.get("enabled", False)),
         "approval_ttl_seconds": int(section.get("approval_ttl_seconds", 3600)),
@@ -98,6 +100,12 @@ def assistant_config(cfg: dict[str, Any]) -> dict[str, Any]:
             "timeout": int(inference.get("timeout", 60)),
             "model": str(inference.get("model", "")),
             "api_key": str(inference.get("api_key", "")),  # never logged
+        },
+        # optional durable Postgres persistence (herdr_pa). When ``dsn`` is set,
+        # the assistant store snapshots itself to pa_store_snapshot on every
+        # mutation and reloads it on startup.
+        "persistence": {
+            "dsn": str(persistence.get("dsn", "")),
         },
     }
 
@@ -584,6 +592,69 @@ def _urllib_transport(url: str, method: str, headers: dict[str, str],
         return {"status": resp.status, "body": resp.read().decode(errors="replace")}
 
 
+class StoreBackend:
+    """Durable persistence for the assistant store snapshot."""
+    def persist(self, snapshot: dict[str, Any]) -> None:
+        raise NotImplementedError
+
+    def load(self) -> dict[str, Any] | None:
+        raise NotImplementedError
+
+
+class PostgresStoreBackend(StoreBackend):
+    """Sync Postgres backend: upserts the store snapshot into ``pa_store_snapshot``.
+
+    Uses psycopg2 (sync) because the assistant service is synchronous. A
+    connection factory is injectable for tests. Credentials come from the DSN
+    and are never logged. On any failure persist is a no-op that does not raise,
+    so a transient DB issue never crashes a chat run.
+    """
+    KEY = "assistant"
+
+    def __init__(self, dsn: str, connect: Callable | None = None):
+        self._dsn = dsn
+        self._connect = connect
+
+    def _open(self):
+        if self._connect is not None:
+            return self._connect()
+        import psycopg2
+        return psycopg2.connect(self._dsn)
+
+    def persist(self, snapshot: dict[str, Any]) -> None:
+        try:
+            conn = self._open()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "INSERT INTO pa_store_snapshot (key, data, updated_at) "
+                        "VALUES (%s, %s::jsonb, now()) "
+                        "ON CONFLICT (key) DO UPDATE SET data=EXCLUDED.data, updated_at=now()",
+                        (self.KEY, json.dumps(snapshot, default=str)))
+                conn.commit()
+            finally:
+                conn.close()
+        except Exception:  # noqa: BLE001 - never fail a chat run on a DB blip
+            pass
+
+    def load(self) -> dict[str, Any] | None:
+        try:
+            conn = self._open()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT data FROM pa_store_snapshot WHERE key=%s", (self.KEY,))
+                    row = cur.fetchone()
+                if not row:
+                    return None
+                data = row[0]
+                # psycopg2 may hand back jsonb already parsed as a dict, or a str
+                return data if isinstance(data, (dict, list)) else json.loads(data)
+            finally:
+                conn.close()
+        except Exception:  # noqa: BLE001
+            return None
+
+
 class ConnectorAdapter:
     """Versioned adapter a connector kind must implement.
 
@@ -704,8 +775,10 @@ class AssistantStore:
     process restart. A Postgres backend remains a deployment concern.
     """
 
-    def __init__(self, persist_path: str | None = None) -> None:
+    def __init__(self, persist_path: str | None = None,
+                 persist_backend: StoreBackend | None = None) -> None:
         self._persist_path = persist_path
+        self._persist_backend = persist_backend
         self.assistants: dict[str, Assistant] = {}
         self.threads: dict[str, AssistantThread] = {}
         self.messages: dict[str, AssistantMessage] = {}
@@ -726,6 +799,8 @@ class AssistantStore:
     def _after_mutation(self) -> None:
         if self._persist_path:
             self.persist()
+        if self._persist_backend is not None:
+            self._persist_backend.persist(self.snapshot())
 
     @staticmethod
     def _e_to_dict(e: Any) -> dict[str, Any]:
@@ -801,10 +876,13 @@ class AssistantStore:
         os.replace(tmp, path)
 
     def load_persisted(self) -> None:
-        if not self._persist_path or not os.path.exists(self._persist_path):
-            return
-        with open(self._persist_path) as f:
-            self.restore(json.load(f))
+        if self._persist_path and os.path.exists(self._persist_path):
+            with open(self._persist_path) as f:
+                self.restore(json.load(f))
+        if self._persist_backend is not None:
+            snap = self._persist_backend.load()
+            if snap is not None:
+                self.restore(snap)
 
     # -- audit --------------------------------------------------------------
     def audit_record(self, *, tenant_id: str, user_id: str, actor: str,
@@ -1078,8 +1156,16 @@ class AssistantService:
                  config: dict[str, Any] | None = None,
                  runner: RuntimeAdapter | None = None,
                  now: Callable[[], datetime] | None = None):
-        self.store = store or AssistantStore()
         self.config = config or assistant_config({})
+        if store is not None:
+            self.store = store
+        else:
+            backend = None
+            dsn = (self.config.get("persistence") or {}).get("dsn")
+            if dsn:
+                backend = PostgresStoreBackend(dsn)
+            self.store = AssistantStore(persist_backend=backend)
+            self.store.load_persisted()
         self.now = now or _now
         if runner is not None:
             self.runner = runner

@@ -11,6 +11,7 @@ Covers the blocking security/privacy controls from the spec bundle
 - idempotency of tool actions
 - memory delete / export propagation
 """
+import os
 from datetime import UTC, datetime, timedelta
 from unittest.mock import patch
 
@@ -27,6 +28,7 @@ from herdr_engineering.control_plane.assistant import (
     HttpModelRunnerAdapter,
     MCPConnectorAdapter,
     OpenApiConnectorAdapter,
+    PostgresStoreBackend,
     RateLimited,
     assistant_config,
     redact_secrets,
@@ -848,3 +850,74 @@ def test_service_builds_http_runner_when_endpoint_configured():
                                                    "inference": {"endpoint": "https://m.example.com/v1"}}})
     svc = AssistantService(config=cfg)
     assert isinstance(svc.runner, HttpModelRunnerAdapter)
+
+
+# ---------------------------------------------------------------------------
+# Postgres store backend (utilize herdr_pa)
+# ---------------------------------------------------------------------------
+
+def _make_pg_fake(bucket):
+    """Return a psycopg2 connect() that shares an in-memory json 'table'."""
+    class _Mem:
+        def __init__(self):
+            self._rows = [(bucket.get("data", "{}"),)]
+            self.executed = []
+        def execute(self, sql, params=None):
+            self.executed.append((sql, params))
+            if sql.startswith("INSERT"):
+                bucket["data"] = params[1]
+            elif sql.startswith("SELECT"):
+                self._rows = [(bucket.get("data", "{}"),)]
+        def fetchone(self):
+            return self._rows[0] if bucket.get("data", "{}") != "{}" else None
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+    class _Conn:
+        def cursor(self): return _Mem()
+        def commit(self): pass
+        def close(self): pass
+    return lambda: _Conn()
+
+
+def test_postgres_backend_persist_and_load():
+    bucket = {}
+    backend = PostgresStoreBackend("postgresql://u:p@h:5432/db", connect=_make_pg_fake(bucket))
+    backend.persist({"assistants": [{"assistant_id": "a1"}]})
+    snap = backend.load()
+    assert snap == {"assistants": [{"assistant_id": "a1"}]}
+    assert backend.load() == {"assistants": [{"assistant_id": "a1"}]}
+
+
+def test_postgres_backend_persist_never_raises():
+    def connect():
+        raise RuntimeError("db down")
+    backend = PostgresStoreBackend("postgresql://u:p@h:5432/db", connect=connect)
+    backend.persist({"x": 1})  # must not raise
+    assert backend.load() is None
+
+
+def test_store_with_pg_backend_survives_restart():
+    bucket = {}
+    backend = PostgresStoreBackend("postgresql://u:p@h:5432/db", connect=_make_pg_fake(bucket))
+    store = AssistantStore(persist_backend=backend)
+    svc = AssistantService(config=assistant_config({"personal_assistant": {"enabled": True}}), store=store)
+    svc.create_assistant(tenant_id="t1", user_id="u1", name="Helper")
+    store2 = AssistantStore(persist_backend=PostgresStoreBackend("postgresql://u:p@h:5432/db",
+                                                                 connect=_make_pg_fake(bucket)))
+    store2.load_persisted()
+    assert next(iter(store2.assistants.values())).name == "Helper"
+
+
+@pytest.mark.integration
+def test_postgres_backend_real_roundtrip():
+    """Requires a live Postgres with the pa_store_snapshot table (PA_PG_DSN)."""
+    dsn = os.environ.get("PA_PG_DSN")
+    if not dsn:
+        pytest.skip("PA_PG_DSN not set")
+    backend = PostgresStoreBackend(dsn)
+    store = AssistantStore(persist_backend=backend)
+    svc = AssistantService(config=assistant_config({"personal_assistant": {"enabled": True}}), store=store)
+    svc.create_assistant(tenant_id="t9", user_id="u9", name="ITest")
+    fresh = AssistantStore(persist_backend=PostgresStoreBackend(dsn))
+    fresh.load_persisted()
+    assert any(x.name == "ITest" for x in fresh.assistants.values())
