@@ -59,6 +59,12 @@ test('real analyzer output: notices, drilldown to symbol and source line, edge e
   await page.locator('[data-node="package:app"]').first().click();
   await page.locator('[data-node="module:app.core"]').waitFor();
   assert.ok(await page.locator('path.arch-edge').count() >= 2, 'aggregated import edges are drawn');
+  assert.equal(await page.locator('path.arch-edge.calls').count(), 0, 'imports are the default edge kind');
+  await page.locator('[data-edgekind]').selectOption('calls');
+  await page.locator('path.arch-edge.calls').first().waitFor();                 // core.run() -> util.helper()
+  assert.match(await page.locator('path.arch-edge.calls title').first().textContent(), /\d+ calls?/);
+  assert.equal(await page.locator('path.arch-edge.imports').count(), 0);
+  await page.locator('[data-edgekind]').selectOption('imports');
   await page.locator('[data-node="module:app.core"]').click();
   await page.locator('[data-node="class:app.core.Engine"]').waitFor();
   await page.locator('[data-open="function:app.core.run"]').click();

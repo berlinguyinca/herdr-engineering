@@ -19,7 +19,7 @@ export function sourceUrl(snapshot, node) {
 export function snapshotNotices(snapshot, all = []) {
   const out = [];
   if (!snapshot) return out;
-  if (snapshot.completeness !== 'complete') out.push({kind: 'partial', text: 'Partial snapshot: some languages or edge kinds are not analysed.'});
+  if (snapshot.completeness !== 'complete') out.push({kind: 'partial', text: 'Partial snapshot: some languages are not analysed, or a limit was reached.'});
   const newer = all.find(s => s.repository_id === snapshot.repository_id && s.snapshot_id !== snapshot.snapshot_id && s.created_at > snapshot.created_at);
   if (newer) out.push({kind: 'stale', text: `Stale: a newer snapshot exists (${newer.commit_sha.slice(0, 8)}).`});
   return out;
@@ -69,7 +69,7 @@ const label = s => `${text(s.repository_id).replace(/^github\.com\//, '')} @ ${t
 
 export function mountArchitecture(root, client, opts = {}) {
   let alive = true, ctl = new AbortController();
-  const st = {snapshots: [], sid: opts.snapshot || '', parent: opts.parent || '', q: opts.q || '', page: null, detail: null, diff: null,
+  const st = {edgeKind: 'imports', snapshots: [], sid: opts.snapshot || '', parent: opts.parent || '', q: opts.q || '', page: null, detail: null, diff: null,
     analyses: [], cursor: null, caps: [], extras: null, timeline: null, cross: null, explain: null, maps: [], request: null, corr: null, rooms: null, cancels: {}};
   root.innerHTML = `<div class="arch">${skeleton('architecture')}</div>`;
   const host = root.firstElementChild;
@@ -111,10 +111,13 @@ export function mountArchitecture(root, client, opts = {}) {
   function graphSvg() {
     const p = st.page;
     if (!p || st.q || !p.nodes.length) return '';
-    const L = layoutGraph(p.nodes.map(n => ({id: n.node_id, n})), p.edges.map(e => ({from: e.from_id, to: e.to_id, count: e.count, e})));
-    const edges = L.edges.map(e => `<path class="arch-edge${e.back ? ' back' : ''}" d="${e.d}" marker-end="url(#arch-arrow)"><title>${esc(`${e.from} → ${e.to} (${e.count} import${e.count === 1 ? '' : 's'}${e.e.inferred ? ', inferred' : ''})`)}</title></path>`).join('');
+    const shown = p.edges.filter(e => st.edgeKind === 'all' || e.kind === st.edgeKind);
+    const L = layoutGraph(p.nodes.map(n => ({id: n.node_id, n})), shown.map(e => ({from: e.from_id, to: e.to_id, count: e.count, e})));
+    const noun = {imports: 'import', calls: 'call'};
+    const edges = L.edges.map(e => `<path class="arch-edge ${esc(e.e.kind)}${e.back ? ' back' : ''}" d="${e.d}" marker-end="url(#arch-arrow)"><title>${esc(`${e.from} → ${e.to} (${e.count} ${noun[e.e.kind] || e.e.kind}${e.count === 1 ? '' : 's'}${e.e.inferred ? ', inferred' : ''})`)}</title></path>`).join('');
+    const kinds = `<label class="arch-edgekind">Edges <select data-edgekind>${[['imports', 'Imports'], ['calls', 'Calls'], ['all', 'Imports and calls']].map(([v, t]) => `<option value="${v}"${st.edgeKind === v ? ' selected' : ''}>${t}</option>`).join('')}</select></label>`;
     const nodes = L.nodes.map(v => `<g class="arch-node kind-${esc(v.n.kind)}" transform="translate(${v.x},${v.y})" tabindex="0" role="button" data-node="${esc(v.id)}" aria-label="${esc(`${v.n.kind} ${v.n.qualified_name}${v.n.child_count ? ', ' + v.n.child_count + ' children, press Enter to open' : ''}`)}"><rect width="${NODE_W}" height="${NODE_H}" rx="6"/><text x="10" y="19" class="t1">${esc(v.n.qualified_name.split('.').pop().slice(0, 24))}</text><text x="10" y="35" class="t2">${esc(v.n.kind)}${v.n.child_count ? ` · ${v.n.child_count}` : ''}</text></g>`).join('');
-    return `<div class="arch-graph" data-testid="arch-graph"><svg viewBox="0 0 ${L.width} ${L.height}" width="${L.width}" height="${L.height}" role="group" aria-label="Dependency graph of the ${p.nodes.length} items below; the table lists the same items"><defs><marker id="arch-arrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L8,4 L0,8 z"/></marker></defs>${edges}${nodes}</svg></div>${L.hidden ? `<p class="arch-note">Showing the ${L.nodes.length} best-connected of ${p.nodes.length} items in the graph; the table has all of them.</p>` : ''}`;
+    return `${kinds}<div class="arch-graph" data-testid="arch-graph"><svg viewBox="0 0 ${L.width} ${L.height}" width="${L.width}" height="${L.height}" role="group" aria-label="Dependency graph of the ${p.nodes.length} items below; the table lists the same items"><defs><marker id="arch-arrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L8,4 L0,8 z"/></marker></defs>${edges}${nodes}</svg></div>${L.hidden ? `<p class="arch-note">Showing the ${L.nodes.length} best-connected of ${p.nodes.length} items in the graph; the table has all of them.</p>` : ''}`;
   }
   function crumbs() {
     const d = st.detail?.ancestors || [];
@@ -296,6 +299,7 @@ export function mountArchitecture(root, client, opts = {}) {
   });
   host.addEventListener('change', async ev => {
     if (ev.target.matches('[data-snap]')) { st.sid = ev.target.value; st.parent = ''; st.q = ''; st.detail = null; st.diff = null; await browse(); }
+    if (ev.target.matches('[data-edgekind]')) { st.edgeKind = ev.target.value; render(); }
     if (ev.target.matches('[data-diff]')) {
       st.diff = null;
       if (ev.target.value) try { st.diff = await client.diffArchitecture(ev.target.value, st.sid, {signal: ctl.signal}); } catch (e) { return fail(e); }
