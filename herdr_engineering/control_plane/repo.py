@@ -2959,7 +2959,17 @@ class ControlPlaneRepo:
         return {"keys": [{"key_id": k["key_id"], "project": k["project"],
                           "key_hash": k["key_hash"], "label": k.get("label", "")}
                          for k in self._llm_keys() if not k.get("revoked")],
-                "custom_models": list(self.list_custom_models().values())}
+                "custom_models": list(self.list_custom_models().values()),
+                "egress": self._egress_config()}
+
+    egress_fn = None   # set by the API: () -> operator YAML egress routes (project_intelligence.egress)
+
+    def _egress_config(self):
+        try:
+            value = self.egress_fn() if self.egress_fn else {}
+        except Exception:
+            return {}
+        return value if isinstance(value, dict) else {}
 
     # ------------------------------------------------------------- analytics
     def mission_analytics(self):
@@ -3366,7 +3376,7 @@ USAGE_ERROR_CLASSES = frozenset({
     "auth_invalid_key", "request_invalid", "request_too_large", "model_project_mismatch",
     "model_not_registered", "proxy_backpressure", "upstream_admission",
     "upstream_rejected_metadata", "upstream_client_error", "upstream_server_error",
-    "upstream_unreachable", "stream_truncated", "client_disconnected"})
+    "upstream_unreachable", "stream_truncated", "client_disconnected", "egress_denied"})
 _USAGE_ID = re.compile(r"^[A-Za-z0-9\-_.:/]{1,128}$")
 
 
