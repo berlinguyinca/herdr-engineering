@@ -1,0 +1,153 @@
+"""Assistant-facing adapter for project intelligence (spec 01 "Assistant tools", 04 "Assistant actions").
+
+* Read tools run under the *caller's* ``Viewer``; the adapter has no authority of its own.
+* ``navigate`` emits a typed, allowlisted deep link, never free text. Unknown kinds/filters are refused.
+* ``ActionBoard`` records proposals only. An approval binds approver, exact payload hash, expected resource
+  version and expiry; any mismatch refuses. Nothing here executes an action: execution stays with the existing
+  services (ci_fix, review_gate) behind ``repair_policy`` — an approved proposal is permission to ask them.
+* Notifications are planned, deduped and quiet-hour aware; sending is a separate privileged channel (blocker B3).
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import uuid
+from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
+from urllib.parse import urlencode
+
+from . import project_intelligence as pi
+
+ROUTES = {"timeline": "#/intelligence", "event": "#/intelligence", "approval": "#/attention"}
+FILTER_KEYS = frozenset({"project", "event", "source", "category", "as_of"})
+_ID = 200
+
+
+def navigate(kind: str, **filters: str) -> str:
+    """Typed deep link for browser and iPhone clients; refuses anything outside the allowlisted schema."""
+    base = ROUTES.get(kind)
+    if base is None:
+        raise ValueError(f"unknown navigation kind {kind!r}")
+    bad = set(filters) - FILTER_KEYS
+    if bad:
+        raise ValueError(f"unsupported filter(s): {sorted(bad)}")
+    clean = {k: str(v) for k, v in filters.items() if v not in (None, "")}
+    if any(len(v) > _ID or "\n" in v for v in clean.values()):
+        raise ValueError("filter value is too long or malformed")
+    if kind in ("timeline", "event") and "project" not in clean:
+        raise ValueError("project is required")
+    if kind == "event" and "event" not in clean:
+        raise ValueError("event is required")
+    return base + (f"?{urlencode(clean)}" if clean else "")
+
+
+class ReadTools:
+    """``herdr.projects.search``, ``herdr.timeline.query``, ``herdr.evidence.open``, ``herdr.dashboard.navigate``."""
+
+    def __init__(self, store: pi.IntelligenceStore):
+        self._s = store
+
+    def projects_search(self, viewer: pi.Viewer, text: str = "") -> list[dict]:
+        t = text.lower()
+        return [{"id": r.id, "name": r.name, "link": navigate("timeline", project=r.id)}
+                for r in self._s.records("project", viewer) if t in r.name.lower() or t in r.id.lower()]
+
+    def timeline_query(self, viewer: pi.Viewer, project_id: str, **kw) -> dict:
+        out = self._s.timeline(viewer, project_id=project_id, **kw)
+        for item in out["items"]:
+            item["link"] = navigate("event", project=project_id, event=item["event_id"])
+        return out
+
+    def evidence_open(self, viewer: pi.Viewer, project_id: str, event_id: str) -> dict:
+        """Evidence is returned only if the event is visible to the caller; otherwise indistinguishable from absent."""
+        for item in self._s.timeline(viewer, project_id=project_id, limit=500)["items"]:
+            if item["event_id"] == event_id:
+                return {"event_id": event_id, "evidence_refs": item["evidence_refs"], "label": item["label"],
+                        "link": navigate("event", project=project_id, event=event_id)}
+        raise pi.NotFound("event")
+
+
+def payload_hash(payload: dict) -> str:
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+@dataclass
+class Proposal:
+    id: str
+    org_id: str
+    requester: str
+    action: str
+    payload: dict
+    payload_sha256: str
+    resource_version: int
+    expires_at: datetime
+    state: str = "awaiting_approval"      # awaiting_approval | approved | refused | expired
+    approver: str | None = None
+    rollback_available: bool = False
+    history: list[str] = field(default_factory=list)
+
+
+ACTIONS = frozenset({"request_ci_repair", "propose_issue", "link_entities", "pause_ingestion"})
+
+
+class ActionBoard:
+    def __init__(self, clock=lambda: datetime.now(UTC), ttl: timedelta = timedelta(minutes=30)):
+        self._clock, self._ttl = clock, ttl
+        self._p: dict[str, Proposal] = {}
+
+    def request(self, *, org_id: str, requester: str, action: str, payload: dict, resource_version: int,
+                rollback_available: bool = False) -> Proposal:
+        if action not in ACTIONS:
+            raise pi.IntelligenceError(f"action {action!r} is not allowed")
+        p = Proposal("act_" + uuid.uuid4().hex, org_id, requester, action, payload, payload_hash(payload), resource_version,
+                     self._clock() + self._ttl, rollback_available=rollback_available)
+        self._p[p.id] = p
+        return p
+
+    def approve(self, proposal_id: str, *, approver: str, org_id: str, payload_sha256: str, resource_version: int) -> Proposal:
+        p = self._p.get(proposal_id)
+        if p is None or p.org_id != org_id:
+            raise pi.NotFound("proposal")
+        if p.state != "awaiting_approval":
+            raise pi.Conflict(f"proposal is {p.state}")
+        if self._clock() > p.expires_at:
+            p.state = "expired"
+            raise pi.Conflict("approval window expired")
+        if approver == p.requester:
+            p.state = "refused"; p.history.append("self-approval refused")
+            raise pi.Conflict("requester cannot approve their own proposal")
+        if payload_sha256 != p.payload_sha256 or resource_version != p.resource_version:
+            p.state = "refused"; p.history.append("approval did not match the exact payload/version")
+            raise pi.Conflict("approval does not match the proposed payload or resource version")
+        p.state, p.approver = "approved", approver
+        return p
+
+
+@dataclass(frozen=True)
+class Notice:
+    key: str
+    priority: str          # urgent | normal
+    text: str
+    link: str
+
+
+class NotificationPlanner:
+    """Plans, never sends. Same key never re-notifies; quiet hours hold normal notices for the digest."""
+
+    def __init__(self, quiet_start: int = 22, quiet_end: int = 7):
+        self._qs, self._qe = quiet_start, quiet_end
+        self._sent: set[str] = set()
+        self.digest: list[Notice] = []
+
+    def _quiet(self, now: datetime) -> bool:
+        h = now.hour
+        return (h >= self._qs or h < self._qe) if self._qs > self._qe else self._qs <= h < self._qe
+
+    def plan(self, n: Notice, now: datetime) -> str:
+        if n.key in self._sent:
+            return "duplicate"
+        self._sent.add(n.key)
+        if n.priority == "urgent" or not self._quiet(now):
+            return "send_now"
+        self.digest.append(n)
+        return "held_for_digest"
