@@ -3,7 +3,8 @@
 ## Final status — 2026-10-28
 
 Deployed and verified release `badc3f7afc0539fa56cb8c10be780e4f6985ce94`.
-PRs #306 and #309 are merged; deployed application source matches main.
+PRs #306 and #309 are merged. Production is pinned to the verified commit above;
+newer independent main commits are not implied to be deployed.
 Web, worker, LLM proxy, public collaboration, and edge are running with zero
 restarts. Canonical fleet configuration is mounted read-only, matches the
 protected candidate snapshot, and immutable image/config provenance is verified.
@@ -37,6 +38,20 @@ retained replay must not be replaced with event-type filters. The separate
 610-second read-only preflight performed **two** complete hydrations and is not
 a single-startup benchmark. Protected rollback was exercised successfully during
 the first rollout failure before the final successful deployment.
+
+Later independent deployment attempts interrupted startup and recreated the
+verified image again. Docker events show manual stops, not application crashes;
+the legacy one-minute readiness default is shorter than the measured replay.
+The deployer now defaults to 300 probes at two-second intervals (about ten
+minutes), retaining environment overrides. A delayed-readiness regression failed
+with the former 30-probe default and passed with the new budget. Only that default
+was also updated in the canonical and mission-UI legacy entry points; private
+backups preserve every original byte and all other local edits remain intact.
+This deployment-tool change does not require another application restart.
+The verified release subsequently became healthy again with 413 sessions and
+zero naming conflicts, confirming the corrected names survive an actual restart.
+All 84 deployment/compose checks passed with this default, including the delayed
+readiness case; callers can still explicitly override the budget.
 
 Durable private evidence, screenshots, live measurements, and reconciliation
 backups are under
