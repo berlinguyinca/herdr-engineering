@@ -714,6 +714,9 @@ class FabricClient:
     def resolve(self, port: int) -> dict[str, Any]:
         return self._req("GET", f"/resolve/{port}")
 
+    def resolve_urls(self, urls: list[str], source_machine: str | None = None) -> dict[str, Any]:
+        return self._req("POST", "/resolve-urls", {"urls": urls, "source_machine": source_machine})
+
     def healthz(self) -> dict[str, Any]:
         return self._req("GET", "/healthz")
 

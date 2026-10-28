@@ -62,3 +62,13 @@ Canonical scheme stays `http` (`public_scheme`) until PR 3 binds a TLS listener 
 before it exists would hand out dead links.
 Deployment note: registration of non-loopback, non-tailnet targets (e.g. LAN IPs via `--host`) is now
 refused unless allow-listed; no such registrant exists in-repo (agents use the tailnet IP).
+
+## PR 2 status (browser integration)
+Shipped: `renderMarkdown(..., {urls})` hook (resolver supplies the href, re-validated with `parseWebUrl`;
+code spans/fences never rewritten); `fabric-urls.js` cache + batch resolver; control-plane
+`POST /api/v1/fabric/resolve-urls` and `GET /api/v1/fabric/services`; hover details, copy-original /
+copy-fabric buttons (always visible on touch devices); unresolved loopback URLs render as a non-link with the
+reason; searchable `#/fabric-services` page. Wired into the session workspace (source host = session host).
+Not yet wired: collab chat, notifications, artifacts, terminal OSC 8 (PR 5 covers terminal/streaming;
+remaining renderers call the same `urls` option).
+Deferred from the PR 1 note: `origin_port` on leases is still open.
