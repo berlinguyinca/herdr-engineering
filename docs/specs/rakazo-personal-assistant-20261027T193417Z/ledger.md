@@ -30,6 +30,28 @@ ruff check ... assistant.py api.py tests/...
 Regression: core control-plane tests still pass (97 backend incl. assistant).
 UI re-rendered at 1280/375 with the Routines tab; DOM dump confirms it.
 
+## 2026-10-28 — P5 voice/mobile + P6 hardening
+
+### P5 — voice and mobile
+- `packages/voice.js`: pure capability helpers + `createVoiceInput` (Web Speech
+  Recognition) and `speak` (SpeechSynthesis), both degrading to text-only.
+- Chat composer: mic (voice input) + speaker (voice output) buttons; hidden when
+  the browser lacks the API.
+- Mobile CSS: 480px media query (stacked composer, full-width controls,
+  comfortable touch targets). Verified at 375px and 1280px.
+
+### P6 — hardening
+- `redact_secrets()` scrubs auth headers / api keys / tokens / passwords / secrets;
+  applied to the audit log (action + detail) and, defense-in-depth, to connector
+  errors in `connector_request`.
+- Input/config validation: connector `base_url` + allowlist origins must be https;
+  routine timezone must resolve via `zoneinfo`; interval amount range-checked.
+- Per-key fixed-window rate limiter (`max_requests_per_minute`, default 120) wired
+  into the assistant GET/POST handlers; HTTP 429 on exceed (`RateLimited`).
+- Cross-user isolation tests for connectors/routines/delegations.
+- Tests: +7 unit (redaction, validation, isolation, rate limit), +1 contract (429),
+  +7 client (voice). 127 backend, 266 client green; ruff clean.
+
 ## 2026-10-28 — P4 connectors, computer tools, delegation
 
 ### What was added

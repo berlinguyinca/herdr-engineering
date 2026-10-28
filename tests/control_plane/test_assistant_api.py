@@ -289,6 +289,25 @@ def test_delegation_create_list_cancel(server):
     assert json.loads(body)["status"] == "cancelled"
 
 
+def test_rate_limit_returns_429():
+    # a low cap so a handful of calls trips the limiter -> HTTP 429
+    cfg = assistant_config({"personal_assistant": {"enabled": True,
+                                                   "max_requests_per_minute": 2}})
+    assistant = AssistantService(config=cfg)
+    repo = ControlPlaneRepo()
+    svr = ControlPlaneServer(repo, assistant_service=assistant)
+    t = threading.Thread(target=svr.serve, daemon=True); t.start(); svr.wait_ready() if hasattr(svr, 'wait_ready') else svr.wait_until_ready()
+    c = Client(svr.port)
+    try:
+        for _ in range(2):
+            assert c.get("/api/v1/assistants", headers=_uid())[0] == 200
+        status, body = c.get("/api/v1/assistants", headers=_uid())
+        assert status == 429
+        assert json.loads(body)["code"] == "rate_limited"
+    finally:
+        svr.shutdown()
+
+
 def test_diagnostics(server):
     _, body = server.post("/api/v1/assistants", {"name": "Helper"}, headers=_uid())
     aid = json.loads(body)["assistant_id"]

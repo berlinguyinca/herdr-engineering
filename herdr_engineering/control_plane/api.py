@@ -2402,10 +2402,11 @@ def _make_handler(server, public=False, operator=False):
             return tenant, uid
 
         def _assistant_get(self, parts, resource):
-            from .assistant import AssistantNotFound, AssistantUnavailable
+            from .assistant import AssistantNotFound, AssistantUnavailable, RateLimited
             try:
                 tenant_id, user_id = self._assistant_scope()
                 svc = server.assistant
+                svc.check_rate_limit(key=f"{tenant_id}:{user_id}")
                 if resource == "assistants":
                     if len(parts) == 4:
                         return self._json({"assistants": [a.as_dict() for a in
@@ -2474,6 +2475,8 @@ def _make_handler(server, public=False, operator=False):
                 return self._json({"error": "not found"}, 404)
             except AssistantUnavailable as exc:
                 return self._json({"error": str(exc), "code": "unavailable"}, 503)
+            except RateLimited as exc:
+                return self._json({"error": str(exc), "code": "rate_limited"}, 429)
             except (KeyError, AssistantNotFound):
                 return self._json({"error": "not found"}, 404)
             except ValueError as exc:
@@ -2485,10 +2488,12 @@ def _make_handler(server, public=False, operator=False):
                 AssistantError,
                 AssistantNotFound,
                 AssistantUnavailable,
+                RateLimited,
             )
             try:
                 tenant_id, user_id = self._assistant_scope()
                 svc = server.assistant
+                svc.check_rate_limit(key=f"{tenant_id}:{user_id}")
                 body = body or {}
                 if resource == "assistants":
                     if len(parts) == 4 and self.command == "POST":
@@ -2618,6 +2623,8 @@ def _make_handler(server, public=False, operator=False):
                                    "approval_id": exc.approval_id}, 403)
             except AssistantUnavailable as exc:
                 return self._json({"error": str(exc), "code": "unavailable"}, 503)
+            except RateLimited as exc:
+                return self._json({"error": str(exc), "code": "rate_limited"}, 429)
             except AssistantError as exc:
                 return self._json({"error": str(exc)}, 400)
             except (KeyError, AssistantNotFound):
