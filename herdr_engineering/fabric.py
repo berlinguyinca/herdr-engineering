@@ -606,7 +606,9 @@ class FabricGateway:
             # Optional same-origin routes: [{prefix, host, port}, ...]. When
             # present, the gateway edge splits this origin by path (the lease's
             # own target is the catch-all); when absent, plain 1:1 forwarding.
-            routes=body.get("routes"))
+            routes=body.get("routes"),
+            origin_port=int(body["origin_port"]) if body.get("origin_port") is not None else None,
+            network_namespace=body.get("network_namespace"))
         self.router.bind(lease.external_port, lease.target_host, lease.target_port,
                          routes=lease.routes, rewrite=self._rewrite_target(lease))
         return {"lease": lease.to_dict(), "url": self.stable_url(lease.external_port)}
@@ -662,12 +664,14 @@ class FabricGateway:
         return {"status": 200, "port": port, "lease": res.lease,
                 "url": f"http://{res.external}"}
 
-    def op_resolve_urls(self, urls: list[str], source_machine: str | None = None) -> dict[str, Any]:
+    def op_resolve_urls(self, urls: list[str], source_machine: str | None = None,
+                        source_namespace: str | None = None) -> dict[str, Any]:
         """Batch canonical-URL resolution for the dashboard (never mutates the originals)."""
         from .fabric_urls import resolve_url
         leases = [lse.to_dict() for lse in self.registry.active_leases()]
         return {"resolutions": [resolve_url(u, leases, url_base=self.url_base, source_machine=source_machine,
-                                            scheme=self.public_scheme, aliases=self.url_aliases).to_dict() for u in urls[:200]]}
+                                            scheme=self.public_scheme, aliases=self.url_aliases,
+                                            source_namespace=source_namespace).to_dict() for u in urls[:200]]}
 
     def op_names(self) -> dict[str, Any]:
         """The names a URL may carry to count as the fabric's (the browser builds its link detector from this)."""
@@ -787,7 +791,11 @@ def _make_handler(gateway: FabricGateway):
                 if not isinstance(urls, list) or not all(isinstance(u, str) for u in urls):
                     self._send(400, {"error": "urls must be a list of strings"})
                     return
-                self._send(200, gateway.op_resolve_urls(urls, body.get("source_machine")))
+                ns = body.get("source_namespace")
+                if not (ns is None or (isinstance(ns, str) and len(ns) <= 64)):
+                    self._send(400, {"error": "source_namespace must be a short string"})
+                    return
+                self._send(200, gateway.op_resolve_urls(urls, body.get("source_machine"), ns))
                 return
             if self.path == "/heartbeat":
                 lease_id = body.get("lease_id", "")
@@ -891,8 +899,12 @@ class FabricClient:
     def resolve(self, port: int) -> dict[str, Any]:
         return self._req("GET", f"/resolve/{port}")
 
-    def resolve_urls(self, urls: list[str], source_machine: str | None = None) -> dict[str, Any]:
-        return self._req("POST", "/resolve-urls", {"urls": urls, "source_machine": source_machine})
+    def resolve_urls(self, urls: list[str], source_machine: str | None = None,
+                     source_namespace: str | None = None) -> dict[str, Any]:
+        body: dict[str, Any] = {"urls": urls, "source_machine": source_machine}
+        if source_namespace:
+            body["source_namespace"] = source_namespace
+        return self._req("POST", "/resolve-urls", body)
 
     def names(self) -> dict[str, Any]:
         return self._req("GET", "/names")

@@ -60,6 +60,9 @@ def _is_loopback_host(host: str) -> bool:
 
 
 def _lease_port(lease: dict[str, Any]) -> int:
+    """The port a loopback URL names: where the app listens, which is not the forwarder's port when that was ephemeral."""
+    if lease.get("origin_port"):
+        return int(lease["origin_port"])
     return int((lease.get("target") or {}).get("port", lease.get("target_port", -1)))
 
 
@@ -78,7 +81,8 @@ def _fail(url: str, status: str, reason: str, **kw: Any) -> UrlResolution:
 
 
 def resolve_url(url: str, leases: Iterable[dict[str, Any]], *, url_base: str, source_machine: str | None = None,
-                scheme: str = "https", aliases: Iterable[str] = ()) -> UrlResolution:
+                scheme: str = "https", aliases: Iterable[str] = (),
+                source_namespace: str | None = None) -> UrlResolution:
     """Resolve ``url`` against ``leases`` as seen from ``source_machine``.
 
     A lease owned by ``source_machine`` always wins over another machine's lease on the same port.
@@ -115,10 +119,15 @@ def resolve_url(url: str, leases: Iterable[dict[str, Any]], *, url_base: str, so
         matches = [lz for lz in pool if _lease_port(lz) == port]
         if source_machine is not None:
             matches = [lz for lz in matches if _lease_machine(lz) == source_machine]
+        if source_namespace:
+            # another namespace's loopback is a different service; a lease that never recorded one stays eligible
+            matches = [lz for lz in matches if not lz.get("network_namespace") or lz["network_namespace"] == source_namespace]
     if not matches:
         return _fail(url, "unmapped", f"no active lease for port {port}", port=port, source_machine=source_machine)
     machines = {_lease_machine(lz) for lz in matches}
-    if len(matches) > 1 and (len(machines) > 1 or fabric_name):
+    # two services on one machine are only distinct when they live in different network namespaces
+    homes = {(_lease_machine(lz), lz.get("network_namespace")) for lz in matches}
+    if len(matches) > 1 and (len(machines) > 1 or len(homes) > 1 or fabric_name):
         return _fail(url, "ambiguous", f"port {port} is served by {sorted(m for m in machines if m)}",
                      port=port, source_machine=source_machine)
     lz = matches[0]

@@ -33,6 +33,8 @@ class Resolution:
 
 
 def _port(lease: dict[str, Any]) -> int:
+    if lease.get("origin_port"):
+        return int(lease["origin_port"])
     t = lease.get("target") or {}
     return int(t.get("port", lease.get("target_port", -1)))
 

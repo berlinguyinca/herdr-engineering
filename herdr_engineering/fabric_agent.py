@@ -110,6 +110,18 @@ def _apply_listener_pids(result, owners, unknown):
     return result
 
 
+def _own_net_namespace() -> str | None:
+    """Identity of this process's network namespace (Linux), e.g. ``net:[4026531840]``; None where unknown.
+
+    The agent scans listeners with ``ss`` in its own namespace, so that namespace is where every loopback port it
+    discovers lives.
+    """
+    try:
+        return os.readlink("/proc/self/ns/net")
+    except OSError:
+        return None
+
+
 def _scan_linux() -> dict[int, dict[str, Any]]:
     """Parse ``ss -ltnpH`` into {port: {"addrs": set, "process": str|None}}."""
     exe = shutil.which("ss")
@@ -1146,7 +1158,9 @@ class FabricAgent:
             result = self._client.register(
                 target_machine_id=self._machine, target_host=target_host,
                 target_port=target_port, protocol="http", label=label,
-                owner_process_id=process or "")
+                owner_process_id=process or "",
+                origin_port=port if target_port != port else None,
+                network_namespace=_own_net_namespace())
         except Exception as exc:  # gateway down / rejected: retry next cycle
             log.warning("register failed for port %d: %s", port, exc)
             if fwd is not None:

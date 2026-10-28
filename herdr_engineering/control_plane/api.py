@@ -3297,15 +3297,18 @@ def _make_handler(server, public=False, operator=False):
             A missing or failing gateway degrades to 'unavailable' so a link is simply left as written."""
             body = self._read_json() or {}
             urls, machine = body.get("urls"), body.get("source_machine")
+            namespace = body.get("source_namespace")
             if (not isinstance(urls, list) or len(urls) > 200 or not all(isinstance(u, str) and len(u) <= 2048 for u in urls)
-                    or not (machine is None or isinstance(machine, str))):
+                    or not (machine is None or isinstance(machine, str))
+                    or not (namespace is None or (isinstance(namespace, str) and len(namespace) <= 64))):
                 return self._json({"error": "urls must be a list of at most 200 strings"}, 400)
             unavailable = {"resolutions": [{"original": u, "canonical": None, "status": "unavailable",
                                             "reason": "fabric gateway not reachable"} for u in urls]}
             if server.fabric_resolver is None:
                 return self._json(unavailable)
             try:
-                return self._json(server.fabric_resolver(urls, machine))
+                return self._json(server.fabric_resolver(urls, machine, namespace) if namespace
+                                  else server.fabric_resolver(urls, machine))
             except Exception:
                 return self._json(unavailable)
 
