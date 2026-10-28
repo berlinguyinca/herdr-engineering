@@ -76,7 +76,7 @@ test('non-Pi mission detail refreshes without a spinner and keeps open disclosur
  const refreshed=async()=>{const n=reads['/api/v1/missions/m1'];await page.evaluate(()=>window.__emit({event_id:`x-${Math.random()}`,event_type:'MissionStageChanged'}));
   await page.clock.runFor(6000);await until(async()=>reads['/api/v1/missions/m1']>n,'mission refetch');await sleep(150);};
  await refreshed();
- assert.equal(await mutationCount(page),0,'identical refresh writes nothing');
+ assert.equal(await mutationCount(page),0,`identical refresh writes nothing: ${JSON.stringify(await page.evaluate(()=>window.__muts.map(r=>({type:r.type,attribute:r.attributeName,target:r.target.outerHTML?.slice(0,240)}))))}`);
  mission.stage='review';
  await refreshed();
  const r=await page.evaluate(()=>({brief:document.querySelector('[data-history-panel=brief]')===window.__brief,open:window.__brief.open,

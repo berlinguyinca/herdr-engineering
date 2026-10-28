@@ -8,6 +8,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { chromium } from 'playwright';
 import { withPage } from './helpers/fixture.mjs';
+import { until } from './helpers/live.mjs';
 
 const REPO = path.resolve(import.meta.dirname, '..', '..');
 const PY = process.env.PYTHON
@@ -130,6 +131,12 @@ test('snooze hides an item from the open list and lists it as snoozed', async ()
 test('the Overview agrees with the Attention page and says so when the inbox cannot be loaded', async () => {
   await withApp(async ({ browser, base }) => {
     const page = await (await browser.newContext()).newPage();
+    // Lazy CI startup briefly reports syncing and adds source:ci to the inbox.
+    // Compare the two pages only after the offline fixture reaches its stable state.
+    await until(async () => {
+      const snapshot = await (await page.request.get(`${base}/api/v1/ci`)).json();
+      return snapshot.status === 'not_configured' && snapshot.refreshing === false;
+    }, 'offline CI startup to settle', 8000);
     await page.goto(`${base}/#/attention`);
     await page.locator('[data-attention-row^="session:"]').waitFor({ timeout: 8000 });
     const keys = (await page.locator('[data-attention-row]').evaluateAll((els) => els.map((e) => e.dataset.attentionRow))).sort();

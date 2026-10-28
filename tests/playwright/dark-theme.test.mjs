@@ -29,16 +29,21 @@ const ids=k=>Array.from({length:k},(_,i)=>i+1);
 
 const BASE={mission_id:'m-1',session_id:'s-1',host_id:'h-1',host_name:'h-1',title:'Mission 1',display_name:'Agent 1',updated_at:T0,created_at:T0,stage:'review',status:'ready'};
 // One body every view accepts with lists empty (the "empty" state).
-const EMPTY={items:[],groups:[],snapshots:[],analyses:[],artifacts:[],versions:[],publications:[],nodes:[],edges:[],...BASE,missions:[],sessions:[],services:[],hosts:[],activities:[],events:[],timeline:[],available:true,reviews:[],repositories:[],issues:[],
+const EMPTY={projects:[],assistants:[],items:[],groups:[],snapshots:[],analyses:[],artifacts:[],versions:[],publications:[],nodes:[],edges:[],...BASE,missions:[],sessions:[],services:[],hosts:[],activities:[],events:[],timeline:[],available:true,reviews:[],repositories:[],issues:[],
  counts:{},pagination:{},components:[],summary:{},reports:[],pipelines:[],samples:[],total:0,completed:0,completion_rate:0,by_stage:{},models:{},
  total_sessions:0,healthy:0,unavailable:0,sessions_detail:[]};
-const FULL={...EMPTY,missions:ids(4).map(mission),sessions:ids(4).map(session),services:ids(4).map(service),hosts:ids(3).map(host),
+const FULL={...EMPTY,assistants:[{assistant_id:'assistant-1',name:'Helper',status:'ready',enabled:true,model_policy:'auto',persona:'helpful',instructions:'Help with current work.'}],missions:ids(4).map(mission),sessions:ids(4).map(session),services:ids(4).map(service),hosts:ids(3).map(host),
  events:ids(6).map(event),total:12,completed:5,completion_rate:42,by_stage:{review:2,done:5,blocked:1},total_sessions:4,healthy:3,unavailable:1,
  models:{'qwen-27b':{requests:12,tokens:3400}}};
 
 const snap=extra=>({available:true,status:'ready',account:'operator',connection_generation:1,last_success_at:T0,pagination:{page:1,per_page:20,total:2,has_next:false},...extra});
 function populated(p){
  switch(p){
+  case '/api/v1/github/projects': {
+   const project={project_id:'PVT_1',owner:'lab',number:1,title:'Roadmap',url:'https://github.com/orgs/lab/projects/1',complete:true,status_options:[{id:'todo',name:'Todo'}]};
+   return snap({revision:1,projects_sync:{status:'ready'},projects:[project],project,
+    items:[{item_id:'item-1',project_id:'PVT_1',type:'ISSUE',status_option:'todo',status:'Todo',title:'Improve dashboard',position:0}]});
+  }
   case '/api/v1/mission-activity':return {activities:[projection(1),projection(2)]};
   case '/api/v1/missions/pi:msn-1':return {__status:404,json:{error:'not found'}};
   case '/api/v1/ci':return {available:true,status:'connected',pipelines:{'org/app':RUNS}};

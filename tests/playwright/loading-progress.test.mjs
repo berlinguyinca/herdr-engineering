@@ -2,6 +2,28 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { withPage } from './helpers/fixture.mjs';
 
+test('Personal Assistant uses calm-aware skeleton and indeterminate progress until its first response', async () => withPage(async (page, base) => {
+  await page.goto(`${base}/__blank`);
+  await page.clock.install();
+  await page.addStyleTag({ url: `${base}/motion.css` });
+  await page.evaluate(async () => {
+    document.documentElement.dataset.calm = 'on';
+    const { mountPersonalAssistant } = await import('/personal-assistant-view.js');
+    document.body.innerHTML = '<main></main>';
+    window.disposeAssistant = mountPersonalAssistant(document.querySelector('main'), {
+      listAssistants: () => new Promise(resolve => { window.finishAssistants = resolve; }),
+    });
+  });
+  assert.equal(await page.locator('[data-skeleton]').count(), 1);
+  await page.clock.runFor(300);
+  const progress = page.getByRole('progressbar', { name: 'Loading Personal Assistant' });
+  assert.equal(await progress.isVisible(), true);
+  assert.equal(await progress.getAttribute('value'), null);
+  assert.equal(await page.locator('.hd-skeleton').first().evaluate(el => getComputedStyle(el).animationName), 'none');
+  await page.evaluate(async () => { window.finishAssistants({ assistants: [] }); await Promise.resolve(); });
+  assert.equal(await page.locator('progress, [data-skeleton]').count(), 0);
+}));
+
 test('slow skeletons expose named indeterminate progress after 300ms and cancel on removal', async () => withPage(async (page, base) => {
   await page.goto(`${base}/__blank`); await page.clock.install({ time: new Date('2026-01-01T00:00:00Z') });
   await page.clock.pauseAt(new Date('2026-01-01T00:00:01Z'));

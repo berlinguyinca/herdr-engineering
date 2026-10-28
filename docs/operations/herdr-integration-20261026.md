@@ -113,6 +113,37 @@ recovery of event-only hosts/sessions/services. The complete replay remains a
 required integration property; the existing measured cold-start limitation still
 applies. Production has not been changed by this resumed work yet.
 
+### Release sweep and final repairs
+
+- All 268 UI gates passed, including unchanged visual baselines, keyboard,
+  responsive layout, and performance budgets. Deployment/compose checks passed
+  66 tests; canonical-config dry-run and the isolated image smoke passed.
+- Broad Python: 7,318 passed, one failed, 58 skipped, two xfailed. The failure
+  assumed request order for accounting from independent HTTP handlers, even
+  though error responses can arrive before their final accounting call. The test
+  now checks the exact rejection multiset and semantic model identities instead;
+  the complete proxy suite passed 63 tests. No production proxy behavior changed.
+- First broad JavaScript sweep: 1,017 passed and 16 failed. These identified
+  CI select synchronization, an unstable offline-CI fixture, new-route loading
+  and freshness gaps, new API fixture shapes, and event-history no-op writes.
+  All affected suites passed after repairs. One architecture timeout during a
+  host CPU-load spike passed unchanged in isolation. A clean broad rerun is
+  running; its result must not be assumed.
+- The Personal Assistant now uses common calm-aware loading/progress and a
+  freshness chip with request diagnostics. Dark-mode fixtures include actual
+  Projects/Assistant responses, retaining all original palette assertions.
+  Ten dark-mode, nine freshness/loading, and two calm loading checks passed.
+- History avoids redundant boolean attribute writes and keeps background polls
+  visually quiet. Initial/page navigation still shows slow progress; newly
+  appended events retain existing rows and shared enter motion. Eighteen
+  history/analytics/motion tests passed. CI selection and adjacent checks passed
+  46 tests; Attention comparison/error checks passed two.
+- Before rollout, live release `3f53537a6c67` returned 72 missions, 46 sessions,
+  264 services, and three hosts. Three-read median latency was 3.03 ms, 3.61 ms,
+  24.59 ms, and 2.79 ms respectively. These are baseline measurements, not gains
+  attributable to the pending integration. Retained event-only entities still
+  need to be verified after complete replay.
+
 ## History and diagnostics verification
 
 - Event-history reads now support bounded cursor pages without changing the

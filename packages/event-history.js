@@ -1,6 +1,7 @@
 // Per-entity history loads independently from the detail page. Cursors are
 // opaque; older pages remain selected while the live stream reports new work.
-import {morph, patchText} from './patch.js';
+import {morph, patchText, patchAttr} from './patch.js';
+import {enter} from './motion.js';
 import {eventKey} from './activity-view.js';
 import {describeEvent} from './herdr-web-components/humanize.js';
 import {formatTimestamp} from './herdr-web-components/format.js';
@@ -29,7 +30,10 @@ export function mountEventHistory(container, client, entityType, entityId, {
   const button = action => container.querySelector(`[data-history-action="${action}"]`);
   const skeleton = '<div class="hd-skeleton" data-skeleton aria-hidden="true" style="min-height:64px"></div>';
 
-  function draw() {
+  function toggle(element, property, value) {
+    if (element[property] !== Boolean(value)) element[property] = Boolean(value);
+  }
+  function draw(animate = false) {
     if (disposed || !container.isConnected) return;
     const loading = Boolean(pending);
     const message = error || (!page ? 'Loading recorded events…' : !page.events.length
@@ -37,23 +41,29 @@ export function mountEventHistory(container, client, entityType, entityId, {
         ? `Reading older recorded events.${unseen ? ' New events are available.' : ''}`
         : `${page.events.length} recent recorded events.${page.has_more ? ' Older events are available.' : ''}`);
     patchText(el('status'), message);
-    el('progress').hidden = !(loading && slow);
-    el('rows').setAttribute('aria-busy', String(loading && !page));
+    // A background poll keeps the readable page quiet; initial/page navigation
+    // owns the progress indicator because the requested page is not ready yet.
+    toggle(el('progress'), 'hidden', !(loading && slow && !background));
+    patchAttr(el('rows'), 'aria-busy', String(loading && !page));
     if (page) {
+      const previousKeys = new Set([...el('rows').children].map(child => child.dataset.key));
       const html = page.events.map(event => {
         const description = describeEvent(event, {missionTitles: titles});
         return `<div class="hd-card" role="listitem" data-key="${esc(eventKey(event))}"><div class="hd-card__title">${esc(description.title)}</div><div class="hd-card__sub">${esc(description.detail)}</div><div class="hd-card__sub">seq ${esc(event.sequence ?? 'unknown')} · ${esc(formatTimestamp(event.source_timestamp))}</div></div>`;
       }).join('');
       morph(el('rows'), html);
+      if (animate) for (const child of el('rows').children) {
+        if (!previousKeys.has(child.dataset.key)) enter(child);
+      }
     } else if (!error) {
       if (el('rows').innerHTML !== skeleton) el('rows').innerHTML = skeleton;
     } else el('rows').replaceChildren();
-    button('older').disabled = !page?.has_more || (loading && !background);
-    button('newer').disabled = !newer.length || (loading && !background);
-    button('latest').hidden = before === null && !unseen && !pinned;
-    button('latest').disabled = loading && !background;
-    button('retry').hidden = !error;
-    button('retry').disabled = loading && !background;
+    toggle(button('older'), 'disabled', !page?.has_more || (loading && !background));
+    toggle(button('newer'), 'disabled', !newer.length || (loading && !background));
+    toggle(button('latest'), 'hidden', before === null && !unseen && !pinned);
+    toggle(button('latest'), 'disabled', loading && !background);
+    toggle(button('retry'), 'hidden', !error);
+    toggle(button('retry'), 'disabled', loading && !background);
   }
 
   function load(target, action = 'refresh') {
@@ -111,7 +121,7 @@ export function mountEventHistory(container, client, entityType, entityId, {
         onStatus(false, error);
       } finally {
         clearTimeout(slowTimer); clearTimeout(deadline);
-        if (revision === generation) {pending = null; controller = null; slow = false; draw();}
+        if (revision === generation) {pending = null; controller = null; slow = false; draw(background && !probe);}
       }
     });
     draw();

@@ -206,8 +206,10 @@ function matchRoute(parts) {
 }
 
 async function viewPersonalAssistant() {
-  root.innerHTML = '<div id="personal-assistant"></div>';
-  return { dispose: mountPersonalAssistant(root.querySelector('#personal-assistant'), client) };
+  root.innerHTML = `${liveHead('<h1>Personal Assistant</h1>')}<div id="personal-assistant"></div>`;
+  const chip = root.querySelector('herdr-freshness');
+  return { dispose: mountPersonalAssistant(root.querySelector('#personal-assistant'), client,
+    { onFreshness: (ok, message) => chip.touch(ok, message) }) };
 }
 
 function mountView(view) {

@@ -763,11 +763,15 @@ def test_pre_dispatch_rejections_are_recorded_with_their_class():
             _post(proxy, "hk-unknown", {"model": "qwen"})
         assert unauth.value.code == 401
         recs = _wait_records(repo, 6)
-        assert [(r["project"], r["status"], r["error_class"]) for r in recs] == [
+        # Error responses can reach the client before their handler's final
+        # accounting call. Independent HTTP handlers need not record in request
+        # order; every rejection and its classification must still be present.
+        assert sorted((r["project"], r["status"], r["error_class"]) for r in recs) == sorted([
             ("proj-a", 503, "model_not_registered"), ("proj-b", 403, "model_project_mismatch"),
             ("proj-a", 400, "request_invalid"), ("proj-a", 400, "request_invalid"),
-            ("proj-a", 400, "request_invalid"), ("proj-a", 413, "request_too_large")]
-        assert recs[0]["model"] == "missing" and recs[2]["model"] == "unknown"
+            ("proj-a", 400, "request_invalid"), ("proj-a", 413, "request_too_large")])
+        assert next(r for r in recs if r["error_class"] == "model_not_registered")["model"] == "missing"
+        assert all(r["model"] == "unknown" for r in recs if r["error_class"] == "request_invalid")
         assert gpu == cpu == []
     finally:
         _teardown(proxy, srvs)

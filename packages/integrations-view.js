@@ -330,7 +330,8 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
         const selectedValue=field==='repository'&&state.project?ciProjectKey(state.project):state[field];
         if(selectedValue)values.set(selectedValue,values.get(selectedValue)||selectedValue);
         const options=`<option value="">${label}</option>`+[...values].sort((a,b)=>a[1].localeCompare(b[1])).map(([value,label])=>`<option value="${esc(value)}">${esc(label)}</option>`).join('');
-        if(select.innerHTML!==options){morph(select,options);select.value=selectedValue;}
+        if(select.innerHTML!==options)morph(select,options);
+        if(select.value!==selectedValue)select.value=selectedValue;
       }
     }
     if(signature!==nextSignature) {
