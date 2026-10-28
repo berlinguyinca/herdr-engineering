@@ -6,6 +6,7 @@
 -- actor/event identity is reused. This is an internal recovery field, not a
 -- client-provided event identity or a timestamp/commit-order watermark.
 ALTER TABLE fabric_events ADD COLUMN IF NOT EXISTS recovery_instance uuid;
+ALTER TABLE IF EXISTS fabric_events_quarantine ADD COLUMN IF NOT EXISTS recovery_instance uuid;
 CREATE OR REPLACE FUNCTION set_fabric_event_recovery_instance() RETURNS trigger
 LANGUAGE plpgsql AS $$
 BEGIN

@@ -392,3 +392,30 @@ def test_updated_compacted_interior_is_replayed_from_current_journal(db):
     recovered, selected, _ = _checkpoint_source(db)
     assert selected == originals
     assert _projections(recovered) == _projections(expected)
+
+
+def test_repair_upgrades_existing_archive_with_original_column_order(db):
+    from herdr_engineering.control_plane.collab_repair import repair_postgres
+
+    db.query("DROP TABLE IF EXISTS fabric_events_quarantine")
+    db.query("CREATE TABLE fabric_events_quarantine (LIKE fabric_events)")
+    db.query("ALTER TABLE fabric_events_quarantine DROP COLUMN recovery_instance")
+    db.query("ALTER TABLE fabric_events_quarantine ADD COLUMN quarantine_reason text, "
+             "ADD COLUMN quarantined_at timestamptz DEFAULT now()")
+    _insert(db, [_row("collab", "foreign", "member_added", {"actor_user_id": "forged"}, 0)])
+    original = db.query("SELECT event_id, recovery_instance FROM fabric_events")[0]
+
+    async def repair():
+        conn = await asyncpg.connect(db.dsn)
+        try:
+            return await repair_postgres(conn, apply=True, confirmed=True)
+        finally:
+            await conn.close()
+    report = asyncio.run(repair())
+    assert len(report["quarantine"]) == 1
+    archived = db.query("SELECT event_id, recovery_instance, quarantine_reason, quarantined_at "
+                        "FROM fabric_events_quarantine")[0]
+    assert archived["event_id"] == original["event_id"]
+    assert archived["recovery_instance"] == original["recovery_instance"]
+    assert archived["quarantine_reason"] == "foreign_stream" and archived["quarantined_at"] is not None
+    assert db.query("SELECT count(*) AS n FROM fabric_events")[0]["n"] == 0
