@@ -81,7 +81,7 @@ class Proposal:
     payload_sha256: str
     resource_version: int
     expires_at: datetime
-    state: str = "awaiting_approval"      # awaiting_approval | approved | refused | expired
+    state: str = "awaiting_approval"      # awaiting_approval | approved | executing | executed | failed | refused | expired
     approver: str | None = None
     rollback_available: bool = False
     history: list[str] = field(default_factory=list)

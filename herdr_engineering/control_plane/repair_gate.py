@@ -133,9 +133,10 @@ def make_facts_fn(*, app: Any, repo: Any, registry: Any, families_fn: Callable[[
         out: dict = {}
         if board_lookup is not None and board_lookup(f"{enrollment.repo}#{pr.number}") is None:
             out["incident_unbound"] = True
-        approvals, changes = app.pr_review_summary(enrollment.repo, pr.number, pr.head_sha,
-                                                   exclude=frozenset({getattr(pr, "author_login", "")}))
-        out["human_approvals"], out["changes_requested"] = approvals, changes
+        author_login = getattr(pr, "author_login", "")
+        approvals, changes = app.pr_review_summary(enrollment.repo, pr.number, pr.head_sha, exclude=frozenset({author_login}))
+        # Without the author's login the author's own approval cannot be excluded, so no approval counts.
+        out["human_approvals"], out["changes_requested"] = (approvals if author_login else 0), changes
         out["provenance_signed"] = bool(app.pr_commits_verified(enrollment.repo, pr.number, pr.head_sha))
         author = registry.author_of(key, pr.head_ref)
         if author.kind != "unknown":

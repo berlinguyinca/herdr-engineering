@@ -475,6 +475,7 @@ class ControlPlaneServer:
         repo.egress_fn = lambda: self._intelligence_section(fleet_config).get("egress") or {}
         self.intelligence.metrics_fn = self._intelligence_metrics
         self.intelligence.github_app_fn = lambda: getattr(self, "gate_app", None)
+        self.intelligence.ci_repair_fn = self._intelligence_ci_repair
         if getattr(self, "assistant", None) is not None:
             self.assistant.intelligence_read = self.intelligence.assistant_read
         self._configure_architecture_explain(fleet_config, architecture_explain)
@@ -482,6 +483,12 @@ class ControlPlaneServer:
             collab.architecture = self.architecture
         # live stream (Spec §52)
         repo.subscribe(self._broadcast)
+
+    def _intelligence_ci_repair(self, repository, run, operation_id, actor):
+        """Executor hook for an approved ``request_ci_repair``: the existing CI-fix request, idempotent on the proposal id."""
+        if self.ci_fix is None:
+            raise ValueError("CI fix agents are not enabled (control_plane.ci_fix)")
+        return self.ci_fix.request(self.ci_monitor, repository, run, operation_id, actor=actor)
 
     def _intelligence_metrics(self) -> dict:
         from collections import Counter

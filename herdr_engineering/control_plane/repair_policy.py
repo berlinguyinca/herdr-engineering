@@ -11,6 +11,7 @@
 """
 from __future__ import annotations
 
+import posixpath
 import re
 from dataclasses import dataclass, field
 from typing import Literal
@@ -35,7 +36,7 @@ def _glob(pattern: str) -> re.Pattern:
 
 
 def _match(path: str, patterns) -> bool:
-    p = path.lower().removeprefix("./").lstrip("/")
+    p = posixpath.normpath(path.replace("\\", "/").lower()).lstrip("/")
     return any(_glob(x.lower()).match(p) for x in patterns)
 
 
@@ -50,11 +51,13 @@ HIGH_PATHS = (
     "**/auth*", "**/*_auth*", "**/*rbac*", "**/*acl*", "**/*secret*", "**/*token*", "**/scheduler*",
     "**/review_gate/**", "**/*policy*", "**/*benchmark*", "**/*scoring*", "**/api.py",
     # agent instructions, skills and prompt templates steer agents: never "docs"
-    "**/skill.md", "**/agents.md", "**/claude.md", "**/skills/**", "**/*prompt*", "**/.claude/**", "**/.agents/**",
+    "docs/specs/**", "**/skill.md", "**/agents.md", "**/claude.md", "**/skills/**", "**/*prompt*", "**/.claude/**", "**/.agents/**",
 )
 LOW_DOC_PATHS = ("docs/**/*.md", "docs/**/*.png", "docs/**/*.txt", "readme", "readme.md", "readme.rst", "changelog", "changelog.md",
                  "contributing.md", "license")
 FIXTURE_PATHS = ("tests/fixtures/**", "**/fixtures/**", "**/testdata/**")
+# A repair that edits the tests can turn CI green by weakening the check rather than fixing the code.
+TEST_PATHS = ("tests/**", "test/**", "**/tests/**", "**/test_*", "**/*_test.*", "**/*.test.*", "**/*.spec.*", "**/__tests__/**")
 
 
 @dataclass(frozen=True)
@@ -83,6 +86,9 @@ def classify_risk(change: Change) -> tuple[str, tuple[str, ...]]:
             continue
         elif _match(path, FIXTURE_PATHS) and change.fixtures_externally_verified:
             continue
+        elif _match(path, TEST_PATHS):
+            worst = "high"
+            reasons.append(f"test change {path} (green CI could be manufactured)")
         elif worst == "low":
             worst = "moderate"
             reasons.append(f"behavioural path {path}")
@@ -169,6 +175,8 @@ def evaluate(policy: RepairPolicy, ev: Evidence) -> PolicyDecision:
         human.append("conflicting active incident")
     if ev.scientific_validation_pending:
         human.append("scientific validation pending; software CI is not validation")
+    if not re.fullmatch(r"[0-9a-f]{40}", ev.head_sha or ""):
+        human.append("head SHA is unknown or malformed")
     if not ev.provenance_signed:
         human.append("provenance is not signed")
     if ev.changes_requested:
@@ -265,6 +273,8 @@ class Incident:
                 raise IllegalTransition("rollback is only requested from post-merge verification or after completion")
         elif cur in _PAUSES:
             origin = self.paused_from
+            if cur == "BLOCKED" and to not in (origin, "AWAITING_APPROVAL", "FAILED", "CANCELLED"):
+                raise IllegalTransition("a blocked incident cannot advance past where it stopped; it needs approval first")
             # Leaving a pause returns to where it began (or its next step); moving between pauses keeps the origin.
             if not (to in _PAUSES and to != cur) and to not in (origin, _FORWARD.get(origin or ""), "FAILED", "CANCELLED"):
                 raise IllegalTransition(f"{cur} -> {to} is not allowed")

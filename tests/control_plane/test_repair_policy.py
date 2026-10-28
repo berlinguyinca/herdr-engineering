@@ -43,7 +43,7 @@ def test_risk_is_by_path_not_size(paths, risk):
 def test_formatting_and_verified_fixtures_are_low_only_when_declared():
     assert rp.classify_risk(rp.Change(("a/b.py",), formatting_only=True))[0] == "low"
     assert rp.classify_risk(rp.Change(("a/b.py",)))[0] == "moderate"
-    assert rp.classify_risk(rp.Change(("tests/fixtures/x.json",)))[0] == "moderate"
+    assert rp.classify_risk(rp.Change(("tests/fixtures/x.json",)))[0] == "high"   # fixtures are tests: unverified ones can manufacture green
     assert rp.classify_risk(rp.Change(("tests/fixtures/x.json",), fixtures_externally_verified=True))[0] == "low"
 
 
@@ -210,3 +210,29 @@ def test_rollback_after_completion_is_possible_but_then_final():
     walk(inc, "ROLLBACK_REQUESTED")
     with pytest.raises(rp.IllegalTransition):
         walk(inc, "COMPLETED")
+
+
+def test_audit_test_edits_spec_docs_and_odd_paths_are_high_risk():
+    for path in ("tests/test_a.py", "pkg/tests/x.py", "src/foo.test.ts", "docs/specs/plan.md", "docs/../.github/workflows/ci.yml",
+                 "docs\\..\\.github\\ci.yml"):
+        assert rp.classify_risk(rp.Change((path,)))[0] == "high", path
+    assert rp.classify_risk(rp.Change(("docs/guide.md",)))[0] == "low"
+
+
+def test_audit_unknown_head_sha_requires_a_human():
+    pol = rp.RepairPolicy(auto_merge_enabled=True, allowed_repositories=frozenset({"a/b"}), auto_merge_risks=frozenset({"low"}))
+    ev = rp.Evidence(repository="a/b", base_branch="main", head_sha="", change=rp.Change(("docs/x.md",), 1), review_sha="",
+                     review_passed=True, reviewer_context="r", author_context="a", reviewer_model_family="x", author_model_family="y",
+                     check_shas={"ci": ""}, check_status={"ci": "pass"}, required_checks=("ci",), changes_requested=False,
+                     human_approvals=1, provenance_signed=True)
+    assert "head SHA is unknown or malformed" in rp.evaluate(pol, ev).reasons
+
+
+def test_audit_blocked_incident_cannot_skip_to_authorized():
+    inc = rp.Incident("k")
+    for to in ("TRIAGED", "INVESTIGATING", "PROPOSED", "BLOCKED"):
+        inc.transition(to, at="t", cause_event="e", policy_version="p")
+    with pytest.raises(rp.IllegalTransition):
+        inc.transition("AUTHORIZED", at="t", cause_event="e", policy_version="p")
+    inc.transition("AWAITING_APPROVAL", at="t", cause_event="e", policy_version="p")
+    inc.transition("AUTHORIZED", at="t", cause_event="e", policy_version="p")
