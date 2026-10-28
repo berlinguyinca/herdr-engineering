@@ -78,6 +78,8 @@ def assistant_config(cfg: dict[str, Any]) -> dict[str, Any]:
     persistence = persistence if isinstance(persistence, dict) else {}
     fleet_ctx = section.get("fleet_context") if isinstance(section, dict) else None
     fleet_ctx = fleet_ctx if isinstance(fleet_ctx, dict) else {}
+    tools = section.get("tools") if isinstance(section, dict) else None
+    tools = tools if isinstance(tools, dict) else {}
     return {
         "enabled": bool(section.get("enabled", False)),
         "approval_ttl_seconds": int(section.get("approval_ttl_seconds", 3600)),
@@ -113,6 +115,14 @@ def assistant_config(cfg: dict[str, Any]) -> dict[str, Any]:
             "enabled": bool(fleet_ctx.get("enabled", False)),
             "max_chars": int(fleet_ctx.get("max_chars", 6000)),
             "per_section": int(fleet_ctx.get("per_section", 10)),
+        },
+        # Agentic tool-calling loop. deny-by-default: only tools with an active
+        # grant are ever offered to the model, and each call still passes through
+        # request_tool_action (grants + fail-closed approvals). Off unless enabled.
+        "tools": {
+            "enabled": bool(tools.get("enabled", False)),
+            "max_iterations": max(1, int(tools.get("max_iterations", 5))),
+            "max_result_chars": max(200, int(tools.get("max_result_chars", 2000))),
         },
     }
 
@@ -471,17 +481,44 @@ class AssistantMemory:
 # approval unless the grant carries `preauthorized: true`.
 TOOL_CATALOG: dict[str, dict[str, Any]] = {
     "chat": {"sensitive": False, "description": "Respond in conversation."},
-    "read_memory": {"sensitive": False, "description": "Read the user's assistant memory."},
-    "write_memory": {"sensitive": False, "description": "Store a corrected memory fact."},
-    "browse": {"sensitive": False, "description": "Fetch a web page for research (untrusted output)."},
-    "run_shell": {"sensitive": True, "description": "Execute a shell command on an authorized host."},
-    "send_message": {"sensitive": True, "description": "Send an external message (email / chat)."},
-    "edit_shared": {"sensitive": True, "description": "Modify a shared record."},
-    "delegate": {"sensitive": True, "description": "Delegate engineering work to a Pi mission."},
+    "read_memory": {"sensitive": False, "description": "Read the user's assistant memory.",
+                    "parameters": {"type": "object", "properties": {
+                        "key": {"type": "string", "description": "Memory key to read."}}}},
+    "write_memory": {"sensitive": False, "description": "Store a corrected memory fact.",
+                     "parameters": {"type": "object", "properties": {
+                         "key": {"type": "string"}, "value": {"type": "string"}},
+                         "required": ["key", "value"]}},
+    "browse": {"sensitive": False, "description": "Fetch a web page for research (untrusted output).",
+               "parameters": {"type": "object", "properties": {
+                   "url": {"type": "string", "description": "Absolute https URL to fetch."}},
+                   "required": ["url"]}},
+    "run_shell": {"sensitive": True, "description": "Execute a shell command on an authorized host.",
+                  "parameters": {"type": "object", "properties": {
+                      "command": {"type": "string"}, "host": {"type": "string"}},
+                      "required": ["command"]}},
+    "send_message": {"sensitive": True, "description": "Send an external message (email / chat).",
+                     "parameters": {"type": "object", "properties": {
+                         "channel": {"type": "string"}, "to": {"type": "string"},
+                         "body": {"type": "string"}}, "required": ["to", "body"]}},
+    "edit_shared": {"sensitive": True, "description": "Modify a shared record.",
+                    "parameters": {"type": "object", "properties": {
+                        "record": {"type": "string"}, "field": {"type": "string"},
+                        "value": {"type": "string"}}, "required": ["record", "field", "value"]}},
+    "delegate": {"sensitive": True, "description": "Delegate engineering work to a Pi mission.",
+                 "parameters": {"type": "object", "properties": {
+                     "task": {"type": "string"}, "target_system": {"type": "string"}},
+                     "required": ["task"]}},
     "connector_request": {"sensitive": True,
-                          "description": "Call an authorized external connector (MCP/OpenAPI/HTTP)."},
+                          "description": "Call an authorized external connector (MCP/OpenAPI/HTTP).",
+                          "parameters": {"type": "object", "properties": {
+                              "connector_id": {"type": "string"},
+                              "method": {"type": "string"}, "path": {"type": "string"},
+                              "body": {"type": "object"}}, "required": ["connector_id"]}},
     "read_fleet": {"sensitive": False,
-                   "description": "Read a live, redacted summary of the fleet (hosts, missions, agents, services, recent activity)."},
+                   "description": "Read a live, redacted summary of the fleet (hosts, missions, agents, services, recent activity).",
+                   "parameters": {"type": "object", "properties": {
+                       "sections": {"type": "array", "items": {"type": "string"},
+                                    "description": "Optional subset of: hosts, missions, sessions, services, activity."}}}},
 }
 
 
@@ -583,9 +620,16 @@ class RuntimeAdapter:
     """Versioned interface a model runner must implement."""
 
     version = 1
+    supports_tools = False
 
     def execute(self, run: AssistantRun, messages: list[AssistantMessage]) -> str:
         """Return the assistant's reply text for a run. Must not raise."""
+        raise NotImplementedError
+
+    def step(self, run: AssistantRun, messages: list[dict],
+             tools: list[dict]) -> dict:
+        """One tool-calling step. Returns {content, tool_calls}. Only runners
+        with ``supports_tools`` implement this; the service drives the loop."""
         raise NotImplementedError
 
 
@@ -624,7 +668,8 @@ class HttpModelRunnerAdapter(RuntimeAdapter):
     to a safe message rather than raising, so a chat run never crashes because of
     the model layer.
     """
-    version = 3
+    version = 4
+    supports_tools = True
 
     def __init__(self, store: AssistantStore, *, endpoint: str, timeout: int = 60,
                  model: str = "", api_key: str = "", context_provider: Any | None = None,
@@ -637,15 +682,33 @@ class HttpModelRunnerAdapter(RuntimeAdapter):
         self.context_provider = context_provider
         self._urlopen = urlopen
 
+    def _system_message(self) -> dict | None:
+        if self.context_provider is None:
+            return None
+        try:
+            ctx = self.context_provider.render()
+        except Exception:  # noqa: BLE001 - context must never break a reply
+            ctx = ""
+        return {"role": "system", "content": ctx} if ctx else None
+
+    def _post(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Send one chat-completions request and return the parsed body.
+        Raises on transport failure; callers degrade to a safe reply."""
+        if self._urlopen:
+            return self._urlopen(self.endpoint, payload, timeout=self.timeout)
+        from urllib.request import Request, urlopen
+        req = Request(self.endpoint, data=json.dumps(payload).encode(), method="POST",
+                      headers={"Content-Type": "application/json"})
+        if self.api_key:
+            req.add_header("Authorization", "Bearer " + self.api_key)
+        with urlopen(req, timeout=self.timeout) as resp:
+            return json.loads(resp.read().decode())
+
     def _payload(self, run: AssistantRun, messages: list[AssistantMessage]) -> dict[str, Any]:
         msgs = [{"role": m.role, "content": m.content} for m in messages]
-        if self.context_provider is not None:
-            try:
-                ctx = self.context_provider.render()
-            except Exception:  # noqa: BLE001 - context must never break a reply
-                ctx = ""
-            if ctx:
-                msgs = [{"role": "system", "content": ctx}] + msgs
+        sys = self._system_message()
+        if sys:
+            msgs = [sys] + msgs
         return {
             "model": self.model,
             "messages": msgs,
@@ -661,25 +724,44 @@ class HttpModelRunnerAdapter(RuntimeAdapter):
             pass
         return str(data.get("reply") or data.get("content") or "").strip()
 
-    def execute(self, run: AssistantRun, messages: list[AssistantMessage]) -> str:
-        payload = self._payload(run, messages)
-        if not self._urlopen:
-            try:
-                from urllib.request import Request, urlopen
-                req = Request(self.endpoint, data=json.dumps(payload).encode(),
-                              method="POST", headers={"Content-Type": "application/json"})
-                if self.api_key:
-                    req.add_header("Authorization", "Bearer " + self.api_key)
-                with urlopen(req, timeout=self.timeout) as resp:
-                    body = resp.read().decode()
-                return self._parse_reply(json.loads(body))
-            except Exception:  # noqa: BLE001
-                return "[http-model runner] inference unavailable"
+    @staticmethod
+    def _parse_step(data: Any) -> dict[str, Any]:
+        """Parse a chat-completions body into {content, tool_calls} (normalized)."""
         try:
-            resp = self._urlopen(self.endpoint, payload, timeout=self.timeout)
-            return self._parse_reply(resp)
+            msg = (data.get("choices") or [{}])[0].get("message", {}) or {}
+        except Exception:  # noqa: BLE001
+            msg = {}
+        content = str(msg.get("content") or "").strip()
+        tool_calls: list[dict[str, str]] = []
+        for tc in (msg.get("tool_calls") or []):
+            fn = tc.get("function") or {}
+            tool_calls.append({
+                "id": str(tc.get("id") or ""),
+                "name": str(fn.get("name") or tc.get("name") or ""),
+                "arguments": str(fn.get("arguments") or tc.get("arguments") or "{}"),
+            })
+        return {"content": content, "tool_calls": tool_calls}
+
+    def execute(self, run: AssistantRun, messages: list[AssistantMessage]) -> str:
+        try:
+            return self._parse_reply(self._post(self._payload(run, messages)))
         except Exception:  # noqa: BLE001
             return "[http-model runner] inference unavailable"
+
+    def step(self, run: AssistantRun, messages: list[dict],
+             tools: list[dict]) -> dict[str, Any]:
+        """One step of the agentic loop. ``messages`` are OpenAI-format dicts
+        (assistant tool_calls and tool results included). Never raises."""
+        msgs = list(messages)
+        sys = self._system_message()
+        if sys:
+            msgs = [sys] + msgs
+        payload = {"model": self.model, "messages": msgs, "tools": tools,
+                   "tool_choice": "auto"}
+        try:
+            return self._parse_step(self._post(payload))
+        except Exception:  # noqa: BLE001
+            return {"content": "[http-model runner] inference unavailable", "tool_calls": []}
 
 
 def _urllib_transport(url: str, method: str, headers: dict[str, str],
@@ -1414,7 +1496,7 @@ class AssistantService:
             run.state = "running"
             self.store.put_run(run)
             messages = self.store.list_messages(thread_id, tenant_id=tenant_id, user_id=user_id)
-            reply = self.runner.execute(run, messages)
+            reply = self._drive(run, messages)
             self.store.put_message(AssistantMessage(
                 message_id=_new_id("msg"), thread_id=thread_id, role="assistant",
                 content=reply, provenance=run.run_id))
@@ -2031,6 +2113,102 @@ class AssistantService:
                                 action="assistant.delegation.artifact", subject_id=delegation_id,
                                 detail=artifact_ref)
         return d
+
+    # -- agentic tool-calling loop -------------------------------------------------
+    def _drive(self, run: AssistantRun, messages: list[AssistantMessage]) -> str:
+        """Produce a reply: run the tool loop when tools are enabled and the
+        assistant has active grants, otherwise a single model call."""
+        tools_cfg = self.config.get("tools") or {}
+        if tools_cfg.get("enabled") and getattr(self.runner, "supports_tools", False):
+            tools = self._tool_specs(run)
+            if tools:
+                return self._tool_loop(
+                    run, messages, tools,
+                    max_iterations=int(tools_cfg.get("max_iterations", 5)),
+                    max_result_chars=int(tools_cfg.get("max_result_chars", 2000)))
+        return self.runner.execute(run, messages)
+
+    def _tool_specs(self, run: AssistantRun) -> list[dict[str, Any]]:
+        """OpenAI tool specs for tools the assistant currently has an ACTIVE grant
+        for (deny-by-default: no grant -> never offered to the model)."""
+        active = {g.tool_id for g in self.store.list_grants(
+            tenant_id=run.tenant_id, user_id=run.user_id, assistant_id=run.assistant_id)
+            if g.active(self.now())}
+        specs = []
+        for tool_id in sorted(active):
+            meta = TOOL_CATALOG.get(tool_id)
+            if not meta or tool_id == "chat":
+                continue
+            specs.append({"type": "function", "function": {
+                "name": tool_id,
+                "description": meta.get("description", ""),
+                "parameters": meta.get("parameters", {"type": "object", "properties": {}}),
+            }})
+        return specs
+
+    def _execute_gated(self, run: AssistantRun, tool_id: str, args: dict[str, Any],
+                       max_result_chars: int) -> str:
+        """Gate (grants + fail-closed approvals) then execute one model-requested
+        tool call, returning a bounded, redacted string result for the model."""
+        if tool_id not in TOOL_CATALOG:
+            return "[unknown tool]"
+        scope = str(args.get("scope") or args.get("url") or args.get("command")
+                    or args.get("record") or args.get("connector_id") or tool_id)[:200]
+        idem = hashlib.sha256(
+            f"{run.run_id}|{tool_id}|{sorted(args.items())!r}".encode()).hexdigest()[:24]
+        try:
+            action = self.request_tool_action(
+                tenant_id=run.tenant_id, user_id=run.user_id, assistant_id=run.assistant_id,
+                tool_id=tool_id, scope=scope, run_id=run.run_id, idempotency_key=idem,
+                request_payload=args, actor=run.user_id)
+        except ApprovalRequired as ar:
+            return f"[operator approval required: {ar.approval_id}]"
+        except AssistantError as exc:
+            return f"[tool gate error: {exc}]"
+        if action.status == "denied":
+            return "[denied: no active grant for this tool]"
+        try:
+            out = self.execute_tool(tenant_id=run.tenant_id, user_id=run.user_id,
+                                    assistant_id=run.assistant_id, tool_id=tool_id,
+                                    payload=args, actor=run.user_id)
+        except AssistantError as exc:
+            return f"[tool error: {exc}]"
+        text = (out.get("context") if isinstance(out, dict) and "context" in out
+                else json.dumps(out, default=str))
+        return (redact_secrets(str(text)) or "")[:max_result_chars]
+
+    def _tool_loop(self, run: AssistantRun, messages: list[AssistantMessage],
+                   tools: list[dict], *, max_iterations: int,
+                   max_result_chars: int) -> str:
+        """Drive the model until it returns a plain reply or the iteration cap is
+        hit. Every tool call is gated; sensitive tools surface an approval instead
+        of auto-running (fail-closed)."""
+        msgs: list[dict[str, Any]] = [{"role": m.role, "content": m.content} for m in messages]
+        for _ in range(max_iterations):
+            step = self.runner.step(run, msgs, tools)
+            calls = step.get("tool_calls") or []
+            if not calls:
+                return step.get("content") or ""
+            msgs.append({"role": "assistant", "content": step.get("content") or "",
+                         "tool_calls": [{"id": c.get("id", ""), "type": "function",
+                                         "function": {"name": c.get("name", ""),
+                                                      "arguments": c.get("arguments", "{}")}}
+                                        for c in calls]})
+            for c in calls:
+                try:
+                    args = json.loads(c.get("arguments") or "{}")
+                    if not isinstance(args, dict):
+                        args = {}
+                except Exception:  # noqa: BLE001
+                    args = {}
+                result = self._execute_gated(run, c.get("name", ""), args, max_result_chars)
+                self.store.audit_record(tenant_id=run.tenant_id, user_id=run.user_id,
+                                        actor=run.user_id, action="assistant.tool.invoked",
+                                        subject_id=run.run_id,
+                                        detail=f"{c.get('name')} (model-invoked)")
+                msgs.append({"role": "tool", "tool_call_id": c.get("id", ""),
+                             "name": c.get("name", ""), "content": result})
+        return "(stopped: tool-call iteration limit reached)"
 
     def execute_tool(self, *, tenant_id: str, user_id: str, assistant_id: str,
                      tool_id: str, payload: dict[str, Any],

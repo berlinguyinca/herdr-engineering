@@ -418,3 +418,101 @@ def test_read_fleet_tool_returns_context_when_enabled():
                                assistant_id=a.assistant_id,
                                tool_id="read_fleet", payload={"sections": ["hosts"]})
     assert "host bender" in out["context"] and "[missions]" not in out["context"]
+
+
+class _FakeStepRunner:
+    """Scripted tool-calling runner: yields canned step() responses and records
+    the messages it was shown at each step (to assert tool results are fed back)."""
+    supports_tools = True
+
+    def __init__(self, script):
+        self.script = script
+        self.i = 0
+        self.seen = []
+
+    def execute(self, run, messages):
+        return "exec-fallback"
+
+    def step(self, run, messages, tools):
+        self.seen.append({"messages": list(messages), "tools": list(tools)})
+        resp = self.script[self.i] if self.i < len(self.script) else self.script[-1]
+        self.i += 1
+        return resp
+
+
+def _tool_service(script, *, tools_enabled=True):
+    from herdr_engineering.control_plane.assistant import (
+        AssistantService, FleetContextProvider)
+    svc = AssistantService(config=assistant_config({"personal_assistant": {
+        "enabled": True, "inference": {"endpoint": "http://x.invalid"},
+        "fleet_context": {"enabled": True},
+        "tools": {"enabled": tools_enabled, "max_iterations": 3}}}))
+    svc.fleet_context = FleetContextProvider(_FakeRepo())
+    runner = _FakeStepRunner(script)
+    svc.runner = runner
+    return svc, runner
+
+
+def test_tool_loop_executes_granted_tool_then_replies():
+    svc, runner = _tool_service([
+        {"content": "", "tool_calls": [{"id": "c1", "name": "read_fleet", "arguments": "{}"}]},
+        {"content": "bender is up", "tool_calls": []},
+    ])
+    a = svc.create_assistant(tenant_id="t1", user_id="u1", name="A")
+    svc.grant_tool(tenant_id="t1", user_id="u1", assistant_id=a.assistant_id,
+                   tool_id="read_fleet", scope="read_fleet")
+    th = svc.create_thread(tenant_id="t1", user_id="u1", assistant_id=a.assistant_id)
+    run = svc.send_message(tenant_id="t1", user_id="u1", assistant_id=a.assistant_id,
+                           thread_id=th.thread_id, content="status?")
+    assert run.state == "completed"
+    reply = svc.store.list_messages(th.thread_id, tenant_id="t1", user_id="u1")[-1].content
+    assert reply == "bender is up"
+    # the fleet snapshot (tool result) was fed back into the second model step
+    tool_msgs = [m for m in runner.seen[1]["messages"] if m.get("role") == "tool"]
+    assert tool_msgs and "host bender" in tool_msgs[0]["content"]
+    assert tool_msgs[0]["tool_call_id"] == "c1"
+
+def test_tool_loop_denies_tools_without_grant():
+    # no grant -> read_fleet is never offered to the model; falls back to single call
+    svc, runner = _tool_service([{"content": "no tools", "tool_calls": []}])
+    a = svc.create_assistant(tenant_id="t1", user_id="u1", name="A")
+    th = svc.create_thread(tenant_id="t1", user_id="u1", assistant_id=a.assistant_id)
+    svc.send_message(tenant_id="t1", user_id="u1", assistant_id=a.assistant_id,
+                     thread_id=th.thread_id, content="status?")
+    assert runner.i == 0            # step() never called (no grants -> no tools)
+    reply = svc.store.list_messages(th.thread_id, tenant_id="t1", user_id="u1")[-1].content
+    assert reply == "exec-fallback"
+
+def test_tool_loop_sensitive_tool_requires_approval_not_executed():
+    svc, runner = _tool_service([
+        {"content": "", "tool_calls": [{"id": "c1", "name": "delegate",
+                                        "arguments": json.dumps({"task": "ship it"})}]},
+        {"content": "I need your approval to delegate", "tool_calls": []},
+    ])
+    a = svc.create_assistant(tenant_id="t1", user_id="u1", name="A")
+    # grant delegate but NOT preauthorized -> sensitive -> approval required
+    svc.grant_tool(tenant_id="t1", user_id="u1", assistant_id=a.assistant_id,
+                   tool_id="delegate", scope="delegate")
+    th = svc.create_thread(tenant_id="t1", user_id="u1", assistant_id=a.assistant_id)
+    svc.send_message(tenant_id="t1", user_id="u1", assistant_id=a.assistant_id,
+                     thread_id=th.thread_id, content="ship it")
+    tool_msg = [m for m in runner.seen[1]["messages"] if m.get("role") == "tool"][0]
+    assert "operator approval required" in tool_msg["content"]
+    # a pending approval was created; the delegation did NOT auto-run
+    pend = [ap for ap in svc.store.list_approvals(tenant_id="t1", user_id="u1")
+            if ap.decision == "pending"]
+    assert pend
+
+def test_tool_loop_stops_at_iteration_cap():
+    svc, runner = _tool_service([
+        {"content": "", "tool_calls": [{"id": "c", "name": "read_fleet", "arguments": "{}"}]},
+    ])
+    a = svc.create_assistant(tenant_id="t1", user_id="u1", name="A")
+    svc.grant_tool(tenant_id="t1", user_id="u1", assistant_id=a.assistant_id,
+                   tool_id="read_fleet", scope="read_fleet")
+    th = svc.create_thread(tenant_id="t1", user_id="u1", assistant_id=a.assistant_id)
+    svc.send_message(tenant_id="t1", user_id="u1", assistant_id=a.assistant_id,
+                     thread_id=th.thread_id, content="loop")
+    assert runner.i == 3            # capped at max_iterations
+    reply = svc.store.list_messages(th.thread_id, tenant_id="t1", user_id="u1")[-1].content
+    assert "iteration limit" in reply
