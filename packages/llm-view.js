@@ -102,9 +102,12 @@ function tiles(total) {
     <div class="llm-tile__value">${esc(value)}</div>${note ? `<div class="llm-tile__note">${esc(note)}</div>` : ''}</div>`).join('')}</div>`;
 }
 
-const table = (headers, rows, empty) => `<div class="llm-table"><table><thead><tr>${headers.map((h) => `<th scope="col">${esc(h)}</th>`).join('')}</tr></thead><tbody>${
+const TABLE_ROWS = 12;       // a long table shows its first rows; the rest sit behind one disclosure instead of a screen of ids
+const tableOf = (headers, rows, empty, head = true) => `<div class="llm-table"><table class="llm-fixed"><thead${head ? '' : ' class="llm-sr"'}><tr>${headers.map((h) => `<th scope="col">${esc(h)}</th>`).join('')}</tr></thead><tbody>${
   rows.length ? rows.map((r) => `<tr>${r.map((c) => `<td>${c}</td>`).join('')}</tr>`).join('')
     : `<tr><td colspan="${headers.length}">${esc(empty)}</td></tr>`}</tbody></table></div>`;
+const table = (headers, rows, empty) => rows.length <= TABLE_ROWS + 3 ? tableOf(headers, rows, empty)
+  : `${tableOf(headers, rows.slice(0, TABLE_ROWS), empty)}<details class="llm-more"><summary>Show ${rows.length - TABLE_ROWS} more</summary>${tableOf(headers, rows.slice(TABLE_ROWS), empty, false)}</details>`;
 
 function modelsTable(models) {
   return table(['Model', 'Source', 'Requests', 'Output tokens', 'TTFT p95', 'Speed p50', 'Errors'],
@@ -217,7 +220,7 @@ export const llmStyles = `<style>
 .llm-tiles{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:12px;margin:12px 0}.llm-tile{border:1px solid var(--border);border-radius:var(--radius);background:var(--surface);padding:12px 14px;min-width:0}.llm-tile__label{font-size:12px;color:var(--text-secondary)}.llm-tile__value{font-size:20px;font-weight:600;margin-top:4px;overflow-wrap:anywhere}.llm-tile__note{font-size:11px;color:var(--text-secondary);margin-top:4px}
 .llm-charts{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px;margin:16px 0}.llm-card{min-width:0;border:1px solid var(--border);border-radius:var(--radius);background:var(--surface);padding:6px 14px 12px}.llm-card h2{font-size:14px;margin:10px 0 4px}.llm-card svg{display:block;width:100%;max-height:210px}.llm-card svg text{font-size:11px;fill:var(--text-secondary);font-family:inherit}.llm-card svg line{stroke:var(--border)}
 .llm-legend{display:flex;flex-wrap:wrap;gap:12px;font-size:11px;color:var(--text-secondary)}.llm-legend span::before{content:'';display:inline-block;width:9px;height:9px;margin-right:5px;background:var(--c);border-radius:2px}
-.llm-note{font-size:12px;line-height:1.6;color:var(--text-secondary);margin:6px 0}.llm-table{overflow:auto}.llm-table table{border-collapse:collapse;width:100%;font-size:13px}.llm-table th,.llm-table td{padding:7px 8px;text-align:left;border-bottom:1px solid var(--border-subtle);overflow-wrap:anywhere}.llm-table th{color:var(--text-secondary);font-weight:500}
+.llm-note{font-size:12px;line-height:1.6;color:var(--text-secondary);margin:6px 0}.llm-table{overflow:auto}.llm-table table{border-collapse:collapse;width:100%;font-size:13px}.llm-table th,.llm-table td{padding:7px 8px;text-align:left;border-bottom:1px solid var(--border-subtle);overflow-wrap:anywhere}.llm-table th{color:var(--text-secondary);font-weight:500}.llm-fixed{table-layout:fixed}.llm-fixed td:first-child,.llm-fixed th:first-child{width:34%}.llm-sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0)}.llm-more{margin:6px 0}.llm-more>summary{cursor:pointer;color:var(--accent);font-size:13px;padding:4px 2px}
 .llm-badge{font-size:11px;font-weight:500;padding:2px 8px;border:1px solid var(--border);border-radius:99px;color:var(--text-secondary);vertical-align:middle}.llm-back{font-size:13px}.llm-data{font-size:12px;margin:8px 0 16px}.llm-data>summary{cursor:pointer}.llm-section h2{font-size:15px;margin:22px 0 6px}
 @media(max-width:650px){.llm-tiles{grid-template-columns:repeat(2,minmax(0,1fr))}.llm-charts{grid-template-columns:minmax(0,1fr)}}
 </style>`;

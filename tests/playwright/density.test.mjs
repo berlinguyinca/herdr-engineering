@@ -58,6 +58,12 @@ async function withApp(fn, env = {}, fixture = 'server.py') {
   }
 }
 
+// On phones the display controls sit inside the Menu drawer; open it when it is closed.
+async function openDisplayControls(page) {
+  const menu = page.locator('herdr-app-shell .hd-shell__menu');
+  if (await menu.isVisible() && (await menu.getAttribute('aria-expanded')) !== 'true') await menu.click();
+}
+
 test('density sanitizes storage, applies immediately by keyboard, and survives reload', async () => {
   await withApp(async ({ page, base }) => {
     await page.goto(`${base}/#/overview`);
@@ -91,6 +97,7 @@ test('density preserves mobile controls and representative route containment at 
       await page.setViewportSize({ width, height: 1080 });
       for (const route of ['/overview', '/github', '/ci', '/services', '/analytics']) {
         await page.goto(`${base}/#${route}`);
+        await openDisplayControls(page);
         const density = page.getByRole('combobox', { name: 'Density' });
         await density.selectOption('dense', { timeout: 5000 });
         await page.locator('#view h1').first().waitFor();
@@ -104,7 +111,7 @@ test('density preserves mobile controls and representative route containment at 
           assert.ok(await menu.isVisible(), `collapsed sidebar at ${width}`);
           assert.ok((await menu.boundingBox()).height >= 44);
           assert.ok((await density.boundingBox()).height >= 44);
-          await menu.click();
+          if ((await menu.getAttribute('aria-expanded')) !== 'true') await menu.click();
           assert.ok((await page.getByRole('link', { name: 'Overview', exact: true }).first().boundingBox()).height >= 44);
         }
       }
@@ -123,6 +130,7 @@ test('populated tablet heatmap keeps touch targets within their own bucket colum
       for (const mode of ['14', '30']) {
         await page.locator(`[data-health-mode="${mode}"]`).click();
         for (const density of ['comfortable', 'compact', 'dense']) {
+          await openDisplayControls(page);
           await page.getByRole('combobox', { name: 'Density' }).selectOption(density);
           // Query and measure inside one browser task: CI history refreshes
           // periodically and replaces the heatmap subtree in place.

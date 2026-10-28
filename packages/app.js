@@ -71,36 +71,50 @@ defineComponents();
 const client = new HerdrClient('');
 const root = document.getElementById('view');
 
+// Sidebar sections. A `tabs` entry owns a section whose other pages show as a tab strip above the page (SECTION_TABS), so
+// related pages (the four service views, plan reviews + review gate, ...) take one sidebar row instead of several.
 const NAV = [
-  { path: '/overview', label: 'Overview' },
-  { path: '/attention', label: 'Attention' },
-  { path: '/topology', label: 'Topology' },
-  { path: '/architecture', label: 'Architecture', capability: 'architecture_v1' },
-  { path: '/missions', label: 'Missions' },
-  { path: '/herd', label: 'Agents' },
-  { path: '/services', label: 'Services' },
-  { path: '/fabric-services', label: 'Fabric services' },
-  { path: '/local-services', label: 'Local services' },
-  { path: '/system-services', label: 'System services' },
-  { path: '/github/projects', label: 'Project boards' },
-  { path: '/github', label: 'Projects' },
-  { path: '/ci', label: 'CI' },
-  { path: '/reviews', label: 'Reviews' },
-  { path: '/review-gate', label: 'Review gate' },
-  { path: '/hosts', label: 'Hosts' },
-  { path: '/activity', label: 'Activity' },
-  { path: '/analytics', label: 'Analytics' },
-  { path: '/llm', label: 'LLM' },
-  { path: '/collab', label: 'Collaboration' },
-  { path: '/artifacts', label: 'Artifacts' },
-  { path: '/publications', label: 'Publications' },
-  { path: '/scheduling', label: 'Scheduling' },
-  { path: '/handoffs', label: 'Handoffs' },
-  { path: '/personal-assistant', label: 'Personal Assistant', capability: 'assistant_v1' },
-  { path: '/intelligence', label: 'Project intelligence', capability: 'project_intelligence_v1' },
+  { group: 'Monitor', path: '/overview', label: 'Overview' },
+  { group: 'Monitor', path: '/attention', label: 'Attention' },
+  { group: 'Work', path: '/missions', label: 'Missions' },
+  { group: 'Work', path: '/herd', label: 'Agents' },
+  { group: 'Work', path: '/topology', label: 'Topology' },
+  { group: 'Work', path: '/architecture', label: 'Architecture', capability: 'architecture_v1' },
+  { group: 'Fabric', path: '/hosts', label: 'Hosts' },
+  { group: 'Fabric', path: '/services', label: 'Services', match: ['/fabric-services', '/local-services', '/system-services'] },
+  { group: 'Fabric', path: '/llm', label: 'LLM' },
+  { group: 'Delivery', path: '/ci', label: 'CI' },
+  { group: 'Delivery', path: '/reviews', label: 'Reviews', match: ['/review-gate'] },
+  { group: 'Delivery', path: '/github', label: 'Projects', match: ['/github/projects'] },
+  { group: 'Insight', path: '/activity', label: 'Activity' },
+  { group: 'Insight', path: '/analytics', label: 'Analytics' },
+  { group: 'Insight', path: '/intelligence', label: 'Project intelligence', capability: 'project_intelligence_v1' },
+  { group: 'Workspace', path: '/collab', label: 'Collaboration' },
+  { group: 'Workspace', path: '/artifacts', label: 'Artifacts', match: ['/publications'] },
+  { group: 'Workspace', path: '/scheduling', label: 'Scheduling' },
+  { group: 'Workspace', path: '/handoffs', label: 'Handoffs' },
+  { group: 'Workspace', path: '/personal-assistant', label: 'Personal Assistant', capability: 'assistant_v1' },
+];
+const SECTION_TABS = [
+  [['/services', 'Catalog'], ['/fabric-services', 'Fabric'], ['/local-services', 'Local'], ['/system-services', 'System']],
+  [['/reviews', 'Plan reviews'], ['/review-gate', 'Review gate']],
+  [['/github', 'Issues'], ['/github/projects', 'Boards']],
+  [['/artifacts', 'Artifacts'], ['/publications', 'Publications']],
 ];
 
 const SHELL = document.getElementById('shell');
+const SUBNAV = document.getElementById('subnav');
+function renderSubnav() {
+  const path = (window.location.hash.replace(/^#/, '') || '/overview').split('?')[0];
+  const tabs = SECTION_TABS.find((t) => t.some(([p]) => path === p || path.startsWith(p + '/')));
+  if (!tabs || !SUBNAV) { if (SUBNAV) { SUBNAV.hidden = true; SUBNAV.textContent = ''; } return; }
+  // The longest matching path wins, so /github/projects is not also an active "Issues" tab.
+  const current = tabs.map(([p]) => p).filter((p) => path === p || path.startsWith(p + '/')).sort((x, y) => y.length - x.length)[0];
+  SUBNAV.hidden = false;
+  SUBNAV.innerHTML = tabs.map(([p, label]) => `<a href="#${p}"${p === current ? ' aria-current="page"' : ''}>${label}</a>`).join('');
+}
+window.addEventListener('hashchange', renderSubnav);
+renderSubnav();
 SHELL.setAttribute('routes', JSON.stringify(visibleNav(NAV, [])));
 // Optional tabs appear once /api/v1/health advertises their capability; a failed probe keeps them hidden.
 // Re-set only when the list changes: every set re-renders the shell's nav.

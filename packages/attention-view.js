@@ -62,6 +62,27 @@ function resolvedRow(item, now) {
     <p class="at-meta">${esc(KINDS[item.kind] || text(item.kind))} · resolved ${when}</p></div></li>`;
 }
 
+const GROUP_AT = 12;        // a short inbox stays one flat list
+const SHOW_PER_BUCKET = 5;
+const SEV_RANK = { critical: 0, warning: 1, info: 2 };
+/** A long inbox, grouped by severity and kind: the first few of each group, the rest behind "Show N more". */
+function bucketed(items, render) {
+  const buckets = new Map();
+  for (const i of items) {
+    const k = `${i.severity}|${i.kind}`;
+    if (!buckets.has(k)) buckets.set(k, []);
+    buckets.get(k).push(i);
+  }
+  const order = [...buckets.entries()].sort(([a, x], [b, y]) => (SEV_RANK[a.split('|')[0]] ?? 3) - (SEV_RANK[b.split('|')[0]] ?? 3) || y.length - x.length);
+  return order.map(([k, rows]) => {
+    const [sev, kind] = k.split('|');
+    const head = rows.slice(0, SHOW_PER_BUCKET), rest = rows.slice(SHOW_PER_BUCKET);
+    return `<section class="at-b" aria-label="${esc(`${sev} ${KINDS[kind] || kind}`)}"><h2 class="at-bucket">${esc(sev)} · ${esc(KINDS[kind] || text(kind))} <small>${rows.length}</small></h2>
+      <ul class="at-list">${head.map(render).join('')}</ul>
+      ${rest.length ? `<details class="at-more"><summary>Show ${rest.length} more</summary><ul class="at-list">${rest.map(render).join('')}</ul></details>` : ''}</section>`;
+  }).join('');
+}
+
 function group(label, items, render, open = false) {
   if (!items.length) return '';
   return `<details class="at-group" ${open ? 'open' : ''}><summary>${esc(label)} (${items.length})</summary><ul class="at-list">${items.map(render).join('')}</ul></details>`;
@@ -87,13 +108,15 @@ const STYLES = `<style>
 .at-summary{display:flex;flex-wrap:wrap;gap:8px 16px;align-items:center;margin:8px 0 16px;font-size:14px}
 .at-partial{background:var(--surface);border:1px solid var(--status-attention);border-radius:var(--radius);padding:8px 12px;margin:0 0 12px;font-size:13px}
 .at-filters{display:flex;flex-wrap:wrap;gap:12px;margin:0 0 12px;font-size:13px}.at-filters select{font:inherit;min-width:0}
-.at-list{list-style:none;margin:0;padding:0;display:grid;gap:8px}
-.at-row{display:flex;flex-wrap:wrap;justify-content:space-between;gap:8px 16px;padding:12px 14px;background:var(--surface);border:1px solid var(--border);border-left-width:4px;border-radius:var(--radius)}
+.at-list{list-style:none;margin:0;padding:0;display:grid;gap:4px}
+.at-row{display:flex;flex-wrap:wrap;justify-content:space-between;align-items:center;gap:4px 16px;padding:8px 12px;background:var(--surface);border:1px solid var(--border);border-left-width:3px;border-radius:var(--radius)}
 .at-critical{border-left-color:var(--status-failed)}.at-warning{border-left-color:var(--status-attention)}.at-info,.at-resolved{border-left-color:var(--border)}
-.at-main{min-width:0;flex:1 1 280px}.at-main p{margin:4px 0 0;font-size:13px;overflow-wrap:anywhere}.at-meta{color:var(--text-secondary)}
+.at-main{min-width:0;flex:1 1 280px}.at-main p{margin:2px 0 0;font-size:12px;overflow-wrap:anywhere}.at-meta{color:var(--text-secondary)}
 .at-sev{font-size:11px;text-transform:uppercase;letter-spacing:.04em;color:var(--text-secondary)}.at-count{color:var(--text-secondary);font-size:12px}
 .at-actions{display:flex;flex-wrap:wrap;gap:8px;align-items:center;font-size:13px}.at-snooze{display:inline-flex;gap:6px;align-items:center}.at-snooze select{font:inherit}
-.at-btn{font:inherit;padding:6px 10px;cursor:pointer;min-height:32px}
+.at-btn{font:inherit;font-size:13px;padding:4px 10px;cursor:pointer;min-height:28px}.at-snooze{font-size:12px;color:var(--text-secondary)}.at-snooze select{font-size:12px}
+.at-bucket{margin:14px 0 6px;display:flex;align-items:baseline;gap:8px;font-size:13px;font-weight:600}.at-bucket small{font-weight:400;color:var(--text-secondary)}
+.at-b .at-sev{display:none}.at-more{margin:4px 0 0}.at-more>summary{cursor:pointer;font-size:13px;color:var(--accent);padding:4px 2px}
 .at-group{margin:16px 0}.at-group>summary{cursor:pointer;font-weight:600;padding:6px 0}
 .at-status{font-size:13px;color:var(--text-secondary);margin:8px 0}
 .at-group[data-state=acknowledged] .at-row{opacity:.78}
@@ -127,7 +150,8 @@ export function renderAttention(model = {}, now = Date.now()) {
   const stale = error ? '<p class="at-partial" role="status">Could not refresh; showing the last received list.</p>' : '';
   const trunc = body.truncated ? '<p class="at-status">Showing the first items only; the inbox is capped.</p>' : '';
   let list;
-  if (open.length) list = `<ul class="at-list" aria-label="Open attention items">${open.map((i) => row(i, now, { busy: busy.has(i.key), urls: model.urls })).join('')}</ul>`;
+  if (open.length > GROUP_AT) list = bucketed(open, (i) => row(i, now, { busy: busy.has(i.key), urls: model.urls }));
+  else if (open.length) list = `<ul class="at-list" aria-label="Open attention items">${open.map((i) => row(i, now, { busy: busy.has(i.key), urls: model.urls })).join('')}</ul>`;
   else if (partial) list = '<p class="at-status">Nothing is known to be open, but some sources could not be read.</p>';
   else list = '<p class="at-status">No attention items. Every source was read.</p>';
   const resolved = records(body.resolved);
