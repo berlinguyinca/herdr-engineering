@@ -180,7 +180,8 @@ const SHARED = `
 .hd-shell__menu { display: none; font: inherit; padding: 6px 10px; color: var(--text-secondary);
   background: var(--surface); border: 1px solid var(--border-subtle); border-radius: var(--radius-sm); cursor: pointer; }
 .hd-shell__nav { display: flex; flex-direction: column; gap: 2px; padding: var(--density-gap, 8px); flex: 1; overflow-y: auto; }
-.hd-shell__group { display: flex; flex-direction: column; gap: 2px; margin-top: 6px; }
+.hd-shell__group { margin-top: 6px; }
+.hd-shell__group > .hd-shell__link { margin-bottom: 2px; }
 .hd-shell__group > summary { list-style: none; cursor: pointer; padding: 6px 10px; font-size: .6875rem; letter-spacing: .06em;
   text-transform: uppercase; color: var(--text-secondary); opacity: .8; display: flex; justify-content: space-between; align-items: center; border-radius: var(--radius-sm); }
 .hd-shell__group > summary::-webkit-details-marker { display: none; }
@@ -218,6 +219,8 @@ const SHARED = `
   .hd-shell__nav { display: none; max-height: 60vh; overflow-y: auto; }
   .hd-shell__nav[data-open=true] { display: flex; }
   .hd-shell__display { padding: 0 8px; }
+  /* The open group's links sit two to a row so the whole menu fits without long scrolling. */
+  .hd-shell__group::details-content { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 2px; }
   .hd-shell__content { max-width: none; padding: 16px; }
 }`;
 

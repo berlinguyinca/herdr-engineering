@@ -87,7 +87,7 @@ function groupedOpen(open, renderRow) {
       const rest = items.slice(SHOWN_PER_GROUP);
       const more = rest.length
         ? `<li class="at-more"><details><summary>Show all ${items.length} (${rest.length} more)</summary><ul class="at-list">${rest.map(renderRow).join('')}</ul></details></li>` : '';
-      return `<section class="at-kind at-kind-${sev}" aria-label="${label}"><h2 class="at-kind-title">${label} <span class="at-count">${items.length}</span></h2><ul class="at-list">${head}${more}</ul></section>`;
+      return `<section class="at-kind at-kind-${sev}" aria-label="${label}"><h2 class="at-kind-title">${label} <span class="at-count">${items.length}</span>${items.length > 1 ? ` <button type="button" class="at-btn at-ack-all" data-ack-all="${esc(JSON.stringify(items.map((i) => [i.key, i.fingerprint])))}">Acknowledge all ${items.length}</button>` : ''}</h2><ul class="at-list">${head}${more}</ul></section>`;
     });
   return `<div aria-label="Open attention items">${sections.join('')}</div>`;
 }
@@ -120,6 +120,7 @@ const STYLES = `<style>
 .at-actions{display:flex;flex-wrap:wrap;gap:8px;align-items:center;font-size:13px}.at-snooze{display:inline-flex;gap:6px;align-items:center}.at-snooze select{font:inherit}
 .at-btn{font:inherit;padding:6px 10px;cursor:pointer;min-height:32px}
 .at-kind{margin:18px 0}.at-kind-title{font-size:.8125rem;text-transform:uppercase;letter-spacing:.05em;color:var(--text-secondary);margin:0 0 8px;font-weight:600}
+.at-ack-all{margin-left:10px;font-size:.75rem;text-transform:none;letter-spacing:0;padding:2px 8px}
 .at-more>details>summary{cursor:pointer;padding:8px 12px;color:var(--accent);font-size:.875rem}.at-more>details[open]>summary{margin-bottom:8px}
 .at-group{margin:16px 0}.at-group>summary{cursor:pointer;font-weight:600;padding:6px 0}
 .at-status{font-size:13px;color:var(--text-secondary);margin:8px 0}
@@ -237,6 +238,21 @@ export function mountAttention(container, client, { onBody, notifier, onFreshnes
     if (toggle && notifier) {
       if (toggle.dataset.notifyToggle === 'on') await notifier.enable(); else notifier.disable();
       last = ''; draw();
+      return;
+    }
+    const all = event.target.closest?.('[data-ack-all]');
+    if (all) {
+      let pairs = [];
+      try { pairs = JSON.parse(all.dataset.ackAll).filter((p) => Array.isArray(p) && typeof p[0] === 'string'); } catch { /* No pairs: nothing to do. */ }
+      if (!pairs.length || !window.confirm(`Acknowledge ${pairs.length} items? They stay listed under Acknowledged.`)) return;
+      model.message = ''; pairs.forEach(([k]) => model.busy.add(k)); draw();
+      let failed = 0;
+      for (const [key, fingerprint] of pairs) {
+        try { await client.attentionAct('ack', { key, fingerprint }); } catch { failed += 1; }
+        model.busy.delete(key);
+      }
+      model.message = failed ? `${failed} of ${pairs.length} could not be acknowledged.` : '';
+      clearTimeout(timer); controller?.abort(); controller = null; poll();
       return;
     }
     const b = event.target.closest?.('[data-ack],[data-clear]');
