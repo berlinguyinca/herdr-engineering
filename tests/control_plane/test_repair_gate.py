@@ -73,3 +73,29 @@ def test_bad_config_raises():
         rg.policy_from_section({"enabled": True, "allowed_repositories": "o/r"})
     with pytest.raises(ValueError):
         rg.policy_from_section({"enabled": True, "max_patch_lines": True})
+
+
+def test_unreadable_central_config_after_enable_rejects(tmp_path, monkeypatch):
+    from herdr_engineering.control_plane.api import ControlPlaneServer
+    from herdr_engineering.control_plane.repo import ControlPlaneRepo
+    from herdr_engineering.fleet_config import FleetConfigError
+
+    class Fleet:
+        broken = False
+
+        def current(self):
+            if self.broken:
+                raise FleetConfigError("unreadable")
+            return self
+
+        def section(self, name):
+            return {"project_intelligence": {"repair": {"enabled": True, "kill_switch": False}}}
+
+    fleet = Fleet()
+    server = ControlPlaneServer.__new__(ControlPlaneServer)
+    gate = ControlPlaneServer._build_repair_gate(server, App(DOC), fleet)
+    assert gate(ENR, PR, CHECKS)[0] in ("wait", "allow")       # enabled and evaluated
+    fleet.broken = True
+    assert gate(ENR, PR, CHECKS)[0] == "reject"
+    fresh = ControlPlaneServer._build_repair_gate(server, App(DOC), fleet)
+    assert fresh(ENR, PR, CHECKS)[0] == "allow"                 # never enabled in this process: unchanged behaviour

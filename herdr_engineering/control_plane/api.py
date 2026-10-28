@@ -647,10 +647,29 @@ class ControlPlaneServer:
         self.gate_service.start()
 
     def _build_repair_gate(self, app, fleet_config):
-        """Inert unless ``project_intelligence.repair.enabled``; read on every PR so the kill switch is hot."""
+        """Inert unless ``project_intelligence.repair.enabled``; read on every PR so the kill switch is hot.
+
+        Once repair has been seen enabled, an unreadable central config means "kill switch on" (reject), never
+        "policy absent" (which would let merges proceed unchecked).
+        """
+        from ..fleet_config import FleetConfigError
+        from . import repair_policy as rp
         from .repair_gate import make_repair_gate, policy_from_section
-        return make_repair_gate(
-            app=app, policy_fn=lambda: policy_from_section(self._intelligence_section(fleet_config).get("repair")))
+        seen = {"enabled": False}
+
+        def policy():
+            if fleet_config is None:
+                return None
+            try:
+                section = fleet_config.current().section("control_plane")
+            except FleetConfigError:
+                return rp.RepairPolicy(kill_switch=True) if seen["enabled"] else None
+            value = ((section or {}).get("project_intelligence") or {})
+            result = policy_from_section(value.get("repair") if isinstance(value, dict) else None)
+            seen["enabled"] = seen["enabled"] or result is not None
+            return result
+
+        return make_repair_gate(app=app, policy_fn=policy)
 
     def _dispatch_native_message(self, record, message, artifact_ids):
         from ..errors import InvalidError
