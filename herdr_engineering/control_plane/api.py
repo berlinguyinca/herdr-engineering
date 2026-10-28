@@ -1239,7 +1239,8 @@ def _make_handler(server, public=False, operator=False):
 
         _ASSISTANT_MUTABLE_RESOURCES = {"assistants", "assistant-runs",
                                         "assistant-approvals", "assistant-memory",
-                                        "assistant-routines"}
+                                        "assistant-routines", "assistant-connectors",
+                                        "assistant-delegations"}
 
         def _mutate_verb(self):
             if operator:
@@ -2142,7 +2143,7 @@ def _make_handler(server, public=False, operator=False):
                                    "offset": offset, "checked_at": r._stamp()})
             if resource == "review-gate":
                 return self._review_gate_get(parts)
-            if resource in ("assistants", "assistant-runs", "assistant-approvals", "assistant-memory", "assistant-routines"):
+            if resource in ("assistants", "assistant-runs", "assistant-approvals", "assistant-memory", "assistant-routines", "assistant-connectors", "assistant-delegations"):
                 return self._assistant_get(parts, resource)
             if resource == "tests":
                 return self._json(_tests_view())
@@ -2382,7 +2383,7 @@ def _make_handler(server, public=False, operator=False):
                     if changed and r.get_session(sid) is not None:
                         server.agent_summaries.request(sid)
                 return self._json({"ok": True, "entity": entity})
-            if resource in ("assistants", "assistant-runs", "assistant-approvals", "assistant-memory", "assistant-routines"):
+            if resource in ("assistants", "assistant-runs", "assistant-approvals", "assistant-memory", "assistant-routines", "assistant-connectors", "assistant-delegations"):
                 # the body is already read above (line ~2170) into the local
                 # ``body``; pass it in rather than re-reading (keep-alive safety)
                 return self._assistant_post(parts, resource, body)
@@ -2460,6 +2461,16 @@ def _make_handler(server, public=False, operator=False):
                                                                          state=state)]})
                 if resource == "assistant-memory" and len(parts) == 5:
                     return self._json(svc.store.get_memory(parts[4], tenant_id=tenant_id, user_id=user_id).as_dict())
+                if resource == "assistant-connectors" and len(parts) == 4:
+                    return self._json({"connectors": [c.as_dict() for c in
+                                                        svc.list_connectors(tenant_id=tenant_id, user_id=user_id)]})
+                if resource == "assistant-connectors" and len(parts) == 5:
+                    return self._json(svc.get_connector(parts[4], tenant_id=tenant_id, user_id=user_id).as_dict())
+                if resource == "assistant-delegations" and len(parts) == 4:
+                    return self._json({"delegations": [d.as_dict() for d in
+                                                         svc.list_delegations(tenant_id=tenant_id, user_id=user_id)]})
+                if resource == "assistant-delegations" and len(parts) == 5:
+                    return self._json(svc.get_delegation(parts[4], tenant_id=tenant_id, user_id=user_id).as_dict())
                 return self._json({"error": "not found"}, 404)
             except AssistantUnavailable as exc:
                 return self._json({"error": str(exc), "code": "unavailable"}, 503)
@@ -2571,6 +2582,36 @@ def _make_handler(server, public=False, operator=False):
                 if resource == "assistant-routines" and len(parts) == 5 and self.command == "DELETE":
                     svc.archive_routine(parts[4], tenant_id=tenant_id, user_id=user_id)
                     return self._json({"ok": True})
+                if resource == "assistant-connectors" and len(parts) == 4 and self.command == "POST":
+                    conn = svc.register_connector(
+                        tenant_id=tenant_id, user_id=user_id,
+                        name=body.get("name", "Connector"),
+                        kind=body.get("kind", "http"),
+                        base_url=body.get("base_url", ""),
+                        auth=body.get("auth") or {})
+                    return self._json(conn.as_dict(), 201)
+                if resource == "assistant-connectors" and len(parts) == 5 and self.command == "DELETE":
+                    svc.archive_connector(parts[4], tenant_id=tenant_id, user_id=user_id)
+                    return self._json({"ok": True})
+                if resource == "assistant-connectors" and len(parts) == 6 and parts[5] == "request":
+                    return self._json(svc.connector_request(
+                        tenant_id=tenant_id, user_id=user_id, connector_id=parts[4],
+                        method=body.get("method", "GET"), path=body.get("path", "/"),
+                        body=body.get("body") or {}, actor=user_id))
+                if resource == "assistant-delegations" and len(parts) == 4 and self.command == "POST":
+                    d = svc.delegate(tenant_id=tenant_id, user_id=user_id,
+                                     assistant_id=body.get("assistant_id", ""),
+                                     task=body.get("task", ""),
+                                     target_system=body.get("target_system", "pi"),
+                                     actor=user_id)
+                    return self._json(d.as_dict(), 201)
+                if resource == "assistant-delegations" and len(parts) == 6 and parts[5] == "cancel":
+                    return self._json(svc.cancel_delegation(parts[4], tenant_id=tenant_id,
+                                                            user_id=user_id).as_dict())
+                if resource == "assistant-delegations" and len(parts) == 6 and parts[5] == "artifact":
+                    return self._json(svc.register_delegation_artifact(
+                        parts[4], tenant_id=tenant_id, user_id=user_id,
+                        artifact_ref=body.get("artifact_ref", "")).as_dict())
                 return self._json({"error": "not found"}, 404)
             except ApprovalRequired as exc:
                 return self._json({"error": str(exc), "code": "approval_needed",

@@ -56,7 +56,7 @@ export function mountPersonalAssistant(container, client) {
                   <span class="pa-badge">${selected.enabled ? 'enabled' : 'disabled'}</span>
                 </div>
                 <div class="pa-tabs">
-                  ${['General', 'Permissions', 'Memory', 'Routines', 'Approvals', 'Diagnostics'].map(t =>
+                  ${['General', 'Permissions', 'Memory', 'Routines', 'Connectors', 'Delegations', 'Approvals', 'Diagnostics'].map(t =>
                     `<button class="pa-tab ${state.tab === t ? 'pa-tab--active' : ''}" data-tab="${t}">${t}</button>`).join('')}
                 </div>
                 <div id="pa-panel">${renderPanel(selected)}</div>
@@ -90,6 +90,8 @@ export function mountPersonalAssistant(container, client) {
     if (state.tab === 'Permissions') return '<div id="pa-perms"><herdr-spinner label="Loading permissions"></herdr-spinner></div>';
     if (state.tab === 'Memory') return '<div id="pa-memory"><herdr-spinner label="Loading memory"></herdr-spinner></div>';
     if (state.tab === 'Routines') return '<div id="pa-routines"><herdr-spinner label="Loading routines"></herdr-spinner></div>';
+    if (state.tab === 'Connectors') return '<div id="pa-connectors"><herdr-spinner label="Loading connectors"></herdr-spinner></div>';
+    if (state.tab === 'Delegations') return '<div id="pa-delegations"><herdr-spinner label="Loading delegations"></herdr-spinner></div>';
     if (state.tab === 'Approvals') return '<div id="pa-approvals"><herdr-spinner label="Loading approvals"></herdr-spinner></div>';
     return '<div id="pa-diagnostics"><herdr-spinner label="Loading diagnostics"></herdr-spinner></div>';
   };
@@ -136,6 +138,10 @@ export function mountPersonalAssistant(container, client) {
     if (memory) loadMemory(memory, a);
     const routines = panel.querySelector('#pa-routines');
     if (routines) loadRoutines(routines, a);
+    const connectors = panel.querySelector('#pa-connectors');
+    if (connectors) loadConnectors(connectors, a);
+    const delegations = panel.querySelector('#pa-delegations');
+    if (delegations) loadDelegations(delegations, a);
     const approvals = panel.querySelector('#pa-approvals');
     if (approvals) loadApprovals(approvals, a);
     const diag = panel.querySelector('#pa-diagnostics');
@@ -232,6 +238,60 @@ export function mountPersonalAssistant(container, client) {
       });
       el.querySelectorAll('[data-rtrigger]').forEach(b => b.addEventListener('click', async () => { await client.triggerRoutine(b.dataset.rtrigger); await loadRoutines(el, a); }));
       el.querySelectorAll('[data-rarchive]').forEach(b => b.addEventListener('click', async () => { await client.archiveRoutine(b.dataset.rarchive); await loadRoutines(el, a); }));
+    } catch (error) { el.innerHTML = `<herdr-error message="${esc(error.message)}"></herdr-error>`; }
+  };
+
+  const loadConnectors = async (el, a) => {
+    try {
+      const { connectors = [] } = await client.listConnectors();
+      el.innerHTML = `
+        <div class="pa-row">
+          <input data-cname placeholder="Name" style="flex:1">
+          <select data-ckind><option value="http">http</option><option value="openapi">openapi</option><option value="mcp">mcp</option></select>
+          <input data-curl placeholder="https://host" style="flex:1.4">
+          <input data-callow placeholder="Allowed host(s), comma-sep" style="flex:1.4">
+          <button class="hd-btn hd-btn--sm" data-ccreate>Register</button>
+        </div>
+        <div style="margin-top:8px">${connectors.length ? connectors.map(c => `
+          <div class="pa-msg pa-msg--meta">
+            <strong>${esc(c.name)}</strong> · ${esc(c.kind)} · ${esc(c.base_url)}
+            · auth ${c.auth_present ? 'yes' : 'no'} · ${c.enabled ? 'enabled' : 'disabled'}
+            <button class="hd-btn hd-btn--sm" data-creq="${esc(c.connector_id)}">Test</button>
+            <button class="hd-btn hd-btn--danger hd-btn--sm" data-carc="${esc(c.connector_id)}">Archive</button>
+          </div>`).join('') : '<div class="pa-muted">No connectors registered.</div>'}</div>`;
+      el.querySelector('[data-ccreate]').addEventListener('click', async () => {
+        const hosts = el.querySelector('[data-callow]').value.split(',').map(s => s.trim()).filter(Boolean);
+        await client.registerConnector({ name: el.querySelector('[data-cname]').value || 'Connector', kind: el.querySelector('[data-ckind]').value, base_url: el.querySelector('[data-curl]').value, auth: { _allowed_origins: hosts } });
+        await loadConnectors(el, a);
+      });
+      el.querySelectorAll('[data-creq]').forEach(b => b.addEventListener('click', async () => {
+        const res = await client.connectorRequest(b.dataset.creq, { path: '/' });
+        window.alert(`Connector test: ${res.ok ? 'ok' : (res.reason || res.error || 'denied')}`);
+      }));
+      el.querySelectorAll('[data-carc]').forEach(b => b.addEventListener('click', async () => { await client.archiveConnector(b.dataset.carc); await loadConnectors(el, a); }));
+    } catch (error) { el.innerHTML = `<herdr-error message="${esc(error.message)}"></herdr-error>`; }
+  };
+
+  const loadDelegations = async (el, a) => {
+    try {
+      const { delegations = [] } = await client.listDelegations();
+      const mine = delegations.filter(d => d.assistant_id === a.assistant_id);
+      el.innerHTML = `
+        <div class="pa-row">
+          <input data-dtask placeholder="Task to delegate to a Pi mission" style="flex:1">
+          <button class="hd-btn hd-btn--sm" data-dcreate>Delegate</button>
+        </div>
+        <div style="margin-top:8px">${mine.length ? mine.map(d => `
+          <div class="pa-msg pa-msg--meta">
+            <strong>${esc(d.status)}</strong> · ${esc(d.task)}
+            ${d.artifact_refs.length ? ' · <code>'+esc(d.artifact_refs.join(', '))+'</code>' : ''}
+            ${(d.status === 'queued' || d.status === 'running') ? `<button class="hd-btn hd-btn--danger hd-btn--sm" data-dcancel="${esc(d.delegation_id)}">Cancel</button>` : ''}
+          </div>`).join('') : '<div class="pa-muted">No delegations yet.</div>'}</div>`;
+      el.querySelector('[data-dcreate]').addEventListener('click', async () => {
+        await client.delegate({ assistant_id: a.assistant_id, task: el.querySelector('[data-dtask]').value || 'Task', target_system: 'pi' });
+        await loadDelegations(el, a);
+      });
+      el.querySelectorAll('[data-dcancel]').forEach(b => b.addEventListener('click', async () => { await client.cancelDelegation(b.dataset.dcancel); await loadDelegations(el, a); }));
     } catch (error) { el.innerHTML = `<herdr-error message="${esc(error.message)}"></herdr-error>`; }
   };
 

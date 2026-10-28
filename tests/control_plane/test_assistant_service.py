@@ -18,6 +18,7 @@ import pytest
 
 from herdr_engineering.control_plane.assistant import (
     ApprovalRequired,
+    AssistantError,
     AssistantNotFound,
     AssistantService,
     AssistantUnavailable,
@@ -493,3 +494,96 @@ def test_memory_correct_bumps_revision():
                              query="tea")
     assert len(hits) == 1
     assert hits[0].revision == corrected.revision
+
+
+# ---------------------------------------------------------------------------
+# P4 — connectors, computer-tool sandbox policy, delegation
+# ---------------------------------------------------------------------------
+
+def test_register_connector_requires_allowlist():
+    svc = make_service()
+    with pytest.raises(AssistantError):
+        svc.register_connector(tenant_id="t1", user_id="u1", name="X", base_url="https://x.example.com", auth={})
+    c = svc.register_connector(tenant_id="t1", user_id="u1", name="X", base_url="https://x.example.com",
+                               auth={"_allowed_origins": ["x.example.com"], "token": "secret"})
+    assert c.enabled is True
+    d = c.as_dict()
+    assert "token" not in d and d["auth_present"] is True
+
+
+def test_connector_isolated_by_user():
+    svc = make_service()
+    c = svc.register_connector(tenant_id="t1", user_id="u1", name="X", base_url="https://x.example.com",
+                               auth={"_allowed_origins": ["x.example.com"]})
+    with pytest.raises((KeyError, AssistantNotFound)):
+        svc.get_connector(c.connector_id, tenant_id="t1", user_id="u2")
+
+
+def test_connector_request_deny_by_default_ssrf():
+    svc = make_service()
+    c = svc.register_connector(tenant_id="t1", user_id="u1", name="X", base_url="https://x.example.com",
+                               auth={"_allowed_origins": ["x.example.com"]})
+    # SSRF attempt: an absolute-URL path must be rejected because its host is
+    # not in the connector's operator allowlist
+    r = svc.connector_request(tenant_id="t1", user_id="u1", connector_id=c.connector_id,
+                              path="https://evil.example.net/steal")
+    assert r["ok"] is False
+    assert "allowlisted" in r["error"]
+    assert svc.store.get_connector(c.connector_id, tenant_id="t1", user_id="u1").as_dict().get("token") is None
+
+
+def test_connector_request_rejects_http():
+    svc = make_service()
+    c = svc.register_connector(tenant_id="t1", user_id="u1", name="X", base_url="http://x.example.com",
+                               auth={"_allowed_origins": ["x.example.com"]})
+    r = svc.connector_request(tenant_id="t1", user_id="u1", connector_id=c.connector_id)
+    assert r["ok"] is False
+    assert "https" in r["error"]
+
+
+def test_computer_policy_deny_by_default():
+    svc = make_service()
+    assert svc.evaluate_computer_policy(tool="browse", target="https://evil.example.com")["allowed"] is False
+    assert svc.evaluate_computer_policy(tool="run_shell", target="rm -rf /")["allowed"] is False
+    assert svc.evaluate_computer_policy(tool="unknown", target="x")["allowed"] is False
+
+
+def test_browse_tool_policy_gated():
+    svc = make_service()
+    res = svc.browse_tool(tenant_id="t1", user_id="u1", url="https://example.com")
+    assert res["denied"] is True and "policy" in res["reason"]
+
+
+def test_run_shell_tool_deny_by_default():
+    svc = make_service()
+    res = svc.run_shell_tool(tenant_id="t1", user_id="u1", command="ls /tmp")
+    assert res["denied"] is True
+
+
+def test_delegate_creates_queued_request():
+    svc = make_service()
+    a = svc.create_assistant(tenant_id="t1", user_id="u1", name="Helper")
+    d = svc.delegate(tenant_id="t1", user_id="u1", assistant_id=a.assistant_id,
+                     task="Add a health endpoint", target_system="pi")
+    assert d.status == "queued"  # never fabricates completion
+    got = svc.get_delegation(d.delegation_id, tenant_id="t1", user_id="u1")
+    assert got.artifact_refs == []
+
+
+def test_delegation_artifact_and_cancel():
+    svc = make_service()
+    a = svc.create_assistant(tenant_id="t1", user_id="u1", name="Helper")
+    d = svc.delegate(tenant_id="t1", user_id="u1", assistant_id=a.assistant_id, task="t")
+    d = svc.register_delegation_artifact(d.delegation_id, tenant_id="t1", user_id="u1",
+                                         artifact_ref="artifact://mission/MSN-1")
+    assert d.status == "running" and "artifact://mission/MSN-1" in d.artifact_refs
+    d = svc.cancel_delegation(d.delegation_id, tenant_id="t1", user_id="u1")
+    assert d.status == "cancelled"
+
+
+def test_execute_tool_delegate_dispatch():
+    svc = make_service()
+    a = svc.create_assistant(tenant_id="t1", user_id="u1", name="Helper")
+    res = svc.execute_tool(tenant_id="t1", user_id="u1", assistant_id=a.assistant_id,
+                           tool_id="delegate", payload={"task": "T"}, actor="u1")
+    assert res["ok"] is True and res["delegation"]["status"] == "queued"

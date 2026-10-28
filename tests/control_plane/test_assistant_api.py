@@ -251,6 +251,44 @@ def test_memory_correction_via_api(server):
     assert json.loads(body)["content"] == "User prefers tea"
 
 
+def test_connector_crud_and_request(server):
+    status, body = server.post("/api/v1/assistant-connectors",
+                               {"name": "Weather", "kind": "http",
+                                "base_url": "https://w.example.com",
+                                "auth": {"_allowed_origins": ["w.example.com"], "token": "s3cr3t"}},
+                               headers=_uid())
+    assert status == 201
+    cid = json.loads(body)["connector_id"]
+    # auth is never serialized
+    assert json.loads(body)["auth_present"] is True
+    status, body = server.get("/api/v1/assistant-connectors", headers=_uid())
+    assert any(c["connector_id"] == cid for c in json.loads(body)["connectors"])
+    # SSRF-guarded request to a non-allowlisted host
+    status, body = server.post(f"/api/v1/assistant-connectors/{cid}/request",
+                               {"path": "https://evil.example.net/x"}, headers=_uid())
+    assert json.loads(body)["ok"] is False
+    # archive (DELETE)
+    status, _ = server.delete(f"/api/v1/assistant-connectors/{cid}", headers=_uid())
+    assert status == 200
+
+
+def test_delegation_create_list_cancel(server):
+    _, body = server.post("/api/v1/assistants", {"name": "Helper"}, headers=_uid())
+    aid = json.loads(body)["assistant_id"]
+    status, body = server.post("/api/v1/assistant-delegations",
+                               {"assistant_id": aid, "task": "Add a health endpoint"},
+                               headers=_uid())
+    assert status == 201
+    dlg = json.loads(body)
+    assert dlg["status"] == "queued"
+    did = dlg["delegation_id"]
+    status, body = server.post(f"/api/v1/assistant-delegations/{did}/artifact",
+                               {"artifact_ref": "artifact://mission/MSN-1"}, headers=_uid())
+    assert json.loads(body)["status"] == "running"
+    status, body = server.post(f"/api/v1/assistant-delegations/{did}/cancel", {}, headers=_uid())
+    assert json.loads(body)["status"] == "cancelled"
+
+
 def test_diagnostics(server):
     _, body = server.post("/api/v1/assistants", {"name": "Helper"}, headers=_uid())
     aid = json.loads(body)["assistant_id"]

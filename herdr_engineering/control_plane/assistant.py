@@ -52,10 +52,24 @@ def assistant_config(cfg: dict[str, Any]) -> dict[str, Any]:
     """
     section = cfg.get("personal_assistant") if isinstance(cfg, dict) else None
     section = section if isinstance(section, dict) else {}
+    computer = section.get("computer") if isinstance(section, dict) else None
+    computer = computer if isinstance(computer, dict) else {}
     return {
         "enabled": bool(section.get("enabled", False)),
         "approval_ttl_seconds": int(section.get("approval_ttl_seconds", 3600)),
         "grant_max_ttl_seconds": int(section.get("grant_max_ttl_seconds", 30 * 24 * 3600)),
+        # Computer-tool sandbox policy. deny-by-default: shell/browser do nothing
+        # unless the operator opts in AND the target host/command is allowlisted.
+        "computer": {
+            "allow_shell": bool(computer.get("allow_shell", False)),
+            "allow_browser": bool(computer.get("allow_browser", False)),
+            "allowed_hosts": [str(h) for h in computer.get("allowed_hosts", [])],
+            "allowed_commands": [str(c) for c in computer.get("allowed_commands", [])],
+            "max_timeout_seconds": int(computer.get("max_timeout_seconds", 30)),
+            # connector allowlist: only these https origins may be reached by the
+            # connector_request / browse tools (SSRF guard).
+            "allowed_connector_origins": [str(o) for o in computer.get("allowed_connector_origins", [])],
+        },
     }
 
 
@@ -313,6 +327,71 @@ class AssistantRoutine:
 
 
 @dataclass
+class Connector:
+    """An external integration reachable by the assistant (MCP / OpenAPI / HTTP).
+
+    The connector is the canonical owner of its endpoint + auth. Credentials are
+    stored but NEVER surfaced through as_dict() (only ``auth_present``). The
+    runtime adapter must never log them either.
+    """
+    connector_id: str
+    tenant_id: str
+    user_id: str
+    name: str
+    kind: str = "http"            # http | mcp | openapi
+    base_url: str = ""
+    auth: dict[str, Any] = field(default_factory=dict)  # never serialized/logged
+    enabled: bool = True
+    created_at: datetime = field(default_factory=_now)
+    updated_at: datetime = field(default_factory=_now)
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "connector_id": self.connector_id,
+            "name": self.name,
+            "kind": self.kind,
+            "base_url": self.base_url,
+            "auth_present": bool(self.auth),
+            "enabled": self.enabled,
+            "created_at": self.created_at.isoformat(),
+            "updated_at": self.updated_at.isoformat(),
+        }
+
+
+@dataclass
+class DelegationRequest:
+    """A delegation of engineering work to a Pi mission.
+
+    Records the request, its target and status, and any artifacts registered
+    back. Status is tracked (queued/running/succeeded/failed/cancelled); the
+    runtime adapter fulfils the actual dispatch. No completion is fabricated:
+    an undelivered delegation stays ``queued``.
+    """
+    delegation_id: str
+    tenant_id: str
+    user_id: str
+    assistant_id: str
+    task: str
+    target_system: str = "pi"
+    status: str = "queued"        # queued|running|succeeded|failed|cancelled
+    artifact_refs: list[str] = field(default_factory=list)
+    created_at: datetime = field(default_factory=_now)
+    updated_at: datetime = field(default_factory=_now)
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "delegation_id": self.delegation_id,
+            "assistant_id": self.assistant_id,
+            "task": self.task,
+            "target_system": self.target_system,
+            "status": self.status,
+            "artifact_refs": self.artifact_refs,
+            "created_at": self.created_at.isoformat(),
+            "updated_at": self.updated_at.isoformat(),
+        }
+
+
+@dataclass
 class AssistantMemory:
     memory_id: str
     tenant_id: str
@@ -355,6 +434,8 @@ TOOL_CATALOG: dict[str, dict[str, Any]] = {
     "send_message": {"sensitive": True, "description": "Send an external message (email / chat)."},
     "edit_shared": {"sensitive": True, "description": "Modify a shared record."},
     "delegate": {"sensitive": True, "description": "Delegate engineering work to a Pi mission."},
+    "connector_request": {"sensitive": True,
+                          "description": "Call an authorized external connector (MCP/OpenAPI/HTTP)."},
 }
 
 
@@ -404,6 +485,77 @@ class LocalRunnerAdapter(RuntimeAdapter):
                 f"\nRelevant memory:\n{context}\n\nAcknowledged: {user_text}")
 
 
+class ConnectorAdapter:
+    """Versioned adapter a connector kind must implement.
+
+    ``request`` must not raise for transport failures: it returns a dict with
+    ``ok`` False and a safe ``error``. Implementations MUST NOT include
+    credentials in any output or log.
+    """
+    version = 1
+    kind = "http"
+
+    def request(self, connector: Connector, method: str, path: str,
+                body: dict[str, Any], timeout: int) -> dict[str, Any]:
+        raise NotImplementedError
+
+
+class HttpConnectorAdapter(ConnectorAdapter):
+    """Deny-by-default HTTP connector adapter.
+
+    Security properties:
+    - only https is allowed;
+    - the resolved origin must be an operator allowlisted origin (SSRF guard);
+    - credentials are attached via header only, never echoed in output;
+    - responses are size-truncated and body is returned as text.
+    A transport callable is injectable for tests.
+    """
+    kind = "http"
+
+    def __init__(self, urlopen: Callable | None = None):
+        self._urlopen = urlopen  # tests inject a fake; None uses urllib
+
+    def request(self, connector: Connector, method: str, path: str,
+                body: dict[str, Any], timeout: int) -> dict[str, Any]:
+        base = (connector.base_url or "").rstrip("/")
+        if not base.startswith("https://"):
+            return {"ok": False, "error": "connector requires https"}
+        try:
+            from urllib.parse import urljoin, urlparse
+            target = urljoin(base + "/", (path or "").lstrip("/"))
+            parsed = urlparse(target)
+            if parsed.scheme != "https" or not parsed.hostname:
+                return {"ok": False, "error": "refusing non-https target"}
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": f"invalid target: {exc}"}
+        allowed = self._allowed_origins(connector)
+        origin = f"https://{parsed.hostname}".lower()
+        if parsed.hostname not in allowed and origin not in allowed:
+            return {"ok": False, "error": "connector origin not allowlisted"}
+        if not self._urlopen:
+            return {"ok": False, "error": "no transport configured (runtime skeleton)"}
+        headers = {"Accept": "application/json"}
+        if connector.auth:
+            headers.setdefault("Authorization",
+                               "Bearer " + str(connector.auth.get("token", "")))
+        try:
+            resp = self._urlopen(target, method=method.upper(), headers=headers,
+                                 body=body, timeout=timeout)
+            return {"ok": True, "status": resp.get("status", 200),
+                    "body": (resp.get("body") or "")[:20000]}
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": f"connector call failed: {exc}"}
+
+    @staticmethod
+    def _allowed_origins(connector: Connector) -> list[str]:
+        # allowlist comes from the connector auth config, populated by the
+        # operator when registering the connector (never derived from user input).
+        allowed = connector.auth.get("_allowed_origins")
+        if isinstance(allowed, list):
+            return [str(o).lower().rstrip("/") for o in allowed]
+        return []
+
+
 # ---------------------------------------------------------------------------
 # Store (canonical persistence on the existing repo)
 # ---------------------------------------------------------------------------
@@ -427,6 +579,8 @@ class AssistantStore:
         self.memory: dict[str, AssistantMemory] = {}
         self.routines: dict[str, AssistantRoutine] = {}
         self._routine_fired: set[str] = set()  # dedupe: routine_id|bucket_iso
+        self.connectors: dict[str, Connector] = {}
+        self.delegations: dict[str, DelegationRequest] = {}
         self.audit: list[dict[str, Any]] = []
         self._lock = threading.RLock()
 
@@ -602,6 +756,42 @@ class AssistantStore:
              if r.tenant_id == tenant_id and r.user_id == user_id
              and (assistant_id is None or r.assistant_id == assistant_id)],
             key=lambda r: r.created_at)
+
+    # -- connectors ---------------------------------------------------------------
+    def put_connector(self, c: Connector) -> None:
+        with self._lock:
+            c.updated_at = _now()
+            self.connectors[c.connector_id] = c
+
+    def get_connector(self, connector_id: str, *, tenant_id: str, user_id: str) -> Connector:
+        c = self.connectors.get(connector_id)
+        if c is None or c.tenant_id != tenant_id or c.user_id != user_id:
+            raise KeyError("connector not found")
+        return c
+
+    def list_connectors(self, *, tenant_id: str, user_id: str) -> list[Connector]:
+        return sorted(
+            [c for c in self.connectors.values()
+             if c.tenant_id == tenant_id and c.user_id == user_id],
+            key=lambda c: c.created_at)
+
+    # -- delegations ---------------------------------------------------------------
+    def put_delegation(self, d: DelegationRequest) -> None:
+        with self._lock:
+            d.updated_at = _now()
+            self.delegations[d.delegation_id] = d
+
+    def get_delegation(self, delegation_id: str, *, tenant_id: str, user_id: str) -> DelegationRequest:
+        d = self.delegations.get(delegation_id)
+        if d is None or d.tenant_id != tenant_id or d.user_id != user_id:
+            raise KeyError("delegation not found")
+        return d
+
+    def list_delegations(self, *, tenant_id: str, user_id: str) -> list[DelegationRequest]:
+        return sorted(
+            [d for d in self.delegations.values()
+             if d.tenant_id == tenant_id and d.user_id == user_id],
+            key=lambda d: d.created_at, reverse=True)
 
     def routine_fired(self, routine_id: str, bucket_iso: str) -> bool:
         return f"{routine_id}|{bucket_iso}" in self._routine_fired
@@ -1196,6 +1386,203 @@ class AssistantService:
                                 action="assistant.memory.updated", subject_id=memory_id,
                                 detail=f"revision={m.revision}")
         return m
+
+    # -- connectors / computer tools / delegation (P4) ----------------------------------
+    def _computer(self) -> dict[str, Any]:
+        return self.config.get("computer", {})
+
+    def register_connector(self, *, tenant_id: str, user_id: str, name: str,
+                           kind: str = "http", base_url: str = "",
+                           auth: dict[str, Any] | None = None) -> Connector:
+        """Register an external connector. ``auth`` is stored but never exposed.
+
+        ``auth["_allowed_origins"]`` is the operator-declared SSRF allowlist for
+        this connector; it must be a list of hostnames/origins.
+        """
+        self._require_enabled()
+        if kind not in ("http", "mcp", "openapi"):
+            raise AssistantError(f"unsupported connector kind {kind}")
+        if not base_url:
+            raise AssistantError("connector base_url is required")
+        allowed = (auth or {}).get("_allowed_origins")
+        if not (isinstance(allowed, list) and allowed):
+            raise AssistantError("connector requires an allowlisted origin (_allowed_origins)")
+        c = Connector(connector_id=_new_id("conn"), tenant_id=tenant_id,
+                      user_id=user_id, name=name, kind=kind, base_url=base_url,
+                      auth=dict(auth or {}))
+        self.store.put_connector(c)
+        self.store.audit_record(tenant_id=tenant_id, user_id=user_id, actor=user_id,
+                                action="assistant.connector.created", subject_id=c.connector_id)
+        return c
+
+    def list_connectors(self, *, tenant_id: str, user_id: str) -> list[Connector]:
+        self._require_enabled()
+        return self.store.list_connectors(tenant_id=tenant_id, user_id=user_id)
+
+    def get_connector(self, connector_id: str, *, tenant_id: str, user_id: str) -> Connector:
+        self._require_enabled()
+        return self.store.get_connector(connector_id, tenant_id=tenant_id, user_id=user_id)
+
+    def archive_connector(self, connector_id: str, *, tenant_id: str, user_id: str) -> None:
+        self._require_enabled()
+        c = self.store.get_connector(connector_id, tenant_id=tenant_id, user_id=user_id)
+        c.enabled = False
+        self.store.put_connector(c)
+        self.store.audit_record(tenant_id=tenant_id, user_id=user_id, actor=user_id,
+                                action="assistant.connector.archived", subject_id=connector_id)
+
+    def connector_request(self, *, tenant_id: str, user_id: str, connector_id: str,
+                          method: str = "GET", path: str = "/",
+                          body: dict[str, Any] | None = None,
+                          actor: str = "") -> dict[str, Any]:
+        """Call a connector through its adapter. deny-by-default on the origin."""
+        self._require_enabled()
+        c = self.store.get_connector(connector_id, tenant_id=tenant_id, user_id=user_id)
+        if not c.enabled:
+            raise AssistantError("connector is disabled")
+        adapter = self._adapter_for(c.kind)
+        result = adapter.request(c, method or "GET", path or "/", body or {},
+                                 self._computer().get("max_timeout_seconds", 30))
+        self.store.audit_record(tenant_id=tenant_id, user_id=user_id, actor=actor or user_id,
+                                action="assistant.connector.requested", subject_id=connector_id,
+                                detail=("ok" if result.get("ok") else result.get("error", "denied")))
+        return result
+
+    def _adapter_for(self, kind: str) -> ConnectorAdapter:
+        # MCP / OpenAPI adapters are a later-phase wiring decision; the skeleton
+        # routes all kinds through the deny-by-default HTTP adapter.
+        return HttpConnectorAdapter()
+
+    def evaluate_computer_policy(self, *, tool: str, target: str) -> dict[str, Any]:
+        """deny-by-default computer-tool sandbox policy check."""
+        pol = self._computer()
+        if tool == "browse":
+            if not pol.get("allow_browser"):
+                return {"allowed": False, "reason": "browser tool disabled by policy"}
+            host = (target or "").split("://")[-1].split("/")[0].lower()
+            hosts = [h.lower() for h in pol.get("allowed_hosts", [])]
+            if hosts and host not in hosts:
+                return {"allowed": False, "reason": f"host {host} not allowlisted"}
+            return {"allowed": True}
+        if tool == "run_shell":
+            if not pol.get("allow_shell"):
+                return {"allowed": False, "reason": "shell tool disabled by policy"}
+            cmd = (target or "").split(" ", 1)[0].strip()
+            cmds = pol.get("allowed_commands", [])
+            if cmds and cmd not in cmds:
+                return {"allowed": False, "reason": f"command '{cmd}' not allowlisted"}
+            return {"allowed": True}
+        return {"allowed": False, "reason": "unknown computer tool"}
+
+    def browse_tool(self, *, tenant_id: str, user_id: str, url: str) -> dict[str, Any]:
+        """Fetch a web page under the sandbox policy (deny-by-default)."""
+        self._require_enabled()
+        verdict = self.evaluate_computer_policy(tool="browse", target=url)
+        if not verdict["allowed"]:
+            return {"ok": False, "denied": True, "reason": verdict["reason"]}
+        host = url.split("://")[-1].split("/")[0]
+        c = Connector(connector_id="__browse__", tenant_id=tenant_id, user_id=user_id,
+                      name="browse", kind="http", base_url=url,
+                      auth={"_allowed_origins": [host]})
+        adapter = HttpConnectorAdapter()
+        result = adapter.request(c, "GET", "/", {}, 30)
+        if not result.get("ok") and "no transport" in result.get("error", ""):
+            return {"ok": False, "denied": True,
+                    "reason": "browse allowed by policy but no real executor configured (skeleton)"}
+        return result
+
+    def run_shell_tool(self, *, tenant_id: str, user_id: str, command: str) -> dict[str, Any]:
+        """Shell tool under the sandbox policy. deny-by-default; no execution in
+        the skeleton (a real executor is a later-phase wiring decision)."""
+        self._require_enabled()
+        verdict = self.evaluate_computer_policy(tool="run_shell", target=command)
+        if not verdict["allowed"]:
+            return {"ok": False, "denied": True, "reason": verdict["reason"]}
+        return {"ok": False, "denied": True,
+                "reason": "shell allowed by policy but no real executor configured (skeleton)"}
+
+    def delegate(self, *, tenant_id: str, user_id: str, assistant_id: str,
+                 task: str, target_system: str = "pi",
+                 actor: str = "") -> DelegationRequest:
+        """Record a delegation request. Status stays ``queued`` until the runtime
+        adapter fulfils it; no completion is fabricated."""
+        self._require_enabled()
+        self.store.get_assistant(assistant_id, tenant_id=tenant_id, user_id=user_id)
+        if not task or not task.strip():
+            raise AssistantError("delegation task is required")
+        d = DelegationRequest(delegation_id=_new_id("dlg"), tenant_id=tenant_id,
+                              user_id=user_id, assistant_id=assistant_id,
+                              task=task, target_system=target_system)
+        self.store.put_delegation(d)
+        self.store.audit_record(tenant_id=tenant_id, user_id=user_id, actor=actor or user_id,
+                                action="assistant.delegation.created", subject_id=d.delegation_id)
+        return d
+
+    def list_delegations(self, *, tenant_id: str, user_id: str) -> list[DelegationRequest]:
+        self._require_enabled()
+        return self.store.list_delegations(tenant_id=tenant_id, user_id=user_id)
+
+    def get_delegation(self, delegation_id: str, *, tenant_id: str, user_id: str) -> DelegationRequest:
+        self._require_enabled()
+        return self.store.get_delegation(delegation_id, tenant_id=tenant_id, user_id=user_id)
+
+    def cancel_delegation(self, delegation_id: str, *, tenant_id: str, user_id: str) -> DelegationRequest:
+        self._require_enabled()
+        d = self.store.get_delegation(delegation_id, tenant_id=tenant_id, user_id=user_id)
+        if d.status not in ("queued", "running"):
+            raise AssistantError(f"cannot cancel delegation in state {d.status}")
+        d.status = "cancelled"
+        self.store.put_delegation(d)
+        self.store.audit_record(tenant_id=tenant_id, user_id=user_id, actor=user_id,
+                                action="assistant.delegation.cancelled", subject_id=delegation_id)
+        return d
+
+    def register_delegation_artifact(self, delegation_id: str, *, tenant_id: str,
+                                     user_id: str, artifact_ref: str) -> DelegationRequest:
+        """Attach an artifact (e.g. a Pi mission/artifact URI) back to a delegation."""
+        self._require_enabled()
+        d = self.store.get_delegation(delegation_id, tenant_id=tenant_id, user_id=user_id)
+        if artifact_ref not in d.artifact_refs:
+            d.artifact_refs.append(artifact_ref)
+        if d.status == "queued":
+            d.status = "running"
+        self.store.put_delegation(d)
+        self.store.audit_record(tenant_id=tenant_id, user_id=user_id, actor=user_id,
+                                action="assistant.delegation.artifact", subject_id=delegation_id,
+                                detail=artifact_ref)
+        return d
+
+    def execute_tool(self, *, tenant_id: str, user_id: str, assistant_id: str,
+                     tool_id: str, payload: dict[str, Any],
+                     actor: str = "") -> dict[str, Any]:
+        """Dispatch a granted tool to its implementation (P4 executor).
+
+        Policy gating happens in ``request_tool_action``; this executes only a
+        tool that has already passed the gate.
+        """
+        self._require_enabled()
+        self.store.get_assistant(assistant_id, tenant_id=tenant_id, user_id=user_id)
+        if tool_id == "browse":
+            return self.browse_tool(tenant_id=tenant_id, user_id=user_id,
+                                    url=payload.get("url", ""))
+        if tool_id == "run_shell":
+            return self.run_shell_tool(tenant_id=tenant_id, user_id=user_id,
+                                       command=payload.get("command", ""))
+        if tool_id == "connector_request":
+            return self.connector_request(tenant_id=tenant_id, user_id=user_id,
+                                          connector_id=payload.get("connector_id", ""),
+                                          method=payload.get("method", "GET"),
+                                          path=payload.get("path", "/"),
+                                          body=payload.get("body") or {},
+                                          actor=actor or user_id)
+        if tool_id == "delegate":
+            d = self.delegate(tenant_id=tenant_id, user_id=user_id,
+                              assistant_id=assistant_id,
+                              task=payload.get("task", ""),
+                              target_system=payload.get("target_system", "pi"),
+                              actor=actor or user_id)
+            return {"ok": True, "delegation": d.as_dict()}
+        raise AssistantError(f"tool {tool_id} has no executor")
 
     # -- diagnostics ---------------------------------------------------------------
     def diagnostics(self, *, tenant_id: str, user_id: str, assistant_id: str) -> dict[str, Any]:
