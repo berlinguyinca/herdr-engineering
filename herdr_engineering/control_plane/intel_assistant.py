@@ -94,14 +94,25 @@ class ActionBoard:
     def __init__(self, clock=lambda: datetime.now(UTC), ttl: timedelta = timedelta(minutes=30)):
         self._clock, self._ttl = clock, ttl
         self._p: dict[str, Proposal] = {}
+        self._idem: dict[tuple[str, str, str], str] = {}
 
     def request(self, *, org_id: str, requester: str, action: str, payload: dict, resource_version: int,
-                rollback_available: bool = False) -> Proposal:
+                rollback_available: bool = False, idempotency_key: str | None = None) -> Proposal:
         if action not in ACTIONS:
             raise pi.IntelligenceError(f"action {action!r} is not allowed")
+        if idempotency_key is not None:
+            if not isinstance(idempotency_key, str) or not 0 < len(idempotency_key) <= 64:
+                raise pi.IntelligenceError("idempotency key must be 1-64 characters")
+            known = self._p.get(self._idem.get((org_id, requester, idempotency_key), ""))
+            if known is not None:
+                if known.payload_sha256 != payload_hash(payload) or known.action != action:
+                    raise pi.Conflict("idempotency key was already used for a different request")
+                return known
         p = Proposal("act_" + uuid.uuid4().hex, org_id, requester, action, payload, payload_hash(payload), resource_version,
                      self._clock() + self._ttl, rollback_available=rollback_available)
         self._p[p.id] = p
+        if idempotency_key is not None:
+            self._idem[(org_id, requester, idempotency_key)] = p.id
         return p
 
     def approve(self, proposal_id: str, *, approver: str, org_id: str, payload_sha256: str, resource_version: int) -> Proposal:

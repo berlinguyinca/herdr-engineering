@@ -284,3 +284,15 @@ def test_a_restart_rebuilds_the_incident_board_from_durable_streams():
     assert out == {"events": 3, "incidents": 1}
     assert fresh.board.summary()[0]["state"] == "COMPLETED"
     assert fresh.rebuild_board(repo)["incidents"] == 1          # repeatable: duplicates attach, nothing doubles
+
+
+def test_hydration_pages_through_more_events_than_one_page_holds(dsn, clean):
+    from datetime import timedelta
+    small = type("Small", (br.PgPersistence,), {"PAGE": 3})
+    store = br.DurableIntelligenceStore(small(dsn))
+    cfg = {"enabled": True, "ingest": True}
+    for n in range(8):
+        store.append_event(raw(f"id{n}", title=f"e{n}", occurred_at=(T - timedelta(seconds=n)).isoformat()), cfg=cfg)
+    again = br.DurableIntelligenceStore(small(dsn))
+    items = again.timeline(pi.Viewer("o", None, "restricted"), project_id="p1")["items"]
+    assert [i["title"] for i in items] == [f"e{n}" for n in range(7, -1, -1)]      # all 8, oldest first

@@ -210,7 +210,7 @@ class IntelligenceRoutes:
                 if viewer.project_ids is not None and project not in viewer.project_ids:
                     return 404, {"error": "not found"}
                 p = self.board.request(org_id=viewer.org_id, requester=actor, action=str(body.get("action") or ""),
-                                       payload=payload, resource_version=version)
+                                       payload=payload, resource_version=version, idempotency_key=body.get("idempotency_key"))
                 self.store.record_audit({"action": "proposal_requested", "id": p.id, "actor": actor, "kind": p.action})
                 return 201, self._proposal_view(p)
             if len(parts) == 3 and parts[0] == "proposals" and parts[2] in ("approve", "reject"):

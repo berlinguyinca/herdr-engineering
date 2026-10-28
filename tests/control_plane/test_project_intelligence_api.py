@@ -152,3 +152,14 @@ def test_proposals_need_suggest_a_different_approver_and_the_exact_payload():
     listed = r.get(["proposals"], {}, KEY, "operator")[1]
     assert all(i["state"] == "awaiting_approval" for i in listed["items"])
     assert r.get(["proposals"], {}, KEY, "viewer")[0] == 200 and r.post(["proposals"], body, KEY, "viewer")[0] == 404
+
+
+def test_proposal_idempotency_key_returns_the_same_proposal_and_refuses_reuse_with_a_different_request():
+    r = routes(dict(FULL, default_org_id="org1", viewers={"key:abc": {"org_id": "org1", "projects": "*"}}))
+    body = {"action": "pause_ingestion", "payload": {"project": "p1"}, "resource_version": 1, "idempotency_key": "k-1"}
+    a = r.post(["proposals"], body, KEY, "operator")[1]
+    assert r.post(["proposals"], body, KEY, "operator")[1]["id"] == a["id"]
+    assert len(r.get(["proposals"], {}, KEY, "operator")[1]["items"]) == 1
+    changed = dict(body, payload={"project": "p2"})
+    assert r.post(["proposals"], changed, KEY, "operator")[0] == 409
+    assert r.post(["proposals"], dict(body, idempotency_key=""), KEY, "operator")[0] == 400

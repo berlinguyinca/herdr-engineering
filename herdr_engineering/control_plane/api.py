@@ -2420,7 +2420,11 @@ def _make_handler(server, public=False, operator=False):
             if resource == "architecture":
                 return self._architecture_post(parts)
             if resource == "intelligence":
-                status, body = server.intelligence.post(parts[4:], self._read_json() or {}, self._principal(), self._role())
+                payload = self._read_json() or {}
+                key = self.headers.get("Idempotency-Key")
+                if isinstance(payload, dict) and key and "idempotency_key" not in payload:
+                    payload["idempotency_key"] = key
+                status, body = server.intelligence.post(parts[4:], payload, self._principal(), self._role())
                 return self._json(body, status)
             # artifact upload carries raw bytes, not JSON — handle first
             if resource == "artifacts" and len(parts) == 4:

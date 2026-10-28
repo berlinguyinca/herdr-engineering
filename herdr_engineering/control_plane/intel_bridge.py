@@ -136,10 +136,20 @@ class PgPersistence:
                 org_id, source_system, paused)
         self._do(go)
 
+    PAGE = 2000
+
     def load(self) -> dict:
         async def go(c):
+            events, after = [], ""
+            while True:        # keyset pages, so start-up never holds one giant result set while building objects
+                page = await c.fetch("select * from pi_event where event_id > $1 order by event_id limit $2", after, self.PAGE)
+                events.extend(page)
+                if len(page) < self.PAGE:
+                    break
+                after = page[-1]["event_id"]
+            events.sort(key=lambda r: (r["occurred_at"], r["event_id"]))
             return {
-                "events": await c.fetch("select * from pi_event order by occurred_at, event_id"),
+                "events": events,
                 "records": await c.fetch("select * from pi_record"),
                 "rels": await c.fetch("select * from pi_relationship"),
                 "findings": await c.fetch("select * from pi_finding"),
