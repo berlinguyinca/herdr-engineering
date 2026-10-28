@@ -4,7 +4,7 @@ from __future__ import annotations
 import hashlib
 import threading
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
@@ -26,6 +26,8 @@ class PlacementRequest:
     required_tags: frozenset[str] = frozenset()
     priority: str = "normal"
     idempotency_key: str | None = None
+    mission_id: str | None = None
+    spawn_depth: int = 0
 
     @property
     def cpu(self) -> float:
@@ -51,6 +53,7 @@ class HostCapacity:
     total_disk_gib: float = 0
     used_disk_gib: float = 0
     reserved_disk_gib: float = 0
+    reason_codes: tuple[str, ...] = ()
 
     def fits(self, request: PlacementRequest) -> bool:
         return (
@@ -84,6 +87,8 @@ class Reservation:
     decision: PlacementDecision
     lease_id: str | None = None
     lease_token: str | None = None
+    request_snapshot: dict | None = None
+    queued_at: str | None = None
 
     def to_dict(self) -> dict:
         data = {
@@ -98,6 +103,8 @@ class Reservation:
             "state": self.state,
             "lease_id": self.lease_id,
             "lease_token": self.lease_token,
+            "request_snapshot": self.request_snapshot,
+            "queued_at": self.queued_at,
             "decision": {
                 "request_id": self.decision.request_id,
                 "state": self.decision.state,
@@ -111,13 +118,51 @@ class Reservation:
 
 
 class Scheduler:
-    def __init__(self, hosts: Callable[[], Iterable[tuple[HostSnapshot, HostCapacity]]], *, reservation_ttl=90.0):
+    def __init__(self, hosts: Callable[[], Iterable[tuple[HostSnapshot, HostCapacity]]], *, reservation_ttl=90.0,
+                 owner_concurrency_limit=20, project_concurrency_limit=50,
+                 mission_concurrency_limit=20, owner_cpu_limit=32, owner_memory_limit=64,
+                 maximum_spawn_depth=3, parent_concurrency_limit=8, parent_burst_limit=20):
         self._hosts = hosts
         self._ttl = max(1.0, float(reservation_ttl))
         self._lock = threading.RLock()
         self._reservations: dict[str, Reservation] = {}
         self._by_request: dict[str, str] = {}
         self._rotation = 0
+        self.owner_concurrency_limit = max(1, int(owner_concurrency_limit))
+        self.project_concurrency_limit = max(1, int(project_concurrency_limit))
+        self.mission_concurrency_limit = max(1, int(mission_concurrency_limit))
+        self.owner_cpu_limit = max(0, float(owner_cpu_limit))
+        self.owner_memory_limit = max(0, float(owner_memory_limit))
+        self.maximum_spawn_depth = max(0, int(maximum_spawn_depth))
+        self.parent_concurrency_limit = max(1, int(parent_concurrency_limit))
+        self.parent_burst_limit = max(1, int(parent_burst_limit))
+
+    def contextualize(self, request):
+        """Derive ancestry from admitted requests, never a caller's depth hint."""
+        parent = request.parent_agent_id
+        depth, visited = 0, {request.request_id}
+        inherited = {}
+        while parent is not None:
+            if parent in visited:
+                raise ValueError("cyclic scheduler ancestry")
+            visited.add(parent)
+            reservation_id = self._by_request.get(parent)
+            ancestor = self._reservations.get(reservation_id)
+            if ancestor is None or ancestor.request_snapshot is None:
+                raise ValueError("authoritative parent context is unavailable")
+            context = ancestor.request_snapshot
+            if context.get("owner_id") != request.owner_id:
+                raise PermissionError("parent owner does not authorize this child")
+            if depth == 0:
+                inherited = context
+            parent = context.get("parent_agent_id")
+            depth += 1
+        for field in ("mission_id", "project_id"):
+            if inherited.get(field) is not None and getattr(request, field) not in (None, inherited[field]):
+                raise PermissionError(f"child cannot change inherited {field}")
+        return replace(request, spawn_depth=depth,
+                       mission_id=inherited.get("mission_id") or request.mission_id,
+                       project_id=inherited.get("project_id") or request.project_id)
 
     def _snapshot(self):
         return list(self._hosts())
@@ -138,6 +183,7 @@ class Scheduler:
             reserved_memory_gib=capacity.reserved_memory_gib + memory,
             total_disk_gib=capacity.total_disk_gib, used_disk_gib=capacity.used_disk_gib,
             reserved_disk_gib=capacity.reserved_disk_gib + disk,
+            reason_codes=capacity.reason_codes,
         )
 
     def _score(self, request, snapshot, capacity):
@@ -153,12 +199,46 @@ class Scheduler:
         return round(score, 6)
 
     def plan(self, request: PlacementRequest, *, explicit_host_uid: str | None = None) -> PlacementDecision:
+        request = self.contextualize(request)
         now = datetime.now(UTC)
         explanations: dict[str, dict] = {}
         candidates: list[tuple[float, HostSnapshot, HostCapacity]] = []
         explicit = explicit_host_uid or request.explicit_host_uid
         snapshots = [(snapshot, self._capacity(snapshot, capacity))
                      for snapshot, capacity in self._snapshot()]
+        legacy_context = any(reservation.state in {"reserved", "committed"}
+                             and not reservation.request_snapshot
+                             for reservation in self._reservations.values())
+        workspace_busy = request.workspace_id is not None and any(
+            reservation.request_id != request.request_id
+            and reservation.state in {"reserved", "committed"}
+            and (reservation.request_snapshot or {}).get("workspace_id") == request.workspace_id
+            for reservation in self._reservations.values())
+        active = [reservation for reservation in self._reservations.values()
+                  if reservation.request_id != request.request_id and reservation.state in {"reserved", "committed"}]
+        owner_full = sum((reservation.request_snapshot or {}).get("owner_id") == request.owner_id
+                         for reservation in active) >= self.owner_concurrency_limit
+        project_full = request.project_id is not None and sum(
+            (reservation.request_snapshot or {}).get("project_id") == request.project_id
+            for reservation in active) >= self.project_concurrency_limit
+        mission_full = request.mission_id is not None and sum(
+            (reservation.request_snapshot or {}).get("mission_id") == request.mission_id
+            for reservation in active) >= self.mission_concurrency_limit
+        owned = [reservation for reservation in active
+                 if (reservation.request_snapshot or {}).get("owner_id") == request.owner_id]
+        owner_resources_full = (sum(reservation.requested_cpu for reservation in owned) + request.cpu > self.owner_cpu_limit
+                                or sum(reservation.requested_memory for reservation in owned) + request.memory > self.owner_memory_limit)
+        siblings = [reservation for reservation in self._reservations.values()
+                    if request.parent_agent_id is not None and reservation.request_id != request.request_id
+                    and (reservation.request_snapshot or {}).get("parent_agent_id") == request.parent_agent_id]
+        parent_full = sum(reservation.state in {"reserved", "committed"} for reservation in siblings) >= self.parent_concurrency_limit
+        recent_children = 0
+        for sibling in siblings:
+            try:
+                created = datetime.fromisoformat(sibling.queued_at)
+                recent_children += 0 <= (now - created).total_seconds() < 600
+            except (ValueError, TypeError):
+                recent_children += 1
         for snapshot, capacity in snapshots:
             eligibility = evaluate_eligibility(
                 snapshot, placement_mode=request.placement_mode,
@@ -166,6 +246,25 @@ class Scheduler:
                 required_tags=request.required_tags, now=now,
             )
             reasons = list(eligibility.reason_codes)
+            if legacy_context:
+                reasons.append("LEGACY_CONTEXT_UNKNOWN")
+            if owner_full:
+                reasons.append("USER_QUOTA")
+            if owner_resources_full:
+                reasons.append("USER_RESOURCE_QUOTA")
+            if project_full:
+                reasons.append("PROJECT_QUOTA")
+            if mission_full:
+                reasons.append("MISSION_QUOTA")
+            if request.spawn_depth > self.maximum_spawn_depth:
+                reasons.append("SPAWN_DEPTH_LIMIT")
+            if parent_full:
+                reasons.append("SPAWN_FANOUT_LIMIT")
+            if recent_children >= self.parent_burst_limit:
+                reasons.append("SPAWN_RATE_LIMIT")
+            if workspace_busy:
+                reasons.append("WORKSPACE_LOCK")
+            reasons.extend(capacity.reason_codes)
             if eligibility.eligible and not capacity.fits(request):
                 reasons.append("RESERVATION_CAPACITY")
             score = self._score(request, snapshot, capacity) if not reasons else 0.0
@@ -179,6 +278,7 @@ class Scheduler:
                     "total_cpu": capacity.total_cpu,
                     "available_cpu": max(0.0, capacity.total_cpu - capacity.used_cpu - capacity.reserved_cpu),
                     "available_memory_gib": max(0.0, capacity.total_memory_gib - capacity.used_memory_gib - capacity.reserved_memory_gib),
+                    "total_memory_gib": capacity.total_memory_gib,
                 },
             }
             if not reasons:
@@ -196,6 +296,7 @@ class Scheduler:
 
     def reserve(self, request: PlacementRequest) -> Reservation:
         with self._lock:
+            request = self.contextualize(request)
             existing_id = self._by_request.get(request.request_id)
             if existing_id:
                 return self._reservations[existing_id]
@@ -208,30 +309,75 @@ class Scheduler:
                 policy_revision=decision.explanations.get(decision.selected_host_uid or "", {}).get("policy_revision", 0),
                 expires_at=now + timedelta(seconds=self._ttl), state="reserved" if decision.selected_host_uid else "queued",
                 decision=decision,
+                request_snapshot={**asdict(request), "required_tags": sorted(request.required_tags)},
+                queued_at=now.isoformat(),
             )
             self._reservations[reservation.reservation_id] = reservation
             self._by_request[request.request_id] = reservation.reservation_id
             return reservation
 
+    def retry_queued(self, reservation_id: str) -> Reservation:
+        with self._lock:
+            reservation = self._reservations[reservation_id]
+            if reservation.state != "queued":
+                raise RuntimeError("only queued reservations can be retried")
+            if reservation.request_snapshot is None:
+                raise RuntimeError("queued request context is unavailable")
+            request = PlacementRequest(**reservation.request_snapshot)
+            decision = self.plan(request)
+            reservation.decision = decision
+            reservation.host_uid = decision.selected_host_uid
+            reservation.policy_revision = decision.explanations.get(
+                decision.selected_host_uid or "", {}).get("policy_revision", 0)
+            reservation.state = "reserved" if reservation.host_uid else "queued"
+            reservation.expires_at = datetime.now(UTC) + timedelta(seconds=self._ttl)
+            return reservation
+
     def commit(self, reservation_id: str) -> Reservation:
         with self._lock:
             reservation = self._reservations[reservation_id]
+            if not reservation.request_snapshot:
+                raise RuntimeError("legacy reservation requires operator reconciliation")
             if reservation.state == "committed":
                 return reservation
             if reservation.state != "reserved":
                 raise RuntimeError(f"reservation is {reservation.state}")
+            if reservation.expires_at <= datetime.now(UTC):
+                raise RuntimeError("reservation expired before commit")
             current = {s.host_uid: (s, c) for s, c in self._snapshot()}.get(reservation.host_uid)
             if current is None or current[0].policy.revision != reservation.policy_revision:
                 reservation.state = "queued"
                 raise RuntimeError("policy changed before commit")
-            eligibility = evaluate_eligibility(current[0], placement_mode="automatic", now=datetime.now(UTC))
+            request = reservation.request_snapshot or {}
+            eligibility = evaluate_eligibility(
+                current[0], placement_mode=request.get("placement_mode", "automatic"),
+                explicit_host_uid=request.get("explicit_host_uid"),
+                required_tags=request.get("required_tags", ()), now=datetime.now(UTC))
             if not eligibility.eligible:
                 reservation.state = "queued"
                 raise RuntimeError("policy changed before commit")
+            self._validate_capacity(*current)
             reservation.state = "committed"
             reservation.lease_id = f"lease_{uuid4().hex}"
             reservation.lease_token = uuid4().hex
             return reservation
+
+    def validate_execution_capacity(self, host_uid):
+        """Recheck all held reservations against current host facts before launch."""
+        with self._lock:
+            current = next(((s, c) for s, c in self._snapshot() if s.host_uid == host_uid), None)
+            if current is None:
+                raise RuntimeError("host capacity unavailable before execution")
+            self._validate_capacity(*current)
+
+    def _validate_capacity(self, snapshot, base_capacity):
+        capacity = self._capacity(snapshot, base_capacity)
+        if capacity.reason_codes:
+            raise RuntimeError("host capacity changed before execution: " + ",".join(capacity.reason_codes))
+        if (capacity.used_cpu + capacity.reserved_cpu > capacity.total_cpu
+                or capacity.used_memory_gib + capacity.reserved_memory_gib > capacity.total_memory_gib
+                or capacity.used_disk_gib + capacity.reserved_disk_gib > capacity.total_disk_gib):
+            raise RuntimeError("host capacity changed before execution")
 
     def release(self, reservation_id: str, *, state="released") -> Reservation:
         with self._lock:
@@ -273,6 +419,8 @@ class Scheduler:
                         expires_at=datetime.fromisoformat(row["expires_at"]), state=str(row.get("state", "queued")),
                         lease_id=row.get("lease_id"),
                         lease_token=row.get("lease_token"),
+                        request_snapshot=row.get("request_snapshot"),
+                        queued_at=row.get("queued_at"),
                         decision=PlacementDecision(
                             request_id=str(decision.get("request_id", row["request_id"])),
                             state=str(decision.get("state", "queued")),

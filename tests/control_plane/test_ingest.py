@@ -52,7 +52,7 @@ def test_ingest_batch_rejects_unbounded_payload():
         make_svc().ingest_batch([{}] * 65)
 
 
-def test_scheduler_registration_updates_known_host_without_losing_metrics():
+def test_generic_heartbeat_preserves_metrics_without_granting_scheduler_authority():
     repo = ControlPlaneRepo()
     svc = make_svc(repo)
     body = {"source": "fabric-agent", "entity_type": "host", "entity_id": "beast",
@@ -67,9 +67,11 @@ def test_scheduler_registration_updates_known_host_without_losing_metrics():
         "sequence": 7, "freshness_seconds": 1, "confidence": "observed",
     }
     svc.ingest(body)
-    assert repo.host_snapshot("beast").host_uid == "uid-beast"
+    assert repo.host_snapshot("beast").host_uid == "beast"
+    assert not repo.host_snapshot("beast").owned
+    assert not repo.host_snapshot("beast").trusted
     assert repo.host_snapshot("beast").telemetry_freshness_seconds == 1
-    assert repo.get_host("beast")["scheduler_capacity"] == {"total_cpu": 8}
+    assert repo.get_host("beast").get("scheduler_capacity") is None
     assert repo.get_host("beast")["latest"]["cpu"] == 12
     assert repo.list_telemetry("beast", limit=1)[0]["sequence"] == 7
     events = repo.stream("host", "beast")
@@ -667,7 +669,6 @@ def test_ingest_usage_rejects_invalid_shapes():
 
 
 def test_ingest_usage_rejects_nonfinite_and_negative_values():
-    import math
     repo = ControlPlaneRepo()
     svc = make_svc(repo)
     bad_tokens = [float("nan"), float("inf"), float("-inf"), -1, True]
@@ -719,7 +720,6 @@ def test_usage_and_stage_analytics_survive_export_import():
 def test_usage_and_stage_analytics_survive_event_only_reload():
     """Durable bridge reload restores event streams with no delivery snapshot; the
     rebuild must regenerate usage and stage projections from those events (codex P1)."""
-    import json as _json
     clock = {"t": 1_700_000_000.0}
     repo = ControlPlaneRepo(now=lambda: clock["t"])
     svc = make_svc(repo)
@@ -805,6 +805,7 @@ def test_v2_resource_usage_envelope_not_double_counted():
 def test_usage_rejects_malformed_occurred_at():
     """A garbage occurred_at must not break the retention sweep later."""
     import datetime as _dt
+
     from herdr_engineering.control_plane.retention import sweep_token_usage
     clock = {"t": _dt.datetime(2026, 10, 23, tzinfo=_dt.UTC).timestamp()}
     repo = ControlPlaneRepo(now=lambda: clock["t"])
@@ -821,8 +822,9 @@ def test_v2_usage_namespaces_mission_and_preserves_envelope_timestamp():
     """Usage ingested from a non-herdr source is aggregated under the namespaced
     mission (pi:M1, not bare M1), and a backdated envelope timestamp is kept so
     retention ages the projection out (codex P2)."""
-    from herdr_engineering.control_plane.retention import sweep_token_usage
     import datetime as _dt
+
+    from herdr_engineering.control_plane.retention import sweep_token_usage
     clock = {"t": _dt.datetime(2026, 10, 23, tzinfo=_dt.UTC).timestamp()}
     repo = ControlPlaneRepo(now=lambda: clock["t"])
     svc = make_svc(repo)
@@ -871,6 +873,7 @@ def test_usage_projection_rebuild_keeps_backdated_timestamp():
     """An event-only reload must keep the backdated envelope timestamp so the
     rebuilt projection still ages out under retention (codex P1)."""
     import datetime as _dt
+
     from herdr_engineering.control_plane.retention import sweep_token_usage
     clock = {"t": _dt.datetime(2026, 10, 23, tzinfo=_dt.UTC).timestamp()}
     repo = ControlPlaneRepo(now=lambda: clock["t"])
@@ -924,6 +927,7 @@ def test_resource_usage_projection_is_pruned_by_event_retention():
     """The general event retention policy must also age out the resource_usage
     projection so usage_analytics() stops reporting expired totals (codex P2)."""
     import datetime as _dt
+
     from herdr_engineering.control_plane.retention import apply_retention
     clock = {"t": _dt.datetime(2026, 10, 23, tzinfo=_dt.UTC).timestamp()}
     repo = ControlPlaneRepo(now=lambda: clock["t"])

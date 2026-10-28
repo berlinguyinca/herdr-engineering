@@ -142,7 +142,7 @@ def evaluate_eligibility(
         reasons.append("HOST_MANUAL_ONLY")
     if snapshot.policy.mode is PolicyMode.DISABLED:
         reasons.append("HOST_DISABLED")
-    if snapshot.policy.mode is PolicyMode.DRAINING and not explicit:
+    if snapshot.policy.mode is PolicyMode.DRAINING:
         reasons.append("HOST_DRAINING")
     if snapshot.policy.maintenance_until and snapshot.policy.maintenance_until > now:
         reasons.append("HOST_MAINTENANCE")
@@ -156,7 +156,7 @@ def evaluate_eligibility(
         # explicit reason prevents future callers from treating lineage as pin.
         reasons.append("PARENT_HOST_NOT_IMPLICIT")
     # An explicit host may bypass automatic-mode gating, never safety gates.
-    safety = {"HOST_NOT_OWNED", "HOST_UNTRUSTED", "HOST_UNREACHABLE", "HOST_STALE", "HOST_DISABLED", "HOST_MAINTENANCE", "HOST_POLICY_DENY", "HOST_POLICY_ALLOWLIST"}
+    safety = {"HOST_NOT_OWNED", "HOST_UNTRUSTED", "HOST_UNREACHABLE", "HOST_STALE", "HOST_DISABLED", "HOST_DRAINING", "HOST_MAINTENANCE", "HOST_POLICY_DENY", "HOST_POLICY_ALLOWLIST"}
     eligible = not (set(reasons) & safety) and (explicit or snapshot.policy.mode is PolicyMode.AUTOMATIC)
     return Eligibility(eligible, tuple(dict.fromkeys(reasons)), snapshot.policy.revision, snapshot)
 
