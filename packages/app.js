@@ -21,6 +21,7 @@ import { mountReviewGate } from './review-gate-view.js';
 import { mountTopology } from './topology-view.js';
 import { mountArchitecture } from './architecture-view.js';
 import { mountPersonalAssistant } from './personal-assistant-view.js';
+import { mountProjectIntelligence } from './project-intelligence-view.js';
 import { visibleNav } from './nav-capabilities.js';
 import { mountSessionsView, sessionEntries } from './sessions-view.js';
 import { recordOutcome, statusOutcome } from './record-state.js';
@@ -96,6 +97,7 @@ const NAV = [
   { path: '/scheduling', label: 'Scheduling' },
   { path: '/handoffs', label: 'Handoffs' },
   { path: '/personal-assistant', label: 'Personal Assistant', capability: 'assistant_v1' },
+  { path: '/intelligence', label: 'Project intelligence', capability: 'project_intelligence_v1' },
 ];
 
 const SHELL = document.getElementById('shell');
@@ -161,6 +163,7 @@ const ROUTES = {
   '/services/:id': viewService,
   '/hosts': viewHosts,
   '/personal-assistant': viewPersonalAssistant,
+  '/intelligence': viewIntelligence,
   '/hosts/:id': viewHost,
   '/activity': viewActivity,
   '/analytics': viewAnalytics,
@@ -213,6 +216,15 @@ async function viewPersonalAssistant() {
   const chip = root.querySelector('herdr-freshness');
   return { dispose: mountPersonalAssistant(root.querySelector('#personal-assistant'), client,
     { onFreshness: (ok, message) => chip.touch(ok, message) }) };
+}
+
+async function viewIntelligence() {
+  root.innerHTML = `${liveHead('<h1>Project intelligence</h1>')}<div id="project-intelligence"></div>`;
+  const chip = root.querySelector('herdr-freshness');
+  const view = mountProjectIntelligence(root.querySelector('#project-intelligence'), client, { query: route().query,
+    onFreshness: (ok, message) => chip.touch(ok, message),
+    setQuery: (o) => history.replaceState(null, '', `#/intelligence${Object.keys(o).length ? `?${new URLSearchParams(o)}` : ''}`) });
+  return { dispose: view.dispose, refresh: view.refresh };
 }
 
 function mountView(view) {

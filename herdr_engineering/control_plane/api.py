@@ -466,11 +466,38 @@ class ControlPlaneServer:
             digest = hashlib.sha256(key.encode()).hexdigest()[:12]
             self.architecture_agent_hosts[f"key:{digest}"] = frozenset(hosts)
         self.architecture.gate_store_fn = lambda: self.gate_store
+        from .intel_bridge import install as install_intelligence
+        self.intelligence, self.intelligence_bridge = install_intelligence(
+            repo, lambda: self._intelligence_section(fleet_config), github_pg_dsn)
+        repo.egress_fn = lambda: self._intelligence_section(fleet_config).get("egress") or {}
+        self.intelligence.metrics_fn = self._intelligence_metrics
+        self.intelligence.github_app_fn = lambda: getattr(self, "gate_app", None)
+        if getattr(self, "assistant", None) is not None:
+            self.assistant.intelligence_read = self.intelligence.assistant_read
         self._configure_architecture_explain(fleet_config, architecture_explain)
         if collab is not None:
             collab.architecture = self.architecture
         # live stream (Spec §52)
         repo.subscribe(self._broadcast)
+
+    def _intelligence_metrics(self) -> dict:
+        from collections import Counter
+        bridge = self.intelligence_bridge
+        return {"bridge": dict(bridge.stats), "queue_depth": bridge._q.qsize(),
+                "incidents": dict(Counter(i["state"] for i in bridge.board.summary()))}
+
+    @staticmethod
+    def _intelligence_section(fleet_config):
+        """`control_plane.project_intelligence` read on every request (hot kill switch); {} when absent."""
+        if fleet_config is None:
+            return {}
+        from ..fleet_config import FleetConfigError
+        try:
+            section = fleet_config.current().section("control_plane")
+        except FleetConfigError:
+            return {}
+        value = (section or {}).get("project_intelligence")
+        return value if isinstance(value, dict) else {}
 
     @staticmethod
     def _architecture_enabled(fleet_config, override):
@@ -600,6 +627,7 @@ class ControlPlaneServer:
         # The queue's real lease and the lease a Claim reports must be one value.
         self.gate_queue = ReviewQueue(repo, lease_seconds=config.reviewer.lease_seconds)
         app = github_app.GitHubAppClient(config.app)  # one client for gate + coordinator
+        self.gate_app = app
         registry = AuthorRegistry(repo)
         notifier = AuthorNotifier(repo, config=config.notify, registry=registry,
                                   dispatcher=self.dispatcher)
@@ -613,6 +641,7 @@ class ControlPlaneServer:
             ci_snapshot=lambda: self.ci_monitor.snapshot(start=False),
             notifier=notifier,
             main_verifier=self.gate_main,
+            repair_gate=self._build_repair_gate(app, fleet_config, repo, registry),
         )
         self.gate_reviewer_config = config.reviewer
         self.gate_coordinator = ReviewCoordinator(
@@ -626,6 +655,47 @@ class ControlPlaneServer:
         # starts the poller, so the server starts the shared monitor itself.
         self.ci_monitor.start()
         self.gate_service.start()
+
+    def _build_repair_gate(self, app, fleet_config, repo=None, registry=None):
+        """Inert unless ``project_intelligence.repair.enabled``; read on every PR so the kill switch is hot.
+
+        Once repair has been seen enabled, an unreadable central config means "kill switch on" (reject), never
+        "policy absent" (which would let merges proceed unchecked).
+        """
+        from ..fleet_config import FleetConfigError
+        from . import repair_policy as rp
+        from .repair_gate import make_repair_gate, policy_from_section
+        seen = {"enabled": False}
+
+        def policy():
+            if fleet_config is None:
+                return None
+            try:
+                section = fleet_config.current().section("control_plane")
+            except FleetConfigError:
+                return rp.RepairPolicy(kill_switch=True) if seen["enabled"] else None
+            value = ((section or {}).get("project_intelligence") or {})
+            result = policy_from_section(value.get("repair") if isinstance(value, dict) else None)
+            seen["enabled"] = seen["enabled"] or result is not None
+            return result
+
+        def families():
+            value = self._intelligence_section(fleet_config).get("repair")
+            fam = value.get("model_families") if isinstance(value, dict) else None
+            return fam if isinstance(fam, dict) else {}
+
+        facts = None
+        if repo is not None and registry is not None:
+            from .repair_gate import make_facts_fn
+            facts = make_facts_fn(app=app, repo=repo, registry=registry, families_fn=families,
+                                  board_lookup=lambda k: self.intelligence_bridge.board._pr.get(k))
+        extra = {"facts_fn": facts} if facts else {}
+        if repo is not None:
+            from .repair_gate import make_counters
+            # looked up per call: the gate is built before project intelligence is installed
+            attempt, open_prs = make_counters(app=app, repo=repo, board_lookup=lambda k: self.intelligence_bridge.board._pr.get(k))
+            extra.update(attempt_fn=attempt, open_repair_prs_fn=open_prs)
+        return make_repair_gate(app=app, policy_fn=policy, **extra)
 
     def _dispatch_native_message(self, record, message, artifact_ids):
         from ..errors import InvalidError
@@ -679,6 +749,8 @@ class ControlPlaneServer:
             h["capabilities"].append("collab_v1")
         if getattr(self, "assistant", None) is not None and self.assistant.config.get("enabled"):
             h["capabilities"].append("assistant_v1")
+        if getattr(self, "intelligence", None) is not None and self.intelligence._cfg()[0]["enabled"]:
+            h["capabilities"].append("project_intelligence_v1")
         if self.architecture.enabled:
             h["capabilities"].append("architecture_v1")
             if self.architecture.explain_config:
@@ -1308,6 +1380,8 @@ def _make_handler(server, public=False, operator=False):
                 return self._collab()
             if self._path_only() == _FLEET_CONFIG_PATH + "/applied":
                 return self._fleet_config_applied()
+            if self._path_only() == "/api/v1/intelligence/webhooks/github":
+                return self._intelligence_webhook()
             # The ingest route is reachable by the ingest role; every other
             # POST requires the operator role (Spec §104).
             path = self.path.split("?")[0]
@@ -1336,6 +1410,17 @@ def _make_handler(server, public=False, operator=False):
             if self.path.startswith("/api/v1/"):
                 return self._route_api()
             return self._send_json(404, {"error": "not found"})
+
+        def _intelligence_webhook(self):
+            # HMAC-authenticated (no API key); 404 while unconfigured. Body is bounded before it is read.
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                return self._deny(400, "bad length")
+            if length < 0 or length > 1_000_000:
+                return self._send_json(413, {"error": "body too large"})
+            status, body = server.intelligence.post_webhook(self.headers, self.rfile.read(length))
+            return self._send_json(status, body)
 
         def do_PATCH(self):
             # PATCH/DELETE are enabled ONLY for the assistant resource family.
@@ -1926,6 +2011,11 @@ def _make_handler(server, public=False, operator=False):
                 return self._json(server._health())
             if resource == "architecture":
                 return self._architecture_get(parts)
+            if resource == "intelligence":
+                status, body = server.intelligence.get(
+                    parts[4:], {k: v[0] for k, v in parse_qs(urlsplit(self.path).query).items()},
+                    self._principal(), self._role())
+                return self._json(body, status)
             if resource == "mission-activity" and len(parts) == 4:
                 return self._json({"activities": r.mission_activity.list_summaries(),
                                    "server_time": r._stamp()})
@@ -2341,6 +2431,13 @@ def _make_handler(server, public=False, operator=False):
                 return self._inspector_set_prefs(parts[4])
             if resource == "architecture":
                 return self._architecture_post(parts)
+            if resource == "intelligence":
+                payload = self._read_json() or {}
+                key = self.headers.get("Idempotency-Key")
+                if isinstance(payload, dict) and key and "idempotency_key" not in payload:
+                    payload["idempotency_key"] = key
+                status, body = server.intelligence.post(parts[4:], payload, self._principal(), self._role())
+                return self._json(body, status)
             # artifact upload carries raw bytes, not JSON — handle first
             if resource == "artifacts" and len(parts) == 4:
                 return self._upload_artifact(r, parts)

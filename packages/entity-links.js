@@ -24,6 +24,8 @@ export const ENTITY_ROUTES = {
   pr: (id, p) => `#/reviews${q({ search: id, ...p })}`,
   project: (id, p) => `#/github${q({ repository: id, ...p })}`,
   'llm-session': (id, p) => `#/llm/session/${enc(id)}${q(p)}`,
+  artifact: (id, p) => `#/artifacts/${enc(id)}${q(p)}`,
+  'intel-project': (id, p) => `#/intelligence${q({ project: id, ...p })}`,
 };
 export const ENTITY_KINDS = Object.keys(ENTITY_ROUTES);
 
@@ -35,7 +37,7 @@ export function entityHref(kind, id, params) {
   return ENTITY_ROUTES[kind](text, params);
 }
 
-const KIND_NAME = { mission: 'Mission', session: 'Agent', host: 'Host', service: 'Service', ci: 'CI run', review: 'Review', pr: 'Pull request', project: 'Project', 'llm-session': 'LLM usage' };
+const KIND_NAME = { mission: 'Mission', session: 'Agent', host: 'Host', service: 'Service', ci: 'CI run', review: 'Review', pr: 'Pull request', project: 'Project', 'llm-session': 'LLM usage', artifact: 'Artifact' };
 const clip = (v) => (typeof v === 'string' ? v.trim().slice(0, 120) : '');
 
 // A short human label; the raw id comes last and only when nothing better is known.

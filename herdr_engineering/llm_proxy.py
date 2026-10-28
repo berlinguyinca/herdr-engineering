@@ -78,6 +78,7 @@ class ProxyState:
         self.refresh_seconds = refresh_seconds
         self._keys: dict[str, dict] = {}
         self._models: dict[str, dict] = {}
+        self._egress: dict = {}
         self._lock = threading.Lock()
         self._slots: dict[str, threading.BoundedSemaphore] = {}
         self._inflight: dict[str, int] = {}
@@ -99,6 +100,7 @@ class ProxyState:
         with self._lock:
             self._keys = {k["key_hash"]: k for k in cfg.get("keys", [])}
             self._models = {m["name"]: m for m in cfg.get("custom_models", [])}
+            self._egress = cfg.get("egress") if isinstance(cfg.get("egress"), dict) else {}
             self._last = time.monotonic()
 
     def authenticate(self, presented: str) -> dict | None:
@@ -220,6 +222,27 @@ class ProxyState:
             return self.upstream, self.upstream_key, concrete
         return custom["base_url"], None, custom.get("upstream_model") or model
 
+    def egress_check(self, model: str | None, data_class: str | None) -> tuple[bool, str]:
+        """Classified-content gate. Route kinds come from operator config (``egress.upstream_kind``,
+        ``egress.custom_kinds``), never from the request; an unconfigured route is treated as external."""
+        from .control_plane.intel_egress import may_route
+        with self._lock:
+            egress = self._egress
+        custom = self.custom_model(model)
+        kinds = egress.get("custom_kinds") if isinstance(egress.get("custom_kinds"), dict) else {}
+        approved = frozenset(x for x in (egress.get("approved") or []) if isinstance(x, str))
+
+        def norm(kind):
+            return kind if kind in ("local", "approved_cloud", "external") else "external"
+        # A custom model may be served by its own endpoint OR resolved onto the shared upstream (fabric model), so the
+        # content must be allowed on BOTH routes: marking a custom model local cannot launder data to the upstream.
+        routes = [norm(egress.get("upstream_kind"))] if not custom else [norm(kinds.get(custom["name"])), norm(egress.get("upstream_kind"))]
+        for kind in routes:
+            ok, why = may_route(data_class, kind, approved=approved)
+            if not ok:
+                return ok, why
+        return True, "allowed on every route the model can take"
+
     def route(self, model: str | None) -> tuple[str, str | None, str | None]:
         """(base_url, bearer, upstream model name) for ``model``."""
         custom = self.custom_model(model)
@@ -324,6 +347,13 @@ def make_handler(state: ProxyState):
                 return self._reject(key, started, 400, {"error": "invalid json"}, "request_invalid")
             if not isinstance(body, dict):
                 return self._reject(key, started, 400, {"error": "json object required"}, "request_invalid")
+            data_class = self.headers.get("X-Herdr-Data-Class")
+            if data_class is not None:
+                # Tagged content (mail, attachments, scientific data) is gated by class; untagged traffic is unchanged.
+                allowed, why = state.egress_check(body.get("model"), data_class.strip().lower())
+                if not allowed:
+                    return self._reject(key, started, 403, {"error": {"type": "egress_denied", "message": why}},
+                                        "egress_denied")
             return self._forward(key, raw, body)
 
         def _reject(self, key: dict, started: float, status: int, payload: dict, error_class: str):

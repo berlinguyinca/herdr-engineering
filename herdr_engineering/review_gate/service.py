@@ -109,6 +109,8 @@ from .trigger import ci_verdict_for
 
 log = logging.getLogger(__name__)
 
+REPAIR_BRANCH_PREFIX = "herdr-ci-fix/"  # branches the CI fix runner pushes (deploy/control-plane/ci-fix-runner.py)
+
 STATUS_CONTEXT = "herdr/review-gate"
 _CHECK_STATUS = {"green": "pass", "red": "fail", "pending": "pending"}
 MERGE_BACKOFF_FIRST = 60.0
@@ -157,8 +159,13 @@ class GateService:
         now: Callable[[], float] = time.time,
         notifier=None,
         main_verifier=None,
+        repair_gate=None,
     ):
         self._config = config
+        # Optional deterministic policy for PRs from the CI repair flow only (``herdr-ci-fix/`` branches):
+        # ``repair_gate(enrollment, pr, checks) -> ("allow"|"wait"|"reject", reasons)``. None (the default) leaves
+        # every merge exactly as before. It can only withhold a merge ``decide_merge`` already allowed.
+        self._repair_gate = repair_gate
         self._notifier = notifier
         self._main_verifier = main_verifier
         self._app = app
@@ -454,6 +461,14 @@ class GateService:
         if decision.decision == "wait":
             self._status(repo, sha, "pending", "review gate: " + "; ".join(decision.reasons))
             return
+        if self._repair_gate is not None and pr.head_ref.startswith(REPAIR_BRANCH_PREFIX):
+            try:
+                gate, why = self._repair_gate(enrollment, pr, checks)
+            except Exception:  # noqa: BLE001 - an unavailable policy fails closed, never open
+                gate, why = "wait", ("repair policy unavailable",)
+            if gate != "allow":
+                self._status(repo, sha, "failure" if gate == "reject" else "pending", "repair policy: " + "; ".join(why))
+                return
         backoff = self._merge_backoff.get((key, sha))
         if backoff is not None and self._now() < backoff[0]:
             return  # the "retrying at" pending status is already posted
@@ -474,13 +489,18 @@ class GateService:
             return
         self._status(repo, sha, "success", "review gate: approved, CI green")
         try:
-            merged = self._app.merge_pr(repo, pr.number, sha)
+            detail = getattr(self._app, "merge_pr_sha", None)
+            if detail is not None:
+                merge_sha = detail(repo, pr.number, sha)
+                merged = merge_sha is not None
+            else:
+                merged, merge_sha = self._app.merge_pr(repo, pr.number, sha), None
         except Exception:
             self._back_off(key, sha, "merge failed")
             raise
         if merged:
             self._merge_backoff.pop((key, sha), None)
-            if self._store.on_merged(key, sha):
+            if self._store.on_merged(key, sha, merge_sha):
                 counts["merged"] += 1
             return
         self._back_off(key, sha, "merge refused (head moved / not mergeable)")
