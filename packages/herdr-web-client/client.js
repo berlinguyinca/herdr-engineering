@@ -616,4 +616,28 @@ export class HerdrClient {
   correctMemory(memoryId, content) {
     return this.request(`/api/v1/assistant-memory/${encodeURIComponent(memoryId)}`, { method: 'PATCH', body: { content } });
   }
+  listConnectors() {
+    return this.request('/api/v1/assistant-connectors');
+  }
+  registerConnector(body) {
+    return this.request('/api/v1/assistant-connectors', { method: 'POST', body });
+  }
+  archiveConnector(connectorId) {
+    return this.request(`/api/v1/assistant-connectors/${encodeURIComponent(connectorId)}`, { method: 'DELETE' });
+  }
+  connectorRequest(connectorId, body) {
+    return this.request(`/api/v1/assistant-connectors/${encodeURIComponent(connectorId)}/request`, { method: 'POST', body });
+  }
+  listDelegations() {
+    return this.request('/api/v1/assistant-delegations');
+  }
+  delegate(body) {
+    return this.request('/api/v1/assistant-delegations', { method: 'POST', body });
+  }
+  cancelDelegation(delegationId) {
+    return this.request(`/api/v1/assistant-delegations/${encodeURIComponent(delegationId)}/cancel`, { method: 'POST', body: {} });
+  }
+  registerDelegationArtifact(delegationId, artifactRef) {
+    return this.request(`/api/v1/assistant-delegations/${encodeURIComponent(delegationId)}/artifact`, { method: 'POST', body: { artifact_ref: artifactRef } });
+  }
 }

@@ -87,3 +87,36 @@ test('archiveRoutine issues DELETE', async () => {
   assert.equal(calls[0].url, '/api/v1/assistant-routines/rout1');
   assert.equal(calls[0].opts.method, 'DELETE');
 });
+
+test('registerConnector POSTs to /api/v1/assistant-connectors', async () => {
+  const { calls, fetchImpl } = capture();
+  const c = new HerdrClient('', { fetchImpl });
+  await c.registerConnector({ name: 'W', base_url: 'https://w.example.com', auth: { token: 'x' } });
+  assert.equal(calls[0].url, '/api/v1/assistant-connectors');
+  assert.equal(calls[0].opts.method, 'POST');
+  assert.equal(JSON.parse(calls[0].opts.body).name, 'W');
+});
+
+test('connectorRequest POSTs to the request endpoint', async () => {
+  const { calls, fetchImpl } = capture();
+  const c = new HerdrClient('', { fetchImpl });
+  await c.connectorRequest('conn1', { path: '/api' });
+  assert.equal(calls[0].url, '/api/v1/assistant-connectors/conn1/request');
+  assert.equal(calls[0].opts.method, 'POST');
+});
+
+test('delegate POSTs to /api/v1/assistant-delegations', async () => {
+  const { calls, fetchImpl } = capture();
+  const c = new HerdrClient('', { fetchImpl });
+  await c.delegate({ task: 'T' });
+  assert.equal(calls[0].url, '/api/v1/assistant-delegations');
+  assert.equal(calls[0].opts.method, 'POST');
+});
+
+test('registerDelegationArtifact POSTs to the artifact endpoint', async () => {
+  const { calls, fetchImpl } = capture();
+  const c = new HerdrClient('', { fetchImpl });
+  await c.registerDelegationArtifact('dlg1', 'artifact://mission/MSN-1');
+  assert.equal(calls[0].url, '/api/v1/assistant-delegations/dlg1/artifact');
+  assert.equal(JSON.parse(calls[0].opts.body).artifact_ref, 'artifact://mission/MSN-1');
+});

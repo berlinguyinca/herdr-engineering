@@ -30,6 +30,25 @@ ruff check ... assistant.py api.py tests/...
 Regression: core control-plane tests still pass (97 backend incl. assistant).
 UI re-rendered at 1280/375 with the Routines tab; DOM dump confirms it.
 
+## 2026-10-28 — P4 connectors, computer tools, delegation
+
+### What was added
+- `Connector` entity + registry; `HttpConnectorAdapter` (deny-by-default):
+  https-only, operator-declared SSRF allowlist (`_allowed_origins`), credentials
+  stored but never serialized/logged (only `auth_present`), response truncation.
+- Computer-tool sandbox policy in `assistant_config["computer"]`:
+  `allow_shell`/`allow_browser` default **false**; `allowed_hosts`/`allowed_commands`
+  allowlists; `max_timeout_seconds`. `browse`/`run_shell` evaluate the policy and
+  deny by default; the skeleton performs no real execution (honest).
+- `delegate` tool + `DelegationRequest` (queued→running→succeeded/failed/cancelled)
+  with artifact-ref registration; never fabricates completion. `execute_tool`
+  dispatches granted tools.
+- API: `/api/v1/assistant-connectors` (register/list/get/archive/request),
+  `/api/v1/assistant-delegations` (create/list/get/cancel/artifact).
+- Frontend: Connectors + Delegations tabs.
+- Tests: +9 unit (connectors SSRF/allowlist/credentials, policy, delegation),
+  +2 contract, +4 client. 109 backend, 259 client green; ruff clean.
+
 ## 2026-10-27 — P0 audit + P1 domain/authorization + P2 settings/chat MVP
 
 ### Decisions taken (see `audit/adr-*.md`)

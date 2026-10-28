@@ -8,7 +8,7 @@ Dependency order per `08-phased-plan.md`. Status as of **2026-10-27**.
 | **P1** | Domain and authorization | ✅ **Done (this slice)** | `assistant.py`; `test_assistant_service.py` (27 passed) |
 | **P2** | Native settings and chat MVP | ✅ **Done (this slice)** | API routes + `personal-assistant-view.js`; `test_assistant_api.py` (11 passed) + client tests (5); screenshots 1280/375 |
 | **P3** | Durable routines, approvals and memory | ✅ **Done (routines + memory correction)** | `assistant.py` routines (timezone/quiet-hours/idempotent trigger), `correct_memory`, `/api/v1/assistant-routines` routes, Routines tab; +2 unit +2 contract +4 client tests. Real InferWeave runner + durable memory backend still deferred to a later phase. |
-| **P4** | Connectors / computer tools / delegation | ⏳ **Not implemented** | Requires MCP/OpenAPI adapters, sandbox policy, Pi-mission handoff |
+| **P4** | Connectors / computer tools / delegation | ✅ **Done (connector registry + sandbox policy + delegation records)** | `Connector` registry + deny-by-default `HttpConnectorAdapter` (https-only, SSRF allowlist, no credential logging); computer-tool sandbox policy (browse/run_shell deny-by-default, host/command allowlist, no execution in skeleton); `delegate` tool creates a tracked `DelegationRequest` (queued→running with artifact refs; never fabricates completion) + `execute_tool` executor. MCP/OpenAPI kind-specific adapters and real shell/browser executors are later wiring. |
 | **P5** | Voice and mobile | ⏳ **Not implemented** | Responsive UI done; transcription, native client deferred |
 | **P6** | Production hardening | ⏳ **Not implemented** | Load/failover, observability, backup/restore, runbook |
 
