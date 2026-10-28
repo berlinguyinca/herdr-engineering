@@ -30,6 +30,35 @@ ruff check ... assistant.py api.py tests/...
 Regression: core control-plane tests still pass (97 backend incl. assistant).
 UI re-rendered at 1280/375 with the Routines tab; DOM dump confirms it.
 
+## 2026-10-28 — Gap-closing (R1 durable store, R2 real runner, adapters, executors)
+
+### What was added
+- **Durable store (R1):** `AssistantStore(persist_path=...)` writes atomic JSON
+  snapshots (tmp+rename) after every mutation via `_after_mutation()` hooked into
+  all 13 store mutations. `snapshot()`/`restore()`/`load_persisted()` round-trip
+  all collections (dataclass serialization with datetime handling). State now
+  survives a process restart. A Postgres backend remains a deployment concern.
+- **Real model runner (R2):** `HttpModelRunnerAdapter(RuntimeAdapter)` POSTs the
+  message history to `inference.endpoint` and returns the model reply; API key
+  sent as a header, never echoed; degrades to a safe message on failure. The
+  service builds it when `inference.endpoint` is configured, else keeps the
+  deterministic `LocalRunnerAdapter`.
+- **MCP/OpenAPI adapters:** `MCPConnectorAdapter` (JSON-RPC 2.0 `tools/call`
+  wrapper) and `OpenApiConnectorAdapter` (operation verb+path templating);
+  `_adapter_for` selects by kind.
+- **Real executors:** `browse` fetches over HTTPS under the sandbox policy
+  (real default urllib transport, injectable in tests); `run_shell` executes
+  allowlisted commands via arglist (no shell), with timeout and redacted output.
+- Tests: +13 (durability round-trip + restart, http runner success/failure,
+  MCP/OpenAPI shaping, browse allow/deny, shell allow/deny, runner selection).
+
+### Test output
+```
+python -m pytest tests/control_plane/ ... -q  # 138 passed (was 127)
+node --test packages/herdr-web-client/*.test.js # 266 passed
+ruff check ...  # All checks passed
+```
+
 ## 2026-10-28 — P5 voice/mobile + P6 hardening
 
 ### P5 — voice and mobile
