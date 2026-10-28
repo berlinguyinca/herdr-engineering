@@ -254,3 +254,20 @@ def test_gateway_acme_domain_serves_public_cert_by_sni_and_defaults_url_base(mon
     assert seen["banner"]["url_base"] == "local.example.test" and seen["banner"]["https"] is True
     assert results["status"].startswith(b"HTTP/1.")
     assert results["url"].startswith("https://local.example.test:")
+
+
+def test_gateway_named_urls_flags(monkeypatch, capsys, tmp_path):
+    d = _acme_dir_with_cert(tmp_path)
+    named = _free_port()
+    argv, seen, _ = _run_gateway(monkeypatch, capsys, tmp_path, "--acme-domain", "local.example.test", "--acme-dir", str(d),
+                                 "--named-port", str(named))
+    argv = [a for a in argv if a not in ("--url-base", "dev.test")]
+    assert cli.main(argv) == 0
+    assert seen["banner"]["named_urls"] == f"https://<service>.local.example.test:{named}"
+    capsys.readouterr()                                  # drop the first run's trailing {"stopped": true}
+
+    argv, seen, _ = _run_gateway(monkeypatch, capsys, tmp_path, "--acme-domain", "local.example.test", "--acme-dir", str(d),
+                                 "--no-named-urls")
+    argv = [a for a in argv if a not in ("--url-base", "dev.test")]
+    assert cli.main(argv) == 0
+    assert seen["banner"]["named_urls"] is None

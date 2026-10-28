@@ -424,6 +424,10 @@ def _build_parser() -> argparse.ArgumentParser:
     p2.add_argument("--url-alias", action="append", default=[],
                     help="extra name the fabric answers to when resolving URLs (repeatable; dev.lan is added "
                          "automatically when a private CA exists)")
+    p2.add_argument("--named-port", type=int, default=None,
+                    help="port for stable https://<service>.<acme-domain> URLs (default 443; if it cannot be bound "
+                         "the gateway keeps using per-port URLs)")
+    p2.add_argument("--no-named-urls", action="store_true", help="do not serve stable service-name URLs")
     p2.add_argument("--acme-dir", default=None, help="certbot state directory (default: ~/.config/herdr-engineering/acme)")
     p2.add_argument("--acme-staging", action="store_true", help="use the Let's Encrypt staging CA (untrusted; for trials)")
     p2.add_argument("--renew-certs", action="store_true",
@@ -2239,6 +2243,8 @@ def _cmd_dev_gateway(args) -> int:
         peer_url=getattr(args, "peer", None) or cfg.get("peer_url") or None,
         node_id=getattr(args, "node_id", None) or cfg.get("node_id") or None,
         promote_after=int(getattr(args, "promote_after", 3)),
+        named_domain=None if getattr(args, "no_named_urls", False) else acme_domain,
+        named_port=int(getattr(args, "named_port", None) or cfg.get("named_port") or 443),
         url_aliases=tuple(dict.fromkeys([*getattr(args, "url_alias", []), *(cfg.get("url_aliases") or []),
                                          *_private_ca_domains(cfg)])))
     tls_cert = getattr(args, "tls_cert", None) or cfg.get("tls_cert")
@@ -2282,6 +2288,8 @@ def _cmd_dev_gateway(args) -> int:
         "ok": True, "gateway": True, "https": bool(tls_cert), "role": gateway.role, "peer": gateway.peer_url, "access_enforced": bool(users or tags),
         "control_url": f"http://{gateway.control_host}:{control_port}",
         "url_base": gateway.url_base,
+        "named_urls": (f"https://<service>.{gateway.named_domain}" + ("" if gateway.named_port == 443 else f":{gateway.named_port}"))
+                      if gateway.named_front else None,
         "bind_hosts": bind_hosts,
         "probe_interval_seconds": gateway.probe_interval,
         "note": f"dev:<port> resolves to {gateway.public_scheme}://{gateway.url_base}:<port>"

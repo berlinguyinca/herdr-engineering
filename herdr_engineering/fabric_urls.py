@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import ipaddress
 import re
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import asdict, dataclass
 from typing import Any
 from urllib.parse import urlsplit
@@ -40,6 +40,7 @@ class UrlResolution:
     source_machine: str | None = None
     lease_id: str | None = None
     access: str = "private-fabric"
+    port_url: str | None = None   # per-port address, present when `canonical` is a stable service name
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -82,7 +83,7 @@ def _fail(url: str, status: str, reason: str, **kw: Any) -> UrlResolution:
 
 def resolve_url(url: str, leases: Iterable[dict[str, Any]], *, url_base: str, source_machine: str | None = None,
                 scheme: str = "https", aliases: Iterable[str] = (),
-                source_namespace: str | None = None) -> UrlResolution:
+                source_namespace: str | None = None, named: Callable[[dict[str, Any]], str | None] | None = None) -> UrlResolution:
     """Resolve ``url`` against ``leases`` as seen from ``source_machine``.
 
     A lease owned by ``source_machine`` always wins over another machine's lease on the same port.
@@ -140,8 +141,11 @@ def resolve_url(url: str, leases: Iterable[dict[str, Any]], *, url_base: str, so
     if lz.get("health_last_error"):
         return _fail(url, "unhealthy", f"service unreachable: {lz['health_last_error']}", **ident)
     tail = url[len(parts.scheme) + 3 + len(parts.netloc):]  # path?query#fragment, byte-for-byte
-    canonical = f"{scheme}://{url_base}:{int(lz['external_port'])}{tail}"
-    return UrlResolution(original=url, canonical=canonical, status="resolved", **ident)
+    port_url = f"{scheme}://{url_base}:{int(lz['external_port'])}{tail}"
+    # the stable service name wins when the gateway is serving it; the port URL stays as the fallback
+    stable = named(lz) if named else None
+    return UrlResolution(original=url, canonical=f"{stable}{tail}" if stable else port_url, status="resolved",
+                         port_url=port_url if stable else None, **ident)
 
 
 def validate_target_host(host: str, extra_networks: Iterable[str] = ()) -> None:
