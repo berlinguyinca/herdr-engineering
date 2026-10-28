@@ -254,7 +254,7 @@ class ControlPlaneServer:
                  review_quorum=None, system_graph: bool = False, attention=None, ci_fix=None, missions=None, github_pg_dsn=None,
                  architecture_enabled=None, architecture_explain=None, architecture_options=None,
                  request_workers=128, request_queue=256,
-                 assistant_service=None, assistant_config=None, fabric_resolver=None, fabric_services=None):
+                 assistant_service=None, assistant_config=None, fabric_resolver=None, fabric_services=None, fabric_names=None):
         """
         Auth (Spec §104): either a single `api_key` (all-access) or a mapping
         `api_keys={key: role}` with roles "viewer" (read-only) / "operator"
@@ -383,6 +383,7 @@ class ControlPlaneServer:
         # callable(urls, source_machine) -> {'resolutions': [...]}; None when no fabric gateway is configured
         self.fabric_resolver = fabric_resolver
         self.fabric_services = fabric_services      # callable() -> {'leases': [...]} | None
+        self.fabric_names = fabric_names            # callable() -> {'url_base', 'aliases', 'scheme'} | None
         self.review_quorum = review_quorum      # QuorumConfig | None (feature off)
         from .review_quorum import RereviewLedger
         self.rereview = RereviewLedger(repo)
@@ -1903,6 +1904,8 @@ def _make_handler(server, public=False, operator=False):
             r = server.repo
             if resource == "fabric" and len(parts) == 5 and parts[4] == "services":
                 return self._fabric_services()
+            if resource == "fabric" and len(parts) == 5 and parts[4] == "names":
+                return self._fabric_names()
             if (resource == "artifacts" and len(parts) >= 5
                     and not self._artifact_allowed(parts[4], "read")):
                 return self._json({"error": "not found"}, 404)
@@ -3279,6 +3282,15 @@ def _make_handler(server, public=False, operator=False):
             except Exception:
                 return self._json({"leases": [], "available": False})
             return self._json({"leases": [{k: lz.get(k) for k in keep} for lz in leases], "available": True})
+
+        def _fabric_names(self):
+            """Names that mark a URL as the fabric's, for the browser's link detector. Degrades to none."""
+            try:
+                got = server.fabric_names() if server.fabric_names else None
+            except Exception:
+                got = None
+            names = [n for n in [(got or {}).get("url_base"), *((got or {}).get("aliases") or [])] if isinstance(n, str)]
+            return self._json({"names": names[:16], "available": got is not None})
 
         def _fabric_resolve_urls(self):
             """Canonical fabric URLs for URLs shown in agent output. Read-only; originals are never changed.

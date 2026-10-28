@@ -285,6 +285,11 @@ export class HerdrClient {
     return this.request('/api/v1/fabric/resolve-urls', { method: 'POST', body: { urls, source_machine: sourceMachine }, signal });
   }
 
+  /** Names that mark a URL as the fabric's (public fleet name, legacy aliases). */
+  getFabricNames({ signal } = {}) {
+    return this.request('/api/v1/fabric/names', { signal });
+  }
+
   listFabricServices({ signal } = {}) {
     return this.request('/api/v1/fabric/services', { signal });
   }

@@ -341,8 +341,11 @@ class FabricGateway:
                  reset_lock: bool = False, rewrite_headers: bool = False,
                  allowed_target_networks: tuple[str, ...] = (), public_scheme: str = "http",
                  peer_url: str | None = None, node_id: str | None = None, promote_after: int = 3,
-                 auto_ha: bool = True) -> None:
+                 auto_ha: bool = True, url_aliases: tuple[str, ...] = ()) -> None:
         self.registry = registry
+        # Other names this fabric answers to (legacy dev.lan next to the public fleet name); accepted when
+        # resolving URLs, never produced.
+        self.url_aliases = tuple(dict.fromkeys(a.lower().strip(".") for a in url_aliases if a))
         # Lease targets are limited to loopback + the tailnet (+ these CIDRs): anything else
         # would let a token holder aim the gateway at arbitrary internal services (SSRF).
         self.allowed_target_networks = tuple(allowed_target_networks)
@@ -664,7 +667,11 @@ class FabricGateway:
         from .fabric_urls import resolve_url
         leases = [lse.to_dict() for lse in self.registry.active_leases()]
         return {"resolutions": [resolve_url(u, leases, url_base=self.url_base, source_machine=source_machine,
-                                            scheme=self.public_scheme).to_dict() for u in urls[:200]]}
+                                            scheme=self.public_scheme, aliases=self.url_aliases).to_dict() for u in urls[:200]]}
+
+    def op_names(self) -> dict[str, Any]:
+        """The names a URL may carry to count as the fabric's (the browser builds its link detector from this)."""
+        return {"url_base": self.url_base, "aliases": list(self.url_aliases), "scheme": self.public_scheme}
 
     def op_rewrite(self, text: str, from_machine: str | None = None) -> dict[str, Any]:
         from .urlrewrite import rewrite_text
@@ -744,10 +751,13 @@ def _make_handler(gateway: FabricGateway):
                                                   (q.get("service") or [None])[0])
                 self._send(res.pop("status"), res)
                 return
+            if self.path == "/names":
+                self._send(200, gateway.op_names())
+                return
             if self.path == "/healthz":
                 lo, hi = gateway.registry.port_range()
                 self._send(200, {"ok": True, "bound_ports": gateway.router.bound_ports(),
-                                 "url_base": gateway.url_base, "role": gateway.role,
+                                 "url_base": gateway.url_base, "url_aliases": list(gateway.url_aliases), "role": gateway.role,
                                  "epoch": gateway.epoch, "node_id": gateway.node_id,
                                  "port_lo": lo, "port_hi": hi})
                 return
@@ -883,6 +893,9 @@ class FabricClient:
 
     def resolve_urls(self, urls: list[str], source_machine: str | None = None) -> dict[str, Any]:
         return self._req("POST", "/resolve-urls", {"urls": urls, "source_machine": source_machine})
+
+    def names(self) -> dict[str, Any]:
+        return self._req("GET", "/names")
 
     def healthz(self) -> dict[str, Any]:
         return self._req("GET", "/healthz")

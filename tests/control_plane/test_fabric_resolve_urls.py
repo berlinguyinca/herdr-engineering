@@ -96,3 +96,21 @@ def test_fabric_services_unavailable_without_gateway():
         assert _get(s, "fabric/services")[1] == {"leases": [], "available": False}
     finally:
         s.shutdown()
+
+
+def test_fabric_names_lists_only_names_and_degrades():
+    s = _start(fabric_names=lambda: {"url_base": "local.example.test", "aliases": ["dev.lan"], "scheme": "https", "secret": "x"})
+    try:
+        code, out = _get(s, "fabric/names")
+        assert code == 200 and out == {"names": ["local.example.test", "dev.lan"], "available": True}
+    finally:
+        s.shutdown()
+
+    def boom():
+        raise RuntimeError("gateway down")
+    for kw in ({}, {"fabric_names": boom}):
+        s = _start(**kw)
+        try:
+            assert _get(s, "fabric/names")[1] == {"names": [], "available": False}
+        finally:
+            s.shutdown()

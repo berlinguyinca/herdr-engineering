@@ -421,6 +421,9 @@ def _build_parser() -> argparse.ArgumentParser:
     p2.add_argument("--tls-key", default=None, help="private key for --tls-cert")
     p2.add_argument("--acme-domain", default=None, help="serve a publicly trusted Let's Encrypt certificate for this "
                     "name and *.name (e.g. local.metabolomics.us); also the default --url-base")
+    p2.add_argument("--url-alias", action="append", default=[],
+                    help="extra name the fabric answers to when resolving URLs (repeatable; dev.lan is added "
+                         "automatically when a private CA exists)")
     p2.add_argument("--acme-dir", default=None, help="certbot state directory (default: ~/.config/herdr-engineering/acme)")
     p2.add_argument("--acme-staging", action="store_true", help="use the Let's Encrypt staging CA (untrusted; for trials)")
     p2.add_argument("--renew-certs", action="store_true",
@@ -2149,6 +2152,21 @@ def _acme_for(args, cfg: dict):
                        email=getattr(args, "email", None) or cfg.get("acme_email") or None)
 
 
+def _private_ca_domains(cfg: dict) -> list[str]:
+    from pathlib import Path
+
+    from .fabric_tls import PrivateCA
+    ca = PrivateCA(Path(cfg.get("ca_dir") or Path.home() / ".config" / "herdr-engineering" / "ca"))
+    return ca.domains() if ca.exists() else []
+
+
+def _fabric_names_getter():
+    from .config import load_config
+    from .fabric import FabricClient, gateway_url_from_config
+    url = gateway_url_from_config(load_config())
+    return FabricClient(url).names if url else None
+
+
 def _cmd_dev_cert(args) -> int:
     from .fabric_certs import CertError, CertManager
     acme = _acme_for(args, _fabric_cfg())
@@ -2220,7 +2238,9 @@ def _cmd_dev_gateway(args) -> int:
         rewrite_headers=bool(getattr(args, "rewrite_headers", False)),
         peer_url=getattr(args, "peer", None) or cfg.get("peer_url") or None,
         node_id=getattr(args, "node_id", None) or cfg.get("node_id") or None,
-        promote_after=int(getattr(args, "promote_after", 3)))
+        promote_after=int(getattr(args, "promote_after", 3)),
+        url_aliases=tuple(dict.fromkeys([*getattr(args, "url_alias", []), *(cfg.get("url_aliases") or []),
+                                         *_private_ca_domains(cfg)])))
     tls_cert = getattr(args, "tls_cert", None) or cfg.get("tls_cert")
     tls_key = getattr(args, "tls_key", None) or cfg.get("tls_key")
     if bool(tls_cert) != bool(tls_key):
@@ -2391,6 +2411,8 @@ def _cmd_dev_agent(args) -> int:
             web_port_min=int(fabric_cfg.get("agent_web_port_min", 1024)),
             ephemeral_min=int(fabric_cfg.get("agent_ephemeral_min", 32768)),
             control_plane_url=control_plane_for(live),
+            fabric_domains=tuple(dict.fromkeys([d for d in (fabric_cfg.get("acme_domain"), fabric_cfg.get("url_base"),
+                                                            *(fabric_cfg.get("url_aliases") or [])) if d])),
             host_report_interval=float(fabric_cfg.get("host_report_interval", 30.0)),
             host_slow_interval=float(fabric_cfg.get("host_slow_interval", 3600.0)),
             agent_binaries=agent_binaries,
@@ -3152,7 +3174,7 @@ def _cmd_cp_web(args) -> int:
                              collab_tls_terminated=args.collab_tls_terminated,
                              collab_require_https=args.collab_require_https,
                              fleet_config=fleet_store, ci_actions=cp.get("ci_actions") is True,
-                             fabric_resolver=_fabric_url_resolver(), fabric_services=_fabric_service_lister(),
+                             fabric_resolver=_fabric_url_resolver(), fabric_services=_fabric_service_lister(), fabric_names=_fabric_names_getter(),
                              summary_config=cp.get("agent_summaries") or {},
                              assistant_config={"personal_assistant": cp["personal_assistant"]}
                                  if isinstance(cp.get("personal_assistant"), dict) else None,

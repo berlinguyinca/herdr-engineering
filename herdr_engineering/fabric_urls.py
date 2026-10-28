@@ -78,7 +78,7 @@ def _fail(url: str, status: str, reason: str, **kw: Any) -> UrlResolution:
 
 
 def resolve_url(url: str, leases: Iterable[dict[str, Any]], *, url_base: str, source_machine: str | None = None,
-                scheme: str = "https") -> UrlResolution:
+                scheme: str = "https", aliases: Iterable[str] = ()) -> UrlResolution:
     """Resolve ``url`` against ``leases`` as seen from ``source_machine``.
 
     A lease owned by ``source_machine`` always wins over another machine's lease on the same port.
@@ -98,7 +98,8 @@ def resolve_url(url: str, leases: Iterable[dict[str, Any]], *, url_base: str, so
     if parts.username is not None or parts.password is not None:
         return _fail(url, "invalid", "userinfo not allowed")
     host = host.lower()
-    fabric_name = host == url_base.lower() or host.endswith("." + url_base.lower())
+    # url_base is canonical; aliases (e.g. the old dev.lan) are accepted on input and rewritten to it
+    fabric_name = any(host == n or host.endswith("." + n) for n in (url_base.lower(), *(a.lower() for a in aliases)))
     if not (_is_loopback_host(host) or fabric_name):
         return _fail(url, "not_loopback", "external host; no explicit mapping")
     if port is None:

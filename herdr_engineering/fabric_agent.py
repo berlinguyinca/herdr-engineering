@@ -518,7 +518,7 @@ class AgentForwarder:
 
     def __init__(self, bind_host: str, target_port: int,
                  bind_port: int = 0, private_only: bool = True,
-                 fabric_names: frozenset[str] = frozenset()) -> None:
+                 fabric_names: frozenset[str] = frozenset(), fabric_domains: frozenset[str] = frozenset()) -> None:
         self.bind_host = bind_host
         self.target_port = target_port
         # Host names the fabric itself owns (the control-plane host, the
@@ -527,6 +527,7 @@ class AgentForwarder:
         # DNS-rebinding guard accepts, so nobody configures the app with the
         # fabric's names. Any other Host is forwarded untouched.
         self.fabric_names = frozenset(n.lower() for n in fabric_names)
+        self.fabric_domains = frozenset(d.lower().strip(".") for d in fabric_domains)
         # bind_port=0 => OS-allocated ephemeral port; a specific bind_port
         # makes the forwarder reuse the SAME port so port-matching works
         # (localhost:4040 -> dev.lan:4040). Callers fall back to 0 on EADDRINUSE.
@@ -611,7 +612,7 @@ class AgentForwarder:
         One overall deadline, not one per read, so a trickle cannot hold the
         connection. Whatever arrived is returned and forwarded either way.
         """
-        if not self.fabric_names:
+        if not self.fabric_names and not self.fabric_domains:
             return b""
         buf = b""
         deadline = time.monotonic() + self._HEAD_DEADLINE
@@ -673,7 +674,8 @@ class AgentForwarder:
                 host = (v[1:].split("]")[0] if v.startswith("[")
                         else v.split(":")[0])
                 host = host.rstrip(".")
-        if host_at is None or host not in self.fabric_names:
+        if host_at is None or not (host in self.fabric_names or any(
+                host == d or host.endswith("." + d) for d in self.fabric_domains)):
             return data
         lines[host_at] = f"Host: 127.0.0.1:{self.target_port}".encode()
         lines = [ln for ln in lines
@@ -768,6 +770,9 @@ class AgentConfig:
     # services to, so every dev:<port> lease shows up on the fleet Services
     # page with a clickable route. Empty = reporting disabled.
     control_plane_url: str = ""
+    # Fleet domains (local.metabolomics.us, legacy dev.lan): a Host that is one of them or a subdomain is the
+    # fabric's, so an app behind the forwarder sees 127.0.0.1 and its own rebinding guard accepts the request.
+    fabric_domains: tuple[str, ...] = ()
     # Host telemetry heartbeat (cpu/mem/disk/gpu/...) cadence, and how often the
     # slow package-update / tool-version data rides along on it.
     host_report_interval: float = 30.0
@@ -786,6 +791,9 @@ class AgentConfig:
             if host:
                 names.add(host)
         return frozenset(n.lower() for n in names if n)
+
+    def domains(self) -> frozenset[str]:
+        return frozenset(d.lower().strip(".") for d in self.fabric_domains if d)
 
 
 class FabricAgent:
@@ -819,7 +827,7 @@ class FabricAgent:
         for port_s, entry in self._store.items():
             if entry.get("fwd_port"):
                 fwd = AgentForwarder(config.tailnet_ip, int(port_s),
-                                     fabric_names=config.fabric_names())
+                                     fabric_names=config.fabric_names(), fabric_domains=config.domains())
                 try:
                     fwd.start()
                     # Rebind to the remembered port when still free so the
@@ -1123,7 +1131,7 @@ class FabricAgent:
                 try:
                     fwd = AgentForwarder(self.cfg.tailnet_ip, port,
                                          bind_port=bind_port,
-                                         fabric_names=self.cfg.fabric_names()
+                                         fabric_names=self.cfg.fabric_names(), fabric_domains=self.cfg.domains()
                                          ).start()
                     break
                 except OSError:

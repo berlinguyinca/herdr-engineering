@@ -79,3 +79,29 @@ test('copy buttons write the exact stored value', async () => {
   await handler({ target: { closest: () => button }, preventDefault() {} });
   assert.deepEqual(written, ['http://localhost:3188/x']);
 });
+
+test('fabric names from the gateway extend link detection to the public fleet name and subdomains', async () => {
+  const { candidateUrls, setFabricNames, createFabricUrlResolver } = await import('../fabric-urls.js');
+  const text = 'open https://svc.local.metabolomics.us:3188/x and https://local.metabolomics.us:4000 and https://evil.example.com:3188';
+  try {
+    assert.deepEqual(candidateUrls(text), []);
+    setFabricNames(['local.metabolomics.us', 'bad name!', 42]);
+    assert.deepEqual(candidateUrls(text), ['https://svc.local.metabolomics.us:3188/x', 'https://local.metabolomics.us:4000']);
+    assert.deepEqual(candidateUrls('https://notlocal.metabolomics.us:1'), []);   // a suffix match must start at a label boundary
+
+    setFabricNames([]);
+    let changed = 0;
+    createFabricUrlResolver({ getFabricNames: async () => ({ available: true, names: ['local.metabolomics.us'] }),
+      resolveFabricUrls: async () => ({ resolutions: [] }) }, { onChange: () => { changed++; } });
+    await new Promise((r) => setTimeout(r, 20));
+    assert.equal(changed, 1);
+    assert.equal(candidateUrls(text).length, 2);
+  } finally { setFabricNames([]); }
+});
+
+test('a gateway without names leaves detection unchanged', async () => {
+  const { candidateUrls, createFabricUrlResolver } = await import('../fabric-urls.js');
+  createFabricUrlResolver({ getFabricNames: async () => { throw new Error('down'); }, resolveFabricUrls: async () => ({}) });
+  await new Promise((r) => setTimeout(r, 10));
+  assert.deepEqual(candidateUrls('http://localhost:3188/a'), ['http://localhost:3188/a']);
+});
