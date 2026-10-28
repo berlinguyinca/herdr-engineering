@@ -285,3 +285,33 @@ def test_explicit_file_cli_needs_no_state_or_machine(tmp_path, monkeypatch, caps
     monkeypatch.setattr(oc, 'remote_request', lambda *_: {'dispatch': 'requested'})
     assert main(['open-client', 'file', str(path)]) == 0
     assert json.loads(capsys.readouterr().out)['target'] == 'active-device'
+
+
+def test_rejects_browser_normalized_loopback_hosts(monkeypatch):
+    def unexpected_dispatch(*_):
+        raise AssertionError('loopback must never reach dispatch')
+    monkeypatch.setattr(oc, 'remote_request', unexpected_dispatch)
+    for url in ['http://%31%32%37.0.0.1:3000', 'http://localhost%2e:3000',
+                'http://127。0。0。1:3000']:
+        with pytest.raises(ValueError, match='fabric'):
+            oc.open_url(url, target='macbook')
+
+
+def test_html_css_assets_with_quoted_spaces_are_preserved(tmp_path, monkeypatch):
+    root, state = start(tmp_path)
+    (root / 'index.html').write_text('<link href="style.css">')
+    (root / 'style.css').write_text('body { background: url("my picture.png") }')
+    (root / 'my picture.png').write_bytes(b'picture')
+    candidate = next(item for item in oc.discover(state)['candidates'] if item['name'] == 'index.html')
+    payloads = []
+    monkeypatch.setattr(oc, 'remote_request', lambda target, payload:
+                        payloads.append(payload) or {'dispatch': 'requested'})
+    oc.show(state, [candidate['id']], target='macbook')
+    assert {item['name'] for item in payloads[0]['assets']} == {'style.css', 'my picture.png'}
+
+
+def test_css_escaped_asset_names():
+    from herdr_engineering.open_client_assets import css_unescape
+
+    assert css_unescape(r'my\ picture.png') == 'my picture.png'
+    assert css_unescape(r'my\20 picture.png') == 'my picture.png'

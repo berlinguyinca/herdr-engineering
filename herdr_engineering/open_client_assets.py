@@ -10,7 +10,18 @@ from urllib.parse import unquote, urlsplit
 
 ASSETS = {'.css', '.js', '.mjs', '.png', '.jpg', '.jpeg', '.gif', '.svg', '.webp',
           '.avif', '.ico', '.woff', '.woff2', '.ttf', '.otf'}
-CSS_URL = re.compile(r'''url\(\s*["']?([^\s"')]+)|@import\s+["']([^"']+)''', re.I)
+CSS_URL = re.compile(
+    r'''url\(\s*(?:"((?:\\.|[^"\\])*)"|'((?:\\.|[^'\\])*)'|([^\s)]+))\s*\)|@import\s+(?:"((?:\\.|[^"\\])*)"|'((?:\\.|[^'\\])*)')''', re.I)
+
+
+def css_unescape(value: str) -> str:
+    def replace(match):
+        if match[1]:
+            number = int(match[1], 16)
+            return chr(number) if 0 < number <= 0x10ffff else '\ufffd'
+        return match[2]
+    return re.sub(r'\\([0-9a-fA-F]{1,6})\s?|\\([^\r\n\f])', replace, value)
+
 
 
 class References(HTMLParser):
@@ -37,7 +48,8 @@ def collect(root: Path, entry: str, content: bytes, read) -> list[dict]:
     while queue:
         name, data = queue.pop()
         text = data.decode('utf-8', errors='replace')
-        urls = [first or second for first, second in CSS_URL.findall(text)]
+        urls = [css_unescape(next((part for part in match if part), ''))
+                for match in CSS_URL.findall(text)]
         if Path(name).suffix.lower() in {'.html', '.htm'}:
             parser = References()
             parser.feed(text)

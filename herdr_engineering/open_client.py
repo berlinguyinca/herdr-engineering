@@ -15,7 +15,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 EXTENSIONS = {'.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.svg', '.avif',
               '.html', '.htm'}
@@ -242,7 +242,10 @@ def open_url(url: str, *, target: str | None = None) -> dict:
     parts = urlsplit(url)
     if parts.scheme not in {'http', 'https'} or not parts.hostname or parts.username or parts.password:
         raise ValueError('only HTTP(S) URLs without embedded credentials may be opened')
-    host = parts.hostname.lower().rstrip('.')
+    try:
+        host = unquote(parts.hostname).encode('idna').decode('ascii').lower().rstrip('.')
+    except UnicodeError:
+        raise ValueError('invalid website hostname') from None
     try:
         address = ipaddress.ip_address(host)
     except ValueError:
