@@ -296,3 +296,20 @@ def test_hydration_pages_through_more_events_than_one_page_holds(dsn, clean):
     again = br.DurableIntelligenceStore(small(dsn))
     items = again.timeline(pi.Viewer("o", None, "restricted"), project_id="p1")["items"]
     assert [i["title"] for i in items] == [f"e{n}" for n in range(7, -1, -1)]      # all 8, oldest first
+
+
+def test_ingest_off_builds_no_incident_state_and_turning_it_on_rebuilds_from_history():
+    from herdr_engineering.control_plane import intel_bridge as ib
+    from herdr_engineering.control_plane.repo import ControlPlaneRepo
+    section = {"enabled": True, "default_org_id": "lab", "forge_host": "github.com"}
+    repo = ControlPlaneRepo()
+    _, bridge = ib.install(repo, lambda: section, None)
+    repo.record_event("ci_fix", "f1", "CIFixStateChanged", {"repository": "o/r", "run": 7, "state": "running"})
+    bridge.drain()
+    assert bridge.board.summary() == []
+    section["ingest"] = True
+    import time
+    time.sleep(2.1)                                   # the section cache is 2 s
+    repo.record_event("ci_fix", "f2", "CIFixStateChanged", {"repository": "o/r", "run": 8, "state": "queued"})
+    bridge.drain()
+    assert {i["key"].split("|")[1] for i in bridge.board.summary()} == {"o/r#7", "o/r#8"}

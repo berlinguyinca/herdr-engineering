@@ -504,6 +504,8 @@ def install(repo, section_fn: Callable[[], dict], dsn: str | None = None):
             return holder["store"]
 
     class LazyBridge(EventBridge):
+        _rebuilt = False
+
         def __init__(self):
             super().__init__(None, section, make_resolver(repo, lambda: section().get("forge_host")),
                              org_id=lambda: section().get("default_org_id"), instance=str(section().get("instance") or "herdr"))
@@ -522,11 +524,15 @@ def install(repo, section_fn: Callable[[], dict], dsn: str | None = None):
             if self._thread is None:
                 with lock:
                     if self._thread is None:
+                        self.start()
+            if not self._rebuilt and section().get("ingest") is True:
+                with lock:
+                    if not self._rebuilt:
+                        self._rebuilt = True          # derived state is built only once ingest is on, never while it is off
                         try:
                             self.rebuild_board(repo)
                         except Exception:  # noqa: BLE001 - a rebuild problem must not stop live ingest
                             log.warning("incident board rebuild failed", exc_info=False)
-                        self.start()
             super().on_event(ev)
 
     bridge = LazyBridge()
