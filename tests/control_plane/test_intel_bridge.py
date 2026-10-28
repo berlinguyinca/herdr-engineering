@@ -229,7 +229,7 @@ def test_ci_fix_events_fold_into_the_incident_board():
     br = EventBridge(store, lambda: {"enabled": True, "ingest": True}, lambda ev: ("p1",), org_id="o")
     for n, state in enumerate(("queued", "running", "succeeded")):
         ev = {"event_id": f"e{n}", "sequence": n, "event_type": "CIFixStateChanged", "entity_type": "ci_fix", "entity_id": "f1",
-              "source_timestamp": "2026-10-28T00:00:0%dZ" % n, "payload": {"repository": "o/r", "run": 7, "state": state}}
+              "source_timestamp": f"2026-10-28T00:00:0{n}Z", "payload": {"repository": "o/r", "run": 7, "state": state}}
         assert br.process(ev) == "accepted"
     assert [i["state"] for i in br.board.summary()] == ["REVIEWING"]
 

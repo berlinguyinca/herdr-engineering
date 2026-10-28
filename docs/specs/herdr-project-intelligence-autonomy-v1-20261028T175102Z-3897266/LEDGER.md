@@ -99,18 +99,25 @@ Routes: `GET /api/v1/intelligence/{status,projects,investigations,relationships?
   for desktop light, desktop dark and phone dark. It found real defects in the first version (chip contrast, focus outline, placeholder, link colour, and
   a CSS `order:-1` that put the detail pane before the list visually but after it in Tab order). All fixed; on a phone the pane now scrolls into view in reading order.
 
+## Completed in the fourth pass: "pilot-ready, read-only" (2026-10-28)
+- The gate now records the merge commit (`merge_pr_sha`; `merge_pr` still returns a bool). Main-branch CI `green`/`red` for that exact commit moves the bound incident to
+  COMPLETED / ROLLBACK_REQUESTED. A result for any other commit is ignored, and an unknown merge commit leaves the incident in VERIFYING.
+- The incident board is rebuilt from the durable `ci_fix`, `pr_gate` and `pr_gate_main` streams once ingest is on (no second copy to persist). While ingest is off nothing is built.
+  The rollout rehearsal caught the original defect: the rebuild ran while ingest was off.
+- Proposals: `GET/POST /api/v1/intelligence/proposals`, `.../approve` (exact payload hash and resource version, never the requester), `.../reject`. Needs `suggest`; blocked by the kill switch;
+  `Idempotency-Key` supported. Approval records permission only; this release has no executor. UI cards cover list, approve, reject and conflicts.
+- Tombstones scrub actor and evidence anchors in memory and in the database; hydration reads stored rows through a trusted parse that ingest cannot use; event loading is paged.
+- Layout loosened (padding, gaps, line height, max width); `Related` label in the detail list renamed `About`; screenshots regenerated.
+- `test_intel_rollout_rehearsal.py` walks RUNBOOK.md on a private Postgres: off, enabled, ingest, restart, kill switch, disabled, migration DOWN.
+
 ## Remaining work
-1. COMPLETED needs a post-merge verification event tied to the merge commit; `merge_pr` does not return the merge SHA and no service emits that event yet.
-2. Incident board and the webhook `ReplayGuard` are in memory (backfill rebuilds the board; the store still dedupes replays).
-3. Approval cards: `ActionBoard` proposals exist in code but have no persisted store or HTTP surface, so there is nothing for a card to show yet.
-4. Live Gmail client (B1), email sender and notification channel (B3), iPhone auth (B4).
-5. Still open from the review: tombstones keep evidence/actor/object_ref metadata; paging for hydration; `Idempotency-Key` header (review and pause are already safe to repeat: versioned or idempotent).
-6. Manual audit and a staged rollout before any auto-merge enablement (B6).
+1. Live connectors (need you): Gmail client (B1), webhook secret file and public receiver URL (B2), email channel (B3), iPhone auth (B4).
+2. An executor for approved proposals (deliberately absent), and a human audit of `repair_policy.py` / `repair_gate.py` before any auto-merge enablement (B6).
+3. The webhook `ReplayGuard` is in memory (the store still dedupes); the store itself keeps all events in memory after hydration (paged load only).
+4. Deploy, apply migration `0020`, flip flags: yours (B6).
 
 ## Blockers needing a user action
 B1 Google OAuth client + consent · B2 GitHub App webhook secret file + public receiver URL · B3 transactional email channel · B4 iPhone device auth scheme / Rakazo compatibility · B5 API key to read live `/api/v1/health` · B6 any deploy, live-DB migration, or flag flip.
 
-## Final verification (2026-10-28, after third pass)
-- Control-plane + root + review-gate suites, 10 parallel shards: 7397 passed, 2 xfailed, skips pre-existing, every shard EXIT=0. Integration on private Postgres: 13 pass.
-- `npm run test:client`: 707 pass. Playwright: all 14 project-intelligence tests pass (including the accessibility audit in 3 themes/sizes); calm, dark-theme, skeletons and freshness-all show the same 3 failures as clean origin/main, none on `/intelligence`.
-- Nothing pushed, merged or deployed. Acceptance criteria are NOT fully met: see Remaining work and blockers B1-B6.
+## Final verification (2026-10-28, after fourth pass)
+- See the PR description for the final numbers; the ledger is updated when the last full run finishes.

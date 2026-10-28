@@ -48,6 +48,10 @@ control_plane:
    gate, and reviewer and author models from different listed families. Anything missing makes the gate wait for a human.
 6. Missed webhook deliveries: `POST /api/v1/intelligence/webhooks/reconcile` (operator, org-wide) records open PR heads no webhook saw.
 
+## Proposals
+With `suggest: true` an operator can create a proposal (`POST /api/v1/intelligence/proposals`, optional `Idempotency-Key`); a *different* operator approves it with the
+exact `payload_sha256` and `resource_version` it was shown. Proposals expire after 30 minutes and are not persisted. Approving records permission only.
+
 ## Stop / rollback
 - Fastest: `kill_switch: true` (config is re-read within seconds). `repair.kill_switch: true` rejects repair merges.
 - If repair was enabled and the central config becomes unreadable, the gate rejects (it never falls back to "allow").
@@ -64,4 +68,6 @@ control_plane:
 | Gmail revoke tombstones and pauses; backfill idempotent | `test_intel_gmail_sync.py` |
 | Egress: mail never reaches a cloud route | `test_llm_proxy.py::test_tagged_content_is_gated_by_operator_egress_routes` |
 | Incident states never move backwards | `test_intel_incidents.py` |
+| Whole enabling order, restart, kill switch, DOWN | `test_intel_rollout_rehearsal.py` |
+| Approval needs another person and the exact payload | `test_project_intelligence_api.py::test_proposals_*` |
 | Attachments: only accepted bytes reach the artifact store | `test_intel_connectors.py` |
