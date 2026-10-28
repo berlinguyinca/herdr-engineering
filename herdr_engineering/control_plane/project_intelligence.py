@@ -125,7 +125,12 @@ class EvidenceRef:
     redaction_policy: str = "none"
 
     @staticmethod
-    def parse(raw: Any) -> EvidenceRef:
+    def parse(raw: Any, *, stored: bool = False) -> EvidenceRef:
+        """``stored=True`` is for rows read back from our own database, where a tombstone scrub may have left the
+        ``removed`` anchor. Ingest never passes it, so a client cannot submit a removed-anchor reference."""
+        if stored and isinstance(raw, dict) and raw.get("anchor_type") == "removed" and raw.get("redaction_policy") == "source_removed" \
+                and isinstance(raw.get("source_ref"), str) and raw["source_ref"]:
+            return EvidenceRef(raw["source_ref"], "removed", "removed", redaction_policy="source_removed")
         if not isinstance(raw, dict):
             raise IntelligenceError("evidence ref must be an object")
         source_ref, anchor_type, anchor_value = raw.get("source_ref"), raw.get("anchor_type"), raw.get("anchor_value")
@@ -367,7 +372,9 @@ class IntelligenceStore:
             for eid, ev in list(self._events.items()):
                 if ev.org_id == org_id and not ev.tombstoned and (
                         ev.object_ref == source_ref or any(e.source_ref == source_ref for e in ev.evidence)):
-                    self._events[eid] = replace(ev, tombstoned=True, payload={}, title="[removed at source]")
+                    self._events[eid] = replace(
+                        ev, tombstoned=True, payload={}, title="[removed at source]", actor_ref=None,
+                        evidence=tuple(EvidenceRef(e.source_ref, "removed", "removed", redaction_policy="source_removed") for e in ev.evidence))
                     n += 1
             # Derived output that cited the removed source is no longer backed by it: back to provisional review.
             for rid, rel in list(self._rels.items()):

@@ -236,3 +236,30 @@ def test_removing_a_source_unverifies_findings_that_only_cited_it():
     by = {f["statement"].removeprefix("[unverified] "): f for f in s.findings(viewer)}
     assert by["only mail"]["verified"] is False and by["only mail"]["evidence_refs"] == []
     assert by["mail and ci"]["verified"] is True and len(by["mail and ci"]["evidence_refs"]) == 1
+
+
+def test_tombstone_scrubs_actor_and_evidence_anchors_but_keeps_the_source_ref():
+    from datetime import UTC, datetime
+
+    from herdr_engineering.control_plane import project_intelligence as pi
+    s = pi.IntelligenceStore()
+    s.append_event({"org_id": "o", "source_system": "gmail", "source_instance": "a", "source_id": "m1", "event_type": "email.received",
+                    "occurred_at": datetime(2026, 10, 1, tzinfo=UTC).isoformat(), "object_ref": "email:m1", "project_ids": ["p"],
+                    "title": "Secret subject", "actor_ref": "email:alex@lab.example", "payload": {"x": 1},
+                    "provenance_refs": [{"source_ref": "gmail:a:m1", "anchor_type": "email_part", "anchor_value": "1.2", "content_hash": "ab" * 32}]},
+                   cfg={"enabled": True, "ingest": True})
+    assert s.tombstone_source("o", "gmail:a:m1") == 1
+    item = s.timeline(pi.Viewer("o", None, "restricted"), project_id="p")["items"][0]
+    assert item["title"] == "[removed at source]" and item["actor"] is None
+    assert item["evidence_refs"] == [{"source_ref": "gmail:a:m1", "anchor_type": "removed", "anchor_value": "removed",
+                                      "redaction_policy": "source_removed"}]
+
+
+def test_ingest_cannot_submit_a_removed_anchor_reference():
+    import pytest
+
+    from herdr_engineering.control_plane import project_intelligence as pi
+    forged = {"source_ref": "x:1", "anchor_type": "removed", "anchor_value": "removed", "redaction_policy": "source_removed"}
+    with pytest.raises(pi.IntelligenceError):
+        pi.EvidenceRef.parse(forged)
+    assert pi.EvidenceRef.parse(forged, stored=True).anchor_type == "removed"

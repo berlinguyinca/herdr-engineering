@@ -85,7 +85,10 @@ class PgPersistence:
 
     def mark_tombstoned(self, event_ids: list[str]) -> None:
         async def go(c):
-            await c.execute("update pi_event set tombstoned=true, payload='{}'::jsonb, title='[removed at source]' "
+            await c.execute("update pi_event set tombstoned=true, payload='{}'::jsonb, title='[removed at source]', actor_ref=null, "
+                            "evidence_refs=(select coalesce(jsonb_agg(jsonb_build_object('source_ref', e->>'source_ref', "
+                            "'anchor_type','removed','anchor_value','removed','redaction_policy','source_removed')), '[]'::jsonb) "
+                            "from jsonb_array_elements(evidence_refs) e) "
                             "where event_id = any($1::text[])", event_ids)
         self._do(go)
 
@@ -153,7 +156,7 @@ def _ev(row) -> pi.SourceEvent:
         event_type=row["event_type"], occurred_at=row["occurred_at"], ingested_at=row["ingested_at"],
         project_ids=tuple(row["project_ids"]), investigation_ids=tuple(row["investigation_ids"]), object_ref=row["object_ref"],
         actor_ref=row["actor_ref"], title=row["title"], category=row["category"],
-        evidence=tuple(pi.EvidenceRef.parse(e) for e in json.loads(row["evidence_refs"])),
+        evidence=tuple(pi.EvidenceRef.parse(e, stored=True) for e in json.loads(row["evidence_refs"])),
         security_label=row["security_label"], visibility_scope=row["visibility_scope"],
         payload_schema_version=row["payload_schema_version"], payload=json.loads(row["payload"]),
         content_digest=row["content_digest"], correlation_id=row["correlation_id"], causation_id=row["causation_id"],
@@ -176,13 +179,13 @@ class DurableIntelligenceStore(pi.IntelligenceStore):
             for row in data["rels"]:
                 self._rels[row["id"]] = pi.Relationship(
                     row["id"], row["org_id"], tuple(row["project_ids"]), row["from_ref"], row["to_ref"], row["predicate"],
-                    row["derivation"], tuple(pi.EvidenceRef.parse(e) for e in json.loads(row["evidence_refs"])),
+                    row["derivation"], tuple(pi.EvidenceRef.parse(e, stored=True) for e in json.loads(row["evidence_refs"])),
                     row["security_label"], row["review_state"], float(row["confidence"]) if row["confidence"] is not None else None,
                     row["extractor_version"], row["model_id"], row["verified_by"], row["superseded_by"], row["version"])
             for row in data["findings"]:
                 self._findings[row["id"]] = pi.Finding(
                     row["id"], row["org_id"], tuple(row["project_ids"]), row["statement"],
-                    tuple(pi.EvidenceRef.parse(e) for e in json.loads(row["evidence_refs"])), row["security_label"],
+                    tuple(pi.EvidenceRef.parse(e, stored=True) for e in json.loads(row["evidence_refs"])), row["security_label"],
                     row["extractor_version"], row["model_identifier"])
             self._paused |= {(r["org_id"], r["source_system"]) for r in data["pauses"]}
             for r in data["outbox"]:
