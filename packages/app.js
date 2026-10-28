@@ -16,9 +16,11 @@ import { mountMissionCatalog } from './mission-catalog-view.js';
 import { mountOverview } from './overview-view.js';
 import { mountIntegrations } from './integrations-view.js';
 import { mountGithub } from './github-view.js';
+import { mountGithubProjects } from './github-projects-view.js';
 import { mountReviewGate } from './review-gate-view.js';
 import { mountTopology } from './topology-view.js';
 import { mountArchitecture } from './architecture-view.js';
+import { mountPersonalAssistant } from './personal-assistant-view.js';
 import { visibleNav } from './nav-capabilities.js';
 import { mountSessionsView, sessionEntries } from './sessions-view.js';
 import { recordOutcome, statusOutcome } from './record-state.js';
@@ -77,6 +79,7 @@ const NAV = [
   { path: '/services', label: 'Services' },
   { path: '/local-services', label: 'Local services' },
   { path: '/system-services', label: 'System services' },
+  { path: '/github/projects', label: 'Project boards' },
   { path: '/github', label: 'Projects' },
   { path: '/ci', label: 'CI' },
   { path: '/reviews', label: 'Reviews' },
@@ -90,6 +93,7 @@ const NAV = [
   { path: '/publications', label: 'Publications' },
   { path: '/scheduling', label: 'Scheduling' },
   { path: '/handoffs', label: 'Handoffs' },
+  { path: '/personal-assistant', label: 'Personal Assistant', capability: 'assistant_v1' },
 ];
 
 const SHELL = document.getElementById('shell');
@@ -134,6 +138,7 @@ function route() {
 const ROUTES = {
   '/overview': viewOverview,
   '/attention': viewAttention,
+  '/github/projects': viewGithubProjects,
   '/github': viewGithub,
   '/collab': viewCollab,
   '/ci': viewIntegrations,
@@ -152,6 +157,7 @@ const ROUTES = {
   '/local-services': viewServices,
   '/services/:id': viewService,
   '/hosts': viewHosts,
+  '/personal-assistant': viewPersonalAssistant,
   '/hosts/:id': viewHost,
   '/activity': viewActivity,
   '/analytics': viewAnalytics,
@@ -197,6 +203,11 @@ function matchRoute(parts) {
     if (rp.length !== parts.length) return false;
     return rp.every((rpseg, i) => rpseg.startsWith(':') || rpseg === parts[i]);
   }) || '/overview';
+}
+
+async function viewPersonalAssistant() {
+  root.innerHTML = '<div id="personal-assistant"></div>';
+  return { dispose: mountPersonalAssistant(root.querySelector('#personal-assistant'), client) };
 }
 
 function mountView(view) {
@@ -359,6 +370,12 @@ async function viewCollab() {
 
 async function viewGithub() {
   return ownPolling(mountGithub(root, client));
+}
+
+async function viewGithubProjects() {
+  // Read-only Projects v2 boards; keeps its own 5 s poll, live events refresh it too.
+  const query = route().query;
+  return mountGithubProjects(root, client, { project: query.get('project') || '', layout: query.get('layout') || 'board' });
 }
 
 async function viewReviewGate() {

@@ -13,16 +13,59 @@ export class ApiError extends Error {
   }
 }
 
+const CONDITIONAL_ENTRIES = 64;
+
 export class HerdrClient {
-  constructor(baseUrl = '', { fetchImpl = fetch } = {}) {
+  constructor(baseUrl = '', { fetchImpl = fetch, user = 'operator', tenant = 'default' } = {}) {
     this.base = baseUrl.replace(/\/+$/, '');
     this.fetch = fetchImpl;
+    this.user = user;
+    this.tenant = tenant;
+    this.conditional = new Map();  // url -> { etag, text } (bounded by CONDITIONAL_ENTRIES)
+  }
+
+  get conditionalSize() { return this.conditional.size; }
+
+  async getConditional(path, { signal } = {}) {
+    const url = `${this.base}${path}`;
+    const doFetch = this.fetch;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const held = attempt === 0 ? this.conditional.get(url) : undefined;
+      const headers = { Accept: 'application/json' };
+      if (held) headers['If-None-Match'] = held.etag;
+      const res = await doFetch(url, { method: 'GET', headers, signal });
+      const current = () => this.conditional.get(url) === held;
+      if (res.status === 304) {
+        if (!held) continue;
+        if (current()) { this.conditional.delete(url); this.conditional.set(url, held); }
+        return { body: JSON.parse(held.text), notModified: true };
+      }
+      const text = await res.text();
+      let json;
+      try { json = text ? JSON.parse(text) : null; } catch { json = { raw: text }; }
+      if (!res.ok) {
+        throw new ApiError(res.status, json, (json && json.error) || `HTTP ${res.status}`);
+      }
+      const etag = res.headers?.get?.('ETag');
+      if (!current()) return { body: json, notModified: false };
+      this.conditional.delete(url);
+      if (etag && text) {
+        this.conditional.set(url, { etag, text });
+        while (this.conditional.size > CONDITIONAL_ENTRIES) this.conditional.delete(this.conditional.keys().next().value);
+      }
+      return { body: json, notModified: false };
+    }
+    throw new ApiError(304, null, 'Not modified, but no remembered body');
+  }
+
+  async getJson(path, { signal } = {}) {
+    return (await this.getConditional(path, { signal })).body;
   }
 
   async request(path, { method = 'GET', body, signal = AbortSignal.timeout(15000) } = {}) {
     const startedAt = Date.now();
     const url = `${this.base}${path}`;
-    const headers = { Accept: 'application/json' };
+    const headers = { Accept: 'application/json', 'X-Herdr-User': this.user, 'X-Herdr-Tenant': this.tenant };
     let payload;
     if (body !== undefined) {
       headers['Content-Type'] = 'application/json';
@@ -342,6 +385,27 @@ export class HerdrClient {
     return this.request(`/api/v1/github${query.size ? `?${query}` : ''}`, { signal });
   }
 
+  // One GitHub list read as { body, notModified }. `since` (a revision the caller holds) asks for a
+  // delta: { revision, resync:false, upserted, removed }, or { resync:true, <full list> }.
+  getGithubConditional(kind, { repository, tab, search, page, per_page, since, signal } = {}) {
+    const query = new URLSearchParams();
+    const params = kind === 'issues' ? { repository, tab, search, page, per_page, since } : { page, per_page, search, since };
+    for (const [key, value] of Object.entries(params)) {
+      if (value != null && !(key === 'repository' && value === '')) query.set(key, String(value));
+    }
+    const path = kind === 'issues' ? '/api/v1/github/issues' : '/api/v1/github';
+    return this.getConditional(`${path}${query.size ? `?${query}` : ''}`, { signal });
+  }
+
+  // GitHub Projects v2 (read-only): the in-scope projects, or one project's items with `project`.
+  // Same contract as getGithubConditional: { body, notModified }, `since` asks for a delta.
+  getGithubProjects({ project, since, signal } = {}) {
+    const query = new URLSearchParams();
+    if (project) query.set('project', String(project));
+    if (since != null) query.set('since', String(since));
+    return this.getConditional(`/api/v1/github/projects${query.size ? `?${query}` : ''}`, { signal });
+  }
+
   getGithubIssues(repository, { tab, search, page, per_page, signal } = {}) {
     const query = new URLSearchParams();
     for (const [key, value] of Object.entries({ repository, tab, search, page, per_page })) {
@@ -487,5 +551,109 @@ export class HerdrClient {
   // -- health / self-observability -----------------------------------------
   health({ signal } = {}) {
     return this.request('/api/v1/health', { signal });
+  }
+
+  // -- Herdr Personal Assistant (Rakazo integration) -----------------------
+  listAssistants({ signal } = {}) {
+    return this.request('/api/v1/assistants', { signal });
+  }
+  createAssistant(body, { signal } = {}) {
+    return this.request('/api/v1/assistants', { method: 'POST', body, signal });
+  }
+  getAssistant(id, { signal } = {}) {
+    return this.request(`/api/v1/assistants/${encodeURIComponent(id)}`, { signal });
+  }
+  updateAssistant(id, patch, { signal } = {}) {
+    return this.request(`/api/v1/assistants/${encodeURIComponent(id)}`, { method: 'PATCH', body: patch, signal });
+  }
+  archiveAssistant(id) {
+    return this.request(`/api/v1/assistants/${encodeURIComponent(id)}`, { method: 'DELETE' });
+  }
+  listAssistantThreads(assistantId, { signal } = {}) {
+    return this.request(`/api/v1/assistants/${encodeURIComponent(assistantId)}/threads`, { signal });
+  }
+  createThread(assistantId, title, { signal } = {}) {
+    return this.request(`/api/v1/assistants/${encodeURIComponent(assistantId)}/threads`, { method: 'POST', body: { title }, signal });
+  }
+  getThread(assistantId, threadId, { signal } = {}) {
+    return this.request(`/api/v1/assistants/${encodeURIComponent(assistantId)}/threads/${encodeURIComponent(threadId)}`, { signal });
+  }
+  sendAssistantMessage(assistantId, threadId, content) {
+    return this.request(`/api/v1/assistants/${encodeURIComponent(assistantId)}/threads/${encodeURIComponent(threadId)}/messages`, { method: 'POST', body: { content } });
+  }
+  getRun(runId) {
+    return this.request(`/api/v1/assistant-runs/${encodeURIComponent(runId)}`);
+  }
+  cancelRun(runId) {
+    return this.request(`/api/v1/assistant-runs/${encodeURIComponent(runId)}/cancel`, { method: 'POST', body: {} });
+  }
+  getAssistantPermissions(assistantId, { signal } = {}) {
+    return this.request(`/api/v1/assistants/${encodeURIComponent(assistantId)}/permissions`, { signal });
+  }
+  grantTool(assistantId, body, { signal } = {}) {
+    return this.request(`/api/v1/assistants/${encodeURIComponent(assistantId)}/permissions`, { method: 'POST', body, signal });
+  }
+  listApprovals({ signal } = {}) {
+    return this.request('/api/v1/assistant-approvals', { signal });
+  }
+  decideApproval(approvalId, decision) {
+    return this.request(`/api/v1/assistant-approvals/${encodeURIComponent(approvalId)}/decision`, { method: 'POST', body: { decision } });
+  }
+  requestToolAction(runId, body) {
+    return this.request(`/api/v1/assistant-runs/${encodeURIComponent(runId)}/tool`, { method: 'POST', body });
+  }
+  searchMemory(assistantId, query, { signal } = {}) {
+    return this.request(`/api/v1/assistants/${encodeURIComponent(assistantId)}/memory?q=${encodeURIComponent(query)}`, { signal });
+  }
+  storeMemory(assistantId, body) {
+    return this.request(`/api/v1/assistants/${encodeURIComponent(assistantId)}/memory`, { method: 'POST', body });
+  }
+  exportMemory(assistantId) {
+    return this.request(`/api/v1/assistants/${encodeURIComponent(assistantId)}/memory/export`, { method: 'POST', body: {} });
+  }
+  forgetMemory(memoryId) {
+    return this.request(`/api/v1/assistant-memory/${encodeURIComponent(memoryId)}`, { method: 'DELETE' });
+  }
+  assistantDiagnostics(assistantId, { signal } = {}) {
+    return this.request(`/api/v1/assistants/${encodeURIComponent(assistantId)}/diagnostics`, { signal });
+  }
+  listRoutines({ signal } = {}) {
+    return this.request('/api/v1/assistant-routines', { signal });
+  }
+  createRoutine(body, { signal } = {}) {
+    return this.request('/api/v1/assistant-routines', { method: 'POST', body, signal });
+  }
+  triggerRoutine(routineId) {
+    return this.request(`/api/v1/assistant-routines/${encodeURIComponent(routineId)}/trigger`, { method: 'POST', body: {} });
+  }
+  archiveRoutine(routineId) {
+    return this.request(`/api/v1/assistant-routines/${encodeURIComponent(routineId)}`, { method: 'DELETE' });
+  }
+  correctMemory(memoryId, content) {
+    return this.request(`/api/v1/assistant-memory/${encodeURIComponent(memoryId)}`, { method: 'PATCH', body: { content } });
+  }
+  listConnectors() {
+    return this.request('/api/v1/assistant-connectors');
+  }
+  registerConnector(body) {
+    return this.request('/api/v1/assistant-connectors', { method: 'POST', body });
+  }
+  archiveConnector(connectorId) {
+    return this.request(`/api/v1/assistant-connectors/${encodeURIComponent(connectorId)}`, { method: 'DELETE' });
+  }
+  connectorRequest(connectorId, body) {
+    return this.request(`/api/v1/assistant-connectors/${encodeURIComponent(connectorId)}/request`, { method: 'POST', body });
+  }
+  listDelegations() {
+    return this.request('/api/v1/assistant-delegations');
+  }
+  delegate(body) {
+    return this.request('/api/v1/assistant-delegations', { method: 'POST', body });
+  }
+  cancelDelegation(delegationId) {
+    return this.request(`/api/v1/assistant-delegations/${encodeURIComponent(delegationId)}/cancel`, { method: 'POST', body: {} });
+  }
+  registerDelegationArtifact(delegationId, artifactRef) {
+    return this.request(`/api/v1/assistant-delegations/${encodeURIComponent(delegationId)}/artifact`, { method: 'POST', body: { artifact_ref: artifactRef } });
   }
 }

@@ -11,6 +11,7 @@ import {mountCiObservability,ciProjectKey} from './ci-observability-view.js';
 import {ciRunInScope,ciRunInWindow,ciSelectRunWindow} from './ci-health.js';
 import {mountCiHealth} from './ci-health-view.js';
 import {snapshotText,animateChanges,skeleton} from './motion.js';
+import {morph,handOff,patchText,patchAttr} from './patch.js';
 import {renderCiFix,ciFixStyles,fixRunKey,latestFix,fixIsActive,fixError} from './ci-fix-view.js';
 import {attachError,attachForms} from './terminal-attach.js';
 import {renderRelated} from './related-panel.js';
@@ -250,6 +251,15 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
   })} : data||{},kind);
   const entryKey=node=>node.closest('[data-entry]')?.dataset.entry;
   let chartsDrawn=false,motionSettled=false,motionView='';
+  // Panels are morphed in place: morph keeps a <details> open, never moves a node holding focus or
+  // a text selection, and reuses unchanged nodes (so scroll and form state persist). A node the user
+  // is in that leaves the new markup is handed to its equivalent control (or the review summary / a
+  // link with the same href) instead of dropping focus.
+  // The results list and inspector are rebuilt with innerHTML (not morphed): the review rows carry
+  // their disclosure open state dynamically, and the visibility handler re-fetches a review detail on
+  // every toggle dispatch for an open disclosure. Rebuilding preserves that interaction exactly. The
+  // signature gate already prevents any DOM write on a quiet poll; the other panels (health, insights,
+  // runners, filters) are morphed.
   function replace(element,html) {
     const focused=document.activeElement;
     const focusKey=element.contains(focused) ? ['data-run','data-step','data-close-inspector','data-ci-action','data-ci-test-search','data-ci-test-page','data-collapse-success','data-pipeline-zoom','data-ci-compare','data-fix-sandbox','data-fix-cancel','data-fix-terminal','data-fix-copy'].find(k=>focused.hasAttribute(k)) : null;
@@ -289,7 +299,7 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
     const health=integrationHealth(data,kind,{failed:!!error});
     const healthElement=el('[data-ig-health]');
     const healthKey=JSON.stringify([!data&&!!error,data?.status,data?.refreshing,data?.progress,data?.last_success_at,data?.checked_at,data?.error,data?.stale,data?.repo_errors,data?.project_mapping_error]);
-    if(healthElement.dataset.signature!==healthKey){healthElement.dataset.signature=healthKey;const issuesOpen=healthElement.querySelector('details')?.open;healthElement.innerHTML=health;if(issuesOpen && healthElement.querySelector('details'))healthElement.querySelector('details').open=true;}
+    if(healthElement.dataset.signature!==healthKey){healthElement.dataset.signature=healthKey;morph(healthElement,health);}
     const all=entries(),filtered=selectIntegrations(all,state),pageSize=20;
     state.page=Math.min(state.page,Math.max(0,Math.ceil(filtered.length/pageSize)-1));
     // Clock advance can change membership even when every provider payload is unchanged.
@@ -300,9 +310,13 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
       const model=ciInsightsModel(observations,state);
       const html=renderCiInsights(model,{loading:reportData===null&&!reportsError,error:reportsError,failurePage});
       if(insightsSignature!==html){
-        const host=el('[data-ci-insights]'),disclosures=[...host.querySelectorAll('details')];
-        const open=disclosures.map(d=>d.open),focus=disclosures.findIndex(d=>d.querySelector('summary')===document.activeElement);
-        host.innerHTML=html;const next=[...host.querySelectorAll('details')];next.forEach((d,i)=>d.open=!!open[i]);if(focus>=0)next[focus]?.querySelector('summary')?.focus({preventScroll:true});insightsSignature=html;
+        const host=el('[data-ci-insights]');
+        const focus=[...host.querySelectorAll('details')].findIndex(d=>d.querySelector('summary')===document.activeElement);
+        const stranded=morph(host,html);
+        // morph keeps an open disclosure open; only re-focus if a focused summary left the tree.
+        if(focus>=0 && !host.contains(document.activeElement))[...host.querySelectorAll('details')][focus]?.querySelector('summary')?.focus({preventScroll:true});
+        handOff(stranded,()=>null);
+        insightsSignature=html;
       }
       for(const [selector,field,label] of [['[data-ci-repository]','repository','All repositories'],['[data-ci-branch]','branch','All branches']]){
         const select=el(selector),values=new Map();
@@ -316,13 +330,13 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
         const selectedValue=field==='repository'&&state.project?ciProjectKey(state.project):state[field];
         if(selectedValue)values.set(selectedValue,values.get(selectedValue)||selectedValue);
         const options=`<option value="">${label}</option>`+[...values].sort((a,b)=>a[1].localeCompare(b[1])).map(([value,label])=>`<option value="${esc(value)}">${esc(label)}</option>`).join('');
-        if(select.innerHTML!==options)select.innerHTML=options;select.value=selectedValue;
+        if(select.innerHTML!==options){morph(select,options);select.value=selectedValue;}
       }
     }
     if(signature!==nextSignature) {
       signature=nextSignature;
-      // Rows and charts are rebuilt with innerHTML (Task 19 moves them onto the patcher); motion pairs
-      // old and new nodes by key: tab counts by node, rows by data-entry (state change = flash).
+      // Rows and charts are morphed (Task 19 patcher); motion pairs old and new nodes by key:
+      // tab counts by node, rows by data-entry (state change = flash).
       // Motion only for data-driven changes: not before the reports have landed (CI counts include
       // retained observations) and not when the user changed the tab, a filter, the search or page.
       const settled=!!data&&(!isCi||reportData!==null||!!reportsError), view=JSON.stringify(state);
@@ -342,6 +356,8 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
         }) : '<p class="ci-chart-note">Waiting for CI reports…</p>';
         if(chartSignature!==html) {
           chartSignature=html;
+          // Charts are rebuilt (not morphed): data-drawn marks must be cleared on later paints so
+          // only the first paint draws in. The chartSignature gate already avoids quiet-poll writes.
           const disclosure=chart.querySelector('[data-ci-chart-data]');
           const open=disclosure?.open, focused=disclosure?.querySelector('summary')===document.activeElement;
           const focusedTable=chart.contains(document.activeElement)&&document.activeElement.classList.contains('ci-chart-table')?document.activeElement.getAttribute('aria-label'):null;
@@ -369,9 +385,8 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
       el('[data-page="previous"]').disabled=state.page===0;el('[data-page="next"]').disabled=(state.page+1)*pageSize>=filtered.length;
       if(isCi) {
         const runners=records(data?.agents);
-        const runnersOpen=el('[data-ig-runners]').querySelector('details')?.open;
-        el('[data-ig-runners]').innerHTML=`<details class="ig-runners"><summary>Runner capacity · ${runners.length ? `${runners.length} reported` : 'not available'}</summary>${data?.agents_error ? `<p>${esc(short(data.agents_error,300))}</p>` : ''}${runners.map(r=>`<p>${esc(short(r.name)||'Unnamed runner')} · ${esc(short(r.platform))}${r.capacity!=null ? ` · Capacity ${esc(r.capacity)}` : ''}</p>`).join('') || '<p>The provider has not supplied runner capacity. Repository runs can still be inspected.</p>'}</details>`;
-        if(runnersOpen)el('[data-ig-runners]').querySelector('details').open=true;
+        // morph keeps the runner-capacity disclosure open across refreshes.
+        morph(el('[data-ig-runners]'),`<details class="ig-runners"><summary>Runner capacity · ${runners.length ? `${runners.length} reported` : 'not available'}</summary>${data?.agents_error ? `<p>${esc(short(data.agents_error,300))}</p>` : ''}${runners.map(r=>`<p>${esc(short(r.name)||'Unnamed runner')} · ${esc(short(r.platform))}${r.capacity!=null ? ` · Capacity ${esc(r.capacity)}` : ''}</p>`).join('') || '<p>The provider has not supplied runner capacity. Repository runs can still be inspected.</p>'}</details>`);
       }
     }
     const inspector=el('.ig-inspector');inspector.hidden=!selected;

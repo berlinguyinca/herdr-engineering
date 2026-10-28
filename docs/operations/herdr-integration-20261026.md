@@ -90,6 +90,29 @@ concern and the deployment readiness deadline must accommodate measured replay.
 
 The active goal remains incomplete until every acceptance gate is verified.
 
+## Resumed on 2026-10-28
+
+The user resumed work in Codex. The original handoff remains a historical
+checkpoint. The paused dirty source was preserved in commit `8ac164f` after
+fresh verification: 44 backend tests and all six event-history browser tests.
+Current upstream/live release is `3f53537`; integration is merging its Personal
+Assistant, GitHub Projects, and shared-patcher changes without replacing the
+complete replay or responsive UI work.
+
+The merge exposed an HTTP diagnostics gap: upstream PATCH/DELETE requests reused
+the previous request identity on persistent connections. A regression test failed
+before applying the shared timing wrapper, then the diagnostics/assistant API
+suite passed 33 tests. The existing restriction of these verbs to assistant
+resources remains unchanged. Merged backend checks passed 186 tests (42 optional
+database cases skipped); subsequent isolated real Postgres checks passed 95 tests
+and the assistant persistence round-trip passed separately.
+
+Full final-source Python, browser, release, and deployment checks are pending.
+The live service still filters startup event types, so health alone does not prove
+recovery of event-only hosts/sessions/services. The complete replay remains a
+required integration property; the existing measured cold-start limitation still
+applies. Production has not been changed by this resumed work yet.
+
 ## History and diagnostics verification
 
 - Event-history reads now support bounded cursor pages without changing the

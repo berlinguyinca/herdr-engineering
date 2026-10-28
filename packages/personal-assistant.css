@@ -1,0 +1,47 @@
+/* Herdr Personal Assistant — feature-scoped styles.
+   Uses the canonical design tokens (packages/herdr-design-system/theme.css)
+   and the shared hd-* primitives. No new component library. */
+.pa-shell { display: grid; grid-template-columns: 240px 1fr; gap: var(--density-gap, 16px); align-items: start; }
+.pa-shell__side { display: flex; flex-direction: column; gap: 8px; }
+.pa-item { border: 1px solid var(--border-color); border-radius: var(--radius-sm); padding: 10px 12px; cursor: pointer; background: var(--surface); }
+.pa-item--active { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+.pa-item__name { font-weight: 600; }
+.pa-item__meta { color: var(--text-muted); font-size: var(--text-sm, 13px); }
+.pa-main { display: grid; grid-template-columns: minmax(0, 1fr) 320px; gap: 16px; }
+.pa-col { display: flex; flex-direction: column; gap: 12px; }
+.pa-tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--border-color); margin-bottom: 12px; flex-wrap: wrap; }
+.pa-tab { padding: 6px 12px; border: 1px solid transparent; border-radius: var(--radius-sm) var(--radius-sm) 0 0; cursor: pointer; background: transparent; color: var(--text-secondary); font: inherit; }
+.pa-tab--active { border-color: var(--border-color); border-bottom-color: transparent; background: var(--surface); color: var(--text-primary); font-weight: 600; }
+.pa-field { display: flex; flex-direction: column; gap: 4px; margin-bottom: 10px; }
+.pa-field label { font-size: var(--text-sm, 13px); color: var(--text-secondary); }
+.pa-field input, .pa-field textarea, .pa-field select { border: 1px solid var(--border-color); border-radius: var(--radius-sm); padding: 7px 9px; font: inherit; background: var(--surface); color: var(--text); }
+.pa-field textarea { min-height: 64px; resize: vertical; font-family: var(--font-sans); }
+.pa-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.pa-status { display: inline-flex; align-items: center; gap: 6px; padding: 2px 10px; border-radius: 999px; font-size: var(--text-sm, 13px); border: 1px solid var(--border-color); }
+.pa-status--ready { color: var(--status-ok); border-color: var(--status-ok); }
+.pa-status--disabled { color: var(--text-muted); }
+.pa-status--running { color: var(--status-active); border-color: var(--status-active); }
+.pa-status--needs { color: var(--status-attention); border-color: var(--status-attention); }
+.pa-chat { display: flex; flex-direction: column; gap: 10px; }
+.pa-msg { padding: 9px 12px; border-radius: var(--radius-sm); border: 1px solid var(--border-color); background: var(--surface); white-space: pre-wrap; }
+.pa-msg--user { background: var(--accent-weak); }
+.pa-msg--meta { color: var(--text-muted); font-size: var(--text-sm, 12px); }
+.pa-approval { border-left: 3px solid var(--status-attention); padding-left: 10px; }
+.pa-muted { color: var(--text-muted); font-size: var(--text-sm, 13px); }
+.pa-empty { padding: 24px; text-align: center; color: var(--text-muted); }
+.pa-badge { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 12px; border: 1px solid var(--border-color); }
+.pa-badge--granted { color: var(--status-ok); border-color: var(--status-ok); }
+.pa-badge--sensitive { color: var(--status-attention); border-color: var(--status-attention); }
+@media (max-width: 900px) { .pa-shell, .pa-main { grid-template-columns: 1fr; } }
+
+/* Mobile (375px) — stack the composer, keep touch targets comfortable, and
+   let tab labels wrap instead of overflowing. */
+@media (max-width: 480px) {
+  .pa-tab { padding: 8px 10px; font-size: 13px; }
+  .pa-row { flex-direction: column; align-items: stretch; }
+  .pa-row input, .pa-row textarea, .pa-row select, .pa-row button { width: 100%; }
+  .pa-row .hd-btn { min-height: 40px; }
+  .pa-shell__side { flex-direction: row; flex-wrap: wrap; }
+  .pa-item { flex: 1 1 40%; }
+  .pa-msg { font-size: 14px; }
+}

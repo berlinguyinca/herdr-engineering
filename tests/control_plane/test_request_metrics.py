@@ -108,3 +108,33 @@ def test_backend_timeout_remains_visible_when_api_returns_an_error_response():
     recent = server.request_metrics.snapshot()['recent_requests'][-1]
     assert recent['request_id'] == request_id
     assert recent['cause'] == 'TimeoutError'
+
+
+def test_new_mutation_verbs_have_fresh_request_diagnostics_without_widening_routes():
+    import http.client
+    import threading
+
+    from herdr_engineering.control_plane.api import ControlPlaneServer
+    from herdr_engineering.control_plane.repo import ControlPlaneRepo
+
+    server = ControlPlaneServer(ControlPlaneRepo())
+    thread = threading.Thread(target=server.serve, daemon=True)
+    thread.start()
+    server.wait_until_ready()
+    conn = http.client.HTTPConnection('127.0.0.1', server.port, timeout=5)
+    ids = []
+    try:
+        for verb in ('GET', 'PATCH', 'DELETE'):
+            conn.request(verb, '/api/v1/sessions')
+            response = conn.getresponse()
+            assert response.status == (200 if verb == 'GET' else 501)
+            ids.append(response.getheader('X-Request-ID'))
+            response.read()
+    finally:
+        conn.close()
+        server.shutdown()
+        thread.join(3)
+    assert all(ids) and len(set(ids)) == 3
+    route = server.request_metrics.snapshot()['by_route']['/api/v1/sessions']
+    assert route['count'] == 3
+    assert route['errors'] == 2

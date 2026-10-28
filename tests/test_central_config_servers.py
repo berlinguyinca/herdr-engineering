@@ -6,12 +6,12 @@ import threading
 import pytest
 import yaml
 
-from herdr_engineering import cli, fleet_config_cli as fcc
+from herdr_engineering import cli
+from herdr_engineering import fleet_config_cli as fcc
 from herdr_engineering.control_plane import db
 from herdr_engineering.control_plane.ci_monitor import CIMonitor
 from herdr_engineering.control_plane.inspector import InspectorStore
 from herdr_engineering.control_plane.repo import ControlPlaneRepo
-
 
 
 def _url(hostport, database, user, pw):
@@ -184,6 +184,16 @@ def test_web_reads_everything_from_the_fleet_file_and_ignores_env(tmp_path, monk
     assert seen["repo"].inspector.limits["max_sessions"] == 9
     assert seen["server_kw"]["ci_actions"] is True
     assert seen["server_kw"]["github_pg_dsn"] == cp["pg_dsn"]  # the GitHub catalog persists there
+
+
+def test_web_wires_personal_assistant_from_fleet_config(tmp_path, monkeypatch, old_env, capsys):
+    # enabled section is passed through to the server as assistant_config
+    p1 = make_file(tmp_path / "pa", personal_assistant={"enabled": True, "inference": {"endpoint": "x"}})
+    seen = _run_web(monkeypatch, p1)
+    assert seen["server_kw"]["assistant_config"] == {"personal_assistant": {"enabled": True, "inference": {"endpoint": "x"}}}
+    # absent section stays disabled (None -> feature flag off)
+    seen = _run_web(monkeypatch, make_file(tmp_path / "none"))
+    assert seen["server_kw"]["assistant_config"] is None
 
 
 def test_web_reads_usage_retention_from_llm_proxy_section(tmp_path, monkeypatch, old_env, capsys):

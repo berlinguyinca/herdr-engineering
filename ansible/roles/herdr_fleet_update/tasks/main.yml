@@ -82,6 +82,24 @@
 - name: "Update this host (OS packages, herdr, pi, extensions, autospec, agent)"
   when: fleet_update_decision.action == 'update'
   block:
+    # Snapshot the controller's powerpack lock/config/plugin policy BEFORE any
+    # step mutates this host, so a failure below can restore the prior known-good
+    # state (convergence 11 fleet-canary-rollout). Runs on the main host: the
+    # controller's home (lookup('env','HOME')) and repo root (chdir) resolve the
+    # herdr-eng binary and powerpack's lock/config independently of the target's
+    # home (which differs on macOS /Users vs Linux /home).
+    - name: "Fleet update: powerpack snapshot before changing this host"
+      ansible.builtin.command:
+        argv: ["{{ lookup('env', 'HOME') }}/.venvs/herdr-engineering/bin/herdr-eng",
+               powerpack, snapshot, "fleet-update-{{ fleet_update_host_id }}"]
+      args:
+        chdir: "{{ herdr_engineering_repo_root }}"
+      changed_when: false
+      register: fleet_update_pp_snapshot
+      delegate_to: localhost
+      become: false
+      when: not ansible_check_mode
+
     - name: "Fleet update: OS packages"
       ansible.builtin.include_tasks: os-packages.yml
 
@@ -289,6 +307,32 @@
         fleet_update_outcome: updated
   rescue:
     # Only the failed task's NAME: results/messages may contain secrets.
+    - name: "Fleet update: powerpack rollback on failure"
+      ansible.builtin.command:
+        argv: ["{{ lookup('env', 'HOME') }}/.venvs/herdr-engineering/bin/herdr-eng",
+               powerpack, rollback, "fleet-update-{{ fleet_update_host_id }}"]
+      args:
+        chdir: "{{ herdr_engineering_repo_root }}"
+      changed_when: false
+      delegate_to: localhost
+      become: false
+      # A rollback failure must never bypass the failure recording / fleet-stop
+      # below (serial: 1), so it is best-effort and non-fatal.
+      #
+      # SCOPE: powerpack rollback restores the CONTROLLER's lock/config/plugin
+      # policy only. It does NOT rewind the target's deployed release — that is
+      # governed by fixed pinned revisions (herdr_pinned_version,
+      # fleet_update_herdr_engineering_revision) plus serial=1, deferral, the
+      # pending-restart marker and stop-on-failure. A target left partially
+      # staged at the pinned revision is recovered by re-running, not by this
+      # controller-side rollback.
+      ignore_errors: true
+      when:
+        - not ansible_check_mode
+        - fleet_update_pp_snapshot is defined
+        - fleet_update_pp_snapshot.rc is defined
+        - fleet_update_pp_snapshot.rc == 0
+
     - name: "Fleet update: mark failed"
       ansible.builtin.set_fact:
         fleet_update_outcome: failed

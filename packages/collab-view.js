@@ -2,6 +2,7 @@
 // people by email. Remote messages use the shared safe Markdown renderer.
 import { escapeHtml as esc } from './herdr-web-components/util.js';
 import { enter, isCalm } from './motion.js';
+import { morph, handOff, patchText, patchAttr } from './patch.js';
 import { bundleScript, filesFromBulk, shq, workerScript } from './collab-scripts.js';
 import { renderFlow } from './collab-flow.js';
 import { renderLinks } from './collab-links.js';
@@ -452,7 +453,7 @@ export function mountCollab(root, { fabricSessions = null, onFreshness = () => {
     try { hosts = (await api.fleetHosts()).hosts; } catch { return; }
     const html = hosts.length ? `<ul class="cx-list">${hosts.map((h) => `<li><span class="grow"><b>${esc(h.host)}</b> ${pill(h.online ? 'online' : 'offline', h.online ? 'var(--status-ok)' : 'var(--text-muted)')}${h.kind === 'local' ? ' <span class="hd-ident">this machine</span>' : ''}${h.online ? ` <span class="hd-ident">${h.families && h.families.length ? esc(h.families.join(', ')) : 'no agent CLIs found'}</span>` : ''}</span><label class="cx-check"><input type="checkbox" data-auto="${esc(h.host)}"${h.auto_agents ? ' checked' : ''}> Automatic agents</label></li>`).join('')}</ul>` : '<div class="hd-empty">No hosts reported yet. The host runner reports every few seconds.</div>';
     if (box.dataset.h === html) return;
-    box.dataset.h = html; box.innerHTML = html;
+    box.dataset.h = html; morph(box, html);
     box.querySelectorAll('[data-auto]').forEach((c) => { c.onchange = async () => { try { await api.setFleetHost(c.dataset.auto, c.checked); } catch (e) { alert(e.message); } renderHosts(); }; });
   }
   async function renderSpawns() {
@@ -463,7 +464,7 @@ export function mountCollab(root, { fabricSessions = null, onFreshness = () => {
     const busy = list.some((s) => ['requested', 'claimed'].includes(s.status));
     const colour = { requested: 'var(--status-attention)', claimed: 'var(--accent)', done: 'var(--status-ok)', stalled: 'var(--status-failed)', expired: 'var(--text-muted)' };
     const html = list.length ? `<h3>Recent fleet starts</h3><ul class="cx-list">${list.map((s) => `<li><span class="grow"><b>${esc(s.name_prefix)}-N</b> ${esc(s.harness_type)} × ${s.count}${s.error ? `<br><span class="cx-msg" role="alert">${esc(s.error)}</span>` : ''}${s.placements.length ? `<br>${s.placements.map((p) => `<span class="hd-ident" title="${esc(p.error || '')}">${esc(p.name)} → ${esc(p.host)}${p.status === 'failed' ? ' ✗' : ''}</span>`).join(' ')}` : ''}</span>${pill(s.status === 'done' && s.placements.some((p) => p.status === 'failed') ? 'partly started' : s.status, colour[s.status] || 'var(--text-muted)')}</li>`).join('')}</ul>` : '';
-    if (box.dataset.h !== html) { box.dataset.h = html; box.innerHTML = html; }
+    if (box.dataset.h !== html) { box.dataset.h = html; morph(box, html); }
     return busy;
   }
 
@@ -724,8 +725,17 @@ export function mountCollab(root, { fabricSessions = null, onFreshness = () => {
       if (el.contains(document.activeElement) && document.activeElement.matches('input,textarea,select')) { stale.add(id); return false; }
       const had = el.contains(document.activeElement) && document.activeElement !== el ? document.activeElement : null;
       const again = had ? stableSelector(had) : null;
-      el.dataset.h = html; el.innerHTML = html; stale.delete(id);
-      if (had && !el.contains(document.activeElement)) refocus(el, again);
+      el.dataset.h = html; stale.delete(id);
+      // Morphed in place: unchanged controls keep their nodes (and any focus/scroll); a focused
+      // control that left the new markup is handed to its equivalent (stable selector) or parked on
+      // the panel, so focus never drops to <body>.
+      const stranded = morph(el, html);
+      handOff(stranded, (node) => {
+        if (!(had && node.contains(had))) return null;
+        let target = again ? el.querySelector(again) : null;
+        if (!target) { if (!el.hasAttribute('tabindex')) el.setAttribute('tabindex', '-1'); target = el; }
+        return target;
+      });
       return true;
     };
     root.addEventListener('focusout', () => setTimeout(() => { if (stale.size && alive) paint(); }, 0));
@@ -1041,7 +1051,7 @@ export function mountCollab(root, { fabricSessions = null, onFreshness = () => {
     function drawAttach() {
       const h = $('hcn-ctx-attached');
       if (!h) return;
-      h.innerHTML = CTX.attach ? `<span class="ctx-chip"><span aria-hidden="true">◆</span> The next message refers to ${esc(CTX.attach)} <button type="button" class="hd-btn hd-btn--ghost hd-btn--sm" data-ctx-act="detach">Remove</button></span>` : '';
+      morph(h, CTX.attach ? `<span class="ctx-chip"><span aria-hidden="true">◆</span> The next message refers to ${esc(CTX.attach)} <button type="button" class="hd-btn hd-btn--ghost hd-btn--sm" data-ctx-act="detach">Remove</button></span>` : '');
       h.onclick = (e) => { if (e.target.closest('[data-ctx-act="detach"]')) { CTX.attach = null; drawAttach(); } };
     }
     async function loadContext() {
@@ -1097,7 +1107,7 @@ export function mountCollab(root, { fabricSessions = null, onFreshness = () => {
         });
       }
       const html = renderInbox({ ...ctxModel(), enabled: CTX.features.consultation });
-      if (h.dataset.h !== html) { h.dataset.h = html; h.innerHTML = html; }
+      if (h.dataset.h !== html) { h.dataset.h = html; handOff(morph(h, html), () => null); }
     }
     const LIN = { step: null, view: 'graph', mode: 'visual', clock: 'recorded', sel: null, focus: null, pages: [], total: 0, next: null,
       truncated: null, asOf: null, timeline: null, error: null, timelineError: null, html: '', pending: null, fails: 0, notice: null, busy: false, at: 0, seq: 0, bound: false, layout: null,
@@ -1248,7 +1258,12 @@ export function mountCollab(root, { fabricSessions = null, onFreshness = () => {
       if (!waiting) LIN.waitFocus = null;
       LIN.wasWaiting = waiting;
       const pos = key && a && box.contains(a) && typeof a.selectionStart === 'number' ? a.selectionStart : null;
-      LIN.html = html; box.innerHTML = html;
+      LIN.html = html;
+      // Morphed in place: unchanged nodes (the SVG, table rows, replay controls, workbench form) keep
+      // their nodes and any focus/scroll; a focused control that left is handed to its equivalent via
+      // the focusKey/focusSelector/successor logic below, so keyboard users keep their place.
+      const stranded = morph(box, html);
+      handOff(stranded, () => null);
       const sel = key && focusSelector(key);
       const el = sel && box.querySelector(sel);
       if (key && !el) {                                                    // the control is gone: its logical successor, else the panel
@@ -1389,7 +1404,7 @@ export function mountCollab(root, { fabricSessions = null, onFreshness = () => {
     // the count is painted (aria-hidden) and spoken as "Tasks, 3 waiting": the button's own name never glues a number onto the word ("Tasks3")
     const setBadge = (k, n) => {
       const b = $(`hcn-b-${k}`); if (!b) return;
-      b.hidden = !n; b.textContent = n > 99 ? '99+' : String(n);
+      b.hidden = !n; patchText(b, n > 99 ? '99+' : String(n));
       const tab = b.closest('[role="tab"]'); if (tab) tab.setAttribute('aria-label', n ? `${tab.dataset.label}, ${n > 99 ? 'more than 99' : n} waiting` : tab.dataset.label);
     };
     const loadMine = async () => { try { S.mine = (await api.agents()).agents.filter((x) => !x.external); }   // a remote agent is bound to its invite: nothing to grant

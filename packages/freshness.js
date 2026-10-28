@@ -26,6 +26,23 @@ export function freshnessState({ now, last, error = null, interval = 5000, conta
 
 const Base = typeof HTMLElement === 'undefined' ? class {} : HTMLElement;
 
+// A chip that several independent sources feed: each calls ok/fail and the chip is red as long as
+// any source is failing, green once every source has reported ok (touch(true) also marks it live).
+export function freshnessSources(chip) {
+  const failing = new Map();
+  const report = () => {
+    const el = chip();
+    if (!el || typeof el.touch !== 'function') return;
+    if (failing.size) el.touch(false, [...failing.values()].join('; '));
+    else el.touch(true);
+  };
+  return {
+    ok(source) { failing.delete(source); report(); },
+    fail(source, message) { failing.set(source, String(message || `${source} could not refresh`)); report(); },
+    get failing() { return failing.size > 0; },
+  };
+}
+
 export class HerdrFreshness extends Base {
   static get observedAttributes() { return ['interval']; }
 
@@ -90,24 +107,6 @@ export class HerdrFreshness extends Base {
       if (this._last == null && this._error == null) this.insertAdjacentHTML('beforeend', loadingProgress('first update'));
     }
   }
-}
-
-// Multi-source views: one chip, many sources. The chip is red while any source's latest read
-// failed (the message names them all) and turns fresh only once every source has recovered, so a
-// healthy source answering never hides a failing one.
-export function freshnessSources(chip) {
-  const failing = new Map();
-  const report = () => {
-    const el = chip();
-    if (!el || typeof el.touch !== 'function') return;
-    if (failing.size) el.touch(false, [...failing.values()].join('; '));
-    else el.touch(true);
-  };
-  return {
-    ok(source) { failing.delete(source); report(); },
-    fail(source, message) { failing.set(source, String(message || `${source} could not refresh`)); report(); },
-    get failing() { return failing.size > 0; },
-  };
 }
 
 if (typeof customElements !== 'undefined' && !customElements.get('herdr-freshness')) {
