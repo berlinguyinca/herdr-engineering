@@ -1095,7 +1095,7 @@ def _cmd_fleet_update(args) -> int:
         for h in report.get("status", {}).get("hosts", []):
             print(f"  {h['host']:12} herdr-eng={h['herdr_eng']} build-gate={h['build_gate']} "
                   f"agent={h['agent']} revision={h.get('revision', 'unknown')} "
-                  f"cleanup={h.get('cleanup', 'unknown')}")
+                  f"cleanup={h.get('cleanup', 'unknown')} summary={h.get('summary', 'unknown')}")
         fs = report.get("steps", {}).get("fleet_sync", {})
         if fs.get("rc") != 0 and fs.get("stderr"):
             print(f"  !! {fs['stderr']}")
@@ -1211,7 +1211,7 @@ def _cmd_fleet_status(args) -> int:
         for h in status.get("hosts", []):
             print(f"{h['host']:12} herdr-eng={h['herdr_eng']} build-gate={h['build_gate']} "
                   f"agent={h['agent']} revision={h.get('revision', 'unknown')} "
-                  f"cleanup={h.get('cleanup', 'unknown')}")
+                  f"cleanup={h.get('cleanup', 'unknown')} summary={h.get('summary', 'unknown')}")
         if not status.get("hosts"):
             print(f"no hosts reported (playbook rc={status.get("rc")})")
     return 0 if status.get("rc") == 0 else 1
