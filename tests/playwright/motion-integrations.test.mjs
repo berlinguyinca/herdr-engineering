@@ -119,6 +119,7 @@ test('CI health: a cell whose outcome changes flashes; others do not',async()=>w
  const s={runs:[run(1,'success'),run(2,'success',{created_at:ago(7200000+120000)})]};
  await calm(page,'off');
  await boot(page,base,'/ci',ciApi(s));
+ await page.locator('[data-health-mode="hours"]').click();
  const cells=page.locator('[data-health-map] [data-health-project][data-health-bucket]');
  await until(()=>page.locator('[data-health-map] .ci-health-cell.state-success').count().then(n=>n>=2),'two successful cells',10000);
  await watch(page,{key:['data-health-bucket']});

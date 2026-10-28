@@ -50,8 +50,10 @@ test('one changed counter mutates only its node; stage bars are a share of the t
  state.missions.completed=3;
  await observe(page);
  await liveRefresh(page);
+ await page.clock.runFor(400);// the changed counter counts up (about 300 ms) to its new value; the
+ // count-up swaps the field's text node, so the replaced (now detached) node's record is the field's own write
  const r=await page.evaluate(()=>{const field=document.querySelector('[data-field="missions.completed"]');return {
-  text:field.textContent,count:window.__muts.length,outside:window.__muts.filter(m=>!field.contains(m.target)).map(m=>`${m.type}:${m.target.nodeName}`)};});
+  text:field.textContent,count:window.__muts.length,outside:window.__muts.filter(m=>!field.contains(m.target)&&m.target.isConnected).map(m=>`${m.type}:${m.target.nodeName}`)};});
  assert.equal(r.text,'3');
  assert.ok(r.count>0);
  assert.deepEqual(r.outside,[]);
@@ -74,7 +76,7 @@ test('non-Pi mission detail refreshes without a spinner and keeps open disclosur
  const refreshed=async()=>{const n=reads['/api/v1/missions/m1'];await page.evaluate(()=>window.__emit({event_id:`x-${Math.random()}`,event_type:'MissionStageChanged'}));
   await page.clock.runFor(6000);await until(async()=>reads['/api/v1/missions/m1']>n,'mission refetch');await sleep(150);};
  await refreshed();
- assert.equal(await mutationCount(page),0,'identical refresh writes nothing');
+ assert.equal(await mutationCount(page),0,`identical refresh writes nothing: ${JSON.stringify(await page.evaluate(()=>window.__muts.map(r=>({type:r.type,attribute:r.attributeName,target:r.target.outerHTML?.slice(0,240)}))))}`);
  mission.stage='review';
  await refreshed();
  const r=await page.evaluate(()=>({brief:document.querySelector('[data-history-panel=brief]')===window.__brief,open:window.__brief.open,
@@ -104,4 +106,72 @@ test('a not-found mission page recovers on a live event once the mission exists,
  await page.clock.runFor(30000);
  await emit();await page.clock.runFor(6000);
  await until(()=>page.locator('#view h1').innerText().then(t=>t==='Late mission').catch(()=>false),'mission rendered without reload',8000);
+}));
+
+// Task 14: a changed cell flashes (data-flash) on a live refresh; unchanged cells and the first paint never do.
+const watchFlash=page=>page.evaluate(()=>{
+ window.__flashed=[];window.__fw?.disconnect();
+ window.__fw=new MutationObserver(rs=>{for(const r of rs)if(r.target.hasAttribute?.('data-flash'))window.__flashed.push(r.target.closest('tr')?.dataset.key+'|'+r.target.cellIndex+'|'+(r.target.dataset.field||''));});
+ window.__fw.observe(document.getElementById('view'),{subtree:true,attributes:true,attributeFilter:['data-flash']});
+});
+
+test('analytics: a changed table cell flashes, unchanged cells and the first paint do not; calm never flashes',async()=>{
+ for(const mode of ['off','on'])await withPage(async(page,base)=>{
+  const state=analyticsState();
+  state.tokens.by_project.herdr.cache_write_tokens=7;
+  state.tokens.by_project.web={requests:2,input_tokens:20,output_tokens:10,reasoning_tokens:0,failed:0};
+  await page.addInitScript(m=>{localStorage.setItem('herdr.calm',m);},mode);
+  await page.addInitScript(()=>{window.__early=[];new MutationObserver(rs=>{for(const r of rs)if(r.target.hasAttribute?.('data-flash'))window.__early.push(r.target.nodeName);}).observe(document,{subtree:true,attributes:true,attributeFilter:['data-flash']});});
+  await boot(page,base,'/analytics/tokens',api(state));
+  await page.locator('tr[data-key="herdr"]').first().waitFor();
+  const headers = await page.locator('tr[data-key="herdr"]').first().evaluate(row => [...row.closest('table').querySelectorAll('thead th')].map(cell => cell.textContent));
+  assert.deepEqual(headers, ['', 'Requests', 'Input', 'Output', 'Reasoning', 'Cache-write', 'Failed'], 'all token analytics columns remain present and ordered');
+  const failedColumn = headers.indexOf('Failed');
+  const cacheWriteColumn = headers.indexOf('Cache-write');
+  assert.ok(failedColumn >= 0, 'the failed-request column is present');
+  assert.ok(cacheWriteColumn >= 0, 'the cache-write column is present');
+  assert.equal(await page.locator('tr[data-key="herdr"] td').nth(cacheWriteColumn).textContent(), '7');
+  await sleep(100);
+  assert.deepEqual(await page.evaluate(()=>window.__early),[],'first paint does not flash');
+  for(const [field,column,value] of [['failed',failedColumn,4],['cache_write_tokens',cacheWriteColumn,9]]){
+   await watchFlash(page);
+   state.tokens.by_project.herdr[field]=value;
+   await liveRefresh(page);
+   const flashed=await page.evaluate(()=>[...new Set(window.__flashed)]);
+   if(mode==='off')assert.deepEqual(flashed,[`herdr|${column}|`],`${field}: only the changed cell flashes`);
+   else assert.deepEqual(flashed,[],`${field}: calm never flashes`);
+   await page.clock.runFor(400);
+   assert.equal(await page.locator('tr[data-key="herdr"] td').nth(failedColumn).textContent(),String(state.tokens.by_project.herdr.failed));
+   assert.equal(await page.locator('tr[data-key="herdr"] td').nth(cacheWriteColumn).textContent(),String(state.tokens.by_project.herdr.cache_write_tokens));
+   assert.equal(await page.locator('tr[data-key="web"] td').nth(failedColumn).textContent(),'0','unchanged row keeps its failed count');
+   await page.clock.runFor(700);
+   await watchFlash(page);
+   await observe(page);
+   await liveRefresh(page);
+   assert.deepEqual(await page.evaluate(()=>window.__flashed),[],`${field}: unchanged refresh never flashes`);
+   assert.equal(await mutationCount(page),0,`${field}: unchanged refresh writes nothing`);
+  }
+ });
+});
+
+test('analytics dashboard: a changed counter flashes and counts up; a metric tile flashes',async()=>withPage(async(page,base)=>{
+ const state=analyticsState();
+ await page.addInitScript(()=>{localStorage.setItem('herdr.calm','off');});
+ await boot(page,base,'/analytics',api(state));
+ await page.locator('[data-field="missions.total"]').waitFor();
+ await sleep(50);
+ await watchFlash(page);
+ state.missions.total=16;
+ await liveRefresh(page);
+ assert.deepEqual(await page.evaluate(()=>[...new Set(window.__flashed)]),['undefined|undefined|missions.total']);
+ await page.clock.runFor(400);
+ assert.equal(await page.locator('[data-field="missions.total"]').textContent(),'16');
+ await page.evaluate(()=>{location.hash='/analytics/hosts';});
+ await page.locator('herdr-metric[label="Healthy"] .hd-metric__value').waitFor();
+ await sleep(50);
+ await watchFlash(page);
+ state.hosts.healthy=3;
+ await liveRefresh(page);
+ const metric=await page.evaluate(()=>window.__flashed.length);
+ assert.ok(metric>=1,'the changed metric tile flashes');
 }));

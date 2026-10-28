@@ -1,12 +1,26 @@
 /* HerdR Collaboration: page styles on top of the shared design tokens (theme.css/base.css).
  * Same look as the dashboard: white cards on a light grey ground, green accent, Inter. */
 .cx-page { color-scheme: light dark; }
+.cx-agentcard[hidden] { display: none; }
 /* WCAG 1.4.3 (T16 UI gate): the shared light tokens in theme.css give 3.2:1 for muted text and for white-on-accent
  * (below 4.5:1). Darker values for this page only; the dashboard theme is untouched. Dark mode sets its own below. */
 .cx-page, .cx-embed {
   --accent: #0a7358; --accent-hover: #085f49;
   --text-secondary: #55556a; --text-muted: #686880;
   --status-attention: #b45309; --status-blocked: #c2410c;
+}
+/* Embedded collaboration follows the dashboard's chosen theme, including forced dark on a light OS. */
+:root[data-theme="dark"] .cx-embed {
+  --accent: inherit; --accent-hover: inherit;
+  --text-secondary: inherit; --text-muted: inherit;
+  --status-attention: inherit; --status-blocked: inherit;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) .cx-embed {
+    --accent: inherit; --accent-hover: inherit;
+    --text-secondary: inherit; --text-muted: inherit;
+    --status-attention: inherit; --status-blocked: inherit;
+  }
 }
 @media (prefers-color-scheme: dark) {
   .cx-page {
@@ -65,7 +79,7 @@
 .cx-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
 .cx-row--between { justify-content: space-between; }
 .cx-stack { display: flex; flex-direction: column; gap: 10px; }
-.cx-agent-toolbar { display:flex; flex-wrap:wrap; align-items:center; gap:10px; padding:12px 14px; margin:0 0 12px; border:1px solid var(--border-subtle); border-radius:var(--radius); background:var(--surface-2); }
+.cx-agent-toolbar { display:flex; flex-wrap:wrap; align-items:center; gap:12px; padding:12px 16px; margin:0 0 12px; border:1px solid var(--border-subtle); border-radius:var(--radius); background:var(--surface-2); }
 .cx-agent-toolbar strong { font-size:.9rem; }
 .cx-agent-toolbar select { min-width:150px; }
 .cx-agent-card--selected { border-color:var(--accent); box-shadow:0 0 0 2px color-mix(in srgb,var(--accent) 20%,transparent); }
@@ -107,7 +121,7 @@
 /* ---- empty / error ---- */
 .hd-empty, .hd-error { display: flex; align-items: center; justify-content: center; gap: 10px; padding: 24px;
   border-radius: var(--radius); border: 1px dashed var(--border); color: var(--text-muted); text-align: center; }
-.hd-error { border-color: var(--status-failed); color: var(--status-failed); background: #fef2f2; }
+.hd-error { border-color: var(--status-failed); color: var(--status-failed); background: var(--error-bg); }
 
 /* ---- sign-in ---- */
 .cx-center { min-height: 100vh; display: grid; place-items: center; padding: 16px; }

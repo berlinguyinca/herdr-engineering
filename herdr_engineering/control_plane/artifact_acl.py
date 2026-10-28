@@ -42,6 +42,9 @@ class ArtifactAcl:
         return [artifact for artifact in artifacts
                 if self.can(artifact.get("artifact_id", ""), principal_id, "read")]
 
+    def has_grants(self, artifact_id: str) -> bool:
+        return any(aid == artifact_id for aid, _ in self._grants)
+
     def load(self, grants: list[dict]) -> None:
         for grant in grants:
             self._grants[(grant["artifact_id"], grant["principal_id"])] = {

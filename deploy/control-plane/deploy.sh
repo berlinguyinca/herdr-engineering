@@ -31,7 +31,9 @@
 #      restored from a backup on any failure. If an install step, compose up or the
 #      checks fail, rolls back: the commit recorded in the
 #      running image's receipt is checked out in a temporary worktree and ITS compose
-#      files are run with the previous image tag (same transient env file). Prints
+#      files are run with pinned image IDs and a protected previous config snapshot.
+#      Recovery metadata and 0600 snapshots persist under STATE_DIR before service changes.
+#      Successful deployments mount the selected canonical source, never a temporary copy. Prints
 #      "rolled back ... and healthy" (exit 1) only when the old commit answers health
 #      again, otherwise FAILED TO ROLL BACK with the manual command (exit 3). A first
 #      deploy, or one whose running commit predates the directory-mounted fleet
@@ -74,6 +76,7 @@ INIT_HINT="create it with: herdr-eng fleet config init --path $CENTRAL"
 # it must hold only fleet-config.yaml (writers' transient .fleet-config.yaml.*.tmp aside).
 CENTRAL_REAL="$(readlink -f "$CENTRAL")"
 FLEET_DIR="$(dirname "$CENTRAL_REAL")"
+CENTRAL_HASH="$(sha256sum "$CENTRAL_REAL" | cut -d' ' -f1)"
 if [ "$(basename "$CENTRAL_REAL")" != "fleet-config.yaml" ]; then
   echo "central fleet config must be named fleet-config.yaml (it is mounted as $MOUNT_TARGET): $CENTRAL_REAL" >&2
   exit 1
@@ -303,6 +306,19 @@ fi
 docker build -q -f "$WORK/deploy/fabric-stack/Dockerfile" --build-arg "GIT_COMMIT=$SHA" \
   -t "herdr-engineering:$TAG" "$WORK" >/dev/null
 
+# Use this checkout's helper, not the target commit's possibly older deploy tooling.
+# The selected canonical source stays the forward mount. Snapshots live outside
+# ENV_DIR so cleanup, logout and a failed rollout cannot destroy recovery inputs.
+STATE_HELPER="$HERE/deploy-state.py"
+ATTEMPT="$(python3 "$STATE_HELPER" prepare "$STATE_DIR" "$CENTRAL_REAL" "$FULL" \
+  "$PREV_COMMIT" "$PREVIOUS_IMAGE" "$COLLAB")" || exit 1
+if [ "$CENTRAL_HASH" != "$(sha256sum "$ATTEMPT/candidate/fleet-config.yaml" | cut -d' ' -f1)" ]; then
+  python3 "$STATE_HELPER" outcome "$ATTEMPT" config_changed
+  echo "canonical config changed during preparation; refusing to recreate services" >&2
+  exit 1
+fi
+ROLLBACK_IMAGES=""
+
 # ---- host files this deploy may change, backed up so every failure path restores them
 BACKUP_DIR="$ENV_DIR/backup"; mkdir -p "$BACKUP_DIR"
 BACKED_UP=()
@@ -355,6 +371,7 @@ compose_run() {
   local tree="$1" envf="$2" tag="$3" commit="$4"; shift 4
   local files=(-f "$tree/deploy/control-plane/compose.yaml")
   if [ "$COLLAB" = 1 ]; then files+=(-f "$tree/deploy/control-plane/compose.collab.yaml"); fi
+  if [ -n "$ROLLBACK_IMAGES" ]; then files+=(-f "$ROLLBACK_IMAGES"); fi
   HERDR_CP_FLEET_DIR="$FLEET_DIR" HERDR_LLM_SLICE_DIR="$LLM_DIR" \
     HERDR_CP_IMAGE_TAG="$tag" HERDR_CP_GIT_COMMIT="$commit" \
     docker compose --env-file "$envf" -p "$PROJECT" "${files[@]}" "$@"
@@ -433,22 +450,16 @@ forward() {
     # same image but a changed slice: collab-public reads it only at startup
     compose_run "$WORK" "$ENV_FILE" "$TAG" "$SHA" up -d --no-deps --no-build --force-recreate collab-public >/dev/null || return 1
   fi
+  python3 "$STATE_HELPER" verify-forward "$ATTEMPT" || return 1
   verify "$SHA"
 }
 
 if forward; then
   # The receipt names the ref, commits and images (and only a hash of the collab
   # slice) - never configuration. json.dumps: a ref may contain quotes.
-  mkdir -p "$STATE_DIR"; chmod 700 "$STATE_DIR"
-  python3 - "$STATE_DIR/$SHA.json" "$REF" "$FULL" "herdr-engineering:$TAG" "$PREV_COMMIT" \
-      "$PREVIOUS_IMAGE" "$COLLAB_HASH" "$(date -u +%FT%TZ)" <<'PY'
-import json, sys
-out, ref, commit, image, prev_commit, prev_image, collab, at = sys.argv[1:]
-with open(out, "w") as fh:
-    json.dump({"ref": ref, "commit": commit, "image": image, "previous_commit": prev_commit,
-               "previous_image": prev_image, "collab_slice_sha256": collab, "at": at}, fh)
-    fh.write("\n")
-PY
+  python3 "$STATE_HELPER" receipt "$ATTEMPT" "$STATE_DIR/$SHA.json" "$REF" \
+    "herdr-engineering:$TAG" "$PREVIOUS_IMAGE" "$COLLAB_HASH" "$(date -u +%FT%TZ)"
+  python3 "$STATE_HELPER" outcome "$ATTEMPT" succeeded
   echo "ok: ${APP_SERVICES[*]}${EDGE_SERVICE[*]:+ ${EDGE_SERVICE[*]}} running $SHA (receipt $STATE_DIR/$SHA.json)"
   exit 0
 fi
@@ -462,6 +473,7 @@ if ! restore_host_state; then
   echo "WARNING: could not restore every host file this deploy changed" >&2
 fi
 if [ -z "$PREV_COMMIT" ]; then
+  python3 "$STATE_HELPER" outcome "$ATTEMPT" failed_no_rollback
   echo "NOT rolled back: $ROLLBACK_NOTE." >&2
   if [ -n "${PREV_COMMIT_OLD:-}" ]; then
     echo "manual rollback (that commit's own deploy.sh reads ~/.config/herdr-engineering/control-plane.env):" >&2
@@ -474,22 +486,30 @@ if [ -z "$PREV_COMMIT" ]; then
 fi
 
 echo "rolling back to $PREVIOUS_IMAGE with the compose files and code of commit $PREV_SHA" >&2
-MANUAL="$REPO/deploy/control-plane/deploy.sh --ref $PREV_COMMIT --no-fetch --fleet-config $CENTRAL"
+PREV_CONFIG="$ATTEMPT/previous/fleet-config.yaml"
+FLEET_DIR="$(dirname "$PREV_CONFIG")"
+ROLLBACK_IMAGES="$ATTEMPT/rollback-images.json"
+printf -v MANUAL '%q --ref %q --no-fetch --fleet-config %q' \
+  "$REPO/deploy/control-plane/deploy.sh" "$PREV_COMMIT" "$PREV_CONFIG"
 PREV_WORK="$ENV_DIR/rollback-worktree"
 PREV_ENV="$ENV_DIR/rollback-compose.env"
 # the compose env as the PREVIOUS commit's own code renders it
 prev_render() {
   (cd "$PREV_WORK" && PYTHONPATH="$PREV_WORK" python3 -m herdr_engineering.cli \
-    fleet config render-compose --path "$CENTRAL" --out "$PREV_ENV") >/dev/null 2>&1
+    fleet config render-compose --path "$PREV_CONFIG" --out "$PREV_ENV") >/dev/null 2>&1
 }
 if [ "$RESTORED" = 1 ] \
     && git -C "$REPO" worktree add -q --detach "$PREV_WORK" "$PREV_COMMIT" >/dev/null 2>&1 \
     && prev_render \
     && compose_up "$PREV_WORK" "$PREV_ENV" "$PREV_TAG" "$PREV_SHA" >/dev/null \
+    && python3 "$STATE_HELPER" verify-rollback "$ATTEMPT" \
     && verify "$PREV_SHA"; then
+  python3 "$STATE_HELPER" outcome "$ATTEMPT" rolled_back
   echo "rolled back to $PREVIOUS_IMAGE (commit $PREV_SHA) and healthy (all of: ${APP_SERVICES[*]}${EDGE_SERVICE[*]:+ ${EDGE_SERVICE[*]}}); the deploy of $SHA FAILED" >&2
   exit 1
 fi
+python3 "$STATE_HELPER" outcome "$ATTEMPT" rollback_failed
 echo "FAILED TO ROLL BACK to $PREVIOUS_IMAGE (commit $PREV_SHA): the control plane may be down or mixed." >&2
 echo "manual rollback: $MANUAL" >&2
+echo "pinned rollback images and recovery metadata: $ATTEMPT" >&2
 exit 3

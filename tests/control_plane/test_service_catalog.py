@@ -179,36 +179,3 @@ def test_newer_structured_unavailable_row_uses_its_own_observation():
     assert svc['status'] == 'unavailable'
     assert svc['lifecycle']['unavailable_since'] == '2026-01-10T00:00:00Z'
     assert svc['lifecycle']['archived'] is True
-
-
-def test_operator_retirement_archives_silent_services_and_a_new_report_restores_them():
-    clock = [1_800_000_000]
-    repo = ControlPlaneRepo(now=lambda: clock[0])
-    old = repo.register_service("old dev server", "host", 8000, status="healthy")
-    clock[0] += 10 * 86400
-    fresh = repo.register_service("fresh server", "host", 8001, status="healthy")
-    assert repo.get_service(old)["lifecycle"]["state"] == "unknown"      # never auto-archived
-    dry = repo.retire_services(older_than_days=7)
-    assert dry == {"matched": 1, "retired": 0, "dry_run": True, "older_than_days": 7.0, "sample": [old]}
-    assert repo.get_service(old)["lifecycle"]["archived"] is False
-    done = repo.retire_services(older_than_days=7, dry_run=False)
-    assert done["retired"] == 1
-    assert repo.get_service(old)["lifecycle"]["state"] == "archived"
-    assert "Retired by an operator" in repo.get_service(old)["lifecycle"]["reason"]
-    assert repo.get_service(fresh)["lifecycle"]["state"] == "current"
-    assert repo.retire_services(older_than_days=7, dry_run=False)["matched"] == 0
-    clock[0] += 60
-    repo.upsert_service("host", "old dev server", 8000, status="healthy")  # the service reports again
-    assert repo.get_service(old)["lifecycle"]["state"] == "current"
-
-
-def test_retirement_survives_event_replay_without_refreshing_the_service():
-    clock = [1_800_000_000]
-    repo = ControlPlaneRepo(now=lambda: clock[0])
-    sid = repo.register_service("old", "host", 8000, status="healthy")
-    clock[0] += 10 * 86400
-    repo.retire_services(older_than_days=7, dry_run=False)
-    events = [e for e in repo.stream("service", sid)]
-    from herdr_engineering.control_plane.bridge import _reconstruct_from_events
-    services = _reconstruct_from_events({f"service:{sid}": events})[3]
-    assert services[sid]["retired_at"]

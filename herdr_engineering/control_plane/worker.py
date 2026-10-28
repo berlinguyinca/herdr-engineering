@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import socket
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -16,30 +17,39 @@ ARTIFACT_TTL = 3600.0
 
 async def _run_artifact_job_pass(conn, *, worker_id: str,
                                  runner, max_jobs: int = 1) -> dict:
+    # Claim and mark running atomically; release the row lock before rendering.
     completed = failed = claimed = 0
+    if max_jobs > 0:
+        # Execution proves this identity exists, not its fleet health or policy.
+        await conn.execute(
+            "INSERT INTO hosts (host_id, hostname) VALUES ($1,$2) "
+            "ON CONFLICT (host_id) DO NOTHING", worker_id, socket.gethostname())
     for _ in range(max(0, max_jobs)):
         job = await conn.fetchrow(
-            "SELECT * FROM artifact_build_jobs WHERE status='queued' "
-            "ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT 1")
+            "WITH candidate AS ("
+            "SELECT job_id FROM artifact_build_jobs WHERE status='queued' "
+            "ORDER BY created_at, job_id FOR UPDATE SKIP LOCKED LIMIT 1) "
+            "UPDATE artifact_build_jobs AS jobs SET status='running', assigned_host_id=$1, "
+            "started_at=now() FROM candidate WHERE jobs.job_id=candidate.job_id "
+            "RETURNING jobs.*", worker_id)
         if job is None:
             break
         claimed += 1
         job_id = job["job_id"]
-        await conn.execute(
-            "UPDATE artifact_build_jobs SET status='running', assigned_host_id=$1, "
-            "started_at=now() WHERE job_id=$2", worker_id, job_id)
         try:
             result = await runner(dict(job))
-            await conn.execute(
+            updated = await conn.execute(
                 "UPDATE artifact_build_jobs SET status='completed', result_version_id=$1, "
-                "completed_at=now() WHERE job_id=$2", result["version_id"], job_id)
-            completed += 1
+                "completed_at=now() WHERE job_id=$2 AND status='running' "
+                "AND assigned_host_id=$3", result["version_id"], job_id, worker_id)
+            completed += int(updated == "UPDATE 1")
         except Exception as exc:  # noqa: BLE001 - durable failure state is required
-            await conn.execute(
+            updated = await conn.execute(
                 "UPDATE artifact_build_jobs SET status='failed', error=$1::jsonb, "
-                "completed_at=now() WHERE job_id=$2",
-                json.dumps({"message": str(exc)}), job_id)
-            failed += 1
+                "completed_at=now() WHERE job_id=$2 AND status='running' "
+                "AND assigned_host_id=$3",
+                json.dumps({"message": str(exc)}), job_id, worker_id)
+            failed += int(updated == "UPDATE 1")
     return {"artifact_jobs_claimed": claimed,
             "artifact_jobs_completed": completed,
             "artifact_jobs_failed": failed}
@@ -94,8 +104,8 @@ async def run_one_pass(conn, *, mission_store=None, session_store=None,
     # Artifact GC: Phase 1 scaffold only; real reachability GC in Phase 5.
     summary["artifact_gc"] = 0
     summary.update({"artifact_jobs_claimed": 0,
-                   "artifact_jobs_completed": 0,
-                   "artifact_jobs_failed": 0})
+                    "artifact_jobs_completed": 0,
+                    "artifact_jobs_failed": 0})
     if conn is not None and worker_id and artifact_job_runner is not None:
         summary.update(await _run_artifact_job_pass(
             conn, worker_id=worker_id, runner=artifact_job_runner,

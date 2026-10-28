@@ -30,14 +30,18 @@ def test_load_per_core_is_positive():
 
 
 def test_default_slots_scales_with_cores():
-    """Default slot count is max(2, cores-4): floors at 2 on small hosts,
-    scales with core count on high-performance hosts."""
+    """Default slots stay conservative even on high-core interactive hosts."""
     import os as _os
     cores = _os.cpu_count() or 4
-    assert _default_slots() == max(2, cores - 4)
+    assert _default_slots() == max(2, min(4, cores - 4))
     assert _default_slots() >= 2  # never below 2
     # On any real host the default should not collapse to 1.
     assert _default_slots() >= 2
+
+
+def test_default_slots_cap_high_core_hosts(monkeypatch):
+    monkeypatch.setattr(os, "cpu_count", lambda: 24)
+    assert _default_slots() == 4
 
 
 def test_default_state_dir_respects_env(monkeypatch, tmp_path):

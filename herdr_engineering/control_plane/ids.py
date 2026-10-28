@@ -6,7 +6,7 @@ import time
 from typing import Final
 
 _KINDS: Final[frozenset[str]] = frozenset({
-    "mission", "session", "service", "artifact",
+    "mission", "session", "service", "artifact", "version",
     "host", "agent", "plan", "worktree", "event", "lease", "llmkey",
     "project", "room", "grant", "collab", "cifix", "version",
 })

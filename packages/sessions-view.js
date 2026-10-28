@@ -3,7 +3,8 @@ import {escapeHtml as esc} from './herdr-web-components/util.js';
 import {formatDuration} from './herdr-web-components/format.js';
 import {recordOutcome,statusOutcome,recordVisibility} from './record-state.js';
 import {patchList,patchText,morph} from './patch.js';
-import {animateChanges} from './motion.js';
+import {animateChanges,skeleton} from './motion.js';
+import { freshnessSources } from './freshness.js';
 
 const text = value => typeof value === 'string' ? value.trim() : '';
 const records = value => Array.isArray(value) ? value.filter(v=>v && typeof v==='object' && !Array.isArray(v)) : [];
@@ -95,13 +96,14 @@ export function mountSessionsView(container,client,{tab='current'}={}) {
   const pageSize=20;
   let disposed=false,sessions=[],missions=[],loaded=false,sessionError='',missionError='',lastSignature='',hostSignature='';
   let sessionRequest=null,missionRequest=null;
-  container.innerHTML=`${styles}<h1>Agents</h1>
+  const chip=freshnessSources(()=>container.querySelector('herdr-freshness'));
+  container.innerHTML=`${styles}<div class="hd-live-head"><h1>Agents</h1><herdr-freshness interval="5000"></herdr-freshness></div>
     <p class="ss-intro">Find an agent by project, host or model. Current shows open agents reported in the last 15 minutes. Older or missing reports move to Unconfirmed automatically; Failed and Finished retain previous work.</p>
     <div class="ss-tabs" role="tablist" aria-label="Agent outcome">${tabs.map(([key,label])=>`<button type="button" role="tab" id="ss-tab-${key}" data-tab="${key}" aria-controls="ss-panel-${key}" aria-selected="${state.tab===key}" tabindex="${state.tab===key?0:-1}">${label} <strong data-count="${key}">…</strong></button>`).join('')}</div>
     <div class="ss-controls"><label class="ss-search">Search agents<input id="ss-search" type="search" placeholder="Project, activity, agent, model or ID"></label>
       <label>Host<select id="ss-host"><option value="">All hosts</option></select></label>
       <label>Group by<select id="ss-group"><option value="project">Project folder</option><option value="none">Recent reports</option></select></label></div>
-    <p class="ss-meta" id="ss-result" role="status">Loading agents…</p><p class="ss-meta" id="ss-error" role="status"></p>
+    <p class="ss-meta" id="ss-result" role="status"></p><p class="ss-meta" id="ss-error" role="status"></p>
     ${tabs.map(([key])=>`<section id="ss-panel-${key}" role="tabpanel" aria-labelledby="ss-tab-${key}" ${state.tab===key?'':'hidden'}></section>`).join('')}
     <div class="ss-pages"><button type="button" class="hd-btn" id="ss-previous">Previous</button><span id="ss-page"></span><button type="button" class="hd-btn" id="ss-next">Next</button></div>`;
   const el=id=>container.querySelector(`#ss-${id}`);
@@ -114,7 +116,7 @@ export function mountSessionsView(container,client,{tab='current'}={}) {
     const view=JSON.stringify([state.tab,state.search,state.host,state.group,state.page]);
     const live=view===lastView&&!!panel.querySelector('.ss-group');lastView=view;
     if(!visible.length){
-      const html=`<p class="ss-empty">${loaded?'No agents match this tab and these filters.':'Loading agents…'}</p>`;
+      const html=loaded?'<p class="ss-empty">No agents match this tab and these filters.</p>':sessionError?'<p class="ss-empty">Agents could not be loaded yet; retrying automatically.</p>':skeleton('agents');
       if(panel.innerHTML!==html)panel.innerHTML=html;
       return;
     }
@@ -134,7 +136,7 @@ export function mountSessionsView(container,client,{tab='current'}={}) {
     const all=entries(), selected=selectSessions(all,state);
     state.page=Math.min(state.page,Math.max(0,Math.ceil(selected.length/pageSize)-1));
     el('error').textContent=[sessionError,missionError].filter(Boolean).join(' ');
-    const signature=JSON.stringify([state,sessions,missions,loaded,all.map(e=>e.tab)]);
+    const signature=JSON.stringify([state,sessions,missions,loaded,!!sessionError,all.map(e=>e.tab)]);
     if(signature===lastSignature)return;
     lastSignature=signature;
     const focused=document.activeElement;
@@ -157,7 +159,7 @@ export function mountSessionsView(container,client,{tab='current'}={}) {
     for(const entry of visible){const label=state.group==='project'?entry.project:'Recent reports';if(!groups.has(label))groups.set(label,[]);groups.get(label).push(entry);}
     patchPanel(el(`panel-${state.tab}`),visible,groups);
     const noModel=loaded && selected.length>0 && !selected.some(e=>text(e.record.model));
-    el('result').textContent=loaded ? `${selected.length} matching ${state.tab} agents${visible.length?` · Showing ${state.page*pageSize+1}–${state.page*pageSize+visible.length}`:''}${noModel?' · None of these agents report which model they use':''}` : 'Loading agents…';
+    el('result').textContent=loaded ? `${selected.length} matching ${state.tab} agents${visible.length?` · Showing ${state.page*pageSize+1}–${state.page*pageSize+visible.length}`:''}${noModel?' · None of these agents report which model they use':''}` : '';
     el('page').textContent=`Page ${state.page+1} of ${Math.max(1,Math.ceil(selected.length/pageSize))}`;
     el('previous').disabled=state.page===0;el('next').disabled=(state.page+1)*pageSize>=selected.length;
     if(focusId){
@@ -186,8 +188,9 @@ export function mountSessionsView(container,client,{tab='current'}={}) {
       if(disposed||controller.signal.aborted)return;
       if(!Array.isArray(data?.[kind]))throw new Error('Invalid response');
       if(kind==='sessions'){sessions=records(data.sessions);loaded=true;sessionError='';}else{missions=records(data.missions);missionError='';}
-    } catch {
-      if(!disposed&&!document.hidden){if(kind==='sessions')sessionError=loaded?'Agent updates unavailable. Showing last received records.':'Agents could not be loaded; retrying automatically.';else missionError='Mission context unavailable.';}
+      chip.ok(kind);
+    } catch (error) {
+      if(!disposed&&!document.hidden){chip.fail(kind,`${kind==='sessions'?'Agents':'Mission context'}: ${error?.message||'request failed'}`);if(kind==='sessions')sessionError=loaded?'Agent updates unavailable. Showing last received records.':'Agents could not be loaded; retrying automatically.';else missionError='Mission context unavailable.';}
     } finally {
       clearTimeout(timeout);
       if(kind==='sessions')sessionRequest=null;else missionRequest=null;

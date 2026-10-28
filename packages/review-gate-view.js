@@ -1,6 +1,7 @@
 // Review gate page: every gated PR, the review queue, main-branch status and recent notices.
 // Every string from the API is untrusted; it is escaped and clipped before it reaches HTML.
 import {escapeHtml as esc} from './herdr-web-components/util.js';
+import {skeleton} from './motion.js';
 
 const text=v=>typeof v==='string'?v:'';
 const short=(v,max=160)=>text(v).replace(/\s+/g,' ').trim().slice(0,max);
@@ -104,7 +105,7 @@ const styles=`<style>
 const errorText=e=>e&&e.name==='TimeoutError'?'request timed out':short(e&&e.body&&typeof e.body.error==='string'?e.body.error:e&&e.message,300)||'request failed';
 const SOURCES=[['prs','/api/v1/review-gate/prs'],['queue','/api/v1/review-gate/queue'],['notices','/api/v1/review-gate/notices'],['main','/api/v1/review-gate/main']];
 
-export function mountReviewGate(container,client,{intervalMs=5000,timers={setInterval,clearInterval},requestTimeoutMs=10000,timeout=ms=>AbortSignal.timeout(ms)}={}) {
+export function mountReviewGate(container,client,{intervalMs=5000,timers={setInterval,clearInterval},requestTimeoutMs=10000,timeout=ms=>AbortSignal.timeout(ms),onFreshness=()=>{}}={}) {
  const panels={};for(const [name] of SOURCES)panels[name]={data:null,at:0,error:''};
  const linked=(a,b)=>{if(typeof AbortSignal.any==='function')return AbortSignal.any([a,b]);const c=new AbortController();for(const x of [a,b]){if(x.aborted)c.abort(x.reason);else x.addEventListener('abort',()=>c.abort(x.reason),{once:true});}return c.signal;};
  let epoch=0;
@@ -113,7 +114,7 @@ export function mountReviewGate(container,client,{intervalMs=5000,timers={setInt
 
  // A panel keeps its last good data; a failed read only adds a visible warning.
  const warn=p=>!p.error?'':p.data!==null?`<p class="rg-warning" role="status">Showing data from ${esc(when(p.at))||'an earlier read'}: ${esc(p.error)}</p>`:`<p class="rg-warning" role="status">Could not load: ${esc(p.error)}</p>`;
- const panel=(title,p,body)=>`<section class="rg-panel"><h2>${esc(title)}</h2>${warn(p)}${p.data!==null?body:''}</section>`;
+ const panel=(title,p,body)=>`<section class="rg-panel"><h2>${esc(title)}</h2>${warn(p)}${p.data!==null?body:p.error?'':skeleton(title,{rows:1})}</section>`;
  let lastHtml=null;
  function write(html){if(html===lastHtml)return false;lastHtml=html;container.innerHTML=html;return true;}
  function draw() {
@@ -151,6 +152,8 @@ export function mountReviewGate(container,client,{intervalMs=5000,timers={setInt
   });
   for(const p of list(panels.prs.data))if(p.state!=='escalated')resumeErrors.delete(p.key);
   if(disabled)stop();
+  const errors=Object.entries(panels).filter(([,p])=>p.error).map(([name,p])=>`${name}: ${p.error}`);
+  onFreshness(disabled||!errors.length,errors.join('; '));
   draw();
   if(again&&!disabled)poll();
  }

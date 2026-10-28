@@ -5,8 +5,11 @@ import { missionEntries } from './mission-catalog-view.js';
 import { recordOutcome, recordVisibility, reportFreshness } from './record-state.js';
 import { serviceState, serviceScope } from './services-view.js';
 import { integrationEntries, integrationTimestamp } from './integrations-view.js';
-import { isCalm, snapshotText, animateChanges, skeleton } from './motion.js';
-import { morph, handOff, patchText, patchAttr } from './patch.js';
+import { isCalm, snapshotText, animateChanges, loadingProgress } from './motion.js';
+import { freshnessSources } from './freshness.js';
+import { createResourcePoller } from './refresh-bus.js';
+import { requestErrorDetail } from './dashboard-load-state.js';
+import { morph, handOff } from './patch.js';
 
 const records = value => Array.isArray(value) ? value.filter(v => v && typeof v === 'object' && !Array.isArray(v)) : [];
 const text = value => typeof value === 'string' ? value : '';
@@ -119,12 +122,13 @@ function ageMarkup(value, now, label = 'Report') {
 }
 const metric = (value, label, href) => `<a class="ov-metric" href="${esc(href)}"><strong>${value}</strong><span>${esc(label)}</span></a>`;
 const empty = label => `<p class="ov-note">${esc(label)}</p>`;
+const SOURCE_LABELS = {projections:'Live mission reports',missions:'Recorded missions',sessions:'Agents',services:'Services',hosts:'Hosts',fleet:'Fleet versions',activity:'Recent activity',health:'Control plane',ci:'CI',reviews:'Reviews',attention:'Attention'};
 function availability(keys, states) {
   return keys.map(key => {
     const state = states[key];
-    const label = {projections:'Live mission reports',missions:'Recorded missions',sessions:'Agents',services:'Services',hosts:'Hosts',activity:'Recent activity',health:'Control plane',ci:'CI',reviews:'Reviews'}[key];
-    if (state?.error) return `<p class="ov-warning" role="status">${esc(label)}: Could not refresh.${state.loaded ? ' Showing last received records.' : ' Data is unavailable; retrying automatically.'}</p>`;
-    if (!state?.loaded) return `<div class="hd-skeleton ov-skeleton" role="status" aria-label="Loading ${esc(label.toLowerCase())}"></div>`;
+    const label = SOURCE_LABELS[key];
+    if (state?.error) return `<p class="ov-warning" role="status">${esc(label)}: ${typeof state.error === 'string' ? esc(state.error) : 'Could not refresh.'}${state.loaded ? ' Showing last received records.' : ' Data is unavailable; retrying automatically.'}</p>`;
+    if (!state?.loaded) return `<div data-skeleton aria-busy="true" role="status" aria-label="Loading ${esc(label.toLowerCase())}"><div class="hd-skeleton ov-skeleton" aria-hidden="true"></div>${loadingProgress(label.toLowerCase())}</div>`;
     return '';
   }).join('');
 }
@@ -143,7 +147,7 @@ export function renderOverviewSection(section, data = {}, states = {}, received 
   const model = overviewModel(data,received,now);
   if (section === 'attention') {
     const mode=states.attention===undefined ? 'browser' : states.attention.error ? 'fallback' : states.attention.loaded && data.attention ? 'server' : states.attention.disabled ? 'browser' : states.attention.loaded ? 'browser' : 'loading';
-    if(mode==='loading')return `<div class="ov-heading"><h2 tabindex="-1">Attention</h2></div><div class="hd-skeleton ov-skeleton" role="status" aria-label="Loading attention"></div>`;
+    if(mode==='loading')return `<div class="ov-heading"><h2 tabindex="-1">Attention</h2></div><div data-skeleton aria-busy="true" role="status" aria-label="Loading attention"><div class="hd-skeleton ov-skeleton" aria-hidden="true"></div>${loadingProgress('attention')}</div>`;
     const attention=mode==='server' ? serverAttention(data.attention,now) : overviewAttention(data,states,received,now),expanded=data.attentionExpanded===true,limit=6;
     const visible=expanded?attention.items:attention.items.slice(0,limit);
     return `<div class="ov-heading"><h2 tabindex="-1">Attention</h2><span class="ov-tag">${attention.items.length ? `${attention.items.length}${attention.complete?'':'+'}` : attention.complete?'0':'—'} ${attention.server?'open':'observed'} items</span></div>
@@ -243,9 +247,10 @@ function saveSnoozed(map) {
   try { localStorage.setItem(SNOOZE_KEY, JSON.stringify(Object.fromEntries(map))); } catch { /* ignore */ }
 }
 
-export function mountOverview(container, client) {
+export function mountOverview(container, client, { freshness = () => null } = {}) {
   let disposed=false, clock=null, received=Date.now();
-  const data={snoozed:loadSnoozed()}, states={}, controllers=new Map(), timers=new Map(), signatures=new Map();
+  const data={snoozed:loadSnoozed()}, states={}, signatures=new Map();
+  const chip=freshnessSources(freshness);
   const panels=['attention',...OVERVIEW_CARDS,'health'];
   let preferences;
   try { preferences=sanitizeOverviewPreferences(JSON.parse(localStorage.getItem(PREFERENCES_KEY) || 'null')); } catch { preferences=sanitizeOverviewPreferences(); }
@@ -280,8 +285,7 @@ export function mountOverview(container, client) {
     }
   }
   applyPreferences();
-  // Motion without the patcher (Overview still swaps panels with innerHTML, Task 19 migrates it):
-  // metric tiles are paired across the swap by link + label, attention rows by data-attention-key.
+  // Motion pairs morphed metric tiles by link + label, attention rows by data-attention-key.
   const metricKey=el=>{const a=el.closest('.ov-metric');return a?`${a.getAttribute('href')}|${a.querySelector('span')?.textContent}`:null;};
   const PULSE_MS=6000;
   const pulseUntil=new Map();
@@ -362,15 +366,8 @@ export function mountOverview(container, client) {
     const now=Date.now();
     container.querySelectorAll('[data-overview-stamp]').forEach(el=>{el.textContent=formatDuration(Math.max(0,now-Date.parse(el.dataset.overviewStamp)));});
   }
-  async function poll(key) {
-    if(disposed || document.hidden || controllers.has(key))return;
-    clearTimeout(timers.get(key));
-    const controller=new AbortController();controllers.set(key,controller);
-    let timedOut=false;
-    const timeout=setTimeout(()=>{timedOut=true;controller.abort();},15000);
-    try {
-      const response=await sources[key](controller.signal);
-      if(disposed || controller.signal.aborted)return;
+  const polling = createResourcePoller({ attention: sources.attention, ...sources }, {
+    apply(key, response) {
       const field={projections:'activities',activity:'events'}[key] || key;
       const objectSource=['health','ci','reviews','fleet','attention'].includes(key);
       if (objectSource ? !response || (key==='attention' ? !response.disabled && !Array.isArray(response.items) : key==='health' ? typeof response.status!=='string' : key==='ci' ? typeof response.available!=='boolean' : key==='fleet' ? !Array.isArray(response.components) : !Array.isArray(response.reviews)) : !Array.isArray(response?.[field])) throw new Error('Invalid response');
@@ -378,19 +375,19 @@ export function mountOverview(container, client) {
       if(key==='projections')received=Date.now();
       if(key==='attention' && response.disabled)data.attention=null;
       states[key]={loaded:true,error:false,...(key==='attention' && response.disabled ? {disabled:true} : {})};
-      draw();
-    } catch {
-      if(!disposed && (!controller.signal.aborted || timedOut)){states[key]={...states[key],error:true};draw();}
-    } finally {
-      clearTimeout(timeout);controllers.delete(key);
-      if(!disposed && !document.hidden)timers.set(key,setTimeout(()=>poll(key),5000));
-    }
-  }
-  function refresh() {for(const key of Object.keys(sources))poll(key);}
+      chip.ok(key); draw();
+    },
+    onError(key, error) {
+      const detail = requestErrorDetail(error);
+      states[key]={...states[key],error:`Could not refresh: ${detail}`};
+      chip.fail(key,`${SOURCE_LABELS[key]}: ${detail}`); draw();
+    },
+  });
+  function refresh() { polling.refresh(); }
   function visibility() {
-    clearInterval(clock);for(const timer of timers.values())clearTimeout(timer);timers.clear();
-    if(document.hidden){for(const controller of controllers.values())controller.abort();return;}
-    draw();refresh();clock=setInterval(draw,1000);
+    clearInterval(clock);
+    if(document.hidden){polling.pause();return;}
+    draw();polling.resume();clock=setInterval(draw,1000);
   }
   container.addEventListener('click',event=>{
     if(event.target.closest?.('[data-attention-toggle]')){data.attentionExpanded=!data.attentionExpanded;draw();return;}
@@ -412,5 +409,5 @@ export function mountOverview(container, client) {
     saveSnoozed(data.snoozed);signatures.delete('missions');userChange=true;draw();
   });
   document.addEventListener('visibilitychange',visibility);visibility();
-  return {refresh,dispose(){disposed=true;clearInterval(clock);for(const timer of timers.values())clearTimeout(timer);for(const controller of controllers.values())controller.abort();document.removeEventListener('visibilitychange',visibility);}};
+  return {refresh,dispose(){disposed=true;clearInterval(clock);polling.dispose();document.removeEventListener('visibilitychange',visibility);}};
 }

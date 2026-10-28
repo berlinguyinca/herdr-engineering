@@ -3,6 +3,8 @@
 // Remote text is untrusted: every dynamic string is escaped and every href is an internal hash link.
 import { escapeHtml as esc } from './herdr-web-components/util.js';
 import { formatDuration } from './herdr-web-components/format.js';
+import { skeleton } from './motion.js';
+import { requestErrorDetail } from './dashboard-load-state.js';
 
 const SEVERITIES = ['critical', 'warning', 'info'];
 const KINDS = {
@@ -107,7 +109,7 @@ export function renderAttention(model = {}, now = Date.now()) {
   const head = '<h1 tabindex="-1">Attention</h1>';
   if (!body) {
     if (error) return `${STYLES}${head}<herdr-error message="${esc(error)}"></herdr-error><p class="at-status" role="status">Could not load the attention inbox; retrying automatically.</p>`;
-    return `${STYLES}${head}<p class="at-status" role="status">${loading === false ? '' : 'Loading attention…'}</p>`;
+    return `${STYLES}${head}${loading === false ? '' : skeleton('attention', { rows: 3 })}`;
   }
   const items = records(body.items).filter((i) => (!filters.kind || i.kind === filters.kind)
     && (!filters.severity || i.severity === filters.severity));
@@ -135,7 +137,7 @@ export function renderAttention(model = {}, now = Date.now()) {
 }
 
 /** Mount the page: polls every POLL_MS while visible; ack/snooze/clear go to the server and re-poll at once. */
-export function mountAttention(container, client, { onBody, notifier } = {}) {
+export function mountAttention(container, client, { onBody, notifier, onFreshness = () => {} } = {}) {
   const model = { body: null, error: '', loading: true, busy: new Set(), filters: {}, message: '' };
   let disposed = false, timer = null, controller = null, last = '';
   function draw() {
@@ -161,21 +163,25 @@ export function mountAttention(container, client, { onBody, notifier } = {}) {
   async function poll() {
     if (disposed || document.hidden || controller) return;
     clearTimeout(timer);
-    controller = new AbortController();
+    const request = new AbortController(); controller = request;
     try {
-      const body = await client.attention({ state: 'all' }, { signal: controller.signal });
-      if (disposed) return;
+      const body = await client.attention({ state: 'all' }, { signal: AbortSignal.any([request.signal, AbortSignal.timeout(15000)]) });
+      if (disposed || request.signal.aborted || controller !== request) return;
       if (!body || !Array.isArray(body.items)) throw new Error('Invalid response');
       model.body = body; model.error = ''; model.loading = false;
       onBody?.(body);
+      onFreshness(true);
     } catch (err) {
-      if (disposed || controller?.signal.aborted) return;
-      model.error = err?.status === 404 ? 'The attention inbox is turned off on this server.' : (err?.message || 'request failed');
+      if (disposed || request.signal.aborted || controller !== request) return;
+      model.error = err?.status === 404 ? 'The attention inbox is turned off on this server.' : requestErrorDetail(err);
       model.loading = false;
+      onFreshness(err?.status === 404, model.error);
     } finally {
-      controller = null;
-      draw();
-      if (!disposed && !document.hidden) timer = setTimeout(poll, POLL_MS);
+      if (controller === request) {
+        controller = null;
+        draw();
+        if (!disposed && !document.hidden) timer = setTimeout(poll, POLL_MS);
+      }
     }
   }
   async function act(action, body, key) {

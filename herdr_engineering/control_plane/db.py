@@ -11,9 +11,10 @@ _DEFAULTS = {
     "rustfs_region": "us-east-1",
 }
 
-# These migrations shipped with the original numbers before the mainline port.
-# Their SQL is byte-identical; an old receipt therefore proves the new one ran.
-_MIGRATION_ALIASES = {
+# These migrations were published under overlapping numeric prefixes before
+# consolidation. Keep their definitions and reconcile the renamed receipts;
+# replaying their CREATE TABLE statements would break existing installations.
+MIGRATION_ALIASES = {
     '0008_artifact_registry.sql': '0003_artifact_registry.sql',
     '0009_artifact_publications.sql': '0004_artifact_publications.sql',
     '0010_artifact_binding_context.sql': '0005_artifact_binding_context.sql',
@@ -70,9 +71,15 @@ class Migrator:
             if name in already:
                 continue
             sql = Path(migrations_dir, name).read_text(encoding="utf-8")
+            previous = MIGRATION_ALIASES.get(name)
+            alias_applied = previous in already if previous else False
+            if alias_applied:
+                legacy = Path(migrations_dir, previous)
+                if legacy.is_file() and legacy.read_text(encoding='utf-8') != sql:
+                    raise ValueError(f'migration alias content differs: {name}')
             await self._conn.execute("BEGIN")
             try:
-                if _MIGRATION_ALIASES.get(name) not in already:
+                if not alias_applied:
                     await self._conn.execute(sql)
                 await self._conn.execute(
                     "INSERT INTO schema_migrations (version) VALUES ($1)", name
@@ -82,4 +89,5 @@ class Migrator:
                 await self._conn.execute("ROLLBACK")
                 raise
             applied.append(name)
+            already.add(name)
         return applied

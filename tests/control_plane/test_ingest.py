@@ -34,6 +34,49 @@ def test_host_upsert_is_idempotent_across_heartbeats():
     assert types == ["HostRegistered"]
 
 
+def test_ingest_batch_returns_one_result_per_envelope():
+    repo = ControlPlaneRepo()
+    svc = make_svc(repo)
+    result = svc.ingest_batch([
+        {"entity_type": "host", "entity_id": "bender",
+         "event_type": "host.heartbeat", "payload": {"cpu": 10}},
+        {"entity_type": "host", "entity_id": "beast",
+         "event_type": "host.heartbeat", "payload": {"cpu": 20}},
+    ])
+    assert len(result) == 2
+    assert {host["host_id"] for host in repo.list_hosts()} == {"bender", "beast"}
+
+
+def test_ingest_batch_rejects_unbounded_payload():
+    with pytest.raises(ValueError, match="at most 64"):
+        make_svc().ingest_batch([{}] * 65)
+
+
+def test_scheduler_registration_updates_known_host_without_losing_metrics():
+    repo = ControlPlaneRepo()
+    svc = make_svc(repo)
+    body = {"source": "fabric-agent", "entity_type": "host", "entity_id": "beast",
+            "event_type": "host.heartbeat", "payload": {"cpu": 10}}
+    svc.ingest(body)
+    body["payload"] = {
+        "host_uid": "uid-beast", "aliases": ["BEAST"], "platform": "linux",
+        "scheduler_owned": True, "scheduler_trusted": True,
+        "scheduler_policy": {"mode": "automatic", "revision": 1},
+        "scheduler_capacity": {"total_cpu": 8},
+        "telemetry": {"cpu": 12, "mem": 40},
+        "sequence": 7, "freshness_seconds": 1, "confidence": "observed",
+    }
+    svc.ingest(body)
+    assert repo.host_snapshot("beast").host_uid == "uid-beast"
+    assert repo.host_snapshot("beast").telemetry_freshness_seconds == 1
+    assert repo.get_host("beast")["scheduler_capacity"] == {"total_cpu": 8}
+    assert repo.get_host("beast")["latest"]["cpu"] == 12
+    assert repo.list_telemetry("beast", limit=1)[0]["sequence"] == 7
+    events = repo.stream("host", "beast")
+    svc.ingest(body)
+    assert repo.stream("host", "beast") == events
+
+
 def test_session_upsert_start_then_stop():
     repo = ControlPlaneRepo()
     svc = make_svc(repo)

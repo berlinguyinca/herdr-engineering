@@ -37,7 +37,7 @@ import json
 import logging
 import os
 import re
-import select
+import selectors
 import shutil
 import socket
 import subprocess
@@ -391,14 +391,18 @@ class ListenerGitMetadata:
             process = subprocess.Popen([executable, *args], cwd=cwd, env=env,
                                        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
             raw = bytearray()
-            while len(raw) <= 4096:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0 or not select.select([process.stdout], [], [], remaining)[0]:
-                    return None
-                chunk = os.read(process.stdout.fileno(), 4097 - len(raw))
-                if not chunk:
-                    break
-                raw.extend(chunk)
+            # epoll/kqueue can watch pipes above select()'s FD_SETSIZE limit on
+            # long-running hosts; the same deadline and byte cap still apply.
+            with selectors.DefaultSelector() as readable:
+                readable.register(process.stdout, selectors.EVENT_READ)
+                while len(raw) <= 4096:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0 or not readable.select(remaining):
+                        return None
+                    chunk = os.read(process.stdout.fileno(), 4097 - len(raw))
+                    if not chunk:
+                        break
+                    raw.extend(chunk)
             if len(raw) > 4096 or process.wait(timeout=max(0.01, deadline - time.monotonic())) != 0:
                 return None
             return raw.decode("utf-8").strip()
@@ -800,6 +804,7 @@ class FabricAgent:
         self._warned_unleased: set[int] = set()
         self._cp_last_report: dict[str, float] = {}
         self._cp_unavailable: dict[str, dict[str, Any]] = {}
+        self._probe_cache: dict[int, tuple[tuple, bool, float]] = {}
         self._lock = threading.Lock()
         from .host_metrics import HostSampler, read_updates, read_versions
         self._sampler = HostSampler(agent_lookup=self._agent_for_pid,
@@ -897,6 +902,10 @@ class FabricAgent:
         """One detect/register/close cycle. Returns a summary."""
         listeners = scan_listening_ports()
         live_ports = set(listeners)
+        self._probe_cache = {
+            port: cached for port, cached in self._probe_cache.items()
+            if port in live_ports
+        }
         registered: list[str] = []
         closed: list[str] = []
 
@@ -964,7 +973,7 @@ class FabricAgent:
                 if (str(port) in self._store
                         or port in fwd_ports):
                     continue
-            if not probe_web(port, timeout=self.cfg.probe_timeout):
+            if not self._probe_web_cached(port, listeners[port]):
                 continue
             entry = self._adopt(port, listeners[port])
             if entry:
@@ -1018,6 +1027,27 @@ class FabricAgent:
         self._save_store()
         return {"registered": registered, "closed": closed,
                 "unleased": [str(p) for p in unleased]}
+
+    def _probe_web_cached(self, port: int, info: dict[str, Any]) -> bool:
+        """Probe a listener once per stable observation window.
+
+        Listener scans run frequently to catch newly-started dev servers, but
+        repeatedly doing an HTTP GET for every unchanged unleased port creates
+        avoidable work. A process/address change invalidates the entry; a
+        short expiry still rechecks a quiet service for recovery.
+        """
+        fingerprint = (
+            tuple(sorted(info.get("addrs") or ())),
+            info.get("process"),
+            info.get("pid"),
+        )
+        now = time.monotonic()
+        prior = self._probe_cache.get(port)
+        if prior and prior[0] == fingerprint and now - prior[2] < 30.0:
+            return prior[1]
+        result = probe_web(port, timeout=self.cfg.probe_timeout)
+        self._probe_cache[port] = (fingerprint, result, now)
+        return result
 
     def _keepalive(self, port_s: str, entry: dict[str, Any]) -> None:
         """Heartbeat a tracked lease; re-register it if the gateway lost it."""

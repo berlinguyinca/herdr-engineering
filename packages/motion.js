@@ -120,9 +120,34 @@ export function flash(el){
 // bare: rows only, for a placeholder nested inside an outer [data-skeleton] that announces itself.
 // inStatus: the placeholder sits inside an existing role="status" region, so it adds no second
 // one; a visually hidden "Loading <label>" lets the outer region announce it.
+export function loadingProgress(label) {
+ const safe=String(label).replace(/[&<>"']/g,c=>`&#${c.charCodeAt(0)};`);
+ return `<herdr-loading-progress label="${safe}"></herdr-loading-progress>`;
+}
+
+const LoadingBase = typeof HTMLElement === 'undefined' ? class {} : HTMLElement;
+class HerdrLoadingProgress extends LoadingBase {
+ connectedCallback() {
+  this.hidden = true;
+  clearTimeout(this._delay);
+  this._delay = setTimeout(() => {
+   if (!this.isConnected) return;
+   const label = `Loading ${this.getAttribute('label') || 'content'}`;
+   const text = document.createElement('span'); text.textContent = label;
+   const bar = document.createElement('progress'); bar.className = 'hd-load-progress';
+   bar.setAttribute('aria-label', label); // No value: the request has no known total.
+   this.replaceChildren(text, bar); this.hidden = false;
+  }, 300);
+ }
+ disconnectedCallback() { clearTimeout(this._delay); }
+}
+if (typeof customElements !== 'undefined' && !customElements.get('herdr-loading-progress')) {
+ customElements.define('herdr-loading-progress', HerdrLoadingProgress);
+}
+
 export function skeleton(label,{rows=3,height=44,bare=false,inStatus=false}={}){
  const safe=String(label).replace(/[&<>"']/g,c=>`&#${c.charCodeAt(0)};`);
  const own=bare?'':inStatus?' data-skeleton aria-busy="true"':` data-skeleton aria-busy="true" role="status" aria-label="Loading ${safe}"`;
  const hidden=!bare&&inStatus?`<span class="visually-hidden">Loading ${safe}</span>`:'';
- return `<div class="hd-skeleton-group"${own}>${hidden}${`<div class="hd-skeleton" style="height:${Number(height)}px"></div>`.repeat(Math.max(1,rows))}</div>`;
+ return `<div class="hd-skeleton-group"${own}>${hidden}${`<div class="hd-skeleton" style="height:${Number(height)}px"></div>`.repeat(Math.max(1,rows))}${loadingProgress(label)}</div>`;
 }

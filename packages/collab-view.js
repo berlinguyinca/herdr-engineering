@@ -32,8 +32,12 @@ const PERMS = [['read', 'Read messages'], ['post', 'Write messages'], ['execute'
 const PERM_SHORT = { read: 'Read', post: 'Write', execute: 'Receive tasks', instruct: 'Send tasks', spawn_helpers: 'Start helpers' };
 const ROLE_LABEL = { owner: 'Owner', contributor: 'Can chat', viewer: 'Read only', guest: 'Guest' };
 
-async function loadConfig() {
-  const res = await fetch('/api/v1/collab/config');
+// onStatus(ok, message): a server error (5xx or no answer) is a failed refresh; a 404 or an
+// incomplete config means collaboration is simply not enabled, which is not an error.
+async function loadConfig(onStatus = () => {}) {
+  let res;
+  try { res = await fetch('/api/v1/collab/config', { signal: AbortSignal.timeout(15000) }); } catch (e) { onStatus(false, e.message || 'request failed'); throw e; }
+  onStatus(res.status < 500, `HTTP ${res.status}`);
   if (!res.ok) return null;
   const cfg = await res.json();
   return cfg && cfg.client_id && cfg.hosted_ui_domain && cfg.public_url ? cfg : null;
@@ -117,7 +121,7 @@ export function refocus(container, selector) {
   target.focus({ preventScroll: true });
 }
 
-export function mountCollab(root, { fabricSessions = null } = {}) {
+export function mountCollab(root, { fabricSessions = null, onFreshness = () => {} } = {}) {
   ensureConversationStyles(root.ownerDocument);
   let teardown = null;      // stops the open room's live loop
   let cursor = 0;
@@ -173,7 +177,7 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
   }
 
   async function start() {
-    const cfg = await loadConfig();
+    const cfg = await loadConfig(onFreshness);
     lastCfg = cfg;
     if (!cfg) {
       centered('<h1>Collaboration</h1><p role="status">The collaboration network is not enabled on this server, or this address is not allowed for the dashboard. Try the dashboard by its IP address.</p>');
@@ -568,7 +572,29 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
     const filter=box.querySelector('[data-agent-family-filter]'),countBox=box.querySelector('[data-agent-selected-count]'),selectedButton=box.querySelector('[data-agent-stop-selected]');
     const syncBulk=()=>{const chosen=[...box.querySelectorAll('[data-agent-select]:checked')];if(countBox)countBox.textContent=`${chosen.length} selected`;if(selectedButton)selectedButton.disabled=!chosen.length;box.querySelectorAll('[data-agent-card]').forEach(card=>{card.hidden=!!(filter?.value&&card.dataset.agentFamily!==filter.value);});};
     filter?.addEventListener('change',syncBulk);box.querySelectorAll('[data-agent-select]').forEach(input=>input.addEventListener('change',()=>{input.closest('[data-agent-card]')?.classList.toggle('cx-agent-card--selected',input.checked);syncBulk();}));
-    const stop=async(ids)=>{if(!ids.length||!window.confirm(`Revoke access and stop ${ids.length} agent${ids.length===1?'':'s'}?`))return;await Promise.all(ids.map(id=>api.revokeAgent(id)));renderAgents();};
+    let stopping = false;
+    const stop = async ids => {
+      if (stopping || !ids.length || !window.confirm(`Revoke access and stop ${ids.length} agent${ids.length === 1 ? '' : 's'}?`)) return;
+      stopping = true;
+      const controls = [...box.querySelectorAll('button,input,select')];
+      controls.forEach(control => { control.disabled = true; });
+      countBox.setAttribute('role', 'status');
+      let completed = 0;
+      const failures = [];
+      for (const id of ids) {
+        if (!box.isConnected) break;
+        countBox.textContent = `Stopping ${completed + failures.length + 1} of ${ids.length}…`;
+        try { await api.revokeAgent(id); completed++; }
+        catch (error) { failures.push(`${id}: ${error.message}`); }
+      }
+      if (!box.isConnected) return;
+      try { await renderAgents(); }
+      catch (error) { failures.push(`Agent list: ${error.message}`); controls.forEach(control => { control.disabled = false; }); syncBulk(); }
+      stopping = false;
+      const status = box.querySelector('[data-agent-selected-count]') || countBox;
+      status.setAttribute('role', 'status');
+      status.textContent = `${completed} stopped${failures.length ? ` · Could not stop: ${failures.join('; ')}. Select remaining agents to retry.` : ''}`;
+    };
     selectedButton?.addEventListener('click',()=>stop([...box.querySelectorAll('[data-agent-select]:checked')].map(i=>i.dataset.agentSelect)));
     box.querySelector('[data-agent-stop-all]')?.addEventListener('click',()=>stop(live.map(a=>a.agent_id)));
     syncBulk();
@@ -577,7 +603,7 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
   // ---- one tab per room, then the AI agents page
   let roomsCache = [];
   async function tabsStrip(activeRoom, activePage) {
-    try { roomsCache = (await api.rooms()).rooms; } catch { /* keep the last list */ }
+    try { roomsCache = (await api.rooms()).rooms; onFreshness(true); } catch (e) { onFreshness(false, `Rooms: ${e.message || 'request failed'}`); /* keep the last list */ }
     let waitingCount = 0;
     if (canManagePeople()) { try { waitingCount = (await api.users('pending')).users.length; } catch { /* not an approver */ } }
     const t = (to, label, on, extra = '') => `<button type="button" class="cx-rtab${extra}" role="tab" data-go="${to}" aria-selected="${on}">${label}</button>`;
@@ -1129,7 +1155,7 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
       WB.busy = true; WB.error = null; WB.steerError = null; WB.notice = null; drawLineage(true);
       try { await fn(); if (done) WB.notice = done; } catch (e) {
         if (steer) WB.steerError = wbWhy(e, 'The request failed.'); else WB.error = wbWhy(e, 'The request failed.');
-      } finally { WB.busy = false; }
+      } finally { WB.busy = false; if (alive) drawLineage(true); }
       await loadWorkbench(true);                                      // refresh the lists but keep the message just shown
     }
     const wbKey = () => `web-wb-${Date.now().toString(36)}-${randomString(9)}`;
@@ -1438,12 +1464,14 @@ export function mountCollab(root, { fabricSessions = null } = {}) {
           const s = await api.state(roomId, since, cursor, 8, ctl.signal);
           if (!alive) return;
           backoff = 1000;
+          onFreshness(true);
           if (s.changed) { apply(s); since = s.has_more ? -1 : s.seq; } else since = s.seq;
         } catch (e) {
           if (!alive) return;
           if (e.name === 'AbortError') continue;
           if (e instanceof AuthError) { dispose(); store.clear(); start(); return; }
           if (/not found/.test(e.message)) { dispose(); go('/rooms'); return; }
+          onFreshness(false, `Room: ${e.message || 'request failed'}`);
           await sleep(backoff); backoff = Math.min(backoff * 2, 15000);
         }
       }

@@ -31,3 +31,14 @@ def test_human_render():
     r.add("x", "ok", "fine")
     out = r.render_human()
     assert "overall" in out
+
+
+def test_missing_handoff_is_a_warning_unless_strict(monkeypatch):
+    from herdr_engineering.handoff_dependency import HandoffDependencyResult
+
+    monkeypatch.setattr("herdr_engineering.handoff_dependency.check_handoff_dependency",
+                        lambda: HandoffDependencyResult("fail", "missing integration"))
+    for strict, expected in ((False, "warn"), (True, "fail")):
+        report = run_doctor(config=dict(DEFAULTS), strict=strict).to_dict()
+        check = next(item for item in report["checks"] if item["name"] == "handoff")
+        assert check["status"] == expected

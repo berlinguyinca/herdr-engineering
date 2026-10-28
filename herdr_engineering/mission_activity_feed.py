@@ -379,6 +379,49 @@ class MissionActivityFeed:
             self.sent.pop(oldest, None)
         return True
 
+    def _publish_many(self, payloads: list[dict]) -> int:
+        """Publish changed mission projections in bounded ingest requests."""
+        candidates = []
+        fingerprints = []
+        now = time.monotonic()
+        for payload in payloads:
+            mid = payload['mission']['id']
+            fingerprint = hashlib.sha256(json.dumps(
+                {key: value for key, value in payload.items()
+                 if key != 'observed_at'}, sort_keys=True).encode()).hexdigest()
+            prior = self.sent.get(mid)
+            if prior and prior[0] == fingerprint and now - prior[1] < self.heartbeat:
+                continue
+            published = {**payload, 'observed_at': _now()}
+            candidates.append({
+                'source': 'pi', 'entity_type': 'mission_activity',
+                'entity_id': f'pi:{mid}',
+                'event_type': 'mission_activity.snapshot', 'payload': published})
+            fingerprints.append((mid, fingerprint, published))
+        if not candidates:
+            return 0
+        # Match the ingest endpoint's 64-envelope limit, including hosts with
+        # multiple runtime sessions each owning several missions.
+        for start in range(0, len(candidates), 64):
+            batch = candidates[start:start + 64]
+            response = self._http_json('/api/v1/ingest', {'events': batch})
+            entities = response.get('entities')
+            if response.get('ok') is not True or not isinstance(entities, list) \
+                    or len(entities) != len(batch) \
+                    or any(not isinstance(entity, dict)
+                           or entity.get('accepted') is not True
+                           for entity in entities):
+                raise PublicationRejected(None)
+            timestamp = time.monotonic()
+            for mid, fingerprint, published in fingerprints[start:start + 64]:
+                self.sent[mid] = (fingerprint, timestamp)
+                self.known[mid] = published
+            while len(self.known) > 256:
+                oldest = next(iter(self.known))
+                del self.known[oldest]
+                self.sent.pop(oldest, None)
+        return len(candidates)
+
     def run_once(self) -> dict:
         result = {'capable': False, 'sessions': 0, 'posted': 0, 'errors': 0, 'reasons': {},
                   'snapshot_reads': 0, 'snapshot_cache_hits': 0, 'snapshot_bytes': 0}
@@ -432,11 +475,15 @@ class MissionActivityFeed:
                     except (OSError, ValueError) as error:
                         _record_error(result, error, 'publication_failed')
                         current.pop(mid, None)
-            for payload in current.values():
-                try:
-                    result['posted'] += self._publish(payload)
-                except (OSError, ValueError) as error:
-                    _record_error(result, error, 'publication_failed')
+            payloads = list(current.values())
+            try:
+                if len(payloads) > 1:
+                    result['posted'] += self._publish_many(payloads)
+                else:
+                    for payload in payloads:
+                        result['posted'] += self._publish(payload)
+            except (OSError, ValueError) as error:
+                _record_error(result, error, 'publication_failed')
             return result
         finally:
             result['snapshot_reads'] = self._snapshot_reads

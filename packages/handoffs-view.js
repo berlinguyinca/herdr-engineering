@@ -1,5 +1,7 @@
 import { escapeHtml as esc } from './herdr-web-components/util.js';
 import { renderFlow } from './collab-flow.js';
+import { skeleton } from './motion.js';
+import { pollWhileVisible } from './refresh-bus.js';
 
 export function handoffGraphSummary(graph = {}) {
   const edges = Array.isArray(graph.edges) ? graph.edges : [];
@@ -9,11 +11,13 @@ export function handoffGraphSummary(graph = {}) {
     edges: edges.length, states, edgeText: edges[0] ? `${edges[0].handoff_id} · ${edges[0].state}` : '' };
 }
 
-export function mountHandoffs(container, client) {
-  container.innerHTML = `<h1>Handoffs</h1><p class="hd-muted">Private work transfers between harnesses and hosts. Handoff text is untrusted and escaped.</p><div data-handoff-summary></div><section class="cx-flow-box" data-handoff-graph></section><section data-handoff-list></section>`;
+export function mountHandoffs(container, client, { freshness = () => null } = {}) {
+  let disposed = false, controller = null, loaded = false, signature = null;
+  container.innerHTML = `<p class="hd-muted">Private work transfers between harnesses and hosts. Handoff text is untrusted and escaped.</p><div data-handoff-summary role="status"></div><section class="cx-flow-box" data-handoff-graph></section><section data-handoff-list></section><button type="button" data-handoff-retry hidden>Retry</button>`;
   const summary = container.querySelector('[data-handoff-summary]');
   const graph = container.querySelector('[data-handoff-graph]');
   const list = container.querySelector('[data-handoff-list]');
+  const retry = container.querySelector('[data-handoff-retry]');
   const draw = data => {
     const stats = handoffGraphSummary(data);
     summary.textContent = `${stats.edges} handoffs · ${stats.nodes} endpoints`;
@@ -28,6 +32,32 @@ export function mountHandoffs(container, client) {
       return `<article class="hd-card"><strong>${esc(from.harness || 'unknown')} → ${esc(to.harness || 'unknown')}</strong><span>${esc(edge.state || 'unknown')}</span><p>${esc(edge.goal || '')}</p><small>${esc(edge.handoff_id || '')}</small></article>`;
     }).join('') || '<p class="hd-muted">No handoffs recorded.</p>';
   };
-  client.getHandoffTree().then(draw).catch(error => { summary.textContent = 'Unable to load handoffs'; graph.textContent = error.message; });
-  return { refresh: () => client.getHandoffTree().then(draw) };
+  const refresh = async () => {
+    if (disposed || controller) return;
+    const request = new AbortController(); controller = request;
+    const signal = AbortSignal.any([request.signal, AbortSignal.timeout(15000)]);
+    if (!loaded) list.innerHTML = skeleton('handoffs');
+    retry.hidden = true;
+    try {
+      const data = await client.getHandoffTree({ signal });
+      if (disposed) return;
+      if (!Array.isArray(data.nodes) || !Array.isArray(data.edges)) throw new Error('Invalid handoff graph response');
+      const next = JSON.stringify(data);
+      if (signature !== next) { draw(data); signature = next; }
+      else { const stats = handoffGraphSummary(data); summary.textContent = `${stats.edges} handoffs · ${stats.nodes} endpoints`; }
+      loaded = true;
+      freshness()?.touch(true);
+    } catch (error) {
+      if (!disposed && !request.signal.aborted) {
+        if (!loaded) list.innerHTML = '';
+        summary.textContent = `Unable to load handoffs: ${error.message}`;
+        retry.hidden = false;
+        freshness()?.touch(false, error.message);
+      }
+    } finally { if (controller === request) controller = null; }
+  };
+  retry.addEventListener('click', refresh);
+  const stop = pollWhileVisible(refresh, 30000);
+  void refresh();
+  return { refresh, dispose() { disposed = true; stop(); controller?.abort(); } };
 }

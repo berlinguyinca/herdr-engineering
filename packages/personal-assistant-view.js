@@ -1,6 +1,8 @@
 // Herdr Personal Assistant view (Rakazo integration, P2 settings + chat MVP).
 // Built on the existing vanilla JS / Web Components stack and design tokens.
 import { escapeHtml as esc } from './herdr-web-components/util.js';
+import { skeleton } from './motion.js';
+import { requestErrorDetail } from './dashboard-load-state.js';
 
 function statusClass(status) {
   return { ready: 'pa-status--ready', running: 'pa-status--running', disabled: 'pa-status--disabled',
@@ -11,20 +13,25 @@ function statusLabel(status) {
   return { ready: 'Ready', running: 'Running', disabled: 'Disabled', needs_attention: 'Needs attention' }[status] || status;
 }
 
-export function mountPersonalAssistant(container, client) {
+export function mountPersonalAssistant(container, client, { onFreshness = () => {} } = {}) {
   let disposed = false;
   let state = { assistants: [], selectedId: null, tab: 'General' };
 
   const render = async () => {
-    container.innerHTML = '<herdr-spinner label="Loading Personal Assistant"></herdr-spinner>';
+    container.innerHTML = skeleton('Personal Assistant');
     try {
       const { assistants = [] } = await client.listAssistants();
       if (disposed) return;
       state.assistants = assistants;
       if (!state.selectedId && assistants.length) state.selectedId = assistants[0].assistant_id;
       draw();
+      onFreshness(true);
     } catch (error) {
-      if (!disposed) container.innerHTML = `<herdr-error message="${esc(error.message || 'Personal Assistant could not load')}"></herdr-error>`;
+      if (!disposed) {
+        const detail = requestErrorDetail(error);
+        container.innerHTML = `<herdr-error message="${esc(detail)}"></herdr-error>`;
+        onFreshness(false, `Personal Assistant: ${detail}`);
+      }
     }
   };
 
@@ -87,13 +94,13 @@ export function mountPersonalAssistant(container, client) {
 
   const renderPanel = (a) => {
     if (state.tab === 'General') return renderGeneral(a);
-    if (state.tab === 'Permissions') return '<div id="pa-perms"><herdr-spinner label="Loading permissions"></herdr-spinner></div>';
-    if (state.tab === 'Memory') return '<div id="pa-memory"><herdr-spinner label="Loading memory"></herdr-spinner></div>';
-    if (state.tab === 'Routines') return '<div id="pa-routines"><herdr-spinner label="Loading routines"></herdr-spinner></div>';
-    if (state.tab === 'Connectors') return '<div id="pa-connectors"><herdr-spinner label="Loading connectors"></herdr-spinner></div>';
-    if (state.tab === 'Delegations') return '<div id="pa-delegations"><herdr-spinner label="Loading delegations"></herdr-spinner></div>';
-    if (state.tab === 'Approvals') return '<div id="pa-approvals"><herdr-spinner label="Loading approvals"></herdr-spinner></div>';
-    return '<div id="pa-diagnostics"><herdr-spinner label="Loading diagnostics"></herdr-spinner></div>';
+    if (state.tab === 'Permissions') return `<div id="pa-perms">${skeleton('permissions')}</div>`;
+    if (state.tab === 'Memory') return `<div id="pa-memory">${skeleton('memory')}</div>`;
+    if (state.tab === 'Routines') return `<div id="pa-routines">${skeleton('routines')}</div>`;
+    if (state.tab === 'Connectors') return `<div id="pa-connectors">${skeleton('connectors')}</div>`;
+    if (state.tab === 'Delegations') return `<div id="pa-delegations">${skeleton('delegations')}</div>`;
+    if (state.tab === 'Approvals') return `<div id="pa-approvals">${skeleton('approvals')}</div>`;
+    return `<div id="pa-diagnostics">${skeleton('diagnostics')}</div>`;
   };
 
   const renderGeneral = (a) => `
@@ -326,7 +333,7 @@ export function mountPersonalAssistant(container, client) {
   const renderChat = (a) => `
     <div class="hd-card">
       <div class="hd-card__title">Chat</div>
-      <div id="pa-threads"><herdr-spinner label="Loading threads"></herdr-spinner></div>
+      <div id="pa-threads">${skeleton('threads')}</div>
       <div id="pa-messages" class="pa-chat" style="min-height:180px;margin-top:10px"></div>
       <div class="pa-row" style="margin-top:10px">
         <input style="flex:1" placeholder="Message…" data-msg>
