@@ -96,6 +96,7 @@ def assistant_config(cfg: dict[str, Any]) -> dict[str, Any]:
         "inference": {
             "endpoint": str(inference.get("endpoint", "")),
             "timeout": int(inference.get("timeout", 60)),
+            "model": str(inference.get("model", "")),
             "api_key": str(inference.get("api_key", "")),  # never logged
         },
     }
@@ -514,29 +515,46 @@ class LocalRunnerAdapter(RuntimeAdapter):
 
 
 class HttpModelRunnerAdapter(RuntimeAdapter):
-    """Real inference runner wired to a configured model endpoint (R2).
+    """Real inference runner wired to the control-plane LLM proxy (R2).
 
-    POSTs the message history to ``inference.endpoint`` and returns the model
-    reply. The API key is sent as an Authorization header and is never echoed in
-    any output. A transport callable is injectable for tests; the default uses
-    urllib. On any failure it degrades to a safe message rather than raising, so
-    a chat run never crashes because of the model layer.
+    Speaks OpenAI-compatible chat-completions against ``inference.endpoint``
+    (the dashboard's herdr-llm-proxy at :8088), sending ``{model, messages}`` and
+    parsing ``choices[0].message.content``. The API key is sent as an
+    Authorization header and is never echoed in any output. A transport callable
+    is injectable for tests; the default uses urllib. On any failure it degrades
+    to a safe message rather than raising, so a chat run never crashes because of
+    the model layer.
     """
-    version = 2
+    version = 3
 
     def __init__(self, store: AssistantStore, *, endpoint: str, timeout: int = 60,
-                 api_key: str = "", urlopen: Callable | None = None):
+                 model: str = "", api_key: str = "",
+                 urlopen: Callable | None = None):
         self.store = store
         self.endpoint = endpoint
         self.timeout = timeout
+        self.model = model
         self.api_key = api_key
         self._urlopen = urlopen
 
-    def execute(self, run: AssistantRun, messages: list[AssistantMessage]) -> str:
-        payload = {
-            "assistant_id": run.assistant_id,
+    def _payload(self, run: AssistantRun, messages: list[AssistantMessage]) -> dict[str, Any]:
+        return {
+            "model": self.model,
             "messages": [{"role": m.role, "content": m.content} for m in messages],
         }
+
+    @staticmethod
+    def _parse_reply(data: Any) -> str:
+        try:
+            choices = data.get("choices") or []
+            if choices:
+                return str(choices[0].get("message", {}).get("content") or "").strip()
+        except Exception:  # noqa: BLE001
+            pass
+        return str(data.get("reply") or data.get("content") or "").strip()
+
+    def execute(self, run: AssistantRun, messages: list[AssistantMessage]) -> str:
+        payload = self._payload(run, messages)
         if not self._urlopen:
             try:
                 from urllib.request import Request, urlopen
@@ -546,13 +564,12 @@ class HttpModelRunnerAdapter(RuntimeAdapter):
                     req.add_header("Authorization", "Bearer " + self.api_key)
                 with urlopen(req, timeout=self.timeout) as resp:
                     body = resp.read().decode()
-                data = json.loads(body)
-                return str(data.get("reply") or data.get("content") or "").strip()
+                return self._parse_reply(json.loads(body))
             except Exception:  # noqa: BLE001
                 return "[http-model runner] inference unavailable"
         try:
             resp = self._urlopen(self.endpoint, payload, timeout=self.timeout)
-            return str(resp.get("reply") or resp.get("content") or "").strip()
+            return self._parse_reply(resp)
         except Exception:  # noqa: BLE001
             return "[http-model runner] inference unavailable"
 
@@ -1072,6 +1089,7 @@ class AssistantService:
                 self.runner = HttpModelRunnerAdapter(
                     self.store, endpoint=inf["endpoint"],
                     timeout=int(inf.get("timeout", 60)),
+                    model=str(inf.get("model", "")),
                     api_key=str(inf.get("api_key", "")))
             else:
                 self.runner = LocalRunnerAdapter(self.store)

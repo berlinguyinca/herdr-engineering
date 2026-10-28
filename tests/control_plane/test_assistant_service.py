@@ -733,14 +733,14 @@ def test_durable_snapshot_roundtrip(tmp_path):
     assert store3.connectors[next(iter(store3.connectors))].auth["token"] == "tok_1"
 
 
-def test_http_model_runner_uses_endpoint():
+def test_http_model_runner_uses_openai_endpoint():
     store = AssistantStore()
     seen = {}
     def fake_urlopen(endpoint, payload, timeout):
         seen["endpoint"] = endpoint; seen["payload"] = payload
-        return {"reply": "model answer"}
-    runner = HttpModelRunnerAdapter(store, endpoint="https://model.example.com/v1",
-                                    urlopen=fake_urlopen)
+        return {"choices": [{"message": {"content": "model answer"}}]}
+    runner = HttpModelRunnerAdapter(store, endpoint="http://llm:8088/v1/chat/completions",
+                                    model="deepseek_v4.1", urlopen=fake_urlopen)
     svc = AssistantService(config=assistant_config({"personal_assistant": {"enabled": True}}),
                            store=store)
     a = svc.create_assistant(tenant_id="t1", user_id="u1", name="Helper")
@@ -750,13 +750,15 @@ def test_http_model_runner_uses_endpoint():
     msgs = store.list_messages(t.thread_id, tenant_id="t1", user_id="u1")
     out = runner.execute(run, msgs)
     assert out == "model answer"
-    assert seen["endpoint"] == "https://model.example.com/v1"
+    assert seen["endpoint"] == "http://llm:8088/v1/chat/completions"
+    assert seen["payload"]["model"] == "deepseek_v4.1"
     assert seen["payload"]["messages"][0]["content"] == "hello"  # the user turn
 
 
 def test_http_model_runner_degrades_on_failure():
     store = AssistantStore()
     runner = HttpModelRunnerAdapter(store, endpoint="https://model.example.com/v1",
+                                    model="deepseek_v4.1",
                                     urlopen=lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
     out = runner.execute(_FakeRun(), [])
     assert "unavailable" in out
