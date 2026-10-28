@@ -2878,6 +2878,8 @@ def _cmd_cp_web(args) -> int:
                              collab_tls_terminated=args.collab_tls_terminated,
                              collab_require_https=args.collab_require_https,
                              fleet_config=fleet_store, ci_actions=cp.get("ci_actions") is True,
+                             scheduler_admission=cp.get("scheduler_admission") is True,
+                             scheduler_limits=cp.get("scheduler_limits") or {},
                              summary_config=cp.get("agent_summaries") or {},
                              assistant_config={"personal_assistant": cp["personal_assistant"]}
                                  if isinstance(cp.get("personal_assistant"), dict) else None,
