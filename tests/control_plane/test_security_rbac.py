@@ -10,15 +10,15 @@ server) with role-scoped API keys:
 * Source isolation: a pi-sourced session never attaches to a herdr mission
   that shares the raw id.
 * Secret redaction: payloads with secret-shaped values/keys are redacted in
-  the activity feed; the known gaps (``/api/v1/events`` stream not redacted,
-  mission ``title`` field not passed through the redactor) are pinned with
-  xfail/leak-pinning tests so a future fix is caught.
+  activity and per-entity events, including events written directly to the repo.
+  Mission title rendering remains covered by its separate API/UI boundary test.
 
 Tests only -- no product code is exercised beyond the public HTTP API and the
 repo it fronts.
 """
 from __future__ import annotations
 
+import copy
 import json
 import threading
 import urllib.error
@@ -404,21 +404,40 @@ def test_mission_title_secret_round_trip(server):
 
 
 # ---------------------------------------------------------------------------
-# (10) known gap: /api/v1/events (r.stream) is not redacted, unlike /activity
+# (10) per-entity events redact direct repository writes like activity and SSE
 # ---------------------------------------------------------------------------
 
-@pytest.mark.xfail(strict=True, reason=(
-    "api.py returns r.stream() on /api/v1/events without _redact_event "
-    "(unlike /activity and SSE); events written directly to the repo "
-    "leak secrets"))
-def test_events_stream_redaction_gap(server):
+@pytest.mark.parametrize("encoded", [False, True])
+@pytest.mark.parametrize("pagination", ["", "&limit=1"])
+def test_events_stream_redacts_direct_repository_secrets(server, encoded, pagination):
     base_url, repo = server
-    repo.record_event("note", "n2", "x", {"api_key": "sk-live-xyz"})
+    payload = {"api_key": "private-execution-proof", "generation": 1}
+    repo.record_event("note", "n2", "x", json.dumps(payload) if encoded else payload)
+    baseline = copy.deepcopy(repo.stream("note", "n2")[0]["payload"])
     status, parsed, _ = _get(
-        base_url, "/api/v1/events?entity_type=note&entity_id=n2",
+        base_url, "/api/v1/events?entity_type=note&entity_id=n2" + pagination,
         key="viewer-key")
     assert status == 200
     assert parsed["events"][0]["payload"]["api_key"] == "[REDACTED]"
+    assert parsed["events"][0]["payload"]["generation"] == 1
+    assert repo.stream("note", "n2")[0]["payload"] == baseline
+
+
+@pytest.mark.parametrize("pagination", ["", "&limit=1"])
+def test_events_stream_redacts_shared_references_without_mutating_source(server, pagination):
+    base_url, repo = server
+    shared = {"api_key": "private-execution-proof"}
+    bearer = "Bearer private-shared-token-proof"
+    payload = {"first": shared, "second": shared, "text": [bearer, bearer]}
+    baseline = copy.deepcopy(payload)
+    repo.record_event("note", "shared", "x", payload)
+    status, parsed, _ = _get(base_url, "/api/v1/events?entity_type=note&entity_id=shared" + pagination,
+                              key="viewer-key")
+    assert status == 200
+    result = parsed["events"][0]["payload"]
+    assert result["first"]["api_key"] == result["second"]["api_key"] == "[REDACTED]"
+    assert result["text"] == ["[REDACTED]", "[REDACTED]"]
+    assert repo.stream("note", "shared")[0]["payload"] == baseline
 
 
 # ---------------------------------------------------------------------------
