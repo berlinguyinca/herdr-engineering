@@ -107,34 +107,40 @@ summary_report:
   enabled: true
   harness: claude          # the summarizer; only claude is accepted until codex has run live
   timeout_seconds: 300     # 10-900
-  max_concurrent: 2        # 1-4 reports at once on the dashboard host
-  local_host_ids: []       # extra names this host answers to (host_id values)
+  max_concurrent: 2        # 1-4 open reports across the fleet
 ```
+
+Where it runs. The control plane is a container with neither the agents' session records nor a
+summarizer CLI, so it only queues the request (`POST /api/v1/sessions/{id}/summary/report`, operator,
+same-origin JSON; a durable `SummaryReportRequested` event). The session service on the host that owns the
+agent (`herdr-cp-sessions`, the same process that publishes snapshots) polls
+`POST /api/v1/host/summary-reports/claim` every 5 s with its host token (`host.json` `host_id`), runs
+`herdr-eng summary report` locally and posts the result to `.../result`. One job at a time per host. A
+request nobody claims within 90 s fails as `host_unreachable` (usually: that host's service has not been
+updated); a claimed job that never reports fails as `timeout`. Both leave the button usable for a retry.
 
 How it stays read-only:
 
-- It never resumes or prompts the target session. The dashboard host reads the session
-  record (`herdr-eng summary history`) and runs fixed-argv, read-only `git` in the
-  recorded worktree itself (`--no-optional-locks`, `core.fsmonitor=false`,
-  `--no-ext-diff`), then starts a fresh `claude -p` in an empty scratch directory with
-  **no tools**, `--no-session-persistence`, `--strict-mcp-config` and no Herdr pane
-  environment. The evidence is passed as quoted data; nothing in a transcript is executed.
-- The report must start with `# Session summary` and contain **Evidence coverage**,
-  otherwise it is discarded as `malformed_report`. It is redacted, capped at 60,000
-  characters and stored as a session event (`SummaryReportCompleted`), so it survives a
-  restart and is returned as `full_report` by `GET /api/v1/sessions/{id}/summary`.
-- One report per session at a time; a second click returns the running job. Runs are
-  background jobs (typically 20 s to a few minutes).
+- It never resumes or prompts the target session. The host reads the session record
+  (`herdr-eng summary history`) and runs fixed-argv, read-only `git` in the recorded worktree itself
+  (`--no-optional-locks`, `core.fsmonitor=false`, `--no-ext-diff`), then starts a fresh `claude -p` in an
+  empty scratch directory with **no tools**, `--no-session-persistence`, `--strict-mcp-config` and no Herdr
+  pane environment. The evidence is passed as quoted data; nothing in a transcript is executed.
+- The report must start with `# Session summary` and contain **Evidence coverage**, otherwise it is
+  discarded as `malformed_report`. The host validates it and the control plane validates and redacts it
+  again before storing it (capped at 60,000 characters) as a session event (`SummaryReportCompleted`), so
+  it survives a restart and is returned as `full_report` by `GET /api/v1/sessions/{id}/summary`.
+- One open report per session; a second click returns the running job.
+- The host endpoints use the ingest role, like snapshots: a host token is not bound to one host, so a
+  token holder could claim another host's job, the same trust the ingest path already has. A result is
+  only accepted for the request it names and the host that request was queued for.
 
 Limits (v1):
 
-- Only sessions whose record is on the **dashboard host** can be reported on. For any
-  other host the button answers `report_host_remote` and shows the exact
-  `herdr-eng summary report --agent … --session …` command to run there. Nothing opens a
-  connection from the dashboard to another machine.
-- The agent must have identified its conversation (`agent_session`). An idle Codex pane
-  that has not run a turn since it started has none yet, and the button says so.
-- The dashboard service must be able to run `claude` with working credentials, as the
-  user that owns the session records (`harness_missing` otherwise).
+- The agent must have identified its conversation (`agent_session`). An idle Codex pane that has not run
+  a turn since it started has none yet, and the button says so.
+- The host needs `herdr-eng` and `claude` on the session service's PATH (`~/.local/bin` is included) with
+  working Claude credentials for the user that owns the session records.
+- Roll the plugin (`deploy/deploy-fleet-agents.sh`) to every host that should be able to run reports.
 - `herdr-eng summary report --agent A --session ID [--harness claude]` prints the same
   result as JSON for use from a terminal.

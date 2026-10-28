@@ -5,9 +5,10 @@ import { realpathSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 import { basename } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
+import { createReportWorker, REPORT_POLL_MS } from "./report-worker.js";
 import { herdrBin } from "./enrich.js";
 import { hostIdentity } from "./emit.js";
-import { loadHostConfig, HostConfigUnavailable } from "./host-config.js";
+import { loadHostConfig, readHostJson, HostConfigUnavailable } from "./host-config.js";
 import { gitMetadata } from "./git-metadata.js";
 import { createInventoryReporter, createLoadReporter } from "./inventory.js";
 import { createModelResolver } from "./session-model.js";
@@ -227,7 +228,9 @@ export async function main(args = process.argv.slice(2), env = process.env, deps
   const { loadConfig = loadHostConfig, collect = collectSnapshot, fetcher = fetch, now = Date.now,
     sleep = (ms, signal) => delay(ms, undefined, { signal }).catch(() => {}),
     refreshMs = CONFIG_REFRESH_MS, inventoryEnvelope = createInventoryReporter(),
-    loadEnvelope = createLoadReporter() } = deps;
+    loadEnvelope = createLoadReporter(), reportPollMs = REPORT_POLL_MS,
+    reportWorker = () => { let hostId; try { hostId = readHostJson().hostId; } catch { /* no host.json: no worker */ }
+      return createReportWorker({ fetcher, hostId }); } } = deps;
   const dryRun = args.includes("--dry-run");
   const loopIndex = args.indexOf("--loop");
   const interval = loopIndex < 0 ? null : Number(args[loopIndex + 1]);
@@ -258,6 +261,14 @@ export async function main(args = process.argv.slice(2), env = process.env, deps
   const controller = new AbortController();
   const publish = createSnapshotPublisher({ fetcher, now });
   const stop = () => controller.abort();
+  // Full /summary reports for this host's agents are requested through the control plane and run here.
+  // Independent of the snapshot cadence so a request is picked up within seconds.
+  let reportTimer = null;
+  if (!dryRun && interval !== null) {
+    const tickReports = reportWorker();
+    reportTimer = setInterval(() => { tickReports(target).catch(() => {}); }, reportPollMs);
+    reportTimer.unref?.();
+  }
   process.once("SIGINT", stop);
   process.once("SIGTERM", stop);
   try {
@@ -280,6 +291,7 @@ export async function main(args = process.argv.slice(2), env = process.env, deps
       await sleep(interval * 1000, controller.signal);
     } while (!controller.signal.aborted);
   } finally {
+    if (reportTimer) clearInterval(reportTimer);
     process.removeListener("SIGINT", stop);
     process.removeListener("SIGTERM", stop);
   }
