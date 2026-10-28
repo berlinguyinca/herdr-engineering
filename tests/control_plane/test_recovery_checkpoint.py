@@ -288,3 +288,70 @@ def test_operator_builder_does_not_print_exception_secrets(monkeypatch, capsys):
     output = capsys.readouterr()
     assert "private-credentials" not in output.err + output.out
     assert "ValueError" in output.err
+
+
+def test_commit_during_build_is_uncovered_tail(db):
+    from herdr_engineering.control_plane.recovery_checkpoint import build_checkpoint
+
+    _insert(db, [_row("mission", "m", "MissionStarted", {"title": "first"}, 10)])
+
+    async def exercise():
+        builder, writer = await asyncpg.connect(db.dsn), await asyncpg.connect(db.dsn)
+
+        class ConcurrentWriter:
+            def __getattr__(self, name):
+                return getattr(builder, name)
+
+            async def execute(self, sql, *args):
+                if "INSERT INTO recovery_checkpoint_rows" in sql:
+                    await writer.execute("""
+                        INSERT INTO fabric_events (event_id, entity_type, entity_id, event_type,
+                            sequence, source_timestamp, ingest_timestamp, payload)
+                        VALUES ('during-build', 'mission', 'm', 'MissionStarted', 5,
+                                '2026-10-26T00:00:05Z', '2026-10-26T00:00:05Z', '{"title":"late"}')
+                    """)
+                return await builder.execute(sql, *args)
+        try:
+            return await build_checkpoint(ConcurrentWriter())
+        finally:
+            await builder.close()
+            await writer.close()
+    report = asyncio.run(exercise())
+    assert report["covered_events"] == report["selected_events"] == 1
+    expected, originals = _reference(db)
+    recovered, selected, metrics = _checkpoint_source(db)
+    assert metrics["tail_events"] == 1
+    assert _projections(recovered) == _projections(expected)
+    assert selected == originals
+
+
+def test_existing_reader_keeps_old_generation_during_successful_publication(db):
+    from herdr_engineering.control_plane.recovery_checkpoint import (
+        build_checkpoint,
+        load_checkpoint_events,
+    )
+
+    _insert(db, [_row("mission", "m", "MissionStarted", {"title": "first"}, 0)])
+    first = _build(db)
+
+    async def exercise():
+        reader, writer = await asyncpg.connect(db.dsn), await asyncpg.connect(db.dsn)
+        try:
+            async with reader.transaction(isolation="repeatable_read", readonly=True):
+                before, metrics = await load_checkpoint_events(reader)
+                assert len(before) == 1 and metrics["checkpoint_id"] == first["checkpoint_id"]
+                await writer.execute("""
+                    INSERT INTO fabric_events (event_id, entity_type, entity_id, event_type,
+                        sequence, source_timestamp, ingest_timestamp, payload)
+                    VALUES ('after-reader', 'mission', 'm', 'MissionStarted', 1, now(), now(), '{"title":"second"}')
+                """)
+                second = await build_checkpoint(writer)
+                after, same_metrics = await load_checkpoint_events(reader)
+                assert after == before and same_metrics["checkpoint_id"] == first["checkpoint_id"]
+            async with reader.transaction(isolation="repeatable_read", readonly=True):
+                latest, metrics = await load_checkpoint_events(reader)
+                assert len(latest) == 2 and metrics["checkpoint_id"] == second["checkpoint_id"]
+        finally:
+            await reader.close()
+            await writer.close()
+    asyncio.run(exercise())
