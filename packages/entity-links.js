@@ -24,6 +24,7 @@ export const ENTITY_ROUTES = {
   pr: (id, p) => `#/reviews${q({ search: id, ...p })}`,
   project: (id, p) => `#/github${q({ repository: id, ...p })}`,
   'llm-session': (id, p) => `#/llm/session/${enc(id)}${q(p)}`,
+  'intel-project': (id, p) => `#/intelligence${q({ project: id, ...p })}`,
 };
 export const ENTITY_KINDS = Object.keys(ENTITY_ROUTES);
 

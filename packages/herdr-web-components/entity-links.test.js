@@ -11,7 +11,8 @@ test('every kind builds the expected hash', () => {
   assert.equal(entityHref('review', 'r1'), '#/reviews?search=r1');
   assert.equal(entityHref('project', 'o/r'), '#/github?repository=o%2Fr');
   assert.equal(entityHref('llm-session', 'x y'), '#/llm/session/x%20y');
-  assert.equal(ENTITY_KINDS.length, 9);
+  assert.equal(entityHref('intel-project', 'p-binbase', { event: 'e 1' }), '#/intelligence?project=p-binbase&event=e+1');
+  assert.equal(ENTITY_KINDS.length, 10);
 });
 
 test('unknown kind, empty or overlong id give null', () => {

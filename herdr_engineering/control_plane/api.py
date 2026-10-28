@@ -693,6 +693,8 @@ class ControlPlaneServer:
             h["capabilities"].append("collab_v1")
         if getattr(self, "assistant", None) is not None and self.assistant.config.get("enabled"):
             h["capabilities"].append("assistant_v1")
+        if getattr(self, "intelligence", None) is not None and self.intelligence._cfg()[0]["enabled"]:
+            h["capabilities"].append("project_intelligence_v1")
         if self.architecture.enabled:
             h["capabilities"].append("architecture_v1")
             if self.architecture.explain_config:
