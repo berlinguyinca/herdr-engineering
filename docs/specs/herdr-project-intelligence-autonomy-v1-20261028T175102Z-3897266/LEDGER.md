@@ -134,3 +134,5 @@ Verified, no change needed: ingestion cannot write `pr_gate`/`ci_fix` streams; g
 Limitations: the gate only applies to branches named `herdr-ci-fix/*`; required checks are the checks present (main has no branch protection to compare with); commit signatures are not checked against trusted keys; the circuit breaker is in memory.
 ## Pass 5: proposal executor
 `intel_executor.py`: runs only with `enabled` + `execute` and no kill switch; atomic claim (second run refused); payload re-hashed; strict per-action schema; `link_entities` (human_verified relationship), `pause_ingestion`, `request_ci_repair` (existing CI-fix request, idempotent on proposal id) are wired; `propose_issue` needs a hook that does not exist yet.
+## Pass 5: approvers allowlist
+`project_intelligence.approvers` (YAML) gates approve/reject: 403 unless the acting principal is listed and not an open listener. Replaces the planned iPhone device-auth scheme (B4) for a single-operator tailnet. Not built: source-address pinning of approvals (the principal does not carry the remote address).

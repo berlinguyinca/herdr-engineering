@@ -237,6 +237,11 @@ class IntelligenceRoutes:
             if len(parts) == 3 and parts[0] == "proposals" and parts[2] in ("approve", "reject"):
                 if not cfg["suggest"] or cfg["kill_switch"]:
                     return 409, {"error": "proposals require the suggest flag and no kill switch"}
+                approvers = raw.get("approvers")
+                if (not isinstance(approvers, list) or actor not in [a for a in approvers if isinstance(a, str)]
+                        or principal.get("authenticated_by") == "open_listener"):
+                    # Only named principals decide. An absent list means nobody can; an open listener has no identity.
+                    return 403, {"error": "this principal is not in project_intelligence.approvers"}
                 known = self.board.get(parts[1], viewer.org_id)
                 if viewer.project_ids is not None and known.payload.get("project") not in viewer.project_ids:
                     return 404, {"error": "not found"}       # a project-scoped operator cannot act on another project's proposal

@@ -74,3 +74,6 @@ exact `payload_sha256` and `resource_version` it was shown. Proposals expire aft
 
 ## Egress gate scope
 `X-Herdr-Data-Class` is honoured only when the caller sends it. Untagged requests are not gated, so the gate protects cooperating callers (the assistant and intelligence tools), not a hostile one. A custom model is allowed only if the content may go to both its own route and the shared upstream.
+
+## Who may approve (single-operator tailnet)
+`control_plane.project_intelligence.approvers: [<principal id>, ...]` names the only principals that can approve or reject a proposal. Absent or empty means nobody can; an open listener never can (no identity). Give the approver key ONLY to your iPhone and Mac, keep it out of every agent's environment, and give agents a different key that can request but not approve. The tailnet keeps outsiders away; this list keeps agents on the tailnet from approving their own requests. Requests are already refused when the approver is the requester.
