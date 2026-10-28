@@ -6,6 +6,7 @@ reconciliation, idempotent registration and private-only addressing.
 """
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 import socket
@@ -81,6 +82,9 @@ def _normalize_routes(routes):
     return [Route(**r) if isinstance(r, dict) else r for r in (routes or [])]
 
 
+_LEASE_FIELDS = frozenset(f.name for f in dataclasses.fields(DevServiceLease))
+
+
 def _parse_leases(data: dict) -> dict[str, DevServiceLease]:
     """Parse a store payload into leases.
 
@@ -101,9 +105,12 @@ def _parse_leases(data: dict) -> dict[str, DevServiceLease]:
         d.setdefault("owner_repository", owner.get("repository"))
         d.setdefault("owner_worktree_id", owner.get("worktree_id"))
         d.setdefault("owner_process_id", owner.get("process_id"))
+        # A store written by a NEWER version may carry fields this version does not know. Keep the lease and ignore the
+        # extras: dropping it would empty the table on a rollback (and on an older standby mirroring a newer active).
+        d = {k: v for k, v in d.items() if k in _LEASE_FIELDS}
         try:
             lease = DevServiceLease(**d)
-        except TypeError:
+        except (TypeError, ValueError):
             continue  # skip malformed entries rather than losing the whole store
         leases[lease.id] = lease
     return leases
