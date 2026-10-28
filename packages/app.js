@@ -16,6 +16,7 @@ import { mountMissionCatalog } from './mission-catalog-view.js';
 import { mountOverview } from './overview-view.js';
 import { mountIntegrations } from './integrations-view.js';
 import { mountGithub } from './github-view.js';
+import { mountGithubProjects } from './github-projects-view.js';
 import { mountReviewGate } from './review-gate-view.js';
 import { mountTopology } from './topology-view.js';
 import { mountArtifacts, renderArtifactDetail } from './artifacts-view.js';
@@ -23,6 +24,7 @@ import { mountPublications } from './publications-view.js';
 import { mountHandoffs } from './handoffs-view.js';
 import { renderSchedulingView } from './scheduler-view.js';
 import { mountArchitecture } from './architecture-view.js';
+import { mountPersonalAssistant } from './personal-assistant-view.js';
 import { visibleNav } from './nav-capabilities.js';
 import { mountSessionsView, sessionEntries } from './sessions-view.js';
 import { recordOutcome, statusOutcome } from './record-state.js';
@@ -75,6 +77,7 @@ const NAV = [
   { path: '/services', label: 'Services' },
   { path: '/local-services', label: 'Local services' },
   { path: '/system-services', label: 'System services' },
+  { path: '/github/projects', label: 'Project boards' },
   { path: '/github', label: 'Projects' },
   { path: '/ci', label: 'CI' },
   { path: '/reviews', label: 'Reviews' },
@@ -88,6 +91,7 @@ const NAV = [
   { path: '/publications', label: 'Publications' },
   { path: '/handoffs', label: 'Handoffs' },
   { path: '/scheduling', label: 'Scheduling' },
+  { path: '/personal-assistant', label: 'Personal Assistant', capability: 'assistant_v1' },
 ];
 
 const SHELL = document.getElementById('shell');
@@ -132,6 +136,7 @@ function route() {
 const ROUTES = {
   '/overview': viewOverview,
   '/attention': viewAttention,
+  '/github/projects': viewGithubProjects,
   '/github': viewGithub,
   '/collab': viewCollab,
   '/artifacts': viewArtifacts,
@@ -155,6 +160,7 @@ const ROUTES = {
   '/services/:id': viewService,
   '/hosts': viewHosts,
   '/scheduling': viewScheduling,
+  '/personal-assistant': viewPersonalAssistant,
   '/hosts/:id': viewHost,
   '/activity': viewActivity,
   '/analytics': viewAnalytics,
@@ -214,6 +220,11 @@ async function viewPublications() {
 async function viewHandoffs() {
   const view = mountHandoffs(root, client);
   return { ...view, dispose() {} };
+}
+
+async function viewPersonalAssistant() {
+  root.innerHTML = '<div id="personal-assistant"></div>';
+  return { dispose: mountPersonalAssistant(root.querySelector('#personal-assistant'), client) };
 }
 
 async function viewScheduling() {
@@ -322,6 +333,12 @@ async function viewCollab() {
 
 async function viewGithub() {
   return ownPolling(mountGithub(root, client));
+}
+
+async function viewGithubProjects() {
+  // Read-only Projects v2 boards; keeps its own 5 s poll, live events refresh it too.
+  const query = route().query;
+  return mountGithubProjects(root, client, { project: query.get('project') || '', layout: query.get('layout') || 'board' });
 }
 
 async function viewReviewGate() {
