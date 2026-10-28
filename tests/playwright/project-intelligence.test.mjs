@@ -238,8 +238,12 @@ for (const [name, size, theme] of [['desktop light', [1280, 900], 'light'], ['de
         { id: 'r1', from: 'pr:acme/app#7', to: 'issue:acme/app#12', predicate: 'fixes', derivation: 'inferred', review_state: 'provisional', confidence: 0.9, evidence_refs: [EVIDENCE] }] }) }));
       await page.route('**/api/v1/intelligence/findings', (route) => route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ items: [
         { id: 'f1', statement: '[unverified] a claim', verified: false, evidence_refs: [] }] }) }));
+      await page.route('**/api/v1/intelligence/proposals', (route) => route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ items: [
+        { id: 'act_1', action: 'pause_ingestion', payload: { project: 'p-binbase', source: 'gmail' }, payload_sha256: 'f'.repeat(64), resource_version: 3,
+          requester: 'key:abc', state: 'awaiting_approval', expires_at: '2026-10-28T12:30:00+00:00' }] }) }));
       await page.goto(`${base}/#/intelligence`);
       await page.waitForSelector('.pi-item');
+      await page.waitForSelector('.pi-card');
       await page.locator('.pi-item[data-event="e2"]').click();
       await page.waitForSelector('#pi-related li');
       const f = [...await staticAudit(page, '#view'), ...await focusIndicatorAudit(page, '#view')];
@@ -248,3 +252,34 @@ for (const [name, size, theme] of [['desktop light', [1280, 900], 'light'], ['de
     });
   });
 }
+
+test('approval cards show the exact payload, send the bound hash and version, and report a conflict', async () => {
+  await withPage(async (page, base) => {
+    const posts = [];
+    let pending = [{ id: 'act_1', action: 'pause_ingestion', payload: { project: 'p-binbase', source: '<b>gmail</b>' }, payload_sha256: 'f'.repeat(64),
+      resource_version: 3, requester: 'key:abc', state: 'awaiting_approval', expires_at: '2026-10-28T12:30:00+00:00' }];
+    await stub(page);
+    await page.route('**/api/v1/intelligence/proposals**', (route) => {
+      const req = route.request();
+      if (req.method() === 'POST') {
+        posts.push({ url: new URL(req.url()).pathname, body: req.postDataJSON() });
+        if (posts.length === 1) return route.fulfill({ status: 409, contentType: 'application/json', body: JSON.stringify({ error: 'requester cannot approve their own proposal' }) });
+        pending = [];
+        return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ state: 'approved' }) });
+      }
+      return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ items: pending }) });
+    });
+    await page.goto(`${base}/#/intelligence`);
+    await page.waitForSelector('.pi-card');
+    assert.equal(await page.locator('.pi-card b').count(), 0, 'payload values are escaped');
+    assert.match(await page.locator('.pi-card').innerText(), /Pause ingestion[\s\S]*p-binbase/);
+    assert.match(await page.locator('.pi-approvals').innerText(), /Nothing runs automatically/);
+    await page.locator('button[data-act=approve]').click();
+    await page.waitForSelector('#pi-proposals [role=status]');
+    assert.match(await page.locator('#pi-proposals').innerText(), /own proposal/);
+    assert.deepEqual(posts[0], { url: '/api/v1/intelligence/proposals/act_1/approve', body: { payload_sha256: 'f'.repeat(64), resource_version: 3 } });
+    await page.locator('button[data-act=approve]').click();
+    await page.waitForSelector('text=Nothing is waiting for approval');
+    assert.equal(posts.length, 2);
+  });
+});

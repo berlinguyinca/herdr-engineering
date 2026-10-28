@@ -20,6 +20,7 @@ export const intelligenceStyles = `<style>.pi{--pi-ok:#0b6b3a;--pi-warn:#8a4b00;
 .pi-chip[data-tone=ok]{color:var(--pi-ok)}.pi-chip[data-tone=warn]{color:var(--pi-warn)}.pi-chip[data-tone=info]{color:var(--pi-info)}
 .pi-day{font-size:13px;font-weight:600;margin:14px 0 4px;color:var(--pi-muted)}.pi-pane{border:1px solid var(--border);border-radius:var(--radius);padding:12px 14px;min-width:0;overflow-wrap:anywhere}
 .pi-pane h2{font-size:15px;margin:0 0 8px}.pi-note{color:var(--pi-muted);font-size:13px}.pi-state{padding:18px 0;color:var(--pi-muted)}
+.pi-cards{list-style:none;margin:0;padding:0;display:grid;gap:10px}.pi-card{border:1px solid var(--border);border-radius:var(--radius);padding:10px 14px;overflow-wrap:anywhere}.pi-card dl{margin:6px 0}.pi-card dt{color:var(--pi-muted);font-size:12px}.pi-card dd{margin:0 0 4px}.pi-actions{display:flex;gap:8px;margin-top:8px}.pi-actions button{font:inherit;padding:6px 14px;border:1px solid var(--border);border-radius:var(--radius);background:transparent;color:inherit;cursor:pointer;min-height:32px}.pi-approvals h2{font-size:15px;margin:14px 0 6px}
 .pi-sup{text-decoration:line-through;opacity:.7}@media(max-width:720px){.pi-split{grid-template-columns:minmax(0,1fr)}}</style>`;
 
 const day = (iso) => String(iso || '').slice(0, 10) || 'unknown date';
@@ -76,6 +77,19 @@ export function renderFindings(items) {
   if (!f.length) return '<p class="pi-note">No findings are visible to you.</p>';
   return `<ul class="pi-rel">${f.map((x) => `<li>${esc(x.statement)} <span class="pi-chip" data-tone="${x.verified ? 'ok' : 'warn'}">${x.verified ? 'Evidence-backed' : 'Unverified'}</span>
 <span class="pi-note"> ${arr(x.evidence_refs).length} evidence ref${arr(x.evidence_refs).length === 1 ? '' : 's'}</span></li>`).join('')}</ul>`;
+}
+
+const ACTION = { request_ci_repair: 'Request a CI repair', propose_issue: 'Propose an issue', link_entities: 'Link two items', pause_ingestion: 'Pause ingestion' };
+
+export function renderProposals(items) {
+  const list = arr(items);
+  if (!list.length) return '<p class="pi-note">Nothing is waiting for approval.</p>';
+  return `<ul class="pi-cards">${list.map((p) => `<li class="pi-card"><strong>${esc(ACTION[p.action] || p.action)}</strong>
+<dl>${Object.entries(p.payload || {}).slice(0, 8).map(([k, v]) => `<dt>${esc(k)}</dt><dd>${esc(typeof v === 'string' ? v : JSON.stringify(v))}</dd>`).join('')}
+<dt>Requested by</dt><dd>${esc(p.requester)}</dd><dt>Expires</dt><dd><time datetime="${esc(p.expires_at)}">${esc(when(p.expires_at))}</time></dd></dl>
+<div class="pi-actions"><button type="button" data-act="approve" data-id="${esc(p.id)}" data-sha="${esc(p.payload_sha256)}" data-ver="${esc(p.resource_version)}">Approve</button>
+<button type="button" data-act="reject" data-id="${esc(p.id)}">Reject</button></div></li>`).join('')}</ul>
+<p class="pi-note">Approving records permission for exactly the payload shown. Nothing runs automatically in this release.</p>`;
 }
 
 export function mountProjectIntelligence(host, client, { query = new URLSearchParams(), setQuery, onFreshness = () => {} } = {}) {
@@ -143,6 +157,31 @@ ${arr(investigations).length ? `<label>Investigation<select id="pi-inv"><option 
 
   let findings = null;
   let relSeq = 0;
+  async function loadProposals(message = '') {
+    let html;
+    try {
+      const out = await client.getJson('/api/v1/intelligence/proposals');
+      html = renderProposals(out?.items);
+    } catch (err) {
+      html = `<p class="pi-note" role="alert">Could not load approvals (${esc(err.status || 'network')}).</p>`;
+    }
+    if (disposed) return;
+    const slot = host.querySelector('#pi-proposals');
+    if (!slot) return;
+    slot.innerHTML = `${message ? `<p class="pi-note" role="status">${esc(message)}</p>` : ''}${html}`;
+    slot.querySelectorAll('button[data-act]').forEach((b) => {
+      b.onclick = async () => {
+        b.disabled = true;
+        const body = b.dataset.act === 'approve' ? { payload_sha256: b.dataset.sha, resource_version: Number(b.dataset.ver) } : {};
+        try {
+          await client.request(`/api/v1/intelligence/proposals/${encodeURIComponent(b.dataset.id)}/${b.dataset.act}`, { method: 'POST', body });
+          loadProposals(b.dataset.act === 'approve' ? 'Approved.' : 'Rejected.');
+        } catch (err) {
+          loadProposals(`Not done: ${err.status === 409 ? (err.message || 'conflict') : `error ${err.status || 'network'}`}`);
+        }
+      };
+    });
+  }
   async function loadRelated(ref) {
     const mine = ++relSeq;
     let html;
@@ -176,6 +215,10 @@ ${arr(investigations).length ? `<label>Investigation<select id="pi-inv"><option 
     const html = `<div class="pi-split"><div>${renderTimeline(timeline, state.event)}</div><aside class="pi-pane" aria-label="Event details" aria-live="polite">${renderDetail(sel)}</aside></div>`;
     if (!el) return;
     el.outerHTML = html;
+    if (!host.querySelector('.pi-approvals')) {
+      host.querySelector('.pi-bar').insertAdjacentHTML('afterend', '<section class="pi-approvals" aria-label="Awaiting approval"><h2>Awaiting approval</h2><div id="pi-proposals" aria-live="polite"><p class="pi-note">Loading approvals…</p></div></section>');
+      loadProposals();
+    }
     if (!host.querySelector('.pi-findings')) {
       host.querySelector('.pi').insertAdjacentHTML('beforeend', `<section class="pi-findings" aria-label="Findings"><h2>Findings</h2><div id="pi-findings">${findings === null ? '<p class="pi-note">Loading findings…</p>' : renderFindings(findings)}</div></section>`);
       if (findings === null) loadFindings();
