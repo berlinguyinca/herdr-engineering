@@ -390,7 +390,26 @@ def _build_parser() -> argparse.ArgumentParser:
                     help="opt-in: rewrite loopback URLs in Location / CORS / cookie-domain "
                          "headers of HTTP leases to the fabric address (forces "
                          "Connection: close; bodies and websockets are untouched)")
+    p2.add_argument("--tls-cert", default=None, help="serve HTTPS on every leased port with this certificate "
+                    "(same port as HTTP; issue one with `devfabric ca issue`)")
+    p2.add_argument("--tls-key", default=None, help="private key for --tls-cert")
     p2.set_defaults(func=_cmd_dev_gateway)
+    p2 = dsub.add_parser("ca", help="private CA for the fabric's HTTPS (dev.lan)")
+    casub = p2.add_subparsers(dest="ca_cmd", required=True)
+    for name, helptext in (("init", "create the name-constrained root CA"),
+                           ("issue", "issue the gateway's server certificate"),
+                           ("export", "write the root for device enrollment (.pem and iOS .mobileconfig)"),
+                           ("status", "show the CA, its fingerprint and certificate expiry")):
+        q = casub.add_parser(name, help=helptext)
+        q.add_argument("--dir", default=None, help="CA directory (default: ~/.config/herdr-engineering/ca)")
+        if name == "init":
+            q.add_argument("--domain", action="append", help="fabric domain the CA may sign (default: dev.lan)")
+        if name == "issue":
+            q.add_argument("--name", action="append", help="DNS name for the certificate "
+                           "(default: dev.lan and *.dev.lan)")
+        if name == "export":
+            q.add_argument("--out", default=".", help="directory to write fabric-ca.pem / fabric-ca.mobileconfig")
+        q.set_defaults(func=_cmd_dev_ca)
     p2 = dsub.add_parser(
         "agent",
         help="auto-register this host's web services with the gateway")
@@ -1974,6 +1993,49 @@ def _cmd_dev_list(args) -> int:
     return 0
 
 
+def _ca_dir(args):
+    from pathlib import Path
+    return Path(args.dir).expanduser() if args.dir else Path.home() / ".config" / "herdr-engineering" / "ca"
+
+
+def _cmd_dev_ca(args) -> int:
+    from .fabric_tls import CAError, PrivateCA, fingerprint_sha256
+    ca = PrivateCA(_ca_dir(args))
+    try:
+        if args.ca_cmd == "init":
+            path = ca.init(args.domain or ["dev.lan"])
+            _print_json({"ok": True, "ca": str(path), "domains": ca.domains(),
+                         "sha256": fingerprint_sha256(path),
+                         "next": "devfabric ca issue, then devfabric ca export and enroll each device"})
+        elif args.ca_cmd == "issue":
+            names = args.name or [d for dom in ca.domains() for d in (dom, f"*.{dom}")]
+            cert, key = ca.issue(names)
+            _print_json({"ok": True, "cert": str(cert), "key": str(key), "names": names,
+                         "expires": ca.expires(cert).isoformat(),
+                         "next": f"run the gateway with --tls-cert {cert} --tls-key {key}"})
+        elif args.ca_cmd == "export":
+            from pathlib import Path
+            out = Path(args.out).expanduser()
+            out.mkdir(parents=True, exist_ok=True)
+            pem, prof = out / "fabric-ca.pem", out / "fabric-ca.mobileconfig"
+            pem.write_text(ca.cert_path.read_text())
+            prof.write_bytes(ca.mobileconfig())
+            _print_json({"ok": True, "pem": str(pem), "mobileconfig": str(prof),
+                         "sha256": fingerprint_sha256(ca.cert_path),
+                         "note": "public certificate only; the CA key never leaves its directory"})
+        else:
+            gw = ca.dir / "gateway.pem"
+            _print_json({"ca": ca.exists(), "domains": ca.domains(),
+                         "sha256": fingerprint_sha256(ca.cert_path) if ca.exists() else None,
+                         "gateway_cert": str(gw) if gw.exists() else None,
+                         "gateway_expires": ca.expires(gw).isoformat() if gw.exists() else None,
+                         "renewal_due": ca.needs_renewal(gw) if gw.exists() else None})
+    except CAError as exc:
+        _print_json({"ok": False, "error": str(exc)})
+        return 1
+    return 0
+
+
 def _cmd_dev_gateway(args) -> int:
     import signal
     import time
@@ -2004,14 +2066,26 @@ def _cmd_dev_gateway(args) -> int:
         probe_interval=float(cfg.get("probe_interval_seconds", 15)),
         reset_lock=bool(getattr(args, "reset_lock", False)),
         rewrite_headers=bool(getattr(args, "rewrite_headers", False)))
+    tls_cert = getattr(args, "tls_cert", None) or cfg.get("tls_cert")
+    tls_key = getattr(args, "tls_key", None) or cfg.get("tls_key")
+    if bool(tls_cert) != bool(tls_key):
+        raise SystemExit("--tls-cert and --tls-key must be given together")
+    if tls_cert:
+        import ssl as _ssl
+        ctx = _ssl.SSLContext(_ssl.PROTOCOL_TLS_SERVER)
+        ctx.minimum_version = _ssl.TLSVersion.TLSv1_2
+        ctx.load_cert_chain(tls_cert, tls_key)
+        ctx.set_alpn_protocols(["http/1.1"])
+        gateway.enable_tls(ctx)
     gateway.start()
     _print_json({
-        "ok": True, "gateway": True,
+        "ok": True, "gateway": True, "https": bool(tls_cert),
         "control_url": f"http://{gateway.control_host}:{control_port}",
         "url_base": gateway.url_base,
         "bind_hosts": bind_hosts,
         "probe_interval_seconds": gateway.probe_interval,
-        "note": f"dev:<port> resolves to http://{gateway.url_base}:<port>",
+        "note": f"dev:<port> resolves to {gateway.public_scheme}://{gateway.url_base}:<port>"
+                f"{' (plain http also accepted on the same port)' if tls_cert else ''}",
     })
     stop = {"flag": False}
 

@@ -22,10 +22,12 @@ from __future__ import annotations
 import json
 import os
 import socket
+import ssl
 import threading
 import time
 import urllib.request
 import uuid
+from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -150,6 +152,9 @@ class GatewayRouter:
 
     def __init__(self, bind_hosts: list[str]) -> None:
         self._bind_hosts = [h for h in bind_hosts if h]
+        # HTTPS on the SAME port as plain HTTP: the first byte of a connection says which (0x16 = TLS handshake).
+        self.tls_context: ssl.SSLContext | None = None
+        self.external_for: Callable[[int], str | None] = lambda port: None   # set by the gateway
         self._listeners: dict[int, list[socket.socket]] = {}
         self._accept_threads: dict[int, list[threading.Thread]] = {}
         self._lock = threading.RLock()
@@ -198,12 +203,62 @@ class GatewayRouter:
             except OSError:
                 break
             threading.Thread(target=self._proxy_one,
-                             args=(client, target_host, target_port, routes, rewrite),
+                             args=(client, target_host, target_port, routes, rewrite, port),
                              daemon=True).start()
+
+    def set_tls(self, context: ssl.SSLContext | None) -> None:
+        """Install (or, with None, remove) the server context. New connections use it at once; open ones are unaffected."""
+        self.tls_context = context
+
+    def _terminate_tls(self, client: socket.socket) -> tuple[socket.socket | None, bool]:
+        """Return (socket, is_tls). A handshake that fails drops the connection: plaintext is never offered on it."""
+        ctx = self.tls_context
+        if ctx is None:
+            return client, False
+        try:
+            client.settimeout(5.0)
+            first = client.recv(1, socket.MSG_PEEK)
+            if first != b"\x16":
+                client.settimeout(None)
+                return client, False
+            tls = ctx.wrap_socket(client, server_side=True)
+            tls.settimeout(None)
+            return tls, True
+        except (OSError, ssl.SSLError):
+            try:
+                client.close()
+            except OSError:
+                pass
+            return None, False
 
     def _proxy_one(self, client: socket.socket, target_host: str,
                    target_port: int, routes: list | None = None,
-                   rewrite: str | None = None) -> None:
+                   rewrite: str | None = None, port: int | None = None) -> None:
+        client, tls = self._terminate_tls(client)
+        if client is None:
+            return
+        if tls and not routes:
+            external = self.external_for(port) if port is not None else None
+            target = None
+            try:
+                target = socket.create_connection((target_host, target_port), timeout=5)
+                from .devfabric import rewriting_pipe
+                try:
+                    peer = client.getpeername()[0]
+                except OSError:
+                    peer = None
+                rewriting_pipe(client, target, target_port, external or rewrite or f"{target_host}:{port}",
+                               tls=True, rewrite_head=external is not None, forwarded_for=peer)
+            except OSError:
+                pass
+            finally:
+                for s in (client, target):
+                    if s is not None:
+                        try:
+                            s.close()
+                        except OSError:
+                            pass
+            return
         if rewrite and not routes:
             target = None
             try:
@@ -479,7 +534,17 @@ class FabricGateway:
                 "url": self.stable_url(port) if lease else None}
 
     def stable_url(self, port: int) -> str:
-        return f"http://{self.url_base}:{port}"
+        return f"{self.public_scheme}://{self.url_base}:{port}"
+
+    def enable_tls(self, context: ssl.SSLContext) -> None:
+        """Serve HTTPS on every leased port (same port as HTTP) and advertise https URLs."""
+        self.router.external_for = lambda port: f"{self.url_base}:{port}"
+        self.router.set_tls(context)
+        self.public_scheme = "https"
+
+    def disable_tls(self) -> None:
+        self.router.set_tls(None)
+        self.public_scheme = "http"
 
     def op_resolve_loopback(self, port: int, from_machine: str | None = None,
                             service: str | None = None) -> dict[str, Any]:
