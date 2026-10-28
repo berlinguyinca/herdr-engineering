@@ -73,6 +73,15 @@ def test_disabled_feature_returns_503():
         svr.shutdown()
 
 
+def test_assistant_config_kwarg_builds_enabled_assistant():
+    # Regression: the server must honour the assistant_config kwarg (the fleet
+    # config's personal_assistant section). A prior shadowing bug always built it
+    # disabled regardless of this kwarg.
+    repo = ControlPlaneRepo()
+    svr = ControlPlaneServer(repo, assistant_config={"personal_assistant": {"enabled": True}})
+    assert svr.assistant.config["enabled"] is True
+
+
 def test_enabled_capability_advertised(server):
     status, body = server.get("/api/v1/health")
     assert status == 200
