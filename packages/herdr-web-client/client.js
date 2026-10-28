@@ -45,6 +45,12 @@ export class HerdrClient {
         (json && json.error) || `HTTP ${res.status}`);
       error.requestId = res.headers?.get?.('X-Request-ID') || '';
       error.elapsedMs = Date.now() - startedAt;
+      const retryAfter = res.headers?.get?.('Retry-After');
+      if (retryAfter != null && retryAfter.trim() !== '') {
+        const seconds = Number(retryAfter);
+        const delay = Number.isFinite(seconds) ? seconds * 1000 : Date.parse(retryAfter) - Date.now();
+        if (Number.isFinite(delay)) error.retryAfterMs = Math.max(0, delay);
+      }
       throw error;
     }
     if (json && typeof json === 'object' && !Array.isArray(json)) {

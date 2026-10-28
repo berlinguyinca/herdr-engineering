@@ -1145,7 +1145,7 @@ export function mountCollab(root, { fabricSessions = null, onFreshness = () => {
       WB.busy = true; WB.error = null; WB.steerError = null; WB.notice = null; drawLineage(true);
       try { await fn(); if (done) WB.notice = done; } catch (e) {
         if (steer) WB.steerError = wbWhy(e, 'The request failed.'); else WB.error = wbWhy(e, 'The request failed.');
-      } finally { WB.busy = false; }
+      } finally { WB.busy = false; if (alive) drawLineage(true); }
       await loadWorkbench(true);                                      // refresh the lists but keep the message just shown
     }
     const wbKey = () => `web-wb-${Date.now().toString(36)}-${randomString(9)}`;

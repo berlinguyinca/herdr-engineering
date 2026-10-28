@@ -22,6 +22,9 @@ export async function openMention(page) {
 /** The log starts as "No messages yet." and fills when the first poll answers: a state audited before that has two text nodes, not thirty. */
 export const logLoaded = (page) => page.locator('#hcn-empty').waitFor({ state: 'detached' });
 export async function chatReady(page) {
+  // People can populate @ suggestions before the first room snapshot arrives;
+  // the seeded conversation must also be present before auditing its editor.
+  await logLoaded(page);
   await openMention(page);
   await page.keyboard.press('Escape');
   await page.locator('textarea.conversation-input').fill('');

@@ -13,7 +13,7 @@ from herdr_engineering.control_plane.api import ControlPlaneServer
 from herdr_engineering.control_plane.artifact_acl import ArtifactAcl
 from herdr_engineering.control_plane.artifact_adapter import SyncArtifactAdapter
 from herdr_engineering.control_plane.artifacts import ArtifactStore
-from herdr_engineering.control_plane.db import Migrator
+from herdr_engineering.control_plane.db import MIGRATION_ALIASES, Migrator
 from herdr_engineering.control_plane.repo import ControlPlaneRepo
 from tests.control_plane.test_artifact_access import call
 
@@ -56,6 +56,18 @@ def test_upload_catalog_acl_and_bytes_survive_http_server_restart():
         conn = await asyncpg.connect(DSN, server_settings={'search_path': schema})
         return ArtifactStore(conn, blobs)
 
+    async def legacy_receipt_upgrade():
+        conn = await asyncpg.connect(DSN, server_settings={'search_path': schema})
+        try:
+            # Reproduce a deployed database that has the old receipts and live
+            # artifact rows before the migration files were renumbered.
+            await conn.execute('DELETE FROM schema_migrations WHERE version=ANY($1::text[])',
+                               list(MIGRATION_ALIASES))
+            applied = await Migrator(conn).apply(str(Path(__file__).parents[2] / 'deploy/control-plane/migrations'))
+            assert set(applied) == set(MIGRATION_ALIASES)
+        finally:
+            await conn.close()
+
     async def cleanup():
         conn = await asyncpg.connect(DSN)
         try:
@@ -67,6 +79,8 @@ def test_upload_catalog_acl_and_bytes_survive_http_server_restart():
     artifact_id = None
     try:
         for restart in range(2):
+            if restart:
+                asyncio.run(legacy_receipt_upgrade())
             adapter = SyncArtifactAdapter(factory)
             acl = ArtifactAcl(on_change=lambda action, payload: adapter('record_acl_event', action, payload))
             acl.load(adapter('load_acl'))

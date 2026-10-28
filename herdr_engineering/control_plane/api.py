@@ -1225,9 +1225,14 @@ def _make_handler(server, public=False, operator=False):
                 self._request_cause = type(exc).__name__
                 raise
             finally:
+                elapsed_ms = (time.monotonic() - self._request_started) * 1000
                 server.request_metrics.record(self.path,
-                    (time.monotonic() - self._request_started) * 1000,
-                    self._response_status, self._request_cause)
+                    elapsed_ms, self._response_status, self._request_cause, self._request_id)
+                route = server.request_metrics.route(self.path)
+                if route is not None and (self._response_status >= 500 or elapsed_ms >= 2000):
+                    log.warning('request id=%s route=%s status=%s duration_ms=%.2f cause=%s',
+                                self._request_id, route, self._response_status,
+                                elapsed_ms, self._request_cause or 'unknown')
 
         def send_response(self, code, message=None):
             self._response_status = code
@@ -2008,11 +2013,23 @@ def _make_handler(server, public=False, operator=False):
                     if not etype or not eid:
                         return self._json(
                             {"error": "entity_type and entity_id required"}, 400)
+                    query = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
+                    if "limit" in query or "before" in query:
+                        try:
+                            for key in ("limit", "before"):
+                                if key in query and len(query[key]) != 1:
+                                    raise ValueError(f"{key} must be supplied once")
+                            raw_limit = query.get("limit", ["50"])[0]
+                            if not re.fullmatch(r"[0-9]{1,3}", raw_limit):
+                                raise ValueError("limit must be an integer between 1 and 200")
+                            page = r.stream_page(etype, eid, limit=int(raw_limit),
+                                                 before=query.get("before", [None])[0])
+                        except ValueError as exc:
+                            return self._json({"error": str(exc)},
+                                              409 if str(exc) == "staleHistoryCursor" else 400)
+                        return self._json(page)
                     return self._json({"events": r.stream(etype, eid)})
             if resource == "artifacts" and len(parts) > 5 and parts[5] == "download":
-                if (server.artifact_acl is not None and
-                        not server.artifact_acl.can(parts[4], self._principal(), "read")):
-                    return self._json({"error": "not found"}, 404)
                 data = r.get_artifact_data(parts[4])
                 a = r.get_artifact(parts[4])
                 if a is None and server.artifact_store is not None:

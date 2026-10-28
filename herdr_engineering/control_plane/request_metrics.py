@@ -2,6 +2,7 @@
 import math
 import threading
 from collections import Counter, deque
+from datetime import UTC, datetime
 
 
 class RequestMetrics:
@@ -10,6 +11,7 @@ class RequestMetrics:
         self._routes = {}
         self._requests = self._slow = 0
         self._total_ms = 0.0
+        self._recent = deque(maxlen=50)
 
     @staticmethod
     def route(path):
@@ -28,7 +30,7 @@ class RequestMetrics:
             resource = 'other'
         return '/api/v1/' + resource + '/:id' * min(4, len(parts) - 3)
 
-    def record(self, path, elapsed_ms, status=200, cause=None):
+    def record(self, path, elapsed_ms, status=200, cause=None, request_id=None):
         route = self.route(path)
         if route is None:
             return
@@ -43,6 +45,10 @@ class RequestMetrics:
             item['timeouts'] += int(cause in {'TimeoutError', 'TimeoutExpired'})
             item['samples'].append(elapsed_ms)
             item['statuses'][str(status)] += 1
+            if status >= 400 or elapsed_ms >= 2000:
+                self._recent.append({'request_id': request_id, 'route': route,
+                    'status': status, 'elapsed_ms': round(elapsed_ms, 2),
+                    'cause': cause, 'at': datetime.now(UTC).isoformat()})
 
     def snapshot(self):
         with self._lock:
@@ -58,4 +64,5 @@ class RequestMetrics:
                 }
             return {'requests': self._requests, 'slow_requests': self._slow,
                     'total_ms': round(self._total_ms, 2), 'by_route': routes,
+                    'recent_requests': [dict(item) for item in self._recent],
                     'by_path': {route: item['count'] for route, item in routes.items()}}

@@ -2,6 +2,7 @@
 // when the page may be out of date: a quiet fleet sends no events, so while the live stream is in
 // contact (its keepalive arrives every ~10 s) an old refresh is still current. Without stream
 // contact the chip goes amber past 2x interval since the last refresh.
+import { loadingProgress } from './motion.js';
 
 // The server's idle keepalive cadence is 10 s; two and a half periods of silence mean the stream is gone.
 export const STREAM_SILENCE_MS = 25000;
@@ -84,7 +85,10 @@ export class HerdrFreshness extends Base {
     let text = state === 'error' ? `error · ${this._error} · ${ago}` : state === 'stale' ? `stale · ${ago}` : age == null ? 'waiting for first update' : `live · ${ago}`;
     if (this._detail) text += ` · ${this._detail}`;
     if (state !== this._state) { this._state = state; this.setAttribute('data-state', state); }
-    if (text !== this._text) { this._text = text; this.textContent = text; }
+    if (text !== this._text) {
+      this._text = text; this.textContent = text;
+      if (this._last == null && this._error == null) this.insertAdjacentHTML('beforeend', loadingProgress('first update'));
+    }
   }
 }
 

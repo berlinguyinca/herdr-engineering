@@ -15,6 +15,7 @@ def test_metrics_bound_route_cardinality_and_preserve_failure_causes():
     assert route['latency_ms']['p95'] == 25
     assert snapshot['slow_requests'] == 1
     assert 'secret' not in str(snapshot)
+    assert snapshot['recent_requests'][-1]['cause'] == 'TimeoutError'
 
 
 def test_slow_does_not_fabricate_a_timeout_and_stream_duration_is_excluded():
@@ -94,7 +95,8 @@ def test_backend_timeout_remains_visible_when_api_returns_an_error_response():
         conn.request('GET', '/api/v1/sessions')
         response = conn.getresponse()
         assert response.status == 500
-        assert response.getheader('X-Request-ID')
+        request_id = response.getheader('X-Request-ID')
+        assert request_id
         response.read()
     finally:
         conn.close()
@@ -103,3 +105,6 @@ def test_backend_timeout_remains_visible_when_api_returns_an_error_response():
     route = server.request_metrics.snapshot()['by_route']['/api/v1/sessions']
     assert route['errors'] == 1
     assert route['timeouts'] == 1
+    recent = server.request_metrics.snapshot()['recent_requests'][-1]
+    assert recent['request_id'] == request_id
+    assert recent['cause'] == 'TimeoutError'

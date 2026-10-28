@@ -1,5 +1,12 @@
 // Shared dashboard request state: preserve useful causes across independent panels.
 
+export function requestErrorDetail(error) {
+  const elapsed = Number(error?.elapsedMs);
+  const duration = Number.isFinite(elapsed) && elapsed > 0 ? ` after ${(elapsed / 1000).toFixed(1)}s` : '';
+  const requestId = error?.requestId || error?.request_id;
+  return `${error?.message || 'Request failed'}${duration}${requestId ? ` · Request ${requestId}` : ''}`;
+}
+
 export function classifyDashboardError(error, elapsedMs = 0) {
   const status = Number(error?.status || error?.response?.status || 0);
   const message = String(error?.message || '').toLowerCase();

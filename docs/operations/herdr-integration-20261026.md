@@ -57,7 +57,13 @@ be verified through actual authentication, without exposing credentials.
 - API/resource reconciliation: 58 tests passed before the nested ACL regression
   test was added; the nested ACL test then failed and passed after its fix.
 - Request metrics and saturation behavior: three tests passed.
-- Full Python suite is running; completion is not yet established.
+- The second broad Python run completed: 7,135 passed, two failed, 65 skipped,
+  two xfailed. Both failures exposed the same obsolete download ACL guard,
+  which passed a structured principal into the artifact ACL. The guard was
+  removed because the enclosing resource guard already enforces the correct
+  stable artifact principal. Subsequent artifact-family checks passed 103 tests,
+  API checks passed 63, and real Postgres checks passed ten. The broad command
+  itself is not reported as green.
 - Integration has not been deployed.
 
 ## Full-history benchmark
@@ -83,3 +89,22 @@ concern and the deployment readiness deadline must accommodate measured replay.
   without fabricated mission/session identities.
 
 The active goal remains incomplete until every acceptance gate is verified.
+
+## History and diagnostics verification
+
+- Event-history reads now support bounded cursor pages without changing the
+  legacy unpaginated API contract. Cursor boundaries survive appends and reject
+  pruning or changed anchors explicitly; duplicate sequence numbers do not
+  omit events. Mission and session histories load independently of detail data.
+- Older history remains selected during live updates, with explicit navigation
+  back to the newest events. Slow reads expose an indeterminate progress bar;
+  errors retain the displayed history, request identity, and retry controls.
+- History pagination, durable handoff transitions, and request diagnostics:
+  44 tests passed (`/tmp/herdr-history-handoff-metrics-final.log`).
+- History browser checks: three passed
+  (`/tmp/herdr-history-ui-final.log`); existing mission/session detail integration
+  checks also passed five tests.
+- The full JavaScript run found nine failures among 983 tests; UI gates found
+  four among 268. Repairs and focused rechecks are in progress. Analytics
+  rendering was correct: Cache-write occupies column five and Failed column six.
+  Tests must resolve semantic headers rather than rely on the old column index.

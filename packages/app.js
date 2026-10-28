@@ -7,7 +7,7 @@ import { createRefreshBus } from './refresh-bus.js';
 import { formatTimestamp, formatDuration } from './herdr-web-components/format.js';
 import { escapeHtml as esc } from './herdr-web-components/util.js';
 import { defineComponents } from './herdr-web-components/index.js';
-import { describeEvent, missionSubtitle, sessionSummary } from './herdr-web-components/humanize.js';
+import { missionSubtitle, sessionSummary } from './herdr-web-components/humanize.js';
 import { mountInspector } from './inspector-view.js';
 import { mountSessionWorkspace } from './session-workspace.js';
 import { mountTerminalAttach } from './terminal-attach.js';
@@ -27,7 +27,7 @@ import { mountHosts, loadHosts } from './hosts-view.js';
 import { mountHostDetail, loadHostDetail } from './host-detail-view.js';
 import { mountActivity, loadActivity } from './activity-view.js';
 import { mountAnalytics, loadAnalytics } from './analytics-view.js';
-import { morph, patchList, patchText } from './patch.js';
+import { morph, patchText } from './patch.js';
 import { flash, skeleton } from './motion.js';
 import { noteStreamContact, freshnessSources } from './freshness.js';
 import { mountServices, mountServiceDetails } from './services-view.js';
@@ -42,6 +42,7 @@ import { mountPublications } from './publications-view.js';
 import { mountHandoffs } from './handoffs-view.js';
 import { mountScheduling } from './scheduler-view.js';
 import { classifyDashboardError, dashboardErrorMessage } from './dashboard-load-state.js';
+import { mountEventHistory } from './event-history.js';
 
 // Cache of { [mission_id]: title } so activity/session text can resolve
 // cryptic mission ids to their human names. Fetched lazily, best-effort.
@@ -431,7 +432,8 @@ async function viewMission(parts, revision) {
   const story = mountMissionStory(document.getElementById('mission-story'), client, key);
   const relatedDispose = showRelated('mission', key, null, relatedIntegrationLinks(m,'mission',key));
   const disposeLive = key.startsWith('pi:') ? mountMissionActivity(document.getElementById('live-mission-detail'), client, key, { onStatus }) : null;
-  const disposeMission = combineDisposers(story?.dispose, relatedDispose, disposeLive);
+  let recordedEvents = null;
+  const disposeMission = combineDisposers(story?.dispose, relatedDispose, disposeLive, () => recordedEvents?.dispose());
   const history = document.getElementById('mission-history');
   let pending = false;
   let shownTimeline = [null, ''];
@@ -442,7 +444,8 @@ async function viewMission(parts, revision) {
       const m = initial || await client.getMission(key);
       const sessions = (m.sessions || []).length;
       const scope = m.purpose || m.cwd || m.title;
-      const [sessionsHtml, streamHtml] = await Promise.all([missionSessions(m), streamList('mission', missionKey(m))]);
+      const sessionsHtml = await missionSessions(m);
+      const streamHtml = recordedEvents?.html() || '<p class="hd-card__sub">Loading recorded events…</p>';
       if (revision !== renderRevision || !history.isConnected) return;
       // Morphed in place: identical data writes nothing and open disclosures stay open.
       morph(history, `<h2>Recorded history</h2>
@@ -460,6 +463,12 @@ async function viewMission(parts, revision) {
     <details class="hd-card" data-history-panel="sessions"><summary>Recorded agents · ${sessions}</summary>${sessionsHtml}</details>
     <details class="hd-card" data-history-panel="timeline"><summary>Timeline</summary><herdr-timeline id="mission-timeline"></herdr-timeline></details>
     <details class="hd-card" data-history-panel="events"><summary>Event stream</summary><div id="mission-stream">${streamHtml}</div></details>`);
+
+      if (!recordedEvents) {
+        recordedEvents = mountEventHistory(history.querySelector('#mission-stream'), client,
+          'mission', missionKey(m), {missionTitles,
+            onStatus: (ok, message) => ok ? sources.ok('events') : sources.fail('events', message)});
+      } else void recordedEvents.refresh();
 
       const timelineElement = history.querySelector('#mission-timeline');
       let items = [];
@@ -779,7 +788,8 @@ async function viewSession(parts, revision) {
     // The chip follows the two reads this page refreshes: the agent record and its recorded events.
     const sources = freshnessSources(chipIn(root));
     sources.ok('agent');
-    streamItems('session',s.session_id).then(items=>{if(stream.isConnected && revision===renderRevision){paintStream(stream,items,{initial:true});sources.ok('events');}}).catch((error)=>{if(stream.isConnected){stream.innerHTML='<span class="muted">Recorded events could not load.</span>';sources.fail('events',`Recorded events: ${error.message || 'request failed'}`);}});
+    const recordedEvents = mountEventHistory(stream, client, 'session', s.session_id,
+      {missionTitles, onStatus: (ok, message) => ok ? sources.ok('events') : sources.fail('events', message)});
     // The page streams its own detail; a live event refreshes the recorded event list (new events
     // are appended) and the head status line, in place.
     return {
@@ -788,20 +798,17 @@ async function viewSession(parts, revision) {
         headRequest?.abort();
         const request = new AbortController(); headRequest = request;
         const failed = (source, label) => (error) => { if (!request.signal.aborted) sources.fail(source, `${label}: ${error?.message || 'request failed'}`); return null; };
-        const [items, latest] = await Promise.all([
-          streamItems('session', s.session_id).catch(failed('events', 'Recorded events')),
-          client.getSession(id, { signal: request.signal }).catch(failed('agent', 'Agent')),
-        ]);
+        void recordedEvents.refresh();
+        const latest = await client.getSession(id, { signal: request.signal }).catch(failed('agent', 'Agent'));
         if (headRequest === request) headRequest = null;
         if (!stream.isConnected || request.signal.aborted) return;
-        if (items) { paintStream(stream, items); sources.ok('events'); }
         if (latest) sources.ok('agent');
         if (!latest || !head.isConnected) return;
         // A heartbeat moves the report time only; the head flashes when the status itself changes.
         patchText(head.querySelector('[data-session-updated]'), formatTimestamp(latest.updated_at));
         if (patchText(head.querySelector('[data-session-status]'), sessionStatusText(latest))) flash(head);
       },
-      dispose() { headRequest?.abort(); disposeSession(); },
+      dispose() { headRequest?.abort(); recordedEvents.dispose(); disposeSession(); },
     };
   } catch (error) {
     if (revision !== renderRevision) return;
@@ -945,39 +952,6 @@ async function viewLlmSession(parts, revision) {
   return NO_REFRESH;
 }
 
-const NO_STREAM_EVENTS = '<herdr-empty message="No events for this entity yet"></herdr-empty>';
-
-// Recorded events for one entity as keyed cards ({key, html}); keyed by sequence so a refresh
-// keeps the cards already shown (morph pairs data-key, patchList appends only the new ones).
-async function streamItems(entityType, entityId) {
-  const { events } = await client.request(
-    `/api/v1/events?entity_type=${encodeURIComponent(entityType)}&entity_id=${encodeURIComponent(entityId)}`);
-  if (!events.length) return [];
-  const t = titles(await missionTitles());
-  return events.map((e) => {
-    const d = describeEvent(e, { missionTitles: t });
-    const key = String(e.sequence ?? e.event_id ?? '');
-    return { key, html: `<div class="hd-card" data-key="${esc(key)}">
-      <div class="hd-card__title">${esc(d.title)}</div>
-      <div class="hd-card__sub">${esc(d.detail)}</div>
-      <div class="hd-card__sub">seq ${e.sequence} · ${formatTimestamp(e.source_timestamp)}</div>
-    </div>` };
-  });
-}
-
-async function streamList(entityType, entityId) {
-  const items = await streamItems(entityType, entityId);
-  return items.length ? items.map((item) => item.html).join('') : NO_STREAM_EVENTS;
-}
-
-// Paints recorded events into a container in place: new events are appended (and enter, unless
-// calm), cards already shown keep their nodes, and the container itself is never replaced.
-function paintStream(container, items, { initial = false } = {}) {
-  if (!items.length) { if (container.innerHTML !== NO_STREAM_EVENTS) container.innerHTML = NO_STREAM_EVENTS; return; }
-  for (const child of [...container.children]) if (!child.hasAttribute('data-key')) child.remove();
-  patchList(container, items, { key: (item) => item.key, render: (item) => item.html, animate: !initial });
-  if (initial) for (const el of container.querySelectorAll('[data-entering]')) el.removeAttribute('data-entering');
-}
 
 // Live updates (Spec §52, §85): SSE events feed the refresh bus, which calls
 // the current view's refresh() at most once per LIVE_REFRESH_MS (first event

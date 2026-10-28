@@ -2474,6 +2474,60 @@ class ControlPlaneRepo:
     def stream(self, entity_type, entity_id):
         return [_copy(e) for e in self._events.get((entity_type, entity_id), [])]
 
+    def stream_page(self, entity_type, entity_id, *, limit=50, before=None):
+        """Return an ascending slice before an entity-bound, anchored index.
+
+        Appends leave older pages stable. Retention or a changed boundary makes
+        the cursor stale instead of silently skipping history. Sequence numbers
+        are metadata only: duplicates and gaps retain their stored ordering.
+        """
+        import base64
+
+        if type(limit) is not int or not 1 <= limit <= 200:
+            raise ValueError("limit must be an integer between 1 and 200")
+
+        def digest(value):
+            return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"),
+                                             default=str).encode()).hexdigest()
+
+        identity = digest([entity_type, entity_id])
+        boundary = None
+        anchor = None
+        if before is not None:
+            if not isinstance(before, str) or not 1 <= len(before) <= 256 \
+                    or not re.fullmatch(r"[A-Za-z0-9_-]+", before):
+                raise ValueError("invalid history cursor")
+            try:
+                raw = base64.b64decode(before + "=" * (-len(before) % 4), altchars=b"-_", validate=True)
+                cursor = json.loads(raw)
+            except (ValueError, UnicodeError):
+                raise ValueError("invalid history cursor") from None
+            if (base64.urlsafe_b64encode(raw).decode().rstrip("=") != before
+                    or not isinstance(cursor, list) or len(cursor) != 4
+                    or type(cursor[0]) is not int or cursor[0] != 1
+                    or type(cursor[1]) is not int or not 0 < cursor[1] < 2**63
+                    or cursor[2] != identity
+                    or not isinstance(cursor[3], str) or not re.fullmatch(r"[0-9a-f]{64}", cursor[3])):
+                raise ValueError("invalid history cursor")
+            boundary, anchor = cursor[1], cursor[3]
+
+        with self._event_lock:
+            stream = self._events.get((entity_type, entity_id), [])
+            end = len(stream)
+            if boundary is not None:
+                if boundary >= len(stream) or digest(stream[boundary]) != anchor:
+                    raise ValueError("staleHistoryCursor")
+                end = boundary
+            start = max(0, end - limit)
+            next_cursor = None
+            if start:
+                raw = json.dumps([1, start, identity, digest(stream[start])], separators=(",", ":")).encode()
+                next_cursor = base64.urlsafe_b64encode(raw).decode().rstrip("=")
+            latest = stream[-1] if stream else {}
+            return {"events": [_copy(event) for event in stream[start:end]],
+                    "has_more": start > 0, "next_cursor": next_cursor,
+                    "latest_sequence": latest.get("sequence"), "last_event_id": latest.get("event_id")}
+
     def entity_ids(self, entity_type):
         """Ids of every entity of ``entity_type`` that has at least one event."""
         with self._event_lock:

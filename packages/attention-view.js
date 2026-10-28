@@ -4,6 +4,7 @@
 import { escapeHtml as esc } from './herdr-web-components/util.js';
 import { formatDuration } from './herdr-web-components/format.js';
 import { skeleton } from './motion.js';
+import { requestErrorDetail } from './dashboard-load-state.js';
 
 const SEVERITIES = ['critical', 'warning', 'info'];
 const KINDS = {
@@ -162,23 +163,25 @@ export function mountAttention(container, client, { onBody, notifier, onFreshnes
   async function poll() {
     if (disposed || document.hidden || controller) return;
     clearTimeout(timer);
-    controller = new AbortController();
+    const request = new AbortController(); controller = request;
     try {
-      const body = await client.attention({ state: 'all' }, { signal: AbortSignal.any([controller.signal, AbortSignal.timeout(15000)]) });
-      if (disposed) return;
+      const body = await client.attention({ state: 'all' }, { signal: AbortSignal.any([request.signal, AbortSignal.timeout(15000)]) });
+      if (disposed || request.signal.aborted || controller !== request) return;
       if (!body || !Array.isArray(body.items)) throw new Error('Invalid response');
       model.body = body; model.error = ''; model.loading = false;
       onBody?.(body);
       onFreshness(true);
     } catch (err) {
-      if (disposed || controller?.signal.aborted) return;
-      model.error = err?.status === 404 ? 'The attention inbox is turned off on this server.' : (err?.message || 'request failed');
+      if (disposed || request.signal.aborted || controller !== request) return;
+      model.error = err?.status === 404 ? 'The attention inbox is turned off on this server.' : requestErrorDetail(err);
       model.loading = false;
       onFreshness(err?.status === 404, model.error);
     } finally {
-      controller = null;
-      draw();
-      if (!disposed && !document.hidden) timer = setTimeout(poll, POLL_MS);
+      if (controller === request) {
+        controller = null;
+        draw();
+        if (!disposed && !document.hidden) timer = setTimeout(poll, POLL_MS);
+      }
     }
   }
   async function act(action, body, key) {
