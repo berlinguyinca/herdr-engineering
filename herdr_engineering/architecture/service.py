@@ -427,8 +427,9 @@ class ArchitectureService:
         return job["state"] in ("started", "progress") and job.get("lease_expires_at", 0) > time.time()
 
     @staticmethod
-    def _request_key(repository_id, host_id, rev) -> str:
-        return identity.hash_obj([repository_id, host_id, rev])[:24]
+    def _request_key(repository_id, host_id, rev, base_rev=None) -> str:
+        parts = [repository_id, host_id, rev] if base_rev is None else [repository_id, host_id, rev, base_rev]
+        return identity.hash_obj(parts)[:24]
 
     def request_analysis(self, body: dict) -> dict:
         """Ask a host to analyse a revision. Identical open requests collapse; known snapshots are returned."""
@@ -441,13 +442,16 @@ class ArchitectureService:
             raise ArchitectureError("host_id is required")
         if not (isinstance(rev, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,199}", rev)):
             raise ArchitectureError("rev must be a branch, tag or commit name")
+        base_rev = body.get("base_rev")
+        if base_rev is not None and not (isinstance(base_rev, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,199}", base_rev)):
+            raise ArchitectureError("base_rev must be a branch, tag or commit name")
         prio = body.get("priority", "interactive")
         if prio not in ("interactive", "background"):
             raise ArchitectureError("priority must be interactive or background")
-        key = self._request_key(repo_id, host_id, rev)
+        key = self._request_key(repo_id, host_id, rev, base_rev)
         with self._lock:
             self._expire_stale(time.time())
-            if identity.is_full_sha(rev):
+            if identity.is_full_sha(rev) and base_rev is None:      # a base request needs the host to resolve the merge-base
                 known = [m for m in self._meta.values() if m["repository_id"] == repo_id and m["host_id"] == host_id
                          and m["commit_sha"] == rev]
                 if known:
@@ -458,7 +462,8 @@ class ArchitectureService:
             aid = "an-" + uuid.uuid4().hex[:16]
             ev = self.repo.record_event(JOB_ENTITY, aid, "architecture.analysis.requested",
                                         {"repository_id": repo_id, "host_id": host_id, "rev": rev, "priority": prio,
-                                         "key": key, "expires_at": time.time() + self.request_ttl})
+                                         "key": key, "expires_at": time.time() + self.request_ttl,
+                                         **({"base_rev": base_rev} if base_rev else {})})
             self._apply(ev)
             return {"analysis_id": aid, "deduplicated": False, "state": "requested"}
 
@@ -484,8 +489,27 @@ class ArchitectureService:
             ev = self.repo.record_event(JOB_ENTITY, job["analysis_id"], "architecture.analysis.started",
                                         {"host_id": host_id, "lease_expires_at": now + lease})
             self._apply(ev)
-            return {"job": {k: job[k] for k in ("analysis_id", "repository_id", "host_id", "rev", "priority") if k in job},
+            return {"job": {k: job[k] for k in ("analysis_id", "repository_id", "host_id", "rev", "base_rev", "priority") if k in job},
                     "lease_expires_at": now + lease}
+
+    def pr_base(self, sid: str) -> dict:
+        """The base snapshot a host paired with this one: merge-base of the head and the requested base ref, resolved
+        from the host's own git history. None when no completed request asked for one, or the host could not."""
+        if sid not in self._meta:
+            raise KeyError(sid)
+        with self._lock:
+            done = [j for j in self._jobs.values() if j.get("state") == "completed" and j.get("snapshot_id") == sid
+                    and j.get("base_rev")]
+        done.sort(key=lambda j: j.get("updated_at") or "")
+        for job in reversed(done):
+            bid = job.get("base_snapshot_id")
+            if bid and bid in self._meta:
+                return {"snapshot_id": sid, "base": {"snapshot_id": bid, "commit_sha": job.get("base_commit_sha"),
+                                                     "base_rev": job["base_rev"], "analysis_id": job["analysis_id"],
+                                                     "resolved": "git merge-base on the analysis host"}}
+        last = done[-1] if done else None
+        return {"snapshot_id": sid, "base": None,
+                "reason": (last.get("base_message") if last else None) or "no analysis asked for a base ref"}
 
     def cancel_analysis(self, analysis_id: str) -> dict:
         """Operator cancel: any unfinished job ends as `cancelled`; a running host sees it on its next heartbeat."""
@@ -508,12 +532,15 @@ class ArchitectureService:
         if event not in EVENTS:
             raise ArchitectureError("event must be one of " + ", ".join(sorted(EVENTS)))
         payload = {k: body[k] for k in ("repository_id", "commit_sha", "host_id", "worktree_id", "snapshot_id",
-                                       "progress", "message") if k in body}
-        for k in ("repository_id", "commit_sha", "host_id", "worktree_id", "snapshot_id", "message"):
+                                       "progress", "message", "base_commit_sha", "base_snapshot_id", "base_message")
+                   if k in body}
+        for k in ("repository_id", "commit_sha", "host_id", "worktree_id", "snapshot_id", "message",
+                  "base_commit_sha", "base_snapshot_id", "base_message"):
             if k in payload and not (isinstance(payload[k], str) and len(payload[k]) <= 500):
                 raise ArchitectureError(f"invalid {k}")
-        if "commit_sha" in payload and not identity.is_full_sha(payload["commit_sha"]):
-            raise ArchitectureError("commit_sha must be a full hexadecimal commit")
+        for k in ("commit_sha", "base_commit_sha"):
+            if k in payload and not identity.is_full_sha(payload[k]):
+                raise ArchitectureError(f"{k} must be a full hexadecimal commit")
         if "progress" in payload and not (isinstance(payload["progress"], (int, float)) and 0 <= payload["progress"] <= 1):
             raise ArchitectureError("progress must be between 0 and 1")
         if "host_id" in payload and not _HOST_ID.fullmatch(payload["host_id"]):

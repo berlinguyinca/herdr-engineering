@@ -102,10 +102,11 @@ export function mountArchitecture(root, client, opts = {}) {
   async function loadExtras() {
     const s = snap(), key = s?.snapshot_id;
     if (!s || st.extras?.id === key) return;
-    const [o, t] = await Promise.all([client.getArchitectureOverlays(key, {signal: ctl.signal}).catch(() => null),
-      client.getArchitectureTimeline(s.repository_id, {signal: ctl.signal}).catch(() => null)]);
+    const [o, t, b] = await Promise.all([client.getArchitectureOverlays(key, {signal: ctl.signal}).catch(() => null),
+      client.getArchitectureTimeline(s.repository_id, {signal: ctl.signal}).catch(() => null),
+      client.getArchitectureBase(key, {signal: ctl.signal}).catch(() => null)]);
     if (!alive || snap()?.snapshot_id !== key) return;
-    st.extras = {id: key, overlays: o}; st.timeline = t; render();
+    st.extras = {id: key, overlays: o, base: b}; st.timeline = t; render();
   }
   function graphSvg() {
     const p = st.page;
@@ -146,8 +147,10 @@ export function mountArchitecture(root, client, opts = {}) {
   function diffPanel() {
     const s = snap(), others = st.snapshots.filter(x => x.repository_id === s.repository_id && x.snapshot_id !== s.snapshot_id);
     if (!others.length) return '';
-    const d = st.diff;
-    return `<section class="arch-diff" aria-label="Compare snapshots"><label>Compare with base <select data-diff>${'<option value="">Choose a snapshot</option>'}${others.map(o => `<option value="${esc(o.snapshot_id)}"${d?.base === o.snapshot_id ? ' selected' : ''}>${esc(label(o))}</option>`).join('')}</select></label>${d ? `<p data-testid="arch-diff-summary">Nodes +${d.summary.nodes_added} −${d.summary.nodes_removed} ~${d.summary.nodes_modified} · edges +${d.summary.edges_added} −${d.summary.edges_removed}</p><ul class="arch-diff-list">${d.items.slice(0, 50).map(i => `<li class="chg-${esc(i.change)}">${esc(i.change)} ${esc(i.type)} ${esc(i.id || `${i.kind} ${i.from_id} → ${i.to_id}`)}</li>`).join('')}</ul>${d.warnings.map(w => `<p class="arch-note">${esc(w)}</p>`).join('')}` : ''}</section>`;
+    const d = st.diff, pb = st.extras?.base?.base;
+    const prBase = pb ? `<p><button type="button" data-pr-base="${esc(pb.snapshot_id)}">Compare with PR base</button> <small>merge-base ${esc(String(pb.commit_sha).slice(0, 8))} of ${esc(pb.base_rev)}, resolved by the analysis host's git history</small></p>`
+      : (st.extras?.base?.reason && !/no analysis asked/.test(st.extras.base.reason) ? `<p class="arch-note" data-pr-base-reason>No PR base: ${esc(st.extras.base.reason)}</p>` : '');
+    return `<section class="arch-diff" aria-label="Compare snapshots">${prBase}<label>Compare with base <select data-diff>${'<option value="">Choose a snapshot</option>'}${others.map(o => `<option value="${esc(o.snapshot_id)}"${d?.base === o.snapshot_id ? ' selected' : ''}>${esc(label(o))}</option>`).join('')}</select></label>${d ? `<p data-testid="arch-diff-summary">Nodes +${d.summary.nodes_added} −${d.summary.nodes_removed} ~${d.summary.nodes_modified} · edges +${d.summary.edges_added} −${d.summary.edges_removed}</p><ul class="arch-diff-list">${d.items.slice(0, 50).map(i => `<li class="chg-${esc(i.change)}">${esc(i.change)} ${esc(i.type)} ${esc(i.id || `${i.kind} ${i.from_id} → ${i.to_id}`)}</li>`).join('')}</ul>${d.warnings.map(w => `<p class="arch-note">${esc(w)}</p>`).join('')}` : ''}</section>`;
   }
   const list = (items, empty, fmt) => items?.length ? `<ul>${items.map(fmt).join('')}</ul>` : `<p class="arch-note">${empty}</p>`;
   function activityPanel() {
@@ -172,9 +175,10 @@ export function mountArchitecture(root, client, opts = {}) {
   function requestPanel() {
     const s = snap(), r = st.request;
     return `<section class="arch-request" aria-label="Request analysis"><h2>Request analysis</h2>
-      <form data-request><label>Repository <input name="repository_id" value="${esc(s.repository_id)}" required></label>
-      <label>Host <input name="host_id" value="${esc(s.host_id)}" required></label>
-      <label>Revision <input name="rev" value="HEAD" required></label><button type="submit">Request analysis</button></form>
+      <form data-request><label>Repository <input name="repository_id" value="${esc(draft("repository_id", s.repository_id))}" required></label>
+      <label>Host <input name="host_id" value="${esc(draft("host_id", s.host_id))}" required></label>
+      <label>Revision <input name="rev" value="${esc(draft("rev", "HEAD"))}" required></label>
+      <label>PR base ref <input name="base_rev" value="${esc(draft("base_rev", ""))}" placeholder="optional, e.g. origin/main"></label><button type="submit">Request analysis</button></form>
       ${r ? `<p class="arch-notice ${r.error ? 'failed' : 'running'}" role="status" data-request-result>${esc(r.error ? r.error : r.deduplicated ? (r.snapshot_id ? 'A snapshot for that commit already exists.' : `Already queued (${r.analysis_id}).`) : `Queued ${r.analysis_id}. A host running "herdr-eng architecture serve" will pick it up.`)}</p>` : ''}</section>`;
   }
   function crossPanel() {
@@ -184,7 +188,7 @@ export function mountArchitecture(root, client, opts = {}) {
     const row = e => `<li data-xedge>${esc(e.from.repository_id)} ${esc(e.from.node_id)} → ${esc(e.to.repository_id)} ${esc(e.to.node_id)} <small>${esc(e.source_span.path)}:${e.source_span.line_start} · ${esc(e.resolution)}</small></li>`;
     return `<section class="arch-cross" aria-label="Cross-repository dependencies"><h2>Cross-repository</h2>
       <form data-mapform aria-label="Add a package mapping"><label>Importer <select name="importer">${repos.map(r => `<option>${esc(r)}</option>`).join('')}</select></label>
-        <label>Package <input name="package" required pattern="[^|]+"></label>
+        <label>Package <input name="package" value="${esc(draft("package", ""))}" required pattern="[^|]+"></label>
         <label>Provided by <select name="provider">${repos.map(r => `<option>${esc(r)}</option>`).join('')}</select></label><button type="submit">Add mapping</button></form>
       ${st.maps.length ? `<ul data-maps>${st.maps.map((m, i) => `<li>${esc(m.importer)}: <code>${esc(m.package)}</code> → ${esc(m.provider)} <button type="button" class="link" data-unmap="${i}">remove</button></li>`).join('')}</ul>` : ''}
       <button type="button" data-cross>Resolve across ${targets.length} repositories</button>
@@ -192,6 +196,16 @@ export function mountArchitecture(root, client, opts = {}) {
       <h3>Verified (explicit mapping)</h3>${list(c.verified.slice(0, 30), 'None. Add a mapping above to state which repository provides a package; only then is an edge verified.', row)}
       <h3>Inferred (name match only)</h3>${list(c.inferred.slice(0, 30), 'None.', row)}
       ${c.warnings.map(w => `<p class="arch-note">${esc(w)}</p>`).join('')}`) : ''}</section>`;
+  }
+  // The view repaints its whole HTML when a background load finishes; keep what the user is typing.
+  st.draft = {}; st.focus = null;
+  const draft = (name, dflt) => st.draft[name] ?? dflt;
+  host.addEventListener('input', ev => { if (ev.target.name && ev.target.closest('[data-request],[data-mapform]')) st.draft[ev.target.name] = ev.target.value; });
+  host.addEventListener('focusin', ev => { st.focus = ev.target.closest?.('[data-request],[data-mapform]') ? ev.target.name || null : null; });
+  function restoreFocus() {
+    if (!st.focus) return;
+    const el = host.querySelector(`[data-request] [name="${st.focus}"], [data-mapform] [name="${st.focus}"]`);
+    if (el && document.activeElement !== el) { el.focus(); try { el.setSelectionRange(el.value.length, el.value.length); } catch { /* select: no range */ } }
   }
   function render() {
     if (!alive) return;
@@ -212,6 +226,7 @@ export function mountArchitecture(root, client, opts = {}) {
       <p class="arch-meta">Commit <code>${esc(s.commit_sha.slice(0, 12))}</code> · ${esc(s.completeness)} · ${s.counts.nodes} nodes, ${s.counts.edges} edges · host ${esc(s.host_id)} · analyzer ${esc(s.analyzer_version)}</p>
       ${notices}${failed}${running}${st.q ? '' : crumbs()}
       <div class="arch-main"><div class="arch-left">${graphSvg()}${table()}</div>${detail()}</div>${diffPanel()}${timelinePanel()}${activityPanel()}${crossPanel()}${jobsPanel(st.analyses, st.cancels)}${requestPanel()}`;
+    restoreFocus();
   }
   async function open(id) {
     try {
@@ -236,7 +251,7 @@ export function mountArchitecture(root, client, opts = {}) {
   host.addEventListener('click', ev => {
     const cx = ev.target.closest('[data-cancel]');
     if (cx) return cancelClick(cx.dataset.cancel);
-    const ex = ev.target.closest('[data-explain],[data-cross],[data-pick],[data-unmap]');
+    const ex = ev.target.closest('[data-explain],[data-cross],[data-pick],[data-unmap],[data-pr-base]');
     if (ex) return extraClick(ex);
     const t = ev.target.closest('[data-node],[data-open],[data-crumb],[data-more]');
     if (!t) return;
@@ -247,6 +262,7 @@ export function mountArchitecture(root, client, opts = {}) {
   async function extraClick(t) {
     try {
       if (t.dataset.unmap !== undefined) { st.maps.splice(Number(t.dataset.unmap), 1); render(); }
+      else if (t.dataset.prBase) { st.diff = await client.diffArchitecture(t.dataset.prBase, st.sid, {signal: ctl.signal}); render(); }
       else if (t.dataset.pick) { st.sid = t.dataset.pick; st.parent = ''; st.q = ''; st.detail = null; st.diff = null; st.extras = null; await browse(); }
       else if (t.dataset.cross !== undefined) {
         const ids = crossTargets(st.snapshots, snap()).map(x => x.snapshot_id);
@@ -267,8 +283,9 @@ export function mountArchitecture(root, client, opts = {}) {
   host.addEventListener('submit', async ev => {
     if (!ev.target.matches('[data-request]')) return;
     ev.preventDefault();
-    const f = new FormData(ev.target);
-    st.request = await client.requestArchitectureAnalysis({repository_id: f.get('repository_id'), host_id: f.get('host_id'), rev: f.get('rev')}, {signal: ctl.signal}).catch(e => ({error: e.message}));
+    const f = new FormData(ev.target), br = String(f.get('base_rev') || '').trim();
+    if (br && !/^[A-Za-z0-9][A-Za-z0-9._\/-]{0,199}$/.test(br)) { st.request = {error: 'PR base ref must be a branch, tag or commit name'}; render(); return; }
+    st.request = await client.requestArchitectureAnalysis({repository_id: f.get('repository_id'), host_id: f.get('host_id'), rev: f.get('rev'), ...(br ? {base_rev: br} : {})}, {signal: ctl.signal}).catch(e => ({error: e.message}));
     render();
     client.listArchitectureAnalyses({signal: ctl.signal}).then(a => { st.analyses = a.analyses; render(); }, () => {});
   });

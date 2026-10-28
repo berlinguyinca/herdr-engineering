@@ -103,6 +103,12 @@ def main():
             third["snapshot"]["created_at"] = "2099-06-01T00:00:00+00:00"
             third["snapshot"]["graph_hash"] = identity.graph_hash(third["graph"])
             svr.architecture.publish(third)
+            # a host paired the newest snapshot with its merge-base (the first snapshot) for a PR base request
+            req = svr.architecture.request_analysis({"repository_id": RID, "host_id": "beast", "rev": third["snapshot"]["commit_sha"],
+                                                     "base_rev": "main"})
+            svr.architecture.record_analysis({"analysis_id": req["analysis_id"], "event": "completed", "host_id": "beast",
+                                              "commit_sha": third["snapshot"]["commit_sha"], "snapshot_id": third["snapshot"]["snapshot_id"],
+                                              "base_commit_sha": first["snapshot"]["commit_sha"], "base_snapshot_id": first["snapshot"]["snapshot_id"]})
             seed_activity(svr, repo, third["snapshot"]["commit_sha"])
         if os.environ.get("ARCH_SELF") == "1":
             svr.architecture.publish(analyze.analyze_commit(str(_REPO), "HEAD", "bender",
