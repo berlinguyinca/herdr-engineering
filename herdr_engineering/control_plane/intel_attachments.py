@@ -114,3 +114,25 @@ def triage(data: bytes, declared_type: str | None = None, filename: str = "") ->
     ok = mime in _ALLOWED
     return Triage("accept" if ok else "quarantine", mime, sha, mime.startswith("image/") or mime == "application/pdf",
                   () if ok else (f"type {mime} not on the allow-list",))
+
+
+def safe_filename(name: str) -> str:
+    base = name.replace("\\", "/").rsplit("/", 1)[-1]
+    base = "".join(c for c in base if c.isprintable() and c not in '<>:"|?*')[:120].strip(". ")
+    return base or "attachment"
+
+
+async def ingest(store, data: bytes, *, declared_type: str | None, filename: str, created_by: str,
+                 mission_id: str | None = None) -> dict:
+    """Triage, then register ONLY accepted bytes with the existing ``ArtifactStore`` (so its ``ArtifactRegistered``
+    event feeds the intelligence bridge unchanged). Quarantined and rejected bytes are never written anywhere; the
+    caller records the returned metadata (sha256, verdict, reasons) as the evidence that they were seen and refused.
+    Registered artifacts keep ``temporary`` retention: promoting one is a human decision."""
+    result = triage(data, declared_type, filename)
+    out = {"verdict": result.verdict, "sha256": result.sha256, "sniffed_type": result.sniffed_type,
+           "previewable": result.previewable, "reasons": list(result.reasons), "artifact_id": None}
+    if result.verdict == "accept":
+        out["artifact_id"] = await store.register(
+            original_filename=safe_filename(filename), mime_type=result.sniffed_type, data=data,
+            artifact_type="email_attachment", created_by=created_by, mission_id=mission_id, retention_class="temporary")
+    return out

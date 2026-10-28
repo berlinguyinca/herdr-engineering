@@ -237,3 +237,27 @@ def test_active_pdfs_late_markers_and_ooxml_externals_are_not_accepted():
     assert att.triage(make_zip([("word/document.xml", b"<w/>"), ("word/embeddings/o.bin", b"x")]),
                       "application/vnd.openxmlformats-officedocument.wordprocessingml.document").verdict == "quarantine"
     assert att.triage(make_zip([("a/b.txt", b"hi")], zipfile.ZIP_STORED), "application/zip").verdict in ("accept", "quarantine")
+
+
+def test_only_accepted_attachments_reach_the_artifact_store():
+    import asyncio
+
+    from herdr_engineering.control_plane import intel_attachments as ia
+
+    class Store:
+        def __init__(self):
+            self.calls = []
+
+        async def register(self, **kw):
+            self.calls.append(kw)
+            return "artifact-1"
+
+    store = Store()
+    png = b"\x89PNG\r\n\x1a\n" + b"0" * 64
+    ok = asyncio.run(ia.ingest(store, png, declared_type="image/png", filename="..\\..\\evil/pic<1>.png", created_by="mail"))
+    assert ok["verdict"] == "accept" and ok["artifact_id"] == "artifact-1"
+    assert store.calls[0]["original_filename"] == "pic1.png" and store.calls[0]["retention_class"] == "temporary"
+    bad = asyncio.run(ia.ingest(store, b"<html><script>x</script>", declared_type="text/plain", filename="a.txt", created_by="mail"))
+    assert bad["verdict"] != "accept" and bad["artifact_id"] is None
+    assert len(store.calls) == 1
+    assert ia.safe_filename("///") == "attachment"
