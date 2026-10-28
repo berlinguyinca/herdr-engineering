@@ -1,5 +1,52 @@
 # HerdR integration recovery — 2026-10-26
 
+## Final status — 2026-10-28
+
+Deployed and verified release `badc3f7afc0539fa56cb8c10be780e4f6985ce94`.
+PRs #306 and #309 are merged; deployed application source matches main.
+Web, worker, LLM proxy, public collaboration, and edge are running with zero
+restarts. Canonical fleet configuration is mounted read-only, matches the
+protected candidate snapshot, and immutable image/config provenance is verified.
+Earlier pending/paused/rollback statements below describe historical checkpoints.
+
+Live APIs expose 72 missions, 413 sessions, 6,286 services, five hosts, and two
+artifacts. All 46 duplicated initial name allocations were repaired through the
+normal version-checked rename API. Stable session IDs and event history were
+preserved. Replaying the actual durable identity records confirms version-two
+labels, zero current naming conflicts, and blocked historical ambiguous aliases.
+Before/after records and the guarded plan are retained privately.
+
+Verification includes the clean 1,033-test JavaScript run, 268 UI gates, 95 real
+Postgres checks plus assistant persistence, 63 proxy tests, and follow-up recovery
+checks: 75 backend, 18 workspace browser, and 74 deployment/compose tests. Fourteen
+live desktop/mobile page visits passed without page exceptions, server errors,
+rendered error components, or horizontal overflow. Actual retained session history
+from an October 11 session traversed 50-event and 19-event pages without overlap.
+The broad Python run passed 7,318 tests and found one accounting-order assumption;
+its corrected exact-multiset assertion and the complete proxy suite then passed.
+The broad Python command itself is not described as a clean pass.
+
+Twenty on-host reads per endpoint measured p95: health 3.54 ms, missions 1.83 ms,
+sessions 10.49 ms, hosts 1.72 ms. The complete 6,286-service response remains the
+warm latency outlier at 1,202.89 ms p95; its UI uses loading/progress and preserves
+the full catalog. No worker requests were rejected during measurement.
+
+Cold start remains material: this single rollout took 295 seconds from container
+start to verified readiness and peaked at 16,317.4 MiB container memory. Full
+retained replay must not be replaced with event-type filters. The separate
+610-second read-only preflight performed **two** complete hydrations and is not
+a single-startup benchmark. Protected rollback was exercised successfully during
+the first rollout failure before the final successful deployment.
+
+Durable private evidence, screenshots, live measurements, and reconciliation
+backups are under
+`~/.local/state/herdr-engineering/releases/20261028-dashboard-4e0368c/`.
+The final receipt is
+`~/.local/state/herdr-engineering/deploys/badc3f7afc05.json`.
+The original dirty canonical checkout was not reset or replaced. Future deploys
+must build a pinned current-main revision through the hardened deployment script,
+not an old local HEAD or a temporary HOME/configuration directory.
+
 ## Required outcome
 
 Consolidate the existing dashboard design and runtime work without losing functionality,
@@ -51,7 +98,7 @@ be verified through actual authentication, without exposing credentials.
 7. Build from the committed integration revision, run a candidate smoke test,
    establish durable rollback/configuration, then verify live provenance and UX.
 
-## Current validation evidence
+## Early validation evidence (historical checkpoint)
 
 - Repository reconciliation: 532 targeted tests passed.
 - API/resource reconciliation: 58 tests passed before the nested ACL regression
