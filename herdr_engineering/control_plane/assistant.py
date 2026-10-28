@@ -30,11 +30,13 @@ Design contract (see ADR-0001, ADR-0002 in that directory):
 from __future__ import annotations
 
 import hashlib
+import json
+import os
 import re
 import secrets
 import threading
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -70,6 +72,8 @@ def assistant_config(cfg: dict[str, Any]) -> dict[str, Any]:
     section = section if isinstance(section, dict) else {}
     computer = section.get("computer") if isinstance(section, dict) else None
     computer = computer if isinstance(computer, dict) else {}
+    inference = section.get("inference") if isinstance(section, dict) else None
+    inference = inference if isinstance(inference, dict) else {}
     return {
         "enabled": bool(section.get("enabled", False)),
         "approval_ttl_seconds": int(section.get("approval_ttl_seconds", 3600)),
@@ -86,6 +90,13 @@ def assistant_config(cfg: dict[str, Any]) -> dict[str, Any]:
             # connector allowlist: only these https origins may be reached by the
             # connector_request / browse tools (SSRF guard).
             "allowed_connector_origins": [str(o) for o in computer.get("allowed_connector_origins", [])],
+        },
+        # optional real-inference endpoint. When set, the service builds an
+        # HttpModelRunnerAdapter instead of the deterministic LocalRunnerAdapter.
+        "inference": {
+            "endpoint": str(inference.get("endpoint", "")),
+            "timeout": int(inference.get("timeout", 60)),
+            "api_key": str(inference.get("api_key", "")),  # never logged
         },
     }
 
@@ -502,6 +513,60 @@ class LocalRunnerAdapter(RuntimeAdapter):
                 f"\nRelevant memory:\n{context}\n\nAcknowledged: {user_text}")
 
 
+class HttpModelRunnerAdapter(RuntimeAdapter):
+    """Real inference runner wired to a configured model endpoint (R2).
+
+    POSTs the message history to ``inference.endpoint`` and returns the model
+    reply. The API key is sent as an Authorization header and is never echoed in
+    any output. A transport callable is injectable for tests; the default uses
+    urllib. On any failure it degrades to a safe message rather than raising, so
+    a chat run never crashes because of the model layer.
+    """
+    version = 2
+
+    def __init__(self, store: AssistantStore, *, endpoint: str, timeout: int = 60,
+                 api_key: str = "", urlopen: Callable | None = None):
+        self.store = store
+        self.endpoint = endpoint
+        self.timeout = timeout
+        self.api_key = api_key
+        self._urlopen = urlopen
+
+    def execute(self, run: AssistantRun, messages: list[AssistantMessage]) -> str:
+        payload = {
+            "assistant_id": run.assistant_id,
+            "messages": [{"role": m.role, "content": m.content} for m in messages],
+        }
+        if not self._urlopen:
+            try:
+                from urllib.request import Request, urlopen
+                req = Request(self.endpoint, data=json.dumps(payload).encode(),
+                              method="POST", headers={"Content-Type": "application/json"})
+                if self.api_key:
+                    req.add_header("Authorization", "Bearer " + self.api_key)
+                with urlopen(req, timeout=self.timeout) as resp:
+                    body = resp.read().decode()
+                data = json.loads(body)
+                return str(data.get("reply") or data.get("content") or "").strip()
+            except Exception:  # noqa: BLE001
+                return "[http-model runner] inference unavailable"
+        try:
+            resp = self._urlopen(self.endpoint, payload, timeout=self.timeout)
+            return str(resp.get("reply") or resp.get("content") or "").strip()
+        except Exception:  # noqa: BLE001
+            return "[http-model runner] inference unavailable"
+
+
+def _urllib_transport(url: str, method: str, headers: dict[str, str],
+                      body: dict[str, Any] | None, timeout: int) -> dict[str, Any]:
+    """Default real transport for connectors/browse (https, gated upstream)."""
+    from urllib.request import Request, urlopen
+    data = json.dumps(body).encode() if body else None
+    req = Request(url, data=data, method=method, headers=headers)
+    with urlopen(req, timeout=timeout) as resp:
+        return {"status": resp.status, "body": resp.read().decode(errors="replace")}
+
+
 class ConnectorAdapter:
     """Versioned adapter a connector kind must implement.
 
@@ -549,15 +614,14 @@ class HttpConnectorAdapter(ConnectorAdapter):
         origin = f"https://{parsed.hostname}".lower()
         if parsed.hostname not in allowed and origin not in allowed:
             return {"ok": False, "error": "connector origin not allowlisted"}
-        if not self._urlopen:
-            return {"ok": False, "error": "no transport configured (runtime skeleton)"}
         headers = {"Accept": "application/json"}
         if connector.auth:
             headers.setdefault("Authorization",
                                "Bearer " + str(connector.auth.get("token", "")))
+        transport = self._urlopen or _urllib_transport
         try:
-            resp = self._urlopen(target, method=method.upper(), headers=headers,
-                                 body=body, timeout=timeout)
+            resp = transport(target, method=method.upper(), headers=headers,
+                             body=body, timeout=timeout)
             return {"ok": True, "status": resp.get("status", 200),
                     "body": (resp.get("body") or "")[:20000]}
         except Exception as exc:  # noqa: BLE001
@@ -573,6 +637,41 @@ class HttpConnectorAdapter(ConnectorAdapter):
         return []
 
 
+class MCPConnectorAdapter(HttpConnectorAdapter):
+    """MCP connector: wraps an HTTP call as a JSON-RPC 2.0 tool invocation.
+
+    ``connector.auth`` may declare the MCP tool name + parameters template; the
+    request body is wrapped as ``{"jsonrpc":"2.0","method":"tools/call",...}``.
+    """
+    kind = "mcp"
+
+    def request(self, connector: Connector, method: str, path: str,
+                body: dict[str, Any], timeout: int) -> dict[str, Any]:
+        tool = connector.auth.get("_mcp_tool", "")
+        rpc = {"jsonrpc": "2.0", "id": 1,
+               "method": "tools/call",
+               "params": {"name": tool, "arguments": body or {}}}
+        return super().request(connector, "POST", path or "/", rpc, timeout)
+
+
+class OpenApiConnectorAdapter(HttpConnectorAdapter):
+    """OpenAPI connector: templated path + verb from the operation spec.
+
+    ``connector.auth`` may declare ``_openapi_operation`` (e.g. ``GET /v1/weather``);
+    the request is shaped from that operation when the caller omits method/path.
+    """
+    kind = "openapi"
+
+    def request(self, connector: Connector, method: str, path: str,
+                body: dict[str, Any], timeout: int) -> dict[str, Any]:
+        op = connector.auth.get("_openapi_operation", "")
+        if op and isinstance(op, str) and " " in op:
+            verb, op_path = op.split(" ", 1)
+            method = method or verb.upper()
+            path = path or op_path
+        return super().request(connector, method, path, body, timeout)
+
+
 # ---------------------------------------------------------------------------
 # Store (canonical persistence on the existing repo)
 # ---------------------------------------------------------------------------
@@ -583,9 +682,13 @@ class AssistantStore:
 
     All collections are plain dicts keyed by stable ids. No separate database:
     the control plane persists the whole repo through its existing mechanisms.
+    Optional ``persist_path`` enables automatic durable JSON snapshots (R1):
+    every mutation is written atomically (tmp + rename) so state survives a
+    process restart. A Postgres backend remains a deployment concern.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, persist_path: str | None = None) -> None:
+        self._persist_path = persist_path
         self.assistants: dict[str, Assistant] = {}
         self.threads: dict[str, AssistantThread] = {}
         self.messages: dict[str, AssistantMessage] = {}
@@ -601,6 +704,90 @@ class AssistantStore:
         self._rate: dict[str, list[int]] = {}  # key -> [minute_window, count]
         self.audit: list[dict[str, Any]] = []
         self._lock = threading.RLock()
+
+    # -- durable snapshots (R1) ----------------------------------------------
+    def _after_mutation(self) -> None:
+        if self._persist_path:
+            self.persist()
+
+    @staticmethod
+    def _e_to_dict(e: Any) -> dict[str, Any]:
+        out: dict[str, Any] = {}
+        for f in fields(e):
+            v = getattr(e, f.name)
+            if isinstance(v, datetime):
+                v = {"$dt": v.isoformat()}
+            out[f.name] = v
+        return out
+
+    @staticmethod
+    def _e_from_dict(cls: type, d: dict[str, Any]):
+        kwargs: dict[str, Any] = {}
+        for f in fields(cls):
+            v = d.get(f.name)
+            if isinstance(v, dict) and "$dt" in v:
+                v = datetime.fromisoformat(v["$dt"])
+            kwargs[f.name] = v
+        return cls(**kwargs)
+
+    def snapshot(self) -> dict[str, Any]:
+        with self._lock:
+            return {
+                "assistants": [self._e_to_dict(a) for a in self.assistants.values()],
+                "threads": [self._e_to_dict(t) for t in self.threads.values()],
+                "messages": [self._e_to_dict(m) for m in self.messages.values()],
+                "runs": [self._e_to_dict(r) for r in self.runs.values()],
+                "actions": [self._e_to_dict(a) for a in self.actions.values()],
+                "grants": [self._e_to_dict(g) for g in self.grants.values()],
+                "approvals": [self._e_to_dict(a) for a in self.approvals.values()],
+                "memory": [self._e_to_dict(m) for m in self.memory.values()],
+                "routines": [self._e_to_dict(r) for r in self.routines.values()],
+                "connectors": [self._e_to_dict(c) for c in self.connectors.values()],
+                "delegations": [self._e_to_dict(d) for d in self.delegations.values()],
+                "routine_fired": sorted(self._routine_fired),
+            }
+
+    def restore(self, snap: dict[str, Any]) -> None:
+        with self._lock:
+            self.assistants = {a.assistant_id: a for a in
+                               (self._e_from_dict(Assistant, d) for d in snap.get("assistants", []))}
+            self.threads = {t.thread_id: t for t in
+                            (self._e_from_dict(AssistantThread, d) for d in snap.get("threads", []))}
+            self.messages = {m.message_id: m for m in
+                             (self._e_from_dict(AssistantMessage, d) for d in snap.get("messages", []))}
+            self.runs = {r.run_id: r for r in
+                         (self._e_from_dict(AssistantRun, d) for d in snap.get("runs", []))}
+            self.actions = {a.action_id: a for a in
+                            (self._e_from_dict(AssistantAction, d) for d in snap.get("actions", []))}
+            self.grants = {g.grant_id: g for g in
+                           (self._e_from_dict(AssistantGrant, d) for d in snap.get("grants", []))}
+            self.approvals = {a.approval_id: a for a in
+                              (self._e_from_dict(AssistantApproval, d) for d in snap.get("approvals", []))}
+            self.memory = {m.memory_id: m for m in
+                           (self._e_from_dict(AssistantMemory, d) for d in snap.get("memory", []))}
+            self.routines = {r.routine_id: r for r in
+                             (self._e_from_dict(AssistantRoutine, d) for d in snap.get("routines", []))}
+            self.connectors = {c.connector_id: c for c in
+                               (self._e_from_dict(Connector, d) for d in snap.get("connectors", []))}
+            self.delegations = {d.delegation_id: d for d in
+                                (self._e_from_dict(DelegationRequest, d) for d in snap.get("delegations", []))}
+            self._routine_fired = set(snap.get("routine_fired", []))
+
+    def persist(self) -> None:
+        if not self._persist_path:
+            return
+        path = self._persist_path
+        tmp = path + ".tmp"
+        data = self.snapshot()
+        with open(tmp, "w") as f:
+            json.dump(data, f)
+        os.replace(tmp, path)
+
+    def load_persisted(self) -> None:
+        if not self._persist_path or not os.path.exists(self._persist_path):
+            return
+        with open(self._persist_path) as f:
+            self.restore(json.load(f))
 
     # -- audit --------------------------------------------------------------
     def audit_record(self, *, tenant_id: str, user_id: str, actor: str,
@@ -621,6 +808,7 @@ class AssistantStore:
     def put_assistant(self, a: Assistant) -> None:
         with self._lock:
             self.assistants[a.assistant_id] = a
+        self._after_mutation()
 
     def _assistant(self, assistant_id: str) -> Assistant:
         a = self.assistants.get(assistant_id)
@@ -645,6 +833,7 @@ class AssistantStore:
     def put_thread(self, t: AssistantThread) -> None:
         with self._lock:
             self.threads[t.thread_id] = t
+        self._after_mutation()
 
     def get_thread(self, thread_id: str, *, tenant_id: str, user_id: str) -> AssistantThread:
         t = self.threads.get(thread_id)
@@ -664,6 +853,7 @@ class AssistantStore:
     def put_message(self, m: AssistantMessage) -> None:
         with self._lock:
             self.messages[m.message_id] = m
+        self._after_mutation()
 
     def list_messages(self, thread_id: str, *, tenant_id: str, user_id: str) -> list[AssistantMessage]:
         t = self.get_thread(thread_id, tenant_id=tenant_id, user_id=user_id)
@@ -677,6 +867,7 @@ class AssistantStore:
             r.updated_at = _now()
             r.version += 1
             self.runs[r.run_id] = r
+        self._after_mutation()
 
     def get_run(self, run_id: str, *, tenant_id: str, user_id: str) -> AssistantRun:
         r = self.runs.get(run_id)
@@ -696,6 +887,7 @@ class AssistantStore:
     def put_action(self, a: AssistantAction) -> None:
         with self._lock:
             self.actions[a.action_id] = a
+        self._after_mutation()
 
     def get_action(self, action_id: str) -> AssistantAction:
         return self.actions[action_id]
@@ -703,6 +895,7 @@ class AssistantStore:
     def put_grant(self, g: AssistantGrant) -> None:
         with self._lock:
             self.grants[g.grant_id] = g
+        self._after_mutation()
 
     def list_grants(self, *, tenant_id: str, user_id: str,
                     assistant_id: str | None = None) -> list[AssistantGrant]:
@@ -715,6 +908,7 @@ class AssistantStore:
     def put_approval(self, a: AssistantApproval) -> None:
         with self._lock:
             self.approvals[a.approval_id] = a
+        self._after_mutation()
 
     def get_approval(self, approval_id: str) -> AssistantApproval:
         return self.approvals[approval_id]
@@ -733,6 +927,7 @@ class AssistantStore:
             m.updated_at = _now()
             m.revision += 1
             self.memory[m.memory_id] = m
+        self._after_mutation()
 
     def search_memory(self, *, tenant_id: str, user_id: str, assistant_id: str,
                       query: str, limit: int = 5) -> list[AssistantMemory]:
@@ -760,6 +955,7 @@ class AssistantStore:
         with self._lock:
             r.updated_at = _now()
             self.routines[r.routine_id] = r
+        self._after_mutation()
 
     def get_routine(self, routine_id: str, *, tenant_id: str, user_id: str) -> AssistantRoutine:
         r = self.routines.get(routine_id)
@@ -780,6 +976,7 @@ class AssistantStore:
         with self._lock:
             c.updated_at = _now()
             self.connectors[c.connector_id] = c
+        self._after_mutation()
 
     def get_connector(self, connector_id: str, *, tenant_id: str, user_id: str) -> Connector:
         c = self.connectors.get(connector_id)
@@ -798,6 +995,7 @@ class AssistantStore:
         with self._lock:
             d.updated_at = _now()
             self.delegations[d.delegation_id] = d
+        self._after_mutation()
 
     def get_delegation(self, delegation_id: str, *, tenant_id: str, user_id: str) -> DelegationRequest:
         d = self.delegations.get(delegation_id)
@@ -817,12 +1015,14 @@ class AssistantStore:
     def mark_routine_fired(self, routine_id: str, bucket_iso: str) -> None:
         with self._lock:
             self._routine_fired.add(f"{routine_id}|{bucket_iso}")
+        self._after_mutation()
 
     def delete_memory(self, memory_id: str, *, tenant_id: str, user_id: str) -> None:
         self.get_memory(memory_id, tenant_id=tenant_id, user_id=user_id)
         del self.memory[memory_id]
         self.audit_record(tenant_id=tenant_id, user_id=user_id, actor=user_id,
                           action="memory.deleted", subject_id=memory_id)
+        self._after_mutation()
 
 
 # ---------------------------------------------------------------------------
@@ -864,7 +1064,19 @@ class AssistantService:
         self.store = store or AssistantStore()
         self.config = config or assistant_config({})
         self.now = now or _now
-        self.runner = runner or LocalRunnerAdapter(self.store)
+        if runner is not None:
+            self.runner = runner
+        else:
+            inf = self.config.get("inference") or {}
+            if inf.get("endpoint"):
+                self.runner = HttpModelRunnerAdapter(
+                    self.store, endpoint=inf["endpoint"],
+                    timeout=int(inf.get("timeout", 60)),
+                    api_key=str(inf.get("api_key", "")))
+            else:
+                self.runner = LocalRunnerAdapter(self.store)
+        self._shell_runner = None  # injected in tests; default uses subprocess
+        self._transport = None  # injected in tests; default uses urllib
         self._approval_ttl = timedelta(seconds=self.config["approval_ttl_seconds"])
 
     # -- feature flag gate -----------------------------------------------------
@@ -1493,9 +1705,19 @@ class AssistantService:
         return result
 
     def _adapter_for(self, kind: str) -> ConnectorAdapter:
-        # MCP / OpenAPI adapters are a later-phase wiring decision; the skeleton
-        # routes all kinds through the deny-by-default HTTP adapter.
-        return HttpConnectorAdapter()
+        """Select the deny-by-default adapter for a connector kind."""
+        cls = {"http": HttpConnectorAdapter, "mcp": MCPConnectorAdapter,
+               "openapi": OpenApiConnectorAdapter}.get(kind, HttpConnectorAdapter)
+        return cls(self._transport) if self._transport is not None else cls()
+
+    @staticmethod
+    def _default_shell_runner(command: str, timeout: int) -> dict[str, Any]:
+        """Real shell executor: arglist (no shell), timeout, captured output."""
+        import shlex
+        import subprocess
+        argv = shlex.split(command)
+        proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+        return {"exit_code": proc.returncode, "stdout": proc.stdout, "stderr": proc.stderr}
 
     def evaluate_computer_policy(self, *, tool: str, target: str) -> dict[str, Any]:
         """deny-by-default computer-tool sandbox policy check."""
@@ -1528,22 +1750,26 @@ class AssistantService:
         c = Connector(connector_id="__browse__", tenant_id=tenant_id, user_id=user_id,
                       name="browse", kind="http", base_url=url,
                       auth={"_allowed_origins": [host]})
-        adapter = HttpConnectorAdapter()
-        result = adapter.request(c, "GET", "/", {}, 30)
-        if not result.get("ok") and "no transport" in result.get("error", ""):
-            return {"ok": False, "denied": True,
-                    "reason": "browse allowed by policy but no real executor configured (skeleton)"}
-        return result
+        adapter = HttpConnectorAdapter(self._transport)
+        return adapter.request(c, "GET", "/", {}, 30)
 
     def run_shell_tool(self, *, tenant_id: str, user_id: str, command: str) -> dict[str, Any]:
-        """Shell tool under the sandbox policy. deny-by-default; no execution in
-        the skeleton (a real executor is a later-phase wiring decision)."""
+        """Shell tool under the sandbox policy. deny-by-default; executes only
+        when the operator has enabled shell AND allowlisted the command, using
+        arglist (no shell interpretation) and a timeout."""
         self._require_enabled()
         verdict = self.evaluate_computer_policy(tool="run_shell", target=command)
         if not verdict["allowed"]:
             return {"ok": False, "denied": True, "reason": verdict["reason"]}
-        return {"ok": False, "denied": True,
-                "reason": "shell allowed by policy but no real executor configured (skeleton)"}
+        runner = self._shell_runner or self._default_shell_runner
+        try:
+            res = runner(command, self._computer().get("max_timeout_seconds", 30))
+            return {"ok": True,
+                    "exit_code": res.get("exit_code"),
+                    "stdout": redact_secrets(res.get("stdout", ""))[:20000],
+                    "stderr": redact_secrets(res.get("stderr", ""))[:20000]}
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": redact_secrets(f"shell execution failed: {exc}")}
 
     def delegate(self, *, tenant_id: str, user_id: str, assistant_id: str,
                  task: str, target_system: str = "pi",

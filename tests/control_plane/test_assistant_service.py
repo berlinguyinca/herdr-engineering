@@ -21,7 +21,12 @@ from herdr_engineering.control_plane.assistant import (
     AssistantError,
     AssistantNotFound,
     AssistantService,
+    AssistantStore,
     AssistantUnavailable,
+    Connector,
+    HttpModelRunnerAdapter,
+    MCPConnectorAdapter,
+    OpenApiConnectorAdapter,
     RateLimited,
     assistant_config,
     redact_secrets,
@@ -683,3 +688,161 @@ def test_rate_limit_resets_next_window():
     # advance into a new minute window -> fresh count
     svc.now = lambda: datetime(2026, 10, 28, 0, 1, tzinfo=UTC)
     svc.check_rate_limit(key="k")
+
+
+# ---------------------------------------------------------------------------
+# Gap-closing: durable store (R1), real model runner (R2), MCP/OpenAPI
+# adapters, real browse/shell executors
+# ---------------------------------------------------------------------------
+
+def test_durable_store_survives_restart(tmp_path):
+    path = tmp_path / "pa.json"
+    store = AssistantStore(persist_path=str(path))
+    svc = AssistantService(config=assistant_config({"personal_assistant": {"enabled": True}}),
+                           store=store)
+    a = svc.create_assistant(tenant_id="t1", user_id="u1", name="Helper")
+    t = svc.create_thread(tenant_id="t1", user_id="u1", assistant_id=a.assistant_id)
+    svc.send_message(tenant_id="t1", user_id="u1", assistant_id=a.assistant_id,
+                     thread_id=t.thread_id, content="hi")
+    # simulate a process restart: a fresh store loaded from the same file
+    store2 = AssistantStore(persist_path=str(path))
+    store2.load_persisted()
+    svc2 = AssistantService(config=assistant_config({"personal_assistant": {"enabled": True}}),
+                            store=store2)
+    got = svc2.get_assistant(a.assistant_id, tenant_id="t1", user_id="u1")
+    assert got.name == "Helper"
+    assert len(store2.runs) == 1  # the run survived
+
+
+def test_durable_snapshot_roundtrip(tmp_path):
+    path = tmp_path / "pa.json"
+    store = AssistantStore(persist_path=str(path))
+    svc = AssistantService(config=assistant_config({"personal_assistant": {"enabled": True}}),
+                           store=store)
+    svc.create_assistant(tenant_id="t1", user_id="u1", name="Helper")
+    svc.register_connector(tenant_id="t1", user_id="u1", name="X",
+                           base_url="https://x.example.com",
+                           auth={"_allowed_origins": ["x.example.com"], "token": "tok_1"})
+    snap = store.snapshot()
+    assert path.exists()  # persist happened on mutation
+    store3 = AssistantStore()
+    store3.restore(snap)
+    assert len(store3.assistants) == 1
+    assert len(store3.connectors) == 1
+    # credentials are not lost in storage but auth is opaque here
+    assert store3.connectors[next(iter(store3.connectors))].auth["token"] == "tok_1"
+
+
+def test_http_model_runner_uses_endpoint():
+    store = AssistantStore()
+    seen = {}
+    def fake_urlopen(endpoint, payload, timeout):
+        seen["endpoint"] = endpoint; seen["payload"] = payload
+        return {"reply": "model answer"}
+    runner = HttpModelRunnerAdapter(store, endpoint="https://model.example.com/v1",
+                                    urlopen=fake_urlopen)
+    svc = AssistantService(config=assistant_config({"personal_assistant": {"enabled": True}}),
+                           store=store)
+    a = svc.create_assistant(tenant_id="t1", user_id="u1", name="Helper")
+    t = svc.create_thread(tenant_id="t1", user_id="u1", assistant_id=a.assistant_id)
+    run = svc.send_message(tenant_id="t1", user_id="u1", assistant_id=a.assistant_id,
+                           thread_id=t.thread_id, content="hello")
+    msgs = store.list_messages(t.thread_id, tenant_id="t1", user_id="u1")
+    out = runner.execute(run, msgs)
+    assert out == "model answer"
+    assert seen["endpoint"] == "https://model.example.com/v1"
+    assert seen["payload"]["messages"][0]["content"] == "hello"  # the user turn
+
+
+def test_http_model_runner_degrades_on_failure():
+    store = AssistantStore()
+    runner = HttpModelRunnerAdapter(store, endpoint="https://model.example.com/v1",
+                                    urlopen=lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+    out = runner.execute(_FakeRun(), [])
+    assert "unavailable" in out
+
+
+class _FakeRun:
+    assistant_id = "asst_x"
+    tenant_id = "t1"
+    user_id = "u1"
+
+
+def test_mcp_adapter_wraps_jsonrpc():
+    seen = {}
+    def fake_urlopen(url, method, headers, body, timeout):
+        seen["body"] = body; seen["headers"] = headers; return {"status": 200, "body": "{}"}
+    c = Connector(connector_id="c", tenant_id="t", user_id="u", name="m", kind="mcp",
+                  base_url="https://m.example.com",
+                  auth={"_allowed_origins": ["m.example.com"], "_mcp_tool": "weather"})
+    adapter = MCPConnectorAdapter(urlopen=fake_urlopen)
+    res = adapter.request(c, "POST", "/", {"q": "x"}, 10)
+    assert res["ok"] is True
+    assert seen["body"]["jsonrpc"] == "2.0"
+    assert seen["body"]["method"] == "tools/call"
+    assert seen["body"]["params"]["name"] == "weather"
+    assert seen["body"]["params"]["arguments"] == {"q": "x"}
+
+
+def test_openapi_adapter_uses_operation_templating():
+    seen = {}
+    def fake_urlopen(url, method, headers, body, timeout):
+        seen["method"] = method; seen["url"] = url; return {"status": 200, "body": "{}"}
+    c = Connector(connector_id="c", tenant_id="t", user_id="u", name="o", kind="openapi",
+                  base_url="https://o.example.com",
+                  auth={"_allowed_origins": ["o.example.com"], "_openapi_operation": "GET /v1/weather"})
+    adapter = OpenApiConnectorAdapter(urlopen=fake_urlopen)
+    adapter.request(c, "", "", {}, 10)
+    assert seen["method"] == "GET"
+    assert seen["url"] == "https://o.example.com/v1/weather"
+
+
+def test_browse_executes_when_policy_allows(tmp_path):
+    cfg = assistant_config({"personal_assistant": {"enabled": True,
+                                                   "computer": {"allow_browser": True,
+                                                                "allowed_hosts": ["example.com"]}}})
+    svc = AssistantService(config=cfg)
+    seen = {}
+    def fake_urlopen(url, method, headers, body, timeout):
+        seen["url"] = url; return {"status": 200, "body": "<html>ok</html>"}
+    svc._transport = fake_urlopen
+    res = svc.browse_tool(tenant_id="t1", user_id="u1", url="https://example.com/page")
+    assert res["ok"] is True
+    assert "<html>ok</html>" in res["body"]
+
+
+def test_browse_denied_outside_allowlist():
+    cfg = assistant_config({"personal_assistant": {"enabled": True,
+                                                   "computer": {"allow_browser": True,
+                                                                "allowed_hosts": ["example.com"]}}})
+    svc = AssistantService(config=cfg)
+    res = svc.browse_tool(tenant_id="t1", user_id="u1", url="https://evil.example.net/x")
+    assert res["denied"] is True
+
+
+def test_run_shell_executes_when_allowlisted():
+    cfg = assistant_config({"personal_assistant": {"enabled": True,
+                                                   "computer": {"allow_shell": True,
+                                                                "allowed_commands": ["/bin/echo"]}}})
+    svc = AssistantService(config=cfg)
+    svc._shell_runner = lambda command, timeout: {"exit_code": 0, "stdout": "hi", "stderr": ""}
+    res = svc.run_shell_tool(tenant_id="t1", user_id="u1", command="/bin/echo hi")
+    assert res["ok"] is True
+    assert res["stdout"] == "hi"
+
+
+def test_run_shell_denied_when_not_allowlisted():
+    cfg = assistant_config({"personal_assistant": {"enabled": True,
+                                                   "computer": {"allow_shell": True,
+                                                                "allowed_commands": ["/bin/echo"]}}})
+    svc = AssistantService(config=cfg)
+    res = svc.run_shell_tool(tenant_id="t1", user_id="u1", command="/bin/rm -rf /")
+    assert res["denied"] is True
+    assert "not allowlisted" in res["reason"]
+
+
+def test_service_builds_http_runner_when_endpoint_configured():
+    cfg = assistant_config({"personal_assistant": {"enabled": True,
+                                                   "inference": {"endpoint": "https://m.example.com/v1"}}})
+    svc = AssistantService(config=cfg)
+    assert isinstance(svc.runner, HttpModelRunnerAdapter)
