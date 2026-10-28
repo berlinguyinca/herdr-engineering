@@ -70,3 +70,14 @@ def test_new_admission_defaults_off_and_can_be_explicitly_enabled(server):
                 {"X-API-Key": "ops"})[0] == 503
     assert post(server, route + "/cancel", {"reservation_id": row["reservation_id"]},
                 {"X-API-Key": "ops"})[0] == 200
+
+
+def test_scheduler_mutations_enforce_same_origin_with_operator_credentials(server):
+    server.scheduler_admission = True
+    route = "/api/v1/scheduler/reservations"
+    assert post(server, route, request(), {
+        "X-API-Key": "ops", "Origin": "https://untrusted.invalid"})[0] == 403
+    assert server.repo.list_scheduler_reservations() == []
+    status, row = post(server, route, request(), {
+        "X-API-Key": "ops", "Origin": f"http://127.0.0.1:{server.port}"})
+    assert status == 201 and row["state"] == "queued"

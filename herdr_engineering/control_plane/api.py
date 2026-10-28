@@ -1435,7 +1435,7 @@ def _make_handler(server, public=False, operator=False):
             # prefix test is bypassed by e.g. /api/v1/%72eview-gate/...
             segs = path.split("/")
             res = unquote(segs[3]) if len(segs) > 3 and segs[:3] == ["", "api", "v1"] else ""
-            if (res.startswith("reviews") or res == "attention" or res == "architecture"
+            if (res.startswith("reviews") or res in {"attention", "architecture", "scheduler"}
                     or (res in {"ci", "review-gate"} and len(segs) > 4) or _SUMMARY_FIX.match(path)
                     or _TERMINAL_ATTACH.match(path) or _STEER_ACK.match(path) or _is_rereview(path)):
                 origin = self.headers.get("Origin")
