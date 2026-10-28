@@ -202,3 +202,15 @@ def test_call_edge_budget_truncates_deterministically_and_marks_partial():
     assert len([e for e in g["edges"] if e["kind"] == "calls"]) == 2
     assert g["completeness"] == "partial" and any(d["code"] == "max_call_edges" for d in g["diagnostics"])
     assert identity.graph_hash(g) == identity.graph_hash(graph(CALLS, cfg=cfg))
+
+
+def test_aggregated_edges_are_capped_per_kind_so_calls_cannot_crowd_out_imports(monkeypatch):
+    from herdr_engineering.architecture import service
+    g = graph({"a/__init__.py": "", "a/x.py": "from . import y\n\ndef f():\n    y.g()\n    y.h()\n",
+               "a/y.py": "def g():\n    pass\n\ndef h():\n    pass\n"})
+    svc = service.ArchitectureService.__new__(service.ArchitectureService)
+    loaded = service._Loaded(g)
+    visible = ["module:a.x", "module:a.y"]
+    monkeypatch.setattr(service, "MAX_AGGREGATE_PER_KIND", 1)
+    kinds = [r["kind"] for r in svc._aggregate(loaded, visible)]
+    assert sorted(kinds) == ["calls", "imports"]

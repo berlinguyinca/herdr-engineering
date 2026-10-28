@@ -27,6 +27,7 @@ _CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 MAX_NODES = 250_000
 MAX_EDGES = 1_000_000
 MAX_LIMIT = 500
+MAX_AGGREGATE_PER_KIND = 2000
 EVENTS = {"requested", "started", "progress", "completed", "failed", "cancelled"}
 FINISHED = frozenset({"completed", "failed", "cancelled", "expired"})
 _JOB_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,95}")
@@ -331,7 +332,12 @@ class ArchitectureService:
                                                               "evidence_ref": e["evidence_ref"]})
                     row["count"] += 1
                     row["inferred"] = row["inferred"] or e["inferred"]
-        return sorted(agg.values(), key=lambda r: (-r["count"], r["from_id"], r["to_id"]))[:2000]
+        by_kind: dict[str, list[dict]] = {}
+        for r in sorted(agg.values(), key=lambda r: (-r["count"], r["from_id"], r["to_id"])):
+            rows = by_kind.setdefault(r["kind"], [])
+            if len(rows) < MAX_AGGREGATE_PER_KIND:          # per kind: dense call edges must not crowd out the imports
+                rows.append(r)
+        return sorted((r for rows in by_kind.values() for r in rows), key=lambda r: (r["kind"], -r["count"], r["from_id"], r["to_id"]))
 
     def search(self, sid, q="", kind=None, cursor=None, limit=50):
         g = self._load(sid)

@@ -41,7 +41,7 @@ class Config:
     max_file_bytes: int = 1_000_000
     max_files: int = 20_000
     max_nodes: int = 200_000
-    max_call_edges: int = 150_000     # calls dominate graph size (23 MB for Herdr's 745 files); keeps output under the runner cap
+    max_call_edges: int = 50_000      # measured ~485 B per call edge: ~24 MB at the cap, so calls cannot alone exceed the runner's 64 MiB output cap
 
     def as_dict(self) -> dict:
         return {"languages": ["python", "javascript-scan"], "max_file_bytes": self.max_file_bytes,
