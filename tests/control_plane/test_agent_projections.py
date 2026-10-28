@@ -4,7 +4,7 @@ from herdr_engineering.control_plane.ingest import IngestService
 from herdr_engineering.control_plane.repo import ControlPlaneRepo
 
 
-@pytest.mark.parametrize('kind', ['agent_identity', 'agent_summary'])
+@pytest.mark.parametrize('kind', ['agent_identity', 'agent_summary', 'agent_identity_reconciliation'])
 def test_generic_ingestion_cannot_forge_private_agent_projections(kind):
     repo = ControlPlaneRepo()
     with pytest.raises(ValueError, match='not accepted'):
@@ -100,3 +100,48 @@ def test_list_names_uses_snapshot_while_persistence_allows_new_agents():
     repo.upsert_session('two')
     assert {s['session_id'] for s in repo.list_sessions()} == {'one', 'two'}
     assert {s['session_id'] for s in repo.list_sessions()} == {'one', 'two', 'late'}
+
+
+def test_export_preserves_complete_private_identity_history():
+    repo = ControlPlaneRepo()
+    repo.upsert_session('one', name='Ada')
+    profile = repo.get_session('one')
+    repo.rename_agent('one', 'Grace', profile['name_version'])
+    backup = repo.export_state()
+    assert len(backup['agent_identity_history']) == 2
+    restored = ControlPlaneRepo()
+    restored.import_state(backup)
+    assert restored.export_state()['agent_identity_history'] == backup['agent_identity_history']
+    assert not any(event['entity_type'].startswith('agent_identity') for event in restored.recent_events())
+
+
+def test_unexplained_divergent_history_is_not_hidden_by_latest_projection():
+    from herdr_engineering.control_plane.agent_identity import (
+        AgentIdentityConflict,
+        AgentIdentityRegistry,
+    )
+
+    events = []
+    for index, name in enumerate(('Ada', 'Grace')):
+        registry = AgentIdentityRegistry(persist=lambda event: events.append(
+            {**event, 'event_id': str(index), 'sequence': index}))
+        registry.allocate('one', name)
+    with pytest.raises(AgentIdentityConflict):
+        ControlPlaneRepo().import_state({'agent_projections': events})
+
+
+def test_global_persistence_acknowledgement_keeps_actual_durable_event():
+    class Sink:
+        def record(self, event):
+            pass
+
+        def record_required(self, event):
+            return {**event, 'event_id': 'actual-stored-id', 'payload': {
+                'identity': 'one', 'display_name': 'Ada Amber', 'handle': 'ada-amber', 'version': 2,
+                'reserved_names': ['ada amber'], 'reserved_handles': ['ada-amber'],
+            }}
+
+    repo = ControlPlaneRepo(sink=Sink())
+    repo.upsert_session('one', name='Ada')
+    assert repo.get_session('one')['display_name'] == 'Ada Amber'
+    assert repo.export_state()['agent_identity_history'][0]['event_id'] == 'actual-stored-id'

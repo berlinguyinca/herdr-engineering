@@ -170,6 +170,7 @@ class ControlPlaneRepo:
         self._event_lock = threading.RLock()
         self._agent_projection_lock = threading.RLock()
         self._agent_records = {}
+        self._agent_identity_history = []
         self._agent_sequence = 0
         self._sink = sink
         self._now = now or (lambda: time.time())
@@ -503,9 +504,17 @@ class ControlPlaneRepo:
                 required = getattr(self._sink, "record_required", None)
                 if not callable(required):
                     raise RuntimeError("agent projections require acknowledged persistence")
-                required(event)
-            self._agent_sequence = sequence
+                acknowledged = required(event)
+                if event["entity_type"] == "agent_identity" and isinstance(acknowledged, dict):
+                    event = copy.deepcopy(acknowledged)
+                    sequence = int(event["sequence"])
+            self._agent_sequence = max(self._agent_sequence, sequence)
             self._agent_records[(event["entity_type"], event["entity_id"])] = event
+            if event["entity_type"] in {"agent_identity", "agent_identity_reconciliation"}:
+                if not any(old.get("event_id") == event.get("event_id") for old in self._agent_identity_history):
+                    self._agent_identity_history.append(copy.deepcopy(event))
+            if event["entity_type"] == "agent_identity":
+                return copy.deepcopy(event["payload"])
 
     def persist_agent_summary(self, event):
         sid = event["session_id"]
@@ -2951,6 +2960,7 @@ class ControlPlaneRepo:
             "ci_sequence": self._ci_sequence,
             "ci_history_truncated": sorted(self._ci_history_truncated),
             "agent_projections": copy.deepcopy(list(self._agent_records.values())),
+            "agent_identity_history": copy.deepcopy(self._agent_identity_history),
         }
 
     def import_state(self, state):
@@ -3009,14 +3019,15 @@ class ControlPlaneRepo:
         self._trim_ci_history()
         # Replay durable naming reservations before any session is presented.
         # Summary continuity lives outside transcript retention and public feeds.
-        projections = list(state.get("agent_projections", []))
+        projections = list(state.get("agent_identity_history", [])) + list(state.get("agent_projections", []))
         self._agent_records = {}
+        self._agent_identity_history = []
         self._agent_sequence = 0
-        self.agent_identities = AgentIdentityRegistry(persist=self._persist_agent_projection)
-        private_types = {"agent_identity", "agent_summary"}
+        private_types = {"agent_identity", "agent_summary", "agent_identity_reconciliation"}
         for key in [k for k in self._events if k[0] in private_types]:
             projections.extend(self._events.pop(key))
         self._event_order = [row for row in self._event_order if row[0] not in private_types]
+        seen_identity_events = {}
         for event in projections:
             if event.get("entity_type") not in private_types:
                 continue
@@ -3024,8 +3035,32 @@ class ControlPlaneRepo:
             key = (event["entity_type"], event["entity_id"])
             self._agent_records[key] = event
             self._agent_sequence = max(self._agent_sequence, int(event.get("sequence") or 0))
-        self.agent_identities.hydrate([event for (kind, _), event in self._agent_records.items()
-                                       if kind == "agent_identity"])
+            if event["entity_type"] in {"agent_identity", "agent_identity_reconciliation"}:
+                identity_key = event.get("event_id") or json.dumps(event, sort_keys=True, default=str)
+                previous = seen_identity_events.get(identity_key)
+                if previous is not None:
+                    if previous != event:
+                        raise ValueError("divergent private identity event")
+                    continue
+                seen_identity_events[identity_key] = event
+                self._agent_identity_history.append(copy.deepcopy(event))
+        from .agent_identity_repair import prepare_identity_replay
+        identity_events, blocked_names, blocked_handles = prepare_identity_replay(self._agent_identity_history)
+        self.agent_identities = AgentIdentityRegistry(persist=self._persist_agent_projection,
+                                                      blocked_names=blocked_names,
+                                                      blocked_handles=blocked_handles)
+        self.agent_identities.hydrate(identity_events)
+        # Keep the acknowledged canonical event, even if a later stale observation
+        # has a lower optimistic version. Full history remains private for audit.
+        for identity, record in self.agent_identities._records.items():
+            for event in reversed(self._agent_identity_history):
+                payload = event["payload"]
+                if event["entity_type"] == "agent_identity" and all(
+                    payload.get(field) == record[field]
+                    for field in ("identity", "display_name", "handle", "version")
+                ):
+                    self._agent_records[("agent_identity", identity)] = event
+                    break
         # Inspector summaries ride the durable log as ``inspector`` streams;
         # move them into the bounded store instead of the unbounded raw streams.
         durable = []

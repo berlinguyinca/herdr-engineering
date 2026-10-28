@@ -11,6 +11,8 @@ import re
 import threading
 import unicodedata
 
+AGENT_IDENTITY_LOCK = 0x48455244524E414D  # Shared durable naming/reconciliation transaction fence.
+
 _WORDS = (
     'Amber', 'Birch', 'Cedar', 'Dawn', 'Elm', 'Fern', 'Glen', 'Hazel',
     'Iris', 'Jade', 'Lake', 'Maple', 'North', 'Oak', 'Pine', 'Quartz',
@@ -74,12 +76,14 @@ class AgentIdentityRegistry:
     so an old reference is never reassigned to a different agent.
     """
 
-    def __init__(self, persist=None):
+    def __init__(self, persist=None, *, blocked_names=(), blocked_handles=()):
         self._persist = persist
         self._lock = threading.RLock()
         self._records = {}
         self._names = {}
         self._handles = {}
+        self._blocked_names = frozenset(blocked_names)
+        self._blocked_handles = frozenset(blocked_handles)
 
     def get(self, identity):
         with self._lock:
@@ -95,7 +99,9 @@ class AgentIdentityRegistry:
         return {key: record[key] for key in ('identity', 'display_name', 'handle', 'version')}
 
     def _available(self, identity, name):
-        return (self._names.get(name.casefold()) in (None, identity)
+        return (name.casefold() not in self._blocked_names
+                and _handle(name) not in self._blocked_handles
+                and self._names.get(name.casefold()) in (None, identity)
                 and self._handles.get(_handle(name)) in (None, identity))
 
     def allocate(self, identity, preferred_name=None):
@@ -141,8 +147,15 @@ class AgentIdentityRegistry:
                   'reserved_handles': sorted(set(previous.get('reserved_handles', [])) | {handle})}
         event = {'entity_type': 'agent_identity', 'entity_id': identity,
                  'event_type': 'agent_identity.updated', 'payload': copy.deepcopy(record)}
-        if self._persist is not None and self._persist(event) is False:
-            raise RuntimeError('agent identity persistence was not acknowledged')
+        if self._persist is not None:
+            acknowledged = self._persist(event)
+            if acknowledged is False:
+                raise RuntimeError('agent identity persistence was not acknowledged')
+            if isinstance(acknowledged, dict):
+                if acknowledged.get('identity') != identity:
+                    raise ValueError('acknowledged agent identity does not match request')
+                self.hydrate([{**event, 'payload': acknowledged}])
+                return self.get(identity)
         self._publish(record)
         return self._public(record)
 
@@ -186,6 +199,8 @@ class AgentIdentityRegistry:
                         or any(not isinstance(item, str) or not item for item in names + handles)
                         or name.casefold() not in names or _handle(name) not in handles):
                     raise ValueError('invalid persisted agent reservations')
+                if self._blocked_names.intersection(names) or self._blocked_handles.intersection(handles):
+                    raise AgentIdentityConflict('persisted agent alias was retired by reconciliation')
                 if any(self._names.get(item) not in (None, identity) for item in names):
                     raise AgentIdentityConflict('persisted agent name is already reserved')
                 if any(self._handles.get(item) not in (None, identity) for item in handles):

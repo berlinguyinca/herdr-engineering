@@ -115,6 +115,24 @@ def test_replay_restores_names_versions_and_old_name_reservations():
     assert registry.allocate('three', 'Grace')['display_name'] != 'Grace'
 
 
+def test_reconciled_ambiguous_aliases_cannot_be_allocated_or_renamed():
+    registry = AgentIdentityRegistry(blocked_names={'ada'}, blocked_handles={'grace'})
+    assert registry.allocate('one', 'Ada')['display_name'] != 'Ada'
+    registry.allocate('two', 'Birch')
+    with pytest.raises(AgentIdentityConflict):
+        registry.rename('two', 'Grace', 1)
+
+
+def test_acknowledged_global_record_wins_over_tentative_local_allocation():
+    canonical = {'identity': 'one', 'display_name': 'Ada Amber', 'handle': 'ada-amber',
+                 'version': 2, 'reserved_names': ['ada-amber', 'ada amber'],
+                 'reserved_handles': ['ada-amber']}
+    registry = AgentIdentityRegistry(persist=lambda event: canonical if event['entity_id'] == 'one' else None)
+    assert registry.allocate('one', 'Ada') == {key: canonical[key]
+                                             for key in ('identity', 'display_name', 'handle', 'version')}
+    assert registry.allocate('two', 'Ada Amber')['display_name'] != 'Ada Amber'
+
+
 def test_replay_ignores_unrelated_events_but_rejects_conflicting_reservations():
     events = []
     original = AgentIdentityRegistry(persist=events.append)

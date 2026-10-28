@@ -10,14 +10,18 @@ was ingested.
 """
 from __future__ import annotations
 
+import copy
 import logging
 import secrets
 import threading
 from collections.abc import Callable
+from dataclasses import asdict
 from datetime import datetime
 from typing import Any
 
-from .bridge import _LoopRunner
+from .agent_identity import AGENT_IDENTITY_LOCK, AgentIdentityRegistry
+from .agent_identity_repair import prepare_identity_replay
+from .bridge import _LoopRunner, _rebuild_events
 from .events import V2_COLUMNS, Event, EventStore
 
 log = logging.getLogger(__name__)
@@ -96,18 +100,63 @@ class DurableEventSink:
             log.exception("durable sink failed to persist event %s",
                           ev.get("event_id"))
 
-    def record_required(self, ev: dict) -> None:
+    def record_required(self, ev: dict) -> dict | None:
         """Persist a command receipt, propagating failure before side effects."""
         # The synchronous web server has concurrent request threads; asyncpg
         # permits one operation per connection, including reconnection.
         with self._write_lock:
             self._ensure_store()
+            if ev.get("entity_type") == "agent_identity":
+                return self._run(self._record_agent_identity(ev))
             # append() returns False only for an existing event_id; any write
             # error propagates from here unchanged.
             if not self._run(self._store.append(_dict_to_event(ev))):
                 raise EventAlreadyStored(
                     "durable event insert was not acknowledged "
                     "(event_id already stored)")
+
+    async def _record_agent_identity(self, ev: dict) -> dict:
+        """Validate global reservations and publish on the same database cut.
+
+        Independent processes can have older in-memory registries. Return the
+        acknowledged durable event rather than publishing a tentative local name.
+        """
+        if ev.get("event_type") != "agent_identity.updated":
+            raise ValueError("invalid private agent identity event type")
+        AgentIdentityRegistry().hydrate([ev])
+        conn = self._store._conn
+        async with conn.transaction():
+            await conn.execute("SELECT pg_advisory_xact_lock($1)", AGENT_IDENTITY_LOCK)
+            rows = await conn.fetch("""
+                SELECT * FROM fabric_events
+                WHERE entity_type IN ('agent_identity', 'agent_identity_reconciliation')
+                ORDER BY ingest_timestamp, sequence, event_id
+            """)
+            streams, _ = _rebuild_events([dict(row) for row in rows])
+            history = [event for stream in streams.values() for event in stream]
+            replay, names, handles = prepare_identity_replay(history)
+            registry = AgentIdentityRegistry(blocked_names=names, blocked_handles=handles)
+            registry.hydrate(replay)
+            identity, proposed = ev["entity_id"], ev["payload"]
+            if proposed["version"] == 1 and registry.get(identity) is not None:
+                canonical = registry._records[identity]
+                for event in reversed(history):
+                    if event["entity_type"] != "agent_identity" or event["entity_id"] != identity:
+                        continue
+                    candidate = AgentIdentityRegistry()
+                    candidate.hydrate([event])
+                    if candidate._records[identity] == canonical:
+                        return copy.deepcopy(event)
+                raise ValueError("canonical agent identity has no durable acknowledgement")
+            if proposed["version"] == 1:
+                registry.allocate(identity, proposed["display_name"])
+            else:
+                registry.rename(identity, proposed["display_name"], proposed["version"] - 1)
+            stored = _dict_to_event({**ev, "payload": copy.deepcopy(registry._records[identity])})
+            if not await self._store.append(stored):
+                raise EventAlreadyStored("durable log already holds this identity event")
+            normalized, _ = _rebuild_events([asdict(stored)])
+            return next(iter(normalized.values()))[0]
 
     def stored_identity(self, event_id: str, actor_id: str = ""):
         """(source, source_sequence) of this principal's stored event, or None when absent."""
