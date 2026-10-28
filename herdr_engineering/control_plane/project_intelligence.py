@@ -260,6 +260,10 @@ class IntelligenceStore:
         with self._lock:
             self._kill_switch = bool(on)
 
+    def record_audit(self, entry: dict) -> None:
+        with self._lock:
+            self._audit.append(dict(entry))
+
     def pause_source(self, org_id: str, source_system: str, paused: bool = True) -> None:
         with self._lock:
             (self._paused.add if paused else self._paused.discard)((org_id, source_system))

@@ -123,6 +123,29 @@ class ActionBoard:
         return p
 
 
+    def reject(self, proposal_id: str, *, approver: str, org_id: str) -> Proposal:
+        p = self._p.get(proposal_id)
+        if p is None or p.org_id != org_id:
+            raise pi.NotFound("proposal")
+        if p.state != "awaiting_approval":
+            raise pi.Conflict(f"proposal is {p.state}")
+        p.state = "refused"
+        p.history.append(f"rejected by {approver}")
+        return p
+
+    def pending(self, org_id: str) -> list[Proposal]:
+        """Awaiting proposals for an org; expired ones are marked and dropped from the list."""
+        now, out = self._clock(), []
+        for p in self._p.values():
+            if p.org_id != org_id:
+                continue
+            if p.state == "awaiting_approval" and now > p.expires_at:
+                p.state = "expired"
+            if p.state == "awaiting_approval":
+                out.append(p)
+        return out
+
+
 @dataclass(frozen=True)
 class Notice:
     key: str

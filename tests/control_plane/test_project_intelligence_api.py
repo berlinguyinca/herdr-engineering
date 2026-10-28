@@ -129,3 +129,26 @@ def test_reconcile_route_is_operator_org_wide_and_needs_the_github_client():
     scoped = routes(dict(sec, viewers={"key:abc": {"org_id": "org1", "projects": ["p1"]}}))
     scoped.github_app_fn = r.github_app_fn
     assert scoped.post(["webhooks", "reconcile"], {}, KEY, "operator")[0] == 404
+
+
+def test_proposals_need_suggest_a_different_approver_and_the_exact_payload():
+    sec = dict(FULL, default_org_id="org1", viewers={"key:abc": {"org_id": "org1", "projects": "*"},
+                                                      "key:def": {"org_id": "org1", "projects": "*"}})
+    r = routes(sec)
+    other = {"kind": "operator", "id": "key:def", "authenticated_by": "api_key"}
+    body = {"action": "pause_ingestion", "payload": {"project": "p1", "source": "gmail"}, "resource_version": 3}
+    assert routes(dict(sec, suggest=False)).post(["proposals"], body, KEY, "operator")[0] == 409
+    assert r.post(["proposals"], {"action": "rm_rf", "payload": {}, "resource_version": 1}, KEY, "operator")[0] == 400
+    st, p = r.post(["proposals"], body, KEY, "operator")
+    assert st == 201 and p["state"] == "awaiting_approval"
+    ok = {"payload_sha256": p["payload_sha256"], "resource_version": 3}
+    assert r.post(["proposals", p["id"], "approve"], ok, KEY, "operator")[0] == 409                  # requester cannot approve
+    st, p2 = r.post(["proposals"], body, KEY, "operator")
+    assert r.post(["proposals", p2["id"], "approve"], {**ok, "resource_version": 4}, other, "operator")[0] == 409   # stale version
+    st, p3 = r.post(["proposals"], body, KEY, "operator")
+    assert r.post(["proposals", p3["id"], "approve"], ok, other, "operator") [1]["state"] == "approved"
+    st, p4 = r.post(["proposals"], body, KEY, "operator")
+    assert r.post(["proposals", p4["id"], "reject"], {}, other, "operator")[1]["state"] == "refused"
+    listed = r.get(["proposals"], {}, KEY, "operator")[1]
+    assert all(i["state"] == "awaiting_approval" for i in listed["items"])
+    assert r.get(["proposals"], {}, KEY, "viewer")[0] == 200 and r.post(["proposals"], body, KEY, "viewer")[0] == 404

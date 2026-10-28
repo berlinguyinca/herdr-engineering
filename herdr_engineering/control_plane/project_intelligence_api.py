@@ -22,6 +22,8 @@ class IntelligenceRoutes:
         """``store_fn`` builds the store lazily (only once the feature is enabled); ``store`` is for tests/embedding."""
         self._store, self._store_fn = store, store_fn
         self._section = section_fn
+        from .intel_assistant import ActionBoard
+        self.board = ActionBoard()   # proposals live 30 minutes by design, so they are not persisted
         self.github_app_fn = None   # set by the API glue: () -> review-gate GitHub client or None
         self.metrics_fn = None      # set by the API glue: () -> dict of bridge counters and incident states
         from .intel_webhook import ReplayGuard
@@ -92,6 +94,13 @@ class IntelligenceRoutes:
         self._replay.mark(delivery)
         return 202, {"status": "accepted" if created else "duplicate"}
 
+    @staticmethod
+    def _proposal_view(p) -> dict:
+        return {"id": p.id, "action": p.action, "payload": p.payload, "payload_sha256": p.payload_sha256,
+                "resource_version": p.resource_version, "requester": p.requester, "state": p.state,
+                "expires_at": p.expires_at.isoformat(), "approver": p.approver, "history": list(p.history),
+                "rollback_available": p.rollback_available}
+
     def assistant_read(self, tenant_id: str, user_id: str, payload: dict) -> dict:
         """Assistant tool entry: scope comes only from YAML ``assistant_viewers: {"<tenant>/<user>": {...}}``."""
         from .intel_assistant import ReadTools, execute_read
@@ -155,6 +164,10 @@ class IntelligenceRoutes:
                     "derivation": r.derivation, "review_state": r.review_state, "confidence": r.confidence,
                     "version": r.version, "provisional": r.review_state == "provisional",
                     "evidence_refs": [e.as_dict() for e in r.evidence]} for r in self.store.neighbours(ref, viewer)]}
+            if parts == ["proposals"]:
+                return 200, {"items": [self._proposal_view(p) for p in self.board.pending(viewer.org_id)
+                                       if viewer.project_ids is None or p.payload.get("project") in viewer.project_ids],
+                             "note": "An approved proposal records permission only; this release has no executor."}
             if parts == ["findings"]:
                 return 200, {"items": self.store.findings(viewer)}
         except (pi.IntelligenceError, ValueError) as exc:
@@ -187,6 +200,32 @@ class IntelligenceRoutes:
                     return 404, {"error": "not found"}
                 self.store.pause_source(viewer.org_id, parts[1], parts[2] == "pause")
                 return 200, {"source": parts[1], "paused": parts[2] == "pause"}
+            if parts == ["proposals"]:
+                if not cfg["suggest"] or cfg["kill_switch"]:
+                    return 409, {"error": "proposals require the suggest flag and no kill switch"}
+                payload, version = body.get("payload"), body.get("resource_version")
+                if not isinstance(payload, dict) or not isinstance(version, int) or isinstance(version, bool):
+                    return 400, {"error": "payload (object) and resource_version (int) are required"}
+                project = payload.get("project")
+                if viewer.project_ids is not None and project not in viewer.project_ids:
+                    return 404, {"error": "not found"}
+                p = self.board.request(org_id=viewer.org_id, requester=actor, action=str(body.get("action") or ""),
+                                       payload=payload, resource_version=version)
+                self.store.record_audit({"action": "proposal_requested", "id": p.id, "actor": actor, "kind": p.action})
+                return 201, self._proposal_view(p)
+            if len(parts) == 3 and parts[0] == "proposals" and parts[2] in ("approve", "reject"):
+                if not cfg["suggest"] or cfg["kill_switch"]:
+                    return 409, {"error": "proposals require the suggest flag and no kill switch"}
+                if parts[2] == "reject":
+                    p = self.board.reject(parts[1], approver=actor, org_id=viewer.org_id)
+                else:
+                    v = body.get("resource_version")
+                    if not isinstance(body.get("payload_sha256"), str) or not isinstance(v, int) or isinstance(v, bool):
+                        return 400, {"error": "payload_sha256 (string) and resource_version (int) are required"}
+                    p = self.board.approve(parts[1], approver=actor, org_id=viewer.org_id,
+                                           payload_sha256=body["payload_sha256"], resource_version=v)
+                self.store.record_audit({"action": f"proposal_{p.state}", "id": p.id, "actor": actor})
+                return 200, self._proposal_view(p)
             if parts == ["webhooks", "reconcile"]:
                 from datetime import UTC, datetime
 
