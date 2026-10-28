@@ -48,7 +48,31 @@ export function renderDetail(e) {
     return href ? `<a href="${esc(href)}">${esc(x)}</a>` : esc(x);
   }).join(', ');
   return `<h2>${esc(e.title)}</h2><dl><dt>Happened</dt><dd><time>${esc(when(e.occurred_at))}</time></dd><dt>Observed by Herdr</dt><dd><time>${esc(when(e.observed_at))}</time></dd>
-<dt>Actor</dt><dd>${esc(e.actor || 'unknown')}</dd><dt>Related</dt><dd>${ents || '—'}</dd></dl><h2>Evidence</h2>${refs}`;
+<dt>Actor</dt><dd>${esc(e.actor || 'unknown')}</dd><dt>Related</dt><dd>${ents || '—'}</dd></dl><h2>Evidence</h2>${refs}<h2>Related</h2><div id="pi-related" aria-live="polite"><p class="pi-note">Loading links…</p></div>`;
+}
+
+const PRED = { derived_from: 'derived from', attached_to: 'attached to', mentions: 'mentions', fixes: 'fixes', caused_by: 'caused by',
+  blocks: 'blocks', relates_to: 'relates to', supersedes: 'supersedes', discusses: 'discusses' };
+
+export function renderRelated(items, ref) {
+  const rels = arr(items);
+  if (!rels.length) return '<p class="pi-note">No links to or from this item.</p>';
+  return `<ul class="pi-rel">${rels.map((r) => {
+    const other = r.from === ref ? r.to : r.from;
+    const dir = r.from === ref ? '→' : '←';
+    const state = r.review_state === 'confirmed' ? ['Confirmed', 'ok'] : r.review_state === 'rejected' ? ['Rejected', 'warn']
+      : r.derivation === 'inferred' ? [`Inferred${typeof r.confidence === 'number' ? ` ${Math.round(r.confidence * 100)}%` : ''} · provisional`, 'warn'] : ['Provisional', 'warn'];
+    const n = arr(r.evidence_refs).length;
+    return `<li><span aria-hidden="true">${dir}</span> ${esc(PRED[r.predicate] || String(r.predicate).replace(/_/g, ' '))} <code>${esc(other)}</code>
+<span class="pi-chip" data-tone="${state[1]}">${esc(state[0])}</span><span class="pi-note"> ${n} evidence ref${n === 1 ? '' : 's'}</span></li>`;
+  }).join('')}</ul>`;
+}
+
+export function renderFindings(items) {
+  const f = arr(items);
+  if (!f.length) return '<p class="pi-note">No findings are visible to you.</p>';
+  return `<ul class="pi-rel">${f.map((x) => `<li>${esc(x.statement)} <span class="pi-chip" data-tone="${x.verified ? 'ok' : 'warn'}">${x.verified ? 'Evidence-backed' : 'Unverified'}</span>
+<span class="pi-note"> ${arr(x.evidence_refs).length} evidence ref${arr(x.evidence_refs).length === 1 ? '' : 's'}</span></li>`).join('')}</ul>`;
 }
 
 export function mountProjectIntelligence(host, client, { query = new URLSearchParams(), setQuery, onFreshness = () => {} } = {}) {
@@ -108,11 +132,46 @@ export function mountProjectIntelligence(host, client, { query = new URLSearchPa
     draw(host.querySelector('.pi-state, .pi-split'));   // re-queried after the await: never a detached node
   }
 
+  let findings = null;
+  let relSeq = 0;
+  async function loadRelated(ref) {
+    const mine = ++relSeq;
+    let html;
+    try {
+      const out = await client.getJson(`/api/v1/intelligence/relationships?ref=${encodeURIComponent(ref)}`);
+      html = renderRelated(out?.items, ref);
+    } catch (err) {
+      html = `<p class="pi-note" role="alert">Could not load links (${esc(err.status || 'network')}).</p>`;
+    }
+    if (disposed || mine !== relSeq) return;       // a newer selection owns the pane
+    const slot = host.querySelector('#pi-related');
+    if (slot) slot.innerHTML = html;
+  }
+  async function loadFindings() {
+    try {
+      const out = await client.getJson('/api/v1/intelligence/findings');
+      findings = arr(out?.items);
+    } catch (err) {
+      if (disposed) return;
+      const slot = host.querySelector('#pi-findings');
+      if (slot) slot.innerHTML = `<p class="pi-note" role="alert">Could not load findings (${esc(err.status || 'network')}).</p>`;
+      return;
+    }
+    if (disposed) return;
+    const slot = host.querySelector('#pi-findings');
+    if (slot) slot.innerHTML = renderFindings(findings);
+  }
+
   function draw(el) {
     const sel = arr(timeline?.items).find((i) => i.event_id === state.event);
     const html = `<div class="pi-split"><div>${renderTimeline(timeline, state.event)}</div><aside class="pi-pane" aria-label="Event details" aria-live="polite">${renderDetail(sel)}</aside></div>`;
     if (!el) return;
     el.outerHTML = html;
+    if (!host.querySelector('.pi-findings')) {
+      host.querySelector('.pi').insertAdjacentHTML('beforeend', `<section class="pi-findings" aria-label="Findings"><h2>Findings</h2><div id="pi-findings">${findings === null ? '<p class="pi-note">Loading findings…</p>' : renderFindings(findings)}</div></section>`);
+      if (findings === null) loadFindings();
+    }
+    if (sel?.involved_entities?.[0]) loadRelated(sel.involved_entities[0]);
     host.querySelectorAll('.pi-item').forEach((b) => { b.onclick = () => { state.event = b.dataset.event; persist(); draw(host.querySelector('.pi-split')); host.querySelector(`.pi-item[data-event="${CSS.escape(state.event)}"]`)?.focus(); }; });
   }
 

@@ -157,3 +157,39 @@ test('two quick filter changes: the slower, older response never overwrites the 
     assert.ok(n >= 2);
   });
 });
+
+test('selected event shows its links with inferred ones marked provisional, and findings are labelled', async () => {
+  await withPage(async (page, base) => {
+    const seen = [];
+    await stub(page, { seen });
+    await page.route('**/api/v1/intelligence/relationships**', (route) => { const u = new URL(route.request().url()); seen.push(u.pathname + u.search); return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ items: [
+      { id: 'r1', from: 'pr:acme/app#7', to: 'issue:acme/app#12', predicate: 'fixes', derivation: 'inferred', review_state: 'provisional', confidence: 0.9, evidence_refs: [EVIDENCE] },
+      { id: 'r2', from: 'email:m9<b>x</b>', to: 'pr:acme/app#7', predicate: 'discusses', derivation: 'asserted', review_state: 'confirmed', evidence_refs: [EVIDENCE, EVIDENCE] }] }) }); });
+    await page.route('**/api/v1/intelligence/findings', (route) => route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ items: [
+      { id: 'f1', statement: '[unverified] Peak shift follows column change', verified: false, evidence_refs: [] },
+      { id: 'f2', statement: 'CI red since a1b2c3', verified: true, evidence_refs: [EVIDENCE] }] }) }));
+    await page.goto(`${base}/#/intelligence`);
+    await page.waitForSelector('.pi-item');
+    await page.waitForSelector('#pi-findings li');
+    assert.match(await page.locator('#pi-findings').innerText(), /Unverified[\s\S]*Evidence-backed/);
+    await page.locator('.pi-item[data-event="e2"]').click();
+    await page.waitForSelector('#pi-related li');
+    const rel = await page.locator('#pi-related').innerText();
+    assert.match(rel, /Inferred 90% · provisional/);
+    assert.match(rel, /Confirmed/);
+    assert.match(rel, /2 evidence refs/);
+    assert.equal(await page.locator('#pi-related b').count(), 0, 'markup in a ref must be escaped');
+    assert.ok(seen.some((u) => u.includes('relationships?ref=pr%3Aacme%2Fapp%237')), seen.join('\n'));
+    assert.equal(await page.locator('.pi-findings').count(), 1, 're-selecting must not duplicate the findings section');
+  });
+});
+
+test('a failed links request says so without hiding the evidence', async () => {
+  await withPage(async (page, base) => {
+    await stub(page);
+    await page.route('**/api/v1/intelligence/relationships**', (route) => route.fulfill({ status: 500, contentType: 'application/json', body: '{}' }));
+    await page.goto(`${base}/#/intelligence?event=e2`);
+    await page.waitForSelector('#pi-related [role=alert]');
+    assert.match(await page.locator('.pi-pane').innerText(), /Evidence/);
+  });
+});
