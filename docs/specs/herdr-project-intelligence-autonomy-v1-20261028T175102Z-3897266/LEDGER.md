@@ -72,20 +72,32 @@ Routes: `GET /api/v1/intelligence/{status,projects,investigations,relationships?
 - Attachment triage is byte-level only: no antivirus engine, no libmagic. A real AV/parse sandbox with rlimits and no network is still required before untrusted files are parsed.
 - This worktree's `node_modules` is a symlink to the main checkout's (gitignored); it is not part of the change.
 
-## Remaining work (in order)
-1. `PgIntelligenceStore` + `fabric_events` bridge + idempotency header; run replay and scope tests against the private Postgres.
-2. Register accepted attachments via `ArtifactStore` (`put_stream` + `commit_version`), emit events from `commit_version`.
-3. Wire `repair_policy.evaluate` + `combine` ahead of `decide_merge`; project incidents from `ci_fix`/review-gate events; classifier for flaky/infra/regression; budgets from YAML.
-4. Register read tools/`dashboard.navigate` in assistant `TOOL_CATALOG`; call `may_route` in `llm_proxy` for classified content.
-5. Gmail connector with cursor/backfill/revoke against a fake, then real after B1; webhook receiver + reconciliation after B2.
-6. UI: investigation, artifact provenance, graph, approval cards; axe run; iPhone check after B4.
-7. P6: opt-in backfill, metrics, runbooks, drills, manual audit before any auto-merge enablement.
+## Completed in the second pass (2026-10-28)
+- Bridge: durable store + fabric-event bridge done earlier; `ci_fix` events now fold into an in-memory `IncidentBoard` (`intel_incidents.py`).
+- `intel_incidents.classify_failure`: infra / flaky / regression / unknown with a conservative action (`rerun`, `rerun_then_human`, `repair`, `human`).
+- `repair_gate.py` wired into `GateService(repair_gate=...)`: inert unless `repair.enabled`; fail-closed when enabled (truncated or renamed
+  file lists wait; bad config raises and the service turns it into `wait`; unreadable central config after enable rejects).
+  Facts GitHub cannot prove (human approvals, signed provenance, reviewer context/model families) come from `facts_fn`; the default supplies none.
+- Assistant: `read_project_intelligence` in `TOOL_CATALOG` (non-sensitive, needs a grant) scoped by YAML `assistant_viewers`.
+- `llm_proxy`: `X-Herdr-Data-Class` tagged requests are gated by operator `egress` routes (`egress_denied`, HTTP 403); untagged traffic unchanged.
+- Attachments: `intel_attachments.ingest` registers only accepted bytes through `ArtifactStore.register` (`temporary` retention).
+- `POST /api/v1/intelligence/webhooks/github` (HMAC, replay guard, unmapped repos acknowledged not stored, 404 unless configured).
+- `intel_gmail_sync.GmailSync` over an injected client: cursor, bounded backfill (dry-run default), deletion tombstones, consent revoke. Tested against a fake only.
+- UI: related links (inferred shown as provisional with confidence) and findings (unverified labelled) in `/intelligence`.
+- Operator metrics on `GET /api/v1/intelligence/status` (counters only). `RUNBOOK.md` with the config reference, enabling order, rollback and drills.
+
+## Remaining work
+1. Facts for the repair gate: a real `facts_fn` (reviewer execution context and model family from the review queue, human approvals from GitHub reviews, signed provenance), plus attempt and open-repair-PR counters. Until then repair PRs always wait for a human.
+2. Webhook reconciliation (poll `open_prs` for missed deliveries); incident board persistence (it is rebuilt by backfill); `ci_fix` -> review-gate (`merged`, `post_merge_verified`) events are not emitted by any existing service yet.
+3. Live Gmail client (B1); email sender and notification channel (B3); iPhone auth (B4).
+4. UI: investigation picker, artifact provenance, graph and approval cards, an axe accessibility run.
+5. Not fixed from review: findings citing a removed source are not re-evaluated; tombstones keep evidence metadata; ReplayGuard is in memory (a restart forgets deliveries; the store still dedupes); zip triage trusts header sizes; paging for hydration; `Idempotency-Key` header.
+6. Manual audit and a staged rollout before any auto-merge enablement (B6).
 
 ## Blockers needing a user action
 B1 Google OAuth client + consent · B2 GitHub App webhook secret file + public receiver URL · B3 transactional email channel · B4 iPhone device auth scheme / Rakazo compatibility · B5 API key to read live `/api/v1/health` · B6 any deploy, live-DB migration, or flag flip.
 
-## Final verification (2026-10-28)
-- Control-plane suite, 12 parallel shards: 4327 passed, 2 xfailed, 12 skipped (pre-existing); integration/e2e deselected. Integration on private Postgres: bridge 11, migration 3 pass.
-- `npm test` UI: all pass except 3 tests that fail identically on clean origin/main (calm "control: calm off sees motion", freshness-all "/fabric-services chip", skeletons "/fabric-services page head"). None involve `/intelligence`; my route's chip, skeleton and dark-theme loading contracts pass.
-- Scratch worktree removed; worktree clean. Nothing pushed, merged or deployed.
-- Acceptance criteria are NOT met: see Remaining work and blockers B1–B6.
+## Final verification (2026-10-28, after second pass)
+- Control-plane + root + review-gate suites, 12 parallel shards: 7387 passed, 1 failed under load (`test_ci_monitor.py::test_unrelated_http_request_completes_while_provider_is_blocked`, a timing test; passes alone, 18/18), skips pre-existing. Integration on private Postgres: 13 pass.
+- `npm test` UI contracts re-run for calm, dark-theme, skeletons, freshness-all and project-intelligence (9 tests): all pass except the same 3 that fail on clean origin/main; none involve `/intelligence`.
+- Nothing pushed, merged or deployed. Acceptance criteria are NOT fully met: see Remaining work and blockers B1-B6.
