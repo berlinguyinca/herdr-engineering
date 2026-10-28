@@ -2849,6 +2849,8 @@ def _cmd_cp_web(args) -> int:
                              collab_require_https=args.collab_require_https,
                              fleet_config=fleet_store, ci_actions=cp.get("ci_actions") is True,
                              summary_config=cp.get("agent_summaries") or {},
+                             assistant_config={"personal_assistant": cp["personal_assistant"]}
+                                 if isinstance(cp.get("personal_assistant"), dict) else None,
                              review_quorum=_review_quorum_config(cp),
                              usage_retention=usage_retention, attention=attention,
                              ci_fix=ci_fix, missions=missions, github_pg_dsn=dsn,
