@@ -11,11 +11,11 @@ from herdr_engineering.fabric import FabricClient, FabricGateway, GatewayRouter
 from tests.test_fabric import _port_range
 
 
-def _node(tmp_path, name, peer, node_id, port_range, control_port=0, promote_after=2):
+def _node(tmp_path, name, peer, node_id, port_range, promote_after=2):
     registry = DevServiceRegistry(store_path=tmp_path / name / "leases.json", port_range=port_range, lease_ttl_seconds=60)
-    gw = FabricGateway(registry, GatewayRouter(["127.0.0.1"]), control_host="127.0.0.1", control_port=control_port,
+    gw = FabricGateway(registry, GatewayRouter(["127.0.0.1"]), control_host="127.0.0.1", control_port=0,
                        url_base="dev.test", probe_interval=3600, token=None, peer_url=peer, node_id=node_id,
-                       promote_after=promote_after)
+                       promote_after=promote_after, auto_ha=False)
     return gw
 
 
@@ -117,11 +117,10 @@ def test_a_flapping_peer_resets_the_miss_counter(tmp_path, origin):
 
 def test_restarted_primary_rejoins_as_standby_instead_of_splitting_the_brain(tmp_path, origin):
     a, b = _pair(tmp_path)
-    port_a = a.control_port
     a.stop()
     b._ha_step(); b._ha_step()
     assert b.role == "active"
-    a2 = _node(tmp_path, "a", f"http://127.0.0.1:{b.control_port}", "node-a", _port_range(), control_port=port_a)
+    a2 = _node(tmp_path, "a", f"http://127.0.0.1:{b.control_port}", "node-a", _port_range())
     try:
         a2.start()
         assert a2.role == "standby" and a2.epoch == b.epoch
@@ -156,3 +155,32 @@ def test_no_peer_means_always_active_as_before(tmp_path):
     finally:
         g.stop()
 
+
+
+def test_background_loop_mirrors_and_promotes_without_any_manual_step(tmp_path, origin):
+    """The real probe thread (auto_ha=True), not hand-driven steps: standby notices the active is gone and takes over."""
+    import time
+    rng = _port_range()
+    a = _node(tmp_path, "a", None, "node-a", rng)
+    a.start()
+    registry = DevServiceRegistry(store_path=tmp_path / "b" / "leases.json", port_range=rng, lease_ttl_seconds=60)
+    b = FabricGateway(registry, GatewayRouter(["127.0.0.1"]), control_host="127.0.0.1", control_port=0, url_base="dev.test",
+                      probe_interval=0.2, token=None, peer_url=f"http://127.0.0.1:{a.control_port}", node_id="node-b",
+                      promote_after=2)
+    b.start()
+    try:
+        lease = FabricClient(f"http://127.0.0.1:{a.control_port}").register(
+            target_machine_id="bender", target_host="127.0.0.1", target_port=origin)["lease"]
+        deadline = time.time() + 15
+        while time.time() < deadline and not any(lz.id == lease["id"] for lz in b.registry.active_leases()):
+            time.sleep(0.1)
+        assert b.role == "standby" and any(lz.id == lease["id"] for lz in b.registry.active_leases())   # mirrored by the loop
+        a.stop()
+        while time.time() < deadline and b.role != "active":
+            time.sleep(0.1)
+        assert b.role == "active"
+        while time.time() < deadline and lease["external_port"] not in b.router.bound_ports():
+            time.sleep(0.1)
+        assert _get(lease["external_port"]).endswith(b"ok")
+    finally:
+        b.stop()

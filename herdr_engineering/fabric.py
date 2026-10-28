@@ -340,7 +340,8 @@ class FabricGateway:
                  probe_interval: float = 15.0, token: str | None = None,
                  reset_lock: bool = False, rewrite_headers: bool = False,
                  allowed_target_networks: tuple[str, ...] = (), public_scheme: str = "http",
-                 peer_url: str | None = None, node_id: str | None = None, promote_after: int = 3) -> None:
+                 peer_url: str | None = None, node_id: str | None = None, promote_after: int = 3,
+                 auto_ha: bool = True) -> None:
         self.registry = registry
         # Lease targets are limited to loopback + the tailnet (+ these CIDRs): anything else
         # would let a token holder aim the gateway at arbitrary internal services (SSRF).
@@ -356,6 +357,8 @@ class FabricGateway:
         self.role = "active"
         self.epoch = 0
         self._peer_failures = 0
+        # False lets a caller (tests) drive _ha_step itself instead of racing the probe thread.
+        self.auto_ha = auto_ha
         # Opt-in: rewrite loopback URLs in Location / CORS / cookie-domain headers
         # of HTTP leases to the fabric address (forces Connection: close).
         self.rewrite_headers = rewrite_headers
@@ -469,7 +472,7 @@ class FabricGateway:
                 # Pick up store changes made by an overlapping process
                 # (e.g. a register served by a gateway that was mid-shutdown).
                 self.registry.reload_if_changed()
-                if self.peer_url:
+                if self.peer_url and self.auto_ha:
                     self._ha_step()
                 changed = False
                 for lease in (self.registry.active_leases() if self.role == "active" else ()):
