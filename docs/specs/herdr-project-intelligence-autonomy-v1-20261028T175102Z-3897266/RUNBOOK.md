@@ -77,3 +77,6 @@ exact `payload_sha256` and `resource_version` it was shown. Proposals expire aft
 
 ## Who may approve (single-operator tailnet)
 `control_plane.project_intelligence.approvers: [<principal id>, ...]` names the only principals that can approve or reject a proposal. Absent or empty means nobody can; an open listener never can (no identity). Give the approver key ONLY to your iPhone and Mac, keep it out of every agent's environment, and give agents a different key that can request but not approve. The tailnet keeps outsiders away; this list keeps agents on the tailnet from approving their own requests. Requests are already refused when the approver is the requester.
+
+## GitHub without a webhook (tailnet-only)
+GitHub cannot reach a tailnet, so use outbound polling: set `project_intelligence.reconcile_interval_seconds` (integer, at least 60; absent or anything else = off), plus `webhook_projects` (repo -> project ids) and `default_org_id`. Every interval the dashboard records open PR heads no event has recorded. It runs only while `enabled` and `ingest` are on and the kill switch is off. Latency is up to one interval; CI failures arrive through fabric events regardless. `POST /api/v1/intelligence/webhooks/reconcile` still runs one pass by hand.

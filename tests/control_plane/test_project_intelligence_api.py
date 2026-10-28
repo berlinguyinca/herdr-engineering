@@ -216,3 +216,29 @@ def test_only_named_approvers_can_approve_or_reject_and_an_open_listener_never_c
     r = routes(dict(FULL, default_org_id="org1", viewers=viewers, approvers=["open"]))
     p = r.post(["proposals"], body, KEY, "operator")[1]
     assert r.post(["proposals", p["id"], "approve"], {"payload_sha256": p["payload_sha256"], "resource_version": 1}, open_l, "operator")[0] == 403
+
+
+def test_reconcile_now_is_gated_and_scheduled_polling_ignores_bad_intervals():
+    import time
+    from types import SimpleNamespace as NS
+
+    from herdr_engineering.control_plane.intel_bridge import EventBridge
+    sec = dict(FULL, default_org_id="org1", webhook_projects={"o/r": ["p1"]}, viewers={"key:abc": {"org_id": "org1", "projects": "*"}})
+    r = routes(sec)
+    assert r.reconcile_now() is None                                   # no GitHub client yet
+    r.github_app_fn = lambda: NS(open_prs=lambda repo: [NS(number=1, head_sha="c" * 40, author_login="u", base_ref="main")])
+    assert r.reconcile_now()["recorded"] == 1 and r.reconcile_now()["already"] == 1
+    assert routes(dict(sec, kill_switch=True)).reconcile_now() is None
+    for bad in (None, 0, 59, "60", True, -5):                 # anything but an int >= 60 is off
+        b = EventBridge(r.store, lambda: sec, lambda ev: ("p1",), org_id="org1")
+        calls = []
+        b.start_poller(lambda: calls.append(1), lambda bad=bad: bad, tick=0.01)
+        time.sleep(0.15)
+        b.stop()
+        assert calls == [], bad
+    b = EventBridge(r.store, lambda: sec, lambda ev: ("p1",), org_id="org1")
+    calls = []
+    b.start_poller(lambda: (calls.append(1), 1 / 0), lambda: 0, tick=0.01, min_interval=0)   # runs, and an error does not stop it
+    time.sleep(0.4)
+    b.stop()
+    assert len(calls) >= 2 and b.stats["errors"] >= 2

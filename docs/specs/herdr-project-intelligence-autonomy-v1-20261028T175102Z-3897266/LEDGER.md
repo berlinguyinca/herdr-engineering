@@ -136,3 +136,5 @@ Limitations: the gate only applies to branches named `herdr-ci-fix/*`; required 
 `intel_executor.py`: runs only with `enabled` + `execute` and no kill switch; atomic claim (second run refused); payload re-hashed; strict per-action schema; `link_entities` (human_verified relationship), `pause_ingestion`, `request_ci_repair` (existing CI-fix request, idempotent on proposal id) are wired; `propose_issue` needs a hook that does not exist yet.
 ## Pass 5: approvers allowlist
 `project_intelligence.approvers` (YAML) gates approve/reject: 403 unless the acting principal is listed and not an open listener. Replaces the planned iPhone device-auth scheme (B4) for a single-operator tailnet. Not built: source-address pinning of approvals (the principal does not carry the remote address).
+## Pass 5: polling replaces the webhook (B2)
+GitHub cannot reach the tailnet, so B2 (public receiver) is dropped. `reconcile_interval_seconds` runs `reconcile_open_prs` on its own thread; the signed receiver stays in the code, unused.
