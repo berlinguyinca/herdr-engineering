@@ -297,8 +297,9 @@ class ControlPlaneServer:
         # Herdr Personal Assistant (Rakazo integration, P1/P2). Canonical owner;
         # feature-flag gated (off by default) and inert until enabled.
         if assistant_service is None:
-            from .assistant import AssistantService, assistant_config
-            self.assistant = AssistantService(config=assistant_config(assistant_config or {}))
+            from .assistant import AssistantService
+            from .assistant import assistant_config as _build_assistant_config
+            self.assistant = AssistantService(config=_build_assistant_config(assistant_config or {}))
         else:
             self.assistant = assistant_service
         from .ingest import IngestService
