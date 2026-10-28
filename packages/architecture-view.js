@@ -70,7 +70,7 @@ const label = s => `${text(s.repository_id).replace(/^github\.com\//, '')} @ ${t
 export function mountArchitecture(root, client, opts = {}) {
   let alive = true, ctl = new AbortController();
   const st = {snapshots: [], sid: opts.snapshot || '', parent: opts.parent || '', q: opts.q || '', page: null, detail: null, diff: null,
-    analyses: [], cursor: null, caps: [], extras: null, timeline: null, cross: null, explain: null, request: null, corr: null, rooms: null, cancels: {}};
+    analyses: [], cursor: null, caps: [], extras: null, timeline: null, cross: null, explain: null, maps: [], request: null, corr: null, rooms: null, cancels: {}};
   root.innerHTML = `<div class="arch">${skeleton('architecture')}</div>`;
   const host = root.firstElementChild;
   const snap = () => st.snapshots.find(s => s.snapshot_id === st.sid);
@@ -180,12 +180,16 @@ export function mountArchitecture(root, client, opts = {}) {
   function crossPanel() {
     const targets = crossTargets(st.snapshots, snap());
     if (targets.length < 2) return '';
-    const c = st.cross;
+    const c = st.cross, repos = targets.map(x => x.repository_id);
     const row = e => `<li data-xedge>${esc(e.from.repository_id)} ${esc(e.from.node_id)} → ${esc(e.to.repository_id)} ${esc(e.to.node_id)} <small>${esc(e.source_span.path)}:${e.source_span.line_start} · ${esc(e.resolution)}</small></li>`;
     return `<section class="arch-cross" aria-label="Cross-repository dependencies"><h2>Cross-repository</h2>
+      <form data-mapform aria-label="Add a package mapping"><label>Importer <select name="importer">${repos.map(r => `<option>${esc(r)}</option>`).join('')}</select></label>
+        <label>Package <input name="package" required pattern="[^|]+"></label>
+        <label>Provided by <select name="provider">${repos.map(r => `<option>${esc(r)}</option>`).join('')}</select></label><button type="submit">Add mapping</button></form>
+      ${st.maps.length ? `<ul data-maps>${st.maps.map((m, i) => `<li>${esc(m.importer)}: <code>${esc(m.package)}</code> → ${esc(m.provider)} <button type="button" class="link" data-unmap="${i}">remove</button></li>`).join('')}</ul>` : ''}
       <button type="button" data-cross>Resolve across ${targets.length} repositories</button>
       ${c ? (c.error ? `<p class="arch-notice failed" role="alert">${esc(c.error)}</p>` : `<p data-testid="arch-cross-summary">${c.verified.length} verified · ${c.inferred.length} inferred · ${c.ambiguous.length} ambiguous${c.incomplete ? ' · incomplete (limit reached)' : ''}</p>
-      <h3>Verified (explicit mapping)</h3>${list(c.verified.slice(0, 30), 'None. Verified edges need an explicit mapping, which is only available through the API (map=importer|package|provider).', row)}
+      <h3>Verified (explicit mapping)</h3>${list(c.verified.slice(0, 30), 'None. Add a mapping above to state which repository provides a package; only then is an edge verified.', row)}
       <h3>Inferred (name match only)</h3>${list(c.inferred.slice(0, 30), 'None.', row)}
       ${c.warnings.map(w => `<p class="arch-note">${esc(w)}</p>`).join('')}`) : ''}</section>`;
   }
@@ -232,7 +236,7 @@ export function mountArchitecture(root, client, opts = {}) {
   host.addEventListener('click', ev => {
     const cx = ev.target.closest('[data-cancel]');
     if (cx) return cancelClick(cx.dataset.cancel);
-    const ex = ev.target.closest('[data-explain],[data-cross],[data-pick]');
+    const ex = ev.target.closest('[data-explain],[data-cross],[data-pick],[data-unmap]');
     if (ex) return extraClick(ex);
     const t = ev.target.closest('[data-node],[data-open],[data-crumb],[data-more]');
     if (!t) return;
@@ -242,16 +246,24 @@ export function mountArchitecture(root, client, opts = {}) {
   });
   async function extraClick(t) {
     try {
-      if (t.dataset.pick) { st.sid = t.dataset.pick; st.parent = ''; st.q = ''; st.detail = null; st.diff = null; st.extras = null; await browse(); }
+      if (t.dataset.unmap !== undefined) { st.maps.splice(Number(t.dataset.unmap), 1); render(); }
+      else if (t.dataset.pick) { st.sid = t.dataset.pick; st.parent = ''; st.q = ''; st.detail = null; st.diff = null; st.extras = null; await browse(); }
       else if (t.dataset.cross !== undefined) {
         const ids = crossTargets(st.snapshots, snap()).map(x => x.snapshot_id);
-        st.cross = await client.getArchitectureCrossRepo(ids, [], {signal: ctl.signal}).catch(e => ({error: e.message})); render();
+        st.cross = await client.getArchitectureCrossRepo(ids, st.maps, {signal: ctl.signal}).catch(e => ({error: e.message})); render();
       } else if (t.dataset.explain !== undefined && st.detail) {
         st.explain = {pending: true}; render();
         st.explain = await client.explainArchitectureNode(st.sid, st.detail.node.node_id, {signal: ctl.signal}).catch(e => ({error: e.message})); render();
       }
     } catch (e) { if (e.name !== 'AbortError') fail(e); }
   }
+  host.addEventListener('submit', ev => {
+    if (!ev.target.matches('[data-mapform]')) return;
+    ev.preventDefault();
+    const f = new FormData(ev.target), m = {importer: f.get('importer'), package: String(f.get('package')).trim(), provider: f.get('provider')};
+    if (m.package && !m.package.includes('|') && !st.maps.some(x => x.importer === m.importer && x.package === m.package)) st.maps.push(m);
+    render();
+  });
   host.addEventListener('submit', async ev => {
     if (!ev.target.matches('[data-request]')) return;
     ev.preventDefault();
