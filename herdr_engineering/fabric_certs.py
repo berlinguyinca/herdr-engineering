@@ -64,7 +64,7 @@ class AcmeRoute53:
     staging: bool = False
     email: str | None = None            # None registers without an address (nothing is sent to a third party)
     certbot: str = "certbot"
-    runner: Callable[..., subprocess.CompletedProcess] = field(default=subprocess.run, repr=False)
+    runner: Callable[..., subprocess.CompletedProcess] | None = field(default=None, repr=False)   # None: subprocess.run, looked up at call time
 
     def __post_init__(self) -> None:
         self.directory = Path(self.directory).expanduser()
@@ -105,7 +105,7 @@ class AcmeRoute53:
         self.directory.mkdir(parents=True, exist_ok=True)
         self.directory.chmod(0o700)
         before = validity(self.fullchain)[1] if self.fullchain.exists() else None
-        proc = self.runner(self.command(force=force), capture_output=True, text=True, timeout=600)
+        proc = (self.runner or subprocess.run)(self.command(force=force), capture_output=True, text=True, timeout=600)
         if proc.returncode != 0:
             tail = (proc.stderr or proc.stdout or "").strip().splitlines()[-3:]
             raise CertError(f"certbot failed ({proc.returncode}): {' | '.join(tail)[:400]}")

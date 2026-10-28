@@ -177,3 +177,80 @@ def test_cp_web_passes_the_fabric_helpers_to_the_server(monkeypatch, config, tmp
     assert rc == 0
     assert callable(captured["fabric_resolver"]) and captured["fabric_resolver"].__name__ == "resolve_urls"
     assert callable(captured["fabric_services"]) and captured["fabric_services"].__name__ == "list"
+
+
+# ---- devfabric cert / dns / gateway --acme-domain ----------------------------------------------
+def _acme_dir_with_cert(tmp_path, domain="local.example.test", days=90):
+    import subprocess
+    live = tmp_path / "acme" / "config" / "live" / domain
+    live.mkdir(parents=True)
+    subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", str(live / "privkey.pem"),
+                    "-out", str(live / "fullchain.pem"), "-days", str(days), "-subj", f"/CN={domain}",
+                    "-addext", f"subjectAltName=DNS:{domain},DNS:*.{domain}"], check=True, capture_output=True)
+    return tmp_path / "acme"
+
+
+def test_cert_status_and_renew_when_not_due(tmp_path, capsys, config):
+    d = _acme_dir_with_cert(tmp_path)
+    rc, st = _run(capsys, "devfabric", "cert", "status", "--domain", "local.example.test", "--dir", str(d))
+    assert rc == 0 and st["public"]["due"] is False and st["public"]["domain"] == "local.example.test"
+    rc, out = _run(capsys, "devfabric", "cert", "renew", "--domain", "local.example.test", "--dir", str(d))
+    assert rc == 0 and out == {"ok": True, "changed": False, "note": "not due"}
+
+
+def test_cert_status_before_issue_and_missing_domain(tmp_path, capsys, config):
+    rc, st = _run(capsys, "devfabric", "cert", "status", "--domain", "x.example.test", "--dir", str(tmp_path / "none"))
+    assert rc == 0 and st["public"] is None
+    with pytest.raises(SystemExit, match="no domain"):
+        cli.main(["devfabric", "cert", "status"])
+
+
+def test_cert_issue_failure_is_reported_not_raised(tmp_path, capsys, config, monkeypatch):
+    import subprocess
+    monkeypatch.setattr(subprocess, "run", lambda cmd, **k: subprocess.CompletedProcess(cmd, 1, "", "no creds"))
+    rc, out = _run(capsys, "devfabric", "cert", "issue", "--domain", "x.example.test", "--dir", str(tmp_path / "a"), "--staging")
+    assert rc == 1 and out["ok"] is False and "no creds" in out["error"]
+
+
+def test_dns_publish_dry_run_and_refusal(capsys, config, monkeypatch):
+    from herdr_engineering import fabric_dns
+    from tests.test_fabric_dns import ZONES, FakeR53
+    fake = FakeR53(ZONES[:1])
+    monkeypatch.setattr(fabric_dns, "route53_client", lambda: fake)
+    rc, out = _run(capsys, "devfabric", "dns", "publish", "--domain", "local.example.test", "--ip", "100.64.1.1", "--dry-run")
+    assert rc == 0 and out["changed"] and not out["applied"] and fake.changes == []
+    rc, out = _run(capsys, "devfabric", "dns", "publish", "--domain", "local.example.test", "--ip", "192.168.0.9")
+    assert rc == 1 and "tailnet" in out["error"] and fake.changes == []
+
+
+def test_gateway_acme_domain_serves_public_cert_by_sni_and_defaults_url_base(monkeypatch, capsys, tmp_path):
+    import http.server
+    import threading
+
+    from herdr_engineering.fabric import FabricClient
+    d = _acme_dir_with_cert(tmp_path)
+    origin = http.server.ThreadingHTTPServer(("127.0.0.1", 0), http.server.SimpleHTTPRequestHandler)
+    threading.Thread(target=origin.serve_forever, daemon=True).start()
+    argv, seen, port = _run_gateway(monkeypatch, capsys, tmp_path, "--acme-domain", "local.example.test", "--acme-dir", str(d))
+    argv = [a for a in argv if a not in ("--url-base", "dev.test")]
+    results = {}
+
+    def probe():
+        reg = FabricClient(f"http://127.0.0.1:{port}", token="").register(
+            target_machine_id="bender", target_host="127.0.0.1", target_port=origin.server_address[1])
+        lease = reg["lease"]
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.check_hostname, ctx.verify_mode = False, ssl.CERT_NONE
+        with socket.create_connection(("127.0.0.1", lease["external_port"]), timeout=5) as raw, \
+                ctx.wrap_socket(raw, server_hostname="svc.local.example.test") as tls:
+            tls.sendall(b"GET / HTTP/1.1\r\nHost: svc.local.example.test\r\nConnection: close\r\n\r\n")
+            results["status"] = tls.recv(12)
+        results["url"] = reg["url"]
+    seen["hook"] = probe
+    try:
+        assert cli.main(argv) == 0
+    finally:
+        origin.shutdown()
+    assert seen["banner"]["url_base"] == "local.example.test" and seen["banner"]["https"] is True
+    assert results["status"].startswith(b"HTTP/1.")
+    assert results["url"].startswith("https://local.example.test:")
