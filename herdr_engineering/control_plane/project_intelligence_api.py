@@ -22,6 +22,7 @@ class IntelligenceRoutes:
         """``store_fn`` builds the store lazily (only once the feature is enabled); ``store`` is for tests/embedding."""
         self._store, self._store_fn = store, store_fn
         self._section = section_fn
+        self.github_app_fn = None   # set by the API glue: () -> review-gate GitHub client or None
         self.metrics_fn = None      # set by the API glue: () -> dict of bridge counters and incident states
         from .intel_webhook import ReplayGuard
         self._replay = ReplayGuard()
@@ -186,6 +187,18 @@ class IntelligenceRoutes:
                     return 404, {"error": "not found"}
                 self.store.pause_source(viewer.org_id, parts[1], parts[2] == "pause")
                 return 200, {"source": parts[1], "paused": parts[2] == "pause"}
+            if parts == ["webhooks", "reconcile"]:
+                from datetime import UTC, datetime
+
+                from .intel_webhook import reconcile_open_prs
+                app = self.github_app_fn() if self.github_app_fn else None
+                projects, org = raw.get("webhook_projects"), raw.get("default_org_id")
+                if app is None or not isinstance(projects, dict) or not projects or not isinstance(org, str):
+                    return 409, {"error": "reconcile needs the review-gate GitHub client, webhook_projects and default_org_id"}
+                if viewer.project_ids is not None or not cfg["ingest"] or cfg["kill_switch"]:
+                    return 404, {"error": "not found"}
+                return 200, reconcile_open_prs(app, self.store, cfg, org_id=org, installation=str(raw.get("webhook_installation") or "github"),
+                                               repo_projects=projects, received_at=datetime.now(UTC))
         except pi.NotFound:
             return 404, {"error": "not found"}
         except pi.StoreUnavailable:

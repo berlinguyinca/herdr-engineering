@@ -470,6 +470,7 @@ class ControlPlaneServer:
             repo, lambda: self._intelligence_section(fleet_config), github_pg_dsn)
         repo.egress_fn = lambda: self._intelligence_section(fleet_config).get("egress") or {}
         self.intelligence.metrics_fn = self._intelligence_metrics
+        self.intelligence.github_app_fn = lambda: getattr(self, "gate_app", None)
         if getattr(self, "assistant", None) is not None:
             self.assistant.intelligence_read = self.intelligence.assistant_read
         self._configure_architecture_explain(fleet_config, architecture_explain)
@@ -625,6 +626,7 @@ class ControlPlaneServer:
         # The queue's real lease and the lease a Claim reports must be one value.
         self.gate_queue = ReviewQueue(repo, lease_seconds=config.reviewer.lease_seconds)
         app = github_app.GitHubAppClient(config.app)  # one client for gate + coordinator
+        self.gate_app = app
         registry = AuthorRegistry(repo)
         notifier = AuthorNotifier(repo, config=config.notify, registry=registry,
                                   dispatcher=self.dispatcher)

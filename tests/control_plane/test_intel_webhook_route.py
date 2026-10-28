@@ -142,3 +142,29 @@ def test_http_status_exposes_metrics_to_a_mapped_operator(tmp_path):
         assert body["enabled"] is True and set(body["metrics"]) == {"bridge", "queue_depth", "incidents"}
     finally:
         server.shutdown()
+
+
+def test_reconcile_records_only_prs_no_webhook_saw_and_is_repeatable():
+    from datetime import UTC, datetime
+    from types import SimpleNamespace as NS
+
+    from herdr_engineering.control_plane import intel_webhook as wh
+
+    class App:
+        def open_prs(self, repo):
+            if repo == "bad/repo":
+                raise RuntimeError("boom")
+            return [NS(number=3, head_sha="a" * 40, author_login="u", base_ref="main"),
+                    NS(number=4, head_sha="b" * 40, author_login="u", base_ref="main")]
+
+    store, cfg = pi.IntelligenceStore(), {"enabled": True, "ingest": True}
+    # PR 3 at that head was already delivered by a webhook
+    store.append_event(wh.normalise("pull_request", json.loads(BODY), org_id="org", installation="github", project_ids=("p1",),
+                                    received_at=datetime(2026, 10, 28, tzinfo=UTC)), cfg=cfg)
+    args = dict(org_id="org", installation="github", repo_projects={"o/r": ["p1"], "bad/repo": ["p2"]},
+                received_at=datetime(2026, 10, 28, 1, tzinfo=UTC))
+    first = wh.reconcile_open_prs(App(), store, cfg, **args)
+    assert first == {"seen": 2, "recorded": 1, "already": 1, "errors": 1}
+    again = wh.reconcile_open_prs(App(), store, cfg, **args)
+    assert again["recorded"] == 0
+    assert store.timeline(pi.Viewer("org", None, "restricted"), project_id="p1")["total"] == 2

@@ -133,3 +133,34 @@ def normalise(event_name: str, payload: dict, *, org_id: str, installation: str,
 
 def stale(delivery_received: datetime, now: datetime, max_age: timedelta = timedelta(days=7)) -> bool:
     return now - delivery_received > max_age
+
+
+def reconcile_open_prs(app, store, cfg: dict, *, org_id: str, installation: str, repo_projects: dict[str, list[str]],
+                       received_at: datetime, max_prs: int = 200) -> dict:
+    """Backstop for missed deliveries: record each open PR head that no webhook already recorded.
+
+    ``app.open_prs(repo)`` is the existing review-gate GitHub client call. Events use ``pr.reconciled`` and a
+    version of ``<head sha>:reconciled``, so a repeat run is a no-op and a webhook that later arrives is stored
+    alongside (it is a different fact), never overwriting it. Unmapped repositories are not queried.
+    """
+    stats = {"seen": 0, "recorded": 0, "already": 0, "errors": 0}
+    for repo, projects in sorted(repo_projects.items()):
+        try:
+            prs = list(app.open_prs(repo))[:max_prs]
+        except Exception:  # noqa: BLE001 - one repository failing must not stop the others
+            stats["errors"] += 1
+            continue
+        for pr in prs:
+            stats["seen"] += 1
+            source_id = f"{repo}#pr{pr.number}"
+            if store.has_source_version(org_id, "github", installation, source_id, f"{pr.head_sha}:"):
+                stats["already"] += 1
+                continue
+            raw = normalise("pull_request", {"action": "reconciled", "repository": {"full_name": repo},
+                                             "pull_request": {"number": pr.number, "head": {"sha": pr.head_sha},
+                                                              "user": {"login": pr.author_login}, "state": "open",
+                                                              "base": {"ref": pr.base_ref}}},
+                            org_id=org_id, installation=installation, project_ids=tuple(projects), received_at=received_at)
+            store.append_event(raw, cfg=cfg)
+            stats["recorded"] += 1
+    return stats

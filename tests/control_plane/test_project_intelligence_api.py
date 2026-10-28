@@ -114,3 +114,18 @@ def test_status_metrics_are_operator_only_counters():
     st, body = r.get(["status"], {}, viewer_key, "operator")
     assert st == 200 and body["metrics"]["bridge"]["accepted"] == 3
     assert "metrics" not in r.get(["status"], {}, viewer_key, "viewer")[1]
+
+
+def test_reconcile_route_is_operator_org_wide_and_needs_the_github_client():
+    from types import SimpleNamespace as NS
+    sec = dict(FULL, default_org_id="org1", webhook_projects={"o/r": ["p1"]},
+               viewers={"key:abc": {"org_id": "org1", "projects": "*"}})
+    r = routes(sec)
+    assert r.post(["webhooks", "reconcile"], {}, KEY, "operator")[0] == 409          # no GitHub client
+    r.github_app_fn = lambda: NS(open_prs=lambda repo: [NS(number=1, head_sha="c" * 40, author_login="u", base_ref="main")])
+    st, body = r.post(["webhooks", "reconcile"], {}, KEY, "operator")
+    assert st == 200 and body["recorded"] == 1
+    assert r.post(["webhooks", "reconcile"], {}, KEY, "viewer")[0] == 404
+    scoped = routes(dict(sec, viewers={"key:abc": {"org_id": "org1", "projects": ["p1"]}}))
+    scoped.github_app_fn = r.github_app_fn
+    assert scoped.post(["webhooks", "reconcile"], {}, KEY, "operator")[0] == 404

@@ -343,6 +343,12 @@ class IntelligenceStore:
                 self._outbox.setdefault((eid, consumer), {"event_id": eid, "consumer": consumer, "done": False})
             return ev, True
 
+    def has_source_version(self, org_id: str, source_system: str, source_instance: str, source_id: str, version_prefix: str) -> bool:
+        """Whether any stored event already records this source fact at a version starting with ``version_prefix``."""
+        with self._lock:
+            return any(e.org_id == org_id and e.source_system == source_system and e.source_instance == source_instance
+                       and e.source_id == source_id and e.source_version.startswith(version_prefix) for e in self._events.values())
+
     def account_message_refs(self, org_id: str, account: str) -> list[str]:
         """Distinct evidence source refs ``gmail:<account>:<id>`` held for one connected account."""
         prefix = f"gmail:{account}:"
