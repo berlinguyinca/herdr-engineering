@@ -343,6 +343,13 @@ class IntelligenceStore:
                 self._outbox.setdefault((eid, consumer), {"event_id": eid, "consumer": consumer, "done": False})
             return ev, True
 
+    def account_message_refs(self, org_id: str, account: str) -> list[str]:
+        """Distinct evidence source refs ``gmail:<account>:<id>`` held for one connected account."""
+        prefix = f"gmail:{account}:"
+        with self._lock:
+            return sorted({r.source_ref for ev in self._events.values() if ev.org_id == org_id and not ev.tombstoned
+                           for r in ev.evidence if r.source_ref.startswith(prefix)})
+
     def tombstone_source(self, org_id: str, source_ref: str) -> int:
         """Source deleted/revoked: tombstone every event citing it, so derived output is re-evaluated."""
         n = 0
