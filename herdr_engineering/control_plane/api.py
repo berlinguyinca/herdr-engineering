@@ -469,6 +469,7 @@ class ControlPlaneServer:
         self.intelligence, self.intelligence_bridge = install_intelligence(
             repo, lambda: self._intelligence_section(fleet_config), github_pg_dsn)
         repo.egress_fn = lambda: self._intelligence_section(fleet_config).get("egress") or {}
+        self.intelligence.metrics_fn = self._intelligence_metrics
         if getattr(self, "assistant", None) is not None:
             self.assistant.intelligence_read = self.intelligence.assistant_read
         self._configure_architecture_explain(fleet_config, architecture_explain)
@@ -476,6 +477,12 @@ class ControlPlaneServer:
             collab.architecture = self.architecture
         # live stream (Spec §52)
         repo.subscribe(self._broadcast)
+
+    def _intelligence_metrics(self) -> dict:
+        from collections import Counter
+        bridge = self.intelligence_bridge
+        return {"bridge": dict(bridge.stats), "queue_depth": bridge._q.qsize(),
+                "incidents": dict(Counter(i["state"] for i in bridge.board.summary()))}
 
     @staticmethod
     def _intelligence_section(fleet_config):

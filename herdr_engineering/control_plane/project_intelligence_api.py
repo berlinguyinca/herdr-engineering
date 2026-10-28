@@ -22,6 +22,7 @@ class IntelligenceRoutes:
         """``store_fn`` builds the store lazily (only once the feature is enabled); ``store`` is for tests/embedding."""
         self._store, self._store_fn = store, store_fn
         self._section = section_fn
+        self.metrics_fn = None      # set by the API glue: () -> dict of bridge counters and incident states
         from .intel_webhook import ReplayGuard
         self._replay = ReplayGuard()
 
@@ -129,8 +130,11 @@ class IntelligenceRoutes:
             return 404, {"error": "not found"}
         try:
             if parts == ["status"]:
-                return 200, {"enabled": True, "flags": {f: cfg[f] for f in pi.FLAGS}, "kill_switch": cfg["kill_switch"],
-                             "schema_version": pi.SCHEMA_VERSION}
+                out = {"enabled": True, "flags": {f: cfg[f] for f in pi.FLAGS}, "kill_switch": cfg["kill_switch"],
+                       "schema_version": pi.SCHEMA_VERSION}
+                if role == "operator" and self.metrics_fn is not None:
+                    out["metrics"] = self.metrics_fn()       # counters only: no content, ids or titles
+                return 200, out
             if parts in (["projects"], ["investigations"]):
                 kind = parts[0][:-1] if parts[0] == "projects" else "investigation"
                 return 200, {"items": [{"id": r.id, "name": r.name, "status": r.status, "owner": r.owner,

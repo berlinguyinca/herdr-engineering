@@ -129,3 +129,16 @@ def test_http_webhook_is_404_when_the_feature_is_off():
         assert _post(server, hdr(), BODY)[0] == 404
     finally:
         server.shutdown()
+
+
+def test_http_status_exposes_metrics_to_a_mapped_operator(tmp_path):
+    import hashlib as _h
+    digest = _h.sha256(b"op").hexdigest()[:12]
+    server = _server({"enabled": True, "default_org_id": "org", "viewers": {f"key:{digest}": {"org_id": "org", "projects": "*"}}})
+    try:
+        req = urllib.request.Request(f"http://127.0.0.1:{server.port}/api/v1/intelligence/status", headers={"X-API-Key": "op"})
+        with urllib.request.urlopen(req, timeout=3) as r:
+            body = json.load(r)
+        assert body["enabled"] is True and set(body["metrics"]) == {"bridge", "queue_depth", "incidents"}
+    finally:
+        server.shutdown()

@@ -105,3 +105,12 @@ def test_store_is_built_lazily_and_never_when_disabled():
     assert r.get(["status"], {}, KEY, "operator")[0] == 404 and built == []
     r2 = IntelligenceRoutes(store_fn=lambda: built.append(1) or pi.IntelligenceStore(), section_fn=lambda: FULL)
     assert r2.get(["projects"], {}, KEY, "operator")[0] == 200 and built == [1]
+
+
+def test_status_metrics_are_operator_only_counters():
+    r = routes(FULL)
+    r.metrics_fn = lambda: {"bridge": {"accepted": 3}, "queue_depth": 0, "incidents": {"FAILED": 1}}
+    viewer_key = dict(KEY)
+    st, body = r.get(["status"], {}, viewer_key, "operator")
+    assert st == 200 and body["metrics"]["bridge"]["accepted"] == 3
+    assert "metrics" not in r.get(["status"], {}, viewer_key, "viewer")[1]
