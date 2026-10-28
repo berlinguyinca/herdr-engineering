@@ -481,13 +481,21 @@ class AssistantMemory:
 # approval unless the grant carries `preauthorized: true`.
 TOOL_CATALOG: dict[str, dict[str, Any]] = {
     "chat": {"sensitive": False, "description": "Respond in conversation."},
-    "read_memory": {"sensitive": False, "description": "Read the user's assistant memory.",
+    "read_memory": {"sensitive": False,
+                    "description": "Read the assistant's stored memory facts (optionally filtered by namespace or keyword).",
                     "parameters": {"type": "object", "properties": {
-                        "key": {"type": "string", "description": "Memory key to read."}}}},
-    "write_memory": {"sensitive": False, "description": "Store a corrected memory fact.",
+                        "namespace": {"type": "array", "items": {"type": "string"},
+                                      "description": "Optional namespaces to filter by."},
+                        "query": {"type": "string",
+                                  "description": "Optional keyword to search memory content."}}}},
+    "write_memory": {"sensitive": False, "description": "Store a memory fact for later recall.",
                      "parameters": {"type": "object", "properties": {
-                         "key": {"type": "string"}, "value": {"type": "string"}},
-                         "required": ["key", "value"]}},
+                         "content": {"type": "string", "description": "The fact to remember."},
+                         "namespace": {"type": "string",
+                                       "description": "Optional namespace (default 'private')."},
+                         "classification": {"type": "string",
+                                            "description": "Optional category (default 'general')."}},
+                         "required": ["content"]}},
     "browse": {"sensitive": False, "description": "Fetch a web page for research (untrusted output).",
                "parameters": {"type": "object", "properties": {
                    "url": {"type": "string", "description": "Absolute https URL to fetch."}},
@@ -2225,7 +2233,8 @@ class AssistantService:
                                     url=payload.get("url", ""))
         if tool_id == "read_memory":
             recs = self.store.search_memory(tenant_id=tenant_id, user_id=user_id,
-                                            assistant_id=assistant_id, query="", limit=50)
+                                            assistant_id=assistant_id,
+                                            query=str(payload.get("query") or ""), limit=50)
             ns = payload.get("namespace")
             if ns:
                 wanted = set(ns) if isinstance(ns, (list, tuple, set)) else {str(ns)}

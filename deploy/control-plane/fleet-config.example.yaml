@@ -56,6 +56,60 @@ sections:
         #   evidence_writers: ["key:ci-service"]   # ONLY these writers' merged/validated marks count as evidence
         #   min_group_size: 5              # aggregates over fewer items are hidden
         #   reads_per_minute: 60
+      # OPTIONAL: the Personal Assistant (inert unless `enabled: true`). Nothing in
+      # the assistant module runs while disabled; the /personal-assistant dashboard
+      # view only appears when the `assistant_v1` capability is advertised (enabled).
+      # Deny-by-default throughout: tools are never offered to the model unless the
+      # user grants them, sensitive tools require an operator approval, and secrets
+      # are redacted from prompts, logs and events. Copy only what you need.
+      # personal_assistant:
+      #   enabled: false                 # master kill-switch (also gates the capability flag)
+      #   # Real inference. When `endpoint` is set the service uses an HTTP
+      #   # chat-completions runner (OpenAI-compatible, incl. tool-calling); when
+      #   # empty it falls back to a deterministic local runner (skeleton only).
+      #   # `api_key` is the llm-proxy PROJECT key and is never logged. `model` must
+      #   # be one the proxy actually serves (check GET /v1/models) or every call
+      #   # returns capacity_unavailable.
+      #   inference:
+      #     endpoint: "http://llm-proxy:8088/v1/chat/completions"
+      #     model: "REDACTED_MODEL_ID"   # e.g. a qwen* id present in the proxy's /v1/models
+      #     timeout: 60
+      #     api_key: "REDACTED"          # llm-proxy project key (never logged)
+      #   # Optional durable store. When set, the assistant snapshots its store to
+      #   # pa_store_snapshot (JSONB) in this database on every mutation and reloads
+      #   # it on startup, so threads/memory/grants/approvals survive a restart.
+      #   persistence:
+      #     dsn: "postgresql://REDACTED:REDACTED@postgres:5432/herdr_pa"
+      #   # Inject a redacted, INFORMATIONAL-ONLY snapshot of live fleet state (hosts,
+      #   # missions, sessions, services, activity) as a system message so the
+      #   # assistant can answer questions about the fleet. Payloads are treated as
+      #   # data, never instructions (prompt-injection guard), and are secret-redacted.
+      #   fleet_context:
+      #     enabled: false
+      #     max_chars: 6000              # hard cap on the injected snapshot
+      #     per_section: 10              # items shown per section
+      #   # Agentic tool-calling loop. When enabled, the model may request tools, but
+      #   # ONLY tools the user has an active grant for are ever offered (deny-by-
+      #   # default), each call is gated, and sensitive tools surface an approval
+      #   # instead of auto-running. The loop is capped at max_iterations; each tool
+      #   # result is truncated to max_result_chars and secret-redacted before return.
+      #   tools:
+      #     enabled: false
+      #     max_iterations: 5            # max model<->tool round-trips per reply
+      #     max_result_chars: 2000       # per-tool-result truncation cap
+      #   # Sandbox policy for the computer tools (run_shell / browse /
+      #   # connector_request). deny-by-default: they do nothing unless the operator
+      #   # opts in AND the target host/command/origin is allowlisted.
+      #   computer:
+      #     allow_shell: false
+      #     allow_browser: false
+      #     allowed_hosts: []            # e.g. ["bender"] - never the operator laptop
+      #     allowed_commands: []         # exact-command allowlist for run_shell
+      #     allowed_connector_origins: []  # https origins reachable by connector/browse (SSRF guard)
+      #     max_timeout_seconds: 30
+      #   approval_ttl_seconds: 3600     # how long a pending approval stays actionable
+      #   grant_max_ttl_seconds: 2592000 # ceiling on a tool grant's lifetime (30d)
+      #   max_requests_per_minute: 120   # fixed-window per-key rate limit
       # Variables docker compose itself substitutes; deploy.sh renders exactly this
       # mapping into a transient 0600 env file. The first eight keys are required.
       compose:

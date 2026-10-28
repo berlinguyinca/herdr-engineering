@@ -78,3 +78,17 @@ def test_gateway_rewrites_redirect_when_opted_in(tmp_path):
     assert "Location: http://localhost:" in results[False][0]
     assert f"Location: http://dev.test:{results[True][1]}/next" in results[True][0]
     assert seen["conn"] == "close"
+
+
+def test_scheme_pins_https_for_tls_terminated_leases():
+    head = b"HTTP/1.1 302 Found\r\nLocation: http://localhost:3000/x\r\nContent-Length: 0"
+    assert b"Location: https://dev.lan:3000/x" in rewrite_response_head(head, 3000, "dev.lan:3000", "https")
+    assert b"Location: http://dev.lan:3000/x" in rewrite_response_head(head, 3000, "dev.lan:3000")
+
+
+def test_inject_request_headers_replaces_client_supplied_forwarding_headers():
+    from herdr_engineering.urlrewrite import inject_request_headers
+    head = b"GET / HTTP/1.1\r\nHost: a\r\nx-forwarded-proto: http\r\nX-Forwarded-For: 6.6.6.6"
+    out = inject_request_headers(head, {"X-Forwarded-Proto": "https", "X-Forwarded-For": "1.2.3.4"})
+    assert out.lower().count(b"x-forwarded-proto") == 1 and b"6.6.6.6" not in out
+    assert b"X-Forwarded-Proto: https" in out and b"X-Forwarded-For: 1.2.3.4" in out

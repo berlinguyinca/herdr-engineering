@@ -4,6 +4,7 @@ import {mergeEntry, renderEvent, telemetryHealth} from './herdr-web-components/i
 import {mountComposer} from './conversation-composer.js';
 import {filterItems} from './collab-mention.js';
 import {renderMarkdown} from './conversation-markdown.js';
+import {createFabricUrlResolver,installFabricLinkActions} from './fabric-urls.js';
 import {createEntityIndex} from './entity-refs.js';
 import {parseJson,renderJson} from './conversation-json.js';
 import {selectEvents, linkedAgents, githubLinks, referenceSuggestions, pendingOperation} from './session-workspace-model.js';
@@ -41,8 +42,12 @@ export function mountSessionWorkspace(host,client,session,{connect=connectEvents
     link.dataset.sessionWorkspaceStyle='';document.head.append(link);
   }
   // session:/mission:/host: references link only entities the dashboard knows now (cross-linking).
-  const entityIndex=createEntityIndex(client),markdown={references:entityIndex.resolver};
+  const entityIndex=createEntityIndex(client);
+  // localhost URLs in agent output resolve to the fabric address of the host the agent ran on (render-time only).
+  const fabric=createFabricUrlResolver(client,{sourceMachine:()=>session?.host_id||session?.host||null,onChange:()=>{if(!disposed){summarySignature='';schedulePaint();}}});
+  const markdown={references:entityIndex.resolver,urls:fabric.resolver};
   let disposed=false, data=null, events=[], conversationEvents=[], sessions=[], collaborators=[], epoch=null, request=0, loading=false, error='', streamError=false;
+  const STREAM_SETTLE_MS=2500;let lastStreamEventAt=0,settleTimer;
   let renderTimer, refreshTimer, selection=null, split=60;
   let historyGeneration=0,historyReset=false,fullscreen=false,fullscreenFocus=null,agentSummary=null,summaryBusy=false,summaryError='',summarySignature='';
   const expanded=new Map();
@@ -115,7 +120,10 @@ export function mountSessionWorkspace(host,client,session,{connect=connectEvents
     const agentNames=new Map((data?.summary?.agents || []).map(a=>[a.agent_id,a.display_name || a.agent_id]));
     agentNames.set('main',session.display_name || agentNames.get('main') || 'Assistant');
     const rows=selectEvents(conversationEvents,{...state,pane:'conversation'});
-    const html=rows.map(e=>`<article class="sw-message conversation-markdown sw-message--${esc(e.data.role)}" data-message-seq="${e.seq}" data-key="${e.seq}"><header><strong>${esc(e.data.role==='user'?'You':agentNames.get(e.agent_id || 'main') || e.agent_id)}</strong><time>${esc(e.ts || '')}</time><button type="button" data-related-turn="${e.seq}" aria-label="Show activity for this turn">Activity ↗</button></header>${e.data.withheld?'<p>Message withheld.</p>':renderMarkdown(e.data.text || '',markdown)}${e.data.text_more?`<button type="button" data-expand-message="${e.seq}">Show full message</button>`:''}${e.truncated?'<p class="sw-note">Message truncated by recording limits.</p>':''}</article>`).join('') || '<p class="sw-empty">No conversation messages recorded for these filters.</p>';
+    const newestSeq=rows.length?rows[rows.length-1].seq:null,streaming=Date.now()-lastStreamEventAt<STREAM_SETTLE_MS;
+    rows.forEach(e=>fabric.prefetchWith({openEnd:streaming && e.seq===newestSeq},e.data?.text));
+    if(streaming){clearTimeout(settleTimer);settleTimer=setTimeout(schedulePaint,STREAM_SETTLE_MS+50);}
+    const html=rows.map(e=>`<article class="sw-message conversation-markdown sw-message--${esc(e.data.role)}" data-message-seq="${e.seq}" data-key="${e.seq}"><header><strong>${esc(e.data.role==='user'?'You':agentNames.get(e.agent_id || 'main') || e.agent_id)}</strong><time>${esc(e.ts || '')}</time><button type="button" data-related-turn="${e.seq}" aria-label="Show activity for this turn">Activity ↗</button></header>${e.data.withheld?'<p>Message withheld.</p>':renderMarkdown(e.data.text || '',streaming && e.seq===newestSeq?{...markdown,openEnd:true}:markdown)}${e.data.text_more?`<button type="button" data-expand-message="${e.seq}">Show full message</button>`:''}${e.truncated?'<p class="sw-note">Message truncated by recording limits.</p>':''}</article>`).join('') || '<p class="sw-empty">No conversation messages recorded for these filters.</p>';
     if(shownConversation!==html){
       shownConversation=html;
       const previousNewest=Math.max(0,...[...conversation.querySelectorAll(':scope > [data-message-seq]')].map(row=>Number(row.dataset.messageSeq)));
@@ -260,6 +268,7 @@ export function mountSessionWorkspace(host,client,session,{connect=connectEvents
     for(const page of Object.values(pages)){page.before=null;page.more=false;}
   }
   function merge(entry,{activity=true,conversation=true}={}) {
+    lastStreamEventAt=Date.now();
     const full=expanded.get(entry.seq);
     if(full && full.rev!==entry.rev)expanded.delete(entry.seq);
     const value=full && full.rev===entry.rev?full:entry;
@@ -354,5 +363,6 @@ export function mountSessionWorkspace(host,client,session,{connect=connectEvents
   entityIndex.load().then(changed=>{if(changed && !disposed){summarySignature='';schedulePaint();}}).catch(()=>{});
   client.listCollabAgentLinks?.().then(result=>{if(!disposed){collaborators=result.agents || [];schedulePaint();}}).catch(()=>{});
   load();
-  return ()=>{disposed=true;request++;clearInterval(summaryTimer);document.removeEventListener('visibilitychange',onVisibility);clearTimeout(renderTimer);clearTimeout(refreshTimer);stop();composer.dispose();};
+  const removeFabricActions=installFabricLinkActions(host);
+  return ()=>{removeFabricActions();disposed=true;request++;clearInterval(summaryTimer);document.removeEventListener('visibilitychange',onVisibility);clearTimeout(renderTimer);clearTimeout(refreshTimer);clearTimeout(settleTimer);stop();composer.dispose();};
 }

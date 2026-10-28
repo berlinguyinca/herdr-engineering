@@ -72,6 +72,21 @@ class TestMissionTelemetryState:
         clock[0] += 31
         assert repo.get_mission("pi:MSN-one")["telemetry_state"] == "stale"
 
+    def test_report_age_comes_from_activity_freshness_not_mission_edits(self):
+        clock = [NOW]
+        repo = ControlPlaneRepo(now=lambda: clock[0])
+        self._pi_mission(repo)
+        IngestService(repo).ingest(envelope())
+        clock[0] += 17
+
+        # Lifecycle edits update the mission record but must not reset the
+        # collector's report age shown by the stall metric.
+        repo.set_mission_stage("pi:MSN-one", "testing", source="pi")
+
+        mission = repo.get_mission("pi:MSN-one")
+        assert mission["telemetry_state"] == "live"
+        assert mission["report_age_seconds"] == 17.0
+
     def test_disconnected_collection_is_stale(self):
         clock = [NOW]
         repo = ControlPlaneRepo(now=lambda: clock[0])

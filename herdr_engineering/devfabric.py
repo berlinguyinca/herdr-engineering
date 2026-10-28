@@ -202,6 +202,28 @@ class DevServiceRegistry:
         self._prune_expired()
         return True
 
+    def replace_from_peer(self, leases: list[dict]) -> int:
+        """Mirror the active gateway's lease table (standby only). Returns how many leases were taken."""
+        cleaned = [{k: v for k, v in dict(lz).items() if k != "url"} for lz in leases]
+        parsed = _parse_leases({"leases": cleaned})
+        with self._lock:
+            self._leases = parsed
+            self._persist()
+        return len(parsed)
+
+    def renew_all(self) -> int:
+        """Give every active lease a fresh TTL (used on promotion so agents have time to re-heartbeat)."""
+        now = _now_iso()
+        n = 0
+        with self._lock:
+            for lease in self._leases.values():
+                if lease.state == "active":
+                    lease.renewed_at = now
+                    lease.expires_at = _add_seconds(now, self._ttl)
+                    n += 1
+            self._persist()
+        return n
+
     def gc(self) -> dict:
         """Drop expired/failed leases past the retention window and persist.
 
@@ -826,13 +848,22 @@ def _read_head(sock: socket.socket) -> tuple[bytes, bytes]:
     return buf[: idx + 4], buf[idx + 4:]
 
 
-def rewriting_pipe(client: socket.socket, target: socket.socket, port: int, external: str) -> None:
+def rewriting_pipe(client: socket.socket, target: socket.socket, port: int, external: str,
+                   *, tls: bool = False, rewrite_head: bool = True, forwarded_for: str | None = None) -> None:
     """Byte-pipe that filters the headers of the origin's responses.
 
     Each exchange is forced to ``Connection: close`` so every response passes the
     head filter. Upgrade requests (websockets) are passed through untouched."""
-    from .urlrewrite import force_close, is_upgrade, rewrite_response_head
+    from .urlrewrite import force_close, inject_request_headers, is_upgrade, rewrite_response_head
     req_head, rest = _read_head(client)
+    if tls and req_head.endswith(b"\r\n\r\n"):
+        # TLS ends here: tell the origin the browser spoke https and which name it used.
+        host = next((ln.split(b":", 1)[1].strip().decode("latin-1") for ln in req_head.split(b"\r\n")[1:]
+                     if ln.lower().startswith(b"host:")), external)
+        pairs = {"X-Forwarded-Proto": "https", "X-Forwarded-Host": host}
+        if forwarded_for:
+            pairs["X-Forwarded-For"] = forwarded_for
+        req_head = inject_request_headers(req_head[:-4], pairs) + b"\r\n\r\n"
     upgrade = is_upgrade(req_head)
     if not upgrade and req_head.endswith(b"\r\n\r\n"):
         req_head = force_close(req_head[:-4]) + b"\r\n\r\n"
@@ -863,8 +894,9 @@ def rewriting_pipe(client: socket.socket, target: socket.socket, port: int, exte
     t.start()
     try:
         resp_head, body = _read_head(target)
-        if resp_head.endswith(b"\r\n\r\n"):
-            resp_head = rewrite_response_head(resp_head[:-4], port, external) + b"\r\n\r\n"
+        if rewrite_head and resp_head.endswith(b"\r\n\r\n"):
+            resp_head = rewrite_response_head(resp_head[:-4], port, external,
+                                              "https" if tls else None) + b"\r\n\r\n"
         client.sendall(resp_head + body)
         while True:
             data = target.recv(65536)

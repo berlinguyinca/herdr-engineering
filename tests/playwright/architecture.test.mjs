@@ -233,7 +233,7 @@ test('cancel a queued analysis: confirm, in-flight disable, escaped refusal', ()
   assert.equal(posts, 2);
 }));
 
-test('cross-repository lists inferred edges separately and never as verified', () => withApp({}, async (page, base) => {
+test('cross-repository: inferred without a mapping, verified only after the user adds one', () => withApp({}, async (page, base) => {
   await page.goto(`${base}/#/architecture`);
   await page.locator('[data-cross]').click();
   const sum = page.locator('[data-testid="arch-cross-summary"]');
@@ -241,6 +241,16 @@ test('cross-repository lists inferred edges separately and never as verified', (
   assert.match(await sum.innerText(), /0 verified · [1-9]\d* inferred/);
   assert.match(await page.locator('.arch-cross').innerText(), /Inferred \(name match only\)[\s\S]*fixturelib/);
   await shot(page, 'architecture-cross-repo.png');
+  const form = page.locator('[data-mapform]');
+  await form.locator('select[name=importer]').selectOption('github.com/example/fixture');
+  await form.locator('input[name=package]').fill('fixturelib');
+  await form.locator('select[name=provider]').selectOption('github.com/example/lib');
+  await form.locator('button[type=submit]').click();
+  await page.locator('[data-maps]').getByText('fixturelib').waitFor();
+  await page.locator('[data-cross]').click();
+  await page.getByText(/^[1-9]\d* verified · 0 inferred/).waitFor();
+  assert.match(await page.locator('.arch-cross [data-xedge]').first().innerText(), /mapping/);
+  await shot(page, 'architecture-cross-repo-verified.png');
 }));
 
 test('explain is labelled inferred, cites real edges and drops invented ones', () => withApp({}, async (page, base) => {

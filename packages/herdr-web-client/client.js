@@ -280,6 +280,15 @@ export class HerdrClient {
     return this.request('/api/v1/services', { signal });
   }
 
+  /** Canonical fabric URLs for URLs in agent output (read-only; originals are never changed). */
+  resolveFabricUrls(urls, sourceMachine = null, { signal } = {}) {
+    return this.request('/api/v1/fabric/resolve-urls', { method: 'POST', body: { urls, source_machine: sourceMachine }, signal });
+  }
+
+  listFabricServices({ signal } = {}) {
+    return this.request('/api/v1/fabric/services', { signal });
+  }
+
   listHosts({ signal } = {}) {
     return this.request('/api/v1/hosts', { signal });
   }
