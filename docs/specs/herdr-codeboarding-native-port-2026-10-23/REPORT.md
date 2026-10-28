@@ -64,8 +64,8 @@ control_plane:
 | Full baseline graph of a representative repo, visible in the Workbench, verified symbol→source links | **Pass for Python** (Herdr, with name-resolved call edges). JS/TS has scanner-level symbols and calls at confidence 0.7, not parser-grade. |
 | Same SHA/config ⇒ identical graph hash; parallel worktrees isolated | **Pass** (tests) |
 | Full vs incremental parity | **Pass** (tests + benchmark parity check) |
-| PR diff with provenance and uncertainty | **Partial**: snapshot diff with warnings, and PRs link by head SHA. A PR's *base* SHA is not resolved automatically; the user picks the base snapshot. |
-| Mission/worker/worktree/parent-worker/issue links; autospec and non-autospec | **Partial**: mission, session, parent worker, flow (pi/autospec/herdr/unknown) and issue mentions work; worktree, `autospec_ref` and authoritative `issue_ref` have no record source and are reported as `unknown`. |
+| PR diff with provenance and uncertainty | **Pass with a limit**: snapshot diff with warnings, PRs link by head SHA, and a request with `base_rev` has the host merge-base it with the head and report the base snapshot (#316). The base must already be analysed or be requested too. |
+| Mission/worker/worktree/parent-worker/issue links; autospec and non-autospec | **Partial**: mission, session, parent worker, flow (pi/autospec/herdr/unknown) and issue mentions work; worktree links work for sessions that report a `worktree_id` (Pi does, #454/#319), as context rather than authorship; `autospec_ref` and authoritative `issue_ref` have no record source and are reported as `unknown`. |
 | Unauthorized guests cannot view/analyse/comment | **Pass for the new surface** (tested: anonymous, cross-origin, viewer and ingest roles, guest redaction of room notes). The legacy `/api/v1` surface has no repo/host ACL (audit); the architecture routes follow the same role model. |
 | Malicious fixture | **Pass** for symlinks, config-hook/fsmonitor execution, path escapes, argument injection, oversize files, timeout + grandchild kill, cancellation, memory limit, env scrubbing, output cap. Explain: source text never sent, redirects refused, forged citations dropped. |
 | UI states and a11y | **Pass**: empty, disabled, loading, API error, partial, stale, failed, running, keyboard, table semantics, themes, layouts. |
@@ -74,8 +74,7 @@ control_plane:
 
 ## Known gaps
 1. Call edges are name-resolved only (no type inference, no inheritance); JS/TS symbols come from a scanner, and Go/Rust/Java/etc. have no symbols (a language-server or tree-sitter pass would be next).
-2. No worktree-level correlation, `autospec_ref` or authoritative `issue_ref`: no source data exists.
-3. PR base-SHA resolution needs a user-chosen base.
-5. Woodpecker is activated, but its gates are red on the agents (see the gate table). Shared choke points `api.py`, `app.js`, `ingest.py` may conflict with sibling worktrees.
+2. No `autospec_ref` or authoritative `issue_ref`: no source data exists. Worktree correlation only helps when the analysis host analyses that checkout.
+3. Woodpecker is activated, but its gates are red on the agents (see the gate table). Shared choke points `api.py`, `app.js`, `ingest.py` may conflict with sibling worktrees.
 
 Note: the user's "Rust for benchmark tooling" rule is scoped to InferWeave (AGENTS.md D-001). `scripts/architecture_bench.py` benchmarks a Python analyzer in a Python repository, so it stays Python.
