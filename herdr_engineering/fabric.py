@@ -330,6 +330,24 @@ class GatewayRouter:
         with self._lock:
             return sorted(self._listeners)
 
+    def can_bind(self, port: int) -> bool:
+        """True when ``port`` is free on every address this router binds (hosts missing on this machine are ignored)."""
+        import errno
+        with self._lock:
+            if port in self._listeners:
+                return False
+        for host in self._bind_hosts:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            try:
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                s.bind((host, port))
+            except OSError as exc:
+                if exc.errno in (errno.EADDRINUSE, errno.EACCES):
+                    return False
+            finally:
+                s.close()
+        return True
+
 
 class FabricGateway:
     """Control API + router + probe loop for the shared dev-fabric registry."""
@@ -346,6 +364,7 @@ class FabricGateway:
                  apex_upstream: tuple[str, int] | None = None,
                  host_routes: dict[str, tuple[str, int]] | None = None) -> None:
         self.registry = registry
+        registry.port_free = router.can_bind
         # Stable service-name URLs (https://<service>.<named_domain>[:named_port]); off unless a domain is given
         # AND the listener bound, so a URL is never advertised that nothing serves.
         self.named_domain = named_domain
@@ -639,8 +658,11 @@ class FabricGateway:
             routes=body.get("routes"),
             origin_port=int(body["origin_port"]) if body.get("origin_port") is not None else None,
             network_namespace=body.get("network_namespace"))
-        self.router.bind(lease.external_port, lease.target_host, lease.target_port,
-                         routes=lease.routes, rewrite=self._rewrite_target(lease))
+        if not self.router.bind(lease.external_port, lease.target_host, lease.target_port,
+                                routes=lease.routes, rewrite=self._rewrite_target(lease)):
+            # Never hand out a lease nothing is listening for: release it so the caller retries on another port.
+            self.registry.close(lease.id)
+            raise ConflictError(f"could not bind external port {lease.external_port} on this gateway")
         return {"lease": lease.to_dict(), "url": self.stable_url(lease.external_port)}
 
     def op_heartbeat(self, lease_id: str) -> dict[str, Any]:
@@ -829,6 +851,8 @@ def _make_handler(gateway: FabricGateway):
                     self._send(200, gateway.op_register(body))
                 except (KeyError, ValueError) as exc:
                     self._send(400, {"error": f"bad register body: {exc}"})
+                except ConflictError as exc:
+                    self._send(409, {"error": str(exc)})
                 return
             if self.path == "/resolve-urls":
                 urls = body.get("urls")
