@@ -329,6 +329,28 @@ class EventBridge:
         self._thread = threading.Thread(target=self._loop, name="herdr-intel-bridge", daemon=True)
         self._thread.start()
 
+    def start_poller(self, task: Callable[[], object], interval_fn: Callable[[], object], *, tick: float = 5.0,
+                     min_interval: int = 60) -> None:
+        """Run ``task`` every ``interval_fn()`` seconds (>= 60; anything else is off) on its own thread, so a slow
+        GitHub call never delays event processing. Errors are counted, never raised."""
+        if getattr(self, "_poller", None) is not None:
+            return
+
+        def run():
+            import time
+            last = time.monotonic()
+            while not self._stop.wait(tick):
+                every = interval_fn()
+                if type(every) is not int or every < min_interval or time.monotonic() - last < every:
+                    continue
+                last = time.monotonic()
+                try:
+                    task()
+                except Exception:  # noqa: BLE001 - a poll failure must not stop the next one
+                    self.stats["errors"] += 1
+        self._poller = threading.Thread(target=run, name="herdr-intel-poller", daemon=True)
+        self._poller.start()
+
     def stop(self) -> None:
         self._stop.set()
 
@@ -505,6 +527,7 @@ def install(repo, section_fn: Callable[[], dict], dsn: str | None = None):
 
     class LazyBridge(EventBridge):
         _rebuilt = False
+        reconcile_task = staticmethod(lambda: None)
 
         def __init__(self):
             super().__init__(None, section, make_resolver(repo, lambda: section().get("forge_host")),
@@ -525,6 +548,7 @@ def install(repo, section_fn: Callable[[], dict], dsn: str | None = None):
                 with lock:
                     if self._thread is None:
                         self.start()
+                        self.start_poller(lambda: self.reconcile_task(), lambda: section().get("reconcile_interval_seconds"))
             if section().get("ingest") is not True:
                 self._rebuilt = False                 # ingest was off: events were missed, so rebuild when it comes back on
             if not self._rebuilt and section().get("ingest") is True:
@@ -539,4 +563,6 @@ def install(repo, section_fn: Callable[[], dict], dsn: str | None = None):
 
     bridge = LazyBridge()
     repo.subscribe(bridge.on_event)
-    return IntelligenceRoutes(store_fn=store, section_fn=section_fn), bridge
+    routes = IntelligenceRoutes(store_fn=store, section_fn=section_fn)
+    bridge.reconcile_task = routes.reconcile_now
+    return routes, bridge

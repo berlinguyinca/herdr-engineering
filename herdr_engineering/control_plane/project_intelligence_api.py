@@ -51,6 +51,21 @@ class IntelligenceRoutes:
                                               ci_repair=lambda *a: self.ci_repair_fn(*a) if self.ci_repair_fn else _unwired())
         return self._executor
 
+    def reconcile_now(self) -> dict | None:
+        """Record open PR heads no delivery has recorded (outbound polling; needs no inbound connection).
+        ``None`` when it cannot run: ingest off, kill switch, or missing client/config."""
+        from datetime import UTC, datetime
+
+        from .intel_webhook import reconcile_open_prs
+        cfg, raw = self._cfg()
+        app = self.github_app_fn() if self.github_app_fn else None
+        projects, org = raw.get("webhook_projects"), raw.get("default_org_id")
+        if not (cfg["enabled"] and cfg["ingest"]) or cfg["kill_switch"] or app is None \
+                or not isinstance(projects, dict) or not projects or not isinstance(org, str):
+            return None
+        return reconcile_open_prs(app, self.store, cfg, org_id=org, installation=str(raw.get("webhook_installation") or "github"),
+                                  repo_projects=projects, received_at=datetime.now(UTC))
+
     def _cfg(self) -> tuple[dict, dict]:
         raw = self._section() or {}
         return pi.config(raw), raw
@@ -258,17 +273,12 @@ class IntelligenceRoutes:
                     p = self.executor.execute(p.id, viewer.org_id)     # no-op unless the execute flag is on
                 return 200, self._proposal_view(p)
             if parts == ["webhooks", "reconcile"]:
-                from datetime import UTC, datetime
-
-                from .intel_webhook import reconcile_open_prs
-                app = self.github_app_fn() if self.github_app_fn else None
-                projects, org = raw.get("webhook_projects"), raw.get("default_org_id")
-                if app is None or not isinstance(projects, dict) or not projects or not isinstance(org, str):
-                    return 409, {"error": "reconcile needs the review-gate GitHub client, webhook_projects and default_org_id"}
-                if viewer.project_ids is not None or not cfg["ingest"] or cfg["kill_switch"]:
+                if viewer.project_ids is not None:
                     return 404, {"error": "not found"}
-                return 200, reconcile_open_prs(app, self.store, cfg, org_id=org, installation=str(raw.get("webhook_installation") or "github"),
-                                               repo_projects=projects, received_at=datetime.now(UTC))
+                out = self.reconcile_now()
+                if out is None:
+                    return 409, {"error": "reconcile needs ingest, no kill switch, the review-gate GitHub client, webhook_projects and default_org_id"}
+                return 200, out
         except pi.NotFound:
             return 404, {"error": "not found"}
         except pi.StoreUnavailable:
