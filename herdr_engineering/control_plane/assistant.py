@@ -2223,6 +2223,24 @@ class AssistantService:
         if tool_id == "browse":
             return self.browse_tool(tenant_id=tenant_id, user_id=user_id,
                                     url=payload.get("url", ""))
+        if tool_id == "read_memory":
+            recs = self.store.search_memory(tenant_id=tenant_id, user_id=user_id,
+                                            assistant_id=assistant_id, query="", limit=50)
+            ns = payload.get("namespace")
+            if ns:
+                wanted = set(ns) if isinstance(ns, (list, tuple, set)) else {str(ns)}
+                recs = [m for m in recs if m.namespace in wanted]
+            if not recs:
+                return {"context": "no memories"}
+            return {"context": "\n".join(
+                f"[{m.namespace}] {m.content}" for m in recs)[:2000]}
+        if tool_id == "write_memory":
+            memo = self.store_memory(
+                tenant_id=tenant_id, user_id=user_id, assistant_id=assistant_id,
+                content=payload.get("content", ""),
+                namespace=payload.get("namespace", "private"),
+                classification=payload.get("classification", "general"))
+            return {"ok": True, "memory": memo.as_dict()}
         if tool_id == "run_shell":
             return self.run_shell_tool(tenant_id=tenant_id, user_id=user_id,
                                        command=payload.get("command", ""))

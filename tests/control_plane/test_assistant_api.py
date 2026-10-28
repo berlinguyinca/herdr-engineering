@@ -516,3 +516,23 @@ def test_tool_loop_stops_at_iteration_cap():
     assert runner.i == 3            # capped at max_iterations
     reply = svc.store.list_messages(th.thread_id, tenant_id="t1", user_id="u1")[-1].content
     assert "iteration limit" in reply
+
+
+def test_tool_loop_executes_read_memory_executor():
+    # the loop must actually run read_memory and feed the stored value back
+    svc, runner = _tool_service([
+        {"content": "", "tool_calls": [{"id": "c1", "name": "read_memory",
+                                        "arguments": json.dumps({"namespace": ["notes"]})}]},
+        {"content": "done", "tool_calls": []},
+    ])
+    a = svc.create_assistant(tenant_id="t1", user_id="u1", name="A")
+    svc.grant_tool(tenant_id="t1", user_id="u1", assistant_id=a.assistant_id,
+                   tool_id="read_memory", scope="*")
+    svc.store_memory(tenant_id="t1", user_id="u1", assistant_id=a.assistant_id,
+                     content="activation token is ZQ-SECRET123", namespace="notes")
+    th = svc.create_thread(tenant_id="t1", user_id="u1", assistant_id=a.assistant_id)
+    svc.send_message(tenant_id="t1", user_id="u1", assistant_id=a.assistant_id,
+                     thread_id=th.thread_id, content="what token?")
+    tool_msg = [m for m in runner.seen[1]["messages"] if m.get("role") == "tool"][0]
+    assert "ZQ-SECRET123" in tool_msg["content"]
+    assert "no executor" not in tool_msg["content"]
