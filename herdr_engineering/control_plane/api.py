@@ -254,7 +254,7 @@ class ControlPlaneServer:
                  review_quorum=None, system_graph: bool = False, attention=None, ci_fix=None, missions=None, github_pg_dsn=None,
                  architecture_enabled=None, architecture_explain=None, architecture_options=None,
                  request_workers=128, request_queue=256,
-                 assistant_service=None, assistant_config=None):
+                 assistant_service=None, assistant_config=None, fabric_resolver=None, fabric_services=None):
         """
         Auth (Spec §104): either a single `api_key` (all-access) or a mapping
         `api_keys={key: role}` with roles "viewer" (read-only) / "operator"
@@ -380,6 +380,9 @@ class ControlPlaneServer:
                 f"{host!r} without collab_tls_terminated (bearer credentials "
                 "require TLS)")
         self.fleet_config = fleet_config
+        # callable(urls, source_machine) -> {'resolutions': [...]}; None when no fabric gateway is configured
+        self.fabric_resolver = fabric_resolver
+        self.fabric_services = fabric_services      # callable() -> {'leases': [...]} | None
         self.review_quorum = review_quorum      # QuorumConfig | None (feature off)
         from .review_quorum import RereviewLedger
         self.rereview = RereviewLedger(repo)
@@ -1896,6 +1899,8 @@ def _make_handler(server, public=False, operator=False):
 
         def _api_get(self, parts, resource):
             r = server.repo
+            if resource == "fabric" and len(parts) == 5 and parts[4] == "services":
+                return self._fabric_services()
             if (resource == "artifacts" and len(parts) >= 5
                     and not self._artifact_allowed(parts[4], "read")):
                 return self._json({"error": "not found"}, 404)
@@ -2306,6 +2311,8 @@ def _make_handler(server, public=False, operator=False):
 
         def _api_post(self, parts, resource):
             r = server.repo
+            if resource == "fabric" and len(parts) == 5 and parts[4] == "resolve-urls":
+                return self._fabric_resolve_urls()
             if resource == "handoffs":
                 body = self._read_json() or {}
                 actor = self._principal()
@@ -3259,6 +3266,35 @@ def _make_handler(server, public=False, operator=False):
             return self._json({"error": "not found"}, 404)
 
         # ---------------------------------------------------------- helpers
+        def _fabric_services(self):
+            """Active fabric leases for the Fabric Services page. Only fields the page shows are passed on."""
+            keep = ("id", "external_port", "protocol", "state", "label", "url", "target", "owner", "renewed_at",
+                    "expires_at", "health_last_ok_at", "health_last_error")
+            if server.fabric_services is None:
+                return self._json({"leases": [], "available": False})
+            try:
+                leases = (server.fabric_services() or {}).get("leases") or []
+            except Exception:
+                return self._json({"leases": [], "available": False})
+            return self._json({"leases": [{k: lz.get(k) for k in keep} for lz in leases], "available": True})
+
+        def _fabric_resolve_urls(self):
+            """Canonical fabric URLs for URLs shown in agent output. Read-only; originals are never changed.
+            A missing or failing gateway degrades to 'unavailable' so a link is simply left as written."""
+            body = self._read_json() or {}
+            urls, machine = body.get("urls"), body.get("source_machine")
+            if (not isinstance(urls, list) or len(urls) > 200 or not all(isinstance(u, str) and len(u) <= 2048 for u in urls)
+                    or not (machine is None or isinstance(machine, str))):
+                return self._json({"error": "urls must be a list of at most 200 strings"}, 400)
+            unavailable = {"resolutions": [{"original": u, "canonical": None, "status": "unavailable",
+                                            "reason": "fabric gateway not reachable"} for u in urls]}
+            if server.fabric_resolver is None:
+                return self._json(unavailable)
+            try:
+                return self._json(server.fabric_resolver(urls, machine))
+            except Exception:
+                return self._json(unavailable)
+
         def _read_json(self, limit=_MAX_JSON_BODY):
             try:
                 length = int(self.headers.get("Content-Length") or 0)

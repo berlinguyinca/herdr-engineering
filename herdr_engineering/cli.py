@@ -1344,6 +1344,24 @@ def _gateway_configured_or_reachable() -> bool:
         return False
 
 
+def _fabric_url_resolver():
+    """Resolver the dashboard uses for canonical fabric URLs; None when no gateway is configured."""
+    from .config import load_config
+    from .fabric import FabricClient, gateway_url_from_config
+    url = gateway_url_from_config(load_config())
+    if not url:
+        return None
+    client = FabricClient(url)
+    return client.resolve_urls
+
+
+def _fabric_service_lister():
+    from .config import load_config
+    from .fabric import FabricClient, gateway_url_from_config
+    url = gateway_url_from_config(load_config())
+    return FabricClient(url).list if url else None
+
+
 def _resolve_target_host(host: str, port: int) -> str:
     """Resolve 'auto'/'local' to this machine's tailnet IP (so the gateway can
     route back to us). Verifies the local target is listening. Explicit hosts
@@ -2878,6 +2896,7 @@ def _cmd_cp_web(args) -> int:
                              collab_tls_terminated=args.collab_tls_terminated,
                              collab_require_https=args.collab_require_https,
                              fleet_config=fleet_store, ci_actions=cp.get("ci_actions") is True,
+                             fabric_resolver=_fabric_url_resolver(), fabric_services=_fabric_service_lister(),
                              summary_config=cp.get("agent_summaries") or {},
                              assistant_config={"personal_assistant": cp["personal_assistant"]}
                                  if isinstance(cp.get("personal_assistant"), dict) else None,
