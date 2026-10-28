@@ -120,4 +120,6 @@ Routes: `GET /api/v1/intelligence/{status,projects,investigations,relationships?
 B1 Google OAuth client + consent · B2 GitHub App webhook secret file + public receiver URL · B3 transactional email channel · B4 iPhone device auth scheme / Rakazo compatibility · B5 API key to read live `/api/v1/health` · B6 any deploy, live-DB migration, or flag flip.
 
 ## Final verification (2026-10-28, after fourth pass)
-- See the PR description for the final numbers; the ledger is updated when the last full run finishes.
+- Control-plane + root + review-gate suites, 10 parallel shards: 7402 passed, 2 xfailed, skips pre-existing, every shard EXIT=0. Integration on private Postgres: 19 pass (incl. the rollout rehearsal).
+- `npm run test:client`: 707 pass. Playwright: all 15 project-intelligence tests pass (accessibility audit in 3 themes/sizes included); calm, dark-theme, skeletons and freshness-all show the same 3 failures as clean origin/main, none on `/intelligence`.
+- Acceptance criteria NOT fully met: live connectors (B1-B4) and an approved-proposal executor do not exist; see Remaining work.
