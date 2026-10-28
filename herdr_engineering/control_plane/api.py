@@ -691,8 +691,8 @@ class ControlPlaneServer:
         extra = {"facts_fn": facts} if facts else {}
         if repo is not None:
             from .repair_gate import make_counters
-            bridge = self.intelligence_bridge
-            attempt, open_prs = make_counters(app=app, repo=repo, board_lookup=lambda k: bridge.board._pr.get(k))
+            # looked up per call: the gate is built before project intelligence is installed
+            attempt, open_prs = make_counters(app=app, repo=repo, board_lookup=lambda k: self.intelligence_bridge.board._pr.get(k))
             extra.update(attempt_fn=attempt, open_repair_prs_fn=open_prs)
         return make_repair_gate(app=app, policy_fn=policy, **extra)
 
