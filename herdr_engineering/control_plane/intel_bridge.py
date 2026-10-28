@@ -338,6 +338,8 @@ class EventBridge:
             cfg = pi.config(self._cfg_fn())
             if not (cfg["enabled"] and cfg["ingest"]) or cfg["kill_switch"]:
                 return "off"
+            if ev.get("entity_type") == "pr_gate":
+                return self._fold_gate(ev)
             probe = normalise_fabric_event(ev, org_id=self._org, instance=self._instance, projects=("_",), security_label=self._label)
             if probe is None:
                 self.stats["ignored"] += 1
@@ -357,11 +359,20 @@ class EventBridge:
             log.warning("intelligence bridge failed to process an event", exc_info=False)
             return "error"
 
+    def _fold_gate(self, ev: dict) -> str:
+        """Review-gate events move an incident only when a repair run recorded this PR's URL (never by guesswork)."""
+        done = self.board.apply_gate(str(ev.get("entity_id")), event_id=str(ev.get("event_id")),
+                                     at=str(_when(ev.get("source_timestamp"))), state=str(ev.get("event_type")))
+        self.stats["accepted" if done is not None else "ignored"] += 1
+        return "folded" if done is not None else "ignored"
+
     def _fold_incident(self, ev: dict, projects: tuple[str, ...]) -> None:
         payload = ev.get("payload") or {}
         if ev.get("entity_type") != "ci_fix" or not isinstance(payload.get("state"), str):
             return
         source = f"{payload.get('repository')}#{payload.get('run') or payload.get('number')}"
+        from .intel_incidents import pr_key_from_url
+        self.board.bind_pr(pr_key_from_url(payload.get("pr_url")), projects[0], source)
         self.board.apply(project=projects[0], source_incident=source, event_id=str(ev.get("event_id")),
                          at=str(_when(ev.get("source_timestamp"))), kind="ci_fix", state=payload["state"])
 

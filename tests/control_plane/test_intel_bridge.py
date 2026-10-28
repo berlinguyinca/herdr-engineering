@@ -232,3 +232,17 @@ def test_ci_fix_events_fold_into_the_incident_board():
               "source_timestamp": "2026-10-28T00:00:0%dZ" % n, "payload": {"repository": "o/r", "run": 7, "state": state}}
         assert br.process(ev) == "accepted"
     assert [i["state"] for i in br.board.summary()] == ["REVIEWING"]
+
+
+def test_gate_merged_event_advances_the_bound_incident():
+    from herdr_engineering.control_plane import project_intelligence as pi
+    from herdr_engineering.control_plane.intel_bridge import EventBridge
+    br = EventBridge(pi.IntelligenceStore(), lambda: {"enabled": True, "ingest": True}, lambda ev: ("p1",), org_id="o")
+    fix = {"event_id": "e1", "sequence": 1, "event_type": "CIFixStateChanged", "entity_type": "ci_fix", "entity_id": "f1",
+           "source_timestamp": "2026-10-28T00:00:01Z",
+           "payload": {"repository": "o/r", "run": 7, "state": "succeeded", "pr_url": "https://github.com/o/r/pull/12"}}
+    assert br.process(fix) == "accepted"
+    gate = {"event_id": "g1", "event_type": "merged", "entity_type": "pr_gate", "entity_id": "o/r#12", "source_timestamp": "2026-10-28T00:00:09Z"}
+    assert br.process(gate) == "folded"
+    assert br.board.summary()[0]["state"] == "VERIFYING"
+    assert br.process(dict(gate, event_id="g2", entity_id="o/r#99")) == "ignored"

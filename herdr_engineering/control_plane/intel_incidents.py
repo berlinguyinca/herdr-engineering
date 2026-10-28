@@ -57,10 +57,32 @@ _REVIEW_GATE = {"merged": "VERIFYING", "post_merge_verified": "COMPLETED", "roll
 _ORDER = {s: i for i, s in enumerate(rp.STATES[:9])}
 
 
+_PR_URL = re.compile(r"https://github\.com/([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)/pull/([1-9][0-9]{0,8})\Z")
+
+
+def pr_key_from_url(url) -> str | None:
+    """``owner/repo#N`` from a GitHub pull-request URL; anything else is not evidence of a PR."""
+    m = _PR_URL.match(url) if isinstance(url, str) else None
+    return f"{m.group(1)}#{m.group(2)}" if m else None
+
+
 class IncidentBoard:
     def __init__(self, policy_version: str):
         self.policy_version = policy_version
         self.incidents: dict[str, rp.Incident] = {}
+        self._pr: dict[str, tuple[str, str]] = {}      # "owner/repo#N" -> (project, source_incident)
+
+    def bind_pr(self, pr_key: str | None, project: str, source_incident: str) -> None:
+        """A repair run that opened this PR (from its recorded pr_url); only then can gate events move the incident."""
+        if pr_key:
+            self._pr[pr_key] = (project, source_incident)
+
+    def apply_gate(self, pr_key: str, *, event_id: str, at: str, state: str) -> rp.Incident | None:
+        """A review-gate event for a PR no repair run claimed is ignored: a PR is never guessed into an incident."""
+        bound = self._pr.get(pr_key)
+        if bound is None:
+            return None
+        return self.apply(project=bound[0], source_incident=bound[1], event_id=event_id, at=at, kind="review_gate", state=state)
 
     def _get(self, project: str, source_incident: str) -> rp.Incident:
         key = rp.incident_key(project, source_incident, self.policy_version)

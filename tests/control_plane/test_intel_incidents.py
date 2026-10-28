@@ -55,3 +55,16 @@ def test_failure_is_terminal_and_unknown_states_ignored():
     assert _apply(b, "e4", "ci_fix", "running").state == "FAILED"
     assert b.summary()[0]["state"] == "FAILED"
     assert rp.Incident  # the board produces policy Incidents
+
+
+def test_gate_events_move_only_incidents_bound_by_a_recorded_pr_url():
+    from herdr_engineering.control_plane.intel_incidents import pr_key_from_url
+    assert pr_key_from_url("https://github.com/o/r/pull/12") == "o/r#12"
+    for bad in ("https://evil.example/o/r/pull/12", "https://github.com/o/r/pull/0", "https://github.com/o/r/issues/3", None, 5):
+        assert pr_key_from_url(bad) is None
+    b = IncidentBoard("v1")
+    _apply(b, "e1", "ci_fix", "succeeded")
+    assert b.apply_gate("o/r#12", event_id="g1", at="t", state="merged") is None      # unbound PR: ignored
+    b.bind_pr("o/r#12", "p", "o/r#7")
+    assert b.apply_gate("o/r#12", event_id="g1", at="t", state="merged").state == "VERIFYING"
+    assert b.apply_gate("o/r#12", event_id="g2", at="t", state="push").state == "VERIFYING"   # other gate events ignored
