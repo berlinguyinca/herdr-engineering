@@ -3,7 +3,8 @@
 ## Final status — 2026-10-28
 
 Deployed and verified release `badc3f7afc0539fa56cb8c10be780e4f6985ce94`.
-PRs #306 and #309 are merged; deployed application source matches main.
+PRs #306 and #309 are merged. Production is pinned to the verified commit above;
+newer independent main commits are not implied to be deployed.
 Web, worker, LLM proxy, public collaboration, and edge are running with zero
 restarts. Canonical fleet configuration is mounted read-only, matches the
 protected candidate snapshot, and immutable image/config provenance is verified.
