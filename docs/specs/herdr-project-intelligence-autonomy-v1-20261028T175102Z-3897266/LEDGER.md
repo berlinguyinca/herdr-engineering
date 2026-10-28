@@ -83,3 +83,9 @@ Routes: `GET /api/v1/intelligence/{status,projects,investigations,relationships?
 
 ## Blockers needing a user action
 B1 Google OAuth client + consent · B2 GitHub App webhook secret file + public receiver URL · B3 transactional email channel · B4 iPhone device auth scheme / Rakazo compatibility · B5 API key to read live `/api/v1/health` · B6 any deploy, live-DB migration, or flag flip.
+
+## Final verification (2026-10-28)
+- Control-plane suite, 12 parallel shards: 4327 passed, 2 xfailed, 12 skipped (pre-existing); integration/e2e deselected. Integration on private Postgres: bridge 11, migration 3 pass.
+- `npm test` UI: all pass except 3 tests that fail identically on clean origin/main (calm "control: calm off sees motion", freshness-all "/fabric-services chip", skeletons "/fabric-services page head"). None involve `/intelligence`; my route's chip, skeleton and dark-theme loading contracts pass.
+- Scratch worktree removed; worktree clean. Nothing pushed, merged or deployed.
+- Acceptance criteria are NOT met: see Remaining work and blockers B1–B6.
