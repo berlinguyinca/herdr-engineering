@@ -91,3 +91,50 @@ It reads Claude Code and Pi/Codex JSONL and OpenCode's SQLite database (opened
 - **Codex:** Herdr reports no conversation for idle Codex panes, so the helper identifies one from Codex's own process log (pid + thread id, newer than the process, primary conversations only; a tie is reported, not guessed). The method shows as `herdr-pane (codex process log)`.
 - Herdr's own `journal summary` projection is included only if a journal file already
   exists.
+
+## Full report in the dashboard
+
+The agent page has a **Generate full report** button next to the model-written summary
+card. It runs the same `summary` skill the terminal uses and shows the result in the
+summary card (a bounded, scrollable block) instead of the terminal. In the fullscreen
+workspace the summary and report sit in their own column beside the conversation and
+activity panes, so the panes and composer keep the whole viewport.
+
+It is off by default. Turn it on in the central fleet configuration (YAML only):
+
+```yaml
+summary_report:
+  enabled: true
+  harness: claude          # the summarizer; only claude is accepted until codex has run live
+  timeout_seconds: 300     # 10-900
+  max_concurrent: 2        # 1-4 reports at once on the dashboard host
+  local_host_ids: []       # extra names this host answers to (host_id values)
+```
+
+How it stays read-only:
+
+- It never resumes or prompts the target session. The dashboard host reads the session
+  record (`herdr-eng summary history`) and runs fixed-argv, read-only `git` in the
+  recorded worktree itself (`--no-optional-locks`, `core.fsmonitor=false`,
+  `--no-ext-diff`), then starts a fresh `claude -p` in an empty scratch directory with
+  **no tools**, `--no-session-persistence`, `--strict-mcp-config` and no Herdr pane
+  environment. The evidence is passed as quoted data; nothing in a transcript is executed.
+- The report must start with `# Session summary` and contain **Evidence coverage**,
+  otherwise it is discarded as `malformed_report`. It is redacted, capped at 60,000
+  characters and stored as a session event (`SummaryReportCompleted`), so it survives a
+  restart and is returned as `full_report` by `GET /api/v1/sessions/{id}/summary`.
+- One report per session at a time; a second click returns the running job. Runs are
+  background jobs (typically 20 s to a few minutes).
+
+Limits (v1):
+
+- Only sessions whose record is on the **dashboard host** can be reported on. For any
+  other host the button answers `report_host_remote` and shows the exact
+  `herdr-eng summary report --agent … --session …` command to run there. Nothing opens a
+  connection from the dashboard to another machine.
+- The agent must have identified its conversation (`agent_session`). An idle Codex pane
+  that has not run a turn since it started has none yet, and the button says so.
+- The dashboard service must be able to run `claude` with working credentials, as the
+  user that owns the session records (`harness_missing` otherwise).
+- `herdr-eng summary report --agent A --session ID [--harness claude]` prints the same
+  result as JSON for use from a terminal.

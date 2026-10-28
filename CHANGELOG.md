@@ -5,6 +5,12 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Dashboard: on-demand full `/summary` report
+- **Generate full report** on the agent page runs the `summary` skill headlessly on the session's recorded conversation and shows the result in the summary card; in the fullscreen workspace it gets its own column so the conversation and composer fit the viewport without page scrolling (the fullscreen panes were previously sized to the whole viewport and cut off the composer). Off by default: `summary_report.enabled` in the central YAML.
+- Read-only by construction: the dashboard host collects the session history and read-only git facts itself and gives a fresh, non-persisted `claude -p` run no tools; the target session is never resumed or prompted. The report is validated (`# Session summary` ... Evidence coverage), redacted, stored as a session event and served as `full_report` on `GET /api/v1/sessions/{id}/summary`. One run per session, background job, `POST .../summary/report` (operator, same-origin JSON).
+- `herdr-eng summary report` prints the same result as JSON. `herdr-eng summary history` now returns the session's recorded `cwd` and finds a session by id without `--agent`. The skill gains a target mode (`/summary <agent> <session-id>`, optionally with prepared `SUMMARY_EVIDENCE_JSON`).
+- v1 covers sessions on the dashboard host only; other hosts get `report_host_remote` with the command to run there. Codex as summarizer is implemented but not enabled until it has run live. See `docs/operations/session-summary.md`.
+
 ### Fix: idle Codex agents showed an empty dashboard and could not be summarized
 - Codex does not keep its rollout file open between writes, and Herdr reports no `agent_session` for it, so a Codex agent's dashboard page said "Waiting for this agent to identify its transcript" with no conversation, no activity and `recording_unavailable` in the summary card. The feed plugin now also reads Codex's own state database (`logs_*.sqlite`: owning `pid:<pid>:...` and `thread_id`) as process evidence. It is the weakest evidence (only used when no fd, descendant or native identity names a conversation), rows must be newer than the process (reused pids are rejected), only a primary conversation counts, and a tie is never guessed.
 - `herdr-eng summary history` uses the same rule, so `/summary` and the dashboard agree on which Codex conversation a pane holds. Deploy the plugin (`deploy/herdr-cp-feed-plugin`) on each host to pick this up.

@@ -263,6 +263,11 @@ export class HerdrClient {
     });
   }
 
+  // Start the full /summary report for one session; the result arrives as `full_report` on getAgentSummary.
+  startSummaryReport(id) {
+    return this.request(`/api/v1/sessions/${encodeURIComponent(id)}/summary/report`, { method: 'POST', body: {} });
+  }
+
   // Terminal button: the server builds the attach command from the session record; the
   // viewer runs it in their own terminal. Nothing is sent but the session id.
   getTerminalAttach(id) {

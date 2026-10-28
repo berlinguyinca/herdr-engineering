@@ -11,6 +11,7 @@ import {selectEvents, linkedAgents, githubLinks, referenceSuggestions, pendingOp
 import {randomString} from './herdr-web-client/collab.js';
 import {recordOutcome} from './record-state.js';
 import {fixOutcome, fixError, FIX_LABELS, FIX_LOCKED} from './summary-fix-status.js';
+import {reportView, reportStartError} from './summary-report-status.js';
 import {morph} from './patch.js';
 import {enter,skeleton} from './motion.js';
 
@@ -50,6 +51,9 @@ export function mountSessionWorkspace(host,client,session,{connect=connectEvents
   const STREAM_SETTLE_MS=2500;let lastStreamEventAt=0,settleTimer;
   let renderTimer, refreshTimer, selection=null, split=60;
   let historyGeneration=0,historyReset=false,fullscreen=false,fullscreenFocus=null,agentSummary=null,summaryBusy=false,summaryError='',summarySignature='';
+  // Full /summary report: the server's `full_report` plus the local start state, kept outside paint.
+  let fullReport=null,reportLocal=null,reportSignature='',reportTimer;
+  const canReport=()=>Boolean(session.capabilities?.summary_report);
   const expanded=new Map();
   // "Let the agent fix this" state per exact item text, kept outside paint so polling keeps it.
   const fixStates=new Map();
@@ -62,7 +66,7 @@ export function mountSessionWorkspace(host,client,session,{connect=connectEvents
     <header class="sw-workspace-heading"><strong data-agent-name>${esc(session.display_name || session.agent_role || 'Agent')}</strong><button type="button" data-rename-agent${session.capabilities?.rename_agent?'':' hidden'}>Rename agent</button><a class="sw-llm-link" data-llm-link href="#/llm/session/${esc(encodeURIComponent(session.session_id))}">LLM usage</a><button type="button" data-fullscreen aria-expanded="false">Fullscreen workspace</button></header>
     ${session.name_error?`<p class="sw-status" data-agent-name-error role="status">${esc(session.name_error)}</p>`:''}
     <form data-rename-form hidden><label>Agent name <input aria-label="Agent name" name="agent_name" maxlength="64" required></label><button type="submit">Save name</button><button type="button" data-cancel-rename>Cancel</button><p data-rename-status role="status"></p></form>
-    <section class="sw-summary-card" aria-label="Agent summary"><div class="sw-summary-heading"><h3>AI-generated summary</h3><button type="button" data-regenerate-summary${session.capabilities?.regenerate_summary?'':' hidden'}>Regenerate summary</button></div><div data-agent-summary role="status">${skeleton('summary',{rows:2,height:18,inStatus:true})}</div></section>
+    <section class="sw-summary-card" aria-label="Agent summary"><div class="sw-summary-heading"><h3>AI-generated summary</h3><button type="button" data-regenerate-summary${session.capabilities?.regenerate_summary?'':' hidden'}>Regenerate summary</button><button type="button" data-summary-report${session.capabilities?.summary_report?'':' hidden'}>Generate full report</button></div><div data-agent-summary role="status">${skeleton('summary',{rows:2,height:18,inStatus:true})}</div><div class="sw-report" data-report-host hidden></div></section>
     <div class="sw-status" data-recording-status role="status">${skeleton('recorded conversation',{rows:1,height:16,inStatus:true})}</div>
     <div class="sw-relations" data-session-relations></div>
     <div class="sw-filters"><label>Agent <select data-agent-filter><option value="">All agents</option></select></label>
@@ -186,6 +190,36 @@ export function mountSessionWorkspace(host,client,session,{connect=connectEvents
     summaryHost.innerHTML=`<p class="sw-summary-state">${esc(summaryError || states[value.state] || 'Summary status unknown.')}</p>${value.overview?`<div class="conversation-markdown">${renderMarkdown(value.overview,markdown)}</div>`:''}${value.where_left_off?`<h4>Where we left off</h4><div class="conversation-markdown">${renderMarkdown(value.where_left_off,markdown)}</div>`:''}${fields.some(([key])=>value[key]?.length)?`<details><summary>Discussion, decisions and next steps</summary>${fields.filter(([key])=>Array.isArray(value[key]) && value[key].length).map(([key,label])=>`<h4>${label}</h4><ul>${value[key].map((text,index)=>item(key,text,index)).join('')}</ul>`).join('')}</details>`:''}<p class="sw-summary-provenance">${esc(provenance)}${value.generated_at?` · Generated ${esc(value.generated_at)}`:''}${value.model?` · ${esc(value.model)}`:''}</p>`;
     const details=summaryHost.querySelector('details');if(details && detailsOpen)details.open=true;
   }
+  function paintReport(){
+    if(disposed)return;
+    const view=reportView(fullReport,reportLocal);
+    const signature=JSON.stringify([view,canReport()]);if(signature===reportSignature)return;reportSignature=signature;
+    const button=$('[data-summary-report]');button.hidden=!canReport();button.textContent=view.label;button.disabled=view.locked;
+    const box=$('[data-report-host]');
+    // Nothing to show until a run has been asked for or a report exists; a viewer without the button still sees a stored report.
+    box.hidden=!(view.report || view.status);
+    const open=box.querySelector('details')?.open;
+    const scroll=box.querySelector('.sw-report-body')?.scrollTop||0;
+    box.innerHTML=`${view.status?`<p class="sw-report-status"${view.error?' role="alert"':' role="status"'}>${esc(view.status)}</p>`:''}${view.command?`<p class="sw-report-status">Run on that host: <code>${esc(view.command)}</code></p>`:''}${view.report?`<details${open===false?'':' open'}><summary>Full session report</summary><div class="sw-report-body conversation-markdown">${renderMarkdown(view.report,markdown)}</div></details>`:''}`;
+    const body=box.querySelector('.sw-report-body');if(body)body.scrollTop=scroll;
+  }
+  function pollReport(){
+    clearTimeout(reportTimer);
+    if(disposed || (fullReport?.state!=='running' && reportLocal?.state!=='starting'))return;
+    reportTimer=setTimeout(loadSummary,3000);
+  }
+  $('[data-summary-report]').addEventListener('click',async()=>{
+    if(!canReport() || typeof client.startSummaryReport!=='function' || reportView(fullReport,reportLocal).locked)return;
+    reportLocal={state:'starting'};paintReport();
+    try{
+      await client.startSummaryReport(session.session_id);
+      if(disposed)return;
+      reportLocal=null;fullReport={...(fullReport||{}),state:'running'};
+    }catch(err){
+      if(disposed)return;
+      reportLocal=reportStartError(err);
+    }finally{if(!disposed){paintReport();pollReport();}}
+  });
   $('[data-agent-summary]').addEventListener('click',async event=>{
     const button=event.target.closest('[data-fix-summary]');if(!button || button.disabled || !canFix())return;
     const list=button.dataset.list,index=Number(button.dataset.index);
@@ -214,9 +248,10 @@ export function mountSessionWorkspace(host,client,session,{connect=connectEvents
       const value=await client.getAgentSummary(session.session_id);if(disposed)return;
       // Older valid text keeps its original provenance when an update has no result yet.
       agentSummary=agentSummary?.generated_at && !value.generated_at ? {...agentSummary,state:value.state,error:value.error} : value;
+      if(value.full_report){fullReport=value.full_report;if(fullReport.state!=='running')reportLocal=null;}
       summaryError='';
     }catch(err){if(!disposed)summaryError=`Summary unavailable: ${err.message}${agentSummary?.generated_at?' Showing the last saved summary.':''}`;}
-    finally{summaryBusy=false;paintSummary();}
+    finally{summaryBusy=false;paintSummary();paintReport();pollReport();}
   }
   const fullscreenButton=$('[data-fullscreen]'), workspace=$('[data-session-workspace]');
   function setFullscreen(value){
@@ -364,5 +399,5 @@ export function mountSessionWorkspace(host,client,session,{connect=connectEvents
   client.listCollabAgentLinks?.().then(result=>{if(!disposed){collaborators=result.agents || [];schedulePaint();}}).catch(()=>{});
   load();
   const removeFabricActions=installFabricLinkActions(host);
-  return ()=>{removeFabricActions();disposed=true;request++;clearInterval(summaryTimer);document.removeEventListener('visibilitychange',onVisibility);clearTimeout(renderTimer);clearTimeout(refreshTimer);clearTimeout(settleTimer);stop();composer.dispose();};
+  return ()=>{removeFabricActions();disposed=true;request++;clearInterval(summaryTimer);clearTimeout(reportTimer);document.removeEventListener('visibilitychange',onVisibility);clearTimeout(renderTimer);clearTimeout(refreshTimer);clearTimeout(settleTimer);stop();composer.dispose();};
 }

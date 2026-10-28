@@ -329,6 +329,12 @@ def _build_parser() -> argparse.ArgumentParser:
     p2.add_argument("--max-events", type=int, default=400)
     p2.add_argument("--json", action="store_true", help="accepted for symmetry; output is always JSON")
     p2.set_defaults(func=_cmd_summary_history)
+    p2 = smsub.add_parser("report", help="run the summary skill headlessly on one recorded session (full report as JSON)")
+    p2.add_argument("--agent", required=True, choices=("claude", "pi", "codex", "opencode"))
+    p2.add_argument("--session", required=True, help="session id of the target session")
+    p2.add_argument("--harness", choices=("claude", "codex"), default="claude", help="summarizer harness")
+    p2.add_argument("--timeout", type=int, default=300)
+    p2.set_defaults(func=_cmd_summary_report)
 
     # journal --------------------------------------------------------------
     p = sub.add_parser("journal", help="session journal & timeline (spec 0090)")
@@ -907,6 +913,16 @@ def _cmd_summary_history(args) -> int:
     out = sh.read_history(res, home=home, max_events=args.max_events)
     out["journal"] = sh.journal_projection(res.session_id)
     _print_json(out)
+    return 0
+
+
+def _cmd_summary_report(args) -> int:
+    from . import summary_report as sr
+    try:
+        _print_json(sr.run_report(args.agent, args.session, harness=args.harness, timeout=args.timeout))
+    except sr.ReportError as exc:
+        _print_json({"ok": False, "error": exc.code, "detail": exc.detail})
+        return 1
     return 0
 
 
@@ -3045,6 +3061,7 @@ def _cmd_cp_web(args) -> int:
                              fleet_config=fleet_store, ci_actions=cp.get("ci_actions") is True,
                              fabric_resolver=_fabric_url_resolver(), fabric_services=_fabric_service_lister(),
                              summary_config=cp.get("agent_summaries") or {},
+                             summary_report_config=cp.get("summary_report") or {},
                              assistant_config={"personal_assistant": cp["personal_assistant"]}
                                  if isinstance(cp.get("personal_assistant"), dict) else None,
                              review_quorum=_review_quorum_config(cp),
