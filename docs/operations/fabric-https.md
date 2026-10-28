@@ -40,3 +40,19 @@ Devices must also resolve `dev.lan` (Tailscale split-DNS to the fabric's CoreDNS
 Automated: chain, SAN (apex + wildcard), EKU, name constraints, 397-day cap, same-port HTTP/HTTPS, redirects, SSE,
 upgrade passthrough, forwarded-header spoofing, handshake failure. **Not verified by automation:** acceptance on a real
 Mac and iPhone (trust UI, Safari). Run the table above and report back.
+
+## Who may open a leased port (data-plane access)
+By default any tailnet peer can open any leased port (unchanged). Give the gateway an allow-list and it flips to
+deny-by-default:
+
+```bash
+herdr-eng devfabric gateway ... --allow-user alice@example.com --allow-tag tag:dev
+# or in config: fabric.access.users / fabric.access.tags
+```
+
+Each connection is checked before TLS or HTTP is spoken, using tailscaled's LocalAPI `whois` for the peer address.
+Guests, shared-in devices and anything not listed are dropped silently (logged as `denied <ip> on :<port>`).
+A failed identity lookup also denies (fail closed). Loopback (the gateway host itself) is trusted. Verdicts are cached 30 s.
+The gateway needs the tailscaled socket (`/var/run/tailscale/tailscaled.sock`); in the container stack mount it read-only
+(the stack already uses `network_mode: host`, so peer addresses are real). The control API on `:29999` keeps its bearer token.
+**Not verified by automation:** a real shared-in guest device; the tests use injected identities and a fake LocalAPI socket.

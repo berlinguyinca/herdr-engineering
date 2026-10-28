@@ -154,6 +154,7 @@ class GatewayRouter:
         self._bind_hosts = [h for h in bind_hosts if h]
         # HTTPS on the SAME port as plain HTTP: the first byte of a connection says which (0x16 = TLS handshake).
         self.tls_context: ssl.SSLContext | None = None
+        self.access = None   # AccessPolicy | None: who may open a leased port (default: any peer, as before)
         self.external_for: Callable[[int], str | None] = lambda port: None   # set by the gateway
         self._listeners: dict[int, list[socket.socket]] = {}
         self._accept_threads: dict[int, list[threading.Thread]] = {}
@@ -234,6 +235,21 @@ class GatewayRouter:
     def _proxy_one(self, client: socket.socket, target_host: str,
                    target_port: int, routes: list | None = None,
                    rewrite: str | None = None, port: int | None = None) -> None:
+        if self.access is not None and self.access.enforcing:
+            try:
+                peer = client.getpeername()[0]
+            except OSError:
+                peer = None
+            allowed, why = self.access.decide(peer)
+            if not allowed:
+                # Dropped before TLS/HTTP: an unauthorised peer learns nothing about what is behind the port.
+                from .devfabric import _log_devfabric
+                _log_devfabric("fabric", "WARNING", "denied %s on :%s (%s)", peer, port, why)
+                try:
+                    client.close()
+                except OSError:
+                    pass
+                return
         client, tls = self._terminate_tls(client)
         if client is None:
             return

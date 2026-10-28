@@ -393,6 +393,10 @@ def _build_parser() -> argparse.ArgumentParser:
     p2.add_argument("--tls-cert", default=None, help="serve HTTPS on every leased port with this certificate "
                     "(same port as HTTP; issue one with `devfabric ca issue`)")
     p2.add_argument("--tls-key", default=None, help="private key for --tls-cert")
+    p2.add_argument("--allow-user", action="append", default=[],
+                    help="tailnet login allowed to open leased ports (repeatable). With --allow-user/--allow-tag "
+                         "every other peer, guests and shared-in devices included, is refused")
+    p2.add_argument("--allow-tag", action="append", default=[], help="tailnet ACL tag allowed (e.g. tag:dev)")
     p2.set_defaults(func=_cmd_dev_gateway)
     p2 = dsub.add_parser("ca", help="private CA for the fabric's HTTPS (dev.lan)")
     casub = p2.add_subparsers(dest="ca_cmd", required=True)
@@ -2077,9 +2081,15 @@ def _cmd_dev_gateway(args) -> int:
         ctx.load_cert_chain(tls_cert, tls_key)
         ctx.set_alpn_protocols(["http/1.1"])
         gateway.enable_tls(ctx)
+    acl = cfg.get("access") or {}
+    users = [*args.allow_user, *(acl.get("users") or [])]
+    tags = [*args.allow_tag, *(acl.get("tags") or [])]
+    if users or tags:
+        from .fabric_access import AccessPolicy
+        router.access = AccessPolicy(users=frozenset(users), tags=frozenset(tags))
     gateway.start()
     _print_json({
-        "ok": True, "gateway": True, "https": bool(tls_cert),
+        "ok": True, "gateway": True, "https": bool(tls_cert), "access_enforced": bool(users or tags),
         "control_url": f"http://{gateway.control_host}:{control_port}",
         "url_base": gateway.url_base,
         "bind_hosts": bind_hosts,
