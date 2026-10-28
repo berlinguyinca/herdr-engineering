@@ -32,6 +32,14 @@ herdr-eng devfabric gateway --acme-domain local.metabolomics.us --renew-certs
   AAAA answer would make dual-stack clients wait on an address nothing serves. With `--ip` repeated (an HA pair) clients
   round-robin and fall through when one host is down. TTL defaults to 60 s.
 
+## Unattended-renewal credentials
+
+Renewal only ever needs to write the `_acme-challenge.local.metabolomics.us` TXT record. `deploy/fabric-stack/iam-acme-renewal-policy.json`
+grants exactly that (plus `ListHostedZones`/`GetChange`, which certbot needs and which expose nothing writable) on the one hosted zone, so a
+leaked key cannot touch the A records, other names or other zones. Attach it to a dedicated IAM user (or role) whose key is the only
+credential the renewal timer sees (`AWS_PROFILE` in the unit, or `~/.aws/credentials`). `devfabric dns publish` is a deliberate,
+human-run step and needs broader rights (A records of this name); do not give those to the timer.
+
 ## Renewal
 
 `--renew-certs` (or `fabric.renew_certs: true`) makes **one** gateway renew. In an HA pair set it on one node only; the

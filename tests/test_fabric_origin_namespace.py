@@ -140,3 +140,43 @@ def test_agent_omits_origin_port_when_ports_match(tmp_path):
 def test_own_net_namespace_is_a_valid_identifier():
     ns = fa._own_net_namespace()
     assert ns is None or _lease(network_namespace=ns).network_namespace == ns
+
+
+# ---- a lease must never be handed out for a port the gateway could not bind ----------------------
+def _squat(host, port):
+    s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind((host, port)); s.listen(1); return s
+
+
+def test_allocation_skips_a_port_held_on_the_routers_own_address(tmp_path):
+    # 127.0.0.2 stands in for the tailnet IP: loopback (127.0.0.1) is free, the bind address is not
+    probe = socket.socket(); probe.bind(("127.0.0.2", 0)); lo = probe.getsockname()[1]; probe.close()
+    held = _squat("127.0.0.2", lo)
+    server, tport = _http_target(tmp_path)
+    from herdr_engineering.devfabric import DevServiceRegistry
+    from herdr_engineering.fabric import FabricGateway, GatewayRouter
+    reg = DevServiceRegistry(store_path=tmp_path / "l.json", port_range=(lo, lo + 40))
+    gw = FabricGateway(reg, GatewayRouter(["127.0.0.2"]), control_host="127.0.0.1", control_port=0,
+                       url_base="x.test", probe_interval=30, token="")
+    gw.start()
+    try:
+        res = _client(gw).register(target_machine_id="m", target_host="127.0.0.1", target_port=tport, preferred_port=lo)
+        assert res["lease"]["external_port"] != lo and res["lease"]["external_port"] in gw.router.bound_ports()
+    finally:
+        gw.stop(); server.shutdown(); held.close()
+
+
+def test_a_bind_failure_is_a_409_and_leaves_no_lease(tmp_path):
+    from herdr_engineering.errors import UnreachableError
+    from herdr_engineering.devfabric import DevServiceRegistry
+    from herdr_engineering.fabric import FabricGateway, GatewayRouter
+    reg = DevServiceRegistry(store_path=tmp_path / "l.json", port_range=(44000, 44010))
+    router = GatewayRouter(["127.0.0.1"])
+    router.bind = lambda *a, **k: False                      # the race: free at allocation, taken at bind
+    gw = FabricGateway(reg, router, control_host="127.0.0.1", control_port=0, url_base="x.test", probe_interval=30, token="")
+    gw.start()
+    try:
+        with pytest.raises(UnreachableError, match="409"):
+            _client(gw).register(target_machine_id="m", target_host="127.0.0.1", target_port=3000)
+        assert reg.active_leases() == []
+    finally:
+        gw.stop()

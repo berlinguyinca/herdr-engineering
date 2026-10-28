@@ -12,6 +12,7 @@ import os
 import socket
 import threading
 import uuid
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -127,6 +128,9 @@ class DevServiceRegistry:
                            str(Path.home() / ".local/share/herdr-engineering/state"))) / "leases.json"
         self._path.parent.mkdir(parents=True, exist_ok=True)
         self._lo, self._hi = port_range
+        # "Is this external port usable here?" Defaults to a loopback probe; the gateway swaps in a probe of the
+        # addresses its router really binds (the tailnet IP can be held by another gateway while loopback is free).
+        self.port_free: Callable[[int], bool] = _os_port_free
         self._ttl = lease_ttl_seconds
         self._leases: dict[str, DevServiceLease] = {}
         self._lock = threading.RLock()
@@ -323,10 +327,10 @@ class DevServiceRegistry:
         if preferred is not None:
             if (preferred >= 1024
                     and not self._is_port_taken(preferred, exclude_id)
-                    and _os_port_free(preferred)):
+                    and self.port_free(preferred)):
                 return preferred
         for port in range(self._lo, self._hi + 1):
-            if not self._is_port_taken(port, exclude_id) and _os_port_free(port):
+            if not self._is_port_taken(port, exclude_id) and self.port_free(port):
                 return port
         raise ConflictError("no free external dev port in configured range")
 
