@@ -247,13 +247,43 @@ def test_report_upload_requires_operator_and_is_readable_by_viewer(server):
 
 
 def test_history_is_viewer_readable_flat_and_memory_only(server):
+    from time import monotonic, sleep
+
     from tests.control_plane.test_ci_history import MemoryProvider, runs
 
+    armed, started, release = threading.Event(), threading.Event(), threading.Event()
+
+    class BlockingProvider(MemoryProvider):
+        def pipelines(self, repository, *, page=1, per_page=50):
+            if armed.is_set():
+                started.set()
+                if not release.wait(10):
+                    raise TimeoutError('history revalidation barrier was not released')
+            return super().pipelines(repository, page=page, per_page=per_page)
+
+    provider = BlockingProvider(runs(3))
     server.ci_monitor.close()
-    server.ci_monitor = CIMonitor(provider_factory=lambda: MemoryProvider(runs(3)))
+    server.ci_monitor = CIMonitor(provider_factory=lambda: provider)
     server.ci_monitor._history.refresh()
-    status, data = request(server, 'ci/history')
-    assert status == 200
+    armed.set()
+    try:
+        assert request(server, 'ci/history')[0] == 200
+        assert started.wait(5), 'background history revalidation did not start'
+        status, data = request(server, 'ci/history')
+        assert status == 200
+        assert data['refreshing'] is True
+        assert data['coverage']['17']['exhausted'] is False
+    finally:
+        release.set()
+
+    deadline = monotonic() + 5
+    while monotonic() < deadline:
+        status, data = request(server, 'ci/history')
+        assert status == 200
+        if data['refreshing'] is False:
+            break
+        sleep(0.01)
+    assert data['refreshing'] is False, data
     assert isinstance(data['pipelines'], list)
     assert data['scope']['memory_only'] is True
     assert data['repos'][0]['provider_url'] == 'https://ci.example'
