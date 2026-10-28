@@ -188,6 +188,12 @@ def resolve(*, agent: str | None = None, session: str | None = None, cwd: str | 
     cwd = cwd or os.getcwd()
     if session and os.path.isfile(session):
         return Resolution(agent=agent, path=session, session_id=Path(session).stem, method="explicit")
+    if session and agent not in AGENTS:
+        # An id with no agent: look in every store rather than fall to the directory heuristic.
+        for candidate in AGENTS:
+            path = _find_by_id(home, candidate, session) if candidate != "opencode" else None
+            if path:
+                return Resolution(agent=candidate, path=path, session_id=session, method="explicit")
     if session and agent in AGENTS:
         path = _find_by_id(home, agent, session)
         return Resolution(agent=agent, path=path, session_id=session, method="explicit",
@@ -373,6 +379,28 @@ def _opencode(db: str, sid: str | None) -> tuple[list[dict], dict]:
     return events, meta
 
 
+def _record_cwd(res: Resolution) -> str | None:
+    """Working directory recorded in the session itself (never the caller's own cwd)."""
+    try:
+        if res.agent == "opencode":
+            con = sqlite3.connect(f"file:{res.path}?mode=ro", uri=True, timeout=5)
+            try:
+                row = con.execute("select directory from session where id = ?", (res.session_id,)).fetchone()
+            finally:
+                con.close()
+            return row[0] if row and isinstance(row[0], str) else None
+        for i, d in enumerate(_jsonl(res.path)):
+            p = d.get("payload") if isinstance(d.get("payload"), dict) else {}
+            value = d.get("cwd") or p.get("cwd")
+            if isinstance(value, str) and value:
+                return value
+            if i >= 200:
+                break
+    except (OSError, sqlite3.Error, ValueError):
+        pass
+    return None
+
+
 # --- public entry -----------------------------------------------------------
 
 def read_history(res: Resolution, *, home: Path | None = None, max_events: int = 400) -> dict:
@@ -409,6 +437,7 @@ def read_history(res: Resolution, *, home: Path | None = None, max_events: int =
     shown = events if not omitted else events[:60] + events[-(max_events - 60):]
     return {
         "agent": res.agent, "session_id": res.session_id, "record": res.path, "method": res.method,
+        "cwd": _record_cwd(res) if res.path and res.agent else None,
         "events_total": len(events), "events_omitted_from_middle": omitted, "events": shown,
         "compactions": len(compactions), "child_records": meta["child_records"],
         "coverage": {"verdict": verdict, "gaps": gaps},

@@ -44,7 +44,7 @@ log = logging.getLogger(__name__)
 
 # Routes a host-side tool (session run, plannotator bridge) may POST with the
 # narrow `agent` role, besides /api/v1/ingest. Nothing else.
-_SUMMARY_FIX = re.compile(r"^/api/v1/sessions/[^/]+/summary/fix$")
+_SUMMARY_FIX = re.compile(r"^/api/v1/sessions/[^/]+/summary/(?:fix|report)$")
 # Terminal button: builds (never runs) the viewer-side attach command; same guard as summary fix.
 _TERMINAL_ATTACH = re.compile(r"^/api/v1/sessions/[^/]+/terminal$")
 _AGENT_POST = re.compile(r"^/api/v1/(?:llm/keys|reviews|llm/keys/[^/]+/revoke"
@@ -250,7 +250,7 @@ class ControlPlaneServer:
                  public_port=None, public_host=None, collab_only=False,
                  operator_port=None, operator_user=None, operator_email=None,
                  operator_hosts=(), collab_operator_url=None, collab_dashboard_hosts=(),
-                 summary_config=None, summary_client=None, usage_retention=None, lineage_key_scopes=None,
+                 summary_config=None, summary_client=None, summary_report_config=None, usage_retention=None, lineage_key_scopes=None,
                  review_quorum=None, system_graph: bool = False, attention=None, ci_fix=None, missions=None, github_pg_dsn=None,
                  architecture_enabled=None, architecture_explain=None, architecture_options=None,
                  request_workers=128, request_queue=256,
@@ -307,6 +307,7 @@ class ControlPlaneServer:
             load_into(repo, source)
         self.source = source
         self.agent_summaries = None
+        self.summary_report = None
         self._summary_stop = threading.Event()
         self._summary_scanner = None
         if not collab_only:
@@ -315,6 +316,8 @@ class ControlPlaneServer:
                                                        persist=repo.persist_agent_summary,
                                                        model_client=summary_client)
             self.agent_summaries.hydrate(repo.agent_summary_events())
+            from .summary_report import SummaryReportService
+            self.summary_report = SummaryReportService(repo, summary_report_config or {})
         # Optional durable object store (RustFS / S3). When wired, artifact
         # payloads are stored content-addressed here instead of the repo's
         # in-memory blob stand-in, so they survive a web restart.
@@ -2086,7 +2089,10 @@ def _make_handler(server, public=False, operator=False):
             if resource == "sessions" and len(parts) == 6 and parts[5] == "summary":
                 if r.get_session(parts[4]) is None:
                     return self._json({"error": "agent not found"}, 404)
-                return self._json(server.agent_summaries.get(parts[4]))
+                body = server.agent_summaries.get(parts[4])
+                if server.summary_report is not None and server.summary_report.enabled:
+                    body = {**body, "full_report": server.summary_report.get(parts[4])}
+                return self._json(body)
             if resource == "sessions":
                 if len(parts) > 4:
                     s = r.get_session(parts[4])
@@ -2667,6 +2673,17 @@ def _make_handler(server, public=False, operator=False):
                                                       peer=self.client_address[0]))
                 except AttachRefused as exc:
                     return self._json(exc.body, exc.status)
+            if resource == "sessions" and len(parts) == 7 and parts[5:] == ["summary", "report"]:
+                from .summary_report import ReportRefused
+                if server.summary_report is None:
+                    return self._json({"ok": False, "error": "Full session reports are not enabled.",
+                                       "reason": "reports_disabled"}, 409)
+                actor = {"role": self._role(), "via": "api_key" if server._keys else "open"}
+                try:
+                    status, result = server.summary_report.start(parts[4], actor=actor)
+                except ReportRefused as exc:
+                    return self._json(exc.body, exc.status)
+                return self._json(result, status)
             if resource == "sessions" and len(parts) == 7 and parts[5:] == ["summary", "fix"]:
                 from .summary_fix import SummaryFixRefused, fix_summary_item
                 actor = {"role": self._role(), "via": "api_key" if server._keys else "open"}
@@ -3105,6 +3122,8 @@ def _make_handler(server, public=False, operator=False):
             return {**session, "capabilities": {"rename_agent": operator,
                                                 "regenerate_summary": operator,
                                                 "fix_summary_item": operator,
+                                                "summary_report": operator and server.summary_report is not None
+                                                and server.summary_report.enabled,
                                                 "attach_terminal": operator}}
 
         def _named_inspector(self, data, sid):

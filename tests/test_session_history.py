@@ -232,3 +232,22 @@ def test_idle_codex_helper_thread_and_ties_are_not_guessed(tmp_path):
     assert sh.resolve(home=home2, env={"HERDR_PANE_ID": "w1:p2"}, herdr_bin=str(fake2), proc=proc2).path is None
 
 
+
+
+def test_history_reports_the_cwd_recorded_in_the_session(tmp_path):
+    rows = [{"type": "user", "timestamp": "t1", "cwd": "/work/proj", "message": {"content": "hi"}}]
+    _jl(tmp_path / ".claude/projects/-work-proj/cwd1.jsonl", rows)
+    out = sh.read_history(sh.resolve(agent="claude", session="cwd1", home=tmp_path), home=tmp_path)
+    assert out["cwd"] == "/work/proj"
+
+
+def test_history_cwd_is_null_when_the_record_names_none(tmp_path):
+    claude_fixture(tmp_path)
+    out = sh.read_history(sh.resolve(agent="claude", session="c1", home=tmp_path), home=tmp_path)
+    assert out["cwd"] is None
+
+
+def test_session_id_without_agent_searches_every_store(tmp_path):
+    claude_fixture(tmp_path, sid="only-here")
+    res = sh.resolve(session="only-here", home=tmp_path, env={}, cwd="/somewhere/else")
+    assert (res.agent, res.method) == ("claude", "explicit")
