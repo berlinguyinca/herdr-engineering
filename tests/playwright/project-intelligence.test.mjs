@@ -5,6 +5,7 @@ import assert from 'node:assert';
 import fs from 'node:fs';
 import path from 'node:path';
 import { withPage } from './helpers/fixture.mjs';
+import { staticAudit, focusIndicatorAudit, overflowAudit, overflowFailure, summarize } from './a11y-checks.mjs';
 
 const SHOTS = process.env.PI_SHOTS || '';
 const EVIDENCE = { source_ref: 'gmail:acct:m1', anchor_type: 'email_part', anchor_value: '1.2' };
@@ -116,7 +117,7 @@ test('empty, no-project and error states are explicit, never partial data', asyn
   });
 });
 
-test('phone width: no horizontal scroll, detail stacks above the list; dark mode', async () => {
+test('phone width: no horizontal scroll, detail scrolls into view in reading order; dark mode', async () => {
   await withPage(async (page, base) => {
     await stub(page);
     await page.setViewportSize({ width: 390, height: 844 });
@@ -125,8 +126,9 @@ test('phone width: no horizontal scroll, detail stacks above the list; dark mode
     await page.locator('.pi-item[data-event="e1"]').click();
     const overflow = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
     assert.ok(overflow <= 1, `horizontal overflow ${overflow}px`);
-    const order = await page.evaluate(() => { const p = document.querySelector('.pi-pane').getBoundingClientRect().top; const l = document.querySelector('.pi-list').getBoundingClientRect().top; return p < l; });
-    assert.ok(order, 'detail pane precedes the list on a phone');
+    // Reading order equals visual order (no CSS reordering); the pane is scrolled into view when an event is chosen.
+    const seen = await page.evaluate(() => { const r = document.querySelector('.pi-pane').getBoundingClientRect(); return r.top < innerHeight && r.bottom > 0; });
+    assert.ok(seen, 'detail pane is visible after selecting an event on a phone');
     await shot(page, 'timeline-phone-light.png');
     await page.emulateMedia({ colorScheme: 'dark' });
     await shot(page, 'timeline-phone-dark.png');
@@ -225,3 +227,24 @@ test('no investigations: the picker is simply absent and a failed lookup does no
     assert.equal(await page.locator('#pi-inv').count(), 0);
   });
 });
+
+for (const [name, size, theme] of [['desktop light', [1280, 900], 'light'], ['desktop dark', [1280, 900], 'dark'], ['phone dark', [390, 844], 'dark']]) {
+  test(`accessibility spot checks (${name}): contrast, names, focus indicators, no overflow`, async () => {
+    await withPage(async (page, base) => {
+      await page.emulateMedia({ colorScheme: theme });
+      await page.setViewportSize({ width: size[0], height: size[1] });
+      await stub(page);
+      await page.route('**/api/v1/intelligence/relationships**', (route) => route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ items: [
+        { id: 'r1', from: 'pr:acme/app#7', to: 'issue:acme/app#12', predicate: 'fixes', derivation: 'inferred', review_state: 'provisional', confidence: 0.9, evidence_refs: [EVIDENCE] }] }) }));
+      await page.route('**/api/v1/intelligence/findings', (route) => route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ items: [
+        { id: 'f1', statement: '[unverified] a claim', verified: false, evidence_refs: [] }] }) }));
+      await page.goto(`${base}/#/intelligence`);
+      await page.waitForSelector('.pi-item');
+      await page.locator('.pi-item[data-event="e2"]').click();
+      await page.waitForSelector('#pi-related li');
+      const f = [...await staticAudit(page, '#view'), ...await focusIndicatorAudit(page, '#view')];
+      assert.deepEqual(f, [], summarize(f));
+      assert.equal(overflowFailure(await overflowAudit(page)), '', 'overflow');
+    });
+  });
+}

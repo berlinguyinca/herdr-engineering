@@ -8,16 +8,19 @@ import { entityHref } from './entity-links.js';
 const arr = (v) => (Array.isArray(v) ? v : []);
 const LABEL = { verified: ['Evidence-backed', 'ok'], unverified: ['Unverified', 'warn'] };
 
-export const intelligenceStyles = `<style>.pi{margin:14px 0}.pi-bar{display:flex;flex-wrap:wrap;gap:8px 12px;align-items:end;margin:8px 0 14px}
-.pi-bar label{display:flex;flex-direction:column;font-size:12px;color:var(--text-secondary);gap:2px}.pi-bar select,.pi-bar input{font:inherit;padding:4px 8px;border:1px solid var(--border);border-radius:var(--radius);background:transparent;color:inherit;min-width:0}
+export const intelligenceStyles = `<style>.pi{--pi-ok:#0b6b3a;--pi-warn:#8a4b00;--pi-info:#1e40af;--pi-muted:#4b4b5c;--pi-focus:#0b4fc4;--pi-link:#0b4fc4;margin:14px 0}
+:root[data-theme=dark] .pi{--pi-ok:#34d399;--pi-warn:#fbbf24;--pi-info:#93c5fd;--pi-muted:#b4bacb;--pi-focus:#8ab4ff;--pi-link:#8ab4ff}
+@media(prefers-color-scheme:dark){:root:not([data-theme=light]) .pi{--pi-ok:#34d399;--pi-warn:#fbbf24;--pi-info:#93c5fd;--pi-muted:#b4bacb;--pi-focus:#8ab4ff;--pi-link:#8ab4ff}}
+.pi a{color:var(--pi-link)}.pi :focus-visible{outline:2px solid var(--pi-focus);outline-offset:1px}.pi ::placeholder{color:var(--pi-muted);opacity:1}.pi-bar{display:flex;flex-wrap:wrap;gap:8px 12px;align-items:end;margin:8px 0 14px}
+.pi-bar label{display:flex;flex-direction:column;font-size:12px;color:var(--pi-muted);gap:2px}.pi-bar select,.pi-bar input{font:inherit;padding:4px 8px;border:1px solid var(--border);border-radius:var(--radius);background:transparent;color:inherit;min-width:0}
 .pi-split{display:grid;grid-template-columns:minmax(0,3fr) minmax(0,2fr);gap:16px}.pi-list{list-style:none;margin:0;padding:0}
 .pi-item{display:block;width:100%;text-align:left;padding:8px 10px;border:0;border-bottom:1px solid var(--border);background:transparent;color:inherit;font:inherit;cursor:pointer;overflow-wrap:anywhere}
-.pi-item:hover,.pi-item:focus-visible,.pi-item[aria-current=true]{background:color-mix(in srgb,var(--accent) 12%,transparent);outline:none}.pi-item:focus-visible{box-shadow:inset 0 0 0 2px var(--accent)}
-.pi-meta{color:var(--text-secondary);font-size:12px}.pi-chip{display:inline-block;padding:1px 8px;border-radius:999px;border:1px solid var(--border);font-size:12px;margin-left:6px}
-.pi-chip[data-tone=ok]{color:var(--status-ok,#1a7f37)}.pi-chip[data-tone=warn]{color:var(--status-attention,#9a6700)}.pi-chip[data-tone=info]{color:var(--accent)}
-.pi-day{font-size:13px;font-weight:600;margin:14px 0 4px;color:var(--text-secondary)}.pi-pane{border:1px solid var(--border);border-radius:var(--radius);padding:12px 14px;min-width:0;overflow-wrap:anywhere}
-.pi-pane h2{font-size:15px;margin:0 0 8px}.pi-note{color:var(--text-secondary);font-size:13px}.pi-state{padding:18px 0;color:var(--text-secondary)}
-.pi-sup{text-decoration:line-through;opacity:.7}@media(max-width:720px){.pi-split{grid-template-columns:minmax(0,1fr)}.pi-pane{order:-1}}</style>`;
+.pi-item:hover,.pi-item:focus-visible,.pi-item[aria-current=true]{background:color-mix(in srgb,var(--accent) 7%,transparent)}
+.pi-meta{color:var(--pi-muted);font-size:12px}.pi-chip{display:inline-block;padding:1px 8px;border-radius:999px;border:1px solid var(--border);font-size:12px;margin-left:6px}
+.pi-chip[data-tone=ok]{color:var(--pi-ok)}.pi-chip[data-tone=warn]{color:var(--pi-warn)}.pi-chip[data-tone=info]{color:var(--pi-info)}
+.pi-day{font-size:13px;font-weight:600;margin:14px 0 4px;color:var(--pi-muted)}.pi-pane{border:1px solid var(--border);border-radius:var(--radius);padding:12px 14px;min-width:0;overflow-wrap:anywhere}
+.pi-pane h2{font-size:15px;margin:0 0 8px}.pi-note{color:var(--pi-muted);font-size:13px}.pi-state{padding:18px 0;color:var(--pi-muted)}
+.pi-sup{text-decoration:line-through;opacity:.7}@media(max-width:720px){.pi-split{grid-template-columns:minmax(0,1fr)}}</style>`;
 
 const day = (iso) => String(iso || '').slice(0, 10) || 'unknown date';
 const when = (iso) => String(iso || '').replace('T', ' ').replace(/(\.\d+)?(\+00:00|Z)$/, ' UTC');
@@ -178,7 +181,7 @@ ${arr(investigations).length ? `<label>Investigation<select id="pi-inv"><option 
       if (findings === null) loadFindings();
     }
     if (sel?.involved_entities?.[0]) loadRelated(sel.involved_entities[0]);
-    host.querySelectorAll('.pi-item').forEach((b) => { b.onclick = () => { state.event = b.dataset.event; persist(); draw(host.querySelector('.pi-split')); host.querySelector(`.pi-item[data-event="${CSS.escape(state.event)}"]`)?.focus(); }; });
+    host.querySelectorAll('.pi-item').forEach((b) => { b.onclick = () => { state.event = b.dataset.event; persist(); draw(host.querySelector('.pi-split')); host.querySelector(`.pi-item[data-event="${CSS.escape(state.event)}"]`)?.focus(); if (window.matchMedia?.('(max-width:720px)').matches) host.querySelector('.pi-pane')?.scrollIntoView?.({ block: 'nearest' }); }; });
   }
 
   load();
