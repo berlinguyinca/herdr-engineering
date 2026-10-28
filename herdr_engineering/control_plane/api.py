@@ -468,6 +468,8 @@ class ControlPlaneServer:
         from .intel_bridge import install as install_intelligence
         self.intelligence, self.intelligence_bridge = install_intelligence(
             repo, lambda: self._intelligence_section(fleet_config), github_pg_dsn)
+        if getattr(self, "assistant", None) is not None:
+            self.assistant.intelligence_read = self.intelligence.assistant_read
         self._configure_architecture_explain(fleet_config, architecture_explain)
         if collab is not None:
             collab.architecture = self.architecture

@@ -527,6 +527,14 @@ TOOL_CATALOG: dict[str, dict[str, Any]] = {
                    "parameters": {"type": "object", "properties": {
                        "sections": {"type": "array", "items": {"type": "string"},
                                     "description": "Optional subset of: hosts, missions, sessions, services, activity."}}}},
+    "read_project_intelligence": {
+        "sensitive": False,
+        "description": "Read project timelines and evidence the caller is already allowed to see (read-only; returns dashboard links).",
+        "parameters": {"type": "object", "properties": {
+            "operation": {"type": "string", "enum": ["projects_search", "timeline_query", "evidence_open"]},
+            "text": {"type": "string"}, "project": {"type": "string"}, "event": {"type": "string"},
+            "source": {"type": "string"}, "category": {"type": "string"}, "as_of": {"type": "string"}},
+            "required": ["operation"]}},
 }
 
 
@@ -1362,6 +1370,8 @@ class AssistantService:
         self.fleet_context = (FleetContextProvider(
             repo, max_chars=fc.get("max_chars", 6000), per_section=fc.get("per_section", 10))
             if (repo is not None and fc.get("enabled")) else None)
+        # Set by the control-plane API when project intelligence is enabled: (tenant, user, payload) -> dict.
+        self.intelligence_read = None
         if runner is not None:
             self.runner = runner
         else:
@@ -2265,6 +2275,13 @@ class AssistantService:
                 raise AssistantError("fleet context is not enabled")
             return {"ok": True, "context": self.fleet_context.render(
                 sections=payload.get("sections"))}
+        if tool_id == "read_project_intelligence":
+            if self.intelligence_read is None:
+                raise AssistantError("project intelligence is not enabled")
+            try:
+                return {"ok": True, "result": self.intelligence_read(tenant_id, user_id, payload)}
+            except (ValueError, LookupError) as exc:
+                raise AssistantError(str(exc)) from exc
         if tool_id == "delegate":
             d = self.delegate(tenant_id=tenant_id, user_id=user_id,
                               assistant_id=assistant_id,

@@ -33,17 +33,30 @@ class IntelligenceRoutes:
         raw = self._section() or {}
         return pi.config(raw), raw
 
+    def assistant_read(self, tenant_id: str, user_id: str, payload: dict) -> dict:
+        """Assistant tool entry: scope comes only from YAML ``assistant_viewers: {"<tenant>/<user>": {...}}``."""
+        from .intel_assistant import ReadTools, execute_read
+        cfg, raw = self._cfg()
+        if not cfg["enabled"]:
+            raise pi.NotFound("project intelligence is not enabled")
+        entry = (raw.get("assistant_viewers") or {}).get(f"{tenant_id}/{user_id}")
+        viewer = self._viewer_from_entry(entry) if isinstance(entry, dict) else None
+        return execute_read(ReadTools(self.store), viewer, payload)
+
+    @staticmethod
+    def _viewer_from_entry(entry: dict) -> pi.Viewer | None:
+        projects, clearance = entry.get("projects"), entry.get("clearance", "internal")
+        if not isinstance(entry.get("org_id"), str) or clearance not in pi.LABELS or not (
+                projects == "*" or (isinstance(projects, list) and all(isinstance(x, str) for x in projects))):
+            return None
+        return pi.Viewer(entry["org_id"], None if projects == "*" else frozenset(projects or ()), clearance)
+
     def viewer_for(self, principal: dict, role: str | None, raw: dict) -> pi.Viewer | None:
         if role not in READ_ROLES:
             return None
         entry = (raw.get("viewers") or {}).get(principal.get("id"))
         if isinstance(entry, dict) and isinstance(entry.get("org_id"), str):
-            projects = entry.get("projects")
-            clearance = entry.get("clearance", "internal")
-            if clearance not in pi.LABELS or not (projects == "*" or (
-                    isinstance(projects, list) and all(isinstance(x, str) for x in projects))):
-                return None     # a malformed scope sees nothing (a bare string would otherwise become a set of letters)
-            return pi.Viewer(entry["org_id"], None if projects == "*" else frozenset(projects or ()), clearance)
+            return self._viewer_from_entry(entry)   # a malformed scope sees nothing
         org = raw.get("default_org_id")
         if principal.get("authenticated_by") == "open_listener" and isinstance(org, str):
             return pi.Viewer(org, None, "internal")

@@ -151,3 +151,24 @@ class NotificationPlanner:
             return "send_now"
         self.digest.append(n)
         return "held_for_digest"
+
+
+READ_OPS = frozenset({"projects_search", "timeline_query", "evidence_open"})
+
+
+def execute_read(tools: ReadTools, viewer: pi.Viewer | None, payload: dict) -> dict:
+    """Run one allowlisted read operation as ``viewer``. No viewer mapping means no data (deny-by-default)."""
+    if viewer is None:
+        raise pi.NotFound("no project-intelligence scope is configured for this user")
+    op = payload.get("operation")
+    if op not in READ_OPS:
+        raise ValueError(f"operation must be one of {sorted(READ_OPS)}")
+    if op == "projects_search":
+        return {"projects": tools.projects_search(viewer, str(payload.get("text") or "")[:100])}
+    project = str(payload.get("project") or "")
+    if not project:
+        raise ValueError("project is required")
+    if op == "evidence_open":
+        return tools.evidence_open(viewer, project, str(payload.get("event") or ""))
+    kw = {k: payload[k] for k in ("source", "category", "as_of") if isinstance(payload.get(k), str) and payload[k]}
+    return tools.timeline_query(viewer, project, **kw)
