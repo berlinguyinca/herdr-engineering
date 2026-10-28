@@ -119,8 +119,13 @@ class NamedFront:
     """One listener that routes by requested host name to the lease that owns it."""
 
     def __init__(self, router, leases: Callable[[], list[dict[str, Any]]], domain: str, port: int = 443,
-                 bind_hosts: list[str] | None = None) -> None:
+                 bind_hosts: list[str] | None = None, apex_hosts: Iterable[str] = (),
+                 apex_target: tuple[str, int] | None = None) -> None:
         self.router, self.leases_fn = router, leases
+        # The bare fleet names (https://dev.lan, https://local.metabolomics.us) are the dashboard, not a lease:
+        # they go to one configured upstream. Without an upstream the bare names are dropped like any unknown name.
+        self.apex_hosts = frozenset(h.lower().strip(".") for h in apex_hosts if h)
+        self.apex_target = apex_target
         self.domain = domain.lower().strip(".")
         self.port = port
         self.bind_hosts = [h for h in (bind_hosts or router._bind_hosts) if h]
@@ -193,7 +198,14 @@ class NamedFront:
             host, tls = peek_name(client)
             lease = self.lookup(host)
         except OSError:
-            lease, tls = None, False
+            host, lease, tls = None, None, False
+        if lease is None and host in self.apex_hosts and self.apex_target:
+            try:
+                client.settimeout(None)
+            except OSError:
+                return
+            self.router._proxy_one(client, self.apex_target[0], self.apex_target[1], None, None, self.port, external=host)
+            return
         if lease is None:
             # unknown name: say nothing about what exists
             try:

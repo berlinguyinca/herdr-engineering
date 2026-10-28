@@ -427,6 +427,9 @@ def _build_parser() -> argparse.ArgumentParser:
     p2.add_argument("--named-port", type=int, default=None,
                     help="port for stable https://<service>.<acme-domain> URLs (default 443; if it cannot be bound "
                          "the gateway keeps using per-port URLs)")
+    p2.add_argument("--apex-upstream", default=None, metavar="HOST:PORT",
+                    help="where the bare fleet names (https://dev.lan, https://<acme-domain>) go: the dashboard, e.g. "
+                         "100.104.39.6:80. Needs the named listener (--acme-domain) and a certificate for the name")
     p2.add_argument("--no-named-urls", action="store_true", help="do not serve stable service-name URLs")
     p2.add_argument("--acme-dir", default=None, help="certbot state directory (default: ~/.config/herdr-engineering/acme)")
     p2.add_argument("--acme-staging", action="store_true", help="use the Let's Encrypt staging CA (untrusted; for trials)")
@@ -2156,6 +2159,15 @@ def _acme_for(args, cfg: dict):
                        email=getattr(args, "email", None) or cfg.get("acme_email") or None)
 
 
+def _host_port(value) -> tuple[str, int] | None:
+    if not value:
+        return None
+    host, _, port = str(value).rpartition(":")
+    if not host or not port.isdigit() or not 0 < int(port) < 65536:
+        raise SystemExit(f"--apex-upstream must be HOST:PORT, got {value!r}")
+    return host, int(port)
+
+
 def _private_ca_domains(cfg: dict) -> list[str]:
     from pathlib import Path
 
@@ -2245,6 +2257,7 @@ def _cmd_dev_gateway(args) -> int:
         promote_after=int(getattr(args, "promote_after", 3)),
         named_domain=None if getattr(args, "no_named_urls", False) else acme_domain,
         named_port=int(getattr(args, "named_port", None) or cfg.get("named_port") or 443),
+        apex_upstream=_host_port(getattr(args, "apex_upstream", None) or cfg.get("apex_upstream")),
         url_aliases=tuple(dict.fromkeys([*getattr(args, "url_alias", []), *(cfg.get("url_aliases") or []),
                                          *_private_ca_domains(cfg)])))
     tls_cert = getattr(args, "tls_cert", None) or cfg.get("tls_cert")

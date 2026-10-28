@@ -170,3 +170,35 @@ def test_access_policy_still_applies_on_the_named_front(stack):
     gw.router.access = Deny()
     assert _get(port, "docs.local.example.test") == b""
     assert _get(port, "docs.local.example.test", tls=False) == b""
+
+
+def test_bare_fleet_names_reach_the_apex_upstream_only(tmp_path):
+    dash, dport = _http_target(tmp_path)
+    cert, key = _self_signed(tmp_path / "pub", "local.example.test", 30)
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(str(cert), str(key))
+    registry = DevServiceRegistry(store_path=tmp_path / "l.json", port_range=(42500, 42600))
+    named = _free_port()
+    gw = FabricGateway(registry, GatewayRouter(["127.0.0.1"]), control_host="127.0.0.1", control_port=0,
+                       url_base="local.example.test", probe_interval=30, token="", named_domain="local.example.test",
+                       named_port=named, url_aliases=("dev.lan",), apex_upstream=("127.0.0.1", dport))
+    gw.start()
+    gw.enable_tls(ctx)
+    try:
+        for host in ("dev.lan", "local.example.test"):
+            assert _get(named, host).startswith(b"HTTP/1."), host
+            assert _get(named, host, tls=False).startswith(b"HTTP/1."), host
+        assert _get(named, "evil.example") == b""
+        assert _get(named, "unknown.local.example.test") == b""          # a subdomain is a lease name, not the apex
+    finally:
+        gw.stop()
+        dash.shutdown()
+    # no upstream configured: bare names are dropped like any other unknown name
+    gw2 = FabricGateway(DevServiceRegistry(store_path=tmp_path / "m.json", port_range=(42700, 42800)), GatewayRouter(["127.0.0.1"]),
+                        control_host="127.0.0.1", control_port=0, url_base="local.example.test", probe_interval=30, token="",
+                        named_domain="local.example.test", named_port=_free_port())
+    gw2.start()
+    try:
+        assert _get(gw2.named_front.port, "local.example.test", tls=False) == b""
+    finally:
+        gw2.stop()

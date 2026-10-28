@@ -57,6 +57,16 @@ logs a warning and keeps using per-port URLs; it never advertises a name nothing
 > and the tailnet address's 443 must be free. If `tailscale serve` already owns it, either move that service behind the
 > gateway as a named route, or run the named front on another port with `--named-port`.
 
+## The bare names: `https://dev.lan` and `https://local.metabolomics.us`
+
+`--apex-upstream HOST:PORT` (config `fabric.apex_upstream`) sends the bare fleet names on the named port to the
+dashboard, e.g. `--apex-upstream 100.104.39.6:80` for the `herdr-cp-web` container. `https://local.metabolomics.us`
+then works on any tailnet device with no enrollment. `https://dev.lan` needs a certificate for `.lan`, which no public CA
+issues, so it uses the private CA: run `devfabric ca init && devfabric ca issue`, start the gateway with the CA present, and
+install the root once per device (`devfabric ca export`, an iOS/macOS `.mobileconfig`). Until a device trusts it, its browser
+warns on `https://dev.lan`; `http://dev.lan` keeps working. The 443 listener must be free first: on bender
+`tailscale serve` holds it (see below).
+
 ## Origin port and network namespaces
 
 A lease records `origin_port` (where the app listens) when the agent's forwarder had to bind a different port, and
