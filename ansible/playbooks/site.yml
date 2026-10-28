@@ -161,6 +161,9 @@
     - name: "Deploy pi build-gate extension (all fleet hosts)"
       ansible.builtin.include_tasks: ../tasks/pi-build-gate.yml
 
+    - name: "Converge summary skill (all fleet hosts)"
+      ansible.builtin.include_tasks: ../tasks/summary-skill.yml
+
     # ----------------------------------------------------------------------
     # Fleet update timer (spec section 4, last in playbook order): the main host (= gateway host) runs
     # playbooks/fleet-update.yml daily from cron against the fleet. Hosts hold

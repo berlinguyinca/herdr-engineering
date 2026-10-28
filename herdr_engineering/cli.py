@@ -304,6 +304,29 @@ def _build_parser() -> argparse.ArgumentParser:
     p2.add_argument("--out", default=None, help="output .html path (default: <graph_json>.html)")
     p2.set_defaults(func=_cmd_graph_artifact_render)
 
+    # summary --------------------------------------------------------------
+    p = sub.add_parser("summary", help="/summary skill: install, verify, remove, read session history")
+    smsub = p.add_subparsers(dest="summary_command", required=True)
+    for name, helptext in (("install", "install or upgrade the summary skill and /summary commands"),
+                           ("uninstall", "remove only what this installer wrote"),
+                           ("verify", "read-only installation check (exit 1 if missing or invalid)")):
+        p2 = smsub.add_parser(name, help=helptext)
+        p2.add_argument("--scope", choices=("global", "project"), default="global")
+        p2.add_argument("--home", default=None, help="override $HOME (tests)")
+        p2.add_argument("--project-dir", default=None, help="project root for --scope project (default: cwd)")
+        if name != "verify":
+            p2.add_argument("--dry-run", action="store_true")
+        p2.add_argument("--json", action="store_true")
+        p2.set_defaults(func=_cmd_summary_manage)
+    p2 = smsub.add_parser("history", help="read-only normalized history of the current agent session")
+    p2.add_argument("--agent", choices=("claude", "pi", "codex", "opencode"), default=None)
+    p2.add_argument("--session", default=None, help="session id or transcript path")
+    p2.add_argument("--cwd", default=None)
+    p2.add_argument("--home", default=None)
+    p2.add_argument("--max-events", type=int, default=400)
+    p2.add_argument("--json", action="store_true", help="accepted for symmetry; output is always JSON")
+    p2.set_defaults(func=_cmd_summary_history)
+
     # journal --------------------------------------------------------------
     p = sub.add_parser("journal", help="session journal & timeline (spec 0090)")
     jsub = p.add_subparsers(dest="journal_command", required=True)
@@ -852,6 +875,36 @@ def _cmd_session_run(args) -> int:
 def _cmd_doctor(args) -> int:
     from .doctor import doctor_main
     return doctor_main(args)
+
+
+def _cmd_summary_manage(args) -> int:
+    from . import session_summary as ss
+    kw = dict(scope=args.scope, home=Path(args.home) if args.home else None,
+              project=Path(args.project_dir) if args.project_dir else None)
+    ok = True
+    if args.summary_command == "verify":
+        ok, results = ss.verify(**kw)
+    else:
+        fn = ss.install if args.summary_command == "install" else ss.uninstall
+        results = fn(dry_run=args.dry_run, **kw)
+    if args.json:
+        _print_json({"ok": ok, "results": [r.to_dict() for r in results]})
+    else:
+        for r in results:
+            print(f"{r.action:10} {r.target}" + (f"  ({r.detail})" if r.detail else ""))
+            if r.action == "preserved":
+                print(f"warning: kept existing {r.target}", file=sys.stderr)
+    return 0 if ok else 1
+
+
+def _cmd_summary_history(args) -> int:
+    from . import session_history as sh
+    home = Path(args.home) if args.home else None
+    res = sh.resolve(agent=args.agent, session=args.session, cwd=args.cwd, home=home)
+    out = sh.read_history(res, home=home, max_events=args.max_events)
+    out["journal"] = sh.journal_projection(res.session_id)
+    _print_json(out)
+    return 0
 
 
 def _cmd_agent_mine(args) -> int:

@@ -49,6 +49,9 @@
     - name: "Converge pi build-gate extension"
       ansible.builtin.include_tasks: ../tasks/pi-build-gate.yml
 
+    - name: "Converge summary skill"
+      ansible.builtin.include_tasks: ../tasks/summary-skill.yml
+
     - name: "Converge AutoSpec runtime and refresh timer"
       ansible.builtin.include_tasks: ../tasks/autospec-fleet.yml
 
