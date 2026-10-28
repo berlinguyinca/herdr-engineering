@@ -20,7 +20,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 VERSION = 1
-SOURCE = Path(__file__).resolve().parents[1] / "skills" / "summary"
+# The canonical copy lives inside the package so a pip-installed (non-editable) herdr-eng carries it;
+# skills/summary in the repo root is a symlink to it for discoverability next to the other skills.
+SOURCE = Path(__file__).resolve().parent / "skill_data" / "summary"
 MANIFEST_NAME = ".summary-manifest.json"
 
 
