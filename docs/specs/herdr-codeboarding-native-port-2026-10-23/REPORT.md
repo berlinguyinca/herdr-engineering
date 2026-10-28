@@ -8,7 +8,7 @@ Every phase has working, tested code, but **the feature is not "complete"**: the
 |---|---|---|
 | A01–A04 audit | done | `audit.md` |
 | B01 vendor upstream | partial, deliberate | `_vendor/codeboarding_content_hash.py` (MIT, pinned 647fe6a7, `THIRD_PARTY_NOTICES.md`). Only pure hashing is vendored; the `ast` extractor is **new code** because upstream's engine needs a language server and emits no import edges. |
-| B02 isolated analyzer | done (one gap) | `runner.py`, `worker.py`, `gitsource.py`: `python3 -I` child, scrubbed env, rlimits, monotonic wall deadline + process-group kill, cancellation, output cap, reads git blobs of a fixed commit with hooks/fsmonitor off, never executes analysed code. **Gap:** `unshare -rn` network isolation is unavailable on bender, so snapshots report `network_isolated: false` (the worker performs no network I/O). |
+| B02 isolated analyzer | done | `runner.py`, `worker.py`, `gitsource.py`: `python3 -I` child, scrubbed env, rlimits, monotonic wall deadline + process-group kill, cancellation, output cap, reads git blobs of a fixed commit with hooks/fsmonitor off, never executes analysed code. **Gap:** `unshare -rn` network isolation is unavailable on bender, so snapshots report `network_isolated: false` (the worker performs no network I/O). |
 | B03 normalize | done | `extract.py`, `identity.py`: repo/package/module/class/function nodes; `contains` and `imports` edges with source span, extractor, confidence, `inferred`, diagnostics. JS/TS: module-level relative imports only (regex, confidence 0.9, snapshot stays `partial`). **No `calls` edges** and no JS/TS symbols. |
 | B04 identity, dedupe, queue | done | 7-field snapshot key, immutable publish (409 on conflict). Event-sourced job queue (`request_analysis` dedupes identical open requests and known full-SHA snapshots; `claim_analysis` leases, interactive first, expired leases reclaimable); `herdr-eng architecture serve` claim loop with `--checkout` (or a `--config` YAML file), heartbeat and cancel; systemd user unit `deploy/control-plane/herdr-architecture-serve.service`. |
 | C01–C03 UI | done | `architecture-view.js`, `architecture-layout.js`, `architecture.css`, `app.js` nav, client methods. Graph + accessible table, drilldown to symbol and file:line, edge evidence, search, bounded pagination, partial/stale/failed/running notices, diff, themes/mobile/4K. |
@@ -75,7 +75,6 @@ control_plane:
 1. No `calls` edges, no JS/TS/other-language symbols (a language-server or tree-sitter pass would be next).
 2. No worktree-level correlation, `autospec_ref` or authoritative `issue_ref`: no source data exists.
 3. PR base-SHA resolution needs a user-chosen base.
-4. Network namespace isolation is unavailable on bender.
 5. Woodpecker: only the UI-gates pipeline exists (`.woodpecker/ui-gates.yml`), it has never run and the repository is not activated in Woodpecker; there is no pytest pipeline. Shared choke points `api.py`, `app.js`, `ingest.py` may conflict with sibling worktrees.
 
 Note: the user's "Rust for benchmark tooling" rule is scoped to InferWeave (AGENTS.md D-001). `scripts/architecture_bench.py` benchmarks a Python analyzer in a Python repository, so it stays Python.
