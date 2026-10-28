@@ -19,4 +19,5 @@ export PATH="$venv/bin:$PATH"
 echo "== pytest =="
 python -m pytest -q
 echo "== client tests =="
+npm ci --no-audit --no-fund       # the component tests import playwright
 node --test packages/herdr-web-client/*.test.js packages/herdr-web-components/*.test.js
