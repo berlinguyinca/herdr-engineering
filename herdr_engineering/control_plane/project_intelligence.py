@@ -370,6 +370,10 @@ class IntelligenceStore:
                 if rel.org_id == org_id and rel.review_state == "confirmed" and rel.derivation != "system_verified" \
                         and any(e.source_ref == source_ref for e in rel.evidence):
                     self._rels[rid] = replace(rel, review_state="provisional", version=rel.version + 1)
+            # A finding stops citing a removed source; one left with no evidence is shown as unverified again.
+            for fid, f in list(self._findings.items()):
+                if f.org_id == org_id and any(e.source_ref == source_ref for e in f.evidence):
+                    self._findings[fid] = replace(f, evidence=tuple(e for e in f.evidence if e.source_ref != source_ref))
         return n
 
     def outbox_pending(self, consumer: str) -> list[str]:

@@ -120,7 +120,7 @@ class PgPersistence:
         async def go(c):
             await c.execute(
                 "insert into pi_finding(id,org_id,project_ids,statement,evidence_refs,security_label,extractor_version,model_identifier) "
-                "values($1,$2,$3,$4,$5::jsonb,$6,$7,$8) on conflict (id) do nothing",
+                "values($1,$2,$3,$4,$5::jsonb,$6,$7,$8) on conflict (id) do update set evidence_refs = excluded.evidence_refs",
                 f.id, f.org_id, list(f.project_ids), f.statement, json.dumps([e.as_dict() for e in f.evidence]),
                 f.security_label, f.extractor_version, f.model_identifier)
         self._do(go)
@@ -225,6 +225,9 @@ class DurableIntelligenceStore(pi.IntelligenceStore):
             for rel in self._rels.values():
                 if rel.org_id == org_id:
                     self._pg.save_relationship(rel)
+            for f in self._findings.values():
+                if f.org_id == org_id:
+                    self._pg.save_finding(f)
         return self._durable(lambda: super(DurableIntelligenceStore, self).tombstone_source(org_id, source_ref), persist)
 
     def outbox_ack(self, event_id, consumer):

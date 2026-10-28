@@ -222,3 +222,17 @@ def test_get_event_by_id_is_scoped_and_not_window_limited():
     assert s.get_event(guest, first.event_id)["event_id"] == first.event_id        # older than the newest 500
     with pytest.raises(pi.NotFound):
         s.get_event(pi.Viewer("org1", frozenset({"p-other"})), first.event_id)
+
+
+def test_removing_a_source_unverifies_findings_that_only_cited_it():
+    from herdr_engineering.control_plane import project_intelligence as pi
+    s = pi.IntelligenceStore()
+    ev = lambda ref: {"source_ref": ref, "anchor_type": "email_part", "anchor_value": "1"}  # noqa: E731
+    base = {"org_id": "o", "project_ids": ["p"], "extractor_version": "v1", "model_identifier": "m"}
+    s.add_finding(dict(base, statement="only mail", evidence_refs=[ev("gmail:a:1")]))
+    s.add_finding(dict(base, statement="mail and ci", evidence_refs=[ev("gmail:a:1"), ev("ci:9")]))
+    viewer = pi.Viewer("o", None, "restricted")
+    s.tombstone_source("o", "gmail:a:1")
+    by = {f["statement"].removeprefix("[unverified] "): f for f in s.findings(viewer)}
+    assert by["only mail"]["verified"] is False and by["only mail"]["evidence_refs"] == []
+    assert by["mail and ci"]["verified"] is True and len(by["mail and ci"]["evidence_refs"]) == 1
