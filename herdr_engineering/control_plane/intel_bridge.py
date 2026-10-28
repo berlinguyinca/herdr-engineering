@@ -362,6 +362,23 @@ class EventBridge:
             log.warning("intelligence bridge failed to process an event", exc_info=False)
             return "error"
 
+    def rebuild_board(self, repo) -> dict:
+        """Re-fold the durable ci_fix and review-gate event streams into the incident board (the board is derived
+        state, so a restart rebuilds it instead of keeping a second copy). Writes nothing to the intelligence store."""
+        seen = 0
+        for entity in ("ci_fix", "pr_gate", "pr_gate_main"):      # repair runs first: they bind the PRs the others move
+            for entity_id in repo.entity_ids(entity):
+                for ev in repo.stream(entity, entity_id):
+                    ev = dict(ev, entity_type=entity, entity_id=entity_id)
+                    seen += 1
+                    if entity == "ci_fix":
+                        projects = self._resolve(ev)
+                        if projects:
+                            self._fold_incident(ev, projects)
+                    else:
+                        self._fold_gate(ev)
+        return {"events": seen, "incidents": len(self.board.incidents)}
+
     def _fold_gate(self, ev: dict) -> str:
         """Review-gate events move an incident only when a repair run recorded this PR's URL (never by guesswork)."""
         at, eid = str(_when(ev.get("source_timestamp"))), str(ev.get("event_id"))
@@ -492,6 +509,10 @@ def install(repo, section_fn: Callable[[], dict], dsn: str | None = None):
             if self._thread is None:
                 with lock:
                     if self._thread is None:
+                        try:
+                            self.rebuild_board(repo)
+                        except Exception:  # noqa: BLE001 - a rebuild problem must not stop live ingest
+                            log.warning("incident board rebuild failed", exc_info=False)
                         self.start()
             super().on_event(ev)
 

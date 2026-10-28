@@ -268,3 +268,19 @@ def test_main_ci_result_for_the_merge_commit_completes_or_rolls_back_the_inciden
     assert run("red") == ("folded", "ROLLBACK_REQUESTED")
     assert run("green", main_sha="e" * 40) == ("ignored", "VERIFYING")      # a later commit proves nothing about this change
     assert run("green", merge_sha="") == ("ignored", "VERIFYING")           # merge commit unknown: stays unverified
+
+
+def test_a_restart_rebuilds_the_incident_board_from_durable_streams():
+    from herdr_engineering.control_plane import project_intelligence as pi
+    from herdr_engineering.control_plane.intel_bridge import EventBridge
+    from herdr_engineering.control_plane.repo import ControlPlaneRepo
+    repo = ControlPlaneRepo()
+    repo.record_event("ci_fix", "f1", "CIFixStateChanged", {"repository": "o/r", "run": 7, "state": "succeeded",
+                                                          "pr_url": "https://github.com/o/r/pull/12"})
+    repo.record_event("pr_gate", "o/r#12", "merged", {"sha": "a" * 40, "merge_sha": "d" * 40})
+    repo.record_event("pr_gate_main", "o/r", "green", {"sha": "d" * 40})
+    fresh = EventBridge(pi.IntelligenceStore(), lambda: {"enabled": True, "ingest": True}, lambda ev: ("p1",), org_id="o")
+    out = fresh.rebuild_board(repo)
+    assert out == {"events": 3, "incidents": 1}
+    assert fresh.board.summary()[0]["state"] == "COMPLETED"
+    assert fresh.rebuild_board(repo)["incidents"] == 1          # repeatable: duplicates attach, nothing doubles
