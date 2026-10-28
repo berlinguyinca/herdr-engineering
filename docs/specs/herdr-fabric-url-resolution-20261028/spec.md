@@ -72,3 +72,7 @@ reason; searchable `#/fabric-services` page. Wired into the session workspace (s
 Not yet wired: collab chat, notifications, artifacts, terminal OSC 8 (PR 5 covers terminal/streaming;
 remaining renderers call the same `urls` option).
 Deferred from the PR 1 note: `origin_port` on leases is still open.
+
+## PR 3 / PR 4 status
+PR 3 merged: same-port HTTPS + name-constrained private CA. PR 4: `fabric_access.AccessPolicy` (tailscaled
+LocalAPI whois, user/tag allow-list, fail closed, loopback trusted) enforced in the router before TLS/HTTP.
