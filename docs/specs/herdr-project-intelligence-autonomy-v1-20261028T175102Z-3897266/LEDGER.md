@@ -86,12 +86,25 @@ Routes: `GET /api/v1/intelligence/{status,projects,investigations,relationships?
 - UI: related links (inferred shown as provisional with confidence) and findings (unverified labelled) in `/intelligence`.
 - Operator metrics on `GET /api/v1/intelligence/status` (counters only). `RUNBOOK.md` with the config reference, enabling order, rollback and drills.
 
+## Completed in the third pass (2026-10-28)
+- Repair gate facts are real now (`repair_gate.make_facts_fn`): human approvals and changes-requested on the exact head (people who are
+  owner/member/collaborator only), commit-signature verification for every PR commit, author session and reviewer verdict model from the
+  gate's own records, model families from operator YAML `repair.model_families`. An unlisted model has no family, so independence cannot be shown and the policy waits.
+- New GitHub reads in the review-gate client: `pr_review_summary`, `pr_commits_verified`.
+- Incident board: a `ci_fix` run that records a `pr_url` binds that PR; review-gate `merged` then moves the incident to VERIFYING. Unbound PRs are ignored (never guessed).
+- Webhook reconciliation: `reconcile_open_prs` plus operator `POST /api/v1/intelligence/webhooks/reconcile` (org-wide viewers; needs the review-gate client, `webhook_projects`, `default_org_id`).
+- Findings stop citing a removed source and are persisted; a finding left with no evidence reads as unverified again.
+- Zip triage inflates each entry (capped) and rejects headers that understate the real size.
+- UI: investigation picker, artifact links with content hashes, and the in-house accessibility audit (contrast, names, focus indicators, overflow)
+  for desktop light, desktop dark and phone dark. It found real defects in the first version (chip contrast, focus outline, placeholder, link colour, and
+  a CSS `order:-1` that put the detail pane before the list visually but after it in Tab order). All fixed; on a phone the pane now scrolls into view in reading order.
+
 ## Remaining work
-1. Facts for the repair gate: a real `facts_fn` (reviewer execution context and model family from the review queue, human approvals from GitHub reviews, signed provenance), plus attempt and open-repair-PR counters. Until then repair PRs always wait for a human.
-2. Webhook reconciliation (poll `open_prs` for missed deliveries); incident board persistence (it is rebuilt by backfill); `ci_fix` -> review-gate (`merged`, `post_merge_verified`) events are not emitted by any existing service yet.
-3. Live Gmail client (B1); email sender and notification channel (B3); iPhone auth (B4).
-4. UI: investigation picker, artifact provenance, graph and approval cards, an axe accessibility run.
-5. Not fixed from review: findings citing a removed source are not re-evaluated; tombstones keep evidence metadata; ReplayGuard is in memory (a restart forgets deliveries; the store still dedupes); zip triage trusts header sizes; paging for hydration; `Idempotency-Key` header.
+1. COMPLETED needs a post-merge verification event tied to the merge commit; `merge_pr` does not return the merge SHA and no service emits that event yet.
+2. Incident board and the webhook `ReplayGuard` are in memory (backfill rebuilds the board; the store still dedupes replays).
+3. Approval cards: `ActionBoard` proposals exist in code but have no persisted store or HTTP surface, so there is nothing for a card to show yet.
+4. Live Gmail client (B1), email sender and notification channel (B3), iPhone auth (B4).
+5. Still open from the review: tombstones keep evidence/actor/object_ref metadata; paging for hydration; `Idempotency-Key` header (review and pause are already safe to repeat: versioned or idempotent).
 6. Manual audit and a staged rollout before any auto-merge enablement (B6).
 
 ## Blockers needing a user action

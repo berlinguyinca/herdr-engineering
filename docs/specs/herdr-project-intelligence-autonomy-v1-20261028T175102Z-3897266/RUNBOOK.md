@@ -35,6 +35,7 @@ control_plane:
       auto_merge_risks: [low]
       max_patch_lines: 200
       require_human_approval: true
+      model_families: {claude: anthropic, gpt: openai}   # model-name prefix -> family; unlisted = unknown = policy waits
 ```
 
 ## Safe enabling order
@@ -43,8 +44,9 @@ control_plane:
 3. `ingest: true`. Run `EventBridge.backfill(repo)` in dry-run first; `unmapped` is what no project could be resolved for.
 4. `derive: true`, then `suggest: true` once a person is ready to review inferred links.
 5. `repair.enabled: true` with `auto_merge_enabled: false` (observe `repair policy:` statuses on herdr-ci-fix PRs).
-   A bare deployment cannot auto-merge: reviewer independence, signed provenance and human approval are supplied by
-   `repair_gate.make_repair_gate(facts_fn=...)`, and the default supplies none.
+   Auto-merge also needs, per PR: a person's approval of the current head, every commit signature verified by GitHub, an author session known to the
+   gate, and reviewer and author models from different listed families. Anything missing makes the gate wait for a human.
+6. Missed webhook deliveries: `POST /api/v1/intelligence/webhooks/reconcile` (operator, org-wide) records open PR heads no webhook saw.
 
 ## Stop / rollback
 - Fastest: `kill_switch: true` (config is re-read within seconds). `repair.kill_switch: true` rejects repair merges.
