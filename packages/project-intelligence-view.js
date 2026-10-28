@@ -85,7 +85,7 @@ export function renderProposals(items) {
   const list = arr(items);
   if (!list.length) return '<p class="pi-note">Nothing is waiting for approval.</p>';
   return `<ul class="pi-cards">${list.map((p) => `<li class="pi-card"><strong>${esc(ACTION[p.action] || p.action)}</strong>
-<dl>${Object.entries(p.payload || {}).slice(0, 8).map(([k, v]) => `<dt>${esc(k)}</dt><dd>${esc(typeof v === 'string' ? v : JSON.stringify(v))}</dd>`).join('')}
+<dl>${Object.entries(p.payload || {}).map(([k, v]) => `<dt>${esc(k)}</dt><dd>${esc(typeof v === 'string' ? v : JSON.stringify(v))}</dd>`).join('')}
 <dt>Requested by</dt><dd>${esc(p.requester)}</dd><dt>Expires</dt><dd><time datetime="${esc(p.expires_at)}">${esc(when(p.expires_at))}</time></dd></dl>
 <div class="pi-actions"><button type="button" data-act="approve" data-id="${esc(p.id)}" data-sha="${esc(p.payload_sha256)}" data-ver="${esc(p.resource_version)}">Approve</button>
 <button type="button" data-act="reject" data-id="${esc(p.id)}">Reject</button></div></li>`).join('')}</ul>

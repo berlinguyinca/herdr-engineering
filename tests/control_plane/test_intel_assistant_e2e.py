@@ -62,7 +62,7 @@ def test_approval_binds_payload_version_expiry_and_a_different_principal():
     p = mk()
     with pytest.raises(pi.Conflict):   # forged: different payload
         board.approve(p.id, approver="alice", org_id="o", payload_sha256=ia.payload_hash({"run": "r9", "repo": "evil/x"}), resource_version=3)
-    assert p.state == "refused"
+    assert p.state == "awaiting_approval" and "exact payload" in p.history[-1]    # refused, but one wrong attempt cannot kill it
     p = mk()
     with pytest.raises(pi.Conflict):   # stale resource version
         board.approve(p.id, approver="alice", org_id="o", payload_sha256=p.payload_sha256, resource_version=2)

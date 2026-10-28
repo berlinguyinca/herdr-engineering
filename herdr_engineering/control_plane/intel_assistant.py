@@ -124,15 +124,23 @@ class ActionBoard:
         if self._clock() > p.expires_at:
             p.state = "expired"
             raise pi.Conflict("approval window expired")
+        # A bad attempt is recorded but never changes the state: otherwise any operator could kill a pending proposal
+        # with one wrong hash. Only a matching approval by someone else, a rejection, or expiry ends it.
         if approver == p.requester:
-            p.state = "refused"; p.history.append("self-approval refused")
+            p.history.append("self-approval refused")
             raise pi.Conflict("requester cannot approve their own proposal")
         if payload_sha256 != p.payload_sha256 or resource_version != p.resource_version:
-            p.state = "refused"; p.history.append("approval did not match the exact payload/version")
+            p.history.append("approval did not match the exact payload/version")
             raise pi.Conflict("approval does not match the proposed payload or resource version")
         p.state, p.approver = "approved", approver
         return p
 
+
+    def get(self, proposal_id: str, org_id: str) -> Proposal:
+        p = self._p.get(proposal_id)
+        if p is None or p.org_id != org_id:
+            raise pi.NotFound("proposal")
+        return p
 
     def reject(self, proposal_id: str, *, approver: str, org_id: str) -> Proposal:
         p = self._p.get(proposal_id)

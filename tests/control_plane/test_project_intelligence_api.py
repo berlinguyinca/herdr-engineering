@@ -163,3 +163,27 @@ def test_proposal_idempotency_key_returns_the_same_proposal_and_refuses_reuse_wi
     changed = dict(body, payload={"project": "p2"})
     assert r.post(["proposals"], changed, KEY, "operator")[0] == 409
     assert r.post(["proposals"], dict(body, idempotency_key=""), KEY, "operator")[0] == 400
+
+
+def test_a_bad_approval_never_kills_the_proposal_and_scope_limits_who_can_act():
+    sec = dict(FULL, default_org_id="org1", viewers={"key:abc": {"org_id": "org1", "projects": "*"},
+                                                      "key:def": {"org_id": "org1", "projects": "*"},
+                                                      "key:ghi": {"org_id": "org1", "projects": ["p2"]}})
+    r = routes(sec)
+    other = {"kind": "operator", "id": "key:def", "authenticated_by": "api_key"}
+    scoped = {"kind": "operator", "id": "key:ghi", "authenticated_by": "api_key"}
+    st, p = r.post(["proposals"], {"action": "pause_ingestion", "payload": {"project": "p1"}, "resource_version": 1}, KEY, "operator")
+    good = {"payload_sha256": p["payload_sha256"], "resource_version": 1}
+    assert r.post(["proposals", p["id"], "approve"], dict(good, payload_sha256="0" * 64), other, "operator")[0] == 409
+    assert r.post(["proposals", p["id"], "approve"], good, KEY, "operator")[0] == 409                  # self-approval, still alive
+    assert r.post(["proposals", p["id"], "approve"], good, scoped, "operator")[0] == 404               # p2-scoped operator cannot act on p1
+    assert r.post(["proposals", p["id"], "reject"], {}, scoped, "operator")[0] == 404
+    assert r.post(["proposals", p["id"], "approve"], good, other, "operator")[1]["state"] == "approved"   # after all that
+
+
+def test_proposal_payload_must_name_a_string_project_and_stay_reviewable_in_full():
+    r = routes(dict(FULL, default_org_id="org1", viewers={"key:abc": {"org_id": "org1", "projects": ["p1"]}}))
+    mk = lambda payload: r.post(["proposals"], {"action": "pause_ingestion", "payload": payload, "resource_version": 1}, KEY, "operator")  # noqa: E731
+    assert mk({"project": ["p1"]})[0] == 400            # was an unhashable-type 500
+    assert mk({"project": "p1", "note": "x" * 5000})[0] == 400
+    assert mk({"project": "p1"})[0] == 201

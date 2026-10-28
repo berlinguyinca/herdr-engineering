@@ -12,6 +12,8 @@ Fail-closed rules (DECISIONS D3/D9):
 """
 from __future__ import annotations
 
+import json
+
 from . import project_intelligence as pi
 
 READ_ROLES = frozenset({"viewer", "operator"})
@@ -71,7 +73,8 @@ class IntelligenceRoutes:
             return (413 if exc.reason == "body too large" else 401), {"error": exc.reason}
         except ValueError:
             return 400, {"error": "invalid json"}
-        repo = ((payload.get("repository") or {}).get("full_name") if isinstance(payload, dict) else None)
+        repo = ((payload.get("repository") or {}).get("full_name") if isinstance(payload, dict) and isinstance(payload.get("repository"), dict) else None)
+        repo = repo if isinstance(repo, str) else None
         projects = (raw.get("webhook_projects") or {}).get(repo)
         org = raw.get("default_org_id")
         if not (isinstance(projects, list) and projects and all(isinstance(x, str) for x in projects) and isinstance(org, str)):
@@ -207,6 +210,10 @@ class IntelligenceRoutes:
                 if not isinstance(payload, dict) or not isinstance(version, int) or isinstance(version, bool):
                     return 400, {"error": "payload (object) and resource_version (int) are required"}
                 project = payload.get("project")
+                if not isinstance(project, str) or not project:
+                    return 400, {"error": "payload.project (string) is required"}
+                if len(json.dumps(payload, sort_keys=True)) > 4096:
+                    return 400, {"error": "payload is too large to review in full (max 4096 characters)"}
                 if viewer.project_ids is not None and project not in viewer.project_ids:
                     return 404, {"error": "not found"}
                 p = self.board.request(org_id=viewer.org_id, requester=actor, action=str(body.get("action") or ""),
@@ -216,6 +223,9 @@ class IntelligenceRoutes:
             if len(parts) == 3 and parts[0] == "proposals" and parts[2] in ("approve", "reject"):
                 if not cfg["suggest"] or cfg["kill_switch"]:
                     return 409, {"error": "proposals require the suggest flag and no kill switch"}
+                known = self.board.get(parts[1], viewer.org_id)
+                if viewer.project_ids is not None and known.payload.get("project") not in viewer.project_ids:
+                    return 404, {"error": "not found"}       # a project-scoped operator cannot act on another project's proposal
                 if parts[2] == "reject":
                     p = self.board.reject(parts[1], approver=actor, org_id=viewer.org_id)
                 else:
