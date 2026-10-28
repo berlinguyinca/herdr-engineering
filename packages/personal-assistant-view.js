@@ -331,6 +331,8 @@ export function mountPersonalAssistant(container, client) {
       <div class="pa-row" style="margin-top:10px">
         <input style="flex:1" placeholder="Message…" data-msg>
         <button class="hd-btn" data-send>Send</button>
+        <button class="hd-btn hd-btn--ghost" data-voice title="Voice input">🎤</button>
+        <button class="hd-btn hd-btn--ghost" data-speak title="Speak reply">🔊</button>
         <button class="hd-btn hd-btn--ghost" data-newthread>New thread</button>
       </div>
       <div id="pa-runstatus" class="pa-muted" style="margin-top:6px"></div>
@@ -371,6 +373,26 @@ export function mountPersonalAssistant(container, client) {
         statusEl.textContent = `Run ${run.run_id} · ${run.state}`;
       } catch (error) { statusEl.textContent = 'Error: ' + error.message; }
     });
+    const voiceBtn = container.querySelector('[data-voice]');
+    const speakBtn = container.querySelector('[data-speak]');
+    const voiceMod = await import('./voice.js').catch(() => null);
+    if (voiceMod && voiceMod.createVoiceInput && voiceBtn) {
+      const v = voiceMod.createVoiceInput({
+        win: window,
+        onResult: (t) => { input.value = t; sendBtn.click(); },
+        onError: () => { statusEl.textContent = 'Voice input unavailable.'; },
+      });
+      voiceBtn.addEventListener('click', () => v.start());
+      if (!v.available) { voiceBtn.title = 'Speech recognition not available'; voiceBtn.disabled = true; }
+    } else if (voiceBtn) { voiceBtn.style.display = 'none'; }
+    if (voiceMod && voiceMod.speak && speakBtn) {
+      speakBtn.addEventListener('click', () => {
+        const last = messagesEl.querySelector('.pa-msg:last-of-type');
+        const text = last ? last.textContent.trim() : '';
+        const { spoken } = voiceMod.speak(text, { win: window });
+        statusEl.textContent = spoken ? 'Speaking reply…' : 'Voice output unavailable in this browser.';
+      });
+    } else if (speakBtn) { speakBtn.style.display = 'none'; }
     const newThreadBtn = container.querySelector('[data-newthread]');
     if (newThreadBtn) newThreadBtn.addEventListener('click', async () => {
       const created = await client.createThread(a.assistant_id, 'New conversation');

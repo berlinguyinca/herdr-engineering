@@ -30,12 +30,28 @@ Design contract (see ADR-0001, ADR-0002 in that directory):
 from __future__ import annotations
 
 import hashlib
+import re
 import secrets
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
+
+
+def redact_secrets(text: str | None) -> str | None:
+    """Scrub common secret patterns from a string (audit/log/event output).
+
+    Guarantees a hardening invariant: authorization headers, api keys, tokens,
+    passwords and secrets are never written to the audit log or event output.
+    """
+    if not text:
+        return text
+    pat = re.compile(
+        r"(?i)(authorization\s*:\s*bearer\s+|api[_-]?key[^\w]|token[^\w]|password[^\w]|secret[^\w])"
+        r"([A-Za-z0-9_\-.:/=]{4,})")
+    return pat.sub(lambda m: m.group(1) + "***REDACTED***", text)
+
 
 # ---------------------------------------------------------------------------
 # Feature flag
@@ -58,6 +74,7 @@ def assistant_config(cfg: dict[str, Any]) -> dict[str, Any]:
         "enabled": bool(section.get("enabled", False)),
         "approval_ttl_seconds": int(section.get("approval_ttl_seconds", 3600)),
         "grant_max_ttl_seconds": int(section.get("grant_max_ttl_seconds", 30 * 24 * 3600)),
+        "max_requests_per_minute": int(section.get("max_requests_per_minute", 120)),
         # Computer-tool sandbox policy. deny-by-default: shell/browser do nothing
         # unless the operator opts in AND the target host/command is allowlisted.
         "computer": {
@@ -544,7 +561,7 @@ class HttpConnectorAdapter(ConnectorAdapter):
             return {"ok": True, "status": resp.get("status", 200),
                     "body": (resp.get("body") or "")[:20000]}
         except Exception as exc:  # noqa: BLE001
-            return {"ok": False, "error": f"connector call failed: {exc}"}
+            return {"ok": False, "error": redact_secrets(f"connector call failed: {exc}")}
 
     @staticmethod
     def _allowed_origins(connector: Connector) -> list[str]:
@@ -581,6 +598,7 @@ class AssistantStore:
         self._routine_fired: set[str] = set()  # dedupe: routine_id|bucket_iso
         self.connectors: dict[str, Connector] = {}
         self.delegations: dict[str, DelegationRequest] = {}
+        self._rate: dict[str, list[int]] = {}  # key -> [minute_window, count]
         self.audit: list[dict[str, Any]] = []
         self._lock = threading.RLock()
 
@@ -594,9 +612,9 @@ class AssistantStore:
                 "tenant_id": tenant_id,
                 "user_id": user_id,
                 "actor": actor,
-                "action": action,
+                "action": redact_secrets(action),
                 "subject_id": subject_id,
-                "detail": detail,
+                "detail": redact_secrets(detail),
             })
 
     # -- assistants ----------------------------------------------------------
@@ -813,6 +831,11 @@ class AssistantStore:
 
 
 class AssistantError(Exception):
+    pass
+
+
+class RateLimited(AssistantError):
+    """Raised when a caller exceeds the assistant API rate limit."""
     pass
 
 
@@ -1291,6 +1314,18 @@ class AssistantService:
         self.store.get_assistant(assistant_id, tenant_id=tenant_id, user_id=user_id)
         if trigger_type not in ("interval", "daily"):
             raise AssistantError(f"unsupported trigger_type {trigger_type}")
+        if trigger_type == "interval":
+            every = str((trigger_spec or {}).get("every", "minutes"))
+            if every not in ("minutes", "hours", "days"):
+                raise AssistantError(f"unsupported interval unit {every}")
+            amount = int((trigger_spec or {}).get("amount", 1) or 1)
+            if not (1 <= amount <= 366 * 24):
+                raise AssistantError("interval amount out of range")
+        try:
+            from zoneinfo import ZoneInfo
+            ZoneInfo(timezone)
+        except Exception as exc:  # noqa: BLE001
+            raise AssistantError(f"invalid timezone {timezone!r}") from exc
         spec = trigger_spec or {}
         r = AssistantRoutine(
             routine_id=_new_id("rout"), assistant_id=assistant_id,
@@ -1404,9 +1439,14 @@ class AssistantService:
             raise AssistantError(f"unsupported connector kind {kind}")
         if not base_url:
             raise AssistantError("connector base_url is required")
+        if not base_url.startswith("https://"):
+            raise AssistantError("connector base_url must be https")
         allowed = (auth or {}).get("_allowed_origins")
         if not (isinstance(allowed, list) and allowed):
             raise AssistantError("connector requires an allowlisted origin (_allowed_origins)")
+        for origin in allowed:
+            if not isinstance(origin, str) or origin.lower().startswith("http://"):
+                raise AssistantError("connector allowlist origins must be https hostnames/origins")
         c = Connector(connector_id=_new_id("conn"), tenant_id=tenant_id,
                       user_id=user_id, name=name, kind=kind, base_url=base_url,
                       auth=dict(auth or {}))
@@ -1443,6 +1483,10 @@ class AssistantService:
         adapter = self._adapter_for(c.kind)
         result = adapter.request(c, method or "GET", path or "/", body or {},
                                  self._computer().get("max_timeout_seconds", 30))
+        # defense-in-depth: never surface a credential-bearing error regardless of
+        # the adapter implementation
+        if not result.get("ok") and result.get("error"):
+            result = {**result, "error": redact_secrets(result["error"])}
         self.store.audit_record(tenant_id=tenant_id, user_id=user_id, actor=actor or user_id,
                                 action="assistant.connector.requested", subject_id=connector_id,
                                 detail=("ok" if result.get("ok") else result.get("error", "denied")))
@@ -1583,6 +1627,24 @@ class AssistantService:
                               actor=actor or user_id)
             return {"ok": True, "delegation": d.as_dict()}
         raise AssistantError(f"tool {tool_id} has no executor")
+
+    # -- hardening: rate limiting ----------------------------------------------------
+    def check_rate_limit(self, *, key: str) -> None:
+        """Fixed-window per-key limiter (deny-by-default over the cap).
+
+        Returns nothing on allow; raises AssistantError(429) when the caller has
+        exceeded ``max_requests_per_minute`` in the current minute window.
+        """
+        cap = self.config.get("max_requests_per_minute", 120)
+        window = int(self.now().timestamp() // 60)
+        with self.store._lock:
+            hits = self.store._rate.get(key)
+            if hits is None or hits[0] != window:
+                hits = [window, 0]
+                self.store._rate[key] = hits
+            if hits[1] >= cap:
+                raise RateLimited("rate limit exceeded; slow down")
+            hits[1] += 1
 
     # -- diagnostics ---------------------------------------------------------------
     def diagnostics(self, *, tenant_id: str, user_id: str, assistant_id: str) -> dict[str, Any]:

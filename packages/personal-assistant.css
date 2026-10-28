@@ -33,3 +33,15 @@
 .pa-badge--granted { color: var(--status-ok); border-color: var(--status-ok); }
 .pa-badge--sensitive { color: var(--status-attention); border-color: var(--status-attention); }
 @media (max-width: 900px) { .pa-shell, .pa-main { grid-template-columns: 1fr; } }
+
+/* Mobile (375px) — stack the composer, keep touch targets comfortable, and
+   let tab labels wrap instead of overflowing. */
+@media (max-width: 480px) {
+  .pa-tab { padding: 8px 10px; font-size: 13px; }
+  .pa-row { flex-direction: column; align-items: stretch; }
+  .pa-row input, .pa-row textarea, .pa-row select, .pa-row button { width: 100%; }
+  .pa-row .hd-btn { min-height: 40px; }
+  .pa-shell__side { flex-direction: row; flex-wrap: wrap; }
+  .pa-item { flex: 1 1 40%; }
+  .pa-msg { font-size: 14px; }
+}

@@ -22,7 +22,9 @@ from herdr_engineering.control_plane.assistant import (
     AssistantNotFound,
     AssistantService,
     AssistantUnavailable,
+    RateLimited,
     assistant_config,
+    redact_secrets,
 )
 
 
@@ -532,13 +534,17 @@ def test_connector_request_deny_by_default_ssrf():
     assert svc.store.get_connector(c.connector_id, tenant_id="t1", user_id="u1").as_dict().get("token") is None
 
 
-def test_connector_request_rejects_http():
+def test_register_connector_rejects_http():
     svc = make_service()
-    c = svc.register_connector(tenant_id="t1", user_id="u1", name="X", base_url="http://x.example.com",
+    with pytest.raises(AssistantError):
+        svc.register_connector(tenant_id="t1", user_id="u1", name="X",
+                               base_url="http://x.example.com",
                                auth={"_allowed_origins": ["x.example.com"]})
-    r = svc.connector_request(tenant_id="t1", user_id="u1", connector_id=c.connector_id)
-    assert r["ok"] is False
-    assert "https" in r["error"]
+    # an http allowlist origin is also rejected
+    with pytest.raises(AssistantError):
+        svc.register_connector(tenant_id="t1", user_id="u1", name="X",
+                               base_url="https://x.example.com",
+                               auth={"_allowed_origins": ["http://x.example.com"]})
 
 
 def test_computer_policy_deny_by_default():
@@ -587,3 +593,93 @@ def test_execute_tool_delegate_dispatch():
     res = svc.execute_tool(tenant_id="t1", user_id="u1", assistant_id=a.assistant_id,
                            tool_id="delegate", payload={"task": "T"}, actor="u1")
     assert res["ok"] is True and res["delegation"]["status"] == "queued"
+
+
+# ---------------------------------------------------------------------------
+# P6 — hardening: secrets redaction, validation, isolation, rate limiting
+# ---------------------------------------------------------------------------
+
+class _FailingAdapter:
+    """A connector adapter whose transport error echoes its URL (to prove the
+    error output is redacted)."""
+    def request(self, connector, method, path, body, timeout):
+        return {"ok": False, "error": f"connector call failed: {connector.base_url}{path}"}
+
+
+def test_audit_log_never_contains_secrets():
+    svc = make_service()
+    svc.create_assistant(tenant_id="t1", user_id="u1", name="Helper")
+    c = svc.register_connector(tenant_id="t1", user_id="u1", name="X",
+                               base_url="https://x.example.com",
+                               auth={"_allowed_origins": ["x.example.com"], "token": "supersecret123"})
+    # a request that fails must not leak the token into the audit detail
+    svc.connector_request(tenant_id="t1", user_id="u1", connector_id=c.connector_id,
+                          path="https://evil.example.net/x")
+    joined = "\n".join(f"{e['action']} {e['detail']}" for e in svc.store.audit)
+    assert "supersecret123" not in joined
+    assert "Authorization" not in joined
+    assert redact_secrets("Authorization: Bearer abcdef123456") == "Authorization: Bearer ***REDACTED***"
+
+
+def test_connector_error_output_redacted():
+    svc = make_service()
+    c = svc.register_connector(tenant_id="t1", user_id="u1", name="X",
+                               base_url="https://x.example.com",
+                               auth={"_allowed_origins": ["x.example.com"], "token": "tok_abc123"})
+    # force a transport failure that echoes the URL including the token
+    svc._adapter_for = lambda kind: _FailingAdapter()
+    r = svc.connector_request(tenant_id="t1", user_id="u1", connector_id=c.connector_id,
+                              path="?token=tok_abc123")
+    assert "tok_abc123" not in r.get("error", "")
+
+
+def test_register_connector_requires_https_allowlist():
+    svc = make_service()
+    with pytest.raises(AssistantError):
+        svc.register_connector(tenant_id="t1", user_id="u1", name="X",
+                               base_url="http://x.example.com",
+                               auth={"_allowed_origins": ["x.example.com"]})
+
+
+def test_invalid_timezone_rejected():
+    svc = make_service()
+    a = svc.create_assistant(tenant_id="t1", user_id="u1", name="Helper")
+    with pytest.raises(AssistantError):
+        svc.create_routine(tenant_id="t1", user_id="u1", assistant_id=a.assistant_id,
+                           name="R", timezone="Not/AZone")
+
+
+def test_p4_entities_isolated_across_users():
+    svc = make_service()
+    a = svc.create_assistant(tenant_id="t1", user_id="u1", name="Helper")
+    c = svc.register_connector(tenant_id="t1", user_id="u1", name="X", base_url="https://x.example.com",
+                               auth={"_allowed_origins": ["x.example.com"]})
+    r = svc.create_routine(tenant_id="t1", user_id="u1", assistant_id=a.assistant_id, name="R")
+    d = svc.delegate(tenant_id="t1", user_id="u1", assistant_id=a.assistant_id, task="T")
+    for access in (lambda: svc.get_connector(c.connector_id, tenant_id="t1", user_id="u2"),
+                   lambda: svc.get_routine(r.routine_id, tenant_id="t1", user_id="u2"),
+                   lambda: svc.get_delegation(d.delegation_id, tenant_id="t1", user_id="u2")):
+        with pytest.raises((KeyError, AssistantNotFound)):
+            access()
+
+
+def test_rate_limit_enforced():
+    svc = make_service()
+    svc.config["max_requests_per_minute"] = 3
+    for _ in range(3):
+        svc.check_rate_limit(key="k1")  # ok
+    with pytest.raises(RateLimited):
+        svc.check_rate_limit(key="k1")
+    # a different key is unaffected
+    svc.check_rate_limit(key="k2")
+
+
+def test_rate_limit_resets_next_window():
+    svc = make_service()
+    svc.config["max_requests_per_minute"] = 1
+    svc.check_rate_limit(key="k")
+    with pytest.raises(RateLimited):
+        svc.check_rate_limit(key="k")
+    # advance into a new minute window -> fresh count
+    svc.now = lambda: datetime(2026, 10, 28, 0, 1, tzinfo=UTC)
+    svc.check_rate_limit(key="k")
