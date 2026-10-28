@@ -1233,6 +1233,36 @@ def _cmd_graph_artifact_render(args) -> int:
     return 0
 
 
+def _cmd_art_upload(args) -> int:
+    import urllib.request
+    from pathlib import Path
+    from urllib.parse import urlencode
+
+    from .host_config import HostConfigUnavailable, exit_unavailable, resolve_control_plane
+
+    try:
+        base = resolve_control_plane(args.control_plane)
+    except HostConfigUnavailable as exc:
+        return exit_unavailable(exc)
+    path = Path(args.data)
+    query = {"filename": args.filename or path.name, "mime": args.mime}
+    if args.session:
+        query["session_id"] = args.session
+    if args.mission:
+        query["mission_id"] = args.mission
+    req = urllib.request.Request(
+        f"{base}/api/v1/artifacts?{urlencode(query)}", data=path.read_bytes(),
+        method="POST", headers={"Content-Type": args.mime})
+    try:
+        with urllib.request.urlopen(req, timeout=60) as response:
+            payload = json.loads(response.read(8 * 1024 * 1024))
+    except (OSError, ValueError) as exc:
+        print(f"artifact upload failed: {exc}", file=sys.stderr)
+        return 1
+    _print_json(payload)
+    return 0
+
+
 def _cmd_art_list(args) -> int:
     from .artifacts import FilesystemArtifactWorkspace
     ws = FilesystemArtifactWorkspace()

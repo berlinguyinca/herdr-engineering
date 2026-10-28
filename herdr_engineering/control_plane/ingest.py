@@ -15,6 +15,7 @@ import logging
 import math
 import re
 
+from ..host_policy import normalize_aliases
 from ..review_gate.entities import RESERVED_ENTITY_PREFIXES
 from .ids import validate_mission_id
 
@@ -193,6 +194,14 @@ class IngestService:
         written = payload.get("from_id") if event_type.startswith("edge.") else payload.get("node_id")
         if isinstance(written, str) and self.reserved_node(written):
             raise PermissionError("not permitted to modify this lineage object")
+
+    def ingest_batch(self, bodies: list[dict], principal: dict | None = None, valid=None) -> list[dict]:
+        """Ingest a bounded batch while preserving single-envelope semantics."""
+        if not isinstance(bodies, list):
+            raise ValueError("events must be a list")
+        if len(bodies) > 64:
+            raise ValueError("events must contain at most 64 envelopes")
+        return [self.ingest(body, principal, valid=valid) for body in bodies]
 
     def ingest(self, body: dict, principal: dict | None = None, valid=None) -> dict:
         """Apply one ingest body.
@@ -380,6 +389,8 @@ class IngestService:
         elif entity_type == "pull_request":
             self._delivery_mission_key(payload.get("mission_id"), source)
         elif entity_type == "token_usage":
+            if event_type not in {'token_usage.recorded', 'TokenUsageRecorded'}:
+                raise ValueError('token usage event type is not accepted')
             if not isinstance(payload, dict):
                 raise ValueError("token usage must be an object")
             for k in ("input_tokens", "output_tokens", "reasoning_tokens",
@@ -590,6 +601,12 @@ class IngestService:
         name = payload.get("host_name") or payload.get("name")
         ip = payload.get("tailnet_ip") or payload.get("ip")
         inventory = payload.get("inventory")
+        scheduler = {key: payload[key] for key in (
+            "host_uid", "aliases", "platform", "scheduler_owned", "scheduler_trusted",
+            "scheduler_policy", "scheduler_capacity",
+        ) if payload.get(key) is not None}
+        if "aliases" in scheduler:
+            scheduler["aliases"] = normalize_aliases(scheduler["aliases"])
         # A routine heartbeat (known healthy host, same identity, no inventory)
         # only refreshes liveness in memory: a durable HostHeartbeat per 30 s
         # sample would grow the event log and the Activity feed without bound.
@@ -600,21 +617,27 @@ class IngestService:
                 and existing.get("status") == "healthy"
                 and (not name or name == existing.get("host_name"))
                 and (not ip or ip == existing.get("tailnet_ip"))
-                and not inventory):
+                and not inventory
+                and all(existing.get(key) == value for key, value in scheduler.items())):
             self.repo.record_heartbeat(entity_id, cpu=cpu, mem=mem)
             host = self.repo.get_host_record(entity_id) or existing
         else:
             host = self.repo.upsert_host(
-                entity_id, name or entity_id, ip,
-                cpu=cpu, mem=mem, status=status, inventory=inventory)
+                entity_id, name or (existing or {}).get('host_name') or entity_id, ip,
+                cpu=cpu, mem=mem, status=status, inventory=inventory, **scheduler)
+        scheduler_sample = {key: payload[key] for key in (
+            "sequence", "freshness_seconds", "confidence") if key in payload}
         if sample is not None or any(v is not None for v in state.values()):
             self.repo.record_host_metrics(entity_id, sample, **state)
+            if scheduler_sample:
+                self.repo.record_telemetry(entity_id, scheduler_sample)
             return host
         legacy = {k: v for k, v in legacy.items() if v is not None}
-        if legacy:
+        if legacy or scheduler_sample:
             self.repo.record_telemetry(entity_id, {
                 "cpu_pct": legacy.get("cpu"), "mem_pct": legacy.get("mem"),
-                "disk_pct": legacy.get("disk")})
+                "disk_pct": legacy.get("disk"),
+                "confidence": "legacy", **scheduler_sample})
         return host
 
     def _ingest_host_state(self, entity_id, payload) -> dict:

@@ -62,7 +62,8 @@ export class HerdrClient {
     return (await this.getConditional(path, { signal })).body;
   }
 
-  async request(path, { method = 'GET', body, signal } = {}) {
+  async request(path, { method = 'GET', body, signal = AbortSignal.timeout(15000) } = {}) {
+    const startedAt = Date.now();
     const url = `${this.base}${path}`;
     const headers = { Accept: 'application/json', 'X-Herdr-User': this.user, 'X-Herdr-Tenant': this.tenant };
     let payload;
@@ -83,8 +84,23 @@ export class HerdrClient {
       json = { raw: text };
     }
     if (!res.ok) {
-      throw new ApiError(res.status, json,
+      const error = new ApiError(res.status, json,
         (json && json.error) || `HTTP ${res.status}`);
+      error.requestId = res.headers?.get?.('X-Request-ID') || '';
+      error.elapsedMs = Date.now() - startedAt;
+      const retryAfter = res.headers?.get?.('Retry-After');
+      if (retryAfter != null && retryAfter.trim() !== '') {
+        const seconds = Number(retryAfter);
+        const delay = Number.isFinite(seconds) ? seconds * 1000 : Date.parse(retryAfter) - Date.now();
+        if (Number.isFinite(delay)) error.retryAfterMs = Math.max(0, delay);
+      }
+      throw error;
+    }
+    if (json && typeof json === 'object' && !Array.isArray(json)) {
+      Object.defineProperty(json, '_requestMeta', {value: {
+        requestId: res.headers?.get?.('X-Request-ID') || '',
+        elapsedMs: Date.now() - startedAt,
+      }, enumerable: false});
     }
     return json;
   }
@@ -110,36 +126,6 @@ export class HerdrClient {
     }
   }
 
-  // -- missions -----------------------------------------------------------
-  listMissions(status, { signal } = {}) {
-    const q = status ? `?status=${encodeURIComponent(status)}` : '';
-    return this.request(`/api/v1/missions${q}`, { signal });
-  }
-
-  getMission(id) {
-    return this.request(`/api/v1/missions/${encodeURIComponent(id)}`);
-  }
-
-  missionTests(id, { signal } = {}) {
-    return this.request(`/api/v1/missions/${encodeURIComponent(id)}/tests`, { signal });
-  }
-
-  missionBuilds(id, { signal } = {}) {
-    return this.request(`/api/v1/missions/${encodeURIComponent(id)}/builds`, { signal });
-  }
-
-  missionReviews(id, { signal } = {}) {
-    return this.request(`/api/v1/missions/${encodeURIComponent(id)}/reviews`, { signal });
-  }
-
-  missionPulls(id, { signal } = {}) {
-    return this.request(`/api/v1/missions/${encodeURIComponent(id)}/pulls`, { signal });
-  }
-
-  listMissionActivity({ signal } = {}) {
-    return this.request('/api/v1/mission-activity', { signal });
-  }
-
   getHandoffTree({ signal } = {}) {
     return this.request('/api/v1/handoffs/tree', { signal });
   }
@@ -147,57 +133,6 @@ export class HerdrClient {
   listHandoffs(state, { signal } = {}) {
     const query = state ? `?state=${encodeURIComponent(state)}` : '';
     return this.request(`/api/v1/handoffs${query}`, { signal });
-  }
-
-  missionActivity(id, { signal } = {}) {
-    return this.request(`/api/v1/missions/${encodeURIComponent(id)}/activity`, { signal });
-  }
-
-  missionTimeline(id) {
-    return this.request(`/api/v1/missions/${encodeURIComponent(id)}/timeline`);
-  }
-
-  // -- sessions -----------------------------------------------------------
-  listSessions(status, { signal } = {}) {
-    const q = status ? `?status=${encodeURIComponent(status)}` : '';
-    return this.request(`/api/v1/sessions${q}`, { signal });
-  }
-
-  getSession(id, { signal } = {}) {
-    return this.request(`/api/v1/sessions/${encodeURIComponent(id)}`, { signal });
-  }
-
-  getAgentSummary(id, { signal } = {}) {
-    return this.request(`/api/v1/sessions/${encodeURIComponent(id)}/summary`, { signal });
-  }
-
-  regenerateAgentSummary(id) {
-    return this.request(`/api/v1/sessions/${encodeURIComponent(id)}/summary`, { method: 'POST', body: {} });
-  }
-
-  // Hand one stored blocker/next step back to the agent that owns the summary.
-  // The server re-checks `text` against the stored item and dedupes replays.
-  fixSummaryItem(id, list, index, text) {
-    return this.request(`/api/v1/sessions/${encodeURIComponent(id)}/summary/fix`, {
-      method: 'POST', body: { list, index, text },
-    });
-  }
-
-  // Terminal button: the server builds the attach command from the session record; the
-  // viewer runs it in their own terminal. Nothing is sent but the session id.
-  getTerminalAttach(id) {
-    return this.request(`/api/v1/sessions/${encodeURIComponent(id)}/terminal`, { method: 'POST', body: {} });
-  }
-
-  renameAgent(id, name, expectedVersion) {
-    return this.request(`/api/v1/sessions/${encodeURIComponent(id)}/name`, {
-      method: 'POST', body: { name, expected_version: expectedVersion },
-    });
-  }
-
-  // -- services / hosts ---------------------------------------------------
-  listServices({ signal } = {}) {
-    return this.request('/api/v1/services', { signal });
   }
 
   listArtifacts({ q, type, status, offset, limit, signal } = {}) {
@@ -256,16 +191,97 @@ export class HerdrClient {
     });
   }
 
-  listHosts({ signal } = {}) {
-    return this.request('/api/v1/hosts', { signal });
-  }
-
   schedulerOverview({ signal } = {}) {
     return this.request('/api/v1/scheduler', { signal });
   }
 
   schedulerPlan(request, { signal } = {}) {
     return this.request('/api/v1/scheduler/plan', { method: 'POST', body: request, signal });
+  }
+
+  // -- missions -----------------------------------------------------------
+  listMissions(status, { signal } = {}) {
+    const q = status ? `?status=${encodeURIComponent(status)}` : '';
+    return this.request(`/api/v1/missions${q}`, { signal });
+  }
+
+  getMission(id) {
+    return this.request(`/api/v1/missions/${encodeURIComponent(id)}`);
+  }
+
+  missionTests(id, { signal } = {}) {
+    return this.request(`/api/v1/missions/${encodeURIComponent(id)}/tests`, { signal });
+  }
+
+  missionBuilds(id, { signal } = {}) {
+    return this.request(`/api/v1/missions/${encodeURIComponent(id)}/builds`, { signal });
+  }
+
+  missionReviews(id, { signal } = {}) {
+    return this.request(`/api/v1/missions/${encodeURIComponent(id)}/reviews`, { signal });
+  }
+
+  missionPulls(id, { signal } = {}) {
+    return this.request(`/api/v1/missions/${encodeURIComponent(id)}/pulls`, { signal });
+  }
+
+  listMissionActivity({ signal } = {}) {
+    return this.request('/api/v1/mission-activity', { signal });
+  }
+
+  missionActivity(id, { signal } = {}) {
+    return this.request(`/api/v1/missions/${encodeURIComponent(id)}/activity`, { signal });
+  }
+
+  missionTimeline(id) {
+    return this.request(`/api/v1/missions/${encodeURIComponent(id)}/timeline`);
+  }
+
+  // -- sessions -----------------------------------------------------------
+  listSessions(status, { signal } = {}) {
+    const q = status ? `?status=${encodeURIComponent(status)}` : '';
+    return this.request(`/api/v1/sessions${q}`, { signal });
+  }
+
+  getSession(id, { signal } = {}) {
+    return this.request(`/api/v1/sessions/${encodeURIComponent(id)}`, { signal });
+  }
+
+  getAgentSummary(id, { signal } = {}) {
+    return this.request(`/api/v1/sessions/${encodeURIComponent(id)}/summary`, { signal });
+  }
+
+  regenerateAgentSummary(id) {
+    return this.request(`/api/v1/sessions/${encodeURIComponent(id)}/summary`, { method: 'POST', body: {} });
+  }
+
+  // Hand one stored blocker/next step back to the agent that owns the summary.
+  // The server re-checks `text` against the stored item and dedupes replays.
+  fixSummaryItem(id, list, index, text) {
+    return this.request(`/api/v1/sessions/${encodeURIComponent(id)}/summary/fix`, {
+      method: 'POST', body: { list, index, text },
+    });
+  }
+
+  // Terminal button: the server builds the attach command from the session record; the
+  // viewer runs it in their own terminal. Nothing is sent but the session id.
+  getTerminalAttach(id) {
+    return this.request(`/api/v1/sessions/${encodeURIComponent(id)}/terminal`, { method: 'POST', body: {} });
+  }
+
+  renameAgent(id, name, expectedVersion) {
+    return this.request(`/api/v1/sessions/${encodeURIComponent(id)}/name`, {
+      method: 'POST', body: { name, expected_version: expectedVersion },
+    });
+  }
+
+  // -- services / hosts ---------------------------------------------------
+  listServices({ signal } = {}) {
+    return this.request('/api/v1/services', { signal });
+  }
+
+  listHosts({ signal } = {}) {
+    return this.request('/api/v1/hosts', { signal });
   }
 
   // -- activity / analytics ------------------------------------------------

@@ -137,6 +137,7 @@ export async function capture(browser, info, surface, viewport, scheme, { extraC
     await page.addStyleTag({ content: bundledFontCss() });
     if (surface.hash) { await page.evaluate((h) => { window.location.hash = h; }, surface.hash); } else { await openSub(page, surface.sub); }
     await page.locator(surface.proof).first().waitFor({ timeout: 15000 });
+    if (surface.sub === 'chat') await page.locator('#hcn-empty').waitFor({ state: 'detached', timeout: 15000 });
     if (surface.steps) await surface.steps(page);
     await page.addStyleTag({ content: '*,*::before,*::after{animation:none!important;transition:none!important;caret-color:transparent!important;scroll-behavior:auto!important}' });
     if (extraCss) await page.addStyleTag({ content: extraCss });

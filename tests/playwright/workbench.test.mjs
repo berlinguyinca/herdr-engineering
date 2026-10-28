@@ -84,6 +84,25 @@ const select = async (page, id = 'attempt:a1') => {
   await page.locator('.wb').waitFor();
 };
 
+test('completed comment writes release controls even while refreshed metadata is delayed', async () => withPage(async page => {
+  await select(page);
+  await page.locator('.wb-comment').first().waitFor();
+  let release;
+  const pending = new Promise(resolve => { release = resolve; });
+  await page.route('**/api/v1/collab/rooms/room-one/state?*', async route => { await pending; await route.fallback(); });
+  await page.route('**/api/v1/collab/rooms/room-one/comments**', async route => {
+    if (route.request().method() === 'GET') await pending;
+    await route.fallback();
+  });
+  await page.locator('textarea[data-wb-field="comment"]').fill('Completed write');
+  const button = page.getByRole('button', { name: 'Post comment', exact: true });
+  await button.click();
+  try {
+    await page.waitForFunction(() => document.querySelector('form[data-wb-form="comment"] button[type="submit"]')?.disabled === false, null, { timeout: 2000 });
+    assert.match(await page.locator('.wb').innerText(), /Comment posted/);
+  } finally { release(); }
+}));
+
 test('hostile comment, author and instruction text never run and show as text', async () => withPage(async (page) => {
   await select(page);
   await page.locator('.wb-comment').first().waitFor();

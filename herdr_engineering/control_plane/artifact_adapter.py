@@ -30,6 +30,7 @@ class SyncArtifactAdapter:
         asyncio.set_event_loop(self._loop)
         try:
             async def create():
+                self._operation_lock = asyncio.Lock()
                 result = store_factory()
                 return await result if hasattr(result, "__await__") else result
             self._store = self._loop.run_until_complete(create())
@@ -48,7 +49,13 @@ class SyncArtifactAdapter:
         function = getattr(self._store, method, None)
         if function is None or not callable(function):
             raise AttributeError(f"artifact store method is unavailable: {method}")
-        future = asyncio.run_coroutine_threadsafe(function(*args, **kwargs), self._loop)
+        async def serialized():
+            # ArtifactStore owns one asyncpg connection; concurrent queries on
+            # that connection are rejected even when they share an event loop.
+            async with self._operation_lock:
+                return await function(*args, **kwargs)
+
+        future = asyncio.run_coroutine_threadsafe(serialized(), self._loop)
         return future.result()
 
     def close(self) -> None:

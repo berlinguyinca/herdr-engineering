@@ -8,6 +8,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { chromium } from 'playwright';
+import { withPage } from './helpers/fixture.mjs';
+import { until } from './helpers/live.mjs';
 
 const REPO = path.resolve(import.meta.dirname, '..', '..');
 const PY = process.env.PYTHON
@@ -63,6 +65,35 @@ async function withApp(fn, env = {}) {
 
 const badge = (page) => page.locator('herdr-app-shell .hd-shell__link[data-path="/attention"] .hd-shell__badge');
 
+test('cancelled attention polls cannot overwrite the resumed page or release its request slot', async () => withPage(async (page, base) => {
+  await page.goto(`${base}/__blank`);
+  await page.evaluate(async () => {
+    const { mountAttention } = await import('/attention-view.js');
+    window.pending = []; window.hiddenForTest = false;
+    Object.defineProperty(document, 'hidden', { configurable: true, get: () => window.hiddenForTest });
+    document.body.innerHTML = '<main></main>';
+    window.inbox = mountAttention(document.querySelector('main'), { attention: (_, { signal }) => new Promise((resolve, reject) => window.pending.push({ signal, resolve, reject })) });
+    window.visibility = hidden => { window.hiddenForTest = hidden; document.dispatchEvent(new Event('visibilitychange')); };
+    window.answer = title => ({ items: [{ key: `session:${title}`, title, kind: 'agent_failed', severity: 'critical', state: 'open', fingerprint: 'abc', href: '#/herd' }], counts: { open: 1 } });
+    window.visibility(true); window.visibility(false);
+    window.pending[0].reject(new DOMException('cancelled', 'AbortError'));
+  });
+  await page.evaluate(() => window.inbox.refresh());
+  assert.equal(await page.evaluate(() => window.pending.length), 2, 'an old cancellation must not unlock the current poll');
+  await page.evaluate(() => window.pending[1].resolve(window.answer('Current')));
+  await page.getByText('Current', { exact: true }).waitFor();
+  await page.evaluate(() => {
+    window.inbox.refresh();
+    window.visibility(true); window.visibility(false);
+    window.pending[3].resolve(window.answer('Newest'));
+  });
+  await page.getByText('Newest', { exact: true }).waitFor();
+  await page.evaluate(() => window.pending[2].resolve(window.answer('Obsolete')));
+  assert.equal(await page.getByText('Newest', { exact: true }).count(), 1);
+  assert.equal(await page.getByText('Obsolete', { exact: true }).count(), 0);
+  await page.evaluate(() => window.inbox.dispose());
+}));
+
 test('the page lists server-derived items, an acknowledge keeps them listed, and the badge follows', async () => {
   await withApp(async ({ browser, base }) => {
     const page = await (await browser.newContext()).newPage();
@@ -117,6 +148,12 @@ test('snooze hides an item from the open list and lists it as snoozed', async ()
 test('the Overview agrees with the Attention page and says so when the inbox cannot be loaded', async () => {
   await withApp(async ({ browser, base }) => {
     const page = await (await browser.newContext()).newPage();
+    // Lazy CI startup briefly reports syncing and adds source:ci to the inbox.
+    // Compare the two pages only after the offline fixture reaches its stable state.
+    await until(async () => {
+      const snapshot = await (await page.request.get(`${base}/api/v1/ci`)).json();
+      return snapshot.status === 'not_configured' && snapshot.refreshing === false;
+    }, 'offline CI startup to settle', 8000);
     await page.goto(`${base}/#/attention`);
     await page.locator('[data-attention-row^="session:"]').waitFor({ timeout: 8000 });
     const keys = (await page.locator('[data-attention-row]').evaluateAll((els) => els.map((e) => e.dataset.attentionRow))).sort();

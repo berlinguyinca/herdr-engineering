@@ -1,6 +1,5 @@
 from pathlib import Path
 
-
 _MIGRATION = Path(__file__).parents[2] / "deploy" / "control-plane" / "migrations" / "0008_artifact_registry.sql"
 
 

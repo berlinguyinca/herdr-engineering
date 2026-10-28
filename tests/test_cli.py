@@ -25,6 +25,32 @@ def test_seed_demo_populates_repo():
     assert len(repo.recent_events(limit=100)) > 0
 
 
+def test_local_artifact_upload_uses_restored_control_plane(tmp_path, capsys):
+    import urllib.request
+
+    repo = ControlPlaneRepo()
+    session_id = repo.create_session()
+    server = ControlPlaneServer(repo)
+    thread = threading.Thread(target=server.serve, daemon=True)
+    thread.start()
+    server.wait_until_ready()
+    base = f"http://127.0.0.1:{server.port}"
+    path = tmp_path / "release notes.txt"
+    path.write_bytes(b"restored artifact upload")
+    try:
+        assert main(["artifacts", "upload", str(path), "--control-plane", base,
+                     "--mime", "text/plain", "--session", session_id]) == 0
+        artifact = json.loads(capsys.readouterr().out)
+        assert artifact["original_filename"] == path.name
+        assert artifact["session_id"] == session_id
+        url = f"{base}/api/v1/artifacts/{artifact['artifact_id']}/download"
+        with urllib.request.urlopen(url, timeout=5) as response:
+            assert response.read() == path.read_bytes()
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+
+
 def test_parse_api_keys_rbac_pairs():
     assert _parse_api_keys(None, "k1=viewer,k2=operator") == {
         "k1": "viewer", "k2": "operator"}

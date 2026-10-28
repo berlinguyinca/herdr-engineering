@@ -139,7 +139,18 @@ async def load_checkpoint_events(conn):
     if not active:
         return None
     manifest = active[0]
-    rows = [dict(row) for row in await conn.fetch(checkpoint_events_sql(), manifest["checkpoint_id"])]
+    from .bridge import _ev_payload, _v2_value
+    if callable(getattr(conn, "cursor", None)):
+        rows = []
+        async for row in conn.cursor(checkpoint_events_sql(), manifest["checkpoint_id"], prefetch=1000):
+            event = dict(row)
+            event["payload"] = _ev_payload(event)
+            for name in ("actor", "evidence_refs"):
+                if name in event:
+                    event[name] = _v2_value(name, event[name])
+            rows.append(event)
+    else:
+        rows = [dict(row) for row in await conn.fetch(checkpoint_events_sql(), manifest["checkpoint_id"])]
     origins = [row.pop("recovery_origin") for row in rows]
     tail_count = origins.count("tail")
     return rows, {

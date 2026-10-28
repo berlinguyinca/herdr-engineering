@@ -332,6 +332,20 @@ def test_postgres_source_uses_provided_run():
 
 def test_postgres_source_compacts_snapshots_without_an_entity_allowlist():
     calls = []
+    rows = [
+        {"event_id": "h0", "entity_type": "host", "entity_id": "observed-host",
+         "event_type": "HostRegistered", "sequence": 0,
+         "source_timestamp": "2026-10-26T12:00:00+00:00",
+         "payload": {"host_name": "Observed host", "status": "healthy"}},
+        {"event_id": "s0", "entity_type": "session", "entity_id": "observed-session",
+         "event_type": "SessionStarted", "sequence": 0,
+         "source_timestamp": "2026-10-26T12:00:00+00:00",
+         "payload": {"host_id": "observed-host", "agent_role": "pi", "status": "active"}},
+        {"event_id": "v0", "entity_type": "service", "entity_id": "observed-service",
+         "event_type": "ServiceRegistered", "sequence": 0,
+         "source_timestamp": "2026-10-26T12:00:00+00:00",
+         "payload": {"host_id": "observed-host", "service_name": "Observed web", "port": 18001}},
+    ]
 
     class FakeConn:
         @asynccontextmanager
@@ -341,12 +355,19 @@ def test_postgres_source_compacts_snapshots_without_an_entity_allowlist():
 
         async def fetch(self, sql, *args):
             calls.append(sql)
+            if "fabric_events" in sql:
+                assert "LIMIT" not in sql
+                return rows
             return []
 
     def fake_run(coro):
         return asyncio.new_event_loop().run_until_complete(coro)
 
-    PostgresSource(FakeConn(), run=fake_run).events()
+    restored = ControlPlaneRepo()
+    load_into(restored, PostgresSource(FakeConn(), run=fake_run))
+    assert restored.get_host("observed-host")["host_name"] == "Observed host"
+    assert restored.get_session("observed-session")["agent_role"] == "pi"
+    assert restored.get_service("observed-service")["service_name"] == "Observed web"
     event_sql = next(sql for sql in calls if "fabric_events" in sql)
     assert "entity_type NOT IN" in event_sql
     assert "UNION ALL" in event_sql
@@ -354,3 +375,4 @@ def test_postgres_source_compacts_snapshots_without_an_entity_allowlist():
     assert "lag(recovery_snapshot)" in event_sql
     assert "'session'" in event_sql
     assert "'service'" in event_sql
+    assert "LIMIT" not in event_sql

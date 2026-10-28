@@ -8,7 +8,7 @@ from datetime import timedelta
 
 import pytest
 
-from herdr_engineering.control_plane.bridge import PostgresSource, load_into
+from herdr_engineering.control_plane.bridge import PostgresSource, _v2_value, load_into
 from herdr_engineering.control_plane.repo import ControlPlaneRepo
 from tests.control_plane.test_postgres_recovery import (
     _insert,
@@ -130,7 +130,7 @@ def test_inflight_backdated_and_cross_actor_tail_are_not_lost(db):
     assert metrics["tail_events"] == 1 and len(selected) == 3
     assert _projections(recovered) == _projections(expected)
     assert recovered.ledger._events == expected.ledger._events
-    assert {json.loads(e["actor"])["id"] for e in selected if e["event_id"] == first["event_id"]} == {"a", "b"}
+    assert {_v2_value("actor", e["actor"])["id"] for e in selected if e["event_id"] == first["event_id"]} == {"a", "b"}
     for actor in ("a", "b"):
         assert recovered.ledger.check(dict(event_id=first["event_id"], source="reporter", source_sequence=5 if actor == "a" else 0,
                                            actor={"id": actor}, content_hash=actor)) == "duplicate"

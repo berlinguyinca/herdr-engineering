@@ -109,7 +109,7 @@ MAX_TEXT = 8000
 MAX_BODY = 64 * 1024
 _PANE_LINK = re.compile(r"pane:[a-z0-9][a-z0-9._-]{0,62}:[A-Za-z0-9][A-Za-z0-9:_.-]{0,39}")
 _KEY_RE = re.compile(r"[A-Za-z0-9._:\-]{1,128}\Z")
-_MESSAGE_FIELDS = frozenset({"text", "idempotency_key", "in_reply_to", "context"})
+_MESSAGE_FIELDS = frozenset({"text", "idempotency_key", "in_reply_to", "context", "artifact_ids"})
 _MESSAGE_DERIVED = frozenset({"mentions"})   # the server derives these from the text; a client's copy is dropped
 _CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")   # C0, DEL and C1 (8-bit CSI)
 _NAME_BAD = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]")
@@ -5108,6 +5108,10 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                 clean = ext.clean_text(text, MAX_TEXT, multiline=True)
             if not clean.strip() or len(clean) > MAX_TEXT:
                 raise CollabError(400, f"text must be 1-{MAX_TEXT} characters")
+            artifact_ids = body.get("artifact_ids", [])
+            if (not isinstance(artifact_ids, list) or len(artifact_ids) > 20 or
+                    not all(isinstance(item, str) and item.strip() for item in artifact_ids)):
+                raise CollabError(400, "artifact_ids must contain at most 20 non-empty strings")
             reply = body.get("in_reply_to")
             if reply is not None:
                 where = self._msg_room.get(reply) if isinstance(reply, str) else None
@@ -5120,10 +5124,15 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
             if "context" in body:
                 # T14: a reference to a graph node/edge/proposal/comment. Validated, and visible to THIS poster now.
                 ctx = self._wb_call(self._context_for_post, pr, room, room_id, body["context"])
-            fp = _digest(json.dumps([room_id, clean, reply] + ([ctx] if ctx else [])))
+            fp = _digest(json.dumps([room_id, clean, reply] + ([artifact_ids] if artifact_ids else []) + ([ctx] if ctx else [])))
             prior = self._idem.get((pr.key, room_id, key))
             if prior:
-                if prior[0] != fp:
+                # The local attachment publisher included an empty list in the
+                # fingerprint. Keep retries of those durable messages valid,
+                # as well as upstream messages that omitted attachments.
+                legacy_empty = (not artifact_ids and not ctx and
+                                prior[0] == _digest(json.dumps([room_id, clean, reply, []])))
+                if prior[0] != fp and not legacy_empty:
                     raise CollabError(409, "idempotency_key already used for a different message")
                 return 200, {"event": self._view(self._log[prior[1] - 1], viewer=pr, replayed=True), "replayed": True}
             now = self._now()
@@ -5152,6 +5161,7 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                 sender_kind=pr.kind, sender_id=pr.id, sender_external=pr.external, idempotency_key=key, fingerprint=fp,
                 text=stored, mentions=self._resolve_mentions(room_id, stored), in_reply_to=reply, trust="untrusted",
                 **({"context": ctx} if ctx else {}),
+                artifact_ids=list(artifact_ids),
                 visibility_scope="room", action="message.post", outcome="allowed",
                 project_ids=[room["project_id"]], resource_id=room_id))
         self.stats["messages"] += 1
@@ -5171,7 +5181,8 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
         if t == "message":
             out.update(sender={"type": "external" if p.get("sender_external") else p["sender_kind"],
                                "id": p["sender_id"], "owner_user_id": p["actor_user_id"]},
-                       text=p["text"], trust="untrusted", in_reply_to=p.get("in_reply_to"))
+                       text=p["text"], trust="untrusted", in_reply_to=p.get("in_reply_to"),
+                       artifact_ids=list(p.get("artifact_ids") or []))
             out["mentions"], mine = self._mentions_for(p, viewer)
             if mine is not None:                   # wake on the long-poll, act if addressed
                 out["mentions_me"] = mine

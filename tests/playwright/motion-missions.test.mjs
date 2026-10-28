@@ -145,7 +145,7 @@ test('agent detail: the recorded event list appends and the head status follows 
   return {};
  });
  await until(()=>page.locator('#session-stream [data-key]').count().then(n=>n===1),'one recorded event');
- await page.evaluate(()=>{window.__stream=document.getElementById('session-stream');window.__row=window.__stream.firstElementChild;});
+ await page.evaluate(()=>{window.__stream=document.querySelector('#session-stream [data-event-history-rows]');window.__row=window.__stream.firstElementChild;});
  assert.match(await page.locator('.sd-head strong').textContent(),/Last reported working/);
  await page.evaluate(()=>{window.__headFlashes=0;new MutationObserver(rs=>{for(const r of rs)if(r.target.hasAttribute('data-flash'))window.__headFlashes++;}).observe(document.querySelector('[data-session-head]'),{attributes:true,attributeFilter:['data-flash']});});
  // A heartbeat (only the report time moves) updates the time without flashing the head.
@@ -160,7 +160,7 @@ test('agent detail: the recorded event list appends and the head status follows 
  await page.evaluate(()=>window.__emit({event_id:'e2',event_type:'SessionUpdated',entity_id:'x'}));
  await page.clock.runFor(6000);
  await until(()=>page.locator('#session-stream [data-key]').count().then(n=>n===2),'second recorded event');
- const r=await page.evaluate(()=>({same:document.getElementById('session-stream')===window.__stream,row:window.__stream.contains(window.__row),children:window.__stream.children.length}));
+ const r=await page.evaluate(()=>({same:document.querySelector('#session-stream [data-event-history-rows]')===window.__stream,row:window.__stream.contains(window.__row),children:window.__stream.children.length}));
  assert.deepEqual(r,{same:true,row:true,children:2},'the list grows by one; container and earlier row survive');
  await until(()=>page.locator('.sd-head strong').textContent().then(t=>/Last reported waiting/.test(t)),'head status follows the live event');
  assert.equal(await page.evaluate(()=>window.__headFlashes),1,'a status change flashes the head once');

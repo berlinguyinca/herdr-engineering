@@ -98,6 +98,22 @@ test('ApiError carries status and body on non-2xx', async () => {
   });
 });
 
+test('HTTP failures retain Retry-After deadlines and request diagnostics', async t => {
+  const now = Date.parse('2026-10-26T12:00:00Z');
+  t.mock.method(Date, 'now', () => now);
+  for (const [header, expected] of [['2', 2000], [new Date(now + 60000).toUTCString(), 60000], ['invalid', undefined]]) {
+    const client = new HerdrClient('', { fetchImpl: async () => ({
+      ok: false, status: 429, headers: new Headers({ 'Retry-After': header, 'X-Request-ID': 'req-test' }),
+      text: async () => JSON.stringify({ error: 'Backend request limit reached' }),
+    }) });
+    await assert.rejects(client.health(), error => {
+      assert.equal(error.retryAfterMs, expected); assert.equal(error.requestId, 'req-test');
+      assert.equal(error.elapsedMs, 0); assert.equal(error.message, 'Backend request limit reached');
+      return true;
+    });
+  }
+});
+
 test('sendMessage retains an explicit operation identity across retries', async () => {
   const bodies=[];
   const client=new HerdrClient('',{fetchImpl:async(url,options)=>{

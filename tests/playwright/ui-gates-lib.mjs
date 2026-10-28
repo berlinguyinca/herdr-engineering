@@ -72,11 +72,22 @@ export async function openReal(browser, info, user = 'alice', ctxOpts = {}, befo
   const ctx = await browser.newContext({ viewport: { width: 1280, height: 800 }, ...ctxOpts });
   const page = await ctx.newPage();
   const w = watch(page);
+  const pending = new Set();
+  page.on('request', request => pending.add(request));
+  page.on('requestfinished', request => pending.delete(request));
+  page.on('requestfailed', request => pending.delete(request));
   const tok = info.tokens[user];
   await page.addInitScript(([t]) => { try { window.sessionStorage.setItem('hcn.tokens', JSON.stringify({ access: t, id: t })); } catch { /* storage blocked */ } }, [tok]);
   if (beforeGoto) await beforeGoto(ctx, page);
   await page.goto(`${info.base}/#/room/${encodeURIComponent(info.room)}`);
-  await page.locator('[data-sub]').first().waitFor({ timeout: 15000 });
+  try {
+    await page.locator('[data-sub]').first().waitFor({ timeout: 15000 });
+  } catch (error) {
+    const body = await page.locator('body').innerText().catch(() => 'page unavailable');
+    const detail = JSON.stringify({ errors: w.errors, failed: w.failed, http: w.bad, pending: [...pending].map(request => request.url()), url: page.url(), body: body.slice(0, 1200) });
+    await ctx.close();
+    throw new Error(`Collaboration room failed to open: ${detail}`, { cause: error });
+  }
   return { ctx, page, w };
 }
 

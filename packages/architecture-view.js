@@ -2,6 +2,7 @@
 // /api/v1/architecture/*; renders loading / disabled / empty / error / stale / partial states.
 import {escapeHtml as esc} from './herdr-web-components/util.js';
 import {layoutGraph, NODE_W, NODE_H} from './architecture-layout.js';
+import {skeleton} from './motion.js';
 
 const PAGE = 100;
 const text = v => typeof v === 'string' ? v : '';
@@ -70,12 +71,12 @@ export function mountArchitecture(root, client, opts = {}) {
   let alive = true, ctl = new AbortController();
   const st = {snapshots: [], sid: opts.snapshot || '', parent: opts.parent || '', q: opts.q || '', page: null, detail: null, diff: null,
     analyses: [], cursor: null, caps: [], extras: null, timeline: null, cross: null, explain: null, request: null, corr: null, rooms: null, cancels: {}};
-  root.innerHTML = '<div class="arch"><herdr-spinner></herdr-spinner></div>';
+  root.innerHTML = `<div class="arch">${skeleton('architecture')}</div>`;
   const host = root.firstElementChild;
   const snap = () => st.snapshots.find(s => s.snapshot_id === st.sid);
-  const fail = e => alive && (host.innerHTML = e.status === 404
+  const fail = e => { if (!alive) return; opts.onFreshness?.(e.status === 404, e.message); host.innerHTML = e.status === 404
     ? '<herdr-empty message="The Architecture Explorer is not enabled on this control plane (control_plane.architecture.enabled)."></herdr-empty>'
-    : `<herdr-error message="${esc(e.message || 'request failed')}"></herdr-error>`);
+    : `<herdr-error message="${esc(e.message || 'request failed')}"></herdr-error>`; };
 
   async function load() {
     try {
@@ -190,6 +191,7 @@ export function mountArchitecture(root, client, opts = {}) {
   }
   function render() {
     if (!alive) return;
+    opts.onFreshness?.(true);
     const s = snap();
     if (!st.snapshots.length) {
       const a = st.analyses[0];

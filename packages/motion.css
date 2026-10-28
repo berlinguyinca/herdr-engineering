@@ -34,6 +34,21 @@ progress, .hd-meter > *, .hd-stage-bar > *, .hv-meter__bar > i { transition: wid
   background-size: 200% 100%; animation: hd-skeleton 1.4s linear infinite;
 }
 
+.hd-skeleton-group { display: grid; gap: 10px; margin: 12px 0; }
+.hd-skeleton--title { height: 1.875rem; width: min(14em, 60%); margin: 0 0 .5rem; }
+.hd-skeleton--line { height: 1em; width: 8em; }
+
+herdr-loading-progress { display: grid; gap: 4px; min-width: 0; font-size: 12px; color: var(--text-secondary); }
+herdr-loading-progress[hidden] { display: none; }
+/* Static stripes express activity without a fabricated completion percentage or
+ * a native indeterminate animation that could bypass calm/reduced-motion rules. */
+.hd-load-progress { appearance: none; border: 0; border-radius: var(--radius-sm); width: 100%; height: 7px; background: repeating-linear-gradient(135deg,var(--accent) 0 6px,var(--surface-2) 6px 12px); }
+.hd-load-progress::-webkit-progress-bar { background: inherit; border-radius: inherit; }
+.hd-load-progress::-moz-progress-bar { background: inherit; }
+
+/* A page head: the title with its freshness chip beside it (wraps below on narrow screens). */
+.hd-live-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 12px; }
+.hd-live-head > h1 { min-width: 0; }
 herdr-freshness { display: inline-block; font-size: var(--text-sm); color: var(--text-secondary); }
 herdr-freshness[data-state="stale"] { color: var(--freshness-warn); }
 herdr-freshness[data-state="error"] { color: var(--status-failed); }

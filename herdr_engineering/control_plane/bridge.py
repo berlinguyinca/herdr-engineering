@@ -187,31 +187,50 @@ class PostgresSource(DurableSource):
             import asyncpg
             self._conn = await asyncpg.connect(self._dsn)
         conn = self._conn
-        # One consistent cut across structured rows and the event log. Concurrent
-        # ingestion must not leave half a recovery or make compaction race a writer.
-        async with conn.transaction(isolation="repeatable_read", readonly=True):
-            started = time.monotonic()
-            state = {
-                "missions": [dict(r) for r in await conn.fetch("SELECT * FROM missions")],
-                "sessions": [dict(r) for r in await conn.fetch("SELECT * FROM sessions")],
-                "services": [dict(r) for r in await conn.fetch("SELECT * FROM services")],
-                "hosts": [dict(r) for r in await conn.fetch("SELECT * FROM hosts")],
-            }
-            from .recovery_checkpoint import load_checkpoint_events
-            # Checkpoints belong to the canonical journal only. Custom sources
-            # continue to use their own full faithful recovery query.
-            checkpoint = (await load_checkpoint_events(conn)
-                          if self._events_table == "fabric_events" else None)
-            if checkpoint is None:
-                state["events"] = [dict(r) for r in await conn.fetch(
-                    _recovery_events_sql(self._events_table))]
-                self.recovery_metrics = {
-                    "mode": "full", "loaded_events": len(state["events"]),
-                    "elapsed_seconds": round(time.monotonic() - started, 3),
-                }
-            else:
-                state["events"], self.recovery_metrics = checkpoint
-            return state
+        use_cursor = callable(getattr(conn, "cursor", None)) and callable(getattr(conn, "transaction", None))
+        if callable(getattr(conn, "transaction", None)):
+            # Entity rows and the complete event log must share one snapshot.
+            # asyncpg cursors require a transaction; keep all work on our loop.
+            async with conn.transaction(isolation="repeatable_read", readonly=True):
+                return await self._fetch_snapshot(use_cursor=use_cursor)
+        # Lightweight fetch-only connections remain supported by the bridge tests.
+        return await self._fetch_snapshot(use_cursor=False)
+
+    async def _fetch_snapshot(self, *, use_cursor: bool) -> dict:
+        conn = self._conn
+        started = time.monotonic()
+        snapshot = {
+            "missions": [dict(r) for r in await conn.fetch("SELECT * FROM missions")],
+            "sessions": [dict(r) for r in await conn.fetch("SELECT * FROM sessions")],
+            "services": [dict(r) for r in await conn.fetch("SELECT * FROM services")],
+            "hosts": [dict(r) for r in await conn.fetch("SELECT * FROM hosts")],
+        }
+        from .recovery_checkpoint import load_checkpoint_events
+        checkpoint = (await load_checkpoint_events(conn)
+                      if self._events_table == "fabric_events" else None)
+        if checkpoint is not None:
+            snapshot["events"], self.recovery_metrics = checkpoint
+            return snapshot
+        query = _recovery_events_sql(self._events_table)
+        if use_cursor:
+            events = []
+            async for row in conn.cursor(query, prefetch=1000):
+                event = dict(row)
+                # Decode while each bounded batch is alive so the complete raw
+                # JSON text never coexists with the complete decoded replay.
+                event["payload"] = _ev_payload(event)
+                for name in ("actor", "evidence_refs"):
+                    if name in event:
+                        event[name] = _v2_value(name, event[name])
+                events.append(event)
+        else:
+            events = [dict(row) for row in await conn.fetch(query)]
+        snapshot["events"] = events
+        self.recovery_metrics = {
+            "mode": "full", "loaded_events": len(events),
+            "elapsed_seconds": round(time.monotonic() - started, 3),
+        }
+        return snapshot
 
     def missions(self) -> list[dict]:
         return self._load()["missions"]
@@ -226,7 +245,16 @@ class PostgresSource(DurableSource):
         return self._load()["hosts"]
 
     def events(self) -> list[dict]:
-        return self._load()["events"]
+        if "events" not in self._load():
+            # load_into consumes the heavy event cache. Explicit later event
+            # reads get a fresh complete snapshot, never an empty placeholder.
+            self._cache = self._run(self._fetch_all())
+        return self._cache["events"]
+
+    def take_events(self) -> list[dict]:
+        """Transfer event-row ownership to replay; retain cheap resource reads."""
+        self.events()
+        return self._cache.pop("events")
 
 
 def _v2_value(name: str, value: Any) -> Any:
@@ -239,8 +267,8 @@ def _v2_value(name: str, value: Any) -> Any:
     return value
 
 
-def _rebuild_events(rows: list[dict]) -> tuple[dict, list]:
-    """Fold fabric_events rows into repo's {stream: [event]} + chronological order."""
+def _rebuild_events(rows: list[dict], *, reuse: bool = False) -> tuple[dict, list]:
+    """Fold rows into streams/order; reuse only source-owned, transferred rows."""
     streams: dict = {}
     order: list = []
     for row in rows:
@@ -250,7 +278,7 @@ def _rebuild_events(rows: list[dict]) -> tuple[dict, list]:
         key = f"{etype}|{eid}"
         stream = streams.setdefault(key, [])
         seq = int(row.get("sequence", len(stream)))
-        stream.append({
+        event = {
             "event_id": row.get("event_id"),
             "schema_version": row.get("schema_version") or 1,
             "source_timestamp": _iso(row.get("source_timestamp")),
@@ -262,7 +290,12 @@ def _rebuild_events(rows: list[dict]) -> tuple[dict, list]:
             "payload": _ev_payload(row),     # asyncpg yields jsonb as str; every consumer expects a dict
             **{name: _v2_value(name, row.get(name))
                for name in V2_COLUMNS if row.get(name) is not None},
-        })
+        }
+        if reuse:
+            row.clear()
+            row.update(event)
+            event = row
+        stream.append(event)
         if not (row.get("source_sequence") is not None and etype in ENVELOPE_ONLY_TYPES):
             order.append((etype, eid, seq))
     for stream in streams.values():
@@ -310,6 +343,12 @@ def _reconstruct_from_events(streams: dict) -> tuple[dict, dict, dict, dict, dic
         p = _ev_payload(ev)
         etype = ev.get("event_type") or ""
         if et == "host":
+            if etype == "HostPolicyChanged":
+                # Policy edits are not evidence that the host is alive.
+                host = hosts.get(eid)
+                if host is not None:
+                    host["scheduler_policy"] = p
+                continue
             h = hosts.setdefault(eid, {
                 "host_id": eid, "host_name": None, "tailnet_ip": None,
                 "cpu": None, "mem": None, "status": "healthy",
@@ -325,7 +364,12 @@ def _reconstruct_from_events(streams: dict) -> tuple[dict, dict, dict, dict, dic
                 h["mem"] = p["mem"]
             if isinstance(p.get("inventory"), dict):
                 h["inventory"] = {**p["inventory"], "collected_at": ts}
-            h["status"] = "unavailable" if "unavailable" in etype.lower() else "healthy"
+            for key in ("host_uid", "aliases", "platform", "scheduler_owned", "scheduler_trusted",
+                        "scheduler_policy", "scheduler_capacity"):
+                if key in p:
+                    h[key] = p[key]
+            h["status"] = "unavailable" if "unavailable" in etype.lower() else p.get("status", "healthy")
+            h["last_seen"] = ts
             h["updated_at"] = ts
         elif et == "mission":
             source = p.get("source") or (eid.split(":", 1)[0] if ":" in eid else "herdr")
@@ -391,10 +435,11 @@ def _reconstruct_from_events(streams: dict) -> tuple[dict, dict, dict, dict, dic
                 "original_filename": None, "mime_type": None,
                 "size_bytes": 0, "sha256": None, "storage_key": None,
                 "status": "available", "materializations": 0,
+                "artifact_type": "other",
                 "created_at": ts, "updated_at": ts,
             })
             for k in ("session_id", "mission_id", "mime_type", "size_bytes",
-                      "sha256", "storage_key"):
+                      "sha256", "storage_key", "artifact_type", "created_by"):
                 if p.get(k):
                     a[k] = p[k]
             if p.get("filename"):
@@ -477,6 +522,9 @@ def load_into(repo, source: DurableSource) -> dict:
     Designed for a fresh repo at server startup: replaces all structured state
     with the durable view so the API/UI read exactly what Postgres holds.
     """
+    if isinstance(source, PostgresSource):
+        # Refresh a previously consumed snapshot BEFORE reading its tables.
+        source.events()
     missions: dict = {}
     for row in source.missions():
         mid = row["mission_id"]
@@ -542,7 +590,10 @@ def load_into(repo, source: DurableSource) -> dict:
             "updated_at": _iso(row.get("updated_at") or row.get("created_at")),
         }
 
-    events, event_order = _rebuild_events(source.events())
+    if isinstance(source, PostgresSource):
+        events, event_order = _rebuild_events(source.take_events(), reuse=True)
+    else:
+        events, event_order = _rebuild_events(source.events())
 
     # Reconstruct the ingestion-managed entities from the event log so durable
     # events (the only thing the write-through sink persists) survive restart.

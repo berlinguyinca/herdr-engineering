@@ -4,6 +4,8 @@ import {spawn} from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import {chromium} from 'playwright';
+import {withPage} from './helpers/fixture.mjs';
+import {boot,until,T0} from './helpers/live.mjs';
 
 const root=path.resolve(import.meta.dirname,'../..');
 const python=process.env.PYTHON || (fs.existsSync(path.join(root,'.venv/bin/python'))?path.join(root,'.venv/bin/python'):'python3');
@@ -127,4 +129,43 @@ test('topology does not report zero current missions while one mission feed has 
  assert.match(await page.locator('[data-tx-result]').innerText(),/Partial view/);
  unavailable=false;
  await page.waitForFunction(()=>[...document.querySelectorAll('[data-tx-metrics]>div')].find(e=>e.innerText.includes('current missions'))?.querySelector('strong')?.textContent==='1',null,{timeout:12000});
+}));
+
+// Task 14 extras, on the shared fixture (stub API, fake clock).
+const projection=(n,health)=>({contract_version:1,mission_key:`pi:M${n}`,host_id:'beast',observed_at:T0,snapshot_at:T0,activity_snapshot_at:T0,connection:'connected',
+ mission:{id:`M${n}`,title:`Mission ${n}`,status:'EXECUTING'},freshness:{state:'live',age_seconds:1,stale_after_seconds:3600,disconnect_after_seconds:7200},
+ activity:{health,currentActivity:{summary:`Working ${n}`}}});
+
+test('topology: a current row shows a status dot whose colour follows the row (attention differs from ok)',async()=>withPage(async(page,base)=>{
+ await boot(page,base,'/topology',p=>({
+  '/api/v1/hosts':{hosts:[{host_id:'beast',host_name:'Beast',status:'healthy',last_seen:T0}]},
+  '/api/v1/services':{services:[]},'/api/v1/sessions':{sessions:[]},'/api/v1/missions':{missions:[]},
+  '/api/v1/mission-activity':{activities:[projection(1,'active'),projection(2,'stalled')]},
+  '/api/v1/ci':{available:true,status:'connected',pipelines:{}},
+ })[p]||{});
+ await page.locator('[data-tx-disclosure="host:beast"]>summary').click();
+ await until(()=>page.locator('[data-topology-entry] .tx-dot').count().then(n=>n===2),'two dotted rows');
+ const dots=await page.evaluate(()=>[...document.querySelectorAll('[data-topology-entry]')].map(row=>({
+  attention:!!row.querySelector('.tx-warning'),colour:getComputedStyle(row.querySelector('.tx-dot')).backgroundColor})));
+ const ok=dots.find(d=>!d.attention),attention=dots.find(d=>d.attention);
+ assert.ok(ok&&attention,JSON.stringify(dots));
+ assert.notEqual(attention.colour,ok.colour,'an attention row is not shown with the healthy dot');
+ assert.equal(attention.colour,await page.evaluate(()=>{const p=document.createElement('p');p.style.color='var(--status-attention)';document.body.append(p);const c=getComputedStyle(p).color;p.remove();return c;}));
+}));
+
+test('services: "last report" ticks in place without re-rendering rows',async()=>withPage(async(page,base)=>{
+ const services=['a','b'].map(id=>({service_id:id,service_name:`Service ${id}`,status:'healthy',host_id:'beast',port:8000,updated_at:T0,catalog:{scope:'herdr'}}));
+ await boot(page,base,'/services?status=all',p=>p==='/api/v1/services'?{services}:{});
+ await until(()=>page.locator('[data-service-id]').count().then(n=>n===2),'two services');
+ await page.evaluate(()=>{
+  window.__rows=[...document.querySelectorAll('[data-service-id]')];window.__structural=0;
+  new MutationObserver(rs=>{for(const r of rs)if(r.type==='childList'&&[...r.addedNodes,...r.removedNodes].some(n=>n.nodeType===1))window.__structural++;})
+   .observe(document.getElementById('sc-results'),{subtree:true,childList:true});
+ });
+ const seen=page.locator('[data-service-id="a"] [data-service-seen]');
+ const first=await seen.textContent();
+ await page.clock.runFor(5000);
+ await until(()=>seen.textContent().then(t=>t!==first),'age ticks');
+ const r=await page.evaluate(()=>({same:[...document.querySelectorAll('[data-service-id]')].every((row,i)=>row===window.__rows[i]),structural:window.__structural}));
+ assert.deepEqual(r,{same:true,structural:0});
 }));

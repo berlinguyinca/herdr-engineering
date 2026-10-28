@@ -9,7 +9,13 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from herdr_engineering.control_plane.bridge import PostgresSource, _recovery_events_sql, load_into
+from herdr_engineering.control_plane.bridge import (
+    PostgresSource,
+    _ev_payload,
+    _recovery_events_sql,
+    _v2_value,
+    load_into,
+)
 from herdr_engineering.control_plane.repo import ControlPlaneRepo
 from herdr_engineering.control_plane.sink import DurableEventSink
 from tests.control_plane.test_bridge import FakeSource
@@ -44,7 +50,8 @@ def _source(db):
     conn = loop.run_until_complete(asyncpg.connect(db.dsn))
     source = PostgresSource(conn, run=loop.run_until_complete)
     try:
-        rows = source.events()
+        # take_events transfers ownership for replay; retain a diagnostic copy.
+        rows = [dict(row) for row in source.events()]
         repo = ControlPlaneRepo(now=lambda: 1793059200)
         repo.inspector._clock = lambda: 1793059200
         load_into(repo, source)
@@ -82,7 +89,10 @@ def _reference(db):
     repo = ControlPlaneRepo(now=lambda: 1793059200)
     repo.inspector._clock = lambda: 1793059200
     load_into(repo, FakeSource(events=rows))
-    return repo, rows
+    normalized = [{**row, "payload": _ev_payload(row),
+                   **{name: _v2_value(name, row[name]) for name in ("actor", "evidence_refs") if name in row}}
+                  for row in rows]
+    return repo, normalized
 
 
 def _projections(repo):
