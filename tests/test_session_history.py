@@ -170,3 +170,65 @@ def test_middle_of_long_sessions_is_elided_and_disclosed(tmp_path):
     _jl(tmp_path / ".claude/projects/-w/long.jsonl", rows)
     out = sh.read_history(sh.resolve(agent="claude", session="long", home=tmp_path), home=tmp_path, max_events=100)
     assert out["events_total"] == 500 and out["events_omitted_from_middle"] == 400 and len(out["events"]) == 100
+
+
+# --- idle Codex panes: Herdr reports no conversation, Codex's own process log does ---
+
+def _codex_idle_fixture(tmp_path, *, started=1000, rows=None, header=None, pid=4242):
+    home = tmp_path / "home"
+    thread = "01a1795b-b6bc-7ff0-aa04-61b9bf926077"
+    rollout = home / f".codex/sessions/2026/10/26/rollout-2026-10-26T10-56-56-{thread}.jsonl"
+    _jl(rollout, [header or {"type": "session_meta", "payload": {"id": thread, "source": "cli"}},
+                  {"type": "response_item", "timestamp": "t1", "payload": {"type": "message", "role": "user",
+                                                                           "content": [{"type": "input_text", "text": "do it"}]}}])
+    db = home / ".codex/logs_2.sqlite"
+    con = sqlite3.connect(db)
+    con.execute("create table logs (id integer primary key autoincrement, ts integer, thread_id text, process_uuid text)")
+    for ts, tid, owner in (rows if rows is not None else [(1500, thread, f"pid:{pid}:u")]):
+        con.execute("insert into logs (ts, thread_id, process_uuid) values (?,?,?)", (ts, tid, owner))
+    con.commit(); con.close()
+    proc = tmp_path / "proc"
+    (proc / str(pid)).mkdir(parents=True)
+    (proc / "stat").write_text("cpu 1\nbtime 900\n")
+    (proc / str(pid) / "stat").write_text(f"{pid} (codex) S " + " ".join(["0"] * 18) + f" {round((started - 900) * 100)} 0")
+    fake = tmp_path / "herdr"
+    fake.write_text("#!/bin/sh\ncase \"$2\" in\n"
+                    "get) echo '{\"result\":{\"pane\":{\"agent\":\"codex\",\"agent_session\":null}}}';;\n"
+                    f"process-info) echo '{{\"result\":{{\"process_info\":{{\"foreground_processes\":[{{\"pid\":{pid}}}]}}}}}}';;\n"
+                    "esac\n")
+    fake.chmod(0o755)
+    return home, proc, fake, rollout, thread
+
+
+def test_idle_codex_pane_resolves_from_the_process_log(tmp_path):
+    home, proc, fake, rollout, thread = _codex_idle_fixture(tmp_path)
+    res = sh.resolve(home=home, env={"HERDR_PANE_ID": "w1:p2"}, herdr_bin=str(fake), cwd="/elsewhere", proc=proc)
+    assert res.agent == "codex" and res.path == str(rollout) and res.session_id == thread
+    assert res.method == "herdr-pane (codex process log)"
+    out = sh.read_history(res, home=home)
+    assert out["events_total"] == 1 and out["coverage"]["verdict"] == "complete"
+
+
+def test_idle_codex_reused_pid_is_not_evidence(tmp_path):
+    home, proc, fake, rollout, thread = _codex_idle_fixture(tmp_path, started=2000)
+    res = sh.resolve(home=home, env={"HERDR_PANE_ID": "w1:p2"}, herdr_bin=str(fake), proc=proc)
+    assert res.path is None and "did not identify" in res.note
+    out = sh.read_history(res, home=home)
+    assert out["events"] == [] and out["coverage"]["verdict"] == "limited"
+
+
+def test_idle_codex_helper_thread_and_ties_are_not_guessed(tmp_path):
+    sub = {"type": "session_meta", "payload": {"id": "01a1795b-b6bc-7ff0-aa04-61b9bf926077",
+                                               "source": {"subagent": {"thread_spawn": {}}}}}
+    home, proc, fake, rollout, thread = _codex_idle_fixture(tmp_path, header=sub)
+    assert sh.resolve(home=home, env={"HERDR_PANE_ID": "w1:p2"}, herdr_bin=str(fake), proc=proc).path is None
+    other = "01a1795b-aaaa-7ff0-aa04-61b9bf926077"
+    _jl(home / f".codex/sessions/2026/10/26/rollout-2026-10-26T11-00-00-{other}.jsonl",
+        [{"type": "session_meta", "payload": {"id": other, "source": "cli"}}])
+    home2, proc2, fake2, rollout2, thread2 = _codex_idle_fixture(
+        tmp_path / "t2", rows=[(1500, "01a1795b-b6bc-7ff0-aa04-61b9bf926077", "pid:4242:u"), (1500, other, "pid:4242:u")])
+    _jl(home2 / f".codex/sessions/2026/10/26/rollout-2026-10-26T11-00-00-{other}.jsonl",
+        [{"type": "session_meta", "payload": {"id": other, "source": "cli"}}])
+    assert sh.resolve(home=home2, env={"HERDR_PANE_ID": "w1:p2"}, herdr_bin=str(fake2), proc=proc2).path is None
+
+

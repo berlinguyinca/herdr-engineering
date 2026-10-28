@@ -88,5 +88,6 @@ It reads Claude Code and Pi/Codex JSONL and OpenCode's SQLite database (opened
   weaker evidence than for the other three.
 - A report is a snapshot: repository state is read now, not as of the session start.
 - `git` is run with `--no-optional-locks`, so even `git status` does not touch the index.
+- **Codex:** Herdr reports no conversation for idle Codex panes, so the helper identifies one from Codex's own process log (pid + thread id, newer than the process, primary conversations only; a tie is reported, not guessed). The method shows as `herdr-pane (codex process log)`.
 - Herdr's own `journal summary` projection is included only if a journal file already
   exists.

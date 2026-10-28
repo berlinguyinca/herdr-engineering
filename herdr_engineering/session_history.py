@@ -89,7 +89,66 @@ def _pane_session(env: dict[str, str], herdr_bin: str | None) -> dict | None:
     except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError):
         return None
     sess = info.get("agent_session")
-    return {"agent": info.get("agent"), **sess} if isinstance(sess, dict) else None
+    if isinstance(sess, dict):
+        return {"agent": info.get("agent"), **sess}
+    # Herdr reports no conversation for some agents (idle Codex); keep the pane so the
+    # process-keyed fallback below can still try, instead of guessing from the directory.
+    return {"agent": info.get("agent"), "pane": pane, "exe": exe} if info.get("agent") else None
+
+
+def _foreground_pids(pane: str, exe: str) -> list[int]:
+    try:
+        out = subprocess.run([exe, "pane", "process-info", "--pane", pane], capture_output=True, text=True, timeout=10)
+        rows = json.loads(out.stdout)["result"]["process_info"]["foreground_processes"]
+        return [int(r["pid"]) for r in rows if int(r["pid"]) > 0][:32]
+    except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError):
+        return []
+
+
+def _process_start_seconds(pid: int, proc: Path = Path("/proc")) -> float | None:
+    try:
+        stat = (proc / str(pid) / "stat").read_text()
+        ticks = int(stat[stat.rindex(")") + 1:].split()[19])
+        boot = int(next(l.split()[1] for l in (proc / "stat").read_text().splitlines() if l.startswith("btime ")))
+    except (OSError, ValueError, IndexError, StopIteration):
+        return None
+    return boot + ticks / 100
+
+
+def codex_rollout_for_pids(home: Path, pids: list[int], proc: Path = Path("/proc")) -> str | None:
+    """Idle Codex holds no rollout open; its own log database records the owning pid and thread.
+
+    Same evidence rule as the dashboard plugin: rows must be at least as new as the process (a reused
+    pid cannot inherit an older conversation), only a primary conversation counts, and a tie is not guessed.
+    """
+    dbs = sorted(glob.glob(str(home / ".codex" / "logs_*.sqlite")), reverse=True,
+                 key=lambda p: int(p.rsplit("_", 1)[1].split(".")[0]) if p.rsplit("_", 1)[1].split(".")[0].isdigit() else -1)
+    if not dbs:
+        return None
+    found: dict[str, int] = {}
+    try:
+        con = sqlite3.connect(f"file:{dbs[0]}?mode=ro", uri=True, timeout=1)
+        try:
+            for pid in pids:
+                started = _process_start_seconds(pid, proc)
+                if started is None:
+                    continue
+                for thread, last in con.execute(
+                        "select thread_id, max(ts) from logs where process_uuid like ? and thread_id is not null "
+                        "and ts >= ? group by thread_id order by 2 desc limit 16", (f"pid:{pid}:%", int(started) - 2)):
+                    for f in glob.glob(str(home / ".codex/sessions/**" / f"rollout-*{thread}.jsonl"), recursive=True):
+                        head = next(_jsonl(f), {})
+                        if head.get("type") == "session_meta" and (head.get("payload") or {}).get("id") == thread \
+                                and isinstance((head.get("payload") or {}).get("source"), str):
+                            found[f] = max(found.get(f, 0), int(last))
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return None
+    ranked = sorted(found.items(), key=lambda kv: kv[1], reverse=True)
+    if not ranked or (len(ranked) > 1 and ranked[0][1] == ranked[1][1]):
+        return None
+    return ranked[0][0]
 
 
 def _find_by_id(home: Path, agent: str, sid: str) -> str | None:
@@ -122,7 +181,7 @@ def _newest_in_cwd(home: Path, agent: str, cwd: str) -> list[str]:
 
 def resolve(*, agent: str | None = None, session: str | None = None, cwd: str | None = None,
             home: Path | None = None, env: dict[str, str] | None = None,
-            herdr_bin: str | None = None) -> Resolution:
+            herdr_bin: str | None = None, proc: Path = Path("/proc")) -> Resolution:
     """Pick the session: explicit id/path, then Herdr pane metadata, then a heuristic."""
     home = home or Path.home()
     env = dict(os.environ if env is None else env)
@@ -134,6 +193,13 @@ def resolve(*, agent: str | None = None, session: str | None = None, cwd: str | 
         return Resolution(agent=agent, path=path, session_id=session, method="explicit",
                           note="" if path else "session id not found in the local store")
     pane = _pane_session(env, herdr_bin)
+    if pane and pane.get("agent") == "codex" and not pane.get("value") and pane.get("pane"):
+        path = codex_rollout_for_pids(home, _foreground_pids(pane["pane"], pane["exe"]), proc)
+        if path:
+            return Resolution(agent="codex", path=path, session_id=Path(path).stem.split("-", 6)[-1],
+                              method="herdr-pane (codex process log)")
+        return Resolution(agent="codex", method="herdr-pane (codex process log)",
+                          note="Herdr reports no Codex conversation for this pane and Codex's own process log did not identify one")
     if pane and pane.get("agent") in AGENTS and pane.get("value"):
         value = str(pane["value"])
         path = value if pane.get("kind") == "file" and os.path.isfile(value) else _find_by_id(

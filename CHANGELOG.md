@@ -5,6 +5,10 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Fix: idle Codex agents showed an empty dashboard and could not be summarized
+- Codex does not keep its rollout file open between writes, and Herdr reports no `agent_session` for it, so a Codex agent's dashboard page said "Waiting for this agent to identify its transcript" with no conversation, no activity and `recording_unavailable` in the summary card. The feed plugin now also reads Codex's own state database (`logs_*.sqlite`: owning `pid:<pid>:...` and `thread_id`) as process evidence. It is the weakest evidence (only used when no fd, descendant or native identity names a conversation), rows must be newer than the process (reused pids are rejected), only a primary conversation counts, and a tie is never guessed.
+- `herdr-eng summary history` uses the same rule, so `/summary` and the dashboard agree on which Codex conversation a pane holds. Deploy the plugin (`deploy/herdr-cp-feed-plugin`) on each host to pick this up.
+
 ### Fix: macOS release staging
 - `docs/specs/herdr-codeboarding-native-port-2026-10-23/AUDIT.md` collided with `audit.md` on case-insensitive filesystems, so every fresh checkout of `main` since #194 looked dirty on macOS and `fleet-sync` refused to stage it. The requirements stub is now `AUDIT-REQUIREMENTS.md`.
 
