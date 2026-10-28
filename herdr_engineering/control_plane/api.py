@@ -638,7 +638,7 @@ class ControlPlaneServer:
             ci_snapshot=lambda: self.ci_monitor.snapshot(start=False),
             notifier=notifier,
             main_verifier=self.gate_main,
-            repair_gate=self._build_repair_gate(app, fleet_config),
+            repair_gate=self._build_repair_gate(app, fleet_config, repo, registry),
         )
         self.gate_reviewer_config = config.reviewer
         self.gate_coordinator = ReviewCoordinator(
@@ -653,7 +653,7 @@ class ControlPlaneServer:
         self.ci_monitor.start()
         self.gate_service.start()
 
-    def _build_repair_gate(self, app, fleet_config):
+    def _build_repair_gate(self, app, fleet_config, repo=None, registry=None):
         """Inert unless ``project_intelligence.repair.enabled``; read on every PR so the kill switch is hot.
 
         Once repair has been seen enabled, an unreadable central config means "kill switch on" (reject), never
@@ -676,7 +676,16 @@ class ControlPlaneServer:
             seen["enabled"] = seen["enabled"] or result is not None
             return result
 
-        return make_repair_gate(app=app, policy_fn=policy)
+        def families():
+            value = self._intelligence_section(fleet_config).get("repair")
+            fam = value.get("model_families") if isinstance(value, dict) else None
+            return fam if isinstance(fam, dict) else {}
+
+        facts = None
+        if repo is not None and registry is not None:
+            from .repair_gate import make_facts_fn
+            facts = make_facts_fn(app=app, repo=repo, registry=registry, families_fn=families)
+        return make_repair_gate(app=app, policy_fn=policy, **({"facts_fn": facts} if facts else {}))
 
     def _dispatch_native_message(self, record, message, artifact_ids):
         from ..errors import InvalidError

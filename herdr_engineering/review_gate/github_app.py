@@ -472,6 +472,50 @@ class GitHubAppClient:
             raise GitHubAppError("invalid_response")
         return branch, head
 
+    def pr_review_summary(self, repo: str, number: int, head_sha: str) -> tuple[int, bool]:
+        """(human approvals of THIS head, whether any reviewer's latest review requests changes).
+
+        Only a person (``user.type == "User"``) who is an owner, member or collaborator counts, only on
+        ``head_sha`` (an approval of an older commit is stale), and only the reviewer's latest review counts.
+        """
+        slug, number, sha = _repo_path(repo), _number(number), _sha(head_sha)
+        latest: dict[str, dict] = {}
+        for page in range(1, 6):
+            data = self._send("GET", f"/repos/{slug}/pulls/{number}/reviews?per_page=100&page={page}")
+            if not isinstance(data, list):
+                raise GitHubAppError("invalid_response")
+            for item in data:
+                user = item.get("user") if isinstance(item, dict) else None
+                if not isinstance(user, dict) or not isinstance(user.get("login"), str):
+                    continue
+                if item.get("state") in ("APPROVED", "CHANGES_REQUESTED", "DISMISSED"):
+                    latest[user["login"]] = item
+            if len(data) < 100:
+                break
+        approvals, changes = 0, False
+        for item in latest.values():
+            state = item.get("state")
+            if state == "CHANGES_REQUESTED":
+                changes = True
+            elif (state == "APPROVED" and str(item.get("commit_id", "")).lower() == sha
+                  and (item.get("user") or {}).get("type") == "User"
+                  and item.get("author_association") in ("OWNER", "MEMBER", "COLLABORATOR")):
+                approvals += 1
+        return approvals, changes
+
+    def pr_commits_verified(self, repo: str, number: int, head_sha: str) -> bool:
+        """True only if the PR has at most 100 commits, ends at ``head_sha`` and GitHub verified every signature."""
+        slug, number, sha = _repo_path(repo), _number(number), _sha(head_sha)
+        data = self._send("GET", f"/repos/{slug}/pulls/{number}/commits?per_page=100")
+        if not isinstance(data, list) or not data or len(data) >= 100:
+            return False
+        try:
+            if str(data[-1]["sha"]).lower() != sha:
+                return False
+            return all(((c.get("commit") or {}).get("verification") or {}).get("verified") is True for c in data)
+        except (KeyError, TypeError, AttributeError):
+            return False
+
     def head_commit(self, repo: str, sha: str) -> CommitInfo:
         """One commit's subject and PR number (the range when no green sha is known)."""
         slug, sha = _repo_path(repo), _sha(sha)

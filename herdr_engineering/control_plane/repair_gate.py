@@ -15,7 +15,7 @@ from typing import Any
 from . import repair_policy as rp
 
 _KEYS = {"enabled", "kill_switch", "auto_merge_enabled", "allowed_repositories", "allowed_branches", "auto_merge_risks",
-         "max_patch_lines", "require_human_approval", "max_attempts", "max_open_repair_prs", "version"}
+         "max_patch_lines", "require_human_approval", "max_attempts", "max_open_repair_prs", "version", "model_families"}
 MAX_PATCH_BYTES = 262144
 
 
@@ -104,3 +104,44 @@ def make_repair_gate(*, app: Any, policy_fn: Callable[[], rp.RepairPolicy | None
         verdict = rp.combine(decision, "merge")
         return {"merge": "allow", "wait": "wait", "reject": "reject"}[verdict], decision.reasons
     return gate
+
+
+def make_facts_fn(*, app: Any, repo: Any, registry: Any, families_fn: Callable[[], dict]) -> Callable[[Any, Any], dict]:
+    """Facts from systems of record. Anything that cannot be established is left out, which makes the policy wait.
+
+    * human approvals / changes requested: GitHub reviews on this exact head (people only).
+    * provenance: GitHub reported every commit signature in the PR as verified.
+    * author context: the pinned/discovered authoring session; reviewer context: the gate's separate review runner.
+    * model families: operator YAML ``model_families: {prefix: family}`` applied to the recorded model names;
+      an unlisted model has no family, so independence cannot be shown.
+    """
+    from ..review_gate.models import PrKey
+
+    def family(model):
+        if not isinstance(model, str):
+            return None
+        for prefix, fam in sorted((families_fn() or {}).items(), key=lambda kv: -len(kv[0])):
+            if isinstance(prefix, str) and isinstance(fam, str) and model.lower().startswith(prefix.lower()):
+                return fam
+        return None
+
+    def facts(enrollment, pr) -> dict:
+        key = PrKey(enrollment.repo, pr.number)
+        out: dict = {}
+        approvals, changes = app.pr_review_summary(enrollment.repo, pr.number, pr.head_sha)
+        out["human_approvals"], out["changes_requested"] = approvals, changes
+        out["provenance_signed"] = bool(app.pr_commits_verified(enrollment.repo, pr.number, pr.head_sha))
+        author = registry.author_of(key, pr.head_ref)
+        if author.kind != "unknown":
+            out["author_context"] = author.session_id
+            out["author_model_family"] = family(author.model)
+        verdict_model = None
+        for ev in repo.stream("pr_gate", str(key)):
+            p = ev.get("payload") or {}
+            if ev.get("event_type") == "verdict" and p.get("verdict") == "PASS" and p.get("sha") == pr.head_sha:
+                verdict_model = p.get("reviewer_model")
+        if verdict_model:
+            out["reviewer_context"] = "gate-reviewer"
+            out["reviewer_model_family"] = family(verdict_model)
+        return out
+    return facts
