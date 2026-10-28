@@ -47,6 +47,9 @@ def _build_parser() -> argparse.ArgumentParser:
         cp.add_argument("--dry-run", action="store_true")
         cp.set_defaults(func=_cmd_build_cleanup)
 
+    from .open_client import register_parser
+    register_parser(sub)
+
     # build-coordinate ----------------------------------------------------
     # Cross-agent single-flight build gate: bound concurrent cargo/tsc builds
     # across ALL agents on a host so they can't create a CPU build-storm.
