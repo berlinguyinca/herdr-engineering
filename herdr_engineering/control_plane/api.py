@@ -406,6 +406,7 @@ class ControlPlaneServer:
         self._lifecycle_lock = threading.Lock()
         self._maintenance_stop = threading.Event()
         self._background_threads = []
+        self._serving_listeners = set()
         self.gate_service = self.gate_store = self.gate_queue = self.gate_main = None
         self.gate_coordinator = self.gate_reviewer_config = None
         self._start_review_gate(repo, fleet_config)
@@ -652,8 +653,8 @@ class ControlPlaneServer:
     # ------------------------------------------------------------- server
     def _start_background_thread(self, target):
         thread = threading.Thread(target=target, daemon=True)
-        self._background_threads.append(thread)
         thread.start()
+        self._background_threads.append(thread)
 
     def serve(self):
         # Publish all listeners/workers before shutdown can snapshot and join them.
@@ -662,7 +663,14 @@ class ControlPlaneServer:
         with self._lifecycle_lock:
             if self._maintenance_stop.is_set():
                 return
-            httpd = self._start_server()
+            try:
+                httpd = self._start_server()
+            except BaseException:
+                self._maintenance_stop.set()
+                self._summary_stop.set()
+                self._shutdown_locked()
+                raise
+            self._serving_listeners.add(httpd)
         httpd.serve_forever()
 
     def _start_server(self):
@@ -676,6 +684,7 @@ class ControlPlaneServer:
                     (self.public_host, self.operator_port), _make_handler(self, operator=True))
                 self.operator_port = self._operator_httpd.server_address[1]
                 self._start_background_thread(self._operator_httpd.serve_forever)
+                self._serving_listeners.add(self._operator_httpd)
             self._ready.set()
             return self._httpd
         self._httpd = _DaemonThreadingServer(
@@ -686,6 +695,7 @@ class ControlPlaneServer:
                 (self.public_host, self.public_port), _make_handler(self, public=True))
             self.public_port = self._public_httpd.server_address[1]
             self._start_background_thread(self._public_httpd.serve_forever)
+            self._serving_listeners.add(self._public_httpd)
         if self.agent_summaries and self.agent_summaries.config.enabled:
             self.agent_summaries.start()
             self._summary_scanner = threading.Thread(target=self._summary_loop, daemon=True)
@@ -757,24 +767,32 @@ class ControlPlaneServer:
         self._maintenance_stop.set()
         self._summary_stop.set()
         with self._lifecycle_lock:
-            if self.gate_service is not None:
-                self.gate_service.stop()
-            if self._summary_scanner:
-                self._summary_scanner.join(timeout=2)
-            if self.agent_summaries:
-                self.agent_summaries.close()
-            self.ci_monitor.close()
-            self.github_monitor.close()
-            for attr in ("_operator_httpd", "_public_httpd", "_httpd"):
-                listener = getattr(self, attr)
-                if listener is not None:
+            self._shutdown_locked()
+
+    def _shutdown_locked(self):
+        """Release startup resources while holding the lifecycle lock."""
+        if self.gate_service is not None:
+            self.gate_service.stop()
+        if self._summary_scanner and self._summary_scanner.ident is not None:
+            self._summary_scanner.join(timeout=2)
+        if self.agent_summaries:
+            self.agent_summaries.close()
+        self.ci_monitor.close()
+        self.github_monitor.close()
+        for attr in ("_operator_httpd", "_public_httpd", "_httpd"):
+            listener = getattr(self, attr)
+            if listener is not None:
+                # BaseServer.shutdown waits forever if serve_forever was never
+                # started (e.g. a subsequent bind or thread startup failed).
+                if listener in self._serving_listeners:
                     listener.shutdown()
-                    listener.server_close()
-                    setattr(self, attr, None)
-            for thread in self._background_threads:
-                thread.join()
-            self._background_threads.clear()
-            self._ready.clear()
+                listener.server_close()
+                setattr(self, attr, None)
+        self._serving_listeners.clear()
+        for thread in self._background_threads:
+            thread.join()
+        self._background_threads.clear()
+        self._ready.clear()
 
 
 def _fabric_session(repo, inst):

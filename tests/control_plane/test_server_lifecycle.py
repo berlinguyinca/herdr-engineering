@@ -1,4 +1,6 @@
 """Real HTTP server shutdown must release its periodic maintenance workers."""
+import errno
+import socket
 import threading
 import time
 import urllib.request
@@ -193,3 +195,99 @@ def test_shutdown_before_serve_does_not_start_listeners_or_maintenance():
     finally:
         server.shutdown()
         serving.join(timeout=5)
+
+
+@pytest.mark.parametrize(("collab_only", "failure"), [
+    (False, "bind"), (True, "bind"),
+    (False, "secondary_thread"), (True, "secondary_thread"),
+    (False, "maintenance_thread"),
+])
+def test_failed_startup_closes_started_and_unstarted_listeners(monkeypatch, collab_only, failure):
+    with socket.socket() as occupied:
+        occupied.bind(("127.0.0.1", 0))
+        occupied.listen()
+        secondary_port = occupied.getsockname()[1] if failure == "bind" else 0
+        options = dict(operator_port=secondary_port, operator_user="owner", operator_hosts=["localhost"]) if collab_only else {}
+        server = ControlPlaneServer(
+            ControlPlaneRepo(), collab=CollabService(StaticTokenAuthenticator({})),
+            public_port=0 if collab_only else secondary_port, collab_only=collab_only, **options)
+        listeners, workers, startup_errors, shutdown_errors = [], [], [], []
+        listener_type, start_thread = api._DaemonThreadingServer, threading.Thread.start
+
+        def make_listener(*args, **kwargs):
+            listener = listener_type(*args, **kwargs)
+            entered = threading.Event()
+            serve_forever = listener.serve_forever
+
+            def serve_listener():
+                entered.set()
+                serve_forever()
+
+            listener.serve_forever = serve_listener
+            listeners.append((listener, entered))
+            return listener
+
+        def start(thread):
+            if (failure == "secondary_thread" and len(listeners) == 2
+                    and thread._target == listeners[1][0].serve_forever):
+                raise RuntimeError("secondary thread startup failed")
+            if failure == "maintenance_thread" and thread._target == server._sweep_loop:
+                raise RuntimeError("maintenance thread startup failed")
+            start_thread(thread)
+            workers.append(thread)
+
+        def serve():
+            try:
+                server.serve()
+            except Exception as error:
+                startup_errors.append(error)
+
+        def shutdown():
+            try:
+                server.shutdown()
+            except Exception as error:
+                shutdown_errors.append(error)
+
+        monkeypatch.setattr(api, "_DaemonThreadingServer", make_listener)
+        monkeypatch.setattr(threading.Thread, "start", start)
+        serving = threading.Thread(target=serve, daemon=True)
+        stopping = threading.Thread(target=shutdown, daemon=True)
+        serving.start()
+        try:
+            serving.join(timeout=5)
+            assert not serving.is_alive(), "failed startup did not return"
+            assert len(startup_errors) == 1
+            error = startup_errors[0]
+            if failure == "bind":
+                assert isinstance(error, OSError) and error.errno == errno.EADDRINUSE
+            else:
+                assert isinstance(error, RuntimeError) and "thread startup failed" in str(error)
+            stopping.start()
+            stopping.join(timeout=3)
+            assert not stopping.is_alive(), "shutdown waited on a listener that never started"
+            assert not shutdown_errors
+            assert all(listener.socket.fileno() == -1 for listener, _ in listeners)
+            assert all(not worker.is_alive() for worker in workers)
+            assert server._httpd is server._public_httpd is server._operator_httpd is None
+            assert not server._ready.is_set()
+            assert not server._background_threads
+            server.shutdown()
+        finally:
+            monkeypatch.setattr(threading.Thread, "start", start_thread)
+            # Unstick the real stdlib shutdown on the broken implementation so
+            # the regression fails within its deadline without leaking threads.
+            rescuers = []
+            for listener, entered in listeners:
+                if listener.socket.fileno() != -1 and not entered.is_set():
+                    rescuer = threading.Thread(target=listener.serve_forever, daemon=True)
+                    rescuer.start()
+                    rescuers.append(rescuer)
+            if stopping.ident is not None:
+                stopping.join(timeout=5)
+            for listener, entered in listeners:
+                if listener.socket.fileno() != -1 and entered.is_set():
+                    listener.shutdown()
+                listener.server_close()
+            serving.join(timeout=5)
+            for rescuer in rescuers:
+                rescuer.join(timeout=5)
