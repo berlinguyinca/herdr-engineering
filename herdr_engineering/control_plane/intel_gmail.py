@@ -7,6 +7,8 @@ event payloads (originals belong in the artifact registry); only the subject is 
 """
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import re
 from datetime import UTC, datetime
@@ -14,6 +16,14 @@ from datetime import UTC, datetime
 _ISSUE_URL = re.compile(r"https://github\.com/([\w.-]+/[\w.-]+)/(issues|pull)/(\d+)")
 _INJECTION = re.compile(r"(ignore (all |any )?(previous|prior) instructions|disregard (the )?(above|system)|"
                         r"\bsystem\s*:|you are now|run the following (command|script)|<\s*tool_call)", re.I)
+
+
+def _decode(data: str) -> str:
+    """Gmail ``body.data`` is base64url without guaranteed padding. Undecodable data scans as empty text."""
+    try:
+        return base64.urlsafe_b64decode(data + "=" * (-len(data) % 4)).decode("utf-8", errors="replace")
+    except (binascii.Error, ValueError):
+        return ""
 
 
 def _headers(msg: dict) -> dict[str, str]:
@@ -44,7 +54,7 @@ def normalise_message(msg: dict, *, org_id: str, account: str, project_ids: tupl
         if part.get("filename"):
             attachments.append((path, part))
         elif (part.get("mimeType") or "").startswith("text/") and (part.get("body") or {}).get("data"):
-            raw = part["body"]["data"]
+            raw = _decode(part["body"]["data"])
             text_hash.update(raw.encode())
             n_chars += len(raw)
             flagged = flagged or bool(_INJECTION.search(raw))
@@ -73,7 +83,7 @@ def explicit_links(msg: dict, *, org_id: str, project_ids: tuple[str, ...], acco
     """Relationship candidates from issue/PR URLs literally present in the text. Explicit, not inferred."""
     out, seen = [], set()
     for path, part in _walk(msg.get("payload") or {}):
-        raw = (part.get("body") or {}).get("data") or ""
+        raw = _decode((part.get("body") or {}).get("data") or "")
         for repo, kind, num in _ISSUE_URL.findall(raw):
             ref = f"{'pr' if kind == 'pull' else 'issue'}:{repo}#{num}"
             if ref in seen:

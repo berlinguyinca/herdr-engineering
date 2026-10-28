@@ -101,7 +101,7 @@ def test_end_to_end_email_to_decision_with_no_unauthorised_effect():
     viewer = pi.Viewer("o", frozenset({"p-binbase"}), "confidential")
     message = {"id": "m1", "threadId": "t1", "historyId": "9", "internalDate": "1790000000000",
                "payload": {"headers": [{"name": "From", "value": "Alex <a@lab.example>"}, {"name": "Subject", "value": "Peak shift"}],
-                           "parts": [{"mimeType": "text/plain", "body": {"data": "see https://github.com/acme/app/issues/12"}},
+                           "parts": [{"mimeType": "text/plain", "body": {"data": "c2VlIGh0dHBzOi8vZ2l0aHViLmNvbS9hY21lL2FwcC9pc3N1ZXMvMTI"}},
                                      {"mimeType": "image/png", "filename": "p.png", "body": {"attachmentId": "A", "size": 40}}]}}
     for e in gm.normalise_message(message, org_id="o", account="a", project_ids=("p-binbase",)):
         s.append_event(e, cfg=ON)

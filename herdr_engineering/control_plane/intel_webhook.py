@@ -55,13 +55,17 @@ class ReplayGuard:
             return True
 
 
-def _iso(value) -> str:
+def _iso(value, received_at: datetime | None) -> str:
+    """The source's own timestamp, else the real delivery time (labelled in the payload); never an invented ``now()``."""
     if isinstance(value, str) and value:
         return value
-    return datetime.now(UTC).isoformat()
+    if received_at is None:
+        raise WebhookRejected("event carries no timestamp and no delivery time was supplied")
+    return received_at.astimezone(UTC).isoformat()
 
 
-def normalise(event_name: str, payload: dict, *, org_id: str, installation: str, project_ids: tuple[str, ...]) -> dict | None:
+def normalise(event_name: str, payload: dict, *, org_id: str, installation: str, project_ids: tuple[str, ...],
+              received_at: datetime | None = None) -> dict | None:
     """Map one delivery to a project-intelligence raw event, or ``None`` for ignorable noise."""
     if event_name not in HANDLED or not isinstance(payload, dict):
         return None
@@ -76,7 +80,7 @@ def normalise(event_name: str, payload: dict, *, org_id: str, installation: str,
         number = pr.get("number")
         # source_version includes the head SHA: a changed head is a new fact, not an edit of the old one.
         return dict(base, source_id=f"{repo}#pr{number}", source_version=f"{sha}:{payload.get('action')}",
-                    event_type=f"pr.{payload.get('action')}", occurred_at=_iso(pr.get("updated_at")),
+                    event_type=f"pr.{payload.get('action')}", occurred_at=_iso(pr.get("updated_at"), received_at),
                     object_ref=f"pr:{repo}#{number}", actor_ref=f"github:{(pr.get('user') or {}).get('login')}",
                     title=f"PR #{number} {payload.get('action')}", payload={"head_sha": sha, "state": pr.get("state"),
                     "merged": bool(pr.get("merged")), "base_ref": (pr.get("base") or {}).get("ref")},
@@ -88,7 +92,7 @@ def normalise(event_name: str, payload: dict, *, org_id: str, installation: str,
         rid = run.get("id")
         concl = run.get("conclusion") or run.get("status")
         return dict(base, source_id=f"{repo}#{event_name}{rid}", source_version=f"{sha}:{run.get('status')}:{concl}",
-                    event_type=f"{event_name}.{payload.get('action')}", occurred_at=_iso(run.get("updated_at") or run.get("completed_at")),
+                    event_type=f"{event_name}.{payload.get('action')}", occurred_at=_iso(run.get("updated_at") or run.get("completed_at"), received_at),
                     object_ref=f"ci:{repo}#{rid}", actor_ref=None, category="ci",
                     title=f"{run.get('name')}: {concl}", payload={"head_sha": sha, "conclusion": run.get("conclusion"),
                     "status": run.get("status"), "name": run.get("name"), "cancelled": run.get("conclusion") == "cancelled"},
@@ -98,7 +102,7 @@ def normalise(event_name: str, payload: dict, *, org_id: str, installation: str,
         rv = payload.get("review") or {}
         pr = payload.get("pull_request") or {}
         return dict(base, source_id=f"{repo}#review{rv.get('id')}", source_version=str(rv.get("commit_id", "")),
-                    event_type=f"review.{rv.get('state')}", occurred_at=_iso(rv.get("submitted_at")),
+                    event_type=f"review.{rv.get('state')}", occurred_at=_iso(rv.get("submitted_at"), received_at),
                     object_ref=f"pr:{repo}#{pr.get('number')}", actor_ref=f"github:{(rv.get('user') or {}).get('login')}",
                     title=f"review {rv.get('state')}", payload={"commit_id": rv.get("commit_id"), "state": rv.get("state"),
                     "reviewer_type": (rv.get("user") or {}).get("type")},
@@ -106,7 +110,7 @@ def normalise(event_name: str, payload: dict, *, org_id: str, installation: str,
     if event_name == "issues":
         iss = payload.get("issue") or {}
         return dict(base, source_id=f"{repo}#issue{iss.get('number')}", source_version=f"{iss.get('updated_at')}:{payload.get('action')}",
-                    event_type=f"issue.{payload.get('action')}", occurred_at=_iso(iss.get("updated_at")),
+                    event_type=f"issue.{payload.get('action')}", occurred_at=_iso(iss.get("updated_at"), received_at),
                     object_ref=f"issue:{repo}#{iss.get('number')}", actor_ref=f"github:{(iss.get('user') or {}).get('login')}",
                     title=f"issue #{iss.get('number')} {payload.get('action')}", payload={"state": iss.get("state")},
                     provenance_refs=[{"source_ref": f"github:{repo}", "anchor_type": "object", "anchor_value": f"issue/{iss.get('number')}"}])
