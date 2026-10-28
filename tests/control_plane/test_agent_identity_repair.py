@@ -366,3 +366,103 @@ def test_valid_maximum_length_unicode_name_can_have_longer_casefolded_aliases():
     assert plan['records'] == [one['payload']]
     assert plan['corrections'] == []
     assert hydrate(repaired([one]))[0].get('a')['display_name'] == 'ß' * 80
+
+
+@pytest.mark.parametrize('entity_id', ['another-repair', None, 123])
+def test_marker_entity_must_bind_to_recomputed_repair_id(entity_id):
+    journal = repaired([event('a', 'Ada', 1)])
+    journal[-1]['entity_id'] = entity_id
+    with pytest.raises(ValueError, match='marker.*identity'):
+        prepare_identity_replay(journal)
+
+
+def test_uncovered_backdated_older_version_cannot_hide_a_new_display_alias():
+    journal = repaired([event('a', 'Grace', 1, version=2)])
+    tail = event('a', 'Ada', 2, stamp='2020-01-01T00:00:00Z')
+    with pytest.raises(AgentIdentityConflict, match='unrepresented'):
+        prepare_identity_replay(journal + [tail])
+
+
+@pytest.mark.parametrize('field', ['reserved_names', 'reserved_handles'])
+@pytest.mark.parametrize('version', [1, 2])
+def test_uncovered_stale_versions_cannot_hide_extra_reservations(field, version):
+    journal = repaired([event('a', 'Grace', 1, version=2)])
+    tail = event('a', 'Grace', 2, version=version)
+    tail['payload'][field].append('ada')
+    with pytest.raises(AgentIdentityConflict, match='unrepresented'):
+        prepare_identity_replay(journal + [tail])
+
+
+@pytest.mark.parametrize('version', [1, 2])
+@pytest.mark.parametrize('field', ['reserved_names', 'reserved_handles'])
+@pytest.mark.parametrize('alias', ['ada', 'ＡDA'])
+def test_uncovered_stale_versions_cannot_hide_blocked_alias_claims(version, field, alias):
+    journal = repaired([event('a', 'Ada', 1), event('b', 'Ada', 2)])
+    baseline = records(journal[-1]['payload']['plan'])['a']
+    tail = event('a', baseline['display_name'], 3, version=version)
+    tail['payload'][field].append(alias)
+    with pytest.raises(AgentIdentityConflict, match='blocked'):
+        prepare_identity_replay(journal + [tail])
+
+
+def test_stale_alias_represented_only_by_another_identity_is_rejected():
+    journal = repaired([event('a', 'Grace', 1, version=2), event('b', 'Ada', 2)])
+    with pytest.raises(AgentIdentityConflict, match='unrepresented'):
+        prepare_identity_replay(journal + [event('a', 'Ada', 3)])
+
+
+def test_stale_tail_with_only_already_reserved_aliases_is_kept_and_safe_to_ignore():
+    journal = repaired([event('a', 'Ada', 1), event('a', 'Grace', 2, version=2)])
+    tail = event('a', 'Ada', 3, stamp='2020-01-01T00:00:00Z')
+    replay, _, _ = prepare_identity_replay(journal + [tail])
+    assert replay[-1] == tail
+    registry, _, _ = hydrate(journal + [tail])
+    assert registry.get('a')['display_name'] == 'Grace'
+    assert registry.allocate('b', 'Ada')['display_name'] != 'Ada'
+
+
+def test_same_version_tail_with_already_reserved_aliases_remains_idempotent():
+    original = event('a', 'Grace', 1, version=2)
+    journal = repaired([original])
+    tail = event('a', 'Grace', 2, version=2)
+    assert prepare_identity_replay(journal + [tail])[0][-1] == tail
+    assert hydrate(journal + [tail])[0].get('a') == {
+        'identity': 'a', 'display_name': 'Grace', 'handle': 'grace', 'version': 2,
+    }
+
+
+def test_stale_tail_is_checked_against_versions_advanced_by_prior_tail_events():
+    journal = repaired([event('a', 'Grace', 1, version=2)])
+    advanced = event('a', 'Linus', 2, version=4)
+    advanced['payload']['reserved_names'].append('grace')
+    advanced['payload']['reserved_handles'].append('grace')
+    stale = event('a', 'Ada', 3, version=3)
+    with pytest.raises(AgentIdentityConflict, match='unrepresented'):
+        prepare_identity_replay(journal + [advanced, stale])
+
+
+def test_prior_tail_reservations_can_explain_a_later_stale_tail():
+    journal = repaired([event('a', 'Grace', 1, version=2)])
+    advanced = event('a', 'Linus', 2, version=4)
+    advanced['payload']['reserved_names'].append('ada')
+    advanced['payload']['reserved_handles'].append('ada')
+    stale = event('a', 'Ada', 3, version=3)
+    older = event('a', 'Grace', 4, version=1)
+    replay, _, _ = prepare_identity_replay(journal + [advanced, stale, older])
+    assert replay[-3:] == [advanced, stale, older]
+    registry, _, _ = hydrate(journal + [advanced, stale, older])
+    assert registry.get('a')['display_name'] == 'Linus'
+    assert registry.allocate('b', 'Ada')['display_name'] != 'Ada'
+    assert registry.allocate('c', 'Grace')['display_name'] != 'Grace'
+
+
+def test_no_marker_legacy_replay_keeps_existing_stale_version_semantics():
+    history = [event('a', 'Grace', 1, version=2), event('a', 'Ada', 2)]
+    for item in history:
+        item.pop('event_id')
+    replay, names, handles = prepare_identity_replay(history)
+    assert replay == history
+    assert names == handles == []
+    registry, _, _ = hydrate(history)
+    assert registry.get('a')['display_name'] == 'Grace'
+    assert registry.allocate('b', 'Ada')['display_name'] == 'Ada'

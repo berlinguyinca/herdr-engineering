@@ -13,7 +13,7 @@ import json
 import unicodedata
 from collections import defaultdict
 
-from .agent_identity import AgentIdentityRegistry, _handle, _suffix
+from .agent_identity import AgentIdentityConflict, AgentIdentityRegistry, _handle, _suffix
 
 _IDENTITY = 'agent_identity'
 _UPDATED = 'agent_identity.updated'
@@ -98,6 +98,46 @@ def _envelope(record, event_id, *, stamp='', sequence=0):
             'sequence': sequence, 'ingest_timestamp': stamp, 'payload': copy.deepcopy(record)}
 
 
+def _alias_claims(record):
+    # These are reservation keys, not display names: casefold can expand a
+    # valid 80-character display name beyond the display-name length limit.
+    names = {' '.join(unicodedata.normalize('NFKC', name).split()).casefold()
+             for name in record['reserved_names']}
+    handles = {_handle(handle) for handle in record['reserved_handles']}
+    # Historical display references also claim their normalized handles.
+    handles.update(_handle(name) for name in names)
+    return names, handles
+
+
+def _validate_tail(baseline, tail, blocked_names, blocked_handles):
+    """Prove ignored versions cannot hide claims outside the repaired state."""
+    registry = AgentIdentityRegistry(blocked_names=blocked_names, blocked_handles=blocked_handles)
+    registry.hydrate(baseline)
+    names, handles = defaultdict(set), defaultdict(set)
+    for event in baseline:
+        record = event['payload']
+        names[record['identity']].update(record['reserved_names'])
+        handles[record['identity']].update(record['reserved_handles'])
+    for event in tail:
+        record = _record(event)
+        identity = record['identity']
+        claimed_names, claimed_handles = _alias_claims(record)
+        claimed_names.update(record['reserved_names'])
+        claimed_handles.update(record['reserved_handles'])
+        if claimed_names.intersection(blocked_names) or claimed_handles.intersection(blocked_handles):
+            raise AgentIdentityConflict('uncovered identity event claims a blocked alias')
+        previous = registry.get(identity)
+        if previous and record['version'] <= previous['version']:
+            if not claimed_names <= names[identity] or not claimed_handles <= handles[identity]:
+                raise AgentIdentityConflict('uncovered stale identity event has unrepresented aliases')
+        registry.hydrate([event])
+        if previous is None or record['version'] > previous['version']:
+            # Hydration retains reservations from earlier accepted versions even
+            # when a newer payload omits them. Track exactly those published keys.
+            names[identity].update(record['reserved_names'])
+            handles[identity].update(record['reserved_handles'])
+
+
 def plan_identity_repair(events):
     """Return a JSON plan for all identity updates; ignore other event types.
 
@@ -114,14 +154,7 @@ def plan_identity_repair(events):
     for event in history:
         record = _record(event)
         identity = record['identity']
-        # These are reservation keys, not display names: casefold can expand a
-        # valid 80-character display name beyond the display-name length limit.
-        normalized_names = {' '.join(unicodedata.normalize('NFKC', name).split()).casefold()
-                            for name in record['reserved_names']}
-        normalized_handles = {_handle(handle) for handle in record['reserved_handles']}
-        # A historical display reference also reserves its normalized handle,
-        # even if an old payload forgot that reservation.
-        normalized_handles.update(_handle(name) for name in normalized_names)
+        normalized_names, normalized_handles = _alias_claims(record)
         for name in normalized_names:
             names[name].add(identity)
         for handle in normalized_handles:
@@ -184,8 +217,10 @@ def prepare_identity_replay(events):
     without event IDs. With markers only the latest by arrival/sequence/ID is
     authoritative. Its raw coverage, complete plan, and exact correction payload
     set must validate before a baseline can replace covered events. Uncovered
-    events are never filtered using a timestamp watermark. The caller hydrates
-    the result with AgentIdentityRegistry and the returned blocked alias sets.
+    events are never filtered using a timestamp watermark. Stale tail versions
+    must contain only aliases already reserved by that identity; all tail claims
+    must avoid blocked aliases. The caller hydrates the validated result with
+    AgentIdentityRegistry and the returned blocked alias sets.
     """
     events = list(events)
     has_marker = any(isinstance(e, dict) and e.get('entity_type') == _MARKER for e in events)
@@ -218,6 +253,8 @@ def prepare_identity_replay(events):
     expected = plan_identity_repair(covered.values())
     if _json(plan) != _json(expected):
         raise ValueError('identity reconciliation plan does not match covered history')
+    if marker.get('entity_id') != expected['repair_id']:
+        raise ValueError('identity reconciliation marker identity does not match repair ID')
 
     correction_ids = payload['correction_event_ids']
     if (not isinstance(correction_ids, list)
@@ -242,4 +279,5 @@ def prepare_identity_replay(events):
                 for index, record in enumerate(expected['records'])]
     excluded = set(covered) | set(correction_ids)
     tail = [e for e in identities if e['event_id'] not in excluded]
+    _validate_tail(baseline, tail, expected['blocked_names'], expected['blocked_handles'])
     return baseline + tail, expected['blocked_names'], expected['blocked_handles']
