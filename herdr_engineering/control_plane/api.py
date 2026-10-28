@@ -662,6 +662,9 @@ class ControlPlaneServer:
         h["rustfs"] = "s3" if self.rustfs is not None else "memory"
         h["version"] = __version__
         h["commit"] = _COMMIT
+        if self.repo.agent_identities.conflict_count:
+            h["agent_identity_degraded"] = True
+            h["agent_identity_conflicts"] = self.repo.agent_identities.conflict_count
         h["performance"] = self.request_metrics.snapshot()
         h['performance'].update(request_workers=self.request_workers, request_queue=self.request_queue,
                                 rejected_requests=getattr(self._httpd, 'rejected_requests', 0))

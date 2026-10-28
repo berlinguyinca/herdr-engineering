@@ -62,6 +62,54 @@ def snapshot(attempt, name, source):
     return str(target)
 
 
+def previous_receipt(state, previous_image, web=None):
+    """Bind a logical receipt to the actual image, never just a mutable tag."""
+    pinned = previous_image.startswith("sha256:")
+    if not pinned and not re.fullmatch(r"herdr-engineering:[0-9a-f]{12}", previous_image):
+        return "", {}
+    tag = previous_image.removeprefix("herdr-engineering:")
+    if not pinned and not (Path(state) / f"{tag}.json").exists():
+        return tag, {}
+    web = web if web is not None else inspect("inspect", container("control-plane-web"))
+    actual_id = image_id(web["Image"])
+    if web["Config"]["Image"] != previous_image:
+        raise ValueError("running image changed")
+    if pinned and image_id(previous_image) != actual_id:
+        raise ValueError("configured image does not match running image")
+    metadata = inspect("image", "inspect", actual_id)
+    if image_id(metadata["Id"]) != actual_id:
+        raise ValueError("image inspection mismatch")
+    stamps = [entry.split("=", 1)[1] for entry in metadata.get("Config", {}).get("Env", []) or []
+              if entry.startswith("HERDR_ENGINEERING_COMMIT=")]
+    if pinned or stamps:
+        if len(stamps) != 1 or not re.fullmatch(r"(?:[0-9a-f]{12}|[0-9a-f]{40})", stamps[0]):
+            raise ValueError("invalid image buildstamp")
+    tag = stamps[0][:12] if pinned else tag
+    receipt_path = Path(state) / f"{tag}.json"
+    receipt = json.loads(receipt_path.read_text())
+    commit = receipt.get("commit", "")
+    if (not re.fullmatch(r"[0-9a-f]{40}", commit) or commit[:12] != tag
+            or receipt.get("image") != f"herdr-engineering:{tag}"
+            or (stamps and stamps[0] not in (commit, commit[:12]))):
+        raise ValueError("receipt does not match image buildstamp")
+    # Older receipts lack an ID. Their tag is usable only when it still resolves
+    # to the running immutable image, whose buildstamp was checked above.
+    expected_id = receipt.get("image_id")
+    if expected_id is None:
+        expected_id = inspect("image", "inspect", f"herdr-engineering:{tag}")["Id"]
+    if image_id(expected_id) != actual_id:
+        raise ValueError("receipt image does not match running image")
+    return tag, receipt
+
+
+def protected_snapshot(state, source):
+    source = Path(source).resolve(strict=True)
+    if (not source.is_relative_to(state) or source.stat().st_mode & 0o077
+            or source.parent.stat().st_mode & 0o077):
+        raise ValueError("unprotected snapshot")
+    return source
+
+
 def prepare(state, central, commit, previous_commit, previous_image, collab):
     state = Path(state).resolve()
     state.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -83,22 +131,21 @@ def prepare(state, central, commit, previous_commit, previous_image, collab):
         # A receipt snapshot preserves the last deployed config even if its canonical
         # source was edited in place for this candidate. Legacy receipts bootstrap
         # from the actual running bind mount, never from the selected candidate path.
-        tag = previous_image.removeprefix("herdr-engineering:")
-        receipt_path = state / f"{tag}.json" if re.fullmatch(r"[0-9a-f]{12}", tag) else None
-        receipt = json.loads(receipt_path.read_text()) if receipt_path and receipt_path.exists() else {}
+        _, receipt = previous_receipt(state, previous_image, web)
+        if previous_commit and receipt.get("commit") != previous_commit:
+            raise ValueError("previous receipt changed during preparation")
         mount = next(m for m in web["Mounts"] if m["Destination"] == "/etc/herdr/fleet")
         source = Path(mount["Source"]) / "fleet-config.yaml"
         saved = receipt.get("fleet_config_snapshot")
-        if saved:
-            if receipt.get("image_id") != images["control-plane-web"]:
-                raise ValueError("receipt image does not match running image")
-            saved = Path(saved).resolve(strict=True)
-            if (not saved.is_relative_to(state) or saved.stat().st_mode & 0o077
-                    or saved.parent.stat().st_mode & 0o077):
-                raise ValueError("unprotected snapshot")
-            source = saved
+        pinned = previous_image.startswith("sha256:")
+        if pinned:
+            # A rollback mounts its own protected snapshot. The original success
+            # receipt may describe a different config; preserve what is live now.
+            source = protected_snapshot(state, source)
+        elif saved:
+            source = protected_snapshot(state, saved)
         previous = {"commit": previous_commit, "image": previous_image, "images": images,
-                    "fleet_config_source": receipt.get("fleet_config_source", str(source)),
+                    "fleet_config_source": str(source) if pinned else receipt.get("fleet_config_source", str(source)),
                     "fleet_config_snapshot": snapshot(attempt, "previous", source)}
         # Image-only override: retain the previous commit's commands, including the
         # collaboration operator URL, while making mutable tags irrelevant.
@@ -114,6 +161,9 @@ def main():
     action, *args = sys.argv[1:]
     if action == "prepare":
         prepare(*args)
+    elif action == "resolve-previous":
+        tag, _ = previous_receipt(*args)
+        print(tag)
     elif action == "outcome":
         attempt, outcome = args
         path = Path(attempt) / "metadata.json"

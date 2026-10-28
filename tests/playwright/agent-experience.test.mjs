@@ -102,6 +102,30 @@ test('operator rename conflicts preserve input and viewer controls remain hidden
   assert.equal(await page.getByRole('button',{name:'Regenerate summary',exact:true}).count(),0);
 }));
 
+test('an ambiguous saved name explains its stable-ID fallback and recovers through rename',()=>withAgent(async page=>{
+  await page.evaluate(()=>{
+    window.agent.display_name=window.agent.session_id;
+    window.agent.agent_handle=null;
+    window.agent.name_error='Saved agent name conflicts with another identity; using the session ID until renamed.';
+    window.remount();
+  });
+  assert.equal(await page.locator('[data-agent-name]').innerText(),'agent:one');
+  assert.match(await page.locator('[data-agent-name-error]').innerText(),/conflicts.*session ID/);
+  await page.setViewportSize({width:390,height:844});
+  await page.evaluate(()=>{
+    window.agent.session_id='agent:'+'x'.repeat(200);
+    window.agent.display_name=window.agent.session_id;
+    window.remount();
+  });
+  assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth+1),false);
+  await page.getByRole('button',{name:'Rename agent',exact:true}).click();
+  await page.getByRole('textbox',{name:'Agent name',exact:true}).fill('Silver Heron');
+  await page.getByRole('button',{name:'Save name',exact:true}).click();
+  await page.waitForFunction(()=>document.querySelector('[data-agent-name]').textContent==='Silver Heron');
+  assert.equal(await page.locator('[data-agent-name-error]').count(),0);
+  assert.deepEqual(await page.evaluate(()=>window.renames.at(-1)),{id:'agent:'+'x'.repeat(200),name:'Silver Heron',version:1});
+}));
+
 test('Summary blockers and next steps can be handed back to the owning agent once',()=>withAgent(async page=>{
   await page.locator('[data-agent-summary] details > summary').click();
   const fixes=page.getByRole('button',{name:'Let the agent fix this',exact:true});

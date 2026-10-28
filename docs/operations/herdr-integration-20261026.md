@@ -144,6 +144,37 @@ applies. Production has not been changed by this resumed work yet.
   attributable to the pending integration. Retained event-only entities still
   need to be verified after complete replay.
 
+### First rollout and safe recovery
+
+The clean full JavaScript rerun passed all 1,033 tests. PR #306 was merged as
+`6e7f135`; its tree exactly matches verified release `4e0368c`. The exact image
+passed cursor traversal, legacy API, private-stream denial, and asset checks.
+
+The first rollout did not become ready: complete replay exposed 23 duplicated
+initial agent names across 46 identities. Startup failed closed with
+`persisted agent name is already reserved`. Protected rollback successfully
+restored the prior `3f53537` release, all app services, and previous configuration.
+Do not describe this first rollout as successful or weaken replay to hide it.
+
+The follow-up preserves all private identity events and normal strict validation.
+Opt-in recovery blocks ambiguous names/handles for every claimant; sessions use
+their stable IDs until explicitly renamed. Historical ambiguous aliases remain
+blocked after renames. Malformed identities and version divergence still fail
+validation. Workspace diagnostics explain the fallback, including on mobile.
+Seventy-five backend recovery/API checks, 18 workspace browser checks, and the
+actual 415-identity private reproduction passed without production writes.
+
+Rollback pins containers by immutable image ID, so follow-up deployment discovery
+also resolves that ID's buildstamp against the full receipt commit and actual
+image identity. It refuses mismatches and preserves the mounted protected
+configuration. Seventy-four deployment/compose checks passed, including repeated
+rollback and mismatch tests. The live pinned rollback image resolves correctly.
+
+A full read-only replay of the current production data (2,098,684 retained events
+at measurement time) is running before a second rollout. It must prove both
+startup and session/service API availability. Production is currently on the
+healthy previous release; the follow-up is on `fix/herdr-identity-replay-20261028`.
+
 ## History and diagnostics verification
 
 - Event-history reads now support bounded cursor pages without changing the

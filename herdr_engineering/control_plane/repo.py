@@ -26,7 +26,7 @@ from uuid import uuid4
 from ..host_policy import HostPolicy, HostSnapshot, PolicyMode, normalize_aliases
 from ..llm_session_id import dashboard_form
 from . import llm_stats
-from .agent_identity import AgentIdentityRegistry
+from .agent_identity import AgentIdentityConflict, AgentIdentityRegistry
 from .envelope import SourceLedger, envelope_event_fields
 from .graph import GraphProjection
 from .graph import _lseq as _graph_lseq
@@ -477,7 +477,15 @@ class ControlPlaneRepo:
     def _named_session(self, record):
         if record is None:
             return None
-        profile = self.agent_identities.allocate(record["session_id"], record.get("name"))
+        try:
+            profile = self.agent_identities.allocate(record["session_id"], record.get("name"))
+        except AgentIdentityConflict:
+            if not self.agent_identities.is_conflicted(record["session_id"]):
+                raise
+            profile = self.agent_identities.get(record["session_id"])
+            return {**record, "display_name": record["session_id"], "agent_handle": None,
+                    "name_version": profile["version"],
+                    "name_error": "Saved agent name conflicts with another identity; using the session ID until renamed."}
         return {**record, "display_name": profile["display_name"],
                 "agent_handle": profile["handle"], "name_version": profile["version"]}
 
@@ -3090,7 +3098,11 @@ class ControlPlaneRepo:
             self._agent_records[key] = event
             self._agent_sequence = max(self._agent_sequence, int(event.get("sequence") or 0))
         self.agent_identities.hydrate([event for (kind, _), event in self._agent_records.items()
-                                       if kind == "agent_identity"])
+                                       if kind == "agent_identity"], quarantine_conflicts=True)
+        if self.agent_identities.conflict_count:
+            logging.getLogger(__name__).error(
+                "restored sessions with %d ambiguous agent names; aliases remain blocked and stable session IDs are shown until renamed",
+                self.agent_identities.conflict_count)
         # Inspector summaries ride the durable log as ``inspector`` streams;
         # move them into the bounded store instead of the unbounded raw streams.
         durable = []
