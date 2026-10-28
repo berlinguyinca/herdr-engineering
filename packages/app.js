@@ -331,7 +331,7 @@ async function viewArtifact(parts, revision) {
   const controller = new AbortController();
   const chip = root.querySelector('herdr-freshness');
   // Mount immediately so navigation can cancel the pending detail read.
-  void renderArtifactDetail(container, client, id, { signal: controller.signal })
+  void renderArtifactDetail(container, client, id, { signal: controller.signal, versionId: route().query.get('version') || undefined })
     .then(result => { if (!controller.signal.aborted && revision === renderRevision) chip.touch(!result?.errors?.length, result?.errors?.join('; ')); })
     .catch(error => { if (!controller.signal.aborted && revision === renderRevision) { container.innerHTML = `<herdr-error message="${esc(error.message)}"></herdr-error><button type="button" data-route-retry>Retry</button>`; chip.touch(false, error.message); } });
   return { refresh() {}, dispose: () => controller.abort() };
