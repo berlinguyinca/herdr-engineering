@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import re
 import struct
 import zipfile
 import zlib
@@ -94,8 +95,8 @@ def _zip_findings(data: bytes) -> tuple[list[str], str]:
             if len(infos) <= MAX_ARCHIVE_ENTRIES and any(_declared_sizes_lie(data, i) for i in infos):
                 reasons.append("suspicious archive: declared sizes do not match the data")
             for i in infos:
-                n = i.filename.lower()
-                if n.startswith("/") or ".." in n.split("/"):
+                n = i.filename.lower().replace("\\", "/")     # some extractors treat a backslash as a separator
+                if n.startswith("/") or ".." in n.split("/") or (len(n) > 1 and n[1] == ":"):
                     reasons.append("path traversal entry")
                 if any(m in n for m in _MACRO_ENTRIES):
                     reasons.append("macro content")
@@ -103,6 +104,12 @@ def _zip_findings(data: bytes) -> tuple[list[str], str]:
                     reasons.append("external link or embedded object")
                 if n.endswith(".zip"):
                     reasons.append("nested archive")
+                if n.endswith(".rels") and i.file_size <= VERIFY_ENTRY_MAX:
+                    try:
+                        if b'targetmode="external"' in zf.read(i).lower().replace(b"'", b'"').replace(b" =", b"=").replace(b"= ", b"="):
+                            reasons.append("external link or embedded object")
+                    except (zipfile.BadZipFile, RuntimeError, zlib.error):
+                        reasons.append("suspicious archive: unreadable relationship part")
             if any(i.filename.startswith(("word/", "xl/", "ppt/")) for i in infos):
                 kind = "application/zip-ooxml"
     except zipfile.BadZipFile:
@@ -121,8 +128,13 @@ def triage(data: bytes, declared_type: str | None = None, filename: str = "") ->
         reasons += zr
     low = data.lower()     # whole content (bounded by MAX_BYTES): markers after the first 64 KiB still count
     if mime == "application/pdf":
-        if any(m in low for m in _PDF_ACTIVE) or b"<script" in low:
+        # PDF names may be written with #xx hex escapes (/J#61vaScript); decode them before looking for keywords.
+        plain = re.sub(rb"#([0-9a-f]{2})", lambda m: bytes([int(m.group(1), 16)]), low)
+        if any(m in plain for m in _PDF_ACTIVE) or b"<script" in plain:
             reasons.append("active PDF content (script, launch action or embedded file)")
+        if b"/objstm" in plain:
+            # Objects inside compressed object streams are not scanned here, so absence of markers proves nothing.
+            reasons.append("PDF with compressed object streams cannot be fully inspected")
     elif mime in ("image/svg+xml", "text/html") or any(m in low for m in _ACTIVE_MARKERS):
         reasons.append("active content")
     if mime == "application/x-ole":

@@ -71,3 +71,6 @@ exact `payload_sha256` and `resource_version` it was shown. Proposals expire aft
 | Whole enabling order, restart, kill switch, DOWN | `test_intel_rollout_rehearsal.py` |
 | Approval needs another person and the exact payload | `test_project_intelligence_api.py::test_proposals_*` |
 | Attachments: only accepted bytes reach the artifact store | `test_intel_connectors.py` |
+
+## Egress gate scope
+`X-Herdr-Data-Class` is honoured only when the caller sends it. Untagged requests are not gated, so the gate protects cooperating callers (the assistant and intelligence tools), not a hostile one. A custom model is allowed only if the content may go to both its own route and the shared upstream.

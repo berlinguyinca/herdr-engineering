@@ -281,3 +281,30 @@ def test_zip_whose_header_understates_the_real_size_is_rejected():
     struct.pack_into("<I", bad, cd + 24, 10)
     t = ia.triage(bytes(bad), "application/zip")
     assert t.verdict == "reject" and any("declared sizes" in r for r in t.reasons)
+
+
+def _zip(entries):
+    import io
+    import zipfile
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for name, body in entries.items():
+            z.writestr(name, body)
+    return buf.getvalue()
+
+
+def test_pdf_hex_escaped_names_and_object_streams_are_not_accepted():
+    from herdr_engineering.control_plane import intel_attachments as att
+    assert att.triage(b"%PDF-1.7\n1 0 obj<</S/J#61vaScript/JS(x)>>endobj", "application/pdf", "a.pdf").verdict == "quarantine"
+    t = att.triage(b"%PDF-1.7\n1 0 obj<</Type/ObjStm>>endobj", "application/pdf", "a.pdf")
+    assert t.verdict == "quarantine" and any("cannot be fully inspected" in r for r in t.reasons)
+    assert att.triage(b"%PDF-1.7\n1 0 obj<</Type/Catalog>>endobj", "application/pdf", "a.pdf").verdict == "accept"
+
+
+def test_ooxml_external_relationship_and_backslash_traversal_are_flagged():
+    from herdr_engineering.control_plane import intel_attachments as att
+    rels = b'<Relationships><Relationship Id="r1" Target="http://evil.example/x" TargetMode="External"/></Relationships>'
+    t = att.triage(_zip({"word/document.xml": b"<w/>", "word/_rels/document.xml.rels": rels}), None, "d.docx")
+    assert t.verdict == "quarantine" and "external link or embedded object" in t.reasons
+    t = att.triage(_zip({"..\\..\\evil.txt": b"x"}), None, "a.zip")
+    assert t.verdict == "reject" and "path traversal entry" in t.reasons
