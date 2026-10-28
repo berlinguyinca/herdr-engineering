@@ -428,20 +428,27 @@ class GitHubAppClient:
         self._send("POST", f"/repos/{slug}/statuses/{sha}", body=body)
 
     def merge_pr(self, repo: str, number: int, sha: str, *, method: str = "squash") -> bool:
+        return self.merge_pr_sha(repo, number, sha, method=method) is not None
+
+    def merge_pr_sha(self, repo: str, number: int, sha: str, *, method: str = "squash") -> str | None:
+        """Merge, returning the merge commit id, ``""`` when merged but GitHub gave no valid id, or None when refused."""
         slug, number, sha = _repo_path(repo), _number(number), _sha(sha)
         if method not in ("squash", "merge", "rebase"):
             raise ValueError("invalid merge method")
         try:
-            self._send(
+            data = self._send(
                 "PUT",
                 f"/repos/{slug}/pulls/{number}/merge",
                 body={"sha": sha, "merge_method": method},
             )
         except GitHubAppError as exc:
             if exc.status in (405, 409):
-                return False
+                return None
             raise
-        return True
+        try:
+            return _sha(data.get("sha")) if isinstance(data, dict) else ""
+        except ValueError:
+            return ""
 
     def update_branch(self, repo: str, number: int, expected_head_sha: str) -> None:
         slug, number, sha = _repo_path(repo), _number(number), _sha(expected_head_sha)

@@ -341,7 +341,7 @@ class EventBridge:
             cfg = pi.config(self._cfg_fn())
             if not (cfg["enabled"] and cfg["ingest"]) or cfg["kill_switch"]:
                 return "off"
-            if ev.get("entity_type") == "pr_gate":
+            if ev.get("entity_type") in ("pr_gate", "pr_gate_main"):
                 return self._fold_gate(ev)
             probe = normalise_fabric_event(ev, org_id=self._org, instance=self._instance, projects=("_",), security_label=self._label)
             if probe is None:
@@ -364,8 +364,15 @@ class EventBridge:
 
     def _fold_gate(self, ev: dict) -> str:
         """Review-gate events move an incident only when a repair run recorded this PR's URL (never by guesswork)."""
-        done = self.board.apply_gate(str(ev.get("entity_id")), event_id=str(ev.get("event_id")),
-                                     at=str(_when(ev.get("source_timestamp"))), state=str(ev.get("event_type")))
+        at, eid = str(_when(ev.get("source_timestamp"))), str(ev.get("event_id"))
+        payload = ev.get("payload") or {}
+        if ev.get("entity_type") == "pr_gate_main":
+            done = self.board.apply_main(str(ev.get("entity_id")), payload.get("sha"), event_id=eid, at=at,
+                                         state=str(ev.get("event_type")))
+        else:
+            done = self.board.apply_gate(str(ev.get("entity_id")), event_id=eid, at=at, state=str(ev.get("event_type")))
+            if done is not None and ev.get("event_type") == "merged":
+                self.board.note_merge_sha(str(ev.get("entity_id")), payload.get("merge_sha"))
         self.stats["accepted" if done is not None else "ignored"] += 1
         return "folded" if done is not None else "ignored"
 

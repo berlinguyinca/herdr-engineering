@@ -34,3 +34,21 @@ def test_commit_signatures_must_all_verify_and_end_at_head():
     assert C(commits=bad).pr_commits_verified("github.com/o/r", 1, SHA) is False
     assert C(commits=ok[:1]).pr_commits_verified("github.com/o/r", 1, SHA) is False     # does not end at head
     assert C(commits=[]).pr_commits_verified("github.com/o/r", 1, SHA) is False
+
+
+def test_merge_pr_sha_returns_the_merge_commit_or_none_when_refused():
+    from herdr_engineering.review_gate.github_app import GitHubAppError
+
+    class M(GitHubAppClient):
+        def __init__(self, result):
+            self.result = result
+
+        def _send(self, method, path, *, body=None, bearer=None):
+            if isinstance(self.result, Exception):
+                raise self.result
+            return self.result
+
+    assert M({"sha": "C" * 40, "merged": True}).merge_pr_sha("github.com/o/r", 1, SHA) == "c" * 40
+    assert M({}).merge_pr_sha("github.com/o/r", 1, SHA) == ""                  # merged, id not reported
+    assert M(GitHubAppError("not mergeable", status=405)).merge_pr_sha("github.com/o/r", 1, SHA) is None
+    assert M({"sha": "c" * 40}).merge_pr("github.com/o/r", 1, SHA) is True

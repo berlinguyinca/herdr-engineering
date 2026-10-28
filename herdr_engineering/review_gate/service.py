@@ -489,13 +489,18 @@ class GateService:
             return
         self._status(repo, sha, "success", "review gate: approved, CI green")
         try:
-            merged = self._app.merge_pr(repo, pr.number, sha)
+            detail = getattr(self._app, "merge_pr_sha", None)
+            if detail is not None:
+                merge_sha = detail(repo, pr.number, sha)
+                merged = merge_sha is not None
+            else:
+                merged, merge_sha = self._app.merge_pr(repo, pr.number, sha), None
         except Exception:
             self._back_off(key, sha, "merge failed")
             raise
         if merged:
             self._merge_backoff.pop((key, sha), None)
-            if self._store.on_merged(key, sha):
+            if self._store.on_merged(key, sha, merge_sha):
                 counts["merged"] += 1
             return
         self._back_off(key, sha, "merge refused (head moved / not mergeable)")

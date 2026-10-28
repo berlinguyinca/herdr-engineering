@@ -246,3 +246,25 @@ def test_gate_merged_event_advances_the_bound_incident():
     assert br.process(gate) == "folded"
     assert br.board.summary()[0]["state"] == "VERIFYING"
     assert br.process(dict(gate, event_id="g2", entity_id="o/r#99")) == "ignored"
+
+
+def test_main_ci_result_for_the_merge_commit_completes_or_rolls_back_the_incident():
+    from herdr_engineering.control_plane import project_intelligence as pi
+    from herdr_engineering.control_plane.intel_bridge import EventBridge
+    M = "d" * 40
+
+    def run(main_event, main_sha=M, merge_sha=M):
+        br = EventBridge(pi.IntelligenceStore(), lambda: {"enabled": True, "ingest": True}, lambda ev: ("p1",), org_id="o")
+        br.process({"event_id": "e1", "sequence": 1, "event_type": "CIFixStateChanged", "entity_type": "ci_fix", "entity_id": "f1",
+                    "source_timestamp": "2026-10-28T00:00:01Z",
+                    "payload": {"repository": "o/r", "run": 7, "state": "succeeded", "pr_url": "https://github.com/o/r/pull/12"}})
+        br.process({"event_id": "g1", "event_type": "merged", "entity_type": "pr_gate", "entity_id": "o/r#12",
+                    "source_timestamp": "2026-10-28T00:00:09Z", "payload": {"sha": "a" * 40, "merge_sha": merge_sha}})
+        r = br.process({"event_id": "m1", "event_type": main_event, "entity_type": "pr_gate_main", "entity_id": "o/r",
+                        "source_timestamp": "2026-10-28T00:01:00Z", "payload": {"sha": main_sha}})
+        return r, br.board.summary()[0]["state"]
+
+    assert run("green") == ("folded", "COMPLETED")
+    assert run("red") == ("folded", "ROLLBACK_REQUESTED")
+    assert run("green", main_sha="e" * 40) == ("ignored", "VERIFYING")      # a later commit proves nothing about this change
+    assert run("green", merge_sha="") == ("ignored", "VERIFYING")           # merge commit unknown: stays unverified

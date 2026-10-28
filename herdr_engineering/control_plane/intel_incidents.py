@@ -71,11 +71,27 @@ class IncidentBoard:
         self.policy_version = policy_version
         self.incidents: dict[str, rp.Incident] = {}
         self._pr: dict[str, tuple[str, str]] = {}      # "owner/repo#N" -> (project, source_incident)
+        self._merge: dict[tuple[str, str], str] = {}   # (repo, merge commit) -> "owner/repo#N"
 
     def bind_pr(self, pr_key: str | None, project: str, source_incident: str) -> None:
         """A repair run that opened this PR (from its recorded pr_url); only then can gate events move the incident."""
         if pr_key:
             self._pr[pr_key] = (project, source_incident)
+
+    def note_merge_sha(self, pr_key: str, merge_sha) -> None:
+        if isinstance(merge_sha, str) and merge_sha and pr_key in self._pr:
+            self._merge[(pr_key.rpartition("#")[0], merge_sha.lower())] = pr_key
+
+    def apply_main(self, repo: str, sha, *, event_id: str, at: str, state: str) -> rp.Incident | None:
+        """Main-branch CI result for a commit. Only a result for the exact merge commit of a bound PR counts:
+        main may have moved on, and a verdict on a later commit says nothing about this change."""
+        pr_key = self._merge.get((repo, str(sha).lower()))
+        if pr_key is None:
+            return None
+        target = {"green": "post_merge_verified", "red": "rollback_requested"}.get(state)
+        if target is None:
+            return None
+        return self.apply_gate(pr_key, event_id=event_id, at=at, state=target)
 
     def apply_gate(self, pr_key: str, *, event_id: str, at: str, state: str) -> rp.Incident | None:
         """A review-gate event for a PR no repair run claimed is ignored: a PR is never guessed into an incident."""
