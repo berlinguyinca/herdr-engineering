@@ -1335,6 +1335,8 @@ def _make_handler(server, public=False, operator=False):
                 return self._collab()
             if self._path_only() == _FLEET_CONFIG_PATH + "/applied":
                 return self._fleet_config_applied()
+            if self._path_only() == "/api/v1/intelligence/webhooks/github":
+                return self._intelligence_webhook()
             # The ingest route is reachable by the ingest role; every other
             # POST requires the operator role (Spec §104).
             path = self.path.split("?")[0]
@@ -1363,6 +1365,17 @@ def _make_handler(server, public=False, operator=False):
             if self.path.startswith("/api/v1/"):
                 return self._route_api()
             return self._send_json(404, {"error": "not found"})
+
+        def _intelligence_webhook(self):
+            # HMAC-authenticated (no API key); 404 while unconfigured. Body is bounded before it is read.
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                return self._deny(400, "bad length")
+            if length < 0 or length > 1_000_000:
+                return self._send_json(413, {"error": "body too large"})
+            status, body = server.intelligence.post_webhook(self.headers, self.rfile.read(length))
+            return self._send_json(status, body)
 
         def do_PATCH(self):
             # PATCH/DELETE are enabled ONLY for the assistant resource family.

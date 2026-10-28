@@ -22,6 +22,8 @@ class IntelligenceRoutes:
         """``store_fn`` builds the store lazily (only once the feature is enabled); ``store`` is for tests/embedding."""
         self._store, self._store_fn = store, store_fn
         self._section = section_fn
+        from .intel_webhook import ReplayGuard
+        self._replay = ReplayGuard()
 
     @property
     def store(self) -> pi.IntelligenceStore:
@@ -32,6 +34,61 @@ class IntelligenceRoutes:
     def _cfg(self) -> tuple[dict, dict]:
         raw = self._section() or {}
         return pi.config(raw), raw
+
+    def post_webhook(self, headers, body: bytes) -> tuple[int, dict]:
+        """``POST /api/v1/intelligence/webhooks/github``: authenticated by HMAC, not an API key.
+
+        404 unless enabled + ``ingest`` + ``webhook_secret_file`` are set. The secret is read from that file on each
+        delivery (rotation needs no restart) and is never logged. Repositories not in ``webhook_projects`` are
+        acknowledged but not stored (never guessed into a project). A delivery is marked seen only after it is stored.
+        """
+        from datetime import UTC, datetime
+
+        from . import intel_webhook as wh
+        cfg, raw = self._cfg()
+        path = raw.get("webhook_secret_file")
+        if not (cfg["enabled"] and cfg["ingest"] and isinstance(path, str) and path):
+            return 404, {"error": "not found"}
+        if cfg["kill_switch"]:
+            return 503, {"error": "ingestion is paused"}
+        try:
+            with open(path, "rb") as f:
+                secret = f.read(4096).strip()
+        except OSError:
+            return 503, {"error": "webhook secret unavailable"}
+        try:
+            wh.verify_signature(secret, body, headers.get("X-Hub-Signature-256"))
+            delivery = headers.get("X-GitHub-Delivery")
+            if self._replay.seen(delivery):
+                return 202, {"status": "duplicate"}
+            import json as _json
+            payload = _json.loads(body or b"{}")
+        except wh.WebhookRejected as exc:
+            return (413 if exc.reason == "body too large" else 401), {"error": exc.reason}
+        except ValueError:
+            return 400, {"error": "invalid json"}
+        repo = ((payload.get("repository") or {}).get("full_name") if isinstance(payload, dict) else None)
+        projects = (raw.get("webhook_projects") or {}).get(repo)
+        org = raw.get("default_org_id")
+        if not (isinstance(projects, list) and projects and all(isinstance(x, str) for x in projects) and isinstance(org, str)):
+            self._replay.mark(delivery)
+            return 202, {"status": "unmapped"}
+        event = wh.normalise(headers.get("X-GitHub-Event") or "", payload, org_id=org,
+                             installation=str(raw.get("webhook_installation") or "github"), project_ids=tuple(projects),
+                             received_at=datetime.now(UTC))
+        if event is None:
+            self._replay.mark(delivery)
+            return 202, {"status": "ignored"}
+        try:
+            _, created = self.store.append_event(event, cfg=cfg)
+        except (pi.IngestionPaused, pi.Conflict):
+            return 503, {"error": "ingestion is paused"}
+        except pi.IntelligenceError:
+            return 422, {"error": "event rejected"}
+        except pi.StoreUnavailable:
+            return 503, {"error": "store unavailable"}     # not marked: GitHub's retry must be processed
+        self._replay.mark(delivery)
+        return 202, {"status": "accepted" if created else "duplicate"}
 
     def assistant_read(self, tenant_id: str, user_id: str, payload: dict) -> dict:
         """Assistant tool entry: scope comes only from YAML ``assistant_viewers: {"<tenant>/<user>": {...}}``."""
