@@ -76,3 +76,11 @@ Deferred from the PR 1 note: `origin_port` on leases is still open.
 ## PR 3 / PR 4 status
 PR 3 merged: same-port HTTPS + name-constrained private CA. PR 4: `fabric_access.AccessPolicy` (tailscaled
 LocalAPI whois, user/tag allow-list, fail closed, loopback trusted) enforced in the router before TLS/HTTP.
+
+## PR 5 status (streaming, terminal hyperlinks)
+`renderMarkdown(..., {openEnd})` renders the URL touching the end of a still-streaming message as written, and
+`candidateUrls(..., {openEnd})` keeps it out of the batch, so a prefix such as `http://localhost:31` is never
+resolved or shown as "unreachable"; the session workspace re-renders 2.5 s after the last event so the complete URL
+resolves. OSC 8 terminal hyperlinks in message text become ordinary links (same safety checks and resolution); other
+escape sequences are stripped for display. Raw tool output, commands and code spans/fences are never touched.
+There is no terminal emulator in the dashboard (the attach flow copies a command), so no further terminal renderer exists.
