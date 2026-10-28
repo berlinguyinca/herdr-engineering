@@ -114,12 +114,16 @@ function modelsTable(models) {
     'No requests recorded in this window.');
 }
 
+const AGENTS_SHOWN = 10;
 function agentsTable(agents, names) {
-  return table(['Agent', 'Source', 'Requests', 'Output tokens', 'Speed p50', 'Errors', 'Last seen'],
-    list(agents?.groups).map((g) => [link(g.key, names, llmSessionHref), esc(sourceLabel(g)), esc(reqs(g)),
-      esc(`${g.tokens?.lower_bound ? '≥ ' : ''}${compact(g.tokens?.output)}`), esc(single(g.speed_tps, rate)),
-      esc(count(g.errors)), esc(when(g.last_seen))]),
-    'No request carried a session id in this window.');
+  const rows = list(agents?.groups).map((g) => [link(g.key, names, llmSessionHref), esc(sourceLabel(g)), esc(reqs(g)),
+    esc(`${g.tokens?.lower_bound ? '≥ ' : ''}${compact(g.tokens?.output)}`), esc(single(g.speed_tps, rate)),
+    esc(count(g.errors)), esc(when(g.last_seen))]);
+  const head = ['Agent', 'Source', 'Requests', 'Output tokens', 'Speed p50', 'Errors', 'Last seen'];
+  const none = 'No request carried a session id in this window.';
+  if (rows.length <= AGENTS_SHOWN + 2) return table(head, rows, none);
+  // Long lists hide behind the busiest few: the rest is one click away, in the same order.
+  return `${table(head, rows.slice(0, AGENTS_SHOWN), none)}<details class="llm-more"><summary>Show all ${rows.length} agents (${rows.length - AGENTS_SHOWN} more)</summary>${table(head, rows.slice(AGENTS_SHOWN), none)}</details>`;
 }
 
 function problemsTable(problems, names) {
@@ -218,7 +222,7 @@ export const llmStyles = `<style>
 .llm-charts{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px;margin:16px 0}.llm-card{min-width:0;border:1px solid var(--border);border-radius:var(--radius);background:var(--surface);padding:6px 14px 12px}.llm-card h2{font-size:14px;margin:10px 0 4px}.llm-card svg{display:block;width:100%;max-height:210px}.llm-card svg text{font-size:11px;fill:var(--text-secondary);font-family:inherit}.llm-card svg line{stroke:var(--border)}
 .llm-legend{display:flex;flex-wrap:wrap;gap:12px;font-size:11px;color:var(--text-secondary)}.llm-legend span::before{content:'';display:inline-block;width:9px;height:9px;margin-right:5px;background:var(--c);border-radius:2px}
 .llm-note{font-size:12px;line-height:1.6;color:var(--text-secondary);margin:6px 0}.llm-table{overflow:auto}.llm-table table{border-collapse:collapse;width:100%;font-size:13px}.llm-table th,.llm-table td{padding:7px 8px;text-align:left;border-bottom:1px solid var(--border-subtle);overflow-wrap:anywhere}.llm-table th{color:var(--text-secondary);font-weight:500}
-.llm-badge{font-size:11px;font-weight:500;padding:2px 8px;border:1px solid var(--border);border-radius:99px;color:var(--text-secondary);vertical-align:middle}.llm-back{font-size:13px}.llm-data{font-size:12px;margin:8px 0 16px}.llm-data>summary{cursor:pointer}.llm-section h2{font-size:15px;margin:22px 0 6px}
+.llm-badge{font-size:11px;font-weight:500;padding:2px 8px;border:1px solid var(--border);border-radius:99px;color:var(--text-secondary);vertical-align:middle}.llm-back{font-size:13px}.llm-data{font-size:12px;margin:8px 0 16px}.llm-data>summary{cursor:pointer}.llm-more>summary{cursor:pointer;padding:8px 0;color:var(--accent);font-size:13px}.llm-section h2{font-size:15px;margin:22px 0 6px}
 @media(max-width:650px){.llm-tiles{grid-template-columns:repeat(2,minmax(0,1fr))}.llm-charts{grid-template-columns:minmax(0,1fr)}}
 </style>`;
 
