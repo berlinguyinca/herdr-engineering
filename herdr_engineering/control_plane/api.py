@@ -2655,15 +2655,12 @@ def _make_handler(server, public=False, operator=False):
 
         # ------------------------------------------------------------ assistant
         # Herdr Personal Assistant (P1/P2). Canonical owner: server.assistant.
-        # All routes are additionally scoped by tenant_id + user_id so assistant
-        # data is isolated per user/tenant (acceptance A3, A4). The operating
-        # user defaults to the authenticated API-key principal and may be
-        # overridden for multi-user testing via X-Herdr-User / X-Herdr-Tenant.
+        # Assistant ownership follows the server-authenticated API-key principal.
+        # Legacy open listeners share one operator identity; neither that identity
+        # nor client-supplied identity headers establish human approval authority.
+        # Collaboration Bearer/Agent authentication belongs to its own dispatch.
         def _assistant_scope(self):
-            principal = self._principal()
-            uid = self.headers.get("X-Herdr-User") or principal.get("id") or "default-user"
-            tenant = self.headers.get("X-Herdr-Tenant") or "default"
-            return tenant, uid
+            return "default", self._principal()["id"]
 
         def _assistant_get(self, parts, resource):
             from .assistant import AssistantNotFound, AssistantUnavailable, RateLimited

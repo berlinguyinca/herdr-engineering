@@ -1019,6 +1019,7 @@ class AssistantStore:
                 "connectors": [self._e_to_dict(c) for c in self.connectors.values()],
                 "delegations": [self._e_to_dict(d) for d in self.delegations.values()],
                 "routine_fired": sorted(self._routine_fired),
+                "audit": list(self.audit),
             }
 
     def restore(self, snap: dict[str, Any]) -> None:
@@ -1046,6 +1047,7 @@ class AssistantStore:
             self.delegations = {d.delegation_id: d for d in
                                 (self._e_from_dict(DelegationRequest, d) for d in snap.get("delegations", []))}
             self._routine_fired = set(snap.get("routine_fired", []))
+            self.audit = list(snap.get("audit", []))
 
     def persist(self) -> None:
         if not self._persist_path:
@@ -1080,6 +1082,7 @@ class AssistantStore:
                 "subject_id": subject_id,
                 "detail": redact_secrets(detail),
             })
+            self._after_mutation()
 
     # -- assistants ----------------------------------------------------------
     def put_assistant(self, a: Assistant) -> None:
@@ -1558,6 +1561,7 @@ class AssistantService:
         grant.revoked_at = self.now()
         self.store.audit_record(tenant_id=tenant_id, user_id=user_id, actor=user_id,
                                 action="assistant.grant.revoked", subject_id=grant_id)
+        self.store.put_grant(grant)
 
     def _find_grant(self, grant_id: str, *, tenant_id: str, user_id: str) -> AssistantGrant:
         grant = self.store.grants.get(grant_id)
@@ -1601,15 +1605,41 @@ class AssistantService:
         request_hash = hashlib.sha256(
             f"{tool_id}\n{scope}\n{request_payload!r}".encode()).hexdigest()
 
-        # idempotency: reuse an existing action with the same key + hash
+        grant = self._active_grant(assistant_id=assistant_id, tool_id=tool_id,
+                                   scope=scope, tenant_id=tenant_id, user_id=user_id)
+
+        # Reuse identity, but never reuse stale authorization.
         for existing in self.store.actions.values():
             if (existing.idempotency_key == idempotency_key
                     and existing.request_hash == request_hash
                     and existing.run_id == run_id):
+                if grant is None:
+                    existing.status = "denied"
+                    self.store.put_action(existing)
+                    self.store.audit_record(
+                        tenant_id=tenant_id, user_id=user_id, actor=actor,
+                        action="assistant.tool.denied", subject_id=existing.action_id,
+                        detail=f"{tool_id} {scope}: no grant")
+                    return existing
+                if existing.status == "denied":
+                    return existing
+                if existing.approval_id:
+                    approval = self.store.approvals.get(existing.approval_id)
+                    if (approval is None or approval.action_id != existing.action_id
+                            or approval.tenant_id != tenant_id or approval.user_id != user_id
+                            or approval.assistant_id != assistant_id
+                            or approval.expires_at <= self.now()
+                            or approval.decision not in ("pending", "approved")):
+                        existing.status = "denied"
+                        self.store.put_action(existing)
+                    elif approval.decision == "pending":
+                        raise ApprovalRequired(approval.approval_id)
+                elif (tool_sensitive(tool_id)
+                      and not (grant.constraints or {}).get("preauthorized")):
+                    existing.status = "denied"
+                    self.store.put_action(existing)
                 return existing
 
-        grant = self._active_grant(assistant_id=assistant_id, tool_id=tool_id,
-                                   scope=scope, tenant_id=tenant_id, user_id=user_id)
         action = AssistantAction(
             action_id=_new_id("act"), run_id=run_id, tool_id=tool_id, scope=scope,
             request_hash=request_hash, idempotency_key=idempotency_key,
@@ -1654,7 +1684,7 @@ class AssistantService:
         for g in self.store.list_grants(tenant_id=tenant_id, user_id=user_id,
                                         assistant_id=assistant_id):
             if (g.tool_id == tool_id and g.active(now)
-                    and (scope == "*" or g.scope == "*" or g.scope == scope)):
+                    and (g.scope == "*" or g.scope == scope)):
                 return g
         return None
 
@@ -2149,11 +2179,36 @@ class AssistantService:
     def _execute_gated(self, run: AssistantRun, tool_id: str, args: dict[str, Any],
                        max_result_chars: int) -> str:
         """Gate (grants + fail-closed approvals) then execute one model-requested
-        tool call, returning a bounded, redacted string result for the model."""
+        tool call, returning a bounded, redacted string result for the model.
+
+        Authorization is checked at call start. Revocation does not cancel an
+        executor already in flight; no store lock is held across external I/O.
+        """
         if tool_id not in TOOL_CATALOG:
             return "[unknown tool]"
-        scope = str(args.get("scope") or args.get("url") or args.get("command")
-                    or args.get("record") or args.get("connector_id") or tool_id)[:200]
+        # Bind authorization to the value dispatched to the executor, never to
+        # a model-supplied scope claim. Keep the full target for exact matching.
+        args = dict(args)
+        if tool_id in ("read_memory", "write_memory"):
+            try:
+                scope = self._memory_namespace(args)
+            except AssistantError as exc:
+                self.store.audit_record(
+                    tenant_id=run.tenant_id, user_id=run.user_id, actor=run.user_id,
+                    action="assistant.tool.denied", subject_id=run.run_id,
+                    detail=f"{tool_id}: {exc}")
+                return f"[denied: {exc}]"
+            args["namespace"] = scope
+        else:
+            target_field = {
+                "browse": "url", "run_shell": "command",
+                "connector_request": "connector_id", "delegate": "target_system",
+                "send_message": "to", "edit_shared": "record",
+            }.get(tool_id)
+            scope = (args.get(target_field, "pi" if tool_id == "delegate" else "")
+                     if target_field else tool_id)
+            if not isinstance(scope, str):
+                return "[denied: tool target must be a string]"
         idem = hashlib.sha256(
             f"{run.run_id}|{tool_id}|{sorted(args.items())!r}".encode()).hexdigest()[:24]
         try:
@@ -2165,8 +2220,8 @@ class AssistantService:
             return f"[operator approval required: {ar.approval_id}]"
         except AssistantError as exc:
             return f"[tool gate error: {exc}]"
-        if action.status == "denied":
-            return "[denied: no active grant for this tool]"
+        if action.status not in ("authorized", "approved"):
+            return "[denied: tool action is not authorized]"
         try:
             out = self.execute_tool(tenant_id=run.tenant_id, user_id=run.user_id,
                                     assistant_id=run.assistant_id, tool_id=tool_id,
@@ -2210,6 +2265,18 @@ class AssistantService:
                              "name": c.get("name", ""), "content": result})
         return "(stopped: tool-call iteration limit reached)"
 
+    @staticmethod
+    def _memory_namespace(payload: dict[str, Any]) -> str:
+        """Resolve exactly one namespace for both authorization and execution."""
+        namespace = payload.get("namespace", "private")
+        if isinstance(namespace, (list, tuple, set)):
+            if len(namespace) != 1:
+                raise AssistantError("exactly one memory namespace is required")
+            namespace = next(iter(namespace))
+        if not isinstance(namespace, str) or not namespace:
+            raise AssistantError("memory namespace must be a nonempty string")
+        return namespace
+
     def execute_tool(self, *, tenant_id: str, user_id: str, assistant_id: str,
                      tool_id: str, payload: dict[str, Any],
                      actor: str = "") -> dict[str, Any]:
@@ -2226,10 +2293,8 @@ class AssistantService:
         if tool_id == "read_memory":
             recs = self.store.search_memory(tenant_id=tenant_id, user_id=user_id,
                                             assistant_id=assistant_id, query="", limit=50)
-            ns = payload.get("namespace")
-            if ns:
-                wanted = set(ns) if isinstance(ns, (list, tuple, set)) else {str(ns)}
-                recs = [m for m in recs if m.namespace in wanted]
+            namespace = self._memory_namespace(payload)
+            recs = [m for m in recs if m.namespace == namespace]
             if not recs:
                 return {"context": "no memories"}
             return {"context": "\n".join(
@@ -2238,7 +2303,7 @@ class AssistantService:
             memo = self.store_memory(
                 tenant_id=tenant_id, user_id=user_id, assistant_id=assistant_id,
                 content=payload.get("content", ""),
-                namespace=payload.get("namespace", "private"),
+                namespace=self._memory_namespace(payload),
                 classification=payload.get("classification", "general"))
             return {"ok": True, "memory": memo.as_dict()}
         if tool_id == "run_shell":

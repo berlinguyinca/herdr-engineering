@@ -4,6 +4,7 @@ Uses the same live-server Client pattern as the rest of tests/control_plane.
 The assistant feature is enabled in these tests via an injected service so the
 routes are exercised; the default (flag off) path is covered by the 503 test.
 """
+import hashlib
 import json
 import threading
 import urllib.error
@@ -48,7 +49,8 @@ def server(acknowledged_sink):
     cfg = assistant_config({"personal_assistant": {"enabled": True}})
     assistant = AssistantService(config=cfg)
     repo = ControlPlaneRepo(sink=acknowledged_sink)
-    svr = ControlPlaneServer(repo, assistant_service=assistant)
+    svr = ControlPlaneServer(repo, assistant_service=assistant,
+                             api_keys={key: "operator" for key in _KEYS.values()})
     thread = threading.Thread(target=svr.serve, daemon=True)
     thread.start()
     svr.wait_until_ready()
@@ -56,8 +58,11 @@ def server(acknowledged_sink):
     svr.shutdown()
 
 
-def _uid(user="u1", tenant="t1"):
-    return {"X-Herdr-User": user, "X-Herdr-Tenant": tenant}
+_KEYS = {"u1": "assistant-test-victim-key", "u2": "assistant-test-attacker-key"}
+
+
+def _uid(user="u1"):
+    return {"X-API-Key": _KEYS[user]}
 
 
 def test_disabled_feature_returns_503():
@@ -83,7 +88,7 @@ def test_assistant_config_kwarg_builds_enabled_assistant():
 
 
 def test_enabled_capability_advertised(server):
-    status, body = server.get("/api/v1/health")
+    status, body = server.get("/api/v1/health", headers=_uid())
     assert status == 200
     caps = json.loads(body).get("capabilities", [])
     assert "assistant_v1" in caps
@@ -114,6 +119,49 @@ def test_cross_user_assistant_404(server):
     aid = json.loads(body)["assistant_id"]
     status, _ = server.get(f"/api/v1/assistants/{aid}", headers=_uid("u2"))
     assert status == 404
+
+
+@pytest.mark.parametrize("tenant", ["default", "victim-tenant"])
+def test_identity_headers_cannot_read_or_change_another_key_scope(server, tenant):
+    victim = _uid("u1")
+    victim_id = "key:" + hashlib.sha256(_KEYS["u1"].encode()).hexdigest()[:12]
+    claimed = {"X-Herdr-User": victim_id, "X-Herdr-Tenant": tenant}
+    status, body = server.post("/api/v1/assistants", {"name": "Victim"},
+                               headers={**victim, **claimed})
+    assert status == 201
+    aid = json.loads(body)["assistant_id"]
+    status, body = server.post(f"/api/v1/assistants/{aid}/memory",
+                               {"content": "private memory"}, headers={**victim, **claimed})
+    assert status == 201
+    mid = json.loads(body)["memory_id"]
+    attacker = {**_uid("u2"), **claimed}
+    assert server.get(f"/api/v1/assistants/{aid}", headers=attacker)[0] == 404
+    status, body = server.get("/api/v1/assistants", headers=attacker)
+    assert status == 200
+    assert json.loads(body)["assistants"] == []
+    assert server.request(f"/api/v1/assistants/{aid}", {"name": "Stolen"},
+                          method="PATCH", headers=attacker)[0] == 404
+    status, body = server.get(f"/api/v1/assistants/{aid}/memory", headers=attacker)
+    assert status == 200
+    assert json.loads(body)["memory"] == []
+    assert server.request(f"/api/v1/assistant-memory/{mid}", {"content": "changed"},
+                          method="PATCH", headers=attacker)[0] == 404
+    assert server.delete(f"/api/v1/assistant-memory/{mid}", headers=attacker)[0] == 404
+    assert server.delete(f"/api/v1/assistants/{aid}", headers=attacker)[0] == 404
+    status, body = server.get(f"/api/v1/assistants/{aid}", headers=victim)
+    assert status == 200
+    assert json.loads(body)["name"] == "Victim"
+    assert json.loads(body)["enabled"] is True
+    status, body = server.get(f"/api/v1/assistants/{aid}/memory", headers=victim)
+    assert status == 200
+    assert json.loads(body)["memory"][0]["content"] == "private memory"
+
+
+@pytest.mark.parametrize("scheme", ["Bearer", "Agent"])
+def test_collaboration_credentials_do_not_authenticate_assistant_routes(server, scheme):
+    headers = {"Authorization": f"{scheme} unverified-token",
+               "X-Herdr-User": "victim", "X-Herdr-Tenant": "victim-tenant"}
+    assert server.get("/api/v1/assistants", headers=headers)[0] == 401
 
 
 def test_update_and_archive_assistant(server):
@@ -304,7 +352,8 @@ def test_rate_limit_returns_429():
                                                    "max_requests_per_minute": 2}})
     assistant = AssistantService(config=cfg)
     repo = ControlPlaneRepo()
-    svr = ControlPlaneServer(repo, assistant_service=assistant)
+    svr = ControlPlaneServer(repo, assistant_service=assistant,
+                             api_keys={key: "operator" for key in _KEYS.values()})
     t = threading.Thread(target=svr.serve, daemon=True); t.start(); svr.wait_ready() if hasattr(svr, 'wait_ready') else svr.wait_until_ready()
     c = Client(svr.port)
     try:
@@ -492,7 +541,7 @@ def test_tool_loop_sensitive_tool_requires_approval_not_executed():
     a = svc.create_assistant(tenant_id="t1", user_id="u1", name="A")
     # grant delegate but NOT preauthorized -> sensitive -> approval required
     svc.grant_tool(tenant_id="t1", user_id="u1", assistant_id=a.assistant_id,
-                   tool_id="delegate", scope="delegate")
+                   tool_id="delegate", scope="pi")
     th = svc.create_thread(tenant_id="t1", user_id="u1", assistant_id=a.assistant_id)
     svc.send_message(tenant_id="t1", user_id="u1", assistant_id=a.assistant_id,
                      thread_id=th.thread_id, content="ship it")
@@ -536,3 +585,24 @@ def test_tool_loop_executes_read_memory_executor():
     tool_msg = [m for m in runner.seen[1]["messages"] if m.get("role") == "tool"][0]
     assert "ZQ-SECRET123" in tool_msg["content"]
     assert "no executor" not in tool_msg["content"]
+
+
+def test_open_listener_identity_headers_share_one_operator_scope():
+    service = AssistantService(config=assistant_config({"personal_assistant": {"enabled": True}}))
+    svr = ControlPlaneServer(ControlPlaneRepo(), assistant_service=service)
+    thread = threading.Thread(target=svr.serve, daemon=True)
+    thread.start()
+    svr.wait_until_ready()
+    client = Client(svr.port)
+    try:
+        status, body = client.post("/api/v1/assistants", {"name": "Open operator"},
+                                   headers={"X-Herdr-User": "one", "X-Herdr-Tenant": "one"})
+        assert status == 201
+        aid = json.loads(body)["assistant_id"]
+        status, body = client.get(f"/api/v1/assistants/{aid}",
+                                  headers={"X-Herdr-User": "two", "X-Herdr-Tenant": "two"})
+        assert status == 200
+        assert json.loads(body)["user_id"] == "open-listener"
+        assert json.loads(body)["tenant_id"] == "default"
+    finally:
+        svr.shutdown()
