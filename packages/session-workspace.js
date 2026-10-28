@@ -55,6 +55,7 @@ export function mountSessionWorkspace(host,client,session,{connect=connectEvents
   const state={agent:'',q:'',type:'',errors:false};
   host.innerHTML=`<section class="sw" data-session-workspace>
     <header class="sw-workspace-heading"><strong data-agent-name>${esc(session.display_name || session.agent_role || 'Agent')}</strong><button type="button" data-rename-agent${session.capabilities?.rename_agent?'':' hidden'}>Rename agent</button><a class="sw-llm-link" data-llm-link href="#/llm/session/${esc(encodeURIComponent(session.session_id))}">LLM usage</a><button type="button" data-fullscreen aria-expanded="false">Fullscreen workspace</button></header>
+    ${session.name_error?`<p class="sw-status" data-agent-name-error role="status">${esc(session.name_error)}</p>`:''}
     <form data-rename-form hidden><label>Agent name <input aria-label="Agent name" name="agent_name" maxlength="64" required></label><button type="submit">Save name</button><button type="button" data-cancel-rename>Cancel</button><p data-rename-status role="status"></p></form>
     <section class="sw-summary-card" aria-label="Agent summary"><div class="sw-summary-heading"><h3>AI-generated summary</h3><button type="button" data-regenerate-summary${session.capabilities?.regenerate_summary?'':' hidden'}>Regenerate summary</button></div><div data-agent-summary role="status">${skeleton('summary',{rows:2,height:18,inStatus:true})}</div></section>
     <div class="sw-status" data-recording-status role="status">${skeleton('recorded conversation',{rows:1,height:16,inStatus:true})}</div>
@@ -235,6 +236,7 @@ export function mountSessionWorkspace(host,client,session,{connect=connectEvents
     try{
       const profile=await client.renameAgent(session.session_id,renameInput.value,session.name_version);
       if(disposed)return;session.display_name=profile.display_name;session.agent_handle=profile.handle;session.name_version=profile.version;
+      delete session.name_error;$('[data-agent-name-error]')?.remove();
       $('[data-agent-name]').textContent=profile.display_name;renameForm.hidden=true;$('[data-rename-agent]').focus();onRename(profile);paint();
     }catch(err){if(!disposed){renameStatus.setAttribute('role','alert');renameStatus.textContent=err.status===409?`Name could not be saved: ${err.message}. Choose another name or refresh to load the latest name.`:`Name could not be saved: ${err.message}`;}}
     finally{submit.disabled=false;}
