@@ -67,9 +67,19 @@ preserved while authority-grant expectations are replaced with denial checks.
 - Fleet reporting/probe regression: 55 passed in 22.90s. Whole CI API file:
   96 passed in 48.64s while investigating a broader-run failure.
 - All 26 changed Python files pass Ruff; `git diff --check` passes.
-- The full 4,960-test control-plane/fleet/domain run remains in progress and has
-  reported a CI-range failure. Do not treat the broad suite as passing.
-  Repository-wide Ruff also has pre-existing findings outside this increment.
+- Broad control-plane/fleet/domain run: **4,945 passed, 12 skipped, two expected
+  failures, one deselected, one failed** in 1,116.64s. The failure is
+  `test_ci_api.py::test_history_is_viewer_readable_flat_and_memory_only`:
+  `coverage['17']['exhausted']` was false during background head revalidation.
+  The case and all 96 CI API tests passed separately. A deterministic Events
+  barrier reproduced the race, then a bounded completion wait corrected the
+  test while preserving every original assertion. The corrected CI API file
+  passed **96 tests in 50.07s**; the broad suite must still be rerun.
+  The final snapshot/suppression deltas are covered by the fresh targeted run,
+  rather than claiming that the earlier-started broad run included them.
+- Scheduling preview Playwright regression passed: edited inputs survive refresh
+  and progress/errors remain visible. Repository-wide Ruff still has baseline
+  findings outside the scoped component; all modified Python files pass.
 
 ## Remaining acceptance and rollback
 
