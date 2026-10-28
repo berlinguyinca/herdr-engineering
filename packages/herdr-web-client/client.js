@@ -601,4 +601,19 @@ export class HerdrClient {
   assistantDiagnostics(assistantId, { signal } = {}) {
     return this.request(`/api/v1/assistants/${encodeURIComponent(assistantId)}/diagnostics`, { signal });
   }
+  listRoutines({ signal } = {}) {
+    return this.request('/api/v1/assistant-routines', { signal });
+  }
+  createRoutine(body, { signal } = {}) {
+    return this.request('/api/v1/assistant-routines', { method: 'POST', body, signal });
+  }
+  triggerRoutine(routineId) {
+    return this.request(`/api/v1/assistant-routines/${encodeURIComponent(routineId)}/trigger`, { method: 'POST', body: {} });
+  }
+  archiveRoutine(routineId) {
+    return this.request(`/api/v1/assistant-routines/${encodeURIComponent(routineId)}`, { method: 'DELETE' });
+  }
+  correctMemory(memoryId, content) {
+    return this.request(`/api/v1/assistant-memory/${encodeURIComponent(memoryId)}`, { method: 'PATCH', body: { content } });
+  }
 }

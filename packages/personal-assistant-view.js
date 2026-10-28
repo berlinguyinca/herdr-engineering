@@ -56,7 +56,7 @@ export function mountPersonalAssistant(container, client) {
                   <span class="pa-badge">${selected.enabled ? 'enabled' : 'disabled'}</span>
                 </div>
                 <div class="pa-tabs">
-                  ${['General', 'Permissions', 'Memory', 'Approvals', 'Diagnostics'].map(t =>
+                  ${['General', 'Permissions', 'Memory', 'Routines', 'Approvals', 'Diagnostics'].map(t =>
                     `<button class="pa-tab ${state.tab === t ? 'pa-tab--active' : ''}" data-tab="${t}">${t}</button>`).join('')}
                 </div>
                 <div id="pa-panel">${renderPanel(selected)}</div>
@@ -89,6 +89,7 @@ export function mountPersonalAssistant(container, client) {
     if (state.tab === 'General') return renderGeneral(a);
     if (state.tab === 'Permissions') return '<div id="pa-perms"><herdr-spinner label="Loading permissions"></herdr-spinner></div>';
     if (state.tab === 'Memory') return '<div id="pa-memory"><herdr-spinner label="Loading memory"></herdr-spinner></div>';
+    if (state.tab === 'Routines') return '<div id="pa-routines"><herdr-spinner label="Loading routines"></herdr-spinner></div>';
     if (state.tab === 'Approvals') return '<div id="pa-approvals"><herdr-spinner label="Loading approvals"></herdr-spinner></div>';
     return '<div id="pa-diagnostics"><herdr-spinner label="Loading diagnostics"></herdr-spinner></div>';
   };
@@ -133,6 +134,8 @@ export function mountPersonalAssistant(container, client) {
     if (perms) loadPerms(perms, a);
     const memory = panel.querySelector('#pa-memory');
     if (memory) loadMemory(memory, a);
+    const routines = panel.querySelector('#pa-routines');
+    if (routines) loadRoutines(routines, a);
     const approvals = panel.querySelector('#pa-approvals');
     if (approvals) loadApprovals(approvals, a);
     const diag = panel.querySelector('#pa-diagnostics');
@@ -198,6 +201,38 @@ export function mountPersonalAssistant(container, client) {
     resultsEl.querySelectorAll('[data-mforget]').forEach(btn => btn.addEventListener('click', async () => {
       await client.forgetMemory(btn.dataset.mforget); await loadMemory(el, a);
     }));
+  };
+
+  const loadRoutines = async (el, a) => {
+    try {
+      const { routines = [] } = await client.listRoutines();
+      const mine = routines.filter(r => r.assistant_id === a.assistant_id);
+      el.innerHTML = `
+        <div class="pa-row">
+          <input data-rname placeholder="Routine name" style="flex:1">
+          <select data-rtype><option value="interval">Interval</option><option value="daily">Daily</option></select>
+          <input data-rspec placeholder='{"every":"hours","amount":1}' style="flex:1">
+          <input data-rtz placeholder="Timezone" value="UTC" style="width:110px">
+          <input data-rquiet placeholder="Quiet 22:00-07:00" style="width:150px">
+          <button class="hd-btn hd-btn--sm" data-rcreate>Create</button>
+        </div>
+        <div style="margin-top:8px">${mine.length ? mine.map(r => `
+          <div class="pa-msg pa-msg--meta">
+            <strong>${esc(r.name)}</strong> · ${esc(r.trigger_type)} · ${esc(r.timezone)}
+            · next ${esc(r.next_at || '—')} · ${esc(r.last_result || 'never run')}
+            ${r.enabled ? `<button class="hd-btn hd-btn--sm" data-rtrigger="${esc(r.routine_id)}">Run</button>` : ''}
+            <button class="hd-btn hd-btn--danger hd-btn--sm" data-rarchive="${esc(r.routine_id)}">Archive</button>
+          </div>`).join('') : '<div class="pa-muted">No routines yet.</div>'}</div>`;
+      el.querySelector('[data-rcreate]').addEventListener('click', async () => {
+        let spec = {}; try { spec = JSON.parse(el.querySelector('[data-rspec]').value || '{}'); } catch { /* ignore */ }
+        let quiet = null; const q = el.querySelector('[data-rquiet]').value;
+        if (q) { const [start, end] = q.split('-'); quiet = { start: start.trim(), end: end.trim() }; }
+        await client.createRoutine({ assistant_id: a.assistant_id, name: el.querySelector('[data-rname]').value || 'Routine', trigger_type: el.querySelector('[data-rtype]').value, trigger_spec: spec, timezone: el.querySelector('[data-rtz]').value || 'UTC', quiet_hours: quiet });
+        await loadRoutines(el, a);
+      });
+      el.querySelectorAll('[data-rtrigger]').forEach(b => b.addEventListener('click', async () => { await client.triggerRoutine(b.dataset.rtrigger); await loadRoutines(el, a); }));
+      el.querySelectorAll('[data-rarchive]').forEach(b => b.addEventListener('click', async () => { await client.archiveRoutine(b.dataset.rarchive); await loadRoutines(el, a); }));
+    } catch (error) { el.innerHTML = `<herdr-error message="${esc(error.message)}"></herdr-error>`; }
   };
 
   const loadApprovals = async (el, a) => {

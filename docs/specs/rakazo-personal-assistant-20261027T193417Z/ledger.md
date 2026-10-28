@@ -3,6 +3,33 @@
 Living record of decisions, modified files, test output, failures, remaining
 risks and rollback notes. Updated each phase.
 
+## 2026-10-27 — P3 durable routines, approvals and memory
+
+### What was added
+- `AssistantRoutine` entity + store support (`routines`, `routine_fired` dedupe set).
+- Routine domain methods: `create/list/get/update/archive_routine`, `due_routines`,
+  `trigger` (idempotent per schedule bucket), `_compute_next` (timezone via
+  `zoneinfo`, DST-aware; quiet-hours [start,end) with wrap-past-midnight;
+  `interval` and `daily` trigger types). No new daemon: `due_routines` is polled
+  by the control plane (or a later phase wires the existing scheduler).
+- `correct_memory` (bump revision + provenance; future retrieval uses new revision).
+- API: `/api/v1/assistant-routines` GET/POST/PATCH/DELETE + trigger; memory PATCH.
+- Frontend: Routines tab (create interval/daily routine, timezone, quiet hours,
+  run/archive); memory correction via PATCH.
+- Tests: +2 unit (routines), +2 contract, +4 client (routines + memory correction).
+
+### Test output
+```
+python -m pytest tests/control_plane/test_assistant_service.py tests/control_plane/test_assistant_api.py -q
+# => 49 passed (was 38)
+node --test packages/herdr-web-client/*.test.js
+# => 255 passed (was 251)
+ruff check ... assistant.py api.py tests/...
+# => All checks passed
+```
+Regression: core control-plane tests still pass (97 backend incl. assistant).
+UI re-rendered at 1280/375 with the Routines tab; DOM dump confirms it.
+
 ## 2026-10-27 — P0 audit + P1 domain/authorization + P2 settings/chat MVP
 
 ### Decisions taken (see `audit/adr-*.md`)

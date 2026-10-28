@@ -7,7 +7,7 @@ Dependency order per `08-phased-plan.md`. Status as of **2026-10-27**.
 | **P0** | Audit and decisions | ✅ **Done** | `audit/current-state.md`, `audit/adr-0001..0003` |
 | **P1** | Domain and authorization | ✅ **Done (this slice)** | `assistant.py`; `test_assistant_service.py` (27 passed) |
 | **P2** | Native settings and chat MVP | ✅ **Done (this slice)** | API routes + `personal-assistant-view.js`; `test_assistant_api.py` (11 passed) + client tests (5); screenshots 1280/375 |
-| **P3** | Durable routines, approvals and memory | ⏳ **Not implemented** | Requires scheduler wiring, real InferWeave runner, durable memory backend |
+| **P3** | Durable routines, approvals and memory | ✅ **Done (routines + memory correction)** | `assistant.py` routines (timezone/quiet-hours/idempotent trigger), `correct_memory`, `/api/v1/assistant-routines` routes, Routines tab; +2 unit +2 contract +4 client tests. Real InferWeave runner + durable memory backend still deferred to a later phase. |
 | **P4** | Connectors / computer tools / delegation | ⏳ **Not implemented** | Requires MCP/OpenAPI adapters, sandbox policy, Pi-mission handoff |
 | **P5** | Voice and mobile | ⏳ **Not implemented** | Responsive UI done; transcription, native client deferred |
 | **P6** | Production hardening | ⏳ **Not implemented** | Load/failover, observability, backup/restore, runbook |

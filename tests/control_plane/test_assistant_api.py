@@ -217,6 +217,40 @@ def test_patch_delete_restricted_to_assistant_resources(server):
     assert status == 200
 
 
+def test_routines_crud_and_trigger(server):
+    _, body = server.post("/api/v1/assistants", {"name": "Helper"}, headers=_uid())
+    aid = json.loads(body)["assistant_id"]
+    status, body = server.post("/api/v1/assistant-routines",
+                               {"assistant_id": aid, "name": "Briefing",
+                                "trigger_type": "interval",
+                                "trigger_spec": {"every": "hours", "amount": 1},
+                                "timezone": "UTC"}, headers=_uid())
+    assert status == 201
+    rid = json.loads(body)["routine_id"]
+    status, body = server.get("/api/v1/assistant-routines", headers=_uid())
+    assert any(r["routine_id"] == rid for r in json.loads(body)["routines"])
+    # trigger it (force next_at into the past is not needed; trigger is idempotent)
+    status, body = server.post(f"/api/v1/assistant-routines/{rid}/trigger", {}, headers=_uid())
+    assert status == 200
+    # archive (DELETE)
+    status, _ = server.delete(f"/api/v1/assistant-routines/{rid}", headers=_uid())
+    assert status == 200
+    status, body = server.get(f"/api/v1/assistant-routines/{rid}", headers=_uid())
+    assert json.loads(body)["enabled"] is False
+
+
+def test_memory_correction_via_api(server):
+    _, body = server.post("/api/v1/assistants", {"name": "Helper"}, headers=_uid())
+    aid = json.loads(body)["assistant_id"]
+    _, body = server.post(f"/api/v1/assistants/{aid}/memory",
+                          {"content": "User likes coffee"}, headers=_uid())
+    mid = json.loads(body)["memory_id"]
+    status, body = server.request(f"/api/v1/assistant-memory/{mid}",
+                                  {"content": "User prefers tea"}, method="PATCH", headers=_uid())
+    assert status == 200
+    assert json.loads(body)["content"] == "User prefers tea"
+
+
 def test_diagnostics(server):
     _, body = server.post("/api/v1/assistants", {"name": "Helper"}, headers=_uid())
     aid = json.loads(body)["assistant_id"]

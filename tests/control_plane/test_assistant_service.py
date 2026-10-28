@@ -11,7 +11,7 @@ Covers the blocking security/privacy controls from the spec bundle
 - idempotency of tool actions
 - memory delete / export propagation
 """
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from unittest.mock import patch
 
 import pytest
@@ -378,3 +378,118 @@ def test_diagnostics():
     assert d["assistant_id"] == a.assistant_id
     assert d["runner"] == "LocalRunnerAdapter"
     assert d["enabled"] is True
+
+
+# ---------------------------------------------------------------------------
+# P3 — durable routines (timezone, quiet hours, idempotent trigger, dedupe)
+# ---------------------------------------------------------------------------
+
+def test_create_interval_routine_computes_next_at():
+    svc = make_service()
+    a = svc.create_assistant(tenant_id="t1", user_id="u1", name="Helper")
+    r = svc.create_routine(tenant_id="t1", user_id="u1", assistant_id=a.assistant_id,
+                           name="Briefing", trigger_type="interval",
+                           trigger_spec={"every": "minutes", "amount": 15},
+                           timezone="UTC")
+    assert r.enabled is True
+    assert r.next_at is not None
+    assert r.last_result == ""
+
+
+def test_daily_routine_respects_timezone_and_day():
+    svc = make_service()
+    a = svc.create_assistant(tenant_id="t1", user_id="u1", name="Helper")
+    # 2026-10-27 is a Tuesday. Daily 09:00 Mon..Fri.
+    base = datetime(2026, 10, 27, 12, 0, tzinfo=UTC)
+    r = svc.create_routine(tenant_id="t1", user_id="u1", assistant_id=a.assistant_id,
+                           name="Daily", trigger_type="daily",
+                           trigger_spec={"time": "09:00", "days": ["mon", "tue", "wed", "thu", "fri"]},
+                           timezone="UTC")
+    with patch.object(svc, "now", (lambda real: lambda: real())(svc.now)):
+        r.next_at = svc._compute_next(base, r)
+    # next 09:00 on the next weekday after Tue 12:00 = Wed 09:00
+    assert r.next_at.date().isoformat() == "2026-10-28"
+    assert r.next_at.hour == 9
+
+
+def test_quiet_hours_defer_trigger():
+    svc = make_service()
+    a = svc.create_assistant(tenant_id="t1", user_id="u1", name="Helper")
+    r = svc.create_routine(tenant_id="t1", user_id="u1", assistant_id=a.assistant_id,
+                           name="Quiet", trigger_type="interval",
+                           trigger_spec={"every": "hours", "amount": 1},
+                           timezone="UTC", quiet_hours={"start": "22:00", "end": "07:00"})
+    # 23:00 is inside quiet hours -> next candidate is 08:00 next day
+    base = datetime(2026, 10, 27, 23, 0, tzinfo=UTC)
+    nxt = svc._compute_next(base, r)
+    # 07:00 is the first interval tick outside the 22:00-07:00 quiet window
+    assert nxt.hour == 7
+    assert nxt.date().isoformat() == "2026-10-28"
+
+
+def test_in_quiet_hours_wrap_midnight():
+    assert AssistantService._in_quiet_hours(datetime(2026, 1, 1, 23, 0), {"start": "22:00", "end": "07:00"}) is True
+    assert AssistantService._in_quiet_hours(datetime(2026, 1, 1, 3, 0), {"start": "22:00", "end": "07:00"}) is True
+    assert AssistantService._in_quiet_hours(datetime(2026, 1, 1, 12, 0), {"start": "22:00", "end": "07:00"}) is False
+
+
+def test_trigger_is_idempotent_per_bucket():
+    svc = make_service()
+    a = svc.create_assistant(tenant_id="t1", user_id="u1", name="Helper")
+    base = datetime(2026, 10, 27, 10, 0, tzinfo=UTC)
+    svc.now = lambda: base  # fixed clock so next_at is deterministic
+    r = svc.create_routine(tenant_id="t1", user_id="u1", assistant_id=a.assistant_id,
+                           name="R", trigger_type="interval",
+                           trigger_spec={"every": "minutes", "amount": 10})
+    fire_at = base + timedelta(minutes=10)  # == next_at
+    fired = svc.trigger(r.routine_id, tenant_id="t1", user_id="u1", now=fire_at)
+    assert fired.last_result == "triggered"
+    assert fired.last_run_at == fire_at
+    assert svc.store.routine_fired(r.routine_id, "2026-10-27T10:10") is True
+    # a duplicate delivery of the SAME scheduled bucket must not re-fire
+    stale = svc.store.get_routine(r.routine_id, tenant_id="t1", user_id="u1")
+    stale.next_at = fire_at  # simulate a duplicate delivery reading the stale schedule
+    dup = svc.trigger(r.routine_id, tenant_id="t1", user_id="u1", now=fire_at)
+    assert dup.last_result == "skipped: already fired for this schedule bucket"
+
+
+def test_due_routines_only_enabled_and_due():
+    svc = make_service()
+    a = svc.create_assistant(tenant_id="t1", user_id="u1", name="Helper")
+    svc.create_routine(tenant_id="t1", user_id="u1", assistant_id=a.assistant_id, name="Due",
+                       trigger_spec={"every": "minutes", "amount": 1})
+    svc.create_routine(tenant_id="t1", user_id="u1", assistant_id=a.assistant_id, name="Off",
+                       trigger_spec={"every": "minutes", "amount": 1}, enabled=False)
+    now = svc.now() + timedelta(minutes=5)
+    due = svc.due_routines(tenant_id="t1", user_id="u1", now=now)
+    assert len(due) == 1
+    assert due[0].name == "Due"
+
+
+def test_routines_isolated_by_user():
+    svc = make_service()
+    a = svc.create_assistant(tenant_id="t1", user_id="u1", name="Helper")
+    r = svc.create_routine(tenant_id="t1", user_id="u1", assistant_id=a.assistant_id, name="R")
+    with pytest.raises((KeyError, AssistantNotFound)):
+        svc.get_routine(r.routine_id, tenant_id="t1", user_id="u2")
+
+
+# ---------------------------------------------------------------------------
+# P3 — memory correction (revision + provenance) and approvals
+# ---------------------------------------------------------------------------
+
+def test_memory_correct_bumps_revision():
+    svc = make_service()
+    a = svc.create_assistant(tenant_id="t1", user_id="u1", name="Helper")
+    m = svc.store_memory(tenant_id="t1", user_id="u1", assistant_id=a.assistant_id,
+                         content="User likes coffee", source_ref="chat")
+    rev_before = m.revision
+    corrected = svc.correct_memory(m.memory_id, tenant_id="t1", user_id="u1",
+                                   new_content="User prefers tea")
+    assert corrected.revision == rev_before + 1
+    assert corrected.content == "User prefers tea"
+    assert corrected.source_ref == "correction"
+    hits = svc.search_memory(tenant_id="t1", user_id="u1", assistant_id=a.assistant_id,
+                             query="tea")
+    assert len(hits) == 1
+    assert hits[0].revision == corrected.revision

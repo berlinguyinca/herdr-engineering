@@ -269,6 +269,50 @@ class AssistantApproval:
 
 
 @dataclass
+class AssistantRoutine:
+    """A scheduled/event-driven routine bound to one assistant.
+
+    Firing is idempotent: each scheduled bucket fires at most once. Firing is
+    deferred across quiet hours and computed in the routine's own timezone
+    (DST-aware via zoneinfo). No new daemon is introduced: the control plane
+    polls ``due_routines`` and calls ``trigger`` (or a later phase wires the
+    existing scheduler loop to do so).
+    """
+    routine_id: str
+    assistant_id: str
+    tenant_id: str
+    user_id: str
+    name: str
+    trigger_type: str = "interval"     # interval | daily
+    trigger_spec: dict[str, Any] = field(default_factory=dict)
+    timezone: str = "UTC"
+    quiet_hours: dict[str, str] | None = None  # {start: "HH:MM", end: "HH:MM"}
+    enabled: bool = True
+    last_result: str = ""
+    last_run_at: datetime | None = None
+    next_at: datetime | None = None
+    created_at: datetime = field(default_factory=_now)
+    updated_at: datetime = field(default_factory=_now)
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "routine_id": self.routine_id,
+            "assistant_id": self.assistant_id,
+            "name": self.name,
+            "trigger_type": self.trigger_type,
+            "trigger_spec": self.trigger_spec,
+            "timezone": self.timezone,
+            "quiet_hours": self.quiet_hours,
+            "enabled": self.enabled,
+            "last_result": self.last_result,
+            "last_run_at": self.last_run_at.isoformat() if self.last_run_at else None,
+            "next_at": self.next_at.isoformat() if self.next_at else None,
+            "created_at": self.created_at.isoformat(),
+            "updated_at": self.updated_at.isoformat(),
+        }
+
+
+@dataclass
 class AssistantMemory:
     memory_id: str
     tenant_id: str
@@ -381,6 +425,8 @@ class AssistantStore:
         self.grants: dict[str, AssistantGrant] = {}
         self.approvals: dict[str, AssistantApproval] = {}
         self.memory: dict[str, AssistantMemory] = {}
+        self.routines: dict[str, AssistantRoutine] = {}
+        self._routine_fired: set[str] = set()  # dedupe: routine_id|bucket_iso
         self.audit: list[dict[str, Any]] = []
         self._lock = threading.RLock()
 
@@ -536,6 +582,33 @@ class AssistantStore:
         if m is None or m.tenant_id != tenant_id or m.user_id != user_id:
             raise KeyError("memory not found")
         return m
+
+    # -- routines ---------------------------------------------------------------
+    def put_routine(self, r: AssistantRoutine) -> None:
+        with self._lock:
+            r.updated_at = _now()
+            self.routines[r.routine_id] = r
+
+    def get_routine(self, routine_id: str, *, tenant_id: str, user_id: str) -> AssistantRoutine:
+        r = self.routines.get(routine_id)
+        if r is None or r.tenant_id != tenant_id or r.user_id != user_id:
+            raise KeyError("routine not found")
+        return r
+
+    def list_routines(self, *, tenant_id: str, user_id: str,
+                      assistant_id: str | None = None) -> list[AssistantRoutine]:
+        return sorted(
+            [r for r in self.routines.values()
+             if r.tenant_id == tenant_id and r.user_id == user_id
+             and (assistant_id is None or r.assistant_id == assistant_id)],
+            key=lambda r: r.created_at)
+
+    def routine_fired(self, routine_id: str, bucket_iso: str) -> bool:
+        return f"{routine_id}|{bucket_iso}" in self._routine_fired
+
+    def mark_routine_fired(self, routine_id: str, bucket_iso: str) -> None:
+        with self._lock:
+            self._routine_fired.add(f"{routine_id}|{bucket_iso}")
 
     def delete_memory(self, memory_id: str, *, tenant_id: str, user_id: str) -> None:
         self.get_memory(memory_id, tenant_id=tenant_id, user_id=user_id)
@@ -939,6 +1012,190 @@ class AssistantService:
                 "exported_at": self.now().isoformat(),
                 "count": len(rows),
                 "memory": [m.as_dict() for m in sorted(rows, key=lambda m: m.created_at)]}
+
+    # -- routines ------------------------------------------------------------------
+    def _tz(self, routine: AssistantRoutine):
+        try:
+            from zoneinfo import ZoneInfo
+            return ZoneInfo(routine.timezone)
+        except Exception:  # noqa: BLE001 - unknown zone falls back to UTC
+            from zoneinfo import ZoneInfo
+            return ZoneInfo("UTC")
+
+    @staticmethod
+    def _in_quiet_hours(dt: datetime, quiet: dict[str, str] | None) -> bool:
+        """True when ``dt`` (wall-clock in its own tz) falls inside quiet hours.
+
+        Quiet hours are a [start, end) interval; an end <= start means the window
+        wraps past midnight.
+        """
+        if not quiet:
+            return False
+        start = quiet.get("start")
+        end = quiet.get("end")
+        if not start or not end:
+            return False
+        try:
+            hh, mm = map(int, start.split(":")); start_min = hh * 60 + mm
+            hh, mm = map(int, end.split(":")); end_min = hh * 60 + mm
+        except (ValueError, AttributeError):
+            return False
+        cur_min = dt.hour * 60 + dt.minute
+        if start_min < end_min:
+            return start_min <= cur_min < end_min
+        # wraps midnight: quiet from start->24:00 and 00:00->end
+        return cur_min >= start_min or cur_min < end_min
+
+    def _compute_next(self, after: datetime, routine: AssistantRoutine) -> datetime | None:
+        """Next fire time strictly after ``after``, honoring timezone + quiet hours.
+
+        Returns None when the routine can never fire again (e.g. disabled or a
+        daily routine with no matching day).
+        """
+        if not routine.enabled:
+            return None
+        tz = self._tz(routine)
+        local_after = after.astimezone(tz)
+        spec = routine.trigger_spec or {}
+        # scan a bounded horizon so a daily routine with no matching weekday is
+        # detected rather than looping forever
+        horizon = 366 * 24 * 3600
+        candidate = self._first_candidate(local_after, routine.trigger_type, spec, tz)
+        while candidate is not None:
+            if (candidate - local_after).total_seconds() > horizon:
+                return None
+            if not self._in_quiet_hours(candidate, routine.quiet_hours):
+                return candidate
+            # inside quiet hours: advance one step and retest
+            candidate = self._first_candidate(candidate, routine.trigger_type, spec, tz)
+        return None
+
+    def _first_candidate(self, after: datetime, trigger_type: str,
+                         spec: dict[str, Any], tz) -> datetime | None:
+        """First fire time strictly after ``after`` ignoring quiet hours."""
+        if trigger_type == "interval":
+            every = str(spec.get("every", "minutes"))
+            amount = int(spec.get("amount", 1) or 1)
+            step = {"minutes": 60, "hours": 3600, "days": 86400}.get(every, 60)
+            return after + timedelta(seconds=step * amount)
+        if trigger_type == "daily":
+            t = str(spec.get("time", "09:00"))
+            days = spec.get("days") or ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+            hh, mm = map(int, t.split(":"))
+            for offset in range(1, 8):  # at most a week ahead
+                day = after + timedelta(days=offset)
+                if day.strftime("%a").lower()[:3] not in days:
+                    continue
+                cand = day.replace(hour=hh, minute=mm, second=0, microsecond=0)
+                if cand > after:
+                    return cand
+            return None
+        return None
+
+    def create_routine(self, *, tenant_id: str, user_id: str, assistant_id: str,
+                       name: str, trigger_type: str = "interval",
+                       trigger_spec: dict[str, Any] | None = None,
+                       timezone: str = "UTC", quiet_hours: dict[str, str] | None = None,
+                       enabled: bool = True) -> AssistantRoutine:
+        self._require_enabled()
+        self.store.get_assistant(assistant_id, tenant_id=tenant_id, user_id=user_id)
+        if trigger_type not in ("interval", "daily"):
+            raise AssistantError(f"unsupported trigger_type {trigger_type}")
+        spec = trigger_spec or {}
+        r = AssistantRoutine(
+            routine_id=_new_id("rout"), assistant_id=assistant_id,
+            tenant_id=tenant_id, user_id=user_id, name=name,
+            trigger_type=trigger_type, trigger_spec=spec, timezone=timezone,
+            quiet_hours=quiet_hours, enabled=enabled)
+        r.next_at = self._compute_next(self.now(), r)
+        self.store.put_routine(r)
+        self.store.audit_record(tenant_id=tenant_id, user_id=user_id, actor=user_id,
+                                action="assistant.routine.created", subject_id=r.routine_id)
+        return r
+
+    def list_routines(self, *, tenant_id: str, user_id: str,
+                      assistant_id: str | None = None) -> list[AssistantRoutine]:
+        self._require_enabled()
+        return self.store.list_routines(tenant_id=tenant_id, user_id=user_id,
+                                        assistant_id=assistant_id)
+
+    def get_routine(self, routine_id: str, *, tenant_id: str, user_id: str) -> AssistantRoutine:
+        self._require_enabled()
+        return self.store.get_routine(routine_id, tenant_id=tenant_id, user_id=user_id)
+
+    def update_routine(self, routine_id: str, *, tenant_id: str, user_id: str,
+                       patch: dict[str, Any]) -> AssistantRoutine:
+        self._require_enabled()
+        r = self.store.get_routine(routine_id, tenant_id=tenant_id, user_id=user_id)
+        for key in ("name", "trigger_spec", "timezone", "quiet_hours", "enabled", "trigger_type"):
+            if key in patch:
+                setattr(r, key, patch[key])
+        r.next_at = self._compute_next(self.now(), r)
+        self.store.put_routine(r)
+        self.store.audit_record(tenant_id=tenant_id, user_id=user_id, actor=user_id,
+                                action="assistant.routine.updated", subject_id=r.routine_id)
+        return r
+
+    def archive_routine(self, routine_id: str, *, tenant_id: str, user_id: str) -> None:
+        self._require_enabled()
+        r = self.store.get_routine(routine_id, tenant_id=tenant_id, user_id=user_id)
+        r.enabled = False
+        r.next_at = None
+        self.store.put_routine(r)
+        self.store.audit_record(tenant_id=tenant_id, user_id=user_id, actor=user_id,
+                                action="assistant.routine.archived", subject_id=r.routine_id)
+
+    def due_routines(self, *, tenant_id: str, user_id: str, now: datetime | None = None) -> list[AssistantRoutine]:
+        """Enabled routines whose next_at has arrived (for an existing scheduler
+        loop or the dashboard to drive). Not a background daemon."""
+        self._require_enabled()
+        now = now or self.now()
+        return [r for r in self.store.list_routines(tenant_id=tenant_id, user_id=user_id)
+                if r.enabled and r.next_at is not None and r.next_at <= now]
+
+    def trigger(self, routine_id: str, *, tenant_id: str, user_id: str,
+                now: datetime | None = None) -> AssistantRoutine:
+        """Fire a due routine idempotently: each scheduled bucket fires once.
+
+        Returns the routine with an updated ``next_at`` / ``last_result``. If the
+        bucket was already fired, it is a no-op (acceptance A5 dedupe).
+        """
+        self._require_enabled()
+        r = self.store.get_routine(routine_id, tenant_id=tenant_id, user_id=user_id)
+        now = now or self.now()
+        if not r.enabled or r.next_at is None or r.next_at > now:
+            return r
+        bucket_iso = r.next_at.astimezone(self._tz(r)).strftime("%Y-%m-%dT%H:%M")
+        if self.store.routine_fired(r.routine_id, bucket_iso):
+            r.last_result = "skipped: already fired for this schedule bucket"
+            self.store.put_routine(r)
+            return r
+        r.last_run_at = now
+        r.last_result = "triggered"
+        r.next_at = self._compute_next(now, r)
+        self.store.put_routine(r)
+        self.store.mark_routine_fired(r.routine_id, bucket_iso)
+        self.store.audit_record(tenant_id=tenant_id, user_id=user_id, actor=user_id,
+                                action="assistant.routine.triggered", subject_id=r.routine_id,
+                                detail=bucket_iso)
+        return r
+
+    def correct_memory(self, memory_id: str, *, tenant_id: str, user_id: str,
+                       new_content: str, source_ref: str = "correction") -> AssistantMemory:
+        """Correct a stored fact: bump revision, record provenance; future
+        retrieval uses the new revision (acceptance A6 memory correction)."""
+        self._require_enabled()
+        m = self.store.get_memory(memory_id, tenant_id=tenant_id, user_id=user_id)
+        if not new_content or not new_content.strip():
+            raise AssistantError("memory content is required")
+        m.content = new_content
+        m.source_ref = source_ref
+        # put_memory bumps revision on every write
+        self.store.put_memory(m)
+        self.store.audit_record(tenant_id=tenant_id, user_id=user_id, actor=user_id,
+                                action="assistant.memory.updated", subject_id=memory_id,
+                                detail=f"revision={m.revision}")
+        return m
 
     # -- diagnostics ---------------------------------------------------------------
     def diagnostics(self, *, tenant_id: str, user_id: str, assistant_id: str) -> dict[str, Any]:

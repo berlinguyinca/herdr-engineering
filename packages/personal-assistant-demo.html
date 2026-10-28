@@ -34,6 +34,7 @@
       approvals: [{ approval_id: 'appr_1', assistant_id: 'asst_1', actor_id: 'u1', decision: 'pending', expires_at: '2026-10-27T12:00:00Z', policy_snapshot: 'send_message:*', created_at: '2026-10-27T10:30:00Z', action_id: 'act_1' }],
       memory: [{ memory_id: 'mem_1', assistant_id: 'asst_1', namespace: 'private', content: 'User prefers concise morning briefings.', source_ref: 'chat', classification: 'general', created_at: '2026-10-27T09:00:00Z', updated_at: '2026-10-27T09:00:00Z', revision: 1 }],
     };
+    db.routines = [{ routine_id: 'rout_1', assistant_id: 'asst_1', name: 'Morning briefing', trigger_type: 'daily', trigger_spec: { time: '09:00' }, timezone: 'UTC', quiet_hours: null, enabled: true, last_result: 'triggered', last_run_at: '2026-10-27T09:00:00Z', next_at: '2026-10-28T09:00:00Z', created_at: '2026-10-27T08:00:00Z', updated_at: '2026-10-27T09:00:00Z' }];
     const tools = [
       { tool_id: 'chat', description: 'Respond in conversation.', sensitive: false, granted: true },
       { tool_id: 'read_memory', description: 'Read the user’s assistant memory.', sensitive: false, granted: true },
@@ -51,6 +52,7 @@
       else if (method === 'GET' && is('/api/v1/assistants/') && path.endsWith('/permissions')) json = { tools, grants: db.grants };
       else if (method === 'GET' && is('/api/v1/assistants/') && path.endsWith('/memory')) json = { memory: db.memory };
       else if (method === 'GET' && path === '/api/v1/assistant-approvals') json = { approvals: db.approvals };
+      else if (method === 'GET' && path === '/api/v1/assistant-routines') json = { routines: db.routines };
       else if (method === 'GET' && is('/api/v1/assistants/') && path.endsWith('/threads')) json = { threads: db.threads };
       else if (method === 'GET' && path.includes('/threads/')) json = { thread: db.threads[0], messages: db.messages };
       else if (method === 'GET' && is('/api/v1/assistants/') && path.endsWith('/diagnostics')) json = { assistant_id: 'asst_1', enabled: true, status: 'ready', model_policy: 'auto', runner: 'LocalRunnerAdapter', runner_version: 1, tool_count: 5, active_grants: 3, pending_approvals: 1, thread_count: 1, run_count: 12, memory_count: 1 };

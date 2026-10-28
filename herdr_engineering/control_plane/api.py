@@ -1238,7 +1238,8 @@ def _make_handler(server, public=False, operator=False):
             return self._mutate_verb()
 
         _ASSISTANT_MUTABLE_RESOURCES = {"assistants", "assistant-runs",
-                                        "assistant-approvals", "assistant-memory"}
+                                        "assistant-approvals", "assistant-memory",
+                                        "assistant-routines"}
 
         def _mutate_verb(self):
             if operator:
@@ -2141,7 +2142,7 @@ def _make_handler(server, public=False, operator=False):
                                    "offset": offset, "checked_at": r._stamp()})
             if resource == "review-gate":
                 return self._review_gate_get(parts)
-            if resource in ("assistants", "assistant-runs", "assistant-approvals", "assistant-memory"):
+            if resource in ("assistants", "assistant-runs", "assistant-approvals", "assistant-memory", "assistant-routines"):
                 return self._assistant_get(parts, resource)
             if resource == "tests":
                 return self._json(_tests_view())
@@ -2381,7 +2382,7 @@ def _make_handler(server, public=False, operator=False):
                     if changed and r.get_session(sid) is not None:
                         server.agent_summaries.request(sid)
                 return self._json({"ok": True, "entity": entity})
-            if resource in ("assistants", "assistant-runs", "assistant-approvals", "assistant-memory"):
+            if resource in ("assistants", "assistant-runs", "assistant-approvals", "assistant-memory", "assistant-routines"):
                 # the body is already read above (line ~2170) into the local
                 # ``body``; pass it in rather than re-reading (keep-alive safety)
                 return self._assistant_post(parts, resource, body)
@@ -2436,6 +2437,20 @@ def _make_handler(server, public=False, operator=False):
                     if len(parts) == 6 and parts[5] == "diagnostics":
                         return self._json(svc.diagnostics(tenant_id=tenant_id, user_id=user_id,
                                                           assistant_id=parts[4]))
+                    if len(parts) == 6 and parts[5] == "routines":
+                        return self._json({"routines": [r.as_dict() for r in
+                                                         svc.list_routines(tenant_id=tenant_id, user_id=user_id,
+                                                                           assistant_id=parts[4])]})
+                    if len(parts) == 7 and parts[5] == "routines":
+                        return self._json(svc.get_routine(parts[6], tenant_id=tenant_id, user_id=user_id).as_dict())
+                    if len(parts) == 7 and parts[5] == "routines" and parts[6] == "due":
+                        return self._json({"routines": [r.as_dict() for r in
+                                                         svc.due_routines(tenant_id=tenant_id, user_id=user_id)]})
+                if resource == "assistant-routines" and len(parts) == 4:
+                    return self._json({"routines": [r.as_dict() for r in
+                                                     svc.store.list_routines(tenant_id=tenant_id, user_id=user_id)]})
+                if resource == "assistant-routines" and len(parts) == 5:
+                    return self._json(svc.get_routine(parts[4], tenant_id=tenant_id, user_id=user_id).as_dict())
                 if resource == "assistant-runs" and len(parts) == 5:
                     return self._json(svc.get_run(parts[4], tenant_id=tenant_id, user_id=user_id).as_dict())
                 if resource == "assistant-approvals" and len(parts) == 4:
@@ -2534,6 +2549,27 @@ def _make_handler(server, public=False, operator=False):
                     return self._json(decision.as_dict())
                 if resource == "assistant-memory" and len(parts) == 5 and self.command == "DELETE":
                     svc.forget_memory(parts[4], tenant_id=tenant_id, user_id=user_id)
+                    return self._json({"ok": True})
+                if resource == "assistant-memory" and len(parts) == 5 and self.command == "PATCH":
+                    memo = svc.correct_memory(parts[4], tenant_id=tenant_id, user_id=user_id,
+                                              new_content=body.get("content", ""),
+                                              source_ref=body.get("source_ref", "correction"))
+                    return self._json(memo.as_dict())
+                if resource == "assistant-routines" and len(parts) == 4 and self.command == "POST":
+                    routine = svc.create_routine(
+                        tenant_id=tenant_id, user_id=user_id,
+                        assistant_id=body.get("assistant_id", ""),
+                        name=body.get("name", "Routine"),
+                        trigger_type=body.get("trigger_type", "interval"),
+                        trigger_spec=body.get("trigger_spec") or {},
+                        timezone=body.get("timezone", "UTC"),
+                        quiet_hours=body.get("quiet_hours"),
+                        enabled=bool(body.get("enabled", True)))
+                    return self._json(routine.as_dict(), 201)
+                if resource == "assistant-routines" and len(parts) == 6 and parts[5] == "trigger":
+                    return self._json(svc.trigger(parts[4], tenant_id=tenant_id, user_id=user_id).as_dict())
+                if resource == "assistant-routines" and len(parts) == 5 and self.command == "DELETE":
+                    svc.archive_routine(parts[4], tenant_id=tenant_id, user_id=user_id)
                     return self._json({"ok": True})
                 return self._json({"error": "not found"}, 404)
             except ApprovalRequired as exc:

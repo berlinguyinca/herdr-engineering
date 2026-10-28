@@ -53,3 +53,37 @@ test('forgetMemory issues DELETE', async () => {
   assert.equal(calls[0].url, '/api/v1/assistant-memory/mem1');
   assert.equal(calls[0].opts.method, 'DELETE');
 });
+
+test('correctMemory issues PATCH to assistant-memory', async () => {
+  const { calls, fetchImpl } = capture();
+  const c = new HerdrClient('', { fetchImpl });
+  await c.correctMemory('mem1', 'prefers tea');
+  assert.equal(calls[0].url, '/api/v1/assistant-memory/mem1');
+  assert.equal(calls[0].opts.method, 'PATCH');
+  assert.equal(JSON.parse(calls[0].opts.body).content, 'prefers tea');
+});
+
+test('createRoutine POSTs to /api/v1/assistant-routines', async () => {
+  const { calls, fetchImpl } = capture();
+  const c = new HerdrClient('', { fetchImpl });
+  await c.createRoutine({ name: 'Briefing', trigger_type: 'interval', trigger_spec: { every: 'hours', amount: 1 } });
+  assert.equal(calls[0].url, '/api/v1/assistant-routines');
+  assert.equal(calls[0].opts.method, 'POST');
+  assert.equal(JSON.parse(calls[0].opts.body).name, 'Briefing');
+});
+
+test('triggerRoutine POSTs to the trigger endpoint', async () => {
+  const { calls, fetchImpl } = capture();
+  const c = new HerdrClient('', { fetchImpl });
+  await c.triggerRoutine('rout1');
+  assert.equal(calls[0].url, '/api/v1/assistant-routines/rout1/trigger');
+  assert.equal(calls[0].opts.method, 'POST');
+});
+
+test('archiveRoutine issues DELETE', async () => {
+  const { calls, fetchImpl } = capture();
+  const c = new HerdrClient('', { fetchImpl });
+  await c.archiveRoutine('rout1');
+  assert.equal(calls[0].url, '/api/v1/assistant-routines/rout1');
+  assert.equal(calls[0].opts.method, 'DELETE');
+});
