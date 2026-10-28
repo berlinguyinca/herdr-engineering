@@ -909,6 +909,13 @@ def test_tagged_content_is_gated_by_operator_egress_routes():
         assert state.egress_check("plain", "private_mail")[0] is True
         assert state.egress_check("my-model", "private_mail")[0] is False   # local-only class never goes to cloud
         assert state.egress_check("my-model", "internal")[0] is True
+        # a custom model marked local cannot launder data onto an external upstream it may resolve to
+        repo.egress_fn = lambda: {"upstream_kind": "external", "custom_kinds": {"my-model": "local"}, "approved": []}
+        state.refresh(force=True)
+        assert state.egress_check("my-model", "private_mail")[0] is False
+        assert state.egress_check("my-model", "public")[0] is True
+        repo.egress_fn = lambda: {"upstream_kind": "local", "custom_kinds": {"my-model": "approved_cloud"}, "approved": ["internal", "private_mail"]}
+        state.refresh(force=True)
         assert state.egress_check("plain", None)[0] is False
     finally:
         _teardown(proxy, srvs)

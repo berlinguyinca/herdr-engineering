@@ -230,10 +230,18 @@ class ProxyState:
             egress = self._egress
         custom = self.custom_model(model)
         kinds = egress.get("custom_kinds") if isinstance(egress.get("custom_kinds"), dict) else {}
-        kind = kinds.get(custom["name"]) if custom else egress.get("upstream_kind")
         approved = frozenset(x for x in (egress.get("approved") or []) if isinstance(x, str))
-        return may_route(data_class, kind if kind in ("local", "approved_cloud", "external") else "external",
-                         approved=approved)
+
+        def norm(kind):
+            return kind if kind in ("local", "approved_cloud", "external") else "external"
+        # A custom model may be served by its own endpoint OR resolved onto the shared upstream (fabric model), so the
+        # content must be allowed on BOTH routes: marking a custom model local cannot launder data to the upstream.
+        routes = [norm(egress.get("upstream_kind"))] if not custom else [norm(kinds.get(custom["name"])), norm(egress.get("upstream_kind"))]
+        for kind in routes:
+            ok, why = may_route(data_class, kind, approved=approved)
+            if not ok:
+                return ok, why
+        return True, "allowed on every route the model can take"
 
     def route(self, model: str | None) -> tuple[str, str | None, str | None]:
         """(base_url, bearer, upstream model name) for ``model``."""
