@@ -4,12 +4,8 @@
 # credential, pull_request and manual only (a push to a PR branch must not build twice). The step logic lives in the script so
 # `bash scripts/ci/unit-gates.sh` reproduces CI from a clean checkout. The browser (Playwright) suites stay in ui-gates.yml.
 #
-# Whole suites, not scoped subsets. First agent run (hive exec host, Python 3.13): 7237 passed, 3 failed, all host-dependent:
-# test_host_config.py::test_install_fleet_host_config_reads_the_fleet_file (gateway_tailnet_ip is required),
-# test_pi_recovery.py::test_target_lookup_preserves_native_default_legacy_root_discovery (needs a control transport), and
-# test_deploy_scripts.py::test_pre_feature_running_commit_gets_the_manual_recipe (needs history; fetched in full below).
-# They show red until fixed or made host-independent; nothing is deselected here. Intermittent under load: test_ci_api.py's
-# telemetry race and a few fabric tests.
+# Whole suites, not scoped subsets; nothing is deselected. Green on the hive exec host (Python 3.13) once the host-dependent
+# tests were made host-independent. Still timing-sensitive under load: test_ci_api.py's telemetry race and a few fabric tests.
 # To use the larger hive pool, add `labels: {cluster: hive}` (queues are long, 10+ minutes).
 when:
   - event: manual
