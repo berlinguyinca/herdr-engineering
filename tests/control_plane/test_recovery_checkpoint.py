@@ -71,6 +71,7 @@ def _checkpoint_source(db):
         repo = ControlPlaneRepo(now=lambda: 1793059200)
         repo.inspector._clock = lambda: 1793059200
         load_into(repo, source)
+        repo._durable_history = None  # Returned value outlives this helper's connection.
         return repo, source.events(), source.recovery_metrics
     finally:
         loop.run_until_complete(conn.close())

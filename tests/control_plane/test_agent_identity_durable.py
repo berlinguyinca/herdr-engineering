@@ -1,11 +1,15 @@
 """Independent naming writers share one durable reservation transaction."""
 import asyncio
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
-from herdr_engineering.control_plane.agent_identity import AgentIdentityVersionConflict
+from herdr_engineering.control_plane.agent_identity import (
+    AGENT_IDENTITY_LOCK,
+    AgentIdentityVersionConflict,
+)
 from herdr_engineering.control_plane.repo import ControlPlaneRepo
 from herdr_engineering.control_plane.sink import DurableEventSink
 from tests.control_plane.test_recovery_checkpoint import pg as checkpoint_pg
@@ -62,7 +66,32 @@ def test_stale_independent_rename_cannot_overwrite_a_durable_version(writers):
     with pytest.raises(AgentIdentityVersionConflict):
         second.rename_agent('a', 'Elm', 1)
     assert second.agent_identities.get('a')['display_name'] != 'Elm'
+    assert second.get_session('a')['display_name'] == 'Grace'
     assert db.query("SELECT count(*) AS n FROM fabric_events WHERE entity_type='agent_identity'")[0]['n'] == 2
+
+
+def test_cached_noop_rename_checks_durable_version_and_refreshes_the_view(writers):
+    db, (first, second) = writers
+    for repo in (first, second):
+        repo.upsert_session('a', name='Ada')
+        repo.get_session('a')
+    first.rename_agent('a', 'Grace', 1)
+    with pytest.raises(AgentIdentityVersionConflict):
+        second.rename_agent('a', 'Ada', 1)
+    assert second.get_session('a')['display_name'] == 'Grace'
+    restored = ControlPlaneRepo()
+    restored.import_state(second.export_state())
+    assert restored.get_session('a')['display_name'] == 'Grace'
+    assert db.query("SELECT count(*) AS n FROM fabric_events WHERE entity_type='agent_identity'")[0]['n'] == 2
+
+
+def test_valid_durable_noop_does_not_append_or_increment_the_version(writers):
+    db, (repo, _) = writers
+    repo.upsert_session('a', name='Ada')
+    repo.get_session('a')
+    result = repo.rename_agent('a', 'Ada', 1)
+    assert result['display_name'] == 'Ada' and result['version'] == 1
+    assert db.query("SELECT count(*) AS n FROM fabric_events WHERE entity_type='agent_identity'")[0]['n'] == 1
 
 
 def test_concurrent_process_registries_reserve_names_atomically(writers):
@@ -102,3 +131,36 @@ def test_failed_identity_insert_does_not_publish_tentative_reservations(writers)
     assert repo.agent_identities.get('a') is None
     assert repo.export_state()['agent_identity_history'] == []
     assert db.query("SELECT count(*) AS n FROM fabric_events WHERE entity_type='agent_identity'")[0]['n'] == 0
+
+
+def test_waiting_writers_do_not_keep_a_prelock_repeatable_read_snapshot(writers):
+    db, repos = writers
+    for index, repo in enumerate(repos):
+        repo.upsert_session(str(index), name='Ada')
+        repo._sink._run(repo._sink._store._conn.execute("SET default_transaction_isolation='repeatable read'"))
+    loop = asyncio.new_event_loop()
+    observer = loop.run_until_complete(asyncpg.connect(db.dsn))
+    transaction = observer.transaction()
+    loop.run_until_complete(transaction.start())
+    loop.run_until_complete(observer.execute('SELECT pg_advisory_xact_lock($1)', AGENT_IDENTITY_LOCK))
+    executor = ThreadPoolExecutor(max_workers=2)
+    futures = [executor.submit(repo.get_session, str(index)) for index, repo in enumerate(repos)]
+    try:
+        deadline = time.monotonic() + 5
+        while True:
+            loop.run_until_complete(observer.execute('SELECT pg_stat_clear_snapshot()'))
+            waiting = loop.run_until_complete(observer.fetchval(
+                "SELECT count(*) FROM pg_stat_activity WHERE datname=current_database() AND wait_event='advisory'"))
+            if waiting == 2:
+                break
+            assert time.monotonic() < deadline, 'both writers must wait behind the transaction fence'
+            time.sleep(0.01)
+        loop.run_until_complete(transaction.rollback())
+        profiles = [future.result(timeout=5) for future in futures]
+        assert len({profile['agent_handle'] for profile in profiles}) == 2
+    finally:
+        if observer.is_in_transaction():
+            loop.run_until_complete(transaction.rollback())
+        executor.shutdown(wait=True)
+        loop.run_until_complete(observer.close())
+        loop.close()

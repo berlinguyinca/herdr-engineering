@@ -54,3 +54,11 @@ readiness requirements or omit streams to make a deployment appear healthy.
 
 Old generations are retained for readers and rollback; no automatic pruning is
 performed. Keep the underlying journal for authoritative recovery and audit.
+
+Projection compaction does not truncate history APIs. Host, session and service
+history reads use the raw PostgreSQL journal: indexed keyset pages for paginated
+requests and the complete stream for legacy requests. Private streams never use
+that reader. Database failures remain explicit failures, not incomplete cache
+fallbacks. Cursor fingerprints use a process-private HMAC so masked low-entropy
+values cannot be guessed from public cursor hashes. Cursors can become stale
+after a server restart; reload history when the API returns409.

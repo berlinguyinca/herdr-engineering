@@ -174,11 +174,13 @@ class PostgresSource(DurableSource):
         self._events_table = events_table
         self._cache: dict | None = None
         self.recovery_metrics: dict = {}
+        self._query_lock = threading.RLock()
 
     def _load(self) -> dict:
-        if self._cache is None:
-            self._cache = self._run(self._fetch_all())
-        return self._cache
+        with self._query_lock:
+            if self._cache is None:
+                self._cache = self._run(self._fetch_all())
+            return self._cache
 
     async def _fetch_all(self) -> dict:
         if self._conn is None:
@@ -245,16 +247,30 @@ class PostgresSource(DurableSource):
         return self._load()["hosts"]
 
     def events(self) -> list[dict]:
-        if "events" not in self._load():
-            # load_into consumes the heavy event cache. Explicit later event
-            # reads get a fresh complete snapshot, never an empty placeholder.
-            self._cache = self._run(self._fetch_all())
-        return self._cache["events"]
+        with self._query_lock:
+            if "events" not in self._load():
+                # Replay consumes the heavy cache. Later explicit reads get a
+                # fresh recovery snapshot, never an empty placeholder.
+                self._cache = self._run(self._fetch_all())
+            return self._cache["events"]
 
     def take_events(self) -> list[dict]:
         """Transfer event-row ownership to replay; retain cheap resource reads."""
-        self.events()
-        return self._cache.pop("events")
+        with self._query_lock:
+            self.events()
+            return self._cache.pop("events")
+
+    def history_page(self, entity_type, entity_id, *, limit=50, before=None):
+        from .durable_history import DurableHistoryReader
+        with self._query_lock:
+            return self._run(DurableHistoryReader(self._conn, events_table=self._events_table).page(
+                entity_type, entity_id, limit=limit, before=before))
+
+    def history_stream(self, entity_type, entity_id):
+        from .durable_history import DurableHistoryReader
+        with self._query_lock:
+            return self._run(DurableHistoryReader(self._conn, events_table=self._events_table).stream(
+                entity_type, entity_id))
 
 
 def _v2_value(name: str, value: Any) -> Any:
@@ -678,6 +694,8 @@ def load_into(repo, source: DurableSource) -> dict:
         "hosts": hosts, "artifacts": artifacts, "blobs": {}, "leases": {},
         "telemetry": {}, "events": events, "event_order": event_order,
     })
+    # Compact projection recovery must not truncate the raw history API.
+    repo._durable_history = source if isinstance(source, PostgresSource) else None
     return {"missions": len(missions), "sessions": len(sessions),
             "services": len(services), "hosts": len(hosts),
             "events": len(event_order), "artifacts": len(artifacts)}

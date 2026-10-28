@@ -55,6 +55,9 @@ def _source(db):
         repo = ControlPlaneRepo(now=lambda: 1793059200)
         repo.inspector._clock = lambda: 1793059200
         load_into(repo, source)
+        # This helper returns a detached projection snapshot and closes its DB
+        # connection. Live raw-history routing has separate integration coverage.
+        repo._durable_history = None
         return repo, rows
     finally:
         loop.run_until_complete(conn.close())

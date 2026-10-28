@@ -666,6 +666,9 @@ class ControlPlaneServer:
         h["rustfs"] = "s3" if self.rustfs is not None else "memory"
         h["version"] = __version__
         h["commit"] = _COMMIT
+        if self.repo.agent_identities.conflict_count:
+            h["agent_identity_degraded"] = True
+            h["agent_identity_conflicts"] = self.repo.agent_identities.conflict_count
         h["performance"] = self.request_metrics.snapshot()
         h['performance'].update(request_workers=self.request_workers, request_queue=self.request_queue,
                                 rejected_requests=getattr(self._httpd, 'rejected_requests', 0))
@@ -2120,8 +2123,8 @@ def _make_handler(server, public=False, operator=False):
                         except ValueError as exc:
                             return self._json({"error": str(exc)},
                                               409 if str(exc) == "staleHistoryCursor" else 400)
-                        return self._json(page)
-                    return self._json({"events": r.stream(etype, eid)})
+                        return self._json({**page, "events": [_redact_event(event) for event in page["events"]]})
+                    return self._json({"events": [_redact_event(event) for event in r.stream(etype, eid)]})
             if resource == "artifacts" and len(parts) > 5 and parts[5] == "download":
                 data = r.get_artifact_data(parts[4])
                 a = r.get_artifact(parts[4])
@@ -3444,7 +3447,10 @@ def _empty_inspector(store, sid: str) -> dict:
 
 def _redact_event(event: dict) -> dict:
     ev = dict(event)
-    ev["payload"] = redact_payload(ev.get("payload", {}))
+    # Count-key exceptions belong to delivery schemas, never arbitrary payloads.
+    redact = (redact_delivery if ev.get("entity_type") in
+              {"test_run", "build", "review", "review_finding", "pull_request"} else redact_payload)
+    ev["payload"] = redact(ev.get("payload", {}))
     return ev
 
 

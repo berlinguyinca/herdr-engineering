@@ -19,8 +19,12 @@ from dataclasses import asdict
 from datetime import datetime
 from typing import Any
 
-from .agent_identity import AGENT_IDENTITY_LOCK, AgentIdentityRegistry
-from .agent_identity_repair import prepare_identity_replay
+from .agent_identity import (
+    AGENT_IDENTITY_LOCK,
+    AgentIdentityConflict,
+    AgentIdentityRegistry,
+    AgentIdentityVersionConflict,
+)
 from .bridge import _LoopRunner, _rebuild_events
 from .events import V2_COLUMNS, Event, EventStore
 
@@ -71,6 +75,8 @@ class DurableEventSink:
     Construct with a ``dsn`` (lazily connects on its own loop) or with an
     existing asyncpg ``conn`` plus ``run`` (tests).
     """
+
+    verify_agent_identity_noop = True
 
     def __init__(self, dsn: str | None = None, *, conn: Any = None,
                  run: Callable | None = None,
@@ -125,33 +131,47 @@ class DurableEventSink:
             raise ValueError("invalid private agent identity event type")
         AgentIdentityRegistry().hydrate([ev])
         conn = self._store._conn
-        async with conn.transaction():
+        # A waiter must read AFTER the previous lock holder commits, even if
+        # the connection's default isolation is repeatable read.
+        async with conn.transaction(isolation="read_committed"):
+            await conn.execute("SET LOCAL lock_timeout='5s'")
             await conn.execute("SELECT pg_advisory_xact_lock($1)", AGENT_IDENTITY_LOCK)
             rows = await conn.fetch("""
                 SELECT * FROM fabric_events
-                WHERE entity_type IN ('agent_identity', 'agent_identity_reconciliation')
+                WHERE entity_type = 'agent_identity'
                 ORDER BY ingest_timestamp, sequence, event_id
             """)
             streams, _ = _rebuild_events([dict(row) for row in rows])
             history = [event for stream in streams.values() for event in stream]
-            replay, names, handles = prepare_identity_replay(history)
-            registry = AgentIdentityRegistry(blocked_names=names, blocked_handles=handles)
-            registry.hydrate(replay)
+            registry = AgentIdentityRegistry()
+            registry.hydrate(history, quarantine_conflicts=True, tolerate_version_resets=True)
             identity, proposed = ev["entity_id"], ev["payload"]
-            if proposed["version"] == 1 and registry.get(identity) is not None:
-                canonical = registry._records[identity]
+
+            def current_event():
                 for event in reversed(history):
                     if event["entity_type"] != "agent_identity" or event["entity_id"] != identity:
                         continue
                     candidate = AgentIdentityRegistry()
                     candidate.hydrate([event])
-                    if candidate._records[identity] == canonical:
+                    if candidate.get(identity) == registry.get(identity):
                         return copy.deepcopy(event)
                 raise ValueError("canonical agent identity has no durable acknowledgement")
+
+            if proposed["version"] == 1 and registry.get(identity) is not None:
+                if registry.is_conflicted(identity):
+                    raise AgentIdentityConflict("saved agent name is ambiguous; use its stable identity")
+                return current_event()
             if proposed["version"] == 1:
                 registry.allocate(identity, proposed["display_name"])
             else:
-                registry.rename(identity, proposed["display_name"], proposed["version"] - 1)
+                try:
+                    registry.rename(identity, proposed["display_name"], proposed["version"] - 1)
+                except AgentIdentityVersionConflict as error:
+                    error.current_event = current_event()
+                    error.current_conflicted = registry.is_conflicted(identity)
+                    raise
+                if registry.get(identity)["version"] < proposed["version"]:
+                    return current_event()  # A globally verified no-op never appends another event.
             stored = _dict_to_event({**ev, "payload": copy.deepcopy(registry._records[identity])})
             if not await self._store.append(stored):
                 raise EventAlreadyStored("durable log already holds this identity event")

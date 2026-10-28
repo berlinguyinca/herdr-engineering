@@ -115,7 +115,7 @@ def test_export_preserves_complete_private_identity_history():
     assert not any(event['entity_type'].startswith('agent_identity') for event in restored.recent_events())
 
 
-def test_unexplained_divergent_history_is_not_hidden_by_latest_projection():
+def test_divergent_history_is_preserved_and_exposed_as_an_unresolved_name():
     from herdr_engineering.control_plane.agent_identity import (
         AgentIdentityConflict,
         AgentIdentityRegistry,
@@ -126,8 +126,14 @@ def test_unexplained_divergent_history_is_not_hidden_by_latest_projection():
         registry = AgentIdentityRegistry(persist=lambda event: events.append(
             {**event, 'event_id': str(index), 'sequence': index}))
         registry.allocate('one', name)
+    repo = ControlPlaneRepo()
+    repo.import_state({'agent_projections': events,
+                       'sessions': {'one': {'session_id': 'one', 'status': 'active'}}})
+    restored = repo.get_session('one')
+    assert restored['display_name'] == 'one' and restored['agent_handle'] is None
+    assert restored['name_error'] and len(repo.export_state()['agent_identity_history']) == 2
     with pytest.raises(AgentIdentityConflict):
-        ControlPlaneRepo().import_state({'agent_projections': events})
+        repo.agent_identities.allocate('one')
 
 
 def test_global_persistence_acknowledgement_keeps_actual_durable_event():
