@@ -4,7 +4,7 @@ from __future__ import annotations
 import html
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 
 class ArtifactRendererError(ValueError):
@@ -18,6 +18,7 @@ class RenderResult:
     outputs: list[dict]
     validation: dict
     toolchain: dict
+    report_descriptor: dict | None = None
 
 
 class RendererRegistry:
@@ -31,8 +32,41 @@ class RendererRegistry:
         if profile == "diagram":
             return self._diagram(source)
         if profile == "report":
-            return self._markdown(source)
+            return self._report(source, request)
         raise ArtifactRendererError(f"unsupported artifact profile: {profile}")
+
+    def _report(self, source: str, request: dict) -> RenderResult:
+        from .artifact_report_descriptor import validate_report_descriptor
+        from .artifact_report_render import render_report_preview
+
+        if not isinstance(source, str):
+            raise ArtifactRendererError("report source must be text")
+        descriptor = request.get("report_descriptor")
+        if "report_descriptor" in request:
+            descriptor = validate_report_descriptor(descriptor)
+            if source.strip():
+                try:
+                    supplied_source = json.loads(source)
+                except ValueError as exc:
+                    raise ArtifactRendererError("descriptor reports require matching JSON source") from exc
+                if validate_report_descriptor(supplied_source) != descriptor:
+                    raise ArtifactRendererError("report source and descriptor disagree")
+        elif source.lstrip().startswith(("{", "[")):
+            try:
+                descriptor = validate_report_descriptor(json.loads(source))
+            except ValueError as exc:
+                raise ArtifactRendererError(f"invalid report descriptor: {exc}") from exc
+        else:
+            return replace(self._markdown(source), profile="report")
+        canonical = json.dumps(descriptor, sort_keys=True, separators=(",", ":"))
+        preview = render_report_preview(descriptor)
+        return RenderResult(
+            "report", canonical,
+            [{"name": "preview.html", "media_type": "text/html", "content": preview}],
+            {"status": "passed", "checks": ["report-descriptor", "bounded-inert-html"],
+             "scope": "format-and-render", "preview_bytes": len(preview.encode())},
+            {"renderer": "builtin-report-descriptor", "revision": "1"},
+            report_descriptor=descriptor)
 
     @staticmethod
     def _markdown(source: str) -> RenderResult:
