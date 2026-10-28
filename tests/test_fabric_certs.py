@@ -227,3 +227,38 @@ def test_renewal_pass_refreshes_a_due_tailnet_cert(tmp_path):
     seen = []
     mgr = fc.CertManager(tailnet=ts, renew=True, on_change=seen.append)
     assert mgr.check()["renewed"] == ["bender.tail.ts.net"] and len(seen) == 1
+
+
+def test_files_replaced_by_someone_else_are_reloaded_without_renew_rights(tmp_path):
+    import os
+    acme = _acme(tmp_path)
+    _self_signed(acme.live, acme.domain, 30)
+    seen = []
+    mgr = fc.CertManager(public=acme, renew=False, on_change=seen.append)
+    mgr.load()
+    assert mgr.check() == {"renewed": [], "error": None} and seen == []        # unchanged: nothing happens
+    first = fc.validity(acme.fullchain)[1]
+    _self_signed(acme.live, acme.domain, 90)                                  # a host timer renewed the files
+    os.utime(acme.fullchain, ns=(1, 1))                                       # (mtime is the signal; make it certain)
+    res = mgr.check()
+    assert res.get("reloaded") is True and len(seen) == 1 and fc.validity(acme.fullchain)[1] > first
+    assert mgr.check() == {"renewed": [], "error": None}                      # and only once
+
+
+def test_half_written_files_keep_the_old_context(tmp_path):
+    acme = _acme(tmp_path)
+    _self_signed(acme.live, acme.domain, 30)
+    seen = []
+    mgr = fc.CertManager(public=acme, on_change=seen.append)
+    mgr.load()
+    acme.fullchain.write_text("-----BEGIN CERTIFICATE-----\ngarbage")
+    assert mgr.reload_if_changed() is False and seen == []
+    assert mgr._by_suffix                                                      # still serving the previous contexts
+
+
+def test_tailnet_cert_is_not_due_without_a_cli_and_no_runner(tmp_path):
+    ts = fc.TailscaleCert("n.ts.net", tmp_path, tailscale="/nonexistent/tailscale")
+    _self_signed(tmp_path / "g", "n.ts.net", 2)
+    ts.directory.mkdir(parents=True, exist_ok=True)
+    (tmp_path / "n.ts.net.crt").write_bytes((tmp_path / "g" / "fullchain.pem").read_bytes())
+    assert ts.due() is False

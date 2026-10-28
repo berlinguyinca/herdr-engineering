@@ -12,6 +12,7 @@ retries more than once a day after a failure, and swaps the live TLS context wit
 from __future__ import annotations
 
 import logging
+import shutil
 import ssl
 import subprocess
 import threading
@@ -158,6 +159,9 @@ class TailscaleCert:
         return before is None or validity(self.fullchain)[1] != before
 
     def due(self, now: datetime | None = None) -> bool:
+        # In a container there is no tailscale CLI; a host timer refreshes the files and the gateway reloads them.
+        if self.runner is None and shutil.which(self.tailscale) is None:
+            return False
         return due_for_renewal(self.fullchain, now)
 
 
@@ -186,6 +190,39 @@ class CertManager:
     _by_suffix: dict[str, ssl.SSLContext] = field(default_factory=dict, repr=False)
     _default: ssl.SSLContext | None = field(default=None, repr=False)
     _lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
+    _stamp_loaded: tuple = field(default=(), repr=False)
+
+    def _files(self) -> list[Path]:
+        out: list[Path] = []
+        if self.public:
+            out += [self.public.fullchain, self.public.privkey]
+        if self.tailnet:
+            out += [self.tailnet.fullchain, self.tailnet.privkey]
+        if self.private_ca:
+            out += [self.private_ca.dir / f"{self.private_leaf}.pem", self.private_ca.dir / f"{self.private_leaf}.key"]
+        return out
+
+    def _stamp(self) -> tuple:
+        stamp = []
+        for f in self._files():
+            try:
+                st = f.stat()
+                stamp.append((str(f), st.st_mtime_ns, st.st_size))
+            except OSError:
+                stamp.append((str(f), None, None))
+        return tuple(stamp)
+
+    def reload_if_changed(self) -> bool:
+        """Pick up certificate files that something else (a host timer, the other node) replaced. Never raises."""
+        stamp = self._stamp()
+        if not self._stamp_loaded or stamp == self._stamp_loaded:   # never loaded: nothing to refresh yet
+            return False
+        try:
+            self._publish()
+        except (CertError, OSError, ssl.SSLError) as exc:      # half-written files: keep serving the old context
+            log.warning("certificate files changed but could not be loaded yet: %s", exc)
+            return False
+        return True
 
     # -- building --------------------------------------------------------------------------------
     def load(self) -> ssl.SSLContext:
@@ -209,6 +246,7 @@ class CertManager:
             raise CertError("no certificate available: run `devfabric cert issue` (public) or `devfabric ca issue` (private)")
         with self._lock:
             self._by_suffix, self._default = by_suffix, default
+            self._stamp_loaded = self._stamp()
         dispatcher = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         dispatcher.minimum_version = ssl.TLSVersion.TLSv1_2
         dispatcher.set_alpn_protocols(["http/1.1"])
@@ -250,6 +288,8 @@ class CertManager:
     def check(self) -> dict:
         """One renewal pass. Cheap when nothing is due; never raises."""
         result = {"renewed": [], "error": None}
+        if self.reload_if_changed():
+            result["reloaded"] = True
         if not self.renew:
             return result
         if self.now() < self._next_attempt:
