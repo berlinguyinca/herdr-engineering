@@ -33,6 +33,8 @@ def pg(tmp_path_factory):
 @pytest.fixture
 def db(pg):
     pg.query("TRUNCATE fabric_events")
+    if pg.query("SELECT to_regclass('recovery_checkpoint_manifests') AS name")[0]["name"]:
+        pg.query("TRUNCATE recovery_checkpoint_manifests CASCADE")
     return pg
 
 
@@ -278,6 +280,11 @@ def test_production_cardinality_snapshot_recovery_and_database_restart(db):
     db.query("ANALYZE fabric_events")
     plan = db.query("EXPLAIN (FORMAT JSON) " + _recovery_events_sql("fabric_events"))[0][0]
     print("Arrival index selected:", "idx_fabric_events_recovery_arrival" in plan, "; TID scan selected:", "Tid Scan" in plan, flush=True)
+    from tests.control_plane.test_recovery_checkpoint import _build
+    checkpoint = _build(db)
+    assert checkpoint["covered_events"] == 1767806
+    assert checkpoint["selected_events"] == len(rows)
+    print(f"Offline checkpoint build: {checkpoint['elapsed_seconds']:.2f}s", flush=True)
     db.stop()
     db.start_existing()
     start = time.monotonic()
@@ -287,7 +294,7 @@ def test_production_cardinality_snapshot_recovery_and_database_restart(db):
     assert [r["event_id"] for r in replay] == [r["event_id"] for r in rows]
     assert db.query("SELECT count(*) AS n FROM fabric_events")[0]["n"] == 1767806
     assert _inspector_view(restarted, "session-0") == _inspector_view(recovered, "session-0")
-    print(f"Mixed recovery after Postgres restart with arrival index: {restart_elapsed:.2f}s", flush=True)
+    print(f"Mixed checkpoint recovery after Postgres restart: {restart_elapsed:.2f}s", flush=True)
     # Timings are evidence, not a hard bound: changing/private histories remain
     # linear and this disposable cluster shares the host's CPU and storage.
 
@@ -363,7 +370,8 @@ def test_observation_clocks_compact_without_losing_resets_or_identity_changes(db
         assert service["updated_at"] == "2026-10-26T00:00:00+00:00"
 
 
-def test_private_projections_and_mutations_match_full_postgres_replay(db):
+@pytest.mark.parametrize("checkpoint", [False, True])
+def test_private_projections_and_mutations_match_full_postgres_replay(db, checkpoint):
     from herdr_engineering.control_plane.collab import CollabService, StaticTokenAuthenticator
     from herdr_engineering.control_plane.ingest import IngestService
     from tests.control_plane.test_collab import _digest
@@ -406,6 +414,9 @@ def test_private_projections_and_mutations_match_full_postgres_replay(db):
         loop.run_until_complete(conn.close())
         loop.close()
     expected, original = _reference(db)
+    if checkpoint:
+        from tests.control_plane.test_recovery_checkpoint import _build
+        _build(db)
     recovered, rows = _source(db)
     assert len(rows) == len(original)
     assert recovered.graph.snapshot() == expected.graph.snapshot() == live.graph.snapshot()

@@ -15,6 +15,7 @@ import asyncio
 import datetime as _dt
 import json
 import threading
+import time
 from collections.abc import Callable
 from typing import Any
 
@@ -172,6 +173,7 @@ class PostgresSource(DurableSource):
         self._run = run
         self._events_table = events_table
         self._cache: dict | None = None
+        self.recovery_metrics: dict = {}
 
     def _load(self) -> dict:
         if self._cache is None:
@@ -188,14 +190,28 @@ class PostgresSource(DurableSource):
         # One consistent cut across structured rows and the event log. Concurrent
         # ingestion must not leave half a recovery or make compaction race a writer.
         async with conn.transaction(isolation="repeatable_read", readonly=True):
-            return {
+            started = time.monotonic()
+            state = {
                 "missions": [dict(r) for r in await conn.fetch("SELECT * FROM missions")],
                 "sessions": [dict(r) for r in await conn.fetch("SELECT * FROM sessions")],
                 "services": [dict(r) for r in await conn.fetch("SELECT * FROM services")],
                 "hosts": [dict(r) for r in await conn.fetch("SELECT * FROM hosts")],
-                "events": [dict(r) for r in await conn.fetch(
-                    _recovery_events_sql(self._events_table))],
             }
+            from .recovery_checkpoint import load_checkpoint_events
+            # Checkpoints belong to the canonical journal only. Custom sources
+            # continue to use their own full faithful recovery query.
+            checkpoint = (await load_checkpoint_events(conn)
+                          if self._events_table == "fabric_events" else None)
+            if checkpoint is None:
+                state["events"] = [dict(r) for r in await conn.fetch(
+                    _recovery_events_sql(self._events_table))]
+                self.recovery_metrics = {
+                    "mode": "full", "loaded_events": len(state["events"]),
+                    "elapsed_seconds": round(time.monotonic() - started, 3),
+                }
+            else:
+                state["events"], self.recovery_metrics = checkpoint
+            return state
 
     def missions(self) -> list[dict]:
         return self._load()["missions"]
