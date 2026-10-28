@@ -439,3 +439,8 @@ button.ctx-chip:focus-visible, .ctx-chip:focus-visible { outline: 2px solid curr
 .cx-m--mine .cx-mention--external::after { color: inherit; }
 .cx-mention__icon { font-size: .8em; margin-right: 2px; }
 .cx-m--mine .cx-mention { background: color-mix(in srgb, var(--text-on-accent) 18%, transparent); color: inherit; border-color: transparent; }
+/* Supporting room views sit after the four that carry the work, set quieter and divided from them. */
+.cx-stab--minor { font-size: .8125rem; padding-inline: 8px; opacity: .85; }
+.cx-stab:not(.cx-stab--minor) + .cx-stab--minor { margin-left: 10px; border-left-color: var(--border); border-radius: 0 var(--radius-sm) var(--radius-sm) 0; }
+.cx-newroom > summary { cursor: pointer; font-weight: 600; font-size: 1rem; margin-bottom: 8px; }
+.cx-helpers-idle h2 { margin-bottom: 2px; }
