@@ -180,3 +180,42 @@ def test_real_repo_events_flow_through_the_listener(clean):
     bridge.drain()
     bridge.stop()
     assert store.timeline(pi.Viewer("o"))["total"] == 2 and bridge.stats["ignored"] >= 1
+
+
+def test_every_mutator_rolls_memory_back_when_the_database_write_fails(clean):
+    s = br.DurableIntelligenceStore(clean, clock=lambda: T)
+    ev, _ = s.append_event(raw(), cfg=ON)
+
+    def fail(*a, **k):
+        raise br.StoreUnavailable("db down")
+    for name in ("save_pause", "save_record", "save_relationship", "save_finding", "ack", "mark_tombstoned"):
+        setattr(clean, name, fail)
+    with pytest.raises(br.StoreUnavailable):
+        s.pause_source("o", "gmail")
+    assert ("o", "gmail") not in s._paused                       # a failed pause must not look paused (or vice versa)
+    with pytest.raises(br.StoreUnavailable):
+        s.upsert_record("project", org_id="o", record_id="p1", name="P1")
+    assert s.records("project", pi.Viewer("o")) == []
+    with pytest.raises(br.StoreUnavailable):
+        s.add_finding({"org_id": "o", "statement": "x", "extractor_version": "v", "model_identifier": "m"})
+    assert s.findings(pi.Viewer("o")) == []
+    with pytest.raises(br.StoreUnavailable):
+        s.outbox_ack(ev.event_id, "timeline")
+    assert s.outbox_pending("timeline") == [ev.event_id]
+    with pytest.raises(br.StoreUnavailable):
+        s.tombstone_source("o", "gmail:a:m1")
+    assert s.timeline(pi.Viewer("o"))["items"][0]["tombstoned"] is False
+
+
+def test_install_does_nothing_while_disabled_and_builds_lazily_when_enabled():
+    class Repo(FakeRepo):
+        subs = []
+        def subscribe(self, fn):
+            self.subs.append(fn)
+    repo, section = Repo(), {}
+    routes, bridge = br.install(repo, lambda: section, dsn="postgresql://unused-never-connected")
+    ev = dict(repo.streams[("ci_fix", "fix1")][0], entity_type="ci_fix", entity_id="fix1")
+    for _ in range(50):
+        bridge.on_event(ev)
+    assert bridge._thread is None and routes._store is None and bridge._q.qsize() == 0   # no thread, no DB, no queue
+    assert repo.subs == [bridge.on_event]

@@ -188,3 +188,37 @@ def test_record_versioning_and_scope():
         s.upsert_record("project", org_id="org1", record_id="p-binbase", name="x", expected_version=5)
     assert [r.id for r in s.records("investigation", pi.Viewer("org1", frozenset({"p-binbase"})))] == ["inv1"]
     assert s.records("project", pi.Viewer("org1", frozenset({"p-work"}))) == []
+
+
+def test_relationship_review_rules_and_tombstone_reevaluation():
+    s = store()
+    inferred = s.add_relationship(rel(derivation="inferred", confidence=0.7, extractor_version="v1"), cfg=ON, actor="u")
+    viewer = pi.Viewer("o" if False else "org1")
+    s.review_relationship(inferred.id, accept=True, actor="a", expected_version=1, viewer=viewer)   # -> confirmed (human_verified)
+    s.tombstone_source("org1", "gmail:msg-1")                    # the evidence's source disappears
+    again = s.neighbours("issue:7", viewer)[0]
+    assert again.review_state == "provisional" and again.version == 3
+    s.review_relationship(inferred.id, accept=False, actor="a", expected_version=3, viewer=viewer)
+    with pytest.raises(pi.Conflict):                              # rejected is final
+        s.review_relationship(inferred.id, accept=True, actor="a", expected_version=4, viewer=viewer)
+    verified = s.add_relationship(rel(to_ref="issue:8"), cfg=ON, actor="u")       # explicit/confirmed
+    with pytest.raises(pi.Conflict):
+        s.review_relationship(verified.id, accept=True, actor="a", expected_version=1, viewer=viewer)
+
+
+def test_dedupe_does_not_swallow_a_differently_labelled_relationship():
+    s = store()
+    a = s.add_relationship(rel(security_label="confidential"), cfg=ON, actor="u")
+    b = s.add_relationship(rel(security_label="internal"), cfg=ON, actor="u")
+    assert a.id != b.id
+
+
+def test_get_event_by_id_is_scoped_and_not_window_limited():
+    s = store()
+    first, _ = s.append_event(evt(), cfg=ON)
+    for i in range(600):
+        s.append_event(evt(source_id=f"x{i}", object_ref=f"email:x{i}"), cfg=ON)
+    guest = pi.Viewer("org1", frozenset({"p-binbase"}))
+    assert s.get_event(guest, first.event_id)["event_id"] == first.event_id        # older than the newest 500
+    with pytest.raises(pi.NotFound):
+        s.get_event(pi.Viewer("org1", frozenset({"p-other"})), first.event_id)

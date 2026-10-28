@@ -43,6 +43,20 @@ class ReplayGuard:
         self._cap = capacity
         self._lock = threading.Lock()
 
+    def seen(self, delivery_id: str | None) -> bool:
+        """Non-recording check. Pair with ``mark`` AFTER the event is durably stored, so GitHub's retry of a delivery
+        that failed to process is not dropped."""
+        if not delivery_id:
+            raise WebhookRejected("missing delivery id")
+        with self._lock:
+            return delivery_id in self._seen
+
+    def mark(self, delivery_id: str) -> None:
+        with self._lock:
+            self._seen[delivery_id] = None
+            if len(self._seen) > self._cap:
+                self._seen.popitem(last=False)
+
     def first_time(self, delivery_id: str | None) -> bool:
         if not delivery_id:
             raise WebhookRejected("missing delivery id")

@@ -134,3 +134,26 @@ test('phone width: no horizontal scroll, detail stacks above the list; dark mode
     await shot(page, 'timeline-desktop-dark.png');
   });
 });
+
+test('two quick filter changes: the slower, older response never overwrites the newer one', async () => {
+  await withPage(async (page, base) => {
+    await stub(page);
+    let n = 0;
+    await page.route('**/timeline?*', async (route) => {
+      const url = route.request().url();
+      const slow = !url.includes('category=fresh');   // the first (older) request has no category yet
+      if (slow) await new Promise((r) => setTimeout(r, 600));
+      n += 1;
+      route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(
+        { total: 1, items: [{ ...TL.items[0], event_id: slow ? 'old' : 'new', title: slow ? 'OLD RESULT' : 'NEW RESULT' }] }) });
+    });
+    await page.goto(`${base}/#/intelligence`);
+    await page.waitForSelector('.pi-item');
+    await page.fill('#pi-source', 'old'); await page.locator('#pi-source').blur();
+    await page.fill('#pi-category', 'fresh'); await page.locator('#pi-category').blur();
+    await page.waitForTimeout(1200);
+    const text = await page.locator('.pi-list').innerText();
+    assert.match(text, /NEW RESULT/); assert.doesNotMatch(text, /OLD RESULT/);
+    assert.ok(n >= 2);
+  });
+});

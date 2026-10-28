@@ -68,7 +68,10 @@ def test_review_and_pause_controls():
     assert r.post(["relationships", rel.id, "review"], dict(body, expected_version=7), KEY, "operator")[0] == 409
     assert r.post(["relationships", rel.id, "review"], body, KEY, "operator")[1]["review_state"] == "confirmed"
     assert routes(dict(FULL, suggest=False)).post(["relationships", "x", "review"], body, KEY, "operator")[0] == 409
-    assert r.post(["sources", "gh", "pause"], {}, KEY, "operator")[1] == {"source": "gh", "paused": True}
+    assert r.post(["sources", "gh", "pause"], {}, KEY, "operator")[0] == 404          # project-scoped: pausing is org-wide
+    admin = {"kind": "operator", "id": "key:adm", "authenticated_by": "api_key"}
+    r._section = lambda: dict(FULL, viewers=dict(FULL["viewers"], **{"key:adm": {"org_id": "org1", "projects": "*"}}))
+    assert r.post(["sources", "gh", "pause"], {}, admin, "operator")[1] == {"source": "gh", "paused": True}
     try:
         r.store.append_event({"org_id": "org1", "source_system": "gh", "source_instance": "i", "source_id": "n",
                               "event_type": "pr", "occurred_at": T0.isoformat(), "object_ref": "pr:n"}, cfg=pi.config(FULL))
@@ -83,3 +86,22 @@ def test_hot_kill_switch_takes_effect_on_the_next_request():
     assert r.get(["status"], {}, KEY, "operator")[0] == 200
     sec["enabled"] = False
     assert r.get(["status"], {}, KEY, "operator")[0] == 404
+
+
+def test_malformed_viewer_scope_sees_nothing_and_store_failure_is_503():
+    bad = dict(FULL, viewers={"key:abc": {"org_id": "org1", "projects": "p1"}})   # a bare string is not a list
+    assert routes(bad).get(["status"], {}, KEY, "operator")[0] == 404
+
+    class Down(pi.IntelligenceStore):
+        def records(self, *a, **k):
+            raise pi.StoreUnavailable("db")
+    r = IntelligenceRoutes(Down(), section_fn=lambda: FULL)
+    assert r.get(["projects"], {}, KEY, "operator")[0] == 503
+
+
+def test_store_is_built_lazily_and_never_when_disabled():
+    built = []
+    r = IntelligenceRoutes(store_fn=lambda: built.append(1) or pi.IntelligenceStore(), section_fn=lambda: {})
+    assert r.get(["status"], {}, KEY, "operator")[0] == 404 and built == []
+    r2 = IntelligenceRoutes(store_fn=lambda: built.append(1) or pi.IntelligenceStore(), section_fn=lambda: FULL)
+    assert r2.get(["projects"], {}, KEY, "operator")[0] == 200 and built == [1]

@@ -12,6 +12,7 @@ import binascii
 import hashlib
 import re
 from datetime import UTC, datetime
+from email.utils import parseaddr
 
 _ISSUE_URL = re.compile(r"https://github\.com/([\w.-]+/[\w.-]+)/(issues|pull)/(\d+)")
 _INJECTION = re.compile(r"(ignore (all |any )?(previous|prior) instructions|disregard (the )?(above|system)|"
@@ -46,8 +47,9 @@ def normalise_message(msg: dict, *, org_id: str, account: str, project_ids: tupl
     occurred = datetime.fromtimestamp(int(msg["internalDate"]) / 1000, UTC).isoformat()
     sender = h.get("from", "")
     # Identity is the address, never the display name (two people may share a name).
-    m = re.search(r"<([^>]+)>|([\w.+-]+@[\w.-]+)", sender)
-    actor = "email:" + (m.group(1) or m.group(2)).lower() if m else None
+    # parseaddr prefers the <angle> address over a display name that merely looks like one ("ceo@corp" <evil@x>).
+    address = parseaddr(sender)[1].lower()
+    actor = f"email:{address}" if re.fullmatch(r"[^@\s<>]+@[^@\s<>]+", address) else None
     text_hash, flagged, n_chars = hashlib.sha256(), False, 0
     attachments = []
     for path, part in _walk(msg.get("payload") or {}):
@@ -62,7 +64,7 @@ def normalise_message(msg: dict, *, org_id: str, account: str, project_ids: tupl
               "security_label": security_label, "visibility_scope": "private", "occurred_at": occurred,
               "correlation_id": tid, "actor_ref": actor}
     anchor = {"source_ref": f"gmail:{account}:{mid}", "anchor_type": "email_part"}
-    events = [dict(common, source_id=mid, source_version=str(msg.get("historyId", "")), event_type="email.received",
+    events = [dict(common, source_id=mid, source_version="", event_type="email.received",
                    object_ref=f"email:{mid}", title=(h.get("subject") or "(no subject)")[:200], category="email",
                    payload={"thread_id": tid, "message_id_header": h.get("message-id"), "body_sha256": text_hash.hexdigest(),
                             "body_chars": n_chars, "attachment_count": len(attachments), "untrusted": True,
@@ -70,7 +72,7 @@ def normalise_message(msg: dict, *, org_id: str, account: str, project_ids: tupl
                    provenance_refs=[dict(anchor, anchor_value="1")])]
     for path, part in attachments:
         body = part.get("body") or {}
-        events.append(dict(common, source_id=f"{mid}:{path}", source_version=str(msg.get("historyId", "")),
+        events.append(dict(common, source_id=f"{mid}:{path}", source_version="",
                            event_type="email.attachment", object_ref=f"attachment:{mid}:{path}", category="artifact",
                            title=f"attachment {part['filename']}"[:200], causation_id=mid,
                            payload={"filename": part["filename"], "declared_type": part.get("mimeType"),
@@ -80,7 +82,8 @@ def normalise_message(msg: dict, *, org_id: str, account: str, project_ids: tupl
 
 
 def explicit_links(msg: dict, *, org_id: str, project_ids: tuple[str, ...], account: str) -> list[dict]:
-    """Relationship candidates from issue/PR URLs literally present in the text. Explicit, not inferred."""
+    """Relationship candidates from issue/PR URLs present in the text. The sender is untrusted, so these are
+    provisional (``inferred``) until a person confirms them; an inbound email can never plant a confirmed link."""
     out, seen = [], set()
     for path, part in _walk(msg.get("payload") or {}):
         raw = _decode((part.get("body") or {}).get("data") or "")
@@ -90,7 +93,8 @@ def explicit_links(msg: dict, *, org_id: str, project_ids: tuple[str, ...], acco
                 continue
             seen.add(ref)
             out.append({"org_id": org_id, "project_ids": list(project_ids), "from_ref": f"email:{msg['id']}", "to_ref": ref,
-                        "predicate": "mentions", "derivation": "explicit", "security_label": "confidential",
+                        "predicate": "mentions", "derivation": "inferred", "confidence": 0.9,
+                        "extractor_version": "gmail-url-v1", "security_label": "confidential",
                         "evidence_refs": [{"source_ref": f"gmail:{account}:{msg['id']}", "anchor_type": "email_part",
                                            "anchor_value": path}]})
     return out

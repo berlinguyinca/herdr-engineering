@@ -11,33 +11,55 @@
 """
 from __future__ import annotations
 
-import fnmatch
+import re
 from dataclasses import dataclass, field
 from typing import Literal
 
 RISKS = ("low", "moderate", "high", "critical")
 
-# Order matters: the first matching rule wins within a tier, tiers are checked critical -> low.
-CRITICAL_PATHS = ("**/secrets/**", "**/*.pem", "**/*.key", "**/.env*", "**/billing/**", "**/iam/**",
-                  "deploy/**/prod*", "**/migrations/**-destructive*", "**/publication*", "**/artifact_acl*")
-HIGH_PATHS = (
-    ".woodpecker/**", ".github/**", "deploy/**", "ansible/**", "**/migrations/**", "**/*.sql",
-    "package.json", "package-lock.json", "pyproject.toml", "**/requirements*.txt", "**/Cargo.toml",
-    "**/Cargo.lock", "**/go.mod", "**/go.sum", "*.lock",
-    "**/auth*", "**/*_auth*", "**/*rbac*", "**/*acl*", "**/*secret*", "**/*token*", "**/scheduler*",
-    "**/review_gate/**", "**/*policy*", "**/*benchmark*", "**/*scoring*", "**/api.py",
-)
-LOW_DOC_PATHS = ("docs/**", "**/*.md", "README*", "CHANGELOG*")
-FIXTURE_PATHS = ("tests/fixtures/**", "**/fixtures/**", "**/testdata/**")
+def _glob(pattern: str) -> re.Pattern:
+    """POSIX-style glob: ``*`` never crosses ``/``; ``**/`` is any depth (including none); ``**`` at the end is anything."""
+    out, i = "", 0
+    while i < len(pattern):
+        if pattern.startswith("**/", i):
+            out += "(?:.*/)?"; i += 3
+        elif pattern.startswith("**", i):
+            out += ".*"; i += 2
+        elif pattern[i] == "*":
+            out += "[^/]*"; i += 1
+        elif pattern[i] == "?":
+            out += "[^/]"; i += 1
+        else:
+            out += re.escape(pattern[i]); i += 1
+    return re.compile(out + r"\Z")
 
 
 def _match(path: str, patterns) -> bool:
-    return any(fnmatch.fnmatch(path, p) or fnmatch.fnmatch("/" + path, "*/" + p.lstrip("*/")) for p in patterns)
+    p = path.lower().removeprefix("./").lstrip("/")
+    return any(_glob(x.lower()).match(p) for x in patterns)
+
+
+CRITICAL_PATHS = ("**/secrets/**", "**/*.pem", "**/*.key", "**/*.p12", "**/*.pfx", "**/id_rsa*", "**/id_ed25519*", "**/.env*",
+                  "**/billing/**", "**/iam/**", "deploy/**/prod*", "**/publication*", "**/artifact_acl*", "**/.npmrc", "**/.pypirc",
+                  "**/credentials*")
+HIGH_PATHS = (
+    ".woodpecker*", ".woodpecker/**", ".github/**", "deploy/**", "ansible/**", "**/migrations/**", "**/*.sql", "**/dockerfile*",
+    "**/makefile", "**/*.sh", "**/*.tf", "**/tox.ini", "**/conftest.py", "**/codeowners", "**/.gitmodules",
+    "package.json", "package-lock.json", "pyproject.toml", "**/requirements*.txt", "**/cargo.toml", "**/cargo.lock",
+    "**/go.mod", "**/go.sum", "**/*.lock",
+    "**/auth*", "**/*_auth*", "**/*rbac*", "**/*acl*", "**/*secret*", "**/*token*", "**/scheduler*",
+    "**/review_gate/**", "**/*policy*", "**/*benchmark*", "**/*scoring*", "**/api.py",
+    # agent instructions, skills and prompt templates steer agents: never "docs"
+    "**/skill.md", "**/agents.md", "**/claude.md", "**/skills/**", "**/*prompt*", "**/.claude/**", "**/.agents/**",
+)
+LOW_DOC_PATHS = ("docs/**/*.md", "docs/**/*.png", "docs/**/*.txt", "readme", "readme.md", "readme.rst", "changelog", "changelog.md",
+                 "contributing.md", "license")
+FIXTURE_PATHS = ("tests/fixtures/**", "**/fixtures/**", "**/testdata/**")
 
 
 @dataclass(frozen=True)
 class Change:
-    paths: tuple[str, ...]
+    paths: tuple[str, ...]       # callers MUST include the OLD path of every rename and deletion
     additions: int = 0
     deletions: int = 0
     formatting_only: bool = False          # declared by a deterministic formatter diff, not by a model
@@ -78,7 +100,11 @@ class RepairPolicy:
     max_patch_lines: int = 200
     require_human_approval: bool = True                 # a bot approval never satisfies this
     max_attempts: int = 3
-    max_open_repair_prs: int = 2
+    max_open_repair_prs: int = 2          # open repair PRs OTHER than the one being evaluated
+
+    def __post_init__(self):
+        if not self.auto_merge_risks <= {"low", "moderate"}:
+            raise ValueError("auto_merge_risks may only contain low or moderate")
 
 
 @dataclass(frozen=True)
@@ -137,7 +163,7 @@ def evaluate(policy: RepairPolicy, ev: Evidence) -> PolicyDecision:
         human.append(f"branch {ev.base_branch} not authorised")
     if risk not in policy.auto_merge_risks:
         human.append(f"risk class {risk} requires a human ({'; '.join(risk_reasons)})")
-    if ev.change.additions + ev.change.deletions > policy.max_patch_lines:
+    if ev.change.additions < 0 or ev.change.deletions < 0 or ev.change.additions + ev.change.deletions > policy.max_patch_lines:
         human.append("patch exceeds size budget")
     if ev.conflicting_incident:
         human.append("conflicting active incident")
@@ -155,7 +181,9 @@ def evaluate(policy: RepairPolicy, ev: Evidence) -> PolicyDecision:
         human.append("review is not on the current head SHA")
     if not ev.reviewer_context or ev.reviewer_context == ev.author_context:
         human.append("reviewer is not an independent execution context")
-    if ev.reviewer_model_family and ev.reviewer_model_family == ev.author_model_family:
+    if not ev.reviewer_model_family or not ev.author_model_family:
+        human.append("reviewer/author model families are not both known")
+    elif ev.reviewer_model_family == ev.author_model_family:
         human.append("reviewer shares the author's model family")
     for name in ev.required_checks:
         if name not in ev.check_status:
@@ -184,8 +212,9 @@ STATES = ("DETECTED", "TRIAGED", "INVESTIGATING", "PROPOSED", "AUTHORIZED", "EXE
 _FORWARD = {"DETECTED": "TRIAGED", "TRIAGED": "INVESTIGATING", "INVESTIGATING": "PROPOSED",
             "PROPOSED": "AUTHORIZED", "AUTHORIZED": "EXECUTING", "EXECUTING": "REVIEWING",
             "REVIEWING": "VERIFYING", "VERIFYING": "COMPLETED"}
-TERMINAL = frozenset({"COMPLETED", "FAILED", "CANCELLED"})
+TERMINAL = frozenset({"FAILED", "CANCELLED", "ROLLBACK_REQUESTED"})   # COMPLETED may still request a rollback
 _SIDE = frozenset({"BLOCKED", "AWAITING_APPROVAL", "FAILED", "CANCELLED", "ROLLBACK_REQUESTED"})
+_PAUSES = ("BLOCKED", "AWAITING_APPROVAL")
 
 
 class IllegalTransition(ValueError):
@@ -228,16 +257,22 @@ class Incident:
             raise IllegalTransition(f"unknown state {to}")
         if cur in TERMINAL:
             raise IllegalTransition(f"{cur} is terminal")
-        if to == "ROLLBACK_REQUESTED" and cur not in ("VERIFYING", "COMPLETED"):
-            raise IllegalTransition("rollback is only requested from post-merge verification")
-        legal = (to == _FORWARD.get(cur)) or (to in _SIDE and to != cur) \
-            or (cur in ("BLOCKED", "AWAITING_APPROVAL") and to == self.paused_from) \
-            or (cur in ("BLOCKED", "AWAITING_APPROVAL") and to == _FORWARD.get(self.paused_from or ""))
-        if not legal:
+        if cur == "COMPLETED":
+            if to != "ROLLBACK_REQUESTED":
+                raise IllegalTransition("COMPLETED only allows a rollback request")
+        elif to == "ROLLBACK_REQUESTED":
+            if cur != "VERIFYING":
+                raise IllegalTransition("rollback is only requested from post-merge verification or after completion")
+        elif cur in _PAUSES:
+            origin = self.paused_from
+            # Leaving a pause returns to where it began (or its next step); moving between pauses keeps the origin.
+            if not (to in _PAUSES and to != cur) and to not in (origin, _FORWARD.get(origin or ""), "FAILED", "CANCELLED"):
+                raise IllegalTransition(f"{cur} -> {to} is not allowed")
+        elif not (to == _FORWARD.get(cur) or (to in _SIDE and to != cur)):
             raise IllegalTransition(f"{cur} -> {to} is not allowed")
-        if to in ("BLOCKED", "AWAITING_APPROVAL"):
+        if to in _PAUSES and cur not in _PAUSES:
             self.paused_from = cur
-        elif cur in ("BLOCKED", "AWAITING_APPROVAL"):
+        elif cur in _PAUSES and to not in _PAUSES:
             self.paused_from = None
         self.history.append(Transition(at, cur, to, cause_event, policy_version, agent_run_id))
         self.state = to

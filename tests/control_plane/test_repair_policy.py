@@ -147,3 +147,66 @@ def test_circuit_breaker_needs_an_operator_to_close():
     assert cb.open  # success does not self-heal
     cb.reset()
     assert not cb.open
+
+
+# ---- independent-review findings (2026-10-28) ----------------------------------------------------------------
+@pytest.mark.parametrize("path,risk", [
+    ("docs/CODEOWNERS", "high"), ("src/README_loader.py", "moderate"), ("pkg/docs/hooks.py", "moderate"),
+    ("x/CHANGELOG_x.py", "moderate"), ("skills/x/SKILL.md", "high"), ("packages/a/AGENTS.md", "high"),
+    ("prompts/review-prompt.md", "high"), (".woodpecker.yml", "high"), ("Dockerfile", "high"), ("Makefile", "high"),
+    ("scripts/run.sh", "high"), (".npmrc", "critical"), ("creds/id_rsa", "critical"), ("certs/a.p12", "critical"),
+    ("a/KEY.PEM", "critical"), (".env", "critical"), ("cfg/.env.prod", "critical"), ("infra/main.tf", "high"),
+    ("docs/guide/setup.md", "low"), ("README.md", "low"), ("./docs/a.md", "low"),
+])
+def test_path_classification_regressions(path, risk):
+    assert rp.classify_risk(rp.Change((path,)))[0] == risk
+
+
+def test_a_rename_into_docs_is_judged_by_its_old_path_when_the_caller_supplies_it():
+    assert rp.classify_risk(rp.Change(("src/auth.py", "docs/auth.md")))[0] == "high"
+
+
+def test_unknown_model_family_is_not_independence():
+    for kw in ({"reviewer_model_family": None}, {"author_model_family": None}, {"reviewer_model_family": None, "author_model_family": None}):
+        d = rp.evaluate(POLICY, ev(**kw))
+        assert d.outcome == "require_human" and any("model families" in r for r in d.reasons)
+
+
+def test_negative_sizes_and_bad_policy_are_refused():
+    assert rp.evaluate(POLICY, ev(change=rp.Change(("docs/a.md",), additions=-5, deletions=1))).outcome == "require_human"
+    with pytest.raises(ValueError):
+        rp.RepairPolicy(auto_merge_risks=frozenset({"high"}))
+
+
+def walk(inc, *states):
+    for s in states:
+        inc.transition(s, at="t", cause_event="e", policy_version="v")
+
+
+def test_moving_between_pause_states_keeps_the_origin():
+    inc = rp.Incident("k")
+    walk(inc, "TRIAGED", "INVESTIGATING", "BLOCKED", "AWAITING_APPROVAL")
+    assert inc.paused_from == "INVESTIGATING"
+    walk(inc, "INVESTIGATING")                      # resumes where it was
+    walk(inc, "PROPOSED")
+    inc2 = rp.Incident("k2")
+    walk(inc2, "TRIAGED", "INVESTIGATING", "AWAITING_APPROVAL", "BLOCKED", "AWAITING_APPROVAL")
+    walk(inc2, "PROPOSED")                          # or its next step
+
+
+def test_a_pause_cannot_skip_ahead():
+    inc = rp.Incident("k")
+    walk(inc, "TRIAGED", "BLOCKED")
+    with pytest.raises(rp.IllegalTransition):
+        walk(inc, "EXECUTING")
+    walk(inc, "FAILED")
+
+
+def test_rollback_after_completion_is_possible_but_then_final():
+    inc = rp.Incident("k")
+    walk(inc, "TRIAGED", "INVESTIGATING", "PROPOSED", "AUTHORIZED", "EXECUTING", "REVIEWING", "VERIFYING", "COMPLETED")
+    with pytest.raises(rp.IllegalTransition):
+        walk(inc, "TRIAGED")
+    walk(inc, "ROLLBACK_REQUESTED")
+    with pytest.raises(rp.IllegalTransition):
+        walk(inc, "COMPLETED")

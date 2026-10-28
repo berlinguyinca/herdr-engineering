@@ -21,6 +21,8 @@ _ALLOWED = frozenset({"image/png", "image/jpeg", "image/gif", "application/pdf",
                       "application/zip-ooxml", "application/xml-scientific"})
 _ACTIVE_MARKERS = (b"<script", b"javascript:", b"onload=", b"onerror=", b"<iframe", b"<foreignobject", b"<!doctype html", b"<html")
 _MACRO_ENTRIES = ("vbaproject.bin", "macros/", "xl/macrosheets")
+_OOXML_EXTERNAL = ("externallinks/", "embeddings/", "oleobject")
+_PDF_ACTIVE = (b"/javascript", b"/js ", b"/js\n", b"/js/", b"/openaction", b"/launch", b"/embeddedfile", b"/richmedia", b"/submitform")
 
 
 @dataclass(frozen=True)
@@ -61,7 +63,8 @@ def _zip_findings(data: bytes) -> tuple[list[str], str]:
             total = sum(i.file_size for i in infos)
             if total > MAX_UNCOMPRESSED:
                 reasons.append("uncompressed size over budget")
-            if any(i.compress_size and i.file_size / max(i.compress_size, 1) > MAX_RATIO for i in infos):
+            if any((i.compress_size == 0 and i.file_size > 0)
+                   or (i.compress_size and i.file_size / i.compress_size > MAX_RATIO) for i in infos):
                 reasons.append("suspicious compression ratio (possible zip bomb)")
             for i in infos:
                 n = i.filename.lower()
@@ -69,6 +72,8 @@ def _zip_findings(data: bytes) -> tuple[list[str], str]:
                     reasons.append("path traversal entry")
                 if any(m in n for m in _MACRO_ENTRIES):
                     reasons.append("macro content")
+                if any(m in n for m in _OOXML_EXTERNAL):
+                    reasons.append("external link or embedded object")
                 if n.endswith(".zip"):
                     reasons.append("nested archive")
             if any(i.filename.startswith(("word/", "xl/", "ppt/")) for i in infos):
@@ -87,8 +92,11 @@ def triage(data: bytes, declared_type: str | None = None, filename: str = "") ->
     if mime == "application/zip":
         zr, mime = _zip_findings(data)
         reasons += zr
-    low = data[:65536].lower()
-    if mime in ("image/svg+xml", "text/html") or any(m in low for m in _ACTIVE_MARKERS) and mime != "application/pdf":
+    low = data.lower()     # whole content (bounded by MAX_BYTES): markers after the first 64 KiB still count
+    if mime == "application/pdf":
+        if any(m in low for m in _PDF_ACTIVE) or b"<script" in low:
+            reasons.append("active PDF content (script, launch action or embedded file)")
+    elif mime in ("image/svg+xml", "text/html") or any(m in low for m in _ACTIVE_MARKERS):
         reasons.append("active content")
     if mime == "application/x-ole":
         reasons.append("legacy OLE document (macros cannot be excluded)")

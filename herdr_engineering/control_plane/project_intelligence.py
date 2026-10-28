@@ -55,6 +55,10 @@ class NotFound(LookupError):
     """Unknown or not visible to the viewer (HTTP 404; indistinguishable on purpose)."""
 
 
+class StoreUnavailable(RuntimeError):
+    """The durable store cannot be used (HTTP 503)."""
+
+
 class IngestionPaused(RuntimeError):
     """Ingestion is paused for this source, or the kill switch is on (HTTP 409)."""
 
@@ -348,6 +352,11 @@ class IntelligenceStore:
                         ev.object_ref == source_ref or any(e.source_ref == source_ref for e in ev.evidence)):
                     self._events[eid] = replace(ev, tombstoned=True, payload={}, title="[removed at source]")
                     n += 1
+            # Derived output that cited the removed source is no longer backed by it: back to provisional review.
+            for rid, rel in list(self._rels.items()):
+                if rel.org_id == org_id and rel.review_state == "confirmed" and rel.derivation != "system_verified" \
+                        and any(e.source_ref == source_ref for e in rel.evidence):
+                    self._rels[rid] = replace(rel, review_state="provisional", version=rel.version + 1)
         return n
 
     def outbox_pending(self, consumer: str) -> list[str]:
@@ -396,6 +405,15 @@ class IntelligenceStore:
         } for e in events[-limit:]]
         return {"items": items, "total": len(events)}
 
+    def get_event(self, viewer: Viewer, event_id: str) -> dict:
+        """One event by id under the viewer's scope; unknown and hidden are indistinguishable."""
+        with self._lock:
+            ev = self._events.get(event_id)
+        if ev is None or not viewer.may_see(ev.org_id, ev.project_ids, ev.security_label):
+            raise NotFound("event")
+        return {"event_id": ev.event_id, "project_ids": list(ev.project_ids), "evidence_refs": [r.as_dict() for r in ev.evidence],
+                "label": "verified" if ev.evidence else "unverified", "tombstoned": ev.tombstoned}
+
     # ---- relationships / findings ---------------------------------------------------------
     def add_relationship(self, raw: dict, *, cfg: dict, actor: str) -> Relationship:
         derivation = raw.get("derivation")
@@ -430,7 +448,8 @@ class IntelligenceStore:
         with self._lock:
             # Idempotent on (from, predicate, to, org) for a live relationship.
             for cur in self._rels.values():
-                if (cur.org_id, cur.from_ref, cur.predicate, cur.to_ref) == (org, rel.from_ref, predicate, rel.to_ref) \
+                if (cur.org_id, cur.from_ref, cur.predicate, cur.to_ref, cur.security_label, cur.project_ids) == \
+                        (org, rel.from_ref, predicate, rel.to_ref, rel.security_label, rel.project_ids) \
                         and cur.review_state != "rejected" and cur.superseded_by is None:
                     return cur
             self._rels[rel.id] = rel
@@ -444,6 +463,10 @@ class IntelligenceStore:
                 raise NotFound("relationship")
             if cur.version != expected_version:
                 raise Conflict(f"relationship is at version {cur.version}")
+            if cur.review_state != "provisional" and cur.derivation in ("system_verified", "explicit") and accept:
+                raise Conflict("a verified relationship is not re-reviewed")
+            if cur.review_state == "rejected":
+                raise Conflict("a rejected relationship is final; propose a new one")
             new = replace(cur, review_state="confirmed" if accept else "rejected", version=cur.version + 1,
                           derivation="human_verified" if accept else cur.derivation, verified_by=actor)
             self._rels[rel_id] = new

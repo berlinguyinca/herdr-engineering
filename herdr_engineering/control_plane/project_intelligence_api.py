@@ -18,9 +18,16 @@ READ_ROLES = frozenset({"viewer", "operator"})
 
 
 class IntelligenceRoutes:
-    def __init__(self, store: pi.IntelligenceStore | None = None, section_fn=lambda: {}):
-        self.store = store or pi.IntelligenceStore()
+    def __init__(self, store: pi.IntelligenceStore | None = None, section_fn=lambda: {}, store_fn=None):
+        """``store_fn`` builds the store lazily (only once the feature is enabled); ``store`` is for tests/embedding."""
+        self._store, self._store_fn = store, store_fn
         self._section = section_fn
+
+    @property
+    def store(self) -> pi.IntelligenceStore:
+        if self._store is None:
+            self._store = self._store_fn() if self._store_fn else pi.IntelligenceStore()
+        return self._store
 
     def _cfg(self) -> tuple[dict, dict]:
         raw = self._section() or {}
@@ -33,8 +40,9 @@ class IntelligenceRoutes:
         if isinstance(entry, dict) and isinstance(entry.get("org_id"), str):
             projects = entry.get("projects")
             clearance = entry.get("clearance", "internal")
-            if clearance not in pi.LABELS:
-                return None
+            if clearance not in pi.LABELS or not (projects == "*" or (
+                    isinstance(projects, list) and all(isinstance(x, str) for x in projects))):
+                return None     # a malformed scope sees nothing (a bare string would otherwise become a set of letters)
             return pi.Viewer(entry["org_id"], None if projects == "*" else frozenset(projects or ()), clearance)
         org = raw.get("default_org_id")
         if principal.get("authenticated_by") == "open_listener" and isinstance(org, str):
@@ -76,6 +84,8 @@ class IntelligenceRoutes:
                 return 200, {"items": self.store.findings(viewer)}
         except (pi.IntelligenceError, ValueError) as exc:
             return 400, {"error": str(exc)}
+        except pi.StoreUnavailable:
+            return 503, {"error": "store unavailable"}
         return 404, {"error": "not found"}
 
     def post(self, parts: list[str], body: dict, principal: dict, role: str | None):
@@ -98,10 +108,14 @@ class IntelligenceRoutes:
                                                      expected_version=version, viewer=viewer)
                 return 200, {"id": rel.id, "review_state": rel.review_state, "version": rel.version}
             if len(parts) == 3 and parts[0] == "sources" and parts[2] in ("pause", "resume"):
+                if viewer.project_ids is not None:     # pausing a source is org-wide: project-scoped viewers may not
+                    return 404, {"error": "not found"}
                 self.store.pause_source(viewer.org_id, parts[1], parts[2] == "pause")
                 return 200, {"source": parts[1], "paused": parts[2] == "pause"}
         except pi.NotFound:
             return 404, {"error": "not found"}
+        except pi.StoreUnavailable:
+            return 503, {"error": "store unavailable"}
         except pi.Conflict as exc:
             return 409, {"error": str(exc)}
         except pi.IntelligenceError as exc:

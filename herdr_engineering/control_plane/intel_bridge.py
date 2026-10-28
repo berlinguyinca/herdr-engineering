@@ -18,6 +18,7 @@ import json
 import logging
 import queue
 import threading
+import time
 from collections.abc import Callable
 from datetime import UTC, datetime
 
@@ -27,8 +28,7 @@ log = logging.getLogger(__name__)
 TABLES = ("pi_record", "pi_source_state", "pi_event", "pi_outbox", "pi_relationship", "pi_finding", "pi_audit")
 
 
-class StoreUnavailable(RuntimeError):
-    pass
+StoreUnavailable = pi.StoreUnavailable
 
 
 class StoreNotMigrated(StoreUnavailable):
@@ -188,54 +188,65 @@ class DurableIntelligenceStore(pi.IntelligenceStore):
             for r in data["outbox"]:
                 self._outbox[(r["event_id"], r["consumer"])] = {"event_id": r["event_id"], "consumer": r["consumer"], "done": r["done"]}
 
-    def append_event(self, raw, *, cfg):
-        ev, created = super().append_event(raw, cfg=cfg)
-        if created:
+    def _snapshot(self):
+        with self._lock:
+            return (dict(self._events), dict(self._records), dict(self._rels), dict(self._findings),
+                    {k: dict(x) for k, x in self._outbox.items()}, set(self._paused))
+
+    def _restore(self, snap) -> None:
+        with self._lock:
+            self._events, self._records, self._rels, self._findings, self._outbox, self._paused = (
+                dict(snap[0]), dict(snap[1]), dict(snap[2]), dict(snap[3]), {k: dict(x) for k, x in snap[4].items()}, set(snap[5]))
+
+    def _durable(self, mutate, persist):
+        """Mutate memory, persist, and on a failed write put memory back: it is never ahead of the database."""
+        with self._lock:
+            snap = self._snapshot()
             try:
-                self._pg.save_event(ev)
+                result = mutate()
+                persist(result)
+                return result
             except StoreUnavailable:
-                with self._lock:   # memory must never be ahead of the database
-                    self._events.pop(ev.event_id, None)
-                    for consumer in ("timeline", "intelligence"):
-                        self._outbox.pop((ev.event_id, consumer), None)
+                self._restore(snap)
                 raise
-        return ev, created
+
+    def append_event(self, raw, *, cfg):
+        def persist(res):
+            if res[1]:
+                self._pg.save_event(res[0])
+        # Held under the lock so a concurrent identical append can never observe a not-yet-durable event.
+        return self._durable(lambda: super(DurableIntelligenceStore, self).append_event(raw, cfg=cfg), persist)
 
     def tombstone_source(self, org_id, source_ref):
-        before = {k for k, v in self._events.items() if v.tombstoned}
-        n = super().tombstone_source(org_id, source_ref)
-        changed = [k for k, v in self._events.items() if v.tombstoned and k not in before]
-        if changed:
-            self._pg.mark_tombstoned(changed)
-        return n
+        def persist(_):
+            ids = [k for k, v in self._events.items() if v.tombstoned and v.org_id == org_id]
+            if ids:
+                self._pg.mark_tombstoned(ids)
+            for rel in self._rels.values():
+                if rel.org_id == org_id:
+                    self._pg.save_relationship(rel)
+        return self._durable(lambda: super(DurableIntelligenceStore, self).tombstone_source(org_id, source_ref), persist)
 
     def outbox_ack(self, event_id, consumer):
-        super().outbox_ack(event_id, consumer)
-        self._pg.ack(event_id, consumer)
+        self._durable(lambda: super(DurableIntelligenceStore, self).outbox_ack(event_id, consumer),
+                      lambda _: self._pg.ack(event_id, consumer))
 
     def upsert_record(self, kind, **kw):
-        rec = super().upsert_record(kind, **kw)
-        self._pg.save_record(rec)
-        return rec
+        return self._durable(lambda: super(DurableIntelligenceStore, self).upsert_record(kind, **kw), self._pg.save_record)
 
     def add_relationship(self, raw, *, cfg, actor):
-        rel = super().add_relationship(raw, cfg=cfg, actor=actor)
-        self._pg.save_relationship(rel)
-        return rel
+        return self._durable(lambda: super(DurableIntelligenceStore, self).add_relationship(raw, cfg=cfg, actor=actor),
+                             self._pg.save_relationship)
 
     def review_relationship(self, rel_id, **kw):
-        rel = super().review_relationship(rel_id, **kw)
-        self._pg.save_relationship(rel)
-        return rel
+        return self._durable(lambda: super(DurableIntelligenceStore, self).review_relationship(rel_id, **kw), self._pg.save_relationship)
 
     def add_finding(self, raw):
-        f = super().add_finding(raw)
-        self._pg.save_finding(f)
-        return f
+        return self._durable(lambda: super(DurableIntelligenceStore, self).add_finding(raw), self._pg.save_finding)
 
     def pause_source(self, org_id, source_system, paused=True):
-        super().pause_source(org_id, source_system, paused)
-        self._pg.save_pause(org_id, source_system, paused)
+        self._durable(lambda: super(DurableIntelligenceStore, self).pause_source(org_id, source_system, paused),
+                      lambda _: self._pg.save_pause(org_id, source_system, paused))
 
 
 # ---- live-event bridge ---------------------------------------------------------------------------------------
@@ -374,18 +385,19 @@ def make_resolver(repo, forge_host: str | Callable[[], str | None] | None = None
     """Resolve an event's project from its repository via the existing ``project_links`` mapping.
 
     A ``ci_fix`` stream names its repository only in the first event, so later events look it up there.
-    Artifacts carry no repository, so they resolve only when their payload says so (otherwise: unmapped).
+    Artifacts carry no verified repository linkage, so they stay unmapped until a server-verified link exists.
     A bare ``owner/name`` names no forge, so it resolves only when the operator configured ``forge_host``
     (``control_plane.project_intelligence.forge_host``); without it the event is unmapped, never guessed.
     """
     from .project_links import canonical_repository, project_for_repository
 
     def resolve(ev: dict) -> tuple[str, ...]:
-        payload = ev.get("payload") or {}
-        repository = payload.get("repository")
-        if not repository and ev.get("entity_type") == "ci_fix":
-            first = repo.stream("ci_fix", ev.get("entity_id"))[:1]
-            repository = ((first[0].get("payload") or {}).get("repository")) if first else None
+        # Only a ci_fix stream is placed, from its own validated first event (CIFixService checks the repository
+        # allow-list). Artifact payloads are uploader-supplied text and never place an event in a project.
+        if ev.get("entity_type") != "ci_fix":
+            return ()
+        first = repo.stream("ci_fix", ev.get("entity_id"))[:1]
+        repository = ((first[0].get("payload") or {}).get("repository")) if first else None
         host = forge_host() if callable(forge_host) else forge_host
         identity = canonical_repository(repository, forge_host=host) if repository else None
         project = project_for_repository(identity) if identity else None
@@ -394,21 +406,63 @@ def make_resolver(repo, forge_host: str | Callable[[], str | None] | None = None
 
 
 def install(repo, section_fn: Callable[[], dict], dsn: str | None = None):
-    """Build the store, routes and live bridge for one control-plane server. Returns ``(routes, bridge)``.
+    """Wire project intelligence into one control-plane server. Returns ``(routes, bridge)``.
 
-    A configured ``dsn`` selects the durable store; tables not yet migrated (or a database that is down) fall back to
-    memory with a warning, so code and migration can roll in either order. Nothing runs unless the flags are on.
+    With the feature disabled (the default) this costs one cached dict read per recorded event: no database
+    connection, no thread, no table load. The store (durable when ``dsn`` is set and the tables are migrated,
+    else memory with a warning), and the worker thread are created the first time the feature is seen enabled.
     """
     from .project_intelligence_api import IntelligenceRoutes
-    store: pi.IntelligenceStore = pi.IntelligenceStore()
-    if dsn:
-        try:
-            store = DurableIntelligenceStore(PgPersistence(dsn))
-        except StoreUnavailable as exc:
-            log.warning("project intelligence is running in memory only: %s", type(exc).__name__)
-    section = lambda: section_fn() or {}  # noqa: E731
-    bridge = EventBridge(store, section, make_resolver(repo, lambda: section().get("forge_host")),
-                         org_id=lambda: section().get("default_org_id"), instance=str(section().get("instance") or "herdr"))
+    ttl = 2.0
+    cache: dict = {"at": 0.0, "value": {}}
+
+    def section() -> dict:
+        now = time.monotonic()
+        if now - cache["at"] > ttl:
+            try:
+                cache["value"] = dict(section_fn() or {})
+            except Exception:  # noqa: BLE001 - config trouble means "off", never an exception into the repo
+                cache["value"] = {}
+            cache["at"] = now
+        return cache["value"]
+
+    lock = threading.Lock()
+    holder: dict = {}
+
+    def store() -> pi.IntelligenceStore:
+        with lock:
+            if "store" not in holder:
+                built: pi.IntelligenceStore = pi.IntelligenceStore()
+                if dsn:
+                    try:
+                        built = DurableIntelligenceStore(PgPersistence(dsn))
+                    except StoreUnavailable as exc:
+                        log.warning("project intelligence is running in memory only: %s", type(exc).__name__)
+                holder["store"] = built
+            return holder["store"]
+
+    class LazyBridge(EventBridge):
+        def __init__(self):
+            super().__init__(None, section, make_resolver(repo, lambda: section().get("forge_host")),
+                             org_id=lambda: section().get("default_org_id"), instance=str(section().get("instance") or "herdr"))
+
+        @property
+        def store(self):  # type: ignore[override]
+            return store()
+
+        @store.setter
+        def store(self, _):
+            pass
+
+        def on_event(self, ev: dict) -> None:
+            if section().get("enabled") is not True:
+                return          # disabled (the default): no store, no thread, nothing queued
+            if self._thread is None:
+                with lock:
+                    if self._thread is None:
+                        self.start()
+            super().on_event(ev)
+
+    bridge = LazyBridge()
     repo.subscribe(bridge.on_event)
-    bridge.start()
-    return IntelligenceRoutes(store, section_fn), bridge
+    return IntelligenceRoutes(store_fn=store, section_fn=section_fn), bridge

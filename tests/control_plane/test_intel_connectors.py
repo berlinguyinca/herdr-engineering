@@ -34,6 +34,14 @@ def test_signature_valid_tampered_missing_and_unconfigured():
         wh.verify_signature(b"s3", b"x" * (wh.MAX_BODY + 1), sign(b"s3", b"x"))
 
 
+def test_replay_guard_marks_only_after_success_so_retries_are_not_dropped():
+    g = wh.ReplayGuard()
+    assert not g.seen("d9")          # processing fails here: nothing recorded
+    assert not g.seen("d9")          # GitHub retries: still accepted
+    g.mark("d9")
+    assert g.seen("d9")
+
+
 def test_replay_guard_rejects_second_delivery():
     g = wh.ReplayGuard(capacity=2)
     assert g.first_time("d1") and not g.first_time("d1")
@@ -167,6 +175,18 @@ def test_gmail_events_have_provenance_and_no_body_text():
     assert s.timeline(pi.Viewer("o", frozenset({"p-binbase"}), "internal"))["total"] == 0  # label clearance
 
 
+def test_a_display_name_that_looks_like_an_address_cannot_spoof_the_sender():
+    e = gm.normalise_message(msg(sender='"ceo@corp.example" <attacker@evil.example>'), org_id="o", account="x", project_ids=())[0]
+    assert e["actor_ref"] == "email:attacker@evil.example"
+
+
+def test_label_changes_do_not_create_new_events():
+    a = msg(); b = msg(); b["historyId"] = "99"; b["labelIds"] = ["INBOX", "STARRED"]
+    ea = gm.normalise_message(a, org_id="o", account="x", project_ids=())[0]
+    eb = gm.normalise_message(b, org_id="o", account="x", project_ids=())[0]
+    assert (ea["source_id"], ea["source_version"]) == (eb["source_id"], eb["source_version"])
+
+
 def test_same_display_name_different_addresses_stay_distinct():
     a = gm.normalise_message(msg("m1", sender="Alex Kim <a@one.example>"), org_id="o", account="x", project_ids=())[0]
     b = gm.normalise_message(msg("m2", sender="Alex Kim <b@two.example>"), org_id="o", account="x", project_ids=())[0]
@@ -187,7 +207,7 @@ def test_explicit_issue_links_become_evidence_backed_relationships():
     s = pi.IntelligenceStore(clock=lambda: T)
     for x in links:
         r = s.add_relationship(x, cfg=ON, actor="ingest")
-        assert r.derivation == "explicit" and r.review_state == "confirmed" and r.evidence
+        assert r.derivation == "inferred" and r.review_state == "provisional" and r.evidence   # email text is untrusted
     # a similar-subject email in another project is NOT linked to this issue
     other = gm.explicit_links(msg("m9", body="no links here"), org_id="o", project_ids=("p2",), account="acct")
     assert other == []
@@ -205,3 +225,15 @@ def test_undecodable_body_is_treated_as_empty_not_an_error():
     m = msg(); m["payload"]["parts"][0]["body"]["data"] = "!!!not base64!!!"
     assert gm.normalise_message(m, org_id="o", account="a", project_ids=())[0]["payload"]["body_chars"] >= 0
     assert gm.explicit_links(m, org_id="o", project_ids=(), account="a") == []
+
+
+def test_active_pdfs_late_markers_and_ooxml_externals_are_not_accepted():
+    for body in (b"%PDF-1.7 << /OpenAction << /S /JavaScript /JS (app.alert(1)) >> >>", b"%PDF-1.4 <script>app.alert(1)</script>",
+                 b"%PDF-1.4 /Launch /Win"):
+        t = att.triage(body, "application/pdf", "a.pdf")
+        assert t.verdict == "quarantine" and not t.previewable, body
+    late = PNG + b"\0" * 70_000 + b"<script>alert(1)</script>"
+    assert att.triage(late, "image/png", "p.png").verdict == "quarantine"            # marker beyond the first 64 KiB
+    assert att.triage(make_zip([("word/document.xml", b"<w/>"), ("word/embeddings/o.bin", b"x")]),
+                      "application/vnd.openxmlformats-officedocument.wordprocessingml.document").verdict == "quarantine"
+    assert att.triage(make_zip([("a/b.txt", b"hi")], zipfile.ZIP_STORED), "application/zip").verdict in ("accept", "quarantine")

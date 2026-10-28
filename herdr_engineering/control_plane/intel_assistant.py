@@ -59,12 +59,12 @@ class ReadTools:
         return out
 
     def evidence_open(self, viewer: pi.Viewer, project_id: str, event_id: str) -> dict:
-        """Evidence is returned only if the event is visible to the caller; otherwise indistinguishable from absent."""
-        for item in self._s.timeline(viewer, project_id=project_id, limit=500)["items"]:
-            if item["event_id"] == event_id:
-                return {"event_id": event_id, "evidence_refs": item["evidence_refs"], "label": item["label"],
-                        "link": navigate("event", project=project_id, event=event_id)}
-        raise pi.NotFound("event")
+        """Looked up by id (not by position in a window). Hidden and absent are indistinguishable."""
+        got = self._s.get_event(viewer, event_id)
+        if project_id not in got["project_ids"]:
+            raise pi.NotFound("event")
+        return {"event_id": event_id, "evidence_refs": got["evidence_refs"], "label": got["label"],
+                "link": navigate("event", project=project_id, event=event_id)}
 
 
 def payload_hash(payload: dict) -> str:

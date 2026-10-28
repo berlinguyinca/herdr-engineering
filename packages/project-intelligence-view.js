@@ -81,26 +81,32 @@ export function mountProjectIntelligence(host, client, { query = new URLSearchPa
     }
   }
 
+  let seq = 0;
   async function refresh() {
     persist();
+    const mine = ++seq;                       // a newer refresh makes every older response stale
     const q = new URLSearchParams();
     if (state.source) q.set('source', state.source);
     if (state.category) q.set('category', state.category);
-    if (state.as_of) q.set('as_of', `${state.as_of}:00+00:00`.replace(/(:\d\d):00\+00:00$/, '$1+00:00').replace(/T(\d\d:\d\d)\+00:00$/, 'T$1:00+00:00'));
-    const el = host.querySelector('.pi-state, .pi-split') || body;
+    if (state.as_of) q.set('as_of', `${state.as_of}${/T\d\d:\d\d$/.test(state.as_of) ? ':00' : ''}+00:00`);
+    let data;
     try {
-      timeline = await client.getJson(`/api/v1/intelligence/projects/${encodeURIComponent(state.project)}/timeline?${q}`);
+      data = await client.getJson(`/api/v1/intelligence/projects/${encodeURIComponent(state.project)}/timeline?${q}`);
     } catch (err) {
-      el.outerHTML = `<p class="pi-state" role="alert">Could not load the timeline (${esc(err.status || 'network')}).</p>`;
+      if (disposed || mine !== seq) return;
+      host.querySelector('.pi-state, .pi-split')?.replaceWith(Object.assign(document.createElement('p'), {
+        className: 'pi-state', role: 'alert', textContent: `Could not load the timeline (${err.status || 'network'}).` }));
       return;
     }
-    if (disposed) return;
-    draw(el);
+    if (disposed || mine !== seq) return;
+    timeline = data;
+    draw(host.querySelector('.pi-state, .pi-split'));   // re-queried after the await: never a detached node
   }
 
   function draw(el) {
     const sel = arr(timeline?.items).find((i) => i.event_id === state.event);
     const html = `<div class="pi-split"><div>${renderTimeline(timeline, state.event)}</div><aside class="pi-pane" aria-label="Event details" aria-live="polite">${renderDetail(sel)}</aside></div>`;
+    if (!el) return;
     el.outerHTML = html;
     host.querySelectorAll('.pi-item').forEach((b) => { b.onclick = () => { state.event = b.dataset.event; persist(); draw(host.querySelector('.pi-split')); host.querySelector(`.pi-item[data-event="${CSS.escape(state.event)}"]`)?.focus(); }; });
   }
