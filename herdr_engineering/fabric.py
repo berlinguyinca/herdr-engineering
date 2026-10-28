@@ -267,8 +267,14 @@ class FabricGateway:
                  router: GatewayRouter, control_host: str = "127.0.0.1",
                  control_port: int = 29999, url_base: str | None = None,
                  probe_interval: float = 15.0, token: str | None = None,
-                 reset_lock: bool = False, rewrite_headers: bool = False) -> None:
+                 reset_lock: bool = False, rewrite_headers: bool = False,
+                 allowed_target_networks: tuple[str, ...] = (), public_scheme: str = "http") -> None:
         self.registry = registry
+        # Lease targets are limited to loopback + the tailnet (+ these CIDRs): anything else
+        # would let a token holder aim the gateway at arbitrary internal services (SSRF).
+        self.allowed_target_networks = tuple(allowed_target_networks)
+        # Scheme advertised in canonical URLs. Stays http until a TLS listener is configured.
+        self.public_scheme = public_scheme
         # Opt-in: rewrite loopback URLs in Location / CORS / cookie-domain headers
         # of HTTP leases to the fabric address (forces Connection: close).
         self.rewrite_headers = rewrite_headers
@@ -424,6 +430,8 @@ class FabricGateway:
 
     # -- API ops (called by the HTTP handler) --------------------------------
     def op_register(self, body: dict[str, Any]) -> dict[str, Any]:
+        from .fabric_urls import validate_target_host
+        validate_target_host(str(body.get("target_host", "")), self.allowed_target_networks)
         lease = self.registry.register(
             target_machine_id=body["target_machine_id"],
             target_host=body["target_host"],
@@ -487,6 +495,13 @@ class FabricGateway:
             return {"status": 200, "port": port, "lease": None, "url": None}
         return {"status": 200, "port": port, "lease": res.lease,
                 "url": f"http://{res.external}"}
+
+    def op_resolve_urls(self, urls: list[str], source_machine: str | None = None) -> dict[str, Any]:
+        """Batch canonical-URL resolution for the dashboard (never mutates the originals)."""
+        from .fabric_urls import resolve_url
+        leases = [lse.to_dict() for lse in self.registry.active_leases()]
+        return {"resolutions": [resolve_url(u, leases, url_base=self.url_base, source_machine=source_machine,
+                                            scheme=self.public_scheme).to_dict() for u in urls[:200]]}
 
     def op_rewrite(self, text: str, from_machine: str | None = None) -> dict[str, Any]:
         from .urlrewrite import rewrite_text
@@ -589,6 +604,13 @@ def _make_handler(gateway: FabricGateway):
                     self._send(200, gateway.op_register(body))
                 except (KeyError, ValueError) as exc:
                     self._send(400, {"error": f"bad register body: {exc}"})
+                return
+            if self.path == "/resolve-urls":
+                urls = body.get("urls")
+                if not isinstance(urls, list) or not all(isinstance(u, str) for u in urls):
+                    self._send(400, {"error": "urls must be a list of strings"})
+                    return
+                self._send(200, gateway.op_resolve_urls(urls, body.get("source_machine")))
                 return
             if self.path == "/heartbeat":
                 lease_id = body.get("lease_id", "")

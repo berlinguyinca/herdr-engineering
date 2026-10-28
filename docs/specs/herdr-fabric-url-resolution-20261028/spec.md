@@ -47,3 +47,18 @@ returns both IPs with health-based removal. The report states what was actually 
 ## Acceptance matrix owner / verifiability
 Tests 12 (Mac/iPhone trust) and the real-fleet parts of 11/15 need physical devices and hosts and will be
 marked **unverified** in the report unless run by the user.
+
+## Known limitation (found in PR 1)
+Leases record the *target* port, which for loopback-only apps is the fabric agent's tailnet forwarder
+port. It equals the app's loopback port only when port-matching succeeded (`fabric_agent._adopt` falls
+back to an ephemeral port otherwise). The resolver matches on the lease's target port, so in that
+fallback case the URL the agent printed resolves as `unmapped`, never to a wrong service. Fix in PR 2:
+agents register an `origin_port` and the resolver prefers it.
+
+## PR 1 status
+Shipped: `fabric_urls.resolve_url`, `validate_target_host`, `POST /resolve-urls`, target-host
+validation in `op_register` (operator CIDR allow-list via `allowed_target_networks`).
+Canonical scheme stays `http` (`public_scheme`) until PR 3 binds a TLS listener — advertising https
+before it exists would hand out dead links.
+Deployment note: registration of non-loopback, non-tailnet targets (e.g. LAN IPs via `--host`) is now
+refused unless allow-listed; no such registrant exists in-repo (agents use the tailnet IP).
