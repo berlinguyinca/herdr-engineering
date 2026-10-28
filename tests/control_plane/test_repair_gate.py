@@ -6,7 +6,7 @@ from herdr_engineering.control_plane import repair_gate as rg
 from herdr_engineering.review_gate.github_app import ReviewFile, ReviewMaterial
 
 SHA = "a" * 40
-PR = NS(number=7, head_sha=SHA, base_ref="main", head_ref="herdr-ci-fix/x")
+PR = NS(number=7, head_sha=SHA, base_ref="main", head_ref="herdr-ci-fix/x", author_login="herdr-bot")
 ENR = NS(repo="o/r")
 CHECKS = [NS(name="ci:pull_request", status="pass", sha=SHA)]
 FULL = {"enabled": True, "auto_merge_enabled": True, "allowed_repositories": ["o/r"], "auto_merge_risks": ["low"],
@@ -157,3 +157,23 @@ def test_make_counters_counts_runs_and_other_open_repair_prs():
     assert attempt(ENR, NS(number=7)) == 2          # two repair requests for run 7
     assert attempt(ENR, NS(number=99)) == 1          # unbound PR: the gate's incident_unbound check handles it
     assert open_prs(ENR, NS(number=7)) == 1          # PR 8 only; itself and non-repair PRs excluded
+
+
+def test_unknown_pr_author_means_no_approval_counts():
+    class GApp:
+        def pr_review_summary(self, *a, **k):
+            return 2, False
+
+        def pr_commits_verified(self, *a):
+            return True
+
+    class Reg:
+        def author_of(self, key, ref):
+            return NS(kind="unknown")
+
+    class Repo:
+        def stream(self, entity, eid):
+            return []
+    pr = NS(number=7, head_sha=SHA, base_ref="main", head_ref="herdr-ci-fix/x")      # no author_login
+    facts = rg.make_facts_fn(app=GApp(), repo=Repo(), registry=Reg(), families_fn=dict)(ENR, pr)
+    assert facts["human_approvals"] == 0
