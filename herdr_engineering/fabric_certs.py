@@ -117,6 +117,50 @@ class AcmeRoute53:
         return due_for_renewal(self.fullchain, now)
 
 
+@dataclass
+class TailscaleCert:
+    """The certificate Tailscale issues for this node's own ``<host>.<tailnet>.ts.net`` name (``tailscale cert``).
+
+    Lets a service that used to sit behind ``tailscale serve`` keep its ``ts.net`` address when the gateway takes the
+    port over. Tailscale does the ACME work; this only asks it for the files and notices when they are due.
+    """
+    name: str
+    directory: Path
+    tailscale: str = "tailscale"
+    runner: Callable[..., subprocess.CompletedProcess] | None = field(default=None, repr=False)
+
+    def __post_init__(self) -> None:
+        self.directory = Path(self.directory).expanduser()
+        self.name = self.name.lower().strip(".")
+
+    @property
+    def fullchain(self) -> Path:
+        return self.directory / f"{self.name}.crt"
+
+    @property
+    def privkey(self) -> Path:
+        return self.directory / f"{self.name}.key"
+
+    def command(self) -> list[str]:
+        return [self.tailscale, "cert", "--cert-file", str(self.fullchain), "--key-file", str(self.privkey), self.name]
+
+    def obtain(self, *, force: bool = False) -> bool:
+        self.directory.mkdir(parents=True, exist_ok=True)
+        self.directory.chmod(0o700)
+        before = validity(self.fullchain)[1] if self.fullchain.exists() else None
+        proc = (self.runner or subprocess.run)(self.command(), capture_output=True, text=True, timeout=120)
+        if proc.returncode != 0:
+            tail = (proc.stderr or proc.stdout or "").strip().splitlines()[-3:]
+            raise CertError(f"tailscale cert failed ({proc.returncode}): {' | '.join(tail)[:400]}")
+        if not self.fullchain.exists() or not self.privkey.exists():
+            raise CertError(f"tailscale cert reported success but wrote no files under {self.directory}")
+        self.privkey.chmod(0o600)
+        return before is None or validity(self.fullchain)[1] != before
+
+    def due(self, now: datetime | None = None) -> bool:
+        return due_for_renewal(self.fullchain, now)
+
+
 def server_context(cert: Path, key: Path) -> ssl.SSLContext:
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ctx.minimum_version = ssl.TLSVersion.TLSv1_2
@@ -132,6 +176,7 @@ class CertManager:
     private_ca: PrivateCA | None = None
     private_names: tuple[str, ...] = ("dev.lan",)
     private_leaf: str = "gateway"
+    tailnet: TailscaleCert | None = None
     renew: bool = False                 # exactly one node of an HA pair sets this
     now: Callable[[], float] = time.time
     backoff: float = FAILURE_BACKOFF
@@ -151,6 +196,9 @@ class CertManager:
             ctx = server_context(self.public.fullchain, self.public.privkey)
             by_suffix[self.public.domain] = ctx
             default = ctx
+        if self.tailnet and self.tailnet.fullchain.exists():
+            by_suffix[self.tailnet.name] = server_context(self.tailnet.fullchain, self.tailnet.privkey)
+            default = default or by_suffix[self.tailnet.name]
         if self.private_ca and (self.private_ca.dir / f"{self.private_leaf}.pem").exists():
             ctx = server_context(self.private_ca.dir / f"{self.private_leaf}.pem",
                                  self.private_ca.dir / f"{self.private_leaf}.key")
@@ -171,6 +219,9 @@ class CertManager:
     def _default_files(self) -> tuple[str, str]:
         if self.public and self.public.fullchain.exists():
             return str(self.public.fullchain), str(self.public.privkey)
+        if self.tailnet and self.tailnet.fullchain.exists() and not (
+                self.private_ca and (self.private_ca.dir / f"{self.private_leaf}.pem").exists()):
+            return str(self.tailnet.fullchain), str(self.tailnet.privkey)
         assert self.private_ca is not None
         return str(self.private_ca.dir / f"{self.private_leaf}.pem"), str(self.private_ca.dir / f"{self.private_leaf}.key")
 
@@ -210,6 +261,9 @@ class CertManager:
                 if self.public.obtain():
                     changed = True
                     result["renewed"].append(self.public.domain)
+            if self.tailnet and self.tailnet.due() and self.tailnet.obtain():
+                changed = True
+                result["renewed"].append(self.tailnet.name)
             if self.private_ca and self.private_ca.exists():
                 leaf = self.private_ca.dir / f"{self.private_leaf}.pem"
                 if self.private_ca.needs_renewal(leaf):
@@ -243,6 +297,9 @@ class CertManager:
             start, end = validity(self.public.fullchain)
             out["public"] = {"domain": self.public.domain, "not_after": end.isoformat(),
                              "lifetime_days": (end - start).days, "due": self.public.due(), "staging": self.public.staging}
+        if self.tailnet and self.tailnet.fullchain.exists():
+            out["tailnet"] = {"name": self.tailnet.name, "not_after": validity(self.tailnet.fullchain)[1].isoformat(),
+                              "due": self.tailnet.due()}
         if self.private_ca and (self.private_ca.dir / f"{self.private_leaf}.pem").exists():
             leaf = self.private_ca.dir / f"{self.private_leaf}.pem"
             out["private"] = {"names": list(self.private_names), "not_after": self.private_ca.expires(leaf).isoformat(),

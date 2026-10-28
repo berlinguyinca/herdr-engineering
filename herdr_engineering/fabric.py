@@ -343,7 +343,8 @@ class FabricGateway:
                  peer_url: str | None = None, node_id: str | None = None, promote_after: int = 3,
                  auto_ha: bool = True, url_aliases: tuple[str, ...] = (),
                  named_domain: str | None = None, named_port: int = 443,
-                 apex_upstream: tuple[str, int] | None = None) -> None:
+                 apex_upstream: tuple[str, int] | None = None,
+                 host_routes: dict[str, tuple[str, int]] | None = None) -> None:
         self.registry = registry
         # Stable service-name URLs (https://<service>.<named_domain>[:named_port]); off unless a domain is given
         # AND the listener bound, so a URL is never advertised that nothing serves.
@@ -351,6 +352,7 @@ class FabricGateway:
         self.named_port = named_port
         self.named_front = None
         self.apex_upstream = apex_upstream
+        self.host_routes = dict(host_routes or {})
         # Other names this fabric answers to (legacy dev.lan next to the public fleet name); accepted when
         # resolving URLs, never produced.
         self.url_aliases = tuple(dict.fromkeys(a.lower().strip(".") for a in url_aliases if a))
@@ -591,7 +593,8 @@ class FabricGateway:
         from .fabric_named import NamedFront
         front = NamedFront(self.router, lambda: [lz.to_dict() for lz in self.registry.active_leases()],
                            self.named_domain, self.named_port,
-                           apex_hosts=(self.named_domain, self.url_base, *self.url_aliases), apex_target=self.apex_upstream)
+                           apex_hosts=(self.named_domain, self.url_base, *self.url_aliases), apex_target=self.apex_upstream,
+                           host_routes=self.host_routes)
         try:
             front.start()
         except OSError as exc:

@@ -202,3 +202,23 @@ def test_bare_fleet_names_reach_the_apex_upstream_only(tmp_path):
         assert _get(gw2.named_front.port, "local.example.test", tls=False) == b""
     finally:
         gw2.stop()
+
+
+def test_exact_host_routes_take_over_a_name_without_opening_its_subdomains(tmp_path):
+    a, aport = _http_target(tmp_path)
+    cert, key = _self_signed(tmp_path / "pub", "bender.tail.ts.net", 30)
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(str(cert), str(key))
+    named = _free_port()
+    gw = FabricGateway(DevServiceRegistry(store_path=tmp_path / "l.json", port_range=(43000, 43100)), GatewayRouter(["127.0.0.1"]),
+                       control_host="127.0.0.1", control_port=0, url_base="local.example.test", probe_interval=30, token="",
+                       named_domain="local.example.test", named_port=named, host_routes={"Bender.Tail.ts.net": ("127.0.0.1", aport)})
+    gw.start()
+    gw.enable_tls(ctx)
+    try:
+        assert _get(named, "bender.tail.ts.net").startswith(b"HTTP/1.")
+        assert _get(named, "x.bender.tail.ts.net") == b""
+        assert _get(named, "local.example.test") == b""
+    finally:
+        gw.stop()
+        a.shutdown()

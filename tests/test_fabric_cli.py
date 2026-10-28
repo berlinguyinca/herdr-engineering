@@ -271,3 +271,10 @@ def test_gateway_named_urls_flags(monkeypatch, capsys, tmp_path):
     argv = [a for a in argv if a not in ("--url-base", "dev.test")]
     assert cli.main(argv) == 0
     assert seen["banner"]["named_urls"] is None
+
+
+def test_route_flag_parsing():
+    assert cli._route("Bender.ts.net=127.0.0.1:8787") == ("bender.ts.net", ("127.0.0.1", 8787))
+    for bad in ("nohost", "=127.0.0.1:80", "h=127.0.0.1", "h=127.0.0.1:99999", "h=:80"):
+        with pytest.raises(SystemExit):
+            cli._route(bad)

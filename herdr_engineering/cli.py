@@ -430,6 +430,11 @@ def _build_parser() -> argparse.ArgumentParser:
     p2.add_argument("--apex-upstream", default=None, metavar="HOST:PORT",
                     help="where the bare fleet names (https://dev.lan, https://<acme-domain>) go: the dashboard, e.g. "
                          "100.104.39.6:80. Needs the named listener (--acme-domain) and a certificate for the name")
+    p2.add_argument("--route", action="append", default=[], metavar="HOST=UP:PORT",
+                    help="send one exact host name on the named port to an upstream (repeatable), e.g. "
+                         "bender.tail0c50da.ts.net=127.0.0.1:8787 to take over a `tailscale serve` rule")
+    p2.add_argument("--tailscale-cert", default=None, metavar="NAME",
+                    help="also serve this node's ts.net NAME with the certificate `tailscale cert` provides")
     p2.add_argument("--no-named-urls", action="store_true", help="do not serve stable service-name URLs")
     p2.add_argument("--acme-dir", default=None, help="certbot state directory (default: ~/.config/herdr-engineering/acme)")
     p2.add_argument("--acme-staging", action="store_true", help="use the Let's Encrypt staging CA (untrusted; for trials)")
@@ -2159,6 +2164,14 @@ def _acme_for(args, cfg: dict):
                        email=getattr(args, "email", None) or cfg.get("acme_email") or None)
 
 
+def _route(spec) -> tuple[str, tuple[str, int]]:
+    host, sep, upstream = str(spec).partition("=")
+    target = _host_port(upstream)
+    if not sep or not host or target is None:
+        raise SystemExit(f"--route must be HOST=UPSTREAM:PORT, got {spec!r}")
+    return host.strip().lower(), target
+
+
 def _host_port(value) -> tuple[str, int] | None:
     if not value:
         return None
@@ -2257,6 +2270,7 @@ def _cmd_dev_gateway(args) -> int:
         promote_after=int(getattr(args, "promote_after", 3)),
         named_domain=None if getattr(args, "no_named_urls", False) else acme_domain,
         named_port=int(getattr(args, "named_port", None) or cfg.get("named_port") or 443),
+        host_routes=dict(_route(r) for r in [*getattr(args, "route", []), *(cfg.get("routes") or [])]),
         apex_upstream=_host_port(getattr(args, "apex_upstream", None) or cfg.get("apex_upstream")),
         url_aliases=tuple(dict.fromkeys([*getattr(args, "url_alias", []), *(cfg.get("url_aliases") or []),
                                          *_private_ca_domains(cfg)])))
@@ -2269,14 +2283,18 @@ def _cmd_dev_gateway(args) -> int:
     if acme_domain:
         import threading
 
-        from .fabric_certs import CertError, CertManager
+        from .fabric_certs import CertError, CertManager, TailscaleCert
         from .fabric_tls import PrivateCA
         ca = PrivateCA(Path(cfg.get("ca_dir") or Path.home() / ".config" / "herdr-engineering" / "ca"))
         mgr = CertManager(public=_acme_for(args, cfg), private_ca=ca if (ca.dir / "gateway.pem").exists() else None,
                           private_names=tuple(ca.domains() or ["dev.lan"]),
+                          tailnet=TailscaleCert(ts_name, Path(cfg.get("tailnet_cert_dir") or Path.home() / ".config" / "herdr-engineering" / "tailnet-cert"))
+                          if (ts_name := getattr(args, "tailscale_cert", None) or cfg.get("tailscale_cert")) else None,
                           renew=bool(getattr(args, "renew_certs", False) or cfg.get("renew_certs")),
                           on_change=gateway.router.set_tls)
         try:
+            if mgr.tailnet and not mgr.tailnet.fullchain.exists():
+                mgr.tailnet.obtain()
             gateway.enable_tls(mgr.load())
         except CertError as exc:
             raise SystemExit(f"{exc}\n(or drop --acme-domain to serve plain HTTP)") from exc

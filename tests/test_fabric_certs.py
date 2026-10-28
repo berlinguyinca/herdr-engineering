@@ -181,3 +181,49 @@ def test_sni_selects_public_vs_private_certificate(tmp_path):
     assert "dev.lan" in _served_cn(ctx, "api.dev.lan", tmp_path / "x")
     # unknown SNI and no SNI fall back to the public certificate
     assert "local.example.test" in _served_cn(ctx, "other.example", tmp_path / "x")
+
+
+def _ts(tmp_path, days=90, fail=False, later=None):
+    calls = []
+    ts = fc.TailscaleCert("bender.tail.ts.net", tmp_path / "ts")
+
+    def runner(cmd, **kw):
+        assert cmd[:2] == ["tailscale", "cert"] and cmd[-1] == "bender.tail.ts.net"
+        if fail:
+            return subprocess.CompletedProcess(cmd, 1, "", "not permitted")
+        d = tmp_path / "gen"
+        calls.append(1)
+        cert, key = _self_signed(d, "bender.tail.ts.net", later if later and len(calls) > 1 else days)
+        Path(cmd[cmd.index("--cert-file") + 1]).write_bytes(cert.read_bytes())
+        Path(cmd[cmd.index("--key-file") + 1]).write_bytes(key.read_bytes())
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+    ts.runner = runner
+    return ts
+
+
+def test_tailscale_cert_obtain_keys_private_and_failure_reported(tmp_path):
+    ts = _ts(tmp_path)
+    assert ts.obtain() is True and (ts.privkey.stat().st_mode & 0o777) == 0o600
+    with pytest.raises(fc.CertError, match="not permitted"):
+        _ts(tmp_path / "x", fail=True).obtain()
+
+
+def test_sni_serves_the_tailnet_name_next_to_public_and_private(tmp_path):
+    acme = _acme(tmp_path)
+    _self_signed(acme.live, acme.domain, 90)
+    ts = _ts(tmp_path)
+    ts.obtain()
+    ctx = fc.CertManager(public=acme, tailnet=ts).load()
+    assert "bender.tail.ts.net" in _served_cn(ctx, "bender.tail.ts.net", tmp_path / "x")
+    assert "local.example.test" in _served_cn(ctx, "svc.local.example.test", tmp_path / "x")
+    only = fc.CertManager(tailnet=ts)                      # a node with just the tailnet name still starts
+    assert "bender.tail.ts.net" in _served_cn(only.load(), "whatever", tmp_path / "x")
+
+
+def test_renewal_pass_refreshes_a_due_tailnet_cert(tmp_path):
+    ts = _ts(tmp_path, days=2, later=90)                    # the renewed cert is longer-lived than the first
+    ts.obtain()
+    ts.due = lambda now=None: True
+    seen = []
+    mgr = fc.CertManager(tailnet=ts, renew=True, on_change=seen.append)
+    assert mgr.check()["renewed"] == ["bender.tail.ts.net"] and len(seen) == 1
