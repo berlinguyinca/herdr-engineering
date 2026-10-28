@@ -5,6 +5,10 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### `/summary` session-recovery skill (default install and fleet converge)
+- New canonical read-only `summary` skill (`skills/summary`) installed by `scripts/install.sh` and converged on every fleet host (`ansible/tasks/summary-skill.yml`). `/summary` in Pi, Claude Code and OpenCode; `$summary` in Codex (no Codex command file is written). Evidence-based: separates verified from reported work and states an explicit coverage verdict.
+- `herdr-eng summary install|uninstall|verify|history`. Install/upgrade is manifest-tracked and never overwrites a customized skill, prompt or command (`preserved`); uninstall removes only unmodified files and our own links. `history` is read-only: it resolves the session from an explicit id, then Herdr pane metadata, and only then a labelled directory heuristic; it reads Claude/Pi/Codex JSONL and OpenCode SQLite (`mode=ro`), marks compaction and child-agent gaps, and redacts output. See `docs/operations/session-summary.md`.
+
 ### Collab addressing (`@owner.harness`, sigil completion, mention chips)
 - Release note: a room task's text now starts with the target's `@address` (e.g. `@gert.pi fix the build`). The worker in this repo strips its own leading address; worker scripts installed from an earlier release pass it through to the harness unchanged, so update them.
 - An external (sponsored) agent never gets an `@owner.harness` address; it is reached by its `ext-...` name and its chip is marked external. A person handle outranks an agent name, an agent cannot be renamed to (or granted under) a member's handle, and an agent keeps its last 5 old names as aliases.
