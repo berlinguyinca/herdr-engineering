@@ -13,7 +13,7 @@ need python3; need node; need git
 venv="$(mktemp -d "${TMPDIR:-/tmp}/herdr-unit-gates-venv.XXXXXX")"
 trap 'rm -rf "$venv"' EXIT
 python3 -m venv "$venv"
-"$venv/bin/pip" install -q -e '.[dev]'
+"$venv/bin/pip" install -q -e '.[dev,collab,review-gate,federation]'
 export PATH="$venv/bin:$PATH"
 
 echo "== pytest =="
