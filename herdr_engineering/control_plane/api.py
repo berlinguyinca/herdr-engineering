@@ -2201,8 +2201,8 @@ def _make_handler(server, public=False, operator=False):
                         except ValueError as exc:
                             return self._json({"error": str(exc)},
                                               409 if str(exc) == "staleHistoryCursor" else 400)
-                        return self._json(page)
-                    return self._json({"events": r.stream(etype, eid)})
+                        return self._json({**page, "events": [_redact_event(event) for event in page["events"]]})
+                    return self._json({"events": [_redact_event(event) for event in r.stream(etype, eid)]})
             if resource == "artifacts" and len(parts) > 5 and parts[5] == "download":
                 data = r.get_artifact_data(parts[4])
                 a = r.get_artifact(parts[4])
@@ -3604,7 +3604,13 @@ def _empty_inspector(store, sid: str) -> dict:
 
 def _redact_event(event: dict) -> dict:
     ev = dict(event)
-    ev["payload"] = redact_payload(ev.get("payload", {}))
+    payload = ev.get("payload", {})
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except ValueError:
+            pass
+    ev["payload"] = redact_payload(payload)
     return ev
 
 
