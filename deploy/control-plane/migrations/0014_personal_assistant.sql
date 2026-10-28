@@ -156,6 +156,14 @@ CREATE TABLE IF NOT EXISTS pa_delegations (
     updated_at    timestamptz NOT NULL
 );
 
+-- Durability: the assistant store writes its full snapshot here on every
+-- mutation (the normalized pa_* tables remain the canonical projection).
+CREATE TABLE IF NOT EXISTS pa_store_snapshot (
+    key         text PRIMARY KEY,
+    data        jsonb NOT NULL,
+    updated_at  timestamptz NOT NULL DEFAULT now()
+);
+
 -- isolation indexes (always filter tenant_id + user_id)
 CREATE INDEX IF NOT EXISTS pa_assistants_tenant_user_idx  ON pa_assistants (tenant_id, user_id);
 CREATE INDEX IF NOT EXISTS pa_threads_tenant_user_idx     ON pa_threads (tenant_id, user_id, assistant_id);
