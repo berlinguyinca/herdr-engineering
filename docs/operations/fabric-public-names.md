@@ -36,8 +36,9 @@ herdr-eng devfabric gateway --acme-domain local.metabolomics.us --renew-certs
 
 Renewal only ever needs to write the `_acme-challenge.local.metabolomics.us` TXT record. `deploy/fabric-stack/iam-acme-renewal-policy.json`
 grants exactly that (plus `ListHostedZones`/`GetChange`, which certbot needs and which expose nothing writable) on the one hosted zone, so a
-leaked key cannot touch the A records, other names or other zones. Attach it to a dedicated IAM user (or role) whose key is the only
-credential the renewal timer sees (`AWS_PROFILE` in the unit, or `~/.aws/credentials`). `devfabric dns publish` is a deliberate,
+leaked key cannot touch the A records, other names or other zones. Attach it to a dedicated IAM user (`herdr-acme-renewal`) whose key (`~/.config/herdr-engineering/aws-acme-credentials`, 0600) is the only
+credential the renewal timer sees (the unit sets `AWS_SHARED_CREDENTIALS_FILE` to it). If that file is missing the timer fails and
+says why; it never falls back to other AWS credentials. `devfabric dns publish` is a deliberate,
 human-run step and needs broader rights (A records of this name); do not give those to the timer.
 
 ## Renewal
