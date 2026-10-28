@@ -381,6 +381,12 @@ class IntelligenceStore:
                 if rel.org_id == org_id and rel.review_state == "confirmed" and rel.derivation != "system_verified" \
                         and any(e.source_ref == source_ref for e in rel.evidence):
                     self._rels[rid] = replace(rel, review_state="provisional", version=rel.version + 1)
+            # Whatever the state, an anchor into a removed source must not outlive it in the relationship's evidence.
+            for rid, rel in list(self._rels.items()):
+                if rel.org_id == org_id and any(e.source_ref == source_ref for e in rel.evidence):
+                    self._rels[rid] = replace(rel, evidence=tuple(
+                        EvidenceRef(e.source_ref, "removed", "removed", redaction_policy="source_removed") if e.source_ref == source_ref else e
+                        for e in rel.evidence))
             # A finding stops citing a removed source; one left with no evidence is shown as unverified again.
             for fid, f in list(self._findings.items()):
                 if f.org_id == org_id and any(e.source_ref == source_ref for e in f.evidence):

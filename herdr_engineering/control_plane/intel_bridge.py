@@ -525,6 +525,8 @@ def install(repo, section_fn: Callable[[], dict], dsn: str | None = None):
                 with lock:
                     if self._thread is None:
                         self.start()
+            if section().get("ingest") is not True:
+                self._rebuilt = False                 # ingest was off: events were missed, so rebuild when it comes back on
             if not self._rebuilt and section().get("ingest") is True:
                 with lock:
                     if not self._rebuilt:

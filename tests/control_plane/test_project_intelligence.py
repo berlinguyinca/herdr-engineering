@@ -206,6 +206,15 @@ def test_relationship_review_rules_and_tombstone_reevaluation():
         s.review_relationship(verified.id, accept=True, actor="a", expected_version=1, viewer=viewer)
 
 
+def test_tombstone_scrubs_anchors_in_relationship_evidence():
+    s = store()
+    r = s.add_relationship(rel(), cfg=ON, actor="u")
+    s.tombstone_source("org1", "gmail:msg-1")
+    got = s.neighbours("issue:7", pi.Viewer("org1"))[0]
+    assert got.id == r.id
+    assert all(e.anchor_value == "removed" and e.source_ref == "gmail:msg-1" for e in got.evidence)
+
+
 def test_dedupe_does_not_swallow_a_differently_labelled_relationship():
     s = store()
     a = s.add_relationship(rel(security_label="confidential"), cfg=ON, actor="u")
