@@ -234,7 +234,7 @@ class GatewayRouter:
 
     def _proxy_one(self, client: socket.socket, target_host: str,
                    target_port: int, routes: list | None = None,
-                   rewrite: str | None = None, port: int | None = None) -> None:
+                   rewrite: str | None = None, port: int | None = None, external: str | None = None) -> None:
         if self.access is not None and self.access.enforcing:
             try:
                 peer = client.getpeername()[0]
@@ -254,7 +254,7 @@ class GatewayRouter:
         if client is None:
             return
         if tls and not routes:
-            external = self.external_for(port) if port is not None else None
+            external = external or (self.external_for(port) if port is not None else None)
             target = None
             try:
                 target = socket.create_connection((target_host, target_port), timeout=5)
@@ -275,12 +275,12 @@ class GatewayRouter:
                         except OSError:
                             pass
             return
-        if rewrite and not routes:
+        if (rewrite or external) and not routes:
             target = None
             try:
                 target = socket.create_connection((target_host, target_port), timeout=5)
                 from .devfabric import rewriting_pipe
-                rewriting_pipe(client, target, target_port, rewrite)
+                rewriting_pipe(client, target, target_port, external or rewrite)
             except OSError:
                 pass
             finally:
@@ -341,8 +341,21 @@ class FabricGateway:
                  reset_lock: bool = False, rewrite_headers: bool = False,
                  allowed_target_networks: tuple[str, ...] = (), public_scheme: str = "http",
                  peer_url: str | None = None, node_id: str | None = None, promote_after: int = 3,
-                 auto_ha: bool = True) -> None:
+                 auto_ha: bool = True, url_aliases: tuple[str, ...] = (),
+                 named_domain: str | None = None, named_port: int = 443,
+                 apex_upstream: tuple[str, int] | None = None,
+                 host_routes: dict[str, tuple[str, int]] | None = None) -> None:
         self.registry = registry
+        # Stable service-name URLs (https://<service>.<named_domain>[:named_port]); off unless a domain is given
+        # AND the listener bound, so a URL is never advertised that nothing serves.
+        self.named_domain = named_domain
+        self.named_port = named_port
+        self.named_front = None
+        self.apex_upstream = apex_upstream
+        self.host_routes = dict(host_routes or {})
+        # Other names this fabric answers to (legacy dev.lan next to the public fleet name); accepted when
+        # resolving URLs, never produced.
+        self.url_aliases = tuple(dict.fromkeys(a.lower().strip(".") for a in url_aliases if a))
         # Lease targets are limited to loopback + the tailnet (+ these CIDRs): anything else
         # would let a token holder aim the gateway at arbitrary internal services (SSRF).
         self.allowed_target_networks = tuple(allowed_target_networks)
@@ -570,10 +583,30 @@ class FabricGateway:
         threading.Thread(target=self._httpd.serve_forever, daemon=True).start()
         self._probe_thread = threading.Thread(target=self._probe, daemon=True)
         self._probe_thread.start()
+        self._start_named_front()
         return self
+
+    def _start_named_front(self) -> None:
+        if not self.named_domain:
+            return
+        from .devfabric import _log_devfabric
+        from .fabric_named import NamedFront
+        front = NamedFront(self.router, lambda: [lz.to_dict() for lz in self.registry.active_leases()],
+                           self.named_domain, self.named_port,
+                           apex_hosts=(self.named_domain, self.url_base, *self.url_aliases), apex_target=self.apex_upstream,
+                           host_routes=self.host_routes)
+        try:
+            front.start()
+        except OSError as exc:
+            _log_devfabric("fabric", "WARNING", "stable service names disabled: %s", exc)   # URLs stay port-based; nothing misleading is advertised
+            return
+        self.named_front = front
 
     def stop(self) -> None:
         self._stop.set()
+        if self.named_front is not None:
+            self.named_front.stop()
+            self.named_front = None
         self._release_lock()
         if self._httpd is not None:
             self._httpd.shutdown()
@@ -603,7 +636,9 @@ class FabricGateway:
             # Optional same-origin routes: [{prefix, host, port}, ...]. When
             # present, the gateway edge splits this origin by path (the lease's
             # own target is the catch-all); when absent, plain 1:1 forwarding.
-            routes=body.get("routes"))
+            routes=body.get("routes"),
+            origin_port=int(body["origin_port"]) if body.get("origin_port") is not None else None,
+            network_namespace=body.get("network_namespace"))
         self.router.bind(lease.external_port, lease.target_host, lease.target_port,
                          routes=lease.routes, rewrite=self._rewrite_target(lease))
         return {"lease": lease.to_dict(), "url": self.stable_url(lease.external_port)}
@@ -622,8 +657,13 @@ class FabricGateway:
 
     def op_list(self) -> dict[str, Any]:
         leases = self.registry.active_leases()
-        return {"leases": [dict(lease.to_dict(), url=self.stable_url(lease.external_port))
-                           for lease in leases]}
+        out = []
+        for lease in leases:
+            d = lease.to_dict()
+            named = self.named_url(d)
+            out.append(dict(d, url=named or self.stable_url(lease.external_port), port_url=self.stable_url(lease.external_port),
+                            **({"named_url": named} if named else {})))
+        return {"leases": out}
 
     def op_resolve(self, port: int) -> dict[str, Any]:
         lease = self.registry.resolve_port(port)
@@ -633,6 +673,14 @@ class FabricGateway:
 
     def stable_url(self, port: int) -> str:
         return f"{self.public_scheme}://{self.url_base}:{port}"
+
+    def named_url(self, lease: dict[str, Any]) -> str | None:
+        """``https://<service>.<domain>[:port]`` for a lease, only while the named front is actually serving."""
+        front = self.named_front
+        if front is None:
+            return None
+        netloc = front.netloc_of(str(lease.get("id")), self.public_scheme == "https")
+        return f"{self.public_scheme}://{netloc}" if netloc else None
 
     def enable_tls(self, context: ssl.SSLContext) -> None:
         """Serve HTTPS on every leased port (same port as HTTP) and advertise https URLs."""
@@ -659,12 +707,18 @@ class FabricGateway:
         return {"status": 200, "port": port, "lease": res.lease,
                 "url": f"http://{res.external}"}
 
-    def op_resolve_urls(self, urls: list[str], source_machine: str | None = None) -> dict[str, Any]:
+    def op_resolve_urls(self, urls: list[str], source_machine: str | None = None,
+                        source_namespace: str | None = None) -> dict[str, Any]:
         """Batch canonical-URL resolution for the dashboard (never mutates the originals)."""
         from .fabric_urls import resolve_url
         leases = [lse.to_dict() for lse in self.registry.active_leases()]
         return {"resolutions": [resolve_url(u, leases, url_base=self.url_base, source_machine=source_machine,
-                                            scheme=self.public_scheme).to_dict() for u in urls[:200]]}
+                                            scheme=self.public_scheme, aliases=self.url_aliases,
+                                            source_namespace=source_namespace, named=self.named_url).to_dict() for u in urls[:200]]}
+
+    def op_names(self) -> dict[str, Any]:
+        """The names a URL may carry to count as the fabric's (the browser builds its link detector from this)."""
+        return {"url_base": self.url_base, "aliases": list(self.url_aliases), "scheme": self.public_scheme}
 
     def op_rewrite(self, text: str, from_machine: str | None = None) -> dict[str, Any]:
         from .urlrewrite import rewrite_text
@@ -744,10 +798,14 @@ def _make_handler(gateway: FabricGateway):
                                                   (q.get("service") or [None])[0])
                 self._send(res.pop("status"), res)
                 return
+            if self.path == "/names":
+                self._send(200, gateway.op_names())
+                return
             if self.path == "/healthz":
                 lo, hi = gateway.registry.port_range()
                 self._send(200, {"ok": True, "bound_ports": gateway.router.bound_ports(),
-                                 "url_base": gateway.url_base, "role": gateway.role,
+                                 "url_base": gateway.url_base, "url_aliases": list(gateway.url_aliases),
+                                 "named_domain": gateway.named_domain if gateway.named_front else None, "role": gateway.role,
                                  "epoch": gateway.epoch, "node_id": gateway.node_id,
                                  "port_lo": lo, "port_hi": hi})
                 return
@@ -777,7 +835,11 @@ def _make_handler(gateway: FabricGateway):
                 if not isinstance(urls, list) or not all(isinstance(u, str) for u in urls):
                     self._send(400, {"error": "urls must be a list of strings"})
                     return
-                self._send(200, gateway.op_resolve_urls(urls, body.get("source_machine")))
+                ns = body.get("source_namespace")
+                if not (ns is None or (isinstance(ns, str) and len(ns) <= 64)):
+                    self._send(400, {"error": "source_namespace must be a short string"})
+                    return
+                self._send(200, gateway.op_resolve_urls(urls, body.get("source_machine"), ns))
                 return
             if self.path == "/heartbeat":
                 lease_id = body.get("lease_id", "")
@@ -881,8 +943,15 @@ class FabricClient:
     def resolve(self, port: int) -> dict[str, Any]:
         return self._req("GET", f"/resolve/{port}")
 
-    def resolve_urls(self, urls: list[str], source_machine: str | None = None) -> dict[str, Any]:
-        return self._req("POST", "/resolve-urls", {"urls": urls, "source_machine": source_machine})
+    def resolve_urls(self, urls: list[str], source_machine: str | None = None,
+                     source_namespace: str | None = None) -> dict[str, Any]:
+        body: dict[str, Any] = {"urls": urls, "source_machine": source_machine}
+        if source_namespace:
+            body["source_namespace"] = source_namespace
+        return self._req("POST", "/resolve-urls", body)
+
+    def names(self) -> dict[str, Any]:
+        return self._req("GET", "/names")
 
     def healthz(self) -> dict[str, Any]:
         return self._req("GET", "/healthz")

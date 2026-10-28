@@ -22,6 +22,7 @@ const ICONS = { person: '👤', group: '👥', robot: '🤖', file: '📄', issu
 
 // The caller owns authentication and delivery. Only its upload adapter can turn
 // a local File into an artifact that onSend is allowed to hand to the runtime.
+// options.urls: a fabric URL resolver ({resolver, prefetch}); the preview then links agent-reachable addresses. The draft itself is never changed.
 export function mountComposer(host, options = {}) {
   const doc = host.ownerDocument;
   ensureConversationStyles(doc);
@@ -121,7 +122,7 @@ export function mountComposer(host, options = {}) {
     if (mode === 'edit') return;
     const text = input.value.trim();
     if (/^[{[]/.test(text) && parseJson(text).ok) jsonViewer = mountJsonViewer(preview, text);
-    else preview.innerHTML = renderMarkdown(input.value);
+    else { options.urls?.prefetch?.(input.value); preview.innerHTML = renderMarkdown(input.value, { urls: options.urls?.resolver || null }); }
   };
   const updateInfo = () => {
     const before = input.value.slice(0, input.selectionStart), lines = before.split('\n');

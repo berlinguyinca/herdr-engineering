@@ -1,5 +1,7 @@
 # Fabric HTTPS (`https://dev.lan:<port>`)
 
+> For devices that cannot or should not enroll a CA, use the publicly trusted name instead: [fabric-public-names.md](fabric-public-names.md).
+
 The gateway serves HTTPS on **the same port** as plain HTTP: the first byte of a connection selects the protocol
 (`0x16` = TLS handshake). `http://dev.lan:<port>` keeps working; a failed TLS handshake is dropped, never downgraded.
 TLS terminates at the gateway. The origin receives `X-Forwarded-Proto: https`, `X-Forwarded-Host` and

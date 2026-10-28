@@ -29,8 +29,11 @@ Legend: **Automated** = a test in this repo exercises it. **Partial** = automate
 * **Done:** canonical resolver; batch API; SSRF validation; browser hook with hover details, copy original/fabric URL (always visible on touch),
   inaccessible-service messaging, searchable Fabric Services page; same-port HTTPS with a name-constrained private CA and enrollment doc;
   tailnet-identity access control; stream-safe rendering and OSC 8; active/standby failover.
-* **Not built:** optional stable service-based URLs on port 443; automatic certificate renewal (expiry is reported, renewal is a manual `ca issue` + restart);
-  network-namespace awareness; Python-side `urlrewrite` text rewriting still produces `http`; wiring `urls` into collab chat, notifications, artifacts and session history lists.
+* **Added in the follow-up (branch `feat/fabric-public-certs`):** publicly trusted certificate for `local.metabolomics.us` (Let's Encrypt, DNS-01 on Route 53, no device enrollment),
+  A-record publishing (tailnet addresses only), automatic renewal with a daily failure backoff and hot reload, stable `https://<service>.local.metabolomics.us[:port]` URLs,
+  `origin_port`, network-namespace matching, legacy-name aliases (`dev.lan`), and `urls` wiring in the composer preview, attention list and agents list. See `docs/operations/fabric-public-names.md`.
+* **Still not built:** Python-side `urlrewrite` text rewriting still produces `http`; `urls` is not wired into mission views, notifications or artifact viewers; `collab-view` is intentionally unwired (public guest surface);
+  the dashboard does not yet know a source network namespace to send.
 * **Known behavior limits:** TLS exchanges are one request per connection; same-origin `routes` leases are terminated but not header-rewritten;
   lease target port may differ from the app's loopback port when port-matching fell back (resolves as `unmapped`, never wrongly); a successful resolve is not a guarantee the browser device has enrolled the CA.
 
@@ -43,6 +46,15 @@ Playwright UI tests of the session workspace (`tests/playwright/fabric-links.tes
 gateway-down), and a failover test driven by the real background loop. Wiring tests were mutation-checked (breaking the wiring makes them fail).
 The earlier one-off failover failure could not be reproduced in 18 stressed runs; its two plausible causes (the probe thread racing hand-driven steps, and re-binding a released ephemeral port) were removed
 (`auto_ha=False` for hand-driven tests, no port reuse).
+
+## Live verification of the public name (2026-10-28)
+Production certificate issued once (`CN=local.metabolomics.us`, SAN apex + `*.local.metabolomics.us`, issuer Let's Encrypt, 89 days). A and wildcard A records published to the gateway's
+tailnet IP only (no AAAA). An ephemeral gateway (scratch state dir, free ports) was run with the real certificate:
+`curl https://docs.local.metabolomics.us:<port>/` and `curl https://local.metabolomics.us:<lease port>/` returned 200 with `ssl_verify_result=0` from this host **and from a second tailnet machine** (beast),
+using only the system trust store; an unknown service name is reset with no response; `resolve-urls` returns the stable name as `canonical` and the per-port address as `port_url`.
+Findings: (1) `100.100.100.100` (MagicDNS) answered SERVFAIL when queried directly while the host's normal resolver and 8.8.8.8 answered correctly; devices using only MagicDNS should be checked.
+(2) A gateway whose lease range overlaps another gateway on the same host registers a lease whose port could not be bound (`op_register` ignores `router.bind`'s result) - hit here because the live
+gateway holds 18000; pre-existing, not changed. (3) Not verified on real devices: iPhone/iPad/Mac browsers, and the named front on port 443 (needs the port free and CAP_NET_BIND_SERVICE).
 
 ## Rollout
 Everything new is opt-in except one behavior change: lease registration now refuses `target_host` outside loopback/tailnet unless allow-listed.

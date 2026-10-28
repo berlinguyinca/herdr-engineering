@@ -2,24 +2,56 @@
 // Detection stays in conversation-markdown.js; this module only answers "what is the canonical URL for this
 // exact string?" from a cache that the server (POST /api/v1/fabric/resolve-urls) fills. Rendering is synchronous,
 // so a URL not yet resolved renders as written and is upgraded on the next paint. Stored text is never rewritten.
+import { escapeHtml as esc } from './herdr-web-components/util.js';
+import { linkifyBare } from './conversation-markdown.js';
 const TTL_MS = 30000;
 const MAX_BATCH = 200;
-const CANDIDATE = /https?:\/\/(?:localhost|127(?:\.\d{1,3}){3}|0\.0\.0\.0|\[::1?\]|\[::ffff:[^\]]+\]|[A-Za-z0-9.-]+\.lan)(?::\d{1,5})?[^\s<>`*"\\)\]]*/gi;
+const URL_TAIL = '(?::\\d{1,5})?[^\\s<>`*"\\\\)\\]]*';
+const LOOPBACK = 'localhost|127(?:\\.\\d{1,3}){3}|0\\.0\\.0\\.0|\\[::1?\\]|\\[::ffff:[^\\]]+\\]|[A-Za-z0-9.-]+\\.lan';
+const buildCandidate = (names) => new RegExp(
+  `https?:\\/\\/(?:${[LOOPBACK, ...names.map((n) => `(?:[A-Za-z0-9-]+\\.)*${n.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`)].join('|')})${URL_TAIL}`, 'gi');
+let CANDIDATE = buildCandidate([]);
+
+// The fabric's own names come from the gateway (public fleet name, legacy aliases), so a URL like
+// https://svc.local.metabolomics.us:3188/x is recognised and canonicalised, not only *.lan.
+export function setFabricNames(names) {
+  const clean = [...new Set((names || []).filter((n) => typeof n === 'string' && /^[A-Za-z0-9.-]{1,253}$/.test(n)))];
+  CANDIDATE = buildCandidate(clean.map((n) => n.toLowerCase().replace(/^\.+|\.+$/g, '')));
+}
 
 // `openEnd`: the text is still streaming, so a URL touching its end may be incomplete; it is left out until the stream settles.
 export function candidateUrls(text, { openEnd = false } = {}) {
   const source = String(text ?? '');
   const seen = new Set();
-  for (const m of source.matchAll(CANDIDATE)) {
+  for (const m of source.matchAll(new RegExp(CANDIDATE.source, 'gi'))) {
     if (openEnd && m.index + m[0].length === source.length) continue;
     seen.add(m[0].replace(/[.,;:!?'"}>]+$/, ''));
   }
   return [...seen].slice(0, MAX_BATCH);
 }
 
+// Plain-text surfaces (attention detail, agent summaries) show agent output as escaped text, not Markdown. This
+// escapes everything and turns only URLs that the fabric knows about into links, using the same anchors as the chat.
+export function linkifyFabricText(text, urls) {
+  const source = String(text ?? '');
+  if (!urls?.resolve) return esc(source);
+  let out = '', at = 0;
+  for (const m of source.matchAll(new RegExp(CANDIDATE.source, 'gi'))) {
+    const linked = linkifyBare(m[0], urls);
+    out += esc(source.slice(at, m.index)) + (linked ?? esc(m[0]));
+    at = m.index + m[0].length;
+  }
+  return out + esc(source.slice(at));
+}
+
 export function createFabricUrlResolver(client, { sourceMachine = null, now = () => Date.now(), onChange = () => {} } = {}) {
   const cache = new Map(); // url -> {info, at}
   let pending = new Set(), timer = null, inflight = false;
+  if (typeof client.getFabricNames === 'function') {
+    Promise.resolve().then(() => client.getFabricNames()).then((out) => {
+      if (out?.available && out.names?.length) { setFabricNames(out.names); onChange(); }
+    }).catch(() => {});
+  }
   const fresh = (e) => e && now() - e.at < TTL_MS;
   async function flush() {
     if (inflight || !pending.size) return;

@@ -336,7 +336,8 @@ class DevServiceRegistry:
                  owner_process_id: str | None = None, label: str | None = None,
                  lease_id: str | None = None,
                  preferred_port: int | None = None,
-                 routes: list | None = None) -> DevServiceLease:
+                 routes: list | None = None, origin_port: int | None = None,
+                 network_namespace: str | None = None) -> DevServiceLease:
         """Register (or idempotently renew) a lease. Allocates a collision-free port."""
         now = _now_iso()
         # Idempotent registration for a stable owner/process identity.
@@ -373,6 +374,7 @@ class DevServiceRegistry:
                 id=lid, external_port=port, protocol=protocol,
                 target_machine_id=target_machine_id, target_host=target_host,
                 target_port=target_port, routes=routes,
+                origin_port=origin_port, network_namespace=network_namespace,
                 owner_herdr_session_id=owner_herdr_session_id,
                 owner_repository=owner_repository,
                 owner_worktree_id=owner_worktree_id,

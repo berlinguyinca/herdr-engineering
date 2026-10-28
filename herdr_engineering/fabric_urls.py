@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import ipaddress
 import re
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import asdict, dataclass
 from typing import Any
 from urllib.parse import urlsplit
@@ -40,6 +40,7 @@ class UrlResolution:
     source_machine: str | None = None
     lease_id: str | None = None
     access: str = "private-fabric"
+    port_url: str | None = None   # per-port address, present when `canonical` is a stable service name
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -60,6 +61,9 @@ def _is_loopback_host(host: str) -> bool:
 
 
 def _lease_port(lease: dict[str, Any]) -> int:
+    """The port a loopback URL names: where the app listens, which is not the forwarder's port when that was ephemeral."""
+    if lease.get("origin_port"):
+        return int(lease["origin_port"])
     return int((lease.get("target") or {}).get("port", lease.get("target_port", -1)))
 
 
@@ -78,7 +82,8 @@ def _fail(url: str, status: str, reason: str, **kw: Any) -> UrlResolution:
 
 
 def resolve_url(url: str, leases: Iterable[dict[str, Any]], *, url_base: str, source_machine: str | None = None,
-                scheme: str = "https") -> UrlResolution:
+                scheme: str = "https", aliases: Iterable[str] = (),
+                source_namespace: str | None = None, named: Callable[[dict[str, Any]], str | None] | None = None) -> UrlResolution:
     """Resolve ``url`` against ``leases`` as seen from ``source_machine``.
 
     A lease owned by ``source_machine`` always wins over another machine's lease on the same port.
@@ -98,7 +103,8 @@ def resolve_url(url: str, leases: Iterable[dict[str, Any]], *, url_base: str, so
     if parts.username is not None or parts.password is not None:
         return _fail(url, "invalid", "userinfo not allowed")
     host = host.lower()
-    fabric_name = host == url_base.lower() or host.endswith("." + url_base.lower())
+    # url_base is canonical; aliases (e.g. the old dev.lan) are accepted on input and rewritten to it
+    fabric_name = any(host == n or host.endswith("." + n) for n in (url_base.lower(), *(a.lower() for a in aliases)))
     if not (_is_loopback_host(host) or fabric_name):
         return _fail(url, "not_loopback", "external host; no explicit mapping")
     if port is None:
@@ -114,10 +120,15 @@ def resolve_url(url: str, leases: Iterable[dict[str, Any]], *, url_base: str, so
         matches = [lz for lz in pool if _lease_port(lz) == port]
         if source_machine is not None:
             matches = [lz for lz in matches if _lease_machine(lz) == source_machine]
+        if source_namespace:
+            # another namespace's loopback is a different service; a lease that never recorded one stays eligible
+            matches = [lz for lz in matches if not lz.get("network_namespace") or lz["network_namespace"] == source_namespace]
     if not matches:
         return _fail(url, "unmapped", f"no active lease for port {port}", port=port, source_machine=source_machine)
     machines = {_lease_machine(lz) for lz in matches}
-    if len(matches) > 1 and (len(machines) > 1 or fabric_name):
+    # two services on one machine are only distinct when they live in different network namespaces
+    homes = {(_lease_machine(lz), lz.get("network_namespace")) for lz in matches}
+    if len(matches) > 1 and (len(machines) > 1 or len(homes) > 1 or fabric_name):
         return _fail(url, "ambiguous", f"port {port} is served by {sorted(m for m in machines if m)}",
                      port=port, source_machine=source_machine)
     lz = matches[0]
@@ -130,8 +141,11 @@ def resolve_url(url: str, leases: Iterable[dict[str, Any]], *, url_base: str, so
     if lz.get("health_last_error"):
         return _fail(url, "unhealthy", f"service unreachable: {lz['health_last_error']}", **ident)
     tail = url[len(parts.scheme) + 3 + len(parts.netloc):]  # path?query#fragment, byte-for-byte
-    canonical = f"{scheme}://{url_base}:{int(lz['external_port'])}{tail}"
-    return UrlResolution(original=url, canonical=canonical, status="resolved", **ident)
+    port_url = f"{scheme}://{url_base}:{int(lz['external_port'])}{tail}"
+    # the stable service name wins when the gateway is serving it; the port URL stays as the fallback
+    stable = named(lz) if named else None
+    return UrlResolution(original=url, canonical=f"{stable}{tail}" if stable else port_url, status="resolved",
+                         port_url=port_url if stable else None, **ident)
 
 
 def validate_target_host(host: str, extra_networks: Iterable[str] = ()) -> None:

@@ -79,3 +79,61 @@ test('copy buttons write the exact stored value', async () => {
   await handler({ target: { closest: () => button }, preventDefault() {} });
   assert.deepEqual(written, ['http://localhost:3188/x']);
 });
+
+test('fabric names from the gateway extend link detection to the public fleet name and subdomains', async () => {
+  const { candidateUrls, setFabricNames, createFabricUrlResolver } = await import('../fabric-urls.js');
+  const text = 'open https://svc.local.metabolomics.us:3188/x and https://local.metabolomics.us:4000 and https://evil.example.com:3188';
+  try {
+    assert.deepEqual(candidateUrls(text), []);
+    setFabricNames(['local.metabolomics.us', 'bad name!', 42]);
+    assert.deepEqual(candidateUrls(text), ['https://svc.local.metabolomics.us:3188/x', 'https://local.metabolomics.us:4000']);
+    assert.deepEqual(candidateUrls('https://notlocal.metabolomics.us:1'), []);   // a suffix match must start at a label boundary
+
+    setFabricNames([]);
+    let changed = 0;
+    createFabricUrlResolver({ getFabricNames: async () => ({ available: true, names: ['local.metabolomics.us'] }),
+      resolveFabricUrls: async () => ({ resolutions: [] }) }, { onChange: () => { changed++; } });
+    await new Promise((r) => setTimeout(r, 20));
+    assert.equal(changed, 1);
+    assert.equal(candidateUrls(text).length, 2);
+  } finally { setFabricNames([]); }
+});
+
+test('a gateway without names leaves detection unchanged', async () => {
+  const { candidateUrls, createFabricUrlResolver } = await import('../fabric-urls.js');
+  createFabricUrlResolver({ getFabricNames: async () => { throw new Error('down'); }, resolveFabricUrls: async () => ({}) });
+  await new Promise((r) => setTimeout(r, 10));
+  assert.deepEqual(candidateUrls('http://localhost:3188/a'), ['http://localhost:3188/a']);
+});
+
+test('plain-text surfaces escape everything and link only URLs the fabric resolved', async () => {
+  const { linkifyFabricText } = await import('../fabric-urls.js');
+  const o = 'http://localhost:3188/a?b=1&c=2';
+  const resolver = { resolve: (u) => (u === o ? resolved(o, 'https://dev.lan:3188/a?b=1&c=2') : null) };
+  const html = linkifyFabricText(`<img src=x onerror=1> see ${o}. next`, resolver);
+  assert.ok(html.startsWith('&lt;img src=x onerror=1&gt; see '));
+  assert.ok(html.includes('href="https://dev.lan:3188/a?b=1&amp;c=2"') && html.includes(`data-original="${o.replace(/&/g, '&amp;')}"`));
+  assert.ok(html.endsWith('. next'));
+  assert.ok(!html.includes('<img'));
+  assert.equal(linkifyFabricText('a <b> & c', null), 'a &lt;b&gt; &amp; c');
+  assert.equal(linkifyFabricText(undefined, resolver), '');
+});
+
+test('attention detail links a resolved loopback URL and survives a client without the resolver', async () => {
+  const { renderAttention } = await import('../attention-view.js');
+  const o = 'http://localhost:3188/x';
+  const item = { key: 'k', kind: 'ci', severity: 'warning', title: 'T', detail: `open ${o}`, first_seen: '2026-10-28T00:00:00Z', state: 'open', count: 1 };
+  const model = { body: { items: [item], policy: {} }, urls: { resolve: (u) => (u === o ? resolved(o, 'https://dev.lan:3188/x') : null) } };
+  assert.ok(renderAttention(model, Date.parse('2026-10-28T01:00:00Z')).includes('href="https://dev.lan:3188/x"'));
+  const plain = renderAttention({ body: model.body }, Date.parse('2026-10-28T01:00:00Z'));
+  assert.ok(plain.includes(o) && !plain.includes('md-fabric-link'));
+});
+
+test('agents list row links the summary when a resolver is given', async () => {
+  const { compactSessionRow } = await import('../sessions-view.js');
+  const o = 'http://localhost:3188/x';
+  const entry = { id: 's1', role: 'worker', project: 'p', host: 'bender', record: { summary: `serving at ${o}` } };
+  const urls = { resolve: (u) => (u === o ? resolved(o, 'https://dev.lan:3188/x') : null) };
+  assert.ok(compactSessionRow(entry, Date.now(), urls).includes('href="https://dev.lan:3188/x"'));
+  assert.ok(compactSessionRow(entry, Date.now()).includes(o));
+});
