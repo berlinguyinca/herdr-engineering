@@ -6,9 +6,14 @@ const TTL_MS = 30000;
 const MAX_BATCH = 200;
 const CANDIDATE = /https?:\/\/(?:localhost|127(?:\.\d{1,3}){3}|0\.0\.0\.0|\[::1?\]|\[::ffff:[^\]]+\]|[A-Za-z0-9.-]+\.lan)(?::\d{1,5})?[^\s<>`*"\\)\]]*/gi;
 
-export function candidateUrls(text) {
+// `openEnd`: the text is still streaming, so a URL touching its end may be incomplete; it is left out until the stream settles.
+export function candidateUrls(text, { openEnd = false } = {}) {
+  const source = String(text ?? '');
   const seen = new Set();
-  for (const m of String(text ?? '').matchAll(CANDIDATE)) seen.add(m[0].replace(/[.,;:!?'"}>]+$/, ''));
+  for (const m of source.matchAll(CANDIDATE)) {
+    if (openEnd && m.index + m[0].length === source.length) continue;
+    seen.add(m[0].replace(/[.,;:!?'"}>]+$/, ''));
+  }
   return [...seen].slice(0, MAX_BATCH);
 }
 
@@ -44,8 +49,9 @@ export function createFabricUrlResolver(client, { sourceMachine = null, now = ()
         return e ? e.info : null; // stale answers are shown while a refresh is in flight
       },
     },
-    prefetch(...texts) {
-      for (const t of texts) for (const u of candidateUrls(t)) if (!fresh(cache.get(u))) pending.add(u);
+    prefetch(...texts) { return this.prefetchWith({}, ...texts); },
+    prefetchWith(options, ...texts) {
+      for (const t of texts) for (const u of candidateUrls(t, options)) if (!fresh(cache.get(u))) pending.add(u);
       if (pending.size) schedule();
     },
     flush,

@@ -59,6 +59,12 @@ test('real analyzer output: notices, drilldown to symbol and source line, edge e
   await page.locator('[data-node="package:app"]').first().click();
   await page.locator('[data-node="module:app.core"]').waitFor();
   assert.ok(await page.locator('path.arch-edge').count() >= 2, 'aggregated import edges are drawn');
+  assert.equal(await page.locator('path.arch-edge.calls').count(), 0, 'imports are the default edge kind');
+  await page.locator('[data-edgekind]').selectOption('calls');
+  await page.locator('path.arch-edge.calls').first().waitFor();                 // core.run() -> util.helper()
+  assert.match(await page.locator('path.arch-edge.calls title').first().textContent(), /\d+ calls?/);
+  assert.equal(await page.locator('path.arch-edge.imports').count(), 0);
+  await page.locator('[data-edgekind]').selectOption('imports');
   await page.locator('[data-node="module:app.core"]').click();
   await page.locator('[data-node="class:app.core.Engine"]').waitFor();
   await page.locator('[data-open="function:app.core.run"]').click();
@@ -174,6 +180,12 @@ test('related activity links only by exact commit; timeline has independent lane
   assert.match(await act.locator('[data-pr]').innerText(), /#17|ci_pending/);
   assert.match(await act.locator('[data-session]').innerText(), /pi:s1/);
   assert.equal(await act.locator('[data-session]').count(), 1, 'the branch-only session is not linked');
+  // same worktree, other commit: listed apart, labelled as context, never in the commit-matched Agents list
+  const wt = act.locator('[data-wt-session]');
+  await wt.waitFor();
+  assert.match(await wt.innerText(), /pi:same-tree · reviewer · aaaaaaaa/);
+  assert.match(await act.innerText(), /Same worktree, other commits \(context, not authorship\)/);
+  assert.doesNotMatch(await act.locator('[data-session]').innerText(), /same-tree/);
   const tl = page.locator('[data-testid="arch-timeline"]');
   await tl.locator('[data-tl-snap]').first().waitFor();
   assert.ok(await tl.locator('[data-tl-snap]').count() >= 3);
@@ -290,4 +302,47 @@ test('loading state is shown while the snapshot list is pending', () => withApp(
   await page.getByText(/loading/i).first().waitFor();
   release();
   await page.locator('[data-testid="arch-graph"]').waitFor();
+}));
+
+test('PR base: the host-resolved merge-base is offered, and comparing uses it', () => withApp({}, async (page, base) => {
+  await page.goto(`${base}/#/architecture`);
+  const btn = page.locator('[data-pr-base]');
+  await btn.waitFor();
+  assert.match(await page.locator('.arch-diff').innerText(), /merge-base [0-9a-f]{8} of main, resolved by the analysis host/);
+  await btn.click();
+  const sum = page.locator('[data-testid="arch-diff-summary"]');
+  await sum.waitFor();
+  assert.match(await sum.innerText(), /Nodes \+[1-9]/);
+  await page.locator('.chg-added', {hasText: 'function:app.util.added'}).waitFor();
+}));
+
+test('request form passes an optional base ref and rejects a flag-like one client-side', () => withApp({}, async (page, base) => {
+  await page.goto(`${base}/#/architecture`);
+  await page.locator('[data-testid="arch-activity"]').waitFor();
+  const posts = [];
+  page.on('request', r => { if (r.method() === 'POST' && r.url().endsWith('/analyses/request')) posts.push(r.postDataJSON()); });
+  await page.locator('[data-request] input[name=base_rev]').fill('--upload-pack=x');
+  await page.locator('[data-request] button[type=submit]').click();
+  await page.waitForTimeout(300);
+  assert.equal(posts.length, 0, 'invalid base ref is not sent: ' + JSON.stringify(posts));
+  await page.locator('[data-request] input[name=base_rev]').fill('origin/main');
+  await page.locator('[data-request] button[type=submit]').click();
+  await page.locator('[data-request-result]').waitFor();
+  assert.equal(posts.length, 1);
+  assert.equal(posts[0].base_rev, 'origin/main');
+}));
+
+test('what the user is typing survives a background repaint', () => withApp({}, async (page, base) => {
+  // the PR-base lookup is slow, so the extras (and a full repaint) land while the user is typing
+  await page.route('**/snapshots/*/base', async r => { await new Promise(x => setTimeout(x, 1500)); await r.continue(); });
+  await page.goto(`${base}/#/architecture`);
+  const input = page.locator('[data-request] input[name=base_rev]');
+  await input.waitFor();
+  await input.focus();
+  await input.pressSequentially('origin/ma');
+  await page.locator('[data-testid="arch-activity"]').waitFor();     // the repaint has happened
+  assert.equal(await page.locator('[data-request] input[name=base_rev]').inputValue(), 'origin/ma');
+  assert.equal(await page.evaluate(() => document.activeElement?.name), 'base_rev');
+  await page.keyboard.type('in');
+  assert.equal(await page.locator('[data-request] input[name=base_rev]').inputValue(), 'origin/main');
 }));

@@ -10,7 +10,8 @@
 # What it does (idempotent):
 #   1. verifies herdr is present (assumption)
 #   2. creates a project .venv and installs herdr-engineering (editable + dev)
-#   3. installs the pinned handoff/artifact skills and all four harness integrations
+#   3. installs the pinned handoff/artifact skills and all four harness integrations,
+#      plus the canonical `summary` skill (/summary in Pi, Claude Code, OpenCode; $summary in Codex)
 #   4. creates the machine-local state + artifact directories
 #   5. writes a safe private-by-default machine-local config (if absent)
 #   6. enrolls THIS machine (detected host + OS) into the private fleet inventory
@@ -95,6 +96,9 @@ if [ ! -f "$ARTIFACT_REPO/install/install.sh" ]; then
 fi
 "$ARTIFACT_REPO/install/install.sh"
 printf '  herdr-artifacts %s installed from %s\n' "$ARTIFACT_REF" "$ARTIFACT_REPO"
+
+# Idempotent; never overwrites a customized summary skill or command.
+"$PY" -m herdr_engineering.cli summary install || warn "summary skill install reported a problem (see above)"
 
 # --- 4. state + artifact directories --------------------------------------
 step "4/8 machine-local state + artifact directories"

@@ -1827,6 +1827,8 @@ def _make_handler(server, public=False, operator=False):
                         return self._json(svc.get_snapshot(sid))
                     if tail == ["children"]:
                         return self._json(svc.children(sid, q("parent"), q("cursor"), q("limit")))
+                    if tail == ["base"]:
+                        return self._json(svc.pr_base(sid))
                     if tail == ["overlays"]:
                         return self._json(svc.overlays(sid))
                     if tail == ["correlations"]:

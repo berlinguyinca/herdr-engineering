@@ -137,6 +137,29 @@ def cmd_analyze(args) -> int:
     return 0
 
 
+def _analyse_base(base, key, job, path, commit, host_id, rid, cancel, timeout, cache_dir) -> dict:
+    """Pair a PR head with its base: the merge-base of the head and ``job['base_rev']`` from this host's own history.
+    Never fails the job; says why in ``base_message`` when it cannot (no common ancestor, base is the head, ...)."""
+    base_rev = job.get("base_rev")
+    if not base_rev:
+        return {}
+    try:
+        tip = gitsource.resolve_commit(path, base_rev)
+        mb = gitsource.merge_base(path, commit, tip)
+        if mb is None:
+            return {"base_message": "no common ancestor with the base ref in this checkout (shallow clone?)"}
+        if mb == commit:
+            return {"base_message": "the head is already contained in the base ref; nothing to compare"}
+        res = runner.run_isolated(path, mb, host_id, rid, cancel=cancel,
+                                  limits=runner.Limits(wall_seconds=timeout), config={"cache_dir": cache_dir})
+        _post(f"{base}/api/v1/architecture/snapshots", {"snapshot": res["snapshot"], "graph": res["graph"]}, key)
+        return {"base_commit_sha": mb, "base_snapshot_id": res["snapshot"]["snapshot_id"]}
+    except runner.AnalysisCancelled:
+        raise
+    except (runner.AnalysisError, gitsource.GitSourceError, *TRANSPORT_ERRORS) as exc:
+        return {"base_message": f"base analysis failed: {str(exc)[:200]}"}
+
+
 def _run_job(base, key, job, checkouts, host_id, timeout, cache_dir) -> None:
     """Run one claimed job; always ends it with completed / failed / cancelled."""
     aid, rid = job["analysis_id"], job["repository_id"]
@@ -165,9 +188,10 @@ def _run_job(base, key, job, checkouts, host_id, timeout, cache_dir) -> None:
                                      limits=runner.Limits(wall_seconds=timeout), config={"cache_dir": cache_dir})
         snap = result["snapshot"]
         _post(f"{base}/api/v1/architecture/snapshots", {"snapshot": snap, "graph": result["graph"]}, key)
+        extra = _analyse_base(base, key, job, path, commit, host_id, rid, cancel, timeout, cache_dir)
         done.set()
         _report(f"{base}/api/v1/architecture/analyses", {**ident, "event": "completed", "commit_sha": commit,
-                                                         "snapshot_id": snap["snapshot_id"]}, key)
+                                                         "snapshot_id": snap["snapshot_id"], **extra}, key)
     except runner.AnalysisCancelled:
         done.set()
     except (runner.AnalysisError, gitsource.GitSourceError, *TRANSPORT_ERRORS) as exc:

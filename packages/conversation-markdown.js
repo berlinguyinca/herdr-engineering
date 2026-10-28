@@ -131,8 +131,21 @@ function referenceLink(kind, raw, references) {
   return `<a class="md-entity-ref" href="${esc(target.href)}" title="${esc(`${kind}:${id}`)}">${esc(label)}</a>${esc(tail)}`;
 }
 
+// Terminal hyperlinks (OSC 8: ESC ] 8 ; params ; URL ST label ESC ] 8 ; ; ST) in pasted terminal output become ordinary links,
+// so they pass the same safety checks and the same fabric resolution. Only http(s) targets survive; any other escape is dropped.
+const OSC8 = /\u001b\]8;[^;\u0007\u001b]*;([^\u0007\u001b]{0,2100})(?:\u0007|\u001b\\)([^\u001b]{0,500})\u001b\]8;;(?:\u0007|\u001b\\)/g;
+export function osc8ToMarkdown(text) {
+  if (!text.includes('\u001b]')) return text;
+  const converted = text.replace(OSC8, (_, url, label) => {
+    const clean = label.replace(/[\[\]\n]/g, ' ').trim() || url;
+    return parseWebUrl(url) && !/[()]/.test(url) ? `[${clean}](${url})` : label;
+  });
+  return converted.replace(/\u001b\][^\u0007\u001b]*(?:\u0007|\u001b\\)/g, '');
+}
+
 function inline(text, depth = 0, noLinks = false, references = null, urls = null) {
   if (depth > 4) return esc(text);
+  if (depth === 0) text = osc8ToMarkdown(text);
   // The markdown-link alternative scans up to ~2600 characters per '[': only try it when a link can exist and the
   // text is of chat size, so a 100k-character "[[[[" message cannot make the page stall.
   const links = text.length <= LINK_SYNTAX_MAX && text.includes('](') && text.includes(')');
@@ -153,8 +166,18 @@ function inline(text, depth = 0, noLinks = false, references = null, urls = null
   return out + esc(text.slice(end));
 }
 
-export function renderMarkdown(value, { references = null, urls = null } = {}) {
+// While a message is still streaming its last URL may be a prefix (`http://localhost:31` on the way to `:3188`). With
+// `openEnd` that trailing URL is rendered as written; everything before it resolves normally. Once the stream settles the
+// caller renders again without `openEnd` and the complete URL is resolved.
+export function trailingOpenUrl(text) {
+  const m = /https?:\/\/[^\s<>`*"\\]*$/i.exec(text);
+  return m ? m[0] : null;
+}
+
+export function renderMarkdown(value, { references = null, urls = null, openEnd = false } = {}) {
   const text = String(value ?? '');
+  const held = openEnd && urls ? trailingOpenUrl(text) : null;
+  if (held) { const inner = urls; urls = { resolve: (u) => (held.startsWith(u) && /^[.,;:!?'"}>]*$/.test(held.slice(u.length)) ? null : inner.resolve(u)) }; }
   const lines = text.slice(0, 200000).replace(/\r\n?/g, '\n').split('\n');
   const out = [];
   let paragraph = [], list = [], listType = '', fence = null, code = [];

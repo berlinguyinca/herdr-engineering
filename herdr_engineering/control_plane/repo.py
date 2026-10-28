@@ -1204,7 +1204,7 @@ class ControlPlaneRepo:
                        agent_session=None, revision=None, interactive_ready=None,
                        launch_pending=None, state_change_seq=None,
                        repository_id=None, commit_sha=None,
-                       transcript=None, parent_session_id=None, name=None, runtime=None):
+                       transcript=None, parent_session_id=None, name=None, runtime=None, worktree_id=None):
         runtime = _runtime(runtime)
         if transcript is not None:
             if (not isinstance(transcript, dict) or transcript.get("status") not in (
@@ -1232,7 +1232,7 @@ class ControlPlaneRepo:
                   "agent_session": agent_session, "revision": revision,
                   "interactive_ready": interactive_ready, "launch_pending": launch_pending,
                   "state_change_seq": state_change_seq,
-                  "repository_id": repository_id, "commit_sha": commit_sha,
+                  "repository_id": repository_id, "commit_sha": commit_sha, "worktree_id": worktree_id,
                   "transcript": transcript, "parent_session_id": _label(parent_session_id, session_id), "name": _label(name),
                   "runtime": runtime}
         if existing is None:
@@ -1283,7 +1283,7 @@ class ControlPlaneRepo:
                               "status", "cwd", "branch", "pid", "cmdline",
                               "summary", "attach", "pane_id", "terminal_id", "herdr_session",
                               "machine", "agent_session", "revision", "interactive_ready",
-                              "launch_pending", "state_change_seq", "repository_id", "commit_sha",
+                              "launch_pending", "state_change_seq", "repository_id", "commit_sha", "worktree_id",
                               "transcript", "parent_session_id", "name", "runtime") if existing.get(k) is not None}},
                           mission_id=existing["mission_id"],
                           session_id=session_id)

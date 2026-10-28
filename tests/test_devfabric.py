@@ -238,3 +238,27 @@ def test_persist_is_dirty_aware(tmp_path):
     r.renew_and_mark(lease.id, ok=True)  # changes state -> dirty
     r.persist()
     assert r.store_path.stat().st_mtime >= first_mtime
+
+
+def test_store_with_unknown_future_fields_keeps_the_lease(tmp_path):
+    """Rollback safety: a newer version's extra lease fields must not make this version discard the lease."""
+    import json
+
+    from herdr_engineering.devfabric import DevServiceRegistry
+    path = tmp_path / "leases.json"
+    path.write_text(json.dumps({"leases": [{
+        "id": "lease_future", "external_port": 18123, "protocol": "http", "state": "active",
+        "target": {"machine_id": "bender", "host": "127.0.0.1", "port": 3000},
+        "origin_port": 3000, "network_namespace": "container-9", "something_new": {"x": 1}}]}))
+    reg = DevServiceRegistry(store_path=path, port_range=(18100, 18200), lease_ttl_seconds=3600)
+    leases = {lz.id: lz for lz in reg.active_leases() or reg._leases.values()}
+    assert "lease_future" in leases and leases["lease_future"].target_port == 3000
+
+
+def test_peer_mirror_tolerates_future_fields(tmp_path):
+    from herdr_engineering.devfabric import DevServiceRegistry
+    reg = DevServiceRegistry(store_path=tmp_path / "leases.json", port_range=(18100, 18200), lease_ttl_seconds=3600)
+    n = reg.replace_from_peer([{"id": "lease_x", "external_port": 18150, "protocol": "http", "state": "active",
+                                "target": {"machine_id": "m", "host": "127.0.0.1", "port": 1}, "origin_port": 1,
+                                "url": "https://x"}])
+    assert n == 1

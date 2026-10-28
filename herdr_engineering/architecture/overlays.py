@@ -54,6 +54,26 @@ def pull_requests(gate_store, meta: dict) -> list[dict]:
     return out
 
 
+def _worktree_rows(repo, meta: dict, exclude: set) -> list[dict]:
+    """Agents that worked in the very worktree this snapshot analysed, on the same host, but not at this commit.
+
+    A weaker link than the commit match, kept apart from it: the agent was here, so its later or earlier work in the
+    same checkout is context, yet nothing says it changed anything this snapshot shows."""
+    wt = meta.get("worktree_id")
+    if not wt:
+        return []
+    rows = []
+    for s in repo.list_sessions():
+        if s.get("worktree_id") != wt or s.get("host_id") != meta.get("host_id") or s["session_id"] in exclude:
+            continue
+        ident = pl._identity(s)
+        if ident is not None and ident != meta["repository_id"]:
+            continue                                  # same path, different repository (a reused directory)
+        rows.append(s)
+    rows.sort(key=lambda s: s["session_id"])
+    return rows[:RELATED_LIMIT]
+
+
 def _session_rows(repo, meta: dict) -> list[dict]:
     rows = []
     for s in repo.list_sessions():
@@ -73,6 +93,7 @@ def correlation(meta: dict, session: dict | None = None, *, node=None, pr_refs=(
                    mission_id=session.get("mission_key") or session.get("mission_id"))
         rec["flow"] = session.get("mission_source") or "unknown"   # who owns the mission: pi / herdr / autospec
         rec["session_host_id"] = session.get("host_id")
+        rec["worktree_id"] = session.get("worktree_id")
     if len(pr_refs) == 1:
         rec["pr_ref"] = pr_refs[0]
     rec["unknown"] = sorted(k for k in CORRELATION_FIELDS if rec[k] is None)
@@ -99,13 +120,20 @@ def overlays(repo, gate_store, meta: dict) -> dict:
     key = (meta["repository_id"], meta["commit_sha"])
     missions = related["missions"].get(key, [])[:RELATED_LIMIT]
     sessions = _session_rows(repo, meta)
+    same_worktree = _worktree_rows(repo, meta, {s["session_id"] for s in sessions})
     prs = pull_requests(gate_store, meta)
     return {"snapshot_id": meta["snapshot_id"], "repository_id": meta["repository_id"], "commit_sha": meta["commit_sha"],
             "ci": ci_runs(repo, meta), "pull_requests": prs, "missions": missions,
             "sessions": [{"session_id": s["session_id"], "agent_role": s.get("agent_role"), "status": s.get("status"),
                           "created_at": s.get("created_at"),
                           "host_id": s.get("host_id"), "parent_session_id": s.get("parent_session_id"),
-                          "flow": s.get("mission_source") or "unknown"} for s in sessions],
+                          "flow": s.get("mission_source") or "unknown", "worktree_id": s.get("worktree_id")} for s in sessions],
+            "worktree_sessions": [{"session_id": s["session_id"], "agent_role": s.get("agent_role"), "status": s.get("status"),
+                                   "host_id": s.get("host_id"), "worktree_id": s.get("worktree_id"),
+                                   "commit_sha": s.get("commit_sha"),
+                                   "at_this_commit": False,
+                                   "flow": s.get("mission_source") or "unknown"} for s in same_worktree],
             "issues": issue_mentions(repo, meta, missions),
             "match_rule": "exact canonical repository identity + full commit SHA; branch names and cwd are not evidence",
+            "worktree_rule": "worktree_sessions share this snapshot's host and worktree id but are at another commit (or none): context, not authorship",
             "gate_available": gate_store is not None}

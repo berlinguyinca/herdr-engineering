@@ -22,10 +22,12 @@ from __future__ import annotations
 import json
 import os
 import socket
+import ssl
 import threading
 import time
 import urllib.request
 import uuid
+from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -150,6 +152,10 @@ class GatewayRouter:
 
     def __init__(self, bind_hosts: list[str]) -> None:
         self._bind_hosts = [h for h in bind_hosts if h]
+        # HTTPS on the SAME port as plain HTTP: the first byte of a connection says which (0x16 = TLS handshake).
+        self.tls_context: ssl.SSLContext | None = None
+        self.access = None   # AccessPolicy | None: who may open a leased port (default: any peer, as before)
+        self.external_for: Callable[[int], str | None] = lambda port: None   # set by the gateway
         self._listeners: dict[int, list[socket.socket]] = {}
         self._accept_threads: dict[int, list[threading.Thread]] = {}
         self._lock = threading.RLock()
@@ -198,12 +204,77 @@ class GatewayRouter:
             except OSError:
                 break
             threading.Thread(target=self._proxy_one,
-                             args=(client, target_host, target_port, routes, rewrite),
+                             args=(client, target_host, target_port, routes, rewrite, port),
                              daemon=True).start()
+
+    def set_tls(self, context: ssl.SSLContext | None) -> None:
+        """Install (or, with None, remove) the server context. New connections use it at once; open ones are unaffected."""
+        self.tls_context = context
+
+    def _terminate_tls(self, client: socket.socket) -> tuple[socket.socket | None, bool]:
+        """Return (socket, is_tls). A handshake that fails drops the connection: plaintext is never offered on it."""
+        ctx = self.tls_context
+        if ctx is None:
+            return client, False
+        try:
+            client.settimeout(5.0)
+            first = client.recv(1, socket.MSG_PEEK)
+            if first != b"\x16":
+                client.settimeout(None)
+                return client, False
+            tls = ctx.wrap_socket(client, server_side=True)
+            tls.settimeout(None)
+            return tls, True
+        except (OSError, ssl.SSLError):
+            try:
+                client.close()
+            except OSError:
+                pass
+            return None, False
 
     def _proxy_one(self, client: socket.socket, target_host: str,
                    target_port: int, routes: list | None = None,
-                   rewrite: str | None = None) -> None:
+                   rewrite: str | None = None, port: int | None = None) -> None:
+        if self.access is not None and self.access.enforcing:
+            try:
+                peer = client.getpeername()[0]
+            except OSError:
+                peer = None
+            allowed, why = self.access.decide(peer)
+            if not allowed:
+                # Dropped before TLS/HTTP: an unauthorised peer learns nothing about what is behind the port.
+                from .devfabric import _log_devfabric
+                _log_devfabric("fabric", "WARNING", "denied %s on :%s (%s)", peer, port, why)
+                try:
+                    client.close()
+                except OSError:
+                    pass
+                return
+        client, tls = self._terminate_tls(client)
+        if client is None:
+            return
+        if tls and not routes:
+            external = self.external_for(port) if port is not None else None
+            target = None
+            try:
+                target = socket.create_connection((target_host, target_port), timeout=5)
+                from .devfabric import rewriting_pipe
+                try:
+                    peer = client.getpeername()[0]
+                except OSError:
+                    peer = None
+                rewriting_pipe(client, target, target_port, external or rewrite or f"{target_host}:{port}",
+                               tls=True, rewrite_head=external is not None, forwarded_for=peer)
+            except OSError:
+                pass
+            finally:
+                for s in (client, target):
+                    if s is not None:
+                        try:
+                            s.close()
+                        except OSError:
+                            pass
+            return
         if rewrite and not routes:
             target = None
             try:
@@ -268,13 +339,26 @@ class FabricGateway:
                  control_port: int = 29999, url_base: str | None = None,
                  probe_interval: float = 15.0, token: str | None = None,
                  reset_lock: bool = False, rewrite_headers: bool = False,
-                 allowed_target_networks: tuple[str, ...] = (), public_scheme: str = "http") -> None:
+                 allowed_target_networks: tuple[str, ...] = (), public_scheme: str = "http",
+                 peer_url: str | None = None, node_id: str | None = None, promote_after: int = 3,
+                 auto_ha: bool = True) -> None:
         self.registry = registry
         # Lease targets are limited to loopback + the tailnet (+ these CIDRs): anything else
         # would let a token holder aim the gateway at arbitrary internal services (SSRF).
         self.allowed_target_networks = tuple(allowed_target_networks)
         # Scheme advertised in canonical URLs. Stays http until a TLS listener is configured.
         self.public_scheme = public_scheme
+        # High availability (active/standby peers). Without ``peer_url`` this gateway is always the active one, as before.
+        # The registry is soft state that the hosts' fabric agents re-register, so a promoted standby needs only a recent
+        # mirror to avoid a gap; correctness never depends on it.
+        self.peer_url = peer_url.rstrip("/") if peer_url else None
+        self.node_id = node_id or socket.gethostname()
+        self.promote_after = max(1, promote_after)
+        self.role = "active"
+        self.epoch = 0
+        self._peer_failures = 0
+        # False lets a caller (tests) drive _ha_step itself instead of racing the probe thread.
+        self.auto_ha = auto_ha
         # Opt-in: rewrite loopback URLs in Location / CORS / cookie-domain headers
         # of HTTP leases to the fabric address (forces Connection: close).
         self.rewrite_headers = rewrite_headers
@@ -300,6 +384,10 @@ class FabricGateway:
     # -- router sync -------------------------------------------------------
     def _sync_router(self) -> None:
         """Bind all active leases and unbind ports with no active lease."""
+        if self.role != "active":
+            for port in self.router.bound_ports():
+                self.router.unbind(port)
+            return
         active = {lease.external_port: lease for lease in self.registry.active_leases()}
         for port, lease in active.items():
             if not self.router.bind(port, lease.target_host, lease.target_port,
@@ -310,6 +398,67 @@ class FabricGateway:
         for port in self.router.bound_ports():
             if port not in active:
                 self.router.unbind(port)
+
+    # -- high availability ----------------------------------------------------
+    def _peer(self) -> FabricClient:
+        client = FabricClient(self.peer_url, token=self.token)
+        return client
+
+    def _peer_health(self) -> dict[str, Any] | None:
+        try:
+            health = self._peer().healthz()
+        except Exception:
+            return None
+        return health if isinstance(health, dict) and health.get("ok") else None
+
+    def _choose_initial_role(self) -> None:
+        """Start as standby when the peer is already serving; otherwise take over (epoch above anything seen)."""
+        peer = self._peer_health()
+        if peer and peer.get("role") == "active":
+            self.role, self.epoch = "standby", int(peer.get("epoch", 0))
+        else:
+            self.role = "active"
+            self.epoch = int(peer.get("epoch", 0)) + 1 if peer else max(self.epoch, 1)
+
+    def _wins_against(self, peer: dict[str, Any]) -> bool:
+        """Two actives: the higher epoch keeps serving; equal epochs fall back to the smaller node id."""
+        theirs = int(peer.get("epoch", 0))
+        if self.epoch != theirs:
+            return self.epoch > theirs
+        return self.node_id <= str(peer.get("node_id", ""))
+
+    def promote(self) -> None:
+        self.epoch += 1
+        self.role = "active"
+        self._peer_failures = 0
+        self.registry.renew_all()
+        self._sync_router()
+
+    def demote(self) -> None:
+        self.role = "standby"
+        self._sync_router()
+
+    def _ha_step(self) -> None:
+        """One peer check: mirror while standby, promote after ``promote_after`` misses, resolve a double-active."""
+        peer = self._peer_health()
+        if self.role == "standby":
+            if peer is None:
+                self._peer_failures += 1
+                if self._peer_failures >= self.promote_after:
+                    self.promote()
+                return
+            if peer.get("role") == "active":
+                self._peer_failures = 0
+                self.epoch = max(self.epoch, int(peer.get("epoch", 0)))
+                try:
+                    self.registry.replace_from_peer(self._peer().list().get("leases", []))
+                except Exception:
+                    pass
+            elif self.node_id <= str(peer.get("node_id", "")):
+                self.promote()   # both standby (e.g. both restarted): the smaller node id takes over
+            return
+        if peer and peer.get("role") == "active" and not self._wins_against(peer):
+            self.demote()
 
     def _rewrite_target(self, lease) -> str | None:
         if self.rewrite_headers and lease.protocol == "http":
@@ -323,8 +472,10 @@ class FabricGateway:
                 # Pick up store changes made by an overlapping process
                 # (e.g. a register served by a gateway that was mid-shutdown).
                 self.registry.reload_if_changed()
+                if self.peer_url and self.auto_ha:
+                    self._ha_step()
                 changed = False
-                for lease in self.registry.active_leases():
+                for lease in (self.registry.active_leases() if self.role == "active" else ()):
                     ok, err = _tcp_probe(lease.target_host, lease.target_port)
                     # Batch: update health + renew TTL in memory for every lease,
                     # then persist once below. (The old code persisted per lease,
@@ -408,6 +559,8 @@ class FabricGateway:
 
     def start(self) -> FabricGateway:
         self._acquire_lock()
+        if self.peer_url:
+            self._choose_initial_role()
         self._sync_router()
         handler = _make_handler(self)
         self._httpd = ThreadingHTTPServer((self.control_host, self.control_port), handler)
@@ -479,7 +632,17 @@ class FabricGateway:
                 "url": self.stable_url(port) if lease else None}
 
     def stable_url(self, port: int) -> str:
-        return f"http://{self.url_base}:{port}"
+        return f"{self.public_scheme}://{self.url_base}:{port}"
+
+    def enable_tls(self, context: ssl.SSLContext) -> None:
+        """Serve HTTPS on every leased port (same port as HTTP) and advertise https URLs."""
+        self.router.external_for = lambda port: f"{self.url_base}:{port}"
+        self.router.set_tls(context)
+        self.public_scheme = "https"
+
+    def disable_tls(self) -> None:
+        self.router.set_tls(None)
+        self.public_scheme = "http"
 
     def op_resolve_loopback(self, port: int, from_machine: str | None = None,
                             service: str | None = None) -> dict[str, Any]:
@@ -584,7 +747,8 @@ def _make_handler(gateway: FabricGateway):
             if self.path == "/healthz":
                 lo, hi = gateway.registry.port_range()
                 self._send(200, {"ok": True, "bound_ports": gateway.router.bound_ports(),
-                                 "url_base": gateway.url_base,
+                                 "url_base": gateway.url_base, "role": gateway.role,
+                                 "epoch": gateway.epoch, "node_id": gateway.node_id,
                                  "port_lo": lo, "port_hi": hi})
                 return
             self._send(404, {"error": "not found"})
@@ -598,6 +762,9 @@ def _make_handler(gateway: FabricGateway):
                 body = json.loads(self.rfile.read(length) or b"{}")
             except (ValueError, json.JSONDecodeError):
                 self._send(400, {"error": "invalid json"})
+                return
+            if gateway.role != "active" and self.path in ("/register", "/heartbeat", "/close"):
+                self._send(503, {"error": "standby", "active": gateway.peer_url})
                 return
             if self.path == "/register":
                 try:
