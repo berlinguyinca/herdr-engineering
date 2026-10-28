@@ -199,3 +199,34 @@ def test_cli_install_verify_uninstall_round_trip(tmp_path):
     assert run("verify").returncode == 0
     assert run("uninstall").returncode == 0
     assert run("verify").returncode == 1
+
+
+def test_installed_wheel_carries_the_skill_and_installs(tmp_path):
+    """A pip-installed (non-editable) herdr-eng must not depend on the repo checkout."""
+    repo = Path(ss.__file__).resolve().parents[1]
+    target = tmp_path / "site"
+    import shutil
+    py = next((c for c in (sys.executable, shutil.which("python3"), "/usr/bin/python3") if c and subprocess.run(
+        [c, "-c", "import setuptools"], capture_output=True).returncode == 0), None)
+    if py is None:
+        pytest.skip("no interpreter with setuptools to build a wheel")
+    build = subprocess.run(
+        [py, "-m", "pip", "install", "--quiet", "--no-deps", "--no-build-isolation",
+         "--no-cache-dir", "--target", str(target), str(repo)],
+        capture_output=True, text=True, cwd=str(tmp_path))
+    if build.returncode != 0:
+        pytest.skip(f"cannot build a wheel offline here: {build.stderr[-200:]}")
+    home = tmp_path / "home"
+    home.mkdir()
+    env = {"PYTHONPATH": str(target), "PATH": os.environ.get("PATH", ""), "HOME": str(home)}
+    def run(*a):
+        return subprocess.run([py, "-I", "-c",
+                               "import sys; sys.path.insert(0, %r); from herdr_engineering import cli; "
+                               "raise SystemExit(cli.main(sys.argv[1:]))" % str(target), "summary", *a,
+                               "--home", str(home)], capture_output=True, text=True, cwd=str(tmp_path), env=env)
+    first = run("install")
+    assert first.returncode == 0, first.stderr
+    assert run("verify").returncode == 0
+    assert (target / "herdr_engineering/skill_data/summary/SKILL.md").is_file()
+    assert (target / "herdr_engineering/skill_data/summary/adapters/pi-summary.md").is_file()
+    assert (home / ".claude/skills/summary/SKILL.md").read_bytes() == SKILL.read_bytes()
