@@ -479,7 +479,7 @@ class GitHubAppClient:
             raise GitHubAppError("invalid_response")
         return branch, head
 
-    def pr_review_summary(self, repo: str, number: int, head_sha: str) -> tuple[int, bool]:
+    def pr_review_summary(self, repo: str, number: int, head_sha: str, exclude: frozenset = frozenset()) -> tuple[int, bool]:
         """(human approvals of THIS head, whether any reviewer's latest review requests changes).
 
         Only a person (``user.type == "User"``) who is an owner, member or collaborator counts, only on
@@ -487,6 +487,7 @@ class GitHubAppClient:
         """
         slug, number, sha = _repo_path(repo), _number(number), _sha(head_sha)
         latest: dict[str, dict] = {}
+        complete = False
         for page in range(1, 6):
             data = self._send("GET", f"/repos/{slug}/pulls/{number}/reviews?per_page=100&page={page}")
             if not isinstance(data, list):
@@ -498,13 +499,16 @@ class GitHubAppClient:
                 if item.get("state") in ("APPROVED", "CHANGES_REQUESTED", "DISMISSED"):
                     latest[user["login"]] = item
             if len(data) < 100:
+                complete = True
                 break
+        if not complete:
+            return 0, True      # more than 500 reviews: a later change request could be hidden, so nothing counts
         approvals, changes = 0, False
-        for item in latest.values():
+        for login, item in latest.items():
             state = item.get("state")
             if state == "CHANGES_REQUESTED":
                 changes = True
-            elif (state == "APPROVED" and str(item.get("commit_id", "")).lower() == sha
+            elif (state == "APPROVED" and login not in exclude and str(item.get("commit_id", "")).lower() == sha
                   and (item.get("user") or {}).get("type") == "User"
                   and item.get("author_association") in ("OWNER", "MEMBER", "COLLABORATOR")):
                 approvals += 1

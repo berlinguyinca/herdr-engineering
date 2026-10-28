@@ -77,7 +77,7 @@ def no_facts(enrollment, pr) -> dict:
 
 def make_repair_gate(*, app: Any, policy_fn: Callable[[], rp.RepairPolicy | None],
                      facts_fn: Callable[[Any, Any], dict] = no_facts, attempt_fn: Callable[[Any, Any], int] = lambda e, p: 1,
-                     open_repair_prs_fn: Callable[[Any], int] = lambda e: 0) -> Callable[[Any, Any, Any], tuple[str, tuple[str, ...]]]:
+                     open_repair_prs_fn: Callable[..., int] = lambda e, p=None: 0) -> Callable[[Any, Any, Any], tuple[str, tuple[str, ...]]]:
     def gate(enrollment, pr, checks):
         policy = policy_fn()
         if policy is None:
@@ -89,6 +89,8 @@ def make_repair_gate(*, app: Any, policy_fn: Callable[[], rp.RepairPolicy | None
         if change is None:
             return "wait", (why or "change could not be read",)
         facts = facts_fn(enrollment, pr) or {}
+        if facts.get("incident_unbound"):
+            return "wait", ("this repair PR is not tied to a tracked incident (is ingest on?), so attempts cannot be counted",)
         ev = rp.Evidence(
             repository=enrollment.repo, base_branch=pr.base_ref, head_sha=pr.head_sha, change=change,
             review_sha=pr.head_sha, review_passed=True,      # the hook runs only after decide_merge accepted a PASS at this head
@@ -97,7 +99,7 @@ def make_repair_gate(*, app: Any, policy_fn: Callable[[], rp.RepairPolicy | None
             check_shas={c.name: c.sha for c in checks}, check_status={c.name: c.status for c in checks},
             required_checks=tuple(c.name for c in checks), changes_requested=bool(facts.get("changes_requested", False)),
             human_approvals=int(facts.get("human_approvals", 0) or 0), provenance_signed=facts.get("provenance_signed") is True,
-            attempt=attempt_fn(enrollment, pr), open_repair_prs=open_repair_prs_fn(enrollment),
+            attempt=attempt_fn(enrollment, pr), open_repair_prs=open_repair_prs_fn(enrollment, pr),
             conflicting_incident=facts.get("conflicting_incident") is True,
             scientific_validation_pending=facts.get("scientific_validation_pending") is True)
         decision = rp.evaluate(policy, ev)
@@ -106,7 +108,8 @@ def make_repair_gate(*, app: Any, policy_fn: Callable[[], rp.RepairPolicy | None
     return gate
 
 
-def make_facts_fn(*, app: Any, repo: Any, registry: Any, families_fn: Callable[[], dict]) -> Callable[[Any, Any], dict]:
+def make_facts_fn(*, app: Any, repo: Any, registry: Any, families_fn: Callable[[], dict],
+                  board_lookup: Callable[[str], Any] | None = None) -> Callable[[Any, Any], dict]:
     """Facts from systems of record. Anything that cannot be established is left out, which makes the policy wait.
 
     * human approvals / changes requested: GitHub reviews on this exact head (people only).
@@ -128,7 +131,10 @@ def make_facts_fn(*, app: Any, repo: Any, registry: Any, families_fn: Callable[[
     def facts(enrollment, pr) -> dict:
         key = PrKey(enrollment.repo, pr.number)
         out: dict = {}
-        approvals, changes = app.pr_review_summary(enrollment.repo, pr.number, pr.head_sha)
+        if board_lookup is not None and board_lookup(f"{enrollment.repo}#{pr.number}") is None:
+            out["incident_unbound"] = True
+        approvals, changes = app.pr_review_summary(enrollment.repo, pr.number, pr.head_sha,
+                                                   exclude=frozenset({getattr(pr, "author_login", "")}))
         out["human_approvals"], out["changes_requested"] = approvals, changes
         out["provenance_signed"] = bool(app.pr_commits_verified(enrollment.repo, pr.number, pr.head_sha))
         author = registry.author_of(key, pr.head_ref)
@@ -145,3 +151,30 @@ def make_facts_fn(*, app: Any, repo: Any, registry: Any, families_fn: Callable[[
             out["reviewer_model_family"] = family(verdict_model)
         return out
     return facts
+
+
+def make_counters(*, app: Any, repo: Any, board_lookup: Callable[[str], tuple[str, str] | None]):
+    """(attempt_fn, open_repair_prs_fn) from systems of record.
+
+    * attempt: how many ``ci_fix`` runs were requested for the incident this PR belongs to (same repository and CI run).
+      The PR is tied to its incident by the ``pr_url`` the repair run recorded (the incident board's binding).
+    * open repair PRs: other open ``herdr-ci-fix/`` PRs in the repository.
+    """
+    from ..review_gate.service import REPAIR_BRANCH_PREFIX
+
+    def attempt(enrollment, pr) -> int:
+        bound = board_lookup(f"{enrollment.repo}#{pr.number}")
+        if bound is None:
+            return 1
+        repository, _, run = bound[1].rpartition("#")
+        n = 0
+        for entity_id in repo.entity_ids("ci_fix"):
+            first = (repo.stream("ci_fix", entity_id) or [{}])[0].get("payload") or {}
+            if str(first.get("run")) == run and first.get("repository") and str(first["repository"]).endswith(repository.rpartition("/")[2]):
+                n += 1
+        return max(n, 1)
+
+    def open_prs(enrollment, pr=None) -> int:
+        number = getattr(pr, "number", None)
+        return sum(1 for p in app.open_prs(enrollment.repo) if p.head_ref.startswith(REPAIR_BRANCH_PREFIX) and p.number != number)
+    return attempt, open_prs

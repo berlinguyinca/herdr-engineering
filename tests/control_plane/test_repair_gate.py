@@ -102,7 +102,7 @@ def test_unreadable_central_config_after_enable_rejects(tmp_path, monkeypatch):
 
 def test_facts_fn_builds_independence_from_systems_of_record():
     class GApp:
-        def pr_review_summary(self, *a):
+        def pr_review_summary(self, *a, **k):
             return 1, False
 
         def pr_commits_verified(self, *a):
@@ -117,10 +117,43 @@ def test_facts_fn_builds_independence_from_systems_of_record():
             return [{"event_type": "verdict", "payload": {"verdict": "PASS", "sha": SHA, "reviewer_model": "gpt-6"}}]
 
     fams = {"claude": "anthropic", "gpt": "openai"}
-    facts = rg.make_facts_fn(app=GApp(), repo=Repo(), registry=Reg(), families_fn=lambda: fams)(ENR, PR)
+    facts = rg.make_facts_fn(app=GApp(), repo=Repo(), registry=Reg(), families_fn=lambda: fams, board_lookup=lambda k: ("p", "o/r#7"))(ENR, PR)
     assert facts == {"human_approvals": 1, "changes_requested": False, "provenance_signed": True, "author_context": "s-1",
                      "author_model_family": "anthropic", "reviewer_context": "gate-reviewer", "reviewer_model_family": "openai"}
     full = dict(FULL, require_human_approval=True)
     assert gate(full, App(DOC), facts) == ("allow", ())
     # an unlisted model has no family: independence cannot be shown, so the policy waits
     assert gate(full, App(DOC), rg.make_facts_fn(app=GApp(), repo=Repo(), registry=Reg(), families_fn=lambda: {})(ENR, PR))[0] == "wait"
+
+
+def test_untracked_incident_waits_and_counters_enforce_the_budgets():
+    # an enabled gate whose facts say the PR is not bound to a tracked incident never auto-merges
+    out = rg.make_repair_gate(app=App(DOC), policy_fn=lambda: rg.policy_from_section(FULL),
+                              facts_fn=lambda e, p: dict(GOOD_FACTS, incident_unbound=True))(ENR, PR, CHECKS)
+    assert out[0] == "wait" and "not tied to a tracked incident" in out[1][0]
+    # attempt and cascade counters reach the policy (previously defaulted to 1 and 0)
+    over = rg.make_repair_gate(app=App(DOC), policy_fn=lambda: rg.policy_from_section(dict(FULL, max_attempts=2, max_open_repair_prs=1)),
+                               facts_fn=lambda e, p: GOOD_FACTS, attempt_fn=lambda e, p: 3)
+    assert over(ENR, PR, CHECKS)[0] == "reject"
+    cascade = rg.make_repair_gate(app=App(DOC), policy_fn=lambda: rg.policy_from_section(dict(FULL, max_open_repair_prs=1)),
+                                  facts_fn=lambda e, p: GOOD_FACTS, open_repair_prs_fn=lambda e, p=None: 1)
+    assert cascade(ENR, PR, CHECKS)[0] == "reject"
+
+
+def test_make_counters_counts_runs_and_other_open_repair_prs():
+    class A:
+        def open_prs(self, repo):
+            return [NS(number=7, head_ref="herdr-ci-fix/a"), NS(number=8, head_ref="herdr-ci-fix/b"), NS(number=9, head_ref="feat/x")]
+
+    class R:
+        def entity_ids(self, e):
+            return ["f1", "f2", "f3"]
+
+        def stream(self, e, i):
+            run = {"f1": 7, "f2": 7, "f3": 9}[i]
+            return [{"payload": {"repository": "o/r", "run": run}}]
+
+    attempt, open_prs = rg.make_counters(app=A(), repo=R(), board_lookup=lambda k: ("p", "o/r#7") if k == "o/r#7" else None)
+    assert attempt(ENR, NS(number=7)) == 2          # two repair requests for run 7
+    assert attempt(ENR, NS(number=99)) == 1          # unbound PR: the gate's incident_unbound check handles it
+    assert open_prs(ENR, NS(number=7)) == 1          # PR 8 only; itself and non-repair PRs excluded

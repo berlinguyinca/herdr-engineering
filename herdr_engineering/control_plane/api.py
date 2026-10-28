@@ -686,8 +686,15 @@ class ControlPlaneServer:
         facts = None
         if repo is not None and registry is not None:
             from .repair_gate import make_facts_fn
-            facts = make_facts_fn(app=app, repo=repo, registry=registry, families_fn=families)
-        return make_repair_gate(app=app, policy_fn=policy, **({"facts_fn": facts} if facts else {}))
+            facts = make_facts_fn(app=app, repo=repo, registry=registry, families_fn=families,
+                                  board_lookup=lambda k: self.intelligence_bridge.board._pr.get(k))
+        extra = {"facts_fn": facts} if facts else {}
+        if repo is not None:
+            from .repair_gate import make_counters
+            bridge = self.intelligence_bridge
+            attempt, open_prs = make_counters(app=app, repo=repo, board_lookup=lambda k: bridge.board._pr.get(k))
+            extra.update(attempt_fn=attempt, open_repair_prs_fn=open_prs)
+        return make_repair_gate(app=app, policy_fn=policy, **extra)
 
     def _dispatch_native_message(self, record, message, artifact_ids):
         from ..errors import InvalidError

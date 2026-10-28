@@ -52,3 +52,13 @@ def test_merge_pr_sha_returns_the_merge_commit_or_none_when_refused():
     assert M({}).merge_pr_sha("github.com/o/r", 1, SHA) == ""                  # merged, id not reported
     assert M(GitHubAppError("not mergeable", status=405)).merge_pr_sha("github.com/o/r", 1, SHA) is None
     assert M({"sha": "c" * 40}).merge_pr("github.com/o/r", 1, SHA) is True
+
+
+def test_author_approval_excluded_and_over_500_reviews_fail_closed():
+    c = C([rv("author", "APPROVED"), rv("a", "APPROVED")])
+    assert c.pr_review_summary("github.com/o/r", 1, SHA, exclude=frozenset({"author"})) == (1, False)
+
+    class Many(C):
+        def _send(self, method, path, *, body=None, bearer=None):
+            return [rv(f"u{n}", "APPROVED") for n in range(100)] if "/reviews" in path else []
+    assert Many().pr_review_summary("github.com/o/r", 1, SHA) == (0, True)
