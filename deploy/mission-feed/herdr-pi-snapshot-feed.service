@@ -5,7 +5,6 @@ After=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=%h/.local/share/herdr-engineering/pi-snapshot-feed/current
-Environment=PYTHONPATH=%h/.local/share/herdr-engineering/pi-snapshot-feed/current
 ExecStart=%h/.venvs/herdr-engineering/bin/python -m herdr_engineering.cli control-plane feed-pi --snapshot %h/IdeaProjects/.pi-eng/orchestration-snapshot.json --interval 30 --allow-open
 Restart=on-failure
 RestartSec=15

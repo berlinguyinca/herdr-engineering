@@ -140,7 +140,7 @@ def test_migration_file_follows_numbering():
     assert "0006_github_catalog.sql" in names
     assert "0007_github_issue_details.sql" in names
     assert "0008_github_projects.sql" in names
-    assert names[-1] == "0013_handoffs.sql"
+    assert names[-1] == "0016_recovery_instance_index.sql"
     assert "CONCURRENTLY" not in _MIGRATION.read_text()
     assert "CONCURRENTLY" not in _DETAIL_MIGRATION.read_text()
     assert "CONCURRENTLY" not in _PROJECTS_MIGRATION.read_text()
