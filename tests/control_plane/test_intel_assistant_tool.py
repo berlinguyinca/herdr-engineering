@@ -2,7 +2,12 @@
 import pytest
 
 from herdr_engineering.control_plane import project_intelligence as pi
-from herdr_engineering.control_plane.assistant import TOOL_CATALOG, AssistantError, AssistantService, assistant_config
+from herdr_engineering.control_plane.assistant import (
+    TOOL_CATALOG,
+    AssistantError,
+    AssistantService,
+    assistant_config,
+)
 from herdr_engineering.control_plane.project_intelligence_api import IntelligenceRoutes
 
 

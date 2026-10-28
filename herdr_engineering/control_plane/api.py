@@ -631,6 +631,7 @@ class ControlPlaneServer:
             ci_snapshot=lambda: self.ci_monitor.snapshot(start=False),
             notifier=notifier,
             main_verifier=self.gate_main,
+            repair_gate=self._build_repair_gate(app, fleet_config),
         )
         self.gate_reviewer_config = config.reviewer
         self.gate_coordinator = ReviewCoordinator(
@@ -644,6 +645,12 @@ class ControlPlaneServer:
         # starts the poller, so the server starts the shared monitor itself.
         self.ci_monitor.start()
         self.gate_service.start()
+
+    def _build_repair_gate(self, app, fleet_config):
+        """Inert unless ``project_intelligence.repair.enabled``; read on every PR so the kill switch is hot."""
+        from .repair_gate import make_repair_gate, policy_from_section
+        return make_repair_gate(
+            app=app, policy_fn=lambda: policy_from_section(self._intelligence_section(fleet_config).get("repair")))
 
     def _dispatch_native_message(self, record, message, artifact_ids):
         from ..errors import InvalidError

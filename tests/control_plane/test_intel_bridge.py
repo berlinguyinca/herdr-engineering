@@ -219,3 +219,16 @@ def test_install_does_nothing_while_disabled_and_builds_lazily_when_enabled():
         bridge.on_event(ev)
     assert bridge._thread is None and routes._store is None and bridge._q.qsize() == 0   # no thread, no DB, no queue
     assert repo.subs == [bridge.on_event]
+
+
+@pytest.mark.integration
+def test_ci_fix_events_fold_into_the_incident_board():
+    from herdr_engineering.control_plane import project_intelligence as pi
+    from herdr_engineering.control_plane.intel_bridge import EventBridge
+    store = pi.IntelligenceStore()
+    br = EventBridge(store, lambda: {"enabled": True, "ingest": True}, lambda ev: ("p1",), org_id="o")
+    for n, state in enumerate(("queued", "running", "succeeded")):
+        ev = {"event_id": f"e{n}", "sequence": n, "event_type": "CIFixStateChanged", "entity_type": "ci_fix", "entity_id": "f1",
+              "source_timestamp": "2026-10-28T00:00:0%dZ" % n, "payload": {"repository": "o/r", "run": 7, "state": state}}
+        assert br.process(ev) == "accepted"
+    assert [i["state"] for i in br.board.summary()] == ["REVIEWING"]

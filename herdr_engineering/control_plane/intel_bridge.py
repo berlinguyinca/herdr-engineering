@@ -287,6 +287,8 @@ class EventBridge:
         self.store, self._cfg_fn, self._resolve = store, cfg_fn, resolve_projects
         self._org_src, self._instance, self._label = org_id, instance, security_label
         self._q: queue.Queue = queue.Queue(maxsize=capacity)
+        from .intel_incidents import IncidentBoard
+        self.board = IncidentBoard("v1")     # in-memory fold of ci_fix events; rebuilt by backfill/replay
         self.stats = {"accepted": 0, "replayed": 0, "unmapped": 0, "dropped": 0, "errors": 0, "ignored": 0}
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -346,6 +348,7 @@ class EventBridge:
                 return "unmapped"
             _, created = self.store.append_event(dict(probe, project_ids=list(projects)), cfg=cfg)
             self.stats["accepted" if created else "replayed"] += 1
+            self._fold_incident(ev, projects)
             return "accepted" if created else "replayed"
         except (pi.IngestionPaused, pi.Conflict):
             return "paused"
@@ -353,6 +356,14 @@ class EventBridge:
             self.stats["errors"] += 1
             log.warning("intelligence bridge failed to process an event", exc_info=False)
             return "error"
+
+    def _fold_incident(self, ev: dict, projects: tuple[str, ...]) -> None:
+        payload = ev.get("payload") or {}
+        if ev.get("entity_type") != "ci_fix" or not isinstance(payload.get("state"), str):
+            return
+        source = f"{payload.get('repository')}#{payload.get('run') or payload.get('number')}"
+        self.board.apply(project=projects[0], source_incident=source, event_id=str(ev.get("event_id")),
+                         at=str(_when(ev.get("source_timestamp"))), kind="ci_fix", state=payload["state"])
 
     def backfill(self, repo, *, entities=("ci_fix", "artifact"), max_events: int = 10_000, dry_run: bool = True) -> dict:
         """Opt-in, repeatable replay of existing event streams. ``dry_run`` only counts; nothing is written.
