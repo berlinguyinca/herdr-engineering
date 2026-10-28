@@ -36,6 +36,20 @@ checkpoint entries. Legacy experimental `.json`/`.bin` pairs remain untouched;
 preserve them for explicit verified conversion rather than treating them as
 current checkpoint containers. This storage change does not enable migration.
 
+Linux supervised workloads can use `SystemdExecutionScope` with the existing
+collaboration sandbox. It owns a named systemd service with process, memory,
+and CPU limits (512 tasks, 8 GiB, 200% CPU by default). The external-scope marker
+keeps bubblewrap and its descendants in that cgroup instead of creating a second
+scope. Receipt identity includes the lease-derived unit name, systemd invocation,
+actual cgroup, and control-group kill mode. A stop is verified only after that
+bound service stops and the exact cgroup is empty or gone. Failed start identity
+acquisition attempts cleanup and returns reconciliation metadata.
+
+Run the real no-model smoke test with `HERDR_SCHEDULER_SCOPE_LIVE=1` against
+`tests/test_execution_scope_live.py`. It starts isolated parent/child writers
+and verifies both stop writing after cgroup revocation. This execution boundary
+does not certify interactive harness checkpoint/resume or enable migration.
+
 - `HOST_STALE`: inspect `/api/v1/hosts/<host>/telemetry`; never substitute a fabricated zero-load value.
 - `HOST_MANUAL_ONLY`: use an explicit authorized manual host selection; this does not permit disabled/untrusted/unreachable hosts.
 - `POLICY_CHANGED`: the host changed after ranking; retry only through `plan`/`reserve`, never by reusing the old reservation.
