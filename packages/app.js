@@ -220,7 +220,9 @@ async function viewPersonalAssistant() {
 
 async function viewIntelligence() {
   root.innerHTML = `${liveHead('<h1>Project intelligence</h1>')}<div id="project-intelligence"></div>`;
+  const chip = root.querySelector('herdr-freshness');
   const view = mountProjectIntelligence(root.querySelector('#project-intelligence'), client, { query: route().query,
+    onFreshness: (ok, message) => chip.touch(ok, message),
     setQuery: (o) => history.replaceState(null, '', `#/intelligence${Object.keys(o).length ? `?${new URLSearchParams(o)}` : ''}`) });
   return { dispose: view.dispose, refresh: view.refresh };
 }

@@ -51,13 +51,13 @@ export function renderDetail(e) {
 <dt>Actor</dt><dd>${esc(e.actor || 'unknown')}</dd><dt>Related</dt><dd>${ents || '—'}</dd></dl><h2>Evidence</h2>${refs}`;
 }
 
-export function mountProjectIntelligence(host, client, { query = new URLSearchParams(), setQuery } = {}) {
+export function mountProjectIntelligence(host, client, { query = new URLSearchParams(), setQuery, onFreshness = () => {} } = {}) {
   let disposed = false;
   let timeline = null;
   const state = { project: query.get('project') || '', source: query.get('source') || '', category: query.get('category') || '',
     as_of: query.get('as_of') || '', event: query.get('event') || '' };
   const persist = () => setQuery?.(Object.fromEntries(Object.entries(state).filter(([, v]) => v)));
-  host.innerHTML = `${intelligenceStyles}<section class="pi" aria-label="Project intelligence"><div class="pi-bar"></div><div class="pi-state" role="status">Loading…</div></section>`;
+  host.innerHTML = `${intelligenceStyles}<section class="pi" aria-label="Project intelligence"><div class="pi-bar"></div><div class="pi-state hd-skeleton-group" data-skeleton aria-busy="true" role="status" aria-label="Loading project intelligence">${'<div class="hd-skeleton" style="height:44px"></div>'.repeat(3)}</div></section>`;
   const bar = host.querySelector('.pi-bar');
   const body = host.querySelector('.pi-state');
 
@@ -65,6 +65,7 @@ export function mountProjectIntelligence(host, client, { query = new URLSearchPa
     try {
       const { items: projects } = await client.getJson('/api/v1/intelligence/projects');
       if (disposed) return;
+      onFreshness(true);
       if (!arr(projects).length) { body.outerHTML = '<p class="pi-state" role="status">No projects are visible to you yet.</p>'; return; }
       if (!projects.some((p) => p.id === state.project)) state.project = projects[0].id;
       bar.innerHTML = `<label>Project<select id="pi-project">${projects.map((p) => `<option value="${esc(p.id)}"${p.id === state.project ? ' selected' : ''}>${esc(p.name)}</option>`).join('')}</select></label>
@@ -77,7 +78,9 @@ export function mountProjectIntelligence(host, client, { query = new URLSearchPa
       bar.querySelector('#pi-asof').onchange = (ev) => { state.as_of = ev.target.value; refresh(); };
       await refresh();
     } catch (err) {
-      if (!disposed) body.outerHTML = `<p class="pi-state" role="alert">Could not load project intelligence (${esc(err.status || 'network')}). Nothing is shown rather than partial data.</p>`;
+      if (disposed) return;
+      onFreshness(false, `project intelligence: ${err.status || 'network'}`);
+      body.outerHTML = `<p class="pi-state" role="alert">Could not load project intelligence (${esc(err.status || 'network')}). Nothing is shown rather than partial data.</p>`;
     }
   }
 
@@ -94,11 +97,13 @@ export function mountProjectIntelligence(host, client, { query = new URLSearchPa
       data = await client.getJson(`/api/v1/intelligence/projects/${encodeURIComponent(state.project)}/timeline?${q}`);
     } catch (err) {
       if (disposed || mine !== seq) return;
+      onFreshness(false, `timeline: ${err.status || 'network'}`);
       host.querySelector('.pi-state, .pi-split')?.replaceWith(Object.assign(document.createElement('p'), {
         className: 'pi-state', role: 'alert', textContent: `Could not load the timeline (${err.status || 'network'}).` }));
       return;
     }
     if (disposed || mine !== seq) return;
+    onFreshness(true);
     timeline = data;
     draw(host.querySelector('.pi-state, .pi-split'));   // re-queried after the await: never a detached node
   }
