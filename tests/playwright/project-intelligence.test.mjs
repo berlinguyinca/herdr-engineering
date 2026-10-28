@@ -193,3 +193,35 @@ test('a failed links request says so without hiding the evidence', async () => {
     assert.match(await page.locator('.pi-pane').innerText(), /Evidence/);
   });
 });
+
+test('investigation picker filters the timeline and persists in the URL; artifacts link with their hash', async () => {
+  await withPage(async (page, base) => {
+    const seen = [];
+    const tl = { total: 1, items: [{ event_id: 'a1', title: 'artifact report.pdf', category: 'artifact', occurred_at: '2026-10-03T09:00:00+00:00',
+      observed_at: '2026-10-03T09:00:00+00:00', actor: 'agent:x', involved_entities: ['artifact:art-77'], late_arrival: false, superseded: false,
+      tombstoned: false, label: 'verified', evidence_refs: [{ source_ref: 'artifact:art-77', anchor_type: 'attachment_bytes', anchor_value: 'all', content_hash: 'ab12cd34ef56aa77bb88' }] }] };
+    await stub(page, { seen, timeline: tl });
+    await page.route('**/api/v1/intelligence/investigations', (route) => route.fulfill({ status: 200, contentType: 'application/json',
+      body: JSON.stringify({ items: [{ id: 'inv-1', name: 'Column drift <i>Q3</i>' }] }) }));
+    await page.goto(`${base}/#/intelligence`);
+    await page.waitForSelector('#pi-inv');
+    assert.equal(await page.locator('#pi-inv option i').count(), 0, 'investigation names are escaped');
+    await page.selectOption('#pi-inv', 'inv-1');
+    await page.waitForFunction(() => location.hash.includes('investigation=inv-1'));
+    assert.ok(seen.some((u) => u.includes('/timeline') && u.includes('investigation=inv-1')), seen.join('\n'));
+    await page.locator('.pi-item[data-event="a1"]').click();
+    const pane = await page.locator('.pi-pane').innerText();
+    assert.match(pane, /sha256 ab12cd34ef56/);
+    assert.equal(await page.locator('.pi-pane a[href="#/artifacts/art-77"]').count(), 1);
+  });
+});
+
+test('no investigations: the picker is simply absent and a failed lookup does not block the timeline', async () => {
+  await withPage(async (page, base) => {
+    await stub(page);
+    await page.route('**/api/v1/intelligence/investigations', (route) => route.fulfill({ status: 500, contentType: 'application/json', body: '{}' }));
+    await page.goto(`${base}/#/intelligence`);
+    await page.waitForSelector('.pi-item');
+    assert.equal(await page.locator('#pi-inv').count(), 0);
+  });
+});

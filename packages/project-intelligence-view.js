@@ -40,11 +40,11 @@ export function renderDetail(e) {
   if (!e) return '<p class="pi-state">Select an event to see its evidence.</p>';
   const ev = arr(e.evidence_refs);
   const refs = ev.length
-    ? `<ul>${ev.map((r) => `<li><code>${esc(r.source_ref)}</code> · ${esc(r.anchor_type)} <code>${esc(r.anchor_value)}</code>${r.git_sha ? ` · <code>${esc(String(r.git_sha).slice(0, 12))}</code>` : ''}</li>`).join('')}</ul>`
+    ? `<ul>${ev.map((r) => `<li><code>${esc(r.source_ref)}</code> · ${esc(r.anchor_type)} <code>${esc(r.anchor_value)}</code>${r.git_sha ? ` · <code>${esc(String(r.git_sha).slice(0, 12))}</code>` : ''}${r.content_hash ? ` · sha256 <code>${esc(String(r.content_hash).slice(0, 12))}</code>` : ''}</li>`).join('')}</ul>`
     : '<p class="pi-note">No evidence reference. Treat this as unverified.</p>';
   const ents = arr(e.involved_entities).map((x) => {
     const kind = String(x).split(':')[0];
-    const href = ['pr', 'ci', 'mission', 'session'].includes(kind) ? entityHref(kind, String(x).slice(kind.length + 1)) : null;
+    const href = ['pr', 'ci', 'mission', 'session', 'artifact'].includes(kind) ? entityHref(kind, String(x).slice(kind.length + 1)) : null;
     return href ? `<a href="${esc(href)}">${esc(x)}</a>` : esc(x);
   }).join(', ');
   return `<h2>${esc(e.title)}</h2><dl><dt>Happened</dt><dd><time>${esc(when(e.occurred_at))}</time></dd><dt>Observed by Herdr</dt><dd><time>${esc(when(e.observed_at))}</time></dd>
@@ -78,7 +78,7 @@ export function renderFindings(items) {
 export function mountProjectIntelligence(host, client, { query = new URLSearchParams(), setQuery, onFreshness = () => {} } = {}) {
   let disposed = false;
   let timeline = null;
-  const state = { project: query.get('project') || '', source: query.get('source') || '', category: query.get('category') || '',
+  const state = { investigation: query.get('investigation') || '', project: query.get('project') || '', source: query.get('source') || '', category: query.get('category') || '',
     as_of: query.get('as_of') || '', event: query.get('event') || '' };
   const persist = () => setQuery?.(Object.fromEntries(Object.entries(state).filter(([, v]) => v)));
   host.innerHTML = `${intelligenceStyles}<section class="pi" aria-label="Project intelligence"><div class="pi-bar"></div><div class="pi-state hd-skeleton-group" data-skeleton aria-busy="true" role="status" aria-label="Loading project intelligence">${'<div class="hd-skeleton" style="height:44px"></div>'.repeat(3)}</div></section>`;
@@ -88,15 +88,20 @@ export function mountProjectIntelligence(host, client, { query = new URLSearchPa
   async function load() {
     try {
       const { items: projects } = await client.getJson('/api/v1/intelligence/projects');
+      // Investigations are optional context: their failure never blocks the timeline.
+      const investigations = await client.getJson('/api/v1/intelligence/investigations').then((o) => arr(o?.items), () => []);
       if (disposed) return;
       onFreshness(true);
       if (!arr(projects).length) { body.outerHTML = '<p class="pi-state" role="status">No projects are visible to you yet.</p>'; return; }
       if (!projects.some((p) => p.id === state.project)) state.project = projects[0].id;
       bar.innerHTML = `<label>Project<select id="pi-project">${projects.map((p) => `<option value="${esc(p.id)}"${p.id === state.project ? ' selected' : ''}>${esc(p.name)}</option>`).join('')}</select></label>
+${arr(investigations).length ? `<label>Investigation<select id="pi-inv"><option value="">All</option>${investigations.map((i) => `<option value="${esc(i.id)}"${i.id === state.investigation ? ' selected' : ''}>${esc(i.name)}</option>`).join('')}</select></label>` : ''}
 <label>Source<input id="pi-source" value="${esc(state.source)}" placeholder="e.g. gmail"></label>
 <label>Category<input id="pi-category" value="${esc(state.category)}" placeholder="e.g. ci"></label>
 <label>As of (UTC)<input id="pi-asof" type="datetime-local" value="${esc(state.as_of)}"></label>`;
       bar.querySelector('#pi-project').onchange = (ev) => { state.project = ev.target.value; state.event = ''; refresh(); };
+      const inv = bar.querySelector('#pi-inv');
+      if (inv) inv.onchange = (ev) => { state.investigation = ev.target.value; refresh(); };
       bar.querySelector('#pi-source').onchange = (ev) => { state.source = ev.target.value.trim(); refresh(); };
       bar.querySelector('#pi-category').onchange = (ev) => { state.category = ev.target.value.trim(); refresh(); };
       bar.querySelector('#pi-asof').onchange = (ev) => { state.as_of = ev.target.value; refresh(); };
@@ -113,6 +118,7 @@ export function mountProjectIntelligence(host, client, { query = new URLSearchPa
     persist();
     const mine = ++seq;                       // a newer refresh makes every older response stale
     const q = new URLSearchParams();
+    if (state.investigation) q.set('investigation', state.investigation);
     if (state.source) q.set('source', state.source);
     if (state.category) q.set('category', state.category);
     if (state.as_of) q.set('as_of', `${state.as_of}${/T\d\d:\d\d$/.test(state.as_of) ? ':00' : ''}+00:00`);
