@@ -1,0 +1,34 @@
+# Woodpecker CI (ci.metabolomics.us) -- the Python and client unit gates (scripts/ci/unit-gates.sh).
+#
+# Same conventions as ui-gates.yml: `image:` names an executable on the agent, skip_clone plus a plain git checkout with the staged
+# credential, pull_request and manual only (a push to a PR branch must not build twice). The step logic lives in the script so
+# `bash scripts/ci/unit-gates.sh` reproduces CI from a clean checkout. The browser (Playwright) suites stay in ui-gates.yml.
+#
+# Whole suites, not scoped subsets. Failures present on a clean main are not hidden here; they show up red until fixed
+# (tests/test_deploy_scripts.py has two, and test_ci_api.py's telemetry test races intermittently).
+# To use the larger hive pool, add `labels: {cluster: hive}` (queues are long, 10+ minutes).
+when:
+  - event: manual
+  - event: pull_request
+    path:
+      include: ['herdr_engineering/**', 'tests/**', 'packages/**', 'pyproject.toml', 'scripts/ci/unit-gates.sh', '.woodpecker/unit-gates.yml']
+
+skip_clone: true
+
+steps:
+  - name: checkout
+    image: bash
+    commands:
+      - 'set -eu'
+      - 'test -r /etc/woodpecker-git-credentials || { echo "the job staged no forge credential" >&2; exit 1; }'
+      - 'git init -q -b "${CI_COMMIT_BRANCH:-main}" .'
+      - 'git remote add origin "https://github.com/${CI_REPO}.git"'
+      - 'git fetch --no-tags --depth=1 origin "$CI_COMMIT_SHA"'
+      - 'git checkout -q FETCH_HEAD'
+      - 'git --no-pager log --oneline -1'
+
+  - name: unit-gates
+    image: bash
+    commands:
+      - 'set -eu'
+      - 'bash scripts/ci/unit-gates.sh'
