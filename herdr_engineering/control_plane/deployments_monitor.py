@@ -40,7 +40,9 @@ from .redact import redact_text
 
 #: The emitter's outcome vocabulary (deploy_event.OUTCOMES).
 OUTCOMES = ("started", "ok", "refused", "failed", "rolled-back", "skipped")
-FIELDS = ("id", "ts", "host", "component", "step", "outcome", "from", "to", "evidence")
+#: ``instance`` is optional: a stable id for one deployable instance of a component
+#: (e.g. a Slurm job id) that outlives the event ``host``; consumers prefer it to ``host``.
+FIELDS = ("id", "ts", "host", "component", "step", "outcome", "from", "to", "evidence", "instance")
 REQUIRED = ("ts", "host", "component", "step", "outcome")
 
 #: Largest accepted request body. The emitter caps evidence at 8192 characters and
@@ -71,6 +73,7 @@ _COMPONENT = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}")
 _STEP_SUFFIX = re.compile(r"[a-z0-9][a-z0-9_.-]{0,63}")
 _HOST = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,252}")
 _COMMIT = re.compile(r"[A-Za-z0-9._-]{0,128}")
+_INSTANCE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
 
 _R = "[REDACTED]"
 # Supplements: the shared ``redact_text`` covers db/s3 connection strings but not
@@ -151,9 +154,13 @@ def validate_event(event) -> dict:
     for field in ("from", "to"):
         if not _COMMIT.fullmatch(ev[field]):
             _fail(field, "must be a commit id of at most 128 characters")
+    if "instance" in event and not _INSTANCE.fullmatch(ev["instance"]):
+        _fail("instance", "must match [A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
     ev["evidence"] = _cap(redact_evidence(ev["evidence"]))
     if "id" not in event:
         del ev["id"]
+    if "instance" not in event:
+        del ev["instance"]
     return ev
 
 
@@ -207,7 +214,8 @@ class DeploymentsMonitor:
         otherwise the tuple, which includes outcome because started/ok share a step and a ts."""
         if ev.get("id"):
             return ("id", ev["id"])
-        return ("tuple", ev["host"], ev["host_ts"], ev["component"], ev["step"], ev["outcome"])
+        return ("tuple", ev["host"], ev["host_ts"], ev["component"], ev["step"], ev["outcome"],
+                ev.get("instance", ""))
 
     def _apply(self, ev) -> bool:
         """Add a stamped event under the lock; False when it is a duplicate."""
@@ -289,8 +297,10 @@ class DeploymentsMonitor:
             "hold_remaining_s": hold,
             # Host clock minus herdr's clock at the latest event (positive: host ahead).
             "clock_skew_s": int(_epoch(latest["host_ts"]) - latest["_rx"]),
-            "timeline": [{k: v for k, v in e.items() if k not in ("seq", "_rx")}
-                         for e in row["timeline"]],
+            # received_epoch: the exact arrival (received_at is floored to the second), so a
+            # consumer's hold never ends early.
+            "timeline": [{**{k: v for k, v in e.items() if k not in ("seq", "_rx")},
+                          "received_epoch": e["_rx"]} for e in row["timeline"]],
         }
 
     # -------------------------------------------------------------- restore

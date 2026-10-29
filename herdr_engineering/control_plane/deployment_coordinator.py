@@ -4,127 +4,157 @@
 no host clock (``now`` is injected), the same input always gives the same actions.
 ``DeploymentCoordinator`` is the thin stateful wrapper: per tick it reads ONE CI view
 (``DeploymentDefinitions.plans()``), one monitor snapshot and one release-evidence answer
-per track, calls ``advance`` and commits what it decided (a new plan generation, the
-attempts it saw) to ``CoordinatorState``, which persists through the repo's private
-sink stream like the deployment events do and is replayed by ``hydrate``.
+per track, folds the events into ``CoordinatorState`` (persisted through the repo's
+private sink stream, replayed by ``hydrate``), calls ``advance`` and adopts a Replan's
+generation. It decides nothing ``advance`` did not.
 
 Rules (spec section 4):
 
-* A stage's components are the definitions with that stage number. Within a stage
-  the order groups run in turn (gateways, order 0, before nodes): a group may start
-  once every earlier group of the stage is healthy on the target. There is no hold
-  between order groups.
-* Stage N+1 starts only when EVERY stage-N component has been healthy on the target
-  for its definition's ``health.hold_s``, counted from the herdr arrival
-  (``received_at``) of the later ``ok``, against the injected ``now``. The host's own
-  ``ts`` is never used. A component that turns unhealthy resets the hold: the hold
-  runs from its next ``ok``.
-* A failed component (``failed``/``refused`` for the target, ``rolled-back`` from it)
-  halts its stage; a halted stage blocks every later stage. There is no auto-skip.
-  The halt is derived from the current events, so a repaired component (a later
-  ``ok``) lifts it; the attempt cap that keeps it halted is Task 7's, fed by
-  ``CoordinatorState.attempts``.
+* A stage's components are the definitions with that stage number. Within a stage the
+  order groups run in turn (gateways, order 0, before nodes): a group may start once
+  every earlier group of the stage is healthy on the target. No hold between groups.
+* Stage N+1 starts only when EVERY stage-N component has been healthy on the target for
+  its definition's ``health.hold_s``, counted from herdr's exact arrival time
+  (``received_epoch``, else ``received_at``) of the later ``ok``, against the injected
+  ``now``. A component that turns unhealthy resets the hold (it runs from its next ok).
+* A failed component halts its stage; a halted stage blocks every later stage. No
+  auto-skip. A later ``ok`` toward the same target from the SAME instance lifts it; the
+  attempt cap that keeps it halted is Task 7's, fed by ``CoordinatorState.attempts``.
 * A new green release mid-roll restarts the plan from the newest commit: ``Replan``
-  bumps the generation and every following action carries it. Actions of an earlier
-  generation are superseded; the consumer acts only on the newest generation.
+  bumps the generation and every following action carries it.
 
-Component state is rebuilt here from the monitor's timeline, not read from the row's
-``health``/``running``/``hold_remaining_s`` (those cover every reporter and use the
-monitor's global hold and clock):
+Instances and the per-release fold (``CoordinatorState.observe``):
 
 * only events whose ``reported_by`` (the authenticated fleet host) equals the
-  definition's ``host`` count. Events accepted before definitions were configured may
-  still be in the store; a missing ``reported_by`` counts as foreign;
-* one component can have many instances (``hive-nodes``: every GPU node reports it
-  under its own event ``host``). Each instance's latest non-``skipped`` event decides
-  that instance; any failed instance halts, any instance not yet healthy keeps the
-  stage open, and the hold runs from the latest ``ok`` across instances;
-* an event counts for the target only when its commit matches (``same_commit``): an
-  ``ok`` for the previous commit is not healthy for the new one.
+  definition's ``host`` count; a missing ``reported_by`` counts as foreign (events
+  accepted before definitions were configured may still be in the store);
+* a component has instances: the event's optional ``instance`` field (a stable id such as
+  a Slurm job id) or else its ``host``. Each event is filed under its RELEASE (``to`` for
+  started/ok/failed/refused, ``from`` for rolled-back) and instance; the slot keeps the
+  instance's decisive event, ordered by (host ``ts``, outcome rank, arrival) - within one
+  instance the host's own clock orders, so a late-arriving older ok cannot lift a newer
+  failure; on a tie a failure beats an ok beats a started. Slots are persisted, so a
+  failure that has left the monitor's 50-event timeline still halts;
+* for the target, an instance with no slot for it is ABSENT: listed in ``missing``
+  (``component:instance``) and it does not block. A failed slot blocks; any started slot
+  keeps the stage open; otherwise the component is healthy from the latest ok;
+* bounds: ``INSTANCES_PER_RELEASE`` slots per (component, release). A new instance
+  evicts the oldest ok, then the oldest started; a failed slot is evicted only when all
+  are failed, and the release is then marked ``failure-evicted`` (a permanent halt
+  reason for that release). Releases per component are LRU (touched on every observe);
+  the cap exceeds the monitor's timeline, so nothing visible churns.
 
 Safety gates, in this order, before any stage decision:
 
 1. no definitions / no green target: ``Idle``.
-2. ``target_on_main is False`` (force-push, revert): ``Halt(stage=None)`` "target no
+2. the target is one of the plan's past targets: ``Hold`` "target is an earlier
+   release" (a fresh server whose CI window holds only a rerun of an old commit must
+   not go backward; such a target is also behind ``plan_commit``, so its evidence says
+   ``on_main=False`` and must not read as a force-push).
+3. ``target_on_main is False`` (force-push, revert): ``Halt(stage=None)`` "target no
    longer on main"; nothing advances, no replan.
-3. the target is one of the plan's past targets: ``Hold`` (a fresh server whose CI
-   window holds only a rerun of an old commit must not go backward).
-4. CI green proves the commit passed CI, not that the release asset was published for
-   it. A ``Start`` is only emitted when ``published_commit`` matches the target:
-   unknown evidence (the default) is ``Hold`` "release not confirmed"; with ancestry
-   confirmed the stage decision is made and a Start becomes that same Hold.
-5. ``target_on_main is None`` (not checked) with a confirmed release: ``Hold``
-   "target ancestry not confirmed".
+4. ``published_commit`` does not match the target: ``Hold`` "release not confirmed"
+   (CI green proves CI passed, not that the release asset was published). With
+   ancestry confirmed the stage decision is made first and only a Start is converted,
+   so a halt still shows.
+5. ``target_on_main is None`` with a confirmed release: ``Hold`` "target ancestry not
+   confirmed".
 6. a target other than the plan's commit: ``Replan`` (generation + 1).
 
 Release evidence (contract for the caller; wiring to the real release-asset check is a
-later task): ``DeploymentCoordinator(evidence=fn)`` with
-``fn(track, target_commit, plan_commit) -> ReleaseEvidence`` called once per track per
-tick. ``published_commit`` is the commit the release (``follows.tag`` /
-``follows.asset``, its ``.commit`` file) currently carries; ``on_main`` answers "the
-target is on ``follows.branch`` and is not behind ``plan_commit``" (True / False /
-None = unknown). The default evidence is unknown for both, so until it is wired the
-coordinator only ever Holds; that is intended (fail closed).
+later task): ``DeploymentCoordinator(evidence=fn)``, ``fn(track, target_commit,
+plan_commit) -> ReleaseEvidence``, called once per track per tick. ``published_commit``
+is the commit the release (``follows.tag``/``follows.asset``, its ``.commit``) carries;
+``on_main`` is True only when the target is on ``follows.branch`` AND not behind
+``plan_commit`` (False / None = unknown). The default is unknown for both, so until it
+is wired the coordinator only ever Holds (fail closed).
 
-A ``Start`` never means "restart this host now": hosts pull. It is a permission, ``allow
-the updaters of these components to proceed to target_commit``; ``components`` is
-cumulative (every component whose turn has come in this generation, earlier stages
-included). Hold and Halt carry no permission list, so the consumer (Task 6) applies:
-permission = the components of the LAST ``Start`` of the CURRENT generation; a ``Halt``
-forbids new starts in its stage and later ones (repairs of an already-permitted
-component are Task 7's); a Replan withdraws everything of older generations. A stage-1
-component turning unhealthy after stage 2 started yields ``Hold``/``Halt`` at stage 1,
-so stage 2's turn is withdrawn until stage 1 has held again (the reset rule). Repairs never
-release a GPU (the definitions validator already refuses GPU-releasing restarts).
-Herdr-down handling stays on the hosts (Task 6).
+Permission (the Task 6 gate is stateless): every action carries ``permitted``, the
+components whose updaters may proceed to ``target_commit`` NOW. A tick's permission is
+its LAST action's (``permitted(actions)``); a component is permitted iff it is in that
+tuple for the current generation and commit. Hosts pull, so permission never means
+"restart now", and repairs never release a GPU.
+
+* ``Start(s, o)``: every component of the stages before ``s`` plus stage ``s``'s order
+  groups up to and including ``o``;
+* ``Hold(s)`` on the hold timer: every component of stages up to and including ``s``
+  (all on the target; their updaters may keep and repair them);
+* ``Halt(s)``: the stages before ``s`` only - a halt stops the halted stage's remaining
+  components too (spec 7.1);
+* ``Idle("rolled out")``: every component;
+* ``Hold(None)``, ``Halt(None)``, a Start converted to "release not confirmed", the
+  other ``Idle``s and ``Replan``: nothing.
+
+A stage-1 component turning unhealthy after stage 2 started yields Start/Hold/Halt at
+stage 1, which withdraws stage 2's permission until stage 1 has held again. Herdr-down
+handling stays on the hosts (Task 6). Expected-reporter sets (a node that never reports
+blocking its stage) are deliberately not built here.
 """
 from __future__ import annotations
 
 import copy
 import math
+import re
 import threading
+import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from itertools import groupby
 
+from .deployments_monitor import TIMELINE_LIMIT
+
 ENTITY_TYPE = "deployment_plan"
 PLAN_EVENT = "DeploymentPlanAdopted"
 ATTEMPT_EVENT = "DeploymentAttemptSeen"
+SLOT_EVENT = "DeploymentInstanceObserved"
+EVICTED_EVENT = "DeploymentFailureEvicted"
 
 #: Past targets kept per track (a replan onto one of them is refused).
 PAST_LIMIT = 32
-#: Attempt bookkeeping bounds: releases per component, instances per release, starts per instance.
-RELEASES_PER_COMPONENT = 16
-INSTANCES_PER_RELEASE = 512
+#: Releases kept per component (LRU). Above the monitor's timeline so nothing churns.
+RELEASES_PER_COMPONENT = 64
+assert RELEASES_PER_COMPONENT > TIMELINE_LIMIT
+#: Slots per (component, release). Above the timeline too, so an instance the timeline still
+#: shows is not evicted and re-added every tick in practice (no tombstones are kept).
+INSTANCES_PER_RELEASE = 256
+assert INSTANCES_PER_RELEASE > TIMELINE_LIMIT
 STARTS_PER_INSTANCE = 64
+MISSING_LIMIT = 50
 MIN_PREFIX = 7
+_ID_CAP = 128
+_KEY_CAP = 200
 
 _TS_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
-_FAILED_TO = ("failed", "refused")
+_RANK = {"started": 0, "ok": 1, "failed": 2, "refused": 2, "rolled-back": 2}
+_COMMIT = re.compile(r"[A-Za-z0-9._-]{1,128}")
+_TS = re.compile(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ")
 
 
 # ----------------------------------------------------------------- actions
 @dataclass(frozen=True)
 class Start:
-    """Allow the updaters of ``components`` (cumulative) to proceed to ``target_commit``.
-    ``stage``/``order`` name the group whose turn has just come."""
+    """The order group ``components`` of ``stage`` has its turn. ``permitted`` is cumulative."""
     stage: int
     order: int
     components: tuple
     target_commit: str
     generation: int
+    permitted: tuple = ()
+    missing: tuple = ()
 
 
 @dataclass(frozen=True)
 class Hold:
-    """Wait. ``stage`` is the stage the plan is at (None: before any stage);
-    ``remaining_s`` is the hold left, None when waiting on evidence rather than time."""
+    """Wait. ``stage``: the stage the plan is at (None: before any stage); ``remaining_s``:
+    the hold left, None when waiting on evidence rather than time."""
     stage: int | None
     remaining_s: int | None
     reason: str
     target_commit: str | None
     generation: int
+    permitted: tuple = ()
+    missing: tuple = ()
 
 
 @dataclass(frozen=True)
@@ -135,6 +165,8 @@ class Halt:
     target_commit: str | None
     generation: int
     components: tuple = ()
+    permitted: tuple = ()
+    missing: tuple = ()
 
 
 @dataclass(frozen=True)
@@ -143,12 +175,20 @@ class Replan:
     new_target: str
     generation: int
     previous_commit: str | None
+    permitted: tuple = ()
 
 
 @dataclass(frozen=True)
 class Idle:
     reason: str
     target_commit: str | None
+    permitted: tuple = ()
+    missing: tuple = ()
+
+
+def permitted(actions) -> tuple:
+    """The tick's permission: the last action's ``permitted`` (nothing for no actions)."""
+    return tuple(actions[-1].permitted) if actions else ()
 
 
 # ------------------------------------------------------------------- input
@@ -163,7 +203,9 @@ class ReleaseEvidence:
 class Snapshot:
     """One tick's input. ``components`` is ``DeploymentsMonitor.snapshot()['components']``;
     ``target_commit`` the track's newest CI-green main commit (one CI read per tick);
-    ``plan_commit``/``generation``/``past_targets`` the persisted plan."""
+    ``plan_commit``/``generation``/``past_targets`` the persisted plan. ``slots`` is
+    ``CoordinatorState.slots_for(target, ...)`` (the persisted fold); when None it is
+    folded from ``components`` alone, which forgets what left the timeline."""
     components: dict
     target_commit: str | None
     published_commit: str | None = None
@@ -171,6 +213,7 @@ class Snapshot:
     plan_commit: str | None = None
     generation: int = 0
     past_targets: tuple = field(default_factory=tuple)
+    slots: dict | None = None
 
 
 def same_commit(a, b) -> bool:
@@ -183,12 +226,31 @@ def same_commit(a, b) -> bool:
     return len(short) >= MIN_PREFIX and full.startswith(short)
 
 
-def _rx(event):
+def _arrival(event):
+    """herdr's arrival time: the exact ``received_epoch`` when present, else ``received_at``."""
+    rx = event.get("received_epoch")
+    if isinstance(rx, (int, float)) and not isinstance(rx, bool) and math.isfinite(rx):
+        return float(rx)
     try:
         return datetime.strptime(event.get("received_at") or "", _TS_FORMAT).replace(
             tzinfo=UTC).timestamp()
     except (TypeError, ValueError):
         return None
+
+
+def _instance_of(event):
+    return str(event.get("instance") or event.get("host") or "")[:_ID_CAP]
+
+
+def _release_of(event):
+    outcome = event.get("outcome")
+    if outcome in ("started", "ok", "failed", "refused"):
+        release = event.get("to")
+    elif outcome == "rolled-back":
+        release = event.get("from")
+    else:
+        return None
+    return release if isinstance(release, str) and _COMMIT.fullmatch(release) else None
 
 
 def _authorized(row, definition):
@@ -197,44 +259,33 @@ def _authorized(row, definition):
     if not isinstance(timeline, list):
         return []
     return [e for e in timeline if isinstance(e, dict)
-            and e.get("reported_by") == definition.host and _rx(e) is not None]
+            and e.get("reported_by") == definition.host and _arrival(e) is not None]
 
 
-def _instance_state(event, target):
-    outcome = event.get("outcome")
-    if outcome == "ok" and same_commit(event.get("to"), target):
-        return "healthy"
-    if outcome == "started" and same_commit(event.get("to"), target):
-        return "updating"
-    if outcome in _FAILED_TO and same_commit(event.get("to"), target):
-        return "failed"
-    if outcome == "rolled-back" and same_commit(event.get("from"), target):
-        return "failed"
-    return "pending"                # its latest event is about another commit
+def _order(slot):
+    return (slot["host_ts"], _RANK[slot["outcome"]], slot["rx"])
 
 
-def component_status(row, definition, target):
-    """``(state, since, outcome)`` for one component on ``target``.
+def _state_of(outcome):
+    return {"started": "updating", "ok": "healthy"}.get(outcome, "failed")
 
-    state: ``healthy`` (``since`` = arrival of the latest ok), ``failed`` (``outcome`` =
-    the failing outcome), ``updating`` or ``pending``.
-    """
-    latest = {}
-    for e in _authorized(row, definition):
-        if e.get("outcome") == "skipped":
-            continue
-        latest[e.get("host") or ""] = e
-    if not latest:
+
+# ------------------------------------------------------------- decisions
+def _status(slot_view):
+    """``(state, since, outcome)`` for one component from its target slots."""
+    if not slot_view:
         return "pending", None, None
-    states = {inst: (_instance_state(e, target), e) for inst, e in latest.items()}
-    failed = sorted((inst, e) for inst, (st, e) in states.items() if st == "failed")
+    instances = slot_view.get("instances") or {}
+    failed = sorted((inst, s) for inst, s in instances.items() if _state_of(s["outcome"]) == "failed")
     if failed:
-        return "failed", None, failed[0][1].get("outcome")
-    if any(st == "updating" for st, _ in states.values()):
-        return "updating", None, None
-    if any(st == "pending" for st, _ in states.values()):
+        return "failed", None, failed[0][1]["outcome"]
+    if slot_view.get("failure_evicted"):
+        return "failed", None, "failure-evicted"
+    if not instances:
         return "pending", None, None
-    return "healthy", max(_rx(e) for _, e in states.values()), None
+    if any(_state_of(s["outcome"]) == "updating" for s in instances.values()):
+        return "updating", None, None
+    return "healthy", max(s["rx"] for s in instances.values()), None
 
 
 def _stages(definitions):
@@ -242,35 +293,41 @@ def _stages(definitions):
     return [(stage, list(group)) for stage, group in groupby(defs, key=lambda d: d.stage)]
 
 
-def _roll(snapshot, definitions, now, target, generation):
+def _roll(slots, definitions, now, target, generation):
     """The stage decision for ``target`` (no gates): one Start, Hold, Halt or Idle."""
-    components = snapshot.components if isinstance(snapshot.components, dict) else {}
-    allowed: list[str] = []
+    missing = []
+    for name in sorted(definitions):
+        missing.extend(f"{name}:{inst}" for inst in (slots.get(name) or {}).get("absent", ()))
+    missing = tuple(missing[:MISSING_LIMIT])
+    done: list[str] = []
     for stage, defs in _stages(definitions):
-        status = {d.component: component_status(components.get(d.component), d, target)
-                  for d in defs}
+        status = {d.component: _status(slots.get(d.component)) for d in defs}
         failed = [d.component for d in defs if status[d.component][0] == "failed"]
         if failed:
             reason = "; ".join(f"{c}: {status[c][2]}" for c in failed)
             return Halt(stage=stage, reason=f"stage {stage} halted: {reason}",
-                        target_commit=target, generation=generation, components=tuple(failed))
+                        target_commit=target, generation=generation, components=tuple(failed),
+                        permitted=tuple(done), missing=missing)
         if all(status[d.component][0] == "healthy" for d in defs):
-            allowed.extend(d.component for d in defs)
             remaining = 0
             for d in defs:
                 elapsed = now - status[d.component][1]
                 remaining = max(remaining, min(d.hold_s, math.ceil(d.hold_s - elapsed)))
+            done.extend(d.component for d in defs)
             if remaining > 0:
                 return Hold(stage=stage, remaining_s=int(remaining), reason=f"holding stage {stage}",
-                            target_commit=target, generation=generation)
+                            target_commit=target, generation=generation, permitted=tuple(done),
+                            missing=missing)
             continue
+        allowed = list(done)
         for order, group in groupby(defs, key=lambda d: d.order):
-            group = list(group)
-            allowed.extend(d.component for d in group)
-            if any(status[d.component][0] != "healthy" for d in group):
-                return Start(stage=stage, order=order, components=tuple(allowed),
-                             target_commit=target, generation=generation)
-    return Idle(reason="rolled out", target_commit=target)
+            group = [d.component for d in group]
+            allowed.extend(group)
+            if any(status[c][0] != "healthy" for c in group):
+                return Start(stage=stage, order=order, components=tuple(group),
+                             target_commit=target, generation=generation,
+                             permitted=tuple(allowed), missing=missing)
+    return Idle(reason="rolled out", target_commit=target, permitted=tuple(done), missing=missing)
 
 
 def advance(snapshot: Snapshot, definitions: dict, now: float) -> list:
@@ -281,14 +338,14 @@ def advance(snapshot: Snapshot, definitions: dict, now: float) -> list:
         return [Idle(reason="no definitions", target_commit=target)]
     if target is None:
         return [Idle(reason="no green release", target_commit=None)]
-    if snapshot.target_on_main is False:
-        return [Halt(stage=None, reason="target no longer on main", target_commit=target,
-                     generation=generation)]
     replan = not same_commit(snapshot.plan_commit, target)
     if replan and any(same_commit(p, target) for p in snapshot.past_targets):
         return [Hold(stage=None, remaining_s=None,
                      reason="target is an earlier release; the plan never goes back",
                      target_commit=target, generation=generation)]
+    if snapshot.target_on_main is False:
+        return [Halt(stage=None, reason="target no longer on main", target_commit=target,
+                     generation=generation)]
     published = same_commit(snapshot.published_commit, target)
     if not published and snapshot.target_on_main is not True:
         return [Hold(stage=None, remaining_s=None, reason="release not confirmed",
@@ -301,10 +358,16 @@ def advance(snapshot: Snapshot, definitions: dict, now: float) -> list:
         generation += 1
         out.append(Replan(new_target=target, generation=generation,
                           previous_commit=snapshot.plan_commit))
-    action = _roll(snapshot, definitions, now, target, generation)
+    slots = snapshot.slots
+    if slots is None:
+        scratch = CoordinatorState()
+        scratch.observe(snapshot.components if isinstance(snapshot.components, dict) else {},
+                        definitions)
+        slots = scratch.slots_for(target, definitions)
+    action = _roll(slots, definitions, now, target, generation)
     if isinstance(action, Start) and not published:
         action = Hold(stage=action.stage, remaining_s=None, reason="release not confirmed",
-                      target_commit=target, generation=generation)
+                      target_commit=target, generation=generation, missing=action.missing)
     out.append(action)
     return out
 
@@ -321,17 +384,20 @@ def _track_key(track):
     return "plan:" + "#".join(str(p) for p in track).replace("|", "_")[:400]
 
 
-class CoordinatorState:
-    """Persisted coordinator state: the plan per track and the attempts per release.
+def _str(v, cap, allow_empty=False):
+    return isinstance(v, str) and len(v) <= cap and (allow_empty or bool(v))
 
-    ``persist(record)`` is the repo's private sink (``ControlPlaneRepo``); ``hydrate`` replays
-    the records after a restart. Bounded: past targets, releases, instances and starts.
-    """
+
+class CoordinatorState:
+    """Persisted coordinator state: plans per track, the per-release instance fold and the
+    attempts. ``persist(record)`` is the repo's private sink; ``hydrate`` replays records."""
 
     def __init__(self, *, persist=None):
         self._persist = persist
         self._lock = threading.Lock()
         self._plans: dict[tuple, PlanState] = {}
+        # component -> OrderedDict(release -> {"instances": {inst: slot}, "failure_evicted": bool})
+        self._slots: dict[str, OrderedDict] = {}
         # component -> OrderedDict(release -> {instance: OrderedDict(start key)})
         self._attempts: dict[str, OrderedDict] = {}
         self._seq = 0
@@ -351,12 +417,12 @@ class CoordinatorState:
             record = self._record(_track_key(track), PLAN_EVENT, {
                 "kind": "plan", "track": list(track), "commit": st.commit,
                 "generation": st.generation, "past": list(st.past)})
-        self._emit(record)
+        self._emit([record])
         return True
 
     def _adopt(self, track, commit, generation, past=None):
         cur = self._plans.get(track, PlanState())
-        if not isinstance(commit, str) or not commit or generation <= cur.generation:
+        if not _str(commit, _ID_CAP) or generation <= cur.generation:
             return False
         if past is None:
             past = ((cur.commit,) if cur.commit else ()) + cur.past
@@ -364,35 +430,101 @@ class CoordinatorState:
                                        past=tuple(past)[:PAST_LIMIT])
         return True
 
-    # ---------------------------------------------------------- attempts
+    # ------------------------------------------------------------ observe
     def observe(self, components, definitions) -> int:
-        """Record every ``started`` seen from the definition's host, keyed by instance and
-        event, so ``attempts`` survives the bounded timeline. Returns the new count."""
+        """Fold every authorized event into the instance slots and the attempts. Idempotent:
+        re-observing the same events persists nothing. Returns the new record count."""
         records = []
+        comps = components if isinstance(components, dict) else {}
         with self._lock:
             for name, d in sorted(definitions.items()):
-                row = components.get(name) if isinstance(components, dict) else None
-                for e in _authorized(row, d):
-                    release = e.get("to")
-                    if e.get("outcome") != "started" or not isinstance(release, str) or not release:
+                for e in _authorized(comps.get(name), d):
+                    release = _release_of(e)
+                    if release is None:
                         continue
-                    instance = str(e.get("host") or "")[:253]
-                    key = str(e.get("id") or f"{e.get('host_ts')}/{e.get('step')}")[:200]
-                    if self._add_attempt(name, release, instance, key):
-                        records.append(self._record(f"attempt:{name}", ATTEMPT_EVENT, {
-                            "kind": "attempt", "component": name, "release": release,
-                            "instance": instance, "key": key}))
-        for record in records:
-            self._emit(record)
+                    instance = _instance_of(e)
+                    host_ts = e.get("host_ts")
+                    if not isinstance(host_ts, str) or not _TS.fullmatch(host_ts):
+                        continue
+                    slot = {"outcome": e["outcome"], "host_ts": host_ts, "rx": _arrival(e)}
+                    records.extend(self._put_slot(name, release, instance, slot))
+                    if e["outcome"] == "started":
+                        key = str(e.get("id") or f"{host_ts}/{e.get('step')}")[:_KEY_CAP]
+                        if self._add_attempt(name, release, instance, key):
+                            records.append(self._record(f"attempt:{name}", ATTEMPT_EVENT, {
+                                "kind": "attempt", "component": name, "release": release,
+                                "instance": instance, "key": key}))
+        self._emit(records)
         return len(records)
 
-    def _add_attempt(self, component, release, instance, key):
-        releases = self._attempts.setdefault(component, OrderedDict())
-        instances = releases.get(release)
-        if instances is None:
-            instances = releases[release] = {}
+    def _release_entry(self, table, component, release, new):
+        releases = table.setdefault(component, OrderedDict())
+        entry = releases.get(release)
+        if entry is None:
+            entry = releases[release] = new()
             while len(releases) > RELEASES_PER_COMPONENT:
                 releases.popitem(last=False)
+        else:
+            releases.move_to_end(release)       # LRU: what the timeline still shows stays
+        return entry
+
+    def _put_slot(self, component, release, instance, slot):
+        """File ``slot`` if it is decisive for (component, release, instance); returns records."""
+        entry = self._release_entry(self._slots, component, release,
+                                    lambda: {"instances": OrderedDict(), "failure_evicted": False})
+        instances = entry["instances"]
+        cur = instances.get(instance)
+        if cur is not None and _order(slot) <= _order(cur):
+            return []
+        out = []
+        if cur is None and len(instances) >= INSTANCES_PER_RELEASE:
+            victim = self._victim(instances)
+            if _state_of(instances[victim]["outcome"]) == "failed" and not entry["failure_evicted"]:
+                entry["failure_evicted"] = True
+                out.append(self._record(f"slot:{component}", EVICTED_EVENT, {
+                    "kind": "failure-evicted", "component": component, "release": release}))
+            del instances[victim]
+        instances[instance] = dict(slot)
+        out.append(self._record(f"slot:{component}", SLOT_EVENT, {
+            "kind": "slot", "component": component, "release": release, "instance": instance,
+            **slot}))
+        return out
+
+    @staticmethod
+    def _victim(instances):
+        """Oldest ok first, then oldest started; a failed one only when every slot failed."""
+        for wanted in ("healthy", "updating", "failed"):
+            pool = [(_order(s), inst) for inst, s in instances.items()
+                    if _state_of(s["outcome"]) == wanted]
+            if pool:
+                return min(pool)[1]
+        raise AssertionError("no slot to evict")
+
+    def slots_for(self, target, definitions) -> dict:
+        """{component: {"instances": {inst: slot}, "failure_evicted": bool, "absent": (inst,)}}
+        for the releases matching ``target``; ``absent`` = instances known only for others."""
+        out = {}
+        with self._lock:
+            for name in sorted(definitions):
+                releases = self._slots.get(name) or {}
+                inst: dict = {}
+                evicted = False
+                known: set = set()
+                for rel, entry in releases.items():
+                    known.update(entry["instances"])
+                    if not same_commit(rel, target):
+                        continue
+                    evicted = evicted or entry["failure_evicted"]
+                    for i, s in entry["instances"].items():
+                        if i not in inst or _order(s) > _order(inst[i]):
+                            inst[i] = dict(s)
+                out[name] = {"instances": inst, "failure_evicted": evicted,
+                             "absent": tuple(sorted(known - set(inst)))}
+        return out
+
+    # ---------------------------------------------------------- attempts
+    def _add_attempt(self, component, release, instance, key):
+        instances = self._release_entry(self._attempts, component, release, dict)
         starts = instances.get(instance)
         if starts is None:
             if len(instances) >= INSTANCES_PER_RELEASE:
@@ -423,20 +555,25 @@ class CoordinatorState:
         return {"entity_type": ENTITY_TYPE, "entity_id": entity_id, "event_type": event_type,
                 "sequence": self._seq, "payload": {**payload, "seq": self._seq}}
 
-    def _emit(self, record):
+    def _emit(self, records):
         if self._persist is None:
             return
-        try:
-            self._persist(copy.deepcopy(record))
-        except Exception:  # noqa: BLE001 - durable history is best-effort, as for deployment events
-            pass
+        for record in records:
+            try:
+                self._persist(copy.deepcopy(record))
+            except Exception:  # noqa: BLE001 - durable history is best-effort, as for deployment events
+                pass
 
     def hydrate(self, rows) -> int:
-        """Replay persisted records (no re-persist); malformed ones are skipped."""
+        """Replay persisted records (no re-persist), with the same caps as live writes;
+        malformed ones are skipped."""
         applied = 0
-        ordered = sorted((r for r in rows if isinstance(r, dict)),
-                         key=lambda r: int(r.get("sequence") or 0)
-                         if isinstance(r.get("sequence"), int) else 0)
+
+        def seq_of(r):
+            s = r.get("sequence")
+            return s if isinstance(s, int) and not isinstance(s, bool) else 0
+
+        ordered = sorted((r for r in rows if isinstance(r, dict)), key=seq_of)
         with self._lock:
             for row in ordered:
                 p = row.get("payload")
@@ -445,19 +582,45 @@ class CoordinatorState:
                 seq = p.get("seq")
                 if isinstance(seq, int) and not isinstance(seq, bool):
                     self._seq = max(self._seq, seq)
-                if p.get("kind") == "plan":
-                    track, gen, past = p.get("track"), p.get("generation"), p.get("past")
-                    if (not isinstance(track, list) or not all(isinstance(x, str) for x in track)
-                            or not isinstance(gen, int) or isinstance(gen, bool)
-                            or not isinstance(past, list)
-                            or not all(isinstance(x, str) for x in past)):
-                        continue
-                    applied += self._adopt(tuple(track), p.get("commit"), gen, past)
-                elif p.get("kind") == "attempt":
-                    vals = [p.get(k) for k in ("component", "release", "instance", "key")]
-                    if all(isinstance(v, str) for v in vals) and vals[0] and vals[1]:
-                        applied += self._add_attempt(*vals)
+                try:
+                    applied += self._replay(p)
+                except (TypeError, ValueError, KeyError):
+                    continue
         return applied
+
+    def _replay(self, p) -> bool:
+        kind = p.get("kind")
+        comp, release = p.get("component"), p.get("release")
+        if kind == "plan":
+            track, gen, past = p.get("track"), p.get("generation"), p.get("past")
+            if (not isinstance(track, list) or len(track) != 3
+                    or not all(_str(x, 400) for x in track)
+                    or not isinstance(gen, int) or isinstance(gen, bool)
+                    or not isinstance(past, list) or not all(_str(x, _ID_CAP) for x in past)):
+                return False
+            return self._adopt(tuple(track), p.get("commit"), gen, past)
+        if not _str(comp, 64) or not _str(release, _ID_CAP) or not _COMMIT.fullmatch(release):
+            return False
+        if kind == "attempt":
+            inst, key = p.get("instance"), p.get("key")
+            if not _str(inst, _ID_CAP, allow_empty=True) or not _str(key, _KEY_CAP):
+                return False
+            return self._add_attempt(comp, release, inst, key)
+        if kind == "slot":
+            inst, outcome, host_ts, rx = (p.get(k) for k in ("instance", "outcome", "host_ts", "rx"))
+            if (not _str(inst, _ID_CAP, allow_empty=True) or outcome not in _RANK
+                    or not isinstance(host_ts, str) or not _TS.fullmatch(host_ts)
+                    or isinstance(rx, bool) or not isinstance(rx, (int, float))
+                    or not math.isfinite(rx)):
+                return False
+            return bool(self._put_slot(comp, release, inst,
+                                       {"outcome": outcome, "host_ts": host_ts, "rx": float(rx)}))
+        if kind == "failure-evicted":
+            entry = self._release_entry(self._slots, comp, release,
+                                        lambda: {"instances": OrderedDict(), "failure_evicted": False})
+            entry["failure_evicted"] = True
+            return True
+        return False
 
 
 # ----------------------------------------------------------------- wrapper
@@ -469,12 +632,12 @@ class DeploymentCoordinator:
     """Per tick: one CI view, one monitor snapshot, one evidence call per track.
 
     ``monitor`` and ``state`` are callables returning the repo's current objects, because
-    a re-import replaces them. ``tick()`` returns ``{track: [Action]}`` and commits a Replan's
-    generation and the attempts it observed; it decides nothing ``advance`` did not.
+    a re-import replaces them. ``tick()`` returns ``{track: [Action]}``. A failure in one
+    track's evidence or decision holds that track (nothing permitted) and the others go
+    on; when the definitions or the CI view cannot be read at all, the tick returns {}.
     """
 
     def __init__(self, definitions, *, monitor, state, evidence=None, now=None):
-        import time
         self._definitions = definitions
         self._monitor = monitor
         self._state = state
@@ -482,26 +645,49 @@ class DeploymentCoordinator:
         self._now = now or time.time
 
     def tick(self) -> dict:
-        defs = self._definitions.definitions()
-        plans = self._definitions.plans()              # the one CI read of this tick
-        components = self._monitor().snapshot()["components"]
+        try:
+            defs = self._definitions.definitions()
+            plans = self._definitions.plans()          # the one CI read of this tick
+        except Exception:  # noqa: BLE001 - no definitions view: decide nothing, permit nothing
+            return {}
         state = self._state()
+        try:
+            components = self._monitor().snapshot()["components"]
+        except Exception:  # noqa: BLE001 - every track holds below
+            components = None
+        if components is not None:
+            state.observe(components, defs)
         now = self._now()
-        state.observe(components, defs)
         out = {}
         for track, plan in sorted(plans.items()):
-            tdefs = {c: d for c, d in defs.items() if d.track == track}
             ps = state.plan(track)
             target = plan.target_commit
-            evidence = (self._evidence(track, target, ps.commit) if target
-                        else ReleaseEvidence())
+
+            def hold(reason, ps=ps, target=target):
+                return [Hold(stage=None, remaining_s=None, reason=reason, target_commit=target,
+                             generation=ps.generation)]
+
+            if components is None:
+                out[track] = hold("deployment events unavailable")
+                continue
+            tdefs = {c: d for c, d in defs.items() if d.track == track}
+            try:
+                evidence = self._evidence(track, target, ps.commit) if target else ReleaseEvidence()
+            except Exception as exc:  # noqa: BLE001 - this track holds, the others go on
+                out[track] = hold(f"release evidence unavailable: {type(exc).__name__}")
+                continue
             if not isinstance(evidence, ReleaseEvidence):
                 evidence = ReleaseEvidence()
-            snap = Snapshot(components=components, target_commit=target,
-                            published_commit=evidence.published_commit,
-                            target_on_main=evidence.on_main, plan_commit=ps.commit,
-                            generation=ps.generation, past_targets=ps.past)
-            actions = advance(snap, tdefs, now)
+            try:
+                snap = Snapshot(components=components, target_commit=target,
+                                published_commit=evidence.published_commit,
+                                target_on_main=evidence.on_main, plan_commit=ps.commit,
+                                generation=ps.generation, past_targets=ps.past,
+                                slots=state.slots_for(target, tdefs) if target else {})
+                actions = advance(snap, tdefs, now)
+            except Exception as exc:  # noqa: BLE001
+                out[track] = hold(f"coordinator error: {type(exc).__name__}")
+                continue
             for action in actions:
                 if isinstance(action, Replan):
                     state.adopt(track, action)

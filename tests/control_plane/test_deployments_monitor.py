@@ -550,3 +550,29 @@ def test_route_redacts_evidence_again(dep_server):
     assert _post(port, "/api/deployments/events", body=ev, headers=_bearer())[0] == 200
     stored = repo.deployments.snapshot()["components"]["hive-gateway"]["timeline"][-1]["evidence"]
     assert "ghtok999" not in stored and "hunter2" not in stored
+
+
+# ------------------------------------------------------------ instance id
+
+def test_an_optional_instance_id_is_kept_and_validated():
+    mon = DeploymentsMonitor(now=Clock())
+    mon.ingest(_event(instance="slurm:25077875"))
+    mon.ingest(_event())
+    timeline = mon.snapshot()["components"]["hive-gateway"]["timeline"]
+    assert timeline[0]["instance"] == "slurm:25077875" and "instance" not in timeline[1]
+    assert timeline[0]["received_epoch"] == T0
+    for bad in ("", "-lead", "a b", "x" * 129, "semi;colon"):
+        with pytest.raises(ValueError, match="instance"):
+            mon.ingest(_event(instance=bad))
+    with pytest.raises(ValueError, match="instance"):
+        mon.ingest(_event(instance=7))
+
+
+def test_the_instance_id_survives_hydrate(acknowledged_sink):
+    clock = Clock(T0 + 120)
+    repo = ControlPlaneRepo(sink=acknowledged_sink, now=clock)
+    repo.deployments.ingest(_event(instance="job-42"), reported_by="hive")
+    rows = [e for e in acknowledged_sink.events if e["entity_type"] == "deployment"]
+    mon = DeploymentsMonitor(now=clock)
+    assert mon.hydrate(rows) == 1
+    assert mon.snapshot()["components"]["hive-gateway"]["timeline"][0]["instance"] == "job-42"
