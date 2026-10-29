@@ -181,6 +181,9 @@ if [ -n "${HERDR_EGRESS_SOCK+x}" ]; then   # set but empty is a runner bug: fail
     exit 126' collab-sandbox "$PORT" "$CMD")
 fi
 run=("$BWRAP" "${args[@]}" -- "${inner[@]}")
+if [ "${HERDR_SANDBOX_EXTERNAL_SCOPE:-0}" = 1 ]; then
+  exec "${run[@]}"
+fi
 if systemd-run --user --scope -q -p TasksMax=1000 true 2>/dev/null; then
   exec systemd-run --user --scope --collect -q \
     -p TasksMax="${HERDR_SANDBOX_TASKS:-512}" \
