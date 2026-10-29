@@ -636,6 +636,15 @@ def _build_parser() -> argparse.ArgumentParser:
     p2.add_argument("--include-gap-tail", action="store_true",
                     help="also set aside every row after the first missing sequence (may drop genuine events)")
     p2.set_defaults(func=_cmd_cp_collab_repair)
+    p2 = csub.add_parser("assistant-audit", help="anchor the assistant audit head off the event store, or "
+                         "verify the stored chain against the last anchor (detects truncation/rollback)")
+    p2.add_argument("action", choices=["anchor", "verify"])
+    p2.add_argument("--fleet-config", default=FLEET_CONFIG_DEFAULT,
+                    help="central fleet config; control_plane.personal_assistant.audit.anchor_file names the file")
+    p2.add_argument("--control-plane", default=None, help="control-plane base URL (default: host.json)")
+    p2.add_argument("--api-key-file", required=True,
+                    help="PATH to a file holding the API key of a principal in the tenant to anchor (never the key itself)")
+    p2.set_defaults(func=_cmd_cp_assistant_audit)
     p2 = csub.add_parser("web", help="serve the control-plane UI + /api/v1 + SSE")
     p2.add_argument("--host", default="127.0.0.1",
                     help="bind host (default 127.0.0.1; private-by-default)")
@@ -2935,6 +2944,56 @@ def _cmd_cp_migrate(args) -> int:
     return 0
 
 
+def _cmd_cp_assistant_audit(args) -> int:
+    """``control-plane assistant-audit anchor|verify``: exit 0 only when the anchor was appended / the chain matches."""
+    import urllib.error
+    import urllib.request
+    from pathlib import Path
+    from urllib.parse import urlencode
+
+    from .control_plane import audit_anchor as aa
+    from .host_config import HostConfigUnavailable, exit_unavailable, resolve_control_plane
+
+    _, cp = _load_cp_fleet_config(args.fleet_config)
+    pa = cp.get("personal_assistant") if isinstance(cp.get("personal_assistant"), dict) else {}
+    anchor_file = str((pa.get("audit") or {}).get("anchor_file") or "") if isinstance(pa.get("audit"), dict) else ""
+    if not anchor_file:
+        print("control_plane.personal_assistant.audit.anchor_file is not set in the fleet config", file=sys.stderr)
+        return 2
+    try:
+        key = Path(args.api_key_file).expanduser().read_text().strip()
+        base = resolve_control_plane(args.control_plane)
+    except HostConfigUnavailable as exc:
+        return exit_unavailable(exc)
+    except OSError as exc:
+        print(f"cannot read --api-key-file: {exc.strerror}", file=sys.stderr)
+        return 2
+
+    def get(path):
+        req = urllib.request.Request(f"{base}{path}", headers={"X-API-Key": key})
+        with urllib.request.urlopen(req, timeout=30) as response:
+            return json.loads(response.read(1024 * 1024))
+    def server_check(seq, sha):
+        return get("/api/v1/assistant-audit/check?" + urlencode({"seq": seq, "sha256": sha}))
+    try:
+        head = get("/api/v1/assistant-audit/head")
+        if args.action == "anchor":
+            if not head.get("chain_intact"):
+                print("refusing to anchor: the stored chain does not verify internally", file=sys.stderr)
+                return 1
+            _print_json({"anchored": aa.anchor_checked(anchor_file, head, server_check), "file": anchor_file})
+            return 0
+        result = aa.verify_against_anchor(anchor_file, head.get("tenant_id", ""), server_check)
+        _print_json(result)
+        return 0 if result["ok"] else 1
+    except aa.AnchorError as exc:
+        print(f"audit anchor: {exc}", file=sys.stderr)
+        return 1
+    except (OSError, ValueError) as exc:
+        print(f"audit anchor: control plane request failed: {exc}", file=sys.stderr)
+        return 1
+
+
 def _cmd_cp_collab_repair(args) -> int:
     import asyncio
 
@@ -3029,6 +3088,7 @@ def _cmd_cp_web(args) -> int:
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")   # boot phase timings
     fleet_store, cp = _load_cp_fleet_config(getattr(args, "fleet_config", None))
+    _validate_graph_merge_gate(cp)
     switch_store = fleet_store
     replay_flag = getattr(args, "collab_replay_history", None)      # an explicit --collab-replay-history wins over the YAML
     api_keys = _parse_api_keys(args.api_key, args.api_keys)
@@ -3519,6 +3579,15 @@ def _review_quorum_config(cp):
     from .control_plane.review_quorum import parse_config
     try:
         return parse_config(cp.get("review_quorum"))
+    except ValueError as exc:
+        raise SystemExit(f"--fleet-config: {exc}") from None
+
+
+def _validate_graph_merge_gate(cp):
+    """Refuse to start on an enabled-but-invalid ``control_plane.graph_merge_gate`` (never enables anything)."""
+    from .control_plane.graph_merge_gate import validate_section
+    try:
+        validate_section((cp or {}).get("graph_merge_gate"))
     except ValueError as exc:
         raise SystemExit(f"--fleet-config: {exc}") from None
 

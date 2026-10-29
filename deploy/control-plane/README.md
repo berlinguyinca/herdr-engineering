@@ -84,7 +84,14 @@ without them, and DB/object-store ports stay loopback-only.
 
 Settings of the reserved `control_plane` section the servers read: `pg_dsn`,
 `host_aliases`, `api_keys`, `rustfs_*`/`minio_*`, `self_host`, `web_port`,
-`ci_actions` (true enables CI retry/cancel), `inspector_limits` (`max_events`,
+`ci_actions` (true enables CI retry/cancel), `deployment_definitions` (absolute path, as the
+web container sees it, to a checkout of InferWeave's `deploy/pipelines`; read live and validated with
+the same rules as its `validate.py`. Absent: no definitions, any host may report any component and the
+Deployments snapshot warns. Set: a host may report only components whose `host` is its fleet id, and
+an invalid set keeps the last good one, or refuses events with 503 if none was ever valid; see
+"Cross-track order" for the optional `requires` key),
+`deployment_actions` (exactly `true` enables the audited Deployments actions; read live, and off while the
+file is unusable unless `config_failure_mode: last_good` — see "Deployment actions" below), `inspector_limits` (`max_events`,
 `max_bytes`, `max_sessions`, `max_total_bytes`, `retention_hours`, `reasoning_role`,
 `sensitive_role`, `store_reasoning`), `inspector_snapshots` (`enabled`, default off;
 `interval_seconds`, default 600, at least 60: the worker keeps a replay snapshot of the inspector so a boot
@@ -206,13 +213,160 @@ disabled by default and ordinary deploys never download or start it. See
 [agent summary model operations](../../docs/operations/agent-summary-model.md) for
 explicit provisioning, central configuration, health checks and removal.
 
+## Deployment actions (force redeploy, permit gate, ack)
+
+Hosts pull and herdr never holds a production credential: a force redeploy only **records a
+request** that the host updater picks up on its next poll. The routes (each also under `/api/v1/`):
+
+| Route | Credential | What it does |
+| --- | --- | --- |
+| `POST /api/deployments/force` `{"component": "<name>"}` or `{"stage": <n>}` | operator `X-API-Key` | records a force request for one component, or one entry per component of a stage, with the current plan target. An identical pending request is not duplicated |
+| `POST /api/deployments/ack` `{"component", "instance"[, "release"]}` | operator `X-API-Key` | acknowledges a stale instance (for example a preempted node whose `failed` would otherwise halt its stage for that release). The release defaults to the plan target. `{"component", "release"}` with no instance lifts a `failure-evicted` mark. Attempt counts are never changed |
+| `GET /api/deployments/requests?host=<id>` | fleet host token | pending force entries for the components defined for that host |
+| `DELETE /api/deployments/requests/<id>` | fleet host token | clears the host's own entries of a request, and every other pending entry forcing the same component to the same commit (the "once"). Answers 503 when the clear could not be persisted durably; the host must then NOT redeploy |
+| `GET /api/deployments/permit?component=<c>&commit=<sha>[&generation=<n>]` | fleet host token | the host gate: `{permitted, reason, generation, target_commit, forced, request_id}`. With `generation`, a different plan generation answers false ("generation changed") |
+
+- **Deployment actions require API keys.** Force and ack work only in keyed mode, with at least one
+  `operator` key in `control_plane.api_keys`. An open tailnet server refuses them with 403, because there every
+  caller is the operator, a DNS-rebound page included. The host routes work in both modes.
+- **Guards on force and ack:**
+  - `control_plane.deployment_actions: true` (otherwise 403).
+  - The operator role, by `X-API-Key`.
+  - A `Host` a rebinding name cannot reach: an IP literal, `localhost`, or a name listed in the collab dashboard
+    hosts. A listed name is compared with the whole `Host` header, so list it as `host:port` (for example
+    `herdr.example:8443`) whenever the browser reaches the dashboard on a non-default port.
+  - No cross-site `Sec-Fetch-Site`; only `same-origin` or `none` is accepted, and a client that sends none is fine.
+  - An `Origin`, when present, whose host equals `Host`. Its scheme may be http or https, because TLS may be
+    terminated in front.
+  - `application/json`, and a body of at most 4 KiB.
+  - Exactly one target, validated against the loaded definitions.
+  - A request that carries a fleet host token is refused even beside an operator key.
+- **Audit.** Rows are `deployment_action` events, one stream per action per UTC day. A row holds the actor
+  (`operator:key:<digest>`), the target, the time and the outcome.
+  - An accepted action is audited durably *before* it is recorded. If that row cannot be persisted, the answer is
+    503 and nothing is recorded. An ack row also records the acknowledged slot's outcome and `host_ts`.
+  - An authenticated operator's refusal is recorded as `refused`. These rows stay out of the shared event feed,
+    at most 60 a minute; the rest are counted.
+  - Refusals before authentication write NO row: open mode, no or a bad key, a non-operator role, or a host token
+    on an operator route. They are counted per reason in memory (the Deployments view, `actions.refused`) and
+    logged at most once a minute per reason.
+  - Host pickups are recorded as `picked-up`.
+- **Requests** are kept until cleared or for 24 h, at most 256 pending (more is refused with 429).
+- **Host token scope.** The host token grants only these host routes, and only for the components whose
+  definition names that host. Every other route still answers 401.
+- **Release evidence comes from GitHub.** herdr reads it with the server-held `github.token` (read only is
+  enough; the repository is private, so a token is required):
+  - **Published:** the `<follows.asset>.commit` asset of the `follows.tag` release (`node-ci-latest`) must hold
+    the plan target. Every (tag, asset) a track's definitions name must carry the same 40-hex commit. The asset's
+    redirect is followed by hand, without the token, and only to a `*.githubusercontent.com` download host.
+  - **On main:** `compare/main...<target>` must answer `identical`, or `behind` with no commits of its own, and
+    the target must not be behind the plan commit (`compare/<target>...<plan>` not `ahead`). A plan commit that
+    was force-pushed away (`diverged`) does not halt a target that is on main.
+  - **CI green** is not fetched again. The plan target is only ever a commit whose whole CI pipeline herdr saw
+    succeed on a main push, which is stricter than the `follows.ci_context` status alone.
+  - **Never in the way.** The coordinator reads a per-target cache and never waits on GitHub: a daemon worker
+    refreshes it. A success is fresh for 60 s and served at most 180 s after it was fetched. A failed refresh
+    retries after 15 s and never extends a success. Each call is bounded to 10 s wall clock, and responses are
+    size-capped and validated. A new target is therefore unknown for one tick (30 s) before it can be confirmed.
+  - **Rate limits.** A 403/429 rate-limit answer pauses every refresh (one token) for its `Retry-After`, or until
+    `X-RateLimit-Reset`, at least 15 s and at most 15 min. The release and compare reads send `If-None-Match`; a
+    304 re-validates the body stored with that ETag, and a 304 with no stored body is a failure, so a 304 never
+    confirms anything a 200 did not. About 4–5 calls per track per minute.
+  - **Fail closed.** No token, any HTTP error, a timeout, an oversized or malformed answer: the evidence is unknown
+    and the coordinator holds with "release not confirmed". Every permit then answers `permitted: false`, and a
+    host updater that has a gate URL (`IW_DEPLOY_GATE_URL`) stays on its running version. The Deployments view
+    shows each plan's `evidence_status` (`evidence`: `configured` after that track's last refresh succeeded, else
+    `unknown`; `evidence_error`: a fixed failure kind), and `coordinator.evidence` over all tracks (`configured`
+    only when every track's is). The token is never logged or shown.
+  - **The host still verifies the bytes.** A permit names a commit, not a file: the host updater must check that
+    the binary it downloads is that permitted commit (its `.commit` asset and the embedded revision, plus the
+    `.sha256`) and refuse it otherwise, as `iw-node-pull-deploy` does.
+- **The permit gate is not behind the flag.**
+  - Nothing is permitted unless the newest tick confirmed the release (published commit matches the target)
+    AND the target on main. Not the plan, not a force, and not a repair other than a rollback to herdr's
+    recorded previous good commit.
+  - A component is permitted when the newest coordinator tick (at most 90 s old, not stale) lists it in
+    `permitted` and the commit is the plan target.
+  - A pending force for that component and target also permits it, but only where staging holds the plan: a Start
+    whose turn has not come, the hold timer, or a halt of the component's OWN stage. A halt in an earlier stage still
+    blocks a later stage's force. That tick must also have the release confirmed and the target on main.
+  - A force never overrides "release not confirmed", "target no longer on main", an earlier-release or
+    unknown-ancestry hold, or a coordinator error.
+  - A replan onto another commit voids a pending force.
+  - The host sequence is: list requests, ask permit (`forced: true`), `DELETE` the request, redeploy. The
+    `DELETE` re-checks the flag (403) and the permit (409, e.g. after a replan or once the release is no longer
+    confirmed): only a 200 means "redeploy".
+  - Host routes are rate limited per host. An unusable fleet file answers 503, not 500.
+  - The durable writes made under a store lock (a force pickup, an escalation round) time out after 10 s and
+    then fail closed.
+- **Turning the flag off** is the kill switch: pending forces are ignored by the gate and the request list is
+  empty. The plan's own permission is unaffected.
+- **While the fleet file is unusable** (deleted or unparseable after having been valid), the flag reads as off
+  (fail closed) unless the last good file set `control_plane.config_failure_mode: last_good`. With `last_good`, a
+  flag that was `true` keeps forces live: new force/ack requests are accepted and pending forces still permit.
+
+### Cross-track order (`requires`)
+
+Components on another `follows` track (the zapp console follows `metabolomics-us/inferweave-gateway`) are staged by
+their own track, so stage 1 of InferWeave does not order them by itself. A definition can name stages of other
+tracks that must be rolled out first:
+
+```yaml
+requires:
+  - {repo: InferWeave/inferweave, ci_context: ci/woodpecker/push/rust, stage: 1}
+```
+
+- The key is optional; a definition without it behaves as before. Branch is always `main`.
+- A track's requirements are the union over its definitions. Until every named stage is rolled out on that
+  track's own current target, nothing on the track is permitted. The stage decision is still made (a new release
+  is still adopted), then converted like an unconfirmed release:
+  - a `Start`, or a hold timer, becomes a `Hold` with the reason `waiting on <repo> <ci_context> stage <n>: <why>`;
+  - a `Halt` or `Idle` still shows as it is, so a failed dependent component is still diagnosed, repaired and
+    rolled back;
+  - every such action carries `waiting`, and the permit gate then refuses any force, an own-stage halt included.
+- "Rolled out" is read from the coordinator's own view of the other track in the same tick: its release confirmed
+  (published and on main), and every component of stages up to `n` healthy on the target past its hold. A new
+  release on the other track, or one of its stage-1 components failing, withdraws the permission again.
+- Unknown or unmet is a hold (fail closed). The validator refuses a malformed entry, at most 8 entries, a
+  requirement on the own track, on a track no definition follows or on a stage that track lacks, and any cycle
+  between tracks. InferWeave's `deploy/pipelines/validate.py` does not know the key yet; it must accept it before
+  a definition there uses it.
+
+### Deployment failures: diagnosis, repairs, escalation
+
+After each coordinator tick whose release is confirmed (published and on main), every component a `Halt`
+names is diagnosed (known patterns first, then the
+optional AI step of `control_plane.deployment_diagnosis`) over its redacted failure event.
+
+- **One repair per round.** The decided repair (`retry`, `restart` or `rollback`) is recorded in a repair ledger
+  per `component:release`, durably before it is used. A round covers the whole fleet of a component: failures
+  herdr received before the round was decided fold into it, so the attempt cap (3) counts rounds, not nodes.
+- **It reaches the host** as an additive `repair` field on the permit answer: `{id, action, attempt, reason,
+  restart?, rollback_to?}`. It is present only while that failure is the component's current failed slot, usually
+  next to `permitted: false`. Hosts act on each `id` once. `rollback_to` is herdr's own record of the component's
+  previous good commit, never model output; a host refuses one it does not hold locally.
+- **Escalation**, once per `component:release` and always internal: the record and full report on the Deployments
+  page, an attention item (kind `deployment_escalation`), and one `deployment_alert` feed event with validated
+  fields only. Side effects outside herdr are off by default, under `control_plane.deployment_escalation`
+  (read live, fail closed):
+  - `issues: true` files a GitHub issue for a software finding through the REST API with the server-held
+    `github.token`, which then needs issue write access. The claim is persisted before GitHub is called, and an
+    unanswered claim is never filed again.
+  - `assistant: true` would notify the Personal Assistant with `dedupe_key = component:release`. The assistant has
+    no notification API yet, so no sink is wired and host findings use the attention item.
+  - `budget_s` (default 40, at most 45, so permits stay fresh) bounds one tick's model and GitHub calls; `issue_timeout_s` (default 15).
+- No pull request is generated: a fix goes through normal CI and review.
+
 ## Inspector snapshots (faster boot)
 
 The control plane replays every stored inspector event at boot. At ~780k events that is about nine minutes
 (`boot import_state: agent, inspector and host projections` in the web log). With
 `control_plane.inspector_snapshots.enabled: true` the **worker** keeps a shadow inspector fed only by that same
 replay and writes it to the `inspector_snapshots` table (migration `0030`) every `interval_seconds`; the **web**
-loads it and replays only newer events.
+loads it and replays only newer events. When it has checked in SQL that the stored inspector rows up to the
+snapshot's watermark are exactly the ones the snapshot consumed (same count), it does not even load those rows from
+Postgres (they are about a third of the data); if the repo then refuses the snapshot it fetches them on demand, and a
+boot never proceeds with an incomplete inspector.
 
 It is an optimisation, never a source of truth. The web replays everything, and logs why
 (`boot inspector replay: full:<reason>`), when the snapshot is missing or unreadable, was built under other

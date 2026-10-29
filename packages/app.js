@@ -46,6 +46,7 @@ import { mountArtifacts, renderArtifactDetail } from './artifacts-view.js';
 import { mountPublications } from './publications-view.js';
 import { mountHandoffs } from './handoffs-view.js';
 import { mountScheduling } from './scheduler-view.js';
+import { mountDeployments } from './deployments-view.js';
 import { classifyDashboardError, dashboardErrorMessage } from './dashboard-load-state.js';
 import { mountEventHistory } from './event-history.js';
 
@@ -83,7 +84,7 @@ const NAV = [
   { group: 'Fabric', path: '/hosts', label: 'Hosts', match: ['/scheduling'] },
   { group: 'Fabric', path: '/services', label: 'Services', match: ['/fabric-services', '/local-services', '/system-services'] },
   { group: 'Fabric', path: '/llm', label: 'Usage', match: ['/analytics'] },
-  { group: 'Delivery', path: '/ci', label: 'CI' },
+  { group: 'Delivery', path: '/ci', label: 'CI', match: ['/deployments'] },
   { group: 'Delivery', path: '/reviews', label: 'Reviews', match: ['/review-gate'] },
   { group: 'Delivery', path: '/github', label: 'Projects', match: ['/github/projects'] },
   { group: 'Code', path: '/architecture', label: 'Architecture', capability: 'architecture_v1' },
@@ -97,6 +98,7 @@ const SECTION_TABS = [
   [['/attention', 'Attention'], ['/activity', 'Activity']],
   [['/hosts', 'Hosts'], ['/scheduling', 'Scheduling']],
   [['/services', 'Catalog'], ['/fabric-services', 'Fabric'], ['/local-services', 'Local'], ['/system-services', 'System']],
+  [['/ci', 'CI'], ['/deployments', 'Deployments']],
   [['/reviews', 'Plan reviews'], ['/review-gate', 'Review gate']],
   [['/github', 'Issues'], ['/github/projects', 'Boards']],
   [['/artifacts', 'Artifacts'], ['/publications', 'Publications']],
@@ -205,6 +207,7 @@ const ROUTES = {
   '/github': viewGithub,
   '/collab': viewCollab,
   '/ci': viewIntegrations,
+  '/deployments': viewDeployments,
   '/reviews': viewIntegrations,
   '/review-gate': viewReviewGate,
   '/topology': viewTopology,
@@ -373,7 +376,7 @@ const BACK_LINK_SKELETON = '<div><span class="hd-skeleton hd-skeleton--line" sty
 function routeSkeleton(match, parts) {
   const back = match.startsWith('/missions/:id') || match === '/herd/session/:id' ? BACK_LINK_SKELETON : match === '/llm/session/:id' ? '<p style="font-size:13px"><span class="hd-skeleton hd-skeleton--line" style="display:inline-block;vertical-align:middle">&nbsp;</span></p>' : '';
   const piMission = match === '/missions/:id' && (safeDecode(parts[1]) || '').startsWith('pi:');
-  const rows = piMission ? 1 : match === '/missions/:id/tests' || match === '/analytics/models' || match === '/analytics/hosts' ? 2 : match === '/missions/:id/reviews' ? 4 : match === '/missions/:id' || match.startsWith('/llm') || match === '/herd/session/:id' || match === '/analytics' || match === '/analytics/missions' ? 8 : match.startsWith('/services') || match.endsWith('-services') ? 7 : 5;
+  const rows = piMission ? 1 : match === '/missions/:id/tests' || match === '/analytics/models' || match === '/analytics/hosts' || match === '/deployments' ? 2 : match === '/missions/:id/reviews' ? 4 : match === '/missions/:id' || match.startsWith('/llm') || match === '/herd/session/:id' || match === '/analytics' || match === '/analytics/missions' ? 8 : match.startsWith('/services') || match.endsWith('-services') ? 7 : 5;
   return `<div data-skeleton aria-busy="true" role="status" aria-label="Loading page">${back}<div class="hd-live-head"><div class="hd-skeleton hd-skeleton--title"></div></div>${skeleton('page content', { rows, height: 64, bare: true })}</div>`;
 }
 
@@ -404,6 +407,11 @@ async function viewPublications() {
 async function viewScheduling() {
   root.innerHTML = `${liveHead('<h1>Scheduling</h1>')}<div id="scheduler"></div>`;
   return mountScheduling(root.querySelector('#scheduler'), client, { freshness: chipIn(root) });
+}
+
+async function viewDeployments() {
+  root.innerHTML = `${liveHead('<h1>Deployments</h1>')}<div id="deployments"></div>`;
+  return mountDeployments(root.querySelector('#deployments'), client, { freshness: chipIn(root) });
 }
 
 async function viewHandoffs() {
@@ -1003,11 +1011,11 @@ function addSnapshotChip() {
 async function viewLlm(_parts, revision) {
   const q = route().query;
   const window_ = WINDOWS.includes(q.get('window')) ? q.get('window') : '24h';
-  const filters = { project: q.get('project') || '', model: q.get('model') || '' };
+  const filters = { project: q.get('project') || '', model: q.get('model') || '', mission: q.get('mission') || '' };
   const f = { window: window_, ...filters };
   const step = STEP_FOR[window_];
   const series = (metric) => client.llm('timeseries', { ...f, step, metric });
-  const [total, models, agents, problems, projects, requests, errors, ttft, speed, sessions, fleet] = await Promise.all([
+  const [total, models, agents, problems, projects, requests, errors, ttft, speed, sessions, fleet, previous, missions, queue, handoffs] = await Promise.all([
     client.llm('stats', { ...f, group: 'all' }),
     client.llm('stats', { window: window_, project: filters.project, group: 'model' }),
     client.llm('stats', { ...f, group: 'session' }),
@@ -1016,6 +1024,10 @@ async function viewLlm(_parts, revision) {
     series('requests'), series('errors'), series('ttft_p95'), series('speed_p50'),
     client.listSessions().catch(() => ({ sessions: [] })),
     loadAnalytics(client, '').catch(() => null),
+    client.llm('stats', { ...f, group: 'all', previous: 1 }).catch(() => null),
+    client.llm('stats', { window: window_, project: filters.project, group: 'mission' }).catch(() => null),
+    series('queue_p95').catch(() => null),
+    client.listHandoffs().catch(() => null),
   ]);
   if (revision !== renderRevision) return NO_REFRESH;
   const names = {};
@@ -1024,7 +1036,8 @@ async function viewLlm(_parts, revision) {
     window: window_, filters, names,
     projects: projects.groups.map((g) => g.key),
     modelNames: [...new Set(models.groups.map((g) => g.key))],
-  }, { total, models, agents, problems, series: { requests, errors, ttft, speed } });
+    missionNames: (missions?.groups || []).map((g) => g.key),
+  }, { total, models, agents, problems, previous, missions, handoffs: handoffs?.handoffs, series: { requests, errors, ttft, speed, queue } });
   if (fleet) root.insertAdjacentHTML('beforeend', usageStrip(fleet));
   addSnapshotChip();
   root.querySelectorAll('[data-llm-filter]').forEach((el) => el.addEventListener('change', () => {
@@ -1040,20 +1053,27 @@ async function viewLlmSession(parts, revision) {
   const f = { window: window_, session: id };
   const step = STEP_FOR[window_];
   const series = (metric) => client.llm('timeseries', { ...f, step, metric });
-  const [total, models, problems, requests, errors, ttft, speed, session] = await Promise.all([
+  const [total, models, problems, requests, errors, ttft, speed, session, previous, queue, handoffs, agents, sessions] = await Promise.all([
     client.llm('stats', { ...f, group: 'all' }), client.llm('stats', { ...f, group: 'model' }),
     client.llm('errors', f), series('requests'), series('errors'), series('ttft_p95'), series('speed_p50'),
     client.getSession(id).catch(() => null),
+    client.llm('stats', { ...f, group: 'all', previous: 1 }).catch(() => null),
+    series('queue_p95').catch(() => null),
+    client.listHandoffs().catch(() => null),
+    client.llm('stats', { window: window_, group: 'session' }).catch(() => null),
+    client.listSessions().catch(() => ({ sessions: [] })),
   ]);
+  const names = {};
+  for (const s of sessions.sessions || []) if (s.display_name) names[s.session_id] = s.display_name;
   if (revision !== renderRevision) return NO_REFRESH;
   root.innerHTML = renderLlmSession({
-    window: window_, sessionId: id, known: Boolean(session), name: session?.display_name || session?.agent_role || '',
-  }, { total, models, problems, series: { requests, errors, ttft, speed } });
+    window: window_, sessionId: id, known: Boolean(session), name: session?.display_name || session?.agent_role || '', names,
+  }, { total, models, problems, previous, handoffs: handoffs?.handoffs, agents, series: { requests, errors, ttft, speed, queue } });
   addSnapshotChip();
   if (session) {
     const slot = document.createElement('div'); slot.id = 'related-panel';
     root.querySelector('.hd-live-head').after(slot);
-    return { refresh() {}, dispose: showRelated('session', id, slot) };
+    return { refresh() {}, dispose: showRelated('session', id, slot, '', { compact: true }) };
   }
   return NO_REFRESH;
 }
