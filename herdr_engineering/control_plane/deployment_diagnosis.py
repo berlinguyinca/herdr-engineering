@@ -31,16 +31,24 @@ suggested rung:
 
 * ``attempts`` is ``CoordinatorState.attempts(component, release)`` (starts toward the
   release, the most made by one instance); the first failure is attempt 1;
-* a retry is only ever the first rung on attempt 1, so it happens at most once;
+* a retry is offered on attempt 1 only (0 counts as 1), so it happens at most once; on a
+  later attempt retry is never chosen, and a ladder that held only retry yields ``none``;
 * ``restart`` is the definition's OWN restart strategy (in the allocation; never a job
-  cancel), and never one of ``GPU_RELEASING``; ``rollback`` needs
+  cancel), and never one of ``GPU_RELEASING``; for a gateway that is its ``gateway-cycle``
+  (operator ruling); ``rollback`` needs
   ``rollback.strategy: previous-version``; an unavailable rung is skipped;
 * at ``cap`` attempts it rolls back if it can, and once rolled back it stays there: no
   further repair for that release (the stage stays halted, the escalation stands);
-* ``suggested_action: none`` (host causes, unclassified failures) repairs nothing.
+* ``suggested_action: none`` (host causes, unclassified failures) repairs nothing;
+* the attempt count only advances when a repair is recorded: the repair ledger and the
+  wiring to the hosts are Task 8's.
+
+The proxy client ignores ``HTTP(S)_PROXY`` (an empty ``ProxyHandler``), so the environment
+cannot reroute evidence, and refuses to send an API key over plain HTTP except to loopback.
 """
 from __future__ import annotations
 
+import ipaddress
 import json
 import logging
 import math
@@ -117,7 +125,7 @@ PATTERNS = (
             r"refusing partial or unknown GPU identity",
             r"invalid device ordinal",
             r"CUDA_ERROR_INVALID_DEVICE|hipErrorInvalidDevice")),
-    Pattern(
+    Pattern(  # a gateway's restart rung is its gateway-cycle (operator ruling)
         "gateway-cannot-follow", "software", "rollback",
         "the gateway cycle was refused: running node jobs do not follow a replacement"
         " gateway, so the new gateway could not join upstream; keep the previous gateway",
@@ -127,16 +135,17 @@ PATTERNS = (
         "link-superseded", "software", "retry",
         "the node's link was refused as superseded (a newer registration of the node id is"
         " live); retry once the old session has stood down",
-        _rx(r"connection id mismatch",
-            r"stands down when superseded",
-            r"\b(?:link|registration|session|heartbeat)\b[^\n]{0,120}?\bsuperseded\b")),
+        # the exact refusal (join.rs ``parent_superseded_connection``) and the join's marker
+        _rx(r"control authentication failed: connection id mismatch",
+            r"join: stands down when superseded")),
     Pattern(
         "moved-health-url", "software", "none",
         "the health probe URL answers not-found/moved: the release moved its health endpoint"
         " and the probe still asks the old one; fix the probe URL in the definition",
-        _rx(r"/health[a-z]{0,2}\b", r"/readyz\b", r"/livez\b"),
-        re.compile(r"\b(?:404|301|302|307|308)\b|not found|moved permanently"
-                   r"|permanent redirect", re.I)),
+        # the 404/30x must be the health URL's OWN response status, right after the URL
+        _rx(r"/(?:health[a-z]{0,2}|readyz|livez)\b[^\s\"']{0,64}[\"']?[ \t]{0,4}"
+            r"(?:->|=>|:|returned|answered|status)?[ \t]{0,4}(?:HTTP/\d(?:\.\d)?[ \t]{1,4})?"
+            r"(?:(?:404|301|302|307|308)\b|not found|moved permanently|permanent redirect)")),
 )
 
 
@@ -183,6 +192,20 @@ def _endpoint(value):
     return value if value.endswith("/chat/completions") else value + "/chat/completions"
 
 
+def _key_transport_ok(endpoint, api_key):
+    """An API key travels over HTTPS, or over HTTP to a loopback host only."""
+    parts = urlsplit(endpoint)
+    if not api_key or parts.scheme == "https":
+        return
+    host = parts.hostname or ""
+    try:
+        loopback = host == "localhost" or ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        loopback = False
+    if not loopback:
+        raise ValueError("deployment_diagnosis.api_key needs an https endpoint (or loopback)")
+
+
 @dataclass(frozen=True)
 class DiagnosisConfig:
     """``control_plane.deployment_diagnosis`` (YAML). Off by default: unknown failures
@@ -202,6 +225,7 @@ class DiagnosisConfig:
             raise ValueError("deployment_diagnosis endpoint and model must be strings")
         if self.endpoint:
             _endpoint(self.endpoint)
+            _key_transport_ok(self.endpoint, self.api_key)
         if self.enabled and (not self.endpoint or not self.model.strip()):
             raise ValueError("an enabled diagnosis needs an explicit endpoint and model")
         if len(self.model) > 256 or any(not c.isprintable() for c in self.model):
@@ -242,8 +266,11 @@ class ProxyDiagnosisClient:
 
     def __init__(self, config: DiagnosisConfig):
         self.endpoint = _endpoint(config.endpoint)
+        _key_transport_ok(self.endpoint, config.api_key)
         self._api_key = config.api_key
-        self._opener = urllib.request.build_opener(_NoRedirects())
+        # ProxyHandler({}): HTTP(S)_PROXY in the environment cannot reroute evidence
+        self._opener = urllib.request.build_opener(urllib.request.ProxyHandler({}),
+                                                   _NoRedirects())
 
     def __call__(self, payload, *, timeout):
         headers = {"Content-Type": "application/json", "X-InferWeave-Agent-ID": AGENT_ID}
@@ -395,4 +422,6 @@ def next_repair(finding: Finding, definition, *, attempts: int, rolled_back: boo
     if not ladder:
         return Repair("none", "no safe repair available for this component")
     rung = ladder[min(attempts - 1, len(ladder) - 1)]
+    if rung == "retry" and attempts > 1:
+        return Repair("none", "retry already used; no further safe repair")
     return _repair(rung, definition, f"attempt {attempts} of {cap}: {rung}")
