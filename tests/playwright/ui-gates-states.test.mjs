@@ -27,7 +27,7 @@ const FLOOR = { owner: { controls: 540, focused: 470 }, viewer: { controls: 37, 
 
 for (const [label, opts] of RUNS) {
   test(`every control in every state is accessible: ${label}`, async () => {
-    const bad = []; const sum = { owner: { controls: 0, focused: 0 }, viewer: { controls: 0, focused: 0 } };
+    const bad = []; const perState = []; const sum = { owner: { controls: 0, focused: 0 }, viewer: { controls: 0, focused: 0 } };
     // acknowledging an attention item is server state, so each run gets its own server: a shared one ran out of items to acknowledge
     const srv = await startRealServer({ mention_agent: true });
     try {
@@ -40,6 +40,7 @@ for (const [label, opts] of RUNS) {
             for (const sel of st.must) assert.ok(await page.locator(sel).count() > 0, `[${st.id}] did not reach its state: "${sel}" is missing`);
             const stat = await staticAudit(page, st.scope);
             const foc = await focusIndicatorAudit(page, st.scope);
+            perState.push(`${who}/${st.id.slice(0, 40)} ${foc.stats.focused}/${stat.stats.controls}`);
             sum[who].controls += stat.stats.controls; sum[who].focused += foc.stats.focused;
             console.log(`# audited ${label} | ${st.id.slice(0, 60)} | controls ${stat.stats.controls} | focused ${foc.stats.focused} | text ${stat.stats.textNodes}`);
             if (stat.stats.controls < st.min) bad.push(`[${st.id}] only ${stat.stats.controls} controls audited, expected at least ${st.min}: the state did not render or the scope is wrong`);
@@ -51,7 +52,7 @@ for (const [label, opts] of RUNS) {
       }
       assert.deepEqual(bad, [], `\n${bad.join('\n')}`);
       for (const who of ['owner', 'viewer']) {
-        assert.ok(sum[who].controls >= FLOOR[who].controls && sum[who].focused >= FLOOR[who].focused, `the ${who} audit really covered the page: ${sum[who].controls} controls (floor ${FLOOR[who].controls}), ${sum[who].focused} focused (floor ${FLOOR[who].focused})`);
+        assert.ok(sum[who].controls >= FLOOR[who].controls && sum[who].focused >= FLOOR[who].focused, `the ${who} audit really covered the page: ${sum[who].controls} controls (floor ${FLOOR[who].controls}), ${sum[who].focused} focused (floor ${FLOOR[who].focused}); focused/controls per state (a state whose controls fold away, like the phone's Filters disclosure, shows as a low ratio):\n${perState.filter((x) => x.startsWith(who)).join('\n')}`);
       }
     } finally { srv.stop(); }
   });
