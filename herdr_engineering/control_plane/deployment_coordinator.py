@@ -693,3 +693,52 @@ class DeploymentCoordinator:
                     state.adopt(track, action)
             out[track] = actions
         return out
+
+
+# ------------------------------------------------------------------- views
+def action_dict(action) -> dict:
+    """One action as plain JSON-ready data, with its kind in ``type``."""
+    from dataclasses import asdict
+    return {"type": type(action).__name__, **{k: list(v) if isinstance(v, tuple) else v
+                                              for k, v in asdict(action).items()}}
+
+
+def component_view(slots, definitions, now) -> dict:
+    """{component: {state, outcome, since, hold_remaining_s, instances}} from the target
+    slots, the same fold ``advance`` decides on (``slots`` = ``slots_for(target, defs)``).
+    ``hold_remaining_s`` is the definition's own hold left while healthy, else None."""
+    out = {}
+    for name, d in sorted(definitions.items()):
+        view = (slots or {}).get(name)
+        state, since, outcome = _status(view)
+        remaining = None
+        if state == "healthy" and since is not None:
+            remaining = max(0, min(d.hold_s, math.ceil(d.hold_s - (now - since))))
+        out[name] = {"state": state, "outcome": outcome, "since": since,
+                     "hold_remaining_s": remaining,
+                     "instances": len((view or {}).get("instances") or {})}
+    return out
+
+
+def track_views(results, definitions, state, now) -> list:
+    """The page's plan view of one ``tick()`` result: per track its generation, target,
+    current action, permission, missing instances and per-component coordinator status."""
+    out = []
+    for track, actions in sorted(results.items()):
+        last = actions[-1] if actions else None
+        target = getattr(last, "target_commit", None) or getattr(last, "new_target", None)
+        tdefs = {c: d for c, d in definitions.items() if d.track == track}
+        plan = state.plan(track)
+        components = component_view(state.slots_for(target, tdefs) if target else {}, tdefs, now)
+        for name, row in components.items():
+            row["attempts"] = state.attempts(name, target) if target else 0
+        out.append({
+            "track": {"repo": track[0], "branch": track[1], "ci_context": track[2]},
+            "generation": plan.generation, "plan_commit": plan.commit, "target_commit": target,
+            "actions": [action_dict(a) for a in actions],
+            "current": action_dict(last) if last is not None else None,
+            "permitted": list(permitted(actions)),
+            "missing": list(getattr(last, "missing", ()) or ()),
+            "components": components,
+        })
+    return out

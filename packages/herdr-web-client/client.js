@@ -533,6 +533,11 @@ export class HerdrClient {
     return this.request('/api/v1/ci', { signal });
   }
 
+  // -- deployments (read-only staged rollout view) --------------------------
+  getDeployments({ signal } = {}) {
+    return this.request('/api/v1/deployments', { signal });
+  }
+
   getCiReports({ signal, compact = false, provider_url, provider_repo_id, repository, run_number } = {}) {
     const query = new URLSearchParams();
     if (compact) query.set('compact', '1');

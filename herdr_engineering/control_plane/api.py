@@ -11,6 +11,7 @@ Optional `X-API-Key` auth for multi-operator deployments (Spec §104).
 """
 from __future__ import annotations
 
+import copy
 import hashlib
 import ipaddress
 import json
@@ -234,6 +235,8 @@ _FLEET_CONFIG_PATH = "/api/v1/fleet/config"
 # Host updaters (InferWeave deploy/pipelines/deploy_event.py) POST here with their per-host fleet
 # token as a Bearer credential; the /api/v1 spelling is accepted as well.
 _DEPLOYMENT_EVENTS_PATHS = frozenset({"/api/deployments/events", "/api/v1/deployments/events"})
+#: Seconds between deployment coordinator ticks (the plan GET /api/v1/deployments serves).
+DEPLOYMENTS_TICK_S = 30
 
 
 def _gate_pr(snap):
@@ -304,6 +307,20 @@ class ControlPlaneServer:
         self.deployment_definitions = DeploymentDefinitions(
             lambda: self._control_plane_value(fleet_config, "deployment_definitions"),
             ci_snapshot=lambda: self.ci_monitor.snapshot(start=True))
+        # The stage coordinator (Task 3), ticked by _deployments_loop; GET /api/v1/deployments
+        # serves the last tick and never ticks itself. `deployment_evidence` is the release-evidence
+        # hook, fn(track, target, plan_commit) -> ReleaseEvidence. No source is wired: herdr has no
+        # REST client for the release `.commit` asset (a 302 to another host) or the compare call,
+        # so it stays None = unknown, and the coordinator Holds "release not confirmed" (fail closed).
+        from .deployment_coordinator import DeploymentCoordinator
+        self.deployment_evidence = None
+        self.deployment_coordinator = DeploymentCoordinator(
+            self.deployment_definitions, monitor=lambda: self.repo.deployments,
+            state=lambda: self.repo.deployment_plans, evidence=self._release_evidence)
+        self._deployments_lock = threading.Lock()
+        self._deployments_tick_lock = threading.Lock()
+        self._deployments_stop = threading.Event()
+        self._deployments_last = {"ticked_at": None, "tracks": [], "error": None, "stale": False}
         # control_plane.missions (validated; outcomes are written when a mission ends, on by default).
         from .mission_outcome import MissionOutcomes, missions_config
         self.missions_config = missions_config(missions)
@@ -534,6 +551,48 @@ class ControlPlaneServer:
     def deployments_snapshot(self) -> dict:
         """Deployment rows plus the definitions status (incl. the accept-all warning flag)."""
         return self.deployment_definitions.annotate(self.repo.deployments.snapshot())
+
+    def _release_evidence(self, track, target, plan_commit):
+        from .deployment_coordinator import ReleaseEvidence
+        source = self.deployment_evidence
+        return source(track, target, plan_commit) if source is not None else ReleaseEvidence()
+
+    def deployments_tick(self):
+        """One coordinator tick, serialized and stored as plain data for the read route.
+
+        Never raises: a failure keeps the last good plan (flagged stale) and records only the
+        exception type, so a broken tick can break neither ingest nor the page."""
+        from .deployment_coordinator import track_views
+        with self._deployments_tick_lock:
+            try:
+                defs = self.deployment_definitions.definitions()
+                now = time.time()
+                tracks = (track_views(self.deployment_coordinator.tick(), defs,
+                                      self.repo.deployment_plans, now) if defs else [])
+                result = {"ticked_at": now, "tracks": tracks, "error": None, "stale": False}
+            except Exception as exc:  # noqa: BLE001 - a tick must never take the server down
+                log.warning("deployment coordinator tick failed: %s", type(exc).__name__)
+                with self._deployments_lock:
+                    result = {**self._deployments_last, "error": f"tick failed: {type(exc).__name__}",
+                              "stale": True}
+            with self._deployments_lock:
+                self._deployments_last = result
+
+    def _deployments_loop(self):
+        while not self._deployments_stop.is_set():
+            self.deployments_tick()
+            self._deployments_stop.wait(DEPLOYMENTS_TICK_S)
+
+    def deployments_view(self) -> dict:
+        """GET /api/v1/deployments: monitor rows + definitions status + the last tick's plans.
+        Evidence and messages are untrusted host text, served as data only."""
+        view = self.deployments_snapshot()
+        with self._deployments_lock:
+            last = copy.deepcopy(self._deployments_last)
+        view["plans"] = last.pop("tracks")
+        view["coordinator"] = {**last, "interval_s": DEPLOYMENTS_TICK_S,
+                               "evidence": "unknown" if self.deployment_evidence is None else "configured"}
+        return view
 
     @staticmethod
     def _intelligence_section(fleet_config):
@@ -800,6 +859,11 @@ class ControlPlaneServer:
             h["capabilities"].append("assistant_v1")
         if getattr(self, "intelligence", None) is not None and self.intelligence._cfg()[0]["enabled"]:
             h["capabilities"].append("project_intelligence_v1")
+        try:
+            if self.deployment_definitions.status()["configured"]:
+                h["capabilities"].append("deployments_v1")     # the read-only Deployments page
+        except Exception:  # noqa: BLE001 - health must answer even if the definitions cannot be read
+            pass
         if self.architecture.enabled:
             h["capabilities"].append("architecture_v1")
             if self.architecture.explain_config:
@@ -847,6 +911,7 @@ class ControlPlaneServer:
             self._summary_scanner = threading.Thread(target=self._summary_loop, daemon=True)
             self._summary_scanner.start()
         threading.Thread(target=self._sweep_loop, daemon=True).start()
+        threading.Thread(target=self._deployments_loop, name="herdr-deployments-tick", daemon=True).start()
         if self.collab is not None and self.collab.lineage_sink is not None:
             threading.Thread(target=self._link_flush_loop, daemon=True).start()
         self._httpd.serve_forever()
@@ -912,6 +977,7 @@ class ControlPlaneServer:
         if self.gate_service is not None:
             self.gate_service.stop()
         self._summary_stop.set()
+        self._deployments_stop.set()
         if self._summary_scanner:
             self._summary_scanner.join(timeout=2)
         if self.agent_summaries:
@@ -1430,6 +1496,10 @@ def _make_handler(server, public=False, operator=False):
             err = self._require("viewer")
             if err:
                 return err
+            if self._path_only() == "/api/deployments":     # the spec's name for /api/v1/deployments
+                if self._rate_limit():
+                    return None
+                return self._json(server.deployments_view())
             if self.path.startswith("/api/v1/"):
                 return self._route_api()
             return self._serve_static()
@@ -2162,6 +2232,10 @@ def _make_handler(server, public=False, operator=False):
             if (resource == "artifacts" and len(parts) >= 5
                     and not self._artifact_allowed(parts[4], "read")):
                 return self._json({"error": "not found"}, 404)
+            if resource == "deployments":
+                if len(parts) > 4:
+                    return self._json({"error": "not found"}, 404)
+                return self._json(server.deployments_view())
             if resource == "handoffs":
                 if len(parts) == 5 and parts[4] == "tree":
                     return self._json(server.handoffs.tree())
