@@ -24,14 +24,21 @@ import secrets
 import stat
 import subprocess
 import urllib.parse
-from datetime import datetime, timezone
+from collections.abc import Callable
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 import yaml
 
-from .fleet_config import (CONTROL_PLANE_SECTION, SCHEMA_VERSION, FleetConfig,
-                           FleetConfigError, _parse, load_fleet_config)
+from .fleet_config import (
+    CONTROL_PLANE_SECTION,
+    SCHEMA_VERSION,
+    FleetConfig,
+    FleetConfigError,
+    _parse,
+    load_fleet_config,
+)
 
 DEFAULT_CONFIG_PATH = Path("~/.config/herdr-engineering/fleet/fleet-config.yaml")
 # Where the file lived before it got its own directory: init leaves a symlink here.
@@ -718,6 +725,11 @@ def validate_config(path: Path) -> dict:
     cfg = load_fleet_config(_expand(path))
     compose_env(cfg)
     check_credentials_consistent(cfg)
+    from .control_plane.graph_merge_gate import validate_section
+    try:
+        validate_section((cfg.section("control_plane") or {}).get("graph_merge_gate"))
+    except ValueError as exc:
+        raise FleetConfigError(str(exc)) from None
     return {"revision": cfg.revision, "hosts": len(cfg.status()["hosts"])}
 
 
@@ -763,7 +775,7 @@ def _backup(path: Path, keep: int = BACKUP_KEEP) -> Path | None:
     if not path.exists():
         return None
     d = _private_dir(backup_dir(path))
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
     dest = d / f"{path.name}.bak-{stamp}"
     write_private_file(dest, path.read_bytes())
     olds = sorted(d.glob(f"{path.name}.bak-*"))  # the stamp sorts chronologically

@@ -17,6 +17,7 @@ graph or config fails closed to ``wait``.
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 from ..review_gate.decision import MergeDecision, decide_merge
@@ -26,6 +27,8 @@ from .review_quorum import pr_review_quorum
 READER = {"kind": "operator", "id": "key:merge-gate", "authenticated_by": "merge_gate"}
 PASS = frozenset({"pass", "passed", "success", "succeeded", "green"})
 FAIL = frozenset({"fail", "failed", "failure", "error", "red", "cancelled", "canceled", "timed_out", "timeout"})
+# an explicit graph principal id, "<kind>:<id>" (e.g. key:0123456789ab); no wildcard, no bare word
+_PRINCIPAL = re.compile(r"^[a-z][a-z0-9_-]{0,31}:[A-Za-z0-9_.@-][A-Za-z0-9_.:@-]{0,127}$")
 _KEYS = frozenset({"enabled", "evidence_writers", "required_checks", "require_review_quorum"})
 
 
@@ -52,7 +55,24 @@ def config_from_section(raw) -> GraphGateConfig | None:
     flag = raw.get("require_review_quorum", False)
     if not isinstance(flag, bool):
         raise ValueError("graph_merge_gate.require_review_quorum must be a boolean")
+    bad = [w for w in writers if not _PRINCIPAL.fullmatch(w)]
+    if bad:
+        raise ValueError("graph_merge_gate.evidence_writers must be explicit principal ids like key:<12 hex> "
+                         f"(no wildcards): refused {bad[:3]}")
     return GraphGateConfig(frozenset(writers), tuple(dict.fromkeys(required)), flag)
+
+
+def validate_section(raw) -> GraphGateConfig | None:
+    """Startup check of ``control_plane.graph_merge_gate``. ``None`` when absent or ``enabled: false``. Anything that
+    looks like an attempt to enable it but is not valid (``enabled`` not a boolean, empty or wildcard writers, unknown
+    keys) raises ValueError, so a typo can never leave the gate silently off or silently open."""
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ValueError("graph_merge_gate must be a mapping")
+    if "enabled" in raw and not isinstance(raw["enabled"], bool):
+        raise ValueError("graph_merge_gate.enabled must be true or false")
+    return config_from_section(raw)
 
 
 def _status(conclusion) -> str:

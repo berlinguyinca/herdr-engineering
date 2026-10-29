@@ -162,7 +162,16 @@ def assistant_config(cfg: dict[str, Any]) -> dict[str, Any]:
         # Tenant of each authenticated principal. YAML only (no env var, no header, no body field): a principal that
         # is not listed belongs to ``default_tenant``. A malformed tenant id stops startup rather than guessing.
         # Optional HMAC for the audit chain: a PATH to a key file (never the key, never an env var).
-        "audit": {"hmac_key_file": str(audit_cfg.get("hmac_key_file") or "")},
+        "audit": {"hmac_key_file": str(audit_cfg.get("hmac_key_file") or ""),
+                  # operator-chosen append-only file the audit head is anchored to (see audit_anchor.py)
+                  "anchor_file": str(audit_cfg.get("anchor_file") or "")},
+        # Consume queued mission/branch delegations into the handoff queue (off unless enabled; YAML only).
+        "delegation_consumer": {
+            "enabled": bool((section.get("delegation_consumer") or {}).get("enabled", False))
+            if isinstance(section.get("delegation_consumer"), dict) else False,
+            "source_harness": str((section.get("delegation_consumer") or {}).get("source_harness", "pi"))
+            if isinstance(section.get("delegation_consumer"), dict) else "pi",
+        },
         "tenancy": {
             "default_tenant": default_tenant,
             "principals": {str(k): _tenant_id(v, f"tenancy.principals[{k}]") for k, v in tenant_map.items()},
