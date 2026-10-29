@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Agent-centric dashboard — what changed</title>
+<style>
+:root{--bg:#f6f6f7;--surface:#fff;--text:#1d1f27;--muted:#5b6070;--border:#dcdfe6;--accent:#0f9d78}
+@media(prefers-color-scheme:dark){:root{--bg:#14161b;--surface:#1c1f26;--text:#e6e8ee;--muted:#aab0bf;--border:#2e323d;--accent:#3ccba3}}
+body{margin:0;background:var(--bg);color:var(--text);font:15px/1.55 system-ui,sans-serif}
+main{max-width:1080px;margin:0 auto;padding:24px 16px 48px}
+h1{font-size:1.6rem;margin:0 0 4px}h2{font-size:1.1rem;margin:30px 0 6px}p{margin:6px 0;color:var(--muted)}
+figure{margin:14px 0;background:var(--surface);border:1px solid var(--border);border-radius:10px;overflow:hidden}
+figure img{display:block;width:100%;height:auto}figcaption{padding:10px 14px;font-size:.9rem;color:var(--muted)}
+ul{color:var(--muted);padding-left:20px}li{margin:3px 0}b{color:var(--text)}
+.n{border-left:3px solid var(--accent);padding:2px 12px;margin:14px 0}
+</style></head><body><main>
+<h1>Agent-centric dashboard: what changed</h1>
+<p>Everything starts from agents: who is working, how they started, what was handed to whom. Pages that do not work are not listed. Shown with the repository's seeded test data, because production was not answering when these were taken.</p>
+
+<h2>Agents: the working ones, drawn by mission</h2>
+<figure><img src="img/new-agents.jpg" alt="Agents page with a lineage chart above the list"><figcaption>A lane per mission, a bar per working agent from start to last report, an arrow wherever a handoff moved work. With no recorded handoff the chart says so rather than implying one. Missions and Handoffs are tabs of this page.</figcaption></figure>
+
+<h2>One agent: how it started and proceeded</h2>
+<figure><img src="img/new-agent-detail.jpg" alt="Agent detail with a start-to-now story"><figcaption>The story reads: started (or "started by handoff from X: goal"), each handoff out, and the last report. The permanent disclaimer is gone; finished and failed agents keep their one line.</figcaption></figure>
+
+<h2>Assistant: chat first</h2>
+<figure><img src="img/new-assistant.jpg" alt="Assistant page: picker, chat"><figcaption>Active assistants only, the three most recent, the rest behind “Show all”. A pending approval appears as a strip above the conversation.</figcaption></figure>
+<figure><img src="img/new-assistant-config.jpg" alt="Assistant with Configure open"><figcaption>Settings (permissions, memory, routines, connectors, delegations, approvals, diagnostics) sit behind Configure. Nothing is archived or deleted.</figcaption></figure>
+
+<h2>Also changed</h2>
+<ul>
+<li><b>Navigation:</b> 25 entries became 14 in six groups. Topology, Scheduling and Activity are no longer separate entries (tabs of Hosts and Attention, or reachable by link).</li>
+<li><b>Only what works:</b> a page whose backend answers 404/501, “not enabled” or “disabled” disappears from the sidebar; a later success brings it back. “Show unavailable (N)” lists them. Timeouts never hide anything.</li>
+<li><b>Collaboration:</b> Chat, Tasks, Agents and Lineage lead; Flow, Tabs, Attention, Progress, Workspaces, Proposals and People are quieter tabs (all still reachable). An idle Helpers panel is one line; “New room” folds once rooms exist.</li>
+</ul>
+<div class="n"><b>Not done:</b> Overview is unchanged; Usage merges LLM and Analytics only as tabs, not one page; the collaboration room has not been viewed against a live server in this pass; the chat conversation composer's 13-button toolbar is untouched. Handoff data in production was empty (0 edges), so arrows appear only once handoffs exist.</div>
+</main></body></html>

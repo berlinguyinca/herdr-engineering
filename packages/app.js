@@ -124,7 +124,7 @@ let capabilities = [];
 let unavailable = new Set();
 let showUnavailable = false;
 try { unavailable = new Set(JSON.parse(window.localStorage.getItem(UNAVAILABLE_KEY) || '[]')); } catch { /* Nothing is hidden then. */ }
-const MISSING = /not found|\b(404|501)\b|not implemented|not enabled/i;
+const MISSING = /not found|\b(404|501)\b|not implemented|not enabled|is disabled/i;
 function currentNavPath() {
   const path = (window.location.hash.replace(/^#/, '') || '/overview').split('?')[0];
   return NAV.find((e) => [e.path, ...(e.match || [])].some((p) => path === p || path.startsWith(p + '/')))?.path || '';

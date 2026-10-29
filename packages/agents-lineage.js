@@ -4,6 +4,7 @@
 import { escapeHtml as esc } from './herdr-web-components/util.js';
 
 const MAX_LANES = 8;
+const MIN_SPAN_MS = 30 * 60 * 1000;
 const ms = value => { const t = Date.parse(value); return Number.isFinite(t) ? t : NaN; };
 const text = value => typeof value === 'string' ? value.trim() : '';
 
@@ -23,8 +24,9 @@ export function lineageModel(entries, edges = [], nodes = [], now = Date.now()) 
   const ordered = [...lanes.values()].sort((a, b) => Math.max(...b.agents.map(x => x.end)) - Math.max(...a.agents.map(x => x.end)));
   const shown = ordered.slice(0, MAX_LANES);
   const all = shown.flatMap(l => l.agents);
-  const t0 = all.length ? Math.min(...all.map(a => a.start)) : now;
   const t1 = Math.max(now, ...all.map(a => a.end));
+  // At least half an hour is drawn, so agents that only just started are bars with room beside them rather than dots.
+  const t0 = Math.min(all.length ? Math.min(...all.map(a => a.start)) : now, t1 - MIN_SPAN_MS);
   const handoffs = (Array.isArray(edges) ? edges : []).map(edge => ({
     from: nodeSession.get(edge.from) || edge.from, to: nodeSession.get(edge.to) || edge.to, state: edge.state || 'unknown', goal: text(edge.goal),
   })).filter(h => bySession.has(h.from) && bySession.has(h.to));
@@ -47,7 +49,8 @@ export function renderLineage(container, model) {
       const bx = x(a.start), bw = Math.max(6, x(a.end) - bx);
       where.set(a.id, { x1: bx, x2: bx + bw, cy });
       return `<a href="#/herd/session/${esc(encodeURIComponent(a.id))}" data-lineage-agent="${esc(a.id)}"><title>${esc(a.label)}</title>` +
-        `<rect x="${bx.toFixed(1)}" y="${cy - 7}" width="${bw.toFixed(1)}" height="14" rx="4" fill="${TONE[a.tab] || TONE.finished}" opacity=".85"/></a>`;
+        `<rect x="${bx.toFixed(1)}" y="${cy - 7}" width="${Math.max(bw, 10).toFixed(1)}" height="14" rx="4" fill="${TONE[a.tab] || TONE.finished}" opacity=".85"/>` +
+        (lane.agents.length <= 3 ? `<text x="${(bx + Math.max(bw, 10) + 6 > W - 110 ? bx - 6 : bx + Math.max(bw, 10) + 6).toFixed(1)}" y="${cy + 4}" text-anchor="${bx + Math.max(bw, 10) + 6 > W - 110 ? 'end' : 'start'}" class="al-bar">${esc(a.label.length > 22 ? `${a.label.slice(0, 21)}…` : a.label)}</text>` : '') + `</a>`;
     }).join('');
     return `<text x="${LABEL - 8}" y="${cy + 4}" text-anchor="end" class="al-lane">${esc(lane.label.length > 24 ? `${lane.label.slice(0, 23)}…` : lane.label)}</text>` +
       `<line x1="${LABEL}" x2="${W - 12}" y1="${cy}" y2="${cy}" class="al-guide"/>${bars}`;
@@ -68,7 +71,7 @@ export function renderLineage(container, model) {
 .al-wrap{margin:8px 0 14px;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:10px 12px}
 .al-wrap h2{font-size:13px;margin:0 0 4px}.al-wrap svg{width:100%;height:auto;display:block}
 .al-lane{font-size:11px;fill:var(--text-secondary)}.al-tick{font-size:10px;fill:var(--text-muted)}
-.al-guide{stroke:var(--border-subtle);stroke-width:1}.al-handoff{fill:none;stroke:var(--accent);stroke-width:1.6;marker-end:url(#al-arrow)}
+.al-bar{font-size:10px;fill:var(--text-secondary)}.al-guide{stroke:var(--border-subtle);stroke-width:1}.al-handoff{fill:none;stroke:var(--accent);stroke-width:1.6;marker-end:url(#al-arrow)}
 .al-note{font-size:12px;margin:4px 0 0}</style>
 <section class="al-wrap" aria-label="Agent lineage"><h2>Working now, by mission</h2>
 <svg viewBox="0 0 ${W} ${H}" role="img" aria-label="${model.agents} working agents in ${model.lanes.length} lanes, ${model.handoffs.length} handoffs">
