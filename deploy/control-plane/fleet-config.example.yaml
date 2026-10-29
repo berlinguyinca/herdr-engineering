@@ -38,7 +38,9 @@ sections:
       # so a host updater with a gate URL (IW_DEPLOY_GATE_URL) stays on its running version.
       # A definition may carry `requires: [{repo, ci_context, stage}]` to hold its track until that
       # stage of another follows track is rolled out (see the README, "Cross-track order").
-      # deployment_definitions: "/srv/inferweave/deploy/pipelines"
+      # deploy.sh mounts ~/.local/share/herdr-engineering/pipelines (kept equal to InferWeave's
+      # deploy/pipelines on main by the herdr-pipelines-sync timer) at /etc/herdr/pipelines.
+      # deployment_definitions: "/etc/herdr/pipelines"
       # OPTIONAL: true enables the audited Deployments actions (POST /api/deployments/force and
       # /ack, operator role). Read live; anything but true is off. Force only records a request the
       # host updaters pick up; the host permit gate (GET /api/deployments/permit) works either way.

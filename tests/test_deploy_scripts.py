@@ -1695,3 +1695,121 @@ def test_candidate_without_lock_held_support_warns_and_leaves_refresh_to_the_tim
     assert "cannot run under the deploy's lock; its refresh is left to the timer" in r.stderr
     assert "another collab-sync is running" in r.stderr     # the old script saw the held lock
     assert _lock_is_free(env)
+
+
+# ---------------------------------------------------------------- deployment definitions mount
+
+def _pipes_dir(e):
+    return e["home"] / ".local/share/herdr-engineering/pipelines"
+
+
+def _log_compose_env(e):
+    """Wrap the docker stub so each call also logs HERDR_CP_PIPELINES_DIR (the stub is shared)."""
+    stub = e["tmp"] / "bin" / "docker"
+    real = e["tmp"] / "bin" / "docker-real"
+    stub.rename(real)
+    stub.write_text(f'#!/usr/bin/env bash\n[ "$1" != compose ] || echo "pipelinesdir=${{HERDR_CP_PIPELINES_DIR:-}}" >> {e["log"]}\n'
+                    f'exec {real} "$@"\n')
+    stub.chmod(0o755)
+
+
+def test_compose_mounts_the_pipelines_dir_read_only_into_web_only():
+    doc = yaml.safe_load((ROOT / "deploy/control-plane/compose.yaml").read_text())
+    mount = "${HERDR_CP_PIPELINES_DIR:?run deploy.sh}:/etc/herdr/pipelines:ro"
+    assert mount in doc["services"]["control-plane-web"]["volumes"]
+    for name, svc in doc["services"].items():
+        if name != "control-plane-web":
+            assert not any("pipelines" in str(v) for v in svc.get("volumes") or []), name
+
+
+def test_dry_run_reports_the_pipelines_mount_and_creates_nothing(env):
+    _log_compose_env(env)
+    r = deploy(env, "--dry-run")
+    assert r.returncode == 0, r.stderr
+    assert "/etc/herdr/pipelines" in r.stdout and "a real deploy creates it empty, 0755" in r.stdout
+    assert not _pipes_dir(env).exists()
+    assert not (env["home"] / ".config/systemd/user/herdr-pipelines-sync.timer").exists()
+    assert f"pipelinesdir={_pipes_dir(env)}" in env["log"].read_text()     # compose config -q sees it
+
+
+def test_deploy_creates_the_pipelines_dir_mounts_it_and_installs_the_sync_timer(env):
+    _log_compose_env(env)
+    # a full successful first deploy (health + settle checks): slower than the failing ones
+    r = run(DEPLOY, env, "--no-fetch", "--ref", env["ref"], "--fleet-config", str(env["central"]), timeout=300)
+    assert r.returncode == 0, r.stderr
+    d = _pipes_dir(env)
+    assert d.is_dir() and (d.stat().st_mode & 0o777) == 0o755 and not list(d.iterdir())
+    log = env["log"].read_text()
+    lines = [ln for ln in log.splitlines() if ln.startswith("pipelinesdir=")]
+    assert lines and all(ln == f"pipelinesdir={d}" for ln in lines)
+    assert "systemctl --user enable --now herdr-pipelines-sync.timer" in log
+    share = env["home"] / ".local/share/herdr-engineering"
+    assert (share / "pipelines-sync.sh").exists()
+    assert (share / "pipelines-validator/deployment_definitions.py").exists()
+    service = (env["home"] / ".config/systemd/user/herdr-pipelines-sync.service").read_text()
+    assert f'--dir "{d}"' in service
+
+
+def test_a_failed_deploy_removes_newly_installed_pipelines_units(env):
+    env["env"]["FAIL_COMPOSE"] = "1"
+    r = deploy(env)
+    assert r.returncode == 1, r.stderr
+    units = env["home"] / ".config/systemd/user"
+    assert not (units / "herdr-pipelines-sync.service").exists()
+    assert not (units / "herdr-pipelines-sync.timer").exists()
+    assert not (env["home"] / ".local/share/herdr-engineering/pipelines-sync.sh").exists()
+
+
+def test_a_valid_pipelines_dir_is_accepted(env):
+    d = _pipes_dir(env)
+    d.mkdir(parents=True, mode=0o755)
+    d.chmod(0o755)
+    (d / "hive-gateway.yaml").write_text("component: hive-gateway\n")
+    (d / "hive-gateway.yaml").chmod(0o644)
+    r = deploy(env, "--dry-run")
+    assert r.returncode == 0, r.stderr
+    assert "a real deploy creates it empty, 0755" not in r.stdout
+
+
+@pytest.mark.parametrize("fault,needle", [
+    ("dir_symlink", "must be a real directory"),
+    ("dir_mode", "must not be writable by group or other"),
+    ("non_yaml", "must hold only regular *.yaml"),
+    ("file_symlink", "must hold only regular *.yaml"),
+    ("subdir", "must hold only regular *.yaml"),
+    ("big_file", "must hold only regular *.yaml"),
+    ("file_mode", "must hold only regular *.yaml"),
+    ("too_many", "at most 256"),
+])
+def test_a_bad_pipelines_dir_is_refused_before_anything_runs(env, fault, needle):
+    d = _pipes_dir(env)
+    if fault == "dir_symlink":
+        real = env["tmp"] / "elsewhere"
+        real.mkdir()
+        d.parent.mkdir(parents=True)
+        d.symlink_to(real)
+    else:
+        d.mkdir(parents=True)
+        d.chmod(0o755)
+        if fault == "dir_mode":
+            d.chmod(0o775)
+        elif fault == "non_yaml":
+            (d / "validate.py").write_text("x")
+        elif fault == "file_symlink":
+            target = env["tmp"] / "x.yaml"
+            target.write_text("x")
+            (d / "x.yaml").symlink_to(target)
+        elif fault == "subdir":
+            (d / "nested.yaml").mkdir()
+        elif fault == "big_file":
+            (d / "big.yaml").write_text("x" * (64 * 1024 + 1))
+        elif fault == "file_mode":
+            (d / "x.yaml").write_text("x")
+            (d / "x.yaml").chmod(0o664)
+        elif fault == "too_many":
+            for i in range(257):
+                (d / f"c{i}.yaml").write_text("x")
+    r = deploy(env, "--dry-run")
+    assert r.returncode != 0
+    assert needle in r.stderr
+    assert not env["log"].exists()
