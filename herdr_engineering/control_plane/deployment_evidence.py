@@ -34,6 +34,10 @@ Safety rules:
   thread and is abandoned at the deadline. Responses are size-capped, JSON is validated,
   commits must be 40 hex. Redirects are never followed by urllib; the asset's one
   redirect is followed by hand, only to an allowed download host, without credentials.
+* A 403/429 rate limit pauses every refresh for its Retry-After / X-RateLimit-Reset,
+  clamped to [FAILURE_RETRY_S, RATE_LIMIT_MAX_S]. API reads send If-None-Match with the
+  ETag of the last body that parsed; a 304 re-parses and re-validates that body, and a
+  304 without one is a failure, so a 304 can never confirm anything a 200 did not.
 * The token is the server-held ``github.token`` (read on every refresh, so a change
   applies live). It goes only to the API base, never into an error, a status or a log:
   failures are recorded as fixed kinds.
@@ -69,6 +73,11 @@ MAX_COMMIT_FILE = 256
 MAX_ASSETS = 1000
 CACHE_ENTRIES = 64
 QUEUE_LIMIT = 32
+#: A 403/429 rate limit pauses every refresh (one token) for Retry-After / until
+#: X-RateLimit-Reset, at least FAILURE_RETRY_S and at most this long.
+RATE_LIMIT_MAX_S = 900.0
+RATE_LIMIT_DEFAULT_S = 60.0
+MAX_ETAG = 200
 
 _SHA = re.compile(r"[0-9a-f]{40}")
 _REPO = re.compile(r"[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}")
@@ -77,11 +86,13 @@ _STATUSES = {"identical", "behind", "ahead", "diverged"}
 
 
 class _Fail(Exception):
-    """A refresh failure; ``kind`` is a fixed, token-free description."""
+    """A refresh failure; ``kind`` is a fixed, token-free description; ``pause_s`` a
+    rate-limit backoff for every refresh."""
 
-    def __init__(self, kind):
+    def __init__(self, kind, pause_s=None):
         super().__init__(kind)
         self.kind = kind
+        self.pause_s = pause_s
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -96,6 +107,40 @@ def _loopback(host) -> bool:
         return ipaddress.ip_address(host).is_loopback
     except ValueError:
         return False
+
+
+def download_allowed(location, download_hosts=()) -> bool:
+    """The asset redirect may go to https ``*.githubusercontent.com`` only, or to a host
+    listed in ``download_hosts`` (tests: loopback, where plain http is accepted)."""
+    if not isinstance(location, str):
+        return False
+    try:
+        parts = urllib.parse.urlsplit(location)
+        host = parts.hostname or ""
+    except ValueError:
+        return False
+    if parts.scheme == "https" and host.endswith(DOWNLOAD_SUFFIX) and len(host) > len(DOWNLOAD_SUFFIX):
+        return True
+    return host in set(download_hosts or ()) and (parts.scheme == "https" or _loopback(host))
+
+
+def _rate_limit_pause(code, headers, wall):
+    """Seconds to pause for a rate-limited answer, or None when it is not one."""
+    get = (headers.get if headers is not None else (lambda _k: None))
+    retry, remaining, reset = get("Retry-After"), get("X-RateLimit-Remaining"), get("X-RateLimit-Reset")
+    if code == 429 or (code == 403 and (retry is not None or remaining == "0")):
+        pause = None
+        try:
+            if retry is not None:
+                pause = float(retry)
+            elif reset is not None:
+                pause = float(reset) - wall()
+        except (TypeError, ValueError):
+            pause = None
+        if pause is None or pause != pause:          # NaN
+            pause = RATE_LIMIT_DEFAULT_S
+        return max(FAILURE_RETRY_S, min(pause, RATE_LIMIT_MAX_S))
+    return None
 
 
 def _token_ok(value) -> bool:
@@ -113,7 +158,7 @@ class GitHubReleaseEvidence:
     ``executor(fn)`` runs a refresh (default: the daemon worker)."""
 
     def __init__(self, definitions, *, token=None, api=API, opener=None, download_hosts=None,
-                 clock=time.monotonic, executor=None, timeout=CALL_TIMEOUT_S):
+                 clock=time.monotonic, executor=None, timeout=CALL_TIMEOUT_S, wall=time.time):
         parts = urllib.parse.urlsplit(api)
         if parts.scheme != "https" and not (parts.scheme == "http" and _loopback(parts.hostname)):
             raise ValueError("the GitHub API base must be https (plain http only to loopback)")
@@ -133,6 +178,10 @@ class GitHubReleaseEvidence:
         self._queue: queue.Queue = queue.Queue(maxsize=QUEUE_LIMIT)
         self._worker = None
         self._state = {"state": "unknown", "error": None}
+        self._tracks: OrderedDict = OrderedDict()     # track -> {"state", "error"}
+        self._paused_until = float("-inf")             # rate limit: no refresh before
+        self._etags: OrderedDict = OrderedDict()      # url -> (ETag, raw body that parsed)
+        self._wall = wall
         self._logged = None
 
     # ------------------------------------------------------------ the call
@@ -149,9 +198,29 @@ class GitHubReleaseEvidence:
         return self._cached(key)
 
     def status(self) -> dict:
-        """{state: "configured" | "unknown", error: fixed kind | None} of the last refresh."""
+        """{state, error} over every track: "configured" only when each track's last refresh
+        succeeded; ``error`` is a failing track's fixed kind (one track's success never
+        hides another's error)."""
         with self._lock:
-            return dict(self._state)
+            if not self._tracks:
+                return dict(self._state)
+            errors = [st["error"] for _t, st in sorted(self._tracks.items()) if st["error"]]
+            ok = all(st["state"] == "configured" for st in self._tracks.values())
+            return {"state": "configured" if ok else "unknown",
+                    "error": errors[0] if errors else None}
+
+    def status_for(self, track) -> dict:
+        """{state, error} of ``track``'s last refresh ("unknown", None before any)."""
+        with self._lock:
+            return dict(self._tracks.get(tuple(track) if isinstance(track, (list, tuple)) else track,
+                                         {"state": "unknown", "error": None}))
+
+    def _set_track(self, track, state, error):
+        self._state = {"state": state, "error": error}
+        self._tracks[track] = {"state": state, "error": error}
+        self._tracks.move_to_end(track)
+        while len(self._tracks) > CACHE_ENTRIES:
+            self._tracks.popitem(last=False)
 
     def _key(self, track, target, plan_commit):
         if not (isinstance(track, tuple) and len(track) == 3
@@ -182,6 +251,8 @@ class GitHubReleaseEvidence:
             if entry is not None and now - entry[1] < SUCCESS_TTL_S:
                 return False
             if key in self._pending or now < self._retry_at.get(key, float("-inf")):
+                return False
+            if now < self._paused_until:
                 return False
             self._pending.add(key)
             return True
@@ -216,7 +287,7 @@ class GitHubReleaseEvidence:
         try:
             evidence, plain = self._fetch(*key)
         except _Fail as exc:
-            self._failed(key, exc.kind)
+            self._failed(key, exc.kind, exc.pause_s)
         except Exception as exc:  # noqa: BLE001 - never a success
             self._failed(key, f"internal error: {type(exc).__name__}")
         else:
@@ -234,17 +305,19 @@ class GitHubReleaseEvidence:
                 while len(self._cache) > CACHE_ENTRIES:
                     self._cache.popitem(last=False)
                 self._retry_at.pop(key, None)
-                self._state = {"state": "configured", "error": None}
+                self._set_track(key[0], "configured", None)
                 self._pending.discard(key)
             self._log(None)
 
-    def _failed(self, key, kind):
+    def _failed(self, key, kind, pause_s=None):
         with self._lock:
-            self._retry_at[key] = self._clock() + FAILURE_RETRY_S
+            if pause_s is not None:
+                self._paused_until = max(self._paused_until, self._clock() + pause_s)
+            self._retry_at[key] = self._clock() + max(FAILURE_RETRY_S, pause_s or 0)
             self._retry_at.move_to_end(key)
             while len(self._retry_at) > CACHE_ENTRIES:
                 self._retry_at.popitem(last=False)
-            self._state = {"state": "unknown", "error": kind}
+            self._set_track(key[0], "unknown", kind)
             self._pending.discard(key)
         self._log(kind)
 
@@ -323,30 +396,46 @@ class GitHubReleaseEvidence:
 
     # ---------------------------------------------------------------- HTTP
     def _json(self, token, path):
-        raw = self._get(self._api + path, cap=MAX_JSON, headers={
-            "Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json",
-            "X-GitHub-Api-Version": "2022-11-28"})
+        """GET + parse. With a stored ETag the request is conditional: a 304 re-parses (and
+        the caller re-validates) the body stored with that ETag; nothing else is reused."""
+        url = self._api + path
+        headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json",
+                   "X-GitHub-Api-Version": "2022-11-28"}
+        with self._lock:
+            stored = self._etags.get(url)
+        if stored is not None:
+            headers["If-None-Match"] = stored[0]
+        status, etag, raw = self._get(url, cap=MAX_JSON, headers=headers, conditional=True)
+        if status == 304:
+            if stored is None:
+                raise _Fail("GitHub HTTP 304")
+            raw = stored[1]
         try:
-            return json.loads(raw.decode("utf-8"))
+            data = json.loads(raw.decode("utf-8"))
         except (ValueError, UnicodeDecodeError, RecursionError):
             raise _Fail("invalid JSON from GitHub") from None
+        if status == 200 and isinstance(etag, str) and 0 < len(etag) <= MAX_ETAG \
+                and all(32 <= ord(c) < 127 for c in etag):
+            with self._lock:
+                self._etags[url] = (etag, raw)
+                self._etags.move_to_end(url)
+                while len(self._etags) > CACHE_ENTRIES:
+                    self._etags.popitem(last=False)
+        return data
 
     def _asset(self, token, url):
         status, location, raw = self._get(url, cap=MAX_COMMIT_FILE, redirect=True, headers={
             "Authorization": f"Bearer {token}", "Accept": "application/octet-stream"})
         if status == 200:
             return raw
-        parts = urllib.parse.urlsplit(location or "")
-        host = parts.hostname or ""
-        allowed = (parts.scheme == "https" and host.endswith(DOWNLOAD_SUFFIX)) or (
-            host in self._download_hosts and (parts.scheme == "https" or _loopback(host)))
-        if not allowed:
+        if not download_allowed(location, self._download_hosts):
             raise _Fail("asset redirect to a host that is not allowed")
         # no Authorization: the signed download URL carries its own credential
         return self._get(location, cap=MAX_COMMIT_FILE, headers={"Accept": "application/octet-stream"})
 
-    def _get(self, url, *, cap, headers, redirect=False):
-        """GET with a hard deadline. ``redirect``: a 3xx returns (status, Location, b"")."""
+    def _get(self, url, *, cap, headers, redirect=False, conditional=False):
+        """GET with a hard deadline. ``redirect``: a 3xx returns (status, Location, b"");
+        ``conditional``: returns (status, ETag, body), a 304 as (304, None, b"")."""
         result: dict = {}
         req = urllib.request.Request(url, headers={**headers, "User-Agent": "herdr-engineering"})
         deadline = time.monotonic() + self._timeout
@@ -364,9 +453,10 @@ class GitHubReleaseEvidence:
                         if not chunk:
                             break
                         raw += chunk
-                    result["ok"] = (response.status, raw)
+                    result["ok"] = (response.status, raw, response.headers.get("ETag"))
             except urllib.error.HTTPError as exc:
-                result["http"] = (exc.code, exc.headers.get("Location") if exc.headers else None)
+                result["http"] = (exc.code, exc.headers.get("Location") if exc.headers else None,
+                                  _rate_limit_pause(exc.code, exc.headers, self._wall))
                 exc.close()
             except Exception as exc:  # noqa: BLE001 - only the type is kept
                 result["error"] = type(exc).__name__
@@ -377,16 +467,22 @@ class GitHubReleaseEvidence:
         if worker.is_alive():
             raise _Fail("timeout")
         if "ok" in result:
-            status, raw = result["ok"]
+            status, raw, etag = result["ok"]
             if len(raw) > cap:
                 raise _Fail("GitHub response too large")
             if status != 200:
                 raise _Fail(f"GitHub HTTP {int(status)}")
+            if conditional:
+                return 200, etag, raw
             return (200, None, raw) if redirect else raw
         if "http" in result:
-            code, location = result["http"]
+            code, location, pause = result["http"]
+            if pause is not None:
+                raise _Fail("GitHub rate limited", pause_s=pause)
             if redirect and code in (301, 302, 303, 307, 308) and isinstance(location, str):
                 return code, location, b""
+            if conditional and code == 304 and "If-None-Match" in headers:
+                return 304, None, b""
             raise _Fail(f"GitHub HTTP {int(code)}")
         kind = result.get("error", "error")
         raise _Fail("timeout" if kind in ("TimeoutError", "timeout") else f"GitHub unreachable: {kind}")

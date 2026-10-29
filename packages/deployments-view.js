@@ -127,13 +127,15 @@ function componentRow(view, item, open) {
 function planCard(plan, coordinator) {
   const track = isObject(plan.track) ? plan.track : {};
   const missing = list(plan.missing);
+  // per track: one track's confirmed release must not hide another track's evidence error
+  const evidence = isObject(plan.evidence_status) ? plan.evidence_status : coordinator;
   return `<article class="hd-card" data-deploy-plan>
     <div class="hd-card__title">${esc(text(track.repo))} · ${esc(text(track.branch))}</div>
     <div class="hd-card__sub">target ${commitCell(plan.target_commit)} · generation ${esc(text(plan.generation, '0'))}${plan.plan_commit ? ` · plan ${commitCell(plan.plan_commit)}` : ''}</div>
     <div data-deploy-current><strong>${esc(describeAction(plan.current))}</strong></div>
     <div class="hd-card__sub">Permitted now: ${list(plan.permitted).length ? esc(list(plan.permitted).join(', ')) : 'nothing'}</div>
     ${missing.length ? `<div class="hd-card__sub" data-deploy-missing>Not reporting for this release: ${esc(missing.join(', '))}</div>` : ''}
-    ${coordinator.evidence === 'unknown' ? `<div class="hd-card__sub" data-deploy-evidence-note>Release evidence from GitHub is unknown${coordinator.evidence_error ? ` (${esc(text(coordinator.evidence_error))})` : ''}: the coordinator holds until a release is confirmed.</div>` : ''}
+    ${evidence.evidence === 'unknown' ? `<div class="hd-card__sub" data-deploy-evidence-note>Release evidence from GitHub is unknown${evidence.evidence_error ? ` (${esc(text(evidence.evidence_error))})` : ''}: the coordinator holds until a release is confirmed.</div>` : ''}
   </article>`;
 }
 

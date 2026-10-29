@@ -45,6 +45,7 @@ class FakeGitHub:
     def __init__(self):
         self.routes = {}
         self.requests = []       # (path, Authorization header or None)
+        self.inm = []            # If-None-Match headers seen
         fake = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -53,6 +54,8 @@ class FakeGitHub:
 
             def do_GET(self):
                 fake.requests.append((self.path, self.headers.get("Authorization")))
+                if self.headers.get("If-None-Match"):
+                    fake.inm.append(self.headers.get("If-None-Match"))
                 route = fake.routes.get(self.path.split("?")[0])
                 if route is None:
                     route = (404, {}, b'{"message":"Not Found"}')
@@ -449,6 +452,8 @@ def test_the_server_wires_the_github_source_and_confirms_through_it(tmp_path, gh
         assert body["coordinator"]["evidence"] == "unknown"
         assert body["coordinator"]["evidence_error"] == "no GitHub token configured"
         assert body["plans"][0]["current"]["reason"] == "release not confirmed"
+        assert body["plans"][0]["evidence_status"] == {
+            "evidence": "unknown", "evidence_error": "no GitHub token configured"}
 
         gh.release()
         gh.asset(C1)
@@ -462,6 +467,7 @@ def test_the_server_wires_the_github_source_and_confirms_through_it(tmp_path, gh
         assert plan["release_confirmed"] is True and plan["target_on_main"] is True
         assert plan["current"]["type"] == "Start" and plan["permitted"] == ["hive-gateway"]
         assert body["coordinator"]["evidence"] == "configured"
+        assert plan["evidence_status"] == {"evidence": "configured", "evidence_error": None}
         assert TOKEN not in json.dumps(body)
     finally:
         svr.shutdown()
@@ -532,3 +538,203 @@ def test_no_unconfirmed_tick_after_a_replan_with_the_async_worker(tmp_path, gh):
         last = tick()[-1]
         assert isinstance(last, Start), last
         assert not (isinstance(last, Hold) and "not confirmed" in last.reason)
+
+
+# ------------------------------------------------ host and asset checks
+@pytest.mark.parametrize("location,allowed", [
+    ("https://objects.githubusercontent.com/x?sig=1", True),
+    ("https://release-assets.githubusercontent.com/x", True),
+    ("https://evilgithubusercontent.com/x", False),                  # no dot before the suffix
+    ("https://githubusercontent.com/x", False),
+    ("http://objects.githubusercontent.com/x", False),               # https only
+    ("ftp://objects.githubusercontent.com/x", False),
+    ("https://evil.example/objects.githubusercontent.com/x", False), # in the path, not the host
+    ("https://evil.example/?h=.githubusercontent.com", False),
+    ("https://objects.githubusercontent.com.evil.example/x", False),
+    ("https://evil.example#.githubusercontent.com", False),
+    ("", False), (None, False),
+])
+def test_only_https_githubusercontent_hosts_are_allowed_downloads(location, allowed):
+    assert de.download_allowed(location) is allowed
+
+
+def test_a_listed_test_host_needs_https_unless_it_is_loopback():
+    assert de.download_allowed("http://127.0.0.1:9/x", {"127.0.0.1"}) is True
+    assert de.download_allowed("http://files.example/x", {"files.example"}) is False
+    assert de.download_allowed("https://files.example/x", {"files.example"}) is True
+    assert de.download_allowed("http://localhost:9/x", {"127.0.0.1"}) is False
+
+
+@pytest.fixture()
+def second():
+    fake = FakeGitHub()
+    yield fake
+    fake.close()
+
+
+def test_an_asset_url_on_another_host_is_never_contacted(gh, second):
+    second.asset(T, redirect=False)                  # a reachable, valid-looking answer
+    gh.routes[f"/repos/{REPO}/releases/tags/node-ci-latest"] = (200, {}, json.dumps({"assets": [
+        {"id": 7, "name": "inferweave.commit",
+         "url": f"{second.base}/repos/{REPO}/releases/assets/7"}]}).encode())
+    gh.compare("main", T, "behind")
+    assert _source(gh)(TRACK, T, None) == UNKNOWN
+    assert second.requests == []                     # neither contacted nor handed the token
+
+
+def test_a_redirect_to_an_unlisted_reachable_host_is_never_followed(gh, second):
+    gh.confirmed()
+    second.routes["/download/7"] = (200, {}, T.encode())
+    port = second.server.server_port
+    gh.routes[f"/repos/{REPO}/releases/assets/7"] = (
+        302, {"Location": f"http://localhost:{port}/download/7"}, b"")
+    assert _source(gh)(TRACK, T, None) == UNKNOWN
+    assert second.requests == []
+
+
+def test_a_commit_asset_with_trailing_extra_hex_is_refused(gh):
+    gh.confirmed()
+    gh.asset(T + "abcd")             # a 40-hex prefix would match, and prefix-compare confirm
+    assert _source(gh)(TRACK, T, None) == UNKNOWN
+
+
+def test_duplicate_commit_assets_are_refused(gh):
+    gh.confirmed()
+    gh.release(assets=(("inferweave.commit", 7), ("inferweave.commit", 8)))
+    gh.asset(T, 8)
+    assert _source(gh)(TRACK, T, None) == UNKNOWN
+
+
+@pytest.mark.parametrize("status", [201, 203, 206])
+def test_a_2xx_other_than_200_is_refused(gh, status):
+    gh.confirmed()
+    route = f"/repos/{REPO}/releases/tags/node-ci-latest"
+    gh.routes[route] = (status, {}, gh.routes[route][2])
+    assert _source(gh)(TRACK, T, None) == UNKNOWN
+
+
+# ------------------------------------------------------------ rate limits
+def test_a_429_pauses_every_refresh_for_its_retry_after(gh):
+    gh.confirmed()
+    gh.compare("main", OTHER, "behind")
+    rel = f"/repos/{REPO}/releases/tags/node-ci-latest"
+    ok = gh.routes[rel]
+    gh.routes[rel] = (429, {"Retry-After": "120"}, b"")
+    clock = Clock()
+    src = _source(gh, clock=clock)
+    assert src(TRACK, T, None) == UNKNOWN
+    assert src.status()["error"] == "GitHub rate limited"
+    gh.routes[rel] = ok
+    clock.t += de.FAILURE_RETRY_S + 1
+    assert src(TRACK, T, None) == UNKNOWN
+    assert src(TRACK, OTHER, None) == UNKNOWN        # another key: the same token is paused
+    assert _count(gh) == 1
+    clock.t = 1000.0 + 121
+    assert src(TRACK, T, None) == ReleaseEvidence(T, True)
+
+
+def test_a_403_with_no_remaining_waits_until_the_reset(gh):
+    gh.confirmed()
+    rel = f"/repos/{REPO}/releases/tags/node-ci-latest"
+    ok = gh.routes[rel]
+    gh.routes[rel] = (403, {"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "50300"}, b"")
+    clock = Clock()
+    src = _source(gh, clock=clock, wall=lambda: 50000.0)
+    assert src(TRACK, T, None) == UNKNOWN
+    gh.routes[rel] = ok
+    clock.t += 299
+    assert src(TRACK, T, None) == UNKNOWN and _count(gh) == 1
+    clock.t += 2
+    assert src(TRACK, T, None) == ReleaseEvidence(T, True)
+
+
+def test_a_plain_403_is_an_ordinary_failure(gh):
+    gh.confirmed()
+    rel = f"/repos/{REPO}/releases/tags/node-ci-latest"
+    ok = gh.routes[rel]
+    gh.routes[rel] = (403, {}, b"")
+    clock = Clock()
+    src = _source(gh, clock=clock)
+    assert src(TRACK, T, None) == UNKNOWN
+    assert src.status()["error"] == "GitHub HTTP 403"
+    gh.routes[rel] = ok
+    clock.t += de.FAILURE_RETRY_S + 1
+    assert src(TRACK, T, None) == ReleaseEvidence(T, True)
+
+
+@pytest.mark.parametrize("headers,expected", [
+    ({"Retry-After": "100000"}, de.RATE_LIMIT_MAX_S),
+    ({"Retry-After": "0"}, de.FAILURE_RETRY_S),
+    ({"Retry-After": "soon"}, de.RATE_LIMIT_DEFAULT_S),
+    ({}, de.RATE_LIMIT_DEFAULT_S),
+    ({"X-RateLimit-Reset": "10"}, de.FAILURE_RETRY_S),     # a reset in the past
+])
+def test_the_rate_limit_pause_is_bounded(headers, expected):
+    assert de._rate_limit_pause(429, headers, lambda: 1000.0) == expected
+    assert de._rate_limit_pause(500, headers, lambda: 1000.0) is None
+
+
+# ------------------------------------------------------------------ ETags
+def _etagged(gh, path, etag, body):
+    def route(handler):
+        if handler.headers.get("If-None-Match") == etag:
+            return (304, {"ETag": etag}, b"")
+        return (200, {"ETag": etag}, body)
+    gh.routes[path] = route
+
+
+def test_conditional_requests_reuse_the_validated_body_on_304(gh):
+    gh.confirmed()
+    for path in (f"/repos/{REPO}/releases/tags/node-ci-latest", f"/repos/{REPO}/compare/main...{T}"):
+        _etagged(gh, path, '"v1"', gh.routes[path][2])
+    clock = Clock()
+    src = _source(gh, clock=clock)
+    assert src(TRACK, T, None) == ReleaseEvidence(T, True)
+    gh.requests.clear()
+    gh.inm.clear()
+    clock.t += de.SUCCESS_TTL_S + 1
+    assert src(TRACK, T, None) == ReleaseEvidence(T, True)
+    assert gh.inm.count('"v1"') == 2                    # both API reads were conditional
+
+
+def test_a_304_without_a_stored_body_is_a_failure(gh):
+    gh.confirmed()
+    gh.routes[f"/repos/{REPO}/releases/tags/node-ci-latest"] = (304, {"ETag": '"x"'}, b"")
+    assert _source(gh)(TRACK, T, None) == UNKNOWN
+
+
+def test_a_304_never_turns_an_invalid_body_into_a_confirmation(gh):
+    gh.confirmed()
+    _etagged(gh, f"/repos/{REPO}/releases/tags/node-ci-latest", '"bad"', b'{"assets": {"x": 1}}')
+    clock = Clock()
+    src = _source(gh, clock=clock)
+    assert src(TRACK, T, None) == UNKNOWN
+    clock.t += de.FAILURE_RETRY_S + 1
+    assert src(TRACK, T, None) == UNKNOWN
+
+
+def test_a_304_is_not_a_success_after_a_failed_compare(gh):
+    gh.confirmed()
+    cmp_ = f"/repos/{REPO}/compare/main...{T}"
+    _etagged(gh, cmp_, '"c"', json.dumps({"status": "diverged", "ahead_by": 1,
+                                          "behind_by": 0}).encode())
+    clock = Clock()
+    src = _source(gh, clock=clock)
+    assert src(TRACK, T, None) == ReleaseEvidence(T, False)
+    clock.t += de.SUCCESS_TTL_S + 1
+    assert src(TRACK, T, None) == ReleaseEvidence(T, False)   # 304 keeps the definitive False
+
+
+# ------------------------------------------------------- per-track status
+def test_one_tracks_success_does_not_hide_another_tracks_error(gh):
+    other = ("InferWeave/other", "main", "ci/woodpecker/push/x")
+    defs = {"hive-gateway": _defn(), "o": _defn("o", track=other)}
+    gh.confirmed()
+    gh.routes[f"/repos/{other[0]}/releases/tags/node-ci-latest"] = (500, {}, b"")
+    src = _source(gh, defs)
+    assert src(other, T, None) == UNKNOWN
+    assert src(TRACK, T, None) == ReleaseEvidence(T, True)      # the newest refresh succeeded
+    assert src.status() == {"state": "unknown", "error": "GitHub HTTP 500"}
+    assert src.status_for(TRACK) == {"state": "configured", "error": None}
+    assert src.status_for(other) == {"state": "unknown", "error": "GitHub HTTP 500"}
+    assert src.status_for(("x/y", "main", "c")) == {"state": "unknown", "error": None}

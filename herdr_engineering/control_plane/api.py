@@ -656,6 +656,20 @@ class ControlPlaneServer:
         except Exception:  # noqa: BLE001 - the view must not break on the source
             return {"evidence": "unknown", "evidence_error": "status unavailable"}
 
+    def _deployment_track_evidence(self, track) -> dict:
+        """One track's evidence source status ({evidence, evidence_error}), so one track's
+        success never hides another's error."""
+        source = self.deployment_evidence
+        status_for = getattr(source, "status_for", None)
+        if not callable(status_for) or not isinstance(track, dict):
+            return self._deployment_evidence_status()
+        try:
+            st = status_for((track.get("repo"), track.get("branch"), track.get("ci_context")))
+            return {"evidence": "configured" if st.get("state") == "configured" else "unknown",
+                    "evidence_error": st.get("error") if isinstance(st.get("error"), str) else None}
+        except Exception:  # noqa: BLE001 - the view must not break on the source
+            return {"evidence": "unknown", "evidence_error": "status unavailable"}
+
     def deployments_tick(self):
         """One coordinator tick, serialized and stored as plain data for the read route.
 
@@ -753,6 +767,7 @@ class ControlPlaneServer:
         ledger = self.repo.deployment_escalations
         view["escalations"] = ledger.snapshot()
         for plan in view["plans"]:
+            plan["evidence_status"] = self._deployment_track_evidence(plan.get("track"))
             # the repair attempts the cap counts (the ledger), next to the coordinator's starts
             for name, row in (plan.get("components") or {}).items():
                 target = plan.get("target_commit")

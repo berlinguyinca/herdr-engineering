@@ -268,11 +268,19 @@ request** that the host updater picks up on its next poll. The routes (each also
     refreshes it. A success is fresh for 60 s and served at most 180 s after it was fetched. A failed refresh
     retries after 15 s and never extends a success. Each call is bounded to 10 s wall clock, and responses are
     size-capped and validated. A new target is therefore unknown for one tick (30 s) before it can be confirmed.
+  - **Rate limits.** A 403/429 rate-limit answer pauses every refresh (one token) for its `Retry-After`, or until
+    `X-RateLimit-Reset`, at least 15 s and at most 15 min. The release and compare reads send `If-None-Match`; a
+    304 re-validates the body stored with that ETag, and a 304 with no stored body is a failure, so a 304 never
+    confirms anything a 200 did not. About 4–5 calls per track per minute.
   - **Fail closed.** No token, any HTTP error, a timeout, an oversized or malformed answer: the evidence is unknown
     and the coordinator holds with "release not confirmed". Every permit then answers `permitted: false`, and a
     host updater that has a gate URL (`IW_DEPLOY_GATE_URL`) stays on its running version. The Deployments view
-    shows `coordinator.evidence` (`configured` after a successful refresh, else `unknown`) and
-    `coordinator.evidence_error` (a fixed failure kind; the token is never logged or shown).
+    shows each plan's `evidence_status` (`evidence`: `configured` after that track's last refresh succeeded, else
+    `unknown`; `evidence_error`: a fixed failure kind), and `coordinator.evidence` over all tracks (`configured`
+    only when every track's is). The token is never logged or shown.
+  - **The host still verifies the bytes.** A permit names a commit, not a file: the host updater must check that
+    the binary it downloads is that permitted commit (its `.commit` asset and the embedded revision, plus the
+    `.sha256`) and refuse it otherwise, as `iw-node-pull-deploy` does.
 - **The permit gate is not behind the flag.**
   - Nothing is permitted unless the newest tick confirmed the release (published commit matches the target)
     AND the target on main. Not the plan, not a force, and not a repair other than a rollback to herdr's
@@ -310,8 +318,12 @@ requires:
 
 - The key is optional; a definition without it behaves as before. Branch is always `main`.
 - A track's requirements are the union over its definitions. Until every named stage is rolled out on that
-  track's own current target, the whole track holds: `Hold` with no stage, the reason `waiting on <repo>
-  <ci_context> stage <n>: <why>`, and nothing permitted. A force cannot override it.
+  track's own current target, nothing on the track is permitted. The stage decision is still made (a new release
+  is still adopted), then converted like an unconfirmed release:
+  - a `Start`, or a hold timer, becomes a `Hold` with the reason `waiting on <repo> <ci_context> stage <n>: <why>`;
+  - a `Halt` or `Idle` still shows as it is, so a failed dependent component is still diagnosed, repaired and
+    rolled back;
+  - every such action carries `waiting`, and the permit gate then refuses any force, an own-stage halt included.
 - "Rolled out" is read from the coordinator's own view of the other track in the same tick: its release confirmed
   (published and on main), and every component of stages up to `n` healthy on the target past its hold. A new
   release on the other track, or one of its stage-1 components failing, withdraws the permission again.
