@@ -10,6 +10,7 @@ class ArtifactAcl:
         self.now = now
         self.on_change = on_change
         self._grants: dict[tuple[str, str], dict] = {}
+        self._holders: dict[str, set] = {}      # artifact id -> principals with a stored grant (read-time gate index)
 
     def grant(self, artifact_id: str, principal_id: str, permissions: set[str],
               *, expires_at: float | None = None) -> dict:
@@ -19,12 +20,14 @@ class ArtifactAcl:
         grant = {"artifact_id": artifact_id, "principal_id": principal_id,
                  "permissions": sorted(permissions), "expires_at": expires_at}
         self._grants[(artifact_id, principal_id)] = grant
+        self._holders.setdefault(artifact_id, set()).add(principal_id)
         if self.on_change:
             self.on_change("grant", dict(grant))
         return dict(grant)
 
     def revoke(self, artifact_id: str, principal_id: str) -> None:
         self._grants.pop((artifact_id, principal_id), None)
+        self._holders.get(artifact_id, set()).discard(principal_id)
         if self.on_change:
             self.on_change("revoke", {"artifact_id": artifact_id, "principal_id": principal_id})
 
@@ -35,6 +38,7 @@ class ArtifactAcl:
         expires_at = grant["expires_at"]
         if expires_at is not None and expires_at <= self.now():
             self._grants.pop((artifact_id, principal_id), None)
+            self._holders.get(artifact_id, set()).discard(principal_id)
             return False
         return permission in grant["permissions"] or "admin" in grant["permissions"]
 
@@ -42,11 +46,16 @@ class ArtifactAcl:
         return [artifact for artifact in artifacts
                 if self.can(artifact.get("artifact_id", ""), principal_id, "read")]
 
+    def principals_with(self, artifact_id: str, permission: str) -> list[str]:
+        """Principal ids holding a live ``permission`` on the artifact (expired grants are dropped on the way)."""
+        return [pid for pid in sorted(self._holders.get(artifact_id, ())) if self.can(artifact_id, pid, permission)]
+
     def has_grants(self, artifact_id: str) -> bool:
         return any(aid == artifact_id for aid, _ in self._grants)
 
     def load(self, grants: list[dict]) -> None:
         for grant in grants:
+            self._holders.setdefault(grant["artifact_id"], set()).add(grant["principal_id"])
             self._grants[(grant["artifact_id"], grant["principal_id"])] = {
                 "artifact_id": grant["artifact_id"],
                 "principal_id": grant["principal_id"],

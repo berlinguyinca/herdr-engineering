@@ -123,9 +123,9 @@ test('attention detail links a resolved loopback URL and survives a client witho
   const { renderAttention } = await import('../attention-view.js');
   const o = 'http://localhost:3188/x';
   const item = { key: 'k', kind: 'ci', severity: 'warning', title: 'T', detail: `open ${o}`, first_seen: '2026-10-28T00:00:00Z', state: 'open', count: 1 };
-  const model = { body: { items: [item], policy: {} }, urls: { resolve: (u) => (u === o ? resolved(o, 'https://dev.lan:3188/x') : null) } };
+  const model = { body: { items: [item], policy: {} }, expanded: new Set(['k']), urls: { resolve: (u) => (u === o ? resolved(o, 'https://dev.lan:3188/x') : null) } };
   assert.ok(renderAttention(model, Date.parse('2026-10-28T01:00:00Z')).includes('href="https://dev.lan:3188/x"'));
-  const plain = renderAttention({ body: model.body }, Date.parse('2026-10-28T01:00:00Z'));
+  const plain = renderAttention({ body: model.body, expanded: model.expanded }, Date.parse('2026-10-28T01:00:00Z'));
   assert.ok(plain.includes(o) && !plain.includes('md-fabric-link'));
 });
 

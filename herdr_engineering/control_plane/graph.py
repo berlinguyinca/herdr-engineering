@@ -50,6 +50,7 @@ import secrets
 import threading
 import time
 from collections import deque
+from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any
 
@@ -755,6 +756,14 @@ def from_stored(event: dict) -> dict:
 class GraphProjection:
     """Thread-safe lineage graph. Mutated only through :meth:`apply`."""
 
+    def set_write_gate(self, node_type: str, gate) -> None:
+        """Admission-time gate: a field-bearing write to a node of this type needs ``gate(actor, node_id)``."""
+        self._write_gates[node_type] = gate
+
+    def set_node_gate(self, node_type: str, gate) -> None:
+        """Install a read-time gate for one node type. It can only narrow what the scope label allows."""
+        self._node_gates[node_type] = gate
+
     def __init__(self, *, keep_log: bool = True, gate: GraphProjection | None = None):
         self._lock = threading.RLock()
         # T09: every applied (non-noop) lineage event with its validated op, in apply order, plus an index by
@@ -767,6 +776,10 @@ class GraphProjection:
         # a replayed projection reads through the CURRENT projection: nothing is visible in the past
         # that the reader cannot see now (no widening by replay)
         self._gate = gate
+        # read-time node gates by node_type: ``fn(principal, node) -> bool`` is ANDed with the scope check, so it can
+        # only narrow (e.g. artifact ACLs, artifact_scope.py). Never persisted, never part of replay.
+        self._node_gates: dict[str, Callable] = {}
+        self._write_gates: dict[str, Callable] = {}    # node_type -> fn(actor, node_id) -> bool, checked at admission
         self._replay_lock = threading.Lock()
         self._replay_cache: dict[tuple, GraphProjection] = {}
         self._cursor_key = secrets.token_bytes(32)
@@ -825,6 +838,10 @@ class GraphProjection:
                 raise deny
             at_quota = not operator and self._owned.get(aid, 0) >= MAX_OBJECTS_PER_PRINCIPAL
             if op["op"] in ("node.upsert", "node.state"):
+                write_gate = self._write_gates.get(op["node_type"])
+                if write_gate is not None and not (op["op"] == "node.upsert" and op["ensure"]) \
+                        and not write_gate(actor, op["node_id"]):
+                    raise deny
                 rec = self._nodes.get(op["node_id"])
                 exists = rec is not None and rec.claim is not None
                 if not exists:
@@ -1408,6 +1425,9 @@ class GraphProjection:
         if node is None:
             return False
         if self._gate is not None and not self._gate._node_visible(principal, self._gate._nodes.get(node.id)):
+            return False
+        read_gate = self._node_gates.get(node.node_type)
+        if read_gate is not None and not read_gate(principal, node):
             return False
         if node.commons:
             # as visible as its most visible writer (see _Node.eff_scope); fields gate separately

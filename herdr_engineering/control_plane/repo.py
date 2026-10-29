@@ -3353,6 +3353,8 @@ class ControlPlaneRepo:
             except ValueError:
                 graph.events_rejected += 1
         graph._seq = max([graph._seq] + [_graph_lseq(e) for e in rows])
+        graph._write_gates = dict(self.graph._write_gates)
+        graph._node_gates = dict(self.graph._node_gates)    # read-time gates are server config, not stored state
         self.graph = graph
         self._event_order = [t for t in self._event_order if t[0] != "lineage"]
 

@@ -105,7 +105,7 @@ export class HerdrFreshness extends Base {
     if (this._detail) text += ` · ${this._detail}`;
     if (state !== this._state) { this._state = state; this.setAttribute('data-state', state); }
     if (text !== this._text) {
-      this._text = text; this.textContent = text;
+      this._text = text; this.textContent = text; this.title = text;
       if (this._last == null && this._error == null) this.insertAdjacentHTML('beforeend', loadingProgress('first update'));
     }
   }

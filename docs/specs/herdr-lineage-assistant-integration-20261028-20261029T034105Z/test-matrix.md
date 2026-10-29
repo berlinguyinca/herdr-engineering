@@ -11,11 +11,11 @@ Status key: **exists** (found, not run), **planned**, **blocked**. Nothing here 
 | Supervisor replacement | 2 | not assessed in audit | planned |
 | Interrupted checkpoint | 4 | `orchestration-checkpoints.test.ts:169-357`; crash-per-handoff-stage | partial / planned (S4) |
 | No duplicate worktree writers | 4 | `orchestration-repository-lease.test.ts`, `git-worktree-concurrency.test.ts` | exists; add worktree lock |
-| Artifact preservation | 10.5 | commit emits graph artifact, survives restart | planned (S2) |
+| Artifact preservation | 10.5 | commit emits graph artifact, survives restart | **run, pass**: `test_artifact_lineage.py`, `test_artifact_scope.py` (rebuild test) |
 | Lineage after restart | 10.8 | `test_graph.py:461`, `test_s6_chaos.py:90` | exists (e2e needs Postgres) |
 | Authorization isolation | 10.6 | `test_graph_membership.py`, `test_artifact_access.py`, assistant `read_lineage` scope tests | partial; assistant planned (S1) |
 | Reviews bound to SHA | 5 | `autospec crates/autospec-core/tests/review_quorum.rs` | exists in AutoSpec |
-| CI failure, repair, re-review | 10.4 | none found | planned (S7) |
+| CI failure, repair, re-review | 10.4 | `test_ci_repair_rereview_gate.py` | **run, pass** (existing pieces; production loop not wired) |
 | Assistant observation | 7A, 10.3 | `read_lineage` tests | planned (S1) |
 | Assistant controlled delegation | 7B | grant/approval negative tests incl. self-approval | planned (S0, S6) |
 | Duplicate/out-of-order events | 10.8 | `test_graph.py:93,133,749` | exists |
