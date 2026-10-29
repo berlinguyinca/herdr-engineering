@@ -23,6 +23,7 @@ import secrets
 import socket
 import threading
 import time
+import traceback
 import urllib.error
 import urllib.request
 from dataclasses import asdict
@@ -320,6 +321,7 @@ class ControlPlaneServer:
         self._deployments_lock = threading.Lock()
         self._deployments_tick_lock = threading.Lock()
         self._deployments_stop = threading.Event()
+        self._deployments_error_type = None     # the last logged tick failure type (log on change only)
         self._deployments_last = {"ticked_at": None, "tracks": [], "error": None, "stale": False}
         # control_plane.missions (validated; outcomes are written when a mission ends, on by default).
         from .mission_outcome import MissionOutcomes, missions_config
@@ -570,8 +572,17 @@ class ControlPlaneServer:
                 tracks = (track_views(self.deployment_coordinator.tick(), defs,
                                       self.repo.deployment_plans, now) if defs else [])
                 result = {"ticked_at": now, "tracks": tracks, "error": None, "stale": False}
+                if self._deployments_error_type is not None:
+                    log.info("deployment coordinator tick recovered from %s", self._deployments_error_type)
+                    self._deployments_error_type = None
             except Exception as exc:  # noqa: BLE001 - a tick must never take the server down
-                log.warning("deployment coordinator tick failed: %s", type(exc).__name__)
+                kind = type(exc).__name__
+                if kind != self._deployments_error_type:
+                    # Once per new error type, then silent until it changes: the type and the frames
+                    # only. The message is never logged (it may carry host- or file-supplied text).
+                    self._deployments_error_type = kind
+                    frames = "".join(traceback.format_tb(exc.__traceback__, limit=20))
+                    log.warning("deployment coordinator tick failed: %s\n%s", kind, frames)
                 with self._deployments_lock:
                     result = {**self._deployments_last, "error": f"tick failed: {type(exc).__name__}",
                               "stale": True}

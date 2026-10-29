@@ -13,6 +13,7 @@ const commitCell = (commit) => commit ? `<code title="${esc(commit)}">${esc(shor
 const text = (value, fallback = '—') => (value == null || value === '' ? fallback : String(value));
 const isObject = (v) => v != null && typeof v === 'object' && !Array.isArray(v);
 const list = (v) => (Array.isArray(v) ? v : []);
+const NO_ROW = Object.freeze(Object.create(null));
 
 function seconds(s) {
   if (s == null || !Number.isFinite(Number(s))) return '—';
@@ -63,7 +64,8 @@ function timeline(row) {
 }
 
 function componentRow(view, item, open) {
-  const row = isObject(view.components[item.name]) ? view.components[item.name] : {};
+  // Own keys only, and a prototype-free empty row: a name like 'constructor' never reads the prototype chain.
+  const row = Object.hasOwn(view.components, item.name) && isObject(view.components[item.name]) ? view.components[item.name] : NO_ROW;
   const plan = planFor(view, item.name);
   const coord = plan ? plan.components[item.name] : null;
   const last = isObject(row.last_result) ? row.last_result : null;

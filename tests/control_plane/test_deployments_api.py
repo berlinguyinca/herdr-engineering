@@ -206,3 +206,27 @@ def test_the_server_ticks_on_its_own_and_stops_on_shutdown(tmp_path):
     finally:
         svr.shutdown()
     assert svr._deployments_stop.is_set()
+
+
+def test_tick_failures_are_logged_once_per_new_type_without_their_message(defined, caplog):
+    svr, _ = defined
+    errors = iter([RuntimeError("secret-a"), RuntimeError("secret-b"), KeyError("secret-c")])
+
+    def boom():
+        raise next(errors)
+    svr.deployment_coordinator.tick = boom
+    with caplog.at_level("INFO", logger="herdr_engineering.control_plane.api"):
+        for _ in range(3):
+            svr.deployments_tick()
+        warnings = [r for r in caplog.records if "tick failed" in r.getMessage()]
+        assert [w.getMessage().split("\n")[0] for w in warnings] == [
+            "deployment coordinator tick failed: RuntimeError",
+            "deployment coordinator tick failed: KeyError"]
+        assert "boom" in warnings[0].getMessage()                       # the frames are there
+        assert "secret" not in caplog.text                              # the messages are not
+        del svr.deployment_coordinator.tick                             # back to the real tick
+        svr.deployments_tick()
+        svr.deployments_tick()
+    recovered = [r for r in caplog.records if "recovered" in r.getMessage()]
+    assert len(recovered) == 1
+    assert svr.deployments_view()["coordinator"]["error"] is None
