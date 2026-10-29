@@ -34,17 +34,23 @@ OUTCOMES = ("started", "ok", "refused", "failed", "rolled-back", "skipped")
 FIELDS = ("id", "ts", "host", "component", "step", "outcome", "from", "to", "evidence")
 REQUIRED = ("ts", "host", "component", "step", "outcome")
 
-#: Largest accepted request body. The emitter caps evidence at 8192 characters;
-#: JSON escaping can grow that several-fold, so leave generous headroom.
-MAX_REQUEST_BYTES = 64 * 1024
+#: Largest accepted request body. The emitter caps evidence at 8192 characters and
+#: sends ``json.dumps`` with ensure_ascii, so one astral character costs 12 bytes
+#: (a surrogate pair): ~98 KB of evidence alone. A refused POST is lost (the emitter
+#: only warns), so leave headroom above that worst case.
+MAX_REQUEST_BYTES = 128 * 1024
 #: Stored evidence cap (the emitter's own cap), tail kept.
 MAX_EVIDENCE = 8192
 TRUNC_MARK = "[earlier output truncated]\n"
 TIMELINE_LIMIT = 50
 MAX_COMPONENTS = 64
-#: At least the emitter's spool (5000 lines), so a full spool replay stays idempotent.
-SEEN_LIMIT = 10_000
+#: Dedupe keys kept (two per event with an id): about 10,000 events fleet-wide, at
+#: least two full emitter spools (5000 lines each), so a spool replay stays idempotent.
+SEEN_LIMIT = 20_000
 HOLD_S = 600
+#: A live event may not claim to be from further in the future than this: "latest" is
+#: decided by event time, so one skewed clock would otherwise freeze a component.
+MAX_FUTURE_S = 300
 
 ENTITY_TYPE = "deployment"
 EVENT_TYPE = "DeploymentEvent"
@@ -154,6 +160,8 @@ class DeploymentsMonitor:
     def ingest(self, event: dict, *, reported_by: str | None = None) -> None:
         """Validate and store one event. Duplicates are ignored; malformed raise ValueError."""
         ev = validate_event(event)
+        if _epoch(ev["ts"]) > self._now() + MAX_FUTURE_S:
+            _fail("ts", f"is more than {MAX_FUTURE_S} s in the future (check the host clock)")
         if reported_by is not None:
             ev["reported_by"] = str(reported_by)[:253]
         with self._lock:
@@ -234,7 +242,7 @@ class DeploymentsMonitor:
             health = {"started": "updating", "ok": "healthy"}.get(health_ev["outcome"], "unhealthy")
         hold = None
         if health == "healthy":
-            hold = max(0, int(self._hold_s - (now - _epoch(health_ev["ts"]))))
+            hold = min(self._hold_s, max(0, int(self._hold_s - (now - _epoch(health_ev["ts"])))))
         if target is None or (running is not None and (running["ts"], running["seq"])
                               > (target["ts"], target["seq"])):
             target = running

@@ -7,6 +7,7 @@ Events come from the inferweave host updaters (``deploy/pipelines/deploy_event.p
 import hashlib
 import json
 import os
+import socket
 import threading
 import urllib.error
 import urllib.request
@@ -139,6 +140,19 @@ def test_out_of_order_arrival_uses_event_time():
     row = mon.snapshot()["components"]["hive-gateway"]
     assert row["health"] == "healthy"
     assert [e["outcome"] for e in row["timeline"]] == ["started", "ok"]
+
+
+def test_future_dated_event_is_rejected_so_a_skewed_clock_cannot_freeze_a_component():
+    mon = DeploymentsMonitor(now=Clock(T0))
+    with pytest.raises(ValueError, match="ts"):
+        mon.ingest(_event(outcome="ok", offset=3600))
+    assert mon.snapshot() == {"components": {}}
+
+
+def test_hold_never_exceeds_hold_s_for_slightly_ahead_clocks():
+    mon = DeploymentsMonitor(now=Clock(T0), hold_s=600)
+    mon.ingest(_event(outcome="ok", offset=200))     # within the allowed skew
+    assert mon.snapshot()["components"]["hive-gateway"]["hold_remaining_s"] == 600
 
 
 def test_skipped_keeps_previous_health():
@@ -372,12 +386,27 @@ def test_route_rejects_malformed_events(dep_server):
     assert repo.deployments.snapshot() == {"components": {}}
 
 
-def test_route_rejects_oversize_bodies(dep_server):
+def test_route_rejects_oversize_bodies_before_reading_them(dep_server):
+    # Headers only, no body: a 413 proves the size is decided before any read
+    # (and avoids a reset racing the response on an unread body).
     port, repo = dep_server
-    ev = _event(evidence="x" * (MAX_REQUEST_BYTES + 10))
-    status, body = _post(port, "/api/deployments/events", body=ev, headers=_bearer())
-    assert status == 413
+    with socket.create_connection(("127.0.0.1", port), timeout=10) as sock:
+        sock.sendall((f"POST /api/deployments/events HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+                      f"Authorization: Bearer {HOST_TOKEN}\r\nContent-Type: application/json\r\n"
+                      f"Content-Length: {MAX_REQUEST_BYTES + 1}\r\n\r\n").encode())
+        reply = sock.recv(4096).decode()
+    assert reply.startswith("HTTP/1.1 413")
     assert repo.deployments.snapshot() == {"components": {}}
+
+
+def test_route_accepts_worst_case_escaped_evidence(dep_server):
+    # The emitter caps evidence at 8192 characters and json.dumps escapes astral
+    # characters to 12 bytes each; that event must still fit.
+    port, repo = dep_server
+    ev = _event(outcome="failed", evidence="\U0001F600" * MAX_EVIDENCE)
+    assert len(json.dumps(ev)) > 64 * 1024
+    assert _post(port, "/api/deployments/events", body=ev, headers=_bearer())[0] == 200
+    assert repo.deployments.snapshot()["components"]["hive-gateway"]["timeline"][-1]["evidence"]
 
 
 def test_route_is_idempotent_over_http(dep_server):
