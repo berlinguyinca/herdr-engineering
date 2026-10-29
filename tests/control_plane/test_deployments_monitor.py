@@ -92,17 +92,20 @@ def test_started_and_ok_in_the_same_second_are_both_kept():
 
 
 def test_snapshot_reflects_ok():
-    clock = Clock(T0 + 120)
+    clock = Clock(T0)
     mon = DeploymentsMonitor(now=clock, hold_s=600)
     mon.ingest(_event(outcome="started", offset=0))
+    clock.t = T0 + 60
     mon.ingest(_event(outcome="ok", offset=60))
+    clock.t = T0 + 120
     row = mon.snapshot()["components"]["hive-gateway"]
     assert row["running"] == REV_B
     assert row["target"] == REV_B
     assert row["step"] == "deployment.hive-gateway.cycle"
     assert row["health"] == "healthy"
     assert row["last_result"]["outcome"] == "ok"
-    assert row["hold_remaining_s"] == 540  # healthy since +60, now +120
+    assert row["hold_remaining_s"] == 540  # ok arrived at +60, now +120
+    assert row["clock_skew_s"] == 0
     clock.t = T0 + 10_000
     assert mon.snapshot()["components"]["hive-gateway"]["hold_remaining_s"] == 0
 
@@ -133,26 +136,71 @@ def test_rollback_restores_running_to_previous():
     assert row["last_result"]["outcome"] == "rolled-back"
 
 
-def test_out_of_order_arrival_uses_event_time():
+def test_order_is_arrival_order_not_host_time():
+    # Host clocks are not trusted. A late event counts from its arrival; for an old
+    # "started" that is the conservative reading (updating: the stage does not advance).
     mon = DeploymentsMonitor(now=Clock(T0 + 120))
     mon.ingest(_event(outcome="ok", offset=60))
-    mon.ingest(_event(outcome="started", offset=0))   # spool replay of an older event
+    mon.ingest(_event(outcome="started", offset=0))
+    row = mon.snapshot()["components"]["hive-gateway"]
+    assert row["health"] == "updating"
+    assert [e["outcome"] for e in row["timeline"]] == ["ok", "started"]
+
+
+def test_host_clock_ahead_is_accepted_shown_and_cannot_freeze_a_component():
+    # The emitter cannot replay a refused event, so a skewed one is kept, not refused.
+    clock = Clock(T0)
+    mon = DeploymentsMonitor(now=clock, hold_s=600)
+    mon.ingest(_event(outcome="failed", offset=3600))   # host clock one hour ahead
+    row = mon.snapshot()["components"]["hive-gateway"]
+    assert row["health"] == "unhealthy"
+    assert row["clock_skew_s"] == 3600
+    assert row["timeline"][-1]["host_ts"] == _ts(3600)
+    assert row["timeline"][-1]["received_at"] == _ts(0)
+    clock.t = T0 + 30
+    mon.ingest(_event(outcome="ok", offset=30))          # a correct host, later
     row = mon.snapshot()["components"]["hive-gateway"]
     assert row["health"] == "healthy"
-    assert [e["outcome"] for e in row["timeline"]] == ["started", "ok"]
+    assert row["hold_remaining_s"] == 600
+    assert row["clock_skew_s"] == 0
 
 
-def test_future_dated_event_is_rejected_so_a_skewed_clock_cannot_freeze_a_component():
-    mon = DeploymentsMonitor(now=Clock(T0))
-    with pytest.raises(ValueError, match="ts"):
-        mon.ingest(_event(outcome="ok", offset=3600))
-    assert mon.snapshot() == {"components": {}}
-
-
-def test_hold_never_exceeds_hold_s_for_slightly_ahead_clocks():
+def test_host_clock_behind_still_gets_the_full_hold():
     mon = DeploymentsMonitor(now=Clock(T0), hold_s=600)
-    mon.ingest(_event(outcome="ok", offset=200))     # within the allowed skew
+    mon.ingest(_event(outcome="ok", offset=-900))       # host clock 15 min behind
+    row = mon.snapshot()["components"]["hive-gateway"]
+    assert row["hold_remaining_s"] == 600
+    assert row["clock_skew_s"] == -900
+
+
+def test_a_replayed_or_late_ok_never_shortens_the_hold():
+    clock = Clock(T0)
+    mon = DeploymentsMonitor(now=clock, hold_s=600)
+    ok = _event(outcome="ok", offset=0)
+    mon.ingest(ok)
+    clock.t = T0 + 300
+    mon.ingest(dict(ok))                                 # exact replay: a no-op
+    assert mon.snapshot()["components"]["hive-gateway"]["hold_remaining_s"] == 300
+    mon.ingest(_event(outcome="ok", offset=-3000))      # a late, older ok: restarts the hold
     assert mon.snapshot()["components"]["hive-gateway"]["hold_remaining_s"] == 600
+    clock.t = T0 + 10_000
+    assert mon.snapshot()["components"]["hive-gateway"]["hold_remaining_s"] == 0
+
+
+def test_distinct_ids_in_the_same_second_are_both_kept():
+    mon = DeploymentsMonitor(now=Clock())
+    mon.ingest(_event(step="install", outcome="failed", evidence="first failure"))
+    mon.ingest(_event(step="install", outcome="failed", evidence="second failure"))
+    assert len(mon.snapshot()["components"]["hive-gateway"]["timeline"]) == 2
+
+
+def test_running_falls_back_to_the_most_recent_from():
+    clock = Clock(T0)
+    mon = DeploymentsMonitor(now=clock)
+    mon.ingest(_event(outcome="started", frm=REV_A, to=REV_B))
+    clock.t += 1
+    mon.ingest(_event(outcome="failed", frm="", to=REV_B))     # no from on the later event
+    assert mon.snapshot()["components"]["hive-gateway"]["running"] == REV_A
 
 
 def test_skipped_keeps_previous_health():
@@ -201,7 +249,7 @@ def test_timeline_is_bounded_per_component():
         mon.ingest(_event(outcome="failed", offset=i))
     row = mon.snapshot()["components"]["hive-gateway"]
     assert len(row["timeline"]) == 5
-    assert row["timeline"][-1]["ts"] == _ts(39)
+    assert row["timeline"][-1]["host_ts"] == _ts(39)
     # state outlives the bounded timeline
     assert row["running"] == REV_A
 
@@ -244,6 +292,23 @@ def test_evidence_is_capped_keeping_the_tail():
     ("fetch https://user:pw1234@example.org/x", "pw1234"),
     ("fetch https://tokenonly@example.org/x", "tokenonly"),
     ("-----BEGIN OPENSSH PRIVATE KEY-----\nAAAA\n-----END OPENSSH PRIVATE KEY-----", "AAAA"),
+    ("-----BEGIN RSA PRIVATE KEY-----\nBBBBunterminated", "BBBBunterminated"),
+    ("Cookie: session=c00kieval", "c00kieval"),
+    ("Set-Cookie: sid=s3tc00kie; Path=/", "s3tc00kie"),
+    ("X-Api-Key: xak123", "xak123"),
+    ("export IW_GATEWAY_KEK=kekvalue1", "kekvalue1"),
+    ("export DB_KEY=dbk3y", "dbk3y"),
+    ("curl -u admin:pw9 https://h/x", "pw9"),
+    ("curl --user admin:pw8 https://h/x", "pw8"),
+    ("sshpass -p sshpw1 ssh host", "sshpw1"),
+    ("mysql -uroot -pMyPw1 db", "MyPw1"),
+    ("inferweave gateway --admin-secret adm1n --port 1", "adm1n"),
+    ("run --api-token=tok42 now", "tok42"),
+    ("docker login -p dockpw1 reg", "dockpw1"),
+    ("redis-cli -a redpw1 ping", "redpw1"),
+    ("echo dockpw2 | docker login --password-stdin", "dockpw2"),
+    ("https://b/o?X-Amz-Signature=sig123abc", "sig123abc"),
+    ("token ghp_" + "A" * 30, "ghp_" + "A" * 30),
 ])
 def test_redact_evidence_strips_secrets(secret_text, secret):
     out = redact_evidence(secret_text)
@@ -383,6 +448,16 @@ def test_route_rejects_malformed_events(dep_server):
     status, _ = _post(port, "/api/deployments/events", body=_event(), headers=_bearer(),
                       content_type="text/plain")
     assert status == 415
+    assert repo.deployments.snapshot() == {"components": {}}
+
+
+def test_route_rejects_deeply_nested_json(dep_server):
+    port, repo = dep_server
+    depth = 50_000
+    raw = b"[" * depth + b"]" * depth
+    assert len(raw) < MAX_REQUEST_BYTES
+    status, body = _post(port, "/api/deployments/events", raw=raw, headers=_bearer())
+    assert status == 400 and "nested" in body["error"]
     assert repo.deployments.snapshot() == {"components": {}}
 
 

@@ -1616,6 +1616,12 @@ def _make_handler(server, public=False, operator=False):
                 return self._deny(415, "deployment events require application/json")
             try:
                 body = self._read_json(MAX_REQUEST_BYTES)
+            except RecursionError:
+                # json.loads raises this (not ValueError) on deeply nested input.
+                return self._deny(400, "invalid JSON body: nested too deeply")
+            except ValueError as exc:
+                return self._deny(400, str(exc))
+            try:
                 server.repo.deployments.ingest(body, reported_by=host)
             except ValueError as exc:
                 return self._deny(400, str(exc))

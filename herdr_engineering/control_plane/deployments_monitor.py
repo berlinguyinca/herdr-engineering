@@ -10,6 +10,13 @@ module validates, de-duplicates and projects those events into one row per
 component. Snapshots are last-known observations reported by hosts, never
 execution authority.
 
+Time: the host's ``ts`` is kept as ``host_ts`` but never trusted for ordering or
+the stage hold. Each event is stamped ``received_at`` on arrival; "latest" is
+arrival order and the hold runs from the arrival of the ``ok``, so a host clock
+running behind cannot shorten the hold and one running ahead cannot freeze a row.
+A late or replayed event can only make the hold longer. The difference between
+the two clocks is shown as ``clock_skew_s``.
+
 Bounds: a fixed number of components, a fixed timeline per component, a bounded
 dedupe memory, and capped evidence. Evidence is untrusted text: it was redacted on
 the host, and is redacted again here before it is stored or served.
@@ -27,6 +34,7 @@ import time
 from collections import OrderedDict
 from datetime import UTC, datetime
 
+from .deployment_redact import redact as _emitter_redact
 from .redact import redact_text
 
 #: The emitter's outcome vocabulary (deploy_event.OUTCOMES).
@@ -44,13 +52,10 @@ MAX_EVIDENCE = 8192
 TRUNC_MARK = "[earlier output truncated]\n"
 TIMELINE_LIMIT = 50
 MAX_COMPONENTS = 64
-#: Dedupe keys kept (two per event with an id): about 10,000 events fleet-wide, at
-#: least two full emitter spools (5000 lines each), so a spool replay stays idempotent.
+#: Dedupe keys kept (one per event: its id, else its tuple): 20,000 events fleet-wide,
+#: four full emitter spools (5000 lines each).
 SEEN_LIMIT = 20_000
 HOLD_S = 600
-#: A live event may not claim to be from further in the future than this: "latest" is
-#: decided by event time, so one skewed clock would otherwise freeze a component.
-MAX_FUTURE_S = 300
 
 ENTITY_TYPE = "deployment"
 EVENT_TYPE = "DeploymentEvent"
@@ -63,8 +68,8 @@ _HOST = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,252}")
 _COMMIT = re.compile(r"[A-Za-z0-9._-]{0,128}")
 
 _R = "[REDACTED]"
-# Supplements to the shared ``redact_text``: it covers db/s3 connection strings but
-# not https userinfo, and it ignores short values after a ``key=``-style name.
+# Supplements: the shared ``redact_text`` covers db/s3 connection strings but not
+# https userinfo, and it ignores short values after a ``key=``-style name.
 _URL_USERINFO = re.compile(r"(?i)\b([a-z][a-z0-9+.-]{0,20}://)[^/\s@]{1,1024}@")
 _SECRET_PAIR = re.compile(
     r"(?i)(\b[a-z0-9_.-]{0,64}(?:key|token|secret|passw(?:or)?d|pass|pwd|credential|auth))"
@@ -76,10 +81,15 @@ class DeploymentEventError(ValueError):
 
 
 def redact_evidence(text: str) -> str:
-    """Second-layer redaction for untrusted evidence text (host already redacted once)."""
+    """Second-layer redaction for untrusted evidence text (host already redacted once).
+
+    The emitter's own rule set (vendored in ``deployment_redact``, which also bounds
+    the input to its last 64 KiB) runs first, then the shared ``redact_text``, then
+    two local supplements.
+    """
     if not text:
         return text
-    out = redact_text(text)
+    out = redact_text(_emitter_redact(text))
     out = _URL_USERINFO.sub(lambda m: m.group(1) + _R + "@", out)
     out = _SECRET_PAIR.sub(lambda m: m.group(1) + m.group(2) + _R, out)
     return out
@@ -142,6 +152,14 @@ def _epoch(ts: str) -> float:
     return datetime.strptime(ts, _TS_FORMAT).replace(tzinfo=UTC).timestamp()
 
 
+def _stamp(ev: dict, received: float) -> dict:
+    """Keep the host's ts as ``host_ts``; stamp herdr's arrival time (``_rx`` is internal)."""
+    ev["host_ts"] = ev.pop("ts")
+    ev["_rx"] = received
+    ev["received_at"] = datetime.fromtimestamp(received, UTC).strftime(_TS_FORMAT)
+    return ev
+
+
 class DeploymentsMonitor:
     def __init__(self, *, now=None, persist=None, hold_s=HOLD_S, timeline_limit=TIMELINE_LIMIT,
                  max_components=MAX_COMPONENTS, seen_limit=SEEN_LIMIT):
@@ -159,9 +177,7 @@ class DeploymentsMonitor:
     # ---------------------------------------------------------------- write
     def ingest(self, event: dict, *, reported_by: str | None = None) -> None:
         """Validate and store one event. Duplicates are ignored; malformed raise ValueError."""
-        ev = validate_event(event)
-        if _epoch(ev["ts"]) > self._now() + MAX_FUTURE_S:
-            _fail("ts", f"is more than {MAX_FUTURE_S} s in the future (check the host clock)")
+        ev = _stamp(validate_event(event), self._now())
         if reported_by is not None:
             ev["reported_by"] = str(reported_by)[:253]
         with self._lock:
@@ -177,16 +193,17 @@ class DeploymentsMonitor:
                 pass
 
     @staticmethod
-    def _keys(ev):
-        keys = [("tuple", ev["host"], ev["ts"], ev["component"], ev["step"], ev["outcome"])]
+    def _key(ev):
+        """The event id when present (distinct ids are distinct events, even in one second);
+        otherwise the tuple, which includes outcome because started/ok share a step and a ts."""
         if ev.get("id"):
-            keys.append(("id", ev["id"]))
-        return keys
+            return ("id", ev["id"])
+        return ("tuple", ev["host"], ev["host_ts"], ev["component"], ev["step"], ev["outcome"])
 
     def _apply(self, ev) -> bool:
-        """Add a validated event under the lock; False when it is a duplicate."""
-        keys = self._keys(ev)
-        if any(k in self._seen for k in keys):
+        """Add a stamped event under the lock; False when it is a duplicate."""
+        key = self._key(ev)
+        if key in self._seen:
             return False
         row = self._components.get(ev["component"])
         if row is None:
@@ -195,22 +212,22 @@ class DeploymentsMonitor:
                     f"deployment event: too many components (limit {self._max_components})")
             row = self._components[ev["component"]] = {
                 "timeline": [], "latest": None, "health_event": None,
-                "running_event": None, "target_event": None, "terminal": None}
-        for k in keys:
-            self._seen[k] = None
+                "running_event": None, "target_event": None, "terminal": None,
+                "from_event": None}
+        self._seen[key] = None
         while len(self._seen) > self._seen_limit:
             self._seen.popitem(last=False)
         self._seq = max(self._seq + 1, int(ev.get("seq") or 0))
         ev["seq"] = self._seq
-        order = (ev["ts"], ev["seq"])
+        order = (ev["_rx"], ev["seq"])
         timeline = row["timeline"]
         timeline.append(ev)
-        timeline.sort(key=lambda e: (e["ts"], e["seq"]))
+        timeline.sort(key=lambda e: (e["_rx"], e["seq"]))
         del timeline[:-self._timeline_limit]
 
         def newer(slot):
             cur = row[slot]
-            if cur is None or order >= (cur["ts"], cur["seq"]):
+            if cur is None or order >= (cur["_rx"], cur["seq"]):
                 row[slot] = ev
 
         newer("latest")
@@ -223,6 +240,8 @@ class DeploymentsMonitor:
             newer("running_event")
         if outcome == "started":
             newer("target_event")
+        if ev["from"]:
+            newer("from_event")
         return True
 
     # ----------------------------------------------------------------- read
@@ -236,25 +255,33 @@ class DeploymentsMonitor:
 
     def _project(self, row, now):
         latest, running, target = row["latest"], row["running_event"], row["target_event"]
-        health_ev, terminal = row["health_event"], row["terminal"]
+        health_ev, terminal, from_ev = row["health_event"], row["terminal"], row["from_event"]
         health = "unknown"
         if health_ev is not None:
             health = {"started": "updating", "ok": "healthy"}.get(health_ev["outcome"], "unhealthy")
         hold = None
         if health == "healthy":
-            hold = min(self._hold_s, max(0, int(self._hold_s - (now - _epoch(health_ev["ts"])))))
-        if target is None or (running is not None and (running["ts"], running["seq"])
-                              > (target["ts"], target["seq"])):
+            # From arrival, never from the host's clock (a clock behind would skip the hold).
+            hold = min(self._hold_s, max(0, int(self._hold_s - (now - health_ev["_rx"]))))
+        if target is None or (running is not None and (running["_rx"], running["seq"])
+                              > (target["_rx"], target["seq"])):
             target = running
+        if running is not None:
+            current = running["to"] or None
+        else:
+            current = from_ev["from"] if from_ev is not None else None
         return {
-            "running": (running["to"] or None) if running else (latest["from"] or None),
+            "running": current,
             "target": (target["to"] or None) if target else (latest["to"] or None),
             "step": latest["step"],
             "health": health,
             "last_result": None if terminal is None else {
-                k: terminal[k] for k in ("outcome", "step", "ts", "from", "to")},
+                k: terminal[k] for k in ("outcome", "step", "host_ts", "received_at", "from", "to")},
             "hold_remaining_s": hold,
-            "timeline": [{k: v for k, v in e.items() if k != "seq"} for e in row["timeline"]],
+            # Host clock minus herdr's clock at the latest event (positive: host ahead).
+            "clock_skew_s": int(_epoch(latest["host_ts"]) - latest["_rx"]),
+            "timeline": [{k: v for k, v in e.items() if k not in ("seq", "_rx")}
+                         for e in row["timeline"]],
         }
 
     # -------------------------------------------------------------- restore
@@ -267,9 +294,14 @@ class DeploymentsMonitor:
             if not isinstance(payload, dict):
                 continue
             raw = {k: v for k, v in payload.items() if k in FIELDS}
+            raw["ts"] = payload.get("host_ts", payload.get("ts"))
+            rx = payload.get("_rx")
             try:
                 ev = validate_event(raw)
-            except ValueError:
+                if isinstance(rx, bool) or not isinstance(rx, (int, float)):
+                    rx = _epoch(ev["ts"])
+                ev = _stamp(ev, float(rx))
+            except (TypeError, ValueError, OverflowError):
                 continue
             if isinstance(payload.get("reported_by"), str):
                 ev["reported_by"] = payload["reported_by"][:253]
