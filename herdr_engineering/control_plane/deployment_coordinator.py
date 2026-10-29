@@ -61,13 +61,22 @@ Safety gates, in this order, before any stage decision:
    confirmed".
 6. a target other than the plan's commit: ``Replan`` (generation + 1).
 
-Release evidence (contract for the caller; wiring to the real release-asset check is a
-later task): ``DeploymentCoordinator(evidence=fn)``, ``fn(track, target_commit,
-plan_commit) -> ReleaseEvidence``, called once per track per tick. ``published_commit``
-is the commit the release (``follows.tag``/``follows.asset``, its ``.commit``) carries;
-``on_main`` is True only when the target is on ``follows.branch`` AND not behind
-``plan_commit`` (False / None = unknown). The default is unknown for both, so until it
-is wired the coordinator only ever Holds (fail closed).
+Release evidence (contract for the caller; the server's source is
+``deployment_evidence.GitHubReleaseEvidence``): ``DeploymentCoordinator(evidence=fn)``,
+``fn(track, target_commit, plan_commit) -> ReleaseEvidence``, called once per track per
+tick. ``published_commit`` is the commit the release (``follows.tag``/``follows.asset``,
+its ``.commit``) carries; ``on_main`` is True only when the target is on
+``follows.branch`` AND not behind ``plan_commit`` (False = not on main, None = unknown).
+The default is unknown for both, so without a source the coordinator only ever Holds
+(fail closed).
+
+Cross-track requirements (a definition's optional ``requires``): after gate 5, a track
+whose definitions name a (track, stage) that ``Snapshot.requirements`` does not mark met
+(None) yields ``Hold(stage=None)`` "waiting on <repo> <ci_context> stage <n>: <why>" and
+permits nothing; absent = unmet. ``tick()`` computes them from the coordinator's own view
+of the other track in the same tick (``requirement_status``: ``advance`` over that
+track's stages up to n must be ``Idle("rolled out")`` with a confirmed release),
+evaluating required tracks first.
 
 Permission (the Task 6 gate is stateless): every action carries ``permitted``, the
 components whose updaters may proceed to ``target_commit`` NOW. A tick's permission is

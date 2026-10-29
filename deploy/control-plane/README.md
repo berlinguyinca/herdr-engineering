@@ -88,7 +88,8 @@ Settings of the reserved `control_plane` section the servers read: `pg_dsn`,
 web container sees it, to a checkout of InferWeave's `deploy/pipelines`; read live and validated with
 the same rules as its `validate.py`. Absent: no definitions, any host may report any component and the
 Deployments snapshot warns. Set: a host may report only components whose `host` is its fleet id, and
-an invalid set keeps the last good one, or refuses events with 503 if none was ever valid),
+an invalid set keeps the last good one, or refuses events with 503 if none was ever valid; see
+"Cross-track order" for the optional `requires` key),
 `deployment_actions` (exactly `true` enables the audited Deployments actions; read live, and off while the
 file is unusable unless `config_failure_mode: last_good` — see "Deployment actions" below), `inspector_limits` (`max_events`,
 `max_bytes`, `max_sessions`, `max_total_bytes`, `retention_hours`, `reasoning_role`,
@@ -253,11 +254,25 @@ request** that the host updater picks up on its next poll. The routes (each also
 - **Requests** are kept until cleared or for 24 h, at most 256 pending (more is refused with 429).
 - **Host token scope.** The host token grants only these host routes, and only for the components whose
   definition names that host. Every other route still answers 401.
-- **Release evidence is not wired yet: wire it before enabling any host gate.** herdr has no source for the
-  release asset's `.commit` or its ancestry on main, so the evidence is "unknown" and the coordinator holds with
-  "release not confirmed". Every permit then answers `permitted: false`, and a host updater that has a gate URL
-  (`IW_DEPLOY_GATE_URL`) stays on its running version indefinitely. Setting `deployment_evidence` (the
-  release-evidence hook) is a prerequisite to turning on any host gate.
+- **Release evidence comes from GitHub.** herdr reads it with the server-held `github.token` (read only is
+  enough; the repository is private, so a token is required):
+  - **Published:** the `<follows.asset>.commit` asset of the `follows.tag` release (`node-ci-latest`) must hold
+    the plan target. Every (tag, asset) a track's definitions name must carry the same 40-hex commit. The asset's
+    redirect is followed by hand, without the token, and only to a `*.githubusercontent.com` download host.
+  - **On main:** `compare/main...<target>` must answer `identical`, or `behind` with no commits of its own, and
+    the target must not be behind the plan commit (`compare/<target>...<plan>` not `ahead`). A plan commit that
+    was force-pushed away (`diverged`) does not halt a target that is on main.
+  - **CI green** is not fetched again. The plan target is only ever a commit whose whole CI pipeline herdr saw
+    succeed on a main push, which is stricter than the `follows.ci_context` status alone.
+  - **Never in the way.** The coordinator reads a per-target cache and never waits on GitHub: a daemon worker
+    refreshes it. A success is fresh for 60 s and served at most 180 s after it was fetched. A failed refresh
+    retries after 15 s and never extends a success. Each call is bounded to 10 s wall clock, and responses are
+    size-capped and validated. A new target is therefore unknown for one tick (30 s) before it can be confirmed.
+  - **Fail closed.** No token, any HTTP error, a timeout, an oversized or malformed answer: the evidence is unknown
+    and the coordinator holds with "release not confirmed". Every permit then answers `permitted: false`, and a
+    host updater that has a gate URL (`IW_DEPLOY_GATE_URL`) stays on its running version. The Deployments view
+    shows `coordinator.evidence` (`configured` after a successful refresh, else `unknown`) and
+    `coordinator.evidence_error` (a fixed failure kind; the token is never logged or shown).
 - **The permit gate is not behind the flag.**
   - Nothing is permitted unless the newest tick confirmed the release (published commit matches the target)
     AND the target on main. Not the plan, not a force, and not a repair other than a rollback to herdr's
@@ -281,6 +296,29 @@ request** that the host updater picks up on its next poll. The routes (each also
 - **While the fleet file is unusable** (deleted or unparseable after having been valid), the flag reads as off
   (fail closed) unless the last good file set `control_plane.config_failure_mode: last_good`. With `last_good`, a
   flag that was `true` keeps forces live: new force/ack requests are accepted and pending forces still permit.
+
+### Cross-track order (`requires`)
+
+Components on another `follows` track (the zapp console follows `metabolomics-us/inferweave-gateway`) are staged by
+their own track, so stage 1 of InferWeave does not order them by itself. A definition can name stages of other
+tracks that must be rolled out first:
+
+```yaml
+requires:
+  - {repo: InferWeave/inferweave, ci_context: ci/woodpecker/push/rust, stage: 1}
+```
+
+- The key is optional; a definition without it behaves as before. Branch is always `main`.
+- A track's requirements are the union over its definitions. Until every named stage is rolled out on that
+  track's own current target, the whole track holds: `Hold` with no stage, the reason `waiting on <repo>
+  <ci_context> stage <n>: <why>`, and nothing permitted. A force cannot override it.
+- "Rolled out" is read from the coordinator's own view of the other track in the same tick: its release confirmed
+  (published and on main), and every component of stages up to `n` healthy on the target past its hold. A new
+  release on the other track, or one of its stage-1 components failing, withdraws the permission again.
+- Unknown or unmet is a hold (fail closed). The validator refuses a malformed entry, at most 8 entries, a
+  requirement on the own track, on a track no definition follows or on a stage that track lacks, and any cycle
+  between tracks. InferWeave's `deploy/pipelines/validate.py` does not know the key yet; it must accept it before
+  a definition there uses it.
 
 ### Deployment failures: diagnosis, repairs, escalation
 

@@ -13,7 +13,10 @@ plan 1). Herdr reads a checkout of that directory, named by the fleet config key
   writable by group/other (definitions are an authorization input) are load errors.
   Messages never echo file content, interpolated values are capped, and the stored
   error list is bounded. Herdr-only additions to validate.py: a .yaml and .yml with the
-  same stem are a duplicate; anchors/aliases are refused.
+  same stem are a duplicate; anchors/aliases are refused; the optional ``requires: [{repo,
+  ci_context, stage}]`` (stages of OTHER follows tracks the coordinator waits for) is
+  validated here, including the cross-file checks (a followed track, an existing stage, not
+  the own track, no cycle). validate.py must learn the key before a definition uses it.
 * ``target_for(component)`` is the newest green ``main`` push of the definition's
   ``follows.repo``, read from the CI monitor's last snapshot (no provider calls here).
   A pipeline-level ``success`` means every workflow passed, so it is stricter than the
