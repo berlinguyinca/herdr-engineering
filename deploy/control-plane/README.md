@@ -232,6 +232,11 @@ sections:
 
 The key is read live (no redeploy). A set loads all-or-nothing; an invalid one keeps the last good set in use.
 
+**Order matters:** deploy first, wait for the first sync (`pipelines.commit` exists and the directory lists
+the definitions), and only then add the line. The loader treats an EMPTY directory as a valid set of zero
+definitions: no warning, yet every host's deployment events are refused because no component is defined.
+deploy.sh creates the directory empty, and the sync never empties it (it refuses an empty set).
+
 - **deploy.sh** creates the directory empty (0755) on a real deploy, never on `--dry-run`, and refuses to deploy
   unless it is a real directory owned by the deploying user, not writable by group/other, holding only regular
   `*.yaml` files (no symlinks or subdirectories, at most 256, each at most 64 KiB, none group/other-writable).
@@ -265,11 +270,13 @@ ls -l ~/.local/share/herdr-engineering/pipelines/          # only *.yaml, 0644
 docker exec herdr-cp-web ls /etc/herdr/pipelines           # the same files, read-only
 ```
 
-On the **Deployments** page, the definitions status must say configured and loaded, with no warning.
+On the **Deployments** page, the definitions status must say configured and loaded, with no warning, AND the
+component groups must list the definitions (an empty list with no warning is the empty-directory case above).
 `no deployment definitions loaded` means the key is not set. `configured but invalid` means no set was ever
 valid. `have errors: the last good set is still in use` means the current files fail and the page lists the
 errors. The component groups (stages) come from the definitions. The same status is in
-`GET /api/v1/deployments` under `definitions` (`configured`, `loaded`, `errors`, `warning`).
+`GET /api/v1/deployments` under `definitions` (`configured`, `loaded`, `errors`, `warning`, and a non-empty
+`groups`).
 
 Run once by hand (same flags as the unit's `ExecStart`): `~/.local/share/herdr-engineering/pipelines-sync.sh once`.
 To roll back, drop `deployment_definitions` from the fleet file (the key is read live), then
