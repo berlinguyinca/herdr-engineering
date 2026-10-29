@@ -1,0 +1,35 @@
+{
+  "doc": {
+    "actor": {
+      "id": "alice",
+      "kind": "user"
+    },
+    "aliases": [
+      {
+        "system": "hcn",
+        "value": "project-1"
+      }
+    ],
+    "causation_id": "ev-0",
+    "correlation_id": "co-1",
+    "created_at": "2026-10-28T12:00:00Z",
+    "etag": "W/\"1\"",
+    "id": "urn:herdr:project:b242429a-a320-5d91-88fc-6067745899c6",
+    "kind": "project",
+    "name": "CI health",
+    "refs": [
+      "herdr://rooms/room-1"
+    ],
+    "scope": {
+      "room_id": "room-1",
+      "tenant_id": "t1",
+      "visibility": "room"
+    },
+    "source_sequence": 7,
+    "trace_id": "tr-1",
+    "updated_at": "2026-10-28T12:00:00Z",
+    "version": 1
+  },
+  "expect_keyword": "pattern",
+  "schema": "project"
+}
