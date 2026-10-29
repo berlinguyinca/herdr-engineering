@@ -24,10 +24,12 @@ test('CI reports publish over HTTP and drive history, pipeline logs and responsi
   const page=await browser.newPage({viewport:{width:1440,height:1000}});const errors=[],reportReads=[];page.on('pageerror',e=>errors.push(e.message));
   page.on('request',request=>{const url=new URL(request.url());if(request.method()==='GET'&&url.pathname==='/api/v1/ci/reports')reportReads.push(url);});
   await page.goto(`${base}/#/ci`);
-  assert.equal(await page.locator('[data-ci-workspace="health"]').getAttribute('aria-selected'),'true');
-  assert.equal(await page.locator('.ci-report-filters').isVisible(),false,'Health owns its own history filters');
+  assert.equal(await page.locator('[data-ci-workspace="overview"]').getAttribute('aria-selected'),'true','the page opens on the Overview tab');
+  assert.equal(await page.locator('.ci-report-filters').isVisible(),false,'Overview and Projects own their own filters');
   assert.equal(await page.locator('[data-ci-workspace="health"]').getAttribute('aria-controls'),'ci-workspace-health');
-  await page.locator('[data-ci-workspace="health"]').focus();await page.keyboard.press('ArrowRight');
+  await page.locator('[data-ci-workspace="overview"]').focus();await page.keyboard.press('ArrowRight');
+  assert.equal(await page.locator('[data-ci-workspace="health"]').getAttribute('aria-selected'),'true');
+  await page.keyboard.press('ArrowRight');
   assert.equal(await page.locator('[data-ci-workspace="runs"]').getAttribute('aria-selected'),'true');
   assert.equal(await page.evaluate(()=>document.activeElement?.dataset.ciWorkspace),'runs');
   await page.locator('[data-ci-workspace="tests"]').click();
@@ -155,7 +157,7 @@ async function commandCenter(run,{invalidateAssetTransport=false,selectionContra
   page.on('response',r=>{if(r.status()>=400)httpErrors.push({url:r.url(),status:r.status()});});
   page.on('request',r=>{if(r.url().includes('/api/v1/ci/'))requests.push(new URL(r.url()).pathname);});
   try {
-   await page.goto(`${base}/#/ci`);
+   await page.goto(`${base}/#/ci?workspace=health`);
    await page.waitForFunction(()=>document.querySelectorAll('[data-ob-project]').length===117);
    await run({page,context,base,requests,assetReads});
   }
@@ -316,20 +318,21 @@ test('failed HTTP refresh retains selected project, run, failed step and expande
  await selectApp(page);await openFailure(page);
  await page.locator('.ci-pipeline-step[data-step="12"]').click();
  await page.locator('[aria-label="Step output"]').waitFor();
+ await page.locator('[data-ci-workspace="health"]').click();      // charts, the project list and the inspector are on Projects; the summary and test history are other tabs, read as text
  const disclosure=page.locator('[data-ob-charts] details');await disclosure.locator('summary').click();
- const cards=await page.locator('[data-ob-summary]').innerText(),chart=await disclosure.innerText();
+ const cards=await page.locator('[data-ob-summary]').textContent(),chart=await disclosure.innerText();
  await page.route('**/api/v1/ci/summary*',route=>route.fulfill({status:503,json:{error:'Fixture outage'}}));
  await page.route('**/api/v1/ci/tests*',route=>route.fulfill({status:503,json:{error:'Fixture outage'}}));
  const failed=evidenceResponses(page,503);
  await page.locator('[data-ob-refresh]').click();await failed;
  await page.waitForFunction(()=>{const status=document.querySelector('[data-ob-status]').textContent;return status.includes('Summary refresh failed')&&status.includes('Project refresh failed')&&!status.includes('Refreshing')&&document.querySelector('[data-ob-tests]').textContent.includes('Test history refresh failed');});
- assert.equal(await page.locator('[data-ob-summary]').innerText(),cards);
+ assert.equal(await page.locator('[data-ob-summary]').textContent(),cards);
  assert.equal(await disclosure.innerText(),chart);assert.equal(await disclosure.evaluate(n=>n.open),true);
  assert.equal(await page.locator('[data-ob-project]').getAttribute('aria-pressed'),'true');
  assert.match(await page.locator('[data-ob-status]').innerText(),/partial/i);
  assert.match(await page.locator('.ig-inspector').innerText(),/Run #3/);
  assert.equal(await page.locator('.ci-pipeline-step[data-step="12"]').getAttribute('aria-pressed'),'true');
- assert.match(await page.locator('[data-ob-tests]').innerText(),/test_status/);
+ assert.match(await page.locator('[data-ob-tests]').textContent(),/test_status/);
  assert.match(await page.locator('[aria-label="Step output"]').innerText(),/expected 200, got 500/);
  await page.unroute('**/api/v1/ci/summary*');await page.unroute('**/api/v1/ci/tests*');
  const recovered=evidenceResponses(page);

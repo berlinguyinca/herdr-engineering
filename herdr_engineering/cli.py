@@ -769,6 +769,8 @@ def _build_parser() -> argparse.ArgumentParser:
                     help="control-plane base URL (default: host.json control_plane_url)")
     p2.add_argument("--interval", type=float, default=0,
                     help="seconds between snapshot reads (default: 0 = once)")
+    p2.add_argument('--allow-open', action='store_true',
+                    help='Allow publication without a key to an intentionally open trusted-network server')
     p2.set_defaults(func=_cmd_cp_feed_pi)
     p2 = csub.add_parser("mission-feed", help="publish read-only live Pi mission activity")
     p2.add_argument("--control-plane", default=None,
@@ -806,7 +808,7 @@ def _cmd_cp_feed_pi(args) -> int:
     from .control_plane.pi_snapshot import post_envelopes, snapshot_to_envelopes
     from .host_config import HostConfigUnavailable, resolve_control_plane
 
-    if not os.environ.get("HERDR_CP_INGEST_KEY", "").strip():
+    if not os.environ.get("HERDR_CP_INGEST_KEY", "").strip() and not args.allow_open:
         print("Set HERDR_CP_INGEST_KEY to an ingest-role API key", file=sys.stderr)
         return 2
     if not math.isfinite(args.interval) or args.interval < 0 or args.interval > 2 ** 31 - 1:
@@ -817,6 +819,7 @@ def _cmd_cp_feed_pi(args) -> int:
     except HostConfigUnavailable:
         print("Set --url or configure host.json control_plane_url", file=sys.stderr)
         return 2
+    previous_payloads = None
     while True:
         try:
             doc = json.loads(Path(args.snapshot).expanduser().read_text(encoding="utf-8"))
@@ -826,7 +829,11 @@ def _cmd_cp_feed_pi(args) -> int:
             print("Cannot read a valid Pi snapshot; check --snapshot and its schema", file=sys.stderr)
             return 2
         try:
-            posted = post_envelopes(url, None, envelopes)
+            payloads = [{key: value for key, value in envelope.items() if key != 'occurred_at'}
+                        for envelope in envelopes]
+            posted = (0 if previous_payloads == payloads else
+                      post_envelopes(url, None, envelopes, allow_open=args.allow_open))
+            previous_payloads = payloads
         except (ValueError, RuntimeError):
             print("Snapshot ingest failed; check --url and HERDR_CP_INGEST_KEY", file=sys.stderr)
             return 1

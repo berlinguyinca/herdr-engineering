@@ -27,7 +27,11 @@ from uuid import uuid4
 from ..host_policy import HostPolicy, HostSnapshot, PolicyMode, normalize_aliases
 from ..llm_session_id import dashboard_form
 from . import llm_stats
-from .agent_identity import AgentIdentityConflict, AgentIdentityRegistry
+from .agent_identity import (
+    AgentIdentityConflict,
+    AgentIdentityRegistry,
+    AgentIdentityVersionConflict,
+)
 from .deployment_actions import ENTITY_TYPE as DEPLOYMENT_REQUEST_ENTITY
 from .deployment_actions import ForceRequests
 from .deployment_coordinator import ENTITY_TYPE as DEPLOYMENT_PLAN_ENTITY
@@ -41,6 +45,7 @@ from .graph import GraphProjection
 from .graph import _lseq as _graph_lseq
 from .graph import _rank as _graph_rank
 from .graph import from_stored as _graph_from_stored
+from .history_cursor import fingerprint
 from .host_metrics_store import ENTITY_TYPE as HOST_METRICS_ENTITY
 from .host_metrics_store import STATE_KEYS as HOST_STATE_KEYS
 from .host_metrics_store import HostMetricsStore, clean_metrics, clean_state
@@ -196,8 +201,10 @@ class ControlPlaneRepo:
         self._event_lock = threading.RLock()
         self._agent_projection_lock = threading.RLock()
         self._agent_records = {}
+        self._agent_identity_history = []
         self._agent_sequence = 0
         self._sink = sink
+        self._durable_history = None
         self._now = now or (lambda: time.time())
         self._missions = {}
         self._sessions = {}
@@ -233,7 +240,8 @@ class ControlPlaneRepo:
         self.collab_quarantine_reasons = []
         self.collab_quarantine = []  # foreign 'collab' rows found at startup (never replayed)
         self._collab_replay = []  # durable HCN events diverted out of the shared streams
-        self.agent_identities = AgentIdentityRegistry(persist=self._persist_agent_projection)
+        self.agent_identities = AgentIdentityRegistry(persist=self._persist_agent_projection,
+            verify_noop=bool(getattr(self._sink, "verify_agent_identity_noop", False)))
         # Agent inspector (spec 0200): bounded per-session detail projection.
         self.inspector = InspectorStore.from_config(inspector_limits, persist=self._persist_inspector)
         self.mission_activity = MissionActivityStore(now=self._now)
@@ -572,7 +580,7 @@ class ControlPlaneRepo:
             profile = self.agent_identities.get(record["session_id"])
             return {**record, "display_name": record["session_id"], "agent_handle": None,
                     "name_version": profile["version"],
-                    "name_error": "Saved agent name conflicts with another identity; using the session ID until renamed."}
+                    "name_error": "Saved agent name has conflicting reservations or versions; using the session ID until renamed."}
         return {**record, "display_name": profile["display_name"],
                 "agent_handle": profile["handle"], "name_version": profile["version"]}
 
@@ -596,9 +604,26 @@ class ControlPlaneRepo:
                 required = getattr(self._sink, "record_required", None)
                 if not callable(required):
                     raise RuntimeError("agent projections require acknowledged persistence")
-                required(event)
-            self._agent_sequence = sequence
-            self._agent_records[(event["entity_type"], event["entity_id"])] = event
+                try:
+                    acknowledged = required(event)
+                except AgentIdentityVersionConflict as error:
+                    current = getattr(error, "current_event", None)
+                    if isinstance(current, dict) and current.get("entity_id") == event["entity_id"]:
+                        self._remember_agent_projection(copy.deepcopy(current))
+                    raise
+                if event["entity_type"] == "agent_identity" and isinstance(acknowledged, dict):
+                    event = copy.deepcopy(acknowledged)
+                    sequence = int(event["sequence"])
+            self._remember_agent_projection(event)
+            if event["entity_type"] == "agent_identity":
+                return copy.deepcopy(event["payload"])
+
+    def _remember_agent_projection(self, event):
+        self._agent_sequence = max(self._agent_sequence, int(event["sequence"]))
+        self._agent_records[(event["entity_type"], event["entity_id"])] = event
+        if event["entity_type"] == "agent_identity":
+            if not any(old.get("event_id") == event.get("event_id") for old in self._agent_identity_history):
+                self._agent_identity_history.append(copy.deepcopy(event))
 
     def persist_agent_summary(self, event):
         sid = event["session_id"]
@@ -2683,6 +2708,8 @@ class ControlPlaneRepo:
                                             i['entity_id'] or ''))
 
     def stream(self, entity_type, entity_id):
+        if self._durable_history is not None and entity_type in {"host", "session", "service"}:
+            return self._durable_history.history_stream(entity_type, entity_id)
         return [_copy(e) for e in self._events.get((entity_type, entity_id), [])]
 
     def stream_page(self, entity_type, entity_id, *, limit=50, before=None):
@@ -2692,6 +2719,8 @@ class ControlPlaneRepo:
         the cursor stale instead of silently skipping history. Sequence numbers
         are metadata only: duplicates and gaps retain their stored ordering.
         """
+        if self._durable_history is not None and entity_type in {"host", "session", "service"}:
+            return self._durable_history.history_page(entity_type, entity_id, limit=limit, before=before)
         import base64
 
         if type(limit) is not int or not 1 <= limit <= 200:
@@ -2726,13 +2755,13 @@ class ControlPlaneRepo:
             stream = self._events.get((entity_type, entity_id), [])
             end = len(stream)
             if boundary is not None:
-                if boundary >= len(stream) or digest(stream[boundary]) != anchor:
+                if boundary >= len(stream) or fingerprint(stream[boundary]) != anchor:
                     raise ValueError("staleHistoryCursor")
                 end = boundary
             start = max(0, end - limit)
             next_cursor = None
             if start:
-                raw = json.dumps([1, start, identity, digest(stream[start])], separators=(",", ":")).encode()
+                raw = json.dumps([1, start, identity, fingerprint(stream[start])], separators=(",", ":")).encode()
                 next_cursor = base64.urlsafe_b64encode(raw).decode().rstrip("=")
             latest = stream[-1] if stream else {}
             return {"events": [_copy(event) for event in stream[start:end]],
@@ -3257,10 +3286,12 @@ class ControlPlaneRepo:
             "ci_sequence": self._ci_sequence,
             "ci_history_truncated": sorted(self._ci_history_truncated),
             "agent_projections": copy.deepcopy(list(self._agent_records.values())),
+            "agent_identity_history": copy.deepcopy(self._agent_identity_history),
         }
 
     def import_state(self, state):
         """Restore state from an export (used by restore tests / recovery)."""
+        self._durable_history = None
         phase = _BootPhases("import_state")
         self._missions = dict(state.get("missions", {}))
         self._sessions = dict(state.get("sessions", {}))
@@ -3339,14 +3370,15 @@ class ControlPlaneRepo:
         phase("delivery and CI history")
         # Replay durable naming reservations before any session is presented.
         # Summary continuity lives outside transcript retention and public feeds.
-        projections = list(state.get("agent_projections", []))
+        projections = list(state.get("agent_identity_history", [])) + list(state.get("agent_projections", []))
         self._agent_records = {}
+        self._agent_identity_history = []
         self._agent_sequence = 0
-        self.agent_identities = AgentIdentityRegistry(persist=self._persist_agent_projection)
         private_types = {"agent_identity", "agent_summary"}
         for key in [k for k in self._events if k[0] in private_types]:
             projections.extend(self._events.pop(key))
         self._event_order = [row for row in self._event_order if row[0] not in private_types]
+        seen_identity_events = {}
         for event in projections:
             if event.get("entity_type") not in private_types:
                 continue
@@ -3354,8 +3386,30 @@ class ControlPlaneRepo:
             key = (event["entity_type"], event["entity_id"])
             self._agent_records[key] = event
             self._agent_sequence = max(self._agent_sequence, int(event.get("sequence") or 0))
-        self.agent_identities.hydrate([event for (kind, _), event in self._agent_records.items()
-                                       if kind == "agent_identity"], quarantine_conflicts=True)
+            if event["entity_type"] == "agent_identity":
+                identity_key = event.get("event_id") or json.dumps(event, sort_keys=True, default=str)
+                previous = seen_identity_events.get(identity_key)
+                if previous is not None:
+                    if previous != event:
+                        raise ValueError("divergent private identity event")
+                    continue
+                seen_identity_events[identity_key] = event
+                self._agent_identity_history.append(copy.deepcopy(event))
+        self.agent_identities = AgentIdentityRegistry(persist=self._persist_agent_projection,
+            verify_noop=bool(getattr(self._sink, "verify_agent_identity_noop", False)))
+        self.agent_identities.hydrate(self._agent_identity_history, quarantine_conflicts=True,
+                                     tolerate_version_resets=True)
+        # Keep the acknowledged canonical event, even if a later stale observation
+        # has a lower optimistic version. Full history remains private for audit.
+        for identity, record in self.agent_identities._records.items():
+            for event in reversed(self._agent_identity_history):
+                payload = event["payload"]
+                if event["entity_type"] == "agent_identity" and all(
+                    payload.get(field) == record[field]
+                    for field in ("identity", "display_name", "handle", "version")
+                ):
+                    self._agent_records[("agent_identity", identity)] = event
+                    break
         if self.agent_identities.conflict_count:
             logging.getLogger(__name__).error(
                 "restored sessions with %d ambiguous agent names; aliases remain blocked and stable session IDs are shown until renamed",
