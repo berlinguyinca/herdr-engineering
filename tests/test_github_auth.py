@@ -188,7 +188,8 @@ def test_the_jwt_is_rs256_with_backdated_iat_and_a_valid_signature(gh, key_file,
 def test_only_read_permissions_are_ever_requested(gh, key_file):
     gh.token_route(11)
     tokens = _tokens(gh, key_file)
-    for bad in ({"contents": "write"}, {"administration": "read"}, {}):
+    for bad in ({"contents": "write"}, {"administration": "read"}, {"statuses": "read"},
+                {"checks": "read"}, {}):
         with pytest.raises(ValueError):
             tokens.token_for("InferWeave", bad)
     assert gh.requests == []
@@ -543,8 +544,9 @@ def test_release_evidence_uses_the_repo_owners_installation_token(gh, key_file):
     assert source(track, target, None) == ReleaseEvidence(target, True)
     posts = gh.posts()
     assert [p for _m, p, *_ in posts] == ["/app/installations/11/access_tokens"]
-    assert posts[0][3] == {"permissions": {"contents": "read", "metadata": "read"}}
-    issued = tokens.token_for("InferWeave")
+    assert posts[0][3] == {"permissions": {"contents": "read", "metadata": "read"},
+                           "repositories": ["inferweave"]}     # limited to the one repository
+    issued = tokens.token_for("InferWeave", repositories=["inferweave"])
     reads = [a for m, p, a, _b in gh.requests if m == "GET"]
     assert reads and all(a == f"Bearer {issued}" for a in reads)
 
@@ -754,3 +756,72 @@ def test_the_cache_still_uses_a_static_token():
     provider = GitHubProvider(credentials=creds, client=client)
     assert provider.repositories_page()[0] == "me"
     assert client.seen[0][0] == "Bearer ghp_static_token_value"
+
+
+# ------------------------------------------------------------------ review follow-ups
+def test_a_token_can_be_limited_to_repositories_and_is_cached_per_repo_set(gh, key_file):
+    gh.token_route(11)
+    tokens = _tokens(gh, key_file)
+    a = tokens.token_for("InferWeave", repositories=["inferweave"])
+    assert gh.posts()[0][3]["repositories"] == ["inferweave"]
+    assert tokens.token_for("InferWeave", repositories="inferweave") == a
+    b = tokens.token_for("InferWeave", repositories=["other"])
+    c = tokens.token_for("InferWeave")
+    assert len({a, b, c}) == 3 and len(gh.posts()) == 3
+    assert "repositories" not in gh.posts()[2][3]
+    for bad in ([], ["a/b"], [".."], ["x"] * 101):
+        with pytest.raises(ValueError):
+            tokens.token_for("InferWeave", repositories=bad)
+
+
+@pytest.mark.parametrize("mode,ok", [(0o600, True), (0o400, True), (0o700, False),
+                                     (0o500, False), (0o660, False)])
+def test_only_mode_0600_or_0400_is_accepted(gh, key_file, mode, ok):
+    os.chmod(key_file, mode)
+    gh.token_route(11)
+    tokens = _tokens(gh, key_file)
+    try:
+        assert (tokens.token_for("InferWeave") is not None) is ok
+    finally:
+        os.chmod(key_file, 0o600)
+    if not ok:
+        assert tokens.last_error["inferweave"] == "key_permissions" and gh.requests == []
+
+
+def test_a_key_owned_by_another_user_is_refused_except_for_root(gh, key_file, monkeypatch):
+    gh.token_route(11)
+    real = os.geteuid()
+    monkeypatch.setattr(ga.os, "geteuid", lambda: real + 1)
+    tokens = _tokens(gh, key_file)
+    assert tokens.token_for("InferWeave") is None
+    assert tokens.last_error["inferweave"] == "key_permissions" and gh.requests == []
+    monkeypatch.setattr(ga.os, "geteuid", lambda: 0)   # rootful docker: the container is root
+    assert _tokens(gh, key_file).token_for("InferWeave")
+
+
+def test_a_key_under_a_symlinked_directory_is_refused(gh, key_file, tmp_path):
+    linked = tmp_path / "linked-dir"
+    linked.symlink_to(os.path.dirname(key_file))
+    gh.token_route(11)
+    tokens = _tokens(gh, str(linked / "app.pem"))
+    assert tokens.token_for("InferWeave") is None
+    assert tokens.last_error["inferweave"] == "key_permissions" and gh.requests == []
+
+
+def test_a_missing_jwt_library_has_its_own_reason(gh, key_file, monkeypatch):
+    import sys
+    monkeypatch.setitem(sys.modules, "jwt", None)
+    gh.token_route(11)
+    tokens = _tokens(gh, key_file)
+    with pytest.raises(ga.GitHubAuthError) as info:
+        tokens.token_or_raise("InferWeave")
+    assert info.value.reason == "jwt_library_missing" and gh.requests == []
+
+
+def test_no_proxy_is_used_for_tokens_or_the_cache(gh, key_file):
+    import urllib.request
+    for opener in (_tokens(gh, key_file)._opener,
+                   GitHubProvider(token="ghp_static_token_value")._client):
+        # ProxyHandler({}) replaces the default (environment) proxy handler and adds none
+        assert not [h for h in opener.handlers
+                    if isinstance(h, urllib.request.ProxyHandler) and h.proxies]

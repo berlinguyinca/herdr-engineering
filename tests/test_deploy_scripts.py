@@ -1304,7 +1304,7 @@ def test_a_valid_github_app_key_dir_is_accepted_and_the_key_never_printed(env):
 @pytest.mark.parametrize("fault,needle", [
     ("dir_mode", "must be mode 0700"),
     ("extra_file", "must hold only github-app.pem"),
-    ("key_mode", "must not be readable by group or others"),
+    ("key_mode", "must be mode 0600 or 0400"),
     ("key_symlink", "must be a regular file"),
     ("dir_symlink", "must be a real directory"),
     ("key_dir", "must be a regular file"),

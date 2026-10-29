@@ -16,9 +16,11 @@ installation id once via ``GET /app/installations`` (cached), it never adds an o
 App token flow (fail closed: any failure is ``None``, never a partial credential):
 
 * A RS256 JWT is minted from the private key file (``iat`` backdated 60 s, ``exp`` 9 min ahead:
-  10 min span, GitHub's maximum). The key file is opened without following symlinks and refused
-  unless it is a regular file readable by its owner only (no group/world bits). The key bytes are
-  dropped as soon as the JWT is signed.
+  10 min span, GitHub's maximum). The key file is refused unless its path has no symlink
+  (resolved path == path, final component opened O_NOFOLLOW), it is a regular file of mode
+  exactly 0600 or 0400, and it is owned by the effective uid (root, e.g. the container under
+  rootful docker, may read a key owned by the host user). A missing PyJWT[crypto] is
+  ``jwt_library_missing``. The key bytes are dropped as soon as the JWT is signed.
 * ``POST /app/installations/{id}/access_tokens`` asks for explicit read-only permissions (a
   consumer passes its own minimal set; anything but ``read`` is refused before the call). The
   answer is validated: a ``ghs_`` token shape, a parsable ``expires_at`` at most 2 h ahead, and
@@ -75,16 +77,18 @@ CATALOG_PERMISSIONS = {"issues": "read", "metadata": "read"}
 #: The GitHub cache's Projects v2 sync (organization projects; items reference issues).
 PROJECTS_PERMISSIONS = {"issues": "read", "metadata": "read", "organization_projects": "read"}
 #: The only permissions herdr ever requests, and only at ``read``.
-ALLOWED_PERMISSIONS = frozenset({"contents", "metadata", "issues", "organization_projects",
-                                 "statuses", "checks", "pull_requests"})
+ALLOWED_PERMISSIONS = frozenset({"contents", "metadata", "issues", "organization_projects"})
 
 _TOKEN = re.compile(r"ghs_[A-Za-z0-9_]{16,1000}")
 _OWNER = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})")
+_REPO_NAME = re.compile(r"[A-Za-z0-9_.-]{1,100}")
+MAX_REPOSITORIES = 100
 _MESSAGES = {
     "invalid_config": "github.app is invalid; fix the YAML configuration.",
     "key_permissions": "The GitHub App private key file must be a regular file with mode 0600.",
     "key_unreadable": "The GitHub App private key file could not be read.",
     "key_invalid": "The GitHub App private key could not sign a token.",
+    "jwt_library_missing": "PyJWT[crypto] is not installed: GitHub App tokens cannot be minted.",
     "unknown_owner": "No GitHub App installation is configured for this owner.",
     "authentication": "GitHub rejected the App credential.",
     "permission": "GitHub denied the requested App permissions.",
@@ -139,6 +143,17 @@ def owner_of(repo) -> str | None:
     if len(parts) != 2 or not _OWNER.fullmatch(parts[0]):
         return None
     return parts[0].lower()
+
+
+def _repositories(value) -> tuple:
+    """Repository names (no owner) a token is limited to; () = the installation's own scope."""
+    if value is None:
+        return ()
+    names = [value] if isinstance(value, str) else list(value)
+    if not names or len(names) > MAX_REPOSITORIES or not all(
+            isinstance(n, str) and _REPO_NAME.fullmatch(n) and n not in (".", "..") for n in names):
+        raise ValueError("repositories must be 1-100 repository names")
+    return tuple(sorted({n.lower() for n in names}))
 
 
 def _permissions(value) -> dict:
@@ -198,8 +213,16 @@ def parse_app_config(raw) -> AppAuthConfig:
     return AppAuthConfig(app_id, os.path.normpath(path), tuple(sorted(table.items())))
 
 
+KEY_MODES = (0o600, 0o400)
+
+
 def read_private_key(path) -> bytes:
-    """The PEM bytes; refuses symlinks, non-regular files and any group/world permission bit."""
+    """The PEM bytes. Refused (``key_permissions``): a symlink anywhere in the path (the
+    resolved path must equal it), a non-regular file, a mode other than exactly 0600/0400, and
+    an owner other than the effective uid, except for root (rootful docker runs the container
+    as root while the bind-mounted key keeps its host owner; root can read any file anyway)."""
+    if not isinstance(path, str) or os.path.realpath(path) != os.path.normpath(path):
+        raise GitHubAuthError("key_permissions")
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
                      | getattr(os, "O_NONBLOCK", 0))
@@ -208,7 +231,9 @@ def read_private_key(path) -> bytes:
         raise GitHubAuthError(reason) from None
     try:
         info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode) or info.st_mode & 0o077:
+        euid = os.geteuid()
+        if not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) not in KEY_MODES \
+                or (euid != 0 and info.st_uid != euid):
             raise GitHubAuthError("key_permissions")
         data = b""
         while len(data) <= MAX_KEY_BYTES:
@@ -229,11 +254,17 @@ def read_private_key(path) -> bytes:
 
 def mint_jwt(app_id, key_file, now) -> str:
     """A RS256 App JWT: ``iat`` = now - 60 s, ``exp`` = now + 540 s, ``iss`` = the App id."""
+    try:
+        import jwt  # PyJWT[crypto] (the review-gate/collab extra), imported lazily
+        from jwt.algorithms import has_crypto
+    except ImportError:
+        jwt = None
+        has_crypto = False
+    if jwt is None or not has_crypto:
+        raise GitHubAuthError("jwt_library_missing")
     pem = read_private_key(key_file)
     encoded, failed = None, False
     try:
-        import jwt  # PyJWT[crypto] (the review-gate/collab extra), imported lazily
-
         issued = int(now)
         encoded = jwt.encode({"iat": issued - JWT_BACKDATE_S, "exp": issued + JWT_AHEAD_S,
                               "iss": str(app_id)}, pem, algorithm="RS256")
@@ -284,7 +315,9 @@ class GitHubAppTokens:
                  wall=time.time, timeout=CALL_TIMEOUT_S):
         self.config = config
         self._api = _check_api(api)
-        self._opener = opener or urllib.request.build_opener(_NoRedirect())
+        # no proxy (a proxy would see the JWT and the token) and no redirects
+        self._opener = opener or urllib.request.build_opener(urllib.request.ProxyHandler({}),
+                                                             _NoRedirect())
         self._clock = clock
         self._wall = wall
         self._timeout = min(float(timeout), CALL_TIMEOUT_S)
@@ -311,20 +344,22 @@ class GitHubAppTokens:
         return f"GitHubAppTokens(app_id={self.config.app_id})"
 
     # -- the interface
-    def token_for(self, owner, permissions=None) -> str | None:
-        """An installation token for ``owner`` with ``permissions`` (read only), or None."""
+    def token_for(self, owner, permissions=None, repositories=None) -> str | None:
+        """An installation token for ``owner`` with ``permissions`` (read only), limited to
+        ``repositories`` (names under that owner) when the caller knows them; or None."""
         try:
-            return self.token_or_raise(owner, permissions)
+            return self.token_or_raise(owner, permissions, repositories)
         except GitHubAuthError:
             return None
 
-    def token_or_raise(self, owner, permissions=None) -> str:
+    def token_or_raise(self, owner, permissions=None, repositories=None) -> str:
         perms = _permissions(permissions if permissions is not None else EVIDENCE_PERMISSIONS)
+        repos = _repositories(repositories)
         owner = owner.lower() if isinstance(owner, str) else None
         if owner not in dict(self.config.installations):
             raise GitHubAuthError("unknown_owner")
-        key = (owner, tuple(sorted(perms.items())))
-        return self._single_flight(key, lambda: self._mint(owner, perms))
+        key = (owner, tuple(sorted(perms.items())), repos)
+        return self._single_flight(key, lambda: self._mint(owner, perms, repos))
 
     def invalidate(self, owner) -> None:
         """Drop every cached token of ``owner`` (call on a 401 from GitHub with one of them)."""
@@ -396,11 +431,14 @@ class GitHubAppTokens:
             log.warning("GitHub App: no installation token for %s: %s", owner, _MESSAGES[reason])
 
     # -- minting
-    def _mint(self, owner, perms):
+    def _mint(self, owner, perms, repos=()):
         iid = self._installation_id(owner)
         jwt_value = mint_jwt(self.config.app_id, self.config.private_key_file, self._wall())
+        body = {"permissions": perms}
+        if repos:
+            body["repositories"] = list(repos)
         status, _headers, raw = self._call("POST", f"/app/installations/{iid}/access_tokens",
-                                           jwt_value, {"permissions": perms})
+                                           jwt_value, body)
         jwt_value = None  # noqa: F841
         if status not in (200, 201):
             raise GitHubAuthError("invalid_response")
@@ -419,7 +457,7 @@ class GitHubAppTokens:
             raise GitHubAuthError("invalid_response")
         return token, self._clock() + min(remaining, MAX_TOKEN_LIFETIME_S) - REFRESH_MARGIN_S
 
-    _DISCOVERY = ("", (("discovery", "read"),))
+    _DISCOVERY = ("", (("discovery", "read"),), ())
 
     def _installation_id(self, owner):
         configured = dict(self.config.installations)[owner]
@@ -552,7 +590,7 @@ class StaticToken:
     def identity(self) -> str:
         return hashlib.sha256((self._token or "").encode()).hexdigest()
 
-    def token_for(self, owner=None, permissions=None) -> str | None:
+    def token_for(self, owner=None, permissions=None, repositories=None) -> str | None:
         return self._token
 
     def invalidate(self, owner=None) -> None:
@@ -575,7 +613,7 @@ class NoCredentials:
     def identity(self) -> str:
         return hashlib.sha256(b"").hexdigest()
 
-    def token_for(self, owner=None, permissions=None):
+    def token_for(self, owner=None, permissions=None, repositories=None):
         return None
 
     def invalidate(self, owner=None) -> None:

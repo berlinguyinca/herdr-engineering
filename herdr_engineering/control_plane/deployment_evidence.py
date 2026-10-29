@@ -344,7 +344,9 @@ class GitHubReleaseEvidence:
         from ..github_auth import EVIDENCE_PERMISSIONS, owner_of
         provider = self._credentials()
         if getattr(provider, "mode", None) == "app":
-            token = provider.token_for(owner_of(repo), EVIDENCE_PERMISSIONS)
+            # the token is limited to this one repository
+            token = provider.token_for(owner_of(repo), EVIDENCE_PERMISSIONS,
+                                       repositories=[repo.split("/")[-1]])
             if not _token_ok(token):
                 raise _Fail("no GitHub App installation token")
             return token, provider

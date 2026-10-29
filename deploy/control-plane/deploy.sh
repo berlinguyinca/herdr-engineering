@@ -42,8 +42,8 @@
 # GitHub App key (optional, fleet config `github.app`): ~/.config/herdr-engineering/github-app/
 # is mounted read-only at /etc/herdr/github-app/ into control-plane-web (the only service
 # that reads GitHub). It must be a real 0700 directory owned by the deploying user holding
-# nothing or exactly one regular file `github-app.pem` (no symlink, owner-only mode, e.g.
-# 0600), else the deploy refuses before building. A missing directory is created empty
+# nothing or exactly one regular file `github-app.pem` (no symlink, owned by the deploying
+# user, mode exactly 0600 or 0400), else the deploy refuses before building. A missing directory is created empty
 # (0700) on a real deploy. The container runs as root (rootless docker: as the deploying
 # user), so an owner-only file is readable there, exactly like the fleet file: never
 # loosen its mode. Set `github.app.private_key_file: /etc/herdr/github-app/github-app.pem`.
@@ -126,8 +126,8 @@ check_github_app_dir() {   # nothing printed but names; never the key
     echo "$f must be owned by the deploying user (uid $(id -u))" >&2; return 1
   fi
   mode="$(stat -c %a "$f")"
-  if [ "$(( 8#$mode & 8#077 ))" != 0 ]; then
-    echo "$f must not be readable by group or others (it is $mode): chmod 600 $f" >&2; return 1
+  if [ "$mode" != 600 ] && [ "$mode" != 400 ]; then
+    echo "$f must be mode 0600 or 0400 (it is $mode): chmod 600 $f" >&2; return 1
   fi
 }
 check_github_app_dir || exit 1

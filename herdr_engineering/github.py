@@ -187,7 +187,9 @@ class GitHubProvider:
             else:
                 value = creds.token_for(None)
         self._token = value if github_auth.static_token_ok(value) else None
-        self._client = client or urllib.request.build_opener(_NoRedirect())
+        # no proxy (it would see the bearer) and no redirects
+        self._client = client or urllib.request.build_opener(urllib.request.ProxyHandler({}),
+                                                             _NoRedirect())
         self.rate_limit = None
         self.last_cost = None  # the last call's reported rateLimit.cost (None: not reported)
 

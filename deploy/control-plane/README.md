@@ -330,29 +330,33 @@ github:
   projects then read as unavailable, fail closed). **Commit statuses, Checks and Actions are not needed**: no herdr reader fetches them (CI green
   comes from herdr's own CI record). Every token request names its permissions explicitly and only at `read`:
   evidence `{contents, metadata}`, cache `{issues, metadata}`, Projects `{issues, metadata, organization_projects}`.
-  A grant broader than `read` in GitHub's answer is refused.
+  A grant broader than `read` in GitHub's answer is refused, and herdr can request nothing outside those four
+  permissions. The evidence token is further limited to the one repository it reads (`repositories: [<name>]`).
 - **Precedence.** With `app` set the App wins for every read and one warning is logged when `token` is also set.
   An invalid `app` block means *no* credential (fail closed), never a silent fallback to `token`. Without `app`,
   `github.token` works exactly as before. `deployment_escalation.issues` (an issue **write**) always uses
   `github.token`; the App is never given write access.
 - **Owners.** A request uses the installation of the repository's owner. Only owners listed under
   `installations` get a token (`auto` resolves an id, it never adds an owner); any other owner reads as unknown.
+  **Keep the App private** (installable only by its owning account): `auto` matches installations by account
+  login, so a public App installed by other accounts must never be relied on; prefer explicit ids.
 - **Tokens.** A RS256 JWT (`iat` backdated 60 s, 10 min span) is exchanged at
   `POST /app/installations/{id}/access_tokens`; the token is cached per owner and permission set until 5 min
   before it expires (validity anchored to the monotonic clock, capped at 1 h). Refreshes are single-flight, each
   call is bounded to 10 s, redirects are never followed, the answer is validated (`ghs_` token, `expires_at`),
   a 403/429 rate limit backs off for its reset (at most 15 min) and any other failure for 30 s. A 401 from a read
   drops that owner's cached token. Any failure means no token: evidence is unknown, the cache reports GitHub
-  unavailable.
-- **Secrets.** The key is read from the file only when a JWT is minted; a group/world-readable file or a symlink
-  is refused. The key, the JWT and installation tokens never reach a log, an error, the state or the UI. Both
+  unavailable. No HTTP proxy is used (environment proxies are ignored), so no proxy sees the JWT or a token.
+- **Secrets.** The key is read from the file only when a JWT is minted. It is refused unless it is a regular
+  file of mode exactly 0600 or 0400, with no symlink anywhere in its path, owned by the reading process's uid;
+  root (the container under rootful docker) may read the key that keeps its host owner. The key, the JWT and installation tokens never reach a log, an error, the state or the UI. Both
   readers run in `control-plane-web`, which alone mounts `~/.config/herdr-engineering/github-app/` read-only at
   `/etc/herdr/github-app/` (the fleet directory may hold only `fleet-config.yaml`). `deploy.sh` refuses to deploy
   unless that directory is a real 0700 directory owned by the deploying user holding nothing or exactly one
-  regular file `github-app.pem`, owned by that user with no group/world bits (0600); a missing directory is
+  regular file `github-app.pem`, owned by that user, mode 0600 or 0400; a missing directory is
   created empty. Like the fleet file, the key stays owner-only: the container runs as root (rootless docker: as
   the deploying user), so it can read it; never loosen the mode. Needs `PyJWT[crypto]` (the image's `review-gate`/`collab` extras
-  already install it). The loader validates the block's structure (`herdr-eng fleet config validate`), not the
+  already install it; without it every token fails as `jwt_library_missing`). The loader validates the block's structure (`herdr-eng fleet config validate`), not the
   key file, which only the control-plane container can see.
 - **The cache under the App** lists each configured owner's repositories (`repositoryOwner`, not `viewer`), and
   its catalog identity is the App's (not the hourly token), so token rotation does not purge it. Switching

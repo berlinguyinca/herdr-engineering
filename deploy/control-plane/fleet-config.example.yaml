@@ -199,8 +199,9 @@ sections:
       # Actions are NOT needed (no herdr reader fetches them). Each reader asks GitHub for only
       # its own subset: evidence {contents, metadata}, cache {issues, metadata}
       # (+ organization_projects for Projects v2).
-      # private_key_file: absolute path on the control-plane host, a regular file, mode 0600
-      # (group/world bits or a symlink are refused). Put the key at
+      # private_key_file: absolute path inside control-plane-web, a regular file, mode exactly
+      # 0600 or 0400, owned by the reading uid (root may read the host user's key), no symlink
+      # in the path. Keep the App private (`auto` matches installations by account login). Put the key at
       # ~/.config/herdr-engineering/github-app/github-app.pem (dir 0700, owned by the deploying
       # user): deploy.sh validates it and mounts that dir read-only into control-plane-web at
       # /etc/herdr/github-app (NOT the fleet dir: only fleet-config.yaml is allowed there).
