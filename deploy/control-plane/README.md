@@ -62,7 +62,10 @@ herdr-eng fleet config init --from-env ~/.config/herdr-engineering/control-plane
 #    the commit in the running image's receipt with THAT commit's compose files and
 #    says honestly whether the rollback came back healthy (exit 1) or not (exit 3);
 #    the very first deploy of the central config has no automatic rollback (see
-#    docs/operations/central-config-cutover.md)
+#    docs/operations/central-config-cutover.md). One deploy runs at a time
+#    (deploys/deploy.lock, --deploy-lock-wait); with collab it also holds collab-sync's
+#    lock (--collab-lock-wait) and recreates collab-public exactly once. A service
+#    container found missing is recreated, also by a rollback.
 deploy/control-plane/deploy.sh --dry-run        # validate, render to a temp dir, `docker compose config -q`
 deploy/control-plane/deploy.sh                  # --ref, --no-fetch, --fleet-config PATH
 

@@ -585,11 +585,11 @@ def render_mermaid(source: str) -> tuple[str, str]:
 
 _DECK_CSS = (
     ":root{color-scheme:light dark}"
-    "body{margin:0;font:20px/1.5 system-ui,sans-serif;background:Canvas;color:CanvasText}"
+    "body{margin:0;font:clamp(18px,2.2vw,32px)/1.5 system-ui,sans-serif;background:Canvas;color:CanvasText}"
     "section{min-height:100vh;box-sizing:border-box;padding:4rem min(8vw,6rem);display:flex;"
     "flex-direction:column;justify-content:center;border-bottom:1px solid color-mix(in srgb,CanvasText 20%,Canvas)}"
     "html{scroll-snap-type:y proximity}section{scroll-snap-align:start}"
-    "h1{font-size:2.4rem}h2{font-size:1.8rem}"
+    "h1{font-size:2.6em;line-height:1.15}h2{font-size:1.9em;line-height:1.2}li{margin:.25em 0}"
     "pre{overflow:auto;padding:.75rem;background:color-mix(in srgb,CanvasText 8%,Canvas)}"
     "table{border-collapse:collapse}th,td{border:1px solid color-mix(in srgb,CanvasText 25%,Canvas);padding:.3rem .6rem}"
     ".n{position:absolute;right:1rem;margin-top:-3rem;opacity:.5;font-size:.8rem}")

@@ -223,9 +223,12 @@ class PostgresSource(DurableSource):
         checkpoint = (await load_checkpoint_events(conn)
                       if self._events_table == "fabric_events" else None)
         if checkpoint is not None:
-            # The checkpoint carries every inspector row, so no snapshot skip applies to it.
+            # The checkpoint carries every inspector row, so nothing is skipped; the snapshot still saves the replay of
+            # the rows below its watermark (the repo counts them in the loaded events and refuses a mismatch).
             snapshot["events"], self.recovery_metrics = checkpoint
-            snapshot["inspector_snapshot"] = None
+            row, _ = await self._inspector_snapshot_row(conn)
+            snapshot["inspector_snapshot"] = (
+                {k: v for k, v in row.items() if k not in ("covered_count", "skipped_upto")} if row else None)
             return snapshot
         inspector_row, skip_upto = await self._inspector_snapshot_row(conn)
         query = _recovery_events_sql(self._events_table, skip_upto)
