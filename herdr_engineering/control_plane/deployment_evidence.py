@@ -38,9 +38,11 @@ Safety rules:
   clamped to [FAILURE_RETRY_S, RATE_LIMIT_MAX_S]. API reads send If-None-Match with the
   ETag of the last body that parsed; a 304 re-parses and re-validates that body, and a
   304 without one is a failure, so a 304 can never confirm anything a 200 did not.
-* The token is the server-held ``github.token`` (read on every refresh, so a change
-  applies live). It goes only to the API base, never into an error, a status or a log:
-  failures are recorded as fixed kinds.
+* The credential comes from ``github_auth.credentials()`` (read on every refresh, so a
+  change applies live): a GitHub App installation token for the repository's owner when
+  ``github.app`` is configured (read-only ``contents`` + ``metadata``), else the static
+  ``github.token``. It goes only to the API base, never into an error, a status or a log:
+  failures are recorded as fixed kinds. A 401 drops the owner's cached App token.
 * Any error is unknown (``ReleaseEvidence()``), never confirmed.
 """
 from __future__ import annotations
@@ -148,22 +150,26 @@ def _token_ok(value) -> bool:
             and all(32 < ord(c) < 127 for c in value))
 
 
-def _default_token():
-    from ..host_config import host_value
-    return host_value("github.token")
+def _default_credentials():
+    from ..github_auth import credentials
+    return credentials()
 
 
 class GitHubReleaseEvidence:
     """See the module docstring. ``definitions`` returns {component: Definition};
     ``executor(fn)`` runs a refresh (default: the daemon worker)."""
 
-    def __init__(self, definitions, *, token=None, api=API, opener=None, download_hosts=None,
-                 clock=time.monotonic, executor=None, timeout=CALL_TIMEOUT_S, wall=time.time):
+    def __init__(self, definitions, *, token=None, credentials=None, api=API, opener=None,
+                 download_hosts=None, clock=time.monotonic, executor=None, timeout=CALL_TIMEOUT_S,
+                 wall=time.time):
         parts = urllib.parse.urlsplit(api)
         if parts.scheme != "https" and not (parts.scheme == "http" and _loopback(parts.hostname)):
             raise ValueError("the GitHub API base must be https (plain http only to loopback)")
         self._definitions = definitions
-        self._token = token or _default_token
+        # ``token``: a zero-arg callable of a static token (tests, legacy); otherwise
+        # ``credentials``: a zero-arg callable of a ``token_for(owner, permissions)`` provider.
+        self._token = token
+        self._credentials = credentials or _default_credentials
         self._api = api.rstrip("/")
         self._opener = opener or urllib.request.build_opener(
             urllib.request.ProxyHandler({}), _NoRedirect())
@@ -331,10 +337,33 @@ class GitHubReleaseEvidence:
             log.warning("release evidence unavailable: %s", kind)
 
     # ------------------------------------------------------------ fetching
+    def _credential(self, repo):
+        """(token, provider); provider is None for a static ``token`` callable."""
+        if self._token is not None:
+            return self._token(), None
+        from ..github_auth import EVIDENCE_PERMISSIONS, owner_of
+        provider = self._credentials()
+        if getattr(provider, "mode", None) == "app":
+            token = provider.token_for(owner_of(repo), EVIDENCE_PERMISSIONS)
+            if not _token_ok(token):
+                raise _Fail("no GitHub App installation token")
+            return token, provider
+        return provider.token_for(owner_of(repo), EVIDENCE_PERMISSIONS), provider
+
     def _fetch(self, track, specs, target, plan):
-        token = self._token()
+        repo = track[0]
+        token, provider = self._credential(repo)
         if not _token_ok(token):
             raise _Fail("no GitHub token configured")
+        try:
+            return self._fetch_with(token, track, specs, target, plan)
+        except _Fail as exc:
+            if exc.kind == "GitHub HTTP 401" and provider is not None:
+                from ..github_auth import owner_of
+                provider.invalidate(owner_of(repo))
+            raise
+
+    def _fetch_with(self, token, track, specs, target, plan):
         repo, branch, _ctx = track
         commits = set()
         releases: dict = {}

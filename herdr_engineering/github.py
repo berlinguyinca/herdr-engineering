@@ -2,6 +2,12 @@
 
 GitHub GraphQL repositories/issues are separate connections: issue totals exclude
 pull requests. AutoSpec labels describe candidates, never execution admission.
+
+Credentials come from ``github_auth.credentials()``: with ``github.app`` every call uses the
+installation token of the owner it reads (repositories and issues: ``issues`` + ``metadata``
+read; Projects v2: also ``organization_projects`` read), the listing walks each configured
+owner (``repositoryOwner``) instead of ``viewer``, and the catalog identity is the App's (stable
+across hourly token rotation). Otherwise the static ``github.token`` works as before.
 """
 from __future__ import annotations
 
@@ -15,8 +21,10 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from collections import OrderedDict
 from datetime import UTC, datetime, timedelta
 
+from . import github_auth
 from .control_plane.project_links import (
     canonical_repository,
     project_for_repository,
@@ -36,6 +44,20 @@ primaryLanguage {name}
 issues(states:OPEN) {totalCount}
 newest: issues(first:1,orderBy:{field:UPDATED_AT,direction:DESC}) {nodes {updatedAt}} } } }
 rateLimit {remaining resetAt cost} }"""
+# The App listing: one configured owner's repositories (an installation token has no useful
+# viewer). Same node fields as REPOS_QUERY, so _connection/_repository parse it unchanged.
+OWNER_REPOS_QUERY = """query($login:String!,$cursor:String) { repositoryOwner(login:$login) { login
+repositories(first:100,after:$cursor,orderBy:{field:NAME,direction:ASC}) {
+totalCount pageInfo {hasNextPage endCursor} nodes {
+id nameWithOwner url isPrivate isArchived hasIssuesEnabled viewerPermission
+primaryLanguage {name}
+issues(states:OPEN) {totalCount}
+newest: issues(first:1,orderBy:{field:UPDATED_AT,direction:DESC}) {nodes {updatedAt}} } } }
+rateLimit {remaining resetAt cost} }"""
+# Projects v2 node id -> owner (the owner whose App token reads its items); bounded.
+_PROJECT_OWNERS: OrderedDict = OrderedDict()
+_PROJECT_OWNERS_LOCK = threading.Lock()
+PROJECT_OWNERS_MAX = 4096
 # GitHub's updatedAt can trail an event by a few seconds (G0 spike), so an
 # incremental read re-reads this much below the stored watermark.
 WATERMARK_OVERLAP = timedelta(seconds=10)
@@ -151,36 +173,69 @@ def _retry_at(headers):
 
 
 class GitHubProvider:
-    def __init__(self, *, token=None, client=None):
-        from .host_config import host_value
-        value = token if token is not None else host_value("github.token")
-        self._token = value if isinstance(value, str) and value and len(value) <= 16384 and all(32 < ord(c) < 127 for c in value) else None
+    """``token``: a static token (tests, legacy); otherwise ``credentials`` (default: the live
+    ``github_auth.credentials()``): a GitHub App provider or the static ``github.token``."""
+
+    def __init__(self, *, token=None, client=None, credentials=None):
+        self._app = None
+        if token is not None:
+            value = token
+        else:
+            creds = credentials if credentials is not None else github_auth.credentials()
+            if getattr(creds, "mode", None) == "app":
+                self._app, value = creds, None
+            else:
+                value = creds.token_for(None)
+        self._token = value if github_auth.static_token_ok(value) else None
         self._client = client or urllib.request.build_opener(_NoRedirect())
         self.rate_limit = None
         self.last_cost = None  # the last call's reported rateLimit.cost (None: not reported)
 
     @property
     def available(self):
-        return bool(self._token)
+        return bool(self._token) or self._app is not None
 
     @property
     def credential_identity(self):
+        if self._app is not None:
+            return self._app.identity
         return hashlib.sha256((self._token or "").encode()).hexdigest()
 
-    def _query(self, query, variables):
+    def _bearer(self, owner, permissions):
+        if self._app is None:
+            return self._token
+        try:
+            return self._app.token_or_raise(owner, permissions)
+        except github_auth.GitHubAuthError as exc:
+            if exc.reason == "rate_limited":
+                raise GitHubError("rate_limited", retry_at=time.time() + (exc.retry_s or 60)) from None
+            raise GitHubError("unavailable", message="No GitHub App installation token for this owner.") from None
+
+    def _query(self, query, variables, *, owner=None, permissions=github_auth.CATALOG_PERMISSIONS):
         if not self.available:
             raise GitHubError("not_configured")
         self.last_cost = None
+        bearer = self._bearer(owner, permissions)
+        try:
+            return self._post(query, variables, bearer)
+        except GitHubError as exc:
+            if exc.reason == "authentication" and self._app is not None:
+                self._app.invalidate(owner)
+            raise
+        finally:
+            bearer = None
+
+    def _post(self, query, variables, bearer):
         request = urllib.request.Request("https://api.github.com/graphql",
             data=json.dumps({"query": query, "variables": variables}).encode(), method="POST",
-            headers={"Authorization": f"Bearer {self._token}", "Content-Type": "application/json",
+            headers={"Authorization": f"Bearer {bearer}", "Content-Type": "application/json",
                      "Accept": "application/vnd.github+json", "User-Agent": "herdr-engineering"})
         try:
             with self._client.open(request, timeout=20) as response:
                 raw = response.read(MAX_RESPONSE + 1)
             if len(raw) > MAX_RESPONSE:
                 raise GitHubError("response_too_large")
-            payload = json.loads(raw.decode().replace(self._token, "[REDACTED]"))
+            payload = json.loads(raw.decode().replace(bearer, "[REDACTED]"))
             if not isinstance(payload, dict):
                 raise GitHubError("invalid_response")
             data = payload.get("data")
@@ -233,7 +288,41 @@ class GitHubProvider:
             raise GitHubError("invalid_response")
         return value
 
+    @property
+    def app_account(self):
+        """The catalog's account under App auth (not a GitHub login: it has a colon)."""
+        return f"github-app:{self._app.config.app_id}" if self._app is not None else None
+
+    def _app_repositories_page(self, cursor):
+        """The configured owners' repositories, owner by owner; the cursor is ``<index>:<inner>``."""
+        owners = list(self._app.owners)
+        index, inner = 0, None
+        if cursor is not None:
+            head, sep, rest = str(cursor).partition(":")
+            if not sep or not head.isdigit() or int(head) >= len(owners):
+                raise GitHubError("invalid_response")
+            index, inner = int(head), (rest or None)
+        login = owners[index]
+        data = self._query(OWNER_REPOS_QUERY, {"login": login, "cursor": inner}, owner=login)
+        node = data.get("repositoryOwner")
+        if not isinstance(node, dict):
+            raise GitHubError("not_found")
+        connection = self._connection(node.get("repositories"))
+        # an owner's listing can include repositories it does not own: never route them to it
+        nodes = [row for row in connection["nodes"] if isinstance(row, dict)
+                 and github_auth.owner_of(row.get("nameWithOwner")) == login]
+        info = connection["pageInfo"]
+        if info["hasNextPage"]:
+            page = {"hasNextPage": True, "endCursor": f"{index}:{info['endCursor']}"}
+        elif index + 1 < len(owners):
+            page = {"hasNextPage": True, "endCursor": f"{index + 1}:"}
+        else:
+            page = {"hasNextPage": False, "endCursor": None}
+        return self.app_account, {"totalCount": connection["totalCount"], "pageInfo": page, "nodes": nodes}
+
     def repositories_page(self, cursor=None):
+        if self._app is not None:
+            return self._app_repositories_page(cursor)
         data = self._query(REPOS_QUERY, {"cursor": cursor})
         viewer = data.get("viewer")
         if not isinstance(viewer, dict) or not isinstance(viewer.get("login"), str):
@@ -251,14 +340,16 @@ class GitHubProvider:
         return {"owner": parts[1], "name": parts[2]}
 
     def issues_page(self, repository_id, cursor=None):
-        data = self._query(ISSUES_QUERY, dict(self._repo_args(repository_id), cursor=cursor))
+        args = self._repo_args(repository_id)
+        data = self._query(ISSUES_QUERY, dict(args, cursor=cursor), owner=args["owner"].lower())
         repository = data.get("repository")
         if not isinstance(repository, dict):
             raise GitHubError("not_found")
         return self._connection(repository.get("issues"))
 
     def closed_issues_page(self, repository_id, since, cursor=None):
-        data = self._query(CLOSED_QUERY, dict(self._repo_args(repository_id), since=since, cursor=cursor))
+        args = self._repo_args(repository_id)
+        data = self._query(CLOSED_QUERY, dict(args, since=since, cursor=cursor), owner=args["owner"].lower())
         repository = data.get("repository")
         if not isinstance(repository, dict):
             raise GitHubError("not_found")
@@ -267,7 +358,8 @@ class GitHubProvider:
     def issue(self, repository_id, number):
         if not isinstance(number, int) or isinstance(number, bool) or number < 1:
             raise ValueError("issue number must be a positive integer")
-        data = self._query(DETAIL_QUERY, dict(self._repo_args(repository_id), number=number))
+        args = self._repo_args(repository_id)
+        data = self._query(DETAIL_QUERY, dict(args, number=number), owner=args["owner"].lower())
         repository = data.get("repository")
         if not isinstance(repository, dict) or not isinstance(repository.get("issue"), dict):
             raise GitHubError("not_found")
@@ -277,15 +369,29 @@ class GitHubProvider:
         """One page of an owner's Projects v2 (organization or user), newest ``updatedAt`` first."""
         if not isinstance(login, str) or not login:
             raise ValueError("login must name a GitHub owner")
-        data = self._query(PROJECTS_QUERY, {"login": login, "cursor": cursor})
+        data = self._query(PROJECTS_QUERY, {"login": login, "cursor": cursor}, owner=login.lower(),
+                           permissions=github_auth.PROJECTS_PERMISSIONS)
         owner = data.get("repositoryOwner")
         if not isinstance(owner, dict):
             raise GitHubError("not_found")
-        return self._connection(owner.get("projectsV2"))
+        connection = self._connection(owner.get("projectsV2"))
+        with _PROJECT_OWNERS_LOCK:
+            for row in connection["nodes"]:
+                if isinstance(row, dict) and isinstance(row.get("id"), str):
+                    _PROJECT_OWNERS[row["id"]] = login.lower()
+                    _PROJECT_OWNERS.move_to_end(row["id"])
+            while len(_PROJECT_OWNERS) > PROJECT_OWNERS_MAX:
+                _PROJECT_OWNERS.popitem(last=False)
+        return connection
 
     def project_items_page(self, project_id, cursor=None):
         """One page of a project's items, in board position order."""
-        data = self._query(PROJECT_ITEMS_QUERY, {"id": project_id, "cursor": cursor})
+        with _PROJECT_OWNERS_LOCK:
+            owner = _PROJECT_OWNERS.get(project_id) if isinstance(project_id, str) else None
+        if self._app is not None and owner is None:
+            raise GitHubError("not_found")  # whose installation would read it is unknown: fail closed
+        data = self._query(PROJECT_ITEMS_QUERY, {"id": project_id, "cursor": cursor}, owner=owner,
+                           permissions=github_auth.PROJECTS_PERMISSIONS)
         node = data.get("node")
         if not isinstance(node, dict):
             raise GitHubError("not_found")
@@ -1227,7 +1333,7 @@ class GitHubMonitor:
         with self._lock:
             owners = set(listed if listed is not None else self._view["scope"]["owners"])
             account = self._view.get("account")
-        if isinstance(account, str) and account:
+        if isinstance(account, str) and account and ":" not in account:  # not the App's account
             owners.add(account.lower())
         return sorted(owners)
 
