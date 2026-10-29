@@ -155,6 +155,20 @@ def _runtime(value):
     return {k: v for k, v in out.items() if v is not None}
 
 
+class _BootPhases:
+    """Logs how long each startup phase takes, so a slow boot says where the time went."""
+
+    def __init__(self, name):
+        self._log = logging.getLogger(__name__)
+        self._name = name
+        self._start = self._last = time.monotonic()
+
+    def __call__(self, phase):
+        now = time.monotonic()
+        self._log.info("boot %s: %s took %.1fs (total %.1fs)", self._name, phase, now - self._last, now - self._start)
+        self._last = now
+
+
 class ControlPlaneRepo:
     """In-memory structured control-plane state with event sequencing."""
 
@@ -3169,6 +3183,7 @@ class ControlPlaneRepo:
 
     def import_state(self, state):
         """Restore state from an export (used by restore tests / recovery)."""
+        phase = _BootPhases("import_state")
         self._missions = dict(state.get("missions", {}))
         self._sessions = dict(state.get("sessions", {}))
         self._services = dict(state.get("services", {}))
@@ -3198,6 +3213,7 @@ class ControlPlaneRepo:
             t, i = key.split("|")
             self._events[(t, i)] = [dict(e) for e in stream]
         self._event_order = [tuple(x) for x in state.get("event_order", [])]
+        phase("copy event streams")
         # Scheduler reservations are event-sourced, so a restart can recover
         # even when the structured export contains only the event streams.
         self._scheduler_observations = {}
@@ -3224,8 +3240,11 @@ class ControlPlaneRepo:
                 payload = _payload(event)
                 if payload:
                     self._scheduler_reservations[entity_id] = _deep_copy(payload)
+        phase("scheduler state")
         self.ledger.hydrate([e for stream in self._events.values() for e in stream])
+        phase("ledger")
         self._rebuild_graph()
+        phase("lineage graph")
         if not delivery_present:
             # The bridge durable-reload path restores event streams but carries no
             # delivery snapshot; rebuild the projections from those streams so
@@ -3239,6 +3258,7 @@ class ControlPlaneRepo:
         self._ci_test_projection = None
         self._ci_history_truncated = set(state.get('ci_history_truncated', []))
         self._trim_ci_history()
+        phase("delivery and CI history")
         # Replay durable naming reservations before any session is presented.
         # Summary continuity lives outside transcript retention and public feeds.
         projections = list(state.get("agent_projections", []))
@@ -3313,6 +3333,7 @@ class ControlPlaneRepo:
                 host = self._hosts.setdefault(entity_id, {"host_id": entity_id, "host_name": entity_id})
                 if policy.get("revision", -1) >= (host.get("scheduler_policy") or {}).get("revision", -1):
                     host["scheduler_policy"] = _deep_copy(policy)
+        phase("agent, inspector and host projections")
 
     def _rebuild_graph(self):
         """Replay stored ``lineage`` envelope rows into a fresh projection.
