@@ -326,6 +326,7 @@ class SchedulerService:
                 if lease is not None and lease.get("state") != "running":
                     raise RuntimeError("execution requires reconciliation before commit retry")
                 return row
+            self.scheduler = self._fresh_scheduler()
             self.scheduler.restore(rows)
             return self._commit(reservation_id)
 
