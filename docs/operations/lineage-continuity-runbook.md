@@ -9,10 +9,10 @@ reversible; nothing in this document needs an environment variable (YAML only).
 |---|---|
 | Lineage graph, scopes, replay | existing, unchanged semantics |
 | `read_lineage` assistant tool | merged in #365, behind `personal_assistant.enabled` and a per-assistant grant |
-| Artifact nodes in the graph | commit route and render-runner hook emit them; ACL read gate narrows visibility |
-| Email attachment -> artifact | control-plane function `intel_attachment_artifact.attach_to_artifact`; **not yet called by any route or job** |
-| CI failure -> repair -> re-review | covered by a test over existing pieces; the production loop is AutoSpec's (not changed here) |
-| Delivery metrics | in the room analytics read (`delivery` key); the assistant tool does not call it yet |
+| Artifact nodes in the graph | commit route, the render worker (HTTP poster -> `/artifact-jobs/<job>/lineage`) and the mail route emit them; ACL read gate narrows visibility; retract and backfill routes below |
+| Email attachment -> artifact | `POST /api/v1/artifacts/email-attachments` calls `intel_attachment_artifact.attach_to_artifact` (see "Artifact routes" below). **Nothing in the fleet calls that route yet**: `GmailSync` has no production constructor and its client protocol cannot fetch attachment bytes, so a person or script posts the message and bytes |
+| CI failure -> repair -> re-review | graph `validated` edges feed `decide_merge` through `graph_merge_gate` (YAML `control_plane.graph_merge_gate`, off by default); the production repair loop itself is AutoSpec's (not changed here) |
+| Delivery metrics | in the room analytics read (`delivery` key). **Not** exposed to the assistant tool, on purpose: see "Why the assistant cannot read delivery metrics" |
 
 ## Restart and replay
 The graph is a projection over stored `lineage` envelope rows. On start the repo rebuilds it (`ControlPlaneRepo._rebuild_graph`,
@@ -41,7 +41,8 @@ tests. Until those land an interrupted handoff needs a human decision.
   nodes to that principal immediately. A revoke or an expired grant hides them on the next read, also after a restart.
 * The graph label of an artifact event is stamped once and, for a shared (commons) node, only ever widens. So the label is
   `org` (fleet keys only; never a signed-in person) and the ACL gate does the narrowing. Nodes committed before this change are
-  `private` (committer only) and stay that way; there is no in-place widening. To expose an old artifact, commit a new version.
+  `private` (committer only); `POST /api/v1/artifacts/<id>/lineage/backfill` (admin) re-emits their stored versions under the
+  gated scope, see "Backfill" below. Without it, committing a new version also exposes the artifact.
 * A signed-in person sees an artifact node only when the ACL names exactly `user:<id>` AND the node carries a room/mission label
   that person's membership covers. The commit route does not know the room, so it never emits such a label; callers that do
   (`artifact_scope.visibility_fields(gated=True, room_id=..)`) get both checks. No such caller exists yet.
@@ -49,8 +50,77 @@ tests. Until those land an interrupted handoff needs a human decision.
 * Known limits from review, not fixed: `issue_lead_time` does not flag a clipped timeline per figure (only the top-level `timeline_truncated`);
   `_same_identity` ignores the key role in the ACL id; HTTP also honours a record's `created_by` and legacy ungranted reads, the graph
   gate uses explicit grants only (stricter); `rework.superseded` includes artifact-version supersessions; `install_gate(acl=None)` does not clear an old gate.
-* Retraction (`artifact_lineage.emit_retraction`) marks a version `retracted`; the version and its digests remain readable
-  by the same audience. There is **no HTTP route** for it yet.
+* Retraction now HIDES (see "Retract" below). `artifact_lineage.emit_retraction` alone is only the graph state marker
+  (version stays readable by its audience); the HTTP route does the hiding and writes that marker as an audit trail.
+
+## Artifact routes (all authenticated, all through the production gates)
+All are `POST` and need an operator-role key (the default for artifact mutations). Rows below say what else is required.
+
+### Retract: `POST /api/v1/artifacts/<id>/retract {"version_id"?, "reason"?}`
+* Needs ACL `admin` on the artifact. Body keys other than `version_id` and `reason` are a 400; an unknown version is a 404.
+* Effect: the artifact (or that version) disappears from EVERY graph read at the next read, for everyone (admins and owner
+  included; the registry still has it): node, version nodes and their `supersession`/`produced` edges (an edge needs both
+  endpoints). It also holds for as-of/replay reads and after `_rebuild_graph`, because the gate is evaluated against the
+  current projection. Retracting a version that is the head the logical node shows hides the logical node too (it carries that
+  version's id and digests); a later correction replaces the head and the logical node reappears for the ACL readers.
+* Durable: the registry keeps it (`artifacts.lifecycle='retracted'` for an artifact, `artifact_versions.state='retracted'` for a
+  version; no migration, both are free-text columns) and `cli.py` reloads it into the gate before the server serves a read
+  (`ArtifactStore.load_retractions`). Without a registry (in-memory server) the hide lasts until restart: the response says
+  `persisted: false`. The route hides FIRST and persists second: if persistence fails you get a 500 that says "hidden, but not
+  persisted" and the node stays hidden.
+* A retracted artifact refuses new versions (409) on the commit route, the worker lineage route and the mail correction route.
+  There is no un-retract route: it is a one-way operation by design; to restore, commit a new artifact.
+* Nothing is deleted: the stored versions, blobs, ACL rows and the event log remain. The graph also gets a bounded
+  `retracted` state marker (audit trail).
+
+### Backfill: `POST /api/v1/artifacts/<id>/lineage/backfill`
+* Needs ACL `admin`. For nodes recorded `private` before artifact scoping: re-emits each stored version, oldest first, under
+  the gated scope (`org`) and a new event source (`artbf-...`), so ACL readers see the history. Idempotent (a second run is
+  deduplicated); skips retracted versions and retracted artifacts. The caller needs the write gate's `edit` (admin implies it).
+* It widens the LABEL only; the ACL gate still decides who reads. Run it per artifact; there is no bulk "all artifacts" route.
+
+### Render worker: `POST /api/v1/artifact-jobs/<job>/lineage {"version_id"}`
+* The worker (`herdr-eng cp-worker`) holds a Postgres connection and the object store but no graph channel. After a durable
+  commit its `ArtifactRenderRunner` calls an HTTP poster built from the worker's `config.yaml`:
+  `control_plane.artifact_worker.lineage: {api_url, key_file, timeout_seconds}`. `key_file` is a file path (the key is never
+  inlined in YAML or read from the environment). Absent section = no poster = the old behaviour.
+* The server reads the version from the registry; the body carries only `version_id`. It requires: the job exists, the caller
+  holds `edit` on the job's artifact (give the worker key an ACL `edit` grant, or let it be the owner), the version belongs
+  to that artifact AND carries that job id, and the artifact/version is not retracted. Replays are deduplicated (idempotent).
+* A graph failure is a 502 and the worker logs it and moves on (the version is already durable; use Backfill to repair).
+
+### Mail attachment: `POST /api/v1/artifacts/email-attachments`
+* Body: `message` (the Gmail message object: id, threadId, payload), `part_path`, `account`, `data_base64`, `audience` (list of
+  ACL principal ids that may READ), optional `previous: {artifact_id, version_id}` for a correction. The owner is always the
+  authenticated caller (a body `owner`/`created_by` is a 400); readers get `read` only. Size cap 25 MiB decoded.
+* Triage decides first: quarantined/rejected bytes are never stored (422, reasons only). A redelivery of the same
+  (account, message, part, sha256) answers 200 `duplicate`; that guard is in memory and is lost on restart (a redelivery after
+  a restart creates a second artifact). A correction needs `edit` for the caller and cannot add readers (409).
+* Issue links appear only when project intelligence is enabled and a person confirmed the relationship for that message.
+* Config: nothing new; it needs the ACL, the registry and the object store that the other artifact routes need.
+
+## Graph evidence in the merge gate (`control_plane.graph_merge_gate`)
+In the central fleet file's `control_plane` section (the same file that carries `review_gate` and `project_intelligence`):
+```yaml
+control_plane:
+  graph_merge_gate:
+    enabled: true                  # default off; false (or removing the section) is a hot kill switch
+    evidence_writers: ["key:<12 hex of the CI reporter key>"]   # required; only these writers' edges count
+    required_checks: ["ci"]        # edges name their check in attrs.check, default "ci"
+    require_review_quorum: false   # true also needs the head-bound review quorum (control_plane.review_quorum)
+```
+* Runs for every PR after `decide_merge` (and the repair policy) allowed a merge, so it can only withhold. A `validated` edge
+  counts only if written by an evidence writer, bound (server-validated `binding.commit`) to the PR's exact head SHA, not stale
+  and not removed. Anything else is reported as "stale evidence ignored" and never passed on as a check: after a push the
+  required check is missing and the PR waits (a pending status), it is not rejected. An unknown conclusion is "pending".
+* Fail closed: a bad section, a missing PR node or any exception is `wait`. Once enabled, an unreadable central config also waits.
+* Reading needs the evidence to be `org`-visible or wider (private edges are invisible to the gate's reader by design).
+
+## Why the assistant cannot read delivery metrics
+`lineage_metrics` is computed from a collaboration ROOM snapshot (room membership, the room's evidence writers, k-anonymity
+suppression). The assistant's principal is an API key, which has no room membership; there is no reader-scoped way to build that
+snapshot from it, and building one from a contexts list the model or server supplies would widen visibility. So `read_lineage`
+has no metrics operation (a test pins that). Members read metrics from the room analytics route.
 
 ## Rollback
 All changes are additive; roll back in this order, each step safe on its own:
@@ -58,7 +128,8 @@ All changes are additive; roll back in this order, each step safe on its own:
 2. Revert the artifact-scope PR: artifact nodes are written `private` again and the gate is gone. Existing `org`-labelled
    artifact events stay in the log and, without the gate, would be visible to every fleet key. **Before reverting, re-label or
    accept that exposure**: the safe alternative is to leave the gate code in place and revoke grants.
-3. Revert the stack (#365 base last). No migration was added; no schema changes.
+3. Revert the stack (#365 base last). No migration was added; no schema changes. Retraction rows in `artifacts.lifecycle` /
+   `artifact_versions.state` stay in the registry harmlessly.
 
 ## Feature flags and grants (YAML)
 ```yaml

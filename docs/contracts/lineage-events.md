@@ -998,8 +998,15 @@ Additive; no new node or edge kind, no `lineage.v3`. Code: `artifact_lineage.py`
 * `artifact:<artifact_id>@<version_id>` (commons, same kind) is one immutable version. A version with a parent adds a
   `supersession` edge new -> old (kind already in the vocabulary). A correction is therefore a new version; nothing is overwritten.
 * `produced` producer -> `artifact:<id>` as before (best effort).
-* Retraction is `node.state` `retracted` (reason <= 200 characters) on the version node, and on the logical node when it was the
-  head. The version node keeps its digests and stays readable by the same audience.
+* `node.state` `retracted` (reason <= 200 characters) on the version node (and the logical node) is an AUDIT MARKER only.
+  What hides a retracted artifact or version is the read gate's retraction set (`ArtifactGraphGate.retract`, persisted in the
+  registry, reloaded at start), written by `POST /api/v1/artifacts/<id>/retract`; it hides the nodes and their edges from every
+  reader, in every replay. `emit_retraction` on its own leaves the version readable by its audience.
+* Event sources: real registry ids are longer than the 32 characters a source may have, and one writer may use only 4 distinct
+  sources on one node, so the logical node uses ONE stable source per artifact (`art-<sha256(artifact_id)[:20]>`) with
+  sequence `version_number*10+1`; objects that belong to one version use `artv-<sha256(version_id)[:20]>`; the backfill uses
+  `artbf`/`artbfv`; mail conversation nodes use `mail-<sha256(thread_node)[:20]>`. (Earlier code used `art-<version_id>`, which
+  the ingest refused for real ids: such commits recorded no lineage.)
 
 ### Why a read-time gate (decision, replaces "private only")
 Scope never widens for an existing object, and for a COMMONS node a writer's labels only ever widen, so an ACL change cannot be

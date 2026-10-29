@@ -19,7 +19,10 @@ import pytest
 from herdr_engineering.control_plane.api import ControlPlaneServer
 from herdr_engineering.control_plane.artifact_acl import ArtifactAcl
 from herdr_engineering.control_plane.artifact_jobs import ArtifactJobManager
-from herdr_engineering.control_plane.artifact_lineage import emit_version_lineage, lineage_poster_from_section
+from herdr_engineering.control_plane.artifact_lineage import (
+    emit_version_lineage,
+    lineage_poster_from_section,
+)
 from herdr_engineering.control_plane.repo import ControlPlaneRepo
 
 DIGEST = "c" * 64
@@ -344,7 +347,7 @@ def test_the_poster_config_is_strict(section):
 
 def test_the_render_runner_hook_can_be_the_poster(world, tmp_path):
     """ArtifactRenderRunner(lineage=poster): the exact production wiring of `_cmd_cp_worker`."""
-    from tests.control_plane.test_artifact_render_lineage import _Renderer, _RustFS, _Store, _job
+    from tests.control_plane.test_artifact_render_lineage import _job, _Renderer, _RustFS, _Store
     w = world
     grant_owner(w)
     share_with_reader(w)

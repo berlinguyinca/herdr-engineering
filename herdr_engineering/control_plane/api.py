@@ -681,6 +681,7 @@ class ControlPlaneServer:
             notifier=notifier,
             main_verifier=self.gate_main,
             repair_gate=self._build_repair_gate(app, fleet_config, repo, registry),
+            graph_gate=self._build_graph_gate(fleet_config),
         )
         self.gate_reviewer_config = config.reviewer
         self.gate_coordinator = ReviewCoordinator(
@@ -694,6 +695,27 @@ class ControlPlaneServer:
         # starts the poller, so the server starts the shared monitor itself.
         self.ci_monitor.start()
         self.gate_service.start()
+
+    def _build_graph_gate(self, fleet_config):
+        """``control_plane.graph_merge_gate`` (YAML, read on every PR so ``enabled: false`` is a hot kill switch). Once it
+        has been seen enabled, an unreadable central config raises, which the gate turns into ``wait`` (never "absent")."""
+        from ..fleet_config import FleetConfigError
+        from .graph_merge_gate import make_graph_gate
+        seen = {"enabled": False}
+
+        def section():
+            if fleet_config is None:
+                return None
+            try:
+                value = (fleet_config.current().section("control_plane") or {}).get("graph_merge_gate")
+            except FleetConfigError:
+                if seen["enabled"]:
+                    raise
+                return None
+            seen["enabled"] = seen["enabled"] or (isinstance(value, dict) and value.get("enabled") is True)
+            return value
+        return make_graph_gate(graph_fn=lambda: self.repo.graph, section_fn=section,
+                               quorum_fn=lambda: self.review_quorum)
 
     def _build_repair_gate(self, app, fleet_config, repo=None, registry=None):
         """Inert unless ``project_intelligence.repair.enabled``; read on every PR so the kill switch is hot.

@@ -162,3 +162,13 @@ def test_tool_loop_denies_read_lineage_without_a_grant():
                                      request_payload={"operation": "node", "node_id": "agent:a1"},
                                      actor="key:view")
     assert action.status == "denied"
+
+
+def test_delivery_metrics_are_not_reachable_through_the_assistant_tool():
+    """lineage_metrics rests on a collab ROOM snapshot (room membership, configured evidence writers, k-suppression). The
+    assistant's principal is an API key, which has no room membership, so there is no reader-scoped way to compute them
+    here: the operation does not exist and a model cannot ask for it (docs/operations/lineage-continuity-runbook.md)."""
+    _, reader = _world()
+    for op in ("metrics", "delivery", "analytics"):
+        with pytest.raises(ValueError):
+            reader.read("t", "key:view", {"operation": op, "room_id": "r1"})
