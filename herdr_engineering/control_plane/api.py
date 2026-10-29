@@ -46,7 +46,7 @@ log = logging.getLogger(__name__)
 # narrow `agent` role, besides /api/v1/ingest. Nothing else.
 _SUMMARY_FIX = re.compile(r"^/api/v1/sessions/[^/]+/summary/(?:fix|report)$")
 # The per-host worker that runs full /summary reports where the session records live (ingest role).
-_HOST_REPORT = re.compile(r"^/api/v1/host/summary-reports/(?:claim|result)$")
+_HOST_REPORT = re.compile(r"^/api/v1/host/summary-reports/(?:claim|result|publish)$")
 # Terminal button: builds (never runs) the viewer-side attach command; same guard as summary fix.
 _TERMINAL_ATTACH = re.compile(r"^/api/v1/sessions/[^/]+/terminal$")
 _AGENT_POST = re.compile(r"^/api/v1/(?:llm/keys|reviews|llm/keys/[^/]+/revoke"
@@ -2756,19 +2756,22 @@ def _make_handler(server, public=False, operator=False):
                                                       peer=self.client_address[0]))
                 except AttachRefused as exc:
                     return self._json(exc.body, exc.status)
-            if resource == "host" and len(parts) == 6 and parts[4] == "summary-reports" and parts[5] in {"claim", "result"}:
+            if resource == "host" and len(parts) == 6 and parts[4] == "summary-reports" and parts[5] in {"claim", "result", "publish"}:
                 from .summary_report import ReportRefused
                 reports = server.summary_report
                 host_id = body.get("host_id") if isinstance(body, dict) else None
                 if not isinstance(host_id, str) or not host_id or len(host_id) > 253:
                     return self._json({"ok": False, "error": "host_id is required"}, 400)
                 if reports is None or not reports.enabled:
+                    if parts[5] == "publish":
+                        return self._json({"ok": False, "error": "Full session reports are not enabled.",
+                                           "reason": "reports_disabled"}, 409)
                     return self._json({"ok": True, "jobs": []} if parts[5] == "claim"
                                       else {"ok": True, "replayed": True})
                 if parts[5] == "claim":
                     return self._json({"ok": True, "jobs": reports.claim(host_id)})
                 try:
-                    status, result = reports.finish(host_id, body)
+                    status, result = (reports.publish if parts[5] == "publish" else reports.finish)(host_id, body)
                 except ReportRefused as exc:
                     return self._json(exc.body, exc.status)
                 return self._json(result, status)

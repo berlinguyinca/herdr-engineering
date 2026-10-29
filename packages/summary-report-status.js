@@ -1,6 +1,6 @@
 // "Full report" button: what the button and its status line say. Pure, so it runs under `node --test`.
 // Messages are plain text (the caller escapes them); the report itself is markdown the caller renders.
-export const REPORT_LABELS = {idle: 'Generate full report', running: 'Generating report…', done: 'Regenerate full report', failed: 'Retry full report'};
+export const REPORT_LABELS = {idle: 'Full report', running: 'Generating report…', done: 'Regenerate full report', failed: 'Retry full report'};
 export const OPEN_STATES = new Set(['queued', 'running']);
 
 const FAILURES = {
@@ -33,7 +33,7 @@ export function reportView(full, local) {
   if (f.state === 'done' && typeof f.report === 'string' && f.report) {
     const when = f.generated_at ? ` · ${f.generated_at}` : '';
     const unsaved = f.persisted === false ? ' · not saved; it disappears when the dashboard restarts' : '';
-    return {label: REPORT_LABELS.done, locked: false, status: `Full report${f.harness ? ` · ${f.harness}` : ''}${when}${unsaved}`, report: f.report};
+    return {label: REPORT_LABELS.done, locked: false, status: `Full report${f.source === 'terminal' ? ' · from the terminal' : f.harness ? ` · ${f.harness}` : ''}${when}${unsaved}`, report: f.report, basisSeq: Number.isFinite(f.basis_seq) ? f.basis_seq : null};
   }
   if (f.state === 'failed') {
     return {label: REPORT_LABELS.failed, locked: false, status: reportFailure(f.error, f.detail), error: true, report: ''};

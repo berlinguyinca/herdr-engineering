@@ -1,6 +1,7 @@
 """Headless /summary runner: fake harness binaries, no network, no real sessions."""
 import json
 import stat
+from pathlib import Path
 import subprocess
 import sys
 
@@ -200,3 +201,92 @@ def test_cli_prints_json_and_fails_cleanly(tmp_path):
     assert missing.returncode == 1 and json.loads(missing.stdout)["error"] == "no_session_record"
     bad = subprocess.run([*cmd, "--session", "--x"], env=env, capture_output=True, text=True)
     assert bad.returncode != 0
+
+
+def test_a_session_that_moved_into_a_worktree_is_judged_by_the_worktree(tmp_path):
+    parent = tmp_path / "parent"
+    parent.mkdir()                                   # not a repository, like ~/IdeaProjects
+    repo = _repo(tmp_path)
+    other = tmp_path / "other"
+    other.mkdir()
+    subprocess.run(["git", "-C", str(other), "init", "-q"], check=True, capture_output=True)
+    git, others = sr._worktree_facts([str(other), str(parent), str(repo)], subprocess.run)
+    assert git["available"] and git["cwd"] == str(repo) and "dirty.txt" in git["status"]
+    assert [o["cwd"] for o in others] == [str(other)]      # the earlier distinct worktree is kept
+    only_parent, none = sr._worktree_facts([str(parent)], subprocess.run)
+    assert only_parent["available"] is False and none == []
+    assert sr._worktree_facts([], subprocess.run)[0]["available"] is False
+    # the same repository reached through two directories is reported once
+    sub = repo / "sub"
+    sub.mkdir()
+    git, others = sr._worktree_facts([str(sub), str(repo)], subprocess.run)
+    assert git["available"] and others == []
+
+
+# -- publishing from a terminal ------------------------------------------------------------------
+class _Cfg:
+    control_plane_url = "http://cp.test"
+    host_id = "bender"
+    api_key = "k"
+
+
+def _fake_herdr(calls, alive=True):
+    def run(argv, **kw):
+        calls.append(argv)
+        if argv[1:3] == ["pane", "split"]:
+            return subprocess.CompletedProcess(argv, 0, stdout=json.dumps({"result": {"pane": {"pane_id": "w1:p9"}}}), stderr="")
+        if argv[1:3] == ["pane", "get"]:
+            return subprocess.CompletedProcess(argv, 0 if alive else 1, stdout="", stderr="")
+        return subprocess.CompletedProcess(argv, 0, stdout="{}", stderr="")
+    return run
+
+
+def test_publish_sends_to_the_dashboard_and_a_side_pane_and_prints_one_line(tmp_path):
+    calls, posted = [], []
+    out = sr.publish_report("claude", "abc-123", REPORT, home=tmp_path, environ={"HERDR_PANE_ID": "w1:p1"},
+                            run=_fake_herdr(calls), load_config=lambda: _Cfg,
+                            post=lambda cfg, body: posted.append(body) or (200, {"ok": True}))
+    assert out["ok"] and out["dashboard"]["ok"] and out["pane"] == {"ok": True, "pane_id": "w1:p9"}
+    assert posted[0]["agent"] == "claude" and posted[0]["target"] == "abc-123" and posted[0]["report"].startswith("# Session summary")
+    assert "\n" not in out["message"] and "dashboard" in out["message"] and "side pane" in out["message"]
+    split = next(c for c in calls if c[1:3] == ["pane", "split"])
+    assert split[split.index("--pane") + 1] == "w1:p1" and "--no-focus" in split and "right" in split
+    shown = next(c for c in calls if c[1:3] == ["pane", "run"])
+    assert shown[3] == "w1:p9" and shown[4:] == ["less", "-R", out["file"]]
+    assert (Path(out["file"]).stat().st_mode & 0o777) == 0o600
+
+
+def test_publish_reuses_the_pane_it_opened_before(tmp_path):
+    calls = []
+    kw = dict(home=tmp_path, environ={"HERDR_PANE_ID": "w1:p1"}, run=_fake_herdr(calls), load_config=lambda: _Cfg,
+              post=lambda cfg, body: (200, {}))
+    sr.publish_report("claude", "abc-123", REPORT, **kw)
+    sr.publish_report("claude", "abc-123", REPORT, **kw)
+    assert sum(1 for c in calls if c[1:3] == ["pane", "split"]) == 1
+    assert sum(1 for c in calls if c[1:3] == ["pane", "run"]) == 2
+
+
+def test_publish_one_destination_failing_still_reports_the_other(tmp_path):
+    out = sr.publish_report("claude", "abc-123", REPORT, home=tmp_path, environ={}, run=_fake_herdr([]),
+                            load_config=lambda: _Cfg, post=lambda cfg, body: (200, {}))
+    assert out["ok"] and out["pane"]["error"] == "not_in_a_herdr_pane" and "dashboard" in out["message"] and "pane" not in out["message"]
+    out = sr.publish_report("claude", "abc-123", REPORT, home=tmp_path, environ={"HERDR_PANE_ID": "w1:p1"},
+                            run=_fake_herdr([]), load_config=lambda: _Cfg, post=lambda cfg, body: (404, {"reason": "no_session"}))
+    assert out["ok"] and out["dashboard"]["error"] == "no_session" and "side pane" in out["message"]
+
+
+def test_publish_with_nowhere_to_put_it_asks_the_caller_to_print_it(tmp_path):
+    def down(cfg, body):
+        raise OSError("offline")
+    out = sr.publish_report("claude", "abc-123", REPORT, home=tmp_path, environ={}, run=_fake_herdr([]),
+                            load_config=lambda: _Cfg, post=down)
+    assert out["ok"] is False and out["message"] == ""
+
+
+def test_publish_refuses_a_non_report_and_bad_ids(tmp_path):
+    with pytest.raises(sr.ReportError) as err:
+        sr.publish_report("claude", "abc-123", "hello", home=tmp_path)
+    assert err.value.code == "malformed_report"
+    with pytest.raises(sr.ReportError):
+        sr.publish_report("claude", "../x", REPORT, home=tmp_path)
+    assert not (tmp_path / ".cache").exists() or not list((tmp_path / ".cache").rglob("*.md"))
