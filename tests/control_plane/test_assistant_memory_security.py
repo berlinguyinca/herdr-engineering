@@ -5,13 +5,17 @@ from unittest.mock import Mock
 import pytest
 
 from herdr_engineering.control_plane.assistant import (
-    ApprovalRequired, AssistantService, AssistantStore, assistant_config,
+    NEVER_PREAUTHORIZED,
+    ApprovalRequired,
+    AssistantService,
+    AssistantStore,
+    assistant_config,
 )
 
 
 @pytest.fixture
 def context():
-    svc = AssistantService(config=assistant_config({'personal_assistant': {'enabled': True}}))
+    svc = AssistantService(config=assistant_config({'personal_assistant': {'enabled': True, 'actions': {'allow_self_approval': True}}}))
     assistant = svc.create_assistant(tenant_id='t1', user_id='u1', name='Helper')
     thread = svc.create_thread(tenant_id='t1', user_id='u1', assistant_id=assistant.assistant_id)
     run = svc.send_message(tenant_id='t1', user_id='u1', assistant_id=assistant.assistant_id,
@@ -19,15 +23,20 @@ def context():
     return svc, run
 
 
+OPERATOR = {'kind': 'operator', 'id': 'key:op', 'authenticated_by': 'api_key'}
+
+
 def grant(svc, run, tool='send_message', scope='*', **kwargs):
+    if kwargs.get('preauthorized'):
+        kwargs['principal'] = OPERATOR
     return svc.grant_tool(tenant_id=run.tenant_id, user_id=run.user_id,
                           assistant_id=run.assistant_id, tool_id=tool, scope=scope, **kwargs)
 
 
-def request(svc, run, tool='send_message', scope='*'):
+def request(svc, run, tool='send_message', scope='*', key='repeat'):
     return svc.request_tool_action(tenant_id=run.tenant_id, user_id=run.user_id,
         assistant_id=run.assistant_id, tool_id=tool, scope=scope, run_id=run.run_id,
-        idempotency_key='repeat', request_payload={}, actor=run.user_id)
+        idempotency_key=key, request_payload={}, actor=run.user_id)
 
 
 def test_cached_pending_action_still_requires_same_approval(context):
@@ -97,7 +106,7 @@ def test_restricted_grant_cannot_authorize_wildcard_request(context):
     svc, run = context
     grant(svc, run, tool='browse', scope='https://allowed.example')
     assert request(svc, run, tool='browse').status == 'denied'
-    assert request(svc, run, tool='browse', scope='https://allowed.example').status == 'authorized'
+    assert request(svc, run, tool='browse', scope='https://allowed.example', key='k2').status == 'authorized'
 
 
 def test_revocation_and_audit_survive_restart(context, tmp_path):
@@ -173,7 +182,7 @@ def test_denial_audit_survives_immediate_restart(context, tmp_path, cached):
 ])
 def test_model_scope_claim_cannot_override_executor_target(context, tool, field, allowed, actual):
     svc, run = context
-    grant(svc, run, tool=tool, scope=allowed, preauthorized=True)
+    grant(svc, run, tool=tool, scope=allowed, preauthorized=tool not in NEVER_PREAUTHORIZED)
     svc.execute_tool = Mock(return_value={'context': 'executed'})
     assert 'denied' in svc._execute_gated(
         run, tool, {'scope': allowed, field: actual}, 1000)
@@ -226,8 +235,13 @@ def test_memory_rejects_ambiguous_namespace_before_execution(context, tool, name
 ])
 def test_executor_target_grant_allows_matching_call_despite_scope_claim(context, tool, field, target):
     svc, run = context
-    grant(svc, run, tool=tool, scope=target, preauthorized=True)
+    grant(svc, run, tool=tool, scope=target, preauthorized=tool not in NEVER_PREAUTHORIZED)
     svc.execute_tool = Mock(return_value={'context': 'executed'})
+    if tool in NEVER_PREAUTHORIZED:           # always needs a real approval, never a preauthorized grant
+        first = svc._execute_gated(run, tool, {field: target, 'scope': 'irrelevant'}, 1000)
+        assert 'approval required' in first
+        svc.decide_approval(next(iter(svc.store.approvals)), tenant_id='t1', user_id='u1',
+                            decision='approved', actor='u1')
     assert svc._execute_gated(run, tool, {field: target, 'scope': 'irrelevant'}, 1000) == 'executed'
     assert next(iter(svc.store.actions.values())).scope == target
     assert svc.execute_tool.call_args.kwargs['payload'][field] == target
