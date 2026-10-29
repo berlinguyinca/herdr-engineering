@@ -205,6 +205,8 @@ def _collab_ops(ev: dict) -> list[dict]:
                        aliases=[("collab_room", rid)]))
         ops.append(ent("project", pid, "scope", **_scope(None, rooms=[rid], project=pid)))
         ops.append(edge("contains", ("project", pid), ("room", rid), **room_scope))
+        if user:                                     # the creator is the owner; HCN emits no member_added for them
+            ops.append(fact("team_role", f"user:{user}", ("room", rid), "open", role="owner", **room_scope))
     elif t in ("member_added", "member_removed") and rid and _text(p.get("subject_user_id")):
         uid = _text(p["subject_user_id"])
         sc = _scope("room", rooms=[rid], project=pid)
