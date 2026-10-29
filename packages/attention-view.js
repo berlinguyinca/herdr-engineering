@@ -104,7 +104,7 @@ function groupedOpen(open, renderRow) {
       const label1 = KINDS[items[0].kind] || text(items[0].kind);
       const names = items.slice(0, SHOWN_PER_GROUP).map((i) => text(i.title).replace(/^[^·]*·\s*/, '')).join(', ');
       const body = items.length > SHOWN_PER_GROUP
-        ? `<li class="at-fold"><details><summary><strong>${items.length} × ${esc(label1)}</strong><span class="at-detail">${esc(names)} and ${items.length - SHOWN_PER_GROUP} more</span><span class="at-showall">Show all ${items.length}</span></summary><ul class="at-list">${items.map((i) => renderRow(i)).join('')}</ul></details></li>`
+        ? `<li class="at-fold"><details data-fold="${esc(`${items[0].severity}|${items[0].kind}`)}"><summary><strong>${items.length} × ${esc(label1)}</strong><span class="at-detail">${esc(names)} and ${items.length - SHOWN_PER_GROUP} more</span><span class="at-showall">Show all ${items.length}</span></summary><ul class="at-list">${items.map((i) => renderRow(i)).join('')}</ul></details></li>`
         : items.map((i) => renderRow(i)).join('');
       return `<section class="at-kind at-kind-${sev}" aria-label="${label}"><h2 class="at-kind-title">${label} <span class="at-count">${items.length}</span>${items.length > 1 ? ` <button type="button" class="at-btn at-ack-all" data-ack-all="${esc(JSON.stringify(items.map((i) => [i.key, i.fingerprint])))}">Acknowledge all ${items.length}</button>` : ''}</h2><ul class="at-list">${body}</ul></section>`;
     });
@@ -188,8 +188,8 @@ export function renderAttention(model = {}, now = Date.now()) {
   const kindSelect = kinds.length > 1 ? `<select data-filter="kind" aria-label="Kind" title="Filter by kind"><option value="">All kinds</option>${kinds.map((k) => `<option value="${esc(k)}" ${filters.kind === k ? 'selected' : ''}>${esc(KINDS[k] || k)}</option>`).join('')}</select>` : '';
   const quiet = (n, word) => (Number(n) ? `<span>${Number(n)} ${word}</span>` : '');
   const blocked = model.notify && (model.notify.status === 'blocked' || model.notify.status === 'unsupported')
-    ? `<span class="at-bell" role="img" aria-label="Browser notifications unavailable" title="${model.notify.status === 'blocked' ? "Browser notifications are blocked. Allow them in this site's settings to hear about new critical items." : 'Browser notifications are not supported in this browser.'}" data-notify-status="${esc(model.notify.status)}">${ICON_BELL_OFF}</span>` : '';
-  const summary = `<div class="at-summary" role="status"><span><strong>${Number(counts.open) || 0}</strong> open</span>${chips}${quiet(counts.acknowledged, 'acknowledged')}${quiet(counts.snoozed, 'snoozed')}${kindSelect}${blocked}${partial ? `<span class="at-bell at-warn" role="img" title="Partial: ${esc(unavailable.join(', ') || 'a source')} unavailable" aria-label="Partial: ${esc(unavailable.join(', ') || 'a source')} unavailable">${ICON_WARN}</span>` : ''}</div>`;
+    ? `<span class="at-bell" tabindex="0" role="img" aria-label="Browser notifications unavailable" title="${model.notify.status === 'blocked' ? "Browser notifications are blocked. Allow them in this site's settings to hear about new critical items." : 'Browser notifications are not supported in this browser.'}" data-notify-status="${esc(model.notify.status)}">${ICON_BELL_OFF}</span>` : '';
+  const summary = `<div class="at-summary" role="status"><span><strong>${Number(counts.open) || 0}</strong> open</span>${chips}${quiet(counts.acknowledged, 'acknowledged')}${quiet(counts.snoozed, 'snoozed')}${kindSelect}${blocked}${partial ? `<span class="at-bell at-warn" tabindex="0" role="img" title="Partial: ${esc(unavailable.join(', ') || 'a source')} unavailable" aria-label="Partial: ${esc(unavailable.join(', ') || 'a source')} unavailable">${ICON_WARN}</span>` : ''}</div>`;
   const stale = error ? '<p class="at-partial" role="status">Could not refresh; showing the last received list.</p>' : '';
   const trunc = body.truncated ? '<p class="at-status">Showing the first items only; the inbox is capped.</p>' : '';
   let list;
@@ -211,7 +211,11 @@ export function renderAttention(model = {}, now = Date.now()) {
 /** Mount the page: polls every POLL_MS while visible; ack/snooze/clear go to the server and re-poll at once. */
 export function mountAttention(container, client, { onBody, notifier, onFreshness = () => {} } = {}) {
   const model = { body: null, error: '', loading: true, busy: new Set(), expanded: new Set(), filters: {}, message: '' };
-  let disposed = false, timer = null, controller = null, last = '';
+  let disposed = false, timer = null, controller = null, last = '', undoTimer = null;
+  const offerUndo = (message, pairs) => {
+    clearTimeout(undoTimer); model.message = message; model.undo = pairs;
+    undoTimer = setTimeout(() => { model.message = ''; model.undo = null; last = ''; draw(); }, 10000);
+  };
   // agent-written detail text may name a loopback service; link it to its fabric address when the gateway knows it
   const fabric = typeof client.resolveFabricUrls === 'function'
     ? createFabricUrlResolver(client, { onChange: () => { last = ''; draw(); } }) : null;
@@ -224,14 +228,16 @@ export function mountAttention(container, client, { onBody, notifier, onFreshnes
     if (signature === last) return;
     last = signature;
     const focused = container.contains(document.activeElement) ? document.activeElement : null;
-    const keep = focused?.dataset ? { key: focused.dataset.key, kind: ['ack', 'clear', 'snooze', 'expand'].find((k) => k in focused.dataset), filter: focused.dataset.filter } : null;
+    const keep = focused?.dataset ? { key: focused.dataset.key, kind: ['ack', 'clear', 'snooze', 'expand'].find((k) => k in focused.dataset), filter: focused.dataset.filter, value: focused.dataset.value } : null;
     const openGroups = [...container.querySelectorAll('details[open] > summary')].map((s) => s.textContent.replace(/\s*\(\d+\)$/, ''));
+    const openFolds = [...container.querySelectorAll('details[data-fold][open]')].map((d) => d.dataset.fold);
     container.innerHTML = html;
+    container.querySelectorAll('details[data-fold]').forEach((d) => { if (openFolds.includes(d.dataset.fold)) d.open = true; });
     container.querySelectorAll('details > summary').forEach((s) => {
       if (openGroups.includes(s.textContent.replace(/\s*\(\d+\)$/, ''))) s.parentElement.open = true;
     });
     if (keep) {
-      const selector = keep.filter ? `[data-filter="${keep.filter}"]`
+      const selector = keep.filter ? `[data-filter="${keep.filter}"]${keep.value ? `[data-value="${CSS.escape(keep.value)}"]` : ''}`
         : keep.kind === 'expand' ? `[data-expand="${CSS.escape(focused.dataset.expand)}"]` : keep.kind ? `[data-${keep.kind}][data-key="${CSS.escape(keep.key || '')}"]` : null;
       (selector && container.querySelector(selector) || container.querySelector('h1'))?.focus({ preventScroll: true });
     }
@@ -245,6 +251,8 @@ export function mountAttention(container, client, { onBody, notifier, onFreshnes
       if (disposed || request.signal.aborted || controller !== request) return;
       if (!body || !Array.isArray(body.items)) throw new Error('Invalid response');
       model.body = body; model.error = ''; model.loading = false;
+      const live = new Set(body.items.map((i) => i?.key));
+      for (const k of model.expanded) if (!live.has(k)) model.expanded.delete(k);
       fabric?.prefetch(...(Array.isArray(body?.items) ? body.items : []).map((i) => i?.detail));
       onBody?.(body);
       onFreshness(true);
@@ -262,10 +270,10 @@ export function mountAttention(container, client, { onBody, notifier, onFreshnes
     }
   }
   async function act(action, body, key) {
-    model.busy.add(key); model.message = ''; model.undo = null; draw();
+    clearTimeout(undoTimer); model.busy.add(key); model.message = ''; model.undo = null; draw();
     try {
       const result = await client.attentionAct(action, body);
-      if (action === 'ack' && !(result && result.stored === false)) { model.message = 'Acknowledged.'; model.undo = [[body.key, body.fingerprint]]; setTimeout(() => { if (model.message === 'Acknowledged.') { model.message = ''; model.undo = null; last = ''; draw(); } }, 10000); }
+      if (action === 'ack' && !(result && result.stored === false)) offerUndo('Acknowledged.', [[body.key, body.fingerprint]]);
       if (result && result.stored === false && result.reason === 'not_current') model.message = 'That item changed or cleared before your action; the list was refreshed.';
     } catch (err) {
       model.message = `Could not ${action === 'ack' ? 'acknowledge' : action}: ${err?.message || 'request failed'}`;
@@ -293,8 +301,7 @@ export function mountAttention(container, client, { onBody, notifier, onFreshnes
         try { await client.attentionAct('ack', { key, fingerprint }); } catch { failed += 1; }
         model.busy.delete(key);
       }
-      model.message = failed ? `${failed} of ${pairs.length} could not be acknowledged.` : `Acknowledged ${pairs.length} items.`;
-      model.undo = failed === pairs.length ? null : pairs;
+      if (failed) { clearTimeout(undoTimer); model.message = `${failed} of ${pairs.length} could not be acknowledged.`; model.undo = failed === pairs.length ? null : pairs; } else offerUndo(`Acknowledged ${pairs.length} items.`, pairs);
       clearTimeout(timer); controller?.abort(); controller = null; poll();
       return;
     }
@@ -314,7 +321,7 @@ export function mountAttention(container, client, { onBody, notifier, onFreshnes
     }
     const undo = event.target.closest?.('[data-undo]');
     if (undo && model.undo) {
-      const pairs = model.undo; model.undo = null; model.message = '';
+      const pairs = model.undo; clearTimeout(undoTimer); model.undo = null; model.message = '';
       for (const [key, fingerprint] of pairs) { try { await client.attentionAct('clear', { key, fingerprint }); } catch { /* the next poll shows the truth */ } }
       clearTimeout(timer); controller?.abort(); controller = null; poll();
       return;
@@ -345,6 +352,6 @@ export function mountAttention(container, client, { onBody, notifier, onFreshnes
   }, 1000);
   return {
     refresh: poll,
-    dispose() { disposed = true; clearInterval(clock); clearTimeout(timer); controller?.abort(); document.removeEventListener('visibilitychange', visibility); },
+    dispose() { disposed = true; clearTimeout(undoTimer); clearInterval(clock); clearTimeout(timer); controller?.abort(); document.removeEventListener('visibilitychange', visibility); },
   };
 }

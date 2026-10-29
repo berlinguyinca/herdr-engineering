@@ -135,3 +135,10 @@ test('a short open list stays flat', () => {
   const html = renderAttention({ body: body(Array.from({ length: 8 }, (_, n) => item({ key: `k:${n}`, kind: `kind${n % 4}`, title: `T${n}` }))) }, now);
   assert.ok(!html.includes('<h2 class="at-kind-title"'));
 });
+
+test('a fold carries a stable id so it can stay open across refreshes, and chips are told apart by value', () => {
+  const many = Array.from({ length: 5 }, (_, n) => item({ key: `ci:${n}`, kind: 'ci_failed', severity: 'critical', title: `CI ${n}` }));
+  const html = renderAttention({ body: body(many) }, now);
+  assert.match(html, /<details data-fold="critical\|ci_failed">/);
+  assert.match(html, /data-filter="severity" data-value="critical"/);
+});
