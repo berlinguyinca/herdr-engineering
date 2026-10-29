@@ -32,3 +32,13 @@ def test_outside_ci_the_journal_is_a_local_temp_file(tmp_path):
     assert result.returncode == 0
     assert not (tmp_path / "archive" / "ci-logs").exists()
     assert f"journal: {tmp_path}/herdr-demo-" in result.stdout
+
+
+def test_the_archive_directory_is_never_created_from_scratch(tmp_path):
+    result = run_gate(tmp_path, "echo hi")                # run_gate's archive parent exists, so this one is used
+    assert result.returncode == 0
+    (tmp_path / "scripts" / "log-archive.yml").write_text(f"directories:\n  - {tmp_path}/nothing/here/ci-logs\n")
+    env = {"PATH": os.environ["PATH"], "TMPDIR": str(tmp_path), "CI_PIPELINE_NUMBER": "9", "CI_REPO": "o/r"}
+    again = subprocess.run(["bash", str(tmp_path / "gate.sh")], env=env, capture_output=True, text=True)
+    assert not (tmp_path / "nothing").exists()
+    assert "log archive not used on" in again.stdout and "parent missing or not writable" in again.stdout

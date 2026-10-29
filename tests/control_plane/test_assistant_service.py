@@ -36,7 +36,7 @@ from herdr_engineering.control_plane.assistant import (
 
 
 def make_service(**kwargs):
-    cfg = assistant_config({"personal_assistant": {"enabled": True}})
+    cfg = assistant_config({"personal_assistant": {"enabled": True, "actions": {"allow_self_approval": True}}})
     cfg.update(kwargs)
     return AssistantService(config=cfg)
 
@@ -222,12 +222,13 @@ def test_sensitive_tool_preauthorized_skips_approval():
     svc = make_service()
     a = svc.create_assistant(tenant_id="t1", user_id="u1", name="Helper")
     svc.grant_tool(tenant_id="t1", user_id="u1", assistant_id=a.assistant_id,
-                   tool_id="send_message", scope="*", preauthorized=True)
+                   tool_id="edit_shared", scope="*", preauthorized=True,
+                   principal={"kind": "operator", "id": "key:op", "authenticated_by": "api_key"})
     t = svc.create_thread(tenant_id="t1", user_id="u1", assistant_id=a.assistant_id)
     run = svc.send_message(tenant_id="t1", user_id="u1", assistant_id=a.assistant_id,
                            thread_id=t.thread_id, content="hi")
     action = svc.request_tool_action(tenant_id="t1", user_id="u1", assistant_id=a.assistant_id,
-                                     tool_id="send_message", scope="*", run_id=run.run_id,
+                                     tool_id="edit_shared", scope="*", run_id=run.run_id,
                                      idempotency_key="k1", request_payload={}, actor="u1")
     assert action.status == "approved"
 

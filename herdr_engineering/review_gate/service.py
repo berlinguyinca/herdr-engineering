@@ -160,12 +160,16 @@ class GateService:
         notifier=None,
         main_verifier=None,
         repair_gate=None,
+        graph_gate=None,
     ):
         self._config = config
         # Optional deterministic policy for PRs from the CI repair flow only (``herdr-ci-fix/`` branches):
         # ``repair_gate(enrollment, pr, checks) -> ("allow"|"wait"|"reject", reasons)``. None (the default) leaves
         # every merge exactly as before. It can only withhold a merge ``decide_merge`` already allowed.
         self._repair_gate = repair_gate
+        # Optional lineage-graph evidence check for EVERY PR (``control_plane.graph_merge_gate``, same signature and
+        # contract as ``repair_gate``): ``None`` or a disabled section leaves every merge as before; it only withholds.
+        self._graph_gate = graph_gate
         self._notifier = notifier
         self._main_verifier = main_verifier
         self._app = app
@@ -468,6 +472,14 @@ class GateService:
                 gate, why = "wait", ("repair policy unavailable",)
             if gate != "allow":
                 self._status(repo, sha, "failure" if gate == "reject" else "pending", "repair policy: " + "; ".join(why))
+                return
+        if self._graph_gate is not None:
+            try:
+                gate, why = self._graph_gate(enrollment, pr, checks)
+            except Exception:  # noqa: BLE001 - unreadable graph or config fails closed, never open
+                gate, why = "wait", ("graph evidence unavailable",)
+            if gate != "allow":
+                self._status(repo, sha, "failure" if gate == "reject" else "pending", "graph evidence: " + "; ".join(why))
                 return
         backoff = self._merge_backoff.get((key, sha))
         if backoff is not None and self._now() < backoff[0]:

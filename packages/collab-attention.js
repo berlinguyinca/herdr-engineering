@@ -143,6 +143,27 @@ function metric(label, v, render) {
   return `<tr><th scope="row">${esc(label)}</th><td>${render(v)}<br><span class="cx-msg">${esc(str(v.basis))}</span></td></tr>`;
 }
 
+// Delivery metrics (lineage_metrics.py): counts only, from what the reader can see; "unknown" is shown as such, never as 0.
+function countCell(v) {
+  if (!v || typeof v !== 'object') return '';
+  const n = v.count;
+  return `${typeof n === 'number' ? Number(n) : 'Unknown'}<br><span class="cx-msg">${esc(str(v.basis || v.reason))}</span>`;
+}
+
+function deliveryRows(g) {
+  if (!g || typeof g !== 'object') return '';
+  const row = (label, cell) => (cell ? `<tr><th scope="row">${esc(label)}</th><td>${cell}</td></tr>` : '');
+  const h = g.handoffs && typeof g.handoffs === 'object' ? g.handoffs : null;
+  const o = h && h.outcomes ? h.outcomes : {};
+  const f = g.review_findings && typeof g.review_findings === 'object' ? g.review_findings : null;
+  return [
+    row('Accepted changes', countCell(g.accepted_changes)),
+    row('Gate failures', countCell(g.gate_failures)),
+    h ? row('Handoffs', `${Number(h.total) || 0} total: ${Number(o.success) || 0} succeeded, ${Number(o.failed) || 0} failed, ${Number(o.pending) || 0} pending<br><span class="cx-msg">Outcome is the successor's own report.</span>`) : '',
+    f ? row('Review findings', `${Number(f.total) || 0} total, ${Number(f.open) || 0} open`) : '',
+  ].join('');
+}
+
 export function renderAnalytics(m) {
   if (m.error) return `<p class="hd-empty" role="alert">${esc(m.error)}</p>`;
   if (!m.data) return skeleton('analytics');
@@ -159,6 +180,7 @@ export function renderAnalytics(m) {
       ${metric('Idle time', d.idle_time, (v) => `${pct(v.share)} of active time (${Number(v.lanes)} lanes)`)}
       ${d.cost ? (d.cost.suppressed ? metric('Cost', d.cost, () => '') : d.cost.reported === false ? metric('Cost', d.cost, () => '') :
         `<tr><th scope="row">Cost</th><td>${esc(String(d.cost.usd))} USD, ${Number(d.cost.tokens)} tokens, <b>self-reported</b> by ${Number(d.cost.reporting_nodes)} of ${Number(d.cost.of_nodes)} nodes</td></tr>`) : ''}
+      ${deliveryRows(d.delivery)}
       <tr><th scope="row">Task states</th><td>${mix || 'Hidden: too few items'}</td></tr>
     </tbody></table>
     ${d.milestones_small_groups_hidden ? '<p class="cx-msg">Some small missions are not listed.</p>' : ''}
