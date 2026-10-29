@@ -12,7 +12,8 @@ const KINDS = {
   mission_attention: 'Mission needs attention', mission_failed: 'Mission failed', agent_failed: 'Agent failed',
   agent_blocked: 'Agent blocked', ci_failed: 'CI failed', review_changes: 'Review changes requested',
   service_down: 'Service down', host_stale: 'Host silent', control_plane: 'Control plane', fleet_drift: 'Fleet drift',
-  llm_problems: 'LLM problems', ci_fix: 'CI fix', source_unavailable: 'Source unavailable',
+  llm_problems: 'LLM problems', ci_fix: 'CI fix', deployment_escalation: 'Deployment failed',
+  source_unavailable: 'Source unavailable',
 };
 export const SNOOZE_CHOICES = [[3600, '1 hour'], [14400, '4 hours'], [86400, '24 hours'], [604800, '7 days']];
 export const POLL_MS = 5000;

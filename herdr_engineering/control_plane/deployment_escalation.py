@@ -56,6 +56,7 @@ import time
 from collections import OrderedDict
 from dataclasses import dataclass
 
+from .deployment_actions import PERMIT_STALE_S
 from .deployment_coordinator import _order, _state_of, same_commit
 from .deployment_diagnosis import (
     ATTEMPT_CAP,
@@ -85,6 +86,12 @@ MAX_KEYS = 64
 MAX_REPORT_EVIDENCE = 2000
 MAX_ISSUE_BODY = 6000
 MAX_REASON = 200
+#: The largest per-tick budget. The next tick starts after the escalation plus the loop's
+#: interval, so this plus the interval must stay under the permit's staleness limit.
+MAX_BUDGET_S = 45
+#: The coordinator loop's interval (``api.DEPLOYMENTS_TICK_S`` asserts it is not larger).
+TICK_INTERVAL_S = 30
+assert MAX_BUDGET_S + TICK_INTERVAL_S + 10 < PERMIT_STALE_S
 
 _COMPONENT = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}")
 _COMMIT = re.compile(r"[A-Za-z0-9._-]{7,128}")
@@ -111,7 +118,8 @@ class EscalationConfig:
     effect is off by default."""
     issues: bool = False
     assistant: bool = False
-    #: Wall-clock budget for one tick's escalation (model and GitHub calls are clamped to it).
+    #: Wall-clock budget for one tick's escalation (model and GitHub calls are clamped to it);
+    #: at most ``MAX_BUDGET_S``, so permits stay fresh.
     budget_s: float = 40
     issue_timeout_s: float = 15
 
@@ -119,7 +127,7 @@ class EscalationConfig:
         for name in ("issues", "assistant"):
             if not isinstance(getattr(self, name), bool):
                 raise ValueError(f"deployment_escalation.{name} must be a boolean")
-        for name, lo, hi in (("budget_s", 5, 60), ("issue_timeout_s", 1, 30)):
+        for name, lo, hi in (("budget_s", 5, MAX_BUDGET_S), ("issue_timeout_s", 1, 30)):
             v = getattr(self, name)
             if type(v) not in (int, float) or not lo <= v <= hi:
                 raise ValueError(f"deployment_escalation.{name} must be a number in {lo}..{hi}")

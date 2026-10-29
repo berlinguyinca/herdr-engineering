@@ -246,6 +246,10 @@ _DEPLOYMENT_HOST_GET_PATHS = {p + "/" + a: a for p in ("/api/deployments", "/api
 _DEPLOYMENT_REQUEST_PATH = re.compile(r"^/api(?:/v1)?/deployments/requests/([^/]+)$")
 #: Seconds between deployment coordinator ticks (the plan GET /api/v1/deployments serves).
 DEPLOYMENTS_TICK_S = 30
+# Escalation runs inside the tick: its budget plus this interval must keep permits fresh.
+from .deployment_escalation import TICK_INTERVAL_S as _ESCALATION_TICK_S  # noqa: E402
+
+assert DEPLOYMENTS_TICK_S <= _ESCALATION_TICK_S
 
 
 def _gate_pr(snap):
@@ -675,7 +679,13 @@ class ControlPlaneServer:
                            "keyed": self._deployment_keyed(),
                            "refused": self._deployment_refusals.snapshot()}
         view["requests"] = self.repo.deployment_requests.pending()
-        view["escalations"] = self.repo.deployment_escalations.snapshot()
+        ledger = self.repo.deployment_escalations
+        view["escalations"] = ledger.snapshot()
+        for plan in view["plans"]:
+            # the repair attempts the cap counts (the ledger), next to the coordinator's starts
+            for name, row in (plan.get("components") or {}).items():
+                target = plan.get("target_commit")
+                row["repair_attempts"] = ledger.attempts(name, target) if target else 0
         return view
 
     # ------------------------------------------------ deployment actions (deploy-4 Task 5)

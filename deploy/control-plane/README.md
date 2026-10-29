@@ -287,6 +287,6 @@ optional AI step of `control_plane.deployment_diagnosis`) over its redacted fail
     unanswered claim is never filed again.
   - `assistant: true` would notify the Personal Assistant with `dedupe_key = component:release`. The assistant has
     no notification API yet, so no sink is wired and host findings use the attention item.
-  - `budget_s` (default 40, at most 60) bounds one tick's model and GitHub calls; `issue_timeout_s` (default 15).
+  - `budget_s` (default 40, at most 45, so permits stay fresh) bounds one tick's model and GitHub calls; `issue_timeout_s` (default 15).
 - No pull request is generated: a fix goes through normal CI and review.
 

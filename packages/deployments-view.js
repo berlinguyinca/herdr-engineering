@@ -118,7 +118,7 @@ function componentRow(view, item, open) {
     <td data-deploy-health>${esc(health)}${coord?.outcome ? ` (${esc(coord.outcome)})` : ''}${permitted ? ' · permitted' : ''}</td>
     <td>${last ? `${esc(text(last.outcome))} · ${esc(text(last.received_at || last.ts))}` : '—'}</td>
     <td data-deploy-hold>${hold != null ? seconds(hold) : '—'}</td>
-    <td>${coord ? esc(text(coord.attempts, '0')) : '—'}</td>
+    <td data-deploy-repairs-count title="${coord ? `${esc(text(coord.attempts, '0'))} start(s) toward this release` : ''}">${coord ? esc(text(coord.repair_attempts, '0')) : '—'}</td>
   </tr>
   <tr id="${esc(id)}" data-deploy-timeline="${esc(item.name)}"${open ? '' : ' hidden'}><td colspan="8">${escalations(view, item.name)}${timeline(row)}</td></tr>`;
 }
@@ -158,7 +158,7 @@ export function renderDeployments(raw) {
     const plans = view.plans.map((p) => planCard(p, view.coordinator)).join('');
     const sections = [...stages].map(([label, items]) => `<section data-deploy-stage="${esc(label)}" aria-label="${esc(label)}">
       <h2>${esc(label)}</h2>
-      <div class="hd-table-wrap"><table class="hd-table"><thead><tr><th>Component</th><th>Running</th><th>Target</th><th>Step</th><th>Health</th><th>Last result</th><th>Hold left</th><th>Attempts</th></tr></thead>
+      <div class="hd-table-wrap"><table class="hd-table"><thead><tr><th>Component</th><th>Running</th><th>Target</th><th>Step</th><th>Health</th><th>Last result</th><th>Hold left</th><th>Repairs</th></tr></thead>
       <tbody>${items.map((item) => componentRow(view, item, open.has(item.name))).join('')}</tbody></table></div>
     </section>`).join('');
     return `${notes.join('')}<div class="hd-grid">${plans}</div>${sections || '<herdr-empty message="No components defined"></herdr-empty>'}`;

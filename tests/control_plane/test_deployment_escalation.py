@@ -566,6 +566,8 @@ def test_a_halt_reaches_the_host_as_a_permit_repair(tmp_path):
         view = w.svr.deployments_view()
         [rec] = view["escalations"]
         assert rec["component"] == "hive-nodes" and rec["open"] is True and rec["pr"] is None
+        [row] = [p["components"]["hive-nodes"] for p in view["plans"]]
+        assert row["repair_attempts"] == 1          # the ledger's count, next to the starts
         # one validated feed event per component:release, however many ticks
         w.svr.deployments_tick()
         feed = [e for k, s in w.repo._events.items() if k[0] == de.FEED_ENTITY for e in s]
@@ -628,3 +630,12 @@ def test_the_issue_flag_off_files_nothing_through_the_server(tmp_path):
         assert w.svr.deployments_view()["escalations"][0]["issue"] is None
     finally:
         w.close()
+
+
+def test_the_budget_keeps_permits_fresh():
+    from herdr_engineering.control_plane.api import DEPLOYMENTS_TICK_S
+    from herdr_engineering.control_plane.deployment_actions import PERMIT_STALE_S
+    assert de.MAX_BUDGET_S + DEPLOYMENTS_TICK_S < PERMIT_STALE_S
+    with pytest.raises(ValueError):
+        EscalationConfig(budget_s=de.MAX_BUDGET_S + 1)
+    assert EscalationConfig(budget_s=de.MAX_BUDGET_S).budget_s == de.MAX_BUDGET_S
