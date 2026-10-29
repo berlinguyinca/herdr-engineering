@@ -317,6 +317,14 @@ def test_a_target_no_longer_on_main_halts_without_advancing():
                             generation=4, components=())]
 
 
+def test_default_evidence_holds_as_release_not_confirmed():
+    w = World()
+    snap = Snapshot(components=w.mon.snapshot()["components"], target_commit=T1)
+    assert advance(snap, DEFS, _at(0)) == [Hold(stage=None, remaining_s=None,
+                                                reason="release not confirmed",
+                                                target_commit=T1, generation=0)]
+
+
 def test_unknown_ancestry_holds():
     w = World()
     actions = advance(w.snap(on_main=None, plan_commit=OLD, generation=4), DEFS, _at(0))
@@ -423,7 +431,9 @@ def test_without_evidence_the_coordinator_only_holds(tmp_path):
     coord = DeploymentCoordinator(DeploymentDefinitions(lambda: defs_dir, ci_snapshot=ci),
                                   monitor=lambda: repo[0].deployments,
                                   state=lambda: repo[0].deployment_plans, now=clock)
-    assert [type(a) for a in coord.tick()[TRACK]] == [Hold]
+    assert coord.tick()[TRACK] == [Hold(stage=None, remaining_s=None, reason="release not confirmed",
+                                        target_commit=T1, generation=0)]
+    assert repo[0].deployment_plans.plan(TRACK).generation == 0
 
 
 def test_generation_and_attempts_persist_across_a_restart(tmp_path, acknowledged_sink):

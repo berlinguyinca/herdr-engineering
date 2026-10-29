@@ -49,11 +49,13 @@ Safety gates, in this order, before any stage decision:
    longer on main"; nothing advances, no replan.
 3. the target is one of the plan's past targets: ``Hold`` (a fresh server whose CI
    window holds only a rerun of an old commit must not go backward).
-4. ``target_on_main is None`` (not checked): ``Hold`` "target ancestry not confirmed".
-5. a target other than the plan's commit: ``Replan`` (generation + 1).
-6. CI green proves the commit passed CI, not that the release asset was published for
-   it. A ``Start`` is only emitted when ``published_commit`` matches the target;
-   otherwise it becomes ``Hold`` "release not confirmed".
+4. CI green proves the commit passed CI, not that the release asset was published for
+   it. A ``Start`` is only emitted when ``published_commit`` matches the target:
+   unknown evidence (the default) is ``Hold`` "release not confirmed"; with ancestry
+   confirmed the stage decision is made and a Start becomes that same Hold.
+5. ``target_on_main is None`` (not checked) with a confirmed release: ``Hold``
+   "target ancestry not confirmed".
+6. a target other than the plan's commit: ``Replan`` (generation + 1).
 
 Release evidence (contract for the caller; wiring to the real release-asset check is a
 later task): ``DeploymentCoordinator(evidence=fn)`` with
@@ -67,7 +69,12 @@ coordinator only ever Holds; that is intended (fail closed).
 A ``Start`` never means "restart this host now": hosts pull. It is a permission, ``allow
 the updaters of these components to proceed to target_commit``; ``components`` is
 cumulative (every component whose turn has come in this generation, earlier stages
-included), so a component that needs a repair keeps its permission. Repairs never
+included). Hold and Halt carry no permission list, so the consumer (Task 6) applies:
+permission = the components of the LAST ``Start`` of the CURRENT generation; a ``Halt``
+forbids new starts in its stage and later ones (repairs of an already-permitted
+component are Task 7's); a Replan withdraws everything of older generations. A stage-1
+component turning unhealthy after stage 2 started yields ``Hold``/``Halt`` at stage 1,
+so stage 2's turn is withdrawn until stage 1 has held again (the reset rule). Repairs never
 release a GPU (the definitions validator already refuses GPU-releasing restarts).
 Herdr-down handling stays on the hosts (Task 6).
 """
@@ -282,6 +289,10 @@ def advance(snapshot: Snapshot, definitions: dict, now: float) -> list:
         return [Hold(stage=None, remaining_s=None,
                      reason="target is an earlier release; the plan never goes back",
                      target_commit=target, generation=generation)]
+    published = same_commit(snapshot.published_commit, target)
+    if not published and snapshot.target_on_main is not True:
+        return [Hold(stage=None, remaining_s=None, reason="release not confirmed",
+                     target_commit=target, generation=generation)]
     if snapshot.target_on_main is not True:
         return [Hold(stage=None, remaining_s=None, reason="target ancestry not confirmed",
                      target_commit=target, generation=generation)]
@@ -291,7 +302,7 @@ def advance(snapshot: Snapshot, definitions: dict, now: float) -> list:
         out.append(Replan(new_target=target, generation=generation,
                           previous_commit=snapshot.plan_commit))
     action = _roll(snapshot, definitions, now, target, generation)
-    if isinstance(action, Start) and not same_commit(snapshot.published_commit, target):
+    if isinstance(action, Start) and not published:
         action = Hold(stage=action.stage, remaining_s=None, reason="release not confirmed",
                       target_commit=target, generation=generation)
     out.append(action)
