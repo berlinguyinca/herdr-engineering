@@ -53,7 +53,7 @@ Acceptance mapping:
 ## Regression run
 
 `pytest tests/control_plane -k "graph or collab or artifact or assistant or lineage or events or sink or envelope or ingest or test_db or contextual or workspace"`:
-see the section "Regression result" below. The full `pytest -q` and `scripts/ci/unit-gates.sh` were not run locally; CI is the authority.
+result: `3029 passed, 10 skipped, 1 xfailed, 2725 deselected in 861s`, zero failures (the P01 load-flaky tests passed this time). Skips/xfail are pre-existing, none added by P02. The full `pytest -q` and `scripts/ci/unit-gates.sh` were not run locally; CI is the authority.
 
 ## Rollback
 
