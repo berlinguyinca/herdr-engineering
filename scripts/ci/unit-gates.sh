@@ -6,6 +6,7 @@
 # It runs the whole suites, not a scoped subset: a scoped gate hides the breakage a change causes elsewhere.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
+. scripts/ci/journal.sh; ci_journal unit-gates
 
 need() { command -v "$1" >/dev/null 2>&1 || { echo "missing on this host: $1" >&2; exit 1; }; }
 need python3; need node; need git
