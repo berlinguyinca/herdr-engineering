@@ -75,8 +75,8 @@ Classification: **V** implemented and verified, **I** implemented but incomplete
 | Explain routing and provenance (7G) | M | |
 
 ## Security findings in the existing assistant (fix before widening it)
-1. `preauthorized=true` on a grant skips approval and any authenticated principal can create it over HTTP (`api.py:3028-3033`); requester and approver are the same principal.
-2. Empty command allowlist allows any command once `allow_shell` and a `run_shell` grant exist (`assistant.py:2078`).
+1. `preauthorized=true` on a grant skips approval (`api.py:3025`); requester and approver are the same principal. **Correction after reading more:** the audit overstated this as reachable by any authenticated principal; the route appears to require the `operator` role, so it is not changed. Not re-verified with a negative test; separate approver for sensitive tools remains an open design item.
+2. Empty command allowlist allowed any command once `allow_shell` and a `run_shell` grant existed (`assistant.py:2078`). **Fixed in S0** (fail closed; `test_run_shell_denied_when_allowlist_empty`).
 3. `POST /assistant-connectors/{id}/request` bypasses grants and approvals (`api.py:3093`).
 4. Request hash is not bound to principal, room or mission; no action TTL; no dry-run (`assistant.py:1623-1659`).
 5. `read_fleet` shows fleet data to any authenticated user.

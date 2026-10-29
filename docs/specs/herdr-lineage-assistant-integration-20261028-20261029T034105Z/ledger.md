@@ -10,8 +10,8 @@ Resume point for future agents. Update after every phase. Statuses are pass / pa
 | Phase | Status | Evidence |
 |---|---|---|
 | P0 audit | **done** (code reading only; no tests run) | `audit.md`, `reuse-map.md`, `rakazo-fit-gap.md`, `architecture.md`, `test-matrix.md` |
-| S0 assistant hardening | not started | |
-| S1 `read_lineage` tool | not started | |
+| S0 assistant hardening | **partial** (shell allowlist fail-closed done; connector-route grant bypass, action TTL/principal-bound hash, dry-run, tenant model not done) | `test_assistant_service.py::test_run_shell_denied_when_allowlist_empty`; all 162 `-k assistant` tests passed |
+| S1 `read_lineage` tool | **done at unit/service level**; not exercised through the live HTTP chat route or the UI | new `control_plane/assistant_lineage.py`; `tests/control_plane/test_assistant_lineage.py` (11 tests); wired in `api.py` beside `intelligence_read`; `-k 'assistant or graph or intel_assistant or api'` = 736 passed (4 min). Flag stays default-off; no grants by default |
 | S2 artifact-to-graph | not started | |
 | S3-S4 Pi continuity | not started (needs a pi-engineering worktree off `origin/main` `6082fb9`) | |
 | S5 UI | not started | |

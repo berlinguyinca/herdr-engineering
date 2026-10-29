@@ -485,6 +485,8 @@ class ControlPlaneServer:
         self.intelligence.ci_repair_fn = self._intelligence_ci_repair
         if getattr(self, "assistant", None) is not None:
             self.assistant.intelligence_read = self.intelligence.assistant_read
+            from .assistant_lineage import LineageReader, principal_resolver
+            self.assistant.lineage_read = LineageReader(repo.graph, principal_resolver(self._keys)).read
         self._configure_architecture_explain(fleet_config, architecture_explain)
         if collab is not None:
             collab.architecture = self.architecture
