@@ -297,11 +297,13 @@ class ControlPlaneServer:
                                     on_observation=repo.observe_ci_pipeline)
         # control_plane.deployment_definitions: a checkout of InferWeave deploy/pipelines (read live;
         # absent = none, and deployment ingest stays accept-all with a warning). Targets come from the
-        # CI monitor's last snapshot, never from a provider call here.
+        # CI monitor's last snapshot, never from a provider call here. It is only read once definitions
+        # are loaded, and start=True (idempotent) keeps the shared poller running from then on: without
+        # the review gate nothing else starts it, and a stopped poller would leave every target None.
         from .deployment_definitions import DeploymentDefinitions
         self.deployment_definitions = DeploymentDefinitions(
             lambda: self._control_plane_value(fleet_config, "deployment_definitions"),
-            ci_snapshot=lambda: self.ci_monitor.snapshot(start=False))
+            ci_snapshot=lambda: self.ci_monitor.snapshot(start=True))
         # control_plane.missions (validated; outcomes are written when a mission ends, on by default).
         from .mission_outcome import MissionOutcomes, missions_config
         self.missions_config = missions_config(missions)

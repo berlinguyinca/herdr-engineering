@@ -192,7 +192,8 @@ def test_a_broken_edit_keeps_the_last_good_set_and_reports_it(tmp_path):
     d = _write(tmp_path / "pipelines", STAGE1[:2])
     store = DeploymentDefinitions(lambda: str(d))
     assert store.status()["loaded"]
-    (d / "hive-gateway.yaml").write_text(yaml.safe_dump(dict(_definition("hive-gateway"), stage=9)))
+    # stage 99 changes the size too: a same-size rewrite within one mtime tick keeps the signature
+    (d / "hive-gateway.yaml").write_text(yaml.safe_dump(dict(_definition("hive-gateway"), stage=99)))
     st = store.status()
     assert st["loaded"] and st["errors"] == ["hive-gateway.yaml: stage must be 1 or 2"]
     assert set(store.definitions()) == {"hive-gateway", "hive-nodes"}   # still authorizing
@@ -418,5 +419,17 @@ def test_server_target_reads_the_ci_monitor_snapshot(defined_server):
     svr, _, _ = defined_server
     ci = CI()
     ci.add(5, C3)
-    svr.ci_monitor.snapshot = lambda start=True: ci()
+    calls = []
+    svr.ci_monitor.snapshot = lambda start=True: calls.append(start) or ci()
     assert svr.deployment_definitions.target_for("hive-gateway").commit == C3
+    assert calls and all(calls)        # start=True: the poller runs even without the review gate
+
+
+def test_no_definitions_never_reads_or_starts_ci(tmp_path, acknowledged_sink):
+    svr, _ = _server(tmp_path, acknowledged_sink, None)
+    try:
+        svr.ci_monitor.snapshot = lambda start=True: pytest.fail("CI read without definitions")
+        assert svr.deployment_definitions.target_for("hive-gateway") is None
+        assert svr.deployment_definitions.plans() == {}
+    finally:
+        svr.shutdown()
