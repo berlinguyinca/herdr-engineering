@@ -47,6 +47,11 @@ export const SURFACES = [
       { name: 'wbcomments', selector: 'ul.wb-comments' }, { name: 'wbfork', selector: '.wb-table-wrap' }, { name: 'wbpropose', selector: 'form[data-wb-form="propose"]' }, { name: 'wbsteers', selector: 'ul.wb-steers' }] },
   { slug: 'collab-lineage-gantt', sub: 'lineage', proof: 'svg.lin-svg', resetScroll: true, steps: async (page) => { await page.locator('[data-view="gantt"]').click(); await page.locator('svg.lin-svg[role=img]').waitFor(); },
     regions: [{ name: 'gantt', selector: 'svg.lin-svg[role=img]' }] },
+  // The Mission Workbench scenario (a 12-session Pi chain, a Claude branch and a Pi continuation, PR, CI, reviews, artifacts, a blocked
+  // task and a merge gate): its own seeded room. The step goes to the newest end of the chain and selects the last session before the fork.
+  { slug: 'collab-workbench', sub: 'lineage', proof: 'svg.lin-svg g[data-node]', resetScroll: true, fixture: { empty: true, workbench: true },
+    steps: async (page) => { await page.locator('[data-vp="end"]').click(); await page.locator('g[data-node="session:pi-12"]').focus(); await page.keyboard.press('Enter'); await page.locator('.lin-facts').waitFor(); await page.locator('.wb-comment, .wb-steer, .wb').first().waitFor().catch(() => {}); await page.evaluate(() => document.activeElement?.blur()); },
+    regions: [{ name: 'status', selector: '.lin-status' }, { name: 'graph', selector: '.lin-viewport' }, { name: 'inspector', selector: '.lin-inspector' }] },
   { slug: 'collab-flow', sub: 'flow', proof: '#hcn-flow svg.cx-flow', regions: [{ name: 'flowhead', selector: '#hcn-p-flow .cx-row--between' }] },
   { slug: 'collab-attention', sub: 'attention', proof: '.cx-attn-item', regions: [{ name: 'item', selector: '.cx-attn-item' }] },
   { slug: 'collab-progress', sub: 'progress', proof: '#hcn-p-progress' },
@@ -68,8 +73,20 @@ const NORMALIZE = () => {
   let n; while ((n = walker.nextNode())) { let v = n.nodeValue; for (const [re, to] of rules) v = v.replace(re, to); if (v !== n.nodeValue) n.nodeValue = v; }
 };
 
-export async function newDeterministicServer() {
-  return startRealServer({ fixed_clock: true });
+export async function newDeterministicServer(extra = {}) {
+  return startRealServer({ fixed_clock: true, ...extra });
+}
+
+/** A surface may need its own seeded room (the Mission Workbench scenario): `fixture` is extra real_server.py config. Surfaces with
+ *  the same fixture share one server; the default surfaces use `defaultServer`. */
+export const fixtureKey = (surface) => (surface.fixture ? JSON.stringify(surface.fixture) : '');
+export async function serversFor(surfaces, defaultServer) {
+  const map = new Map([['', defaultServer]]);
+  for (const s of surfaces) {
+    const k = fixtureKey(s);
+    if (!map.has(k)) map.set(k, await newDeterministicServer(s.fixture));
+  }
+  return { infoFor: (s) => map.get(fixtureKey(s)).info, stop: () => { for (const [k, v] of map) if (k) v.stop(); } };
 }
 
 // ---- fonts -----------------------------------------------------------------------------------------------------------
@@ -277,13 +294,14 @@ async function main() {
   if (!combos(filter).length) { console.error(`no surface matches "${filter}" (surfaces: ${SURFACES.map((x) => x.slug).join(', ')})`); process.exit(2); }
   if (cmd === 'update') refuseUnlessAllowed(argv);
   const srv = await newDeterministicServer();
+  const servers = await serversFor(SURFACES.filter((x) => x.slug.includes(filter)), srv);
   const browser = await launch();
   let failed = 0;
   const pending = [];
   try {
     mkdirSync(BASELINE_DIR, { recursive: true });
     for (const { surface, viewport, scheme } of combos(filter)) {
-      const shot = await capture(browser, srv.info, surface, viewport, scheme);
+      const shot = await capture(browser, servers.infoFor(surface), surface, viewport, scheme);
       const targets = [[fileFor(surface.slug, viewport, scheme), shot.page, (png) => checkAgainstBaseline(browser, png, surface.slug, viewport, scheme)],
         ...Object.entries(shot.regions).map(([name, png]) => [regionFileFor(surface.slug, name, scheme), png, (p) => checkRegion(browser, p, surface.slug, name, scheme)])];
       for (const [file, png, compare] of targets) {
@@ -313,7 +331,7 @@ async function main() {
     const sz = baselineSizes();
     console.log(`${sz.count} baselines, ${(sz.totalKb).toFixed(0)} KB total (cap ${CFG.screenshots.max_total_kb} KB), biggest ${sz.biggest ? `${sz.biggest.f} ${sz.biggest.kb.toFixed(0)} KB` : 'none'}`);
     if (sz.totalKb > CFG.screenshots.max_total_kb) { console.error('the baselines exceed the total size cap'); failed += 1; }
-  } finally { await browser.close(); srv.stop(); }
+  } finally { await browser.close(); srv.stop(); servers.stop(); }
   if (failed) { console.error(`${failed} problem(s); diffs are in ${path.relative(REPO, REPORT_DIR)}`); process.exit(1); }
 }
 if (import.meta.url === `file://${process.argv[1]}`) main();

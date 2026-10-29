@@ -1,7 +1,7 @@
 // T16 UI gates: large-graph performance on the REAL page. 2k / 5k / 10k nodes are written through the real ingest service
 // (tests/playwright/real_server.py `graph_nodes`), then the lineage tab is opened as a room owner and the browser is
 // measured: first render, every "Load more" page up to the whole graph, long tasks, key-to-frame latency while filtering,
-// JS heap. Also proves that above MAX_RENDER_NODES the SVG is skipped and the table alternative is shown and usable.
+// JS heap. Also proves that however many nodes are loaded the graph is a BOUNDED viewport (at most MAX_DRAWN_NODES nodes in the DOM) and the table alternative is shown and usable.
 //
 // Budgets live in ui-gates.yaml (perf:). The measurements are written to .autospec/reports/ui-gates-perf.json (not committed).
 // Run: node --test --test-concurrency=1 tests/playwright/ui-gates-perf.test.mjs
@@ -56,7 +56,7 @@ for (const n of SIZES) {
       await page.locator('[data-sub="lineage"]').click();
       await page.locator('#hcn-lineage svg.lin-svg g[data-node]').first().waitFor({ timeout: 60000 });
       const firstRender = Date.now() - t0;
-      assert.ok(await page.locator('svg.lin-svg g[data-node]').count() <= 300, 'first page is drawn as an SVG');
+      assert.ok(await page.locator('svg.lin-svg g[data-node]').count() <= 242, 'first page is drawn as a bounded SVG viewport');
 
       // page through the whole graph with the keyboard (Load more)
       const per = []; let pages = 1; const tAll = Date.now();
@@ -73,9 +73,11 @@ for (const n of SIZES) {
       const text = await page.locator('#hcn-lineage').innerText();
       const loaded = Number((text.match(/(\d+) nodes/) || [])[1] || 0);
 
-      // above the cap: no SVG, an explicit message and the table alternative
-      assert.equal(await page.locator('#hcn-lineage svg.lin-svg g[data-node]').count(), 0, 'the SVG graph is skipped above the cap');
-      assert.match(text, /more than the 300 drawn/);
+      // with everything loaded the drawing is still a bounded viewport (never one node per loaded node), and the table alternative exists
+      const drawnAll = await page.locator('#hcn-lineage svg.lin-svg g[data-node]').count();
+      assert.ok(drawnAll >= 1 && drawnAll <= 242, `${drawnAll} nodes drawn of ${loaded} loaded`);
+      assert.ok(await page.locator('#hcn-lineage [data-viewport] *').count() < 4000, 'the viewport holds a bounded number of elements');
+      assert.doesNotMatch(text, /more than the 300 drawn/);
       await page.getByRole('button', { name: 'Show as table' }).first().focus();
       await page.keyboard.press('Enter');
       const tt = Date.now();
@@ -136,7 +138,7 @@ test('typing in the filter of a graph above the draw cap redraws once, not once 
       if (before === null) break;
       await page.waitForFunction((b) => document.querySelector('#hcn-lineage')?.innerText !== b, before, { timeout: 60000 });
     }
-    assert.equal(await page.locator('#hcn-lineage svg.lin-svg g[data-node]').count(), 0, 'above the cap, so nothing is drawn');
+    assert.ok(await page.locator('#hcn-lineage svg.lin-svg g[data-node]').count() <= 242, 'the drawing stays bounded');
     const cdp = await ctx.newCDPSession(page);
     await cdp.send('Profiler.enable');
     await cdp.send('Profiler.startPreciseCoverage', { callCount: true, detailed: false });
@@ -162,9 +164,10 @@ test('typing in the filter of a graph above the draw cap redraws once, not once 
   } finally { srv.stop(); }
 });
 
-// The layout of a graph this size is expensive, and above the draw cap nothing is drawn from it. Typing is debounced, but a checkbox is
-// not: it must redraw at once, so it is the path that proves the layout is skipped when there is no SVG to lay out for.
-test('toggling a type filter on a graph above the draw cap is cheap: the layout is not computed for a graph that is not drawn', { timeout: 600000 }, async () => {
+// The layout of a graph this size is expensive. It is cached by content, so a redraw of the same graph (a pan, a zoom, a selection)
+// never lays it out again, and a filter change lays it out once, not once for the model and once more for the drawing. Typing is
+// debounced, but a checkbox is not: it redraws at once, so it is the path that counts layouts per toggle.
+test('toggling a type filter on a graph above the old draw cap is cheap: at most one layout per toggle', { timeout: 600000 }, async () => {
   const srv = await startRealServer({ graph_nodes: 3500 });
   try {
     const { ctx, page } = await openReal(browser, srv.info, 'alice');
@@ -176,7 +179,7 @@ test('toggling a type filter on a graph above the draw cap is cheap: the layout 
       await page.locator('[data-more]').focus(); await page.keyboard.press('Enter');
       await page.waitForFunction((b) => document.querySelector('#hcn-lineage')?.innerText !== b, before, { timeout: 60000 });
     }
-    assert.equal(await page.locator('#hcn-lineage svg.lin-svg g[data-node]').count(), 0, 'above the cap, so nothing is drawn');
+    assert.ok(await page.locator('#hcn-lineage svg.lin-svg g[data-node]').count() <= 242, 'the drawing stays bounded');
     await page.evaluate(() => { window.__t = []; });
     // Count calls instead of trusting a stopwatch: the layout of this graph costs only tens of milliseconds, which no budget can tell
     // from noise, but a graph that is not drawn must not be laid out at all.
@@ -204,7 +207,7 @@ test('toggling a type filter on a graph above the draw cap is cheap: the layout 
     }
     const after = await layoutCalls();
     assert.ok(after.rendered >= 6, `the call counter works: renderLineage ran ${after.rendered} times for 6 toggles`);
-    assert.equal(after.n, 0, `layoutGraph ran ${after.n} times while a graph above the draw cap was filtered (nothing is drawn from its result)`);
+    assert.ok(after.n <= 6, `layoutGraph ran ${after.n} times for 6 filter toggles (at most one each; it is cached by content)`);
     const med = median(times);
     console.log(JSON.stringify({ toggleFilterMs: times, median: med, hostSlowdown: Number(scale.toFixed(2)) }));
     report.toggle = { nodes: 3500, ms: times, median: med, hostSlowdown: Number(scale.toFixed(2)) };
