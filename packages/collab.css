@@ -486,3 +486,8 @@ button.ctx-chip:focus-visible, .ctx-chip:focus-visible { outline: 2px solid curr
 .lin-mm-view { fill: color-mix(in srgb, var(--accent, #1f7ae0) 18%, transparent); stroke: var(--accent, #1f7ae0); stroke-width: 1.5; }
 .lin-minimap, .lin-mm, .lin-mm-view { transition: none; animation: none; }
 .lin-termauth .lin-tool { min-height: 44px; }
+/* display:flex drops the browser's disclosure marker: draw one (no animation) */
+.lin-filterbox > summary, .lin-legend > summary { list-style: none; gap: 8px; }
+.lin-filterbox > summary::-webkit-details-marker, .lin-legend > summary::-webkit-details-marker { display: none; }
+.lin-filterbox > summary::before, .lin-legend > summary::before { content: '▸'; display: inline-block; }
+.lin-filterbox[open] > summary::before, .lin-legend[open] > summary::before { content: '▾'; }
