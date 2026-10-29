@@ -230,7 +230,8 @@ request** that the host updater picks up on its next poll. The routes (each also
   - `control_plane.deployment_actions: true` (otherwise 403).
   - The operator role, by `X-API-Key`.
   - A `Host` a rebinding name cannot reach: an IP literal, `localhost`, or a name listed in the collab dashboard
-    hosts.
+    hosts. A listed name is compared with the whole `Host` header, so list it as `host:port` (for example
+    `herdr.example:8443`) whenever the browser reaches the dashboard on a non-default port.
   - No cross-site `Sec-Fetch-Site`; only `same-origin` or `none` is accepted, and a client that sends none is fine.
   - An `Origin`, when present, whose host equals `Host`. Its scheme may be http or https, because TLS may be
     terminated in front.

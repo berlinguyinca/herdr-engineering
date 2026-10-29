@@ -867,3 +867,58 @@ def test_a_force_overrides_staging_only_even_with_confirmed_evidence(current, ok
     out = da.permit_decision(meta, view, "whiteale-gateway", C1, "force-" + "e" * 16, now=now,
                              component_stage=2)
     assert out["permitted"] is ok and out["forced"] is ok and out["generation"] == 3
+
+
+# ------------------------------------------------------------------ end-of-plan minors
+class _LegacySink:
+    """A best-effort sink without record_required."""
+
+    def __init__(self):
+        self.events = []
+
+    def record(self, ev):
+        self.events.append(ev)
+
+
+def test_a_legacy_sink_fails_safe_for_durable_deployment_rows(tmp_path):
+    repo = ControlPlaneRepo(sink=_LegacySink())
+    with pytest.raises(RuntimeError):
+        repo._persist_deployments_required({"entity_type": "x", "payload": {}})
+    w = World(tmp_path, sink=_LegacySink())
+    try:
+        w.svr.deployments_tick()
+        status, body = w.force({"component": "hive-gateway"})
+        assert status == 503 and body["error"] == "audit_persistence_failed"
+        assert w.repo.deployment_requests.pending() == []
+    finally:
+        w.close()
+
+
+def test_a_legacy_sink_pickup_answers_503_and_stays_pending():
+    store = da.ForceRequests(persist_required=ControlPlaneRepo(sink=_LegacySink())._persist_deployments_required)
+    store.add("component", "hive-gateway", {"hive-gateway": (C1, 1)}, "operator:x")
+    [req] = store.pending()
+    with pytest.raises(RuntimeError):
+        store.clear(req["id"], ["hive-gateway"], "hive")
+    assert store.entries(["hive-gateway"])
+
+
+def test_pickup_rows_skip_the_refusal_throttle(world):
+    world.stage1_holding()
+    world.svr._deployment_refused_rows = da.AuditThrottle(limit=0)      # refusals: none may land
+    rid = world.force({"component": "whiteale-gateway"})[1]["request"]["id"]
+    assert world.clear(rid, WHITEALE_TOKEN)[0] == 200
+    picked = [a for a in world.audits() if a["payload"]["outcome"] == "picked-up"]
+    assert len(picked) == 1
+    assert world.refused().get("force: audit row throttled") is None
+
+
+def test_refusal_rows_are_neither_in_the_feed_nor_published(world):
+    seen = []
+    world.repo.subscribe(seen.append)
+    world.svr.deployment_refused("force", "operator:x", 400, "bad body")
+    rows = [a for a in world.audits() if a["payload"]["outcome"] == "refused"]
+    assert len(rows) == 1
+    assert not any(e.get("entity_type") == da.AUDIT_ENTITY for e in seen)
+    assert not any(t[0] == da.AUDIT_ENTITY and t[2] == rows[0]["sequence"]
+                   for t in world.repo._event_order if t[1] == rows[0]["entity_id"])

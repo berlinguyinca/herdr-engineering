@@ -723,11 +723,13 @@ class ControlPlaneServer:
         return last, view
 
     def deployment_audit(self, action, event_type, *, outcome, actor, target, reason, status,
-                         durable=False, **extra):
+                         durable=False, refusal=True, **extra):
         """One audit row (``deployment_action``, one stream per action per UTC day, which bounds
         record_event's per-stream sequence scan). Every value is validated or ours. ``durable``
         rows raise when they cannot be persisted; refusal rows never raise, stay out of the
-        shared feed and are throttled (the overflow is counted)."""
+        shared feed (and the live listeners) and are throttled (the overflow is counted).
+        ``refusal=False`` (a host pickup): best effort, never throttled, and in the feed like
+        an accepted row."""
         from .deployment_actions import AUDIT_ENTITY, stamp
         now = time.time()
         payload = {"action": action, "outcome": outcome, "actor": actor, "target": target,
@@ -736,11 +738,18 @@ class ControlPlaneServer:
         if durable:
             self.repo.record_event(AUDIT_ENTITY, stream, event_type, payload, require_durable=True)
             return
+        if not refusal:
+            try:
+                self.repo.record_event(AUDIT_ENTITY, stream, event_type, payload)
+            except Exception:  # noqa: BLE001 - the clear itself was persisted durably
+                log.warning("deployment %s audit row could not be recorded", action)
+            return
         if not self._deployment_refused_rows.take():
             self._deployment_count_refusal(action, "audit row throttled")
             return
         try:
-            self.repo.record_event(AUDIT_ENTITY, stream, event_type, payload, feed=False)
+            self.repo.record_event(AUDIT_ENTITY, stream, event_type, payload, feed=False,
+                                   publish=False)
         except Exception:  # noqa: BLE001 - a refusal is answered whether or not its row lands
             log.warning("deployment %s refusal could not be audited", action)
 
@@ -892,7 +901,7 @@ class ControlPlaneServer:
         if done:
             self.deployment_audit("force", "DeploymentForcePickedUp", outcome="picked-up",
                                   actor=f"host:{host}", target={"request_id": rid}, reason="cleared",
-                                  status=200, host=host, components=done)
+                                  status=200, refusal=False, host=host, components=done)
         return done
 
     @staticmethod

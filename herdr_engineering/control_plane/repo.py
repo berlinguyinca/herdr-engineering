@@ -260,10 +260,14 @@ class ControlPlaneRepo:
         record (a force pickup must not be lost, or a restart would grant the force again)."""
         if self._sink is None:
             return
+        required = getattr(self._sink, "record_required", None)
+        if not callable(required):
+            # a legacy best-effort sink cannot acknowledge: fail safe (the route answers 503)
+            raise RuntimeError("durable deployment persistence requires an acknowledged sink")
         stamp = self._stamp()
-        self._sink.record_required({"event_id": new_id("event"), "schema_version": 1,
-                                    "source_timestamp": stamp, "ingest_timestamp": stamp,
-                                    "mission_id": None, "session_id": None, **ev})
+        required({"event_id": new_id("event"), "schema_version": 1,
+                  "source_timestamp": stamp, "ingest_timestamp": stamp,
+                  "mission_id": None, "session_id": None, **ev})
 
     def _persist_host_metrics(self, ev):
         """Rollups and host-state changes go to the sink, not the shared streams/SSE."""
