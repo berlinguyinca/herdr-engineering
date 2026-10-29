@@ -119,7 +119,14 @@ class PostgresSource(DurableSource):
             "hosts": [dict(r) for r in await conn.fetch("SELECT * FROM hosts")],
         }
         phase("entity tables")
-        query = f"SELECT * FROM {self._events_table} ORDER BY ingest_timestamp, sequence"
+        inspector_row, skip_upto = await self._inspector_snapshot_row(conn)
+        where = ""
+        if skip_upto is not None:
+            # The snapshot already holds these rows' effect. Rows with envelope metadata still load: the ledger
+            # replays those, and the snapshot never covered them.
+            where = (f"WHERE NOT (entity_type = 'inspector' AND sequence <= {int(skip_upto)} "
+                     "AND (source IS NULL OR source_sequence IS NULL)) ")
+        query = f"SELECT * FROM {self._events_table} {where}ORDER BY ingest_timestamp, sequence"
         if use_cursor:
             events = []
             decode = 0.0
@@ -138,15 +145,58 @@ class PostgresSource(DurableSource):
         else:
             events = [dict(row) for row in await conn.fetch(query)]
         snapshot["events"] = events
-        if self._inspector_snapshots:
-            # Optional optimisation: a missing table or row just means a full replay.
-            try:
-                row = await conn.fetchrow("SELECT schema_version, fingerprint, watermark, event_count, body "
-                                          "FROM inspector_snapshots WHERE id = 1")
-                snapshot["inspector_snapshot"] = dict(row) if row is not None else None
-            except Exception:  # noqa: BLE001
-                snapshot["inspector_snapshot"] = None
+        snapshot["inspector_snapshot"] = inspector_row
         return snapshot
+
+    async def _inspector_snapshot_row(self, conn) -> tuple[dict | None, int | None]:
+        """The stored inspector snapshot and, when the event log below its watermark is verifiably the one it
+        consumed, that watermark (the boot then does not load those rows). An optimisation only: a missing table
+        or row, or any doubt, means every row loads and the repo replays them all."""
+        if not self._inspector_snapshots:
+            return None, None
+        try:
+            row = await conn.fetchrow("SELECT schema_version, fingerprint, watermark, event_count, body "
+                                      "FROM inspector_snapshots WHERE id = 1")
+            if row is None:
+                return None, None
+            row = dict(row)
+            covered = await conn.fetchval(
+                f"SELECT count(*) FROM {self._events_table} WHERE entity_type = 'inspector' AND entity_id IS NOT NULL "
+                "AND entity_id <> '' AND sequence <= $1", int(row["watermark"]))
+            row["covered_count"] = int(covered)
+            if int(covered) != int(row["event_count"]):
+                return row, None
+            row["skipped_upto"] = int(row["watermark"])
+            return row, int(row["watermark"])
+        except Exception:  # noqa: BLE001
+            return None, None
+
+    def inspector_backfill(self) -> list[dict]:
+        """The inspector rows a boot skipped because a snapshot covered them, for the case where the repo refuses
+        that snapshot. Same shape as the rows the boot normally loads."""
+        row = self._load().get("inspector_snapshot") or {}
+        upto = row.get("skipped_upto")
+        if upto is None:
+            return []
+        return self._run(self._fetch_backfill(int(upto)))
+
+    async def _fetch_backfill(self, upto: int) -> list[dict]:
+        if self._conn is None:
+            import asyncpg
+            self._conn = await asyncpg.connect(self._dsn)
+        rows = await self._conn.fetch(
+            f"SELECT * FROM {self._events_table} WHERE entity_type = 'inspector' AND sequence <= $1 "
+            "AND (source IS NULL OR source_sequence IS NULL) ORDER BY ingest_timestamp, sequence", upto)
+        out = []
+        for r in rows:
+            event = dict(r)
+            event["payload"] = _ev_payload(event)
+            for name in ("actor", "evidence_refs"):
+                if name in event:
+                    event[name] = _v2_value(name, event[name])
+            out.append(event)
+        streams, _ = _rebuild_events(out, reuse=True)
+        return [e for stream in streams.values() for e in stream]
 
     def missions(self) -> list[dict]:
         return self._load()["missions"]
@@ -601,6 +651,7 @@ def load_into(repo, source: DurableSource) -> dict:
         "hosts": hosts, "artifacts": artifacts, "blobs": {}, "leases": {},
         "telemetry": {}, "events": events, "event_order": event_order,
         "inspector_snapshot": source.inspector_snapshot() if isinstance(source, PostgresSource) else None,
+        "inspector_backfill": source.inspector_backfill if isinstance(source, PostgresSource) else None,
     })
     return {"missions": len(missions), "sessions": len(sessions),
             "services": len(services), "hosts": len(hosts),

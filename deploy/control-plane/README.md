@@ -313,7 +313,10 @@ The control plane replays every stored inspector event at boot. At ~780k events 
 (`boot import_state: agent, inspector and host projections` in the web log). With
 `control_plane.inspector_snapshots.enabled: true` the **worker** keeps a shadow inspector fed only by that same
 replay and writes it to the `inspector_snapshots` table (migration `0030`) every `interval_seconds`; the **web**
-loads it and replays only newer events.
+loads it and replays only newer events. When it has checked in SQL that the stored inspector rows up to the
+snapshot's watermark are exactly the ones the snapshot consumed (same count), it does not even load those rows from
+Postgres (they are about a third of the data); if the repo then refuses the snapshot it fetches them on demand, and a
+boot never proceeds with an incomplete inspector.
 
 It is an optimisation, never a source of truth. The web replays everything, and logs why
 (`boot inspector replay: full:<reason>`), when the snapshot is missing or unreadable, was built under other

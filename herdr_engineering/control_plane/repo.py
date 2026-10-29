@@ -3384,7 +3384,8 @@ class ControlPlaneRepo:
         self._event_order = [t for t in self._event_order if t[0] not in ("collab", "review_request")]
         if durable:
             from .inspector_snapshot import apply_to_store
-            outcome = apply_to_store(self.inspector, state.get("inspector_snapshot"), durable)
+            outcome = apply_to_store(self.inspector, state.get("inspector_snapshot"), durable,
+                                    backfill=state.get("inspector_backfill"))
             logging.getLogger(__name__).info("boot inspector replay: %s (%d events)", outcome, len(durable))
         # Deployment events ride a private stream too: untrusted host evidence never enters the shared feed.
         deployment_rows = []
