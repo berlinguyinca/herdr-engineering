@@ -14,11 +14,11 @@ import { mkdtempSync, writeFileSync, readdirSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { CFG, launch, openReal, openSub } from '../playwright/ui-gates-lib.mjs';
-import { FONT_DIR, SURFACES, VIEWPORTS, assertBundledFonts, baselineSizes, bundledFontCss, capture, expectedBaselineFiles, orphanBaselines, projectedTotalKb, checkAgainstBaseline, checkRegion, diffPng, newDeterministicServer } from '../playwright/visual-baselines.mjs';
+import { FONT_DIR, SURFACES, VIEWPORTS, assertBundledFonts, baselineSizes, bundledFontCss, capture, expectedBaselineFiles, orphanBaselines, projectedTotalKb, checkAgainstBaseline, checkRegion, diffPng, newDeterministicServer, serversFor } from '../playwright/visual-baselines.mjs';
 
-let srv; let browser;
-before(async () => { srv = await newDeterministicServer(); browser = await launch(); });
-after(async () => { await browser?.close(); srv?.stop(); });
+let srv; let browser; let servers;
+before(async () => { srv = await newDeterministicServer(); servers = await serversFor(SURFACES, srv); browser = await launch(); });
+after(async () => { await browser?.close(); srv?.stop(); servers?.stop(); });
 
 const surface = (slug) => SURFACES.find((s) => s.slug === slug);
 
@@ -159,7 +159,7 @@ for (const scheme of ['light', 'dark']) {
     test(`visual regression: ${viewport} ${scheme}, every surface within budget of its baseline`, async () => {
       const bad = [];
       for (const s of SURFACES) {
-        const shot = await capture(browser, srv.info, s, viewport, scheme);
+        const shot = await capture(browser, servers.infoFor(s), s, viewport, scheme);
         const r = await checkAgainstBaseline(browser, shot.page, s.slug, viewport, scheme);
         if (!r.ok) bad.push(`${r.name}: ${r.why}`);
         for (const [name, png] of Object.entries(shot.regions)) {

@@ -568,3 +568,21 @@ def test_without_the_ci_fix_service_there_is_no_source_and_a_broken_one_is_parti
     service.list = boom
     body = inbox2.snapshot()
     assert body["unavailable"] == ["ci_fix"] and body["items"][0]["key"] == "source:ci_fix"
+
+
+def test_an_agent_item_names_the_handoff_that_gave_it_its_task_and_only_recorded_ones():
+    from herdr_engineering.control_plane.handoffs import HandoffRegistry
+    repo, _, clock, view = _world()
+    registry = HandoffRegistry(repo, now=lambda: clock[0])
+    inbox = AttentionInbox(repo, ci_snapshot=lambda: view, now=lambda: clock[0], handoffs=lambda: registry)
+    receiver = repo.create_session(agent_role="coder")
+    stray = repo.create_session(agent_role="reviewer")
+    repo._sessions[receiver]["status"] = "failed"
+    repo._sessions[stray]["status"] = "failed"
+    registry.create({"handoff_id": "h-1", "source_harness": "claude", "target_harness": "codex", "source_agent_id": "planner",
+                     "source_session_id": "planner-session", "target_session_id": receiver, "goal": "Fix the parser"}, "tester")
+    items = {i["key"]: i for i in inbox.snapshot()["items"]}
+    (link,) = items[f"session:{receiver}"]["handoffs"]
+    assert (link["direction"], link["state"], link["goal"], link["agent"]) == ("in", "queued", "Fix the parser", "planner")
+    assert link["href"] == "#/herd/session/planner-session"
+    assert items[f"session:{stray}"]["handoffs"] == []        # no recorded handoff: nothing is guessed

@@ -5,9 +5,7 @@
 # git, Chromium's shared libraries, and fontconfig with /etc/fonts/conf.d (docs/operations/ui-gates.md, "CI").
 set -euo pipefail
 cd "$(dirname "$0")/../.."
-journal="${TMPDIR:-/tmp}/herdr-ui-gates-$$.log"
-echo "journal: $journal"        # first, so a run is readable even when the agent drops the tail of the step log
-exec > >(tee "$journal") 2>&1
+. "$(dirname "$0")/journal.sh"; ci_journal ui-gates     # first, so a run is readable even when the agent drops the tail of the step log
 
 need() { command -v "$1" >/dev/null 2>&1 || { echo "missing on this host: $1" >&2; exit 1; }; }
 need node; need python3; need git

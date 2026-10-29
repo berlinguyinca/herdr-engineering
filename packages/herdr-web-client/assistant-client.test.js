@@ -120,3 +120,34 @@ test('registerDelegationArtifact POSTs to the artifact endpoint', async () => {
   assert.equal(calls[0].url, '/api/v1/assistant-delegations/dlg1/artifact');
   assert.equal(JSON.parse(calls[0].opts.body).artifact_ref, 'artifact://mission/MSN-1');
 });
+
+test('testConnector posts the assistant to the gated test route (not the bare request route)', async () => {
+  const { calls, fetchImpl } = capture();
+  const c = new HerdrClient('', { fetchImpl });
+  await c.testConnector('conn 1', { assistant_id: 'asst1' });
+  assert.equal(calls[0].url, '/api/v1/assistant-connectors/conn%201/test');
+  assert.equal(calls[0].opts.method, 'POST');
+  assert.equal(JSON.parse(calls[0].opts.body).assistant_id, 'asst1');
+});
+
+test('proposal, execute and notification calls hit the documented routes', async () => {
+  const { calls, fetchImpl } = capture();
+  const c = new HerdrClient('', { fetchImpl });
+  await c.listProposals('approved');
+  await c.previewProposal('p1');
+  await c.decideProposal('p1', 'rejected');
+  await c.executeProposal('p1');
+  await c.executeApproval('a1');
+  await c.listNotifications('ready');
+  await c.ackNotification('n1');
+  assert.deepEqual(calls.map(x => [x.opts.method, x.url]), [
+    ['GET', '/api/v1/assistant-proposals?status=approved'],
+    ['GET', '/api/v1/assistant-proposals/p1/preview'],
+    ['POST', '/api/v1/assistant-proposals/p1/decision'],
+    ['POST', '/api/v1/assistant-proposals/p1/execute'],
+    ['POST', '/api/v1/assistant-approvals/a1/execute'],
+    ['GET', '/api/v1/assistant-notifications?state=ready'],
+    ['POST', '/api/v1/assistant-notifications/n1/ack'],
+  ]);
+  assert.equal(JSON.parse(calls[2].opts.body).decision, 'rejected');
+});

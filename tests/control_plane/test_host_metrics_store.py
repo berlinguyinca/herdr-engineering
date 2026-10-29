@@ -262,3 +262,18 @@ def test_legacy_rollup_with_sample_never_overwrites_latest():
          "payload": {"rollup": {"ts": T0, "cpu": 9.0, "n": 10}, "latest": {"cpu": 9.0}}},
     ]
     assert store.hydrate(events)["bender"]["latest"] == {"cpu": 5.0, "at": "t1"}
+
+
+def test_hydrate_replays_many_rollups_in_linear_time_and_the_later_duplicate_wins():
+    """Boot replays every stored rollup; filtering the list per event made 1M telemetry events take minutes."""
+    import time
+    now = 1_000_000.0
+    store = HostMetricsStore(now=lambda: now)
+    events = [{"entity_id": "bender", "event_type": "HostMetricsRollup", "sequence": i,
+               "payload": {"rollup": {"ts": now - 3600 + (i % 3000), "marker": i}}} for i in range(60_000)]
+    started = time.monotonic()
+    store.hydrate(events)
+    assert time.monotonic() - started < 3.0
+    rows = store._rollups["bender"]
+    assert [r["ts"] for r in rows] == sorted({r["ts"] for r in rows}) and len(rows) == 3000
+    assert max(r["marker"] for r in rows) > 57_000        # each ts kept its LATEST event

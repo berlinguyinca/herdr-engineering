@@ -166,6 +166,20 @@ def _runtime(value):
     return {k: v for k, v in out.items() if v is not None}
 
 
+class _BootPhases:
+    """Logs how long each startup phase takes, so a slow boot says where the time went."""
+
+    def __init__(self, name):
+        self._log = logging.getLogger(__name__)
+        self._name = name
+        self._start = self._last = time.monotonic()
+
+    def __call__(self, phase):
+        now = time.monotonic()
+        self._log.info("boot %s: %s took %.1fs (total %.1fs)", self._name, phase, now - self._last, now - self._start)
+        self._last = now
+
+
 class ControlPlaneRepo:
     """In-memory structured control-plane state with event sequencing."""
 
@@ -2731,6 +2745,13 @@ class ControlPlaneRepo:
             return [eid for (etype, eid), stream in self._events.items()
                     if etype == entity_type and stream]
 
+    def events_of_type(self, entity_type):
+        """Every stored event of one entity type, oldest stream first (a copy). Used to read back append-only logs
+        that a service writes through ``record_event`` (e.g. the assistant audit log) after a restart."""
+        with self._event_lock:
+            return [_copy(e) for (etype, _), stream in sorted(self._events.items()) if etype == entity_type
+                    for e in stream]
+
     def recent_events(self, limit=50):
         out = []
         by_sequence = {}
@@ -3238,6 +3259,7 @@ class ControlPlaneRepo:
 
     def import_state(self, state):
         """Restore state from an export (used by restore tests / recovery)."""
+        phase = _BootPhases("import_state")
         self._missions = dict(state.get("missions", {}))
         self._sessions = dict(state.get("sessions", {}))
         self._services = dict(state.get("services", {}))
@@ -3267,6 +3289,7 @@ class ControlPlaneRepo:
             t, i = key.split("|")
             self._events[(t, i)] = [dict(e) for e in stream]
         self._event_order = [tuple(x) for x in state.get("event_order", [])]
+        phase("copy event streams")
         # Scheduler reservations are event-sourced, so a restart can recover
         # even when the structured export contains only the event streams.
         self._scheduler_observations = {}
@@ -3293,8 +3316,11 @@ class ControlPlaneRepo:
                 payload = _payload(event)
                 if payload:
                     self._scheduler_reservations[entity_id] = _deep_copy(payload)
+        phase("scheduler state")
         self.ledger.hydrate([e for stream in self._events.values() for e in stream])
+        phase("ledger")
         self._rebuild_graph()
+        phase("lineage graph")
         if not delivery_present:
             # The bridge durable-reload path restores event streams but carries no
             # delivery snapshot; rebuild the projections from those streams so
@@ -3308,6 +3334,7 @@ class ControlPlaneRepo:
         self._ci_test_projection = None
         self._ci_history_truncated = set(state.get('ci_history_truncated', []))
         self._trim_ci_history()
+        phase("delivery and CI history")
         # Replay durable naming reservations before any session is presented.
         # Summary continuity lives outside transcript retention and public feeds.
         projections = list(state.get("agent_projections", []))
@@ -3356,7 +3383,9 @@ class ControlPlaneRepo:
                 ", ".join(sorted(set(self.collab_quarantine_reasons))))
         self._event_order = [t for t in self._event_order if t[0] not in ("collab", "review_request")]
         if durable:
-            self.inspector.hydrate(durable)
+            from .inspector_snapshot import apply_to_store
+            outcome = apply_to_store(self.inspector, state.get("inspector_snapshot"), durable)
+            logging.getLogger(__name__).info("boot inspector replay: %s (%d events)", outcome, len(durable))
         # Deployment events ride a private stream too: untrusted host evidence never enters the shared feed.
         deployment_rows = []
         for key in [k for k in self._events if k[0] == DEPLOYMENT_ENTITY]:
@@ -3407,6 +3436,7 @@ class ControlPlaneRepo:
                 host = self._hosts.setdefault(entity_id, {"host_id": entity_id, "host_name": entity_id})
                 if policy.get("revision", -1) >= (host.get("scheduler_policy") or {}).get("revision", -1):
                     host["scheduler_policy"] = _deep_copy(policy)
+        phase("agent, inspector and host projections")
 
     def _rebuild_graph(self):
         """Replay stored ``lineage`` envelope rows into a fresh projection.
@@ -3426,6 +3456,8 @@ class ControlPlaneRepo:
             except ValueError:
                 graph.events_rejected += 1
         graph._seq = max([graph._seq] + [_graph_lseq(e) for e in rows])
+        graph._write_gates = dict(self.graph._write_gates)
+        graph._node_gates = dict(self.graph._node_gates)    # read-time gates are server config, not stored state
         self.graph = graph
         self._event_order = [t for t in self._event_order if t[0] != "lineage"]
 

@@ -66,7 +66,7 @@ export function mountPersonalAssistant(container, client, { onFreshness = () => 
       ${selected && configOpen ? `<section class="hd-card pa-config" aria-label="Configure ${esc(selected.name)}">
         <div class="pa-row"><div class="pa-status ${statusClass(selected.status)}"><span class="hd-status__dot"></span>${esc(statusLabel(selected.status))}</div>
           <span class="pa-muted">${esc(selected.assistant_id)}</span><span class="pa-badge">${selected.enabled ? 'enabled' : 'disabled'}</span></div>
-        <div class="pa-tabs">${['General', 'Permissions', 'Memory', 'Routines', 'Connectors', 'Delegations', 'Approvals', 'Diagnostics'].map(t =>
+        <div class="pa-tabs">${['General', 'Permissions', 'Memory', 'Routines', 'Connectors', 'Delegations', 'Approvals', 'Proposals', 'Notifications', 'Diagnostics'].map(t =>
           `<button class="pa-tab ${state.tab === t ? 'pa-tab--active' : ''}" data-tab="${t}">${t}</button>`).join('')}</div>
         <div id="pa-panel">${renderPanel(selected)}</div></section>` : ''}`;
     container.querySelector('[data-select]')?.addEventListener('change', e => { state.selectedId = e.target.value; draw(); });
@@ -116,6 +116,8 @@ export function mountPersonalAssistant(container, client, { onFreshness = () => 
     if (state.tab === 'Connectors') return `<div id="pa-connectors">${skeleton('connectors')}</div>`;
     if (state.tab === 'Delegations') return `<div id="pa-delegations">${skeleton('delegations')}</div>`;
     if (state.tab === 'Approvals') return `<div id="pa-approvals">${skeleton('approvals')}</div>`;
+    if (state.tab === 'Proposals') return `<div id="pa-proposals">${skeleton('proposals')}</div>`;
+    if (state.tab === 'Notifications') return `<div id="pa-notifications">${skeleton('notifications')}</div>`;
     return `<div id="pa-diagnostics">${skeleton('diagnostics')}</div>`;
   };
 
@@ -167,6 +169,10 @@ export function mountPersonalAssistant(container, client, { onFreshness = () => 
     if (delegations) loadDelegations(delegations, a);
     const approvals = panel.querySelector('#pa-approvals');
     if (approvals) loadApprovals(approvals, a);
+    const proposals = panel.querySelector('#pa-proposals');
+    if (proposals) loadProposals(proposals, a);
+    const notifications = panel.querySelector('#pa-notifications');
+    if (notifications) loadNotifications(notifications, a);
     const diag = panel.querySelector('#pa-diagnostics');
     if (diag) loadDiagnostics(diag, a);
   };
@@ -279,17 +285,38 @@ export function mountPersonalAssistant(container, client, { onFreshness = () => 
           <div class="pa-msg pa-msg--meta">
             <strong>${esc(c.name)}</strong> · ${esc(c.kind)} · ${esc(c.base_url)}
             · auth ${c.auth_present ? 'yes' : 'no'} · ${c.enabled ? 'enabled' : 'disabled'}
-            <button class="hd-btn hd-btn--sm" data-creq="${esc(c.connector_id)}">Test</button>
+            <button class="hd-btn hd-btn--sm" data-creq="${esc(c.connector_id)}" aria-label="Test connector ${esc(c.name)}">Test</button>
             <button class="hd-btn hd-btn--danger hd-btn--sm" data-carc="${esc(c.connector_id)}">Archive</button>
+            <div data-cstatus="${esc(c.connector_id)}" role="status" aria-live="polite"></div>
           </div>`).join('') : '<div class="pa-muted">No connectors registered.</div>'}</div>`;
       el.querySelector('[data-ccreate]').addEventListener('click', async () => {
         const hosts = el.querySelector('[data-callow]').value.split(',').map(s => s.trim()).filter(Boolean);
         await client.registerConnector({ name: el.querySelector('[data-cname]').value || 'Connector', kind: el.querySelector('[data-ckind]').value, base_url: el.querySelector('[data-curl]').value, auth: { _allowed_origins: hosts } });
         await loadConnectors(el, a);
       });
+      // The check goes through the same gate as every tool call: it may be refused (no grant), answer, or wait for an
+      // approval, and the row says which. Nothing is called until a person approves.
       el.querySelectorAll('[data-creq]').forEach(b => b.addEventListener('click', async () => {
-        const res = await client.connectorRequest(b.dataset.creq, { path: '/' });
-        window.alert(`Connector test: ${res.ok ? 'ok' : (res.reason || res.error || 'denied')}`);
+        const out = [...el.querySelectorAll('[data-cstatus]')].find(n => n.dataset.cstatus === b.dataset.creq);
+        b.disabled = true;
+        out.className = 'pa-msg pa-msg--meta'; out.textContent = 'Checking…';
+        try {
+          const res = await client.testConnector(b.dataset.creq, { assistant_id: a.assistant_id });
+          out.textContent = res.replayed ? 'Connector test: already ran.' : `Connector test: ${res.ok ? 'ok' : (res.reason || res.error || 'denied')}`;
+        } catch (e) {
+          const body = (e && e.body) || {};
+          if (e && e.status === 403 && body.code === 'approval_needed') {
+            out.className = 'pa-msg pa-approval';
+            out.textContent = `Approval pending (${body.approval_id}). ${body.dry_run || ''} Nothing was called. `;
+            const go = document.createElement('button');
+            go.className = 'hd-linkbtn'; go.type = 'button'; go.textContent = 'Open approvals';
+            go.addEventListener('click', () => { state.tab = 'Approvals'; draw(); });
+            out.appendChild(go);
+          } else {
+            out.className = 'pa-msg pa-msg--meta';
+            out.textContent = `Connector test: ${body.error || (e && e.message) || 'failed'}`;
+          }
+        } finally { b.disabled = false; }
       }));
       el.querySelectorAll('[data-carc]').forEach(b => b.addEventListener('click', async () => { await client.archiveConnector(b.dataset.carc); await loadConnectors(el, a); }));
     } catch (error) { el.innerHTML = `<herdr-error message="${esc(error.message)}"></herdr-error>`; }
@@ -318,21 +345,113 @@ export function mountPersonalAssistant(container, client, { onFreshness = () => 
     } catch (error) { el.innerHTML = `<herdr-error message="${esc(error.message)}"></herdr-error>`; }
   };
 
-  const loadApprovals = async (el, a) => {
+  const errText = (e) => ((e && e.body && e.body.error) || (e && e.message) || 'failed');
+  const when = (iso) => { const t = Date.parse(iso || ''); return t ? new Date(t).toLocaleString() : ''; };
+  const flashHtml = (flash) => `<div class="pa-flash" role="${flash && flash.error ? 'alert' : 'status'}" aria-live="polite">${flash ? esc(flash.text) : ''}</div>`;
+
+  const loadApprovals = async (el, a, flash = null) => {
     try {
       const { approvals = [] } = await client.listApprovals();
       const mine = approvals.filter(ap => ap.assistant_id === a.assistant_id);
-      el.innerHTML = mine.length ? mine.map(ap => `
-        <div class="pa-approval pa-msg">
-          <div><strong>${esc(ap.policy_snapshot)}</strong> · ${esc(ap.decision)}</div>
-          <div class="pa-muted">${esc(ap.approval_id)}</div>
+      el.innerHTML = flashHtml(flash) + (mine.length ? mine.map(ap => `
+        <article class="pa-approval pa-msg" aria-label="Approval for ${esc(ap.policy_snapshot)}">
+          <div><strong>${esc(ap.policy_snapshot)}</strong> · <span class="pa-badge">${esc(ap.decision)}</span>
+            ${ap.action_status ? `<span class="pa-badge">action ${esc(ap.action_status)}</span>` : ''}</div>
+          ${ap.dry_run ? `<div class="pa-muted" data-dryrun>Approving allows: ${esc(ap.dry_run)}</div>` : ''}
+          <div class="pa-muted">Requested by ${esc(ap.requested_by || 'unknown')} · expires ${esc(when(ap.expires_at))} · ${esc(ap.approval_id)}</div>
+          ${ap.decision === 'pending' ? `<div class="pa-muted">The approver must be a different person from the requester.</div>` : ''}
+          ${ap.result && ap.result.summary ? `<div class="pa-muted" data-result>Result: ${esc(ap.result.summary)}</div>` : ''}
+          ${ap.result && ap.result.error ? `<div class="pa-muted" data-result>Failed: ${esc(ap.result.error)}</div>` : ''}
           ${ap.decision === 'pending' ? `<div class="pa-row" style="margin-top:6px">
-            <button class="hd-btn hd-btn--sm" data-approve="${esc(ap.approval_id)}">Approve</button>
-            <button class="hd-btn hd-btn--danger hd-btn--sm" data-deny="${esc(ap.approval_id)}">Deny</button></div>` : ''}
-        </div>`).join('') : '<div class="pa-muted">No approvals.</div>';
+            <button class="hd-btn hd-btn--sm" data-approve="${esc(ap.approval_id)}" aria-label="Approve ${esc(ap.policy_snapshot)}">Approve</button>
+            <button class="hd-btn hd-btn--danger hd-btn--sm" data-deny="${esc(ap.approval_id)}" aria-label="Deny ${esc(ap.policy_snapshot)}">Deny</button></div>` : ''}
+          ${ap.decision === 'approved' && ap.action_status === 'approved' && ap.executable ? `<div class="pa-row" style="margin-top:6px">
+            <button class="hd-btn hd-btn--sm" data-run="${esc(ap.approval_id)}" aria-label="Run approved ${esc(ap.policy_snapshot)} now">Run now</button></div>` : ''}
+        </article>`).join('') : '<div class="pa-muted">No approvals.</div>');
       el.querySelectorAll('[data-approve],[data-deny]').forEach(btn => btn.addEventListener('click', async () => {
-        await client.decideApproval(btn.dataset.approve || btn.dataset.deny, btn.dataset.approve ? 'approved' : 'denied');
-        await loadApprovals(el, a);
+        btn.disabled = true;
+        try {
+          const out = await client.decideApproval(btn.dataset.approve || btn.dataset.deny, btn.dataset.approve ? 'approved' : 'denied');
+          const ex = out && out.execution;
+          await loadApprovals(el, a, { text: btn.dataset.approve ? `Approved${ex ? `; execution ${ex.status}${ex.error ? `: ${ex.error}` : ''}` : ''}.` : 'Denied.' });
+        } catch (e) { await loadApprovals(el, a, { error: true, text: errText(e) }); }
+      }));
+      el.querySelectorAll('[data-run]').forEach(btn => btn.addEventListener('click', async () => {
+        btn.disabled = true;
+        try { const out = await client.executeApproval(btn.dataset.run); await loadApprovals(el, a, { text: `Execution ${out.status}.` }); }
+        catch (e) { await loadApprovals(el, a, { error: true, text: errText(e) }); }
+      }));
+    } catch (error) { el.innerHTML = `<herdr-error message="${esc(error.message)}"></herdr-error>`; }
+  };
+
+  // Proposals the assistant raised for a person to approve. Pending, approved (waiting to run), executed, then the rest.
+  const loadProposals = async (el, a, flash = null) => {
+    try {
+      const { proposals = [] } = await client.listProposals();
+      const mine = proposals.filter(x => !x.assistant_id || x.assistant_id === a.assistant_id);
+      const group = (x) => x.execution === 'executed' ? 'executed'
+        : x.status === 'awaiting_approval' ? 'pending' : x.status === 'approved' ? 'approved' : 'closed';
+      const titles = { pending: 'Waiting for approval', approved: 'Approved, not yet run', executed: 'Executed', closed: 'Rejected, expired or failed' };
+      const card = (x) => `
+        <article class="pa-msg ${x.status === 'awaiting_approval' ? 'pa-approval' : ''}" aria-label="Proposal ${esc(x.title)}">
+          <div><strong>${esc(x.title)}</strong> · <span class="pa-badge">${esc(x.kind)}</span> <span class="pa-badge">${esc(x.status)}</span>
+            <span class="pa-badge">execution ${esc(x.execution)}</span></div>
+          <div class="pa-muted">Requested by ${esc(x.requested_by || 'unknown')}${x.decided_by ? ` · decided by ${esc(x.decided_by)}` : ''} · ${esc(x.proposal_id)}</div>
+          ${x.result_ref ? `<div class="pa-muted">Handed to ${esc(x.result_ref)}</div>` : ''}
+          ${x.execution_error ? `<div class="pa-muted">Failed: ${esc(x.execution_error)}</div>` : ''}
+          <div class="pa-muted" data-preview="${esc(x.proposal_id)}" role="status" aria-live="polite"></div>
+          <div class="pa-row" style="margin-top:6px">
+            ${x.kind !== 'ci_repair' ? `<button class="hd-btn hd-btn--ghost hd-btn--sm" data-ppreview="${esc(x.proposal_id)}" aria-label="Preview ${esc(x.title)}">Preview</button>` : ''}
+            ${x.status === 'awaiting_approval' && x.kind !== 'ci_repair' ? `
+              <button class="hd-btn hd-btn--sm" data-papprove="${esc(x.proposal_id)}" aria-label="Approve ${esc(x.title)}">Approve</button>
+              <button class="hd-btn hd-btn--danger hd-btn--sm" data-preject="${esc(x.proposal_id)}" aria-label="Reject ${esc(x.title)}">Reject</button>
+              <span class="pa-muted">The approver must differ from the requester.</span>` : ''}
+            ${x.status === 'awaiting_approval' && x.kind === 'ci_repair' ? '<span class="pa-muted">CI repairs are decided in the attention queue.</span>' : ''}
+            ${x.status === 'approved' && x.execution === 'not_started' ? `<button class="hd-btn hd-btn--sm" data-prun="${esc(x.proposal_id)}" aria-label="Run approved ${esc(x.title)} now">Run now</button>` : ''}
+          </div>
+        </article>`;
+      const groups = ['pending', 'approved', 'executed', 'closed'].map(g => [g, mine.filter(x => group(x) === g)]);
+      el.innerHTML = flashHtml(flash) + (mine.length ? groups.filter(([, xs]) => xs.length).map(([g, xs]) => `
+        <section aria-labelledby="pa-prop-${g}"><h3 id="pa-prop-${g}" class="pa-h3">${titles[g]} (${xs.length})</h3>${xs.map(card).join('')}</section>`).join('')
+        : '<div class="pa-muted">No proposals.</div>');
+      const reload = (f) => loadProposals(el, a, f);
+      const act = (sel, fn) => el.querySelectorAll(sel).forEach(btn => btn.addEventListener('click', async () => {
+        btn.disabled = true;
+        try { await fn(btn); } catch (e) { await reload({ error: true, text: errText(e) }); }
+      }));
+      act('[data-ppreview]', async (btn) => {
+        const out = await client.previewProposal(btn.dataset.ppreview);
+        const slot = [...el.querySelectorAll('[data-preview]')].find(n => n.dataset.preview === btn.dataset.ppreview);
+        slot.textContent = `Dry run: ${out.description}${out.payload_intact ? '' : ' (payload no longer matches what was proposed)'}`;
+        btn.disabled = false;
+      });
+      act('[data-papprove]', async (btn) => {
+        const out = await client.decideProposal(btn.dataset.papprove, 'approved');
+        await reload({ text: out.execution === 'executed' ? 'Approved and handed off.' : 'Approved.' });
+      });
+      act('[data-preject]', async (btn) => { await client.decideProposal(btn.dataset.preject, 'rejected'); await reload({ text: 'Rejected.' }); });
+      act('[data-prun]', async (btn) => { const out = await client.executeProposal(btn.dataset.prun); await reload({ text: `Execution ${out.execution}.` }); });
+    } catch (error) { el.innerHTML = `<herdr-error message="${esc(error.message)}"></herdr-error>`; }
+  };
+
+  // Delivery records on the dashboard channel. Nothing here is sent anywhere else.
+  const loadNotifications = async (el, a, flash = null) => {
+    try {
+      const { notifications = [] } = await client.listNotifications();
+      el.innerHTML = flashHtml(flash) + (notifications.length ? notifications.map(n => `
+        <article class="pa-msg" aria-label="Notification ${esc(n.key)}">
+          <div><span class="pa-badge ${n.priority === 'urgent' ? 'pa-badge--sensitive' : ''}">${esc(n.priority)}</span>
+            <span class="pa-badge">${esc(n.state.replace(/_/g, ' '))}</span>
+            <span class="pa-badge">${esc(n.channel)}${n.external ? ' · external' : ' · not sent externally'}</span></div>
+          <div>${esc(n.text)}</div>
+          <div class="pa-muted">${esc(when(n.created_at))} · ${esc(n.notification_id)}
+            ${typeof n.link === 'string' && n.link.startsWith('#/') ? ` · <a href="${esc(n.link)}">Open</a>` : ''}</div>
+          ${n.state !== 'acknowledged' ? `<div class="pa-row" style="margin-top:6px"><button class="hd-btn hd-btn--sm" data-nack="${esc(n.notification_id)}" aria-label="Acknowledge ${esc(n.key)}">Acknowledge</button></div>` : ''}
+        </article>`).join('') : '<div class="pa-muted">No notifications.</div>');
+      el.querySelectorAll('[data-nack]').forEach(btn => btn.addEventListener('click', async () => {
+        btn.disabled = true;
+        try { await client.ackNotification(btn.dataset.nack); await loadNotifications(el, a, { text: 'Acknowledged.' }); }
+        catch (e) { await loadNotifications(el, a, { error: true, text: errText(e) }); }
       }));
     } catch (error) { el.innerHTML = `<herdr-error message="${esc(error.message)}"></herdr-error>`; }
   };

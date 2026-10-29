@@ -15,6 +15,7 @@ import asyncio
 import datetime as _dt
 import json
 import threading
+import time
 from collections.abc import Callable
 from typing import Any
 
@@ -75,13 +76,15 @@ class PostgresSource(DurableSource):
     """
 
     def __init__(self, conn: Any = None, *, run: Callable | None = None,
-                 events_table: str = "fabric_events", dsn: str | None = None):
+                 events_table: str = "fabric_events", dsn: str | None = None,
+                 inspector_snapshots: bool = False):
         if run is None:
             run = _LoopRunner().run
         self._conn = conn
         self._dsn = dsn
         self._run = run
         self._events_table = events_table
+        self._inspector_snapshots = inspector_snapshots
         self._cache: dict | None = None
 
     def _load(self) -> dict:
@@ -106,6 +109,8 @@ class PostgresSource(DurableSource):
         return await self._fetch_snapshot(use_cursor=False)
 
     async def _fetch_snapshot(self, *, use_cursor: bool) -> dict:
+        from .repo import _BootPhases
+        phase = _BootPhases("event load")
         conn = self._conn
         snapshot = {
             "missions": [dict(r) for r in await conn.fetch("SELECT * FROM missions")],
@@ -113,10 +118,13 @@ class PostgresSource(DurableSource):
             "services": [dict(r) for r in await conn.fetch("SELECT * FROM services")],
             "hosts": [dict(r) for r in await conn.fetch("SELECT * FROM hosts")],
         }
+        phase("entity tables")
         query = f"SELECT * FROM {self._events_table} ORDER BY ingest_timestamp, sequence"
         if use_cursor:
             events = []
+            decode = 0.0
             async for row in conn.cursor(query, prefetch=1000):
+                started = time.perf_counter()
                 event = dict(row)
                 # Decode while each bounded batch is alive so the complete raw
                 # JSON text never coexists with the complete decoded replay.
@@ -125,9 +133,19 @@ class PostgresSource(DurableSource):
                     if name in event:
                         event[name] = _v2_value(name, event[name])
                 events.append(event)
+                decode += time.perf_counter() - started
+            phase(f"event rows streamed ({len(events)} rows; {decode:.1f}s of it decoding in Python, the rest waiting on Postgres)")
         else:
             events = [dict(row) for row in await conn.fetch(query)]
         snapshot["events"] = events
+        if self._inspector_snapshots:
+            # Optional optimisation: a missing table or row just means a full replay.
+            try:
+                row = await conn.fetchrow("SELECT schema_version, fingerprint, watermark, event_count, body "
+                                          "FROM inspector_snapshots WHERE id = 1")
+                snapshot["inspector_snapshot"] = dict(row) if row is not None else None
+            except Exception:  # noqa: BLE001
+                snapshot["inspector_snapshot"] = None
         return snapshot
 
     def missions(self) -> list[dict]:
@@ -148,6 +166,9 @@ class PostgresSource(DurableSource):
             # reads get a fresh complete snapshot, never an empty placeholder.
             self._cache = self._run(self._fetch_all())
         return self._cache["events"]
+
+    def inspector_snapshot(self) -> dict | None:
+        return self._load().get("inspector_snapshot")
 
     def take_events(self) -> list[dict]:
         """Transfer event-row ownership to replay; retain cheap resource reads."""
@@ -417,9 +438,12 @@ def load_into(repo, source: DurableSource) -> dict:
     Designed for a fresh repo at server startup: replaces all structured state
     with the durable view so the API/UI read exactly what Postgres holds.
     """
+    from .repo import _BootPhases
+    phase = _BootPhases("load_into")
     if isinstance(source, PostgresSource):
         # Refresh a previously consumed snapshot BEFORE reading its tables.
         source.events()
+        phase("Postgres fetch and decode (see 'event load' lines above for the split)")
     missions: dict = {}
     for row in source.missions():
         mid = row["mission_id"]
@@ -486,9 +510,12 @@ def load_into(repo, source: DurableSource) -> dict:
         }
 
     if isinstance(source, PostgresSource):
-        events, event_order = _rebuild_events(source.take_events(), reuse=True)
+        rows = source.take_events()
+        events, event_order = _rebuild_events(rows, reuse=True)
+        del rows
     else:
         events, event_order = _rebuild_events(source.events())
+    phase("group rows into streams")
 
     # Reconstruct the ingestion-managed entities from the event log so durable
     # events (the only thing the write-through sink persists) survive restart.
@@ -508,6 +535,7 @@ def load_into(repo, source: DurableSource) -> dict:
 
     rmissions, rsessions, rhosts, rservices, rartifacts = \
         _reconstruct_from_events(events)
+    phase("reconstruct entities from events")
     for mid, m in rmissions.items():
         _overlay(missions.setdefault(mid, m), m)
     for sid, s in rsessions.items():
@@ -572,6 +600,7 @@ def load_into(repo, source: DurableSource) -> dict:
         "missions": missions, "sessions": sessions, "services": services,
         "hosts": hosts, "artifacts": artifacts, "blobs": {}, "leases": {},
         "telemetry": {}, "events": events, "event_order": event_order,
+        "inspector_snapshot": source.inspector_snapshot() if isinstance(source, PostgresSource) else None,
     })
     return {"missions": len(missions), "sessions": len(sessions),
             "services": len(services), "hosts": len(hosts),

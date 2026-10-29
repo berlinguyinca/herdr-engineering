@@ -30,7 +30,7 @@ import { RANGES, safeHostId } from './host-view.js';
 import { mountHosts, loadHosts } from './hosts-view.js';
 import { mountHostDetail, loadHostDetail } from './host-detail-view.js';
 import { mountActivity, loadActivity } from './activity-view.js';
-import { mountAnalytics, loadAnalytics } from './analytics-view.js';
+import { mountAnalytics, loadAnalytics, usageStrip } from './analytics-view.js';
 import { morph, patchText } from './patch.js';
 import { flash, skeleton } from './motion.js';
 import { noteStreamContact, freshnessSources } from './freshness.js';
@@ -97,7 +97,6 @@ const SECTION_TABS = [
   [['/herd', 'Agents'], ['/missions', 'Missions'], ['/handoffs', 'Handoffs']],
   [['/attention', 'Attention'], ['/activity', 'Activity']],
   [['/hosts', 'Hosts'], ['/scheduling', 'Scheduling']],
-  [['/llm', 'LLM'], ['/analytics', 'Analytics']],
   [['/services', 'Catalog'], ['/fabric-services', 'Fabric'], ['/local-services', 'Local'], ['/system-services', 'System']],
   [['/ci', 'CI'], ['/deployments', 'Deployments']],
   [['/reviews', 'Plan reviews'], ['/review-gate', 'Review gate']],
@@ -1016,7 +1015,7 @@ async function viewLlm(_parts, revision) {
   const f = { window: window_, ...filters };
   const step = STEP_FOR[window_];
   const series = (metric) => client.llm('timeseries', { ...f, step, metric });
-  const [total, models, agents, problems, projects, requests, errors, ttft, speed, sessions] = await Promise.all([
+  const [total, models, agents, problems, projects, requests, errors, ttft, speed, sessions, fleet] = await Promise.all([
     client.llm('stats', { ...f, group: 'all' }),
     client.llm('stats', { window: window_, project: filters.project, group: 'model' }),
     client.llm('stats', { ...f, group: 'session' }),
@@ -1024,6 +1023,7 @@ async function viewLlm(_parts, revision) {
     client.llm('stats', { window: window_, group: 'project' }),
     series('requests'), series('errors'), series('ttft_p95'), series('speed_p50'),
     client.listSessions().catch(() => ({ sessions: [] })),
+    loadAnalytics(client, '').catch(() => null),
   ]);
   if (revision !== renderRevision) return NO_REFRESH;
   const names = {};
@@ -1033,6 +1033,7 @@ async function viewLlm(_parts, revision) {
     projects: projects.groups.map((g) => g.key),
     modelNames: [...new Set(models.groups.map((g) => g.key))],
   }, { total, models, agents, problems, series: { requests, errors, ttft, speed } });
+  if (fleet) root.insertAdjacentHTML('beforeend', usageStrip(fleet));
   addSnapshotChip();
   root.querySelectorAll('[data-llm-filter]').forEach((el) => el.addEventListener('change', () => {
     window.location.hash = `#/llm?${llmQuery({ window: window_, ...filters, [el.dataset.llmFilter]: el.value })}`;

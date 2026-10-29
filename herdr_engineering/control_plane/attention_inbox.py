@@ -198,8 +198,9 @@ def _item(key, kind, severity, title, detail, href, source, condition, *, seen=N
 class AttentionInbox:
     """Derive the open attention items and fold the operator's acknowledge/snooze events."""
 
-    def __init__(self, repo, *, config=None, ci_snapshot=None, health=None, now=None, ci_fix=None):
+    def __init__(self, repo, *, config=None, ci_snapshot=None, health=None, now=None, ci_fix=None, handoffs=None):
         self.repo = repo
+        self._handoffs = handoffs        # callable returning the handoff registry (it is built after the inbox)
         self._ci_fix = ci_fix
         self.config = attention_config(config)
         self._ci_snapshot = ci_snapshot
@@ -258,6 +259,32 @@ class AttentionInbox:
                                    action="Open mission"))
         return items
 
+    def _handoff_context(self, session_id):
+        """The handoffs that moved work into or out of this agent, newest first, so an item can say how the agent got its task.
+
+        Facts only: what the registry recorded. An agent with no recorded handoff gets an empty list, never a guess.
+        """
+        registry = self._handoffs() if callable(self._handoffs) else None
+        if registry is None:
+            return []
+        out = []
+        for row in registry.list(limit=200):
+            source, target = row.get("source") or {}, row.get("target") or {}
+            if session_id == target.get("session_id"):
+                direction, other = "in", source
+            elif session_id == source.get("session_id"):
+                direction, other = "out", target
+            else:
+                continue
+            other_session = other.get("session_id")
+            out.append({"handoff_id": row.get("handoff_id"), "direction": direction, "state": row.get("state"),
+                        "goal": _short(row.get("goal"), 160), "agent": other.get("agent_id") or other.get("harness"),
+                        "href": f"#/herd/session/{_enc(other_session)}" if other_session else None,
+                        "at": _iso(row.get("updated_at")) if isinstance(row.get("updated_at"), (int, float)) else row.get("updated_at")})
+            if len(out) >= 3:
+                break
+        return out
+
     def _sessions(self, now):
         failed_after = now - float(self.config["thresholds"]["failed_window_hours"]) * 3600
         items = []
@@ -269,8 +296,10 @@ class AttentionInbox:
             if seen is not None and seen < failed_after:
                 continue
             name = session.get("display_name") or session.get("title") or session.get("agent_role") or "Failed agent"
-            items.append(_item(f"session:{sid}", "agent_failed", "critical", name, "Agent reported failed",
-                               f"#/herd/session/{_enc(sid)}", "sessions", "failed", seen=seen, action="Open agent"))
+            item = _item(f"session:{sid}", "agent_failed", "critical", name, "Agent reported failed",
+                         f"#/herd/session/{_enc(sid)}", "sessions", "failed", seen=seen, action="Open agent")
+            item["handoffs"] = self._handoff_context(sid)
+            items.append(item)
         return items
 
     def _blocked(self, now):
@@ -289,9 +318,11 @@ class AttentionInbox:
             sid = session["session_id"]
             name = session.get("display_name") or session.get("title") or session.get("agent_role") or "Agent"
             extra = f" (+{len(blockers) - 1} more)" if len(blockers) > 1 else ""
-            items.append(_item(f"blocked:{sid}", "agent_blocked", "warning", f"Agent blocked · {name}",
-                               blockers[0] + extra, f"#/herd/session/{_enc(sid)}", "summaries",
-                               "\n".join(blockers), seen=generated, action="Open agent"))
+            item = _item(f"blocked:{sid}", "agent_blocked", "warning", f"Agent blocked · {name}",
+                         blockers[0] + extra, f"#/herd/session/{_enc(sid)}", "summaries",
+                         "\n".join(blockers), seen=generated, action="Open agent")
+            item["handoffs"] = self._handoff_context(sid)
+            items.append(item)
         return items
 
     def _ci(self, now):
