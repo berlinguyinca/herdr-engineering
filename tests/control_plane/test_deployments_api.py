@@ -27,7 +27,9 @@ def _sha(t):
     return hashlib.sha256(t.encode()).hexdigest()
 
 
-def _server(tmp_path, control_plane, sink=None):
+def _server(tmp_path, control_plane, sink=None, *, loop=False, ci=None):
+    """A served control plane. The tick loop is off unless ``loop``: tests tick by hand, so a
+    background tick can never land mid-test (or reach the real CI poller before ``ci`` is set)."""
     path = tmp_path / "fleet.yaml"
     path.write_text(yaml.safe_dump({
         "version": 1,
@@ -39,6 +41,10 @@ def _server(tmp_path, control_plane, sink=None):
     repo = ControlPlaneRepo(sink=sink)
     svr = ControlPlaneServer(repo, api_keys={"opkey": "operator", "viewkey": "viewer"},
                              fleet_config=FleetConfigStore(path))
+    if ci is not None:
+        svr.ci_monitor.snapshot = lambda start=True: ci()
+    if not loop:
+        svr._deployments_stop.set()
     threading.Thread(target=svr.serve, daemon=True).start()
     svr.wait_until_ready()
     return svr, repo
@@ -77,10 +83,9 @@ VIEW = {"X-API-Key": "viewkey"}
 @pytest.fixture()
 def defined(tmp_path):
     d = _write(tmp_path / "pipelines", [doc for doc in STAGE1 if doc["host"] == "hive"])
-    svr, repo = _server(tmp_path, {"deployment_definitions": str(d)})
     ci = CI()
     ci.add(10, C1)
-    svr.ci_monitor.snapshot = lambda start=True: ci()
+    svr, repo = _server(tmp_path, {"deployment_definitions": str(d)}, ci=ci)
     yield svr, repo
     svr.shutdown()
 
@@ -135,7 +140,7 @@ def test_a_confirmed_release_starts_and_the_component_view_follows_events(define
     svr.deployment_evidence = lambda track, target, plan: ReleaseEvidence(target, True)
     svr.deployments_tick()
     [plan] = _get(svr.port, headers=VIEW)[1]["plans"]
-    assert plan["actions"][-1]["type"] == "Start"       # after a Replan (here or in the first loop tick)
+    assert [a["type"] for a in plan["actions"]] == ["Replan", "Start"]
     assert plan["generation"] == 1
     assert plan["current"]["stage"] == 1 and plan["current"]["components"] == ["hive-gateway"]
     assert plan["permitted"] == ["hive-gateway"]
@@ -190,7 +195,9 @@ def test_reads_never_tick_and_a_failed_tick_breaks_neither_the_page_nor_ingest(d
 
 def test_the_server_ticks_on_its_own_and_stops_on_shutdown(tmp_path):
     d = _write(tmp_path / "pipelines", [doc for doc in STAGE1 if doc["host"] == "hive"])
-    svr, _ = _server(tmp_path, {"deployment_definitions": str(d)})
+    ci = CI()
+    ci.add(10, C1)
+    svr, _ = _server(tmp_path, {"deployment_definitions": str(d)}, loop=True, ci=ci)
     try:
         deadline = time.time() + 5
         while svr.deployments_view()["coordinator"]["ticked_at"] is None and time.time() < deadline:

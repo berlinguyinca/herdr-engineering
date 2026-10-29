@@ -4,6 +4,7 @@
 // or set with textContent, never interpolated as markup.
 import { escapeHtml as esc } from './herdr-web-components/util.js';
 import { skeleton } from './motion.js';
+import { morph } from './patch.js';
 import { pollWhileVisible } from './refresh-bus.js';
 
 export const POLL_MS = 15000;
@@ -131,7 +132,8 @@ export function mountDeployments(container, client, { freshness = () => null } =
   const content = container.querySelector('[data-deploy-content]');
   const status = container.querySelector('[data-deploy-status]');
   const retry = container.querySelector('[data-deploy-retry]');
-  const paint = () => { if (draw) content.innerHTML = draw(open); };
+  // morph keeps focus and scroll on a redraw (the hold timers change the payload on every poll).
+  const paint = () => { if (draw) morph(content, draw(open)); };
   const onClick = (event) => {
     const button = event.target.closest('[data-deploy-toggle]');
     if (!button || !container.contains(button)) return;
