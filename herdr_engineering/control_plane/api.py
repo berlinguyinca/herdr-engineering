@@ -3116,6 +3116,9 @@ def _make_handler(server, public=False, operator=False):
                         return self._json(svc.get_routine(parts[6], tenant_id=tenant_id, user_id=user_id).as_dict())
                 if resource == "assistant-audit" and len(parts) == 5 and parts[4] in ("head", "check"):
                     svc._require_enabled()
+                    if not svc._is_approver(user_id):           # the anchor tooling is an operator task, not any caller's
+                        return self._json({"error": "forbidden: anchoring needs a configured approver of the tenant",
+                                           "code": "forbidden"}, 403)
                 if resource == "assistant-audit" and len(parts) == 5 and parts[4] == "head":
                     from datetime import UTC, datetime
                     return self._json({"tenant_id": tenant_id, "head": svc.store.audit_head(tenant_id),
@@ -3404,7 +3407,8 @@ def _make_handler(server, public=False, operator=False):
                         raise AssistantUnavailable("delegation dispatch is not enabled (personal_assistant.delegation_consumer)")
                     d = server.delegation_consumer.dispatch(parts[4], tenant_id=tenant_id, user_id=user_id,
                                                             actor=user_id)
-                    return self._json(d.as_dict(), 200 if d.status == "running" else 409)
+                    handed = ((d.correlation or {}).get("dispatch") or {}).get("state") == "handed_off"
+                    return self._json(d.as_dict(), 200 if handed else 409)
                 if resource == "assistant-notifications" and len(parts) == 6 and parts[5] == "ack":
                     return self._json(svc.ack_notification(
                         parts[4], tenant_id=tenant_id, user_id=user_id).as_dict())

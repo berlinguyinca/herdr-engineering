@@ -165,3 +165,144 @@ def test_disabled_by_default_in_yaml(world):
     svr.sweep_once()
     assert d.status == "queued" and handoffs(h) == []
     assert assistant_config({"personal_assistant": {"enabled": True}})["delegation_consumer"]["enabled"] is False
+
+
+# ---- review findings ------------------------------------------------------------------------------------------
+
+def _approve(h, svc, args, tool="request_mission", who="alice"):
+    """Approve a proposal (auto-execute off) and return it, so a test controls when it executes."""
+    aid, run = setup_assistant(h, who)
+    grant_via_service(svc, who, aid, tool)
+    svc._execute_gated(svc.store.runs[run], tool, args, 4000)
+    x = [p for p in svc.store.proposals.values() if p.status == "awaiting_approval"][-1]
+    svc.config["actions"]["auto_execute"] = False
+    assert h.call("boss", "POST", f"/api/v1/assistant-proposals/{x.proposal_id}/decision", {"decision": "approved"})[0] == 200
+    return x
+
+
+def test_a_sweep_fired_while_the_proposal_is_still_executing_defers_instead_of_failing(world):
+    h, svc, svr = world
+    x = _approve(h, svc, {"title": "T", "task": "do it", "target_system": "pi"})
+    seen = []
+    real_put = svc.store.put_delegation
+
+    def put(d):
+        real_put(d)
+        if d.kind == "mission" and x.execution == "executing":
+            seen.append(svr.delegation_consumer.sweep())                   # the window the review reproduced
+    svc.store.put_delegation = put
+    done = svc.execute_approved_proposal(x.proposal_id, tenant_id="acme", user_id=pid("alice"), actor="a")
+    svc.store.put_delegation = real_put
+    (d,) = svc.store.delegations.values()
+    assert done.execution == "executed" and seen and seen[0]["failed"] == 0
+    assert d.status == "queued" and "dispatch" not in d.correlation and handoffs(h) == []
+    svr.sweep_once()
+    assert d.status == "running" and len(handoffs(h, "queued")) == 1
+
+
+def test_a_cancel_that_lands_while_the_handoff_is_being_made_wins_and_cancels_the_handoff(world):
+    h, svc, svr = world
+    d = approved_delegation(h, svc)
+    real = svr.handoffs.create
+
+    def create(body, actor):
+        out = real(body, actor)
+        svc.cancel_delegation(d.delegation_id, tenant_id="acme", user_id=pid("alice"))   # between the two lock blocks
+        return out
+    svr.handoffs.create = create
+    out = svr.delegation_consumer.dispatch(d.delegation_id, tenant_id="acme", user_id=pid("alice"), actor="a")
+    assert out.status == "cancelled"
+    assert svr.handoffs.get(f"assistant.{d.delegation_id}")["state"] == "cancelled"
+    assert any(e["action"] == "assistant.delegation.dispatch_abandoned" for e in svc.store.audit)
+
+
+def test_cancelling_after_dispatch_cancels_the_queued_handoff_so_no_executor_can_run_it(world):
+    h, svc, svr = world
+    d = approved_delegation(h, svc)
+    assert h.call("alice", "POST", f"/api/v1/assistant-delegations/{d.delegation_id}/dispatch", {})[0] == 200
+    hid = f"assistant.{d.delegation_id}"
+    assert h.call("alice", "POST", f"/api/v1/assistant-delegations/{d.delegation_id}/cancel", {})[0] == 200
+    assert d.status == "cancelled" and svr.handoffs.get(hid)["state"] == "cancelled"
+    assert handoffs(h, "queued") == []
+    assert h.call("alice", "POST", f"/api/v1/handoffs/{hid}/claim", {})[0] >= 400
+    svr.sweep_once()
+    assert d.status == "cancelled"                                          # reconcile never resurrects it
+
+
+def test_sweep_isolates_failures_rotates_and_audits_an_outage_once(world):
+    h, svc, svr = world
+    ds = [approved_delegation(h, svc, args={"title": f"T{i}", "task": f"job {i}", "target_system": "pi"})
+          for i in range(3)]
+    con = svr.delegation_consumer
+    real_verify = con._verify
+
+    def verify(d):
+        if d.delegation_id == ds[0].delegation_id:
+            raise RuntimeError("boom")                                      # not an AssistantError
+        return real_verify(d)
+    con._verify = verify
+    out = con.sweep()
+    assert out["errors"] == 1 and out["dispatched"] == 2                     # the others were not starved
+    con._verify = real_verify
+    con._retry.clear()                                                      # skip the back-off the failure earned
+    real = svr.handoffs.create
+    svr.handoffs.create = Mock(side_effect=OSError("disk"))
+    for _ in range(3):
+        con.sweep()
+    assert svr.handoffs.create.call_count == 1                              # backed off, not retried every sweep
+    deferred = [e for e in svc.store.audit if e["action"] == "assistant.delegation.dispatch_deferred"
+                and e["subject_id"] == ds[0].delegation_id]
+    dispatching = [e for e in svc.store.audit if e["action"] == "assistant.delegation.dispatching"
+                   and e["subject_id"] == ds[0].delegation_id]
+    assert len(deferred) == 1 and len(dispatching) == 1                      # one audited deferral, one attempt
+    svr.handoffs.create = real
+    con._retry.clear()
+    con.sweep()
+    assert ds[0].status == "running"
+
+
+def test_rotation_reaches_later_delegations_when_the_limit_is_small(world):
+    h, svc, svr = world
+    ds = [approved_delegation(h, svc, args={"title": f"T{i}", "task": f"job {i}", "target_system": "pi"})
+          for i in range(3)]
+    for _ in range(3):
+        svr.delegation_consumer.sweep(limit=1)
+    assert all(d.status == "running" for d in ds)
+
+
+def test_delegation_consumer_enabled_must_be_a_real_boolean():
+    for bad in ("false", "true", 1, "no"):
+        with pytest.raises(ValueError, match="true or false"):
+            assistant_config({"personal_assistant": {"delegation_consumer": {"enabled": bad}}})
+    with pytest.raises(ValueError, match="source_harness"):
+        assistant_config({"personal_assistant": {"delegation_consumer": {"source_harness": "mainframe"}}})
+    assert assistant_config({"personal_assistant": {"delegation_consumer": {"enabled": True}}})[
+        "delegation_consumer"]["enabled"] is True
+
+
+def test_the_handoff_comes_from_the_verified_proposal_not_the_delegations_own_text(world):
+    h, svc, svr = world
+    d = approved_delegation(h, svc, args={"title": "T", "task": "the approved task", "target_system": "pi"})
+    d.task, d.target_system = "something nobody approved", "claude"        # a record edited after approval
+    assert h.call("alice", "POST", f"/api/v1/assistant-delegations/{d.delegation_id}/dispatch", {})[0] == 200
+    (row,) = handoffs(h)
+    assert row["goal"] == "the approved task" and row["target"]["harness"] == "pi"
+
+
+def test_replaying_dispatch_on_a_finished_delegation_is_200_and_a_vanished_handoff_is_reported(world):
+    h, svc, svr = world
+    d = approved_delegation(h, svc)
+    path = f"/api/v1/assistant-delegations/{d.delegation_id}/dispatch"
+    assert h.call("alice", "POST", path, {})[0] == 200
+    hid = f"assistant.{d.delegation_id}"
+    for step in ("claim", "accept", "start", "complete"):
+        assert h.call("alice", "POST", f"/api/v1/handoffs/{hid}/{step}", {})[0] == 200
+    svr.sweep_once()
+    assert d.status == "succeeded"
+    st, out = h.call("alice", "POST", path, {})
+    assert st == 200 and out["status"] == "succeeded"
+    lost = approved_delegation(h, svc, args={"title": "L", "task": "lost one", "target_system": "pi"})
+    assert h.call("alice", "POST", f"/api/v1/assistant-delegations/{lost.delegation_id}/dispatch", {})[0] == 200
+    svr.handoffs._rows.pop(f"assistant.{lost.delegation_id}")
+    svr.sweep_once()
+    assert lost.status == "failed" and "disappeared" in lost.note

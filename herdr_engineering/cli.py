@@ -2966,17 +2966,17 @@ def _cmd_cp_assistant_audit(args) -> int:
         req = urllib.request.Request(f"{base}{path}", headers={"X-API-Key": key})
         with urllib.request.urlopen(req, timeout=30) as response:
             return json.loads(response.read(1024 * 1024))
+    def server_check(seq, sha):
+        return get("/api/v1/assistant-audit/check?" + urlencode({"seq": seq, "sha256": sha}))
     try:
         head = get("/api/v1/assistant-audit/head")
         if args.action == "anchor":
             if not head.get("chain_intact"):
                 print("refusing to anchor: the stored chain does not verify internally", file=sys.stderr)
                 return 1
-            _print_json({"anchored": aa.anchor_head(anchor_file, head), "file": anchor_file})
+            _print_json({"anchored": aa.anchor_checked(anchor_file, head, server_check), "file": anchor_file})
             return 0
-        result = aa.verify_against_anchor(
-            anchor_file, head.get("tenant_id", ""),
-            lambda seq, sha: get("/api/v1/assistant-audit/check?" + urlencode({"seq": seq, "sha256": sha})))
+        result = aa.verify_against_anchor(anchor_file, head.get("tenant_id", ""), server_check)
         _print_json(result)
         return 0 if result["ok"] else 1
     except aa.AnchorError as exc:

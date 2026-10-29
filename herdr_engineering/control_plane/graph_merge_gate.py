@@ -63,15 +63,32 @@ def config_from_section(raw) -> GraphGateConfig | None:
 
 
 def validate_section(raw) -> GraphGateConfig | None:
-    """Startup check of ``control_plane.graph_merge_gate``. ``None`` when absent or ``enabled: false``. Anything that
-    looks like an attempt to enable it but is not valid (``enabled`` not a boolean, empty or wildcard writers, unknown
-    keys) raises ValueError, so a typo can never leave the gate silently off or silently open."""
+    """Startup check of ``control_plane.graph_merge_gate``. Whenever the section is a mapping its SHAPE is validated,
+    enabled or not: unknown keys (a typo such as ``enabld``), a non-boolean ``enabled``, a wildcard or non-principal
+    writer, bad ``required_checks`` / ``require_review_quorum`` all raise ValueError, so a typo can never leave the gate
+    silently off or silently open. Returns the config only when ``enabled: true`` (which also needs non-empty writers)."""
     if raw is None:
         return None
     if not isinstance(raw, dict):
         raise ValueError("graph_merge_gate must be a mapping")
+    unknown = set(raw) - _KEYS
+    if unknown:
+        raise ValueError(f"graph_merge_gate: unknown key(s) {sorted(unknown)}")
     if "enabled" in raw and not isinstance(raw["enabled"], bool):
         raise ValueError("graph_merge_gate.enabled must be true or false")
+    if "evidence_writers" in raw:
+        w = raw["evidence_writers"]
+        if not isinstance(w, list) or len(w) > 32 or not all(isinstance(x, str) and x for x in w):
+            raise ValueError("graph_merge_gate.evidence_writers must be a list of at most 32 graph principal ids")
+        bad = [x for x in w if not _PRINCIPAL.fullmatch(x)]
+        if bad:
+            raise ValueError("graph_merge_gate.evidence_writers must be explicit principal ids like key:<12 hex> "
+                             f"(no wildcards): refused {bad[:3]}")
+    rc = raw.get("required_checks", ["ci"])
+    if not isinstance(rc, list) or not rc or len(rc) > 32 or not all(isinstance(c, str) and c for c in rc):
+        raise ValueError("graph_merge_gate.required_checks must be a non-empty list of check names")
+    if not isinstance(raw.get("require_review_quorum", False), bool):
+        raise ValueError("graph_merge_gate.require_review_quorum must be a boolean")
     return config_from_section(raw)
 
 

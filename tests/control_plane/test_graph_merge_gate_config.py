@@ -34,7 +34,8 @@ def test_example_file_parses_and_ships_the_gate_disabled_and_commented():
     assert "graph_merge_gate" not in yaml.safe_load(EXAMPLE.read_text())["sections"]["control_plane"]["values"]
     block = yaml.safe_load(example_block())
     assert set(block["graph_merge_gate"]) == {"enabled", "evidence_writers", "required_checks", "require_review_quorum"}
-    assert validate_section(yaml.safe_load(example_block(enabled="false"))["graph_merge_gate"]) is None
+    real = yaml.safe_load(example_block(enabled="false", writers='["key:0123456789ab"]'))["graph_merge_gate"]
+    assert validate_section(real) is None
 
 
 def test_enabling_the_example_verbatim_fails_closed_because_the_writer_is_a_placeholder():
@@ -53,7 +54,7 @@ def test_enabling_with_a_real_writer_works_and_names_it():
     ({"enabled": True, "evidence_writers": ["*"]}, "explicit principal ids"),
     ({"enabled": True, "evidence_writers": ["key:*"]}, "explicit principal ids"),
     ({"enabled": True, "evidence_writers": ["ci"]}, "explicit principal ids"),
-    ({"enabled": True, "evidence_writers": ["key:ab", ""]}, "non-empty list"),
+    ({"enabled": True, "evidence_writers": ["key:ab", ""]}, "list of at most 32"),
     ({"enabled": "true", "evidence_writers": ["key:ab"]}, "true or false"),
     ({"enabled": True, "evidence_writers": ["key:ab"], "required_check": ["ci"]}, "unknown key"),
     ("on", "mapping"),
@@ -69,6 +70,21 @@ def test_enabling_without_explicit_writers_or_with_a_bad_shape_is_refused(raw, m
 def test_absent_or_disabled_sections_enable_nothing():
     assert validate_section(None) is None and validate_section({}) is None
     assert validate_section({"enabled": False, "evidence_writers": []}) is None
+    assert validate_section({"enabled": False, "evidence_writers": ["key:0123456789ab"]}) is None
+
+
+@pytest.mark.parametrize("raw,match", [
+    ({"enabld": True, "evidence_writers": ["key:ab"]}, "unknown key"),                 # a typo is an error, not "off"
+    ({"enabled": False, "evidence_writers": ["*"]}, "explicit principal ids"),         # disabled does not excuse it
+    ({"enabled": False, "evidence_writers": "key:ab"}, "list of at most 32"),
+    ({"enabled": 1, "evidence_writers": ["key:ab"]}, "true or false"),
+    ({"enabled": False, "require_review_quorum": "no"}, "boolean"),
+    ({"enabled": False, "required_checks": []}, "non-empty list"),
+    ({"evidence_writers": ["key:ab"], "extra": 1}, "unknown key"),
+])
+def test_a_mapping_is_validated_even_when_the_gate_is_not_enabled(raw, match):
+    with pytest.raises(ValueError, match=match):
+        validate_section(raw)
 
 
 def test_serve_startup_stops_on_a_bad_section_and_the_validate_command_reports_it(tmp_path):

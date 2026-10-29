@@ -25,7 +25,8 @@ def world(acknowledged_sink, tmp_path):
     fleet.write_text(yaml.safe_dump({"version": 1, "hosts": {}, "sections": {"control_plane": {
         "roles": ["control-plane"], "values": {"personal_assistant": {"audit": {"anchor_file": str(anchor)}}}}}}))
     fleet.chmod(0o600)
-    section = {"enabled": True, "tenancy": {"principals": {pid("alice"): "acme", pid("bea"): "globex"}}}
+    section = {"enabled": True, "tenancy": {"principals": {pid("alice"): "acme", pid("bea"): "globex", pid("cora"): "acme"}},
+               "actions": {"approvers": [pid("alice"), pid("bea")]}}
     svc = AssistantService(config=assistant_config({"personal_assistant": section}))
     svr = ControlPlaneServer(ControlPlaneRepo(sink=acknowledged_sink), assistant_service=svc,
                              api_keys={k: "operator" for k in KEYS.values()})
@@ -72,7 +73,7 @@ def test_truncating_the_stored_chain_is_detected_even_though_the_remainder_verif
     rc, out, _ = run("verify", capsys)
     assert rc == 1 and out["status"] == "rolled_back" and out["head"]["seq"] == anchored - 2
     rc, _, err = run("anchor", capsys)                                       # and a rollback is never anchored over
-    assert rc == 1 and "behind the last anchor" in err and len(anchor.read_text().splitlines()) == 1
+    assert rc == 1 and "rolled_back" in err and len(anchor.read_text().splitlines()) == 1
 
 
 def test_a_rewritten_history_that_is_re_hashed_is_reported_as_diverged(world, capsys):
@@ -149,3 +150,80 @@ def test_cli_without_anchor_file_in_yaml_exits_2(world, capsys, tmp_path):
     rc = cli.main(["control-plane", "assistant-audit", "anchor", "--fleet-config", str(bare),
                    "--control-plane", "http://127.0.0.1:1", "--api-key-file", str(tmp_path / "alice.key")])
     assert rc == 2 and "anchor_file is not set" in capsys.readouterr().err
+
+
+def test_a_rewritten_then_extended_chain_is_not_anchored_over(world, capsys):
+    h, svc, run, activity, anchor, _ = world
+    activity(3)
+    assert run("anchor", capsys)[0] == 0
+    prev = ""
+    for e in (x for x in svc.store._audit if x["tenant_id"] == "acme"):      # rewrite entry 2, re-sign, then grow
+        if e["seq"] == 2:
+            e["detail"] = "rewritten"
+        e["prev_sha256"] = prev
+        e["sha256"] = svc.store._audit_digest(e)
+        prev = e["sha256"]
+    activity(3)
+    assert svc.store.verify_audit("acme") and svc.store.audit_head("acme")["seq"] > 3
+    rc, _, err = run("anchor", capsys)
+    assert rc == 1 and "diverged" in err
+    assert len(anchor.read_text().splitlines()) == 1                         # nothing was appended
+
+
+def _head(n):
+    return {"tenant_id": "acme", "head": {"seq": n, "sha256": f"{n:064x}", "keyed": False}}
+
+
+def test_concurrent_anchors_keep_the_files_own_chain_intact(tmp_path):
+    path = tmp_path / "a" / "x.anchor"
+    errors = []
+
+    def go(n):
+        try:
+            aa.anchor_head(path, _head(n))
+        except aa.AnchorError as exc:                                        # "behind the last anchor" is fine
+            errors.append(str(exc))
+    ts = [threading.Thread(target=go, args=(n,)) for n in range(1, 25)]
+    [t.start() for t in ts]
+    [t.join() for t in ts]
+    rows = aa.read_anchors(path)                                             # raises if any line forked the chain
+    assert rows and [r["seq"] for r in rows] == sorted(r["seq"] for r in rows)
+    assert all(("behind" in e) for e in errors)
+    assert oct((tmp_path / "a").stat().st_mode & 0o777) == "0o700"
+
+
+def test_a_last_line_without_its_newline_is_continued_safely_and_a_torn_one_is_refused(tmp_path):
+    path = tmp_path / "x.anchor"
+    aa.anchor_head(path, _head(1))
+    path.write_text(path.read_text().rstrip("\n"))                          # lost the trailing newline
+    aa.anchor_head(path, _head(2))
+    assert [r["seq"] for r in aa.read_anchors(path)] == [1, 2]
+    path.write_text(path.read_text()[:-40])                                  # now genuinely torn
+    with pytest.raises(aa.AnchorError, match="does not verify"):
+        aa.anchor_head(path, _head(3))
+
+
+def test_modes_symlinks_and_messages(world, capsys, tmp_path):
+    h, svc, run, activity, anchor, _ = world
+    activity(1)
+    assert run("anchor", capsys)[0] == 0
+    assert oct(anchor.stat().st_mode & 0o777) == "0o600"
+    anchor.chmod(0o640)
+    activity(1)
+    rc, _, err = run("anchor", capsys)
+    assert rc == 1 and "0600 or stricter" in err
+    anchor.chmod(0o600)
+    moved = anchor.with_name("real")
+    anchor.rename(moved)
+    anchor.symlink_to(moved)
+    for action in ("anchor", "verify"):
+        rc, out, err = run(action, capsys)
+        assert rc == 1 and ("symlink" in err or "symlink" in out.get("detail", ""))
+        assert "control plane request failed" not in err
+
+
+def test_only_a_tenant_approver_may_read_the_head_or_check_routes(world):
+    h, svc, run, activity, anchor, _ = world
+    assert h.call("alice", "GET", "/api/v1/assistant-audit/head")[0] == 200
+    assert h.call("cora", "GET", "/api/v1/assistant-audit/head")[0] == 403
+    assert h.call("cora", "GET", "/api/v1/assistant-audit/check?seq=1&sha256=x")[0] == 403
