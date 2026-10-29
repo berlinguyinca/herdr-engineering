@@ -26,6 +26,11 @@ sections:
       minio_password: "REDACTED"
       rustfs_bucket: "REDACTED"
       ci_actions: false             # true lets operators retry/cancel CI pipelines
+      # OPTIONAL: absolute path (as the web container sees it) to a checkout of InferWeave's
+      # deploy/pipelines/*.yaml. Read live. Absent: no definitions, and any host token may report
+      # deployment events for any component (the Deployments snapshot then carries a warning).
+      # Set but invalid: deployment events are refused (503) until it validates.
+      # deployment_definitions: "/srv/inferweave/deploy/pipelines"
       # OPTIONAL: head-bound post-PR review quorum (GET /api/v1/graph/nodes/{pr}/review-quorum).
       # Principal ids are the server-side `key:<digest>` actors; omit the block to turn it off.
       # review_quorum:

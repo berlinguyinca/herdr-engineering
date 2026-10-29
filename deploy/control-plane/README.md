@@ -84,7 +84,11 @@ without them, and DB/object-store ports stay loopback-only.
 
 Settings of the reserved `control_plane` section the servers read: `pg_dsn`,
 `host_aliases`, `api_keys`, `rustfs_*`/`minio_*`, `self_host`, `web_port`,
-`ci_actions` (true enables CI retry/cancel), `inspector_limits` (`max_events`,
+`ci_actions` (true enables CI retry/cancel), `deployment_definitions` (absolute path, as the
+web container sees it, to a checkout of InferWeave's `deploy/pipelines`; read live and validated with
+the same rules as its `validate.py`. Absent: no definitions, any host may report any component and the
+Deployments snapshot warns. Set: a host may report only components whose `host` is its fleet id, and
+an invalid set keeps the last good one, or refuses events with 503 if none was ever valid), `inspector_limits` (`max_events`,
 `max_bytes`, `max_sessions`, `max_total_bytes`, `retention_hours`, `reasoning_role`,
 `sensitive_role`, `store_reasoning`) and `llm_proxy` (`max_inflight`,
 `queue_wait_seconds`, `raw_retention_days` (default 14: the web server drops older

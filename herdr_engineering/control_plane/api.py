@@ -295,6 +295,13 @@ class ControlPlaneServer:
                                     repo.record_event("ci_pipeline", key, event, row),
                                     actions_enabled=ci_actions,
                                     on_observation=repo.observe_ci_pipeline)
+        # control_plane.deployment_definitions: a checkout of InferWeave deploy/pipelines (read live;
+        # absent = none, and deployment ingest stays accept-all with a warning). Targets come from the
+        # CI monitor's last snapshot, never from a provider call here.
+        from .deployment_definitions import DeploymentDefinitions
+        self.deployment_definitions = DeploymentDefinitions(
+            lambda: self._control_plane_value(fleet_config, "deployment_definitions"),
+            ci_snapshot=lambda: self.ci_monitor.snapshot(start=False))
         # control_plane.missions (validated; outcomes are written when a mission ends, on by default).
         from .mission_outcome import MissionOutcomes, missions_config
         self.missions_config = missions_config(missions)
@@ -507,6 +514,24 @@ class ControlPlaneServer:
         bridge = self.intelligence_bridge
         return {"bridge": dict(bridge.stats), "queue_depth": bridge._q.qsize(),
                 "incidents": dict(Counter(i["state"] for i in bridge.board.summary()))}
+
+    @staticmethod
+    def _control_plane_value(fleet_config, key):
+        """One `control_plane` value from the last good fleet config; None when absent.
+
+        Uses ``current()`` (last good), not ``secure_section``: for deployment definitions a
+        failing-closed read would mean "not configured", which is the permissive state."""
+        if fleet_config is None:
+            return None
+        from ..fleet_config import FleetConfigError
+        try:
+            return fleet_config.current().section("control_plane").get(key)
+        except FleetConfigError:
+            return None
+
+    def deployments_snapshot(self) -> dict:
+        """Deployment rows plus the definitions status (incl. the accept-all warning flag)."""
+        return self.deployment_definitions.annotate(self.repo.deployments.snapshot())
 
     @staticmethod
     def _intelligence_section(fleet_config):
@@ -1621,6 +1646,20 @@ def _make_handler(server, public=False, operator=False):
                 return self._deny(400, "invalid JSON body: nested too deeply")
             except ValueError as exc:
                 return self._deny(400, str(exc))
+            from .deployment_definitions import (
+                DeploymentAuthorizationError,
+                DeploymentDefinitionsUnavailable,
+            )
+            # With definitions loaded a host reports only its own components; refused events
+            # are never ingested (not stored, not persisted). A malformed body falls through
+            # to ingest's own 400.
+            if isinstance(body, dict) and isinstance(body.get("component"), str):
+                try:
+                    server.deployment_definitions.authorize(body["component"], host)
+                except DeploymentAuthorizationError as exc:
+                    return self._deny(403, str(exc))
+                except DeploymentDefinitionsUnavailable as exc:
+                    return self._deny(503, str(exc))
             try:
                 server.repo.deployments.ingest(body, reported_by=host)
             except ValueError as exc:
