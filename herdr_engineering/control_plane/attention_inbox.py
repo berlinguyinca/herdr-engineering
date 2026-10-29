@@ -20,7 +20,8 @@ ENTITY = "attention"
 STREAM = "operator"
 SEVERITIES = ("critical", "warning", "info")
 KINDS = ("mission_attention", "mission_failed", "agent_failed", "agent_blocked", "ci_failed", "review_changes",
-         "service_down", "host_stale", "control_plane", "fleet_drift", "llm_problems", "ci_fix", "source_unavailable")
+         "service_down", "host_stale", "control_plane", "fleet_drift", "llm_problems", "ci_fix", "deployment_escalation",
+         "source_unavailable")
 STATES = ("open", "acknowledged", "snoozed")
 MAX_ITEMS = 200
 MAX_PER_KIND = 50
@@ -40,9 +41,11 @@ _CI_DONE = frozenset(("success", "passed", "finished", "complete", "completed", 
 _REVIEW_CHANGES = frozenset(("changes_requested", "request_changes", "rejected", "annotated", "denied"))
 _CI_OUTAGE = frozenset(("unavailable", "auth_error", "partial"))
 _SOURCE_PAGES = {"missions": "#/missions", "sessions": "#/herd", "summaries": "#/herd", "llm": "#/llm", "ci": "#/ci", "ci_fix": "#/ci", "reviews": "#/reviews",
-                 "services": "#/services", "hosts": "#/hosts", "health": "#/topology", "fleet": "#/hosts"}
+                 "services": "#/services", "hosts": "#/hosts", "health": "#/topology", "fleet": "#/hosts",
+                 "deployments": "#/deployments"}
 _SOURCE_LABELS = {"missions": "Missions", "sessions": "Agents", "summaries": "Agent summaries", "llm": "LLM usage", "ci": "CI", "ci_fix": "CI fixes", "reviews": "Reviews",
-                  "services": "Services", "hosts": "Hosts", "health": "Control plane", "fleet": "Fleet versions"}
+                  "services": "Services", "hosts": "Hosts", "health": "Control plane", "fleet": "Fleet versions",
+                  "deployments": "Deployments"}
 _RANK = {name: index for index, name in enumerate(SEVERITIES)}
 
 
@@ -213,6 +216,8 @@ class AttentionInbox:
                         "health": self._control_plane, "fleet": self._fleet, "llm": self._llm}
         if ci_fix is not None:
             self.sources["ci_fix"] = self._ci_fixes
+        if getattr(repo, "deployment_escalations", None) is not None:
+            self.sources["deployments"] = self._deployments
 
     # ------------------------------------------------------------- sources
     def _missions(self, now):
@@ -445,6 +450,12 @@ class AttentionInbox:
             items.append(_item(f"cifix:{fix['id']}", "ci_fix", severity, title, detail, "#/ci",
                                "ci_fix", condition, seen=ended, action="Open CI"))
         return items
+
+    def _deployments(self, now):
+        """Open deployment escalations (deploy-4 Task 8): the herdr notification for a failed
+        component, read later by the operator and the assistant. Validated fields only."""
+        from .deployment_escalation import attention_items
+        return attention_items(self.repo.deployment_escalations, _item)
 
     def _control_plane(self, now):
         status = (self._health() or {}).get("status")

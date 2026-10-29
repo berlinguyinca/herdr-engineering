@@ -146,7 +146,7 @@ def _run_web(monkeypatch, path, **overrides):
     import herdr_engineering.control_plane.sink as sink
     monkeypatch.setattr(api, "ControlPlaneServer", FakeServer)
     monkeypatch.setattr(sink, "DurableEventSink", lambda dsn: seen.setdefault("sink_dsn", dsn))
-    monkeypatch.setattr(cli, "_maybe_pg_source", lambda dsn: None)
+    monkeypatch.setattr(cli, "_maybe_pg_source", lambda dsn, **_: None)
     monkeypatch.setattr(cli, "_maybe_rustfs_client", lambda cp: seen.setdefault("rustfs_cp", cp) and None)
     monkeypatch.setattr(cli, "_self_report_services",
                         lambda repo, **kw: seen.setdefault("self_report", kw))

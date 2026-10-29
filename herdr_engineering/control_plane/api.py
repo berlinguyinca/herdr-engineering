@@ -11,6 +11,7 @@ Optional `X-API-Key` auth for multi-operator deployments (Spec §104).
 """
 from __future__ import annotations
 
+import copy
 import hashlib
 import ipaddress
 import json
@@ -22,6 +23,7 @@ import secrets
 import socket
 import threading
 import time
+import traceback
 import urllib.error
 import urllib.request
 from dataclasses import asdict
@@ -249,6 +251,23 @@ class _RateLimiter:
 
 
 _FLEET_CONFIG_PATH = "/api/v1/fleet/config"
+# Host updaters (InferWeave deploy/pipelines/deploy_event.py) POST here with their per-host fleet
+# token as a Bearer credential; the /api/v1 spelling is accepted as well.
+_DEPLOYMENT_EVENTS_PATHS = frozenset({"/api/deployments/events", "/api/v1/deployments/events"})
+# deploy-4 Task 5: operator actions (X-API-Key, operator role, control_plane.deployment_actions) ...
+_DEPLOYMENT_ACTION_PATHS = {p + "/" + a: a for p in ("/api/deployments", "/api/v1/deployments")
+                            for a in ("force", "ack")}
+# ... and the host routes (fleet host token only): the force-request list and the permit gate,
+_DEPLOYMENT_HOST_GET_PATHS = {p + "/" + a: a for p in ("/api/deployments", "/api/v1/deployments")
+                              for a in ("requests", "permit")}
+# ... and clearing a picked-up request (DELETE).
+_DEPLOYMENT_REQUEST_PATH = re.compile(r"^/api(?:/v1)?/deployments/requests/([^/]+)$")
+#: Seconds between deployment coordinator ticks (the plan GET /api/v1/deployments serves).
+DEPLOYMENTS_TICK_S = 30
+# Escalation runs inside the tick: its budget plus this interval must keep permits fresh.
+from .deployment_escalation import TICK_INTERVAL_S as _ESCALATION_TICK_S  # noqa: E402
+
+assert DEPLOYMENTS_TICK_S <= _ESCALATION_TICK_S
 
 
 def _gate_pr(snap):
@@ -311,6 +330,48 @@ class ControlPlaneServer:
                                     repo.record_event("ci_pipeline", key, event, row),
                                     actions_enabled=ci_actions,
                                     on_observation=repo.observe_ci_pipeline)
+        # control_plane.deployment_definitions: a checkout of InferWeave deploy/pipelines (read live;
+        # absent = none, and deployment ingest stays accept-all with a warning). Targets come from the
+        # CI monitor's last snapshot, never from a provider call here. It is only read once definitions
+        # are loaded, and start=True (idempotent) keeps the shared poller running from then on: without
+        # the review gate nothing else starts it, and a stopped poller would leave every target None.
+        from .deployment_definitions import DeploymentDefinitions
+        self.deployment_definitions = DeploymentDefinitions(
+            lambda: self._control_plane_value(fleet_config, "deployment_definitions"),
+            ci_snapshot=lambda: self.ci_monitor.snapshot(start=True))
+        # The stage coordinator (Task 3), ticked by _deployments_loop; GET /api/v1/deployments
+        # serves the last tick and never ticks itself. `deployment_evidence` is the release-evidence
+        # source, fn(track, target, plan_commit) -> ReleaseEvidence: the GitHub `.commit` asset of
+        # the definitions' release and the compare-based ancestry, read with the server-held
+        # github.token. Its call only reads a cache (a daemon worker refreshes it), so the tick and
+        # the permit path never wait on GitHub; without a token, or on any error, it answers unknown
+        # and the coordinator Holds "release not confirmed" (fail closed). None = unknown as well.
+        from .deployment_coordinator import DeploymentCoordinator
+        from .deployment_evidence import GitHubReleaseEvidence
+        self.deployment_evidence = GitHubReleaseEvidence(self.deployment_definitions.definitions)
+        self.deployment_coordinator = DeploymentCoordinator(
+            self.deployment_definitions, monitor=lambda: self.repo.deployments,
+            state=lambda: self.repo.deployment_plans, evidence=self._release_evidence)
+        self._deployments_lock = threading.Lock()
+        self._deployments_tick_lock = threading.Lock()
+        self._deployments_stop = threading.Event()
+        self._deployments_error_type = None     # the last logged tick failure type (log on change only)
+        self._deployments_last = {"ticked_at": None, "tracks": [], "error": None, "stale": False}
+        # Task 5: force/ack are serialized (validate, audit, then record, with no race between).
+        from .deployment_actions import AuditThrottle, RefusalCounter
+        self._deployment_actions_lock = threading.Lock()
+        self._deployment_refused_rows = AuditThrottle()
+        self._deployment_refusals = RefusalCounter()
+        # Task 8: diagnosis, the repair ledger and escalation, run after each tick. The issue
+        # sink exists only with control_plane.deployment_escalation.issues: true (read per run);
+        # the Personal Assistant has no notification API yet, so its sink stays None and host
+        # findings take the fallback (stored report + attention item + feed event).
+        from .deployment_escalation import DeploymentEscalation, GitHubIssueSink
+        self.deployment_escalation = DeploymentEscalation(
+            ledger=lambda: self.repo.deployment_escalations, state=lambda: self.repo.deployment_plans,
+            monitor=lambda: self.repo.deployments, config=self._deployment_escalation_config,
+            diagnosis_config=self._deployment_diagnosis_config, issue_sink=GitHubIssueSink(),
+            alert=self._deployment_alert)
         # control_plane.missions (validated; outcomes are written when a mission ends, on by default).
         from .mission_outcome import MissionOutcomes, missions_config
         self.missions_config = missions_config(missions)
@@ -546,6 +607,23 @@ class ControlPlaneServer:
             self.assistant.comment_poster = comment_hook(self)
             self.assistant.artifact_writer = draft_writer_hook(self)
             self.assistant.ci_board_request = self.intelligence.assistant_ci_repair
+            from .assistant_dispatch import DelegationConsumer
+            self.delegation_consumer = DelegationConsumer(
+                self.assistant, self.handoffs,
+                source_harness=self.assistant.config["delegation_consumer"]["source_harness"])
+
+            # The audit log is append-only in the repo event store: durable before it is visible, and read back here
+            # after a restart. A failed write raises, so an operation that cannot be audited does not complete.
+            def _audit_append(entry):
+                repo.record_event("assistant_audit", str(entry.get("tenant_id") or "default"),
+                                  "AssistantAuditAppended", entry, require_durable=True, publish=False, feed=False)
+            def _audit_read():
+                # only what this module wrote: the right event type and no ingest envelope (ingest cannot reach this
+                # entity type, and the read-back would ignore such an event anyway)
+                return [dict(e.get("payload") or {}) for e in repo.events_of_type("assistant_audit")
+                        if e.get("event_type") == "AssistantAuditAppended"
+                        and "_envelope" not in (e.get("payload") or {})]
+            self.assistant.attach_audit_log(_audit_append, _audit_read)
         self._configure_architecture_explain(fleet_config, architecture_explain)
         if collab is not None:
             collab.architecture = self.architecture
@@ -563,6 +641,398 @@ class ControlPlaneServer:
         bridge = self.intelligence_bridge
         return {"bridge": dict(bridge.stats), "queue_depth": bridge._q.qsize(),
                 "incidents": dict(Counter(i["state"] for i in bridge.board.summary()))}
+
+    @staticmethod
+    def _control_plane_value(fleet_config, key):
+        """One `control_plane` value from the last good fleet config; None when absent.
+
+        Uses ``current()`` (last good), not ``secure_section``: for deployment definitions a
+        failing-closed read would mean "not configured", which is the permissive state."""
+        if fleet_config is None:
+            return None
+        from ..fleet_config import FleetConfigError
+        try:
+            return fleet_config.current().section("control_plane").get(key)
+        except FleetConfigError:
+            return None
+
+    def deployments_snapshot(self) -> dict:
+        """Deployment rows plus the definitions status (incl. the accept-all warning flag)."""
+        return self.deployment_definitions.annotate(self.repo.deployments.snapshot())
+
+    def _release_evidence(self, track, target, plan_commit):
+        from .deployment_coordinator import ReleaseEvidence
+        source = self.deployment_evidence
+        return source(track, target, plan_commit) if source is not None else ReleaseEvidence()
+
+    def _deployment_evidence_status(self) -> dict:
+        """``evidence``: "configured" once the source's last refresh succeeded, else "unknown";
+        ``evidence_error``: the source's last failure kind (fixed text, never a token)."""
+        source = self.deployment_evidence
+        if source is None:
+            return {"evidence": "unknown", "evidence_error": None}
+        status = getattr(source, "status", None)
+        if not callable(status):
+            return {"evidence": "configured", "evidence_error": None}
+        try:
+            st = status()
+            return {"evidence": "configured" if st.get("state") == "configured" else "unknown",
+                    "evidence_error": st.get("error") if isinstance(st.get("error"), str) else None}
+        except Exception:  # noqa: BLE001 - the view must not break on the source
+            return {"evidence": "unknown", "evidence_error": "status unavailable"}
+
+    def _deployment_track_evidence(self, track) -> dict:
+        """One track's evidence source status ({evidence, evidence_error}), so one track's
+        success never hides another's error."""
+        source = self.deployment_evidence
+        status_for = getattr(source, "status_for", None)
+        if not callable(status_for) or not isinstance(track, dict):
+            return self._deployment_evidence_status()
+        try:
+            st = status_for((track.get("repo"), track.get("branch"), track.get("ci_context")))
+            return {"evidence": "configured" if st.get("state") == "configured" else "unknown",
+                    "evidence_error": st.get("error") if isinstance(st.get("error"), str) else None}
+        except Exception:  # noqa: BLE001 - the view must not break on the source
+            return {"evidence": "unknown", "evidence_error": "status unavailable"}
+
+    def deployments_tick(self):
+        """One coordinator tick, serialized and stored as plain data for the read route.
+
+        Never raises: a failure keeps the last good plan (flagged stale) and records only the
+        exception type, so a broken tick can break neither ingest nor the page."""
+        from .deployment_coordinator import track_views
+        with self._deployments_tick_lock:
+            defs, results = {}, {}
+            try:
+                defs = self.deployment_definitions.definitions()
+                now = time.time()
+                self.deployment_coordinator.last_evidence = {}
+                results = self.deployment_coordinator.tick() if defs else {}
+                tracks = (track_views(results, defs, self.repo.deployment_plans, now,
+                                      self.deployment_coordinator.last_evidence) if defs else [])
+                result = {"ticked_at": now, "tracks": tracks, "error": None, "stale": False}
+                if self._deployments_error_type is not None:
+                    log.info("deployment coordinator tick recovered from %s", self._deployments_error_type)
+                    self._deployments_error_type = None
+            except Exception as exc:  # noqa: BLE001 - a tick must never take the server down
+                kind = type(exc).__name__
+                if kind != self._deployments_error_type:
+                    # Once per new error type, then silent until it changes: the type and the frames
+                    # only. The message is never logged (it may carry host- or file-supplied text).
+                    self._deployments_error_type = kind
+                    frames = "".join(traceback.format_tb(exc.__traceback__, limit=20))
+                    log.warning("deployment coordinator tick failed: %s\n%s", kind, frames)
+                with self._deployments_lock:
+                    result = {**self._deployments_last, "error": f"tick failed: {type(exc).__name__}",
+                              "stale": True}
+            with self._deployments_lock:
+                self._deployments_last = result
+            if result["error"] is None and defs:
+                self._deployments_escalate(results, defs, dict(self.deployment_coordinator.last_evidence))
+
+    def _deployments_escalate(self, results, defs, evidence):
+        """Diagnose, decide repairs and escalate after the tick result is stored (its calls
+        are clamped to a budget well under the permit staleness). Only tracks whose release
+        this tick confirmed (published + on main) are escalated. Never raises."""
+        try:
+            self.deployment_escalation.run(results, defs, evidence=evidence)
+        except Exception as exc:  # noqa: BLE001 - escalation must never break the tick
+            log.warning("deployment escalation failed: %s", type(exc).__name__)
+
+    def _deployment_secure_value(self, key):
+        """A ``control_plane`` value read failing closed (``secure_section``): None when absent
+        or unreadable."""
+        if self.fleet_config is None:
+            return None
+        from ..fleet_config import FleetConfigError
+        try:
+            return self.fleet_config.secure_section("control_plane").get(key)
+        except FleetConfigError:
+            return None
+
+    def _deployment_escalation_config(self):
+        from .deployment_escalation import EscalationConfig
+        try:
+            return EscalationConfig.from_mapping(self._deployment_secure_value("deployment_escalation"))
+        except (TypeError, ValueError):
+            log.warning("control_plane.deployment_escalation is invalid; escalation side effects stay off")
+            return EscalationConfig()
+
+    def _deployment_diagnosis_config(self):
+        from .deployment_diagnosis import DiagnosisConfig
+        try:
+            return DiagnosisConfig.from_mapping(self._deployment_secure_value("deployment_diagnosis"))
+        except (TypeError, ValueError):
+            log.warning("control_plane.deployment_diagnosis is invalid; AI diagnosis stays off")
+            return DiagnosisConfig()
+
+    def _deployment_alert(self, component, release, payload):
+        """The escalation's herdr event (shared feed): validated fields only, no host text."""
+        from .deployment_escalation import FEED_ENTITY, FEED_EVENT
+        self.repo.record_event(FEED_ENTITY, f"{component}:{release}"[:200], FEED_EVENT, payload)
+
+    def _deployments_loop(self):
+        while not self._deployments_stop.is_set():
+            self.deployments_tick()
+            self._deployments_stop.wait(DEPLOYMENTS_TICK_S)
+
+    def deployments_view(self) -> dict:
+        """GET /api/v1/deployments: monitor rows + definitions status + the last tick's plans.
+        Evidence and messages are untrusted host text, served as data only."""
+        view = self.deployments_snapshot()
+        with self._deployments_lock:
+            last = copy.deepcopy(self._deployments_last)
+        view["plans"] = last.pop("tracks")
+        view["coordinator"] = {**last, "interval_s": DEPLOYMENTS_TICK_S,
+                               **self._deployment_evidence_status()}
+        view["actions"] = {"enabled": self.deployment_actions_enabled(),
+                           "keyed": self._deployment_keyed(),
+                           "refused": self._deployment_refusals.snapshot()}
+        view["requests"] = self.repo.deployment_requests.pending()
+        ledger = self.repo.deployment_escalations
+        view["escalations"] = ledger.snapshot()
+        for plan in view["plans"]:
+            plan["evidence_status"] = self._deployment_track_evidence(plan.get("track"))
+            # the repair attempts the cap counts (the ledger), next to the coordinator's starts
+            for name, row in (plan.get("components") or {}).items():
+                target = plan.get("target_commit")
+                row["repair_attempts"] = ledger.attempts(name, target) if target else 0
+        return view
+
+    # ------------------------------------------------ deployment actions (deploy-4 Task 5)
+    def deployment_actions_enabled(self) -> bool:
+        """``control_plane.deployment_actions: true``, read per request and failing closed
+        (``secure_section``): a missing, unreadable or non-true value is off."""
+        if self.fleet_config is None:
+            return False
+        from ..fleet_config import FleetConfigError
+        try:
+            return self.fleet_config.secure_section("control_plane").get("deployment_actions") is True
+        except FleetConfigError:
+            return False
+
+    def _deployment_keyed(self) -> bool:
+        """Force/ack need keyed mode: at least one operator API key."""
+        return any(role == "operator" for role in self._keys.values())
+
+    def _loaded_deployment_definitions(self):
+        """The definitions, or None unless they are configured AND loaded. Unlike ingest
+        (where "not configured" accepts every host), the action and gate routes need a
+        definition to decide whose component is whose."""
+        status = self.deployment_definitions.status()
+        if not status["configured"] or not status["loaded"]:
+            return None
+        return self.deployment_definitions.definitions()
+
+    def _deployment_track_view(self, definition):
+        """(last tick meta, that tick's track view for ``definition``'s track or None)."""
+        repo, branch, context = definition.track
+        with self._deployments_lock:
+            last = copy.deepcopy(self._deployments_last)
+        want = {"repo": repo, "branch": branch, "ci_context": context}
+        view = next((t for t in last.get("tracks") or () if t.get("track") == want), None)
+        return last, view
+
+    def deployment_audit(self, action, event_type, *, outcome, actor, target, reason, status,
+                         durable=False, refusal=True, **extra):
+        """One audit row (``deployment_action``, one stream per action per UTC day, which bounds
+        record_event's per-stream sequence scan). Every value is validated or ours. ``durable``
+        rows raise when they cannot be persisted; refusal rows never raise, stay out of the
+        shared feed (and the live listeners) and are throttled (the overflow is counted).
+        ``refusal=False`` (a host pickup): best effort, never throttled, and in the feed like
+        an accepted row."""
+        from .deployment_actions import AUDIT_ENTITY, stamp
+        now = time.time()
+        payload = {"action": action, "outcome": outcome, "actor": actor, "target": target,
+                   "reason": reason, "status": status, "at": stamp(now), "at_epoch": now, **extra}
+        stream = f"{action}:{stamp(now)[:10]}"
+        if durable:
+            self.repo.record_event(AUDIT_ENTITY, stream, event_type, payload, require_durable=True)
+            return
+        if not refusal:
+            try:
+                self.repo.record_event(AUDIT_ENTITY, stream, event_type, payload)
+            except Exception:  # noqa: BLE001 - the clear itself was persisted durably
+                log.warning("deployment %s audit row could not be recorded", action)
+            return
+        if not self._deployment_refused_rows.take():
+            self._deployment_count_refusal(action, "audit row throttled")
+            return
+        try:
+            self.repo.record_event(AUDIT_ENTITY, stream, event_type, payload, feed=False,
+                                   publish=False)
+        except Exception:  # noqa: BLE001 - a refusal is answered whether or not its row lands
+            log.warning("deployment %s refusal could not be audited", action)
+
+    def _deployment_count_refusal(self, action, reason):
+        """An unaudited refusal: counted in memory, logged at most once a minute per reason."""
+        if self._deployment_refusals.count(action, reason):
+            log.warning("deployment %s refused before authentication: %s (counted; see the "
+                        "Deployments view, actions.refused)", action, reason)
+
+    def deployment_refused(self, action, actor, status, reason, target=None, *, auth=False):
+        """A refusal. ``auth``: before authentication, so counted only (never a row);
+        otherwise an authenticated operator's refusal, audited as ``refused``."""
+        if auth:
+            self._deployment_count_refusal(action, reason)
+            return
+        kind = "Force" if action == "force" else "Ack"
+        self.deployment_audit(action, f"Deployment{kind}Refused", outcome="refused", actor=actor,
+                              target=target, reason=reason, status=status)
+
+    def _deployment_refusal(self, action, actor, exc, target):
+        self.deployment_refused(action, actor, exc.status, exc.message, target)
+        return exc.status, {"error": exc.message}
+
+    def _deployment_action_gate(self):
+        """Flag and definitions, shared by force and ack (raises ActionRefused)."""
+        from .deployment_actions import ActionRefused
+        if not self.deployment_actions_enabled():
+            raise ActionRefused(403, "deployment actions are disabled (control_plane.deployment_actions)")
+        defs = self._loaded_deployment_definitions()
+        if defs is None:
+            raise ActionRefused(503, "no deployment definitions loaded")
+        return defs
+
+    def deployment_force(self, actor, body):
+        """POST force: validate, audit (durably), then record. -> (status, payload)."""
+        from .deployment_actions import ActionRefused, ForceRequests, parse_force
+        try:
+            kind, value = parse_force(body)
+        except ActionRefused as exc:
+            return self._deployment_refusal("force", actor, exc, None)
+        target = {kind: value}
+        store = self.repo.deployment_requests
+        with self._deployment_actions_lock:
+            try:
+                defs = self._deployment_action_gate()
+                if kind == "component" and value not in defs:
+                    raise ActionRefused(404, "unknown component")
+                names = ([value] if kind == "component"
+                         else sorted(c for c, d in defs.items() if d.stage == value))
+                if not names:
+                    raise ActionRefused(404, "unknown stage")
+                entries = {}
+                for name in names:
+                    _, view = self._deployment_track_view(defs[name])
+                    commit = (view or {}).get("target_commit")
+                    if not commit:
+                        raise ActionRefused(409, f"no target release for {name} yet")
+                    entries[name] = (commit, int((view or {}).get("generation") or 0))
+                existing = store.find(kind, value, entries)
+                if existing is None:
+                    store.check_capacity()
+            except ActionRefused as exc:
+                return self._deployment_refusal("force", actor, exc, target)
+            rid = existing["id"] if existing else ForceRequests.new_id()
+            try:
+                self.deployment_audit(
+                    "force", "DeploymentForceRequested", outcome="accepted", actor=actor,
+                    target=target, reason="already pending" if existing else "recorded", status=200,
+                    durable=True, request_id=rid, components=names,
+                    target_commits={n: c for n, (c, _) in entries.items()}, existing=existing is not None)
+            except Exception:  # noqa: BLE001 - no audit, no request
+                log.warning("deployment force request not recorded: the audit row could not be persisted")
+                return 503, {"error": "audit_persistence_failed"}
+            if existing is not None:
+                return 200, {"created": False, "request": existing}
+            return 200, {"created": True, "request": store.add(kind, value, entries, actor, rid=rid)}
+
+    def deployment_ack(self, actor, body):
+        """POST ack: acknowledge a stale instance (or lift a failure-evicted mark)."""
+        from .deployment_actions import ActionRefused, parse_ack
+        try:
+            component, instance, release = parse_ack(body)
+        except ActionRefused as exc:
+            return self._deployment_refusal("ack", actor, exc, None)
+        target = {"component": component, "instance": instance, "release": release}
+        state = self.repo.deployment_plans
+        with self._deployment_actions_lock:
+            try:
+                defs = self._deployment_action_gate()
+                if component not in defs:
+                    raise ActionRefused(404, "unknown component")
+                if release is None:
+                    _, view = self._deployment_track_view(defs[component])
+                    release = (view or {}).get("target_commit")
+                    if not release:
+                        raise ActionRefused(409, "no target release to acknowledge against; give release")
+                    target["release"] = release
+                slots = state.acknowledgeable(component, release, instance)
+                if not slots:
+                    raise ActionRefused(404, "nothing to acknowledge: no such instance slot"
+                                        if instance is not None else "nothing to acknowledge: "
+                                        "the release is not failure-evicted")
+            except ActionRefused as exc:
+                return self._deployment_refusal("ack", actor, exc, target)
+            from .deployment_coordinator import ACK_EVENT, EVICTION_ACK_EVENT
+            try:
+                self.deployment_audit("ack", ACK_EVENT if instance is not None else EVICTION_ACK_EVENT,
+                                      outcome="accepted", actor=actor, target=target,
+                                      reason="acknowledged", status=200, durable=True,
+                                      acknowledged=slots)
+            except Exception:  # noqa: BLE001 - no audit, no ack
+                log.warning("deployment ack not applied: the audit row could not be persisted")
+                return 503, {"error": "audit_persistence_failed"}
+            return 200, {"acknowledged": state.acknowledge(component, release, instance)}
+
+    def deployment_permit(self, host, component, commit, generation=None):
+        """GET permit (host token). -> (status, payload); never writes anything."""
+        from .deployment_actions import _deny, permit_decision
+        defs = self._loaded_deployment_definitions()
+        if defs is None:
+            return 200, _deny("no deployment definitions loaded")
+        d = defs.get(component)
+        if d is None or d.host != host:
+            return 403, {"error": "component is not defined for this host"}
+        last, view = self._deployment_track_view(d)
+        force = (self.repo.deployment_requests.active(component, commit)
+                 if self.deployment_actions_enabled() else None)
+        try:
+            repair = self.deployment_escalation.repair_for(component, (view or {}).get("target_commit"), d)
+        except Exception:  # noqa: BLE001 - no repair is the safe answer
+            repair = None
+        return 200, permit_decision(last, view, component, commit, force, now=time.time(),
+                                    component_stage=d.stage, generation=generation, repair=repair)
+
+    def deployment_requests_for(self, host) -> list:
+        """The host's pending force entries ([] with the flag off or no definitions)."""
+        defs = self._loaded_deployment_definitions()
+        if defs is None or not self.deployment_actions_enabled():
+            return []
+        return self.repo.deployment_requests.entries([c for c, d in defs.items() if d.host == host])
+
+    def deployment_clear(self, host, rid) -> list:
+        """DELETE a request (host token): spend the host's own entries (and every overlapping
+        entry for the same component and commit); audited. Raises when the clear could not
+        be persisted durably (the route answers 503 and every entry stays pending).
+
+        The flag and the permit are checked AGAIN here, under the actions lock: a flag turned
+        off or a replan/unconfirmed release since the host's permit raises ``ActionRefused``
+        (nothing is cleared, the host must not redeploy)."""
+        from .deployment_actions import ActionRefused, permit_decision
+        if not self.deployment_actions_enabled():
+            raise ActionRefused(403, "deployment actions are disabled (control_plane.deployment_actions)")
+        defs = self._loaded_deployment_definitions()
+        if defs is None:
+            raise ActionRefused(503, "no deployment definitions loaded")
+        mine = [c for c, d in defs.items() if d.host == host]
+        store = self.repo.deployment_requests
+        with self._deployment_actions_lock:
+            for entry in (e for e in store.entries(mine) if e["id"] == rid):
+                d = defs[entry["component"]]
+                last, view = self._deployment_track_view(d)
+                answer = permit_decision(last, view, entry["component"], entry["target_commit"], rid,
+                                         now=time.time(), component_stage=d.stage,
+                                         generation=entry["generation"])
+                if not answer["permitted"]:
+                    raise ActionRefused(409, f"no longer permitted: {answer['reason']}")
+            done = store.clear(rid, mine, host)
+        if done:
+            self.deployment_audit("force", "DeploymentForcePickedUp", outcome="picked-up",
+                                  actor=f"host:{host}", target={"request_id": rid}, reason="cleared",
+                                  status=200, refusal=False, host=host, components=done)
+        return done
 
     @staticmethod
     def _intelligence_section(fleet_config):
@@ -855,6 +1325,11 @@ class ControlPlaneServer:
             h["capabilities"].append("unified_workspace_v1")
         if getattr(self, "skills", None) is not None:
             h["capabilities"].append("skill_registry_v1")
+        try:
+            if self.deployment_definitions.status()["configured"]:
+                h["capabilities"].append("deployments_v1")     # the read-only Deployments page
+        except Exception:  # noqa: BLE001 - health must answer even if the definitions cannot be read
+            pass
         if self.architecture.enabled:
             h["capabilities"].append("architecture_v1")
             if self.architecture.explain_config:
@@ -902,6 +1377,7 @@ class ControlPlaneServer:
             self._summary_scanner = threading.Thread(target=self._summary_loop, daemon=True)
             self._summary_scanner.start()
         threading.Thread(target=self._sweep_loop, daemon=True).start()
+        threading.Thread(target=self._deployments_loop, name="herdr-deployments-tick", daemon=True).start()
         if self.collab is not None and self.collab.lineage_sink is not None:
             threading.Thread(target=self._link_flush_loop, daemon=True).start()
         self._httpd.serve_forever()
@@ -920,6 +1396,12 @@ class ControlPlaneServer:
             self.repo.inspector.sweep()
         except Exception:
             pass
+        consumer = getattr(self, "delegation_consumer", None)
+        if consumer is not None:
+            try:
+                consumer.sweep()
+            except Exception as exc:
+                log.warning("assistant delegation sweep failed: %s", type(exc).__name__)
         try:
             sweep_token_usage(self.repo, raw_retention_days=self.usage_retention["raw_retention_days"])
         except Exception as exc:
@@ -967,6 +1449,7 @@ class ControlPlaneServer:
         if self.gate_service is not None:
             self.gate_service.stop()
         self._summary_stop.set()
+        self._deployments_stop.set()
         if self._summary_scanner:
             self._summary_scanner.join(timeout=2)
         if self.agent_summaries:
@@ -1479,6 +1962,8 @@ def _make_handler(server, public=False, operator=False):
                 return self._collab()
             if self._path_only() == _FLEET_CONFIG_PATH:
                 return self._fleet_config_get()
+            if self._path_only() in _DEPLOYMENT_HOST_GET_PATHS:      # host token, not X-API-Key
+                return self._deployment_host_get(_DEPLOYMENT_HOST_GET_PATHS[self._path_only()])
             if self._path_only() == "/api/v1/health" and self._role() is None:
                 # Keyed mode without a valid key: liveness only (deploy.sh's health
                 # check needs status + commit), no counters, sources or capabilities.
@@ -1487,6 +1972,10 @@ def _make_handler(server, public=False, operator=False):
             err = self._require("viewer")
             if err:
                 return err
+            if self._path_only() == "/api/deployments":     # the spec's name for /api/v1/deployments
+                if self._rate_limit():
+                    return None
+                return self._json(server.deployments_view())
             if self.path.startswith("/api/v1/"):
                 return self._route_api()
             return self._serve_static()
@@ -1515,6 +2004,10 @@ def _make_handler(server, public=False, operator=False):
                 return self._intelligence_webhook()
             if self._path_only() == _FLEET_CONFIG_PATH + "/telemetry":
                 return self._fleet_resource_telemetry()
+            if self._path_only() in _DEPLOYMENT_EVENTS_PATHS:
+                return self._deployment_event()
+            if self._path_only() in _DEPLOYMENT_ACTION_PATHS:
+                return self._deployment_action(_DEPLOYMENT_ACTION_PATHS[self._path_only()])
             # The ingest route is reachable by the ingest role; every other
             # POST requires the operator role (Spec §104).
             path = self.path.split("?")[0]
@@ -1594,6 +2087,9 @@ def _make_handler(server, public=False, operator=False):
                 return self._deny(400, "ambiguous request framing")
             if self._path_only() == _FLEET_CONFIG_PATH + "/applied":
                 return self._fleet_config_applied()
+            cleared = _DEPLOYMENT_REQUEST_PATH.match(self._path_only())
+            if cleared and self.command == "DELETE":                # host token, not X-API-Key
+                return self._deployment_request_clear(cleared.group(1))
             path = self.path.split("?")[0]
             segs = path.split("/")
             resource = unquote(segs[3]) if (len(segs) > 3 and segs[:3] == ["", "api", "v1"]
@@ -1662,6 +2158,199 @@ def _make_handler(server, public=False, operator=False):
                 return self._deny(400, "invalid resource observation")
             except RuntimeError:
                 return self._deny(503, "resource persistence unavailable")
+
+        def _deployment_host(self):
+            """Fleet host id owning the request's host token, or None (never says why).
+
+            The deploy event emitter sends ``Authorization: Bearer <host token>``; the
+            fleet's own ``X-Host-Token`` header is accepted too, but never both at once.
+            The token is checked by ``host_for_token`` (sha256, constant-time compare)
+            and grants this one route only: ``_role`` reads X-API-Key alone.
+            """
+            auth = self.headers.get_all("Authorization") or []
+            direct = self.headers.get_all("X-Host-Token") or []
+            token = None
+            if len(auth) == 1 and not direct:
+                scheme, _, value = auth[0].strip().partition(" ")
+                value = value.strip()
+                if scheme.lower() == "bearer" and value and not any(c.isspace() for c in value):
+                    token = value
+            elif len(direct) == 1 and not auth:
+                token = direct[0]
+            self._deployment_config_unavailable = False
+            if not token:
+                return None
+            from ..fleet_config import FleetConfigError
+            try:
+                return server.fleet_config.current().host_for_token(token)
+            except FleetConfigError:
+                # no usable fleet file: the caller answers 503, never a 500
+                self._deployment_config_unavailable = True
+                return None
+
+        def _deny_deployment_host(self):
+            if getattr(self, "_deployment_config_unavailable", False):
+                return self._deny(503, "fleet configuration unavailable")
+            return self._deny(401, "unauthorized")
+
+        def _deployment_event(self):
+            """POST one deployment event. Auth and size are decided before the body is read."""
+            if server.fleet_config is None:
+                return self._deny(404, "not found")
+            host = self._deployment_host()
+            if host is None:
+                return self._deny_deployment_host()
+            if self._rate_limit(f"deploy-host:{host}"):
+                return None
+            from .deployments_monitor import MAX_REQUEST_BYTES
+            length = _content_length(self.headers.get("Content-Length"))
+            if not length:
+                return self._deny(400, "a deployment event body is required")
+            if length > MAX_REQUEST_BYTES:
+                return self._deny(413, f"deployment event exceeds {MAX_REQUEST_BYTES} bytes")
+            if self.headers.get("Content-Type", "").split(";", 1)[0].strip() != "application/json":
+                return self._deny(415, "deployment events require application/json")
+            try:
+                body = self._read_json(MAX_REQUEST_BYTES)
+            except RecursionError:
+                # json.loads raises this (not ValueError) on deeply nested input.
+                return self._deny(400, "invalid JSON body: nested too deeply")
+            except ValueError as exc:
+                return self._deny(400, str(exc))
+            from .deployment_definitions import (
+                DeploymentAuthorizationError,
+                DeploymentDefinitionsUnavailable,
+            )
+            # With definitions loaded a host reports only its own components; refused events
+            # are never ingested (not stored, not persisted). A malformed body falls through
+            # to ingest's own 400.
+            if isinstance(body, dict) and isinstance(body.get("component"), str):
+                try:
+                    server.deployment_definitions.authorize(body["component"], host)
+                except DeploymentAuthorizationError as exc:
+                    return self._deny(403, str(exc))
+                except DeploymentDefinitionsUnavailable as exc:
+                    return self._deny(503, str(exc))
+            try:
+                server.repo.deployments.ingest(body, reported_by=host)
+            except ValueError as exc:
+                return self._deny(400, str(exc))
+            return self._json({"ok": True})
+
+        # ---------------------------------------- deployment actions (deploy-4 Task 5)
+        def _deployment_action(self, action):
+            """POST force/ack. Operator role first: an auth refusal is audited as refused
+            (throttled, no target: the body is never read), never as accepted. Every later
+            refusal is audited with the validated target; see deployment_actions."""
+            from .deployment_actions import MAX_BODY_BYTES
+            if self._rate_limit():
+                return None
+
+            def unaudited(status, reason):
+                server.deployment_refused(action, None, status, reason, auth=True)
+                return self._deny(status, reason)
+
+            if not server._deployment_keyed():
+                # Open tailnet mode: every caller is "operator", so a DNS-rebound page would be
+                # too. Deployment actions need a real credential.
+                return unaudited(403, "deployment actions require API keys (keyed mode)")
+            role = self._role()
+            if role is None:
+                return unaudited(401, "unauthorized")
+            if role != "operator":
+                return unaudited(403, "operator role required")
+            if server.fleet_config is not None and self._deployment_host() is not None:
+                # A fleet host token grants the host routes only, even beside an operator key.
+                return unaudited(403, "a host token grants no operator action")
+            principal = self._principal()
+            actor = f"{principal['kind']}:{principal['id']}"
+
+            def refuse(status, reason):
+                server.deployment_refused(action, actor, status, reason)
+                return self._deny(status, reason)
+
+            # Browser defences (the key could be in a page's hands): a Host a rebinding name
+            # cannot reach, no cross-site fetch, and an Origin equal to the Host.
+            if not _dashboard_host_ok(self.headers.get("Host", ""), server.collab_dashboard_hosts):
+                return refuse(403, "deployment actions need a dashboard host")
+            fetch_site = self.headers.get("Sec-Fetch-Site")
+            if fetch_site is not None and fetch_site.strip().lower() not in {"same-origin", "none"}:
+                return refuse(403, "cross-site deployment action refused")
+            origin = self.headers.get("Origin")
+            if origin is not None and (urlsplit(origin).netloc != self.headers.get("Host")
+                                       or urlsplit(origin).scheme not in {"http", "https"}):
+                return refuse(403, "cross-origin deployment action refused")
+            if self.headers.get("Content-Type", "").split(";", 1)[0].strip() != "application/json":
+                return refuse(415, "deployment actions require application/json")
+            length = _content_length(self.headers.get("Content-Length"))
+            if length is None:
+                return refuse(400, "bad length")
+            if not length:
+                return refuse(400, "a JSON body is required")
+            if length > MAX_BODY_BYTES:
+                return refuse(413, f"deployment actions are at most {MAX_BODY_BYTES} bytes")
+            try:
+                body = self._read_json(MAX_BODY_BYTES)
+            except (RecursionError, ValueError):
+                self.close_connection = True
+                return refuse(400, "invalid JSON body")
+            handler = server.deployment_force if action == "force" else server.deployment_ack
+            status, payload = handler(actor, body)
+            return self._json(payload, status)
+
+        def _deployment_host_get(self, what):
+            """GET requests / permit with the fleet host token (grants these routes only)."""
+            from .deployment_actions import COMMIT, COMPONENT, HOST
+            if server.fleet_config is None:
+                return self._deny(404, "not found")
+            host = self._deployment_host()
+            if host is None:
+                return self._deny_deployment_host()
+            if self._rate_limit(f"deploy-host:{host}"):
+                return None
+            raw = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
+            allowed = {"host"} if what == "requests" else {"component", "commit", "generation"}
+            if set(raw) - allowed or any(len(v) != 1 for v in raw.values()):
+                return self._deny(400, f"query takes only {', '.join(sorted(allowed))}")
+            query = {k: v[0] for k, v in raw.items()}
+            if what == "requests":
+                asked = query.get("host", host)
+                if not HOST.fullmatch(asked or "") or asked != host:
+                    return self._deny(403, "a host reads only its own requests")
+                return self._json({"host": host, "actions_enabled": server.deployment_actions_enabled(),
+                                   "requests": server.deployment_requests_for(host)})
+            component, commit = query.get("component", ""), query.get("commit", "")
+            if not COMPONENT.fullmatch(component) or not COMMIT.fullmatch(commit):
+                return self._deny(400, "component and commit are required")
+            generation = query.get("generation")
+            if generation is not None and not (generation.isascii() and generation.isdigit()
+                                               and len(generation) <= 9):
+                return self._deny(400, "generation must be a non-negative integer")
+            status, payload = server.deployment_permit(
+                host, component, commit, None if generation is None else int(generation))
+            return self._json(payload, status)
+
+        def _deployment_request_clear(self, rid):
+            """DELETE /api/deployments/requests/<id>: the owning host clears its entries."""
+            from .deployment_actions import REQUEST_ID
+            if server.fleet_config is None:
+                return self._deny(404, "not found")
+            host = self._deployment_host()
+            if host is None:
+                return self._deny_deployment_host()
+            if self._rate_limit(f"deploy-host:{host}"):
+                return None
+            from .deployment_actions import ActionRefused
+            try:
+                done = server.deployment_clear(host, rid) if REQUEST_ID.fullmatch(rid) else []
+            except ActionRefused as exc:            # nothing cleared: the host must not redeploy
+                return self._deny(exc.status, exc.message)
+            except Exception:  # noqa: BLE001 - not durably cleared: the host must not redeploy
+                log.warning("deployment force pickup not persisted; the request stays pending")
+                return self._deny(503, "the pickup could not be persisted; do not redeploy")
+            if not done:
+                return self._deny(404, "no pending request of this host")
+            return self._json({"cleared": done})
 
         # --------------------------------------------------- collaboration (HCN)
         def _is_collab_path(self):
@@ -2160,6 +2849,10 @@ def _make_handler(server, public=False, operator=False):
             if (resource == "artifacts" and len(parts) >= 5
                     and not self._artifact_allowed(parts[4], "read")):
                 return self._json({"error": "not found"}, 404)
+            if resource == "deployments":
+                if len(parts) > 4:
+                    return self._json({"error": "not found"}, 404)
+                return self._json(server.deployments_view())
             if resource == "handoffs":
                 if len(parts) == 5 and parts[4] == "tree":
                     return self._json(server.handoffs.tree())
@@ -2580,7 +3273,7 @@ def _make_handler(server, public=False, operator=False):
             if resource == "review-gate":
                 return self._review_gate_get(parts)
             if resource in ("assistants", "assistant-runs", "assistant-approvals", "assistant-memory", "assistant-routines", "assistant-connectors", "assistant-delegations",
-                            "assistant-proposals", "assistant-notifications"):
+                            "assistant-proposals", "assistant-notifications", "assistant-audit"):
                 return self._assistant_get(parts, resource)
             if resource == "tests":
                 return self._json(_tests_view())
@@ -3045,7 +3738,28 @@ def _make_handler(server, public=False, operator=False):
         # nor client-supplied identity headers establish human approval authority.
         # Collaboration Bearer/Agent authentication belongs to its own dispatch.
         def _assistant_scope(self):
-            return "default", self._principal()["id"]
+            # The tenant is the authenticated principal's, from the operator's YAML (personal_assistant.tenancy);
+            # nothing the client sends (headers included) can choose it.
+            principal_id = self._principal()["id"]
+            return server.assistant.tenant_for(principal_id), principal_id
+
+        @staticmethod
+        def _execute_action_view(svc, action_id, tenant_id, user_id):
+            """Run an approved action and describe the outcome. A refusal is reported, never raised: the approval
+            itself stands, and a person can see why nothing ran."""
+            from .assistant import AssistantError, AssistantNotFound
+            try:
+                action = svc.execute_approved_action(action_id, tenant_id=tenant_id, user_id=user_id, actor=user_id)
+            except AssistantNotFound:
+                raise
+            except AssistantError as exc:
+                return {"status": "not_executed", "error": str(exc)}
+            except Exception:  # noqa: BLE001 - e.g. the audit store refused the pre-execution entry: nothing ran
+                logging.getLogger(__name__).exception("assistant action %s was not executed", action_id)
+                return {"status": "not_executed", "error": "the action could not be started (the audit store refused the "
+                                                    "pre-execution entry); nothing was run"}
+            return {"status": action.status, "result": action.result or {},
+                    "executed_at": action.executed_at.isoformat() if action.executed_at else None}
 
         def _assistant_get(self, parts, resource):
             from .assistant import AssistantNotFound, AssistantUnavailable, RateLimited
@@ -3096,6 +3810,33 @@ def _make_handler(server, public=False, operator=False):
                                                                           assistant_id=parts[4])]})
                     if len(parts) == 7 and parts[5] == "routines":
                         return self._json(svc.get_routine(parts[6], tenant_id=tenant_id, user_id=user_id).as_dict())
+                if resource == "assistant-audit" and len(parts) == 5 and parts[4] in ("head", "check"):
+                    svc._require_enabled()
+                    if not svc._is_approver(user_id):           # the anchor tooling is an operator task, not any caller's
+                        return self._json({"error": "forbidden: anchoring needs a configured approver of the tenant",
+                                           "code": "forbidden"}, 403)
+                if resource == "assistant-audit" and len(parts) == 5 and parts[4] == "head":
+                    from datetime import UTC, datetime
+                    return self._json({"tenant_id": tenant_id, "head": svc.store.audit_head(tenant_id),
+                                       "chain_intact": svc.store.verify_audit(tenant_id),
+                                       "time": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")})
+                if resource == "assistant-audit" and len(parts) == 5 and parts[4] == "check":
+                    from .audit_anchor import check_chain
+                    try:
+                        seq = int(_q(self.path, "seq") or "")
+                    except ValueError:
+                        return self._json({"error": "seq must be an integer"}, 400)
+                    return self._json({"tenant_id": tenant_id, **check_chain(
+                        svc.store, tenant_id, seq, _q(self.path, "sha256") or "")})
+                if resource == "assistant-audit" and len(parts) == 4:
+                    # read only: there is no POST/PATCH/DELETE route for the audit log
+                    repaired = svc.repair_pending_audits(tenant_id=tenant_id, user_id=user_id)
+                    return self._json({"audit": svc.audit_log(tenant_id=tenant_id, user_id=user_id,
+                                                              limit=int(_q(self.path, "limit") or 200)),
+                                       "chain_intact": svc.store.verify_audit(tenant_id),
+                                       "head": svc.store.audit_head(tenant_id), "repaired": repaired})
+                if resource == "assistant-proposals" and len(parts) == 6 and parts[5] == "preview":
+                    return self._json(svc.preview_proposal(parts[4], tenant_id=tenant_id, user_id=user_id))
                 if resource == "assistant-proposals" and len(parts) == 4:
                     return self._json({"proposals": [x.as_dict() for x in svc.list_proposals(
                         tenant_id=tenant_id, user_id=user_id, status=_q(self.path, "status"))]})
@@ -3113,7 +3854,7 @@ def _make_handler(server, public=False, operator=False):
                     return self._json(svc.get_run(parts[4], tenant_id=tenant_id, user_id=user_id).as_dict())
                 if resource == "assistant-approvals" and len(parts) == 4:
                     state = _q(self.path, "state")
-                    return self._json({"approvals": [a.as_dict() for a in
+                    return self._json({"approvals": [svc.approval_view(a) for a in
                                                       svc.list_approvals(tenant_id=tenant_id, user_id=user_id,
                                                                          state=state)]})
                 if resource == "assistant-memory" and len(parts) == 5:
@@ -3229,7 +3970,19 @@ def _make_handler(server, public=False, operator=False):
                     decision = svc.decide_approval(parts[4], tenant_id=tenant_id, user_id=user_id,
                                                    decision=body.get("decision", ""),
                                                    actor=user_id)
-                    return self._json(decision.as_dict())
+                    execution = None
+                    if decision.decision == "approved" and svc.config["actions"]["auto_execute"]:
+                        execution = self._execute_action_view(svc, decision.action_id, tenant_id, user_id)
+                    view = svc.approval_view(decision)
+                    if execution is not None:
+                        view["execution"] = execution
+                    return self._json(view)
+                if resource == "assistant-approvals" and len(parts) == 6 and parts[5] == "execute":
+                    approval = svc.store.approvals.get(parts[4])
+                    if approval is None or approval.tenant_id != tenant_id:
+                        raise AssistantNotFound("approval not found")
+                    view = self._execute_action_view(svc, approval.action_id, tenant_id, user_id)
+                    return self._json(view, 200 if view["status"] == "completed" else 409)
                 if resource == "assistant-memory" and len(parts) == 5 and self.command == "DELETE":
                     svc.forget_memory(parts[4], tenant_id=tenant_id, user_id=user_id)
                     return self._json({"ok": True})
@@ -3265,9 +4018,25 @@ def _make_handler(server, public=False, operator=False):
                 if resource == "assistant-connectors" and len(parts) == 5 and self.command == "DELETE":
                     svc.archive_connector(parts[4], tenant_id=tenant_id, user_id=user_id)
                     return self._json({"ok": True})
-                if resource == "assistant-connectors" and len(parts) == 6 and parts[5] == "request":
+                if resource == "assistant-connectors" and len(parts) == 6 and parts[5] in ("request", "test"):
                     # Same gate as every other tool: an assistant run, a grant scoped to THIS connector (from the
                     # path, never the body), a fail-closed approval, an idempotency key and a TTL.
+                    # ``test`` is the dashboard's way in: it opens (or reuses) a bookkeeping run for the named
+                    # assistant, so the button needs no chat, and then takes exactly the ``request`` path below.
+                    if parts[5] == "test":
+                        if not isinstance(body.get("assistant_id"), str) or not body["assistant_id"]:
+                            return self._json({"error": "assistant_id is required"}, 400)
+                        _tr = svc.open_tool_run(tenant_id=tenant_id, user_id=user_id,
+                                                assistant_id=body["assistant_id"], purpose="connector-test")
+                        # a click while a check for this connector still waits for approval asks again about the SAME
+                        # action (same key), so repeated clicks never pile up approvals
+                        _open = next((x.idempotency_key for x in svc.store.actions.values()
+                                      if x.run_id == _tr.run_id and x.scope == parts[4] and x.status == "requested"
+                                      and x.idempotency_key.startswith("test-") and x.expires_at is not None
+                                      and x.expires_at > svc.now()), None)
+                        body = {"run_id": _tr.run_id,
+                                "idempotency_key": body.get("idempotency_key") or _open or f"test-{parts[4]}-{secrets.token_hex(8)}",
+                                "method": "GET", "path": "/", "dry_run": bool(body.get("dry_run"))}
                     run_id, idem = body.get("run_id"), body.get("idempotency_key")
                     if not isinstance(run_id, str) or not run_id or not isinstance(idem, str) or not idem:
                         return self._json({"error": "run_id and idempotency_key are required: connector calls "
@@ -3300,12 +4069,42 @@ def _make_handler(server, public=False, operator=False):
                     except Exception:
                         svc.fail_action(action)
                         raise
+                    action.result = svc._result_summary(result)
+                    action.executed_by, action.executed_at = user_id, svc.now()
                     svc.complete_action(action)
                     return self._json(result)
                 if resource == "assistant-proposals" and len(parts) == 6 and parts[5] == "decision":
-                    return self._json(svc.decide_proposal(
-                        parts[4], tenant_id=tenant_id, user_id=user_id,
-                        decision=body.get("decision", ""), actor=user_id).as_dict())
+                    x = svc.decide_proposal(parts[4], tenant_id=tenant_id, user_id=user_id,
+                                            decision=body.get("decision", ""), actor=user_id)
+                    out, run_error = None, None
+                    if (x.status == "approved" and svc.config["actions"]["auto_execute"]
+                            and x.kind in ("propose_branch", "request_mission")):
+                        # the decision is already committed: an execution problem is reported next to it, never as
+                        # a failed request
+                        try:
+                            x = svc.execute_approved_proposal(x.proposal_id, tenant_id=tenant_id, user_id=user_id,
+                                                              actor=user_id)
+                        except AssistantNotFound:
+                            raise
+                        except AssistantError as exc:
+                            run_error = str(exc)
+                        except Exception:  # noqa: BLE001
+                            logging.getLogger(__name__).exception("proposal %s was not executed", x.proposal_id)
+                            run_error = "the proposal could not be started; nothing was handed off"
+                    out = x.as_dict()
+                    if run_error:
+                        out["execution_error"] = out.get("execution_error") or run_error
+                    return self._json(out)
+                if resource == "assistant-proposals" and len(parts) == 6 and parts[5] == "execute":
+                    x = svc.execute_approved_proposal(parts[4], tenant_id=tenant_id, user_id=user_id, actor=user_id)
+                    return self._json(x.as_dict(), 200 if x.execution == "executed" else 409)
+                if resource == "assistant-delegations" and len(parts) == 6 and parts[5] == "dispatch":
+                    if not svc.config["delegation_consumer"]["enabled"]:
+                        raise AssistantUnavailable("delegation dispatch is not enabled (personal_assistant.delegation_consumer)")
+                    d = server.delegation_consumer.dispatch(parts[4], tenant_id=tenant_id, user_id=user_id,
+                                                            actor=user_id)
+                    handed = ((d.correlation or {}).get("dispatch") or {}).get("state") == "handed_off"
+                    return self._json(d.as_dict(), 200 if handed else 409)
                 if resource == "assistant-notifications" and len(parts) == 6 and parts[5] == "ack":
                     return self._json(svc.ack_notification(
                         parts[4], tenant_id=tenant_id, user_id=user_id).as_dict())
@@ -3396,7 +4195,7 @@ def _make_handler(server, public=False, operator=False):
         def _llm_stats(self, what):
             """LLM page statistics (operator listener only; a bad parameter is a 400)."""
             window = _q(self.path, "window") or "24h"
-            filters = {k: _q(self.path, k) for k in ("project", "model", "session", "mission", "source")}
+            filters = {k: _q(self.path, k) for k in ("project", "model", "session", "mission", "source", "previous")}
             try:
                 if what == "stats":
                     return self._json(server.repo.llm_stats(

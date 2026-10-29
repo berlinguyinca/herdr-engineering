@@ -259,3 +259,15 @@ def test_transcript_usage_outside_the_window_is_left_out():
     repo.inspector.ingest("t-1", {"events": [{"kind": "usage", "ts": "2026-10-10T00:00:00Z", "output_tokens": 5}]})
     assert repo.llm_stats("24h", group="all")["groups"] == []
     assert repo.llm_stats("30d", group="all")["groups"][0]["tokens"]["output"] == 5
+
+
+def test_group_by_mission_queue_series_and_the_previous_window():
+    repo, clock = _repo()
+    _seed(repo, clock, [_row(mission_id="m-1", queue_ms=40) for _ in range(5)] + [_row(), _row(mission_id="m-2")], ago=30)
+    _seed(repo, clock, [_row(mission_id="m-1") for _ in range(2)], ago=30 * HOUR)       # before the 24h window, inside the one before
+    groups = {g["key"]: g["requests"] for g in repo.llm_stats("24h", "mission", source="llm-proxy")["groups"]}
+    assert groups == {"m-1": 5, "m-2": 1}                       # a row with no mission is left out of this grouping
+    assert repo.llm_stats("24h", "all")["groups"][0]["requests"] == 7
+    assert repo.llm_stats("24h", "all", previous="1")["groups"][0]["requests"] == 2
+    queue = [p["v"] for p in repo.llm_timeseries("24h", "1h", "queue_p95")["points"] if p["v"] is not None]
+    assert queue and all(v >= 40 for v in queue)
