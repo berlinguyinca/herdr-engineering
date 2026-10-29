@@ -260,7 +260,7 @@ def test_trace_id_round_trips_and_writers_work_without_the_column(wg):
                                           event_type="x", source="hcn", source_sequence=2, actor={"id": "a"}))
             await tr.rollback()
             return ok
-    assert wg.run(go()) is True                                # a database without 0031 still accepts events without a trace id
+    assert wg.run(go()) is True                                # a database without 0033 still accepts events without a trace id
 
 
 def _sql_blocks(path: Path):
@@ -270,7 +270,7 @@ def _sql_blocks(path: Path):
     return up, down
 
 
-@pytest.mark.parametrize("name", ["0031_event_trace_id.sql", "0032_work_graph.sql"])
+@pytest.mark.parametrize("name", ["0033_event_trace_id.sql", "0034_work_graph.sql"])
 def test_migrations_are_idempotent_and_the_down_script_undoes_exactly_the_up(wg, name):
     up, down = _sql_blocks(MIGRATIONS / name)
     assert re.findall(r"CREATE TABLE (?!IF NOT EXISTS)", up) == []
@@ -291,7 +291,7 @@ def test_migrations_are_idempotent_and_the_down_script_undoes_exactly_the_up(wg,
             await tr.rollback()
             return before, after, col, col2, back
     before, after, col, col2, back = wg.run(go())
-    if name.startswith("0032"):
+    if name.startswith("0034"):
         assert before == 10 and after == 0 and back == 10
     else:
         assert col == 0 and col2 == 1

@@ -272,7 +272,7 @@ def validate_event(doc: Mapping) -> None:
 
 def event_from_envelope(ev: Any, *, tenant_id: str, entity_urns: Iterable[str] = ()) -> dict:
     """Project an ``events.Event`` (envelope v2) onto the contract event. ``trace_id`` is carried when the
-    envelope has one (migration 0031); correlation falls back to the entity id so the field is never empty."""
+    envelope has one (migration 0033); correlation falls back to the entity id so the field is never empty."""
     actor = ev.actor if isinstance(ev.actor, dict) else {"kind": "system", "id": ev.source or "unknown"}
     vis = ev.visibility_scope if ev.visibility_scope in ("private", "mission", "room", "org") else "private"
     scope: dict[str, Any] = {"tenant_id": tenant_id, "visibility": vis}

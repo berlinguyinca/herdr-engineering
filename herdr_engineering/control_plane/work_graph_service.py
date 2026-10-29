@@ -60,7 +60,7 @@ class WorkGraphService:
         if not have:
             await self._pool.close()
             self._pool = None
-            raise Unavailable("work graph tables are not migrated (apply migration 0032)")
+            raise Unavailable("work graph tables are not migrated (apply migration 0034)")
         self.store = WorkGraphStore(self._pool, artifact_ok=self.artifact_ok)
 
     def _boot(self) -> None:

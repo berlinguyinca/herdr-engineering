@@ -1,7 +1,7 @@
 # Persistent Work Graph v1 (unified workspace P02)
 
 Flag: `control_plane.unified_workspace.enabled` (YAML, default off). Off: every `/api/v1/graph/work/*` route is a 404, the
-capability `unified_workspace_v1` is not advertised, migrations 0031/0032 are inert additive tables. On without
+capability `unified_workspace_v1` is not advertised, migrations 0033/0034 are inert additive tables. On without
 `control_plane.pg_dsn`: the routes answer 503 (never a crash). Rollback = flag off; DOWN scripts are in the migrations.
 
 ## What it is
@@ -14,7 +14,7 @@ versions. `pi_relationship` stays separate (decision D1); the in-memory lineage 
 Sources (all read, none copied): `fabric_events` (`entity_type` `collab`, `session`, `artifact`), the artifact registry tables
 (`artifacts`, `artifact_versions`, `artifact_bindings`) and the GitHub catalog (`github_issues`).
 
-## Model (migration 0032)
+## Model (migration 0034)
 | Table | Role |
 |---|---|
 | `wg_event` | ledger of source events already projected (idempotence; the reconciler's anti-join) |

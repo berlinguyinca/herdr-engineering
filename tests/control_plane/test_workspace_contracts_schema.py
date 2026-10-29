@@ -197,7 +197,7 @@ def test_events_envelope_v2_projects_onto_the_event_contract():
                                           actor={"kind": "user", "id": "alice"}, visibility_scope="org",
                                           trace_id="trace-9"), tenant_id="t1")
     _validator("event").validate(traced)
-    assert traced["trace_id"] == "trace-9"             # migration 0031 / Event.trace_id
+    assert traced["trace_id"] == "trace-9"             # migration 0033 / Event.trace_id
     v1 = Event(event_id="ev_2", entity_id="e", event_type="x")      # a v1 event (no v2 fields) still projects
     _validator("event").validate(wc.event_from_envelope(v1, tenant_id="t1"))
 

@@ -27,4 +27,4 @@ Rules the Pi side can rely on
 * Pi must keep sending the ids on **every** session event for the session; the fold takes scope from events that state scope
   and ignores scope-less ones, so a later event without the ids does not lose the room.
 * No secret, prompt text or transcript belongs in these payloads (they are stored in `fabric_events` as sent).
-* `trace_id` (new envelope field, migration 0031) may be sent for correlation; it is stored and indexed, nothing depends on it.
+* `trace_id` (new envelope field, migration 0033) may be sent for correlation; it is stored and indexed, nothing depends on it.

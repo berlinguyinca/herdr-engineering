@@ -38,8 +38,8 @@ class Event:
     workspace_id: str | None = None
     task_id: str | None = None
     agent_id: str | None = None
-    # Distributed trace id (migration 0031). Optional; the INSERT names the column only when it is set, so a writer
-    # still works against a database that has not applied 0031.
+    # Distributed trace id (migration 0033). Optional; the INSERT names the column only when it is set, so a writer
+    # still works against a database that has not applied 0033.
     trace_id: str | None = None
 
 
