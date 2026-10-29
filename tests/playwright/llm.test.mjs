@@ -56,6 +56,7 @@ test('the LLM page shows request, latency, speed and error figures with links to
     assert.match(tiles[4], /^\d+(\.\d+)?% \(\d+\)$/);
     assert.equal(await page.locator('.llm-card svg').count(), 3);
     await page.locator('.llm-data > summary').waitFor();
+    await page.locator('[data-llm-switch="llm-tab"] .llm-tabs label', { hasText: 'Agents' }).click();       // the tables share one card; Agents is its second tab
     const link = page.locator('.llm-section a[href^="#/llm/session/"]').first();
     await link.waitFor();
     await link.click();
@@ -67,6 +68,7 @@ test('the LLM page shows request, latency, speed and error figures with links to
     await page.locator('[data-llm-link]').first().waitFor();       // the workspace links to its usage
     await page.goto(`${base}/#/llm`);
     await page.locator('.llm-tile').first().waitFor();
+    await page.locator('[data-llm-switch="llm-tab"] .llm-tabs label', { hasText: 'Problems' }).click();
     await page.getByText('upstream_admission').first().waitFor();
     assert.ok(await page.getByText('(unmatched)').count() >= 1);
   });
