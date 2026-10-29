@@ -505,3 +505,16 @@ for(const [date,counts] of [['2026-10-25',[2,4,5,4,0]],['2026-10-24',[4,2,0,0,0]
  assert.deepEqual([initial.start,initial.end],[`${date}T12:00:00.000Z`,`${date}T13:00:00.000Z`]);
  await page.evaluate(()=>app.dispose());
 }));
+
+test('overview lists the projects with the most failed runs; choosing one opens Projects with it selected, and the tiles say what they cover',()=>reviewPage(async page=>{
+ await page.evaluate(()=>{fixture.projects=fixture.projects.map((p,i)=>({...p,failure_count:i?1:9,completed_count:i?1:9}));});
+ await page.evaluate(async()=>{const {mountIntegrations}=await import('/packages/integrations-view.js');window.app=mountIntegrations(document.querySelector('main'),client);});
+ await page.locator('[data-ci-workspace="overview"][aria-selected="true"]').waitFor();
+ const worst=page.locator('[data-ob-worst] button');await worst.first().waitFor();
+ assert.equal(await worst.first().textContent(),'org/current','the project with the most failures is first');
+ assert.match(await page.locator('[data-ob-worst]').textContent(),/9 failed of 9/);
+ assert.match(await page.locator('[data-ob-caption]').textContent(),/Last 14 days.*Needs attention lists only failures no later run has fixed/);
+ await worst.first().click();
+ assert.equal(await page.locator('[data-ci-workspace="health"]').getAttribute('aria-selected'),'true');
+ assert.equal(await page.locator('[data-ob-project][aria-pressed="true"]').textContent(),'org/current');
+}));
