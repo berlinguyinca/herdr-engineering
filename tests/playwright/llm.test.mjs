@@ -54,7 +54,7 @@ test('the LLM page shows request, latency, speed and error figures with links to
     assert.match(tiles[2], /ms \/ .*ms|ms \/ .* s/);      // TTFT p50 / p95 are real numbers (n >= 5)
     assert.match(tiles[3], /t\/s$/);
     assert.match(tiles[4], /^\d+(\.\d+)?% \(\d+\)$/);
-    assert.equal(await page.locator('.llm-card svg').count(), 3);
+    assert.equal(await page.locator('.llm-card svg').count(), 4);                 // requests, TTFT, speed, queue
     await page.locator('.llm-data > summary').waitFor();
     await page.locator('[data-llm-switch="llm-tab"] .llm-tabs label', { hasText: 'Agents' }).click();       // the tables share one card; Agents is its second tab
     const link = page.locator('.llm-section a[href^="#/llm/session/"]').first();
