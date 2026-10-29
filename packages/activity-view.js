@@ -12,7 +12,7 @@ const STYLE = `<style>
     .ac-workspace{display:grid;grid-template-columns:minmax(620px,1600px) minmax(320px,1fr);gap:var(--density-gap,16px);align-items:start;width:100%}
     .ac-stream{min-width:0}.ac-stream-head{display:flex;align-items:baseline;justify-content:space-between;gap:12px;margin-bottom:8px}.ac-stream-head h2{margin:0}.ac-stream-head span,.ac-eyebrow{font-size:12px;color:var(--text-secondary)}
     .ac-new{position:sticky;top:8px;z-index:1;display:block;margin:0 auto 8px;min-height:32px;padding:4px 14px;border:1px solid var(--accent);border-radius:999px;background:var(--accent);color:var(--accent-contrast,#fff);font:inherit;font-size:13px;cursor:pointer}.ac-new[hidden]{display:none}
-    .ac-list{min-width:0;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);overflow:hidden}
+    .ac-list{min-width:0;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);overflow:hidden;overflow-anchor:none}
     .ac-row{border-bottom:1px solid var(--border-subtle)}.ac-row:last-child{border-bottom:0}.ac-row[open]{background:var(--bg)}
     .ac-row summary{display:grid;grid-template-columns:minmax(140px,220px) minmax(0,1fr) auto;gap:14px;align-items:center;padding:10px 12px;cursor:pointer;list-style-position:inside;font-size:13px}
     .ac-row summary strong{overflow-wrap:anywhere}.ac-kind,.ac-time{font-size:12px;color:var(--text-secondary)}.ac-time{white-space:nowrap}

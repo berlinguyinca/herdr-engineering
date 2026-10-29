@@ -127,6 +127,8 @@ export class CollabApi {
   xlinks(room) { return this.call('GET', `/rooms/${encodeURIComponent(room)}/xlinks`); }
   createLink(room, body) { return this.call('POST', `/rooms/${encodeURIComponent(room)}/xlinks`, body); }
   revokeLink(room, id) { return this.call('POST', `/rooms/${encodeURIComponent(room)}/xlinks/${encodeURIComponent(id)}/revoke`, {}); }
+  // Asks the server whether this principal may do `action` on a linked workspace (the one authorization point; it audits the answer).
+  authorizeWorkspace(room, link, action) { return this.call('POST', `/rooms/${encodeURIComponent(room)}/workspaces/${encodeURIComponent(link)}/authorize`, { action }); }
   agents() { return this.call('GET', '/agents'); }
   connectAgent(name) {
     return this.call('POST', '/agents/connect', { harness_type: 'claude-code', ...(name ? { name } : {}) });

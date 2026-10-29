@@ -8,9 +8,8 @@ from dataclasses import dataclass, replace
 
 from .artifact_visual_renderers import (
     _DECK_CSS,
-    parse_flowchart,
     render_chart_svg,
-    render_flowchart_svg,
+    render_mermaid,
     split_slides,
 )
 
@@ -49,6 +48,15 @@ _PAGE_HEAD = (
     "th,td{border:1px solid color-mix(in srgb,CanvasText 25%,Canvas);padding:.3rem .6rem}"
     "blockquote{margin-left:0;padding-left:1rem;border-left:3px solid color-mix(in srgb,CanvasText 30%,Canvas)}"
     "</style></head><body>\n")
+
+# The diagram page follows the viewer's colour scheme, like the document and deck pages, so the dark SVG panel does not sit on white.
+_DIAGRAM_HEAD = (
+    '<!doctype html><html lang="en"><head><meta charset="utf-8">'
+    '<meta name="viewport" content="width=device-width, initial-scale=1">'
+    '<meta name="color-scheme" content="light dark">'
+    "<style>:root{color-scheme:light dark}"
+    "body{margin:0;padding:1rem;font:16px/1.5 system-ui,sans-serif;background:Canvas;color:CanvasText}"
+    "figure{margin:0 0 1rem;overflow:auto}pre{overflow:auto}</style></head><body>\n")
 
 _SAFE_URL = re.compile(r"^(?:https?:|mailto:)", re.I)
 
@@ -246,7 +254,7 @@ class RendererRegistry:
             validation["findings"] = [{"code": "no_chart_spec",
                                        "detail": "JSON has no 'type'; only data.json was produced"}]
         return RenderResult("visualization", source, outputs, validation,
-                            {"renderer": "builtin-chart-svg", "revision": "1"})
+                            {"renderer": "builtin-chart-svg", "revision": "2"})
 
     @staticmethod
     def _diagram(source: str) -> RenderResult:
@@ -256,20 +264,21 @@ class RendererRegistry:
                + html.escape(source) + "</pre></details>")
         outputs, checks, findings = [], ["mermaid-source"], []
         try:
-            svg = render_flowchart_svg(parse_flowchart(source))
+            svg, check = render_mermaid(source)
             outputs.append({"name": "diagram.svg", "media_type": "image/svg+xml", "content": svg})
             content = "<figure>" + svg + "</figure>" + pre
-            checks.append("flowchart-svg")
+            checks.append(check)
         except ValueError as exc:
-            # Other Mermaid diagram types stay inert source until a sandboxed renderer exists.
+            # Unsupported Mermaid constructs stay inert source until a sandboxed renderer exists.
             content = "<pre data-diagram-format=\"mermaid\">" + html.escape(source) + "</pre>"
             findings.append({"code": "not_rendered", "detail": str(exc)})
-        outputs.insert(0, {"name": "diagram.html", "media_type": "text/html", "content": content})
+        outputs.insert(0, {"name": "diagram.html", "media_type": "text/html",
+                           "content": _DIAGRAM_HEAD + content + "</body></html>\n"})
         validation = {"status": "passed", "checks": checks}
         if findings:
             validation["findings"] = findings
         return RenderResult("diagram", source, outputs, validation,
-                            {"renderer": "builtin-flowchart-svg", "revision": "2"})
+                            {"renderer": "builtin-mermaid-svg", "revision": "3"})
 
     @staticmethod
     def _presentation(source: str) -> RenderResult:

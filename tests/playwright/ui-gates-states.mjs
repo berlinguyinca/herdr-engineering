@@ -6,7 +6,7 @@
 // what the audit counted when they were set, so a state that renders half of itself, or a scope that slips, fails instead of passing on less.
 //
 // Used by ui-gates-states.test.mjs (accessibility) and ui-gates-xss.test.mjs (inert hostile text).
-import { openSub, settled } from './ui-gates-lib.mjs';
+import { openSub, settled, scaled } from './ui-gates-lib.mjs';
 
 /** Type "@" until the list opens: the room's agents arrive after the chat does, and a list asked for too early is simply empty. */
 export async function openMention(page) {
@@ -14,7 +14,7 @@ export async function openMention(page) {
   const opt = page.locator('ul[role="listbox"]:not([hidden]) [role="option"]').first();
   for (let i = 0; i < 20; i += 1) {
     await input.focus(); await input.fill(''); await page.keyboard.type('@');
-    if (await opt.waitFor({ timeout: 1500 }).then(() => true, () => false)) return;
+    if (await opt.waitFor({ timeout: scaled(1500) }).then(() => true, () => false)) return;
   }
   throw new Error('the @-mention list never opened: the room has no agent that accepts tasks');
 }
@@ -78,6 +78,9 @@ export const STATES = [
     } },
   { id: 'lineage: steering confirm step (the request restated before it is sent)', scope: '#hcn-p-lineage', must: ['.wb-confirm', '[data-wb-act="confirm-go"]'], min: 61, minText: 182,
     open: async (page) => { await nodeSelected(page); await page.locator('[data-wb-act="confirm"]').first().click(); await page.locator('.wb-confirm').waitFor(); } },
+  // collapsed by default on a phone (and still audited there, because the disclosure is opened by its own summary, as a person would)
+  { id: 'lineage: filters disclosure opened', scope: '#hcn-p-lineage', must: ['details[data-filterbox][open] input[data-filter="q"]', 'details[data-filterbox][open] select[data-filter="state"]'], min: 20, minText: 20,
+    open: async (page) => { await openSub(page, 'lineage'); await page.locator('svg.lin-svg g[data-node]').first().waitFor(); await page.evaluate(() => document.querySelector('details[data-filterbox]:not([open]) > summary')?.click()); await settled(page); } },
   { id: 'lineage: Gantt view', scope: '#hcn-p-lineage', must: ['svg.lin-svg[role="img"]', '[data-view="gantt"][aria-selected="true"]'], min: 25, minText: 171,
     open: async (page) => { await openSub(page, 'lineage'); await page.locator('svg.lin-svg g[data-node]').first().waitFor(); await page.locator('[data-view="gantt"]').click(); await page.locator('svg.lin-svg[role="img"]').waitFor(); await settled(page); } },
   { id: 'lineage: replay controls after stepping back', scope: '#hcn-p-lineage', must: ['[data-replay="slider"]', '[data-replay="live"]'], min: 30, minText: 68,
@@ -141,6 +144,7 @@ export const VIEWER_STATES = [
     open: async (page) => {
       await openSub(page, 'lineage');
       await page.locator('svg.lin-svg g[data-node]').first().waitFor();
+      await page.evaluate(() => document.querySelector('details[data-filterbox]:not([open]) > summary')?.click());   // collapsed on a phone: open it so its controls are audited
       await page.locator('g[data-node="attempt:a1"]').focus(); await page.keyboard.press('Enter');
       await page.locator('.wb').waitFor(); await settled(page);
     } },

@@ -439,3 +439,61 @@ button.ctx-chip:focus-visible, .ctx-chip:focus-visible { outline: 2px solid curr
 .cx-m--mine .cx-mention--external::after { color: inherit; }
 .cx-mention__icon { font-size: .8em; margin-right: 2px; }
 .cx-m--mine .cx-mention { background: color-mix(in srgb, var(--text-on-accent) 18%, transparent); color: inherit; border-color: transparent; }
+
+/* ---- Mission Workbench: graph viewport, toolbar, status strip, inspector facts (S5) ---- */
+#hcn-lineage { container-type: inline-size; }
+@container (max-width: 760px) { .lin-grid2 { grid-template-columns: minmax(0, 1fr); } }
+.lin-viewport { overflow: hidden; position: relative; max-width: 100%; touch-action: pan-y; cursor: grab; }
+.lin-viewport--drag { cursor: grabbing; user-select: none; }
+.lin-viewport .lin-svg { max-width: 100%; height: auto; }
+.lin-viewport:focus-visible { outline: 2px solid var(--accent, #1f7ae0); outline-offset: 2px; }
+.lin-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.lin-tool { min-width: 44px; min-height: 44px; }
+.lin-zoom { min-width: 48px; text-align: center; font-size: .8125rem; color: var(--text-secondary, #555); }
+.lin-hint { margin: 4px 0 0; }
+.lin-badge { display: inline-flex; align-items: center; gap: 4px; padding: 4px 12px; border: 2px solid var(--text-secondary, #555); border-radius: 999px; font-size: .8125rem; font-weight: 600; color: var(--text, #1b1f24); background: var(--surface, #fff); }
+.lin-badge--live { border-style: solid; border-color: var(--status-ok, #1a9b6c); }
+.lin-badge--replay { border-style: dashed; border-color: var(--status-attention, #d89b1d); }
+.lin-status { display: grid; grid-template-columns: auto repeat(2, minmax(0, 1fr)); gap: 12px 24px; align-items: start; padding: 8px 0 12px; border-bottom: 1px solid var(--border-subtle, #d0d4da); }
+.lin-status ul { list-style: none; margin: 0; padding: 0; }
+.lin-status__counts { display: flex; flex-wrap: wrap; gap: 4px 12px; font-size: .8125rem; font-weight: 600; }
+.lin-status__h { margin: 0 0 4px; font-size: .8125rem; font-weight: 600; }
+.lin-status__list { display: grid; gap: 4px; }
+.lin-status p { margin: 0; }
+.lin-status > p { grid-column: 1 / -1; }
+.lin-facts { margin-bottom: 8px; }
+.lin-facts__list { list-style: none; margin: 0; padding: 0; display: grid; gap: 4px; }
+.lin-nr { color: var(--text-secondary, #555); font-style: italic; }
+.lin-terminal { display: grid; gap: 4px; }
+.lin-chip rect { fill: var(--text-secondary, #555); }
+.lin-chip text { font: 700 9px var(--font-sans, system-ui, sans-serif); fill: var(--surface, #fff); }
+.lin-k-agent .lin-box { stroke-width: 3; }
+.lin-k-session .lin-box { stroke-dasharray: 6 2; }
+.lin-lane-hl { fill: color-mix(in srgb, var(--accent, #1f7ae0) 14%, transparent); }
+@media (max-width: 640px) {
+  .lin-status { grid-template-columns: minmax(0, 1fr); }
+  .lin-toolbar .lin-tool { flex: 1 1 auto; }
+}
+@media (prefers-reduced-motion: reduce) { .lin-viewport { scroll-behavior: auto; } }
+.lin-status > div { min-width: 0; }
+.lin-status .hd-btn { max-width: 100%; height: auto; white-space: normal; text-align: left; overflow-wrap: anywhere; }
+/* filters disclosure + minimap (S5): the summary is a full-size target; nothing here animates */
+.lin-filterbox > summary, .lin-legend > summary { cursor: pointer; display: flex; align-items: center; min-height: 44px; font-weight: 600; }
+.lin-filterbox > summary:focus-visible, .lin-legend > summary:focus-visible { outline: 2px solid var(--accent, #1f7ae0); outline-offset: 2px; }
+.lin-minimap { margin: 8px 0 0; display: inline-block; }
+.lin-mm { display: block; max-width: 100%; height: auto; border: 1px solid var(--line, #8886); border-radius: 4px; background: var(--surface, transparent); cursor: crosshair; touch-action: manipulation; }
+.lin-mm-bar { fill: currentColor; opacity: .28; }
+.lin-mm-view { fill: color-mix(in srgb, var(--accent, #1f7ae0) 18%, transparent); stroke: var(--accent, #1f7ae0); stroke-width: 1.5; }
+.lin-minimap, .lin-mm, .lin-mm-view { transition: none; animation: none; }
+.lin-termauth .lin-tool { min-height: 44px; }
+/* display:flex drops the browser's disclosure marker: draw one (no animation) */
+.lin-filterbox > summary, .lin-legend > summary { list-style: none; gap: 8px; }
+.lin-filterbox > summary::-webkit-details-marker, .lin-legend > summary::-webkit-details-marker { display: none; }
+.lin-filterbox > summary::before, .lin-legend > summary::before { content: '▸'; display: inline-block; }
+.lin-filterbox[open] > summary::before, .lin-legend[open] > summary::before { content: '▾'; }
+
+/* Supporting room views sit after the four that carry the work, set quieter and divided from them. */
+.cx-stab--minor { font-size: .8125rem; padding-inline: 8px; }
+.cx-stab:not(.cx-stab--minor) + .cx-stab--minor { margin-left: 8px; border-left-color: var(--border); border-radius: 0 var(--radius-sm) var(--radius-sm) 0; }
+.cx-newroom > summary { cursor: pointer; font-weight: 600; font-size: 1rem; margin-bottom: 8px; }
+.cx-helpers-idle h2 { margin-bottom: 2px; }

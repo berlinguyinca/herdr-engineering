@@ -132,6 +132,23 @@ def _is_loopback(host: str) -> bool:
 _WEB_ROOT = Path(__file__).resolve().parent.parent.parent / "packages"
 _INDEX = "index.html"
 _MAX_JSON_BODY = 4 * 1024 * 1024
+_MAX_ATTACHMENT_JSON = 36 * 1024 * 1024        # a 25 MiB attachment is ~33.4 MiB of base64 plus its mail envelope
+
+
+class _SyncStoreShim:
+    """Async face of the sync registry adapter for ``attach_to_artifact`` (which awaits its store). Each call runs in a
+    worker thread, so the request thread's own event loop never blocks the adapter's loop."""
+
+    def __init__(self, call, rustfs):
+        self._call, self._rf = call, rustfs
+
+    async def register_logical(self, **kwargs):
+        import asyncio
+        return await asyncio.to_thread(self._call, "register_logical", **kwargs)
+
+    async def commit_version(self, artifact_id, **kwargs):
+        import asyncio
+        return await asyncio.to_thread(self._call, "commit_version", artifact_id, **kwargs)
 _MAX_ARCHITECTURE_BODY = 64 * 1024 * 1024  # a published graph snapshot; validated by the service
 _ARCHITECTURE_KEYS = frozenset({"enabled", "explain", "cache", "request_ttl_seconds", "agent_hosts",
                                 "require_host_binding"})
@@ -261,7 +278,8 @@ class ControlPlaneServer:
                  review_quorum=None, system_graph: bool = False, attention=None, ci_fix=None, missions=None, github_pg_dsn=None,
                  architecture_enabled=None, architecture_explain=None, architecture_options=None,
                  request_workers=128, request_queue=256,
-                 assistant_service=None, assistant_config=None, fabric_resolver=None, fabric_services=None, fabric_names=None):
+                 assistant_service=None, assistant_config=None, fabric_resolver=None, fabric_services=None, fabric_names=None,
+                 scheduler_admission=False, scheduler_limits=None, skill_registry=None):
         """
         Auth (Spec §104): either a single `api_key` (all-access) or a mapping
         `api_keys={key: role}` with roles "viewer" (read-only) / "operator"
@@ -301,7 +319,8 @@ class ControlPlaneServer:
         self.attention = None
         if self.attention_config["enabled"] and not collab_only:
             self.attention = AttentionInbox(repo, config=self.attention_config, health=self._health,
-                                            ci_snapshot=self.ci_monitor.snapshot, ci_fix=self.ci_fix)
+                                            ci_snapshot=self.ci_monitor.snapshot, ci_fix=self.ci_fix,
+                                            handoffs=lambda: getattr(self, "handoffs", None))
         if github_monitor is None:
             # control-plane-web only (the worker never builds a server): the GitHub
             # catalog persists in control_plane.pg_dsn when set, else in memory.
@@ -334,10 +353,19 @@ class ControlPlaneServer:
         self.artifact_job_manager = artifact_job_manager
         self.artifact_review_manager = artifact_review_manager
         self.artifact_acl = artifact_acl
+        self.attachment_dedupe: dict = {}      # redelivery guard for the email-attachment route; lost on restart
+        from .artifact_scope import install_gate
+        self.artifact_graph_gate = install_gate(repo.graph, artifact_acl)   # None without an ACL: nodes stay private
+        # control_plane.skill_registry (flag off by default: nothing is constructed and the routes answer 404).
+        from .skill_routes import build_skill_registry
+        self.skills, self.skill_transfer = build_skill_registry(
+            skill_registry, artifact_store=artifact_store, rustfs=rustfs, acl=artifact_acl,
+            record_event=repo.record_event)
         from .handoffs import HandoffRegistry
         self.handoffs = handoff_registry or HandoffRegistry(repo)
         from .scheduler_service import SchedulerService
-        self.scheduler = SchedulerService(repo)
+        self.scheduler_admission = scheduler_admission is True
+        self.scheduler = SchedulerService(repo, **(scheduler_limits or {}))
         # Herdr Personal Assistant (Rakazo integration, P1/P2). Canonical owner;
         # feature-flag gated (off by default) and inert until enabled.
         if assistant_service is None:
@@ -470,9 +498,9 @@ class ControlPlaneServer:
         self.architecture_require_host_binding = arch_opts["require_host_binding"]
         self.architecture_agent_hosts = {}
         for key, hosts in arch_opts["agent_hosts"].items():
-            if self._keys.get(key) != "agent":
+            if self._keys.get(key) not in ("agent", "ingest"):
                 raise ValueError("control_plane.architecture.agent_hosts: each entry must name a configured "
-                                 "api key with the agent role")
+                                 "api key with the agent or ingest role")
             digest = hashlib.sha256(key.encode()).hexdigest()[:12]
             self.architecture_agent_hosts[f"key:{digest}"] = frozenset(hosts)
         self.architecture.gate_store_fn = lambda: self.gate_store
@@ -668,6 +696,7 @@ class ControlPlaneServer:
             notifier=notifier,
             main_verifier=self.gate_main,
             repair_gate=self._build_repair_gate(app, fleet_config, repo, registry),
+            graph_gate=self._build_graph_gate(fleet_config),
         )
         self.gate_reviewer_config = config.reviewer
         self.gate_coordinator = ReviewCoordinator(
@@ -681,6 +710,27 @@ class ControlPlaneServer:
         # starts the poller, so the server starts the shared monitor itself.
         self.ci_monitor.start()
         self.gate_service.start()
+
+    def _build_graph_gate(self, fleet_config):
+        """``control_plane.graph_merge_gate`` (YAML, read on every PR so ``enabled: false`` is a hot kill switch). Once it
+        has been seen enabled, an unreadable central config raises, which the gate turns into ``wait`` (never "absent")."""
+        from ..fleet_config import FleetConfigError
+        from .graph_merge_gate import make_graph_gate
+        seen = {"enabled": False}
+
+        def section():
+            if fleet_config is None:
+                return None
+            try:
+                value = (fleet_config.current().section("control_plane") or {}).get("graph_merge_gate")
+            except FleetConfigError:
+                if seen["enabled"]:
+                    raise
+                return None
+            seen["enabled"] = seen["enabled"] or (isinstance(value, dict) and value.get("enabled") is True)
+            return value
+        return make_graph_gate(graph_fn=lambda: self.repo.graph, section_fn=section,
+                               quorum_fn=lambda: self.review_quorum)
 
     def _build_repair_gate(self, app, fleet_config, repo=None, registry=None):
         """Inert unless ``project_intelligence.repair.enabled``; read on every PR so the kill switch is hot.
@@ -777,6 +827,8 @@ class ControlPlaneServer:
             h["capabilities"].append("assistant_v1")
         if getattr(self, "intelligence", None) is not None and self.intelligence._cfg()[0]["enabled"]:
             h["capabilities"].append("project_intelligence_v1")
+        if getattr(self, "skills", None) is not None:
+            h["capabilities"].append("skill_registry_v1")
         if self.architecture.enabled:
             h["capabilities"].append("architecture_v1")
             if self.architecture.explain_config:
@@ -1433,6 +1485,8 @@ def _make_handler(server, public=False, operator=False):
                 return self._fleet_config_applied()
             if self._path_only() == "/api/v1/intelligence/webhooks/github":
                 return self._intelligence_webhook()
+            if self._path_only() == _FLEET_CONFIG_PATH + "/telemetry":
+                return self._fleet_resource_telemetry()
             # The ingest route is reachable by the ingest role; every other
             # POST requires the operator role (Spec §104).
             path = self.path.split("?")[0]
@@ -1440,7 +1494,7 @@ def _make_handler(server, public=False, operator=False):
             # prefix test is bypassed by e.g. /api/v1/%72eview-gate/...
             segs = path.split("/")
             res = unquote(segs[3]) if len(segs) > 3 and segs[:3] == ["", "api", "v1"] else ""
-            if (res.startswith("reviews") or res == "attention" or res == "architecture"
+            if (res.startswith("reviews") or res in {"attention", "architecture", "scheduler"}
                     or (res in {"ci", "review-gate"} and len(segs) > 4) or _SUMMARY_FIX.match(path)
                     or _TERMINAL_ATTACH.match(path) or _STEER_ACK.match(path) or _is_rereview(path)):
                 origin = self.headers.get("Origin")
@@ -1563,6 +1617,22 @@ def _make_handler(server, public=False, operator=False):
                 return self._deny(401, "unauthorized")
             store.record_applied(host, body["revision"])
             return self._json({"ok": True})
+
+        def _fleet_resource_telemetry(self):
+            if server.fleet_config is None:
+                return self._deny(404, "not found")
+            host = self._fleet_host(server.fleet_config.current())
+            if host is None:
+                return self._deny(401, "unauthorized")
+            try:
+                body = self._read_json()
+                if not isinstance(body, dict):
+                    return self._deny(400, "resource snapshot must be an object")
+                return self._json(server.scheduler.observe_host(host, body))
+            except (TypeError, ValueError):
+                return self._deny(400, "invalid resource observation")
+            except RuntimeError:
+                return self._deny(503, "resource persistence unavailable")
 
         # --------------------------------------------------- collaboration (HCN)
         def _is_collab_path(self):
@@ -1760,6 +1830,9 @@ def _make_handler(server, public=False, operator=False):
             try:
                 from .artifact_report_api import route_report
                 if route_report(self, server, parts, resource):
+                    return None
+                from .skill_routes import route_skills
+                if route_skills(self, server, parts, resource):
                     return None
                 if self.command == "GET":
                     return self._api_get(parts, resource)
@@ -2067,9 +2140,9 @@ def _make_handler(server, public=False, operator=False):
                 return self._json({"handoffs": server.handoffs.list(state=_q(self.path, "state"))})
             if resource == "scheduler":
                 if len(parts) == 4:
-                    return self._json({"hosts": server.scheduler.host_cards(), "queued_agents": 0, "running_agents": 0})
+                    return self._json(server.scheduler.overview())
                 if parts[4:] == ["queue"]:
-                    return self._json({"queue": []})
+                    return self._json({"queue": server.scheduler.overview()["queue"]})
                 return self._json({"error": "not found"}, 404)
             if resource == "health":
                 return self._json(server._health())
@@ -2453,9 +2526,13 @@ def _make_handler(server, public=False, operator=False):
                         active=_q(self.path, "active") == "1"))
                 if what:
                     return self._json({"error": "not found"}, 404)
-                from .project_links import annotate_ci, cached_github_languages
-                return self._json(annotate_ci(server.ci_monitor.snapshot(), r,
-                    repository_languages=cached_github_languages(server.github_monitor)))
+                from .project_links import (
+                    annotate_ci,
+                    cached_github_languages,
+                    mark_merged_pull_requests,
+                )
+                return self._json(mark_merged_pull_requests(annotate_ci(server.ci_monitor.snapshot(), r,
+                    repository_languages=cached_github_languages(server.github_monitor)), server.gate_store))
             if resource == "reviews":
                 from .reviews import ReviewService
                 reviews = ReviewService(r)
@@ -2533,6 +2610,18 @@ def _make_handler(server, public=False, operator=False):
                 body = self._read_json() or {}
                 server.artifact_acl.revoke(parts[4], str(body.get("principal_id") or ""))
                 return self._json({"ok": True})
+            if resource == "artifacts" and server.artifact_graph_gate is not None and len(parts) == 6 \
+                    and parts[5] == "retract":
+                return self._artifact_retract(parts[4])
+            if resource == "artifacts" and server.artifact_graph_gate is not None and len(parts) == 7 \
+                    and parts[5] == "lineage" and parts[6] == "backfill":
+                return self._artifact_backfill(parts[4])
+            if resource == "artifacts" and server.artifact_graph_gate is not None and server.rustfs is not None \
+                    and server.artifact_store is not None and len(parts) == 5 and parts[4] == "email-attachments":
+                return self._artifact_email_attachment()
+            if resource == "artifact-jobs" and server.artifact_graph_gate is not None \
+                    and server.artifact_store is not None and len(parts) == 6 and parts[5] == "lineage":
+                return self._artifact_job_lineage(parts[4])
             if resource == "artifacts" and server.artifact_store is not None and len(parts) == 6 and parts[5] == "versions":
                 if not self._artifact_allowed(parts[4], 'edit'):
                     return self._artifact_forbidden()
@@ -2544,11 +2633,15 @@ def _make_handler(server, public=False, operator=False):
                 if body.get("report_descriptor") is not None and any(key in body for key in
                         {"validation", "job_id", "host_id", "agent_id", "session_id", "mission_id"}):
                     return self._json({"error": "report execution validation and context are worker-owned; use report checks for attestations"}, 400)
+                if server.artifact_graph_gate is not None and server.artifact_graph_gate.artifact_retracted(parts[4]):
+                    return self._json({"error": "artifact is retracted: commit a new artifact instead"}, 409)
                 body["created_by"] = self._resource_principal()
                 body["provenance"] = {**(body.get("provenance") or {}), "principal_id": body["created_by"]}
                 committed = self._artifact_call("commit_version", parts[4], **body)
                 from .artifact_lineage import emit_version_lineage
-                emit_version_lineage(server.ingest, committed, self._principal())
+                from .artifact_scope import visibility_fields
+                emit_version_lineage(server.ingest, committed, self._principal(),
+                                     scope=visibility_fields(gated=server.artifact_graph_gate is not None))
                 return self._json(committed, 201)
             if resource == "artifact-jobs" and server.artifact_job_manager is not None:
                 if len(parts) == 4:
@@ -2630,6 +2723,11 @@ def _make_handler(server, public=False, operator=False):
             if resource == "scheduler":
                 body = self._read_json() or {}
                 principal = self._resource_principal()
+                admission = (parts[4:] == ["reservations"]
+                             or (len(parts) == 6 and parts[4] == "reservations"
+                                 and parts[5] in {"commit", "claim", "retry"}))
+                if admission and not server.scheduler_admission:
+                    return self._json({"error": "scheduler admission is disabled"}, 503)
                 try:
                     if len(parts) == 5 and parts[4] == "plan":
                         return self._json(server.scheduler.plan(body, principal))
@@ -2637,6 +2735,10 @@ def _make_handler(server, public=False, operator=False):
                         return self._json(server.scheduler.reserve(body, principal), 201)
                     if len(parts) == 6 and parts[4] == "reservations" and parts[5] == "commit":
                         return self._json(server.scheduler.commit(body.get("reservation_id", "")))
+                    if len(parts) == 6 and parts[4] == "reservations" and parts[5] == "claim":
+                        return self._json(server.scheduler.claim_execution(body.get("reservation_id", "")))
+                    if len(parts) == 6 and parts[4] == "reservations" and parts[5] == "retry":
+                        return self._json(server.scheduler.retry_queued(body.get("reservation_id", "")))
                     if len(parts) == 6 and parts[4] == "reservations" and parts[5] in {"release", "cancel"}:
                         state = "cancelled" if parts[5] == "cancel" else "released"
                         return self._json(server.scheduler.release(body.get("reservation_id", ""), state=state))
@@ -2776,6 +2878,12 @@ def _make_handler(server, public=False, operator=False):
                 host_id = body.get("host_id") if isinstance(body, dict) else None
                 if not isinstance(host_id, str) or not host_id or len(host_id) > 253:
                     return self._json({"ok": False, "error": "host_id is required"}, 400)
+                # A key bound in control_plane.architecture.agent_hosts acts only for its own hosts.
+                bound = (server.architecture_agent_hosts.get(self._principal()["id"])
+                         if self._role() in ("agent", "ingest") else None)
+                if (bound is None and self._role() == "agent" and server.architecture_require_host_binding
+                        or bound is not None and host_id not in bound):
+                    return self._json({"ok": False, "error": "this API key may not act for that host"}, 403)
                 if reports is None or not reports.enabled:
                     if parts[5] == "publish":
                         return self._json({"ok": False, "error": "Full session reports are not enabled.",
@@ -3638,6 +3746,120 @@ def _make_handler(server, public=False, operator=False):
             self.end_headers()
             self.wfile.write(payload)
             return None
+
+        # ----------------------------------------------------- artifact <-> lineage graph routes
+        def _artifact_retract(self, artifact_id):
+            """POST /api/v1/artifacts/<id>/retract {"version_id"?, "reason"?}: hide the artifact (or one version) from
+            every graph reader, durably. ``admin`` on the artifact, like the ACL routes."""
+            if not self._artifact_allowed(artifact_id, "admin"):
+                return self._artifact_forbidden()
+            body = self._read_json() or {}
+            if not isinstance(body, dict) or set(body) - {"version_id", "reason"}:
+                return self._json({"error": "body may only carry version_id and reason"}, 400)
+            version_id = body.get("version_id")
+            if version_id is not None and (not isinstance(version_id, str) or not version_id):
+                return self._json({"error": "version_id must be a non-empty string"}, 400)
+            if server.artifact_store is not None:
+                known = (self._artifact_call("get_version", version_id, artifact_id) if version_id
+                         else self._artifact_call("get_record", artifact_id, principal_id=self._resource_principal()))
+                if known is None:
+                    return self._deny(404, "not found")
+            from .artifact_retraction import retract
+            persist = None
+            if server.artifact_store is not None:
+                def persist(aid, vid, why):
+                    self._artifact_call("record_retraction", aid, vid, why)
+            result = retract(gate=server.artifact_graph_gate, ingest=server.ingest, principal=self._principal(),
+                             artifact_id=artifact_id, version_id=version_id, reason=body.get("reason"),
+                             persist=persist)
+            return self._json(result, 500 if result["error"] else 200)
+
+        def _artifact_backfill(self, artifact_id):
+            """POST /api/v1/artifacts/<id>/lineage/backfill: re-emit stored versions so nodes created before artifact
+            scoping (``private``) become readable by the artifact's ACL. ``admin``; idempotent."""
+            if not self._artifact_allowed(artifact_id, "admin"):
+                return self._artifact_forbidden()
+            self._read_json()
+            if server.artifact_store is None:
+                return self._json({"error": "the versioned registry is unavailable"}, 503)
+            versions = self._artifact_call("list_versions", artifact_id)
+            from .artifact_retraction import backfill
+            return self._json(backfill(gate=server.artifact_graph_gate, ingest=server.ingest,
+                                       principal=self._principal(), versions=versions or [],
+                                       artifact_id=artifact_id))
+
+        def _artifact_job_lineage(self, job_id):
+            """POST /api/v1/artifact-jobs/<job>/lineage {"version_id"}: the render worker reports a committed version.
+            The server reads the version from the registry; nothing but the id comes from the caller."""
+            body = self._read_json() or {}
+            version_id = body.get("version_id") if isinstance(body, dict) else None
+            if set(body) - {"version_id"} or not isinstance(version_id, str) or not version_id:
+                return self._json({"error": "body must be exactly {\"version_id\": ...}"}, 400)
+            job = self._artifact_call("get_job", job_id)
+            if job is None or not self._artifact_allowed(job["artifact_id"], "edit"):
+                return self._deny(404, "not found")
+            artifact_id = job["artifact_id"]
+            version = self._artifact_call("get_version", version_id, artifact_id)
+            if version is None:
+                return self._deny(404, "not found")
+            if version.get("job_id") != job_id:
+                return self._json({"error": "that version was not committed by this job"}, 409)
+            if server.artifact_graph_gate.version_retracted(artifact_id, version_id):
+                return self._json({"error": "artifact or version is retracted"}, 409)
+            from .artifact_lineage import emit_version_lineage
+            from .artifact_scope import visibility_fields
+            result = emit_version_lineage(server.ingest, {**version, "artifact_id": artifact_id}, self._principal(),
+                                          scope=visibility_fields(gated=True))
+            return self._json(result, 502 if result["error"] else 200)
+
+        def _artifact_email_attachment(self):
+            """POST /api/v1/artifacts/email-attachments: store one accepted mail attachment as a versioned, ACL-scoped
+            artifact linked into the graph (intel_attachment_artifact). The owner is the authenticated caller."""
+            import asyncio
+            import base64
+            import binascii
+            body = self._read_json(limit=_MAX_ATTACHMENT_JSON) or {}
+            allowed = {"message", "part_path", "data_base64", "account", "audience", "previous"}
+            if not isinstance(body, dict) or set(body) - allowed:
+                return self._json({"error": "unknown field: the owner is always the authenticated caller"}, 400)
+            message, part_path, account = body.get("message"), body.get("part_path"), body.get("account")
+            audience = body.get("audience") or []
+            previous = body.get("previous")
+            if (not isinstance(message, dict) or not isinstance(part_path, str) or not isinstance(account, str)
+                    or not account or not isinstance(body.get("data_base64"), str)
+                    or not isinstance(audience, list) or len(audience) > 64
+                    or not all(isinstance(a, str) and a for a in audience)
+                    or not isinstance(message.get("id"), str) or not isinstance(message.get("threadId"), str)
+                    or (previous is not None and not (isinstance(previous, dict)
+                                                      and set(previous) == {"artifact_id", "version_id"}))):
+                return self._json({"error": "message{id,threadId,payload}, part_path, account, data_base64 and "
+                                            "an audience list of principal ids are required"}, 400)
+            try:
+                data = base64.b64decode(body["data_base64"], validate=True)
+            except (binascii.Error, ValueError):
+                return self._json({"error": "data_base64 is not valid base64"}, 400)
+            from . import intel_attachments as att
+            from .intel_attachment_artifact import attach_to_artifact
+            if len(data) > att.MAX_BYTES:
+                return self._json({"error": "attachment over the size limit"}, 413)
+            intelligence = viewer = None
+            try:
+                cfg, raw = server.intelligence._cfg()
+                if cfg["enabled"]:
+                    viewer = server.intelligence.viewer_for(self._principal(), self._role(), raw)
+                    intelligence = server.intelligence.store if viewer is not None else None
+            except Exception:                              # noqa: BLE001 - issue links are optional evidence
+                intelligence = viewer = None
+            if previous and server.artifact_graph_gate.artifact_retracted(previous["artifact_id"]):
+                return self._json({"error": "artifact is retracted"}, 409)
+            shim = _SyncStoreShim(lambda method, *a, **k: self._artifact_call(method, *a, **k), server.rustfs)
+            out = asyncio.run(attach_to_artifact(
+                store=shim, acl=server.artifact_acl, ingest=server.ingest, principal=self._principal(), msg=message,
+                part_path=part_path, data=data, account=account, owner=self._resource_principal(),
+                audience=tuple(audience), previous=previous, intelligence=intelligence, viewer=viewer, gated=True,
+                dedupe=server.attachment_dedupe))
+            status = {"accept": 201, "duplicate": 200, "forbidden": 403, "audience_widened": 409}.get(out["verdict"], 422)
+            return self._json(out, status)
 
         def _artifact_call(self, method, *args, **kwargs):
             store = server.artifact_store

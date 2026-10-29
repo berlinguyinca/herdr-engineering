@@ -21,10 +21,10 @@
 .sw-report-strip{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin:8px 0}
 .sw-badge{display:inline-flex;gap:6px;align-items:center;padding:2px 9px;border-radius:999px;border:1px solid var(--border-color,#ddd);font-size:12px;font-weight:600;text-transform:capitalize}
 .sw-badge--complete{border-color:var(--status-ok,#067647);color:var(--status-ok,#067647)}
-.sw-badge--partial,.sw-badge--stale{border-color:var(--status-warn,#b54708);color:var(--status-warn,#b54708);text-transform:none}
+.sw-badge--partial,.sw-badge--stale{border-color:var(--status-attention);color:var(--status-attention);text-transform:none}
 .sw-badge--limited{border-color:var(--status-failed,#b42318);color:var(--status-failed,#b42318)}
 .sw-badge button{font-size:12px;padding:0 6px}
-.sw-report-resume{margin:6px 0;padding:8px 10px;border-left:3px solid var(--accent,#2563eb);background:var(--surface-muted,rgba(127,127,127,.08));border-radius:4px}
+.sw-report-resume{margin:6px 0;padding:8px 10px;border-left:3px solid var(--accent,#2563eb);background:var(--surface-hover);border-radius:4px}
 .sw-report-resume .conversation-markdown{margin-top:2px}
 .sw-report-actions{display:flex;gap:8px;margin:8px 0}
 .sw-report-section{margin:4px 0}

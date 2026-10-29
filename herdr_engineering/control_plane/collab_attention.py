@@ -23,6 +23,7 @@ from typing import Any
 
 from . import collab_insights as ins
 from .collab_workbench import WorkbenchError
+from .lineage_metrics import lineage_metrics
 from .review_quorum import pr_review_quorum
 
 INSIGHTS_KEYS = frozenset({
@@ -236,6 +237,7 @@ class AttentionMixin:
             out["review_quorum"] = "configured" if self.quorum_config is not None else "not configured: review does not count as evidence"
         else:
             out = ins.analytics_of(snap, cfg, room_id, now, quorum)
+            out["delivery"] = lineage_metrics(snap, cfg, now)       # handoffs, gates, findings, lead time, usage
         return {"room_id": room_id, "generated_at": self._iso(now), "trusted_evidence_configured": bool(cfg["evidence_writers"]),
                 **out}
 

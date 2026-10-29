@@ -79,6 +79,16 @@ def test_preview_uses_references_without_loading_or_embedding_large_assets():
     assert "iframe" not in document.tags
 
 
+def test_preview_follows_the_viewer_colour_scheme_without_scripts_or_remote_styles():
+    from herdr_engineering.control_plane.artifact_report_render import render_report_preview
+
+    page = render_report_preview(descriptor())
+    assert "color-scheme:light dark" in page
+    assert "prefers-color-scheme:dark" in page
+    assert "background:var(--bg)" in page
+    assert "<script" not in page and "@import" not in page
+
+
 def test_preview_escapes_report_text_and_rejects_active_or_remote_asset_links():
     from herdr_engineering.control_plane.artifact_report_render import render_report_preview
 

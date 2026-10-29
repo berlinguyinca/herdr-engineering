@@ -70,3 +70,8 @@
 .conversation-markdown .md-fabric-copy[data-copied="true"]::after { content: " ✓"; }
 .conversation-markdown .md-fabric-copy[data-copied="failed"]::after { content: " ✗"; }
 .conversation-markdown .md-link-unreachable { text-decoration: underline dotted; opacity: .75; cursor: help; }
+/* Everyday formatting stays in the bar; the rest sits behind "More". */
+.conversation-more { display: inline-flex; flex-wrap: wrap; gap: 4px; align-items: center; }
+.conversation-more > summary { cursor: pointer; padding: 4px 8px; border: 1px solid var(--border, #d8dde5); border-radius: var(--radius-sm, 4px); font-size: .8125rem; color: var(--text-secondary); list-style: none; }
+.conversation-more > summary::-webkit-details-marker { display: none; }
+.conversation-more-tools { display: inline-flex; flex-wrap: wrap; gap: 4px; align-items: center; }
