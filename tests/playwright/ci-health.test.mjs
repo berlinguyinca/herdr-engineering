@@ -14,7 +14,7 @@ test('CI health integrates real paginated history, PR drilldown, old filtered ru
   const port=await new Promise((resolve,reject)=>{let output='';const timeout=setTimeout(()=>reject(new Error(stderr||'Health server timeout')),25000);server.stdout.on('data',d=>{output+=d;const m=output.match(/PORT=(\d+)/);if(m){clearTimeout(timeout);resolve(m[1]);}});server.once('exit',code=>{clearTimeout(timeout);reject(new Error(`Server exit${code}: ${stderr}`));});});
   browser=await chromium.launch({headless:true});
   const page=await browser.newPage({viewport:{width:1440,height:1100}});const errors=[];page.on('pageerror',e=>errors.push(e.message));
-  await page.goto(`http://127.0.0.1:${port}/#/ci`);
+  await page.goto(`http://127.0.0.1:${port}/#/ci?workspace=health`);
   await hf(page);
   await page.locator('[data-health-mode="14"]').waitFor({timeout:15000});
   await hf(page);
@@ -94,7 +94,7 @@ test('CI health integrates real paginated history, PR drilldown, old filtered ru
   await page.locator('[data-health-search]').fill('org/app');await page.reload();
   await hf(page);
   assert.equal(await page.locator('[data-health-search]').inputValue(),'org/app');
-  await page.goto(`http://127.0.0.1:${port}/#/ci?repository=github.com/org/app&search=main`);
+  await page.goto(`http://127.0.0.1:${port}/#/ci?repository=github.com/org/app&search=main&workspace=health`);
   await page.waitForFunction(()=>document.querySelectorAll('.ci-health-grid > tbody > tr').length===1);
   await hf(page);
   assert.equal(await page.locator('[data-health-search]').inputValue(),'main');
