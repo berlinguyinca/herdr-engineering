@@ -619,13 +619,14 @@ class ControlPlaneServer:
             with self._deployments_lock:
                 self._deployments_last = result
             if result["error"] is None and defs:
-                self._deployments_escalate(results, defs)
+                self._deployments_escalate(results, defs, dict(self.deployment_coordinator.last_evidence))
 
-    def _deployments_escalate(self, results, defs):
+    def _deployments_escalate(self, results, defs, evidence):
         """Diagnose, decide repairs and escalate after the tick result is stored (its calls
-        are clamped to a budget well under the permit staleness). Never raises."""
+        are clamped to a budget well under the permit staleness). Only tracks whose release
+        this tick confirmed (published + on main) are escalated. Never raises."""
         try:
-            self.deployment_escalation.run(results, defs)
+            self.deployment_escalation.run(results, defs, evidence=evidence)
         except Exception as exc:  # noqa: BLE001 - escalation must never break the tick
             log.warning("deployment escalation failed: %s", type(exc).__name__)
 
@@ -894,10 +895,29 @@ class ControlPlaneServer:
     def deployment_clear(self, host, rid) -> list:
         """DELETE a request (host token): spend the host's own entries (and every overlapping
         entry for the same component and commit); audited. Raises when the clear could not
-        be persisted durably (the route answers 503 and every entry stays pending)."""
-        defs = self._loaded_deployment_definitions() or {}
-        done = self.repo.deployment_requests.clear(
-            rid, [c for c, d in defs.items() if d.host == host], host)
+        be persisted durably (the route answers 503 and every entry stays pending).
+
+        The flag and the permit are checked AGAIN here, under the actions lock: a flag turned
+        off or a replan/unconfirmed release since the host's permit raises ``ActionRefused``
+        (nothing is cleared, the host must not redeploy)."""
+        from .deployment_actions import ActionRefused, permit_decision
+        if not self.deployment_actions_enabled():
+            raise ActionRefused(403, "deployment actions are disabled (control_plane.deployment_actions)")
+        defs = self._loaded_deployment_definitions()
+        if defs is None:
+            raise ActionRefused(503, "no deployment definitions loaded")
+        mine = [c for c, d in defs.items() if d.host == host]
+        store = self.repo.deployment_requests
+        with self._deployment_actions_lock:
+            for entry in (e for e in store.entries(mine) if e["id"] == rid):
+                d = defs[entry["component"]]
+                last, view = self._deployment_track_view(d)
+                answer = permit_decision(last, view, entry["component"], entry["target_commit"], rid,
+                                         now=time.time(), component_stage=d.stage,
+                                         generation=entry["generation"])
+                if not answer["permitted"]:
+                    raise ActionRefused(409, f"no longer permitted: {answer['reason']}")
+            done = store.clear(rid, mine, host)
         if done:
             self.deployment_audit("force", "DeploymentForcePickedUp", outcome="picked-up",
                                   actor=f"host:{host}", target={"request_id": rid}, reason="cleared",
@@ -2011,7 +2031,21 @@ def _make_handler(server, public=False, operator=False):
                     token = value
             elif len(direct) == 1 and not auth:
                 token = direct[0]
-            return server.fleet_config.current().host_for_token(token) if token else None
+            self._deployment_config_unavailable = False
+            if not token:
+                return None
+            from ..fleet_config import FleetConfigError
+            try:
+                return server.fleet_config.current().host_for_token(token)
+            except FleetConfigError:
+                # no usable fleet file: the caller answers 503, never a 500
+                self._deployment_config_unavailable = True
+                return None
+
+        def _deny_deployment_host(self):
+            if getattr(self, "_deployment_config_unavailable", False):
+                return self._deny(503, "fleet configuration unavailable")
+            return self._deny(401, "unauthorized")
 
         def _deployment_event(self):
             """POST one deployment event. Auth and size are decided before the body is read."""
@@ -2019,7 +2053,9 @@ def _make_handler(server, public=False, operator=False):
                 return self._deny(404, "not found")
             host = self._deployment_host()
             if host is None:
-                return self._deny(401, "unauthorized")
+                return self._deny_deployment_host()
+            if self._rate_limit(f"deploy-host:{host}"):
+                return None
             from .deployments_monitor import MAX_REQUEST_BYTES
             length = _content_length(self.headers.get("Content-Length"))
             if not length:
@@ -2123,7 +2159,7 @@ def _make_handler(server, public=False, operator=False):
                 return self._deny(404, "not found")
             host = self._deployment_host()
             if host is None:
-                return self._deny(401, "unauthorized")
+                return self._deny_deployment_host()
             if self._rate_limit(f"deploy-host:{host}"):
                 return None
             raw = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
@@ -2155,11 +2191,14 @@ def _make_handler(server, public=False, operator=False):
                 return self._deny(404, "not found")
             host = self._deployment_host()
             if host is None:
-                return self._deny(401, "unauthorized")
+                return self._deny_deployment_host()
             if self._rate_limit(f"deploy-host:{host}"):
                 return None
+            from .deployment_actions import ActionRefused
             try:
                 done = server.deployment_clear(host, rid) if REQUEST_ID.fullmatch(rid) else []
+            except ActionRefused as exc:            # nothing cleared: the host must not redeploy
+                return self._deny(exc.status, exc.message)
             except Exception:  # noqa: BLE001 - not durably cleared: the host must not redeploy
                 log.warning("deployment force pickup not persisted; the request stays pending")
                 return self._deny(503, "the pickup could not be persisted; do not redeploy")

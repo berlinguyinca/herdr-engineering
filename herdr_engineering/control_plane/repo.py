@@ -64,6 +64,9 @@ from .service_catalog import (
     validate_archive_days,
 )
 
+#: Hard bound on one durable deployment write made under a store lock (seconds).
+DEPLOYMENT_DURABLE_WRITE_TIMEOUT_S = 10
+
 _STAGES = {
     "planning", "specification", "ready", "implementation", "testing",
     "review", "repair", "validation", "pr", "complete", "failed", "cancelled",
@@ -265,9 +268,27 @@ class ControlPlaneRepo:
             # a legacy best-effort sink cannot acknowledge: fail safe (the route answers 503)
             raise RuntimeError("durable deployment persistence requires an acknowledged sink")
         stamp = self._stamp()
-        required({"event_id": new_id("event"), "schema_version": 1,
-                  "source_timestamp": stamp, "ingest_timestamp": stamp,
-                  "mission_id": None, "session_id": None, **ev})
+        row = {"event_id": new_id("event"), "schema_version": 1, "source_timestamp": stamp,
+               "ingest_timestamp": stamp, "mission_id": None, "session_id": None, **ev}
+        # Callers hold a store lock (the force requests, the escalation ledger): a hung
+        # database must fail this write (fail closed), not pin the permit and inbox threads.
+        # A write that lands after the timeout only ever errs towards "not done".
+        box = {}
+
+        def write():
+            try:
+                required(row)
+                box["ok"] = True
+            except BaseException as exc:  # noqa: BLE001 - re-raised in the caller below
+                box["error"] = exc
+
+        worker = threading.Thread(target=write, name="deployment-durable-write", daemon=True)
+        worker.start()
+        worker.join(DEPLOYMENT_DURABLE_WRITE_TIMEOUT_S)
+        if worker.is_alive():
+            raise TimeoutError("durable deployment write timed out")
+        if "error" in box:
+            raise box["error"]
 
     def _persist_host_metrics(self, ev):
         """Rollups and host-state changes go to the sink, not the shared streams/SSE."""

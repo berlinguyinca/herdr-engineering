@@ -789,3 +789,21 @@ def test_releases_are_kept_least_recently_seen_first(monkeypatch):
     names = {"hive-gateway": None}
     assert state.slots_for(a, names)["hive-gateway"]["instances"]
     assert not state.slots_for(b, names)["hive-gateway"]["instances"]
+
+
+# ------------------------------------------------------- final review: unconfirmed permits nothing
+def test_an_unpublished_release_permits_nothing_on_hold_halt_or_idle():
+    w = World()
+    _stage1_done(w, at=0)
+    hold = advance(w.snap(published=None), DEFS, _at(10))
+    assert isinstance(hold[-1], Hold) and hold[-1].stage == 1 and permitted(hold) == ()
+    assert permitted(advance(w.snap(), DEFS, _at(10))) == STAGE1          # confirmed: stage 1
+    for c in ("whiteale-gateway", "whiteale-laya"):
+        w.deploy(c, at=700)
+    idle = advance(w.snap(published=OLD), DEFS, _at(10_000))
+    assert isinstance(idle[-1], Idle) and permitted(idle) == ()
+    assert permitted(advance(w.snap(), DEFS, _at(10_000))) == ALL
+    w.emit("whiteale-laya", "failed", at=10_001)
+    halt = advance(w.snap(published=None), DEFS, _at(10_002))
+    assert isinstance(halt[-1], Halt) and halt[-1].stage == 2 and permitted(halt) == ()
+    assert permitted(advance(w.snap(), DEFS, _at(10_002))) == STAGE1

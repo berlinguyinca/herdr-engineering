@@ -44,7 +44,9 @@ these routes and nothing else):
 Permit rule (``permit_decision``): any doubt is ``permitted: false`` with a reason. No
 tick, a stale tick (flag, error, or older than ``PERMIT_STALE_S``), no plan or target for
 the component's track, a commit other than the plan's target, or a ``generation`` other
-than the plan's (when the host sends one): false. A component in
+than the plan's (when the host sends one): false. A release the tick did not confirm
+(``release_confirmed`` and ``target_on_main`` both True) is false for EVERY component,
+whatever the plan or a force says. A component in
 the tick's ``permitted`` is permitted. Otherwise a pending force for that component whose
 captured target is the same commit (a replan onto another commit voids it) permits it,
 but only where the plan is held by STAGING - a Start whose turn has not come, a hold
@@ -401,10 +403,19 @@ def permit_decision(meta, view, component, commit, force_id, *, now, component_s
         return _deny("commit is not the plan target", view)
     if generation is not None and generation != view.get("generation"):
         return _deny("generation changed", view)
-    extra = {"repair": dict(repair)} if isinstance(repair, dict) else {}
+    confirmed = view.get("release_confirmed") is True and view.get("target_on_main") is True
+    # A repair needs the release confirmed, except a rollback: it goes only to herdr's own
+    # recorded previous good commit (deployment_escalation), never toward the new release.
+    extra = ({"repair": dict(repair)} if isinstance(repair, dict)
+             and (confirmed or repair.get("action") == "rollback") else {})
+    why = " ".join(str(x) for x in (current.get("type"), current.get("reason")) if x)
+    if not confirmed:
+        # nothing - not the plan, not a force - permits an unconfirmed release
+        gate = ("target not confirmed on main" if view.get("release_confirmed") is True
+                else "release not confirmed")
+        return _deny(f"{gate} ({why})", view, **extra)
     if component in (view.get("permitted") or ()):
         return {**_deny("permitted by the plan", view, **extra), "permitted": True}
-    why = " ".join(str(x) for x in (current.get("type"), current.get("reason")) if x)
     if force_id is None:
         return _deny(f"not permitted: {why}", view, **extra)
     if not (view.get("release_confirmed") is True and view.get("target_on_main") is True

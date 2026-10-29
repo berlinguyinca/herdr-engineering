@@ -14,7 +14,12 @@ import pytest
 
 from herdr_engineering.control_plane import deployment_escalation as de
 from herdr_engineering.control_plane.attention_inbox import _item
-from herdr_engineering.control_plane.deployment_coordinator import CoordinatorState, Halt, Replan
+from herdr_engineering.control_plane.deployment_coordinator import (
+    CoordinatorState,
+    Halt,
+    ReleaseEvidence,
+    Replan,
+)
 from herdr_engineering.control_plane.deployment_diagnosis import DiagnosisConfig, Finding
 from herdr_engineering.control_plane.deployment_escalation import (
     DeploymentEscalation,
@@ -81,11 +86,13 @@ class World:
             alert=lambda c, r, p: self.alerts.append((c, r, p)), now=lambda: self.t[0],
             clock=clock)
 
-    def tick(self, components=("hive-nodes",), target=C1):
+    def tick(self, components=("hive-nodes",), target=C1, evidence="confirmed"):
         self.state.observe(self.mon.snapshot()["components"], self.defs)
         halt = Halt(stage=1, reason="halted", target_commit=target, generation=1,
                     components=tuple(components))
-        return self.esc.run({TRACK: [halt]}, self.defs)
+        if evidence == "confirmed":
+            evidence = {TRACK: ReleaseEvidence(target, True)}
+        return self.esc.run({TRACK: [halt]}, self.defs, evidence=evidence)
 
     def rounds(self, component="hive-nodes", release=C1):
         return (self.ledger.get(component, release) or {}).get("rounds", [])
@@ -719,3 +726,79 @@ def test_model_text_is_labelled_in_the_host_report():
     report = w.ledger.get("hive-nodes", C1)["report"]
     assert report["finding_source"] == "model"
     assert report["next_step"].startswith("Model output (AI-generated, unverified): the disk is full")
+
+
+# ---------------------------------------------------------------- final review wave
+@pytest.mark.parametrize("evidence", [None, {}, {TRACK: ReleaseEvidence(None, True)},
+                                      {TRACK: ReleaseEvidence(C1, None)},
+                                      {TRACK: ReleaseEvidence(C0, True)}])
+def test_an_unconfirmed_release_is_never_escalated(evidence):
+    diag, sink, assistant = Counting(RETRY), Sink(), Sink()
+    w = World(diagnose_fn=diag, issue_sink=sink, assistant_sink=assistant,
+              cfg=EscalationConfig(issues=True, assistant=True))
+    w.mon.add("hive-nodes", "failed", evidence=FOLLOW)
+    stats = w.tick(evidence=evidence)
+    assert stats["unconfirmed"] == 1
+    assert diag.calls == [] and sink.calls == [] and assistant.calls == []
+    assert w.rounds() == [] and w.alerts == [] and w.rows == []
+
+
+def test_an_open_alert_survives_an_unconfirmed_tick():
+    w = World()
+    w.mon.add("hive-nodes", "failed", evidence=GPU)
+    w.tick()
+    assert len(w.ledger.alerts()) == 1
+    w.tick(evidence={})
+    assert len(w.ledger.alerts()) == 1
+
+
+def test_a_failing_ledger_write_is_warned_once_per_component_release(caplog):
+    def refuse(_row):
+        raise RuntimeError("legacy sink")
+
+    w = World(diagnose_fn=Counting(RETRY), persist_required=refuse)
+    w.mon.add("hive-nodes", "failed")
+    with caplog.at_level("WARNING", logger="herdr.deployment_escalation"):
+        for _ in range(5):
+            w.tick()
+    assert len([r for r in caplog.records if "escalation for hive-nodes" in r.getMessage()]) == 1
+
+
+def test_a_hung_durable_write_fails_the_round_instead_of_blocking(monkeypatch):
+    import herdr_engineering.control_plane.repo as repo_mod
+    from herdr_engineering.control_plane.repo import ControlPlaneRepo
+    monkeypatch.setattr(repo_mod, "DEPLOYMENT_DURABLE_WRITE_TIMEOUT_S", 0.2)
+    gate = threading.Event()
+
+    class Hung:
+        def record(self, ev):
+            pass
+
+        def record_required(self, ev):
+            gate.wait(5)
+
+    repo = ControlPlaneRepo(sink=Hung())
+    w = World(diagnose_fn=Counting(RETRY), persist_required=repo._persist_deployments_required)
+    w.mon.add("hive-nodes", "failed")
+    started = time.monotonic()
+    w.tick()
+    assert time.monotonic() - started < 2
+    assert w.rounds() == [] and w.esc.repair_for("hive-nodes", C1, w.defs["hive-nodes"]) is None
+    gate.set()
+
+
+def test_the_server_escalates_only_a_confirmed_release(tmp_path):
+    w = _server_world(tmp_path)
+    try:
+        _fail_hive_nodes(w, SUPERSEDED)
+        assert w.svr.deployments_view()["escalations"]
+        # a second component fails while the release is no longer confirmed: nothing new
+        w.svr.deployment_evidence = lambda track, target, plan: ReleaseEvidence(None, True)
+        w.event("hive-gateway", "failed")
+        w.svr.deployments_tick()
+        comps = [e["component"] for e in w.svr.deployments_view()["escalations"]]
+        assert comps == ["hive-nodes"]
+        # and the retry decided earlier is not exposed for the unconfirmed release
+        assert "repair" not in w.permit("hive-nodes")[1]
+    finally:
+        w.close()

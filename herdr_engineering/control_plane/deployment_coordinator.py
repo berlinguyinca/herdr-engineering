@@ -100,6 +100,7 @@ ignored; a NEWER event from that instance counts again. Attempts are never touch
 from __future__ import annotations
 
 import copy
+import dataclasses
 import math
 import re
 import threading
@@ -377,6 +378,9 @@ def advance(snapshot: Snapshot, definitions: dict, now: float) -> list:
     if isinstance(action, Start) and not published:
         action = Hold(stage=action.stage, remaining_s=None, reason="release not confirmed",
                       target_commit=target, generation=generation, missing=action.missing)
+    elif not published:
+        # A Hold, Halt or Idle still shows, but an unconfirmed release permits nothing.
+        action = dataclasses.replace(action, permitted=())
     out.append(action)
     return out
 

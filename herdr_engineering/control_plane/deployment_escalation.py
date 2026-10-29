@@ -245,6 +245,10 @@ class EscalationLedger:
         with self._lock:
             self._open = set(keys) & set(self._records)
 
+    def open_keys(self) -> set:
+        with self._lock:
+            return set(self._open)
+
     def alerts(self) -> list:
         with self._lock:
             return [copy.deepcopy(self._records[k]) for k in self._records if k in self._open]
@@ -443,6 +447,7 @@ class DeploymentEscalation:
         self._alert = alert
         self._now = now or time.time
         self._clock = clock or time.monotonic
+        self._warned: set = set()
 
     def _configs(self):
         try:
@@ -457,9 +462,14 @@ class DeploymentEscalation:
                 dcfg if isinstance(dcfg, DiagnosisConfig) else DiagnosisConfig())
 
     # -------------------------------------------------------------- run
-    def run(self, results, definitions) -> dict:
-        """Escalate every halted component of one tick's ``results`` ({track: [actions]})."""
-        from .deployment_coordinator import Halt
+    def run(self, results, definitions, *, evidence=None) -> dict:
+        """Escalate every halted component of one tick's ``results`` ({track: [actions]}).
+
+        ``evidence`` is the tick's ``{track: ReleaseEvidence}``. Only a track whose target that
+        tick confirmed (published commit matches, on main) is escalated: no diagnosis, ledger
+        round, issue, assistant call or feed event for an unconfirmed release. Its open alerts
+        stay as they were."""
+        from .deployment_coordinator import Halt, ReleaseEvidence
         cfg, dcfg = self._configs()
         deadline = self._clock() + cfg.budget_s
         ledger, state = self._ledger(), self._state()
@@ -468,10 +478,16 @@ class DeploymentEscalation:
         except Exception:  # noqa: BLE001 - evidence then falls back to the slot alone
             components = {}
         stats = {"rounds": 0, "folded": 0, "deferred": 0, "issues": 0, "assistant": 0}
-        open_keys = set()
+        open_keys, skipped = set(), set()
         for track, actions in sorted((results or {}).items()):
             last = actions[-1] if actions else None
             if not isinstance(last, Halt) or last.stage is None or not last.target_commit:
+                continue
+            ev = (evidence or {}).get(track)
+            if not (isinstance(ev, ReleaseEvidence) and ev.on_main is True
+                    and same_commit(ev.published_commit, last.target_commit)):
+                stats["unconfirmed"] = stats.get("unconfirmed", 0) + 1
+                skipped.update(last.components)
                 continue
             for name in last.components:
                 d = definitions.get(name)
@@ -481,11 +497,19 @@ class DeploymentEscalation:
                     key = self._component(track, d, last, ledger, state, components, cfg, dcfg,
                                           deadline, stats)
                 except Exception as exc:  # noqa: BLE001 - one component never stops the others
-                    log.warning("deployment escalation for %s failed: %s", name, type(exc).__name__)
+                    # once per component:release and error type, not every tick (a legacy
+                    # sink would otherwise warn every 30 s)
+                    warn = (name, last.target_commit, type(exc).__name__)
+                    if warn not in self._warned:
+                        if len(self._warned) >= 256:
+                            self._warned.clear()
+                        self._warned.add(warn)
+                        log.warning("deployment escalation for %s failed: %s", name, type(exc).__name__)
                     key = None
                 if key:
                     open_keys.add(key)
-        ledger.set_open(open_keys)
+        kept = {k for k in ledger.open_keys() if k.split(":", 1)[0] in skipped}
+        ledger.set_open(open_keys | kept)
         return stats
 
     def _remaining(self, deadline):

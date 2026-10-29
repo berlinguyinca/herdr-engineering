@@ -404,6 +404,7 @@ def test_hosts_see_only_requests_for_their_own_components(world):
 
 def test_only_the_owning_host_clears_a_request(world):
     w = world
+    w.confirm()                       # a pickup re-checks the permit
     w.svr.deployments_tick()
     stage1 = w.force({"stage": 1})[1]["request"]["id"]
     white = w.force({"component": "whiteale-gateway"})[1]["request"]["id"]
@@ -424,6 +425,7 @@ def test_only_the_owning_host_clears_a_request(world):
 
 def test_a_cleared_request_can_be_asked_for_again(world):
     w = world
+    w.confirm()                       # a pickup re-checks the permit
     w.svr.deployments_tick()
     first = w.force({"component": "hive-gateway"})[1]["request"]["id"]
     w.clear(first)
@@ -434,6 +436,7 @@ def test_a_cleared_request_can_be_asked_for_again(world):
 def test_force_requests_survive_a_restart(tmp_path, acknowledged_sink):
     w = World(tmp_path, sink=acknowledged_sink)
     try:
+        w.confirm()                       # a pickup re-checks the permit
         w.svr.deployments_tick()
         stage1 = w.force({"stage": 1})[1]["request"]["id"]
         w.clear(stage1)
@@ -494,7 +497,7 @@ def test_permit_follows_the_newest_tick(world):
     w.svr.deployments_tick()                                            # default evidence
     status, body = w.permit("hive-gateway")
     assert status == 200 and body["permitted"] is False
-    assert body["reason"] == "not permitted: Hold release not confirmed"
+    assert body["reason"] == "release not confirmed (Hold release not confirmed)"
     assert body["target_commit"] == C1 and body["generation"] == 0 and body["forced"] is False
     w.confirm()
     w.svr.deployments_tick()
@@ -648,7 +651,7 @@ def test_a_force_never_overrides_release_not_confirmed(world):
     w.force({"component": "hive-gateway"})
     body = w.permit("hive-gateway")[1]
     assert body["permitted"] is False and body["forced"] is False
-    assert body["reason"].startswith("a forced redeploy cannot override")
+    assert body["reason"].startswith("release not confirmed")
     # A timer hold over an unpublished release (ancestry known) is not overridable either.
     w.stage1_holding()
     w.force({"component": "whiteale-gateway"})
@@ -922,3 +925,151 @@ def test_refusal_rows_are_neither_in_the_feed_nor_published(world):
     assert not any(e.get("entity_type") == da.AUDIT_ENTITY for e in seen)
     assert not any(t[0] == da.AUDIT_ENTITY and t[2] == rows[0]["sequence"]
                    for t in world.repo._event_order if t[1] == rows[0]["entity_id"])
+
+
+# ------------------------------------------------------- final review wave
+def _unconfirm(w, published=None, on_main=True):
+    w.svr.deployment_evidence = lambda track, target, plan: ReleaseEvidence(published, on_main)
+    w.svr.deployments_tick()
+
+
+def test_a_holding_stage_is_not_permitted_once_the_release_is_unconfirmed(world):
+    w = world
+    w.stage1_holding()
+    assert w.permit("hive-gateway")[1]["permitted"] is True
+    _unconfirm(w)
+    plan = w.plan()
+    assert plan["current"]["type"] == "Hold" and plan["permitted"] == []
+    body = w.permit("hive-gateway")[1]
+    assert body["permitted"] is False and body["reason"].startswith("release not confirmed")
+
+
+def test_permit_decision_needs_confirmation_for_hold_halt_and_idle():
+    meta = {"ticked_at": 100.0}
+    for current in ({"type": "Hold", "stage": 1, "remaining_s": 5, "reason": "holding"},
+                    {"type": "Halt", "stage": 2, "reason": "stage 2 halted"},
+                    {"type": "Idle", "reason": "rolled out"}):
+        for confirmed, on_main in ((False, True), (True, None), (False, False)):
+            view = {"target_commit": C1, "generation": 1, "current": current,
+                    "permitted": ["hive-gateway"], "release_confirmed": confirmed,
+                    "target_on_main": on_main}
+            body = da.permit_decision(meta, view, "hive-gateway", C1, "force-0123456789abcdef",
+                                      now=101.0, component_stage=1)
+            assert body["permitted"] is False and body["forced"] is False, (current, confirmed)
+        view.update(release_confirmed=True, target_on_main=True)
+        assert da.permit_decision(meta, view, "hive-gateway", C1, None, now=101.0)["permitted"] is True
+
+
+def test_stage_two_and_a_force_are_refused_for_an_unconfirmed_release(world):
+    w = world
+    w.stage1_holding()
+    w.force({"component": "whiteale-gateway"})
+    assert w.permit("whiteale-gateway", token=WHITEALE_TOKEN)[1]["forced"] is True
+    _unconfirm(w, published=C1, on_main=None)          # published, ancestry unknown
+    body = w.permit("whiteale-gateway", token=WHITEALE_TOKEN)[1]
+    assert body["permitted"] is False and body["forced"] is False
+
+
+def test_a_repair_is_only_exposed_for_a_confirmed_release_except_a_rollback():
+    meta = {"ticked_at": 100.0}
+    view = {"target_commit": C1, "generation": 1, "current": {"type": "Halt", "stage": 1},
+            "permitted": [], "release_confirmed": False, "target_on_main": True}
+    retry = {"id": "x", "action": "retry", "attempt": 1, "reason": "r"}
+    rollback = {"id": "y", "action": "rollback", "attempt": 3, "reason": "r", "rollback_to": C2}
+    assert "repair" not in da.permit_decision(meta, view, "hive-nodes", C1, None, now=101.0, repair=retry)
+    # a rollback goes only to herdr's recorded previous good commit, never toward the new
+    # release, so it is the one repair an unconfirmed release still carries
+    assert da.permit_decision(meta, view, "hive-nodes", C1, None, now=101.0,
+                              repair=rollback)["repair"] == rollback
+    view.update(release_confirmed=True)
+    assert da.permit_decision(meta, view, "hive-nodes", C1, None, now=101.0,
+                              repair=retry)["repair"] == retry
+
+
+def test_a_pickup_is_refused_when_the_flag_turns_off_after_the_permit(world):
+    w = world
+    w.stage1_holding()
+    rid = w.force({"component": "whiteale-gateway"})[1]["request"]["id"]
+    assert w.permit("whiteale-gateway", token=WHITEALE_TOKEN)[1]["forced"] is True
+    w.write_config(False)
+    status, _ = w.clear(rid, WHITEALE_TOKEN)
+    assert status == 403
+    w.write_config(True)
+    assert len(w.requests(WHITEALE_TOKEN, "?host=whiteale")[1]["requests"]) == 1
+
+
+def test_a_pickup_is_refused_after_a_replan(world):
+    w = world
+    w.stage1_holding()
+    rid = w.force({"component": "whiteale-gateway"})[1]["request"]["id"]
+    assert w.permit("whiteale-gateway", token=WHITEALE_TOKEN)[1]["forced"] is True
+    w.ci.add(11, C2)                                     # a newer green release: replan
+    w.svr.deployments_tick()
+    status, body = w.clear(rid, WHITEALE_TOKEN)
+    assert status == 409 and "no longer permitted" in body["error"]
+
+
+def test_a_pickup_is_refused_when_the_release_turns_unconfirmed(world):
+    w = world
+    w.stage1_holding()
+    rid = w.force({"component": "whiteale-gateway"})[1]["request"]["id"]
+    _unconfirm(w)
+    assert w.clear(rid, WHITEALE_TOKEN)[0] == 409
+
+
+def test_deployment_events_are_rate_limited_per_host(world):
+    from herdr_engineering.control_plane.api import _RateLimiter
+    world.svr._limiter = _RateLimiter(max_requests=2, window_seconds=60)
+    statuses = []
+    for n in range(3):
+        ev = {"id": f"{900 + n:032x}", "ts": "2026-10-28T12:00:00Z", "host": "hive-gateway.box",
+              "component": "hive-gateway", "step": "deployment.hive-gateway.cycle",
+              "outcome": "started", "from": "0" * 40, "to": C1, "evidence": ""}
+        statuses.append(world.call("POST", "/api/deployments/events", ev,
+                                   {"Authorization": "Bearer " + HIVE_TOKEN})[0])
+    assert statuses == [200, 200, 429]
+    # keyed by host: another host is unaffected
+    ev = {"id": f"{999:032x}", "ts": "2026-10-28T12:00:00Z", "host": "whiteale-gateway.box",
+          "component": "whiteale-gateway", "step": "deployment.whiteale-gateway.cycle",
+          "outcome": "started", "from": "0" * 40, "to": C1, "evidence": ""}
+    assert world.call("POST", "/api/deployments/events", ev,
+                      {"Authorization": "Bearer " + WHITEALE_TOKEN})[0] == 200
+
+
+def test_an_unusable_fleet_file_answers_503_on_host_routes(world, monkeypatch):
+    from herdr_engineering.fleet_config import FleetConfigError
+
+    def broken():
+        raise FleetConfigError("unreadable")
+
+    monkeypatch.setattr(world.svr.fleet_config, "current", broken)
+    for status in (world.permit("hive-gateway")[0], world.requests()[0],
+                   world.clear("force-0123456789abcdef")[0]):
+        assert status == 503
+    status, _ = world.call("POST", "/api/deployments/events", {"x": 1},
+                           {"Authorization": "Bearer " + HIVE_TOKEN})
+    assert status == 503
+
+
+def test_a_hung_durable_write_fails_the_pickup_instead_of_blocking(monkeypatch):
+    import herdr_engineering.control_plane.repo as repo_mod
+    monkeypatch.setattr(repo_mod, "DEPLOYMENT_DURABLE_WRITE_TIMEOUT_S", 0.2)
+    gate = threading.Event()
+
+    class Hung:
+        def record(self, ev):
+            pass
+
+        def record_required(self, ev):
+            gate.wait(5)
+
+    repo = ControlPlaneRepo(sink=Hung())
+    store = da.ForceRequests(persist_required=repo._persist_deployments_required)
+    store.add("component", "hive-gateway", {"hive-gateway": (C1, 1)}, "operator:x")
+    [req] = store.pending()
+    started = time.monotonic()
+    with pytest.raises(TimeoutError):
+        store.clear(req["id"], ["hive-gateway"], "hive")
+    assert time.monotonic() - started < 2
+    assert store.entries(["hive-gateway"])                 # still pending: fail closed
+    gate.set()
