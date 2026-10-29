@@ -285,12 +285,12 @@
 :root[data-density] :is(.ov-panel, .hd-card) { padding: var(--density-panel-padding); }
 :root[data-density] :is(.ov-layout, .hd-grid, .gh-layout, .gh-issue-layout, .sc-row) { gap: var(--density-gap); }
 :root[data-density] :is(.ov-row, .gh-issue, .gh-repo, .sc-row) { padding-top: var(--density-row-padding); padding-bottom: var(--density-row-padding); }
-:root[data-density] .ci-health-tree button { padding-block: var(--density-row-padding); }
+:root[data-density] .ci-health-detail button { padding-block: var(--density-row-padding); }
 /* Fit operational analytics to the available content width, including tablets. */
 :root .an-links { grid-template-columns: repeat(auto-fit, minmax(min(200px, 100%), 1fr)); }
 @media (max-width: 900px) {
-  :root[data-density] :is(button, select, input:not([type=checkbox]):not([type=radio]), summary, .gh-issue-title, .ov-row a, .ci-health-tree a) { min-height: 44px; }
-  :root[data-density] :is(.ov-row a, .ci-health-tree a) { display: inline-flex; align-items: center; }
+  :root[data-density] :is(button, select, input:not([type=checkbox]):not([type=radio]), summary, .gh-issue-title, .ov-row a, .ci-health-detail a) { min-height: 44px; }
+  :root[data-density] :is(.ov-row a, .ci-health-detail a) { display: inline-flex; align-items: center; }
   /* The 44px button plus cell padding must fit the bucket's actual column. */
   :root[data-density] .ci-health-grid { width: max-content; table-layout: auto; }
   :root[data-density] .ci-health-grid :is(td, thead th:not(.ci-health-project)) { width: 48px; min-width: 48px; }

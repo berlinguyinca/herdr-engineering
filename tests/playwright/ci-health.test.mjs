@@ -30,21 +30,20 @@ test('CI health integrates real paginated history, PR drilldown, old filtered ru
   await page.locator('[data-health-mode="runs"]').click();
   await page.waitForFunction(async()=>{const d=await(await fetch('/api/v1/ci/history')).json();return d.coverage?.['17']?.exhausted&&d.pipelines.some(r=>r.run_number===8);},null,{timeout:45000});
   assert.match(await page.locator('[data-ci-health]').innerText(),/24/);
-  const summaries=page.locator('[data-health-tree] [data-health-disclosure] > summary');
-  await summaries.nth(0).click();await summaries.nth(1).click();
-  await page.getByRole('button',{name:/^Run #8 ·/}).click();
+  const filled=page.locator('.ci-health-grid tbody tr',{has:page.locator('th.ci-health-project',{hasText:/^org\/app\b/})}).locator('.ci-health-cell:not(.state-empty)');
+  for(let i=0,n=await filled.count();i<n;i++){await filled.nth(i).click();if(await page.getByRole('button',{name:/^Run #8\b/}).count())break;}
+  await page.getByRole('button',{name:/^Run #8\b/}).click();
   await page.locator('.ig-inspector .ci-pipeline-step[data-step="12"]').waitFor();
   assert.match(await page.locator('.ig-inspector').innerText(),/Run #8/);
   assert.equal(await page.locator('[data-health-pipeline-slot] .ig-inspector').count(),1);
   await page.locator('.ig-inspector .ci-pipeline-step[data-step="12"]').click();
   await page.waitForFunction(()=>document.querySelector('.ig-log')?.textContent.includes('expected 200, got 500'));
   assert.equal(await page.locator('.ig-inspector .ci-pipeline-step[data-step="12"]').evaluate(e=>getComputedStyle(e).borderLeftColor),'rgb(220, 53, 69)');
-  assert.equal(await page.locator('[data-health-run][aria-current="true"]').count(),1);
+  assert.equal(await page.locator('[data-health-slot-run][aria-current="true"]').count(),1);
   await hf(page);
   const search=page.locator('[data-health-search]');await search.fill('org/app');
   await search.focus();await page.waitForTimeout(5300);
   assert.equal(await search.evaluate(e=>e===document.activeElement),true);
-  assert.equal(await summaries.nth(0).evaluate(e=>e.parentElement.open),true);
   await search.fill('');
   await page.locator('[data-close-inspector]').click();
   for(const mode of ['7','14','30']){
@@ -55,7 +54,7 @@ test('CI health integrates real paginated history, PR drilldown, old filtered ru
   }
   await hf(page);
   await page.locator('[data-health-scope]').selectOption('pr');
-  await page.waitForFunction(()=>document.querySelector('[data-ci-health]')?.textContent.includes('PR #1200'));
+  await page.waitForFunction(()=>document.querySelector('[data-health-scope]')?.value==='pr'&&document.querySelector('[data-health-map] .ci-health-grid'));
   await hf(page);
   await page.locator('[data-health-mode="30"]').click();
   assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true);

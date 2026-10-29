@@ -44,7 +44,7 @@ function rail(model,projectCharts=new Map()) {
   const idle=model.projects.filter(p=>!p.metrics.completed&&!p.metrics.active&&p.key!==model.projectKey);
   const seen=model.projects.filter(p=>!idle.includes(p));
   const oneProvider=new Set(seen.map(p=>p.provider_url)).size<2;
-  return `<div class="ci-ob-table" tabindex="0" role="region" aria-label="Project comparison"><table><thead><tr>${['Project / provider','Pass / fail','Pass rate','Duration p50 / p95','Failure trend'].map(t=>`<th scope="col">${t}</th>`).join('')}</tr></thead><tbody>${seen.map(p=>`<tr><th scope="row"><button type="button" data-ob-project="${esc(p.key)}" aria-pressed="${p.key===model.projectKey}">${esc(p.repository)}</button>${oneProvider?'':`<small>${esc(p.provider_url)} · #${esc(p.provider_repo_id)}</small>`}${p.scope_unavailable?'<small>Default branch unavailable</small>':''}</th><td>${p.metrics.success} / ${p.metrics.failed}<small>${p.metrics.completed} completed</small></td><td${p.metrics.completed<5?' class="ci-ob-low" title="Fewer than 5 completed runs: the rate is not meaningful yet"':''}>${percent(p.metrics.passRate)}</td><td>${p.metrics.duration.p50===null&&p.metrics.duration.p95===null?'<span class="ci-ob-low" title="Fewer than 5 measured runs">Too few runs</span>':`${duration(p.metrics.duration.p50)} / ${duration(p.metrics.duration.p95)}`}<small>${p.metrics.duration.samples} samples</small></td><td class="ci-ob-spark">${projectCharts.has(p.key)?renderCiSparkline(projectCharts.get(p.key),p.repository):'<span class="ci-ob-low" title="Select the project to load its trend">—</span>'}</td></tr>`).join('')}</tbody></table>${!seen.length?'<p>No projects match these filters.</p>':''}${idle.length?`<p class="ci-chart-note" data-ob-idle>${idle.length} more project${idle.length===1?'':'s'} had no runs in this window.</p>`:''}</div>`;
+  return `<div class="ci-ob-table" tabindex="0" role="region" aria-label="Project comparison"><table><thead><tr>${['Project / provider','Pass / fail','Pass rate','Duration p50 / p95','Failure trend'].map(t=>`<th scope="col">${t}</th>`).join('')}</tr></thead><tbody>${seen.map(p=>`<tr><th scope="row"><button type="button" data-ob-project="${esc(p.key)}" aria-pressed="${p.key===model.projectKey}">${esc(p.repository)}</button>${oneProvider?'':`<small>${esc(p.provider_url)} · #${esc(p.provider_repo_id)}</small>`}${p.scope_unavailable?'<small>Default branch unavailable</small>':''}</th><td>${p.metrics.success} / ${p.metrics.failed}<small>${p.metrics.completed} completed</small></td><td${p.metrics.completed<5?' class="ci-ob-low" title="Fewer than 5 completed runs: the rate is not meaningful yet"':''}>${percent(p.metrics.passRate)}</td><td>${p.metrics.duration.p50===null&&p.metrics.duration.p95===null?'<span class="ci-ob-low" title="Fewer than 5 measured runs">Too few runs</span>':`${duration(p.metrics.duration.p50)} / ${duration(p.metrics.duration.p95)}`}<small>${p.metrics.duration.samples} samples</small></td><td class="ci-ob-spark">${projectCharts.has(p.key)?renderCiSparkline(projectCharts.get(p.key),p.repository):'<span class="ci-ob-low" title="No trend loaded yet">—</span>'}</td></tr>`).join('')}</tbody></table>${!seen.length?'<p>No projects match these filters.</p>':''}${idle.length?`<p class="ci-chart-note" data-ob-idle>${idle.length} more project${idle.length===1?'':'s'} had no runs in this window.</p>`:''}</div>`;
 }
 export function renderCiObservability(model,{projectCharts=new Map()}={}) {
   return `<p class="ci-chart-note">${esc(scopeNote(model.scope))}</p>${model.available===false?'<p role="status">CI summary unavailable. Retained observations may be incomplete.</p>':''}${cards(model)}${rail(model,projectCharts)}`;
@@ -104,7 +104,7 @@ export function mountCiObservability(host,client,{repository='',provider='',miss
     if(disposed)return;
     const model=ciObservabilityModel(summary||{}, {...view,projectKey:project?ciProjectKey(project):''});
     const selected=project?detail:summary;
-    el('[data-ob-status]').textContent=unsupported?'Compact summaries are unavailable for mission/session context. Use the scoped run tree below.':`${error||''} ${detailError||''} ${summary?.available===false||detail?.available===false?'CI summary unavailable. Coverage is partial. ':''}${pending.size?'Refreshing observations… ':''}${summary?scopeNote(summary.scope):'CI summary unavailable or loading.'}${summary?.generated_at?` Last provider snapshot: ${summary.generated_at}.`:''}`.trim();
+    el('[data-ob-status]').textContent=unsupported?'Compact summaries are unavailable for mission/session context. Use the project map below.':`${error||''} ${detailError||''} ${summary?.available===false||detail?.available===false?'CI summary unavailable. Coverage is partial. ':''}${pending.size?'Refreshing observations… ':''}${summary?scopeNote(summary.scope):'CI summary unavailable or loading.'}${summary?.generated_at?` Last provider snapshot: ${summary.generated_at}.`:''}`.trim();
     replace(el('[data-ob-summary]'),selected?cards(ciObservabilityModel(selected))+summaryCaption(selected.scope):'');
     replace(el('[data-ob-worst]'),summary&&!project?worstProjects(model):'');
     replace(el('[data-ob-projects]'),summary?rail(model,projectCharts):'<p class="ci-chart-note">No project summary received.</p>');
@@ -138,12 +138,33 @@ export function mountCiObservability(host,client,{repository='',provider='',miss
       jobs.push(request('tests',signal=>client.getCiTests({...context,signal}),data=>{if(!Array.isArray(data?.tests))throw Error('Invalid test history');tests=data;testsError='';},()=>{testsError='Test history refresh failed.';}));
     }
     draw();await Promise.all(jobs);
-    if(!disposed&&!doc.hidden&&version===generation){clearTimeout(timer);timer=setTimeout(refresh,5000);}
+    if(!disposed&&!doc.hidden&&version===generation){clearTimeout(timer);timer=setTimeout(refresh,5000);void loadTrends(version);}
+  }
+  // Every project's trend loads by itself, a few at a time and only while nothing the person asked for is in flight; nobody has to select a row first.
+  const trendAt=new Map();
+  let trendsRunning=false;
+  async function loadTrends(version) {
+    if(trendsRunning||disposed||doc.hidden||unsupported||!summary||version!==generation)return;
+    trendsRunning=true;
+    const model=ciObservabilityModel(summary,{...view,projectKey:project?ciProjectKey(project):''});
+    const queue=model.projects.filter(p=>(p.metrics.completed||p.metrics.active)&&!(project&&p.key===ciProjectKey(project))&&Date.now()-(trendAt.get(p.key)||0)>300000);
+    const worker=async()=>{
+      for(let next=queue.shift();next&&!disposed&&version===generation;next=queue.shift()){
+        const item=next;let trendTimer=0;trendAt.set(item.key,Date.now());
+        while(pending.size&&!disposed&&version===generation)await new Promise(resolve=>setTimeout(resolve,250));
+        if(disposed||version!==generation){trendAt.delete(item.key);break;}
+        // No abort signal: selecting a project or editing a filter must not cancel these quietly; a stale answer is dropped by the generation check.
+        try{const data=await Promise.race([client.getCiSummary({...filters,start:null,end:null,run_number:null,repository:item.repository,provider_url:item.provider_url,provider_repo_id:item.provider_repo_id}),new Promise((_,fail)=>{trendTimer=setTimeout(()=>fail(new Error('Trend timed out')),15000);})]);
+          if(!disposed&&version===generation&&Array.isArray(data?.charts)){projectCharts.set(item.key,rows(data.charts));draw();}else trendAt.delete(item.key);
+        }catch{trendAt.set(item.key,Date.now()-240000);}finally{clearTimeout(trendTimer);}
+      }
+    };
+    try{await Promise.all([worker(),worker(),worker()]);}finally{trendsRunning=false;}
   }
   function invalidate({all=false}={}) {
     generation++;for(const request of pending.values())request.abort();pending.clear();
     detail=null;tests=null;detailError='';testsError='';
-    if(all){summary=null;error='';projectCharts.clear();}
+    if(all){summary=null;error='';projectCharts.clear();trendAt.clear();}
   }
   function selectProject(next) {const bucket=filters.start!=null||filters.run_number!=null;filters.start=null;filters.end=null;filters.run_number=null;invalidate({all:bucket});project=next;refresh({selectionOnly:!bucket});notify();}
   const onClick=event=>{
