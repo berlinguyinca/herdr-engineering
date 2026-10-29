@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { compact, disclosure, ms, pair, percent, rate, renderLlm, renderLlmSession, single, when, pickTotal, handoffChains } from '../llm-view.js';
+import { handoffNote, compact, disclosure, ms, pair, percent, rate, renderLlm, renderLlmSession, single, when, pickTotal, handoffChains } from '../llm-view.js';
 
 const dist = (n, p50, p95) => ({ n, p50, p95, insufficient: n < 5 });
 const group = (over = {}) => ({
@@ -155,7 +155,8 @@ test('tiles compare counts with the previous window and add input, cache and que
   const html = renderLlm(state(), d);
   const values = [...html.matchAll(/<div class="llm-tile__label">([^<]*)<\/div>/g)].map((m) => m[1]);
   assert.deepEqual(values.slice(0, 5), ['Requests', 'Output tokens', 'TTFT p50 / p95', 'Speed p50', 'Errors']);
-  assert.deepEqual(values.slice(5), ['Input tokens', 'Cache hit', 'Queue p50 / p95']);
+  assert.deepEqual(values.slice(5), ['Input tokens', 'Cache hit']);
+  assert.match(html, /queue 0 ms \/ 10 ms waiting in the proxy/);    // queue sits in the TTFT tile, not a tile of its own
   assert.match(html, /↑ 20% vs previous 24h/);      // requests 100 -> 120
   assert.match(html, /↓ 50% vs previous 24h/);      // output tokens 4000 -> 2000
   assert.match(html, /→ 0% vs previous 24h/);       // errors unchanged
@@ -190,4 +191,23 @@ test('handoffChains sums usage over agents joined by recorded handoffs and leave
   assert.equal(chains[0].output, 157);
   assert.equal(chains[0].requests, 4);
   assert.deepEqual(handoffChains(null, agents), []);
+});
+
+test('the session page links back to Usage, compares with the previous window and says where the agent sits in a handoff', () => {
+  const d = data();
+  d.previous = { groups: [group({ requests: 10 })] };
+  d.handoffs = [{ source: { session_id: 'a' }, target: { session_id: 's1' }, created_at: 1 }, { source: { session_id: 's1' }, target: { session_id: 'b' }, created_at: 2 }];
+  d.agents = { groups: ['a', 's1', 'b'].map((key) => ({ key, source: 'llm-proxy', requests: 2, errors: 0, tokens: { output: 10 } })) };
+  const html = renderLlmSession({ window: '24h', sessionId: 's1', known: true, name: 'Quiet', names: { a: 'Planner' } }, d);
+  assert.match(html, /← Usage/);
+  assert.match(html, /vs previous 24h/);
+  assert.match(html, /data-llm-handoff[^>]*>← from <a[^>]*>Planner<\/a> · → to .*chain total: 30 output tokens in 6 requests/);
+  assert.equal(handoffNote('lone', d.handoffs, d.agents, {}), '', 'an agent in no handoff gets no line');
+});
+
+test('a chart whose data sits at the end of the window is trimmed and says so', () => {
+  const pts = Array.from({ length: 24 }, (_, i) => ({ t: 1700000000 + i * 3600, v: i === 23 ? 5 : 0 }));
+  const html = renderLlm(state(), { ...data(), series: { requests: { points: pts }, errors: { points: pts.map((p) => ({ ...p, v: 0 })) } } });
+  assert.match(html, /data-llm-trim/);
+  assert.match(html, /no requests earlier in this window/);
 });

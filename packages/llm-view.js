@@ -102,13 +102,12 @@ function tiles(total, prev, win) {
     ['Requests', total ? reqs(t) : GAP, withDelta(!total ? 'no records in this window' : t.source === 'transcript' ? 'tokens only, from the agent\'s transcript' : '', delta(t.requests, before.requests, win))],
     ['Output tokens', total ? `${bound}${compact(tokens.output)}` : GAP,
       withDelta(tokens.lower_bound ? 'some replies carried no usage figure' : '', delta(tokens.output, before.tokens?.output, win))],
-    ['TTFT p50 / p95', pair(t.ttft_ms, ms), 'streams only'],
+    ['TTFT p50 / p95', pair(t.ttft_ms, ms), withDelta('streams only', /^(not reported|insufficient data|—)/.test(pair(t.queue_ms, ms)) ? '' : `queue ${pair(t.queue_ms, ms)} waiting in the proxy`)],
     ['Speed p50', single(t.speed_tps, rate), 'streams with a usage figure'],
     ['Errors', total ? `${percent(t.error_rate)} (${count(t.errors)})` : GAP, delta(t.errors, before.errors, win)],
     // appended after the original five so their order never changes
     ['Input tokens', num(tokens.input) != null ? compact(tokens.input) : GAP, delta(tokens.input, before.tokens?.input, win)],
     ['Cache hit', num(tokens.cache_read) > 0 ? percent(tokens.cache_read / (tokens.cache_read + (num(tokens.input) || 0))) : GAP, 'of input tokens served from cache'],
-    ['Queue p50 / p95', pair(t.queue_ms, ms), 'time requests waited in the proxy'],
   ];
   const reported = (value) => !/^(not reported|insufficient data|—)/.test(value);
   const shown = cards.filter(([, value]) => reported(value));
@@ -206,9 +205,20 @@ const W = 780; const H = 64; const X0 = 42; const Y1 = 84;     // wide and short
 const fx = (i, n) => (n <= 1 ? X0 + W / 2 : X0 + (i / (n - 1)) * W);
 const r2 = (v) => Math.round(v * 100) / 100;
 
-function barPlot(id, title, desc, ok, bad) {
+/** When the data sits in the last part of the window, the empty lead is cut (one empty bucket is kept) and said so, so a lone
+ *  bar is not drawn at the edge of a mostly blank axis. The table of every point stays complete. */
+function trimLead(points, isEmpty) {
+  const lead = points.findIndex((p) => !isEmpty(p));
+  if (lead < 0 || lead <= points.length / 2) return { from: 0, note: '' };
+  const from = lead - 1;
+  return { from, note: `<p class="llm-note" data-llm-trim>Showing from ${esc(when(points[from].t))}: no requests earlier in this window.</p>` };
+}
+
+function barPlot(id, title, desc, ok0, bad0) {
+  if (!ok0.length || ok0.every((p) => !p.v)) return `<p class="llm-note">No requests in this window.</p>`;
+  const { from, note } = trimLead(ok0, (p) => !p.v);
+  const ok = ok0.slice(from); const bad = bad0.slice(from);
   const n = ok.length;
-  if (!n || ok.every((p) => !p.v)) return `<p class="llm-note">No requests in this window.</p>`;
   const top = Math.max(...ok.map((p) => p.v));
   const bw = Math.min(22, (W / n) * 0.7);
   const bars = ok.map((p, i) => {
@@ -219,10 +229,12 @@ function barPlot(id, title, desc, ok, bad) {
     return `${good ? `<rect x="${x}" y="${r2(Y1 - hg)}" width="${r2(bw)}" height="${r2(hg)}" fill="var(--status-ok)"><title>${esc(when(p.t))}: ${good} ok</title></rect>` : ''}${
       failed ? `<rect x="${x}" y="${r2(Y1 - hg - hb)}" width="${r2(bw)}" height="${r2(hb)}" fill="var(--status-attention)"><title>${esc(when(p.t))}: ${failed} failed</title></rect>` : ''}`;
   }).join('');
-  return `<svg viewBox="0 0 ${X0 + W + 18} ${Y1 + 28}" role="img" aria-labelledby="${id}-t ${id}-d"><title id="${id}-t">${esc(title)}</title><desc id="${id}-d">${esc(desc)}</desc><line x1="${X0}" y1="${Y1}" x2="${X0 + W}" y2="${Y1}"/><text x="34" y="${Y1 - H + 4}" text-anchor="end">${top}</text><text x="34" y="${Y1 + 4}" text-anchor="end">0</text>${bars}<text x="${X0}" y="${Y1 + 20}">${esc(when(ok[0].t).slice(5, 16))}</text><text x="${X0 + W}" y="${Y1 + 20}" text-anchor="end">${esc(when(ok[n - 1].t).slice(5, 16))}</text></svg>`;
+  return `<svg viewBox="0 0 ${X0 + W + 18} ${Y1 + 28}" role="img" aria-labelledby="${id}-t ${id}-d"><title id="${id}-t">${esc(title)}</title><desc id="${id}-d">${esc(desc)}</desc><line x1="${X0}" y1="${Y1}" x2="${X0 + W}" y2="${Y1}"/><text x="34" y="${Y1 - H + 4}" text-anchor="end">${top}</text><text x="34" y="${Y1 + 4}" text-anchor="end">0</text>${bars}<text x="${X0}" y="${Y1 + 20}">${esc(when(ok[0].t).slice(5, 16))}</text><text x="${X0 + W}" y="${Y1 + 20}" text-anchor="end">${esc(when(ok[n - 1].t).slice(5, 16))}</text></svg>${note}`;
 }
 
-function linePlot(id, title, desc, series, fmt) {
+function linePlot(id, title, desc, series0, fmt) {
+  const lead = series0[0] ? trimLead(series0[0].points, (p) => num(p.v) == null) : { from: 0, note: '' };
+  const series = lead.from ? series0.map((s) => ({ ...s, points: s.points.slice(lead.from) })) : series0;
   const all = series.flatMap((s) => s.points.map((p) => num(p.v)).filter((v) => v != null));
   if (!all.length) return `<p class="llm-note">Not reported in this window, or fewer than 5 samples per bucket.</p>`;
   const top = Math.max(...all);
@@ -239,7 +251,7 @@ function linePlot(id, title, desc, series, fmt) {
       : `<polyline points="${seg.map((q) => `${q[0]},${q[1]}`).join(' ')}" fill="none" stroke="${s.color}" stroke-width="2"/>`)).join('');
   }).join('');
   const first = series[0].points[0]; const last = series[0].points[series[0].points.length - 1];
-  return `<svg viewBox="0 0 ${X0 + W + 18} ${Y1 + 28}" role="img" aria-labelledby="${id}-t ${id}-d"><title id="${id}-t">${esc(title)}</title><desc id="${id}-d">${esc(desc)}</desc><line x1="${X0}" y1="${Y1}" x2="${X0 + W}" y2="${Y1}"/><text x="34" y="${Y1 - H + 4}" text-anchor="end">${esc(fmt(top))}</text><text x="34" y="${Y1 + 4}" text-anchor="end">0</text>${lines}<text x="${X0}" y="${Y1 + 20}">${esc(when(first.t).slice(5, 16))}</text><text x="${X0 + W}" y="${Y1 + 20}" text-anchor="end">${esc(when(last.t).slice(5, 16))}</text></svg>`;
+  return `<svg viewBox="0 0 ${X0 + W + 18} ${Y1 + 28}" role="img" aria-labelledby="${id}-t ${id}-d"><title id="${id}-t">${esc(title)}</title><desc id="${id}-d">${esc(desc)}</desc><line x1="${X0}" y1="${Y1}" x2="${X0 + W}" y2="${Y1}"/><text x="34" y="${Y1 - H + 4}" text-anchor="end">${esc(fmt(top))}</text><text x="34" y="${Y1 + 4}" text-anchor="end">0</text>${lines}<text x="${X0}" y="${Y1 + 20}">${esc(when(first.t).slice(5, 16))}</text><text x="${X0 + W}" y="${Y1 + 20}" text-anchor="end">${esc(when(last.t).slice(5, 16))}</text></svg>${lead.note}`;
 }
 
 function seriesTable(headers, rows) {
@@ -323,6 +335,18 @@ export function renderLlm(state, data) {
 
 /** One agent's usage (#/llm/session/<id>). `state`: {window, sessionId, name, known}.
  *  `data`: {total, models, problems, series}, all scoped to the session by the API. */
+/** Where this agent sits in recorded handoffs: who handed work to it, who it handed to, and the chain's total. */
+export function handoffNote(id, handoffs, agents, names) {
+  const rows = list(handoffs).filter((h) => h?.source?.session_id && h?.target?.session_id);
+  const from = [...new Set(rows.filter((h) => h.target.session_id === id).map((h) => h.source.session_id))];
+  const to = [...new Set(rows.filter((h) => h.source.session_id === id).map((h) => h.target.session_id))];
+  if (!from.length && !to.length) return '';
+  const names_ = (ids) => ids.map((x) => link(x, names, llmSessionHref)).join(', ');
+  const chain = handoffChains(rows, agents).find((c) => c.ids.includes(id));
+  return `<p class="llm-note" data-llm-handoff>${from.length ? `← from ${names_(from)}` : ''}${from.length && to.length ? ' · ' : ''}${to.length ? `→ to ${names_(to)}` : ''}${
+    chain && chain.agents > 1 ? ` · chain total: ${esc(compact(chain.output))} output tokens in ${esc(count(chain.requests))} requests` : ''}</p>`;
+}
+
 export function renderLlmSession(state, data) {
   const d = data || {};
   const id = state.sessionId;
@@ -335,9 +359,9 @@ export function renderLlmSession(state, data) {
     : `<a class="llm-back" href="${esc(sessionHref(id))}">Open agent ↗</a>`;
   const notReported = proxy && !num(proxy.ttft_ms?.n) && !num(proxy.speed_tps?.n)
     ? '<p class="llm-note" data-llm-latency-note>Latency and speed are not reported by this agent\'s path.</p>' : '';
-  return `${llmStyles}<p class="llm-note"><a href="#/llm">← LLM</a></p><h1>${esc(title)} ${badge}</h1>
-    <p>${opens}</p>${controls({ window: state.window, filters: {} }, llmSessionHref(id))}
+  return `${llmStyles}<p class="llm-note"><a href="#/llm">← Usage</a></p><h1>${esc(title)} ${badge}</h1>
+    <p>${opens}</p>${handoffNote(id, d.handoffs, d.agents, state.names)}${controls({ window: state.window, filters: {} }, llmSessionHref(id))}
     <p class="llm-note" data-llm-disclosure>${esc(disclosure(d.total))}</p>${notReported}
-    ${tiles(proxy)}${charts(d.series)}
-    ${tables('llm-tab', [['Models', list(d.models?.groups).length, modelsTable(d.models)], ['Problems', list(d.problems?.problems).length, problemsTable(d.problems, {})]])}`;
+    ${tiles(proxy, pickTotal(d.previous), state.window)}${charts(d.series)}
+    ${tables('llm-tab', [['Models', list(d.models?.groups).length, modelsTable(d.models) + (list(d.models?.groups).some((g) => g.source !== PROXY) ? '<p class="llm-note">Rows from another source (such as the transcript) come from the agent\'s own log and are not added to the figures above.</p>' : '')], ['Problems', list(d.problems?.problems).length, problemsTable(d.problems, {})]])}`;
 }

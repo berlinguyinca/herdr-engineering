@@ -1045,20 +1045,27 @@ async function viewLlmSession(parts, revision) {
   const f = { window: window_, session: id };
   const step = STEP_FOR[window_];
   const series = (metric) => client.llm('timeseries', { ...f, step, metric });
-  const [total, models, problems, requests, errors, ttft, speed, session] = await Promise.all([
+  const [total, models, problems, requests, errors, ttft, speed, session, previous, queue, handoffs, agents, sessions] = await Promise.all([
     client.llm('stats', { ...f, group: 'all' }), client.llm('stats', { ...f, group: 'model' }),
     client.llm('errors', f), series('requests'), series('errors'), series('ttft_p95'), series('speed_p50'),
     client.getSession(id).catch(() => null),
+    client.llm('stats', { ...f, group: 'all', previous: 1 }).catch(() => null),
+    series('queue_p95').catch(() => null),
+    client.listHandoffs().catch(() => null),
+    client.llm('stats', { window: window_, group: 'session' }).catch(() => null),
+    client.listSessions().catch(() => ({ sessions: [] })),
   ]);
+  const names = {};
+  for (const s of sessions.sessions || []) if (s.display_name) names[s.session_id] = s.display_name;
   if (revision !== renderRevision) return NO_REFRESH;
   root.innerHTML = renderLlmSession({
-    window: window_, sessionId: id, known: Boolean(session), name: session?.display_name || session?.agent_role || '',
-  }, { total, models, problems, series: { requests, errors, ttft, speed } });
+    window: window_, sessionId: id, known: Boolean(session), name: session?.display_name || session?.agent_role || '', names,
+  }, { total, models, problems, previous, handoffs: handoffs?.handoffs, agents, series: { requests, errors, ttft, speed, queue } });
   addSnapshotChip();
   if (session) {
     const slot = document.createElement('div'); slot.id = 'related-panel';
     root.querySelector('.hd-live-head').after(slot);
-    return { refresh() {}, dispose: showRelated('session', id, slot) };
+    return { refresh() {}, dispose: showRelated('session', id, slot, '', { compact: true }) };
   }
   return NO_REFRESH;
 }
