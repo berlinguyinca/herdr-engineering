@@ -85,17 +85,30 @@ export function pickTotal(all) {
   return groups.find((g) => g.source === PROXY) || groups[0] || null;
 }
 
-function tiles(total) {
+/** "↑ 18% vs previous 24h" for a count, or '' when either window has no figure to compare. */
+function delta(now, before, win) {
+  if (num(now) == null || num(before) == null || before <= 0) return '';
+  const pct = Math.round(((now - before) / before) * 100);
+  return `${pct > 0 ? '↑' : pct < 0 ? '↓' : '→'} ${Math.abs(pct)}% vs previous ${win}`;
+}
+
+function tiles(total, prev, win) {
   const t = total || {};
+  const before = prev || {};
+  const withDelta = (note, d) => [note, d].filter(Boolean).join(' · ');
   const tokens = t.tokens || {};
   const bound = tokens.lower_bound ? '≥ ' : '';
   const cards = [
-    ['Requests', total ? reqs(t) : GAP, !total ? 'no records in this window' : t.source === 'transcript' ? 'tokens only, from the agent\'s transcript' : ''],
+    ['Requests', total ? reqs(t) : GAP, withDelta(!total ? 'no records in this window' : t.source === 'transcript' ? 'tokens only, from the agent\'s transcript' : '', delta(t.requests, before.requests, win))],
     ['Output tokens', total ? `${bound}${compact(tokens.output)}` : GAP,
-      tokens.lower_bound ? 'some replies carried no usage figure' : ''],
+      withDelta(tokens.lower_bound ? 'some replies carried no usage figure' : '', delta(tokens.output, before.tokens?.output, win))],
     ['TTFT p50 / p95', pair(t.ttft_ms, ms), 'streams only'],
     ['Speed p50', single(t.speed_tps, rate), 'streams with a usage figure'],
-    ['Errors', total ? `${percent(t.error_rate)} (${count(t.errors)})` : GAP, ''],
+    ['Errors', total ? `${percent(t.error_rate)} (${count(t.errors)})` : GAP, delta(t.errors, before.errors, win)],
+    // appended after the original five so their order never changes
+    ['Input tokens', num(tokens.input) != null ? compact(tokens.input) : GAP, delta(tokens.input, before.tokens?.input, win)],
+    ['Cache hit', num(tokens.cache_read) > 0 ? percent(tokens.cache_read / (tokens.cache_read + (num(tokens.input) || 0))) : GAP, 'of input tokens served from cache'],
+    ['Queue p50 / p95', pair(t.queue_ms, ms), 'time requests waited in the proxy'],
   ];
   const reported = (value) => !/^(not reported|insufficient data|—)/.test(value);
   const shown = cards.filter(([, value]) => reported(value));
@@ -132,9 +145,16 @@ function modelsTable(models) {
     'No requests recorded in this window.');
 }
 
+function missionsTable(missions) {
+  return table(['Mission', 'Source', 'Requests', 'Output tokens', 'Errors', 'Last seen'],
+    list(missions?.groups).map((g) => [`<a href="${esc(`#/missions/${encodeURIComponent(g.key)}`)}">${esc(g.key)}</a>`, esc(sourceLabel(g)), esc(reqs(g)),
+      esc(`${g.tokens?.lower_bound ? '≥ ' : ''}${compact(g.tokens?.output)}`), esc(count(g.errors)), esc(when(g.last_seen))]),
+    'No request in this window belonged to a mission.');
+}
+
 const AGENTS_SHOWN = 10;
 function agentsTable(agents, names) {
-  const rows = list(agents?.groups).map((g) => [link(g.key, names, llmSessionHref), esc(sourceLabel(g)), esc(reqs(g)),
+  const rows = list(agents?.groups).map((g) => [`${link(g.key, names, llmSessionHref)}${typeof g.key === 'string' && !g.key.startsWith('unmatched:') ? ` <a class="llm-ext" href="${esc(sessionHref(g.key))}" title="Open the agent" aria-label="Open the agent">↗</a>` : ''}`, esc(sourceLabel(g)), esc(reqs(g)),
     esc(`${g.tokens?.lower_bound ? '≥ ' : ''}${compact(g.tokens?.output)}`), esc(single(g.speed_tps, rate)),
     esc(count(g.errors)), esc(when(g.last_seen))]);
   const head = ['Agent', 'Source', 'Requests', 'Output tokens', 'Speed p50', 'Errors', 'Last seen'];
@@ -198,6 +218,7 @@ function seriesTable(headers, rows) {
 }
 
 function charts(series) {
+  const queue = list(series?.queue?.points);
   const req = list(series?.requests?.points); const err = list(series?.errors?.points);
   const ttft = list(series?.ttft?.points); const spd = list(series?.speed?.points);
   const step = series?.requests?.step || '';
@@ -207,6 +228,7 @@ function charts(series) {
   const hasReq = req.some((p) => num(p.v) > 0);
   const hasLat = ttft.some((p) => num(p.v) != null);
   const hasSpd = spd.some((p) => num(p.v) != null);
+  const hasQueue = queue.some((p) => num(p.v) != null);
   const sw = switcher('llm-chart', [
     [`Requests per ${step}`, '', `${barPlot('llm-req', 'Requests over time', `${req.length} buckets of ${step}; failed requests are stacked on top. Exact counts follow in Chart data.`, req, err)}
       <div class="llm-legend"><span style="--c:var(--status-ok)">OK</span><span style="--c:var(--status-attention)">Failed</span></div>`, hasReq],
@@ -214,6 +236,8 @@ function charts(series) {
       [{ points: ttft, color: 'var(--accent)' }], ms)}<div class="llm-legend"><span style="--c:var(--accent)">TTFT p95 (axis in time)</span></div>`, hasLat],
     ['Speed p50', '', `${linePlot('llm-spd', 'Generation speed over time', `${spd.length} buckets of ${step}.`, [{ points: spd, color: 'var(--status-ok)' }], rate)}
       <div class="llm-legend"><span style="--c:var(--status-ok)">Speed p50 (axis in tokens/s)</span></div>`, hasSpd],
+    ['Queue p95', '', `${linePlot('llm-q', 'Time waiting in the proxy', `${queue.length} buckets of ${step}. Buckets with fewer than 5 samples are left out.`, [{ points: queue, color: 'var(--status-attention)' }], ms)}
+      <div class="llm-legend"><span style="--c:var(--status-attention)">Queue p95 (axis in time)</span></div>`, hasQueue],
   ]);
   return `<div class="llm-charts">${sw}</div><details class="llm-data"><summary>Chart data</summary>${data}</details>`;
 }
@@ -231,7 +255,7 @@ function controls(state, base = '#/llm') {
   const select = (name, label, values) => `<select data-llm-filter="${name}" aria-label="${label}" title="${label}"${state.filters[name] ? ' class="llm-set"' : ''}><option value="">All ${label.toLowerCase()}s</option>${
     values.map((v) => `<option value="${esc(v)}" ${v === state.filters[name] ? 'selected' : ''}>${esc(v)}</option>`).join('')}</select>`;
   const filters = base === '#/llm'
-    ? `${select('project', 'Project', state.projects || [])}${select('model', 'Model', state.modelNames || [])}` : '';
+    ? `${select('project', 'Project', state.projects || [])}${select('model', 'Model', state.modelNames || [])}${(state.missionNames || []).length || state.filters.mission ? select('mission', 'Mission', state.missionNames || []) : ''}` : '';
   return `<div class="llm-controls"><nav class="llm-windows" aria-label="Time window">${WINDOWS.map(link2).join('')}</nav>${filters}</div>`;
 }
 
@@ -242,9 +266,9 @@ export const llmStyles = `<style>
 .llm-charts{display:grid;grid-template-columns:minmax(0,1fr);gap:16px;margin:16px 0}.llm-quiet{display:flex;flex-wrap:wrap;gap:4px 24px;margin:12px 0;font-size:12px;color:var(--text-muted)}.llm-card{min-width:0;border:1px solid var(--border);border-radius:var(--radius);background:var(--surface);padding:6px 14px 12px}.llm-card h2{font-size:14px;margin:10px 0 4px}.llm-card svg{display:block;width:100%;max-height:210px}.llm-card svg text{font-size:11px;fill:var(--text-secondary);font-family:inherit}.llm-card svg line{stroke:var(--border)}
 .llm-legend{display:flex;flex-wrap:wrap;gap:12px;font-size:11px;color:var(--text-secondary)}.llm-legend span::before{content:'';display:inline-block;width:9px;height:9px;margin-right:5px;background:var(--c);border-radius:2px}
 .llm-note{font-size:12px;line-height:1.6;color:var(--text-secondary);margin:6px 0}.llm-table{overflow:auto}.llm-table table{border-collapse:collapse;width:100%;font-size:13px}.llm-table th,.llm-table td{padding:7px 8px;text-align:left;border-bottom:1px solid var(--border-subtle);overflow-wrap:anywhere}.llm-table th{color:var(--text-secondary);font-weight:500}.llm-fixed{table-layout:fixed}.llm-fixed td:first-child,.llm-fixed th:first-child{width:34%}.llm-sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0)}
-.llm-badge{font-size:11px;font-weight:500;padding:2px 8px;border:1px solid var(--border);border-radius:99px;color:var(--text-secondary);vertical-align:middle}.llm-back{font-size:13px}.llm-data{font-size:12px;margin:8px 0 16px}.llm-data>summary{cursor:pointer}.llm-more>summary{cursor:pointer;padding:8px 0;color:var(--accent);font-size:13px}.llm-section h2{font-size:15px;margin:22px 0 6px}.llm-switch{position:relative;margin:16px 0;padding:12px 16px 16px}.llm-tabs{display:flex;flex-wrap:wrap;gap:8px;margin:0 0 12px}.llm-tabs label{padding:4px 12px;min-height:32px;display:inline-flex;align-items:center;gap:4px;border:1px solid transparent;border-radius:var(--radius-sm);font-size:13px;color:var(--text-secondary);cursor:pointer}.llm-tabs label:hover{color:var(--text)}.llm-tab--empty{opacity:.6}.llm-tab__badge{font-size:11px;padding:0 8px;border:1px solid var(--border);border-radius:99px}.llm-panel{display:none}.llm-switch .llm-section>.llm-table:first-child{margin-top:0}
+.llm-badge{font-size:11px;font-weight:500;padding:2px 8px;border:1px solid var(--border);border-radius:99px;color:var(--text-secondary);vertical-align:middle}.llm-back{font-size:13px}.llm-data{font-size:12px;margin:8px 0 16px}.llm-data>summary{cursor:pointer}.llm-more>summary{cursor:pointer;padding:8px 0;color:var(--accent);font-size:13px}.llm-section h2{font-size:15px;margin:22px 0 6px}.llm-switch{position:relative;margin:16px 0;padding:12px 16px 16px}.llm-tabs{display:flex;flex-wrap:wrap;gap:8px;margin:0 0 12px}.llm-tabs label{padding:4px 12px;min-height:32px;display:inline-flex;align-items:center;gap:4px;border:1px solid transparent;border-radius:var(--radius-sm);font-size:13px;color:var(--text-secondary);cursor:pointer}.llm-tabs label:hover{color:var(--text)}.llm-tab--empty{opacity:.6}.llm-tab__badge{font-size:11px;padding:0 8px;border:1px solid var(--border);border-radius:99px}.llm-panel{display:none}.llm-ext{margin-left:4px;color:var(--text-muted);text-decoration:none}.llm-ext:hover{color:var(--accent)}.llm-switch .llm-section>.llm-table:first-child{margin-top:0}
 @media(max-width:650px){.llm-tiles{grid-template-columns:repeat(2,minmax(0,1fr))}.llm-charts{grid-template-columns:minmax(0,1fr)}}
-${switchCss('llm-chart', 3)}${switchCss('llm-tab', 3)}</style>`;
+${switchCss('llm-chart', 4)}${switchCss('llm-tab', 4)}</style>`;
 
 /** Models, agents and problems share one card; a tab with nothing to show says so in its label and is not the one opened first. */
 function tables(id, defs) {
@@ -260,8 +284,9 @@ export function renderLlm(state, data) {
     <p class="llm-note" data-llm-disclosure>${esc(disclosure(d.total))}${
       extra.length ? ` Other sources (${esc(extra.join(', '))}) are listed in the tables and never added to these figures.` : ''}${
       list(d.agents?.groups).some((g) => g.partial_source) ? ' Transcript rows cover only the events still retained for each agent, and carry tokens only.' : ''}</p>
-    ${tiles(pickTotal(d.total))}${charts(d.series)}
+    ${tiles(pickTotal(d.total), pickTotal(d.previous), state.window)}${charts(d.series)}
     ${tables('llm-tab', [['Models', list(d.models?.groups).length, modelsTable(d.models)], ['Agents', list(d.agents?.groups).length, agentsTable(d.agents, state.names)],
+      ['Missions', list(d.missions?.groups).length, missionsTable(d.missions)],
       ['Problems', list(d.problems?.problems).length, problemsTable(d.problems, state.names)]])}`;
 }
 

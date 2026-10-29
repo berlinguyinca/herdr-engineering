@@ -147,3 +147,31 @@ test('with only a transcript the tiles show tokens and say requests are not repo
   assert.doesNotMatch(html, /<div class="llm-tile__value">not reported<\/div>/, 'a tile with nothing to report is not drawn at full size');
   assert.match(html, /data-llm-quiet[^>]*>.*TTFT p50 \/ p95: not reported/s);
 });
+
+test('tiles compare counts with the previous window and add input, cache and queue figures after the original five', () => {
+  const d = data();
+  d.total.groups = [group({ requests: 120, errors: 6, tokens: { input: 3000, output: 2000, reasoning: 0, cache_read: 1000, lower_bound: false } })];
+  d.previous = { groups: [group({ requests: 100, errors: 6, tokens: { input: 1000, output: 4000, reasoning: 0, cache_read: 0, lower_bound: false } })] };
+  const html = renderLlm(state(), d);
+  const values = [...html.matchAll(/<div class="llm-tile__label">([^<]*)<\/div>/g)].map((m) => m[1]);
+  assert.deepEqual(values.slice(0, 5), ['Requests', 'Output tokens', 'TTFT p50 / p95', 'Speed p50', 'Errors']);
+  assert.deepEqual(values.slice(5), ['Input tokens', 'Cache hit', 'Queue p50 / p95']);
+  assert.match(html, /↑ 20% vs previous 24h/);      // requests 100 -> 120
+  assert.match(html, /↓ 50% vs previous 24h/);      // output tokens 4000 -> 2000
+  assert.match(html, /→ 0% vs previous 24h/);       // errors unchanged
+  assert.match(html, /<div class="llm-tile__value">25%<\/div>/);   // 1000 cached of 4000 input-side tokens
+  assert.doesNotMatch(renderLlm(state(), data()), /vs previous/, 'no previous window, no comparison');
+});
+
+test('a mission filter, a missions tab, a queue chart and an open-agent link are offered', () => {
+  const d = data();
+  d.missions = { groups: [group({ key: 'mission-1' })] };
+  d.series.queue = { points: pts([null, 40, null, 90]) };
+  const html = renderLlm(state({ missionNames: ['mission-1'], filters: { project: '', model: '', mission: 'mission-1' } }), d);
+  assert.match(html, /data-llm-filter="mission"/);
+  assert.match(html, /href="#\/missions\/mission-1">mission-1</);
+  assert.match(html, /Queue p95/);
+  assert.match(html, /class="llm-ext" href="#\/herd\/session\/herdr%3Abeast%3Aeng%3Aw1%3Ap1"/);
+  assert.doesNotMatch(html, /llm-ext" href="#\/herd\/session\/unmatched/);   // an unmatched id is no agent
+  assert.doesNotMatch(renderLlm(state(), data()), /data-llm-filter="mission"/, 'no missions, no filter');
+});

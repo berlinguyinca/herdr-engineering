@@ -2962,6 +2962,8 @@ class ControlPlaneRepo:
         if window not in llm_stats.WINDOWS:
             raise ValueError(f"window must be one of {', '.join(llm_stats.WINDOWS)}")
         now = self._now()
+        if filters.pop("previous", None):    # the window of the same length just before this one, to compare against
+            now -= llm_stats.WINDOWS[window]
         since = now - llm_stats.WINDOWS[window]
         cache = {}
 

@@ -1003,11 +1003,11 @@ function addSnapshotChip() {
 async function viewLlm(_parts, revision) {
   const q = route().query;
   const window_ = WINDOWS.includes(q.get('window')) ? q.get('window') : '24h';
-  const filters = { project: q.get('project') || '', model: q.get('model') || '' };
+  const filters = { project: q.get('project') || '', model: q.get('model') || '', mission: q.get('mission') || '' };
   const f = { window: window_, ...filters };
   const step = STEP_FOR[window_];
   const series = (metric) => client.llm('timeseries', { ...f, step, metric });
-  const [total, models, agents, problems, projects, requests, errors, ttft, speed, sessions, fleet] = await Promise.all([
+  const [total, models, agents, problems, projects, requests, errors, ttft, speed, sessions, fleet, previous, missions, queue] = await Promise.all([
     client.llm('stats', { ...f, group: 'all' }),
     client.llm('stats', { window: window_, project: filters.project, group: 'model' }),
     client.llm('stats', { ...f, group: 'session' }),
@@ -1016,6 +1016,9 @@ async function viewLlm(_parts, revision) {
     series('requests'), series('errors'), series('ttft_p95'), series('speed_p50'),
     client.listSessions().catch(() => ({ sessions: [] })),
     loadAnalytics(client, '').catch(() => null),
+    client.llm('stats', { ...f, group: 'all', previous: 1 }).catch(() => null),
+    client.llm('stats', { window: window_, project: filters.project, group: 'mission' }).catch(() => null),
+    series('queue_p95').catch(() => null),
   ]);
   if (revision !== renderRevision) return NO_REFRESH;
   const names = {};
@@ -1024,7 +1027,8 @@ async function viewLlm(_parts, revision) {
     window: window_, filters, names,
     projects: projects.groups.map((g) => g.key),
     modelNames: [...new Set(models.groups.map((g) => g.key))],
-  }, { total, models, agents, problems, series: { requests, errors, ttft, speed } });
+    missionNames: (missions?.groups || []).map((g) => g.key),
+  }, { total, models, agents, problems, previous, missions, series: { requests, errors, ttft, speed, queue } });
   if (fleet) root.insertAdjacentHTML('beforeend', usageStrip(fleet));
   addSnapshotChip();
   root.querySelectorAll('[data-llm-filter]').forEach((el) => el.addEventListener('change', () => {
