@@ -32,7 +32,8 @@ sections:
       # Set but invalid: the last valid set stays in use; events are refused (503) only when no
       # set was ever valid.
       # NOTE: release evidence (the release asset's .commit and its ancestry on main) is read from
-      # GitHub with the github.token below (read only; the repository is private). Without a token,
+      # GitHub with the github.app (or else github.token) below (read only; the repository is
+      # private). Without a credential,
       # or while GitHub fails, it is unknown: every permit answers false ("release not confirmed"),
       # so a host updater with a gate URL (IW_DEPLOY_GATE_URL) stays on its running version.
       # A definition may carry `requires: [{repo, ci_context, stage}]` to hold its track until that
@@ -44,7 +45,8 @@ sections:
       # A force never permits a release that is not confirmed (see the NOTE above).
       deployment_actions: false
       # OPTIONAL: side effects of a deployment failure escalation (all off by default). issues: a
-      # GitHub issue per software finding (needs github.token with issue write access).
+      # GitHub issue per software finding (needs github.token with issue write access; the
+      # read-only github.app is never used for it).
       # deployment_escalation:
       #   issues: false
       #   assistant: false
@@ -184,9 +186,31 @@ sections:
   github:
     roles: [ci]
     values:
-      # Also the deployment release evidence: needs read access to InferWeave/inferweave
-      # (releases, compare); issue write only if deployment_escalation.issues is true.
+      # Static personal token. Used for every GitHub read only while no `app` block is set
+      # (then: the deployment release evidence needs read access to InferWeave/inferweave -
+      # releases, compare - and the GitHub cache reads repositories/issues/projects). Always
+      # the credential of deployment_escalation.issues (issue WRITE; the App is read only).
       token: "REDACTED"
+      # OPTIONAL (recommended): authenticate GitHub reads as a read-only GitHub App instead of
+      # the token. When set it WINS for every read (one warning is logged if `token` is also
+      # set); an invalid block means no credential at all (no fallback to `token`).
+      # App permissions (Repository): Contents read, Metadata read, Issues read; (Organization)
+      # Projects read only for the cache's Projects v2 sync. Commit statuses, Checks and
+      # Actions are NOT needed (no herdr reader fetches them). Each reader asks GitHub for only
+      # its own subset: evidence {contents, metadata}, cache {issues, metadata}
+      # (+ organization_projects for Projects v2).
+      # private_key_file: absolute path on the control-plane host, a regular file, mode 0600
+      # (group/world bits or a symlink are refused), readable by the container user; e.g.
+      # inside the mounted fleet dir. Only its path is in this file, never the key.
+      # installations: one entry per repository owner herdr reads; owners not listed never
+      # get a token. `auto` looks the installation id up once (GET /app/installations).
+      # app:
+      #   app_id: 123456
+      #   private_key_file: "/etc/herdr/fleet/github-app.pem"
+      #   installations:
+      #     InferWeave: 11111111
+      #     metabolomics-us: 22222222
+      #     berlinguyinca: auto
 
   # Posted by every host's feeds as the control-plane API key (role ingest).
   # Empty = send no X-API-Key (open control plane, the default).

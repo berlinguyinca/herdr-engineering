@@ -254,8 +254,9 @@ request** that the host updater picks up on its next poll. The routes (each also
 - **Requests** are kept until cleared or for 24 h, at most 256 pending (more is refused with 429).
 - **Host token scope.** The host token grants only these host routes, and only for the components whose
   definition names that host. Every other route still answers 401.
-- **Release evidence comes from GitHub.** herdr reads it with the server-held `github.token` (read only is
-  enough; the repository is private, so a token is required):
+- **Release evidence comes from GitHub.** herdr reads it with the server-held GitHub credential (read only is
+  enough; the repository is private, so a credential is required): the `github.app` installation token of the
+  repository's owner when the App is configured (see "GitHub App authentication" below), else `github.token`:
   - **Published:** the `<follows.asset>.commit` asset of the `follows.tag` release (`node-ci-latest`) must hold
     the plan target. Every (tag, asset) a track's definitions name must carry the same 40-hex commit. The asset's
     redirect is followed by hand, without the token, and only to a `*.githubusercontent.com` download host.
@@ -304,6 +305,53 @@ request** that the host updater picks up on its next poll. The routes (each also
 - **While the fleet file is unusable** (deleted or unparseable after having been valid), the flag reads as off
   (fail closed) unless the last good file set `control_plane.config_failure_mode: last_good`. With `last_good`, a
   flag that was `true` keeps forces live: new force/ack requests are accepted and pending forces still permit.
+
+### GitHub App authentication (`github.app`)
+
+Every herdr GitHub **reader** (the release evidence above and the GitHub issue/project cache) can authenticate
+as a read-only GitHub App instead of the static `github.token`:
+
+```yaml
+github:
+  roles: [ci]
+  values:
+    app:
+      app_id: 123456
+      private_key_file: "/etc/herdr/fleet/github-app.pem"   # absolute, regular file, mode 0600
+      installations:                                        # one per repository owner herdr reads
+        InferWeave: 11111111
+        metabolomics-us: 22222222
+        berlinguyinca: auto                                 # looked up once via GET /app/installations
+```
+
+- **Required App permissions.** Repository: **Contents: read** (releases, release assets, compare),
+  **Metadata: read**, **Issues: read** (the GitHub cache). Organization: **Projects: read** only if the cache's
+  Projects v2 sync is used (GitHub may not expose a personal account's projects to an App; such an owner's
+  projects then read as unavailable, fail closed). **Commit statuses, Checks and Actions are not needed**: no herdr reader fetches them (CI green
+  comes from herdr's own CI record). Every token request names its permissions explicitly and only at `read`:
+  evidence `{contents, metadata}`, cache `{issues, metadata}`, Projects `{issues, metadata, organization_projects}`.
+  A grant broader than `read` in GitHub's answer is refused.
+- **Precedence.** With `app` set the App wins for every read and one warning is logged when `token` is also set.
+  An invalid `app` block means *no* credential (fail closed), never a silent fallback to `token`. Without `app`,
+  `github.token` works exactly as before. `deployment_escalation.issues` (an issue **write**) always uses
+  `github.token`; the App is never given write access.
+- **Owners.** A request uses the installation of the repository's owner. Only owners listed under
+  `installations` get a token (`auto` resolves an id, it never adds an owner); any other owner reads as unknown.
+- **Tokens.** A RS256 JWT (`iat` backdated 60 s, 10 min span) is exchanged at
+  `POST /app/installations/{id}/access_tokens`; the token is cached per owner and permission set until 5 min
+  before it expires (validity anchored to the monotonic clock, capped at 1 h). Refreshes are single-flight, each
+  call is bounded to 10 s, redirects are never followed, the answer is validated (`ghs_` token, `expires_at`),
+  a 403/429 rate limit backs off for its reset (at most 15 min) and any other failure for 30 s. A 401 from a read
+  drops that owner's cached token. Any failure means no token: evidence is unknown, the cache reports GitHub
+  unavailable.
+- **Secrets.** The key is read from the file only when a JWT is minted; a group/world-readable file or a symlink
+  is refused. The key, the JWT and installation tokens never reach a log, an error, the state or the UI. The
+  file must be readable by the control-plane container user, e.g. placed in the mounted fleet directory
+  (`/etc/herdr/fleet`) with mode 0600 and the container user's uid. Needs `PyJWT[crypto]` (the image's
+  `review-gate`/`collab` extras already install it).
+- **The cache under the App** lists each configured owner's repositories (`repositoryOwner`, not `viewer`), and
+  its catalog identity is the App's (not the hourly token), so token rotation does not purge it. Switching
+  between `token` and `app` re-syncs the catalog once.
 
 ### Cross-track order (`requires`)
 
