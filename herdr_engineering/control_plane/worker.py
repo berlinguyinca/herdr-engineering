@@ -59,7 +59,7 @@ async def _run_artifact_job_pass(conn, *, worker_id: str,
 
 async def run_one_pass(conn, *, mission_store=None, session_store=None,
                        service_store=None, host_store=None,
-                       snapshot_store=None, artifact_store=None,
+                       snapshot_store=None, artifact_store=None, collab_archive=None, collab_uploads=None,
                        lease_ttl=LEASE_TTL, host_ttl=HOST_TTL,
                        artifact_ttl=ARTIFACT_TTL, worker_id=None,
                        artifact_job_runner=None, max_artifact_jobs=1) -> dict:
@@ -102,6 +102,21 @@ async def run_one_pass(conn, *, mission_store=None, session_store=None,
                                       dict(m), sequence=0)
             snapshots += 1
     summary["snapshots"] = snapshots
+
+    if collab_uploads is not None:
+        try:
+            summary["collab_uploads"] = await collab_uploads.cleanup_expired_uploads()
+        except Exception:
+            summary["collab_uploads"] = []
+            summary["collab_upload_error"] = "upload cleanup retry required"
+
+    if collab_archive is not None:
+        try:
+            summary["collab_archives"] = await collab_archive.resume_pending_archives()
+        except Exception:
+            # Never include object-provider exception text or signed URLs.
+            summary["collab_archives"] = []
+            summary["collab_archive_error"] = "archive retry required"
 
     # Artifact GC: Phase 1 scaffold only; real reachability GC in Phase 5.
     summary["artifact_gc"] = 0

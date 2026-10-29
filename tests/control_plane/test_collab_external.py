@@ -206,7 +206,9 @@ def test_the_room_binding_makes_a_grant_elsewhere_inert(w):
     assert w.s._effective(rw, w.s._rooms[w.room2]) is None
     assert code(w.s.read_events, rw, w.room2, 0, 10) == 404
     assert code(w.s.post_message, rw, w.room2, {"text": "x", "idempotency_key": "z"}) == 404
-    assert w.s.agent_rooms(rw)["rooms"] == [{"room_id": w.room, "name": "r", "actions": ["post", "read"]}]
+    # the listing also carries the owner's lifecycle status fields (user/membership/agent-permission/upload)
+    assert [{k: r[k] for k in ("room_id", "name", "actions")} for r in w.s.agent_rooms(rw)["rooms"]] == [
+        {"room_id": w.room, "name": "r", "actions": ["post", "read"]}]
     assert w.s.external_heartbeat(rw, {"status": "idle"})["ok"] is True       # still works in its own room
 
 
