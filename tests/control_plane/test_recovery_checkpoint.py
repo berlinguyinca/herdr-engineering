@@ -420,3 +420,56 @@ def test_repair_upgrades_existing_archive_with_original_column_order(db):
     assert archived["recovery_instance"] == original["recovery_instance"]
     assert archived["quarantine_reason"] == "foreign_stream" and archived["quarantined_at"] is not None
     assert db.query("SELECT count(*) AS n FROM fabric_events")[0]["n"] == 0
+
+
+def test_checkpoint_boot_keeps_the_inspector_snapshot(db):
+    """A checkpoint boot carries every inspector row, so nothing is skipped, but the verified snapshot must still
+    replace the replay of the rows below its watermark (the replay was ~8 minutes in production)."""
+    from datetime import datetime
+
+    from herdr_engineering.control_plane import inspector_snapshot as snap
+    from tests.control_plane.test_inspector_snapshot import LIMITS, T0, canon, stream
+
+    def store():
+        # Built the way the worker builds it, so the fingerprint (limits, roles, redaction) matches the booting repo.
+        shadow = ControlPlaneRepo(inspector_limits=LIMITS).inspector
+        shadow._clock = lambda: T0 + 10_000
+        return shadow
+
+    rows = stream(400, seed=21)
+
+    async def seed():
+        conn = await asyncpg.connect(db.dsn)
+        try:
+            for index, e in enumerate(rows):
+                await conn.execute(
+                    "INSERT INTO fabric_events (event_id, sequence, event_type, entity_type, entity_id, session_id, payload,"
+                    " source_timestamp, ingest_timestamp) VALUES ($1,$2,$3,'inspector',$4,$4,$5::jsonb,$6,$6)",
+                    f"id-{e['sequence']}", e["sequence"], e["event_type"], e["entity_id"], json.dumps(e["payload"]),
+                    datetime.fromisoformat(e["source_timestamp"]))
+                if index == 299:
+                    await snap.SnapshotWriter(store, interval=0, settle=-10**9).tick(conn)
+        finally:
+            await conn.close()
+
+    asyncio.run(seed())
+    _build(db)
+
+    def boot(snapshots):
+        repo = ControlPlaneRepo(inspector_limits=LIMITS)
+        repo.inspector._clock = lambda: T0 + 10_000
+        source = PostgresSource(dsn=db.dsn, inspector_snapshots=snapshots)
+        load_into(repo, source)
+        assert source.recovery_metrics["mode"] != "full"
+        return canon(repo.inspector.export_state())
+
+    full, fast = boot(False), boot(True)
+    assert fast == full
+    seen = []
+    real = snap.apply_to_store
+    snap.apply_to_store = lambda *a, **k: (seen.append(real(*a, **k)) or seen[-1])
+    try:
+        boot(True)
+    finally:
+        snap.apply_to_store = real
+    assert seen == ["snapshot"]
