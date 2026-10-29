@@ -135,7 +135,7 @@ def registry_events(registry: Mapping[str, Mapping[str, Any]]) -> list[tuple[dic
             stamp = [x for x in ([v.get("committed_at") or v.get("created_at")] if v else []) + [art.get("created_at")] + bind_times if x]
             when = max(stamp) if stamp else None
             key = f"reg:art:{v['version_id'] if v else aid}:{fp}"
-            ev = core.normalize_event({"event_id": key, "entity_type": "artifact", "entity_id": aid, "source": "registry",
+            ev = core.normalize_event({"event_id": key, "entity_type": "registry", "entity_id": aid, "source": "registry",
                                        "event_type": "artifact.registry", "source_timestamp": when, "payload": {}})
             out.append((ev, core.artifact_ops(art, v, bindings)))
     return out
