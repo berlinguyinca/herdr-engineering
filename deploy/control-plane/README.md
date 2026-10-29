@@ -86,7 +86,9 @@ Settings of the reserved `control_plane` section the servers read: `pg_dsn`,
 `host_aliases`, `api_keys`, `rustfs_*`/`minio_*`, `self_host`, `web_port`,
 `ci_actions` (true enables CI retry/cancel), `inspector_limits` (`max_events`,
 `max_bytes`, `max_sessions`, `max_total_bytes`, `retention_hours`, `reasoning_role`,
-`sensitive_role`, `store_reasoning`) and `llm_proxy` (`max_inflight`,
+`sensitive_role`, `store_reasoning`), `inspector_snapshots` (`enabled`, default off;
+`interval_seconds`, default 600, at least 60: the worker keeps a replay snapshot of the inspector so a boot
+replays only newer events instead of every stored one; see "Inspector snapshots" below) and `llm_proxy` (`max_inflight`,
 `queue_wait_seconds`, `raw_retention_days` (default 14: the web server drops older
 `token_usage` records, in memory and in `fabric_events`), `rollup_retention_days`
 (default 400, reserved for the hourly rollups)). `control_plane.compose` is the mapping `deploy.sh` renders
@@ -203,3 +205,21 @@ Automatic agent summaries can use a separately managed private CPU model. It is
 disabled by default and ordinary deploys never download or start it. See
 [agent summary model operations](../../docs/operations/agent-summary-model.md) for
 explicit provisioning, central configuration, health checks and removal.
+
+## Inspector snapshots (faster boot)
+
+The control plane replays every stored inspector event at boot. At ~780k events that is about nine minutes
+(`boot import_state: agent, inspector and host projections` in the web log). With
+`control_plane.inspector_snapshots.enabled: true` the **worker** keeps a shadow inspector fed only by that same
+replay and writes it to the `inspector_snapshots` table (migration `0030`) every `interval_seconds`; the **web**
+loads it and replays only newer events.
+
+It is an optimisation, never a source of truth. The web replays everything, and logs why
+(`boot inspector replay: full:<reason>`), when the snapshot is missing or unreadable, was built under other
+inspector limits/roles or other redaction rules, or does not match the stored events (a different event count below
+its watermark, or a newer event that orders before it). The shadow never contains reasoning, which is memory-only.
+
+Turn it on in this order: deploy with it off (the migration applies at boot), set `enabled: true` and redeploy,
+wait for the worker log line `inspector snapshot written`, then redeploy once more and check
+`boot inspector replay: snapshot` and the phase timing. Rollback is `enabled: false`; the table can stay.
+If a redaction rule or inspector semantics change, bump `SNAPSHOT_VERSION` in `inspector.py`.

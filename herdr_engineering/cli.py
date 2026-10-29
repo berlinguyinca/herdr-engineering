@@ -3108,7 +3108,7 @@ def _cmd_cp_web(args) -> int:
     except ValueError as exc:
         raise SystemExit(f"fleet config {exc}") from None
     _require_durable_review_gate(cp, dsn)
-    source = _maybe_pg_source(dsn)
+    source = _maybe_pg_source(dsn, inspector_snapshots=_inspector_snapshot_settings(cp)[0])
     # When durable storage is wired, attach a write-through sink so every
     # ingested event persists to Postgres instead of dying with the in-memory
     # repo on restart (Phase 1a). Best-effort; never blocks or breaks serving.
@@ -3256,6 +3256,7 @@ def _cmd_cp_web(args) -> int:
                              skill_registry=cp.get("skill_registry"),
                              summary_config=cp.get("agent_summaries") or {},
                              summary_report_config=cp.get("summary_report") or {},
+                             unified_workspace_config=cp.get("unified_workspace") if isinstance(cp.get("unified_workspace"), dict) else None,
                              assistant_config={"personal_assistant": cp["personal_assistant"]}
                                  if isinstance(cp.get("personal_assistant"), dict) else None,
                              review_quorum=_review_quorum_config(cp),
@@ -3562,7 +3563,18 @@ def _maybe_rustfs_client(cp=None):
     return client
 
 
-def _maybe_pg_source(dsn):
+def _inspector_snapshot_settings(cp) -> tuple[bool, float]:
+    """``control_plane.inspector_snapshots: {enabled, interval_seconds}`` (off unless ``enabled`` is exactly true)."""
+    raw = (cp or {}).get("inspector_snapshots") or {}
+    if not isinstance(raw, dict):
+        raise SystemExit("fleet config control_plane.inspector_snapshots must be a mapping")
+    interval = raw.get("interval_seconds", 600)
+    if isinstance(interval, bool) or not isinstance(interval, (int, float)) or interval < 60:
+        interval = 600
+    return raw.get("enabled") is True, float(interval)
+
+
+def _maybe_pg_source(dsn, *, inspector_snapshots=False):
     """Build a PostgresSource from a DSN, or None if not provided."""
     if not dsn:
         return None
@@ -3570,7 +3582,27 @@ def _maybe_pg_source(dsn):
 
     # Lazy: PostgresSource connects on its own persistent event loop when the
     # server first hydrates from Postgres, so connect+fetch share one loop.
-    return PostgresSource(dsn=dsn)
+    return PostgresSource(dsn=dsn, inspector_snapshots=inspector_snapshots)
+
+
+def _worker_snapshot_writer(fleet_config_path):
+    """The inspector snapshot writer when the fleet file enables it, else None."""
+    from pathlib import Path
+
+    from .control_plane.inspector import InspectorStore
+    from .control_plane.inspector_snapshot import SnapshotWriter
+    from .fleet_config import FleetConfigError, load_fleet_config
+    if not fleet_config_path or not Path(fleet_config_path).expanduser().exists():
+        return None
+    try:
+        cp = load_fleet_config(Path(fleet_config_path).expanduser()).section("control_plane")
+    except FleetConfigError as exc:
+        raise SystemExit(f"--fleet-config: {exc}") from None
+    enabled, interval = _inspector_snapshot_settings(cp)
+    if not enabled:
+        return None
+    limits = cp.get("inspector_limits") or {}
+    return SnapshotWriter(lambda: InspectorStore.from_config(limits), interval=interval)
 
 
 def _parse_api_keys(single_key, pairs_str):
@@ -3649,11 +3681,12 @@ def _cmd_cp_worker(args) -> int:
                              if rustfs is not None else None)
             runner = render_runner if render_runner is not None else None
             worker_id = args.host_id or socket.gethostname()
+            snapshotter = _worker_snapshot_writer(getattr(args, "fleet_config", None))
             if args.once:
                 return await run_one_pass(conn, worker_id=worker_id,
-                                          artifact_job_runner=runner)
+                                          artifact_job_runner=runner, inspector_snapshotter=snapshotter)
             await run_worker(conn, interval=args.interval, worker_id=worker_id,
-                             artifact_job_runner=runner)
+                             artifact_job_runner=runner, inspector_snapshotter=snapshotter)
             return None
         finally:
             await conn.close()

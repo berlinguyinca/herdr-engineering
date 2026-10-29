@@ -1,0 +1,190 @@
+[
+  {
+    "doc": {
+      "actor": {
+        "id": "alice",
+        "kind": "user"
+      },
+      "aliases": [
+        {
+          "system": "hcn",
+          "value": "project-1"
+        }
+      ],
+      "causation_id": "ev-0",
+      "correlation_id": "co-1",
+      "created_at": "2026-10-28T12:00:00Z",
+      "etag": "sha256:9d886ec601445356f85416dacbfd2302c27f0aa1b2b4a0d0e88ccbcb853d35c0",
+      "id": "urn:herdr:project:b242429a-a320-5d91-88fc-6067745899c6",
+      "kind": "project",
+      "name": "tampered",
+      "refs": [
+        "herdr://rooms/room-1"
+      ],
+      "scope": {
+        "room_id": "room-1",
+        "tenant_id": "t1",
+        "visibility": "room"
+      },
+      "source_sequence": 7,
+      "trace_id": "tr-1",
+      "updated_at": "2026-10-28T12:00:00Z",
+      "version": 1
+    },
+    "fn": "validate_entity",
+    "why": "etag no longer matches content"
+  },
+  {
+    "doc": {
+      "actor": {
+        "id": "alice",
+        "kind": "user"
+      },
+      "aliases": [
+        {
+          "system": "hcn",
+          "value": "project-1"
+        }
+      ],
+      "causation_id": "ev-0",
+      "correlation_id": "co-1",
+      "created_at": "2026-10-28T12:00:00Z",
+      "etag": "sha256:9d886ec601445356f85416dacbfd2302c27f0aa1b2b4a0d0e88ccbcb853d35c0",
+      "id": "urn:herdr:project:b242429a-a320-5d91-88fc-6067745899c6",
+      "kind": "team",
+      "name": "CI health",
+      "refs": [
+        "herdr://rooms/room-1"
+      ],
+      "scope": {
+        "room_id": "room-1",
+        "tenant_id": "t1",
+        "visibility": "room"
+      },
+      "source_sequence": 7,
+      "trace_id": "tr-1",
+      "updated_at": "2026-10-28T12:00:00Z",
+      "version": 1
+    },
+    "fn": "validate_entity",
+    "why": "kind disagrees with urn"
+  },
+  {
+    "doc": {
+      "actor": {
+        "id": "alice",
+        "kind": "user"
+      },
+      "aliases": [
+        {
+          "system": "hcn",
+          "value": "project-1"
+        }
+      ],
+      "causation_id": "ev-0",
+      "correlation_id": "co-1",
+      "created_at": "2026-10-28T12:00:00Z",
+      "etag": "sha256:17e081dce023e1cf408925ac48e468c16507d4a113dbfcd2d47068a034be0f68",
+      "id": "urn:herdr:project:b242429a-a320-5d91-88fc-6067745899c6",
+      "kind": "project",
+      "name": "CI health",
+      "refs": [
+        "herdr://rooms/room-1"
+      ],
+      "scope": {
+        "tenant_id": "t1",
+        "visibility": "room"
+      },
+      "source_sequence": 7,
+      "trace_id": "tr-1",
+      "updated_at": "2026-10-28T12:00:00Z",
+      "version": 1
+    },
+    "fn": "validate_entity",
+    "why": "room scope without room_id would be operator-only"
+  },
+  {
+    "doc": {
+      "created_at": "2026-10-28T12:00:00Z",
+      "from_id": "urn:herdr:artifact:c26da410-e000-53bd-a098-b56939c71392",
+      "id": "urn:herdr:edge:931bf266-16f1-5be1-820a-2fd260a9a0c7",
+      "revision": 1,
+      "scope": {
+        "room_id": "room-1",
+        "tenant_id": "t1",
+        "visibility": "room"
+      },
+      "source_event_id": "ev-1",
+      "to_id": "urn:herdr:task:c763fb13-6880-57c1-84ff-9e19c150baa6",
+      "type": "produced"
+    },
+    "fn": "validate_edge",
+    "why": "produced must go task->artifact"
+  },
+  {
+    "doc": {
+      "created_at": "2026-10-28T12:00:00Z",
+      "from_id": "urn:herdr:project:b242429a-a320-5d91-88fc-6067745899c6",
+      "id": "urn:herdr:edge:931bf266-16f1-5be1-820a-2fd260a9a0c7",
+      "revision": 1,
+      "scope": {
+        "room_id": "room-1",
+        "tenant_id": "t1",
+        "visibility": "room"
+      },
+      "source_event_id": "ev-1",
+      "to_id": "urn:herdr:project:b242429a-a320-5d91-88fc-6067745899c6",
+      "type": "contains"
+    },
+    "fn": "validate_edge",
+    "why": "self edge"
+  },
+  {
+    "doc": {
+      "created_at": "2026-10-28T12:00:00Z",
+      "from_id": "urn:herdr:task:6069d68b-1c5e-5715-9062-6509235f3ae0",
+      "id": "urn:herdr:edge:931bf266-16f1-5be1-820a-2fd260a9a0c7",
+      "revision": 1,
+      "scope": {
+        "room_id": "room-1",
+        "tenant_id": "t1",
+        "visibility": "room"
+      },
+      "source_event_id": "ev-1",
+      "to_id": "urn:herdr:issue:377be2cc-a1bd-52f0-8240-5e022950204d",
+      "type": "supersedes"
+    },
+    "fn": "validate_edge",
+    "why": "supersedes across kinds"
+  },
+  {
+    "doc": {
+      "actor": {
+        "id": "alice",
+        "kind": "user"
+      },
+      "actor_id": "mallory",
+      "causation_id": "ev-0",
+      "correlation_id": "co-1",
+      "entity_refs": [
+        "urn:herdr:task:dd9c5159-f7b9-561a-8620-284e9b6fd32b"
+      ],
+      "event_id": "ev-1",
+      "event_type": "task.updated",
+      "occurred_at": "2026-10-28T12:00:00Z",
+      "payload_ref": "herdr://events/ev-1",
+      "received_at": "2026-10-28T12:00:00Z",
+      "schema_version": 2,
+      "scope": {
+        "room_id": "room-1",
+        "tenant_id": "t1",
+        "visibility": "room"
+      },
+      "source": "hcn",
+      "source_sequence": 12,
+      "trace_id": "tr-1"
+    },
+    "fn": "validate_event",
+    "why": "actor_id != actor.id"
+  }
+]

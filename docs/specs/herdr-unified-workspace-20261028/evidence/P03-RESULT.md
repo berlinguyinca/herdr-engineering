@@ -2,12 +2,12 @@
 
 Status: **partial**. Backend foundation implemented and tested; share-link delivery, WebUI gallery and the CLI/Pi
 `/artifact` adapter are not done. Design: `design/ARTIFACT_INTEGRATION.md`. Branch `feat/uw-artifact-registry-ext`
-(base `origin/main` 28aff00b; migration 0029).
+(base `origin/main` 28aff00b, re-merged with main through 0030; migration 0031).
 
 ## Done (file evidence)
 | Requirement | Where | Test |
 |---|---|---|
-| Provenance on every version (room/task/issue/project, parent, session, agent/model, prompt/skill revision, commit, redacted inputs) | `deploy/control-plane/migrations/0029_artifact_registry_extensions.sql`, `artifact_provenance.py`, `ArtifactStore.commit_version(origin=...)` | `test_provenance_is_validated_and_inputs_are_redacted` |
+| Provenance on every version (room/task/issue/project, parent, session, agent/model, prompt/skill revision, commit, redacted inputs) | `deploy/control-plane/migrations/0031_artifact_registry_extensions.sql`, `artifact_provenance.py`, `ArtifactStore.commit_version(origin=...)` | `test_provenance_is_validated_and_inputs_are_redacted` |
 | Immutable versions, no deletes | trigger `artifact_versions_freeze` | `test_a06_v1_is_immutable_after_v2_and_rows_cannot_be_deleted` |
 | Lookup by project / task / issue / room, ACL-filtered, 15 artifacts in 3 formats, survives DB restart and a deleted session | `artifact_context.py`, `artifact_registry_api.py` `GET /artifacts/for/{kind}/{ref}` | `test_a05_...survive_restart`, `test_lookup_routes_are_acl_filtered_and_missing_equals_forbidden` |
 | No leak via counts, pagination, search, grants, expiry, revocation, missing-vs-forbidden | same SQL predicate as `list_records` | `test_a09_no_leak_...` |

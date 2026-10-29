@@ -352,9 +352,9 @@ def test_resumable_upload_out_of_order_replay_verify_and_cleanup(registry_pg):
     run(with_store(registry_pg["dsn"], blobs, body))
 
 
-def test_migration_0029_is_idempotent_and_keeps_legacy_binding_dedupe(registry_pg):
+def test_migration_0031_is_idempotent_and_keeps_legacy_binding_dedupe(registry_pg):
     from tests.control_plane.registry_pg import ROOT
-    sql = (ROOT / "deploy/control-plane/migrations/0029_artifact_registry_extensions.sql").read_text()
+    sql = (ROOT / "deploy/control-plane/migrations/0031_artifact_registry_extensions.sql").read_text()
 
     async def body(store, connection):
         await connection.execute(sql)

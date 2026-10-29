@@ -22,8 +22,8 @@ carries `origin_room_id`. B's good ideas become *features of the registry*, neve
 | Item | Decision |
 |---|---|
 | Base of the registry-extensions PR | `origin/main` (28aff00b). It stores *native* ids (HCN task id, GitHub `issue_ref`, room id). `project_id` holds the P01 URN because a project has no native id. The URN for other kinds is derivable later with `workspace_contracts` uuid5, so no dependency on #364 (open, based on an older main) is needed and nothing in `workspace_contracts.py` is forked. |
-| Highest migration | `origin/main`: **0021**. #366: 0022-0028. #364: none. P02 plans >= 0022. Gaps 0015-0019 stay unfilled (the `Migrator` applies any unapplied file in name order; backfilling would make fresh and existing databases run different orders). |
-| Our numbers | **0029** `artifact_registry_extensions` (this PR) and **0030** reserved for the skill-registry PR if it needs a table (it prefers none). Both sit above #366's 0028 so the three PRs can land in any order with no name collision. |
+| Highest migration | `origin/main`: **0030** (`inspector_snapshots`, #383; 0015-0019 gap stays unfilled: the `Migrator` applies unapplied files in name order, so backfilling would make fresh and existing databases differ). #366: 0022-0028 (will renumber when it lands). #364: none. A migration numbered below an already-applied one is an ordering hazard, so ours must be above main's highest. |
+| Our numbers | **0031** `artifact_registry_extensions` (this PR). #376 added no migration. P02 takes a later number; re-check before merge. |
 | #367 (open, "artifact ACL visibility, retraction") | It is the *graph-side* gate (`artifact_scope.py`) plus `ArtifactStore.record_retraction` (`lifecycle='retracted'`, version `state='retracted'`). We carve around it: we do not touch `artifact_scope.py`/`artifact_lineage.py`; our lifecycle states `archived`/`tombstoned` extend the same `artifacts.lifecycle` column and `retracted` stays valid (CHECK allows it). Lookup excludes every non-`active` lifecycle by default. If #367 merges first, only a one-line import/mixin rebase in `artifacts.py` is needed. |
 | #364 | Contracts only; the lookup routes return rows that already carry the `{kind, id}` pairs `workspace_contracts` validates. |
 
@@ -54,7 +54,7 @@ carries `origin_room_id`. B's good ideas become *features of the registry*, neve
 Everything B has that is **not** listed above (room/membership/agent tables 0022, messages, invitations, session logs, MCP
 tools) is HCN's domain and out of scope here.
 
-## Data model (migration 0029, additive, idempotent, `-- DOWN:`)
+## Data model (migration 0031, additive, idempotent, `-- DOWN:`)
 
 `artifact_versions` (all nullable, **no foreign keys**: the P03 gate requires survival of session deletion, and the
 existing `agent_id/host_id/session_id/mission_id` columns *are* FK-bound):
