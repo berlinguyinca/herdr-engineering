@@ -55,3 +55,15 @@ Re-run of those three modules in full: `303 passed in 196.59s`. So the 3 failure
 
 ## Rollback
 Flag off (the default): capability unadvertised, nothing calls the module. The change is additive (new schema file, new module, new tests/fixtures/docs, one optional `ControlPlaneServer` kwarg, `jsonschema` in the dev extra). Reverting the PR removes it with no data impact; there is no migration.
+
+## Update after rebase onto main (ad937a3)
+- Conflict: one hunk in `ControlPlaneServer.__init__` signature (`scheduler_admission`/`scheduler_limits` from #322 plus `unified_workspace_config`); both kept. 112 new tests still pass.
+- Woodpecker (https://ci.metabolomics.us/repos/120/pipeline/133): artifact-handoff (/1) success, ui-gates (/2) success, unit-gates (/3) success; GitGuardian success; mergeStateStatus CLEAN. This is the CI evidence that supersedes the "unit-gates.sh not run" caveat above (Woodpecker runs it).
+- Baseline of the 3 full-run failures on clean origin/main ad937a3 (separate worktree), modules run alone: `1 failed, 302 passed`. `tests/test_fabric_cli.py::test_gateway_tls_flags_serve_https_and_both_flags_are_required` FAILS on main too (pre-existing, not caused by P01, and green in Woodpecker); the JWT `over12` pentest and collab-public restart tests pass on main and on this branch when run alone, i.e. load/clock-dependent flakes.
+
+## Decisions recorded (coordinator, 2026-10-28)
+Q1 project/team/artifact_version/external_action become OWNED graph kinds in P02 (not COMMONS). Q2 `trace_id` via a P02 migration (>=0022, idempotent, `-- DOWN:`). Q3 agents stay WITHOUT task submit (matches collab.py); P05 routes task admission through the broker with an authorized human/actor. Q4 only the account owner approves send_email; no room-owner proxy approval.
+
+## Open follow-ups (P02)
+- Retention-gap signal (`snapshot_required`) for replay cursors.
+- Re-test guest-hidden helper events advancing the cursor end to end.
