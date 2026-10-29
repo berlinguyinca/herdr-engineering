@@ -22,6 +22,37 @@ python3 -m venv "$venv"
 export PATH="$venv/bin:$PATH"     # the fixture server starts with `python3`
 npm ci --no-audit --no-fund
 npx playwright install chromium         # the build the baselines were made with (Playwright 1.64); a no-op when cached
-npm run test:ui-gates
-npm run ui-gates:baselines:check
+
+# Phase budgets. A healthy run is ~11 min for the suite and ~1 min for the baseline check, so a phase that blows through 2x that is a
+# regression in the harness (the 2026-10-28 networkidle wait made every capture ~10 s slower: 11 min -> 49 min and never failed), not a
+# slow host. Fail fast with a message that names the phase instead of letting the step run for the pipeline timeout.
+suite_budget="${UI_GATES_SUITE_BUDGET_SECONDS:-1500}"
+baseline_budget="${UI_GATES_BASELINES_BUDGET_SECONDS:-300}"
+phase() {   # phase NAME BUDGET_SECONDS COMMAND...
+  local name="$1" budget="$2" started=$SECONDS rc=0
+  shift 2
+  timeout -k 10 "$budget" "$@" || rc=$?
+  if [ "$rc" -eq 124 ]; then
+    echo "ui-gates: $name exceeded its ${budget}s budget; this is a harness slowdown to find, not a slow host (docs/operations/ui-gates.md, CI)" >&2
+  fi
+  echo "ui-gates: $name took $((SECONDS - started))s (budget ${budget}s)"
+  return "$rc"
+}
+
+# Woodpecker checks out the PR head commit, not a merge with main, so this run measures the branch as forked. If main has since changed
+# what runs here (a fix to the harness), a red or slow run may only mean "stale branch": say so, and say which files (merge main into
+# the branch and push to re-run; Woodpecker does not re-run a pipeline when only main moves). Non-fatal; skipped when history is short.
+stale_base_notice() {
+  local fork files
+  git fetch -q --no-tags --depth=200 origin main 2>/dev/null || return 0
+  fork=$(git merge-base HEAD FETCH_HEAD 2>/dev/null) || return 0
+  files=$(git diff --name-only "$fork" FETCH_HEAD -- .woodpecker scripts/ci tests/playwright/ui-gates-lib.mjs tests/visual package.json 2>/dev/null) || return 0
+  [ -z "$files" ] && return 0
+  echo "ui-gates: NOTICE main changed the harness since this branch forked; merge main and push if this run fails or is slow:" >&2
+  echo "$files" | sed 's/^/ui-gates:   /' >&2
+}
+stale_base_notice
+
+phase "test:ui-gates" "$suite_budget" npm run test:ui-gates
+phase "baselines:check" "$baseline_budget" npm run ui-gates:baselines:check
 git diff --exit-code -- docs/assets/screenshots

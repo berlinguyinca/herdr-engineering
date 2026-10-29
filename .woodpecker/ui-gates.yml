@@ -27,7 +27,7 @@ steps:
       - 'test -r /etc/woodpecker-git-credentials || { echo "the job staged no forge credential" >&2; exit 1; }'
       - 'git init -q -b "${CI_COMMIT_BRANCH:-main}" .'
       - 'git remote add origin "https://github.com/${CI_REPO}.git"'
-      - 'git fetch --no-tags --depth=1 origin "$CI_COMMIT_SHA"'
+      - 'git fetch --no-tags --depth=200 origin "$CI_COMMIT_SHA"   # enough history for the stale-base notice in ui-gates.sh to find the fork point'
       - 'git checkout -q FETCH_HEAD'
       - 'git --no-pager log --oneline -1'
 
