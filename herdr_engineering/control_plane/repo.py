@@ -28,6 +28,14 @@ from ..host_policy import HostPolicy, HostSnapshot, PolicyMode, normalize_aliase
 from ..llm_session_id import dashboard_form
 from . import llm_stats
 from .agent_identity import AgentIdentityConflict, AgentIdentityRegistry
+from .deployment_actions import ENTITY_TYPE as DEPLOYMENT_REQUEST_ENTITY
+from .deployment_actions import ForceRequests
+from .deployment_coordinator import ENTITY_TYPE as DEPLOYMENT_PLAN_ENTITY
+from .deployment_coordinator import CoordinatorState
+from .deployment_escalation import ENTITY_TYPE as DEPLOYMENT_ESCALATION_ENTITY
+from .deployment_escalation import EscalationLedger
+from .deployments_monitor import ENTITY_TYPE as DEPLOYMENT_ENTITY
+from .deployments_monitor import DeploymentsMonitor
 from .envelope import SourceLedger, envelope_event_fields
 from .graph import GraphProjection
 from .graph import _lseq as _graph_lseq
@@ -55,6 +63,9 @@ from .service_catalog import (
     track_availability,
     validate_archive_days,
 )
+
+#: Hard bound on one durable deployment write made under a store lock (seconds).
+DEPLOYMENT_DURABLE_WRITE_TIMEOUT_S = 10
 
 _STAGES = {
     "planning", "specification", "ready", "implementation", "testing",
@@ -231,9 +242,67 @@ class ControlPlaneRepo:
         # from them on import_state; owns no storage of its own.
         self.graph = GraphProjection()
         self.host_metrics = self._new_host_metrics()
+        # Deployment events reported by the host updaters (deploy-4): a private stream, like host metrics.
+        self.deployments = self._new_deployments()
+        # The deployment coordinator's plan generation and attempts (deploy-4 Task 3): private too.
+        self.deployment_plans = self._new_deployment_plans()
+        # Operator force-redeploy requests the hosts pick up (deploy-4 Task 5): private too.
+        self.deployment_requests = self._new_deployment_requests()
+        # The repair ledger and escalation records (deploy-4 Task 8): private too.
+        self.deployment_escalations = self._new_deployment_escalations()
+
+    def _new_deployment_escalations(self):
+        return EscalationLedger(persist=self._persist_deployments,
+                                persist_required=self._persist_deployments_required)
+
+    def _new_deployment_requests(self):
+        return ForceRequests(persist=self._persist_deployments,
+                             persist_required=self._persist_deployments_required, now=lambda: self._now())
+
+    def _new_deployment_plans(self):
+        return CoordinatorState(persist=self._persist_deployments)
 
     def _new_host_metrics(self):
         return HostMetricsStore(now=lambda: self._now(), persist=self._persist_host_metrics)
+
+    def _new_deployments(self):
+        return DeploymentsMonitor(now=lambda: self._now(), persist=self._persist_deployments)
+
+    def _persist_deployments(self, ev):
+        """Deployment events take the same private sink path as host-metrics rollups."""
+        self._persist_host_metrics(ev)
+
+    def _persist_deployments_required(self, ev):
+        """Like ``_persist_deployments`` but durable: raises unless the sink acknowledged the
+        record (a force pickup must not be lost, or a restart would grant the force again)."""
+        if self._sink is None:
+            return
+        required = getattr(self._sink, "record_required", None)
+        if not callable(required):
+            # a legacy best-effort sink cannot acknowledge: fail safe (the route answers 503)
+            raise RuntimeError("durable deployment persistence requires an acknowledged sink")
+        stamp = self._stamp()
+        row = {"event_id": new_id("event"), "schema_version": 1, "source_timestamp": stamp,
+               "ingest_timestamp": stamp, "mission_id": None, "session_id": None, **ev}
+        # Callers hold a store lock (the force requests, the escalation ledger): a hung
+        # database must fail this write (fail closed), not pin the permit and inbox threads.
+        # A write that lands after the timeout only ever errs towards "not done".
+        box = {}
+
+        def write():
+            try:
+                required(row)
+                box["ok"] = True
+            except BaseException as exc:  # noqa: BLE001 - re-raised in the caller below
+                box["error"] = exc
+
+        worker = threading.Thread(target=write, name="deployment-durable-write", daemon=True)
+        worker.start()
+        worker.join(DEPLOYMENT_DURABLE_WRITE_TIMEOUT_S)
+        if worker.is_alive():
+            raise TimeoutError("durable deployment write timed out")
+        if "error" in box:
+            raise box["error"]
 
     def _persist_host_metrics(self, ev):
         """Rollups and host-state changes go to the sink, not the shared streams/SSE."""
@@ -2969,6 +3038,8 @@ class ControlPlaneRepo:
         if window not in llm_stats.WINDOWS:
             raise ValueError(f"window must be one of {', '.join(llm_stats.WINDOWS)}")
         now = self._now()
+        if filters.pop("previous", None):    # the window of the same length just before this one, to compare against
+            now -= llm_stats.WINDOWS[window]
         since = now - llm_stats.WINDOWS[window]
         cache = {}
 
@@ -3315,8 +3386,34 @@ class ControlPlaneRepo:
         self._event_order = [t for t in self._event_order if t[0] not in ("collab", "review_request")]
         if durable:
             from .inspector_snapshot import apply_to_store
-            outcome = apply_to_store(self.inspector, state.get("inspector_snapshot"), durable)
+            outcome = apply_to_store(self.inspector, state.get("inspector_snapshot"), durable,
+                                    backfill=state.get("inspector_backfill"))
             logging.getLogger(__name__).info("boot inspector replay: %s (%d events)", outcome, len(durable))
+        # Deployment events ride a private stream too: untrusted host evidence never enters the shared feed.
+        deployment_rows = []
+        for key in [k for k in self._events if k[0] == DEPLOYMENT_ENTITY]:
+            deployment_rows.extend(self._events.pop(key))
+        self._event_order = [t for t in self._event_order if t[0] != DEPLOYMENT_ENTITY]
+        self.deployments = self._new_deployments()
+        self.deployments.hydrate(deployment_rows)
+        plan_rows = []
+        for key in [k for k in self._events if k[0] == DEPLOYMENT_PLAN_ENTITY]:
+            plan_rows.extend(self._events.pop(key))
+        self._event_order = [t for t in self._event_order if t[0] != DEPLOYMENT_PLAN_ENTITY]
+        self.deployment_plans = self._new_deployment_plans()
+        self.deployment_plans.hydrate(plan_rows)
+        request_rows = []
+        for key in [k for k in self._events if k[0] == DEPLOYMENT_REQUEST_ENTITY]:
+            request_rows.extend(self._events.pop(key))
+        self._event_order = [t for t in self._event_order if t[0] != DEPLOYMENT_REQUEST_ENTITY]
+        self.deployment_requests = self._new_deployment_requests()
+        self.deployment_requests.hydrate(request_rows)
+        escalation_rows = []
+        for key in [k for k in self._events if k[0] == DEPLOYMENT_ESCALATION_ENTITY]:
+            escalation_rows.extend(self._events.pop(key))
+        self._event_order = [t for t in self._event_order if t[0] != DEPLOYMENT_ESCALATION_ENTITY]
+        self.deployment_escalations = self._new_deployment_escalations()
+        self.deployment_escalations.hydrate(escalation_rows)
         # Host telemetry rollups/state ride a private stream: rebuild history and
         # put the latest record back on each host.
         metrics = []

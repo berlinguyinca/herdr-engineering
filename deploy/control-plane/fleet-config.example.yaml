@@ -26,6 +26,26 @@ sections:
       minio_password: "REDACTED"
       rustfs_bucket: "REDACTED"
       ci_actions: false             # true lets operators retry/cancel CI pipelines
+      # OPTIONAL: absolute path (as the web container sees it) to a checkout of InferWeave's
+      # deploy/pipelines/*.yaml. Read live. Absent: no definitions, and any host token may report
+      # deployment events for any component (the Deployments snapshot then carries a warning).
+      # Set but invalid: the last valid set stays in use; events are refused (503) only when no
+      # set was ever valid.
+      # NOTE: release evidence (the release asset's .commit and its ancestry on main) is NOT
+      # wired yet. Until it is, every permit answers false ("release not confirmed"), so a host
+      # updater with a gate URL (IW_DEPLOY_GATE_URL) freezes on its running version. Wire the
+      # evidence before enabling any host gate.
+      # deployment_definitions: "/srv/inferweave/deploy/pipelines"
+      # OPTIONAL: true enables the audited Deployments actions (POST /api/deployments/force and
+      # /ack, operator role). Read live; anything but true is off. Force only records a request the
+      # host updaters pick up; the host permit gate (GET /api/deployments/permit) works either way.
+      # A force never permits a release that is not confirmed (see the NOTE above).
+      deployment_actions: false
+      # OPTIONAL: side effects of a deployment failure escalation (all off by default). issues: a
+      # GitHub issue per software finding (needs github.token with issue write access).
+      # deployment_escalation:
+      #   issues: false
+      #   assistant: false
       # OPTIONAL: head-bound post-PR review quorum (GET /api/v1/graph/nodes/{pr}/review-quorum).
       # Principal ids are the server-side `key:<digest>` actors; omit the block to turn it off.
       # review_quorum:
