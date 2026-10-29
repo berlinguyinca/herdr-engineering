@@ -21,8 +21,18 @@ export class HerdrAppShell extends HTMLElement {
   }
 
   attributeChangedCallback() {
+    // A route list change (a page becoming unavailable, a capability arriving) rebuilds the nav: keep keyboard focus where it was.
+    const focused = this.shadowRoot.activeElement;
+    const focusKey = focused?.classList?.contains('hd-shell__menu') ? '.hd-shell__menu'
+      : focused?.getAttribute?.('data-path') ? `[data-path="${CSS.escape(focused.getAttribute('data-path'))}"]` : '';
     this._parse();
     this._render();
+    if (focusKey) {
+      const target = this.shadowRoot.querySelector(focusKey);
+      target?.focus();
+      // The rebuilt nav starts closed; a link hidden by that cannot hold focus, so the Menu button does.
+      if (this.shadowRoot.activeElement !== target) this.shadowRoot.querySelector('.hd-shell__menu')?.focus();
+    }
     if (this.isConnected) this._syncActive();
   }
 
@@ -147,7 +157,7 @@ const SHARED = `
   background: var(--surface); border: 1px solid var(--border-subtle); border-radius: var(--radius-sm); cursor: pointer; }
 .hd-shell__nav { display: flex; flex-direction: column; gap: 8px; padding: 8px 8px; flex: 1; }
 .hd-shell__group { display: flex; flex-direction: column; gap: 1px; }
-.hd-shell__group-label { padding: 0 10px 3px; font-size: .6875rem; letter-spacing: .06em; text-transform: uppercase; color: var(--text-tertiary, var(--text-secondary)); font-weight: 600; }
+.hd-shell__group-label { padding: 0 10px 3px; font-size: .6875rem; letter-spacing: .06em; text-transform: uppercase; color: var(--text-muted); font-weight: 600; }
 .hd-shell__link { display: flex; padding: calc(var(--density-row-padding, 8px) - 4px) 10px; line-height: 1.3; border-radius: var(--radius-sm);
   color: var(--text-secondary); text-decoration: none; font-size: 0.875rem; }
 .hd-shell__badge { margin-left: auto; min-width: 20px; padding: 0 6px; border-radius: 10px; font-size: .75rem; line-height: 20px; text-align: center; background: var(--accent-weak); color: var(--accent); font-weight: 600; }

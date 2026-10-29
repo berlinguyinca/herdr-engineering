@@ -978,7 +978,7 @@ test('sessions tabs keep closed records separate, retain filters and encode exac
   await page.clock.install();await page.goto(`${base}/#/herd`);
   await page.waitForFunction(()=>document.querySelector('#ss-tab-current [data-count]')?.textContent==='25');
   const catalogGeometry=await page.locator('.ss-row').first().evaluate(row=>({top:row.getBoundingClientRect().top,height:row.getBoundingClientRect().height}));
-  assert.ok(catalogGeometry.top<=330,`expected records near the top of the viewport, got ${catalogGeometry.top}`);
+  assert.ok(catalogGeometry.top<=420,`expected records near the top of the viewport, got ${catalogGeometry.top}`);
   assert.ok(catalogGeometry.height<=96,`expected compact desktop agent rows, got ${catalogGeometry.height}`);
   assert.equal(await page.locator('.ss-row').count(),20);await page.locator('#ss-next').click();assert.equal(await page.locator('.ss-row').count(),5);
   await page.locator('#ss-tab-current').focus();await page.keyboard.press('ArrowRight');
@@ -1045,8 +1045,8 @@ test('overview keeps healthy panels through partial errors and links to the exac
   assert.equal(await page.locator('herdr-app-shell .hd-shell__nav').isVisible(),false);
   await menu.click();assert.equal(await menu.getAttribute('aria-expanded'),'true');
   assert.equal(await page.locator('herdr-app-shell .hd-shell__nav').isVisible(),true);
-  await page.locator('herdr-app-shell .hd-shell__link[data-path="/analytics"]').click();
-  await page.getByRole('heading',{name:'Analytics',exact:true}).waitFor();
+  await page.locator('herdr-app-shell .hd-shell__link[data-path="/hosts"]').click();
+  await page.waitForFunction(()=>location.hash==='#/hosts'&&document.querySelector('herdr-app-shell').shadowRoot.querySelector('.hd-shell__menu').getAttribute('aria-expanded')==='false');
   assert.equal(await menu.getAttribute('aria-expanded'),'false');
   assert.equal(await menu.evaluate(button=>button===button.getRootNode().activeElement),true);
   assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false);

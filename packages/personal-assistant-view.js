@@ -35,49 +35,44 @@ export function mountPersonalAssistant(container, client, { onFreshness = () => 
     }
   };
 
+  // Only assistants that are on and not archived are offered; of those the three most recently changed lead, the rest wait
+  // behind "Show all". Nothing is archived or removed by this: it only decides what is listed.
+  const stamp = a => Date.parse(a.updated_at || a.created_at || '') || 0;
+  const isActive = a => a.enabled !== false && !/archiv|disabled|deleted/i.test(String(a.status || ''));
+  let showAll = false, configOpen = false, pending = [];
+  const offered = () => {
+    const active = state.assistants.filter(isActive).sort((x, y) => stamp(y) - stamp(x));
+    const list = showAll ? active : active.slice(0, 3);
+    const sel = state.assistants.find(a => a.assistant_id === state.selectedId);
+    return { list: sel && !list.includes(sel) ? [sel, ...list] : list, active: active.length, hidden: state.assistants.length - active.length };
+  };
+
   const draw = () => {
     const selected = state.assistants.find(a => a.assistant_id === state.selectedId);
+    const { list, active, hidden } = offered();
+    const more = active - list.length;
     container.innerHTML = `
-      <div class="hd-card" style="margin-bottom:16px">
-        <div class="hd-card__title">Personal Assistant</div>
-        <div class="hd-card__sub">Persistent, user-scoped assistant with policy-controlled tools, approvals and memory.</div>
-        <div class="pa-row" style="margin-top:10px">
-          <button class="hd-btn" data-new>+ New assistant</button>
-        </div>
+      <div class="pa-bar">
+        <label class="pa-pick">Assistant
+          <select data-select aria-label="Assistant">${list.map(a => `<option value="${esc(a.assistant_id)}" ${a.assistant_id === state.selectedId ? 'selected' : ''}>${esc(a.name)} · ${esc(statusLabel(a.status))}</option>`).join('')}</select></label>
+        ${more > 0 || showAll && active > 3 ? `<button class="hd-linkbtn" data-showall>${showAll ? 'Show recent only' : `Show all ${active}`}</button>` : ''}
+        <span class="pa-grow"></span>
+        <button class="hd-btn hd-btn--ghost" data-config aria-expanded="${configOpen}">Configure</button>
+        <button class="hd-btn" data-new>+ New</button>
       </div>
-      <div class="pa-shell">
-        <div class="pa-shell__side">
-          ${state.assistants.length ? state.assistants.map(a => `
-            <div class="pa-item ${a.assistant_id === state.selectedId ? 'pa-item--active' : ''}" data-pick="${esc(a.assistant_id)}">
-              <div class="pa-item__name">${esc(a.name)}</div>
-              <div class="pa-item__meta">${esc(a.status)} · model ${esc(a.model_policy)}</div>
-            </div>`).join('') : '<div class="pa-empty">No assistants yet. Create one to begin.</div>'}
-        </div>
-        <div class="pa-main">
-          <div class="pa-col">
-            ${selected ? `
-              <div class="hd-card">
-                <div class="pa-row">
-                  <div class="pa-status ${statusClass(selected.status)}"><span class="hd-status__dot"></span>${esc(statusLabel(selected.status))}</div>
-                  <span class="pa-muted">${esc(selected.assistant_id)}</span>
-                  <span class="pa-badge">${selected.enabled ? 'enabled' : 'disabled'}</span>
-                </div>
-                <div class="pa-tabs">
-                  ${['General', 'Permissions', 'Memory', 'Routines', 'Connectors', 'Delegations', 'Approvals', 'Diagnostics'].map(t =>
-                    `<button class="pa-tab ${state.tab === t ? 'pa-tab--active' : ''}" data-tab="${t}">${t}</button>`).join('')}
-                </div>
-                <div id="pa-panel">${renderPanel(selected)}</div>
-              </div>` : '<div class="hd-card"><div class="pa-empty">Select or create an assistant.</div></div>'}
-          </div>
-          <div class="pa-col">
-            ${selected ? renderChat(selected) : ''}
-          </div>
-        </div>
-      </div>`;
-
-    container.querySelectorAll('[data-pick]').forEach(el => el.addEventListener('click', () => {
-      state.selectedId = el.dataset.pick; draw();
-    }));
+      ${hidden ? `<p class="pa-muted pa-hidden-note">${hidden} inactive assistant${hidden === 1 ? '' : 's'} not listed.</p>` : ''}
+      ${selected ? `<div id="pa-strip" class="pa-strip" role="status" ${pending.some(ap => ap.assistant_id === selected.assistant_id) ? '' : 'hidden'}></div>` : ''}
+      ${selected ? renderChat(selected) : `<div class="hd-card"><div class="pa-empty">${state.assistants.length ? 'No active assistant. Use Show all, or create one.' : 'No assistants yet. Create one to begin.'}</div></div>`}
+      ${selected && configOpen ? `<section class="hd-card pa-config" aria-label="Configure ${esc(selected.name)}">
+        <div class="pa-row"><div class="pa-status ${statusClass(selected.status)}"><span class="hd-status__dot"></span>${esc(statusLabel(selected.status))}</div>
+          <span class="pa-muted">${esc(selected.assistant_id)}</span><span class="pa-badge">${selected.enabled ? 'enabled' : 'disabled'}</span></div>
+        <div class="pa-tabs">${['General', 'Permissions', 'Memory', 'Routines', 'Connectors', 'Delegations', 'Approvals', 'Diagnostics'].map(t =>
+          `<button class="pa-tab ${state.tab === t ? 'pa-tab--active' : ''}" data-tab="${t}">${t}</button>`).join('')}</div>
+        <div id="pa-panel">${renderPanel(selected)}</div></section>` : ''}`;
+    container.querySelector('[data-select]')?.addEventListener('change', e => { state.selectedId = e.target.value; draw(); });
+    container.querySelector('[data-showall]')?.addEventListener('click', () => { showAll = !showAll; draw(); });
+    container.querySelector('[data-config]')?.addEventListener('click', () => { configOpen = !configOpen; draw(); });
+    if (selected) drawApprovalStrip(selected);
     container.querySelectorAll('[data-tab]').forEach(el => el.addEventListener('click', () => {
       state.tab = el.dataset.tab; draw();
     }));
@@ -90,6 +85,26 @@ export function mountPersonalAssistant(container, client, { onFreshness = () => 
     const panel = container.querySelector('#pa-panel');
     if (panel) bindPanel(panel, selected);
     bindChat(container, selected);
+  };
+
+  // Waiting approvals are the one thing a person must act on here, so they sit above the conversation rather than in a tab.
+  const drawApprovalStrip = async (a) => {
+    try {
+      const { approvals = [] } = await client.listApprovals();
+      pending = approvals.filter(ap => ap.decision === 'pending');
+      const mine = pending.filter(ap => ap.assistant_id === a.assistant_id);
+      const strip = container.querySelector('#pa-strip');
+      if (!strip) return;
+      strip.hidden = !mine.length;
+      strip.innerHTML = mine.map(ap => `<div class="pa-row"><span><strong>Approval needed</strong> · ${esc(ap.policy_snapshot)}</span><span class="pa-grow"></span>
+        <button class="hd-btn hd-btn--sm" data-strip-approve="${esc(ap.approval_id)}">Approve</button>
+        <button class="hd-btn hd-btn--danger hd-btn--sm" data-strip-deny="${esc(ap.approval_id)}">Deny</button></div>`).join('');
+      strip.querySelectorAll('[data-strip-approve],[data-strip-deny]').forEach(b => b.addEventListener('click', async () => {
+        const id = b.dataset.stripApprove || b.dataset.stripDeny;
+        try { await client.decideApproval(id, b.dataset.stripApprove ? 'approved' : 'denied'); } catch { /* the strip refreshes below */ }
+        drawApprovalStrip(a);
+      }));
+    } catch { /* approvals unavailable: the Approvals tab reports it */ }
   };
 
   const renderPanel = (a) => {

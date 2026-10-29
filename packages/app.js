@@ -833,6 +833,7 @@ async function viewSession(parts, revision) {
       <a href="#/herd?tab=${terminal ? outcome : 'current'}">← Agents</a>
       ${liveHead(`<h1 class="sd-title">${esc(clip(s.display_name || s.agent_role) || 'Agent')}${project ? ` · ${esc(clip(project))}` : ''}</h1>`)}
       <div class="sd-head"><strong data-session-head><span data-session-status>${esc(sessionStatusText(s))}</span> · <span data-session-updated>${esc(formatTimestamp(s.updated_at))}</span></strong><span class="sd-meta">${esc(s.host_id || 'Host not reported')} · ${esc(s.model || 'Model not reported')}</span></div>
+       ${terminal ? `<p class="sd-meta">${outcome === 'failed' ? 'Failed' : 'Finished'} agent · recorded inspection remains available.</p>` : ''}
        <div id="session-story"></div>
       ${s.mission_id || s.mission_key ? `<p class="sd-meta" id="session-mission">Mission association not resolved · ${esc(s.mission_key || s.mission_id)}</p>` : ''}
       <div id="related-panel"></div>
