@@ -223,3 +223,10 @@ test('a failed pull-request run is dropped once main passed a run that names the
   ]);
   assert.deepEqual(out.map(x => x.record.branch), ['other']);
 });
+
+test('a pass on another pull request does not clear a failing pull request', async () => {
+  const { unresolvedCiFailures } = await import('../overview-view.js');
+  const run = (state, at, ref) => ({ tab: state === 'failure' ? 'failed' : 'finished', record: { repository: 'r', branch: 'main', event: 'pull_request', state, updated_at: at, ref } });
+  const out = unresolvedCiFailures([run('success', '2026-10-28T12:00:00Z', 'refs/pull/9/head'), run('failure', '2026-10-28T09:00:00Z', 'refs/pull/8/head')]);
+  assert.equal(out.length, 1);
+});

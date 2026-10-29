@@ -166,7 +166,7 @@ export function mountSessionsView(container,client,{tab='current'}={}) {
     {
       const live=state.tab==='current'&&loaded?all.filter(e=>e.tab==='current'&&(!state.host||e.host===state.host)):[];
       const model=lineageModel(live,handoffs.edges,handoffs.nodes);
-      const sig=JSON.stringify(model);
+      const sig=JSON.stringify({...model,t0:Math.floor(model.t0/60000),t1:Math.floor(model.t1/60000)});
       if(sig!==lineageSig){lineageSig=sig;renderLineage(el('lineage'),model);}
     }
     const noModel=loaded && selected.length>0 && !selected.some(e=>text(e.record.model));

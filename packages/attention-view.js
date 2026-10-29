@@ -62,27 +62,6 @@ function resolvedRow(item, now) {
     <p class="at-meta">${esc(KINDS[item.kind] || text(item.kind))} · resolved ${when}</p></div></li>`;
 }
 
-const GROUP_AT = 12;        // a short inbox stays one flat list
-const SHOW_PER_BUCKET = 5;
-const SEV_RANK = { critical: 0, warning: 1, info: 2 };
-/** A long inbox, grouped by severity and kind: the first few of each group, the rest behind "Show N more". */
-function bucketed(items, render) {
-  const buckets = new Map();
-  for (const i of items) {
-    const k = `${i.severity}|${i.kind}`;
-    if (!buckets.has(k)) buckets.set(k, []);
-    buckets.get(k).push(i);
-  }
-  const order = [...buckets.entries()].sort(([a, x], [b, y]) => (SEV_RANK[a.split('|')[0]] ?? 3) - (SEV_RANK[b.split('|')[0]] ?? 3) || y.length - x.length);
-  return order.map(([k, rows]) => {
-    const [sev, kind] = k.split('|');
-    const head = rows.slice(0, SHOW_PER_BUCKET), rest = rows.slice(SHOW_PER_BUCKET);
-    return `<section class="at-b" aria-label="${esc(`${sev} ${KINDS[kind] || kind}`)}"><h2 class="at-bucket">${esc(sev)} · ${esc(KINDS[kind] || text(kind))} <small>${rows.length}</small></h2>
-      <ul class="at-list">${head.map(render).join('')}</ul>
-      ${rest.length ? `<details class="at-more"><summary>Show ${rest.length} more</summary><ul class="at-list">${rest.map(render).join('')}</ul></details>` : ''}</section>`;
-  }).join('');
-}
-
 function group(label, items, render, open = false) {
   if (!items.length) return '';
   return `<details class="at-group" ${open ? 'open' : ''}><summary>${esc(label)} (${items.length})</summary><ul class="at-list">${items.map(render).join('')}</ul></details>`;

@@ -46,12 +46,12 @@ export function overviewModel(data = {}, received = Date.now(), now = Date.now()
 // A failed CI run only matters until a later run of the same repository and branch has passed.
 const PASSED=['success','passed','finished','complete','completed'];
 export function unresolvedCiFailures(entries) {
-  const passedAt=new Map(), key=r=>`${r.repository || ''}\u0000${r.branch || ''}`, when=r=>integrationTimestamp(r.updated_at || r.created_at);
+  const prOf=r=>/^refs\/pull\/(\d+)\//.exec(r.ref || '')?.[1] || '', passedAt=new Map(), key=r=>`${r.repository || ''}\u0000${prOf(r) ? `pr${prOf(r)}` : r.branch || ''}`, when=r=>integrationTimestamp(r.updated_at || r.created_at);
   for(const e of entries)if(PASSED.includes(String(e.record.state || e.record.status || '').toLowerCase()))passedAt.set(key(e.record),Math.max(passedAt.get(key(e.record)) || 0,when(e.record)));
   // The server marks runs of merged pull requests (pr_merged); failing that, a passing run on the default branch whose message names the pull request ("... (#123)") closes that PR's failures.
   const merged=new Set();
   for(const e of entries)if(PASSED.includes(String(e.record.state || e.record.status || '').toLowerCase()) && /^(main|master)$/.test(e.record.branch || ''))
-    for(const m of String(e.record.message || e.record.title || '').matchAll(/#(\d+)/g))merged.add(`${e.record.repository || ''}#${m[1]}`);
+    for(const m of String(e.record.message || e.record.title || '').matchAll(/\(#(\d+)\)/g))merged.add(`${e.record.repository || ''}#${m[1]}`);
   const pr=r=>/^refs\/pull\/(\d+)\//.exec(r.ref || '')?.[1] || (String(r.event || '')==='pull_request' ? /^(\d+)$/.exec(String(r.pull_request ?? ''))?.[1] : null);
   return entries.filter(e=>e.tab==='failed' && !((passedAt.get(key(e.record)) || 0) > when(e.record)) && !e.record.pr_merged && !merged.has(`${e.record.repository || ''}#${pr(e.record)}`));
 }
@@ -346,7 +346,7 @@ export function mountOverview(container, client, { freshness = () => null } = {}
     if(!source)return;
     // A refresh that failed after data had loaded (a rate limit, a blip) does not bring an empty card back.
     const ready=states[source]?.loaded;
-    const empty=ready && !element.querySelector('.ov-row,.ov-warning:not(.ov-stale),[data-skeleton],herdr-error') && [...element.querySelectorAll('.ov-metric strong')].every(n=>/^[0—]$/.test(n.textContent.trim()));
+    const empty=ready && !element.querySelector('.ov-row,.ov-warning:not(.ov-stale),[data-skeleton],herdr-error') && (m=>m.length>0 && m.every(n=>/^[0—]$/.test(n.textContent.trim())))([...element.querySelectorAll('.ov-metric strong')]) && !/\b[1-9]\d*\s+(unavailable|unconfirmed|failed|archived)/i.test([...element.querySelectorAll('.ov-note')].map(n=>n.textContent).join(' '));
     if(empty)element.setAttribute('data-empty','');else element.removeAttribute('data-empty');
   }
   function draw() {

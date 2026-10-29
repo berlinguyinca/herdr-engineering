@@ -50,7 +50,7 @@ export function mountPersonalAssistant(container, client, { onFreshness = () => 
   const draw = () => {
     const selected = state.assistants.find(a => a.assistant_id === state.selectedId);
     const { list, active, hidden } = offered();
-    const more = active - list.length;
+    const more = Math.max(0, active - list.filter(isActive).length);
     container.innerHTML = `
       <div class="pa-bar">
         <label class="pa-pick">Assistant
@@ -91,6 +91,7 @@ export function mountPersonalAssistant(container, client, { onFreshness = () => 
   const drawApprovalStrip = async (a) => {
     try {
       const { approvals = [] } = await client.listApprovals();
+      if (state.selectedId !== a.assistant_id) return;     // the picker moved on while this was in flight
       pending = approvals.filter(ap => ap.decision === 'pending');
       const mine = pending.filter(ap => ap.assistant_id === a.assistant_id);
       const strip = container.querySelector('#pa-strip');

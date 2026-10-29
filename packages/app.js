@@ -130,7 +130,6 @@ function renderSubnav() {
   SUBNAV.hidden = listed.length < 2;
   SUBNAV.innerHTML = listed.map(([p, label]) => `<a href="#${p}"${p === current ? ' aria-current="page"' : ''}>${label}</a>`).join('');
 }
-window.addEventListener('hashchange', renderSubnav);
 function currentNavPath() {
   const path = routePath();
   return NAV.find((e) => [e.path, ...(e.match || [])].some((p) => path === p || path.startsWith(p + '/')))?.path || '';
