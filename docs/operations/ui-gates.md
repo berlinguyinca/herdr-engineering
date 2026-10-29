@@ -50,7 +50,8 @@ start real Python servers, launch Chromium and push 10,000-node graphs with 600 
 | Surface | Gate |
 |---|---|
 | Rooms, chat, tabs, remote agent tabs (T08, T10) | accessibility audit (light and dark, owner and viewer), tablist arrow keys, no tab trap, screenshot at 3 viewports x 2 schemes |
-| Lineage, Gantt, replay (T09) | keyboard graph (one Tab stop, arrow keys), table alternative above the draw cap, replay by keyboard, stale-evidence edges drawn differently, perf at 2k to 10k nodes |
+| Mission Workbench (S5): inspector facts, pan/zoom/focus, status strip, 64-session chain, 1500 nodes, 375 and 320px | `ui-gates-workbench.test.mjs` on the `workbench` fixture (`real_server.py`), screenshots `collab-workbench*` |
+| Lineage, Gantt, replay (T09) | keyboard graph (one Tab stop, arrow keys), bounded graph viewport (at most 240 nodes drawn at any zoom) with the table alternative, replay by keyboard, stale-evidence edges drawn differently, perf at 2k to 10k nodes |
 | Comments, steering, forks (T12, T13) | keyboard-only comment, propose redirect, propose fork, owner confirms what was proposed by someone else; focus is never dropped to the body |
 | Proposals and quarantine (T11) | untrusted content is inert (hostile markup is text), reject by keyboard through the confirm dialog, focus kept |
 | Context, consult, links (T14) | audit, 320px reflow with 300-character unbroken labels, screenshot |
@@ -165,8 +166,10 @@ treat the numbers as an upper bound and re-measure on an idle machine or the CI 
 | 10,000 | 3.4 s | 896 ms | 458 / 1197 ms | 22 / 32 ms | 2 (323 ms) | 8 MB |
 
 (An earlier run on the same loaded host gave first renders of 473, 394 and 988 ms and key-to-frame p95 of 38, 108 and 40 ms; the
-spread between runs is the host load.) The first page is about 147 KB (200 nodes drawn as SVG). Above 300 loaded nodes the SVG is
-skipped (the page says "more than the 300 drawn") and the table alternative is shown, at most 1000 rows per table.
+spread between runs is the host load.) The first page is about 147 KB. These figures were measured when the SVG was skipped above 300
+loaded nodes; since the Mission Workbench change (S5) the graph is a viewport that draws at most 240 nodes and 480 links at any zoom, the
+table alternative is still at most 1000 rows per table, and the layout is cached by content (a pan, zoom or selection never lays it out
+again). The figures above have not been re-measured for the viewport.
 
 Before the fixes below, typing in the lineage filter took p50 482 ms / p95 611 ms per key at 2,000 nodes and p95 2417 ms at 10,000.
 

@@ -504,22 +504,33 @@ Times are server receipt times; the emitter's claim (`occurred_at`, which falls 
 offers it as a separate choice. Nothing is inferred from chat, layout or timing, and no progress is invented.
 
 ### UI and accessibility
-Graph (layered SVG, no library), table view of the same data (always available; the only view above 300 nodes), Gantt (SVG +
+Graph (layered SVG viewport, no library; pan, zoom, fit, focus-lineage, only the nodes in view are in the DOM, at most 240 nodes and 480 links at any
+zoom), table view of the same data (always available, at most 1000 rows per table), Gantt (SVG +
 table), replay (range slider with spoken `aria-valuetext`, step buttons, Live), filters (search, node type, link type, state),
-inspector (read-only: fields, attributes as text, links in/out, state history, provenance). Keyboard: one tab stop in the graph,
-arrows/Home/End between nodes, Enter selects, Escape clears; arrow keys switch Graph/Gantt tabs. Nothing is encoded by colour alone:
+inspector (read-only: a Summary of measured facts, then fields, attributes as text, links in/out, state history, provenance).
+The Summary shows the mission status, blockers, next action, linked artifact versions and digests, the PR / CI / review within two links, the
+upstream and downstream counts and, for a session or a handoff record, the handoff from/to, checkpoint sha and cause. Each is taken from a node,
+an edge or an attribute of the response (`attrs.next_action`, `attrs.blockers`, `blocked_by` edges, `attrs.version_number`, `attrs.content_digests`,
+the handoff edge's `attrs.handoff_id` / `cause` and the handoff node's `attrs.checkpoint_sha`); a field the response does not carry reads
+"not reported". Nothing is estimated and no percentage is shown. An artifact's storage location (`uri`, `url`, `path`, `bucket`, `blob`...) is
+never printed. A status strip above the controls counts nodes by state and lists failed or blocked nodes and gates waiting for approval, so a
+phone shows status, attention and approvals first. Keyboard: one tab stop in the graph, arrows/Home/End between nodes (the view follows the
+focused node), Enter selects, Escape clears; + and - zoom, 0 fits, Shift+arrows (or arrows on the graph itself) pan; arrow keys switch Graph/Gantt tabs.
+Pointer: drag pans, the wheel with Ctrl, Cmd or Alt zooms (a plain wheel scrolls the page). Live and Replay are a word and a glyph in the replay bar. Nothing is encoded by colour alone:
 node types differ by shape, link types by dash pattern and a text tag (`stale` is struck through and says so), states by glyph and word,
 Gantt states by fill pattern and label, head changes by a letter. No animation (so nothing to reduce); forced-colors supported.
 Every id, label, attribute and reason is escaped for text and attribute contexts (unit and browser tested with hostile values).
 
 ### Not in this task / limitations
-- Click-to-inspect terminal is NOT offered (needs `authorize_workspace`; the inspector says so). No comments, fork, steer or retry.
+- Terminal click-through: the standalone page offers no terminal (the inspector says so). On the operator dashboard, for a `session:<id>` node whose id the
+  dashboard itself lists, the inspector links to `/#/herd/session/<id>`, the existing page whose Terminal button is the authorized route
+  (`docs/operations/terminal-attach.md`: operator only, live sessions only). The room's `authorize_workspace` terminal action is not used by this page.
 - T05 (canonical GitHub issue/PR linking and reconciliation) is not built: issue/PR nodes and `issue_link` edges are drawn when an
   emitter sends them, but no canonicalisation or reconciliation exists yet. T06's `review_quorum.py` is on this stack
   (see "Head-bound review quorum"); stale/head-change come from the T02 projection's own flags.
 - Replay cost is the reader's visible prefix (see budgets); beyond 25,000 visible events a past position answers 400. A busy room needs
-  the snapshot table mentioned above. Not load-tested at that size. No visual-regression suite exists; layout is checked by
-  unit tests and a browser smoke run against a mocked API plus one real-HTTP pytest of the routes, not by screenshots.
+  the snapshot table mentioned above. Not load-tested at that size. Layout is checked by unit tests, real-page gates
+  (`tests/playwright/ui-gates-workbench.test.mjs`, a 64-session chain and a 1500-node graph) and screenshot baselines (`collab-lineage*`, `collab-workbench*`).
 - There is no separate review/CI phase model. PR, review and CI objects appear as lanes of their node types (state spans from
   `node.state`), `reviewed`/`validated` edges as markers, and revision changes as `head_change` markers; nothing else is inferred.
 - The inspector shows the node as of the chosen position, from the page's own response; it does not fetch `graph/nodes/{id}`.
