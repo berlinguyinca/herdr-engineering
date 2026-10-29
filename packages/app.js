@@ -104,6 +104,20 @@ const SECTION_TABS = [
 ];
 
 const SHELL = document.getElementById('shell');
+// A page is listed only while it works. `hd-freshness` reports each page's last load: a missing backend (404/501, "not enabled",
+// "disabled") marks that exact page or tab, a later success clears it, and timeouts or other errors never mark anything (they are
+// transient). Only a page's own route counts: a detail route (/missions/x, /hosts/y) failing says nothing about its section. A
+// sidebar entry disappears only when its own page and every tab of its section are marked, and a marked tab drops out of the tab
+// strip. "Show unavailable" in the display footer lists everything again. Last-known state lives in localStorage.
+const UNAVAILABLE_KEY = 'herdr-unavailable-pages';
+let capabilities = [];
+let unavailable = new Set();
+let showUnavailable = false;
+try { unavailable = new Set(JSON.parse(window.localStorage.getItem(UNAVAILABLE_KEY) || '[]')); } catch { /* Nothing is hidden then. */ }
+const MISSING = /not found|\b(404|501)\b|not implemented|not enabled|is disabled/i;
+const routePath = () => (window.location.hash.replace(/^#/, '') || '/overview').split('?')[0];
+const KNOWN_PAGES = new Set([...NAV.flatMap((e) => [e.path, ...(e.match || [])]), ...SECTION_TABS.flat().map(([p]) => p)]);
+const entryPages = (entry) => [entry.path, ...(entry.match || [])].filter((p) => KNOWN_PAGES.has(p));
 const SUBNAV = document.getElementById('subnav');
 function renderSubnav() {
   const path = (window.location.hash.replace(/^#/, '') || '/overview').split('?')[0];
@@ -112,35 +126,31 @@ function renderSubnav() {
   // The longest matching path wins, so /github/projects is not also an active "Issues" tab.
   const current = tabs.map(([p]) => p).filter((p) => path === p || path.startsWith(p + '/')).sort((x, y) => y.length - x.length)[0];
   SUBNAV.hidden = false;
-  SUBNAV.innerHTML = tabs.map(([p, label]) => `<a href="#${p}"${p === current ? ' aria-current="page"' : ''}>${label}</a>`).join('');
+  const listed = tabs.filter(([p]) => showUnavailable || p === current || !unavailable.has(p));
+  SUBNAV.hidden = listed.length < 2;
+  SUBNAV.innerHTML = listed.map(([p, label]) => `<a href="#${p}"${p === current ? ' aria-current="page"' : ''}>${label}</a>`).join('');
 }
 window.addEventListener('hashchange', renderSubnav);
-renderSubnav();
-// A page is listed only while it works. `hd-freshness` reports each page's last load: a missing backend (404/501) hides its nav
-// entry on the next paint, a later success restores it, and timeouts or other errors never hide anything (they are transient).
-// "Show unavailable" in the display footer lists the hidden ones again. Last-known state lives in localStorage.
-const UNAVAILABLE_KEY = 'herdr-unavailable-pages';
-let capabilities = [];
-let unavailable = new Set();
-let showUnavailable = false;
-try { unavailable = new Set(JSON.parse(window.localStorage.getItem(UNAVAILABLE_KEY) || '[]')); } catch { /* Nothing is hidden then. */ }
-const MISSING = /not found|\b(404|501)\b|not implemented|not enabled|is disabled/i;
 function currentNavPath() {
-  const path = (window.location.hash.replace(/^#/, '') || '/overview').split('?')[0];
+  const path = routePath();
   return NAV.find((e) => [e.path, ...(e.match || [])].some((p) => path === p || path.startsWith(p + '/')))?.path || '';
 }
 function navRoutes() {
   const list = visibleNav(NAV, capabilities);
-  return showUnavailable ? list : list.filter((entry) => !unavailable.has(entry.path) || entry.path === currentNavPath());
+  if (showUnavailable) return list;
+  const here = currentNavPath();
+  return list.filter((entry) => entry.path === here || !entryPages(entry).every((p) => unavailable.has(p)));
 }
 function applyRoutes() {
   const routes = JSON.stringify(navRoutes());
   if (routes !== SHELL.getAttribute('routes')) SHELL.setAttribute('routes', routes);
   const toggle = document.getElementById('show-unavailable');
   if (toggle) { toggle.hidden = !unavailable.size; toggle.textContent = showUnavailable ? 'Hide unavailable' : `Show unavailable (${unavailable.size})`; }
+  renderSubnav();
 }
-function markAvailability(path, ok, message) {
-  if (!path || path === '/overview' || path === '/attention') return;
+function markAvailability(ok, message) {
+  const path = routePath();
+  if (!KNOWN_PAGES.has(path) || path === '/overview' || path === '/attention') return;
   const missing = !ok && MISSING.test(message || '');
   if (!ok && !missing) return;
   if (missing === unavailable.has(path)) return;
@@ -148,13 +158,14 @@ function markAvailability(path, ok, message) {
   try { window.localStorage.setItem(UNAVAILABLE_KEY, JSON.stringify([...unavailable])); } catch { /* Kept for this page only. */ }
   applyRoutes();
 }
-root.addEventListener('hd-freshness', (event) => markAvailability(currentNavPath(), event.detail.ok, event.detail.message));
+root.addEventListener('hd-freshness', (event) => markAvailability(event.detail.ok, event.detail.message));
 {
   const toggle = document.createElement('button');
   toggle.type = 'button'; toggle.id = 'show-unavailable'; toggle.slot = 'controls'; toggle.hidden = true; toggle.className = 'hd-linkbtn';
   toggle.addEventListener('click', () => { showUnavailable = !showUnavailable; applyRoutes(); });
   SHELL.append(toggle);
 }
+window.addEventListener('hashchange', applyRoutes);   // the entry you are on stays listed; leaving it lets it go
 applyRoutes();
 // Optional tabs appear once /api/v1/health advertises their capability; a failed probe keeps them hidden.
 client.health().then((h) => { capabilities = h?.capabilities || []; applyRoutes(); }).catch(() => { /* optional tabs stay hidden */ });

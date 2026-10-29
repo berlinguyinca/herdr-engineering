@@ -22,13 +22,13 @@ ul{color:var(--muted);padding-left:20px}li{margin:3px 0}b{color:var(--text)}
 <figure><img src="img/new-agent-detail.jpg" alt="Agent detail with a start-to-now story"><figcaption>The story reads: started (or "started by handoff from X: goal"), each handoff out, and the last report. The permanent disclaimer is gone; finished and failed agents keep their one line.</figcaption></figure>
 
 <h2>Assistant: chat first</h2>
-<figure><img src="img/new-assistant.jpg" alt="Assistant page: picker, chat"><figcaption>Active assistants only, the three most recent, the rest behind “Show all”. A pending approval appears as a strip above the conversation.</figcaption></figure>
+<figure><img src="img/new-assistant.jpg" alt="Assistant page: picker, chat"><figcaption>Active assistants only, the three most recent, the rest behind “Show all”. A pending approval is meant to appear as a strip above the conversation; that strip was not seen working in these captures (the stub did not match), so it is unverified here.</figcaption></figure>
 <figure><img src="img/new-assistant-config.jpg" alt="Assistant with Configure open"><figcaption>Settings (permissions, memory, routines, connectors, delegations, approvals, diagnostics) sit behind Configure. Nothing is archived or deleted.</figcaption></figure>
 
 <h2>Also changed</h2>
 <ul>
-<li><b>Navigation:</b> 25 entries became 14 in six groups. Topology, Scheduling and Activity are no longer separate entries (tabs of Hosts and Attention, or reachable by link).</li>
-<li><b>Only what works:</b> a page whose backend answers 404/501, “not enabled” or “disabled” disappears from the sidebar; a later success brings it back. “Show unavailable (N)” lists them. Timeouts never hide anything.</li>
+<li><b>Navigation:</b> 25 entries became at most 14 in five groups (Monitor, Agents, Fabric, Delivery, Code); production shows 12 because Architecture and Project intelligence are switched off there. Missions and Handoffs are tabs of Agents, Scheduling of Hosts, Activity of Attention, Analytics of Usage. Topology is no longer listed (its address still works).</li>
+<li><b>Only what works:</b> a page or tab whose backend answers 404/501, “not enabled” or “disabled” is marked, and a later success clears it. A marked tab leaves its tab strip; a sidebar entry disappears only when its own page and every tab of its section are marked. Detail pages (a missing mission, a missing host) never mark anything, and neither do timeouts. “Show unavailable (N)” lists everything again.</li>
 <li><b>Collaboration:</b> Chat, Tasks, Agents and Lineage lead; Flow, Tabs, Attention, Progress, Workspaces, Proposals and People are quieter tabs (all still reachable). An idle Helpers panel is one line; “New room” folds once rooms exist.</li>
 </ul>
 <div class="n"><b>Not done:</b> Overview is unchanged; Usage merges LLM and Analytics only as tabs, not one page; the collaboration room has not been viewed against a live server in this pass; the chat conversation composer's 13-button toolbar is untouched. Handoff data in production was empty (0 edges), so arrows appear only once handoffs exist.</div>

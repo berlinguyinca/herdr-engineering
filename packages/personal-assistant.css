@@ -46,11 +46,11 @@
   .pa-msg { font-size: 14px; }
 }
 /* Chat first: one bar to pick an assistant, an approvals strip when something waits, the conversation, then an optional Configure card. */
-.pa-bar { display: flex; flex-wrap: wrap; align-items: end; gap: 10px; margin-bottom: 8px; }
+.pa-bar { display: flex; flex-wrap: wrap; align-items: end; gap: 8px; margin-bottom: 8px; }
 .pa-pick { display: flex; flex-direction: column; gap: 4px; font-size: .75rem; color: var(--text-secondary); }
-.pa-pick select { font: inherit; min-width: 240px; padding: 7px 9px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--surface); color: var(--text); }
+.pa-pick select { font: inherit; min-width: 240px; padding: 8px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--surface); color: var(--text); }
 .pa-grow { flex: 1; }
 .pa-hidden-note { font-size: .75rem; margin: 0 0 8px; }
-.pa-strip { border: 1px solid var(--status-attention); background: var(--surface); border-radius: var(--radius); padding: 8px 12px; margin-bottom: 10px; display: flex; flex-direction: column; gap: 6px; }
+.pa-strip { border: 1px solid var(--status-attention); background: var(--surface); border-radius: var(--radius); padding: 8px 12px; margin-bottom: 8px; display: flex; flex-direction: column; gap: 4px; }
 .pa-strip[hidden] { display: none; }
 .pa-config { margin-top: 14px; }
