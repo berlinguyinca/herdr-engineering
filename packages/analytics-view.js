@@ -59,6 +59,20 @@ function dashboard({ missions, models, hosts }) {
     </div>`;
 }
 
+// The fleet and missions figures that sit under the model usage on the Usage page: four tiles and the way to the detail pages.
+export function usageStrip({ missions = {}, models = {}, hosts = {} } = {}) {
+  const modelCount = Object.keys(models.models || {}).length;
+  const tile = (label, value, note) => `<div class="us-tile"><span class="us-label">${esc(label)}</span><strong>${esc(value)}</strong><span class="us-note">${esc(note)}</span></div>`;
+  return `<style>.us-strip{margin:32px 0 0}.us-strip h2{font-size:14px;margin:0 0 12px}.us-tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:16px}
+.us-tile{display:flex;flex-direction:column;gap:4px;padding:12px 16px;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius)}.us-tile strong{font-size:20px}.us-label,.us-note{font-size:12px;color:var(--text-secondary)}
+.us-links{display:flex;flex-wrap:wrap;gap:8px 24px;margin:16px 0 0;font-size:13px}</style>
+  <section class="us-strip" data-usage-strip aria-label="Missions and fleet"><h2>Missions and fleet</h2><div class="us-tiles">
+    ${tile('Missions', missions.total ?? 0, `${missions.completed ?? 0} completed · ${missions.completion_rate ?? 0}%`)}
+    ${tile('Hosts healthy', hosts.healthy ?? 0, `${hosts.unavailable ?? 0} unavailable of ${hosts.total ?? 0}`)}
+    ${tile('Models in use', modelCount, `${models.total_sessions ?? 0} agent sessions`)}</div>
+    <nav class="us-links" aria-label="More usage detail"><a href="#/analytics/models">Models</a><a href="#/analytics/hosts">Hosts</a><a href="#/analytics/tokens">Token usage</a><a href="#/analytics/stages">Stage timings</a><a href="#/analytics/usage">Resources</a></nav></section>`;
+}
+
 function modelsPage({ models: { models, total_sessions } }) {
   return `<p>${field('models.total_sessions', total_sessions, 'span')} total agents</p><div class="hd-grid">` +
     Object.entries(models || {}).map(([model, u]) => `
@@ -145,7 +159,7 @@ const changeKey = (el) => el.closest('herdr-metric')?.getAttribute('label') ?? e
 
 export function mountAnalytics(container, client, sub = '', { data = null } = {}) {
   const page = PAGES[sub] ? sub : '';
-  container.innerHTML = `<div class="hd-live-head" style="display:flex;flex-wrap:wrap;align-items:baseline;gap:12px"><h1>${TITLES[page]}</h1><herdr-freshness interval="5000"></herdr-freshness></div><div data-analytics-body></div>`;
+  container.innerHTML = `${page ? '<p class="llm-note" style="font-size:13px"><a href="#/llm">← Usage</a></p>' : ''}<div class="hd-live-head" style="display:flex;flex-wrap:wrap;align-items:baseline;gap:12px"><h1>${TITLES[page]}</h1><herdr-freshness interval="5000"></herdr-freshness></div><div data-analytics-body></div>`;
   const body = container.querySelector('[data-analytics-body]');
   // A refresh that changed a value flashes that cell (a single number counts up); the first paint
   // and identical refreshes do not. morph keeps counter and table-cell nodes, so they pair by node;
