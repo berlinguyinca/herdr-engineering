@@ -62,38 +62,87 @@ def migration_plan(lease: ExecutionLease, *, destination_host_uid: str, dirty: b
 class RecoveryCoordinator:
     """Coordinates certified checkpoint moves without retrying uncertain writers."""
 
-    def __init__(self, *, store, resumes):
+    def __init__(self, *, store, resumes, migration_enabled=False, runtime=None, journal=None):
         self.store = store
         self.resumes = resumes
         self.fence = Fence()
         self._uncertain: set[str] = set()
+        self.migration_enabled = migration_enabled
+        self.runtime = runtime
+        self.journal = journal
 
     def migrate(self, lease: ExecutionLease, *, family: str, version: str,
-                owner_id: str, destination_host_uid: str, payload: bytes) -> dict:
+                owner_id: str, destination_host_uid: str, payload: bytes | None = None) -> dict:
         reasons = []
+        if not self.migration_enabled:
+            reasons.append("MIGRATION_DISABLED")
         if not self.resumes.certified(family, version):
             reasons.append("RESUME_CONTRACT_UNCERTIFIED")
         if not lease.checkpoint_capable:
             reasons.append("CHECKPOINT_UNSUPPORTED")
+        operations = ("quiesce", "checkpoint", "stop_origin", "fenced", "acquire_destination", "restore", "verify")
+        if self.runtime is None or not all(callable(getattr(self.runtime, operation, None)) for operation in operations):
+            reasons.append("RUNTIME_RECOVERY_UNAVAILABLE")
+        elif getattr(self.runtime, "family", None) != family or getattr(self.runtime, "version", None) != version:
+            reasons.append("RESUME_VERSION_MISMATCH")
+        if self.journal is None:
+            reasons.append("DURABLE_RECOVERY_REQUIRED")
         if reasons:
             return {"state": "blocked", "reason_codes": reasons,
                     "agent_id": lease.agent_id, "source_host_uid": lease.host_uid,
                     "destination_host_uid": destination_host_uid}
-        manifest = self.store.put(checkpoint_id=f"cp-{lease.agent_id}-{lease.generation}",
-                                  owner_id=owner_id, agent_id=lease.agent_id,
-                                  lease=lease, payload=payload)
-        self.fence.adopt(lease)
-        self.fence.revoke(lease)
-        destination = self.fence.acquire(lease.agent_id, destination_host_uid,
-                                          checkpoint_capable=True)
-        return {"state": "restoring", "agent_id": lease.agent_id,
-                "checkpoint_id": manifest.checkpoint_id,
-                "destination_host_uid": destination_host_uid,
-                "destination_generation": destination.generation,
-                "source_generation": lease.generation}
+        operation_id = f"{lease.agent_id}:{lease.generation}:{destination_host_uid}"
+        record = {"operation_id": operation_id, "state": "migration_requested",
+                  "agent_id": lease.agent_id, "owner_id": owner_id,
+                  "source_host_uid": lease.host_uid, "source_generation": lease.generation,
+                  "destination_host_uid": destination_host_uid}
+        with self.journal.operation(operation_id) as existing:
+            if existing is not None:
+                # Interrupted submissions require reconciliation, never replay
+                # non-idempotent stop/restore operations from their beginning.
+                return {**existing, "state": existing["state"] if existing["state"] in {
+                    "migration_completed", "blocked"} else "reconciling"}
+            self.journal.record(operation_id, record)
+            stopped = False
+            try:
+                if self.runtime.quiesce(lease).get("safe") is not True:
+                    record.update(state="blocked", reason_codes=["COMMAND_IN_FLIGHT"])
+                    return self.journal.record(operation_id, record)
+                record["state"] = "checkpointing"
+                self.journal.record(operation_id, record)
+                captured = self.runtime.checkpoint(lease)
+                manifest = self.store.put(checkpoint_id=f"cp-{lease.agent_id}-{lease.generation}",
+                    owner_id=owner_id, agent_id=lease.agent_id, lease=lease, payload=captured)
+                verified = self.store.get(manifest.checkpoint_id, owner_id=owner_id, expected_lease=lease)
+                record.update(checkpoint_id=manifest.checkpoint_id, state="draining")
+                self.journal.record(operation_id, record)
+                # From submission of stop onward, assume origin state uncertain
+                # until both supervised termination and durable fencing prove it.
+                stopped = True
+                proof = self.runtime.stop_origin(lease)
+                if proof.get("stop_verified") is not True or self.runtime.fenced(lease) is not True:
+                    record.update(state="reconciling", reason_codes=["STOP_UNVERIFIED"])
+                    return self.journal.record(operation_id, record)
+                destination = self.runtime.acquire_destination(lease, destination_host_uid)
+                if (destination.agent_id != lease.agent_id or destination.host_uid != destination_host_uid
+                        or destination.generation <= lease.generation):
+                    raise RuntimeError("destination fencing generation is invalid")
+                record.update(state="restoring", destination_generation=destination.generation)
+                self.journal.record(operation_id, record)
+                restored = self.runtime.restore(destination, verified)
+                checks = self.runtime.verify(destination, restored)
+                if not all(checks.get(key) is True for key in ("heartbeat", "workspace_consistent", "single_writer")):
+                    record.update(state="reconciling", reason_codes=["RESTORE_UNVERIFIED"])
+                else:
+                    record.update(state="migration_completed", reason_codes=[])
+                return self.journal.record(operation_id, record)
+            except Exception as exc:
+                record.update(state="reconciling" if stopped else "blocked",
+                              reason_codes=["RECOVERY_OPERATION_FAILED"], error_type=type(exc).__name__)
+                return self.journal.record(operation_id, record)
 
     def fault_matrix(self) -> list[dict]:
-        """Return deterministic safety outcomes for known ambiguous failures."""
+        """Inventory required fault checks; entries are not executed proof."""
         cases = [
             "commit_before_ack", "heartbeat_lost_running", "network_partition",
             "slow_ssh", "two_schedulers", "expired_lease_while_running",
@@ -101,8 +150,8 @@ class RecoveryCoordinator:
             "shutdown_mid_transfer", "dirty_worktree", "resume_version_mismatch",
             "safe_fence_unavailable",
         ]
-        return [{"case": case, "state": "reconciling" if case in {
+        return [{"case": case, "required_state": "reconciling" if case in {
             "commit_before_ack", "heartbeat_lost_running", "network_partition",
             "slow_ssh", "two_schedulers", "expired_lease_while_running",
-        } else "blocked", "duplicate_execution": False} for case in cases]
+        } else "blocked", "verification": "pending"} for case in cases]
 

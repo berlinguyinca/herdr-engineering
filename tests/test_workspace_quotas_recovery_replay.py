@@ -50,6 +50,22 @@ def test_workspace_preparer_never_calls_native_launcher_when_preflight_fails():
     assert called == []
 
 
+def test_prepared_workspace_resolver_survives_event_replay_and_binds_host():
+    from herdr_engineering.control_plane.repo import ControlPlaneRepo
+    repo = ControlPlaneRepo()
+    store = WorkspaceManifestStore(repo)
+    manifest = WorkspaceManifest("persisted-ws", "git@example/repo", "revision", "branch", "wt", "task", (), "env", "alice", ("alice",))
+    WorkspacePreparer(store).prepare(manifest, preflight={"ready": True}, host_uid="host-b",
+        create_worktree=lambda _: {"path": "/work/isolated", "revision": "revision"})
+    restored_repo = ControlPlaneRepo()
+    restored_repo.import_state(repo.export_state())
+    restored = WorkspaceManifestStore(restored_repo)
+    assert restored.resolve("persisted-ws", "host-b")["owner"] == "alice"
+    assert restored.resolve("persisted-ws", "other-host") is None
+    with pytest.raises(WorkspacePreparationError, match="revision"):
+        restored.mark_prepared(manifest, host_uid="host-b", path="/work/isolated", revision="wrong")
+
+
 def test_fair_queue_prioritizes_interactive_but_enforces_caps():
     queue = FairQueue(owner_limits={"alice": 1})
     queue.add(QueueEntry("b", "bob", "p", "background", monotonic(), envelope()))
