@@ -127,13 +127,13 @@ export async function assertBundledFonts(page, ctx) {
 }
 
 /**
- * Wait until the page has stopped changing: no request in flight and no DOM mutation for `quietMs`. The proof element of a surface
+ * Wait until the page has stopped changing: no DOM mutation for `quietMs`. (Not `networkidle`: the page polls, so the network is never
+ * idle and every capture would sit out the whole cap.) The proof element of a surface
  * appears before its data does, so a fixed pause after it photographed a half-populated page on a slow or busy host (one page of 88,
  * 9% of its pixels, on the CI agent only). Bounded: a page that keeps redrawing on its poll is captured after `maxMs` anyway, and the
  * text it redraws is normalised afterwards.
  */
-async function settled(page, quietMs = 500, maxMs = 12000) {
-  await page.waitForLoadState('networkidle', { timeout: maxMs }).catch(() => {});
+async function settled(page, quietMs = 500, maxMs = 5000) {
   await page.evaluate(([quiet, max]) => new Promise((resolve) => {
     let timer; const done = () => { obs.disconnect(); clearTimeout(timer); clearTimeout(cap); resolve(); };
     const obs = new MutationObserver(() => { clearTimeout(timer); timer = setTimeout(done, quiet); });

@@ -26,6 +26,16 @@ Set `scheduler.all_spawns=false`, `scheduler.admission=false`, and `scheduler.pl
 
 ## Troubleshooting
 
+Checkpoints now publish as one immutable private `HERDRCP1` container named
+`<checkpoint-id>.checkpoint`, with metadata and payload committed together.
+The default payload limit is 256 MiB. Duplicate IDs may replay identical bytes
+but cannot replace an existing checkpoint with different contents. Recovery
+callers should pass `expected_lease` to validate agent, host, and generation.
+The store pins a private directory descriptor and rejects symlink/nonregular
+checkpoint entries. Legacy experimental `.json`/`.bin` pairs remain untouched;
+preserve them for explicit verified conversion rather than treating them as
+current checkpoint containers. This storage change does not enable migration.
+
 - `HOST_STALE`: inspect `/api/v1/hosts/<host>/telemetry`; never substitute a fabricated zero-load value.
 - `HOST_MANUAL_ONLY`: use an explicit authorized manual host selection; this does not permit disabled/untrusted/unreachable hosts.
 - `POLICY_CHANGED`: the host changed after ranking; retry only through `plan`/`reserve`, never by reusing the old reservation.
