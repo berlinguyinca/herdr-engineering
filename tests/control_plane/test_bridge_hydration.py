@@ -42,7 +42,8 @@ class CursorConnection:
 
     async def cursor(self, sql, *, prefetch):
         assert self.in_transaction
-        assert sql == "SELECT * FROM fabric_events ORDER BY ingest_timestamp, sequence"
+        assert "ORDER BY ingest_timestamp, sequence, event_id" in sql
+        assert "entity_type NOT IN" in sql and "LIMIT" not in sql
         self.prefetches.append(prefetch)
         for index, row in enumerate(self.rows):
             assert self.in_transaction
@@ -123,7 +124,7 @@ def test_fetch_only_connection_remains_reusable_after_event_cache_release():
     assert len(conn.calls) == calls
     # Explicit event reads refetch the complete snapshot rather than returning an empty log.
     assert len(source.events()) == 3
-    assert len(conn.calls) == calls + 5
+    assert len(conn.calls) == calls + 6  # Four resource reads, checkpoint discovery, complete replay.
 
 
 def test_cursor_decodes_once_and_keeps_envelope_fields_and_payload(monkeypatch):

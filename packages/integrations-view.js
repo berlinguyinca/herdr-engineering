@@ -162,7 +162,7 @@ const styles=`<style>
 @media(max-width:900px){.ig-layout:has(.ig-inspector:not([hidden])){grid-template-columns:minmax(0,1fr)}.ig-inspector{grid-row:1}}@media(max-width:550px){.ig-row{grid-template-columns:minmax(0,1fr);gap:8px}.ig-state{max-width:none}.ig-tabs button{padding:9px 12px}}
 </style>`;
 const commandCenterStyles=`<style>
-.ci-workspace-tabs{margin:8px 0 20px;padding:5px;background:var(--surface);border:1px solid var(--border);border-radius:12px;box-shadow:var(--shadow-sm,0 2px 8px #0001)}.ci-workspace-tabs button{border:0!important;border-radius:8px!important;font-weight:650}.ci-workspace-tabs button[aria-selected=true]{background:var(--accent);color:var(--text-on-accent);box-shadow:0 2px 8px color-mix(in srgb,var(--accent) 30%,transparent)}.ig-group,.ig-inspector{box-shadow:var(--shadow-sm,0 2px 8px #0001)}.ig-inspector{border-top:3px solid var(--accent)}.ci-slot-detail{animation:ci-slot-in .18s ease-out}@keyframes ci-slot-in{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
+.ci-workspace-tabs{margin:8px 0 20px;padding:5px;background:var(--surface);border:1px solid var(--border);border-radius:12px;box-shadow:var(--shadow)}.ci-workspace-tabs button{border:0!important;border-radius:8px!important;font-weight:650}.ci-workspace-tabs button[aria-selected=true]{background:var(--accent);color:var(--text-on-accent);box-shadow:0 2px 8px color-mix(in srgb,var(--accent) 30%,transparent)}.ig-group,.ig-inspector{box-shadow:var(--shadow)}.ig-inspector{border-top:3px solid var(--accent)}.ci-slot-detail{animation:ci-slot-in .18s ease-out}@keyframes ci-slot-in{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
 </style>`;
 
 export function mountIntegrations(container,client,{kind='ci',tab='current',search='',repository='',provider='',mission='',session='',workspace:startWorkspace=''}={}) {
@@ -341,6 +341,7 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
         if(selectedValue)values.set(selectedValue,values.get(selectedValue)||selectedValue);
         const options=`<option value="">${label}</option>`+[...values].sort((a,b)=>a[1].localeCompare(b[1])).map(([value,label])=>`<option value="${esc(value)}">${esc(label)}</option>`).join('');
         if(select.innerHTML!==options)morph(select,options);
+        // Shared selection can change while the available options stay identical.
         if(select.value!==selectedValue)select.value=selectedValue;
       }
     }

@@ -545,6 +545,10 @@ class ControlPlaneServer:
         self.request_metrics = RequestMetrics()
         self._ready = threading.Event()
         self._httpd = None
+        self._lifecycle_lock = threading.Lock()
+        self._maintenance_stop = threading.Event()
+        self._background_threads = []
+        self._serving_listeners = set()
         self.gate_service = self.gate_store = self.gate_queue = self.gate_main = None
         self.gate_coordinator = self.gate_reviewer_config = None
         self._start_review_gate(repo, fleet_config)
@@ -1327,7 +1331,29 @@ class ControlPlaneServer:
             self._subscribers.discard(q)
 
     # ------------------------------------------------------------- server
+    def _start_background_thread(self, target):
+        thread = threading.Thread(target=target, daemon=True)
+        thread.start()
+        self._background_threads.append(thread)
+
     def serve(self):
+        # Publish all listeners/workers before shutdown can snapshot and join them.
+        # Keep the primary listener locally: shutdown may clear self._httpd as
+        # soon as its serving loop returns.
+        with self._lifecycle_lock:
+            if self._maintenance_stop.is_set():
+                return
+            try:
+                httpd = self._start_server()
+            except BaseException:
+                self._maintenance_stop.set()
+                self._summary_stop.set()
+                self._shutdown_locked()
+                raise
+            self._serving_listeners.add(httpd)
+        httpd.serve_forever()
+
+    def _start_server(self):
         if self.collab_only:
             # No operator listener at all: this process serves the public collab surface only.
             self._httpd = _DaemonThreadingServer(
@@ -1337,10 +1363,10 @@ class ControlPlaneServer:
                 self._operator_httpd = _DaemonThreadingServer(
                     (self.public_host, self.operator_port), _make_handler(self, operator=True))
                 self.operator_port = self._operator_httpd.server_address[1]
-                threading.Thread(target=self._operator_httpd.serve_forever, daemon=True).start()
+                self._start_background_thread(self._operator_httpd.serve_forever)
+                self._serving_listeners.add(self._operator_httpd)
             self._ready.set()
-            self._httpd.serve_forever()
-            return
+            return self._httpd
         self._httpd = _DaemonThreadingServer(
             (self.host, self.port), _make_handler(self),
             request_workers=self.request_workers, request_queue=self.request_queue)
@@ -1349,23 +1375,24 @@ class ControlPlaneServer:
             self._public_httpd = _DaemonThreadingServer(
                 (self.public_host, self.public_port), _make_handler(self, public=True))
             self.public_port = self._public_httpd.server_address[1]
-            threading.Thread(target=self._public_httpd.serve_forever, daemon=True).start()
-        self._ready.set()
+            self._start_background_thread(self._public_httpd.serve_forever)
+            self._serving_listeners.add(self._public_httpd)
         if self.agent_summaries and self.agent_summaries.config.enabled:
             self.agent_summaries.start()
             self._summary_scanner = threading.Thread(target=self._summary_loop, daemon=True)
             self._summary_scanner.start()
-        threading.Thread(target=self._sweep_loop, daemon=True).start()
-        threading.Thread(target=self._deployments_loop, name="herdr-deployments-tick", daemon=True).start()
+        self._start_background_thread(self._sweep_loop)
+        self._start_background_thread(self._deployments_loop)
         if self.collab is not None and self.collab.lineage_sink is not None:
-            threading.Thread(target=self._link_flush_loop, daemon=True).start()
-        self._httpd.serve_forever()
+            self._start_background_thread(self._link_flush_loop)
+        self._ready.set()
+        return self._httpd
 
     def _sweep_loop(self, interval=300):
         """Periodic retention, starting at once so re-hydrated expired rows do not linger."""
-        while self._httpd is not None:
+        while not self._maintenance_stop.is_set():
             self.sweep_once()
-            time.sleep(interval)
+            self._maintenance_stop.wait(interval)
 
     def sweep_once(self):
         """Inspector age retention for idle sessions too (ingest only prunes the active
@@ -1389,12 +1416,12 @@ class ControlPlaneServer:
     def _link_flush_loop(self, interval=30):
         """T14: tell the lineage graph what it missed about cross-workspace links (a retraction the graph was down
         for), once at start and then on a timer. The pending set is derived from the durable link records."""
-        while self._httpd is not None:
+        while not self._maintenance_stop.is_set():
             try:
                 self.collab.maintain()
             except Exception:
                 pass
-            time.sleep(interval)
+            self._maintenance_stop.wait(interval)
 
     def wait_until_ready(self, timeout=5.0):
         self._ready.wait(timeout=timeout)
@@ -1425,25 +1452,36 @@ class ControlPlaneServer:
         return True
 
     def shutdown(self):
+        self._maintenance_stop.set()
+        self._summary_stop.set()
+        with self._lifecycle_lock:
+            self._shutdown_locked()
+
+    def _shutdown_locked(self):
+        """Release startup resources while holding the lifecycle lock."""
         if self.gate_service is not None:
             self.gate_service.stop()
-        self._summary_stop.set()
         self._deployments_stop.set()
-        if self._summary_scanner:
+        if self._summary_scanner and self._summary_scanner.ident is not None:
             self._summary_scanner.join(timeout=2)
         if self.agent_summaries:
             self.agent_summaries.close()
         self.ci_monitor.close()
         self.github_monitor.close()
-        if self._operator_httpd:
-            self._operator_httpd.shutdown()
-            self._operator_httpd.server_close()
-        if self._public_httpd:
-            self._public_httpd.shutdown()
-            self._public_httpd.server_close()
-        if self._httpd:
-            self._httpd.shutdown()
-            self._httpd.server_close()
+        for attr in ("_operator_httpd", "_public_httpd", "_httpd"):
+            listener = getattr(self, attr)
+            if listener is not None:
+                # BaseServer.shutdown waits forever if serve_forever was never
+                # started (e.g. a subsequent bind or thread startup failed).
+                if listener in self._serving_listeners:
+                    listener.shutdown()
+                listener.server_close()
+                setattr(self, attr, None)
+        self._serving_listeners.clear()
+        for thread in self._background_threads:
+            thread.join()
+        self._background_threads.clear()
+        self._ready.clear()
 
 
 def _fabric_session(repo, inst):
@@ -4788,7 +4826,10 @@ def _redact_event(event: dict) -> dict:
             payload = json.loads(payload)
         except ValueError:
             pass
-    ev["payload"] = redact_payload(payload)
+    # Count-key exceptions belong to delivery schemas, never arbitrary payloads.
+    redact = (redact_delivery if ev.get("entity_type") in
+              {"test_run", "build", "review", "review_finding", "pull_request"} else redact_payload)
+    ev["payload"] = redact(payload)
     return ev
 
 
