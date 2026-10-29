@@ -384,6 +384,8 @@ class GitHubAppTokens:
             table.pop(next(iter(table)))
 
     def _note(self, owner, reason):
+        if not owner:
+            return  # the discovery slot: its failure surfaces as the owner's own reason
         self.last_error[owner] = reason
         if self._logged.get(owner) == reason:
             return
@@ -446,7 +448,10 @@ class GitHubAppTokens:
         jwt_value = mint_jwt(self.config.app_id, self.config.private_key_file, self._wall())
         wanted = set(self.config.owners)
         found: dict = {}
+        deadline = self._clock() + 2 * self._timeout   # the whole walk, not only each call
         for page in range(1, DISCOVERY_PAGES + 1):
+            if page > 1 and self._clock() > deadline:
+                raise GitHubAuthError("timeout")
             status, _h, raw = self._call("GET", f"/app/installations?per_page=100&page={page}",
                                          jwt_value, None)
             data = self._json(raw)

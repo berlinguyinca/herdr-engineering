@@ -317,7 +317,7 @@ github:
   values:
     app:
       app_id: 123456
-      private_key_file: "/etc/herdr/fleet/github-app.pem"   # absolute, regular file, mode 0600
+      private_key_file: "/etc/herdr/github-app/github-app.pem"   # absolute, regular file, mode 0600
       installations:                                        # one per repository owner herdr reads
         InferWeave: 11111111
         metabolomics-us: 22222222
@@ -345,10 +345,13 @@ github:
   drops that owner's cached token. Any failure means no token: evidence is unknown, the cache reports GitHub
   unavailable.
 - **Secrets.** The key is read from the file only when a JWT is minted; a group/world-readable file or a symlink
-  is refused. The key, the JWT and installation tokens never reach a log, an error, the state or the UI. The
-  file must be readable by the control-plane container user, e.g. placed in the mounted fleet directory
-  (`/etc/herdr/fleet`) with mode 0600 and the container user's uid. Needs `PyJWT[crypto]` (the image's
-  `review-gate`/`collab` extras already install it).
+  is refused. The key, the JWT and installation tokens never reach a log, an error, the state or the UI. Both
+  readers run in `control-plane-web`, so the key must be an absolute path inside that container, mode 0600 and
+  owned by the container user. It cannot go in the fleet directory (`deploy.sh` refuses any file there but
+  `fleet-config.yaml`), and `compose.yaml` has no key mount yet: add a read-only bind mount of the key for
+  `control-plane-web` before enabling `app`. Needs `PyJWT[crypto]` (the image's `review-gate`/`collab` extras
+  already install it). The loader validates the block's structure (`herdr-eng fleet config validate`), not the
+  key file, which only the control-plane container can see.
 - **The cache under the App** lists each configured owner's repositories (`repositoryOwner`, not `viewer`), and
   its catalog identity is the App's (not the hourly token), so token rotation does not purge it. Switching
   between `token` and `app` re-syncs the catalog once.

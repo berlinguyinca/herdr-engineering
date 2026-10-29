@@ -200,13 +200,14 @@ sections:
       # its own subset: evidence {contents, metadata}, cache {issues, metadata}
       # (+ organization_projects for Projects v2).
       # private_key_file: absolute path on the control-plane host, a regular file, mode 0600
-      # (group/world bits or a symlink are refused), readable by the container user; e.g.
-      # inside the mounted fleet dir. Only its path is in this file, never the key.
+      # (group/world bits or a symlink are refused), owned by the control-plane-web container
+      # user and bind-mounted into it read-only (NOT the fleet dir: deploy.sh allows only
+      # fleet-config.yaml there). Only its path is in this file, never the key.
       # installations: one entry per repository owner herdr reads; owners not listed never
       # get a token. `auto` looks the installation id up once (GET /app/installations).
       # app:
       #   app_id: 123456
-      #   private_key_file: "/etc/herdr/fleet/github-app.pem"
+      #   private_key_file: "/etc/herdr/github-app/github-app.pem"
       #   installations:
       #     InferWeave: 11111111
       #     metabolomics-us: 22222222
