@@ -4,6 +4,7 @@ import {spawn} from 'node:child_process';
 import {mkdirSync} from 'node:fs';
 import path from 'node:path';
 import {chromium} from 'playwright';
+const hf=async p=>{await p.locator('[data-health-filters]').waitFor({state:'attached',timeout:15000});await p.evaluate(()=>{const d=document.querySelector('[data-health-filters]');if(d)d.open=true;});};  // the Health filter bar is a closed disclosure by default
 const root=path.resolve(import.meta.dirname,'../..');
 
 test('CI health integrates real paginated history, PR drilldown, old filtered runs and responsive layout',async()=>{
@@ -14,13 +15,18 @@ test('CI health integrates real paginated history, PR drilldown, old filtered ru
   browser=await chromium.launch({headless:true});
   const page=await browser.newPage({viewport:{width:1440,height:1100}});const errors=[];page.on('pageerror',e=>errors.push(e.message));
   await page.goto(`http://127.0.0.1:${port}/#/ci`);
+  await hf(page);
   await page.locator('[data-health-mode="14"]').waitFor({timeout:15000});
+  await hf(page);
   assert.equal(await page.locator('[data-health-mode="14"]').getAttribute('aria-pressed'),'true');
   await page.waitForFunction(()=>document.querySelector('[data-ci-health]')?.textContent.includes('org/app'),null,{timeout:45000});
   assert.equal(await page.locator('.ci-health-grid > tbody > tr').count(),117);
+  await hf(page);
   assert.equal(await page.locator('[data-health-scope]').inputValue(),'all');
   // This drilldown scenario targets the default-branch history explicitly.
+  await hf(page);
   await page.locator('[data-health-scope]').selectOption('default');
+  await hf(page);
   await page.locator('[data-health-mode="runs"]').click();
   await page.waitForFunction(async()=>{const d=await(await fetch('/api/v1/ci/history')).json();return d.coverage?.['17']?.exhausted&&d.pipelines.some(r=>r.run_number===8);},null,{timeout:45000});
   assert.match(await page.locator('[data-ci-health]').innerText(),/24/);
@@ -34,6 +40,7 @@ test('CI health integrates real paginated history, PR drilldown, old filtered ru
   await page.waitForFunction(()=>document.querySelector('.ig-log')?.textContent.includes('expected 200, got 500'));
   assert.equal(await page.locator('.ig-inspector .ci-pipeline-step[data-step="12"]').evaluate(e=>getComputedStyle(e).borderLeftColor),'rgb(220, 53, 69)');
   assert.equal(await page.locator('[data-health-run][aria-current="true"]').count(),1);
+  await hf(page);
   const search=page.locator('[data-health-search]');await search.fill('org/app');
   await search.focus();await page.waitForTimeout(5300);
   assert.equal(await search.evaluate(e=>e===document.activeElement),true);
@@ -41,11 +48,15 @@ test('CI health integrates real paginated history, PR drilldown, old filtered ru
   await search.fill('');
   await page.locator('[data-close-inspector]').click();
   for(const mode of ['7','14','30']){
+   await hf(page);
    await page.locator(`[data-health-mode="${mode}"]`).click();
+   await hf(page);
    assert.equal(await page.locator(`[data-health-mode="${mode}"]`).getAttribute('aria-pressed'),'true');
   }
+  await hf(page);
   await page.locator('[data-health-scope]').selectOption('pr');
   await page.waitForFunction(()=>document.querySelector('[data-ci-health]')?.textContent.includes('PR #1200'));
+  await hf(page);
   await page.locator('[data-health-mode="30"]').click();
   assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true);
   // Resolve and measure the refreshing heatmap in one browser task. The
@@ -75,12 +86,17 @@ test('CI health integrates real paginated history, PR drilldown, old filtered ru
   assert.equal(await page.locator('[data-health-clear]').count(),1);
   await page.locator('[data-health-clear]').click();
   await page.reload();
+  await hf(page);
   assert.equal(await page.locator('[data-health-mode="30"]').getAttribute('aria-pressed'),'true');
+  await hf(page);
   assert.equal(await page.locator('[data-health-scope]').inputValue(),'pr');
+  await hf(page);
   await page.locator('[data-health-search]').fill('org/app');await page.reload();
+  await hf(page);
   assert.equal(await page.locator('[data-health-search]').inputValue(),'org/app');
   await page.goto(`http://127.0.0.1:${port}/#/ci?repository=github.com/org/app&search=main`);
   await page.waitForFunction(()=>document.querySelectorAll('.ci-health-grid > tbody > tr').length===1);
+  await hf(page);
   assert.equal(await page.locator('[data-health-search]').inputValue(),'main');
   assert.match(await page.locator('.ci-health-grid > tbody > tr').innerText(),/org\/app/);
   assert.deepEqual(errors,[]);
