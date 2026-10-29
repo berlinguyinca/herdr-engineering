@@ -335,6 +335,12 @@ def _build_parser() -> argparse.ArgumentParser:
     p2.add_argument("--harness", choices=("claude", "codex"), default="claude", help="summarizer harness")
     p2.add_argument("--timeout", type=int, default=300)
     p2.set_defaults(func=_cmd_summary_report)
+    p2 = smsub.add_parser("publish", help="publish a finished /summary report (stdin) to the dashboard and a side pane")
+    p2.add_argument("--agent", required=True, choices=("claude", "pi", "codex", "opencode"))
+    p2.add_argument("--session", required=True, help="session id of the summarized session")
+    p2.add_argument("--no-pane", action="store_true")
+    p2.add_argument("--no-dashboard", action="store_true")
+    p2.set_defaults(func=_cmd_summary_publish)
 
     # journal --------------------------------------------------------------
     p = sub.add_parser("journal", help="session journal & timeline (spec 0090)")
@@ -967,6 +973,18 @@ def _cmd_summary_report(args) -> int:
         _print_json({"ok": False, "error": exc.code, "detail": exc.detail})
         return 1
     return 0
+
+
+def _cmd_summary_publish(args) -> int:
+    from . import summary_report as sr
+    try:
+        out = sr.publish_report(args.agent, args.session, sys.stdin.read(),
+                                pane=not args.no_pane, dashboard=not args.no_dashboard)
+    except sr.ReportError as exc:
+        _print_json({"ok": False, "error": exc.code, "detail": exc.detail})
+        return 1
+    _print_json(out)
+    return 0 if out["ok"] else 1
 
 
 def _cmd_agent_mine(args) -> int:

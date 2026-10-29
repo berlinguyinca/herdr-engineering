@@ -379,8 +379,13 @@ def _opencode(db: str, sid: str | None) -> tuple[list[dict], dict]:
     return events, meta
 
 
-def _record_cwd(res: Resolution) -> str | None:
-    """Working directory recorded in the session itself (never the caller's own cwd)."""
+def _record_cwds(res: Resolution, limit: int = 8) -> list[str]:
+    """Working directories the session itself recorded, oldest first by last use.
+
+    A session often starts in a parent folder and later moves into a worktree, so the *last* entry is
+    the best guess for where the work is, and earlier ones are kept for the other worktrees it touched.
+    """
+    seen: dict[str, int] = {}
     try:
         if res.agent == "opencode":
             con = sqlite3.connect(f"file:{res.path}?mode=ro", uri=True, timeout=5)
@@ -388,17 +393,16 @@ def _record_cwd(res: Resolution) -> str | None:
                 row = con.execute("select directory from session where id = ?", (res.session_id,)).fetchone()
             finally:
                 con.close()
-            return row[0] if row and isinstance(row[0], str) else None
+            return [row[0]] if row and isinstance(row[0], str) and row[0] else []
         for i, d in enumerate(_jsonl(res.path)):
             p = d.get("payload") if isinstance(d.get("payload"), dict) else {}
             value = d.get("cwd") or p.get("cwd")
             if isinstance(value, str) and value:
-                return value
-            if i >= 200:
-                break
+                seen.pop(value, None)
+                seen[value] = i
     except (OSError, sqlite3.Error, ValueError):
         pass
-    return None
+    return list(seen)[-limit:]
 
 
 # --- public entry -----------------------------------------------------------
@@ -433,11 +437,12 @@ def read_history(res: Resolution, *, home: Path | None = None, max_events: int =
         gaps.append("session record contains no turns")
     verdict = "limited" if (not events or res.method.startswith(("newest", "none"))) else (
         "partial" if gaps else "complete")
+    cwds = _record_cwds(res) if res.path and res.agent else []
     omitted = max(0, len(events) - max_events)
     shown = events if not omitted else events[:60] + events[-(max_events - 60):]
     return {
         "agent": res.agent, "session_id": res.session_id, "record": res.path, "method": res.method,
-        "cwd": _record_cwd(res) if res.path and res.agent else None,
+        "cwd": (cwds[-1] if cwds else None), "cwds": cwds,
         "events_total": len(events), "events_omitted_from_middle": omitted, "events": shown,
         "compactions": len(compactions), "child_records": meta["child_records"],
         "coverage": {"verdict": verdict, "gaps": gaps},

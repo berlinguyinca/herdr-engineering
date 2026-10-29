@@ -12,6 +12,7 @@ import {randomString} from './herdr-web-client/collab.js';
 import {recordOutcome} from './record-state.js';
 import {fixOutcome, fixError, FIX_LABELS, FIX_LOCKED} from './summary-fix-status.js';
 import {reportView, reportStartError, OPEN_STATES} from './summary-report-status.js';
+import {parseReport, staleness, elapsedLabel, nearestTurn, TIMESTAMP} from './summary-report-parse.js';
 import {morph} from './patch.js';
 import {enter,skeleton} from './motion.js';
 
@@ -52,7 +53,7 @@ export function mountSessionWorkspace(host,client,session,{connect=connectEvents
   let renderTimer, refreshTimer, selection=null, split=60;
   let historyGeneration=0,historyReset=false,fullscreen=false,fullscreenFocus=null,agentSummary=null,summaryBusy=false,summaryError='',summarySignature='';
   // Full /summary report: the server's `full_report` plus the local start state, kept outside paint.
-  let fullReport=null,reportLocal=null,reportSignature='',reportTimer;
+  let fullReport=null,reportLocal=null,reportSignature='',reportTimer,reportTick,reportStartedAt=0,reportCopied='';
   const canReport=()=>Boolean(session.capabilities?.summary_report);
   const expanded=new Map();
   // "Let the agent fix this" state per exact item text, kept outside paint so polling keeps it.
@@ -62,11 +63,12 @@ export function mountSessionWorkspace(host,client,session,{connect=connectEvents
   const pages={all:{before:null,more:false},conversation:{before:null,more:false}};
   const canLoadOlder=view=>pages[view].more && (view==='conversation'?conversationEvents:events).length<MAX_EVENTS;
   const state={agent:'',q:'',type:'',errors:false};
+  let showUsage=false;
   host.innerHTML=`<section class="sw" data-session-workspace>
     <header class="sw-workspace-heading"><strong data-agent-name>${esc(session.display_name || session.agent_role || 'Agent')}</strong><button type="button" data-rename-agent${session.capabilities?.rename_agent?'':' hidden'}>Rename agent</button><a class="sw-llm-link" data-llm-link href="#/llm/session/${esc(encodeURIComponent(session.session_id))}">LLM usage</a><button type="button" data-fullscreen aria-expanded="false">Fullscreen workspace</button></header>
     ${session.name_error?`<p class="sw-status" data-agent-name-error role="status">${esc(session.name_error)}</p>`:''}
     <form data-rename-form hidden><label>Agent name <input aria-label="Agent name" name="agent_name" maxlength="64" required></label><button type="submit">Save name</button><button type="button" data-cancel-rename>Cancel</button><p data-rename-status role="status"></p></form>
-    <section class="sw-summary-card" aria-label="Agent summary"><div class="sw-summary-heading"><h3>AI-generated summary</h3><button type="button" data-regenerate-summary${session.capabilities?.regenerate_summary?'':' hidden'}>Regenerate summary</button><button type="button" data-summary-report${session.capabilities?.summary_report?'':' hidden'}>Generate full report</button></div><div data-agent-summary role="status">${skeleton('summary',{rows:2,height:18,inStatus:true})}</div><div class="sw-report" data-report-host hidden></div></section>
+    <section class="sw-summary-card" aria-label="Agent summary"><div class="sw-summary-heading"><h3>Summary</h3><button type="button" data-regenerate-summary title="Short model-written summary, refreshed automatically"${session.capabilities?.regenerate_summary?'':' hidden'}>Quick summary</button><button type="button" data-summary-report title="Run /summary on this session: objective, work, verification, next steps"${session.capabilities?.summary_report?'':' hidden'}>Full report</button></div><div data-agent-summary role="status">${skeleton('summary',{rows:2,height:18,inStatus:true})}</div><div class="sw-report" data-report-host hidden></div></section>
     <div class="sw-status" data-recording-status role="status">${skeleton('recorded conversation',{rows:1,height:16,inStatus:true})}</div>
     <div class="sw-relations" data-session-relations></div>
     <div class="sw-filters"><label>Agent <select data-agent-filter><option value="">All agents</option></select></label>
@@ -80,7 +82,7 @@ export function mountSessionWorkspace(host,client,session,{connect=connectEvents
         <div data-composer></div></section>
       <div class="sw-splitter" data-splitter role="separator" aria-label="Resize conversation pane" aria-orientation="vertical" tabindex="0" aria-valuemin="30" aria-valuemax="75" aria-valuenow="60"></div>
       <section class="sw-activity" data-activity-pane aria-label="Coding activity"><h3>Activity</h3>
-        <div class="sw-filters"><label>Type <select data-type-filter><option value="">All activity</option>${['tool','file','test','usage','model','association','lifecycle'].map(t=>`<option value="${t}">${t}</option>`).join('')}</select></label><label><input type="checkbox" data-errors-filter> Errors only</label><button type="button" data-clear-selection hidden>Show all turns</button></div>
+        <div class="sw-filters"><label>Type <select data-type-filter><option value="">All activity</option>${['tool','file','test','usage','model','association','lifecycle'].map(t=>`<option value="${t}">${t}</option>`).join('')}</select></label><label><input type="checkbox" data-errors-filter> Errors only</label><label class="sw-usage-toggle"><input type="checkbox" data-show-usage> Show usage rows</label><button type="button" class="sw-activity-collapse" data-activity-collapse aria-expanded="true">Hide activity</button><button type="button" data-clear-selection hidden>Show all turns</button></div>
         <div class="sw-activity-log" data-activity></div></section>
     </div></section>`;
   const $=s=>host.querySelector(s);
@@ -141,6 +143,8 @@ export function mountSessionWorkspace(host,client,session,{connect=connectEvents
     }
     const open=new Set([...activity.querySelectorAll('details[open]')].map(d=>d.dataset.activitySeq));
     let activityRows=selectEvents(events,{...state,pane:'activity'});
+    // Fullscreen is for reading: token-usage rows are noise there unless asked for or filtered to.
+    if(fullscreen && !state.type && !showUsage)activityRows=activityRows.filter(e=>e.kind!=='usage');
     if(selection!=null){
       const next=conversationEvents.filter(e=>e.seq>selection).sort((a,b)=>a.seq-b.seq)[0]?.seq ?? Infinity;
       activityRows=activityRows.filter(e=>e.seq>selection && e.seq<next);
@@ -157,6 +161,7 @@ export function mountSessionWorkspace(host,client,session,{connect=connectEvents
     $('[data-load-older]').hidden=!canLoadOlder('all') && !canLoadOlder('conversation');
     $('[data-load-older]').disabled=loading;
     $('[data-clear-selection]').hidden=selection==null;
+    paintReport();
   }
   function activityEvent(entry) {
     entry={...entry,display_name:data?.summary?.agents?.find(agent=>agent.agent_id===entry.agent_id)?.display_name};
@@ -171,7 +176,7 @@ export function mountSessionWorkspace(host,client,session,{connect=connectEvents
   function paintSummary(){
     if(disposed)return;
     const value=agentSummary || {state:summaryError?'failed':'pending'};
-    const signature=JSON.stringify([value,summaryError,[...fixStates]]);if(signature===summarySignature)return;summarySignature=signature;
+    const signature=JSON.stringify([value,summaryError,[...fixStates],Boolean(fullReport?.report)]);if(signature===summarySignature)return;summarySignature=signature;
     const states={disabled:'Automatic summaries are not enabled.',pending:'Summary update pending.',ready:'Up to date with recorded conversation.',stale:'Newer conversation or unavailable history: showing the last saved summary.',failed:'Summary update failed. The last saved summary is retained.',no_data:'No recorded conversation is available to summarize.'};
     const fields=[['discussed','Discussed'],['decisions','Decisions'],['completed','Completed'],['next_steps','Next steps'],['blockers','Blockers']];
     const coverage=value.coverage;
@@ -189,37 +194,107 @@ export function mountSessionWorkspace(host,client,session,{connect=connectEvents
     const detailsOpen=summaryHost.querySelector('details')?.open;
     summaryHost.innerHTML=`<p class="sw-summary-state">${esc(summaryError || states[value.state] || 'Summary status unknown.')}</p>${value.overview?`<div class="conversation-markdown">${renderMarkdown(value.overview,markdown)}</div>`:''}${value.where_left_off?`<h4>Where we left off</h4><div class="conversation-markdown">${renderMarkdown(value.where_left_off,markdown)}</div>`:''}${fields.some(([key])=>value[key]?.length)?`<details><summary>Discussion, decisions and next steps</summary>${fields.filter(([key])=>Array.isArray(value[key]) && value[key].length).map(([key,label])=>`<h4>${label}</h4><ul>${value[key].map((text,index)=>item(key,text,index)).join('')}</ul>`).join('')}</details>`:''}<p class="sw-summary-provenance">${esc(provenance)}${value.generated_at?` · Generated ${esc(value.generated_at)}`:''}${value.model?` · ${esc(value.model)}`:''}</p>`;
     const details=summaryHost.querySelector('details');if(details && detailsOpen)details.open=true;
+    // A failed or empty model summary should not compete with a full report that exists.
+    const hasContent=Boolean(value.overview || value.where_left_off || fields.some(([key])=>value[key]?.length));
+    summaryHost.classList.toggle('sw-summary--quiet',!hasContent && Boolean(fullReport?.report));
   }
+  const SECTION_OPEN=new Set([7,9]);
+  function reportHandoff(parsed){
+    const pick=re=>parsed.sections.find(x=>re.test(x.title))?.body||'';
+    const text=['Continue from this session recovery report.',parsed.resume&&`Resume point:\n${parsed.resume}`,pick(/next actions/i)&&`Next actions:\n${pick(/next actions/i)}`].filter(Boolean).join('\n\n');
+    return text.slice(0,4000);
+  }
+  function linkTimestamps(body){
+    const turns=conversationEvents.filter(e=>e.ts);
+    if(!turns.length)return;
+    const walker=body.ownerDocument.createTreeWalker(body,4);const nodes=[];
+    for(let n=walker.nextNode();n;n=walker.nextNode())if(!n.parentElement.closest('button,a'))nodes.push(n);
+    for(const node of nodes){
+      const text=node.nodeValue;TIMESTAMP.lastIndex=0;
+      const matches=[...text.matchAll(TIMESTAMP)].filter(m=>nearestTurn(m[0],turns)!=null);
+      if(!matches.length)continue;
+      const frag=body.ownerDocument.createDocumentFragment();let at=0;
+      for(const m of matches){
+        frag.append(text.slice(at,m.index));
+        const b=body.ownerDocument.createElement('button');b.type='button';b.className='sw-ts';b.dataset.ts=m[0];b.title='Jump to this point in the conversation';b.textContent=m[0];frag.append(b);at=m.index+m[0].length;
+      }
+      frag.append(text.slice(at));node.replaceWith(frag);
+    }
+  }
+  function tickReport(){const el=host.querySelector('[data-report-elapsed]');if(el)el.textContent=elapsedLabel(Date.now()-reportStartedAt);}
   function paintReport(){
     if(disposed)return;
     const view=reportView(fullReport,reportLocal);
-    const signature=JSON.stringify([view,canReport()]);if(signature===reportSignature)return;reportSignature=signature;
+    if(view.locked){
+      if(!reportStartedAt){const t=Date.parse(fullReport?.started_at||'');reportStartedAt=Number.isFinite(t)&&Date.now()-t<3600000?t:Date.now();}
+      if(!reportTick)reportTick=setInterval(tickReport,1000);
+    }else{reportStartedAt=0;clearInterval(reportTick);reportTick=null;}
+    const newest=Math.max(-Infinity,...conversationEvents.map(e=>e.seq));
+    const stale=view.report&&!view.locked?staleness(view.basisSeq,newest,conversationEvents):{stale:false,count:0};
+    const signature=JSON.stringify([view,canReport(),stale,reportCopied,terminal,Boolean(reportStartedAt)]);if(signature===reportSignature)return;reportSignature=signature;
     const button=$('[data-summary-report]');button.hidden=!canReport();button.textContent=view.label;button.disabled=view.locked;
     const box=$('[data-report-host]');
     // Nothing to show until a run has been asked for or a report exists; a viewer without the button still sees a stored report.
     box.hidden=!(view.report || view.status);
-    const open=box.querySelector('details')?.open;
+    const sectionsOpen=new Map([...box.querySelectorAll('details[data-section]')].map(d=>[d.dataset.section,d.open]));
+    const open=box.querySelector('details[data-report]')?.open;
     const scroll=box.querySelector('.sw-report-body')?.scrollTop||0;
-    box.innerHTML=`${view.status?`<p class="sw-report-status"${view.error?' role="alert"':' role="status"'}>${esc(view.status)}</p>`:''}${view.report?`<details${open===false?'':' open'}><summary>Full session report</summary><div class="sw-report-body conversation-markdown">${renderMarkdown(view.report,markdown)}</div></details>`:''}`;
-    const body=box.querySelector('.sw-report-body');if(body)body.scrollTop=scroll;
+    const parsed=view.report?parseReport(view.report):null;
+    const timer=view.locked?` <span data-report-elapsed>${esc(elapsedLabel(Date.now()-reportStartedAt))}</span>`:'';
+    const strip=parsed&&(parsed.status||parsed.coverage||stale.stale)?`<div class="sw-report-strip">${parsed.status?`<span class="sw-badge" data-report-status>${esc(parsed.status)}</span>`:''}${parsed.coverage?`<span class="sw-badge sw-badge--${esc(parsed.coverage)}" title="How much of the session history the report could read">Evidence: ${esc(parsed.coverage)}</span>`:''}${stale.stale?`<span class="sw-badge sw-badge--stale" data-report-stale>${stale.count?`${stale.count} newer message${stale.count===1?'':'s'}`:'Newer activity'} since this report${canReport()?' <button type="button" data-report-regenerate>Regenerate</button>':''}</span>`:''}</div>`:'';
+    const resume=parsed?.resume?`<div class="sw-report-resume"><strong>Resume point</strong><div class="conversation-markdown">${renderMarkdown(parsed.resume,markdown)}</div></div>`:'';
+    const actions=view.report?`<div class="sw-report-actions"><button type="button" data-report-copy>${reportCopied||'Copy as markdown'}</button>${parsed?.resume&&typeof client.sendMessage==='function'?`<button type="button" data-report-send title="Send the resume point and next actions to this agent as a message"${terminal?' disabled':''}>${terminal?'Agent ended':'Send to agent'}</button>`:''}</div>`:'';
+    const sections=parsed?.sections.length?parsed.sections.map(x=>{
+      const key=String(x.n||x.title),wasOpen=sectionsOpen.get(key);
+      return `<details class="sw-report-section" data-section="${esc(key)}"${(wasOpen??(SECTION_OPEN.has(x.n)))?' open':''}><summary>${x.n?`${x.n}. `:''}${esc(x.title)}</summary><div class="conversation-markdown">${renderMarkdown(x.body,markdown)}</div></details>`;
+    }).join(''):`<div class="conversation-markdown">${view.report?renderMarkdown(view.report,markdown):''}</div>`;
+    box.innerHTML=`${view.status?`<p class="sw-report-status"${view.error?' role="alert"':' role="status"'}>${esc(view.status)}${timer}</p>`:''}${view.report?`${strip}${resume}<details data-report${open===false?'':' open'}><summary>Full session report</summary>${actions}<div class="sw-report-body">${sections}</div></details>`:''}`;
+    const body=box.querySelector('.sw-report-body');if(body){body.scrollTop=scroll;linkTimestamps(body);}
   }
-  function pollReport(){
-    clearTimeout(reportTimer);
-    if(disposed || (!OPEN_STATES.has(fullReport?.state) && reportLocal?.state!=='starting'))return;
-    reportTimer=setTimeout(loadSummary,3000);
-  }
-  $('[data-summary-report]').addEventListener('click',async()=>{
+  async function startReport(){
     if(!canReport() || typeof client.startSummaryReport!=='function' || reportView(fullReport,reportLocal).locked)return;
     reportLocal={state:'starting'};paintReport();
     try{
       await client.startSummaryReport(session.session_id);
       if(disposed)return;
-      reportLocal=null;fullReport={...(fullReport||{}),state:'queued'};
+      reportLocal=null;fullReport={...(fullReport||{}),state:'queued',started_at:new Date().toISOString()};
     }catch(err){
       if(disposed)return;
       reportLocal=reportStartError(err);
     }finally{if(!disposed){paintReport();pollReport();}}
+  }
+  $('[data-report-host]').addEventListener('click',async event=>{
+    const target=event.target;
+    if(target.closest('[data-report-regenerate]'))return startReport();
+    const ts=target.closest('.sw-ts');
+    if(ts){
+      const seq=nearestTurn(ts.dataset.ts,conversationEvents.filter(e=>e.ts));
+      const row=seq!=null&&conversation.querySelector(`[data-message-seq="${seq}"]`);
+      if(row){row.scrollIntoView({block:'center'});row.classList.add('sw-message--flash');setTimeout(()=>row.classList.remove('sw-message--flash'),1500);}
+      return;
+    }
+    if(target.closest('[data-report-copy]')){
+      const text=reportView(fullReport,reportLocal).report;
+      try{await host.ownerDocument.defaultView.navigator.clipboard.writeText(text);reportCopied='Copied';}catch{reportCopied='Copy failed';}
+      paintReport();setTimeout(()=>{reportCopied='';if(!disposed)paintReport();},1500);
+      return;
+    }
+    const send=target.closest('[data-report-send]');
+    if(send && !send.disabled && !terminal){
+      const parsed=parseReport(reportView(fullReport,reportLocal).report);
+      const text=reportHandoff(parsed);
+      if(!text || !host.ownerDocument.defaultView.confirm('Send the resume point and next actions to this agent as a message?'))return;
+      send.disabled=true;
+      try{await client.sendMessage(session.session_id,text,[],randomString(18));reportCopied='';send.textContent='Sent';}
+      catch(err){send.disabled=false;send.textContent=`Send failed: ${err.message}`;}
+    }
   });
+  function pollReport(){
+    clearTimeout(reportTimer);
+    if(disposed || (!OPEN_STATES.has(fullReport?.state) && reportLocal?.state!=='starting'))return;
+    reportTimer=setTimeout(loadSummary,3000);
+  }
+  $('[data-summary-report]').addEventListener('click',startReport);
   $('[data-agent-summary]').addEventListener('click',async event=>{
     const button=event.target.closest('[data-fix-summary]');if(!button || button.disabled || !canFix())return;
     const list=button.dataset.list,index=Number(button.dataset.index);
@@ -257,7 +332,7 @@ export function mountSessionWorkspace(host,client,session,{connect=connectEvents
   function setFullscreen(value){
     if(value===fullscreen)return;
     if(value)fullscreenFocus=document.activeElement;
-    fullscreen=value;workspace.classList.toggle('sw--fullscreen',value);fullscreenButton.setAttribute('aria-expanded',String(value));fullscreenButton.textContent=value?'Exit fullscreen workspace':'Fullscreen workspace';
+    fullscreen=value;schedulePaint();workspace.classList.toggle('sw--fullscreen',value);fullscreenButton.setAttribute('aria-expanded',String(value));fullscreenButton.textContent=value?'Exit fullscreen workspace':'Fullscreen workspace';
     if(value){workspace.setAttribute('role','dialog');workspace.setAttribute('aria-label','Agent workspace');workspace.setAttribute('aria-modal','true');fullscreenButton.focus();}
     else{workspace.removeAttribute('role');workspace.removeAttribute('aria-label');workspace.removeAttribute('aria-modal');if(fullscreenFocus?.isConnected)fullscreenFocus.focus();}
   }
@@ -360,6 +435,8 @@ export function mountSessionWorkspace(host,client,session,{connect=connectEvents
   $('[data-load-older]').addEventListener('click',()=>load(true));
   $('[data-search]').addEventListener('input',e=>{state.q=e.target.value;schedulePaint();});
   $('[data-agent-filter]').addEventListener('change',e=>{state.agent=e.target.value;selection=null;schedulePaint();});
+  $('[data-show-usage]').addEventListener('change',e=>{showUsage=e.target.checked;schedulePaint();});
+  $('[data-activity-collapse]').addEventListener('click',e=>{const solo=panes.classList.toggle('sw-panes--solo');e.currentTarget.setAttribute('aria-expanded',String(!solo));e.currentTarget.textContent=solo?'Show activity':'Hide activity';});
   $('[data-type-filter]').addEventListener('change',e=>{state.type=e.target.value;schedulePaint();});
   $('[data-errors-filter]').addEventListener('change',e=>{state.errors=e.target.checked;schedulePaint();});
   $('[data-clear-selection]').addEventListener('click',()=>{selection=null;paint();});
@@ -399,5 +476,5 @@ export function mountSessionWorkspace(host,client,session,{connect=connectEvents
   client.listCollabAgentLinks?.().then(result=>{if(!disposed){collaborators=result.agents || [];schedulePaint();}}).catch(()=>{});
   load();
   const removeFabricActions=installFabricLinkActions(host);
-  return ()=>{removeFabricActions();disposed=true;request++;clearInterval(summaryTimer);clearTimeout(reportTimer);document.removeEventListener('visibilitychange',onVisibility);clearTimeout(renderTimer);clearTimeout(refreshTimer);clearTimeout(settleTimer);stop();composer.dispose();};
+  return ()=>{removeFabricActions();disposed=true;request++;clearInterval(summaryTimer);clearTimeout(reportTimer);clearInterval(reportTick);document.removeEventListener('visibilitychange',onVisibility);clearTimeout(renderTimer);clearTimeout(refreshTimer);clearTimeout(settleTimer);stop();composer.dispose();};
 }

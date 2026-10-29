@@ -104,7 +104,7 @@ class SummaryReportService:
                     return None
                 return {"operation_id": body["operation_id"], "session_id": session_id, "host_id": body["host_id"],
                         "agent": body.get("agent"), "target": body.get("target"), "state": "queued",
-                        "started_at": body.get("started_at") or _now(),
+                        "started_at": body.get("started_at") or _now(), "basis_seq": body.get("basis_seq"),
                         "queued_at": float(body.get("requested_at") or self._clock()), "claimed_at": None}
         return None
 
@@ -185,19 +185,67 @@ class SummaryReportService:
             now = self._clock()
             operation_id = f"summary-report-{datetime.now(UTC).strftime('%Y%m%dT%H%M%S%f')}"
             job = {"operation_id": operation_id, "session_id": session_id, "host_id": host, "agent": agent,
-                   "target": target, "state": "queued", "started_at": _now(), "queued_at": now, "claimed_at": None}
+                   "target": target, "state": "queued", "started_at": _now(), "queued_at": now, "claimed_at": None,
+                   "basis_seq": self._basis_seq(session_id)}
             self._jobs[session_id] = job
         try:
             self.repo.record_event(
                 "session", session_id, "SummaryReportRequested",
                 {"actor": dict(actor), "agent": agent, "target": target, "host_id": host, "operation_id": operation_id,
-                 "started_at": job["started_at"], "requested_at": now},
+                 "started_at": job["started_at"], "requested_at": now, "basis_seq": job["basis_seq"]},
                 session_id=session_id, require_durable=True, publish=False, feed=False)
         except Exception:
             with self._lock:
                 self._jobs.pop(session_id, None)
             raise ReportRefused(503, "audit_persistence_failed") from None
         return 202, {"ok": True, "status": "queued", "replayed": False, "session_id": session_id, **self._view(job)}
+
+    def _basis_seq(self, session_id):
+        try:
+            return self.repo.inspector.newest_seq(session_id)
+        except Exception:
+            return None
+
+    def publish(self, host_id, body):
+        """Store a report a person generated in a terminal (``/summary``) for the session it describes.
+
+        The terminal knows the harness and its own session id, not the dashboard's session id, so the
+        dashboard session is the one on this host whose conversation identity names that harness session.
+        """
+        if not self.enabled:
+            raise ReportRefused(409, "Full session reports are not enabled.", reason="reports_disabled")
+        if not isinstance(body, dict):
+            raise ReportRefused(400, "request body must be a JSON object")
+        agent, target = body.get("agent"), body.get("target")
+        if agent not in runner.AGENTS or not isinstance(target, str) or not runner._SESSION_ID.match(target):
+            raise ReportRefused(400, "agent and target must name a recorded session")
+        try:
+            report = runner.validate_report(body.get("report") if isinstance(body.get("report"), str) else "")
+        except runner.ReportError as exc:
+            raise ReportRefused(422, "not a session summary", reason=exc.code) from None
+        matches = []
+        for session in self.repo.list_sessions():
+            if str(session.get("host_id") or "") != host_id:
+                continue
+            conversation = session.get("agent_session")
+            if not isinstance(conversation, dict) or str(conversation.get("agent") or "").lower() != agent:
+                continue
+            value = str(conversation.get("value") or "")
+            if conversation.get("kind") == "path":
+                value = Path(value).stem
+            if value == target:
+                matches.append(session)
+        if not matches:
+            raise ReportRefused(404, "The dashboard has no agent for that session on this host.", reason="no_session")
+        if len(matches) > 1:
+            raise ReportRefused(409, "More than one dashboard agent matches that session.", reason="ambiguous_session")
+        session_id = matches[0]["session_id"]
+        self._finish(session_id, {"operation_id": f"terminal-{datetime.now(UTC).strftime('%Y%m%dT%H%M%S%f')}",
+                                  "host_id": host_id, "started_at": _now(), "basis_seq": self._basis_seq(session_id)},
+                     "SummaryReportCompleted",
+                     {"report": report, "harness": agent, "source": "terminal", "generated_at": _now()},
+                     close_job=False)               # a run that is still open for this session keeps going
+        return 200, {"ok": True, "session_id": session_id}
 
     def _expired(self, job):
         age = self._clock() - (job["claimed_at"] or job["queued_at"])
@@ -254,9 +302,9 @@ class SummaryReportService:
         self._finish(session_id, job, "SummaryReportFailed", {"error": code, "detail": detail})
         return 200, {"ok": True, "status": "failed"}
 
-    def _finish(self, session_id, job, event_type, body):
+    def _finish(self, session_id, job, event_type, body, *, close_job=True):
         body = {**body, "operation_id": job["operation_id"], "host_id": job["host_id"],
-                "started_at": job["started_at"], "finished_at": _now()}
+                "started_at": job["started_at"], "finished_at": _now(), "basis_seq": job.get("basis_seq")}
         state = _EVENTS[event_type]
         try:
             self.repo.record_event("session", session_id, event_type, body, session_id=session_id,
@@ -265,7 +313,8 @@ class SummaryReportService:
         except Exception:
             saved = False
         with self._lock:
-            self._jobs.pop(session_id, None)
+            if close_job:
+                self._jobs.pop(session_id, None)
             if saved:
                 self._unsaved.pop(session_id, None)
             else:
