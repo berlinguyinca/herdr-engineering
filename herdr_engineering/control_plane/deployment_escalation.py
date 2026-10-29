@@ -180,6 +180,12 @@ def _no_mentions(text):
     return text.replace("@", "@​").replace("#", "#​")
 
 
+def _fenced(text):
+    """Text for inside a ``~~~`` fence: no run of three tildes (or backticks) survives, and
+    mentions are neutralised."""
+    return _no_mentions(re.sub(r"~{3,}|`{3,}", lambda m: " ".join(m.group(0)), text))
+
+
 def _tail(text, cap):
     text = redact_evidence(text) if isinstance(text, str) else ""
     return text if len(text) <= cap else "[earlier evidence dropped]\n" + text[-cap:]
@@ -562,7 +568,9 @@ class DeploymentEscalation:
             "evidence": _tail(evidence.get("evidence"), MAX_REPORT_EVIDENCE),
             "tried": tried,
             "current_state": f"stage {halt.stage} halted; {d.component} failed on this release",
-            "next_step": _line(f"{last['finding']['summary']} Repair decided: "
+            "next_step": _line(("Model output (AI-generated, unverified): "
+                                if last["finding"]["source"] == "model" else "")
+                               + f"{last['finding']['summary']} Repair decided: "
                                f"{last['repair']['action']} ({last['repair']['reason']}).", 700),
             "finding_source": last["finding"]["source"],
         }
@@ -676,12 +684,13 @@ def issue_text(rec):
     label = src.split(":", 1)[1] if src.startswith("pattern:") else (
         "AI diagnosis" if src == "model" else "unclassified")
     title = f"Deployment of {rec['component']} failed on {rec['release'][:12]}: {label}"
-    summary = _no_mentions(_line(redact_evidence(f["summary"]), 400))
-    if src == "model":
-        summary = ("**Model output (AI-generated, unverified; it read redacted evidence only):** "
-                   + summary)
+    # Host and model text only ever sits inside a ~~~ fence, so GitHub renders no link, image or
+    # HTML from it; a fence marker inside it is broken up so it cannot close the fence.
+    summary = _fenced(_line(redact_evidence(f["summary"]), 400))
+    label_line = ("**Model output (AI-generated, unverified; it read redacted evidence only):**"
+                  if src == "model" else f"Finding text (source `{src}`):")
     report = rec.get("report") or {}
-    evidence = _no_mentions(redact_evidence(report.get("evidence") or "")).replace("~~~", "~ ~ ~")
+    evidence = _fenced(redact_evidence(report.get("evidence") or ""))
     tried = "\n".join(f"- {_no_mentions(_line(t, 200))}" for t in report.get("tried") or ())
     body = "\n".join([
         f"<!-- herdr-deployment-escalation {rec['component']}:{rec['release']} -->",
@@ -693,7 +702,10 @@ def issue_text(rec):
         f"- Repair decided: `{last['repair']['action']}` - {_no_mentions(last['repair']['reason'])}",
         "",
         "### Finding",
-        summary,
+        label_line,
+        "~~~text",
+        summary or "(none)",
+        "~~~",
         "",
         "### What was tried",
         tried or "- nothing yet",

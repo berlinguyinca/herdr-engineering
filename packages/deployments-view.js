@@ -93,7 +93,8 @@ function escalations(view, name) {
       <dt>What changed</dt><dd>${esc(text(report.what_changed))}</dd>
       <dt>Current state</dt><dd>${esc(text(report.current_state))}</dd>
       <dt>Tried</dt><dd>${list(report.tried).map((t) => esc(text(t))).join('<br>') || '—'}</dd>
-      <dt>Suggested next step</dt><dd>${esc(text(report.next_step))}</dd>
+      <dt>Diagnosis source</dt><dd data-deploy-report-source>${esc(text(report.finding_source))}${report.finding_source === 'model' ? ' <em>model output (AI-generated, unverified)</em>' : ''}</dd>
+      <dt>Suggested next step</dt><dd>${report.finding_source === 'model' ? '<em>model output:</em> ' : ''}${esc(text(report.next_step))}</dd>
       ${report.evidence ? `<dt>Evidence (redacted)</dt><dd><pre class="dp-evidence" data-deploy-report-evidence>${esc(report.evidence)}</pre></dd>` : ''}
     </dl>` : ''}
   </section>`;

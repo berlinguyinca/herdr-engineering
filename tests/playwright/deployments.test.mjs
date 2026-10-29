@@ -79,6 +79,7 @@ test('rows are grouped by stage with the plan, a drill-down timeline, and hostil
  assert.match(await escalation.locator('[data-deploy-repair]').innerText(),/round 1: host \(fallback\) → none/);
  assert.match(await escalation.innerText(),/issue: none/);
  assert.equal(await escalation.locator('[data-deploy-report-evidence]').innerText(),HOSTILE);
+ assert.equal(await escalation.locator('[data-deploy-report-source]').innerText(),'fallback');
  assert.equal(await escalation.locator('[data-deploy-report-link]').getAttribute('href'),'#'+await escalation.locator('[data-deploy-report]').getAttribute('id'));
  assert.equal(await page.locator('#view img').count(),0);
  assert.equal(await page.evaluate(()=>window.__pwned),undefined);
@@ -124,7 +125,7 @@ test('hostile strings in every server field render inert',async()=>withPage(asyn
     issue:{state:H('issue_state'),number:H('issue_number'),url:'javascript:alert(1)',reason:H('issue_reason')},
     assistant:{state:H('assistant_state')},
     rounds:[{index:H('index'),attempt:H('attempt'),finding:{kind:H('kind'),source:'model',summary:H('esc_summary')},repair:{action:H('action'),reason:H('esc_reason'),rollback_to:H('rollback_to')}}],
-    report:{what_changed:H('what_changed'),current_state:H('current_state'),tried:[H('tried')],next_step:H('next_step'),evidence:H('report_evidence')}}]}).replace('"__proto__X"','"__proto__"'));
+    report:{finding_source:'model',what_changed:H('what_changed'),current_state:H('current_state'),tried:[H('tried')],next_step:H('next_step'),evidence:H('report_evidence')}}]}).replace('"__proto__X"','"__proto__"'));
   const root=document.createElement('div');document.body.append(root);
   Object.prototype.step='POLLUTED';   // a polluted prototype must not reach a row with no own data
   try{root.innerHTML=renderDeployments(raw)(new Set([raw.definitions.groups[0].components[0]]));}finally{delete Object.prototype.step;}
@@ -132,10 +133,11 @@ test('hostile strings in every server field render inert',async()=>withPage(asyn
   for(const el of root.querySelectorAll('*'))el.dispatchEvent(new FocusEvent('focus'));
   await new Promise(r=>setTimeout(r,100));
   const rows=[...root.querySelectorAll('[data-deploy-row]')].map(r=>r.getAttribute('data-deploy-row'));
-  return {jslinks:root.querySelectorAll('a[href^="javascript"]').length,imgs:root.querySelectorAll('img').length,canaries:root.querySelectorAll('.canary').length,handlers:root.querySelectorAll('[onfocus],[onerror]').length,
+  const source=root.querySelector('[data-deploy-report-source]')?.innerText;
+  return {source,jslinks:root.querySelectorAll('a[href^="javascript"]').length,imgs:root.querySelectorAll('img').length,canaries:root.querySelectorAll('.canary').length,handlers:root.querySelectorAll('[onfocus],[onerror]').length,
    pwned:window.__pwned,text:root.textContent,rows,proto:root.querySelector('[data-deploy-row="__proto__"]')?.innerText,ctor:root.querySelector('[data-deploy-row="constructor"]')?.innerText};
  });
- assert.equal(result.jslinks,0);assert.equal(result.imgs,0);assert.equal(result.canaries,0);assert.equal(result.handlers,0);assert.equal(result.pwned,undefined);
+ assert.match(result.source,/model output/);assert.equal(result.jslinks,0);assert.equal(result.imgs,0);assert.equal(result.canaries,0);assert.equal(result.handlers,0);assert.equal(result.pwned,undefined);
  for(const k of ['warning','error1','error2','halt_reason','hold_reason','repo','branch','component','evidence','tick_error','missing','instance','reported_by',
   'esc_summary','esc_reason','issue_reason','what_changed','tried','next_step','report_evidence','pr'])
   assert.ok(result.text.includes(`<b class="canary">${k}</b>`),`${k} shown as text`);

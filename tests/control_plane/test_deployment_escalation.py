@@ -639,3 +639,83 @@ def test_the_budget_keeps_permits_fresh():
     with pytest.raises(ValueError):
         EscalationConfig(budget_s=de.MAX_BUDGET_S + 1)
     assert EscalationConfig(budget_s=de.MAX_BUDGET_S).budget_s == de.MAX_BUDGET_S
+
+
+# ---------------------------------------------------------------- fix round 1
+PHISH = ("see [x](https://phish.example/login) ![](https://t.example/p.png) "
+         "<a href=\"https://evil.example\">click</a> <img src=x> https://bare.example/path ~~~ ```")
+
+
+def _outside_fences(body):
+    out, inside = [], False
+    for line in body.splitlines():
+        if line.startswith("~~~"):
+            inside = not inside
+            continue
+        if not inside:
+            out.append(line)
+    assert not inside, "every fence is closed"
+    return "\n".join(out)
+
+
+@pytest.mark.parametrize("source", ["model", "fallback"])
+def test_model_and_evidence_text_never_renders_markup_in_the_issue(source):
+    sink = Sink()
+    finding = Finding("software", PHISH, "none", source)
+    w = World(issue_sink=sink, cfg=EscalationConfig(issues=True), diagnose_fn=Counting(finding))
+    _software(w, evidence=PHISH)
+    body = sink.calls[0]["body"]
+    outside = _outside_fences(body)
+    for bad in ("phish.example", "t.example", "evil.example", "bare.example", "<a ", "<img", "![", "]("):
+        assert bad not in outside, bad
+    # both texts are still there, inside the fences, with no fence marker that could close them
+    assert body.count("phish.example") == 2
+    inside = [ln for ln in body.splitlines() if "phish.example" in ln]
+    assert all("~~~" not in ln and "```" not in ln for ln in inside)
+    if source == "model":
+        assert "Model output (AI-generated, unverified" in outside
+
+
+def test_a_past_commit_without_an_ok_slot_is_never_the_rollback_target():
+    C2 = "2" * 40
+    w = World(diagnose_fn=Counting(Finding("software", "x", "rollback", "pattern:gateway-cannot-follow")))
+    for gen, commit in enumerate((C2, C0, C1), start=1):
+        w.state.adopt(TRACK, Replan(new_target=commit, generation=gen, previous_commit=None))
+    assert w.state.plan(TRACK).past[:2] == (C0, C2)
+    w.mon.add("hive-nodes", "failed", to=C0, rx=10)       # newest past commit: failed, never ok
+    w.mon.add("hive-nodes", "ok", to=C2, rx=5)            # older: ok
+    w.mon.add("hive-nodes", "failed")
+    w.tick()
+    assert w.rounds()[0]["repair"]["rollback_to"] == C2
+
+
+def test_a_past_commit_with_only_failures_gives_no_rollback():
+    w = World(diagnose_fn=Counting(Finding("software", "x", "rollback", "pattern:gateway-cannot-follow")))
+    w.state.adopt(TRACK, Replan(new_target=C0, generation=1, previous_commit=None))
+    w.state.adopt(TRACK, Replan(new_target=C1, generation=2, previous_commit=C0))
+    w.mon.add("hive-nodes", "failed", to=C0, rx=10)
+    w.mon.add("hive-nodes", "failed")
+    w.tick()
+    assert w.rounds()[0]["repair"]["action"] == "none"
+
+
+def test_a_none_round_does_not_advance_the_attempt_count():
+    findings = iter([Finding("host", "disk", "none", "fallback"), RETRY])
+    w = World(diagnose_fn=lambda evidence, *, config=None: next(findings))
+    for n in range(2):
+        w.t[0] = 5000.0 + 1000 * n
+        w.mon.add("hive-nodes", "failed", rx=w.t[0] - 10)
+        w.tick()
+    first, second = w.rounds()
+    assert first["repair"]["action"] == "none" and first["attempt"] is None
+    assert w.ledger.attempts("hive-nodes", C1) == 1
+    assert second["repair"]["action"] == "retry" and second["attempt"] == 1
+
+
+def test_model_text_is_labelled_in_the_host_report():
+    w = World(diagnose_fn=Counting(Finding("host", "the disk is full", "none", "model")))
+    w.mon.add("hive-nodes", "failed")
+    w.tick()
+    report = w.ledger.get("hive-nodes", C1)["report"]
+    assert report["finding_source"] == "model"
+    assert report["next_step"].startswith("Model output (AI-generated, unverified): the disk is full")
