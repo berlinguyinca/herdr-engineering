@@ -133,7 +133,7 @@ function planCard(plan, coordinator) {
     <div data-deploy-current><strong>${esc(describeAction(plan.current))}</strong></div>
     <div class="hd-card__sub">Permitted now: ${list(plan.permitted).length ? esc(list(plan.permitted).join(', ')) : 'nothing'}</div>
     ${missing.length ? `<div class="hd-card__sub" data-deploy-missing>Not reporting for this release: ${esc(missing.join(', '))}</div>` : ''}
-    ${coordinator.evidence === 'unknown' ? '<div class="hd-card__sub">Release evidence is not wired: the coordinator holds until a release is confirmed.</div>' : ''}
+    ${coordinator.evidence === 'unknown' ? `<div class="hd-card__sub" data-deploy-evidence-note>Release evidence from GitHub is unknown${coordinator.evidence_error ? ` (${esc(text(coordinator.evidence_error))})` : ''}: the coordinator holds until a release is confirmed.</div>` : ''}
   </article>`;
 }
 
