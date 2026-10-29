@@ -31,7 +31,7 @@ export function lineageModel(entries, edges = [], nodes = [], now = Date.now()) 
   return { lanes: shown, hidden: ordered.length - shown.length, t0, t1, handoffs, agents: all.length };
 }
 
-const TONE = { current: 'var(--status-ok, #2e9d5b)', unconfirmed: 'var(--status-warn, #c58b1a)', failed: 'var(--status-failed, #c0392b)', finished: 'var(--text-tertiary, #8a8f98)' };
+const TONE = { current: 'var(--status-active)', unconfirmed: 'var(--status-attention)', failed: 'var(--status-failed)', finished: 'var(--text-muted)' };
 
 export function renderLineage(container, model) {
   if (!model.agents) { container.innerHTML = ''; return; }
@@ -67,7 +67,7 @@ export function renderLineage(container, model) {
   container.innerHTML = `<style>
 .al-wrap{margin:8px 0 14px;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:10px 12px}
 .al-wrap h2{font-size:13px;margin:0 0 4px}.al-wrap svg{width:100%;height:auto;display:block}
-.al-lane{font-size:11px;fill:var(--text-secondary)}.al-tick{font-size:10px;fill:var(--text-tertiary,var(--text-secondary))}
+.al-lane{font-size:11px;fill:var(--text-secondary)}.al-tick{font-size:10px;fill:var(--text-muted)}
 .al-guide{stroke:var(--border-subtle);stroke-width:1}.al-handoff{fill:none;stroke:var(--accent);stroke-width:1.6;marker-end:url(#al-arrow)}
 .al-note{font-size:12px;margin:4px 0 0}</style>
 <section class="al-wrap" aria-label="Agent lineage"><h2>Working now, by mission</h2>
@@ -95,6 +95,6 @@ export function agentStory(session, tree = {}, now = Date.now()) {
 
 export function renderStory(story) {
   const fmt = at => Number.isFinite(at) ? new Date(at).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : '';
-  return `<style>.as-story{list-style:none;margin:8px 0 14px;padding:0 0 0 14px;border-left:2px solid var(--border)}.as-story li{position:relative;padding:2px 0 8px 10px;font-size:13px;line-height:1.4;overflow-wrap:anywhere}.as-story li::before{content:"";position:absolute;left:-19px;top:7px;width:8px;height:8px;border-radius:50%;background:var(--text-tertiary,var(--border))}.as-story li[data-kind=start]::before{background:var(--accent)}.as-story li[data-kind=now]::before{background:var(--status-ok,#2e9d5b)}.as-story time{display:block;font-size:11px;color:var(--text-secondary)}</style>
+  return `<style>.as-story{list-style:none;margin:8px 0 14px;padding:0 0 0 14px;border-left:2px solid var(--border)}.as-story li{position:relative;padding:2px 0 8px 10px;font-size:13px;line-height:1.4;overflow-wrap:anywhere}.as-story li::before{content:"";position:absolute;left:-19px;top:7px;width:8px;height:8px;border-radius:50%;background:var(--text-muted)}.as-story li[data-kind=start]::before{background:var(--accent)}.as-story li[data-kind=now]::before{background:var(--status-ok,#2e9d5b)}.as-story time{display:block;font-size:11px;color:var(--text-secondary)}</style>
 <ol class="as-story" aria-label="How this agent started and proceeded">${story.steps.map(s => `<li data-kind="${esc(s.kind)}"><time>${esc(fmt(s.at))}</time>${esc(s.text)}</li>`).join('')}</ol>`;
 }

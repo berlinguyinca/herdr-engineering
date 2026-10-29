@@ -1045,8 +1045,8 @@ test('overview keeps healthy panels through partial errors and links to the exac
   assert.equal(await page.locator('herdr-app-shell .hd-shell__nav').isVisible(),false);
   await menu.click();assert.equal(await menu.getAttribute('aria-expanded'),'true');
   assert.equal(await page.locator('herdr-app-shell .hd-shell__nav').isVisible(),true);
-  await page.locator('herdr-app-shell .hd-shell__link[data-path="/analytics"]').click();
-  await page.getByRole('heading',{name:'Analytics',exact:true}).waitFor();
+  await page.locator('herdr-app-shell .hd-shell__link[data-path="/hosts"]').click();
+  await page.getByRole('heading',{name:'Hosts',exact:true}).waitFor();
   assert.equal(await menu.getAttribute('aria-expanded'),'false');
   assert.equal(await menu.evaluate(button=>button===button.getRootNode().activeElement),true);
   assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false);
