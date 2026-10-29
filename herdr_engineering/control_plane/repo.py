@@ -2676,6 +2676,13 @@ class ControlPlaneRepo:
             return [eid for (etype, eid), stream in self._events.items()
                     if etype == entity_type and stream]
 
+    def events_of_type(self, entity_type):
+        """Every stored event of one entity type, oldest stream first (a copy). Used to read back append-only logs
+        that a service writes through ``record_event`` (e.g. the assistant audit log) after a restart."""
+        with self._event_lock:
+            return [_copy(e) for (etype, _), stream in sorted(self._events.items()) if etype == entity_type
+                    for e in stream]
+
     def recent_events(self, limit=50):
         out = []
         by_sequence = {}
