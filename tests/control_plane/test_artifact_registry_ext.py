@@ -9,6 +9,7 @@ import pytest
 from herdr_engineering.control_plane.artifacts import ArtifactConflict, ArtifactError, ArtifactStore
 from tests.control_plane.registry_pg import FakeBlobs, registry_pg, uid  # noqa: F401 - imported fixture
 
+FAKE = "x" * 16     # placeholder shaped like a credential value; not a secret
 FORMATS = [("report.pdf", "application/pdf", b"%PDF-1.7 fake"),
            ("notes.md", "text/markdown", b"# notes\n"),
            ("data.json", "application/json", b'{"x": 1}')]
@@ -184,15 +185,15 @@ def test_provenance_is_validated_and_inputs_are_redacted(registry_pg):
         origin = {"task_id": uid("task"), "prompt_revision": "p-7", "skill_revision": "skill-x@1.2.0",
                   "inputs": [{"name": "prompt", "kind": "prompt", "value": "my password is hunter2"},
                              {"name": "config", "kind": "file", "sha256": "a" * 64, "size_bytes": 10,
-                              "headers": {"Authorization": "Bearer abcdefghijklmnop", "ok": "fine"}}]}
+                              "headers": {"Authorization": "Bearer " + FAKE, "ok": "fine"}}]}
         artifact_id, version = await publish(store, blobs, owner="o", name="a.md", media="text/markdown", data=b"a",
                                              origin=origin)
         stored = json.dumps((await store.get_version(version["version_id"]))["redacted_inputs"])
-        assert "hunter2" not in stored and "abcdefghijklmnop" not in stored and "fine" in stored
+        assert "hunter2" not in stored and FAKE not in stored and "fine" in stored
         first = (await store.get_version(version["version_id"]))["redacted_inputs"][0]
         assert first["redacted"] is True and len(first["sha256"]) == 64 and "value" not in first
         for bad in ({"unknown": 1}, {"commit_sha": "NOTHEX"}, {"task_id": ""}, {"task_id": "x\x00y"},
-                    {"model_id": "sk-abcdefghijklmnopqrstuvwxyz"}, {"inputs": "nope"}, "string"):
+                    {"model_id": "sk-" + "x" * 24}, {"inputs": "nope"}, "string"):
             with pytest.raises(ArtifactError):
                 await publish(store, blobs, owner="o", name="b.md", media="text/markdown", data=b"b", origin=bad)
         assert version["skill_revision"] == "skill-x@1.2.0"
