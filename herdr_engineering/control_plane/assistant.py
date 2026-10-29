@@ -30,7 +30,9 @@ Design contract (see ADR-0001, ADR-0002 in that directory):
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
+import logging
 import os
 import re
 import secrets
@@ -39,6 +41,24 @@ from collections.abc import Callable
 from dataclasses import dataclass, field, fields, replace
 from datetime import UTC, datetime, timedelta
 from typing import Any
+
+_log = logging.getLogger(__name__)
+_SECRET_KEY_RE = re.compile(r"(?i)(api[_-]?key|token|passw(or)?d|secret|authorization|credential|private[_-]?key)")
+_JSON_SECRET_RE = re.compile(
+    r'(?i)("[\w.\-]*(?:api[_-]?key|token|passw(?:or)?d|secret|authorization|credential|private[_-]?key)[\w.\-]*"'
+    r'\s*:\s*")((?:[^"\\]|\\.)*)(")')
+
+
+def redact_obj(value: Any) -> Any:
+    """Structural redaction: the value of a secret-looking key is replaced, every string is scrubbed. Returns a copy."""
+    if isinstance(value, dict):
+        return {k: ("***REDACTED***" if isinstance(k, str) and _SECRET_KEY_RE.search(k) and isinstance(v, (str, int))
+                    and v != "" else redact_obj(v)) for k, v in value.items()}
+    if isinstance(value, list):
+        return [redact_obj(v) for v in value]
+    if isinstance(value, str):
+        return redact_secrets(value)
+    return value
 
 
 def redact_secrets(text: str | None) -> str | None:
@@ -52,6 +72,7 @@ def redact_secrets(text: str | None) -> str | None:
     pat = re.compile(
         r"(?i)(authorization\s*:\s*bearer\s+|api[_-]?key[^\w]|token[^\w]|password[^\w]|secret[^\w])"
         r"([A-Za-z0-9_\-.:/=]{4,})")
+    text = _JSON_SECRET_RE.sub(lambda m: m.group(1) + "***REDACTED***" + m.group(3), text)   # {"api_key": "..."}
     return pat.sub(lambda m: m.group(1) + "***REDACTED***", text)
 
 
@@ -95,6 +116,7 @@ def assistant_config(cfg: dict[str, Any]) -> dict[str, Any]:
     notif = notif if isinstance(notif, dict) else {}
     collab_users = actions.get("collab_users")
     collab_users = collab_users if isinstance(collab_users, dict) else {}
+    audit_cfg = section.get("audit") if isinstance(section.get("audit"), dict) else {}
     tenancy = section.get("tenancy") if isinstance(section.get("tenancy"), dict) else {}
     tenant_map = tenancy.get("principals") if isinstance(tenancy.get("principals"), dict) else {}
     default_tenant = _tenant_id(tenancy.get("default_tenant", "default"), "tenancy.default_tenant")
@@ -139,6 +161,8 @@ def assistant_config(cfg: dict[str, Any]) -> dict[str, Any]:
         },
         # Tenant of each authenticated principal. YAML only (no env var, no header, no body field): a principal that
         # is not listed belongs to ``default_tenant``. A malformed tenant id stops startup rather than guessing.
+        # Optional HMAC for the audit chain: a PATH to a key file (never the key, never an env var).
+        "audit": {"hmac_key_file": str(audit_cfg.get("hmac_key_file") or "")},
         "tenancy": {
             "default_tenant": default_tenant,
             "principals": {str(k): _tenant_id(v, f"tenancy.principals[{k}]") for k, v in tenant_map.items()},
@@ -321,6 +345,7 @@ class AssistantAction:
     user_id: str = ""
     assistant_id: str = ""
     request_payload: dict[str, Any] = field(default_factory=dict)
+    payload_redacted: bool = False      # True when this copy had secrets scrubbed (a restored snapshot): not executable
     result: dict[str, Any] = field(default_factory=dict)       # bounded, redacted outcome of the execution
     executed_by: str = ""
     executed_at: datetime | None = None
@@ -584,9 +609,11 @@ class AssistantProposal:
     executed_at: datetime | None = None
     result_ref: str = ""            # e.g. the delegation id the executor created
     execution_error: str = ""
+    audit_pending: bool = False     # the post-hand-off audit entry could not be written yet (repair retries it)
 
     def as_dict(self) -> dict[str, Any]:
         return {
+            "audit_pending": self.audit_pending,
             "executed_by": self.executed_by, "result_ref": self.result_ref,
             "executed_at": self.executed_at.isoformat() if self.executed_at else None,
             "execution_error": self.execution_error,
@@ -1268,6 +1295,7 @@ class AssistantStore:
         # (entry) -> None. Wired by the control plane to the repo event store so every entry is durable BEFORE it is
         # visible here; a failing sink raises and the caller's operation fails closed.
         self.audit_sink: Callable[[dict[str, Any]], None] | None = None
+        self.audit_key: bytes = b""           # optional HMAC key (read from a file named in YAML by the service)
         self._lock = threading.RLock()
 
     # -- durable snapshots (R1) ----------------------------------------------
@@ -1285,6 +1313,11 @@ class AssistantStore:
             if isinstance(v, datetime):
                 v = {"$dt": v.isoformat()}
             out[f.name] = v
+        if isinstance(e, AssistantAction) and e.request_payload:
+            # The live payload is needed to run an approved action; a persisted copy is not allowed to carry a secret.
+            safe = redact_obj(e.request_payload)
+            if safe != e.request_payload:
+                out["request_payload"], out["payload_redacted"] = safe, True
         return out
 
     @staticmethod
@@ -1382,10 +1415,20 @@ class AssistantStore:
         with self._lock:
             return [dict(e) for e in self._audit]
 
-    @staticmethod
-    def _audit_digest(entry: dict[str, Any]) -> str:
+    def _audit_digest(self, entry: dict[str, Any]) -> str:
         body = {k: v for k, v in entry.items() if k != "sha256"}
-        return hashlib.sha256(canonical_json(body).encode()).hexdigest()
+        data = canonical_json(body).encode()
+        if entry.get("mac") == "hmac-sha256":
+            if not self.audit_key:
+                return ""                                   # cannot be verified without the key
+            return hmac.new(self.audit_key, data, hashlib.sha256).hexdigest()
+        return hashlib.sha256(data).hexdigest()
+
+    def audit_head(self, tenant_id: str) -> dict[str, Any]:
+        """The newest entry of a tenant's chain: anchor this OUTSIDE the event store to detect truncation/rollback."""
+        with self._lock:
+            tail = next((e for e in reversed(self._audit) if e.get("tenant_id") == tenant_id and "seq" in e), None)
+            return {"seq": tail["seq"], "sha256": tail["sha256"], "keyed": tail.get("mac") == "hmac-sha256"} if tail else {}
 
     def audit_record(self, *, tenant_id: str, user_id: str, actor: str,
                      action: str, subject_id: str, detail: str = "") -> None:
@@ -1404,6 +1447,8 @@ class AssistantStore:
                 "seq": (int(tail.get("seq", 0)) + 1) if tail else 1,
                 "prev_sha256": tail.get("sha256", "") if tail else "",
             }
+            if self.audit_key:
+                entry["mac"] = "hmac-sha256"
             entry["sha256"] = self._audit_digest(entry)
             if self.audit_sink is not None:
                 self.audit_sink(dict(entry))            # durable first; raises -> nothing is appended
@@ -1718,6 +1763,16 @@ class AssistantService:
             self.store = AssistantStore(persist_backend=backend)
             self.store.load_persisted()
         self.now = now or _now
+        key_file = (self.config.get("audit") or {}).get("hmac_key_file")
+        if key_file:
+            try:
+                with open(key_file, "rb") as fh:
+                    key = fh.read().strip()
+            except OSError as exc:
+                raise ValueError(f"personal_assistant.audit.hmac_key_file cannot be read: {exc.strerror}") from None
+            if len(key) < 16:
+                raise ValueError("personal_assistant.audit.hmac_key_file must hold at least 16 bytes")
+            self.store.audit_key = key
         fc = self.config.get("fleet_context") or {}
         self.fleet_context = (FleetContextProvider(
             repo, max_chars=fc.get("max_chars", 6000), per_section=fc.get("per_section", 10))
@@ -2271,7 +2326,7 @@ class AssistantService:
             res["lineage_node"] = lineage.get("node")
             if lineage.get("error"):
                 res["lineage_error"] = redact_secrets(str(lineage["error"]))[:200]
-        res["summary"] = (redact_secrets(canonical_json({k: v for k, v in out.items() if k not in ("lineage", "body")})) or "")[:600]
+        res["summary"] = (redact_secrets(canonical_json(redact_obj({k: v for k, v in out.items() if k not in ("lineage", "body")}))) or "")[:600]
         return res
 
     def execute_approved_action(self, action_id: str, *, tenant_id: str, user_id: str,
@@ -2298,6 +2353,8 @@ class AssistantService:
                                     detail=f"{action.tool_id}: {message}")
             raise exc(message)
 
+        if action.status in ("completed", "failed") and (action.result or {}).get("audit_pending"):
+            self._repair_action_audit(action, o_tenant, o_user, actor)
         if action.status == "completed":
             return action                                  # a replay returns the recorded outcome, runs nothing
         if action.status == "executing":
@@ -2326,19 +2383,27 @@ class AssistantService:
             self.store.put_action(action)
             refuse("grant", "the grant was revoked or expired")
         payload = action.request_payload
+        if action.payload_redacted:
+            raise AssistantError("the request held secret content that is not persisted; request the action again")
         if not payload:
             raise AssistantError("the request payload was not recorded; request the action again")
         if request_digest(tenant_id=o_tenant, user_id=o_user, assistant_id=o_assistant, tool_id=action.tool_id,
                           scope=action.scope, payload=payload) != action.request_hash:
             self.fail_action(action)
             refuse("hash", "the recorded payload no longer matches what was approved")
-        # Durable BEFORE the side effect: if the audit store cannot take this entry, nothing has run and the action
-        # is still approved (the caller may retry once the store is back).
-        self.store.audit_record(tenant_id=o_tenant, user_id=o_user, actor=actor,
-                                action="assistant.action.executing", subject_id=action.action_id,
-                                detail=f"{action.tool_id} {action.scope} approval={action.approval_id or 'grant'}")
+        prior = action.status
         if not self.claim_action(action):
             raise AssistantError("this action is not executable (it was claimed by another caller)")
+        # Durable BEFORE the side effect, and only by the caller that holds the claim (so two callers never both log).
+        # If the audit store cannot take it, nothing has run: the claim is released and the action is still approved.
+        try:
+            self.store.audit_record(tenant_id=o_tenant, user_id=o_user, actor=actor,
+                                    action="assistant.action.executing", subject_id=action.action_id,
+                                    detail=f"{action.tool_id} {action.scope} approval={action.approval_id or 'grant'}")
+        except Exception:
+            action.status = prior
+            self.store.put_action(action)
+            raise
         try:
             out = self.execute_tool(tenant_id=o_tenant, user_id=o_user, assistant_id=o_assistant,
                                     tool_id=action.tool_id, payload=dict(payload), actor=actor, action=action)
@@ -2346,17 +2411,72 @@ class AssistantService:
             action.result = {"ok": False, "error": (redact_secrets(f"{type(exc).__name__}: {exc}") or "")[:300]}
             action.executed_by, action.executed_at = actor, self.now()
             self.fail_action(action)
-            self.store.audit_record(tenant_id=o_tenant, user_id=o_user, actor=actor,
-                                    action="assistant.action.failed", subject_id=action.action_id,
-                                    detail=f"{action.tool_id}: {action.result['error']}")
+            self._audit_after_effect(action, o_tenant, o_user, actor, "assistant.action.failed",
+                                     f"{action.tool_id}: {action.result['error']}")
             return action
         action.result = self._result_summary(out if isinstance(out, dict) else {})
         action.executed_by, action.executed_at = actor, self.now()
         self.complete_action(action)
-        self.store.audit_record(tenant_id=o_tenant, user_id=o_user, actor=actor,
-                                action="assistant.action.executed", subject_id=action.action_id,
-                                detail=f"{action.tool_id} {action.scope} approval={action.approval_id or 'grant'}")
+        self._audit_after_effect(action, o_tenant, o_user, actor, "assistant.action.executed",
+                                 f"{action.tool_id} {action.scope} approval={action.approval_id or 'grant'}")
         return action
+
+    def _audit_after_effect(self, action: AssistantAction, tenant: str, user: str, actor: str,
+                            what: str, detail: str) -> bool:
+        """The side effect HAS happened, so a failing audit store must not turn the outcome into an error. Keep the
+        real result, flag it ``audit_pending`` with the error, log loudly, and let ``_repair_action_audit`` (run on a
+        replay and by ``repair_pending_audits``) write the entry later."""
+        try:
+            self.store.audit_record(tenant_id=tenant, user_id=user, actor=actor, action=what,
+                                    subject_id=action.action_id, detail=detail)
+            return True
+        except Exception as exc:  # noqa: BLE001
+            _log.error("assistant audit entry %s for action %s could not be written: %s", what, action.action_id, exc)
+            action.result = {**(action.result or {}), "audit_pending": True, "audit_action": what,
+                             "audit_detail": detail[:300], "audit_error": f"{type(exc).__name__}: {exc}"[:200]}
+            self.store.put_action(action)
+            return False
+
+    def _repair_action_audit(self, action: AssistantAction, tenant: str, user: str, actor: str) -> bool:
+        res = dict(action.result or {})
+        try:
+            self.store.audit_record(tenant_id=tenant, user_id=user, actor=actor,
+                                    action=res.get("audit_action") or "assistant.action.executed",
+                                    subject_id=action.action_id,
+                                    detail=(res.get("audit_detail") or "") + " (repaired)")
+        except Exception as exc:  # noqa: BLE001
+            _log.error("assistant audit repair for action %s failed: %s", action.action_id, exc)
+            return False
+        for k in ("audit_pending", "audit_action", "audit_detail", "audit_error"):
+            res.pop(k, None)
+        action.result = res
+        self.store.put_action(action)
+        return True
+
+    def repair_pending_audits(self, *, tenant_id: str, user_id: str) -> int:
+        """Write the audit entries that could not be written after an effect. Returns how many were repaired."""
+        self._require_enabled()
+        done = 0
+        for a in list(self.store.actions.values()):
+            owner = self._action_owner(a)
+            if owner and owner[0] == tenant_id and owner[1] == user_id and (a.result or {}).get("audit_pending"):
+                done += self._repair_action_audit(a, tenant_id, user_id, user_id)
+        for x in list(self.store.proposals.values()):
+            if x.tenant_id == tenant_id and x.user_id == user_id and x.audit_pending:
+                done += self._repair_proposal_audit(x, user_id)
+        return done
+
+    def _repair_proposal_audit(self, x: AssistantProposal, actor: str) -> bool:
+        try:
+            self.store.audit_record(tenant_id=x.tenant_id, user_id=x.user_id, actor=actor,
+                                    action="assistant.proposal.executed", subject_id=x.proposal_id,
+                                    detail=f"{x.kind} -> delegation {x.result_ref} (repaired)")
+        except Exception as exc:  # noqa: BLE001
+            _log.error("assistant audit repair for proposal %s failed: %s", x.proposal_id, exc)
+            return False
+        x.audit_pending = False
+        self.store.put_proposal(x)
+        return True
 
     def approval_view(self, approval: AssistantApproval) -> dict[str, Any]:
         """An approval plus the state of its action, for the dashboard. Adds no payload."""
@@ -2387,6 +2507,8 @@ class AssistantService:
             raise exc(message)
 
         if x.execution == "executed":
+            if x.audit_pending:
+                self._repair_proposal_audit(x, actor)
             return x
         if x.execution in ("executing", "failed"):
             raise AssistantError(f"this proposal is {x.execution}" + ("; it is not retried" if x.execution == "failed" else ""))
@@ -2401,13 +2523,18 @@ class AssistantService:
                 x.execution, x.execution_error = "failed", "payload changed after approval"
             self.store.put_proposal(x)
             refuse("the payload changed after approval")
-        self.store.audit_record(tenant_id=x.tenant_id, user_id=x.user_id, actor=actor,
-                                action="assistant.proposal.executing", subject_id=proposal_id, detail=x.kind)
         with self.store._lock:                                  # claim: exactly one caller proceeds
             if x.execution != "not_started":
                 raise AssistantError(f"this proposal is {x.execution}")
             x.execution = "executing"
         self.store.put_proposal(x)
+        try:                                                    # durable before the hand-off, by the claim holder only
+            self.store.audit_record(tenant_id=x.tenant_id, user_id=x.user_id, actor=actor,
+                                    action="assistant.proposal.executing", subject_id=proposal_id, detail=x.kind)
+        except Exception:
+            x.execution = "not_started"                         # nothing happened: release the claim
+            self.store.put_proposal(x)
+            raise
         try:
             p = x.payload
             if x.kind == "propose_branch":
@@ -2434,10 +2561,14 @@ class AssistantService:
             return x
         x.execution, x.result_ref = "executed", d.delegation_id
         x.executed_by, x.executed_at = actor, self.now()
+        try:
+            self.store.audit_record(tenant_id=x.tenant_id, user_id=x.user_id, actor=actor,
+                                    action="assistant.proposal.executed", subject_id=proposal_id,
+                                    detail=f"{x.kind} -> delegation {d.delegation_id}")
+        except Exception as exc:  # noqa: BLE001 - the hand-off happened; keep the truth and repair the entry later
+            _log.error("assistant audit entry for executed proposal %s could not be written: %s", proposal_id, exc)
+            x.audit_pending = True
         self.store.put_proposal(x)
-        self.store.audit_record(tenant_id=x.tenant_id, user_id=x.user_id, actor=actor,
-                                action="assistant.proposal.executed", subject_id=proposal_id,
-                                detail=f"{x.kind} -> delegation {d.delegation_id}")
         corr = {**(x.correlation or {}), "action_id": f"exec.{x.proposal_id}", "tool_id": x.kind,
                 "proposal_id": x.proposal_id, "delegation_id": d.delegation_id}
         corr.pop("approval_id", None)
@@ -2871,9 +3002,9 @@ class AssistantService:
         d = DelegationRequest(delegation_id=_new_id("dlg"), tenant_id=tenant_id,
                               user_id=user_id, assistant_id=assistant_id,
                               task=task, target_system=target_system)
-        self.store.put_delegation(d)
         self.store.audit_record(tenant_id=tenant_id, user_id=user_id, actor=actor or user_id,
                                 action="assistant.delegation.created", subject_id=d.delegation_id)
+        self.store.put_delegation(d)                                # audit first: a refusal leaves no orphan
         return d
 
     def list_delegations(self, *, tenant_id: str, user_id: str) -> list[DelegationRequest]:
@@ -2957,10 +3088,10 @@ class AssistantService:
                     d.note = "re-review not recorded: the PR is not visible to you"
                 except ValueError as exc:
                     d.note = f"re-review not recorded: {str(exc)[:200]}"
-        self.store.put_delegation(d)
         self.store.audit_record(tenant_id=tenant_id, user_id=user_id, actor=actor,
                                 action="assistant.review.requested", subject_id=d.delegation_id,
-                                detail=f"{target} {pr_id}")
+                                detail=f"{target} {pr_id}")          # audit first: a refusal leaves no orphan record
+        self.store.put_delegation(d)
         return d
 
     def create_proposal(self, *, tenant_id: str, user_id: str, assistant_id: str, kind: str,

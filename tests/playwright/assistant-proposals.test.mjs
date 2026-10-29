@@ -31,7 +31,7 @@ async function withPage(fn, { width = 1100 } = {}) {
   let browser;
   try {
     const fallback = '/home/wohlgemuth/.cache/ms-playwright/chromium-1243/chrome-linux64/chrome';
-    const executablePath = process.env.PLAYWRIGHT_CHROMIUM || (existsSync(fallback) ? fallback : undefined);
+    const executablePath = existsSync(fallback) ? fallback : undefined;   // else Playwright's own browser
     browser = await chromium.launch({ headless: true, args: ['--no-sandbox'], executablePath });
     const page = await browser.newPage({ viewport: { width, height: 900 } });
     await page.goto(`http://127.0.0.1:${server.address().port}/`);

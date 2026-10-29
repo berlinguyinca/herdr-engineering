@@ -3045,7 +3045,8 @@ def _make_handler(server, public=False, operator=False):
                 return {"status": "not_executed", "error": str(exc)}
             except Exception:  # noqa: BLE001 - e.g. the audit store refused the pre-execution entry: nothing ran
                 logging.getLogger(__name__).exception("assistant action %s was not executed", action_id)
-                return {"status": "not_executed", "error": "the action could not be started; nothing was run"}
+                return {"status": "not_executed", "error": "the action could not be started (the audit store refused the "
+                                                    "pre-execution entry); nothing was run"}
             return {"status": action.status, "result": action.result or {},
                     "executed_at": action.executed_at.isoformat() if action.executed_at else None}
 
@@ -3100,9 +3101,11 @@ def _make_handler(server, public=False, operator=False):
                         return self._json(svc.get_routine(parts[6], tenant_id=tenant_id, user_id=user_id).as_dict())
                 if resource == "assistant-audit" and len(parts) == 4:
                     # read only: there is no POST/PATCH/DELETE route for the audit log
+                    repaired = svc.repair_pending_audits(tenant_id=tenant_id, user_id=user_id)
                     return self._json({"audit": svc.audit_log(tenant_id=tenant_id, user_id=user_id,
                                                               limit=int(_q(self.path, "limit") or 200)),
-                                       "chain_intact": svc.store.verify_audit(tenant_id)})
+                                       "chain_intact": svc.store.verify_audit(tenant_id),
+                                       "head": svc.store.audit_head(tenant_id), "repaired": repaired})
                 if resource == "assistant-proposals" and len(parts) == 6 and parts[5] == "preview":
                     return self._json(svc.preview_proposal(parts[4], tenant_id=tenant_id, user_id=user_id))
                 if resource == "assistant-proposals" and len(parts) == 4:
@@ -3344,11 +3347,25 @@ def _make_handler(server, public=False, operator=False):
                 if resource == "assistant-proposals" and len(parts) == 6 and parts[5] == "decision":
                     x = svc.decide_proposal(parts[4], tenant_id=tenant_id, user_id=user_id,
                                             decision=body.get("decision", ""), actor=user_id)
+                    out, run_error = None, None
                     if (x.status == "approved" and svc.config["actions"]["auto_execute"]
                             and x.kind in ("propose_branch", "request_mission")):
-                        x = svc.execute_approved_proposal(x.proposal_id, tenant_id=tenant_id, user_id=user_id,
-                                                          actor=user_id)
-                    return self._json(x.as_dict())
+                        # the decision is already committed: an execution problem is reported next to it, never as
+                        # a failed request
+                        try:
+                            x = svc.execute_approved_proposal(x.proposal_id, tenant_id=tenant_id, user_id=user_id,
+                                                              actor=user_id)
+                        except AssistantNotFound:
+                            raise
+                        except AssistantError as exc:
+                            run_error = str(exc)
+                        except Exception:  # noqa: BLE001
+                            logging.getLogger(__name__).exception("proposal %s was not executed", x.proposal_id)
+                            run_error = "the proposal could not be started; nothing was handed off"
+                    out = x.as_dict()
+                    if run_error:
+                        out["execution_error"] = out.get("execution_error") or run_error
+                    return self._json(out)
                 if resource == "assistant-proposals" and len(parts) == 6 and parts[5] == "execute":
                     x = svc.execute_approved_proposal(parts[4], tenant_id=tenant_id, user_id=user_id, actor=user_id)
                     return self._json(x.as_dict(), 200 if x.execution == "executed" else 409)

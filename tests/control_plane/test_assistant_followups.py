@@ -781,3 +781,245 @@ def test_repeated_connector_test_clicks_reuse_the_pending_approval_and_the_summa
                          {"decision": "approved"})
     assert decided["execution"]["status"] == "completed"
     assert "EXTERNAL-RESPONSE-BODY" not in json.dumps(decided["result"])
+
+
+# ---- review round 2 ------------------------------------------------------------------------------------------
+
+def sink_failing_on(svc, *names):
+    real = svc.store.audit_sink
+
+    def sink(entry):
+        if entry["action"] in names:
+            raise OSError("event store unavailable")
+        if real is not None:
+            real(entry)
+    svc.store.audit_sink = sink
+    return real
+
+
+def test_f1_a_failing_post_effect_audit_keeps_the_completed_result_and_is_repaired_on_replay():
+    svc, run, _ = build()
+    grant(svc, run, "request_review", "claude")
+    action = request(svc, run, "request_review", REVIEW, scope="claude")
+    approve(svc, action)
+    real = sink_failing_on(svc, "assistant.action.executed")
+    done = execute(svc, action)
+    assert done.status == "completed" and svc.review_rereview.call_count == 1 and len(svc.store.delegations) == 1
+    assert done.result["audit_pending"] is True and "OSError" in done.result["audit_error"]
+    assert not any(e["action"] == "assistant.action.executed" for e in svc.store.audit)
+    svc.store.audit_sink = real                                             # the store is back
+    again = execute(svc, action)
+    assert again.status == "completed" and "audit_pending" not in again.result
+    assert svc.review_rereview.call_count == 1                              # repair never re-runs the effect
+    assert any(e["action"] == "assistant.action.executed" for e in svc.store.audit)
+
+
+def test_f1_the_repair_also_runs_from_the_service_entry_point_the_audit_route_uses():
+    svc, run, _ = build()
+    grant(svc, run, "request_review", "claude")
+    action = request(svc, run, "request_review", REVIEW, scope="claude")
+    approve(svc, action)
+    real = sink_failing_on(svc, "assistant.action.executed")
+    execute(svc, action)
+    assert svc.repair_pending_audits(tenant_id="t", user_id="key:u1") == 0   # still down: stays pending, no crash
+    svc.store.audit_sink = real
+    assert svc.repair_pending_audits(tenant_id="t", user_id="key:u1") == 1
+    assert "audit_pending" not in action.result
+
+
+def test_f1_http_never_says_nothing_ran_when_the_effect_ran(world):
+    h, svc, _ = world
+    aid, run = setup_assistant(h, "alice")
+    grant_via_service(svc, "alice", aid, "request_review", "claude")
+    st, out = h.call("alice", "POST", f"/api/v1/assistant-runs/{run}/tool",
+                     {"tool_id": "request_review", "scope": "claude", "idempotency_key": "f1", "payload": REVIEW})
+    real = sink_failing_on(svc, "assistant.action.executed")
+    st, decided = h.call("boss", "POST", f"/api/v1/assistant-approvals/{out['approval_id']}/decision",
+                         {"decision": "approved"})
+    assert st == 200 and decided["execution"]["status"] == "completed"
+    assert decided["execution"]["result"]["audit_pending"] is True
+    assert len(svc.store.delegations) == 1
+    svc.store.audit_sink = real
+    st, aud = h.call("alice", "GET", "/api/v1/assistant-audit")
+    assert aud["repaired"] == 1 and any(e["action"] == "assistant.action.executed" for e in aud["audit"])
+
+
+def test_f1_proposal_hand_off_survives_a_failing_post_effect_audit_and_is_repaired():
+    svc, run, _ = build()
+    grant(svc, run, "request_mission")
+    propose(svc, run, "request_mission", {"title": "A", "task": "t1"})
+    (x,) = svc.store.proposals.values()
+    svc.decide_proposal(x.proposal_id, tenant_id="t", user_id="key:u1", decision="approved", actor="key:u1")
+    real = sink_failing_on(svc, "assistant.proposal.executed")
+    done = svc.execute_approved_proposal(x.proposal_id, tenant_id="t", user_id="key:u1", actor="key:u1")
+    assert done.execution == "executed" and done.audit_pending and len(svc.store.delegations) == 1
+    svc.store.audit_sink = real
+    again = svc.execute_approved_proposal(x.proposal_id, tenant_id="t", user_id="key:u1", actor="key:u1")
+    assert again.execution == "executed" and not again.audit_pending and len(svc.store.delegations) == 1
+    assert any(e["action"] == "assistant.proposal.executed" for e in svc.store.audit)
+
+
+def test_f3_proposal_decision_returns_200_with_the_execution_problem_reported(world):
+    h, svc, _ = world
+    aid, run = setup_assistant(h, "alice")
+    grant_via_service(svc, "alice", aid, "request_mission")
+    svc._execute_gated(svc.store.runs[run], "request_mission", {"title": "T", "task": "do it"}, 4000)
+    (x,) = svc.store.proposals.values()
+    real = svc.execute_approved_proposal
+    svc.execute_approved_proposal = Mock(side_effect=OSError("audit store down"))
+    st, out = h.call("boss", "POST", f"/api/v1/assistant-proposals/{x.proposal_id}/decision",
+                     {"decision": "approved"})
+    assert st == 200 and out["status"] == "approved" and out["execution"] == "not_started"
+    assert "nothing was handed off" in out["execution_error"]
+    svc.execute_approved_proposal = Mock(side_effect=AssistantError("something refused"))
+    svc.store.proposals[x.proposal_id].status = "awaiting_approval"
+    st, out = h.call("boss", "POST", f"/api/v1/assistant-proposals/{x.proposal_id}/decision",
+                     {"decision": "approved"})
+    assert st == 200 and out["execution_error"] == "something refused"
+    svc.execute_approved_proposal = real
+    st, out = h.call("boss", "POST", f"/api/v1/assistant-proposals/{x.proposal_id}/execute", {})
+    assert st == 200 and out["execution"] == "executed"
+
+
+# F4 / F5: secrets in JSON form and in persisted payloads. Fake secrets are built by concatenation.
+FAKE = "sk" + "-" + "z" * 12
+BEARER = "Bearer " + "q" * 20
+
+
+def test_f4_json_encoded_secrets_are_redacted_by_the_shared_redactor():
+    from herdr_engineering.control_plane.assistant import redact_obj, redact_secrets
+    text = json.dumps({"api" + "_key": FAKE, "to" + "ken": FAKE, "nested": {"client_" + "secret": FAKE}, "ok": "visible"})
+    out = redact_secrets(text)
+    assert FAKE not in out and "visible" in out
+    assert FAKE not in json.dumps(redact_obj({"Auth" + "orization": BEARER, "body": [{"pass" + "word": FAKE}], "n": 3}))
+    assert redact_obj({"n": 3, "t": "plain"}) == {"n": 3, "t": "plain"}
+
+
+def test_f4_result_summary_never_carries_a_json_secret():
+    svc, _, _ = build()
+    summary = svc._result_summary({"ok": True, "echo": json.dumps({"api" + "_key": FAKE}), "token_like": {"to" + "ken": FAKE}})
+    assert FAKE not in json.dumps(summary)
+
+
+def connector_world():
+    svc, run, clock = build()
+    conn = svc.register_connector(tenant_id="t", user_id="key:u1", name="W", kind="http",
+                                  base_url="https://w.example.com", auth={"_allowed_origins": ["w.example.com"]})
+    svc._transport = Mock(return_value={"status": 200, "body": "fine"})
+    grant(svc, run, "connector_request", conn.connector_id)
+    body = {"connector_id": conn.connector_id, "method": "POST", "path": "/x",
+            "body": {"note": "hello", "authorization": BEARER, "inner": {"api" + "_key": FAKE}}}
+    action = request(svc, run, "connector_request", body, scope=conn.connector_id)
+    approve(svc, action)
+    return svc, run, action, conn
+
+
+def test_f5_a_secret_in_a_request_body_never_reaches_snapshot_audit_or_views_but_the_call_still_works():
+    svc, run, action, conn = connector_world()
+    execute(svc, action)
+    sent = svc._transport.call_args.kwargs["body"] if svc._transport.call_args.kwargs else svc._transport.call_args.args[3]
+    assert sent["authorization"] == BEARER                                  # the live call used the real value
+    blob = json.dumps(svc.store.snapshot(), default=str) + json.dumps(svc.store.audit, default=str)
+    blob += json.dumps(action.as_dict()) + json.dumps([svc.approval_view(a) for a in svc.store.approvals.values()])
+    blob += json.dumps([a.as_dict() for a in svc.store.approvals.values()])
+    assert BEARER not in blob and FAKE not in blob and "q" * 20 not in blob
+    assert "hello" in blob                                                  # non-secret content is kept
+
+
+def test_f5_a_restored_action_with_scrubbed_secrets_refuses_instead_of_sending_a_placeholder():
+    from herdr_engineering.control_plane.assistant import AssistantStore
+    svc, run, action, conn = connector_world()
+    snap = svc.store.snapshot()
+    svc2 = AssistantService(config=svc.config, store=AssistantStore(), now=svc.now)
+    svc2.store.restore(snap)
+    svc2._transport = Mock()
+    restored = svc2.store.actions[action.action_id]
+    assert restored.payload_redacted
+    with pytest.raises(AssistantError, match="not persisted"):
+        svc2.execute_approved_action(action.action_id, tenant_id="t", user_id="key:u1", actor="key:u1")
+    svc2._transport.assert_not_called()
+    assert restored.status == "approved"                                    # not burned: a new request can follow
+
+
+def test_f6_concurrent_callers_write_one_executing_entry_and_one_effect():
+    svc, run, _ = build()
+    gate, entered = threading.Event(), threading.Event()
+
+    def slow(*a):
+        entered.set()
+        gate.wait(2)
+        return "ok"
+    svc.review_rereview = Mock(side_effect=slow)
+    grant(svc, run, "request_review", "claude")
+    action = request(svc, run, "request_review", REVIEW, scope="claude")
+    approve(svc, action)
+    t1 = threading.Thread(target=lambda: execute(svc, action))
+    t1.start()
+    assert entered.wait(2)
+    with pytest.raises(AssistantError, match="already running"):
+        execute(svc, action)
+    gate.set()
+    t1.join(3)
+    mine = [e["action"] for e in svc.store.audit if e["subject_id"] == action.action_id]
+    assert mine.count("assistant.action.executing") == 1 and svc.review_rereview.call_count == 1
+
+
+def test_f6_a_failing_audit_leaves_no_orphan_delegation_on_either_path():
+    svc, run, _ = build()
+    grant(svc, run, "request_mission")
+    propose(svc, run, "request_mission", {"title": "A", "task": "t1"})
+    (x,) = svc.store.proposals.values()
+    svc.decide_proposal(x.proposal_id, tenant_id="t", user_id="key:u1", decision="approved", actor="key:u1")
+    sink_failing_on(svc, "assistant.delegation.created")
+    done = svc.execute_approved_proposal(x.proposal_id, tenant_id="t", user_id="key:u1", actor="key:u1")
+    assert done.execution == "failed" and not svc.store.delegations         # nothing queued that the audit never saw
+    svc2, run2, _ = build()
+    grant(svc2, run2, "request_review", "claude")
+    action = request(svc2, run2, "request_review", REVIEW, scope="claude")
+    approve(svc2, action)
+    sink_failing_on(svc2, "assistant.review.requested")
+    assert execute(svc2, action).status == "failed" and not svc2.store.delegations
+
+
+# F2: optional HMAC keying from a file named in YAML.
+def keyed_service(tmp_path, key=None):
+    path = tmp_path / "audit.key"
+    path.write_bytes(key if key is not None else (b"audit-" + b"mac-" + b"k" * 20))
+    return AssistantService(config=assistant_config({"personal_assistant": {
+        "enabled": True, "audit": {"hmac_key_file": str(path)}}}))
+
+
+def test_f2_a_keyed_chain_cannot_be_recomputed_without_the_key(tmp_path):
+    svc = keyed_service(tmp_path)
+    a = svc.create_assistant(tenant_id="t", user_id="u", name="A")
+    svc.archive_assistant(a.assistant_id, tenant_id="t", user_id="u")
+    rows = svc.store.audit
+    assert rows and all(e["mac"] == "hmac-sha256" for e in rows) and svc.store.verify_audit("t")
+    # an attacker who edits an entry and recomputes the plain SHA-256 chain is caught
+    forged = svc.store._audit
+    forged[0]["detail"] = "forged"
+    body = {k: v for k, v in forged[0].items() if k != "sha256"}
+    forged[0]["sha256"] = hashlib.sha256(json.dumps(body, sort_keys=True, separators=(",", ":"), default=str).encode()).hexdigest()
+    assert not svc.store.verify_audit("t")
+    # and a verifier without the key cannot vouch for a keyed chain
+    other = AssistantService(config=assistant_config({"personal_assistant": {"enabled": True}}))
+    other.store.restore({"audit": rows})
+    assert not other.store.verify_audit("t")
+
+
+def test_f2_the_head_anchors_truncation_and_bad_key_files_stop_startup(tmp_path):
+    svc = keyed_service(tmp_path)
+    for n in range(3):
+        svc.create_assistant(tenant_id="t", user_id="u", name=f"A{n}")
+    anchor = svc.store.audit_head("t")
+    assert anchor["keyed"] and anchor["seq"] == len(svc.store.audit)
+    svc.store._audit.pop()                                                  # tail truncation: the chain still verifies...
+    assert svc.store.verify_audit("t")
+    assert svc.store.audit_head("t") != anchor                              # ...but the anchored head exposes it
+    cfg = lambda p: assistant_config({"personal_assistant": {"enabled": True, "audit": {"hmac_key_file": str(p)}}})  # noqa: E731
+    with pytest.raises(ValueError, match="cannot be read"):
+        AssistantService(config=cfg(tmp_path / "missing"))
+    short = tmp_path / "short"
+    short.write_bytes(b"tiny")
+    with pytest.raises(ValueError, match="at least 16"):
+        AssistantService(config=cfg(short))

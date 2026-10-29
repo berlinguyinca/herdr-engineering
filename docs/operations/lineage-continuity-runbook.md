@@ -146,6 +146,20 @@ control_plane:
   change or delete an entry. Approved actions and proposals write an `...executing` audit entry BEFORE their side
   effect, so with the event store down nothing is run and the action stays approved. Other operations error when the
   entry cannot be written, but the state change made just before it may already be stored.
+* Audit integrity limits. Without a key the chain is an unkeyed SHA-256: it detects casual edits and a removed or
+  reordered entry in the middle, but anyone who can write the event store can recompute it, and truncating the tail
+  or rolling the stream back still verifies. Set `personal_assistant.audit.hmac_key_file` to the PATH of a file (at
+  least 16 bytes, outside the repo, readable by the control plane; a missing or short file stops startup) and entries
+  are HMAC-SHA-256 keyed, so an edit cannot be re-signed without the key. Truncation or rollback is only detectable
+  against a head recorded elsewhere: `GET /api/v1/assistant-audit` returns `head` (`seq`, `sha256`); keep the latest
+  one off the box and compare. Rotating the key makes older keyed entries unverifiable by the new key.
+* After an effect (review request, comment, draft, connector call, hand-off) a failing audit store does not turn the
+  result into an error: the action stays `completed` with `result.audit_pending`/`audit_error`, the error is logged,
+  and the entry is written on the next replay of `.../execute` or the next `GET /api/v1/assistant-audit`.
+* A queued action keeps its request payload in memory so it can run; the persisted copy has secret-looking values
+  scrubbed. An action restored from a snapshot that had to scrub a secret is refused (`not persisted`) rather than
+  sent with a placeholder: request it again. Content that is secret but does not look like one (free text) is stored.
+* Review findings F7 and F8 are not addressed in this change.
 * Moving a principal to a new tenant in `tenancy.principals` hides what it created under its old tenant (`default`):
   assistants, memory, approvals and notifications are tenant-scoped. Re-create them or keep the mapping.
 
