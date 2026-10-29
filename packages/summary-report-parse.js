@@ -2,7 +2,7 @@
 // Best effort: a report that does not match the expected shape falls back to plain rendering (sections: []).
 const SECTION = /^\s*(?:#{1,6}\s*)?(?:\*\*)?\s*(\d{1,2})[.)]\s+(?:\*\*)?([^*\n]+?)(?:\*\*)?\s*(?:[—:-]\s*(.*))?$/;
 const COVERAGE = /\*{0,2}Evidence coverage\*{0,2}\s*:?\s*\*{0,2}\s*`?(complete|partial|limited)\b/i;
-const STATUS = /\*\*Overall status:\*\*\s*`?([^\n`]+?)`?\s*$/im;
+const STATUS = /\*\*Overall status:\*\*\s*`?([^\n.`;,]+)/i;
 
 export function parseReport(markdown) {
   const text = typeof markdown === 'string' ? markdown : '';
