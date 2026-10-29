@@ -3253,6 +3253,7 @@ def _cmd_cp_web(args) -> int:
                              fabric_resolver=_fabric_url_resolver(), fabric_services=_fabric_service_lister(), fabric_names=_fabric_names_getter(),
                              scheduler_admission=cp.get("scheduler_admission") is True,
                              scheduler_limits=cp.get("scheduler_limits") or {},
+                             skill_registry=cp.get("skill_registry"),
                              summary_config=cp.get("agent_summaries") or {},
                              summary_report_config=cp.get("summary_report") or {},
                              assistant_config={"personal_assistant": cp["personal_assistant"]}
