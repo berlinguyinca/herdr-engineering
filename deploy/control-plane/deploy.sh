@@ -39,7 +39,7 @@
 #      deploy, or one whose running commit predates the directory-mounted fleet
 #      config, has no automatic rollback and says so.
 #
-#   HERDR_CP_HEALTH_URL / _TRIES (300) / _INTERVAL (2s) tune the health check.
+#   HERDR_CP_HEALTH_URL / _TRIES (900) / _INTERVAL (2s) tune the health check.
 #
 # The central file is the only configuration source: no env file is authored or
 # kept. Nothing from it is printed by this script or written to a receipt.
@@ -295,7 +295,7 @@ if [ -z "$HEALTH_URL" ]; then
   case "$BIND" in *:*) BIND="[$BIND]" ;; esac   # IPv6 literal
   HEALTH_URL="http://${BIND:-127.0.0.1}:${PORT:-80}/api/v1/health"
 fi
-HEALTH_TRIES="${HERDR_CP_HEALTH_TRIES:-300}"
+HEALTH_TRIES="${HERDR_CP_HEALTH_TRIES:-900}"
 HEALTH_INTERVAL="${HERDR_CP_HEALTH_INTERVAL:-2}"
 
 COLLAB_HASH=""
