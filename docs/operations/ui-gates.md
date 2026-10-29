@@ -355,8 +355,10 @@ The suite takes about ten minutes on a workstation and runs one test at a time; 
 ### Time budgets and stale bases
 
 A healthy CI run is about 11 minutes (`ui-gates`) and the check itself is about a minute. `scripts/ci/ui-gates.sh` therefore fails fast:
-the suite has a 1500 s budget (`UI_GATES_SUITE_BUDGET_SECONDS`), `baselines:check` has 300 s (`UI_GATES_BASELINES_BUDGET_SECONDS`), and
-each test has a 300 s limit (`--test-timeout` in `package.json`). Exceeding a budget names the phase and exits non-zero. On 2026-10-28 a
+the suite has a 1500 s budget (`UI_GATES_SUITE_BUDGET_SECONDS`) and `baselines:check` has 300 s (`UI_GATES_BASELINES_BUDGET_SECONDS`).
+Exceeding a budget names the phase and exits non-zero. There is deliberately no per-test limit: `node --test --test-timeout` applies to
+each test *file* as a whole, and `tests/visual/ui-gates-visual.test.mjs` legitimately runs for several minutes (a 300 s limit cancelled
+it on the first attempt at this change). On 2026-10-28 a
 `networkidle` wait on a polling page added ~10 s to each of 268 captures: 11 min became 49 min, nothing failed, and the slowdown was
 mistaken for a contended host. A budget turns that into a clear red run the first time it happens.
 
