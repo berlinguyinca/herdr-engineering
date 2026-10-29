@@ -46,3 +46,8 @@ test('nearestTurn picks the closest turn within a day', () => {
   assert.equal(nearestTurn('2026-10-28 10:55', turns), 2);
   assert.equal(nearestTurn('2026-12-01 10:55', turns), null);
 });
+
+test('status is the leading phrase of a long status sentence', () => {
+  const p = parseReport('**Overall status:** in progress. The code is merged and `x` ran.\n');
+  assert.equal(p.status, 'in progress');
+});
