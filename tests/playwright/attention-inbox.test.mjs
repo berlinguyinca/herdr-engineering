@@ -230,3 +230,22 @@ test('with notifications left off nothing is announced and the page offers to en
     assert.equal(await page.evaluate(() => window.__shown.length), 0);
   });
 });
+
+test('a row folds out into a quick inspection and stays open through refreshes', async () => {
+  await withApp(async ({ browser, base }) => {
+    const page = await (await browser.newContext()).newPage();
+    await page.goto(`${base}/#/attention`);
+    const row = page.locator('[data-attention-row="fleet:drift"]');
+    await row.waitFor({ timeout: 8000 });
+    assert.equal(await row.locator('[data-attention-inspector]').count(), 0);
+    await row.locator('[data-expand]').click();
+    await row.locator('[data-attention-inspector]').waitFor({ timeout: 4000 });
+    assert.equal(await row.locator('[data-expand]').getAttribute('aria-expanded'), 'true');
+    assert.match(await row.locator('[data-attention-inspector]').innerText(), /first seen/i);
+    assert.equal(page.url().endsWith('#/attention'), true, 'inspecting does not leave the page');
+    await page.waitForTimeout(6500);                                                           // one poll interval
+    assert.equal(await row.locator('[data-attention-inspector]').count(), 1);
+    await row.locator('[data-expand]').click();
+    assert.equal(await row.locator('[data-attention-inspector]').count(), 0);
+  });
+});
