@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import {reportView, reportStartError, reportFailure} from './summary-report-status.js';
 
 test('idle, running, done and failed map to one button each', () => {
-  assert.deepEqual(reportView(null, null), {label: 'Generate full report', locked: false, status: '', report: ''});
+  assert.deepEqual(reportView(null, null), {label: 'Full report', locked: false, status: '', report: ''});
   assert.equal(reportView({state: 'running'}, null).locked, true);
   assert.equal(reportView({state: 'idle'}, {state: 'starting'}).locked, true);
   const done = reportView({state: 'done', report: '# Session summary', harness: 'claude', generated_at: 'T'}, null);

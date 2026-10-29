@@ -284,3 +284,72 @@ def test_http_disabled_hides_the_feature(http):
     assert h.call('/api/v1/host/summary-reports/claim', {'host_id': 'bender'}, key='host')[1] == {'ok': True, 'jobs': []}
     assert 'full_report' not in h.call(BASE + '/summary', key='read', method='GET')[1]
     assert h.call(BASE, key='write', method='GET')[1]['capabilities']['summary_report'] is False
+
+
+def test_report_records_how_much_of_the_session_it_covers(acknowledged_sink):
+    repo = ControlPlaneRepo(sink=acknowledged_sink)
+    native(repo)
+    repo.inspector.ingest(SID, {'kind': 'message', 'role': 'user', 'text': 'one', 'message_id': 'm0'})
+    repo.inspector.ingest(SID, {'kind': 'message', 'role': 'assistant', 'text': 'two', 'message_id': 'm1'})
+    svc = service(repo)
+    svc.start(SID, actor=ACTOR)
+    seq = repo.inspector.newest_seq(SID)
+    assert seq is not None and seq >= 1
+    (job,) = svc.claim('bender')
+    svc.finish('bender', ok(job))
+    assert svc.get(SID)['basis_seq'] == seq                 # the dashboard compares it with the newest event it sees
+    assert service(repo).get(SID)['basis_seq'] == seq        # and it survives a restart
+
+
+def test_terminal_publish_lands_on_the_matching_agent(acknowledged_sink):
+    repo = ControlPlaneRepo(sink=acknowledged_sink)
+    native(repo)
+    native(repo, 'other', agent_session={'agent': 'claude', 'kind': 'id', 'value': 'zzz'})
+    svc = service(repo)
+    status, body = svc.publish('bender', {'agent': 'claude', 'target': 'abc-123', 'report': REPORT})
+    assert status == 200 and body['session_id'] == SID
+    done = svc.get(SID)
+    assert done['state'] == 'done' and done['source'] == 'terminal' and done['report'] == STORED
+    assert svc.get('other')['state'] == 'idle'
+
+
+def test_terminal_publish_refusals(acknowledged_sink):
+    repo = ControlPlaneRepo(sink=acknowledged_sink)
+    native(repo)
+    native(repo, 'twin')                                      # same harness session on the same host
+    svc = service(repo)
+    for body, status in (({'agent': 'claude', 'target': 'abc-123', 'report': REPORT}, 409),
+                         ({'agent': 'claude', 'target': 'nope', 'report': REPORT}, 404),
+                         ({'agent': 'claude', 'target': 'abc-123', 'report': 'hi'}, 422),
+                         ({'agent': 'gemini', 'target': 'abc-123', 'report': REPORT}, 400),
+                         ({'agent': 'claude', 'target': '--x', 'report': REPORT}, 400)):
+        with pytest.raises(ReportRefused) as err:
+            svc.publish('bender', body)
+        assert err.value.status == status
+    with pytest.raises(ReportRefused):
+        svc.publish('beast', {'agent': 'claude', 'target': 'abc-123', 'report': REPORT})   # another host's agent
+    off = service(repo, enabled=False)
+    with pytest.raises(ReportRefused) as err:
+        off.publish('bender', {'agent': 'claude', 'target': 'abc-123', 'report': REPORT})
+    assert err.value.body['reason'] == 'reports_disabled'
+
+
+def test_terminal_publish_does_not_cancel_a_running_job(acknowledged_sink):
+    repo = ControlPlaneRepo(sink=acknowledged_sink)
+    native(repo)
+    svc = service(repo)
+    svc.start(SID, actor=ACTOR)
+    (job,) = svc.claim('bender')
+    svc.publish('bender', {'agent': 'claude', 'target': 'abc-123', 'report': REPORT})
+    assert svc.get(SID)['state'] == 'running'                  # the open run is still tracked
+    assert svc.finish('bender', ok(job))[1]['status'] == 'done'
+
+
+def test_http_terminal_publish_needs_a_host_token(http):
+    h = http()
+    body = {'host_id': 'bender', 'agent': 'claude', 'target': 'abc-123', 'report': REPORT}
+    assert h.call('/api/v1/host/summary-reports/publish', body, key='read')[0] == 403
+    status, out = h.call('/api/v1/host/summary-reports/publish', body, key='host')
+    assert status == 200 and out['session_id'] == SID
+    full = h.call(BASE + '/summary', key='read', method='GET')[1]['full_report']
+    assert full['state'] == 'done' and full['source'] == 'terminal'

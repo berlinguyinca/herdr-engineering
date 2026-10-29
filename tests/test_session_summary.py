@@ -177,6 +177,11 @@ def test_skill_is_read_only_by_construction():
     text = SKILL.read_text()
     assert "git --no-optional-locks" in text
     assert "never modify files" in text
+    assert "The one permitted write is publishing" in text
+    # publishing is for terminal runs only; a dashboard (target-mode) run must never do it
+    assert "Never run `herdr-eng summary publish` there" in text
+    # a failed publish falls back to printing the whole report, so nothing is lost
+    assert "print the complete report in the conversation instead" in text
     bad = re.findall(r"`(git (?:add|commit|checkout|reset|stash|push)[^`]*)`", text)
     assert bad == []
 
