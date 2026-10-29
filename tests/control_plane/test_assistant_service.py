@@ -921,3 +921,14 @@ def test_postgres_backend_real_roundtrip():
     fresh = AssistantStore(persist_backend=PostgresStoreBackend(dsn))
     fresh.load_persisted()
     assert any(x.name == "ITest" for x in fresh.assistants.values())
+
+
+def test_run_shell_denied_when_allowlist_empty():
+    """An enabled shell with no allowlisted commands must fail closed."""
+    cfg = assistant_config({"personal_assistant": {"enabled": True,
+                                                   "computer": {"allow_shell": True}}})
+    svc = AssistantService(config=cfg)
+    svc._shell_runner = lambda command, timeout: {"exit_code": 0, "stdout": "ran", "stderr": ""}
+    res = svc.run_shell_tool(tenant_id="t1", user_id="u1", command="/bin/echo hi")
+    assert res["denied"] is True
+    assert "allowlist" in res["reason"]
