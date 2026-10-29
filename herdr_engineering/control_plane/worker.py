@@ -62,7 +62,8 @@ async def run_one_pass(conn, *, mission_store=None, session_store=None,
                        snapshot_store=None, artifact_store=None,
                        lease_ttl=LEASE_TTL, host_ttl=HOST_TTL,
                        artifact_ttl=ARTIFACT_TTL, worker_id=None,
-                       artifact_job_runner=None, max_artifact_jobs=1) -> dict:
+                       artifact_job_runner=None, max_artifact_jobs=1,
+                       inspector_snapshotter=None) -> dict:
     summary: dict[str, Any] = {}
 
     # Stale services -> unavailable (never delete).
@@ -112,6 +113,8 @@ async def run_one_pass(conn, *, mission_store=None, session_store=None,
         summary.update(await _run_artifact_job_pass(
             conn, worker_id=worker_id, runner=artifact_job_runner,
             max_jobs=max_artifact_jobs))
+    if conn is not None and inspector_snapshotter is not None:
+        summary["inspector_snapshot"] = await inspector_snapshotter.tick(conn)
     return summary
 
 

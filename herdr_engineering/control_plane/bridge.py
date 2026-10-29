@@ -75,13 +75,15 @@ class PostgresSource(DurableSource):
     """
 
     def __init__(self, conn: Any = None, *, run: Callable | None = None,
-                 events_table: str = "fabric_events", dsn: str | None = None):
+                 events_table: str = "fabric_events", dsn: str | None = None,
+                 inspector_snapshots: bool = False):
         if run is None:
             run = _LoopRunner().run
         self._conn = conn
         self._dsn = dsn
         self._run = run
         self._events_table = events_table
+        self._inspector_snapshots = inspector_snapshots
         self._cache: dict | None = None
 
     def _load(self) -> dict:
@@ -128,6 +130,14 @@ class PostgresSource(DurableSource):
         else:
             events = [dict(row) for row in await conn.fetch(query)]
         snapshot["events"] = events
+        if self._inspector_snapshots:
+            # Optional optimisation: a missing table or row just means a full replay.
+            try:
+                row = await conn.fetchrow("SELECT schema_version, fingerprint, watermark, event_count, body "
+                                          "FROM inspector_snapshots WHERE id = 1")
+                snapshot["inspector_snapshot"] = dict(row) if row is not None else None
+            except Exception:  # noqa: BLE001
+                snapshot["inspector_snapshot"] = None
         return snapshot
 
     def missions(self) -> list[dict]:
@@ -148,6 +158,9 @@ class PostgresSource(DurableSource):
             # reads get a fresh complete snapshot, never an empty placeholder.
             self._cache = self._run(self._fetch_all())
         return self._cache["events"]
+
+    def inspector_snapshot(self) -> dict | None:
+        return self._load().get("inspector_snapshot")
 
     def take_events(self) -> list[dict]:
         """Transfer event-row ownership to replay; retain cheap resource reads."""
@@ -572,6 +585,7 @@ def load_into(repo, source: DurableSource) -> dict:
         "missions": missions, "sessions": sessions, "services": services,
         "hosts": hosts, "artifacts": artifacts, "blobs": {}, "leases": {},
         "telemetry": {}, "events": events, "event_order": event_order,
+        "inspector_snapshot": source.inspector_snapshot() if isinstance(source, PostgresSource) else None,
     })
     return {"missions": len(missions), "sessions": len(sessions),
             "services": len(services), "hosts": len(hosts),
