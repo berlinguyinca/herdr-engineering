@@ -50,7 +50,8 @@ export const SURFACES = [
   // The Mission Workbench scenario (a 12-session Pi chain, a Claude branch and a Pi continuation, PR, CI, reviews, artifacts, a blocked
   // task and a merge gate): its own seeded room. The step goes to the newest end of the chain and selects the last session before the fork.
   { slug: 'collab-workbench', sub: 'lineage', proof: 'svg.lin-svg g[data-node]', resetScroll: true, fixture: { empty: true, workbench: true },
-    steps: async (page) => { await page.locator('[data-vp="end"]').click(); await page.locator('g[data-node="session:pi-12"]').focus(); await page.keyboard.press('Enter'); await page.locator('.lin-facts').waitFor(); await page.locator('.wb-comment, .wb-steer, .wb').first().waitFor().catch(() => {}); await page.evaluate(() => document.activeElement?.blur()); },
+    // select through the table (every node is a button there), which also centres it in the graph when the graph is shown again
+    steps: async (page) => { await page.locator('[data-mode="table"]').first().click(); await page.locator('table.lin-table button[data-node="session:pi-12"]').click(); await page.locator('[data-mode="visual"]').first().click(); await page.locator('g[data-node="session:pi-12"]').waitFor(); await page.locator('.lin-facts').waitFor(); await page.locator('.wb').first().waitFor().catch(() => {}); await page.evaluate(() => document.activeElement?.blur()); },
     regions: [{ name: 'status', selector: '.lin-status' }, { name: 'graph', selector: '.lin-viewport' }, { name: 'inspector', selector: '.lin-inspector' }] },
   { slug: 'collab-flow', sub: 'flow', proof: '#hcn-flow svg.cx-flow', regions: [{ name: 'flowhead', selector: '#hcn-p-flow .cx-row--between' }] },
   { slug: 'collab-attention', sub: 'attention', proof: '.cx-attn-item', regions: [{ name: 'item', selector: '.cx-attn-item' }] },
