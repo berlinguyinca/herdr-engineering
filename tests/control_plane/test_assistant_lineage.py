@@ -124,3 +124,41 @@ def test_principal_resolver_matches_server_key_ids():
     assert peer["kind"] == "unknown"                    # a role spelling a server-only kind is unprivileged
     assert principal_resolver({})("open-listener")["kind"] == "operator"
     assert principal_resolver({})("someone") is None
+
+
+@pytest.mark.parametrize("field,value", [("depth", [1]), ("depth", {"a": 1}), ("depth", "deep"),
+                                         ("limit", float("inf")), ("limit", [5]), ("limit", "many")])
+def test_malformed_numbers_become_value_errors(field, value):
+    _, reader = _world()
+    op = {"operation": "neighborhood", "node_id": "agent:a1"} if field == "depth" else {"operation": "list"}
+    with pytest.raises(ValueError):
+        reader.read("t", "key:view", {**op, field: value})
+
+
+@pytest.mark.parametrize("depth", [0, -3])
+def test_depth_below_one_is_clamped_up(depth):
+    _, reader = _world()
+    out = reader.read("t", "key:view", {"operation": "neighborhood", "node_id": "agent:a1", "depth": depth})
+    assert out["data"]["nodes"]
+
+
+def test_negative_or_zero_limit_is_clamped_up():
+    _, reader = _world()
+    for limit in (-5, 0):
+        assert reader.read("t", "key:view", {"operation": "list", "node_type": "agent", "limit": limit})
+
+
+def test_tool_loop_denies_read_lineage_without_a_grant():
+    _, reader = _world()
+    svc = AssistantService(config=assistant_config({"personal_assistant": {"enabled": True}}))
+    svc.lineage_read = reader.read
+    a = svc.create_assistant(tenant_id="t", user_id="key:view", name="A")
+    t = svc.create_thread(tenant_id="t", user_id="key:view", assistant_id=a.assistant_id)
+    run = svc.send_message(tenant_id="t", user_id="key:view", assistant_id=a.assistant_id,
+                           thread_id=t.thread_id, content="hi")
+    action = svc.request_tool_action(tenant_id="t", user_id="key:view", assistant_id=a.assistant_id,
+                                     tool_id="read_lineage", scope="read_lineage", run_id=run.run_id,
+                                     idempotency_key="k1",
+                                     request_payload={"operation": "node", "node_id": "agent:a1"},
+                                     actor="key:view")
+    assert action.status == "denied"

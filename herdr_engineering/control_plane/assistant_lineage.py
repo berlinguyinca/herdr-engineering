@@ -20,6 +20,14 @@ def _utcnow() -> str:
     return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _bounded(value, default: int, low: int, high: int, name: str) -> int:
+    """A model-supplied number, clamped. Anything that is not a finite integer is a ValueError, never a crash."""
+    try:
+        return max(low, min(int(value or default), high))
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(f"{name} must be an integer") from None
+
+
 class LineageReader:
     def __init__(self, graph: GraphProjection, principal_for_user: Callable[[str], dict | None],
                  *, now: Callable[[], str] = _utcnow):
@@ -42,11 +50,11 @@ class LineageReader:
         if op == "node":
             parts, query = ["nodes", node_id], {}
         elif op == "neighborhood":
-            depth = max(1, min(int(payload.get("depth") or 2), MAX_DEPTH))
+            depth = _bounded(payload.get("depth"), 2, 1, MAX_DEPTH, "depth")
             parts, query = ["nodes", node_id, "neighborhood"], {"depth": str(depth)}
         else:
             parts, query = ["nodes"], {"node_type": str(payload.get("node_type") or ""),
-                                       "limit": str(min(int(payload.get("limit") or 50), MAX_NODES))}
+                                       "limit": str(_bounded(payload.get("limit"), 50, 1, MAX_NODES, "limit"))}
         try:
             data = read_graph(self.graph, principal, parts, query.get)
         except KeyError:

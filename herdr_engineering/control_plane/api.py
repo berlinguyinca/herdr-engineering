@@ -2537,7 +2537,10 @@ def _make_handler(server, public=False, operator=False):
                     return self._json({"error": "report execution validation and context are worker-owned; use report checks for attestations"}, 400)
                 body["created_by"] = self._resource_principal()
                 body["provenance"] = {**(body.get("provenance") or {}), "principal_id": body["created_by"]}
-                return self._json(self._artifact_call("commit_version", parts[4], **body), 201)
+                committed = self._artifact_call("commit_version", parts[4], **body)
+                from .artifact_lineage import emit_version_lineage
+                emit_version_lineage(server.ingest, committed, self._principal())
+                return self._json(committed, 201)
             if resource == "artifact-jobs" and server.artifact_job_manager is not None:
                 if len(parts) == 4:
                     body = self._read_json() or {}
