@@ -140,6 +140,7 @@ export function renderCiDetail(f, detail, logs, errors = {}) {
 }
 
 const styles = `.cia{margin:12px 0 20px;min-width:0}.cia h2{font-size:15px;margin:16px 0 6px;display:flex;align-items:center;gap:8px}.cia-count{font-size:12px;font-weight:500;padding:0 8px;border:1px solid var(--border);border-radius:99px;color:var(--text-secondary)}
+.cia-row>summary::before,.cia-runsec>summary::before{content:'\\25B8';display:inline-block;width:12px;color:var(--text-muted);transition:transform .12s}.cia-row[open]>summary::before,.cia-runsec[open]>summary::before{transform:rotate(90deg)}
 .cia-runsec{margin-top:8px}.cia-runsec>summary{display:flex;align-items:center;gap:8px;cursor:pointer;padding:8px 0;list-style:none}.cia-runsec>summary::-webkit-details-marker{display:none}.cia-h{font-size:15px;font-weight:600}
 .cia-note{font-size:12px;color:var(--text-secondary);margin:4px 0 8px}.cia-row{border-bottom:1px solid var(--border-subtle)}.cia-row>summary{display:flex;flex-wrap:wrap;align-items:center;gap:4px 12px;padding:10px 4px;cursor:pointer;list-style:none;font-size:13px}.cia-row>summary::-webkit-details-marker{display:none}.cia-row>summary:hover{background:var(--surface-2)}
 .cia-dot{width:8px;height:8px;border-radius:50%;flex:none;background:var(--text-muted)}.cia-dot--bad{background:var(--status-failed)}.cia-dot--live{background:var(--status-active)}.cia-name{font-weight:600;overflow-wrap:anywhere}.cia-ref{color:var(--text-secondary)}.cia-meta{font-size:12px;color:var(--text-muted)}
