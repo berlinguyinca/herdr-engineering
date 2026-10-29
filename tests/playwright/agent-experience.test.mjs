@@ -153,7 +153,7 @@ test('full report: button states, polling, remote-host message, and a side colum
   await page.evaluate(()=>{
     window.agent.capabilities={...window.agent.capabilities,summary_report:true};
     window.starts=0;
-    window.client.startSummaryReport=async()=>{window.starts++;if(window.remote)throw Object.assign(new Error('This session record is on beast.'),{status:409,body:{reason:'report_host_remote',command:'herdr-eng summary report --agent claude --session abc'}});window.summary.full_report={state:'running'};return {ok:true,status:'running'};};
+    window.client.startSummaryReport=async()=>{window.starts++;if(window.refuse)throw Object.assign(new Error('Too many reports are running; try again shortly.'),{status:429,body:{reason:'report_limit'}});window.summary.full_report={state:'queued'};return {ok:true,status:'running'};};
     window.remount();
   });
   await page.clock.runFor(200);
@@ -163,6 +163,9 @@ test('full report: button states, polling, remote-host message, and a side colum
   await button.click();
   await page.getByRole('button',{name:'Generating report…',exact:true}).waitFor();
   assert.equal(await page.getByRole('button',{name:'Generating report…',exact:true}).isDisabled(),true);
+  assert.match(await page.locator('.sw-report-status').innerText(),/Waiting for the agent's host/);
+  await page.evaluate(()=>{window.summary.full_report={state:'running'};});await page.clock.fastForward(3100);
+  assert.match(await page.locator('.sw-report-status').innerText(),/Running the summary skill/);
   await button.click({force:true}).catch(()=>{});
   assert.equal(await page.evaluate(()=>window.starts),1);
   const report='# Session summary\n**Overall status:** completed\n\n1. **Original objective** — ship it\n\nEvidence coverage: complete\n'.repeat(1)+Array.from({length:60},(_,i)=>`- line ${i}`).join('\n');
@@ -180,12 +183,12 @@ test('full report: button states, polling, remote-host message, and a side colum
   assert.ok(geo.card.left>=geo.conv.right-1,JSON.stringify(geo));
   assert.ok(geo.card.right<=geo.vw+1 && geo.hscroll===false,JSON.stringify(geo));
   await page.getByRole('button',{name:'Exit fullscreen workspace',exact:true}).click();
-  // A session record on another host: the refusal names the command to run there.
-  await page.evaluate(()=>{window.remote=true;window.summary.full_report={state:'idle'};});
+  // A refusal is shown in place and the button stays usable.
+  await page.evaluate(()=>{window.refuse=true;window.summary.full_report={state:'idle'};});
   await page.clock.fastForward(10000);
   await page.getByRole('button',{name:'Generate full report',exact:true}).click();
-  const alert=page.getByRole('alert').filter({hasText:'beast'});await alert.waitFor();
-  assert.match(await page.locator('.sw-report code').innerText(),/^herdr-eng summary report --agent claude/);
+  await page.getByRole('alert').filter({hasText:'Too many reports'}).waitFor();
+  assert.equal(await page.locator('[data-summary-report]').isDisabled(),false);
   // Viewers without the capability see no button but still read a stored report.
   await page.evaluate(()=>{window.agent.capabilities={};window.summary.full_report={state:'done',report:'# Session summary\n\nEvidence coverage: complete'};window.remount();});
   await page.clock.runFor(200);await page.locator('.sw-report-body').waitFor();
