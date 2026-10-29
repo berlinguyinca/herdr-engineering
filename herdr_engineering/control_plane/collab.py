@@ -380,6 +380,7 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
         # The fabric lineage graph, attached by the combined (non collab-only) server. The graph never
         # calls back into this service: membership is handed to it as a per-request snapshot.
         self.graph_source = None      # callable returning the CURRENT projection (a rebuild replaces it)
+        self.work_graph_handle = None  # unified workspace P02: (principal, method, parts, query, body) -> (status, body, headers)
         # Writes an external agent's lineage through the ingest path (combined server only; None = refused).
         # Called with (envelope, principal); the envelope is built here, never taken from the request.
         self.lineage_sink = None
@@ -4062,6 +4063,8 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
     def graph_read(self, pr: Principal, parts: list[str], query: dict) -> dict:
         """Lineage graph read for a signed-in person. Hidden, missing and 'no graph for you' all
         answer one 404; nothing here lets a read widen what the graph's own checks allow."""
+        if parts[:1] == ["work"]:
+            return self.work_graph_request(pr, "GET", parts[1:], query, None)
         graph = self.graph_source() if self.graph_source is not None else None
         access = self.graph_access(pr) if graph is not None else None
         if access is None:
@@ -4078,6 +4081,18 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
             return self.xlink_filter(out)
         except KeyError:
             raise CollabError(404, "not found") from None
+
+    def work_graph_request(self, pr: Principal, method: str, parts: list[str], query: dict, body: dict | None) -> dict:
+        """Unified workspace P02: the persistent Work Graph for a signed-in person. Guests, agents and people with no
+        non-guest membership get the same 404 as a missing route (``graph_access`` is None for them)."""
+        access = self.graph_access(pr)
+        if access is None or self.work_graph_handle is None:
+            raise CollabError(404, "not found")
+        principal = {"kind": "member", "id": f"user:{pr.id}", "authenticated_by": "collab", "access": access}
+        status, payload, _headers = self.work_graph_handle(principal, method, parts, query, body)
+        if status != 200:
+            raise CollabError(status, str(payload.get("error", "error")))
+        return payload
 
     def _join_times(self, pr: Principal, access: dict) -> dict | None:
         """T16 M2: the reader's join time in EVERY room they read through (``None`` = history is not restricted).
@@ -5461,6 +5476,8 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
             elif method in ("PUT", "POST") and n == 3 and parts[0] == "rooms" and parts[2] == "profile":
                 return 200, self.set_room_profile(pr, parts[1], body)
             elif method == "POST":
+                if parts[:2] == ["graph", "work"]:
+                    return 200, self.work_graph_request(pr, "POST", parts[2:], query, body)
                 if parts == ["me"]:
                     return 200, self.link_identity(pr, body)
                 if parts == ["agents", "connect"]:
