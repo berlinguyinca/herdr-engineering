@@ -22,7 +22,8 @@ const RUNS = [
 ];
 
 // What the audit counted when the floors were set (sum over STATES / over VIEWER_STATES). The totals may not fall below 90% of it.
-const FLOOR = { owner: { controls: 540, focused: 480 }, viewer: { controls: 37, focused: 30 } };
+// focused was 480 until the Usage page put its tables and charts behind tabs: a hidden panel's links are not tab stops, so one tab stop fewer is expected there.
+const FLOOR = { owner: { controls: 540, focused: 470 }, viewer: { controls: 37, focused: 30 } };
 
 for (const [label, opts] of RUNS) {
   test(`every control in every state is accessible: ${label}`, async () => {

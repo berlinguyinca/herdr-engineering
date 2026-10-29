@@ -35,17 +35,22 @@ def decode(body: bytes) -> dict:
     return json.loads(gzip.decompress(bytes(body)))
 
 
-def apply_to_store(store: InspectorStore, row: dict | None, events: list[dict]) -> str:
+def apply_to_store(store: InspectorStore, row: dict | None, events: list[dict], backfill=None) -> str:
     """Rebuild ``store`` from a snapshot ``row`` plus the ``events`` that came after it, or from ``events`` alone.
 
-    ``events`` are ALL inspector events in memory. Returns "snapshot" or "full:<reason>"; the store is complete
-    either way, and untouched by a refused snapshot."""
+    ``events`` are the inspector events the boot loaded: all of them, or, when the source verified the snapshot and
+    skipped the rows below its watermark (``row["skipped_upto"]``), only the newer ones. ``backfill()`` then returns
+    the skipped rows for the case where the snapshot is refused here. Returns "snapshot" or "full:<reason>"; the
+    store is complete either way, and untouched by a refused snapshot."""
     if row is None:
         store.hydrate(events)
         return "full:no snapshot"
     try:
         watermark = int(row["watermark"])
-        if sum(1 for e in events if isinstance(e.get("sequence"), int) and e["sequence"] <= watermark) != int(row["event_count"]):
+        covered = row.get("covered_count")
+        if covered is None:
+            covered = sum(1 for e in events if isinstance(e.get("sequence"), int) and e["sequence"] <= watermark)
+        if int(covered) != int(row["event_count"]):
             raise SnapshotStale("the event log below the watermark is not the one the snapshot consumed")
         state = decode(row["body"])
         if state.get("watermark") != watermark or state.get("count") != int(row["event_count"]):
@@ -61,6 +66,11 @@ def apply_to_store(store: InspectorStore, row: dict | None, events: list[dict]) 
     # load_state is all-or-nothing and hydrate_delta checks before it mutates, but a refusal after load_state
     # leaves the loaded snapshot in place: start over from an empty projection.
     store.reset_replay()
+    if row.get("skipped_upto") is not None:
+        if backfill is None:
+            raise RuntimeError("inspector rows were skipped for a snapshot that was then refused, and there is no way "
+                               "to load them; refusing to start with an incomplete inspector")
+        events = [*backfill(), *events]
     store.hydrate(events)
     return f"full:{reason}"
 

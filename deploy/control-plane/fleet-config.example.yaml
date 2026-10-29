@@ -26,6 +26,26 @@ sections:
       minio_password: "REDACTED"
       rustfs_bucket: "REDACTED"
       ci_actions: false             # true lets operators retry/cancel CI pipelines
+      # OPTIONAL: absolute path (as the web container sees it) to a checkout of InferWeave's
+      # deploy/pipelines/*.yaml. Read live. Absent: no definitions, and any host token may report
+      # deployment events for any component (the Deployments snapshot then carries a warning).
+      # Set but invalid: the last valid set stays in use; events are refused (503) only when no
+      # set was ever valid.
+      # NOTE: release evidence (the release asset's .commit and its ancestry on main) is NOT
+      # wired yet. Until it is, every permit answers false ("release not confirmed"), so a host
+      # updater with a gate URL (IW_DEPLOY_GATE_URL) freezes on its running version. Wire the
+      # evidence before enabling any host gate.
+      # deployment_definitions: "/srv/inferweave/deploy/pipelines"
+      # OPTIONAL: true enables the audited Deployments actions (POST /api/deployments/force and
+      # /ack, operator role). Read live; anything but true is off. Force only records a request the
+      # host updaters pick up; the host permit gate (GET /api/deployments/permit) works either way.
+      # A force never permits a release that is not confirmed (see the NOTE above).
+      deployment_actions: false
+      # OPTIONAL: side effects of a deployment failure escalation (all off by default). issues: a
+      # GitHub issue per software finding (needs github.token with issue write access).
+      # deployment_escalation:
+      #   issues: false
+      #   assistant: false
       # OPTIONAL: head-bound post-PR review quorum (GET /api/v1/graph/nodes/{pr}/review-quorum).
       # Principal ids are the server-side `key:<digest>` actors; omit the block to turn it off.
       # review_quorum:
@@ -56,6 +76,17 @@ sections:
         #   evidence_writers: ["key:ci-service"]   # ONLY these writers' merged/validated marks count as evidence
         #   min_group_size: 5              # aggregates over fewer items are hidden
         #   reads_per_minute: 60
+      # OPTIONAL: lineage-graph evidence in the merge gate. OFF unless you uncomment AND set `enabled: true`.
+      # It runs after decide_merge for every PR and can only withhold a merge. `evidence_writers` is REQUIRED and
+      # must be explicit graph principal ids ("key:<12 hex of sha256(the CI reporter's API key)>"): an empty list,
+      # a wildcard or a bare word stops startup (and `fleet-config validate`) instead of enabling anything.
+      # Only `validated` edges written by these principals, bound to the PR's exact head SHA, count.
+      # See docs/operations/lineage-continuity-runbook.md ("Turning the graph merge gate on").
+      # graph_merge_gate:
+      #   enabled: false                 # true to turn it on; false/removed = hot kill switch
+      #   evidence_writers: ["key:<12-hex-of-the-ci-reporter-key>"]   # REPLACE: the placeholder is refused at startup
+      #   required_checks: ["ci"]        # edges name their check in attrs.check (default "ci")
+      #   require_review_quorum: false   # true also needs control_plane.review_quorum to be satisfied
       # OPTIONAL: the Personal Assistant (inert unless `enabled: true`). Nothing in
       # the assistant module runs while disabled; the /personal-assistant dashboard
       # view only appears when the `assistant_v1` capability is advertised (enabled).
@@ -64,6 +95,14 @@ sections:
       # are redacted from prompts, logs and events. Copy only what you need.
       # personal_assistant:
       #   enabled: false                 # master kill-switch (also gates the capability flag)
+      #   # Off-box anchor for the audit chain head (see runbook "Anchoring the audit head"):
+      #   audit:
+      #     hmac_key_file: "/etc/herdr/assistant-audit.key"   # PATH only (>= 16 bytes)
+      #     anchor_file: "/var/lib/herdr-anchor/assistant-audit.anchor"  # append-only; ideally a different device
+      #   # Hand approved request_mission / propose_branch delegations to the handoff queue:
+      #   delegation_consumer:
+      #     enabled: false
+      #     source_harness: pi
       #   # Real inference. When `endpoint` is set the service uses an HTTP
       #   # chat-completions runner (OpenAI-compatible, incl. tool-calling); when
       #   # empty it falls back to a deterministic local runner (skeleton only).

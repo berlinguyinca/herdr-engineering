@@ -17,6 +17,7 @@ import {attachError,attachForms} from './terminal-attach.js';
 import {renderRelated} from './related-panel.js';
 import {entityHref} from './entity-links.js';
 import {freshnessSources} from './freshness.js';
+import {mountCiAttention} from './ci-attention.js';
 
 const text = value => typeof value === 'string' ? value : '';
 const records = value => Array.isArray(value) ? value.filter(v=>v && typeof v==='object' && !Array.isArray(v)) : [];
@@ -181,9 +182,9 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
   const reviewCache=new Map();
   const title=isCi?'CI':'Reviews';
   const chip=freshnessSources(()=>container.querySelector('herdr-freshness'));
-  container.innerHTML=`${styles}${isCi?ciChartStyles+ciInsightStyles+ciPipelineStyles+commandCenterStyles+'<style>'+ciFixStyles+'</style>':''}<div class="hd-live-head"><h1>${title}</h1><herdr-freshness interval="5000"></herdr-freshness></div><p class="ig-intro">${isCi?'Follow builds from queue to finished steps. Inspect output and open the original run in Woodpecker.':'Review plans and code in Plannotator, with decisions linked to the mission and revision they belong to.'}</p>
+  container.innerHTML=`${styles}${isCi?ciChartStyles+ciInsightStyles+ciPipelineStyles+commandCenterStyles+'<style>'+ciFixStyles+'</style>':''}<div class="hd-live-head"><h1>${title}</h1><herdr-freshness interval="5000"></herdr-freshness></div><p class="ig-intro"${isCi?' hidden':''}>${isCi?'Follow builds from queue to finished steps. Inspect output and open the original run in Woodpecker.':'Review plans and code in Plannotator, with decisions linked to the mission and revision they belong to.'}</p>
     <div data-ig-health role="status"></div><p data-ig-error class="ig-warning" role="status"></p>
-    ${isCi?'<div data-ci-observability></div><div data-ci-health></div>':''}
+    ${isCi?'<div data-ci-attention></div><div data-ci-observability></div><div data-ci-health></div>':''}
     <div class="ig-tabs" role="tablist" aria-label="${title} outcome">${tabs.map(([key,label])=>`<button type="button" role="tab" id="ig-tab-${key}" data-tab="${key}" aria-controls="ig-results" aria-selected="${state.tab===key}" tabindex="${state.tab===key?0:-1}">${label} <strong data-count="${key}">…</strong></button>`).join('')}</div>
     <div class="ig-controls"><label>Search ${isCi?'runs':'reviews'}<input data-ig-search type="search" value="${esc(search)}" placeholder="Project, repository, branch or revision"></label><label>Group by<select data-ig-group><option value="project">Project / repository</option><option value="none">Most recent</option></select></label></div>
     ${isCi ? '<div class="ig-controls ci-report-filters"><label>Repository<select data-ci-repository><option value="">All repositories</option></select></label><label>Branch<select data-ci-branch><option value="">All branches</option></select></label><label>Period<select data-ci-period><option value="7">Last 7 days</option><option value="14" selected>Last 14 days</option><option value="30">Last 30 days</option></select></label></div><div data-ci-insights></div>' : ''}
@@ -192,6 +193,8 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
     <p class="ig-note" data-ig-count></p><div class="ig-layout"><section id="ig-results" role="tabpanel" aria-labelledby="ig-tab-${state.tab}"></section><aside class="ig-inspector" aria-label="Pipeline inspector" hidden></aside></div>
     <div class="ig-pages"><button type="button" class="hd-btn" data-page="previous">Previous</button><span data-ig-page></span><button type="button" class="hd-btn" data-page="next">Next</button></div><div data-ig-runners></div>${!isCi ? '<details class="ig-runners"><summary>Start a review</summary><p>Start Plannotator from the project workspace with <code>herdr-plannotator --help</code>. Its review link and upstream decision appear here when the launcher is connected to this control plane.</p></details>' : ''}`;
   const el=selector=>container.querySelector(selector);
+  let attentionView=null;
+  if(isCi&&typeof client.getCi==='function'&&!(mission||session))attentionView=mountCiAttention(el('[data-ci-attention]'),client);
   if(isCi){
     healthView=mountCiHealth(el('[data-ci-health]'),client,{repository,mission,session,search:search || undefined,
       onContext:context=>{const next={days:['7','14','30'].includes(context.mode)?Number(context.mode):null,mode:['runs','hours'].includes(context.mode)?context.mode:'days',run_number:context.run_number,scope:context.scope,start:context.start,end:context.end,branch:context.branch,search:context.search,failuresOnly:context.failuresOnly,project:context.project};observabilityView?.setContext(next);if(observabilityView)applyCiContext(next);},
@@ -604,5 +607,5 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
     refresh();for(const disclosure of container.querySelectorAll('details[open]'))disclosure.dispatchEvent(new Event('toggle'));timer=setInterval(refresh,5000);clock=setInterval(tick,1000);
   }
   draw();document.addEventListener('visibilitychange',visibility);visibility();
-  return {refresh(){refresh();healthView?.refresh?.();observabilityView?.refresh();},dispose(){disposed=true;healthView?.dispose();observabilityView?.dispose();listenerController.abort();clearInterval(timer);clearInterval(clock);for(const controller of pending.values())controller.abort();pending.clear();document.removeEventListener('visibilitychange',visibility);}};
+  return {refresh(){refresh();healthView?.refresh?.();observabilityView?.refresh();},dispose(){disposed=true;attentionView?.();healthView?.dispose();observabilityView?.dispose();listenerController.abort();clearInterval(timer);clearInterval(clock);for(const controller of pending.values())controller.abort();pending.clear();document.removeEventListener('visibilitychange',visibility);}};
 }

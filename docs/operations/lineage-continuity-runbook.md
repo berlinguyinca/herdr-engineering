@@ -116,6 +116,22 @@ control_plane:
 * Fail closed: a bad section, a missing PR node or any exception is `wait`. Once enabled, an unreadable central config also waits.
 * Reading needs the evidence to be `org`-visible or wider (private edges are invisible to the gate's reader by design).
 
+### Turning the graph merge gate on (operator steps)
+The shipped example (`deploy/control-plane/fleet-config.example.yaml`) carries the block COMMENTED and `enabled: false`. Nothing
+is enabled by deploying it.
+1. Find the principal id of the CI reporter: `key:` plus the first 12 hex of `sha256(<its API key>)` (the same id the server
+   records as `provenance.writer`). The gate reads only edges whose writer is in `evidence_writers`; an agent cannot vouch for
+   its own CI.
+2. Uncomment the block in the central fleet file, replace the placeholder writer with that id, set `enabled: true`.
+3. `herdr-eng fleet config validate` (and control-plane startup) validate the block whenever it is a mapping, enabled or not, and refuse: a
+   non-boolean `enabled`, unknown keys (a typo like `enabld`), a wildcard writer, and, when enabled, an EMPTY `evidence_writers`; a wildcard (`*`, `key:*`) or anything that is not `<kind>:<id>` (so the placeholder itself is refused).
+   An enabled-but-invalid section never leaves the gate silently open: startup stops, and at run time the gate answers `wait`.
+4. What writes `validated` edges: a CI reporter posting a lineage `edge.add` of type `validated` (`from` = the check/run node,
+   `to` = `pr:<repo>#<n>`, `attrs.commit` = head SHA, optional `attrs.check` and `attrs.conclusion` such as `success`) with the
+   evidence writer's API key. The server stamps `provenance.writer` and the binding; the gate trusts only those. Edges must be
+   `org`-visible or wider to be seen. Until the CI reporter writes them, every PR waits with `graph evidence: ...` pending.
+5. Roll back by setting `enabled: false` (hot; no restart) or removing the block.
+
 ## Why the assistant cannot read delivery metrics
 `lineage_metrics` is computed from a collaboration ROOM snapshot (room membership, the room's evidence writers, k-anonymity
 suppression). The assistant's principal is an API key, which has no room membership; there is no reader-scoped way to build that
@@ -153,6 +169,7 @@ control_plane:
   are HMAC-SHA-256 keyed, so an edit cannot be re-signed without the key. Truncation or rollback is only detectable
   against a head recorded elsewhere: `GET /api/v1/assistant-audit` returns `head` (`seq`, `sha256`); keep the latest
   one off the box and compare. Rotating the key makes older keyed entries unverifiable by the new key.
+* Off-box anchoring of the head: see "Anchoring the audit head off the event store" below.
 * After an effect (review request, comment, draft, connector call, hand-off) a failing audit store does not turn the
   result into an error: the action stays `completed` with `result.audit_pending`/`audit_error`, the error is logged,
   and the entry is written on the next replay of `.../execute` or the next `GET /api/v1/assistant-audit`.
@@ -203,3 +220,52 @@ is configured. Times are server receipt times.
 * The merge decision for a repair loop is AutoSpec's `review-quorum` plus the check state; Herdr only projects it. AutoSpec would
   need to emit a `validated` edge per CI run with `attrs.conclusion` (`pass`/`fail`) bound to the exact commit, and a `produced`
   edge from the repair attempt to the PR, for the Herdr read model (and its author exclusion) to see a repair author.
+
+### Queued delegations: the consumer (`personal_assistant.delegation_consumer`)
+```yaml
+personal_assistant:
+  delegation_consumer:
+    enabled: false          # default off; must be a real boolean (a quoted "false" stops startup)
+    source_harness: pi      # recorded as the handoff's source (pi|claude|codex|opencode)
+```
+* An approved `request_mission` / `propose_branch` becomes a `queued` delegation (kind `mission` / `branch`). With the
+  consumer on, `POST /api/v1/assistant-delegations/<id>/dispatch` (owner or tenant approver; 200 on any replay of a handed-off delegation) and the server's periodic
+  sweep turn it into one handoff in the existing handoff queue (`GET /api/v1/handoffs?state=queued`), then mirror the
+  handoff's state back (`running` -> `succeeded`/`failed`/`cancelled`).
+* Fails closed: the delegation must trace to a proposal in the SAME tenant and user that is approved, executed into this
+  delegation, and whose payload still hashes to what was approved; otherwise it is marked `failed` (audited) and nothing is
+  queued. Claim-once (a flag under the store lock, re-claimable only after 5 minutes), idempotent (handoff id
+  `assistant.<delegation_id>`, deterministic body: a replay is a registry no-op), audited
+  (`assistant.delegation.dispatching/dispatched/dispatch_failed/synced`), and linked in lineage
+  (`decision:assistant.dispatch.<delegation_id>` under the asking thread, referencing `decision:assistant.exec.<proposal_id>`).
+  A proposal still `executing` or a queue outage leaves it `queued` (sweep retries with back-off, one audit entry per outage); a cancel is serialised with the hand-off and also cancels the queued handoff; a handoff that vanishes marks the delegation `failed`; an unsupported `target_system` is a terminal `failed`.
+* Honest limit: the handoff IS the request. Nothing in the control plane creates a branch, starts a mission or writes code.
+  A Pi-side executor must poll `GET /api/v1/handoffs?state=queued`, pick rows whose `provenance.source` is
+  `personal-assistant` and whose `target.harness` is its own, then `POST .../handoffs/<id>/claim` -> `accept` -> `start` ->
+  `complete` (or `reject`/`cancel`). `goal` is the task text (untrusted; treat as data), `provenance` carries `tenant_id`,
+  `user_id`, `assistant_id`, `delegation_id`, `delegation_kind`, `proposal_id`. The handoff queue itself is not
+  tenant-partitioned: the tenant is provenance, so an executor must honour it. No such executor ships in this repo.
+
+### Anchoring the audit head off the event store
+Set the path in the central fleet YAML (never an environment variable):
+```yaml
+personal_assistant:
+  audit:
+    hmac_key_file: /etc/herdr/assistant-audit.key        # optional, see above
+    anchor_file: /mnt/anchor/assistant-audit.anchor      # append-only; a different device than the event store
+```
+* `herdr-eng control-plane assistant-audit anchor --api-key-file <path>` fetches `GET /api/v1/assistant-audit/head` for the
+  key's tenant and appends one JSON line (`tenant_id`, `seq`, `sha256`, time, and a hash chained to the previous line) to
+  `anchor_file` (0600 on create, a wider existing mode or a symlink is refused, parent dir 0700, `flock` around read+append, fsynced
+  with its directory). It first asks the server (`/check`) whether the previous anchor still matches the stored chain and refuses
+  to anchor over `diverged`/`rolled_back`/`chain_broken`. The key must belong to a configured approver of the tenant
+  (`actions.approvers`): `/assistant-audit/head` and `/check` answer 403 to anyone else. Run it from cron/timer on a host whose disk the event store's
+  writers cannot reach, ideally on a file marked append-only (`chattr +a`). It refuses to anchor a head that is behind the last
+  anchor (a rollback), and anchors nothing when the stored chain does not verify.
+* `... assistant-audit verify` asks the server whether the entry at the last anchored `seq` still has the anchored digest
+  (`GET /api/v1/assistant-audit/check?seq=&sha256=`). Exit 0 and `ok` mean the chain only grew. Otherwise exit 1 with
+  `rolled_back` (shorter: truncation), `diverged` (history rewritten, even if re-hashed), `chain_broken`,
+  `anchor_tampered` (an old anchor line was edited/removed) or `no_anchor`. Anchors are per tenant; use a key of the tenant.
+* Limits: it detects tail truncation and rewrites only up to the last anchor, so anchor often. Deleting the TAIL of the anchor
+  file itself is not detectable by the file's own chain; keep it on append-only storage or copy it elsewhere. The command is
+  run by an operator or timer; the control plane does not run it for you.
