@@ -95,9 +95,9 @@ class ActionLineageEmitter:
     action created) and ``references`` (the node it was about). Everything is ``private`` to the user the
     assistant acts for. Event ids derive from the action id, so a replay is a no-op. Emission is best effort.
     """
-    DELEGATING = frozenset({"request_review", "propose_branch", "request_mission"})
+    DELEGATING = frozenset({"request_review", "propose_branch", "request_mission", "dispatch_delegation"})
     ATTRS = ("assistant_id", "thread_id", "run_id", "action_id", "approval_id", "request_hash",
-             "idempotency_key", "tool_id", "delegation_id", "proposal_id", "artifact_id", "target_id")
+             "idempotency_key", "tool_id", "delegation_id", "handoff_id", "proposal_id", "artifact_id", "target_id")
 
     def __init__(self, ingest, principal_for_user: Callable[[str], dict | None]):
         self.ingest, self.principal_for_user = ingest, principal_for_user

@@ -1011,11 +1011,11 @@ function addSnapshotChip() {
 async function viewLlm(_parts, revision) {
   const q = route().query;
   const window_ = WINDOWS.includes(q.get('window')) ? q.get('window') : '24h';
-  const filters = { project: q.get('project') || '', model: q.get('model') || '' };
+  const filters = { project: q.get('project') || '', model: q.get('model') || '', mission: q.get('mission') || '' };
   const f = { window: window_, ...filters };
   const step = STEP_FOR[window_];
   const series = (metric) => client.llm('timeseries', { ...f, step, metric });
-  const [total, models, agents, problems, projects, requests, errors, ttft, speed, sessions, fleet] = await Promise.all([
+  const [total, models, agents, problems, projects, requests, errors, ttft, speed, sessions, fleet, previous, missions, queue, handoffs] = await Promise.all([
     client.llm('stats', { ...f, group: 'all' }),
     client.llm('stats', { window: window_, project: filters.project, group: 'model' }),
     client.llm('stats', { ...f, group: 'session' }),
@@ -1024,6 +1024,10 @@ async function viewLlm(_parts, revision) {
     series('requests'), series('errors'), series('ttft_p95'), series('speed_p50'),
     client.listSessions().catch(() => ({ sessions: [] })),
     loadAnalytics(client, '').catch(() => null),
+    client.llm('stats', { ...f, group: 'all', previous: 1 }).catch(() => null),
+    client.llm('stats', { window: window_, project: filters.project, group: 'mission' }).catch(() => null),
+    series('queue_p95').catch(() => null),
+    client.listHandoffs().catch(() => null),
   ]);
   if (revision !== renderRevision) return NO_REFRESH;
   const names = {};
@@ -1032,7 +1036,8 @@ async function viewLlm(_parts, revision) {
     window: window_, filters, names,
     projects: projects.groups.map((g) => g.key),
     modelNames: [...new Set(models.groups.map((g) => g.key))],
-  }, { total, models, agents, problems, series: { requests, errors, ttft, speed } });
+    missionNames: (missions?.groups || []).map((g) => g.key),
+  }, { total, models, agents, problems, previous, missions, handoffs: handoffs?.handoffs, series: { requests, errors, ttft, speed, queue } });
   if (fleet) root.insertAdjacentHTML('beforeend', usageStrip(fleet));
   addSnapshotChip();
   root.querySelectorAll('[data-llm-filter]').forEach((el) => el.addEventListener('change', () => {
@@ -1048,20 +1053,27 @@ async function viewLlmSession(parts, revision) {
   const f = { window: window_, session: id };
   const step = STEP_FOR[window_];
   const series = (metric) => client.llm('timeseries', { ...f, step, metric });
-  const [total, models, problems, requests, errors, ttft, speed, session] = await Promise.all([
+  const [total, models, problems, requests, errors, ttft, speed, session, previous, queue, handoffs, agents, sessions] = await Promise.all([
     client.llm('stats', { ...f, group: 'all' }), client.llm('stats', { ...f, group: 'model' }),
     client.llm('errors', f), series('requests'), series('errors'), series('ttft_p95'), series('speed_p50'),
     client.getSession(id).catch(() => null),
+    client.llm('stats', { ...f, group: 'all', previous: 1 }).catch(() => null),
+    series('queue_p95').catch(() => null),
+    client.listHandoffs().catch(() => null),
+    client.llm('stats', { window: window_, group: 'session' }).catch(() => null),
+    client.listSessions().catch(() => ({ sessions: [] })),
   ]);
+  const names = {};
+  for (const s of sessions.sessions || []) if (s.display_name) names[s.session_id] = s.display_name;
   if (revision !== renderRevision) return NO_REFRESH;
   root.innerHTML = renderLlmSession({
-    window: window_, sessionId: id, known: Boolean(session), name: session?.display_name || session?.agent_role || '',
-  }, { total, models, problems, series: { requests, errors, ttft, speed } });
+    window: window_, sessionId: id, known: Boolean(session), name: session?.display_name || session?.agent_role || '', names,
+  }, { total, models, problems, previous, handoffs: handoffs?.handoffs, agents, series: { requests, errors, ttft, speed, queue } });
   addSnapshotChip();
   if (session) {
     const slot = document.createElement('div'); slot.id = 'related-panel';
     root.querySelector('.hd-live-head').after(slot);
-    return { refresh() {}, dispose: showRelated('session', id, slot) };
+    return { refresh() {}, dispose: showRelated('session', id, slot, '', { compact: true }) };
   }
   return NO_REFRESH;
 }

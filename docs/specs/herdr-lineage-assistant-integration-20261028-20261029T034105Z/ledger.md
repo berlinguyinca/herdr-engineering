@@ -35,3 +35,8 @@ Not done: real quota model switch; phase-transition handoff records stay `prepar
 - Correction to audit.md: the 0.7/0.75/0.8 constants are not all competing rollover triggers (0.7 is a worker budget share, 0.8 a UI warning); only 0.75 is the phase-handoff trigger, and it is off by default.
 - Supervisor replacement was not assessed in the Pi audit.
 - Open decision, not made on the user's behalf: whether the proposed 70/80/90 context thresholds become defaults (the spec labels them proposals).
+
+## Follow-up 2026-10-29 (branch `feat/delegation-consumer-gate-audit-20261029`)
+- Queued delegations: `control_plane/assistant_dispatch.py` hands an approved `request_mission` / `propose_branch` delegation to the existing `HandoffRegistry` (route `POST /assistant-delegations/<id>/dispatch`, plus the server sweep), claim-once, idempotent, audited, lineage-linked, tenant-checked, fail closed; handoff state is mirrored back. Off unless `personal_assistant.delegation_consumer.enabled`. **Still open:** no Pi-side executor claims these handoffs in this repo (contract in the runbook); the handoff queue is not tenant-partitioned.
+- Merge-gate adapter: still OFF. Example block (commented) in `deploy/control-plane/fleet-config.example.yaml`, startup and `fleet config validate` refuse an enabled-but-invalid section; runbook steps added. **Still open:** nothing writes `validated` edges from CI yet.
+- Audit anchor: `herdr-eng control-plane assistant-audit anchor|verify`, YAML `personal_assistant.audit.anchor_file`. **Still open:** nobody runs it on a timer; the tail of the anchor file itself is not self-protecting.
