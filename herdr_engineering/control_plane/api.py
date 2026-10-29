@@ -54,6 +54,11 @@ _AGENT_POST = re.compile(r"^/api/v1/(?:llm/keys|reviews|llm/keys/[^/]+/revoke"
                         r"|architecture/(?:snapshots|analyses|analyses/claim)"
                         # CI fix runner: claim, report state, report result. Never create or cancel.
                         r"|ci/fix/claim|ci/fix/[^/]+/(?:state|result))$")
+# Report mutations have their own artifact owner/edit/review checks after this
+# narrow role gate. This does not grant agents publication or generic mutation.
+_REPORT_AGENT_POST = re.compile(
+    r"^/api/v1/(?:artifact-reports(?:/[^/]+/jobs)?|"
+    r"artifacts/[^/]+/(?:blobs|versions(?:/[^/]+/(?:feedback|checks))?))$")
 # T12: the one POST an ingest key may make besides /api/v1/ingest: acknowledging a steering request addressed to it.
 _STEER_ACK = re.compile(r"^/api/v1/steering/[^/]+/ack$")
 # T16 gap C: the second: ask for a re-review of a PR whose head has no quorum (ingest-role key; scoped in the handler).
@@ -1084,9 +1089,33 @@ def _make_handler(server, public=False, operator=False):
             digest = hashlib.sha256(supplied.encode()).hexdigest()[:16]
             return f"api-key:{digest}:{self._role() or 'local'}"
 
+        def _artifact_version_allowed(self, artifact_id, version_id, permission):
+            """Permission on the artifact AND the version must belong to it (registry-backed only)."""
+            if not self._artifact_allowed(artifact_id, permission):
+                return False
+            if server.artifact_store is None:
+                return True
+            return bool(version_id) and self._artifact_call("get_version", version_id, artifact_id) is not None
+
+        def _artifact_forbidden(self):
+            # Versioned registry artifacts (reports) must not leak existence.
+            if server.artifact_store is not None:
+                return self._deny(404, "not found")
+            return self._deny(403, "forbidden")
+
         def _artifact_allowed(self, artifact_id, permission):
             if server.artifact_acl is None:
                 return True
+            if self._artifact_acl_allows(artifact_id, permission):
+                return True
+            # Versioned-registry artifacts (native reports) are also private to their
+            # durable owner and grants, which the registry itself records. Reads stay
+            # ACL-only: an unauthorized read must never reach the store.
+            return bool(permission != "read" and server.artifact_store is not None
+                        and artifact_id and self._artifact_call(
+                "report_permission", artifact_id, self._resource_principal(), permission))
+
+        def _artifact_acl_allows(self, artifact_id, permission):
             principal = self._resource_principal()
             if server.artifact_acl.can(artifact_id, principal, permission):
                 return True
@@ -1136,7 +1165,8 @@ def _make_handler(server, public=False, operator=False):
                         and path == "/api/v1/ingest"):
                     return None
                 if (role == "agent" and self.command == "POST"
-                        and (path == "/api/v1/ingest" or _AGENT_POST.match(path))):
+                        and (path == "/api/v1/ingest" or _AGENT_POST.match(path)
+                             or _REPORT_AGENT_POST.match(path))):
                     return None
                 return self._deny(403, "read-only")
             if min_role == "ingest":
@@ -1410,6 +1440,12 @@ def _make_handler(server, public=False, operator=False):
                     return self._deny(403, "cross-origin integration mutation refused")
                 if self.headers.get("Content-Type", "").split(";", 1)[0].strip() != "application/json":
                     return self._deny(415, "integration mutations require application/json")
+            if path.split("/")[3:4] and path.split("/")[3] in {
+                    "artifacts", "artifact-reports", "artifact-jobs", "artifact-reviews", "publications"}:
+                origin = self.headers.get("Origin")
+                if origin and (urlsplit(origin).netloc != self.headers.get("Host")
+                               or urlsplit(origin).scheme not in {"http", "https"}):
+                    return self._deny(403, "cross-origin artifact mutation refused")
             min_role = ("ingest" if path == "/api/v1/ingest" or _STEER_ACK.match(path) or _is_rereview(path)
                         or _HOST_REPORT.match(path)
                        else "operator")
@@ -1712,6 +1748,9 @@ def _make_handler(server, public=False, operator=False):
             if self._rate_limit():
                 return None
             try:
+                from .artifact_report_api import route_report
+                if route_report(self, server, parts, resource):
+                    return None
                 if self.command == "GET":
                     return self._api_get(parts, resource)
                 return self._api_post(parts, resource)
@@ -1731,6 +1770,8 @@ def _make_handler(server, public=False, operator=False):
                 return self._send_json(403, {"error": "not permitted to modify this lineage object",
                                              "reason": "lineage_forbidden"})
             except ValueError as exc:
+                if getattr(exc, "code", None) == "not_found":
+                    return self._send_json(404, {"error": "not found"})
                 message = "Invalid GitHub query." if resource == "github" else str(exc)
                 return self._send_json(400, {"error": message})
             except ArtifactConflict as exc:
@@ -2252,9 +2293,13 @@ def _make_handler(server, public=False, operator=False):
                     artifact = None
                 return self._json(artifact) if artifact else self._json({"error": "not found"}, 404)
             if resource == "artifacts" and server.artifact_store is not None:
+                if len(parts) in {6, 7} and parts[5] == "versions" and not self._artifact_call(
+                        "report_permission", parts[4], self._resource_principal(), "read"):
+                    return self._json({"error": "not found"}, 404)
                 if len(parts) == 6 and parts[5] == "versions":
+                    method = "list_version_summaries" if _q(self.path, "summary") in {"true", "1"} else "list_versions"
                     return self._json({"artifact_id": parts[4],
-                                       "versions": self._artifact_call("list_versions", parts[4])})
+                                       "versions": self._artifact_call(method, parts[4])})
                 if len(parts) == 7 and parts[5] == "versions":
                     version = self._artifact_call("get_version", parts[6], parts[4])
                     return self._json(version) if version else self._json({"error": "not found"}, 404)
@@ -2276,6 +2321,10 @@ def _make_handler(server, public=False, operator=False):
                     if not self._artifact_allowed(job['artifact_id'], 'read'):
                         return self._json({'error': 'not found'}, 404)
                     server.artifact_job_manager.load([job])
+                    if job.get("profile") == "report" and server.artifact_store is not None:
+                        job = self._artifact_call("get_report_job", job["artifact_id"], parts[4])
+                        if job is None:
+                            return self._json({"error": "not found"}, 404)
                     return self._json(job)
             if resource == "artifact-reviews" and server.artifact_review_manager is not None:
                 if len(parts) == 5:
@@ -2459,7 +2508,7 @@ def _make_handler(server, public=False, operator=False):
                 return self._upload_artifact(r, parts)
             if resource == "artifacts" and server.artifact_acl is not None and len(parts) == 6 and parts[5] == "acl":
                 if not self._artifact_allowed(parts[4], 'admin'):
-                    return self._deny(403, 'forbidden')
+                    return self._artifact_forbidden()
                 body = self._read_json() or {}
                 permissions = set(body.get("permissions") or [])
                 grant = server.artifact_acl.grant(
@@ -2469,43 +2518,66 @@ def _make_handler(server, public=False, operator=False):
                 return self._json(grant, 201)
             if resource == "artifacts" and server.artifact_acl is not None and len(parts) == 7 and parts[5] == "acl" and parts[6] == "revoke":
                 if not self._artifact_allowed(parts[4], 'admin'):
-                    return self._deny(403, 'forbidden')
+                    return self._artifact_forbidden()
                 body = self._read_json() or {}
                 server.artifact_acl.revoke(parts[4], str(body.get("principal_id") or ""))
                 return self._json({"ok": True})
             if resource == "artifacts" and server.artifact_store is not None and len(parts) == 6 and parts[5] == "versions":
                 if not self._artifact_allowed(parts[4], 'edit'):
-                    return self._deny(403, 'forbidden')
+                    return self._artifact_forbidden()
+                if not self._artifact_call("report_permission", parts[4], self._resource_principal(), "edit"):
+                    return self._deny(404, "not found")
                 body = self._read_json() or {}
                 if "created_by" in body:
                     return self._json({"error": "created_by is derived from authentication"}, 400)
+                if body.get("report_descriptor") is not None and any(key in body for key in
+                        {"validation", "job_id", "host_id", "agent_id", "session_id", "mission_id"}):
+                    return self._json({"error": "report execution validation and context are worker-owned; use report checks for attestations"}, 400)
                 body["created_by"] = self._resource_principal()
                 body["provenance"] = {**(body.get("provenance") or {}), "principal_id": body["created_by"]}
                 return self._json(self._artifact_call("commit_version", parts[4], **body), 201)
             if resource == "artifact-jobs" and server.artifact_job_manager is not None:
                 if len(parts) == 4:
                     body = self._read_json() or {}
+                    if body.get("profile") == "report" and server.artifact_store is None:
+                        return self._json({"error": "versioned report registry is unavailable"}, 503)
                     if not self._artifact_allowed(body.get('artifact_id', ''), 'edit'):
-                        return self._deny(403, 'forbidden')
+                        return self._artifact_forbidden()
                     return self._json(server.artifact_job_manager.submit(
                         profile=body.get("profile"), artifact_id=body.get("artifact_id"),
                         base_version_id=body.get("base_version_id"), request=body.get("request") or {},
                         requested_by=self._resource_principal()), 201)
                 if len(parts) == 6 and parts[5] == "cancel":
                     self._read_json()
-                    job = (self._artifact_call('get_job', parts[4]) if server.artifact_store is not None
-                           else server.artifact_job_manager.get(parts[4]))
+                    try:
+                        local = server.artifact_job_manager.get(parts[4])
+                    except KeyError:
+                        local = None
+                    if local is not None and local.get("profile") == "report" and server.artifact_store is not None:
+                        # Report jobs: the database row, not the manager, decides cancellation.
+                        job = local
+                    else:
+                        job = (self._artifact_call('get_job', parts[4]) if server.artifact_store is not None
+                               else server.artifact_job_manager.get(parts[4]))
                     if job is None:
                         return self._json({'error': 'not found'}, 404)
                     if not self._artifact_allowed(job['artifact_id'], 'edit'):
-                        return self._deny(403, 'forbidden')
+                        return self._artifact_forbidden()
                     server.artifact_job_manager.load([job])
+                    if job.get("profile") == "report" and server.artifact_store is not None:
+                        cancelled = self._artifact_call("cancel_report_job", job["artifact_id"], parts[4])
+                        if cancelled is not None:
+                            return self._json(cancelled)
+                        persisted = self._artifact_call("get_report_job", job["artifact_id"], parts[4])
+                        if persisted is None:
+                            return self._json({"error": "not found"}, 404)
+                        return self._json({"error": "report job is no longer queued; no cancellation recorded"}, 409)
                     return self._json(server.artifact_job_manager.cancel(parts[4]))
             if resource == "artifact-reviews" and server.artifact_review_manager is not None:
                 if len(parts) == 4:
                     body = self._read_json() or {}
-                    if not self._artifact_allowed(body.get('artifact_id', ''), 'review'):
-                        return self._deny(403, 'forbidden')
+                    if not self._artifact_version_allowed(body.get('artifact_id', ''), body.get('version_id'), 'review'):
+                        return self._artifact_forbidden()
                     return self._json(server.artifact_review_manager.request(
                         artifact_id=body.get("artifact_id"), version_id=body.get("version_id"),
                         requested_by=self._resource_principal()), 201)
@@ -2514,16 +2586,16 @@ def _make_handler(server, public=False, operator=False):
                     review = server.artifact_review_manager.get(parts[4])
                     if review is None:
                         return self._json({'error': 'not found'}, 404)
-                    if not self._artifact_allowed(review['artifact_id'], 'review'):
-                        return self._deny(403, 'forbidden')
+                    if not self._artifact_version_allowed(review['artifact_id'], review['version_id'], 'review'):
+                        return self._artifact_forbidden()
                     return self._json(server.artifact_review_manager.complete(
                         parts[4], reviewer=self._resource_principal(), decision=body.get("decision"),
                         comments=body.get("comments") or []))
             if resource == "publications" and server.publication_controller is not None:
                 if len(parts) == 5 and parts[4] == "requests":
                     body = self._read_json() or {}
-                    if not self._artifact_allowed(body.get('resource_id', ''), 'share'):
-                        return self._deny(403, 'forbidden')
+                    if not self._artifact_version_allowed(body.get('resource_id', ''), body.get('version_id'), 'share'):
+                        return self._artifact_forbidden()
                     return self._json(server.publication_controller.request(
                         resource_id=body.get("resource_id"), version_id=body.get("version_id"),
                         requested_by=self._resource_principal(), audience=body.get("audience"),
@@ -2533,8 +2605,9 @@ def _make_handler(server, public=False, operator=False):
                     publication = server.publication_controller.get(parts[4])
                     if publication is None:
                         return self._json({'error': 'not found'}, 404)
-                    if not self._artifact_allowed(publication['resource_id'], 'share'):
-                        return self._deny(403, 'forbidden')
+                    if not self._artifact_version_allowed(
+                            publication['resource_id'], publication['pinned_version_id'], 'share'):
+                        return self._artifact_forbidden()
                     if parts[5] == "approve":
                         result = server.publication_controller.approve(parts[4], approver=self._resource_principal())
                     else:
