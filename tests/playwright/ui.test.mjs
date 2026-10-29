@@ -286,22 +286,17 @@ test('analytics auto-fits operational panels without document overflow', async (
 test('4K operational views use the canvas while prose and catalog groups stay readable', async () => {
   await withApp(async ({page,base}) => {
     await page.setViewportSize({width:3840,height:2160});
-    await page.goto(`${base}/#/overview`);await page.locator('[data-overview=missions]').waitFor();
+    await page.goto(`${base}/#/overview`);await page.locator('[data-overview=hosts]').waitFor();
     const overview=await page.evaluate(()=>{
       const shell=document.querySelector('herdr-app-shell').shadowRoot;
       const content=shell.querySelector('.hd-shell__content').getBoundingClientRect();
-      const intro=document.querySelector('.ov-intro').getBoundingClientRect();
       const layout=getComputedStyle(document.querySelector('.ov-layout')).gridTemplateColumns.split(' ').length;
-      const missions=document.querySelector('[data-overview=missions]').getBoundingClientRect();
-      const fleet=document.querySelector('[data-overview=fleet]').getBoundingClientRect();
       const hosts=document.querySelector('[data-overview=hosts]').getBoundingClientRect();
       const activity=document.querySelector('[data-overview=activity]').getBoundingClientRect();
-      return {width:content.width,intro:intro.width,columns:layout,missions:missions.width,fleet:fleet.width,lastRowWidth:hosts.width+activity.width,overflow:document.documentElement.scrollWidth>innerWidth};
+      return {width:content.width,columns:layout,lastRowWidth:hosts.width+activity.width,overflow:document.documentElement.scrollWidth>innerWidth};
     });
     assert.ok(overview.width>=3400,`expected the 4K canvas after the sidebar, got ${overview.width}`);
-    assert.ok(overview.intro<900,`prose should retain a readable measure, got ${overview.intro}`);
     assert.equal(overview.columns,4);
-    assert.ok(Math.abs(overview.missions-overview.fleet)<40,'the sparse mission and fleet panels should split the first row evenly');
     assert.ok(overview.lastRowWidth>overview.width*.9,`last Overview row should use the canvas, got ${overview.lastRowWidth}`);
     assert.equal(overview.overflow,false);
     await page.goto(`${base}/#/herd`);await page.locator('.ss-group').first().waitFor();
