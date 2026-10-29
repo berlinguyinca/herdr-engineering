@@ -29,12 +29,13 @@ const zoom = async (page) => Number((await page.locator('.lin-zoom').innerText()
 const select = async (page, id) => {
   const n = page.locator(`g[data-node="${id}"]`);
   if (!(await n.count())) {                    // not in the current view: find it with the search box, as a person would
+    await page.evaluate(() => { const d = document.querySelector('details[data-filterbox]'); if (d && !d.open) d.open = true; });   // collapsed on a phone
     await page.locator('input[data-filter="q"]').fill(id.split(':').slice(1).join(':'));
     await n.waitFor({ timeout: 10000 });
   }
   await n.focus();
   await page.keyboard.press('Enter');
-  if (await page.locator('input[data-filter="q"]').inputValue()) await page.locator('input[data-filter="q"]').fill('');
+  if (await page.locator('input[data-filter="q"]').inputValue().catch(() => '')) await page.locator('input[data-filter="q"]').fill('');
   await page.locator('.lin-inspector').waitFor();
   await page.locator(`.lin-inspector[aria-label="Inspector for ${(await page.locator('.lin-inspector h3').first().innerText())}"]`).waitFor();
   await settled(page);
@@ -235,7 +236,7 @@ for (const [w, h] of [[375, 667], [320, 640]]) {
     const { ctx, page } = await open(srv.info, { viewport: { width: w, height: h } });
     const strip = await page.locator('.lin-status').boundingBox();
     const graph = await page.locator('[data-viewport]').boundingBox();
-    const filters = await page.locator('form[data-lineage-filters]').boundingBox();
+    const filters = await page.locator('details[data-filterbox]').boundingBox();
     assert.ok(strip.y < filters.y && strip.y < graph.y, 'the status strip is above the filters and the graph');
     const attn = await page.locator('.lin-status .lin-status__need').first().boundingBox();
     assert.ok(attn.y + attn.height < h * 2.2, 'the attention list is within the first two screens');
@@ -253,6 +254,76 @@ for (const [w, h] of [[375, 667], [320, 640]]) {
     await ctx.close();
   });
 }
+
+// ---- filters disclosure and minimap (S5 follow-ups) ---------------------------------------------------------------------
+test('filters: open on a wide page, collapsed on a phone, operable by keyboard, and a collapsed box still says how many are active', async () => {
+  const wide = await open();
+  assert.equal(await wide.page.locator('details[data-filterbox]').evaluate((d) => d.open), true, 'open at 1280px');
+  assert.ok(await wide.page.locator('input[data-filter="q"]').isVisible());
+  await wide.ctx.close();
+  const { ctx, page } = await open(srv.info, { viewport: { width: 375, height: 700 } });
+  const box = page.locator('details[data-filterbox]');
+  assert.equal(await box.evaluate((d) => d.open), false, 'collapsed at 375px');
+  assert.ok(!(await page.locator('input[data-filter="q"]').isVisible()), 'the search box is not on screen until the box is opened');
+  const sum = page.locator('details[data-filterbox] > summary');
+  const b = await sum.boundingBox();
+  assert.ok(b.height >= 44 && b.width >= 44, `the summary is a ${b.width}x${b.height} target`);
+  for (const audit of [await staticAudit(page, '#hcn-p-lineage')]) assert.deepEqual(audit, [], summarize(audit));
+  await sum.focus();
+  await page.keyboard.press('Enter');
+  assert.equal(await box.evaluate((d) => d.open), true, 'Enter opens it');
+  await page.locator('input[data-filter="q"]').fill('session');
+  await settled(page);
+  assert.equal(await box.evaluate((d) => d.open), true, 'a redraw keeps the box as the person left it');
+  await sum.focus();
+  await page.keyboard.press('Space');
+  assert.equal(await box.evaluate((d) => d.open), false, 'Space closes it');
+  assert.match(await sum.innerText(), /Filters\s*\(1 active\)/, 'the active filter is still announced when collapsed');
+  assert.ok(await page.locator('g[data-node]').count() > 0, 'the filter applies while collapsed');
+  await sum.focus(); await page.keyboard.press('Enter');
+  const f = await staticAudit(page, '#hcn-p-lineage');
+  assert.deepEqual(f, [], summarize(f));
+  assert.equal(overflowFailure(await overflowAudit(page)), '');
+  await ctx.close();
+});
+
+test('minimap: a text alternative that follows the view, no focus stop, no motion, click moves the view, absent when the whole graph fits', async () => {
+  const { ctx, page } = await open();
+  const mm = page.locator('svg.lin-mm');
+  assert.equal(await mm.count(), 1, 'the workbench graph is wider than the viewport');
+  assert.equal(await mm.getAttribute('role'), 'img');
+  const before = await mm.getAttribute('aria-label');
+  assert.match(before, /^Overview map: the view shows columns 1 to \d+ of \d+ and rows 1 to \d+ of \d+\./);
+  assert.equal(await page.locator('[data-minimap] :is(a, button, input, [tabindex])').count(), 0, 'nothing inside the minimap can take focus');
+  assert.equal(await page.locator('[data-minimap]').evaluate((el) => el.matches(':focus-within') || el.tabIndex >= 0), false);
+  // keyboard: Tab leaves the toolbar through the viewport and onward; it never gets stuck on or inside the map
+  await page.locator('[data-vp="end"]').focus();
+  const seen = [];
+  for (let i = 0; i < 6; i += 1) { await page.keyboard.press('Tab'); seen.push(await page.evaluate(() => `${document.activeElement.tagName}:${document.activeElement.closest('[data-minimap]') ? 'IN-MAP' : ''}${document.activeElement.getAttribute('data-vp') || document.activeElement.className.toString().slice(0, 20)}`)); }
+  assert.ok(!seen.some((x) => x.includes('IN-MAP')), seen.join(' | '));
+  assert.ok(new Set(seen).size >= 2, `focus keeps moving: ${seen.join(' | ')}`);
+  const vb0 = await page.locator('svg.lin-svg').getAttribute('viewBox');
+  const r = await mm.boundingBox();
+  await page.mouse.click(r.x + r.width * 0.9, r.y + r.height * 0.5);
+  await settled(page);
+  assert.notEqual(await page.locator('svg.lin-svg').getAttribute('viewBox'), vb0, 'a click on the map moved the view');
+  assert.notEqual(await page.locator('svg.lin-mm').getAttribute('aria-label'), before, 'the text alternative follows the view');
+  assert.ok(await drawn(page) <= 242);
+  const motion = await page.evaluate(() => [...document.querySelectorAll('.lin-minimap, .lin-mm, .lin-mm-view, .lin-mm-bar')].map((el) => getComputedStyle(el)).map((c) => `${c.transitionDuration}/${c.animationName}`));
+  assert.ok(motion.every((m) => /^0s\/none$/.test(m)), `no transition or animation: ${motion.join(',')}`);
+  await ctx.close();
+});
+
+test('terminal authorization is not offered on the standalone page, whatever the node', async () => {
+  const { ctx, page } = await open();
+  const posts = [];
+  page.on('request', (r) => { if (/\/authorize/.test(r.url())) posts.push(r.url()); });
+  await page.locator('[data-vp="end"]').click();
+  await select(page, 'session:pi-12');
+  assert.equal(await page.locator('[data-term-auth]').count(), 0);
+  assert.deepEqual(posts, []);
+  await ctx.close();
+});
 
 // ---- scale -----------------------------------------------------------------------------------------------------------
 test('a 64-session chain: the drawing is bounded, the newest session is one key away, and its handoff is inspectable', async () => {

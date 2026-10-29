@@ -9,7 +9,7 @@ import { renderLinks } from './collab-links.js';
 import { buildTabsPanes, nextTab, renderTabsPanes } from './collab-tabs.js';
 import { decisionBody, delegationBody, renderDelegations, renderProposalList, renderReview } from './collab-proposals.js';
 import {
-  VIEW_H, viewportSize, centerOn, clampView, filterGraph, fitView, focusKey, focusSelector, focusSubgraph, focusSuccessor, isVisible, layoutCached, mergePages, nextNode, panBy, zoomAt, pagesTruncated, renderLineage, replayTarget,
+  VIEW_H, minimapTarget, workspaceLinkFor, viewportSize, centerOn, clampView, filterGraph, fitView, focusKey, focusSelector, focusSubgraph, focusSuccessor, isVisible, layoutCached, mergePages, nextNode, panBy, zoomAt, pagesTruncated, renderLineage, replayTarget,
 } from './collab-lineage.js';
 import { answerBody, askBody, contextBody, declineBody, linkBody, renderContextChip, renderContextPanel, renderInbox } from './collab-context.js';
 import { ackBody, renderAnalytics, renderInbox as renderAttention, renderProgress, restoreBody, snoozeBody } from './collab-attention.js';
@@ -1129,6 +1129,24 @@ export function mountCollab(root, { fabricSessions = null, onFreshness = () => {
       const tail = typeof id === 'string' && id.startsWith('session:') ? id.slice(8) : null;
       return tail && SESS.ids && SESS.ids.has(tail) ? { href: `/#/herd/session/${encodeURIComponent(tail)}` } : null;
     };
+    // Operator-only: the server is asked (the real authorize route) whether the operator may use the terminal of the workspace this node belongs to.
+    // Nothing is rendered for anyone else, so there is also no handler to reach: the click path re-checks the same condition.
+    const TERM = { result: null, busy: false };
+    const termAuthFor = (id) => {
+      if (!operator || standalone || !id) return null;
+      const node = mergePages(LIN.pages).nodes.find((n) => n.id === id);
+      const link = workspaceLinkFor(S.links, node);
+      return link && link.can_terminal === true ? { link, result: TERM.result, busy: TERM.busy } : null;
+    };
+    async function termAuth(linkId) {
+      const t = termAuthFor(LIN.sel);
+      if (!t || t.link.link_id !== linkId || TERM.busy) return;                  // only the control that is on screen, only for the operator
+      TERM.busy = true; TERM.result = null; drawLineage(true);
+      try { await api.authorizeWorkspace(roomId, linkId, 'terminal'); TERM.result = { link_id: linkId, ok: true }; }
+      catch (e) { TERM.result = { link_id: linkId, ok: false, reason: e && e.status ? `HTTP ${e.status}` : 'forbidden' }; }
+      TERM.busy = false;
+      if (alive) drawLineage(true);
+    }
     const vpSize = () => {
       const box = $('hcn-lineage');
       // a hidden panel measures 0: fall back to the window, never to a desktop width on a phone
@@ -1146,8 +1164,8 @@ export function mountCollab(root, { fabricSessions = null, onFreshness = () => {
       const sz = viewportSize(layout, max.w, max.h);
       LIN.vpW = sz.w; LIN.vpH = sz.h;
       if (LIN.vp && layout) LIN.vp = clampView(LIN.vp, layout, sz.w, sz.h);
-      return { graphAll, filtered, vp: LIN.vp, focusId: LIN.focusId, vpW: sz.w, vpH: sz.h, terminal: terminalFor(LIN.sel), asOf: LIN.asOf, timeline: LIN.timeline, error: LIN.error, timelineError: LIN.timelineError, queued: LIN.pending !== null, notice: LIN.notice, busy: LIN.busy, view: LIN.view,
-        mode: LIN.mode, clock: LIN.clock, sel: LIN.sel, focus: LIN.focus, filters: LIN.filters, total: LIN.total,
+      return { graphAll, filtered, vp: LIN.vp, focusId: LIN.focusId, vpW: sz.w, vpH: sz.h, terminal: terminalFor(LIN.sel), termAuth: termAuthFor(LIN.sel), asOf: LIN.asOf, timeline: LIN.timeline, error: LIN.error, timelineError: LIN.timelineError, queued: LIN.pending !== null, notice: LIN.notice, busy: LIN.busy, view: LIN.view,
+        mode: LIN.mode, clock: LIN.clock, sel: LIN.sel, focus: LIN.focus, filters: LIN.filters, filtersOpen: LIN.filtersOpen ?? window.innerWidth > 760, total: LIN.total,
         workbench: LIN.sel ? renderWorkbench(wbModel()) + renderContextPanel(ctxModel()) : '',
         graphTruncated: LIN.next !== null ? (LIN.truncated || 'limit') : (LIN.truncated || null), graphMore: LIN.next !== null, width: Math.max(640, ($('hcn-lineage')?.clientWidth || 900)) };
     };
@@ -1410,6 +1428,14 @@ export function mountCollab(root, { fabricSessions = null, onFreshness = () => {
           return;
         }
         if (wb) { wbAct(wb.dataset.wbAct, wb.dataset.wbId); return; }
+        const ta = e.target.closest('[data-term-auth]');
+        if (ta) { termAuth(ta.dataset.termAuth); return; }
+        const mm = e.target.closest('svg.lin-mm');
+        if (mm && LIN.layout) {
+          const r = mm.getBoundingClientRect(); const v = curView();
+          if (r.width && r.height && v) { const t = minimapTarget(LIN.layout, (e.clientX - r.left) / r.width, (e.clientY - r.top) / r.height); setView({ ...v, x: t.x - LIN.vpW / v.k / 2, y: t.y - LIN.vpH / v.k / 2 }); }
+          return;
+        }
         const vpb = e.target.closest('[data-vp]');
         if (vpb) { vpAct(vpb.dataset.vp); return; }
         const n = e.target.closest('[data-node]');
@@ -1423,6 +1449,8 @@ export function mountCollab(root, { fabricSessions = null, onFreshness = () => {
         if (md) { LIN.mode = md.dataset.mode; savePrefs(); drawLineage(true); return; }
         if (e.target.closest('[data-more]') && !LIN.busy) loadLineage(true);
       });
+      // `toggle` does not bubble: capture it, so the person's choice survives every redraw
+      box.addEventListener('toggle', (e) => { if (e.target.matches && e.target.matches('details[data-filterbox]')) LIN.filtersOpen = e.target.open; }, true);
       box.addEventListener('submit', (e) => {
         e.preventDefault();                                              // Enter in the search box filters; it never navigates
         const cf = e.target.closest && e.target.closest('[data-ctx-form]');

@@ -7,7 +7,8 @@
 //  * nothing is encoded by colour alone: node types differ by shape, edge types by dash pattern and a text tag,
 //    states by a glyph and a word, Gantt states by a fill pattern and a label; every view also has a table;
 //  * every id, label and value is data: it reaches the page only through esc() (text and attributes alike);
-//  * there is no terminal and no command here. Comments and steering (collab-workbench.js) are drawn beside the
+//  * there is no terminal and no command here (the operator's "Check terminal access" button only asks the server and records the
+//    answer in the audit log; it opens nothing). Comments and steering (collab-workbench.js) are drawn beside the
 //    inspector; they are written only through the server's checked routes. The one exception is a link to the
 //    dashboard's own session page (which owns the authorized Terminal button), offered only when the caller passes it;
 //  * the graph is a viewport, not a page: only the nodes inside the visible rectangle (plus the selected and the
@@ -456,6 +457,48 @@ export function renderGraphSvg(graph, layout, { sel = null, focus = null, match 
     + `${edges}${nodes}</svg>${note}`;
 }
 
+// ---- minimap ----------------------------------------------------------------------------------------------------
+// A small overview of the whole layout with the part the viewport shows. It is bounded however large the graph is (at most
+// MINIMAP_BINS bars: the columns are binned, each bar as tall as the tallest column in its bin), is not focusable (the toolbar and the
+// arrow keys already do everything it does, so it can never trap focus), has a text alternative, and never animates.
+export const MINIMAP_W = 160;
+export const MINIMAP_H = 72;
+export const MINIMAP_BINS = 40;
+export const minimapNeeded = (layout, view, vw, vh) => Boolean(layout) && (layout.width > vw / view.k + 1 || layout.height > vh / view.k + 1);
+export function minimapText(layout, view, vw, vh) {
+  const r = visibleRect(view, vw, vh);
+  const cols = layout.columns.length;
+  const maxRows = Math.max(1, ...layout.columns.map((c) => c.length));
+  const c0 = clamp(Math.floor((r.x0 - PAD) / COL_W) + 1, 1, cols);
+  const c1 = clamp(Math.floor((r.x1 - PAD) / COL_W) + 1, c0, cols);
+  const r0 = clamp(Math.floor((r.y0 - PAD) / ROW_H) + 1, 1, maxRows);
+  const r1 = clamp(Math.floor((r.y1 - PAD) / ROW_H) + 1, r0, maxRows);
+  return `Overview map: the view shows columns ${c0} to ${c1} of ${cols} and rows ${r0} to ${r1} of ${maxRows}. Click or tap the map to move the view there; the zoom and arrow keys do the same.`;
+}
+// graph-space point under a click at fractions (fx, fy) of the minimap, as the centre of the new view
+export const minimapTarget = (layout, fx, fy) => ({ x: clamp(fx, 0, 1) * layout.width, y: clamp(fy, 0, 1) * layout.height });
+export function renderMinimap(layout, view, vw, vh) {
+  if (!minimapNeeded(layout, view, vw, vh)) return '';
+  const sx = MINIMAP_W / Math.max(1, layout.width);
+  const sy = MINIMAP_H / Math.max(1, layout.height);
+  const bins = Math.min(MINIMAP_BINS, layout.columns.length);
+  const per = Math.ceil(layout.columns.length / Math.max(1, bins));
+  let bars = '';
+  for (let b = 0; b * per < layout.columns.length; b += 1) {
+    const slice = layout.columns.slice(b * per, (b + 1) * per);
+    const rows = Math.max(...slice.map((c) => c.length));
+    const x = PAD + b * per * COL_W;
+    bars += `<rect class="lin-mm-bar" x="${(x * sx).toFixed(1)}" y="0" width="${Math.max(1, per * COL_W * sx - 0.5).toFixed(1)}" height="${Math.max(1, (PAD + rows * ROW_H) * sy).toFixed(1)}"/>`;
+  }
+  const r = visibleRect(view, vw, vh);
+  const x0 = clamp(r.x0 * sx, 0, MINIMAP_W - 2);
+  const y0 = clamp(r.y0 * sy, 0, MINIMAP_H - 2);
+  const w = clamp((r.x1 - r.x0) * sx, 2, MINIMAP_W - x0);
+  const h = clamp((r.y1 - r.y0) * sy, 2, MINIMAP_H - y0);
+  return `<figure class="lin-minimap" data-minimap><svg class="lin-mm" width="${MINIMAP_W}" height="${MINIMAP_H}" viewBox="0 0 ${MINIMAP_W} ${MINIMAP_H}" role="img" aria-label="${esc(minimapText(layout, view, vw, vh))}" focusable="false">`
+    + `${bars}<rect class="lin-mm-view" x="${x0.toFixed(1)}" y="${y0.toFixed(1)}" width="${w.toFixed(1)}" height="${h.toFixed(1)}"/></svg></figure>`;
+}
+
 // The controls over the graph: zoom, fit, focus on one lineage. Plain buttons (keyboard and screen reader operable); the page binds them.
 export function renderGraphToolbar({ view, focusId = null, sel = null } = {}) {
   const v = view || { k: 1 };
@@ -518,7 +561,19 @@ export function renderGraphTable(graph, { sel = null } = {}) {
     + `<thead><tr><th scope="col">Type</th><th scope="col">From</th><th scope="col">To</th><th scope="col">Revision</th><th scope="col">Freshness</th></tr></thead><tbody>${erows || '<tr><td colspan="5">No links.</td></tr>'}</tbody></table></div></div>`;
 }
 
-export function renderFilters(graphAll, f = {}) {
+// How many filters are narrowing the graph right now (shown in the disclosure's summary, so a collapsed box never hides an active filter).
+export function activeFilterCount(f = {}) {
+  return (text(f.q).trim() ? 1 : 0) + (f.types instanceof Set ? f.types.size : 0) + (f.edgeTypes instanceof Set ? f.edgeTypes.size : 0) + (f.state ? 1 : 0);
+}
+
+// The filters sit behind a disclosure (a native <details>: Enter / Space on the summary toggles it, no script needed). `open` is the
+// caller's choice (open on a wide page, closed on a phone, then whatever the person last chose); the form inside is unchanged.
+export function renderFilters(graphAll, f = {}, { open = true } = {}) {
+  const n = activeFilterCount(f);
+  return `<details class="lin-filterbox" data-filterbox${open ? ' open' : ''}><summary>Filters<span class="lin-filtercount"${n ? '' : ' hidden'}> (${n} active)</span></summary>${renderFilterForm(graphAll, f)}</details>`;
+}
+
+function renderFilterForm(graphAll, f = {}) {
   const types = [...new Set(graphAll.nodes.map((n) => n.node_type))].sort();
   const etypes = [...new Set(graphAll.edges.map((e) => e.edge_type))].sort();
   const states = [...new Set(graphAll.nodes.map((n) => text(n.state, 'none')))].sort();
@@ -876,6 +931,26 @@ function renderFacts(f) {
 // `opts.terminal` is {href} when the caller (the dashboard) has already established that the viewer is the operator and the session
 // is one the dashboard knows; the link goes to the dashboard's own session page, which owns the authorized Terminal button.
 // Without it the explicit "not offered" text stays: this module never builds a terminal command and never widens authorization.
+// The operator-only "check terminal access" control. `link` is the room's workspace link (from room state) that matches the node, and the
+// caller passes it ONLY for the operator on the dashboard and only when the server said can_terminal for that link; this module never
+// decides who may open a terminal, it asks the server (POST /collab/rooms/<room>/workspaces/<link>/authorize, action terminal) and shows the answer.
+export function workspaceLinkFor(links, node) {
+  if (!Array.isArray(links) || !node) return null;
+  const a = (node.attrs && typeof node.attrs === 'object') ? node.attrs : {};
+  const ws = node.node_type === 'workspace' ? idTail(node.id) : (typeof a.workspace_id === 'string' ? a.workspace_id : null);
+  if (!ws) return null;
+  const hits = links.filter((l) => l && l.workspace_id === ws && (typeof a.host !== 'string' || !a.host || l.host === a.host));
+  return hits.length === 1 ? hits[0] : null;
+}
+export function renderTerminalAuth(link, result = null, busy = false) {
+  if (!link || typeof link.link_id !== 'string' || link.can_terminal !== true) return '';
+  const msg = result && result.link_id === link.link_id
+    ? (result.ok ? `<span class="cx-msg" role="status">The server allows you the terminal of ${esc(link.workspace_id)} on ${esc(link.host)}. Recorded in the audit log; nothing was opened.</span>`
+      : `<span class="cx-msg" role="alert">The server did not allow the terminal (${esc(result.reason || 'forbidden')}).</span>`)
+    : '<span class="cx-msg">This is an access check, not a terminal: it asks the server whether you may open this workspace\'s terminal and records the answer in the audit log. It opens nothing.</span>';
+  return `<p class="lin-termauth"><button type="button" class="hd-btn hd-btn--sm lin-tool" data-term-auth="${esc(link.link_id)}"${busy ? ' disabled aria-disabled="true"' : ''}>Check terminal access for ${esc(link.workspace_id)}</button> ${msg}</p>`;
+}
+
 export function renderInspector(graph, id, tl = null, opts = {}) {
   const n = graph.nodes.find((x) => x.id === id);
   if (!n) return '<div class="hd-empty">Select a node to inspect it. Arrow keys move between nodes; Enter selects.</div>';
@@ -897,6 +972,7 @@ export function renderInspector(graph, id, tl = null, opts = {}) {
   const term = opts && opts.terminal && typeof opts.terminal.href === 'string' && opts.terminal.href.startsWith('/#/herd/session/')
     ? `<p class="lin-terminal"><a class="hd-btn hd-btn--sm lin-tool" href="${esc(opts.terminal.href)}">Open this session on the dashboard</a> <span class="cx-msg">The Terminal button on that page shows the attach command. It is limited to operators and to live sessions.</span></p>`
     : '<p class="cx-msg">This page offers no terminal and no commands. Discussion and steering requests are below.</p>';
+  const auth = opts && opts.termAuth ? renderTerminalAuth(opts.termAuth.link, opts.termAuth.result, opts.termAuth.busy) : '';
   return `<section class="lin-inspector" aria-label="Inspector for ${esc(text(n.label, idTail(n.id)))}">`
     + `<h3 class="hd-card__title">${esc(text(n.label, idTail(n.id)))}</h3>`
     + `<dl class="lin-dl"><dt>Id</dt><dd><code>${esc(n.id)}</code></dd><dt>Type</dt><dd>${esc(n.node_type)}</dd>`
@@ -908,7 +984,7 @@ export function renderInspector(graph, id, tl = null, opts = {}) {
     + `${attrs.length ? `<h4>Attributes</h4><dl class="lin-dl">${attrs.map(([k, v]) => `<dt>${esc(k)}</dt><dd>${esc(shown(v))}</dd>`).join('')}</dl>${hiddenAttrs ? '<p class="cx-msg">Storage locations are not shown.</p>' : ''}` : ''}`
     + `<h4>Downstream: links out</h4>${links('out') ? `<ul class="cx-list">${links('out')}</ul>` : '<p class="cx-msg">None.</p>'}`
     + `<h4>Upstream: links in</h4>${links('in') ? `<ul class="cx-list">${links('in')}</ul>` : '<p class="cx-msg">None.</p>'}`
-    + `${history}${term}</section>`;
+    + `${history}${term}${auth}</section>`;
 }
 
 // ---- whole panel -------------------------------------------------------------------------------------------------
@@ -928,6 +1004,7 @@ export function renderLineage(m) {
   const graphPane = m.mode === 'table' ? renderGraphTable(view, { sel: m.sel })
     : `${renderGraphToolbar({ view: m.vp || fitView(layout, vpW, vpH), focusId: m.focusId, sel: m.sel })}`
       + `<div class="lin-viewport lin-scroll" role="region" tabindex="0" data-viewport aria-label="Lineage graph, drag to pan">${renderGraphSvg(view, layout, { sel: m.sel, focus: m.focus, match: view.match, view: m.vp, vw: vpW, vh: vpH })}</div>`
+      + `${renderMinimap(layout, m.vp || fitView(layout, vpW, vpH), vpW, vpH)}`
       + '<p class="cx-msg lin-hint">Drag to pan. Hold Ctrl or Alt and turn the wheel, or press + and −, to zoom. Shift with the arrow keys pans; 0 fits the graph.</p>';
   // `graphMore === false` is the last page the server will give. What the server says it ran out of decides what is missing:
   // `scan_budget` means it stopped reading NODES (more may exist); any other reason with no next page (`edge_budget`,
@@ -949,8 +1026,8 @@ export function renderLineage(m) {
       + `${renderGanttLegend()}${m.mode === 'table' ? '' : `<div class="cx-scroll lin-scroll" role="region" tabindex="0" aria-label="Gantt timeline">${gantt ? renderGanttSvg(gantt, { width: m.width, sel: m.sel }) : ''}</div>`}${gantt ? renderGanttTable(gantt) : ''}`
     : `<div class="cx-row"><button type="button" class="hd-btn hd-btn--ghost hd-btn--sm" data-mode="${m.mode === 'table' ? 'visual' : 'table'}">${m.mode === 'table' ? 'Show graph' : 'Show as table'}</button><span class="cx-msg">${view.nodes.length} nodes, ${view.edges.length} links shown</span></div>${renderGraphLegend()}${trunc}${graphPane}`;
   return `${renderStatusStrip(a, { truncated: Boolean(m.graphTruncated) })}${renderReplay(m.asOf, { busy: m.busy, queued: m.queued })}${notice(m)}`
-    + `<div class="lin-grid2"><div class="cx-stack">${renderFilters(a, m.filters)}`
+    + `<div class="lin-grid2"><div class="cx-stack">${renderFilters(a, m.filters, { open: m.filtersOpen !== false })}`
     + `<div role="tablist" aria-label="Lineage views" class="cx-stabs">${tab('graph', 'Graph')}${tab('gantt', 'Gantt')}</div>`
     + `<div role="tabpanel" aria-label="${m.view === 'gantt' ? 'Gantt' : 'Graph'}" class="cx-stack">${body}</div></div>`
-    + `<aside class="cx-stack" aria-label="Inspector" aria-live="polite">${renderInspector(a, m.sel, m.timeline, { terminal: m.terminal })}${m.workbench || ''}</aside></div>`;
+    + `<aside class="cx-stack" aria-label="Inspector" aria-live="polite">${renderInspector(a, m.sel, m.timeline, { terminal: m.terminal, termAuth: m.termAuth })}${m.workbench || ''}</aside></div>`;
 }

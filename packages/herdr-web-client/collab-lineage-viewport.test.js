@@ -312,3 +312,73 @@ test('viewportSize gives a small graph its own size and a large one the room the
   const r = visibleRect({ x: 10, y: 20, k: 2 }, 400, 200);
   assert.deepEqual(r, { x0: 10, y0: 20, x1: 210, y1: 120 });
 });
+
+// ---- S5 follow-ups: filters disclosure, minimap, operator terminal authorization ----------------------------------
+import { MINIMAP_BINS, MINIMAP_H, MINIMAP_W, activeFilterCount, minimapNeeded, minimapTarget, minimapText, renderFilters, renderMinimap, renderTerminalAuth, workspaceLinkFor } from '../collab-lineage.js';
+
+test('filters sit in a native disclosure: open or closed as the caller says, the active count is always in the summary', () => {
+  const g = mergePages([chain(3)]);
+  const open = renderFilters(g, {}, { open: true });
+  const shut = renderFilters(g, {}, { open: false });
+  assert.match(open, /^<details class="lin-filterbox" data-filterbox open><summary>Filters<span class="lin-filtercount" hidden>/);
+  assert.match(shut, /^<details class="lin-filterbox" data-filterbox><summary>/);
+  assert.ok(open.includes('data-lineage-filters') && shut.includes('data-lineage-filters'), 'the form is the same either way');
+  const active = renderFilters(g, { q: 'x', types: new Set(['task']), edgeTypes: new Set(), state: 'done' }, { open: false });
+  assert.match(active, /<span class="lin-filtercount"> \(3 active\)<\/span>/);
+  assert.equal(activeFilterCount({ q: '  ' }), 0);
+  assert.equal(count(renderLineage({ graphAll: g, filtered: g, asOf: null, timeline: null, error: null, busy: false, view: 'graph', mode: 'visual', clock: 'recorded', sel: null, focus: null, filters: { q: '', types: new Set(), edgeTypes: new Set(), state: '' }, filtersOpen: false, total: 1, graphTruncated: null, width: 900 }), /<details class="lin-filterbox" data-filterbox>/g), 1, 'the panel passes the choice through (closed)');
+});
+
+test('minimap: bounded however big the graph, a text alternative, not focusable, nothing animated, absent when the whole graph is in view', () => {
+  const big = { nodes: [], edges: [] };
+  for (let i = 0; i < 3000; i += 1) { big.nodes.push(node(`task:t${i}`)); if (i) big.edges.push(edge('dependency', `task:t${Math.floor((i - 1) / 2)}`, `task:t${i}`)); }
+  const lay = layoutGraph(big);
+  const v = fitView(lay, 900, 480);
+  const html = renderMinimap(lay, v, 900, 480);
+  assert.ok(minimapNeeded(lay, v, 900, 480));
+  assert.ok(count(html, /<rect class="lin-mm-bar"/g) <= MINIMAP_BINS, `${count(html, /<rect class="lin-mm-bar"/g)} bars`);
+  assert.equal(count(html, /<rect class="lin-mm-view"/g), 1);
+  assert.match(html, new RegExp(`width="${MINIMAP_W}" height="${MINIMAP_H}"`));
+  assert.match(html, /role="img" aria-label="Overview map: the view shows columns 1 to \d+ of \d+ and rows 1 to \d+ of \d+\./);
+  assert.ok(!/tabindex|<button|<a |<animate|<set |transition/.test(html), 'no focus stop, no control, no animation');
+  assert.match(minimapText(lay, { ...v, x: 5000 }, 900, 480), /columns (?!1 to)\d+ to \d+ of \d+/, 'the text follows the view');
+  const small = layoutGraph(mergePages([chain(2)]));
+  assert.equal(renderMinimap(small, fitView(small, 900, 480), 900, 480), '', 'nothing to overview when everything is in view');
+  const t = minimapTarget(lay, 0.5, 2);
+  assert.equal(t.x, lay.width / 2); assert.equal(t.y, lay.height, 'a click is clamped to the layout');
+});
+
+test('minimap viewport rectangle follows the view and stays inside the map', () => {
+  const lay = layoutGraph(mergePages([chain(60)]));
+  for (const x of [-500, 0, 3000, 13000, 99999]) {
+    const html = renderMinimap(lay, { x, y: 0, k: 1 }, 900, 480);
+    const m = html.match(/class="lin-mm-view" x="([\d.]+)" y="([\d.]+)" width="([\d.]+)" height="([\d.]+)"/);
+    assert.ok(m, `view rect for x=${x}`);
+    const [, rx, ry, rw, rh] = m.map(Number);
+    assert.ok(rx >= 0 && ry >= 0 && rx + rw <= MINIMAP_W + 0.05 && ry + rh <= MINIMAP_H + 0.05, `inside the map at x=${x}: ${m[0]}`);
+  }
+});
+
+test('terminal authorization control: only for a link the server said the viewer may use; the node must map to exactly one link', () => {
+  const links = [{ link_id: 'wl_1', workspace_id: 'ws-1', host: 'bender', can_terminal: true }, { link_id: 'wl_2', workspace_id: 'ws-2', host: 'bender', can_terminal: false }];
+  const ws = node('workspace:ws-1');
+  assert.equal(workspaceLinkFor(links, ws).link_id, 'wl_1');
+  assert.equal(workspaceLinkFor(links, node('session:x', { attrs: { workspace_id: 'ws-1', host: 'bender' } })).link_id, 'wl_1');
+  assert.equal(workspaceLinkFor(links, node('session:x', { attrs: { workspace_id: 'ws-1', host: 'beast' } })), null, 'a different host is not this link');
+  assert.equal(workspaceLinkFor(links, node('session:x')), null);
+  assert.equal(workspaceLinkFor(null, ws), null);
+  assert.equal(workspaceLinkFor([...links, { ...links[0], link_id: 'wl_3' }], ws), null, 'ambiguous: no guess');
+  const html = renderTerminalAuth(links[0]);
+  assert.match(html, /<button type="button" class="hd-btn hd-btn--sm lin-tool" data-term-auth="wl_1">Check terminal access for ws-1<\/button>/);
+  assert.equal(renderTerminalAuth(links[1]), '', 'can_terminal false: not rendered');
+  assert.equal(renderTerminalAuth({ ...links[0], can_terminal: 'yes' }), '', 'only a literal true');
+  assert.equal(renderTerminalAuth(null), '');
+  assert.match(renderTerminalAuth(links[0], { link_id: 'wl_1', ok: true }), /role="status">The server allows you the terminal of ws-1 on bender/);
+  assert.match(renderTerminalAuth(links[0], { link_id: 'wl_1', ok: false, reason: 'HTTP 403' }), /role="alert">The server did not allow the terminal \(HTTP 403\)/);
+  assert.match(renderTerminalAuth(links[0], null, true), /disabled aria-disabled="true"/);
+  const g = mergePages([{ nodes: [ws], edges: [] }]);
+  assert.ok(!/data-term-auth/.test(renderInspector(g, 'workspace:ws-1')), 'without termAuth (anyone but the operator) nothing is rendered');
+  assert.match(renderInspector(g, 'workspace:ws-1', null, { termAuth: { link: links[0], result: null, busy: false } }), /data-term-auth="wl_1"/);
+  const evil = renderTerminalAuth({ link_id: HOSTILE, workspace_id: HOSTILE, host: HOSTILE, can_terminal: true });
+  assert.ok(!/<img/.test(evil) && /&lt;img/.test(evil), 'hostile ids are escaped');
+});

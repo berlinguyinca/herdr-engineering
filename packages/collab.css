@@ -477,3 +477,12 @@ button.ctx-chip:focus-visible, .ctx-chip:focus-visible { outline: 2px solid curr
 @media (prefers-reduced-motion: reduce) { .lin-viewport { scroll-behavior: auto; } }
 .lin-status > div { min-width: 0; }
 .lin-status .hd-btn { max-width: 100%; height: auto; white-space: normal; text-align: left; overflow-wrap: anywhere; }
+/* filters disclosure + minimap (S5): the summary is a full-size target; nothing here animates */
+.lin-filterbox > summary { cursor: pointer; display: flex; align-items: center; min-height: 44px; font-weight: 600; }
+.lin-filterbox > summary:focus-visible { outline: 2px solid var(--accent, #1f7ae0); outline-offset: 2px; }
+.lin-minimap { margin: 8px 0 0; display: inline-block; }
+.lin-mm { display: block; max-width: 100%; height: auto; border: 1px solid var(--line, #8886); border-radius: 4px; background: var(--surface, transparent); cursor: crosshair; touch-action: manipulation; }
+.lin-mm-bar { fill: currentColor; opacity: .28; }
+.lin-mm-view { fill: color-mix(in srgb, var(--accent, #1f7ae0) 18%, transparent); stroke: var(--accent, #1f7ae0); stroke-width: 1.5; }
+.lin-minimap, .lin-mm, .lin-mm-view { transition: none; animation: none; }
+.lin-termauth .lin-tool { min-height: 44px; }
