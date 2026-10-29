@@ -433,3 +433,132 @@ def test_no_definitions_never_reads_or_starts_ci(tmp_path, acknowledged_sink):
         assert svr.deployment_definitions.plans() == {}
     finally:
         svr.shutdown()
+
+
+# ------------------------------------------------ hostile input (review round 1)
+
+def _bomb(depth=6):
+    lines = ["a0: &a0 [x,x,x,x,x,x,x,x,x,x]"]
+    for i in range(1, depth + 1):
+        lines.append(f"a{i}: &a{i} [" + ",".join([f"*a{i - 1}"] * 10) + "]")
+    lines.append(f"restart: *a{depth}")
+    return "\n".join(lines) + "\n"
+
+
+def test_deep_nesting_is_a_parse_error_and_keeps_the_last_good_set(tmp_path):
+    d = _write(tmp_path / "pipelines", STAGE1[:2])
+    store = DeploymentDefinitions(lambda: str(d))
+    assert store.status()["loaded"]
+    (d / "deep.yaml").write_text("restart: " + "[" * 5000 + "]" * 5000 + "\n")
+    st = store.status()
+    assert st["loaded"] and len(st["errors"]) == 1
+    assert st["errors"][0].startswith("deep.yaml: cannot parse: ")
+    store.authorize("hive-gateway", "hive")                   # still the last good set
+    assert store.status() == st                               # stable, no repeated failure
+
+
+def test_deep_nesting_on_first_load_fails_closed_not_crashes(tmp_path):
+    d = tmp_path / "p"
+    d.mkdir()
+    (d / "deep.yaml").write_text("restart: " + "[" * 5000 + "]" * 5000 + "\n")
+    store = DeploymentDefinitions(lambda: str(d))
+    assert store.status()["errors"][0].startswith("deep.yaml: cannot parse: ")
+    with pytest.raises(DeploymentDefinitionsUnavailable):
+        store.authorize("hive-gateway", "hive")
+
+
+def test_yaml_aliases_and_anchors_are_refused(tmp_path):
+    d = tmp_path / "p"
+    d.mkdir()
+    (d / "bomb.yaml").write_text(_bomb())
+    doc = dict(_definition("hive-gateway"))
+    text = yaml.safe_dump(doc).replace("follows:\n", "follows: &f\n")
+    (d / "hive-gateway.yaml").write_text(text)
+    errs = validate_dir(str(d))
+    assert [e.split(": cannot parse: ")[0] for e in errs] == ["bomb.yaml", "hive-gateway.yaml"]
+    assert all("alias" in e or "anchor" in e for e in errs)
+    assert sum(map(len, errs)) < 1000
+
+
+def test_long_values_are_capped_in_messages_and_the_error_list_is_bounded(tmp_path):
+    long = "x" * 100_000
+    doc = _definition("hive-gateway", restart=long)
+    doc["component"] = long
+    doc[long] = 1
+    errs = validate_definition(doc, "hive-gateway")
+    assert errs and max(map(len, errs)) < 300
+    d = tmp_path / "p"
+    d.mkdir()
+    for i in range(200):
+        (d / f"c{i}.yaml").write_text(yaml.safe_dump({"x" * 1000 + str(j): 1 for j in range(5)}))
+    errs = validate_dir(str(d))
+    assert len(errs) <= 101 and errs[-1].startswith("... ") and sum(map(len, errs)) < 40_000
+
+
+def test_parse_errors_do_not_echo_file_content(tmp_path):
+    d = tmp_path / "p"
+    d.mkdir()
+    (d / "leak.yaml").write_text("component: ok\nsecret_value: SUPERSECRET-123 : : [\n")
+    errs = validate_dir(str(d))
+    assert len(errs) == 1 and errs[0].startswith("leak.yaml: cannot parse: ")
+    assert "SUPERSECRET" not in errs[0] and "line" in errs[0] and len(errs[0]) < 300
+
+
+def test_same_stem_yaml_and_yml_is_a_duplicate(tmp_path):
+    d = _write(tmp_path / "p", STAGE1[:1])
+    (d / "hive-gateway.yml").write_text(yaml.safe_dump(_definition("hive-gateway", order=5)))
+    errs = validate_dir(str(d))
+    assert "hive-gateway.yml: duplicate component 'hive-gateway' also in hive-gateway.yaml" in errs
+
+
+def test_symlinks_fifos_and_non_regular_entries_are_refused(tmp_path):
+    d = _write(tmp_path / "p", STAGE1[:1])
+    target = tmp_path / "elsewhere.yaml"
+    target.write_text(yaml.safe_dump(_definition("hive-nodes", order=1)))
+    os.symlink(target, d / "hive-nodes.yaml")
+    os.mkfifo(d / "fifo.yaml")
+    errs = validate_dir(str(d))          # a FIFO must not block the loader
+    assert "hive-nodes.yaml: not a regular file" in errs
+    assert "fifo.yaml: not a regular file" in errs
+
+
+def test_group_or_world_writable_directory_or_file_is_refused(tmp_path):
+    d = _write(tmp_path / "p", STAGE1[:2])
+    os.chmod(d / "hive-nodes.yaml", 0o666)
+    assert "hive-nodes.yaml: must not be writable by group or other (chmod go-w)" in validate_dir(str(d))
+    os.chmod(d / "hive-nodes.yaml", 0o644)
+    os.chmod(d, 0o777)
+    try:
+        errs = validate_dir(str(d))
+        assert errs == [f"{d}: must not be writable by group or other (chmod go-w)"]
+        store = DeploymentDefinitions(lambda: str(d))
+        assert not store.status()["loaded"] and store.status()["errors"] == errs
+    finally:
+        os.chmod(d, 0o755)
+
+
+def test_the_lock_is_not_held_during_file_io(tmp_path):
+    d = _write(tmp_path / "p", STAGE1[:1])
+    store = DeploymentDefinitions(lambda: str(d))
+    store.definitions()
+    seen = []
+    import herdr_engineering.control_plane.deployment_definitions as mod
+    real = mod.load_definitions
+
+    def spy(path):
+        acquired = store._lock.acquire(blocking=False)
+        if acquired:
+            store._lock.release()
+        # another thread must be able to take the lock while we read
+        t = threading.Thread(target=lambda: seen.append(store._lock.acquire(timeout=1) and
+                                                         (store._lock.release() or True)))
+        t.start()
+        t.join()
+        return real(path)
+    mod.load_definitions = spy
+    try:
+        _write(d, [_definition("farm-gateway")])
+        store.definitions()
+    finally:
+        mod.load_definitions = real
+    assert seen == [True]

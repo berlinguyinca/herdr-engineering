@@ -7,11 +7,22 @@ plan 1). Herdr reads a checkout of that directory, named by the fleet config key
 * The validator is a port of ``deploy/pipelines/validate.py`` with the same rules and
   messages; keep the two in sync. A set loads all-or-nothing: any error and the
   previous good set stays in use (or, if there never was one, none is used).
-* Parsing is ``yaml.safe_load`` only: python object tags are refused, never built.
+* Parsing is a ``yaml.SafeLoader`` subclass that also refuses anchors and aliases
+  (alias bombs); python object tags are refused, never built. Deep nesting, odd files
+  (symlinks, FIFOs, devices: lstat + O_NOFOLLOW|O_NONBLOCK) and a directory or file
+  writable by group/other (definitions are an authorization input) are load errors.
+  Messages never echo file content, interpolated values are capped, and the stored
+  error list is bounded. Herdr-only additions to validate.py: a .yaml and .yml with the
+  same stem are a duplicate; anchors/aliases are refused.
 * ``target_for(component)`` is the newest green ``main`` push of the definition's
   ``follows.repo``, read from the CI monitor's last snapshot (no provider calls here).
   A pipeline-level ``success`` means every workflow passed, so it is stricter than the
   ``follows.ci_context`` status alone (whose per-workflow state the list rows lack).
+  Caveat: "a rerun never moves the target back" ranks a commit by the earliest run
+  herdr has SEEN for it. A server that starts after an old commit's original run has
+  left the CI window sees only the rerun and takes it as newest. The coordinator
+  (Task 3) must guard on CI freshness / ancestry before acting (a ``target_off_main``
+  style check is not built here).
 * Each ``follows`` track has a plan: a new green commit bumps ``generation`` and marks
   the plan restarted from the newest commit. A rerun of an older commit, a CI outage or
   an empty snapshot never moves the target or bumps the generation.
@@ -26,6 +37,7 @@ from __future__ import annotations
 
 import copy
 import os
+import stat
 import threading
 from collections import OrderedDict
 from dataclasses import dataclass, field
@@ -53,10 +65,26 @@ MAX_FILE_BYTES = 64 * 1024
 MAX_FILES = 256
 #: Commits remembered per track to rank reruns (bounded, oldest dropped).
 RANK_MEMORY = 2048
+#: Message bounds: one interpolated value, one message, the stored error list.
+MAX_VALUE_REPR = 64
+MAX_MESSAGE = 240
+MAX_ERRORS = 100
+WRITABLE_BY_OTHERS = "must not be writable by group or other (chmod go-w)"
 CONFIG_KEY = "deployment_definitions"
 UNRESTRICTED_WARNING = "no deployment definitions loaded: any fleet host may report any component"
 INVALID_WARNING = "deployment definitions are configured but invalid: deployment events are refused"
 STALE_WARNING = "deployment definitions have errors: the last good set is still in use"
+
+
+def _r(v):
+    """repr(v), capped: a message never carries more than MAX_VALUE_REPR characters of input."""
+    text = repr(v)
+    return text if len(text) <= MAX_VALUE_REPR else text[:MAX_VALUE_REPR - 3] + "..."
+
+
+def _k(k):
+    text = str(k)
+    return text if len(text) <= MAX_VALUE_REPR else text[:MAX_VALUE_REPR - 3] + "..."
 
 
 def _int(v):
@@ -76,7 +104,7 @@ def _section(doc, key, allowed, required, errs):
         return None
     for k in sorted(sec, key=str):
         if k not in allowed:
-            errs.append(f"unknown key {key}.{k}")
+            errs.append(f"unknown key {key}.{_k(k)}")
     for k in sorted(required - set(sec)):
         errs.append(f"missing key {key}.{k}")
     return sec
@@ -89,12 +117,12 @@ def validate_definition(doc, name):
         return ["definition must be a mapping"]
     for k in sorted(doc, key=str):
         if k not in TOP:
-            errs.append(f"unknown key {k}")
+            errs.append(f"unknown key {_k(k)}")
     for k in sorted(TOP - set(doc)):
         errs.append(f"missing key {k}")
 
     if "component" in doc and doc["component"] != name:
-        errs.append(f"component {doc['component']!r} must match file name {name!r}")
+        errs.append(f"component {_r(doc['component'])} must match file name {_r(name)}")
     if "stage" in doc and (not _int(doc["stage"]) or doc["stage"] not in (1, 2)):
         errs.append("stage must be 1 or 2")
     if "order" in doc and (not _int(doc["order"]) or doc["order"] < 0):
@@ -116,9 +144,9 @@ def validate_definition(doc, name):
     if "restart" in doc:
         r = doc["restart"]
         if isinstance(r, str) and r in GPU_RELEASING and doc.get("gpu") is True:
-            errs.append(f"restart {r!r} releases a GPU; not allowed when gpu is true")
+            errs.append(f"restart {_r(r)} releases a GPU; not allowed when gpu is true")
         if not isinstance(r, str) or r not in RESTARTS:
-            errs.append(f"restart {r!r} must be one of {sorted(RESTARTS)}")
+            errs.append(f"restart {_r(r)} must be one of {sorted(RESTARTS)}")
 
     h = _section(doc, "health", HEALTH, HEALTH, errs)
     if h is not None:
@@ -137,35 +165,112 @@ def validate_definition(doc, name):
     return errs
 
 
+class _NoAliasLoader(yaml.SafeLoader):
+    """SafeLoader that refuses anchors and aliases: definitions never need them, and an
+    alias chain turns a few hundred bytes into megabytes (a "billion laughs" file)."""
+
+    def compose_node(self, parent, index):
+        event = self.peek_event()
+        if isinstance(event, yaml.AliasEvent) or getattr(event, "anchor", None) is not None:
+            raise yaml.composer.ComposerError(
+                None, None, "YAML anchors and aliases are not allowed", event.start_mark)
+        return super().compose_node(parent, index)
+
+
+def _parse_error(exc):
+    """A short parse message without the file snippet (it can hold a secret)."""
+    if isinstance(exc, RecursionError):
+        return "nested too deeply"
+    if isinstance(exc, MemoryError):
+        return "too large to parse"
+    if isinstance(exc, yaml.MarkedYAMLError):
+        what = exc.problem or exc.context or "invalid YAML"
+        mark = exc.problem_mark or exc.context_mark
+        where = f" at line {mark.line + 1}, column {mark.column + 1}" if mark is not None else ""
+        return f"{what}{where}"
+    if isinstance(exc, yaml.YAMLError):
+        return "invalid YAML"
+    if isinstance(exc, UnicodeDecodeError):
+        return "not UTF-8"
+    return str(exc)
+
+
+def _read_file(path, fn):
+    """(doc, error) for one entry: regular files only, never followed, never blocking."""
+    full = os.path.join(path, fn)
+    try:
+        st = os.lstat(full)
+        if not stat.S_ISREG(st.st_mode):
+            return None, f"{fn}: not a regular file"
+        if st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+            return None, f"{fn}: {WRITABLE_BY_OTHERS}"
+        fd = os.open(full, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0))
+    except OSError as e:   # ELOOP: became a symlink after the lstat
+        return None, f"{fn}: cannot parse: {e.strerror or 'unreadable'}"
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):   # swapped after the lstat
+            return None, f"{fn}: not a regular file"
+        with os.fdopen(fd, "rb") as fh:
+            fd = None
+            raw = fh.read(MAX_FILE_BYTES + 1)
+    except OSError as e:
+        return None, f"{fn}: cannot parse: {e.strerror or 'unreadable'}"
+    finally:
+        if fd is not None:
+            os.close(fd)
+    if len(raw) > MAX_FILE_BYTES:
+        return None, f"{fn}: cannot parse: file exceeds {MAX_FILE_BYTES} bytes"
+    try:
+        return yaml.load(raw.decode("utf-8"), Loader=_NoAliasLoader), None   # noqa: S506 - SafeLoader subclass
+    except (yaml.YAMLError, UnicodeDecodeError, RecursionError, MemoryError, ValueError) as e:
+        return None, f"{fn}: cannot parse: {_parse_error(e)}"
+
+
+def _bound(errs):
+    """Cap each message and the list (the page shows them; the input is untrusted)."""
+    out = [e if len(e) <= MAX_MESSAGE else e[:MAX_MESSAGE - 3] + "..." for e in errs[:MAX_ERRORS]]
+    if len(errs) > MAX_ERRORS:
+        out.append(f"... {len(errs) - MAX_ERRORS} more errors")
+    return out
+
+
 def _read_dir(path):
     """(errors, {stem: (file name, doc)}) with validate_dir's messages and order."""
-    errs, docs, seen = [], {}, {}
-    if not os.path.isdir(path):
-        return [f"{path}: not a directory"], docs
-    names = sorted(n for n in os.listdir(path) if n.endswith((".yaml", ".yml")))
+    errs, docs, seen, stems = [], {}, {}, {}
+    try:
+        st = os.stat(path)
+    except OSError:
+        st = None
+    if st is None or not stat.S_ISDIR(st.st_mode):
+        return _bound([f"{path}: not a directory"]), docs
+    if st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        return _bound([f"{path}: {WRITABLE_BY_OTHERS}"]), docs
+    try:
+        names = sorted(n for n in os.listdir(path) if n.endswith((".yaml", ".yml")))
+    except OSError as e:
+        return _bound([f"{path}: cannot list: {e.strerror or 'error'}"]), docs
     if len(names) > MAX_FILES:
-        return [f"{path}: more than {MAX_FILES} definition files"], docs
+        return _bound([f"{path}: more than {MAX_FILES} definition files"]), docs
     for fn in names:
         stem = os.path.splitext(fn)[0]
-        try:
-            with open(os.path.join(path, fn), "rb") as fh:
-                raw = fh.read(MAX_FILE_BYTES + 1)
-            if len(raw) > MAX_FILE_BYTES:
-                raise OSError(f"file exceeds {MAX_FILE_BYTES} bytes")
-            doc = yaml.safe_load(raw.decode("utf-8"))
-        except (yaml.YAMLError, OSError, UnicodeDecodeError) as e:
-            errs.append(f"{fn}: cannot parse: {e}")
+        if stem in stems:
+            errs.append(f"{fn}: duplicate component {_r(stem)} also in {stems[stem]}")
+            continue
+        stems[stem] = fn
+        doc, error = _read_file(path, fn)
+        if error:
+            errs.append(error)
             continue
         errs.extend(f"{fn}: {m}" for m in validate_definition(doc, stem))
         if isinstance(doc, dict) and _int(doc.get("stage")) and _int(doc.get("order")) \
                 and isinstance(doc.get("host"), str):
             key = (doc["host"], doc["stage"], doc["order"])
             if key in seen:
-                errs.append(f"{fn}: duplicate (host, stage, order) {key} also in {seen[key]}")
+                errs.append(f"{fn}: duplicate (host, stage, order) {_r(key)} also in {seen[key]}")
             else:
                 seen[key] = fn
         docs[stem] = (fn, doc)
-    return errs, docs
+    return _bound(errs), docs
 
 
 def validate_dir(path):
@@ -288,18 +393,23 @@ class DeploymentDefinitions:
 
     @staticmethod
     def _signature(path):
+        """Directory and entry metadata (lstat: a swapped symlink or a chmod changes it)."""
         try:
+            d = os.stat(path)
             names = sorted(n for n in os.listdir(path) if n.endswith((".yaml", ".yml")))
             stats = []
             for n in names[:MAX_FILES + 1]:
-                st = os.stat(os.path.join(path, n))
-                stats.append((n, st.st_mtime_ns, st.st_size, st.st_ino))
-            return (path, tuple(stats))
+                st = os.lstat(os.path.join(path, n))
+                stats.append((n, st.st_mode, st.st_mtime_ns, st.st_ctime_ns, st.st_size, st.st_ino))
+            return (path, d.st_mode, d.st_mtime_ns, d.st_ctime_ns, d.st_ino, tuple(stats))
         except OSError:
             return (path, None)
 
     def _refresh(self):
+        """Re-read the directory when its signature moved. File I/O runs outside the lock;
+        any failure is recorded as an error and keeps the last good set."""
         configured, path, errors = self._configured_path()
+        sig = self._signature(path) if configured and not errors else None
         with self._lock:
             if not configured:
                 self._configured, self._defs, self._loaded, self._errors, self._sig = False, {}, False, [], None
@@ -310,10 +420,15 @@ class DeploymentDefinitions:
             if errors:
                 self._errors, self._sig = errors, None
                 return
-            sig = self._signature(path)
             if sig == self._sig:
                 return
+        try:
             defs, errors = load_definitions(path)
+        except Exception as exc:  # noqa: BLE001 - never let a hostile file break ingest
+            defs, errors = {}, [f"cannot load deployment definitions: {type(exc).__name__}"]
+        with self._lock:
+            if not self._configured:
+                return
             self._sig = sig
             self._errors = errors
             if not errors:
