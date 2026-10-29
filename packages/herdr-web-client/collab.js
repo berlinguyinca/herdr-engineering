@@ -64,7 +64,58 @@ export class TokenStore {
   clear() { this.storage.removeItem('hcn.tokens'); }
 }
 
-export class AuthError extends Error {}
+const errorCode = (status) => ({ 401: 'unauthorized', 403: 'forbidden', 404: 'not_found',
+  409: 'conflict', 429: 'rate_limited' })[status] || (status >= 500 ? 'unavailable' : 'request_failed');
+
+export class CollabError extends Error {
+  constructor(message, status = 0, code = errorCode(status)) {
+    super(message);
+    this.name = 'CollabError'; this.status = status; this.code = code;
+  }
+}
+
+export class AuthError extends CollabError {
+  constructor(message) { super(message, 401); this.name = 'AuthError'; }
+}
+
+// Both shells consume the same server decisions. Legacy responses lack the newer
+// status fields; retain their role behavior, but never infer upload permission.
+export function normalizeIdentity(data) {
+  const status = data.user_status ?? data.status ?? 'approved';
+  return { ...data, status, user_status: status, capabilities: {
+    canManagePeople: status === 'approved' && (data.admin === true || data.approver === true),
+  } };
+}
+
+export function normalizeRoom(data) {
+  const knownRole = ['owner', 'contributor', 'viewer', 'guest'].includes(data.role);
+  const userStatus = data.user_status ?? 'approved';
+  const membership = data.room_membership_status ?? (knownRole ? 'approved' : 'none');
+  const canRead = knownRole && userStatus === 'approved' && membership === 'approved';
+  return { ...data, user_status: userStatus, room_membership_status: membership,
+    agent_permission_status: data.agent_permission_status ?? {},
+    file_upload_permission: data.file_upload_permission === true,
+    capabilities: {
+      canRead, canPost: canRead && ['owner', 'contributor'].includes(data.role),
+      canInvite: canRead && data.role === 'owner', canUpload: canRead && data.file_upload_permission === true,
+    } };
+}
+
+// `route` is the page; the decoded room ID is separate from URL/shell handling.
+// Request state is independent of user, membership, file and upload statuses.
+export function collabRouteState({ surface = 'public', route = '/rooms', status = 'idle', error } = {}) {
+  const path = route.replace(/^#/, '');
+  const room = /^\/room\/(.+)$/.exec(path);
+  let roomId = null;
+  if (room) {
+    try { roomId = decodeURIComponent(room[1]); }
+    catch { status = 'not-found'; }
+  }
+  if (error) status = ({ unauthorized: 'signed-out', forbidden: 'forbidden', not_found: 'not-found',
+    unavailable: 'degraded', network_error: 'degraded', invalid_response: 'degraded', rate_limited: 'degraded',
+  })[error.code] || 'error';
+  return { surface, route: roomId ? '/room' : ['/agents', '/people', '/skills'].includes(path) ? path : '/rooms', roomId, status };
+}
 
 function lineageQuery(room, o, extra = {}) {
   const q = new URLSearchParams({ room_id: room });
@@ -81,31 +132,85 @@ export class CollabApi {
   async call(method, path, body, signal) {
     const t = this.getTokens();
     if (!t) throw new AuthError('signed out');
-    const res = await this.fetch(this.base + path, {
-      method,
-      headers: { Authorization: `Bearer ${t.access}`, ...(body ? { 'Content-Type': 'application/json' } : {}) },
-      body: body ? JSON.stringify(body) : undefined,
-      signal,
-    });
+    let res;
+    try {
+      res = await this.fetch(this.base + path, {
+        method,
+        headers: { Authorization: `Bearer ${t.access}`, ...(body ? { 'Content-Type': 'application/json' } : {}) },
+        body: body ? JSON.stringify(body) : undefined,
+        signal,
+      });
+    } catch (error) {
+      if (error.name === 'AbortError') throw error;
+      throw new CollabError('network request failed', 0, 'network_error');
+    }
     if (res.status === 401) throw new AuthError('session expired');
-    const data = await res.json().catch(() => ({}));
+    let data;
+    try { data = await res.json(); }
+    catch (error) {
+      if (error.name === 'AbortError') throw error;
+      if (res.ok) throw new CollabError('invalid server response', res.status, 'invalid_response');
+    }
     if (!res.ok) {
-      const err = new Error(data.error || `request failed (${res.status})`);
-      err.status = res.status; err.code = data.code; err.fence = data.fence;
+      const err = new CollabError(typeof data?.error === 'string' ? data.error : `request failed (${res.status})`,
+        res.status, typeof data?.code === 'string' ? data.code : undefined);
+      err.fence = data?.fence;
       throw err;
+    }
+    if (!data || typeof data !== 'object' || Array.isArray(data)) {
+      throw new CollabError('invalid server response', res.status, 'invalid_response');
     }
     return data;
   }
-  me() { return this.call('GET', '/me'); }
-  link(idToken) { return this.call('POST', '/me', { id_token: idToken }); }
-  rooms() { return this.call('GET', '/rooms'); }
+  async me() { return normalizeIdentity(await this.call('GET', '/me')); }
+  async link(idToken) { return normalizeIdentity(await this.call('POST', '/me', { id_token: idToken })); }
+  async rooms() {
+    const data = await this.call('GET', '/rooms');
+    if (!Array.isArray(data.rooms) || data.rooms.some((room) => !room || typeof room !== 'object' || Array.isArray(room))) {
+      throw new CollabError('invalid server response', 200, 'invalid_response');
+    }
+    return { ...data, rooms: data.rooms.map(normalizeRoom) };
+  }
+  roomFiles(roomId, cursor) {
+    return this.call('GET', `/rooms/${encodeURIComponent(roomId)}/files${cursor == null ? '' : `?cursor=${encodeURIComponent(cursor)}`}`);
+  }
+  uploadStatus(uploadId) { return this.call('GET', `/uploads/${encodeURIComponent(uploadId)}`); }
+  fileAccess(roomId, fileId, purpose) {
+    return this.call('POST', `/rooms/${encodeURIComponent(roomId)}/files/${encodeURIComponent(fileId)}/access`, { purpose });
+  }
+  previewUpload(roomId, manifest) {
+    return this.call('POST', `/rooms/${encodeURIComponent(roomId)}/uploads/preview`, { manifest });
+  }
+  skills(scope) { return this.call('GET', `/skills${scope == null ? '' : `?scope=${encodeURIComponent(scope)}`}`); }
+  skillDraft(draftId) { return this.call('GET', `/skills/drafts/${encodeURIComponent(draftId)}`); }
+  publishSkill(draftId, scope) {
+    return this.call('POST', `/skills/drafts/${encodeURIComponent(draftId)}/publish`, { scope });
+  }
+  async downloadSkill(skillId, version) {
+    const grant = await this.call('POST', `/skills/${encodeURIComponent(skillId)}/versions/${encodeURIComponent(version)}/download`, {});
+    let url;
+    try { url = new URL(grant.url); } catch { /* reject malformed grants below */ }
+    if (!url || url.protocol !== 'https:' || url.username || url.password
+        || typeof grant.expires_at !== 'number' || !Number.isFinite(grant.expires_at)
+        || grant.expires_at * 1000 <= Date.now() || grant.skill_id !== skillId || grant.version !== version) {
+      throw new CollabError('Invalid or expired skill download authorization', 200, 'invalid_response');
+    }
+    return grant;
+  }
   // approval: the people who asked to join (operator: everyone; approvers: those waiting)
   users(status) { return this.call('GET', `/admin/users${status ? `?status=${encodeURIComponent(status)}` : ''}`); }
   decideUser(user, action, reason) {
     return this.call('POST', `/admin/users/${encodeURIComponent(user)}/${encodeURIComponent(action)}`, reason ? { reason } : {});
   }
+  // Lifecycle HTTP contracts: servers without these routes return visible errors.
+  deletePerson(user) { return this.call('POST', `/admin/users/${encodeURIComponent(user)}/delete`, {}); }
+  approveMember(room, user) { return this.call('POST', `/rooms/${encodeURIComponent(room)}/members/${encodeURIComponent(user)}/approve`, {}); }
+  setUploadPermission(room, user, allowed) {
+    return this.call('POST', `/rooms/${encodeURIComponent(room)}/members/${encodeURIComponent(user)}/upload-permission`, { file_upload_permission: allowed });
+  }
+  archiveRoom(room) { return this.call('POST', `/rooms/${encodeURIComponent(room)}/archive`, {}); }
   userLog() { return this.call('GET', '/admin/users/log'); }
-  room(id) { return this.call('GET', `/rooms/${encodeURIComponent(id)}`); }
+  async room(id) { return normalizeRoom(await this.call('GET', `/rooms/${encodeURIComponent(id)}`)); }
   createProject(name) { return this.call('POST', '/projects', { name }); }
   createRoom(project, name) { return this.call('POST', `/projects/${encodeURIComponent(project)}/rooms`, { name }); }
   events(id, cursor) { return this.call('GET', `/rooms/${encodeURIComponent(id)}/events?cursor=${cursor}&limit=200`); }

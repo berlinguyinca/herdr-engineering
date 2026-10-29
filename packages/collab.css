@@ -439,3 +439,28 @@ button.ctx-chip:focus-visible, .ctx-chip:focus-visible { outline: 2px solid curr
 .cx-m--mine .cx-mention--external::after { color: inherit; }
 .cx-mention__icon { font-size: .8em; margin-right: 2px; }
 .cx-m--mine .cx-mention { background: color-mix(in srgb, var(--text-on-accent) 18%, transparent); color: inherit; border-color: transparent; }
+
+/* Administration feedback uses the same layout on both shells. */
+.cx-administration { grid-column: 1 / -1; }
+.cx-administration .cx-msg { overflow-wrap: anywhere; }
+.cx-check input:disabled, .cx-administration button:disabled { cursor: not-allowed; opacity: .65; }
+/* Shared room files: aggregate upload updates leave unchanged file rows intact. */
+.cx-file-name { flex: 1 1 220px; min-width: 0; overflow-wrap: anywhere; }
+.cx-file-name small { display: block; color: var(--text-muted); margin-top: 4px; }
+.cx-file-list li { flex-wrap: wrap; }
+.cx-upload-batch { display: flex; flex-direction: column; gap: 6px; padding-block: 10px; overflow-wrap: anywhere; }
+.cx-upload-batch progress { width: 100%; accent-color: var(--accent); }
+#hcn-p-files { min-width: 0; }
+#hcn-p-files textarea { width: 100%; box-sizing: border-box; resize: vertical; }
+#hcn-p-files [data-file-preview] { overflow-wrap: anywhere; }
+
+/* Shared skill library and package review, in both collaboration shells. */
+.cx-skills, .cx-skill, .cx-skill-review { min-width: 0; overflow-wrap: anywhere; }
+.cx-skill h2, .cx-skill-review h2, .cx-skill-review h3 { margin: 0; }
+.cx-skill p, .cx-skill-review p { margin: 0; }
+.cx-skill-review pre { margin: 0; padding: 12px; white-space: pre-wrap; overflow-wrap: anywhere;
+  background: var(--surface-2); border-radius: var(--radius-sm); max-height: 280px; overflow: auto; }
+.cx-skill-review dd { margin: 0 0 8px; }
+.cx-skill-review li code { display: block; }
+.cx-skills textarea { box-sizing: border-box; width: 100%; min-width: 0; resize: vertical;
+  padding: 10px; font: inherit; color: var(--text); background: var(--surface); border: 1px solid var(--border); }
