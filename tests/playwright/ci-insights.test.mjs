@@ -377,11 +377,9 @@ test('shared selection: PR scope and a day bucket narrow summary, Tests and Runs
  const summary=await (await summaryResponse).json(),tests=await (await testsResponse).json();
  assert.equal(summary.kpis.pipeline_count,1);assert.equal(tests.scope.report_count,1);
  assert.deepEqual(tests.tests.map(t=>t.name),['test_status']);
- await page.locator('[data-health-tree] [data-health-disclosure] > summary').first().click();
- await page.locator('[data-health-tree] [data-health-disclosure] [data-health-disclosure] > summary').first().click();
- await page.locator('[data-health-tree] [data-health-run]').first().waitFor({state:'attached'});
- assert.equal(await page.locator('[data-health-tree] [data-health-run]').count(),1);
- assert.match(await page.locator('[data-health-tree]').textContent(),/Run #3/);
+ await page.locator('[data-health-detail] [data-health-slot-run]').first().waitFor({state:'attached'});
+ assert.equal(await page.locator('[data-health-detail] [data-health-slot-run]').count(),1);
+ assert.match(await page.locator('[data-health-detail]').textContent(),/Run #3/);
  await page.waitForFunction(()=>document.querySelector('[data-ob-summary] .ci-ob-card:nth-child(3) strong')?.textContent==='1');
  assert.doesNotMatch(await page.locator('[data-ob-tests]').innerText(),/selected-[124]/);
  await page.locator('[data-ci-workspace="tests"]').click();
