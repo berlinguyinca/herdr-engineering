@@ -144,8 +144,8 @@ Duplicate events: bindings by `source_event_id`, lineage by event id, commits by
 ## Resumable uploads
 
 Sessions live in the registry, are scoped to the artifact (edit permission), and expire (default 24 h). The control plane
-proxies parts: no browser-to-S3 traffic, so **no CSP change**. Limits: part <= 64 MiB (configurable), <= 10,000 parts,
-declared total size <= 5 GiB. Finalize streams parts in order through `RustFSClient.put_stream(expected_sha256,
+proxies parts: no browser-to-S3 traffic, so **no CSP change**. Limits: part <= 64 MiB, <= 10,000 parts,
+declared total size <= 1 GiB (same ceiling as scoped blob upload). Finalize streams parts in order through `RustFSClient.put_stream(expected_sha256,
 expected_size)`, so a bad byte anywhere fails the whole upload and nothing lands in the content store.
 
 ## Lifecycle and deletion policy

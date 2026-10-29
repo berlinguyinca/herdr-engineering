@@ -5,6 +5,14 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Artifact registry: provenance, context lookup, resumable uploads, lifecycle (unified workspace P03 foundation)
+- Migration `0029_artifact_registry_extensions` (additive, idempotent, `-- DOWN:` in the file). Versions gain typed provenance (origin room/task/issue/project, session, agent, model, prompt/skill revision, commit, redacted inputs) with **no foreign keys**, and a trigger makes committed content and provenance immutable and undeletable. Bindings gain task/project/link kind so one artifact can belong to several tasks.
+- `GET /api/v1/artifacts/for/{project|task|issue|room}/{ref}`: artifacts for a work object, filtered by the registry ACL in SQL before counts, pagination and search; a missing context and a context with nothing visible are the same empty page. `GET|POST /artifacts/{id}/links` for post-hoc, idempotent links.
+- Resumable uploads proxied through the control plane (`POST /artifacts/{id}/uploads`, `.../parts/{n}`, `.../complete`, `.../abort`): whole-file SHA-256 and size verified, parts staged under `staging/` only. No browser-to-S3 traffic and no CSP change.
+- Lifecycle: `archive`, `restore`, `tombstone` (reason required, 30 day hold or legal hold) and a purge that deletes bytes only when no other live artifact shares the content-addressed key; rows, hashes and the append-only event trail remain.
+- `POST /artifacts/reconcile` (operator): re-emits lineage for versions committed but never linked, marks (never deletes) orphaned blobs, expires stale upload sessions, runs due purges. Rollback: deploy the previous control-plane image first (commit_version writes the new columns), then apply the DOWN block; the migration is additive, so leaving it applied under old code is harmless.
+- Design: `docs/specs/herdr-unified-workspace-20261028/design/ARTIFACT_INTEGRATION.md`.
+
 ### Dashboard: on-demand full `/summary` report
 - **Generate full report** on the agent page runs the `summary` skill on the session's recorded conversation and shows the result in the summary card; in the fullscreen workspace it gets its own column so the conversation and composer fit the viewport without page scrolling (the fullscreen panes were previously sized to the whole viewport and cut off the composer). Off by default: `summary_report.enabled` in the central YAML.
 - Runs on the host that owns the session, not in the control-plane container (which has no session records and no `claude`): the control plane queues the request (`POST .../summary/report`, durable event), the per-host session service claims it (`POST /api/v1/host/summary-reports/claim`), runs `herdr-eng summary report` locally and posts the result back, which the server validates and redacts again before storing. Unclaimed requests fail as `host_unreachable`, stuck ones as `timeout`. Roll the plugin to each host.
