@@ -2940,11 +2940,13 @@ def _make_handler(server, public=False, operator=False):
                         return self._json({"routines": [r.as_dict() for r in
                                                          svc.list_routines(tenant_id=tenant_id, user_id=user_id,
                                                                            assistant_id=parts[4])]})
+                    if len(parts) == 7 and parts[5] == "routines" and parts[6] == "due":
+                        # before the generic {routine_id} match, which would otherwise swallow "due"
+                        return self._json({"routines": [r.as_dict() for r in
+                                                         svc.due_routines(tenant_id=tenant_id, user_id=user_id,
+                                                                          assistant_id=parts[4])]})
                     if len(parts) == 7 and parts[5] == "routines":
                         return self._json(svc.get_routine(parts[6], tenant_id=tenant_id, user_id=user_id).as_dict())
-                    if len(parts) == 7 and parts[5] == "routines" and parts[6] == "due":
-                        return self._json({"routines": [r.as_dict() for r in
-                                                         svc.due_routines(tenant_id=tenant_id, user_id=user_id)]})
                 if resource == "assistant-routines" and len(parts) == 4:
                     return self._json({"routines": [r.as_dict() for r in
                                                      svc.store.list_routines(tenant_id=tenant_id, user_id=user_id)]})
@@ -2983,6 +2985,7 @@ def _make_handler(server, public=False, operator=False):
             from .assistant import (
                 ApprovalRequired,
                 AssistantError,
+                AssistantForbidden,
                 AssistantNotFound,
                 AssistantUnavailable,
                 RateLimited,
@@ -3027,7 +3030,8 @@ def _make_handler(server, public=False, operator=False):
                                                tool_id=body.get("tool_id", ""),
                                                scope=body.get("scope", "*"),
                                                ttl_seconds=body.get("ttl_seconds"),
-                                               preauthorized=bool(body.get("preauthorized", False)))
+                                               preauthorized=bool(body.get("preauthorized", False)),
+                                               principal=self._principal())
                         return self._json(grant.as_dict(), 201)
                     if len(parts) == 7 and parts[5] == "permissions" and parts[6] == "revoke":
                         svc.revoke_grant(body.get("grant_id", parts[5]), tenant_id=tenant_id, user_id=user_id)
@@ -3048,6 +3052,11 @@ def _make_handler(server, public=False, operator=False):
                 if resource == "assistant-runs" and len(parts) == 6 and parts[5] == "tool":
                     # the assistant is derived from the run (never trusted from the body)
                     _run = svc.get_run(parts[4], tenant_id=tenant_id, user_id=user_id)
+                    if body.get("dry_run"):
+                        return self._json(svc.dry_run_tool_action(
+                            tenant_id=tenant_id, user_id=user_id, assistant_id=_run.assistant_id,
+                            tool_id=body.get("tool_id", ""), scope=body.get("scope", "*"),
+                            request_payload=body.get("payload") or {}))
                     action = svc.request_tool_action(
                         tenant_id=tenant_id, user_id=user_id,
                         assistant_id=_run.assistant_id,
@@ -3096,10 +3105,33 @@ def _make_handler(server, public=False, operator=False):
                     svc.archive_connector(parts[4], tenant_id=tenant_id, user_id=user_id)
                     return self._json({"ok": True})
                 if resource == "assistant-connectors" and len(parts) == 6 and parts[5] == "request":
-                    return self._json(svc.connector_request(
+                    # Same gate as every other tool: an assistant run, a grant scoped to THIS connector (from the
+                    # path, never the body), a fail-closed approval, an idempotency key and a TTL.
+                    run_id, idem = body.get("run_id"), body.get("idempotency_key")
+                    if not isinstance(run_id, str) or not run_id or not isinstance(idem, str) or not idem:
+                        return self._json({"error": "run_id and idempotency_key are required: connector calls "
+                                                    "go through an assistant run's tool gate"}, 400)
+                    _run = svc.get_run(run_id, tenant_id=tenant_id, user_id=user_id)
+                    call = {"connector_id": parts[4], "method": body.get("method", "GET"),
+                            "path": body.get("path", "/"), "body": body.get("body") or {}}
+                    if body.get("dry_run"):
+                        return self._json(svc.dry_run_tool_action(
+                            tenant_id=tenant_id, user_id=user_id, assistant_id=_run.assistant_id,
+                            tool_id="connector_request", scope=parts[4], request_payload=call))
+                    action = svc.request_tool_action(
+                        tenant_id=tenant_id, user_id=user_id, assistant_id=_run.assistant_id,
+                        tool_id="connector_request", scope=parts[4], run_id=run_id,
+                        idempotency_key=idem, request_payload=call, actor=user_id)
+                    if action.status == "completed":
+                        return self._json({"replayed": True, "action": action.as_dict()})
+                    if not svc.action_executable(action):
+                        return self._json({"error": "connector call is not authorized",
+                                           "action": action.as_dict()}, 403)
+                    result = svc.connector_request(
                         tenant_id=tenant_id, user_id=user_id, connector_id=parts[4],
-                        method=body.get("method", "GET"), path=body.get("path", "/"),
-                        body=body.get("body") or {}, actor=user_id))
+                        method=call["method"], path=call["path"], body=call["body"], actor=user_id)
+                    svc.complete_action(action)
+                    return self._json(result)
                 if resource == "assistant-delegations" and len(parts) == 4 and self.command == "POST":
                     d = svc.delegate(tenant_id=tenant_id, user_id=user_id,
                                      assistant_id=body.get("assistant_id", ""),
@@ -3117,11 +3149,13 @@ def _make_handler(server, public=False, operator=False):
                 return self._json({"error": "not found"}, 404)
             except ApprovalRequired as exc:
                 return self._json({"error": str(exc), "code": "approval_needed",
-                                   "approval_id": exc.approval_id}, 403)
+                                   "approval_id": exc.approval_id, "dry_run": exc.dry_run}, 403)
             except AssistantUnavailable as exc:
                 return self._json({"error": str(exc), "code": "unavailable"}, 503)
             except RateLimited as exc:
                 return self._json({"error": str(exc), "code": "rate_limited"}, 429)
+            except AssistantForbidden as exc:
+                return self._json({"error": str(exc), "code": "forbidden"}, 403)
             except AssistantError as exc:
                 return self._json({"error": str(exc)}, 400)
             except (KeyError, AssistantNotFound):

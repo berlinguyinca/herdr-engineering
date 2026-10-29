@@ -36,7 +36,7 @@ import re
 import secrets
 import threading
 from collections.abc import Callable
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, field, fields, replace
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -80,6 +80,12 @@ def assistant_config(cfg: dict[str, Any]) -> dict[str, Any]:
     fleet_ctx = fleet_ctx if isinstance(fleet_ctx, dict) else {}
     tools = section.get("tools") if isinstance(section, dict) else None
     tools = tools if isinstance(tools, dict) else {}
+    actions = section.get("actions") if isinstance(section, dict) else None
+    actions = actions if isinstance(actions, dict) else {}
+    notif = section.get("notifications") if isinstance(section, dict) else None
+    notif = notif if isinstance(notif, dict) else {}
+    collab_users = actions.get("collab_users")
+    collab_users = collab_users if isinstance(collab_users, dict) else {}
     return {
         "enabled": bool(section.get("enabled", False)),
         "approval_ttl_seconds": int(section.get("approval_ttl_seconds", 3600)),
@@ -115,6 +121,26 @@ def assistant_config(cfg: dict[str, Any]) -> dict[str, Any]:
             "enabled": bool(fleet_ctx.get("enabled", False)),
             "max_chars": int(fleet_ctx.get("max_chars", 6000)),
             "per_section": int(fleet_ctx.get("per_section", 10)),
+            # Principals (API-key ids, or "*" for everyone) the operator allows to see fleet data.
+            # Empty means nobody: fleet data is never shown just because a caller authenticated.
+            "allowed_principals": [str(p) for p in (fleet_ctx.get("allowed_principals") or [])],
+        },
+        # Governance of assistant actions. All deny-by-default; YAML only.
+        "actions": {
+            # sensitive actions: approver must differ from the requester unless the operator opts in
+            "allow_self_approval": bool(actions.get("allow_self_approval", False)),
+            # principals (other than the owner) who may list and decide approvals in their tenant
+            "approvers": [str(p) for p in (actions.get("approvers") or [])],
+            "action_ttl_seconds": max(30, min(int(actions.get("action_ttl_seconds", 3600)), 86400)),
+            "max_review_budget_seconds": max(60, int(actions.get("max_review_budget_seconds", 3600))),
+            # API principal id -> collaboration user id the assistant may comment as. No entry, no comments.
+            "collab_users": {str(k): str(v) for k, v in collab_users.items()},
+        },
+        # Dashboard notification delivery. Nothing here ever sends externally.
+        "notifications": {
+            "quiet_start": int(notif.get("quiet_start", 22)),
+            "quiet_end": int(notif.get("quiet_end", 7)),
+            "timezone": str(notif.get("timezone", "UTC")),
         },
         # Agentic tool-calling loop. deny-by-default: only tools with an active
         # grant are ever offered to the model, and each call still passes through
@@ -262,9 +288,18 @@ class AssistantAction:
     approval_id: str = ""
     evidence_ref: str = ""
     created_at: datetime = field(default_factory=_now)
+    # Bound at creation. ``None`` (an older snapshot) is treated as already expired.
+    expires_at: datetime | None = None
+    requested_by: str = ""
+    dry_run: str = ""
+    correlation: dict[str, Any] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:
         return {
+            "expires_at": self.expires_at.isoformat() if self.expires_at else None,
+            "requested_by": self.requested_by,
+            "dry_run": self.dry_run,
+            "correlation": self.correlation or {},
             "action_id": self.action_id,
             "run_id": self.run_id,
             "tool_id": self.tool_id,
@@ -321,9 +356,13 @@ class AssistantApproval:
     policy_snapshot: str = ""
     decision_at: datetime | None = None
     created_at: datetime = field(default_factory=_now)
+    requested_by: str = ""
+    dry_run: str = ""
 
     def as_dict(self) -> dict[str, Any]:
         return {
+            "requested_by": self.requested_by,
+            "dry_run": self.dry_run,
             "approval_id": self.approval_id,
             "action_id": self.action_id,
             "assistant_id": self.assistant_id,
@@ -535,6 +574,44 @@ TOOL_CATALOG: dict[str, dict[str, Any]] = {
             "text": {"type": "string"}, "project": {"type": "string"}, "event": {"type": "string"},
             "source": {"type": "string"}, "category": {"type": "string"}, "as_of": {"type": "string"}},
             "required": ["operation"]}},
+    "request_review": {
+        "sensitive": True,
+        "description": "Ask another Pi or Claude agent to review a pull request or node. Records a delegation and, "
+                       "for a PR with a quorum, the existing re-review request. Merges nothing.",
+        "parameters": {"type": "object", "properties": {
+            "target_system": {"type": "string", "description": "pi or claude"},
+            "pr_id": {"type": "string", "description": "Graph node id of the PR, e.g. pr:owner/repo#12"},
+            "head": {"type": "string", "description": "Full commit id the review is for (optional)"},
+            "task": {"type": "string"}, "budget_seconds": {"type": "integer"}},
+            "required": ["task"]}},
+    "propose_branch": {
+        "sensitive": False,
+        "description": "Propose a feature branch. Creates a proposal a person must approve; starts no work.",
+        "parameters": {"type": "object", "properties": {
+            "title": {"type": "string"}, "repo": {"type": "string"}, "base": {"type": "string"},
+            "rationale": {"type": "string"}}, "required": ["title", "repo"]}},
+    "request_mission": {
+        "sensitive": False,
+        "description": "Propose a mission or task for AutoSpec or Pi. Creates a proposal a person must approve; "
+                       "starts no work.",
+        "parameters": {"type": "object", "properties": {
+            "title": {"type": "string"}, "task": {"type": "string"},
+            "target_system": {"type": "string"}}, "required": ["title", "task"]}},
+    "comment_on_node": {
+        "sensitive": True,
+        "description": "Comment on a lineage node or edge in a collaboration room, as the user.",
+        "parameters": {"type": "object", "properties": {
+            "room_id": {"type": "string"},
+            "anchor": {"type": "object", "description": "{kind: node, node_id} or {kind: edge, edge_type, from_id, to_id}"},
+            "text": {"type": "string"}}, "required": ["room_id", "anchor", "text"]}},
+    "draft_email": {
+        "sensitive": False,
+        "description": "Save an email draft as a private versioned artifact. Never sends; sending needs the "
+                       "separate send_message tool, a scoped grant and an explicit approval.",
+        "parameters": {"type": "object", "properties": {
+            "to": {"type": "string"}, "subject": {"type": "string"}, "body": {"type": "string"},
+            "artifact_id": {"type": "string", "description": "Existing draft artifact to add a version to (optional)"}},
+            "required": ["to", "subject", "body"]}},
     "read_lineage": {
         "sensitive": False,
         "description": "Read the mission/agent lineage graph (sessions, handoffs, branches, reviews, PRs, CI, artifacts) "
@@ -550,6 +627,62 @@ TOOL_CATALOG: dict[str, dict[str, Any]] = {
 def tool_sensitive(tool_id: str) -> bool:
     meta = TOOL_CATALOG.get(tool_id)
     return bool(meta and meta.get("sensitive"))
+
+
+# Tools whose every use needs an explicit approval: a grant may never carry ``preauthorized`` for them.
+NEVER_PREAUTHORIZED = frozenset({"send_message", "run_shell"})
+
+
+def canonical_json(obj: Any) -> str:
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def request_digest(*, tenant_id: str, user_id: str, assistant_id: str, tool_id: str,
+                   scope: str, payload: Any) -> str:
+    """Hash of what is being asked, bound to WHO asks and for WHICH assistant. Key order never matters."""
+    return hashlib.sha256(canonical_json({
+        "tenant": tenant_id, "user": user_id, "assistant": assistant_id,
+        "tool": tool_id, "scope": scope, "payload": payload}).encode()).hexdigest()
+
+
+_DRY_RUN_MAX = 1200
+
+
+def describe_action(tool_id: str, scope: str, payload: dict[str, Any] | None) -> str:
+    """Human-readable statement of what approving this action would allow. Built from the exact payload that is
+    hashed, redacted and bounded. It never executes anything."""
+    p = payload if isinstance(payload, dict) else {}
+
+    def v(key: str, limit: int = 200) -> str:
+        val = p.get(key)
+        text = val if isinstance(val, str) else canonical_json(val)
+        return (redact_secrets(text) or "")[:limit]
+
+    if tool_id == "run_shell":
+        text = f"Run this shell command on an authorized host: {v('command')}"
+    elif tool_id == "send_message":
+        text = f"SEND an external message to {v('to')} via {v('channel') or 'default channel'}: {v('body', 300)}"
+    elif tool_id == "connector_request":
+        text = (f"Call connector {scope or v('connector_id')} with {v('method') or 'GET'} {v('path') or '/'}"
+                + (f" and a body with fields {sorted(p['body'])}" if isinstance(p.get("body"), dict) and p["body"] else ""))
+    elif tool_id == "delegate":
+        text = f"Queue a task for {v('target_system') or 'pi'}: {v('task', 300)}"
+    elif tool_id == "edit_shared":
+        text = f"Change shared record {v('record')} field {v('field')} to: {v('value')}"
+    elif tool_id == "request_review":
+        text = (f"Ask {v('target_system') or 'pi'} to review {v('pr_id') or v('node_id') or v('task', 120)}; "
+                "records a request only, nothing is merged or changed")
+    elif tool_id in ("propose_branch", "request_mission"):
+        text = (f"Create a PROPOSAL ({tool_id}): {v('title', 200) or v('task', 200)}. "
+                "A person must approve it; creating it starts no work and changes no code")
+    elif tool_id == "comment_on_node":
+        text = f"Post a comment in room {v('room_id')} on {v('anchor', 160)} as you: {v('text', 300)}"
+    elif tool_id == "draft_email":
+        text = (f"Save an email DRAFT to {v('to')} with subject {v('subject', 120)} as a private artifact. "
+                "Nothing is sent")
+    else:
+        text = f"Use tool {tool_id} on {scope or 'default scope'} with fields {sorted(p)}"
+    return text[:_DRY_RUN_MAX]
 
 
 class FleetContextProvider:
@@ -698,6 +831,7 @@ class HttpModelRunnerAdapter(RuntimeAdapter):
 
     def __init__(self, store: AssistantStore, *, endpoint: str, timeout: int = 60,
                  model: str = "", api_key: str = "", context_provider: Any | None = None,
+                 context_gate: Callable[[AssistantRun], bool] | None = None,
                  urlopen: Callable | None = None):
         self.store = store
         self.endpoint = endpoint
@@ -705,10 +839,13 @@ class HttpModelRunnerAdapter(RuntimeAdapter):
         self.model = model
         self.api_key = api_key
         self.context_provider = context_provider
+        self.context_gate = context_gate
         self._urlopen = urlopen
 
-    def _system_message(self) -> dict | None:
+    def _system_message(self, run: AssistantRun | None = None) -> dict | None:
         if self.context_provider is None:
+            return None
+        if self.context_gate is not None and (run is None or not self.context_gate(run)):
             return None
         try:
             ctx = self.context_provider.render()
@@ -731,7 +868,7 @@ class HttpModelRunnerAdapter(RuntimeAdapter):
 
     def _payload(self, run: AssistantRun, messages: list[AssistantMessage]) -> dict[str, Any]:
         msgs = [{"role": m.role, "content": m.content} for m in messages]
-        sys = self._system_message()
+        sys = self._system_message(run)
         if sys:
             msgs = [sys] + msgs
         return {
@@ -778,7 +915,7 @@ class HttpModelRunnerAdapter(RuntimeAdapter):
         """One step of the agentic loop. ``messages`` are OpenAI-format dicts
         (assistant tool_calls and tool results included). Never raises."""
         msgs = list(messages)
-        sys = self._system_message()
+        sys = self._system_message(run)
         if sys:
             msgs = [sys] + msgs
         payload = {"model": self.model, "messages": msgs, "tools": tools,
@@ -1023,6 +1160,8 @@ class AssistantStore:
     def _e_from_dict(cls: type, d: dict[str, Any]):
         kwargs: dict[str, Any] = {}
         for f in fields(cls):
+            if f.name not in d:
+                continue                      # an older snapshot: keep the dataclass default
             v = d.get(f.name)
             if isinstance(v, dict) and "$dt" in v:
                 v = datetime.fromisoformat(v["$dt"])
@@ -1348,12 +1487,17 @@ class AssistantUnavailable(AssistantError):
     """Raised when the assistant feature is disabled or the service is absent."""
 
 
+class AssistantForbidden(AssistantError):
+    """The caller is authenticated but not permitted to do this (HTTP 403)."""
+
+
 class AssistantNotFound(AssistantError):
     pass
 
 
 class ApprovalRequired(AssistantError):
-    def __init__(self, approval_id: str, message: str = "approval required"):
+    def __init__(self, approval_id: str, message: str = "approval required", dry_run: str = ""):
+        self.dry_run = dry_run
         super().__init__(message)
         self.approval_id = approval_id
 
@@ -1395,12 +1539,18 @@ class AssistantService:
                     timeout=int(inf.get("timeout", 60)),
                     model=str(inf.get("model", "")),
                     api_key=str(inf.get("api_key", "")),
-                    context_provider=self.fleet_context)
+                    context_provider=self.fleet_context,
+                    context_gate=lambda run: self.fleet_allowed(run.user_id))
             else:
                 self.runner = LocalRunnerAdapter(self.store)
         self._shell_runner = None  # injected in tests; default uses subprocess
         self._transport = None  # injected in tests; default uses urllib
         self._approval_ttl = timedelta(seconds=self.config["approval_ttl_seconds"])
+
+    def fleet_allowed(self, user_id: str) -> bool:
+        """Fleet data is shown only to principals the operator names (or ``*``). Authenticating is not enough."""
+        allowed = (self.config.get("fleet_context") or {}).get("allowed_principals") or []
+        return user_id in allowed or "*" in allowed
 
     # -- feature flag gate -----------------------------------------------------
     def _require_enabled(self) -> None:
@@ -1566,10 +1716,20 @@ class AssistantService:
     # -- grants / tools / approvals ----------------------------------------------
     def grant_tool(self, *, tenant_id: str, user_id: str, assistant_id: str,
                    tool_id: str, scope: str, ttl_seconds: int | None = None,
-                   preauthorized: bool = False) -> AssistantGrant:
+                   preauthorized: bool = False,
+                   principal: dict[str, Any] | None = None) -> AssistantGrant:
+        """``preauthorized`` skips per-action approval, so it is the self-grant escape hatch: only an authenticated
+        operator principal may create one (``principal`` is the server-authenticated caller, never a body field),
+        and never for tools that must always be approved."""
         self._require_enabled()
         if tool_id not in TOOL_CATALOG:
             raise AssistantError(f"unknown tool {tool_id}")
+        if preauthorized:
+            if (not isinstance(principal, dict) or principal.get("kind") != "operator"
+                    or principal.get("authenticated_by") != "api_key"):
+                raise AssistantForbidden("preauthorized grants require an authenticated operator key")
+            if tool_id in NEVER_PREAUTHORIZED:
+                raise AssistantForbidden(f"{tool_id} always needs an explicit approval; it cannot be preauthorized")
         self.store.get_assistant(assistant_id, tenant_id=tenant_id, user_id=user_id)
         ttl = ttl_seconds if ttl_seconds is not None else self.config["grant_max_ttl_seconds"]
         ttl = max(1, min(ttl, self.config["grant_max_ttl_seconds"]))
@@ -1613,6 +1773,52 @@ class AssistantService:
             })
         return out
 
+    def _action_ttl(self) -> timedelta:
+        return timedelta(seconds=self.config["actions"]["action_ttl_seconds"])
+
+    def _correlation(self, run_id: str, assistant_id: str, action_id: str = "",
+                     approval_id: str = "") -> dict[str, Any]:
+        run = self.store.runs.get(run_id)
+        out = {"assistant_id": assistant_id, "run_id": run_id,
+               "thread_id": run.thread_id if run is not None else "", "action_id": action_id}
+        if approval_id:
+            out["approval_id"] = approval_id
+        return out
+
+    def dry_run_tool_action(self, *, tenant_id: str, user_id: str, assistant_id: str,
+                            tool_id: str, scope: str, request_payload: dict[str, Any]) -> dict[str, Any]:
+        """What WOULD happen, without creating an action, an approval or any side effect."""
+        self._require_enabled()
+        self.store.get_assistant(assistant_id, tenant_id=tenant_id, user_id=user_id)
+        if tool_id not in TOOL_CATALOG:
+            raise AssistantError(f"unknown tool {tool_id}")
+        grant = self._active_grant(assistant_id=assistant_id, tool_id=tool_id, scope=scope,
+                                   tenant_id=tenant_id, user_id=user_id)
+        preauthorized = bool(grant and (grant.constraints or {}).get("preauthorized")
+                             and tool_id not in NEVER_PREAUTHORIZED)
+        return {
+            "dry_run": True, "tool_id": tool_id, "scope": scope,
+            "description": describe_action(tool_id, scope, request_payload),
+            "granted": grant is not None,
+            "approval_required": bool(grant) and tool_sensitive(tool_id) and not preauthorized,
+            "request_hash": request_digest(tenant_id=tenant_id, user_id=user_id,
+                                           assistant_id=assistant_id, tool_id=tool_id, scope=scope,
+                                           payload=request_payload),
+            "ttl_seconds": int(self._action_ttl().total_seconds()),
+        }
+
+    def action_executable(self, action: AssistantAction) -> bool:
+        """True only for an authorized/approved action that has not expired. A completed action is never executable
+        again: a replay must not repeat the side effect."""
+        if action.status not in ("authorized", "approved"):
+            return False
+        return action.expires_at is not None and action.expires_at > self.now()
+
+    def complete_action(self, action: AssistantAction, detail: str = "") -> AssistantAction:
+        action.status = "completed"
+        self.store.put_action(action)
+        return action
+
     def request_tool_action(self, *, tenant_id: str, user_id: str,
                             assistant_id: str, tool_id: str, scope: str,
                             run_id: str, idempotency_key: str,
@@ -1622,56 +1828,74 @@ class AssistantService:
 
         deny-by-default: no active grant -> denied.
         sensitive + not preauthorized -> ApprovalRequired (waiting_for_approval).
-        idempotent: same (idempotency_key, request_hash) returns the existing
-        action without re-executing.
+        idempotent: same (run, idempotency_key, request_hash) returns the existing action without re-executing;
+        the same key with a different request is refused. The hash binds tenant, user, assistant, tool, scope and
+        payload. Every action expires; an expired or completed action is never executable.
         """
         self._require_enabled()
         self.store.get_assistant(assistant_id, tenant_id=tenant_id, user_id=user_id)
         if tool_id not in TOOL_CATALOG:
             raise AssistantError(f"unknown tool {tool_id}")
 
-        request_hash = hashlib.sha256(
-            f"{tool_id}\n{scope}\n{request_payload!r}".encode()).hexdigest()
+        request_hash = request_digest(tenant_id=tenant_id, user_id=user_id, assistant_id=assistant_id,
+                                      tool_id=tool_id, scope=scope, payload=request_payload)
 
         grant = self._active_grant(assistant_id=assistant_id, tool_id=tool_id,
                                    scope=scope, tenant_id=tenant_id, user_id=user_id)
+        preauthorized = bool(grant and (grant.constraints or {}).get("preauthorized")
+                             and tool_id not in NEVER_PREAUTHORIZED)
 
         # Reuse identity, but never reuse stale authorization.
         for existing in self.store.actions.values():
-            if (existing.idempotency_key == idempotency_key
-                    and existing.request_hash == request_hash
-                    and existing.run_id == run_id):
-                if grant is None:
-                    existing.status = "denied"
-                    self.store.put_action(existing)
-                    self.store.audit_record(
-                        tenant_id=tenant_id, user_id=user_id, actor=actor,
-                        action="assistant.tool.denied", subject_id=existing.action_id,
-                        detail=f"{tool_id} {scope}: no grant")
-                    return existing
-                if existing.status == "denied":
-                    return existing
-                if existing.approval_id:
-                    approval = self.store.approvals.get(existing.approval_id)
-                    if (approval is None or approval.action_id != existing.action_id
-                            or approval.tenant_id != tenant_id or approval.user_id != user_id
-                            or approval.assistant_id != assistant_id
-                            or approval.expires_at <= self.now()
-                            or approval.decision not in ("pending", "approved")):
-                        existing.status = "denied"
-                        self.store.put_action(existing)
-                    elif approval.decision == "pending":
-                        raise ApprovalRequired(approval.approval_id)
-                elif (tool_sensitive(tool_id)
-                      and not (grant.constraints or {}).get("preauthorized")):
-                    existing.status = "denied"
-                    self.store.put_action(existing)
+            if existing.idempotency_key != idempotency_key or existing.run_id != run_id:
+                continue
+            if existing.request_hash != request_hash:
+                raise AssistantError("idempotency key was already used for a different request")
+            if grant is None and existing.status == "completed":
+                return replace(existing, status="denied")      # not persisted: the record of what ran stays true
+            if existing.status == "completed":
                 return existing
+            if grant is None:
+                existing.status = "denied"
+                self.store.put_action(existing)
+                self.store.audit_record(
+                    tenant_id=tenant_id, user_id=user_id, actor=actor,
+                    action="assistant.tool.denied", subject_id=existing.action_id,
+                    detail=f"{tool_id} {scope}: no grant")
+                return existing
+            if existing.status in ("denied", "expired"):
+                return existing
+            if existing.expires_at is None or existing.expires_at <= self.now():
+                existing.status = "expired"
+                self.store.put_action(existing)
+                self.store.audit_record(
+                    tenant_id=tenant_id, user_id=user_id, actor=actor,
+                    action="assistant.tool.expired", subject_id=existing.action_id,
+                    detail=f"{tool_id} {scope}")
+                return existing
+            if existing.approval_id:
+                approval = self.store.approvals.get(existing.approval_id)
+                if (approval is None or approval.action_id != existing.action_id
+                        or approval.tenant_id != tenant_id or approval.user_id != user_id
+                        or approval.assistant_id != assistant_id
+                        or approval.expires_at <= self.now()
+                        or approval.decision not in ("pending", "approved")):
+                    existing.status = "denied"
+                    self.store.put_action(existing)
+                elif approval.decision == "pending":
+                    raise ApprovalRequired(approval.approval_id)
+            elif tool_sensitive(tool_id) and not preauthorized:
+                existing.status = "denied"
+                self.store.put_action(existing)
+            return existing
 
         action = AssistantAction(
             action_id=_new_id("act"), run_id=run_id, tool_id=tool_id, scope=scope,
             request_hash=request_hash, idempotency_key=idempotency_key,
-            status="denied" if grant is None else "authorized")
+            status="denied" if grant is None else "authorized",
+            expires_at=self.now() + self._action_ttl(), requested_by=actor,
+            dry_run=describe_action(tool_id, scope, request_payload))
+        action.correlation = self._correlation(run_id, assistant_id, action.action_id)
         if grant is None:
             action.status = "denied"
             self.store.put_action(action)
@@ -1681,28 +1905,30 @@ class AssistantService:
             return action
 
         sensitive = tool_sensitive(tool_id)
-        preauthorized = bool((grant.constraints or {}).get("preauthorized"))
         if sensitive and not preauthorized:
             approval = AssistantApproval(
                 approval_id=_new_id("appr"), action_id=action.action_id,
                 tenant_id=tenant_id, user_id=user_id, assistant_id=assistant_id,
                 actor_id=user_id, decision="pending",
-                expires_at=self.now() + self._approval_ttl,
-                policy_snapshot=f"{tool_id}:{scope}")
+                expires_at=min(self.now() + self._approval_ttl, action.expires_at),
+                policy_snapshot=f"{tool_id}:{scope}",
+                requested_by=actor, dry_run=action.dry_run)
             self.store.put_approval(approval)
             action.status = "requested"
             action.approval_id = approval.approval_id
+            action.correlation = self._correlation(run_id, assistant_id, action.action_id,
+                                                   approval.approval_id)
             self.store.put_action(action)
             self.store.audit_record(tenant_id=tenant_id, user_id=user_id, actor=actor,
                                     action="assistant.approval.requested",
-                                    subject_id=approval.approval_id)
-            raise ApprovalRequired(approval.approval_id)
+                                    subject_id=approval.approval_id, detail=action.dry_run)
+            raise ApprovalRequired(approval.approval_id, dry_run=action.dry_run)
 
         action.status = "approved" if preauthorized else "authorized"
         action.evidence_ref = "grant"
         self.store.put_action(action)
         self.store.audit_record(tenant_id=tenant_id, user_id=user_id, actor=actor,
-                                action="assistant.tool.completed",
+                                action="assistant.tool.authorized",
                                 subject_id=action.action_id, detail=f"{tool_id} {scope}")
         return action
 
@@ -1716,35 +1942,57 @@ class AssistantService:
                 return g
         return None
 
+    def _is_approver(self, user_id: str) -> bool:
+        return user_id in self.config["actions"]["approvers"]
+
     def list_approvals(self, *, tenant_id: str, user_id: str,
                        state: str | None = None) -> list[AssistantApproval]:
+        """The caller's own approvals; a configured approver also sees the other users' in the same tenant."""
         self._require_enabled()
-        return self.store.list_approvals(tenant_id=tenant_id, user_id=user_id, state=state)
+        own = self.store.list_approvals(tenant_id=tenant_id, user_id=user_id, state=state)
+        if not self._is_approver(user_id):
+            return own
+        seen = {a.approval_id for a in own}
+        extra = [a for a in self.store.approvals.values()
+                 if a.tenant_id == tenant_id and a.approval_id not in seen
+                 and (state is None or a.decision == state)]
+        return sorted(own + extra, key=lambda a: a.created_at, reverse=True)
 
     def decide_approval(self, approval_id: str, *, tenant_id: str, user_id: str,
                         decision: str, actor: str) -> AssistantApproval:
+        """Decide a pending approval. The owner may; so may an operator-configured approver. For a sensitive tool
+        the approver must differ from the requester unless ``actions.allow_self_approval`` is set in YAML."""
         self._require_enabled()
         if decision not in ("approved", "denied"):
             raise AssistantError("decision must be 'approved' or 'denied'")
         approval = self.store.get_approval(approval_id)
-        if approval.tenant_id != tenant_id or approval.user_id != user_id:
+        if approval.tenant_id != tenant_id or not (
+                approval.user_id == user_id or self._is_approver(user_id)):
             raise AssistantNotFound("approval not found")
         if approval.decision != "pending":
             raise AssistantError(f"approval already {approval.decision}")
-        if approval.expires_at <= self.now():
+        action = self.store.get_action(approval.action_id)
+        if approval.expires_at <= self.now() or (
+                action.expires_at is not None and action.expires_at <= self.now()):
             approval.decision = "expired"
             self.store.put_approval(approval)
             raise AssistantError("approval expired; request a new one")
+        if (decision == "approved" and tool_sensitive(action.tool_id)
+                and not self.config["actions"]["allow_self_approval"]
+                and actor == (approval.requested_by or approval.user_id)):
+            self.store.audit_record(tenant_id=tenant_id, user_id=approval.user_id, actor=actor,
+                                    action="assistant.approval.self_approval_refused",
+                                    subject_id=approval_id)
+            raise AssistantForbidden("the approver must differ from the requester for this action")
         approval.decision = decision
         approval.decision_at = self.now()
         approval.actor_id = actor
         self.store.put_approval(approval)
-        action = self.store.get_action(approval.action_id)
         action.status = "approved" if decision == "approved" else "denied"
         if decision == "approved":
             action.evidence_ref = f"approval:{approval.approval_id}"
         self.store.put_action(action)
-        self.store.audit_record(tenant_id=tenant_id, user_id=user_id, actor=actor,
+        self.store.audit_record(tenant_id=tenant_id, user_id=approval.user_id, actor=actor,
                                 action="assistant.approval." + decision,
                                 subject_id=approval_id)
         return approval
@@ -1932,13 +2180,15 @@ class AssistantService:
         self.store.audit_record(tenant_id=tenant_id, user_id=user_id, actor=user_id,
                                 action="assistant.routine.archived", subject_id=r.routine_id)
 
-    def due_routines(self, *, tenant_id: str, user_id: str, now: datetime | None = None) -> list[AssistantRoutine]:
+    def due_routines(self, *, tenant_id: str, user_id: str, now: datetime | None = None,
+                     assistant_id: str | None = None) -> list[AssistantRoutine]:
         """Enabled routines whose next_at has arrived (for an existing scheduler
         loop or the dashboard to drive). Not a background daemon."""
         self._require_enabled()
         now = now or self.now()
         return [r for r in self.store.list_routines(tenant_id=tenant_id, user_id=user_id)
-                if r.enabled and r.next_at is not None and r.next_at <= now]
+                if r.enabled and r.next_at is not None and r.next_at <= now
+                and (assistant_id is None or r.assistant_id == assistant_id)]
 
     def trigger(self, routine_id: str, *, tenant_id: str, user_id: str,
                 now: datetime | None = None) -> AssistantRoutine:
@@ -2245,19 +2495,28 @@ class AssistantService:
             action = self.request_tool_action(
                 tenant_id=run.tenant_id, user_id=run.user_id, assistant_id=run.assistant_id,
                 tool_id=tool_id, scope=scope, run_id=run.run_id, idempotency_key=idem,
-                request_payload=args, actor=run.user_id)
+                request_payload=args, actor=f"assistant:{run.assistant_id}")
         except ApprovalRequired as ar:
-            return f"[operator approval required: {ar.approval_id}]"
+            return f"[operator approval required: {ar.approval_id}: {ar.dry_run}]"
         except AssistantError as exc:
             return f"[tool gate error: {exc}]"
-        if action.status not in ("authorized", "approved"):
+        if action.status == "completed":
+            return "[replay: this action already ran; it is not repeated]"
+        if action.status == "expired":
+            return "[denied: the action expired; request it again]"
+        if not self.action_executable(action):
             return "[denied: tool action is not authorized]"
         try:
             out = self.execute_tool(tenant_id=run.tenant_id, user_id=run.user_id,
                                     assistant_id=run.assistant_id, tool_id=tool_id,
-                                    payload=args, actor=run.user_id)
+                                    payload=args, actor=run.user_id, action=action)
         except AssistantError as exc:
             return f"[tool error: {exc}]"
+        self.complete_action(action)
+        self.store.audit_record(tenant_id=run.tenant_id, user_id=run.user_id,
+                                actor=f"assistant:{run.assistant_id}",
+                                action="assistant.tool.completed", subject_id=action.action_id,
+                                detail=f"{tool_id} {scope}")
         text = (out.get("context") if isinstance(out, dict) and "context" in out
                 else json.dumps(out, default=str))
         return (redact_secrets(str(text)) or "")[:max_result_chars]
@@ -2309,7 +2568,7 @@ class AssistantService:
 
     def execute_tool(self, *, tenant_id: str, user_id: str, assistant_id: str,
                      tool_id: str, payload: dict[str, Any],
-                     actor: str = "") -> dict[str, Any]:
+                     actor: str = "", action: AssistantAction | None = None) -> dict[str, Any]:
         """Dispatch a granted tool to its implementation (P4 executor).
 
         Policy gating happens in ``request_tool_action``; this executes only a
@@ -2350,6 +2609,8 @@ class AssistantService:
         if tool_id == "read_fleet":
             if self.fleet_context is None:
                 raise AssistantError("fleet context is not enabled")
+            if not self.fleet_allowed(user_id):
+                raise AssistantForbidden("fleet data is not enabled for this principal")
             return {"ok": True, "context": self.fleet_context.render(
                 sections=payload.get("sections"))}
         if tool_id == "read_project_intelligence":
