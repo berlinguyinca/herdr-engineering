@@ -48,12 +48,12 @@ const PASSED=['success','passed','finished','complete','completed'];
 export function unresolvedCiFailures(entries) {
   const passedAt=new Map(), key=r=>`${r.repository || ''}\u0000${r.branch || ''}`, when=r=>integrationTimestamp(r.updated_at || r.created_at);
   for(const e of entries)if(PASSED.includes(String(e.record.state || e.record.status || '').toLowerCase()))passedAt.set(key(e.record),Math.max(passedAt.get(key(e.record)) || 0,when(e.record)));
-  // Merged work: a passing run on the default branch whose message names the pull request ("... (#123)") closes that PR's failures.
+  // The server marks runs of merged pull requests (pr_merged); failing that, a passing run on the default branch whose message names the pull request ("... (#123)") closes that PR's failures.
   const merged=new Set();
   for(const e of entries)if(PASSED.includes(String(e.record.state || e.record.status || '').toLowerCase()) && /^(main|master)$/.test(e.record.branch || ''))
     for(const m of String(e.record.message || e.record.title || '').matchAll(/#(\d+)/g))merged.add(`${e.record.repository || ''}#${m[1]}`);
   const pr=r=>/^refs\/pull\/(\d+)\//.exec(r.ref || '')?.[1] || (String(r.event || '')==='pull_request' ? /^(\d+)$/.exec(String(r.pull_request ?? ''))?.[1] : null);
-  return entries.filter(e=>e.tab==='failed' && !((passedAt.get(key(e.record)) || 0) > when(e.record)) && !merged.has(`${e.record.repository || ''}#${pr(e.record)}`));
+  return entries.filter(e=>e.tab==='failed' && !((passedAt.get(key(e.record)) || 0) > when(e.record)) && !e.record.pr_merged && !merged.has(`${e.record.repository || ''}#${pr(e.record)}`));
 }
 const OVERVIEW_CARDS = ['sessions','missions','fleet','ci','reviews','services','hosts','activity'];
 const CARD_LABELS = {missions:'Current missions',fleet:'Fleet health',sessions:'Agents',ci:'CI builds',reviews:'Reviews',services:'HerdR services',hosts:'Hosts',activity:'Recent changes'};

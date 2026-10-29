@@ -2384,9 +2384,9 @@ def _make_handler(server, public=False, operator=False):
                         active=_q(self.path, "active") == "1"))
                 if what:
                     return self._json({"error": "not found"}, 404)
-                from .project_links import annotate_ci, cached_github_languages
-                return self._json(annotate_ci(server.ci_monitor.snapshot(), r,
-                    repository_languages=cached_github_languages(server.github_monitor)))
+                from .project_links import annotate_ci, cached_github_languages, mark_merged_pull_requests
+                return self._json(mark_merged_pull_requests(annotate_ci(server.ci_monitor.snapshot(), r,
+                    repository_languages=cached_github_languages(server.github_monitor)), server.gate_store))
             if resource == "reviews":
                 from .reviews import ReviewService
                 reviews = ReviewService(r)
