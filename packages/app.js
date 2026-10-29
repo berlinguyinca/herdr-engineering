@@ -46,6 +46,7 @@ import { mountArtifacts, renderArtifactDetail } from './artifacts-view.js';
 import { mountPublications } from './publications-view.js';
 import { mountHandoffs } from './handoffs-view.js';
 import { mountScheduling } from './scheduler-view.js';
+import { mountDeployments } from './deployments-view.js';
 import { classifyDashboardError, dashboardErrorMessage } from './dashboard-load-state.js';
 import { mountEventHistory } from './event-history.js';
 
@@ -83,7 +84,7 @@ const NAV = [
   { group: 'Fabric', path: '/hosts', label: 'Hosts', match: ['/scheduling'] },
   { group: 'Fabric', path: '/services', label: 'Services', match: ['/fabric-services', '/local-services', '/system-services'] },
   { group: 'Fabric', path: '/llm', label: 'Usage', match: ['/analytics'] },
-  { group: 'Delivery', path: '/ci', label: 'CI' },
+  { group: 'Delivery', path: '/ci', label: 'CI', match: ['/deployments'] },
   { group: 'Delivery', path: '/reviews', label: 'Reviews', match: ['/review-gate'] },
   { group: 'Delivery', path: '/github', label: 'Projects', match: ['/github/projects'] },
   { group: 'Code', path: '/architecture', label: 'Architecture', capability: 'architecture_v1' },
@@ -97,6 +98,7 @@ const SECTION_TABS = [
   [['/attention', 'Attention'], ['/activity', 'Activity']],
   [['/hosts', 'Hosts'], ['/scheduling', 'Scheduling']],
   [['/services', 'Catalog'], ['/fabric-services', 'Fabric'], ['/local-services', 'Local'], ['/system-services', 'System']],
+  [['/ci', 'CI'], ['/deployments', 'Deployments']],
   [['/reviews', 'Plan reviews'], ['/review-gate', 'Review gate']],
   [['/github', 'Issues'], ['/github/projects', 'Boards']],
   [['/artifacts', 'Artifacts'], ['/publications', 'Publications']],
@@ -205,6 +207,7 @@ const ROUTES = {
   '/github': viewGithub,
   '/collab': viewCollab,
   '/ci': viewIntegrations,
+  '/deployments': viewDeployments,
   '/reviews': viewIntegrations,
   '/review-gate': viewReviewGate,
   '/topology': viewTopology,
@@ -373,7 +376,7 @@ const BACK_LINK_SKELETON = '<div><span class="hd-skeleton hd-skeleton--line" sty
 function routeSkeleton(match, parts) {
   const back = match.startsWith('/missions/:id') || match === '/herd/session/:id' ? BACK_LINK_SKELETON : match === '/llm/session/:id' ? '<p style="font-size:13px"><span class="hd-skeleton hd-skeleton--line" style="display:inline-block;vertical-align:middle">&nbsp;</span></p>' : '';
   const piMission = match === '/missions/:id' && (safeDecode(parts[1]) || '').startsWith('pi:');
-  const rows = piMission ? 1 : match === '/missions/:id/tests' || match === '/analytics/models' || match === '/analytics/hosts' ? 2 : match === '/missions/:id/reviews' ? 4 : match === '/missions/:id' || match.startsWith('/llm') || match === '/herd/session/:id' || match === '/analytics' || match === '/analytics/missions' ? 8 : match.startsWith('/services') || match.endsWith('-services') ? 7 : 5;
+  const rows = piMission ? 1 : match === '/missions/:id/tests' || match === '/analytics/models' || match === '/analytics/hosts' || match === '/deployments' ? 2 : match === '/missions/:id/reviews' ? 4 : match === '/missions/:id' || match.startsWith('/llm') || match === '/herd/session/:id' || match === '/analytics' || match === '/analytics/missions' ? 8 : match.startsWith('/services') || match.endsWith('-services') ? 7 : 5;
   return `<div data-skeleton aria-busy="true" role="status" aria-label="Loading page">${back}<div class="hd-live-head"><div class="hd-skeleton hd-skeleton--title"></div></div>${skeleton('page content', { rows, height: 64, bare: true })}</div>`;
 }
 
@@ -404,6 +407,11 @@ async function viewPublications() {
 async function viewScheduling() {
   root.innerHTML = `${liveHead('<h1>Scheduling</h1>')}<div id="scheduler"></div>`;
   return mountScheduling(root.querySelector('#scheduler'), client, { freshness: chipIn(root) });
+}
+
+async function viewDeployments() {
+  root.innerHTML = `${liveHead('<h1>Deployments</h1>')}<div id="deployments"></div>`;
+  return mountDeployments(root.querySelector('#deployments'), client, { freshness: chipIn(root) });
 }
 
 async function viewHandoffs() {

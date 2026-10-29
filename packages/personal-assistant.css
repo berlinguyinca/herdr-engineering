@@ -54,3 +54,10 @@
 .pa-strip { border: 1px solid var(--status-attention); background: var(--surface); border-radius: var(--radius); padding: 8px 12px; margin-bottom: 8px; display: flex; flex-direction: column; gap: 4px; }
 .pa-strip[hidden] { display: none; }
 .pa-config { margin-top: 14px; }
+
+.pa-h3 { font-size: var(--text-md, 14px); margin: 14px 0 6px; color: var(--text-secondary); }
+.pa-flash:empty { display: none; }
+.pa-flash { margin-bottom: 8px; padding: 6px 10px; border-radius: var(--radius-sm); border: 1px solid var(--border-color); }
+.pa-flash[role="alert"] { border-color: var(--status-attention); color: var(--status-attention); }
+.pa-approval, .pa-msg { overflow-wrap: anywhere; }
+.pa-msg + .pa-msg { margin-top: 8px; }

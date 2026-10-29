@@ -37,6 +37,29 @@ test('the sidebar is grouped, merged pages share one link with tabs, and the cur
   });
 });
 
+test('with every optional capability advertised the sidebar still fits, and Deployments is a CI tab', async () => {
+  await withPage(async (page, base) => {
+    const capabilities = ['mission_activity_v1', 'ci_v1', 'plannotator_reviews_v1', 'github_v1', 'collab_v1', 'assistant_v1',
+      'project_intelligence_v1', 'architecture_v1', 'architecture_explain_v1', 'deployments_v1'];
+    await page.route('**/api/v1/**', (route) => route.fulfill({ json: new URL(route.request().url()).pathname === '/api/v1/health'
+      ? { status: 'ok', capabilities } : {} }));
+    await page.goto(`${base}/#/overview`);
+    await links(page).filter({ hasText: 'Assistant' }).waitFor({ timeout: 10000 });   // the capabilities have applied
+    const labels = await links(page).allTextContents();
+    for (const optional of ['Assistant', 'Architecture', 'Project intelligence']) {
+      assert.ok(labels.some((l) => l.startsWith(optional)), `${optional} is listed: ${labels.join(', ')}`);
+    }
+    assert.ok(labels.length <= 14, `sidebar has ${labels.length} links with every capability: ${labels.join(', ')}`);
+    assert.ok(!labels.some((l) => l.startsWith('Deployments')), 'Deployments is a tab, not a sidebar link');
+
+    await page.goto(`${base}/#/deployments`);
+    await page.locator('#subnav a[aria-current=page]').waitFor({ timeout: 10000 });
+    assert.deepEqual(await page.locator('#subnav a').allTextContents(), ['CI', 'Deployments']);
+    assert.equal(await page.locator('#subnav a[aria-current=page]').textContent(), 'Deployments');
+    assert.equal(await page.locator('herdr-app-shell a.hd-shell__link.active').textContent(), 'CI');
+  });
+});
+
 test('display controls are icon buttons with tooltips', async () => {
   await withPage(async (page, base) => {
     await page.goto(`${base}/#/overview`);

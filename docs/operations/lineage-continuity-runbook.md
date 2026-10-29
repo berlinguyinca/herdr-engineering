@@ -122,6 +122,48 @@ suppression). The assistant's principal is an API key, which has no room members
 snapshot from it, and building one from a contexts list the model or server supplies would widen visibility. So `read_lineage`
 has no metrics operation (a test pins that). Members read metrics from the room analytics route.
 
+## Assistant approvals, tenants and audit (YAML)
+
+```yaml
+control_plane:
+  personal_assistant:
+    tenancy:
+      default_tenant: default          # principals not listed below
+      principals:                      # authenticated principal id (key:<12 hex of sha256(api key)>) -> tenant
+        "key:0123456789ab": acme
+    actions:
+      approvers: ["key:..."]           # may decide approvals/proposals in their OWN tenant
+      auto_execute: true               # run an action/proposal as soon as it is approved (false = POST .../execute)
+```
+
+* Tenant is never read from a header, query or body. A malformed tenant id stops startup.
+* `POST /api/v1/assistant-approvals/<id>/execute` and `POST /api/v1/assistant-proposals/<id>/execute` run what was
+  approved, once (replay returns the recorded result; a failed action is not retried under the same key). Each
+  re-checks tenant, approval, expiry, grant and the payload hash. `send_message`, `run_shell` and `edit_shared` have no
+  executor: approving them records permission only.
+* `GET /api/v1/assistant-audit` reads the audit log (`chain_intact` reports the per-tenant hash chain). It is stored
+  as `assistant_audit` events in the repo event store, written before the operation completes; there is no route to
+  change or delete an entry. Approved actions and proposals write an `...executing` audit entry BEFORE their side
+  effect, so with the event store down nothing is run and the action stays approved. Other operations error when the
+  entry cannot be written, but the state change made just before it may already be stored.
+* Audit integrity limits. Without a key the chain is an unkeyed SHA-256: it detects casual edits and a removed or
+  reordered entry in the middle, but anyone who can write the event store can recompute it, and truncating the tail
+  or rolling the stream back still verifies. Set `personal_assistant.audit.hmac_key_file` to the PATH of a file (at
+  least 16 bytes, outside the repo, readable by the control plane; a missing or short file stops startup) and entries
+  are HMAC-SHA-256 keyed, so an edit cannot be re-signed without the key. Truncation or rollback is only detectable
+  against a head recorded elsewhere: `GET /api/v1/assistant-audit` returns `head` (`seq`, `sha256`); keep the latest
+  one off the box and compare. Rotating the key makes older keyed entries unverifiable by the new key.
+* After an effect (review request, comment, draft, connector call, hand-off) a failing audit store does not turn the
+  result into an error: the action stays `completed` with `result.audit_pending`/`audit_error`, the error is logged,
+  and the entry is written on the next replay of `.../execute` or the next `GET /api/v1/assistant-audit`.
+* A queued action keeps its request payload in memory so it can run; the persisted copy has secret-looking values
+  scrubbed. An action restored from a snapshot that had to scrub a secret is refused (`not persisted`) rather than
+  sent with a placeholder: request it again. Content that is secret but does not look like one (free text) is stored.
+* Audit before effect is not universal: only `execute_approved_action` / `execute_approved_proposal` write the `executing` entry before the effect. The inline connector `/request` and `/test` path and the chat `_execute_gated` path record the call afterwards, so they can run while the audit store is down.
+* If the audit sink commits but then raises (for example a timeout after commit), the entry is durable but absent from memory and the next entry reuses its `seq`; after a restart the chain then reports `chain_intact: false` until repaired. The hydrate order is by timestamp, so a backwards clock step can reorder entries. The sink write happens under the store lock, so a slow database slows every assistant operation. Not fixed in this change.
+* Moving a principal to a new tenant in `tenancy.principals` hides what it created under its old tenant (`default`):
+  assistants, memory, approvals and notifications are tenant-scoped. Re-create them or keep the mapping.
+
 ## Rollback
 All changes are additive; roll back in this order, each step safe on its own:
 1. Switch the assistant tool off: `personal_assistant.enabled: false` (or revoke the `read_lineage` grant).
