@@ -164,7 +164,7 @@ const STYLES = `<style>
 .at-group{margin:24px 0 16px}.at-group>summary{cursor:pointer;font-weight:600;padding:4px 0}
 .at-status{font-size:13px;color:var(--text-secondary);margin:8px 0}
 .at-group[data-state=acknowledged] .at-row{opacity:.78}
-@media (max-width:600px){.at-row{flex-wrap:wrap}.at-detail{white-space:normal}.at-actions{width:100%;flex-wrap:wrap}.at-snooze select,.at-chip{min-height:44px}}
+@media (max-width:900px){.at-row{flex-wrap:wrap}.at-detail{white-space:normal}.at-actions{width:100%;flex-wrap:wrap}.at-snooze select,.at-chip{min-height:44px}}
 </style>`;
 
 /**
