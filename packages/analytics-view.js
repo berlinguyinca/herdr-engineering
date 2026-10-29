@@ -59,7 +59,7 @@ function dashboard({ missions, models, hosts }) {
     </div>`;
 }
 
-// The fleet and missions figures that sit under the model usage on the Usage page: four tiles and the way to the detail pages.
+// The fleet and missions figures that sit under the model usage on the Usage page: three tiles and the way to the detail pages.
 export function usageStrip({ missions = {}, models = {}, hosts = {} } = {}) {
   const modelCount = Object.keys(models.models || {}).length;
   const tile = (label, value, note) => `<div class="us-tile"><span class="us-label">${esc(label)}</span><strong>${esc(value)}</strong><span class="us-note">${esc(note)}</span></div>`;
@@ -159,7 +159,7 @@ const changeKey = (el) => el.closest('herdr-metric')?.getAttribute('label') ?? e
 
 export function mountAnalytics(container, client, sub = '', { data = null } = {}) {
   const page = PAGES[sub] ? sub : '';
-  container.innerHTML = `${page ? '<p class="llm-note" style="font-size:13px"><a href="#/llm">← Usage</a></p>' : ''}<div class="hd-live-head" style="display:flex;flex-wrap:wrap;align-items:baseline;gap:12px"><h1>${TITLES[page]}</h1><herdr-freshness interval="5000"></herdr-freshness></div><div data-analytics-body></div>`;
+  container.innerHTML = `<p class="llm-note" style="font-size:13px"><a href="#/llm">← Usage</a></p><div class="hd-live-head" style="display:flex;flex-wrap:wrap;align-items:baseline;gap:12px"><h1>${TITLES[page]}</h1><herdr-freshness interval="5000"></herdr-freshness></div><div data-analytics-body></div>`;
   const body = container.querySelector('[data-analytics-body]');
   // A refresh that changed a value flashes that cell (a single number counts up); the first paint
   // and identical refreshes do not. morph keeps counter and table-cell nodes, so they pair by node;
