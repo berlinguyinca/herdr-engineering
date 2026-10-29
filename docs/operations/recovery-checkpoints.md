@@ -62,3 +62,18 @@ that reader. Database failures remain explicit failures, not incomplete cache
 fallbacks. Cursor fingerprints use a process-private HMAC so masked low-entropy
 values cannot be guessed from public cursor hashes. Cursors can become stale
 after a server restart; reload history when the API returns409.
+
+## Compacting service observations
+
+`control_plane.fabric_compaction` (fleet YAML, worker only) removes the journal rows a replay never needs:
+interior `ServiceListenerObserved` / `ServiceMetadataObserved` rows (each service keeps its first and last), and
+`ServiceUpdated` rows whose payload repeats the previous one. Other `ServiceUpdated` rows carry state transitions and
+stay. Rows with a v2 envelope (source, source sequence, actor) and rows younger than `min_age_days` are never
+candidates. Removed rows are written to `fabric_events_archive` in the same statement (migration 0035) and purged after
+`archive_retention_days`; copy rows back from there to undo a compaction.
+
+Rollout: apply 0035, set `enabled: true` with `dry_run: true` and read the worker log line
+`fabric compaction dry run: would archive N rows {...}`; set `dry_run: false` only after that. Each tick moves at
+most `batch_rows`. Deleting rows changes the journal a checkpoint covered, so affected streams replay in full until
+the checkpoint is rebuilt; the job rebuilds it once a drain finishes (`rebuild_checkpoint: false` leaves that to the
+operator, using the builder above).

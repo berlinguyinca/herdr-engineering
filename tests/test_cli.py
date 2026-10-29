@@ -290,3 +290,15 @@ def test_feed_pi_invalid_url_is_sanitized(pi_feed_snapshot, monkeypatch, capsys)
     output = capsys.readouterr()
     assert "--url" in output.err
     assert "url-secret" not in output.out + output.err
+
+
+def test_fabric_compaction_settings_default_to_off_and_dry_run():
+    from herdr_engineering.cli import _fabric_compaction_settings
+    off = _fabric_compaction_settings({})
+    assert off.enabled is False and off.dry_run is True and off.rebuild_checkpoint is True
+    on = _fabric_compaction_settings({"fabric_compaction": {"enabled": True, "dry_run": False, "min_age_days": 5,
+                                                            "archive_retention_days": None}})
+    assert on.enabled and not on.dry_run and on.min_age_days == 5.0 and on.archive_retention_days is None
+    assert _fabric_compaction_settings({"fabric_compaction": {"enabled": "yes"}}).enabled is False
+    with pytest.raises(SystemExit):
+        _fabric_compaction_settings({"fabric_compaction": {"min_age_days": 0}})
