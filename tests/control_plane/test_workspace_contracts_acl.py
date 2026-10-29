@@ -83,7 +83,9 @@ ENTRIES = [{"ref": "n1", "text": "ci failure report"}, {"ref": "n2", "text": "pl
 
 
 def test_search_applies_acl_before_matching_and_counts_visible_only():
-    m = lambda e: "ci failure" in e["text"]
+    def m(e):
+        return "ci failure" in e["text"]
+
     high = wc.search(ALICE, ENTRIES, m, can_node)
     assert [h["ref"] for h in high["hits"]] == ["n1", "secret"] and high["total"] == 2          # control
     low = wc.search(CAROL, ENTRIES, m, can_node)
@@ -103,7 +105,7 @@ def test_export_filters_items_and_their_references():
 
 def test_subscription_is_rechecked_on_every_delivery_and_closes_on_revocation():
     carol = member("carol", {"room-1"})
-    ok = lambda v, ref: can_node(v, ref)
+    ok = can_node
     g = wc.SubscriptionGuard(carol, "n1", ok)
     assert g.deliver("n2") is True and g.deliver("secret") is False and g.closed
     assert g.deliver("n2") is False                                   # once closed, stays closed even for visible events

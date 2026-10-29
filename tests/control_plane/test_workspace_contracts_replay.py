@@ -9,7 +9,6 @@ from herdr_engineering.control_plane.collab import CollabError
 from herdr_engineering.control_plane.workspace_contracts import ReplayCursor
 from tests.control_plane.test_collab_tasks import W, code, svc, user  # noqa: F401
 
-
 _N = itertools.count()
 
 

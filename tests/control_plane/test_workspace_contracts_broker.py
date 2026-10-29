@@ -12,7 +12,13 @@ import pytest
 from herdr_engineering.control_plane import workspace_contracts as wc
 from herdr_engineering.control_plane.collab import AGENT_ACTIONS, ROLE_ACTIONS
 from herdr_engineering.control_plane.workspace_contracts import (
-    AccountGrant, Approver, Broker, Delegation, StaticGrantSource, ToolRequest, taint,
+    AccountGrant,
+    Approver,
+    Broker,
+    Delegation,
+    StaticGrantSource,
+    ToolRequest,
+    taint,
 )
 
 T0 = datetime(2026, 10, 28, 12, 0, tzinfo=UTC)
