@@ -153,6 +153,11 @@ def test_keyed_door_extends_graph_routes_with_etag_paging_and_acl(world, wg, wg_
         assert call(svr, f"/api/v1/graph/work/entity?ref={ref}", key="view-key")[0] == 404
         assert call(svr, "/api/v1/graph/work/search?q=Investigate", key="view-key")[1]["hits"] == []
         assert call(svr, "/api/v1/graph/work/status", key="view-key")[0] == 404
+        status, rep, _ = call(svr, "/api/v1/graph/work/reconcile", method="POST", body={},
+                              headers={"Content-Type": "application/json"})
+        assert status == 200 and rep["poison"] == 0 and "orphans" in rep       # nothing in fabric_events here: a no-op pass
+        assert call(svr, "/api/v1/graph/work/reconcile", method="POST", body={}, key="view-key",
+                    headers={"Content-Type": "application/json"})[0] in (403, 404)
         status, st, _ = call(svr, "/api/v1/graph/work/status")
         assert status == 200 and st["counts"]["entities"] >= 5
         # snapshot by root and as_of

@@ -973,6 +973,8 @@ class ControlPlaneServer:
             self.agent_summaries.close()
         self.ci_monitor.close()
         self.github_monitor.close()
+        if getattr(self, "work_graph", None) is not None:
+            self.work_graph.close()
         if self._operator_httpd:
             self._operator_httpd.shutdown()
             self._operator_httpd.server_close()
