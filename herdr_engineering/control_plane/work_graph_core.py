@@ -341,19 +341,22 @@ def artifact_ops(art: Mapping[str, Any], version: Mapping[str, Any] | None, bind
     for b in bindings:
         room, issue, task, project = (_text(b.get(k)) for k in ("room_id", "issue_ref", "task_id", "project_id"))
         mission, session = _text(b.get("mission_id")), _text(b.get("session_id"))
+        # a binding that names a room makes the work objects it links visible to that room; a binding with no room
+        # leaves them as they are (fail closed: nothing is widened by an artifact link)
+        sc = _scope("room", rooms=[room], project=project) if room else {}
         if project:
-            ops.append(edge("contains", ("project", project), ("artifact", aid)))
+            ops.append(edge("contains", ("project", project), ("artifact", aid), **sc))
         if room:
-            ops.append(edge("contains", ("room", room), ("artifact", aid)))
+            ops.append(edge("contains", ("room", room), ("artifact", aid), **sc))
         if task:
-            ops.append(edge("contains", ("task", task), ("artifact", aid)))
-            ops.append(edge("produced", ("task", task), ("artifact", aid)))
+            ops.append(edge("contains", ("task", task), ("artifact", aid), **sc))
+            ops.append(edge("produced", ("task", task), ("artifact", aid), **sc))
         if issue:
-            ops.append(edge("contains", ("issue", _split_issue_ref(issue)), ("artifact", aid)))
+            ops.append(edge("contains", ("issue", _split_issue_ref(issue)), ("artifact", aid), **sc))
         if mission:
-            ops.append(edge("contains", ("mission", mission), ("artifact", aid)))
+            ops.append(edge("contains", ("mission", mission), ("artifact", aid), **sc))
         if session:
-            ops.append(edge("produced", ("agent_session", session), ("artifact", aid)))
+            ops.append(edge("produced", ("agent_session", session), ("artifact", aid), **sc))
     return ops
 
 
