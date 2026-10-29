@@ -1229,9 +1229,12 @@ def test_review_fan_in_hub_reads_stay_fast_and_ingest_stays_linear():
     for read in (lambda: g.get_node(V, "commit:h"),
                  lambda: g.neighborhood(V, "commit:h", depth=2, max_edges=2000),
                  lambda: g.get_edge(V, "reviewed", "agent:v", "commit:h")):
-        t = time.perf_counter()
-        out = read()
-        assert time.perf_counter() - t < 0.5        # ~0.05-0.1 s idle; loose for a busy CI box
+        best = float("inf")
+        for _ in range(3):                          # a stalled host slows one try; a slow read slows all of them
+            t = time.perf_counter()
+            read()
+            best = min(best, time.perf_counter() - t)
+        assert best < 0.5                           # ~0.05-0.1 s idle; loose for a busy CI box
     node = g.get_node(V, "commit:h")
     assert node["edges_truncated"] is True
     mine = [e for e in node["edges"] if e["from_id"] == "agent:v"][0]
