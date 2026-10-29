@@ -43,6 +43,13 @@ export function overviewModel(data = {}, received = Date.now(), now = Date.now()
   return {missions,sessions,services,hosts:records(data.hosts).sort((a,b)=>text(a.host_name || a.host_id).localeCompare(text(b.host_name || b.host_id)))};
 }
 
+// A failed CI run only matters until a later run of the same repository and branch has passed.
+const PASSED=['success','passed','finished','complete','completed'];
+export function unresolvedCiFailures(entries) {
+  const passedAt=new Map(), key=r=>`${r.repository || ''}\u0000${r.branch || ''}`, when=r=>integrationTimestamp(r.updated_at || r.created_at);
+  for(const e of entries)if(PASSED.includes(String(e.record.state || e.record.status || '').toLowerCase()))passedAt.set(key(e.record),Math.max(passedAt.get(key(e.record)) || 0,when(e.record)));
+  return entries.filter(e=>e.tab==='failed' && !((passedAt.get(key(e.record)) || 0) > when(e.record)));
+}
 const OVERVIEW_CARDS = ['sessions','missions','fleet','ci','reviews','services','hosts','activity'];
 const CARD_LABELS = {missions:'Current missions',fleet:'Fleet health',sessions:'Agents',ci:'CI builds',reviews:'Reviews',services:'HerdR services',hosts:'Hosts',activity:'Recent changes'};
 const PREFERENCES_KEY = 'herdr.overview.layout.v1';
@@ -66,7 +73,9 @@ export function overviewAttention(data = {}, states = {}, received = Date.now(),
   for(const session of model.sessions.failed)if(session.session_id)add(`session:${session.session_id}`,'critical',1,session.display_name || session.title || session.agent_role || 'Failed agent','Agent reported failed',`#/herd/session/${encodeURIComponent(session.session_id)}`,session.updated_at || session.last_activity,'sessions');
   for(const kind of ['ci','reviews']) {
    const seen=new Set();
-   for(const entry of integrationEntries(data[kind],kind)) {
+   const all=integrationEntries(data[kind],kind), open=kind==='ci'?new Set(unresolvedCiFailures(all)):null;
+   for(const entry of all) {
+    if(open && entry.tab==='failed' && !open.has(entry))continue;
     if(seen.has(entry.id))continue;
     seen.add(entry.id);
     if(entry.tab!=='failed' && entry.tab!=='changes')continue;
@@ -186,7 +195,7 @@ export function renderOverviewSection(section, data = {}, states = {}, received 
   }
   if (section === 'ci' || section === 'reviews') {
     const isCi=section==='ci', snapshot=data[section], entries=integrationEntries(snapshot,section);
-    const current=entries.filter(e=>e.tab==='current'), attention=entries.filter(e=>e.tab===(isCi?'failed':'changes'));
+    const current=entries.filter(e=>e.tab==='current'), attention=isCi?unresolvedCiFailures(entries):entries.filter(e=>e.tab==='changes');
     const ready=states[section]?.loaded;
     const title=isCi?'CI builds':'Plan and code reviews';
     return `<div class="ov-heading"><h2>${title}</h2>${link(`#/${section}`,isCi?'All CI →':'All reviews →')}</div>${availability([section],states)}${ready ? `

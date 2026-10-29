@@ -204,3 +204,11 @@ test('short attention queues do not offer a redundant expansion control',()=>{
   assert.equal((html.match(/data-attention-key=/g)||[]).length,1);
   assert.doesNotMatch(html,/data-attention-toggle/);
 });
+
+test('a failed CI run is dropped once a later run of the same branch passed', async () => {
+  const { unresolvedCiFailures } = await import('../overview-view.js');
+  const e = (state, at, branch = 'main') => ({ tab: state === 'failure' ? 'failed' : 'finished', record: { repository: 'r', branch, state, updated_at: at } });
+  const out = unresolvedCiFailures([e('success', '2026-10-28T10:00:00Z'), e('failure', '2026-10-28T09:00:00Z'), e('failure', '2026-10-28T08:00:00Z', 'dev'), e('failure', '2026-10-28T11:00:00Z')]);
+  assert.equal(out.length, 2);
+  assert.ok(!out.some(x => x.record.updated_at === '2026-10-28T09:00:00Z'));
+});
