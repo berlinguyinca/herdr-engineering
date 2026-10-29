@@ -497,7 +497,7 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
     const entry=integrationEntries({pipelines:{history:[record]}})[0];
     if(!entry)return;
     if(selected?.id===entry.id&&selected.repository===record.repository){draw();focusInspector();return;}
-    listScroll=window.scrollY;healthOriginKey=document.activeElement?.dataset.healthRun||healthOriginKey;testPage=0;testSearch='';comparisonKey='';cancelDetail();selectedReports=null;selectedReportsError='';
+    listScroll=window.scrollY;healthOriginKey=document.activeElement?.dataset.healthSlotRun||healthOriginKey;testPage=0;testSearch='';comparisonKey='';cancelDetail();selectedReports=null;selectedReportsError='';
     selected={id:entry.id,repository:record.repository,providerId:record.provider_repo_id || record.repository,number:record.run_number,providerUrl:JSON.parse(entry.id)[0]};
     pipeline=selected.providerUrl?record:{...record,can_retry:false,can_cancel:false};debugSessions=null;debugSessionId='';debugMessage='';debugOperationId='';fixOperationId='';fix=null;fixMessage='';sandboxOperationId='';fixTerminal=null;fixTerminalError='';step='';log=null;logError='';detailError='';actionMessage='';detailSignature='';related=null;relatedFailed=false;
     // Start lazy I/O before rendering the synchronized run/health views.

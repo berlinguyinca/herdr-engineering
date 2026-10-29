@@ -101,12 +101,14 @@ export function mountCiHealth(host,client,{onSelectRun=()=>{},onSelectStep=()=>{
     const groups=new Map();for(const task of rows(selected.tasks)){const key=String(task.workflow ?? task.workflow_id ?? 'Steps');if(!groups.has(key))groups.set(key,[]);groups.get(key).push(task);}
     return `<section class="ci-health-workflows" aria-label="Selected run workflows"><h3>Run #${esc(String(selected.run_number ?? selected.number ?? ''))} · workflows and steps</h3>${[...groups].map(([name,tasks])=>`<details data-health-disclosure="${esc(JSON.stringify(['workflow',selectedKey,name]))}"><summary>${esc(name)}</summary>${tasks.map(task=>`<button type="button" class="hd-btn" data-health-step="${esc(String(task.id ?? ''))}">${esc(task.name || `Step ${task.id ?? '?'}`)} · ${esc(task.state || task.status || 'Unknown')}</button>`).join('')}</details>`).join('')}</section>`;
   }
+  let slotLimit=100,slotShown='';
   function selectedSlot() {
     if(!selection || !model)return '';
     const project=model.projects.find(p=>p.key===selection.projectKey),cell=project?.cells.find(c=>c.key===selection.bucketKey);
     if(!project || !cell)return '';
     const counts=cell.counts||{},runs=Array.isArray(cell.runs)?cell.runs:[];
-    const runButtons=runs.slice(0,100).map(run=>`<button type="button" data-health-slot-run="${esc(String(run.runKey||run.run_number||''))}"${run.runKey&&run.runKey===selectedKey?' aria-current="true"':''}><strong>Run #${esc(String(run.run_number??'unknown'))}</strong><br><small>${esc(run.state||run.status||'Unknown')} · ${esc(run.branch||'Branch unavailable')} · ${esc(run.revision||'Revision unavailable')}</small></button>`).join('');
+    const slotKey=`${selection.projectKey}|${selection.bucketKey}`;if(slotKey!==slotShown){slotShown=slotKey;slotLimit=100;}
+    const runButtons=runs.slice(0,slotLimit).map(run=>`<button type="button" data-health-slot-run="${esc(String(run.runKey||run.run_number||''))}"${run.runKey&&run.runKey===selectedKey?' aria-current="true"':''}><strong>Run #${esc(String(run.run_number??'unknown'))}</strong><br><small>${esc(run.state||run.status||'Unknown')} · ${esc(run.pr?`PR #${run.pr.number}${run.pr.title?` ${run.pr.title}`:''}`:run.branch||'Branch unavailable')} · ${esc(run.revision||'Revision unavailable')}</small></button>`).join('')+(runs.length>slotLimit?`<button type="button" class="hd-btn hd-btn--secondary hd-btn--sm" data-health-slot-more>Show ${Math.min(100,runs.length-slotLimit)} more runs · ${runs.length-slotLimit} remaining</button>`:'');
     return `<section class="ci-slot-detail" aria-label="Selected CI slot detail"><header><div><h3>${esc(project.identity)}</h3><p class="ci-slot-note">${esc(cell.label||cell.key)} · ${cell.complete?'Complete coverage':'Incomplete coverage'}</p></div><strong>${esc(`${counts.failure||0} failed`)}</strong></header><dl><div><dt>Runs</dt><dd>${esc(counts.total??runs.length)}</dd></div><div><dt>Passed</dt><dd>${esc(counts.success||0)}</dd></div><div><dt>Failed</dt><dd>${esc(counts.failure||0)}</dd></div><div><dt>Active</dt><dd>${esc(counts.active||0)}</dd></div></dl>${runs.length?`<div class="ci-slot-runs">${runButtons}</div><p class="ci-slot-note">Select a run to open its failed steps, tests, logs and provider diagnosis.</p>`:'<p class="ci-slot-note">No run evidence is reported for this slot. Try a wider window or another scope.</p>'}</section>`;
   }
   const CELL='[data-health-project][data-health-bucket]';
@@ -176,8 +178,8 @@ export function mountCiHealth(host,client,{onSelectRun=()=>{},onSelectStep=()=>{
     if(button.hasAttribute('data-health-mode')){state.mode=button.dataset.healthMode;selection=null;syncControls();save();draw();notifyContext();return;}
     if(button.hasAttribute('data-health-clear')){selection=null;save();draw();notifyContext();return;}
     if(button.hasAttribute('data-health-bucket')){if(state.mode==='runs'&&!model?.projects.find(p=>p.key===button.dataset.healthProject)?.cells.find(c=>c.key===button.dataset.healthBucket)?.runs.length)return;selection={projectKey:button.dataset.healthProject,bucketKey:button.dataset.healthBucket};save();draw();notifyContext();return;}
+    if(button.hasAttribute('data-health-slot-more')){slotLimit+=100;draw();return;}
     if(button.hasAttribute('data-health-slot-run')){const record=model?.selectedRows.find(row=>row.runKey===button.dataset.healthSlotRun)||model?.projects.flatMap(p=>p.cells.flatMap(c=>c.runs||[])).find(row=>row.runKey===button.dataset.healthSlotRun);if(record){selected=record;selectedKey=record.runKey;draw();onSelectRun(record);}return;}
-    if(button.hasAttribute('data-health-run')){const record=model?.selectedRows.find(row=>row.runKey===button.dataset.healthRun);if(record){selected=record;selectedKey=record.runKey;draw();onSelectRun(record);}return;}
     if(button.hasAttribute('data-health-step') && selected)onSelectStep(selected,button.dataset.healthStep);
   },{signal:listeners.signal});
   host.addEventListener('keydown',event=>{
@@ -205,7 +207,7 @@ export function mountCiHealth(host,client,{onSelectRun=()=>{},onSelectStep=()=>{
       state=ciHealthPreferences(updated);syncControls();save();draw();
     },
     selectedRun(record){if(disposed)return;selected=record;selectedKey=record?runKey(record):'';draw();},
-    setContext(next={}){if(disposed)return;rememberDisclosures();save();context={repository:next.repository || '',mission:next.mission || '',session:next.session || ''};load();for(const name of ['search','branch'])if(typeof next[name]==='string')state[name]=bounded(next[name]);selected=null;selectedKey='';treeLimits.clear();syncControls();draw(false);},
+    setContext(next={}){if(disposed)return;rememberDisclosures();save();context={repository:next.repository || '',mission:next.mission || '',session:next.session || ''};load();for(const name of ['search','branch'])if(typeof next[name]==='string')state[name]=bounded(next[name]);selected=null;selectedKey='';syncControls();draw(false);},
     dispose(){disposed=true;generation++;clearTimeout(timer);pending?.abort();pending=null;listeners.abort();},
   };
 }

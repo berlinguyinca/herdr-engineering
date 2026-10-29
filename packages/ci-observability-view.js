@@ -104,7 +104,7 @@ export function mountCiObservability(host,client,{repository='',provider='',miss
     if(disposed)return;
     const model=ciObservabilityModel(summary||{}, {...view,projectKey:project?ciProjectKey(project):''});
     const selected=project?detail:summary;
-    el('[data-ob-status]').textContent=unsupported?'Compact summaries are unavailable for mission/session context. Use the scoped run tree below.':`${error||''} ${detailError||''} ${summary?.available===false||detail?.available===false?'CI summary unavailable. Coverage is partial. ':''}${pending.size?'Refreshing observations… ':''}${summary?scopeNote(summary.scope):'CI summary unavailable or loading.'}${summary?.generated_at?` Last provider snapshot: ${summary.generated_at}.`:''}`.trim();
+    el('[data-ob-status]').textContent=unsupported?'Compact summaries are unavailable for mission/session context. Use the project map below.':`${error||''} ${detailError||''} ${summary?.available===false||detail?.available===false?'CI summary unavailable. Coverage is partial. ':''}${pending.size?'Refreshing observations… ':''}${summary?scopeNote(summary.scope):'CI summary unavailable or loading.'}${summary?.generated_at?` Last provider snapshot: ${summary.generated_at}.`:''}`.trim();
     replace(el('[data-ob-summary]'),selected?cards(ciObservabilityModel(selected))+summaryCaption(selected.scope):'');
     replace(el('[data-ob-worst]'),summary&&!project?worstProjects(model):'');
     replace(el('[data-ob-projects]'),summary?rail(model,projectCharts):'<p class="ci-chart-note">No project summary received.</p>');
@@ -137,27 +137,29 @@ export function mountCiObservability(host,client,{repository='',provider='',miss
       jobs.push(request('project',signal=>client.getCiSummary({...context,signal}),data=>{if(!Array.isArray(data?.charts)||!data.kpis)throw Error('Invalid project summary');detail=data;detailError='';projectCharts.set(ciProjectKey(project),rows(data.charts));},()=>{detailError=detail?'Project refresh failed. Retained charts are stale.':'Project charts unavailable.';}));
       jobs.push(request('tests',signal=>client.getCiTests({...context,signal}),data=>{if(!Array.isArray(data?.tests))throw Error('Invalid test history');tests=data;testsError='';},()=>{testsError='Test history refresh failed.';}));
     }
-    draw();await Promise.all(jobs);await loadTrends(version);
-    if(!disposed&&!doc.hidden&&version===generation){clearTimeout(timer);timer=setTimeout(refresh,5000);}
+    draw();await Promise.all(jobs);
+    if(!disposed&&!doc.hidden&&version===generation){clearTimeout(timer);timer=setTimeout(refresh,5000);void loadTrends(version);}
   }
   // Every project's trend loads by itself, a few at a time and only while nothing the person asked for is in flight; nobody has to select a row first.
   const trendAt=new Map();
+  let trendsRunning=false;
   async function loadTrends(version) {
-    if(disposed||doc.hidden||unsupported||!summary||version!==generation)return;
+    if(trendsRunning||disposed||doc.hidden||unsupported||!summary||version!==generation)return;
+    trendsRunning=true;
     const model=ciObservabilityModel(summary,{...view,projectKey:project?ciProjectKey(project):''});
-    const queue=model.projects.filter(p=>(p.metrics.completed||p.metrics.active)&&!(project&&p.key===ciProjectKey(project))&&!trendAt.has(p.key));
+    const queue=model.projects.filter(p=>(p.metrics.completed||p.metrics.active)&&!(project&&p.key===ciProjectKey(project))&&Date.now()-(trendAt.get(p.key)||0)>300000);
     const worker=async()=>{
       for(let next=queue.shift();next&&!disposed&&version===generation;next=queue.shift()){
-        const item=next;trendAt.set(item.key,Date.now());
+        const item=next;let trendTimer=0;trendAt.set(item.key,Date.now());
         while(pending.size&&!disposed&&version===generation)await new Promise(resolve=>setTimeout(resolve,250));
         if(disposed||version!==generation){trendAt.delete(item.key);break;}
         // No abort signal: selecting a project or editing a filter must not cancel these quietly; a stale answer is dropped by the generation check.
-        try{const data=await Promise.race([client.getCiSummary({...filters,start:null,end:null,run_number:null,repository:item.repository,provider_url:item.provider_url,provider_repo_id:item.provider_repo_id}),new Promise((_,fail)=>setTimeout(()=>fail(new Error('Trend timed out')),15000))]);
-          if(!disposed&&version===generation&&Array.isArray(data?.charts)){projectCharts.set(item.key,rows(data.charts));draw();}
-        }catch{trendAt.delete(item.key);}
+        try{const data=await Promise.race([client.getCiSummary({...filters,start:null,end:null,run_number:null,repository:item.repository,provider_url:item.provider_url,provider_repo_id:item.provider_repo_id}),new Promise((_,fail)=>{trendTimer=setTimeout(()=>fail(new Error('Trend timed out')),15000);})]);
+          if(!disposed&&version===generation&&Array.isArray(data?.charts)){projectCharts.set(item.key,rows(data.charts));draw();}else trendAt.delete(item.key);
+        }catch{trendAt.set(item.key,Date.now()-240000);}finally{clearTimeout(trendTimer);}
       }
     };
-    await Promise.all([worker(),worker(),worker()]);
+    try{await Promise.all([worker(),worker(),worker()]);}finally{trendsRunning=false;}
   }
   function invalidate({all=false}={}) {
     generation++;for(const request of pending.values())request.abort();pending.clear();
