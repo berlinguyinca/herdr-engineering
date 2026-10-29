@@ -231,6 +231,9 @@ class _RateLimiter:
 
 
 _FLEET_CONFIG_PATH = "/api/v1/fleet/config"
+# Host updaters (InferWeave deploy/pipelines/deploy_event.py) POST here with their per-host fleet
+# token as a Bearer credential; the /api/v1 spelling is accepted as well.
+_DEPLOYMENT_EVENTS_PATHS = frozenset({"/api/deployments/events", "/api/v1/deployments/events"})
 
 
 def _gate_pr(snap):
@@ -1428,6 +1431,8 @@ def _make_handler(server, public=False, operator=False):
                 return self._intelligence_webhook()
             if self._path_only() == _FLEET_CONFIG_PATH + "/telemetry":
                 return self._fleet_resource_telemetry()
+            if self._path_only() in _DEPLOYMENT_EVENTS_PATHS:
+                return self._deployment_event()
             # The ingest route is reachable by the ingest role; every other
             # POST requires the operator role (Spec §104).
             path = self.path.split("?")[0]
@@ -1573,6 +1578,48 @@ def _make_handler(server, public=False, operator=False):
                 return self._deny(400, "invalid resource observation")
             except RuntimeError:
                 return self._deny(503, "resource persistence unavailable")
+
+        def _deployment_host(self):
+            """Fleet host id owning the request's host token, or None (never says why).
+
+            The deploy event emitter sends ``Authorization: Bearer <host token>``; the
+            fleet's own ``X-Host-Token`` header is accepted too, but never both at once.
+            The token is checked by ``host_for_token`` (sha256, constant-time compare)
+            and grants this one route only: ``_role`` reads X-API-Key alone.
+            """
+            auth = self.headers.get_all("Authorization") or []
+            direct = self.headers.get_all("X-Host-Token") or []
+            token = None
+            if len(auth) == 1 and not direct:
+                scheme, _, value = auth[0].strip().partition(" ")
+                value = value.strip()
+                if scheme.lower() == "bearer" and value and not any(c.isspace() for c in value):
+                    token = value
+            elif len(direct) == 1 and not auth:
+                token = direct[0]
+            return server.fleet_config.current().host_for_token(token) if token else None
+
+        def _deployment_event(self):
+            """POST one deployment event. Auth and size are decided before the body is read."""
+            if server.fleet_config is None:
+                return self._deny(404, "not found")
+            host = self._deployment_host()
+            if host is None:
+                return self._deny(401, "unauthorized")
+            from .deployments_monitor import MAX_REQUEST_BYTES
+            length = _content_length(self.headers.get("Content-Length"))
+            if not length:
+                return self._deny(400, "a deployment event body is required")
+            if length > MAX_REQUEST_BYTES:
+                return self._deny(413, f"deployment event exceeds {MAX_REQUEST_BYTES} bytes")
+            if self.headers.get("Content-Type", "").split(";", 1)[0].strip() != "application/json":
+                return self._deny(415, "deployment events require application/json")
+            try:
+                body = self._read_json(MAX_REQUEST_BYTES)
+                server.repo.deployments.ingest(body, reported_by=host)
+            except ValueError as exc:
+                return self._deny(400, str(exc))
+            return self._json({"ok": True})
 
         # --------------------------------------------------- collaboration (HCN)
         def _is_collab_path(self):

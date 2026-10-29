@@ -28,6 +28,8 @@ from ..host_policy import HostPolicy, HostSnapshot, PolicyMode, normalize_aliase
 from ..llm_session_id import dashboard_form
 from . import llm_stats
 from .agent_identity import AgentIdentityConflict, AgentIdentityRegistry
+from .deployments_monitor import ENTITY_TYPE as DEPLOYMENT_ENTITY
+from .deployments_monitor import DeploymentsMonitor
 from .envelope import SourceLedger, envelope_event_fields
 from .graph import GraphProjection
 from .graph import _lseq as _graph_lseq
@@ -217,9 +219,18 @@ class ControlPlaneRepo:
         # from them on import_state; owns no storage of its own.
         self.graph = GraphProjection()
         self.host_metrics = self._new_host_metrics()
+        # Deployment events reported by the host updaters (deploy-4): a private stream, like host metrics.
+        self.deployments = self._new_deployments()
 
     def _new_host_metrics(self):
         return HostMetricsStore(now=lambda: self._now(), persist=self._persist_host_metrics)
+
+    def _new_deployments(self):
+        return DeploymentsMonitor(now=lambda: self._now(), persist=self._persist_deployments)
+
+    def _persist_deployments(self, ev):
+        """Deployment events take the same private sink path as host-metrics rollups."""
+        self._persist_host_metrics(ev)
 
     def _persist_host_metrics(self, ev):
         """Rollups and host-state changes go to the sink, not the shared streams/SSE."""
@@ -3288,6 +3299,13 @@ class ControlPlaneRepo:
         self._event_order = [t for t in self._event_order if t[0] not in ("collab", "review_request")]
         if durable:
             self.inspector.hydrate(durable)
+        # Deployment events ride a private stream too: untrusted host evidence never enters the shared feed.
+        deployment_rows = []
+        for key in [k for k in self._events if k[0] == DEPLOYMENT_ENTITY]:
+            deployment_rows.extend(self._events.pop(key))
+        self._event_order = [t for t in self._event_order if t[0] != DEPLOYMENT_ENTITY]
+        self.deployments = self._new_deployments()
+        self.deployments.hydrate(deployment_rows)
         # Host telemetry rollups/state ride a private stream: rebuild history and
         # put the latest record back on each host.
         metrics = []
