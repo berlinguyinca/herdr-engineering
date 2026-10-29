@@ -143,6 +143,27 @@ class IntelligenceRoutes:
         viewer = self._viewer_from_entry(entry) if isinstance(entry, dict) else None
         return execute_read(ReadTools(self.store), viewer, payload)
 
+    def assistant_ci_repair(self, tenant_id: str, user_id: str, payload: dict, idempotency_key: str) -> dict:
+        """Assistant CI watch entry: queue a ``request_ci_repair`` PROPOSAL on the existing board. Scope comes only
+        from YAML ``assistant_viewers`` (as for reads). The requester is the user, so the board's own refusal of
+        self-approval applies. Executing an approved proposal stays with the existing executor and its policy."""
+        cfg, raw = self._cfg()
+        if not cfg["enabled"]:
+            raise pi.NotFound("project intelligence is not enabled")
+        entry = (raw.get("assistant_viewers") or {}).get(f"{tenant_id}/{user_id}")
+        viewer = self._viewer_from_entry(entry) if isinstance(entry, dict) else None
+        if viewer is None:
+            raise pi.NotFound("no project-intelligence scope is configured for this user")
+        repo = payload.get("repo")
+        mapped = (raw.get("webhook_projects") or {}).get(repo) if isinstance(repo, str) else None
+        if not (isinstance(mapped, list) and mapped) or (
+                viewer.project_ids is not None and not set(mapped) <= viewer.project_ids):
+            raise pi.NotFound("the repository is outside this user's project scope")
+        p = self.board.request(org_id=viewer.org_id, requester=user_id, action="request_ci_repair",
+                               payload=dict(payload), resource_version=1, idempotency_key=idempotency_key[:64])
+        return {"id": p.id, "expires_at": p.expires_at.isoformat(), "state": p.state,
+                "payload_sha256": p.payload_sha256}
+
     @staticmethod
     def _viewer_from_entry(entry: dict) -> pi.Viewer | None:
         projects, clearance = entry.get("projects"), entry.get("clearance", "internal")
