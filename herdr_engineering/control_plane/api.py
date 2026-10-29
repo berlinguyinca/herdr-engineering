@@ -340,11 +340,14 @@ class ControlPlaneServer:
             ci_snapshot=lambda: self.ci_monitor.snapshot(start=True))
         # The stage coordinator (Task 3), ticked by _deployments_loop; GET /api/v1/deployments
         # serves the last tick and never ticks itself. `deployment_evidence` is the release-evidence
-        # hook, fn(track, target, plan_commit) -> ReleaseEvidence. No source is wired: herdr has no
-        # REST client for the release `.commit` asset (a 302 to another host) or the compare call,
-        # so it stays None = unknown, and the coordinator Holds "release not confirmed" (fail closed).
+        # source, fn(track, target, plan_commit) -> ReleaseEvidence: the GitHub `.commit` asset of
+        # the definitions' release and the compare-based ancestry, read with the server-held
+        # github.token. Its call only reads a cache (a daemon worker refreshes it), so the tick and
+        # the permit path never wait on GitHub; without a token, or on any error, it answers unknown
+        # and the coordinator Holds "release not confirmed" (fail closed). None = unknown as well.
         from .deployment_coordinator import DeploymentCoordinator
-        self.deployment_evidence = None
+        from .deployment_evidence import GitHubReleaseEvidence
+        self.deployment_evidence = GitHubReleaseEvidence(self.deployment_definitions.definitions)
         self.deployment_coordinator = DeploymentCoordinator(
             self.deployment_definitions, monitor=lambda: self.repo.deployments,
             state=lambda: self.repo.deployment_plans, evidence=self._release_evidence)
@@ -641,6 +644,36 @@ class ControlPlaneServer:
         source = self.deployment_evidence
         return source(track, target, plan_commit) if source is not None else ReleaseEvidence()
 
+    def _deployment_evidence_status(self) -> dict:
+        """``evidence``: "configured" once the source's last refresh succeeded, else "unknown";
+        ``evidence_error``: the source's last failure kind (fixed text, never a token)."""
+        source = self.deployment_evidence
+        if source is None:
+            return {"evidence": "unknown", "evidence_error": None}
+        status = getattr(source, "status", None)
+        if not callable(status):
+            return {"evidence": "configured", "evidence_error": None}
+        try:
+            st = status()
+            return {"evidence": "configured" if st.get("state") == "configured" else "unknown",
+                    "evidence_error": st.get("error") if isinstance(st.get("error"), str) else None}
+        except Exception:  # noqa: BLE001 - the view must not break on the source
+            return {"evidence": "unknown", "evidence_error": "status unavailable"}
+
+    def _deployment_track_evidence(self, track) -> dict:
+        """One track's evidence source status ({evidence, evidence_error}), so one track's
+        success never hides another's error."""
+        source = self.deployment_evidence
+        status_for = getattr(source, "status_for", None)
+        if not callable(status_for) or not isinstance(track, dict):
+            return self._deployment_evidence_status()
+        try:
+            st = status_for((track.get("repo"), track.get("branch"), track.get("ci_context")))
+            return {"evidence": "configured" if st.get("state") == "configured" else "unknown",
+                    "evidence_error": st.get("error") if isinstance(st.get("error"), str) else None}
+        except Exception:  # noqa: BLE001 - the view must not break on the source
+            return {"evidence": "unknown", "evidence_error": "status unavailable"}
+
     def deployments_tick(self):
         """One coordinator tick, serialized and stored as plain data for the read route.
 
@@ -730,7 +763,7 @@ class ControlPlaneServer:
             last = copy.deepcopy(self._deployments_last)
         view["plans"] = last.pop("tracks")
         view["coordinator"] = {**last, "interval_s": DEPLOYMENTS_TICK_S,
-                               "evidence": "unknown" if self.deployment_evidence is None else "configured"}
+                               **self._deployment_evidence_status()}
         view["actions"] = {"enabled": self.deployment_actions_enabled(),
                            "keyed": self._deployment_keyed(),
                            "refused": self._deployment_refusals.snapshot()}
@@ -738,6 +771,7 @@ class ControlPlaneServer:
         ledger = self.repo.deployment_escalations
         view["escalations"] = ledger.snapshot()
         for plan in view["plans"]:
+            plan["evidence_status"] = self._deployment_track_evidence(plan.get("track"))
             # the repair attempts the cap counts (the ledger), next to the coordinator's starts
             for name, row in (plan.get("components") or {}).items():
                 target = plan.get("target_commit")

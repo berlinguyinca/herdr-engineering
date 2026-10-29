@@ -31,10 +31,12 @@ sections:
       # deployment events for any component (the Deployments snapshot then carries a warning).
       # Set but invalid: the last valid set stays in use; events are refused (503) only when no
       # set was ever valid.
-      # NOTE: release evidence (the release asset's .commit and its ancestry on main) is NOT
-      # wired yet. Until it is, every permit answers false ("release not confirmed"), so a host
-      # updater with a gate URL (IW_DEPLOY_GATE_URL) freezes on its running version. Wire the
-      # evidence before enabling any host gate.
+      # NOTE: release evidence (the release asset's .commit and its ancestry on main) is read from
+      # GitHub with the github.token below (read only; the repository is private). Without a token,
+      # or while GitHub fails, it is unknown: every permit answers false ("release not confirmed"),
+      # so a host updater with a gate URL (IW_DEPLOY_GATE_URL) stays on its running version.
+      # A definition may carry `requires: [{repo, ci_context, stage}]` to hold its track until that
+      # stage of another follows track is rolled out (see the README, "Cross-track order").
       # deployment_definitions: "/srv/inferweave/deploy/pipelines"
       # OPTIONAL: true enables the audited Deployments actions (POST /api/deployments/force and
       # /ack, operator role). Read live; anything but true is off. Force only records a request the
@@ -182,6 +184,8 @@ sections:
   github:
     roles: [ci]
     values:
+      # Also the deployment release evidence: needs read access to InferWeave/inferweave
+      # (releases, compare); issue write only if deployment_escalation.issues is true.
       token: "REDACTED"
 
   # Posted by every host's feeds as the control-plane API key (role ingest).
