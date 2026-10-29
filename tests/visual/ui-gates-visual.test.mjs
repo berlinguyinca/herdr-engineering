@@ -138,6 +138,9 @@ const TEETH = [
   ['the steering request buttons are hidden', 'collab-lineage', 'ul.wb-steers button { visibility: hidden !important }', ['wbsteers']],
   ['the steering form submit button is hidden', 'collab-lineage', 'form[data-wb-form="propose"] > button { visibility: hidden !important }', ['wbpropose']],
   ['the lineage node boxes lost their borders', 'collab-lineage', '.lin-box { stroke: transparent !important }', ['node', 'graph']],
+  ['the Approve and Reject buttons of the assistant proposals are hidden', 'dashboard-assistant-proposals', '[data-papprove], [data-preject] { visibility: hidden !important }', ['panel']],
+  ['the Missions progress bars are hidden', 'dashboard-missions', '.mc-progress progress { visibility: hidden !important }', ['groups']],
+  ['the notification acknowledge buttons are hidden', 'dashboard-assistant-notifications', '[data-nack] { visibility: hidden !important }', ['panel']],
   ['a failed node is painted the wrong colour', 'collab-lineage', '.lin-node--failed .lin-box { fill: #ccc !important }', ['graph']],
 ];
 for (const [name, slug, css, regions] of TEETH) {
