@@ -186,3 +186,35 @@ def test_visibility_rule_mirrors_graph_can_see():
             label = label_args if scope in ("room", "mission") else scope
             want = graph.can_see(pr, label, frozenset(writers) if writers else None)
             assert bool(core.visible(pr, row)) == want, (pr, row)
+
+
+def test_real_session_ingest_rows_carry_room_workspace_and_agent_instance_ids_into_the_graph():
+    """Through the REAL ingest path: the envelope row ``session.started`` keeps the ids; the server's derived ``SessionStarted``
+    row has none and must neither widen nor narrow the scope the envelope declared."""
+    from herdr_engineering.control_plane.ingest import IngestService
+    from herdr_engineering.control_plane.repo import ControlPlaneRepo
+    repo = ControlPlaneRepo()
+    svc = IngestService(repo)
+    who = {"id": "key:pi", "kind": "ingest", "authenticated_by": "api_key"}
+    base = {"schema_version": 2, "source": "pi", "entity_type": "session", "entity_id": "sess-9", "room_id": "r1",
+            "workspace_id": "ws-1", "agent_id": "agent-7", "visibility_scope": "room", "task_id": "t-1",
+            "payload": {"agent_instance_id": "inst-3", "mission_id": "M1", "agent_role": "worker"}}
+    svc.ingest({**base, "event_id": "pi-s1", "source_sequence": 1, "event_type": "session.started"}, who)
+    svc.ingest({**base, "event_id": "pi-s2", "source_sequence": 2, "event_type": "session.stopped"}, who)
+    rows = [e for k, v in repo._events.items() if k[0] == "session" for e in v]
+    assert {e["event_type"] for e in rows} >= {"session.started", "SessionStarted"}      # envelope row + derived row
+    p = core.Projection()
+    p.apply_all(rows)
+    d = p.dump()
+    s = d["entities"][wc.urn_for("agent_session", "sess-9")]
+    assert s["visibility"] == "room" and s["room_ids"] == ["r1"]
+    assert s["attrs"]["workspace_id"] == "ws-1" and s["attrs"]["agent_instance_id"] == "inst-3" and s["attrs"]["agent_id"] == "agent-7"
+    fact = [f for f in d["facts"].values() if f["fact_kind"] == "agent_session"]
+    assert len(fact) == 1 and fact[0]["open"] is False and fact[0]["subject_ref"] == "agent:agent-7"
+    assert fact[0]["segments"][0]["attrs"]["agent_instance_id"] == "inst-3"
+    spawned = {(e["from_id"]) for e in d["edges"].values() if e["edge_type"] == "spawned"}
+    assert wc.urn_for("task", "t-1") in spawned and wc.urn_for("mission", "M1") in spawned
+    # replay in any order gives the same graph
+    q = core.Projection()
+    q.apply_all(list(reversed(rows)))
+    assert q.digest() == p.digest()

@@ -275,9 +275,19 @@ def _collab_ops(ev: dict) -> list[dict]:
     return ops
 
 
+_SESSION_STARTS = {"sessioncreated": "created", "session.created": "created", "sessionstarted": "active",
+                   "session.started": "active", "session.resumed": "active"}
+_SESSION_STOPS = {"sessionstopped": "stopped", "session.stopped": "stopped", "sessionended": "stopped",
+                  "session.ended": "stopped", "session.exited": "stopped", "session.closed": "stopped"}
+
+
 def _session_ops(ev: dict) -> list[dict]:
-    """Pi / Herdr session events.  Accepts the Pi ingest fields (docs/.../contracts/PI_INGEST_FIELDS.md) from the envelope
-    columns OR the payload; every one of them is optional (a session without a room is private to its writer)."""
+    """Pi / Herdr session events (the envelope row ``session.started`` AND the server's derived ``SessionStarted``).
+
+    Accepted ids (docs/specs/.../contracts/PI_INGEST_FIELDS.md), each from the envelope column OR the payload, each
+    optional: ``room_id``, ``workspace_id``, ``agent_id`` (the HCN agent), ``agent_instance_id`` (the Pi process),
+    ``mission_id``, ``task_id``, ``project_id``.  A derived row carries no scope; it then writes NO scope fields, so it can
+    neither widen nor narrow what the envelope row said.  A session no source scoped stays private to its writer."""
     t, p = ev["event_type"], ev["payload"]
     sid = ev["entity_id"] or _text(p.get("session_id"))
     if not sid:
@@ -285,30 +295,32 @@ def _session_ops(ev: dict) -> list[dict]:
 
     def pick(name):
         return _text(ev.get(name)) or _text(p.get(name))
-    rid, wid, inst = pick("room_id"), pick("workspace_id"), pick("agent_instance_id") or pick("agent_id")
+    rid, wid, inst, agent = pick("room_id"), pick("workspace_id"), pick("agent_instance_id"), pick("agent_id")
     mid, tid, pid = pick("mission_id"), pick("task_id"), pick("project_id")
     actor = ev.get("actor_id")
+    scoped = ev.get("visibility_scope") in VIS_ORDER or bool(rid)
     vis = _vis_for(ev, [rid] if rid else [])
     if vis in ("room", "mission") and not rid:
         vis = "private"
-    sc = _scope(vis, rooms=[rid] if rid else (), grantees=[actor] if actor and vis == "private" else (), project=pid)
-    status = {"SessionCreated": "created", "SessionStarted": "active", "SessionStopped": "stopped",
-              "SessionEnded": "stopped"}.get(t) or _text(p.get("status"), 64)
-    ops = [ent("agent_session", sid, status=status, display_name=_text(p.get("agent_role")) or sid, **sc,
-               attrs={"workspace_id": wid, "agent_instance_id": inst, "model": _text(p.get("model"), 128),
+    sc = _scope(vis, rooms=[rid] if rid else (), grantees=[actor] if actor and vis == "private" else (), project=pid) if scoped else \
+        _scope(None, grantees=[actor] if actor else (), project=pid)
+    key = t.lower()
+    status = _SESSION_STARTS.get(key) or _SESSION_STOPS.get(key) or _text(p.get("status"), 64)
+    ops = [ent("agent_session", sid, status=status, display_name=_text(p.get("agent_role")), **sc,
+               attrs={"workspace_id": wid, "agent_instance_id": inst, "agent_id": agent, "model": _text(p.get("model"), 128),
                       "agent_role": _text(p.get("agent_role"), 64), "room_id": rid}, aliases=[("pi_session", sid)])]
     if mid:
         ops.append(edge("spawned", ("mission", mid), ("agent_session", sid), **sc))
     if tid:
         ops.append(edge("spawned", ("task", tid), ("agent_session", sid), **sc))
-    if inst:
-        ops.append(ent("agent", inst, "ensure", **sc))
-        ops.append(fact("agent_session", f"agent:{inst}", ("agent_session", sid),
-                        "close" if status == "stopped" else "open", workspace_id=wid, room_id=rid, **sc))
-    elif status in ("active", "created"):
-        ops.append(fact("agent_session", "agent:unknown", ("agent_session", sid), "open", workspace_id=wid, room_id=rid, **sc))
-    elif status == "stopped":
-        ops.append(fact("agent_session", "agent:unknown", ("agent_session", sid), "close", workspace_id=wid, room_id=rid, **sc))
+    who = (("agent", agent) if agent else None)
+    subject = f"agent:{agent}" if agent else (f"agent_instance:{inst}" if inst else None)
+    if who:
+        ops.append(ent("agent", agent, "ensure", **sc))
+    if subject and (key in _SESSION_STARTS or key in _SESSION_STOPS):
+        # historical fact: when an agent (instance) held a session; closed on stop, never deleted
+        ops.append(fact("agent_session", subject, ("agent_session", sid), "close" if key in _SESSION_STOPS else "open",
+                        workspace_id=wid, room_id=rid, agent_instance_id=inst, **sc))
     return ops
 
 

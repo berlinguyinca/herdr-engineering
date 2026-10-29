@@ -5,6 +5,12 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Unified workspace P02: persistent Work Graph and reconciliation (flag off by default)
+- Migrations `0031_event_trace_id.sql` (nullable `fabric_events.trace_id`, `Event.trace_id`, envelope `trace_id`) and `0032_work_graph.sql` (`wg_*` tables: event ledger, assertions, entities + aliases, typed edges with intervals and unique `(type, from, to)`, historical facts, layouts, cursor, gaps). Additive, idempotent, `-- DOWN:`.
+- `work_graph_core` (pure fold: idempotent, order-tolerant, per-field merge, tombstones that cannot be resurrected, immutable artifact versions), `work_graph_store` (Postgres, ACL inside every statement, cursor paging, search, snapshot by root, `as_of`, facts, layouts with ETag/If-Match), `work_graph_sync` (sources, reconciler with orphan check in both directions, replay-from-clean with `snapshot_required`, worker), `work_graph_service` (sync facade + request handler).
+- New `GET/POST /api/v1/graph/work/*` and `/api/v1/collab/graph/work/*` behind `control_plane.unified_workspace.enabled`; 404 when off, 503 without Postgres. The lineage graph vocabulary gains the owned kinds `project team artifact_version external_action` and edges `contains derived_from discussed_in approved_by notified_via`.
+- Contract: `docs/contracts/work-graph-v1.md`; Pi session-ingest ids: `docs/specs/herdr-unified-workspace-20261028/contracts/PI_INGEST_FIELDS.md`.
+
 ### Unified workspace P01: contracts, ids and the capability/action broker (library only, flag off)
 - New `schemas/workspace-v1.schema.json` (JSON Schema 2020-12) for project, team, room, mission, issue, task, agent, agent_session, host, artifact, artifact_version, review, decision, external_action, event and the 14 typed edges, with canonical ids `urn:herdr:<kind>:<uuid>` (uuid5 over the native id, so every host agrees), aliases, scope, version/ETag, trace/correlation/causation ids and reference URIs. Contract table and graph.py mapping: `docs/contracts/unified-workspace-v1.md`.
 - New `herdr_engineering/control_plane/workspace_contracts.py`: id/alias canonicalisation, validators, ETag compare-and-swap, idempotency tokens, a discover/authorize/approve/invoke broker (user role, agent delegation, room grant, artifact grant, account grant and risk policy are intersected; room membership never grants shell or external-account access), untrusted-content tainting, ACL re-check hooks for traversal, search, export and subscriptions, and the replay-cursor contract.
