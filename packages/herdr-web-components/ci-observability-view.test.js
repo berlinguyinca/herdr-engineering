@@ -233,6 +233,25 @@ test('review: exact project identity reaches Runs, health, report and cache char
  assert.deepEqual(JSON.parse(value),['https://ci.example','17','org/current']);
 }));
 
+test('review: project selection synchronizes unchanged Runs options immediately, including clearing',()=>reviewPage(async page=>{
+ await page.evaluate(()=>mount());
+ await page.locator('[data-ob-project]').first().waitFor();
+ await page.waitForFunction(()=>document.querySelector('[data-ci-repository]').options.length===3);
+ const states=await page.evaluate(()=>{
+  const select=document.querySelector('[data-ci-repository]'),options=select.innerHTML;
+  return ['org/current','org/former',null].map(repository=>{
+   const button=repository?[...document.querySelectorAll('[data-ob-project]')].find(node=>node.textContent===repository):document.querySelector('[data-ob-clear]');
+   button.click();
+   return {value:select.value,sameNode:select===document.querySelector('[data-ci-repository]'),sameOptions:select.innerHTML===options};
+  });
+ });
+ assert.deepEqual(states,[
+  {value:JSON.stringify(['https://ci.example','17','org/current']),sameNode:true,sameOptions:true},
+  {value:JSON.stringify(['https://ci.example','17','org/former']),sameNode:true,sameOptions:true},
+  {value:'',sameNode:true,sameOptions:true},
+ ]);
+}));
+
 test('review: Runs repository selection updates command center and health with exact identity in both directions',()=>reviewPage(async page=>{
  await page.evaluate(()=>mount());await page.locator('[data-ob-project]').first().waitFor();
  await page.locator('[data-ci-workspace="runs"]').click();
@@ -504,4 +523,17 @@ for(const [date,counts] of [['2026-10-25',[2,4,5,4,0]],['2026-10-24',[4,2,0,0,0]
  }
  assert.deepEqual([initial.start,initial.end],[`${date}T12:00:00.000Z`,`${date}T13:00:00.000Z`]);
  await page.evaluate(()=>app.dispose());
+}));
+
+test('overview lists the projects with the most failed runs; choosing one opens Projects with it selected, and the tiles say what they cover',()=>reviewPage(async page=>{
+ await page.evaluate(()=>{fixture.projects=fixture.projects.map((p,i)=>({...p,failure_count:i?1:9,completed_count:i?1:9}));});
+ await page.evaluate(async()=>{const {mountIntegrations}=await import('/packages/integrations-view.js');window.app=mountIntegrations(document.querySelector('main'),client);});
+ await page.locator('[data-ci-workspace="overview"][aria-selected="true"]').waitFor();
+ const worst=page.locator('[data-ob-worst] button');await worst.first().waitFor();
+ assert.equal(await worst.first().textContent(),'org/current','the project with the most failures is first');
+ assert.match(await page.locator('[data-ob-worst]').textContent(),/9 failed of 9/);
+ assert.match(await page.locator('[data-ob-caption]').textContent(),/Last 14 days.*Needs attention lists only failures no later run has fixed/);
+ await worst.first().click();
+ assert.equal(await page.locator('[data-ci-workspace="health"]').getAttribute('aria-selected'),'true');
+ assert.equal(await page.locator('[data-ob-project][aria-pressed="true"]').textContent(),'org/current');
 }));

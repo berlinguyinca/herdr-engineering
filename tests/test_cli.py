@@ -160,8 +160,13 @@ def test_feed_pi_once_posts_snapshot(pi_feed_server, pi_feed_snapshot, monkeypat
     base, repo = pi_feed_server
     monkeypatch.setenv("HERDR_CP_INGEST_KEY", "cli-ingest-secret")
     before = pi_feed_snapshot.read_bytes()
+    real_sleep = time.sleep
+    cli_thread = threading.current_thread()
 
-    def no_sleep(_seconds):
+    def no_sleep(seconds):
+        # The HTTP server's maintenance threads still need their real sleeps.
+        if threading.current_thread() is not cli_thread:
+            return real_sleep(seconds)
         pytest.fail("once mode must not sleep")
 
     monkeypatch.setattr(time, "sleep", no_sleep)
@@ -214,9 +219,10 @@ def test_feed_pi_interval_rereads_snapshot(pi_feed_server, pi_feed_snapshot, mon
     monkeypatch.setenv("HERDR_CP_INGEST_KEY", "cli-ingest-secret")
     waits = []
     real_sleep = time.sleep
+    cli_thread = threading.current_thread()
 
     def next_cycle(seconds):
-        if threading.current_thread() is not threading.main_thread():
+        if threading.current_thread() is not cli_thread:
             return real_sleep(seconds)
         waits.append(seconds)
         if len(waits) == 2:

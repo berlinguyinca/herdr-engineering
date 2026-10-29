@@ -162,7 +162,7 @@ const styles=`<style>
 @media(max-width:900px){.ig-layout:has(.ig-inspector:not([hidden])){grid-template-columns:minmax(0,1fr)}.ig-inspector{grid-row:1}}@media(max-width:550px){.ig-row{grid-template-columns:minmax(0,1fr);gap:8px}.ig-state{max-width:none}}
 </style>`;
 const commandCenterStyles=`<style>
-.ci-workspace-tabs{margin:8px 0 20px}.ig-group,.ig-inspector{box-shadow:var(--shadow-sm,0 2px 8px #0001)}.ig-inspector{border-top:3px solid var(--accent)}.ci-slot-detail{animation:ci-slot-in .18s ease-out}@keyframes ci-slot-in{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
+.ci-workspace-tabs{margin:8px 0 20px}.ig-group,.ig-inspector{box-shadow:var(--shadow)}.ig-inspector{border-top:3px solid var(--accent)}.ci-slot-detail{animation:ci-slot-in .18s ease-out}@keyframes ci-slot-in{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
 </style>`;
 
 export function mountIntegrations(container,client,{kind='ci',tab='current',search='',repository='',provider='',mission='',session='',workspace:startWorkspace=''}={}) {
@@ -208,6 +208,7 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
     if(slot)slot.append(el('.ig-inspector'));
     if(typeof client.getCiSummary==='function') {
       observabilityView=mountCiObservability(el('[data-ci-observability]'),client,{repository,provider,mission,session,search:search||undefined,
+        onProjectPicked:()=>{workspace='health';draw();},
         onContext:context=>{
           healthView?.setObservabilityContext(context);
           applyCiContext(context);
@@ -227,10 +228,10 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
     nav.innerHTML=WORKSPACES.map((key,index)=>`<button type="button" role="tab" data-ci-workspace="${key}" id="ci-workspace-tab-${key}" aria-controls="ci-workspace-${key}" aria-selected="${index===0}" tabindex="${index===0?0:-1}">${LABELS[key]}<span class="ci-tab-badge" data-ci-badge="${key}" hidden></span></button>`).join('');
     el('[data-ci-attention]').before(nav);
     for(const key of WORKSPACES){const panel=document.createElement('section');panel.id=`ci-workspace-${key}`;panel.setAttribute('role','tabpanel');panel.setAttribute('aria-labelledby',`ci-workspace-tab-${key}`);panel.hidden=key!==workspace;panels[key]=panel;container.append(panel);}
-    panels.overview.append(el('[data-ci-attention]'),el('[data-ob-summary]'));
+    panels.overview.append(el('[data-ci-attention]'),el('[data-ob-summary]'),el('[data-ob-worst]'));
     panels.health.append(el('[data-ci-observability]'),el('[data-ci-health]'));
     panels.tests.append(el('[data-ob-tests-block]'));
-    observabilityView?.adopt(el('[data-ob-summary]'));observabilityView?.adopt(el('[data-ob-tests-block]'));
+    observabilityView?.adopt(el('[data-ob-summary]'));observabilityView?.adopt(el('[data-ob-worst]'));observabilityView?.adopt(el('[data-ob-tests-block]'));
     for(const selector of ['.ig-tabs:not(.ci-workspace-tabs)','.ig-controls:not(.ci-report-filters)','.ci-report-filters','[data-ci-insights]','[data-ci-charts]','[data-ig-count]','.ig-layout','.ig-pages','[data-ig-runners]']){
       const node=el(selector);if(!node)continue;if(selector==='.ci-report-filters'){nav.after(node);continue;}panels[selector==='[data-ci-insights]'?'tests':'runs'].append(node);
     }
@@ -340,6 +341,7 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
         if(selectedValue)values.set(selectedValue,values.get(selectedValue)||selectedValue);
         const options=`<option value="">${label}</option>`+[...values].sort((a,b)=>a[1].localeCompare(b[1])).map(([value,label])=>`<option value="${esc(value)}">${esc(label)}</option>`).join('');
         if(select.innerHTML!==options)morph(select,options);
+        // Shared selection can change while the available options stay identical.
         if(select.value!==selectedValue)select.value=selectedValue;
       }
     }
