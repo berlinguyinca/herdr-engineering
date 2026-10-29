@@ -241,3 +241,13 @@ def redact_ingest_body(body: Any) -> Any:
         if key in payload:
             out["payload"][key] = redact_values(payload[key])
     return out
+
+
+def rules_fingerprint() -> str:
+    """Stable digest of every redaction rule. A stored projection built under different rules is stale."""
+    import hashlib
+    h = hashlib.sha256()
+    for pattern in _PATTERNS:
+        h.update(f"{pattern.flags}:{pattern.pattern}\0".encode())
+    h.update("|".join(_SECRET_KEY_HINTS).encode() + b"\0" + "|".join(sorted(_PLAIN_KEYS)).encode())
+    return h.hexdigest()
