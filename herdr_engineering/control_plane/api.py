@@ -263,7 +263,7 @@ class ControlPlaneServer:
                  architecture_enabled=None, architecture_explain=None, architecture_options=None,
                  request_workers=128, request_queue=256,
                  assistant_service=None, assistant_config=None, fabric_resolver=None, fabric_services=None, fabric_names=None,
-                 scheduler_admission=False, scheduler_limits=None):
+                 scheduler_admission=False, scheduler_limits=None, skill_registry=None):
         """
         Auth (Spec §104): either a single `api_key` (all-access) or a mapping
         `api_keys={key: role}` with roles "viewer" (read-only) / "operator"
@@ -303,7 +303,8 @@ class ControlPlaneServer:
         self.attention = None
         if self.attention_config["enabled"] and not collab_only:
             self.attention = AttentionInbox(repo, config=self.attention_config, health=self._health,
-                                            ci_snapshot=self.ci_monitor.snapshot, ci_fix=self.ci_fix)
+                                            ci_snapshot=self.ci_monitor.snapshot, ci_fix=self.ci_fix,
+                                            handoffs=lambda: getattr(self, "handoffs", None))
         if github_monitor is None:
             # control-plane-web only (the worker never builds a server): the GitHub
             # catalog persists in control_plane.pg_dsn when set, else in memory.
@@ -336,6 +337,11 @@ class ControlPlaneServer:
         self.artifact_job_manager = artifact_job_manager
         self.artifact_review_manager = artifact_review_manager
         self.artifact_acl = artifact_acl
+        # control_plane.skill_registry (flag off by default: nothing is constructed and the routes answer 404).
+        from .skill_routes import build_skill_registry
+        self.skills, self.skill_transfer = build_skill_registry(
+            skill_registry, artifact_store=artifact_store, rustfs=rustfs, acl=artifact_acl,
+            record_event=repo.record_event)
         from .handoffs import HandoffRegistry
         self.handoffs = handoff_registry or HandoffRegistry(repo)
         from .scheduler_service import SchedulerService
@@ -473,9 +479,9 @@ class ControlPlaneServer:
         self.architecture_require_host_binding = arch_opts["require_host_binding"]
         self.architecture_agent_hosts = {}
         for key, hosts in arch_opts["agent_hosts"].items():
-            if self._keys.get(key) != "agent":
+            if self._keys.get(key) not in ("agent", "ingest"):
                 raise ValueError("control_plane.architecture.agent_hosts: each entry must name a configured "
-                                 "api key with the agent role")
+                                 "api key with the agent or ingest role")
             digest = hashlib.sha256(key.encode()).hexdigest()[:12]
             self.architecture_agent_hosts[f"key:{digest}"] = frozenset(hosts)
         self.architecture.gate_store_fn = lambda: self.gate_store
@@ -773,6 +779,8 @@ class ControlPlaneServer:
             h["capabilities"].append("assistant_v1")
         if getattr(self, "intelligence", None) is not None and self.intelligence._cfg()[0]["enabled"]:
             h["capabilities"].append("project_intelligence_v1")
+        if getattr(self, "skills", None) is not None:
+            h["capabilities"].append("skill_registry_v1")
         if self.architecture.enabled:
             h["capabilities"].append("architecture_v1")
             if self.architecture.explain_config:
@@ -1777,6 +1785,9 @@ def _make_handler(server, public=False, operator=False):
                 from .artifact_registry_api import route_registry
                 if route_registry(self, server, parts, resource):
                     return None
+                from .skill_routes import route_skills
+                if route_skills(self, server, parts, resource):
+                    return None
                 if self.command == "GET":
                     return self._api_get(parts, resource)
                 return self._api_post(parts, resource)
@@ -2469,7 +2480,11 @@ def _make_handler(server, public=False, operator=False):
                         active=_q(self.path, "active") == "1"))
                 if what:
                     return self._json({"error": "not found"}, 404)
-                from .project_links import annotate_ci, cached_github_languages, mark_merged_pull_requests
+                from .project_links import (
+                    annotate_ci,
+                    cached_github_languages,
+                    mark_merged_pull_requests,
+                )
                 return self._json(mark_merged_pull_requests(annotate_ci(server.ci_monitor.snapshot(), r,
                     repository_languages=cached_github_languages(server.github_monitor)), server.gate_store))
             if resource == "reviews":
@@ -2804,6 +2819,12 @@ def _make_handler(server, public=False, operator=False):
                 host_id = body.get("host_id") if isinstance(body, dict) else None
                 if not isinstance(host_id, str) or not host_id or len(host_id) > 253:
                     return self._json({"ok": False, "error": "host_id is required"}, 400)
+                # A key bound in control_plane.architecture.agent_hosts acts only for its own hosts.
+                bound = (server.architecture_agent_hosts.get(self._principal()["id"])
+                         if self._role() in ("agent", "ingest") else None)
+                if (bound is None and self._role() == "agent" and server.architecture_require_host_binding
+                        or bound is not None and host_id not in bound):
+                    return self._json({"ok": False, "error": "this API key may not act for that host"}, 403)
                 if reports is None or not reports.enabled:
                     if parts[5] == "publish":
                         return self._json({"ok": False, "error": "Full session reports are not enabled.",

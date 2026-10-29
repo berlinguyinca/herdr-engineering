@@ -280,10 +280,11 @@ class SummaryReportService:
             raise ReportRefused(400, "session_id and operation_id are required")
         with self._lock:
             job = self._adopt(session_id)
-        if job is None or job["operation_id"] != operation_id:
-            return 200, {"ok": True, "replayed": True}          # already finished (or expired): nothing to store
-        if job["host_id"] != host_id:
-            raise ReportRefused(403, "this request belongs to another host")
+            if job is None or job["operation_id"] != operation_id or job.get("finishing"):
+                return 200, {"ok": True, "replayed": True}      # already finished (or expired): nothing to store
+            if job["host_id"] != host_id:
+                raise ReportRefused(403, "this request belongs to another host")
+            job["finishing"] = True                             # a concurrent duplicate result must not store twice
         if body.get("ok") is True:
             try:
                 report = runner.validate_report(body.get("report") if isinstance(body.get("report"), str) else "")
