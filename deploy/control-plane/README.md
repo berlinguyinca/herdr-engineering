@@ -216,6 +216,65 @@ disabled by default and ordinary deploys never download or start it. See
 [agent summary model operations](../../docs/operations/agent-summary-model.md) for
 explicit provisioning, central configuration, health checks and removal.
 
+## Deployment definitions (`deploy/pipelines` sync)
+
+InferWeave owns the pipeline definitions (`deploy/pipelines/<component>.yaml` in `InferWeave/inferweave`).
+`control-plane-web`, their only reader, sees them read-only at `/etc/herdr/pipelines/`, bind-mounted from
+`~/.local/share/herdr-engineering/pipelines/` on the deploy host. Turn them on with one line under
+`sections.control_plane.values` of the central fleet file:
+
+```yaml
+sections:
+  control_plane:
+    values:
+      deployment_definitions: "/etc/herdr/pipelines"
+```
+
+The key is read live (no redeploy). A set loads all-or-nothing; an invalid one keeps the last good set in use.
+
+- **deploy.sh** creates the directory empty (0755) on a real deploy, never on `--dry-run`, and refuses to deploy
+  unless it is a real directory owned by the deploying user, not writable by group/other, holding only regular
+  `*.yaml` files (no symlinks or subdirectories, at most 256, each at most 64 KiB, none group/other-writable).
+  Every real deploy installs (and a failed one restores) `pipelines-sync.sh`, a copy of the validator
+  `herdr_engineering/control_plane/deployment_definitions.py` from the deployed commit, and the user units
+  `herdr-pipelines-sync.service` + `.timer`.
+- **The timer** runs `pipelines-sync.sh once` about 20 s after it starts and then every 5 minutes. Runs never
+  overlap (`flock` on `pipelines.lock`); git calls are bounded with `timeout`, the unit with `TimeoutStartSec`.
+  Each run fetches `main` into a dedicated bare, blob-less clone
+  (`~/.local/share/herdr-engineering/inferweave-pipelines.git`; it never has a working tree, and only the
+  blobs of `deploy/pipelines` are downloaded). It takes ONLY the regular `*.yaml` files directly under
+  `deploy/pipelines/` (symlinks, subdirectories, `validate.py` and other files are skipped) and validates them
+  with herdr's own `validate_dir` in a staging directory next to the mount. Only a set that passes replaces
+  the mounted files: changed files are renamed in one at a time, then removed definitions are deleted. A failed
+  fetch, a file over 64 KiB, more than 256 files, an empty set or any validation error keeps the previous set
+  and fails the unit (see the journal). The mounted directory itself is never replaced, because a bind mount
+  pins its inode. The commit in use is written to `~/.local/share/herdr-engineering/pipelines.commit`.
+- **Authentication** is ssh as the deploying user: the remote is `git@github.com:InferWeave/inferweave.git`,
+  with `BatchMode=yes` and no prompts. No token is used or stored. The user's ssh key must be able to read the
+  repository without an agent or passphrase prompt (the timer has neither), and `github.com` must be in
+  `~/.ssh/known_hosts`. The lab `~/.gitconfig` rewrites https GitHub URLs to ssh, so an https remote ends up
+  on ssh as well. User timers run while the user is logged in unless lingering is on
+  (`loginctl enable-linger`).
+
+Verify after a deploy:
+
+```bash
+systemctl --user start herdr-pipelines-sync.service       # or wait for the timer
+journalctl --user -u herdr-pipelines-sync -n 20            # "pipelines: <commit> N definitions, ..."
+ls -l ~/.local/share/herdr-engineering/pipelines/          # only *.yaml, 0644
+docker exec herdr-cp-web ls /etc/herdr/pipelines           # the same files, read-only
+```
+
+On the **Deployments** page, the definitions status must say configured and loaded, with no warning.
+`no deployment definitions loaded` means the key is not set. `configured but invalid` means no set was ever
+valid. `have errors: the last good set is still in use` means the current files fail and the page lists the
+errors. The component groups (stages) come from the definitions. The same status is in
+`GET /api/v1/deployments` under `definitions` (`configured`, `loaded`, `errors`, `warning`).
+
+Run once by hand (same flags as the unit's `ExecStart`): `~/.local/share/herdr-engineering/pipelines-sync.sh once`.
+To roll back, drop `deployment_definitions` from the fleet file (the key is read live), then
+`systemctl --user disable --now herdr-pipelines-sync.timer`.
+
 ## Deployment actions (force redeploy, permit gate, ack)
 
 Hosts pull and herdr never holds a production credential: a force redeploy only **records a
