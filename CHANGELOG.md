@@ -5,6 +5,11 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Unified workspace P01: contracts, ids and the capability/action broker (library only, flag off)
+- New `schemas/workspace-v1.schema.json` (JSON Schema 2020-12) for project, team, room, mission, issue, task, agent, agent_session, host, artifact, artifact_version, review, decision, external_action, event and the 14 typed edges, with canonical ids `urn:herdr:<kind>:<uuid>` (uuid5 over the native id, so every host agrees), aliases, scope, version/ETag, trace/correlation/causation ids and reference URIs. Contract table and graph.py mapping: `docs/contracts/unified-workspace-v1.md`.
+- New `herdr_engineering/control_plane/workspace_contracts.py`: id/alias canonicalisation, validators, ETag compare-and-swap, idempotency tokens, a discover/authorize/approve/invoke broker (user role, agent delegation, room grant, artifact grant, account grant and risk policy are intersected; room membership never grants shell or external-account access), untrusted-content tainting, ACL re-check hooks for traversal, search, export and subscriptions, and the replay-cursor contract.
+- Capability `unified_workspace_v1` in `/api/v1/health`, only when `control_plane.unified_workspace.enabled: true` (YAML, default off). No existing route, table or graph vocabulary changes; nothing calls the broker yet. `jsonschema` joins the `dev` extra for the contract tests.
+
 ### Skill registry on registry artifacts (flag off)
 - `control_plane.skill_registry.enabled` (YAML, default false) adds `/api/v1/skills` publish, search, get, 60-second transfer capability, download and install receipt. Skills are `artifact_type='skill'` registry artifacts (immutable versions, signed package in RustFS, sharing = artifact ACL grant); no new tables, no CSP change. Extracted from #366. See `docs/contracts/skill-registry.md`.
 

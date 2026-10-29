@@ -723,6 +723,7 @@ def test_fleet_config_takes_one_snapshot_per_request(tmp_path, acknowledged_sink
     store = FlippingStore()
     svr = ControlPlaneServer(ControlPlaneRepo(sink=acknowledged_sink), fleet_config=store)
     store.calls = 0  # construction reads the review_gate section once; count requests only
+    svr._deployments_stop.set()  # the deployment tick reads the config on its own thread; count requests only
     threading.Thread(target=svr.serve, daemon=True).start()
     svr.wait_until_ready()
     try:

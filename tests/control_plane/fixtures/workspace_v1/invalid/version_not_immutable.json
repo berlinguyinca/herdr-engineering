@@ -1,0 +1,38 @@
+{
+  "doc": {
+    "actor": {
+      "id": "alice",
+      "kind": "user"
+    },
+    "aliases": [
+      {
+        "system": "hcn",
+        "value": "artifact_version-1"
+      }
+    ],
+    "artifact_id": "urn:herdr:artifact:a912246f-649c-5cf8-a93d-06e023bc0eca",
+    "blob_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "causation_id": "ev-0",
+    "correlation_id": "co-1",
+    "created_at": "2026-10-28T12:00:00Z",
+    "etag": "sha256:cced1c0b69dc3e62410ed62b63106070c5e1ac042e144f00a796d6e000fb6f14",
+    "id": "urn:herdr:artifact_version:06fa827e-0651-51b6-a2e4-d700694ffff4",
+    "immutable": false,
+    "kind": "artifact_version",
+    "ordinal": 1,
+    "refs": [
+      "herdr://rooms/room-1"
+    ],
+    "scope": {
+      "room_id": "room-1",
+      "tenant_id": "t1",
+      "visibility": "room"
+    },
+    "source_sequence": 7,
+    "trace_id": "tr-1",
+    "updated_at": "2026-10-28T12:00:00Z",
+    "version": 1
+  },
+  "expect_keyword": "const",
+  "schema": "artifact_version"
+}
