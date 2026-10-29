@@ -32,6 +32,8 @@ from .deployment_actions import ENTITY_TYPE as DEPLOYMENT_REQUEST_ENTITY
 from .deployment_actions import ForceRequests
 from .deployment_coordinator import ENTITY_TYPE as DEPLOYMENT_PLAN_ENTITY
 from .deployment_coordinator import CoordinatorState
+from .deployment_escalation import ENTITY_TYPE as DEPLOYMENT_ESCALATION_ENTITY
+from .deployment_escalation import EscalationLedger
 from .deployments_monitor import ENTITY_TYPE as DEPLOYMENT_ENTITY
 from .deployments_monitor import DeploymentsMonitor
 from .envelope import SourceLedger, envelope_event_fields
@@ -229,6 +231,12 @@ class ControlPlaneRepo:
         self.deployment_plans = self._new_deployment_plans()
         # Operator force-redeploy requests the hosts pick up (deploy-4 Task 5): private too.
         self.deployment_requests = self._new_deployment_requests()
+        # The repair ledger and escalation records (deploy-4 Task 8): private too.
+        self.deployment_escalations = self._new_deployment_escalations()
+
+    def _new_deployment_escalations(self):
+        return EscalationLedger(persist=self._persist_deployments,
+                                persist_required=self._persist_deployments_required)
 
     def _new_deployment_requests(self):
         return ForceRequests(persist=self._persist_deployments,
@@ -3343,6 +3351,12 @@ class ControlPlaneRepo:
         self._event_order = [t for t in self._event_order if t[0] != DEPLOYMENT_REQUEST_ENTITY]
         self.deployment_requests = self._new_deployment_requests()
         self.deployment_requests.hydrate(request_rows)
+        escalation_rows = []
+        for key in [k for k in self._events if k[0] == DEPLOYMENT_ESCALATION_ENTITY]:
+            escalation_rows.extend(self._events.pop(key))
+        self._event_order = [t for t in self._event_order if t[0] != DEPLOYMENT_ESCALATION_ENTITY]
+        self.deployment_escalations = self._new_deployment_escalations()
+        self.deployment_escalations.hydrate(escalation_rows)
         # Host telemetry rollups/state ride a private stream: rebuild history and
         # put the latest record back on each host.
         metrics = []

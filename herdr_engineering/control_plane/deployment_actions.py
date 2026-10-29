@@ -33,8 +33,11 @@ these routes and nothing else):
   per component, so each host clears only its own.
 * ``DELETE /api/deployments/requests/<id>`` clears that host's entries of the request.
 * ``GET /api/deployments/permit?component=&commit=[&generation=]`` answers ``{permitted, reason,
-  generation, target_commit, forced, request_id}`` from the newest coordinator tick, with
-  no side effects. It is NOT behind the flag (a host gate that 404s would freeze every
+  generation, target_commit, forced, request_id[, repair]}`` from the newest coordinator tick,
+  with no side effects. ``repair`` (Task 8, additive) is ``{id, action: retry|restart|rollback,
+  attempt, reason, restart?, rollback_to?}``: herdr's one decided repair for a failed
+  component on the target. Hosts read it independently of ``permitted``, act on each ``id``
+  once, and refuse a ``rollback_to`` they do not hold locally. It is NOT behind the flag (a host gate that 404s would freeze every
   gated host); with the flag off, pending forces are ignored and the list is empty (the
   kill switch).
 
@@ -376,12 +379,14 @@ def _overridable(current, component_stage) -> bool:
 
 
 def permit_decision(meta, view, component, commit, force_id, *, now, component_stage=None,
-                    generation=None) -> dict:
+                    generation=None, repair=None) -> dict:
     """The host gate's answer (see the module docstring). ``meta`` is the last tick
     ({ticked_at, stale, error}); ``view`` that tick's track view for the component (None
     when the track has no plan); ``force_id`` a pending force entry for this component and
     commit (None when there is none or actions are off); ``component_stage`` its definition's
-    stage; ``generation`` the plan generation the host last saw (None: not checked)."""
+    stage; ``generation`` the plan generation the host last saw (None: not checked);
+    ``repair`` the escalation's decided repair for this component on the target (Task 8),
+    added as ``repair`` only once the tick is fresh and the commit and generation match."""
     ticked = meta.get("ticked_at")
     if ticked is None:
         return _deny("no coordinator tick yet")
@@ -396,15 +401,16 @@ def permit_decision(meta, view, component, commit, force_id, *, now, component_s
         return _deny("commit is not the plan target", view)
     if generation is not None and generation != view.get("generation"):
         return _deny("generation changed", view)
+    extra = {"repair": dict(repair)} if isinstance(repair, dict) else {}
     if component in (view.get("permitted") or ()):
-        return {**_deny("permitted by the plan", view), "permitted": True}
+        return {**_deny("permitted by the plan", view, **extra), "permitted": True}
     why = " ".join(str(x) for x in (current.get("type"), current.get("reason")) if x)
     if force_id is None:
-        return _deny(f"not permitted: {why}", view)
+        return _deny(f"not permitted: {why}", view, **extra)
     if not (view.get("release_confirmed") is True and view.get("target_on_main") is True
             and _overridable(current, component_stage)):
-        return _deny(f"a forced redeploy cannot override: {why}", view)
-    return {**_deny("forced redeploy", view), "permitted": True, "forced": True,
+        return _deny(f"a forced redeploy cannot override: {why}", view, **extra)
+    return {**_deny("forced redeploy", view, **extra), "permitted": True, "forced": True,
             "request_id": force_id}
 
 

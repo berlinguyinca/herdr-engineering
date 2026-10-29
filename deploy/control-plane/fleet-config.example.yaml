@@ -35,6 +35,11 @@ sections:
       # /ack, operator role). Read live; anything but true is off. Force only records a request the
       # host updaters pick up; the host permit gate (GET /api/deployments/permit) works either way.
       deployment_actions: false
+      # OPTIONAL: side effects of a deployment failure escalation (all off by default). issues: a
+      # GitHub issue per software finding (needs github.token with issue write access).
+      # deployment_escalation:
+      #   issues: false
+      #   assistant: false
       # OPTIONAL: head-bound post-PR review quorum (GET /api/v1/graph/nodes/{pr}/review-quorum).
       # Principal ids are the server-side `key:<digest>` actors; omit the block to turn it off.
       # review_quorum:

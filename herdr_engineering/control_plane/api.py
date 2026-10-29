@@ -336,6 +336,16 @@ class ControlPlaneServer:
         self._deployment_actions_lock = threading.Lock()
         self._deployment_refused_rows = AuditThrottle()
         self._deployment_refusals = RefusalCounter()
+        # Task 8: diagnosis, the repair ledger and escalation, run after each tick. The issue
+        # sink exists only with control_plane.deployment_escalation.issues: true (read per run);
+        # the Personal Assistant has no notification API yet, so its sink stays None and host
+        # findings take the fallback (stored report + attention item + feed event).
+        from .deployment_escalation import DeploymentEscalation, GitHubIssueSink
+        self.deployment_escalation = DeploymentEscalation(
+            ledger=lambda: self.repo.deployment_escalations, state=lambda: self.repo.deployment_plans,
+            monitor=lambda: self.repo.deployments, config=self._deployment_escalation_config,
+            diagnosis_config=self._deployment_diagnosis_config, issue_sink=GitHubIssueSink(),
+            alert=self._deployment_alert)
         # control_plane.missions (validated; outcomes are written when a mission ends, on by default).
         from .mission_outcome import MissionOutcomes, missions_config
         self.missions_config = missions_config(missions)
@@ -579,12 +589,13 @@ class ControlPlaneServer:
         exception type, so a broken tick can break neither ingest nor the page."""
         from .deployment_coordinator import track_views
         with self._deployments_tick_lock:
+            defs, results = {}, {}
             try:
                 defs = self.deployment_definitions.definitions()
                 now = time.time()
                 self.deployment_coordinator.last_evidence = {}
-                tracks = (track_views(self.deployment_coordinator.tick(), defs,
-                                      self.repo.deployment_plans, now,
+                results = self.deployment_coordinator.tick() if defs else {}
+                tracks = (track_views(results, defs, self.repo.deployment_plans, now,
                                       self.deployment_coordinator.last_evidence) if defs else [])
                 result = {"ticked_at": now, "tracks": tracks, "error": None, "stale": False}
                 if self._deployments_error_type is not None:
@@ -603,6 +614,48 @@ class ControlPlaneServer:
                               "stale": True}
             with self._deployments_lock:
                 self._deployments_last = result
+            if result["error"] is None and defs:
+                self._deployments_escalate(results, defs)
+
+    def _deployments_escalate(self, results, defs):
+        """Diagnose, decide repairs and escalate after the tick result is stored (its calls
+        are clamped to a budget well under the permit staleness). Never raises."""
+        try:
+            self.deployment_escalation.run(results, defs)
+        except Exception as exc:  # noqa: BLE001 - escalation must never break the tick
+            log.warning("deployment escalation failed: %s", type(exc).__name__)
+
+    def _deployment_secure_value(self, key):
+        """A ``control_plane`` value read failing closed (``secure_section``): None when absent
+        or unreadable."""
+        if self.fleet_config is None:
+            return None
+        from ..fleet_config import FleetConfigError
+        try:
+            return self.fleet_config.secure_section("control_plane").get(key)
+        except FleetConfigError:
+            return None
+
+    def _deployment_escalation_config(self):
+        from .deployment_escalation import EscalationConfig
+        try:
+            return EscalationConfig.from_mapping(self._deployment_secure_value("deployment_escalation"))
+        except (TypeError, ValueError):
+            log.warning("control_plane.deployment_escalation is invalid; escalation side effects stay off")
+            return EscalationConfig()
+
+    def _deployment_diagnosis_config(self):
+        from .deployment_diagnosis import DiagnosisConfig
+        try:
+            return DiagnosisConfig.from_mapping(self._deployment_secure_value("deployment_diagnosis"))
+        except (TypeError, ValueError):
+            log.warning("control_plane.deployment_diagnosis is invalid; AI diagnosis stays off")
+            return DiagnosisConfig()
+
+    def _deployment_alert(self, component, release, payload):
+        """The escalation's herdr event (shared feed): validated fields only, no host text."""
+        from .deployment_escalation import FEED_ENTITY, FEED_EVENT
+        self.repo.record_event(FEED_ENTITY, f"{component}:{release}"[:200], FEED_EVENT, payload)
 
     def _deployments_loop(self):
         while not self._deployments_stop.is_set():
@@ -622,6 +675,7 @@ class ControlPlaneServer:
                            "keyed": self._deployment_keyed(),
                            "refused": self._deployment_refusals.snapshot()}
         view["requests"] = self.repo.deployment_requests.pending()
+        view["escalations"] = self.repo.deployment_escalations.snapshot()
         return view
 
     # ------------------------------------------------ deployment actions (deploy-4 Task 5)
@@ -804,8 +858,12 @@ class ControlPlaneServer:
         last, view = self._deployment_track_view(d)
         force = (self.repo.deployment_requests.active(component, commit)
                  if self.deployment_actions_enabled() else None)
+        try:
+            repair = self.deployment_escalation.repair_for(component, (view or {}).get("target_commit"), d)
+        except Exception:  # noqa: BLE001 - no repair is the safe answer
+            repair = None
         return 200, permit_decision(last, view, component, commit, force, now=time.time(),
-                                    component_stage=d.stage, generation=generation)
+                                    component_stage=d.stage, generation=generation, repair=repair)
 
     def deployment_requests_for(self, host) -> list:
         """The host's pending force entries ([] with the flag off or no definitions)."""
@@ -2983,7 +3041,11 @@ def _make_handler(server, public=False, operator=False):
                         active=_q(self.path, "active") == "1"))
                 if what:
                     return self._json({"error": "not found"}, 404)
-                from .project_links import annotate_ci, cached_github_languages, mark_merged_pull_requests
+                from .project_links import (
+                    annotate_ci,
+                    cached_github_languages,
+                    mark_merged_pull_requests,
+                )
                 return self._json(mark_merged_pull_requests(annotate_ci(server.ci_monitor.snapshot(), r,
                     repository_languages=cached_github_languages(server.github_monitor)), server.gate_store))
             if resource == "reviews":

@@ -266,3 +266,27 @@ request** that the host updater picks up on its next poll. The routes (each also
   (fail closed) unless the last good file set `control_plane.config_failure_mode: last_good`. With `last_good`, a
   flag that was `true` keeps forces live: new force/ack requests are accepted and pending forces still permit.
 
+### Deployment failures: diagnosis, repairs, escalation
+
+After each coordinator tick, every component a `Halt` names is diagnosed (known patterns first, then the
+optional AI step of `control_plane.deployment_diagnosis`) over its redacted failure event.
+
+- **One repair per round.** The decided repair (`retry`, `restart` or `rollback`) is recorded in a repair ledger
+  per `component:release`, durably before it is used. A round covers the whole fleet of a component: failures
+  herdr received before the round was decided fold into it, so the attempt cap (3) counts rounds, not nodes.
+- **It reaches the host** as an additive `repair` field on the permit answer: `{id, action, attempt, reason,
+  restart?, rollback_to?}`. It is present only while that failure is the component's current failed slot, usually
+  next to `permitted: false`. Hosts act on each `id` once. `rollback_to` is herdr's own record of the component's
+  previous good commit, never model output; a host refuses one it does not hold locally.
+- **Escalation**, once per `component:release` and always internal: the record and full report on the Deployments
+  page, an attention item (kind `deployment_escalation`), and one `deployment_alert` feed event with validated
+  fields only. Side effects outside herdr are off by default, under `control_plane.deployment_escalation`
+  (read live, fail closed):
+  - `issues: true` files a GitHub issue for a software finding through the REST API with the server-held
+    `github.token`, which then needs issue write access. The claim is persisted before GitHub is called, and an
+    unanswered claim is never filed again.
+  - `assistant: true` would notify the Personal Assistant with `dedupe_key = component:release`. The assistant has
+    no notification API yet, so no sink is wired and host findings use the attention item.
+  - `budget_s` (default 40, at most 60) bounds one tick's model and GitHub calls; `issue_timeout_s` (default 15).
+- No pull request is generated: a fix goes through normal CI and review.
+

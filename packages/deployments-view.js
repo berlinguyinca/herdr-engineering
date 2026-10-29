@@ -63,6 +63,43 @@ function timeline(row) {
   </li>`).join('')}</ol>`;
 }
 
+// Only a GitHub issue URL of the plain shape is ever a link; anything else is shown as text (the server validates it too).
+const ISSUE_URL = /^https:\/\/github\.com\/[A-Za-z0-9][A-Za-z0-9_.-]*\/[A-Za-z0-9][A-Za-z0-9_.-]*\/issues\/[1-9][0-9]*$/;
+
+function issueCell(issue) {
+  if (!isObject(issue)) return 'issue: none';
+  const label = `issue ${issue.number != null ? `#${esc(text(issue.number))}` : ''} ${esc(text(issue.state))}`.replace(/\s+/g, ' ');
+  if (typeof issue.url === 'string' && ISSUE_URL.test(issue.url)) {
+    return `<a href="${esc(issue.url)}" target="_blank" rel="noopener noreferrer" data-deploy-issue>${label}</a>`;
+  }
+  return `<span data-deploy-issue>${label}${issue.reason ? ` · ${esc(issue.reason)}` : ''}</span>`;
+}
+
+// Drill-down (spec 8): the repair attempts, and links to the issue / PR / report of each escalated release of a component.
+function escalations(view, name) {
+  const recs = view.escalations.filter((e) => isObject(e) && e.component === name);
+  if (!recs.length) return '';
+  return recs.map((rec, n) => {
+    const rounds = list(rec.rounds).filter(isObject);
+    const report = isObject(rec.report) ? rec.report : null;
+    const rid = `dp-report-${encodeURIComponent(name).replace(/%/g, '_')}-${n}`;
+    return `<section class="dp-escalation" data-deploy-escalation>
+    <div><strong>Escalation</strong> · release ${commitCell(rec.release)}${rec.open ? ' · open' : ' · closed'} · ${issueCell(rec.issue)} · PR: ${rec.pr ? esc(text(rec.pr)) : 'none'}${report ? ` · <a href="#${esc(rid)}" data-deploy-report-link>report</a>` : ''}${isObject(rec.assistant) ? ` · assistant ${esc(text(rec.assistant.state))}` : ' · assistant: not notified (herdr notification)'}</div>
+    <ol class="dp-repairs" data-deploy-repairs>${rounds.map((r) => {
+      const f = isObject(r.finding) ? r.finding : {}, rep = isObject(r.repair) ? r.repair : {};
+      return `<li data-deploy-repair>round ${esc(text(r.index))}: ${esc(text(f.kind))} (${esc(text(f.source))})${f.source === 'model' ? ' <em>model output</em>' : ''} → <strong>${esc(text(rep.action))}</strong>${r.attempt != null ? ` · attempt ${esc(text(r.attempt))}` : ''}${rep.rollback_to ? ` · to ${commitCell(rep.rollback_to)}` : ''} · ${esc(text(rep.reason))}<div class="hd-card__sub">${esc(text(f.summary))}</div></li>`;
+    }).join('')}</ol>
+    ${report ? `<dl id="${esc(rid)}" class="dp-report" data-deploy-report>
+      <dt>What changed</dt><dd>${esc(text(report.what_changed))}</dd>
+      <dt>Current state</dt><dd>${esc(text(report.current_state))}</dd>
+      <dt>Tried</dt><dd>${list(report.tried).map((t) => esc(text(t))).join('<br>') || '—'}</dd>
+      <dt>Suggested next step</dt><dd>${esc(text(report.next_step))}</dd>
+      ${report.evidence ? `<dt>Evidence (redacted)</dt><dd><pre class="dp-evidence" data-deploy-report-evidence>${esc(report.evidence)}</pre></dd>` : ''}
+    </dl>` : ''}
+  </section>`;
+  }).join('');
+}
+
 function componentRow(view, item, open) {
   // Own keys only, and a prototype-free empty row: a name like 'constructor' never reads the prototype chain.
   const row = Object.hasOwn(view.components, item.name) && isObject(view.components[item.name]) ? view.components[item.name] : NO_ROW;
@@ -83,7 +120,7 @@ function componentRow(view, item, open) {
     <td data-deploy-hold>${hold != null ? seconds(hold) : '—'}</td>
     <td>${coord ? esc(text(coord.attempts, '0')) : '—'}</td>
   </tr>
-  <tr id="${esc(id)}" data-deploy-timeline="${esc(item.name)}"${open ? '' : ' hidden'}><td colspan="8">${timeline(row)}</td></tr>`;
+  <tr id="${esc(id)}" data-deploy-timeline="${esc(item.name)}"${open ? '' : ' hidden'}><td colspan="8">${escalations(view, item.name)}${timeline(row)}</td></tr>`;
 }
 
 function planCard(plan, coordinator) {
@@ -105,6 +142,7 @@ export function renderDeployments(raw) {
     definitions: isObject(raw?.definitions) ? raw.definitions : {},
     plans: list(raw?.plans).filter(isObject),
     coordinator: isObject(raw?.coordinator) ? raw.coordinator : {},
+    escalations: list(raw?.escalations).filter(isObject),
   };
   return (open) => {
     const defs = view.definitions;
