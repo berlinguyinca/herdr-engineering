@@ -42,6 +42,10 @@ class ArtifactAcl:
         return [artifact for artifact in artifacts
                 if self.can(artifact.get("artifact_id", ""), principal_id, "read")]
 
+    def principals_with(self, artifact_id: str, permission: str) -> list[str]:
+        """Principal ids holding a live ``permission`` on the artifact (expired grants are dropped on the way)."""
+        return [pid for (aid, pid) in list(self._grants) if aid == artifact_id and self.can(aid, pid, permission)]
+
     def has_grants(self, artifact_id: str) -> bool:
         return any(aid == artifact_id for aid, _ in self._grants)
 

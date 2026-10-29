@@ -334,6 +334,8 @@ class ControlPlaneServer:
         self.artifact_job_manager = artifact_job_manager
         self.artifact_review_manager = artifact_review_manager
         self.artifact_acl = artifact_acl
+        from .artifact_scope import install_gate
+        self.artifact_graph_gate = install_gate(repo.graph, artifact_acl)   # None without an ACL: nodes stay private
         from .handoffs import HandoffRegistry
         self.handoffs = handoff_registry or HandoffRegistry(repo)
         from .scheduler_service import SchedulerService
@@ -2539,7 +2541,9 @@ def _make_handler(server, public=False, operator=False):
                 body["provenance"] = {**(body.get("provenance") or {}), "principal_id": body["created_by"]}
                 committed = self._artifact_call("commit_version", parts[4], **body)
                 from .artifact_lineage import emit_version_lineage
-                emit_version_lineage(server.ingest, committed, self._principal())
+                from .artifact_scope import visibility_fields
+                emit_version_lineage(server.ingest, committed, self._principal(),
+                                     scope=visibility_fields(gated=server.artifact_graph_gate is not None))
                 return self._json(committed, 201)
             if resource == "artifact-jobs" and server.artifact_job_manager is not None:
                 if len(parts) == 4:
