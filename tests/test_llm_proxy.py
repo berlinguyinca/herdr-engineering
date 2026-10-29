@@ -884,3 +884,38 @@ def test_row_whitelist_drops_unknown_fields_and_bad_values():
     assert rec["ttft_ms"] is None and rec["gen_ms"] is None and rec["queue_ms"] == 3
     assert rec["stream"] is None and rec["route"] is None and rec["output_tokens"] is None
     assert rec["engine"] is None and rec["session_id"] is None  # over-long ids are dropped, not cut
+
+
+def test_tagged_content_is_gated_by_operator_egress_routes():
+    repo, key, proxy, seen, seen_custom, srvs = _setup()
+    try:
+        body = {"model": "plain", "messages": [{"role": "user", "content": "x"}]}
+        # untagged traffic is unchanged
+        assert _post_headers(proxy, key, body)[0] == 200
+        # tagged, but the upstream route is not configured -> treated as external -> mail is refused, nothing forwarded
+        before = len(seen)
+        for tag in ("private_mail", "scientific", "garbage"):
+            with pytest.raises(urllib.error.HTTPError) as err:
+                _post_headers(proxy, key, body, {"X-Herdr-Data-Class": tag})
+            assert err.value.code == 403
+        assert len(seen) == before
+        # public data may go to an external route
+        assert _post_headers(proxy, key, body, {"X-Herdr-Data-Class": "public"})[0] == 200
+        # operator marks the upstream local: mail is allowed there; the custom model stays unconfigured/external
+        repo.egress_fn = lambda: {"upstream_kind": "local", "custom_kinds": {"my-model": "approved_cloud"},
+                                  "approved": ["internal", "private_mail"]}
+        state = ProxyState(RepoControl(repo), "http://127.0.0.1:9", "k")
+        state.refresh(force=True)
+        assert state.egress_check("plain", "private_mail")[0] is True
+        assert state.egress_check("my-model", "private_mail")[0] is False   # local-only class never goes to cloud
+        assert state.egress_check("my-model", "internal")[0] is True
+        # a custom model marked local cannot launder data onto an external upstream it may resolve to
+        repo.egress_fn = lambda: {"upstream_kind": "external", "custom_kinds": {"my-model": "local"}, "approved": []}
+        state.refresh(force=True)
+        assert state.egress_check("my-model", "private_mail")[0] is False
+        assert state.egress_check("my-model", "public")[0] is True
+        repo.egress_fn = lambda: {"upstream_kind": "local", "custom_kinds": {"my-model": "approved_cloud"}, "approved": ["internal", "private_mail"]}
+        state.refresh(force=True)
+        assert state.egress_check("plain", None)[0] is False
+    finally:
+        _teardown(proxy, srvs)

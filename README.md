@@ -77,6 +77,27 @@ Pi Forge is explicitly excluded.
 - **Incremental implementation.** Every numbered spec has entry/exit criteria and leaves the system usable.
 - **Recoverable changes.** Pinned dependencies, safe config merging, health checks, backups, canaries, and rollback are mandatory.
 
+## View generated files on your active device
+
+Install the shared skill for Claude, Codex, Pi, and OpenCode on a harness host:
+
+```bash
+python3 scripts/install-open-skill.py --activate
+```
+
+This adds managed global instructions to baseline task output and offer newly
+created or changed pictures and HTML at completion. Choose all files,
+a subset, or skip. Markdown opens only when explicitly requested. The destination
+is discovered from live HerdR client connections and desktop capabilities, without
+machine or account questions. Unresolved discovery leaves files unopened. Files are
+verified and opened on that device using its existing desktop applications.
+
+Activation uses harness instructions rather than native completion hooks. Existing
+sessions may need to reload instructions; installation applies to the current host,
+not the whole fleet. Keep this checkout available because installed skills link to
+it. Use `--dry-run` to inspect changes or `--harness` to choose a harness. See
+[the skill](skills/herdr-open/SKILL.md) for supported clients and preview limits.
+
 ## Current validation fleet
 
 The initial fleet is:

@@ -67,6 +67,10 @@ def seed_activity(svr, repo, head):
     repo.upsert_session("branchy", host_id="beast", repository_id=RID, branch="main", cwd="/x")
     repo.observe_ci_pipeline({"provider_repo_id": "9", "repository": "fixture", "run_number": 5, "state": "success", "branch": "main",
                               "repository_id": RID, "commit_sha": head, "url": "https://ci.example/5"})
+    wt = next(m["worktree_id"] for m in svr.architecture.list_snapshots(RID, None, None, None, None)["snapshots"]
+              if m["commit_sha"] == head)
+    repo.upsert_session("pi:same-tree", host_id="beast", agent_role="reviewer", source="pi", repository_id=RID,
+                        commit_sha="a" * 40, worktree_id=wt)
     gate = SimpleNamespace(snapshots=lambda: [SimpleNamespace(key=SimpleNamespace(repo=RID, number=17), head_sha=head,
                                                               state=SimpleNamespace(value="ci_pending"))])
     svr.architecture.gate_store_fn = lambda: gate
@@ -103,6 +107,12 @@ def main():
             third["snapshot"]["created_at"] = "2099-06-01T00:00:00+00:00"
             third["snapshot"]["graph_hash"] = identity.graph_hash(third["graph"])
             svr.architecture.publish(third)
+            # a host paired the newest snapshot with its merge-base (the first snapshot) for a PR base request
+            req = svr.architecture.request_analysis({"repository_id": RID, "host_id": "beast", "rev": third["snapshot"]["commit_sha"],
+                                                     "base_rev": "main"})
+            svr.architecture.record_analysis({"analysis_id": req["analysis_id"], "event": "completed", "host_id": "beast",
+                                              "commit_sha": third["snapshot"]["commit_sha"], "snapshot_id": third["snapshot"]["snapshot_id"],
+                                              "base_commit_sha": first["snapshot"]["commit_sha"], "base_snapshot_id": first["snapshot"]["snapshot_id"]})
             seed_activity(svr, repo, third["snapshot"]["commit_sha"])
         if os.environ.get("ARCH_SELF") == "1":
             svr.architecture.publish(analyze.analyze_commit(str(_REPO), "HEAD", "bender",

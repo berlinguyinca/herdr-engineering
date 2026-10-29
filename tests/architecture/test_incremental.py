@@ -132,7 +132,7 @@ def test_js_relative_imports_resolve_with_spans_and_confidence():
     e = imps[("module:web/app.js", "module:web/lib/a.js")]
     assert e["source_span"]["line_start"] == 1 and e["confidence"] == extract.JS_CONFIDENCE and e["extractor"] == extract.EXTRACTOR_JS
     assert not [e for e in g["edges"] if "outside" in e["to_id"]]            # never resolves outside the repo
-    assert g["completeness"] == "partial" and any(d["code"] == "js_imports_only" for d in g["diagnostics"])
+    assert g["completeness"] == "partial" and any(d["code"] == "js_scanned_not_parsed" for d in g["diagnostics"])
     ext = next(d for d in g["diagnostics"] if d["code"] == "external_imports")
     assert "react" in dict(map(tuple, ext["top"]))
 

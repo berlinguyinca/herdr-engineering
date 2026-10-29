@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "title": "Processing-method benchmark example",
+  "summary": "A descriptive comparison with conditions still to validate.",
+  "questions": [{"id": "question-1", "text": "Which method warrants an independent comparison?"}],
+  "evidence": [{"id": "evidence-1", "title": "Recorded benchmark observations", "description": "Baseline mean 124 ms across 30 trials; candidate mean 118 ms across eight trials on another device. Variability is unavailable.", "asset_ids": ["data-1"]}],
+  "findings": [{"id": "finding-1", "title": "Observed difference needs a controlled evaluation", "statement": "The supplied means differ, but the device and method change together.", "question_ids": ["question-1"], "evidence_ids": ["evidence-1"], "figure_ids": ["figure-1"], "limitations": ["The comparison does not isolate the method effect."], "next_steps": ["Freeze both methods and evaluate on comparable devices and new trials."]}],
+  "figures": [{"id": "figure-1", "title": "Reported means", "asset_id": "plot-1", "caption": "Mean elapsed time in milliseconds, with trial counts and device labels.", "reading_guide": "A shorter bar is a lower reported mean, not a validated causal improvement."}],
+  "assets": [
+    {"id": "data-1", "name": "evidence/trials.csv", "role": "data", "media_type": "text/csv", "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "size_bytes": 1500},
+    {"id": "plot-1", "name": "figures/means.svg", "role": "figure", "media_type": "image/svg+xml", "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "size_bytes": 4200}
+  ],
+  "analysis": {"method": "Descriptive comparison of supplied summaries", "configuration": {"warmup": 3, "trial_order": [1, 2, 3]}, "code_revision": "example-revision", "source_hashes": {"benchmark.py": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}},
+  "limitations": ["Fixture digests and sizes illustrate the descriptor; no backing assets are supplied."],
+  "next_steps": ["Collect independently evaluated measurements."]
+}

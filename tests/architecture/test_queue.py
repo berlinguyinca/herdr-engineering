@@ -120,3 +120,65 @@ def test_serve_rejects_bad_checkout_mapping(tmp_path):
     with pytest.raises(SystemExit):
         command.cmd_serve(SimpleNamespace(url="http://127.0.0.1:1", api_key_file=str(key), host_id="h", checkout=["nope=/tmp"],
                                           poll=1, once=True, timeout=1, cache_dir=str(tmp_path)))
+
+
+# ------------------------------------------------------------------ PR base resolved by the host's git history
+def _serve(base, tmp_path, repo):
+    key = tmp_path / "key"; key.write_text("k")
+    args = SimpleNamespace(url=base, api_key_file=str(key), host_id="h1", checkout=[f"{REPO_ID}={repo}"], poll=0.1,
+                           once=True, timeout=60.0, cache_dir=str(tmp_path / "cache"))
+    assert command.cmd_serve(args) == 0
+
+
+def _branch_off_main(repo, tmp_path):
+    """main moves on after a feature branch forks: the PR base is the fork point, not main's tip."""
+    from helpers import write
+    fork = git(repo, "rev-parse", "HEAD")
+    git(repo, "checkout", "-q", "-b", "feature")
+    write(repo, {"app/util.py": "import json\n\ndef helper():\n    return 3\n\ndef feature_only(): pass\n"})
+    git(repo, "add", "-A"); git(repo, "commit", "-q", "-m", "feature")
+    head = git(repo, "rev-parse", "HEAD")
+    git(repo, "checkout", "-q", "main")
+    write(repo, {"app/other.py": "x = 1\n"})
+    git(repo, "add", "-A"); git(repo, "commit", "-q", "-m", "main moves on")
+    return fork, head
+
+
+def test_base_rev_resolves_the_merge_base_not_the_branch_tip(api, repo, tmp_path):
+    base, _, _ = api
+    fork, head = _branch_off_main(repo, tmp_path)
+    tip = git(repo, "rev-parse", "main")
+    assert tip != fork
+    a = req(base, rev=head, base_rev="main")[1]
+    assert a["deduplicated"] is False            # a full sha alone would be answered; a base request needs the host
+    _serve(base, tmp_path, repo)
+    job = call(base, f"/api/v1/architecture/analyses/{a['analysis_id']}")[1]["analysis"]
+    assert job["state"] == "completed" and job["base_commit_sha"] == fork
+    pr = call(base, f"/api/v1/architecture/snapshots/{job['snapshot_id']}/base")[1]
+    assert pr["base"]["commit_sha"] == fork and pr["base"]["snapshot_id"] == job["base_snapshot_id"]
+    assert "merge-base" in pr["base"]["resolved"]
+    d = call(base, f"/api/v1/architecture/diff?base={pr['base']['snapshot_id']}&head={job['snapshot_id']}")[1]
+    added = {c["id"] for c in d["items"] if c["change"] == "added" and c["type"] == "node"}
+    assert "function:app.util.feature_only" in added and not any("other" in n for n in added)
+
+
+def test_base_unavailable_is_reported_not_guessed(api, repo, tmp_path):
+    base, _, _ = api
+    head = git(repo, "rev-parse", "HEAD")
+    a = req(base, rev=head, base_rev="main")[1]      # the head IS main: nothing to compare
+    _serve(base, tmp_path, repo)
+    job = call(base, f"/api/v1/architecture/analyses/{a['analysis_id']}")[1]["analysis"]
+    assert job["state"] == "completed" and "base_snapshot_id" not in job
+    pr = call(base, f"/api/v1/architecture/snapshots/{job['snapshot_id']}/base")[1]
+    assert pr["base"] is None and "already contained" in pr["reason"]
+    # a snapshot nobody asked a base for, and an unknown snapshot
+    plain = req(base, rev="main")[1]
+    assert req(base, rev="main", base_rev="no-such-ref")[0] in (200, 201)
+    assert call(base, "/api/v1/architecture/snapshots/arch_" + "0" * 32 + "/base")[0] == 404
+    assert plain["analysis_id"]
+
+
+def test_base_rev_is_validated(api):
+    base, _, _ = api
+    assert req(base, rev="main", base_rev="--upload-pack=x")[0] == 400
+    assert req(base, rev="main", base_rev=5)[0] == 400

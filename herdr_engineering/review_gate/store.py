@@ -312,12 +312,15 @@ class PipelineStore:
                 return False
             return self._record(key, "base_changed", {"sha": sha, "base_ref": base_ref})
 
-    def on_merged(self, key: PrKey, sha: str) -> bool:
+    def on_merged(self, key: PrKey, sha: str, merge_sha: str | None = None) -> bool:
         with self._lock:
             snap = self.snapshot(key)
             if sha != snap.head_sha or snap.state != State.APPROVED:
                 return False
-            return self._record(key, "merged", {"sha": sha})
+            payload = {"sha": sha}
+            if merge_sha:
+                payload["merge_sha"] = merge_sha      # the commit now on the base branch; lets later main-CI results be tied to this PR
+            return self._record(key, "merged", payload)
 
     def resume(self, key: PrKey) -> bool:
         with self._lock:

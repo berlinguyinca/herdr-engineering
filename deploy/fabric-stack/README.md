@@ -147,3 +147,20 @@ curl http://dev.lan:18052                # reaches the leased service
   may not route `dev.lan` to CoreDNS; query CoreDNS directly with
   `dig @127.0.0.1 dev.lan`, and confirm the admin-console nameserver is
   restricted to `dev.lan`.
+
+## HTTPS on 443
+
+The gateway serves `https://dev.lan`, `https://local.metabolomics.us`, `https://<service>.local.metabolomics.us` and the
+node's `ts.net` name on port 443 (it replaces the old `tailscale serve --https=443` rule). Design and flags:
+[`docs/operations/fabric-public-names.md`](../../docs/operations/fabric-public-names.md).
+
+The container cannot issue or renew certificates, so the host does it and the gateway reloads changed files on its own:
+
+```bash
+deploy/fabric-stack/certs-sync.sh install     # one-time: private CA, first certificates, hourly user timer
+deploy/fabric-stack/certs-sync.sh renew       # what the timer runs (certbot renew if due + tailscale cert)
+```
+
+Order for the switch-over: `certs-sync.sh install`, `tailscale serve --https=443 off`, `docker compose up -d fabric-gateway`.
+The `:9447` serve rule is unaffected. Roll back with `tailscale serve --bg --https=443 http://127.0.0.1:8787` and the
+previous gateway command.

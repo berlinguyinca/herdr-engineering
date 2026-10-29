@@ -492,3 +492,21 @@ def test_naming_an_optional_host_explicitly_is_not_tolerated(tmp_path, monkeypat
     result = fleet.fleet_update(host='mac', pull_controller=False, reinstall_local=False)
     assert not result['ok'] and result['absent_optional'] == []
     assert not any(c[0] == 'ansible' for c in calls)
+
+
+def test_fleet_status_reports_summary_skill_state_without_gating(tmp_path, monkeypatch):
+    import hashlib
+    repo = _fake_repo(tmp_path)
+    (repo / 'skills' / 'summary').mkdir(parents=True)
+    (repo / 'skills' / 'summary' / 'SKILL.md').write_text('canonical')
+    want = hashlib.sha256(b'canonical').hexdigest()
+    monkeypatch.setenv('HERDR_ENGINEERING_REPO', str(repo))
+    base = ('"msg": "fry | herdr-eng=herdr-eng 0.1.0 | build-gate=' + 'b' * 32
+            + ' | agent=active | revision=' + REVISION + ' | cleanup=inactive | pi-revision='
+            + REVISION + ' | pi-path=/p | autospec-revision=x | autospec-cli=y')
+    for tail, expected in ((f' | summary={want}"', 'current'), (' | summary=' + 'c' * 64 + '"', 'differs'),
+                           (' | summary=MISSING"', 'MISSING'), ('"', 'unknown')):
+        monkeypatch.setattr(fleet, '_run', lambda *a, _o=base + tail, **kw: (0, _o, ''))
+        host = fleet.fleet_status()['hosts'][0]
+        assert host['summary'] == expected
+        assert host['build_gate'] == 'b' * 32 and host['pi_path'] == '/p'

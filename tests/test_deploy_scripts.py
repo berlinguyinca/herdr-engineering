@@ -58,6 +58,7 @@ def env(tmp_path, candidate_ref, monkeypatch):
     log = tmp_path / "docker.log"
     stub = bindir / "docker"
     running = tmp_path / "running-tag"
+    health_reads = tmp_path / "health-reads"
     running_mount = tmp_path / "running-mount"
     running_images = tmp_path / "running-images.json"
     running_config = tmp_path / "running-config-image"
@@ -170,6 +171,11 @@ case "$url" in
   *api/v1/health*)
     tag="$(cat {running} 2>/dev/null)"
     [ -n "$tag" ] || exit 7
+    if [ -n "${{STUB_READY_AFTER:-}}" ]; then
+      count="$(cat {health_reads} 2>/dev/null || echo 0)"
+      count=$((count + 1)); echo "$count" > {health_reads}
+      [ "$count" -gt "$STUB_READY_AFTER" ] || exit 7
+    fi
     case " ${{STUB_UNHEALTHY_TAGS:-}} " in *" $tag "*) exit 22 ;; esac
     echo '{{"status":"ok","commit":"'"$tag"'"}}' ;;
   *) echo '{{"keys":[{{"kid":"k"}}]}}' > "${{out:-/dev/stdout}}" ;;
@@ -218,6 +224,16 @@ def test_deploy_dry_run_renders_env_from_central_file_and_removes_it(env):
     assert compose_calls and " config -q" in compose_calls[0]
     path = [ln for ln in env["log"].read_text().splitlines() if ln.startswith("envfile ")][0].split()[1]
     assert not os.path.exists(path) and not os.path.exists(os.path.dirname(path))
+
+
+def test_default_readiness_budget_waits_past_the_old_thirty_probe_window(env):
+    env['env'].pop('HERDR_CP_HEALTH_TRIES')
+    env['env']['STUB_READY_AFTER'] = '35'
+    result = deploy(env)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert 'ok:' in result.stdout
+    assert 'rolled back' not in result.stdout + result.stderr
+    assert int((env['tmp'] / 'health-reads').read_text()) > 35
 
 
 def test_deploy_refuses_when_central_file_missing(env):

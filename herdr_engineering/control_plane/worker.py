@@ -48,7 +48,9 @@ async def _run_artifact_job_pass(conn, *, worker_id: str,
                 "UPDATE artifact_build_jobs SET status='failed', error=$1::jsonb, "
                 "completed_at=now() WHERE job_id=$2 AND status='running' "
                 "AND assigned_host_id=$3",
-                json.dumps({"message": str(exc)}), job_id, worker_id)
+                json.dumps({"message": str(exc),
+                            **({"code": exc.code} if getattr(exc, "code", None) else {})}),
+                job_id, worker_id)
             failed += int(updated == "UPDATE 1")
     return {"artifact_jobs_claimed": claimed,
             "artifact_jobs_completed": completed,

@@ -147,7 +147,7 @@ def test_runner_memory_limit_and_scrubbed_env(repo, tmp_path, monkeypatch):
     env = runner.run_isolated(str(repo), "HEAD", "h", REPO_ID)
     env.pop("sandbox")
     assert "SECRET_TOKEN" not in env and set(env) <= {"PATH", "HOME", "LC_ALL", "GIT_CONFIG_NOSYSTEM",
-                                                      "GIT_CONFIG_GLOBAL", "GIT_TERMINAL_PROMPT", "LANG"}
+                                                      "GIT_CONFIG_GLOBAL", "GIT_TERMINAL_PROMPT", "LANG", "PWD"}
 
 
 def test_runner_output_cap(repo, tmp_path, monkeypatch):
@@ -155,3 +155,54 @@ def test_runner_output_cap(repo, tmp_path, monkeypatch):
     monkeypatch.setattr(runner, "_WORKER", _fake_worker(tmp_path, "print('{\"a\":\"' + 'x'*5000 + '\"}')"))
     with pytest.raises(runner.AnalysisError, match="size limit"):
         runner.run_isolated(str(repo), "HEAD", "h", REPO_ID)
+
+
+# ------------------------------------------------------------------ the sandbox really cuts the network
+needs_sandbox = pytest.mark.skipif(runner._mechanism() is None, reason="no unprivileged network sandbox on this host")
+
+
+@needs_sandbox
+def test_sandbox_blocks_a_connection_to_a_listener_the_parent_can_reach(tmp_path):
+    import socket
+    import subprocess
+    import sys
+    srv = socket.socket(); srv.bind(("127.0.0.1", 0)); srv.listen(1)
+    port = srv.getsockname()[1]
+    probe = f"import socket,sys\ntry:\n socket.create_connection(('127.0.0.1',{port}),timeout=2)\nexcept OSError: sys.exit(7)\n"
+    assert subprocess.run([sys.executable, "-c", probe]).returncode == 0          # reachable without the sandbox
+    prefix, mech = runner._sandbox_prefix(str(tmp_path))
+    assert mech and subprocess.run([*prefix, sys.executable, "-c", probe]).returncode == 7
+    srv.close()
+
+
+@needs_sandbox
+def test_bwrap_makes_everything_but_scratch_and_cache_read_only(repo, tmp_path):
+    if runner._mechanism() != "bwrap":
+        pytest.skip("read-only filesystem is a bwrap property")
+    import subprocess
+    import sys
+    scratch, cache = tmp_path / "s", tmp_path / "c"
+    scratch.mkdir(); cache.mkdir()
+    prefix, _ = runner._sandbox_prefix(str(scratch), (str(cache),))
+    def can_write(path):
+        code = f"import pathlib,sys\ntry:\n pathlib.Path({str(path)!r}).write_text('x')\nexcept OSError: sys.exit(9)\n"
+        return subprocess.run([*prefix, sys.executable, "-c", code]).returncode == 0
+    assert can_write(scratch / "f") and can_write(cache / "f")
+    assert not can_write(repo / "planted") and not can_write(tmp_path / "elsewhere")
+
+
+def test_sandbox_report_matches_what_ran(repo):
+    res = runner.run_isolated(str(repo), "HEAD", "h", REPO_ID)
+    sb = res["sandbox"]
+    assert sb["network_isolated"] == (runner._mechanism() is not None)
+    assert sb["mechanism"] == runner._mechanism() and sb["read_only_filesystem"] == (sb["mechanism"] == "bwrap")
+
+
+@needs_sandbox
+def test_analysis_with_a_cache_works_inside_the_sandbox_and_fills_the_cache(repo, tmp_path):
+    cache = tmp_path / "cache"
+    first = runner.run_isolated(str(repo), "HEAD", "h", REPO_ID, config={"cache_dir": str(cache)})
+    assert first["sandbox"]["network_isolated"] and any(cache.iterdir())
+    second = runner.run_isolated(str(repo), "HEAD", "h", REPO_ID, config={"cache_dir": str(cache)})
+    assert second["snapshot"]["graph_hash"] == first["snapshot"]["graph_hash"]
+    assert second["snapshot"]["reuse"]["reused"] > 0

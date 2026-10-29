@@ -239,6 +239,11 @@ services:
     volumes:
       - ../fabric-stack/config.yaml:/app/config.yaml:ro
       - herdr-state:/state
+      # Certificates are issued and renewed ON THE HOST (the image has no certbot or tailscale CLI; see
+      # deploy/fabric-stack/README.md "HTTPS on 443"). The gateway only reads them and reloads when the files change.
+      - ${HOME}/.config/herdr-engineering/acme:/acme:ro
+      - ${HOME}/.config/herdr-engineering/ca:/ca:ro
+      - ${HOME}/.config/herdr-engineering/tailnet-cert:/tailnet-cert:ro
     environment:
       HERDR_ENGINEERING_STATE: /state
       HERDR_ENGINEERING_CONFIG: /app/config.yaml
@@ -249,8 +254,14 @@ services:
       - "29999"
       - "--bind"
       - "${GATEWAY_BIND:?run deploy.sh (derived from GATEWAY_TAILNET_IP)}"
-      - "--url-base"
-      - "dev.lan"
+      # Public name + certificate (fabric.acme_domain in config.yaml) with dev.lan kept as an alias; HTTPS and the
+      # stable <service>.<domain> names are served on 443. The bare names are the dashboard.
+      - "--acme-dir"
+      - "/acme"
+      - "--named-port"
+      - "443"
+      - "--apex-upstream"
+      - "${GATEWAY_HEALTH_HOST:?run deploy.sh (derived from GATEWAY_TAILNET_IP)}:80"
       # The container entrypoint is always PID 1, so a stale gateway.lock from
       # a previous (SIGKILLed/crashed) container would be mistaken for a live
       # instance. Compose owns this container's lifecycle, so safe to reset.

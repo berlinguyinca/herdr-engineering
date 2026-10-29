@@ -208,6 +208,7 @@ function loopHarness({ passes, fleet, ingest }) {
     refreshMs: 300000,
     inventoryEnvelope: async () => null,
     loadEnvelope: () => null,
+    reportWorker: () => async () => ({ ran: false }),
   };
   return { home, deps, keysUsed, fleetCalls: () => fleetCalls };
 }
@@ -414,4 +415,22 @@ test('dry-run explicitly disables native identity metadata reports',async()=>{
     inventoryEnvelope:async()=>null,loadEnvelope:()=>null,
   }),0);
   assert.equal(observed?.reportNative,false);
+});
+
+test('loop polls the report worker with the live target, independently of the snapshot interval; dry-run does not',async()=>{
+  const targets=[];
+  const h=loopHarness({passes:1,fleet:()=>({status:200,body:cfgBody('k1')}),ingest:()=>({ok:true,status:200})});
+  let release;
+  const gate=new Promise(r=>{release=r;});
+  h.deps.sleep=async()=>{await gate;process.emit('SIGTERM');};
+  h.deps.reportPollMs=5;
+  h.deps.reportWorker=()=>async target=>{targets.push(target);release();return {ran:false};};
+  assert.equal(await main(['--loop','100'],{},h.deps),0);
+  assert.ok(targets.length>=1);
+  assert.equal(targets[0].url,'http://cp.test');
+  assert.equal(targets[0].apiKey,'k1');
+  const dry=[];
+  await main(['--dry-run'],{}, {collect:async()=>({envelopes:[],summary:{errors:0}}),inventoryEnvelope:async()=>null,loadEnvelope:()=>null,
+    reportPollMs:1,reportWorker:()=>async t=>{dry.push(t);return {};}});
+  assert.equal(dry.length,0);
 });

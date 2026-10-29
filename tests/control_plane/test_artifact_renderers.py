@@ -38,3 +38,34 @@ def test_visualization_and_diagram_profiles_preserve_safe_source_renditions():
     diagram = registry.render("diagram", "graph TD; A-->B", {})
     assert "data-diagram-format=\"mermaid\"" in diagram.outputs[0]["content"]
 
+
+
+def test_unsupported_profile_carries_machine_readable_code():
+    with pytest.raises(ArtifactRendererError) as caught:
+        RendererRegistry().render("presentation", "source", {})
+    assert caught.value.code == "unsupported_format"
+    assert caught.value.to_dict()["code"] == "unsupported_format"
+
+
+def test_markdown_renders_lists_tables_code_links_and_stays_inert():
+    source = ("## Findings\n- one with `code`\n- [link](https://example.com)\n\n"
+              "| a | b |\n|---|---|\n| 1 | 2 |\n\n```\n<b>raw</b>\n```\n\n"
+              "1. first\n2. second\n\n#hashtag line\n\n"
+              "[bad](javascript:alert(1)) <script>alert(1)</script>")
+    page = RendererRegistry().render("document", source, {}).outputs[0]["content"]
+    assert "<h2>Findings</h2>" in page
+    assert "<ul><li>one with <code>code</code></li>" in page
+    assert '<a href="https://example.com" rel="noopener noreferrer">link</a>' in page
+    assert "<table>" in page and "<th>a</th>" in page and "<td>2</td>" in page
+    assert "<pre><code>&lt;b&gt;raw&lt;/b&gt;</code></pre>" in page
+    assert "<ol><li>first</li>" in page
+    assert "<p>#hashtag line</p>" in page
+    assert 'href="javascript' not in page and "<script>" not in page
+
+
+def test_web_validation_reports_active_and_external_content():
+    html_source = ("<html><body><script>1</script>"
+                   "<img src='https://cdn.example/x.png'></body></html>")
+    findings = RendererRegistry().render("web", html_source, {}).validation["findings"]
+    codes = {finding["code"] for finding in findings}
+    assert codes == {"active_content", "external_resource"}

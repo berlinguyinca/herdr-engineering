@@ -7,6 +7,7 @@
 //
 // Run: node --test --test-concurrency=1 tests/visual/ui-gates-visual.test.mjs
 import test, { before, after } from 'node:test';
+import { chromium } from 'playwright';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { mkdtempSync, writeFileSync, readdirSync } from 'node:fs';
@@ -80,7 +81,9 @@ test('the CLI refuses a slug that matches nothing, for check and for update, ins
 });
 
 test('the font assertion looks at every element: a host font on ANY element fails the capture', async () => {
-  const { ctx, page } = await openReal(browser, srv.info, 'alice', { bypassCSP: true, reducedMotion: 'reduce' });
+  // a browser that sees the HOST's fonts: the capture browser runs under a fontconfig with none, so it could not paint one
+  const hostBrowser = await chromium.launch({ headless: true, args: ['--no-sandbox'] });
+  const { ctx, page } = await openReal(hostBrowser, srv.info, 'alice', { bypassCSP: true, reducedMotion: 'reduce' });
   try {
     await page.addStyleTag({ content: bundledFontCss() });
     await openSub(page, 'chat');
@@ -93,16 +96,17 @@ test('the font assertion looks at every element: a host font on ANY element fail
       await assert.rejects(() => assertBundledFonts(page, ctx), /host fonts painted glyphs/, `${css} / ${text} must be caught`);
       await page.evaluate(() => document.getElementById('host-probe').remove());
     }
-  } finally { await ctx.close(); }
+  } finally { await ctx.close(); await hostBrowser.close(); }
 });
 
-test('the baselines do not depend on the host: the whole suite passes under a fontconfig that knows ONLY the bundled fonts', () => {
+test('the baselines do not depend on the host: the whole suite passes under a host fontconfig that knows ONLY the bundled fonts and renders with other settings', () => {
   const dir = mkdtempSync(path.join(os.tmpdir(), 'fc-'));
   const conf = path.join(dir, 'fonts.conf');
-  // rendering settings (hinting, antialiasing, subpixel) still come from the system's conf.d: they are NOT a font, and they are the
-  // part of the host that a baseline can still depend on (documented in docs/operations/ui-gates.md)
+  // the host's rendering settings are deliberately the OPPOSITE of the ones the baselines were made with (no hinting, grayscale
+  // anti-aliasing): the capture pins its own (pinnedFontconfigFile in ui-gates-lib.mjs), so a host with other settings, which is
+  // what moved all 88 pages on the first CI run, must not move a pixel
   writeFileSync(conf, `<?xml version="1.0"?><!DOCTYPE fontconfig SYSTEM "fonts.dtd"><fontconfig><dir>${FONT_DIR}</dir><cachedir>${path.join(dir, 'cache')}</cachedir>`
-    + '<include ignore_missing="yes">/etc/fonts/conf.d</include></fontconfig>');
+    + '<match target="pattern"><edit name="hinting" mode="assign"><bool>false</bool></edit><edit name="rgba" mode="assign"><const>none</const></edit></match></fontconfig>');
   const env = { ...process.env, FONTCONFIG_FILE: conf };
   const fc = spawnSync('fc-list', ['--format', '%{family}\\n'], { encoding: 'utf8', env });
   if (!fc.error) {

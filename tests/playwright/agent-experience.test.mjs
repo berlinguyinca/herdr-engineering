@@ -148,3 +148,49 @@ test('Summary blockers and next steps can be handed back to the owning agent onc
   await page.clock.runFor(200);
   assert.equal(await page.locator('[data-fix-summary]').count(),0);
 }));
+
+test('full report: button states, polling, remote-host message, and a side column in fullscreen',()=>withAgent(async page=>{
+  await page.evaluate(()=>{
+    window.agent.capabilities={...window.agent.capabilities,summary_report:true};
+    window.starts=0;
+    window.client.startSummaryReport=async()=>{window.starts++;if(window.refuse)throw Object.assign(new Error('Too many reports are running; try again shortly.'),{status:429,body:{reason:'report_limit'}});window.summary.full_report={state:'queued'};return {ok:true,status:'running'};};
+    window.remount();
+  });
+  await page.clock.runFor(200);
+  const button=page.getByRole('button',{name:'Generate full report',exact:true});
+  await button.waitFor();
+  assert.equal(await page.locator('[data-report-host]').isHidden(),true);
+  await button.click();
+  await page.getByRole('button',{name:'Generating report…',exact:true}).waitFor();
+  assert.equal(await page.getByRole('button',{name:'Generating report…',exact:true}).isDisabled(),true);
+  assert.match(await page.locator('.sw-report-status').innerText(),/Waiting for the agent's host/);
+  await page.evaluate(()=>{window.summary.full_report={state:'running'};});await page.clock.fastForward(3100);
+  assert.match(await page.locator('.sw-report-status').innerText(),/Running the summary skill/);
+  await button.click({force:true}).catch(()=>{});
+  assert.equal(await page.evaluate(()=>window.starts),1);
+  const report='# Session summary\n**Overall status:** completed\n\n1. **Original objective** — ship it\n\nEvidence coverage: complete\n'.repeat(1)+Array.from({length:60},(_,i)=>`- line ${i}`).join('\n');
+  await page.evaluate(r=>{window.summary.full_report={state:'done',report:r,harness:'claude',generated_at:'2026-10-28T20:00:00+00:00'};},report);
+  await page.clock.fastForward(3100);
+  await page.getByRole('button',{name:'Regenerate full report',exact:true}).waitFor();
+  assert.match(await page.locator('.sw-report-body').innerText(),/Original objective[\s\S]*Evidence coverage/);
+  assert.match(await page.locator('.sw-report-status').innerText(),/claude · 2026-10-28/);
+  // Inline: the long report scrolls inside its own box instead of lengthening the page.
+  const inline=await page.locator('.sw-report-body').evaluate(n=>({box:n.clientHeight,all:n.scrollHeight}));
+  assert.ok(inline.box<=520 && inline.all>inline.box,JSON.stringify(inline));
+  // Fullscreen: the summary card is a column to the right of the conversation, nothing overflows horizontally.
+  await page.getByRole('button',{name:'Fullscreen workspace',exact:true}).click();
+  const geo=await page.evaluate(()=>{const r=s=>document.querySelector(s).getBoundingClientRect();const w=document.querySelector('[data-session-workspace]');return {card:r('.sw-summary-card'),conv:r('[data-conversation-pane]'),hscroll:w.scrollWidth>w.clientWidth,vw:innerWidth};});
+  assert.ok(geo.card.left>=geo.conv.right-1,JSON.stringify(geo));
+  assert.ok(geo.card.right<=geo.vw+1 && geo.hscroll===false,JSON.stringify(geo));
+  await page.getByRole('button',{name:'Exit fullscreen workspace',exact:true}).click();
+  // A refusal is shown in place and the button stays usable.
+  await page.evaluate(()=>{window.refuse=true;window.summary.full_report={state:'idle'};});
+  await page.clock.fastForward(10000);
+  await page.getByRole('button',{name:'Generate full report',exact:true}).click();
+  await page.getByRole('alert').filter({hasText:'Too many reports'}).waitFor();
+  assert.equal(await page.locator('[data-summary-report]').isDisabled(),false);
+  // Viewers without the capability see no button but still read a stored report.
+  await page.evaluate(()=>{window.agent.capabilities={};window.summary.full_report={state:'done',report:'# Session summary\n\nEvidence coverage: complete'};window.remount();});
+  await page.clock.runFor(200);await page.locator('.sw-report-body').waitFor();
+  assert.equal(await page.locator('[data-summary-report]').isHidden(),true);
+}));

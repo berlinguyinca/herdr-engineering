@@ -1,0 +1,24 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ListZonesAndWatchChanges",
+      "Effect": "Allow",
+      "Action": ["route53:ListHostedZones", "route53:GetChange"],
+      "Resource": "*"
+    },
+    {
+      "Sid": "ChangeOnlyTheAcmeChallengeTxtRecord",
+      "Effect": "Allow",
+      "Action": "route53:ChangeResourceRecordSets",
+      "Resource": "arn:aws:route53:::hostedzone/Z2ANBWTR462YC8",
+      "Condition": {
+        "ForAllValues:StringEquals": {
+          "route53:ChangeResourceRecordSetsNormalizedRecordNames": ["_acme-challenge.local.metabolomics.us"],
+          "route53:ChangeResourceRecordSetsRecordTypes": ["TXT"],
+          "route53:ChangeResourceRecordSetsActions": ["UPSERT", "DELETE"]
+        }
+      }
+    }
+  ]
+}

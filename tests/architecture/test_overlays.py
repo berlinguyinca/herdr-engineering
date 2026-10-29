@@ -142,3 +142,62 @@ def test_timeline_has_independent_tracks_linked_only_by_exact_commit(world):
     assert sorted(next(x for x in t["architecture"] if x["snapshot_id"] == b)["session_ids"]) == ["pi:s1", "pi:s2"]
     assert call(base, "/api/v1/architecture/timeline?repository_id=bogus")[0] == 400
     assert call(base, "/api/v1/architecture/timeline")[0] == 400
+
+
+# ------------------------------------------------------------------ worktree-level correlation
+def _meta(base, sid):
+    return call(base, f"/api/v1/architecture/snapshots/{sid}")[1]["snapshot"]
+
+
+def test_worktree_sessions_are_kept_apart_from_commit_matches(world):
+    base, _a, b, head = world
+    crepo, wt = _STATE["repo"], _meta(base, b)["worktree_id"]
+    other = "0123456789abcdef01234567"
+    crepo.upsert_session("wt:at-commit", host_id="h1", repository_id=REPO_ID, commit_sha=head, worktree_id=wt)
+    crepo.upsert_session("wt:earlier", host_id="h1", repository_id=REPO_ID, commit_sha="a" * 40, worktree_id=wt)
+    crepo.upsert_session("wt:no-commit", host_id="h1", worktree_id=wt)
+    crepo.upsert_session("wt:other-host", host_id="h2", repository_id=REPO_ID, commit_sha="a" * 40, worktree_id=wt)
+    crepo.upsert_session("wt:other-tree", host_id="h1", repository_id=REPO_ID, commit_sha="a" * 40, worktree_id=other)
+    crepo.upsert_session("wt:other-repo", host_id="h1", repository_id="github.com/else/where", commit_sha="a" * 40, worktree_id=wt)
+    o = call(base, f"/api/v1/architecture/snapshots/{b}/overlays")[1]
+    assert "wt:at-commit" in {s["session_id"] for s in o["sessions"]}
+    assert {s["session_id"] for s in o["worktree_sessions"]} == {"wt:earlier", "wt:no-commit"}
+    assert all(s["at_this_commit"] is False for s in o["worktree_sessions"])
+    assert "context, not authorship" in o["worktree_rule"]
+    # the base snapshot has the same worktree id (same checkout) but sessions listed there are not at ITS commit either
+    assert "wt:at-commit" in {s["session_id"] for s in call(base, f"/api/v1/architecture/snapshots/{_a}/overlays")[1]["worktree_sessions"]}
+
+
+def test_correlation_fills_worktree_id_when_the_session_reported_one(world):
+    base, _a, b, head = world
+    wt = _meta(base, b)["worktree_id"]
+    _STATE["repo"].upsert_session("wt:c1", host_id="h1", repository_id=REPO_ID, commit_sha=head, worktree_id=wt)
+    rows = {r["session_id"]: r for r in call(base, f"/api/v1/architecture/snapshots/{b}/correlations")[1]["correlations"]}
+    assert rows["wt:c1"]["worktree_id"] == wt and "worktree_id" not in rows["wt:c1"]["unknown"]
+    assert rows["pi:s1"]["worktree_id"] is None and "worktree_id" in rows["pi:s1"]["unknown"]
+    # worktree-only sessions never become symbol authors
+    _STATE["repo"].upsert_session("wt:earlier2", host_id="h1", repository_id=REPO_ID, commit_sha="a" * 40, worktree_id=wt)
+    ids = {r["session_id"] for r in call(base, f"/api/v1/architecture/snapshots/{b}/correlations?node=function:app.util.added")[1]["correlations"]}
+    assert "wt:earlier2" not in ids and "wt:c1" in ids
+
+
+def test_ingest_validates_stores_and_rebuilds_the_worktree_id():
+    from herdr_engineering.control_plane.bridge import _reconstruct_from_events
+    from herdr_engineering.control_plane.ingest import IngestService
+    from herdr_engineering.control_plane.repo import ControlPlaneRepo
+    repo = ControlPlaneRepo()
+    svc = IngestService(repo)
+    ok = "0123456789abcdef01234567"
+    svc.ingest({"entity_type": "session", "entity_id": "pi:w1", "event_type": "session.started", "source": "pi",
+                "payload": {"host_id": "h1", "worktree_id": ok, "repo_url": "https://github.com/example/fixture.git",
+                            "commit_sha": "b" * 40}})
+    svc.ingest({"entity_type": "session", "entity_id": "pi:w1", "event_type": "session.updated", "source": "pi",
+                "payload": {"host_id": "h1", "status": "working"}})
+    assert repo.list_sessions()[0]["worktree_id"] == ok            # a later update without it does not erase it
+    rebuilt = _reconstruct_from_events({"session:pi:w1": repo.stream("session", "pi:w1")})
+    sessions = next(x for x in rebuilt if isinstance(x, dict) and "pi:w1" in x)
+    assert sessions["pi:w1"]["worktree_id"] == ok
+    for bad in ("0123", "G" * 24, "A" * 24, 5, "../../etc/passwd" + "0" * 8):
+        with pytest.raises(ValueError):
+            svc.ingest({"entity_type": "session", "entity_id": "pi:w2", "event_type": "session.started", "source": "pi",
+                        "payload": {"host_id": "h1", "worktree_id": bad}})

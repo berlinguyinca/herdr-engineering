@@ -51,8 +51,16 @@ gen_coredns() {
     local gen="$STACK_DIR/coredns/generated"
     mkdir -p "$gen"
     sed "s/{{GATEWAY_TAILNET_IP}}/$IP/g" "$STACK_DIR/coredns/Corefile.tmpl" > "$gen/Corefile"
-    sed "s/{{GATEWAY_TAILNET_IP}}/$IP/g" "$STACK_DIR/coredns/dev.lan.zone.tmpl" > "$gen/dev.lan.zone"
-    say "Rendered CoreDNS config (dev.lan -> $IP): $gen"
+    # Optional standby gateway (HA pair): GATEWAY_PEER_TAILNET_IP adds a second A record for dev.lan and *.dev.lan.
+    # Clients try both addresses; the one without a listener refuses and they fall through to the active gateway.
+    local peer_apex="" peer_wild=""
+    if [ -n "${GATEWAY_PEER_TAILNET_IP:-}" ]; then
+        peer_apex="    IN A   ${GATEWAY_PEER_TAILNET_IP}"
+        peer_wild="*   IN A   ${GATEWAY_PEER_TAILNET_IP}"
+    fi
+    sed -e "s/{{GATEWAY_TAILNET_IP}}/$IP/g" -e "s|{{PEER_APEX_RECORD}}|$peer_apex|" -e "s|{{PEER_WILDCARD_RECORD}}|$peer_wild|" \
+        "$STACK_DIR/coredns/dev.lan.zone.tmpl" > "$gen/dev.lan.zone"
+    say "Rendered CoreDNS config (dev.lan -> $IP${GATEWAY_PEER_TAILNET_IP:+, $GATEWAY_PEER_TAILNET_IP}): $gen"
 }
 
 stop_old_host_services() {

@@ -5,6 +5,7 @@ import {recordOutcome,statusOutcome,recordVisibility} from './record-state.js';
 import {patchList,patchText,morph} from './patch.js';
 import {animateChanges,skeleton} from './motion.js';
 import { freshnessSources } from './freshness.js';
+import { createFabricUrlResolver, linkifyFabricText } from './fabric-urls.js';
 
 const text = value => typeof value === 'string' ? value.trim() : '';
 const records = value => Array.isArray(value) ? value.filter(v=>v && typeof v==='object' && !Array.isArray(v)) : [];
@@ -68,11 +69,11 @@ export function runtimeLine(runtime) {
   return `${RUNTIME_LABELS[runtime.runtime_kind]}${engine}${fallback}`;
 }
 
-export function compactSessionRow(entry,now=Date.now()) {
+export function compactSessionRow(entry,now=Date.now(),urls=null) {
   const s=entry.record;
   return `<article class="ss-row" data-session-id="${esc(entry.id)}">
     <div class="ss-main"><a class="ss-title" data-session-link href="#/herd/session/${esc(encodeURIComponent(entry.id))}">${esc(short(entry.role,70))} · ${esc(short(entry.project,80))}</a>
-      <p class="ss-summary">${esc(short(s.summary)||'Activity not reported.')}</p>
+      <p class="ss-summary">${short(s.summary)?linkifyFabricText(short(s.summary),urls):esc('Activity not reported.')}</p>
       ${entry.mission ? `<p class="ss-meta">Mission: <a data-mission-link href="#/missions/${esc(encodeURIComponent(entry.mission.key))}">${esc(short(entry.mission.title,130))}</a></p>` : text(s.mission_id) ? '<p class="ss-meta">Mission association not resolved; see agent details.</p>' : ''}
       <p class="ss-meta ss-id">${esc(short(entry.id,64))}${text(s.branch) ? ` · Branch ${esc(short(s.branch,70))}` : ''}</p>
     </div>
@@ -96,6 +97,8 @@ export function mountSessionsView(container,client,{tab='current'}={}) {
   const pageSize=20;
   let disposed=false,sessions=[],missions=[],loaded=false,sessionError='',missionError='',lastSignature='',hostSignature='';
   let sessionRequest=null,missionRequest=null;
+  // agent summaries can name a loopback service; no single source machine here, so only a fleet-unique match links
+  const fabric=typeof client.resolveFabricUrls==='function'?createFabricUrlResolver(client,{onChange:()=>{lastSignature='';draw();}}):null;
   const chip=freshnessSources(()=>container.querySelector('herdr-freshness'));
   container.innerHTML=`${styles}<div class="hd-live-head"><h1>Agents</h1><herdr-freshness interval="5000"></herdr-freshness></div>
     <p class="ss-intro">Find an agent by project, host or model. Current shows open agents reported in the last 15 minutes. Older or missing reports move to Unconfirmed automatically; Failed and Finished retain previous work.</p>
@@ -127,7 +130,7 @@ export function mountSessionsView(container,client,{tab='current'}={}) {
       if(!group){group=document.createElement('div');group.className='ss-group';group.dataset.groupName=name;group.innerHTML=`<h2>${esc(name)}</h2><div data-rows></div>`;}
       if(group!==cursor)panel.insertBefore(group,cursor);else cursor=group.nextElementSibling;
       const list=group.querySelector('[data-rows]');
-      patchList(list,rows.map(e=>({id:e.id,html:compactSessionRow(e)})),{key:item=>item.id,render:item=>item.html,update:(row,item)=>morph(row,element(item.html)),inPlace:true,animate:live});
+      patchList(list,rows.map(e=>({id:e.id,html:compactSessionRow(e,undefined,fabric?.resolver)})),{key:item=>item.id,render:item=>item.html,update:(row,item)=>morph(row,element(item.html)),inPlace:true,animate:live});
       if(!live)for(const row of list.querySelectorAll('[data-entering]'))row.removeAttribute('data-entering');
     }
   }
@@ -187,7 +190,7 @@ export function mountSessionsView(container,client,{tab='current'}={}) {
       const data=await Promise.race([client[method](undefined,{signal:controller.signal}),new Promise((_,reject)=>{timeout=setTimeout(()=>{controller.abort();reject(new Error('Request timed out'));},12000);})]);
       if(disposed||controller.signal.aborted)return;
       if(!Array.isArray(data?.[kind]))throw new Error('Invalid response');
-      if(kind==='sessions'){sessions=records(data.sessions);loaded=true;sessionError='';}else{missions=records(data.missions);missionError='';}
+      if(kind==='sessions'){sessions=records(data.sessions);loaded=true;sessionError='';fabric?.prefetch(...sessions.map(s=>s?.summary));}else{missions=records(data.missions);missionError='';}
       chip.ok(kind);
     } catch (error) {
       if(!disposed&&!document.hidden){chip.fail(kind,`${kind==='sessions'?'Agents':'Mission context'}: ${error?.message||'request failed'}`);if(kind==='sessions')sessionError=loaded?'Agent updates unavailable. Showing last received records.':'Agents could not be loaded; retrying automatically.';else missionError='Mission context unavailable.';}

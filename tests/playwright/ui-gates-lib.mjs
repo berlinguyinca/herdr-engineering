@@ -1,7 +1,8 @@
 // Shared helpers for the T16 UI gates: browser launch, thresholds (ui-gates.yaml), the real integrated server, and
 // per-page watchers for console errors, CSP violations and failed requests.
 import { spawn } from 'node:child_process';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { chromium } from 'playwright';
 
@@ -29,7 +30,31 @@ export const CFG = loadConfig();
 /** The browser Playwright itself resolves for this install (PLAYWRIGHT_BROWSERS_PATH is Playwright's own setting, not ours).
  *  No path is hard-coded: a machine without the browser gets Playwright's own "run npx playwright install" message. */
 export const chromePath = () => chromium.executablePath();
-export const launch = () => chromium.launch({ headless: true, args: ['--no-sandbox'] });
+
+/** The fontconfig the browser runs under: the bundled fonts and NOTHING from the host, including the host's /etc/fonts/conf.d.
+ *  The pixel gate compares screenshots, and what Skia does to a glyph (hinting, anti-aliasing, sub-pixel order) comes from
+ *  fontconfig: a CI host whose conf.d differs from the workstation the baselines were made on moved every one of the 88 pages by
+ *  1-11% of its pixels. The values below are the ones the baselines were made with (Debian/Ubuntu 10-hinting-slight,
+ *  10-sub-pixel-rgb, 10-yes-antialias, 11-lcdfilter-default); pinning them here is what makes a baseline independent of the host. */
+let pinnedFontconfig;
+export function pinnedFontconfigFile() {
+  if (pinnedFontconfig) return pinnedFontconfig;
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'herdr-fc-'));
+  pinnedFontconfig = path.join(dir, 'fonts.conf');
+  writeFileSync(pinnedFontconfig, `<?xml version="1.0"?><!DOCTYPE fontconfig SYSTEM "urn:fontconfig:fonts.dtd"><fontconfig>`
+    + `<dir>${path.join(import.meta.dirname, 'fonts')}</dir><cachedir>${path.join(dir, 'cache')}</cachedir>`
+    + '<match target="pattern">'
+    + '<edit name="antialias" mode="assign"><bool>true</bool></edit>'
+    + '<edit name="hinting" mode="assign"><bool>true</bool></edit>'
+    + '<edit name="hintstyle" mode="assign"><const>hintslight</const></edit>'
+    + '<edit name="rgba" mode="assign"><const>rgb</const></edit>'
+    + '<edit name="lcdfilter" mode="assign"><const>lcddefault</const></edit>'
+    + '</match></fontconfig>');
+  return pinnedFontconfig;
+}
+export const launch = () => chromium.launch({
+  headless: true, args: ['--no-sandbox'], env: { ...process.env, FONTCONFIG_FILE: pinnedFontconfigFile() },
+});
 
 /** Start tests/playwright/real_server.py (the integrated control plane on loopback). Resolves with its handshake line. */
 export async function startRealServer(cfg = {}) {

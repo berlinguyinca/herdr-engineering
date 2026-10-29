@@ -9,6 +9,7 @@ analysed repository is attacker-controlled.
 """
 from __future__ import annotations
 
+import re
 import os
 import subprocess
 from dataclasses import dataclass, field
@@ -60,6 +61,17 @@ def resolve_commit(repo: str, rev: str) -> str:
         raise GitSourceError("invalid revision")
     out = run_git(repo, "rev-parse", "--verify", "--end-of-options", rev + "^{commit}")
     return out.decode().strip()
+
+
+def merge_base(repo: str, a: str, b: str) -> str | None:
+    """Best common ancestor of two full commit ids, or None when the histories share none (shallow clone, orphan)."""
+    for c in (a, b):
+        if not re.fullmatch(r"[0-9a-f]{40}", c):
+            raise GitSourceError("merge_base needs full commit ids")
+    try:
+        return run_git(repo, "merge-base", "--end-of-options", a, b).decode().strip() or None
+    except GitSourceError:
+        return None
 
 
 def list_tree(repo: str, commit_sha: str) -> CommitTree:

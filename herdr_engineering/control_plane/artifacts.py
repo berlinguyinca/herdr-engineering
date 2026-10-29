@@ -82,14 +82,29 @@ class ArtifactStore:
                              session_id: str | None = None,
                              mission_id: str | None = None,
                              job_id: str | None = None,
-                             idempotency_key: str | None = None) -> dict:
+                             idempotency_key: str | None = None,
+                             report_descriptor: dict | None = None,
+                             validation: dict | None = None) -> dict:
         """Commit one immutable version using compare-and-swap on the head."""
+        if report_descriptor is not None:
+            from .artifact_report_descriptor import validate_report_descriptor
+            report_descriptor = validate_report_descriptor(report_descriptor, output_manifest)
+        validation = {} if validation is None else validation
+        if not isinstance(validation, dict):
+            raise ArtifactError("validation must be an object")
+        report_json = json.dumps(report_descriptor, sort_keys=True) if report_descriptor is not None else None
+        validation_json = json.dumps(validation, sort_keys=True, allow_nan=False)
         output_json = json.dumps(output_manifest, sort_keys=True, separators=(",", ":"))
         provenance_json = json.dumps(provenance or {}, sort_keys=True, separators=(",", ":"))
-        request_sha = hashlib.sha256(
-            json.dumps({"artifact_id": artifact_id, "base_version_id": base_version_id,
+        request_body = {"artifact_id": artifact_id, "base_version_id": base_version_id,
                         "source_manifest_blob": source_manifest_blob,
-                        "output_manifest": output_manifest, "provenance": provenance or {}},
+                        "output_manifest": output_manifest, "provenance": provenance or {}}
+        if report_descriptor is not None:
+            request_body["report_descriptor"] = report_descriptor
+        if validation:
+            request_body["validation"] = validation
+        request_sha = hashlib.sha256(
+            json.dumps(request_body,
                        sort_keys=True, separators=(",", ":")).encode()
         ).hexdigest()
         principal = created_by or "unknown"
@@ -101,10 +116,56 @@ class ArtifactStore:
             reference = output.get("storage_key") or output.get("blob_sha256")
             if not reference:
                 raise ArtifactError("each output manifest entry needs a blob reference")
+            if not isinstance(reference, str):
+                raise ArtifactError("output blob reference must be a string")
+            digests = [output[field] for field in ("sha256", "blob_sha256")
+                       if output.get(field) is not None]
+            if any(not isinstance(value, str) or not value for value in digests):
+                raise ArtifactError("output blob digest must be a nonempty string")
+            reference_digest = reference.rsplit("/", 1)[-1]
+            if len(reference_digest) == 64 and all(char in "0123456789abcdef" for char in reference_digest):
+                digests.append(reference_digest)
+            if len(set(digests)) > 1:
+                raise ArtifactError("conflicting output blob digest/reference metadata")
         await self._validate_blob_reference(source_manifest_blob)
         for output in output_manifest:
             await self._validate_blob_reference(
                 output.get("storage_key") or output.get("blob_sha256"))
+        if report_descriptor is None:
+            # Legacy unscoped blobs remain compatible, but an artifact-scoped
+            # upload cannot become public by attaching it to a non-report target.
+            if source_manifest_blob is not None:
+                await self._validate_existing_blob_scope(artifact_id, source_manifest_blob)
+            for output in output_manifest:
+                await self._validate_existing_blob_scope(artifact_id,
+                    output.get("storage_key") or output.get("blob_sha256"),
+                    sha256=output.get("sha256") or output.get("blob_sha256"),
+                    size_bytes=output.get("size_bytes"), media_type=output.get("media_type"))
+        if report_descriptor is not None:
+            # Every report output/source needs the same artifact scope. Otherwise
+            # an editor could omit a private blob from descriptor.assets, attach
+            # it as an extra output, and later share their own stolen-content version.
+            for output in output_manifest:
+                await self._report_scoped_blob(artifact_id,
+                    output.get("storage_key") or output.get("blob_sha256"),
+                    sha256=output.get("sha256") or output.get("blob_sha256"),
+                    size_bytes=output.get("size_bytes"), media_type=output.get("media_type"))
+            if source_manifest_blob is not None:
+                await self._report_scoped_blob(artifact_id, source_manifest_blob)
+            for asset in report_descriptor["assets"]:
+                blob = await self._conn.fetchrow(
+                    "SELECT storage_key, size_bytes, media_type FROM artifact_blobs "
+                    "WHERE scope=$1 AND blob_sha256=$2 AND verified_at IS NOT NULL",
+                    artifact_id, asset["sha256"])
+                if not blob:
+                    raise ArtifactError("report asset must be uploaded in this artifact scope")
+                if int(blob["size_bytes"]) != asset["size_bytes"] or blob["media_type"] != asset["media_type"]:
+                    raise ArtifactError("report asset metadata differs from its scoped upload")
+                matching = next(output for output in output_manifest
+                                if output.get("name") == asset["name"] and output.get("sha256") == asset["sha256"])
+                if (matching.get("storage_key") or matching.get("blob_sha256")) not in {
+                        blob["storage_key"], asset["sha256"]}:
+                    raise ArtifactError("report asset storage reference differs from its scoped upload")
         async with _transaction(self._conn):
             if idempotency_key:
                 prior = await self._conn.fetchrow(
@@ -119,11 +180,13 @@ class ArtifactStore:
                     if existing is not None:
                         return existing
             artifact = await self._conn.fetchrow(
-                "SELECT artifact_id, current_version_id FROM artifacts "
+                "SELECT artifact_id, current_version_id, artifact_type FROM artifacts "
                 "WHERE artifact_id=$1 FOR UPDATE", artifact_id,
             )
             if artifact is None:
                 raise ArtifactError(f"no artifact {artifact_id}")
+            if artifact.get("artifact_type") == "report" and report_descriptor is None:
+                raise ArtifactError("report artifact versions require a report descriptor")
             if idempotency_key:
                 # The artifact row lock serializes retries for the same logical
                 # artifact. Re-read the key after acquiring it so a concurrent
@@ -152,16 +215,20 @@ class ArtifactStore:
                 "INSERT INTO artifact_versions (version_id, artifact_id, version_number, "
                 "parent_version_id, base_version_id, state, source_manifest_blob, "
                 "output_manifest, provenance, created_by, agent_id, host_id, session_id, "
-                "mission_id, job_id, committed_at) VALUES "
-                "($1,$2,$3,$4,$5,'ready',$6,$7::jsonb,$8::jsonb,$9,$10,$11,$12,$13,$14,now())",
+                "mission_id, job_id, committed_at, report_descriptor, validation) VALUES "
+                "($1,$2,$3,$4,$5,'ready',$6,$7::jsonb,$8::jsonb,$9,$10,$11,$12,$13,$14,now(),$15::jsonb,$16::jsonb)",
                 version_id, artifact_id, version_number, base_version_id, base_version_id,
                 source_manifest_blob, output_json, provenance_json, created_by, agent_id,
-                host_id, session_id, mission_id, job_id,
+                host_id, session_id, mission_id, job_id, report_json, validation_json,
             )
             await self._conn.execute(
                 "UPDATE artifacts SET current_version_id=$1, status='available' "
                 "WHERE artifact_id=$2", version_id, artifact_id,
             )
+            if report_descriptor is not None:
+                await self._conn.execute(
+                    "UPDATE artifacts SET artifact_type='report', size_bytes=$1 WHERE artifact_id=$2",
+                    sum(output.get("size_bytes", 0) for output in output_manifest), artifact_id)
             if idempotency_key:
                 await self._conn.execute(
                     "INSERT INTO artifact_idempotency "
@@ -191,7 +258,162 @@ class ArtifactStore:
             "session_id": session_id,
             "mission_id": mission_id,
             "job_id": job_id,
+            "report_descriptor": report_descriptor,
+            "validation": validation,
         }
+
+    async def report_permission(self, artifact_id: str, principal_id: str, permission: str) -> bool:
+        """Private report operations use durable owner/grant authority, not a guessed context."""
+        if not principal_id or permission not in {"read", "edit", "review", "share", "admin"}:
+            return False
+        artifact = await self._conn.fetchrow(
+            "SELECT created_by FROM artifacts WHERE artifact_id=$1", artifact_id)
+        if artifact is None:
+            return False
+        if artifact.get("created_by") == principal_id:
+            return True
+        grant = await self._conn.fetchrow(
+            "SELECT permissions FROM artifact_acl WHERE artifact_id=$1 AND principal_id=$2 "
+            "AND (expires_at IS NULL OR expires_at > now())", artifact_id, principal_id)
+        if not grant:
+            return False
+        permissions = grant["permissions"]
+        if isinstance(permissions, str):
+            permissions = json.loads(permissions)
+        return permission in permissions or "admin" in permissions
+
+    async def _validate_existing_blob_scope(self, artifact_id, reference, **metadata):
+        # Inspect the actual reference, never the caller's optional SHA metadata:
+        # a forged digest must not hide the scope of the requested storage key.
+        digest = reference.rsplit("/", 1)[-1] if isinstance(reference, str) else ""
+        scoped = await self._conn.fetchrow(
+            "SELECT scope FROM artifact_blobs WHERE scope <> 'fabric' "
+            "AND (storage_key=$1 OR blob_sha256=$2) LIMIT 1", reference, digest)
+        if scoped:
+            await self._report_scoped_blob(artifact_id, reference, **metadata)
+
+    async def _report_scoped_blob(self, artifact_id, reference, *, sha256=None,
+                                  size_bytes=None, media_type=None):
+        digest = sha256 or (reference.rsplit("/", 1)[-1] if isinstance(reference, str) else "")
+        if (not isinstance(digest, str) or len(digest) != 64
+                or any(character not in "0123456789abcdef" for character in digest)):
+            raise ArtifactError("report references require a scoped uploaded SHA-256 blob")
+        key = f"sha256/{digest[:2]}/{digest[2:4]}/{digest}"
+        blob = await self._conn.fetchrow(
+            "SELECT storage_key, size_bytes, media_type FROM artifact_blobs "
+            "WHERE scope=$1 AND blob_sha256=$2 AND verified_at IS NOT NULL", artifact_id, digest)
+        if not blob or reference not in {key, digest} or blob["storage_key"] != key:
+            raise ArtifactError("report reference must be uploaded in this artifact scope")
+        if size_bytes is not None and size_bytes != blob["size_bytes"]:
+            raise ArtifactError("report output size differs from its scoped blob")
+        if media_type is not None and media_type != blob["media_type"]:
+            raise ArtifactError("report output media type differs from its scoped blob")
+        return blob
+
+    async def register_report_blob(self, artifact_id: str, *, storage_key: str, sha256: str,
+                                   size_bytes: int, media_type: str) -> dict:
+        """Record bytes already verified by the scoped HTTP/worker upload boundary."""
+        if (not isinstance(sha256, str) or len(sha256) != 64
+                or any(character not in "0123456789abcdef" for character in sha256)
+                or isinstance(size_bytes, bool) or not isinstance(size_bytes, int) or size_bytes < 0
+                or not isinstance(media_type, str) or not media_type or len(media_type) > 255):
+            raise ArtifactError("invalid report blob metadata")
+        expected = f"sha256/{sha256[:2]}/{sha256[2:4]}/{sha256}"
+        if storage_key != expected:
+            raise ArtifactError("report blob key must match its content digest")
+        await self._validate_blob_reference(storage_key)
+        previous = await self._conn.fetchrow(
+            "SELECT storage_key, size_bytes, media_type FROM artifact_blobs "
+            "WHERE scope=$1 AND blob_sha256=$2", artifact_id, sha256)
+        if previous and (previous["storage_key"] != storage_key or previous["size_bytes"] != size_bytes
+                         or previous["media_type"] != media_type):
+            raise ArtifactError("immutable scoped blob metadata conflict")
+        await self._conn.execute(
+            "INSERT INTO artifact_blobs (scope, blob_sha256, storage_key, size_bytes, media_type, verified_at) "
+            "VALUES ($1,$2,$3,$4,$5,now()) ON CONFLICT (scope, blob_sha256) DO NOTHING",
+            artifact_id, sha256, storage_key, size_bytes, media_type)
+        return {"storage_key": storage_key, "sha256": sha256, "size_bytes": size_bytes,
+                "media_type": media_type}
+
+    async def get_report(self, artifact_id: str, version_id: str) -> dict:
+        from .artifact_report_state import ArtifactReportState
+        version = await self.get_version(version_id, artifact_id)
+        if version is None or not version.get("report_descriptor"):
+            raise ArtifactError("no artifact report version")
+        state = ArtifactReportState(self)
+        feedback = await state.list_feedback(artifact_id, version_id, limit=10)
+        feedback_count = await state.feedback_count(artifact_id, version_id)
+        return {**await state.inspect(artifact_id, version_id),
+                "report_descriptor": version["report_descriptor"],
+                "validation": version.get("validation") or {},
+                "assets": version["report_descriptor"].get("assets", []),
+                "feedback": feedback, "feedback_count": feedback_count,
+                "feedback_has_more": len(feedback) < feedback_count}
+
+    async def get_report_descriptor(self, artifact_id: str, version_id: str) -> dict:
+        version = await self.get_version(version_id, artifact_id)
+        if not version or not version.get("report_descriptor"):
+            raise ArtifactError("no artifact report version")
+        return version["report_descriptor"]
+
+    async def get_report_diff(self, artifact_id: str, version_id: str, base_version_id: str) -> dict:
+        from .artifact_report_descriptor import report_diff
+        current = await self.get_version(version_id, artifact_id)
+        base = await self.get_version(base_version_id, artifact_id)
+        if not current or not base or not current.get("report_descriptor") or not base.get("report_descriptor"):
+            raise ArtifactError("no artifact report comparison")
+        return {"artifact_id": artifact_id, "version_id": version_id, "base_version_id": base_version_id,
+                **report_diff(base["report_descriptor"], current["report_descriptor"])}
+
+    async def record_report_check(self, artifact_id: str, version_id: str, **values) -> dict:
+        from .artifact_report_state import ArtifactReportState
+        return await ArtifactReportState(self).record_check(artifact_id, version_id, **values)
+
+    async def add_report_feedback(self, artifact_id: str, version_id: str, **values) -> dict:
+        from .artifact_report_state import ArtifactReportState
+        return await ArtifactReportState(self).add_feedback(artifact_id, version_id, **values)
+
+    async def list_report_feedback(self, artifact_id: str, version_id: str, **pagination) -> list[dict]:
+        from .artifact_report_state import ArtifactReportState
+        return await ArtifactReportState(self).list_feedback(artifact_id, version_id, **pagination)
+
+    async def count_report_feedback(self, artifact_id: str, version_id: str) -> int:
+        from .artifact_report_state import ArtifactReportState
+        return await ArtifactReportState(self).feedback_count(artifact_id, version_id)
+
+    async def list_version_summaries(self, artifact_id: str) -> list[dict]:
+        rows = await self._conn.fetch(
+            "SELECT version_id, artifact_id, version_number, parent_version_id, state, created_at, "
+            "committed_at, (report_descriptor IS NOT NULL) AS is_report FROM artifact_versions "
+            "WHERE artifact_id=$1 ORDER BY version_number DESC", artifact_id)
+        return [self._row(row) for row in rows]
+
+    async def get_report_job(self, artifact_id: str, job_id: str) -> dict | None:
+        row = await self._conn.fetchrow(
+            "SELECT * FROM artifact_build_jobs WHERE artifact_id=$1 AND job_id=$2 AND profile='report'",
+            artifact_id, job_id)
+        return self._row(row)
+
+    async def cancel_report_job(self, artifact_id: str, job_id: str) -> dict | None:
+        row = await self._conn.fetchrow(
+            "UPDATE artifact_build_jobs SET status='cancelled', completed_at=now() "
+            "WHERE artifact_id=$1 AND job_id=$2 AND profile='report' AND status='queued' RETURNING *",
+            artifact_id, job_id)
+        return self._row(row)
+
+    async def get_report_asset(self, artifact_id: str, version_id: str, asset_id: str) -> dict:
+        version = await self.get_version(version_id, artifact_id)
+        if not version or not version.get("report_descriptor"):
+            raise ArtifactError("no artifact report version")
+        asset = next((value for value in version["report_descriptor"]["assets"] if value["id"] == asset_id), None)
+        if asset is None:
+            raise ArtifactError("no artifact report asset")
+        blob = await self._conn.fetchrow(
+            "SELECT storage_key, size_bytes, media_type FROM artifact_blobs "
+            "WHERE scope=$1 AND blob_sha256=$2 AND verified_at IS NOT NULL", artifact_id, asset["sha256"])
+        if not blob or blob["size_bytes"] != asset["size_bytes"] or blob["media_type"] != asset["media_type"]:
+            raise ArtifactError("no artifact verified report asset")
+        return {**asset, "storage_key": blob["storage_key"]}
 
     async def _validate_blob_reference(self, reference: str | None) -> None:
         if not reference:
@@ -219,7 +441,7 @@ class ArtifactStore:
             return None
         value = dict(row) if not isinstance(row, dict) else row
         normalized = ArtifactStore._jsonable(value)
-        for key in ("output_manifest", "provenance", "validation", "payload",
+        for key in ("output_manifest", "provenance", "validation", "report_descriptor", "payload",
                     "request", "permissions", "findings"):
             candidate = normalized.get(key)
             if isinstance(candidate, str):
