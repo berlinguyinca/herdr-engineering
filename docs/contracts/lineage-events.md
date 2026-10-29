@@ -987,3 +987,52 @@ Not fixed here: a per-API-key ingest limiter (M12's second half); compaction/sna
 pre-paid revocation only); the ids are
 remembered up to `FIRST_TS_MAX`, an evicted id is stripped; L3 (accepted), L4, L6-L9, L13 (a longer principal id would break configured key ids), L14.
 
+
+## Artifact nodes, ACL visibility and delivery metrics (lineage/assistant integration, 2026-10-29)
+
+Additive; no new node or edge kind, no `lineage.v3`. Code: `artifact_lineage.py`, `artifact_scope.py`, `lineage_metrics.py`.
+
+### Node ids and edges
+* `artifact:<artifact_id>` (commons) is the logical artifact: `attrs` carry the HEAD version's ids, number, parent and sorted
+  content digests (never blob locations or file names).
+* `artifact:<artifact_id>@<version_id>` (commons, same kind) is one immutable version. A version with a parent adds a
+  `supersession` edge new -> old (kind already in the vocabulary). A correction is therefore a new version; nothing is overwritten.
+* `produced` producer -> `artifact:<id>` as before (best effort).
+* Retraction is `node.state` `retracted` (reason <= 200 characters) on the version node, and on the logical node when it was the
+  head. The version node keeps its digests and stays readable by the same audience.
+
+### Why a read-time gate (decision, replaces "private only")
+Scope never widens for an existing object, and for a COMMONS node a writer's labels only ever widen, so an ACL change cannot be
+expressed by re-stamping a label. The ACL is therefore applied at READ time, like room membership:
+* `GraphProjection.set_node_gate(node_type, fn)` registers `fn(principal, node) -> bool`, evaluated in `_node_visible` AND-ed with the
+  scope check. It can only narrow. Edges need both endpoints visible, so they follow. The gate is server configuration, not stored
+  state: the server installs it at start (`ControlPlaneServer.__init__`) and `_rebuild_graph` carries it over.
+* `ArtifactGraphGate` allows a principal iff the artifact's ACL holds a live `read` grant for it. Operators get no bypass (same as
+  the artifact HTTP reads). Identity mapping: a graph key principal `key:<12 hex>` matches the ACL id `api-key:<16 hex>:<role>` that
+  starts with the same 12 digits of the same key digest; a signed-in person `user:<id>` matches only an ACL grant naming exactly `user:<id>`.
+* Emission label: with a gate installed (`artifact_acl` configured) the commit route stamps `org` (fleet keys only, never a person);
+  a caller that knows the room/mission stamps that contextual label (`visibility_fields`) and a person then needs the membership AND the
+  ACL grant. Without a gate the label is `private` (committer only), as before. A scope the ingest refuses falls back to `private`, never wider.
+* Writes are gated too: `GraphProjection.set_write_gate('artifact', ...)` makes admission of any field-bearing write to an `artifact`
+  node require an ACL `edit` grant (an empty "ensure" is exempt). Without it any key could pre-create `artifact:<id>` and have its
+  forged label/version facts shown as the primary value to the real audience (found in independent review). Only the first
+  state-writer's state is primary on a commons node, so a retraction by another editor is reported as an error by
+  `emit_retraction(graph=...)` rather than silently ignored; `scope` is required for retractions.
+* Consequences: a grant shows the node on the next read; a revoke or expiry hides it on the next read, also after restart/rebuild.
+  Nodes emitted `private` before this change stay committer-only (no in-place widening; commit a new version to expose it).
+  Removing the gate code later would expose `org`-labelled artifact nodes to every fleet key: revoke grants instead of reverting the gate.
+
+### Delivery metrics (existing route)
+`GET /api/v1/collab/rooms/<room>/analytics` gains `delivery` (from `lineage_metrics.lineage_metrics`, over the SAME reader-filtered
+snapshot as the rest of the analytics): `accepted_changes`, `gate_failures` (only states from `insights.evidence_writers`; `count:
+"unknown"` when none is configured), `handoffs` (outcomes, success rate, recovery latency; self-reported), `rework` (stale reviews,
+supersessions, head changes after review), `review_findings` (total, open, severity cells, precision), `issue_lead_time`, `sessions`,
+`usage.tokens` / `usage.cost_usd` (summed only from nodes whose emitter reported `tokens`/`tokens_in`/`tokens_out`/`cost_usd`,
+otherwise `status: "unknown"`, never estimated). Rates, durations and usage over fewer than `min_group_size` items are `suppressed`.
+Times are server receipt times. No per-person or per-agent breakdown. Nothing is written.
+
+### Email attachment artifacts (control-plane function, not yet routed)
+`intel_attachment_artifact.attach_to_artifact` triages the bytes (`intel_attachments.triage`), stores an accepted attachment as a new
+version of a (new or given) logical artifact, grants `read` to the named mail audience only, records original message metadata as
+artifact provenance (inside the ACL boundary), writes a private `thread:` node plus a `produced` edge to the artifact, and writes an
+`issue_link` only for a project-intelligence relationship that a person confirmed (`confirmed` and `human_verified`).

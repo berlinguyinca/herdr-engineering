@@ -199,3 +199,30 @@ def test_replaying_the_commit_is_deterministic():
     before = w.repo.graph.snapshot()
     assert w.commit(1)["error"] is None
     assert w.repo.graph.snapshot() == before
+
+
+def test_a_key_without_edit_cannot_squat_or_overlay_the_artifact_node():
+    w = World()
+    squat = {"schema_version": 2, "event_id": "x1", "source": "evil", "source_sequence": 1, "entity_type": "lineage",
+             "entity_id": "artifact:art_1", "event_type": "node.upsert", "visibility_scope": "org",
+             "payload": {"node_type": "artifact", "node_id": "artifact:art_1", "label": "EVIL",
+                         "attrs": {"version_id": "ver_FAKE"}}}
+    for who in (STRANGER, OPERATOR):
+        with pytest.raises(PermissionError):
+            w.svc.ingest({**squat, "event_id": f"x-{who['id']}"}, who)
+    w.commit(1)
+    node = w.repo.graph.get_node(OWNER, "artifact:art_1")["node"]
+    assert node["label"] == "art_1 v1" and node["attrs"]["version_id"] == "ver_1"
+    # an edit-only grantee may write; a read-only grantee may not
+    w.acl.grant("art_1", ACL_READER, {"read"})
+    with pytest.raises(PermissionError):
+        w.svc.ingest({**squat, "event_id": "x-reader"}, READER)
+
+
+def test_retraction_by_a_non_committing_writer_is_reported_not_silently_ignored():
+    w = World()
+    w.commit(1)
+    w.acl.grant("art_1", ACL_READER, {"read", "edit", "admin"})
+    out = emit_retraction(w.svc, "art_1", "ver_1", READER, "mine", scope=w.scope, graph=w.repo.graph)
+    assert out["error"] and "only the committing writer" in out["error"]
+    assert emit_retraction(w.svc, "art_1", "ver_1", OWNER, "ok", scope=w.scope, graph=w.repo.graph)["error"] is None

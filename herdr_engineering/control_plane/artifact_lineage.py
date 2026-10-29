@@ -98,18 +98,24 @@ def emit_version_lineage(ingest, version: dict, principal: dict, *, scope: dict 
 
 
 def emit_retraction(ingest, artifact_id: str, version_id: str, principal: dict, reason: str, *,
-                    scope: dict | None = None, head: bool = False) -> dict:
+                    scope: dict, head: bool = False, graph=None) -> dict:
     """Record that a version was retracted. The version node keeps its facts and stays readable by its audience (state
-    ``retracted`` plus a bounded reason); ``head=True`` also marks the logical node. Nothing is deleted, and the scope is
-    the one the version was committed with (callers pass the same ``scope``); never raises."""
+    ``retracted`` plus a bounded reason); ``head=True`` also marks the logical node. Nothing is deleted, and ``scope`` is required: pass the one the
+    version was committed with (a default could silently hide the retraction). ``graph`` (optional) verifies the state took;
+    never raises."""
     result = {"node": None, "error": None}
     try:
         node_id = f"artifact:{artifact_id}@{version_id}"
         source = f"artret-{version_id}"[:64]
-        chosen, why = scope or PRIVATE, " ".join(str(reason or "").split())[:200] or "retracted"
+        chosen, why = scope, " ".join(str(reason or "").split())[:200] or "retracted"
         ingest.ingest(_envelope(source, 1, "node.state", node_id, {"node_id": node_id, "state": "retracted",
                                                                    "reason": why}, chosen), principal)
         result["node"] = node_id
+        if graph is not None:
+            # a node's primary state is its first state-writer's: another writer's retraction is only a contribution
+            seen = graph.get_node(principal, node_id)["node"]["state"]
+            if seen != "retracted":
+                result["error"] = f"retraction recorded but the node still reads {seen!r}: only the committing writer can retract"
         if head:
             logical = f"artifact:{artifact_id}"
             ingest.ingest(_envelope(source, 2, "node.state", logical, {"node_id": logical, "state": "retracted",

@@ -756,6 +756,10 @@ def from_stored(event: dict) -> dict:
 class GraphProjection:
     """Thread-safe lineage graph. Mutated only through :meth:`apply`."""
 
+    def set_write_gate(self, node_type: str, gate) -> None:
+        """Admission-time gate: a field-bearing write to a node of this type needs ``gate(actor, node_id)``."""
+        self._write_gates[node_type] = gate
+
     def set_node_gate(self, node_type: str, gate) -> None:
         """Install a read-time gate for one node type. It can only narrow what the scope label allows."""
         self._node_gates[node_type] = gate
@@ -775,6 +779,7 @@ class GraphProjection:
         # read-time node gates by node_type: ``fn(principal, node) -> bool`` is ANDed with the scope check, so it can
         # only narrow (e.g. artifact ACLs, artifact_scope.py). Never persisted, never part of replay.
         self._node_gates: dict[str, Callable] = {}
+        self._write_gates: dict[str, Callable] = {}    # node_type -> fn(actor, node_id) -> bool, checked at admission
         self._replay_lock = threading.Lock()
         self._replay_cache: dict[tuple, GraphProjection] = {}
         self._cursor_key = secrets.token_bytes(32)
@@ -833,6 +838,10 @@ class GraphProjection:
                 raise deny
             at_quota = not operator and self._owned.get(aid, 0) >= MAX_OBJECTS_PER_PRINCIPAL
             if op["op"] in ("node.upsert", "node.state"):
+                write_gate = self._write_gates.get(op["node_type"])
+                if write_gate is not None and not (op["op"] == "node.upsert" and op["ensure"]) \
+                        and not write_gate(actor, op["node_id"]):
+                    raise deny
                 rec = self._nodes.get(op["node_id"])
                 exists = rec is not None and rec.claim is not None
                 if not exists:

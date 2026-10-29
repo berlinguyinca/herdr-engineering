@@ -71,12 +71,15 @@ def confirmed_issue_refs(intelligence, viewer, message_ref: str) -> list[str]:
 
 async def attach_to_artifact(*, store, acl, ingest, principal: dict, msg: dict, part_path: str, data: bytes, account: str,
                              owner: str, audience: tuple[str, ...] = (), previous: dict | None = None,
-                             intelligence=None, viewer=None, gated: bool = True) -> dict:
+                             intelligence=None, viewer=None, gated: bool = True, dedupe: dict | None = None) -> dict:
     """Store one accepted attachment as a new artifact version (``previous={"artifact_id", "version_id"}`` makes it a
     correction of that artifact). Returns ``{"verdict", "artifact_id", "version_id", "audience", "thread_node",
     "issue_links", "graph"}``; quarantined or rejected bytes are never stored (verdict and reasons only).
-    ``owner`` and ``audience`` are ACL principal ids (``api-key:...``). ``gated=False`` (no ACL read gate installed)
-    keeps the graph node ``private``."""
+    ``owner`` and ``audience`` are ACL principal ids (``api-key:...``). ``gated=False`` keeps the graph node
+    ``private``; ``gated=True`` is honoured only when the ACL read gate is really installed on the ingest's graph.
+    ``dedupe`` (a caller-owned dict) makes a redelivered (account, message, part, sha256) return the first result
+    instead of creating a second artifact. A correction (``previous``) needs ``edit`` on that artifact for ``owner`` and
+    may not add readers: a wider audience is a separate, explicit ACL grant."""
     part = dict(gm._walk(msg.get("payload") or {})).get(part_path) or {}
     filename = part.get("filename") or "attachment"
     result = att.triage(data, part.get("mimeType"), filename)
@@ -84,6 +87,18 @@ async def attach_to_artifact(*, store, acl, ingest, principal: dict, msg: dict, 
            "version_id": None, "audience": [], "thread_node": None, "issue_links": [], "graph": None}
     if result.verdict != "accept":
         return out
+    gated = gated and getattr(getattr(getattr(ingest, "repo", None), "graph", None), "_node_gates", {}).get("artifact") \
+        is not None
+    key_ = (account, str(msg.get("id")), part_path, result.sha256)
+    if dedupe is not None and key_ in dedupe:
+        return {**dedupe[key_], "verdict": "duplicate"}
+    if previous:
+        if not acl.can(previous["artifact_id"], owner, "edit"):
+            return {**out, "verdict": "forbidden", "reasons": ["owner may not edit the artifact being corrected"]}
+        readers = set(acl.principals_with(previous["artifact_id"], "read"))
+        if set(audience) - readers:
+            return {**out, "verdict": "audience_widened",
+                    "reasons": ["a correction cannot add readers; grant access to the artifact explicitly"]}
     provenance = mail_provenance(msg, part_path, result, account)
     key, digest = store._rf.put(data)
     if previous:
@@ -138,11 +153,13 @@ async def attach_to_artifact(*, store, acl, ingest, principal: dict, msg: dict, 
                 out["issue_links"].append(issue)
             except Exception:                                   # noqa: BLE001 - issue node unknown/unreadable: no link
                 pass
+    if dedupe is not None:
+        dedupe[key_] = dict(out)
     return out
 
 
 def retract_attachment(*, ingest, principal: dict, artifact_id: str, version_id: str, reason: str,
-                       head: bool = False, gated: bool = True) -> dict:
+                       head: bool = False, gated: bool = True, graph=None) -> dict:
     """Record that a sender retracted an attachment. The version stays stored and readable by its audience."""
     return emit_retraction(ingest, artifact_id, version_id, principal, reason, scope=visibility_fields(gated=gated),
-                           head=head)
+                           head=head, graph=graph)

@@ -239,3 +239,30 @@ def test_reattaching_the_same_mail_is_a_new_version_never_an_overwrite():
                                           ("email:m1", None), ("issue:../x#1", None)])
 def test_ref_mapping(ref, expected):
     assert graph_ref(ref) == expected
+
+
+def test_a_redelivered_mail_does_not_create_a_second_artifact():
+    w, seen = World(), {}
+    first = w.attach(dedupe=seen)
+    again = w.attach(dedupe=seen)
+    assert again["verdict"] == "duplicate" and again["artifact_id"] == first["artifact_id"]
+    assert len(w.store.artifacts) == 1 and len(w.store.versions) == 1
+
+
+def test_a_correction_cannot_widen_the_audience_or_target_an_artifact_the_owner_cannot_edit():
+    w = World()
+    first = w.attach(audience=(ACL_READER,))
+    prev = {"artifact_id": first["artifact_id"], "version_id": first["version_id"]}
+    wider = w.attach(mail("m2"), data=PNG2, audience=(ACL_READER, "api-key:dddddddddddd4444:agent"), previous=prev)
+    assert wider["verdict"] == "audience_widened" and len(w.store.versions) == 1
+    w.acl.revoke(first["artifact_id"], ACL_OWNER)
+    assert w.attach(mail("m3"), data=PNG2, previous=prev)["verdict"] == "forbidden"
+    assert len(w.store.versions) == 1
+
+
+def test_without_the_acl_gate_the_graph_stays_private_even_if_the_caller_asks_for_gated():
+    w = World()
+    w.repo.graph._node_gates.clear()
+    out = w.attach()
+    assert out["graph"]["scope"] == {"visibility_scope": "private"}
+    assert not w.sees(STRANGER, f"artifact:{out['artifact_id']}")

@@ -45,12 +45,20 @@ class ArtifactGraphGate:
     def __init__(self, acl):
         self.acl = acl
 
-    def __call__(self, principal, node) -> bool:
+    def _holds(self, principal, node_id, permission) -> bool:
         pid = (principal or {}).get("id")
-        artifact_id = artifact_id_of(getattr(node, "id", ""))
+        artifact_id = artifact_id_of(node_id)
         if not pid or not artifact_id:
             return False
-        return any(_same_identity(pid, holder) for holder in self.acl.principals_with(artifact_id, "read"))
+        return any(_same_identity(pid, holder) for holder in self.acl.principals_with(artifact_id, permission))
+
+    def __call__(self, principal, node) -> bool:
+        return self._holds(principal, getattr(node, "id", ""), "read")
+
+    def may_write(self, actor, node_id) -> bool:
+        """Admission: only a principal holding ``edit`` on the artifact may write fields of its graph nodes, so a stranger
+        cannot pre-create or overlay ``artifact:<id>`` with a forged label or version facts."""
+        return self._holds(actor, node_id, "edit")
 
 
 def install_gate(graph, acl) -> ArtifactGraphGate | None:
@@ -59,6 +67,7 @@ def install_gate(graph, acl) -> ArtifactGraphGate | None:
         return None
     gate = ArtifactGraphGate(acl)
     graph.set_node_gate("artifact", gate)
+    graph.set_write_gate("artifact", gate.may_write)
     return gate
 
 
