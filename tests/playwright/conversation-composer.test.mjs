@@ -264,6 +264,28 @@ test('editor JSON format and find replace are undoable and preview is safely ren
   assert.deepEqual(await page.evaluate(() => window.sent), []);
 }));
 
+test('preview links fabric addresses through options.urls and never edits the draft', async () => withComposer(async (page) => {
+  const o = 'http://localhost:3188/app';
+  await page.evaluate((url) => {
+    window.prefetched = [];
+    window.mount({ urls: { prefetch: (t) => window.prefetched.push(t), resolver: { resolve: (u) => (u === url
+      ? { original: u, canonical: 'https://dev.lan:3188/app', status: 'resolved', service: 'web', host: '127.0.0.1' } : null) } } });
+  }, o);
+  const input = page.getByRole('combobox', { name: 'Message' });
+  await input.fill(`try ${o} now`);
+  await page.getByRole('button', { name: 'Expand editor' }).click();
+  await page.getByRole('button', { name: 'Split preview', exact: true }).click();
+  const link = page.locator('.conversation-editor-preview a.md-fabric-link');
+  assert.equal(await link.getAttribute('href'), 'https://dev.lan:3188/app');
+  assert.equal(await input.inputValue(), `try ${o} now`);          // the draft keeps the address as typed
+  assert.ok((await page.evaluate(() => window.prefetched)).some((t) => t.includes('localhost:3188')));
+  await page.evaluate(() => window.mount());                       // without a resolver the preview is unchanged
+  await page.getByRole('combobox', { name: 'Message' }).fill(`try ${o} now`);
+  await page.getByRole('button', { name: 'Expand editor' }).click();
+  await page.getByRole('button', { name: 'Split preview', exact: true }).click();
+  assert.equal(await page.locator('.conversation-editor-preview a.md-fabric-link').count(), 0);
+}));
+
 test('JSON viewer toggles raw content and handles clipboard denial', async () => withComposer(async (page) => {
   await page.evaluate(async () => {
     const { mountJsonViewer } = await import('/conversation-json.js');

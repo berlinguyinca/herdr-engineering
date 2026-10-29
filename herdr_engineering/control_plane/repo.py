@@ -1229,7 +1229,7 @@ class ControlPlaneRepo:
                        agent_session=None, revision=None, interactive_ready=None,
                        launch_pending=None, state_change_seq=None,
                        repository_id=None, commit_sha=None,
-                       transcript=None, parent_session_id=None, name=None, runtime=None):
+                       transcript=None, parent_session_id=None, name=None, runtime=None, worktree_id=None):
         runtime = _runtime(runtime)
         if transcript is not None:
             if (not isinstance(transcript, dict) or transcript.get("status") not in (
@@ -1257,7 +1257,7 @@ class ControlPlaneRepo:
                   "agent_session": agent_session, "revision": revision,
                   "interactive_ready": interactive_ready, "launch_pending": launch_pending,
                   "state_change_seq": state_change_seq,
-                  "repository_id": repository_id, "commit_sha": commit_sha,
+                  "repository_id": repository_id, "commit_sha": commit_sha, "worktree_id": worktree_id,
                   "transcript": transcript, "parent_session_id": _label(parent_session_id, session_id), "name": _label(name),
                   "runtime": runtime}
         if existing is None:
@@ -1308,7 +1308,7 @@ class ControlPlaneRepo:
                               "status", "cwd", "branch", "pid", "cmdline",
                               "summary", "attach", "pane_id", "terminal_id", "herdr_session",
                               "machine", "agent_session", "revision", "interactive_ready",
-                              "launch_pending", "state_change_seq", "repository_id", "commit_sha",
+                              "launch_pending", "state_change_seq", "repository_id", "commit_sha", "worktree_id",
                               "transcript", "parent_session_id", "name", "runtime") if existing.get(k) is not None}},
                           mission_id=existing["mission_id"],
                           session_id=session_id)
@@ -2988,7 +2988,17 @@ class ControlPlaneRepo:
         return {"keys": [{"key_id": k["key_id"], "project": k["project"],
                           "key_hash": k["key_hash"], "label": k.get("label", "")}
                          for k in self._llm_keys() if not k.get("revoked")],
-                "custom_models": list(self.list_custom_models().values())}
+                "custom_models": list(self.list_custom_models().values()),
+                "egress": self._egress_config()}
+
+    egress_fn = None   # set by the API: () -> operator YAML egress routes (project_intelligence.egress)
+
+    def _egress_config(self):
+        try:
+            value = self.egress_fn() if self.egress_fn else {}
+        except Exception:
+            return {}
+        return value if isinstance(value, dict) else {}
 
     # ------------------------------------------------------------- analytics
     def mission_analytics(self):
@@ -3420,7 +3430,7 @@ USAGE_ERROR_CLASSES = frozenset({
     "auth_invalid_key", "request_invalid", "request_too_large", "model_project_mismatch",
     "model_not_registered", "proxy_backpressure", "upstream_admission",
     "upstream_rejected_metadata", "upstream_client_error", "upstream_server_error",
-    "upstream_unreachable", "stream_truncated", "client_disconnected"})
+    "upstream_unreachable", "stream_truncated", "client_disconnected", "egress_denied"})
 _USAGE_ID = re.compile(r"^[A-Za-z0-9\-_.:/]{1,128}$")
 
 

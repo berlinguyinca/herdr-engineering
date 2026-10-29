@@ -63,3 +63,10 @@
 .conversation-input-wrap { position: static; }
 .conversation-composer--expanded { position: fixed; }
 .conversation-composer--expanded .conversation-input-wrap { position: relative; }
+.conversation-markdown .md-fabric-actions { display: inline-flex; gap: .25em; margin-left: .35em; opacity: 0; transition: opacity .12s; }
+.conversation-markdown .md-fabric-link:hover + .md-fabric-actions, .conversation-markdown .md-fabric-actions:hover, .conversation-markdown .md-fabric-actions:focus-within { opacity: 1; }
+@media (hover: none) { .conversation-markdown .md-fabric-actions { opacity: 1; } } /* touch devices have no hover */
+.conversation-markdown .md-fabric-copy { font-size: .75em; padding: .1em .45em; border-radius: .6em; border: 1px solid currentColor; background: transparent; color: inherit; cursor: pointer; }
+.conversation-markdown .md-fabric-copy[data-copied="true"]::after { content: " ✓"; }
+.conversation-markdown .md-fabric-copy[data-copied="failed"]::after { content: " ✗"; }
+.conversation-markdown .md-link-unreachable { text-decoration: underline dotted; opacity: .75; cursor: help; }

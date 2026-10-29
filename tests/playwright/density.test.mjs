@@ -58,11 +58,18 @@ async function withApp(fn, env = {}, fixture = 'server.py') {
   }
 }
 
+// The density, theme and calm controls live in the sidebar's collapsed Display menu.
+async function openDisplay(page) {
+  const open = await page.locator('details.hd-shell__display').evaluate((d) => d.open).catch(() => false);
+  if (!open) await page.locator('details.hd-shell__display > summary').click();
+}
+
 test('density sanitizes storage, applies immediately by keyboard, and survives reload', async () => {
   await withApp(async ({ page, base }) => {
     await page.goto(`${base}/#/overview`);
     await page.evaluate(() => localStorage.setItem('herdr-density', '{invalid}'));
     await page.reload();
+    await openDisplay(page);
     const density = page.getByRole('combobox', { name: 'Density' });
     await density.waitFor({ timeout: 5000 });
     assert.equal(await page.locator('html').getAttribute('data-density'), 'comfortable');
@@ -79,6 +86,7 @@ test('density sanitizes storage, applies immediately by keyboard, and survives r
     await page.keyboard.press('Enter');
     assert.equal(await page.locator('html').getAttribute('data-density'), 'compact');
     await page.reload();
+    await openDisplay(page);
     await density.waitFor({ timeout: 5000 });
     assert.equal(await density.inputValue(), 'compact');
     assert.equal(await page.evaluate(() => localStorage.getItem('herdr-density')), 'compact');
@@ -91,6 +99,7 @@ test('density preserves mobile controls and representative route containment at 
       await page.setViewportSize({ width, height: 1080 });
       for (const route of ['/overview', '/github', '/ci', '/services', '/analytics']) {
         await page.goto(`${base}/#${route}`);
+        await openDisplay(page);
         const density = page.getByRole('combobox', { name: 'Density' });
         await density.selectOption('dense', { timeout: 5000 });
         await page.locator('#view h1').first().waitFor();
@@ -123,6 +132,7 @@ test('populated tablet heatmap keeps touch targets within their own bucket colum
       for (const mode of ['14', '30']) {
         await page.locator(`[data-health-mode="${mode}"]`).click();
         for (const density of ['comfortable', 'compact', 'dense']) {
+          await openDisplay(page);
           await page.getByRole('combobox', { name: 'Density' }).selectOption(density);
           // Query and measure inside one browser task: CI history refreshes
           // periodically and replaces the heatmap subtree in place.

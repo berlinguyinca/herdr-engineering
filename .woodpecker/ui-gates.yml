@@ -8,10 +8,9 @@
 #  * the clone plugin fails invisibly on this backend: skip_clone plus a plain git checkout with the credential the agent stages.
 #  * pull_request and manual only, filtered to what can change the result, so it does not build twice for a push to a PR branch.
 #
-# STATUS: NOT RUN on any agent. Nobody has checked that an exec host has Chromium's shared libraries and Debian-style
-# /etc/fonts/conf.d, and the screenshots are compared pixel for pixel, so the first run is also the test of whether that host renders
-# like the workstation the baselines came from. If `baselines:check` fails there while every other gate passes, fix the host; do
-# not regenerate the baselines. GitHub Actions is disabled organisation-wide and is not used.
+# STATUS: the first run failed the pixel compare on all 88 pages because the exec host's fontconfig rendering settings differed from
+# the workstation's. The browser now runs under its own pinned fontconfig (tests/playwright/ui-gates-lib.mjs), so a host difference in
+# fonts or rendering settings no longer reaches a screenshot. GitHub Actions is disabled organisation-wide and is not used.
 when:
   - event: manual
   - event: pull_request

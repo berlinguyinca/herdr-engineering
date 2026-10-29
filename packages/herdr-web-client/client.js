@@ -263,6 +263,11 @@ export class HerdrClient {
     });
   }
 
+  // Start the full /summary report for one session; the result arrives as `full_report` on getAgentSummary.
+  startSummaryReport(id) {
+    return this.request(`/api/v1/sessions/${encodeURIComponent(id)}/summary/report`, { method: 'POST', body: {} });
+  }
+
   // Terminal button: the server builds the attach command from the session record; the
   // viewer runs it in their own terminal. Nothing is sent but the session id.
   getTerminalAttach(id) {
@@ -278,6 +283,20 @@ export class HerdrClient {
   // -- services / hosts ---------------------------------------------------
   listServices({ signal } = {}) {
     return this.request('/api/v1/services', { signal });
+  }
+
+  /** Canonical fabric URLs for URLs in agent output (read-only; originals are never changed). */
+  resolveFabricUrls(urls, sourceMachine = null, { signal } = {}) {
+    return this.request('/api/v1/fabric/resolve-urls', { method: 'POST', body: { urls, source_machine: sourceMachine }, signal });
+  }
+
+  /** Names that mark a URL as the fabric's (public fleet name, legacy aliases). */
+  getFabricNames({ signal } = {}) {
+    return this.request('/api/v1/fabric/names', { signal });
+  }
+
+  listFabricServices({ signal } = {}) {
+    return this.request('/api/v1/fabric/services', { signal });
   }
 
   listHosts({ signal } = {}) {
@@ -432,6 +451,7 @@ export class HerdrClient {
   getArchitectureNode(sid, nid, { signal } = {}) { return this._arch(`snapshots/${encodeURIComponent(sid)}/nodes/${encodeURIComponent(nid)}`, {}, signal); }
   expandArchitectureNode(sid, nid, { signal, ...params } = {}) { return this._arch(`snapshots/${encodeURIComponent(sid)}/nodes/${encodeURIComponent(nid)}/edges`, params, signal); }
   diffArchitecture(base, head, { signal, ...params } = {}) { return this._arch('diff', { base, head, ...params }, signal); }
+  getArchitectureBase(sid, { signal } = {}) { return this._arch(`snapshots/${encodeURIComponent(sid)}/base`, {}, signal); }
   getArchitectureOverlays(sid, { signal } = {}) { return this._arch(`snapshots/${encodeURIComponent(sid)}/overlays`, {}, signal); }
   getArchitectureCorrelations(sid, { signal, ...params } = {}) { return this._arch(`snapshots/${encodeURIComponent(sid)}/correlations`, params, signal); }
   getArchitectureNodeRooms(sid, nid, { signal } = {}) { return this._arch(`snapshots/${encodeURIComponent(sid)}/nodes/${encodeURIComponent(nid)}/rooms`, {}, signal); }

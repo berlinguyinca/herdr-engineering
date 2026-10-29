@@ -32,6 +32,16 @@ from .project_links import canonical_repository
 from .sink import EventAlreadyStored
 
 
+def _worktree_id(payload):
+    """The 24-hex worktree id an agent runtime derives from its git common dir and root (None when absent)."""
+    value = payload.get("worktree_id")
+    if value is None:
+        return None
+    if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{24}", value):
+        raise ValueError("worktree_id must be 24 lowercase hexadecimal characters")
+    return value
+
+
 def _git_identity(payload):
     """Only explicit forge identity and a dedicated full commit SHA link CI."""
     fields = ("repository_id", "forge_url", "repository_url", "repo_url", "clone_url")
@@ -670,7 +680,7 @@ class IngestService:
             cwd=payload.get("cwd"), branch=payload.get("branch"),
             pid=payload.get("pid"), cmdline=payload.get("cmdline"),
             summary=payload.get("summary"), attach=payload.get("attach"),
-            source=source, **_git_identity(payload),
+            source=source, **_git_identity(payload), worktree_id=_worktree_id(payload),
             **{k: payload.get(k) for k in (
                 "pane_id", "terminal_id", "herdr_session", "machine", "agent_session",
                 "revision", "interactive_ready", "launch_pending", "state_change_seq",

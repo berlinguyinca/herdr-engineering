@@ -21,6 +21,7 @@ import { mountReviewGate } from './review-gate-view.js';
 import { mountTopology } from './topology-view.js';
 import { mountArchitecture } from './architecture-view.js';
 import { mountPersonalAssistant } from './personal-assistant-view.js';
+import { mountProjectIntelligence } from './project-intelligence-view.js';
 import { visibleNav } from './nav-capabilities.js';
 import { mountSessionsView, sessionEntries } from './sessions-view.js';
 import { recordOutcome, statusOutcome } from './record-state.js';
@@ -33,6 +34,7 @@ import { morph, patchText } from './patch.js';
 import { flash, skeleton } from './motion.js';
 import { noteStreamContact, freshnessSources } from './freshness.js';
 import { mountServices, mountServiceDetails } from './services-view.js';
+import { mountFabricServices } from './fabric-services-view.js';
 import { mountCollab, completeSignInIfRedirected } from './collab-view.js';
 import { mountAttention, attentionBadge, POLL_MS as ATTENTION_POLL_MS } from './attention-view.js';
 import { createAttentionNotifier } from './attention-notify.js';
@@ -69,31 +71,35 @@ defineComponents();
 const client = new HerdrClient('');
 const root = document.getElementById('view');
 
+// Grouped sidebar. Entries sharing a `family` are ONE sidebar link and appear as tabs above the page
+// (the shell renders them), so related pages are combined without changing any route.
 const NAV = [
-  { path: '/overview', label: 'Overview' },
-  { path: '/attention', label: 'Attention' },
-  { path: '/topology', label: 'Topology' },
-  { path: '/architecture', label: 'Architecture', capability: 'architecture_v1' },
-  { path: '/missions', label: 'Missions' },
-  { path: '/herd', label: 'Agents' },
-  { path: '/services', label: 'Services' },
-  { path: '/local-services', label: 'Local services' },
-  { path: '/system-services', label: 'System services' },
-  { path: '/github/projects', label: 'Project boards' },
-  { path: '/github', label: 'Projects' },
-  { path: '/ci', label: 'CI' },
-  { path: '/reviews', label: 'Reviews' },
-  { path: '/review-gate', label: 'Review gate' },
-  { path: '/hosts', label: 'Hosts' },
-  { path: '/activity', label: 'Activity' },
-  { path: '/analytics', label: 'Analytics' },
-  { path: '/llm', label: 'LLM' },
-  { path: '/collab', label: 'Collaboration' },
-  { path: '/artifacts', label: 'Artifacts' },
-  { path: '/publications', label: 'Publications' },
-  { path: '/scheduling', label: 'Scheduling' },
-  { path: '/handoffs', label: 'Handoffs' },
-  { path: '/personal-assistant', label: 'Personal Assistant', capability: 'assistant_v1' },
+  { path: '/overview', label: 'Overview', group: 'Now' },
+  { path: '/attention', label: 'Attention', group: 'Now' },
+  { path: '/missions', label: 'Missions', group: 'Work' },
+  { path: '/herd', label: 'Agents', group: 'Work' },
+  { path: '/handoffs', label: 'Handoffs', group: 'Work' },
+  { path: '/github', label: 'Projects', group: 'Work', family: 'projects', familyLabel: 'Projects', tab: 'Overview' },
+  { path: '/github/projects', label: 'Project boards', group: 'Work', family: 'projects', tab: 'Boards' },
+  { path: '/ci', label: 'CI', group: 'Delivery', family: 'delivery', familyLabel: 'CI & reviews', tab: 'CI' },
+  { path: '/reviews', label: 'Reviews', group: 'Delivery', family: 'delivery', tab: 'Reviews' },
+  { path: '/review-gate', label: 'Review gate', group: 'Delivery', family: 'delivery', tab: 'Review gate' },
+  { path: '/artifacts', label: 'Artifacts', group: 'Delivery', family: 'artifacts', familyLabel: 'Artifacts', tab: 'Artifacts' },
+  { path: '/publications', label: 'Publications', group: 'Delivery', family: 'artifacts', tab: 'Publications' },
+  { path: '/hosts', label: 'Hosts', group: 'Fleet' },
+  { path: '/services', label: 'Services', group: 'Fleet', family: 'services', familyLabel: 'Services', tab: 'Catalog' },
+  { path: '/fabric-services', label: 'Fabric services', group: 'Fleet', family: 'services', tab: 'Fabric' },
+  { path: '/local-services', label: 'Local services', group: 'Fleet', family: 'services', tab: 'Local' },
+  { path: '/system-services', label: 'System services', group: 'Fleet', family: 'services', tab: 'System' },
+  { path: '/topology', label: 'Topology', group: 'Fleet', family: 'topology', familyLabel: 'Topology', tab: 'Topology' },
+  { path: '/architecture', label: 'Architecture', group: 'Fleet', family: 'topology', tab: 'Architecture', capability: 'architecture_v1' },
+  { path: '/scheduling', label: 'Scheduling', group: 'Fleet' },
+  { path: '/analytics', label: 'Analytics', group: 'Insights', family: 'insight', familyLabel: 'Analytics', tab: 'Analytics' },
+  { path: '/llm', label: 'LLM', group: 'Insights', family: 'insight', tab: 'LLM' },
+  { path: '/activity', label: 'Activity', group: 'Insights', family: 'insight', tab: 'Activity' },
+  { path: '/collab', label: 'Collaboration', group: 'Workspace' },
+  { path: '/personal-assistant', label: 'Personal Assistant', group: 'Workspace', capability: 'assistant_v1' },
+  { path: '/intelligence', label: 'Project intelligence', group: 'Workspace', capability: 'project_intelligence_v1' },
 ];
 
 const SHELL = document.getElementById('shell');
@@ -155,9 +161,11 @@ const ROUTES = {
   '/services': viewServices,
   '/system-services': viewServices,
   '/local-services': viewServices,
+  '/fabric-services': viewFabricServices,
   '/services/:id': viewService,
   '/hosts': viewHosts,
   '/personal-assistant': viewPersonalAssistant,
+  '/intelligence': viewIntelligence,
   '/hosts/:id': viewHost,
   '/activity': viewActivity,
   '/analytics': viewAnalytics,
@@ -210,6 +218,15 @@ async function viewPersonalAssistant() {
   const chip = root.querySelector('herdr-freshness');
   return { dispose: mountPersonalAssistant(root.querySelector('#personal-assistant'), client,
     { onFreshness: (ok, message) => chip.touch(ok, message) }) };
+}
+
+async function viewIntelligence() {
+  root.innerHTML = `${liveHead('<h1>Project intelligence</h1>')}<div id="project-intelligence"></div>`;
+  const chip = root.querySelector('herdr-freshness');
+  const view = mountProjectIntelligence(root.querySelector('#project-intelligence'), client, { query: route().query,
+    onFreshness: (ok, message) => chip.touch(ok, message),
+    setQuery: (o) => history.replaceState(null, '', `#/intelligence${Object.keys(o).length ? `?${new URLSearchParams(o)}` : ''}`) });
+  return { dispose: view.dispose, refresh: view.refresh };
 }
 
 function mountView(view) {
@@ -858,6 +875,12 @@ async function viewServices(_parts, revision) {
   const { services } = await client.listServices();
   if (revision !== renderRevision) return;
   return mountServices(root, client, services, { scope: ({'system-services':'system','local-services':'local'})[_parts[0]] || 'herdr', showAll: route().query.get('all') === '1', status: route().query.get('status') || undefined });
+}
+
+async function viewFabricServices(_parts, revision) {
+  const data = await client.listFabricServices();
+  if (revision !== renderRevision) return;
+  return mountFabricServices(root, client, data, { search: route().query.get('search') || '' });
 }
 
 async function viewService(parts, revision) {
