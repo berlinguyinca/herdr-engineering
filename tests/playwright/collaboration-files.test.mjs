@@ -174,7 +174,7 @@ for (const surface of ['public', 'dashboard']) {
     await page.locator('[data-file-path="data"]').click();
     let release; holds.set('/rooms/r1/files/a/access', new Promise(r => { release = r; }));
     await page.locator('[data-file-id="a"]').getByRole('button', { name: 'Preview', exact: true }).click();
-    await page.getByRole('tab', { name: '＋ New room', exact: true }).click();
+    await page.getByRole('tab', { name: '+ New room', exact: true }).click();
     release({ url: 'https://objects.example/authorized', expires_at: Date.now() / 1000 + 60 });
     await page.locator('[data-room="r1"]').click();
     await page.getByRole('tab', { name: 'Files', exact: true }).click();
