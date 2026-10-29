@@ -322,7 +322,7 @@ personal_assistant:
 ### Anchor timer (systemd, repo files only; nothing is installed or enabled by the repo)
 Files in `deploy/control-plane/`: `herdr-audit-anchor.service` + `.timer` (every 15 minutes) and `herdr-audit-verify.service` +
 `.timer` (hourly). Both are oneshot system units run as a dedicated login-less user, with `NoNewPrivileges`, `ProtectSystem=strict`,
-`ProtectHome`, `PrivateTmp`, `Restart=no`, no capabilities and no environment variables. Only the anchor unit may write, and only
+`ProtectHome=read-only`, `PrivateTmp`, `Restart=no`, no capabilities and no environment variables. Only the anchor unit may write, and only
 `ReadWritePaths=/var/lib/herdr-anchor`; the verify unit has that directory read-only. `verify` exits 1 on anything but `ok`
 (`rolled_back`, `diverged`, `chain_broken`, `anchor_tampered`, `no_anchor`, or a failed request), so the unit shows as failed; add
 `OnFailure=` to page.
@@ -334,6 +334,9 @@ Operator steps (run by you, on the host that will anchor, ideally NOT the contro
    `version: 1`, `hosts: {}`, `sections.control_plane.roles: [control-plane]`, and under `values`
    `personal_assistant.audit.anchor_file: /var/lib/herdr-anchor/assistant-audit.anchor`.
 3. Replace `https://REPLACE-control-plane.example.invalid` in both services; check `herdr-eng` is at `/usr/local/bin/herdr-eng`.
+   `ProtectHome=read-only` keeps `/home` readable, so a `herdr-eng` that is a venv shim under a home directory still runs; but the
+   unit's login-less user must be able to traverse and read that path (or install the binary under `/usr/local`). The units allow
+   `AF_UNIX` besides `AF_INET`/`AF_INET6` because NSS/nscd name resolution can need it.
 4. Append-only: create the file once (`install -m 0600 -o herdr-anchor -g herdr-anchor /dev/null /var/lib/herdr-anchor/assistant-audit.anchor`)
    and run `chattr +a` on it as root. The anchor opens it `O_APPEND`, so appends keep working while rewriting or truncating it
    needs root to `chattr -a` first. Put the directory on its own filesystem or device; `chattr +a` on the directory also stops

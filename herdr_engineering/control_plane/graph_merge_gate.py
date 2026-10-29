@@ -103,7 +103,12 @@ def _status(conclusion) -> str:
 def graph_checks(graph, reader, pr_id: str, head_sha: str, writers: frozenset) -> tuple[list[CheckRun], dict]:
     """(checks bound to ``head_sha``, notes). Raises KeyError when the PR node is not visible to ``reader``."""
     head = head_sha.lower()
-    edges = graph.neighborhood(reader, pr_id, depth=1)["edges"]
+    # the configured writers' edges come from a direct, writer-filtered accessor, never from the budgeted neighbourhood
+    # read: any key may add `validated` edges into a PR, and a flood of them must not hide the writer's evidence.
+    # The neighbourhood read is kept only to count (best effort) the edges that are not trusted.
+    trusted = graph.edges_into_by_writers(reader, pr_id, "validated", writers)
+    around = graph.neighborhood(reader, pr_id, depth=1, direction="in", edge_types={"validated"})["edges"]
+    edges = trusted + [e for e in around if (e.get("provenance") or {}).get("writer") not in writers]
     best: dict[str, tuple[int, CheckRun]] = {}
     notes = {"stale": [], "untrusted": 0}
     for e in edges:

@@ -29,6 +29,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import re
+import time
 from dataclasses import dataclass
 
 from ..review_gate.trigger import _num, ci_verdict_for
@@ -46,6 +47,9 @@ _REPO_KEYS = frozenset({"repo", "prs"})
 MAX_REPOS = 64
 MAX_PRS = 256
 _REMEMBER = 4096
+_WARN_EVERY = 900.0              # seconds between repeats of the SAME refusal for the same PR
+_REVIVALS = 16                 # extra admissions tried when a written edge is still not visible
+_VERIFIER = {"kind": "operator", "id": "key:evidence-verify", "authenticated_by": "merge_gate"}
 
 
 @dataclass(frozen=True)
@@ -131,8 +135,11 @@ def _signature(sha: str, rows, enrollment) -> str:
 class GraphEvidenceWriter:
     """``observe(enrollment, pr, rows, stale)`` is the review gate's ``evidence_hook``. Never raises into the gate."""
 
-    def __init__(self, *, ingest, section_fn):
+    def __init__(self, *, ingest, section_fn, graph_fn=None, clock=time.monotonic):
         self._ingest = ingest
+        self._graph_fn = graph_fn              # optional: lets the writer confirm its edge exists before it trusts its memo
+        self._clock = clock
+        self._warned: dict = {}                # (repo, number) -> (error, last logged at)
         self._section_fn = section_fn          # raw ``control_plane.graph_merge_gate`` mapping, read hot on every call
         self._done: dict = {}
         self.last_error: str | None = None
@@ -155,24 +162,53 @@ class GraphEvidenceWriter:
         conclusion = "success" if verdict.result == "green" else "failure"
         sig = _signature(sha, rows, enrollment)
         memo = (repo, number, sha, cfg.check, sig)
-        if memo in self._done:
+        if memo in self._done and self._present(cfg, repo, number, sha, sig):
             return "known"
         try:
             self._write(cfg, repo, number, sha, conclusion, sig)
         except Exception as exc:               # noqa: BLE001 - evidence is best effort; the gate then simply waits
             self.last_error = f"{type(exc).__name__}: {exc}"[:300]
-            log.warning("graph evidence: %s#%s not written", repo, number)
+            self._warn(repo, number, self.last_error)
             return "error"
         self.last_error = None
+        self._warned.pop((repo, number), None)
         if len(self._done) >= _REMEMBER:
             self._done.pop(next(iter(self._done)))
         self._done[memo] = conclusion
         return "written"
 
+    def _warn(self, repo, number, error: str) -> None:
+        """One warning per (PR, error) per ``_WARN_EVERY`` seconds, not one per tick."""
+        now, last = self._clock(), self._warned.get((repo, number))
+        if last is not None and last[0] == error and now - last[1] < _WARN_EVERY:
+            return
+        if len(self._warned) >= _REMEMBER:
+            self._warned.pop(next(iter(self._warned)))
+        self._warned[(repo, number)] = (error, now)
+        log.warning("graph evidence: %s#%s not written (%s)", repo, number, error)
+
+    def _run_id(self, cfg, repo, number, sha, sig) -> str:
+        # under the writer's own namespace: ingest lets only a ``ci-evidence:`` principal (or an operator) create it, so a
+        # predictable id cannot be pre-created by a stranger to make this write fail every tick
+        return f"ci:{cfg.principal}/{repo}#{number}/{cfg.check}/{sig}@{sha}"
+
+    def _present(self, cfg, repo, number, sha, sig) -> bool:
+        """Is the run's edge still live in the graph? ``True`` without a graph handle (the memo is then all there is).
+        An operator ``edge.remove``, retention or a rebuild can lose it; the memo must not hide that."""
+        if self._graph_fn is None:
+            return True
+        run_id = self._run_id(cfg, repo, number, sha, sig)
+        try:
+            edges = self._graph_fn().edges_into_by_writers(_VERIFIER, f"pr:{repo}#{number}", "validated",
+                                                           {cfg.principal})
+        except Exception:                       # noqa: BLE001 - cannot tell: rewrite (idempotent) rather than trust the memo
+            return False
+        return any(e["from_id"] == run_id and (e.get("binding") or {}).get("commit") == sha for e in edges)
+
     def _write(self, cfg, repo, number, sha, conclusion, sig) -> None:
         principal = {"kind": "agent", "id": cfg.principal, "authenticated_by": "evidence_writer"}
         pr_id = f"pr:{repo}#{number}"
-        run_id = f"ci:{repo}#{number}/{cfg.check}/{sig}@{sha}"
+        run_id = self._run_id(cfg, repo, number, sha, sig)
 
         def send(source, seq, event_type, entity_id, payload):
             self._ingest.ingest({
@@ -190,3 +226,10 @@ class GraphEvidenceWriter:
         send(src, 1, "node.upsert", run_id, {"node_type": "ci", "node_id": run_id,
                                               "label": f"{cfg.check} {conclusion}", "state": conclusion, "attrs": attrs})
         send(src, 2, "edge.add", run_id, {"edge_type": "validated", "from_id": run_id, "to_id": pr_id, "attrs": attrs})
+        # An edge that was written before but is gone (operator remove, retention, a rebuild) is not revived by replaying the
+        # same event: that is a duplicate. Confirm it is visible, and if not admit it again as a NEW event (next sequence).
+        for extra in range(1, _REVIVALS + 1):
+            if self._present(cfg, repo, number, sha, sig):
+                return
+            send(src, 2 + extra, "edge.add", run_id,
+                 {"edge_type": "validated", "from_id": run_id, "to_id": pr_id, "attrs": attrs})

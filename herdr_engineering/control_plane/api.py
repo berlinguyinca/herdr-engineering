@@ -1202,7 +1202,8 @@ class ControlPlaneServer:
                 return (fleet_config.current().section("control_plane") or {}).get("graph_merge_gate")
             except FleetConfigError:
                 return None
-        self.graph_evidence_writer = GraphEvidenceWriter(ingest=self.ingest, section_fn=section)
+        self.graph_evidence_writer = GraphEvidenceWriter(ingest=self.ingest, section_fn=section,
+                                                      graph_fn=lambda: self.repo.graph)
         return self.graph_evidence_writer.observe
 
     def _build_graph_gate(self, fleet_config):

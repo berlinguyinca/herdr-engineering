@@ -27,7 +27,7 @@ TimeoutStartSec=2min
 NoNewPrivileges=yes
 ProtectSystem=strict
 ReadWritePaths=/var/lib/herdr-anchor
-ProtectHome=yes
+ProtectHome=read-only
 PrivateTmp=yes
 PrivateDevices=yes
 ProtectKernelTunables=yes
@@ -35,7 +35,7 @@ ProtectKernelModules=yes
 ProtectControlGroups=yes
 RestrictSUIDSGID=yes
 LockPersonality=yes
-RestrictAddressFamilies=AF_INET AF_INET6
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 CapabilityBoundingSet=
 # REPLACE the control-plane URL with the real one (host.json is per-user, and this user has no home).
 ExecStart=/usr/local/bin/herdr-eng control-plane assistant-audit anchor --fleet-config /etc/herdr/anchor/fleet-config.yaml --control-plane https://REPLACE-control-plane.example.invalid --api-key-file /etc/herdr/anchor/approver.key
