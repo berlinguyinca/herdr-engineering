@@ -23,6 +23,7 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ### Control plane: inspector replay snapshots (opt-in)
 - `control_plane.inspector_snapshots.enabled` lets the worker keep a replay snapshot of the inspector in the new `inspector_snapshots` table (migration 0030) so a boot replays only newer events instead of ~780k (about nine minutes). Off by default; any doubt makes the boot replay everything. See `deploy/control-plane/README.md`.
+- With a verified snapshot the boot also skips loading the inspector rows it covers (SQL filter on the watermark; the repo fetches them back if it refuses the snapshot).
 - Deploy health window 30 minutes (#373) and boot phase timings in the log; host-metrics rollups replay in linear time (#379).
 
 ### Dashboard: on-demand full `/summary` report

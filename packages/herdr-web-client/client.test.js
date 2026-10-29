@@ -214,6 +214,16 @@ test('getCi requests /api/v1/ci', async () => {
   assert.equal(r.available, false);
 });
 
+test('getDeployments requests /api/v1/deployments', async () => {
+  const calls = [];
+  const client = new HerdrClient('', {
+    fetchImpl: async (url) => { calls.push(url); return { ok: true, text: async () => '{"plans": []}' }; },
+  });
+  const r = await client.getDeployments();
+  assert.equal(calls[0], '/api/v1/deployments');
+  assert.deepEqual(r.plans, []);
+});
+
 test('getTests requests /api/v1/tests', async () => {
   const calls = [];
   const client = new HerdrClient('', {

@@ -7,6 +7,8 @@ for identity. There is no write path here.
 """
 from __future__ import annotations
 
+import hashlib
+import re
 from collections.abc import Callable
 from datetime import UTC, datetime
 
@@ -93,9 +95,9 @@ class ActionLineageEmitter:
     action created) and ``references`` (the node it was about). Everything is ``private`` to the user the
     assistant acts for. Event ids derive from the action id, so a replay is a no-op. Emission is best effort.
     """
-    DELEGATING = frozenset({"request_review", "propose_branch", "request_mission"})
+    DELEGATING = frozenset({"request_review", "propose_branch", "request_mission", "dispatch_delegation"})
     ATTRS = ("assistant_id", "thread_id", "run_id", "action_id", "approval_id", "request_hash",
-             "idempotency_key", "tool_id", "delegation_id", "proposal_id", "artifact_id", "target_id")
+             "idempotency_key", "tool_id", "delegation_id", "handoff_id", "proposal_id", "artifact_id", "target_id")
 
     def __init__(self, ingest, principal_for_user: Callable[[str], dict | None]):
         self.ingest, self.principal_for_user = ingest, principal_for_user
@@ -108,7 +110,11 @@ class ActionLineageEmitter:
             result["error"] = "no principal or action id; nothing emitted"
             return result
         n = [0]
-        source = f"asst-{action_id}"[:64]
+        # ingest wants a lowercase source of at most 32 characters from [a-z0-9_-]; an id that does not fit is hashed
+        # (still one stable source per action, so a replay stays a no-op)
+        source = f"asst-{action_id}".lower()
+        if len(source) > 32 or not re.fullmatch(r"[a-z][a-z0-9_-]*", source):
+            source = "asst-" + hashlib.sha256(action_id.encode()).hexdigest()[:24]
 
         def send(event_type: str, entity_id: str, payload: dict) -> None:
             n[0] += 1
