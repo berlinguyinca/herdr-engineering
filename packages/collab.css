@@ -430,7 +430,7 @@ button.ctx-chip:focus-visible, .ctx-chip:focus-visible { outline: 2px solid curr
 /* Inline (not inline-flex, no nowrap) so a 48-character address wraps inside a 320px bubble instead of overflowing (1.4.10). */
 .cx-mention { display: inline; padding: 0 4px; border-radius: 999px; font-weight: 600; overflow-wrap: anywhere; word-break: break-word;
   -webkit-box-decoration-break: clone; box-decoration-break: clone;
-  background: var(--accent-weak, var(--surface-2)); color: var(--text); border: 1px solid var(--border-subtle); }
+  background: var(--accent-weak, var(--surface-2)); color: var(--accent-strong, var(--text)); border: 1px solid var(--border-subtle); }
 .cx-mention--agent { background: var(--violet-weak, var(--surface-2)); }
 .cx-mention--group { background: var(--surface-2); }
 /* generated text: shown and announced, but not copied, so a copied message keeps its literal "@ext-..." */
