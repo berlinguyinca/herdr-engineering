@@ -50,7 +50,7 @@ function inspector(item, kindLabel, urls) {
   const links = seen.map((l) => `<a class="at-action" href="${esc(l.href)}">${esc(l.label)}</a>`).join('');
   const field = (name, value) => `<div><dt>${name}</dt><dd>${value}</dd></div>`;
   return `<div class="at-inspect" data-attention-inspector="${esc(item.key)}">
-    ${text(item.detail).length > 60 || /[\n]/.test(text(item.detail)) ? `<p>${linkifyFabricText(item.detail, urls)}</p>` : ''}
+    ${text(item.detail).length > 60 || /[\n]|:\/\//.test(text(item.detail)) ? `<p>${linkifyFabricText(item.detail, urls)}</p>` : ''}
     <dl>${field('Kind', esc(kindLabel))}${field('Source', esc(text(item.source) || 'not reported'))}${field('First seen', esc(when(item.first_seen)))}${field('Last seen', esc(when(item.last_seen)))}${Number.isFinite(item.count) && item.count > 1 ? field('Occurrences', String(item.count)) : ''}${field('State', esc(text(item.state) || 'open'))}</dl>
     ${links ? `<p class="at-links">${links}</p>` : ''}</div>`;
 }
