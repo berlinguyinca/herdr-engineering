@@ -168,7 +168,7 @@ root.addEventListener('hd-freshness', (event) => markAvailability(event.detail.o
 window.addEventListener('hashchange', applyRoutes);   // the entry you are on stays listed; leaving it lets it go
 applyRoutes();
 // Optional tabs appear once /api/v1/health advertises their capability; a failed probe keeps them hidden.
-client.health().then((h) => { capabilities = h?.capabilities || []; applyRoutes(); }).catch(() => { /* optional tabs stay hidden */ });
+client.health({ probe: true }).then((h) => { capabilities = h?.capabilities || []; applyRoutes(); }).catch(() => { /* optional tabs stay hidden */ });
 SHELL.setAttribute('brand', 'HerdR Dev Fabric');
 
 // The nav badge follows the server inbox on every page, so a new critical item is visible from anywhere.

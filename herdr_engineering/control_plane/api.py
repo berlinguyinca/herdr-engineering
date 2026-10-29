@@ -1282,6 +1282,40 @@ class ControlPlaneServer:
             raise InvalidError("native agent is not ready for prompt delivery")
         return adapter.send_input(target, message, machine=machine, session=server)
 
+    def _capabilities(self):
+        """Advertised feature flags. Cheap: reads in-memory config only, never the repo,
+        the inspector's per-session scan, or the request-metrics snapshot."""
+        caps = ["mission_activity_v1", "ci_v1", "plannotator_reviews_v1", "github_v1"]
+        if self.collab is not None:
+            caps.append("collab_v1")
+        if getattr(self, "assistant", None) is not None and self.assistant.config.get("enabled"):
+            caps.append("assistant_v1")
+        if getattr(self, "intelligence", None) is not None and self.intelligence._cfg()[0]["enabled"]:
+            caps.append("project_intelligence_v1")
+        if getattr(self, "unified_workspace_enabled", False):
+            caps.append("unified_workspace_v1")
+        if getattr(self, "skills", None) is not None:
+            caps.append("skill_registry_v1")
+        try:
+            if self.deployment_definitions.status()["configured"]:
+                caps.append("deployments_v1")     # the read-only Deployments page
+        except Exception:  # noqa: BLE001 - health must answer even if the definitions cannot be read
+            pass
+        if self.architecture.enabled:
+            caps.append("architecture_v1")
+            if self.architecture.explain_config:
+                caps.append("architecture_explain_v1")
+        return caps
+
+    def _health_probe(self):
+        """O(1) liveness + capability shape for the deploy gate and the dashboard nav
+        probe. Deliberately excludes repo counters, the inspector's O(total-events)
+        scan and the request-metrics snapshot -- those make full /health slow under
+        load and are served by the default /health and /api/v1/metrics instead.
+        Preserves the status/version/commit fields deploy.sh's healthy_commit gate."""
+        return {"status": "ok", "version": __version__, "commit": _COMMIT,
+                "capabilities": self._capabilities()}
+
     def _health(self):
         """Repo stats + deployment context (source backend, image version/commit)."""
         h = self.repo.health()
@@ -1297,26 +1331,7 @@ class ControlPlaneServer:
                                 rejected_requests=getattr(self._httpd, 'rejected_requests', 0))
         if self.collab is not None and self.collab.degraded:
             h["collab_degraded"] = True       # no detail here: the reason is in the server log and the repair command
-        h["capabilities"] = ["mission_activity_v1", "ci_v1", "plannotator_reviews_v1", "github_v1"]
-        if self.collab is not None:
-            h["capabilities"].append("collab_v1")
-        if getattr(self, "assistant", None) is not None and self.assistant.config.get("enabled"):
-            h["capabilities"].append("assistant_v1")
-        if getattr(self, "intelligence", None) is not None and self.intelligence._cfg()[0]["enabled"]:
-            h["capabilities"].append("project_intelligence_v1")
-        if getattr(self, "unified_workspace_enabled", False):
-            h["capabilities"].append("unified_workspace_v1")
-        if getattr(self, "skills", None) is not None:
-            h["capabilities"].append("skill_registry_v1")
-        try:
-            if self.deployment_definitions.status()["configured"]:
-                h["capabilities"].append("deployments_v1")     # the read-only Deployments page
-        except Exception:  # noqa: BLE001 - health must answer even if the definitions cannot be read
-            pass
-        if self.architecture.enabled:
-            h["capabilities"].append("architecture_v1")
-            if self.architecture.explain_config:
-                h["capabilities"].append("architecture_explain_v1")
+        h["capabilities"] = self._capabilities()
         return h
 
     # ------------------------------------------------------- SSE plumbing
@@ -1979,6 +1994,12 @@ def _make_handler(server, public=False, operator=False):
                 return self._fleet_config_get()
             if self._path_only() in _DEPLOYMENT_HOST_GET_PATHS:      # host token, not X-API-Key
                 return self._deployment_host_get(_DEPLOYMENT_HOST_GET_PATHS[self._path_only()])
+            if self._path_only() == "/api/v1/health" and "probe" in parse_qs(urlsplit(self.path).query):
+                # Cheap liveness+capability probe (?probe=1): O(1), no repo counters,
+                # no inspector O(total-events) scan, no metrics snapshot. Used by
+                # deploy.sh's health gate and the dashboard nav-capability probe so a
+                # loaded server cannot make the deploy/initial-render time out.
+                return self._json(server._health_probe())
             if self._path_only() == "/api/v1/health" and self._role() is None:
                 # Keyed mode without a valid key: liveness only (deploy.sh's health
                 # check needs status + commit), no counters, sources or capabilities.

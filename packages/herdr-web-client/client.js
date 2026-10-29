@@ -630,8 +630,10 @@ export class HerdrClient {
   }
 
   // -- health / self-observability -----------------------------------------
-  health({ signal } = {}) {
-    return this.request('/api/v1/health', { signal });
+  health({ signal, probe } = {}) {
+    // probe=true requests the O(1) liveness+capability shape (?probe=1) so the
+    // nav probe on first paint never drags the heavy inspector/metrics payload.
+    return this.request(probe ? '/api/v1/health?probe=1' : '/api/v1/health', { signal });
   }
 
   // -- Herdr Personal Assistant (Rakazo integration) -----------------------
