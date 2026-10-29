@@ -39,6 +39,15 @@
 #      deploy, or one whose running commit predates the directory-mounted fleet
 #      config, has no automatic rollback and says so.
 #
+# GitHub App key (optional, fleet config `github.app`): ~/.config/herdr-engineering/github-app/
+# is mounted read-only at /etc/herdr/github-app/ into control-plane-web (the only service
+# that reads GitHub). It must be a real 0700 directory owned by the deploying user holding
+# nothing or exactly one regular file `github-app.pem` (no symlink, owner-only mode, e.g.
+# 0600), else the deploy refuses before building. A missing directory is created empty
+# (0700) on a real deploy. The container runs as root (rootless docker: as the deploying
+# user), so an owner-only file is readable there, exactly like the fleet file: never
+# loosen its mode. Set `github.app.private_key_file: /etc/herdr/github-app/github-app.pem`.
+#
 #   HERDR_CP_HEALTH_URL / _TRIES (900) / _INTERVAL (2s) tune the health check.
 #
 # The central file is the only configuration source: no env file is authored or
@@ -87,6 +96,41 @@ if [ -n "$OTHERS" ]; then
   echo "move the file into its own directory (default ~/.config/herdr-engineering/fleet/) and leave a symlink at the old path" >&2
   exit 1
 fi
+
+# The GitHub App key gets its OWN read-only mount (the fleet dir holds only the config).
+GITHUB_APP_DIR="$HOME/.config/herdr-engineering/github-app"
+check_github_app_dir() {   # nothing printed but names; never the key
+  local d="$GITHUB_APP_DIR" mode others f
+  [ -e "$d" ] || [ -L "$d" ] || return 0
+  if [ -L "$d" ] || [ ! -d "$d" ]; then
+    echo "$d must be a real directory (not a symlink or a file)" >&2; return 1
+  fi
+  if [ "$(stat -c %u "$d")" != "$(id -u)" ]; then
+    echo "$d must be owned by the deploying user (uid $(id -u))" >&2; return 1
+  fi
+  mode="$(stat -c %a "$d")"
+  if [ "$mode" != 700 ]; then
+    echo "$d must be mode 0700 (it is $mode): chmod 700 $d" >&2; return 1
+  fi
+  others="$(find "$d" -mindepth 1 -maxdepth 1 ! -name github-app.pem -printf '%f ' 2>/dev/null || true)"
+  if [ -n "$others" ]; then
+    echo "$d must hold only github-app.pem (the directory is mounted into control-plane-web); also found: $others" >&2
+    return 1
+  fi
+  f="$d/github-app.pem"
+  [ -e "$f" ] || [ -L "$f" ] || return 0
+  if [ -L "$f" ] || [ ! -f "$f" ]; then
+    echo "$f must be a regular file (not a symlink)" >&2; return 1
+  fi
+  if [ "$(stat -c %u "$f")" != "$(id -u)" ]; then
+    echo "$f must be owned by the deploying user (uid $(id -u))" >&2; return 1
+  fi
+  mode="$(stat -c %a "$f")"
+  if [ "$(( 8#$mode & 8#077 ))" != 0 ]; then
+    echo "$f must not be readable by group or others (it is $mode): chmod 600 $f" >&2; return 1
+  fi
+}
+check_github_app_dir || exit 1
 
 WORK=""; ENV_DIR=""; PREV_WORK=""
 cleanup() {
@@ -217,7 +261,8 @@ if [ "$DRY" = 1 ]; then
   echo "[dry-run] rendered the compose variables to a 0600 file in a 0700 temp dir (removed on exit)"
   if docker compose version >/dev/null 2>&1; then
     # -q prints nothing on success; errors are withheld so no value can leak.
-    if HERDR_CP_FLEET_DIR="$FLEET_DIR" HERDR_CP_IMAGE_TAG="$TAG" HERDR_CP_GIT_COMMIT="$SHA" \
+    if HERDR_CP_FLEET_DIR="$FLEET_DIR" HERDR_CP_GITHUB_APP_DIR="$GITHUB_APP_DIR" \
+        HERDR_CP_IMAGE_TAG="$TAG" HERDR_CP_GIT_COMMIT="$SHA" \
         docker compose --env-file "$ENV_FILE" -p "$PROJECT" "${COMPOSE_FILES[@]}" config -q >/dev/null 2>&1; then
       echo "[dry-run] docker compose config: valid"
     else
@@ -229,6 +274,7 @@ if [ "$DRY" = 1 ]; then
   fi
   echo "[dry-run] would run: herdr-eng fleet config render-compose --path <central> --out <file>"
   echo "[dry-run] control-plane-web and worker mount $FLEET_DIR read-only; the file is $MOUNT_TARGET"
+  echo "[dry-run] control-plane-web mounts $GITHUB_APP_DIR read-only at /etc/herdr/github-app$([ -d "$GITHUB_APP_DIR" ] || echo ' (would create it empty, 0700)')"
   echo "[dry-run] llm-proxy mounts only the llm slice (rendered to a temp dir; would install it at ~/.config/herdr-engineering/llm-proxy/)"
   if [ "$COLLAB" = 1 ]; then
     echo "[dry-run] rendered control_plane.collab to a temp slice; after the build would install it at ~/.config/herdr-engineering/collab/, the edge nginx.conf, and the collab-sync timer"
@@ -327,6 +373,11 @@ if [ "$CENTRAL_HASH" != "$(sha256sum "$ATTEMPT/candidate/fleet-config.yaml" | cu
   exit 1
 fi
 ROLLBACK_IMAGES=""
+# the GitHub App key mount source must exist (empty is fine: github.app then fails closed)
+if [ ! -e "$GITHUB_APP_DIR" ]; then
+  mkdir -p "$(dirname "$GITHUB_APP_DIR")" && mkdir -m 700 "$GITHUB_APP_DIR"
+fi
+check_github_app_dir || exit 1
 
 # ---- host files this deploy may change, backed up so every failure path restores them
 BACKUP_DIR="$ENV_DIR/backup"; mkdir -p "$BACKUP_DIR"
@@ -382,7 +433,7 @@ compose_run() {
   if [ "$COLLAB" = 1 ]; then files+=(-f "$tree/deploy/control-plane/compose.collab.yaml"); fi
   if [ -n "$ROLLBACK_IMAGES" ]; then files+=(-f "$ROLLBACK_IMAGES"); fi
   HERDR_CP_FLEET_DIR="$FLEET_DIR" HERDR_LLM_SLICE_DIR="$LLM_DIR" \
-    HERDR_CP_IMAGE_TAG="$tag" HERDR_CP_GIT_COMMIT="$commit" \
+    HERDR_CP_GITHUB_APP_DIR="$GITHUB_APP_DIR" HERDR_CP_IMAGE_TAG="$tag" HERDR_CP_GIT_COMMIT="$commit" \
     docker compose --env-file "$envf" -p "$PROJECT" "${files[@]}" "$@"
 }
 

@@ -346,10 +346,12 @@ github:
   unavailable.
 - **Secrets.** The key is read from the file only when a JWT is minted; a group/world-readable file or a symlink
   is refused. The key, the JWT and installation tokens never reach a log, an error, the state or the UI. Both
-  readers run in `control-plane-web`, so the key must be an absolute path inside that container, mode 0600 and
-  owned by the container user. It cannot go in the fleet directory (`deploy.sh` refuses any file there but
-  `fleet-config.yaml`), and `compose.yaml` has no key mount yet: add a read-only bind mount of the key for
-  `control-plane-web` before enabling `app`. Needs `PyJWT[crypto]` (the image's `review-gate`/`collab` extras
+  readers run in `control-plane-web`, which alone mounts `~/.config/herdr-engineering/github-app/` read-only at
+  `/etc/herdr/github-app/` (the fleet directory may hold only `fleet-config.yaml`). `deploy.sh` refuses to deploy
+  unless that directory is a real 0700 directory owned by the deploying user holding nothing or exactly one
+  regular file `github-app.pem`, owned by that user with no group/world bits (0600); a missing directory is
+  created empty. Like the fleet file, the key stays owner-only: the container runs as root (rootless docker: as
+  the deploying user), so it can read it; never loosen the mode. Needs `PyJWT[crypto]` (the image's `review-gate`/`collab` extras
   already install it). The loader validates the block's structure (`herdr-eng fleet config validate`), not the
   key file, which only the control-plane container can see.
 - **The cache under the App** lists each configured owner's repositories (`repositoryOwner`, not `viewer`), and

@@ -114,7 +114,7 @@ PY
 fi
 if [ "$1" = build ] && [ -n "${{FAIL_BUILD:-}}" ]; then exit 1; fi
 if [ "$1" = compose ]; then
-  echo "composeenv fleetdir=${{HERDR_CP_FLEET_DIR:-}} tag=${{HERDR_CP_IMAGE_TAG:-}} collabdir=${{HERDR_COLLAB_CONFIG_DIR:-}} llmdir=${{HERDR_LLM_SLICE_DIR:-}}" >> {log}
+  echo "composeenv fleetdir=${{HERDR_CP_FLEET_DIR:-}} tag=${{HERDR_CP_IMAGE_TAG:-}} collabdir=${{HERDR_COLLAB_CONFIG_DIR:-}} llmdir=${{HERDR_LLM_SLICE_DIR:-}} githubappdir=${{HERDR_CP_GITHUB_APP_DIR:-}}" >> {log}
   if [ -n "${{HERDR_LLM_SLICE_DIR:-}}" ]; then echo "llmslice $(cat "$HERDR_LLM_SLICE_DIR/llm-config.json" | tr -d '\n')" >> {log}; fi
   prev=""; files=""; up=0; pins=""
   for a in "$@"; do
@@ -1255,3 +1255,86 @@ def test_collab_sync_install_failure_triggers_rollback(env):
     assert edge.read_text() == "previous nginx conf\n"
     ups = [ln for ln in env["log"].read_text().splitlines() if ln.startswith("composefiles ")]
     assert not any(f"tag={_head()} " in ln for ln in ups)     # forward compose never ran
+
+
+# ---------------------------------------------------------------- GitHub App key mount
+
+def _app_dir(e):
+    return e["home"] / ".config/herdr-engineering/github-app"
+
+
+def test_compose_mounts_the_github_app_dir_read_only_into_web_only():
+    doc = yaml.safe_load((ROOT / "deploy/control-plane/compose.yaml").read_text())
+    mount = "${HERDR_CP_GITHUB_APP_DIR:?run deploy.sh}:/etc/herdr/github-app:ro"
+    assert mount in doc["services"]["control-plane-web"]["volumes"]
+    for name, svc in doc["services"].items():
+        if name != "control-plane-web":
+            assert not any("github-app" in str(v) for v in svc.get("volumes") or []), name
+
+
+def test_dry_run_reports_the_github_app_mount_and_creates_nothing(env):
+    r = deploy(env, "--dry-run")
+    assert r.returncode == 0, r.stderr
+    assert "/etc/herdr/github-app" in r.stdout and "would create it empty" in r.stdout
+    assert not _app_dir(env).exists()
+
+
+def test_deploy_creates_an_empty_0700_github_app_dir_and_mounts_it(env):
+    env["env"]["FAIL_COMPOSE"] = "1"
+    deploy(env)
+    d = _app_dir(env)
+    assert d.is_dir() and (d.stat().st_mode & 0o777) == 0o700 and not list(d.iterdir())
+    lines = [ln for ln in env["log"].read_text().splitlines() if ln.startswith("composeenv ")]
+    assert lines and all(f"githubappdir={d}" in ln for ln in lines)
+
+
+def test_a_valid_github_app_key_dir_is_accepted_and_the_key_never_printed(env):
+    d = _app_dir(env)
+    d.mkdir(parents=True, mode=0o700)
+    d.chmod(0o700)
+    key = d / "github-app.pem"
+    key.write_text("-----BEGIN PRIVATE KEY-----\nPLACEHOLDERKEYMATERIAL\n-----END PRIVATE KEY-----\n")
+    key.chmod(0o600)
+    r = deploy(env, "--dry-run")
+    assert r.returncode == 0, r.stderr
+    assert "PLACEHOLDERKEYMATERIAL" not in r.stdout + r.stderr
+    assert "would create" not in r.stdout
+
+
+@pytest.mark.parametrize("fault,needle", [
+    ("dir_mode", "must be mode 0700"),
+    ("extra_file", "must hold only github-app.pem"),
+    ("key_mode", "must not be readable by group or others"),
+    ("key_symlink", "must be a regular file"),
+    ("dir_symlink", "must be a real directory"),
+    ("key_dir", "must be a regular file"),
+])
+def test_a_bad_github_app_dir_is_refused_before_anything_runs(env, fault, needle):
+    d = _app_dir(env)
+    if fault == "dir_symlink":
+        real = env["tmp"] / "elsewhere"
+        real.mkdir(mode=0o700)
+        d.parent.mkdir(parents=True, exist_ok=True)
+        d.symlink_to(real)
+    else:
+        d.mkdir(parents=True, mode=0o700)
+        d.chmod(0o700)
+        key = d / "github-app.pem"
+        if fault == "key_symlink":
+            target = env["tmp"] / "key.pem"
+            target.write_text("k")
+            target.chmod(0o600)
+            key.symlink_to(target)
+        elif fault == "key_dir":
+            key.mkdir()
+        else:
+            key.write_text("k")
+            key.chmod(0o640 if fault == "key_mode" else 0o600)
+        if fault == "dir_mode":
+            d.chmod(0o750)
+        if fault == "extra_file":
+            (d / "notes.txt").write_text("x")
+    r = deploy(env, "--dry-run")
+    assert r.returncode != 0
+    assert needle in r.stderr
+    assert not env["log"].exists()
