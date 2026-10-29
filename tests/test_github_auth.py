@@ -276,6 +276,18 @@ def test_invalidate_forces_a_new_token(gh, key_file):
     assert tokens.token_for("InferWeave") != first and len(gh.posts()) == 2
 
 
+def test_a_current_long_installation_token_with_dash_and_dot_is_accepted(gh, key_file):
+    # Real GitHub installation tokens are ~390 characters and contain "-" and ".".
+    long_token = "ghs_" + "Ab9_-." * 64
+    assert len(long_token) > 380
+    def answer(_handler, body):
+        return 201, {}, json.dumps({
+            "token": long_token, "expires_at": "2027-01-15T09:00:00Z",
+            "permissions": (body or {}).get("permissions"), "repository_selection": "selected"}).encode()
+    gh.routes[("POST", "/app/installations/11/access_tokens")] = answer
+    assert _tokens(gh, key_file).token_for("InferWeave") == long_token
+
+
 # ------------------------------------------------------------------ failure modes
 def _ok_body(**over):
     body = {"token": "ghs_" + "a" * 36, "expires_at": "2027-01-15T09:00:00Z",

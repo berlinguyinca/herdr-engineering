@@ -79,7 +79,8 @@ PROJECTS_PERMISSIONS = {"issues": "read", "metadata": "read", "organization_proj
 #: The only permissions herdr ever requests, and only at ``read``.
 ALLOWED_PERMISSIONS = frozenset({"contents", "metadata", "issues", "organization_projects"})
 
-_TOKEN = re.compile(r"ghs_[A-Za-z0-9_]{16,1000}")
+# GitHub's current installation tokens are ~390 chars and contain "-" and "." as well.
+_TOKEN = re.compile(r"ghs_[A-Za-z0-9_.-]{16,2000}")
 _OWNER = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})")
 _REPO_NAME = re.compile(r"[A-Za-z0-9_.-]{1,100}")
 MAX_REPOSITORIES = 100
