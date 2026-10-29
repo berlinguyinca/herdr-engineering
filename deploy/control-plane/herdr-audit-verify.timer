@@ -1,0 +1,12 @@
+# Hourly. Not enabled by anything.
+[Unit]
+Description=Verify the assistant audit chain against the anchor every hour
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+RandomizedDelaySec=2min
+Unit=herdr-audit-verify.service
+
+[Install]
+WantedBy=timers.target

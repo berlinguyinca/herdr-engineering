@@ -132,6 +132,55 @@ is enabled by deploying it.
    `org`-visible or wider to be seen. Until the CI reporter writes them, every PR waits with `graph evidence: ...` pending.
 5. Roll back by setting `enabled: false` (hot; no restart) or removing the block.
 
+### The evidence writer: what writes `validated` edges (`graph_merge_gate.evidence_source`)
+Without a writer, enabling the gate makes every PR wait. The writer is part of the review gate's EXISTING tick: for every open,
+non-draft PR of a repo you list, it takes the head SHA the gate just listed and the Woodpecker rows the gate already holds, and
+writes through the ordinary `IngestService` (the same path as `POST /api/v1/ingest`) under ONE dedicated principal. No new
+store, endpoint or scheduler. Code: `herdr_engineering/control_plane/graph_evidence_writer.py`.
+```yaml
+control_plane:
+  graph_merge_gate:
+    evidence_source:                       # own switch; off unless enabled: true
+      enabled: true
+      principal: "ci-evidence:woodpecker"  # dedicated id; must start with ci-evidence: (key:<hash> ids are refused)
+      check: "ci"                          # written to attrs.check; must match graph_merge_gate.required_checks
+      repos:                               # ONLY these are written; each must also be enrolled in control_plane.review_gate
+        - repo: github.com/<owner>/<name>
+          prs: [123]                       # optional; omit for every open non-draft PR of that repo
+```
+* What is written, per PR head and CI run state: a `pr:<repo>#<n>` node (ensure), a `ci:<repo>#<n>/<check>/<run-signature>@<sha>`
+  node, and one `validated` edge from it to the PR with `attrs` `{commit: <head SHA>, check, conclusion: success|failure, run}`,
+  `org` visibility. The server turns `attrs.commit` into the binding.
+* Never a pass for an unobserved head: nothing is written while CI is pending, the CI snapshot is stale, the rows are for another
+  SHA, or the repo/PR is not listed. A red run writes `failure` (the gate then rejects). A push moves the head, so the old head's
+  edges become stale and the gate ignores them; the new head has no evidence until its own CI finishes.
+* Idempotent: ids, sources and sequences are functions of (repo, PR, head, check, run signature). A restart or second tick
+  replays as duplicates. A re-run has a different signature, so it is a new edge and the gate's "latest admission wins" applies.
+* Trust: the writer's id is stamped as `provenance.writer`. API keys are always `key:<hash>`, so nobody can pose as it over HTTP.
+  The gate counts these edges only when the same id is in `graph_merge_gate.evidence_writers`: a writer that is not listed
+  there is ignored ("required check ci missing").
+* The block is validated at startup and by `herdr-eng fleet config validate`, enabled or not (typo, wrong type, `key:` principal,
+  non-`github.com/<o>/<r>` repo, empty `repos` when enabled all stop startup). The writer reads the YAML on every tick: it is hot.
+
+#### Enable sequence (nothing here is done by deploying the repo)
+1. Configure the writer ONLY: add `evidence_source` with `enabled: true`, a principal and the repos/PRs you want, and leave
+   `graph_merge_gate.enabled` false (or the block absent) so merges are unaffected. Run `herdr-eng fleet config validate`.
+2. Verify edges appear: open a listed PR whose CI has finished, then as an operator
+   `GET /api/v1/graph/nodes/<url-encoded pr:github.com/o/r#n>/neighborhood?depth=1`. Expect one `validated` edge with
+   `provenance.writer` = your principal, `binding.commit` = the PR head, `attrs.conclusion` as CI reported, `stale: false`.
+   Push a commit and confirm the old edge turns `stale` once the new head's CI has finished. Also confirm a red run shows `failure`.
+3. Only then add the principal id to `graph_merge_gate.evidence_writers` and set `graph_merge_gate.enabled: true` (see
+   "Turning the graph merge gate on"). PRs that already have fresh evidence merge as before; a PR without it waits.
+
+#### Roll back
+* Stop the gate first: `graph_merge_gate.enabled: false` (hot) restores the old merge behaviour immediately.
+* Stop the writer: `evidence_source.enabled: false` (hot) or remove the block. Existing edges stay (history); removing the
+  principal from `evidence_writers` makes the gate ignore them.
+* To retract evidence for a PR, an operator tombstones the edge with `edge.remove` (`reason` required).
+* Limits: a CI run that goes green and is then re-run (pending) keeps its earlier pass until the re-run finishes; one `ci:` node is
+  owned per run, against the principal's 25k-object quota (when it is reached writes fail and the gate waits); the writer is
+  called from the review gate tick, so repos must be enrolled there and the writer is idle if the review gate is off.
+
 ## Why the assistant cannot read delivery metrics
 `lineage_metrics` is computed from a collaboration ROOM snapshot (room membership, the room's evidence writers, k-anonymity
 suppression). The assistant's principal is an API key, which has no room membership; there is no reader-scoped way to build that
@@ -269,3 +318,30 @@ personal_assistant:
 * Limits: it detects tail truncation and rewrites only up to the last anchor, so anchor often. Deleting the TAIL of the anchor
   file itself is not detectable by the file's own chain; keep it on append-only storage or copy it elsewhere. The command is
   run by an operator or timer; the control plane does not run it for you.
+
+### Anchor timer (systemd, repo files only; nothing is installed or enabled by the repo)
+Files in `deploy/control-plane/`: `herdr-audit-anchor.service` + `.timer` (every 15 minutes) and `herdr-audit-verify.service` +
+`.timer` (hourly). Both are oneshot system units run as a dedicated login-less user, with `NoNewPrivileges`, `ProtectSystem=strict`,
+`ProtectHome`, `PrivateTmp`, `Restart=no`, no capabilities and no environment variables. Only the anchor unit may write, and only
+`ReadWritePaths=/var/lib/herdr-anchor`; the verify unit has that directory read-only. `verify` exits 1 on anything but `ok`
+(`rolled_back`, `diverged`, `chain_broken`, `anchor_tampered`, `no_anchor`, or a failed request), so the unit shows as failed; add
+`OnFailure=` to page.
+
+Operator steps (run by you, on the host that will anchor, ideally NOT the control-plane host):
+1. `useradd --system --shell /usr/sbin/nologin herdr-anchor`; `install -d -m 0700 -o herdr-anchor -g herdr-anchor /var/lib/herdr-anchor /etc/herdr/anchor`.
+2. Put an approver's API key in `/etc/herdr/anchor/approver.key` (0400, owner `herdr-anchor`). Write a MINIMAL fleet file
+   `/etc/herdr/anchor/fleet-config.yaml` (0600, owner `herdr-anchor`; never the central file, which holds database credentials):
+   `version: 1`, `hosts: {}`, `sections.control_plane.roles: [control-plane]`, and under `values`
+   `personal_assistant.audit.anchor_file: /var/lib/herdr-anchor/assistant-audit.anchor`.
+3. Replace `https://REPLACE-control-plane.example.invalid` in both services; check `herdr-eng` is at `/usr/local/bin/herdr-eng`.
+4. Append-only: create the file once (`install -m 0600 -o herdr-anchor -g herdr-anchor /dev/null /var/lib/herdr-anchor/assistant-audit.anchor`)
+   and run `chattr +a` on it as root. The anchor opens it `O_APPEND`, so appends keep working while rewriting or truncating it
+   needs root to `chattr -a` first. Put the directory on its own filesystem or device; `chattr +a` on the directory also stops
+   deletes and renames. (Not all filesystems support it; check `lsattr`.)
+5. Off-box copy: the anchor file's own chain cannot reveal deleting its TAIL, so copy it somewhere the anchor host cannot
+   rewrite, for example `rsync --append-verify` or `restic` to another host/bucket after each anchor run (a second oneshot
+   with `ExecStartPost=` or a separate timer on the receiving side that PULLS the file read-only).
+6. Install and start (your call): copy the four files to `/etc/systemd/system/`, `systemctl daemon-reload`, run
+   `systemctl start herdr-audit-anchor.service` once and check the journal, then `systemctl start herdr-audit-verify.service`
+   (expect `ok`), then `systemctl enable --now herdr-audit-anchor.timer herdr-audit-verify.timer`.
+7. Roll back: `systemctl disable --now` both timers. The anchor file is evidence; keep it (removing it needs `chattr -a`).

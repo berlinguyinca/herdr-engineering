@@ -1174,6 +1174,7 @@ class ControlPlaneServer:
             main_verifier=self.gate_main,
             repair_gate=self._build_repair_gate(app, fleet_config, repo, registry),
             graph_gate=self._build_graph_gate(fleet_config),
+            evidence_hook=self._build_evidence_hook(fleet_config),
         )
         self.gate_reviewer_config = config.reviewer
         self.gate_coordinator = ReviewCoordinator(
@@ -1187,6 +1188,22 @@ class ControlPlaneServer:
         # starts the poller, so the server starts the shared monitor itself.
         self.ci_monitor.start()
         self.gate_service.start()
+
+    def _build_evidence_hook(self, fleet_config):
+        """``control_plane.graph_merge_gate.evidence_source`` (YAML, read on every PR; off unless ``enabled: true``). An
+        unreadable central config just means nothing is written; the gate then waits, it never passes."""
+        from ..fleet_config import FleetConfigError
+        from .graph_evidence_writer import GraphEvidenceWriter
+
+        def section():
+            if fleet_config is None:
+                return None
+            try:
+                return (fleet_config.current().section("control_plane") or {}).get("graph_merge_gate")
+            except FleetConfigError:
+                return None
+        self.graph_evidence_writer = GraphEvidenceWriter(ingest=self.ingest, section_fn=section)
+        return self.graph_evidence_writer.observe
 
     def _build_graph_gate(self, fleet_config):
         """``control_plane.graph_merge_gate`` (YAML, read on every PR so ``enabled: false`` is a hot kill switch). Once it
