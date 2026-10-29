@@ -261,7 +261,8 @@ class ControlPlaneServer:
                  review_quorum=None, system_graph: bool = False, attention=None, ci_fix=None, missions=None, github_pg_dsn=None,
                  architecture_enabled=None, architecture_explain=None, architecture_options=None,
                  request_workers=128, request_queue=256,
-                 assistant_service=None, assistant_config=None, fabric_resolver=None, fabric_services=None, fabric_names=None):
+                 assistant_service=None, assistant_config=None, fabric_resolver=None, fabric_services=None, fabric_names=None,
+                 unified_workspace_config=None):
         """
         Auth (Spec §104): either a single `api_key` (all-access) or a mapping
         `api_keys={key: role}` with roles "viewer" (read-only) / "operator"
@@ -315,6 +316,8 @@ class ControlPlaneServer:
         self.source = source
         self.agent_summaries = None
         self.summary_report = None
+        # unified_workspace_v1 (P01): capability advertisement only; no route consumes it yet. YAML-only, default off.
+        self.unified_workspace_enabled = isinstance(unified_workspace_config, dict) and unified_workspace_config.get("enabled") is True
         self._summary_stop = threading.Event()
         self._summary_scanner = None
         if not collab_only:
@@ -768,6 +771,8 @@ class ControlPlaneServer:
             h["capabilities"].append("assistant_v1")
         if getattr(self, "intelligence", None) is not None and self.intelligence._cfg()[0]["enabled"]:
             h["capabilities"].append("project_intelligence_v1")
+        if getattr(self, "unified_workspace_enabled", False):
+            h["capabilities"].append("unified_workspace_v1")
         if self.architecture.enabled:
             h["capabilities"].append("architecture_v1")
             if self.architecture.explain_config:
