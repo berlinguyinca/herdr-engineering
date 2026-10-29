@@ -294,6 +294,7 @@ class HostMetricsStore:
     def hydrate(self, events: list[dict]) -> dict:
         """Replay persisted rollups/state; returns ``{host_id: {"latest", **state}}``."""
         hosts: dict[str, dict] = {}
+        replay: dict[str, dict] = {}
         with self._lock:
             ordered = sorted(events, key=lambda e: int(e.get("sequence") or 0))
             for ev in ordered:
@@ -315,9 +316,14 @@ class HostMetricsStore:
                 rollup = p.get("rollup")
                 if ev.get("event_type") == ROLLUP_EVENT and isinstance(rollup, dict) \
                         and isinstance(rollup.get("ts"), (int, float)):
-                    rows = self._rollups.setdefault(hid, [])
-                    rows[:] = [r for r in rows if r["ts"] != rollup["ts"]]
-                    rows.append(dict(rollup))
+                    # Keyed by ts: a later rollup for the same ts replaces the earlier one. Filtering the whole
+                    # list per event was quadratic and made a boot over ~1M telemetry events take minutes.
+                    by_ts = replay.get(hid)
+                    if by_ts is None:
+                        by_ts = replay[hid] = {r["ts"]: r for r in self._rollups.get(hid, [])}
+                    by_ts[rollup["ts"]] = dict(rollup)
+            for hid, by_ts in replay.items():
+                self._rollups[hid] = list(by_ts.values())
             for hid, rows in self._rollups.items():
                 rows.sort(key=lambda r: r["ts"])
                 self._prune(hid, self._now())

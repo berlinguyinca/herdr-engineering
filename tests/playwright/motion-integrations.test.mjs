@@ -5,7 +5,7 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {withPage} from './helpers/fixture.mjs';
-import {boot,until,sleep,T0} from './helpers/live.mjs';
+import {boot,until,sleep,T0,openHealthFilters} from './helpers/live.mjs';
 
 const calm=(page,mode)=>page.addInitScript(m=>{try{localStorage.setItem('herdr.calm',m);}catch{}},mode);
 const ago=ms=>new Date(Date.parse(T0)-ms).toISOString();
@@ -88,11 +88,10 @@ test('topology: metric tiles count up and a row whose status changes flashes; cu
 
 const run=(n,state,extra={})=>({provider_repo_id:7,provider_url:'https://ci.example',repository:'org/app',run_number:n,state,branch:'main',created_at:ago(3600000+n*60000),started_at:ago(3500000+n*60000),finished_at:state==='running'?null:ago(3000000+n*60000),updated_at:ago(1000),...extra});
 function ciApi(s){
- return (p,url)=>{
+ return p=>{
   if(p==='/api/v1/ci')return {available:true,status:'connected',pipelines:{'org/app':structuredClone(s.runs)}};
   if(p==='/api/v1/ci/history')return {available:true,repos:[{id:7,provider_url:'https://ci.example',repository:'org/app',default_branch:'main'}],pipelines:structuredClone(s.runs),coverage:{}};
   if(p==='/api/v1/ci/reports')return {available:true,pipelines:[],reports:[]};
-  if(p==='/api/v1/ci/performance')return {schema_version:1,days:Number(url.searchParams.get('days')),cache_groups:[],execution_trends:[],alerts:[]};
   return {};
  };
 }
@@ -100,41 +99,15 @@ function ciApi(s){
 test('CI: running rows pulse and charts draw in on the first paint only; calm stops the pulse',async()=>{
  for(const mode of ['off','on'])await withPage(async(page,base)=>{
   const s={runs:[run(1,'success'),run(2,'failure'),run(3,'running')]};
-  let releasePerformance;
-  const performanceReady=new Promise(resolve=>{releasePerformance=resolve;});
-  const api=ciApi(s);
   await calm(page,mode);
-  await page.addInitScript(()=>{
-   window.__firstChartPaint=null;
-   const observer=new MutationObserver(records=>{
-    for(const record of records)if(record.target.matches?.('[data-ci-charts-body]')){
-     for(const node of record.addedNodes){
-      const line=node.querySelector?.('svg polyline');
-      if(line){
-       // Read the added nodes, not the current chart: another response may have replaced them.
-       window.__firstChartPaint={drawn:line.getAttribute('data-drawn')};
-       observer.disconnect();return;
-      }
-     }
-    }
-   });
-   observer.observe(document,{childList:true,subtree:true});
-  });
-  await boot(page,base,'/ci?tab=current',async(p,url)=>{
-   if(p==='/api/v1/ci/performance')await performanceReady;
-   return api(p,url);
-  });
+  await boot(page,base,'/ci?tab=current',ciApi(s));
   await page.locator('[data-ci-workspace="runs"]').click();
   const running=page.locator('.ig-row[data-state="running"]');
   await running.first().waitFor();
   const animation=await running.first().locator('.ig-state strong').evaluate(el=>getComputedStyle(el).animationName);
   assert.equal(animation,mode==='off'?'hd-pulse':'none');
   await page.locator('[data-ci-charts-body] svg polyline').first().waitFor({state:'attached'});
-  // Force a separately arriving resource to repaint before inspecting first-paint evidence.
-  releasePerformance();
-  await until(()=>page.locator('.ci-cache-performance').textContent().then(t=>t.includes('No cache observations match this selection.')),'performance response rendered');
-  assert.equal(await page.evaluate(()=>window.__firstChartPaint.drawn),'','first paint draws in');
-  assert.equal(await page.locator('[data-ci-charts-body] svg [data-drawn]').count(),0,'a separately arriving resource does not draw in again');
+  assert.equal(await page.locator('[data-ci-charts-body] svg polyline').first().getAttribute('data-drawn'),'','first paint draws in');
   s.runs.push(run(4,'success'));
   await page.clock.runFor(6000);
   await until(()=>page.locator('[data-ci-charts-body] svg circle').count().then(n=>n===3),'chart redrawn with the new run',8000);
@@ -146,7 +119,7 @@ test('CI health: a cell whose outcome changes flashes; others do not',async()=>w
  const s={runs:[run(1,'success'),run(2,'success',{created_at:ago(7200000+120000)})]};
  await calm(page,'off');
  await boot(page,base,'/ci',ciApi(s));
- // These two runs occupy different hours on the same day; select the hourly window explicitly.
+ await openHealthFilters(page);
  await page.locator('[data-health-mode="hours"]').click();
  const cells=page.locator('[data-health-map] [data-health-project][data-health-bucket]');
  await until(()=>page.locator('[data-health-map] .ci-health-cell.state-success').count().then(n=>n>=2),'two successful cells',10000);

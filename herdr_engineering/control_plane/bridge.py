@@ -360,6 +360,8 @@ def _reconstruct_from_events(streams: dict) -> tuple[dict, dict, dict, dict, dic
         etype = ev.get("event_type") or ""
         if et == "host":
             if etype == "HostPolicyChanged":
+                if "_envelope" in p:
+                    continue
                 # Policy edits are not evidence that the host is alive.
                 host = hosts.get(eid)
                 if host is not None:

@@ -337,6 +337,12 @@ def _build_parser() -> argparse.ArgumentParser:
     p2.add_argument("--harness", choices=("claude", "codex"), default="claude", help="summarizer harness")
     p2.add_argument("--timeout", type=int, default=300)
     p2.set_defaults(func=_cmd_summary_report)
+    p2 = smsub.add_parser("publish", help="publish a finished /summary report (stdin) to the dashboard and a side pane")
+    p2.add_argument("--agent", required=True, choices=("claude", "pi", "codex", "opencode"))
+    p2.add_argument("--session", required=True, help="session id of the summarized session")
+    p2.add_argument("--no-pane", action="store_true")
+    p2.add_argument("--no-dashboard", action="store_true")
+    p2.set_defaults(func=_cmd_summary_publish)
 
     # journal --------------------------------------------------------------
     p = sub.add_parser("journal", help="session journal & timeline (spec 0090)")
@@ -976,6 +982,18 @@ def _cmd_summary_report(args) -> int:
         _print_json({"ok": False, "error": exc.code, "detail": exc.detail})
         return 1
     return 0
+
+
+def _cmd_summary_publish(args) -> int:
+    from . import summary_report as sr
+    try:
+        out = sr.publish_report(args.agent, args.session, sys.stdin.read(),
+                                pane=not args.no_pane, dashboard=not args.no_dashboard)
+    except sr.ReportError as exc:
+        _print_json({"ok": False, "error": exc.code, "detail": exc.detail})
+        return 1
+    _print_json(out)
+    return 0 if out["ok"] else 1
 
 
 def _cmd_agent_mine(args) -> int:
@@ -3009,6 +3027,7 @@ def _cmd_cp_web(args) -> int:
     from .control_plane.repo import ControlPlaneRepo
     from .control_plane.sink import DurableEventSink
 
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")   # boot phase timings
     fleet_store, cp = _load_cp_fleet_config(getattr(args, "fleet_config", None))
     switch_store = fleet_store
     replay_flag = getattr(args, "collab_replay_history", None)      # an explicit --collab-replay-history wins over the YAML
@@ -3239,6 +3258,9 @@ def _cmd_cp_web(args) -> int:
                              collab_require_https=args.collab_require_https,
                              fleet_config=fleet_store, ci_actions=cp.get("ci_actions") is True,
                              fabric_resolver=_fabric_url_resolver(), fabric_services=_fabric_service_lister(), fabric_names=_fabric_names_getter(),
+                             scheduler_admission=cp.get("scheduler_admission") is True,
+                             scheduler_limits=cp.get("scheduler_limits") or {},
+                             skill_registry=cp.get("skill_registry"),
                              summary_config=cp.get("agent_summaries") or {},
                              summary_report_config=cp.get("summary_report") or {},
                              assistant_config={"personal_assistant": cp["personal_assistant"]}

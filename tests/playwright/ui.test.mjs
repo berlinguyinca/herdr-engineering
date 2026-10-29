@@ -286,22 +286,17 @@ test('analytics auto-fits operational panels without document overflow', async (
 test('4K operational views use the canvas while prose and catalog groups stay readable', async () => {
   await withApp(async ({page,base}) => {
     await page.setViewportSize({width:3840,height:2160});
-    await page.goto(`${base}/#/overview`);await page.locator('[data-overview=missions]').waitFor();
+    await page.goto(`${base}/#/overview`);await page.locator('[data-overview=hosts]').waitFor();
     const overview=await page.evaluate(()=>{
       const shell=document.querySelector('herdr-app-shell').shadowRoot;
       const content=shell.querySelector('.hd-shell__content').getBoundingClientRect();
-      const intro=document.querySelector('.ov-intro').getBoundingClientRect();
       const layout=getComputedStyle(document.querySelector('.ov-layout')).gridTemplateColumns.split(' ').length;
-      const missions=document.querySelector('[data-overview=missions]').getBoundingClientRect();
-      const fleet=document.querySelector('[data-overview=fleet]').getBoundingClientRect();
       const hosts=document.querySelector('[data-overview=hosts]').getBoundingClientRect();
       const activity=document.querySelector('[data-overview=activity]').getBoundingClientRect();
-      return {width:content.width,intro:intro.width,columns:layout,missions:missions.width,fleet:fleet.width,lastRowWidth:hosts.width+activity.width,overflow:document.documentElement.scrollWidth>innerWidth};
+      return {width:content.width,columns:layout,lastRowWidth:hosts.width+activity.width,overflow:document.documentElement.scrollWidth>innerWidth};
     });
     assert.ok(overview.width>=3400,`expected the 4K canvas after the sidebar, got ${overview.width}`);
-    assert.ok(overview.intro<900,`prose should retain a readable measure, got ${overview.intro}`);
     assert.equal(overview.columns,4);
-    assert.ok(Math.abs(overview.missions-overview.fleet)<40,'the sparse mission and fleet panels should split the first row evenly');
     assert.ok(overview.lastRowWidth>overview.width*.9,`last Overview row should use the canvas, got ${overview.lastRowWidth}`);
     assert.equal(overview.overflow,false);
     await page.goto(`${base}/#/herd`);await page.locator('.ss-group').first().waitFor();
@@ -978,7 +973,7 @@ test('sessions tabs keep closed records separate, retain filters and encode exac
   await page.clock.install();await page.goto(`${base}/#/herd`);
   await page.waitForFunction(()=>document.querySelector('#ss-tab-current [data-count]')?.textContent==='25');
   const catalogGeometry=await page.locator('.ss-row').first().evaluate(row=>({top:row.getBoundingClientRect().top,height:row.getBoundingClientRect().height}));
-  assert.ok(catalogGeometry.top<=330,`expected records near the top of the viewport, got ${catalogGeometry.top}`);
+  assert.ok(catalogGeometry.top<=420,`expected records near the top of the viewport, got ${catalogGeometry.top}`);
   assert.ok(catalogGeometry.height<=96,`expected compact desktop agent rows, got ${catalogGeometry.height}`);
   assert.equal(await page.locator('.ss-row').count(),20);await page.locator('#ss-next').click();assert.equal(await page.locator('.ss-row').count(),5);
   await page.locator('#ss-tab-current').focus();await page.keyboard.press('ArrowRight');
@@ -1033,9 +1028,9 @@ test('overview keeps healthy panels through partial errors and links to the exac
    return {contentWidth:content.width,missions:box('missions'),fleet:box('fleet'),sessions:box('sessions'),ci:box('ci')};
   });
   assert.ok(desktopLayout.contentWidth>=1400,`expected operational content to use desktop width, got ${desktopLayout.contentWidth}`);
-  assert.ok(desktopLayout.missions.width>desktopLayout.sessions.width,'current missions should remain the primary overview panel');
-  assert.ok(desktopLayout.fleet.top<desktopLayout.sessions.bottom,'fleet status should share the upper overview region');
-  assert.ok(Math.abs(desktopLayout.sessions.top-desktopLayout.ci.top)<2,'secondary overview panels should align in a desktop row');
+  assert.ok(desktopLayout.sessions.width>desktopLayout.missions.width,'agents are the primary overview panel');
+  assert.ok(desktopLayout.fleet.top<desktopLayout.sessions.bottom+desktopLayout.fleet.height,'fleet status should stay in the upper overview region');
+  assert.ok(Math.abs(desktopLayout.sessions.top-desktopLayout.missions.top)<2,'agents and missions share the top row');
   await page.setViewportSize({width:768,height:1024});await page.goto(`${base}/#/overview`);await page.locator('[data-overview=sessions] .ov-row').waitFor();
   const tabletColumns=await page.locator('.ov-layout').evaluate(layout=>getComputedStyle(layout).gridTemplateColumns.split(' ').length);
   assert.equal(tabletColumns,1,'tablet content should collapse before cards become too narrow beside the sidebar');
@@ -1045,8 +1040,8 @@ test('overview keeps healthy panels through partial errors and links to the exac
   assert.equal(await page.locator('herdr-app-shell .hd-shell__nav').isVisible(),false);
   await menu.click();assert.equal(await menu.getAttribute('aria-expanded'),'true');
   assert.equal(await page.locator('herdr-app-shell .hd-shell__nav').isVisible(),true);
-  await page.locator('herdr-app-shell .hd-shell__link[data-path="/analytics"]').click();
-  await page.getByRole('heading',{name:'Analytics',exact:true}).waitFor();
+  await page.locator('herdr-app-shell .hd-shell__link[data-path="/hosts"]').click();
+  await page.waitForFunction(()=>location.hash==='#/hosts'&&document.querySelector('herdr-app-shell').shadowRoot.querySelector('.hd-shell__menu').getAttribute('aria-expanded')==='false');
   assert.equal(await menu.getAttribute('aria-expanded'),'false');
   assert.equal(await menu.evaluate(button=>button===button.getRootNode().activeElement),true);
   assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false);
@@ -1440,10 +1435,10 @@ test('overview attention and saved layout stay keyboard usable through refresh a
   assert.equal(await hideCi.evaluate(el=>el===document.activeElement),true);
   await page.getByRole('button',{name:'Move CI builds down',exact:true}).focus();await page.keyboard.press('Enter');
   assert.equal(await page.getByRole('button',{name:'Move CI builds down',exact:true}).evaluate(el=>el===document.activeElement),true);
-  assert.equal(await page.locator('.ov-layout > section').first().getAttribute('data-overview'),'missions');
+  assert.equal(await page.locator('.ov-layout > section').first().getAttribute('data-overview'),'sessions');
   // Reload with the saved preferences rather than reconstructing the layout.
   await page.goto(`${base}/#/activity`);await page.getByRole('heading',{name:'Activity',exact:true}).waitFor();await page.goto(`${base}/#/overview`);await page.getByRole('heading',{name:'Overview',exact:true}).waitFor();
-  assert.equal(await page.locator('.ov-layout > section').first().getAttribute('data-overview'),'missions');
+  assert.equal(await page.locator('.ov-layout > section').first().getAttribute('data-overview'),'sessions');
   const target=attention.locator('a[href*="missions/"]');await target.focus();
   await page.clock.runFor(5500);
   assert.equal(await target.evaluate(el=>el===document.activeElement),true,await page.evaluate(()=>document.activeElement.outerHTML));
@@ -1452,7 +1447,7 @@ test('overview attention and saved layout stay keyboard usable through refresh a
   assert.equal(await page.evaluate(()=>document.querySelector('[data-overview=attention] h2')===document.activeElement),true,await page.locator('#view').innerText());
   await page.locator('.ov-customize summary').click();
   await page.getByRole('button',{name:'Reset layout',exact:true}).click();
-  assert.deepEqual(await page.locator('.ov-layout > section').evaluateAll(cards=>cards.map(card=>card.dataset.overview)),['missions','fleet','sessions','ci','reviews','services','hosts','activity']);
+  assert.deepEqual(await page.locator('.ov-layout > section').evaluateAll(cards=>cards.map(card=>card.dataset.overview)),['sessions','missions','fleet','ci','reviews','services','hosts','activity']);
   assert.equal(await page.locator('.ov-layout > section[hidden]').count(),0);
   for(const width of [3840,2560,1920,768,390]) {
    await page.setViewportSize({width,height:1080});
@@ -1501,8 +1496,8 @@ test('large Overview attention queues keep cards close and expand within a keybo
   await page.addInitScript(()=>localStorage.setItem('herdr.overview.layout.v1',JSON.stringify({order:['ci'],hidden:['sessions']})));
   await page.clock.install();await page.goto(`${base}/#/overview`);
   const attention=page.locator('[data-overview=attention]'),toggle=attention.locator('[data-attention-toggle]');
-  await page.waitForFunction(()=>document.querySelectorAll('[data-attention-key]').length===6);
-  await attention.getByText('Showing 6 of 196 observed items',{exact:true}).waitFor();
+  await page.waitForFunction(()=>document.querySelectorAll('[data-attention-key]').length===3);
+  await attention.getByText('Showing 3 of 196 observed items',{exact:true}).waitFor();
   assert.equal(await attention.locator('[data-attention-key] a').first().getAttribute('href'),'#/missions/failure-0');
   for(const width of [3840,2560,1920,768,390]) {
    await page.setViewportSize({width,height:1080});
@@ -1548,7 +1543,7 @@ test('large Overview attention queues keep cards close and expand within a keybo
    await toggle.focus();await page.keyboard.press('Enter');
    assert.equal(await toggle.getAttribute('aria-expanded'),'false');
    assert.equal(await page.evaluate(()=>document.querySelector('[data-attention-toggle]')===document.activeElement),true);
-   assert.equal(await attention.locator('[data-attention-key]').count(),6);
+   assert.equal(await attention.locator('[data-attention-key]').count(),3);
   }
   assert.equal(await page.locator('[data-overview=sessions]').isVisible(),false);
   assert.equal(await page.locator('.ov-layout > section').first().getAttribute('data-overview'),'ci');

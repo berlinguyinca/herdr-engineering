@@ -13,7 +13,7 @@
 // Run: node --test --test-concurrency=1 tests/playwright/ui-gates-xss.test.mjs
 import test, { before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { launch, openReal, openSub, settled, startRealServer } from './ui-gates-lib.mjs';
+import { launch, openReal, openSub, settled, startRealServer, scaled } from './ui-gates-lib.mjs';
 import { STATES } from './ui-gates-states.mjs';
 import { URLS, UNREAD, tag, taint } from './ui-gates-taint.mjs';
 
@@ -123,7 +123,7 @@ for (const [, what, sel, canary, open] of PLACEMENTS) {
   test(`a canary is visible, as text, in ${what}`, async () => {
     const { ctx, page } = await hostile(browser);
     await open(page);
-    await page.waitForFunction(([s, c]) => (document.querySelector(s)?.innerText || '').includes(c), [sel, canary], { timeout: 5000 }).catch(() => {});
+    await page.waitForFunction(([s, c]) => (document.querySelector(s)?.innerText || '').includes(c), [sel, canary], { timeout: scaled(5000) }).catch(() => {});
     const shown = await page.locator(sel).first().innerText();
     assert.ok(shown.includes(canary), `${canary} is not on screen inside ${sel}: ${shown.slice(0, 120)}`);
     note(`placement: ${what}`, await shownKeys(page));

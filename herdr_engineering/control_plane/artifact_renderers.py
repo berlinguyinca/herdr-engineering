@@ -6,6 +6,13 @@ import json
 import re
 from dataclasses import dataclass, replace
 
+from .artifact_visual_renderers import (
+    _DECK_CSS,
+    render_chart_svg,
+    render_mermaid,
+    split_slides,
+)
+
 
 class ArtifactRendererError(ValueError):
     """Renderer failure. ``code`` is machine-readable; ``to_dict`` is the structured result."""
@@ -41,6 +48,15 @@ _PAGE_HEAD = (
     "th,td{border:1px solid color-mix(in srgb,CanvasText 25%,Canvas);padding:.3rem .6rem}"
     "blockquote{margin-left:0;padding-left:1rem;border-left:3px solid color-mix(in srgb,CanvasText 30%,Canvas)}"
     "</style></head><body>\n")
+
+# The diagram page follows the viewer's colour scheme, like the document and deck pages, so the dark SVG panel does not sit on white.
+_DIAGRAM_HEAD = (
+    '<!doctype html><html lang="en"><head><meta charset="utf-8">'
+    '<meta name="viewport" content="width=device-width, initial-scale=1">'
+    '<meta name="color-scheme" content="light dark">'
+    "<style>:root{color-scheme:light dark}"
+    "body{margin:0;padding:1rem;font:16px/1.5 system-ui,sans-serif;background:Canvas;color:CanvasText}"
+    "figure{margin:0 0 1rem;overflow:auto}pre{overflow:auto}</style></head><body>\n")
 
 _SAFE_URL = re.compile(r"^(?:https?:|mailto:)", re.I)
 
@@ -158,6 +174,8 @@ class RendererRegistry:
             return self._diagram(source)
         if profile == "report":
             return self._report(source, request)
+        if profile == "presentation":
+            return self._presentation(source)
         raise ArtifactRendererError(f"unsupported artifact profile: {profile}", "unsupported_format")
 
     def _report(self, source: str, request: dict) -> RenderResult:
@@ -223,21 +241,55 @@ class RendererRegistry:
         except (TypeError, ValueError) as exc:
             raise ArtifactRendererError("visualization profile requires valid JSON") from exc
         normalized = json.dumps(parsed, indent=2, sort_keys=True)
-        return RenderResult("visualization", source,
-                            [{"name": "data.json", "media_type": "application/json",
-                              "content": normalized}],
-                            {"status": "passed", "checks": ["json-parse"]},
-                            {"renderer": "builtin-json", "revision": "1"})
+        outputs = [{"name": "data.json", "media_type": "application/json", "content": normalized}]
+        validation = {"status": "passed", "checks": ["json-parse"]}
+        if isinstance(parsed, dict) and "type" in parsed:
+            try:
+                svg = render_chart_svg(parsed)
+            except ValueError as exc:
+                raise ArtifactRendererError(f"invalid chart spec: {exc}") from exc
+            outputs.insert(0, {"name": "chart.svg", "media_type": "image/svg+xml", "content": svg})
+            validation["checks"].append("chart-svg")
+        else:
+            validation["findings"] = [{"code": "no_chart_spec",
+                                       "detail": "JSON has no 'type'; only data.json was produced"}]
+        return RenderResult("visualization", source, outputs, validation,
+                            {"renderer": "builtin-chart-svg", "revision": "2"})
 
     @staticmethod
     def _diagram(source: str) -> RenderResult:
         if not isinstance(source, str) or not source.strip():
             raise ArtifactRendererError("diagram profile requires Mermaid source")
-        # Keep Mermaid as inert text; a later sandboxed renderer may produce SVG.
-        content = "<pre data-diagram-format=\"mermaid\">" + html.escape(source) + "</pre>"
-        return RenderResult("diagram", source,
-                            [{"name": "diagram.html", "media_type": "text/html",
-                              "content": content}],
-                            {"status": "passed", "checks": ["mermaid-source"]},
-                            {"renderer": "builtin-mermaid-source", "revision": "1"})
+        pre = ('<details><summary>Mermaid source</summary><pre data-diagram-format="mermaid">'
+               + html.escape(source) + "</pre></details>")
+        outputs, checks, findings = [], ["mermaid-source"], []
+        try:
+            svg, check = render_mermaid(source)
+            outputs.append({"name": "diagram.svg", "media_type": "image/svg+xml", "content": svg})
+            content = "<figure>" + svg + "</figure>" + pre
+            checks.append(check)
+        except ValueError as exc:
+            # Unsupported Mermaid constructs stay inert source until a sandboxed renderer exists.
+            content = "<pre data-diagram-format=\"mermaid\">" + html.escape(source) + "</pre>"
+            findings.append({"code": "not_rendered", "detail": str(exc)})
+        outputs.insert(0, {"name": "diagram.html", "media_type": "text/html",
+                           "content": _DIAGRAM_HEAD + content + "</body></html>\n"})
+        validation = {"status": "passed", "checks": checks}
+        if findings:
+            validation["findings"] = findings
+        return RenderResult("diagram", source, outputs, validation,
+                            {"renderer": "builtin-mermaid-svg", "revision": "3"})
+
+    @staticmethod
+    def _presentation(source: str) -> RenderResult:
+        if not isinstance(source, str) or not source.strip():
+            raise ArtifactRendererError("presentation profile requires markdown slides separated by ---")
+        slides = split_slides(source)
+        deck = (_PAGE_HEAD.replace("<style>", "<style>" + _DECK_CSS, 1)
+                + "".join(f"<section>{render_markdown(slide)}</section>\n" for slide in slides)
+                + "</body></html>\n")
+        return RenderResult("presentation", source,
+                            [{"name": "deck.html", "media_type": "text/html", "content": deck}],
+                            {"status": "passed", "checks": ["markdown-slides"], "slide_count": len(slides)},
+                            {"renderer": "builtin-markdown-deck", "revision": "1"})
 

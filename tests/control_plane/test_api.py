@@ -35,7 +35,7 @@ class Client:
 @pytest.fixture()
 def server(acknowledged_sink):
     repo = ControlPlaneRepo(sink=acknowledged_sink)
-    svr = ControlPlaneServer(repo)
+    svr = ControlPlaneServer(repo, scheduler_admission=True)
     thread = threading.Thread(target=svr.serve, daemon=True)
     thread.start()
     svr.wait_until_ready()

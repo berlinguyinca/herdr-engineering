@@ -860,6 +860,12 @@ class InspectorStore:
             "model", "message", "call_id", "run_id", "branch", "worktree")) + " " + " ".join(
             f"{f.get('name')} {f.get('message')}" for f in d.get("failures", []))
 
+    def newest_seq(self, session_id: str) -> int | None:
+        """Sequence number of the newest recorded event, or None when nothing is recorded."""
+        with self._lock:
+            sess = self._sessions.get(session_id)
+            return sess.next_seq - 1 if sess is not None and sess.next_seq > 0 else None
+
     def query(self, session_id: str, role: str = "viewer", *, view: str = "all",
               q: str | None = None, agent_id: str | None = None, status: str | None = None,
               since_rev: int = 0, limit: int = 200, before_seq: int | None = None) -> dict:

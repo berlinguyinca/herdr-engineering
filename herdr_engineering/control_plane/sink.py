@@ -11,11 +11,14 @@ was ingested.
 from __future__ import annotations
 
 import copy
+import json
 import logging
 import secrets
 import threading
 from collections.abc import Callable
 from dataclasses import asdict
+from contextlib import contextmanager
+from dataclasses import replace
 from datetime import datetime
 from typing import Any
 
@@ -114,9 +117,14 @@ class DurableEventSink:
             self._ensure_store()
             if ev.get("entity_type") == "agent_identity":
                 return self._run(self._record_agent_identity(ev))
+            event = _dict_to_event(ev)
+            if (event.entity_type in {"scheduler_reservation", "scheduler_lease", "scheduler_observation"}
+                    or event.event_type == "HostPolicyChanged"):
+                event = replace(event, sequence=self._run(self._store.next_sequence(
+                    event.entity_type, event.entity_id)))
             # append() returns False only for an existing event_id; any write
             # error propagates from here unchanged.
-            if not self._run(self._store.append(_dict_to_event(ev))):
+            if not self._run(self._store.append(event)):
                 raise EventAlreadyStored(
                     "durable event insert was not acknowledged "
                     "(event_id already stored)")
@@ -177,6 +185,51 @@ class DurableEventSink:
                 raise EventAlreadyStored("durable log already holds this identity event")
             normalized, _ = _rebuild_events([asdict(stored)])
             return next(iter(normalized.values()))[0]
+    @contextmanager
+    def scheduler_admission(self):
+        """Serialize admission across control-plane processes in PostgreSQL."""
+        with self._write_lock:
+            self._ensure_store()
+            conn = self._store._conn
+            self._run(conn.execute("BEGIN"))
+            try:
+                self._run(conn.execute("SELECT pg_advisory_xact_lock(724965310221)"))
+                rows = self._run(conn.fetch(
+                    f"SELECT DISTINCT ON (entity_id) payload FROM {self._events_table} "
+                    "WHERE entity_type='scheduler_reservation' "
+                    "ORDER BY entity_id, sequence DESC"))
+                yield [json.loads(row["payload"]) if isinstance(row["payload"], str)
+                       else dict(row["payload"]) for row in rows]
+                self._run(conn.execute("COMMIT"))
+            except BaseException:
+                self._run(conn.execute("ROLLBACK"))
+                raise
+
+    def scheduler_leases(self):
+        """Read latest lease state while the caller holds the admission lock."""
+        rows = self._run(self._store._conn.fetch(
+            f"SELECT DISTINCT ON (entity_id) entity_id, payload FROM {self._events_table} "
+            "WHERE entity_type='scheduler_lease' ORDER BY entity_id, sequence DESC"))
+        return {row["entity_id"]: json.loads(row["payload"]) if isinstance(row["payload"], str)
+                else dict(row["payload"]) for row in rows}
+
+    def scheduler_observations(self):
+        """Latest token-bound host facts, read under the admission transaction."""
+        rows = self._run(self._store._conn.fetch(
+            f"SELECT DISTINCT ON (entity_id) entity_id, payload FROM {self._events_table} "
+            "WHERE entity_type='scheduler_observation' ORDER BY entity_id, sequence DESC"))
+        return {row["entity_id"]: json.loads(row["payload"]) if isinstance(row["payload"], str)
+                else dict(row["payload"]) for row in rows}
+
+    def scheduler_policies(self):
+        """Read authoritative policies while the caller holds admission lock."""
+        rows = self._run(self._store._conn.fetch(
+            f"SELECT DISTINCT ON (entity_id) entity_id, payload FROM {self._events_table} "
+            "WHERE entity_type='host' AND event_type='HostPolicyChanged' "
+            "AND NOT (payload ? '_envelope') "
+            "ORDER BY entity_id, sequence DESC"))
+        return {row["entity_id"]: json.loads(row["payload"]) if isinstance(row["payload"], str)
+                else dict(row["payload"]) for row in rows}
 
     def stored_identity(self, event_id: str, actor_id: str = ""):
         """(source, source_sequence) of this principal's stored event, or None when absent."""

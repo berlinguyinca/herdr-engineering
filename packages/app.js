@@ -24,6 +24,7 @@ import { mountPersonalAssistant } from './personal-assistant-view.js';
 import { mountProjectIntelligence } from './project-intelligence-view.js';
 import { visibleNav } from './nav-capabilities.js';
 import { mountSessionsView, sessionEntries } from './sessions-view.js';
+import { agentStory, renderStory } from './agents-lineage.js';
 import { recordOutcome, statusOutcome } from './record-state.js';
 import { RANGES, safeHostId } from './host-view.js';
 import { mountHosts, loadHosts } from './hosts-view.js';
@@ -71,45 +72,102 @@ defineComponents();
 const client = new HerdrClient('');
 const root = document.getElementById('view');
 
-// Grouped sidebar. Entries sharing a `family` are ONE sidebar link and appear as tabs above the page
-// (the shell renders them), so related pages are combined without changing any route.
+// Sidebar sections. A `tabs` entry owns a section whose other pages show as a tab strip above the page (SECTION_TABS), so
+// related pages (the four service views, plan reviews + review gate, ...) take one sidebar row instead of several.
 const NAV = [
-  { path: '/overview', label: 'Overview', group: 'Now' },
-  { path: '/attention', label: 'Attention', group: 'Now' },
-  { path: '/missions', label: 'Missions', group: 'Work' },
-  { path: '/herd', label: 'Agents', group: 'Work' },
-  { path: '/handoffs', label: 'Handoffs', group: 'Work' },
-  { path: '/github', label: 'Projects', group: 'Work', family: 'projects', familyLabel: 'Projects', tab: 'Overview' },
-  { path: '/github/projects', label: 'Project boards', group: 'Work', family: 'projects', tab: 'Boards' },
-  { path: '/ci', label: 'CI', group: 'Delivery', family: 'delivery', familyLabel: 'CI & reviews', tab: 'CI' },
-  { path: '/reviews', label: 'Reviews', group: 'Delivery', family: 'delivery', tab: 'Reviews' },
-  { path: '/review-gate', label: 'Review gate', group: 'Delivery', family: 'delivery', tab: 'Review gate' },
-  { path: '/artifacts', label: 'Artifacts', group: 'Delivery', family: 'artifacts', familyLabel: 'Artifacts', tab: 'Artifacts' },
-  { path: '/publications', label: 'Publications', group: 'Delivery', family: 'artifacts', tab: 'Publications' },
-  { path: '/hosts', label: 'Hosts', group: 'Fleet' },
-  { path: '/services', label: 'Services', group: 'Fleet', family: 'services', familyLabel: 'Services', tab: 'Catalog' },
-  { path: '/fabric-services', label: 'Fabric services', group: 'Fleet', family: 'services', tab: 'Fabric' },
-  { path: '/local-services', label: 'Local services', group: 'Fleet', family: 'services', tab: 'Local' },
-  { path: '/system-services', label: 'System services', group: 'Fleet', family: 'services', tab: 'System' },
-  { path: '/topology', label: 'Topology', group: 'Fleet', family: 'topology', familyLabel: 'Topology', tab: 'Topology' },
-  { path: '/architecture', label: 'Architecture', group: 'Fleet', family: 'topology', tab: 'Architecture', capability: 'architecture_v1' },
-  { path: '/scheduling', label: 'Scheduling', group: 'Fleet' },
-  { path: '/analytics', label: 'Analytics', group: 'Insights', family: 'insight', familyLabel: 'Analytics', tab: 'Analytics' },
-  { path: '/llm', label: 'LLM', group: 'Insights', family: 'insight', tab: 'LLM' },
-  { path: '/activity', label: 'Activity', group: 'Insights', family: 'insight', tab: 'Activity' },
-  { path: '/collab', label: 'Collaboration', group: 'Workspace' },
-  { path: '/personal-assistant', label: 'Personal Assistant', group: 'Workspace', capability: 'assistant_v1' },
-  { path: '/intelligence', label: 'Project intelligence', group: 'Workspace', capability: 'project_intelligence_v1' },
+  { group: 'Monitor', path: '/overview', label: 'Overview' },
+  { group: 'Monitor', path: '/attention', label: 'Attention', match: ['/activity'] },
+  { group: 'Agents', path: '/herd', label: 'Agents', match: ['/missions', '/handoffs', '/topology'] },
+  { group: 'Agents', path: '/collab', label: 'Collaboration' },
+  { group: 'Agents', path: '/personal-assistant', label: 'Assistant', capability: 'assistant_v1' },
+  { group: 'Fabric', path: '/hosts', label: 'Hosts', match: ['/scheduling'] },
+  { group: 'Fabric', path: '/services', label: 'Services', match: ['/fabric-services', '/local-services', '/system-services'] },
+  { group: 'Fabric', path: '/llm', label: 'Usage', match: ['/analytics'] },
+  { group: 'Delivery', path: '/ci', label: 'CI' },
+  { group: 'Delivery', path: '/reviews', label: 'Reviews', match: ['/review-gate'] },
+  { group: 'Delivery', path: '/github', label: 'Projects', match: ['/github/projects'] },
+  { group: 'Code', path: '/architecture', label: 'Architecture', capability: 'architecture_v1' },
+  { group: 'Code', path: '/artifacts', label: 'Artifacts', match: ['/publications'] },
+  { group: 'Code', path: '/intelligence', label: 'Project intelligence', capability: 'project_intelligence_v1' },
+];
+// Handoffs are the thread through the Agents section: who started whom, and why. Topology is no longer listed (the lineage
+// graph replaces it); its route still answers for old links.
+const SECTION_TABS = [
+  [['/herd', 'Agents'], ['/missions', 'Missions'], ['/handoffs', 'Handoffs']],
+  [['/attention', 'Attention'], ['/activity', 'Activity']],
+  [['/hosts', 'Hosts'], ['/scheduling', 'Scheduling']],
+  [['/llm', 'LLM'], ['/analytics', 'Analytics']],
+  [['/services', 'Catalog'], ['/fabric-services', 'Fabric'], ['/local-services', 'Local'], ['/system-services', 'System']],
+  [['/reviews', 'Plan reviews'], ['/review-gate', 'Review gate']],
+  [['/github', 'Issues'], ['/github/projects', 'Boards']],
+  [['/artifacts', 'Artifacts'], ['/publications', 'Publications']],
 ];
 
 const SHELL = document.getElementById('shell');
-SHELL.setAttribute('routes', JSON.stringify(visibleNav(NAV, [])));
-// Optional tabs appear once /api/v1/health advertises their capability; a failed probe keeps them hidden.
-// Re-set only when the list changes: every set re-renders the shell's nav.
-client.health().then((h) => {
-  const routes = JSON.stringify(visibleNav(NAV, h?.capabilities));
+// A page is listed only while it works. `hd-freshness` reports each page's last load: a missing backend (404/501, "not enabled",
+// "disabled") marks that exact page or tab, a later success clears it, and timeouts or other errors never mark anything (they are
+// transient). Only a page's own route counts: a detail route (/missions/x, /hosts/y) failing says nothing about its section. A
+// sidebar entry disappears only when its own page and every tab of its section are marked, and a marked tab drops out of the tab
+// strip. "Show unavailable" in the display footer lists everything again. Last-known state lives in localStorage.
+const UNAVAILABLE_KEY = 'herdr-unavailable-pages';
+let capabilities = [];
+let unavailable = new Set();
+let showUnavailable = false;
+try { unavailable = new Set(JSON.parse(window.localStorage.getItem(UNAVAILABLE_KEY) || '[]')); } catch { /* Nothing is hidden then. */ }
+const MISSING = /not found|\b(404|501)\b|not implemented|not enabled|is disabled/i;
+const routePath = () => (window.location.hash.replace(/^#/, '') || '/overview').split('?')[0];
+const KNOWN_PAGES = new Set([...NAV.flatMap((e) => [e.path, ...(e.match || [])]), ...SECTION_TABS.flat().map(([p]) => p)]);
+const entryPages = (entry) => [entry.path, ...(entry.match || [])].filter((p) => KNOWN_PAGES.has(p));
+const SUBNAV = document.getElementById('subnav');
+function renderSubnav() {
+  const path = (window.location.hash.replace(/^#/, '') || '/overview').split('?')[0];
+  const tabs = SECTION_TABS.find((t) => t.some(([p]) => path === p || path.startsWith(p + '/')));
+  if (!tabs || !SUBNAV) { if (SUBNAV) { SUBNAV.hidden = true; SUBNAV.textContent = ''; } return; }
+  // The longest matching path wins, so /github/projects is not also an active "Issues" tab.
+  const current = tabs.map(([p]) => p).filter((p) => path === p || path.startsWith(p + '/')).sort((x, y) => y.length - x.length)[0];
+  SUBNAV.hidden = false;
+  const listed = tabs.filter(([p]) => showUnavailable || p === current || !unavailable.has(p));
+  SUBNAV.hidden = listed.length < 2;
+  SUBNAV.innerHTML = listed.map(([p, label]) => `<a href="#${p}"${p === current ? ' aria-current="page"' : ''}>${label}</a>`).join('');
+}
+function currentNavPath() {
+  const path = routePath();
+  return NAV.find((e) => [e.path, ...(e.match || [])].some((p) => path === p || path.startsWith(p + '/')))?.path || '';
+}
+function navRoutes() {
+  const list = visibleNav(NAV, capabilities);
+  if (showUnavailable) return list;
+  const here = currentNavPath();
+  return list.filter((entry) => entry.path === here || !entryPages(entry).every((p) => unavailable.has(p)));
+}
+function applyRoutes() {
+  const routes = JSON.stringify(navRoutes());
   if (routes !== SHELL.getAttribute('routes')) SHELL.setAttribute('routes', routes);
-}).catch(() => { /* optional tabs stay hidden */ });
+  const toggle = document.getElementById('show-unavailable');
+  if (toggle) { toggle.hidden = !unavailable.size; toggle.textContent = showUnavailable ? 'Hide unavailable' : `Show unavailable (${unavailable.size})`; }
+  renderSubnav();
+}
+function markAvailability(ok, message) {
+  const path = routePath();
+  if (!KNOWN_PAGES.has(path) || path === '/overview' || path === '/attention') return;
+  const missing = !ok && MISSING.test(message || '');
+  if (!ok && !missing) return;
+  if (missing === unavailable.has(path)) return;
+  if (missing) unavailable.add(path); else unavailable.delete(path);
+  try { window.localStorage.setItem(UNAVAILABLE_KEY, JSON.stringify([...unavailable])); } catch { /* Kept for this page only. */ }
+  applyRoutes();
+}
+root.addEventListener('hd-freshness', (event) => markAvailability(event.detail.ok, event.detail.message));
+{
+  const toggle = document.createElement('button');
+  toggle.type = 'button'; toggle.id = 'show-unavailable'; toggle.slot = 'controls'; toggle.hidden = true; toggle.className = 'hd-linkbtn';
+  toggle.addEventListener('click', () => { showUnavailable = !showUnavailable; applyRoutes(); });
+  SHELL.append(toggle);
+}
+window.addEventListener('hashchange', applyRoutes);   // the entry you are on stays listed; leaving it lets it go
+applyRoutes();
+// Optional tabs appear once /api/v1/health advertises their capability; a failed probe keeps them hidden.
+client.health().then((h) => { capabilities = h?.capabilities || []; applyRoutes(); }).catch(() => { /* optional tabs stay hidden */ });
 SHELL.setAttribute('brand', 'HerdR Dev Fabric');
 
 // The nav badge follows the server inbox on every page, so a new critical item is visible from anywhere.
@@ -333,7 +391,7 @@ async function viewArtifact(parts, revision) {
   const controller = new AbortController();
   const chip = root.querySelector('herdr-freshness');
   // Mount immediately so navigation can cancel the pending detail read.
-  void renderArtifactDetail(container, client, id, { signal: controller.signal })
+  void renderArtifactDetail(container, client, id, { signal: controller.signal, versionId: route().query.get('version') || undefined })
     .then(result => { if (!controller.signal.aborted && revision === renderRevision) chip.touch(!result?.errors?.length, result?.errors?.join('; ')); })
     .catch(error => { if (!controller.signal.aborted && revision === renderRevision) { container.innerHTML = `<herdr-error message="${esc(error.message)}"></herdr-error><button type="button" data-route-retry>Retry</button>`; chip.touch(false, error.message); } });
   return { refresh() {}, dispose: () => controller.abort() };
@@ -785,8 +843,8 @@ async function viewSession(parts, revision) {
       <a href="#/herd?tab=${terminal ? outcome : 'current'}">← Agents</a>
       ${liveHead(`<h1 class="sd-title">${esc(clip(s.display_name || s.agent_role) || 'Agent')}${project ? ` · ${esc(clip(project))}` : ''}</h1>`)}
       <div class="sd-head"><strong data-session-head><span data-session-status>${esc(sessionStatusText(s))}</span> · <span data-session-updated>${esc(formatTimestamp(s.updated_at))}</span></strong><span class="sd-meta">${esc(s.host_id || 'Host not reported')} · ${esc(s.model || 'Model not reported')}</span></div>
-      <p class="sd-meta">${terminal ? `${outcome === 'failed' ? 'Failed' : 'Finished'} agent · recorded inspection remains available.` : 'Agent status reflects the last report; it is not a live process check.'}</p>
-      ${s.summary ? `<p style="overflow-wrap:anywhere">${esc(clip(s.summary))}</p>` : ''}
+       ${terminal ? `<p class="sd-meta">${outcome === 'failed' ? 'Failed' : 'Finished'} agent · recorded inspection remains available.</p>` : ''}
+       <div id="session-story"></div>
       ${s.mission_id || s.mission_key ? `<p class="sd-meta" id="session-mission">Mission association not resolved · ${esc(s.mission_key || s.mission_id)}</p>` : ''}
       <div id="related-panel"></div>
       <div id="session-terminal" class="sd-details"></div>
@@ -794,6 +852,11 @@ async function viewSession(parts, revision) {
       <div id="session-workspace-host"></div>
       <details class="hd-card sd-details" id="advanced-inspector"><summary>Advanced inspection</summary><div id="inspector-host"></div></details>
       <details class="hd-card sd-details" id="session-events"><summary>Recorded event stream</summary><div id="session-stream">${skeleton('recorded events', { rows: 2 })}</div></details>`;
+    // The story shows how the agent began and any handoff in or out; without handoff data it is the start and the last report.
+    const storyHost = document.getElementById('session-story');
+    const drawStory = tree => { if (storyHost.isConnected) storyHost.innerHTML = renderStory(agentStory(s, tree)); };
+    drawStory({});
+    client.getHandoffTree?.({signal: controller.signal}).then(drawStory).catch(() => { /* the story keeps start and last report */ });
     const relatedDispose = showRelated('session', s.session_id, null, relatedIntegrationLinks(s,'session',s.session_id), { sessionId: s.session_id });
     const disposeWorkspace = mountSessionWorkspace(document.getElementById('session-workspace-host'), client, s, {onRename: profile => { s.display_name = profile.display_name; const title = root.querySelector('.sd-title'); if (title) title.textContent = `${profile.display_name}${project ? ` · ${clip(project)}` : ''}`; }});
     let disposeAdvanced = null;

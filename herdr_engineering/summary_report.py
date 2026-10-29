@@ -59,7 +59,7 @@ def _clean_env(environ):
 
 
 def _git_facts(cwd, run):
-    """Fixed, read-only git reads in the session's own worktree; nothing from the transcript is executed."""
+    """Fixed, read-only git reads in one worktree; nothing from the transcript is executed."""
     if not isinstance(cwd, str) or not os.path.isdir(cwd):
         return {"available": False, "reason": "the session's recorded directory is unknown or no longer exists"}
     facts = {"available": True, "cwd": cwd}
@@ -81,6 +81,30 @@ def _git_facts(cwd, run):
     return facts
 
 
+def _worktree_facts(cwds, run, limit=3):
+    """Git facts for the session's latest working directory, plus the other distinct worktrees it used.
+
+    ``git`` is the most recent directory that is a repository (a session that started in a parent folder
+    and moved into a worktree is judged by the worktree); ``other_worktrees`` are earlier, distinct ones.
+    """
+    primary, others, tops = None, [], set()
+    for cwd in reversed(list(cwds or [])):
+        facts = _git_facts(cwd, run)
+        if not facts.get("available"):
+            if primary is None and not others:
+                primary = facts                     # remembered only if nothing better is found
+            continue
+        top = facts.get("toplevel")
+        if top in tops:
+            continue
+        tops.add(top)
+        if primary is None or not primary.get("available"):
+            primary = facts
+        elif len(others) < limit - 1:
+            others.append(facts)
+    return (primary or {"available": False, "reason": "the session recorded no working directory"}), others
+
+
 def collect_evidence(agent, session_id, *, home=None, run=subprocess.run):
     """History helper output plus git facts, bounded to one argv string. Raises when there is no record."""
     res = sh.resolve(agent=agent, session=session_id, home=home, env={}, cwd="/nonexistent-summary-target")
@@ -89,7 +113,8 @@ def collect_evidence(agent, session_id, *, home=None, run=subprocess.run):
     for max_events in (400, 200, 100, 50):
         history = sh.read_history(res, home=home, max_events=max_events)
         history["journal"] = sh.journal_projection(res.session_id)
-        evidence = {"history": history, "git": _git_facts(history.get("cwd"), run)}
+        git, others = _worktree_facts(history.get("cwds") or [history.get("cwd")], run)
+        evidence = {"history": history, "git": git, "other_worktrees": others}
         text = json.dumps(evidence, ensure_ascii=False, default=str)
         if len(text) <= MAX_EVIDENCE_CHARS:
             return text
@@ -170,3 +195,91 @@ def run_report(agent, session_id, *, harness="claude", timeout=DEFAULT_TIMEOUT_S
     return {"ok": True, "report": validate_report(text), "harness": harness, "agent": agent,
             "session_id": session_id, "duration_s": round(time.monotonic() - started, 1),
             "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+
+
+# --- publishing a report generated in a terminal ------------------------------------------------
+
+def _cache_dir(home):
+    path = Path(home) / ".cache/herdr-engineering/summary"
+    path.mkdir(parents=True, exist_ok=True)
+    os.chmod(path, 0o700)
+    return path
+
+
+def _post_publish(cfg, body, *, timeout=15):
+    import urllib.error
+    import urllib.request
+    req = urllib.request.Request(
+        cfg.control_plane_url.rstrip("/") + "/api/v1/host/summary-reports/publish",
+        data=json.dumps({**body, "host_id": cfg.host_id}).encode(), method="POST",
+        headers={"Content-Type": "application/json", "X-API-Key": cfg.api_key or ""})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:      # noqa: S310 (operator-configured URL)
+            return resp.status, json.loads(resp.read(1_000_000) or b"{}")
+    except urllib.error.HTTPError as exc:
+        try:
+            return exc.code, json.loads(exc.read(1_000_000) or b"{}")
+        except ValueError:
+            return exc.code, {}
+
+
+def _open_side_pane(file, pane_id, env, run, herdr="herdr"):
+    """Show the report in a pane to the right of the caller's own pane, reusing the one a previous run made."""
+    sidecar = Path(str(file) + ".pane")
+    try:
+        previous = sidecar.read_text().strip() if sidecar.is_file() else ""
+        target = None
+        if previous:
+            alive = run([herdr, "pane", "get", previous], capture_output=True, text=True, timeout=10, env=env)
+            target = previous if alive.returncode == 0 else None
+        if target is None:
+            split = run([herdr, "pane", "split", "--pane", pane_id, "--direction", "right", "--no-focus",
+                         "--cwd", str(Path(file).parent)], capture_output=True, text=True, timeout=10, env=env)
+            if split.returncode != 0:
+                return {"ok": False, "error": "split_failed"}
+            target = json.loads(split.stdout)["result"]["pane"]["pane_id"]
+            sidecar.write_text(target)
+        shown = run([herdr, "pane", "run", target, "less", "-R", str(file)], capture_output=True, text=True,
+                    timeout=10, env=env)
+        return {"ok": shown.returncode == 0, "pane_id": target} if shown.returncode == 0 else {"ok": False, "error": "run_failed"}
+    except (OSError, ValueError, KeyError, subprocess.TimeoutExpired):
+        return {"ok": False, "error": "herdr_unavailable"}
+
+
+def publish_report(agent, session_id, text, *, home=None, environ=None, run=subprocess.run,
+                   load_config=None, post=_post_publish, pane=True, dashboard=True):
+    """Put a terminal-made report where it can be read without scrolling the terminal.
+
+    It goes to the dashboard (the session's Summary view) and into a Herdr pane beside the caller's own.
+    ``message`` is the single line the terminal should show; when neither destination took the report
+    the caller must print it instead, so nothing is lost.
+    """
+    if agent not in AGENTS or not isinstance(session_id, str) or not _SESSION_ID.match(session_id):
+        raise ReportError("invalid_session_id", "agent or session id has unsupported characters")
+    report = validate_report(text)
+    home = Path(home) if home else Path.home()
+    env = dict(os.environ if environ is None else environ)
+    file = _cache_dir(home) / f"{agent}-{session_id}.md"
+    file.write_text(report + "\n")
+    os.chmod(file, 0o600)
+    out = {"ok": False, "file": str(file), "dashboard": {"ok": False, "skipped": True},
+           "pane": {"ok": False, "skipped": True}}
+    if dashboard:
+        try:
+            if load_config is None:
+                from .host_config import load_host_config as load_config
+            status, body = post(load_config(), {"agent": agent, "target": session_id, "report": report})
+            out["dashboard"] = {"ok": status == 200, **({} if status == 200 else {"error": body.get("reason") or f"http_{status}"})}
+        except Exception as exc:                       # no host config, network down, ...
+            out["dashboard"] = {"ok": False, "error": exc.__class__.__name__}
+    pane_id = env.get("HERDR_PANE_ID")
+    if pane and pane_id:
+        out["pane"] = _open_side_pane(file, pane_id, env, run)
+    elif pane:
+        out["pane"] = {"ok": False, "error": "not_in_a_herdr_pane"}
+    places = [name for name, key in (("the dashboard Summary view", "dashboard"), ("a side pane", "pane"))
+              if out[key]["ok"]]
+    out["ok"] = bool(places)
+    out["message"] = (f"Session summary published to {' and '.join(places)}; it is not repeated here."
+                      if places else "")
+    return out

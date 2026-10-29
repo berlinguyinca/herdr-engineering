@@ -535,6 +535,15 @@ TOOL_CATALOG: dict[str, dict[str, Any]] = {
             "text": {"type": "string"}, "project": {"type": "string"}, "event": {"type": "string"},
             "source": {"type": "string"}, "category": {"type": "string"}, "as_of": {"type": "string"}},
             "required": ["operation"]}},
+    "read_lineage": {
+        "sensitive": False,
+        "description": "Read the mission/agent lineage graph (sessions, handoffs, branches, reviews, PRs, CI, artifacts) "
+                       "as the calling user may see it. Read-only; returns freshness and source.",
+        "parameters": {"type": "object", "properties": {
+            "operation": {"type": "string", "enum": ["node", "neighborhood", "list"]},
+            "node_id": {"type": "string"}, "node_type": {"type": "string"},
+            "depth": {"type": "integer"}, "limit": {"type": "integer"}},
+            "required": ["operation"]}},
 }
 
 
@@ -1375,6 +1384,7 @@ class AssistantService:
             if (repo is not None and fc.get("enabled")) else None)
         # Set by the control-plane API when project intelligence is enabled: (tenant, user, payload) -> dict.
         self.intelligence_read = None
+        self.lineage_read = None
         if runner is not None:
             self.runner = runner
         else:
@@ -2075,7 +2085,9 @@ class AssistantService:
                 return {"allowed": False, "reason": "shell tool disabled by policy"}
             cmd = (target or "").split(" ", 1)[0].strip()
             cmds = pol.get("allowed_commands", [])
-            if cmds and cmd not in cmds:
+            if not cmds:
+                return {"allowed": False, "reason": "no commands on the shell allowlist"}
+            if cmd not in cmds:
                 return {"allowed": False, "reason": f"command '{cmd}' not allowlisted"}
             return {"allowed": True}
         return {"allowed": False, "reason": "unknown computer tool"}
@@ -2345,6 +2357,13 @@ class AssistantService:
                 raise AssistantError("project intelligence is not enabled")
             try:
                 return {"ok": True, "result": self.intelligence_read(tenant_id, user_id, payload)}
+            except (ValueError, LookupError) as exc:
+                raise AssistantError(str(exc)) from exc
+        if tool_id == "read_lineage":
+            if self.lineage_read is None:
+                raise AssistantError("lineage reading is not enabled")
+            try:
+                return {"ok": True, "result": self.lineage_read(tenant_id, user_id, payload)}
             except (ValueError, LookupError) as exc:
                 raise AssistantError(str(exc)) from exc
         if tool_id == "delegate":

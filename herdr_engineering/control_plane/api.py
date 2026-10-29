@@ -46,7 +46,7 @@ log = logging.getLogger(__name__)
 # narrow `agent` role, besides /api/v1/ingest. Nothing else.
 _SUMMARY_FIX = re.compile(r"^/api/v1/sessions/[^/]+/summary/(?:fix|report)$")
 # The per-host worker that runs full /summary reports where the session records live (ingest role).
-_HOST_REPORT = re.compile(r"^/api/v1/host/summary-reports/(?:claim|result)$")
+_HOST_REPORT = re.compile(r"^/api/v1/host/summary-reports/(?:claim|result|publish)$")
 # Terminal button: builds (never runs) the viewer-side attach command; same guard as summary fix.
 _TERMINAL_ATTACH = re.compile(r"^/api/v1/sessions/[^/]+/terminal$")
 _AGENT_POST = re.compile(r"^/api/v1/(?:llm/keys|reviews|llm/keys/[^/]+/revoke"
@@ -261,7 +261,8 @@ class ControlPlaneServer:
                  review_quorum=None, system_graph: bool = False, attention=None, ci_fix=None, missions=None, github_pg_dsn=None,
                  architecture_enabled=None, architecture_explain=None, architecture_options=None,
                  request_workers=128, request_queue=256,
-                 assistant_service=None, assistant_config=None, fabric_resolver=None, fabric_services=None, fabric_names=None):
+                 assistant_service=None, assistant_config=None, fabric_resolver=None, fabric_services=None, fabric_names=None,
+                 scheduler_admission=False, scheduler_limits=None, skill_registry=None):
         """
         Auth (Spec §104): either a single `api_key` (all-access) or a mapping
         `api_keys={key: role}` with roles "viewer" (read-only) / "operator"
@@ -301,7 +302,8 @@ class ControlPlaneServer:
         self.attention = None
         if self.attention_config["enabled"] and not collab_only:
             self.attention = AttentionInbox(repo, config=self.attention_config, health=self._health,
-                                            ci_snapshot=self.ci_monitor.snapshot, ci_fix=self.ci_fix)
+                                            ci_snapshot=self.ci_monitor.snapshot, ci_fix=self.ci_fix,
+                                            handoffs=lambda: getattr(self, "handoffs", None))
         if github_monitor is None:
             # control-plane-web only (the worker never builds a server): the GitHub
             # catalog persists in control_plane.pg_dsn when set, else in memory.
@@ -334,10 +336,16 @@ class ControlPlaneServer:
         self.artifact_job_manager = artifact_job_manager
         self.artifact_review_manager = artifact_review_manager
         self.artifact_acl = artifact_acl
+        # control_plane.skill_registry (flag off by default: nothing is constructed and the routes answer 404).
+        from .skill_routes import build_skill_registry
+        self.skills, self.skill_transfer = build_skill_registry(
+            skill_registry, artifact_store=artifact_store, rustfs=rustfs, acl=artifact_acl,
+            record_event=repo.record_event)
         from .handoffs import HandoffRegistry
         self.handoffs = handoff_registry or HandoffRegistry(repo)
         from .scheduler_service import SchedulerService
-        self.scheduler = SchedulerService(repo)
+        self.scheduler_admission = scheduler_admission is True
+        self.scheduler = SchedulerService(repo, **(scheduler_limits or {}))
         # Herdr Personal Assistant (Rakazo integration, P1/P2). Canonical owner;
         # feature-flag gated (off by default) and inert until enabled.
         if assistant_service is None:
@@ -474,9 +482,9 @@ class ControlPlaneServer:
         self.architecture_require_host_binding = arch_opts["require_host_binding"]
         self.architecture_agent_hosts = {}
         for key, hosts in arch_opts["agent_hosts"].items():
-            if self._keys.get(key) != "agent":
+            if self._keys.get(key) not in ("agent", "ingest"):
                 raise ValueError("control_plane.architecture.agent_hosts: each entry must name a configured "
-                                 "api key with the agent role")
+                                 "api key with the agent or ingest role")
             digest = hashlib.sha256(key.encode()).hexdigest()[:12]
             self.architecture_agent_hosts[f"key:{digest}"] = frozenset(hosts)
         self.architecture.gate_store_fn = lambda: self.gate_store
@@ -489,6 +497,8 @@ class ControlPlaneServer:
         self.intelligence.ci_repair_fn = self._intelligence_ci_repair
         if getattr(self, "assistant", None) is not None:
             self.assistant.intelligence_read = self.intelligence.assistant_read
+            from .assistant_lineage import LineageReader, principal_resolver
+            self.assistant.lineage_read = LineageReader(repo.graph, principal_resolver(self._keys)).read
         self._configure_architecture_explain(fleet_config, architecture_explain)
         if collab is not None:
             collab.architecture = self.architecture
@@ -772,6 +782,8 @@ class ControlPlaneServer:
             h["capabilities"].append("assistant_v1")
         if getattr(self, "intelligence", None) is not None and self.intelligence._cfg()[0]["enabled"]:
             h["capabilities"].append("project_intelligence_v1")
+        if getattr(self, "skills", None) is not None:
+            h["capabilities"].append("skill_registry_v1")
         if self.architecture.enabled:
             h["capabilities"].append("architecture_v1")
             if self.architecture.explain_config:
@@ -1462,6 +1474,8 @@ def _make_handler(server, public=False, operator=False):
                 return self._fleet_config_applied()
             if self._path_only() == "/api/v1/intelligence/webhooks/github":
                 return self._intelligence_webhook()
+            if self._path_only() == _FLEET_CONFIG_PATH + "/telemetry":
+                return self._fleet_resource_telemetry()
             # The ingest route is reachable by the ingest role; every other
             # POST requires the operator role (Spec §104).
             path = self.path.split("?")[0]
@@ -1469,7 +1483,7 @@ def _make_handler(server, public=False, operator=False):
             # prefix test is bypassed by e.g. /api/v1/%72eview-gate/...
             segs = path.split("/")
             res = unquote(segs[3]) if len(segs) > 3 and segs[:3] == ["", "api", "v1"] else ""
-            if (res.startswith("reviews") or res == "attention" or res == "architecture"
+            if (res.startswith("reviews") or res in {"attention", "architecture", "scheduler"}
                     or (res in {"ci", "review-gate"} and len(segs) > 4) or _SUMMARY_FIX.match(path)
                     or _TERMINAL_ATTACH.match(path) or _STEER_ACK.match(path) or _is_rereview(path)):
                 origin = self.headers.get("Origin")
@@ -1591,6 +1605,22 @@ def _make_handler(server, public=False, operator=False):
                 return self._deny(401, "unauthorized")
             store.record_applied(host, body["revision"])
             return self._json({"ok": True})
+
+        def _fleet_resource_telemetry(self):
+            if server.fleet_config is None:
+                return self._deny(404, "not found")
+            host = self._fleet_host(server.fleet_config.current())
+            if host is None:
+                return self._deny(401, "unauthorized")
+            try:
+                body = self._read_json()
+                if not isinstance(body, dict):
+                    return self._deny(400, "resource snapshot must be an object")
+                return self._json(server.scheduler.observe_host(host, body))
+            except (TypeError, ValueError):
+                return self._deny(400, "invalid resource observation")
+            except RuntimeError:
+                return self._deny(503, "resource persistence unavailable")
 
         # --------------------------------------------------- collaboration (HCN)
         def _is_collab_path(self):
@@ -1788,6 +1818,9 @@ def _make_handler(server, public=False, operator=False):
             try:
                 from .artifact_report_api import route_report
                 if route_report(self, server, parts, resource):
+                    return None
+                from .skill_routes import route_skills
+                if route_skills(self, server, parts, resource):
                     return None
                 if self.command == "GET":
                     return self._api_get(parts, resource)
@@ -2095,9 +2128,9 @@ def _make_handler(server, public=False, operator=False):
                 return self._json({"handoffs": server.handoffs.list(state=_q(self.path, "state"))})
             if resource == "scheduler":
                 if len(parts) == 4:
-                    return self._json({"hosts": server.scheduler.host_cards(), "queued_agents": 0, "running_agents": 0})
+                    return self._json(server.scheduler.overview())
                 if parts[4:] == ["queue"]:
-                    return self._json({"queue": []})
+                    return self._json({"queue": server.scheduler.overview()["queue"]})
                 return self._json({"error": "not found"}, 404)
             if resource == "health":
                 return self._json(server._health())
@@ -2481,9 +2514,13 @@ def _make_handler(server, public=False, operator=False):
                         active=_q(self.path, "active") == "1"))
                 if what:
                     return self._json({"error": "not found"}, 404)
-                from .project_links import annotate_ci, cached_github_languages
-                return self._json(annotate_ci(server.ci_monitor.snapshot(), r,
-                    repository_languages=cached_github_languages(server.github_monitor)))
+                from .project_links import (
+                    annotate_ci,
+                    cached_github_languages,
+                    mark_merged_pull_requests,
+                )
+                return self._json(mark_merged_pull_requests(annotate_ci(server.ci_monitor.snapshot(), r,
+                    repository_languages=cached_github_languages(server.github_monitor)), server.gate_store))
             if resource == "reviews":
                 from .reviews import ReviewService
                 reviews = ReviewService(r)
@@ -2573,7 +2610,10 @@ def _make_handler(server, public=False, operator=False):
                     return self._json({"error": "report execution validation and context are worker-owned; use report checks for attestations"}, 400)
                 body["created_by"] = self._resource_principal()
                 body["provenance"] = {**(body.get("provenance") or {}), "principal_id": body["created_by"]}
-                return self._json(self._artifact_call("commit_version", parts[4], **body), 201)
+                committed = self._artifact_call("commit_version", parts[4], **body)
+                from .artifact_lineage import emit_version_lineage
+                emit_version_lineage(server.ingest, committed, self._principal())
+                return self._json(committed, 201)
             if resource == "artifact-jobs" and server.artifact_job_manager is not None:
                 if len(parts) == 4:
                     body = self._read_json() or {}
@@ -2654,6 +2694,11 @@ def _make_handler(server, public=False, operator=False):
             if resource == "scheduler":
                 body = self._read_json() or {}
                 principal = self._resource_principal()
+                admission = (parts[4:] == ["reservations"]
+                             or (len(parts) == 6 and parts[4] == "reservations"
+                                 and parts[5] in {"commit", "claim", "retry"}))
+                if admission and not server.scheduler_admission:
+                    return self._json({"error": "scheduler admission is disabled"}, 503)
                 try:
                     if len(parts) == 5 and parts[4] == "plan":
                         return self._json(server.scheduler.plan(body, principal))
@@ -2661,6 +2706,10 @@ def _make_handler(server, public=False, operator=False):
                         return self._json(server.scheduler.reserve(body, principal), 201)
                     if len(parts) == 6 and parts[4] == "reservations" and parts[5] == "commit":
                         return self._json(server.scheduler.commit(body.get("reservation_id", "")))
+                    if len(parts) == 6 and parts[4] == "reservations" and parts[5] == "claim":
+                        return self._json(server.scheduler.claim_execution(body.get("reservation_id", "")))
+                    if len(parts) == 6 and parts[4] == "reservations" and parts[5] == "retry":
+                        return self._json(server.scheduler.retry_queued(body.get("reservation_id", "")))
                     if len(parts) == 6 and parts[4] == "reservations" and parts[5] in {"release", "cancel"}:
                         state = "cancelled" if parts[5] == "cancel" else "released"
                         return self._json(server.scheduler.release(body.get("reservation_id", ""), state=state))
@@ -2794,19 +2843,28 @@ def _make_handler(server, public=False, operator=False):
                                                       peer=self.client_address[0]))
                 except AttachRefused as exc:
                     return self._json(exc.body, exc.status)
-            if resource == "host" and len(parts) == 6 and parts[4] == "summary-reports" and parts[5] in {"claim", "result"}:
+            if resource == "host" and len(parts) == 6 and parts[4] == "summary-reports" and parts[5] in {"claim", "result", "publish"}:
                 from .summary_report import ReportRefused
                 reports = server.summary_report
                 host_id = body.get("host_id") if isinstance(body, dict) else None
                 if not isinstance(host_id, str) or not host_id or len(host_id) > 253:
                     return self._json({"ok": False, "error": "host_id is required"}, 400)
+                # A key bound in control_plane.architecture.agent_hosts acts only for its own hosts.
+                bound = (server.architecture_agent_hosts.get(self._principal()["id"])
+                         if self._role() in ("agent", "ingest") else None)
+                if (bound is None and self._role() == "agent" and server.architecture_require_host_binding
+                        or bound is not None and host_id not in bound):
+                    return self._json({"ok": False, "error": "this API key may not act for that host"}, 403)
                 if reports is None or not reports.enabled:
+                    if parts[5] == "publish":
+                        return self._json({"ok": False, "error": "Full session reports are not enabled.",
+                                           "reason": "reports_disabled"}, 409)
                     return self._json({"ok": True, "jobs": []} if parts[5] == "claim"
                                       else {"ok": True, "replayed": True})
                 if parts[5] == "claim":
                     return self._json({"ok": True, "jobs": reports.claim(host_id)})
                 try:
-                    status, result = reports.finish(host_id, body)
+                    status, result = (reports.publish if parts[5] == "publish" else reports.finish)(host_id, body)
                 except ReportRefused as exc:
                     return self._json(exc.body, exc.status)
                 return self._json(result, status)

@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import {withPage} from './helpers/fixture.mjs';
+const setCycle=async(page,name,wanted)=>{const b=page.locator(`.hd-controls button[data-control="${name}"]`);for(let i=0;i<3&&(await b.getAttribute('data-value'))!==wanted;i+=1)await b.click();};
 
 const packages=path.resolve(import.meta.dirname,'../../packages');
 
@@ -104,11 +105,11 @@ test('inline script applies stored theme and calm before any module loads',async
  assert.deepEqual(early,{t:'dark',c:'on',controls:false});
  release();
  await page.waitForSelector('.hd-controls');
- const r=await page.evaluate(()=>[...document.querySelectorAll('.hd-controls select')].map(s=>s.value));
+ const r=await page.evaluate(()=>[...document.querySelectorAll('.hd-controls button')].map(b=>b.dataset.value));
  assert.deepEqual(r,['dark','on']);
- await page.selectOption('.hd-controls select[data-control="calm"]','off');
+ await setCycle(page,'calm','off');
  assert.equal(await page.evaluate(()=>[document.documentElement.dataset.calm,localStorage.getItem('herdr.calm')].join()),'off,off');
- await page.selectOption('.hd-controls select[data-control="theme"]','auto');
+ await setCycle(page,'theme','auto');
  assert.equal(await page.evaluate(()=>[document.documentElement.dataset.theme??'none',localStorage.getItem('herdr.theme')].join()),'none,');
 }));
 
