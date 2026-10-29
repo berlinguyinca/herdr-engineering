@@ -127,6 +127,10 @@ services:
     # (--fleet-config): Postgres DSN, host aliases, RustFS/MinIO, API keys, ...
     volumes:
       - ${HERDR_CP_FLEET_DIR:?run deploy.sh}:/etc/herdr/fleet:ro
+      # GitHub App private key (github.app.private_key_file =
+      # /etc/herdr/github-app/github-app.pem): its own 0700 dir, validated by deploy.sh.
+      # Only this service reads GitHub (release evidence + GitHub cache).
+      - ${HERDR_CP_GITHUB_APP_DIR:?run deploy.sh}:/etc/herdr/github-app:ro
     # The HerdR UI is served at dev.lan:<public-port> (default 80 = plain
     # http://dev.lan). Host bind is the Tailnet interface so only Tailnet
     # clients reach it; container keeps its internal 8080 listener.

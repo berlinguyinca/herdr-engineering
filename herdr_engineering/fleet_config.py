@@ -134,6 +134,13 @@ def _parse(data: Any) -> FleetConfig:
                 parse_review_gate_section(sec["values"]["review_gate"], check_key_file=False)
             except ValueError as exc:
                 raise FleetConfigError(f"section {name}: {exc}") from None
+        if name == "github" and sec["values"].get("app") not in (None, {}):
+            from herdr_engineering.github_auth import GitHubAuthError, parse_app_config
+
+            try:  # structure only: the key file lives on the control-plane host
+                parse_app_config(sec["values"]["app"])
+            except GitHubAuthError as exc:
+                raise FleetConfigError(f"section {name}: {exc}") from None
         sections[name] = {"roles": roles, "values": sec["values"]}
 
     hosts: dict[str, dict] = {}
