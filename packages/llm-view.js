@@ -97,10 +97,25 @@ function tiles(total) {
     ['Speed p50', single(t.speed_tps, rate), 'streams with a usage figure'],
     ['Errors', total ? `${percent(t.error_rate)} (${count(t.errors)})` : GAP, ''],
   ];
-  return `<div class="llm-tiles">${cards.map(([label, value, note]) => `
+  const reported = (value) => !/^(not reported|insufficient data|—)/.test(value);
+  const shown = cards.filter(([, value]) => reported(value));
+  const quiet = cards.filter(([, value]) => !reported(value));
+  return `${shown.length ? `<div class="llm-tiles">${shown.map(([label, value, note]) => `
     <div class="llm-tile"><div class="llm-tile__label">${esc(label)}</div>
-    <div class="llm-tile__value">${esc(value)}</div>${note ? `<div class="llm-tile__note">${esc(note)}</div>` : ''}</div>`).join('')}</div>`;
+    <div class="llm-tile__value">${esc(value)}</div>${note ? `<div class="llm-tile__note">${esc(note)}</div>` : ''}</div>`).join('')}</div>` : ''}${
+    quiet.length ? `<p class="llm-quiet" data-llm-quiet>${quiet.map(([label, value, note]) => `<span title="${esc(note || '')}">${esc(label)}: ${esc(value === GAP && total ? 'not reported' : value)}</span>`).join('')}</p>` : ''}`;
 }
+
+
+/** A tab switcher with no script: radio inputs choose which panel shows. `tabs`: [[label, badge|'', html, hasData]]; the first
+ *  tab with data is the one shown, else the first. Every panel stays in the DOM, so the exact numbers are always there to read. */
+function switcher(id, tabs) {
+  const first = Math.max(0, tabs.findIndex((t) => t[3] !== false));
+  return `<section class="llm-card llm-switch" data-llm-switch="${id}">${tabs.map((t, i) => `<input type="radio" class="llm-sr" name="${id}" id="${id}-${i}"${i === first ? ' checked' : ''}>`).join('')}
+    <div class="llm-tabs" role="presentation">${tabs.map((t, i) => `<label for="${id}-${i}"${t[3] === false ? ' class="llm-tab--empty"' : ''}>${esc(t[0])}${t[1] ? ` <span class="llm-tab__badge">${esc(t[1])}</span>` : ''}</label>`).join('')}</div>
+    <div class="llm-panels">${tabs.map((t, i) => `<div class="llm-panel" data-panel="${id}-${i}">${t[2]}</div>`).join('')}</div></section>`;
+}
+const switchCss = (id, n) => Array.from({ length: n }, (_, i) => `[data-llm-switch="${id}"] #${id}-${i}:checked ~ .llm-panels [data-panel="${id}-${i}"]{display:block}[data-llm-switch="${id}"] #${id}-${i}:checked ~ .llm-tabs label[for="${id}-${i}"]{background:var(--surface-2);color:var(--text);border-color:var(--border)}[data-llm-switch="${id}"] #${id}-${i}:focus-visible ~ .llm-tabs label[for="${id}-${i}"]{outline:2px solid var(--accent)}`).join('');
 
 const TABLE_ROWS = 12;       // a long table shows its first rows; the rest sit behind one disclosure instead of a screen of ids
 const tableOf = (headers, rows, empty, head = true) => `<div class="llm-table"><table class="llm-fixed"><thead${head ? '' : ' class="llm-sr"'}><tr>${headers.map((h) => `<th scope="col">${esc(h)}</th>`).join('')}</tr></thead><tbody>${
@@ -189,16 +204,18 @@ function charts(series) {
   const data = seriesTable(['Time (UTC)', 'Requests', 'Errors', 'TTFT p95', 'Speed p50'],
     req.map((p, i) => [esc(when(p.t)), esc(count(p.v)), esc(count(err[i]?.v)),
       esc(num(ttft[i]?.v) == null ? GAP : ms(ttft[i].v)), esc(num(spd[i]?.v) == null ? GAP : rate(spd[i].v))]));
-  return `<div class="llm-charts"><section class="llm-card"><h2>Requests per ${esc(step)}</h2>${
-    barPlot('llm-req', 'Requests over time', `${req.length} buckets of ${step}; failed requests are stacked on top. Exact counts follow in Chart data.`, req, err)}
-    <div class="llm-legend"><span style="--c:var(--status-ok)">OK</span><span style="--c:var(--status-attention)">Failed</span></div></section>
-    <section class="llm-card"><h2>TTFT p95 and speed p50</h2>${
-      linePlot('llm-lat', 'Latency and speed over time', `${ttft.length} buckets of ${step}. Buckets with fewer than 5 samples are left out. Exact values follow in Chart data.`,
-        [{ points: ttft, color: 'var(--accent)' }], ms)}
-    <div class="llm-legend"><span style="--c:var(--accent)">TTFT p95 (axis in time)</span></div>${
-      linePlot('llm-spd', 'Generation speed over time', `${spd.length} buckets of ${step}.`, [{ points: spd, color: 'var(--status-ok)' }], rate)}
-    <div class="llm-legend"><span style="--c:var(--status-ok)">Speed p50 (axis in tokens/s)</span></div></section></div>
-    <details class="llm-data"><summary>Chart data</summary>${data}</details>`;
+  const hasReq = req.some((p) => num(p.v) > 0);
+  const hasLat = ttft.some((p) => num(p.v) != null);
+  const hasSpd = spd.some((p) => num(p.v) != null);
+  const sw = switcher('llm-chart', [
+    [`Requests per ${step}`, '', `${barPlot('llm-req', 'Requests over time', `${req.length} buckets of ${step}; failed requests are stacked on top. Exact counts follow in Chart data.`, req, err)}
+      <div class="llm-legend"><span style="--c:var(--status-ok)">OK</span><span style="--c:var(--status-attention)">Failed</span></div>`, hasReq],
+    ['TTFT p95', '', `${linePlot('llm-lat', 'Latency over time', `${ttft.length} buckets of ${step}. Buckets with fewer than 5 samples are left out. Exact values follow in Chart data.`,
+      [{ points: ttft, color: 'var(--accent)' }], ms)}<div class="llm-legend"><span style="--c:var(--accent)">TTFT p95 (axis in time)</span></div>`, hasLat],
+    ['Speed p50', '', `${linePlot('llm-spd', 'Generation speed over time', `${spd.length} buckets of ${step}.`, [{ points: spd, color: 'var(--status-ok)' }], rate)}
+      <div class="llm-legend"><span style="--c:var(--status-ok)">Speed p50 (axis in tokens/s)</span></div>`, hasSpd],
+  ]);
+  return `<div class="llm-charts">${sw}</div><details class="llm-data"><summary>Chart data</summary>${data}</details>`;
 }
 
 export function disclosure(meta) {
@@ -211,23 +228,28 @@ export function disclosure(meta) {
 
 function controls(state, base = '#/llm') {
   const link2 = (w) => `<a class="llm-window" href="${esc(`${base}?${llmQuery({ ...state.filters, window: w })}`)}"${w === state.window ? ' aria-current="page"' : ''}>${w}</a>`;
-  const select = (name, label, values) => `<label>${label}<select data-llm-filter="${name}"><option value="">All</option>${
-    values.map((v) => `<option value="${esc(v)}" ${v === state.filters[name] ? 'selected' : ''}>${esc(v)}</option>`).join('')}</select></label>`;
+  const select = (name, label, values) => `<select data-llm-filter="${name}" aria-label="${label}" title="${label}"${state.filters[name] ? ' class="llm-set"' : ''}><option value="">All ${label.toLowerCase()}s</option>${
+    values.map((v) => `<option value="${esc(v)}" ${v === state.filters[name] ? 'selected' : ''}>${esc(v)}</option>`).join('')}</select>`;
   const filters = base === '#/llm'
     ? `${select('project', 'Project', state.projects || [])}${select('model', 'Model', state.modelNames || [])}` : '';
   return `<div class="llm-controls"><nav class="llm-windows" aria-label="Time window">${WINDOWS.map(link2).join('')}</nav>${filters}</div>`;
 }
 
 export const llmStyles = `<style>
-.llm-controls{display:flex;flex-wrap:wrap;gap:12px;align-items:flex-end;margin:10px 0}.llm-controls label{display:flex;flex-direction:column;gap:4px;font-size:12px}.llm-controls select{padding:7px 9px;border:1px solid var(--border);border-radius:var(--radius-sm);font:inherit;color:var(--text);background:var(--surface);max-width:100%}
-.llm-windows{display:flex;gap:4px}.llm-window{padding:7px 12px;border:1px solid var(--border);border-radius:var(--radius-sm);font-size:13px;text-decoration:none;color:var(--text);background:var(--surface)}.llm-window[aria-current=page]{border-color:var(--accent);font-weight:600}
+.llm-controls{display:flex;flex-wrap:wrap;gap:12px 16px;align-items:center;margin:16px 0}.llm-controls select{padding:4px 12px;min-height:32px;border:1px solid var(--border);border-radius:var(--radius-sm);font:inherit;font-size:13px;color:var(--text-secondary);background:var(--surface);max-width:100%}.llm-controls select.llm-set{border-color:var(--accent);color:var(--text)}
+.llm-windows{display:inline-flex;border:1px solid var(--border);border-radius:var(--radius-sm);overflow:hidden}.llm-window{padding:4px 12px;min-height:32px;display:inline-flex;align-items:center;font-size:13px;text-decoration:none;color:var(--text-secondary);background:var(--surface);border-left:1px solid var(--border)}.llm-window:first-child{border-left:0}.llm-window[aria-current=page]{background:var(--surface-2);color:var(--text);font-weight:600}
 .llm-tiles{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:12px;margin:12px 0}.llm-tile{border:1px solid var(--border);border-radius:var(--radius);background:var(--surface);padding:12px 14px;min-width:0}.llm-tile__label{font-size:12px;color:var(--text-secondary)}.llm-tile__value{font-size:20px;font-weight:600;margin-top:4px;overflow-wrap:anywhere}.llm-tile__note{font-size:11px;color:var(--text-secondary);margin-top:4px}
-.llm-charts{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px;margin:16px 0}.llm-card{min-width:0;border:1px solid var(--border);border-radius:var(--radius);background:var(--surface);padding:6px 14px 12px}.llm-card h2{font-size:14px;margin:10px 0 4px}.llm-card svg{display:block;width:100%;max-height:210px}.llm-card svg text{font-size:11px;fill:var(--text-secondary);font-family:inherit}.llm-card svg line{stroke:var(--border)}
+.llm-charts{display:grid;grid-template-columns:minmax(0,1fr);gap:16px;margin:16px 0}.llm-quiet{display:flex;flex-wrap:wrap;gap:4px 24px;margin:12px 0;font-size:12px;color:var(--text-muted)}.llm-card{min-width:0;border:1px solid var(--border);border-radius:var(--radius);background:var(--surface);padding:6px 14px 12px}.llm-card h2{font-size:14px;margin:10px 0 4px}.llm-card svg{display:block;width:100%;max-height:210px}.llm-card svg text{font-size:11px;fill:var(--text-secondary);font-family:inherit}.llm-card svg line{stroke:var(--border)}
 .llm-legend{display:flex;flex-wrap:wrap;gap:12px;font-size:11px;color:var(--text-secondary)}.llm-legend span::before{content:'';display:inline-block;width:9px;height:9px;margin-right:5px;background:var(--c);border-radius:2px}
 .llm-note{font-size:12px;line-height:1.6;color:var(--text-secondary);margin:6px 0}.llm-table{overflow:auto}.llm-table table{border-collapse:collapse;width:100%;font-size:13px}.llm-table th,.llm-table td{padding:7px 8px;text-align:left;border-bottom:1px solid var(--border-subtle);overflow-wrap:anywhere}.llm-table th{color:var(--text-secondary);font-weight:500}.llm-fixed{table-layout:fixed}.llm-fixed td:first-child,.llm-fixed th:first-child{width:34%}.llm-sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0)}
-.llm-badge{font-size:11px;font-weight:500;padding:2px 8px;border:1px solid var(--border);border-radius:99px;color:var(--text-secondary);vertical-align:middle}.llm-back{font-size:13px}.llm-data{font-size:12px;margin:8px 0 16px}.llm-data>summary{cursor:pointer}.llm-more>summary{cursor:pointer;padding:8px 0;color:var(--accent);font-size:13px}.llm-section h2{font-size:15px;margin:22px 0 6px}
+.llm-badge{font-size:11px;font-weight:500;padding:2px 8px;border:1px solid var(--border);border-radius:99px;color:var(--text-secondary);vertical-align:middle}.llm-back{font-size:13px}.llm-data{font-size:12px;margin:8px 0 16px}.llm-data>summary{cursor:pointer}.llm-more>summary{cursor:pointer;padding:8px 0;color:var(--accent);font-size:13px}.llm-section h2{font-size:15px;margin:22px 0 6px}.llm-switch{position:relative;margin:16px 0;padding:12px 16px 16px}.llm-tabs{display:flex;flex-wrap:wrap;gap:8px;margin:0 0 12px}.llm-tabs label{padding:4px 12px;min-height:32px;display:inline-flex;align-items:center;gap:4px;border:1px solid transparent;border-radius:var(--radius-sm);font-size:13px;color:var(--text-secondary);cursor:pointer}.llm-tabs label:hover{color:var(--text)}.llm-tab--empty{opacity:.6}.llm-tab__badge{font-size:11px;padding:0 8px;border:1px solid var(--border);border-radius:99px}.llm-panel{display:none}.llm-switch .llm-section>.llm-table:first-child{margin-top:0}
 @media(max-width:650px){.llm-tiles{grid-template-columns:repeat(2,minmax(0,1fr))}.llm-charts{grid-template-columns:minmax(0,1fr)}}
-</style>`;
+${switchCss('llm-chart', 3)}${switchCss('llm-tab', 3)}</style>`;
+
+/** Models, agents and problems share one card; a tab with nothing to show says so in its label and is not the one opened first. */
+function tables(id, defs) {
+  return switcher(id, defs.map(([label, n, html]) => [label, n ? String(n) : '', `<div class="llm-section">${html}</div>`, n > 0]));
+}
 
 /** The whole page. `state`: {window, filters:{project,model}, projects, modelNames, names}.
  *  `data`: {total, models, agents, problems, series:{requests,errors,ttft,speed}} from the API. */
@@ -239,9 +261,8 @@ export function renderLlm(state, data) {
       extra.length ? ` Other sources (${esc(extra.join(', '))}) are listed in the tables and never added to these figures.` : ''}${
       list(d.agents?.groups).some((g) => g.partial_source) ? ' Transcript rows cover only the events still retained for each agent, and carry tokens only.' : ''}</p>
     ${tiles(pickTotal(d.total))}${charts(d.series)}
-    <section class="llm-section"><h2>Models</h2>${modelsTable(d.models)}</section>
-    <section class="llm-section"><h2>Agents</h2>${agentsTable(d.agents, state.names)}</section>
-    <section class="llm-section"><h2>Problems</h2>${problemsTable(d.problems, state.names)}</section>`;
+    ${tables('llm-tab', [['Models', list(d.models?.groups).length, modelsTable(d.models)], ['Agents', list(d.agents?.groups).length, agentsTable(d.agents, state.names)],
+      ['Problems', list(d.problems?.problems).length, problemsTable(d.problems, state.names)]])}`;
 }
 
 /** One agent's usage (#/llm/session/<id>). `state`: {window, sessionId, name, known}.
@@ -262,6 +283,5 @@ export function renderLlmSession(state, data) {
     <p>${opens}</p>${controls({ window: state.window, filters: {} }, llmSessionHref(id))}
     <p class="llm-note" data-llm-disclosure>${esc(disclosure(d.total))}</p>${notReported}
     ${tiles(proxy)}${charts(d.series)}
-    <section class="llm-section"><h2>Models</h2>${modelsTable(d.models)}</section>
-    <section class="llm-section"><h2>Problems</h2>${problemsTable(d.problems, {})}</section>`;
+    ${tables('llm-tab', [['Models', list(d.models?.groups).length, modelsTable(d.models)], ['Problems', list(d.problems?.problems).length, problemsTable(d.problems, {})]])}`;
 }

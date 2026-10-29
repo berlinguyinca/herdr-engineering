@@ -144,5 +144,6 @@ test('with only a transcript the tiles show tokens and say requests are not repo
     partial_source: true, ttft_ms: dist(0, null, null), speed_tps: dist(0, null, null) })];
   const html = renderLlm(state(), d);
   assert.match(html, /<div class="llm-tile__value">3 events<\/div><div class="llm-tile__note">tokens only, from the agent&#39;s transcript/);
-  assert.match(html, /<div class="llm-tile__value">not reported<\/div><div class="llm-tile__note">streams only/);
+  assert.doesNotMatch(html, /<div class="llm-tile__value">not reported<\/div>/, 'a tile with nothing to report is not drawn at full size');
+  assert.match(html, /data-llm-quiet[^>]*>.*TTFT p50 \/ p95: not reported/s);
 });
