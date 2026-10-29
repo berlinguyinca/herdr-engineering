@@ -39,12 +39,25 @@ const ICON_BELL_OFF = '<svg viewBox="0 0 16 16" width="14" height="14" aria-hidd
 
 const ICON_WARN = '<svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true" focusable="false"><path d="M8 2l6.5 11.5h-13zM8 6.5v3.2M8 11.6v.1" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>';
 
-function row(item, now, { busy = false, urls = null, showKind = false } = {}) {
-  const sev = SEVERITIES.includes(item.severity) ? item.severity : 'info';
+const when = (value) => { const at = Date.parse(value); return Number.isFinite(at) ? new Date(at).toLocaleString() : 'not reported'; };
+const CHEVRON = '<svg class="at-chev" viewBox="0 0 16 16" width="12" height="12" aria-hidden="true" focusable="false"><path d="M6 3.5L10.5 8 6 12.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+
+// Quick inspection: everything the server knows about the item, without leaving the page.
+function inspector(item, kindLabel, urls) {
   const href = safeHref(item.href);
-  const title = href ? `<a href="${esc(href)}">${esc(item.title)}</a>` : esc(item.title);
-  // the title already links to the item; an action is only worth a second link when it goes somewhere else
-  const links = records(item.actions).filter((a) => safeHref(a.href) && safeHref(a.href) !== href).map((a) => `<a class="at-action" href="${esc(safeHref(a.href))}">${esc(a.label || 'Open')}</a>`).join('');
+  const seen = [href ? { href, label: 'Open' } : null, ...records(item.actions).filter((a) => safeHref(a.href) && safeHref(a.href) !== href)
+    .map((a) => ({ href: safeHref(a.href), label: a.label || 'Open' }))].filter(Boolean);
+  const links = seen.map((l) => `<a class="at-action" href="${esc(l.href)}">${esc(l.label)}</a>`).join('');
+  const field = (name, value) => `<div><dt>${name}</dt><dd>${value}</dd></div>`;
+  return `<div class="at-inspect" data-attention-inspector="${esc(item.key)}">
+    ${text(item.detail).length > 60 || /[\n]/.test(text(item.detail)) ? `<p>${linkifyFabricText(item.detail, urls)}</p>` : ''}
+    <dl>${field('Kind', esc(kindLabel))}${field('Source', esc(text(item.source) || 'not reported'))}${field('First seen', esc(when(item.first_seen)))}${field('Last seen', esc(when(item.last_seen)))}${Number.isFinite(item.count) && item.count > 1 ? field('Occurrences', String(item.count)) : ''}${field('State', esc(text(item.state) || 'open'))}</dl>
+    ${links ? `<p class="at-links">${links}</p>` : ''}</div>`;
+}
+
+function row(item, now, { busy = false, urls = null, showKind = false, expanded = false } = {}) {
+  const sev = SEVERITIES.includes(item.severity) ? item.severity : 'info';
+  const kindLabel = KINDS[item.kind] || text(item.kind);
   const count = Number.isFinite(item.count) && item.count > 1 ? ` <span class="at-count">×${item.count}</span>` : '';
   const key = `data-key="${esc(item.key)}" data-fingerprint="${esc(item.fingerprint)}"`;
   const controls = item.state === 'open'
@@ -53,17 +66,18 @@ function row(item, now, { busy = false, urls = null, showKind = false } = {}) {
          <option value="">Snooze</option>${SNOOZE_CHOICES.map(([s, label]) => `<option value="${s}">${label}</option>`).join('')}</select></label>`
     : `<button type="button" class="at-btn" data-clear ${key} ${busy ? 'disabled' : ''}>${item.state === 'snoozed' ? 'Wake now' : 'Reopen'}</button>`;
   const until = item.state === 'snoozed' && item.snoozed_until ? ` · until ${esc(new Date(item.snoozed_until).toLocaleString())}` : '';
-  const detail = text(item.detail) ? `<span class="at-detail">${linkifyFabricText(item.detail, urls)}</span>` : '';
-  return `<li class="at-row at-${sev}" data-attention-row="${esc(item.key)}">
-    <div class="at-main"><span class="at-sr">${esc(sev)}</span><strong title="${esc(KINDS[item.kind] || text(item.kind))}">${title}</strong>${count}${showKind ? `<span class="at-kindlabel">${esc(KINDS[item.kind] || text(item.kind))}</span>` : ''}${detail}</div>
-    <div class="at-actions"><span class="at-meta">first seen ${age(item, now)}${until}</span>${links}${controls}</div></li>`;
+  const detail = text(item.detail) ? `<span class="at-detail">${esc(item.detail)}</span>` : '';
+  return `<li class="at-row at-${sev}" data-attention-row="${esc(item.key)}" data-expanded="${expanded}">
+    <button type="button" class="at-main at-toggle" data-expand="${esc(item.key)}" aria-expanded="${expanded}" title="${expanded ? 'Hide' : 'Show'} details">${CHEVRON}<span class="at-sr">${esc(sev)}</span><strong>${esc(item.title)}</strong>${count}${showKind ? `<span class="at-kindlabel">${esc(kindLabel)}</span>` : ''}${detail}</button>
+    <div class="at-actions"><span class="at-meta">first seen ${age(item, now)}${until}</span>${controls}</div>
+    ${expanded ? inspector(item, kindLabel, urls) : ''}</li>`;
 }
 
 function resolvedRow(item, now) {
   const at = Date.parse(item.resolved_at);
-  const when = Number.isFinite(at) ? `${esc(formatDuration(Math.max(0, now - at)))} ago` : 'time not reported';
-  return `<li class="at-row at-resolved"><div class="at-main"><strong>${esc(item.title)}</strong>
-    <p class="at-meta">${esc(KINDS[item.kind] || text(item.kind))} · resolved ${when}</p></div></li>`;
+  const ago = Number.isFinite(at) ? `${esc(formatDuration(Math.max(0, now - at)))} ago` : 'time not reported';
+  return `<li class="at-row at-resolved"><div class="at-main"><strong>${esc(item.title)}</strong><span class="at-kindlabel">${esc(KINDS[item.kind] || text(item.kind))}</span></div>
+    <div class="at-actions"><span class="at-meta">resolved ${ago}</span></div></li>`;
 }
 
 function group(label, items, render, open = false) {
@@ -122,16 +136,23 @@ const STYLES = `<style>
 .at-fold>details>summary{display:flex;flex-wrap:wrap;align-items:baseline;gap:4px 12px;cursor:pointer;padding:12px 16px;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);font-size:14px}.at-fold>details[open]>summary{margin-bottom:8px}
 .at-showall{color:var(--accent);font-size:13px;margin-left:auto}.at-fold .at-detail{flex:1 1 200px}
 .at-list{list-style:none;margin:0;padding:0;display:grid;gap:8px}
-.at-row{display:flex;align-items:center;gap:8px 24px;padding:12px 16px;background:var(--surface);border:1px solid var(--border);border-left-width:3px;border-radius:var(--radius)}
-.at-critical{border-left-color:var(--status-failed)}.at-warning{border-left-color:var(--status-attention)}.at-info,.at-resolved{border-left-color:var(--border)}
-.at-main{min-width:0;flex:1 1 auto;display:flex;flex-wrap:wrap;align-items:baseline;gap:4px 12px;font-size:14px}.at-main strong{font-weight:600}
+.at-row{display:flex;flex-wrap:wrap;align-items:center;gap:8px 24px;padding:8px 16px;background:var(--surface);border:1px solid var(--border);border-left-width:3px;border-radius:var(--radius);transition:background-color .15s ease,border-color .15s ease}.at-row:hover{background:var(--surface-hover)}
+.at-critical{border-left-color:var(--status-failed)}.at-warning{border-left-color:var(--status-attention)}.at-resolved{opacity:.7}.at-info,.at-resolved{border-left-color:var(--border)}
+.at-main{min-width:0;flex:1 1 auto;display:flex;flex-wrap:wrap;align-items:baseline;gap:4px 12px;font-size:14px}
+.at-toggle{font:inherit;color:inherit;text-align:left;background:none;border:0;padding:8px 0;cursor:pointer;position:relative;padding-left:20px}.at-toggle:focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-radius:var(--radius)}
+.at-chev{position:absolute;left:0;top:12px;color:var(--text-muted);transition:transform .15s ease}.at-row[data-expanded=true] .at-chev{transform:rotate(90deg)}
+.at-toggle:hover strong{color:var(--accent)}
+.at-inspect{flex:1 1 100%;margin:0 0 8px;padding:12px 0 8px 20px;border-top:1px solid var(--border-subtle);font-size:13px;animation:at-open .15s ease}
+.at-inspect p{margin:0 0 12px;overflow-wrap:anywhere}.at-inspect dl{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:8px 24px;margin:0 0 12px}
+.at-inspect dt{font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:var(--text-muted)}.at-inspect dd{margin:0;color:var(--text-secondary)}.at-links{display:flex;gap:16px}
+@keyframes at-open{from{opacity:0;transform:translateY(-4px)}to{opacity:1;transform:none}}@media (prefers-reduced-motion:reduce){.at-inspect{animation:none}.at-row,.at-chev{transition:none}}.at-main strong{font-weight:600}
 .at-kindlabel{color:var(--text-muted);font-size:12px}
 .at-detail{flex:1 1 100%;min-width:0;color:var(--text-secondary);font-size:13px;line-height:1.4;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .at-meta{color:var(--text-muted);font-size:12px;white-space:nowrap;margin-right:4px}.at-count{color:var(--text-secondary);font-size:12px}
 .at-sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
-.at-actions{display:flex;gap:12px;align-items:center;font-size:13px;flex:0 0 auto}.at-snooze{display:inline-flex;align-items:center}.at-snooze select{font:inherit;font-size:13px;min-height:32px;max-width:104px}
-.at-btn{font:inherit;padding:4px 12px;cursor:pointer;min-height:32px}.at-icon{display:inline-flex;align-items:center;justify-content:center;width:32px;padding:0}
-.at-kind{margin:24px 0}.at-kind-title{font-size:.8125rem;text-transform:uppercase;letter-spacing:.05em;color:var(--text-secondary);margin:0 0 8px;font-weight:600}
+.at-actions{display:flex;gap:12px;align-items:center;font-size:13px;flex:0 0 auto}.at-snooze{display:inline-flex;align-items:center}.at-snooze select{font:inherit;font-size:13px;min-height:32px;max-width:104px;background:transparent;color:var(--text-secondary);border:1px solid transparent;border-radius:var(--radius);cursor:pointer}.at-snooze select:hover{border-color:var(--border);color:var(--text)}
+.at-btn{font:inherit;padding:4px 12px;cursor:pointer;min-height:32px;background:transparent;border:1px solid transparent;border-radius:var(--radius);color:var(--text-secondary)}.at-btn:hover:not(:disabled){background:var(--surface-hover);border-color:var(--border);color:var(--text)}.at-icon{display:inline-flex;align-items:center;justify-content:center;width:32px;padding:0}
+.at-kind{margin:32px 0}.at-kind-title{font-size:.8125rem;text-transform:uppercase;letter-spacing:.05em;color:var(--text-secondary);margin:0 0 8px;font-weight:600}
 .at-ack-all{margin-left:8px;font-size:.75rem;text-transform:none;letter-spacing:0;padding:2px 8px;min-height:24px}
 .at-more>details>summary{cursor:pointer;padding:4px 12px;color:var(--accent);font-size:.875rem}.at-more>details[open]>summary{margin-bottom:8px}
 .at-group{margin:24px 0 16px}.at-group>summary{cursor:pointer;font-weight:600;padding:4px 0}
@@ -172,7 +193,9 @@ export function renderAttention(model = {}, now = Date.now()) {
   const stale = error ? '<p class="at-partial" role="status">Could not refresh; showing the last received list.</p>' : '';
   const trunc = body.truncated ? '<p class="at-status">Showing the first items only; the inbox is capped.</p>' : '';
   let list;
-  const renderRow = (i, showKind = false) => row(i, now, { busy: busy.has(i.key), urls: model.urls, showKind });
+  const expandedKeys = model.expanded instanceof Set ? model.expanded : new Set();
+  const rowOpts = (i, extra = {}) => ({ busy: busy.has(i.key), urls: model.urls, expanded: expandedKeys.has(i.key), ...extra });
+  const renderRow = (i, showKind = false) => row(i, now, rowOpts(i, { showKind }));
   const repeated = Object.values(open.reduce((m, i) => { const k = `${i.severity}|${i.kind}`; m[k] = (m[k] || 0) + 1; return m; }, {})).some((n) => n > SHOWN_PER_GROUP);
   if (open.length > GROUP_AFTER || repeated) list = groupedOpen(open, renderRow);
   else if (open.length) list = `<ul class="at-list" aria-label="Open attention items">${open.map((i) => renderRow(i, true)).join('')}</ul>`;
@@ -180,14 +203,14 @@ export function renderAttention(model = {}, now = Date.now()) {
   else list = '<p class="at-status">No attention items. Every source was read.</p>';
   const resolved = records(body.resolved);
   return `${STYLES}${head}${summary}${message ? `<p class="at-status" role="status">${esc(message)}${model.undo ? ' <button type="button" class="at-btn" data-undo>Undo</button>' : ''}</p>` : ''}${blocked ? '' : notifyLine(model.notify)}${stale}${list}${trunc}
-    <div data-state="acknowledged">${group('Acknowledged', acknowledged, (i) => row(i, now, { busy: busy.has(i.key), urls: model.urls }))}</div>
-    ${group('Snoozed', snoozed, (i) => row(i, now, { busy: busy.has(i.key), urls: model.urls }))}
+    <div data-state="acknowledged">${group('Acknowledged', acknowledged, (i) => row(i, now, rowOpts(i)))}</div>
+    ${group('Snoozed', snoozed, (i) => row(i, now, rowOpts(i)))}
     ${group('Recently resolved', resolved, (i) => resolvedRow(i, now))}`;
 }
 
 /** Mount the page: polls every POLL_MS while visible; ack/snooze/clear go to the server and re-poll at once. */
 export function mountAttention(container, client, { onBody, notifier, onFreshness = () => {} } = {}) {
-  const model = { body: null, error: '', loading: true, busy: new Set(), filters: {}, message: '' };
+  const model = { body: null, error: '', loading: true, busy: new Set(), expanded: new Set(), filters: {}, message: '' };
   let disposed = false, timer = null, controller = null, last = '';
   // agent-written detail text may name a loopback service; link it to its fabric address when the gateway knows it
   const fabric = typeof client.resolveFabricUrls === 'function'
@@ -201,7 +224,7 @@ export function mountAttention(container, client, { onBody, notifier, onFreshnes
     if (signature === last) return;
     last = signature;
     const focused = container.contains(document.activeElement) ? document.activeElement : null;
-    const keep = focused?.dataset ? { key: focused.dataset.key, kind: ['ack', 'clear', 'snooze'].find((k) => k in focused.dataset), filter: focused.dataset.filter } : null;
+    const keep = focused?.dataset ? { key: focused.dataset.key, kind: ['ack', 'clear', 'snooze', 'expand'].find((k) => k in focused.dataset), filter: focused.dataset.filter } : null;
     const openGroups = [...container.querySelectorAll('details[open] > summary')].map((s) => s.textContent.replace(/\s*\(\d+\)$/, ''));
     container.innerHTML = html;
     container.querySelectorAll('details > summary').forEach((s) => {
@@ -209,7 +232,7 @@ export function mountAttention(container, client, { onBody, notifier, onFreshnes
     });
     if (keep) {
       const selector = keep.filter ? `[data-filter="${keep.filter}"]`
-        : keep.kind ? `[data-${keep.kind}][data-key="${CSS.escape(keep.key || '')}"]` : null;
+        : keep.kind === 'expand' ? `[data-expand="${CSS.escape(focused.dataset.expand)}"]` : keep.kind ? `[data-${keep.kind}][data-key="${CSS.escape(keep.key || '')}"]` : null;
       (selector && container.querySelector(selector) || container.querySelector('h1'))?.focus({ preventScroll: true });
     }
   }
@@ -273,6 +296,13 @@ export function mountAttention(container, client, { onBody, notifier, onFreshnes
       model.message = failed ? `${failed} of ${pairs.length} could not be acknowledged.` : `Acknowledged ${pairs.length} items.`;
       model.undo = failed === pairs.length ? null : pairs;
       clearTimeout(timer); controller?.abort(); controller = null; poll();
+      return;
+    }
+    const toggleRow = event.target.closest?.('[data-expand]');
+    if (toggleRow) {
+      const k = toggleRow.dataset.expand;
+      if (!model.expanded.delete(k)) model.expanded.add(k);
+      last = ''; draw();
       return;
     }
     const chip = event.target.closest?.('button[data-filter]');

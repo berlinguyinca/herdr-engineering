@@ -17,8 +17,13 @@ const body = (items = [item()], over = {}) => ({
 
 test('renders an open item with its evidence link, owner link and controls', () => {
   const html = renderAttention({ body: body() }, now);
-  assert.match(html, /<span class="at-sr">critical<\/span><strong title="[^"]*"><a href="#\/herd\/session\/a">Amber Swift<\/a><\/strong>/);
-  assert.doesNotMatch(html, /class="at-action" href="#\/herd\/session\/a">Open agent/, 'an action to the same place as the title is not repeated');
+  assert.match(html, /<span class="at-sr">critical<\/span><strong>Amber Swift<\/strong>/);
+  assert.doesNotMatch(html, /data-attention-inspector/, 'details are folded until asked for');
+  const open = renderAttention({ body: body(), expanded: new Set(['session:a']) }, now);
+  assert.match(open, /aria-expanded="true"/);
+  assert.match(open, /data-attention-inspector="session:a"/);
+  assert.match(open, /class="at-action" href="#\/herd\/session\/a">Open</);
+  assert.equal((open.match(/href="#\/herd\/session\/a"/g) || []).length, 1, 'an action to the same place is not repeated');
   assert.match(html, /data-ack data-key="session:a" data-fingerprint="f1"/);
   for (const [seconds] of SNOOZE_CHOICES) assert.match(html, new RegExp(`<option value="${seconds}">`));
   assert.match(html, /<strong>1<\/strong> open/);
@@ -58,7 +63,7 @@ test('filters narrow the list by severity and kind', () => {
 test('remote text is escaped and only internal hash links become hrefs', () => {
   const evil = item({ title: '<img src=x onerror=alert(1)>', detail: '"><script>x</script>', href: 'javascript:alert(1)', key: 'k"><b>',
     actions: [{ label: 'Go', href: 'https://evil.example/' }, { label: 'Ok', href: '#/hosts/h' }] });
-  const html = renderAttention({ body: body([evil]) }, now);
+  const html = renderAttention({ body: body([evil]), expanded: new Set([evil.key]) }, now);
   assert.doesNotMatch(html, /<img|<script|<b>|javascript:|evil\.example/);
   assert.match(html, /&lt;img src=x onerror=alert\(1\)&gt;/);
   assert.match(html, /href="#\/hosts\/h">Ok/);
