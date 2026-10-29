@@ -201,7 +201,7 @@ function problemsTable(problems, names) {
 }
 
 // --- charts: SVG with <title>/<desc>, a table of the same numbers below, tokens only ---
-const W = 780; const H = 64; const X0 = 42; const Y1 = 84;     // wide and short: the plot spans the card instead of a small square in its middle
+const W = 780; const H = 64; const X0 = 64; const Y1 = 84;     // wide and short: the plot spans the card instead of a small square in its middle
 const fx = (i, n) => (n <= 1 ? X0 + W / 2 : X0 + (i / (n - 1)) * W);
 const r2 = (v) => Math.round(v * 100) / 100;
 
@@ -229,7 +229,7 @@ function barPlot(id, title, desc, ok0, bad0) {
     return `${good ? `<rect x="${x}" y="${r2(Y1 - hg)}" width="${r2(bw)}" height="${r2(hg)}" fill="var(--status-ok)"><title>${esc(when(p.t))}: ${good} ok</title></rect>` : ''}${
       failed ? `<rect x="${x}" y="${r2(Y1 - hg - hb)}" width="${r2(bw)}" height="${r2(hb)}" fill="var(--status-attention)"><title>${esc(when(p.t))}: ${failed} failed</title></rect>` : ''}`;
   }).join('');
-  return `<svg viewBox="0 0 ${X0 + W + 18} ${Y1 + 28}" role="img" aria-labelledby="${id}-t ${id}-d"><title id="${id}-t">${esc(title)}</title><desc id="${id}-d">${esc(desc)}</desc><line x1="${X0}" y1="${Y1}" x2="${X0 + W}" y2="${Y1}"/><text x="34" y="${Y1 - H + 4}" text-anchor="end">${top}</text><text x="34" y="${Y1 + 4}" text-anchor="end">0</text>${bars}<text x="${X0}" y="${Y1 + 20}">${esc(when(ok[0].t).slice(5, 16))}</text><text x="${X0 + W}" y="${Y1 + 20}" text-anchor="end">${esc(when(ok[n - 1].t).slice(5, 16))}</text></svg>${note}`;
+  return `<svg viewBox="0 0 ${X0 + W + 18} ${Y1 + 28}" role="img" aria-labelledby="${id}-t ${id}-d"><title id="${id}-t">${esc(title)}</title><desc id="${id}-d">${esc(desc)}</desc><line x1="${X0}" y1="${Y1}" x2="${X0 + W}" y2="${Y1}"/><text x="${X0 - 8}" y="${Y1 - H + 4}" text-anchor="end">${top}</text><text x="${X0 - 8}" y="${Y1 + 4}" text-anchor="end">0</text>${bars}<text x="${X0}" y="${Y1 + 20}">${esc(when(ok[0].t).slice(5, 16))}</text><text x="${X0 + W}" y="${Y1 + 20}" text-anchor="end">${esc(when(ok[n - 1].t).slice(5, 16))}</text></svg>${note}`;
 }
 
 function linePlot(id, title, desc, series0, fmt) {
@@ -251,7 +251,7 @@ function linePlot(id, title, desc, series0, fmt) {
       : `<polyline points="${seg.map((q) => `${q[0]},${q[1]}`).join(' ')}" fill="none" stroke="${s.color}" stroke-width="2"/>`)).join('');
   }).join('');
   const first = series[0].points[0]; const last = series[0].points[series[0].points.length - 1];
-  return `<svg viewBox="0 0 ${X0 + W + 18} ${Y1 + 28}" role="img" aria-labelledby="${id}-t ${id}-d"><title id="${id}-t">${esc(title)}</title><desc id="${id}-d">${esc(desc)}</desc><line x1="${X0}" y1="${Y1}" x2="${X0 + W}" y2="${Y1}"/><text x="34" y="${Y1 - H + 4}" text-anchor="end">${esc(fmt(top))}</text><text x="34" y="${Y1 + 4}" text-anchor="end">0</text>${lines}<text x="${X0}" y="${Y1 + 20}">${esc(when(first.t).slice(5, 16))}</text><text x="${X0 + W}" y="${Y1 + 20}" text-anchor="end">${esc(when(last.t).slice(5, 16))}</text></svg>${lead.note}`;
+  return `<svg viewBox="0 0 ${X0 + W + 18} ${Y1 + 28}" role="img" aria-labelledby="${id}-t ${id}-d"><title id="${id}-t">${esc(title)}</title><desc id="${id}-d">${esc(desc)}</desc><line x1="${X0}" y1="${Y1}" x2="${X0 + W}" y2="${Y1}"/><text x="${X0 - 8}" y="${Y1 - H + 4}" text-anchor="end">${esc(fmt(top))}</text><text x="${X0 - 8}" y="${Y1 + 4}" text-anchor="end">0</text>${lines}<text x="${X0}" y="${Y1 + 20}">${esc(when(first.t).slice(5, 16))}</text><text x="${X0 + W}" y="${Y1 + 20}" text-anchor="end">${esc(when(last.t).slice(5, 16))}</text></svg>${lead.note}`;
 }
 
 function seriesTable(headers, rows) {
@@ -304,11 +304,11 @@ export const llmStyles = `<style>
 .llm-controls{display:flex;flex-wrap:wrap;gap:12px 16px;align-items:center;margin:16px 0}.llm-controls select{padding:4px 12px;min-height:32px;border:1px solid var(--border);border-radius:var(--radius-sm);font:inherit;font-size:13px;color:var(--text-secondary);background:var(--surface);max-width:100%}.llm-controls select.llm-set{border-color:var(--accent);color:var(--text)}
 .llm-windows{display:inline-flex;border:1px solid var(--border);border-radius:var(--radius-sm);overflow:hidden}.llm-window{padding:4px 12px;min-height:32px;display:inline-flex;align-items:center;font-size:13px;text-decoration:none;color:var(--text-secondary);background:var(--surface);border-left:1px solid var(--border)}.llm-window:first-child{border-left:0}.llm-window[aria-current=page]{background:var(--surface-2);color:var(--text);font-weight:600}
 .llm-tiles{display:flex;flex-wrap:wrap;gap:12px;margin:12px 0}.llm-tile{flex:1 1 170px;border:1px solid var(--border);border-radius:var(--radius);background:var(--surface);padding:12px 14px;min-width:0}.llm-tile__label{font-size:12px;color:var(--text-secondary)}.llm-tile__value{font-size:20px;font-weight:600;margin-top:4px;overflow-wrap:anywhere}.llm-tile__note{font-size:11px;color:var(--text-secondary);margin-top:4px}
-.llm-charts{display:grid;grid-template-columns:minmax(0,1fr);gap:16px;margin:16px 0}.llm-quiet{display:flex;flex-wrap:wrap;gap:4px 24px;margin:12px 0;font-size:12px;color:var(--text-muted)}.llm-card{min-width:0;border:1px solid var(--border);border-radius:var(--radius);background:var(--surface);padding:6px 14px 12px}.llm-card h2{font-size:14px;margin:10px 0 4px}.llm-card svg{display:block;width:100%;height:auto}.llm-card svg text{font-size:11px;fill:var(--text-secondary);font-family:inherit}.llm-card svg line{stroke:var(--border)}
+.llm-charts{display:grid;grid-template-columns:minmax(0,1fr);gap:16px;margin:16px 0}.llm-quiet{display:flex;flex-wrap:wrap;gap:4px 24px;margin:12px 0;font-size:12px;color:var(--text-muted)}.llm-card{min-width:0;border:1px solid var(--border);border-radius:var(--radius);background:var(--surface);padding:6px 14px 12px}.llm-card h2{font-size:14px;margin:10px 0 4px}.llm-card svg{display:block;width:100%;height:auto}.llm-card svg text{font-size:8px;fill:var(--text-secondary);font-family:inherit}.llm-card svg line{stroke:var(--border)}
 .llm-legend{display:flex;flex-wrap:wrap;gap:12px;font-size:11px;color:var(--text-secondary)}.llm-legend span::before{content:'';display:inline-block;width:9px;height:9px;margin-right:5px;background:var(--c);border-radius:2px}
 .llm-note{font-size:12px;line-height:1.6;color:var(--text-secondary);margin:6px 0}.llm-table{overflow:auto}.llm-table table{border-collapse:collapse;width:100%;font-size:13px}.llm-table th,.llm-table td{padding:7px 8px;text-align:left;border-bottom:1px solid var(--border-subtle);overflow-wrap:anywhere}.llm-table th{color:var(--text-secondary);font-weight:500}.llm-fixed{table-layout:fixed}.llm-fixed td:first-child,.llm-fixed th:first-child{width:34%}.llm-sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0)}
 .llm-badge{font-size:11px;font-weight:500;padding:2px 8px;border:1px solid var(--border);border-radius:99px;color:var(--text-secondary);vertical-align:middle}.llm-back{font-size:13px}.llm-data{font-size:12px;margin:8px 0 16px}.llm-data>summary{cursor:pointer}.llm-more>summary{cursor:pointer;padding:8px 0;color:var(--accent);font-size:13px}.llm-section h2{font-size:15px;margin:22px 0 6px}.llm-switch{position:relative;margin:16px 0;padding:12px 16px 16px}.llm-tabs{display:flex;flex-wrap:wrap;gap:8px;margin:0 0 12px}.llm-tabs label{padding:4px 12px;min-height:32px;display:inline-flex;align-items:center;gap:4px;border:1px solid transparent;border-radius:var(--radius-sm);font-size:13px;color:var(--text-secondary);cursor:pointer}.llm-tabs label:hover{color:var(--text)}.llm-tab--empty{opacity:.6}.llm-tab__badge{font-size:11px;padding:0 8px;border:1px solid var(--border);border-radius:99px}.llm-panel{display:none}.llm-ext{margin-left:4px;color:var(--text-muted);text-decoration:none}.llm-ext:hover{color:var(--accent)}.llm-switch .llm-section>.llm-table:first-child{margin-top:0}
-@media(max-width:650px){.llm-tile{flex-basis:140px}.llm-charts{grid-template-columns:minmax(0,1fr)}}
+@media(max-width:650px){.llm-tile{flex-basis:140px}.llm-card svg text{font-size:16px}.llm-charts{grid-template-columns:minmax(0,1fr)}}
 ${switchCss('llm-chart', 4)}${switchCss('llm-tab', 5)}</style>`;
 
 /** Models, agents and problems share one card; a tab with nothing to show says so in its label and is not the one opened first. */
@@ -360,7 +360,7 @@ export function renderLlmSession(state, data) {
   const notReported = proxy && !num(proxy.ttft_ms?.n) && !num(proxy.speed_tps?.n)
     ? '<p class="llm-note" data-llm-latency-note>Latency and speed are not reported by this agent\'s path.</p>' : '';
   return `${llmStyles}<p class="llm-note"><a href="#/llm">← Usage</a></p><h1>${esc(title)} ${badge}</h1>
-    <p>${opens}</p>${handoffNote(id, d.handoffs, d.agents, state.names)}${controls({ window: state.window, filters: {} }, llmSessionHref(id))}
+    <p class="llm-note">${opens}</p>${handoffNote(id, d.handoffs, d.agents, state.names)}${controls({ window: state.window, filters: {} }, llmSessionHref(id))}
     <p class="llm-note" data-llm-disclosure>${esc(disclosure(d.total))}</p>${notReported}
     ${tiles(proxy, pickTotal(d.previous), state.window)}${charts(d.series)}
     ${tables('llm-tab', [['Models', list(d.models?.groups).length, modelsTable(d.models) + (list(d.models?.groups).some((g) => g.source !== PROXY) ? '<p class="llm-note">Rows from another source (such as the transcript) come from the agent\'s own log and are not added to the figures above.</p>' : '')], ['Problems', list(d.problems?.problems).length, problemsTable(d.problems, {})]])}`;
