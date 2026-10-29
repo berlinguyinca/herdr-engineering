@@ -23,6 +23,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdirSync, readFileSync, writeFileSync, existsSync, readdirSync, statSync } from 'node:fs';
 import path from 'node:path';
 import { CFG, REPO, launch, openReal, openSub, startRealServer, scaled } from './ui-gates-lib.mjs';
+import { DASHBOARD_SURFACES, openDashboard } from './visual-dashboard.mjs';
 
 export const BASELINE_DIR = path.join(REPO, 'docs', 'assets', 'screenshots');
 export const REPORT_DIR = path.join(REPO, '.autospec', 'reports', 'visual');
@@ -59,6 +60,8 @@ export const SURFACES = [
   { slug: 'collab-links', sub: 'links', proof: '#hcn-links li' },
   { slug: 'collab-proposals', sub: 'proposals', proof: '[data-proposal]', steps: async (page) => { await page.locator('[data-proposal]').first().click(); await page.locator('#hcn-review [data-decide]').first().waitFor(); },
     regions: [{ name: 'review', selector: '#hcn-review' }] },
+  // The dashboard app (Missions, Personal Assistant tabs): served from packages/ over a stubbed API, no server process (visual-dashboard.mjs)
+  ...DASHBOARD_SURFACES,
 ];
 
 export const fileFor = (slug, viewport, scheme) => path.join(BASELINE_DIR, `${slug}__${viewport}${scheme === 'dark' ? '-dark' : ''}.png`);
@@ -165,11 +168,13 @@ async function settled(page, quietMs = 500, maxMs = 5000) {
  * `extraCss` is only for the gate's own "teeth" tests: it lets a test inject a defect and prove the compare notices it.
  */
 export async function capture(browser, info, surface, viewport, scheme, { extraCss = '', regions = viewport === 'desktop' } = {}) {
-  const { ctx, page } = await openReal(browser, info, 'alice', { viewport: CFG.viewports[viewport], colorScheme: scheme, reducedMotion: 'reduce', deviceScaleFactor: 1, bypassCSP: true });
+  const ctxOpts = { viewport: CFG.viewports[viewport], colorScheme: scheme, reducedMotion: 'reduce', deviceScaleFactor: 1, bypassCSP: true };
+  const dashboard = surface.app === 'dashboard';
+  const { ctx, page } = dashboard ? await openDashboard(browser, surface.hash, ctxOpts) : await openReal(browser, info, 'alice', ctxOpts);
   try {
-    await page.clock.setFixedTime(new Date(CFG.screenshots.fixed_clock));
+    if (!dashboard) await page.clock.setFixedTime(new Date(CFG.screenshots.fixed_clock));
     await page.addStyleTag({ content: bundledFontCss() });
-    if (surface.hash) { await page.evaluate((h) => { window.location.hash = h; }, surface.hash); } else { await openSub(page, surface.sub); }
+    if (dashboard) { /* already at its route */ } else if (surface.hash) { await page.evaluate((h) => { window.location.hash = h; }, surface.hash); } else { await openSub(page, surface.sub); }
     await page.locator(surface.proof).first().waitFor({ timeout: scaled(15000) });
     if (surface.sub === 'chat') await page.locator('#hcn-empty').waitFor({ state: 'detached', timeout: scaled(15000) });
     if (surface.steps) await surface.steps(page);
@@ -188,7 +193,7 @@ export async function capture(browser, info, surface, viewport, scheme, { extraC
     const full = await page.evaluate(() => Math.max(document.documentElement.scrollHeight, innerHeight));
     if (full > MAX_HEIGHT) throw new Error(`${surface.slug} at ${viewport} is ${full}px tall, above the ${MAX_HEIGHT}px capture cap: the rest would never be compared`);
     const height = full;
-    const out = { page: await page.screenshot({ clip: { x: 0, y: 0, width: CFG.viewports[viewport].width, height }, animations: 'disabled', caret: 'hide' }), regions: {} };
+    const out = { page: await page.screenshot({ clip: { x: 0, y: 0, width: CFG.viewports[viewport].width, height }, fullPage: surface.fullPage === true, animations: 'disabled', caret: 'hide' }), regions: {} };
     if (regions) {
       for (const r of surface.regions || []) {
         // by bounding box, not locator.screenshot(): that waits for the element to be visible, which would make a test that hides
@@ -244,14 +249,18 @@ export const checkAgainstBaseline = (browser, png, slug, viewport, scheme) => ch
 export const checkRegion = (browser, png, slug, region, scheme) => checkFile(browser, png, regionFileFor(slug, region, scheme), CFG.screenshots.component_max_diff_pct);
 
 /** All (surface, viewport, scheme) combinations: light everywhere, dark at every viewport (autospec requires both themes). */
-export const combos = (filter = '') => SURFACES.filter((s) => s.slug.includes(filter)).flatMap((s) => VIEWPORTS.flatMap((v) => ['light', 'dark'].map((scheme) => ({ surface: s, viewport: v, scheme }))));
+// A surface may leave combinations out (`skip: ['mobile-dark']`, as "<viewport>-<scheme>") when its pages are large and the total size cap
+// (ui-gates.yaml screenshots.max_total_kb) would not allow all six. The omission is declared here, in one place, and listed in the test matrix.
+export const matrixOf = (s) => VIEWPORTS.flatMap((v) => ['light', 'dark'].map((scheme) => ({ viewport: v, scheme }))).filter((c) => !(s.skip || []).includes(`${c.viewport}-${c.scheme}`));
+export const combos = (filter = '') => SURFACES.filter((s) => s.slug.includes(filter)).flatMap((s) => matrixOf(s).map((c) => ({ surface: s, ...c })));
 
 /** Every PNG the suite owns: a page per (surface, viewport, scheme) and a component per (surface, region, scheme). */
 export function expectedBaselineFiles() {
   const out = new Set();
-  for (const s of SURFACES) for (const scheme of ['light', 'dark']) {
-    for (const v of VIEWPORTS) out.add(path.basename(fileFor(s.slug, v, scheme)));
-    for (const r of s.regions || []) out.add(path.basename(regionFileFor(s.slug, r.name, scheme)));
+  for (const s of SURFACES) for (const { viewport, scheme } of matrixOf(s)) {
+    out.add(path.basename(fileFor(s.slug, viewport, scheme)));
+    // components are captured at desktop only
+    if (viewport === 'desktop') for (const r of s.regions || []) out.add(path.basename(regionFileFor(s.slug, r.name, scheme)));
   }
   return out;
 }
