@@ -11,7 +11,7 @@ import {selectEvents, linkedAgents, githubLinks, referenceSuggestions, pendingOp
 import {randomString} from './herdr-web-client/collab.js';
 import {recordOutcome} from './record-state.js';
 import {fixOutcome, fixError, FIX_LABELS, FIX_LOCKED} from './summary-fix-status.js';
-import {reportView, reportStartError} from './summary-report-status.js';
+import {reportView, reportStartError, OPEN_STATES} from './summary-report-status.js';
 import {morph} from './patch.js';
 import {enter,skeleton} from './motion.js';
 
@@ -200,12 +200,12 @@ export function mountSessionWorkspace(host,client,session,{connect=connectEvents
     box.hidden=!(view.report || view.status);
     const open=box.querySelector('details')?.open;
     const scroll=box.querySelector('.sw-report-body')?.scrollTop||0;
-    box.innerHTML=`${view.status?`<p class="sw-report-status"${view.error?' role="alert"':' role="status"'}>${esc(view.status)}</p>`:''}${view.command?`<p class="sw-report-status">Run on that host: <code>${esc(view.command)}</code></p>`:''}${view.report?`<details${open===false?'':' open'}><summary>Full session report</summary><div class="sw-report-body conversation-markdown">${renderMarkdown(view.report,markdown)}</div></details>`:''}`;
+    box.innerHTML=`${view.status?`<p class="sw-report-status"${view.error?' role="alert"':' role="status"'}>${esc(view.status)}</p>`:''}${view.report?`<details${open===false?'':' open'}><summary>Full session report</summary><div class="sw-report-body conversation-markdown">${renderMarkdown(view.report,markdown)}</div></details>`:''}`;
     const body=box.querySelector('.sw-report-body');if(body)body.scrollTop=scroll;
   }
   function pollReport(){
     clearTimeout(reportTimer);
-    if(disposed || (fullReport?.state!=='running' && reportLocal?.state!=='starting'))return;
+    if(disposed || (!OPEN_STATES.has(fullReport?.state) && reportLocal?.state!=='starting'))return;
     reportTimer=setTimeout(loadSummary,3000);
   }
   $('[data-summary-report]').addEventListener('click',async()=>{
@@ -214,7 +214,7 @@ export function mountSessionWorkspace(host,client,session,{connect=connectEvents
     try{
       await client.startSummaryReport(session.session_id);
       if(disposed)return;
-      reportLocal=null;fullReport={...(fullReport||{}),state:'running'};
+      reportLocal=null;fullReport={...(fullReport||{}),state:'queued'};
     }catch(err){
       if(disposed)return;
       reportLocal=reportStartError(err);
@@ -248,7 +248,7 @@ export function mountSessionWorkspace(host,client,session,{connect=connectEvents
       const value=await client.getAgentSummary(session.session_id);if(disposed)return;
       // Older valid text keeps its original provenance when an update has no result yet.
       agentSummary=agentSummary?.generated_at && !value.generated_at ? {...agentSummary,state:value.state,error:value.error} : value;
-      if(value.full_report){fullReport=value.full_report;if(fullReport.state!=='running')reportLocal=null;}
+      if(value.full_report){fullReport=value.full_report;if(!OPEN_STATES.has(fullReport.state))reportLocal=null;}
       summaryError='';
     }catch(err){if(!disposed)summaryError=`Summary unavailable: ${err.message}${agentSummary?.generated_at?' Showing the last saved summary.':''}`;}
     finally{summaryBusy=false;paintSummary();paintReport();pollReport();}

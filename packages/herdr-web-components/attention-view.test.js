@@ -112,3 +112,21 @@ test('the overview falls back to the browser projection and says so when the ser
   assert.doesNotMatch(disabled, /computed in this browser/);
   assert.match(overview(data, { sessions: { loaded: true } }), /Browser-only agent/);   // legacy callers without the new source
 });
+
+test('a long open list folds into one section per severity and kind, worst first, with the rest behind Show all', () => {
+  const many = [
+    ...Array.from({ length: 12 }, (_, n) => item({ key: `ci:${n}`, kind: 'ci_failed', severity: 'critical', title: `CI ${n}` })),
+    ...Array.from({ length: 2 }, (_, n) => item({ key: `h:${n}`, kind: 'host_silent', severity: 'warning', title: `Host ${n}` })),
+  ];
+  const html = renderAttention({ body: body(many) }, now);
+  assert.equal((html.match(/class="at-kind at-kind-/g) || []).length, 2);
+  assert.ok(html.indexOf('at-kind-critical') < html.indexOf('at-kind-warning'));
+  assert.match(html, /Show all 12 \(9 more\)/);
+  assert.equal((html.match(/data-attention-row="/g) || []).length, 14);      // nothing is dropped, only folded
+  assert.ok(!html.includes('Show all 2'));                                    // a section of three or fewer has nothing to fold
+});
+
+test('a short open list stays flat', () => {
+  const html = renderAttention({ body: body(Array.from({ length: 8 }, (_, n) => item({ key: `k:${n}`, title: `T${n}` }))) }, now);
+  assert.ok(!html.includes('<h2 class="at-kind-title"'));
+});
