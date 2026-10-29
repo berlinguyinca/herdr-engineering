@@ -5,6 +5,9 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Skill registry on registry artifacts (flag off)
+- `control_plane.skill_registry.enabled` (YAML, default false) adds `/api/v1/skills` publish, search, get, 60-second transfer capability, download and install receipt. Skills are `artifact_type='skill'` registry artifacts (immutable versions, signed package in RustFS, sharing = artifact ACL grant); no new tables, no CSP change. Extracted from #366. See `docs/contracts/skill-registry.md`.
+
 ### Dashboard: on-demand full `/summary` report
 - **Generate full report** on the agent page runs the `summary` skill on the session's recorded conversation and shows the result in the summary card; in the fullscreen workspace it gets its own column so the conversation and composer fit the viewport without page scrolling (the fullscreen panes were previously sized to the whole viewport and cut off the composer). Off by default: `summary_report.enabled` in the central YAML.
 - Runs on the host that owns the session, not in the control-plane container (which has no session records and no `claude`): the control plane queues the request (`POST .../summary/report`, durable event), the per-host session service claims it (`POST /api/v1/host/summary-reports/claim`), runs `herdr-eng summary report` locally and posts the result back, which the server validates and redacts again before storing. Unclaimed requests fail as `host_unreachable`, stuck ones as `timeout`. Roll the plugin to each host.
