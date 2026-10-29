@@ -63,6 +63,8 @@ NODE_TYPES = frozenset(
     # default to per-writer ownership exactly like the existing non-commons kinds.
     "repository branch service endpoint deployment host gpu model worker request "
     "span queue dataset memory_reference external_dependency module symbol package trace "
+    # unified workspace (P02, docs/contracts/unified-workspace-v1.md): OWNED kinds, never COMMONS.
+    "project team artifact_version external_action "
     # ADR-0008 P1: the reserved `peer:<peer>.` namespace a federated peer's mirror lives in. Ingest lets ONLY that
     # peer write it (ingest.py:_check_peer_namespace); it never takes part in local gate staleness (_peer_edge).
     "peer".split())
@@ -73,7 +75,9 @@ EDGE_TYPES = frozenset(
     # existing kinds above (depends_on->dependency, handoff_to->handoff,
     # reviews->reviewed, produced->produced, spawned_by->spawn, supersedes->supersession).
     "calls observed_in belongs_to blocked_by implements references runs_on "
-    "serves deploys_to assigned_to precedes imports routes_to queued_on".split())
+    "serves deploys_to assigned_to precedes imports routes_to queued_on "
+    # unified workspace (P02): the five edge kinds the contract adds on top of the existing vocabulary.
+    "contains derived_from discussed_in approved_by notified_via".split())
 # T14: edge kinds only the HCN service may write (as a `collab` principal, after it has checked the asking person
 # and the room). `cross_link` joins two nodes of different workspaces of one room; a `consultation` edge from a
 # service-written `thread:hcn-consult.*` node records a peer consultation. Everybody else is refused with the one

@@ -154,17 +154,20 @@ def test_artifact_version_and_tombstoned_docs_are_immutable():
 # ---- graph mapping (reuse, additive only) ----------------------------------------------------
 def test_mapping_is_truthful_about_what_graph_py_has_today():
     for kind, (g, status) in wc.GRAPH_NODE_MAP.items():
-        assert (g in NODE_TYPES) == (status == "exists"), kind
+        assert g in NODE_TYPES, kind        # P02 registered the "added" kinds (status stays as P01 recorded it)
     for edge, (g, status) in wc.GRAPH_EDGE_MAP.items():
-        assert (g in EDGE_TYPES) == (status == "exists"), edge
+        assert g in EDGE_TYPES, edge
     assert set(wc.GRAPH_NODE_MAP) == set(wc.ENTITY_KINDS) and set(wc.GRAPH_EDGE_MAP) == set(wc.EDGE_KINDS)
     assert wc.ADDED_NODE_TYPES == {"project", "team", "artifact_version", "external_action"}
     assert wc.ADDED_EDGE_TYPES == {"contains", "derived_from", "discussed_in", "approved_by", "notified_via"}
 
 
-def test_live_graph_vocabulary_is_unchanged_by_p01():
-    assert not (wc.ADDED_NODE_TYPES & set(NODE_TYPES)) and not (wc.ADDED_EDGE_TYPES & set(EDGE_TYPES))
-    assert set(NODE_TYPES) <= wc.EXTENDED_NODE_TYPES and set(EDGE_TYPES) <= wc.EXTENDED_EDGE_TYPES
+def test_live_graph_vocabulary_is_the_p02_extension():
+    # P01 recorded the ADDED kinds as absent; P02 registers exactly those (and nothing else) as owned kinds.
+    assert wc.ADDED_NODE_TYPES <= set(NODE_TYPES) and wc.ADDED_EDGE_TYPES <= set(EDGE_TYPES)
+    assert set(NODE_TYPES) == wc.EXTENDED_NODE_TYPES and set(EDGE_TYPES) == wc.EXTENDED_EDGE_TYPES
+    from herdr_engineering.control_plane.graph import COMMONS_KINDS
+    assert not (wc.ADDED_NODE_TYPES & COMMONS_KINDS)          # Q1: owned, not shared identities
     # aliases land on existing edge kinds, never a twin of them
     assert wc.GRAPH_EDGE_MAP["depends_on"][0] == "dependency" and "depends_on" not in EDGE_TYPES
 
@@ -188,7 +191,13 @@ def test_events_envelope_v2_projects_onto_the_event_contract():
     doc = wc.event_from_envelope(ev, tenant_id="t1", entity_urns=[wc.urn_for("task", "tsk_1")])
     _validator("event").validate(doc)
     wc.validate_event(doc)
-    assert "trace_id" not in doc                       # events.py has no trace_id column: documented P02 gap
+    assert "trace_id" not in doc                       # absent unless the envelope carries one
+    traced = wc.event_from_envelope(Event(event_id="ev_3", schema_version=2, entity_type="task", entity_id="tsk_1",
+                                          event_type="task.updated", source="hcn", source_sequence=6,
+                                          actor={"kind": "user", "id": "alice"}, visibility_scope="org",
+                                          trace_id="trace-9"), tenant_id="t1")
+    _validator("event").validate(traced)
+    assert traced["trace_id"] == "trace-9"             # migration 0031 / Event.trace_id
     v1 = Event(event_id="ev_2", entity_id="e", event_type="x")      # a v1 event (no v2 fields) still projects
     _validator("event").validate(wc.event_from_envelope(v1, tenant_id="t1"))
 
