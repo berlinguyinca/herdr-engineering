@@ -583,6 +583,10 @@ class ControlPlaneServer:
             self.assistant.comment_poster = comment_hook(self)
             self.assistant.artifact_writer = draft_writer_hook(self)
             self.assistant.ci_board_request = self.intelligence.assistant_ci_repair
+            from .assistant_dispatch import DelegationConsumer
+            self.delegation_consumer = DelegationConsumer(
+                self.assistant, self.handoffs,
+                source_harness=self.assistant.config["delegation_consumer"]["source_harness"])
 
             # The audit log is append-only in the repo event store: durable before it is visible, and read back here
             # after a restart. A failed write raises, so an operation that cannot be audited does not complete.
@@ -1337,6 +1341,12 @@ class ControlPlaneServer:
             self.repo.inspector.sweep()
         except Exception:
             pass
+        consumer = getattr(self, "delegation_consumer", None)
+        if consumer is not None:
+            try:
+                consumer.sweep()
+            except Exception as exc:
+                log.warning("assistant delegation sweep failed: %s", type(exc).__name__)
         try:
             sweep_token_usage(self.repo, raw_retention_days=self.usage_retention["raw_retention_days"])
         except Exception as exc:
@@ -3740,6 +3750,24 @@ def _make_handler(server, public=False, operator=False):
                                                                           assistant_id=parts[4])]})
                     if len(parts) == 7 and parts[5] == "routines":
                         return self._json(svc.get_routine(parts[6], tenant_id=tenant_id, user_id=user_id).as_dict())
+                if resource == "assistant-audit" and len(parts) == 5 and parts[4] in ("head", "check"):
+                    svc._require_enabled()
+                    if not svc._is_approver(user_id):           # the anchor tooling is an operator task, not any caller's
+                        return self._json({"error": "forbidden: anchoring needs a configured approver of the tenant",
+                                           "code": "forbidden"}, 403)
+                if resource == "assistant-audit" and len(parts) == 5 and parts[4] == "head":
+                    from datetime import UTC, datetime
+                    return self._json({"tenant_id": tenant_id, "head": svc.store.audit_head(tenant_id),
+                                       "chain_intact": svc.store.verify_audit(tenant_id),
+                                       "time": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")})
+                if resource == "assistant-audit" and len(parts) == 5 and parts[4] == "check":
+                    from .audit_anchor import check_chain
+                    try:
+                        seq = int(_q(self.path, "seq") or "")
+                    except ValueError:
+                        return self._json({"error": "seq must be an integer"}, 400)
+                    return self._json({"tenant_id": tenant_id, **check_chain(
+                        svc.store, tenant_id, seq, _q(self.path, "sha256") or "")})
                 if resource == "assistant-audit" and len(parts) == 4:
                     # read only: there is no POST/PATCH/DELETE route for the audit log
                     repaired = svc.repair_pending_audits(tenant_id=tenant_id, user_id=user_id)
@@ -4010,6 +4038,13 @@ def _make_handler(server, public=False, operator=False):
                 if resource == "assistant-proposals" and len(parts) == 6 and parts[5] == "execute":
                     x = svc.execute_approved_proposal(parts[4], tenant_id=tenant_id, user_id=user_id, actor=user_id)
                     return self._json(x.as_dict(), 200 if x.execution == "executed" else 409)
+                if resource == "assistant-delegations" and len(parts) == 6 and parts[5] == "dispatch":
+                    if not svc.config["delegation_consumer"]["enabled"]:
+                        raise AssistantUnavailable("delegation dispatch is not enabled (personal_assistant.delegation_consumer)")
+                    d = server.delegation_consumer.dispatch(parts[4], tenant_id=tenant_id, user_id=user_id,
+                                                            actor=user_id)
+                    handed = ((d.correlation or {}).get("dispatch") or {}).get("state") == "handed_off"
+                    return self._json(d.as_dict(), 200 if handed else 409)
                 if resource == "assistant-notifications" and len(parts) == 6 and parts[5] == "ack":
                     return self._json(svc.ack_notification(
                         parts[4], tenant_id=tenant_id, user_id=user_id).as_dict())

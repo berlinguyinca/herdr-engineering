@@ -76,6 +76,17 @@ sections:
         #   evidence_writers: ["key:ci-service"]   # ONLY these writers' merged/validated marks count as evidence
         #   min_group_size: 5              # aggregates over fewer items are hidden
         #   reads_per_minute: 60
+      # OPTIONAL: lineage-graph evidence in the merge gate. OFF unless you uncomment AND set `enabled: true`.
+      # It runs after decide_merge for every PR and can only withhold a merge. `evidence_writers` is REQUIRED and
+      # must be explicit graph principal ids ("key:<12 hex of sha256(the CI reporter's API key)>"): an empty list,
+      # a wildcard or a bare word stops startup (and `fleet-config validate`) instead of enabling anything.
+      # Only `validated` edges written by these principals, bound to the PR's exact head SHA, count.
+      # See docs/operations/lineage-continuity-runbook.md ("Turning the graph merge gate on").
+      # graph_merge_gate:
+      #   enabled: false                 # true to turn it on; false/removed = hot kill switch
+      #   evidence_writers: ["key:<12-hex-of-the-ci-reporter-key>"]   # REPLACE: the placeholder is refused at startup
+      #   required_checks: ["ci"]        # edges name their check in attrs.check (default "ci")
+      #   require_review_quorum: false   # true also needs control_plane.review_quorum to be satisfied
       # OPTIONAL: the Personal Assistant (inert unless `enabled: true`). Nothing in
       # the assistant module runs while disabled; the /personal-assistant dashboard
       # view only appears when the `assistant_v1` capability is advertised (enabled).
@@ -84,6 +95,14 @@ sections:
       # are redacted from prompts, logs and events. Copy only what you need.
       # personal_assistant:
       #   enabled: false                 # master kill-switch (also gates the capability flag)
+      #   # Off-box anchor for the audit chain head (see runbook "Anchoring the audit head"):
+      #   audit:
+      #     hmac_key_file: "/etc/herdr/assistant-audit.key"   # PATH only (>= 16 bytes)
+      #     anchor_file: "/var/lib/herdr-anchor/assistant-audit.anchor"  # append-only; ideally a different device
+      #   # Hand approved request_mission / propose_branch delegations to the handoff queue:
+      #   delegation_consumer:
+      #     enabled: false
+      #     source_harness: pi
       #   # Real inference. When `endpoint` is set the service uses an HTTP
       #   # chat-completions runner (OpenAI-compatible, incl. tool-calling); when
       #   # empty it falls back to a deterministic local runner (skeleton only).

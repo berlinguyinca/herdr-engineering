@@ -46,6 +46,9 @@ fabric:
 scheduler:
   telemetry: true
 
+# The lineage merge-gate evidence block (control_plane.graph_merge_gate) lives in the CENTRAL fleet file, not this
+# per-host file: see deploy/control-plane/fleet-config.example.yaml. It is off by default.
+
 tests:
   adapters: [pytest, go, cargo, junit, scala]
 

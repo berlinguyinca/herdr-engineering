@@ -92,6 +92,31 @@ def _tenant_id(value: Any, where: str) -> str:
     return value
 
 
+def _consumer_config(raw: Any) -> dict[str, Any]:
+    raw = {} if raw is None else raw
+    if not isinstance(raw, dict):
+        raise ValueError("personal_assistant.delegation_consumer must be a mapping")
+    enabled = raw.get("enabled", False)
+    if not isinstance(enabled, bool):
+        raise ValueError("personal_assistant.delegation_consumer.enabled must be true or false (not a string)")
+    harness = raw.get("source_harness", "pi")
+    if harness not in ("pi", "claude", "codex", "opencode"):
+        raise ValueError("personal_assistant.delegation_consumer.source_harness must be pi, claude, codex or opencode")
+    return {"enabled": enabled, "source_harness": harness}
+
+
+def proposal_delegation_fields(kind: str, p: dict[str, Any]) -> tuple[str, str, str]:
+    """(task, target_system, delegation kind) of an approved propose_branch / request_mission payload. The ONE place
+    that derives them: the executor writes the delegation from it and the dispatcher re-derives it from the verified
+    payload."""
+    if kind == "propose_branch":
+        task = (f"Create feature branch for: {p.get('title', '')} in {p.get('repo', '')}"
+                + (f" (base {p['base']})" if p.get("base") else "")
+                + (f". Rationale: {p['rationale']}" if p.get("rationale") else ""))
+        return task, "pi", "branch"
+    return p.get("task", ""), p.get("target_system") or "pi", "mission"
+
+
 def assistant_config(cfg: dict[str, Any]) -> dict[str, Any]:
     """Normalize the ``personal_assistant`` config section.
 
@@ -162,7 +187,11 @@ def assistant_config(cfg: dict[str, Any]) -> dict[str, Any]:
         # Tenant of each authenticated principal. YAML only (no env var, no header, no body field): a principal that
         # is not listed belongs to ``default_tenant``. A malformed tenant id stops startup rather than guessing.
         # Optional HMAC for the audit chain: a PATH to a key file (never the key, never an env var).
-        "audit": {"hmac_key_file": str(audit_cfg.get("hmac_key_file") or "")},
+        "audit": {"hmac_key_file": str(audit_cfg.get("hmac_key_file") or ""),
+                  # operator-chosen append-only file the audit head is anchored to (see audit_anchor.py)
+                  "anchor_file": str(audit_cfg.get("anchor_file") or "")},
+        # Consume queued mission/branch delegations into the handoff queue (off unless enabled; YAML only).
+        "delegation_consumer": _consumer_config(section.get("delegation_consumer")),
         "tenancy": {
             "default_tenant": default_tenant,
             "principals": {str(k): _tenant_id(v, f"tenancy.principals[{k}]") for k, v in tenant_map.items()},
@@ -1786,6 +1815,7 @@ class AssistantService:
         self.comment_poster = None     # (collab_user, room_id, body) -> (status, json)   the collab comments route
         self.artifact_writer = None    # (user, draft dict, idempotency key) -> committed version dict
         self.lineage_emit = None       # (user, correlation dict) -> dict   best-effort graph events
+        self.delegation_consumer = None  # set by assistant_dispatch.DelegationConsumer; cancel reaches the handoff through it
         self.ci_board_request = None   # (tenant, user, payload, idempotency key) -> dict   ActionBoard.request
         if runner is not None:
             self.runner = runner
@@ -2536,19 +2566,13 @@ class AssistantService:
             self.store.put_proposal(x)
             raise
         try:
-            p = x.payload
-            if x.kind == "propose_branch":
-                task = (f"Create feature branch for: {p.get('title', '')} in {p.get('repo', '')}"
-                        + (f" (base {p['base']})" if p.get("base") else "")
-                        + (f". Rationale: {p['rationale']}" if p.get("rationale") else ""))
-                target, kind = "pi", "branch"
-            else:
-                task, target, kind = p.get("task", ""), p.get("target_system") or "pi", "mission"
+            task, target, kind = proposal_delegation_fields(x.kind, x.payload)
             d = self.delegate(tenant_id=x.tenant_id, user_id=x.user_id, assistant_id=x.assistant_id,
                               task=task[:4000], target_system=target, actor=actor)
-            d.kind = kind
-            d.note = f"from proposal {x.proposal_id}, approved by {x.decided_by}"
-            d.correlation = {**(x.correlation or {}), "proposal_id": x.proposal_id}
+            with self.store._lock:                              # one step: a consumer never sees a half-made mission
+                d.kind = kind
+                d.note = f"from proposal {x.proposal_id}, approved by {x.decided_by}"
+                d.correlation = {**(x.correlation or {}), "proposal_id": x.proposal_id}
             self.store.put_delegation(d)
         except Exception as exc:  # noqa: BLE001 - recorded; not retried automatically
             x.execution = "failed"
@@ -2559,7 +2583,8 @@ class AssistantService:
                                     action="assistant.proposal.execution_failed", subject_id=proposal_id,
                                     detail=x.execution_error)
             return x
-        x.execution, x.result_ref = "executed", d.delegation_id
+        x.result_ref = d.delegation_id                          # before the state a consumer keys on
+        x.execution = "executed"
         x.executed_by, x.executed_at = actor, self.now()
         try:
             self.store.audit_record(tenant_id=x.tenant_id, user_id=x.user_id, actor=actor,
@@ -3018,12 +3043,16 @@ class AssistantService:
     def cancel_delegation(self, delegation_id: str, *, tenant_id: str, user_id: str) -> DelegationRequest:
         self._require_enabled()
         d = self.store.get_delegation(delegation_id, tenant_id=tenant_id, user_id=user_id)
-        if d.status not in ("queued", "running"):
-            raise AssistantError(f"cannot cancel delegation in state {d.status}")
-        d.status = "cancelled"
+        with self.store._lock:                                  # serialised with the dispatcher's claim and hand-off
+            if d.status not in ("queued", "running"):
+                raise AssistantError(f"cannot cancel delegation in state {d.status}")
+            d.status = "cancelled"
         self.store.put_delegation(d)
         self.store.audit_record(tenant_id=tenant_id, user_id=user_id, actor=user_id,
                                 action="assistant.delegation.cancelled", subject_id=delegation_id)
+        consumer = getattr(self, "delegation_consumer", None)
+        if consumer is not None:
+            consumer.on_cancel(d, user_id)                      # the queued handoff must not stay runnable
         return d
 
     def register_delegation_artifact(self, delegation_id: str, *, tenant_id: str,
