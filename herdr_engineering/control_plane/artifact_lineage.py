@@ -13,6 +13,7 @@ by the same audience.
 """
 from __future__ import annotations
 
+import hashlib
 import re
 
 from .artifact_scope import PRIVATE
@@ -34,16 +35,34 @@ def _digests(manifest) -> list[str]:
     return sorted(found)
 
 
+def source_name(prefix: str, key: str) -> str:
+    """A valid ingest source (``[a-z][a-z0-9_-]{0,31}``) that is a pure function of ``key``. Real registry ids are longer
+    than a source may be, and a source that changes per version would hit the graph's cap on distinct sources one writer
+    may use per node (4), so a node that every version touches gets ONE stable source and distinct sequences instead."""
+    return f"{prefix}-{hashlib.sha256(str(key).encode()).hexdigest()[:20]}"
+
+
+def sequence_of(version: dict) -> int:
+    """Strictly per-version, deterministic, positive: the version number when it is one, else a digest of the id."""
+    n = version.get("version_number")
+    if isinstance(n, int) and not isinstance(n, bool) and 0 < n < 10**9:
+        return n
+    return int(hashlib.sha256(str(version.get("version_id")).encode()).hexdigest()[:9], 16) + 10**9
+
+
 def _envelope(source: str, n: int, event_type: str, entity_id: str, payload: dict, scope: dict) -> dict:
     return {"schema_version": 2, "event_id": f"{source}-{n}"[:128], "source": source, "source_sequence": n,
             "entity_type": "lineage", "entity_id": entity_id, "event_type": event_type, "payload": payload, **scope}
 
 
-def emit_version_lineage(ingest, version: dict, principal: dict, *, scope: dict | None = None) -> dict:
+def emit_version_lineage(ingest, version: dict, principal: dict, *, scope: dict | None = None,
+                         source_prefix: str = "art") -> dict:
     """Ingest ``artifact:<id>`` (commons node), the immutable ``artifact:<id>@<version_id>`` node, a ``supersession``
     edge to the parent version and, when the committing principal may write it, a ``produced`` edge from the producer.
     ``scope`` is the envelope visibility (``artifact_scope.visibility_fields``); if the ingest refuses it (for example
     the key may not address that room) the whole sequence is retried ``private``, never wider.
+    ``source_prefix`` names the event sources (see ``source_name``): the default is the commit's own, a different one
+    (``artbf`` for the backfill) is a new source, so the ingest does not deduplicate it away as a replay.
     Returns ``{"node", "version_node", "edge", "scope", "error"}``; never raises."""
     result = {"node": None, "version_node": None, "edge": None, "scope": None, "error": None}
     try:
@@ -56,28 +75,30 @@ def emit_version_lineage(ingest, version: dict, principal: dict, *, scope: dict 
             if version.get(key):
                 facts[key] = str(version[key])
         attrs = {k: v for k, v in facts.items() if v is not None}
-        source = f"art-{version_id}"[:64]
+        source = source_name(source_prefix, artifact_id)            # the logical node: one source, a sequence per version
+        vsource = source_name(source_prefix + "v", version_id)       # objects that belong to this version alone
+        seq = sequence_of(version) * 10
         label = f"{artifact_id} v{version.get('version_number')}"
         candidates = [scope or PRIVATE] + ([] if (scope or PRIVATE) == PRIVATE else [PRIVATE])
         for index, chosen in enumerate(candidates):
-            def send(n, event_type, entity_id, payload):
-                return ingest.ingest(_envelope(source, n, event_type, entity_id, payload, chosen), principal)
+            def send(n, event_type, entity_id, payload, src=vsource):
+                return ingest.ingest(_envelope(src, n, event_type, entity_id, payload, chosen), principal)
             try:
-                send(1, "node.upsert", node_id, {"node_type": "artifact", "node_id": node_id, "label": label,
-                                                 "state": "ready", "attrs": attrs})
+                send(seq + 1, "node.upsert", node_id, {"node_type": "artifact", "node_id": node_id, "label": label,
+                                                 "state": "ready", "attrs": attrs}, source)
             except Exception:                          # noqa: BLE001 - refused scope: fall back to private
                 if index + 1 == len(candidates):
                     raise
                 continue
             result["node"], result["scope"] = node_id, dict(chosen)
-            send(3, "node.upsert", version_node, {"node_type": "artifact", "node_id": version_node, "label": label,
+            send(1, "node.upsert", version_node, {"node_type": "artifact", "node_id": version_node, "label": label,
                                                   "state": "ready", "attrs": attrs})
             result["version_node"] = version_node
             parent = version.get("parent_version_id")
             if parent:
                 old = f"artifact:{artifact_id}@{parent}"
                 try:
-                    send(4, "edge.add", version_node, {"edge_type": "supersession", "from_id": version_node,
+                    send(2, "edge.add", version_node, {"edge_type": "supersession", "from_id": version_node,
                                                        "to_id": old})
                 except Exception:                      # noqa: BLE001 - the parent was never recorded: no edge
                     pass
@@ -85,7 +106,7 @@ def emit_version_lineage(ingest, version: dict, principal: dict, *, scope: dict 
                 if version.get(field):
                     producer = f"{kind}:{version[field]}"
                     try:
-                        send(2, "edge.add", producer, {"edge_type": "produced", "from_id": producer,
+                        send(3, "edge.add", producer, {"edge_type": "produced", "from_id": producer,
                                                        "to_id": node_id})
                         result["edge"] = producer
                     except Exception:                  # noqa: BLE001 - someone else owns the producer: node stands
@@ -106,7 +127,7 @@ def emit_retraction(ingest, artifact_id: str, version_id: str, principal: dict, 
     result = {"node": None, "error": None}
     try:
         node_id = f"artifact:{artifact_id}@{version_id}"
-        source = f"artret-{version_id}"[:64]
+        source = source_name("artret", f"{artifact_id}@{version_id}")
         chosen, why = scope, " ".join(str(reason or "").split())[:200] or "retracted"
         ingest.ingest(_envelope(source, 1, "node.state", node_id, {"node_id": node_id, "state": "retracted",
                                                                    "reason": why}, chosen), principal)
@@ -118,8 +139,8 @@ def emit_retraction(ingest, artifact_id: str, version_id: str, principal: dict, 
                 result["error"] = f"retraction recorded but the node still reads {seen!r}: only the committing writer can retract"
         if head:
             logical = f"artifact:{artifact_id}"
-            ingest.ingest(_envelope(source, 2, "node.state", logical, {"node_id": logical, "state": "retracted",
-                                                                       "reason": why}, chosen), principal)
+            ingest.ingest(_envelope(source_name("artret", artifact_id), sequence_of({"version_id": version_id}), "node.state",
+                                    logical, {"node_id": logical, "state": "retracted", "reason": why}, chosen), principal)
     except Exception as exc:                           # noqa: BLE001
         result["error"] = str(exc) or type(exc).__name__
     return result
@@ -129,3 +150,43 @@ def lineage_emitter(ingest, principal: dict, *, scope: dict | None = None):
     """``fn(version) -> result`` for ``ArtifactRenderRunner(..., lineage=...)``: the render path then records the same
     lineage as the HTTP commit route (same function, same shape)."""
     return lambda version: emit_version_lineage(ingest, version, principal, scope=scope)
+
+
+_POSTER_KEYS = frozenset({"api_url", "key_file", "timeout_seconds"})
+
+
+def lineage_poster_from_section(section):
+    """Build the render worker's lineage hook from YAML ``control_plane.artifact_worker.lineage`` (``api_url``, ``key_file``,
+    optional ``timeout_seconds``), or None when the section is absent. The key is read from the FILE at start-up (never from
+    the environment, never inlined in YAML). The hook POSTs ``{"version_id"}`` to the control plane's authenticated
+    ``/api/v1/artifact-jobs/<job>/lineage`` route: the server re-reads the version from the registry and applies the ACL
+    write gate, so the worker has no graph channel of its own and cannot assert facts."""
+    if not section:
+        return None
+    import json
+    import urllib.request
+    from pathlib import Path
+    from urllib.parse import quote, urlsplit
+    if not isinstance(section, dict) or set(section) - _POSTER_KEYS:
+        raise ValueError(f"artifact_worker.lineage: allowed keys are {sorted(_POSTER_KEYS)}")
+    url, key_file = section.get("api_url"), section.get("key_file")
+    if not isinstance(url, str) or urlsplit(url).scheme not in {"http", "https"} or not isinstance(key_file, str):
+        raise ValueError("artifact_worker.lineage needs an http(s) api_url and a key_file path")
+    timeout = section.get("timeout_seconds", 10)
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not 0 < timeout <= 120:
+        raise ValueError("artifact_worker.lineage.timeout_seconds must be a number in (0, 120]")
+    key = Path(key_file).expanduser().read_text(encoding="utf-8").strip()
+    if not key:
+        raise ValueError("artifact_worker.lineage.key_file is empty")
+
+    def post(version: dict):
+        job_id, version_id = version.get("job_id"), version.get("version_id")
+        if not job_id or not version_id:
+            return {"skipped": "version has no job_id/version_id"}
+        request = urllib.request.Request(
+            f"{url.rstrip('/')}/api/v1/artifact-jobs/{quote(str(job_id), safe='')}/lineage",
+            data=json.dumps({"version_id": version_id}).encode(), method="POST",
+            headers={"X-API-Key": key, "Content-Type": "application/json"})
+        with urllib.request.urlopen(request, timeout=timeout) as response:     # noqa: S310 - scheme checked above
+            return json.loads(response.read())
+    return post

@@ -672,6 +672,25 @@ class ArtifactStore:
         else:
             raise ArtifactError(f"unknown publication event: {action}")
 
+    async def record_retraction(self, artifact_id: str, version_id: str | None = None, reason: str = "") -> None:
+        """Durable half of the lineage retraction (``artifact_scope.ArtifactGraphGate``): an artifact becomes
+        ``lifecycle='retracted'``, a version ``state='retracted'``. Nothing is deleted; both columns are free text."""
+        if version_id is None:
+            changed = await self._conn.execute(
+                "UPDATE artifacts SET lifecycle='retracted' WHERE artifact_id=$1", artifact_id)
+        else:
+            changed = await self._conn.execute(
+                "UPDATE artifact_versions SET state='retracted' WHERE version_id=$1 AND artifact_id=$2",
+                version_id, artifact_id)
+        if changed != "UPDATE 1":
+            raise ArtifactError("no such artifact or version to retract")
+
+    async def load_retractions(self) -> list[dict]:
+        rows = await self._conn.fetch(
+            "SELECT artifact_id, NULL::text AS version_id FROM artifacts WHERE lifecycle='retracted' "
+            "UNION ALL SELECT artifact_id, version_id FROM artifact_versions WHERE state='retracted'")
+        return [self._row(row) for row in rows]
+
     async def load_acl(self) -> list[dict]:
         rows = await self._conn.fetch(
             "SELECT artifact_id, principal_id, permissions, expires_at, granted_by "

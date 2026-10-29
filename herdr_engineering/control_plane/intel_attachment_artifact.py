@@ -25,7 +25,7 @@ from email.utils import parseaddr
 
 from . import intel_attachments as att
 from . import intel_gmail as gm
-from .artifact_lineage import emit_retraction, emit_version_lineage
+from .artifact_lineage import emit_retraction, emit_version_lineage, sequence_of, source_name
 from .artifact_scope import PRIVATE, visibility_fields
 
 _REF = re.compile(r"(?P<kind>issue|pr):(?P<repo>\w[\w.-]*/\w[\w.-]*)#(?P<num>\d+)\Z")
@@ -125,14 +125,17 @@ async def attach_to_artifact(*, store, acl, ingest, principal: dict, msg: dict, 
     out["graph"] = emit_version_lineage(ingest, version, principal, scope=scope)
     node_id = f"artifact:{artifact_id}"
     thread = thread_node_id(account, str(msg["threadId"]))
-    source = f"mail-{artifact_id}-{version['version_id']}"[:64]     # one source per stored version: own sequence
+    # ONE source per conversation (the thread node takes a field write from every attachment of it, and the graph allows
+    # one writer only a few distinct sources per node); every stored version owns a block of 8 sequence numbers
+    source = source_name("mail", thread)
+    base = sequence_of({"version_id": version["version_id"]}) * 8
     try:
-        ingest.ingest({"schema_version": 2, "event_id": f"{source}-thread", "source": source,
-                       "source_sequence": 1, "entity_type": "lineage", "entity_id": thread, "event_type": "node.upsert",
+        ingest.ingest({"schema_version": 2, "event_id": f"{source}-{base}", "source": source,
+                       "source_sequence": base, "entity_type": "lineage", "entity_id": thread, "event_type": "node.upsert",
                        "payload": {"node_type": "thread", "node_id": thread, "label": "mail conversation",
                                    "attrs": {"source_ref": f"gmail:{_account_tag(account)}:{msg['id']}"}}, **PRIVATE}, principal)
-        ingest.ingest({"schema_version": 2, "event_id": f"{source}-produced",
-                       "source": source, "source_sequence": 2, "entity_type": "lineage",
+        ingest.ingest({"schema_version": 2, "event_id": f"{source}-{base + 1}",
+                       "source": source, "source_sequence": base + 1, "entity_type": "lineage",
                        "entity_id": thread, "event_type": "edge.add",
                        "payload": {"edge_type": "produced", "from_id": thread, "to_id": node_id}, **scope}, principal)
         out["thread_node"] = thread
@@ -141,12 +144,12 @@ async def attach_to_artifact(*, store, acl, ingest, principal: dict, msg: dict, 
     if intelligence is not None and viewer is not None:
         for issue in confirmed_issue_refs(intelligence, viewer, f"email:{msg['id']}"):
             try:
-                seq = 3 + 2 * len(out["issue_links"])
-                ingest.ingest({"schema_version": 2, "event_id": f"{source}-issue-{seq}", "source": source,
+                seq = base + 2 + 2 * len(out["issue_links"])
+                ingest.ingest({"schema_version": 2, "event_id": f"{source}-{seq}", "source": source,
                                "source_sequence": seq, "entity_type": "lineage", "entity_id": issue,
                                "event_type": "node.upsert", "payload": {"node_type": "issue", "node_id": issue},
                                **PRIVATE}, principal)          # an empty "ensure": defines the endpoint, owns nothing
-                ingest.ingest({"schema_version": 2, "event_id": f"{source}-link-{seq + 1}", "source": source,
+                ingest.ingest({"schema_version": 2, "event_id": f"{source}-{seq + 1}", "source": source,
                                "source_sequence": seq + 1, "entity_type": "lineage", "entity_id": node_id, "event_type": "edge.add",
                                "payload": {"edge_type": "issue_link", "from_id": node_id, "to_id": issue}, **scope},
                               principal)
