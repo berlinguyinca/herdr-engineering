@@ -6,10 +6,10 @@ Resume point for future agents. Update after every phase. Statuses are pass / pa
 - Run id `20261029T034105Z`; execution host bender; branch `feat/lineage-assistant-20261029T034105Z` off `herdr-engineering` `origin/main` `694aba1`; worktree `~/IdeaProjects/herdr-lineage-assistant-wt`.
 - Package ZIP copied from the Mac (`~/Downloads`, 10,253 bytes) over SSH; sha256 `7db18708377c59a7283eb0ecab9db90976c3d9912a11e120508d80ddbe1252cc`. Original files preserved in `original-package/`.
 
-## Pull requests
-- berlinguyinca/herdr-engineering#365 (audit docs, read_lineage, shell fail-closed, artifact-to-graph). Not merged; CI not yet reported.
-- berlinguyinca/herdr-engineering artifact-scope/CI/metrics PR (stacked on #365; link in the PR list when opened).
-- berlinguyinca/pi-engineering#460 (Pi continuity slice). Not merged; no CI workflow files exist on that repo's main.
+## Pull requests (all merged 2026-10-29 with merge commits; nothing deployed)
+- herdr-engineering: #365 (`a6eef852`) audit docs, read_lineage, shell fail-closed, artifact-to-graph; #367 (`d7bd75f9`) artifact scope/ACL, retract and backfill routes, worker and email routes, merge-gate adapter, metrics; #371 (`45bee6c6`) Workbench UI; #382 (`4e54dc41`) assistant hardening and action adapters (replaces #368, closed); #385 (`70b7986e`) executor for approved actions, tenants, durable audit, dashboard tabs.
+- pi-engineering: #460 (`c9656dc1`), #462 (`61d264d0`), #461 (`2498faaf`), #465 (`ebcb9a58`) verified handoff wired into production.
+- Merge conditions used: Woodpecker CI was NOT awaited for #367, #371, #382, #385 at the operator's instruction; GitGuardian green; Pi has no CI, full local `npm test` run instead; the "Independent AI review" check (errors on file size / binary patch) was ignored at the operator's instruction.
 
 ## Phases
 | Phase | Status | Evidence |
@@ -23,6 +23,10 @@ Resume point for future agents. Update after every phase. Statuses are pass / pa
 | S6 room TUI, request adapters | **adapters partial** (assistant side only; no Pi `/room` TUI) | `request_review`, `propose_branch`, `request_mission`, `comment_on_node`, `draft_email` in `assistant.py`; hooks in `assistant_adapters.py`; `test_assistant_actions.py`. Proposals start no work: nothing consumes an approved proposal yet |
 | S7 CI repair loop | **partial**, scenario test only (branch `feat/artifact-scope-ci-metrics-20261029`) | `tests/control_plane/test_ci_repair_rereview_gate.py` (4 tests): review bound to head A stale after B; CI failure on B blocks even with a fresh quorum; repair commit C needs fresh independent reviews (producer and author login rejected); only then `decide_merge` allows; same answer after graph rebuild. Shared review-quorum vectors confirmed byte-identical to AutoSpec `origin/main` and digest-pinned. **Not done:** no production adapter feeding graph `validated` edges to `decide_merge`; the assistant-notices-CI -> proposal -> Pi -> PR path is not wired; AutoSpec not edited (needed emissions are described in `docs/operations/lineage-continuity-runbook.md`) ; assistant side: `AssistantService.watch_ci` -> deduped `request_ci_repair` proposal on the existing ActionBoard + dashboard notice; no auto-merge path. Not done: AutoSpec quorum/re-review loop after the repair, exact-SHA tests, board proposals are in-memory with a 30 min window |
 | S8 fault matrix, metrics, runbooks | **partial** | Done: delivery metrics (`control_plane/lineage_metrics.py`, 14 tests incl. 12 handoffs / 61 sessions / branch / CI failure, exposed as `delivery` in room analytics); operator runbook, release checklist, contract section, README, `traceability.md`. **Not done:** crash/partition fault matrix, large-graph and UI performance runs, connected-UI screenshots, A/B measurement, assistant tool access to metrics |
+
+## Status after merge (supersedes the per-phase "PR/branch" notes below)
+Done and merged: S0-S2, S3-S4 (verified handoff, quarantine, thresholds, `/room` thin client against a fake server), S5 (filters disclosure, minimap, terminal link; perf numbers in `perf.md`), S6 adapters plus executor, S7 scenario test plus merge-gate adapter, S8 metrics/runbook.
+Not done: real quota model switch; phase-transition handoff records stay `prepared`; merge-gate adapter is off until operator YAML names evidence writers; `/room` untested against a live Herdr; Missions and assistant visual baselines (dashboard app is outside the visual harness); queued delegations are consumed by nothing; audit chain is only tamper-evident against casual edits unless `personal_assistant.audit.hmac_key_file` is set and the head is recorded off the box; Woodpecker CI results for the merged heads were never observed; shelved local branch `shelf/missionstore-split-20261029` (pi worktree, unpushed) would shrink missionStore.ts below the AI-review size limit.
 
 ## Blockers and open items
 - None blocking. Postgres-dependent e2e tests need a local Postgres.
