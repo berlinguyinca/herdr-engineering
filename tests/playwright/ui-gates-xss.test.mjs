@@ -136,9 +136,9 @@ for (const [, what, sel, canary, open] of PLACEMENTS) {
 
 // Fields the server sends and the proxy taints that no surface or state of THIS fixture paints. Every one is covered somewhere else
 // (ui-gates-render-xss.test.mjs): a renderer prints it (error, method, milestone, paths: the canary is asserted visible when a complete
-// model is rendered), it is drawn only as a number (progress), or no page source reads it at all (UNREAD, scanned there). The list
+// model is rendered), it is drawn only as a number (progress, count: the delivery metrics), or no page source reads it at all (UNREAD, scanned there). The list
 // must match what the run finds: a field that starts to render here must be removed, a new one added on purpose.
-const UNRENDERED = ['error', 'method', 'milestone', 'paths', 'progress', ...Object.keys(UNREAD).map(tag)].sort();
+const UNRENDERED = ['count', 'error', 'method', 'milestone', 'paths', 'progress', ...Object.keys(UNREAD).map(tag)].sort();
 
 test('the canaries really reached the screen for a wide set of fields (otherwise "inert" proves nothing)', () => {
   const table = [...seen].map(([k, w]) => `${k}: ${[...w].map((x) => x.slice(0, 24)).join(' | ')}`).sort();
