@@ -118,7 +118,7 @@ test('CI: running rows pulse and charts draw in on the first paint only; calm st
 test('CI health: a cell whose outcome changes flashes; others do not',async()=>withPage(async(page,base)=>{
  const s={runs:[run(1,'success'),run(2,'success',{created_at:ago(7200000+120000)})]};
  await calm(page,'off');
- await boot(page,base,'/ci',ciApi(s));
+ await boot(page,base,'/ci?workspace=health',ciApi(s));
  await openHealthFilters(page);
  await page.locator('[data-health-mode="hours"]').click();
  const cells=page.locator('[data-health-map] [data-health-project][data-health-bucket]');

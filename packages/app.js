@@ -471,7 +471,7 @@ async function viewReviewGate() {
 async function viewIntegrations(parts) {
   const query = route().query;
   return ownPolling(mountIntegrations(root, client, {
-    kind: parts[0], tab: query.get('tab') || 'current', search: query.get('search') || '',
+    kind: parts[0], tab: query.get('tab') || 'current', search: query.get('search') || '', workspace: query.get('workspace') || '',
     repository: query.get('repository') || '', provider: query.get('provider') || '', mission: query.get('mission') || '', session: query.get('session') || '',
   }));
 }

@@ -123,7 +123,7 @@ test('CI page shares project context with the existing heatmap and inspector wit
     getCiReports:async options=>{calls.push(['reports',options]);return {reports:[],pipelines:[run]};},
     getCiPipeline:async(id,number)=>{calls.push(['pipeline',id,number]);return {pipeline:{...run,tasks:[{id:9,name:'Unit tests',state:'failure'}]},diagnosis:{evidence_availability:'unavailable',reason:'No validated report matches this run.',failed_steps:[{id:9,name:'Unit tests',state:'failure'}],failed_tests:[]}};},
     getCiLog:async(id,number,step)=>{calls.push(['log',id,number,step]);return {available:true,log:'Exact provider output',truncated:true};}
-   });
+   },{workspace:'health'});
   },{...summary,projects:[project(),project({provider_repo_id:'18'})]});
   await page.locator('[data-ob-project]').nth(1).waitFor();
   assert.doesNotMatch(await page.locator('main').innerText(),/\.ig-fix\{/,'styles must not leak into visible page text');
@@ -179,7 +179,7 @@ async function reviewPage(run) {
     getCiPerformance:async({days})=>({schema_version:1,days,cache_groups:runs.map((r,i)=>({...r,kind:i?'Former cache':'Current cache',sample_count:5,restore_count:5,hit_count:3,hit_rate:.6})),execution_trends:[],alerts:[]}),
     getCiPipeline:async(id,number)=>({pipeline:{...runs.find(r=>r.run_number===number),tasks:[]},diagnosis:{evidence_availability:'unavailable'}})
    };
-   window.mount=()=>window.app=mountIntegrations(document.querySelector('main'),client);
+   window.mount=()=>window.app=mountIntegrations(document.querySelector('main'),client,{workspace:'health'});
   });
   await run(page);assert.deepEqual(errors,[]);
  }finally{await browser.close();server.closeAllConnections();await new Promise(resolve=>server.close(resolve));}
@@ -198,6 +198,7 @@ test('review: selected run report refresh retains evidence with a visible stale 
   mount();
  });
  await page.locator('[data-ob-project]').filter({hasText:'org/current'}).click();
+ await page.locator('[data-ci-workspace="tests"]').click();
  await page.locator('[data-ob-run]').click();
  const inspector=page.locator('.ig-inspector');
  const evidence=inspector.locator('.ci-insight-card').filter({hasText:'Test results'});
@@ -242,6 +243,7 @@ test('review: Runs repository selection updates command center and health with e
  assert.deepEqual(await page.locator('th[scope=row].ci-health-project').allTextContents(),['org/former']);
  await page.waitForFunction(()=>calls.some(([key,o])=>key==='tests'&&o.repository==='org/former'&&o.provider_repo_id==='17'&&o.provider_url==='https://ci.example'));
  await page.locator('[data-ci-repository]').selectOption('');
+ await page.locator('[data-ci-workspace="health"]').click();
  assert.equal(await page.locator('[data-ob-clear]').isVisible(),false);
  await page.locator('[data-ob-project]').filter({hasText:'org/current'}).click();
  assert.equal(await page.locator('[data-ci-repository]').inputValue(),JSON.stringify(['https://ci.example','17','org/current']));
@@ -250,7 +252,7 @@ test('review: Runs repository selection updates command center and health with e
 test('review: representative runs activate and focus the inspector from every workspace, including reopening the same run',()=>reviewPage(async page=>{
  await page.evaluate(()=>mount());await page.locator('[data-ob-project]').first().waitFor();
  await page.locator('[data-ob-project]').filter({hasText:'org/current'}).click();
- for(const workspace of ['tests','health','runs','tests']) {
+ for(const workspace of ['tests','tests']) {      // representative runs live in the Tests workspace; the second pass reopens the same run
   await page.locator(`[data-ci-workspace="${workspace}"]`).click();
   await page.locator('[data-ob-run]').click();
   assert.equal(await page.locator('.ig-inspector').isVisible(),true,workspace);
@@ -287,6 +289,7 @@ test('review: mounting preserves existing saved health filters when no command-c
 test('review: mounted unavailable summaries show missing coverage instead of observed-zero cards',()=>reviewPage(async page=>{
  await page.evaluate(()=>{fixture={...fixture,available:false,projects:[],kpis:{project_count:0,success_count:0,failure_count:0,active_count:0},scope:{partial:true}};mount();});
  await page.waitForFunction(()=>calls.length>0);
+ await page.locator('[data-ci-workspace="overview"]').click();
  assert.match(await page.locator('[data-ob-summary]').textContent(),/unavailable/i);
  assert.match(await page.locator('[data-ob-status]').textContent(),/unavailable.*partial|partial.*unavailable/i);
  assert.equal(await page.locator('[data-ob-summary] .ci-ob-card').count(),0);
