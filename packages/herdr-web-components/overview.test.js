@@ -212,3 +212,14 @@ test('a failed CI run is dropped once a later run of the same branch passed', as
   assert.equal(out.length, 2);
   assert.ok(!out.some(x => x.record.updated_at === '2026-10-28T09:00:00Z'));
 });
+
+test('a failed pull-request run is dropped once main passed a run that names the merged PR', async () => {
+  const { unresolvedCiFailures } = await import('../overview-view.js');
+  const run = (state, at, extra) => ({ tab: state === 'failure' ? 'failed' : 'finished', record: { repository: 'r', state, updated_at: at, ...extra } });
+  const out = unresolvedCiFailures([
+    run('success', '2026-10-28T12:00:00Z', { branch: 'main', message: 'Fix thing (#42)' }),
+    run('failure', '2026-10-28T09:00:00Z', { branch: 'fix', ref: 'refs/pull/42/head' }),
+    run('failure', '2026-10-28T09:30:00Z', { branch: 'other', ref: 'refs/pull/43/head' }),
+  ]);
+  assert.deepEqual(out.map(x => x.record.branch), ['other']);
+});
