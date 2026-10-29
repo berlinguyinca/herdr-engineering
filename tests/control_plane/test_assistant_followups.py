@@ -377,6 +377,7 @@ def world(acknowledged_sink):
     threading.Thread(target=svr.serve, daemon=True).start()
     svr.wait_until_ready()
     svc.review_rereview = Mock(return_value="re-review recorded")
+    svc.real_lineage = svc.lineage_emit                      # the emitter the server wired to the real graph
     svc.lineage_emit = Mock(return_value={"node": "decision:assistant.z", "edges": []})
     yield Http(svr.port), svc, repo
     svr.shutdown()
@@ -640,3 +641,143 @@ def test_audit_is_read_only_scoped_to_the_caller_and_tenant(world):
     assert {e["user_id"] for e in mine["audit"]} == {pid("alice")}
     theirs = h.call("bea", "GET", "/api/v1/assistant-audit")[1]
     assert {e["tenant_id"] for e in theirs["audit"]} == {"globex"}
+
+
+# ---- review follow-ups: audit-before-effect, real lineage, ingest cannot forge audit -------------------------
+
+def test_the_audit_store_being_down_stops_an_approved_action_before_its_side_effect():
+    svc, run, _ = build()
+    grant(svc, run, "request_review", "claude")
+    action = request(svc, run, "request_review", REVIEW, scope="claude")
+    approve(svc, action)
+    real_sink = svc.store.audit_sink
+    svc.store.audit_sink = Mock(side_effect=OSError("event store unavailable"))
+    with pytest.raises(OSError):
+        execute(svc, action)
+    svc.review_rereview.assert_not_called()                 # the "executing" entry could not be made durable
+    assert action.status == "approved" and not svc.store.delegations
+    svc.store.audit_sink = real_sink
+    assert execute(svc, action).status == "completed"       # nothing was burned: it runs once the store is back
+    assert svc.review_rereview.call_count == 1
+    actions = [e["action"] for e in svc.store.audit if e["subject_id"] == action.action_id]
+    assert actions.index("assistant.action.executing") < actions.index("assistant.action.executed")
+
+
+def test_the_audit_store_being_down_stops_an_approved_proposal_before_it_is_handed_off():
+    svc, run, _ = build()
+    grant(svc, run, "request_mission")
+    propose(svc, run, "request_mission", {"title": "A", "task": "t1"})
+    (x,) = svc.store.proposals.values()
+    svc.decide_proposal(x.proposal_id, tenant_id="t", user_id="key:u1", decision="approved", actor="key:u1")
+    svc.store.audit_sink = Mock(side_effect=OSError("event store unavailable"))
+    with pytest.raises(OSError):
+        svc.execute_approved_proposal(x.proposal_id, tenant_id="t", user_id="key:u1", actor="key:u1")
+    assert x.execution == "not_started" and not svc.store.delegations
+
+
+def test_http_a_down_audit_store_reports_not_executed_and_the_approval_stands(world):
+    h, svc, _ = world
+    aid, run = setup_assistant(h, "alice")
+    grant_via_service(svc, "alice", aid, "request_review", "claude")
+    st, out = h.call("alice", "POST", f"/api/v1/assistant-runs/{run}/tool",
+                     {"tool_id": "request_review", "scope": "claude", "idempotency_key": "d1", "payload": REVIEW})
+    real_sink = svc.store.audit_sink
+    calls = {"n": 0}
+
+    def flaky(entry):
+        if entry["action"] == "assistant.action.executing":
+            raise OSError("event store unavailable")
+        real_sink(entry)
+    svc.store.audit_sink = flaky
+    st, decided = h.call("boss", "POST", f"/api/v1/assistant-approvals/{out['approval_id']}/decision",
+                         {"decision": "approved"})
+    assert st == 200 and decided["decision"] == "approved"
+    assert decided["execution"]["status"] == "not_executed" and not svc.store.delegations
+    calls["n"] += 1
+    svc.store.audit_sink = real_sink
+    st, ran = h.call("alice", "POST", f"/api/v1/assistant-approvals/{out['approval_id']}/execute", {})
+    assert st == 200 and ran["status"] == "completed"
+
+
+def test_real_lineage_node_and_delegation_edge_for_an_executed_review_and_an_executed_proposal(world):
+    h, svc, repo = world
+    svc.lineage_emit = svc.real_lineage                      # the emitter the API wired: real ingest, real graph
+    aid, run = setup_assistant(h, "alice")
+    grant_via_service(svc, "alice", aid, "request_review", "claude")
+    grant_via_service(svc, "alice", aid, "request_mission")
+    st, out = h.call("alice", "POST", f"/api/v1/assistant-runs/{run}/tool",
+                     {"tool_id": "request_review", "scope": "claude", "idempotency_key": "ln1", "payload": REVIEW})
+    st, decided = h.call("boss", "POST", f"/api/v1/assistant-approvals/{out['approval_id']}/decision",
+                         {"decision": "approved"})
+    assert decided["execution"]["status"] == "completed"
+    action_id = svc.store.approvals[out["approval_id"]].action_id
+    thread_id = svc.store.runs[run].thread_id
+    st, node = h.call("alice", "GET", f"/api/v1/graph/nodes/decision:assistant.{action_id}")
+    assert st == 200 and node["node"]["attrs"]["approval_id"] == out["approval_id"]
+    assert node["node"]["attrs"]["delegation_id"]
+    st, hood = h.call("alice", "GET", f"/api/v1/graph/nodes/decision:assistant.{action_id}/neighborhood?depth=1")
+    assert st == 200
+    edges = {(e["edge_type"], e["from_id"], e["to_id"]) for e in hood["edges"]}
+    assert ("delegation", f"thread:assistant.{thread_id}", f"decision:assistant.{action_id}") in edges
+    # a proposal: approved, executed, and the execution is its own node (id with an extra dot) on the same thread
+    svc._execute_gated(svc.store.runs[run], "request_mission", {"title": "T", "task": "do it"}, 4000)
+    (prop,) = svc.store.proposals.values()
+    st, done = h.call("boss", "POST", f"/api/v1/assistant-proposals/{prop.proposal_id}/decision",
+                      {"decision": "approved"})
+    assert done["execution"] == "executed"
+    exec_node = f"decision:assistant.exec.{prop.proposal_id}"
+    st, node2 = h.call("alice", "GET", f"/api/v1/graph/nodes/{exec_node}")
+    assert st == 200 and node2["node"]["attrs"]["delegation_id"] == done["result_ref"]
+    st, hood2 = h.call("alice", "GET", f"/api/v1/graph/nodes/{exec_node}/neighborhood?depth=1")
+    assert ("delegation", f"thread:assistant.{thread_id}", exec_node) in {
+        (e["edge_type"], e["from_id"], e["to_id"]) for e in hood2["edges"]}
+    assert h.call("bea", "GET", f"/api/v1/graph/nodes/{exec_node}")[0] == 404         # private to its user
+
+
+def test_ingest_cannot_write_or_forge_audit_events_and_readback_ignores_foreign_ones(world):
+    h, svc, repo = world
+    setup_assistant(h, "alice")
+    forged = {"schema_version": 2, "event_id": "forge-1", "source": "pi", "source_sequence": 0,
+              "entity_type": "assistant_audit", "entity_id": "acme", "event_type": "AssistantAuditAppended",
+              "payload": {"event_id": "evt_forged", "tenant_id": "acme", "user_id": pid("alice"),
+                          "actor": "attacker", "action": "assistant.approval.approved", "subject_id": "x"}}
+    st, _ = h.call("alice", "POST", "/api/v1/ingest", forged)
+    assert st >= 400
+    assert not [e for e in svc.store.audit if e["event_id"] == "evt_forged"]
+    # even an event of that type that reached the store by another path is ignored unless it is ours
+    repo.record_event("assistant_audit", "acme", "SomethingElse", {"event_id": "evt_other", "tenant_id": "acme"})
+    repo.record_event("assistant_audit", "acme", "AssistantAuditAppended",
+                      {"event_id": "evt_env", "tenant_id": "acme", "_envelope": {"content_sha256": "x"}})
+    fresh_repo = restart(repo)
+    svr2 = ControlPlaneServer(fresh_repo, assistant_service=AssistantService(
+        config=assistant_config({"personal_assistant": {"enabled": True}}), repo=fresh_repo),
+        api_keys={k: "operator" for k in KEYS.values()})
+    ids = {e["event_id"] for e in svr2.assistant.store.audit}
+    assert "evt_other" not in ids and "evt_env" not in ids and ids
+
+
+def test_restore_never_drops_a_live_audit_entry(world):
+    h, svc, _ = world
+    setup_assistant(h, "alice")
+    live = {e["event_id"] for e in svc.store.audit}
+    svc.store.restore({"audit": []})                          # e.g. an older snapshot loaded after the sink attached
+    assert live <= {e["event_id"] for e in svc.store.audit}
+
+
+def test_repeated_connector_test_clicks_reuse_the_pending_approval_and_the_summary_has_no_body(world):
+    h, svc, _ = world
+    aid, _ = setup_assistant(h, "alice")
+    st, conn = h.call("alice", "POST", "/api/v1/assistant-connectors",
+                      {"name": "W", "kind": "http", "base_url": "https://w.example.com",
+                       "auth": {"_allowed_origins": ["w.example.com"]}})
+    cid = conn["connector_id"]
+    grant_via_service(svc, "alice", aid, "connector_request", cid)
+    svc._transport = Mock(return_value={"status": 200, "body": "EXTERNAL-RESPONSE-BODY"})
+    first = h.call("alice", "POST", f"/api/v1/assistant-connectors/{cid}/test", {"assistant_id": aid})[1]
+    second = h.call("alice", "POST", f"/api/v1/assistant-connectors/{cid}/test", {"assistant_id": aid})[1]
+    assert first["approval_id"] == second["approval_id"]
+    assert len([a for a in svc.store.approvals.values() if a.decision == "pending"]) == 1
+    st, decided = h.call("boss", "POST", f"/api/v1/assistant-approvals/{first['approval_id']}/decision",
+                         {"decision": "approved"})
+    assert decided["execution"]["status"] == "completed"
+    assert "EXTERNAL-RESPONSE-BODY" not in json.dumps(decided["result"])

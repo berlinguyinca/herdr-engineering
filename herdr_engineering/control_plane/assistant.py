@@ -1349,7 +1349,11 @@ class AssistantStore:
                                   (self._e_from_dict(AssistantNotification, d)
                                    for d in snap.get("notifications", []))}
             self._routine_fired = set(snap.get("routine_fired", []))
-            self._audit = [dict(e) for e in snap.get("audit", [])]
+            kept = {e.get("event_id") for e in snap.get("audit", [])}
+            merged = [dict(e) for e in snap.get("audit", [])]
+            merged += [e for e in self._audit if e.get("event_id") not in kept]   # restore never drops a live entry
+            merged.sort(key=lambda e: (str(e.get("timestamp", "")), str(e.get("tenant_id", "")), int(e.get("seq", 0))))
+            self._audit = merged
 
     def persist(self) -> None:
         if not self._persist_path:
@@ -2267,7 +2271,7 @@ class AssistantService:
             res["lineage_node"] = lineage.get("node")
             if lineage.get("error"):
                 res["lineage_error"] = redact_secrets(str(lineage["error"]))[:200]
-        res["summary"] = (redact_secrets(canonical_json({k: v for k, v in out.items() if k != "lineage"})) or "")[:600]
+        res["summary"] = (redact_secrets(canonical_json({k: v for k, v in out.items() if k not in ("lineage", "body")})) or "")[:600]
         return res
 
     def execute_approved_action(self, action_id: str, *, tenant_id: str, user_id: str,
@@ -2328,6 +2332,11 @@ class AssistantService:
                           scope=action.scope, payload=payload) != action.request_hash:
             self.fail_action(action)
             refuse("hash", "the recorded payload no longer matches what was approved")
+        # Durable BEFORE the side effect: if the audit store cannot take this entry, nothing has run and the action
+        # is still approved (the caller may retry once the store is back).
+        self.store.audit_record(tenant_id=o_tenant, user_id=o_user, actor=actor,
+                                action="assistant.action.executing", subject_id=action.action_id,
+                                detail=f"{action.tool_id} {action.scope} approval={action.approval_id or 'grant'}")
         if not self.claim_action(action):
             raise AssistantError("this action is not executable (it was claimed by another caller)")
         try:
@@ -2392,6 +2401,8 @@ class AssistantService:
                 x.execution, x.execution_error = "failed", "payload changed after approval"
             self.store.put_proposal(x)
             refuse("the payload changed after approval")
+        self.store.audit_record(tenant_id=x.tenant_id, user_id=x.user_id, actor=actor,
+                                action="assistant.proposal.executing", subject_id=proposal_id, detail=x.kind)
         with self.store._lock:                                  # claim: exactly one caller proceeds
             if x.execution != "not_started":
                 raise AssistantError(f"this proposal is {x.execution}")

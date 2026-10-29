@@ -528,8 +528,13 @@ class ControlPlaneServer:
             def _audit_append(entry):
                 repo.record_event("assistant_audit", str(entry.get("tenant_id") or "default"),
                                   "AssistantAuditAppended", entry, require_durable=True, publish=False, feed=False)
-            self.assistant.attach_audit_log(
-                _audit_append, lambda: [dict(e.get("payload") or {}) for e in repo.events_of_type("assistant_audit")])
+            def _audit_read():
+                # only what this module wrote: the right event type and no ingest envelope (ingest cannot reach this
+                # entity type, and the read-back would ignore such an event anyway)
+                return [dict(e.get("payload") or {}) for e in repo.events_of_type("assistant_audit")
+                        if e.get("event_type") == "AssistantAuditAppended"
+                        and "_envelope" not in (e.get("payload") or {})]
+            self.assistant.attach_audit_log(_audit_append, _audit_read)
         self._configure_architecture_explain(fleet_config, architecture_explain)
         if collab is not None:
             collab.architecture = self.architecture
@@ -3038,6 +3043,9 @@ def _make_handler(server, public=False, operator=False):
                 raise
             except AssistantError as exc:
                 return {"status": "not_executed", "error": str(exc)}
+            except Exception:  # noqa: BLE001 - e.g. the audit store refused the pre-execution entry: nothing ran
+                logging.getLogger(__name__).exception("assistant action %s was not executed", action_id)
+                return {"status": "not_executed", "error": "the action could not be started; nothing was run"}
             return {"status": action.status, "result": action.result or {},
                     "executed_at": action.executed_at.isoformat() if action.executed_at else None}
 
@@ -3286,10 +3294,16 @@ def _make_handler(server, public=False, operator=False):
                     if parts[5] == "test":
                         if not isinstance(body.get("assistant_id"), str) or not body["assistant_id"]:
                             return self._json({"error": "assistant_id is required"}, 400)
-                        body = {"run_id": svc.open_tool_run(tenant_id=tenant_id, user_id=user_id,
-                                                            assistant_id=body["assistant_id"],
-                                                            purpose="connector-test").run_id,
-                                "idempotency_key": body.get("idempotency_key") or f"test-{parts[4]}-{secrets.token_hex(8)}",
+                        _tr = svc.open_tool_run(tenant_id=tenant_id, user_id=user_id,
+                                                assistant_id=body["assistant_id"], purpose="connector-test")
+                        # a click while a check for this connector still waits for approval asks again about the SAME
+                        # action (same key), so repeated clicks never pile up approvals
+                        _open = next((x.idempotency_key for x in svc.store.actions.values()
+                                      if x.run_id == _tr.run_id and x.scope == parts[4] and x.status == "requested"
+                                      and x.idempotency_key.startswith("test-") and x.expires_at is not None
+                                      and x.expires_at > svc.now()), None)
+                        body = {"run_id": _tr.run_id,
+                                "idempotency_key": body.get("idempotency_key") or _open or f"test-{parts[4]}-{secrets.token_hex(8)}",
                                 "method": "GET", "path": "/", "dry_run": bool(body.get("dry_run"))}
                     run_id, idem = body.get("run_id"), body.get("idempotency_key")
                     if not isinstance(run_id, str) or not run_id or not isinstance(idem, str) or not idem:

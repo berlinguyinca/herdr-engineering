@@ -122,6 +122,33 @@ suppression). The assistant's principal is an API key, which has no room members
 snapshot from it, and building one from a contexts list the model or server supplies would widen visibility. So `read_lineage`
 has no metrics operation (a test pins that). Members read metrics from the room analytics route.
 
+## Assistant approvals, tenants and audit (YAML)
+
+```yaml
+control_plane:
+  personal_assistant:
+    tenancy:
+      default_tenant: default          # principals not listed below
+      principals:                      # authenticated principal id (key:<12 hex of sha256(api key)>) -> tenant
+        "key:0123456789ab": acme
+    actions:
+      approvers: ["key:..."]           # may decide approvals/proposals in their OWN tenant
+      auto_execute: true               # run an action/proposal as soon as it is approved (false = POST .../execute)
+```
+
+* Tenant is never read from a header, query or body. A malformed tenant id stops startup.
+* `POST /api/v1/assistant-approvals/<id>/execute` and `POST /api/v1/assistant-proposals/<id>/execute` run what was
+  approved, once (replay returns the recorded result; a failed action is not retried under the same key). Each
+  re-checks tenant, approval, expiry, grant and the payload hash. `send_message`, `run_shell` and `edit_shared` have no
+  executor: approving them records permission only.
+* `GET /api/v1/assistant-audit` reads the audit log (`chain_intact` reports the per-tenant hash chain). It is stored
+  as `assistant_audit` events in the repo event store, written before the operation completes; there is no route to
+  change or delete an entry. Approved actions and proposals write an `...executing` audit entry BEFORE their side
+  effect, so with the event store down nothing is run and the action stays approved. Other operations error when the
+  entry cannot be written, but the state change made just before it may already be stored.
+* Moving a principal to a new tenant in `tenancy.principals` hides what it created under its old tenant (`default`):
+  assistants, memory, approvals and notifications are tenant-scoped. Re-create them or keep the mapping.
+
 ## Rollback
 All changes are additive; roll back in this order, each step safe on its own:
 1. Switch the assistant tool off: `personal_assistant.enabled: false` (or revoke the `read_lineage` grant).

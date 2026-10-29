@@ -717,6 +717,34 @@ export class HerdrClient {
   archiveConnector(connectorId) {
     return this.request(`/api/v1/assistant-connectors/${encodeURIComponent(connectorId)}`, { method: 'DELETE' });
   }
+  // The dashboard's connector check: the server opens its own bookkeeping run and takes the normal tool gate, so the
+  // answer is a result, a refusal, or a 403 ``approval_needed`` (with the approval id and the dry-run text).
+  testConnector(connectorId, body) {
+    return this.request(`/api/v1/assistant-connectors/${encodeURIComponent(connectorId)}/test`, { method: 'POST', body });
+  }
+  executeApproval(approvalId) {
+    return this.request(`/api/v1/assistant-approvals/${encodeURIComponent(approvalId)}/execute`, { method: 'POST', body: {} });
+  }
+  listProposals(status) {
+    const q = status ? `?status=${encodeURIComponent(status)}` : '';
+    return this.request(`/api/v1/assistant-proposals${q}`);
+  }
+  previewProposal(proposalId) {
+    return this.request(`/api/v1/assistant-proposals/${encodeURIComponent(proposalId)}/preview`);
+  }
+  decideProposal(proposalId, decision) {
+    return this.request(`/api/v1/assistant-proposals/${encodeURIComponent(proposalId)}/decision`, { method: 'POST', body: { decision } });
+  }
+  executeProposal(proposalId) {
+    return this.request(`/api/v1/assistant-proposals/${encodeURIComponent(proposalId)}/execute`, { method: 'POST', body: {} });
+  }
+  listNotifications(state) {
+    const q = state ? `?state=${encodeURIComponent(state)}` : '';
+    return this.request(`/api/v1/assistant-notifications${q}`);
+  }
+  ackNotification(notificationId) {
+    return this.request(`/api/v1/assistant-notifications/${encodeURIComponent(notificationId)}/ack`, { method: 'POST', body: {} });
+  }
   connectorRequest(connectorId, body) {
     return this.request(`/api/v1/assistant-connectors/${encodeURIComponent(connectorId)}/request`, { method: 'POST', body });
   }

@@ -7,6 +7,8 @@ for identity. There is no write path here.
 """
 from __future__ import annotations
 
+import hashlib
+import re
 from collections.abc import Callable
 from datetime import UTC, datetime
 
@@ -108,7 +110,11 @@ class ActionLineageEmitter:
             result["error"] = "no principal or action id; nothing emitted"
             return result
         n = [0]
-        source = f"asst-{action_id}"[:64]
+        # ingest wants a lowercase source of at most 32 characters from [a-z0-9_-]; an id that does not fit is hashed
+        # (still one stable source per action, so a replay stays a no-op)
+        source = f"asst-{action_id}".lower()
+        if len(source) > 32 or not re.fullmatch(r"[a-z][a-z0-9_-]*", source):
+            source = "asst-" + hashlib.sha256(action_id.encode()).hexdigest()[:24]
 
         def send(event_type: str, entity_id: str, payload: dict) -> None:
             n[0] += 1
