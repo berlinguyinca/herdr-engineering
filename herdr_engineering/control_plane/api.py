@@ -472,9 +472,9 @@ class ControlPlaneServer:
         self.architecture_require_host_binding = arch_opts["require_host_binding"]
         self.architecture_agent_hosts = {}
         for key, hosts in arch_opts["agent_hosts"].items():
-            if self._keys.get(key) != "agent":
+            if self._keys.get(key) not in ("agent", "ingest"):
                 raise ValueError("control_plane.architecture.agent_hosts: each entry must name a configured "
-                                 "api key with the agent role")
+                                 "api key with the agent or ingest role")
             digest = hashlib.sha256(key.encode()).hexdigest()[:12]
             self.architecture_agent_hosts[f"key:{digest}"] = frozenset(hosts)
         self.architecture.gate_store_fn = lambda: self.gate_store
@@ -2796,6 +2796,12 @@ def _make_handler(server, public=False, operator=False):
                 host_id = body.get("host_id") if isinstance(body, dict) else None
                 if not isinstance(host_id, str) or not host_id or len(host_id) > 253:
                     return self._json({"ok": False, "error": "host_id is required"}, 400)
+                # A key bound in control_plane.architecture.agent_hosts acts only for its own hosts.
+                bound = (server.architecture_agent_hosts.get(self._principal()["id"])
+                         if self._role() in ("agent", "ingest") else None)
+                if (bound is None and self._role() == "agent" and server.architecture_require_host_binding
+                        or bound is not None and host_id not in bound):
+                    return self._json({"ok": False, "error": "this API key may not act for that host"}, 403)
                 if reports is None or not reports.enabled:
                     if parts[5] == "publish":
                         return self._json({"ok": False, "error": "Full session reports are not enabled.",
