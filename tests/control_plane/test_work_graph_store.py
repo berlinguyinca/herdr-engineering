@@ -1,3 +1,4 @@
+# ruff: noqa: F811  (pytest fixtures are imported by name from wg_pg)
 """Work Graph on real PostgreSQL: parity with the pure core, idempotence, ACL, paging, history, layouts."""
 from __future__ import annotations
 

@@ -1,3 +1,4 @@
+# ruff: noqa: F811  (pytest fixtures are imported by name from wg_pg)
 """Work Graph producers on real PostgreSQL: reconciliation, replay-from-clean gate, retention, orphans, migrations."""
 from __future__ import annotations
 
@@ -13,10 +14,14 @@ from herdr_engineering.control_plane import work_graph_core as core
 from herdr_engineering.control_plane import workspace_contracts as wc
 from herdr_engineering.control_plane.events import Event, EventStore
 from herdr_engineering.control_plane.work_graph_store import SnapshotRequired, WorkGraphStore
-from herdr_engineering.control_plane.work_graph_sync import PgSources, WorkGraphReconciler, WorkGraphWorker
+from herdr_engineering.control_plane.work_graph_sync import (
+    PgSources,
+    WorkGraphReconciler,
+    WorkGraphWorker,
+)
 
 from .wg_pg import wg, wg_pg  # noqa: F401
-from .work_graph_events import Stream, scenario
+from .work_graph_events import scenario
 
 OP = {"kind": "operator", "id": "key:op", "authenticated_by": "api_key"}
 MIGRATIONS = Path(__file__).resolve().parents[2] / "deploy/control-plane/migrations"
