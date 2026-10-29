@@ -77,10 +77,12 @@ def route_registry(handler, server, parts, resource):
     if reconcile:
         handler._read_json()
         from .artifact_lineage import emit_version_lineage
+        from .artifact_scope import visibility_fields
+        scope = visibility_fields(gated=getattr(server, "artifact_graph_gate", None) is not None)
         ingest = server.ingest
         agent = handler._principal()
         report = handler._artifact_call(
-            "reconcile", emit=(lambda version: emit_version_lineage(ingest, version, agent)))
+            "reconcile", emit=(lambda version: emit_version_lineage(ingest, version, agent, scope=scope)))
         handler._json(report)
         return True
 

@@ -46,7 +46,7 @@ class Client:
 
 @pytest.fixture()
 def server(acknowledged_sink):
-    cfg = assistant_config({"personal_assistant": {"enabled": True}})
+    cfg = assistant_config({"personal_assistant": {"enabled": True, "actions": {"allow_self_approval": True}}})
     assistant = AssistantService(config=cfg)
     repo = ControlPlaneRepo(sink=acknowledged_sink)
     svr = ControlPlaneServer(repo, assistant_service=assistant,
@@ -320,9 +320,20 @@ def test_connector_crud_and_request(server):
     assert json.loads(body)["auth_present"] is True
     status, body = server.get("/api/v1/assistant-connectors", headers=_uid())
     assert any(c["connector_id"] == cid for c in json.loads(body)["connectors"])
-    # SSRF-guarded request to a non-allowlisted host
+    # SSRF-guarded request to a non-allowlisted host, through the run's tool gate
+    _, body = server.post("/api/v1/assistants", {"name": "Helper"}, headers=_uid())
+    aid = json.loads(body)["assistant_id"]
+    _, body = server.post(f"/api/v1/assistants/{aid}/threads", {}, headers=_uid())
+    tid = json.loads(body)["thread_id"]
+    _, body = server.post(f"/api/v1/assistants/{aid}/threads/{tid}/messages", {"content": "hi"}, headers=_uid())
+    rid = json.loads(body)["run"]["run_id"]
+    status, _ = server.post(f"/api/v1/assistants/{aid}/permissions",
+                            {"tool_id": "connector_request", "scope": cid, "preauthorized": True},
+                            headers=_uid())
+    assert status == 201
     status, body = server.post(f"/api/v1/assistant-connectors/{cid}/request",
-                               {"path": "https://evil.example.net/x"}, headers=_uid())
+                               {"path": "https://evil.example.net/x", "run_id": rid,
+                                "idempotency_key": "k1"}, headers=_uid())
     assert json.loads(body)["ok"] is False
     # archive (DELETE)
     status, _ = server.delete(f"/api/v1/assistant-connectors/{cid}", headers=_uid())
@@ -460,7 +471,7 @@ def test_read_fleet_tool_returns_context_when_enabled():
     service = AssistantService(
         config=assistant_config({"personal_assistant": {
             "enabled": True, "inference": {"endpoint": "http://x.invalid"},
-            "fleet_context": {"enabled": True}}}))
+            "fleet_context": {"enabled": True, "allowed_principals": ["u1"]}}}))
     service.fleet_context = FleetContextProvider(_FakeRepo())
     a = service.create_assistant(tenant_id="t1", user_id="u1", name="A")
     out = service.execute_tool(tenant_id="t1", user_id="u1",
@@ -494,7 +505,7 @@ def _tool_service(script, *, tools_enabled=True):
         AssistantService, FleetContextProvider)
     svc = AssistantService(config=assistant_config({"personal_assistant": {
         "enabled": True, "inference": {"endpoint": "http://x.invalid"},
-        "fleet_context": {"enabled": True},
+        "fleet_context": {"enabled": True, "allowed_principals": ["u1"]},
         "tools": {"enabled": tools_enabled, "max_iterations": 3}}}))
     svc.fleet_context = FleetContextProvider(_FakeRepo())
     runner = _FakeStepRunner(script)

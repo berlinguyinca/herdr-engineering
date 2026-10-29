@@ -126,15 +126,30 @@ def _commit_via_http(base, store, key="owner-key"):
     return request(base, "/api/v1/artifacts/artifact_report/versions", key=key, body=body)
 
 
-def test_http_commit_records_the_artifact_in_the_graph_for_the_committer_only(reports_server):  # noqa: F811
+def _acl_id(key, role="operator"):
+    import hashlib
+    return f"api-key:{hashlib.sha256(key.encode()).hexdigest()[:16]}:{role}"
+
+
+def test_http_commit_records_the_artifact_in_the_graph_for_acl_readers_only(reports_server):  # noqa: F811
     base, store, _ = reports_server
+    store.acl.grant("artifact_report", _acl_id("owner-key"), {"read", "edit", "admin"})   # what registration does
     status, raw, _ = _commit_via_http(base, store)
     assert status == 201, raw
     status, raw, _ = request(base, "/api/v1/graph/nodes/artifact:artifact_report")
     assert status == 200, raw
-    attrs = json.loads(raw)["node"]["attrs"]
+    node = json.loads(raw)["node"]
+    attrs = node["attrs"]
     assert attrs["version_id"] == "ver_1" and attrs["content_digests"] == [DIGEST]
+    assert node["visibility_scope"] == "org"       # the label is wide; the ACL gate is what narrows it
     assert request(base, "/api/v1/graph/nodes/artifact:artifact_report", key="other-key")[0] == 404
+    # a grant shows it, a revoke hides it again on the very next read, over the real HTTP graph route
+    store.acl.grant("artifact_report", _acl_id("other-key"), {"read"})
+    assert request(base, "/api/v1/graph/nodes/artifact:artifact_report", key="other-key")[0] == 200
+    assert request(base, "/api/v1/graph/nodes/artifact:artifact_report@ver_1", key="other-key")[0] == 200
+    store.acl.revoke("artifact_report", _acl_id("other-key"))
+    assert request(base, "/api/v1/graph/nodes/artifact:artifact_report", key="other-key")[0] == 404
+    assert request(base, "/api/v1/graph/nodes/artifact:artifact_report@ver_1", key="other-key")[0] == 404
 
 
 def test_http_commit_still_succeeds_when_graph_emission_fails(reports_server, monkeypatch):  # noqa: F811

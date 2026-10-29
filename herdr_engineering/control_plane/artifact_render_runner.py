@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from pathlib import PurePosixPath
 
@@ -39,9 +40,12 @@ def _asset_references(value):
 
 
 class ArtifactRenderRunner:
-    def __init__(self, artifact_store, renderer):
+    def __init__(self, artifact_store, renderer, lineage=None):
         self.store = artifact_store
         self.renderer = renderer
+        # optional ``fn(version: dict) -> Any`` called after a durable commit (see artifact_lineage.lineage_emitter);
+        # the worker process has no ingest channel of its own, so the caller supplies one or leaves it None
+        self.lineage = lineage
         self.rustfs = artifact_store._rf
 
     async def __call__(self, job: dict) -> dict:
@@ -108,11 +112,21 @@ class ArtifactRenderRunner:
                       "host_id": job.get("assigned_host_id"),
                       "job_id": job.get("job_id"),
                       "generator_skill": "herdr-artifact", "toolchain": rendered.toolchain}
-        return await self.store.commit_version(
+        committed = await self.store.commit_version(
             artifact_id=job["artifact_id"], base_version_id=job.get("base_version_id"),
             source_manifest_blob=manifest_key, output_manifest=outputs,
             provenance=provenance, validation=rendered.validation,
             report_descriptor=descriptor,
             created_by=job.get("requested_by"),
             host_id=job.get("assigned_host_id"), job_id=job.get("job_id"), **context)
+        if self.lineage is not None:
+            # the version is already durable: a lineage failure must never fail or retry the job
+            try:
+                self.lineage({"artifact_id": job["artifact_id"], "output_manifest": outputs,
+                              "parent_version_id": job.get("base_version_id"),
+                              "host_id": job.get("assigned_host_id"), "job_id": job.get("job_id"),
+                              **context, **(committed if isinstance(committed, dict) else {})})
+            except Exception:                              # noqa: BLE001
+                logging.getLogger(__name__).warning("artifact lineage emission failed", exc_info=True)
+        return committed
 

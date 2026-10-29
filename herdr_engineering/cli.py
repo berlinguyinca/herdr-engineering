@@ -3270,6 +3270,9 @@ def _cmd_cp_web(args) -> int:
                              operator_hosts=args.collab_operator_host,
                              collab_operator_url=args.collab_operator_url,
                              collab_dashboard_hosts=args.collab_dashboard_host)
+    if artifact_adapter is not None and svr.artifact_graph_gate is not None:
+        # the lineage retraction set is server state kept in the registry: reload it before serving a single read
+        svr.artifact_graph_gate.load_retractions(artifact_adapter("load_retractions"))
     # Self-report the control-plane stack so the Services page has real data.
     try:
         if not args.collab_only:   # collab-only has no stack to report
@@ -3634,8 +3637,15 @@ def _cmd_cp_worker(args) -> int:
             migrations = args.migrations or _cp_migrations_dir()
             await Migrator(conn).apply(migrations)
             rustfs = _maybe_rustfs_client(cp)
+            from .config import load_config
+            from .control_plane.artifact_lineage import lineage_poster_from_section
+            try:
+                worker_cfg = ((load_config().get("control_plane") or {}).get("artifact_worker") or {})
+            except Exception:  # noqa: BLE001 - no readable config means no lineage poster, as before
+                worker_cfg = {}
             render_runner = (ArtifactRenderRunner(ArtifactStore(conn, rustfs),
-                                                   RendererRegistry())
+                                                   RendererRegistry(),
+                                                   lineage=lineage_poster_from_section(worker_cfg.get("lineage")))
                              if rustfs is not None else None)
             runner = render_runner if render_runner is not None else None
             worker_id = args.host_id or socket.gethostname()

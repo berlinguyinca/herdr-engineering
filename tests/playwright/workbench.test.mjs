@@ -150,6 +150,10 @@ test('steering: propose by keyboard, then a separate confirm step that restates 
   await page.locator('textarea[data-wb-field="instruction"]').dispatchEvent('input');
   await page.getByRole('button', { name: 'Propose', exact: true }).click();
   await page.waitForFunction(() => document.querySelector('.wb')?.innerText.includes('A room owner must confirm'));
+  // The notice appears BEFORE the list is reloaded; the reload then inserts the new request (s2) above s1 and shifts every button below it.
+  // A click aimed at s1's button in that window landed on s2's Reject (seen in the failing runs: the POST list ended with .../s2/reject).
+  // Wait for the reloaded list, so the layout is final before the test acts on it.
+  await page.locator('[data-wb-steer="s2"]').waitFor();
   const prop = m.posts.find((p) => p.path === '/rooms/room-one/steering');
   assert.deepEqual(Object.keys(prop.body).sort(), ['action', 'expected_fence', 'idempotency_key', 'instruction', 'node_id']);
   assert.equal(prop.body.expected_fence, FENCE);

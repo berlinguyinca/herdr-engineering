@@ -234,7 +234,7 @@ export const llmStyles = `<style>
 export function renderLlm(state, data) {
   const d = data || {};
   const extra = list(d.total?.groups).filter((g) => g !== pickTotal(d.total)).map((g) => g.source);
-  return `${llmStyles}<h1>LLM</h1>${controls(state)}
+  return `${llmStyles}<h1>Usage</h1>${controls(state)}
     <p class="llm-note" data-llm-disclosure>${esc(disclosure(d.total))}${
       extra.length ? ` Other sources (${esc(extra.join(', '))}) are listed in the tables and never added to these figures.` : ''}${
       list(d.agents?.groups).some((g) => g.partial_source) ? ' Transcript rows cover only the events still retained for each agent, and carry tokens only.' : ''}</p>

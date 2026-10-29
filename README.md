@@ -626,6 +626,15 @@ Ansible deploys the same unit + script on the designated gateway host
 Design and deployment model:
 [`docs/architecture/dev-fabric-gateway.md`](docs/architecture/dev-fabric-gateway.md).
 
+## Lineage continuity, artifact visibility and delivery metrics
+
+The lineage graph (sessions, handoffs, branches, reviews, PRs, CI, artifacts) is a read model over stored events; Pi, AutoSpec and
+GitHub stay authoritative. Operator material: [runbook](docs/operations/lineage-continuity-runbook.md) (restart/replay, interrupted
+handoff, rollback, flags and grants), [release checklist](docs/operations/lineage-release-checklist.md), and the
+[contract section](docs/contracts/lineage-events.md) on artifact nodes, the ACL read gate and `delivery` metrics. Everything is
+off or additive by default; configuration is YAML only. Install and test: `pip install -e '.[dev,collab,review-gate,federation]'`, then
+`python3 -m pytest tests/control_plane/test_artifact_scope.py tests/control_plane/test_lineage_metrics.py -q`.
+
 ## Contributing
 
 See `CONTRIBUTING.md`. In short: run `scripts/validate.sh` (lint + tests +
