@@ -1722,6 +1722,41 @@ class GraphProjection:
                     "head_visible": head_visible,
                     "reviews": reviews, "authors": sorted(authors)}
 
+    def edges_into_by_writers(self, principal, to_id: str, edge_type: str, writers, *,
+                              include_removed: bool = False, limit: int = 256) -> list:
+        """Views of the visible ``edge_type`` edges INTO ``to_id`` whose current add was written by one of ``writers``.
+
+        Unlike ``neighborhood`` this is not an incident-edge scan under a budget that other principals can spend: the
+        candidates come from the configured writers' own by-owner index (or the node's in-edges when that is smaller), and
+        the writer is checked on every one, so a flood of junk edges from other principals cannot push a trusted writer's
+        edge out of view. KeyError if ``to_id`` is absent or hidden from ``principal``. At most ``limit`` views."""
+        writers = frozenset(writers)
+        with self._lock:
+            if not self._node_visible(principal, self._nodes.get(to_id)):
+                raise KeyError(to_id)
+            ins = self._in.get(to_id, {})
+            mine = [set(self._edges_by_owner.get(w, ())) for w in sorted(writers)]
+            if sum(len(m) for m in mine) <= len(ins):
+                keys = [k for m in mine for k in m if k in ins]
+            else:
+                keys = list(ins)
+            ctx, out = {}, []
+            for key in keys:
+                edge = self._edges.get(key)
+                if edge is None or edge.edge_type != edge_type or not self._live(edge):
+                    continue
+                if edge.adds.best()[4][1] not in writers:
+                    continue
+                if not include_removed and self._is_removed(edge):
+                    continue
+                if not (can_see(principal, edge.scope or "private", edge.writers())
+                        and self._node_visible(principal, self._nodes.get(edge.from_id))):
+                    continue
+                out.append(self._edge_view(edge, principal, ctx))
+                if len(out) >= limit:
+                    break
+            return out
+
     def list_nodes(self, principal, node_type: str, *, edge_type: str | None = None,
                    limit: int = DEFAULT_NODES, contexts: frozenset | None = None) -> dict:
         """The nodes of one type the caller may see (first-seen order, at most ``limit``), plus the visible

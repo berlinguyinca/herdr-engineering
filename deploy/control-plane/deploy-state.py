@@ -42,6 +42,26 @@ def inspect(*args):
     return json.loads(result.stdout)[0]
 
 
+# Docker's own words for "there is no such container". Anything else (daemon down,
+# permission denied, a timeout) is NOT absence and must still fail the operation.
+_ABSENT = (b"No such object", b"No such container")
+
+
+def inspect_container(name):
+    """A container's inspect document, or None only when Docker says it does not exist."""
+    result = subprocess.run(["docker", "inspect", "--type", "container", name], capture_output=True)
+    if result.returncode != 0:
+        if any(marker in result.stderr for marker in _ABSENT):
+            return None
+        raise RuntimeError("container inspection failed")
+    return json.loads(result.stdout)[0]
+
+
+# Services that run the herdr-engineering image (collab-edge runs a digest-pinned nginx
+# from the compose file itself). An ABSENT one of these is pinned to the web's image.
+HERDR_IMAGE_SERVICES = ("control-plane-web", "control-plane-worker", "llm-proxy", "collab-public")
+
+
 def image_id(value):
     if not re.fullmatch(r"sha256:[0-9a-f]{64}", value):
         raise ValueError("invalid image ID")
@@ -70,7 +90,7 @@ def previous_receipt(state, previous_image, web=None):
     tag = previous_image.removeprefix("herdr-engineering:")
     if not pinned and not (Path(state) / f"{tag}.json").exists():
         return tag, {}
-    web = web if web is not None else inspect("inspect", container("control-plane-web"))
+    web = web if web is not None else inspect("inspect", "--type", "container", container("control-plane-web"))
     actual_id = image_id(web["Image"])
     if web["Config"]["Image"] != previous_image:
         raise ValueError("running image changed")
@@ -125,8 +145,23 @@ def prepare(state, central, commit, previous_commit, previous_image, collab):
     if collab == "1":
         services += ["collab-public", "collab-edge"]
     if previous_image:
-        live = {s: inspect("inspect", container(s)) for s in services}
+        # A service container may be missing (an interrupted recreate removed it): record
+        # it as absent instead of failing, so this deploy - or its rollback - recreates it.
+        live, absent = {}, []
+        for s in services:
+            document = inspect_container(container(s))
+            if document is None:
+                absent.append(s)
+            else:
+                live[s] = document
+        if "control-plane-web" in absent:
+            raise ValueError("running web container disappeared during preparation")
         images = {s: image_id(d["Image"]) for s, d in live.items()}
+        # Rollback recreates an absent herdr-engineering service from the previous web's
+        # immutable image (they share it); verify-rollback then checks it like the rest.
+        for s in absent:
+            if s in HERDR_IMAGE_SERVICES:
+                images[s] = images["control-plane-web"]
         web = live["control-plane-web"]
         # A receipt snapshot preserves the last deployed config even if its canonical
         # source was edited in place for this candidate. Legacy receipts bootstrap
@@ -145,6 +180,7 @@ def prepare(state, central, commit, previous_commit, previous_image, collab):
         elif saved:
             source = protected_snapshot(state, saved)
         previous = {"commit": previous_commit, "image": previous_image, "images": images,
+                    "absent": absent,
                     "fleet_config_source": str(source) if pinned else receipt.get("fleet_config_source", str(source)),
                     "fleet_config_snapshot": snapshot(attempt, "previous", source)}
         # Image-only override: retain the previous commit's commands, including the
@@ -190,7 +226,7 @@ def main():
             images = {s: metadata["candidate"]["image_id"] for s in services}
             config = metadata["candidate"]["fleet_config_source"]
         for service, expected in images.items():
-            live = inspect("inspect", container(service))
+            live = inspect("inspect", "--type", "container", container(service))
             if live["Image"] != expected:
                 raise ValueError("deployment image mismatch")
             if service in ("control-plane-web", "control-plane-worker"):

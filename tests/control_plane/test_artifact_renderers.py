@@ -126,6 +126,15 @@ def test_presentation_splits_slides_outside_code_fences():
     assert "not a split" in deck and "<script>" not in deck
 
 
+def test_deck_type_scale_is_applied_after_the_page_rules():
+    deck = RendererRegistry().render("presentation", "# One\n\n---\n\n## Two", {}).outputs[0]["content"]
+    assert deck.count("<style>") == 1
+    page_body = deck.index("body{margin:0;font:16px")
+    deck_body = deck.index("body{margin:0;font:clamp(")
+    assert deck_body > page_body                       # a later rule wins; the deck CSS used to come first
+    assert "h1{font-size:2.6em" in deck and "color-scheme:light dark" in deck
+
+
 # ------------------------------------------------- v2: series, dark mode, sequences
 
 def _render(profile, source):

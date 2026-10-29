@@ -191,6 +191,19 @@ class IngestService:
         if not good:
             raise PermissionError("not permitted to modify this lineage object")
 
+    def _check_evidence_namespace(self, env: dict, event_type: str, payload: dict) -> None:
+        """CI evidence run nodes live under ``ci:ci-evidence:``. API keys are ``key:<hash>`` and rooms ``collab:...``, so
+        only the in-process evidence writer (a ``ci-evidence:`` principal) or an authenticated operator may create or
+        attach to a node there: a stranger cannot pre-create a predictable run id and make the writer's next write fail."""
+        actor = env.get("actor") or {}
+        if str(actor.get("id") or "").startswith("ci-evidence:") or (
+                actor.get("kind") == "operator" and actor.get("authenticated_by") not in (None, "none", "open_listener")):
+            return
+        ends = ((payload.get("from_id"), payload.get("to_id")) if event_type.startswith("edge.")
+                else (payload.get("node_id"),))
+        if any(isinstance(e, str) and e.startswith("ci:ci-evidence:") for e in ends):
+            raise PermissionError("not permitted to modify this lineage object")
+
     def _check_reserved_nodes(self, env: dict, event_type: str, payload: dict) -> None:
         """Only an external agent itself (or an authenticated operator key) may write a node or edge
         source inside that agent's namespace; anyone else is refused exactly like any lineage refusal."""
@@ -283,6 +296,7 @@ class IngestService:
             self._check_peer_namespace(env, event_type, payload, entity_id)
             self._check_lineage_scope(env)
             self._check_reserved_nodes(env, event_type, payload)
+            self._check_evidence_namespace(env, event_type, payload)
         self._prevalidate(entity_type, entity_id, payload, event_type, source)
         if env is None:
             return self._dispatch(entity_type, entity_id, event_type, payload, source)

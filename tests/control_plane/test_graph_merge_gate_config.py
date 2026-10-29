@@ -20,11 +20,12 @@ def example_block(enabled="true", writers=None):
     for line in lines:
         if re.match(r"\s*# graph_merge_gate:", line):
             on = True
-        elif on and not re.match(r"\s*#   \S", line):
+        elif on and not re.match(r"\s*#   +\S", line):
             break
         if on:
             out.append(re.sub(r"^(\s*)# ?", r"\1", line))
-    text = "\n".join(out).replace("enabled: false", f"enabled: {enabled}")
+    text = "\n".join(out).replace("enabled: false", f"enabled: {enabled}", 1)   # the gate's switch, not evidence_source's
+    text = text.replace("<owner>/<name>", "acme/widgets")      # the writer's repo placeholder, like the writer-id one below
     if writers is not None:
         text = re.sub(r"evidence_writers: \[.*?\]", f"evidence_writers: {writers}", text)
     return text
@@ -33,7 +34,9 @@ def example_block(enabled="true", writers=None):
 def test_example_file_parses_and_ships_the_gate_disabled_and_commented():
     assert "graph_merge_gate" not in yaml.safe_load(EXAMPLE.read_text())["sections"]["control_plane"]["values"]
     block = yaml.safe_load(example_block())
-    assert set(block["graph_merge_gate"]) == {"enabled", "evidence_writers", "required_checks", "require_review_quorum"}
+    assert set(block["graph_merge_gate"]) == {"enabled", "evidence_writers", "required_checks", "require_review_quorum",
+                                           "evidence_source"}
+    assert block["graph_merge_gate"]["evidence_source"]["enabled"] is False        # the writer ships off too
     real = yaml.safe_load(example_block(enabled="false", writers='["key:0123456789ab"]'))["graph_merge_gate"]
     assert validate_section(real) is None
 
