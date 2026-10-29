@@ -522,6 +522,14 @@ class ControlPlaneServer:
             self.assistant.comment_poster = comment_hook(self)
             self.assistant.artifact_writer = draft_writer_hook(self)
             self.assistant.ci_board_request = self.intelligence.assistant_ci_repair
+
+            # The audit log is append-only in the repo event store: durable before it is visible, and read back here
+            # after a restart. A failed write raises, so an operation that cannot be audited does not complete.
+            def _audit_append(entry):
+                repo.record_event("assistant_audit", str(entry.get("tenant_id") or "default"),
+                                  "AssistantAuditAppended", entry, require_durable=True, publish=False, feed=False)
+            self.assistant.attach_audit_log(
+                _audit_append, lambda: [dict(e.get("payload") or {}) for e in repo.events_of_type("assistant_audit")])
         self._configure_architecture_explain(fleet_config, architecture_explain)
         if collab is not None:
             collab.architecture = self.architecture
@@ -2551,7 +2559,7 @@ def _make_handler(server, public=False, operator=False):
             if resource == "review-gate":
                 return self._review_gate_get(parts)
             if resource in ("assistants", "assistant-runs", "assistant-approvals", "assistant-memory", "assistant-routines", "assistant-connectors", "assistant-delegations",
-                            "assistant-proposals", "assistant-notifications"):
+                            "assistant-proposals", "assistant-notifications", "assistant-audit"):
                 return self._assistant_get(parts, resource)
             if resource == "tests":
                 return self._json(_tests_view())
@@ -3014,7 +3022,24 @@ def _make_handler(server, public=False, operator=False):
         # nor client-supplied identity headers establish human approval authority.
         # Collaboration Bearer/Agent authentication belongs to its own dispatch.
         def _assistant_scope(self):
-            return "default", self._principal()["id"]
+            # The tenant is the authenticated principal's, from the operator's YAML (personal_assistant.tenancy);
+            # nothing the client sends (headers included) can choose it.
+            principal_id = self._principal()["id"]
+            return server.assistant.tenant_for(principal_id), principal_id
+
+        @staticmethod
+        def _execute_action_view(svc, action_id, tenant_id, user_id):
+            """Run an approved action and describe the outcome. A refusal is reported, never raised: the approval
+            itself stands, and a person can see why nothing ran."""
+            from .assistant import AssistantError, AssistantNotFound
+            try:
+                action = svc.execute_approved_action(action_id, tenant_id=tenant_id, user_id=user_id, actor=user_id)
+            except AssistantNotFound:
+                raise
+            except AssistantError as exc:
+                return {"status": "not_executed", "error": str(exc)}
+            return {"status": action.status, "result": action.result or {},
+                    "executed_at": action.executed_at.isoformat() if action.executed_at else None}
 
         def _assistant_get(self, parts, resource):
             from .assistant import AssistantNotFound, AssistantUnavailable, RateLimited
@@ -3065,6 +3090,13 @@ def _make_handler(server, public=False, operator=False):
                                                                           assistant_id=parts[4])]})
                     if len(parts) == 7 and parts[5] == "routines":
                         return self._json(svc.get_routine(parts[6], tenant_id=tenant_id, user_id=user_id).as_dict())
+                if resource == "assistant-audit" and len(parts) == 4:
+                    # read only: there is no POST/PATCH/DELETE route for the audit log
+                    return self._json({"audit": svc.audit_log(tenant_id=tenant_id, user_id=user_id,
+                                                              limit=int(_q(self.path, "limit") or 200)),
+                                       "chain_intact": svc.store.verify_audit(tenant_id)})
+                if resource == "assistant-proposals" and len(parts) == 6 and parts[5] == "preview":
+                    return self._json(svc.preview_proposal(parts[4], tenant_id=tenant_id, user_id=user_id))
                 if resource == "assistant-proposals" and len(parts) == 4:
                     return self._json({"proposals": [x.as_dict() for x in svc.list_proposals(
                         tenant_id=tenant_id, user_id=user_id, status=_q(self.path, "status"))]})
@@ -3082,7 +3114,7 @@ def _make_handler(server, public=False, operator=False):
                     return self._json(svc.get_run(parts[4], tenant_id=tenant_id, user_id=user_id).as_dict())
                 if resource == "assistant-approvals" and len(parts) == 4:
                     state = _q(self.path, "state")
-                    return self._json({"approvals": [a.as_dict() for a in
+                    return self._json({"approvals": [svc.approval_view(a) for a in
                                                       svc.list_approvals(tenant_id=tenant_id, user_id=user_id,
                                                                          state=state)]})
                 if resource == "assistant-memory" and len(parts) == 5:
@@ -3198,7 +3230,19 @@ def _make_handler(server, public=False, operator=False):
                     decision = svc.decide_approval(parts[4], tenant_id=tenant_id, user_id=user_id,
                                                    decision=body.get("decision", ""),
                                                    actor=user_id)
-                    return self._json(decision.as_dict())
+                    execution = None
+                    if decision.decision == "approved" and svc.config["actions"]["auto_execute"]:
+                        execution = self._execute_action_view(svc, decision.action_id, tenant_id, user_id)
+                    view = svc.approval_view(decision)
+                    if execution is not None:
+                        view["execution"] = execution
+                    return self._json(view)
+                if resource == "assistant-approvals" and len(parts) == 6 and parts[5] == "execute":
+                    approval = svc.store.approvals.get(parts[4])
+                    if approval is None or approval.tenant_id != tenant_id:
+                        raise AssistantNotFound("approval not found")
+                    view = self._execute_action_view(svc, approval.action_id, tenant_id, user_id)
+                    return self._json(view, 200 if view["status"] == "completed" else 409)
                 if resource == "assistant-memory" and len(parts) == 5 and self.command == "DELETE":
                     svc.forget_memory(parts[4], tenant_id=tenant_id, user_id=user_id)
                     return self._json({"ok": True})
@@ -3234,9 +3278,19 @@ def _make_handler(server, public=False, operator=False):
                 if resource == "assistant-connectors" and len(parts) == 5 and self.command == "DELETE":
                     svc.archive_connector(parts[4], tenant_id=tenant_id, user_id=user_id)
                     return self._json({"ok": True})
-                if resource == "assistant-connectors" and len(parts) == 6 and parts[5] == "request":
+                if resource == "assistant-connectors" and len(parts) == 6 and parts[5] in ("request", "test"):
                     # Same gate as every other tool: an assistant run, a grant scoped to THIS connector (from the
                     # path, never the body), a fail-closed approval, an idempotency key and a TTL.
+                    # ``test`` is the dashboard's way in: it opens (or reuses) a bookkeeping run for the named
+                    # assistant, so the button needs no chat, and then takes exactly the ``request`` path below.
+                    if parts[5] == "test":
+                        if not isinstance(body.get("assistant_id"), str) or not body["assistant_id"]:
+                            return self._json({"error": "assistant_id is required"}, 400)
+                        body = {"run_id": svc.open_tool_run(tenant_id=tenant_id, user_id=user_id,
+                                                            assistant_id=body["assistant_id"],
+                                                            purpose="connector-test").run_id,
+                                "idempotency_key": body.get("idempotency_key") or f"test-{parts[4]}-{secrets.token_hex(8)}",
+                                "method": "GET", "path": "/", "dry_run": bool(body.get("dry_run"))}
                     run_id, idem = body.get("run_id"), body.get("idempotency_key")
                     if not isinstance(run_id, str) or not run_id or not isinstance(idem, str) or not idem:
                         return self._json({"error": "run_id and idempotency_key are required: connector calls "
@@ -3269,12 +3323,21 @@ def _make_handler(server, public=False, operator=False):
                     except Exception:
                         svc.fail_action(action)
                         raise
+                    action.result = svc._result_summary(result)
+                    action.executed_by, action.executed_at = user_id, svc.now()
                     svc.complete_action(action)
                     return self._json(result)
                 if resource == "assistant-proposals" and len(parts) == 6 and parts[5] == "decision":
-                    return self._json(svc.decide_proposal(
-                        parts[4], tenant_id=tenant_id, user_id=user_id,
-                        decision=body.get("decision", ""), actor=user_id).as_dict())
+                    x = svc.decide_proposal(parts[4], tenant_id=tenant_id, user_id=user_id,
+                                            decision=body.get("decision", ""), actor=user_id)
+                    if (x.status == "approved" and svc.config["actions"]["auto_execute"]
+                            and x.kind in ("propose_branch", "request_mission")):
+                        x = svc.execute_approved_proposal(x.proposal_id, tenant_id=tenant_id, user_id=user_id,
+                                                          actor=user_id)
+                    return self._json(x.as_dict())
+                if resource == "assistant-proposals" and len(parts) == 6 and parts[5] == "execute":
+                    x = svc.execute_approved_proposal(parts[4], tenant_id=tenant_id, user_id=user_id, actor=user_id)
+                    return self._json(x.as_dict(), 200 if x.execution == "executed" else 409)
                 if resource == "assistant-notifications" and len(parts) == 6 and parts[5] == "ack":
                     return self._json(svc.ack_notification(
                         parts[4], tenant_id=tenant_id, user_id=user_id).as_dict())

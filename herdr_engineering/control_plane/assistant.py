@@ -62,6 +62,15 @@ def redact_secrets(text: str | None) -> str | None:
 _FEATURE_FLAG_KEY = "personal_assistant"
 
 
+_TENANT_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.\-]{0,63}\Z")
+
+
+def _tenant_id(value: Any, where: str) -> str:
+    if not isinstance(value, str) or not _TENANT_RE.match(value):
+        raise ValueError(f"personal_assistant.{where} must be a tenant id of 1-64 letters, digits, '.', '_' or '-'")
+    return value
+
+
 def assistant_config(cfg: dict[str, Any]) -> dict[str, Any]:
     """Normalize the ``personal_assistant`` config section.
 
@@ -86,6 +95,9 @@ def assistant_config(cfg: dict[str, Any]) -> dict[str, Any]:
     notif = notif if isinstance(notif, dict) else {}
     collab_users = actions.get("collab_users")
     collab_users = collab_users if isinstance(collab_users, dict) else {}
+    tenancy = section.get("tenancy") if isinstance(section.get("tenancy"), dict) else {}
+    tenant_map = tenancy.get("principals") if isinstance(tenancy.get("principals"), dict) else {}
+    default_tenant = _tenant_id(tenancy.get("default_tenant", "default"), "tenancy.default_tenant")
     return {
         "enabled": bool(section.get("enabled", False)),
         "approval_ttl_seconds": int(section.get("approval_ttl_seconds", 3600)),
@@ -125,8 +137,17 @@ def assistant_config(cfg: dict[str, Any]) -> dict[str, Any]:
             # Empty means nobody: fleet data is never shown just because a caller authenticated.
             "allowed_principals": [str(p) for p in (fleet_ctx.get("allowed_principals") or [])],
         },
+        # Tenant of each authenticated principal. YAML only (no env var, no header, no body field): a principal that
+        # is not listed belongs to ``default_tenant``. A malformed tenant id stops startup rather than guessing.
+        "tenancy": {
+            "default_tenant": default_tenant,
+            "principals": {str(k): _tenant_id(v, f"tenancy.principals[{k}]") for k, v in tenant_map.items()},
+        },
         # Governance of assistant actions. All deny-by-default; YAML only.
         "actions": {
+            # run an approved action/proposal as soon as it is approved (the API does this; ``False`` leaves the
+            # explicit ``/execute`` call as the only trigger)
+            "auto_execute": bool(actions.get("auto_execute", True)),
             # sensitive actions: approver must differ from the requester unless the operator opts in
             "allow_self_approval": bool(actions.get("allow_self_approval", False)),
             # principals (other than the owner) who may list and decide approvals in their tenant
@@ -294,9 +315,21 @@ class AssistantAction:
     requested_by: str = ""
     dry_run: str = ""
     correlation: dict[str, Any] = field(default_factory=dict)
+    # Who the action belongs to, and the exact payload the request hash binds. The payload is kept ONLY for tools the
+    # executor can run after approval; it is never returned by ``as_dict`` (it is re-hashed before anything runs).
+    tenant_id: str = ""
+    user_id: str = ""
+    assistant_id: str = ""
+    request_payload: dict[str, Any] = field(default_factory=dict)
+    result: dict[str, Any] = field(default_factory=dict)       # bounded, redacted outcome of the execution
+    executed_by: str = ""
+    executed_at: datetime | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
+            "result": self.result or {},
+            "executed_by": self.executed_by,
+            "executed_at": self.executed_at.isoformat() if self.executed_at else None,
             "expires_at": self.expires_at.isoformat() if self.expires_at else None,
             "requested_by": self.requested_by,
             "dry_run": self.dry_run,
@@ -471,7 +504,7 @@ class DelegationRequest:
     artifact_refs: list[str] = field(default_factory=list)
     created_at: datetime = field(default_factory=_now)
     updated_at: datetime = field(default_factory=_now)
-    kind: str = "task"            # task | review
+    kind: str = "task"            # task | review | mission | branch
     pr_id: str = ""
     head: str = ""
     budget_seconds: int = 0
@@ -524,8 +557,9 @@ class AssistantMemory:
 
 @dataclass
 class AssistantProposal:
-    """A request the assistant surfaces for a person (or policy) to approve. It records intent only: approving it
-    is permission for an existing service to act, and nothing here starts work, writes code or merges."""
+    """A request the assistant surfaces for a person (or policy) to approve. Approving it is permission for an existing
+    service to act: ``execute_approved_proposal`` hands an approved proposal to the delegation path, once. Nothing
+    here writes code or merges."""
     proposal_id: str
     tenant_id: str
     user_id: str
@@ -544,9 +578,18 @@ class AssistantProposal:
     expires_at: datetime | None = None
     created_at: datetime = field(default_factory=_now)
     decided_at: datetime | None = None
+    # Execution of an APPROVED proposal: not_started | executing | executed | failed. Exactly one executor claims it.
+    execution: str = "not_started"
+    executed_by: str = ""
+    executed_at: datetime | None = None
+    result_ref: str = ""            # e.g. the delegation id the executor created
+    execution_error: str = ""
 
     def as_dict(self) -> dict[str, Any]:
         return {
+            "executed_by": self.executed_by, "result_ref": self.result_ref,
+            "executed_at": self.executed_at.isoformat() if self.executed_at else None,
+            "execution_error": self.execution_error,
             "proposal_id": self.proposal_id, "assistant_id": self.assistant_id, "kind": self.kind,
             "title": self.title, "payload": self.payload, "payload_sha256": self.payload_sha256,
             "status": self.status, "requested_by": self.requested_by, "decided_by": self.decided_by,
@@ -555,7 +598,7 @@ class AssistantProposal:
             "expires_at": self.expires_at.isoformat() if self.expires_at else None,
             "created_at": self.created_at.isoformat(),
             "decided_at": self.decided_at.isoformat() if self.decided_at else None,
-            "execution": "not_started",      # always: this record never starts work
+            "execution": self.execution,
         }
 
 
@@ -708,6 +751,12 @@ def tool_sensitive(tool_id: str) -> bool:
 
 # Tools whose every use needs an explicit approval: a grant may never carry ``preauthorized`` for them.
 NEVER_PREAUTHORIZED = frozenset({"send_message", "run_shell"})
+
+# Tools the post-approval executor can run. Everything else (send_message, run_shell, edit_shared) is NOT here: an
+# approval for those stays a record, and ``execute_approved_action`` refuses them (fail closed). ``draft_email`` only
+# ever saves a draft; nothing in this set sends.
+EXECUTABLE_AFTER_APPROVAL = frozenset({"request_review", "propose_branch", "request_mission", "comment_on_node",
+                                       "draft_email", "delegate", "connector_request"})
 
 
 def canonical_json(obj: Any) -> str:
@@ -1215,7 +1264,10 @@ class AssistantStore:
         self.proposals: dict[str, AssistantProposal] = {}
         self.notifications: dict[str, AssistantNotification] = {}
         self._rate: dict[str, list[int]] = {}  # key -> [minute_window, count]
-        self.audit: list[dict[str, Any]] = []
+        self._audit: list[dict[str, Any]] = []
+        # (entry) -> None. Wired by the control plane to the repo event store so every entry is durable BEFORE it is
+        # visible here; a failing sink raises and the caller's operation fails closed.
+        self.audit_sink: Callable[[dict[str, Any]], None] | None = None
         self._lock = threading.RLock()
 
     # -- durable snapshots (R1) ----------------------------------------------
@@ -1264,7 +1316,7 @@ class AssistantStore:
                 "proposals": [self._e_to_dict(x) for x in self.proposals.values()],
                 "notifications": [self._e_to_dict(x) for x in self.notifications.values()],
                 "routine_fired": sorted(self._routine_fired),
-                "audit": list(self.audit),
+                "audit": [dict(e) for e in self._audit],
             }
 
     def restore(self, snap: dict[str, Any]) -> None:
@@ -1297,7 +1349,7 @@ class AssistantStore:
                                   (self._e_from_dict(AssistantNotification, d)
                                    for d in snap.get("notifications", []))}
             self._routine_fired = set(snap.get("routine_fired", []))
-            self.audit = list(snap.get("audit", []))
+            self._audit = [dict(e) for e in snap.get("audit", [])]
 
     def persist(self) -> None:
         if not self._persist_path:
@@ -1319,10 +1371,23 @@ class AssistantStore:
                 self.restore(snap)
 
     # -- audit --------------------------------------------------------------
+    @property
+    def audit(self) -> list[dict[str, Any]]:
+        """A COPY of the audit log. There is no way to change an entry or drop one through this object: callers get
+        copies, ``audit_record`` only appends, and with a sink wired the entries live in the repo event store."""
+        with self._lock:
+            return [dict(e) for e in self._audit]
+
+    @staticmethod
+    def _audit_digest(entry: dict[str, Any]) -> str:
+        body = {k: v for k, v in entry.items() if k != "sha256"}
+        return hashlib.sha256(canonical_json(body).encode()).hexdigest()
+
     def audit_record(self, *, tenant_id: str, user_id: str, actor: str,
                      action: str, subject_id: str, detail: str = "") -> None:
         with self._lock:
-            self.audit.append({
+            tail = next((e for e in reversed(self._audit) if e.get("tenant_id") == tenant_id), None)
+            entry = {
                 "event_id": _new_id("evt"),
                 "timestamp": _now().isoformat(),
                 "tenant_id": tenant_id,
@@ -1331,8 +1396,38 @@ class AssistantStore:
                 "action": redact_secrets(action),
                 "subject_id": subject_id,
                 "detail": redact_secrets(detail),
-            })
+                # hash chain per tenant: a removed or edited entry breaks every digest after it
+                "seq": (int(tail.get("seq", 0)) + 1) if tail else 1,
+                "prev_sha256": tail.get("sha256", "") if tail else "",
+            }
+            entry["sha256"] = self._audit_digest(entry)
+            if self.audit_sink is not None:
+                self.audit_sink(dict(entry))            # durable first; raises -> nothing is appended
+            self._audit.append(entry)
             self._after_mutation()
+
+    def hydrate_audit(self, persisted: list[dict[str, Any]]) -> int:
+        """Merge entries read back from the durable event store (restart). Entries already known are not duplicated;
+        the log is re-ordered by (tenant, seq) so each tenant's chain reads in order. Returns how many were added."""
+        with self._lock:
+            known = {e.get("event_id") for e in self._audit}
+            added = [dict(e) for e in persisted if e.get("event_id") not in known]
+            self._audit.extend(added)
+            self._audit.sort(key=lambda e: (str(e.get("timestamp", "")), str(e.get("tenant_id", "")),
+                                            int(e.get("seq", 0))))
+            return len(added)
+
+    def verify_audit(self, tenant_id: str) -> bool:
+        """True when the tenant's chain is intact: contiguous seq, each prev matches, each digest recomputes."""
+        with self._lock:
+            prev, seq = "", 0
+            for e in (e for e in self._audit if e.get("tenant_id") == tenant_id and "seq" in e):
+                seq += 1
+                if (e.get("seq") != seq or e.get("prev_sha256", "") != prev
+                        or e.get("sha256") != self._audit_digest(e)):
+                    return False
+                prev = e["sha256"]
+            return True
 
     # -- assistants ----------------------------------------------------------
     def put_assistant(self, a: Assistant) -> None:
@@ -1650,6 +1745,28 @@ class AssistantService:
         self._shell_runner = None  # injected in tests; default uses subprocess
         self._transport = None  # injected in tests; default uses urllib
         self._approval_ttl = timedelta(seconds=self.config["approval_ttl_seconds"])
+
+    def tenant_for(self, principal_id: str | None) -> str:
+        """The tenant an authenticated principal belongs to, from YAML only. Unlisted principals share the default
+        tenant. Nothing the client sends (header, body, query) is consulted."""
+        t = self.config["tenancy"]
+        return t["principals"].get(principal_id or "", t["default_tenant"])
+
+    def attach_audit_log(self, record: Callable[[dict[str, Any]], None],
+                         read: Callable[[], list[dict[str, Any]]]) -> int:
+        """Make the audit log durable: ``record`` appends one entry to the repo event store (and raises if it cannot),
+        ``read`` returns what that store already holds. Entries from before a restart come back; returns how many."""
+        added = self.store.hydrate_audit(read())
+        self.store.audit_sink = record
+        return added
+
+    def audit_log(self, *, tenant_id: str, user_id: str, limit: int = 200) -> list[dict[str, Any]]:
+        """The caller's own audit entries (a configured approver sees the tenant's). Read only; copies."""
+        self._require_enabled()
+        see_all = self._is_approver(user_id)
+        rows = [e for e in self.store.audit if e.get("tenant_id") == tenant_id
+                and (see_all or e.get("user_id") == user_id)]
+        return rows[-max(1, min(int(limit), 1000)):]
 
     def fleet_allowed(self, user_id: str) -> bool:
         """Fleet data is shown only to principals the operator names (or ``*``). Authenticating is not enough."""
@@ -2016,6 +2133,9 @@ class AssistantService:
             expires_at=self.now() + self._action_ttl(), requested_by=actor,
             dry_run=describe_action(tool_id, scope, request_payload))
         action.correlation = self._correlation(run_id, assistant_id, action.action_id)
+        action.tenant_id, action.user_id, action.assistant_id = tenant_id, user_id, assistant_id
+        if tool_id in EXECUTABLE_AFTER_APPROVAL and isinstance(request_payload, dict):
+            action.request_payload = json.loads(canonical_json(request_payload))
         if grant is None:
             action.status = "denied"
             self.store.put_action(action)
@@ -2118,6 +2238,239 @@ class AssistantService:
                                 action="assistant.approval." + decision,
                                 subject_id=approval_id)
         return approval
+
+    # -- executing what was approved ---------------------------------------------------------------------------
+    def _action_owner(self, action: AssistantAction) -> tuple[str, str, str] | None:
+        if action.tenant_id and action.user_id:
+            return action.tenant_id, action.user_id, action.assistant_id
+        appr = self.store.approvals.get(action.approval_id) if action.approval_id else None
+        if appr is not None:
+            return appr.tenant_id, appr.user_id, appr.assistant_id
+        run = self.store.runs.get(action.run_id)
+        return (run.tenant_id, run.user_id, run.assistant_id) if run is not None else None
+
+    @staticmethod
+    def _result_summary(out: dict[str, Any]) -> dict[str, Any]:
+        """What the dashboard may show of an execution: ids and a short redacted line, never a raw payload."""
+        res: dict[str, Any] = {"ok": bool(out.get("ok", True))}
+        for key in ("delegation", "proposal"):
+            if isinstance(out.get(key), dict):
+                res[f"{key}_id"] = out[key].get(f"{key}_id")
+                res["note"] = str(out[key].get("note") or "")[:300]
+        for key in ("comment_id", "artifact_id", "version_id", "sent"):
+            if key in out:
+                res[key] = out[key]
+        if "status" in out and "sent" not in res:
+            res["http_status"] = out.get("status")
+        lineage = out.get("lineage")
+        if isinstance(lineage, dict):
+            res["lineage_node"] = lineage.get("node")
+            if lineage.get("error"):
+                res["lineage_error"] = redact_secrets(str(lineage["error"]))[:200]
+        res["summary"] = (redact_secrets(canonical_json({k: v for k, v in out.items() if k != "lineage"})) or "")[:600]
+        return res
+
+    def execute_approved_action(self, action_id: str, *, tenant_id: str, user_id: str,
+                                actor: str) -> AssistantAction:
+        """Run an approved tool action through the EXISTING subsystem for that tool (the re-review ledger, the
+        delegation record, collab comments, the draft artifact registry, the connector adapter), exactly once.
+
+        Fails closed: the action must belong to the caller's tenant, be authorized/approved and unexpired; a
+        sensitive action needs an approved, unexpired approval whose action, tenant, user and assistant match; the
+        grant must still be active; and the recorded payload must still hash to what was approved. The action is
+        claimed atomically, so a replay or a concurrent call never repeats the side effect: a completed action is
+        returned as recorded. A failed action is not retried under the same key. Nothing here sends a message."""
+        self._require_enabled()
+        action = self.store.actions.get(action_id)
+        owner = self._action_owner(action) if action is not None else None
+        if (action is None or owner is None or owner[0] != tenant_id
+                or not (owner[1] == user_id or self._is_approver(user_id))):
+            raise AssistantNotFound("action not found")
+        o_tenant, o_user, o_assistant = owner
+
+        def refuse(kind: str, message: str, exc: type[AssistantError] = AssistantForbidden):
+            self.store.audit_record(tenant_id=o_tenant, user_id=o_user, actor=actor,
+                                    action="assistant.action.refused", subject_id=action.action_id,
+                                    detail=f"{action.tool_id}: {message}")
+            raise exc(message)
+
+        if action.status == "completed":
+            return action                                  # a replay returns the recorded outcome, runs nothing
+        if action.status == "executing":
+            raise AssistantError("this action is already running")
+        if action.status == "failed":
+            raise AssistantError("this action failed earlier and is not retried under the same key")
+        if action.status not in ("authorized", "approved"):
+            refuse("status", f"the action is {action.status}; it has not been approved", AssistantError)
+        if action.tool_id not in EXECUTABLE_AFTER_APPROVAL:
+            refuse("tool", f"{action.tool_id} has no post-approval executor; the approval is a record only")
+        if not self.action_executable(action):
+            action.status = "expired"
+            self.store.put_action(action)
+            refuse("expired", "the action expired; request it again", AssistantError)
+        if action.approval_id:
+            approval = self.store.approvals.get(action.approval_id)
+            if (approval is None or approval.action_id != action.action_id or approval.tenant_id != o_tenant
+                    or approval.user_id != o_user or approval.assistant_id != o_assistant
+                    or approval.decision != "approved" or approval.expires_at <= self.now()):
+                refuse("approval", "no valid approval for this action (missing, mismatched, undecided or expired)")
+        elif tool_sensitive(action.tool_id) and action.evidence_ref != "grant":
+            refuse("approval", "this sensitive action has no approval")
+        if self._active_grant(assistant_id=o_assistant, tool_id=action.tool_id, scope=action.scope,
+                              tenant_id=o_tenant, user_id=o_user) is None:
+            action.status = "denied"
+            self.store.put_action(action)
+            refuse("grant", "the grant was revoked or expired")
+        payload = action.request_payload
+        if not payload:
+            raise AssistantError("the request payload was not recorded; request the action again")
+        if request_digest(tenant_id=o_tenant, user_id=o_user, assistant_id=o_assistant, tool_id=action.tool_id,
+                          scope=action.scope, payload=payload) != action.request_hash:
+            self.fail_action(action)
+            refuse("hash", "the recorded payload no longer matches what was approved")
+        if not self.claim_action(action):
+            raise AssistantError("this action is not executable (it was claimed by another caller)")
+        try:
+            out = self.execute_tool(tenant_id=o_tenant, user_id=o_user, assistant_id=o_assistant,
+                                    tool_id=action.tool_id, payload=dict(payload), actor=actor, action=action)
+        except Exception as exc:  # noqa: BLE001 - recorded on the action; never retried under this key
+            action.result = {"ok": False, "error": (redact_secrets(f"{type(exc).__name__}: {exc}") or "")[:300]}
+            action.executed_by, action.executed_at = actor, self.now()
+            self.fail_action(action)
+            self.store.audit_record(tenant_id=o_tenant, user_id=o_user, actor=actor,
+                                    action="assistant.action.failed", subject_id=action.action_id,
+                                    detail=f"{action.tool_id}: {action.result['error']}")
+            return action
+        action.result = self._result_summary(out if isinstance(out, dict) else {})
+        action.executed_by, action.executed_at = actor, self.now()
+        self.complete_action(action)
+        self.store.audit_record(tenant_id=o_tenant, user_id=o_user, actor=actor,
+                                action="assistant.action.executed", subject_id=action.action_id,
+                                detail=f"{action.tool_id} {action.scope} approval={action.approval_id or 'grant'}")
+        return action
+
+    def approval_view(self, approval: AssistantApproval) -> dict[str, Any]:
+        """An approval plus the state of its action, for the dashboard. Adds no payload."""
+        out = approval.as_dict()
+        action = self.store.actions.get(approval.action_id)
+        if action is not None:
+            out.update({"tool_id": action.tool_id, "scope": action.scope, "action_status": action.status,
+                        "result": action.result or {},
+                        "executable": action.tool_id in EXECUTABLE_AFTER_APPROVAL})
+        return out
+
+    def execute_approved_proposal(self, proposal_id: str, *, tenant_id: str, user_id: str,
+                                  actor: str) -> AssistantProposal:
+        """Hand an APPROVED ``propose_branch`` / ``request_mission`` proposal to the existing delegation path (a
+        queued ``DelegationRequest`` of kind ``branch`` or ``mission`` that the runtime adapter fulfils), once.
+        Nothing here writes code, opens a PR or merges. Fails closed: the proposal must be in the caller's tenant,
+        approved (by someone other than the requester unless YAML allows), unexpired, and its payload must still hash
+        to what was approved. Exactly one caller claims it; a replay returns the recorded result."""
+        self._require_enabled()
+        x = self.store.proposals.get(proposal_id)
+        if x is None or x.tenant_id != tenant_id or not (x.user_id == user_id or self._is_approver(user_id)):
+            raise AssistantNotFound("proposal not found")
+
+        def refuse(message: str, exc: type[AssistantError] = AssistantForbidden):
+            self.store.audit_record(tenant_id=x.tenant_id, user_id=x.user_id, actor=actor,
+                                    action="assistant.proposal.execute_refused", subject_id=proposal_id,
+                                    detail=message)
+            raise exc(message)
+
+        if x.execution == "executed":
+            return x
+        if x.execution in ("executing", "failed"):
+            raise AssistantError(f"this proposal is {x.execution}" + ("; it is not retried" if x.execution == "failed" else ""))
+        if x.kind not in ("propose_branch", "request_mission"):
+            refuse(f"{x.kind} proposals are not executed here")
+        if x.status != "approved" or not x.decided_by:
+            refuse(f"the proposal is {x.status}; it has not been approved", AssistantError)
+        if x.expires_at is None or x.expires_at <= self.now():
+            refuse("the proposal expired; ask again", AssistantError)
+        if hashlib.sha256(canonical_json([x.kind, x.payload]).encode()).hexdigest() != x.payload_sha256:
+            with self.store._lock:
+                x.execution, x.execution_error = "failed", "payload changed after approval"
+            self.store.put_proposal(x)
+            refuse("the payload changed after approval")
+        with self.store._lock:                                  # claim: exactly one caller proceeds
+            if x.execution != "not_started":
+                raise AssistantError(f"this proposal is {x.execution}")
+            x.execution = "executing"
+        self.store.put_proposal(x)
+        try:
+            p = x.payload
+            if x.kind == "propose_branch":
+                task = (f"Create feature branch for: {p.get('title', '')} in {p.get('repo', '')}"
+                        + (f" (base {p['base']})" if p.get("base") else "")
+                        + (f". Rationale: {p['rationale']}" if p.get("rationale") else ""))
+                target, kind = "pi", "branch"
+            else:
+                task, target, kind = p.get("task", ""), p.get("target_system") or "pi", "mission"
+            d = self.delegate(tenant_id=x.tenant_id, user_id=x.user_id, assistant_id=x.assistant_id,
+                              task=task[:4000], target_system=target, actor=actor)
+            d.kind = kind
+            d.note = f"from proposal {x.proposal_id}, approved by {x.decided_by}"
+            d.correlation = {**(x.correlation or {}), "proposal_id": x.proposal_id}
+            self.store.put_delegation(d)
+        except Exception as exc:  # noqa: BLE001 - recorded; not retried automatically
+            x.execution = "failed"
+            x.execution_error = (redact_secrets(f"{type(exc).__name__}: {exc}") or "")[:300]
+            x.executed_by, x.executed_at = actor, self.now()
+            self.store.put_proposal(x)
+            self.store.audit_record(tenant_id=x.tenant_id, user_id=x.user_id, actor=actor,
+                                    action="assistant.proposal.execution_failed", subject_id=proposal_id,
+                                    detail=x.execution_error)
+            return x
+        x.execution, x.result_ref = "executed", d.delegation_id
+        x.executed_by, x.executed_at = actor, self.now()
+        self.store.put_proposal(x)
+        self.store.audit_record(tenant_id=x.tenant_id, user_id=x.user_id, actor=actor,
+                                action="assistant.proposal.executed", subject_id=proposal_id,
+                                detail=f"{x.kind} -> delegation {d.delegation_id}")
+        corr = {**(x.correlation or {}), "action_id": f"exec.{x.proposal_id}", "tool_id": x.kind,
+                "proposal_id": x.proposal_id, "delegation_id": d.delegation_id}
+        corr.pop("approval_id", None)
+        self._emit_lineage(x.user_id, corr)
+        try:
+            self.notify(tenant_id=x.tenant_id, user_id=x.user_id, key=f"proposal-executed:{x.proposal_id}",
+                        priority="normal", text=f"Approved {x.kind.replace('_', ' ')} handed off: {x.title}"[:300],
+                        link="#/assistant")
+        except Exception:  # noqa: BLE001 - a notification is never a reason to fail the hand-off
+            pass
+        return x
+
+    def preview_proposal(self, proposal_id: str, *, tenant_id: str, user_id: str) -> dict[str, Any]:
+        """What executing this proposal WOULD do. No side effect, no state change."""
+        self._require_enabled()
+        x = self.store.proposals.get(proposal_id)
+        if x is None or x.tenant_id != tenant_id or not (x.user_id == user_id or self._is_approver(user_id)):
+            raise AssistantNotFound("proposal not found")
+        p = x.payload
+        what = (f"Queue a branch-creation request for {p.get('repo', '')} titled '{p.get('title', '')}' with the "
+                "delegation runtime" if x.kind == "propose_branch" else
+                f"Queue a mission for {p.get('target_system') or 'pi'}: {str(p.get('task', ''))[:300]}")
+        return {"dry_run": True, "proposal_id": x.proposal_id, "kind": x.kind, "status": x.status,
+                "execution": x.execution, "description": (redact_secrets(what) or "")[:600] +
+                ". Writes no code and merges nothing.",
+                "payload_intact": hashlib.sha256(canonical_json([x.kind, x.payload]).encode()).hexdigest() == x.payload_sha256,
+                "needs_distinct_approver": not self.config["actions"]["allow_self_approval"]}
+
+    def open_tool_run(self, *, tenant_id: str, user_id: str, assistant_id: str, purpose: str) -> AssistantRun:
+        """A bookkeeping run for an action a person starts from the dashboard (no model call, no message). One per
+        (user, assistant, purpose), so the gate has a run to bind idempotency and audit to."""
+        self._require_enabled()
+        self.store.get_assistant(assistant_id, tenant_id=tenant_id, user_id=user_id)
+        initiator = f"dashboard:{purpose}"
+        for r in self.store.runs.values():
+            if (r.tenant_id == tenant_id and r.user_id == user_id and r.assistant_id == assistant_id
+                    and r.initiator == initiator):
+                return r
+        run = AssistantRun(run_id=_new_id("run"), thread_id="", assistant_id=assistant_id, tenant_id=tenant_id,
+                           user_id=user_id, task_id=_new_id("task"), state="completed", initiator=initiator)
+        self.store.put_run(run)
+        self.store.audit_record(tenant_id=tenant_id, user_id=user_id, actor=user_id,
+                               action="assistant.run.opened", subject_id=run.run_id, detail=purpose)
+        return run
 
     # -- memory ------------------------------------------------------------------
     def store_memory(self, *, tenant_id: str, user_id: str, assistant_id: str,
