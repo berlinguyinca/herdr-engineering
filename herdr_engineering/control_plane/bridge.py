@@ -94,13 +94,18 @@ class PostgresSource(DurableSource):
             import asyncpg
             self._conn = await asyncpg.connect(self._dsn)
         conn = self._conn
+        # Do not replay the unbounded event log during web startup. The log is
+        # durable history, while the web projection is reconstructed from the
+        # current entity tables and receives new events through live ingest.
+        # Replaying millions of wide JSON rows blocks the listener and can use
+        # many gigabytes before the first health response.
+        events = []
         return {
             "missions": [dict(r) for r in await conn.fetch("SELECT * FROM missions")],
             "sessions": [dict(r) for r in await conn.fetch("SELECT * FROM sessions")],
             "services": [dict(r) for r in await conn.fetch("SELECT * FROM services")],
             "hosts": [dict(r) for r in await conn.fetch("SELECT * FROM hosts")],
-            "events": [dict(r) for r in await conn.fetch(
-                f"SELECT * FROM {self._events_table} ORDER BY ingest_timestamp, sequence")],
+            "events": events,
         }
 
     def missions(self) -> list[dict]:
@@ -185,6 +190,11 @@ def _reconstruct_from_events(streams: dict) -> tuple[dict, dict, dict, dict, dic
         p = _ev_payload(ev)
         etype = ev.get("event_type") or ""
         if et == "host":
+            if etype == "HostPolicyChanged":
+                host = hosts.setdefault(eid, {"host_id": eid, "host_name": eid,
+                                             "status": "unknown"})
+                host["scheduler_policy"] = dict(p)
+                continue
             h = hosts.setdefault(eid, {
                 "host_id": eid, "host_name": None, "tailnet_ip": None,
                 "cpu": None, "mem": None, "status": "healthy",

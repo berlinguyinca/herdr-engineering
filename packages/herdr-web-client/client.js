@@ -14,14 +14,16 @@ export class ApiError extends Error {
 }
 
 export class HerdrClient {
-  constructor(baseUrl = '', { fetchImpl = fetch } = {}) {
+  constructor(baseUrl = '', { fetchImpl = fetch, headers = {} } = {}) {
     this.base = baseUrl.replace(/\/+$/, '');
     this.fetch = fetchImpl;
+    this.headers = { ...headers };
   }
 
   async request(path, { method = 'GET', body, signal } = {}) {
+    const startedAt = Date.now();
     const url = `${this.base}${path}`;
-    const headers = { Accept: 'application/json' };
+    const headers = { ...this.headers, Accept: 'application/json' };
     let payload;
     if (body !== undefined) {
       headers['Content-Type'] = 'application/json';
@@ -40,8 +42,17 @@ export class HerdrClient {
       json = { raw: text };
     }
     if (!res.ok) {
-      throw new ApiError(res.status, json,
+      const error = new ApiError(res.status, json,
         (json && json.error) || `HTTP ${res.status}`);
+      error.requestId = res.headers?.get?.('X-Request-ID') || '';
+      error.elapsedMs = Date.now() - startedAt;
+      throw error;
+    }
+    if (json && typeof json === 'object' && !Array.isArray(json)) {
+      Object.defineProperty(json, '_requestMeta', {value: {
+        requestId: res.headers?.get?.('X-Request-ID') || '',
+        elapsedMs: Date.now() - startedAt,
+      }, enumerable: false});
     }
     return json;
   }
@@ -81,6 +92,15 @@ export class HerdrClient {
     return this.request('/api/v1/mission-activity', { signal });
   }
 
+  getHandoffTree({ signal } = {}) {
+    return this.request('/api/v1/handoffs/tree', { signal });
+  }
+
+  listHandoffs(state, { signal } = {}) {
+    const query = state ? `?state=${encodeURIComponent(state)}` : '';
+    return this.request(`/api/v1/handoffs${query}`, { signal });
+  }
+
   missionActivity(id, { signal } = {}) {
     return this.request(`/api/v1/missions/${encodeURIComponent(id)}/activity`, { signal });
   }
@@ -104,8 +124,141 @@ export class HerdrClient {
     return this.request('/api/v1/services', { signal });
   }
 
+  listArtifacts({ q, type, status, offset, limit, signal } = {}) {
+    const query = new URLSearchParams();
+    for (const [key, value] of Object.entries({ q, type, status, offset, limit })) {
+      if (value != null && value !== '') query.set(key, String(value));
+    }
+    return this.request(`/api/v1/artifacts${query.size ? `?${query}` : ''}`, { signal });
+  }
+
+  getArtifact(id, { signal } = {}) {
+    return this.request(`/api/v1/artifacts/${encodeURIComponent(id)}`, { signal });
+  }
+
+  artifactDownloadUrl(id) {
+    return `${this.base}/api/v1/artifacts/${encodeURIComponent(id)}/download`;
+  }
+
+  artifactVersions(id, { signal, summary = false } = {}) {
+    return this.request(`/api/v1/artifacts/${encodeURIComponent(id)}/versions${summary ? '?summary=true' : ''}`, { signal });
+  }
+
+  artifactVersion(id, versionId, { signal } = {}) {
+    return this.request(`/api/v1/artifacts/${encodeURIComponent(id)}/versions/${encodeURIComponent(versionId)}`, { signal });
+  }
+
+  artifactReviews(id, { signal } = {}) {
+    return this.request(`/api/v1/artifacts/${encodeURIComponent(id)}/reviews`, { signal });
+  }
+
+  requestArtifactReview(artifactId, versionId, { signal } = {}) {
+    return this.request('/api/v1/artifact-reviews', {
+      method: 'POST', body: { artifact_id: artifactId, version_id: versionId }, signal,
+    });
+  }
+
+  completeArtifactReview(reviewId, decision, comments = [], { signal } = {}) {
+    return this.request(`/api/v1/artifact-reviews/${encodeURIComponent(reviewId)}/complete`, {
+      method: 'POST', body: { decision, comments }, signal,
+    });
+  }
+
+  artifactReport(id, versionId, { signal } = {}) {
+    return this.request(`${this.artifactReportPath(id, versionId)}/report`, { signal });
+  }
+
+  artifactReportPath(id, versionId) {
+    return `/api/v1/artifacts/${encodeURIComponent(id)}/versions/${encodeURIComponent(versionId)}`;
+  }
+
+  artifactReportDiff(id, versionId, baseVersionId, { signal } = {}) {
+    return this.request(`${this.artifactReportPath(id, versionId)}/diff?base_version_id=${encodeURIComponent(baseVersionId)}`, { signal });
+  }
+
+  artifactReportFeedback(id, versionId, { signal, limit, offset } = {}) {
+    const query = new URLSearchParams();
+    if (limit != null) query.set('limit', String(limit));
+    if (offset != null) query.set('offset', String(offset));
+    return this.request(`${this.artifactReportPath(id, versionId)}/feedback${query.size ? `?${query}` : ''}`, { signal });
+  }
+
+  addArtifactReportFeedback(id, versionId, body, { signal } = {}) {
+    return this.request(`${this.artifactReportPath(id, versionId)}/feedback`, { method: 'POST', body, signal });
+  }
+
+  recordArtifactReportCheck(id, versionId, body, { signal } = {}) {
+    return this.request(`${this.artifactReportPath(id, versionId)}/checks`, { method: 'POST', body, signal });
+  }
+
+  artifactReportAssetUrl(id, versionId, assetId) {
+    return `${this.base}${this.artifactReportPath(id, versionId)}/assets/${encodeURIComponent(assetId)}`;
+  }
+
+  artifactReportPreview(id, versionId, { signal } = {}) {
+    return this.artifactReportContent(`${this.artifactReportPath(id, versionId)}/preview`, 'text', signal);
+  }
+
+  downloadArtifactReportAsset(id, versionId, assetId, { signal } = {}) {
+    return this.artifactReportContent(`${this.artifactReportPath(id, versionId)}/assets/${encodeURIComponent(assetId)}`, 'blob', signal);
+  }
+
+  async artifactReportContent(path, kind, signal) {
+    const doFetch = this.fetch;
+    const response = await doFetch(`${this.base}${path}`, {
+      headers: { ...this.headers, Accept: kind === 'text' ? 'text/html' : 'application/octet-stream' }, signal,
+    });
+    if (!response.ok) {
+      const text = await response.text();
+      let body;
+      try { body = JSON.parse(text); } catch { body = { raw: text }; }
+      const error = new ApiError(response.status, body, body?.error || `HTTP ${response.status}`);
+      error.requestId = response.headers?.get?.('X-Request-ID') || '';
+      throw error;
+    }
+    return kind === 'text' ? response.text() : response.blob();
+  }
+
+  listPublications({ signal } = {}) {
+    return this.request('/api/v1/publications', { signal });
+  }
+
+  approvePublication(id, { signal } = {}) {
+    return this.request(`/api/v1/publications/${encodeURIComponent(id)}/approve`, {
+      method: 'POST', body: {}, signal,
+    });
+  }
+
+  revokePublication(id, { signal } = {}) {
+    return this.request(`/api/v1/publications/${encodeURIComponent(id)}/revoke`, {
+      method: 'POST', body: {}, signal,
+    });
+  }
+
   listHosts({ signal } = {}) {
     return this.request('/api/v1/hosts', { signal });
+  }
+
+  schedulerOverview({ signal } = {}) {
+    return this.request('/api/v1/scheduler', { signal });
+  }
+
+  schedulerPlan(request, { signal } = {}) {
+    return this.request('/api/v1/scheduler/plan', { method: 'POST', body: request, signal });
+  }
+
+  setSchedulerHostPolicy(policy) {
+    return this.request('/api/v1/scheduler/host-policy', {method: 'POST', body: policy});
+  }
+
+  retrySchedulerReservation(reservationId) {
+    return this.request('/api/v1/scheduler/reservations/retry', {
+      method:'POST', body:{reservation_id:reservationId},
+    });
+  }
+
+  previewSchedulerSimulation(body) {
+    return this.request('/api/v1/scheduler/simulator', {method:'POST', body});
   }
 
   // -- activity / analytics ------------------------------------------------

@@ -5,6 +5,7 @@ import { missionEntries } from './mission-catalog-view.js';
 import { recordOutcome, recordVisibility, reportFreshness } from './record-state.js';
 import { serviceState, serviceScope } from './services-view.js';
 import { integrationEntries } from './integrations-view.js';
+import { classifyDashboardError, dashboardErrorMessage } from './dashboard-load-state.js';
 
 const records = value => Array.isArray(value) ? value.filter(v => v && typeof v === 'object' && !Array.isArray(v)) : [];
 const text = value => typeof value === 'string' ? value : '';
@@ -68,8 +69,8 @@ function availability(keys, states) {
   return keys.map(key => {
     const state = states[key];
     const label = {projections:'Live mission reports',missions:'Recorded missions',sessions:'Sessions',services:'Services',hosts:'Hosts',activity:'Recent activity',health:'Control plane',ci:'CI',reviews:'Reviews'}[key];
-    if (state?.error) return `<p class="ov-warning" role="status">${esc(label)}: Could not refresh.${state.loaded ? ' Showing last received records.' : ' Data is unavailable; retrying automatically.'}</p>`;
-    if (!state?.loaded) return `<p class="ov-note" role="status">Loading ${esc(label.toLowerCase())}…</p>`;
+    if (state?.error) return `<p class="ov-warning" role="status"><strong>${esc(dashboardErrorMessage(label, state.error))}</strong> Could not refresh. ${state.loaded ? 'Showing last received records.' : 'Retrying automatically.'} <button type="button" class="ov-retry" data-overview-retry="${esc(key)}">Retry now</button>${state.error.requestId ? ` <small>Request ${esc(state.error.requestId)}</small>` : ''}</p>`;
+    if (!state?.loaded) return `<div class="ov-loading" role="status" aria-live="polite"><span>Loading ${esc(label.toLowerCase())}…</span><progress aria-label="Loading ${esc(label.toLowerCase())}"></progress>${state?.startedAt ? `<small>Elapsed ${esc(formatDuration(Math.max(0, Date.now() - state.startedAt)))}</small>` : ''}</div>`;
     return '';
   }).join('');
 }
@@ -155,7 +156,7 @@ export function renderOverviewSection(section, data = {}, states = {}, received 
 }
 
 const styles = `<style>
-.ov-sub{font-size:13px;margin:14px 0 0}.ov-snooze{font:inherit;font-size:11px;margin-top:6px;padding:2px 8px;border:1px solid var(--border);border-radius:var(--radius-sm);background:var(--surface);color:var(--text-secondary);cursor:pointer}.ov-intro,.ov-note{color:var(--text-secondary);font-size:13px;line-height:1.6}.ov-intro{max-width:75ch;margin:0 0 18px}.ov-layout{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.ov-panel{min-width:0;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:18px;overflow-wrap:anywhere}.ov-panel[data-overview=missions],.ov-panel[data-overview=fleet]{grid-column:1/-1}.ov-heading{display:flex;justify-content:space-between;align-items:baseline;gap:12px;margin-bottom:14px}.ov-heading h2{font-size:17px;margin:0}.ov-heading>a{font-size:12px;white-space:nowrap}.ov-metrics{display:flex;flex-wrap:wrap;gap:12px;margin:12px 0}.ov-metric{display:flex;flex-direction:column;gap:4px;padding:10px 13px;background:var(--bg);border:1px solid var(--border-subtle);border-radius:var(--radius-sm);font-size:12px;color:var(--text);text-decoration:none}.ov-metric strong{font-size:25px;line-height:1.2}.ov-list{list-style:none;padding:0;margin:0}.ov-row{display:flex;justify-content:space-between;align-items:start;gap:16px;padding:11px 0;border-top:1px solid var(--border-subtle);font-size:13px;line-height:1.5}.ov-row>div{min-width:0;flex:1}.ov-row>div>a{font-weight:600;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}.ov-row p{margin:4px 0 0;color:var(--text-secondary);font-size:12px;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}.ov-tag{font-size:12px;color:var(--text-secondary);max-width:45%;text-align:right}.ov-alert,.ov-warning{color:var(--status-attention)}.ov-warning{font-size:12px;line-height:1.6}.ov-history{display:flex;flex-wrap:wrap;gap:16px;border-top:1px solid var(--border-subtle);padding-top:12px;margin-top:12px;font-size:12px}.ov-health{display:flex;flex-wrap:wrap;gap:16px;color:var(--text-secondary);font-size:12px;margin:18px 0}.ov-health p{margin:0}
+.ov-sub{font-size:13px;margin:14px 0 0}.ov-snooze,.ov-retry{font:inherit;font-size:11px;margin-top:6px;padding:2px 8px;border:1px solid var(--border);border-radius:var(--radius-sm);background:var(--surface);color:var(--text-secondary);cursor:pointer}.ov-intro,.ov-note{color:var(--text-secondary);font-size:13px;line-height:1.6}.ov-intro{max-width:75ch;margin:0 0 18px}.ov-layout{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.ov-panel{min-width:0;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:18px;overflow-wrap:anywhere}.ov-panel[data-overview=missions],.ov-panel[data-overview=fleet]{grid-column:1/-1}.ov-heading{display:flex;justify-content:space-between;align-items:baseline;gap:12px;margin-bottom:14px}.ov-heading h2{font-size:17px;margin:0}.ov-heading>a{font-size:12px;white-space:nowrap}.ov-metrics{display:flex;flex-wrap:wrap;gap:12px;margin:12px 0}.ov-metric{display:flex;flex-direction:column;gap:4px;padding:10px 13px;background:var(--bg);border:1px solid var(--border-subtle);border-radius:var(--radius-sm);font-size:12px;color:var(--text);text-decoration:none}.ov-metric strong{font-size:25px;line-height:1.2}.ov-list{list-style:none;padding:0;margin:0}.ov-row{display:flex;justify-content:space-between;align-items:start;gap:16px;padding:11px 0;border-top:1px solid var(--border-subtle);font-size:13px;line-height:1.5}.ov-row>div{min-width:0;flex:1}.ov-row>div>a{font-weight:600;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}.ov-row p{margin:4px 0 0;color:var(--text-secondary);font-size:12px;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}.ov-tag{font-size:12px;color:var(--text-secondary);max-width:45%;text-align:right}.ov-alert,.ov-warning{color:var(--status-attention)}.ov-warning{font-size:12px;line-height:1.6}.ov-loading{display:flex;flex-direction:column;gap:7px;color:var(--text-secondary);font-size:12px}.ov-loading progress{width:100%;height:7px;accent-color:var(--accent)}.ov-loading small,.ov-warning small{color:var(--text-secondary)}.ov-history{display:flex;flex-wrap:wrap;gap:16px;border-top:1px solid var(--border-subtle);padding-top:12px;margin-top:12px;font-size:12px}.ov-health{display:flex;flex-wrap:wrap;gap:16px;color:var(--text-secondary);font-size:12px;margin:18px 0}.ov-health p{margin:0}
 @media(max-width:750px){.ov-layout{grid-template-columns:minmax(0,1fr)}.ov-panel{padding:14px}.ov-row{gap:10px}.ov-tag{max-width:42%}.ov-metric{padding:9px}.ov-metrics{gap:8px}.ov-heading{gap:8px}}
 </style>`;
 
@@ -173,8 +174,8 @@ function saveSnoozed(map) {
 }
 
 export function mountOverview(container, client) {
-  let disposed=false, clock=null, received=Date.now();
-  const data={snoozed:loadSnoozed()}, states={}, controllers=new Map(), timers=new Map(), signatures=new Map();
+  let disposed=false, clock=null, received=Date.now(), activeLoads=0;
+  const data={snoozed:loadSnoozed()}, states={}, controllers=new Map(), timers=new Map(), signatures=new Map(), queued=new Set();
   const panels=['missions','fleet','sessions','ci','reviews','services','hosts','activity','health'];
   const sources={
     projections:signal=>client.listMissionActivity({signal}),
@@ -201,6 +202,7 @@ export function mountOverview(container, client) {
       const focused=document.activeElement;
       const href=element.contains(focused) ? focused.closest('a')?.getAttribute('href') : null;
       element.innerHTML=html;
+      element.toggleAttribute('aria-busy', Boolean(states[panel]?.startedAt && !states[panel]?.loaded));
       if(href)[...element.querySelectorAll('a')].find(a=>a.getAttribute('href')===href)?.focus({preventScroll:true});
     }
     tickClocks();
@@ -213,6 +215,9 @@ export function mountOverview(container, client) {
     if(disposed || document.hidden || controllers.has(key))return;
     clearTimeout(timers.get(key));
     const controller=new AbortController();controllers.set(key,controller);
+    const startedAt=Date.now();
+    states[key]={...states[key],startedAt,error:false};
+    draw();
     let timedOut=false;
     const timeout=setTimeout(()=>{timedOut=true;controller.abort();},15000);
     try {
@@ -223,24 +228,41 @@ export function mountOverview(container, client) {
       if (objectSource ? !response || (key==='health' ? typeof response.status!=='string' : key==='ci' ? typeof response.available!=='boolean' : key==='fleet' ? !Array.isArray(response.components) : !Array.isArray(response.reviews)) : !Array.isArray(response?.[field])) throw new Error('Invalid response');
       data[key==='activity' ? 'events' : key]=objectSource ? response : records(response?.[field]);
       if(key==='projections')received=Date.now();
-      states[key]={loaded:true,error:false};
+      states[key]={loaded:true,error:false,startedAt:0};
       draw();
-    } catch {
-      if(!disposed && (!controller.signal.aborted || timedOut)){states[key]={...states[key],error:true};draw();}
+    } catch (error) {
+      if(!disposed && (!controller.signal.aborted || timedOut)){
+        if(timedOut) error=Object.assign(new Error('Request timed out'),{name:'TimeoutError',dashboardTimeout:true});
+        const detail=classifyDashboardError(error,Date.now()-startedAt);
+        detail.requestId=error?.requestId || error?.request_id;
+        states[key]={...states[key],error:detail,startedAt:0};draw();
+      }
     } finally {
       clearTimeout(timeout);controllers.delete(key);
-      if(!disposed && !document.hidden)timers.set(key,setTimeout(()=>poll(key),5000));
+      if(states[key]?.startedAt) states[key]={...states[key],startedAt:0};
+      if(!disposed && !document.hidden)timers.set(key,setTimeout(()=>schedule(key),5000));
     }
   }
-  function refresh() {for(const key of Object.keys(sources))poll(key);}
+  function pump() {
+    while(!disposed && !document.hidden && activeLoads<4 && queued.size) {
+      const key=queued.values().next().value;queued.delete(key);activeLoads++;
+      poll(key).finally(()=>{activeLoads--;pump();});
+    }
+  }
+  function schedule(key) {
+    if(disposed || document.hidden || controllers.has(key))return;
+    clearTimeout(timers.get(key));timers.delete(key);queued.add(key);pump();
+  }
+  function refresh() {for(const key of Object.keys(sources))schedule(key);}
   function visibility() {
     clearInterval(clock);for(const timer of timers.values())clearTimeout(timer);timers.clear();
-    if(document.hidden){for(const controller of controllers.values())controller.abort();return;}
+    if(document.hidden){queued.clear();for(const controller of controllers.values())controller.abort();return;}
     draw();refresh();clock=setInterval(draw,1000);
   }
   container.addEventListener('click',event=>{
     const button=event.target.closest?.('.ov-snooze');
     if(!button)return;
+    if(button.hasAttribute('data-overview-retry')) { schedule(button.dataset.overviewRetry); return; }
     if(button.hasAttribute('data-snooze'))data.snoozed.set(button.dataset.snooze,Date.now()+SNOOZE_MS);
     else data.snoozed.clear();
     saveSnoozed(data.snoozed);signatures.delete('missions');draw();

@@ -17,8 +17,10 @@ import hashlib
 import json
 import threading
 import time
+from contextlib import contextmanager
 from uuid import uuid4
 
+from ..host_policy import HostPolicy, HostSnapshot, PolicyMode, normalize_aliases
 from .ids import new_id
 from .inspector import REQUIRED_DURABLE_KINDS, InspectorStore
 from .mission_activity import MissionActivityStore
@@ -137,6 +139,10 @@ class ControlPlaneRepo:
         self._artifacts = {}
         self._blobs = {}  # artifact_id -> bytes (in-memory RustFS stand-in)
         self._leases = {}
+        self._scheduler_reservations = {}
+        self._scheduler_leases = {}
+        self._scheduler_observations = {}
+        self._pending_scheduler_observations = None
         self._test_runs = {}
         self._reviews = {}
         self._pull_requests = {}
@@ -695,6 +701,67 @@ class ControlPlaneRepo:
     def list_hosts(self):
         return _sort_by(list(self._merged_hosts().values()), "host_name")
 
+    def host_snapshot(self, host_id):
+        """Return the scheduler view of one host, or ``None`` when unknown."""
+        from datetime import datetime
+        record = self.get_host(host_id)
+        if record is None:
+            return None
+        samples = self.list_telemetry(record.get("host_id"), limit=1)
+        observation = self._scheduler_observations.get(record.get("host_id"))
+        latest = observation["sample"] if observation else (samples[-1] if samples else None)
+        at = latest.get("at") if latest else record.get("last_seen")
+        try:
+            telemetry_at = datetime.fromisoformat(at) if at else None
+            if telemetry_at and telemetry_at.tzinfo is None:
+                telemetry_at = None
+        except (TypeError, ValueError):
+            telemetry_at = None
+        freshness = latest.get("freshness_seconds") if latest else None
+        policy = record.get("scheduler_policy") or {}
+        return HostSnapshot(
+            host_uid=record.get("host_uid") or record.get("host_id"),
+            host_name=record.get("host_name") or record.get("host_id"),
+            aliases=tuple(record.get("aliases") or (record.get("host_name"),)),
+            platform=record.get("platform") or "unknown",
+            owned=record.get("scheduler_owned", False),
+            trusted=record.get("scheduler_trusted", False),
+            reachable=record.get("status") not in {"unavailable", "unknown"},
+            telemetry_at=telemetry_at,
+            telemetry_freshness_seconds=freshness,
+            policy=HostPolicy(
+                mode=PolicyMode(policy.get("mode", PolicyMode.MANUAL_ONLY)),
+                revision=int(policy.get("revision", 0)),
+                allow_tags=frozenset(policy.get("allow_tags") or ()),
+                deny_tags=frozenset(policy.get("deny_tags") or ()),
+            ),
+        )
+
+    def set_host_policy(self, host_id, *, mode, expected_revision, allow_tags=(), deny_tags=(), reason=None):
+        """Update scheduler policy with optimistic concurrency and an audit event."""
+        with self.scheduler_admission():
+            return self._set_host_policy(host_id, mode=mode, expected_revision=expected_revision,
+                                         allow_tags=allow_tags, deny_tags=deny_tags, reason=reason)
+
+    def _set_host_policy(self, host_id, *, mode, expected_revision, allow_tags, deny_tags, reason):
+        host = self._hosts.get(host_id)
+        if host is None:
+            raise KeyError(host_id)
+        mode = PolicyMode(mode)
+        current = host.get("scheduler_policy") or {"revision": 0, "mode": PolicyMode.MANUAL_ONLY}
+        if int(expected_revision) != int(current.get("revision", 0)):
+            raise ValueError("host policy revision conflict")
+        next_policy = {
+            "mode": mode.value,
+            "revision": int(current.get("revision", 0)) + 1,
+            "allow_tags": sorted({str(v).strip().lower() for v in allow_tags if str(v).strip()}),
+            "deny_tags": sorted({str(v).strip().lower() for v in deny_tags if str(v).strip()}),
+            "reason": str(reason)[:300] if reason else None,
+        }
+        self.record_event("host", host_id, "HostPolicyChanged", next_policy, require_durable=True)
+        host["scheduler_policy"] = next_policy
+        return _copy(next_policy)
+
     def fleet_inventory(self):
         """Host x component version matrix with drift against the fleet reference.
 
@@ -771,7 +838,10 @@ class ControlPlaneRepo:
     # after a restart reproduces exactly the same stable entities.
 
     def upsert_host(self, host_id, host_name, tailnet_ip, *,
-                    cpu=None, mem=None, status="healthy", inventory=None):
+                    cpu=None, mem=None, status="healthy", inventory=None,
+                    host_uid=None, aliases=None, platform=None,
+                    scheduler_owned=None, scheduler_trusted=None,
+                    scheduler_policy=None, scheduler_capacity=None):
         stamp = self._stamp()
         inventory = _clean_inventory(inventory)
         existing = self._hosts.get(host_id)
@@ -780,6 +850,20 @@ class ControlPlaneRepo:
                    "tailnet_ip": tailnet_ip, "status": status,
                    "cpu": cpu, "mem": mem,
                    "last_seen": stamp, "created_at": stamp}
+            if host_uid:
+                rec["host_uid"] = host_uid
+            if aliases:
+                rec["aliases"] = normalize_aliases(aliases)
+            if platform:
+                rec["platform"] = platform
+            if scheduler_owned is not None:
+                rec["scheduler_owned"] = bool(scheduler_owned)
+            if scheduler_trusted is not None:
+                rec["scheduler_trusted"] = bool(scheduler_trusted)
+            if scheduler_policy:
+                rec["scheduler_policy"] = dict(scheduler_policy)
+            if scheduler_capacity:
+                rec["scheduler_capacity"] = dict(scheduler_capacity)
             if inventory:
                 rec["inventory"] = {**inventory, "collected_at": stamp}
             self._hosts[host_id] = rec
@@ -792,6 +876,19 @@ class ControlPlaneRepo:
         existing["tailnet_ip"] = tailnet_ip or existing["tailnet_ip"]
         existing["status"] = status
         existing["last_seen"] = stamp
+        for key, value in (("host_uid", host_uid), ("platform", platform)):
+            if value:
+                existing[key] = value
+        if aliases:
+            existing["aliases"] = normalize_aliases(aliases)
+        if scheduler_owned is not None:
+            existing["scheduler_owned"] = bool(scheduler_owned)
+        if scheduler_trusted is not None:
+            existing["scheduler_trusted"] = bool(scheduler_trusted)
+        if scheduler_policy is not None:
+            existing["scheduler_policy"] = dict(scheduler_policy)
+        if scheduler_capacity is not None:
+            existing["scheduler_capacity"] = dict(scheduler_capacity)
         if cpu is not None:
             existing["cpu"] = cpu
         if mem is not None:
@@ -1323,6 +1420,7 @@ class ControlPlaneRepo:
             "artifact_id": aid, "session_id": session_id,
             "mission_id": mission_id, "original_filename": original_filename,
             "mime_type": mime_type, "size_bytes": size_bytes, "sha256": sha256,
+            "artifact_type": "other",
             "storage_key": storage_key, "status": "available",
             "materializations": 0, "created_at": self._stamp(),
         }
@@ -1347,6 +1445,25 @@ class ControlPlaneRepo:
 
     def get_artifact(self, artifact_id):
         return _copy(self._artifacts.get(artifact_id))
+
+    def list_artifacts(self, *, query=None, artifact_type=None, status=None,
+                       created_by=None, limit=200, offset=0):
+        rows = []
+        needle = str(query or "").casefold()
+        for record in self._artifacts.values():
+            if artifact_type and record.get("artifact_type") != artifact_type:
+                continue
+            if status and record.get("status") != status:
+                continue
+            if created_by and record.get("created_by") != created_by:
+                continue
+            haystack = " ".join(str(record.get(key) or "")
+                                for key in ("artifact_id", "original_filename", "mime_type"))
+            if needle and needle not in haystack.casefold():
+                continue
+            rows.append(_copy(record))
+        ordered = _sort_by(rows, "created_at", id_key="artifact_id")
+        return ordered[max(0, int(offset)):max(0, int(offset)) + min(500, max(1, int(limit)))]
 
     def materialize_artifact(self, artifact_id, host_id, session_id,
                              local_path):
@@ -1378,6 +1495,101 @@ class ControlPlaneRepo:
             del self._leases[lease_id]
             return True
         return False
+
+    # ------------------------------------------------------- scheduler state
+    def scheduler_execution_ready(self):
+        return callable(getattr(self._sink, "record_required", None))
+
+    @contextmanager
+    def scheduler_admission(self):
+        # Match record_event's event -> sink ordering. Holding the sink lock
+        # while waiting for an event writer would deadlock with that writer.
+        with self._command_lock, self._event_lock:
+            transaction = getattr(self._sink, "scheduler_admission", None)
+            if callable(transaction):
+                pending = []
+                try:
+                    with transaction() as rows:
+                        observations = getattr(self._sink, "scheduler_observations", None)
+                        if callable(observations):
+                            for host_id, observation in observations().items():
+                                self._apply_scheduler_observation(host_id, observation)
+                        policies = getattr(self._sink, "scheduler_policies", None)
+                        if callable(policies):
+                            for host_id, policy in policies().items():
+                                if host_id in self._hosts:
+                                    self._hosts[host_id]["scheduler_policy"] = _deep_copy(policy)
+                        self._pending_scheduler_observations = pending
+                        try:
+                            yield rows
+                        finally:
+                            self._pending_scheduler_observations = None
+                except BaseException:
+                    # An acknowledged INSERT can still be rolled back by COMMIT.
+                    for host_id, _, event in pending:
+                        key = ("scheduler_observation", host_id)
+                        self._events[key] = [e for e in self._events[key]
+                                             if e["event_id"] != event["event_id"]]
+                        position = (*key, event["sequence"])
+                        self._event_order = [p for p in self._event_order if p != position]
+                    raise
+                for host_id, observation, _ in pending:
+                    self._apply_scheduler_observation(host_id, observation)
+            else:
+                yield self.list_scheduler_reservations()
+
+    def save_scheduler_observation(self, host_id, observation):
+        record = _deep_copy(observation)
+        event = self.record_event("scheduler_observation", host_id, "SchedulerHostObserved", record,
+                                  require_durable=True, publish=False)
+        if self._pending_scheduler_observations is not None:
+            self._pending_scheduler_observations.append((host_id, record, event))
+        else:
+            self._apply_scheduler_observation(host_id, record)
+
+    def scheduler_observation(self, host_id):
+        return _deep_copy(self._scheduler_observations.get(host_id))
+
+    def _apply_scheduler_observation(self, host_id, observation):
+        previous = self._scheduler_observations.get(host_id)
+        if previous and previous["sample"]["sequence"] >= observation["sample"]["sequence"]:
+            return
+        self._scheduler_observations[host_id] = _deep_copy(observation)
+        host = self._hosts.setdefault(host_id, {"host_id": host_id, "tailnet_ip": None})
+        policy = host.get("scheduler_policy")
+        host.update(_deep_copy(observation["host"]))
+        # Resource reports cannot undo an operator's newer policy revision.
+        if policy and policy.get("revision", 0) >= host["scheduler_policy"].get("revision", 0):
+            host["scheduler_policy"] = policy
+        sample = _deep_copy(observation["sample"])
+        self.record_telemetry(host_id, sample)
+
+    def save_scheduler_reservation(self, reservation: dict):
+        """Persist scheduler reservation/lease state through the existing event sink."""
+        reservation_id = str(reservation.get("reservation_id") or "")
+        if not reservation_id:
+            raise ValueError("reservation_id is required")
+        record = _deep_copy(reservation)
+        self.record_event("scheduler_reservation", reservation_id,
+                          "SchedulerReservationChanged", record, require_durable=True)
+        self._scheduler_reservations[reservation_id] = record
+        return _deep_copy(record)
+
+    def list_scheduler_reservations(self):
+        return [_deep_copy(row) for row in self._scheduler_reservations.values()]
+
+    def save_scheduler_lease(self, lease: dict):
+        lease_id = str(lease.get("lease_id") or "")
+        if not lease_id:
+            raise ValueError("lease_id is required")
+        record = _deep_copy(lease)
+        self.record_event("scheduler_lease", lease_id, "SchedulerLeaseChanged", record,
+                          require_durable=True)
+        self._scheduler_leases[lease_id] = record
+        return _deep_copy(record)
+
+    def list_scheduler_leases(self):
+        return [_deep_copy(row) for row in self._scheduler_leases.values()]
 
     # --------------------------------------------------------------- events
     def record_event(self, entity_type, entity_id, event_type, payload=None,
@@ -1638,6 +1850,9 @@ class ControlPlaneRepo:
             "blobs": {k: __import__("base64").b64encode(v).decode()
                       for k, v in self._blobs.items()},
             "leases": _copy(self._leases),
+            "scheduler_reservations": _deep_copy(self._scheduler_reservations),
+            "scheduler_leases": _deep_copy(self._scheduler_leases),
+            "scheduler_observations": _deep_copy(self._scheduler_observations),
             "telemetry": {k: [dict(s) for s in v]
                           for k, v in self._telemetry.items()},
             "events": {f"{t}|{i}": [dict(e) for e in s]
@@ -1655,6 +1870,8 @@ class ControlPlaneRepo:
         self._blobs = {k: __import__("base64").b64decode(v)
                        for k, v in state.get("blobs", {}).items()}
         self._leases = dict(state.get("leases", {}))
+        self._scheduler_reservations = _deep_copy(state.get("scheduler_reservations", {}))
+        self._scheduler_leases = _deep_copy(state.get("scheduler_leases", {}))
         self._telemetry = {k: [dict(s) for s in v]
                           for k, v in state.get("telemetry", {}).items()}
         self._events = {}
@@ -1662,6 +1879,39 @@ class ControlPlaneRepo:
             t, i = key.split("|")
             self._events[(t, i)] = [dict(e) for e in stream]
         self._event_order = [tuple(x) for x in state.get("event_order", [])]
+        # Scheduler reservations are event-sourced, so a restart can recover
+        # even when the structured export contains only the event streams.
+        self._scheduler_observations = {}
+        for host_id, observation in state.get("scheduler_observations", {}).items():
+            self._apply_scheduler_observation(host_id, observation)
+        for (etype, entity_id), stream in self._events.items():
+            if etype == "scheduler_observation":
+                for event in stream:
+                    self._apply_scheduler_observation(entity_id, _payload(event))
+                continue
+            if etype != "scheduler_reservation":
+                if etype != "scheduler_lease":
+                    continue
+                for event in stream:
+                    payload = _payload(event)
+                    if payload:
+                        self._scheduler_leases[entity_id] = _deep_copy(payload)
+                continue
+            for event in stream:
+                payload = _payload(event)
+                if payload:
+                    self._scheduler_reservations[entity_id] = _deep_copy(payload)
+        # Policies are authoritative independently of stream iteration order.
+        for (etype, entity_id), stream in self._events.items():
+            if etype != "host":
+                continue
+            for event in stream:
+                if event.get("event_type") != "HostPolicyChanged":
+                    continue
+                policy = _payload(event)
+                host = self._hosts.setdefault(entity_id, {"host_id": entity_id, "host_name": entity_id})
+                if policy.get("revision", -1) >= (host.get("scheduler_policy") or {}).get("revision", -1):
+                    host["scheduler_policy"] = _deep_copy(policy)
         # Inspector summaries ride the durable log as ``inspector`` streams;
         # move them into the bounded store instead of the unbounded raw streams.
         durable = []

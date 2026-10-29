@@ -99,6 +99,50 @@ async function withApp(fn, env = {}) {
 const bodyText = (page) =>
   page.evaluate(() => document.body ? document.body.innerText : '');
 
+test('scheduler policy changes persist and placement previews do not reserve', async () => {
+  await withApp(async ({page, base}) => {
+    const writes = [];
+    page.on('request', request => { if (request.method() === 'POST') writes.push(new URL(request.url()).pathname); });
+    await page.goto(`${base}/#/scheduling`);
+    const form = page.locator('[data-host-policy="mac.lan"]');
+    await form.waitFor();
+    assert.equal(await form.locator('[name="mode"]').inputValue(), 'manual_only');
+    await form.locator('[name="mode"]').selectOption('draining');
+    await form.locator('[name="confirm"]').check();
+    const [response] = await Promise.all([
+      page.waitForResponse(r => r.url().endsWith('/api/v1/scheduler/host-policy') && r.request().method() === 'POST', {timeout:5000})
+        .catch(async error => { throw new Error(`${error.message}; form: ${JSON.stringify(await form.evaluate(f => ({html:f.outerHTML, valid:f.checkValidity(), values:[...new FormData(f)]})))}`); }),
+      form.getByRole('button', {name:'Save policy'}).click(),
+    ]);
+    assert.equal(response.status(), 200);
+    await page.reload();
+    await form.waitFor();
+    assert.equal(await form.locator('[name="mode"]').inputValue(), 'draining');
+    await page.getByRole('button', {name:'Preview automatic placement'}).click();
+    await page.locator('[data-scheduler-plan-result]').filter({hasText:'Selected: queued'}).waitFor();
+    assert.equal(writes.filter(p => p.endsWith('/reservations')).length, 0);
+    for (const width of [390, 768, 1440, 3840]) {
+      await page.setViewportSize({width, height:900});
+      await page.screenshot({path:path.join(REPO,'tests/playwright/screenshots',`scheduler-${width}.png`), fullPage:true});
+    }
+  }, {BURST:'0'});
+});
+
+test('scheduler historical simulation preserves reservation state', async () => {
+  await withApp(async ({page, base}) => {
+    const reservation = await page.request.post(`${base}/api/v1/scheduler/reservations`, {data:{
+      request_id:'simulation-evidence', agent_family:'codex', resource_profile:{class:'coding',cpu_cores:1},
+    }});
+    assert.equal(reservation.status(), 201);
+    const before = await (await page.request.get(`${base}/api/v1/scheduler`)).json();
+    await page.goto(`${base}/#/scheduling`);
+    await page.getByRole('button',{name:'Preview historical placement'}).click();
+    await page.locator('[data-simulator-result]').filter({hasText:'1 observed decisions'}).waitFor();
+    const after = await (await page.request.get(`${base}/api/v1/scheduler`)).json();
+    assert.deepEqual(after.history, before.history);
+  }, {BURST:'0', SCHEDULER_ADMISSION:'1'});
+});
+
 test('every page renders without rate-limit / fetch errors', async () => {
   // No event burst (BURST=0): the SPA renders once per view with no SSE churn,
   // so content presence is deterministic and never races a live re-render.

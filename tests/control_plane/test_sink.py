@@ -29,6 +29,33 @@ def fake_run(coro):
     return asyncio.run(coro)
 
 
+def test_scheduler_admission_locks_before_read_and_rolls_back_on_failure():
+    import pytest
+
+    class TransactionConn(FakeConn):
+        def __init__(self):
+            super().__init__()
+            self.commands = []
+
+        async def execute(self, sql):
+            self.commands.append(sql)
+
+        async def fetch(self, sql, *args):
+            self.commands.append("read")
+            return [{"payload": '{"request_id":"existing"}'}]
+
+    conn = TransactionConn()
+    sink = DurableEventSink(conn=conn, run=fake_run)
+    with sink.scheduler_admission() as rows:
+        assert rows == [{"request_id": "existing"}]
+        assert conn.commands == ["BEGIN", "SELECT pg_advisory_xact_lock(724965310221)", "read"]
+    assert conn.commands[-1] == "COMMIT"
+    with pytest.raises(RuntimeError):
+        with sink.scheduler_admission():
+            raise RuntimeError("injected admission failure")
+    assert conn.commands[-1] == "ROLLBACK"
+
+
 def test_sink_persists_repo_events():
     conn = FakeConn()
     sink = DurableEventSink(conn=conn, run=fake_run)

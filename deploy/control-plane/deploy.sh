@@ -282,7 +282,7 @@ if [ -z "$HEALTH_URL" ]; then
   case "$BIND" in *:*) BIND="[$BIND]" ;; esac   # IPv6 literal
   HEALTH_URL="http://${BIND:-127.0.0.1}:${PORT:-80}/api/v1/health"
 fi
-HEALTH_TRIES="${HERDR_CP_HEALTH_TRIES:-30}"
+HEALTH_TRIES="${HERDR_CP_HEALTH_TRIES:-300}"
 HEALTH_INTERVAL="${HERDR_CP_HEALTH_INTERVAL:-2}"
 
 COLLAB_HASH=""

@@ -27,12 +27,18 @@ from typing import Any
 from urllib.parse import parse_qs, unquote, urlsplit
 
 from ..version import __version__
+from .artifacts import ArtifactConflict, ArtifactError
 from .redact import redact_payload
 
 # Routes a host-side tool (session run, plannotator bridge) may POST with the
 # narrow `agent` role, besides /api/v1/ingest. Nothing else.
 _AGENT_POST = re.compile(r"^/api/v1/(?:llm/keys|reviews|llm/keys/[^/]+/revoke"
                         r"|reviews/[^/]+/(?:heartbeat|result|failure))$")
+# Report mutations have their own artifact owner/edit/review checks after this
+# narrow role gate. This does not grant agents publication or generic mutation.
+_REPORT_AGENT_POST = re.compile(
+    r"^/api/v1/(?:artifact-reports(?:/[^/]+/jobs)?|"
+    r"artifacts/[^/]+/(?:blobs|versions(?:/[^/]+/(?:feedback|checks))?))$")
 # Optional build stamp; the compose build arg sets it (see Dockerfile). Falls
 # back to "dev" in a local checkout / un-stamped image.
 _COMMIT = os.environ.get("HERDR_ENGINEERING_COMMIT", "dev")
@@ -147,13 +153,18 @@ class ControlPlaneServer:
 
     def __init__(self, repo, *, api_key=None, api_keys=None, host="127.0.0.1",
                  port=0, web_root=None, source=None, allow_open=False,
-                 rustfs=None, dispatcher=None, github_monitor=None,
+                 rustfs=None, artifact_store=None, publication_controller=None,
+                 artifact_job_manager=None, artifact_review_manager=None,
+                 artifact_acl=None,
+                 handoff_registry=None,
+                 dispatcher=None, github_monitor=None,
                  collab=None, collab_tls_terminated=False,
                  collab_require_https=False, fleet_config=None, ci_actions=False,
                  public_port=None, public_host=None, collab_only=False,
                  operator_port=None, operator_user=None, operator_email=None,
                  operator_hosts=(), collab_operator_url=None, collab_dashboard_hosts=(),
-                 request_workers=32, request_queue=128):
+                 request_workers=32, request_queue=128, scheduler_admission=False, native_adapter=None,
+                 scheduler_limits=None):
         """
         Auth (Spec §104): either a single `api_key` (all-access) or a mapping
         `api_keys={key: role}` with roles "viewer" (read-only) / "operator"
@@ -167,6 +178,7 @@ class ControlPlaneServer:
         other and are encrypted end-to-end via WireGuard.
         """
         self.repo = repo
+        self.scheduler_admission = scheduler_admission
         from .ci_monitor import CIMonitor
         self.ci_monitor = CIMonitor(on_transition=lambda key, event, row:
                                     repo.record_event("ci_pipeline", key, event, row),
@@ -184,8 +196,19 @@ class ControlPlaneServer:
         # payloads are stored content-addressed here instead of the repo's
         # in-memory blob stand-in, so they survive a web restart.
         self.rustfs = rustfs
+        self.artifact_store = artifact_store
+        self.publication_controller = publication_controller
+        self.artifact_job_manager = artifact_job_manager
+        self.artifact_review_manager = artifact_review_manager
+        self.artifact_acl = artifact_acl
+        from .handoffs import HandoffRegistry
+        self.handoffs = handoff_registry or HandoffRegistry(repo)
         from .ingest import IngestService
         self.ingest = IngestService(repo)
+        from .scheduler_service import SchedulerService
+        self.scheduler = SchedulerService(repo, **(scheduler_limits or {}))
+        if native_adapter is not None:
+            self.scheduler.configure_native(native_adapter)
         self._limiter = _RateLimiter()
         # Fleet telemetry has a separate bounded budget so bursts cannot starve
         # dashboard reads or operator commands from the same host/proxy IP.
@@ -251,18 +274,24 @@ class ControlPlaneServer:
         self._subscribers = set()
         self._lock = threading.Lock()
         self._metrics_lock = threading.Lock()
-        self._metrics = {"requests": 0, "by_path": {}, "total_ms": 0.0}
+        self._metrics = {"requests": 0, "by_path": {}, "by_route": {},
+                         "total_ms": 0.0, "slow_requests": 0}
         self._ready = threading.Event()
         self._httpd = None
         # live stream (Spec §52)
         repo.subscribe(self._broadcast)
 
     def _dispatch_native_message(self, record, message, artifact_ids):
-        from ..errors import InvalidError, UnsupportedError
+        from ..errors import InvalidError
         from ..herdr_adapter import NativeHerdrAdapter
 
         if artifact_ids:
-            raise UnsupportedError("native prompt attachment delivery is not implemented")
+            if not all(isinstance(artifact_id, str) and artifact_id.strip()
+                       for artifact_id in artifact_ids):
+                raise InvalidError("artifact references must be non-empty strings")
+            message = (message + "\n\nAttached HerdR artifact references:\n" +
+                       "\n".join(f"- herdr-artifact://{artifact_id}"
+                                 for artifact_id in artifact_ids))
         target = record.get("terminal_id")
         conversation = record.get("agent_session")
         if not target or not conversation or not record.get("host_id"):
@@ -296,21 +325,51 @@ class ControlPlaneServer:
         if self.collab is not None:
             h["capabilities"].append("collab_v1")
         with self._metrics_lock:
+            routes = {}
+            for route, value in self._metrics["by_route"].items():
+                samples = value["samples"]
+                ordered = sorted(samples)
+                p95 = ordered[min(len(ordered) - 1, int(len(ordered) * .95))] if ordered else 0
+                routes[route] = {
+                    "count": value["count"],
+                    "errors": value["errors"],
+                    "timeouts": value["timeouts"],
+                    "latency_ms": {
+                        "last": round(value["last"], 2),
+                        "max": round(max(samples, default=0), 2),
+                        "p95": round(p95, 2),
+                    },
+                }
             h["performance"] = {
                 "requests": self._metrics["requests"],
                 "by_path": dict(self._metrics["by_path"]),
+                "by_route": routes,
                 "total_ms": round(self._metrics["total_ms"], 2),
+                "slow_requests": self._metrics["slow_requests"],
                 "request_workers": self.request_workers,
                 "request_queue": self.request_queue,
             }
         return h
 
-    def _record_request(self, path: str, elapsed_ms: float) -> None:
+    def _record_request(self, path: str, elapsed_ms: float, status: int = 200) -> None:
         path = path.split("?", 1)[0][:120]
         with self._metrics_lock:
             self._metrics["requests"] += 1
             self._metrics["by_path"][path] = self._metrics["by_path"].get(path, 0) + 1
             self._metrics["total_ms"] += elapsed_ms
+            route = self._metrics["by_route"].setdefault(
+                path, {"count": 0, "errors": 0, "timeouts": 0, "last": 0.0, "samples": []})
+            route["count"] += 1
+            if status >= 400:
+                route["errors"] += 1
+            route["last"] = elapsed_ms
+            route["samples"].append(elapsed_ms)
+            if len(route["samples"]) > 200:
+                del route["samples"][:-200]
+            if elapsed_ms >= 2000:
+                self._metrics["slow_requests"] += 1
+            if elapsed_ms >= 15000:
+                route["timeouts"] += 1
 
     # ------------------------------------------------------- SSE plumbing
     def _broadcast(self, event):
@@ -351,12 +410,15 @@ class ControlPlaneServer:
         threading.Thread(target=self._sweep_loop, daemon=True).start()
         self._httpd.serve_forever()
 
-    def _sweep_loop(self, interval=300):
+    def _sweep_loop(self, interval=15):
         """Apply inspector age retention to idle sessions too (ingest only prunes the active one)."""
         while self._httpd is not None:
             time.sleep(interval)
             try:
                 self.repo.inspector.sweep()
+                if self.scheduler_admission:
+                    self.scheduler.reconcile()
+                    self.scheduler.drain_queue()
             except Exception:
                 pass
 
@@ -509,6 +571,7 @@ def _make_handler(server, public=False, operator=False):
             next request (request smuggling behind a filtering proxy).
             """
             payload = json.dumps({"error": message}).encode()
+            self._response_status = status
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
             self.send_header("Cache-Control", "no-store")
@@ -544,7 +607,8 @@ def _make_handler(server, public=False, operator=False):
                         and path == "/api/v1/ingest"):
                     return None
                 if (role == "agent" and self.command == "POST"
-                        and (path == "/api/v1/ingest" or _AGENT_POST.match(path))):
+                        and (path == "/api/v1/ingest" or _AGENT_POST.match(path)
+                             or _REPORT_AGENT_POST.match(path))):
                     return None
                 return self._deny(403, "read-only")
             if min_role == "ingest":
@@ -680,11 +744,13 @@ def _make_handler(server, public=False, operator=False):
             return self._json(payload, status)
 
         def do_GET(self):
+            self._request_id = secrets.token_hex(8)
             started = time.monotonic()
             try:
                 return self._do_GET()
             finally:
-                server._record_request(self.path, (time.monotonic() - started) * 1000)
+                server._record_request(self.path, (time.monotonic() - started) * 1000,
+                                       getattr(self, "_response_status", 200))
 
         def _do_GET(self):
             if operator:
@@ -708,11 +774,13 @@ def _make_handler(server, public=False, operator=False):
             return self._serve_static()
 
         def do_POST(self):
+            self._request_id = secrets.token_hex(8)
             started = time.monotonic()
             try:
                 return self._do_POST()
             finally:
-                server._record_request(self.path, (time.monotonic() - started) * 1000)
+                server._record_request(self.path, (time.monotonic() - started) * 1000,
+                                       getattr(self, "_response_status", 200))
 
         def _do_POST(self):
             if operator:
@@ -723,6 +791,8 @@ def _make_handler(server, public=False, operator=False):
                 return self._collab()
             if self._path_only() == _FLEET_CONFIG_PATH + "/applied":
                 return self._fleet_config_applied()
+            if self._path_only() == _FLEET_CONFIG_PATH + "/telemetry":
+                return self._fleet_resource_telemetry()
             # The ingest route is reachable by the ingest role; every other
             # POST requires the operator role (Spec §104).
             path = self.path.split("?")[0]
@@ -733,6 +803,12 @@ def _make_handler(server, public=False, operator=False):
                     return self._deny(403, "cross-origin integration mutation refused")
                 if self.headers.get("Content-Type", "").split(";", 1)[0].strip() != "application/json":
                     return self._deny(415, "integration mutations require application/json")
+            if path.split("/")[3:4] and path.split("/")[3] in {
+                    "artifacts", "artifact-reports", "artifact-jobs", "artifact-reviews", "publications"}:
+                origin = self.headers.get("Origin")
+                if origin and (urlsplit(origin).netloc != self.headers.get("Host")
+                               or urlsplit(origin).scheme not in {"http", "https"}):
+                    return self._deny(403, "cross-origin artifact mutation refused")
             min_role = ("ingest" if path == "/api/v1/ingest"
                        else "operator")
             err = self._require(min_role)
@@ -782,6 +858,20 @@ def _make_handler(server, public=False, operator=False):
                 return self._deny(401, "unauthorized")
             store.record_applied(host, body["revision"])
             return self._json({"ok": True})
+
+        def _fleet_resource_telemetry(self):
+            if server.fleet_config is None:
+                return self._deny(404, "not found")
+            host = self._fleet_host(server.fleet_config.current())
+            if host is None:
+                return self._deny(401, "unauthorized")
+            try:
+                body = self._read_json()
+                if not isinstance(body, dict):
+                    return self._deny(400, "resource snapshot must be an object")
+                return self._json(server.scheduler.observe_host(host, body))
+            except (TypeError, ValueError):
+                return self._deny(400, "invalid resource observation")
 
         # --------------------------------------------------- collaboration (HCN)
         def _is_collab_path(self):
@@ -976,14 +1066,27 @@ def _make_handler(server, public=False, operator=False):
             if self._rate_limit():
                 return None
             try:
+                from .artifact_report_api import route_report
+                if route_report(self, server, parts, resource):
+                    return None
                 if self.command == "GET":
                     return self._api_get(parts, resource)
                 return self._api_post(parts, resource)
             except KeyError:
                 return self._send_json(404, {"error": "not found"})
             except ValueError as exc:
+                if getattr(exc, "code", None) == "not_found":
+                    return self._send_json(404, {"error": "not found"})
                 message = "Invalid GitHub query." if resource == "github" else str(exc)
                 return self._send_json(400, {"error": message})
+            except ArtifactConflict as exc:
+                return self._send_json(409, {"error": str(exc),
+                                             "code": "artifact_version_conflict",
+                                             "artifact_id": exc.artifact_id,
+                                             "current_version_id": exc.current_version_id})
+            except ArtifactError as exc:
+                return self._send_json(404 if str(exc).startswith("no artifact") else 400,
+                                       {"error": str(exc)})
             except RuntimeError as exc:
                 if resource == "github":
                     from ..github import GitHubError
@@ -993,12 +1096,22 @@ def _make_handler(server, public=False, operator=False):
                 if resource == "reviews":
                     return self._send_json(503, {"error": "Review persistence is unavailable; no launch or decision was acknowledged."})
                 return self._send_json(503, {"error": "Integration service is unavailable."})
+            except (BrokenPipeError, ConnectionResetError):
+                self.close_connection = True
+                return None
             except Exception as exc:  # never drop a connection: surface 500
                 message = "GitHub service is unavailable." if resource == "github" else str(exc)
                 return self._send_json(500, {"error": message})
 
         def _api_get(self, parts, resource):
             r = server.repo
+            if resource == "handoffs":
+                if len(parts) == 5 and parts[4] == "tree":
+                    return self._json(server.handoffs.tree())
+                if len(parts) == 5:
+                    row = server.handoffs.get(parts[4])
+                    return self._json(row) if row else self._json({"error": "not found"}, 404)
+                return self._json({"handoffs": server.handoffs.list(state=_q(self.path, "state"))})
             if resource == "health":
                 return self._json(server._health())
             if resource == "mission-activity" and len(parts) == 4:
@@ -1060,6 +1173,12 @@ def _make_handler(server, public=False, operator=False):
                     return self._json(h) if h else self._json(
                         {"error": "not found"}, 404)
                 return self._json({"hosts": r.list_hosts()})
+            if resource == "scheduler":
+                if len(parts) == 4:
+                    return self._json(server.scheduler.overview())
+                if len(parts) == 5 and parts[4] == "queue":
+                    return self._json({"queue": server.scheduler.overview()["queue"]})
+                return self._json({"error": "not found"}, 404)
             if resource == "activity":
                 evs = [_redact_event(e) for e in r.recent_events(
                     limit=_qint(self.path, "limit", 50))]
@@ -1088,8 +1207,11 @@ def _make_handler(server, public=False, operator=False):
                     if not etype or not eid:
                         return self._json(
                             {"error": "entity_type and entity_id required"}, 400)
-                    return self._json({"events": r.stream(etype, eid)})
+                    return self._json({"events": [_redact_event(event) for event in r.stream(etype, eid)]})
             if resource == "artifacts" and len(parts) > 5 and parts[5] == "download":
+                if (server.artifact_acl is not None and
+                        not server.artifact_acl.can(parts[4], self._principal(), "read")):
+                    return self._json({"error": "not found"}, 404)
                 data = r.get_artifact_data(parts[4])
                 a = r.get_artifact(parts[4])
                 # payload lives in the object store, not the in-memory blob
@@ -1102,6 +1224,68 @@ def _make_handler(server, public=False, operator=False):
                 if data is None or a is None:
                     return self._json({"error": "not found"}, 404)
                 return self._bytes(data, a.get("mime_type", "application/octet-stream"))
+            if resource == "artifacts" and len(parts) == 4:
+                if server.artifact_store is not None:
+                    artifacts = self._artifact_call(
+                        "list_records", principal_id=self._principal(), query=_q(self.path, "q"),
+                        artifact_type=_q(self.path, "type"), status=_q(self.path, "status"),
+                        limit=_qint(self.path, "limit", 200), offset=_qint(self.path, "offset", 0))
+                else:
+                    artifacts = r.list_artifacts(
+                        query=_q(self.path, "q"), artifact_type=_q(self.path, "type"),
+                        status=_q(self.path, "status"), created_by=_q(self.path, "created_by"),
+                        limit=_qint(self.path, "limit", 200), offset=_qint(self.path, "offset", 0))
+                if server.artifact_acl is not None:
+                    artifacts = server.artifact_acl.filter_visible(artifacts, self._principal())
+                return self._json({"artifacts": artifacts})
+            if resource == "artifacts" and len(parts) == 5:
+                artifact = (self._artifact_call("get_record", parts[4], principal_id=self._principal())
+                            if server.artifact_store is not None else r.get_artifact(parts[4]))
+                if (artifact and server.artifact_acl is not None and
+                        not server.artifact_acl.can(parts[4], self._principal(), "read")):
+                    artifact = None
+                return self._json(artifact) if artifact else self._json({"error": "not found"}, 404)
+            if resource == "artifacts" and server.artifact_store is not None:
+                if not self._artifact_call("report_permission", parts[4], self._principal(), "read"):
+                    return self._json({"error": "not found"}, 404)
+                if len(parts) == 6 and parts[5] == "versions":
+                    method = "list_version_summaries" if _q(self.path, "summary") in {"true", "1"} else "list_versions"
+                    return self._json({"artifact_id": parts[4],
+                                       "versions": self._artifact_call(method, parts[4])})
+                if len(parts) == 7 and parts[5] == "versions":
+                    version = self._artifact_call("get_version", parts[6], parts[4])
+                    return self._json(version) if version else self._json({"error": "not found"}, 404)
+            if resource == "artifacts" and server.artifact_review_manager is not None:
+                if len(parts) == 6 and parts[5] == "reviews":
+                    if not self._artifact_allowed(parts[4], "read"):
+                        return self._deny(404, "not found")
+                    return self._json({"artifact_id": parts[4],
+                                       "reviews": server.artifact_review_manager.list_for_artifact(parts[4])})
+            if resource == "artifact-jobs" and server.artifact_job_manager is not None:
+                if len(parts) == 5:
+                    job = server.artifact_job_manager.get(parts[4])
+                    if not self._artifact_allowed(job["artifact_id"], "read"):
+                        return self._json({"error": "not found"}, 404)
+                    if job.get("profile") == "report" and server.artifact_store is not None:
+                        job = self._artifact_call("get_report_job", job["artifact_id"], parts[4])
+                        if job is None:
+                            return self._json({"error": "not found"}, 404)
+                    return self._json(job)
+            if resource == "artifact-reviews" and server.artifact_review_manager is not None:
+                if len(parts) == 5:
+                    review = server.artifact_review_manager.get(parts[4])
+                    if not review or not self._artifact_allowed(review["artifact_id"], "read"):
+                        return self._deny(404, "not found")
+                    return self._json(review)
+            if resource == "publications" and server.publication_controller is not None:
+                if len(parts) == 4:
+                    return self._json({"publications": [row for row in server.publication_controller.list()
+                        if self._artifact_allowed(row["resource_id"], "read")]})
+                if len(parts) == 5:
+                    publication = server.publication_controller.get(parts[4])
+                    if not publication or not self._artifact_allowed(publication["resource_id"], "read"):
+                        return self._deny(404, "not found")
+                    return self._json(publication)
             if resource == "leases":
                 return self._json({"leases": r.list_leases()})
             if resource == "llm":
@@ -1161,6 +1345,20 @@ def _make_handler(server, public=False, operator=False):
 
         def _api_post(self, parts, resource):
             r = server.repo
+            if resource == "handoffs":
+                body = self._read_json() or {}
+                actor = self._principal()
+                if len(parts) == 4:
+                    row, replayed = server.handoffs.create(body, actor)
+                    return self._json(row, 200 if replayed else 201)
+                if len(parts) == 6 and parts[5] in {"claim", "accept", "reject", "complete",
+                                                      "cancel", "retry", "start"}:
+                    state = {"claim": "claimed", "accept": "accepted", "reject": "rejected",
+                             "complete": "completed", "cancel": "cancelled", "retry": "queued",
+                             "start": "in_progress"}[parts[5]]
+                    if "actor" in body:
+                        return self._json({"error": "actor is derived from authentication"}, 400)
+                    return self._json(server.handoffs.transition(parts[4], state, actor))
             if resource == "inspector" and len(parts) == 5 and parts[4] == "preferences":
                 return self._inspector_set_prefs(None)
             if (resource == "sessions" and len(parts) == 7 and parts[5] == "inspector"
@@ -1171,7 +1369,141 @@ def _make_handler(server, public=False, operator=False):
             # artifact upload carries raw bytes, not JSON — handle first
             if resource == "artifacts" and len(parts) == 4:
                 return self._upload_artifact(r, parts)
+            if resource == "artifacts" and server.artifact_acl is not None and len(parts) == 6 and parts[5] == "acl":
+                if not self._artifact_allowed(parts[4], "admin"):
+                    return self._deny(404, "not found")
+                body = self._read_json() or {}
+                permissions = set(body.get("permissions") or [])
+                grant = server.artifact_acl.grant(
+                    parts[4], str(body.get("principal_id") or ""), permissions,
+                    expires_at=body.get("expires_at"))
+                grant["granted_by"] = self._principal()
+                return self._json(grant, 201)
+            if resource == "artifacts" and server.artifact_acl is not None and len(parts) == 7 and parts[5] == "acl" and parts[6] == "revoke":
+                if not self._artifact_allowed(parts[4], "admin"):
+                    return self._deny(404, "not found")
+                body = self._read_json() or {}
+                server.artifact_acl.revoke(parts[4], str(body.get("principal_id") or ""))
+                return self._json({"ok": True})
+            if resource == "artifacts" and server.artifact_store is not None and len(parts) == 6 and parts[5] == "versions":
+                if not self._artifact_call("report_permission", parts[4], self._principal(), "edit"):
+                    return self._deny(404, "not found")
+                body = self._read_json() or {}
+                if "created_by" in body:
+                    return self._json({"error": "created_by is derived from authentication"}, 400)
+                if body.get("report_descriptor") is not None and any(key in body for key in
+                        {"validation", "job_id", "host_id", "agent_id", "session_id", "mission_id"}):
+                    return self._json({"error": "report execution validation and context are worker-owned; use report checks for attestations"}, 400)
+                body["created_by"] = self._principal()
+                body["provenance"] = {**(body.get("provenance") or {}), "principal_id": body["created_by"]}
+                return self._json(self._artifact_call("commit_version", parts[4], **body), 201)
+            if resource == "artifact-jobs" and server.artifact_job_manager is not None:
+                if len(parts) == 4:
+                    body = self._read_json() or {}
+                    if body.get("profile") == "report" and server.artifact_store is None:
+                        return self._json({"error": "versioned report registry is unavailable"}, 503)
+                    if not self._artifact_allowed(body.get("artifact_id"), "edit"):
+                        return self._deny(404, "not found")
+                    return self._json(server.artifact_job_manager.submit(
+                        profile=body.get("profile"), artifact_id=body.get("artifact_id"),
+                        base_version_id=body.get("base_version_id"), request=body.get("request") or {},
+                        requested_by=self._principal()), 201)
+                if len(parts) == 6 and parts[5] == "cancel":
+                    job = server.artifact_job_manager.get(parts[4])
+                    if not self._artifact_allowed(job["artifact_id"], "edit"):
+                        return self._deny(404, "not found")
+                    if job.get("profile") == "report" and server.artifact_store is not None:
+                        cancelled = self._artifact_call("cancel_report_job", job["artifact_id"], parts[4])
+                        if cancelled is not None:
+                            return self._json(cancelled)
+                        persisted = self._artifact_call("get_report_job", job["artifact_id"], parts[4])
+                        if persisted is None:
+                            return self._json({"error": "not found"}, 404)
+                        return self._json({"error": "report job is no longer queued; no cancellation recorded"}, 409)
+                    return self._json(server.artifact_job_manager.cancel(parts[4]))
+            if resource == "artifact-reviews" and server.artifact_review_manager is not None:
+                if len(parts) == 4:
+                    body = self._read_json() or {}
+                    if not self._artifact_version_allowed(body.get("artifact_id"), body.get("version_id"), "review"):
+                        return self._deny(404, "not found")
+                    return self._json(server.artifact_review_manager.request(
+                        artifact_id=body.get("artifact_id"), version_id=body.get("version_id"),
+                        requested_by=self._principal()), 201)
+                if len(parts) == 6 and parts[5] == "complete":
+                    body = self._read_json() or {}
+                    review = server.artifact_review_manager.get(parts[4])
+                    if not review or not self._artifact_version_allowed(
+                            review["artifact_id"], review["version_id"], "review"):
+                        return self._deny(404, "not found")
+                    return self._json(server.artifact_review_manager.complete(
+                        parts[4], reviewer=self._principal(), decision=body.get("decision"),
+                        comments=body.get("comments") or []))
+            if resource == "publications" and server.publication_controller is not None:
+                if len(parts) == 5 and parts[4] == "requests":
+                    body = self._read_json() or {}
+                    if not self._artifact_version_allowed(body.get("resource_id"), body.get("version_id"), "share"):
+                        return self._deny(404, "not found")
+                    return self._json(server.publication_controller.request(
+                        resource_id=body.get("resource_id"), version_id=body.get("version_id"),
+                        requested_by=self._principal(), audience=body.get("audience"),
+                        expires_at=float(body.get("expires_at", 0))), 201)
+                if len(parts) == 6 and parts[5] in {"approve", "revoke"}:
+                    publication = server.publication_controller.get(parts[4])
+                    if not publication or not self._artifact_version_allowed(
+                            publication["resource_id"], publication["pinned_version_id"], "share"):
+                        return self._deny(404, "not found")
+                    if parts[5] == "approve":
+                        result = server.publication_controller.approve(parts[4], approver=self._principal())
+                    else:
+                        result = server.publication_controller.revoke(parts[4], actor=self._principal())
+                    return self._json(result)
             body = self._read_json() or {}
+            if resource == "scheduler":
+                principal = self._principal()
+                if len(parts) > 4 and parts[4] in {"reservations", "launch"} and not server.scheduler_admission:
+                    return self._json({"error": "scheduler admission is disabled; use placement preview"}, 503)
+                try:
+                    if len(parts) == 5 and parts[4] == "plan":
+                        return self._json(server.scheduler.plan(body, principal))
+                    if len(parts) == 5 and parts[4] == "simulator":
+                        return self._json(server.scheduler.simulate(body))
+                    if len(parts) == 5 and parts[4] == "launch":
+                        return self._json(server.scheduler.launch_native(body, principal), 201)
+                    if len(parts) == 5 and parts[4] == "reservations":
+                        return self._json(server.scheduler.reserve(body, principal), 201)
+                    if len(parts) == 6 and parts[4] == "reservations" and parts[5] == "commit":
+                        return self._json(server.scheduler.commit(body.get("reservation_id", "")))
+                    if len(parts) == 6 and parts[4] == "reservations" and parts[5] == "claim":
+                        return self._json(server.scheduler.claim_execution(body.get("reservation_id", "")))
+                    if len(parts) == 6 and parts[4] == "reservations" and parts[5] == "retry":
+                        return self._json(server.scheduler.retry_queued(body.get("reservation_id", "")))
+                    if len(parts) == 6 and parts[4] == "reservations" and parts[5] in {"release", "cancel"}:
+                        state = "cancelled" if parts[5] == "cancel" else "released"
+                        return self._json(server.scheduler.release(body.get("reservation_id", ""), state=state))
+                    if len(parts) == 6 and parts[4] == "leases" and parts[5] == "heartbeat":
+                        return self._json(server.scheduler.heartbeat(
+                            body.get("lease_id", ""), generation=body.get("generation"),
+                            token=body.get("token"), ttl=body.get("ttl", 90)))
+                    if len(parts) == 5 and parts[4] == "host-policy":
+                        host_uid = body.get("host_uid")
+                        host = next((h for h in r.list_hosts() if h.get("host_uid") == host_uid or h.get("host_id") == host_uid), None)
+                        if host is None:
+                            return self._json({"error": "host not found"}, 404)
+                        updated = r.set_host_policy(host["host_id"], mode=body.get("mode"),
+                                                    expected_revision=body.get("expected_revision"),
+                                                    allow_tags=body.get("allow_tags", ()),
+                                                    deny_tags=body.get("deny_tags", ()),
+                                                    reason=body.get("reason"))
+                        return self._json(updated)
+                except KeyError:
+                    return self._json({"error": "reservation not found"}, 404)
+                except PermissionError as exc:
+                    return self._json({"error": str(exc)}, 409)
+                except (TypeError, ValueError, RuntimeError) as exc:
+                    message = str(exc)
+                    return self._json({"error": message}, 409 if any(
+                        word in message for word in ("conflict", "changed", "reconciliation")) else 400)
+                return self._json({"error": "not found"}, 404)
             if resource == "ci" and len(parts) == 5 and parts[4] == "debug":
                 from ..errors import HerdrEngineeringError
                 from .ci_debug import debug_ci
@@ -1486,18 +1818,51 @@ def _make_handler(server, public=False, operator=False):
 
         def _json(self, data, status=200):
             payload = json.dumps(data).encode()
+            self._response_status = status
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
             self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Request-ID", getattr(self, "_request_id", "unknown"))
             self.send_header("Content-Length", str(len(payload)))
             self.end_headers()
             self.wfile.write(payload)
             return None
 
+        def _principal(self):
+            role = self._role()
+            supplied = self.headers.get("X-API-Key", "")
+            digest = __import__("hashlib").sha256(supplied.encode()).hexdigest()[:16]
+            return f"api-key:{digest}:{role or 'local'}"
+
+        def _artifact_allowed(self, artifact_id, permission):
+            if not artifact_id:
+                return False
+            if server.artifact_store is not None:
+                return self._artifact_call("report_permission", artifact_id, self._principal(), permission)
+            if server.artifact_acl is not None:
+                return server.artifact_acl.can(artifact_id, self._principal(), permission)
+            # Compatibility for the explicit private, unversioned scaffold only.
+            # Native reports never use this fallback.
+            return True
+
+        def _artifact_version_allowed(self, artifact_id, version_id, permission):
+            if not version_id or not self._artifact_allowed(artifact_id, permission):
+                return False
+            return (server.artifact_store is None
+                    or self._artifact_call("get_version", version_id, artifact_id) is not None)
+
+        def _artifact_call(self, method, *args, **kwargs):
+            store = server.artifact_store
+            runner = getattr(store, "sync_call", None) or (store if callable(store) else None)
+            if runner is None:
+                raise RuntimeError("versioned artifact registry adapter is unavailable")
+            return runner(method, *args, **kwargs)
+
         def _bytes(self, data, mime):
             self.send_response(200)
             self.send_header("Content-Type", mime)
             self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Request-ID", getattr(self, "_request_id", "unknown"))
             self.send_header("Content-Length", str(len(data)))
             self.send_header("X-Content-Type-Options", "nosniff")
             self.end_headers()
@@ -1525,7 +1890,13 @@ def _empty_inspector(store, sid: str) -> dict:
 
 def _redact_event(event: dict) -> dict:
     ev = dict(event)
-    ev["payload"] = redact_payload(ev.get("payload", {}))
+    payload = ev.get("payload", {})
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except ValueError:
+            pass
+    ev["payload"] = redact_payload(payload)
     return ev
 
 

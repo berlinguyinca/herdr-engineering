@@ -252,6 +252,10 @@ def test_enroll_serve_end_to_end(tmp_path):
         "routes": [{"prefix": "/api", "host": "127.0.0.1", "port": api_port}]}))
     env = os.environ.copy()
     env["HERDR_ENGINEERING_STATE"] = str(tmp_path / "state")
+    # The subprocess must not inherit host.json and enroll this fixture into
+    # the developer's live gateway. In-process host_config mocks do not cross
+    # this process boundary.
+    env["HOME"] = str(tmp_path / "isolated-home")
     proc = subprocess.Popen(
         [sys.executable, "-m", "herdr_engineering.cli", "devfabric", "enroll",
          "--manifest", str(manifest), "--serve"],

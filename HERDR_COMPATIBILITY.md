@@ -71,3 +71,8 @@ No dependency enters the Powerpack without a tested revision and classification,
 and the implementation uses native Herdr primitives wherever they satisfy the
 requirement. Compatibility tests for the adopted adapter surface live in
 `tests/test_herdr_adapter.py`.
+
+`herdr-handoff` is also an adopted operational dependency. Its pinned revision
+is recorded in `lock/upstreams.yaml`. `scripts/install.sh` installs the CLI and
+the skill into Codex, Claude, Pi, and OpenCode. `scripts/validate.sh` runs
+strict doctor mode and fails if any required handoff component is missing.

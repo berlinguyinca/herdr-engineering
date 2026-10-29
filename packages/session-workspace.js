@@ -50,9 +50,9 @@ export function mountSessionWorkspace(host,client,session,{connect=connectEvents
     hint:terminal?'Recorded history remains available.':'Enter sends · Shift+Enter adds a line · @ inserts a file, agent or GitHub reference.',
     suggestions:()=>referenceSuggestions(session,data,sessions,collaborators),
     onSend:async(text,attachments)=>{
-      if(attachments.length)throw new Error('This session transport cannot deliver files. Remove attachments before sending.');
       if(!operationId || operationText!==text){operationId=pendingOperation(storage,operationKey,text,()=>randomString(18));operationText=text;}
-      const receipt=await client.sendMessage(session.session_id,text,[],operationId);
+      const artifactIds=attachments.map(attachment=>attachment.artifact_id || attachment.artifactId || attachment.id).filter(Boolean);
+      const receipt=await client.sendMessage(session.session_id,text,artifactIds,operationId);
       if(receipt.status!=='delivered')throw new Error(receipt.status==='queued'?'Message queued; delivery is not confirmed. Refresh before retrying.':receipt.error || 'Delivery was not acknowledged.');
       operationId=null;operationText=null;
       try{storage?.removeItem(operationKey);}catch{/* optional storage */}

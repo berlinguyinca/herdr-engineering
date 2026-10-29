@@ -119,6 +119,7 @@ def main():
         _seed_inspector(repo, _s1)
 
     svr = ControlPlaneServer(repo, host="127.0.0.1", port=0,
+                             scheduler_admission=os.environ.get("SCHEDULER_ADMISSION") == "1",
                              web_root=_REPO / "packages")
     # Stricter than the production default (600/min): a throttled live-
     # refreshing dashboard must respect a finite per-IP budget. This makes the

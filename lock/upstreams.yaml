@@ -4,6 +4,20 @@ version: 1
 # Revisions are immutable where the upstream publishes them; otherwise a
 # documented stable tag is pinned. Audit notes record license/maintenance.
 dependencies:
+  herdr-artifacts:
+    source: "berlinguyinca/herdr-artifacts"
+    revision: "c6156ea"
+    decision: ADOPT
+    license: "MIT"
+    maintenance: "active; standalone artifact skill"
+    note: "Required cross-harness artifact skill, installed into the same four harnesses as herdr-handoff."
+  herdr-handoff:
+    source: "berlinguyinca/herdr-handoff"
+    revision: "3051d8c"
+    decision: ADOPT
+    license: "MIT"
+    maintenance: "active; standalone cross-harness handoff contract"
+    note: "Required operational dependency. Install the pinned CLI and all four harness skills before strict validation."
   herdr:
     source: "official (local binary)"
     revision: "0.9.1"

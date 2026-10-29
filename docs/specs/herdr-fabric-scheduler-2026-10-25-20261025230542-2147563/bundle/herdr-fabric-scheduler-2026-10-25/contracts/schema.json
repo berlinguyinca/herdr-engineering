@@ -1,0 +1,108 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "HerdrPlacementRequest",
+  "type": "object",
+  "required": [
+    "request_id",
+    "owner_id",
+    "agent_family",
+    "placement_mode",
+    "resource_profile"
+  ],
+  "properties": {
+    "request_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "owner_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "project_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "workspace_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "parent_agent_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "agent_family": {
+      "enum": [
+        "pi",
+        "claude-code",
+        "codex",
+        "agent"
+      ]
+    },
+    "placement_mode": {
+      "enum": [
+        "automatic",
+        "manual"
+      ]
+    },
+    "explicit_host_uid": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "preferred_host_uid": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "resource_profile": {
+      "type": "object",
+      "required": [
+        "class"
+      ],
+      "properties": {
+        "class": {
+          "enum": [
+            "interactive",
+            "coding",
+            "planning",
+            "review",
+            "build-test",
+            "benchmark",
+            "observer",
+            "maintenance"
+          ]
+        },
+        "cpu_cores": {
+          "type": "number",
+          "minimum": 0
+        },
+        "memory_gib": {
+          "type": "number",
+          "minimum": 0
+        },
+        "disk_gib": {
+          "type": "number",
+          "minimum": 0
+        }
+      }
+    },
+    "priority": {
+      "enum": [
+        "owner-interactive",
+        "normal",
+        "background"
+      ]
+    },
+    "idempotency_key": {
+      "type": "string"
+    }
+  }
+}

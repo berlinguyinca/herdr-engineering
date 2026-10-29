@@ -10,10 +10,13 @@ was ingested.
 """
 from __future__ import annotations
 
+import json
 import logging
 import secrets
 import threading
 from collections.abc import Callable
+from contextlib import contextmanager
+from dataclasses import replace
 from datetime import datetime
 from typing import Any
 
@@ -92,5 +95,74 @@ class DurableEventSink:
         # permits one operation per connection, including reconnection.
         with self._write_lock:
             self._ensure_store()
-            if not self._run(self._store.append(_dict_to_event(ev))):
+            event = _dict_to_event(ev)
+            if event.entity_type in {"scheduler_reservation", "scheduler_lease", "scheduler_recovery", "scheduler_observation"} or event.event_type == "HostPolicyChanged":
+                event = replace(event, sequence=self._run(self._store.next_sequence(
+                    event.entity_type, event.entity_id)))
+            if not self._run(self._store.append(event)):
                 raise RuntimeError("durable event insert was not acknowledged")
+
+    @contextmanager
+    def scheduler_admission(self):
+        """Serialize admission across control-plane processes in PostgreSQL."""
+        with self._write_lock:
+            self._ensure_store()
+            conn = self._store._conn
+            self._run(conn.execute("BEGIN"))
+            try:
+                self._run(conn.execute("SELECT pg_advisory_xact_lock(724965310221)"))
+                rows = self._run(conn.fetch(
+                    f"SELECT DISTINCT ON (entity_id) payload FROM {self._events_table} "
+                    "WHERE entity_type='scheduler_reservation' "
+                    "ORDER BY entity_id, sequence DESC"))
+                yield [json.loads(row["payload"]) if isinstance(row["payload"], str)
+                       else dict(row["payload"]) for row in rows]
+                self._run(conn.execute("COMMIT"))
+            except BaseException:
+                self._run(conn.execute("ROLLBACK"))
+                raise
+
+    def scheduler_observations(self):
+        """Latest token-bound host facts, read under the admission transaction."""
+        rows = self._run(self._store._conn.fetch(
+            f"SELECT DISTINCT ON (entity_id) entity_id, payload FROM {self._events_table} "
+            "WHERE entity_type='scheduler_observation' ORDER BY entity_id, sequence DESC"))
+        return {row["entity_id"]: json.loads(row["payload"]) if isinstance(row["payload"], str)
+                else dict(row["payload"]) for row in rows}
+
+    def scheduler_policies(self):
+        """Read authoritative policies while the caller holds admission lock."""
+        rows = self._run(self._store._conn.fetch(
+            f"SELECT DISTINCT ON (entity_id) entity_id, payload FROM {self._events_table} "
+            "WHERE entity_type='host' AND event_type='HostPolicyChanged' "
+            "ORDER BY entity_id, sequence DESC"))
+        return {row["entity_id"]: json.loads(row["payload"]) if isinstance(row["payload"], str)
+                else dict(row["payload"]) for row in rows}
+
+    def scheduler_recovery_latest(self, operation_id):
+        with self._write_lock:
+            self._ensure_store()
+            rows = self._run(self._store._conn.fetch(
+                f"SELECT payload FROM {self._events_table} "
+                "WHERE entity_type='scheduler_recovery' AND entity_id=$1 ORDER BY sequence DESC LIMIT 1",
+                operation_id))
+        if not rows:
+            return None
+        payload = rows[0]["payload"]
+        return json.loads(payload) if isinstance(payload, str) else dict(payload)
+
+    @contextmanager
+    def scheduler_recovery_operation(self, operation_id):
+        """Serialize one recovery while each transition commits before side effects."""
+        if not self._dsn:
+            raise RuntimeError("recovery requires a dedicated PostgreSQL lock connection")
+        import asyncpg
+        connection = self._run(asyncpg.connect(self._dsn))
+        try:
+            self._run(connection.execute(
+                "SELECT pg_advisory_lock(hashtextextended($1, 724965310221))", operation_id))
+            yield
+        finally:
+            # Closing the dedicated session releases its lock even if the
+            # coordinator loses transport or an unlock statement cannot run.
+            self._run(connection.close())

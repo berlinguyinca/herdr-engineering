@@ -35,7 +35,7 @@ class Client:
 @pytest.fixture()
 def server(acknowledged_sink):
     repo = ControlPlaneRepo(sink=acknowledged_sink)
-    svr = ControlPlaneServer(repo)
+    svr = ControlPlaneServer(repo, scheduler_admission=True)
     thread = threading.Thread(target=svr.serve, daemon=True)
     thread.start()
     svr.wait_until_ready()
@@ -72,6 +72,20 @@ def test_health_reports_deployment_context(server):
     assert h["commit"] == "dev"
     assert "missions" in h and "timestamp" in h
     assert "requests" in h["performance"]
+
+
+def test_api_responses_have_request_ids_and_health_exposes_latency_diagnostics(server):
+    c, _ = server
+    status, headers, body = c.get("/api/v1/missions")
+    assert status == 200
+    assert headers.get("X-Request-ID")
+    assert json.loads(body)["missions"] == []
+
+    _, _, body = c.get("/api/v1/health")
+    performance = json.loads(body)["performance"]
+    assert performance["by_route"]["/api/v1/missions"]["count"] >= 1
+    assert "latency_ms" in performance["by_route"]["/api/v1/missions"]
+    assert "slow_requests" in performance
 
 
 def test_ingest_accepts_bounded_batch(server):
@@ -492,6 +506,23 @@ def test_fleet_config_requires_valid_host_token(fc_server):
         assert json.loads(body) == {"error": "unauthorized"}
 
 
+def test_resource_telemetry_uses_host_token_identity(fc_server):
+    from datetime import UTC, datetime
+    port, _, _ = fc_server
+    observation = {"host_uid": "host-" + "a" * 32, "captured_at": datetime.now(UTC).isoformat(),
+                   "sequence": 1, "platform": "linux", "cpu_count": 16, "cpu_utilization": .2,
+                   "memory_total_gib": 64, "memory_available_gib": 50,
+                   "disk_total_gib": 500, "disk_free_gib": 400, "pressure": {}}
+    endpoint = "/api/v1/fleet/config/telemetry"
+    status, _, _ = _fc_req(port, "POST", endpoint, {"X-API-Key": "opkey"}, observation)
+    assert status == 401
+    status, _, payload = _fc_req(port, "POST", endpoint,
+                                {"X-Host-Token": "placeholder-host-bender"}, observation)
+    assert status == 200 and json.loads(payload)["capacity_known"] is True
+    status, _, payload = _fc_req(port, "GET", "/api/v1/scheduler", {"X-API-Key": "opkey"})
+    assert json.loads(payload)["hosts"][0]["host_name"] == "bender"
+
+
 def test_fleet_config_returns_scoped_slice_no_store_header(fc_server):
     port, _, _ = fc_server
     status, headers, body = _fc_req(port, "GET", "/api/v1/fleet/config", {"X-Host-Token": "placeholder-host-bender"})
@@ -637,3 +668,76 @@ def test_fleet_config_takes_one_snapshot_per_request(tmp_path, acknowledged_sink
         assert store.calls == 1
     finally:
         svr.shutdown()
+
+
+def test_scheduler_api_is_readable_and_queues_untrusted_host(server):
+    c, repo = server
+    repo.upsert_host("beast", "beast", "100.0.0.2", host_uid="uid-beast", aliases=["beast"],
+                     platform="linux", scheduler_capacity={"total_cpu": 16, "total_memory_gib": 64})
+    status, _, body = c.get("/api/v1/scheduler")
+    assert status == 200 and json.loads(body)["hosts"][0]["host_uid"] == "uid-beast"
+    status, body = c.post("/api/v1/scheduler/plan", {
+        "request_id": "api-request", "agent_family": "codex", "placement_mode": "automatic",
+        "resource_profile": {"class": "coding", "cpu_cores": 1, "memory_gib": 1},
+    })
+    assert status == 200
+    assert json.loads(body)["state"] == "queued"
+
+
+def test_disabled_scheduler_rejects_mutations_but_allows_preview():
+    svr = ControlPlaneServer(ControlPlaneRepo())
+    threading.Thread(target=svr.serve, daemon=True).start()
+    svr.wait_until_ready()
+    try:
+        client = Client(svr.port)
+        request = {"request_id": "disabled-admission", "agent_family": "codex",
+                   "resource_profile": {"class": "coding", "cpu_cores": 1}}
+        assert client.post("/api/v1/scheduler/plan", request)[0] == 200
+        for path in ("reservations", "reservations/commit", "reservations/claim", "launch"):
+            assert client.post("/api/v1/scheduler/" + path, request)[0] == 503
+    finally:
+        svr.shutdown()
+
+
+def test_scheduler_event_stream_redacts_lease_credentials(server):
+    client, repo = server
+    repo.record_event("scheduler_lease", "lease-test", "SchedulerLeaseChanged",
+                      {"token": "private-execution-proof", "generation": 1})
+    status, _, data = client.get("/api/v1/events?entity_type=scheduler_lease&entity_id=lease-test")
+    assert status == 200
+    assert b"private-execution-proof" not in data
+    assert json.loads(data)["events"][0]["payload"]["generation"] == 1
+
+
+def test_scheduler_lease_heartbeat_route_renews_and_rejects_stale_token(server):
+    c, repo = server
+    repo.upsert_host("beast", "beast", "100.0.0.2", host_uid="uid-beast", aliases=["beast"],
+                     platform="linux", scheduler_owned=True, scheduler_trusted=True,
+                     scheduler_policy={"mode": "automatic", "revision": 1},
+                     scheduler_capacity={"total_cpu": 4, "total_memory_gib": 8, "total_disk_gib": 20})
+    repo.record_telemetry("beast", {"freshness_seconds": 1, "sequence": 1})
+    base = {"request_id": "api-lease", "agent_family": "codex", "placement_mode": "automatic",
+            "resource_profile": {"class": "coding", "cpu_cores": 1, "memory_gib": 1}}
+    status, body = c.post("/api/v1/scheduler/reservations", base)
+    assert status == 201
+    reservation = json.loads(body)
+    status, body = c.post("/api/v1/scheduler/reservations/commit", {"reservation_id": reservation["reservation_id"]})
+    assert status == 200
+    committed = json.loads(body)
+    status, claimed = c.post("/api/v1/scheduler/reservations/claim", {
+        "reservation_id": reservation["reservation_id"],
+    })
+    assert status == 200 and json.loads(claimed)["execution_claimed"] is True
+    status, _ = c.post("/api/v1/scheduler/reservations/claim", {
+        "reservation_id": reservation["reservation_id"],
+    })
+    assert status == 409
+    lease = repo.list_scheduler_leases()[0]
+    status, body = c.post("/api/v1/scheduler/leases/heartbeat", {
+        "lease_id": lease["lease_id"], "generation": lease["generation"], "token": lease["token"], "ttl": 120,
+    })
+    assert status == 200 and json.loads(body)["lease_id"] == committed["lease_id"]
+    status, body = c.post("/api/v1/scheduler/leases/heartbeat", {
+        "lease_id": lease["lease_id"], "generation": lease["generation"], "token": "wrong", "ttl": 120,
+    })
+    assert status == 409

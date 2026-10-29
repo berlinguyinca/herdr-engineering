@@ -1,0 +1,46 @@
+{
+  "artifacts": [],
+  "context": {
+    "completed": [
+      "Implementation paused at user request; current changes, verification results, live Mac exclusions, and known gaps are documented in PI_HANDOFF.md and release-safety-audit.md."
+    ],
+    "decisions": [],
+    "goal": "Finish the Herdr Fabric Resource Scheduler P00-P10 from the existing shared worktree. Read docs/specs/herdr-fabric-scheduler-2026-10-25-20261025230542-2147563/PI_HANDOFF.md before any implementation.",
+    "remaining": [
+      "Claim and accept this handoff in Pi. Read the complete handoff and original AGENT_PROMPT/specification bundle. Inspect current git status and mixed diffs; preserve concurrent work.",
+      "Finish real runtime/workspace/artifact/lifecycle integration, server-derived recursive budgets, process-backed fencing and reconciliation, actual fault-injection and canary acceptance, review, commits and PRs. Keep uncertified migration off.",
+      "Latest focused scheduler/service/persistence/adapter suite passed 53 tests. Full repository and deployment acceptance are not complete. Track https://github.com/berlinguyinca/herdr-engineering/issues/290."
+    ],
+    "risks": [],
+    "validation": []
+  },
+  "created_at": "2026-10-26T20:50:20.604135Z",
+  "handoff_id": "handoff_26324334401d4fa59e91dfd6033f223a",
+  "history": [
+    {
+      "actor": "local",
+      "at": "2026-10-26T20:50:20.604368Z",
+      "state": "queued"
+    }
+  ],
+  "mission_id": null,
+  "provenance": {},
+  "redaction": {
+    "policy": "herdr-handoff-v1",
+    "redacted": false
+  },
+  "room_id": null,
+  "schema_version": 1,
+  "session_id": null,
+  "source": {
+    "agent_id": null,
+    "harness": "codex"
+  },
+  "state": "queued",
+  "target": {
+    "agent_id": null,
+    "harness": "pi",
+    "model_hint": null
+  },
+  "updated_at": "2026-10-26T20:50:20.604368Z"
+}
