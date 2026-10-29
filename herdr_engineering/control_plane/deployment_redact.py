@@ -7,7 +7,11 @@ layer does: PEM private keys, auth/cookie/api-key headers, Bearer, URL userinfo,
 ``export ..._KEY=``, argv secret flags, curl/wget/http/openssl/ssh-keygen/docker/
 sshpass/redis-cli/mysql passwords, ``--password-stdin`` feeds, aws/vault/htpasswd,
 signed-URL query secrets and known token formats. Keep in sync with the emitter.
+
+One deliberate difference: ``_STDIN_HERE2`` is the linear ``_stdin_here2`` (the
+regex was a ReDoS); ``emitter-redos.patch`` brings the same change to the emitter.
 """
+import bisect
 import re
 
 R = "[REDACTED]"
@@ -56,7 +60,71 @@ _STDIN_PIPE = re.compile(
     r"(\b(?:echo|printf)[ \t]+(?:-[a-zA-Z]+[ \t]+)*(?:(?:'%s'|\"%s\"|%s)[ \t]+)?)"
     r"(\"[^\"\n]*\"|'[^'\n]*'|[^\s|]+)([ \t]*\|[^\n]{0,200}--password-stdin)")
 _STDIN_HERE1 = re.compile(r"(--password-stdin[^\n]{0,200}?<<<[ \t]*)(\"[^\"\n]*\"|'[^'\n]*'|\S+)")
-_STDIN_HERE2 = re.compile(r"(<<<[ \t]*)(\"[^\"\n]*\"|'[^'\n]*'|\S+)(?=[^\n]{0,200}--password-stdin)")
+
+
+_STDIN_FLAG = "--password-stdin"
+
+
+def _stdin_here2(text):
+    """``<<< VALUE ... --password-stdin`` (VALUE before the flag on the same line).
+
+    Linear-time equivalent of the former regex
+    ``(<<<[ \\t]*)("[^"\\n]*"|'[^'\\n]*'|\\S+)(?=[^\\n]{0,200}--password-stdin)``, which
+    backtracked quadratically on a run of ``<`` (8 KB took over 7 s). Same matches,
+    same greedy choice of VALUE: the longest prefix of the non-space run that has the
+    flag at most 200 characters after it, without a newline in between.
+    """
+    if _STDIN_FLAG not in text or "<<<" not in text:
+        return text
+    flags, at = [], text.find(_STDIN_FLAG)
+    while at >= 0:
+        flags.append(at)
+        at = text.find(_STDIN_FLAG, at + 1)
+    n = len(text)
+    # next whitespace at or after i (\\S is "not str.isspace()"), and the next newline
+    next_ws, next_nl = [n] * (n + 1), [n] * (n + 1)
+    for i in range(n - 1, -1, -1):
+        c = text[i]
+        next_ws[i] = i if c.isspace() else next_ws[i + 1]
+        next_nl[i] = i if c == "\n" else next_nl[i + 1]
+
+    def flag_in(lo, hi):
+        """Largest flag start p with lo <= p <= hi, or -1."""
+        k = bisect.bisect_right(flags, hi) - 1
+        return flags[k] if k >= 0 and flags[k] >= lo else -1
+
+    def ahead(q):  # the lookahead: a flag within 200 chars of q, no newline between
+        return flag_in(q, min(q + 200, next_nl[q])) >= 0
+
+    out, last, pos = [], 0, 0
+    while True:
+        s = text.find("<<<", pos)
+        if s < 0:
+            break
+        j = s + 3
+        while j < n and text[j] in " \t":
+            j += 1
+        end = -1
+        if j < n and text[j] in "\"'":
+            close = text.find(text[j], j + 1)
+            if close >= 0 and next_nl[j] > close and ahead(close + 1):
+                end = close + 1
+        if end < 0 and j < n and next_ws[j] > j:
+            e = next_ws[j]
+            if flag_in(e, min(e + 200, next_nl[e])) >= 0:
+                end = e
+            else:
+                p = flag_in(j + 1, e - 1)
+                if p >= 0:
+                    end = p
+        if end < 0:
+            pos = s + 1
+            continue
+        out.append(text[last:j])
+        out.append(R)
+        last = pos = end
+    out.append(text[last:])
+    return "".join(out)
 
 
 def _cmd(cmd, flags, sep=r"(?:=|[ \t]*)"):
@@ -110,7 +178,7 @@ def _redact_window(text):
     text = _EXPORT.sub(lambda m: m.group(1) + R, text)
     text = _STDIN_PIPE.sub(lambda m: m.group(1) + R + m.group(3), text)
     text = _STDIN_HERE1.sub(lambda m: m.group(1) + R, text)
-    text = _STDIN_HERE2.sub(lambda m: m.group(1) + R, text)
+    text = _stdin_here2(text)
     for rx in _CMDS + (_AWSCFG, _VAULT, _HTPASSWD):
         text = rx.sub(lambda m: m.group(1) + R, text)
     text = _MYSQL.sub(lambda m: m.group(1) + m.group(2) + R, text)

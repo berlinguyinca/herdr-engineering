@@ -7,8 +7,11 @@ Events come from the inferweave host updaters (``deploy/pipelines/deploy_event.p
 import hashlib
 import json
 import os
+import random
+import re
 import socket
 import threading
+import time
 import urllib.error
 import urllib.request
 from datetime import UTC, datetime
@@ -16,11 +19,13 @@ from datetime import UTC, datetime
 import pytest
 import yaml
 
+from herdr_engineering.control_plane import deployment_redact
 from herdr_engineering.control_plane.api import ControlPlaneServer
 from herdr_engineering.control_plane.bridge import load_into
 from herdr_engineering.control_plane.deployments_monitor import (
     MAX_EVIDENCE,
     MAX_REQUEST_BYTES,
+    PRE_REDACT_CAP,
     DeploymentsMonitor,
     redact_evidence,
 )
@@ -309,11 +314,58 @@ def test_evidence_is_capped_keeping_the_tail():
     ("echo dockpw2 | docker login --password-stdin", "dockpw2"),
     ("https://b/o?X-Amz-Signature=sig123abc", "sig123abc"),
     ("token ghp_" + "A" * 30, "ghp_" + "A" * 30),
+    ('cat <<< "here str" | docker login --password-stdin', "here str"),
+    ("<<<hs9--password-stdin", "hs9"),
+    ("docker login --password-stdin <<< hs8", "hs8"),
 ])
 def test_redact_evidence_strips_secrets(secret_text, secret):
     out = redact_evidence(secret_text)
     assert secret not in out
     assert "[REDACTED]" in out
+
+
+# The emitter's former _STDIN_HERE2 regex, kept here as the reference the linear
+# replacement must agree with (it is a ReDoS: never run it on long input).
+_HERE2_REGEX = re.compile(r"(<<<[ \t]*)(\"[^\"\n]*\"|'[^'\n]*'|\S+)(?=[^\n]{0,200}--password-stdin)")
+
+
+def test_linear_stdin_here2_matches_the_former_regex():
+    alphabet = ["<", "<<<", " ", "\t", "\n", '"', "'", "a", "b", "--password-stdin", "-", "|",
+                "x" * 90, "\r", "\u00a0"]
+    rnd = random.Random(1028)
+    for _ in range(20_000):
+        text = "".join(rnd.choice(alphabet) for _ in range(rnd.randint(0, 14)))
+        want = _HERE2_REGEX.sub(lambda m: m.group(1) + "[REDACTED]", text)
+        assert deployment_redact._stdin_here2(text) == want, repr(text)
+
+
+_FILLERS = ["<", "<<<", "a<<<", "-", "--", "\\", " ", "=", ":", '"', "'", "a ", "docker login ",
+            "export ", "Authorization: ", "-----BEGIN ", "echo ", "curl -u ", "mysql -p", "x://",
+            "<<<a --password-stdin", "export A_KEY ", "docker login -p ", "'\"", "= : "]
+
+
+@pytest.mark.parametrize("size", [8192, 66_000, 128 * 1024])
+def test_redaction_stays_fast_on_adversarial_fillers(size):
+    # Each filler, alone and followed by the flag the stdin rules look for. The bound
+    # is generous: the ReDoS this guards against took >7 s at 8 KB and minutes at 128 KiB.
+    for unit in _FILLERS:
+        base = (unit * (size // len(unit) + 1))[:size]
+        for text in (base, base + " --password-stdin"):
+            started = time.perf_counter()
+            deployment_redact.redact(text)
+            assert time.perf_counter() - started < 1.0, (unit, size, "emitter rules")
+            started = time.perf_counter()
+            redact_evidence(text)
+            assert time.perf_counter() - started < 1.0, (unit, size, "redact_evidence")
+
+
+def test_long_evidence_is_cut_before_redaction_and_a_late_secret_is_still_redacted():
+    text = "noise line\n" * 20_000 + "Authorization: Bearer late.secret.value\nFINAL"
+    assert len(text) > 16 * PRE_REDACT_CAP
+    out = redact_evidence(text)
+    assert "late.secret.value" not in out
+    assert out.endswith("FINAL")
+    assert len(out) <= PRE_REDACT_CAP + 64
 
 
 def test_evidence_is_redacted_a_second_time_before_storing():

@@ -34,6 +34,7 @@ import time
 from collections import OrderedDict
 from datetime import UTC, datetime
 
+from .deployment_redact import _drop_partial_start
 from .deployment_redact import redact as _emitter_redact
 from .redact import redact_text
 
@@ -50,6 +51,10 @@ MAX_REQUEST_BYTES = 128 * 1024
 #: Stored evidence cap (the emitter's own cap), tail kept.
 MAX_EVIDENCE = 8192
 TRUNC_MARK = "[earlier output truncated]\n"
+#: Evidence longer than this is cut to its tail BEFORE redaction, so redaction work is
+#: bounded whatever a host sends. The emitter sends at most MAX_EVIDENCE characters;
+#: the margin keeps a key that sits just before the final cap inside the window.
+PRE_REDACT_CAP = MAX_EVIDENCE + 1024
 TIMELINE_LIMIT = 50
 MAX_COMPONENTS = 64
 #: Dedupe keys kept (one per event: its id, else its tuple): 20,000 events fleet-wide,
@@ -89,6 +94,10 @@ def redact_evidence(text: str) -> str:
     """
     if not text:
         return text
+    if len(text) > PRE_REDACT_CAP:
+        # Drop the (possibly partial) first line too: a value whose key was cut off
+        # would no longer look like a secret.
+        text = TRUNC_MARK + _drop_partial_start(text[-PRE_REDACT_CAP:])
     out = redact_text(_emitter_redact(text))
     out = _URL_USERINFO.sub(lambda m: m.group(1) + _R + "@", out)
     out = _SECRET_PAIR.sub(lambda m: m.group(1) + m.group(2) + _R, out)
