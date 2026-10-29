@@ -8,21 +8,71 @@ The scheduler owns placement of Herdr-controlled local agents. InferWeave remain
 - `disabled`, `draining`, stale, unreachable, untrusted, conflicting-identity, and unowned hosts are not automatic candidates.
 - A parent host is lineage metadata, not an implicit child placement pin.
 - External collaborators can appear in the graph but never become owned scheduler hosts.
-- `scheduler.migration` stays `false` unless the runtime family has a verified checkpoint/resume contract and single-writer fence tests.
+- Automatic migration remains unavailable until runtime checkpoint/resume and single-writer fencing are certified.
+
+## Admission configuration and persistence
+
+The central fleet config's `control_plane` section accepts
+`scheduler_admission: false` (the default) and `scheduler_limits`. Limit keys
+include `reservation_ttl`, `owner_queue_limit`, `project_queue_limit`,
+`global_queue_limit`, `owner_concurrency_limit`, `project_concurrency_limit`,
+`mission_concurrency_limit`, `owner_cpu_limit`, `owner_memory_limit`,
+`maximum_spawn_depth`, `parent_concurrency_limit`, and `parent_burst_limit`.
+These settings stay on the server. The host-visible `scheduler` section accepts
+`telemetry: false` to opt out of resource collection. Defaults and bounds are
+defined by `SchedulerService`; preview requests cannot override operator limits.
+
+The existing fleet host loop posts observations to
+`POST /api/v1/fleet/config/telemetry` using `X-Host-Token`. An operator API key
+does not authenticate a host report. Generic ingest cannot grant ownership,
+trust, stable UID, capacity, or operator policy. Reports use the acknowledged
+event store before becoming eligible capacity. Observations and policies
+refresh during admission, and their original capture timestamps expire after
+60 seconds. Ordinary liveness reports do not renew resource freshness.
+
+PostgreSQL admission serializes reservations, queue caps, policy checks, lease
+transitions, and execution claims across replicas. Queue caps count persisted
+rows; lower caps retain existing entries and allow retry/draining. A claim
+requires a live matching execution lease and a final capacity/policy check.
+Receipts and subscriber notifications become visible after transaction commit.
+Commit failure restores prior policy, reservation, and lease projections.
+Backups wait for in-flight admission before copying scheduler state; a backup
+inside the same uncommitted admission is rejected. Refreshed peer observations,
+reservations, and leases are retained in the scheduler snapshot.
+It marks submission ownership; it does not prove a native process is running.
+Native launch adapters and supervised process reconciliation remain separate
+rollout gates.
+
+Active legacy reservations without a saved request context produce
+`LEGACY_CONTEXT_UNKNOWN` and block new placement until reconciled. Reserved
+entries may expire or be cancelled; committed entries require verified process
+reconciliation. Never invent owner/project/workspace attribution or delete the
+audit log to bypass this gate. Historical client policy envelopes are ignored
+as operator receipts; contaminated policy snapshots are disabled pending review.
+Audit historical host ownership and obtain fresh token-bound observations
+before enabling admission for any fleet host.
 
 ## Rollout
 
 1. Snapshot config and sessions; run the existing pytest/Node/Playwright commands and record baseline queue/launch metrics.
 2. Enable stable identity/policy and telemetry shadow collection. Verify Mac aliases remain manual-only and stale hosts are visibly distinct from zero load.
-3. Enable `plan_only`; compare structured explanations against the old placement path without reserving.
-4. Enable `admission` for one collaboration canary. Confirm reservation idempotency, policy-generation recheck, release on launch failure, and no duplicate execution.
-5. Enable `all_spawns` one adapter family at a time after its launch-path contract tests pass.
+3. Use `POST /api/v1/scheduler/plan` for previews while admission remains disabled.
+4. Set `control_plane.scheduler_admission=true` for canary requests. Verify idempotency, policy and capacity rechecks, queue limits, and rollback before wiring native launches.
+5. Integrate each native launch family only after its launch, stop, ownership, and reconciliation contracts pass. This admission increment does not enable all-spawn routing.
 6. Enable quotas/workspace preparation and then the scheduling dashboard. Keep migration disabled.
 7. Run overload, network-partition, stale-host, 100-concurrent, and cross-host parent/child tests before any recovery pilot.
 
 ## Rollback
 
-Set `scheduler.all_spawns=false`, `scheduler.admission=false`, and `scheduler.plan_only=true`; preserve telemetry and audit history. Existing running agents are not killed. Drain queued reservations through release/cancel, inspect `placement_decisions` and execution leases, and return policy mutations using the recorded expected revision. Never roll back by deleting reservations, leases, checkpoints, or audit events.
+Set `control_plane.scheduler_admission=false` and restart the control plane
+using the existing deployment procedure. Server admission and limit values are
+read at startup; changing the file alone does not toggle a running server.
+New reservations, commit, claim,
+and retry return 503. Preview, cancellation of unclaimed work, and maintenance
+of existing leases remain available. Preserve telemetry and audit history;
+existing running agents are not killed. Claimed executions retain capacity
+until a runtime provides verified stop evidence. Never roll back by deleting
+reservations, leases, checkpoints, or audit events.
 
 ## Troubleshooting
 

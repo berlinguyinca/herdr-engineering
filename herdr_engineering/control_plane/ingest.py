@@ -17,19 +17,24 @@ import re
 
 from ..host_policy import normalize_aliases
 from ..review_gate.entities import RESERVED_ENTITY_PREFIXES
-from .ids import validate_mission_id
-
-log = logging.getLogger(__name__)
 from .envelope import ENVELOPE_ONLY_TYPES, EnvelopeConflict, normalize_envelope
 from .events import SequenceCollision
 from .federation import (
-    clamp_for_principal, in_peer_namespace, is_peer_actor, is_peer_node, peer_fingerprint, peer_of,
+    clamp_for_principal,
+    in_peer_namespace,
+    is_peer_actor,
+    is_peer_node,
+    peer_fingerprint,
+    peer_of,
     policy_from_source,
 )
 from .graph import validate_lineage
 from .host_metrics_store import STATE_KEYS, clean_metrics, clean_state
+from .ids import validate_mission_id
 from .project_links import canonical_repository
 from .sink import EventAlreadyStored
+
+log = logging.getLogger(__name__)
 
 
 def _worktree_id(payload):
@@ -73,7 +78,10 @@ GENERIC_ENTITY_TYPES = frozenset({"task", "note", "workspace", "ledger", "platfo
 INGEST_ENTITY_TYPES = DISPATCHED_ENTITY_TYPES | GENERIC_ENTITY_TYPES
 # Event types the server itself writes for an allowed entity type: receipts other code trusts as idempotency
 # markers (repo.send_message, ci_debug, bridge). A client may not name them.
-SERVER_OWNED_EVENT_TYPES = {"session": frozenset({"SessionCommandQueued", "SessionCommandSettled"})}
+SERVER_OWNED_EVENT_TYPES = {
+    "session": frozenset({"SessionCommandQueued", "SessionCommandSettled"}),
+    "host": frozenset({"HostPolicyChanged"}),
+}
 
 # Sources whose host events prove the host is alive: its fabric agent, and the
 # herdr feed plugin on the host (deploy/herdr-cp-feed-plugin posts host.heartbeat
@@ -612,8 +620,7 @@ class IngestService:
         ip = payload.get("tailnet_ip") or payload.get("ip")
         inventory = payload.get("inventory")
         scheduler = {key: payload[key] for key in (
-            "host_uid", "aliases", "platform", "scheduler_owned", "scheduler_trusted",
-            "scheduler_policy", "scheduler_capacity",
+            "aliases", "platform",
         ) if payload.get(key) is not None}
         if "aliases" in scheduler:
             scheduler["aliases"] = normalize_aliases(scheduler["aliases"])

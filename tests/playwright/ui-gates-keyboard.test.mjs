@@ -5,7 +5,7 @@
 // Run: node --test --test-concurrency=1 tests/playwright/ui-gates-keyboard.test.mjs
 import test, { before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { launch, openReal, openSub, settled, startRealServer } from './ui-gates-lib.mjs';
+import { launch, openReal, openSub, settled, startRealServer, scaled } from './ui-gates-lib.mjs';
 
 let srv; let browser; let info;
 before(async () => { srv = await startRealServer({}); info = srv.info; browser = await launch(); });
@@ -153,7 +153,7 @@ test('an owner reads a quarantined proposal and rejects it: keyboard only', asyn
   let asked = '';
   page.once('dialog', (d) => { asked = d.message(); d.accept(); });
   await page.keyboard.press('Enter');
-  await page.waitForFunction(() => !document.querySelector('#hcn-review [data-decide]'), null, { timeout: 8000 });
+  await page.waitForFunction(() => !document.querySelector('#hcn-review [data-decide]'), null, { timeout: scaled(8000) });
   assert.match(asked, /Reject this proposal/);
   assert.match(await page.locator('#hcn-p-proposals').innerText(), /rejected/i);
   await focusIs(page, `[data-proposal="${pid}"]`, 'after rejecting a proposal (back on its row)');
@@ -173,7 +173,7 @@ test('an owner reads a quarantined proposal and accepts it: focus returns to its
     await tabTo(page, '#hcn-review button[data-decide="accept"]');
     page.once('dialog', (d) => d.accept());
     await page.keyboard.press('Enter');
-    await page.waitForFunction(() => !document.querySelector('#hcn-review [data-decide="accept"]'), null, { timeout: 8000 }).catch(() => {});
+    await page.waitForFunction(() => !document.querySelector('#hcn-review [data-decide="accept"]'), null, { timeout: scaled(8000) }).catch(() => {});
     await settled(page, { quietMs: 300 });
     await focusIs(page, `[data-proposal="${pid}"], #hcn-review [data-decide]`, 'after accepting a proposal');
     await pointerFree(page);

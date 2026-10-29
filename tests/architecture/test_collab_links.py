@@ -13,7 +13,6 @@ from helpers import REPO_ID  # noqa: E402
 from herdr_engineering.architecture import analyze  # noqa: E402
 from herdr_engineering.architecture.service import MAX_LINKS_PER_ROOM, ArchitectureService  # noqa: E402
 from herdr_engineering.control_plane.repo import ControlPlaneRepo  # noqa: E402
-from tests.control_plane.conftest import acknowledged_sink  # noqa: E402,F401
 from tests.control_plane.test_collab import BASE, Api, invite, make_room  # noqa: E402
 from tests.control_plane.test_collab_public import H, stack  # noqa: E402,F401
 from tests.control_plane.test_collab_tasks import W, code, svc  # noqa: E402,F401

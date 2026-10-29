@@ -38,7 +38,7 @@ test('nav entry appears only with the capability', async () => {
   await withPage(async (page, base) => {
     await stub(page, { capabilities: [] });
     await page.goto(`${base}/#/overview`);
-    await page.waitForSelector('text=Handoffs');   // the nav (a shadow-DOM element) has rendered
+    await page.waitForSelector('text=Collaboration');   // the nav (a shadow-DOM element) has rendered
     assert.equal(await page.locator('text=Project intelligence').count(), 0);
   });
   await withPage(async (page, base) => {

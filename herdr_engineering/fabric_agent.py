@@ -819,6 +819,8 @@ class FabricAgent:
         self._machine = socket.gethostname()
         self._ownership = ListenerOwnership(self._machine)
         self._git_metadata = ListenerGitMetadata()
+        self._resource_probe = None
+        self._resource_report_at = 0.0
         self._store: dict[str, dict[str, Any]] = self._load_store()
         self._forwards: dict[int, AgentForwarder] = {}
         self._warned_unleased: set[int] = set()
@@ -1340,6 +1342,25 @@ class FabricAgent:
             log.warning("host telemetry report failed: %s", exc)
             return None
 
+    def _report_resources(self):
+        if not self.cfg.control_plane_url or time.monotonic() - self._resource_report_at < 15:
+            return
+        self._resource_report_at = time.monotonic()
+        try:
+            from .host_config import _default_fetch, _read_host_json, host_config
+            from .resource_probe import ResourceProbe
+            if host_config().get("scheduler.telemetry", True) is not True:
+                return
+            host = _read_host_json(Path.home())
+            if self._resource_probe is None:
+                self._resource_probe = ResourceProbe(
+                    self.cfg.store_path.parent / "scheduler-host-identity", Path.home())
+            _default_fetch(host["control_plane_url"] + "/api/v1/fleet/config/telemetry",
+                           token=host["token"], method="POST", body=self._resource_probe.sample(), timeout=2)
+        except Exception:
+            # Metric collection failure must not interrupt service leases.
+            log.debug("resource telemetry unavailable")
+
     def _host_tick(self, now: float | None = None) -> bool:
         """One fast sample + post. Slow data rides along when it is new, and
         again every ``host_slow_interval``. Never raises."""
@@ -1356,6 +1377,7 @@ class FabricAgent:
             slow is not self._slow_handled
             or self._slow_sent is None
             or now - self._slow_sent >= self.cfg.host_slow_interval)
+        self._report_resources()
         status = self._report_host(telemetry, slow_due)
         ok = status is not None and 200 <= status < 300
         if slow_due and (ok or (status is not None and 400 <= status < 500)):
