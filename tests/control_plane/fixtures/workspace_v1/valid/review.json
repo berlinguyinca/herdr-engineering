@@ -1,0 +1,35 @@
+{
+  "actor": {
+    "id": "alice",
+    "kind": "user"
+  },
+  "aliases": [
+    {
+      "system": "hcn",
+      "value": "review-1"
+    }
+  ],
+  "binding": {
+    "commit": "abc1234"
+  },
+  "causation_id": "ev-0",
+  "correlation_id": "co-1",
+  "created_at": "2026-10-28T12:00:00Z",
+  "etag": "sha256:e3ba20fd7743fb38222a2a2aa969e683f0c902bbb99505cca09fad3f791125c0",
+  "id": "urn:herdr:review:c258146f-9885-5add-9aa6-071df999f2a0",
+  "kind": "review",
+  "refs": [
+    "herdr://rooms/room-1"
+  ],
+  "scope": {
+    "room_id": "room-1",
+    "tenant_id": "t1",
+    "visibility": "room"
+  },
+  "source_sequence": 7,
+  "subject_id": "urn:herdr:artifact_version:25e147fe-f881-5e88-9503-9ad01cfeaf6e",
+  "trace_id": "tr-1",
+  "updated_at": "2026-10-28T12:00:00Z",
+  "verdict": "approved",
+  "version": 1
+}

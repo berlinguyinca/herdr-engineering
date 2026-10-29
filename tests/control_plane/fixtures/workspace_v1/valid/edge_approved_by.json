@@ -1,0 +1,14 @@
+{
+  "created_at": "2026-10-28T12:00:00Z",
+  "from_id": "urn:herdr:external_action:fc9ac56d-3553-5a62-aff9-f1268662814d",
+  "id": "urn:herdr:edge:e0917b8e-6802-55e4-b4b6-cc36cadeb74f",
+  "revision": 1,
+  "scope": {
+    "room_id": "room-1",
+    "tenant_id": "t1",
+    "visibility": "room"
+  },
+  "source_event_id": "ev-1",
+  "to_id": "urn:herdr:decision:65b3c7e9-5084-5275-b853-8b47b692c18f",
+  "type": "approved_by"
+}
