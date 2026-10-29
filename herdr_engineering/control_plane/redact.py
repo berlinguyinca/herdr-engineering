@@ -6,6 +6,7 @@ secrets are not stored or rendered.
 """
 from __future__ import annotations
 
+import functools
 import math
 import re
 from typing import Any
@@ -89,6 +90,18 @@ def _redact_private_keys(text: str) -> str:
     return "".join(out)
 
 
+#: Bounded size of the ``redact_text`` memoization cache.
+_REDACT_CACHE_MAXSIZE = 8192
+
+# Redaction rules are module-level constants fixed at import (a rules change ships
+# as a new image / process, which starts a fresh cache). redact_text is pure and
+# deterministic, so memoizing it avoids re-running the regex scan over the same
+# message/payload text on every agent-summaries poll. Bounded so unique large
+# payloads (review bodies, github text) cannot grow memory without limit. Strings
+# are immutable, so sharing a cached result is safe. lru_cache is thread-safe,
+# which matters because the control-plane web redacts concurrently from many
+# request-handler threads (this was a GIL-bound hot path pegging a full core).
+@functools.lru_cache(maxsize=_REDACT_CACHE_MAXSIZE)
 def redact_text(text: str) -> str:
     """Replace secret-looking substrings in a string with [REDACTED]."""
     if not text:
@@ -97,6 +110,11 @@ def redact_text(text: str) -> str:
     for pattern in _PATTERNS:
         out = pattern.sub(_REDACTED, out)
     return out
+
+
+def redact_text_cache_clear() -> None:
+    """Drop the ``redact_text`` memoization cache (tests / future rule hot-reload)."""
+    redact_text.cache_clear()
 
 
 def redact_payload(payload: Any, *, _seen=None, _memo=None) -> Any:
