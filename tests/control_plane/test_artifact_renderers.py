@@ -251,3 +251,21 @@ def test_diagram_dispatch_uses_first_non_comment_line_and_flowcharts_are_unaffec
     cyc = _render("diagram", "graph TD\nA-->B\nB-->A")
     assert "flowchart-svg" in cyc.validation["checks"]
     assert _render("diagram", "pie\n\"a\": 1").validation["findings"][0]["code"] == "not_rendered"
+
+
+def test_diagram_page_declares_color_scheme_and_still_carries_source():
+    rendered = RendererRegistry().render("diagram", "graph TD; A-->B", {}).outputs[0]["content"]
+    fallback = RendererRegistry().render("diagram", "stateDiagram-v2\n A --> B", {}).outputs[0]["content"]
+    for page in (rendered, fallback):
+        assert page.startswith("<!doctype html>") and 'name="color-scheme"' in page
+        assert 'data-diagram-format="mermaid"' in page and "<script" not in page
+
+
+def test_sequence_async_arrows_render_with_arrowheads():
+    from xml.dom import minidom
+
+    result = RendererRegistry().render("diagram", "sequenceDiagram\nA-)B: fire\nB--)A: later", {})
+    svg = next(o for o in result.outputs if o["name"] == "diagram.svg")["content"]
+    minidom.parseString(svg)
+    assert "marker-end" in svg and "stroke-dasharray" in svg
+    assert "findings" not in result.validation

@@ -385,7 +385,7 @@ def render_flowchart_svg(diagram: dict) -> str:
 
 _SEQ_HEADER = re.compile(r"^sequenceDiagram\s*$", re.I)
 _SEQ_PARTICIPANT = re.compile(r"^(participant|actor)\s+([A-Za-z0-9_]+)(?:\s+as\s+(.+))?$")
-_SEQ_MESSAGE = re.compile(r"^([A-Za-z0-9_]+)\s*(-->>|->>|-->|->|--x|-x)\s*[+-]?\s*([A-Za-z0-9_]+)\s*:\s*(.*)$")
+_SEQ_MESSAGE = re.compile(r"^([A-Za-z0-9_]+)\s*(-->>|->>|-->|->|--x|-x|--\)|-\))\s*[+-]?\s*([A-Za-z0-9_]+)\s*:\s*(.*)$")
 _SEQ_NOTE = re.compile(r"^note\s+(over|left of|right of)\s+([A-Za-z0-9_]+)(?:\s*,\s*([A-Za-z0-9_]+))?\s*:\s*(.*)$", re.I)
 _SEQ_IGNORED = re.compile(r"^(?:activate|deactivate)\s+[A-Za-z0-9_]+$|^autonumber(?:\s.*)?$", re.I)
 
@@ -436,6 +436,7 @@ def parse_sequence(source: str) -> dict:
         message = _SEQ_MESSAGE.match(line)
         if message:
             src, op, dst, text = message.groups()
+            op = {"-)": "->>", "--)": "-->>"}.get(op, op)   # async arrows draw as the filled-head arrow of the same line style
             ensure(src)
             ensure(dst)
             events.append({"kind": "message", "src": src, "dst": dst, "op": op, "text": text.strip()})

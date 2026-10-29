@@ -49,6 +49,15 @@ _PAGE_HEAD = (
     "blockquote{margin-left:0;padding-left:1rem;border-left:3px solid color-mix(in srgb,CanvasText 30%,Canvas)}"
     "</style></head><body>\n")
 
+# The diagram page follows the viewer's colour scheme, like the document and deck pages, so the dark SVG panel does not sit on white.
+_DIAGRAM_HEAD = (
+    '<!doctype html><html lang="en"><head><meta charset="utf-8">'
+    '<meta name="viewport" content="width=device-width, initial-scale=1">'
+    '<meta name="color-scheme" content="light dark">'
+    "<style>:root{color-scheme:light dark}"
+    "body{margin:0;padding:1rem;font:16px/1.5 system-ui,sans-serif;background:Canvas;color:CanvasText}"
+    "figure{margin:0 0 1rem;overflow:auto}pre{overflow:auto}</style></head><body>\n")
+
 _SAFE_URL = re.compile(r"^(?:https?:|mailto:)", re.I)
 
 
@@ -263,7 +272,8 @@ class RendererRegistry:
             # Unsupported Mermaid constructs stay inert source until a sandboxed renderer exists.
             content = "<pre data-diagram-format=\"mermaid\">" + html.escape(source) + "</pre>"
             findings.append({"code": "not_rendered", "detail": str(exc)})
-        outputs.insert(0, {"name": "diagram.html", "media_type": "text/html", "content": content})
+        outputs.insert(0, {"name": "diagram.html", "media_type": "text/html",
+                           "content": _DIAGRAM_HEAD + content + "</body></html>\n"})
         validation = {"status": "passed", "checks": checks}
         if findings:
             validation["findings"] = findings

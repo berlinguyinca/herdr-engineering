@@ -3020,6 +3020,7 @@ def _cmd_cp_web(args) -> int:
     from .control_plane.repo import ControlPlaneRepo
     from .control_plane.sink import DurableEventSink
 
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")   # boot phase timings
     fleet_store, cp = _load_cp_fleet_config(getattr(args, "fleet_config", None))
     switch_store = fleet_store
     replay_flag = getattr(args, "collab_replay_history", None)      # an explicit --collab-replay-history wins over the YAML
@@ -3252,6 +3253,7 @@ def _cmd_cp_web(args) -> int:
                              fabric_resolver=_fabric_url_resolver(), fabric_services=_fabric_service_lister(), fabric_names=_fabric_names_getter(),
                              scheduler_admission=cp.get("scheduler_admission") is True,
                              scheduler_limits=cp.get("scheduler_limits") or {},
+                             skill_registry=cp.get("skill_registry"),
                              summary_config=cp.get("agent_summaries") or {},
                              summary_report_config=cp.get("summary_report") or {},
                              unified_workspace_config=cp.get("unified_workspace") if isinstance(cp.get("unified_workspace"), dict) else None,

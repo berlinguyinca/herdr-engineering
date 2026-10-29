@@ -43,7 +43,19 @@ export function overviewModel(data = {}, received = Date.now(), now = Date.now()
   return {missions,sessions,services,hosts:records(data.hosts).sort((a,b)=>text(a.host_name || a.host_id).localeCompare(text(b.host_name || b.host_id)))};
 }
 
-const OVERVIEW_CARDS = ['missions','fleet','sessions','ci','reviews','services','hosts','activity'];
+// A failed CI run only matters until a later run of the same repository and branch has passed.
+const PASSED=['success','passed','finished','complete','completed'];
+export function unresolvedCiFailures(entries) {
+  const prOf=r=>/^refs\/pull\/(\d+)\//.exec(r.ref || '')?.[1] || '', passedAt=new Map(), key=r=>`${r.repository || ''}\u0000${prOf(r) ? `pr${prOf(r)}` : r.branch || ''}`, when=r=>integrationTimestamp(r.updated_at || r.created_at);
+  for(const e of entries)if(PASSED.includes(String(e.record.state || e.record.status || '').toLowerCase()))passedAt.set(key(e.record),Math.max(passedAt.get(key(e.record)) || 0,when(e.record)));
+  // The server marks runs of merged pull requests (pr_merged); failing that, a passing run on the default branch whose message names the pull request ("... (#123)") closes that PR's failures.
+  const merged=new Set();
+  for(const e of entries)if(PASSED.includes(String(e.record.state || e.record.status || '').toLowerCase()) && /^(main|master)$/.test(e.record.branch || ''))
+    for(const m of String(e.record.message || e.record.title || '').matchAll(/\(#(\d+)\)/g))merged.add(`${e.record.repository || ''}#${m[1]}`);
+  const pr=r=>/^refs\/pull\/(\d+)\//.exec(r.ref || '')?.[1] || (String(r.event || '')==='pull_request' ? /^(\d+)$/.exec(String(r.pull_request ?? ''))?.[1] : null);
+  return entries.filter(e=>e.tab==='failed' && !((passedAt.get(key(e.record)) || 0) > when(e.record)) && !e.record.pr_merged && !merged.has(`${e.record.repository || ''}#${pr(e.record)}`));
+}
+const OVERVIEW_CARDS = ['sessions','missions','fleet','ci','reviews','services','hosts','activity'];
 const CARD_LABELS = {missions:'Current missions',fleet:'Fleet health',sessions:'Agents',ci:'CI builds',reviews:'Reviews',services:'HerdR services',hosts:'Hosts',activity:'Recent changes'};
 const PREFERENCES_KEY = 'herdr.overview.layout.v1';
 export function sanitizeOverviewPreferences(value) {
@@ -66,7 +78,9 @@ export function overviewAttention(data = {}, states = {}, received = Date.now(),
   for(const session of model.sessions.failed)if(session.session_id)add(`session:${session.session_id}`,'critical',1,session.display_name || session.title || session.agent_role || 'Failed agent','Agent reported failed',`#/herd/session/${encodeURIComponent(session.session_id)}`,session.updated_at || session.last_activity,'sessions');
   for(const kind of ['ci','reviews']) {
    const seen=new Set();
-   for(const entry of integrationEntries(data[kind],kind)) {
+   const all=integrationEntries(data[kind],kind), open=kind==='ci'?new Set(unresolvedCiFailures(all)):null;
+   for(const entry of all) {
+    if(open && entry.tab==='failed' && !open.has(entry))continue;
     if(seen.has(entry.id))continue;
     seen.add(entry.id);
     if(entry.tab!=='failed' && entry.tab!=='changes')continue;
@@ -127,7 +141,13 @@ function availability(keys, states) {
   return keys.map(key => {
     const state = states[key];
     const label = SOURCE_LABELS[key];
-    if (state?.error) return `<p class="ov-warning" role="status">${esc(label)}: ${typeof state.error === 'string' ? esc(state.error) : 'Could not refresh.'}${state.loaded ? ' Showing last received records.' : ' Data is unavailable; retrying automatically.'}</p>`;
+    if (state?.error) {
+      // One short line per card; the full reason (rate limit, request id) is in the tooltip rather than three lines of text.
+      const detail = typeof state.error === 'string' ? state.error : 'Could not refresh.';
+      const limited = /too many requests/i.test(detail);
+      const short = limited ? 'Could not refresh (rate limited)' : 'Could not refresh';
+      return `<p class="ov-warning ov-stale" role="status" title="${esc(`${label}: ${detail}`)}">↻ ${short} · ${state.loaded ? 'showing last data' : 'retrying'}</p>`;
+    }
     if (!state?.loaded) return `<div data-skeleton aria-busy="true" role="status" aria-label="Loading ${esc(label.toLowerCase())}"><div class="hd-skeleton ov-skeleton" aria-hidden="true"></div>${loadingProgress(label.toLowerCase())}</div>`;
     return '';
   }).join('');
@@ -148,7 +168,7 @@ export function renderOverviewSection(section, data = {}, states = {}, received 
   if (section === 'attention') {
     const mode=states.attention===undefined ? 'browser' : states.attention.error ? 'fallback' : states.attention.loaded && data.attention ? 'server' : states.attention.disabled ? 'browser' : states.attention.loaded ? 'browser' : 'loading';
     if(mode==='loading')return `<div class="ov-heading"><h2 tabindex="-1">Attention</h2></div><div data-skeleton aria-busy="true" role="status" aria-label="Loading attention"><div class="hd-skeleton ov-skeleton" aria-hidden="true"></div>${loadingProgress('attention')}</div>`;
-    const attention=mode==='server' ? serverAttention(data.attention,now) : overviewAttention(data,states,received,now),expanded=data.attentionExpanded===true,limit=6;
+    const attention=mode==='server' ? serverAttention(data.attention,now) : overviewAttention(data,states,received,now),expanded=data.attentionExpanded===true,limit=3;
     const visible=expanded?attention.items:attention.items.slice(0,limit);
     return `<div class="ov-heading"><h2 tabindex="-1">Attention</h2><span class="ov-tag">${attention.items.length ? `${attention.items.length}${attention.complete?'':'+'}` : attention.complete?'0':'—'} ${attention.server?'open':'observed'} items</span></div>
       ${mode==='fallback' ? '<p class="ov-warning" role="status">The shared attention list could not be loaded, so this list is computed in this browser and may differ from the Attention page.</p>' : ''}
@@ -180,14 +200,14 @@ export function renderOverviewSection(section, data = {}, states = {}, received 
   }
   if (section === 'ci' || section === 'reviews') {
     const isCi=section==='ci', snapshot=data[section], entries=integrationEntries(snapshot,section);
-    const current=entries.filter(e=>e.tab==='current'), attention=entries.filter(e=>e.tab===(isCi?'failed':'changes'));
+    const current=entries.filter(e=>e.tab==='current'), attention=isCi?unresolvedCiFailures(entries):entries.filter(e=>e.tab==='changes');
     const ready=states[section]?.loaded;
     const title=isCi?'CI builds':'Plan and code reviews';
     return `<div class="ov-heading"><h2>${title}</h2>${link(`#/${section}`,isCi?'All CI →':'All reviews →')}</div>${availability([section],states)}${ready ? `
       ${isCi && snapshot.available===false && !entries.length ? `<p class="ov-warning">${esc(snapshot.status==='auth_error'?'Woodpecker authentication needs attention.':snapshot.status==='not_configured'?'Woodpecker is not configured.':'CI reports are unavailable.')}</p>` : `<div class="ov-metrics">${metric(current.length,isCi?'Queued / running / unknown':'Awaiting review',`#/${section}`)}${metric(attention.length,isCi?'Failed':'Changes requested',`#/${section}?tab=${isCi?'failed':'changes'}`)}</div>`}
       ${snapshot.stale ? '<p class="ov-warning">Showing stale reports. Open the catalog for connection details.</p>' : ''}
-      ${current.length ? `<ul class="ov-list">${current.slice(0,3).map(e=>`<li class="ov-row"><div>${link(`#/${section}?search=${encodeURIComponent(e.record.repository || e.record.review_id || '')}`,short(e.record.title || e.record.repository || (isCi?'CI run':'Review')))}<p>${esc(isCi?`Run #${e.record.run_number} · ${e.record.branch || 'Branch not reported'}`:e.record.repository || 'Repository not reported')}</p></div><span class="ov-tag">${esc(human(e.record.state || e.record.status) || 'Status unknown')}</span></li>`).join('')}</ul>` : ''}
-      ${isCi && attention.length ? `<h3 class="ov-sub">Latest failures</h3><ul class="ov-list">${attention.slice(0,3).map(e=>`<li class="ov-row"><div>${link(`#/ci?search=${encodeURIComponent(e.record.repository || '')}`,short(e.record.repository || e.record.title || 'CI run'))}<p>${esc(`Run #${e.record.run_number} · ${e.record.branch || 'Branch not reported'}`)}</p></div><span class="ov-tag ov-alert">${esc(human(e.record.state || e.record.status) || 'failed')}</span></li>`).join('')}</ul>` : ''}
+      ${current.length ? `<ul class="ov-list">${current.slice(0,2).map(e=>`<li class="ov-row"><div>${link(`#/${section}?search=${encodeURIComponent(e.record.repository || e.record.review_id || '')}`,short(e.record.title || e.record.repository || (isCi?'CI run':'Review')))}<p>${esc(isCi?`Run #${e.record.run_number} · ${e.record.branch || 'Branch not reported'}`:e.record.repository || 'Repository not reported')}</p></div><span class="ov-tag">${esc(human(e.record.state || e.record.status) || 'Status unknown')}</span></li>`).join('')}</ul>` : ''}
+      ${isCi && attention.length ? `<h3 class="ov-sub">Latest failures</h3><ul class="ov-list">${attention.slice(0,2).map(e=>`<li class="ov-row"><div>${link(`#/ci?search=${encodeURIComponent(e.record.repository || '')}`,short(e.record.repository || e.record.title || 'CI run'))}<p>${esc(`Run #${e.record.run_number} · ${e.record.branch || 'Branch not reported'}`)}</p></div><span class="ov-tag ov-alert">${esc(human(e.record.state || e.record.status) || 'failed')}</span></li>`).join('')}</ul>` : ''}
       <p class="ov-note">${isCi?'Recent pipeline window; inspect steps, output and provider refresh progress.':'Review decisions and revision links stay with Plannotator.'}</p>` : ''}`;
   }
   if (section === 'services') {
@@ -226,10 +246,10 @@ export function renderOverviewSection(section, data = {}, states = {}, received 
 }
 
 const styles = `<style>
-.ov-sub{font-size:13px;margin:14px 0 0}.ov-skeleton{height:58px;margin:10px 0}.ov-health .ov-skeleton{height:1em;width:16em;margin:0}.ov-snooze{font:inherit;font-size:11px;margin-top:6px;padding:2px 8px;border:1px solid var(--border);border-radius:var(--radius-sm);background:var(--surface);color:var(--text-secondary);cursor:pointer}.ov-intro,.ov-note{color:var(--text-secondary);font-size:13px;line-height:1.6}.ov-intro{max-width:75ch;margin:0 0 18px}.ov-layout{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px;align-items:start}.ov-panel{min-width:0;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:16px;overflow-wrap:anywhere}.ov-panel[data-overview=missions]{grid-column:span 2}.ov-panel[data-overview=fleet]{grid-column:auto}.ov-heading{display:flex;justify-content:space-between;align-items:baseline;gap:12px;margin-bottom:12px}.ov-heading h2{font-size:17px;margin:0}.ov-heading>a{font-size:12px;white-space:nowrap}.ov-metrics{display:flex;flex-wrap:wrap;gap:10px;margin:10px 0}.ov-metric{display:flex;flex-direction:column;gap:4px;padding:9px 12px;background:var(--bg);border:1px solid var(--border-subtle);border-radius:var(--radius-sm);font-size:12px;color:var(--text);text-decoration:none}.ov-metric strong{font-size:23px;line-height:1.2}.ov-list{list-style:none;padding:0;margin:0}.ov-row{display:flex;justify-content:space-between;align-items:start;gap:14px;padding:9px 0;border-top:1px solid var(--border-subtle);font-size:13px;line-height:1.45}.ov-row>div{min-width:0;flex:1}.ov-row>div>a{font-weight:600;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}.ov-row p{margin:3px 0 0;color:var(--text-secondary);font-size:12px;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}.ov-tag{font-size:12px;color:var(--text-secondary);max-width:45%;text-align:right}.ov-alert,.ov-warning{color:var(--status-attention)}.ov-warning{font-size:12px;line-height:1.6}.ov-history{display:flex;flex-wrap:wrap;gap:14px;border-top:1px solid var(--border-subtle);padding-top:10px;margin-top:10px;font-size:12px}.ov-health{display:flex;flex-wrap:wrap;gap:16px;color:var(--text-secondary);font-size:12px;margin:18px 0}.ov-health p{margin:0}
-@media(min-width:2200px){.ov-layout{grid-template-columns:repeat(4,minmax(0,1fr))}.ov-panel[data-overview=missions],.ov-panel[data-overview=fleet],.ov-panel[data-overview=hosts],.ov-panel[data-overview=activity]{grid-column:span 2}}
-@media(max-width:1180px){.ov-layout{grid-template-columns:repeat(2,minmax(0,1fr))}.ov-panel[data-overview=missions]{grid-column:1/-1;grid-row:auto}.ov-panel[data-overview=fleet]{grid-column:1/-1}}
-@media(max-width:960px){.ov-layout{grid-template-columns:minmax(0,1fr)}.ov-panel[data-overview=missions],.ov-panel[data-overview=fleet]{grid-column:auto}.ov-panel{padding:14px}.ov-row{gap:10px}.ov-tag{max-width:42%}.ov-metric{padding:9px}.ov-metrics{gap:8px}.ov-heading{gap:8px}}
+.ov-sub{font-size:13px;margin:14px 0 0}.ov-stale{font-size:12px;margin:8px 0 0;color:var(--status-attention)}.ov-panel .ov-note,.ov-panel p.ov-note{font-size:12px;color:var(--text-muted);margin:8px 0 0}.ov-skeleton{height:58px;margin:10px 0}.ov-health .ov-skeleton{height:1em;width:16em;margin:0}.ov-snooze{font:inherit;font-size:11px;margin-top:6px;padding:2px 8px;border:1px solid var(--border);border-radius:var(--radius-sm);background:var(--surface);color:var(--text-secondary);cursor:pointer}.ov-intro,.ov-note{color:var(--text-secondary);font-size:13px;line-height:1.6}.ov-intro{max-width:75ch;margin:0 0 18px}.ov-layout{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px;align-items:start}.ov-panel{min-width:0;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:16px;overflow-wrap:anywhere}.ov-panel[data-overview=sessions]{grid-column:span 2}.ov-panel[data-empty]{display:none}.ov-panel[data-overview=fleet]{grid-column:auto}.ov-heading{display:flex;justify-content:space-between;align-items:baseline;gap:12px;margin-bottom:12px}.ov-heading h2{font-size:17px;margin:0}.ov-heading>a{font-size:12px;white-space:nowrap}.ov-metrics{display:flex;flex-wrap:wrap;gap:10px;margin:10px 0}.ov-metric{display:flex;flex-direction:column;gap:4px;padding:9px 12px;background:var(--bg);border:1px solid var(--border-subtle);border-radius:var(--radius-sm);font-size:12px;color:var(--text);text-decoration:none}.ov-metric strong{font-size:23px;line-height:1.2}.ov-list{list-style:none;padding:0;margin:0}.ov-row{display:flex;justify-content:space-between;align-items:start;gap:14px;padding:9px 0;border-top:1px solid var(--border-subtle);font-size:13px;line-height:1.45}.ov-row>div{min-width:0;flex:1}.ov-row>div>a{font-weight:600;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}.ov-row p{margin:3px 0 0;color:var(--text-secondary);font-size:12px;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}.ov-tag{font-size:12px;color:var(--text-secondary);max-width:45%;text-align:right}.ov-alert,.ov-warning{color:var(--status-attention)}.ov-warning{font-size:12px;line-height:1.6}.ov-history{display:flex;flex-wrap:wrap;gap:14px;border-top:1px solid var(--border-subtle);padding-top:10px;margin-top:10px;font-size:12px}.ov-health{display:flex;flex-wrap:wrap;gap:16px;color:var(--text-secondary);font-size:12px;margin:18px 0}.ov-health p{margin:0}
+@media(min-width:2200px){.ov-layout{grid-template-columns:repeat(4,minmax(0,1fr))}.ov-panel[data-overview=sessions],.ov-panel[data-overview=missions],.ov-panel[data-overview=hosts],.ov-panel[data-overview=activity]{grid-column:span 2}}
+@media(max-width:1180px){.ov-layout{grid-template-columns:repeat(2,minmax(0,1fr))}.ov-panel[data-overview=sessions]{grid-column:1/-1;grid-row:auto}}
+@media(max-width:960px){.ov-layout{grid-template-columns:minmax(0,1fr)}.ov-panel[data-overview=sessions]{grid-column:auto}.ov-panel{padding:14px}.ov-row{gap:10px}.ov-tag{max-width:42%}.ov-metric{padding:9px}.ov-metrics{gap:8px}.ov-heading{gap:8px}}
 .ov-attention{margin-bottom:16px}.ov-attention-list{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,340px),1fr));gap:0 24px}.ov-attention-list.is-expanded{max-height:min(60vh,560px);overflow:auto;overscroll-behavior:contain;scrollbar-gutter:stable}.ov-attention-controls{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:8px}.ov-attention-controls button{font:inherit;font-size:13px;color:var(--text);background:var(--bg);border:1px solid var(--border);border-radius:var(--radius-sm);padding:9px 12px;min-height:44px;cursor:pointer}.ov-attention-controls button:focus-visible,.ov-attention-list:focus-visible{outline:2px solid var(--accent);outline-offset:3px}.ov-panel[hidden]{display:none}.ov-customize{margin:0 0 16px;font-size:13px}.ov-customize>summary{cursor:pointer;width:fit-content;padding:8px 0}.ov-control-row{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin:8px 0}.ov-control-row strong{min-width:145px}.ov-customize button{font:inherit;color:var(--text);background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-sm);padding:7px 10px;cursor:pointer}.ov-customize button:disabled{opacity:.45;cursor:default}.ov-customize button:focus-visible,.ov-customize summary:focus-visible{outline:2px solid var(--accent);outline-offset:3px}.ov-layout:has(>[hidden]){grid-template-columns:repeat(auto-fit,minmax(min(100%,360px),1fr))}.ov-layout:has(>[hidden])>.ov-panel{grid-column:auto}
 @media(max-width:960px){.ov-layout:has(>[hidden]){grid-template-columns:minmax(0,1fr)}.ov-control-row{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));padding-bottom:8px;border-bottom:1px solid var(--border)}.ov-control-row strong{grid-column:1/-1}.ov-customize button{min-height:44px;padding:8px 4px}}
 </style>`;
@@ -269,7 +289,7 @@ export function mountOverview(container, client, { freshness = () => null } = {}
     attention:signal=>client.attention({state:'open'},{signal}).catch(error=>{if(error?.status===404)return {disabled:true};throw error;}),
   };
   states.attention={loaded:false,error:false};
-  container.innerHTML=`${styles}<p class="ov-intro">Current work and changes that matter.</p><details class="ov-customize"><summary>Customize Overview</summary><p class="ov-note">Attention is always visible. Health stays in the footer.</p><div data-overview-controls></div><button type="button" data-overview-reset>Reset layout</button></details><section class="ov-panel ov-attention" data-overview="attention" aria-label="Attention"></section><div class="ov-layout">${OVERVIEW_CARDS.map(key=>`<section class="ov-panel" data-overview="${key}" aria-label="${key}"></section>`).join('')}</div><footer class="ov-health" data-overview="health"></footer>`;
+  container.innerHTML=`${styles}<details class="ov-customize"><summary>Customize Overview</summary><p class="ov-note">Attention is always visible. Health stays in the footer.</p><div data-overview-controls></div><button type="button" data-overview-reset>Reset layout</button></details><section class="ov-panel ov-attention" data-overview="attention" aria-label="Attention"></section><div class="ov-layout">${OVERVIEW_CARDS.map(key=>`<section class="ov-panel" data-overview="${key}" aria-label="${key}"></section>`).join('')}</div><footer class="ov-health" data-overview="health"></footer>`;
   function applyPreferences() {
     const focused=document.activeElement;
     const action=focused?.dataset.overviewAction, card=focused?.dataset.card;
@@ -319,6 +339,16 @@ export function mountOverview(container, client, { freshness = () => null } = {}
   // Tiles count up only for data-driven changes: not while sources are still landing on first load,
   // and not right after the user snoozed or restored missions.
   let motionSettled=false, userChange=false;
+  // A card with nothing active (loaded, no rows, every tile zero, no warning) is not drawn; it returns when something happens.
+  const EMPTY_SOURCE={sessions:'sessions',missions:'projections',fleet:'fleet',ci:'ci',reviews:'reviews',services:'services',hosts:'hosts',activity:'activity'};
+  function setEmpty(panel,element) {
+    const source=EMPTY_SOURCE[panel];
+    if(!source)return;
+    // A refresh that failed after data had loaded (a rate limit, a blip) does not bring an empty card back.
+    const ready=states[source]?.loaded;
+    const empty=ready && !element.querySelector('.ov-row,.ov-warning:not(.ov-stale),[data-skeleton],herdr-error') && (m=>m.length>0 && m.every(n=>/^[0—]$/.test(n.textContent.trim())))([...element.querySelectorAll('.ov-metric strong')]) && !/\b[1-9]\d*\s+(unavailable|unconfirmed|failed|archived)/i.test([...element.querySelectorAll('.ov-note')].map(n=>n.textContent).join(' '));
+    if(empty)element.setAttribute('data-empty','');else element.removeAttribute('data-empty');
+  }
   function draw() {
     if(disposed || document.hidden)return;
     // Settled = every source has answered once, with data or an error: a source that keeps failing
@@ -347,6 +377,7 @@ export function mountOverview(container, client, { freshness = () => null } = {}
       // heading) instead of dropping to <body>; handOff cleans up any node morph kept only because
       // the user was in it.
       const stranded=morph(element,html);
+      setEmpty(panel,element);
       animateChanges(element,'.ov-metric strong',metrics,metricKey);
       if(panel==='attention')markNewCritical(element);
       const expandedList=element.querySelector('.ov-attention-list.is-expanded');
@@ -380,7 +411,7 @@ export function mountOverview(container, client, { freshness = () => null } = {}
     onError(key, error) {
       const detail = requestErrorDetail(error);
       states[key]={...states[key],error:`Could not refresh: ${detail}`};
-      chip.fail(key,`${SOURCE_LABELS[key]}: ${detail}`); draw();
+      chip.fail(key,/too many requests|rate.?limit|429/i.test(detail)?`${SOURCE_LABELS[key]} rate limited`:`${SOURCE_LABELS[key]}: ${String(detail).split(/\s*·\s*Request\b/)[0].slice(0,80)}`); draw();
     },
   });
   function refresh() { polling.refresh(); }

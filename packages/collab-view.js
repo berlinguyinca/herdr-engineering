@@ -254,9 +254,9 @@ export function mountCollab(root, { fabricSessions = null, onFreshness = () => {
           <span class="cx-row cx-row--between">${pill(roleLabel(r.role), r.role === 'owner' ? 'var(--accent)' : 'var(--status-active)')}<span class="hd-card__sub">Open →</span></span></button>`).join('')}</div>`
         : '<div class="hd-empty">No rooms yet. Create your first one below.</div>'}
       ${operator ? '<div id="hcn-helpers-panel"></div>' : ''}
-      <section class="cx-section"><h2>New room</h2>
+      <details class="cx-section cx-newroom"${rooms.length ? '' : ' open'}><summary>New room</summary>
         <form id="hcn-new" class="hd-card cx-form"><label class="cx-field">Room name<input name="name" required maxlength="120" placeholder="e.g. Metabolomics review"></label>
-          <button class="hd-btn" type="submit">Create room</button><span id="hcn-new-msg" class="cx-msg" role="status"></span></form></section>`, strip);
+          <button class="hd-btn" type="submit">Create room</button><span id="hcn-new-msg" class="cx-msg" role="status"></span></form></details>`, strip);
     document.querySelectorAll('#hcn-rooms [data-room]').forEach((b) => { b.onclick = () => { go(`/room/${encodeURIComponent(b.dataset.room)}`); }; });
     if (operator && $('hcn-helpers-panel')) {   // all rooms' host requests, helpers and the panic switch; the operator is rarely a member of the rooms asking
       const panel = createHelpersPanel({ container: $('hcn-helpers-panel'), api, operator, getRooms: async () => (await api.rooms()).rooms || [], go, hidden: () => document.hidden });
@@ -625,12 +625,20 @@ export function mountCollab(root, { fabricSessions = null, onFreshness = () => {
     let names = new Map((info.members || []).map((m) => [m.user_id, m.email || shortId(m.user_id)]));
     const agentName = new Map();           // agent id -> handle, for rendering task events
     const S = { agents: [], people: [], tasks: [], flow: null, requests: null, mine: [], links: null, missions: null, tabs: null, tabsAt: 0, tabSel: null, externals: null, deleg: null, props: null, propSel: null, propOne: null, profile: null, allow: [], egress: [], helpers: [], paused: false, entries: null };
-    const tabs = [['chat', 'Chat'], ...(guest ? [] : [['flow', 'Flow']]), ['tasks', 'Tasks'], ...(guest ? [] : [['agents', 'Agents'], ['tabs', 'Tabs'], ['lineage', 'Lineage'], ['attention', 'Attention'], ['progress', 'Progress'], ['links', 'Workspaces']]), ...(canInvite ? [['proposals', 'Proposals'], ['people', 'People']] : [])];
+    // Collaboration is where people and agents talk and where work is assigned to agents: those four tabs lead, the rest are
+    // supporting views shown quieter (still reachable, still tabs).
+    const MAJOR_SUBS = ['chat', 'tasks', 'agents', 'lineage'];
+    const SUB_USE = { chat: 'Talk with the people and agents in this room', tasks: 'Assign work to an agent and follow it', agents: 'Who is in the room and what they may do',
+      lineage: 'How work started and moved between agents', flow: 'Who is handing work to whom, as a graph', tabs: 'Agents by terminal tab, and remote-agent invites',
+      attention: 'Items in this room that need a person', progress: 'How far assigned work has come', links: 'Workspaces linked to this room',
+      proposals: 'Changes agents propose, held until reviewed', people: 'Members and invitations' };
+    const order = (list) => [...list.filter(([k]) => MAJOR_SUBS.includes(k)), ...list.filter(([k]) => !MAJOR_SUBS.includes(k))];
+    const tabs = order([['chat', 'Chat'], ...(guest ? [] : [['flow', 'Flow']]), ['tasks', 'Tasks'], ...(guest ? [] : [['agents', 'Agents'], ['tabs', 'Tabs'], ['lineage', 'Lineage'], ['attention', 'Attention'], ['progress', 'Progress'], ['links', 'Workspaces']]), ...(canInvite ? [['proposals', 'Proposals'], ['people', 'People']] : [])]);
     let sub = subTab.get(roomId);
     if (!tabs.some(([k]) => k === sub)) sub = 'chat';
 
     frame('/rooms', `<div class="cx-roomhead"><h1>${esc(info.name)}</h1>${pill(roleLabel(info.role), 'var(--accent)')}</div>
-      <div class="cx-stabs" role="tablist" aria-label="${esc(info.name)}">${tabs.map(([k, l]) => `<button type="button" class="cx-stab" role="tab" id="hcn-st-${k}" aria-controls="hcn-p-${k}" data-sub="${k}" data-label="${l}" aria-label="${l}" aria-selected="${k === sub}">${l}<span class="cx-badge" id="hcn-b-${k}" aria-hidden="true" hidden></span></button>`).join('')}</div>
+      <div class="cx-stabs" role="tablist" aria-label="${esc(info.name)}">${tabs.map(([k, l]) => `<button type="button" class="cx-stab${MAJOR_SUBS.includes(k) ? '' : ' cx-stab--minor'}" title="${esc(SUB_USE[k] || '')}" role="tab" id="hcn-st-${k}" aria-controls="hcn-p-${k}" data-sub="${k}" data-label="${l}" aria-label="${l}" aria-selected="${k === sub}">${l}<span class="cx-badge" id="hcn-b-${k}" aria-hidden="true" hidden></span></button>`).join('')}</div>
       <section class="hd-card cx-chat cx-panel" id="hcn-p-chat" aria-label="Conversation">
         <div id="hcn-log" class="cx-log" role="log" aria-live="polite"><div class="hd-empty" id="hcn-empty">No messages yet.</div></div>
         <button type="button" id="hcn-jump" class="hd-btn hd-btn--sm cx-jump" hidden>↓ New messages</button>
