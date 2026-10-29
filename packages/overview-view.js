@@ -127,7 +127,13 @@ function availability(keys, states) {
   return keys.map(key => {
     const state = states[key];
     const label = SOURCE_LABELS[key];
-    if (state?.error) return `<p class="ov-warning" role="status">${esc(label)}: ${typeof state.error === 'string' ? esc(state.error) : 'Could not refresh.'}${state.loaded ? ' Showing last received records.' : ' Data is unavailable; retrying automatically.'}</p>`;
+    if (state?.error) {
+      // One short line per card; the full reason (rate limit, request id) is in the tooltip rather than three lines of text.
+      const detail = typeof state.error === 'string' ? state.error : 'Could not refresh.';
+      const limited = /too many requests/i.test(detail);
+      const short = limited ? 'Could not refresh (rate limited)' : 'Could not refresh';
+      return `<p class="ov-warning ov-stale" role="status" title="${esc(`${label}: ${detail}`)}">↻ ${short} · ${state.loaded ? 'showing last data' : 'retrying'}</p>`;
+    }
     if (!state?.loaded) return `<div data-skeleton aria-busy="true" role="status" aria-label="Loading ${esc(label.toLowerCase())}"><div class="hd-skeleton ov-skeleton" aria-hidden="true"></div>${loadingProgress(label.toLowerCase())}</div>`;
     return '';
   }).join('');
@@ -226,7 +232,7 @@ export function renderOverviewSection(section, data = {}, states = {}, received 
 }
 
 const styles = `<style>
-.ov-sub{font-size:13px;margin:14px 0 0}.ov-panel .ov-note,.ov-panel p.ov-note{font-size:12px;color:var(--text-muted);margin:8px 0 0}.ov-skeleton{height:58px;margin:10px 0}.ov-health .ov-skeleton{height:1em;width:16em;margin:0}.ov-snooze{font:inherit;font-size:11px;margin-top:6px;padding:2px 8px;border:1px solid var(--border);border-radius:var(--radius-sm);background:var(--surface);color:var(--text-secondary);cursor:pointer}.ov-intro,.ov-note{color:var(--text-secondary);font-size:13px;line-height:1.6}.ov-intro{max-width:75ch;margin:0 0 18px}.ov-layout{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px;align-items:start}.ov-panel{min-width:0;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:16px;overflow-wrap:anywhere}.ov-panel[data-overview=sessions]{grid-column:span 2}.ov-panel[data-empty]{display:none}.ov-panel[data-overview=fleet]{grid-column:auto}.ov-heading{display:flex;justify-content:space-between;align-items:baseline;gap:12px;margin-bottom:12px}.ov-heading h2{font-size:17px;margin:0}.ov-heading>a{font-size:12px;white-space:nowrap}.ov-metrics{display:flex;flex-wrap:wrap;gap:10px;margin:10px 0}.ov-metric{display:flex;flex-direction:column;gap:4px;padding:9px 12px;background:var(--bg);border:1px solid var(--border-subtle);border-radius:var(--radius-sm);font-size:12px;color:var(--text);text-decoration:none}.ov-metric strong{font-size:23px;line-height:1.2}.ov-list{list-style:none;padding:0;margin:0}.ov-row{display:flex;justify-content:space-between;align-items:start;gap:14px;padding:9px 0;border-top:1px solid var(--border-subtle);font-size:13px;line-height:1.45}.ov-row>div{min-width:0;flex:1}.ov-row>div>a{font-weight:600;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}.ov-row p{margin:3px 0 0;color:var(--text-secondary);font-size:12px;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}.ov-tag{font-size:12px;color:var(--text-secondary);max-width:45%;text-align:right}.ov-alert,.ov-warning{color:var(--status-attention)}.ov-warning{font-size:12px;line-height:1.6}.ov-history{display:flex;flex-wrap:wrap;gap:14px;border-top:1px solid var(--border-subtle);padding-top:10px;margin-top:10px;font-size:12px}.ov-health{display:flex;flex-wrap:wrap;gap:16px;color:var(--text-secondary);font-size:12px;margin:18px 0}.ov-health p{margin:0}
+.ov-sub{font-size:13px;margin:14px 0 0}.ov-stale{font-size:12px;margin:8px 0 0;color:var(--status-attention)}.ov-panel .ov-note,.ov-panel p.ov-note{font-size:12px;color:var(--text-muted);margin:8px 0 0}.ov-skeleton{height:58px;margin:10px 0}.ov-health .ov-skeleton{height:1em;width:16em;margin:0}.ov-snooze{font:inherit;font-size:11px;margin-top:6px;padding:2px 8px;border:1px solid var(--border);border-radius:var(--radius-sm);background:var(--surface);color:var(--text-secondary);cursor:pointer}.ov-intro,.ov-note{color:var(--text-secondary);font-size:13px;line-height:1.6}.ov-intro{max-width:75ch;margin:0 0 18px}.ov-layout{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px;align-items:start}.ov-panel{min-width:0;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:16px;overflow-wrap:anywhere}.ov-panel[data-overview=sessions]{grid-column:span 2}.ov-panel[data-empty]{display:none}.ov-panel[data-overview=fleet]{grid-column:auto}.ov-heading{display:flex;justify-content:space-between;align-items:baseline;gap:12px;margin-bottom:12px}.ov-heading h2{font-size:17px;margin:0}.ov-heading>a{font-size:12px;white-space:nowrap}.ov-metrics{display:flex;flex-wrap:wrap;gap:10px;margin:10px 0}.ov-metric{display:flex;flex-direction:column;gap:4px;padding:9px 12px;background:var(--bg);border:1px solid var(--border-subtle);border-radius:var(--radius-sm);font-size:12px;color:var(--text);text-decoration:none}.ov-metric strong{font-size:23px;line-height:1.2}.ov-list{list-style:none;padding:0;margin:0}.ov-row{display:flex;justify-content:space-between;align-items:start;gap:14px;padding:9px 0;border-top:1px solid var(--border-subtle);font-size:13px;line-height:1.45}.ov-row>div{min-width:0;flex:1}.ov-row>div>a{font-weight:600;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}.ov-row p{margin:3px 0 0;color:var(--text-secondary);font-size:12px;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}.ov-tag{font-size:12px;color:var(--text-secondary);max-width:45%;text-align:right}.ov-alert,.ov-warning{color:var(--status-attention)}.ov-warning{font-size:12px;line-height:1.6}.ov-history{display:flex;flex-wrap:wrap;gap:14px;border-top:1px solid var(--border-subtle);padding-top:10px;margin-top:10px;font-size:12px}.ov-health{display:flex;flex-wrap:wrap;gap:16px;color:var(--text-secondary);font-size:12px;margin:18px 0}.ov-health p{margin:0}
 @media(min-width:2200px){.ov-layout{grid-template-columns:repeat(4,minmax(0,1fr))}.ov-panel[data-overview=sessions],.ov-panel[data-overview=missions],.ov-panel[data-overview=hosts],.ov-panel[data-overview=activity]{grid-column:span 2}}
 @media(max-width:1180px){.ov-layout{grid-template-columns:repeat(2,minmax(0,1fr))}.ov-panel[data-overview=sessions]{grid-column:1/-1;grid-row:auto}}
 @media(max-width:960px){.ov-layout{grid-template-columns:minmax(0,1fr)}.ov-panel[data-overview=sessions]{grid-column:auto}.ov-panel{padding:14px}.ov-row{gap:10px}.ov-tag{max-width:42%}.ov-metric{padding:9px}.ov-metrics{gap:8px}.ov-heading{gap:8px}}
@@ -324,8 +330,9 @@ export function mountOverview(container, client, { freshness = () => null } = {}
   function setEmpty(panel,element) {
     const source=EMPTY_SOURCE[panel];
     if(!source)return;
-    const ready=states[source]?.loaded && !states[source]?.error;
-    const empty=ready && !element.querySelector('.ov-row,.ov-warning,[data-skeleton],herdr-error') && [...element.querySelectorAll('.ov-metric strong')].every(n=>/^[0—]$/.test(n.textContent.trim()));
+    // A refresh that failed after data had loaded (a rate limit, a blip) does not bring an empty card back.
+    const ready=states[source]?.loaded;
+    const empty=ready && !element.querySelector('.ov-row,.ov-warning:not(.ov-stale),[data-skeleton],herdr-error') && [...element.querySelectorAll('.ov-metric strong')].every(n=>/^[0—]$/.test(n.textContent.trim()));
     if(empty)element.setAttribute('data-empty','');else element.removeAttribute('data-empty');
   }
   function draw() {
@@ -390,7 +397,7 @@ export function mountOverview(container, client, { freshness = () => null } = {}
     onError(key, error) {
       const detail = requestErrorDetail(error);
       states[key]={...states[key],error:`Could not refresh: ${detail}`};
-      chip.fail(key,`${SOURCE_LABELS[key]}: ${detail}`); draw();
+      chip.fail(key,/too many requests|rate.?limit|429/i.test(detail)?`${SOURCE_LABELS[key]} rate limited`:`${SOURCE_LABELS[key]}: ${String(detail).split(/\s*·\s*Request\b/)[0].slice(0,80)}`); draw();
     },
   });
   function refresh() { polling.refresh(); }
