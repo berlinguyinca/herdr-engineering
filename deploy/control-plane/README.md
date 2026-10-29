@@ -251,7 +251,15 @@ request** that the host updater picks up on its next poll. The routes (each also
 - **Requests** are kept until cleared or for 24 h, at most 256 pending (more is refused with 429).
 - **Host token scope.** The host token grants only these host routes, and only for the components whose
   definition names that host. Every other route still answers 401.
+- **Release evidence is not wired yet: wire it before enabling any host gate.** herdr has no source for the
+  release asset's `.commit` or its ancestry on main, so the evidence is "unknown" and the coordinator holds with
+  "release not confirmed". Every permit then answers `permitted: false`, and a host updater that has a gate URL
+  (`IW_DEPLOY_GATE_URL`) stays on its running version indefinitely. Setting `deployment_evidence` (the
+  release-evidence hook) is a prerequisite to turning on any host gate.
 - **The permit gate is not behind the flag.**
+  - Nothing is permitted unless the newest tick confirmed the release (published commit matches the target)
+    AND the target on main. Not the plan, not a force, and not a repair other than a rollback to herdr's
+    recorded previous good commit.
   - A component is permitted when the newest coordinator tick (at most 90 s old, not stale) lists it in
     `permitted` and the commit is the plan target.
   - A pending force for that component and target also permits it, but only where staging holds the plan: a Start
@@ -260,7 +268,12 @@ request** that the host updater picks up on its next poll. The routes (each also
   - A force never overrides "release not confirmed", "target no longer on main", an earlier-release or
     unknown-ancestry hold, or a coordinator error.
   - A replan onto another commit voids a pending force.
-  - The host sequence is: list requests, ask permit (`forced: true`), `DELETE` the request, redeploy.
+  - The host sequence is: list requests, ask permit (`forced: true`), `DELETE` the request, redeploy. The
+    `DELETE` re-checks the flag (403) and the permit (409, e.g. after a replan or once the release is no longer
+    confirmed): only a 200 means "redeploy".
+  - Host routes are rate limited per host. An unusable fleet file answers 503, not 500.
+  - The durable writes made under a store lock (a force pickup, an escalation round) time out after 10 s and
+    then fail closed.
 - **Turning the flag off** is the kill switch: pending forces are ignored by the gate and the request list is
   empty. The plan's own permission is unaffected.
 - **While the fleet file is unusable** (deleted or unparseable after having been valid), the flag reads as off
@@ -269,7 +282,8 @@ request** that the host updater picks up on its next poll. The routes (each also
 
 ### Deployment failures: diagnosis, repairs, escalation
 
-After each coordinator tick, every component a `Halt` names is diagnosed (known patterns first, then the
+After each coordinator tick whose release is confirmed (published and on main), every component a `Halt`
+names is diagnosed (known patterns first, then the
 optional AI step of `control_plane.deployment_diagnosis`) over its redacted failure event.
 
 - **One repair per round.** The decided repair (`retry`, `restart` or `rollback`) is recorded in a repair ledger
