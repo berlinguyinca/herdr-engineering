@@ -1,7 +1,8 @@
 import { DENSITIES, sanitizeDensity } from './density.js';
 
 // herdr-web-components — <herdr-app-shell> sidebar shell (Spec §12-16).
-// routes is a JSON attribute: [{"path":"/missions","label":"Missions"}].
+// routes is a JSON attribute: [{"path":"/missions","label":"Missions","group":"Work","match":["/missions"]}].
+// `group` heads a section of the sidebar; `match` lists the other paths that keep the entry active (tabbed sections).
 // The active route is driven by hashchange. The shell owns its template and
 // the shared document density preference. Content projects into the main region.
 
@@ -20,8 +21,18 @@ export class HerdrAppShell extends HTMLElement {
   }
 
   attributeChangedCallback() {
+    // A route list change (a page becoming unavailable, a capability arriving) rebuilds the nav: keep keyboard focus where it was.
+    const focused = this.shadowRoot.activeElement;
+    const focusKey = focused?.classList?.contains('hd-shell__menu') ? '.hd-shell__menu'
+      : focused?.getAttribute?.('data-path') ? `[data-path="${CSS.escape(focused.getAttribute('data-path'))}"]` : '';
     this._parse();
     this._render();
+    if (focusKey) {
+      const target = this.shadowRoot.querySelector(focusKey);
+      target?.focus();
+      // The rebuilt nav starts closed; a link hidden by that cannot hold focus, so the Menu button does.
+      if (this.shadowRoot.activeElement !== target) this.shadowRoot.querySelector('.hd-shell__menu')?.focus();
+    }
     if (this.isConnected) this._syncActive();
   }
 
@@ -45,10 +56,6 @@ export class HerdrAppShell extends HTMLElement {
     try { localStorage.setItem('herdr-density', this._density); } catch { /* Apply even without storage. */ }
   }
 
-  _openGroups() {
-    try { const v = JSON.parse(localStorage.getItem('herdr-nav-groups') || '{}'); return v && typeof v === 'object' ? v : {}; } catch { return {}; }
-  }
-
   _parse() {
     try {
       this._nav = JSON.parse(this.getAttribute('routes') || '[]');
@@ -60,22 +67,12 @@ export class HerdrAppShell extends HTMLElement {
   _syncActive = () => {
     const hash = window.location.hash.replace(/^#/, '') || '/';
     const path = hash.split('?')[0];
-    const within = (base) => path === base || (path !== '/' && path.startsWith(base + '/'));
     const links = this.shadowRoot.querySelectorAll('.hd-shell__link');
     links.forEach((a) => {
-      const members = (a.getAttribute('data-members') || a.getAttribute('data-path')).split(' ');
-      const active = members.some(within);
+      const paths = [a.getAttribute('data-path'), ...JSON.parse(a.getAttribute('data-match') || '[]')];
+      const active = paths.some((p) => path === p || (path !== '/' && path.startsWith(p + '/')));
       a.classList.toggle('active', active);
       if (active) a.setAttribute('aria-current', 'page'); else a.removeAttribute('aria-current');
-      // The group holding the current page is always open, so the user never loses their place.
-      if (active) a.closest('details.hd-shell__group')?.setAttribute('open', '');
-    });
-    // Within one tab bar only the most specific match is current (/github/projects beats /github).
-    this.shadowRoot.querySelectorAll('.hd-shell__tabs').forEach((bar) => {
-      const tabs = [...bar.querySelectorAll('.hd-shell__tab')];
-      const best = tabs.filter((a) => within(a.getAttribute('data-path'))).sort((x, y) => y.getAttribute('data-path').length - x.getAttribute('data-path').length)[0];
-      tabs.forEach((a) => { a.classList.toggle('active', a === best); if (a === best) a.setAttribute('aria-current', 'page'); else a.removeAttribute('aria-current'); });
-      bar.hidden = !best;
     });
     this._menuOpen = false;
     const nav = this.shadowRoot.querySelector('.hd-shell__nav');
@@ -107,56 +104,45 @@ export class HerdrAppShell extends HTMLElement {
 
   _render() {
     const brand = this.getAttribute('brand') || 'HerdR';
-    // Entries sharing a `family` are one sidebar link (the first member) and become tabs above the content.
-    const families = new Map();
-    for (const n of this._nav) if (n.family) families.set(n.family, [...(families.get(n.family) || []), n]);
-    const seen = new Set();
-    const linkHtml = (n) => {
-      const members = n.family ? families.get(n.family) : [n];
-      const label = n.family ? (members[0].familyLabel || n.label) : n.label;
-      return `<a class="hd-shell__link" href="#${escapeAttr(members[0].path)}" data-path="${escapeAttr(members[0].path)}" ` +
-        `data-members="${escapeAttr(members.map((m) => m.path).join(' '))}">${escapeHtml(label)}${this._badgeHtml(members[0].path)}</a>`;
-    };
+    const link = (n) => `<a class="hd-shell__link" href="#${escapeAttr(n.path)}" data-path="${escapeAttr(n.path)}"` +
+      `${n.match ? ` data-match="${escapeAttr(JSON.stringify(n.match))}"` : ''}>${escapeHtml(n.label)}${this._badgeHtml(n.path)}</a>`;
     const groups = [];
     for (const n of this._nav) {
-      if (n.family) { if (seen.has(n.family)) continue; seen.add(n.family); }
       const name = n.group || '';
       let g = groups.find((x) => x.name === name);
-      if (!g) { g = { name, html: [] }; groups.push(g); }
-      g.html.push(linkHtml(n));
+      if (!g) groups.push(g = { name, items: [] });
+      g.items.push(n);
     }
-    const stored = this._openGroups();
-    const links = groups.map((g) => g.name
-      ? `<details class="hd-shell__group" data-group="${escapeAttr(g.name)}" ${stored[g.name] === false ? '' : 'open'}><summary>${escapeHtml(g.name)}</summary>${g.html.join('')}</details>`
-      : g.html.join('')).join('');
-    const tabHtml = [...families.values()].filter((m) => m.length > 1).map((m) =>
-      `<nav class="hd-shell__tabs" aria-label="${escapeAttr(m[0].familyLabel || 'Section')}" hidden>${m.map((x) =>
-        `<a class="hd-shell__tab" href="#${escapeAttr(x.path)}" data-path="${escapeAttr(x.path)}">${escapeHtml(x.tab || x.label)}</a>`).join('')}</nav>`).join('');
+    const links = groups.map((g) => `<div class="hd-shell__group"${g.name ? ` role="group" aria-label="${escapeAttr(g.name)}"` : ''}>` +
+      `${g.name ? `<div class="hd-shell__group-label" aria-hidden="true">${escapeHtml(g.name)}</div>` : ''}${g.items.map(link).join('')}</div>`).join('');
     this.shadowRoot.innerHTML = `
       <style>${SHARED}</style>
       <div class="hd-shell">
         <aside class="hd-shell__sidebar">
           <div class="hd-shell__brand"><span>${escapeHtml(brand)}</span><button class="hd-shell__menu" type="button" aria-expanded="false" aria-controls="primary-navigation">Menu</button></div>
           <nav class="hd-shell__nav" id="primary-navigation" data-open="false" aria-label="Primary">${links}</nav>
-          <details class="hd-shell__display"><summary>Display</summary>
-            <label class="hd-shell__density">Density
-              <select aria-label="Density">${DENSITIES.map(value => `<option value="${value}" ${value === this._density ? 'selected' : ''}>${value[0].toUpperCase() + value.slice(1)}</option>`).join('')}</select>
-            </label>
+          <div class="hd-shell__display">
+            <button type="button" class="hd-shell__icon" data-density-button aria-label="" title=""></button>
             <slot name="controls"></slot>
-          </details>
+          </div>
         </aside>
         <main class="hd-shell__main"><div class="hd-shell__content">
-          ${tabHtml}
           <slot></slot>
         </div></main>
       </div>`;
-    this.shadowRoot.querySelector('.hd-shell__density select').addEventListener('change', event => {
-      this._applyDensity(event.target.value);
+    const densityButton = this.shadowRoot.querySelector('[data-density-button]');
+    const paintDensity = () => {
+      const next = DENSITIES[(DENSITIES.indexOf(this._density) + 1) % DENSITIES.length];
+      const label = `Density: ${this._density}. Switch to ${next}`;
+      densityButton.setAttribute('aria-label', label); densityButton.title = label;
+      densityButton.dataset.value = this._density;
+      densityButton.innerHTML = DENSITY_ICONS[this._density];
+    };
+    paintDensity();
+    densityButton.addEventListener('click', () => {
+      this._applyDensity(DENSITIES[(DENSITIES.indexOf(this._density) + 1) % DENSITIES.length]);
+      paintDensity();
     });
-    this.shadowRoot.querySelectorAll('details.hd-shell__group').forEach((d) => d.addEventListener('toggle', () => {
-      const open = this._openGroups(); open[d.getAttribute('data-group')] = d.open;
-      try { localStorage.setItem('herdr-nav-groups', JSON.stringify(open)); } catch { /* Not persisted without storage. */ }
-    }));
     this._syncActive();
     this.shadowRoot.querySelector('.hd-shell__menu')?.addEventListener('click', () => {
       this._menuOpen = !this._menuOpen;
@@ -167,60 +153,47 @@ export class HerdrAppShell extends HTMLElement {
 }
 
 // The shell's own styles (referencing the global theme tokens).
+const bars = (ys) => `<svg viewBox="0 0 20 20" width="18" height="18" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round">${ys.map((y) => `<path d="M3 ${y}h14"/>`).join('')}</svg>`;
+const DENSITY_ICONS = { comfortable: bars([5, 10, 15]), compact: bars([4, 8, 12, 16]), dense: bars([3, 6.5, 10, 13.5, 17]) };
 const SHARED = `
 :host { display: block; }
 .hd-shell { display: flex; min-height: 100vh; }
 .hd-shell__sidebar { width: var(--sidebar-width); background: var(--surface);
   flex-shrink: 0; border-right: 1px solid var(--border-subtle);
-  display: flex; flex-direction: column; }
-.hd-shell__brand { display: flex; align-items: center; padding: 16px;
+  display: flex; flex-direction: column; position: sticky; top: 0; height: 100vh; overflow-y: auto; }
+.hd-shell__brand { display: flex; align-items: center; padding: 14px 16px;
   justify-content: space-between; gap: 12px;
   font-weight: 600; font-size: 0.95rem;
   border-bottom: 1px solid var(--border-subtle); }
 .hd-shell__menu { display: none; font: inherit; padding: 6px 10px; color: var(--text-secondary);
   background: var(--surface); border: 1px solid var(--border-subtle); border-radius: var(--radius-sm); cursor: pointer; }
-.hd-shell__nav { display: flex; flex-direction: column; gap: 2px; padding: var(--density-gap, 8px); flex: 1; overflow-y: auto; }
-.hd-shell__group { margin-top: 6px; }
-.hd-shell__group > .hd-shell__link { margin-bottom: 2px; }
-.hd-shell__group > summary { list-style: none; cursor: pointer; padding: 6px 10px; font-size: .6875rem; letter-spacing: .06em;
-  text-transform: uppercase; color: var(--text-secondary); opacity: .8; display: flex; justify-content: space-between; align-items: center; border-radius: var(--radius-sm); }
-.hd-shell__group > summary::-webkit-details-marker { display: none; }
-.hd-shell__group > summary::after { content: '\\25B8'; font-size: .75rem; transition: transform .12s; }
-.hd-shell__group[open] > summary::after { transform: rotate(90deg); }
-.hd-shell__group > summary:hover { background: var(--surface-hover); }
-.hd-shell__display { border-top: 1px solid var(--border-subtle); padding: 4px var(--density-gap, 8px) 8px; font-size: .8125rem; color: var(--text-secondary); }
-.hd-shell__display > summary { cursor: pointer; padding: 8px 10px; border-radius: var(--radius-sm); list-style: none; }
-.hd-shell__display > summary::-webkit-details-marker { display: none; }
-.hd-shell__display > summary:hover { background: var(--surface-hover); }
-.hd-shell__tabs { display: flex; flex-wrap: wrap; gap: 4px; margin: -4px 0 18px; padding-bottom: 8px; border-bottom: 1px solid var(--border-subtle); }
-.hd-shell__tabs[hidden] { display: none; }
-.hd-shell__tab { padding: 6px 12px; border-radius: 999px; font-size: .8125rem; color: var(--text-secondary); text-decoration: none; }
-.hd-shell__tab:hover { background: var(--surface-hover); text-decoration: none; }
-.hd-shell__tab.active { background: var(--accent-weak); color: var(--accent); font-weight: 500; }
-.hd-shell__link { display: flex; padding: var(--density-row-padding, 8px) 10px; border-radius: var(--radius-sm);
+.hd-shell__nav { display: flex; flex-direction: column; gap: 8px; padding: 8px 8px; flex: 1; }
+.hd-shell__group { display: flex; flex-direction: column; gap: 1px; }
+.hd-shell__group-label { padding: 0 10px 3px; font-size: .6875rem; letter-spacing: .06em; text-transform: uppercase; color: var(--text-muted); font-weight: 600; }
+.hd-shell__link { display: flex; padding: calc(var(--density-row-padding, 8px) - 4px) 10px; line-height: 1.3; border-radius: var(--radius-sm);
   color: var(--text-secondary); text-decoration: none; font-size: 0.875rem; }
 .hd-shell__badge { margin-left: auto; min-width: 20px; padding: 0 6px; border-radius: 10px; font-size: .75rem; line-height: 20px; text-align: center; background: var(--accent-weak); color: var(--accent); font-weight: 600; }
 .hd-shell__badge[data-tone=critical] { background: var(--status-failed); color: #fff; }
 .hd-shell__link:hover { background: var(--surface-hover); text-decoration: none; }
 .hd-shell__link.active { background: var(--accent-weak); color: var(--accent); font-weight: 500; }
-.hd-shell__density { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 8px 10px; font-size: .8125rem; color: var(--text-secondary); }
-.hd-shell__density select { flex: 1; min-width: 0; font: inherit; color: var(--text); background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 6px; }
+.hd-shell__display { display: flex; flex-wrap: wrap; gap: 6px 10px; align-items: center; padding: 10px 14px 14px; border-top: 1px solid var(--border-subtle); position: sticky; bottom: 0; background: var(--surface); }
+.hd-shell__icon { display: inline-flex; align-items: center; justify-content: center; width: 32px; height: 32px; padding: 0; color: var(--text-secondary); background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-sm); cursor: pointer; }
+.hd-shell__icon:hover { background: var(--surface-hover); color: var(--text); }
 :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .hd-shell__main { flex: 1; min-width: 0; }
 .hd-shell__content { width: auto; max-width: none; margin: 0; padding: clamp(20px,1.25vw,48px); }
 @media (max-width: 900px) {
   .hd-shell { flex-direction: column; }
-  .hd-shell__sidebar { width: 100%; border-right: none;
+  .hd-shell__sidebar { width: 100%; border-right: none; position: static; height: auto; overflow: visible;
     border-bottom: 1px solid var(--border-subtle); }
+  .hd-shell__nav[data-open=false] ~ .hd-shell__display { display: none; }
+  .hd-shell__display { position: static; }
   .hd-shell__brand { padding: 10px 16px; }
   .hd-shell__menu { display: inline-flex; min-height: 44px; align-items: center; }
-  .hd-shell__density { padding: 8px 16px; }
-  .hd-shell__density select, .hd-shell__link { min-height: 44px; align-items: center; }
-  .hd-shell__nav { display: none; max-height: 60vh; overflow-y: auto; }
-  .hd-shell__nav[data-open=true] { display: flex; }
-  .hd-shell__display { padding: 0 8px; }
-  /* The open group's links sit two to a row so the whole menu fits without long scrolling. */
-  .hd-shell__group::details-content { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 2px; }
+  .hd-shell__icon { width: 44px; height: 44px; }
+  .hd-shell__link { min-height: 44px; align-items: center; }
+  .hd-shell__nav { display: none; grid-template-columns: repeat(2,minmax(0,1fr)); max-height: 55vh; overflow-y: auto; }
+  .hd-shell__nav[data-open=true] { display: grid; }
   .hd-shell__content { max-width: none; padding: 16px; }
 }`;
 

@@ -10,7 +10,7 @@ import assert from 'node:assert/strict';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { CFG, REPO, launch, openReal, settled, startRealServer } from './ui-gates-lib.mjs';
+import { CFG, REPO, launch, openReal, settled, startRealServer, scaled } from './ui-gates-lib.mjs';
 
 const SIZES = [2000, 5000, 10000];
 const report = { machine: { cpu: os.cpus()[0].model, threads: os.cpus().length, memGB: Math.round(os.totalmem() / 2 ** 30), platform: `${os.type()} ${os.release()}` }, runs: [] };
@@ -54,7 +54,7 @@ for (const n of SIZES) {
       // first render of the lineage tab
       const t0 = Date.now();
       await page.locator('[data-sub="lineage"]').click();
-      await page.locator('#hcn-lineage svg.lin-svg g[data-node]').first().waitFor({ timeout: 60000 });
+      await page.locator('#hcn-lineage svg.lin-svg g[data-node]').first().waitFor({ timeout: scaled(60000) });
       const firstRender = Date.now() - t0;
       assert.ok(await page.locator('svg.lin-svg g[data-node]').count() <= 242, 'first page is drawn as a bounded SVG viewport');
 
@@ -66,7 +66,7 @@ for (const n of SIZES) {
         const shown = await page.evaluate(() => (document.querySelector('#hcn-lineage')?.innerText.match(/Showing (\d+) of/) || [])[1]);
         const t = Date.now();
         await more.focus(); await page.keyboard.press('Enter');
-        await page.waitForFunction((was) => { const m = document.querySelector('#hcn-lineage')?.innerText.match(/Showing (\d+) of/); return !m || Number(m[1]) > Number(was || 0) || !document.querySelector('[data-more]'); }, shown, { timeout: 60000 });
+        await page.waitForFunction((was) => { const m = document.querySelector('#hcn-lineage')?.innerText.match(/Showing (\d+) of/); return !m || Number(m[1]) > Number(was || 0) || !document.querySelector('[data-more]'); }, shown, { timeout: scaled(60000) });
         per.push(Date.now() - t);
       }
       const loadAll = Date.now() - tAll;
@@ -131,12 +131,12 @@ test('typing in the filter of a graph above the draw cap redraws once, not once 
   try {
     const { ctx, page } = await openReal(browser, srv.info, 'alice');
     await page.locator('[data-sub="lineage"]').click();
-    await page.locator('#hcn-lineage svg.lin-svg g[data-node]').first().waitFor({ timeout: 60000 });
+    await page.locator('#hcn-lineage svg.lin-svg g[data-node]').first().waitFor({ timeout: scaled(60000) });
     // page with a click from inside the page: the button is replaced by each redraw, and a locator can lose it between two steps
     for (let i = 0; i < 40; i += 1) {
       const before = await page.evaluate(() => { const b = document.querySelector('[data-more]'); const t = document.querySelector('#hcn-lineage')?.innerText; if (b) b.click(); return b ? t : null; });
       if (before === null) break;
-      await page.waitForFunction((b) => document.querySelector('#hcn-lineage')?.innerText !== b, before, { timeout: 60000 });
+      await page.waitForFunction((b) => document.querySelector('#hcn-lineage')?.innerText !== b, before, { timeout: scaled(60000) });
     }
     assert.ok(await page.locator('#hcn-lineage svg.lin-svg g[data-node]').count() <= 242, 'the drawing stays bounded');
     const cdp = await ctx.newCDPSession(page);
@@ -173,11 +173,11 @@ test('toggling a type filter on a graph above the old draw cap is cheap: at most
     const { ctx, page } = await openReal(browser, srv.info, 'alice');
     const scale = await slowdown(page);
     await page.locator('[data-sub="lineage"]').click();
-    await page.locator('#hcn-lineage svg.lin-svg g[data-node]').first().waitFor({ timeout: 60000 });
+    await page.locator('#hcn-lineage svg.lin-svg g[data-node]').first().waitFor({ timeout: scaled(60000) });
     for (let i = 0; i < 40 && await page.locator('[data-more]').count(); i += 1) {
       const before = await page.locator('#hcn-lineage').innerText();
       await page.locator('[data-more]').focus(); await page.keyboard.press('Enter');
-      await page.waitForFunction((b) => document.querySelector('#hcn-lineage')?.innerText !== b, before, { timeout: 60000 });
+      await page.waitForFunction((b) => document.querySelector('#hcn-lineage')?.innerText !== b, before, { timeout: scaled(60000) });
     }
     assert.ok(await page.locator('#hcn-lineage svg.lin-svg g[data-node]').count() <= 242, 'the drawing stays bounded');
     await page.evaluate(() => { window.__t = []; });

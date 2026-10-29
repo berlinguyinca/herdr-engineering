@@ -13,7 +13,7 @@ export function handoffGraphSummary(graph = {}) {
 
 export function mountHandoffs(container, client, { freshness = () => null } = {}) {
   let disposed = false, controller = null, loaded = false, signature = null;
-  container.innerHTML = `<p class="hd-muted">Private work transfers between harnesses and hosts. Handoff text is untrusted and escaped.</p><div data-handoff-summary role="status"></div><section class="cx-flow-box" data-handoff-graph></section><section data-handoff-list></section><button type="button" data-handoff-retry hidden>Retry</button>`;
+  container.innerHTML = `<p class="hd-muted">Work passed from one agent to another, between harnesses and hosts: who handed what to whom, and where it stands. Handoff text is untrusted and escaped.</p><div data-handoff-summary role="status"></div><section class="cx-flow-box" data-handoff-graph></section><section data-handoff-list></section><button type="button" data-handoff-retry hidden>Retry</button>`;
   const summary = container.querySelector('[data-handoff-summary]');
   const graph = container.querySelector('[data-handoff-graph]');
   const list = container.querySelector('[data-handoff-list]');
@@ -30,7 +30,7 @@ export function mountHandoffs(container, client, { freshness = () => null } = {}
       const from = (data.nodes || []).find(node => node.id === edge.from) || {};
       const to = (data.nodes || []).find(node => node.id === edge.to) || {};
       return `<article class="hd-card"><strong>${esc(from.harness || 'unknown')} → ${esc(to.harness || 'unknown')}</strong><span>${esc(edge.state || 'unknown')}</span><p>${esc(edge.goal || '')}</p><small>${esc(edge.handoff_id || '')}</small></article>`;
-    }).join('') || '<p class="hd-muted">No handoffs recorded.</p>';
+    }).join('') || '<p class="hd-muted">No handoffs recorded. A handoff appears here when one agent passes work to another (for example from one harness to another); until then the <a href="#/herd">Agents</a> page shows each mission\'s agents side by side.</p>';
   };
   const refresh = async () => {
     if (disposed || controller) return;

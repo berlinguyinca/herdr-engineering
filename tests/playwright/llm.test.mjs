@@ -55,7 +55,7 @@ test('the LLM page shows request, latency, speed and error figures with links to
     assert.match(tiles[3], /t\/s$/);
     assert.match(tiles[4], /^\d+(\.\d+)?% \(\d+\)$/);
     assert.equal(await page.locator('.llm-card svg').count(), 3);
-    await page.locator('.llm-data summary').waitFor();
+    await page.locator('.llm-data > summary').waitFor();
     const link = page.locator('.llm-section a[href^="#/llm/session/"]').first();
     await link.waitFor();
     await link.click();

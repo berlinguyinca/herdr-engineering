@@ -6,7 +6,7 @@
 // what the audit counted when they were set, so a state that renders half of itself, or a scope that slips, fails instead of passing on less.
 //
 // Used by ui-gates-states.test.mjs (accessibility) and ui-gates-xss.test.mjs (inert hostile text).
-import { openSub, settled } from './ui-gates-lib.mjs';
+import { openSub, settled, scaled } from './ui-gates-lib.mjs';
 
 /** Type "@" until the list opens: the room's agents arrive after the chat does, and a list asked for too early is simply empty. */
 export async function openMention(page) {
@@ -14,7 +14,7 @@ export async function openMention(page) {
   const opt = page.locator('ul[role="listbox"]:not([hidden]) [role="option"]').first();
   for (let i = 0; i < 20; i += 1) {
     await input.focus(); await input.fill(''); await page.keyboard.type('@');
-    if (await opt.waitFor({ timeout: 1500 }).then(() => true, () => false)) return;
+    if (await opt.waitFor({ timeout: scaled(1500) }).then(() => true, () => false)) return;
   }
   throw new Error('the @-mention list never opened: the room has no agent that accepts tasks');
 }

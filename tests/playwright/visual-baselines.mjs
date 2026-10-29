@@ -22,7 +22,7 @@
 import { execFileSync } from 'node:child_process';
 import { mkdirSync, readFileSync, writeFileSync, existsSync, readdirSync, statSync } from 'node:fs';
 import path from 'node:path';
-import { CFG, REPO, launch, openReal, openSub, startRealServer } from './ui-gates-lib.mjs';
+import { CFG, REPO, launch, openReal, openSub, startRealServer, scaled } from './ui-gates-lib.mjs';
 
 export const BASELINE_DIR = path.join(REPO, 'docs', 'assets', 'screenshots');
 export const REPORT_DIR = path.join(REPO, '.autospec', 'reports', 'visual');
@@ -170,8 +170,8 @@ export async function capture(browser, info, surface, viewport, scheme, { extraC
     await page.clock.setFixedTime(new Date(CFG.screenshots.fixed_clock));
     await page.addStyleTag({ content: bundledFontCss() });
     if (surface.hash) { await page.evaluate((h) => { window.location.hash = h; }, surface.hash); } else { await openSub(page, surface.sub); }
-    await page.locator(surface.proof).first().waitFor({ timeout: 15000 });
-    if (surface.sub === 'chat') await page.locator('#hcn-empty').waitFor({ state: 'detached', timeout: 15000 });
+    await page.locator(surface.proof).first().waitFor({ timeout: scaled(15000) });
+    if (surface.sub === 'chat') await page.locator('#hcn-empty').waitFor({ state: 'detached', timeout: scaled(15000) });
     if (surface.steps) await surface.steps(page);
     await page.addStyleTag({ content: '*,*::before,*::after{animation:none!important;transition:none!important;caret-color:transparent!important;scroll-behavior:auto!important}' });
     if (extraCss) await page.addStyleTag({ content: extraCss });

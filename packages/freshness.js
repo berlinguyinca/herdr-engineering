@@ -83,6 +83,8 @@ export class HerdrFreshness extends Base {
       this._error = String(message || 'refresh failed');
     }
     this._render();
+    // The shell listens to hide pages whose backend is missing (see app.js); a bubbling event keeps views unaware of it.
+    this.dispatchEvent?.(new CustomEvent('hd-freshness', { bubbles: true, detail: { ok: !!ok, message: this._error } }));
   }
 
   setDetail(text = '', { warn = false } = {}) {

@@ -5,6 +5,7 @@ import {recordOutcome,statusOutcome,recordVisibility} from './record-state.js';
 import {patchList,patchText,morph} from './patch.js';
 import {animateChanges,skeleton} from './motion.js';
 import { freshnessSources } from './freshness.js';
+import { lineageModel, renderLineage } from './agents-lineage.js';
 import { createFabricUrlResolver, linkifyFabricText } from './fabric-urls.js';
 
 const text = value => typeof value === 'string' ? value.trim() : '';
@@ -96,12 +97,13 @@ export function mountSessionsView(container,client,{tab='current'}={}) {
   const state={tab:tabs.some(([key])=>key===tab)?tab:'current',search:'',host:'',group:'project',page:0};
   const pageSize=20;
   let disposed=false,sessions=[],missions=[],loaded=false,sessionError='',missionError='',lastSignature='',hostSignature='';
-  let sessionRequest=null,missionRequest=null;
+  let sessionRequest=null,missionRequest=null,handoffs={nodes:[],edges:[]},lineageSig='';
   // agent summaries can name a loopback service; no single source machine here, so only a fleet-unique match links
   const fabric=typeof client.resolveFabricUrls==='function'?createFabricUrlResolver(client,{onChange:()=>{lastSignature='';draw();}}):null;
   const chip=freshnessSources(()=>container.querySelector('herdr-freshness'));
   container.innerHTML=`${styles}<div class="hd-live-head"><h1>Agents</h1><herdr-freshness interval="5000"></herdr-freshness></div>
-    <p class="ss-intro">Find an agent by project, host or model. Current shows open agents reported in the last 15 minutes. Older or missing reports move to Unconfirmed automatically; Failed and Finished retain previous work.</p>
+    <p class="ss-intro">Agents reporting in the last 15 minutes. Older reports move to Unconfirmed; Failed and Finished keep earlier work.</p>
+    <div id="ss-lineage"></div>
     <div class="ss-tabs" role="tablist" aria-label="Agent outcome">${tabs.map(([key,label])=>`<button type="button" role="tab" id="ss-tab-${key}" data-tab="${key}" aria-controls="ss-panel-${key}" aria-selected="${state.tab===key}" tabindex="${state.tab===key?0:-1}">${label} <strong data-count="${key}">…</strong></button>`).join('')}</div>
     <div class="ss-controls"><label class="ss-search">Search agents<input id="ss-search" type="search" placeholder="Project, activity, agent, model or ID"></label>
       <label>Host<select id="ss-host"><option value="">All hosts</option></select></label>
@@ -161,6 +163,12 @@ export function mountSessionsView(container,client,{tab='current'}={}) {
     const visible=selected.slice(state.page*pageSize,(state.page+1)*pageSize),groups=new Map();
     for(const entry of visible){const label=state.group==='project'?entry.project:'Recent reports';if(!groups.has(label))groups.set(label,[]);groups.get(label).push(entry);}
     patchPanel(el(`panel-${state.tab}`),visible,groups);
+    {
+      const live=state.tab==='current'&&loaded?all.filter(e=>e.tab==='current'&&(!state.host||e.host===state.host)):[];
+      const model=lineageModel(live,handoffs.edges,handoffs.nodes);
+      const sig=JSON.stringify({...model,t0:Math.floor(model.t0/60000),t1:Math.floor(model.t1/60000)});
+      if(sig!==lineageSig){lineageSig=sig;renderLineage(el('lineage'),model);}
+    }
     const noModel=loaded && selected.length>0 && !selected.some(e=>text(e.record.model));
     el('result').textContent=loaded ? `${selected.length} matching ${state.tab} agents${visible.length?` · Showing ${state.page*pageSize+1}–${state.page*pageSize+visible.length}`:''}${noModel?' · None of these agents report which model they use':''}` : '';
     el('page').textContent=`Page ${state.page+1} of ${Math.max(1,Math.ceil(selected.length/pageSize))}`;
@@ -200,10 +208,15 @@ export function mountSessionsView(container,client,{tab='current'}={}) {
       draw();
     }
   }
-  function refresh(){return Promise.all([request('sessions'),request('missions')]);}
+  // Handoffs only enrich the lineage chart; a missing or failing endpoint leaves the chart without arrows.
+  async function requestHandoffs(){
+    if(disposed||document.hidden||typeof client.getHandoffTree!=='function')return;
+    try{const data=await client.getHandoffTree({signal:AbortSignal.timeout(8000)});if(!disposed&&Array.isArray(data?.edges)){handoffs={nodes:records(data.nodes),edges:records(data.edges)};draw();}}catch{/* chart stays arrow-free */}
+  }
+  function refresh(){return Promise.all([request('sessions'),request('missions'),requestHandoffs()]);}
   function visibility(){if(document.hidden){sessionRequest?.abort();missionRequest?.abort();}else refresh();}
   document.addEventListener('visibilitychange',visibility);
-  const poll=setInterval(()=>request('sessions'),5000), contextPoll=setInterval(()=>request('missions'),30000);
+  const poll=setInterval(()=>request('sessions'),5000), contextPoll=setInterval(()=>{request('missions');requestHandoffs();},30000);
   const clock=setInterval(()=>{if(disposed||document.hidden)return;draw();const byId=new Map(entries().map(e=>[e.id,e]));container.querySelectorAll('[data-session-id]').forEach(row=>{const entry=byId.get(row.dataset.sessionId);if(entry)row.querySelector('[data-report]').textContent=sessionReport(entry.record);});},1000);
   draw();refresh();
   return {refresh,dispose(){disposed=true;sessionRequest?.abort();missionRequest?.abort();clearInterval(poll);clearInterval(contextPoll);clearInterval(clock);document.removeEventListener('visibilitychange',visibility);container.removeEventListener('click',click);container.removeEventListener('keydown',keydown);container.removeEventListener('input',controls);container.removeEventListener('change',controls);}};

@@ -24,7 +24,7 @@ test('restored navigation retains upstream routes alongside the fabric routes', 
   await until(() => page.locator('[data-handoff-list]').textContent().then(text => text.includes('No handoffs')), 'handoffs loaded');
   const routes = await page.locator('#shell').getAttribute('routes').then(JSON.parse);
   for (const path of ['/attention', '/architecture', '/ci', '/reviews', '/review-gate', '/llm', '/collab', '/local-services', '/system-services', '/artifacts', '/publications', '/scheduling', '/handoffs']) {
-    assert.ok(routes.some(route => route.path === path), `navigation preserves ${path}`);
+    assert.ok(routes.some(route => route.path === path || (route.match || []).includes(path)), `navigation preserves ${path} (as an entry or a tab of one)`);
   }
   assert.deepEqual(errors, []);
 }));

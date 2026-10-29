@@ -1,6 +1,24 @@
+import copy
+
 import pytest
 
 from herdr_engineering import host_config as hc
+
+
+@pytest.fixture
+def acknowledged_sink():
+    """Shared across control-plane and domain selections regardless of ordering."""
+    class AcknowledgedSink:
+        def __init__(self):
+            self.events = []
+
+        def record(self, event):
+            self.record_required(event)
+
+        def record_required(self, event):
+            self.events.append(copy.deepcopy(event))
+
+    return AcknowledgedSink()
 
 
 @pytest.fixture(autouse=True)

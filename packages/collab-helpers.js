@@ -197,6 +197,10 @@ export function renderHelpersPanel(st, { operator }) {
   const reqs = st.requests || [];
   const ent = st.entries || {};
   const hostRooms = Object.keys(st.allow || {}).filter((r) => (Array.isArray(ent[r]) ? ent[r] : st.allow[r] || []).length);
+  // Nothing running, nothing waiting for approval and no allowed host: say so in one line instead of three empty boxes.
+  if (st.loaded !== false && !st.error && !st.paused && !reqs.length && !(st.helpers || []).length && !hostRooms.length && !Array.isArray(st.fixes)) {
+    return `<section class="cx-section cx-helpers-panel cx-helpers-idle"><h2>Helpers</h2><p class="cx-msg">No helpers are running and no host access is waiting for approval.</p></section>`;
+  }
   return `<section class="cx-section cx-helpers-panel"><h2>Helpers</h2>${st.error ? `<div class="hd-error" role="alert">${esc(st.error)}</div>` : ''}`
     + `${renderPanic(Boolean(st.paused), { operator })}`
     + `<div class="hd-card cx-stack"><div class="hd-card__title">Host access requests (all rooms)</div>${renderEgressRequests(reqs, { operator, rooms })}`
@@ -210,7 +214,7 @@ export function renderHelpersPanel(st, { operator }) {
 export function createHelpersPanel({ container, api, operator, getRooms, go, schedule = setTimeout, clear = clearTimeout, interval = 6000, hidden = () => false }) {
   if (!operator) return { refresh: async () => {}, start() {}, destroy() {} };
   let alive = true; let timer = null; let seq = 0;
-  const st = { paused: false, requests: [], helpers: [], allow: {}, entries: {}, rooms: [], error: '', fixes: null };
+  const st = { paused: false, requests: [], helpers: [], allow: {}, entries: {}, rooms: [], error: '', fixes: null, loaded: false };
   const draw = () => { if (alive) container.innerHTML = renderHelpersPanel(st, { operator }); };
   const refresh = async () => {
     if (!alive) return;
@@ -223,6 +227,7 @@ export function createHelpersPanel({ container, api, operator, getRooms, go, sch
       // older servers have no such route: the section just stays hidden
       typeof api.summaryFixHelpers === 'function' ? api.summaryFixHelpers().catch(() => null) : null]);
     if (!alive || mine !== seq) return;
+    if (rq && hp) st.loaded = true;
     if (rq) st.requests = (rq.requests || []).filter((r) => r.state === 'open' || r.state === 'approved');
     if (hp) { st.helpers = hp.helpers || []; st.paused = Boolean(hp.paused); st.now = hp.now; }
     if (rm) st.rooms = rm;
