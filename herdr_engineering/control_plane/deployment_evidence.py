@@ -27,6 +27,9 @@ Safety rules:
   fetched; then unknown. A failed refresh sets only a retry backoff (``FAILURE_RETRY_S``)
   and never refreshes, extends or replaces a success. A definitive answer (another
   commit, not on main) is a success and replaces the entry.
+* The key is (track, (tag, asset)s, target, plan); a plan equal to the target counts as
+  none, and a refresh with a plan also stores the plan-free answer, so the tick after a
+  Replan (whose plan is then the target) hits the cache instead of reading unconfirmed.
 * Every HTTP call has a hard wall-clock bound (``CALL_TIMEOUT_S``): it runs in a daemon
   thread and is abandoned at the deadline. Responses are size-capped, JSON is validated,
   commits must be 40 hex. Redirects are never followed by urllib; the asset's one
@@ -168,6 +171,8 @@ class GitHubReleaseEvidence:
                                 and isinstance(a, str) and _NAME.fullmatch(a) for t, a in specs):
             return None
         plan = plan_commit if isinstance(plan_commit, str) and _SHA.fullmatch(plan_commit) else None
+        if plan is not None and same_commit(plan, target):
+            plan = None              # nothing to compare: shares the entry the Replan tick used
         return (track, specs, target, plan)
 
     def _due(self, key) -> bool:
@@ -209,14 +214,22 @@ class GitHubReleaseEvidence:
 
     def _refresh(self, key):
         try:
-            evidence = self._fetch(*key)
+            evidence, plain = self._fetch(*key)
         except _Fail as exc:
             self._failed(key, exc.kind)
         except Exception as exc:  # noqa: BLE001 - never a success
             self._failed(key, f"internal error: {type(exc).__name__}")
         else:
             with self._lock:
-                self._cache[key] = (evidence, self._clock())
+                at = self._clock()
+                if key[3] is not None:
+                    # The same answer without the plan check is the entry the tick after the
+                    # Replan asks for (its plan is then the target): no unconfirmed tick between.
+                    plain_key = key[:3] + (None,)
+                    self._cache[plain_key] = (plain, at)
+                    self._cache.move_to_end(plain_key)
+                    self._retry_at.pop(plain_key, None)
+                self._cache[key] = (evidence, at)
                 self._cache.move_to_end(key)
                 while len(self._cache) > CACHE_ENTRIES:
                     self._cache.popitem(last=False)
@@ -257,12 +270,14 @@ class GitHubReleaseEvidence:
                 releases[tag] = self._release(token, repo, tag)
             commits.add(self._commit_asset(token, repo, releases[tag], asset))
         published = commits.pop() if len(commits) == 1 else None
-        on_main = self._on_main(token, repo, branch, target)
-        if on_main and plan is not None and not same_commit(plan, target):
+        on_branch = self._on_main(token, repo, branch, target)
+        on_main = on_branch
+        if on_main and plan is not None:
             status = self._compare(token, repo, target, plan)
             if status == "ahead":            # the plan is ahead: the target is older
                 on_main = False
-        return ReleaseEvidence(published_commit=published, on_main=on_main)
+        return (ReleaseEvidence(published_commit=published, on_main=on_main),
+                ReleaseEvidence(published_commit=published, on_main=on_branch))
 
     def _release(self, token, repo, tag):
         data = self._json(token, f"/repos/{repo}/releases/tags/{urllib.parse.quote(tag, safe='')}")
@@ -334,12 +349,16 @@ class GitHubReleaseEvidence:
         """GET with a hard deadline. ``redirect``: a 3xx returns (status, Location, b"")."""
         result: dict = {}
         req = urllib.request.Request(url, headers={**headers, "User-Agent": "herdr-engineering"})
+        deadline = time.monotonic() + self._timeout
 
         def call():
             try:
                 with self._opener.open(req, timeout=self._timeout) as response:
                     raw = b""
                     while len(raw) <= cap:
+                        if time.monotonic() > deadline:       # an abandoned call ends too
+                            result["error"] = "timeout"
+                            return
                         chunk = response.read1(min(65536, cap + 1 - len(raw))) \
                             if hasattr(response, "read1") else response.read(cap + 1 - len(raw))
                         if not chunk:

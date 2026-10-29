@@ -465,3 +465,70 @@ def test_the_server_wires_the_github_source_and_confirms_through_it(tmp_path, gh
         assert TOKEN not in json.dumps(body)
     finally:
         svr.shutdown()
+
+
+# ------------------------------------------------ real ticks, async worker
+class Deferred:
+    """An executor whose refreshes run only when the test says (the worker between ticks)."""
+
+    def __init__(self):
+        self.queued = []
+
+    def __call__(self, fn):
+        self.queued.append(fn)
+
+    def run(self):
+        while self.queued:
+            self.queued.pop(0)()
+
+
+def test_no_unconfirmed_tick_after_a_replan_with_the_async_worker(tmp_path, gh):
+    from herdr_engineering.control_plane.deployment_coordinator import (
+        DeploymentCoordinator,
+        Hold,
+        Replan,
+        Start,
+    )
+    from herdr_engineering.control_plane.deployment_definitions import DeploymentDefinitions
+    from herdr_engineering.control_plane.repo import ControlPlaneRepo
+    from tests.control_plane.test_deployment_coordinator import CI as CoordCI
+    from tests.control_plane.test_deployment_coordinator import T1, T2, _write_defs
+
+    defs_dir = str(tmp_path / "pipelines")
+    _write_defs(defs_dir)
+    ci = CoordCI()
+    ci.green(T1, 10)
+    repo = ControlPlaneRepo()
+    definitions = DeploymentDefinitions(lambda: defs_dir, ci_snapshot=ci)
+    worker, clock = Deferred(), Clock()
+    source = GitHubReleaseEvidence(definitions.definitions, token=lambda: TOKEN, api=gh.base,
+                                   download_hosts={"127.0.0.1"}, clock=clock, executor=worker)
+    coord = DeploymentCoordinator(definitions, monitor=lambda: repo.deployments,
+                                  state=lambda: repo.deployment_plans, evidence=source)
+    gh.release()
+    gh.asset(T1)
+    gh.compare("main", T1, "identical")
+    gh.compare("main", T2, "identical")
+    gh.compare(T2, T1, "behind", behind_by=1)
+
+    def tick():
+        out = coord.tick()[TRACK]
+        worker.run()
+        clock.t += 30
+        return out
+
+    first = tick()
+    assert first[-1].reason == "release not confirmed"          # a new target: one unknown tick
+    roll = tick()
+    assert isinstance(roll[0], Replan) and isinstance(roll[-1], Start)
+    for _ in range(3):                                           # plan T1 now: no flicker back
+        assert isinstance(tick()[-1], Start)
+    gh.asset(T2)
+    ci.green(T2, 11)
+    assert tick()[-1].reason == "release not confirmed"
+    roll = tick()
+    assert isinstance(roll[0], Replan) and isinstance(roll[-1], Start)
+    for _ in range(3):
+        last = tick()[-1]
+        assert isinstance(last, Start), last
+        assert not (isinstance(last, Hold) and "not confirmed" in last.reason)
