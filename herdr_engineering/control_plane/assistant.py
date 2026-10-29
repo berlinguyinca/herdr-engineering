@@ -133,6 +133,7 @@ def assistant_config(cfg: dict[str, Any]) -> dict[str, Any]:
             "approvers": [str(p) for p in (actions.get("approvers") or [])],
             "action_ttl_seconds": max(30, min(int(actions.get("action_ttl_seconds", 3600)), 86400)),
             "max_review_budget_seconds": max(60, int(actions.get("max_review_budget_seconds", 3600))),
+            "proposal_ttl_seconds": max(60, int(actions.get("proposal_ttl_seconds", 7 * 86400))),
             # API principal id -> collaboration user id the assistant may comment as. No entry, no comments.
             "collab_users": {str(k): str(v) for k, v in collab_users.items()},
         },
@@ -470,9 +471,18 @@ class DelegationRequest:
     artifact_refs: list[str] = field(default_factory=list)
     created_at: datetime = field(default_factory=_now)
     updated_at: datetime = field(default_factory=_now)
+    kind: str = "task"            # task | review
+    pr_id: str = ""
+    head: str = ""
+    budget_seconds: int = 0
+    note: str = ""
+    correlation: dict[str, Any] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:
         return {
+            "kind": self.kind, "pr_id": self.pr_id, "head": self.head,
+            "budget_seconds": self.budget_seconds, "note": self.note,
+            "correlation": self.correlation or {},
             "delegation_id": self.delegation_id,
             "assistant_id": self.assistant_id,
             "task": self.task,
@@ -509,6 +519,68 @@ class AssistantMemory:
             "created_at": self.created_at.isoformat(),
             "updated_at": self.updated_at.isoformat(),
             "revision": self.revision,
+        }
+
+
+@dataclass
+class AssistantProposal:
+    """A request the assistant surfaces for a person (or policy) to approve. It records intent only: approving it
+    is permission for an existing service to act, and nothing here starts work, writes code or merges."""
+    proposal_id: str
+    tenant_id: str
+    user_id: str
+    assistant_id: str
+    kind: str                       # propose_branch | request_mission | ci_repair
+    title: str
+    payload: dict[str, Any] = field(default_factory=dict)
+    payload_sha256: str = ""
+    status: str = "awaiting_approval"   # awaiting_approval | approved | rejected | expired
+    requested_by: str = ""
+    decided_by: str = ""
+    dedupe_key: str = ""
+    link: str = ""
+    external_ref: str = ""          # e.g. the ActionBoard proposal id for a CI repair
+    correlation: dict[str, Any] = field(default_factory=dict)
+    expires_at: datetime | None = None
+    created_at: datetime = field(default_factory=_now)
+    decided_at: datetime | None = None
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "proposal_id": self.proposal_id, "assistant_id": self.assistant_id, "kind": self.kind,
+            "title": self.title, "payload": self.payload, "payload_sha256": self.payload_sha256,
+            "status": self.status, "requested_by": self.requested_by, "decided_by": self.decided_by,
+            "dedupe_key": self.dedupe_key, "link": self.link, "external_ref": self.external_ref,
+            "correlation": self.correlation or {},
+            "expires_at": self.expires_at.isoformat() if self.expires_at else None,
+            "created_at": self.created_at.isoformat(),
+            "decided_at": self.decided_at.isoformat() if self.decided_at else None,
+            "execution": "not_started",      # always: this record never starts work
+        }
+
+
+@dataclass
+class AssistantNotification:
+    """A delivery record on the DASHBOARD channel. ``external`` is always False: nothing is sent off-box."""
+    notification_id: str
+    tenant_id: str
+    user_id: str
+    key: str
+    priority: str
+    text: str
+    link: str = ""
+    state: str = "ready"            # ready | held_for_digest | digested | acknowledged
+    channel: str = "dashboard"
+    external: bool = False
+    created_at: datetime = field(default_factory=_now)
+    updated_at: datetime = field(default_factory=_now)
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "notification_id": self.notification_id, "key": self.key, "priority": self.priority,
+            "text": self.text, "link": self.link, "state": self.state, "channel": self.channel,
+            "external": self.external, "created_at": self.created_at.isoformat(),
+            "updated_at": self.updated_at.isoformat(),
         }
 
 
@@ -1135,6 +1207,8 @@ class AssistantStore:
         self._routine_fired: set[str] = set()  # dedupe: routine_id|bucket_iso
         self.connectors: dict[str, Connector] = {}
         self.delegations: dict[str, DelegationRequest] = {}
+        self.proposals: dict[str, AssistantProposal] = {}
+        self.notifications: dict[str, AssistantNotification] = {}
         self._rate: dict[str, list[int]] = {}  # key -> [minute_window, count]
         self.audit: list[dict[str, Any]] = []
         self._lock = threading.RLock()
@@ -1182,6 +1256,8 @@ class AssistantStore:
                 "routines": [self._e_to_dict(r) for r in self.routines.values()],
                 "connectors": [self._e_to_dict(c) for c in self.connectors.values()],
                 "delegations": [self._e_to_dict(d) for d in self.delegations.values()],
+                "proposals": [self._e_to_dict(x) for x in self.proposals.values()],
+                "notifications": [self._e_to_dict(x) for x in self.notifications.values()],
                 "routine_fired": sorted(self._routine_fired),
                 "audit": list(self.audit),
             }
@@ -1210,6 +1286,11 @@ class AssistantStore:
                                (self._e_from_dict(Connector, d) for d in snap.get("connectors", []))}
             self.delegations = {d.delegation_id: d for d in
                                 (self._e_from_dict(DelegationRequest, d) for d in snap.get("delegations", []))}
+            self.proposals = {x.proposal_id: x for x in
+                              (self._e_from_dict(AssistantProposal, d) for d in snap.get("proposals", []))}
+            self.notifications = {x.notification_id: x for x in
+                                  (self._e_from_dict(AssistantNotification, d)
+                                   for d in snap.get("notifications", []))}
             self._routine_fired = set(snap.get("routine_fired", []))
             self.audit = list(snap.get("audit", []))
 
@@ -1453,6 +1534,17 @@ class AssistantStore:
              if d.tenant_id == tenant_id and d.user_id == user_id],
             key=lambda d: d.created_at, reverse=True)
 
+    def put_proposal(self, x: AssistantProposal) -> None:
+        with self._lock:
+            self.proposals[x.proposal_id] = x
+        self._after_mutation()
+
+    def put_notification(self, x: AssistantNotification) -> None:
+        with self._lock:
+            x.updated_at = _now()
+            self.notifications[x.notification_id] = x
+        self._after_mutation()
+
     def routine_fired(self, routine_id: str, bucket_iso: str) -> bool:
         return f"{routine_id}|{bucket_iso}" in self._routine_fired
 
@@ -1529,6 +1621,13 @@ class AssistantService:
         # Set by the control-plane API when project intelligence is enabled: (tenant, user, payload) -> dict.
         self.intelligence_read = None
         self.lineage_read = None
+        # Thin adapters over EXISTING endpoints, all wired by the control-plane API and all optional. Absent = the
+        # tool says it is not enabled; nothing falls back to doing the thing some other way.
+        self.review_rereview = None    # (tenant, user, pr_id, head|None) -> str   the existing re-review request
+        self.comment_poster = None     # (collab_user, room_id, body) -> (status, json)   the collab comments route
+        self.artifact_writer = None    # (user, draft dict, idempotency key) -> committed version dict
+        self.lineage_emit = None       # (user, correlation dict) -> dict   best-effort graph events
+        self.ci_board_request = None   # (tenant, user, payload, idempotency key) -> dict   ActionBoard.request
         if runner is not None:
             self.runner = runner
         else:
@@ -2424,6 +2523,365 @@ class AssistantService:
                                 detail=artifact_ref)
         return d
 
+    # -- adapters: thin, over existing endpoints --------------------------------------------------------
+    _ADAPTER_TOOLS = frozenset({"request_review", "propose_branch", "request_mission",
+                                "comment_on_node", "draft_email"})
+    _REPO_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.\-]{0,99}(/[A-Za-z0-9_][A-Za-z0-9_.\-]{0,99}){0,2}\Z")
+    _EMAIL_RE = re.compile(r"[^@\s<>,;]{1,64}@[^@\s<>,;]{1,255}\Z")
+
+    @staticmethod
+    def _text(payload: dict[str, Any], key: str, limit: int, *, required: bool = True) -> str:
+        v = payload.get(key)
+        if v is None or v == "":
+            if required:
+                raise AssistantError(f"{key} is required")
+            return ""
+        if not isinstance(v, str) or len(v) > limit:
+            raise AssistantError(f"{key} must be text of at most {limit} characters")
+        return v
+
+    def request_review(self, *, tenant_id: str, user_id: str, assistant_id: str,
+                       payload: dict[str, Any], actor: str,
+                       correlation: dict[str, Any] | None = None) -> DelegationRequest:
+        """Ask Pi or Claude to review something. A delegation RECORD (no executor here) plus, for a PR, the existing
+        re-review request. Bounded budget. It runs nothing and merges nothing."""
+        target = self._text(payload, "target_system", 40, required=False) or "pi"
+        if target not in ("pi", "claude"):
+            raise AssistantError("target_system must be pi or claude")
+        task = self._text(payload, "task", 2000)
+        pr_id = self._text(payload, "pr_id", 256, required=False)
+        head = self._text(payload, "head", 64, required=False)
+        cap = self.config["actions"]["max_review_budget_seconds"]
+        try:
+            budget = int(payload.get("budget_seconds") or cap)
+        except (TypeError, ValueError):
+            raise AssistantError("budget_seconds must be an integer") from None
+        d = DelegationRequest(
+            delegation_id=_new_id("dlg"), tenant_id=tenant_id, user_id=user_id, assistant_id=assistant_id,
+            task=task, target_system=target, kind="review", pr_id=pr_id, head=head,
+            budget_seconds=max(60, min(budget, cap)), correlation=dict(correlation or {}))
+        if pr_id:
+            if self.review_rereview is None:
+                d.note = "re-review endpoint is not enabled; the request is recorded only"
+            else:
+                try:
+                    d.note = str(self.review_rereview(tenant_id, user_id, pr_id, head or None))[:300]
+                except LookupError:
+                    d.note = "re-review not recorded: the PR is not visible to you"
+                except ValueError as exc:
+                    d.note = f"re-review not recorded: {str(exc)[:200]}"
+        self.store.put_delegation(d)
+        self.store.audit_record(tenant_id=tenant_id, user_id=user_id, actor=actor,
+                                action="assistant.review.requested", subject_id=d.delegation_id,
+                                detail=f"{target} {pr_id}")
+        return d
+
+    def create_proposal(self, *, tenant_id: str, user_id: str, assistant_id: str, kind: str,
+                        title: str, payload: dict[str, Any], requested_by: str,
+                        dedupe_key: str = "", link: str = "", external_ref: str = "",
+                        correlation: dict[str, Any] | None = None) -> tuple[AssistantProposal, bool]:
+        """Record a proposal for a person to approve. Returns (proposal, created). The same proposal while one is
+        still open is returned, not duplicated. Starts no work."""
+        self._require_enabled()
+        self.store.get_assistant(assistant_id, tenant_id=tenant_id, user_id=user_id)
+        digest = hashlib.sha256(canonical_json([kind, payload]).encode()).hexdigest()
+        key = dedupe_key or digest[:32]
+        now = self.now()
+        for x in self.store.proposals.values():
+            if (x.tenant_id == tenant_id and x.user_id == user_id and x.dedupe_key == key
+                    and x.kind == kind and x.status in ("awaiting_approval", "approved")
+                    and x.expires_at is not None and x.expires_at > now):
+                return x, False
+        from .intel_assistant import navigate
+        x = AssistantProposal(
+            proposal_id=_new_id("prop"), tenant_id=tenant_id, user_id=user_id, assistant_id=assistant_id,
+            kind=kind, title=(redact_secrets(title) or "")[:200], payload=payload, payload_sha256=digest,
+            requested_by=requested_by, dedupe_key=key, link=link or navigate("approval"),
+            external_ref=external_ref, correlation=dict(correlation or {}),
+            expires_at=now + timedelta(seconds=self.config["actions"]["proposal_ttl_seconds"]))
+        self.store.put_proposal(x)
+        self.store.audit_record(tenant_id=tenant_id, user_id=user_id, actor=requested_by,
+                                action="assistant.proposal.created", subject_id=x.proposal_id, detail=kind)
+        return x, True
+
+    def list_proposals(self, *, tenant_id: str, user_id: str, status: str | None = None) -> list[AssistantProposal]:
+        self._require_enabled()
+        now = self.now()
+        out = []
+        for x in self.store.proposals.values():
+            if x.tenant_id != tenant_id or not (x.user_id == user_id or self._is_approver(user_id)):
+                continue
+            if x.status == "awaiting_approval" and (x.expires_at is None or x.expires_at <= now):
+                x.status = "expired"
+                self.store.put_proposal(x)
+            if status is None or x.status == status:
+                out.append(x)
+        return sorted(out, key=lambda x: x.created_at, reverse=True)
+
+    def decide_proposal(self, proposal_id: str, *, tenant_id: str, user_id: str,
+                        decision: str, actor: str) -> AssistantProposal:
+        """Approve or reject a proposal. Approving records permission only: no code is changed, no mission is
+        started, nothing is merged. The approver must differ from the requester unless YAML opts in."""
+        self._require_enabled()
+        if decision not in ("approved", "rejected"):
+            raise AssistantError("decision must be 'approved' or 'rejected'")
+        x = self.store.proposals.get(proposal_id)
+        if x is None or x.tenant_id != tenant_id or not (x.user_id == user_id or self._is_approver(user_id)):
+            raise AssistantNotFound("proposal not found")
+        if x.kind == "ci_repair":
+            raise AssistantError("CI repair proposals are decided in the attention queue, not here")
+        if x.status != "awaiting_approval":
+            raise AssistantError(f"proposal already {x.status}")
+        if x.expires_at is None or x.expires_at <= self.now():
+            x.status = "expired"
+            self.store.put_proposal(x)
+            raise AssistantError("proposal expired; ask again")
+        if (decision == "approved" and not self.config["actions"]["allow_self_approval"]
+                and actor == x.requested_by):
+            raise AssistantForbidden("the approver must differ from the requester")
+        x.status, x.decided_by, x.decided_at = decision, actor, self.now()
+        self.store.put_proposal(x)
+        self.store.audit_record(tenant_id=tenant_id, user_id=x.user_id, actor=actor,
+                                action=f"assistant.proposal.{decision}", subject_id=proposal_id)
+        return x
+
+    def _propose(self, tool_id: str, *, tenant_id: str, user_id: str, assistant_id: str,
+                 payload: dict[str, Any], actor: str, correlation: dict[str, Any]) -> AssistantProposal:
+        title = self._text(payload, "title", 200)
+        if tool_id == "propose_branch":
+            repo = self._text(payload, "repo", 200)
+            if not self._REPO_RE.match(repo):
+                raise AssistantError("repo must look like owner/name")
+            body = {"title": title, "repo": repo, "base": self._text(payload, "base", 100, required=False),
+                    "rationale": self._text(payload, "rationale", 2000, required=False)}
+        else:
+            body = {"title": title, "task": self._text(payload, "task", 4000),
+                    "target_system": self._text(payload, "target_system", 40, required=False) or "pi"}
+        x, _ = self.create_proposal(tenant_id=tenant_id, user_id=user_id, assistant_id=assistant_id,
+                                    kind=tool_id, title=title, payload=body, requested_by=actor,
+                                    correlation=correlation)
+        return x
+
+    def _comment(self, *, user_id: str, payload: dict[str, Any], idem: str) -> dict[str, Any]:
+        if self.comment_poster is None:
+            raise AssistantError("collaboration comments are not enabled")
+        collab_user = self.config["actions"]["collab_users"].get(user_id)
+        if not collab_user:
+            raise AssistantForbidden("no collaboration identity is mapped for this principal")
+        room_id = self._text(payload, "room_id", 128)
+        text = self._text(payload, "text", 4000)
+        anchor = payload.get("anchor")
+        if not isinstance(anchor, dict):
+            raise AssistantError("anchor must be an object")
+        try:
+            status, out = self.comment_poster(collab_user, room_id, {
+                "anchor": anchor, "text": text,
+                "idempotency_key": hashlib.sha256(idem.encode()).hexdigest()[:32]})
+        except Exception as exc:  # noqa: BLE001 - the collaboration service's own refusal, surfaced as a tool error
+            raise AssistantError(redact_secrets(f"comment refused: {getattr(exc, 'message', exc)}") or "refused") from None
+        comment = (out or {}).get("comment") or {}
+        return {"ok": True, "status": status, "comment_id": comment.get("comment_id") or comment.get("id")}
+
+    def _draft(self, *, user_id: str, assistant_id: str, payload: dict[str, Any], idem: str) -> dict[str, Any]:
+        if self.artifact_writer is None:
+            raise AssistantError("the artifact registry is not available; nothing was drafted")
+        to = self._text(payload, "to", 320)
+        if not self._EMAIL_RE.match(to):
+            raise AssistantError("to must be one email address")
+        draft = {"kind": "email_draft", "status": "draft", "sent": False, "to": to,
+                 "subject": self._text(payload, "subject", 300), "body": self._text(payload, "body", 20000),
+                 "drafted_by": f"assistant:{assistant_id}"}
+        artifact_id = self._text(payload, "artifact_id", 128, required=False)
+        version = self.artifact_writer(user_id, {**draft, "artifact_id": artifact_id}, idem)
+        return {"ok": True, "sent": False, "artifact_id": version.get("artifact_id"),
+                "version_id": version.get("version_id"), "version_number": version.get("version_number"),
+                "note": "Draft saved only. Sending needs the send_message tool, a scoped grant and an approval."}
+
+    def _emit_lineage(self, user_id: str, correlation: dict[str, Any]) -> dict[str, Any]:
+        """Best effort: the action already happened. Never raises."""
+        if self.lineage_emit is None:
+            return {"node": None, "error": "lineage emission is not enabled"}
+        try:
+            return self.lineage_emit(user_id, correlation)
+        except Exception as exc:  # noqa: BLE001
+            return {"node": None, "error": str(exc) or type(exc).__name__}
+
+    def _run_adapter(self, tool_id: str, *, tenant_id: str, user_id: str, assistant_id: str,
+                     payload: dict[str, Any], actor: str, action: AssistantAction | None) -> dict[str, Any]:
+        corr = dict(action.correlation) if action is not None else {"assistant_id": assistant_id}
+        if action is not None:
+            corr.update({"request_hash": action.request_hash, "idempotency_key": action.idempotency_key,
+                         "approval_id": action.approval_id or corr.get("approval_id", "")})
+        corr["tool_id"] = tool_id
+        requester = action.requested_by if action is not None and action.requested_by else (actor or user_id)
+        idem = (action.idempotency_key if action is not None
+                else hashlib.sha256(canonical_json([tool_id, payload]).encode()).hexdigest())
+        if tool_id == "request_review":
+            d = self.request_review(tenant_id=tenant_id, user_id=user_id, assistant_id=assistant_id,
+                                    payload=payload, actor=actor or user_id, correlation=corr)
+            corr.update({"delegation_id": d.delegation_id, "target_id": d.pr_id})
+            result: dict[str, Any] = {"ok": True, "delegation": d.as_dict()}
+        elif tool_id in ("propose_branch", "request_mission"):
+            x = self._propose(tool_id, tenant_id=tenant_id, user_id=user_id, assistant_id=assistant_id,
+                              payload=payload, actor=requester, correlation=corr)
+            corr["proposal_id"] = x.proposal_id
+            result = {"ok": True, "proposal": x.as_dict()}
+        elif tool_id == "comment_on_node":
+            result = self._comment(user_id=user_id, payload=payload, idem=idem)
+            anchor = payload.get("anchor") if isinstance(payload.get("anchor"), dict) else {}
+            corr["target_id"] = str(anchor.get("node_id") or anchor.get("to_id") or "")
+        else:
+            result = self._draft(user_id=user_id, assistant_id=assistant_id, payload=payload, idem=idem)
+            corr["artifact_id"] = result.get("artifact_id") or ""
+        result["lineage"] = self._emit_lineage(user_id, corr)
+        return result
+
+    # -- CI-failure watching ----------------------------------------------------------------------------
+    _CI_FAILED = frozenset({"failed", "failure", "error", "errored", "timed_out"})
+
+    def watch_ci(self, *, tenant_id: str, user_id: str, assistant_id: str, actor: str,
+                 refresh: bool = False) -> dict[str, Any]:
+        """Look at the CI runs this user can see in the lineage graph and surface each NEW failure once.
+
+        A failure is identified by (ci node, repo, run, head). The first sighting becomes a ``ci_repair`` proposal
+        on the existing intelligence ActionBoard (the approval and the optional executor live there, behind
+        ``repair_policy``) plus one dashboard notification. The same failure is never re-alerted; ``refresh``
+        only re-requests a repair proposal whose approval window lapsed. Nothing here merges, pushes or writes to
+        GitHub, and no assistant verdict approves anything.
+        """
+        self._require_enabled()
+        self.store.get_assistant(assistant_id, tenant_id=tenant_id, user_id=user_id)
+        if self.lineage_read is None:
+            raise AssistantError("lineage reading is not enabled")
+        if self.ci_board_request is None:
+            raise AssistantError("the repair queue (project intelligence) is not enabled")
+        try:
+            out = self.lineage_read(tenant_id, user_id, {"operation": "list", "node_type": "ci", "limit": 200})
+        except (ValueError, LookupError) as exc:
+            raise AssistantError(str(exc)) from exc
+        nodes = ((out or {}).get("data") or {}).get("nodes") or []
+        res: dict[str, Any] = {"created": [], "duplicates": 0, "skipped": [], "scanned": len(nodes)}
+        for n in nodes:
+            attrs = n.get("attrs") if isinstance(n.get("attrs"), dict) else {}
+            if str(n.get("state") or "").lower() not in self._CI_FAILED:
+                continue
+            repo = str(attrs.get("repo") or attrs.get("repository") or "")
+            run = attrs.get("run") or attrs.get("run_number")
+            head = str(attrs.get("head") or attrs.get("commit") or attrs.get("sha") or "")
+            try:
+                run_no = int(run)
+            except (TypeError, ValueError):
+                run_no = 0
+            if not self._REPO_RE.match(repo) or run_no < 1:
+                res["skipped"].append({"node": n.get("id"), "reason": "no repository/run on the CI node"})
+                continue
+            fp = hashlib.sha256(canonical_json([n.get("id"), repo, run_no, head]).encode()).hexdigest()
+            prior = [x for x in self.store.proposals.values()
+                     if x.tenant_id == tenant_id and x.user_id == user_id and x.kind == "ci_repair"
+                     and x.payload.get("fingerprint") == fp]
+            open_ = [x for x in prior if x.status == "awaiting_approval"
+                     and x.expires_at is not None and x.expires_at > self.now()]
+            if open_ or (prior and not refresh):
+                res["duplicates"] += 1
+                continue
+            payload = {"repo": repo, "run": run_no}
+            try:
+                board = self.ci_board_request(tenant_id, user_id, payload, f"{fp[:56]}-{len(prior)}")
+            except Exception as exc:  # noqa: BLE001 - no scope, kill switch, or a refused action
+                res["skipped"].append({"node": n.get("id"), "reason": redact_secrets(str(exc))[:200]})
+                continue
+            expires = board.get("expires_at")
+            x, _ = self.create_proposal(
+                tenant_id=tenant_id, user_id=user_id, assistant_id=assistant_id, kind="ci_repair",
+                title=f"CI failed: {repo} run {run_no}",
+                payload={**payload, "fingerprint": fp, "head": head, "ci_node": n.get("id"),
+                         "auto_merge": False},
+                requested_by=user_id, dedupe_key=f"ci:{fp[:32]}:{len(prior)}",
+                external_ref=str(board.get("id") or ""),
+                correlation={"assistant_id": assistant_id, "ci_node": str(n.get("id") or "")})
+            if expires:
+                x.expires_at = datetime.fromisoformat(expires)
+                self.store.put_proposal(x)
+            self.notify(tenant_id=tenant_id, user_id=user_id, key=f"ci:{fp[:32]}", priority="urgent",
+                        text=f"CI failed in {repo} (run {run_no}); a repair proposal awaits approval",
+                        link=x.link)
+            res["created"].append(x.proposal_id)
+        self.store.audit_record(tenant_id=tenant_id, user_id=user_id, actor=actor,
+                                action="assistant.ci.watched", subject_id=assistant_id,
+                                detail=f"created={len(res['created'])} duplicates={res['duplicates']}")
+        return res
+
+    # -- notifications: dashboard delivery records only -----------------------------------------------------
+    def _quiet_planner(self):
+        from .intel_assistant import NotificationPlanner
+        cfg = self.config["notifications"]
+        return NotificationPlanner(cfg["quiet_start"], cfg["quiet_end"])
+
+    def _local(self, dt: datetime) -> datetime:
+        from zoneinfo import ZoneInfo
+        try:
+            return dt.astimezone(ZoneInfo(self.config["notifications"]["timezone"]))
+        except Exception:  # noqa: BLE001 - an unknown zone falls back to UTC rather than failing a notification
+            return dt.astimezone(UTC)
+
+    def notify(self, *, tenant_id: str, user_id: str, key: str, priority: str, text: str,
+               link: str = "") -> tuple[AssistantNotification, str]:
+        """Plan with the existing ``NotificationPlanner`` and RECORD the outcome for the dashboard. Returns
+        (record, verdict) where verdict is ``send_now`` (the dashboard shows it now), ``held_for_digest`` (quiet
+        hours, in the user's timezone) or ``duplicate`` (the same key never notifies twice). Nothing leaves this
+        process: there is no transport on this path."""
+        from .intel_assistant import Notice
+        self._require_enabled()
+        if priority not in ("urgent", "normal"):
+            raise AssistantError("priority must be urgent or normal")
+        if link and not link.startswith("#/"):
+            raise AssistantError("notification links must be dashboard links")
+        for x in self.store.notifications.values():
+            if x.tenant_id == tenant_id and x.user_id == user_id and x.key == key:
+                return x, "duplicate"
+        planner = self._quiet_planner()
+        notice = Notice(key=key, priority=priority, text=(redact_secrets(text) or "")[:500], link=link)
+        verdict = planner.plan(notice, self._local(self.now()))
+        rec = AssistantNotification(
+            notification_id=_new_id("ntf"), tenant_id=tenant_id, user_id=user_id, key=key,
+            priority=priority, text=notice.text, link=link,
+            state="ready" if verdict == "send_now" else "held_for_digest")
+        self.store.put_notification(rec)
+        self.store.audit_record(tenant_id=tenant_id, user_id=user_id, actor=user_id,
+                                action="assistant.notification.recorded", subject_id=rec.notification_id,
+                                detail=f"{verdict} dashboard")
+        return rec, verdict
+
+    def list_notifications(self, *, tenant_id: str, user_id: str,
+                           state: str | None = None) -> list[AssistantNotification]:
+        self._require_enabled()
+        return sorted([x for x in self.store.notifications.values()
+                       if x.tenant_id == tenant_id and x.user_id == user_id
+                       and (state is None or x.state == state)],
+                      key=lambda x: x.created_at, reverse=True)
+
+    def digest(self, *, tenant_id: str, user_id: str) -> dict[str, Any]:
+        """Collect what quiet hours held back (once: they become ``digested``)."""
+        self._require_enabled()
+        held = sorted([x for x in self.store.notifications.values()
+                       if x.tenant_id == tenant_id and x.user_id == user_id and x.state == "held_for_digest"],
+                      key=lambda x: x.created_at)
+        if held and self._quiet_planner()._quiet(self._local(self.now())):
+            return {"items": [], "quiet_hours": True, "held": len(held)}
+        for x in held:
+            x.state = "digested"
+            self.store.put_notification(x)
+        return {"items": [x.as_dict() for x in held], "quiet_hours": False, "held": 0}
+
+    def ack_notification(self, notification_id: str, *, tenant_id: str, user_id: str) -> AssistantNotification:
+        self._require_enabled()
+        x = self.store.notifications.get(notification_id)
+        if x is None or x.tenant_id != tenant_id or x.user_id != user_id:
+            raise AssistantNotFound("notification not found")
+        x.state = "acknowledged"
+        self.store.put_notification(x)
+        return x
+
     # -- agentic tool-calling loop -------------------------------------------------
     def _drive(self, run: AssistantRun, messages: list[AssistantMessage]) -> str:
         """Produce a reply: run the tool loop when tools are enabled and the
@@ -2484,8 +2942,10 @@ class AssistantService:
                 "browse": "url", "run_shell": "command",
                 "connector_request": "connector_id", "delegate": "target_system",
                 "send_message": "to", "edit_shared": "record",
+                "request_review": "target_system", "request_mission": "target_system",
+                "propose_branch": "repo", "comment_on_node": "room_id", "draft_email": "to",
             }.get(tool_id)
-            scope = (args.get(target_field, "pi" if tool_id == "delegate" else "")
+            scope = (args.get(target_field, "pi" if tool_id in ("delegate", "request_review", "request_mission") else "")
                      if target_field else tool_id)
             if not isinstance(scope, str):
                 return "[denied: tool target must be a string]"
@@ -2627,6 +3087,9 @@ class AssistantService:
                 return {"ok": True, "result": self.lineage_read(tenant_id, user_id, payload)}
             except (ValueError, LookupError) as exc:
                 raise AssistantError(str(exc)) from exc
+        if tool_id in self._ADAPTER_TOOLS:
+            return self._run_adapter(tool_id, tenant_id=tenant_id, user_id=user_id, assistant_id=assistant_id,
+                                     payload=payload, actor=actor, action=action)
         if tool_id == "delegate":
             d = self.delegate(tenant_id=tenant_id, user_id=user_id,
                               assistant_id=assistant_id,
