@@ -56,6 +56,10 @@ PROBES = {"served-request"}
 STRATEGIES = {"previous-version", "none"}
 TOP = {"component", "stage", "order", "host", "updater", "follows", "restart",
        "gpu", "health", "rollback"}
+#: Herdr-side optional keys (not in validate.py yet): absent = the Task 2 behaviour.
+OPTIONAL = {"requires"}
+REQUIRES = {"repo", "ci_context", "stage"}
+MAX_REQUIRES = 8
 FOLLOWS = {"repo", "tag", "asset", "branch", "ci_context"}
 HEALTH = {"probe", "timeout_s", "hold_s"}
 ROLLBACK = {"strategy", "reason"}
@@ -116,7 +120,7 @@ def validate_definition(doc, name):
     if not isinstance(doc, dict):
         return ["definition must be a mapping"]
     for k in sorted(doc, key=str):
-        if k not in TOP:
+        if k not in TOP and k not in OPTIONAL:
             errs.append(f"unknown key {_k(k)}")
     for k in sorted(TOP - set(doc)):
         errs.append(f"missing key {k}")
@@ -162,6 +166,105 @@ def validate_definition(doc, name):
             errs.append(f"rollback.strategy must be one of {sorted(STRATEGIES)}")
         elif rb["strategy"] == "none" and not _str(rb.get("reason")):
             errs.append("rollback.reason is required when strategy is 'none'")
+    if "requires" in doc:
+        _validate_requires(doc["requires"], errs)
+    return errs
+
+
+def _validate_requires(value, errs):
+    """``requires: [{repo, ci_context, stage}]``: stages of OTHER follows tracks (branch is
+    always main) that must be rolled out on their target before this track may start."""
+    if not isinstance(value, list):
+        errs.append("requires must be a list")
+        return
+    if len(value) > MAX_REQUIRES:
+        errs.append(f"requires must have at most {MAX_REQUIRES} entries")
+        return
+    seen = set()
+    for i, r in enumerate(value):
+        where = f"requires[{i}]"
+        if not isinstance(r, dict):
+            errs.append(f"{where} must be a mapping")
+            continue
+        for k in sorted(r, key=str):
+            if k not in REQUIRES:
+                errs.append(f"unknown key {where}.{_k(k)}")
+        for k in sorted(REQUIRES - set(r)):
+            errs.append(f"missing key {where}.{k}")
+        for k in ("repo", "ci_context"):
+            if k in r and not _str(r[k]):
+                errs.append(f"{where}.{k} must be a non-empty string")
+        if "stage" in r and (not _int(r["stage"]) or r["stage"] not in (1, 2)):
+            errs.append(f"{where}.stage must be 1 or 2")
+        key = _requirement(r)
+        if key is not None:
+            if key in seen:
+                errs.append(f"{where} duplicates an earlier requirement")
+            seen.add(key)
+
+
+def _requirement(r):
+    """((repo, "main", ci_context), stage) for a well-formed entry, else None."""
+    if (not isinstance(r, dict) or set(r) != REQUIRES or not _str(r["repo"])
+            or not _str(r["ci_context"]) or not _int(r["stage"]) or r["stage"] not in (1, 2)):
+        return None
+    return ((r["repo"], "main", r["ci_context"]), r["stage"])
+
+
+def _doc_track(doc):
+    f = doc.get("follows") if isinstance(doc, dict) else None
+    if not isinstance(f, dict) or not all(_str(f.get(k)) for k in ("repo", "ci_context")):
+        return None
+    return (f["repo"], "main", f["ci_context"])
+
+
+def _requires_errors(docs):
+    """Cross-file ``requires`` checks: a requirement names another track some definition
+    follows, at a stage that track has, and the track graph has no cycle."""
+    errs = []
+    stages: dict[tuple, set] = {}
+    for _stem, (_fn, doc) in docs.items():
+        track = _doc_track(doc)
+        if track is not None and _int(doc.get("stage")):
+            stages.setdefault(track, set()).add(doc["stage"])
+    edges: dict[tuple, set] = {}
+    for _stem, (fn, doc) in sorted(docs.items()):
+        reqs = doc.get("requires") if isinstance(doc, dict) else None
+        track = _doc_track(doc)
+        if not isinstance(reqs, list) or track is None:
+            continue
+        for i, r in enumerate(reqs):
+            key = _requirement(r)
+            if key is None:
+                continue
+            req_track, stage = key
+            if req_track == track:
+                errs.append(f"{fn}: requires[{i}] names its own track")
+            elif req_track not in stages:
+                errs.append(f"{fn}: requires[{i}] names a track no definition follows")
+            elif stage not in stages[req_track]:
+                errs.append(f"{fn}: requires[{i}] names stage {stage}, which that track does not have")
+            else:
+                edges.setdefault(track, set()).add(req_track)
+    # cycle check over the track graph (white/grey/black DFS, iterative)
+    state: dict[tuple, int] = {}
+    for start in sorted(edges):
+        if state.get(start):
+            continue
+        stack = [(start, iter(sorted(edges.get(start, ()))))]
+        state[start] = 1
+        while stack:
+            node, it = stack[-1]
+            nxt = next(it, None)
+            if nxt is None:
+                state[node] = 2
+                stack.pop()
+            elif state.get(nxt) == 1:
+                errs.append(f"requires forms a cycle between tracks {_r(node[0])} and {_r(nxt[0])}")
+                return errs
+            elif not state.get(nxt):
+                state[nxt] = 1
+                stack.append((nxt, iter(sorted(edges.get(nxt, ())))))
     return errs
 
 
@@ -270,6 +373,7 @@ def _read_dir(path):
             else:
                 seen[key] = fn
         docs[stem] = (fn, doc)
+    errs.extend(_requires_errors(docs))
     return _bound(errs), docs
 
 
@@ -291,6 +395,8 @@ class Definition:
     gpu: bool
     health: dict
     rollback: dict
+    #: ((repo, branch, ci_context), stage) pairs of OTHER tracks that must be rolled out first.
+    requires: tuple = ()
 
     @property
     def hold_s(self) -> int:
@@ -338,7 +444,8 @@ def load_definitions(path):
         out[stem] = Definition(
             component=d["component"], stage=d["stage"], order=d["order"], host=d["host"],
             updater=d["updater"], follows=dict(d["follows"]), restart=d["restart"],
-            gpu=d["gpu"], health=dict(d["health"]), rollback=dict(d["rollback"]))
+            gpu=d["gpu"], health=dict(d["health"]), rollback=dict(d["rollback"]),
+            requires=tuple(sorted(_requirement(r) for r in d.get("requires") or ())))
     return out, []
 
 

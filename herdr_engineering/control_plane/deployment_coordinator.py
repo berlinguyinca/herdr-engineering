@@ -224,6 +224,9 @@ class Snapshot:
     generation: int = 0
     past_targets: tuple = field(default_factory=tuple)
     slots: dict | None = None
+    #: ((track, stage), None | reason) for the definitions' ``requires``: None = met (that
+    #: stage of the other track is rolled out on its confirmed target). Absent = unmet.
+    requirements: tuple = field(default_factory=tuple)
 
 
 def same_commit(a, b) -> bool:
@@ -363,6 +366,15 @@ def advance(snapshot: Snapshot, definitions: dict, now: float) -> list:
     if snapshot.target_on_main is not True:
         return [Hold(stage=None, remaining_s=None, reason="target ancestry not confirmed",
                      target_commit=target, generation=generation)]
+    met = dict(snapshot.requirements or ())
+    for req in sorted({r for d in definitions.values() for r in d.requires}):
+        why = met.get(req, "unknown")
+        if why is not None:
+            (repo, _branch, ci_context), stage = req
+            # Hold(None) with no timer: no force overrides it (deployment_actions._overridable)
+            return [Hold(stage=None, remaining_s=None,
+                         reason=f"waiting on {repo} {ci_context} stage {stage}: {why}",
+                         target_commit=target, generation=generation)]
     out: list = []
     if replan:
         generation += 1
@@ -383,6 +395,37 @@ def advance(snapshot: Snapshot, definitions: dict, now: float) -> list:
         action = dataclasses.replace(action, permitted=())
     out.append(action)
     return out
+
+
+def requirement_status(snapshot: Snapshot, definitions: dict, stage: int, now: float):
+    """None when stage ``stage`` of the track ``definitions`` follow is rolled out on its
+    confirmed target (every component of stages <= ``stage`` healthy past its hold, the
+    release published and on main, the track's own requirements met), else the reason.
+    Pure: it is ``advance`` over those stages, so every safety gate applies."""
+    defs = {c: d for c, d in definitions.items() if d.stage <= stage}
+    if not any(d.stage == stage for d in defs.values()):
+        return f"the track has no stage {stage}"
+    last = advance(snapshot, defs, now)[-1]
+    if isinstance(last, Idle) and last.reason == "rolled out" and last.permitted:
+        return None
+    if isinstance(last, Start):
+        return f"stage {last.stage} is rolling"
+    return last.reason if isinstance(last, (Hold, Halt, Idle)) else "not rolled out"
+
+
+def _requirement_order(tracks, defs):
+    """Tracks in an order where every required track comes first; a track caught in a
+    cycle (the validator refuses one) comes last and its requirements stay unmet."""
+    deps = {t: {r[0] for d in defs.values() if d.track == t for r in d.requires} for t in tracks}
+    done, order = set(), []
+    while True:
+        ready = [t for t in sorted(tracks) if t not in done and deps[t] <= done | (deps[t] - set(tracks))]
+        if not ready:
+            break
+        for t in ready:
+            done.add(t)
+            order.append(t)
+    return order + [t for t in sorted(tracks) if t not in done]
 
 
 # ------------------------------------------------------------------- state
@@ -755,7 +798,8 @@ class DeploymentCoordinator:
         if components is not None:
             state.observe(components, defs)
         now = self._now()
-        out = {}
+        out, snaps = {}, {}
+        # Pass 1: one evidence call per track and its snapshot (no requirements yet).
         for track, plan in sorted(plans.items()):
             ps = state.plan(track)
             target = plan.target_commit
@@ -777,20 +821,38 @@ class DeploymentCoordinator:
                 evidence = ReleaseEvidence()
             seen[track] = evidence
             try:
-                snap = Snapshot(components=components, target_commit=target,
-                                published_commit=evidence.published_commit,
-                                target_on_main=evidence.on_main, plan_commit=ps.commit,
-                                generation=ps.generation, past_targets=ps.past,
-                                slots=state.slots_for(target, tdefs) if target else {})
-                actions = advance(snap, tdefs, now)
+                snaps[track] = (tdefs, Snapshot(
+                    components=components, target_commit=target,
+                    published_commit=evidence.published_commit,
+                    target_on_main=evidence.on_main, plan_commit=ps.commit,
+                    generation=ps.generation, past_targets=ps.past,
+                    slots=state.slots_for(target, tdefs) if target else {}))
             except Exception as exc:  # noqa: BLE001
                 out[track] = hold(f"coordinator error: {type(exc).__name__}")
+        # Pass 2: required tracks first, so a requirement reads that track's own view.
+        for track in _requirement_order(list(snaps), defs):
+            tdefs, snap = snaps[track]
+            try:
+                reqs = sorted({r for d in tdefs.values() for r in d.requires})
+                met = []
+                for req_track, stage in reqs:
+                    other = snaps.get(req_track)
+                    why = ("the required track has no usable plan this tick" if other is None
+                           else requirement_status(other[1], other[0], stage, now))
+                    met.append(((req_track, stage), why))
+                snap = dataclasses.replace(snap, requirements=tuple(met))
+                snaps[track] = (tdefs, snap)
+                actions = advance(snap, tdefs, now)
+            except Exception as exc:  # noqa: BLE001
+                out[track] = [Hold(stage=None, remaining_s=None,
+                                   reason=f"coordinator error: {type(exc).__name__}",
+                                   target_commit=snap.target_commit, generation=snap.generation)]
                 continue
             for action in actions:
                 if isinstance(action, Replan):
                     state.adopt(track, action)
             out[track] = actions
-        return out
+        return dict(sorted(out.items()))
 
 
 # ------------------------------------------------------------------- views
