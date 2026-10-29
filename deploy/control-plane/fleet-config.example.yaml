@@ -91,6 +91,13 @@ sections:
       #   evidence_writers: ["key:<12-hex-of-the-ci-reporter-key>"]   # REPLACE: the placeholder is refused at startup
       #   required_checks: ["ci"]        # edges name their check in attrs.check (default "ci")
       #   require_review_quorum: false   # true also needs control_plane.review_quorum to be satisfied
+      #   evidence_source:               # OPTIONAL: the writer of the `validated` edges the gate reads (own switch, off by default)
+      #     enabled: false               # step 1 of the enable sequence; the gate's evidence_writers is step 3
+      #     principal: "ci-evidence:woodpecker"   # dedicated in-process id; must start with ci-evidence: (API-key ids are refused)
+      #     check: "ci"                  # the check name written to attrs.check
+      #     repos:                       # ONLY these repos / PRs get evidence (also enrolled in control_plane.review_gate)
+      #       - repo: github.com/<owner>/<name>
+      #         prs: [123]               # optional; omit for every open non-draft PR of the repo
       # OPTIONAL: the Personal Assistant (inert unless `enabled: true`). Nothing in
       # the assistant module runs while disabled; the /personal-assistant dashboard
       # view only appears when the `assistant_v1` capability is advertised (enabled).

@@ -24,6 +24,8 @@ Direction: `spawn` parent->child; `handoff` from->to; `delegation` delegator->de
 `dependency` dependent->prerequisite; `issue_link` any->issue/pr; `fork` origin->new approach; `supersession` new->old;
 `reviewed` reviewer->subject (attrs.commit / attrs.plan_digest REQUIRED = revision binding); `produced` producer->artifact;
 `validated` validator->subject (attrs.commit REQUIRED).
+Convention for CI evidence (the graph merge gate and its writer, `graph_evidence_writer.py`): `attrs` carry `commit` (the exact head
+SHA), `check` (name, default `ci`), `conclusion` (`success`|`failure`; anything unknown is pending, never a pass) and `run`.
 
 ## Rules
 - Every event carries the envelope `source`, `source_sequence`, `visibility_scope`; graph reads must filter by it.

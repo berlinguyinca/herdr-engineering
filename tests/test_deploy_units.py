@@ -133,3 +133,52 @@ def test_serve_without_config_keeps_flag_defaults():
     args = _serve_args(url="http://cp", api_key_file="/k")
     command.resolve_serve_config(args)
     assert (args.poll, args.timeout, args.cache_dir) == (5.0, 300.0, command.DEFAULT_CACHE)
+
+
+ANCHOR_DIR = ROOT / "deploy/control-plane"
+ANCHOR_SERVICES = {"anchor": ANCHOR_DIR / "herdr-audit-anchor.service", "verify": ANCHOR_DIR / "herdr-audit-verify.service"}
+ANCHOR_PATH = "/var/lib/herdr-anchor"
+HARDENING = {"NoNewPrivileges": "yes", "ProtectSystem": "strict", "Restart": "no", "Type": "oneshot",
+             "User": "herdr-anchor", "ProtectHome": "yes", "PrivateTmp": "yes"}
+
+
+@pytest.mark.parametrize("action", sorted(ANCHOR_SERVICES))
+def test_audit_anchor_services_are_hardened_oneshots_that_run_the_real_cli(action):
+    unit = ANCHOR_SERVICES[action]
+    s = parse_unit(unit)
+    svc = dict(s["Service"])
+    for key, value in HARDENING.items():
+        assert svc.get(key) == value, f"{unit.name}: {key}={value} required"
+    writable = [v for k, v in s["Service"] if k == "ReadWritePaths"]
+    assert writable == ([ANCHOR_PATH] if action == "anchor" else []), "only the anchor service writes, and only its own dir"
+    if action == "verify":
+        assert ("ReadOnlyPaths", ANCHOR_PATH) in s["Service"]
+    assert not any(k in {"Environment", "EnvironmentFile", "PassEnvironment"} for sec in s.values() for k, _ in sec)
+    argv = shlex.split(svc["ExecStart"])
+    assert argv[0].endswith("/herdr-eng") and argv[1:4] == ["control-plane", "assistant-audit", action]
+    from herdr_engineering import cli
+    args = cli._build_parser().parse_args(argv[1:])                    # the real CLI accepts the unit's command line
+    assert args.action == action and args.api_key_file == "/etc/herdr/anchor/approver.key"
+    assert args.fleet_config == "/etc/herdr/anchor/fleet-config.yaml" and "REPLACE" in args.control_plane
+    assert "--api-key-file" in argv and not any("key=" in a or a.startswith("--api-key=") for a in argv)
+
+
+@pytest.mark.parametrize("action,calendar", [("anchor", "*:0/15"), ("verify", "hourly")])
+def test_audit_anchor_timers_trigger_their_service_on_schedule_and_are_never_enabled_by_the_repo(action, calendar):
+    timer = ANCHOR_SERVICES[action].with_suffix(".timer")
+    s = parse_unit(timer)
+    assert dict(s["Timer"])["OnCalendar"] == calendar and dict(s["Timer"])["Unit"] == ANCHOR_SERVICES[action].name
+    assert dict(s["Install"])["WantedBy"] == "timers.target"
+    deploy_sh = (ROOT / "deploy/control-plane/deploy.sh").read_text()
+    assert "herdr-audit" not in deploy_sh, "deploy.sh must not install or enable the anchor units"
+
+
+def test_anchor_minimal_fleet_file_loads_with_the_real_loader(tmp_path):
+    """The runbook's minimal fleet file (so the anchor user never reads the central one) is accepted by the CLI loader."""
+    from herdr_engineering import cli
+    minimal = tmp_path / "fleet-config.yaml"
+    minimal.write_text("version: 1\nhosts: {}\nsections:\n  control_plane:\n    roles: [control-plane]\n    values:\n"
+                       "      personal_assistant:\n        audit:\n          anchor_file: /var/lib/herdr-anchor/assistant-audit.anchor\n")
+    minimal.chmod(0o600)                                              # the loader refuses a group/other-readable file
+    _, cp = cli._load_cp_fleet_config(str(minimal))
+    assert cp["personal_assistant"]["audit"]["anchor_file"] == f"{ANCHOR_PATH}/assistant-audit.anchor"

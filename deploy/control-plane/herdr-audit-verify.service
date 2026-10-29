@@ -1,0 +1,33 @@
+# System unit: check the stored audit chain against the last anchor (`... assistant-audit verify`). Hourly via
+# herdr-audit-verify.timer. The command exits 0 only for status `ok`; `rolled_back`, `diverged`, `chain_broken`,
+# `anchor_tampered`, `no_anchor` and any transport error exit 1, so this unit FAILS (visible in `systemctl --failed`,
+# and OnFailure= can page you). Same user, key and minimal fleet file as herdr-audit-anchor.service; read-only here.
+# Not installed or enabled by anything.
+[Unit]
+Description=Verify the assistant audit chain against the off-store anchor (fails on anything but ok)
+After=network-online.target
+Wants=network-online.target
+# Optional: OnFailure=your-alert@%n.service
+
+[Service]
+Type=oneshot
+User=herdr-anchor
+Group=herdr-anchor
+UMask=0077
+Restart=no
+TimeoutStartSec=2min
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadOnlyPaths=/var/lib/herdr-anchor
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+CapabilityBoundingSet=
+# REPLACE the control-plane URL with the real one.
+ExecStart=/usr/local/bin/herdr-eng control-plane assistant-audit verify --fleet-config /etc/herdr/anchor/fleet-config.yaml --control-plane https://REPLACE-control-plane.example.invalid --api-key-file /etc/herdr/anchor/approver.key

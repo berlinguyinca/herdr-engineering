@@ -29,7 +29,8 @@ PASS = frozenset({"pass", "passed", "success", "succeeded", "green"})
 FAIL = frozenset({"fail", "failed", "failure", "error", "red", "cancelled", "canceled", "timed_out", "timeout"})
 # an explicit graph principal id, "<kind>:<id>" (e.g. key:0123456789ab); no wildcard, no bare word
 _PRINCIPAL = re.compile(r"^[a-z][a-z0-9_-]{0,31}:[A-Za-z0-9_.@-][A-Za-z0-9_.:@-]{0,127}$")
-_KEYS = frozenset({"enabled", "evidence_writers", "required_checks", "require_review_quorum"})
+_KEYS = frozenset({"enabled", "evidence_writers", "required_checks", "require_review_quorum",
+                   "evidence_source"})
 
 
 @dataclass(frozen=True)
@@ -89,6 +90,8 @@ def validate_section(raw) -> GraphGateConfig | None:
         raise ValueError("graph_merge_gate.required_checks must be a non-empty list of check names")
     if not isinstance(raw.get("require_review_quorum", False), bool):
         raise ValueError("graph_merge_gate.require_review_quorum must be a boolean")
+    from .graph_evidence_writer import validate_evidence_source   # the writer's block is checked here too, enabled or not
+    validate_evidence_source(raw.get("evidence_source"))
     return config_from_section(raw)
 
 
