@@ -6,6 +6,14 @@ import json
 import re
 from dataclasses import dataclass, replace
 
+from .artifact_visual_renderers import (
+    _DECK_CSS,
+    parse_flowchart,
+    render_chart_svg,
+    render_flowchart_svg,
+    split_slides,
+)
+
 
 class ArtifactRendererError(ValueError):
     """Renderer failure. ``code`` is machine-readable; ``to_dict`` is the structured result."""
@@ -158,6 +166,8 @@ class RendererRegistry:
             return self._diagram(source)
         if profile == "report":
             return self._report(source, request)
+        if profile == "presentation":
+            return self._presentation(source)
         raise ArtifactRendererError(f"unsupported artifact profile: {profile}", "unsupported_format")
 
     def _report(self, source: str, request: dict) -> RenderResult:
@@ -223,21 +233,54 @@ class RendererRegistry:
         except (TypeError, ValueError) as exc:
             raise ArtifactRendererError("visualization profile requires valid JSON") from exc
         normalized = json.dumps(parsed, indent=2, sort_keys=True)
-        return RenderResult("visualization", source,
-                            [{"name": "data.json", "media_type": "application/json",
-                              "content": normalized}],
-                            {"status": "passed", "checks": ["json-parse"]},
-                            {"renderer": "builtin-json", "revision": "1"})
+        outputs = [{"name": "data.json", "media_type": "application/json", "content": normalized}]
+        validation = {"status": "passed", "checks": ["json-parse"]}
+        if isinstance(parsed, dict) and "type" in parsed:
+            try:
+                svg = render_chart_svg(parsed)
+            except ValueError as exc:
+                raise ArtifactRendererError(f"invalid chart spec: {exc}") from exc
+            outputs.insert(0, {"name": "chart.svg", "media_type": "image/svg+xml", "content": svg})
+            validation["checks"].append("chart-svg")
+        else:
+            validation["findings"] = [{"code": "no_chart_spec",
+                                       "detail": "JSON has no 'type'; only data.json was produced"}]
+        return RenderResult("visualization", source, outputs, validation,
+                            {"renderer": "builtin-chart-svg", "revision": "1"})
 
     @staticmethod
     def _diagram(source: str) -> RenderResult:
         if not isinstance(source, str) or not source.strip():
             raise ArtifactRendererError("diagram profile requires Mermaid source")
-        # Keep Mermaid as inert text; a later sandboxed renderer may produce SVG.
-        content = "<pre data-diagram-format=\"mermaid\">" + html.escape(source) + "</pre>"
-        return RenderResult("diagram", source,
-                            [{"name": "diagram.html", "media_type": "text/html",
-                              "content": content}],
-                            {"status": "passed", "checks": ["mermaid-source"]},
-                            {"renderer": "builtin-mermaid-source", "revision": "1"})
+        pre = ('<details><summary>Mermaid source</summary><pre data-diagram-format="mermaid">'
+               + html.escape(source) + "</pre></details>")
+        outputs, checks, findings = [], ["mermaid-source"], []
+        try:
+            svg = render_flowchart_svg(parse_flowchart(source))
+            outputs.append({"name": "diagram.svg", "media_type": "image/svg+xml", "content": svg})
+            content = "<figure>" + svg + "</figure>" + pre
+            checks.append("flowchart-svg")
+        except ValueError as exc:
+            # Other Mermaid diagram types stay inert source until a sandboxed renderer exists.
+            content = "<pre data-diagram-format=\"mermaid\">" + html.escape(source) + "</pre>"
+            findings.append({"code": "not_rendered", "detail": str(exc)})
+        outputs.insert(0, {"name": "diagram.html", "media_type": "text/html", "content": content})
+        validation = {"status": "passed", "checks": checks}
+        if findings:
+            validation["findings"] = findings
+        return RenderResult("diagram", source, outputs, validation,
+                            {"renderer": "builtin-flowchart-svg", "revision": "2"})
+
+    @staticmethod
+    def _presentation(source: str) -> RenderResult:
+        if not isinstance(source, str) or not source.strip():
+            raise ArtifactRendererError("presentation profile requires markdown slides separated by ---")
+        slides = split_slides(source)
+        deck = (_PAGE_HEAD.replace("<style>", "<style>" + _DECK_CSS, 1)
+                + "".join(f"<section>{render_markdown(slide)}</section>\n" for slide in slides)
+                + "</body></html>\n")
+        return RenderResult("presentation", source,
+                            [{"name": "deck.html", "media_type": "text/html", "content": deck}],
+                            {"status": "passed", "checks": ["markdown-slides"], "slide_count": len(slides)},
+                            {"renderer": "builtin-markdown-deck", "revision": "1"})
 
