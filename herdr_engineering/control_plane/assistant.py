@@ -684,6 +684,11 @@ TOOL_CATALOG: dict[str, dict[str, Any]] = {
             "to": {"type": "string"}, "subject": {"type": "string"}, "body": {"type": "string"},
             "artifact_id": {"type": "string", "description": "Existing draft artifact to add a version to (optional)"}},
             "required": ["to", "subject", "body"]}},
+    "watch_ci": {
+        "sensitive": False,
+        "description": "Look for failed CI runs the user can see and surface each new one once as a repair proposal "
+                       "that a person must approve. Never merges or writes to GitHub.",
+        "parameters": {"type": "object", "properties": {"refresh": {"type": "boolean"}}}},
     "read_lineage": {
         "sensitive": False,
         "description": "Read the mission/agent lineage graph (sessions, handoffs, branches, reviews, PRs, CI, artifacts) "
@@ -1821,8 +1826,8 @@ class AssistantService:
         operator principal may create one (``principal`` is the server-authenticated caller, never a body field),
         and never for tools that must always be approved."""
         self._require_enabled()
-        if tool_id not in TOOL_CATALOG:
-            raise AssistantError(f"unknown tool {tool_id}")
+        if not isinstance(tool_id, str) or tool_id not in TOOL_CATALOG:
+            raise AssistantError("unknown tool")
         if preauthorized:
             if (not isinstance(principal, dict) or principal.get("kind") != "operator"
                     or principal.get("authenticated_by") != "api_key"):
@@ -1889,8 +1894,8 @@ class AssistantService:
         """What WOULD happen, without creating an action, an approval or any side effect."""
         self._require_enabled()
         self.store.get_assistant(assistant_id, tenant_id=tenant_id, user_id=user_id)
-        if tool_id not in TOOL_CATALOG:
-            raise AssistantError(f"unknown tool {tool_id}")
+        if not isinstance(tool_id, str) or tool_id not in TOOL_CATALOG:
+            raise AssistantError("unknown tool")
         grant = self._active_grant(assistant_id=assistant_id, tool_id=tool_id, scope=scope,
                                    tenant_id=tenant_id, user_id=user_id)
         preauthorized = bool(grant and (grant.constraints or {}).get("preauthorized")
@@ -1913,8 +1918,24 @@ class AssistantService:
             return False
         return action.expires_at is not None and action.expires_at > self.now()
 
+    def claim_action(self, action: AssistantAction) -> bool:
+        """Atomically move an executable action to ``executing``. Exactly one caller wins, so two concurrent
+        requests with the same key cannot both run the side effect."""
+        with self.store._lock:
+            if not self.action_executable(action):
+                return False
+            action.status = "executing"
+        self.store.put_action(action)
+        return True
+
     def complete_action(self, action: AssistantAction, detail: str = "") -> AssistantAction:
         action.status = "completed"
+        self.store.put_action(action)
+        return action
+
+    def fail_action(self, action: AssistantAction) -> AssistantAction:
+        """A claimed action that errored is NOT retried under the same key (it may have partly run)."""
+        action.status = "failed"
         self.store.put_action(action)
         return action
 
@@ -1933,8 +1954,8 @@ class AssistantService:
         """
         self._require_enabled()
         self.store.get_assistant(assistant_id, tenant_id=tenant_id, user_id=user_id)
-        if tool_id not in TOOL_CATALOG:
-            raise AssistantError(f"unknown tool {tool_id}")
+        if not isinstance(tool_id, str) or tool_id not in TOOL_CATALOG:
+            raise AssistantError("unknown tool")
 
         request_hash = request_digest(tenant_id=tenant_id, user_id=user_id, assistant_id=assistant_id,
                                       tool_id=tool_id, scope=scope, payload=request_payload)
@@ -2083,6 +2104,8 @@ class AssistantService:
                                     action="assistant.approval.self_approval_refused",
                                     subject_id=approval_id)
             raise AssistantForbidden("the approver must differ from the requester for this action")
+        if action.status != "requested":
+            raise AssistantError(f"the action is {action.status}; request it again")
         approval.decision = decision
         approval.decision_at = self.now()
         approval.actor_id = actor
@@ -2716,6 +2739,19 @@ class AssistantService:
         requester = action.requested_by if action is not None and action.requested_by else (actor or user_id)
         idem = (action.idempotency_key if action is not None
                 else hashlib.sha256(canonical_json([tool_id, payload]).encode()).hexdigest())
+        try:
+            result = self._adapter_body(tool_id, tenant_id=tenant_id, user_id=user_id, assistant_id=assistant_id,
+                                        payload=payload, actor=actor, requester=requester, corr=corr, idem=idem)
+        except AssistantError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - a hook failed; surface a tool error, never a 500 or a raw trace
+            raise AssistantError(redact_secrets(f"{tool_id} failed: {type(exc).__name__}: {exc}")[:300]) from None
+        result["lineage"] = self._emit_lineage(user_id, corr)
+        return result
+
+    def _adapter_body(self, tool_id: str, *, tenant_id: str, user_id: str, assistant_id: str,
+                      payload: dict[str, Any], actor: str, requester: str, corr: dict[str, Any],
+                      idem: str) -> dict[str, Any]:
         if tool_id == "request_review":
             d = self.request_review(tenant_id=tenant_id, user_id=user_id, assistant_id=assistant_id,
                                     payload=payload, actor=actor or user_id, correlation=corr)
@@ -2733,7 +2769,6 @@ class AssistantService:
         else:
             result = self._draft(user_id=user_id, assistant_id=assistant_id, payload=payload, idem=idem)
             corr["artifact_id"] = result.get("artifact_id") or ""
-        result["lineage"] = self._emit_lineage(user_id, corr)
         return result
 
     # -- CI-failure watching ----------------------------------------------------------------------------
@@ -2751,6 +2786,9 @@ class AssistantService:
         """
         self._require_enabled()
         self.store.get_assistant(assistant_id, tenant_id=tenant_id, user_id=user_id)
+        if self._active_grant(assistant_id=assistant_id, tool_id="watch_ci", scope="*",
+                              tenant_id=tenant_id, user_id=user_id) is None:
+            raise AssistantForbidden("CI watching needs an active watch_ci grant")
         if self.lineage_read is None:
             raise AssistantError("lineage reading is not enabled")
         if self.ci_board_request is None:
@@ -2955,7 +2993,10 @@ class AssistantService:
             action = self.request_tool_action(
                 tenant_id=run.tenant_id, user_id=run.user_id, assistant_id=run.assistant_id,
                 tool_id=tool_id, scope=scope, run_id=run.run_id, idempotency_key=idem,
-                request_payload=args, actor=f"assistant:{run.assistant_id}")
+                request_payload=args,
+                # the two tools that must always be approved are requested BY the person who instructed the run, so
+                # "approver differs from requester" binds them; for the rest the assistant asks and the owner decides
+                actor=run.user_id if tool_id in NEVER_PREAUTHORIZED else f"assistant:{run.assistant_id}")
         except ApprovalRequired as ar:
             return f"[operator approval required: {ar.approval_id}: {ar.dry_run}]"
         except AssistantError as exc:
@@ -2964,13 +3005,16 @@ class AssistantService:
             return "[replay: this action already ran; it is not repeated]"
         if action.status == "expired":
             return "[denied: the action expired; request it again]"
-        if not self.action_executable(action):
+        if action.status == "failed":
+            return "[denied: this action failed earlier and is not retried under the same key]"
+        if not self.claim_action(action):
             return "[denied: tool action is not authorized]"
         try:
             out = self.execute_tool(tenant_id=run.tenant_id, user_id=run.user_id,
                                     assistant_id=run.assistant_id, tool_id=tool_id,
                                     payload=args, actor=run.user_id, action=action)
         except AssistantError as exc:
+            self.fail_action(action)
             return f"[tool error: {exc}]"
         self.complete_action(action)
         self.store.audit_record(tenant_id=run.tenant_id, user_id=run.user_id,
@@ -3087,6 +3131,10 @@ class AssistantService:
                 return {"ok": True, "result": self.lineage_read(tenant_id, user_id, payload)}
             except (ValueError, LookupError) as exc:
                 raise AssistantError(str(exc)) from exc
+        if tool_id == "watch_ci":
+            return {"ok": True, "result": self.watch_ci(
+                tenant_id=tenant_id, user_id=user_id, assistant_id=assistant_id, actor=actor or user_id,
+                refresh=bool(payload.get("refresh")))}
         if tool_id in self._ADAPTER_TOOLS:
             return self._run_adapter(tool_id, tenant_id=tenant_id, user_id=user_id, assistant_id=assistant_id,
                                      payload=payload, actor=actor, action=action)

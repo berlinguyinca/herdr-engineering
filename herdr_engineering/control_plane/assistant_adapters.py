@@ -82,8 +82,8 @@ def draft_writer_hook(server):
             may_edit = (server.artifact_acl.can(artifact_id, owner, "edit") if server.artifact_acl is not None
                         else True) or bool(call("report_permission", artifact_id, owner, "edit"))
             record = call("get_record", artifact_id, principal_id=owner) if may_edit else None
-            if record is None:
-                raise LookupError("not found")
+            if record is None or record.get("artifact_type") != "email_draft":
+                raise LookupError("not found")             # only an existing email draft takes a new draft version
             base = record.get("current_version_id")
         else:
             artifact_id = call("register_logical", original_filename="email-draft.json",
