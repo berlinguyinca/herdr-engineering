@@ -159,7 +159,8 @@ control_plane:
 * A queued action keeps its request payload in memory so it can run; the persisted copy has secret-looking values
   scrubbed. An action restored from a snapshot that had to scrub a secret is refused (`not persisted`) rather than
   sent with a placeholder: request it again. Content that is secret but does not look like one (free text) is stored.
-* Review findings F7 and F8 are not addressed in this change.
+* Audit before effect is not universal: only `execute_approved_action` / `execute_approved_proposal` write the `executing` entry before the effect. The inline connector `/request` and `/test` path and the chat `_execute_gated` path record the call afterwards, so they can run while the audit store is down.
+* If the audit sink commits but then raises (for example a timeout after commit), the entry is durable but absent from memory and the next entry reuses its `seq`; after a restart the chain then reports `chain_intact: false` until repaired. The hydrate order is by timestamp, so a backwards clock step can reorder entries. The sink write happens under the store lock, so a slow database slows every assistant operation. Not fixed in this change.
 * Moving a principal to a new tenant in `tenancy.principals` hides what it created under its old tenant (`default`):
   assistants, memory, approvals and notifications are tenant-scoped. Re-create them or keep the mapping.
 
