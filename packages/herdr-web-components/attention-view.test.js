@@ -17,8 +17,8 @@ const body = (items = [item()], over = {}) => ({
 
 test('renders an open item with its evidence link, owner link and controls', () => {
   const html = renderAttention({ body: body() }, now);
-  assert.match(html, /<span class="at-sev">critical<\/span> <strong><a href="#\/herd\/session\/a">Amber Swift<\/a><\/strong>/);
-  assert.match(html, /class="at-action" href="#\/herd\/session\/a">Open agent/);
+  assert.match(html, /<span class="at-sr">critical<\/span><strong title="[^"]*"><a href="#\/herd\/session\/a">Amber Swift<\/a><\/strong>/);
+  assert.doesNotMatch(html, /class="at-action" href="#\/herd\/session\/a">Open agent/, 'an action to the same place as the title is not repeated');
   assert.match(html, /data-ack data-key="session:a" data-fingerprint="f1"/);
   for (const [seconds] of SNOOZE_CHOICES) assert.match(html, new RegExp(`<option value="${seconds}">`));
   assert.match(html, /<strong>1<\/strong> open/);
