@@ -214,3 +214,39 @@ def test_layout_documents_cas_and_isolation(wg):
     assert wg.run(wg.pool.fetchval("SELECT count(*) FROM wg_layout")) == 2
     with pytest.raises(ValueError):
         wg.run(st.put_layout(alice, "project:p1", {"nodes": {"x": 5}}, shared=True, if_match="x"))
+
+
+def test_project_grant_lets_a_manager_outside_every_room_see_the_project_but_not_its_rooms(wg):
+    st = store(wg)
+    s = scenario()
+    s.collab(30, "project_member_added", project_id="p1", subject_user_id="dana", role="manager")
+    wg.run(st.apply_events(s.events))
+    dana = member("dana", [])
+    projects = {i["native_id"] for i in wg.run(st.list_entities(dana, kinds=["project"]))["items"]}
+    assert projects == {"p1"}                                              # granted by name, not p2
+    assert wg.run(st.list_entities(dana, kinds=["room", "task"]))["items"] == []   # no room membership, no room content
+    assert {i["native_id"] for i in wg.run(st.list_entities(member("erin", []), kinds=["project"]))["items"]} == set()
+
+
+def test_alias_conflicts_are_reported_and_first_owner_wins(wg):
+    st = store(wg)
+    s = scenario()
+    wg.run(st.apply_events(s.events))
+    room = wg.run(wg.pool.fetchval("SELECT entity_id FROM wg_entity WHERE kind = 'room' ORDER BY entity_id LIMIT 1"))
+    other = wg.run(wg.pool.fetchval("SELECT entity_id FROM wg_entity WHERE kind = 'project' ORDER BY entity_id LIMIT 1"))
+    assert wg.run(st.status())["open_gaps"].get("alias_conflict") is None
+    # another entity already owns the alias a later task claims (a re-used native id across systems)
+    ev0 = wg.run(wg.pool.fetchval("SELECT source_event_id FROM wg_entity WHERE entity_id = $1", other))
+    wg.run(wg.pool.execute("INSERT INTO wg_alias (system, value, entity_id, source_event_id) VALUES "
+                           "('collab_task', 'tx-clash', $1, $2)", other, ev0))
+    s2 = scenario()
+    s2.events.clear()
+    s2.seq = 500
+    s2.collab(90, "task_created", project_id="p1", room_id=room.split(":")[-1], task_id="tx-clash", text="clash")
+    wg.run(st.apply_events(s2.events))
+    assert wg.run(st.status())["open_gaps"].get("alias_conflict") == 1
+    owner = wg.run(wg.pool.fetchval("SELECT entity_id FROM wg_alias WHERE system='collab_task' AND value='tx-clash'"))
+    assert owner == other                                                  # first owner wins; nothing was overwritten
+    # re-applying does not pile up duplicate reports
+    wg.run(st.apply_events(s2.events))
+    assert wg.run(st.status())["open_gaps"].get("alias_conflict") == 1

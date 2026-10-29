@@ -256,9 +256,23 @@ class WorkGraphStore:
                   h["room_ids"], h["mission_scope"], h["grantees"], h["attrs"], h["version"], h["has_upsert"],
                   to_dt(h["created_at"]), to_dt(h["updated_at"]),
                   to_dt(h["tombstoned_at"]) if h["tombstoned_at"] else None, h["source_event_id"]) for h in heads])
+            alias_rows = [(s, v, h["entity_id"], h["source_event_id"]) for h in heads for s, v in h["aliases"]]
             await c.executemany(
                 "INSERT INTO wg_alias (system, value, entity_id, source_event_id) VALUES ($1,$2,$3,$4) ON CONFLICT DO NOTHING",
-                [(s, v, h["entity_id"], h["source_event_id"]) for h in heads for s, v in h["aliases"]])
+                alias_rows)
+            # a (system, value) already owned by ANOTHER entity is a conflict: first owner wins, the clash is reported
+            if alias_rows:
+                clashes = await c.fetch(
+                    "SELECT a.system, a.value, a.entity_id AS owner, x.entity_id AS claimant FROM wg_alias a "
+                    "JOIN unnest($1::text[], $2::text[], $3::text[]) AS x(system, value, entity_id) "
+                    "ON a.system = x.system AND a.value = x.value AND a.entity_id <> x.entity_id",
+                    [r[0] for r in alias_rows], [r[1] for r in alias_rows], [r[2] for r in alias_rows])
+                for k in clashes:
+                    detail = {"system": k["system"], "value": k["value"], "owner": k["owner"], "claimant": k["claimant"]}
+                    await c.execute(
+                        "INSERT INTO wg_gap (kind, source, detail) SELECT 'alias_conflict', 'projection', $1::jsonb "
+                        "WHERE NOT EXISTS (SELECT 1 FROM wg_gap WHERE kind = 'alias_conflict' AND resolved_at IS NULL "
+                        "AND detail = $1::jsonb)", detail)
         edges = await self._load_asserts(c, "edge", sorted(touched["edge"]))
         eheads = [core.fold_edge(i, a) for i, a in sorted(edges.items())]
         if eheads:

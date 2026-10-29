@@ -68,13 +68,24 @@ result: `3029 passed, 10 skipped, 1 xfailed, 2725 deselected in 861s`, zero fail
 - P01 vocabulary test was changed to `test_live_graph_vocabulary_is_the_p02_extension` because P02 adds node types
   `project team artifact_version external_action` and edge types `contains derived_from discussed_in approved_by notified_via`.
 
+## Decisions on the open questions (coordinator, 2026-10-29)
+
+1. Room membership grants artifact read access: yes, but that is P03. Today artifacts use only the registry gate, so
+   members need explicit grants. Documented, not implemented here.
+2. Project-level grant for a manager outside every room: implemented. `project_member_added` writes a named grantee on the
+   project and its team, and a named grantee sees the row whatever its scope. Test:
+   `test_project_grant_lets_a_manager_outside_every_room_see_the_project_but_not_its_rooms` (sees only their project,
+   no rooms or tasks, a stranger sees nothing).
+3. Alias conflicts are reported: implemented. When a `(system, value)` alias is already owned by another entity, the first
+   owner wins and a `wg_gap` row of kind `alias_conflict` (owner and claimant ids, deduplicated while open) is written.
+   `GET /api/v1/graph/work/status` shows it under `open_gaps.alias_conflict`. Test:
+   `test_alias_conflicts_are_reported_and_first_owner_wins`.
+4. Layout shared-default writes: kept as operator plus members who can see the root. Documented.
+
 ## Open follow-ups
 
-- Room-derived artifact read grants are a P03 decision; artifacts use only the registry gate, so members need explicit grants.
-- A project is visible via its rooms or named grantees; a manager in no room does not see it.
-- Alias conflicts are ignored (first wins), not surfaced.
+- Room-derived artifact read grants (P03, see decision 1).
 - GitHub enrichment covers only issues the graph already references; catalog project to HCN project mapping not done.
 - Guest-hidden helper events advancing the cursor are not re-tested.
 - PG tests skip when no Postgres binaries exist (repo convention).
-- Migration numbers must be re-checked against main and open PRs before merge (#380 uses 0031).
-- Layout shared-default write is allowed for operators and members who can see the root.
+- Migration numbers 0033/0034 re-checked 2026-10-29 against origin/main (highest 0030), #380 (0031) and #366 (0022-0028): free.
