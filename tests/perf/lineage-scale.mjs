@@ -69,18 +69,14 @@ for (const shape of ['tree', 'chains']) for (const n of [5000, 10000]) {
     for (let i = 0; i < 24; i += 1) { steps.zoomOut.push(await page.evaluate(() => window.__frame(() => document.querySelector('[data-vp="out"]').click()))); }
     const far = await bound('zoomed far out');
     for (let i = 0; i < 12; i += 1) { steps.zoomIn.push(await page.evaluate(() => window.__frame(() => document.querySelector('[data-vp="in"]').click()))); }
+    // every step below is dispatched INSIDE the page and timed to the second frame after it, so the figure includes the handler, the cull and the redraw
     await page.locator('[data-viewport]').focus();
     for (let i = 0; i < 24; i += 1) {
-      await page.keyboard.press(i % 2 ? 'Shift+ArrowDown' : 'Shift+ArrowRight');
-      steps.pan.push(await page.evaluate(() => new Promise((r) => { const s = performance.now(); requestAnimationFrame(() => requestAnimationFrame(() => r(performance.now() - s))); })));
+      steps.pan.push(await page.evaluate((k) => window.__frame(() => document.querySelector('[data-viewport]').dispatchEvent(new KeyboardEvent('keydown', { key: k, shiftKey: true, bubbles: true }))), i % 2 ? 'ArrowDown' : 'ArrowRight'));
     }
     const hasMap = await page.locator('svg.lin-mm').count();
-    if (hasMap) await page.locator('svg.lin-mm').scrollIntoViewIfNeeded();
-    const box = hasMap ? await page.locator('svg.lin-mm').boundingBox() : null;
-    if (box) for (let i = 0; i < 12; i += 1) {
-      const f = (i + 0.5) / 12;
-      await page.mouse.click(box.x + box.width * f, box.y + box.height * (1 - f));
-      steps.minimap.push(await page.evaluate(() => new Promise((r) => { const s = performance.now(); requestAnimationFrame(() => requestAnimationFrame(() => r(performance.now() - s))); })));
+    if (hasMap) for (let i = 0; i < 12; i += 1) {
+      steps.minimap.push(await page.evaluate((f) => window.__frame(() => { const m = document.querySelector('svg.lin-mm'); const r = m.getBoundingClientRect(); m.dispatchEvent(new MouseEvent('click', { bubbles: true, clientX: r.left + r.width * f, clientY: r.top + r.height * (1 - f) })); }), (i + 0.5) / 12));
     }
     const sel = await page.locator('g[data-node]').first().getAttribute('data-node');
     for (let i = 0; i < 6; i += 1) { steps.select.push(await page.evaluate((id) => window.__frame(() => document.querySelector(`g[data-node="${id}"]`)?.dispatchEvent(new MouseEvent('click', { bubbles: true }))), sel)); }

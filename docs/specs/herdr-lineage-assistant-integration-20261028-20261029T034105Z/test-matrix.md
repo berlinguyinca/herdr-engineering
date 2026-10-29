@@ -19,8 +19,8 @@ Status key: **exists** (found, not run), **planned**, **blocked**. Nothing here 
 | Assistant observation | 7A, 10.3 | `read_lineage` tests | planned (S1) |
 | Assistant controlled delegation | 7B | grant/approval negative tests incl. self-approval | planned (S0, S6) |
 | Duplicate/out-of-order events | 10.8 | `test_graph.py:93,133,749` | exists |
-| Desktop/mobile UI | 6 | `tests/playwright` ui-gates, new Missions/assistant baselines | partial / planned (S5) |
-| 60+ sessions bounded render | 10.9 | `ui-gates-perf` (2k-10k nodes) | exists; verify covers sessions |
+| Desktop/mobile UI | 6 | `tests/playwright` ui-gates (workbench, states, visual baselines); Missions page and assistant baselines still planned: the dashboard app is outside the visual harness | partial (S5): lineage/workbench done, Missions/assistant not |
+| 60+ sessions bounded render | 10.9 | `ui-gates-perf` (2k-10k nodes, server-capped at 3,000 loaded), `ui-gates-workbench` 64-session chain, `tests/perf/lineage-scale.mjs` (5k/10k loaded in the client); numbers in `perf.md` | exists |
 
 ## How to run locally (bender)
 `python3` only (no `python`). Fresh venv: `pip install -e '.[dev,collab,review-gate,federation]'`. `python3 -m pytest --co -q` collected 8152 of 8281 in about 17 s. JS: `npm ci` then `npm run test:client`. UI gates: `bash scripts/ci/ui-gates.sh` (about 11 min; baselines were made with Chromium 156, cached browsers here are 1228/1243/1248, so pixel diffs may need the pinned build). CI of record is Woodpecker (`.woodpecker/`).
