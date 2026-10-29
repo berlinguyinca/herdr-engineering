@@ -351,13 +351,15 @@ def fingerprint(payload: Any) -> str:
 class IdempotencyStore:
     """Mirror of collab's ``_idem``: ``(principal, scope, key) -> (fingerprint, result)``. Same key + same
     fingerprint replays the stored result without calling ``fn``; same key + other fingerprint is a conflict.
-    A failing ``fn`` is not remembered (internal retry is safe) unless ``external`` - then the key is in doubt."""
+    ``fn(mark)`` must call ``mark()`` immediately before an irreversible ``external`` effect; if it then fails
+    the key is in doubt (InDoubt on retry). A failure before ``mark()`` leaves no trace, so a retry is safe."""
 
     def __init__(self) -> None:
         self._d: dict[tuple, tuple[str, Any, str]] = {}
         self._lock = threading.RLock()
 
-    def run(self, principal: str, scope: str, key: str, fp: str, fn: Callable[[], Any], *, external: bool = False):
+    def run(self, principal: str, scope: str, key: str, fp: str, fn: Callable[[Callable[[], None]], Any], *,
+            external: bool = False):
         k = (principal, scope, key)
         with self._lock:
             prior = self._d.get(k)
@@ -368,13 +370,18 @@ class IdempotencyStore:
                 if state == "in_doubt":
                     raise InDoubt("previous attempt outcome unknown; reconcile before retrying")
                 return result, True
-            if external:
-                self._d[k] = (fp, None, "in_doubt")
+            marked = []
+
+            def mark() -> None:                 # the caller says "the effect may now have left the building"
+                if external:
+                    self._d[k] = (fp, None, "in_doubt")
+                    marked.append(1)
+
             try:
-                result = fn()
+                result = fn(mark)
             except BaseException:
-                if not external:
-                    self._d.pop(k, None)
+                if not marked:
+                    self._d.pop(k, None)        # failed before any effect: a plain retry is safe
                 raise
             self._d[k] = (fp, result, "done")
             return result, False
@@ -881,13 +888,14 @@ class Broker:
         if not idem_key:
             raise InvocationDenied("idempotency_key required")
 
-        def run() -> Untrusted:
+        def run(mark: Callable[[], None]) -> Untrusted:
             if decision.outcome == "needs_approval":
                 try:
                     self.ledger.consume(approval_id, decision.binding, now)
                 except ApprovalError as exc:
                     self.audit.append(event="invoke.denied", actor=who, action=req.action_id, reasons=[str(exc)])
                     raise InvocationDenied(str(exc)) from exc
+            mark()
             out = handler(_plain(dict(req.args)))
             self.audit.append(event="invoke.done", actor=who, intent=req.action_id, on_behalf_of=req.user_id,
                               room=req.room_id, approval=approval_id, binding=decision.binding)
