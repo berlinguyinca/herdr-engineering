@@ -236,6 +236,14 @@ _FLEET_CONFIG_PATH = "/api/v1/fleet/config"
 # Host updaters (InferWeave deploy/pipelines/deploy_event.py) POST here with their per-host fleet
 # token as a Bearer credential; the /api/v1 spelling is accepted as well.
 _DEPLOYMENT_EVENTS_PATHS = frozenset({"/api/deployments/events", "/api/v1/deployments/events"})
+# deploy-4 Task 5: operator actions (X-API-Key, operator role, control_plane.deployment_actions) ...
+_DEPLOYMENT_ACTION_PATHS = {p + "/" + a: a for p in ("/api/deployments", "/api/v1/deployments")
+                            for a in ("force", "ack")}
+# ... and the host routes (fleet host token only): the force-request list and the permit gate,
+_DEPLOYMENT_HOST_GET_PATHS = {p + "/" + a: a for p in ("/api/deployments", "/api/v1/deployments")
+                              for a in ("requests", "permit")}
+# ... and clearing a picked-up request (DELETE).
+_DEPLOYMENT_REQUEST_PATH = re.compile(r"^/api(?:/v1)?/deployments/requests/([^/]+)$")
 #: Seconds between deployment coordinator ticks (the plan GET /api/v1/deployments serves).
 DEPLOYMENTS_TICK_S = 30
 
@@ -323,6 +331,10 @@ class ControlPlaneServer:
         self._deployments_stop = threading.Event()
         self._deployments_error_type = None     # the last logged tick failure type (log on change only)
         self._deployments_last = {"ticked_at": None, "tracks": [], "error": None, "stale": False}
+        # Task 5: force/ack are serialized (validate, audit, then record, with no race between).
+        from .deployment_actions import AuditThrottle
+        self._deployment_actions_lock = threading.Lock()
+        self._deployment_auth_audit = AuditThrottle()
         # control_plane.missions (validated; outcomes are written when a mission ends, on by default).
         from .mission_outcome import MissionOutcomes, missions_config
         self.missions_config = missions_config(missions)
@@ -569,8 +581,10 @@ class ControlPlaneServer:
             try:
                 defs = self.deployment_definitions.definitions()
                 now = time.time()
+                self.deployment_coordinator.last_evidence = {}
                 tracks = (track_views(self.deployment_coordinator.tick(), defs,
-                                      self.repo.deployment_plans, now) if defs else [])
+                                      self.repo.deployment_plans, now,
+                                      self.deployment_coordinator.last_evidence) if defs else [])
                 result = {"ticked_at": now, "tracks": tracks, "error": None, "stale": False}
                 if self._deployments_error_type is not None:
                     log.info("deployment coordinator tick recovered from %s", self._deployments_error_type)
@@ -603,7 +617,193 @@ class ControlPlaneServer:
         view["plans"] = last.pop("tracks")
         view["coordinator"] = {**last, "interval_s": DEPLOYMENTS_TICK_S,
                                "evidence": "unknown" if self.deployment_evidence is None else "configured"}
+        view["actions"] = {"enabled": self.deployment_actions_enabled()}
+        view["requests"] = self.repo.deployment_requests.pending()
         return view
+
+    # ------------------------------------------------ deployment actions (deploy-4 Task 5)
+    def deployment_actions_enabled(self) -> bool:
+        """``control_plane.deployment_actions: true``, read per request and failing closed
+        (``secure_section``): a missing, unreadable or non-true value is off."""
+        if self.fleet_config is None:
+            return False
+        from ..fleet_config import FleetConfigError
+        try:
+            return self.fleet_config.secure_section("control_plane").get("deployment_actions") is True
+        except FleetConfigError:
+            return False
+
+    def _loaded_deployment_definitions(self):
+        """The definitions, or None unless they are configured AND loaded. Unlike ingest
+        (where "not configured" accepts every host), the action and gate routes need a
+        definition to decide whose component is whose."""
+        status = self.deployment_definitions.status()
+        if not status["configured"] or not status["loaded"]:
+            return None
+        return self.deployment_definitions.definitions()
+
+    def _deployment_track_view(self, definition):
+        """(last tick meta, that tick's track view for ``definition``'s track or None)."""
+        repo, branch, context = definition.track
+        with self._deployments_lock:
+            last = copy.deepcopy(self._deployments_last)
+        want = {"repo": repo, "branch": branch, "ci_context": context}
+        view = next((t for t in last.get("tracks") or () if t.get("track") == want), None)
+        return last, view
+
+    def deployment_audit(self, action, event_type, *, outcome, actor, target, reason, status,
+                         durable=False, **extra):
+        """One audit row (``deployment_action``/<action>). Every value is validated or ours.
+        ``durable`` rows raise when they cannot be persisted; others never raise."""
+        from .deployment_actions import AUDIT_ENTITY, stamp
+        now = time.time()
+        payload = {"action": action, "outcome": outcome, "actor": actor, "target": target,
+                   "reason": reason, "status": status, "at": stamp(now), "at_epoch": now, **extra}
+        if durable:
+            self.repo.record_event(AUDIT_ENTITY, action, event_type, payload, require_durable=True)
+            return
+        try:
+            self.repo.record_event(AUDIT_ENTITY, action, event_type, payload)
+        except Exception:  # noqa: BLE001 - a refusal is answered whether or not its row lands
+            log.warning("deployment %s refusal could not be audited", action)
+
+    def deployment_refused(self, action, actor, status, reason, target=None, *, auth=False):
+        """Audit a refusal; auth refusals are throttled (counted into the next row)."""
+        extra = {}
+        if auth:
+            write, suppressed = self._deployment_auth_audit.take()
+            if not write:
+                return
+            if suppressed:
+                extra["suppressed"] = suppressed
+        kind = "Force" if action == "force" else "Ack"
+        self.deployment_audit(action, f"Deployment{kind}Refused", outcome="refused", actor=actor,
+                              target=target, reason=reason, status=status, **extra)
+
+    def _deployment_refusal(self, action, actor, exc, target):
+        self.deployment_refused(action, actor, exc.status, exc.message, target)
+        return exc.status, {"error": exc.message}
+
+    def _deployment_action_gate(self):
+        """Flag and definitions, shared by force and ack (raises ActionRefused)."""
+        from .deployment_actions import ActionRefused
+        if not self.deployment_actions_enabled():
+            raise ActionRefused(403, "deployment actions are disabled (control_plane.deployment_actions)")
+        defs = self._loaded_deployment_definitions()
+        if defs is None:
+            raise ActionRefused(503, "no deployment definitions loaded")
+        return defs
+
+    def deployment_force(self, actor, body):
+        """POST force: validate, audit (durably), then record. -> (status, payload)."""
+        from .deployment_actions import ActionRefused, ForceRequests, parse_force
+        try:
+            kind, value = parse_force(body)
+        except ActionRefused as exc:
+            return self._deployment_refusal("force", actor, exc, None)
+        target = {kind: value}
+        store = self.repo.deployment_requests
+        with self._deployment_actions_lock:
+            try:
+                defs = self._deployment_action_gate()
+                if kind == "component" and value not in defs:
+                    raise ActionRefused(404, "unknown component")
+                names = ([value] if kind == "component"
+                         else sorted(c for c, d in defs.items() if d.stage == value))
+                if not names:
+                    raise ActionRefused(404, "unknown stage")
+                entries = {}
+                for name in names:
+                    _, view = self._deployment_track_view(defs[name])
+                    commit = (view or {}).get("target_commit")
+                    if not commit:
+                        raise ActionRefused(409, f"no target release for {name} yet")
+                    entries[name] = (commit, int((view or {}).get("generation") or 0))
+                existing = store.find(kind, value, entries)
+                if existing is None:
+                    store.check_capacity()
+            except ActionRefused as exc:
+                return self._deployment_refusal("force", actor, exc, target)
+            rid = existing["id"] if existing else ForceRequests.new_id()
+            try:
+                self.deployment_audit(
+                    "force", "DeploymentForceRequested", outcome="accepted", actor=actor,
+                    target=target, reason="already pending" if existing else "recorded", status=200,
+                    durable=True, request_id=rid, components=names,
+                    target_commits={n: c for n, (c, _) in entries.items()}, existing=existing is not None)
+            except Exception:  # noqa: BLE001 - no audit, no request
+                log.warning("deployment force request not recorded: the audit row could not be persisted")
+                return 503, {"error": "audit_persistence_failed"}
+            if existing is not None:
+                return 200, {"created": False, "request": existing}
+            return 200, {"created": True, "request": store.add(kind, value, entries, actor, rid=rid)}
+
+    def deployment_ack(self, actor, body):
+        """POST ack: acknowledge a stale instance (or lift a failure-evicted mark)."""
+        from .deployment_actions import ActionRefused, parse_ack
+        try:
+            component, instance, release = parse_ack(body)
+        except ActionRefused as exc:
+            return self._deployment_refusal("ack", actor, exc, None)
+        target = {"component": component, "instance": instance, "release": release}
+        state = self.repo.deployment_plans
+        with self._deployment_actions_lock:
+            try:
+                defs = self._deployment_action_gate()
+                if component not in defs:
+                    raise ActionRefused(404, "unknown component")
+                if release is None:
+                    _, view = self._deployment_track_view(defs[component])
+                    release = (view or {}).get("target_commit")
+                    if not release:
+                        raise ActionRefused(409, "no target release to acknowledge against; give release")
+                    target["release"] = release
+                if not state.acknowledgeable(component, release, instance):
+                    raise ActionRefused(404, "nothing to acknowledge: no such instance slot"
+                                        if instance is not None else "nothing to acknowledge: "
+                                        "the release is not failure-evicted")
+            except ActionRefused as exc:
+                return self._deployment_refusal("ack", actor, exc, target)
+            try:
+                self.deployment_audit("ack", "DeploymentInstanceAcknowledged", outcome="accepted",
+                                      actor=actor, target=target, reason="acknowledged",
+                                      status=200, durable=True)
+            except Exception:  # noqa: BLE001 - no audit, no ack
+                log.warning("deployment ack not applied: the audit row could not be persisted")
+                return 503, {"error": "audit_persistence_failed"}
+            return 200, {"acknowledged": state.acknowledge(component, release, instance)}
+
+    def deployment_permit(self, host, component, commit):
+        """GET permit (host token). -> (status, payload); never writes anything."""
+        from .deployment_actions import _deny, permit_decision
+        defs = self._loaded_deployment_definitions()
+        if defs is None:
+            return 200, _deny("no deployment definitions loaded")
+        d = defs.get(component)
+        if d is None or d.host != host:
+            return 403, {"error": "component is not defined for this host"}
+        last, view = self._deployment_track_view(d)
+        force = (self.repo.deployment_requests.active(component, commit)
+                 if self.deployment_actions_enabled() else None)
+        return 200, permit_decision(last, view, component, commit, force, now=time.time())
+
+    def deployment_requests_for(self, host) -> list:
+        """The host's pending force entries ([] with the flag off or no definitions)."""
+        defs = self._loaded_deployment_definitions()
+        if defs is None or not self.deployment_actions_enabled():
+            return []
+        return self.repo.deployment_requests.entries([c for c, d in defs.items() if d.host == host])
+
+    def deployment_clear(self, host, rid) -> list:
+        """DELETE a request (host token): clear the host's own entries; audited."""
+        defs = self._loaded_deployment_definitions() or {}
+        done = self.repo.deployment_requests.clear(
+            rid, [c for c, d in defs.items() if d.host == host], host)
+        if done:
+            self.deployment_audit("force", "DeploymentForcePickedUp", outcome="picked-up",
+                                  actor=f"host:{host}", target={"request_id": rid}, reason="cleared",
+                                  status=200, host=host, components=done)
+        return done
 
     @staticmethod
     def _intelligence_section(fleet_config):
@@ -1499,6 +1699,8 @@ def _make_handler(server, public=False, operator=False):
                 return self._collab()
             if self._path_only() == _FLEET_CONFIG_PATH:
                 return self._fleet_config_get()
+            if self._path_only() in _DEPLOYMENT_HOST_GET_PATHS:      # host token, not X-API-Key
+                return self._deployment_host_get(_DEPLOYMENT_HOST_GET_PATHS[self._path_only()])
             if self._path_only() == "/api/v1/health" and self._role() is None:
                 # Keyed mode without a valid key: liveness only (deploy.sh's health
                 # check needs status + commit), no counters, sources or capabilities.
@@ -1541,6 +1743,8 @@ def _make_handler(server, public=False, operator=False):
                 return self._fleet_resource_telemetry()
             if self._path_only() in _DEPLOYMENT_EVENTS_PATHS:
                 return self._deployment_event()
+            if self._path_only() in _DEPLOYMENT_ACTION_PATHS:
+                return self._deployment_action(_DEPLOYMENT_ACTION_PATHS[self._path_only()])
             # The ingest route is reachable by the ingest role; every other
             # POST requires the operator role (Spec §104).
             path = self.path.split("?")[0]
@@ -1618,6 +1822,9 @@ def _make_handler(server, public=False, operator=False):
                 return self._deny(400, "ambiguous request framing")
             if self._path_only() == _FLEET_CONFIG_PATH + "/applied":
                 return self._fleet_config_applied()
+            cleared = _DEPLOYMENT_REQUEST_PATH.match(self._path_only())
+            if cleared and self.command == "DELETE":                # host token, not X-API-Key
+                return self._deployment_request_clear(cleared.group(1))
             path = self.path.split("?")[0]
             segs = path.split("/")
             resource = unquote(segs[3]) if (len(segs) > 3 and segs[:3] == ["", "api", "v1"]
@@ -1748,6 +1955,95 @@ def _make_handler(server, public=False, operator=False):
             except ValueError as exc:
                 return self._deny(400, str(exc))
             return self._json({"ok": True})
+
+        # ---------------------------------------- deployment actions (deploy-4 Task 5)
+        def _deployment_action(self, action):
+            """POST force/ack. Operator role first: an auth refusal is audited as refused
+            (throttled, no target: the body is never read), never as accepted. Every later
+            refusal is audited with the validated target; see deployment_actions."""
+            from .deployment_actions import MAX_BODY_BYTES
+            if self._rate_limit():
+                return None
+            role = self._role()
+            principal = self._principal()
+            actor = f"{principal['kind']}:{principal['id']}" if role is not None else None
+            if role != "operator":
+                status, reason = (401, "unauthorized") if role is None else (403, "operator role required")
+                server.deployment_refused(action, actor, status, reason, auth=True)
+                return self._deny(status, reason)
+            if server.fleet_config is not None and self._deployment_host() is not None:
+                # A fleet host token grants the host routes only, even beside an operator key.
+                server.deployment_refused(action, actor, 403, "a host token grants no operator action",
+                                          auth=True)
+                return self._deny(403, "a host token grants no operator action")
+
+            def refuse(status, reason):
+                server.deployment_refused(action, actor, status, reason)
+                return self._deny(status, reason)
+
+            origin = self.headers.get("Origin")
+            if origin and (urlsplit(origin).netloc != self.headers.get("Host")
+                           or urlsplit(origin).scheme not in {"http", "https"}):
+                return refuse(403, "cross-origin deployment action refused")
+            if self.headers.get("Content-Type", "").split(";", 1)[0].strip() != "application/json":
+                return refuse(415, "deployment actions require application/json")
+            length = _content_length(self.headers.get("Content-Length"))
+            if length is None:
+                return refuse(400, "bad length")
+            if not length:
+                return refuse(400, "a JSON body is required")
+            if length > MAX_BODY_BYTES:
+                return refuse(413, f"deployment actions are at most {MAX_BODY_BYTES} bytes")
+            try:
+                body = self._read_json(MAX_BODY_BYTES)
+            except (RecursionError, ValueError):
+                self.close_connection = True
+                return refuse(400, "invalid JSON body")
+            handler = server.deployment_force if action == "force" else server.deployment_ack
+            status, payload = handler(actor, body)
+            return self._json(payload, status)
+
+        def _deployment_host_get(self, what):
+            """GET requests / permit with the fleet host token (grants these routes only)."""
+            from .deployment_actions import COMMIT, COMPONENT, HOST
+            if server.fleet_config is None:
+                return self._deny(404, "not found")
+            host = self._deployment_host()
+            if host is None:
+                return self._deny(401, "unauthorized")
+            if self._rate_limit(f"deploy-host:{host}"):
+                return None
+            raw = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
+            allowed = {"host"} if what == "requests" else {"component", "commit"}
+            if set(raw) - allowed or any(len(v) != 1 for v in raw.values()):
+                return self._deny(400, f"query takes only {', '.join(sorted(allowed))}")
+            query = {k: v[0] for k, v in raw.items()}
+            if what == "requests":
+                asked = query.get("host", host)
+                if not HOST.fullmatch(asked or "") or asked != host:
+                    return self._deny(403, "a host reads only its own requests")
+                return self._json({"host": host, "actions_enabled": server.deployment_actions_enabled(),
+                                   "requests": server.deployment_requests_for(host)})
+            component, commit = query.get("component", ""), query.get("commit", "")
+            if not COMPONENT.fullmatch(component) or not COMMIT.fullmatch(commit):
+                return self._deny(400, "component and commit are required")
+            status, payload = server.deployment_permit(host, component, commit)
+            return self._json(payload, status)
+
+        def _deployment_request_clear(self, rid):
+            """DELETE /api/deployments/requests/<id>: the owning host clears its entries."""
+            from .deployment_actions import REQUEST_ID
+            if server.fleet_config is None:
+                return self._deny(404, "not found")
+            host = self._deployment_host()
+            if host is None:
+                return self._deny(401, "unauthorized")
+            if self._rate_limit(f"deploy-host:{host}"):
+                return None
+            done = server.deployment_clear(host, rid) if REQUEST_ID.fullmatch(rid) else []
+            if not done:
+                return self._deny(404, "no pending request of this host")
+            return self._json({"cleared": done})
 
         # --------------------------------------------------- collaboration (HCN)
         def _is_collab_path(self):

@@ -89,6 +89,13 @@ A stage-1 component turning unhealthy after stage 2 started yields Start/Hold/Ha
 stage 1, which withdraws stage 2's permission until stage 1 has held again. Herdr-down
 handling stays on the hosts (Task 6). Expected-reporter sets (a node that never reports
 blocking its stage) are deliberately not built here.
+
+Operator acknowledgement (Task 5, ``CoordinatorState.acknowledge``): an audited operator
+action for a stale instance (a preempted node whose failure would otherwise halt its stage
+for good) or a ``failure-evicted`` release. Acknowledging an instance removes its slot for
+that release and leaves a tombstone holding the acknowledged slot's order, so the same
+(older) events, re-observed from the 50-event timeline or replayed after a restart, stay
+ignored; a NEWER event from that instance counts again. Attempts are never touched.
 """
 from __future__ import annotations
 
@@ -109,6 +116,8 @@ PLAN_EVENT = "DeploymentPlanAdopted"
 ATTEMPT_EVENT = "DeploymentAttemptSeen"
 SLOT_EVENT = "DeploymentInstanceObserved"
 EVICTED_EVENT = "DeploymentFailureEvicted"
+ACK_EVENT = "DeploymentInstanceAcknowledged"
+EVICTION_ACK_EVENT = "DeploymentEvictionAcknowledged"
 
 #: Past targets kept per track (a replan onto one of them is refused).
 PAST_LIMIT = 32
@@ -380,6 +389,10 @@ class PlanState:
     past: tuple = ()
 
 
+def _slot_entry():
+    return {"instances": OrderedDict(), "failure_evicted": False, "acked": OrderedDict()}
+
+
 def _track_key(track):
     return "plan:" + "#".join(str(p) for p in track).replace("|", "_")[:400]
 
@@ -470,12 +483,16 @@ class CoordinatorState:
 
     def _put_slot(self, component, release, instance, slot):
         """File ``slot`` if it is decisive for (component, release, instance); returns records."""
-        entry = self._release_entry(self._slots, component, release,
-                                    lambda: {"instances": OrderedDict(), "failure_evicted": False})
+        entry = self._release_entry(self._slots, component, release, _slot_entry)
         instances = entry["instances"]
         cur = instances.get(instance)
         if cur is not None and _order(slot) <= _order(cur):
             return []
+        acked = entry["acked"].get(instance)
+        if acked is not None:
+            if _order(slot) <= acked:
+                return []                       # acknowledged by an operator: stays ignored
+            del entry["acked"][instance]        # a newer event from the instance counts again
         out = []
         if cur is None and len(instances) >= INSTANCES_PER_RELEASE:
             victim = self._victim(instances)
@@ -521,6 +538,57 @@ class CoordinatorState:
                 out[name] = {"instances": inst, "failure_evicted": evicted,
                              "absent": tuple(sorted(known - set(inst)))}
         return out
+
+    # ------------------------------------------------------ operator ack
+    @staticmethod
+    def _tombstone(entry, instance, order):
+        entry["instances"].pop(instance, None)
+        acked = entry["acked"]
+        acked.pop(instance, None)
+        acked[instance] = order
+        while len(acked) > INSTANCES_PER_RELEASE:
+            acked.popitem(last=False)
+
+    def acknowledgeable(self, component, release, instance=None) -> list:
+        """The releases ``acknowledge`` would act on (read only)."""
+        if not _str(release, _ID_CAP) or not _COMMIT.fullmatch(release):
+            return []
+        with self._lock:
+            return [rel for rel, entry in (self._slots.get(component) or {}).items()
+                    if same_commit(rel, release)
+                    and (entry["failure_evicted"] if instance is None
+                         else instance in entry["instances"])]
+
+    def acknowledge(self, component, release, instance=None) -> list:
+        """Operator ack (audited by the caller). With ``instance``: drop that instance's slot
+        in every release matching ``release`` (prefix-matched) and tombstone it, so it no
+        longer blocks and its older events stay ignored. Without: lift the
+        ``failure-evicted`` mark of the matching releases. Attempts are untouched. Returns
+        the releases acknowledged; [] means there was nothing to acknowledge."""
+        if not _str(release, _ID_CAP) or not _COMMIT.fullmatch(release):
+            return []
+        done, records = [], []
+        with self._lock:
+            for rel, entry in list((self._slots.get(component) or {}).items()):
+                if not same_commit(rel, release):
+                    continue
+                if instance is None:
+                    if entry["failure_evicted"]:
+                        entry["failure_evicted"] = False
+                        done.append(rel)
+                        records.append(self._record(f"slot:{component}", EVICTION_ACK_EVENT, {
+                            "kind": "eviction-ack", "component": component, "release": rel}))
+                    continue
+                slot = entry["instances"].get(instance)
+                if slot is None:
+                    continue
+                self._tombstone(entry, instance, _order(slot))
+                done.append(rel)
+                records.append(self._record(f"slot:{component}", ACK_EVENT, {
+                    "kind": "ack", "component": component, "release": rel, "instance": instance,
+                    **slot}))
+        self._emit(records)
+        return done
 
     # ---------------------------------------------------------- attempts
     def _add_attempt(self, component, release, instance, key):
@@ -616,9 +684,22 @@ class CoordinatorState:
             return bool(self._put_slot(comp, release, inst,
                                        {"outcome": outcome, "host_ts": host_ts, "rx": float(rx)}))
         if kind == "failure-evicted":
-            entry = self._release_entry(self._slots, comp, release,
-                                        lambda: {"instances": OrderedDict(), "failure_evicted": False})
+            entry = self._release_entry(self._slots, comp, release, _slot_entry)
             entry["failure_evicted"] = True
+            return True
+        if kind == "ack":
+            inst, outcome, host_ts, rx = (p.get(k) for k in ("instance", "outcome", "host_ts", "rx"))
+            if (not _str(inst, _ID_CAP, allow_empty=True) or outcome not in _RANK
+                    or not isinstance(host_ts, str) or not _TS.fullmatch(host_ts)
+                    or isinstance(rx, bool) or not isinstance(rx, (int, float))
+                    or not math.isfinite(rx)):
+                return False
+            entry = self._release_entry(self._slots, comp, release, _slot_entry)
+            self._tombstone(entry, inst, (host_ts, _RANK[outcome], float(rx)))
+            return True
+        if kind == "eviction-ack":
+            entry = self._release_entry(self._slots, comp, release, _slot_entry)
+            entry["failure_evicted"] = False
             return True
         return False
 
@@ -638,6 +719,7 @@ class DeploymentCoordinator:
     """
 
     def __init__(self, definitions, *, monitor, state, evidence=None, now=None):
+        self.last_evidence: dict = {}
         self._definitions = definitions
         self._monitor = monitor
         self._state = state
@@ -645,6 +727,9 @@ class DeploymentCoordinator:
         self._now = now or time.time
 
     def tick(self) -> dict:
+        # The release evidence this tick decided on, per track (unknown unless the call
+        # succeeded): the force-redeploy gate reads it next to the tick's actions.
+        self.last_evidence = seen = {}
         try:
             defs = self._definitions.definitions()
             plans = self._definitions.plans()          # the one CI read of this tick
@@ -678,6 +763,7 @@ class DeploymentCoordinator:
                 continue
             if not isinstance(evidence, ReleaseEvidence):
                 evidence = ReleaseEvidence()
+            seen[track] = evidence
             try:
                 snap = Snapshot(components=components, target_commit=target,
                                 published_commit=evidence.published_commit,
@@ -720,9 +806,11 @@ def component_view(slots, definitions, now) -> dict:
     return out
 
 
-def track_views(results, definitions, state, now) -> list:
+def track_views(results, definitions, state, now, evidence=None) -> list:
     """The page's plan view of one ``tick()`` result: per track its generation, target,
-    current action, permission, missing instances and per-component coordinator status."""
+    current action, permission, missing instances and per-component coordinator status.
+    ``evidence`` ({track: ReleaseEvidence}, the tick's ``last_evidence``) adds
+    ``release_confirmed`` / ``target_on_main``; a track without it is unconfirmed."""
     out = []
     for track, actions in sorted(results.items()):
         last = actions[-1] if actions else None
@@ -732,8 +820,11 @@ def track_views(results, definitions, state, now) -> list:
         components = component_view(state.slots_for(target, tdefs) if target else {}, tdefs, now)
         for name, row in components.items():
             row["attempts"] = state.attempts(name, target) if target else 0
+        ev = (evidence or {}).get(track) or ReleaseEvidence()
         out.append({
             "track": {"repo": track[0], "branch": track[1], "ci_context": track[2]},
+            "release_confirmed": bool(target) and same_commit(ev.published_commit, target),
+            "target_on_main": ev.on_main if isinstance(ev.on_main, bool) else None,
             "generation": plan.generation, "plan_commit": plan.commit, "target_commit": target,
             "actions": [action_dict(a) for a in actions],
             "current": action_dict(last) if last is not None else None,

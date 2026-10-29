@@ -88,7 +88,9 @@ Settings of the reserved `control_plane` section the servers read: `pg_dsn`,
 web container sees it, to a checkout of InferWeave's `deploy/pipelines`; read live and validated with
 the same rules as its `validate.py`. Absent: no definitions, any host may report any component and the
 Deployments snapshot warns. Set: a host may report only components whose `host` is its fleet id, and
-an invalid set keeps the last good one, or refuses events with 503 if none was ever valid), `inspector_limits` (`max_events`,
+an invalid set keeps the last good one, or refuses events with 503 if none was ever valid),
+`deployment_actions` (exactly `true` enables the audited Deployments actions; read live, and off while the
+file is unusable unless `config_failure_mode: last_good` — see "Deployment actions" below), `inspector_limits` (`max_events`,
 `max_bytes`, `max_sessions`, `max_total_bytes`, `retention_hours`, `reasoning_role`,
 `sensitive_role`, `store_reasoning`) and `llm_proxy` (`max_inflight`,
 `queue_wait_seconds`, `raw_retention_days` (default 14: the web server drops older
@@ -207,3 +209,46 @@ Automatic agent summaries can use a separately managed private CPU model. It is
 disabled by default and ordinary deploys never download or start it. See
 [agent summary model operations](../../docs/operations/agent-summary-model.md) for
 explicit provisioning, central configuration, health checks and removal.
+
+## Deployment actions (force redeploy, permit gate, ack)
+
+Hosts pull and herdr never holds a production credential: a force redeploy only **records a
+request** that the host updater picks up on its next poll. The routes (each also under `/api/v1/`):
+
+| Route | Credential | What it does |
+| --- | --- | --- |
+| `POST /api/deployments/force` `{"component": "<name>"}` or `{"stage": <n>}` | operator `X-API-Key` | records a force request for one component, or one entry per component of a stage, with the current plan target. An identical pending request is not duplicated |
+| `POST /api/deployments/ack` `{"component", "instance"[, "release"]}` | operator `X-API-Key` | acknowledges a stale instance (for example a preempted node whose `failed` would otherwise halt its stage for that release). The release defaults to the plan target. `{"component", "release"}` with no instance lifts a `failure-evicted` mark. Attempt counts are never changed |
+| `GET /api/deployments/requests?host=<id>` | fleet host token | pending force entries for the components defined for that host |
+| `DELETE /api/deployments/requests/<id>` | fleet host token | clears the host's own entries of a request (the "once") |
+| `GET /api/deployments/permit?component=<c>&commit=<sha>` | fleet host token | the host gate: `{permitted, reason, generation, target_commit, forced, request_id}` |
+
+- **Guards on force and ack:**
+  - `control_plane.deployment_actions: true` (otherwise 403).
+  - The operator role. In open tailnet mode every loopback/tailnet caller is the operator.
+  - Same-origin, `application/json`, and a body of at most 4 KiB.
+  - Exactly one target, validated against the loaded definitions.
+  - A request that carries a fleet host token is refused even beside an operator key.
+- **Audit.** Every request writes an audit row (`deployment_action` events) with the actor (`<role>:key:<digest>`),
+  the target, the time and the outcome.
+  - An accepted request is audited durably *before* it is recorded. If that row cannot be persisted, the answer is
+    503 and nothing is recorded.
+  - Refusals are recorded as `refused`. Auth refusals have no target because the body is never read, and are
+    throttled to 60 rows a minute.
+  - Host pickups are recorded as `picked-up`.
+- **Requests** are kept until cleared or for 24 h, at most 256 pending (more is refused with 429).
+- **Host token scope.** The host token grants only these host routes, and only for the components whose
+  definition names that host. Every other route still answers 401.
+- **The permit gate is not behind the flag.**
+  - A component is permitted when the newest coordinator tick (at most 90 s old, not stale) lists it in
+    `permitted` and the commit is the plan target.
+  - A pending force for that component and target also permits it, but only where staging holds the plan: a Start
+    whose turn has not come, the hold timer, or a stage halt. That tick must also have the release confirmed and the
+    target on main.
+  - A force never overrides "release not confirmed", "target no longer on main", an earlier-release or
+    unknown-ancestry hold, or a coordinator error.
+  - A replan onto another commit voids a pending force.
+  - The host sequence is: list requests, ask permit (`forced: true`), `DELETE` the request, redeploy.
+- **Turning the flag off** is the kill switch: pending forces are ignored by the gate and the request list is
+  empty. The plan's own permission is unaffected.
+

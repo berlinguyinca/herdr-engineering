@@ -28,6 +28,8 @@ from ..host_policy import HostPolicy, HostSnapshot, PolicyMode, normalize_aliase
 from ..llm_session_id import dashboard_form
 from . import llm_stats
 from .agent_identity import AgentIdentityConflict, AgentIdentityRegistry
+from .deployment_actions import ENTITY_TYPE as DEPLOYMENT_REQUEST_ENTITY
+from .deployment_actions import ForceRequests
 from .deployment_coordinator import ENTITY_TYPE as DEPLOYMENT_PLAN_ENTITY
 from .deployment_coordinator import CoordinatorState
 from .deployments_monitor import ENTITY_TYPE as DEPLOYMENT_ENTITY
@@ -225,6 +227,11 @@ class ControlPlaneRepo:
         self.deployments = self._new_deployments()
         # The deployment coordinator's plan generation and attempts (deploy-4 Task 3): private too.
         self.deployment_plans = self._new_deployment_plans()
+        # Operator force-redeploy requests the hosts pick up (deploy-4 Task 5): private too.
+        self.deployment_requests = self._new_deployment_requests()
+
+    def _new_deployment_requests(self):
+        return ForceRequests(persist=self._persist_deployments, now=lambda: self._now())
 
     def _new_deployment_plans(self):
         return CoordinatorState(persist=self._persist_deployments)
@@ -3319,6 +3326,12 @@ class ControlPlaneRepo:
         self._event_order = [t for t in self._event_order if t[0] != DEPLOYMENT_PLAN_ENTITY]
         self.deployment_plans = self._new_deployment_plans()
         self.deployment_plans.hydrate(plan_rows)
+        request_rows = []
+        for key in [k for k in self._events if k[0] == DEPLOYMENT_REQUEST_ENTITY]:
+            request_rows.extend(self._events.pop(key))
+        self._event_order = [t for t in self._event_order if t[0] != DEPLOYMENT_REQUEST_ENTITY]
+        self.deployment_requests = self._new_deployment_requests()
+        self.deployment_requests.hydrate(request_rows)
         # Host telemetry rollups/state ride a private stream: rebuild history and
         # put the latest record back on each host.
         metrics = []

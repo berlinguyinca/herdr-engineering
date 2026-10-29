@@ -31,6 +31,10 @@ sections:
       # deployment events for any component (the Deployments snapshot then carries a warning).
       # Set but invalid: deployment events are refused (503) until it validates.
       # deployment_definitions: "/srv/inferweave/deploy/pipelines"
+      # OPTIONAL: true enables the audited Deployments actions (POST /api/deployments/force and
+      # /ack, operator role). Read live; anything but true is off. Force only records a request the
+      # host updaters pick up; the host permit gate (GET /api/deployments/permit) works either way.
+      deployment_actions: false
       # OPTIONAL: head-bound post-PR review quorum (GET /api/v1/graph/nodes/{pr}/review-quorum).
       # Principal ids are the server-side `key:<digest>` actors; omit the block to turn it off.
       # review_quorum:
