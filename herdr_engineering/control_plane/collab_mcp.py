@@ -276,7 +276,8 @@ def _upload_call(service, principal, name, args):
 # helper_*: an external agent never holds spawn_helpers (EXTERNAL_ACTIONS is read/post), so it never owns a helper either.
 _NEVER_FOR_EXTERNAL = frozenset({"tasks_inbox", "tasks_wait", "task_update", "task_create", "agents_list",
                                  "helper_spawn", "helper_wait", "helper_result", "helper_cancel",
-                                 "skills_search", "skills_get", "skills_download", "skills_install"})
+                                 # skills, uploads and analyses act for an enrolled person's own agent, never a coworker's bridge
+                                 *_SKILL_TOOLS, *_UPLOAD_TOOLS, *_ANALYSIS_TOOLS})
 
 
 def tools_for(service: CollabService, pr=None) -> list[dict]:
@@ -402,6 +403,9 @@ def _helper_call(service: CollabService, pr, name: str, args: dict) -> dict:
 
 
 def _call(service: CollabService, pr, name: str, args: dict) -> dict:
+    if name in _SKILL_TOOLS or name in _ANALYSIS_TOOLS or name in _UPLOAD_TOOLS:
+        if service.tool_profile(pr)["external"]:      # refused before any argument is read, like the other external-only refusals
+            raise CollabError(403, "forbidden")
     if name in _SKILL_TOOLS:
         return _skill_call(service, pr, name, args)
     if name in _ANALYSIS_TOOLS:

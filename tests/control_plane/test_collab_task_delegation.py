@@ -7,7 +7,15 @@ import pytest
 from herdr_engineering.control_plane.collab import CollabError, CollabService
 from tests.control_plane.test_collab_pentest import tool, tool_text
 from tests.control_plane.test_collab_public import H, stack  # noqa: F401
-from tests.control_plane.test_collab_tasks import USERS, mcp_world, svc, w  # noqa: F401
+from tests.control_plane.test_collab_tasks import USERS, mcp_world, svc  # noqa: F401
+from tests.control_plane.test_collab_tasks import w as _base_world
+
+
+@pytest.fixture
+def w(_base_world):
+    # Per-member delegation is opt-in (require_agent_delegation); these tests cover the opted-in behaviour.
+    _base_world.s.require_agent_delegation = True
+    return _base_world
 
 
 def submit(w, agent, key='delegation'):
@@ -60,7 +68,7 @@ def test_delegation_persists_after_event_log_hydration(w):
     agent, _ = w.agent('alice', delegate=False)
     w.s.set_agent_permission(w.alice, w.room, agent.id, 'bob', 'approved')
     old = w.s
-    w.s = CollabService(old.auth, now=old.clock)
+    w.s = CollabService(old.auth, now=old.clock, require_agent_delegation=True)
     w.s.hydrate(old._log)
     assert submit(w, agent)[0] == 201
 
@@ -151,13 +159,14 @@ def test_relay_keeps_owner_and_admin_overrides_across_hydration(w):
     child = relay_task(w, boss, target, r)['task_id']
     assert w.s._tasks[child]['delegation_admin'] is True
     old = w.s
-    w.s = CollabService(old.auth, now=old.clock)
+    w.s = CollabService(old.auth, now=old.clock, require_agent_delegation=True)
     w.s.hydrate(old._log)
     assert w.s._tasks[child]['delegation_admin'] is True
     assert [x['task_id'] for x in w.s.task_inbox(target)['tasks']] == [child]
 
 
 def test_public_request_and_mcp_acceptance_share_the_delegation_envelope(stack):
+    stack.svc.require_agent_delegation = True
     _, room, agents = mcp_world(stack)
     base = f'/api/v1/collab/rooms/{room}'
     body = {'target_agent_id': agents['alice']['agent_id'], 'text': 'do work', 'idempotency_key': 'public'}

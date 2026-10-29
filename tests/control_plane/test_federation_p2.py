@@ -1012,7 +1012,7 @@ def test_non_message_events_in_the_feed_are_never_exported(fx):
     agent, _ = w.agent("bob")                                                            # member/agent/grant events
     fx.say(w.bob, "only this")
     feed_types = {e["event_type"] for e in fx.s._by_room[w.room]}
-    assert {"member_added", "agent_granted"} <= feed_types
+    assert {"agent_granted"} <= feed_types and feed_types & {"member_added", "room_member_approved"}
     doc = fx.events(sid)[1]
     assert [e["event_type"] for e in doc["events"]] == ["message"] and [e["text"] for e in doc["events"]] == ["only this"]
     assert EXPORT_FIELDS.keys() == {"message"} and agent

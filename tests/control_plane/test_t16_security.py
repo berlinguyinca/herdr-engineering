@@ -266,7 +266,7 @@ def test_non_safety_writes_stop_before_safety_writes_and_the_tiers_are_ordered()
     bulk, ordinary, safety = (svc._log_limit(t) for t in ("message", "room_created", "member_removed"))
     assert bulk < ordinary < safety == 1000
     assert "message" in BULK_EVENTS and not (BULK_EVENTS & SAFETY_EVENTS)
-    assert SAFETY_EVENTS == {"member_removed", "agent_revoked", "user_decided", "join_token_revoked", "xlink_revoked",
+    assert SAFETY_EVENTS == {"member_removed", "room_member_removed", "agent_revoked", "user_decided", "join_token_revoked", "xlink_revoked",
                              "workspace_unlinked", "mission_unlinked", "agent_grant_revoked",
                              "helpers_paused", "helper_cancelled", "egress_removed",
                              "federation_share_revoked", "federation_peer_disabled"}      # ADR-0008 P2

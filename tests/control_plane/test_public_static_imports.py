@@ -17,12 +17,12 @@ _HTML_REF = re.compile(r"""<(?:script|link)\b[^>]*?\b(?:src|href)=["']([^"':]+\.
 
 
 def _refs(name: str) -> list[str]:
+    if not name.endswith((".js", ".html")):         # fonts and vendored .mjs bundles are served, not walked
+        return []
     text = (PACKAGES / name).read_text(encoding="utf-8")
     if name.endswith(".js"):
         return _IMPORT.findall(text)
-    if name.endswith(".html"):
-        return _HTML_REF.findall(text)
-    return []
+    return _HTML_REF.findall(text)
 
 
 def _resolve(name: str, ref: str) -> str:

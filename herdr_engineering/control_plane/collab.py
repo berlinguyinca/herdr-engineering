@@ -368,10 +368,13 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                  max_log_events: int = 200_000, guest_ttl: float = 7 * 24 * 3600.0,
                  default_grant_ttl: float = 30 * 24 * 3600.0,
                  approval: ApprovalPolicy | None = None, delegation_enabled: bool = False,
-                 summary_fix: dict | None = None,
+                 summary_fix: dict | None = None, require_agent_delegation: bool = False,
                  archive_service: Any = None, upload_service: Any = None, upload_runner: Any = None,
                  analysis_service: Any = None, analysis_runner: Any = None,
                  skill_service: Any = None, skill_runner: Any = None):
+        # Per-member agent delegation (agent_access_* records): when on, a member who is neither the room owner nor the
+        # agent's owner needs the owner's approval before tasking the agent. Off keeps the room-wide "task" right.
+        self.require_agent_delegation = require_agent_delegation
         self.skill_service = skill_service
         self.skill_runner = skill_runner
         self.analysis_service = analysis_service
@@ -4888,6 +4891,8 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
             del self._egress[rid]
 
     def _delegation_valid(self, pr: Principal, room: dict, agent_id: str) -> bool:
+        if not self.require_agent_delegation:
+            return True
         member = self._member(room, pr.id)
         if pr.admin or (member and member["role"] == "owner") or self._agents.get(agent_id, {}).get("owner") == pr.id:
             return True
