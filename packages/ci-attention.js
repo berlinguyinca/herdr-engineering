@@ -106,11 +106,11 @@ function runningRow(x) {
 export function renderCiAttention(model, { open = new Set(), showAll = false, runsOpen = null } = {}) {
   const f = model.failures; const shown = showAll ? f : f.slice(0, SHOWN);
   const failBlock = f.length
-    ? `${shown.map((x) => failureRow(x, open.has(x.key))).join('')}${f.length > shown.length ? `<button type="button" class="cia-more" data-cia-more>Show ${f.length - shown.length} more</button>` : ''}`
+    ? `${shown.map((x) => failureRow(x, open.has(x.key))).join('')}${f.length > shown.length ? `<button type="button" class="hd-btn hd-btn--secondary hd-btn--sm cia-more" data-cia-more>Show ${f.length - shown.length} more</button>` : ''}`
     : '<p class="cia-note" data-cia-clear>No unresolved failures: the newest finished run of every branch and pull request passed.</p>';
   const runs = showAll ? model.running : model.running.slice(0, SHOWN);
   const runBlock = model.running.length
-    ? `<ul class="cia-runs">${runs.map(runningRow).join('')}</ul>${model.running.length > runs.length ? `<button type="button" class="cia-more" data-cia-more>Show ${model.running.length - runs.length} more</button>` : ''}`
+    ? `<ul class="cia-runs">${runs.map(runningRow).join('')}</ul>${model.running.length > runs.length ? `<button type="button" class="hd-btn hd-btn--secondary hd-btn--sm cia-more" data-cia-more>Show ${model.running.length - runs.length} more</button>` : ''}`
     : '<p class="cia-note">Nothing is running.</p>';
   return `<style>${styles}</style><section class="cia" aria-label="CI needs attention">
 <h2>Needs attention <span class="cia-count" data-cia-count>${f.length}</span></h2>
@@ -146,7 +146,7 @@ const styles = `.cia{margin:12px 0 20px;min-width:0}.cia h2{font-size:15px;margi
 .cia-chip{font-size:11px;padding:0 8px;border:1px solid var(--border);border-radius:99px;color:var(--text-secondary)}.cia-chip--bad{border-color:var(--status-failed);color:var(--status-failed)}
 .cia-body{padding:4px 4px 16px 24px}.cia-who{font-size:13px;margin:4px 0 8px;overflow-wrap:anywhere}.cia-links{font-size:12px;margin:8px 0 0}.cia-step h3{font-size:13px;margin:8px 0 4px}
 .cia-log{margin:4px 0;padding:12px;background:var(--surface-2);border:1px solid var(--border);border-radius:var(--radius-sm);font-size:12px;line-height:1.5;max-height:320px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere}
-.cia-runs{list-style:none;margin:0;padding:0}.cia-run{display:flex;flex-wrap:wrap;align-items:center;gap:4px 12px;padding:8px 4px;border-bottom:1px solid var(--border-subtle);font-size:13px}.cia-more{margin:8px 0;padding:6px 12px;font:inherit;font-size:13px;color:var(--accent);background:none;border:1px solid var(--border);border-radius:var(--radius-sm);cursor:pointer}`;
+.cia-runs{list-style:none;margin:0;padding:0}.cia-run{display:flex;flex-wrap:wrap;align-items:center;gap:4px 12px;padding:8px 4px;border-bottom:1px solid var(--border-subtle);font-size:13px}.cia-more{margin:8px 0}`;
 
 /** Mounts the section into `host`; returns a disposer. Opened rows survive the refresh. */
 export function mountCiAttention(host, client, { intervalMs = 20000, now = () => Date.now(), onModel = () => {} } = {}) {
