@@ -121,12 +121,12 @@ test('a long open list folds into one section per severity and kind, worst first
   const html = renderAttention({ body: body(many) }, now);
   assert.equal((html.match(/class="at-kind at-kind-/g) || []).length, 2);
   assert.ok(html.indexOf('at-kind-critical') < html.indexOf('at-kind-warning'));
-  assert.match(html, /Show all 12 \(9 more\)/);
+  assert.match(html, /12 × CI failed/);
   assert.equal((html.match(/data-attention-row="/g) || []).length, 14);      // nothing is dropped, only folded
-  assert.ok(!html.includes('Show all 2'));                                    // a section of three or fewer has nothing to fold
+  assert.ok(!html.includes('Show all 2<'));                                    // a section of three or fewer has nothing to fold
 });
 
 test('a short open list stays flat', () => {
-  const html = renderAttention({ body: body(Array.from({ length: 8 }, (_, n) => item({ key: `k:${n}`, title: `T${n}` }))) }, now);
+  const html = renderAttention({ body: body(Array.from({ length: 8 }, (_, n) => item({ key: `k:${n}`, kind: `kind${n % 4}`, title: `T${n}` }))) }, now);
   assert.ok(!html.includes('<h2 class="at-kind-title"'));
 });

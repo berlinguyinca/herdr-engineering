@@ -37,6 +37,8 @@ function age(item, now) {
 const ICON_CHECK = '<svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true" focusable="false"><path d="M3 8.5l3.2 3L13 4.5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>';
 const ICON_BELL_OFF = '<svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true" focusable="false"><path d="M4 11V7a4 4 0 016-3.5M12 7v4l1 1H3M6.5 14h3M2 2l12 12" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>';
 
+const ICON_WARN = '<svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true" focusable="false"><path d="M8 2l6.5 11.5h-13zM8 6.5v3.2M8 11.6v.1" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+
 function row(item, now, { busy = false, urls = null, showKind = false } = {}) {
   const sev = SEVERITIES.includes(item.severity) ? item.severity : 'info';
   const href = safeHref(item.href);
@@ -85,11 +87,12 @@ function groupedOpen(open, renderRow) {
     .map(([, items]) => {
       const sev = SEVERITIES.includes(items[0].severity) ? items[0].severity : 'info';
       const label = `${esc(sev)} · ${esc(KINDS[items[0].kind] || text(items[0].kind))}`;
-      const head = items.slice(0, SHOWN_PER_GROUP).map((i) => renderRow(i)).join('');
-      const rest = items.slice(SHOWN_PER_GROUP);
-      const more = rest.length
-        ? `<li class="at-more"><details><summary>Show all ${items.length} (${rest.length} more)</summary><ul class="at-list">${rest.map((i) => renderRow(i)).join('')}</ul></details></li>` : '';
-      return `<section class="at-kind at-kind-${sev}" aria-label="${label}"><h2 class="at-kind-title">${label} <span class="at-count">${items.length}</span>${items.length > 1 ? ` <button type="button" class="at-btn at-ack-all" data-ack-all="${esc(JSON.stringify(items.map((i) => [i.key, i.fingerprint])))}">Acknowledge all ${items.length}</button>` : ''}</h2><ul class="at-list">${head}${more}</ul></section>`;
+      const label1 = KINDS[items[0].kind] || text(items[0].kind);
+      const names = items.slice(0, SHOWN_PER_GROUP).map((i) => text(i.title).replace(/^[^·]*·\s*/, '')).join(', ');
+      const body = items.length > SHOWN_PER_GROUP
+        ? `<li class="at-fold"><details><summary><strong>${items.length} × ${esc(label1)}</strong><span class="at-detail">${esc(names)} and ${items.length - SHOWN_PER_GROUP} more</span><span class="at-showall">Show all ${items.length}</span></summary><ul class="at-list">${items.map((i) => renderRow(i)).join('')}</ul></details></li>`
+        : items.map((i) => renderRow(i)).join('');
+      return `<section class="at-kind at-kind-${sev}" aria-label="${label}"><h2 class="at-kind-title">${label} <span class="at-count">${items.length}</span>${items.length > 1 ? ` <button type="button" class="at-btn at-ack-all" data-ack-all="${esc(JSON.stringify(items.map((i) => [i.key, i.fingerprint])))}">Acknowledge all ${items.length}</button>` : ''}</h2><ul class="at-list">${body}</ul></section>`;
     });
   return `<div aria-label="Open attention items">${sections.join('')}</div>`;
 }
@@ -115,7 +118,9 @@ const STYLES = `<style>
 .at-partial{background:var(--surface);border:1px solid var(--status-attention);border-radius:var(--radius);padding:4px 12px;font-size:13px}
 .at-chip{font:inherit;font-size:13px;padding:2px 12px;min-height:28px;border:1px solid var(--border);border-radius:999px;background:var(--surface);color:var(--text-secondary);cursor:pointer}
 .at-chip[aria-pressed=true]{border-color:var(--accent);color:var(--text)}.at-chip-critical{border-left:3px solid var(--status-failed)}.at-chip-warning{border-left:3px solid var(--status-attention)}
-.at-bell{display:inline-flex;color:var(--text-muted);cursor:help}
+.at-bell{display:inline-flex;color:var(--text-muted);cursor:help}.at-warn{color:var(--status-attention)}
+.at-fold>details>summary{display:flex;flex-wrap:wrap;align-items:baseline;gap:4px 12px;cursor:pointer;padding:12px 16px;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);font-size:14px}.at-fold>details[open]>summary{margin-bottom:8px}
+.at-showall{color:var(--accent);font-size:13px;margin-left:auto}.at-fold .at-detail{flex:1 1 200px}
 .at-list{list-style:none;margin:0;padding:0;display:grid;gap:8px}
 .at-row{display:flex;align-items:center;gap:8px 24px;padding:12px 16px;background:var(--surface);border:1px solid var(--border);border-left-width:3px;border-radius:var(--radius)}
 .at-critical{border-left-color:var(--status-failed)}.at-warning{border-left-color:var(--status-attention)}.at-info,.at-resolved{border-left-color:var(--border)}
@@ -163,17 +168,18 @@ export function renderAttention(model = {}, now = Date.now()) {
   const quiet = (n, word) => (Number(n) ? `<span>${Number(n)} ${word}</span>` : '');
   const blocked = model.notify && (model.notify.status === 'blocked' || model.notify.status === 'unsupported')
     ? `<span class="at-bell" role="img" aria-label="Browser notifications unavailable" title="${model.notify.status === 'blocked' ? "Browser notifications are blocked. Allow them in this site's settings to hear about new critical items." : 'Browser notifications are not supported in this browser.'}" data-notify-status="${esc(model.notify.status)}">${ICON_BELL_OFF}</span>` : '';
-  const summary = `<div class="at-summary" role="status"><span><strong>${Number(counts.open) || 0}</strong> open</span>${chips}${quiet(counts.acknowledged, 'acknowledged')}${quiet(counts.snoozed, 'snoozed')}${kindSelect}${blocked}${partial ? `<span class="at-partial">Partial: ${esc(unavailable.join(', ') || 'a source')} unavailable</span>` : ''}</div>`;
+  const summary = `<div class="at-summary" role="status"><span><strong>${Number(counts.open) || 0}</strong> open</span>${chips}${quiet(counts.acknowledged, 'acknowledged')}${quiet(counts.snoozed, 'snoozed')}${kindSelect}${blocked}${partial ? `<span class="at-bell at-warn" role="img" title="Partial: ${esc(unavailable.join(', ') || 'a source')} unavailable" aria-label="Partial: ${esc(unavailable.join(', ') || 'a source')} unavailable">${ICON_WARN}</span>` : ''}</div>`;
   const stale = error ? '<p class="at-partial" role="status">Could not refresh; showing the last received list.</p>' : '';
   const trunc = body.truncated ? '<p class="at-status">Showing the first items only; the inbox is capped.</p>' : '';
   let list;
   const renderRow = (i, showKind = false) => row(i, now, { busy: busy.has(i.key), urls: model.urls, showKind });
-  if (open.length > GROUP_AFTER) list = groupedOpen(open, renderRow);
+  const repeated = Object.values(open.reduce((m, i) => { const k = `${i.severity}|${i.kind}`; m[k] = (m[k] || 0) + 1; return m; }, {})).some((n) => n > SHOWN_PER_GROUP);
+  if (open.length > GROUP_AFTER || repeated) list = groupedOpen(open, renderRow);
   else if (open.length) list = `<ul class="at-list" aria-label="Open attention items">${open.map((i) => renderRow(i, true)).join('')}</ul>`;
   else if (partial) list = '<p class="at-status">Nothing is known to be open, but some sources could not be read.</p>';
   else list = '<p class="at-status">No attention items. Every source was read.</p>';
   const resolved = records(body.resolved);
-  return `${STYLES}${head}${summary}${message ? `<p class="at-status" role="status">${esc(message)}</p>` : ''}${blocked ? '' : notifyLine(model.notify)}${stale}${list}${trunc}
+  return `${STYLES}${head}${summary}${message ? `<p class="at-status" role="status">${esc(message)}${model.undo ? ' <button type="button" class="at-btn" data-undo>Undo</button>' : ''}</p>` : ''}${blocked ? '' : notifyLine(model.notify)}${stale}${list}${trunc}
     <div data-state="acknowledged">${group('Acknowledged', acknowledged, (i) => row(i, now, { busy: busy.has(i.key), urls: model.urls }))}</div>
     ${group('Snoozed', snoozed, (i) => row(i, now, { busy: busy.has(i.key), urls: model.urls }))}
     ${group('Recently resolved', resolved, (i) => resolvedRow(i, now))}`;
@@ -233,9 +239,10 @@ export function mountAttention(container, client, { onBody, notifier, onFreshnes
     }
   }
   async function act(action, body, key) {
-    model.busy.add(key); model.message = ''; draw();
+    model.busy.add(key); model.message = ''; model.undo = null; draw();
     try {
       const result = await client.attentionAct(action, body);
+      if (action === 'ack' && !(result && result.stored === false)) { model.message = 'Acknowledged.'; model.undo = [[body.key, body.fingerprint]]; setTimeout(() => { if (model.message === 'Acknowledged.') { model.message = ''; model.undo = null; last = ''; draw(); } }, 10000); }
       if (result && result.stored === false && result.reason === 'not_current') model.message = 'That item changed or cleared before your action; the list was refreshed.';
     } catch (err) {
       model.message = `Could not ${action === 'ack' ? 'acknowledge' : action}: ${err?.message || 'request failed'}`;
@@ -256,14 +263,15 @@ export function mountAttention(container, client, { onBody, notifier, onFreshnes
     if (all) {
       let pairs = [];
       try { pairs = JSON.parse(all.dataset.ackAll).filter((p) => Array.isArray(p) && typeof p[0] === 'string'); } catch { /* No pairs: nothing to do. */ }
-      if (!pairs.length || !window.confirm(`Acknowledge ${pairs.length} items? They stay listed under Acknowledged.`)) return;
+      if (!pairs.length) return;
       model.message = ''; pairs.forEach(([k]) => model.busy.add(k)); draw();
       let failed = 0;
       for (const [key, fingerprint] of pairs) {
         try { await client.attentionAct('ack', { key, fingerprint }); } catch { failed += 1; }
         model.busy.delete(key);
       }
-      model.message = failed ? `${failed} of ${pairs.length} could not be acknowledged.` : '';
+      model.message = failed ? `${failed} of ${pairs.length} could not be acknowledged.` : `Acknowledged ${pairs.length} items.`;
+      model.undo = failed === pairs.length ? null : pairs;
       clearTimeout(timer); controller?.abort(); controller = null; poll();
       return;
     }
@@ -272,6 +280,13 @@ export function mountAttention(container, client, { onBody, notifier, onFreshnes
       const f = chip.dataset.filter, v = chip.dataset.value;
       model.filters = { ...model.filters, [f]: model.filters[f] === v ? '' : v };
       last = ''; draw();
+      return;
+    }
+    const undo = event.target.closest?.('[data-undo]');
+    if (undo && model.undo) {
+      const pairs = model.undo; model.undo = null; model.message = '';
+      for (const [key, fingerprint] of pairs) { try { await client.attentionAct('clear', { key, fingerprint }); } catch { /* the next poll shows the truth */ } }
+      clearTimeout(timer); controller?.abort(); controller = null; poll();
       return;
     }
     const b = event.target.closest?.('[data-ack],[data-clear]');
