@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { compact, disclosure, ms, pair, percent, rate, renderLlm, renderLlmSession, single, when, pickTotal } from '../llm-view.js';
+import { compact, disclosure, ms, pair, percent, rate, renderLlm, renderLlmSession, single, when, pickTotal, handoffChains } from '../llm-view.js';
 
 const dist = (n, p50, p95) => ({ n, p50, p95, insufficient: n < 5 });
 const group = (over = {}) => ({
@@ -174,4 +174,20 @@ test('a mission filter, a missions tab, a queue chart and an open-agent link are
   assert.match(html, /class="llm-ext" href="#\/herd\/session\/herdr%3Abeast%3Aeng%3Aw1%3Ap1"/);
   assert.doesNotMatch(html, /llm-ext" href="#\/herd\/session\/unmatched/);   // an unmatched id is no agent
   assert.doesNotMatch(renderLlm(state(), data()), /data-llm-filter="mission"/, 'no missions, no filter');
+});
+
+test('handoffChains sums usage over agents joined by recorded handoffs and leaves the rest out', () => {
+  const g = (key, out, requests = 1) => ({ key, source: 'llm-proxy', requests, errors: 0, tokens: { output: out } });
+  const agents = { groups: [g('a', 100), g('b', 50, 2), g('c', 7), g('lone', 9)] };
+  const handoffs = [
+    { source: { session_id: 'a' }, target: { session_id: 'b' }, created_at: 1 },
+    { source: { session_id: 'b' }, target: { session_id: 'c' }, created_at: 2 },
+    { source: { session_id: 'x' }, target: { session_id: 'y' }, created_at: 3 },
+  ];
+  const chains = handoffChains(handoffs, agents);
+  assert.equal(chains.length, 1, 'x→y has no usage so is left out; lone is in no handoff');
+  assert.deepEqual(chains[0].ids, ['a', 'b', 'c']);
+  assert.equal(chains[0].output, 157);
+  assert.equal(chains[0].requests, 4);
+  assert.deepEqual(handoffChains(null, agents), []);
 });

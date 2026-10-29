@@ -152,6 +152,35 @@ function missionsTable(missions) {
     'No request in this window belonged to a mission.');
 }
 
+/** Agents joined by recorded handoffs form a chain; its usage is the sum over the chain's agents that have usage. Only recorded
+ *  handoffs join anything: an agent no handoff names is not in a chain, and a chain with no usage in the window is left out. */
+export function handoffChains(handoffs, agents) {
+  const rows = list(handoffs).filter((h) => h && h.source?.session_id && h.target?.session_id)
+    .sort((a, b) => (num(a.created_at) ?? 0) - (num(b.created_at) ?? 0));
+  const parent = new Map();
+  const find = (x) => { while (parent.get(x) !== x) { parent.set(x, parent.get(parent.get(x))); x = parent.get(x); } return x; };
+  const add = (x) => { if (!parent.has(x)) parent.set(x, x); };
+  for (const h of rows) { add(h.source.session_id); add(h.target.session_id); parent.set(find(h.source.session_id), find(h.target.session_id)); }
+  const usage = new Map(list(agents?.groups).filter((g) => g.source === PROXY || g.source === 'transcript').map((g) => [g.key, g]));
+  const chains = new Map();
+  for (const h of rows) {
+    const root = find(h.source.session_id);
+    if (!chains.has(root)) chains.set(root, { ids: [] });
+    for (const id of [h.source.session_id, h.target.session_id]) if (!chains.get(root).ids.includes(id)) chains.get(root).ids.push(id);
+  }
+  return [...chains.values()].map((c) => {
+    const used = c.ids.map((id) => usage.get(id)).filter(Boolean);
+    const sum = (f) => used.reduce((t, g) => t + (num(f(g)) || 0), 0);
+    return { ids: c.ids, agents: used.length, requests: sum((g) => g.requests ?? g.events), output: sum((g) => g.tokens?.output), errors: sum((g) => g.errors) };
+  }).filter((c) => c.agents > 0).sort((a, b) => b.output - a.output);
+}
+
+function chainsTable(chains, names) {
+  return table(['Handoff chain', 'Agents with usage', 'Requests', 'Output tokens', 'Errors'],
+    chains.map((c) => [c.ids.map((id) => link(id, names, llmSessionHref)).join(' → '), esc(String(c.agents)), esc(count(c.requests)), esc(compact(c.output)), esc(count(c.errors))]),
+    'No recorded handoff joined agents that have usage in this window.');
+}
+
 const AGENTS_SHOWN = 10;
 function agentsTable(agents, names) {
   const rows = list(agents?.groups).map((g) => [`${link(g.key, names, llmSessionHref)}${typeof g.key === 'string' && !g.key.startsWith('unmatched:') ? ` <a class="llm-ext" href="${esc(sessionHref(g.key))}" title="Open the agent" aria-label="Open the agent">↗</a>` : ''}`, esc(sourceLabel(g)), esc(reqs(g)),
@@ -173,7 +202,7 @@ function problemsTable(problems, names) {
 }
 
 // --- charts: SVG with <title>/<desc>, a table of the same numbers below, tokens only ---
-const W = 300; const H = 100; const X0 = 42; const Y1 = 130;
+const W = 780; const H = 64; const X0 = 42; const Y1 = 84;     // wide and short: the plot spans the card instead of a small square in its middle
 const fx = (i, n) => (n <= 1 ? X0 + W / 2 : X0 + (i / (n - 1)) * W);
 const r2 = (v) => Math.round(v * 100) / 100;
 
@@ -181,7 +210,7 @@ function barPlot(id, title, desc, ok, bad) {
   const n = ok.length;
   if (!n || ok.every((p) => !p.v)) return `<p class="llm-note">No requests in this window.</p>`;
   const top = Math.max(...ok.map((p) => p.v));
-  const bw = Math.min(14, (W / n) * 0.7);
+  const bw = Math.min(22, (W / n) * 0.7);
   const bars = ok.map((p, i) => {
     const failed = Math.min(num(bad[i]?.v) || 0, p.v);
     const good = p.v - failed;
@@ -190,7 +219,7 @@ function barPlot(id, title, desc, ok, bad) {
     return `${good ? `<rect x="${x}" y="${r2(Y1 - hg)}" width="${r2(bw)}" height="${r2(hg)}" fill="var(--status-ok)"><title>${esc(when(p.t))}: ${good} ok</title></rect>` : ''}${
       failed ? `<rect x="${x}" y="${r2(Y1 - hg - hb)}" width="${r2(bw)}" height="${r2(hb)}" fill="var(--status-attention)"><title>${esc(when(p.t))}: ${failed} failed</title></rect>` : ''}`;
   }).join('');
-  return `<svg viewBox="0 0 360 165" role="img" aria-labelledby="${id}-t ${id}-d"><title id="${id}-t">${esc(title)}</title><desc id="${id}-d">${esc(desc)}</desc><line x1="${X0}" y1="${Y1}" x2="${X0 + W}" y2="${Y1}"/><text x="34" y="34" text-anchor="end">${top}</text><text x="34" y="134" text-anchor="end">0</text>${bars}<text x="${X0}" y="150">${esc(when(ok[0].t).slice(5, 16))}</text><text x="${X0 + W}" y="150" text-anchor="end">${esc(when(ok[n - 1].t).slice(5, 16))}</text></svg>`;
+  return `<svg viewBox="0 0 ${X0 + W + 18} ${Y1 + 28}" role="img" aria-labelledby="${id}-t ${id}-d"><title id="${id}-t">${esc(title)}</title><desc id="${id}-d">${esc(desc)}</desc><line x1="${X0}" y1="${Y1}" x2="${X0 + W}" y2="${Y1}"/><text x="34" y="${Y1 - H + 4}" text-anchor="end">${top}</text><text x="34" y="${Y1 + 4}" text-anchor="end">0</text>${bars}<text x="${X0}" y="${Y1 + 20}">${esc(when(ok[0].t).slice(5, 16))}</text><text x="${X0 + W}" y="${Y1 + 20}" text-anchor="end">${esc(when(ok[n - 1].t).slice(5, 16))}</text></svg>`;
 }
 
 function linePlot(id, title, desc, series, fmt) {
@@ -210,7 +239,7 @@ function linePlot(id, title, desc, series, fmt) {
       : `<polyline points="${seg.map((q) => `${q[0]},${q[1]}`).join(' ')}" fill="none" stroke="${s.color}" stroke-width="2"/>`)).join('');
   }).join('');
   const first = series[0].points[0]; const last = series[0].points[series[0].points.length - 1];
-  return `<svg viewBox="0 0 360 165" role="img" aria-labelledby="${id}-t ${id}-d"><title id="${id}-t">${esc(title)}</title><desc id="${id}-d">${esc(desc)}</desc><line x1="${X0}" y1="${Y1}" x2="${X0 + W}" y2="${Y1}"/><text x="34" y="20" text-anchor="end">${esc(fmt(top))}</text><text x="34" y="134" text-anchor="end">0</text>${lines}<text x="${X0}" y="150">${esc(when(first.t).slice(5, 16))}</text><text x="${X0 + W}" y="150" text-anchor="end">${esc(when(last.t).slice(5, 16))}</text></svg>`;
+  return `<svg viewBox="0 0 ${X0 + W + 18} ${Y1 + 28}" role="img" aria-labelledby="${id}-t ${id}-d"><title id="${id}-t">${esc(title)}</title><desc id="${id}-d">${esc(desc)}</desc><line x1="${X0}" y1="${Y1}" x2="${X0 + W}" y2="${Y1}"/><text x="34" y="${Y1 - H + 4}" text-anchor="end">${esc(fmt(top))}</text><text x="34" y="${Y1 + 4}" text-anchor="end">0</text>${lines}<text x="${X0}" y="${Y1 + 20}">${esc(when(first.t).slice(5, 16))}</text><text x="${X0 + W}" y="${Y1 + 20}" text-anchor="end">${esc(when(last.t).slice(5, 16))}</text></svg>`;
 }
 
 function seriesTable(headers, rows) {
@@ -262,13 +291,13 @@ function controls(state, base = '#/llm') {
 export const llmStyles = `<style>
 .llm-controls{display:flex;flex-wrap:wrap;gap:12px 16px;align-items:center;margin:16px 0}.llm-controls select{padding:4px 12px;min-height:32px;border:1px solid var(--border);border-radius:var(--radius-sm);font:inherit;font-size:13px;color:var(--text-secondary);background:var(--surface);max-width:100%}.llm-controls select.llm-set{border-color:var(--accent);color:var(--text)}
 .llm-windows{display:inline-flex;border:1px solid var(--border);border-radius:var(--radius-sm);overflow:hidden}.llm-window{padding:4px 12px;min-height:32px;display:inline-flex;align-items:center;font-size:13px;text-decoration:none;color:var(--text-secondary);background:var(--surface);border-left:1px solid var(--border)}.llm-window:first-child{border-left:0}.llm-window[aria-current=page]{background:var(--surface-2);color:var(--text);font-weight:600}
-.llm-tiles{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:12px;margin:12px 0}.llm-tile{border:1px solid var(--border);border-radius:var(--radius);background:var(--surface);padding:12px 14px;min-width:0}.llm-tile__label{font-size:12px;color:var(--text-secondary)}.llm-tile__value{font-size:20px;font-weight:600;margin-top:4px;overflow-wrap:anywhere}.llm-tile__note{font-size:11px;color:var(--text-secondary);margin-top:4px}
-.llm-charts{display:grid;grid-template-columns:minmax(0,1fr);gap:16px;margin:16px 0}.llm-quiet{display:flex;flex-wrap:wrap;gap:4px 24px;margin:12px 0;font-size:12px;color:var(--text-muted)}.llm-card{min-width:0;border:1px solid var(--border);border-radius:var(--radius);background:var(--surface);padding:6px 14px 12px}.llm-card h2{font-size:14px;margin:10px 0 4px}.llm-card svg{display:block;width:100%;max-height:210px}.llm-card svg text{font-size:11px;fill:var(--text-secondary);font-family:inherit}.llm-card svg line{stroke:var(--border)}
+.llm-tiles{display:flex;flex-wrap:wrap;gap:12px;margin:12px 0}.llm-tile{flex:1 1 170px;border:1px solid var(--border);border-radius:var(--radius);background:var(--surface);padding:12px 14px;min-width:0}.llm-tile__label{font-size:12px;color:var(--text-secondary)}.llm-tile__value{font-size:20px;font-weight:600;margin-top:4px;overflow-wrap:anywhere}.llm-tile__note{font-size:11px;color:var(--text-secondary);margin-top:4px}
+.llm-charts{display:grid;grid-template-columns:minmax(0,1fr);gap:16px;margin:16px 0}.llm-quiet{display:flex;flex-wrap:wrap;gap:4px 24px;margin:12px 0;font-size:12px;color:var(--text-muted)}.llm-card{min-width:0;border:1px solid var(--border);border-radius:var(--radius);background:var(--surface);padding:6px 14px 12px}.llm-card h2{font-size:14px;margin:10px 0 4px}.llm-card svg{display:block;width:100%;height:auto}.llm-card svg text{font-size:11px;fill:var(--text-secondary);font-family:inherit}.llm-card svg line{stroke:var(--border)}
 .llm-legend{display:flex;flex-wrap:wrap;gap:12px;font-size:11px;color:var(--text-secondary)}.llm-legend span::before{content:'';display:inline-block;width:9px;height:9px;margin-right:5px;background:var(--c);border-radius:2px}
 .llm-note{font-size:12px;line-height:1.6;color:var(--text-secondary);margin:6px 0}.llm-table{overflow:auto}.llm-table table{border-collapse:collapse;width:100%;font-size:13px}.llm-table th,.llm-table td{padding:7px 8px;text-align:left;border-bottom:1px solid var(--border-subtle);overflow-wrap:anywhere}.llm-table th{color:var(--text-secondary);font-weight:500}.llm-fixed{table-layout:fixed}.llm-fixed td:first-child,.llm-fixed th:first-child{width:34%}.llm-sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0)}
 .llm-badge{font-size:11px;font-weight:500;padding:2px 8px;border:1px solid var(--border);border-radius:99px;color:var(--text-secondary);vertical-align:middle}.llm-back{font-size:13px}.llm-data{font-size:12px;margin:8px 0 16px}.llm-data>summary{cursor:pointer}.llm-more>summary{cursor:pointer;padding:8px 0;color:var(--accent);font-size:13px}.llm-section h2{font-size:15px;margin:22px 0 6px}.llm-switch{position:relative;margin:16px 0;padding:12px 16px 16px}.llm-tabs{display:flex;flex-wrap:wrap;gap:8px;margin:0 0 12px}.llm-tabs label{padding:4px 12px;min-height:32px;display:inline-flex;align-items:center;gap:4px;border:1px solid transparent;border-radius:var(--radius-sm);font-size:13px;color:var(--text-secondary);cursor:pointer}.llm-tabs label:hover{color:var(--text)}.llm-tab--empty{opacity:.6}.llm-tab__badge{font-size:11px;padding:0 8px;border:1px solid var(--border);border-radius:99px}.llm-panel{display:none}.llm-ext{margin-left:4px;color:var(--text-muted);text-decoration:none}.llm-ext:hover{color:var(--accent)}.llm-switch .llm-section>.llm-table:first-child{margin-top:0}
-@media(max-width:650px){.llm-tiles{grid-template-columns:repeat(2,minmax(0,1fr))}.llm-charts{grid-template-columns:minmax(0,1fr)}}
-${switchCss('llm-chart', 4)}${switchCss('llm-tab', 4)}</style>`;
+@media(max-width:650px){.llm-tile{flex-basis:140px}.llm-charts{grid-template-columns:minmax(0,1fr)}}
+${switchCss('llm-chart', 4)}${switchCss('llm-tab', 5)}</style>`;
 
 /** Models, agents and problems share one card; a tab with nothing to show says so in its label and is not the one opened first. */
 function tables(id, defs) {
@@ -279,6 +308,7 @@ function tables(id, defs) {
  *  `data`: {total, models, agents, problems, series:{requests,errors,ttft,speed}} from the API. */
 export function renderLlm(state, data) {
   const d = data || {};
+  const chains = handoffChains(d.handoffs, d.agents);
   const extra = list(d.total?.groups).filter((g) => g !== pickTotal(d.total)).map((g) => g.source);
   return `${llmStyles}<h1>Usage</h1>${controls(state)}
     <p class="llm-note" data-llm-disclosure>${esc(disclosure(d.total))}${
@@ -287,6 +317,7 @@ export function renderLlm(state, data) {
     ${tiles(pickTotal(d.total), pickTotal(d.previous), state.window)}${charts(d.series)}
     ${tables('llm-tab', [['Models', list(d.models?.groups).length, modelsTable(d.models)], ['Agents', list(d.agents?.groups).length, agentsTable(d.agents, state.names)],
       ['Missions', list(d.missions?.groups).length, missionsTable(d.missions)],
+      ['Handoffs', chains.length, chainsTable(chains, state.names)],
       ['Problems', list(d.problems?.problems).length, problemsTable(d.problems, state.names)]])}`;
 }
 
