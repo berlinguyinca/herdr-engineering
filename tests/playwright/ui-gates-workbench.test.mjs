@@ -287,7 +287,7 @@ test('filters: open on a wide page, collapsed on a phone, operable by keyboard, 
   await ctx.close();
 });
 
-test('minimap: a text alternative that follows the view, no focus stop, no motion, click moves the view, absent when the whole graph fits', async () => {
+test('minimap: a text alternative that follows the view, no focus stop, no motion, click moves the view', async () => {
   const { ctx, page } = await open();
   const mm = page.locator('svg.lin-mm');
   assert.equal(await mm.count(), 1, 'the workbench graph is wider than the viewport');
@@ -303,6 +303,7 @@ test('minimap: a text alternative that follows the view, no focus stop, no motio
   assert.ok(!seen.some((x) => x.includes('IN-MAP')), seen.join(' | '));
   assert.ok(new Set(seen).size >= 2, `focus keeps moving: ${seen.join(' | ')}`);
   const vb0 = await page.locator('svg.lin-svg').getAttribute('viewBox');
+  await mm.scrollIntoViewIfNeeded();
   const r = await mm.boundingBox();
   await page.mouse.click(r.x + r.width * 0.9, r.y + r.height * 0.5);
   await settled(page);
@@ -310,7 +311,7 @@ test('minimap: a text alternative that follows the view, no focus stop, no motio
   assert.notEqual(await page.locator('svg.lin-mm').getAttribute('aria-label'), before, 'the text alternative follows the view');
   assert.ok(await drawn(page) <= 242);
   const motion = await page.evaluate(() => [...document.querySelectorAll('.lin-minimap, .lin-mm, .lin-mm-view, .lin-mm-bar')].map((el) => getComputedStyle(el)).map((c) => `${c.transitionDuration}/${c.animationName}`));
-  assert.ok(motion.every((m) => /^0s\/none$/.test(m)), `no transition or animation: ${motion.join(',')}`);
+  assert.ok(motion.every((m) => /^(0s|1e-06s)\/none$/.test(m)), `no transition or animation (reduced motion clamps to 1e-06s): ${[...new Set(motion)].join(",")}`);
   await ctx.close();
 });
 

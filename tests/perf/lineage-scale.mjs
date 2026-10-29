@@ -75,6 +75,7 @@ for (const shape of ['tree', 'chains']) for (const n of [5000, 10000]) {
       steps.pan.push(await page.evaluate(() => new Promise((r) => { const s = performance.now(); requestAnimationFrame(() => requestAnimationFrame(() => r(performance.now() - s))); })));
     }
     const hasMap = await page.locator('svg.lin-mm').count();
+    if (hasMap) await page.locator('svg.lin-mm').scrollIntoViewIfNeeded();
     const box = hasMap ? await page.locator('svg.lin-mm').boundingBox() : null;
     if (box) for (let i = 0; i < 12; i += 1) {
       const f = (i + 0.5) / 12;
