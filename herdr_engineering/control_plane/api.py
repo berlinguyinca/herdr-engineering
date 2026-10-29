@@ -3146,12 +3146,21 @@ def _make_handler(server, public=False, operator=False):
                         idempotency_key=idem, request_payload=call, actor=user_id)
                     if action.status == "completed":
                         return self._json({"replayed": True, "action": action.as_dict()})
+                    if action.status in ("executing", "failed"):
+                        return self._json({"error": f"this connector call is {action.status}; use a new key",
+                                           "action": action.as_dict()}, 409)
                     if not svc.action_executable(action):
                         return self._json({"error": "connector call is not authorized",
                                            "action": action.as_dict()}, 403)
-                    result = svc.connector_request(
-                        tenant_id=tenant_id, user_id=user_id, connector_id=parts[4],
-                        method=call["method"], path=call["path"], body=call["body"], actor=user_id)
+                    if not svc.claim_action(action):          # a concurrent request with this key won the claim
+                        return self._json({"error": "this connector call is already running"}, 409)
+                    try:
+                        result = svc.connector_request(
+                            tenant_id=tenant_id, user_id=user_id, connector_id=parts[4],
+                            method=call["method"], path=call["path"], body=call["body"], actor=user_id)
+                    except Exception:
+                        svc.fail_action(action)
+                        raise
                     svc.complete_action(action)
                     return self._json(result)
                 if resource == "assistant-proposals" and len(parts) == 6 and parts[5] == "decision":

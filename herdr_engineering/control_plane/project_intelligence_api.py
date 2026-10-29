@@ -154,6 +154,11 @@ class IntelligenceRoutes:
         viewer = self._viewer_from_entry(entry) if isinstance(entry, dict) else None
         if viewer is None:
             raise pi.NotFound("no project-intelligence scope is configured for this user")
+        repo = payload.get("repo")
+        mapped = (raw.get("webhook_projects") or {}).get(repo) if isinstance(repo, str) else None
+        if not (isinstance(mapped, list) and mapped) or (
+                viewer.project_ids is not None and not set(mapped) <= viewer.project_ids):
+            raise pi.NotFound("the repository is outside this user's project scope")
         p = self.board.request(org_id=viewer.org_id, requester=user_id, action="request_ci_repair",
                                payload=dict(payload), resource_version=1, idempotency_key=idempotency_key[:64])
         return {"id": p.id, "expires_at": p.expires_at.isoformat(), "state": p.state,

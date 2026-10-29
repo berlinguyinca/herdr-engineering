@@ -288,7 +288,7 @@ def test_draft_writer_commits_a_versioned_private_artifact_and_a_new_version_on_
     def store(method, *args, **kw):
         calls.append((method, args, kw))
         return {"register_logical": {"artifact_id": "artifact_9"},
-                "get_record": {"current_version_id": "ver_1"},
+                "get_record": {"current_version_id": "ver_1", "artifact_type": "email_draft"},
                 "report_permission": True,
                 "commit_version": {"artifact_id": "artifact_9", "version_id": "ver_2", "version_number": 2}}[method]
 
@@ -444,12 +444,14 @@ def _ci_world(*, board_scope=True, execute=False):
     ingest = IngestService(repo, key_scopes=_AnyKey())
     feed = Feed(ingest)
     feed.principal = U1
-    section = {"enabled": True, "execute": execute,
+    section = {"enabled": True, "execute": execute, "webhook_projects": {"o/r": ["p1"]},
                "assistant_viewers": ({"t/key:u1": {"org_id": "org1", "projects": "*"}} if board_scope else {})}
     routes = IntelligenceRoutes(section_fn=lambda: section)
     svc, r1, r2 = build()
     svc.lineage_read = LineageReader(repo.graph, PRINCIPALS.get).read
     svc.ci_board_request = routes.assistant_ci_repair
+    for run in (r1, r2):
+        grant(svc, run, "watch_ci")
     return repo, feed, routes, svc, r1, r2
 
 
@@ -593,3 +595,84 @@ def test_one_user_cannot_read_or_acknowledge_anothers_notifications():
     with pytest.raises(AssistantNotFound):
         svc.ack_notification(rec.notification_id, tenant_id="t", user_id="key:u2")
     assert svc.ack_notification(rec.notification_id, tenant_id="t", user_id="key:u1").state == "acknowledged"
+
+
+# ---- review follow-ups -----------------------------------------------------------------------------------------
+
+@pytest.mark.parametrize("tool,args", [("send_message", {"to": "x@example.com", "body": "b"}),
+                                       ("run_shell", {"command": "ls"})])
+def test_the_person_who_instructed_a_run_cannot_approve_its_send_or_shell_without_yaml_opt_in(tool, args):
+    svc, r1, _ = build()
+    grant(svc, r1, tool)
+    assert "approval required" in run_tool(svc, r1, tool, args)
+    appr = next(iter(svc.store.approvals.values()))
+    assert appr.requested_by == "key:u1"
+    with pytest.raises(AssistantForbidden):
+        svc.decide_approval(appr.approval_id, tenant_id="t", user_id="key:u1", decision="approved", actor="key:u1")
+
+
+def test_two_claims_of_one_action_cannot_both_run_and_a_failed_action_is_not_retried():
+    svc, r1, _ = build()
+    grant(svc, r1, "propose_branch")
+    svc.execute_tool = Mock(side_effect=[__import__("herdr_engineering.control_plane.assistant",
+                                                    fromlist=["AssistantError"]).AssistantError("boom"),
+                                         {"context": "ran"}])
+    args = {"title": "T", "repo": "o/r"}
+    assert "boom" in run_tool(svc, r1, "propose_branch", args)
+    assert "failed earlier" in run_tool(svc, r1, "propose_branch", args)
+    assert svc.execute_tool.call_count == 1
+    action = next(iter(svc.store.actions.values()))
+    action.status = "authorized"
+    assert svc.claim_action(action) is True and svc.claim_action(action) is False
+
+
+def test_a_failing_hook_becomes_a_tool_error_not_an_exception():
+    svc, r1, _ = build()
+    svc.artifact_writer = Mock(side_effect=RuntimeError("registry down password=hunter2hunter2"))
+    grant(svc, r1, "draft_email")
+    out = run_tool(svc, r1, "draft_email", {"to": "bob@example.com", "subject": "s", "body": "b"})
+    assert "tool error" in out and "hunter2" not in out
+
+
+def test_draft_writer_only_adds_versions_to_an_existing_email_draft():
+    from herdr_engineering.control_plane.assistant_adapters import draft_writer_hook
+    store = lambda method, *a, **k: {"report_permission": True,  # noqa: E731
+                                     "get_record": {"current_version_id": "v", "artifact_type": "report"}}[method]
+    server = SimpleNamespace(_keys={}, artifact_store=store, rustfs=SimpleNamespace(put=lambda d: ("k", "s")),
+                             artifact_acl=None, ingest=Mock())
+    with pytest.raises(LookupError):
+        draft_writer_hook(server)("open-listener", {"to": "a@b.c", "subject": "s", "body": "b",
+                                                     "artifact_id": "artifact_report"}, "i")
+
+
+def test_ci_watch_needs_its_own_grant_and_respects_the_project_scope():
+    _, feed, routes, svc, r1, _ = _ci_world()
+    _fail(feed)
+    svc.revoke_grant(next(g.grant_id for g in svc.store.grants.values() if g.user_id == "key:u1"),
+                     tenant_id="t", user_id="key:u1")
+    with pytest.raises(AssistantForbidden):
+        svc.watch_ci(tenant_id="t", user_id="key:u1", assistant_id=r1.assistant_id, actor="key:u1")
+    assert not svc.store.proposals
+    # a viewer limited to project p2 may not queue a repair for a repo mapped to p1
+    _, feed2, routes2, svc2, s1, _ = _ci_world()
+    routes2._section = lambda: {"enabled": True, "webhook_projects": {"o/r": ["p1"]},
+                                "assistant_viewers": {"t/key:u1": {"org_id": "org1", "projects": ["p2"]}}}
+    _fail(feed2)
+    out = svc2.watch_ci(tenant_id="t", user_id="key:u1", assistant_id=s1.assistant_id, actor="key:u1")
+    assert out["created"] == [] and "scope" in out["skipped"][0]["reason"]
+
+
+def test_unhashable_tool_id_is_a_clean_error_and_a_denied_action_cannot_be_approved_later():
+    svc, r1, _ = build()
+    with pytest.raises(Exception, match="unknown tool"):
+        svc.dry_run_tool_action(tenant_id="t", user_id="key:u1", assistant_id=r1.assistant_id,
+                                tool_id=["x"], scope="*", request_payload={})
+    grant(svc, r1, "edit_shared", "rec")
+    with pytest.raises(Exception) as ei:
+        svc.request_tool_action(tenant_id="t", user_id="key:u1", assistant_id=r1.assistant_id, tool_id="edit_shared",
+                                scope="rec", run_id=r1.run_id, idempotency_key="k", actor="key:u1",
+                                request_payload={"record": "rec", "field": "f", "value": "v"})
+    appr = svc.store.get_approval(ei.value.approval_id)
+    svc.store.get_action(appr.action_id).status = "denied"                   # e.g. the grant was revoked meanwhile
+    with pytest.raises(Exception, match="request it again"):
+        svc.decide_approval(appr.approval_id, tenant_id="t", user_id="key:u1", decision="approved", actor="boss")
