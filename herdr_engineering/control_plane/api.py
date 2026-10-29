@@ -262,6 +262,7 @@ class ControlPlaneServer:
                  architecture_enabled=None, architecture_explain=None, architecture_options=None,
                  request_workers=128, request_queue=256,
                  assistant_service=None, assistant_config=None, fabric_resolver=None, fabric_services=None, fabric_names=None,
+                 scheduler_admission=False, scheduler_limits=None,
                  unified_workspace_config=None):
         """
         Auth (Spec §104): either a single `api_key` (all-access) or a mapping
@@ -340,7 +341,8 @@ class ControlPlaneServer:
         from .handoffs import HandoffRegistry
         self.handoffs = handoff_registry or HandoffRegistry(repo)
         from .scheduler_service import SchedulerService
-        self.scheduler = SchedulerService(repo)
+        self.scheduler_admission = scheduler_admission is True
+        self.scheduler = SchedulerService(repo, **(scheduler_limits or {}))
         # Herdr Personal Assistant (Rakazo integration, P1/P2). Canonical owner;
         # feature-flag gated (off by default) and inert until enabled.
         if assistant_service is None:
@@ -1429,6 +1431,8 @@ def _make_handler(server, public=False, operator=False):
                 return self._fleet_config_applied()
             if self._path_only() == "/api/v1/intelligence/webhooks/github":
                 return self._intelligence_webhook()
+            if self._path_only() == _FLEET_CONFIG_PATH + "/telemetry":
+                return self._fleet_resource_telemetry()
             # The ingest route is reachable by the ingest role; every other
             # POST requires the operator role (Spec §104).
             path = self.path.split("?")[0]
@@ -1436,7 +1440,7 @@ def _make_handler(server, public=False, operator=False):
             # prefix test is bypassed by e.g. /api/v1/%72eview-gate/...
             segs = path.split("/")
             res = unquote(segs[3]) if len(segs) > 3 and segs[:3] == ["", "api", "v1"] else ""
-            if (res.startswith("reviews") or res == "attention" or res == "architecture"
+            if (res.startswith("reviews") or res in {"attention", "architecture", "scheduler"}
                     or (res in {"ci", "review-gate"} and len(segs) > 4) or _SUMMARY_FIX.match(path)
                     or _TERMINAL_ATTACH.match(path) or _STEER_ACK.match(path) or _is_rereview(path)):
                 origin = self.headers.get("Origin")
@@ -1558,6 +1562,22 @@ def _make_handler(server, public=False, operator=False):
                 return self._deny(401, "unauthorized")
             store.record_applied(host, body["revision"])
             return self._json({"ok": True})
+
+        def _fleet_resource_telemetry(self):
+            if server.fleet_config is None:
+                return self._deny(404, "not found")
+            host = self._fleet_host(server.fleet_config.current())
+            if host is None:
+                return self._deny(401, "unauthorized")
+            try:
+                body = self._read_json()
+                if not isinstance(body, dict):
+                    return self._deny(400, "resource snapshot must be an object")
+                return self._json(server.scheduler.observe_host(host, body))
+            except (TypeError, ValueError):
+                return self._deny(400, "invalid resource observation")
+            except RuntimeError:
+                return self._deny(503, "resource persistence unavailable")
 
         # --------------------------------------------------- collaboration (HCN)
         def _is_collab_path(self):
@@ -2062,9 +2082,9 @@ def _make_handler(server, public=False, operator=False):
                 return self._json({"handoffs": server.handoffs.list(state=_q(self.path, "state"))})
             if resource == "scheduler":
                 if len(parts) == 4:
-                    return self._json({"hosts": server.scheduler.host_cards(), "queued_agents": 0, "running_agents": 0})
+                    return self._json(server.scheduler.overview())
                 if parts[4:] == ["queue"]:
-                    return self._json({"queue": []})
+                    return self._json({"queue": server.scheduler.overview()["queue"]})
                 return self._json({"error": "not found"}, 404)
             if resource == "health":
                 return self._json(server._health())
@@ -2621,6 +2641,11 @@ def _make_handler(server, public=False, operator=False):
             if resource == "scheduler":
                 body = self._read_json() or {}
                 principal = self._resource_principal()
+                admission = (parts[4:] == ["reservations"]
+                             or (len(parts) == 6 and parts[4] == "reservations"
+                                 and parts[5] in {"commit", "claim", "retry"}))
+                if admission and not server.scheduler_admission:
+                    return self._json({"error": "scheduler admission is disabled"}, 503)
                 try:
                     if len(parts) == 5 and parts[4] == "plan":
                         return self._json(server.scheduler.plan(body, principal))
@@ -2628,6 +2653,10 @@ def _make_handler(server, public=False, operator=False):
                         return self._json(server.scheduler.reserve(body, principal), 201)
                     if len(parts) == 6 and parts[4] == "reservations" and parts[5] == "commit":
                         return self._json(server.scheduler.commit(body.get("reservation_id", "")))
+                    if len(parts) == 6 and parts[4] == "reservations" and parts[5] == "claim":
+                        return self._json(server.scheduler.claim_execution(body.get("reservation_id", "")))
+                    if len(parts) == 6 and parts[4] == "reservations" and parts[5] == "retry":
+                        return self._json(server.scheduler.retry_queued(body.get("reservation_id", "")))
                     if len(parts) == 6 and parts[4] == "reservations" and parts[5] in {"release", "cancel"}:
                         state = "cancelled" if parts[5] == "cancel" else "released"
                         return self._json(server.scheduler.release(body.get("reservation_id", ""), state=state))

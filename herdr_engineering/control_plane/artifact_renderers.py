@@ -8,9 +8,8 @@ from dataclasses import dataclass, replace
 
 from .artifact_visual_renderers import (
     _DECK_CSS,
-    parse_flowchart,
     render_chart_svg,
-    render_flowchart_svg,
+    render_mermaid,
     split_slides,
 )
 
@@ -246,7 +245,7 @@ class RendererRegistry:
             validation["findings"] = [{"code": "no_chart_spec",
                                        "detail": "JSON has no 'type'; only data.json was produced"}]
         return RenderResult("visualization", source, outputs, validation,
-                            {"renderer": "builtin-chart-svg", "revision": "1"})
+                            {"renderer": "builtin-chart-svg", "revision": "2"})
 
     @staticmethod
     def _diagram(source: str) -> RenderResult:
@@ -256,12 +255,12 @@ class RendererRegistry:
                + html.escape(source) + "</pre></details>")
         outputs, checks, findings = [], ["mermaid-source"], []
         try:
-            svg = render_flowchart_svg(parse_flowchart(source))
+            svg, check = render_mermaid(source)
             outputs.append({"name": "diagram.svg", "media_type": "image/svg+xml", "content": svg})
             content = "<figure>" + svg + "</figure>" + pre
-            checks.append("flowchart-svg")
+            checks.append(check)
         except ValueError as exc:
-            # Other Mermaid diagram types stay inert source until a sandboxed renderer exists.
+            # Unsupported Mermaid constructs stay inert source until a sandboxed renderer exists.
             content = "<pre data-diagram-format=\"mermaid\">" + html.escape(source) + "</pre>"
             findings.append({"code": "not_rendered", "detail": str(exc)})
         outputs.insert(0, {"name": "diagram.html", "media_type": "text/html", "content": content})
@@ -269,7 +268,7 @@ class RendererRegistry:
         if findings:
             validation["findings"] = findings
         return RenderResult("diagram", source, outputs, validation,
-                            {"renderer": "builtin-flowchart-svg", "revision": "2"})
+                            {"renderer": "builtin-mermaid-svg", "revision": "3"})
 
     @staticmethod
     def _presentation(source: str) -> RenderResult:

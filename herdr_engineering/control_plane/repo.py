@@ -21,6 +21,7 @@ import math
 import re
 import threading
 import time
+from contextlib import contextmanager
 from uuid import uuid4
 
 from ..host_policy import HostPolicy, HostSnapshot, PolicyMode, normalize_aliases
@@ -183,6 +184,9 @@ class ControlPlaneRepo:
         self._leases = {}
         self._scheduler_reservations = {}
         self._scheduler_leases = {}
+        self._scheduler_observations = {}
+        self._pending_scheduler_observations = None
+        self._pending_scheduler_events = None
         self._test_runs = {}
         self._reviews = {}
         self._pull_requests = {}
@@ -390,7 +394,7 @@ class ControlPlaneRepo:
             prev = runs[-1]
             prev["ended_at"] = now
             prev["duration_ms"] = max(0, int(
-                (self._epoch_ms(now) - self._epoch_ms(prev["started_at"]))))
+                self._epoch_ms(now) - self._epoch_ms(prev["started_at"])))
         runs.append({
             "mission_id": mission_key, "stage": new,
             "started_at": now, "ended_at": None, "duration_ms": None,
@@ -977,16 +981,18 @@ class ControlPlaneRepo:
 
     def host_snapshot(self, host_id):
         """Return the scheduler view of one host, or ``None`` when unknown."""
+        from datetime import datetime
         record = self.get_host(host_id)
         if record is None:
             return None
         samples = self.list_telemetry(record.get("host_id"), limit=1)
-        latest = samples[-1] if samples else None
+        observation = self._scheduler_observations.get(record.get("host_id"))
+        latest = observation["sample"] if observation else (samples[-1] if samples else None)
         at = latest.get("at") if latest else record.get("last_seen")
         try:
-            telemetry_at = _dt.datetime.fromisoformat(at) if at else None
+            telemetry_at = datetime.fromisoformat(at) if at else None
             if telemetry_at and telemetry_at.tzinfo is None:
-                telemetry_at = telemetry_at.replace(tzinfo=_dt.UTC)
+                telemetry_at = None
         except (TypeError, ValueError):
             telemetry_at = None
         freshness = latest.get("freshness_seconds") if latest else None
@@ -1011,6 +1017,11 @@ class ControlPlaneRepo:
 
     def set_host_policy(self, host_id, *, mode, expected_revision, allow_tags=(), deny_tags=(), reason=None):
         """Update scheduler policy with optimistic concurrency and an audit event."""
+        with self.scheduler_admission():
+            return self._set_host_policy(host_id, mode=mode, expected_revision=expected_revision,
+                                         allow_tags=allow_tags, deny_tags=deny_tags, reason=reason)
+
+    def _set_host_policy(self, host_id, *, mode, expected_revision, allow_tags, deny_tags, reason):
         host = self._hosts.get(host_id)
         if host is None:
             raise KeyError(host_id)
@@ -1025,8 +1036,8 @@ class ControlPlaneRepo:
             "deny_tags": sorted({str(v).strip().lower() for v in deny_tags if str(v).strip()}),
             "reason": str(reason)[:300] if reason else None,
         }
+        self.record_event("host", host_id, "HostPolicyChanged", next_policy, require_durable=True)
         host["scheduler_policy"] = next_policy
-        self.record_event("host", host_id, "HostPolicyChanged", next_policy)
         return _copy(next_policy)
 
     def fleet_inventory(self):
@@ -2329,15 +2340,111 @@ class ControlPlaneRepo:
         return result
 
     # ------------------------------------------------------- scheduler state
+    def scheduler_execution_ready(self):
+        return callable(getattr(self._sink, "record_required", None))
+
+    @contextmanager
+    def scheduler_admission(self):
+        # Match record_event's event -> sink ordering. Holding the sink lock
+        # while waiting for an event writer would deadlock with that writer.
+        with self._command_lock, self._event_lock:
+            transaction = getattr(self._sink, "scheduler_admission", None)
+            if callable(transaction):
+                pending = []
+                pending_events = []
+                before = None
+                try:
+                    with transaction() as rows:
+                        self._scheduler_reservations = {
+                            row["reservation_id"]: _deep_copy(row) for row in rows}
+                        observations = getattr(self._sink, "scheduler_observations", None)
+                        if callable(observations):
+                            for host_id, observation in observations().items():
+                                self._apply_scheduler_observation(host_id, observation)
+                        leases = getattr(self._sink, "scheduler_leases", None)
+                        if callable(leases):
+                            self._scheduler_leases = _deep_copy(leases())
+                        policies = getattr(self._sink, "scheduler_policies", None)
+                        if callable(policies):
+                            for host_id, policy in policies().items():
+                                if host_id in self._hosts:
+                                    self._hosts[host_id]["scheduler_policy"] = _deep_copy(policy)
+                        before = (_deep_copy(self._scheduler_reservations),
+                                  _deep_copy(self._scheduler_leases),
+                                  {hid: _deep_copy(host.get("scheduler_policy"))
+                                   for hid, host in self._hosts.items()})
+                        self._pending_scheduler_observations = pending
+                        self._pending_scheduler_events = pending_events
+                        try:
+                            yield rows
+                        finally:
+                            self._pending_scheduler_observations = None
+                            self._pending_scheduler_events = None
+                except BaseException:
+                    # An acknowledged INSERT can still be rolled back by COMMIT.
+                    if before is not None:
+                        self._scheduler_reservations, self._scheduler_leases, policies = before
+                        for host_id, policy in policies.items():
+                            if policy is None:
+                                self._hosts[host_id].pop("scheduler_policy", None)
+                            else:
+                                self._hosts[host_id]["scheduler_policy"] = policy
+                    raise
+                for host_id, observation, _ in pending:
+                    self._apply_scheduler_observation(host_id, observation)
+                for event, feed, publish in pending_events:
+                    key = (event["entity_type"], event["entity_id"])
+                    self._events.setdefault(key, []).append(event)
+                    if event["entity_type"] in {"ci_report", "ci_observation", "ci_telemetry"}:
+                        self._ci_sequence = max(self._ci_sequence, event["sequence"] + 1)
+                    if feed:
+                        self._event_order.append((*key, event["sequence"]))
+                for event, _, publish in pending_events:
+                    if publish:
+                        for listener in self._listeners:
+                            try:
+                                listener(_copy(event))
+                            except Exception:
+                                pass
+            else:
+                yield self.list_scheduler_reservations()
+
+    def save_scheduler_observation(self, host_id, observation):
+        record = _deep_copy(observation)
+        event = self.record_event("scheduler_observation", host_id, "SchedulerHostObserved", record,
+                                  require_durable=True, publish=False)
+        if self._pending_scheduler_observations is not None:
+            self._pending_scheduler_observations.append((host_id, record, event))
+        else:
+            self._apply_scheduler_observation(host_id, record)
+
+    def scheduler_observation(self, host_id):
+        return _deep_copy(self._scheduler_observations.get(host_id))
+
+    def _apply_scheduler_observation(self, host_id, observation):
+        previous = self._scheduler_observations.get(host_id)
+        if previous and previous["sample"]["sequence"] >= observation["sample"]["sequence"]:
+            return
+        self._scheduler_observations[host_id] = _deep_copy(observation)
+        host = self._hosts.setdefault(host_id, {"host_id": host_id, "tailnet_ip": None})
+        policy = host.get("scheduler_policy")
+        host.update(_deep_copy(observation["host"]))
+        host["scheduler_policy"] = _clean_scheduler_policy(host.get("scheduler_policy"))
+        # Resource reports cannot undo an operator's newer policy revision.
+        if policy and policy.get("revision", 0) >= host["scheduler_policy"].get("revision", 0):
+            host["scheduler_policy"] = policy
+        sample = _deep_copy(observation["sample"])
+        self.record_telemetry(host_id, sample)
+
     def save_scheduler_reservation(self, reservation: dict):
         """Persist scheduler reservation/lease state through the existing event sink."""
         reservation_id = str(reservation.get("reservation_id") or "")
         if not reservation_id:
             raise ValueError("reservation_id is required")
         record = _deep_copy(reservation)
-        self._scheduler_reservations[reservation_id] = record
         self.record_event("scheduler_reservation", reservation_id,
-                          "SchedulerReservationChanged", record)
+                          "SchedulerReservationChanged", record, require_durable=True)
+        self._scheduler_reservations[reservation_id] = record
         return _deep_copy(record)
 
     def list_scheduler_reservations(self):
@@ -2348,8 +2455,9 @@ class ControlPlaneRepo:
         if not lease_id:
             raise ValueError("lease_id is required")
         record = _deep_copy(lease)
+        self.record_event("scheduler_lease", lease_id, "SchedulerLeaseChanged", record,
+                          require_durable=True)
         self._scheduler_leases[lease_id] = record
-        self.record_event("scheduler_lease", lease_id, "SchedulerLeaseChanged", record)
         return _deep_copy(record)
 
     def list_scheduler_leases(self):
@@ -2362,12 +2470,16 @@ class ControlPlaneRepo:
         """Record one event. ``envelope`` (a normalised v2 envelope) makes it the
         canonical envelope row: emitter event_id, server-set actor/received_at,
         durable before return. ``feed=False`` keeps it out of the global feed."""
-        if self._suppress_record_events:
+        if self._suppress_record_events and not require_durable and envelope is None:
             return
         with self._event_lock:
             key = (entity_type, entity_id)
-            stream = self._events.setdefault(key, [])
+            stream = (self._events.setdefault(key, []) if self._pending_scheduler_events is None
+                      else self._events.get(key, []))
             seq = max((e.get("sequence", -1) for e in stream), default=-1) + 1
+            if self._pending_scheduler_events is not None:
+                seq = max(seq, max((e["sequence"] + 1 for e, _, _ in self._pending_scheduler_events
+                                   if (e["entity_type"], e["entity_id"]) == key), default=seq))
             if entity_type in {"ci_report", "ci_observation", "ci_telemetry"}:
                 seq = max(seq, self._ci_sequence)
             ev = {
@@ -2410,6 +2522,14 @@ class ControlPlaneRepo:
                     if entity_type in {"ci_report", "ci_observation", "ci_telemetry"} and not stream:
                         self._events.pop(key, None)
                     raise
+            if self._pending_scheduler_events is not None:
+                if self._sink is not None and not require_durable:
+                    try:
+                        self._sink.record(ev)
+                    except Exception:
+                        pass
+                self._pending_scheduler_events.append((ev, feed, publish))
+                return _copy(ev)
             if entity_type in {"ci_report", "ci_observation", "ci_telemetry"}:
                 self._ci_sequence = seq + 1
             stream.append(ev)
@@ -3001,18 +3121,34 @@ class ControlPlaneRepo:
     # --------------------------------------------------- backup / restore
     def export_state(self):
         """Serialize the full structured state for backup/restore (Spec §102)."""
+        # Do not hold the event lock while exporting the source ledger/graph:
+        # ingestion takes those locks before writing events. Capture only the
+        # scheduler projections here, after any in-flight admission commits.
+        with self._event_lock:
+            if self._pending_scheduler_events is not None:
+                raise RuntimeError("backup requires completed scheduler admission")
+            scheduler_state = {
+                "hosts": _deep_copy(self._hosts),
+                "reservations": _deep_copy(self._scheduler_reservations),
+                "leases": _deep_copy(self._scheduler_leases),
+                "observations": _deep_copy(self._scheduler_observations),
+                "events": {f"{t}|{i}": [dict(event) for event in stream]
+                           for (t, i), stream in self._events.items()},
+                "event_order": list(self._event_order),
+            }
         return {
             "version": 1,
             "missions": _copy(self._missions),
             "sessions": _copy(self._sessions),
             "services": _copy(self._services),
-            "hosts": _copy(self._hosts),
+            "hosts": scheduler_state["hosts"],
             "artifacts": _copy(self._artifacts),
             "blobs": {k: __import__("base64").b64encode(v).decode()
                       for k, v in self._blobs.items()},
             "leases": _copy(self._leases),
-            "scheduler_reservations": _deep_copy(self._scheduler_reservations),
-            "scheduler_leases": _deep_copy(self._scheduler_leases),
+            "scheduler_reservations": scheduler_state["reservations"],
+            "scheduler_leases": scheduler_state["leases"],
+            "scheduler_observations": scheduler_state["observations"],
             "telemetry": {k: [dict(s) for s in v]
                           for k, v in self._telemetry.items()},
             "delivery": {
@@ -3024,9 +3160,8 @@ class ControlPlaneRepo:
                                     for k, v in self._resource_usage.items()},
                 "stage_runs": _copy(self._stage_runs),
             },
-            "events": {f"{t}|{i}": [dict(e) for e in s]
-                       for (t, i), s in self._events.items()},
-            "event_order": list(self._event_order),
+            "events": scheduler_state["events"],
+            "event_order": scheduler_state["event_order"],
             "ci_sequence": self._ci_sequence,
             "ci_history_truncated": sorted(self._ci_history_truncated),
             "agent_projections": copy.deepcopy(list(self._agent_records.values())),
@@ -3037,7 +3172,10 @@ class ControlPlaneRepo:
         self._missions = dict(state.get("missions", {}))
         self._sessions = dict(state.get("sessions", {}))
         self._services = dict(state.get("services", {}))
-        self._hosts = dict(state.get("hosts", {}))
+        self._hosts = _deep_copy(state.get("hosts", {}))
+        for host in self._hosts.values():
+            if host.get("scheduler_policy"):
+                host["scheduler_policy"] = _clean_scheduler_policy(host["scheduler_policy"])
         self._artifacts = dict(state.get("artifacts", {}))
         self._blobs = {k: __import__("base64").b64decode(v)
                        for k, v in state.get("blobs", {}).items()}
@@ -3062,7 +3200,18 @@ class ControlPlaneRepo:
         self._event_order = [tuple(x) for x in state.get("event_order", [])]
         # Scheduler reservations are event-sourced, so a restart can recover
         # even when the structured export contains only the event streams.
+        self._scheduler_observations = {}
+        for host_id, observation in state.get("scheduler_observations", {}).items():
+            self._apply_scheduler_observation(host_id, observation)
         for (etype, entity_id), stream in self._events.items():
+            if etype == "scheduler_observation":
+                for event in stream:
+                    self._apply_scheduler_observation(entity_id, _payload(event))
+        for (etype, entity_id), stream in self._events.items():
+            if etype == "scheduler_reservation" and "scheduler_reservations" in state:
+                continue
+            if etype == "scheduler_lease" and "scheduler_leases" in state:
+                continue
             if etype != "scheduler_reservation":
                 if etype != "scheduler_lease":
                     continue
@@ -3150,6 +3299,20 @@ class ControlPlaneRepo:
             host = self._hosts.get(hid)
             if host is not None:
                 host.update({k: v for k, v in rec.items() if v is not None})
+
+        # Policies are authoritative independently of stream iteration order.
+        for (etype, entity_id), stream in self._events.items():
+            if etype != "host":
+                continue
+            for event in stream:
+                if event.get("event_type") != "HostPolicyChanged":
+                    continue
+                policy = _payload(event)
+                if "_envelope" in policy:
+                    continue
+                host = self._hosts.setdefault(entity_id, {"host_id": entity_id, "host_name": entity_id})
+                if policy.get("revision", -1) >= (host.get("scheduler_policy") or {}).get("revision", -1):
+                    host["scheduler_policy"] = _deep_copy(policy)
 
     def _rebuild_graph(self):
         """Replay stored ``lineage`` envelope rows into a fresh projection.
@@ -3356,6 +3519,13 @@ def _native_id_matches(agent_session, value):
         return name == f"{value}.jsonl" or (bool(_UUID.fullmatch(value)) and name.endswith(
             (f"_{value}.jsonl", f"-{value}.jsonl")))
     return False
+
+
+def _clean_scheduler_policy(policy):
+    if isinstance(policy, dict) and "_envelope" in policy:
+        return {"mode": "disabled", "revision": 0,
+                "reason": "historical client policy requires operator reconciliation"}
+    return _deep_copy(policy)
 
 
 def _payload(ev):
