@@ -1726,7 +1726,7 @@ def test_dry_run_reports_the_pipelines_mount_and_creates_nothing(env):
     _log_compose_env(env)
     r = deploy(env, "--dry-run")
     assert r.returncode == 0, r.stderr
-    assert "/etc/herdr/pipelines" in r.stdout and "would create it empty, 0755" in r.stdout
+    assert "/etc/herdr/pipelines" in r.stdout and "a real deploy creates it empty, 0755" in r.stdout
     assert not _pipes_dir(env).exists()
     assert not (env["home"] / ".config/systemd/user/herdr-pipelines-sync.timer").exists()
     assert f"pipelinesdir={_pipes_dir(env)}" in env["log"].read_text()     # compose config -q sees it
@@ -1768,7 +1768,7 @@ def test_a_valid_pipelines_dir_is_accepted(env):
     (d / "hive-gateway.yaml").chmod(0o644)
     r = deploy(env, "--dry-run")
     assert r.returncode == 0, r.stderr
-    assert "would create it empty, 0755" not in r.stdout
+    assert "a real deploy creates it empty, 0755" not in r.stdout
 
 
 @pytest.mark.parametrize("fault,needle", [

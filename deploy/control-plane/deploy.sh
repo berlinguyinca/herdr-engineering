@@ -340,7 +340,7 @@ if [ "$DRY" = 1 ]; then
   echo "[dry-run] would run: herdr-eng fleet config render-compose --path <central> --out <file>"
   echo "[dry-run] control-plane-web and worker mount $FLEET_DIR read-only; the file is $MOUNT_TARGET"
   echo "[dry-run] control-plane-web mounts $GITHUB_APP_DIR read-only at /etc/herdr/github-app$([ -d "$GITHUB_APP_DIR" ] || echo ' (would create it empty, 0700)')"
-  echo "[dry-run] control-plane-web mounts $PIPELINES_DIR read-only at /etc/herdr/pipelines$([ -d "$PIPELINES_DIR" ] || echo ' (would create it empty, 0755)'); after the build would install the herdr-pipelines-sync timer"
+  echo "[dry-run] control-plane-web mounts $PIPELINES_DIR read-only at /etc/herdr/pipelines$([ -d "$PIPELINES_DIR" ] || echo ' (missing: a real deploy creates it empty, 0755)'); after the build would install the herdr-pipelines-sync timer"
   echo "[dry-run] llm-proxy mounts only the llm slice (rendered to a temp dir; would install it at ~/.config/herdr-engineering/llm-proxy/)"
   if [ "$COLLAB" = 1 ]; then
     echo "[dry-run] rendered control_plane.collab to a temp slice; after the build would install it at ~/.config/herdr-engineering/collab/, the edge nginx.conf, and the collab-sync timer"
