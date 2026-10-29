@@ -48,10 +48,16 @@ function inspector(item, kindLabel, urls) {
   const seen = [href ? { href, label: 'Open' } : null, ...records(item.actions).filter((a) => safeHref(a.href) && safeHref(a.href) !== href)
     .map((a) => ({ href: safeHref(a.href), label: a.label || 'Open' }))].filter(Boolean);
   const links = seen.map((l) => `<a class="at-action" href="${esc(l.href)}">${esc(l.label)}</a>`).join('');
+  const handoffs = records(item.handoffs).length ? `<ul class="at-handoffs" aria-label="Handoffs">${records(item.handoffs).map((h) => {
+    const who = esc(text(h.agent) || 'another agent');
+    const link = safeHref(h.href) ? `<a href="${esc(safeHref(h.href))}">${who}</a>` : who;
+    return `<li data-handoff-direction="${esc(text(h.direction))}">${h.direction === 'out' ? 'Handed off to' : 'Received from'} ${link}${text(h.goal) ? `: ${esc(h.goal)}` : ''} <span class="at-count">(${esc(text(h.state) || 'unknown')})</span></li>`;
+  }).join('')}</ul>` : '';
   const field = (name, value) => `<div><dt>${name}</dt><dd>${value}</dd></div>`;
   return `<div class="at-inspect" data-attention-inspector="${esc(item.key)}">
     ${text(item.detail).length > 60 || /[\n]|:\/\//.test(text(item.detail)) ? `<p>${linkifyFabricText(item.detail, urls)}</p>` : ''}
     <dl>${field('Kind', esc(kindLabel))}${field('Source', esc(text(item.source) || 'not reported'))}${field('First seen', esc(when(item.first_seen)))}${field('Last seen', esc(when(item.last_seen)))}${Number.isFinite(item.count) && item.count > 1 ? field('Occurrences', String(item.count)) : ''}${field('State', esc(text(item.state) || 'open'))}</dl>
+    ${handoffs}
     ${links ? `<p class="at-links">${links}</p>` : ''}</div>`;
 }
 
@@ -144,7 +150,7 @@ const STYLES = `<style>
 .at-toggle:hover strong{color:var(--accent)}
 .at-inspect{flex:1 1 100%;margin:0 0 8px;padding:12px 0 8px 20px;border-top:1px solid var(--border-subtle);font-size:13px;animation:at-open .15s ease}
 .at-inspect p{margin:0 0 12px;overflow-wrap:anywhere}.at-inspect dl{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:8px 24px;margin:0 0 12px}
-.at-inspect dt{font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:var(--text-muted)}.at-inspect dd{margin:0;color:var(--text-secondary)}.at-links{display:flex;gap:16px}
+.at-inspect dt{font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:var(--text-muted)}.at-inspect dd{margin:0;color:var(--text-secondary)}.at-links{display:flex;gap:16px}.at-handoffs{list-style:none;margin:0 0 12px;padding:0;display:grid;gap:4px}
 @keyframes at-open{from{opacity:0;transform:translateY(-4px)}to{opacity:1;transform:none}}@media (prefers-reduced-motion:reduce){.at-inspect{animation:none}.at-row,.at-chev{transition:none}}.at-main strong{font-weight:600}
 .at-kindlabel{color:var(--text-muted);font-size:12px}
 .at-detail{flex:1 1 100%;min-width:0;color:var(--text-secondary);font-size:13px;line-height:1.4;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}

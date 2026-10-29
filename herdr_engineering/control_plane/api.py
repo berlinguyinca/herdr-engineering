@@ -302,7 +302,8 @@ class ControlPlaneServer:
         self.attention = None
         if self.attention_config["enabled"] and not collab_only:
             self.attention = AttentionInbox(repo, config=self.attention_config, health=self._health,
-                                            ci_snapshot=self.ci_monitor.snapshot, ci_fix=self.ci_fix)
+                                            ci_snapshot=self.ci_monitor.snapshot, ci_fix=self.ci_fix,
+                                            handoffs=lambda: getattr(self, "handoffs", None))
         if github_monitor is None:
             # control-plane-web only (the worker never builds a server): the GitHub
             # catalog persists in control_plane.pg_dsn when set, else in memory.

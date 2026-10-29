@@ -142,3 +142,14 @@ test('a fold carries a stable id so it can stay open across refreshes, and chips
   assert.match(html, /<details data-fold="critical\|ci_failed">/);
   assert.match(html, /data-filter="severity" data-value="critical"/);
 });
+
+test('the inspector says which handoff gave an agent its task, escaped, and omits the list when none is recorded', () => {
+  const agent = item({ key: 'session:a', handoffs: [{ direction: 'in', state: 'accepted', goal: '<b>Fix</b> it', agent: 'planner', href: '#/herd/session/p' },
+    { direction: 'out', state: 'queued', goal: '', agent: 'x', href: 'javascript:alert(1)' }] });
+  const html = renderAttention({ body: body([agent]), expanded: new Set(['session:a']) }, now);
+  assert.match(html, /Received from <a href="#\/herd\/session\/p">planner<\/a>: &lt;b&gt;Fix&lt;\/b&gt; it/);
+  assert.match(html, /Handed off to x/);
+  assert.doesNotMatch(html, /javascript:|<b>Fix/);
+  const none = renderAttention({ body: body([item({ key: 'session:a', handoffs: [] })]), expanded: new Set(['session:a']) }, now);
+  assert.doesNotMatch(none, /<ul class="at-handoffs"/);
+});
