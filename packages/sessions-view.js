@@ -86,11 +86,11 @@ export function compactSessionRow(entry,now=Date.now(),urls=null) {
 
 const styles=`<style>
 .ss-intro{max-width:85ch;line-height:1.6;color:var(--text-secondary)}
-.ss-tabs{display:flex;flex-wrap:wrap;gap:6px;margin:12px 0}.ss-tabs button{font:inherit;padding:8px 13px;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);color:var(--text);cursor:pointer}.ss-tabs button[aria-selected=true]{border-color:var(--accent);box-shadow:inset 0 -2px var(--accent)}.ss-tabs strong{margin-left:6px}
+.ss-tabs{margin:12px 0}.ss-tabs strong{margin-left:2px}
 .ss-controls{display:flex;flex-wrap:wrap;gap:10px;margin:10px 0}.ss-controls label{display:flex;flex-direction:column;gap:4px;font-size:12px}.ss-controls .ss-search{flex:1;min-width:180px}.ss-controls input,.ss-controls select{padding:7px 9px;border:1px solid var(--border);border-radius:var(--radius-sm);font:inherit;color:var(--text);background:var(--surface);max-width:100%}
 .ss-group{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);margin:8px 0;overflow:hidden}.ss-group h2{font-size:13px;margin:0;padding:9px 12px;overflow-wrap:anywhere}.ss-row{display:grid;grid-template-columns:minmax(0,1fr) minmax(190px,290px);gap:14px;padding:9px 12px;border-top:1px solid var(--border-subtle);overflow-wrap:anywhere}.ss-main{min-width:0}.ss-title{font-size:13px;font-weight:600;line-height:1.4}.ss-summary{font-size:12px;line-height:1.4;margin:3px 0;display:-webkit-box;-webkit-line-clamp:1;-webkit-box-orient:vertical;overflow:hidden}.ss-meta{font-size:12px;color:var(--text-secondary);line-height:1.4;margin:3px 0}.ss-id{display:none}.ss-state{display:flex;flex-direction:column;gap:3px;font-size:12px;line-height:1.4}.ss-state strong{font-weight:500}.ss-pages{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin:12px 0;font-size:13px}.ss-empty{padding:18px;color:var(--text-secondary)}
 @media(min-width:2200px){section[id^=ss-panel-]:not([hidden]){display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;align-items:start}.ss-group{margin:0}}
-@media(max-width:650px){.ss-row{grid-template-columns:minmax(0,1fr);gap:8px;padding:12px}.ss-id{display:block}.ss-controls label{min-width:130px;flex:1}.ss-tabs button{padding:9px 12px}}
+@media(max-width:650px){.ss-row{grid-template-columns:minmax(0,1fr);gap:8px;padding:12px}.ss-id{display:block}.ss-controls label{min-width:130px;flex:1}}
 </style>`;
 
 export function mountSessionsView(container,client,{tab='current'}={}) {
@@ -104,7 +104,7 @@ export function mountSessionsView(container,client,{tab='current'}={}) {
   container.innerHTML=`${styles}<div class="hd-live-head"><h1>Agents</h1><herdr-freshness interval="5000"></herdr-freshness></div>
     <p class="ss-intro">Agents reporting in the last 15 minutes. Older reports move to Unconfirmed; Failed and Finished keep earlier work.</p>
     <div id="ss-lineage"></div>
-    <div class="ss-tabs" role="tablist" aria-label="Agent outcome">${tabs.map(([key,label])=>`<button type="button" role="tab" id="ss-tab-${key}" data-tab="${key}" aria-controls="ss-panel-${key}" aria-selected="${state.tab===key}" tabindex="${state.tab===key?0:-1}">${label} <strong data-count="${key}">…</strong></button>`).join('')}</div>
+    <div class="ss-tabs hd-tabs" role="tablist" aria-label="Agent outcome">${tabs.map(([key,label])=>`<button type="button" role="tab" id="ss-tab-${key}" data-tab="${key}" aria-controls="ss-panel-${key}" aria-selected="${state.tab===key}" tabindex="${state.tab===key?0:-1}">${label} <strong data-count="${key}">…</strong></button>`).join('')}</div>
     <div class="ss-controls"><label class="ss-search">Search agents<input id="ss-search" type="search" placeholder="Project, activity, agent, model or ID"></label>
       <label>Host<select id="ss-host"><option value="">All hosts</option></select></label>
       <label>Group by<select id="ss-group"><option value="project">Project folder</option><option value="none">Recent reports</option></select></label></div>

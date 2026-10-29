@@ -68,10 +68,10 @@ function row(item, now, { busy = false, urls = null, showKind = false, expanded 
   const count = Number.isFinite(item.count) && item.count > 1 ? ` <span class="at-count">×${item.count}</span>` : '';
   const key = `data-key="${esc(item.key)}" data-fingerprint="${esc(item.fingerprint)}"`;
   const controls = item.state === 'open'
-    ? `<button type="button" class="at-btn at-icon" data-ack ${key} aria-label="Acknowledge ${esc(item.title)}" title="Acknowledge: keep it listed, stop counting it" ${busy ? 'disabled' : ''}>${ICON_CHECK}</button>
+    ? `<button type="button" class="hd-btn hd-btn--quiet hd-btn--icon at-btn at-icon" data-ack ${key} aria-label="Acknowledge ${esc(item.title)}" title="Acknowledge: keep it listed, stop counting it" ${busy ? 'disabled' : ''}>${ICON_CHECK}</button>
        <label class="at-snooze" title="Snooze: hide it for a while"><span class="at-sr">Snooze ${esc(item.title)}</span><select data-snooze ${key} ${busy ? 'disabled' : ''}>
          <option value="">Snooze</option>${SNOOZE_CHOICES.map(([s, label]) => `<option value="${s}">${label}</option>`).join('')}</select></label>`
-    : `<button type="button" class="at-btn" data-clear ${key} ${busy ? 'disabled' : ''}>${item.state === 'snoozed' ? 'Wake now' : 'Reopen'}</button>`;
+    : `<button type="button" class="hd-btn hd-btn--quiet at-btn" data-clear ${key} ${busy ? 'disabled' : ''}>${item.state === 'snoozed' ? 'Wake now' : 'Reopen'}</button>`;
   const until = item.state === 'snoozed' && item.snoozed_until ? ` · until ${esc(new Date(item.snoozed_until).toLocaleString())}` : '';
   const detail = text(item.detail) ? `<span class="at-detail">${esc(item.detail)}</span>` : '';
   return `<li class="at-row at-${sev}" data-attention-row="${esc(item.key)}" data-expanded="${expanded}">
@@ -113,7 +113,7 @@ function groupedOpen(open, renderRow) {
       const body = items.length > SHOWN_PER_GROUP
         ? `<li class="at-fold"><details data-fold="${esc(`${items[0].severity}|${items[0].kind}`)}"><summary><strong>${items.length} × ${esc(label1)}</strong><span class="at-detail">${esc(names)} and ${items.length - SHOWN_PER_GROUP} more</span><span class="at-showall">Show all ${items.length}</span></summary><ul class="at-list">${items.map((i) => renderRow(i)).join('')}</ul></details></li>`
         : items.map((i) => renderRow(i)).join('');
-      return `<section class="at-kind at-kind-${sev}" aria-label="${label}"><h2 class="at-kind-title">${label} <span class="at-count">${items.length}</span>${items.length > 1 ? ` <button type="button" class="at-btn at-ack-all" data-ack-all="${esc(JSON.stringify(items.map((i) => [i.key, i.fingerprint])))}">Acknowledge all ${items.length}</button>` : ''}</h2><ul class="at-list">${body}</ul></section>`;
+      return `<section class="at-kind at-kind-${sev}" aria-label="${label}"><h2 class="at-kind-title">${label} <span class="at-count">${items.length}</span>${items.length > 1 ? ` <button type="button" class="hd-btn hd-btn--quiet hd-btn--sm at-btn at-ack-all" data-ack-all="${esc(JSON.stringify(items.map((i) => [i.key, i.fingerprint])))}">Acknowledge all ${items.length}</button>` : ''}</h2><ul class="at-list">${body}</ul></section>`;
     });
   return `<div aria-label="Open attention items">${sections.join('')}</div>`;
 }
@@ -128,8 +128,8 @@ export function notifyLine(notify) {
   const line = {
     unsupported: 'Browser notifications are not supported in this browser.',
     blocked: 'Browser notifications are blocked. Allow them in this site\'s settings to hear about new critical items.',
-    off: `Browser notifications are off. <button type="button" class="at-btn" data-notify-toggle="on">Enable notifications</button>`,
-    on: `Browser notifications are on for ${what}${quiet}. <button type="button" class="at-btn" data-notify-toggle="off">Turn off</button>`,
+    off: `Browser notifications are off. <button type="button" class="hd-btn hd-btn--quiet at-btn" data-notify-toggle="on">Enable notifications</button>`,
+    on: `Browser notifications are on for ${what}${quiet}. <button type="button" class="hd-btn hd-btn--quiet at-btn" data-notify-toggle="off">Turn off</button>`,
   }[notify.status];
   return line ? `<p class="at-status" data-notify-status="${esc(notify.status)}">${line}</p>` : '';
 }
@@ -137,7 +137,7 @@ export function notifyLine(notify) {
 const STYLES = `<style>
 .at-summary{display:flex;flex-wrap:wrap;gap:8px 16px;align-items:center;margin:16px 0 24px;font-size:14px}.at-summary select{font:inherit;min-width:0}
 .at-partial{background:var(--surface);border:1px solid var(--status-attention);border-radius:var(--radius);padding:4px 12px;font-size:13px}
-.at-chip{font:inherit;font-size:13px;padding:2px 12px;min-height:28px;border:1px solid var(--border);border-radius:999px;background:var(--surface);color:var(--text-secondary);cursor:pointer}
+.at-chip{font:inherit;font-size:13px;font-weight:500;padding:0 12px;min-height:var(--control-h-sm);border:1px solid var(--border);border-radius:var(--control-radius);background:var(--surface);color:var(--text-secondary);cursor:pointer}
 .at-chip[aria-pressed=true]{border-color:var(--accent);color:var(--text)}.at-chip-critical{border-left:3px solid var(--status-failed)}.at-chip-warning{border-left:3px solid var(--status-attention)}
 .at-bell{display:inline-flex;color:var(--text-muted);cursor:help}.at-warn{color:var(--status-attention)}
 .at-fold>details>summary{display:flex;flex-wrap:wrap;align-items:baseline;gap:4px 12px;cursor:pointer;padding:12px 16px;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);font-size:14px}.at-fold>details[open]>summary{margin-bottom:8px}
@@ -158,14 +158,13 @@ const STYLES = `<style>
 .at-meta{color:var(--text-muted);font-size:12px;white-space:nowrap;margin-right:4px}.at-count{color:var(--text-secondary);font-size:12px}
 .at-sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
 .at-actions{display:flex;gap:12px;align-items:center;font-size:13px;flex:0 0 auto}.at-snooze{display:inline-flex;align-items:center}.at-snooze select{font:inherit;font-size:13px;min-height:32px;max-width:104px;background:transparent;color:var(--text-secondary);border:1px solid transparent;border-radius:var(--radius);cursor:pointer}.at-snooze select:hover{border-color:var(--border);color:var(--text)}
-.at-btn{font:inherit;padding:4px 12px;cursor:pointer;min-height:32px;background:transparent;border:1px solid transparent;border-radius:var(--radius);color:var(--text-secondary)}.at-btn:hover:not(:disabled){background:var(--surface-hover);border-color:var(--border);color:var(--text)}.at-icon{display:inline-flex;align-items:center;justify-content:center;width:32px;padding:0}
 .at-kind{margin:32px 0}.at-kind-title{font-size:.8125rem;text-transform:uppercase;letter-spacing:.05em;color:var(--text-secondary);margin:0 0 8px;font-weight:600}
-.at-ack-all{margin-left:8px;font-size:.75rem;text-transform:none;letter-spacing:0;padding:2px 8px;min-height:24px}
+.at-ack-all{margin-left:8px;text-transform:none;letter-spacing:0}
 .at-more>details>summary{cursor:pointer;padding:4px 12px;color:var(--accent);font-size:.875rem}.at-more>details[open]>summary{margin-bottom:8px}
 .at-group{margin:24px 0 16px}.at-group>summary{cursor:pointer;font-weight:600;padding:4px 0}
 .at-status{font-size:13px;color:var(--text-secondary);margin:8px 0}
 .at-group[data-state=acknowledged] .at-row{opacity:.78}
-@media (max-width:600px){.at-row{flex-wrap:wrap}.at-detail{white-space:normal}.at-actions{width:100%;flex-wrap:wrap}.at-btn,.at-snooze select,.at-chip{min-height:44px}.at-icon{width:44px}}
+@media (max-width:900px){.at-row{flex-wrap:wrap}.at-detail{white-space:normal}.at-actions{width:100%;flex-wrap:wrap}.at-snooze select,.at-chip{min-height:44px}}
 </style>`;
 
 /**
@@ -209,7 +208,7 @@ export function renderAttention(model = {}, now = Date.now()) {
   else if (partial) list = '<p class="at-status">Nothing is known to be open, but some sources could not be read.</p>';
   else list = '<p class="at-status">No attention items. Every source was read.</p>';
   const resolved = records(body.resolved);
-  return `${STYLES}${head}${summary}${message ? `<p class="at-status" role="status">${esc(message)}${model.undo ? ' <button type="button" class="at-btn" data-undo>Undo</button>' : ''}</p>` : ''}${blocked ? '' : notifyLine(model.notify)}${stale}${list}${trunc}
+  return `${STYLES}${head}${summary}${message ? `<p class="at-status" role="status">${esc(message)}${model.undo ? ' <button type="button" class="hd-btn hd-btn--quiet at-btn" data-undo>Undo</button>' : ''}</p>` : ''}${blocked ? '' : notifyLine(model.notify)}${stale}${list}${trunc}
     <div data-state="acknowledged">${group('Acknowledged', acknowledged, (i) => row(i, now, rowOpts(i)))}</div>
     ${group('Snoozed', snoozed, (i) => row(i, now, rowOpts(i)))}
     ${group('Recently resolved', resolved, (i) => resolvedRow(i, now))}`;

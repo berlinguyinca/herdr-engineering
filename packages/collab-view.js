@@ -638,7 +638,7 @@ export function mountCollab(root, { fabricSessions = null, onFreshness = () => {
     if (!tabs.some(([k]) => k === sub)) sub = 'chat';
 
     frame('/rooms', `<div class="cx-roomhead"><h1>${esc(info.name)}</h1>${pill(roleLabel(info.role), 'var(--accent)')}</div>
-      <div class="cx-stabs" role="tablist" aria-label="${esc(info.name)}">${tabs.map(([k, l]) => `<button type="button" class="cx-stab${MAJOR_SUBS.includes(k) ? '' : ' cx-stab--minor'}" title="${esc(SUB_USE[k] || '')}" role="tab" id="hcn-st-${k}" aria-controls="hcn-p-${k}" data-sub="${k}" data-label="${l}" aria-label="${l}" aria-selected="${k === sub}">${l}<span class="cx-badge" id="hcn-b-${k}" aria-hidden="true" hidden></span></button>`).join('')}</div>
+      <div class="cx-stabs hd-tabs" role="tablist" aria-label="${esc(info.name)}">${tabs.map(([k, l]) => `<button type="button" class="cx-stab${MAJOR_SUBS.includes(k) ? '' : ' cx-stab--minor'}" title="${esc(SUB_USE[k] || '')}" role="tab" id="hcn-st-${k}" aria-controls="hcn-p-${k}" data-sub="${k}" data-label="${l}" aria-label="${l}" aria-selected="${k === sub}">${l}<span class="cx-badge" id="hcn-b-${k}" aria-hidden="true" hidden></span></button>`).join('')}</div>
       <section class="hd-card cx-chat cx-panel" id="hcn-p-chat" aria-label="Conversation">
         <div id="hcn-log" class="cx-log" role="log" aria-live="polite"><div class="hd-empty" id="hcn-empty">No messages yet.</div></div>
         <button type="button" id="hcn-jump" class="hd-btn hd-btn--sm cx-jump" hidden>↓ New messages</button>

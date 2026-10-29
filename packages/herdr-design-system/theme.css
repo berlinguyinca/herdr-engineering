@@ -59,6 +59,10 @@
   /* layout / elevation */
   --radius: 8px;
   --radius-sm: 4px;
+  /* Controls (buttons, tabs, chips): one height scale and one radius everywhere. */
+  --control-h: 32px;
+  --control-h-sm: 28px;
+  --control-radius: var(--radius-sm);
   --shadow: 0 1px 2px rgba(16, 24, 40, 0.05);
   --shadow-lg: 0 8px 24px rgba(16, 24, 40, 0.1);
   --sidebar-width: 232px;
