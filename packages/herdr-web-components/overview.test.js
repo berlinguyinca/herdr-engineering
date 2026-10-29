@@ -133,10 +133,10 @@ test('attention uses recency within severity and actionability and retains faile
 
 test('overview preferences discard unknown and fixed cards and restore omitted cards safely', () => {
   assert.deepEqual(overview.sanitizeOverviewPreferences({order:['ci','ci','attention','bogus','health'],hidden:['ci','attention','health','bogus']}),{
-    order:['ci','missions','fleet','sessions','reviews','services','hosts','activity'],hidden:['ci'],
+    order:['ci','sessions','missions','fleet','reviews','services','hosts','activity'],hidden:['ci'],
   });
   for(const value of [null,42,'bad',[],{order:'ci',hidden:{ci:true}}]) {
-    assert.deepEqual(overview.sanitizeOverviewPreferences(value),{order:['missions','fleet','sessions','ci','reviews','services','hosts','activity'],hidden:[]});
+    assert.deepEqual(overview.sanitizeOverviewPreferences(value),{order:['sessions','missions','fleet','ci','reviews','services','hosts','activity'],hidden:[]});
   }
 });
 
@@ -181,16 +181,16 @@ test('CI attention destinations retain provider identity when repository IDs and
   for(const url of destinations)assert.equal(url.searchParams.get('repository'),'7');
 });
 
-test('large attention queues show only the six highest ranked items until expanded',()=>{
+test('large attention queues show only the three highest ranked items until expanded',()=>{
   const missions=Array.from({length:196},(_,index)=>({mission_id:`failure-${index}`,title:`Failure ${index}`,status:'failed',updated_at:new Date(now-index*1000).toISOString()}));
   const data={missions};
   const collapsed=renderOverviewSection('attention',data,{},now,now);
   assert.equal(overview.overviewAttention(data,{},now,now).items.length,196);
-  assert.equal((collapsed.match(/data-attention-key=/g)||[]).length,6);
-  assert.match(collapsed,/Showing 6 of 196 observed items/);
+  assert.equal((collapsed.match(/data-attention-key=/g)||[]).length,3);
+  assert.match(collapsed,/Showing 3 of 196 observed items/);
   assert.match(collapsed,/aria-expanded="false" aria-controls="ov-attention-items"/);
   assert.match(collapsed,/#\/missions\/failure-0/);
-  assert.doesNotMatch(collapsed,/#\/missions\/failure-6/);
+  assert.doesNotMatch(collapsed,/#\/missions\/failure-3/);
   assert.match(collapsed,/Partial coverage/);
   const expanded=renderOverviewSection('attention',{...data,attentionExpanded:true},{},now,now);
   assert.equal((expanded.match(/data-attention-key=/g)||[]).length,196);

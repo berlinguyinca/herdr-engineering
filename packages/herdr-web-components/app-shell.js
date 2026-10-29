@@ -121,9 +121,7 @@ export class HerdrAppShell extends HTMLElement {
           <div class="hd-shell__brand"><span>${escapeHtml(brand)}</span><button class="hd-shell__menu" type="button" aria-expanded="false" aria-controls="primary-navigation">Menu</button></div>
           <nav class="hd-shell__nav" id="primary-navigation" data-open="false" aria-label="Primary">${links}</nav>
           <div class="hd-shell__display">
-            <label class="hd-shell__density">Density
-              <select aria-label="Density">${DENSITIES.map(value => `<option value="${value}" ${value === this._density ? 'selected' : ''}>${value[0].toUpperCase() + value.slice(1)}</option>`).join('')}</select>
-            </label>
+            <button type="button" class="hd-shell__icon" data-density-button aria-label="" title=""></button>
             <slot name="controls"></slot>
           </div>
         </aside>
@@ -131,8 +129,18 @@ export class HerdrAppShell extends HTMLElement {
           <slot></slot>
         </div></main>
       </div>`;
-    this.shadowRoot.querySelector('.hd-shell__density select').addEventListener('change', event => {
-      this._applyDensity(event.target.value);
+    const densityButton = this.shadowRoot.querySelector('[data-density-button]');
+    const paintDensity = () => {
+      const next = DENSITIES[(DENSITIES.indexOf(this._density) + 1) % DENSITIES.length];
+      const label = `Density: ${this._density}. Switch to ${next}`;
+      densityButton.setAttribute('aria-label', label); densityButton.title = label;
+      densityButton.dataset.value = this._density;
+      densityButton.innerHTML = DENSITY_ICONS[this._density];
+    };
+    paintDensity();
+    densityButton.addEventListener('click', () => {
+      this._applyDensity(DENSITIES[(DENSITIES.indexOf(this._density) + 1) % DENSITIES.length]);
+      paintDensity();
     });
     this.shadowRoot.querySelector('.hd-shell__menu')?.addEventListener('click', () => {
       this._menuOpen = !this._menuOpen;
@@ -143,6 +151,8 @@ export class HerdrAppShell extends HTMLElement {
 }
 
 // The shell's own styles (referencing the global theme tokens).
+const bars = (ys) => `<svg viewBox="0 0 20 20" width="18" height="18" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round">${ys.map((y) => `<path d="M3 ${y}h14"/>`).join('')}</svg>`;
+const DENSITY_ICONS = { comfortable: bars([5, 10, 15]), compact: bars([4, 8, 12, 16]), dense: bars([3, 6.5, 10, 13.5, 17]) };
 const SHARED = `
 :host { display: block; }
 .hd-shell { display: flex; min-height: 100vh; }
@@ -165,8 +175,8 @@ const SHARED = `
 .hd-shell__link:hover { background: var(--surface-hover); text-decoration: none; }
 .hd-shell__link.active { background: var(--accent-weak); color: var(--accent); font-weight: 500; }
 .hd-shell__display { display: flex; flex-wrap: wrap; gap: 6px 10px; align-items: center; padding: 10px 14px 14px; border-top: 1px solid var(--border-subtle); position: sticky; bottom: 0; background: var(--surface); }
-.hd-shell__density { display: flex; align-items: center; gap: 6px; font-size: .75rem; color: var(--text-secondary); }
-.hd-shell__density select { min-width: 0; font: inherit; color: var(--text); background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 6px; }
+.hd-shell__icon { display: inline-flex; align-items: center; justify-content: center; width: 32px; height: 32px; padding: 0; color: var(--text-secondary); background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-sm); cursor: pointer; }
+.hd-shell__icon:hover { background: var(--surface-hover); color: var(--text); }
 :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .hd-shell__main { flex: 1; min-width: 0; }
 .hd-shell__content { width: auto; max-width: none; margin: 0; padding: clamp(20px,1.25vw,48px); }
@@ -178,7 +188,8 @@ const SHARED = `
   .hd-shell__display { position: static; }
   .hd-shell__brand { padding: 10px 16px; }
   .hd-shell__menu { display: inline-flex; min-height: 44px; align-items: center; }
-  .hd-shell__density select, .hd-shell__link { min-height: 44px; align-items: center; }
+  .hd-shell__icon { width: 44px; height: 44px; }
+  .hd-shell__link { min-height: 44px; align-items: center; }
   .hd-shell__nav { display: none; grid-template-columns: repeat(2,minmax(0,1fr)); max-height: 55vh; overflow-y: auto; }
   .hd-shell__nav[data-open=true] { display: grid; }
   .hd-shell__content { max-width: none; padding: 16px; }
