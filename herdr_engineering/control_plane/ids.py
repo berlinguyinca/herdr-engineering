@@ -6,9 +6,10 @@ import time
 from typing import Final
 
 _KINDS: Final[frozenset[str]] = frozenset({
-    "mission", "session", "service", "artifact", "version",
+    "mission", "session", "service", "artifact",
     "host", "agent", "plan", "worktree", "event", "lease", "llmkey",
     "project", "room", "grant", "collab", "cifix", "version",
+    "membership", "permission", "transition",
 })
 # Crockford base32 in ASCII order (0-9 then a-z, omitting i/l/o/u) so the
 # integer encoding is lexicographically sortable.

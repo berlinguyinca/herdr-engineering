@@ -19,20 +19,25 @@ def content_key(data: bytes) -> str:
 class RustFSClient:
     """Thin S3-compatible client over RustFS. ``s3`` is a boto3 client or fake."""
 
-    def __init__(self, *, endpoint: str, bucket: str,
+    def __init__(self, *, endpoint: str | None, bucket: str,
                  region: str = "us-east-1", s3: Any | None = None,
                  sha: Any = hashlib.sha256,
-                 access_key: str = "herdr", secret_key: str = "herdr"):
+                 access_key: str | None = "herdr", secret_key: str | None = "herdr",
+                 session_token: str | None = None, addressing_style: str = "auto"):
         self._bucket = bucket
         self._sha = sha
         if s3 is not None:
             self._s3 = s3
         else:
             import boto3
+            from botocore.config import Config
+
             self._s3 = boto3.client(
                 "s3", endpoint_url=endpoint,
                 region_name=region,
                 aws_access_key_id=access_key, aws_secret_access_key=secret_key,
+                aws_session_token=session_token,
+                config=Config(signature_version="s3v4", s3={"addressing_style": addressing_style}),
             )
 
     def ensure_bucket(self) -> None:
@@ -135,6 +140,52 @@ class RustFSClient:
 
     def get(self, content_key: str, expected_sha256: str) -> bytes:
         return b"".join(self.iter_get(content_key, expected_sha256))
+
+    def put_at(self, key: str, data: bytes) -> str:
+        """Write at a caller-selected key and return the bytes' SHA-256."""
+        digest = self._sha(data).hexdigest()
+        self._s3.put_object(Bucket=self._bucket, Key=key, Body=data)
+        return digest
+
+    def checksum(self, key: str, *, parts: list[dict] | None = None) -> tuple[int, str]:
+        """Hash bytes with bounded memory; optionally verify each persisted part.
+
+        Part evidence binds a composite-only upload to actual bytes. The returned
+        whole-file hash is computed independently, not copied from the manifest.
+        """
+        body = self._s3.get_object(Bucket=self._bucket, Key=key)["Body"]
+        if not hasattr(body, 'read'):
+            body = io.BytesIO(bytes(body))
+        digest, size = self._sha(), 0
+        try:
+            if parts is not None:
+                if not parts:
+                    raise IntegrityError('missing part checksums')
+                for part in parts:
+                    remaining = part['size_bytes']
+                    if type(remaining) is not int or remaining < 0:
+                        raise IntegrityError('invalid part size')
+                    part_digest = self._sha()
+                    while remaining:
+                        chunk = body.read(min(remaining, 1024 * 1024))
+                        if not chunk or len(chunk) > remaining:
+                            raise IntegrityError('part size mismatch')
+                        digest.update(chunk)
+                        part_digest.update(chunk)
+                        size += len(chunk)
+                        remaining -= len(chunk)
+                    if part_digest.hexdigest() != part['sha256']:
+                        raise IntegrityError('part checksum mismatch')
+                if body.read(1):
+                    raise IntegrityError('unexpected trailing bytes')
+            else:
+                while chunk := body.read(1024 * 1024):
+                    digest.update(chunk)
+                    size += len(chunk)
+        finally:
+            if hasattr(body, 'close'):
+                body.close()
+        return size, digest.hexdigest()
 
     def head(self, content_key: str) -> bool:
         try:
