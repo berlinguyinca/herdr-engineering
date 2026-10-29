@@ -117,6 +117,9 @@ def test_durable_upload_is_visible_and_downloadable_without_the_legacy_projectio
                 return record if record and record['created_by'] == kwargs['principal_id'] else None
             if method == 'list_records':
                 return [r for r in self.records.values() if r['created_by'] == kwargs['principal_id']]
+            if method == 'report_permission':
+                record = self.records.get(args[0])
+                return bool(record and record['created_by'] == args[1])
             raise AssertionError(method)
 
     with running(artifact_store=Durable(), rustfs=blobs) as server:

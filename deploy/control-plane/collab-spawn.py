@@ -702,12 +702,14 @@ class Runner:
         names[aid] = target
 
     # ------------------------------------------------------------ one request
-    def pick_host(self, eligible: list[str]) -> str | None:
+    def pick_host(self, eligible: list[str], *, preferred: str | None = None) -> str | None:
         """Rollback-compatible placement used only while scheduler rollout is disabled."""
         flags = {h["host"]: h["auto_agents"] for h in self.ok("GET", "fleet/hosts")["hosts"]}
         live = [h for h in eligible if flags.get(h, True)]
         if not live:
             return None
+        if preferred in live:
+            return preferred
         cursor_file = self.state / "rr"
         try:
             cursor = int(cursor_file.read_text())
@@ -841,7 +843,7 @@ class Runner:
                                                   spec.get("parent_agent_id"), None)
                         host, reservation_id = self.scheduler_host(placement, eligible)
                     else:
-                        host = parent_host or self.pick_host(eligible) or ""
+                        host = self.pick_host(eligible, preferred=parent_host) or ""
                     if not host:
                         raise Failure("every host opted out meanwhile")
                     pane_parent = parent_pane if host == parent_host else None

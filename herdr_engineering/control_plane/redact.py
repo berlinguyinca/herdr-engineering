@@ -99,28 +99,37 @@ def redact_text(text: str) -> str:
     return out
 
 
-def redact_payload(payload: Any, *, _seen=None) -> Any:
-    """Recursively redact secret values/keys inside an event payload / JSON."""
-    _seen = _seen if _seen is not None else set()
-    if id(payload) in _seen:
-        return payload
-    _seen.add(id(payload))
+def redact_payload(payload: Any, *, _seen=None, _memo=None) -> Any:
+    """Redact every occurrence, memoizing sanitized containers and masking cycles."""
     if isinstance(payload, str):
         return redact_text(payload)
-    if isinstance(payload, dict):
-        result = {}
-        for key, value in payload.items():
-            lk = str(key).lower()
-            if lk not in _PLAIN_KEYS and any(s in lk for s in _SECRET_KEY_HINTS):
-                result[key] = _REDACTED
-            else:
-                result[key] = redact_payload(value, _seen=_seen)
+    if not isinstance(payload, (dict, list, tuple)):
+        return payload
+    active = _seen if _seen is not None else set()
+    memo = _memo if _memo is not None else {}
+    identity = id(payload)
+    if identity in active:
+        return _REDACTED
+    if identity in memo:
+        return memo[identity]
+    active.add(identity)
+    try:
+        if isinstance(payload, dict):
+            result = {}
+            for key, value in payload.items():
+                lk = str(key).lower()
+                if lk not in _PLAIN_KEYS and any(s in lk for s in _SECRET_KEY_HINTS):
+                    result[key] = _REDACTED
+                else:
+                    result[key] = redact_payload(value, _seen=active, _memo=memo)
+        elif isinstance(payload, list):
+            result = [redact_payload(item, _seen=active, _memo=memo) for item in payload]
+        else:
+            result = tuple(redact_payload(item, _seen=active, _memo=memo) for item in payload)
+        memo[identity] = result
         return result
-    if isinstance(payload, list):
-        return [redact_payload(item, _seen=_seen) for item in payload]
-    if isinstance(payload, tuple):
-        return tuple(redact_payload(item, _seen=_seen) for item in payload)
-    return payload
+    finally:
+        active.remove(identity)
 
 
 def redact_values(payload: Any) -> Any:
