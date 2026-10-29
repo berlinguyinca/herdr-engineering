@@ -49,6 +49,8 @@ import {createServer} from 'node:http';
 import {readFile} from 'node:fs/promises';
 import path from 'node:path';
 import {chromium} from 'playwright';
+// The CI Health filter bar is a closed disclosure by default; tests that drive its controls open it first.
+const hf=async p=>{await p.locator('[data-health-filters]').waitFor({state:'attached',timeout:15000});await p.evaluate(()=>{const d=document.querySelector('[data-health-filters]');if(d)d.open=true;});};
 
 test('command center loads selected evidence lazily, rejects stale responses and retains UI state on outages',async()=>{
  const root=path.resolve(import.meta.dirname,'../..');
@@ -144,7 +146,7 @@ test('CI page shares project context with the existing heatmap and inspector wit
   await page.locator('[data-ob-days]').selectOption('7');
   assert.equal(await page.locator('[data-ci-period]').inputValue(),'7','legacy period reflects the shared window');
   assert.equal(await page.locator('[data-health-mode="7"]').getAttribute('aria-pressed'),'true');
-  await page.locator('[data-health-branch]').fill('feature');
+  await hf(page);await page.locator('[data-health-branch]').fill('feature');
   await page.waitForFunction(()=>document.querySelector('[data-ob-branch]').value==='feature');
   assert.equal(await page.locator('[data-ci-branch]').inputValue(),'feature','legacy branch reflects heatmap changes');
   for(const width of [390,1440,3840]){await page.setViewportSize({width,height:1000});assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true,`no page overflow at ${width}px`);}
@@ -353,7 +355,7 @@ test('last-24-runs cell shares exact old run identity and mode with every consum
   mount();
  });
  await page.locator('[data-ob-project]').filter({hasText:'org/current'}).click();
- await page.locator('[data-health-mode="runs"]').click();
+ await hf(page);await page.locator('[data-health-mode="runs"]').click();
  await page.locator('[data-health-bucket]').last().click();
  await page.waitForFunction(()=>calls.some(([kind,o])=>kind==='tests'&&o.run_number===9));
  for(const kind of ['summary','tests']) {
@@ -382,6 +384,7 @@ for(const origin of ['ob','health'])for(const control of ['search','failures'])t
  await page.locator('[data-health-bucket]').last().click();
  await page.waitForFunction(()=>calls.some(([kind,o])=>kind==='tests'&&o.start));
  await page.evaluate(()=>calls=[]);
+ await hf(page);
  if(control==='search')await page.locator(`[data-${origin}-search]`).fill('org/current');
  else await page.locator(`[data-${origin}-failures]`).check();
  await page.waitForFunction(()=>calls.some(([kind,o])=>kind==='tests'&&!o.start&&!o.end));
@@ -473,7 +476,7 @@ for(const [date,counts] of [['2026-10-25',[2,4,5,4,0]],['2026-10-24',[4,2,0,0,0]
   mount();
  },date);
  await page.locator('[data-ob-project]').filter({hasText:'org/current'}).click();
- await page.locator('[data-health-mode="hours"]').click();
+ await hf(page);await page.locator('[data-health-mode="hours"]').click();
  const bucket=`hour:${Date.parse(date+'T12:00:00Z')}`;
  await page.locator(`[data-health-bucket="${bucket}"]`).click();
  await page.waitForFunction(()=>calls.some(([kind,o])=>kind==='tests'&&o.start));
