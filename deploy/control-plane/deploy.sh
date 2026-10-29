@@ -3,6 +3,7 @@
 #
 #   deploy/control-plane/deploy.sh [--ref origin/main] [--dry-run] [--no-fetch]
 #                                  [--fleet-config PATH] [--collab-lock-wait SECONDS]
+#                                  [--deploy-lock-wait SECONDS]
 #
 # What it does, in order:
 #   1. checks the central fleet config (default
@@ -42,14 +43,18 @@
 #      recreate removed it) is recorded as absent, not an error: the deploy recreates it,
 #      and a rollback recreates it from the previous web's pinned image.
 #
-# With collaboration enabled, the deploy holds collab-sync's own lock
-# (<collab-sync dir>.lock, the one `collab-sync.sh once` takes) from before the first
-# host or container change until it exits - rollback included - so the minute timer's
-# run never overlaps a recreate. It waits --collab-lock-wait seconds (default 300) for a
-# running refresh to finish, then fails before touching anything. The kernel drops the
-# lock on any exit, even SIGKILL, so nothing is left paused. A compose recreate that
-# hits "removal of container ... is already in progress" waits for the removal to
-# finish and is retried (bounded); any other compose failure is not retried.
+# One deploy at a time: every real deploy holds STATE_DIR/deploy.lock from before it
+# changes anything until it exits (rollback included), waiting --deploy-lock-wait
+# seconds (default 600) for another deploy to finish, else failing untouched.
+# collab-public is recreated exactly ONCE per deploy (forced only when its slice
+# changed); the 2026-10-29 "removal of container ... is already in progress" came most
+# probably from recreating it twice back to back (or from two concurrent deploys).
+# Defence in depth: with collaboration enabled the deploy also holds collab-sync's own
+# lock (<collab-sync dir>.lock, the one `collab-sync.sh once` takes; that run only
+# reloads the edge's nginx, it never removes a container), waiting --collab-lock-wait
+# seconds (default 300). The kernel drops both locks on any exit, even SIGKILL, so
+# nothing is left paused. A compose up that still hits that removal error waits for
+# the removal to finish and is retried (bounded); any other failure is not retried.
 #
 # GitHub App key (optional, fleet config `github.app`): ~/.config/herdr-engineering/github-app/
 # is mounted read-only at /etc/herdr/github-app/ into control-plane-web (the only service
@@ -66,7 +71,7 @@
 # kept. Nothing from it is printed by this script or written to a receipt.
 set -euo pipefail
 
-REF="origin/main"; DRY=0; FETCH=1; COLLAB_LOCK_WAIT=300
+REF="origin/main"; DRY=0; FETCH=1; COLLAB_LOCK_WAIT=300; DEPLOY_LOCK_WAIT=600
 CENTRAL="$HOME/.config/herdr-engineering/fleet/fleet-config.yaml"
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -75,11 +80,13 @@ while [ $# -gt 0 ]; do
     --no-fetch) FETCH=0; shift ;;
     --fleet-config) CENTRAL="${2:?--fleet-config needs a value}"; shift 2 ;;
     --collab-lock-wait) COLLAB_LOCK_WAIT="${2:?--collab-lock-wait needs a value}"; shift 2 ;;
+    --deploy-lock-wait) DEPLOY_LOCK_WAIT="${2:?--deploy-lock-wait needs a value}"; shift 2 ;;
     -h|--help) sed -n '2,/^[^#]/{/^#/p}' "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
 [[ "$COLLAB_LOCK_WAIT" =~ ^[0-9]+$ ]] || { echo "--collab-lock-wait needs a whole number of seconds" >&2; exit 2; }
+[[ "$DEPLOY_LOCK_WAIT" =~ ^[0-9]+$ ]] || { echo "--deploy-lock-wait needs a whole number of seconds" >&2; exit 2; }
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(git -C "$HERE" rev-parse --show-toplevel)"
@@ -155,6 +162,18 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM HUP
+
+# One deploy at a time (fd 7, released by the kernel on any exit). A dry run changes
+# nothing, so it neither takes nor waits for the lock.
+if [ "$DRY" = 0 ]; then
+  mkdir -p "$STATE_DIR" && chmod 700 "$STATE_DIR"
+  DEPLOY_LOCK="$STATE_DIR/deploy.lock"
+  exec 7>"$DEPLOY_LOCK"
+  if ! flock -w "$DEPLOY_LOCK_WAIT" 7; then
+    echo "another deploy.sh is still running after ${DEPLOY_LOCK_WAIT}s (lock $DEPLOY_LOCK); nothing was changed. Retry, or raise --deploy-lock-wait" >&2
+    exit 1
+  fi
+fi
 
 [ "$FETCH" = 1 ] && git -C "$REPO" fetch -q origin
 FULL="$(git -C "$REPO" rev-parse --verify "$REF^{commit}")"
@@ -500,7 +519,7 @@ compose_up_retry() {
     compose_run "$@" 2>"$err" || rc=$?
     cat "$err" >&2
     [ "$rc" != 0 ] || return 0
-    grep -q 'is already in progress' "$err" || return "$rc"
+    grep -qE 'removal of container .* is already in progress' "$err" || return "$rc"
     [ "$attempt" != "$REMOVAL_RETRIES" ] || break
     echo "a container removal is still in progress; waiting for it, then retrying ($((attempt + 1))/$REMOVAL_RETRIES)" >&2
     wait_removals || return "$rc"
@@ -580,12 +599,18 @@ forward() {
     mkdir -p "$(dirname "$HERDR_COLLAB_EDGE_CONF")" || return 1
     write_edge_conf "$WORK/deploy/control-plane/collab-edge/nginx.conf" || return 1
   fi
-  compose_up "$WORK" "$ENV_FILE" "$TAG" "$SHA" >/dev/null || return 1
-  if [ "$COLLAB" = 1 ]; then reload_edge_if_changed || return 1; fi
   if [ "$COLLAB" = 1 ] && [ "$COLLAB_HASH" != "$PREV_COLLAB_HASH" ]; then
-    # same image but a changed slice: collab-public reads it only at startup
+    # A changed slice: collab-public reads it only at startup, so force ITS recreate -
+    # once, alone, first - and leave it out of the up below. Recreating it twice back to
+    # back is what raced Docker's removal of the old container (2026-10-29).
     compose_up_retry "$WORK" "$ENV_FILE" "$TAG" "$SHA" up -d --no-deps --no-build --force-recreate collab-public >/dev/null || return 1
+    compose_up_retry "$WORK" "$ENV_FILE" "$TAG" "$SHA" up -d --no-deps --no-build "${APP_SERVICES[@]}" collab-edge >/dev/null || return 1
+  else
+    compose_up "$WORK" "$ENV_FILE" "$TAG" "$SHA" >/dev/null || return 1
   fi
+  # The edge resolves collab-public once, at (re)load: a recreated collab-public has a
+  # new address, so reload the edge after every collab up, not only on a new conf.
+  if [ "$COLLAB" = 1 ]; then EDGE_CONF_CHANGED=1; reload_edge_if_changed || return 1; fi
   python3 "$STATE_HELPER" verify-forward "$ATTEMPT" || return 1
   verify "$SHA"
 }
@@ -638,6 +663,7 @@ if [ "$RESTORED" = 1 ] \
     && git -C "$REPO" worktree add -q --detach "$PREV_WORK" "$PREV_COMMIT" >/dev/null 2>&1 \
     && prev_render \
     && compose_up "$PREV_WORK" "$PREV_ENV" "$PREV_TAG" "$PREV_SHA" >/dev/null \
+    && { [ "$COLLAB" = 0 ] || { EDGE_CONF_CHANGED=1; reload_edge_if_changed || true; }; } \
     && python3 "$STATE_HELPER" verify-rollback "$ATTEMPT" \
     && verify "$PREV_SHA"; then
   python3 "$STATE_HELPER" outcome "$ATTEMPT" rolled_back

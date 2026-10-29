@@ -49,7 +49,7 @@ _ABSENT = (b"No such object", b"No such container")
 
 def inspect_container(name):
     """A container's inspect document, or None only when Docker says it does not exist."""
-    result = subprocess.run(["docker", "inspect", name], capture_output=True)
+    result = subprocess.run(["docker", "inspect", "--type", "container", name], capture_output=True)
     if result.returncode != 0:
         if any(marker in result.stderr for marker in _ABSENT):
             return None
@@ -90,7 +90,7 @@ def previous_receipt(state, previous_image, web=None):
     tag = previous_image.removeprefix("herdr-engineering:")
     if not pinned and not (Path(state) / f"{tag}.json").exists():
         return tag, {}
-    web = web if web is not None else inspect("inspect", container("control-plane-web"))
+    web = web if web is not None else inspect("inspect", "--type", "container", container("control-plane-web"))
     actual_id = image_id(web["Image"])
     if web["Config"]["Image"] != previous_image:
         raise ValueError("running image changed")
@@ -226,7 +226,7 @@ def main():
             images = {s: metadata["candidate"]["image_id"] for s in services}
             config = metadata["candidate"]["fleet_config_source"]
         for service, expected in images.items():
-            live = inspect("inspect", container(service))
+            live = inspect("inspect", "--type", "container", container(service))
             if live["Image"] != expected:
                 raise ValueError("deployment image mismatch")
             if service in ("control-plane-web", "control-plane-worker"):

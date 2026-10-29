@@ -75,6 +75,8 @@ def env(tmp_path, candidate_ref, monkeypatch):
     # the tag as "running" (what the stub curl's health answer reports).
     stub.write_text(f"""#!/usr/bin/env bash
 echo "docker $*" >> {log}
+# deploy-state.py asks for `inspect --type container NAME`: answer it like `inspect NAME`
+if [ "$1 ${{2:-}} ${{3:-}}" = "inspect --type container" ] && [ "$#" = 4 ]; then set -- inspect "$4"; fi
 is_missing() {{ case " $(cat {missing} 2>/dev/null) " in *" $1 "*) return 0 ;; esac; return 1; }}
 if [ "$1" = inspect ] && [ "${{@: -1}}" = "${{STUB_INSPECT_ERROR:-}}" ]; then
   echo "permission denied while trying to connect to the docker daemon" >&2; exit 1
@@ -173,7 +175,7 @@ state = pathlib.Path(os.environ['HOME']) / '.local/state/herdr-engineering/deplo
 attempts = list(state.glob('attempt-*/metadata.json'))
 print('prepared_before_recreate', any(json.loads(p.read_text())['outcome'] == 'prepared' for p in attempts))
 PY
-    [ -n "${{FAIL_COMPOSE:-}}" ] && exit 1
+    if [ -n "${{FAIL_COMPOSE:-}}" ]; then [ -z "${{STUB_COMPOSE_STDERR:-}}" ] || echo "$STUB_COMPOSE_STDERR" >&2; exit 1; fi
     case " ${{FAIL_COMPOSE_TAGS:-}} " in *" ${{HERDR_CP_IMAGE_TAG:-}} "*) exit 1 ;; esac
     echo "${{HERDR_CP_IMAGE_TAG:-}}" > {running}
     if [ -e {missing} ]; then   # the services this up names exist again
@@ -1491,9 +1493,9 @@ def test_removal_in_progress_is_waited_out_and_retried(env):
     assert log.count("removalinprogress") == 1
     assert "removal of container herdr-collab-public is already in progress" in r.stderr
     assert "docker inspect -f {{.State.Status}} herdr-collab-public" in log
-    ups = [ln for ln in log.splitlines() if ln.startswith("docker compose") and " up " in ln
-           and "--force-recreate" not in ln]
-    assert len(ups) == 2                                         # the failed up, then the retry
+    ups = [ln for ln in log.splitlines() if ln.startswith("docker compose") and " up " in ln]
+    # first deploy = changed slice: the failed collab-public up, its retry, then the rest once
+    assert [("--force-recreate collab-public" in ln) for ln in ups] == [True, True, False]
 
 
 def test_removal_in_progress_retries_are_bounded(env):
@@ -1566,3 +1568,130 @@ def test_capture_still_fails_on_an_inspect_error_that_is_not_absence(env):
     assert "deployment recovery state operation failed" in r.stderr
     assert "permission denied" not in r.stdout + r.stderr
     assert " up " not in env["log"].read_text()
+
+
+# ------------- fix round: single recreate, deploy-wide lock, tight retry match
+
+def _deploy_lock(e):
+    return e["home"] / ".local/state/herdr-engineering/deploys/deploy.lock"
+
+
+def _public_ups(e):
+    return [ln for ln in e["log"].read_text().splitlines()
+            if ln.startswith("docker compose") and " up " in ln and " collab-public" in ln]
+
+
+def test_changed_slice_recreates_collab_public_exactly_once_and_reloads_the_edge(env):
+    _with_collab(env)
+    _seed_previous(env, _layout_commit(), {"collab_slice_sha256": "0" * 64})
+    r = deploy(env)
+    assert r.returncode == 0, r.stderr
+    ups = _public_ups(env)
+    assert len(ups) == 1 and "--force-recreate collab-public" in ups[0]
+    rest = [ln for ln in env["log"].read_text().splitlines()
+            if ln.startswith("docker compose") and " up " in ln and ln not in ups]
+    assert len(rest) == 1 and rest[0].endswith("control-plane-web control-plane-worker llm-proxy collab-edge")
+    assert "docker exec herdr-collab-edge nginx -s reload" in env["log"].read_text()
+
+
+def test_unchanged_slice_recreates_collab_public_once_without_forcing(env):
+    _with_collab(env)
+    _seed_previous(env, _layout_commit())
+    first = deploy(env)
+    assert first.returncode == 0, first.stderr
+    env["log"].write_text("")
+    env["env"]["STUB_RUNNING_IMAGE"] = f"herdr-engineering:{_head()}"
+    r = deploy(env)
+    assert r.returncode == 0, r.stderr
+    ups = _public_ups(env)
+    assert len(ups) == 1 and "--force-recreate" not in ups[0]
+
+
+def test_generic_compose_failure_runs_up_exactly_once(env):
+    _with_collab(env)
+    env["env"].update(FAIL_COMPOSE="1", STUB_COMPOSE_STDERR="Error: some other operation is already in progress")
+    r = deploy(env)
+    assert r.returncode == 1
+    ups = [ln for ln in env["log"].read_text().splitlines() if ln.startswith("docker compose") and " up " in ln]
+    assert len(ups) == 1, ups
+    assert "waiting for it, then retrying" not in r.stderr
+
+
+def test_deploy_lock_held_elsewhere_fails_before_changing_anything(env):
+    import time
+    lock = _deploy_lock(env)
+    lock.parent.mkdir(parents=True)
+    holder = subprocess.Popen(["flock", str(lock), "sleep", "60"])
+    try:
+        while subprocess.run(["flock", "-n", str(lock), "true"]).returncode == 0:
+            time.sleep(0.02)
+        r = deploy(env, "--deploy-lock-wait", "1")
+    finally:
+        holder.kill()
+        holder.wait()
+    assert r.returncode == 1
+    assert "another deploy.sh is still running after 1s" in r.stderr and "nothing was changed" in r.stderr
+    assert not env["log"].exists()                       # never reached docker
+    assert not list(lock.parent.glob("attempt-*"))
+
+
+def test_concurrent_deploys_serialize(env):
+    import time
+    lock = _deploy_lock(env)
+    lock.parent.mkdir(parents=True)
+    holder = subprocess.Popen(["flock", str(lock), "sleep", "1"])
+    while subprocess.run(["flock", "-n", str(lock), "true"]).returncode == 0:
+        time.sleep(0.02)
+    started = time.monotonic()
+    r = deploy(env, "--deploy-lock-wait", "60")
+    holder.wait()
+    assert r.returncode == 0, r.stderr
+    assert time.monotonic() - started >= 0.5                  # it waited for the holder
+    assert subprocess.run(["flock", "-n", str(lock), "true"]).returncode == 0
+
+
+def test_second_concurrent_deploy_fails_cleanly_while_the_first_runs(env):
+    import time
+    env["env"].update(STUB_READY_AFTER="100000", HERDR_CP_HEALTH_TRIES="100000",
+                      HERDR_CP_HEALTH_INTERVAL="0.05")
+    first = subprocess.Popen(["bash", str(DEPLOY), "--no-fetch", "--ref", env["ref"],
+                              "--fleet-config", str(env["central"])], env=env["env"], cwd=ROOT,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        deadline = time.monotonic() + 90
+        while "api/v1/health" not in (env["log"].read_text() if env["log"].exists() else ""):
+            assert first.poll() is None and time.monotonic() < deadline
+            time.sleep(0.05)
+        before = env["log"].read_text()
+        second = deploy(env, "--deploy-lock-wait", "1")
+        assert second.returncode == 1 and "another deploy.sh is still running" in second.stderr
+        assert "docker build" not in env["log"].read_text()[len(before):]
+    finally:
+        first.kill()
+        first.wait()
+
+
+def test_web_absent_at_capture_aborts_preparation(env):
+    """deploy-state.py prepare: only the WEB is load-bearing; if it vanishes the attempt aborts."""
+    (env["tmp"] / "missing").write_text("herdr-cp-web")
+    env["env"]["STUB_RUNNING_IMAGE"] = "herdr-engineering:" + "0" * 12
+    state = env["tmp"] / "state"
+    r = subprocess.run(["python3", str(ROOT / "deploy/control-plane/deploy-state.py"), "prepare",
+                        str(state), str(env["central"]), env["ref"], "f" * 40,
+                        "herdr-engineering:" + "0" * 12, "1"],
+                       env=env["env"], capture_output=True, text=True)
+    assert r.returncode == 1
+    assert "deployment recovery state operation failed" in r.stderr
+    assert "docker inspect --type container herdr-cp-web" in env["log"].read_text()
+
+
+def test_candidate_without_lock_held_support_warns_and_leaves_refresh_to_the_timer(env):
+    added = _git("log", "--format=%H", "-S", "--lock-held", "--",
+                 "deploy/control-plane/collab-sync.sh").splitlines()[-1]
+    old = _git("rev-parse", f"{added}^")
+    _with_collab(env)
+    r = run(DEPLOY, env, "--no-fetch", "--ref", old, "--fleet-config", str(env["central"]))
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "cannot run under the deploy's lock; its refresh is left to the timer" in r.stderr
+    assert "another collab-sync is running" in r.stderr     # the old script saw the held lock
+    assert _lock_is_free(env)
