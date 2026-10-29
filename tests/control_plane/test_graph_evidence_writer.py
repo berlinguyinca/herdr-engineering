@@ -42,7 +42,8 @@ class Rig:
         self.section = section
         self.cp = ControlPlaneRepo()
         self.ingest = IngestService(self.cp)
-        self.writer = GraphEvidenceWriter(ingest=self.ingest, section_fn=lambda: self.section)
+        self.writer = GraphEvidenceWriter(ingest=self.ingest, section_fn=lambda: self.section,
+                                      graph_fn=lambda: self.cp.graph)
         self.app, self.ci = FakeApp(), CI()
         self.store = PipelineStore(self.cp)
         self.svc = GateService(

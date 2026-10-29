@@ -139,7 +139,7 @@ ANCHOR_DIR = ROOT / "deploy/control-plane"
 ANCHOR_SERVICES = {"anchor": ANCHOR_DIR / "herdr-audit-anchor.service", "verify": ANCHOR_DIR / "herdr-audit-verify.service"}
 ANCHOR_PATH = "/var/lib/herdr-anchor"
 HARDENING = {"NoNewPrivileges": "yes", "ProtectSystem": "strict", "Restart": "no", "Type": "oneshot",
-             "User": "herdr-anchor", "ProtectHome": "yes", "PrivateTmp": "yes"}
+             "User": "herdr-anchor", "ProtectHome": "read-only", "PrivateTmp": "yes"}
 
 
 @pytest.mark.parametrize("action", sorted(ANCHOR_SERVICES))
@@ -149,6 +149,8 @@ def test_audit_anchor_services_are_hardened_oneshots_that_run_the_real_cli(actio
     svc = dict(s["Service"])
     for key, value in HARDENING.items():
         assert svc.get(key) == value, f"{unit.name}: {key}={value} required"
+    assert svc.get("RestrictAddressFamilies", "").split() == ["AF_UNIX", "AF_INET", "AF_INET6"], \
+        "AF_UNIX is needed for NSS / nscd name resolution"
     writable = [v for k, v in s["Service"] if k == "ReadWritePaths"]
     assert writable == ([ANCHOR_PATH] if action == "anchor" else []), "only the anchor service writes, and only its own dir"
     if action == "verify":
