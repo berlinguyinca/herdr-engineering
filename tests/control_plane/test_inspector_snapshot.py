@@ -318,3 +318,41 @@ def test_snapshot_settings_are_off_unless_explicitly_enabled():
     assert settings({"inspector_snapshots": {"enabled": True, "interval_seconds": 5}}) == (True, 600.0)
     with pytest.raises(SystemExit):
         settings({"inspector_snapshots": "on"})
+
+
+# ---- boot that does not even load the rows a snapshot covers ------------------------------------------------------
+def skipped_boot(rows, saved, *, backfill=True):
+    """What the source hands the repo when it verified the snapshot: the rows above the watermark only."""
+    events = boot_events(rows)
+    upto = saved["watermark"]
+    row = {**saved, "covered_count": sum(1 for e in events if e["sequence"] <= upto), "skipped_upto": upto}
+    kept = [e for e in events if e["sequence"] > upto]
+    skipped = [e for e in events if e["sequence"] <= upto]
+    s = store()
+    outcome = snap.apply_to_store(s, row, kept, backfill=(lambda: skipped) if backfill else None)
+    return outcome, canon(s.export_state())
+
+
+def test_boot_without_the_covered_rows_equals_a_full_replay():
+    rows = [db_row(e) for e in stream(400, seed=31)]
+    conn = FakeConn(rows[:300])
+    run(snap.SnapshotWriter(store, interval=0).tick(conn))
+    assert skipped_boot(rows, conn.saved) == ("snapshot", full_state(rows))
+
+
+def test_a_refused_snapshot_loads_the_skipped_rows_and_still_equals_a_full_replay(monkeypatch):
+    rows = [db_row(e) for e in stream(300, seed=32)]
+    conn = FakeConn(rows[:250])
+    run(snap.SnapshotWriter(store, interval=0).tick(conn))
+    monkeypatch.setattr(insp, "rules_fingerprint", lambda: "other rules")
+    outcome, state = skipped_boot(rows, conn.saved)
+    assert outcome.startswith("full:") and state == full_state(rows)
+
+
+def test_a_refused_snapshot_without_a_way_to_load_the_skipped_rows_refuses_to_start(monkeypatch):
+    rows = [db_row(e) for e in stream(200, seed=33)]
+    conn = FakeConn(rows[:150])
+    run(snap.SnapshotWriter(store, interval=0).tick(conn))
+    monkeypatch.setattr(insp, "rules_fingerprint", lambda: "other rules")
+    with pytest.raises(RuntimeError, match="incomplete inspector"):
+        skipped_boot(rows, conn.saved, backfill=False)
