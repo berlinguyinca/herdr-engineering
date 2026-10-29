@@ -53,9 +53,8 @@ function row(item, now, { busy = false, urls = null, showKind = false } = {}) {
   const until = item.state === 'snoozed' && item.snoozed_until ? ` · until ${esc(new Date(item.snoozed_until).toLocaleString())}` : '';
   const detail = text(item.detail) ? `<span class="at-detail">${linkifyFabricText(item.detail, urls)}</span>` : '';
   return `<li class="at-row at-${sev}" data-attention-row="${esc(item.key)}">
-    <div class="at-main"><span class="at-sr">${esc(sev)}</span><strong title="${esc(KINDS[item.kind] || text(item.kind))}">${title}</strong>${count}${showKind ? `<span class="at-detail">${esc(KINDS[item.kind] || text(item.kind))}</span>` : ''}${detail}
-      <span class="at-meta">first seen ${age(item, now)}${until}</span></div>
-    <div class="at-actions">${links}${controls}</div></li>`;
+    <div class="at-main"><span class="at-sr">${esc(sev)}</span><strong title="${esc(KINDS[item.kind] || text(item.kind))}">${title}</strong>${count}${showKind ? `<span class="at-kindlabel">${esc(KINDS[item.kind] || text(item.kind))}</span>` : ''}${detail}</div>
+    <div class="at-actions"><span class="at-meta">first seen ${age(item, now)}${until}</span>${links}${controls}</div></li>`;
 }
 
 function resolvedRow(item, now) {
@@ -112,27 +111,28 @@ export function notifyLine(notify) {
 }
 
 const STYLES = `<style>
-.at-summary{display:flex;flex-wrap:wrap;gap:8px 12px;align-items:center;margin:8px 0 12px;font-size:14px}.at-summary select{font:inherit;min-width:0}
+.at-summary{display:flex;flex-wrap:wrap;gap:8px 16px;align-items:center;margin:16px 0 24px;font-size:14px}.at-summary select{font:inherit;min-width:0}
 .at-partial{background:var(--surface);border:1px solid var(--status-attention);border-radius:var(--radius);padding:4px 12px;font-size:13px}
 .at-chip{font:inherit;font-size:13px;padding:2px 12px;min-height:28px;border:1px solid var(--border);border-radius:999px;background:var(--surface);color:var(--text-secondary);cursor:pointer}
 .at-chip[aria-pressed=true]{border-color:var(--accent);color:var(--text)}.at-chip-critical{border-left:3px solid var(--status-failed)}.at-chip-warning{border-left:3px solid var(--status-attention)}
 .at-bell{display:inline-flex;color:var(--text-muted);cursor:help}
-.at-list{list-style:none;margin:0;padding:0;display:grid;gap:4px}
-.at-row{display:flex;align-items:center;gap:4px 12px;padding:4px 12px;background:var(--surface);border:1px solid var(--border);border-left-width:3px;border-radius:var(--radius)}
+.at-list{list-style:none;margin:0;padding:0;display:grid;gap:8px}
+.at-row{display:flex;align-items:center;gap:8px 24px;padding:12px 16px;background:var(--surface);border:1px solid var(--border);border-left-width:3px;border-radius:var(--radius)}
 .at-critical{border-left-color:var(--status-failed)}.at-warning{border-left-color:var(--status-attention)}.at-info,.at-resolved{border-left-color:var(--border)}
-.at-main{min-width:0;flex:1 1 auto;display:flex;flex-wrap:wrap;align-items:baseline;gap:0 12px;font-size:13px}.at-main strong{font-weight:600}
-.at-detail{min-width:0;flex:1 1 200px;color:var(--text-secondary);font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.at-meta{color:var(--text-muted);font-size:12px;white-space:nowrap;margin-left:auto}.at-count{color:var(--text-secondary);font-size:12px}
+.at-main{min-width:0;flex:1 1 auto;display:flex;flex-wrap:wrap;align-items:baseline;gap:4px 12px;font-size:14px}.at-main strong{font-weight:600}
+.at-kindlabel{color:var(--text-muted);font-size:12px}
+.at-detail{flex:1 1 100%;min-width:0;color:var(--text-secondary);font-size:13px;line-height:1.4;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.at-meta{color:var(--text-muted);font-size:12px;white-space:nowrap;margin-right:4px}.at-count{color:var(--text-secondary);font-size:12px}
 .at-sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
-.at-actions{display:flex;gap:8px;align-items:center;font-size:13px;flex:0 0 auto}.at-snooze{display:inline-flex;align-items:center}.at-snooze select{font:inherit;font-size:12px;max-width:88px}
-.at-btn{font:inherit;padding:2px 8px;cursor:pointer;min-height:28px}.at-icon{display:inline-flex;align-items:center;justify-content:center;width:28px;padding:0}
-.at-kind{margin:16px 0}.at-kind-title{font-size:.8125rem;text-transform:uppercase;letter-spacing:.05em;color:var(--text-secondary);margin:0 0 8px;font-weight:600}
+.at-actions{display:flex;gap:12px;align-items:center;font-size:13px;flex:0 0 auto}.at-snooze{display:inline-flex;align-items:center}.at-snooze select{font:inherit;font-size:13px;min-height:32px;max-width:104px}
+.at-btn{font:inherit;padding:4px 12px;cursor:pointer;min-height:32px}.at-icon{display:inline-flex;align-items:center;justify-content:center;width:32px;padding:0}
+.at-kind{margin:24px 0}.at-kind-title{font-size:.8125rem;text-transform:uppercase;letter-spacing:.05em;color:var(--text-secondary);margin:0 0 8px;font-weight:600}
 .at-ack-all{margin-left:8px;font-size:.75rem;text-transform:none;letter-spacing:0;padding:2px 8px;min-height:24px}
 .at-more>details>summary{cursor:pointer;padding:4px 12px;color:var(--accent);font-size:.875rem}.at-more>details[open]>summary{margin-bottom:8px}
-.at-group{margin:12px 0}.at-group>summary{cursor:pointer;font-weight:600;padding:4px 0}
+.at-group{margin:24px 0 16px}.at-group>summary{cursor:pointer;font-weight:600;padding:4px 0}
 .at-status{font-size:13px;color:var(--text-secondary);margin:8px 0}
 .at-group[data-state=acknowledged] .at-row{opacity:.78}
-@media (max-width:600px){.at-row{flex-wrap:wrap;padding:8px 12px}.at-detail{white-space:normal;flex-basis:100%}.at-meta{margin-left:0}.at-btn,.at-snooze select,.at-chip{min-height:44px}.at-icon{width:44px}}
+@media (max-width:600px){.at-row{flex-wrap:wrap}.at-detail{white-space:normal}.at-actions{width:100%;flex-wrap:wrap}.at-btn,.at-snooze select,.at-chip{min-height:44px}.at-icon{width:44px}}
 </style>`;
 
 /**
