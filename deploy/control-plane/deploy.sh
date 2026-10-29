@@ -65,6 +65,14 @@
 # user), so an owner-only file is readable there, exactly like the fleet file: never
 # loosen its mode. Set `github.app.private_key_file: /etc/herdr/github-app/github-app.pem`.
 #
+# Deployment definitions (fleet config `control_plane.deployment_definitions: /etc/herdr/pipelines`):
+# ~/.local/share/herdr-engineering/pipelines/ is mounted read-only at /etc/herdr/pipelines/ into
+# control-plane-web (the only reader). It must be a real directory owned by the deploying user, not
+# writable by group/other, holding only regular *.yaml files (no symlinks, at most 256, each at most
+# 64 KiB), else the deploy refuses before building. A missing one is created empty (0755) on a real
+# deploy. Its content is kept equal to InferWeave's deploy/pipelines on origin/main by the
+# herdr-pipelines-sync timer (pipelines-sync.sh), installed by every real deploy.
+#
 #   HERDR_CP_HEALTH_URL / _TRIES (900) / _INTERVAL (2s) tune the health check.
 #
 # The central file is the only configuration source: no env file is authored or
@@ -152,6 +160,30 @@ check_github_app_dir() {   # nothing printed but names; never the key
   fi
 }
 check_github_app_dir || exit 1
+
+# Deployment definitions: their OWN read-only mount, refreshed by pipelines-sync.sh.
+PIPELINES_DIR="$HOME/.local/share/herdr-engineering/pipelines"
+check_pipelines_dir() {   # names only, never content
+  local d="$PIPELINES_DIR" bad n
+  [ -e "$d" ] || [ -L "$d" ] || return 0
+  if [ -L "$d" ] || [ ! -d "$d" ]; then
+    echo "$d must be a real directory (not a symlink or a file)" >&2; return 1
+  fi
+  if [ "$(stat -c %u "$d")" != "$(id -u)" ]; then
+    echo "$d must be owned by the deploying user (uid $(id -u))" >&2; return 1
+  fi
+  if [ $(( 0$(stat -c %a "$d") & 022 )) != 0 ]; then
+    echo "$d must not be writable by group or other: chmod 755 $d" >&2; return 1
+  fi
+  bad="$(find "$d" -mindepth 1 -maxdepth 1 \( ! -type f -o ! -name '*.yaml' -o -perm /022 -o -size +64k \) -printf '%f ' 2>/dev/null || true)"
+  if [ -n "$bad" ]; then
+    echo "$d must hold only regular *.yaml files of at most 64 KiB, not writable by group/other (it is mounted into control-plane-web); found: $bad" >&2
+    return 1
+  fi
+  n="$(find "$d" -mindepth 1 -maxdepth 1 -printf . | wc -c)"
+  if [ "$n" -gt 256 ]; then echo "$d holds $n files (at most 256)" >&2; return 1; fi
+}
+check_pipelines_dir || exit 1
 
 WORK=""; ENV_DIR=""; PREV_WORK=""
 cleanup() {
@@ -295,7 +327,7 @@ if [ "$DRY" = 1 ]; then
   if docker compose version >/dev/null 2>&1; then
     # -q prints nothing on success; errors are withheld so no value can leak.
     if HERDR_CP_FLEET_DIR="$FLEET_DIR" HERDR_CP_GITHUB_APP_DIR="$GITHUB_APP_DIR" \
-        HERDR_CP_IMAGE_TAG="$TAG" HERDR_CP_GIT_COMMIT="$SHA" \
+        HERDR_CP_PIPELINES_DIR="$PIPELINES_DIR" HERDR_CP_IMAGE_TAG="$TAG" HERDR_CP_GIT_COMMIT="$SHA" \
         docker compose --env-file "$ENV_FILE" -p "$PROJECT" "${COMPOSE_FILES[@]}" config -q >/dev/null 2>&1; then
       echo "[dry-run] docker compose config: valid"
     else
@@ -308,6 +340,7 @@ if [ "$DRY" = 1 ]; then
   echo "[dry-run] would run: herdr-eng fleet config render-compose --path <central> --out <file>"
   echo "[dry-run] control-plane-web and worker mount $FLEET_DIR read-only; the file is $MOUNT_TARGET"
   echo "[dry-run] control-plane-web mounts $GITHUB_APP_DIR read-only at /etc/herdr/github-app$([ -d "$GITHUB_APP_DIR" ] || echo ' (would create it empty, 0700)')"
+  echo "[dry-run] control-plane-web mounts $PIPELINES_DIR read-only at /etc/herdr/pipelines$([ -d "$PIPELINES_DIR" ] || echo ' (would create it empty, 0755)'); after the build would install the herdr-pipelines-sync timer"
   echo "[dry-run] llm-proxy mounts only the llm slice (rendered to a temp dir; would install it at ~/.config/herdr-engineering/llm-proxy/)"
   if [ "$COLLAB" = 1 ]; then
     echo "[dry-run] rendered control_plane.collab to a temp slice; after the build would install it at ~/.config/herdr-engineering/collab/, the edge nginx.conf, and the collab-sync timer"
@@ -431,6 +464,10 @@ if [ ! -e "$GITHUB_APP_DIR" ]; then
   mkdir -p "$(dirname "$GITHUB_APP_DIR")" && mkdir -m 700 "$GITHUB_APP_DIR"
 fi
 check_github_app_dir || exit 1
+if [ ! -e "$PIPELINES_DIR" ]; then
+  mkdir -p "$(dirname "$PIPELINES_DIR")" && mkdir -m 755 "$PIPELINES_DIR"
+fi
+check_pipelines_dir || exit 1
 
 # ---- host files this deploy may change, backed up so every failure path restores them
 BACKUP_DIR="$ENV_DIR/backup"; mkdir -p "$BACKUP_DIR"
@@ -444,6 +481,12 @@ SYNC_STABLE="$HOME/.local/share/herdr-engineering/collab-sync.sh"
 UNIT_DIR="$HOME/.config/systemd/user"
 SYNC_UNITS=(herdr-collab-sync.service herdr-collab-sync.timer herdr-collab-cert-renew.service herdr-collab-cert-renew.timer)
 backup_file "$LLM_DIR/llm-config.json"
+PIPELINES_SYNC="$WORK/deploy/control-plane/pipelines-sync.sh"
+if [ -f "$PIPELINES_SYNC" ]; then   # the pipelines-sync script, its validator copy and units
+  for f in "$HOME/.local/share/herdr-engineering/pipelines-sync.sh" \
+      "$HOME/.local/share/herdr-engineering/pipelines-validator/deployment_definitions.py" \
+      "$UNIT_DIR/herdr-pipelines-sync.service" "$UNIT_DIR/herdr-pipelines-sync.timer"; do backup_file "$f"; done
+fi
 if [ "$COLLAB" = 1 ]; then
   backup_file "$COLLAB_CONFIG"
   backup_file "$HERDR_COLLAB_EDGE_CONF"
@@ -465,10 +508,8 @@ restore_host_state() {
       cp -p "$BACKUP_DIR/$key" "$f.restore.tmp" && mv -f "$f.restore.tmp" "$f" || rc=1
     fi
   done
-  if [ "$COLLAB" = 1 ]; then
-    reload_edge_if_changed || rc=1
-    systemctl --user daemon-reload >/dev/null 2>&1 || true
-  fi
+  if [ "$COLLAB" = 1 ]; then reload_edge_if_changed || rc=1; fi
+  if [ "$COLLAB" = 1 ] || [ -f "$PIPELINES_SYNC" ]; then systemctl --user daemon-reload >/dev/null 2>&1 || true; fi
   return "$rc"
 }
 
@@ -486,7 +527,7 @@ compose_run() {
   if [ "$COLLAB" = 1 ]; then files+=(-f "$tree/deploy/control-plane/compose.collab.yaml"); fi
   if [ -n "$ROLLBACK_IMAGES" ]; then files+=(-f "$ROLLBACK_IMAGES"); fi
   HERDR_CP_FLEET_DIR="$FLEET_DIR" HERDR_LLM_SLICE_DIR="$LLM_DIR" \
-    HERDR_CP_GITHUB_APP_DIR="$GITHUB_APP_DIR" HERDR_CP_IMAGE_TAG="$tag" HERDR_CP_GIT_COMMIT="$commit" \
+    HERDR_CP_GITHUB_APP_DIR="$GITHUB_APP_DIR" HERDR_CP_PIPELINES_DIR="$PIPELINES_DIR" HERDR_CP_IMAGE_TAG="$tag" HERDR_CP_GIT_COMMIT="$commit" \
     docker compose --env-file "$envf" -p "$PROJECT" "${files[@]}" "$@"
 }
 
@@ -582,6 +623,10 @@ verify() {   # <commit>: the web reports it AND every recreated service is up
 
 forward() {
   install_private "$NEW_LLM" "$LLM_DIR/llm-config.json" || return 1
+  # the deploy/pipelines refresh timer; its first run is the timer's (a fetch never fails a deploy)
+  if [ -f "$PIPELINES_SYNC" ]; then
+    "$PIPELINES_SYNC" install --dir "$PIPELINES_DIR" || return 1
+  fi
   if [ "$COLLAB" = 1 ]; then
     install_private "$NEW_COLLAB" "$COLLAB_CONFIG" || return 1
     mkdir -p "$HERDR_COLLAB_DATA_DIR" && chmod 700 "$HERDR_COLLAB_DATA_DIR" || return 1
