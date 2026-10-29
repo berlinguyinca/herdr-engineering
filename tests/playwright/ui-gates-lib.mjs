@@ -101,12 +101,14 @@ export function loadScale(load = os.loadavg()[0], cpus = os.cpus().length) {
   return Number.isFinite(scale) ? Math.min(3, Math.max(1, scale)) : 1;
 }
 export const BASE_WAIT_MS = 30000;
+/** An explicit wait budget, stretched for the load this host is under right now (see loadScale). */
+export const scaled = (ms) => Math.round(ms * loadScale());
 
 /** Open the real assembled page signed in as `user`. */
 export async function openReal(browser, info, user = 'alice', ctxOpts = {}, beforeGoto = null) {
   const ctx = await browser.newContext({ viewport: { width: 1280, height: 800 }, ...ctxOpts });
   const page = await ctx.newPage();
-  page.setDefaultTimeout(Math.round(BASE_WAIT_MS * loadScale()));
+  page.setDefaultTimeout(scaled(BASE_WAIT_MS));
   const w = watch(page);
   const pending = new Set();
   page.on('request', request => pending.add(request));
@@ -117,7 +119,7 @@ export async function openReal(browser, info, user = 'alice', ctxOpts = {}, befo
   if (beforeGoto) await beforeGoto(ctx, page);
   await page.goto(`${info.base}/#/room/${encodeURIComponent(info.room)}`);
   try {
-    await page.locator('[data-sub]').first().waitFor({ timeout: 15000 });
+    await page.locator('[data-sub]').first().waitFor({ timeout: scaled(15000) });
   } catch (error) {
     const body = await page.locator('body').innerText().catch(() => 'page unavailable');
     const detail = JSON.stringify({ errors: w.errors, failed: w.failed, http: w.bad, pending: [...pending].map(request => request.url()), url: page.url(), body: body.slice(0, 1200) });

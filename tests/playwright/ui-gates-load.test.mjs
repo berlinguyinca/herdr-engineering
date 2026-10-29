@@ -18,3 +18,9 @@ test('nonsense input never shrinks or breaks the wait', () => {
   assert.equal(loadScale(5, 0), 3);
   assert.equal(loadScale(-2, 8), 1);
 });
+
+test('scaled() stretches an explicit wait by the current load and never below the base', async () => {
+  const { scaled } = await import('./ui-gates-lib.mjs');
+  const wait = scaled(8000);
+  assert.ok(wait >= 8000 && wait <= 24000, `scaled(8000) = ${wait}`);
+});

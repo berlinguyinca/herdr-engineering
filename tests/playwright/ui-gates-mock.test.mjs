@@ -7,7 +7,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { readFile } from 'node:fs/promises';
-import { launch, watch } from './ui-gates-lib.mjs';
+import { launch, watch, scaled } from './ui-gates-lib.mjs';
 import { staticAudit, focusIndicatorAudit, overflowAudit, overflowFailure, summarize } from './a11y-checks.mjs';
 
 const T = '2026-10-23T10:00:00+00:00';
@@ -90,7 +90,7 @@ test('a slow response announces that it is loading in a live region and stays op
   await page.locator('.lin-replay__status').waitFor();
   assert.match(await page.locator('.lin-replay__status').innerText(), /Loading/);
   assert.equal(await page.locator('.lin-replay__status').getAttribute('aria-live'), 'polite');
-  await page.locator('svg.lin-svg g[data-node]').first().waitFor({ timeout: 8000 });
+  await page.locator('svg.lin-svg g[data-node]').first().waitFor({ timeout: scaled(8000) });
   await audit(page, 'after loading');
 }));
 
