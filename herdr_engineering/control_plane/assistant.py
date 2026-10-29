@@ -481,13 +481,21 @@ class AssistantMemory:
 # approval unless the grant carries `preauthorized: true`.
 TOOL_CATALOG: dict[str, dict[str, Any]] = {
     "chat": {"sensitive": False, "description": "Respond in conversation."},
-    "read_memory": {"sensitive": False, "description": "Read the user's assistant memory.",
+    "read_memory": {"sensitive": False,
+                    "description": "Read the assistant's stored memory facts (optionally filtered by namespace or keyword).",
                     "parameters": {"type": "object", "properties": {
-                        "key": {"type": "string", "description": "Memory key to read."}}}},
-    "write_memory": {"sensitive": False, "description": "Store a corrected memory fact.",
+                        "namespace": {"type": "array", "items": {"type": "string"},
+                                      "description": "Optional namespaces to filter by."},
+                        "query": {"type": "string",
+                                  "description": "Optional keyword to search memory content."}}}},
+    "write_memory": {"sensitive": False, "description": "Store a memory fact for later recall.",
                      "parameters": {"type": "object", "properties": {
-                         "key": {"type": "string"}, "value": {"type": "string"}},
-                         "required": ["key", "value"]}},
+                         "content": {"type": "string", "description": "The fact to remember."},
+                         "namespace": {"type": "string",
+                                       "description": "Optional namespace (default 'private')."},
+                         "classification": {"type": "string",
+                                            "description": "Optional category (default 'general')."}},
+                         "required": ["content"]}},
     "browse": {"sensitive": False, "description": "Fetch a web page for research (untrusted output).",
                "parameters": {"type": "object", "properties": {
                    "url": {"type": "string", "description": "Absolute https URL to fetch."}},
@@ -519,6 +527,14 @@ TOOL_CATALOG: dict[str, dict[str, Any]] = {
                    "parameters": {"type": "object", "properties": {
                        "sections": {"type": "array", "items": {"type": "string"},
                                     "description": "Optional subset of: hosts, missions, sessions, services, activity."}}}},
+    "read_project_intelligence": {
+        "sensitive": False,
+        "description": "Read project timelines and evidence the caller is already allowed to see (read-only; returns dashboard links).",
+        "parameters": {"type": "object", "properties": {
+            "operation": {"type": "string", "enum": ["projects_search", "timeline_query", "evidence_open"]},
+            "text": {"type": "string"}, "project": {"type": "string"}, "event": {"type": "string"},
+            "source": {"type": "string"}, "category": {"type": "string"}, "as_of": {"type": "string"}},
+            "required": ["operation"]}},
 }
 
 
@@ -1357,6 +1373,8 @@ class AssistantService:
         self.fleet_context = (FleetContextProvider(
             repo, max_chars=fc.get("max_chars", 6000), per_section=fc.get("per_section", 10))
             if (repo is not None and fc.get("enabled")) else None)
+        # Set by the control-plane API when project intelligence is enabled: (tenant, user, payload) -> dict.
+        self.intelligence_read = None
         if runner is not None:
             self.runner = runner
         else:
@@ -2292,7 +2310,8 @@ class AssistantService:
                                     url=payload.get("url", ""))
         if tool_id == "read_memory":
             recs = self.store.search_memory(tenant_id=tenant_id, user_id=user_id,
-                                            assistant_id=assistant_id, query="", limit=50)
+                                            assistant_id=assistant_id,
+                                            query=str(payload.get("query") or ""), limit=50)
             namespace = self._memory_namespace(payload)
             recs = [m for m in recs if m.namespace == namespace]
             if not recs:
@@ -2321,6 +2340,13 @@ class AssistantService:
                 raise AssistantError("fleet context is not enabled")
             return {"ok": True, "context": self.fleet_context.render(
                 sections=payload.get("sections"))}
+        if tool_id == "read_project_intelligence":
+            if self.intelligence_read is None:
+                raise AssistantError("project intelligence is not enabled")
+            try:
+                return {"ok": True, "result": self.intelligence_read(tenant_id, user_id, payload)}
+            except (ValueError, LookupError) as exc:
+                raise AssistantError(str(exc)) from exc
         if tool_id == "delegate":
             d = self.delegate(tenant_id=tenant_id, user_id=user_id,
                               assistant_id=assistant_id,

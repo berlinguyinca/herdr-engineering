@@ -11,6 +11,9 @@ import re
 import threading
 import unicodedata
 
+# A quarantined reservation is unavailable even to its original claimants.
+_CONFLICTED = object()
+
 _WORDS = (
     'Amber', 'Birch', 'Cedar', 'Dawn', 'Elm', 'Fern', 'Glen', 'Hazel',
     'Iris', 'Jade', 'Lake', 'Maple', 'North', 'Oak', 'Pine', 'Quartz',
@@ -90,6 +93,16 @@ class AgentIdentityRegistry:
         with self._lock:
             return [self._public(record) for record in self._records.values()]
 
+    def is_conflicted(self, identity):
+        with self._lock:
+            record = self._records.get(identity)
+            return record is not None and not self._available(identity, record['display_name'])
+
+    @property
+    def conflict_count(self):
+        with self._lock:
+            return sum(self.is_conflicted(identity) for identity in self._records)
+
     @staticmethod
     def _public(record):
         return {key: record[key] for key in ('identity', 'display_name', 'handle', 'version')}
@@ -102,6 +115,11 @@ class AgentIdentityRegistry:
         identity = _identity(identity)
         with self._lock:
             if identity in self._records:
+                if self.is_conflicted(identity):
+                    raise AgentIdentityConflict(
+                        'agent name is ambiguous; explicitly rename to an available name '
+                        f'or use stable identity ID {identity!r}'
+                    )
                 return self._public(self._records[identity])
             try:
                 base = _name(preferred_name)
@@ -148,19 +166,57 @@ class AgentIdentityRegistry:
 
     def _publish(self, record):
         identity = record['identity']
-        for name in record['reserved_names']:
-            self._names[name] = identity
-        for handle in record['reserved_handles']:
-            self._handles[handle] = identity
+        for reservations, aliases in ((self._names, record['reserved_names']),
+                                      (self._handles, record['reserved_handles'])):
+            for alias in aliases:
+                owner = reservations.get(alias)
+                # Cumulative aliases on a rename must never steal a reservation
+                # from another identity or replace a previously blocked alias.
+                reservations[alias] = identity if owner in (None, identity) else _CONFLICTED
         self._records[identity] = record
 
-    def hydrate(self, events):
+    def _hydrate_quarantined(self, events):
+        grouped = {}
+        for event in events:
+            if (event.get('entity_type') != 'agent_identity'
+                    or event.get('event_type') != 'agent_identity.updated'):
+                continue
+            # Validate every envelope, including malformed duplicate/older
+            # versions that an ordinary replay would otherwise ignore.
+            validator = AgentIdentityRegistry()
+            validator.hydrate([event])
+            identity = event['payload']['identity']
+            grouped.setdefault(identity, []).append(event)
+
+        validated = []
+        for identity, history in grouped.items():
+            previous = self._records.get(identity)
+            if previous is not None:
+                history.append({'entity_type': 'agent_identity', 'entity_id': identity,
+                                'event_type': 'agent_identity.updated', 'payload': previous})
+            isolated = AgentIdentityRegistry()
+            # Ascending versions also expose divergent older versions; global
+            # collisions are the only validation failures quarantine tolerates.
+            isolated.hydrate(sorted(history, key=lambda event: event['payload']['version']))
+            validated.append(isolated._records[identity])
+        # Publish only after every identity has passed strict validation. The
+        # cumulative reservations reconstruct blocked aliases from snapshots.
+        for record in validated:
+            self._publish(record)
+
+    def hydrate(self, events, *, quarantine_conflicts=False):
         """Replay ordered durable envelopes without generating new events.
 
         Duplicate/older versions are ignored. Conflicting or malformed identity
         events fail closed rather than silently permitting duplicate references.
+        Opt-in quarantine retains validated identities but blocks ambiguous
+        reservations until operators explicitly rename the affected identities.
+        Historical ambiguous aliases remain blocked after those renames.
         """
         with self._lock:
+            if quarantine_conflicts:
+                self._hydrate_quarantined(events)
+                return
             for event in events:
                 if event.get('entity_type') != 'agent_identity':
                     continue

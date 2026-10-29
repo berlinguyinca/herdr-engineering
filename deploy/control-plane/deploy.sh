@@ -39,7 +39,7 @@
 #      deploy, or one whose running commit predates the directory-mounted fleet
 #      config, has no automatic rollback and says so.
 #
-#   HERDR_CP_HEALTH_URL / _TRIES (30) / _INTERVAL (2s) tune the health check.
+#   HERDR_CP_HEALTH_URL / _TRIES (300) / _INTERVAL (2s) tune the health check.
 #
 # The central file is the only configuration source: no env file is authored or
 # kept. Nothing from it is printed by this script or written to a receipt.
@@ -239,13 +239,19 @@ fi
 
 PREVIOUS_IMAGE="$(docker inspect -f '{{.Config.Image}}' herdr-cp-web 2>/dev/null || true)"
 echo "currently running: ${PREVIOUS_IMAGE:-nothing}"
+STATE_HELPER="$HERE/deploy-state.py"
 
 # What to roll back to: the commit recorded in the running image's receipt, deployed
 # again with THAT commit's compose files. Only a commit whose compose.yaml carries
 # `x-herdr-deploy-layout: 2` can run on this script's variables; anything older (or no
 # receipt at all) gets no automatic rollback and a manual recipe instead.
 PREV_COMMIT=""; PREV_SHA=""; PREV_TAG=""; PREV_COLLAB_HASH=""; ROLLBACK_NOTE=""
-PREV_RECEIPT_TAG="${PREVIOUS_IMAGE#herdr-engineering:}"
+PREV_RECEIPT_TAG=""
+if [ -n "$PREVIOUS_IMAGE" ]; then
+  # Protected rollback uses image IDs as Config.Image. Recover its logical tag
+  # from the actual image buildstamp, cross-checked against the existing receipt.
+  PREV_RECEIPT_TAG="$(python3 "$STATE_HELPER" resolve-previous "$STATE_DIR" "$PREVIOUS_IMAGE")" || exit 1
+fi
 if [ -z "$PREVIOUS_IMAGE" ]; then
   ROLLBACK_NOTE="nothing was running (first deploy)"
 elif ! [[ "$PREV_RECEIPT_TAG" =~ ^[0-9a-f]{12}$ ]] || [ ! -r "$STATE_DIR/$PREV_RECEIPT_TAG.json" ]; then
@@ -276,6 +282,10 @@ if [ -n "$PREV_COMMIT" ]; then
   echo "automatic rollback target: $PREVIOUS_IMAGE (commit $PREV_SHA)"
 else
   echo "no automatic rollback for this deploy: $ROLLBACK_NOTE"
+  if [[ "$PREVIOUS_IMAGE" == sha256:* ]]; then
+    echo "cannot validate a rollback target for the pinned running image; refusing deployment" >&2
+    exit 1
+  fi
 fi
 
 if [ -z "$HEALTH_URL" ]; then
@@ -285,7 +295,7 @@ if [ -z "$HEALTH_URL" ]; then
   case "$BIND" in *:*) BIND="[$BIND]" ;; esac   # IPv6 literal
   HEALTH_URL="http://${BIND:-127.0.0.1}:${PORT:-80}/api/v1/health"
 fi
-HEALTH_TRIES="${HERDR_CP_HEALTH_TRIES:-30}"
+HEALTH_TRIES="${HERDR_CP_HEALTH_TRIES:-300}"
 HEALTH_INTERVAL="${HERDR_CP_HEALTH_INTERVAL:-2}"
 
 COLLAB_HASH=""
@@ -309,7 +319,6 @@ docker build -q -f "$WORK/deploy/fabric-stack/Dockerfile" --build-arg "GIT_COMMI
 # Use this checkout's helper, not the target commit's possibly older deploy tooling.
 # The selected canonical source stays the forward mount. Snapshots live outside
 # ENV_DIR so cleanup, logout and a failed rollout cannot destroy recovery inputs.
-STATE_HELPER="$HERE/deploy-state.py"
 ATTEMPT="$(python3 "$STATE_HELPER" prepare "$STATE_DIR" "$CENTRAL_REAL" "$FULL" \
   "$PREV_COMMIT" "$PREVIOUS_IMAGE" "$COLLAB")" || exit 1
 if [ "$CENTRAL_HASH" != "$(sha256sum "$ATTEMPT/candidate/fleet-config.yaml" | cut -d' ' -f1)" ]; then

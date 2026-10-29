@@ -606,3 +606,24 @@ def test_open_listener_identity_headers_share_one_operator_scope():
         assert json.loads(body)["tenant_id"] == "default"
     finally:
         svr.shutdown()
+
+
+def test_read_memory_executor_honors_query_and_namespace_schema():
+    # schema now exposes namespace[]/query (not key/value); executor must use them
+    svc, runner = _tool_service([
+        {"content": "", "tool_calls": [{"id": "c1", "name": "read_memory",
+                                        "arguments": json.dumps({"query": "deploy", "namespace": ["ops"]})}]},
+        {"content": "done", "tool_calls": []},
+    ])
+    a = svc.create_assistant(tenant_id="t1", user_id="u1", name="A")
+    svc.grant_tool(tenant_id="t1", user_id="u1", assistant_id=a.assistant_id,
+                   tool_id="read_memory", scope="*")
+    svc.store_memory(tenant_id="t1", user_id="u1", assistant_id=a.assistant_id,
+                     content="the deploy window is Friday", namespace="ops")
+    svc.store_memory(tenant_id="t1", user_id="u1", assistant_id=a.assistant_id,
+                     content="unrelated lunch note", namespace="ops")
+    th = svc.create_thread(tenant_id="t1", user_id="u1", assistant_id=a.assistant_id)
+    svc.send_message(tenant_id="t1", user_id="u1", assistant_id=a.assistant_id,
+                     thread_id=th.thread_id, content="when is deploy?")
+    tool_msg = [m for m in runner.seen[1]["messages"] if m.get("role") == "tool"][0]
+    assert "deploy window is Friday" in tool_msg["content"]

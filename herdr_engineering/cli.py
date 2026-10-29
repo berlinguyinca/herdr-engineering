@@ -47,6 +47,9 @@ def _build_parser() -> argparse.ArgumentParser:
         cp.add_argument("--dry-run", action="store_true")
         cp.set_defaults(func=_cmd_build_cleanup)
 
+    from .open_client import register_parser
+    register_parser(sub)
+
     # build-coordinate ----------------------------------------------------
     # Cross-agent single-flight build gate: bound concurrent cargo/tsc builds
     # across ALL agents on a host so they can't create a CPU build-storm.
@@ -304,6 +307,35 @@ def _build_parser() -> argparse.ArgumentParser:
     p2.add_argument("--out", default=None, help="output .html path (default: <graph_json>.html)")
     p2.set_defaults(func=_cmd_graph_artifact_render)
 
+    # summary --------------------------------------------------------------
+    p = sub.add_parser("summary", help="/summary skill: install, verify, remove, read session history")
+    smsub = p.add_subparsers(dest="summary_command", required=True)
+    for name, helptext in (("install", "install or upgrade the summary skill and /summary commands"),
+                           ("uninstall", "remove only what this installer wrote"),
+                           ("verify", "read-only installation check (exit 1 if missing or invalid)")):
+        p2 = smsub.add_parser(name, help=helptext)
+        p2.add_argument("--scope", choices=("global", "project"), default="global")
+        p2.add_argument("--home", default=None, help="override $HOME (tests)")
+        p2.add_argument("--project-dir", default=None, help="project root for --scope project (default: cwd)")
+        if name != "verify":
+            p2.add_argument("--dry-run", action="store_true")
+        p2.add_argument("--json", action="store_true")
+        p2.set_defaults(func=_cmd_summary_manage)
+    p2 = smsub.add_parser("history", help="read-only normalized history of the current agent session")
+    p2.add_argument("--agent", choices=("claude", "pi", "codex", "opencode"), default=None)
+    p2.add_argument("--session", default=None, help="session id or transcript path")
+    p2.add_argument("--cwd", default=None)
+    p2.add_argument("--home", default=None)
+    p2.add_argument("--max-events", type=int, default=400)
+    p2.add_argument("--json", action="store_true", help="accepted for symmetry; output is always JSON")
+    p2.set_defaults(func=_cmd_summary_history)
+    p2 = smsub.add_parser("report", help="run the summary skill headlessly on one recorded session (full report as JSON)")
+    p2.add_argument("--agent", required=True, choices=("claude", "pi", "codex", "opencode"))
+    p2.add_argument("--session", required=True, help="session id of the target session")
+    p2.add_argument("--harness", choices=("claude", "codex"), default="claude", help="summarizer harness")
+    p2.add_argument("--timeout", type=int, default=300)
+    p2.set_defaults(func=_cmd_summary_report)
+
     # journal --------------------------------------------------------------
     p = sub.add_parser("journal", help="session journal & timeline (spec 0090)")
     jsub = p.add_subparsers(dest="journal_command", required=True)
@@ -390,7 +422,77 @@ def _build_parser() -> argparse.ArgumentParser:
                     help="opt-in: rewrite loopback URLs in Location / CORS / cookie-domain "
                          "headers of HTTP leases to the fabric address (forces "
                          "Connection: close; bodies and websockets are untouched)")
+    p2.add_argument("--tls-cert", default=None, help="serve HTTPS on every leased port with this certificate "
+                    "(same port as HTTP; issue one with `devfabric ca issue`)")
+    p2.add_argument("--tls-key", default=None, help="private key for --tls-cert")
+    p2.add_argument("--acme-domain", default=None, help="serve a publicly trusted Let's Encrypt certificate for this "
+                    "name and *.name (e.g. local.metabolomics.us); also the default --url-base")
+    p2.add_argument("--url-alias", action="append", default=[],
+                    help="extra name the fabric answers to when resolving URLs (repeatable; dev.lan is added "
+                         "automatically when a private CA exists)")
+    p2.add_argument("--named-port", type=int, default=None,
+                    help="port for stable https://<service>.<acme-domain> URLs (default 443; if it cannot be bound "
+                         "the gateway keeps using per-port URLs)")
+    p2.add_argument("--apex-upstream", default=None, metavar="HOST:PORT",
+                    help="where the bare fleet names (https://dev.lan, https://<acme-domain>) go: the dashboard, e.g. "
+                         "100.104.39.6:80. Needs the named listener (--acme-domain) and a certificate for the name")
+    p2.add_argument("--route", action="append", default=[], metavar="HOST=UP:PORT",
+                    help="send one exact host name on the named port to an upstream (repeatable), e.g. "
+                         "bender.tail0c50da.ts.net=127.0.0.1:8787 to take over a `tailscale serve` rule")
+    p2.add_argument("--tailscale-cert", default=None, metavar="NAME",
+                    help="also serve this node's ts.net NAME with the certificate `tailscale cert` provides")
+    p2.add_argument("--no-named-urls", action="store_true", help="do not serve stable service-name URLs")
+    p2.add_argument("--acme-dir", default=None, help="certbot state directory (default: ~/.config/herdr-engineering/acme)")
+    p2.add_argument("--acme-staging", action="store_true", help="use the Let's Encrypt staging CA (untrusted; for trials)")
+    p2.add_argument("--renew-certs", action="store_true",
+                    help="renew certificates from this gateway (set on exactly one node of a pair)")
+    p2.add_argument("--peer", default=None, help="control URL of the other gateway: run as an active/standby pair "
+                    "(the standby mirrors leases and promotes itself when the peer stops answering)")
+    p2.add_argument("--node-id", default=None, help="stable name for this gateway in a pair (default: hostname)")
+    p2.add_argument("--promote-after", type=int, default=3, help="missed peer checks before a standby takes over")
+    p2.add_argument("--allow-user", action="append", default=[],
+                    help="tailnet login allowed to open leased ports (repeatable). With --allow-user/--allow-tag "
+                         "every other peer, guests and shared-in devices included, is refused")
+    p2.add_argument("--allow-tag", action="append", default=[], help="tailnet ACL tag allowed (e.g. tag:dev)")
     p2.set_defaults(func=_cmd_dev_gateway)
+    p2 = dsub.add_parser("cert", help="publicly trusted certificate for the fabric name (Let's Encrypt, DNS-01 on Route 53)")
+    csub = p2.add_subparsers(dest="cert_cmd", required=True)
+    for name, helptext in (("issue", "obtain the certificate now (no-op while a valid one exists unless --force)"),
+                           ("renew", "renew only when due (safe to run from cron)"),
+                           ("status", "show expiry and whether renewal is due")):
+        q = csub.add_parser(name, help=helptext)
+        q.add_argument("--domain", default=None, help="fleet name (default: fabric.acme_domain from config)")
+        q.add_argument("--dir", default=None, help="certbot state directory (default: ~/.config/herdr-engineering/acme)")
+        q.add_argument("--staging", action="store_true", help="use the Let's Encrypt staging CA")
+        q.add_argument("--email", default=None, help="expiry-notice address; omitted = register without one")
+        if name == "issue":
+            q.add_argument("--force", action="store_true", help="force a new certificate (counts against rate limits)")
+    p2.set_defaults(func=_cmd_dev_cert)
+    p2 = dsub.add_parser("dns", help="publish the fabric name in Route 53")
+    dnssub = p2.add_subparsers(dest="dns_cmd", required=True)
+    q = dnssub.add_parser("publish", help="UPSERT A records for NAME and *.NAME pointing at the gateway tailnet IPs")
+    q.add_argument("--domain", default=None, help="fleet name (default: fabric.acme_domain from config)")
+    q.add_argument("--ip", action="append", default=[], help="gateway tailnet IPv4 (repeatable; default: this host's)")
+    q.add_argument("--ttl", type=int, default=60)
+    q.add_argument("--zone-id", default=None, help="hosted zone id (default: found by name)")
+    q.add_argument("--dry-run", action="store_true", help="show what would change; write nothing")
+    p2.set_defaults(func=_cmd_dev_dns)
+    p2 = dsub.add_parser("ca", help="private CA for the fabric's HTTPS (dev.lan)")
+    casub = p2.add_subparsers(dest="ca_cmd", required=True)
+    for name, helptext in (("init", "create the name-constrained root CA"),
+                           ("issue", "issue the gateway's server certificate"),
+                           ("export", "write the root for device enrollment (.pem and iOS .mobileconfig)"),
+                           ("status", "show the CA, its fingerprint and certificate expiry")):
+        q = casub.add_parser(name, help=helptext)
+        q.add_argument("--dir", default=None, help="CA directory (default: ~/.config/herdr-engineering/ca)")
+        if name == "init":
+            q.add_argument("--domain", action="append", help="fabric domain the CA may sign (default: dev.lan)")
+        if name == "issue":
+            q.add_argument("--name", action="append", help="DNS name for the certificate "
+                           "(default: dev.lan and *.dev.lan)")
+        if name == "export":
+            q.add_argument("--out", default=".", help="directory to write fabric-ca.pem / fabric-ca.mobileconfig")
+        q.set_defaults(func=_cmd_dev_ca)
     p2 = dsub.add_parser(
         "agent",
         help="auto-register this host's web services with the gateway")
@@ -827,6 +929,46 @@ def _cmd_doctor(args) -> int:
     return doctor_main(args)
 
 
+def _cmd_summary_manage(args) -> int:
+    from . import session_summary as ss
+    kw = dict(scope=args.scope, home=Path(args.home) if args.home else None,
+              project=Path(args.project_dir) if args.project_dir else None)
+    ok = True
+    if args.summary_command == "verify":
+        ok, results = ss.verify(**kw)
+    else:
+        fn = ss.install if args.summary_command == "install" else ss.uninstall
+        results = fn(dry_run=args.dry_run, **kw)
+    if args.json:
+        _print_json({"ok": ok, "results": [r.to_dict() for r in results]})
+    else:
+        for r in results:
+            print(f"{r.action:10} {r.target}" + (f"  ({r.detail})" if r.detail else ""))
+            if r.action == "preserved":
+                print(f"warning: kept existing {r.target}", file=sys.stderr)
+    return 0 if ok else 1
+
+
+def _cmd_summary_history(args) -> int:
+    from . import session_history as sh
+    home = Path(args.home) if args.home else None
+    res = sh.resolve(agent=args.agent, session=args.session, cwd=args.cwd, home=home)
+    out = sh.read_history(res, home=home, max_events=args.max_events)
+    out["journal"] = sh.journal_projection(res.session_id)
+    _print_json(out)
+    return 0
+
+
+def _cmd_summary_report(args) -> int:
+    from . import summary_report as sr
+    try:
+        _print_json(sr.run_report(args.agent, args.session, harness=args.harness, timeout=args.timeout))
+    except sr.ReportError as exc:
+        _print_json({"ok": False, "error": exc.code, "detail": exc.detail})
+        return 1
+    return 0
+
+
 def _cmd_agent_mine(args) -> int:
     from . import agent_mine
     args.out = os.path.expanduser(args.out)
@@ -1015,7 +1157,7 @@ def _cmd_fleet_update(args) -> int:
         for h in report.get("status", {}).get("hosts", []):
             print(f"  {h['host']:12} herdr-eng={h['herdr_eng']} build-gate={h['build_gate']} "
                   f"agent={h['agent']} revision={h.get('revision', 'unknown')} "
-                  f"cleanup={h.get('cleanup', 'unknown')}")
+                  f"cleanup={h.get('cleanup', 'unknown')} summary={h.get('summary', 'unknown')}")
         fs = report.get("steps", {}).get("fleet_sync", {})
         if fs.get("rc") != 0 and fs.get("stderr"):
             print(f"  !! {fs['stderr']}")
@@ -1131,7 +1273,7 @@ def _cmd_fleet_status(args) -> int:
         for h in status.get("hosts", []):
             print(f"{h['host']:12} herdr-eng={h['herdr_eng']} build-gate={h['build_gate']} "
                   f"agent={h['agent']} revision={h.get('revision', 'unknown')} "
-                  f"cleanup={h.get('cleanup', 'unknown')}")
+                  f"cleanup={h.get('cleanup', 'unknown')} summary={h.get('summary', 'unknown')}")
         if not status.get("hosts"):
             print(f"no hosts reported (playbook rc={status.get("rc")})")
     return 0 if status.get("rc") == 0 else 1
@@ -1342,6 +1484,24 @@ def _gateway_configured_or_reachable() -> bool:
         return True
     except Exception:
         return False
+
+
+def _fabric_url_resolver():
+    """Resolver the dashboard uses for canonical fabric URLs; None when no gateway is configured."""
+    from .config import load_config
+    from .fabric import FabricClient, gateway_url_from_config
+    url = gateway_url_from_config(load_config())
+    if not url:
+        return None
+    client = FabricClient(url)
+    return client.resolve_urls
+
+
+def _fabric_service_lister():
+    from .config import load_config
+    from .fabric import FabricClient, gateway_url_from_config
+    url = gateway_url_from_config(load_config())
+    return FabricClient(url).list if url else None
 
 
 def _resolve_target_host(host: str, port: int) -> str:
@@ -1956,6 +2116,140 @@ def _cmd_dev_list(args) -> int:
     return 0
 
 
+def _ca_dir(args):
+    from pathlib import Path
+    return Path(args.dir).expanduser() if args.dir else Path.home() / ".config" / "herdr-engineering" / "ca"
+
+
+def _cmd_dev_ca(args) -> int:
+    from .fabric_tls import CAError, PrivateCA, fingerprint_sha256
+    ca = PrivateCA(_ca_dir(args))
+    try:
+        if args.ca_cmd == "init":
+            path = ca.init(args.domain or ["dev.lan"])
+            _print_json({"ok": True, "ca": str(path), "domains": ca.domains(),
+                         "sha256": fingerprint_sha256(path),
+                         "next": "devfabric ca issue, then devfabric ca export and enroll each device"})
+        elif args.ca_cmd == "issue":
+            names = args.name or [d for dom in ca.domains() for d in (dom, f"*.{dom}")]
+            cert, key = ca.issue(names)
+            _print_json({"ok": True, "cert": str(cert), "key": str(key), "names": names,
+                         "expires": ca.expires(cert).isoformat(),
+                         "next": f"run the gateway with --tls-cert {cert} --tls-key {key}"})
+        elif args.ca_cmd == "export":
+            from pathlib import Path
+            out = Path(args.out).expanduser()
+            out.mkdir(parents=True, exist_ok=True)
+            pem, prof = out / "fabric-ca.pem", out / "fabric-ca.mobileconfig"
+            pem.write_text(ca.cert_path.read_text())
+            prof.write_bytes(ca.mobileconfig())
+            _print_json({"ok": True, "pem": str(pem), "mobileconfig": str(prof),
+                         "sha256": fingerprint_sha256(ca.cert_path),
+                         "note": "public certificate only; the CA key never leaves its directory"})
+        else:
+            gw = ca.dir / "gateway.pem"
+            _print_json({"ca": ca.exists(), "domains": ca.domains(),
+                         "sha256": fingerprint_sha256(ca.cert_path) if ca.exists() else None,
+                         "gateway_cert": str(gw) if gw.exists() else None,
+                         "gateway_expires": ca.expires(gw).isoformat() if gw.exists() else None,
+                         "renewal_due": ca.needs_renewal(gw) if gw.exists() else None})
+    except CAError as exc:
+        _print_json({"ok": False, "error": str(exc)})
+        return 1
+    return 0
+
+
+def _fabric_cfg() -> dict:
+    from .config import InvalidError, load_config
+    try:
+        return load_config().get("fabric") or {}
+    except InvalidError:
+        return {}
+
+
+def _acme_for(args, cfg: dict):
+    from pathlib import Path
+
+    from .fabric_certs import AcmeRoute53
+    domain = getattr(args, "domain", None) or getattr(args, "acme_domain", None) or cfg.get("acme_domain")
+    if not domain:
+        raise SystemExit("no domain: pass --domain/--acme-domain or set fabric.acme_domain")
+    directory = getattr(args, "dir", None) or getattr(args, "acme_dir", None) or cfg.get("acme_dir") \
+        or Path.home() / ".config" / "herdr-engineering" / "acme"
+    return AcmeRoute53(domain, Path(directory), staging=bool(getattr(args, "staging", False) or getattr(args, "acme_staging", False) or cfg.get("acme_staging")),
+                       email=getattr(args, "email", None) or cfg.get("acme_email") or None)
+
+
+def _route(spec) -> tuple[str, tuple[str, int]]:
+    host, sep, upstream = str(spec).partition("=")
+    target = _host_port(upstream)
+    if not sep or not host or target is None:
+        raise SystemExit(f"--route must be HOST=UPSTREAM:PORT, got {spec!r}")
+    return host.strip().lower(), target
+
+
+def _host_port(value) -> tuple[str, int] | None:
+    if not value:
+        return None
+    host, _, port = str(value).rpartition(":")
+    if not host or not port.isdigit() or not 0 < int(port) < 65536:
+        raise SystemExit(f"--apex-upstream must be HOST:PORT, got {value!r}")
+    return host, int(port)
+
+
+def _private_ca_domains(cfg: dict) -> list[str]:
+    from pathlib import Path
+
+    from .fabric_tls import PrivateCA
+    ca = PrivateCA(Path(cfg.get("ca_dir") or Path.home() / ".config" / "herdr-engineering" / "ca"))
+    return ca.domains() if ca.exists() else []
+
+
+def _fabric_names_getter():
+    from .config import load_config
+    from .fabric import FabricClient, gateway_url_from_config
+    url = gateway_url_from_config(load_config())
+    return FabricClient(url).names if url else None
+
+
+def _cmd_dev_cert(args) -> int:
+    from .fabric_certs import CertError, CertManager
+    acme = _acme_for(args, _fabric_cfg())
+    try:
+        if args.cert_cmd == "status":
+            _print_json(CertManager(public=acme).status() if acme.fullchain.exists()
+                        else {"public": None, "note": f"no certificate yet: run `devfabric cert issue --domain {acme.domain}`"})
+        elif args.cert_cmd == "issue":
+            changed = acme.obtain(force=args.force)
+            _print_json({"ok": True, "changed": changed, "fullchain": str(acme.fullchain), "names": list(acme.names),
+                         "staging": acme.staging, **CertManager(public=acme).status().get("public", {})})
+        else:
+            if not acme.due():
+                _print_json({"ok": True, "changed": False, "note": "not due"})
+            else:
+                _print_json({"ok": True, "changed": acme.obtain()})
+    except CertError as exc:
+        _print_json({"ok": False, "error": str(exc)})
+        return 1
+    return 0
+
+
+def _cmd_dev_dns(args) -> int:
+    from .fabric import tailnet_ipv4
+    from .fabric_dns import DnsError, publish, route53_client
+    cfg = _fabric_cfg()
+    domain = args.domain or cfg.get("acme_domain")
+    if not domain:
+        raise SystemExit("no domain: pass --domain or set fabric.acme_domain")
+    ips = args.ip or ([tailnet_ipv4()] if tailnet_ipv4() else [])
+    try:
+        _print_json({"ok": True, **publish(route53_client(), domain, ips, ttl=args.ttl, dry_run=args.dry_run, zone_id=args.zone_id)})
+    except DnsError as exc:
+        _print_json({"ok": False, "error": str(exc)})
+        return 1
+    return 0
+
+
 def _cmd_dev_gateway(args) -> int:
     import signal
     import time
@@ -1978,22 +2272,75 @@ def _cmd_dev_gateway(args) -> int:
     # Control API must be reachable from other tailnet hosts (they register
     # through it): prefer the tailnet IP; loopback-only when no tailnet.
     control_host = next((h for h in bind_hosts if h != "127.0.0.1"), "127.0.0.1")
+    acme_domain = getattr(args, "acme_domain", None) or cfg.get("acme_domain") or None
     registry = DevServiceRegistry()
     router = GatewayRouter(bind_hosts)
     gateway = FabricGateway(
         registry, router, control_host=control_host, control_port=control_port,
-        url_base=args.url_base or (cfg.get("url_base") or None),
+        url_base=args.url_base or (cfg.get("url_base") or None) or acme_domain,
         probe_interval=float(cfg.get("probe_interval_seconds", 15)),
         reset_lock=bool(getattr(args, "reset_lock", False)),
-        rewrite_headers=bool(getattr(args, "rewrite_headers", False)))
+        rewrite_headers=bool(getattr(args, "rewrite_headers", False)),
+        peer_url=getattr(args, "peer", None) or cfg.get("peer_url") or None,
+        node_id=getattr(args, "node_id", None) or cfg.get("node_id") or None,
+        promote_after=int(getattr(args, "promote_after", 3)),
+        named_domain=None if getattr(args, "no_named_urls", False) else acme_domain,
+        named_port=int(getattr(args, "named_port", None) or cfg.get("named_port") or 443),
+        host_routes=dict(_route(r) for r in [*getattr(args, "route", []), *(cfg.get("routes") or [])]),
+        apex_upstream=_host_port(getattr(args, "apex_upstream", None) or cfg.get("apex_upstream")),
+        url_aliases=tuple(dict.fromkeys([*getattr(args, "url_alias", []), *(cfg.get("url_aliases") or []),
+                                         *_private_ca_domains(cfg)])))
+    tls_cert = getattr(args, "tls_cert", None) or cfg.get("tls_cert")
+    tls_key = getattr(args, "tls_key", None) or cfg.get("tls_key")
+    if bool(tls_cert) != bool(tls_key):
+        raise SystemExit("--tls-cert and --tls-key must be given together")
+    from pathlib import Path
+    cert_stop = None
+    if acme_domain:
+        import threading
+
+        from .fabric_certs import CertError, CertManager, TailscaleCert
+        from .fabric_tls import PrivateCA
+        ca = PrivateCA(Path(cfg.get("ca_dir") or Path.home() / ".config" / "herdr-engineering" / "ca"))
+        mgr = CertManager(public=_acme_for(args, cfg), private_ca=ca if (ca.dir / "gateway.pem").exists() else None,
+                          private_names=tuple(ca.domains() or ["dev.lan"]),
+                          tailnet=TailscaleCert(ts_name, Path(cfg.get("tailnet_cert_dir") or Path.home() / ".config" / "herdr-engineering" / "tailnet-cert"))
+                          if (ts_name := getattr(args, "tailscale_cert", None) or cfg.get("tailscale_cert")) else None,
+                          renew=bool(getattr(args, "renew_certs", False) or cfg.get("renew_certs")),
+                          on_change=gateway.router.set_tls)
+        try:
+            if mgr.tailnet and not mgr.tailnet.fullchain.exists():
+                mgr.tailnet.obtain()
+            gateway.enable_tls(mgr.load())
+        except CertError as exc:
+            raise SystemExit(f"{exc}\n(or drop --acme-domain to serve plain HTTP)") from exc
+        tls_cert = tls_cert or "acme"
+        cert_stop = threading.Event()
+        threading.Thread(target=mgr.run_forever, args=(cert_stop,), daemon=True, name="cert-renewal").start()
+    elif tls_cert:
+        import ssl as _ssl
+        ctx = _ssl.SSLContext(_ssl.PROTOCOL_TLS_SERVER)
+        ctx.minimum_version = _ssl.TLSVersion.TLSv1_2
+        ctx.load_cert_chain(tls_cert, tls_key)
+        ctx.set_alpn_protocols(["http/1.1"])
+        gateway.enable_tls(ctx)
+    acl = cfg.get("access") or {}
+    users = [*args.allow_user, *(acl.get("users") or [])]
+    tags = [*args.allow_tag, *(acl.get("tags") or [])]
+    if users or tags:
+        from .fabric_access import AccessPolicy
+        router.access = AccessPolicy(users=frozenset(users), tags=frozenset(tags))
     gateway.start()
     _print_json({
-        "ok": True, "gateway": True,
+        "ok": True, "gateway": True, "https": bool(tls_cert), "role": gateway.role, "peer": gateway.peer_url, "access_enforced": bool(users or tags),
         "control_url": f"http://{gateway.control_host}:{control_port}",
         "url_base": gateway.url_base,
+        "named_urls": (f"https://<service>.{gateway.named_domain}" + ("" if gateway.named_port == 443 else f":{gateway.named_port}"))
+                      if gateway.named_front else None,
         "bind_hosts": bind_hosts,
         "probe_interval_seconds": gateway.probe_interval,
-        "note": f"dev:<port> resolves to http://{gateway.url_base}:<port>",
+        "note": f"dev:<port> resolves to {gateway.public_scheme}://{gateway.url_base}:<port>"
+                f"{' (plain http also accepted on the same port)' if tls_cert else ''}",
     })
     stop = {"flag": False}
 
@@ -2008,6 +2355,8 @@ def _cmd_dev_gateway(args) -> int:
         while not stop["flag"]:
             time.sleep(0.5)
     finally:
+        if cert_stop:
+            cert_stop.set()
         gateway.stop()
         _print_json({"stopped": True})
     return 0
@@ -2117,6 +2466,8 @@ def _cmd_dev_agent(args) -> int:
             web_port_min=int(fabric_cfg.get("agent_web_port_min", 1024)),
             ephemeral_min=int(fabric_cfg.get("agent_ephemeral_min", 32768)),
             control_plane_url=control_plane_for(live),
+            fabric_domains=tuple(dict.fromkeys([d for d in (fabric_cfg.get("acme_domain"), fabric_cfg.get("url_base"),
+                                                            *(fabric_cfg.get("url_aliases") or [])) if d])),
             host_report_interval=float(fabric_cfg.get("host_report_interval", 30.0)),
             host_slow_interval=float(fabric_cfg.get("host_slow_interval", 3600.0)),
             agent_binaries=agent_binaries,
@@ -2878,7 +3229,9 @@ def _cmd_cp_web(args) -> int:
                              collab_tls_terminated=args.collab_tls_terminated,
                              collab_require_https=args.collab_require_https,
                              fleet_config=fleet_store, ci_actions=cp.get("ci_actions") is True,
+                             fabric_resolver=_fabric_url_resolver(), fabric_services=_fabric_service_lister(), fabric_names=_fabric_names_getter(),
                              summary_config=cp.get("agent_summaries") or {},
+                             summary_report_config=cp.get("summary_report") or {},
                              assistant_config={"personal_assistant": cp["personal_assistant"]}
                                  if isinstance(cp.get("personal_assistant"), dict) else None,
                              review_quorum=_review_quorum_config(cp),

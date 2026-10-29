@@ -44,7 +44,9 @@ log = logging.getLogger(__name__)
 
 # Routes a host-side tool (session run, plannotator bridge) may POST with the
 # narrow `agent` role, besides /api/v1/ingest. Nothing else.
-_SUMMARY_FIX = re.compile(r"^/api/v1/sessions/[^/]+/summary/fix$")
+_SUMMARY_FIX = re.compile(r"^/api/v1/sessions/[^/]+/summary/(?:fix|report)$")
+# The per-host worker that runs full /summary reports where the session records live (ingest role).
+_HOST_REPORT = re.compile(r"^/api/v1/host/summary-reports/(?:claim|result)$")
 # Terminal button: builds (never runs) the viewer-side attach command; same guard as summary fix.
 _TERMINAL_ATTACH = re.compile(r"^/api/v1/sessions/[^/]+/terminal$")
 _AGENT_POST = re.compile(r"^/api/v1/(?:llm/keys|reviews|llm/keys/[^/]+/revoke"
@@ -250,11 +252,11 @@ class ControlPlaneServer:
                  public_port=None, public_host=None, collab_only=False,
                  operator_port=None, operator_user=None, operator_email=None,
                  operator_hosts=(), collab_operator_url=None, collab_dashboard_hosts=(),
-                 summary_config=None, summary_client=None, usage_retention=None, lineage_key_scopes=None,
+                 summary_config=None, summary_client=None, summary_report_config=None, usage_retention=None, lineage_key_scopes=None,
                  review_quorum=None, system_graph: bool = False, attention=None, ci_fix=None, missions=None, github_pg_dsn=None,
                  architecture_enabled=None, architecture_explain=None, architecture_options=None,
                  request_workers=128, request_queue=256,
-                 assistant_service=None, assistant_config=None):
+                 assistant_service=None, assistant_config=None, fabric_resolver=None, fabric_services=None, fabric_names=None):
         """
         Auth (Spec §104): either a single `api_key` (all-access) or a mapping
         `api_keys={key: role}` with roles "viewer" (read-only) / "operator"
@@ -307,6 +309,7 @@ class ControlPlaneServer:
             load_into(repo, source)
         self.source = source
         self.agent_summaries = None
+        self.summary_report = None
         self._summary_stop = threading.Event()
         self._summary_scanner = None
         if not collab_only:
@@ -315,6 +318,8 @@ class ControlPlaneServer:
                                                        persist=repo.persist_agent_summary,
                                                        model_client=summary_client)
             self.agent_summaries.hydrate(repo.agent_summary_events())
+            from .summary_report import SummaryReportService
+            self.summary_report = SummaryReportService(repo, summary_report_config or {})
         # Optional durable object store (RustFS / S3). When wired, artifact
         # payloads are stored content-addressed here instead of the repo's
         # in-memory blob stand-in, so they survive a web restart.
@@ -380,6 +385,10 @@ class ControlPlaneServer:
                 f"{host!r} without collab_tls_terminated (bearer credentials "
                 "require TLS)")
         self.fleet_config = fleet_config
+        # callable(urls, source_machine) -> {'resolutions': [...]}; None when no fabric gateway is configured
+        self.fabric_resolver = fabric_resolver
+        self.fabric_services = fabric_services      # callable() -> {'leases': [...]} | None
+        self.fabric_names = fabric_names            # callable() -> {'url_base', 'aliases', 'scheme'} | None
         self.review_quorum = review_quorum      # QuorumConfig | None (feature off)
         from .review_quorum import RereviewLedger
         self.rereview = RereviewLedger(repo)
@@ -462,11 +471,45 @@ class ControlPlaneServer:
             digest = hashlib.sha256(key.encode()).hexdigest()[:12]
             self.architecture_agent_hosts[f"key:{digest}"] = frozenset(hosts)
         self.architecture.gate_store_fn = lambda: self.gate_store
+        from .intel_bridge import install as install_intelligence
+        self.intelligence, self.intelligence_bridge = install_intelligence(
+            repo, lambda: self._intelligence_section(fleet_config), github_pg_dsn)
+        repo.egress_fn = lambda: self._intelligence_section(fleet_config).get("egress") or {}
+        self.intelligence.metrics_fn = self._intelligence_metrics
+        self.intelligence.github_app_fn = lambda: getattr(self, "gate_app", None)
+        self.intelligence.ci_repair_fn = self._intelligence_ci_repair
+        if getattr(self, "assistant", None) is not None:
+            self.assistant.intelligence_read = self.intelligence.assistant_read
         self._configure_architecture_explain(fleet_config, architecture_explain)
         if collab is not None:
             collab.architecture = self.architecture
         # live stream (Spec §52)
         repo.subscribe(self._broadcast)
+
+    def _intelligence_ci_repair(self, repository, run, operation_id, actor):
+        """Executor hook for an approved ``request_ci_repair``: the existing CI-fix request, idempotent on the proposal id."""
+        if self.ci_fix is None:
+            raise ValueError("CI fix agents are not enabled (control_plane.ci_fix)")
+        return self.ci_fix.request(self.ci_monitor, repository, run, operation_id, actor=actor)
+
+    def _intelligence_metrics(self) -> dict:
+        from collections import Counter
+        bridge = self.intelligence_bridge
+        return {"bridge": dict(bridge.stats), "queue_depth": bridge._q.qsize(),
+                "incidents": dict(Counter(i["state"] for i in bridge.board.summary()))}
+
+    @staticmethod
+    def _intelligence_section(fleet_config):
+        """`control_plane.project_intelligence` read on every request (hot kill switch); {} when absent."""
+        if fleet_config is None:
+            return {}
+        from ..fleet_config import FleetConfigError
+        try:
+            section = fleet_config.current().section("control_plane")
+        except FleetConfigError:
+            return {}
+        value = (section or {}).get("project_intelligence")
+        return value if isinstance(value, dict) else {}
 
     @staticmethod
     def _architecture_enabled(fleet_config, override):
@@ -596,6 +639,7 @@ class ControlPlaneServer:
         # The queue's real lease and the lease a Claim reports must be one value.
         self.gate_queue = ReviewQueue(repo, lease_seconds=config.reviewer.lease_seconds)
         app = github_app.GitHubAppClient(config.app)  # one client for gate + coordinator
+        self.gate_app = app
         registry = AuthorRegistry(repo)
         notifier = AuthorNotifier(repo, config=config.notify, registry=registry,
                                   dispatcher=self.dispatcher)
@@ -609,6 +653,7 @@ class ControlPlaneServer:
             ci_snapshot=lambda: self.ci_monitor.snapshot(start=False),
             notifier=notifier,
             main_verifier=self.gate_main,
+            repair_gate=self._build_repair_gate(app, fleet_config, repo, registry),
         )
         self.gate_reviewer_config = config.reviewer
         self.gate_coordinator = ReviewCoordinator(
@@ -622,6 +667,47 @@ class ControlPlaneServer:
         # starts the poller, so the server starts the shared monitor itself.
         self.ci_monitor.start()
         self.gate_service.start()
+
+    def _build_repair_gate(self, app, fleet_config, repo=None, registry=None):
+        """Inert unless ``project_intelligence.repair.enabled``; read on every PR so the kill switch is hot.
+
+        Once repair has been seen enabled, an unreadable central config means "kill switch on" (reject), never
+        "policy absent" (which would let merges proceed unchecked).
+        """
+        from ..fleet_config import FleetConfigError
+        from . import repair_policy as rp
+        from .repair_gate import make_repair_gate, policy_from_section
+        seen = {"enabled": False}
+
+        def policy():
+            if fleet_config is None:
+                return None
+            try:
+                section = fleet_config.current().section("control_plane")
+            except FleetConfigError:
+                return rp.RepairPolicy(kill_switch=True) if seen["enabled"] else None
+            value = ((section or {}).get("project_intelligence") or {})
+            result = policy_from_section(value.get("repair") if isinstance(value, dict) else None)
+            seen["enabled"] = seen["enabled"] or result is not None
+            return result
+
+        def families():
+            value = self._intelligence_section(fleet_config).get("repair")
+            fam = value.get("model_families") if isinstance(value, dict) else None
+            return fam if isinstance(fam, dict) else {}
+
+        facts = None
+        if repo is not None and registry is not None:
+            from .repair_gate import make_facts_fn
+            facts = make_facts_fn(app=app, repo=repo, registry=registry, families_fn=families,
+                                  board_lookup=lambda k: self.intelligence_bridge.board._pr.get(k))
+        extra = {"facts_fn": facts} if facts else {}
+        if repo is not None:
+            from .repair_gate import make_counters
+            # looked up per call: the gate is built before project intelligence is installed
+            attempt, open_prs = make_counters(app=app, repo=repo, board_lookup=lambda k: self.intelligence_bridge.board._pr.get(k))
+            extra.update(attempt_fn=attempt, open_repair_prs_fn=open_prs)
+        return make_repair_gate(app=app, policy_fn=policy, **extra)
 
     def _dispatch_native_message(self, record, message, artifact_ids):
         from ..errors import InvalidError
@@ -662,6 +748,9 @@ class ControlPlaneServer:
         h["rustfs"] = "s3" if self.rustfs is not None else "memory"
         h["version"] = __version__
         h["commit"] = _COMMIT
+        if self.repo.agent_identities.conflict_count:
+            h["agent_identity_degraded"] = True
+            h["agent_identity_conflicts"] = self.repo.agent_identities.conflict_count
         h["performance"] = self.request_metrics.snapshot()
         h['performance'].update(request_workers=self.request_workers, request_queue=self.request_queue,
                                 rejected_requests=getattr(self._httpd, 'rejected_requests', 0))
@@ -672,6 +761,8 @@ class ControlPlaneServer:
             h["capabilities"].append("collab_v1")
         if getattr(self, "assistant", None) is not None and self.assistant.config.get("enabled"):
             h["capabilities"].append("assistant_v1")
+        if getattr(self, "intelligence", None) is not None and self.intelligence._cfg()[0]["enabled"]:
+            h["capabilities"].append("project_intelligence_v1")
         if self.architecture.enabled:
             h["capabilities"].append("architecture_v1")
             if self.architecture.explain_config:
@@ -1301,6 +1392,8 @@ def _make_handler(server, public=False, operator=False):
                 return self._collab()
             if self._path_only() == _FLEET_CONFIG_PATH + "/applied":
                 return self._fleet_config_applied()
+            if self._path_only() == "/api/v1/intelligence/webhooks/github":
+                return self._intelligence_webhook()
             # The ingest route is reachable by the ingest role; every other
             # POST requires the operator role (Spec §104).
             path = self.path.split("?")[0]
@@ -1318,6 +1411,7 @@ def _make_handler(server, public=False, operator=False):
                 if self.headers.get("Content-Type", "").split(";", 1)[0].strip() != "application/json":
                     return self._deny(415, "integration mutations require application/json")
             min_role = ("ingest" if path == "/api/v1/ingest" or _STEER_ACK.match(path) or _is_rereview(path)
+                        or _HOST_REPORT.match(path)
                        else "operator")
             if _is_rereview(path) and self._role() == "reviewer":
                 # _require would refuse it too ("read-only"); say why. The review gate dispatches its own re-reviews
@@ -1329,6 +1423,17 @@ def _make_handler(server, public=False, operator=False):
             if self.path.startswith("/api/v1/"):
                 return self._route_api()
             return self._send_json(404, {"error": "not found"})
+
+        def _intelligence_webhook(self):
+            # HMAC-authenticated (no API key); 404 while unconfigured. Body is bounded before it is read.
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                return self._deny(400, "bad length")
+            if length < 0 or length > 1_000_000:
+                return self._send_json(413, {"error": "body too large"})
+            status, body = server.intelligence.post_webhook(self.headers, self.rfile.read(length))
+            return self._send_json(status, body)
 
         def do_PATCH(self):
             # PATCH/DELETE are enabled ONLY for the assistant resource family.
@@ -1743,6 +1848,8 @@ def _make_handler(server, public=False, operator=False):
                         return self._json(svc.get_snapshot(sid))
                     if tail == ["children"]:
                         return self._json(svc.children(sid, q("parent"), q("cursor"), q("limit")))
+                    if tail == ["base"]:
+                        return self._json(svc.pr_base(sid))
                     if tail == ["overlays"]:
                         return self._json(svc.overlays(sid))
                     if tail == ["correlations"]:
@@ -1893,6 +2000,10 @@ def _make_handler(server, public=False, operator=False):
 
         def _api_get(self, parts, resource):
             r = server.repo
+            if resource == "fabric" and len(parts) == 5 and parts[4] == "services":
+                return self._fabric_services()
+            if resource == "fabric" and len(parts) == 5 and parts[4] == "names":
+                return self._fabric_names()
             if (resource == "artifacts" and len(parts) >= 5
                     and not self._artifact_allowed(parts[4], "read")):
                 return self._json({"error": "not found"}, 404)
@@ -1913,6 +2024,11 @@ def _make_handler(server, public=False, operator=False):
                 return self._json(server._health())
             if resource == "architecture":
                 return self._architecture_get(parts)
+            if resource == "intelligence":
+                status, body = server.intelligence.get(
+                    parts[4:], {k: v[0] for k, v in parse_qs(urlsplit(self.path).query).items()},
+                    self._principal(), self._role())
+                return self._json(body, status)
             if resource == "mission-activity" and len(parts) == 4:
                 return self._json({"activities": r.mission_activity.list_summaries(),
                                    "server_time": r._stamp()})
@@ -1983,7 +2099,10 @@ def _make_handler(server, public=False, operator=False):
             if resource == "sessions" and len(parts) == 6 and parts[5] == "summary":
                 if r.get_session(parts[4]) is None:
                     return self._json({"error": "agent not found"}, 404)
-                return self._json(server.agent_summaries.get(parts[4]))
+                body = server.agent_summaries.get(parts[4])
+                if server.summary_report is not None and server.summary_report.enabled:
+                    body = {**body, "full_report": server.summary_report.get(parts[4])}
+                return self._json(body)
             if resource == "sessions":
                 if len(parts) > 4:
                     s = r.get_session(parts[4])
@@ -2303,6 +2422,8 @@ def _make_handler(server, public=False, operator=False):
 
         def _api_post(self, parts, resource):
             r = server.repo
+            if resource == "fabric" and len(parts) == 5 and parts[4] == "resolve-urls":
+                return self._fabric_resolve_urls()
             if resource == "handoffs":
                 body = self._read_json() or {}
                 actor = self._principal()
@@ -2326,6 +2447,13 @@ def _make_handler(server, public=False, operator=False):
                 return self._inspector_set_prefs(parts[4])
             if resource == "architecture":
                 return self._architecture_post(parts)
+            if resource == "intelligence":
+                payload = self._read_json() or {}
+                key = self.headers.get("Idempotency-Key")
+                if isinstance(payload, dict) and key and "idempotency_key" not in payload:
+                    payload["idempotency_key"] = key
+                status, body = server.intelligence.post(parts[4:], payload, self._principal(), self._role())
+                return self._json(body, status)
             # artifact upload carries raw bytes, not JSON — handle first
             if resource == "artifacts" and len(parts) == 4:
                 return self._upload_artifact(r, parts)
@@ -2555,6 +2683,33 @@ def _make_handler(server, public=False, operator=False):
                                                       peer=self.client_address[0]))
                 except AttachRefused as exc:
                     return self._json(exc.body, exc.status)
+            if resource == "host" and len(parts) == 6 and parts[4] == "summary-reports" and parts[5] in {"claim", "result"}:
+                from .summary_report import ReportRefused
+                reports = server.summary_report
+                host_id = body.get("host_id") if isinstance(body, dict) else None
+                if not isinstance(host_id, str) or not host_id or len(host_id) > 253:
+                    return self._json({"ok": False, "error": "host_id is required"}, 400)
+                if reports is None or not reports.enabled:
+                    return self._json({"ok": True, "jobs": []} if parts[5] == "claim"
+                                      else {"ok": True, "replayed": True})
+                if parts[5] == "claim":
+                    return self._json({"ok": True, "jobs": reports.claim(host_id)})
+                try:
+                    status, result = reports.finish(host_id, body)
+                except ReportRefused as exc:
+                    return self._json(exc.body, exc.status)
+                return self._json(result, status)
+            if resource == "sessions" and len(parts) == 7 and parts[5:] == ["summary", "report"]:
+                from .summary_report import ReportRefused
+                if server.summary_report is None:
+                    return self._json({"ok": False, "error": "Full session reports are not enabled.",
+                                       "reason": "reports_disabled"}, 409)
+                actor = {"role": self._role(), "via": "api_key" if server._keys else "open"}
+                try:
+                    status, result = server.summary_report.start(parts[4], actor=actor)
+                except ReportRefused as exc:
+                    return self._json(exc.body, exc.status)
+                return self._json(result, status)
             if resource == "sessions" and len(parts) == 7 and parts[5:] == ["summary", "fix"]:
                 from .summary_fix import SummaryFixRefused, fix_summary_item
                 actor = {"role": self._role(), "via": "api_key" if server._keys else "open"}
@@ -2990,6 +3145,8 @@ def _make_handler(server, public=False, operator=False):
             return {**session, "capabilities": {"rename_agent": operator,
                                                 "regenerate_summary": operator,
                                                 "fix_summary_item": operator,
+                                                "summary_report": operator and server.summary_report is not None
+                                                and server.summary_report.enabled,
                                                 "attach_terminal": operator}}
 
         def _named_inspector(self, data, sid):
@@ -3253,6 +3410,47 @@ def _make_handler(server, public=False, operator=False):
             return self._json({"error": "not found"}, 404)
 
         # ---------------------------------------------------------- helpers
+        def _fabric_services(self):
+            """Active fabric leases for the Fabric Services page. Only fields the page shows are passed on."""
+            keep = ("id", "external_port", "protocol", "state", "label", "url", "target", "owner", "renewed_at",
+                    "expires_at", "health_last_ok_at", "health_last_error")
+            if server.fabric_services is None:
+                return self._json({"leases": [], "available": False})
+            try:
+                leases = (server.fabric_services() or {}).get("leases") or []
+            except Exception:
+                return self._json({"leases": [], "available": False})
+            return self._json({"leases": [{k: lz.get(k) for k in keep} for lz in leases], "available": True})
+
+        def _fabric_names(self):
+            """Names that mark a URL as the fabric's, for the browser's link detector. Degrades to none."""
+            try:
+                got = server.fabric_names() if server.fabric_names else None
+            except Exception:
+                got = None
+            names = [n for n in [(got or {}).get("url_base"), *((got or {}).get("aliases") or [])] if isinstance(n, str)]
+            return self._json({"names": names[:16], "available": got is not None})
+
+        def _fabric_resolve_urls(self):
+            """Canonical fabric URLs for URLs shown in agent output. Read-only; originals are never changed.
+            A missing or failing gateway degrades to 'unavailable' so a link is simply left as written."""
+            body = self._read_json() or {}
+            urls, machine = body.get("urls"), body.get("source_machine")
+            namespace = body.get("source_namespace")
+            if (not isinstance(urls, list) or len(urls) > 200 or not all(isinstance(u, str) and len(u) <= 2048 for u in urls)
+                    or not (machine is None or isinstance(machine, str))
+                    or not (namespace is None or (isinstance(namespace, str) and len(namespace) <= 64))):
+                return self._json({"error": "urls must be a list of at most 200 strings"}, 400)
+            unavailable = {"resolutions": [{"original": u, "canonical": None, "status": "unavailable",
+                                            "reason": "fabric gateway not reachable"} for u in urls]}
+            if server.fabric_resolver is None:
+                return self._json(unavailable)
+            try:
+                return self._json(server.fabric_resolver(urls, machine, namespace) if namespace
+                                  else server.fabric_resolver(urls, machine))
+            except Exception:
+                return self._json(unavailable)
+
         def _read_json(self, limit=_MAX_JSON_BODY):
             try:
                 length = int(self.headers.get("Content-Length") or 0)

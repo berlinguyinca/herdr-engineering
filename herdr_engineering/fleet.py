@@ -438,8 +438,25 @@ def fleet_status(*, inventory: Path | None = None, host: str | None = None) -> d
                           "revision": _clean(parts[4]).removeprefix("revision=") if len(parts) > 4 else "unknown",
                           "cleanup": _clean(parts[5]).removeprefix("cleanup=") if len(parts) > 5 else "unknown",
                           "pi_revision": _clean(parts[6]).removeprefix("pi-revision=") if len(parts) > 6 else "unknown",
-                          "pi_path": _clean(parts[7]).removeprefix("pi-path=") if len(parts) > 7 else ""})
+                          "pi_path": _clean(parts[7]).removeprefix("pi-path=") if len(parts) > 7 else "",
+                          "summary": _summary_state(parts, root)})
     return {"rc": rc, "hosts": hosts, "stderr": err.strip()[-300:] or None}
+
+
+def _summary_state(parts: list[str], root: Path) -> str:
+    """Informational: is the host's /summary skill the controller's? Never gates parity,
+    because a customized skill is deliberately preserved. Old fingerprints report 'unknown'."""
+    raw = next((p.strip().rstrip('"').strip() for p in parts if p.strip().startswith("summary=")), None)
+    if raw is None:
+        return "unknown"
+    sha = raw.removeprefix("summary=")
+    if sha == "MISSING":
+        return "MISSING"
+    try:
+        want = hashlib.sha256((root / "skills" / "summary" / "SKILL.md").read_bytes()).hexdigest()
+    except OSError:
+        return "unknown"
+    return "current" if sha == want else "differs"
 
 
 def stage_pi_runtime(revision: str, *, host: str, inventory: Path | None = None) -> dict:

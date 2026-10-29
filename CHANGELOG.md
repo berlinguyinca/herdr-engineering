@@ -5,6 +5,24 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Dashboard: on-demand full `/summary` report
+- **Generate full report** on the agent page runs the `summary` skill on the session's recorded conversation and shows the result in the summary card; in the fullscreen workspace it gets its own column so the conversation and composer fit the viewport without page scrolling (the fullscreen panes were previously sized to the whole viewport and cut off the composer). Off by default: `summary_report.enabled` in the central YAML.
+- Runs on the host that owns the session, not in the control-plane container (which has no session records and no `claude`): the control plane queues the request (`POST .../summary/report`, durable event), the per-host session service claims it (`POST /api/v1/host/summary-reports/claim`), runs `herdr-eng summary report` locally and posts the result back, which the server validates and redacts again before storing. Unclaimed requests fail as `host_unreachable`, stuck ones as `timeout`. Roll the plugin to each host.
+- Read-only by construction: the host collects the session history and read-only git facts itself and gives a fresh, non-persisted `claude -p` run no tools; the target session is never resumed or prompted. The report is validated (`# Session summary` ... Evidence coverage) and served as `full_report` on `GET /api/v1/sessions/{id}/summary`.
+- `herdr-eng summary report` prints the same result as JSON. `herdr-eng summary history` now returns the session's recorded `cwd` and finds a session by id without `--agent`. The skill gains a target mode (`/summary <agent> <session-id>`, optionally with prepared `SUMMARY_EVIDENCE_JSON`). Codex as summarizer is implemented but not enabled until it has run live. See `docs/operations/session-summary.md`.
+
+### Fix: idle Codex agents showed an empty dashboard and could not be summarized
+- Codex does not keep its rollout file open between writes, and Herdr reports no `agent_session` for it, so a Codex agent's dashboard page said "Waiting for this agent to identify its transcript" with no conversation, no activity and `recording_unavailable` in the summary card. The feed plugin now also reads Codex's own state database (`logs_*.sqlite`: owning `pid:<pid>:...` and `thread_id`) as process evidence. It is the weakest evidence (only used when no fd, descendant or native identity names a conversation), rows must be newer than the process (reused pids are rejected), only a primary conversation counts, and a tie is never guessed.
+- `herdr-eng summary history` uses the same rule, so `/summary` and the dashboard agree on which Codex conversation a pane holds. Deploy the plugin (`deploy/herdr-cp-feed-plugin`) on each host to pick this up.
+
+### Fix: macOS release staging
+- `docs/specs/herdr-codeboarding-native-port-2026-10-23/AUDIT.md` collided with `audit.md` on case-insensitive filesystems, so every fresh checkout of `main` since #194 looked dirty on macOS and `fleet-sync` refused to stage it. The requirements stub is now `AUDIT-REQUIREMENTS.md`.
+
+### `/summary` session-recovery skill (default install and fleet converge)
+- New canonical read-only `summary` skill (`skills/summary`) installed by `scripts/install.sh` and converged on every fleet host (`ansible/tasks/summary-skill.yml`). `/summary` in Pi, Claude Code and OpenCode; `$summary` in Codex (no Codex command file is written). Evidence-based: separates verified from reported work and states an explicit coverage verdict.
+- `herdr-eng summary install|uninstall|verify|history`. Install/upgrade is manifest-tracked and never overwrites a customized skill, prompt or command (`preserved`); uninstall removes only unmodified files and our own links. `history` is read-only: it resolves the session from an explicit id, then Herdr pane metadata, and only then a labelled directory heuristic; it reads Claude/Pi/Codex JSONL and OpenCode SQLite (`mode=ro`), marks compaction and child-agent gaps, and redacts output. See `docs/operations/session-summary.md`.
+- `herdr-eng fleet status` now shows `summary=current|differs|MISSING|unknown` per host (informational; never fails parity, since a customized skill is deliberately preserved).
+
 ### Collab addressing (`@owner.harness`, sigil completion, mention chips)
 - Release note: a room task's text now starts with the target's `@address` (e.g. `@gert.pi fix the build`). The worker in this repo strips its own leading address; worker scripts installed from an earlier release pass it through to the harness unchanged, so update them.
 - An external (sponsored) agent never gets an `@owner.harness` address; it is reached by its `ext-...` name and its chip is marked external. A person handle outranks an agent name, an agent cannot be renamed to (or granted under) a member's handle, and an agent keeps its last 5 old names as aliases.

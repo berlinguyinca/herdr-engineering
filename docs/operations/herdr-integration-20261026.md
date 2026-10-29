@@ -1,5 +1,67 @@
 # HerdR integration recovery — 2026-10-26
 
+## Final status — 2026-10-28
+
+Deployed and verified release `badc3f7afc0539fa56cb8c10be780e4f6985ce94`.
+PRs #306 and #309 are merged. Production is pinned to the verified commit above;
+newer independent main commits are not implied to be deployed.
+Web, worker, LLM proxy, public collaboration, and edge are running with zero
+restarts. Canonical fleet configuration is mounted read-only, matches the
+protected candidate snapshot, and immutable image/config provenance is verified.
+Earlier pending/paused/rollback statements below describe historical checkpoints.
+
+Live APIs expose 72 missions, 413 sessions, 6,286 services, five hosts, and two
+artifacts. All 46 duplicated initial name allocations were repaired through the
+normal version-checked rename API. Stable session IDs and event history were
+preserved. Replaying the actual durable identity records confirms version-two
+labels, zero current naming conflicts, and blocked historical ambiguous aliases.
+Before/after records and the guarded plan are retained privately.
+
+Verification includes the clean 1,033-test JavaScript run, 268 UI gates, 95 real
+Postgres checks plus assistant persistence, 63 proxy tests, and follow-up recovery
+checks: 75 backend, 18 workspace browser, and 74 deployment/compose tests. Fourteen
+live desktop/mobile page visits passed without page exceptions, server errors,
+rendered error components, or horizontal overflow. Actual retained session history
+from an October 11 session traversed 50-event and 19-event pages without overlap.
+The broad Python run passed 7,318 tests and found one accounting-order assumption;
+its corrected exact-multiset assertion and the complete proxy suite then passed.
+The broad Python command itself is not described as a clean pass.
+
+Twenty on-host reads per endpoint measured p95: health 3.54 ms, missions 1.83 ms,
+sessions 10.49 ms, hosts 1.72 ms. The complete 6,286-service response remains the
+warm latency outlier at 1,202.89 ms p95; its UI uses loading/progress and preserves
+the full catalog. No worker requests were rejected during measurement.
+
+Cold start remains material: this single rollout took 295 seconds from container
+start to verified readiness and peaked at 16,317.4 MiB container memory. Full
+retained replay must not be replaced with event-type filters. The separate
+610-second read-only preflight performed **two** complete hydrations and is not
+a single-startup benchmark. Protected rollback was exercised successfully during
+the first rollout failure before the final successful deployment.
+
+Later independent deployment attempts interrupted startup and recreated the
+verified image again. Docker events show manual stops, not application crashes;
+the legacy one-minute readiness default is shorter than the measured replay.
+The deployer now defaults to 300 probes at two-second intervals (about ten
+minutes), retaining environment overrides. A delayed-readiness regression failed
+with the former 30-probe default and passed with the new budget. Only that default
+was also updated in the canonical and mission-UI legacy entry points; private
+backups preserve every original byte and all other local edits remain intact.
+This deployment-tool change does not require another application restart.
+The verified release subsequently became healthy again with 413 sessions and
+zero naming conflicts, confirming the corrected names survive an actual restart.
+All 84 deployment/compose checks passed with this default, including the delayed
+readiness case; callers can still explicitly override the budget.
+
+Durable private evidence, screenshots, live measurements, and reconciliation
+backups are under
+`~/.local/state/herdr-engineering/releases/20261028-dashboard-4e0368c/`.
+The final receipt is
+`~/.local/state/herdr-engineering/deploys/badc3f7afc05.json`.
+The original dirty canonical checkout was not reset or replaced. Future deploys
+must build a pinned current-main revision through the hardened deployment script,
+not an old local HEAD or a temporary HOME/configuration directory.
+
 ## Required outcome
 
 Consolidate the existing dashboard design and runtime work without losing functionality,
@@ -51,7 +113,7 @@ be verified through actual authentication, without exposing credentials.
 7. Build from the committed integration revision, run a candidate smoke test,
    establish durable rollback/configuration, then verify live provenance and UX.
 
-## Current validation evidence
+## Early validation evidence (historical checkpoint)
 
 - Repository reconciliation: 532 targeted tests passed.
 - API/resource reconciliation: 58 tests passed before the nested ACL regression
@@ -143,6 +205,37 @@ applies. Production has not been changed by this resumed work yet.
   24.59 ms, and 2.79 ms respectively. These are baseline measurements, not gains
   attributable to the pending integration. Retained event-only entities still
   need to be verified after complete replay.
+
+### First rollout and safe recovery
+
+The clean full JavaScript rerun passed all 1,033 tests. PR #306 was merged as
+`6e7f135`; its tree exactly matches verified release `4e0368c`. The exact image
+passed cursor traversal, legacy API, private-stream denial, and asset checks.
+
+The first rollout did not become ready: complete replay exposed 23 duplicated
+initial agent names across 46 identities. Startup failed closed with
+`persisted agent name is already reserved`. Protected rollback successfully
+restored the prior `3f53537` release, all app services, and previous configuration.
+Do not describe this first rollout as successful or weaken replay to hide it.
+
+The follow-up preserves all private identity events and normal strict validation.
+Opt-in recovery blocks ambiguous names/handles for every claimant; sessions use
+their stable IDs until explicitly renamed. Historical ambiguous aliases remain
+blocked after renames. Malformed identities and version divergence still fail
+validation. Workspace diagnostics explain the fallback, including on mobile.
+Seventy-five backend recovery/API checks, 18 workspace browser checks, and the
+actual 415-identity private reproduction passed without production writes.
+
+Rollback pins containers by immutable image ID, so follow-up deployment discovery
+also resolves that ID's buildstamp against the full receipt commit and actual
+image identity. It refuses mismatches and preserves the mounted protected
+configuration. Seventy-four deployment/compose checks passed, including repeated
+rollback and mismatch tests. The live pinned rollback image resolves correctly.
+
+A full read-only replay of the current production data (2,098,684 retained events
+at measurement time) is running before a second rollout. It must prove both
+startup and session/service API availability. Production is currently on the
+healthy previous release; the follow-up is on `fix/herdr-identity-replay-20261028`.
 
 ## History and diagnostics verification
 

@@ -58,8 +58,10 @@ def env(tmp_path, candidate_ref, monkeypatch):
     log = tmp_path / "docker.log"
     stub = bindir / "docker"
     running = tmp_path / "running-tag"
+    health_reads = tmp_path / "health-reads"
     running_mount = tmp_path / "running-mount"
     running_images = tmp_path / "running-images.json"
+    running_config = tmp_path / "running-config-image"
     # Records each call. `inspect` answers $STUB_RUNNING_IMAGE. On `compose ... up` it
     # snapshots the --env-file (mode, dir mode), the -f files and the image tag, fails
     # when FAIL_COMPOSE is set or the tag is in FAIL_COMPOSE_TAGS, and otherwise records
@@ -67,7 +69,19 @@ def env(tmp_path, candidate_ref, monkeypatch):
     stub.write_text(f"""#!/usr/bin/env bash
 echo "docker $*" >> {log}
 if [ "$1 $2" = 'image inspect' ]; then
-  echo '[{{"Id":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}]'; exit 0
+  python3 - "$3" <<'PY'
+import json, os, sys
+old_id = 'sha256:' + 'a' * 64
+old_tag = 'herdr-engineering:' + os.environ.get('STUB_PREVIOUS_TAG', '')
+previous = sys.argv[1] in (old_id, old_tag)
+identity = old_id if previous else 'sha256:' + 'b' * 64
+if sys.argv[1] == old_tag:
+    identity = os.environ.get('STUB_PREVIOUS_TAG_ID', identity)
+commit = os.environ.get('STUB_PREVIOUS_COMMIT', '') if previous else {candidate_ref!r}
+env = json.loads(os.environ['STUB_IMAGE_ENV']) if previous and 'STUB_IMAGE_ENV' in os.environ else ['HERDR_ENGINEERING_COMMIT=' + commit]
+print(json.dumps([{{'Id': identity, 'Config': {{'Env': env}}}}]))
+PY
+  exit 0
 fi
 if [ "$1" = inspect ]; then
   if [ "$#" = 2 ]; then
@@ -77,8 +91,9 @@ import json, os, pathlib, sys
 mount = pathlib.Path({str(running_mount)!r})
 images = pathlib.Path({str(running_images)!r})
 ids = json.loads(images.read_text()) if images.exists() else {{}}
+config = pathlib.Path({str(running_config)!r})
 print(json.dumps([{{"Image": ids.get(sys.argv[1], "sha256:" + "a" * 64),
-    "Config": {{"Image": os.environ.get("STUB_RUNNING_IMAGE", "herdr-engineering:test")}},
+    "Config": {{"Image": config.read_text() if config.exists() else os.environ.get("STUB_RUNNING_IMAGE", "herdr-engineering:test")}},
     "Mounts": [{{"Destination": "/etc/herdr/fleet", "Source": mount.read_text() if mount.exists() else os.environ["STUB_FLEET_DIR"]}}]}}]))
 PY
     exit 0
@@ -93,6 +108,7 @@ PY
       esac
       exit 0 ;;
   esac
+  if [ -f {running_config} ]; then cat {running_config}; exit 0; fi
   [ -n "${{STUB_RUNNING_IMAGE:-}}" ] || exit 1
   echo "$STUB_RUNNING_IMAGE"; exit 0
 fi
@@ -135,6 +151,7 @@ ids = {{v: 'sha256:' + 'b' * 64 for v in names.values()}}
 if sys.argv[1] and not os.environ.get('STUB_IGNORE_ROLLBACK_IMAGES'):
     ids.update({{names[k]: v['image'] for k,v in json.loads(pathlib.Path(sys.argv[1]).read_text())['services'].items()}})
 pathlib.Path({str(running_images)!r}).write_text(json.dumps(ids))
+pathlib.Path({str(running_config)!r}).write_text(ids['herdr-cp-web'] if sys.argv[1] else 'herdr-engineering:' + os.environ['HERDR_CP_IMAGE_TAG'])
 PY
   fi
 fi
@@ -154,6 +171,11 @@ case "$url" in
   *api/v1/health*)
     tag="$(cat {running} 2>/dev/null)"
     [ -n "$tag" ] || exit 7
+    if [ -n "${{STUB_READY_AFTER:-}}" ]; then
+      count="$(cat {health_reads} 2>/dev/null || echo 0)"
+      count=$((count + 1)); echo "$count" > {health_reads}
+      [ "$count" -gt "$STUB_READY_AFTER" ] || exit 7
+    fi
     case " ${{STUB_UNHEALTHY_TAGS:-}} " in *" $tag "*) exit 22 ;; esac
     echo '{{"status":"ok","commit":"'"$tag"'"}}' ;;
   *) echo '{{"keys":[{{"kid":"k"}}]}}' > "${{out:-/dev/stdout}}" ;;
@@ -202,6 +224,16 @@ def test_deploy_dry_run_renders_env_from_central_file_and_removes_it(env):
     assert compose_calls and " config -q" in compose_calls[0]
     path = [ln for ln in env["log"].read_text().splitlines() if ln.startswith("envfile ")][0].split()[1]
     assert not os.path.exists(path) and not os.path.exists(os.path.dirname(path))
+
+
+def test_default_readiness_budget_waits_past_the_old_thirty_probe_window(env):
+    env['env'].pop('HERDR_CP_HEALTH_TRIES')
+    env['env']['STUB_READY_AFTER'] = '35'
+    result = deploy(env)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert 'ok:' in result.stdout
+    assert 'rolled back' not in result.stdout + result.stderr
+    assert int((env['tmp'] / 'health-reads').read_text()) > 35
 
 
 def test_deploy_refuses_when_central_file_missing(env):
@@ -616,6 +648,7 @@ def _seed_previous(e, commit, extra=None):
     receipt = {"ref": "x", "commit": full, "image": f"herdr-engineering:{tag}", **(extra or {})}
     (state / f"{tag}.json").write_text(json.dumps(receipt))
     e["env"]["STUB_RUNNING_IMAGE"] = f"herdr-engineering:{tag}"
+    e["env"].update(STUB_PREVIOUS_TAG=tag, STUB_PREVIOUS_COMMIT=tag)
     return full, tag
 
 
@@ -781,6 +814,141 @@ def test_success_receipt_retains_protected_config_but_mounts_canonical_source(en
     assert receipt["fleet_config_source"] == str(env["central"].resolve())
     assert f"fleetdir={env['central'].parent} tag={_head()}" in env["log"].read_text()
     assert json.loads(Path(receipt["rollback_metadata"]).read_text())["outcome"] == "succeeded"
+
+
+def _seed_pinned_previous(env):
+    full, tag = _seed_previous(env, _layout_commit())
+    state = env["home"] / ".local/state/herdr-engineering/deploys"
+    state.chmod(0o700)
+    mounted = state / "protected-rollback"
+    mounted.mkdir(mode=0o700)
+    saved = mounted / "fleet-config.yaml"
+    saved.write_bytes(env["central"].read_bytes())
+    saved.chmod(0o600)
+    env["env"].update(STUB_RUNNING_IMAGE="sha256:" + "a" * 64,
+                      STUB_FLEET_DIR=str(mounted))
+    return full, tag, state, saved
+
+
+@pytest.mark.parametrize("full_stamp", [False, True])
+def test_pinned_previous_resolves_receipt_and_keeps_actual_mount_and_service_ids(env, full_stamp):
+    full, tag, state, saved = _seed_pinned_previous(env)
+    if full_stamp:
+        env["env"]["STUB_PREVIOUS_COMMIT"] = full
+    receipt_path = state / f"{tag}.json"
+    receipt = json.loads(receipt_path.read_text())
+    # A recorded immutable ID remains valid even if the mutable tag has moved.
+    receipt.update(image_id="sha256:" + "a" * 64,
+                   fleet_config_snapshot=str(state / "obsolete-snapshot"))
+    receipt_path.write_text(json.dumps(receipt))
+    env["env"]["STUB_PREVIOUS_TAG_ID"] = "sha256:" + "f" * 64
+    ids = {"herdr-cp-web": "sha256:" + "a" * 64,
+           "herdr-cp-worker": "sha256:" + "c" * 64,
+           "herdr-llm-proxy": "sha256:" + "d" * 64}
+    (env["tmp"] / "running-images.json").write_text(json.dumps(ids))
+    r = deploy(env)
+    assert r.returncode == 0, r.stderr
+    assert f"automatic rollback target: sha256:{'a' * 64} (commit {tag})" in r.stdout
+    metadata = json.loads(next(state.glob("attempt-*/metadata.json")).read_text())
+    previous = metadata["previous"]
+    assert previous["commit"] == full
+    assert previous["fleet_config_source"] == str(saved)
+    assert Path(previous["fleet_config_snapshot"]).read_bytes() == saved.read_bytes()
+    assert previous["images"] == {
+        "control-plane-web": ids["herdr-cp-web"],
+        "control-plane-worker": ids["herdr-cp-worker"], "llm-proxy": ids["herdr-llm-proxy"],
+    }
+    assert json.loads((state / f"{_head()}.json").read_text())["previous_commit"] == full
+
+
+def test_next_failed_candidate_after_pinned_rollback_is_still_protected(env):
+    full, tag = _seed_previous(env, _layout_commit())
+    env["env"]["STUB_UNHEALTHY_TAGS"] = _head()
+    old_bytes = env["central"].read_bytes()
+    first = deploy(env)
+    assert first.returncode == 1 and "and healthy" in first.stderr
+    state = env["home"] / ".local/state/herdr-engineering/deploys"
+    first_path = next(state.glob("attempt-*/metadata.json"))
+    first_metadata = json.loads(first_path.read_text())
+    first_snapshot = Path(first_metadata["previous"]["fleet_config_snapshot"])
+    data = yaml.safe_load(old_bytes)
+    data["sections"]["control_plane"]["values"]["compose"]["HERDR_CP_WEB_PUBLIC_PORT"] = "8181"
+    fcc.write_private_file(env["central"], yaml.safe_dump(data))
+    second = deploy(env)
+    assert second.returncode == 1 and "and healthy" in second.stderr, second.stderr
+    second_path, = set(state.glob("attempt-*/metadata.json")) - {first_path}
+    metadata = json.loads(second_path.read_text())
+    assert metadata["outcome"] == "rolled_back"
+    assert metadata["previous"]["commit"] == full
+    assert metadata["previous"]["fleet_config_source"] == str(first_snapshot)
+    snapshot = Path(metadata["previous"]["fleet_config_snapshot"])
+    assert snapshot.read_bytes() == old_bytes != env["central"].read_bytes()
+    assert metadata["previous"]["images"] == first_metadata["previous"]["images"]
+    assert f"fleetdir={snapshot.parent} tag={tag}" in env["log"].read_text()
+    for path in (snapshot, second_path):
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+        assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
+    for secret in env["secrets"]:
+        assert secret not in second.stdout + second.stderr + second_path.read_text()
+    _assert_deploy_worktrees_removed(env)
+
+
+@pytest.mark.parametrize("fault", [
+    "missing_stamp", "invalid_stamp", "duplicate_stamp", "wrong_stamp", "wrong_full_stamp",
+    "missing_receipt", "wrong_commit", "wrong_receipt_tag", "wrong_receipt_id", "retagged",
+    "wrong_config_id", "unprotected_mount",
+])
+def test_pinned_previous_identity_mismatch_refuses_before_mutation(env, fault):
+    full, tag, state, saved = _seed_pinned_previous(env)
+    receipt_path = state / f"{tag}.json"
+    receipt = json.loads(receipt_path.read_text())
+    if fault.endswith("stamp"):
+        stamps = {
+            "missing_stamp": [], "invalid_stamp": ["HERDR_ENGINEERING_COMMIT=secret-invalid"],
+            "duplicate_stamp": [f"HERDR_ENGINEERING_COMMIT={tag}"] * 2,
+            "wrong_stamp": ["HERDR_ENGINEERING_COMMIT=" + "f" * 12],
+            "wrong_full_stamp": ["HERDR_ENGINEERING_COMMIT=" + tag + "f" * 28],
+        }
+        env["env"]["STUB_IMAGE_ENV"] = json.dumps(stamps[fault] + ["UNRELATED_SECRET=never-print-this"])
+    elif fault == "wrong_commit":
+        receipt["commit"] = "f" * 40
+    elif fault == "wrong_receipt_tag":
+        receipt["image"] = "herdr-engineering:" + "f" * 12
+    elif fault == "wrong_receipt_id":
+        receipt["image_id"] = "sha256:" + "f" * 64
+    elif fault == "retagged":
+        env["env"]["STUB_PREVIOUS_TAG_ID"] = "sha256:" + "f" * 64
+    elif fault == "wrong_config_id":
+        env["env"]["STUB_RUNNING_IMAGE"] = "sha256:" + "f" * 64
+    elif fault == "unprotected_mount":
+        saved.parent.chmod(0o755)
+    receipt_path.write_text(json.dumps(receipt))
+    if fault == "missing_receipt":
+        receipt_path.unlink()
+    r = deploy(env)
+    assert r.returncode != 0, r.stdout
+    assert " up " not in env["log"].read_text()
+    assert not (env["home"] / ".config/herdr-engineering/llm-proxy").exists()
+    assert "deployment recovery state operation failed" in r.stderr
+    assert "never-print-this" not in r.stdout + r.stderr
+    assert "secret-invalid" not in r.stdout + r.stderr
+
+
+@pytest.mark.parametrize("retagged", [False, True])
+def test_legacy_receipt_without_buildstamp_requires_tag_to_match_running_id(env, retagged):
+    full, _ = _seed_previous(env, _layout_commit())
+    env["env"]["STUB_IMAGE_ENV"] = "[]"
+    if retagged:
+        env["env"]["STUB_PREVIOUS_TAG_ID"] = "sha256:" + "f" * 64
+    r = deploy(env)
+    if retagged:
+        assert r.returncode != 0
+        assert " up " not in env["log"].read_text()
+        assert "deployment recovery state operation failed" in r.stderr
+    else:
+        assert r.returncode == 0, r.stderr
+        receipt = env["home"] / f".local/state/herdr-engineering/deploys/{_head()}.json"
+        assert json.loads(receipt.read_text())["previous_commit"] == full
 
 
 def test_rollback_prefers_last_deployed_snapshot_when_canonical_file_was_edited(env):
