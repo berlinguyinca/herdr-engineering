@@ -493,13 +493,16 @@ class DeploymentDefinitions:
         return view
 
     # ------------------------------------------------------- target + plan
-    def _green_rows(self, track):
-        repo, branch, ci_context = track
-        event = _push_event(ci_context)
+    def _read_ci(self):
+        """One read of the CI view (None when absent or unreadable)."""
         try:
-            snap = self._ci_snapshot() if self._ci_snapshot is not None else None
+            return self._ci_snapshot() if self._ci_snapshot is not None else None
         except Exception:  # noqa: BLE001 - an unreadable CI view keeps the last target
             return None
+
+    def _green_rows(self, track, snap):
+        repo, branch, ci_context = track
+        event = _push_event(ci_context)
         if not isinstance(snap, dict) or not isinstance(snap.get("pipelines"), dict):
             return None
         rows = []
@@ -518,11 +521,11 @@ class DeploymentDefinitions:
                 rows.append((run, commit, row.get("state") or row.get("status")))
         return rows
 
-    def _advance(self, track):
-        """Update one track's target from the CI view; caller holds the lock."""
+    def _advance(self, track, snap):
+        """Update one track's target from the CI view ``snap``; caller holds the lock."""
         st = self._tracks.setdefault(track, {"commit": None, "run": None, "rank": None, "generation": 0,
                                              "previous": None, "ranks": OrderedDict()})
-        rows = self._green_rows(track)
+        rows = self._green_rows(track, snap)
         if not rows:
             return st
         ranks = st["ranks"]
@@ -544,19 +547,23 @@ class DeploymentDefinitions:
             st.update(commit=commit, run=run, rank=rank, generation=st["generation"] + 1)
         return st
 
-    def _plan(self, track, defs):
-        st = self._advance(track)
+    def _plan(self, track, defs, snap):
+        st = self._advance(track, snap)
         return Plan(track=track, target_commit=st["commit"], run_number=st["run"],
                     generation=st["generation"], restarted=st["generation"] > 1,
                     previous_commit=st["previous"],
                     groups=self.groups([d for d in defs.values() if d.track == track]))
 
     def plans(self) -> dict:
-        """{track: Plan} for every track a loaded definition follows."""
+        """{track: Plan} for every track a loaded definition follows. The CI view is read
+        once for all tracks (the coordinator's one CI snapshot per tick)."""
         defs = self.definitions()
         tracks = sorted({d.track for d in defs.values()})
+        if not tracks:
+            return {}
+        snap = self._read_ci()
         with self._lock:
-            return {t: self._plan(t, defs) for t in tracks}
+            return {t: self._plan(t, defs, snap) for t in tracks}
 
     def plan(self, track=None):
         """The plan for ``track``, or for the only track; None when there is none."""
@@ -575,8 +582,9 @@ class DeploymentDefinitions:
         d = defs.get(component)
         if d is None:
             return None
+        snap = self._read_ci()
         with self._lock:
-            plan = self._plan(d.track, defs)
+            plan = self._plan(d.track, defs, snap)
         if plan.target_commit is None:
             return None
         return Target(component=d.component, commit=plan.target_commit, run_number=plan.run_number,

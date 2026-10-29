@@ -28,6 +28,8 @@ from ..host_policy import HostPolicy, HostSnapshot, PolicyMode, normalize_aliase
 from ..llm_session_id import dashboard_form
 from . import llm_stats
 from .agent_identity import AgentIdentityConflict, AgentIdentityRegistry
+from .deployment_coordinator import ENTITY_TYPE as DEPLOYMENT_PLAN_ENTITY
+from .deployment_coordinator import CoordinatorState
 from .deployments_monitor import ENTITY_TYPE as DEPLOYMENT_ENTITY
 from .deployments_monitor import DeploymentsMonitor
 from .envelope import SourceLedger, envelope_event_fields
@@ -221,6 +223,11 @@ class ControlPlaneRepo:
         self.host_metrics = self._new_host_metrics()
         # Deployment events reported by the host updaters (deploy-4): a private stream, like host metrics.
         self.deployments = self._new_deployments()
+        # The deployment coordinator's plan generation and attempts (deploy-4 Task 3): private too.
+        self.deployment_plans = self._new_deployment_plans()
+
+    def _new_deployment_plans(self):
+        return CoordinatorState(persist=self._persist_deployments)
 
     def _new_host_metrics(self):
         return HostMetricsStore(now=lambda: self._now(), persist=self._persist_host_metrics)
@@ -3306,6 +3313,12 @@ class ControlPlaneRepo:
         self._event_order = [t for t in self._event_order if t[0] != DEPLOYMENT_ENTITY]
         self.deployments = self._new_deployments()
         self.deployments.hydrate(deployment_rows)
+        plan_rows = []
+        for key in [k for k in self._events if k[0] == DEPLOYMENT_PLAN_ENTITY]:
+            plan_rows.extend(self._events.pop(key))
+        self._event_order = [t for t in self._event_order if t[0] != DEPLOYMENT_PLAN_ENTITY]
+        self.deployment_plans = self._new_deployment_plans()
+        self.deployment_plans.hydrate(plan_rows)
         # Host telemetry rollups/state ride a private stream: rebuild history and
         # put the latest record back on each host.
         metrics = []
