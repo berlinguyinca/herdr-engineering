@@ -39,15 +39,16 @@ phase() {   # phase NAME BUDGET_SECONDS COMMAND...
   return "$rc"
 }
 
-# In a PR pipeline HEAD is the merge of the PR into main as it was when the pipeline started. If main has since changed what runs
-# here, this run measures a stale harness: say so instead of leaving a confusing red or slow run (merge main and push to re-run).
+# Woodpecker checks out the PR head commit, not a merge with main, so this run measures the branch as forked. If main has since changed
+# what runs here (a fix to the harness), a red or slow run may only mean "stale branch": say so, and say which files (merge main into
+# the branch and push to re-run; Woodpecker does not re-run a pipeline when only main moves). Non-fatal; skipped when history is short.
 stale_base_notice() {
-  local base files
-  base=$(git rev-parse -q --verify 'HEAD^1' 2>/dev/null) || return 0
-  git fetch -q --no-tags --depth=1 origin main 2>/dev/null || return 0
-  files=$(git diff --name-only "$base" FETCH_HEAD -- .woodpecker scripts/ci tests/playwright/ui-gates-lib.mjs tests/visual package.json 2>/dev/null) || return 0
+  local fork files
+  git fetch -q --no-tags --depth=200 origin main 2>/dev/null || return 0
+  fork=$(git merge-base HEAD FETCH_HEAD 2>/dev/null) || return 0
+  files=$(git diff --name-only "$fork" FETCH_HEAD -- .woodpecker scripts/ci tests/playwright/ui-gates-lib.mjs tests/visual package.json 2>/dev/null) || return 0
   [ -z "$files" ] && return 0
-  echo "ui-gates: NOTICE main changed the harness since this run's base; merge main into the branch and push if this run fails or is slow:" >&2
+  echo "ui-gates: NOTICE main changed the harness since this branch forked; merge main and push if this run fails or is slow:" >&2
   echo "$files" | sed 's/^/ui-gates:   /' >&2
 }
 stale_base_notice

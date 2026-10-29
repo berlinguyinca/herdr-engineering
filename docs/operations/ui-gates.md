@@ -362,8 +362,8 @@ it on the first attempt at this change). On 2026-10-28 a
 `networkidle` wait on a polling page added ~10 s to each of 268 captures: 11 min became 49 min, nothing failed, and the slowdown was
 mistaken for a contended host. A budget turns that into a clear red run the first time it happens.
 
-Each phase also prints `took Ns (budget Ms)`, so a creeping run is visible before it trips. In a pull-request pipeline the script also
-compares the base the run measured (the merge commit's first parent) with the current `main` for the harness files (`.woodpecker`,
-`scripts/ci`, `tests/playwright/ui-gates-lib.mjs`, `tests/visual`, `package.json`) and prints a NOTICE listing what changed. When a fix
-to the harness has merged, merge `main` into your branch and push before trusting a red or slow run: Woodpecker does not re-run a
-pipeline when only `main` moves.
+Each phase also prints `took Ns (budget Ms)`, so a creeping run is visible before it trips. Woodpecker checks out the PR head commit, not
+a merge with `main`, so a run measures the branch as it forked. The script therefore compares the fork point with the current `main` for
+the harness files (`.woodpecker`, `scripts/ci`, `tests/playwright/ui-gates-lib.mjs`, `tests/visual`, `package.json`) and prints a NOTICE
+listing what `main` has changed since. When a fix to the harness has merged, merge `main` into your branch and push before trusting a
+red or slow run: Woodpecker does not re-run a pipeline when only `main` moves.
