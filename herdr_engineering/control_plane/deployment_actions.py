@@ -418,6 +418,9 @@ def permit_decision(meta, view, component, commit, force_id, *, now, component_s
         return {**_deny("permitted by the plan", view, **extra), "permitted": True}
     if force_id is None:
         return _deny(f"not permitted: {why}", view, **extra)
+    if current.get("waiting"):
+        # a cross-track requirement is unmet: no force starts this track early
+        return _deny(f"a forced redeploy cannot override: {why}", view, **extra)
     if not (view.get("release_confirmed") is True and view.get("target_on_main") is True
             and _overridable(current, component_stage)):
         return _deny(f"a forced redeploy cannot override: {why}", view, **extra)

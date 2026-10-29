@@ -5,6 +5,7 @@ zapp-console follows metabolomics-us/inferweave-gateway; it must not start until
 of the InferWeave/inferweave track is done. The required track's state is the
 coordinator's own view of that track in the same tick.
 """
+import dataclasses
 import os
 
 import pytest
@@ -13,12 +14,14 @@ import yaml
 from herdr_engineering.control_plane.deployment_actions import permit_decision
 from herdr_engineering.control_plane.deployment_coordinator import (
     DeploymentCoordinator,
+    Halt,
     Hold,
     Idle,
     ReleaseEvidence,
     Replan,
     Snapshot,
     Start,
+    _requirement_order,
     advance,
     permitted,
     requirement_status,
@@ -163,19 +166,27 @@ def _gw_snap(requirements=()):
 GW_DEFS = {"zapp-console": DEFS["zapp-console"]}
 
 
+WAIT = "waiting on InferWeave/inferweave ci/woodpecker/push/rust stage 1: "
+
+
 def test_an_unmet_requirement_holds_the_track_and_permits_nothing():
     out = advance(_gw_snap((((IW, 1), "stage 1 holding"),)), GW_DEFS, T0)
-    assert out == [Hold(stage=None, remaining_s=None,
-                        reason="waiting on InferWeave/inferweave ci/woodpecker/push/rust stage 1: "
-                               "stage 1 holding",
-                        target_commit=G1, generation=1)]
+    assert out == [Hold(stage=2, remaining_s=None, reason=WAIT + "stage 1 holding",
+                        target_commit=G1, generation=1, waiting=WAIT + "stage 1 holding")]
     assert permitted(out) == ()
 
 
 def test_a_requirement_absent_from_the_snapshot_fails_closed():
     out = advance(_gw_snap(), GW_DEFS, T0)
-    assert isinstance(out[-1], Hold) and out[-1].stage is None and "unknown" in out[-1].reason
-    assert permitted(out) == ()
+    assert isinstance(out[-1], Hold) and out[-1].remaining_s is None and "unknown" in out[-1].reason
+    assert out[-1].waiting and permitted(out) == ()
+
+
+def test_an_unmet_requirement_still_adopts_a_replan():
+    snap = dataclasses.replace(_gw_snap((((IW, 1), "x"),)), plan_commit=None, generation=0)
+    out = advance(snap, GW_DEFS, T0)
+    assert isinstance(out[0], Replan) and out[0].generation == 1
+    assert isinstance(out[-1], Hold) and out[-1].waiting and permitted(out) == ()
 
 
 def test_a_met_requirement_lets_the_track_roll():
@@ -337,19 +348,44 @@ def test_a_stage_1_component_turning_unhealthy_withdraws_the_separate_track(tmp_
     _never_starts(rig.tick(620))
 
 
-def test_the_gate_does_not_depend_on_track_sort_order(tmp_path):
-    # the dependent track sorts BEFORE the one it requires
-    early = ("Aaa/console", "main", "ci/woodpecker/push/console")
-    docs = DOCS[:3] + [_doc("zapp-console", 2, 0, "zapp", track=early, requires=REQ_IW1)]
+CHAIN_A = ("Aaa/console", "main", "ci/woodpecker/push/a")
+CHAIN_B = ("Bbb/relay", "main", "ci/woodpecker/push/b")
+
+
+def _chain_docs():
+    # A requires B, B requires InferWeave: sorted order (A, B, I) is the WRONG order
+    return [_doc("hive-gateway", 1, 0, "hive"),
+            _doc("b-relay", 1, 0, "bhost", track=CHAIN_B, requires=REQ_IW1),
+            _doc("a-console", 2, 0, "ahost", track=CHAIN_A,
+                 requires=[{"repo": CHAIN_B[0], "ci_context": CHAIN_B[2], "stage": 1}])]
+
+
+def test_requirement_order_puts_required_tracks_first_whatever_the_sort_order():
+    defs = {d["component"]: _defn(d) for d in _chain_docs()}
+    assert sorted([CHAIN_A, CHAIN_B, IW]) == [CHAIN_A, CHAIN_B, IW]
+    assert _requirement_order([CHAIN_A, CHAIN_B, IW], defs) == [IW, CHAIN_B, CHAIN_A]
+    # a cycle (refused by the validator) goes last and stays unmet
+    cyc = dict(defs, **{"hive-gateway": dataclasses.replace(defs["hive-gateway"],
+                                                            requires=((CHAIN_A, 2),))})
+    assert set(_requirement_order([CHAIN_A, CHAIN_B, IW], cyc)) == {CHAIN_A, CHAIN_B, IW}
+
+
+def test_a_chain_of_tracks_rolls_in_requirement_order_not_sort_order(tmp_path):
+    docs = _chain_docs()
     defs = {d["component"]: _defn(d) for d in docs}
     rig = Rig(tmp_path, docs, defs)
     rig.ci.green(IW[0], T1, 10)
-    rig.ci.green(early[0], G1, 20)
+    rig.ci.green(CHAIN_B[0], G1, 20)
+    rig.ci.green(CHAIN_A[0], "b" * 40, 30)
     rig.deploy("hive-gateway", at=0)
-    rig.deploy("hive-nodes", at=0)
-    out = rig.tick(600)
-    assert list(out)[0] == early
-    assert isinstance(_gw_last(out, early), Start)
+    out = rig.tick(300)
+    assert out[CHAIN_B][-1].waiting and out[CHAIN_A][-1].waiting
+    out = rig.tick(600)                                  # InferWeave stage 1 held
+    assert isinstance(out[CHAIN_B][-1], Start) and out[CHAIN_A][-1].waiting
+    rig.deploy("b-relay", at=600, to=G1)
+    out = rig.tick(1200)                                 # B's stage 1 held too
+    assert isinstance(out[CHAIN_A][-1], Start), out[CHAIN_A]
+    assert "a-console" in permitted(out[CHAIN_A])
 
 
 def test_a_track_without_requires_is_unchanged(tmp_path):
@@ -397,3 +433,75 @@ def test_old_target_of_required_track_is_not_enough(tmp_path):
     rig.deploy("hive-gateway", at=0, to=OLD)
     rig.deploy("hive-nodes", at=0, to=OLD)
     _never_starts(rig.tick(3600))
+
+
+# --------------------------------------- a dependent Halt is never hidden
+def _dependent_halted(rig, *, required="broken"):
+    _stage_before(rig)
+    rig.deploy("hive-gateway", at=0)
+    rig.deploy("hive-nodes", at=0)
+    assert isinstance(_gw_last(rig.tick(600)), Start)
+    rig.fail("zapp-console", at=610, to=G1)
+    if required == "broken":
+        rig.fail("hive-nodes", at=615)
+    else:
+        rig.ci.green(IW[0], T2, 11)                  # a new InferWeave release restarts it
+    return rig.tick(620)
+
+
+@pytest.mark.parametrize("required", ["broken", "new-release"])
+def test_a_dependent_halt_still_shows_while_the_requirement_is_unmet(tmp_path, required):
+    rig = Rig(tmp_path)
+    out = _dependent_halted(rig, required=required)
+    last = _gw_last(out)
+    assert isinstance(last, Halt) and last.stage == 2 and last.components == ("zapp-console",)
+    assert last.waiting and permitted(out[GW]) == ()
+
+
+@pytest.mark.parametrize("required", ["broken", "new-release"])
+def test_a_dependent_halt_is_still_diagnosed_and_escalated(tmp_path, required):
+    from herdr_engineering.control_plane.deployment_diagnosis import Finding
+    from herdr_engineering.control_plane.deployment_escalation import (
+        DeploymentEscalation,
+        EscalationLedger,
+    )
+    rig = Rig(tmp_path)
+    out = _dependent_halted(rig, required=required)
+    calls = []
+
+    def diagnose(evidence, *, config=None):
+        calls.append(evidence)
+        return Finding(kind="software", summary="broke", suggested_action="retry", source="model")
+
+    ledger = EscalationLedger(persist=lambda r: None, persist_required=lambda r: None)
+    esc = DeploymentEscalation(ledger=lambda: ledger, state=lambda: rig.repo.deployment_plans,
+                               monitor=lambda: rig.world.mon, diagnose_fn=diagnose,
+                               alert=lambda *a: None, now=lambda: T0 + 620)
+    esc.run(out, rig.defs, evidence=dict(rig.coord.last_evidence))
+    assert calls, "the dependent track's halt was not diagnosed"
+    assert ledger.get("zapp-console", G1)["rounds"]
+
+
+def test_a_force_cannot_override_a_dependent_own_stage_halt_while_waiting(tmp_path):
+    rig = Rig(tmp_path)
+    out = _dependent_halted(rig)
+    now = T0 + 620
+    views = track_views(out, rig.defs, rig.repo.deployment_plans, now, rig.coord.last_evidence)
+    view = next(v for v in views if v["track"]["repo"] == GW[0])
+    assert view["current"]["waiting"]
+    meta = {"ticked_at": now, "stale": False, "error": None}
+    answer = permit_decision(meta, view, "zapp-console", G1, "force-1", now=now, component_stage=2)
+    assert answer["permitted"] is False and "cannot override" in answer["reason"]
+
+
+def test_a_force_cannot_override_a_dependent_hold_timer_while_waiting(tmp_path):
+    rig = Rig(tmp_path)
+    _stage_before(rig)
+    rig.deploy("hive-gateway", at=0)
+    rig.deploy("hive-nodes", at=0)
+    rig.tick(600)
+    rig.deploy("zapp-console", at=610, to=G1)        # zapp healthy, on its hold timer
+    rig.fail("hive-nodes", at=615)
+    out = rig.tick(620)
+    last = _gw_last(out)
+    assert isinstance(last, Hold) and last.remaining_s is None and last.waiting

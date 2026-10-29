@@ -70,10 +70,12 @@ its ``.commit``) carries; ``on_main`` is True only when the target is on
 The default is unknown for both, so without a source the coordinator only ever Holds
 (fail closed).
 
-Cross-track requirements (a definition's optional ``requires``): after gate 5, a track
-whose definitions name a (track, stage) that ``Snapshot.requirements`` does not mark met
-(None) yields ``Hold(stage=None)`` "waiting on <repo> <ci_context> stage <n>: <why>" and
-permits nothing; absent = unmet. ``tick()`` computes them from the coordinator's own view
+Cross-track requirements (a definition's optional ``requires``): when the definitions
+name a (track, stage) that ``Snapshot.requirements`` does not mark met (None; absent =
+unmet), the stage decision is still made (and a Replan adopted), then converted like an
+unpublished release: a Start or timed Hold becomes ``Hold(stage, remaining_s=None)``
+"waiting on <repo> <ci_context> stage <n>: <why>", a Halt or Idle shows unchanged, and
+nothing is permitted. Each carries ``waiting``, which makes the permit gate refuse a force. ``tick()`` computes them from the coordinator's own view
 of the other track in the same tick (``requirement_status``: ``advance`` over that
 track's stages up to n must be ``Idle("rolled out")`` with a confirmed release),
 evaluating required tracks first.
@@ -174,6 +176,8 @@ class Hold:
     generation: int
     permitted: tuple = ()
     missing: tuple = ()
+    #: set while a cross-track requirement is unmet: nothing is permitted, no force applies
+    waiting: str | None = None
 
 
 @dataclass(frozen=True)
@@ -186,6 +190,7 @@ class Halt:
     components: tuple = ()
     permitted: tuple = ()
     missing: tuple = ()
+    waiting: str | None = None
 
 
 @dataclass(frozen=True)
@@ -203,6 +208,7 @@ class Idle:
     target_commit: str | None
     permitted: tuple = ()
     missing: tuple = ()
+    waiting: str | None = None
 
 
 def permitted(actions) -> tuple:
@@ -375,15 +381,14 @@ def advance(snapshot: Snapshot, definitions: dict, now: float) -> list:
     if snapshot.target_on_main is not True:
         return [Hold(stage=None, remaining_s=None, reason="target ancestry not confirmed",
                      target_commit=target, generation=generation)]
+    waiting = None
     met = dict(snapshot.requirements or ())
     for req in sorted({r for d in definitions.values() for r in d.requires}):
         why = met.get(req, "unknown")
         if why is not None:
             (repo, _branch, ci_context), stage = req
-            # Hold(None) with no timer: no force overrides it (deployment_actions._overridable)
-            return [Hold(stage=None, remaining_s=None,
-                         reason=f"waiting on {repo} {ci_context} stage {stage}: {why}",
-                         target_commit=target, generation=generation)]
+            waiting = f"waiting on {repo} {ci_context} stage {stage}: {why}"
+            break
     out: list = []
     if replan:
         generation += 1
@@ -396,6 +401,18 @@ def advance(snapshot: Snapshot, definitions: dict, now: float) -> list:
                         definitions)
         slots = scratch.slots_for(target, definitions)
     action = _roll(slots, definitions, now, target, generation)
+    if waiting is not None:
+        # Like an unpublished release: a Start (and a hold timer) becomes a Hold with no
+        # timer, a Halt or Idle still shows (diagnosis, repair and rollback still run), and
+        # nothing is permitted. ``waiting`` makes the permit gate refuse any force.
+        if isinstance(action, (Start, Hold)):
+            action = Hold(stage=action.stage, remaining_s=None, reason=waiting,
+                          target_commit=target, generation=generation, missing=action.missing,
+                          waiting=waiting)
+        else:
+            action = dataclasses.replace(action, permitted=(), waiting=waiting)
+        out.append(action)
+        return out
     if isinstance(action, Start) and not published:
         action = Hold(stage=action.stage, remaining_s=None, reason="release not confirmed",
                       target_commit=target, generation=generation, missing=action.missing)
