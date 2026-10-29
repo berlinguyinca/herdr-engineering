@@ -27,7 +27,7 @@ steps:
       - 'test -r /etc/woodpecker-git-credentials || { echo "the job staged no forge credential" >&2; exit 1; }'
       - 'git init -q -b "${CI_COMMIT_BRANCH:-main}" .'
       - 'git remote add origin "https://github.com/${CI_REPO}.git"'
-      - 'git fetch --no-tags --depth=1 origin "$CI_COMMIT_SHA"'
+      - 'git fetch --no-tags --depth=2 origin "$CI_COMMIT_SHA"   # depth 2: the first parent of a PR merge commit is the base the run measured'
       - 'git checkout -q FETCH_HEAD'
       - 'git --no-pager log --oneline -1'
 
