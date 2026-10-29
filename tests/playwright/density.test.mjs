@@ -5,6 +5,7 @@ import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { chromium } from 'playwright';
+const hf=async p=>{await p.locator('[data-health-filters]').waitFor({state:'attached',timeout:15000});await p.evaluate(()=>{const d=document.querySelector('[data-health-filters]');if(d)d.open=true;});};  // the Health filter bar is a closed disclosure by default
 
 // Density is an icon button that steps through the modes; click until it reads the wanted one.
 async function setDensity(page, wanted) {
@@ -133,6 +134,7 @@ test('populated tablet heatmap keeps touch targets within their own bucket colum
     for (const width of [768, 701, 900, 390]) {
       await page.setViewportSize({ width, height: 1080 });
       for (const mode of ['14', '30']) {
+        await hf(page);
         await page.locator(`[data-health-mode="${mode}"]`).click();
         for (const density of ['comfortable', 'compact', 'dense']) {
           await openDisplayControls(page);

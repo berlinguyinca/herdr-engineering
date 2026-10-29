@@ -72,6 +72,7 @@ export class HerdrAppShell extends HTMLElement {
       const paths = [a.getAttribute('data-path'), ...JSON.parse(a.getAttribute('data-match') || '[]')];
       const active = paths.some((p) => path === p || (path !== '/' && path.startsWith(p + '/')));
       a.classList.toggle('active', active);
+      if (active) a.setAttribute('aria-current', 'page'); else a.removeAttribute('aria-current');
     });
     this._menuOpen = false;
     const nav = this.shadowRoot.querySelector('.hd-shell__nav');
@@ -142,6 +143,7 @@ export class HerdrAppShell extends HTMLElement {
       this._applyDensity(DENSITIES[(DENSITIES.indexOf(this._density) + 1) % DENSITIES.length]);
       paintDensity();
     });
+    this._syncActive();
     this.shadowRoot.querySelector('.hd-shell__menu')?.addEventListener('click', () => {
       this._menuOpen = !this._menuOpen;
       this.shadowRoot.querySelector('.hd-shell__nav')?.setAttribute('data-open', String(this._menuOpen));

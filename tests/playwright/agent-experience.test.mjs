@@ -99,7 +99,7 @@ test('operator rename conflicts preserve input and viewer controls remain hidden
   assert.deepEqual(await page.evaluate(()=>window.renames.at(-1)),{id:'agent:one',name:'Silver Heron',version:1});
   await page.evaluate(()=>{window.agent.capabilities={rename_agent:false,regenerate_summary:false};window.remount();});
   assert.equal(await page.getByRole('button',{name:'Rename agent',exact:true}).count(),0);
-  assert.equal(await page.getByRole('button',{name:'Regenerate summary',exact:true}).count(),0);
+  assert.equal(await page.getByRole('button',{name:'Quick summary',exact:true}).count(),0);
 }));
 
 test('an ambiguous saved name explains its stable-ID fallback and recovers through rename',()=>withAgent(async page=>{
@@ -153,16 +153,19 @@ test('full report: button states, polling, remote-host message, and a side colum
   await page.evaluate(()=>{
     window.agent.capabilities={...window.agent.capabilities,summary_report:true};
     window.starts=0;
-    window.client.startSummaryReport=async()=>{window.starts++;if(window.remote)throw Object.assign(new Error('This session record is on beast.'),{status:409,body:{reason:'report_host_remote',command:'herdr-eng summary report --agent claude --session abc'}});window.summary.full_report={state:'running'};return {ok:true,status:'running'};};
+    window.client.startSummaryReport=async()=>{window.starts++;if(window.refuse)throw Object.assign(new Error('Too many reports are running; try again shortly.'),{status:429,body:{reason:'report_limit'}});window.summary.full_report={state:'queued'};return {ok:true,status:'running'};};
     window.remount();
   });
   await page.clock.runFor(200);
-  const button=page.getByRole('button',{name:'Generate full report',exact:true});
+  const button=page.getByRole('button',{name:'Full report',exact:true});
   await button.waitFor();
   assert.equal(await page.locator('[data-report-host]').isHidden(),true);
   await button.click();
   await page.getByRole('button',{name:'Generating report…',exact:true}).waitFor();
   assert.equal(await page.getByRole('button',{name:'Generating report…',exact:true}).isDisabled(),true);
+  assert.match(await page.locator('.sw-report-status').innerText(),/Waiting for the agent's host/);
+  await page.evaluate(()=>{window.summary.full_report={state:'running'};});await page.clock.fastForward(3100);
+  assert.match(await page.locator('.sw-report-status').innerText(),/Running the summary skill/);
   await button.click({force:true}).catch(()=>{});
   assert.equal(await page.evaluate(()=>window.starts),1);
   const report='# Session summary\n**Overall status:** completed\n\n1. **Original objective** — ship it\n\nEvidence coverage: complete\n'.repeat(1)+Array.from({length:60},(_,i)=>`- line ${i}`).join('\n');
@@ -180,14 +183,45 @@ test('full report: button states, polling, remote-host message, and a side colum
   assert.ok(geo.card.left>=geo.conv.right-1,JSON.stringify(geo));
   assert.ok(geo.card.right<=geo.vw+1 && geo.hscroll===false,JSON.stringify(geo));
   await page.getByRole('button',{name:'Exit fullscreen workspace',exact:true}).click();
-  // A session record on another host: the refusal names the command to run there.
-  await page.evaluate(()=>{window.remote=true;window.summary.full_report={state:'idle'};});
+  // A refusal is shown in place and the button stays usable.
+  await page.evaluate(()=>{window.refuse=true;window.summary.full_report={state:'idle'};});
   await page.clock.fastForward(10000);
-  await page.getByRole('button',{name:'Generate full report',exact:true}).click();
-  const alert=page.getByRole('alert').filter({hasText:'beast'});await alert.waitFor();
-  assert.match(await page.locator('.sw-report code').innerText(),/^herdr-eng summary report --agent claude/);
+  await page.getByRole('button',{name:'Full report',exact:true}).click();
+  await page.getByRole('alert').filter({hasText:'Too many reports'}).waitFor();
+  assert.equal(await page.locator('[data-summary-report]').isDisabled(),false);
   // Viewers without the capability see no button but still read a stored report.
   await page.evaluate(()=>{window.agent.capabilities={};window.summary.full_report={state:'done',report:'# Session summary\n\nEvidence coverage: complete'};window.remount();});
   await page.clock.runFor(200);await page.locator('.sw-report-body').waitFor();
   assert.equal(await page.locator('[data-summary-report]').isHidden(),true);
+}));
+
+test('full report: status strip, stale badge with one-click regenerate, collapsible sections, copy and handoff',()=>withAgent(async page=>{
+  const report=['# Session summary','**Overall status:** in progress','','1. **Original objective** — ship it','2. **Starting point**','Clean.','3. **Timeline of work**','- a','4. **Changes completed**','x','5. **Decisions**','x','6. **Verification**','x','7. **Outstanding work and blockers**','None.','8. **Current worktree state**','x','9. **Prioritized next actions**','1. run it','10. **Resume point**','Continue in file.py.','','**Evidence coverage**: partial — one gap'].join('\n');
+  await page.evaluate(r=>{
+    window.agent.capabilities={...window.agent.capabilities,summary_report:true};
+    window.starts=0;window.sent=[];window.confirm=()=>true;
+    window.client.startSummaryReport=async()=>{window.starts++;window.summary.full_report={state:'queued'};return {ok:true};};
+    window.client.sendMessage=async(id,text)=>{window.sent.push(text);return {ok:true};};
+    Object.defineProperty(navigator,'clipboard',{value:{writeText:async t=>{window.copied=t;}},configurable:true});
+    window.summary.full_report={state:'done',report:r,harness:'claude',source:'terminal',generated_at:'2026-10-28T20:00:00+00:00',basis_seq:0};
+    window.remount();
+  },report);
+  await page.clock.runFor(200);
+  assert.match(await page.locator('[data-report-status]').innerText(),/in progress/i);
+  assert.match(await page.locator('.sw-badge--partial').first().innerText(),/Evidence: partial/i);
+  assert.match(await page.locator('.sw-report-resume').innerText(),/Continue in file\.py/);
+  assert.match(await page.locator('.sw-report-status').innerText(),/from the terminal/);
+  assert.match(await page.locator('[data-report-stale]').innerText(),/1 newer message since this report/);
+  const outstanding=page.locator('details[data-section="7"]'),starting=page.locator('details[data-section="2"]');
+  assert.equal(await outstanding.evaluate(n=>n.open),true);
+  assert.equal(await starting.evaluate(n=>n.open),false);
+  await page.getByRole('button',{name:'Copy as markdown',exact:true}).click();
+  assert.equal(await page.evaluate(()=>window.copied.startsWith('# Session summary')),true);
+  await page.getByRole('button',{name:'Send to agent',exact:true}).click();
+  await page.waitForFunction(()=>window.sent.length===1);
+  assert.match(await page.evaluate(()=>window.sent[0]),/Resume point:\nContinue in file\.py\./);
+  await page.locator('[data-report-regenerate]').click();
+  assert.equal(await page.evaluate(()=>window.starts),1);
+  await page.getByRole('button',{name:'Generating report…',exact:true}).waitFor();
+  assert.match(await page.locator('[data-report-elapsed]').innerText(),/^\d+s$/);
 }));

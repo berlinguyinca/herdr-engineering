@@ -127,6 +127,22 @@ export async function assertBundledFonts(page, ctx) {
 }
 
 /**
+ * Wait until the page has stopped changing: no DOM mutation for `quietMs`. (Not `networkidle`: the page polls, so the network is never
+ * idle and every capture would sit out the whole cap.) The proof element of a surface
+ * appears before its data does, so a fixed pause after it photographed a half-populated page on a slow or busy host (one page of 88,
+ * 9% of its pixels, on the CI agent only). Bounded: a page that keeps redrawing on its poll is captured after `maxMs` anyway, and the
+ * text it redraws is normalised afterwards.
+ */
+async function settled(page, quietMs = 500, maxMs = 5000) {
+  await page.evaluate(([quiet, max]) => new Promise((resolve) => {
+    let timer; const done = () => { obs.disconnect(); clearTimeout(timer); clearTimeout(cap); resolve(); };
+    const obs = new MutationObserver(() => { clearTimeout(timer); timer = setTimeout(done, quiet); });
+    obs.observe(document.body, { subtree: true, childList: true, characterData: true, attributes: true });
+    timer = setTimeout(done, quiet); const cap = setTimeout(done, max);
+  }), [quietMs, maxMs]);
+}
+
+/**
  * Capture one surface at one viewport / colour scheme. Returns { page: Buffer, regions: {name: Buffer} }.
  * `extraCss` is only for the gate's own "teeth" tests: it lets a test inject a defect and prove the compare notices it.
  */
@@ -142,6 +158,7 @@ export async function capture(browser, info, surface, viewport, scheme, { extraC
     await page.addStyleTag({ content: '*,*::before,*::after{animation:none!important;transition:none!important;caret-color:transparent!important;scroll-behavior:auto!important}' });
     if (extraCss) await page.addStyleTag({ content: extraCss });
     await page.evaluate(() => document.fonts.ready);
+    await settled(page);
     await page.waitForTimeout(600);
     // the page re-renders on its poll and puts the random text back: keep rewriting it for as long as the page lives (a one-off pass raced
     // the redraw and left an unnormalised digest in about half of the captures)

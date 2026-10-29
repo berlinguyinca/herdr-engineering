@@ -132,7 +132,7 @@ def test_reconcile_route_is_operator_org_wide_and_needs_the_github_client():
 
 
 def test_proposals_need_suggest_a_different_approver_and_the_exact_payload():
-    sec = dict(FULL, default_org_id="org1", viewers={"key:abc": {"org_id": "org1", "projects": "*"},
+    sec = dict(FULL, default_org_id="org1", approvers=["key:abc", "key:def"], viewers={"key:abc": {"org_id": "org1", "projects": "*"},
                                                       "key:def": {"org_id": "org1", "projects": "*"}})
     r = routes(sec)
     other = {"kind": "operator", "id": "key:def", "authenticated_by": "api_key"}
@@ -166,8 +166,8 @@ def test_proposal_idempotency_key_returns_the_same_proposal_and_refuses_reuse_wi
 
 
 def test_a_bad_approval_never_kills_the_proposal_and_scope_limits_who_can_act():
-    sec = dict(FULL, default_org_id="org1", viewers={"key:abc": {"org_id": "org1", "projects": "*"},
-                                                      "key:def": {"org_id": "org1", "projects": "*"},
+    sec = dict(FULL, default_org_id="org1", approvers=["key:abc", "key:def", "key:ghi"],
+               viewers={"key:abc": {"org_id": "org1", "projects": "*"}, "key:def": {"org_id": "org1", "projects": "*"},
                                                       "key:ghi": {"org_id": "org1", "projects": ["p2"]}})
     r = routes(sec)
     other = {"kind": "operator", "id": "key:def", "authenticated_by": "api_key"}
@@ -187,3 +187,58 @@ def test_proposal_payload_must_name_a_string_project_and_stay_reviewable_in_full
     assert mk({"project": ["p1"]})[0] == 400            # was an unhashable-type 500
     assert mk({"project": "p1", "note": "x" * 5000})[0] == 400
     assert mk({"project": "p1"})[0] == 201
+
+
+def test_approval_executes_only_when_the_execute_flag_is_on():
+    sec = dict(FULL, default_org_id="org1", approvers=["key:def"], viewers={"key:abc": {"org_id": "org1", "projects": "*"},
+                                                      "key:def": {"org_id": "org1", "projects": "*"}})
+    other = {"kind": "operator", "id": "key:def", "authenticated_by": "api_key"}
+    body = {"action": "pause_ingestion", "payload": {"project": "p1", "source": "gmail"}, "resource_version": 3}
+    for flag, want in ((False, "approved"), (True, "executed")):
+        r = routes(dict(sec, execute=flag))
+        p = r.post(["proposals"], body, KEY, "operator")[1]
+        ok = {"payload_sha256": p["payload_sha256"], "resource_version": 3}
+        assert r.post(["proposals", p["id"], "approve"], ok, other, "operator")[1]["state"] == want
+        assert (("org1", "gmail") in r.store._paused) is flag
+
+
+def test_only_named_approvers_can_approve_or_reject_and_an_open_listener_never_can():
+    viewers = {"key:abc": {"org_id": "org1", "projects": "*"}, "key:def": {"org_id": "org1", "projects": "*"}}
+    other = {"kind": "operator", "id": "key:def", "authenticated_by": "api_key"}
+    open_l = {"kind": "operator", "id": "open", "authenticated_by": "open_listener"}
+    body = {"action": "pause_ingestion", "payload": {"project": "p1", "source": "gmail"}, "resource_version": 1}
+    for approvers in (None, [], ["key:abc"], "key:def", [7]):         # absent, empty, someone else, wrong type
+        r = routes(dict(FULL, default_org_id="org1", viewers=viewers, **({} if approvers is None else {"approvers": approvers})))
+        p = r.post(["proposals"], body, KEY, "operator")[1]
+        ok = {"payload_sha256": p["payload_sha256"], "resource_version": 1}
+        assert r.post(["proposals", p["id"], "approve"], ok, other, "operator")[0] == 403
+        assert r.post(["proposals", p["id"], "reject"], {}, other, "operator")[0] == 403
+    r = routes(dict(FULL, default_org_id="org1", viewers=viewers, approvers=["open"]))
+    p = r.post(["proposals"], body, KEY, "operator")[1]
+    assert r.post(["proposals", p["id"], "approve"], {"payload_sha256": p["payload_sha256"], "resource_version": 1}, open_l, "operator")[0] == 403
+
+
+def test_reconcile_now_is_gated_and_scheduled_polling_ignores_bad_intervals():
+    import time
+    from types import SimpleNamespace as NS
+
+    from herdr_engineering.control_plane.intel_bridge import EventBridge
+    sec = dict(FULL, default_org_id="org1", webhook_projects={"o/r": ["p1"]}, viewers={"key:abc": {"org_id": "org1", "projects": "*"}})
+    r = routes(sec)
+    assert r.reconcile_now() is None                                   # no GitHub client yet
+    r.github_app_fn = lambda: NS(open_prs=lambda repo: [NS(number=1, head_sha="c" * 40, author_login="u", base_ref="main")])
+    assert r.reconcile_now()["recorded"] == 1 and r.reconcile_now()["already"] == 1
+    assert routes(dict(sec, kill_switch=True)).reconcile_now() is None
+    for bad in (None, 0, 59, "60", True, -5):                 # anything but an int >= 60 is off
+        b = EventBridge(r.store, lambda: sec, lambda ev: ("p1",), org_id="org1")
+        calls = []
+        b.start_poller(lambda: calls.append(1), lambda bad=bad: bad, tick=0.01)
+        time.sleep(0.15)
+        b.stop()
+        assert calls == [], bad
+    b = EventBridge(r.store, lambda: sec, lambda ev: ("p1",), org_id="org1")
+    calls = []
+    b.start_poller(lambda: (calls.append(1), 1 / 0), lambda: 0, tick=0.01, min_interval=0)   # runs, and an error does not stop it
+    time.sleep(0.4)
+    b.stop()
+    assert len(calls) >= 2 and b.stats["errors"] >= 2

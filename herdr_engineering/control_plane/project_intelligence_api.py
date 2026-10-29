@@ -19,6 +19,10 @@ from . import project_intelligence as pi
 READ_ROLES = frozenset({"viewer", "operator"})
 
 
+def _unwired():
+    raise pi.IntelligenceError("no executor wired for request_ci_repair")
+
+
 class IntelligenceRoutes:
     def __init__(self, store: pi.IntelligenceStore | None = None, section_fn=lambda: {}, store_fn=None):
         """``store_fn`` builds the store lazily (only once the feature is enabled); ``store`` is for tests/embedding."""
@@ -28,6 +32,8 @@ class IntelligenceRoutes:
         self.board = ActionBoard()   # proposals live 30 minutes by design, so they are not persisted
         self.github_app_fn = None   # set by the API glue: () -> review-gate GitHub client or None
         self.metrics_fn = None      # set by the API glue: () -> dict of bridge counters and incident states
+        self.ci_repair_fn = None    # set by the API glue: (repository, run, operation_id, actor) -> CI-fix request
+        self._executor = None
         from .intel_webhook import ReplayGuard
         self._replay = ReplayGuard()
 
@@ -36,6 +42,29 @@ class IntelligenceRoutes:
         if self._store is None:
             self._store = self._store_fn() if self._store_fn else pi.IntelligenceStore()
         return self._store
+
+    @property
+    def executor(self):
+        if self._executor is None:
+            from .intel_executor import ProposalExecutor
+            self._executor = ProposalExecutor(self.board, self.store, section_fn=self._section,
+                                              ci_repair=lambda *a: self.ci_repair_fn(*a) if self.ci_repair_fn else _unwired())
+        return self._executor
+
+    def reconcile_now(self) -> dict | None:
+        """Record open PR heads no delivery has recorded (outbound polling; needs no inbound connection).
+        ``None`` when it cannot run: ingest off, kill switch, or missing client/config."""
+        from datetime import UTC, datetime
+
+        from .intel_webhook import reconcile_open_prs
+        cfg, raw = self._cfg()
+        app = self.github_app_fn() if self.github_app_fn else None
+        projects, org = raw.get("webhook_projects"), raw.get("default_org_id")
+        if not (cfg["enabled"] and cfg["ingest"]) or cfg["kill_switch"] or app is None \
+                or not isinstance(projects, dict) or not projects or not isinstance(org, str):
+            return None
+        return reconcile_open_prs(app, self.store, cfg, org_id=org, installation=str(raw.get("webhook_installation") or "github"),
+                                  repo_projects=projects, received_at=datetime.now(UTC))
 
     def _cfg(self) -> tuple[dict, dict]:
         raw = self._section() or {}
@@ -170,7 +199,7 @@ class IntelligenceRoutes:
             if parts == ["proposals"]:
                 return 200, {"items": [self._proposal_view(p) for p in self.board.pending(viewer.org_id)
                                        if viewer.project_ids is None or p.payload.get("project") in viewer.project_ids],
-                             "note": "An approved proposal records permission only; this release has no executor."}
+                             "note": "An approved proposal is executed only when the execute flag is on; otherwise it records permission only."}
             if parts == ["findings"]:
                 return 200, {"items": self.store.findings(viewer)}
         except (pi.IntelligenceError, ValueError) as exc:
@@ -223,6 +252,11 @@ class IntelligenceRoutes:
             if len(parts) == 3 and parts[0] == "proposals" and parts[2] in ("approve", "reject"):
                 if not cfg["suggest"] or cfg["kill_switch"]:
                     return 409, {"error": "proposals require the suggest flag and no kill switch"}
+                approvers = raw.get("approvers")
+                if (not isinstance(approvers, list) or actor not in [a for a in approvers if isinstance(a, str)]
+                        or principal.get("authenticated_by") == "open_listener"):
+                    # Only named principals decide. An absent list means nobody can; an open listener has no identity.
+                    return 403, {"error": "this principal is not in project_intelligence.approvers"}
                 known = self.board.get(parts[1], viewer.org_id)
                 if viewer.project_ids is not None and known.payload.get("project") not in viewer.project_ids:
                     return 404, {"error": "not found"}       # a project-scoped operator cannot act on another project's proposal
@@ -235,19 +269,16 @@ class IntelligenceRoutes:
                     p = self.board.approve(parts[1], approver=actor, org_id=viewer.org_id,
                                            payload_sha256=body["payload_sha256"], resource_version=v)
                 self.store.record_audit({"action": f"proposal_{p.state}", "id": p.id, "actor": actor})
+                if p.state == "approved":
+                    p = self.executor.execute(p.id, viewer.org_id)     # no-op unless the execute flag is on
                 return 200, self._proposal_view(p)
             if parts == ["webhooks", "reconcile"]:
-                from datetime import UTC, datetime
-
-                from .intel_webhook import reconcile_open_prs
-                app = self.github_app_fn() if self.github_app_fn else None
-                projects, org = raw.get("webhook_projects"), raw.get("default_org_id")
-                if app is None or not isinstance(projects, dict) or not projects or not isinstance(org, str):
-                    return 409, {"error": "reconcile needs the review-gate GitHub client, webhook_projects and default_org_id"}
-                if viewer.project_ids is not None or not cfg["ingest"] or cfg["kill_switch"]:
+                if viewer.project_ids is not None:
                     return 404, {"error": "not found"}
-                return 200, reconcile_open_prs(app, self.store, cfg, org_id=org, installation=str(raw.get("webhook_installation") or "github"),
-                                               repo_projects=projects, received_at=datetime.now(UTC))
+                out = self.reconcile_now()
+                if out is None:
+                    return 409, {"error": "reconcile needs ingest, no kill switch, the review-gate GitHub client, webhook_projects and default_org_id"}
+                return 200, out
         except pi.NotFound:
             return 404, {"error": "not found"}
         except pi.StoreUnavailable:

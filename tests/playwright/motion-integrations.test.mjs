@@ -5,7 +5,7 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {withPage} from './helpers/fixture.mjs';
-import {boot,until,sleep,T0} from './helpers/live.mjs';
+import {boot,until,sleep,T0,openHealthFilters} from './helpers/live.mjs';
 
 const calm=(page,mode)=>page.addInitScript(m=>{try{localStorage.setItem('herdr.calm',m);}catch{}},mode);
 const ago=ms=>new Date(Date.parse(T0)-ms).toISOString();
@@ -119,6 +119,7 @@ test('CI health: a cell whose outcome changes flashes; others do not',async()=>w
  const s={runs:[run(1,'success'),run(2,'success',{created_at:ago(7200000+120000)})]};
  await calm(page,'off');
  await boot(page,base,'/ci',ciApi(s));
+ await openHealthFilters(page);
  await page.locator('[data-health-mode="hours"]').click();
  const cells=page.locator('[data-health-map] [data-health-project][data-health-bucket]');
  await until(()=>page.locator('[data-health-map] .ci-health-cell.state-success').count().then(n=>n>=2),'two successful cells',10000);

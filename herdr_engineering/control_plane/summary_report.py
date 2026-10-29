@@ -1,16 +1,18 @@
 """On-demand full ``/summary`` report for one dashboard session.
 
-The operator asks for a report; a background job runs the same ``summary`` skill the terminal uses
-(``herdr_engineering.summary_report``) against the session's record on this host and stores the result
-as a durable session event, so it survives a restart and is read back through ``GET .../summary``.
-Only sessions whose record lives on the control-plane host can be reported on: nothing here opens a
-connection to another machine. The existing model-backed summary card is separate and untouched.
+The control plane runs in a container that has neither the agents' session records nor a summarizer
+CLI, so it never runs a report itself. The operator's request becomes a durable ``SummaryReportRequested``
+event and a queued job; the per-host plugin that owns the session claims it (``claim``), runs
+``herdr-eng summary report`` where the records and credentials live, and posts the result (``finish``).
+The server validates and redacts the result again before storing it as a session event, so it survives a
+restart and is read back through ``GET .../summary``. A request nobody claims or finishes in time
+fails with a stable code instead of hanging. The model-backed summary card is separate and untouched.
 """
 from __future__ import annotations
 
 import json
-import socket
 import threading
+import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -19,6 +21,11 @@ from .. import summary_report as runner
 from .redact import redact_text
 
 _EVENTS = {"SummaryReportCompleted": "done", "SummaryReportFailed": "failed"}
+QUEUE_GRACE_S = 90          # a host that has not claimed a request by now is not running a worker
+RUN_GRACE_S = 60            # slack on top of the summarizer timeout before a claimed job is abandoned
+# Failure codes a host may report; anything else is stored as summarizer_failed.
+HOST_ERRORS = frozenset({"timeout", "harness_missing", "no_session_record", "malformed_report", "summarizer_failed",
+                         "evidence_too_large", "invalid_agent", "invalid_session_id", "unsupported_harness"})
 
 
 class ReportRefused(Exception):
@@ -36,7 +43,6 @@ class ReportConfig:
     harness: str = "claude"
     timeout_seconds: int = 300
     max_concurrent: int = 2
-    local_host_ids: tuple = ()
 
     def __post_init__(self):
         if not isinstance(self.enabled, bool):
@@ -48,16 +54,10 @@ class ReportConfig:
             value = getattr(self, name)
             if type(value) is not int or not lower <= value <= upper:
                 raise ValueError(f"summary_report {name} must be an integer between {lower} and {upper}")
-        if (not isinstance(self.local_host_ids, tuple)
-                or any(not isinstance(h, str) or not h or len(h) > 253 for h in self.local_host_ids)):
-            raise ValueError("summary_report local_host_ids must be a list of host names")
 
     @classmethod
     def from_mapping(cls, raw):
-        raw = dict(raw or {})
-        if "local_host_ids" in raw:
-            raw["local_host_ids"] = tuple(raw["local_host_ids"] or ())
-        return cls(**raw)
+        return cls(**dict(raw or {}))
 
 
 def _payload(event):
@@ -75,41 +75,78 @@ def _now():
 
 
 class SummaryReportService:
-    def __init__(self, repo, config, *, run=None, hostnames=None, spawn=None):
+    def __init__(self, repo, config, *, clock=time.time):
         self.repo = repo
         self.config = config if isinstance(config, ReportConfig) else ReportConfig.from_mapping(config)
-        self._run = run or runner.run_report
-        self._local = {h.lower() for h in (hostnames if hostnames is not None
-                                           else {socket.gethostname(), socket.getfqdn()})}
-        self._local |= {h.lower() for h in self.config.local_host_ids}
-        self._spawn = spawn or self._thread
+        self._clock = clock
         self._lock = threading.Lock()
-        self._running = {}          # session id -> {"operation_id", "started_at"}
+        self._jobs = {}             # session id -> open job (queued or running)
         self._unsaved = {}          # outcomes the event log refused; readable until restart
 
     @property
     def enabled(self):
         return self.config.enabled
 
-    @staticmethod
-    def _thread(fn):
-        threading.Thread(target=fn, name="summary-report", daemon=True).start()
-
     # -- reading ------------------------------------------------------------------
+    def _view(self, job):
+        return {"state": job["state"], "operation_id": job["operation_id"], "started_at": job["started_at"],
+                "harness": self.config.harness}
+
+    def _open_request(self, session_id):
+        """The session's request that has no outcome yet (rebuilt from the event log after a restart)."""
+        for event in reversed(self.repo.stream("session", session_id)):
+            kind = event.get("event_type")
+            if kind in _EVENTS:
+                return None
+            if kind == "SummaryReportRequested":
+                body = _payload(event)
+                if not body.get("operation_id") or not body.get("host_id"):
+                    return None
+                return {"operation_id": body["operation_id"], "session_id": session_id, "host_id": body["host_id"],
+                        "agent": body.get("agent"), "target": body.get("target"), "state": "queued",
+                        "started_at": body.get("started_at") or _now(), "basis_seq": body.get("basis_seq"),
+                        "queued_at": float(body.get("requested_at") or self._clock()), "claimed_at": None}
+        return None
+
+    def _adopt(self, session_id):
+        job = self._jobs.get(session_id)
+        if job is None:
+            job = self._open_request(session_id)
+            held = self._unsaved.get(session_id)
+            if job is not None and held and held.get("operation_id") == job["operation_id"]:
+                return None             # finished, but the event log refused the outcome: it is held in memory
+            if job is not None:
+                self._jobs[session_id] = job
+        return job
+
+    def _expire(self, session_id, job):
+        """Fail a job nobody finished; returns True when it was failed (the lock is NOT held)."""
+        age = self._clock() - (job["claimed_at"] or job["queued_at"])
+        if job["state"] == "queued" and age > QUEUE_GRACE_S:
+            self._finish(session_id, job, "SummaryReportFailed",
+                         {"error": "host_unreachable", "detail": "the agent's host did not pick up the request"})
+            return True
+        if job["state"] == "running" and age > self.config.timeout_seconds + RUN_GRACE_S:
+            self._finish(session_id, job, "SummaryReportFailed", {"error": "timeout"})
+            return True
+        return False
+
     def get(self, session_id):
-        """``{"state": idle|running|done|failed, …}``; a report never leaves this module unredacted."""
+        """``{"state": idle|queued|running|done|failed, …}``; a report never leaves this module unredacted."""
         with self._lock:
-            live = self._running.get(session_id)
+            job = self._adopt(session_id)
+            snapshot = dict(job) if job else None
+        if snapshot and not self._expire(session_id, snapshot):
+            return self._view(snapshot)
+        with self._lock:
             unsaved = self._unsaved.get(session_id)
-        if live:
-            return {"state": "running", **live}
         if unsaved:
             return dict(unsaved)
         for event in reversed(self.repo.stream("session", session_id)):
             state = _EVENTS.get(event.get("event_type"))
             if state:
                 body = _payload(event)
-                return {"state": state, **{k: v for k, v in body.items() if k != "actor"}}
+                return {"state": state, **{k: v for k, v in body.items() if k not in ("actor", "host_id")}}
         return {"state": "idle"}
 
     # -- starting -----------------------------------------------------------------
@@ -134,55 +171,140 @@ class SummaryReportService:
         if session is None:
             raise ReportRefused(404, "agent not found")
         agent, target = self._target(session)
-        host = str(session.get("host_id") or "").lower()
-        if host and host not in self._local:
-            raise ReportRefused(
-                409, f"This session's record is on {session.get('host_id')}, not on the dashboard host.",
-                reason="report_host_remote",
-                command=f"herdr-eng summary report --agent {agent} --session {target}")
+        host = str(session.get("host_id") or "")
+        if not host:
+            raise ReportRefused(409, "This session is not tied to a host, so no host can run the report.",
+                                reason="no_host")
         with self._lock:
-            if session_id in self._running:
-                return 202, {"ok": True, "status": "running", "replayed": True, "session_id": session_id,
-                             **self._running[session_id]}
-            if len(self._running) >= self.config.max_concurrent:
-                raise ReportRefused(429, "Too many reports are running; try again shortly.",
-                                    reason="report_limit")
+            job = self._adopt(session_id)
+            if job is not None and not self._expired(job):
+                return 202, {"ok": True, "status": job["state"], "replayed": True, "session_id": session_id,
+                             **self._view(job)}
+            if sum(1 for j in self._jobs.values() if not self._expired(j)) >= self.config.max_concurrent:
+                raise ReportRefused(429, "Too many reports are running; try again shortly.", reason="report_limit")
+            now = self._clock()
             operation_id = f"summary-report-{datetime.now(UTC).strftime('%Y%m%dT%H%M%S%f')}"
-            job = {"operation_id": operation_id, "started_at": _now(), "harness": self.config.harness}
-            self._running[session_id] = job
+            job = {"operation_id": operation_id, "session_id": session_id, "host_id": host, "agent": agent,
+                   "target": target, "state": "queued", "started_at": _now(), "queued_at": now, "claimed_at": None,
+                   "basis_seq": self._basis_seq(session_id)}
+            self._jobs[session_id] = job
         try:
-            self.repo.record_event("session", session_id, "SummaryReportRequested",
-                                   {"actor": dict(actor), "agent": agent, "operation_id": operation_id},
-                                   session_id=session_id, require_durable=True, publish=False, feed=False)
+            self.repo.record_event(
+                "session", session_id, "SummaryReportRequested",
+                {"actor": dict(actor), "agent": agent, "target": target, "host_id": host, "operation_id": operation_id,
+                 "started_at": job["started_at"], "requested_at": now, "basis_seq": job["basis_seq"]},
+                session_id=session_id, require_durable=True, publish=False, feed=False)
         except Exception:
             with self._lock:
-                self._running.pop(session_id, None)
+                self._jobs.pop(session_id, None)
             raise ReportRefused(503, "audit_persistence_failed") from None
-        try:
-            self._spawn(lambda: self._work(session_id, agent, target, job))
-        except Exception:
-            self._finish(session_id, job, "SummaryReportFailed", {"error": "summarizer_failed"})
-            raise ReportRefused(503, "could not start the report") from None
-        return 202, {"ok": True, "status": "running", "replayed": False, "session_id": session_id, **job}
+        return 202, {"ok": True, "status": "queued", "replayed": False, "session_id": session_id, **self._view(job)}
 
-    # -- the job ------------------------------------------------------------------
-    def _work(self, session_id, agent, target, job):
+    def _basis_seq(self, session_id):
         try:
-            result = self._run(agent, target, harness=self.config.harness,
-                               timeout=self.config.timeout_seconds)
-            body = {"report": result["report"], "harness": result.get("harness"),
-                    "generated_at": result.get("generated_at") or _now(),
-                    "duration_s": result.get("duration_s")}
-            self._finish(session_id, job, "SummaryReportCompleted", body)
+            return self.repo.inspector.newest_seq(session_id)
+        except Exception:
+            return None
+
+    def publish(self, host_id, body):
+        """Store a report a person generated in a terminal (``/summary``) for the session it describes.
+
+        The terminal knows the harness and its own session id, not the dashboard's session id, so the
+        dashboard session is the one on this host whose conversation identity names that harness session.
+        """
+        if not self.enabled:
+            raise ReportRefused(409, "Full session reports are not enabled.", reason="reports_disabled")
+        if not isinstance(body, dict):
+            raise ReportRefused(400, "request body must be a JSON object")
+        agent, target = body.get("agent"), body.get("target")
+        if agent not in runner.AGENTS or not isinstance(target, str) or not runner._SESSION_ID.match(target):
+            raise ReportRefused(400, "agent and target must name a recorded session")
+        try:
+            report = runner.validate_report(body.get("report") if isinstance(body.get("report"), str) else "")
         except runner.ReportError as exc:
-            self._finish(session_id, job, "SummaryReportFailed",
-                         {"error": exc.code, "detail": redact_text(exc.detail or "")[:300]})
-        except Exception:
-            self._finish(session_id, job, "SummaryReportFailed", {"error": "summarizer_failed"})
+            raise ReportRefused(422, "not a session summary", reason=exc.code) from None
+        matches = []
+        for session in self.repo.list_sessions():
+            if str(session.get("host_id") or "") != host_id:
+                continue
+            conversation = session.get("agent_session")
+            if not isinstance(conversation, dict) or str(conversation.get("agent") or "").lower() != agent:
+                continue
+            value = str(conversation.get("value") or "")
+            if conversation.get("kind") == "path":
+                value = Path(value).stem
+            if value == target:
+                matches.append(session)
+        if not matches:
+            raise ReportRefused(404, "The dashboard has no agent for that session on this host.", reason="no_session")
+        if len(matches) > 1:
+            raise ReportRefused(409, "More than one dashboard agent matches that session.", reason="ambiguous_session")
+        session_id = matches[0]["session_id"]
+        self._finish(session_id, {"operation_id": f"terminal-{datetime.now(UTC).strftime('%Y%m%dT%H%M%S%f')}",
+                                  "host_id": host_id, "started_at": _now(), "basis_seq": self._basis_seq(session_id)},
+                     "SummaryReportCompleted",
+                     {"report": report, "harness": agent, "source": "terminal", "generated_at": _now()},
+                     close_job=False)               # a run that is still open for this session keeps going
+        return 200, {"ok": True, "session_id": session_id}
 
-    def _finish(self, session_id, job, event_type, body):
-        body = {**body, "operation_id": job["operation_id"], "started_at": job["started_at"],
-                "finished_at": _now()}
+    def _expired(self, job):
+        age = self._clock() - (job["claimed_at"] or job["queued_at"])
+        limit = QUEUE_GRACE_S if job["state"] == "queued" else self.config.timeout_seconds + RUN_GRACE_S
+        return age > limit
+
+    # -- the host worker's two calls ------------------------------------------------
+    def claim(self, host_id):
+        """Hand a host its next queued job (one at a time per host) and mark it running."""
+        if not self.enabled or not isinstance(host_id, str) or not host_id:
+            return []
+        with self._lock:
+            mine = [j for j in self._jobs.values() if j["host_id"] == host_id]
+            if any(j["state"] == "running" and not self._expired(j) for j in mine):
+                return []
+            ready = sorted((j for j in mine if j["state"] == "queued" and not self._expired(j)),
+                           key=lambda j: j["queued_at"])
+            if not ready:
+                return []
+            job = ready[0]
+            job["state"], job["claimed_at"] = "running", self._clock()
+            return [{"operation_id": job["operation_id"], "session_id": job["session_id"], "agent": job["agent"],
+                     "target": job["target"], "harness": self.config.harness,
+                     "timeout_seconds": self.config.timeout_seconds}]
+
+    def finish(self, host_id, body):
+        """Store a host's result for the open request it names, after validating and redacting it."""
+        if not isinstance(body, dict):
+            raise ReportRefused(400, "request body must be a JSON object")
+        session_id, operation_id = body.get("session_id"), body.get("operation_id")
+        if not isinstance(session_id, str) or not isinstance(operation_id, str):
+            raise ReportRefused(400, "session_id and operation_id are required")
+        with self._lock:
+            job = self._adopt(session_id)
+        if job is None or job["operation_id"] != operation_id:
+            return 200, {"ok": True, "replayed": True}          # already finished (or expired): nothing to store
+        if job["host_id"] != host_id:
+            raise ReportRefused(403, "this request belongs to another host")
+        if body.get("ok") is True:
+            try:
+                report = runner.validate_report(body.get("report") if isinstance(body.get("report"), str) else "")
+            except runner.ReportError as exc:
+                self._finish(session_id, job, "SummaryReportFailed", {"error": exc.code, "detail": exc.detail[:300]})
+                return 200, {"ok": True, "status": "failed"}
+            harness = body.get("harness") if body.get("harness") == self.config.harness else self.config.harness
+            duration = body.get("duration_s")
+            self._finish(session_id, job, "SummaryReportCompleted",
+                         {"report": report, "harness": harness, "generated_at": _now(),
+                          "duration_s": duration if isinstance(duration, (int, float)) and not isinstance(duration, bool)
+                          else None})
+            return 200, {"ok": True, "status": "done"}
+        code = body.get("error") if body.get("error") in HOST_ERRORS else "summarizer_failed"
+        detail = redact_text(body.get("detail") if isinstance(body.get("detail"), str) else "")[:300]
+        self._finish(session_id, job, "SummaryReportFailed", {"error": code, "detail": detail})
+        return 200, {"ok": True, "status": "failed"}
+
+    def _finish(self, session_id, job, event_type, body, *, close_job=True):
+        body = {**body, "operation_id": job["operation_id"], "host_id": job["host_id"],
+                "started_at": job["started_at"], "finished_at": _now(), "basis_seq": job.get("basis_seq")}
         state = _EVENTS[event_type]
         try:
             self.repo.record_event("session", session_id, event_type, body, session_id=session_id,
@@ -191,8 +313,10 @@ class SummaryReportService:
         except Exception:
             saved = False
         with self._lock:
-            self._running.pop(session_id, None)
+            if close_job:
+                self._jobs.pop(session_id, None)
             if saved:
                 self._unsaved.pop(session_id, None)
             else:
-                self._unsaved[session_id] = {"state": state, **body, "persisted": False}
+                self._unsaved[session_id] = {"state": state, **{k: v for k, v in body.items() if k != "host_id"},
+                                             "persisted": False}

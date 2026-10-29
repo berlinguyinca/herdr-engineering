@@ -4,6 +4,7 @@ import {spawn} from 'node:child_process';
 import {existsSync,mkdirSync} from 'node:fs';
 import path from 'node:path';
 import {chromium} from 'playwright';
+const hf=async p=>{await p.locator('[data-health-filters]').waitFor({state:'attached',timeout:15000});await p.evaluate(()=>{const d=document.querySelector('[data-health-filters]');if(d)d.open=true;});};  // the Health filter bar is a closed disclosure by default
 const root=path.resolve(import.meta.dirname,'../..');
 
 test('CI reports publish over HTTP and drive history, pipeline logs and responsive layout',async()=>{
@@ -394,6 +395,7 @@ test('shared selection: PR scope and a day bucket narrow summary, Tests and Runs
 
 test('shared selection: last-24-runs exact old run reaches summary, Tests and Runs through real HTTP',()=>commandCenter(async({page})=>{
  await page.locator('[data-ob-project]').filter({hasText:'org/app'}).click();
+ await hf(page);
  await page.locator('[data-health-mode="runs"]').click();
  const responses=Promise.all(['summary','tests'].map(route=>page.waitForResponse(r=>{
   const u=new URL(r.url());return u.pathname===`/api/v1/ci/${route}`&&u.searchParams.get('run_number')==='3';

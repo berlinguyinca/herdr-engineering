@@ -192,12 +192,14 @@ data URLs for capture only (`bypassCSP`, because the page CSP is `default-src 'n
 (it was U+FF0B, which only a CJK font has). `assertBundledFonts` walks EVERY element and ::before/::after of the page through the
 DevTools protocol (`CSS.getPlatformFontsForNode`) and fails the capture if any glyph was painted by a host font; its own test puts a
 host-font span (and an emoji) on the page and requires the failure. **What that proves, and what it does not:** the visual suite runs
-`baselines:check` in a child process under a `FONTCONFIG_FILE` that lists only `tests/playwright/fonts` (plus `/etc/fonts/conf.d`
-for rendering settings) and requires the whole suite to pass; `fc-list` under that file shows only the four bundled families. So the
-screenshots do not depend on which FONTS the host has installed. They do still depend on the host's fontconfig RENDERING settings
-(hinting, antialiasing, subpixel order, in `/etc/fonts/conf.d`): with no `conf.d` at all the check fails. A host with other
-settings, another Chromium build or another operating system has not been tried; the first run on the CI agent is that test (see
-"CI" below).
+`baselines:check` in a child process under a host `FONTCONFIG_FILE` that lists only `tests/playwright/fonts` and renders with the
+OPPOSITE settings to the baselines (no hinting, grayscale) and requires the whole suite to pass; `fc-list` under that file shows only
+the four bundled families. The browser does not read the host's fontconfig at all: `launch()` in `ui-gates-lib.mjs` starts Chromium
+under a generated `FONTCONFIG_FILE` with the bundled fonts and the rendering settings pinned to the ones the baselines were made with
+(`hintslight`, `rgb` sub-pixel order, anti-aliasing on, `lcddefault`). So the screenshots depend on neither the fonts nor the
+rendering settings of the host. This was added after the first Woodpecker run, where a host with other `conf.d` settings moved all 88
+baselines by 1-11% of their pixels; before the pin, the same check under the opposite settings failed 88 of 88 on the workstation,
+after it 0 of 88. Another Chromium build or another operating system has not been tried.
 
 The suite has teeth (18 injected defects, each of which must fail on the page or the component): hidden edges, transparent
 inspector text, hidden logo and glyphs, missing badges, an invisible Send button, a +7 colour shift, a 1px shift, a 1px wider button,
@@ -213,10 +215,9 @@ Baseline policy:
   writes nothing and exits 1. It also writes nothing if any surface failed to capture, so a failed update never leaves a half
   rewritten set. A test pins the projection.
 - Baselines are tied to the Chromium build Playwright resolves (its FreeType and Skia) and to the bundled fonts. No glyph may fall
-  back to a host font (asserted per element). What a baseline can STILL depend on, honestly: the host's fontconfig RENDERING
-  settings (hinting level, anti-aliasing, sub-pixel layout: they come from `/etc/fonts/conf.d`, are not fonts, and were left
-  as the system has them in the portability run), device scale factor 1, and the Chromium build. A machine with different
-  rendering settings, or another Chromium build, needs an `update` with the PNG diff reviewed. An emoji on a surface would fail the
+  back to a host font (asserted per element). The fontconfig rendering settings (hinting level, anti-aliasing, sub-pixel layout)
+  are pinned by `launch()`, not read from the host. What a baseline can STILL depend on, honestly: device scale factor 1 and the
+  Chromium build. Another Chromium build needs an `update` with the PNG diff reviewed. An emoji on a surface would fail the
   font assertion rather than silently paint with a colour-emoji font.
 - `check` fails on an orphan PNG (a baseline no surface produces); `update` and `check` exit 2 on a slug that matches nothing.
 - A miss writes `<name>.actual.png` and `<name>.diff.png` under `.autospec/reports/visual/` (not committed).
@@ -319,7 +320,7 @@ Found by the round-3 review's gates (fourth round):
   stepped-back replay state (a poll can put the view back to live between two lines of the test); it is gone, and the
   `aria-pressed` on Live is required in the live table state instead.
 - **N5b** (the Pause motion label gone, an empty box) was invisible to every gate until the flow surface joined the visual suite.
-- **Not covered by the pixel gate:** a change of one colour step (+1 per channel); a host whose fontconfig rendering settings differ.
+- **Not covered by the pixel gate:** a change of one colour step (+1 per channel).
 - **Search is client-side** and covers only loaded nodes; the server caps lineage paging at 3,000 nodes.
 - **Performance numbers come from a loaded host** (see above).
 - **Screenshot determinism is bounded, not proven exact.** The determinism test allows half the page budget between fresh loads. The deterministic server stamps
@@ -337,16 +338,16 @@ Found by the round-3 review's gates (fourth round):
 then fails on any change under `docs/assets/screenshots`) on Woodpecker, for pull requests that touch the page, its tests, the control
 plane or the baselines, and by hand. GitHub Actions is disabled organisation-wide and is not used. The definition follows the shape of
 the organisation's other pipelines that were read (`image: bash`, `skip_clone` plus a plain git checkout, step logic in a script in
-the repository, no docker, apt or sudo on the exec hosts). **It has not been run on a Woodpecker agent.** Whether an exec host has
-Chromium's shared libraries and a Debian-style fontconfig is unknown, and the first run is the real test of the screenshots there.
+the repository, no docker, apt or sudo on the exec hosts). It has run on a Woodpecker agent: the first run failed
+`baselines:check` on all 88 pages because that host's fontconfig rendering settings differed from the workstation's; `launch()` now pins
+them (see the fonts section above).
 
 What the host must already have, because the screenshots are compared pixel for pixel and the script installs nothing system-wide:
 
 - Node 22 and Python 3.12 with `venv`; `git`; a writable checkout. The script installs the Python package into a venv, runs `npm ci`
   and `npx playwright install chromium` (the Chromium of Playwright 1.64 is the build the baselines came from);
 - Chromium's shared libraries (what Playwright's own `install-deps` would add);
-- fontconfig with `/etc/fonts/conf.d` as shipped by Debian/Ubuntu (`10-hinting-slight`, `10-sub-pixel-rgb`, `10-yes-antialias`,
-  `11-lcdfilter-default`): fonts do not matter, these rendering settings do. A host whose settings differ fails `baselines:check`
-  while every other gate passes; fix the host (or, after reviewing the diff images, run `update` from a commit and say why).
+- `/etc/fonts/conf.d` must exist (the script checks it), but its contents do not matter: the browser runs under its own pinned
+  fontconfig, so neither the host's fonts nor its rendering settings reach a screenshot.
 
 The suite takes about ten minutes on a workstation and runs one test at a time; give the step that much and one CPU core per Chromium.

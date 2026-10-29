@@ -94,8 +94,7 @@ It reads Claude Code and Pi/Codex JSONL and OpenCode's SQLite database (opened
 
 ## Full report in the dashboard
 
-The agent page has a **Generate full report** button next to the model-written summary
-card. It runs the same `summary` skill the terminal uses and shows the result in the
+The agent page has a **Full report** button next to the model-written **Quick summary** button. It runs the same `summary` skill the terminal uses and shows the result in the
 summary card (a bounded, scrollable block) instead of the terminal. In the fullscreen
 workspace the summary and report sit in their own column beside the conversation and
 activity panes, so the panes and composer keep the whole viewport.
@@ -107,34 +106,75 @@ summary_report:
   enabled: true
   harness: claude          # the summarizer; only claude is accepted until codex has run live
   timeout_seconds: 300     # 10-900
-  max_concurrent: 2        # 1-4 reports at once on the dashboard host
-  local_host_ids: []       # extra names this host answers to (host_id values)
+  max_concurrent: 2        # 1-4 open reports across the fleet
 ```
+
+Where it runs. The control plane is a container with neither the agents' session records nor a
+summarizer CLI, so it only queues the request (`POST /api/v1/sessions/{id}/summary/report`, operator,
+same-origin JSON; a durable `SummaryReportRequested` event). The session service on the host that owns the
+agent (`herdr-cp-sessions`, the same process that publishes snapshots) polls
+`POST /api/v1/host/summary-reports/claim` every 5 s with its host token (`host.json` `host_id`), runs
+`herdr-eng summary report` locally and posts the result to `.../result`. One job at a time per host. A
+request nobody claims within 90 s fails as `host_unreachable` (usually: that host's service has not been
+updated); a claimed job that never reports fails as `timeout`. Both leave the button usable for a retry.
 
 How it stays read-only:
 
-- It never resumes or prompts the target session. The dashboard host reads the session
-  record (`herdr-eng summary history`) and runs fixed-argv, read-only `git` in the
-  recorded worktree itself (`--no-optional-locks`, `core.fsmonitor=false`,
-  `--no-ext-diff`), then starts a fresh `claude -p` in an empty scratch directory with
-  **no tools**, `--no-session-persistence`, `--strict-mcp-config` and no Herdr pane
-  environment. The evidence is passed as quoted data; nothing in a transcript is executed.
-- The report must start with `# Session summary` and contain **Evidence coverage**,
-  otherwise it is discarded as `malformed_report`. It is redacted, capped at 60,000
-  characters and stored as a session event (`SummaryReportCompleted`), so it survives a
-  restart and is returned as `full_report` by `GET /api/v1/sessions/{id}/summary`.
-- One report per session at a time; a second click returns the running job. Runs are
-  background jobs (typically 20 s to a few minutes).
+- It never resumes or prompts the target session. The host reads the session record
+  (`herdr-eng summary history`) and runs fixed-argv, read-only `git` in the recorded worktree itself
+  (`--no-optional-locks`, `core.fsmonitor=false`, `--no-ext-diff`), then starts a fresh `claude -p` in an
+  empty scratch directory with **no tools**, `--no-session-persistence`, `--strict-mcp-config` and no Herdr
+  pane environment. The evidence is passed as quoted data; nothing in a transcript is executed.
+- The report must start with `# Session summary` and contain **Evidence coverage**, otherwise it is
+  discarded as `malformed_report`. The host validates it and the control plane validates and redacts it
+  again before storing it (capped at 60,000 characters) as a session event (`SummaryReportCompleted`), so
+  it survives a restart and is returned as `full_report` by `GET /api/v1/sessions/{id}/summary`.
+- One open report per session; a second click returns the running job.
+- The host endpoints use the ingest role, like snapshots: a host token is not bound to one host, so a
+  token holder could claim another host's job, the same trust the ingest path already has. A result is
+  only accepted for the request it names and the host that request was queued for.
 
 Limits (v1):
 
-- Only sessions whose record is on the **dashboard host** can be reported on. For any
-  other host the button answers `report_host_remote` and shows the exact
-  `herdr-eng summary report --agent … --session …` command to run there. Nothing opens a
-  connection from the dashboard to another machine.
-- The agent must have identified its conversation (`agent_session`). An idle Codex pane
-  that has not run a turn since it started has none yet, and the button says so.
-- The dashboard service must be able to run `claude` with working credentials, as the
-  user that owns the session records (`harness_missing` otherwise).
+- The agent must have identified its conversation (`agent_session`). An idle Codex pane that has not run
+  a turn since it started has none yet, and the button says so.
+- The host needs `herdr-eng` and `claude` on the session service's PATH (`~/.local/bin` is included) with
+  working Claude credentials for the user that owns the session records.
+- Roll the plugin (`deploy/deploy-fleet-agents.sh`) to every host that should be able to run reports.
 - `herdr-eng summary report --agent A --session ID [--harness claude]` prints the same
   result as JSON for use from a terminal.
+
+### Reading the report
+
+The report block opens with a strip: overall status, an **Evidence** badge (`complete`, `partial` or
+`limited`, copied from the report's own coverage verdict) and the **Resume point**. The numbered sections
+below are collapsible (outstanding work and next actions start open). When the conversation has moved on
+since the report was made, a **stale** badge shows how many newer messages exist and offers **Regenerate**.
+While a report runs the status line shows elapsed time. **Copy as markdown** copies the stored report;
+**Send to agent** posts the resume point and next actions to the agent as a message (confirmed first, and
+disabled once the agent has ended). Timestamps in the report that match a recorded turn jump to that turn
+(best effort: a timestamp with no turn within a day stays plain text). A failed or empty quick summary is
+reduced to one muted line once a full report exists. In the fullscreen workspace, token-usage rows are hidden
+from Activity unless **Show usage rows** is ticked, and **Hide activity** gives the conversation the full width.
+
+### Running `/summary` in a terminal
+
+In a Herdr pane, `/summary` (or `$summary` in Codex) no longer prints the whole report into the scrollback.
+It publishes the report and prints one line:
+
+- `herdr-eng summary publish --agent A --session ID` reads the report on stdin, validates and redacts it, and
+  writes `~/.cache/herdr-engineering/summary/<agent>-<session>.md` (mode 0600).
+- It posts the report to the control plane (`POST /api/v1/host/summary-reports/publish`, ingest role), where it
+  becomes the session's `full_report` with `source: "terminal"`. The dashboard names the agent by its recorded
+  identity; zero or several matching dashboard sessions are refused (`no_session`, `ambiguous_session`) rather
+  than guessed, and a running dashboard job is not cancelled.
+- It opens, or reuses, a read-only `less -R` side pane to the right of the agent (`--no-focus`), remembering
+  the pane in a sidecar file. `--no-pane` and `--no-dashboard` turn either half off.
+- If publishing fails, the skill prints the complete report so nothing is lost. Target mode and prepared
+  evidence runs never publish.
+
+### Work spread over several worktrees
+
+A session that moved into a different git worktree records every distinct `cwd` (latest last). The report's
+git facts come from the latest directory that is a repository; earlier distinct worktrees are listed as
+`other_worktrees` and reported as such, never merged into one state.
