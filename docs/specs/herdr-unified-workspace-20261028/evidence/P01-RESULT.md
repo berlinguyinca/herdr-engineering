@@ -67,3 +67,6 @@ Q1 project/team/artifact_version/external_action become OWNED graph kinds in P02
 ## Open follow-ups (P02)
 - Retention-gap signal (`snapshot_required`) for replay cursors.
 - Re-test guest-hidden helper events advancing the cursor end to end.
+
+## Second rebase (skill registry #376 merged)
+Pipeline 137 unit-gates failed on one test, `tests/control_plane/test_github_api.py::test_real_monitor_surfaces_scope_and_invalid_config_in_the_list_bodies` (`'syncing' == 'ready'`, 1 failed / 8244 passed). It passes in isolation both on this branch and on clean origin/main (31 passed each): a timing flake under CI load, not related to P01. Branch merged with fresh origin/main (conflicts: api.py signature + capability list, CHANGELOG; both sides kept); the push triggers a fresh pipeline in place of a restart.
