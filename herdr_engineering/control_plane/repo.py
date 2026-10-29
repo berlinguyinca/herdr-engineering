@@ -231,7 +231,8 @@ class ControlPlaneRepo:
         self.deployment_requests = self._new_deployment_requests()
 
     def _new_deployment_requests(self):
-        return ForceRequests(persist=self._persist_deployments, now=lambda: self._now())
+        return ForceRequests(persist=self._persist_deployments,
+                             persist_required=self._persist_deployments_required, now=lambda: self._now())
 
     def _new_deployment_plans(self):
         return CoordinatorState(persist=self._persist_deployments)
@@ -245,6 +246,16 @@ class ControlPlaneRepo:
     def _persist_deployments(self, ev):
         """Deployment events take the same private sink path as host-metrics rollups."""
         self._persist_host_metrics(ev)
+
+    def _persist_deployments_required(self, ev):
+        """Like ``_persist_deployments`` but durable: raises unless the sink acknowledged the
+        record (a force pickup must not be lost, or a restart would grant the force again)."""
+        if self._sink is None:
+            return
+        stamp = self._stamp()
+        self._sink.record_required({"event_id": new_id("event"), "schema_version": 1,
+                                    "source_timestamp": stamp, "ingest_timestamp": stamp,
+                                    "mission_id": None, "session_id": None, **ev})
 
     def _persist_host_metrics(self, ev):
         """Rollups and host-state changes go to the sink, not the shared streams/SSE."""

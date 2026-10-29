@@ -550,14 +550,22 @@ class CoordinatorState:
             acked.popitem(last=False)
 
     def acknowledgeable(self, component, release, instance=None) -> list:
-        """The releases ``acknowledge`` would act on (read only)."""
+        """What ``acknowledge`` would act on (read only): ``[{release, outcome, host_ts}]``
+        for an instance (the slot being acknowledged), ``[{release}]`` for an eviction."""
         if not _str(release, _ID_CAP) or not _COMMIT.fullmatch(release):
             return []
+        out = []
         with self._lock:
-            return [rel for rel, entry in (self._slots.get(component) or {}).items()
-                    if same_commit(rel, release)
-                    and (entry["failure_evicted"] if instance is None
-                         else instance in entry["instances"])]
+            for rel, entry in (self._slots.get(component) or {}).items():
+                if not same_commit(rel, release):
+                    continue
+                if instance is None:
+                    if entry["failure_evicted"]:
+                        out.append({"release": rel})
+                elif instance in entry["instances"]:
+                    slot = entry["instances"][instance]
+                    out.append({"release": rel, "outcome": slot["outcome"], "host_ts": slot["host_ts"]})
+        return out
 
     def acknowledge(self, component, release, instance=None) -> list:
         """Operator ack (audited by the caller). With ``instance``: drop that instance's slot

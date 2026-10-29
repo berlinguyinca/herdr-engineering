@@ -332,9 +332,10 @@ class ControlPlaneServer:
         self._deployments_error_type = None     # the last logged tick failure type (log on change only)
         self._deployments_last = {"ticked_at": None, "tracks": [], "error": None, "stale": False}
         # Task 5: force/ack are serialized (validate, audit, then record, with no race between).
-        from .deployment_actions import AuditThrottle
+        from .deployment_actions import AuditThrottle, RefusalCounter
         self._deployment_actions_lock = threading.Lock()
-        self._deployment_auth_audit = AuditThrottle()
+        self._deployment_refused_rows = AuditThrottle()
+        self._deployment_refusals = RefusalCounter()
         # control_plane.missions (validated; outcomes are written when a mission ends, on by default).
         from .mission_outcome import MissionOutcomes, missions_config
         self.missions_config = missions_config(missions)
@@ -617,7 +618,9 @@ class ControlPlaneServer:
         view["plans"] = last.pop("tracks")
         view["coordinator"] = {**last, "interval_s": DEPLOYMENTS_TICK_S,
                                "evidence": "unknown" if self.deployment_evidence is None else "configured"}
-        view["actions"] = {"enabled": self.deployment_actions_enabled()}
+        view["actions"] = {"enabled": self.deployment_actions_enabled(),
+                           "keyed": self._deployment_keyed(),
+                           "refused": self._deployment_refusals.snapshot()}
         view["requests"] = self.repo.deployment_requests.pending()
         return view
 
@@ -632,6 +635,10 @@ class ControlPlaneServer:
             return self.fleet_config.secure_section("control_plane").get("deployment_actions") is True
         except FleetConfigError:
             return False
+
+    def _deployment_keyed(self) -> bool:
+        """Force/ack need keyed mode: at least one operator API key."""
+        return any(role == "operator" for role in self._keys.values())
 
     def _loaded_deployment_definitions(self):
         """The definitions, or None unless they are configured AND loaded. Unlike ingest
@@ -653,32 +660,41 @@ class ControlPlaneServer:
 
     def deployment_audit(self, action, event_type, *, outcome, actor, target, reason, status,
                          durable=False, **extra):
-        """One audit row (``deployment_action``/<action>). Every value is validated or ours.
-        ``durable`` rows raise when they cannot be persisted; others never raise."""
+        """One audit row (``deployment_action``, one stream per action per UTC day, which bounds
+        record_event's per-stream sequence scan). Every value is validated or ours. ``durable``
+        rows raise when they cannot be persisted; refusal rows never raise, stay out of the
+        shared feed and are throttled (the overflow is counted)."""
         from .deployment_actions import AUDIT_ENTITY, stamp
         now = time.time()
         payload = {"action": action, "outcome": outcome, "actor": actor, "target": target,
                    "reason": reason, "status": status, "at": stamp(now), "at_epoch": now, **extra}
+        stream = f"{action}:{stamp(now)[:10]}"
         if durable:
-            self.repo.record_event(AUDIT_ENTITY, action, event_type, payload, require_durable=True)
+            self.repo.record_event(AUDIT_ENTITY, stream, event_type, payload, require_durable=True)
+            return
+        if not self._deployment_refused_rows.take():
+            self._deployment_count_refusal(action, "audit row throttled")
             return
         try:
-            self.repo.record_event(AUDIT_ENTITY, action, event_type, payload)
+            self.repo.record_event(AUDIT_ENTITY, stream, event_type, payload, feed=False)
         except Exception:  # noqa: BLE001 - a refusal is answered whether or not its row lands
             log.warning("deployment %s refusal could not be audited", action)
 
+    def _deployment_count_refusal(self, action, reason):
+        """An unaudited refusal: counted in memory, logged at most once a minute per reason."""
+        if self._deployment_refusals.count(action, reason):
+            log.warning("deployment %s refused before authentication: %s (counted; see the "
+                        "Deployments view, actions.refused)", action, reason)
+
     def deployment_refused(self, action, actor, status, reason, target=None, *, auth=False):
-        """Audit a refusal; auth refusals are throttled (counted into the next row)."""
-        extra = {}
+        """A refusal. ``auth``: before authentication, so counted only (never a row);
+        otherwise an authenticated operator's refusal, audited as ``refused``."""
         if auth:
-            write, suppressed = self._deployment_auth_audit.take()
-            if not write:
-                return
-            if suppressed:
-                extra["suppressed"] = suppressed
+            self._deployment_count_refusal(action, reason)
+            return
         kind = "Force" if action == "force" else "Ack"
         self.deployment_audit(action, f"Deployment{kind}Refused", outcome="refused", actor=actor,
-                              target=target, reason=reason, status=status, **extra)
+                              target=target, reason=reason, status=status)
 
     def _deployment_refusal(self, action, actor, exc, target):
         self.deployment_refused(action, actor, exc.status, exc.message, target)
@@ -758,22 +774,25 @@ class ControlPlaneServer:
                     if not release:
                         raise ActionRefused(409, "no target release to acknowledge against; give release")
                     target["release"] = release
-                if not state.acknowledgeable(component, release, instance):
+                slots = state.acknowledgeable(component, release, instance)
+                if not slots:
                     raise ActionRefused(404, "nothing to acknowledge: no such instance slot"
                                         if instance is not None else "nothing to acknowledge: "
                                         "the release is not failure-evicted")
             except ActionRefused as exc:
                 return self._deployment_refusal("ack", actor, exc, target)
+            from .deployment_coordinator import ACK_EVENT, EVICTION_ACK_EVENT
             try:
-                self.deployment_audit("ack", "DeploymentInstanceAcknowledged", outcome="accepted",
-                                      actor=actor, target=target, reason="acknowledged",
-                                      status=200, durable=True)
+                self.deployment_audit("ack", ACK_EVENT if instance is not None else EVICTION_ACK_EVENT,
+                                      outcome="accepted", actor=actor, target=target,
+                                      reason="acknowledged", status=200, durable=True,
+                                      acknowledged=slots)
             except Exception:  # noqa: BLE001 - no audit, no ack
                 log.warning("deployment ack not applied: the audit row could not be persisted")
                 return 503, {"error": "audit_persistence_failed"}
             return 200, {"acknowledged": state.acknowledge(component, release, instance)}
 
-    def deployment_permit(self, host, component, commit):
+    def deployment_permit(self, host, component, commit, generation=None):
         """GET permit (host token). -> (status, payload); never writes anything."""
         from .deployment_actions import _deny, permit_decision
         defs = self._loaded_deployment_definitions()
@@ -785,7 +804,8 @@ class ControlPlaneServer:
         last, view = self._deployment_track_view(d)
         force = (self.repo.deployment_requests.active(component, commit)
                  if self.deployment_actions_enabled() else None)
-        return 200, permit_decision(last, view, component, commit, force, now=time.time())
+        return 200, permit_decision(last, view, component, commit, force, now=time.time(),
+                                    component_stage=d.stage, generation=generation)
 
     def deployment_requests_for(self, host) -> list:
         """The host's pending force entries ([] with the flag off or no definitions)."""
@@ -795,7 +815,9 @@ class ControlPlaneServer:
         return self.repo.deployment_requests.entries([c for c, d in defs.items() if d.host == host])
 
     def deployment_clear(self, host, rid) -> list:
-        """DELETE a request (host token): clear the host's own entries; audited."""
+        """DELETE a request (host token): spend the host's own entries (and every overlapping
+        entry for the same component and commit); audited. Raises when the clear could not
+        be persisted durably (the route answers 503 and every entry stays pending)."""
         defs = self._loaded_deployment_definitions() or {}
         done = self.repo.deployment_requests.clear(
             rid, [c for c, d in defs.items() if d.host == host], host)
@@ -1964,26 +1986,40 @@ def _make_handler(server, public=False, operator=False):
             from .deployment_actions import MAX_BODY_BYTES
             if self._rate_limit():
                 return None
-            role = self._role()
-            principal = self._principal()
-            actor = f"{principal['kind']}:{principal['id']}" if role is not None else None
-            if role != "operator":
-                status, reason = (401, "unauthorized") if role is None else (403, "operator role required")
-                server.deployment_refused(action, actor, status, reason, auth=True)
+
+            def unaudited(status, reason):
+                server.deployment_refused(action, None, status, reason, auth=True)
                 return self._deny(status, reason)
+
+            if not server._deployment_keyed():
+                # Open tailnet mode: every caller is "operator", so a DNS-rebound page would be
+                # too. Deployment actions need a real credential.
+                return unaudited(403, "deployment actions require API keys (keyed mode)")
+            role = self._role()
+            if role is None:
+                return unaudited(401, "unauthorized")
+            if role != "operator":
+                return unaudited(403, "operator role required")
             if server.fleet_config is not None and self._deployment_host() is not None:
                 # A fleet host token grants the host routes only, even beside an operator key.
-                server.deployment_refused(action, actor, 403, "a host token grants no operator action",
-                                          auth=True)
-                return self._deny(403, "a host token grants no operator action")
+                return unaudited(403, "a host token grants no operator action")
+            principal = self._principal()
+            actor = f"{principal['kind']}:{principal['id']}"
 
             def refuse(status, reason):
                 server.deployment_refused(action, actor, status, reason)
                 return self._deny(status, reason)
 
+            # Browser defences (the key could be in a page's hands): a Host a rebinding name
+            # cannot reach, no cross-site fetch, and an Origin equal to the Host.
+            if not _dashboard_host_ok(self.headers.get("Host", ""), server.collab_dashboard_hosts):
+                return refuse(403, "deployment actions need a dashboard host")
+            fetch_site = self.headers.get("Sec-Fetch-Site")
+            if fetch_site is not None and fetch_site.strip().lower() not in {"same-origin", "none"}:
+                return refuse(403, "cross-site deployment action refused")
             origin = self.headers.get("Origin")
-            if origin and (urlsplit(origin).netloc != self.headers.get("Host")
-                           or urlsplit(origin).scheme not in {"http", "https"}):
+            if origin is not None and (urlsplit(origin).netloc != self.headers.get("Host")
+                                       or urlsplit(origin).scheme not in {"http", "https"}):
                 return refuse(403, "cross-origin deployment action refused")
             if self.headers.get("Content-Type", "").split(";", 1)[0].strip() != "application/json":
                 return refuse(415, "deployment actions require application/json")
@@ -2014,7 +2050,7 @@ def _make_handler(server, public=False, operator=False):
             if self._rate_limit(f"deploy-host:{host}"):
                 return None
             raw = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
-            allowed = {"host"} if what == "requests" else {"component", "commit"}
+            allowed = {"host"} if what == "requests" else {"component", "commit", "generation"}
             if set(raw) - allowed or any(len(v) != 1 for v in raw.values()):
                 return self._deny(400, f"query takes only {', '.join(sorted(allowed))}")
             query = {k: v[0] for k, v in raw.items()}
@@ -2027,7 +2063,12 @@ def _make_handler(server, public=False, operator=False):
             component, commit = query.get("component", ""), query.get("commit", "")
             if not COMPONENT.fullmatch(component) or not COMMIT.fullmatch(commit):
                 return self._deny(400, "component and commit are required")
-            status, payload = server.deployment_permit(host, component, commit)
+            generation = query.get("generation")
+            if generation is not None and not (generation.isascii() and generation.isdigit()
+                                               and len(generation) <= 9):
+                return self._deny(400, "generation must be a non-negative integer")
+            status, payload = server.deployment_permit(
+                host, component, commit, None if generation is None else int(generation))
             return self._json(payload, status)
 
         def _deployment_request_clear(self, rid):
@@ -2040,7 +2081,11 @@ def _make_handler(server, public=False, operator=False):
                 return self._deny(401, "unauthorized")
             if self._rate_limit(f"deploy-host:{host}"):
                 return None
-            done = server.deployment_clear(host, rid) if REQUEST_ID.fullmatch(rid) else []
+            try:
+                done = server.deployment_clear(host, rid) if REQUEST_ID.fullmatch(rid) else []
+            except Exception:  # noqa: BLE001 - not durably cleared: the host must not redeploy
+                log.warning("deployment force pickup not persisted; the request stays pending")
+                return self._deny(503, "the pickup could not be persisted; do not redeploy")
             if not done:
                 return self._deny(404, "no pending request of this host")
             return self._json({"cleared": done})

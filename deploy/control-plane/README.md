@@ -220,21 +220,32 @@ request** that the host updater picks up on its next poll. The routes (each also
 | `POST /api/deployments/force` `{"component": "<name>"}` or `{"stage": <n>}` | operator `X-API-Key` | records a force request for one component, or one entry per component of a stage, with the current plan target. An identical pending request is not duplicated |
 | `POST /api/deployments/ack` `{"component", "instance"[, "release"]}` | operator `X-API-Key` | acknowledges a stale instance (for example a preempted node whose `failed` would otherwise halt its stage for that release). The release defaults to the plan target. `{"component", "release"}` with no instance lifts a `failure-evicted` mark. Attempt counts are never changed |
 | `GET /api/deployments/requests?host=<id>` | fleet host token | pending force entries for the components defined for that host |
-| `DELETE /api/deployments/requests/<id>` | fleet host token | clears the host's own entries of a request (the "once") |
-| `GET /api/deployments/permit?component=<c>&commit=<sha>` | fleet host token | the host gate: `{permitted, reason, generation, target_commit, forced, request_id}` |
+| `DELETE /api/deployments/requests/<id>` | fleet host token | clears the host's own entries of a request, and every other pending entry forcing the same component to the same commit (the "once"). Answers 503 when the clear could not be persisted durably; the host must then NOT redeploy |
+| `GET /api/deployments/permit?component=<c>&commit=<sha>[&generation=<n>]` | fleet host token | the host gate: `{permitted, reason, generation, target_commit, forced, request_id}`. With `generation`, a different plan generation answers false ("generation changed") |
 
+- **Deployment actions require API keys.** Force and ack work only in keyed mode, with at least one
+  `operator` key in `control_plane.api_keys`. An open tailnet server refuses them with 403, because there every
+  caller is the operator, a DNS-rebound page included. The host routes work in both modes.
 - **Guards on force and ack:**
   - `control_plane.deployment_actions: true` (otherwise 403).
-  - The operator role. In open tailnet mode every loopback/tailnet caller is the operator.
-  - Same-origin, `application/json`, and a body of at most 4 KiB.
+  - The operator role, by `X-API-Key`.
+  - A `Host` a rebinding name cannot reach: an IP literal, `localhost`, or a name listed in the collab dashboard
+    hosts.
+  - No cross-site `Sec-Fetch-Site`; only `same-origin` or `none` is accepted, and a client that sends none is fine.
+  - An `Origin`, when present, whose host equals `Host`. Its scheme may be http or https, because TLS may be
+    terminated in front.
+  - `application/json`, and a body of at most 4 KiB.
   - Exactly one target, validated against the loaded definitions.
   - A request that carries a fleet host token is refused even beside an operator key.
-- **Audit.** Every request writes an audit row (`deployment_action` events) with the actor (`<role>:key:<digest>`),
-  the target, the time and the outcome.
-  - An accepted request is audited durably *before* it is recorded. If that row cannot be persisted, the answer is
-    503 and nothing is recorded.
-  - Refusals are recorded as `refused`. Auth refusals have no target because the body is never read, and are
-    throttled to 60 rows a minute.
+- **Audit.** Rows are `deployment_action` events, one stream per action per UTC day. A row holds the actor
+  (`operator:key:<digest>`), the target, the time and the outcome.
+  - An accepted action is audited durably *before* it is recorded. If that row cannot be persisted, the answer is
+    503 and nothing is recorded. An ack row also records the acknowledged slot's outcome and `host_ts`.
+  - An authenticated operator's refusal is recorded as `refused`. These rows stay out of the shared event feed,
+    at most 60 a minute; the rest are counted.
+  - Refusals before authentication write NO row: open mode, no or a bad key, a non-operator role, or a host token
+    on an operator route. They are counted per reason in memory (the Deployments view, `actions.refused`) and
+    logged at most once a minute per reason.
   - Host pickups are recorded as `picked-up`.
 - **Requests** are kept until cleared or for 24 h, at most 256 pending (more is refused with 429).
 - **Host token scope.** The host token grants only these host routes, and only for the components whose
@@ -243,12 +254,15 @@ request** that the host updater picks up on its next poll. The routes (each also
   - A component is permitted when the newest coordinator tick (at most 90 s old, not stale) lists it in
     `permitted` and the commit is the plan target.
   - A pending force for that component and target also permits it, but only where staging holds the plan: a Start
-    whose turn has not come, the hold timer, or a stage halt. That tick must also have the release confirmed and the
-    target on main.
+    whose turn has not come, the hold timer, or a halt of the component's OWN stage. A halt in an earlier stage still
+    blocks a later stage's force. That tick must also have the release confirmed and the target on main.
   - A force never overrides "release not confirmed", "target no longer on main", an earlier-release or
     unknown-ancestry hold, or a coordinator error.
   - A replan onto another commit voids a pending force.
   - The host sequence is: list requests, ask permit (`forced: true`), `DELETE` the request, redeploy.
 - **Turning the flag off** is the kill switch: pending forces are ignored by the gate and the request list is
   empty. The plan's own permission is unaffected.
+- **While the fleet file is unusable** (deleted or unparseable after having been valid), the flag reads as off
+  (fail closed) unless the last good file set `control_plane.config_failure_mode: last_good`. With `last_good`, a
+  flag that was `true` keeps forces live: new force/ack requests are accepted and pending forces still permit.
 

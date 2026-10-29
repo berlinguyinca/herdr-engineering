@@ -37,7 +37,7 @@ def _sha(t):
 
 
 class World:
-    def __init__(self, tmp_path, *, actions=True, sink=None, defs=True):
+    def __init__(self, tmp_path, *, actions=True, sink=None, defs=True, keyed=True):
         self.tmp = tmp_path
         self.defs = str(_write(tmp_path / "pipelines", DOCS)) if defs else None
         self.path = tmp_path / "fleet.yaml"
@@ -46,7 +46,8 @@ class World:
         self.ci.add(10, C1)
         self.repo = ControlPlaneRepo(sink=sink)
         self.svr = ControlPlaneServer(
-            self.repo, api_keys={"opkey": "operator", "viewkey": "viewer", "agentkey": "agent"},
+            self.repo, api_keys=({"opkey": "operator", "viewkey": "viewer", "agentkey": "agent"}
+                                 if keyed else None),
             fleet_config=FleetConfigStore(self.path))
         self.svr.ci_monitor.snapshot = lambda start=True: self.ci()
         self.svr._deployments_stop.set()              # tick by hand
@@ -96,8 +97,8 @@ class World:
         return self.call("DELETE", f"/api/deployments/requests/{rid}",
                          headers={"Authorization": "Bearer " + token})
 
-    def permit(self, component, commit=C1, token=HIVE_TOKEN):
-        return self.call("GET", f"/api/deployments/permit?component={component}&commit={commit}",
+    def permit(self, component, commit=C1, token=HIVE_TOKEN, extra=""):
+        return self.call("GET", f"/api/deployments/permit?component={component}&commit={commit}{extra}",
                          headers={"Authorization": "Bearer " + token})
 
     def event(self, component, outcome, *, token=HIVE_TOKEN, to=C1, instance=None, ts=None):
@@ -116,6 +117,9 @@ class World:
     def audits(self):
         return [e for (t, _), stream in self.repo._events.items() if t == da.AUDIT_ENTITY
                 for e in stream]
+
+    def refused(self):
+        return self.svr.deployments_view()["actions"]["refused"]
 
     def plan(self):
         [plan] = self.svr.deployments_view()["plans"]
@@ -193,10 +197,9 @@ def test_force_needs_the_operator_role_and_auth_refusals_are_never_accepted(worl
     assert w.force({"component": "hive-gateway"}, headers={"X-API-Key": "agentkey"})[0] == 403
     assert w.ack({"component": "hive-nodes", "instance": "job-1"}, headers=VIEW)[0] == 403
     assert w.repo.deployment_requests.pending() == []
-    audits = w.audits()
-    assert len(audits) == 5 and _accepted(audits) == []
-    assert all(a["payload"]["target"] is None for a in audits)        # the body was never read
-    assert {a["payload"]["reason"] for a in audits} == {"unauthorized", "operator role required"}
+    assert w.audits() == []                         # refused before authentication: no row ...
+    assert w.refused() == {"force: unauthorized": 2, "force: operator role required": 2,
+                           "ack: operator role required": 1}      # ... only a counter
 
 
 def test_a_host_token_cannot_post_force(world):
@@ -207,23 +210,74 @@ def test_a_host_token_cannot_post_force(world):
     assert w.force({"component": "hive-gateway"}, headers={"X-Host-Token": HIVE_TOKEN})[0] == 401
     # Even beside an operator key, a host credential on the request is refused.
     assert w.force({"component": "hive-gateway"}, headers={**OP, **bearer})[0] == 403
-    assert w.repo.deployment_requests.pending() == [] and _accepted(w.audits()) == []
+    assert w.repo.deployment_requests.pending() == [] and w.audits() == []
+    assert w.refused() == {"force: unauthorized": 2, "force: a host token grants no operator action": 1}
+
+
+def test_a_thousand_unauthenticated_refusals_write_no_rows(world, caplog):
+    w = world
+    with caplog.at_level("WARNING", logger="herdr_engineering.control_plane.api"):
+        for _ in range(1000):
+            w.svr.deployment_refused("force", None, 401, "unauthorized", auth=True)
+        assert w.force({"component": "hive-gateway"}, headers={})[0] == 401
+    assert w.audits() == [] and w.repo._event_order == []
+    assert w.refused() == {"force: unauthorized": 1001}
+    assert len([r for r in caplog.records if "refused before authentication" in r.getMessage()]) == 1
+
+
+@pytest.mark.parametrize("headers", [
+    {},
+    {"Host": "evil.example", "Origin": "http://evil.example"},          # DNS rebinding
+    {"Origin": "null"},
+    {"Origin": "https://127.0.0.1"},
+])
+def test_open_mode_refuses_deployment_actions(tmp_path, headers):
+    w = World(tmp_path, keyed=False)
+    try:
+        w.svr.deployments_tick()
+        status, body = w.force({"component": "hive-gateway"}, headers=headers)
+        assert status == 403 and body["error"] == "deployment actions require API keys (keyed mode)"
+        assert w.ack({"component": "hive-nodes", "instance": "job-1"}, headers=headers)[0] == 403
+        assert w.repo.deployment_requests.pending() == [] and w.audits() == []
+        assert w.refused() == {"force: deployment actions require API keys (keyed mode)": 1,
+                               "ack: deployment actions require API keys (keyed mode)": 1}
+        # The host routes are unaffected by the mode.
+        assert w.permit("hive-gateway")[0] == 200
+    finally:
+        w.close()
 
 
 def test_force_refuses_cross_origin_and_non_json(world):
     w = world
     w.svr.deployments_tick()
-    assert w.force({"component": "hive-gateway"},
-                   headers={**OP, "Origin": "http://evil.example"})[0] == 403
+    here = f"127.0.0.1:{w.port}"
+    cases = [
+        ({"Origin": "http://evil.example"}, "cross-origin deployment action refused"),
+        ({"Origin": "null"}, "cross-origin deployment action refused"),
+        ({"Origin": ""}, "cross-origin deployment action refused"),           # present but empty
+        ({"Origin": f"ftp://{here}"}, "cross-origin deployment action refused"),
+        ({"Host": f"evil.example:{w.port}", "Origin": f"http://evil.example:{w.port}"},
+         "deployment actions need a dashboard host"),                               # rebinding
+        ({"Sec-Fetch-Site": "cross-site"}, "cross-site deployment action refused"),
+        ({"Sec-Fetch-Site": "same-site", "Origin": f"http://{here}"}, "cross-site deployment action refused"),
+    ]
+    for extra, _ in cases:
+        assert w.force({"component": "hive-gateway"}, headers={**OP, **extra})[0] == 403, extra
     status, _ = w.call("POST", "/api/deployments/force", raw=b"component=hive-gateway",
                        headers={**OP, "Content-Type": "application/x-www-form-urlencoded"})
     assert status == 415
     assert w.repo.deployment_requests.pending() == []
     audits = w.audits()
-    assert len(_refused(audits)) == 2 and _accepted(audits) == []
+    assert _accepted(audits) == []
+    assert [a["payload"]["reason"] for a in audits] == [r for _, r in cases] + [
+        "deployment actions require application/json"]
+    assert all(a["payload"]["actor"] == OP_DIGEST and a["payload"]["outcome"] == "refused"
+               for a in audits)
+    # Refusal rows stay out of the shared feed.
+    assert not any(t == da.AUDIT_ENTITY for t, _, _ in w.repo._event_order)
     # A same-origin browser request is fine.
     status, _ = w.force({"component": "hive-gateway"},
-                        headers={**OP, "Origin": f"http://127.0.0.1:{w.port}"})
+                        headers={**OP, "Origin": f"http://{here}", "Sec-Fetch-Site": "same-origin"})
     assert status == 200
 
 
@@ -321,7 +375,7 @@ def test_an_accepted_force_is_audited_with_actor_target_and_time(world):
     assert len(_accepted(w.audits())) == 2 and w.audits()[-1]["payload"]["existing"] is True
     # The operator's page lists it.
     view = w.svr.deployments_view()
-    assert view["actions"] == {"enabled": True}
+    assert view["actions"] == {"enabled": True, "keyed": True, "refused": {}}
     assert [r["id"] for r in view["requests"]] == [rid]
 
 
@@ -524,6 +578,68 @@ def test_a_force_overrides_a_stage_halt(world):
         body = w.permit(c)[1]
         assert body["permitted"] is True and body["forced"] is True and body["request_id"] == rid
     assert w.permit("whiteale-gateway", token=WHITEALE_TOKEN)[1]["permitted"] is False
+    # A halt in an EARLIER stage blocks a later stage's force.
+    w.force({"component": "whiteale-gateway"})
+    body = w.permit("whiteale-gateway", token=WHITEALE_TOKEN)[1]
+    assert body["permitted"] is False and body["forced"] is False
+    assert body["reason"].startswith("a forced redeploy cannot override: Halt")
+
+
+def test_permit_checks_the_generation_when_given(world):
+    w = world
+    w.confirm()
+    w.svr.deployments_tick()
+    assert w.permit("hive-gateway", extra="&generation=1")[1]["permitted"] is True
+    body = w.permit("hive-gateway", extra="&generation=0")[1]
+    assert body["permitted"] is False and body["reason"] == "generation changed"
+    assert w.permit("hive-gateway", extra="&generation=-1")[0] == 400
+    assert w.permit("hive-gateway", extra="&generation=x")[0] == 400
+    assert w.permit("hive-gateway", extra="&bogus=1")[0] == 400
+
+
+def test_one_pickup_spends_overlapping_forces(world):
+    w = world
+    w.stage1_holding()
+    w.svr.deployments_tick()
+    # A component force and a stage force cover hive-nodes at the same commit.
+    single = w.force({"component": "hive-nodes"})[1]["request"]["id"]
+    stage = w.force({"stage": 1})[1]["request"]["id"]
+    assert single != stage
+    status, body = w.clear(single)
+    assert status == 200 and body["cleared"] == ["hive-nodes"]
+    # The stage request's hive-nodes entry is spent too; its hive-gateway entry is not.
+    assert [r["component"] for r in w.requests()[1]["requests"]] == ["hive-gateway"]
+    assert w.repo.deployment_requests.active("hive-nodes", C1) is None
+
+
+def test_a_pickup_that_cannot_be_persisted_answers_503_and_stays_pending(tmp_path):
+    class Flaky:
+        fail = False
+        events = []
+
+        def record(self, ev):
+            self.events.append(ev)
+
+        def record_required(self, ev):
+            if self.fail:
+                raise OSError("disk full")
+            self.events.append(ev)
+
+    sink = Flaky()
+    w = World(tmp_path, sink=sink)
+    try:
+        w.stage1_holding()
+        rid = w.force({"component": "whiteale-gateway"})[1]["request"]["id"]
+        sink.fail = True
+        status, body = w.clear(rid, WHITEALE_TOKEN)
+        assert status == 503 and "do not redeploy" in body["error"]
+        assert w.permit("whiteale-gateway", token=WHITEALE_TOKEN)[1]["forced"] is True
+        assert len(w.requests(WHITEALE_TOKEN, "?host=whiteale")[1]["requests"]) == 1
+        sink.fail = False
+        assert w.clear(rid, WHITEALE_TOKEN)[0] == 200
+        assert w.permit("whiteale-gateway", token=WHITEALE_TOKEN)[1]["forced"] is False
+    finally:
+        w.close()
 
 
 def test_a_force_never_overrides_release_not_confirmed(world):
@@ -577,7 +693,7 @@ def test_turning_the_flag_off_disables_pending_forces(world):
     w.write_config(False)
     assert w.permit("whiteale-gateway", token=WHITEALE_TOKEN)[1]["permitted"] is False
     assert w.requests(WHITEALE_TOKEN, "?host=whiteale")[1]["requests"] == []
-    assert w.svr.deployments_view()["actions"] == {"enabled": False}
+    assert w.svr.deployments_view()["actions"]["enabled"] is False
     # The plan's own permission does not depend on the flag.
     assert w.permit("hive-gateway")[1]["permitted"] is True
 
@@ -623,6 +739,8 @@ def test_an_ack_lifts_a_halt_from_a_stale_failed_instance(world):
     assert row["payload"]["actor"] == OP_DIGEST and row["payload"]["outcome"] == "accepted"
     assert row["payload"]["target"] == {"component": "hive-nodes", "instance": "job-1",
                                         "release": C1}
+    assert row["payload"]["acknowledged"] == [
+        {"release": C1, "outcome": "failed", "host_ts": "2026-10-28T12:00:01Z"}]
 
 
 def test_an_ack_does_not_hide_a_newer_failure_of_the_same_instance(world):
@@ -733,7 +851,8 @@ def test_state_ack_replays_in_sequence_order():
 @pytest.mark.parametrize("current,ok", [
     ({"type": "Start", "stage": 2, "order": 0}, True),
     ({"type": "Hold", "stage": 1, "remaining_s": 30, "reason": "holding stage 1"}, True),
-    ({"type": "Halt", "stage": 1, "reason": "stage 1 halted: x: failed"}, True),
+    ({"type": "Halt", "stage": 2, "reason": "stage 2 halted: x: failed"}, True),
+    ({"type": "Halt", "stage": 1, "reason": "stage 1 halted: x: failed"}, False),   # an earlier stage
     ({"type": "Hold", "stage": None, "remaining_s": None, "reason": "target ancestry not confirmed"}, False),
     ({"type": "Hold", "stage": 1, "remaining_s": None, "reason": "release not confirmed"}, False),
     ({"type": "Halt", "stage": None, "reason": "target no longer on main"}, False),
@@ -745,5 +864,6 @@ def test_a_force_overrides_staging_only_even_with_confirmed_evidence(current, ok
     view = {"target_commit": C1, "generation": 3, "permitted": [], "current": current,
             "release_confirmed": True, "target_on_main": True}
     meta = {"ticked_at": now, "stale": False, "error": None}
-    out = da.permit_decision(meta, view, "whiteale-gateway", C1, "force-" + "e" * 16, now=now)
+    out = da.permit_decision(meta, view, "whiteale-gateway", C1, "force-" + "e" * 16, now=now,
+                             component_stage=2)
     assert out["permitted"] is ok and out["forced"] is ok and out["generation"] == 3

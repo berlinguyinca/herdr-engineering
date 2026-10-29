@@ -6,13 +6,24 @@ a request. The host updater reads it with its fleet host token, asks the permit 
 clears the request (that is the "once") and redeploys by itself.
 
 Operator side (``POST /api/deployments/force`` and ``/ack``, also under ``/api/v1``):
-the operator role (X-API-Key), the hot ``control_plane.deployment_actions: true`` flag
-(fail closed), a same-origin check, application/json and a small body cap. EVERY request
-writes an audit row (``AUDIT_ENTITY``): accepted ones durably BEFORE the request is stored
-(no audit, no request: 503); refused ones as ``refused``, best effort, including auth
-refusals (actor = whatever authenticated, ``target`` null because the body was never
-read; throttled so an unauthenticated flood cannot grow the log without bound). Audit
-values come from validated fields only.
+KEYED MODE ONLY (an open tailnet server has no credential a DNS-rebound page lacks, so it
+refuses them), the operator role (X-API-Key), a Host an attacker cannot rebind
+(``_dashboard_host_ok``), no cross-site ``Sec-Fetch-Site``, a same-origin ``Origin``,
+application/json, a small body cap and the hot ``control_plane.deployment_actions: true``
+flag (fail closed). Auditing:
+
+* accepted actions: a durable row (``AUDIT_ENTITY``) BEFORE the request is stored or the
+  ack applied (no audit, no action: 503);
+* refusals of an AUTHENTICATED operator (browser guards, bad body, unknown target, flag
+  off): a best-effort row kept out of the shared feed, at most ``REFUSED_ROWS_PER_MIN``
+  a minute (the rest are counted);
+* refusals before authentication (open mode, no or a bad key, a non-operator role, a host
+  token on an operator route): NO row. They are an in-memory counter per reason
+  (``RefusalCounter``, shown in the Deployments view under ``actions.refused``) and a log
+  line at most once a minute per reason, so an unauthenticated flood writes nothing.
+
+Rows go to one stream per action per UTC day (``force:2026-10-29``), which bounds the
+per-stream sequence scan ``record_event`` does. Audit values come from validated fields only.
 
 Host side (fleet host token, ``Authorization: Bearer`` or ``X-Host-Token``; it grants
 these routes and nothing else):
@@ -21,7 +32,7 @@ these routes and nothing else):
   components DEFINED for that host. A stage force is expanded at POST time into one entry
   per component, so each host clears only its own.
 * ``DELETE /api/deployments/requests/<id>`` clears that host's entries of the request.
-* ``GET /api/deployments/permit?component=&commit=`` answers ``{permitted, reason,
+* ``GET /api/deployments/permit?component=&commit=[&generation=]`` answers ``{permitted, reason,
   generation, target_commit, forced, request_id}`` from the newest coordinator tick, with
   no side effects. It is NOT behind the flag (a host gate that 404s would freeze every
   gated host); with the flag off, pending forces are ignored and the list is empty (the
@@ -29,11 +40,13 @@ these routes and nothing else):
 
 Permit rule (``permit_decision``): any doubt is ``permitted: false`` with a reason. No
 tick, a stale tick (flag, error, or older than ``PERMIT_STALE_S``), no plan or target for
-the component's track, or a commit other than the plan's target: false. A component in
+the component's track, a commit other than the plan's target, or a ``generation`` other
+than the plan's (when the host sends one): false. A component in
 the tick's ``permitted`` is permitted. Otherwise a pending force for that component whose
 captured target is the same commit (a replan onto another commit voids it) permits it,
 but only where the plan is held by STAGING - a Start whose turn has not come, a hold
-timer (``Hold`` with ``remaining_s``) or a stage halt (``Halt`` with a stage) - and only
+timer (``Hold`` with ``remaining_s``) or a halt of the component's OWN stage (a halt in an
+earlier stage still blocks a later stage's force) - and only
 when the same tick saw the release confirmed AND the target on main. A force never
 overrides "release not confirmed", "target no longer on main", an earlier-release or
 unknown-ancestry hold, or a coordinator error.
@@ -64,8 +77,8 @@ MAX_PENDING = 256
 REQUEST_TTL_S = 24 * 3600
 #: A permit answer needs a tick at most this old (the tick runs every 30 s).
 PERMIT_STALE_S = 90
-#: Auth-refusal audit rows per minute; the rest are counted into the next row.
-AUTH_AUDIT_PER_MIN = 60
+#: Durable rows for an authenticated operator's refusals per minute; the rest are counted.
+REFUSED_ROWS_PER_MIN = 60
 
 COMPONENT = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}")
 INSTANCE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
@@ -139,8 +152,9 @@ class ForceRequests:
     replayed by ``hydrate``. A request is {id, type, target, requested_at, actor,
     components: {component: {target_commit, generation, cleared_at, cleared_by}}}."""
 
-    def __init__(self, *, persist=None, now=None):
+    def __init__(self, *, persist=None, persist_required=None, now=None):
         self._persist = persist
+        self._persist_required = persist_required
         self._now = now or time.time
         self._lock = threading.Lock()
         self._requests: OrderedDict[str, dict] = OrderedDict()
@@ -231,26 +245,36 @@ class ForceRequests:
         return out
 
     def clear(self, rid, components, host) -> list:
-        """Clear ``rid``'s uncleared entries among ``components`` (the asking host's)."""
+        """Spend ``rid``'s uncleared entries among ``components`` (the asking host's), and
+        with them EVERY other uncleared entry forcing the same component to the same commit
+        (a component force and a stage force overlap: one pickup spends both, so a force is
+        granted once). The clear is one record, persisted DURABLY before it is applied:
+        ``persist_required`` raising leaves every entry pending and propagates (the route
+        answers 503, which the host reads as "do not redeploy"). Returns the components
+        cleared ([] when ``rid`` has none of the host's)."""
         allowed = set(components)
-        records, done = [], []
         with self._lock:
             now = self._now()
             self._purge(now)
             req = self._requests.get(rid)
             if req is None:
                 return []
-            for name, e in sorted(req["components"].items()):
-                if name in allowed and e["cleared_at"] is None:
-                    e["cleared_at"], e["cleared_by"] = float(now), host
-                    done.append(name)
-                    records.append(self._record(CLEARED_EVENT, {
-                        "kind": "cleared", "id": rid, "component": name, "host": host,
-                        "at": float(now)}))
+            spent = {name: e["target_commit"] for name, e in req["components"].items()
+                     if name in allowed and e["cleared_at"] is None}
+            if not spent:
+                return []
+            pairs = [[r["id"], name] for r in self._requests.values()
+                     for name, e in sorted(r["components"].items())
+                     if name in spent and e["cleared_at"] is None
+                     and same_commit(e["target_commit"], spent[name])]
+            record = self._record(CLEARED_EVENT, {"kind": "cleared", "id": rid, "entries": pairs,
+                                                  "host": host, "at": float(now)})
+            if self._persist_required is not None:
+                self._persist_required(copy.deepcopy(record))      # raises: nothing applied
+            for other, name in pairs:
+                self._requests[other]["components"][name].update(cleared_at=float(now), cleared_by=host)
             self._purge(now)
-        for record in records:
-            self._emit(record)
-        return done
+        return sorted(spent)
 
     # ------------------------------------------------------- persistence
     def _record(self, event_type, payload):
@@ -312,13 +336,20 @@ class ForceRequests:
                                for c, e in sorted(comps.items())}}
             return 1
         if p.get("kind") == "cleared":
-            req = self._requests.get(rid)
-            comp, host, at = p.get("component"), p.get("host"), p.get("at")
-            if (req is None or comp not in req["components"] or not isinstance(host, str)
-                    or isinstance(at, bool) or not isinstance(at, (int, float))):
+            entries, host, at = p.get("entries"), p.get("host"), p.get("at")
+            if (not isinstance(entries, list) or len(entries) > MAX_PENDING * 64
+                    or not isinstance(host, str) or isinstance(at, bool)
+                    or not isinstance(at, (int, float))):
                 return 0
-            req["components"][comp].update(cleared_at=float(at), cleared_by=host[:64])
-            return 1
+            applied = 0
+            for pair in entries:
+                if not (isinstance(pair, list) and len(pair) == 2 and all(isinstance(x, str) for x in pair)):
+                    continue
+                req = self._requests.get(pair[0])
+                if req is not None and pair[1] in req["components"]:
+                    req["components"][pair[1]].update(cleared_at=float(at), cleared_by=host[:64])
+                    applied = 1
+            return applied
         return 0
 
 
@@ -330,23 +361,27 @@ def _deny(reason, view=None, **extra):
             "forced": False, "request_id": None, **extra}
 
 
-def _overridable(current) -> bool:
-    """True when the plan is held by staging (a force may override it), not by a gate."""
+def _overridable(current, component_stage) -> bool:
+    """True when the plan is held by staging (a force may override it), not by a gate. A
+    Halt is overridable only for a component of the halted stage itself: a halt in an
+    earlier stage keeps blocking a later stage's force."""
     kind, stage = current.get("type"), current.get("stage")
     if kind == "Start":
         return True
     if kind == "Hold":
         return stage is not None and current.get("remaining_s") is not None
     if kind == "Halt":
-        return stage is not None
+        return stage is not None and stage == component_stage
     return False
 
 
-def permit_decision(meta, view, component, commit, force_id, *, now) -> dict:
+def permit_decision(meta, view, component, commit, force_id, *, now, component_stage=None,
+                    generation=None) -> dict:
     """The host gate's answer (see the module docstring). ``meta`` is the last tick
     ({ticked_at, stale, error}); ``view`` that tick's track view for the component (None
     when the track has no plan); ``force_id`` a pending force entry for this component and
-    commit (None when there is none or actions are off)."""
+    commit (None when there is none or actions are off); ``component_stage`` its definition's
+    stage; ``generation`` the plan generation the host last saw (None: not checked)."""
     ticked = meta.get("ticked_at")
     if ticked is None:
         return _deny("no coordinator tick yet")
@@ -359,36 +394,66 @@ def permit_decision(meta, view, component, commit, force_id, *, now) -> dict:
         return _deny("no target release", view)
     if not same_commit(commit, target):
         return _deny("commit is not the plan target", view)
+    if generation is not None and generation != view.get("generation"):
+        return _deny("generation changed", view)
     if component in (view.get("permitted") or ()):
         return {**_deny("permitted by the plan", view), "permitted": True}
     why = " ".join(str(x) for x in (current.get("type"), current.get("reason")) if x)
     if force_id is None:
         return _deny(f"not permitted: {why}", view)
     if not (view.get("release_confirmed") is True and view.get("target_on_main") is True
-            and _overridable(current)):
+            and _overridable(current, component_stage)):
         return _deny(f"a forced redeploy cannot override: {why}", view)
     return {**_deny("forced redeploy", view), "permitted": True, "forced": True,
             "request_id": force_id}
 
 
 class AuditThrottle:
-    """At most ``AUTH_AUDIT_PER_MIN`` auth-refusal rows a minute; ``take()`` -> (write, suppressed)."""
+    """At most ``limit`` rows a minute; ``take()`` -> True when this one may be written."""
 
-    def __init__(self, now=None):
+    def __init__(self, limit=None, now=None):
+        self._limit = REFUSED_ROWS_PER_MIN if limit is None else limit
         self._now = now or time.time
         self._lock = threading.Lock()
         self._window = 0.0
         self._count = 0
-        self._suppressed = 0
 
-    def take(self):
+    def take(self) -> bool:
         with self._lock:
             now = self._now()
             if now - self._window >= 60:
                 self._window, self._count = now, 0
-            if self._count >= AUTH_AUDIT_PER_MIN:
-                self._suppressed += 1
-                return False, 0
+            if self._count >= self._limit:
+                return False
             self._count += 1
-            suppressed, self._suppressed = self._suppressed, 0
-            return True, suppressed
+            return True
+
+
+class RefusalCounter:
+    """Unaudited refusals counted per (action, reason); reasons are this module's constants,
+    capped at ``MAX_REASONS`` keys. ``count`` returns True when a log line is due (at most
+    once a minute per key)."""
+
+    MAX_REASONS = 32
+
+    def __init__(self, now=None):
+        self._now = now or time.time
+        self._lock = threading.Lock()
+        self._counts: dict = {}
+        self._logged: dict = {}
+
+    def count(self, action, reason) -> bool:
+        key = f"{action}: {reason}"
+        with self._lock:
+            if key not in self._counts and len(self._counts) >= self.MAX_REASONS:
+                key = f"{action}: other"
+            self._counts[key] = self._counts.get(key, 0) + 1
+            now = self._now()
+            if now - self._logged.get(key, float("-inf")) >= 60:
+                self._logged[key] = now
+                return True
+            return False
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            return dict(self._counts)
