@@ -352,6 +352,14 @@ What the host must already have, because the screenshots are compared pixel for 
 
 The suite takes about ten minutes on a workstation and runs one test at a time; give the step that much and one CPU core per Chromium.
 
+### Load tolerance
+
+The real-page gates wait for elements with Playwright's 30 s default. `openReal` in `tests/playwright/ui-gates-lib.mjs` stretches that by
+the host's 1-minute load average per CPU (`loadScale`, clamped to 1x-3x), so a CI host shared with other jobs does not time out a room
+that is merely slow to open. On an idle host nothing changes. A pipeline that fails with a handful of 30-45 s `waitFor` timeouts and
+passes on a re-run of the same commit was load, not a regression; a failure that repeats on every run is not covered by this.
+A whole-suite retry was considered and rejected: it doubles the time of every failed run and can hide a real flaky test.
+
 ### Time budgets and stale bases
 
 A healthy CI run is about 11 minutes (`ui-gates`) and the check itself is about a minute. `scripts/ci/ui-gates.sh` therefore fails fast:

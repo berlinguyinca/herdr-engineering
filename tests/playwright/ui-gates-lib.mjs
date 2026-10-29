@@ -92,10 +92,21 @@ export function watch(page) {
   return w;
 }
 
+/** How much to stretch waits on a loaded host: the 1-minute load average per CPU, clamped to 1..3. Playwright's 30 s default is right on
+ *  an idle machine and too tight on a CI host shared with other jobs (2026-10-28: 6 of 268 tests timed out waiting for the room to open
+ *  while the host ran at 17 min instead of 11, and the same commit passed on a re-run). Only waits stretch, so a passing run costs
+ *  nothing; a real failure under load takes at most 3x longer to report. */
+export function loadScale(load = os.loadavg()[0], cpus = os.cpus().length) {
+  const scale = load / Math.max(1, cpus);
+  return Number.isFinite(scale) ? Math.min(3, Math.max(1, scale)) : 1;
+}
+export const BASE_WAIT_MS = 30000;
+
 /** Open the real assembled page signed in as `user`. */
 export async function openReal(browser, info, user = 'alice', ctxOpts = {}, beforeGoto = null) {
   const ctx = await browser.newContext({ viewport: { width: 1280, height: 800 }, ...ctxOpts });
   const page = await ctx.newPage();
+  page.setDefaultTimeout(Math.round(BASE_WAIT_MS * loadScale()));
   const w = watch(page);
   const pending = new Set();
   page.on('request', request => pending.add(request));
