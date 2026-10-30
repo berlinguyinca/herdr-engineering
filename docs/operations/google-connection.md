@@ -35,3 +35,30 @@ It warns when the downloaded client does not list the redirect URI the dashboard
 Rotating the secret: download the new JSON, run `set-client` again, then `connect` if `status` shows the account needs
 attention. Changing the host name: update `personal_assistant.apps.redirect_base`, redeploy, add the new redirect URI in
 the Console, and run `status`.
+
+## Watching the inbox
+
+`personal_assistant.inbox_watch` (fleet config, off by default) makes the server check each named user's inbox on a timer. New
+mail is remembered once (a dashboard notification keyed `inbox:<id>`) and handed to that user's assistant as ONE triage turn
+in a thread called "Inbox watch": it summarizes, ranks, and proposes replies (`send_email`, or `create_email_draft` when
+unsure) and calendar entries. Every send, draft and event is an approval card showing the exact content; the watcher itself
+never writes anything.
+
+```yaml
+control_plane:
+  personal_assistant:
+    inbox_watch:
+      enabled: true
+      interval_seconds: 300          # at least 60
+      lookback_minutes: 360          # only mail newer than this is considered (first run catches up on the last 6 h)
+      max_new_per_tick: 10           # Gmail search returns at most 10
+      query: "in:inbox -category:promotions -category:social -category:forums"
+      users:
+        - {tenant_id: default, user_id: open-listener}
+```
+
+For the assistant to read and propose it needs grants for `search_email`, `read_email`, `send_email`,
+`create_email_draft` and `create_calendar_event` (the write tools are never pre-authorized: each use needs an approval).
+Without grants the turn still produces a digest from the sender, subject and snippet. Email text is untrusted: it is quoted
+as JSON data in the prompt, and a message that asks the assistant to do something can at worst produce a card you reject.
+Status (counts and fixed reasons only) is on the server object as `inbox_watch.status()`.

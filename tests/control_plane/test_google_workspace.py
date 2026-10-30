@@ -109,7 +109,8 @@ def test_search_read_and_events_return_trimmed_untrusted_data(store):
     w, g = ws(store)
     out = w.run("default", "u1", "search_email", {"query": "from:alice", "max_results": 3})
     assert out["untrusted_content"] is True
-    assert out["result"] == [{"id": "m1", "from": "Alice <a@x.org>", "subject": "Lunch", "date": "Fri", "snippet": "snip"}]
+    assert out["result"] == [{"id": "m1", "thread_id": "", "message_id": "", "from": "Alice <a@x.org>", "subject": "Lunch",
+                              "date": "Fri", "snippet": "snip"}]
     mail = w.run("default", "u1", "read_email", {"message_id": "m1"})["result"]
     assert mail["body"] == "Hello from the body" and mail["subject"] == "Lunch" and mail["truncated"] is False
     [ev] = w.run("default", "u1", "list_calendar_events", {"time_min": "2026-10-31"})["result"]

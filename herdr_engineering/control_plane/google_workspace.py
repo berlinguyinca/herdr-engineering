@@ -302,9 +302,12 @@ class GoogleWorkspace:
             mid = ref.get("id") if isinstance(ref, dict) else None
             if not isinstance(mid, str) or not _ID.fullmatch(mid):
                 continue
-            msg = self._get(tenant, user, f"{GMAIL}/messages/{mid}", {"format": "metadata", "metadataHeaders": ["From", "Subject", "Date"]})
+            msg = self._get(tenant, user, f"{GMAIL}/messages/{mid}", {"format": "metadata", "metadataHeaders": ["From", "Subject", "Date", "Message-ID"]})
             h = self._headers(msg)
-            out.append({"id": mid, "from": h.get("from", ""), "subject": h.get("subject", ""), "date": h.get("date", ""),
+            tid, header_id = msg.get("threadId"), h.get("message-id", "")
+            out.append({"id": mid, "thread_id": tid if isinstance(tid, str) and THREAD_ID.fullmatch(tid) else "",
+                        "message_id": header_id if MESSAGE_ID_HEADER.match(header_id) else "",
+                        "from": h.get("from", ""), "subject": h.get("subject", ""), "date": h.get("date", ""),
                         "snippet": str(msg.get("snippet", ""))[:200]})
         return out
 

@@ -233,6 +233,8 @@ def assistant_config(cfg: dict[str, Any]) -> dict[str, Any]:
         },
         # Scheduled CI watch (ci_watch.py): a deterministic server-side loop, off unless enabled; YAML only.
         "ci_watch": ci_watch_config(section.get("ci_watch")),
+        # Scheduled inbox watch (inbox_watch.py): new mail goes to the assistant as one triage turn; off unless enabled.
+        "inbox_watch": inbox_watch_config(section.get("inbox_watch")),
         # Per-person app connections (Gmail, Calendar) made from the dashboard: key file + public redirect base.
         "apps": apps_config(section.get("apps")),
     }
@@ -293,6 +295,42 @@ def ci_watch_config(raw: Any) -> dict[str, Any]:
         "source": source,
         "max_age_seconds": max(60, int(raw.get("max_age_seconds", 6 * 3600))),
         "tick_budget_seconds": max(5, int(raw.get("tick_budget_seconds", 60))),
+        "users": users,
+    }
+
+
+def inbox_watch_config(raw: Any) -> dict[str, Any]:
+    """``personal_assistant.inbox_watch``. Off by default. A malformed section stops startup rather than guessing."""
+    raw = raw if isinstance(raw, dict) else {}
+    where = "control_plane.personal_assistant.inbox_watch"
+    unknown = set(raw) - {"enabled", "interval_seconds", "users", "query", "lookback_minutes", "tick_budget_seconds",
+                          "max_new_per_tick"}
+    if unknown:
+        raise ValueError(f"{where} has unknown keys: {sorted(unknown)}")
+    query = raw.get("query", "in:inbox -category:promotions -category:social -category:forums")
+    if not isinstance(query, str) or not query.strip() or len(query) > 200 or "after:" in query or "\n" in query:
+        raise ValueError(f"{where}.query must be a Gmail search of up to 200 characters without 'after:' (the loop adds it)")
+    users: list[dict[str, str]] = []
+    for i, row in enumerate(raw.get("users") or []):
+        if not isinstance(row, dict) or set(row) - {"tenant_id", "user_id", "assistant_id"}:
+            raise ValueError(f"{where}.users[{i}] must be a mapping with tenant_id, user_id and optional assistant_id")
+        uid = row.get("user_id")
+        if not isinstance(uid, str) or not uid.strip() or len(uid) > 200:
+            raise ValueError(f"{where}.users[{i}].user_id must be a non-empty string")
+        aid = row.get("assistant_id") or ""
+        if not isinstance(aid, str) or len(aid) > 100:
+            raise ValueError(f"{where}.users[{i}].assistant_id must be a string")
+        users.append({"tenant_id": _tenant_id(row.get("tenant_id", "default"), f"{where}.users[{i}].tenant_id"),
+                      "user_id": uid.strip(), "assistant_id": aid})
+    if len(users) > 20:
+        raise ValueError(f"{where}.users lists at most 20 users")
+    return {
+        "enabled": raw.get("enabled", False) is True,
+        "interval_seconds": max(60, int(raw.get("interval_seconds", 300))),
+        "max_new_per_tick": min(10, max(1, int(raw.get("max_new_per_tick", 10)))),       # Gmail search returns at most 10
+        "lookback_minutes": min(2880, max(30, int(raw.get("lookback_minutes", 360)))),
+        "tick_budget_seconds": max(5, int(raw.get("tick_budget_seconds", 120))),
+        "query": query.strip(),
         "users": users,
     }
 
