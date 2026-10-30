@@ -1774,6 +1774,16 @@ def _make_handler(server, public=False, operator=False):
                     return role
             return None
 
+        def _lineage_handoffs(self):
+            """Pi's handoffs from the lineage graph, only those this caller's principal may read. (rows, status)."""
+            from .handoff_lineage import rows_from_nodes
+            try:
+                out = read_graph(server.repo.graph, self._principal(), ["nodes"],
+                                 lambda name: {"node_type": "handoff", "limit": "1000"}.get(name))
+                return rows_from_nodes(out.get("nodes")), ("truncated" if out.get("truncated") else "ok")
+            except Exception:                      # a graph that cannot answer must never take the registry view down with it
+                return [], "unavailable"
+
         def _principal(self):
             """Who the request authenticated as (server-side actor of ingest envelopes).
 
@@ -3066,20 +3076,34 @@ def _make_handler(server, public=False, operator=False):
                 if len(parts) == 5 and parts[4] == "tree":
                     return self._json(server.handoffs.tree(session_id=_q(self.path, "session_id")))
                 if len(parts) == 5 and parts[4] == "overview":
-                    return self._json(server.handoffs.overview())
+                    extra, status = self._lineage_handoffs()
+                    out = server.handoffs.overview(extra=extra)
+                    out["sources"] = {"registry": "ok", "lineage": status}
+                    return self._json(out)
                 if len(parts) == 6 and parts[5] == "chain":
+                    extra, _ = self._lineage_handoffs()
                     try:
-                        return self._json(server.handoffs.chain(parts[4]))
+                        return self._json(server.handoffs.chain(parts[4], extra=extra))
                     except KeyError:
                         return self._json({"error": "not found"}, 404)
                 if len(parts) == 5:
-                    row = server.handoffs.get(parts[4])
+                    hid = parts[4]
+                    if hid.startswith("handoff:"):
+                        from .handoff_lineage import row_from_node
+                        try:
+                            node = read_graph(server.repo.graph, self._principal(), ["nodes", hid], lambda name: None)["node"]
+                        except KeyError:
+                            return self._json({"error": "not found"}, 404)
+                        row = row_from_node(node)
+                        return self._json(row) if row else self._json({"error": "not found"}, 404)
+                    row = server.handoffs.get(hid)
                     return self._json(row) if row else self._json({"error": "not found"}, 404)
                 if any(_q(self.path, k) for k in ("cursor", "workspace", "attention", "limit")):
+                    extra, _ = self._lineage_handoffs()
                     return self._json(server.handoffs.page(
                         state=_q(self.path, "state"), workspace=_q(self.path, "workspace"),
                         attention=_q(self.path, "attention") == "1", cursor=_q(self.path, "cursor"),
-                        limit=_qint(self.path, "limit", 50)))
+                        limit=_qint(self.path, "limit", 50), extra=extra))
                 return self._json({"handoffs": server.handoffs.list(state=_q(self.path, "state"))})
             if resource == "scheduler":
                 if len(parts) == 4:

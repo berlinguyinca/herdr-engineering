@@ -175,6 +175,14 @@ class HandoffRegistry:
 
     # ---- read side for dashboards: bounded by construction, so hundreds of agents stay one screen -------------------
 
+    def _with(self, extra):
+        """Registry rows plus the lineage rows the caller may read; a registry row wins on an id clash."""
+        if not extra:
+            return self._rows
+        merged = {r["handoff_id"]: r for r in extra if r.get("handoff_id")}
+        merged.update(self._rows)
+        return merged
+
     def _workspace(self, row):
         """The group a handoff belongs to: its source session's repository, else working directory, else its mission."""
         sid = (row.get("source") or {}).get("session_id")
@@ -187,14 +195,25 @@ class HandoffRegistry:
         mission = self.repo.get_mission(row["mission_id"]) if row.get("mission_id") else None
         if mission and mission.get("title"):
             return str(mission["title"])
-        return UNASSIGNED
+        return str(row["mission_id"]) if row.get("origin") == "lineage" and row.get("mission_id") else UNASSIGNED
 
     def _stalled(self, row, now):
         updated = _when(row.get("updated_at"))
         return row["state"] in _PENDING and updated is not None and now - updated > STALL_AFTER
 
+    def _attention_reason(self, row, now):
+        if row["state"] in ATTENTION_STATES:
+            return row["state"]
+        if self._stalled(row, now):
+            return "stalled"
+        if row.get("origin") == "lineage" and row.get("cause") == "context_pressure" and row.get("model_change") == "not_pinned":
+            return "successor not pinned to the same model"
+        if row.get("origin") == "lineage" and row.get("model_change") == "switched":
+            return "model changed"
+        return None
+
     def _needs_attention(self, row, now):
-        return row["state"] in ATTENTION_STATES or self._stalled(row, now)
+        return self._attention_reason(row, now) is not None
 
     def _summary(self, row, workspace, now):
         source, target = row.get("source") or {}, row.get("target") or {}
@@ -204,14 +223,17 @@ class HandoffRegistry:
                 "goal": str(row.get("goal") or "")[:240], "mission_id": row.get("mission_id"),
                 "updated_at": row.get("updated_at"), "created_at": row.get("created_at"),
                 "completed": len(row.get("completed") or []), "remaining": len(row.get("remaining") or []),
-                "attention": self._needs_attention(row, now), "stalled": self._stalled(row, now)}
+                "attention": self._needs_attention(row, now), "stalled": self._stalled(row, now),
+                "attention_reason": self._attention_reason(row, now),
+                **({k: row.get(k) for k in ("origin", "cause", "from_model", "to_model", "model_change", "checkpoint")} if row.get("origin") == "lineage" else {"origin": "registry"})}
 
-    def overview(self):
+    def overview(self, extra=None):
         """Counts by workspace and the few handoffs that need a human; no rows beyond OVERVIEW_ATTENTION."""
         with self.repo._event_lock:
+            rows = self._with(extra)
             now = _when(self.now()) or datetime.now(timezone.utc)
             groups, attention, states = {}, [], {}
-            for row in self._rows.values():
+            for row in rows.values():
                 ws = self._workspace(row)
                 g = groups.setdefault(ws, {"workspace": ws, "total": 0, "states": {}, "attention": 0, "stalled": 0, "latest_at": ""})
                 g["total"] += 1
@@ -225,24 +247,25 @@ class HandoffRegistry:
                     attention.append((row.get("updated_at") or "", row["handoff_id"], ws, row))
             ordered = sorted(groups.values(), key=lambda g: (g["attention"], g["latest_at"]), reverse=True)
             attention.sort(key=lambda t: (t[0], t[1]), reverse=True)
-            return {"total": len(self._rows), "states": states,
+            return {"total": len(rows), "states": states,
                     "attention_total": sum(g["attention"] for g in groups.values()),
                     "workspaces": ordered[:OVERVIEW_WORKSPACES],
                     "workspaces_omitted": max(0, len(ordered) - OVERVIEW_WORKSPACES),
                     "attention": [self._summary(r, ws, now) for _, _, ws, r in attention[:OVERVIEW_ATTENTION]],
                     "untrusted_text": True}
 
-    def page(self, *, state=None, workspace=None, attention=False, cursor=None, limit=50):
+    def page(self, *, state=None, workspace=None, attention=False, cursor=None, limit=50, extra=None):
         """Newest first, keyed on (updated_at, handoff_id) so equal timestamps never skip or repeat a row."""
         limit = max(1, min(int(limit), PAGE_MAX))
         with self.repo._event_lock:
+            rows = self._with(extra)
             now = _when(self.now()) or datetime.now(timezone.utc)
             after = None
             if cursor:
                 stamp, _, hid = str(cursor).partition("|")
                 after = (stamp, hid)
             keyed = []
-            for row in self._rows.values():
+            for row in rows.values():
                 if state and row["state"] != state:
                     continue
                 if attention and not self._needs_attention(row, now):
@@ -265,27 +288,33 @@ class HandoffRegistry:
                     "next_cursor": f"{out[-1][0][0]}|{out[-1][0][1]}" if more and out else None,
                     "untrusted_text": True}
 
-    def chain(self, handoff_id):
+    def chain(self, handoff_id, extra=None):
         """The single path of handoffs through this one: backwards to the handoff that delivered the work to its source session,
         forwards to the one that took it on from its target session (the same session ids the Usage tab joins on). A session that
         received or gave many handoffs contributes only the nearest one in time, so the chain stays a path, not a blob."""
         with self.repo._event_lock:
-            row = self._rows.get(handoff_id)
+            rows = self._with(extra)
+            row = rows.get(handoff_id)
             if row is None:
                 raise KeyError(handoff_id)
             now = _when(self.now()) or datetime.now(timezone.utc)
             key = lambda r: (r.get("created_at") or "", r["handoff_id"])
             by_target, by_source = {}, {}
-            for r in self._rows.values():
+            for r in rows.values():
                 t, sr = (r.get("target") or {}).get("session_id"), (r.get("source") or {}).get("session_id")
                 if t:
                     by_target.setdefault(t, []).append(r)
                 if sr:
                     by_source.setdefault(sr, []).append(r)
 
+            def timed(r, current):
+                return bool(r.get("created_at")) and bool(current.get("created_at"))
+
             def step(current, index, side, later):
+                # Time picks the nearest hop when both have a time; a lineage handoff carries none, so the session join stands alone.
                 sid = (current.get(side) or {}).get("session_id")
-                pool = [r for r in index.get(sid, []) if (key(r) > key(current)) == later and r["handoff_id"] != current["handoff_id"]
+                pool = [r for r in index.get(sid, []) if r["handoff_id"] != current["handoff_id"]
+                        and (not timed(r, current) or (key(r) > key(current)) == later)
                         and (not current.get("mission_id") or r.get("mission_id") in (None, current["mission_id"]))] if sid else []
                 return (min if later else max)(pool, key=key) if pool else None
 
