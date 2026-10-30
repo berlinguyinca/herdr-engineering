@@ -31,6 +31,7 @@ from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from typing import Any
 
+from . import rakazo_bots as bots
 from . import rakazo_events as ev
 from . import rakazo_prefs as pf
 from . import rakazo_rooms as rooms
@@ -620,6 +621,10 @@ class RakazoBridge:
         }
         self.rooms = rooms.Rooms(self, BridgeError)
         self._procs.update(self.rooms.procs())
+        self.max_bots = MAX_BOTS
+        self.bots = bots.Bots(self, BridgeError)
+        for name, fn in self.bots.procs().items():
+            self._procs[name] = fn
         for name, group_fn in (("threads/head", self.rooms.head), ("threads/get", self.rooms.thread),
                                ("threads/messages", self.rooms.messages), ("threads/send", self.rooms.send),
                                ("threads/stop", lambda c, i, **kw: {"ok": True}),
@@ -864,8 +869,9 @@ class RakazoBridge:
         messages, runs, _ = self._gather(ctx, assistant, thread)
         visible = [m for m in messages if m.visibility == "visible"]
         active = any(ev.run_status(r.state) in ev.ACTIVE for r in runs)
-        return ev.bot_view(assistant, thread.thread_id, ev.snippet(visible[-1].content, 120) if visible else "",
+        view = ev.bot_view(assistant, thread.thread_id, ev.snippet(visible[-1].content, 120) if visible else "",
                            "running" if active else "idle", ctx.space)
+        return self.bots.apply(ctx, view)
 
     # procedures ------------------------------------------------------------------------------------------------
     def _ok(self, ctx, inp):
@@ -926,7 +932,8 @@ class RakazoBridge:
         return sorted(space.overrides)
 
     def _bots(self, ctx: _Ctx) -> list[dict[str, Any]]:
-        return ([self._bot(ctx, a) for a in self.svc.list_assistants(tenant_id=ctx.tenant, user_id=ctx.user)]
+        return ([self._bot(ctx, a) for a in self.svc.list_assistants(tenant_id=ctx.tenant, user_id=ctx.user)
+                 if a.enabled]
                 + self.rooms.agent_bots(ctx))
 
     def prefs_put(self, account: str, space: str, kind: str, key: str, value: Any) -> None:
@@ -1150,7 +1157,9 @@ class RakazoBridge:
         return {"ok": True}
 
     def _threads_mark_read(self, ctx, inp):
-        self._target(ctx, inp)
+        assistant = self._target(ctx, inp)
+        if self.bots.meta(ctx, assistant.assistant_id).get("unread"):
+            self.bots._put_meta(ctx, assistant.assistant_id, {"unread": False})
         return {"ok": True, "unreadAfterSeq": None}
 
     def _runs_list(self, ctx, inp):
