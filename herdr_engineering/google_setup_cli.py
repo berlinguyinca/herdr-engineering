@@ -150,7 +150,7 @@ def cmd_set_client(api: Api, json_file: str | None, client_id: str | None, secre
 
 
 def cmd_connect(api: Api, out=print) -> int:
-    status, data = api.call("POST", "/api/v1/assistant-apps/google/connect")
+    status, data = api.call("POST", "/api/v1/assistant-apps/google/connect", {})
     if status == 409:
         raise SetupError("no OAuth client is stored yet: run  herdr-eng google set-client")
     if status != 200 or not isinstance(data, dict) or not data.get("url"):

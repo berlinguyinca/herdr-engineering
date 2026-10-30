@@ -44,6 +44,8 @@ class Fake:
             self.client = True
             return Resp(200, {"ok": True})
         if (method, path) == ("POST", "/api/v1/assistant-apps/google/connect"):
+            if body is None:           # the live server answers 415 to a POST without a JSON body
+                raise urllib.error.HTTPError(req.full_url, 415, "x", {}, io.BytesIO(b""))
             if not self.client:
                 raise urllib.error.HTTPError(req.full_url, 409, "x", {}, io.BytesIO(b'{"error":"no_client"}'))
             return Resp(200, {"url": "https://accounts.google.com/o/oauth2/v2/auth?state=s"})
