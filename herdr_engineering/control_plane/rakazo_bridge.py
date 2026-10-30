@@ -645,7 +645,7 @@ class RakazoBridge:
         for name, group_fn in (("threads/head", self.rooms.head), ("threads/get", self.rooms.thread),
                                ("threads/messages", self.rooms.messages), ("threads/send", self.rooms.send),
                                ("threads/stop", lambda c, i, **kw: {"ok": True}),
-                               ("threads/markRead", self.rooms.mark_read)):
+                               ("threads/markRead", self.rooms.mark_read), ("threads/answer", self.rooms.answer)):
             self._procs[name] = self._grouped(self._procs[name], group_fn)
         # a dummy for requests whose email matches no account, so a wrong email costs the same KDF as a wrong password
         self._dummy = self.accounts[0].params

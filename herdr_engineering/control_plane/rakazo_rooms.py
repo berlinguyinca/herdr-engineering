@@ -29,6 +29,7 @@ MAX_ROOMS = 100
 SPACE_KIND, ARCHIVED_KIND, PINNED_KIND, NAME_KIND, READ_KIND, REMOVED_KIND = (
     "group_space", "group_archived", "group_pinned", "group_name", "group_read", "group_removed")
 PROJECT_KIND = "rooms_project"
+PROPOSAL_PREFIX = "proposal:"
 
 
 def person_bot_id(user_id: str) -> str:
@@ -304,9 +305,46 @@ class Rooms:
         msgs = [m for m in (self.message(e, pr.id, tid) for e in events["events"]) if m]
         page = msgs[-MAX_PAGE:]
         older = page[0]["seq"] if page and len(msgs) > len(page) else None
+        page += self.proposal_cards(pr, rid, tid, max(events["next_cursor"], 0))
         return {"threadId": tid, "cursor": events["next_cursor"], "messages": page, "olderCursor": older,
                 "groupId": rid, "groupName": self._pref(ctx, NAME_KIND, rid, room["name"]),
                 "members": self.members(ctx, pr, rid), "run": None, "activeRuns": []}
+
+    # delegate proposals as approval cards ---------------------------------------------------------------------
+    def proposal_cards(self, pr, room_id: str, tid: str, seq: int) -> list[dict[str, Any]]:
+        """Quarantined proposals from delegate agents, as ask cards the room owner can allow or deny. The proposal text is
+        untrusted data: shown as a short snippet, never executed. A person who cannot review proposals sees no cards."""
+        try:
+            listed = self.collab.list_proposals(pr, room_id)["proposals"]
+        except CollabError:
+            return []
+        cards = []
+        for p in listed:
+            if p.get("state") != "quarantined":
+                continue
+            block = {"kind": "ask", "text": f"Accept the proposal \"{ev.snippet(str(p.get('title') or ''), 80)}\"?",
+                     "approvalEffectId": p["proposal_id"], "actions": [{"id": "allow", "label": "Accept"},
+                                                                       {"id": "deny", "label": "Reject"}],
+                     "status": "pending", "detail": "Untrusted text from another agent. Accepting records it; it is not run."}
+            cards.append({"id": PROPOSAL_PREFIX + p["proposal_id"], "threadId": tid, "seq": seq, "role": "bot",
+                          "blocks": [block], "botId": p.get("agent_id") or "", "runId": p.get("task_id"),
+                          "createdAt": p.get("created_at") or ""})
+        return cards
+
+    def answer(self, ctx, inp):
+        pr = self.principal(ctx)
+        room = self.room(ctx, pr, inp.get("groupId"))
+        message_id, answer = inp.get("messageId"), inp.get("answer")
+        if not (isinstance(message_id, str) and message_id.startswith(PROPOSAL_PREFIX)) or inp.get("dismiss") or inp.get("fields"):
+            raise self.Error(400, "BAD_REQUEST", "Only proposal answers are supported in groups.")
+        decision = {"allow": "accept", "deny": "reject"}.get(answer)
+        if decision is None:
+            raise self.Error(400, "BAD_REQUEST", "Answer allow or deny.")
+        proposal_id = message_id[len(PROPOSAL_PREFIX):]
+        shown = self.call(self.collab.get_proposal, pr, room["room_id"], proposal_id)
+        self.call(self.collab.decide_proposal, pr, room["room_id"], proposal_id,
+                  {"decision": decision, "expected_digest": shown["digest"], "idempotency_key": "rk-" + secrets.token_hex(8)})
+        return {"ok": True}
 
     def messages(self, ctx, inp):
         pr = self.principal(ctx)

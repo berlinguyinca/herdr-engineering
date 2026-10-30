@@ -245,3 +245,35 @@ def test_the_collab_user_link_is_validated_in_the_configuration():
         with pytest.raises(ValueError, match="collab_user"):
             rakazo_bridge_config(bridge_section(accounts=[{**ACCOUNTS[0], "collab_user": bad}]))
     assert SPACE == "x-rakazo-space-id"
+
+
+def test_delegate_proposals_are_cards_that_the_owner_can_accept_or_reject(world, monkeypatch):
+    seen = []
+    proposal = {"proposal_id": "prop1", "state": "quarantined", "title": "Rename the module", "agent_id": "ag1",
+                "task_id": "t1", "created_at": "2026-10-30T10:00:00+00:00"}
+    monkeypatch.setattr(world.s, "list_proposals", lambda pr, room: {"proposals": [proposal], "enabled": True})
+    monkeypatch.setattr(world.s, "get_proposal", lambda pr, room, pid: {"digest": "dg1"})
+    monkeypatch.setattr(world.s, "decide_proposal", lambda pr, room, pid, body: seen.append((pid, body)) or {"state": "x"})
+    snap = ok(world.api, "threads/get", {"groupId": world.room}, world.alice_t)
+    validate("threads/get", snap)
+    [card] = [m for m in snap["messages"] if m["id"] == "proposal:prop1"]
+    assert card["blocks"][0]["status"] == "pending" and "not run" in card["blocks"][0]["detail"]
+    ok_ = ok(world.api, "threads/answer", {"groupId": world.room, "messageId": "proposal:prop1", "answer": "allow"},
+             world.alice_t)
+    validate("threads/answer", ok_)
+    ok(world.api, "threads/answer", {"groupId": world.room, "messageId": "proposal:prop1", "answer": "deny"}, world.alice_t)
+    assert [(p, b["decision"], b["expected_digest"]) for p, b in seen] == [("prop1", "accept", "dg1"),
+                                                                           ("prop1", "reject", "dg1")]
+    status, _, _ = world.api.rpc("threads/answer", {"groupId": world.room, "messageId": "approval:x", "answer": "allow"},
+                                 world.alice_t)
+    assert status == 400
+
+
+def test_a_reviewer_without_rights_sees_no_proposal_cards(world, monkeypatch):
+    from herdr_engineering.control_plane.collab import CollabError
+
+    def refuse(pr, room):
+        raise CollabError(403, "no")
+    monkeypatch.setattr(world.s, "list_proposals", refuse)
+    snap = ok(world.api, "threads/get", {"groupId": world.room}, world.bob_t)
+    assert all(not m["id"].startswith("proposal:") for m in snap["messages"])
