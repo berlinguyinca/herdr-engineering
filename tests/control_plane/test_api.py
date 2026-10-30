@@ -188,6 +188,17 @@ def test_pull_request_trail_endpoint_links_the_agent_and_rejects_bad_or_unknown_
     assert c.get("/api/v1/pull-requests/org/app/0/trail")[0] == 400
 
 
+def test_pull_request_trail_is_cached_briefly_and_validates_the_host(server):
+    c, repo = server
+    repo.upsert_session("sx", host_id="h", agent_role="pi", repository_id="github.com/org/app", branch="feat/x", status="active")
+    repo.upsert_pull_request("pr-1", repository="github.com/org/app", number=7, status="open", branch="feat/x")
+    first = json.loads(c.get("/api/v1/pull-requests/org/app/7/trail")[2])
+    repo.upsert_pull_request("pr-1", repository="github.com/org/app", number=7, status="merged", branch="feat/x")
+    assert json.loads(c.get("/api/v1/pull-requests/org/app/7/trail")[2])["pull_request"]["status"] == first["pull_request"]["status"] == "open"
+    assert c.get("/api/v1/pull-requests/org/app/7/trail?host=github.com")[0] == 200
+    assert c.get("/api/v1/pull-requests/org/app/7/trail?host=bad%20host!")[0] == 400
+
+
 def test_session_with_colon_id_fetches_percent_encoded(server):
     """Entity ids like ``w9:p5`` are percent-encoded by the web client
     (encodeURIComponent -> ``w9%3Ap5``); the server must URL-decode them so

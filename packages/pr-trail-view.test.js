@@ -53,9 +53,9 @@ test('an odd body does not throw', () => {
 });
 
 test('pull request links point at the trail page', () => {
-  assert.equal(prTrailHref('github.com/org/app', 7), '#/pr/org/app/7');
+  assert.equal(prTrailHref('github.com/org/app', 7), '#/pr/org/app/7?host=github.com');
   assert.equal(prTrailHref('org/app', 7), '#/pr/org/app/7');
-  assert.equal(prTrailHref('https://github.com/org/app.git', 7), '#/pr/org/app/7');
+  assert.equal(prTrailHref('https://github.com/org/app.git', 7), '#/pr/org/app/7?host=github.com');
   assert.equal(prTrailHref('app', 7), null);
   assert.equal(prTrailHref('org/app', 0), null);
   assert.equal(entityHref('pr', 'org/app#12'), '#/pr/org/app/12');
@@ -64,7 +64,22 @@ test('pull request links point at the trail page', () => {
 
 test('the agent story links a pull request line to its trail', () => {
   const steps = commitSteps({ state: 'linked', repository_id: 'github.com/org/app', commits: [{ sha: 'a'.repeat(40), pull_request: 7, run_number: 1, state: 'success' }], pull_requests: [{ number: 7 }, { number: 9, status: 'open' }] });
-  assert.deepEqual(steps.map((s) => s.trail), ['#/pr/org/app/7', '#/pr/org/app/9']);
+  assert.deepEqual(steps.map((s) => s.trail), ['#/pr/org/app/7?host=github.com', '#/pr/org/app/9?host=github.com']);
   const html = renderStory(agentStory({ session_id: 's' }, {}, Date.now(), { state: 'linked', repository_id: 'org/app', commits: [], pull_requests: [{ number: 9 }] }));
   assert.match(html, /<a href="#\/pr\/org\/app\/9" data-pr-trail>how it got here<\/a>/);
+});
+
+test('a sub-cent cost is never shown as $0.00, and inferred agents are labelled as hints', () => {
+  const cost = (value) => signalCards({ cost_usd_estimate: { value, reason: '' } }).find((c) => c.key === 'cost_usd_estimate').value;
+  assert.equal(cost(0.004), '<$0.01');
+  assert.equal(cost(0), '$0.00');
+  assert.equal(cost(1.5), '$1.50');
+  const html = renderTrail({ ...trail, inferred_sessions: [{ session_id: 'm1', name: 'Mission mate', rule: 'mission', inferred: true }] });
+  assert.match(html, /<h2>Possibly involved<\/h2>/);
+  assert.match(html, /data-inferred="true"/);
+  assert.match(html, /not counted in any figure/);
+});
+
+test('link targets in the timeline are at least 44px tall', () => {
+  assert.match(renderTrail(trail), /\.pt-line a\{[^}]*min-height:44px/);
 });

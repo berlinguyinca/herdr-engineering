@@ -63,5 +63,6 @@ export function forgePrUrl(repository, number) {
 export function prTrailHref(repository, number) {
   if (typeof repository !== 'string' || !Number.isInteger(number) || number < 1) return null;
   const m = /^(?:[\w.-]+\.[\w.-]+\/)?([\w.-]{1,100})\/([\w.-]{1,100}?)(?:\.git)?$/.exec(repository.trim().replace(/^https?:\/\//, ''));
-  return m ? `#/pr/${m[1]}/${m[2]}/${number}` : null;
+  const host = /^(?:https?:\/\/)?([\w-]+(?:\.[\w-]+)+)\//.exec(repository.trim());
+  return m ? `#/pr/${m[1]}/${m[2]}/${number}${host ? `?host=${encodeURIComponent(host[1].toLowerCase())}` : ''}` : null;
 }

@@ -71,7 +71,7 @@ test('an unknown pull request says so and offers a retry, not an empty page', as
   await withApp(async ({ page, base }) => {
     await page.goto(`${base}/#/pr/org/app/9999`);
     await page.locator('[data-pt-error]:not([hidden])').waitFor({ timeout: 10000 });
-    assert.match(await page.locator('[data-pt-error]').innerText(), /No pull request with this number|not found/i);
+    assert.match(await page.locator('[data-pt-error]').innerText(), /No pull request with this number is recorded/);
     assert.equal(await page.locator('[data-pt-retry]:not([hidden])').count(), 1);
   });
 });
@@ -89,11 +89,13 @@ test('the agent page links its pull request to the trail', async () => {
   });
 });
 
-test('at phone width nothing overflows', async () => {
+test('at phone width nothing overflows and every trail link is 44px tall', async () => {
   await withApp(async ({ page, base }) => {
     await page.goto(`${base}/#/pr/org/app/214`);
     await page.locator('[data-pt-head]').waitFor({ timeout: 10000 });
     const over = await page.evaluate(() => document.documentElement.scrollWidth - innerWidth);
     assert.ok(over <= 0, `horizontal overflow ${over}px`);
+    const small = await page.locator('.pt-line a').evaluateAll((els) => els.map((e) => e.getBoundingClientRect().height).filter((h) => h < 43.5));
+    assert.deepEqual(small, [], 'every link in the trail is at least 44px tall');
   }, { width: 390, height: 844 });
 });

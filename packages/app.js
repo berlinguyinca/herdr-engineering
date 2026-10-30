@@ -419,7 +419,7 @@ async function viewDeployments() {
 async function viewPrTrail(parts) {
   const [, owner, repo, number] = parts.map((p) => safeDecode(p) || '');
   root.innerHTML = `<p style="font-size:13px"><a href="#/github">← Projects</a></p>${liveHead('<h1>How this pull request got here</h1>')}<div id="pr-trail"></div>`;
-  return mountPrTrail(root.querySelector('#pr-trail'), client, { owner, repo, number, freshness: chipIn(root) });
+  return mountPrTrail(root.querySelector('#pr-trail'), client, { owner, repo, number, host: route().query.get('host') || '', freshness: chipIn(root) });
 }
 
 async function viewHandoffs() {
