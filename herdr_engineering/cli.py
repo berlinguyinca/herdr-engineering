@@ -765,7 +765,7 @@ def _build_parser() -> argparse.ArgumentParser:
                     help="dashboard: forward /api/v1/collab/* to the operator listener of the "
                          "isolated collab service (e.g. http://100.64.0.1:8082)")
     # No flag on purpose: the T11 delegation kill switch is YAML only (control_plane.collab.delegation_enabled).
-    p2.set_defaults(collab_delegation_enabled=False)
+    p2.set_defaults(collab_delegation_enabled=False, collab_task_lease_seconds=None)
     p2.add_argument("--collab-dashboard-host", action="append", default=[],
                     help="extra DNS name the dashboard may be reached by for collaboration "
                          "(IP literals and localhost always work; repeatable; DNS-rebinding guard)")
@@ -3384,6 +3384,7 @@ def _cmd_cp_web(args) -> int:
         collab = CollabService(auth, sink=sink, public_config=public, approval=approval,
                                delegation_enabled=_delegation_switch(args, cp),
                                summary_fix=getattr(args, "collab_summary_fix", None))
+        collab.task_lease_seconds = _task_lease(args, cp)
         if args.collab_only:
             collab.hydrate_or_degrade(sink.load)       # T16 H1: any replay failure disables collaboration only
     elif args.collab_users_file:
@@ -3400,6 +3401,7 @@ def _cmd_cp_web(args) -> int:
                              "existing state; refusing to start empty over an existing log")
         collab = CollabService(StaticTokenAuthenticator(users), sink=sink,
                                delegation_enabled=_delegation_switch(args, cp))
+        collab.task_lease_seconds = _task_lease(args, cp)
     if collab is not None:
         history = getattr(args, "collab_replay_history", None) or "since_join"
         if history not in ("full", "since_join"):
@@ -3621,6 +3623,8 @@ COLLAB_CONFIG_KEYS = {
     "dashboard_hosts": ("collab_dashboard_host", list),   # names the private dashboard may be opened by
     # T11 kill switch: bounded task delegation + artifact proposals. Default false = the feature does not exist.
     "delegation_enabled": ("collab_delegation_enabled", bool),
+    # P05 crash takeover: seconds an accepted task may stay accepted before it is requeued (read once at startup)
+    "task_lease_seconds": ("collab_task_lease_seconds", float),
     "replay_history": ("collab_replay_history", str),     # lineage replay: since_join (default) | full
     "steering": ("collab_steering", dict),                # T12 comments + steering; YAML only, off by default
     "contextual": ("collab_contextual", dict),            # T14 context refs, consultation, cross links; YAML only, off by default
@@ -3666,6 +3670,8 @@ def _apply_collab_config(args, cp) -> None:
             except ValueError as exc:
                 raise SystemExit(f"fleet config {exc}") from None
             setattr(args, dest, dict(value))
+        elif kind is float:
+            setattr(args, dest, _task_lease_value(value))
         elif kind is bool:
             if not isinstance(value, bool):
                 raise SystemExit(f"fleet config control_plane.collab.{key} must be true or false")
@@ -3743,6 +3749,22 @@ def _wire_collab_switches(collab, store, pinned=frozenset()) -> None:
         except Exception as exc:   # noqa: BLE001
             logging.getLogger(__name__).error(
                 "control_plane.collab.%s is unusable (%s): the feature is OFF until the file is fixed", key, exc)
+
+
+def _task_lease_value(value) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not 60 <= value <= 7 * 86400:
+        raise SystemExit("fleet config control_plane.collab.task_lease_seconds must be a number of seconds, 60 to 604800")
+    return float(value)
+
+
+def _task_lease(args, cp):
+    """control_plane.collab.task_lease_seconds (YAML only, default off = None); the collab-only path already folded it into args."""
+    folded = getattr(args, "collab_task_lease_seconds", None)
+    if folded is not None:
+        return folded
+    collab = cp.get("collab") if isinstance(cp, dict) else None
+    value = collab.get("task_lease_seconds") if isinstance(collab, dict) else None
+    return None if value is None else _task_lease_value(value)
 
 
 def _delegation_switch(args, cp) -> bool:
