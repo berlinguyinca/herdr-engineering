@@ -245,3 +245,17 @@ def test_a_connection_without_the_gmail_scopes_shows_gmail_as_not_connected(env)
     by = {p["id"]: p for p in svc.providers("t", "u")}
     assert not by["gmail"]["connected"] and by["gmail"]["status"] == "not_connected" and by["gmail"]["account"] == ""
     assert by["calendar"]["connected"]
+
+
+def test_exchange_failure_logs_googles_error_code_but_no_secret(caplog):
+    import io
+    import urllib.error
+
+    from herdr_engineering.control_plane.google_workspace import error_detail
+    body = io.BytesIO(b'{"error": {"code": 403, "message": "SECRET-TEXT", "errors": [{"reason": "accessNotConfigured"}]}}')
+    exc = urllib.error.HTTPError("https://x", 403, "Forbidden", {}, body)
+    assert error_detail(exc) == "http_403:accessNotConfigured"
+    exc2 = urllib.error.HTTPError("https://x", 400, "Bad", {}, io.BytesIO(b'{"error": "invalid_grant", "error_description": "SECRET-TEXT"}'))
+    assert error_detail(exc2) == "http_400:invalid_grant"
+    exc3 = urllib.error.HTTPError("https://x", 500, "Bad", {}, io.BytesIO(b"<html>SECRET-TEXT"))
+    assert error_detail(exc3) == "http_500"

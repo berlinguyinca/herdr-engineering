@@ -61,9 +61,28 @@ _TIME = re.compile(r"\d{4}-\d{2}-\d{2}(T\d{2}:\d{2}(:\d{2})?(Z|[+-]\d{2}:\d{2})?
 class GoogleError(Exception):
     """A fixed, credential-free reason (``not_connected``, ``unauthorized``, ``unavailable`` ...)."""
 
-    def __init__(self, reason: str):
+    def __init__(self, reason: str, detail: str = ""):
         super().__init__(reason)
         self.reason = reason
+        self.detail = detail      # "http_403:accessNotConfigured": status plus Google's short error code, for the log only
+
+
+_CODE = re.compile(r"[A-Za-z0-9_.-]{1,60}")
+
+
+def error_detail(exc: urllib.error.HTTPError) -> str:
+    """``http_<status>[:<code>]`` from a Google error response. Only Google's short machine code is kept, never the
+    description, so no credential or account text can reach a log."""
+    code = ""
+    try:
+        body = json.loads(exc.read(MAX_RESPONSE))
+        err = body.get("error") if isinstance(body, dict) else None
+        if isinstance(err, dict):
+            err = (err.get("errors") or [{}])[0].get("reason") or err.get("status")
+        code = err if isinstance(err, str) and _CODE.fullmatch(err) else ""
+    except (ValueError, OSError, AttributeError, IndexError, TypeError):
+        pass
+    return f"http_{exc.code}" + (f":{code}" if code else "")
 
 
 def _b64(raw: bytes) -> str:
@@ -83,10 +102,11 @@ def _post_form(opener: Callable, url: str, form: dict[str, str]) -> dict:
         with opener(req, TIMEOUT) as resp:
             return json.loads(resp.read(MAX_RESPONSE))
     except urllib.error.HTTPError as exc:
+        detail = error_detail(exc)
         exc.close()
-        raise GoogleError("unauthorized" if exc.code in (400, 401) else "unavailable") from None
+        raise GoogleError("unauthorized" if exc.code in (400, 401) else "unavailable", detail) from None
     except (urllib.error.URLError, OSError, ValueError):
-        raise GoogleError("unavailable") from None
+        raise GoogleError("unavailable", "network") from None
 
 
 def validate_write(tool_id: str, payload: Any) -> None:

@@ -148,7 +148,8 @@ class AppsService:
         verifier = self._store.open_pending(sealed)
         try:
             data = google_oauth.exchange_authorization_code(self._open, client, code, verifier, self._redirect)
-        except GoogleError:
+        except GoogleError as exc:
+            log.warning("assistant apps: Google token exchange failed (%s)", exc.detail or exc.reason)
             raise AppsError("exchange_failed") from None
         granted = google_oauth.normalize_scopes(str(data.get("scope", "")).split())
         if not granted or granted != set(google_oauth.SCOPES):
@@ -158,7 +159,8 @@ class AppsService:
             raise AppsError("no_refresh_token")
         try:
             account = google_oauth.account_address(self._open, access)
-        except GoogleError:
+        except GoogleError as exc:
+            log.warning("assistant apps: Google account lookup failed (%s)", exc.detail or exc.reason)
             raise AppsError("exchange_failed") from None
         self._store.put_connection(tenant, user, GOOGLE, account=account, scopes=sorted(granted), refresh_token=refresh)
         self._changed(tenant, user)
