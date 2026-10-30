@@ -437,7 +437,7 @@ class ArtifactStore(ArtifactContextMixin, ArtifactUploadMixin, ArtifactLifecycle
 
     async def list_version_summaries(self, artifact_id: str) -> list[dict]:
         rows = await self._conn.fetch(
-            "SELECT version_id, artifact_id, version_number, parent_version_id, state, created_at, "
+            "SELECT version_id, artifact_id, version_number, parent_version_id, created_by, state, created_at, "
             "committed_at, (report_descriptor IS NOT NULL) AS is_report FROM artifact_versions "
             "WHERE artifact_id=$1 ORDER BY version_number DESC", artifact_id)
         return [self._row(row) for row in rows]

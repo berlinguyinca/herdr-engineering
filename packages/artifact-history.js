@@ -1,6 +1,8 @@
 import { escapeHtml as esc } from './herdr-web-components/util.js';
 
 export const HEAD_MOVED = 'The head moved — reload and try again';
+export const NO_PERMISSION = 'You do not have permission to restore versions of this artifact';
+export const RESTORED_STALE = 'Restored; reload to see the new version';
 
 const parentsOf = version => {
   const list = Array.isArray(version.parent_version_ids) && version.parent_version_ids.length
@@ -17,10 +19,10 @@ export function renderVersionRow(version, { headVersionId, canRestore = false, b
   const parentHtml = parents.length
     ? `<p>${merge ? '<strong data-version-merge>Merge</strong> of parents' : 'Parent'}: ${parents.map(parent => `<code>${esc(parent)}</code>`).join(' + ')}</p>`
     : '';
-  const restore = canRestore && !isHead
+  const restore = canRestore && !isHead && version.is_report !== true
     ? `<button type="button" class="hd-btn" data-history-action="restore" data-version-id="${esc(id)}"${busy ? ' disabled' : ''}>Restore this version</button>`
     : '';
-  return `<li data-version-row data-version-id="${esc(id)}"><p><strong>v${esc(version.version_number)}</strong> · ${esc(version.state || 'unknown')}${isHead ? ' · <span class="hd-badge" data-version-head>current</span>' : ''} · ${esc(version.created_by || 'unknown author')} · <time>${esc(version.created_at || '')}</time> · <code>${esc(id)}</code></p>${parentHtml}${restore}</li>`;
+  return `<li data-version-row data-version-id="${esc(id)}"><p><strong>v${esc(version.version_number)}</strong> · ${esc(version.state || 'unknown')}${isHead ? ' · <span class="hd-badge" data-version-head>current</span>' : ''}${version.created_by ? ` · ${esc(version.created_by)}` : ''} · <time>${esc(version.created_at || '')}</time> · <code>${esc(id)}</code></p>${parentHtml}${restore}</li>`;
 }
 
 export function renderVersionList(versions, { headVersionId, canRestore = false, busy = false } = {}) {
@@ -47,8 +49,10 @@ export function createHistoryController(client, artifactId, { versions = [], hea
   ctrl.restore = async versionId => {
     if (!live() || state.busy || !state.canRestore || versionId === state.headVersionId) return;
     state.busy = true; state.notice = ''; state.error = ''; changed();
+    let restored = false;
     try {
       await client.restoreArtifactVersion(artifactId, versionId, { signal: aborter.signal });
+      restored = true;
       if (!live()) return;
       if (await refresh()) {
         const head = state.versions.find(version => version.version_id === state.headVersionId);
@@ -56,10 +60,12 @@ export function createHistoryController(client, artifactId, { versions = [], hea
       }
     } catch (error) {
       if (!live()) return;
-      if (error?.status === 409) {
+      if (restored) state.notice = RESTORED_STALE;
+      else if (error?.status === 409) {
         state.error = HEAD_MOVED;
         try { await refresh(); } catch { /* the message already says to reload */ }
-      } else state.error = error?.message || 'Restore failed';
+      } else if (error?.status === 403 || error?.status === 404) state.error = NO_PERMISSION;
+      else state.error = error?.message || 'Restore failed';
     } finally {
       if (live()) { state.busy = false; changed(); }
     }

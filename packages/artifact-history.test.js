@@ -160,3 +160,50 @@ test('mounted: success shows the notice and the new head badge; errors are escap
   assert.doesNotMatch(bad.html, /<img/i);
   assert.match(bad.html, /role="alert"/);
 });
+
+test('summary rows without created_by render cleanly with no author placeholder text', () => {
+  const html = renderVersionRow({ version_id: 'v2', version_number: 2, state: 'ready', parent_version_id: 'v1', created_at: '2026-10-30T10:00:00Z' }, { headVersionId: 'v2' });
+  assert.doesNotMatch(html, /undefined|null|unknown author/);
+  assert.match(html, /v2/);
+});
+
+test('rows flagged is_report never offer Restore', () => {
+  assert.doesNotMatch(renderVersionRow(v(1, { is_report: true }), { headVersionId: 'v2', canRestore: true }), /Restore this version/);
+});
+
+test('403 and 404 map to an explicit permission message', async () => {
+  for (const status of [403, 404]) {
+    const client = fakeClient({ async restoreArtifactVersion() { throw Object.assign(new Error('nope'), { status }); } });
+    const ctrl = createHistoryController(client, 'a1', { versions: [v(2), v(1)], headVersionId: 'v2', canRestore: true });
+    await ctrl.restore('v1');
+    assert.equal(ctrl.state.error, 'You do not have permission to restore versions of this artifact');
+  }
+  const container = fakeContainer();
+  mountHistory(container, fakeClient({ async restoreArtifactVersion() { throw Object.assign(new Error(IMG), { status: 403 }); } }), 'a1', { versions: [v(2), v(1)], headVersionId: 'v2', canRestore: true });
+  container.click('v1'); await tick(); await tick();
+  assert.match(container.html, /do not have permission/);
+});
+
+test('a refresh failure after a successful restore is not reported as a restore failure', async () => {
+  const client = fakeClient({ async artifactVersions() { throw new Error('boom'); } });
+  const ctrl = createHistoryController(client, 'a1', { versions: [v(2), v(1)], headVersionId: 'v2', canRestore: true });
+  await ctrl.restore('v1');
+  assert.equal(ctrl.state.error, '');
+  assert.equal(ctrl.state.notice, 'Restored; reload to see the new version');
+  assert.ok(client.calls.some(c => Array.isArray(c)));
+});
+
+test('a 409 refreshes the list and feeds onVersions', async () => {
+  let list = [v(3), v(2), v(1)];
+  const client = fakeClient({
+    async getArtifact() { return { current_version_id: 'v3' }; },
+    async artifactVersions() { return { versions: list }; },
+    async restoreArtifactVersion() { throw Object.assign(new Error('c'), { status: 409 }); },
+  });
+  const seen = [];
+  const ctrl = createHistoryController(client, 'a1', { versions: [v(2), v(1)], headVersionId: 'v2', canRestore: true, onVersions: (vs, h) => seen.push([vs.length, h]) });
+  await ctrl.restore('v1');
+  assert.equal(ctrl.state.error, 'The head moved — reload and try again');
+  assert.equal(ctrl.state.headVersionId, 'v3');
+  assert.deepEqual(seen, [[3, 'v3']]);
+});

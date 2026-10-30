@@ -668,3 +668,24 @@ test('setVersions refreshes the version choices and keeps a still-valid selectio
   assert.equal(panel.controller.state.form.versionId, 'v3');
   panel.dispose();
 });
+
+test('setVersions does not clobber a pending review or a shown link', async () => {
+  const container = fakeContainer();
+  const panel = mountSharePanel(container, fakeClient(), 'art1', { versions, headVersionId: 'v2' });
+  await tick();
+  panel.controller.setField('audience', 'public');
+  await panel.controller.review();
+  await panel.controller.generate();
+  await tick();
+  assert.equal(container.querySelector('[data-share-url]').value, SECRET_URL);
+  panel.setVersions([{ version_id: 'v3', version_number: 3, state: 'ready' }, ...versions], 'v3');
+  assert.equal(container.querySelector('[data-share-url]').value, SECRET_URL);
+  assert.equal(panel.controller.state.link.url, SECRET_URL);
+  await panel.controller.review();
+  const pending = panel.controller.state.pending;
+  assert.ok(pending);
+  panel.setVersions(versions, 'v2');
+  assert.equal(panel.controller.state.pending, pending);
+  assert.match(container.regions.review.html, /Review before generating/);
+  panel.dispose();
+});
