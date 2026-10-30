@@ -14,6 +14,7 @@ import json
 import os
 import re
 import shutil
+import tempfile
 import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -45,6 +46,7 @@ _CONTENT_TYPES = {
     ".wasm": "application/wasm",
     ".woff2": "font/woff2",
 }
+MAX_SCAN_BYTES = 1024 * 1024
 _SCANNED = {".html", ".css", ".js", ".mjs", ".svg"}
 
 
@@ -79,16 +81,16 @@ def normalise_name(name: str) -> str:
     if not isinstance(name, str) or not name:
         raise ShareBundleError("file name is empty")
     name = unicodedata.normalize("NFC", name)
-    if len(name.encode("utf-8", "surrogatepass")) > MAX_NAME_BYTES:
+    if any(ord(c) < 0x20 or ord(c) == 0x7F or 0xD800 <= ord(c) <= 0xDFFF for c in name):
+        raise ShareBundleError("file name contains a control character or surrogate")
+    if len(name.encode("utf-8")) > MAX_NAME_BYTES:
         raise ShareBundleError("file name is too long")
     if name.startswith("/") or "\\" in name:
         raise ShareBundleError("file name must be a relative path with '/' separators")
-    if any(ord(c) < 0x20 or ord(c) == 0x7F for c in name):
-        raise ShareBundleError("file name contains a control character")
     for segment in name.split("/"):
         if segment in ("", ".", ".."):
             raise ShareBundleError("file name has an empty, '.' or '..' segment")
-        if len(segment.encode("utf-8", "surrogatepass")) > MAX_SEGMENT_BYTES:
+        if len(segment.encode("utf-8")) > MAX_SEGMENT_BYTES:
             raise ShareBundleError("file name segment is too long")
     return name
 
@@ -97,18 +99,20 @@ def content_type_for(name: str) -> str:
     return _CONTENT_TYPES.get(os.path.splitext(name)[1].lower(), "application/octet-stream")
 
 
+_HOST_OR_ABS = r"((?:https?:)?//[^\s\"'<>)]+|/[^/\s\"'<>)][^\s\"'<>)]*)"
+# Every pattern is linear: no nested/adjacent unbounded repeats, and the one lookbehind-ish gap (import ... from) is bounded.
 _URL_PATTERNS = [
-    re.compile(r"""\b(?:src|srcset|poster|data-src)\s*=\s*["']?\s*((?:https?:)?//[^\s"'<>)]+|/[^/\s"'<>)][^\s"'<>)]*)""", re.I),
-    re.compile(r"""<link\b[^>]*?\bhref\s*=\s*["']?\s*((?:https?:)?//[^\s"'<>)]+|/[^/\s"'<>)][^\s"'<>)]*)""", re.I),
-    re.compile(r"""\burl\(\s*["']?\s*((?:https?:)?//[^\s"')]+|/[^/\s"')][^\s"')]*)""", re.I),
-    re.compile(r"""\bimport\s*(?:[\w{}*\s,$]+\bfrom\s*)?\(?\s*["']((?:https?:)?//[^"']+|/[^/"'][^"']*)["']""", re.I),
+    re.compile(r"""\b(?:src|srcset|poster|data-src)\s*=\s*["']?""" + _HOST_OR_ABS, re.I),
+    re.compile(r"""<link\b[^>]{0,300}?\bhref\s*=\s*["']?""" + _HOST_OR_ABS, re.I),
+    re.compile(r"""\burl\(\s*["']?""" + _HOST_OR_ABS, re.I),
+    re.compile(r"""\bimport\s*(?:\(\s*|[^"'\n;()]{0,200}?\bfrom\s*)?["']((?:https?:)?//[^"']+|/[^/"'][^"']*)["']""", re.I),
     re.compile(r"""@import\s+["']((?:https?:)?//[^"']+|/[^/"'][^"']*)["']""", re.I),
 ]
 
 
 def scan_external_references(html: bytes) -> list[str]:
     """URLs a page loads from another host or by absolute path (neither works from a frozen bundle). Relative and ``data:`` are fine."""
-    text = html.decode("utf-8", "replace")
+    text = html[:MAX_SCAN_BYTES].decode("utf-8", "replace")
     found: list[str] = []
     for pattern in _URL_PATTERNS:
         for match in pattern.finditer(text):
@@ -129,8 +133,14 @@ def _check_dest(dest: Path) -> None:
 
 def _write_file(base: Path, name: str, expected_sha: str, expected_size: int, chunks: Iterable[bytes], budget: int) -> int:
     target = base.joinpath(*name.split("/"))
-    target.parent.mkdir(parents=True, exist_ok=True)
+    current = base
+    for part in name.split("/")[:-1]:
+        current = current / part
+        if not current.is_dir():
+            current.mkdir()
+            os.chmod(current, 0o755)
     fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+    os.fchmod(fd, 0o644)
     digest = hashlib.sha256()
     size = 0
     with os.fdopen(fd, "wb") as handle:
@@ -201,8 +211,10 @@ def build_bundle(dest: Path, files: Iterable[tuple[str, str, int, Iterable[bytes
             raise ShareBundleError("name is both a file and a directory: %s" % ", ".join(clash))
         dest.mkdir(parents=True)
         created = True
+        os.chmod(dest, 0o755)
         base = dest / "files"
         base.mkdir()
+        os.chmod(base, 0o755)
         index_files = []
         total = 0
         for name, sha, size, chunks in entries:
@@ -211,8 +223,12 @@ def build_bundle(dest: Path, files: Iterable[tuple[str, str, int, Iterable[bytes
         chosen = _choose_entry(entry, [f.name for f in index_files])
         warnings = []
         for f in index_files:
-            if os.path.splitext(f.name)[1].lower() in _SCANNED and f.size <= 8 * 1024 * 1024:
-                refs = scan_external_references((base.joinpath(*f.name.split("/"))).read_bytes())
+            if os.path.splitext(f.name)[1].lower() in _SCANNED:
+                if f.size > MAX_SCAN_BYTES:
+                    warnings.append("%s is over %d bytes; only the first %d were checked for external references"
+                                    % (f.name, MAX_SCAN_BYTES, MAX_SCAN_BYTES))
+                with open(base.joinpath(*f.name.split("/")), "rb") as handle:
+                    refs = scan_external_references(handle.read(MAX_SCAN_BYTES))
                 warnings.extend("%s references %s" % (f.name, url) for url in refs[:20])
         return BundleIndex(chosen, index_files, total, warnings)
     except BaseException:
@@ -238,10 +254,11 @@ def write_state(root: Path, token_hash: str, state: dict) -> None:
     directory = _token_dir(root, token_hash)
     Path(root).mkdir(parents=True, exist_ok=True)
     _mkdirs(directory, Path(root))
-    tmp = directory / (".state.%d.tmp" % os.getpid())
+    fd, tmp_name = tempfile.mkstemp(prefix=".state.", suffix=".tmp", dir=directory)
+    tmp = Path(tmp_name)
     try:
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o644)
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            os.fchmod(handle.fileno(), 0o644)
             json.dump(state, handle, sort_keys=True)
             handle.flush()
             os.fsync(handle.fileno())

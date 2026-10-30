@@ -3,6 +3,8 @@ import hashlib
 import json
 import os
 import stat
+import threading
+import time
 
 import pytest
 
@@ -29,7 +31,7 @@ def _f(name, body=b"x", *, sha=None, size=None, chunks=None):
 
 @pytest.mark.parametrize("bad", [
     "../x", "a/../x", "/abs", "a//b", "a/", "a\\b", "a\x00b", "a\nb", "x" * 300, "ok/" + "y" * 256, ".", "..", "a/./b",
-    "", "%00".replace("%00", "\x7f"), "z" * 2000,
+    "", "\x7f", "z" * 2000, "a\ud800b",
 ])
 def test_normalise_rejects_escape_forms(bad):
     with pytest.raises(ShareBundleError):
@@ -192,3 +194,49 @@ def test_remove_bundle(tmp_path):
         with pytest.raises(ShareBundleError):
             remove_bundle(tmp_path, bad)
     assert tmp_path.exists()
+
+
+def test_scan_is_linear_on_hostile_input():
+    for body in (b"import a " * 8000, b"import a " * 400000, b"src=" + b" " * 3_000_000, b"url(" + b" " * 3_000_000,
+                 b"<link " * 100000, b"@import " * 300000, b"import {" * 300000):
+        started = time.monotonic()
+        scan_external_references(body)
+        assert time.monotonic() - started < 2.0, body[:12]
+
+
+def test_large_scanned_file_is_capped_with_warning(tmp_path):
+    big = b"<p>x</p>" + b" " * (2 * 1024 * 1024)
+    index = build_bundle(tmp_path / "s", [_f("index.html", big)],
+                         entry=None, limits=BundleLimits(max_bytes=4 * 1024 * 1024, max_files=5))
+    assert any("only the first" in w for w in index.warnings)
+
+
+def test_modes_are_explicit_under_restrictive_umask(tmp_path):
+    old = os.umask(0o077)
+    try:
+        build_bundle(tmp_path / "s", [_f("index.html"), _f("a/b/c.txt")], entry=None, limits=LIMITS)
+        write_state(tmp_path / "root", TOKEN_HASH, {"a": 1})
+    finally:
+        os.umask(old)
+    for d in (tmp_path / "s", tmp_path / "s" / "files", tmp_path / "s" / "files" / "a", tmp_path / "s" / "files" / "a" / "b",
+              tmp_path / "root" / "by-token", tmp_path / "root" / "by-token" / TOKEN_HASH):
+        assert stat.S_IMODE(d.stat().st_mode) == 0o755, d
+    for f in (tmp_path / "s" / "files" / "index.html", tmp_path / "s" / "files" / "a" / "b" / "c.txt",
+              tmp_path / "root" / "by-token" / TOKEN_HASH / "state.json"):
+        assert stat.S_IMODE(f.stat().st_mode) == 0o644, f
+
+
+def test_concurrent_write_state_same_token(tmp_path):
+    errors = []
+
+    def go(i):
+        try:
+            for _ in range(30):
+                write_state(tmp_path, TOKEN_HASH, {"i": i})
+        except Exception as exc:  # pragma: no cover
+            errors.append(exc)
+    threads = [threading.Thread(target=go, args=(i,)) for i in range(8)]
+    [t.start() for t in threads]
+    [t.join() for t in threads]
+    assert errors == []
+    assert [p.name for p in (tmp_path / "by-token" / TOKEN_HASH).iterdir()] == ["state.json"]
