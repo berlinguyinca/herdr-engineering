@@ -224,6 +224,7 @@ class ControlPlaneRepo:
         self._test_runs = {}
         self._reviews = {}
         self._pull_requests = {}
+        self.pull_request_version = 0      # bumped on every change to a PR record: lets a consumer tell cheaply that nothing moved
         self._stage_runs = {}  # mission_key -> [open+closed stage runs, ...]
         self._token_usage = {}  # request_id -> token usage record (issue #36)
         self._resource_usage = {}  # (mission_id, kind) -> [resource usage record, ...]
@@ -1729,6 +1730,7 @@ class ControlPlaneRepo:
         closed_at=None,
     ):
         stamp = self._stamp()
+        self.pull_request_version += 1
         existing = self._pull_requests.get(pr_id)
         if existing is None:
             rec = {
@@ -3483,6 +3485,7 @@ class ControlPlaneRepo:
         for pull in self._pull_requests.values():      # a record stored before end_count existed has ended once if it has an end time
             if isinstance(pull, dict) and (pull.get("merged_at") or pull.get("closed_at")) and not pull.get("end_count"):
                 pull["end_count"] = 1
+        self.pull_request_version += 1
         self._token_usage = dict(delivery.get("token_usage", {}))
         self._resource_usage = {tuple(json.loads(k)): [dict(x) for x in v]
                                 for k, v in delivery.get("resource_usage", {}).items()}

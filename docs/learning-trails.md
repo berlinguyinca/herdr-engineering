@@ -34,9 +34,13 @@ One `PullRequestTrail` event on the `pr_trail` stream of the PR (kept out of the
 
 An allowlist is stored, not a copy of the trail. Handoff goals, agent names, reviewer names, CI URLs and agent ids are not stored.
 The remaining text is passed once, at write time, through the redactor (key-hint masking such as `password`/`token`), then scrubbed of
-e-mail addresses (`[EMAIL]`, also `a%40b.com`, fullwidth `＠`, `a@localhost`) and home paths (`/home/<u>`, `/Users/<u>`, `/root`, `~<u>`,
-`C:\Users\<u>`, `C:/Users/<u>` → `[USER]`), keys included, after Unicode NFKC normalisation and URL-decoding (twice). Text that needs nothing is
-kept verbatim. Every string longer than 300 characters (200 for branches) is cut with a visible `…[truncated]` marker and named in
+e-mail addresses (`[EMAIL]`, also `a%40b.com`, fullwidth `＠`, `a@localhost`, `a (at) b.com`) and home paths (`/home/<u>`, `/Users/<u>`,
+`/root`, `~<u>`, `C:\Users\<u>`, `C:/Users/<u>` → `[USER]`), keys included. Input is cut to 4 KiB first (every field is clipped far below
+that and marked), then NFKC-normalised and stripped of format/control characters (zero-width, bidi overrides), and every pattern is
+linear (bounded local part and labels). An address needs a dotted domain with an alphabetic TLD or `localhost`: `lodash@4.17.21`,
+`feat@v2` and ssh remotes (`git@github.com:org/repo`, `git@` generally) are left alone. Percent-escapes are decoded up to three rounds for
+matching; when only the decoded form exposes something, the encoded text is scrubbed **in place** (a URL keeps its shape, so joins on it
+work). Text that needs nothing is kept verbatim. Every string longer than 300 characters (200 for branches) is cut with a visible `…[truncated]` marker and named in
 `trimmed` (`text:<field>`), signal reasons and agent text included.
 
 **Branch names and similar identifiers (`fix/john.smith`) are kept as they are, by design:** hashing them would break joins with the
@@ -69,8 +73,11 @@ re-reads the PR just before writing and skips the write if its status, times or 
 It is retried every `retry_interval_minutes`. A pass builds at most `sweep_batch` trails, never-tried PRs first, then the least recently
 tried, so a backlog is worked through fairly and old not-ready PRs cannot starve newer ones. After `ready_retry_minutes` without a complete read it is stored anyway with
 `incomplete: true` and `missing_sources` (for example `["ci"]`). Training code should filter on `incomplete`. A PR whose trail cannot be built at all (no repository or number, or never readable) is given
-up on after `max_build_attempts` attempts: nothing is stored, a warning is logged, it is listed by `TrailRecords.unbuildable()`, and the
-bookkeeping is dropped once the PR changes or disappears. Retry clocks are in memory: a restart restarts them, and the warm-up plus the
+up on after `max_build_attempts` attempts: nothing is stored and a warning is logged. It is not abandoned: it waits `unbuildable_retry_hours`
+(default 24) and is tried once more (one failure puts it back to waiting; a success writes the record and clears the state). The export
+tells a consumer what is missing: `unbuildable: {count, items[<=20 of {pr_id, end_seq, reason, retry_at}]}` and `skipped_by_horizon`
+(PRs left out because their end is older than what retention dropped); on the line form the headers `X-Unbuildable-Count` and
+`X-Skipped-By-Horizon`. The bookkeeping is dropped once the PR changes or disappears. Retry clocks are in memory: a restart restarts them, and the warm-up plus the
 `sweep_batch` bound keep the restart from releasing a stampede.
 
 **Assembled once.** The set of ends ever assembled (rebuilt from the stored events at start) is separate from the export index. Retention
@@ -105,7 +112,9 @@ Pruning only trims the in-memory index and the export; the stored events are lef
 pruned the same way, so `truncated_before` is the same after a restart. Late evidence for a pruned record is refused.
 
 **Locks.** Writers take a writer lock (held across a durable write that waits for the sink); readers use only a short index lock, so a
-slow sink never blocks an export. A read starts a background sweep only when a record is actually due, and `shutdown()` stops and joins it.
+slow sink never blocks an export. A read starts a background sweep only when a record is actually due; when nothing is due it costs O(1) (the repository's
+`pull_request_version` and the next retry time say nothing moved), and `shutdown()` stops and joins it. A closed instance writes nothing,
+even from a pass already running.
 
 ## Configuration
 
@@ -128,7 +137,8 @@ control_plane:
     late_checks: 3                    # 0..20
     late_window_hours: 24             # 1..720
     late_check_interval_minutes: 30   # 1..1440
-    max_build_attempts: 12            # 1..1000, then an unreadable trail is given up on
+    max_build_attempts: 12            # 1..1000, then an unreadable trail waits unbuildable_retry_hours
+    unbuildable_retry_hours: 24       # 1..720
 ```
 
 Unknown keys are refused at start.

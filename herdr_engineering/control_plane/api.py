@@ -4516,6 +4516,8 @@ def _make_handler(server, public=False, operator=False):
             if page["truncated_before"]:
                 self.send_header("X-Truncated-Before", page["truncated_before"])
             self.send_header("X-Cursor-Truncated", "true" if page["cursor_truncated"] else "false")
+            self.send_header("X-Unbuildable-Count", str(page["unbuildable"]["count"]))
+            self.send_header("X-Skipped-By-Horizon", str(page["skipped_by_horizon"]))
             if page["next_cursor"]:
                 self.send_header("X-Next-Cursor", page["next_cursor"])
             if self.close_connection:

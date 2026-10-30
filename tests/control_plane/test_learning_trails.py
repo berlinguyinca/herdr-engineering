@@ -578,7 +578,7 @@ def test_retention_prunes_the_oldest_whole_prs_and_reports_where_the_export_now_
     ({"max_agents": 0}, "max_agents must be a whole number from 1 to 50"), ({"sweep_batch": True}, "sweep_batch"),
     ({"page_default": 300, "page_max": 100}, "page_default must not exceed page_max"), ({"require_role": "ingest"}, "require_role must be one of"),
     ({"max_records": 5}, "max_records"), ({"warmup_minutes": -1}, "warmup_minutes"), ({"retry_interval_minutes": 0}, "retry_interval_minutes"),
-    ({"late_checks": 99}, "late_checks"), ({"low_confidence_after_minutes": "x"}, "low_confidence_after_minutes")])
+    ({"late_checks": 99}, "late_checks"), ({"unbuildable_retry_hours": 0}, "unbuildable_retry_hours"), ({"low_confidence_after_minutes": "x"}, "low_confidence_after_minutes")])
 def test_config_is_validated(raw, message):
     with pytest.raises(ValueError, match=message):
         learning_config(raw)
@@ -588,7 +588,8 @@ def test_config_defaults_and_repository_parsing():
     assert learning_config(None) == {"enabled": True, "max_agents": 12, "sweep_batch": 20, "page_default": 50, "page_max": 200,
                                      "max_records": 20000, "require_role": "operator", "warmup_minutes": 10, "retry_interval_minutes": 5,
                                      "ready_retry_minutes": 60, "low_confidence_after_minutes": 15, "late_checks": 3,
-                                     "late_window_hours": 24, "late_check_interval_minutes": 30, "max_build_attempts": 12}
+                                     "late_window_hours": 24, "late_check_interval_minutes": 30, "max_build_attempts": 12,
+                                     "unbuildable_retry_hours": 24}
     assert parse_repository("github.com/org/app") == ("github.com", "org", "app")
     assert parse_repository("org/app") == (None, "org", "app")
     assert parse_repository("https://ghe.example/org/app.git") == ("ghe.example", "org", "app")
@@ -908,3 +909,124 @@ def test_a_server_with_nothing_ended_does_no_work_and_a_close_stops_the_backgrou
     svr.learning_trails.close()
     assert svr.learning_trails._worker is not None and not svr.learning_trails._worker.is_alive()
     assert svr.learning_trails.sweep(force=True) == 0 and svr.learning_trails.trigger_sweep() is False
+
+
+# ---------------------------------------------------------------- scrub: linear time, no false positives, closed bypasses
+@pytest.mark.parametrize("make", [lambda: "a" * 1_000_000, lambda: "a." * 500_000, lambda: "%" * 1_000_000, lambda: "%25" * 330_000,
+                                  lambda: "/home/" * 170_000, lambda: "a@" * 500_000, lambda: ("a" * 60 + ".") * 16_000])
+def test_scrub_is_linear_on_hostile_input(make):
+    text = make()
+    began = time.monotonic()
+    out = scrub(text)
+    assert time.monotonic() - began < 0.2 and len(out) <= 4096
+
+
+def test_clip_marks_an_input_that_was_capped_before_scrubbing():
+    repo, records, _, _ = world(trail=fake_trail({"pull_request": {"number": 7, "url": None, "branch": "a" * 100_000}}))
+    end_pr(repo)
+    records.sweep(force=True)
+    p = stored(repo)[0]["payload"]
+    assert p["pull_request"]["branch"].endswith("…[truncated]") and "text:branch" in p["trimmed"]
+
+
+@pytest.mark.parametrize("text", ["lodash@4.17.21", "feat@v2", "git@github.com:org/repo.git", "ssh://git@github.com/org/repo.git",
+                                  "pkg@1.2.3-beta.1", "@types/node", "bump react@18"])
+def test_things_that_are_not_email_addresses_are_left_alone(text):
+    assert scrub(text) == text
+
+
+@pytest.mark.parametrize("text", ["a@b.com", "first.last+tag@sub.example.co.uk", "root@localhost", "x@LOCALHOST"])
+def test_real_addresses_are_still_scrubbed(text):
+    assert scrub(text) == "[EMAIL]"
+
+
+@pytest.mark.parametrize("text,gone", [
+    ("a​@b.com", "a"), ("‮a@b.com", "b.com"), ("/ho​me/alice", "alice"), ("/home‮/alice", "alice"), ("/ho­me/alice", "alice"),
+    ("%2f%48ome%2falice", "alice"), ("%25252Fhome%25252Falice", "alice"), ("%2F%68ome%2F%61lice", "alice"),
+    ("/home//alice", "alice"), ("/home/ alice", "alice"), ("/Users//bob", "bob"),
+    ("alice (at) example.com", "alice"), ("alice [at] example [dot] com", "alice"), ("alice(AT)example.org", "alice")])
+def test_remaining_bypasses_are_closed(text, gone):
+    out = scrub(text)
+    assert gone not in out.replace("[USER]", "").replace("[EMAIL]", ""), (text, out)
+
+
+def test_a_url_is_not_rewritten_when_decoding_exposes_a_path_in_its_query():
+    url = "https://x.example/cb?next=%2Fhome%2Falice&a=1"
+    out = scrub(url)
+    assert "alice" not in out and out.startswith("https://x.example/cb?next=%2Fhome%2F") and out.endswith("&a=1"), out
+    mail = "https://x.example/u?e=bob%40example.com&z=2"
+    out = scrub(mail)
+    assert "bob" not in out and out.startswith("https://x.example/u?e=") and out.endswith("&z=2"), out
+
+
+# ---------------------------------------------------------------- unbuildable: long retry, metadata, horizon count, idle cost, close
+def test_an_unbuildable_pr_is_retried_daily_and_a_success_clears_it():
+    state = {"ok": False}
+    repo, records, clock, calls = world(trail=lambda: fake_trail() if state["ok"] else None, max_build_attempts=2, late_checks=0)
+    merged(repo, 1)
+    for _ in range(4):
+        records.sweep(force=True)
+        clock[0] += 301
+    assert len(calls) == 2 and ("pr-1", 1) in records.unbuildable()
+    clock[0] += 24 * 3600
+    records.sweep(force=True)
+    assert len(calls) == 3, "after the long retry it is tried once more"
+    assert ("pr-1", 1) in records.unbuildable()
+    clock[0] += 301
+    records.sweep(force=True)
+    assert len(calls) == 3, "and a failure starts the long wait again"
+    state["ok"] = True
+    clock[0] += 24 * 3600
+    assert records.sweep(force=True) == 1 and records.unbuildable() == {} and records._track == {}
+
+
+def test_the_export_reports_how_many_records_are_missing_and_how_many_were_skipped_by_the_horizon():
+    repo, records, clock, _ = world(trail=lambda: None, max_build_attempts=1, late_checks=0, page_default=2, page_max=3)
+    for n in range(30):
+        merged(repo, n)
+    for _ in range(2):
+        records.sweep(force=True)
+        clock[0] += 301
+    meta = records.export()["unbuildable"]
+    assert meta["count"] == 30 and len(meta["items"]) == 20 and set(meta["items"][0]) == {"pr_id", "end_seq", "reason", "retry_at"}
+    assert records.export()["skipped_by_horizon"] == 0
+    repo2, rec2, clock2, _ = world(max_records=100, late_checks=0)
+    for n in range(101):
+        merged(repo2, n, at="2026-10-05T10:00:00Z")
+    for _ in range(7):
+        rec2.sweep(force=True)
+        clock2[0] += 301
+    repo2.upsert_pull_request("old", repository="github.com/org/app", number=999, status="merged", merged_at="2026-09-01T10:00:00Z")
+    rec2.sweep(force=True)
+    assert rec2.export()["skipped_by_horizon"] == 1
+
+
+def test_an_idle_read_costs_nothing_until_a_pr_changes_or_a_retry_comes_due(monkeypatch):
+    repo, records, clock, _ = world()
+    merged(repo, 1)
+    records.sweep(force=True)
+    clock[0] += 400
+    scans = []
+    original = repo.list_pull_requests
+    monkeypatch.setattr(repo, "list_pull_requests", lambda *a, **k: scans.append(1) or original(*a, **k))
+    assert records.trigger_sweep() is False
+    first = len(scans)
+    for _ in range(50):
+        assert records.trigger_sweep() is False
+    assert len(scans) == first, "nothing moved, so no scan"
+    merged(repo, 2)
+    clock[0] += 400
+    assert records.trigger_sweep() is True
+    records._worker.join(5)
+    assert len(scans) > first
+
+
+def test_a_sweep_that_is_closed_while_it_builds_writes_nothing():
+    repo, records, _, _ = world()
+
+    def closing():
+        records._closed = True
+        return fake_trail()
+    records.trail_for = lambda *a: closing()
+    end_pr(repo)
+    assert records.sweep(force=True) == 0 and stored(repo) == []
