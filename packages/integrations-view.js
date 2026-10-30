@@ -318,7 +318,7 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
     if(isCi) {
       const observations=ciObservations();
       const model=ciInsightsModel(observations,state);
-      const html=renderCiInsights(model,{loading:reportData===null&&!reportsError,error:reportsError,failurePage});
+      const html=renderCiInsights(model,{loading:reportData===null&&!reportsError,error:reportsError,failurePage,selectedRepo:state.project?ciProjectKey(state.project):el('[data-ci-repository]')?.value||''});
       if(insightsSignature!==html){
         const host=el('[data-ci-insights]');
         const focus=[...host.querySelectorAll('details')].findIndex(d=>d.querySelector('summary')===document.activeElement);
@@ -510,6 +510,25 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
     if(button.hasAttribute('data-collapse-success')){collapseSuccess=!collapseSuccess;draw();return;}
     if(button.hasAttribute('data-pipeline-zoom')){zoom=pipelineZoom(button.dataset.pipelineZoom==='reset'?1:Math.round((zoom+(button.dataset.pipelineZoom==='in'?.25:-.25))*100)/100);draw();return;}
     if(button.dataset.ciTestPage){testPage=Math.max(0,testPage+(button.dataset.ciTestPage==='next'?1:-1));draw();}
+    if(button.hasAttribute('data-ci-test-repo')){
+      const select=el('[data-ci-repository]'),key=button.dataset.ciTestRepo;
+      const option=[...select.options].find(o=>o.value===key);
+      if(option){
+        const clearing=select.value===option.value;
+        select.value=clearing?'':option.value;select.dispatchEvent(new Event('change',{bubbles:true}));
+        setTimeout(()=>el(`[data-ci-test-repo="${CSS.escape(key)}"]`)?.focus({preventScroll:true}),0);
+      }
+      return;
+    }
+    if(button.hasAttribute('data-ci-investigate')){
+      const action=button.dataset.ciInvestigate;
+      if(action==='clear'){const select=el('[data-ci-repository]');select.value='';select.dispatchEvent(new Event('change',{bubbles:true}));setTimeout(()=>el('[data-ci-test-repo]')?.focus({preventScroll:true}),0);return;}
+      if(action==='runs'){workspace='runs';state.tab='failed';state.page=0;draw();return;}
+      if(action==='failing'||action==='slow'){const sort=el('[data-ob-test-sort]');if(sort){sort.value=action==='slow'?'duration':'failure';sort.dispatchEvent(new Event('change',{bubbles:true}));}}
+      const card=action==='history'?el('#ci-card-history'):el('[data-ob-tests]');
+      if(card){card.scrollIntoView({block:'start',behavior:window.matchMedia?.('(prefers-reduced-motion: reduce)').matches?'auto':'smooth'});card.setAttribute('tabindex','-1');card.focus({preventScroll:true});}
+      return;
+    }
     if(button.dataset.ciFailurePage){failurePage=Math.max(0,failurePage+(button.dataset.ciFailurePage==='next'?1:-1));draw();el(`[data-ci-failure-page="${button.dataset.ciFailurePage}"]`)?.focus();}
     if(button.dataset.tab){state.tab=button.dataset.tab;state.page=0;draw();}
     if(button.dataset.page){state.page+=button.dataset.page==='next'?1:-1;draw();}

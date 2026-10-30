@@ -426,3 +426,23 @@ test('shared selection: last-24-runs exact old run reaches summary, Tests and Ru
  await page.locator('[data-ci-workspace="tests"]').click();
  assert.match(await page.locator('[data-ci-insights]').innerText(),/4 retained runs · 1 test report attempts/);
 },{oldRun:true}));
+
+test('All repositories shows a stacked passed/failed bar per repository; a bar selects it and offers investigation',()=>commandCenter(async({page})=>{
+ await page.locator('[data-ci-workspace="tests"]').click();
+ const row=page.locator('[data-ci-test-repo]').first();
+ await row.waitFor();
+ assert.match(await row.innerText(),/org\/app/);
+ assert.match(await row.innerText(),/[1-9]\d* failed/);
+ assert.ok(await row.locator('.ci-to-fail').count()>0,'failed segment drawn');
+ assert.equal(await page.locator('[data-ci-investigate]').count(),0,'no investigation options before a repository is chosen');
+ await row.click();
+ await page.locator('[data-ci-investigate="failing"]').waitFor();
+ assert.equal(await page.locator('[data-ci-repository]').evaluate(s=>s.selectedOptions[0].textContent.includes('org/app')),true);
+ assert.equal(await page.locator('[data-ci-test-repo]').first().getAttribute('aria-pressed'),'true');
+ await page.locator('[data-ci-investigate="failing"]').click();
+ await page.waitForFunction(()=>document.querySelector('[data-ob-test-sort]').value==='failure');
+ await page.locator('[data-ci-investigate="slow"]').click();
+ await page.waitForFunction(()=>document.querySelector('[data-ob-test-sort]').value==='duration');
+ await page.locator('[data-ci-investigate="clear"]').click();
+ await page.waitForFunction(()=>document.querySelectorAll('[data-ci-investigate]').length===0);
+}));
