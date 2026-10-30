@@ -2081,6 +2081,7 @@ class AssistantService:
         # Set by the control-plane API when project intelligence is enabled: (tenant, user, payload) -> dict.
         self.intelligence_read = None
         self.google_write = None      # (tenant, user, tool_id, payload) -> dict; runs ONLY an approved Google draft/event
+        self.canonical_person = lambda tenant, user: (tenant, user)   # single-operator rule hook (see RakazoBridge.canonical_person); identity until api.py wires it
         self.reminders = None         # ReminderStore, set by the server; reminders need no Google account
         self.google_read = None       # (tenant, user, tool_id, payload) -> dict; set when personal_assistant.apps is set up
         self.lineage_read = None
@@ -4078,7 +4079,8 @@ class AssistantService:
             if self.reminders is None:
                 raise AssistantError("reminders are not enabled")
             try:
-                return run_reminder_tool(self.reminders, tool_id, tenant_id, user_id, payload, self.now(),
+                r_tenant, r_user = self.canonical_person(tenant_id, user_id)   # data key only; the run keeps the real principal
+                return run_reminder_tool(self.reminders, tool_id, r_tenant, r_user, payload, self.now(),
                                          self.config["notifications"]["timezone"])
             except ReminderError as exc:
                 raise AssistantError(str(exc)) from None

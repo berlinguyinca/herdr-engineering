@@ -662,6 +662,7 @@ class RakazoBridge:
         self._by_id = {a.account_id: a for a in self.accounts}
         self._cognito_users: dict[str, str] = {}      # account id -> Cognito username, for pool members who signed in
         self._accounts_lock = threading.Lock()
+        self.single_operator_fn: Callable[[], bool] = lambda: False     # set by api.py: control_plane.single_operator
         self.cognito = cognito_signin or (cognito.CognitoSignIn(config["cognito"]) if config.get("cognito") else None)
         self.tokens = TokenStore(config["token_ttl_days"] * 86400, config["max_tokens"], persistence, clock,
                                  cutoffs={a.account_id: a.tokens_valid_after for a in self.accounts})
@@ -1446,6 +1447,28 @@ class RakazoBridge:
         """Every known account: the configured ones plus any added later (those live only in ``_by_id``)."""
         with self._accounts_lock:
             return list(self._by_id.values())
+
+    def canonical_person(self, tenant: str, user: str) -> tuple[str, str]:
+        """The single-operator rule: in single-operator mode a Rakazo phone account configured in YAML with role
+        ``operator`` is the same human as the dashboard operator (``open-listener``), so its per-person DATA (Google
+        connection, blocked calendars, reminders) is keyed by ``(tenant, open-listener)``. Only the data key changes:
+        approvals, audit and grants keep the real phone principal. Fails closed (returned unchanged) when the server is
+        not in single-operator mode, the tenant is not the dashboard operator's, the account is not a YAML account
+        (Cognito-derived accounts never map, whatever their role), is no longer a member, is not an operator, or on error."""
+        if not isinstance(user, str) or not user.startswith("rakazo:") or not self.single_operator_fn():
+            return tenant, user
+        try:
+            if tenant != self.svc.tenant_for(OPEN_LISTENER_USER):
+                return tenant, user
+            with self._accounts_lock:
+                live = self._by_principal.get(user)
+                configured = next((a for a in self.accounts if a.principal_id == user), None)
+                cognito = configured is not None and configured.account_id in self._cognito_users
+            if configured is not None and live is configured and not cognito and configured.role == "operator":
+                return tenant, OPEN_LISTENER_USER
+        except Exception:  # noqa: BLE001 - never widen access on an error
+            log.warning("rakazo: canonical_person lookup failed; person left unchanged")
+        return tenant, user
 
     def _operator_accounts(self) -> list[Any]:
         """The accounts a board proposal (and, for the open-listener operator, a reminder) is pushed to."""
