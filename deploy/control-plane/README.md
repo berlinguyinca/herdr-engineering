@@ -98,7 +98,7 @@ file is unusable unless `config_failure_mode: last_good` — see "Deployment act
 `max_bytes`, `max_sessions`, `max_total_bytes`, `retention_hours`, `reasoning_role`,
 `sensitive_role`, `store_reasoning`), `inspector_snapshots` (`enabled`, default off;
 `interval_seconds`, default 600, at least 60: the worker keeps a replay snapshot of the inspector so a boot
-replays only newer events instead of every stored one; see "Inspector snapshots" below) and `llm_proxy` (`max_inflight`,
+replays only newer events instead of every stored one; see "Inspector snapshots" below), `artifact_reconcile` (`enabled`, default off; the **worker** runs the artifact registry's idempotent repair pass every `interval_seconds`, default 300, at least 60: orphan blobs are marked after `orphan_ttl_hours` (default 24) and never deleted, expired uploads are closed, tombstones past their hold window are purged; `grace_seconds` default 60, `limit` default 100; it does not re-emit lineage, the worker has no graph emitter) and `llm_proxy` (`max_inflight`,
 `queue_wait_seconds`, `raw_retention_days` (default 14: the web server drops older
 `token_usage` records, in memory and in `fabric_events`), `rollup_retention_days`
 (default 400, reserved for the hourly rollups)). `control_plane.compose` is the mapping `deploy.sh` renders
@@ -739,3 +739,13 @@ For a Rakazo bridge account add `{tenant_id: default, user_id: "rakazo:<id>"}` a
 (`rakazo bridge assistant users: rakazo:...`, no email or secret), and an account must have created an assistant
 (opened the app once) before the watch has an assistant to act for. If `personal_assistant.tenancy.principals` maps the
 user to another tenant, use that tenant; the server logs a warning when the configured tenant disagrees.
+
+**Approving returns at once.** `threads/answer` records the decision and audit under the routes lock and returns
+`{"ok": true, "state": "approved"}` (the card shows "Allowed once", the outcome message says "Running now"); the executor
+(for a CI re-run, a Woodpecker restart that can take seconds) then runs on a daemon thread owned by the desk, at most 4 at a
+time with no queue behind them: a fifth approval while 4 run is refused with 429 before anything is decided. When the
+execution ends the same thread refreshes the journal, so the card turns Executed or Failed and the outcome is posted
+whether or not a stream is open. The executor claims the proposal itself, so a double answer, a racing dashboard approve or
+a late reject still cannot run it twice or after a reject. The board is in memory: a control-plane restart mid-execution
+drops the proposal with the rest of the board (nothing is left "executing"), and the action may or may not have reached
+the CI provider; check the dashboard or CI.

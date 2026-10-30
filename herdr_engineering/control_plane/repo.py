@@ -54,6 +54,7 @@ from .ids import new_id, validate_mission_id
 from .inspector import REQUIRED_DURABLE_KINDS, InspectorStore
 from .mission_activity import MissionActivityStore
 from .redact import redact_payload
+from . import review_refs
 from .service_catalog import (
     INACTIVE,
     capture_service_origin,
@@ -224,6 +225,7 @@ class ControlPlaneRepo:
         self._test_runs = {}
         self._reviews = {}
         self._pull_requests = {}
+        self.pull_request_version = 0      # bumped on every change to a PR record: lets a consumer tell cheaply that nothing moved
         self._stage_runs = {}  # mission_key -> [open+closed stage runs, ...]
         self._token_usage = {}  # request_id -> token usage record (issue #36)
         self._resource_usage = {}  # (mission_id, kind) -> [resource usage record, ...]
@@ -1599,9 +1601,18 @@ class ControlPlaneRepo:
         verdict=None,
         started_at=None,
         completed_at=None,
+        repository=None,
+        pull_request_number=None,
     ):
+        repository = review_refs.repository(repository)
+        pull_request_number = review_refs.pull_request_number(pull_request_number)
         stamp = self._stamp()
         existing = self._reviews.get(review_id)
+        if pull_request_number is not None and not (repository or (existing or {}).get("repository")):
+            raise ValueError("pull_request_number needs the repository it belongs to")
+        if existing is not None:   # before anything is written: a stored reference is never changed or moved
+            repository, pull_request_number = review_refs.keep_reference(
+                existing.get("repository"), existing.get("pull_request_number"), repository, pull_request_number)
         if existing is None:
             rec = {
                 "review_id": review_id,
@@ -1612,6 +1623,8 @@ class ControlPlaneRepo:
                 "verdict": verdict,
                 "started_at": started_at or stamp,
                 "completed_at": completed_at,
+                "repository": repository,
+                "pull_request_number": pull_request_number,
                 "findings": [],
                 "created_at": stamp,
                 "updated_at": stamp,
@@ -1631,6 +1644,8 @@ class ControlPlaneRepo:
                         "verdict",
                         "started_at",
                         "completed_at",
+                        "repository",
+                        "pull_request_number",
                     )
                 },
                 mission_id=mission_id,
@@ -1646,6 +1661,8 @@ class ControlPlaneRepo:
             "verdict": verdict,
             "started_at": started_at,
             "completed_at": completed_at,
+            "repository": repository,
+            "pull_request_number": pull_request_number,
         }.items():
             if v is not None:
                 existing[k] = v
@@ -1663,6 +1680,8 @@ class ControlPlaneRepo:
                     "verdict",
                     "started_at",
                     "completed_at",
+                    "repository",
+                    "pull_request_number",
                 )
             },
             mission_id=existing["mission_id"],
@@ -1727,8 +1746,10 @@ class ControlPlaneRepo:
         created_at=None,
         merged_at=None,
         closed_at=None,
+        ended_source=None,
     ):
         stamp = self._stamp()
+        self.pull_request_version += 1
         existing = self._pull_requests.get(pr_id)
         if existing is None:
             rec = {
@@ -1745,8 +1766,9 @@ class ControlPlaneRepo:
                 "merged_at": None,
                 "closed_at": None,
                 "ended_source": None,
+                "end_count": 0,
             }
-            self._stamp_pr_end(rec, status, merged_at, closed_at, stamp)
+            self._stamp_pr_end(rec, status, merged_at, closed_at, stamp, ended_source)
             self._pull_requests[pr_id] = rec
             self.record_event(
                 "pull_request",
@@ -1766,6 +1788,7 @@ class ControlPlaneRepo:
                         "merged_at",
                         "closed_at",
                         "ended_source",
+                        "end_count",
                     )
                 },
                 mission_id=mission_id,
@@ -1778,7 +1801,7 @@ class ControlPlaneRepo:
         existing.setdefault("merged_at", None)
         existing.setdefault("closed_at", None)
         existing.setdefault("ended_source", None)
-        self._stamp_pr_end(existing, status, merged_at, closed_at, stamp)
+        self._stamp_pr_end(existing, status, merged_at, closed_at, stamp, ended_source)
         for k, v in {
             "mission_id": mission_id,
             "repository": repository,
@@ -1809,6 +1832,7 @@ class ControlPlaneRepo:
                     "merged_at",
                     "closed_at",
                     "ended_source",
+                    "end_count",
                 )
             },
             mission_id=existing["mission_id"],
@@ -1818,11 +1842,15 @@ class ControlPlaneRepo:
         return _copy(existing)
 
     @staticmethod
-    def _stamp_pr_end(rec, status, merged_at, closed_at, stamp):
+    def _stamp_pr_end(rec, status, merged_at, closed_at, stamp, ended_source=None):
         """Keep when a pull request ended. A time the provider reported is kept as given (``ended_source`` "reported");
         otherwise the first moment this server saw the PR merged or closed is used and labelled "observed", which can be
         later than the real merge. A PR that is open again loses its end time; a time already stored is never overwritten
-        by a later observation."""
+        by a later observation. ``end_count`` counts ends (the first, and each after a reopen); a record that predates it but has an
+        end time has ended once. ``ended_source`` is passed only when rebuilding from the durable event log (an ingest request
+        never supplies it), so a restart keeps "observed" times observed."""
+        if (rec.get("merged_at") or rec.get("closed_at")) and not rec.get("end_count"):
+            rec["end_count"] = 1
         if status == "open":
             rec["merged_at"] = rec["closed_at"] = rec["ended_source"] = None
             return
@@ -1832,10 +1860,13 @@ class ControlPlaneRepo:
             except ValueError:
                 return False
         merged_at, closed_at = (merged_at if valid(merged_at) else None), (closed_at if valid(closed_at) else None)
+        if status in ("merged", "closed") and not (rec.get("merged_at") or rec.get("closed_at")):
+            rec["end_count"] = (rec.get("end_count") or 0) + 1      # a new end (the first, or after a reopen), not a corrected time
+        label = "observed" if ended_source == "observed" else "reported"
         if merged_at:
-            rec["merged_at"], rec["ended_source"] = merged_at, "reported"
+            rec["merged_at"], rec["ended_source"] = merged_at, label
         if closed_at:
-            rec["closed_at"], rec["ended_source"] = closed_at, "reported"
+            rec["closed_at"], rec["ended_source"] = closed_at, label
         if status in ("merged", "closed") and not (rec.get("merged_at") or rec.get("closed_at")):
             rec["merged_at" if status == "merged" else "closed_at"] = stamp
             rec["ended_source"] = "observed"
@@ -3472,6 +3503,10 @@ class ControlPlaneRepo:
         self._test_runs = dict(delivery.get("test_runs", {}))
         self._reviews = dict(delivery.get("reviews", {}))
         self._pull_requests = dict(delivery.get("pull_requests", {}))
+        for pull in self._pull_requests.values():      # a record stored before end_count existed has ended once if it has an end time
+            if isinstance(pull, dict) and (pull.get("merged_at") or pull.get("closed_at")) and not pull.get("end_count"):
+                pull["end_count"] = 1
+        self.pull_request_version += 1
         self._token_usage = dict(delivery.get("token_usage", {}))
         self._resource_usage = {tuple(json.loads(k)): [dict(x) for x in v]
                                 for k, v in delivery.get("resource_usage", {}).items()}
@@ -3798,6 +3833,8 @@ class ControlPlaneRepo:
                                     verdict=payload.get("verdict"),
                                     started_at=payload.get("started_at"),
                                     completed_at=payload.get("completed_at"),
+                                    repository=payload.get("repository"),
+                                    pull_request_number=payload.get("pull_request_number"),
                                 )
                         elif entity_type == "pull_request":
                             if event_type == "PullRequestMerged":
@@ -3813,6 +3850,7 @@ class ControlPlaneRepo:
                                 created_at=payload.get("created_at"),
                                 merged_at=payload.get("merged_at"),
                                 closed_at=payload.get("closed_at"),
+                                ended_source=payload.get("ended_source"),
                             )
                     except (ValueError, KeyError, TypeError):  # a bad row never blocks startup
                         continue

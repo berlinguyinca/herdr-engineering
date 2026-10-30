@@ -290,7 +290,7 @@ class ThreadJournal:
         approval, ``run.cancelled`` for a rejection or expiry) and a short outcome message is posted."""
         for card in cards:
             old = self.proposals.get(card["id"])
-            if old is not None and old["state"] == card["state"]:
+            if old is not None and old["state"] == card["state"] and old["outcome"] == card["outcome"]:
                 continue
             first = old is None
             self.proposals[card["id"]] = card
@@ -302,9 +302,10 @@ class ThreadJournal:
                     self._emit("run.waiting_input", now, {"userId": card["user_id"]}, proposal_run_id(card))
             else:
                 self._card_event(card, now, created=False)
-            if card["state"] != "pending" and (first or old["state"] == "pending"):
-                kind = "run.cancelled" if card["state"] in ("rejected", "expired", "withdrawn") else "run.completed"
-                self._emit(kind, now, {}, proposal_run_id(card))
+            if card["state"] != "pending":
+                if first or old["state"] == "pending":       # the run ends once; the outcome text may be updated later
+                    kind = "run.cancelled" if card["state"] in ("rejected", "expired", "withdrawn") else "run.completed"
+                    self._emit(kind, now, {}, proposal_run_id(card))
                 self._text_note(PROPOSAL_OUTCOME_PREFIX + card["id"], card["outcome"], now)
 
     def _card_event(self, card: dict[str, Any], now: datetime, created: bool) -> None:

@@ -48,7 +48,7 @@ def put_fabric(wg, events):
 @pytest.fixture()
 def env(wg):
     wg.run(wg.pool.execute("DELETE FROM fabric_events"))
-    wg.run(wg.pool.execute("DELETE FROM artifact_bindings; DELETE FROM artifact_versions; DELETE FROM artifacts;"))
+    wg.run(wg.pool.execute("TRUNCATE artifact_bindings, artifact_versions, artifacts CASCADE"))
     st = WorkGraphStore(wg.pool)
     return wg, st, PgSources(wg.pool), WorkGraphReconciler(st, PgSources(wg.pool))
 
@@ -171,11 +171,10 @@ def _registry(wg):
         "('art-1','alice','CI report','report','available'), ('art-2','alice','Plan','plan','available'), "
         "('art-3','alice','Loose','other','available')"))
     wg.run(wg.pool.execute(
-        "INSERT INTO artifact_versions (version_id, artifact_id, version_number, state, created_by, created_at, committed_at) VALUES "
-        "('ver-a','art-1',1,'committed','alice','2026-10-01T09:00:00Z','2026-10-01T09:00:00Z'), "
-        "('ver-b','art-1',2,'committed','alice','2026-10-01T10:00:00Z','2026-10-01T10:00:00Z'), "
-        "('ver-c','art-2',1,'committed','alice','2026-10-01T09:30:00Z','2026-10-01T09:30:00Z')"))
-    wg.run(wg.pool.execute("UPDATE artifact_versions SET parent_version_id='ver-a' WHERE version_id='ver-b'"))
+        "INSERT INTO artifact_versions (version_id, artifact_id, version_number, state, created_by, created_at, committed_at, parent_version_id) VALUES "
+        "('ver-a','art-1',1,'committed','alice','2026-10-01T09:00:00Z','2026-10-01T09:00:00Z',NULL), "
+        "('ver-b','art-1',2,'committed','alice','2026-10-01T10:00:00Z','2026-10-01T10:00:00Z','ver-a'), "
+        "('ver-c','art-2',1,'committed','alice','2026-10-01T09:30:00Z','2026-10-01T09:30:00Z',NULL)"))
     wg.run(wg.pool.execute(
         "INSERT INTO artifact_bindings (artifact_id, room_id, issue_ref, created_by) VALUES "
         "('art-1','p1-r0','acme/app#7','alice'), ('art-2','p1-r1',NULL,'alice')"))

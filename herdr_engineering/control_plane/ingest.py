@@ -581,6 +581,8 @@ class IngestService:
             verdict=payload.get("verdict"),
             started_at=payload.get("started_at"),
             completed_at=payload.get("completed_at"),
+            repository=payload.get("repository"),
+            pull_request_number=payload.get("pull_request_number"),
         )
 
     def _ingest_review_finding(self, entity_id, payload, source) -> dict:
