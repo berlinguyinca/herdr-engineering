@@ -300,6 +300,9 @@ def test_fabric_compaction_settings_default_to_off_and_dry_run():
                                                             "archive_retention_days": None}})
     assert on.enabled and not on.dry_run and on.min_age_days == 5.0 and on.archive_retention_days is None
     assert _fabric_compaction_settings({"fabric_compaction": {"enabled": "yes"}}).enabled is False
+    assert (off.chunk_rows, off.chunk_pause_seconds, off.max_pass_seconds) == (5000, 0.25, 300.0)
+    with pytest.raises(SystemExit):
+        _fabric_compaction_settings({"fabric_compaction": {"chunk_rows": 10}})
     with pytest.raises(SystemExit):
         _fabric_compaction_settings({"fabric_compaction": {"min_age_days": 0}})
 

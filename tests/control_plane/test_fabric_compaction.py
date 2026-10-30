@@ -109,6 +109,61 @@ def test_batches_drain_over_several_ticks_and_then_rebuild_the_checkpoint(db):
     assert _projections(recovered) == _projections(expected)
 
 
+def test_small_chunks_move_the_same_rows_and_leave_no_temp_table_or_lock(db):
+    _seed(db)
+    before = _ids(db)
+    settings = CompactionSettings(enabled=True, dry_run=False, rebuild_checkpoint=False, chunk_rows=1,
+                                  chunk_pause_seconds=0)
+    compactor = FabricCompactor(settings, clock=iter(range(0, 10**6, 10**5)).__next__)
+
+    async def go():
+        conn = await asyncpg.connect(db.dsn)
+        other = await asyncpg.connect(db.dsn)
+        try:
+            outcome = await compactor.tick(conn)
+            # the lock and the temp table were released: a second session can take the lock at once
+            free = await other.fetchval("SELECT pg_try_advisory_lock($1)", 0x46414243)
+            temp = await conn.fetchval("SELECT to_regclass('pg_temp.compaction_pending') IS NOT NULL")
+            return outcome, free, temp
+        finally:
+            await conn.close()
+            await other.close()
+    outcome, free, temp = asyncio.run(go())
+    assert outcome.startswith("archived 7 rows") and free and not temp
+    assert _ids(db) | _ids(db, "fabric_events_archive") == before and len(_ids(db, "fabric_events_archive")) == 7
+
+
+def test_the_pass_stops_at_its_time_budget_and_asks_to_come_back(db):
+    _seed(db)
+    pass_times = iter([0.0, 1000.0])                                   # pass start, then past the budget
+    settings = CompactionSettings(enabled=True, dry_run=False, rebuild_checkpoint=False, chunk_rows=2,
+                                  chunk_pause_seconds=0, max_pass_seconds=60)
+    compactor = FabricCompactor(settings, clock=iter(range(0, 10**6, 10**5)).__next__,
+                                pass_clock=lambda: next(pass_times, 1000.0))
+    [outcome] = _run(db, settings, compactor)
+    assert outcome.startswith("archived 2 rows")                       # one chunk, then the budget ended the pass
+    assert compactor._last == 10**5 - settings.interval_seconds + 60.0   # not drained: due again in a minute
+    [rest] = _run(db, settings, compactor)                             # a later pass picks up the remainder
+    assert rest.startswith("archived") and len(_ids(db, "fabric_events_archive")) > 2
+
+
+def test_a_second_compaction_holding_the_lock_makes_this_one_skip(db):
+    _seed(db)
+
+    async def go():
+        holder = await asyncpg.connect(db.dsn)
+        conn = await asyncpg.connect(db.dsn)
+        try:
+            await holder.fetchval("SELECT pg_advisory_lock($1)", 0x46414243)
+            settings = CompactionSettings(enabled=True, dry_run=False, rebuild_checkpoint=False)
+            return await FabricCompactor(settings).tick(conn)
+        finally:
+            await holder.close()
+            await conn.close()
+    assert asyncio.run(go()) == "skipped: another compaction is running"
+    assert not _ids(db, "fabric_events_archive")
+
+
 def test_archive_retention_purges_old_archived_rows(db):
     _seed(db)
     settings = CompactionSettings(enabled=True, dry_run=False, rebuild_checkpoint=False, archive_retention_days=30)

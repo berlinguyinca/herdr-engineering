@@ -75,7 +75,10 @@ candidates. Removed rows are written to `fabric_events_archive` in the same stat
 `archive_retention_days`; copy rows back from there to undo a compaction.
 
 Rollout: apply 0035, set `enabled: true` with `dry_run: true` and read the worker log line
-`fabric compaction dry run: would archive N rows {...}`; set `dry_run: false` only after that. Each tick moves at
-most `batch_rows`. Deleting rows changes the journal a checkpoint covered, so affected streams replay in full until
+`fabric compaction dry run: would archive N rows {...}`; set `dry_run: false` only after that. Each pass scans the journal once
+(read only) into a temp table of at most `batch_rows` event ids, then moves them `chunk_rows` per transaction with
+`chunk_pause_seconds` between chunks, for at most `max_pass_seconds`; a backlog left over is listed again a minute
+later. Chunking keeps ingest writes from queuing behind one huge delete (a single 250,000-row statement stalled the
+control plane for ~8 minutes per batch in October 2026). Deleting rows changes the journal a checkpoint covered, so affected streams replay in full until
 the checkpoint is rebuilt; the job rebuilds it once a drain finishes (`rebuild_checkpoint: false` leaves that to the
 operator, using the builder above).
