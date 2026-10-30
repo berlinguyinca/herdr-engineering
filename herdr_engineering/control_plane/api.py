@@ -294,7 +294,7 @@ class ControlPlaneServer:
                  operator_port=None, operator_user=None, operator_email=None,
                  operator_hosts=(), collab_operator_url=None, collab_dashboard_hosts=(),
                  summary_config=None, summary_client=None, summary_report_config=None, usage_retention=None, lineage_key_scopes=None,
-                 review_quorum=None, system_graph: bool = False, attention=None, ci_fix=None, missions=None, github_pg_dsn=None, ci_log_tests=None,
+                 review_quorum=None, system_graph: bool = False, attention=None, ci_fix=None, missions=None, github_pg_dsn=None, ci_log_tests=None, usage_prices=None,
                  architecture_enabled=None, architecture_explain=None, architecture_options=None,
                  request_workers=128, request_queue=256,
                  assistant_service=None, assistant_config=None, fabric_resolver=None, fabric_services=None, fabric_names=None,
@@ -320,6 +320,8 @@ class ControlPlaneServer:
         from .retention import usage_retention_config
         # control_plane.llm_proxy raw/rollup retention (validated; None = defaults).
         self.usage_retention = usage_retention_config(usage_retention)
+        # control_plane.usage.prices (validated by the caller; empty = no estimate).
+        self.usage_prices = list(usage_prices or [])
         # control_plane.ci_fix (validated; None = defaults, which are disabled: the routes then 404).
         from .ci_fix import CIFixService, ci_fix_config
         self.ci_fix_config = ci_fix_config(ci_fix)
@@ -3191,7 +3193,7 @@ def _make_handler(server, public=False, operator=False):
                     return self._json({"keys": r.list_project_keys()})
                 if what == "models":
                     return self._json({"models": list(r.list_custom_models().values())})
-                if what in ("stats", "timeseries", "errors") and len(parts) == 5:
+                if what in ("stats", "timeseries", "errors", "spend") and len(parts) == 5:
                     return self._llm_stats(what)
                 return self._json({"error": "not found"}, 404)
             if resource == "graph":
@@ -4239,6 +4241,8 @@ def _make_handler(server, public=False, operator=False):
                 if what == "stats":
                     return self._json(server.repo.llm_stats(
                         window, _q(self.path, "group") or "model", **filters))
+                if what == "spend":
+                    return self._json(server.repo.llm_spend(window, server.usage_prices, **filters))
                 if what == "timeseries":
                     return self._json(server.repo.llm_timeseries(
                         window, _q(self.path, "step") or "1h", _q(self.path, "metric") or "requests",

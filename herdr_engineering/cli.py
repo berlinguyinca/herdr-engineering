@@ -3165,6 +3165,11 @@ def _cmd_cp_web(args) -> int:
         usage_retention = usage_retention_config(cp.get("llm_proxy"))
     except ValueError as exc:
         raise SystemExit(f"fleet config {exc}") from None
+    from .control_plane.usage_spend import usage_prices_config
+    try:
+        usage_prices = usage_prices_config(cp.get("usage"))
+    except ValueError as exc:
+        raise SystemExit(f"fleet config {exc}") from None
     from .control_plane.attention_inbox import attention_config
     try:
         attention = attention_config(cp.get("attention"))
@@ -3338,7 +3343,7 @@ def _cmd_cp_web(args) -> int:
                              assistant_config={"personal_assistant": cp["personal_assistant"]}
                                  if isinstance(cp.get("personal_assistant"), dict) else None,
                              review_quorum=_review_quorum_config(cp),
-                             usage_retention=usage_retention, attention=attention,
+                             usage_retention=usage_retention, usage_prices=usage_prices, attention=attention,
                              ci_fix=ci_fix, missions=missions, github_pg_dsn=dsn, ci_log_tests=ci_log_tests,
                              public_port=args.collab_public_port,
                              public_host=args.collab_public_host,
