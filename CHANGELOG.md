@@ -5,6 +5,9 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Rakazo bridge: slow calls are logged
+- A bridge call that takes 300 ms or more logs `rakazo bridge: <procedure> took N ms (status S)` (a warning from 2 s). Only the procedure name and the duration are logged, never bodies, tokens or query strings. A stream's duration is its setup only.
+
 ### Assistant: scheduled CI watch
 - `control_plane.personal_assistant.ci_watch` (YAML, off by default: `enabled`, `interval_seconds` min 60 default 300, `users: [{tenant_id, user_id, assistant_id?}]`, `auto_grant` default false, `source`, `max_age_seconds`, `tick_budget_seconds`) runs `watch_ci` periodically from a deterministic server thread (actor `system:ci_watch`, jittered start, time-budgeted, never raises, stops with the server). Per user it skips quietly when the assistant, project intelligence or scope is missing or the kill switch is on; a missing `watch_ci` grant logs one WARNING per user per hour unless `auto_grant: true`, which creates an audited standing grant.
 - `watch_ci` now also reads failed pipelines from the CI monitor's cached snapshot: the lineage `ci` nodes the deployed flow writes carry no repository or run number, so they could not alert. Only the scheduled runner uses it (the manual/tool path stays lineage-only); scope-filtered before a row cap, finite age bound (unknown time dropped), `killed` is not a failure, one `(repo, run, head)` fingerprint for both sources, at most `max_new_per_tick` (10) new proposals per user per tick, and `auto_grant` never re-creates a revoked grant.

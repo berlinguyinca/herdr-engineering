@@ -43,6 +43,8 @@ from .assistant import (
 from .rakazo_proposals import ProposalDesk
 
 log = logging.getLogger(__name__)
+SLOW_CALL_MS = 300           # a call slower than this is logged (name + duration only)
+VERY_SLOW_CALL_MS = 2000      # ... as a warning
 
 SCRYPT_N, SCRYPT_R, SCRYPT_P, SALT_BYTES, HASH_BYTES = 2 ** 15, 8, 1, 16, 32
 _MAX_N = 2 ** 17                     # 128 MiB: a hash in the YAML cannot make one sign-in allocate more than this
@@ -583,7 +585,19 @@ class RakazoBridge:
         return str(addr)
 
     def handle(self, method: str, path: str, headers: dict[str, str], body: bytes, peer: str) -> BridgeResponse | None:
-        """``headers`` has lower-case names; ``peer`` is the TCP peer address. Never raises."""
+        """``headers`` has lower-case names; ``peer`` is the TCP peer address. Never raises. Slow calls are logged by
+        procedure name and duration only (a stream's duration is just its setup), so a slow screen can be found."""
+        started = time.monotonic()
+        out = self._handle(method, path, headers, body, peer)
+        if out is not None:
+            ms = (time.monotonic() - started) * 1000
+            if ms >= SLOW_CALL_MS:
+                name = re.sub(r"[^A-Za-z0-9/_-]", "", path.split("?", 1)[0].split("/", 2)[-1])[:60]
+                (log.warning if ms >= VERY_SLOW_CALL_MS else log.info)(
+                    "rakazo bridge: %s took %.0f ms (status %s)", name, ms, getattr(out, "status", "?"))
+        return out
+
+    def _handle(self, method: str, path: str, headers: dict[str, str], body: bytes, peer: str) -> BridgeResponse | None:
         path = path.split("?", 1)[0]
         if not self.handles(path):
             return None

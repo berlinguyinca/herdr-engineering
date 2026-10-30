@@ -1197,3 +1197,17 @@ def test_bots_per_account_are_capped_with_a_rakazo_shaped_error(srv):
     assert status == 400 and err["code"] == "BAD_REQUEST" and err["status"] == 400 and str(rb.MAX_BOTS) in err["message"]
     assert len(api.ok("bots/list", token=alice)) == rb.MAX_BOTS
     new_bot(api, bob)                                         # the cap is per account
+
+
+def test_slow_calls_are_logged_by_name_and_duration_only(monkeypatch, caplog):
+    import logging
+
+    from herdr_engineering.control_plane import rakazo_bridge as rb
+    monkeypatch.setattr(rb, "SLOW_CALL_MS", 0)
+    bridge = rb.RakazoBridge.__new__(rb.RakazoBridge)
+    monkeypatch.setattr(rb.RakazoBridge, "_handle", lambda *a, **k: rb.BridgeResponse(200, b"secret-body"))
+    with caplog.at_level(logging.INFO, logger=rb.log.name):
+        bridge.handle("POST", "/rpc/spaces/list?token=abc", {"authorization": "Bearer s3cr3t"}, b'{"x":1}', "1.2.3.4")
+    text = " ".join(r.getMessage() for r in caplog.records)
+    assert "spaces/list took" in text and "status 200" in text
+    assert "s3cr3t" not in text and "secret-body" not in text and "token=abc" not in text
