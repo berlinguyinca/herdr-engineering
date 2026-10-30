@@ -78,7 +78,8 @@ const root = document.getElementById('view');
 const NAV = [
   { group: 'Monitor', path: '/overview', label: 'Overview' },
   { group: 'Monitor', path: '/attention', label: 'Attention', match: ['/activity'] },
-  { group: 'Agents', path: '/herd', label: 'Agents', match: ['/missions', '/handoffs', '/topology'] },
+  { group: 'Agents', path: '/herd', label: 'Agents', match: ['/missions', '/topology'] },
+  { group: 'Agents', path: '/handoffs', label: 'Handoffs' },
   { group: 'Agents', path: '/collab', label: 'Collaboration' },
   { group: 'Agents', path: '/personal-assistant', label: 'Assistant', capability: 'assistant_v1' },
   { group: 'Fabric', path: '/hosts', label: 'Hosts', match: ['/scheduling'] },
@@ -91,10 +92,10 @@ const NAV = [
   { group: 'Code', path: '/artifacts', label: 'Artifacts', match: ['/publications'] },
   { group: 'Code', path: '/intelligence', label: 'Project intelligence', capability: 'project_intelligence_v1' },
 ];
-// Handoffs are the thread through the Agents section: who started whom, and why. Topology is no longer listed (the lineage
+// Handoffs have their own sidebar row: who started whom, and why. Topology is no longer listed (the lineage
 // graph replaces it); its route still answers for old links.
 const SECTION_TABS = [
-  [['/herd', 'Agents'], ['/missions', 'Missions'], ['/handoffs', 'Handoffs']],
+  [['/herd', 'Agents'], ['/missions', 'Missions']],
   [['/attention', 'Attention'], ['/activity', 'Activity']],
   [['/hosts', 'Hosts'], ['/scheduling', 'Scheduling']],
   [['/services', 'Catalog'], ['/fabric-services', 'Fabric'], ['/local-services', 'Local'], ['/system-services', 'System']],

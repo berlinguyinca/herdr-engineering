@@ -11,7 +11,7 @@ test('the sidebar is grouped, merged pages share one link with tabs, and the cur
     await page.goto(`${base}/#/overview`);
     await links(page).first().waitFor({ timeout: 10000 });
     const labels = await links(page).allTextContents();
-    assert.ok(labels.length <= 14, `sidebar has ${labels.length} links: ${labels.join(', ')}`);
+    assert.ok(labels.length <= 15, `sidebar has ${labels.length} links: ${labels.join(', ')}`);
     for (const merged of ['Local services', 'System services', 'Review gate', 'Publications', 'Project boards']) {
       assert.ok(!labels.some((l) => l.startsWith(merged)), `${merged} should be a tab, not a sidebar link`);
     }
@@ -49,7 +49,7 @@ test('with every optional capability advertised the sidebar still fits, and Depl
     for (const optional of ['Assistant', 'Architecture', 'Project intelligence']) {
       assert.ok(labels.some((l) => l.startsWith(optional)), `${optional} is listed: ${labels.join(', ')}`);
     }
-    assert.ok(labels.length <= 14, `sidebar has ${labels.length} links with every capability: ${labels.join(', ')}`);
+    assert.ok(labels.length <= 15, `sidebar has ${labels.length} links with every capability: ${labels.join(', ')}`);
     assert.ok(!labels.some((l) => l.startsWith('Deployments')), 'Deployments is a tab, not a sidebar link');
 
     await page.goto(`${base}/#/deployments`);

@@ -37,3 +37,13 @@ test('a detail route or an optional tab failing never hides its section; only a 
     assert.ok(!(await stored(page)).includes('/hosts'), 'a timeout is transient and marks nothing');
   });
 });
+
+test('Handoffs has its own sidebar row and is no longer a tab of the Agents section', async () => {
+  await withPage(async (page, base) => {
+    await boot(page, base, '/handoffs', () => ({ ...defaults, capabilities: [] }));
+    await until(() => entries(page).then((e) => e.includes('/handoffs')), 'Handoffs listed in the sidebar');
+    assert.equal(await page.locator('#subnav a', { hasText: 'Handoffs' }).count(), 0, 'no Handoffs tab in the Agents strip');
+    await go(page, '#/herd');
+    assert.equal(await page.locator('#subnav a', { hasText: 'Handoffs' }).count(), 0);
+  });
+});
