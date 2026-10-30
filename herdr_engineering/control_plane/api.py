@@ -4488,28 +4488,31 @@ def _make_handler(server, public=False, operator=False):
             trails = server.learning_trails
             if not trails.enabled:
                 return self._json({"error": "learning trails are disabled"}, 404)
+            # The export is fleet-wide (the control plane has no per-project key scope): it needs control_plane.learning.require_role.
+            if server.learning["require_role"] == "operator" and self._role() != "operator":
+                return self._json({"error": "operator role required"}, 403)
             query = parse_qs(urlsplit(self.path).query, keep_blank_values=True)     # a blank value is a bad value, not an absent one
             raw_limit = query.get("limit", [None])[0]
             if raw_limit is not None and not _re.fullmatch(r"[0-9]{1,6}", raw_limit):
                 return self._json({"error": "limit must be a whole number"}, 400)
             try:
-                trails.sweep(force=True)   # cheap when nothing ended; assembles at most sweep_batch records, failures back off for an hour
-            except Exception:  # noqa: BLE001 - an assembly problem must never fail a read
-                pass
-            try:
                 page = trails.export(since=query.get("since", [None])[0], cursor=query.get("cursor", [None])[0],
                                      limit=int(raw_limit) if raw_limit is not None else None)
             except ValueError as exc:
                 return self._json({"error": str(exc)}, 400)
+            trails.trigger_sweep()         # bounded and in the background: a read never waits for a trail build
+            # Records were redacted once, when written; neither form is redacted again, so both carry the same content.
             if not jsonl:
-                return self._json(page)
-            records = [server.ci_fix.redact(rec) if server.ci_fix is not None else rec for rec in page["records"]]
-            payload = "".join(json.dumps(rec, separators=(",", ":")) + "\n" for rec in records).encode()
+                return self._json(page, payload=json.dumps(page).encode())
+            payload = "".join(json.dumps(rec, separators=(",", ":")) + "\n" for rec in page["records"]).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/x-ndjson")
             self.send_header("Cache-Control", "no-store")
             self.send_header("Content-Length", str(len(payload)))
             self.send_header("X-Has-More", "true" if page["has_more"] else "false")
+            if page["truncated_before"]:
+                self.send_header("X-Truncated-Before", page["truncated_before"])
+            self.send_header("X-Cursor-Truncated", "true" if page["cursor_truncated"] else "false")
             if page["next_cursor"]:
                 self.send_header("X-Next-Cursor", page["next_cursor"])
             if self.close_connection:

@@ -858,10 +858,11 @@ def test_evolution_config_is_validated():
             evolution_config(bad)
 
 
-def test_learning_trails_require_a_viewer_key_like_the_other_read_endpoints(fc_server):
+def test_learning_trails_default_to_the_operator_role_and_reject_missing_or_wrong_keys(fc_server):
     port, _, _ = fc_server
     for path in ("/api/v1/learning/trails", "/api/v1/learning/trails.jsonl"):
         assert _fc_req(port, "GET", path)[0] == 401
         assert _fc_req(port, "GET", path, {"X-API-Key": "wrong"})[0] == 401
-        assert _fc_req(port, "GET", path, {"X-API-Key": "viewkey"})[0] == 200
-        assert _fc_req(port, "GET", path + "?limit=0", {"X-API-Key": "viewkey"})[0] == 400
+        assert _fc_req(port, "GET", path, {"X-API-Key": "viewkey"})[0] == 403
+        assert _fc_req(port, "GET", path, {"X-API-Key": "opkey"})[0] == 200
+        assert _fc_req(port, "GET", path + "?limit=0", {"X-API-Key": "opkey"})[0] == 400

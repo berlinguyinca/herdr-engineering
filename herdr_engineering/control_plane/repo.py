@@ -1825,7 +1825,10 @@ class ControlPlaneRepo:
         """Keep when a pull request ended. A time the provider reported is kept as given (``ended_source`` "reported");
         otherwise the first moment this server saw the PR merged or closed is used and labelled "observed", which can be
         later than the real merge. A PR that is open again loses its end time; a time already stored is never overwritten
-        by a later observation."""
+        by a later observation. ``end_count`` counts ends (the first, and each after a reopen); a record that predates it but has an
+        end time has ended once."""
+        if (rec.get("merged_at") or rec.get("closed_at")) and not rec.get("end_count"):
+            rec["end_count"] = 1
         if status == "open":
             rec["merged_at"] = rec["closed_at"] = rec["ended_source"] = None
             return
@@ -3477,6 +3480,9 @@ class ControlPlaneRepo:
         self._test_runs = dict(delivery.get("test_runs", {}))
         self._reviews = dict(delivery.get("reviews", {}))
         self._pull_requests = dict(delivery.get("pull_requests", {}))
+        for pull in self._pull_requests.values():      # a record stored before end_count existed has ended once if it has an end time
+            if isinstance(pull, dict) and (pull.get("merged_at") or pull.get("closed_at")) and not pull.get("end_count"):
+                pull["end_count"] = 1
         self._token_usage = dict(delivery.get("token_usage", {}))
         self._resource_usage = {tuple(json.loads(k)): [dict(x) for x in v]
                                 for k, v in delivery.get("resource_usage", {}).items()}
