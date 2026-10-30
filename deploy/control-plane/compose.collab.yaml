@@ -191,4 +191,11 @@ networks:
     internal: true
   share:
     internal: true
+    # Fixed so the edge can refuse it on the operator listener (8082, no sign-in): share-public shares this
+    # network with collab-edge and must never reach collab_operator by setting Host itself. High in the
+    # daemon's 172.16.0.0/12 pool (allocated bottom-up), next to the host's other fixed 172.31.250.0/29; a
+    # change here must match the `deny` in collab-edge/nginx.conf (a test keeps them in step).
+    ipam:
+      config:
+        - subnet: 172.31.251.0/28
   edge: {}
