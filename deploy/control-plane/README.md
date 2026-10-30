@@ -678,3 +678,64 @@ and its run ends. A request that wants a current view re-reads the board at most
 opened or streamed, not on the lock screen. Proposals live 30 minutes and the board and journal are both in memory, so a control-plane restart drops pending
 proposals (as on the dashboard). Only the first bot's thread carries cards. Approving executes in the request; a slow CI provider can outlast the app's
 8 s timeout, but execution is claimed once, so retrying is safe.
+attachments, memory, routines, skills, connections, bot editing/archiving, spaces other than "Herdr", and ActionBoard
+proposals (those stay on the dashboard). `threads/send` does not deduplicate a retried `clientNonce`.
+
+## Scheduled CI watch (assistant)
+
+`watch_ci` used to run only when the assistant model called it, so a failed CI run went unnoticed unless someone asked.
+`control_plane.personal_assistant.ci_watch` adds a deterministic server-side loop (no model, no routine) that calls it
+every `interval_seconds` (default 300, minimum 60; the first tick is jittered by up to 30 s) as the actor
+`system:ci_watch`. Each NEW failure becomes one `request_ci_repair` and one `ci_rerun` proposal on the intelligence board,
+one assistant `ci_repair` proposal and one dashboard notification; nothing is merged, pushed or restarted without an
+approval, and `project_intelligence.execute` still gates execution. Off unless `enabled: true`.
+
+Failure source. The deployed flow writes lineage `ci` nodes only from the graph merge gate's evidence writer, and those
+nodes carry a commit and a check but no repository or run number, so `watch_ci` could not alert from them. The watch
+therefore also reads the CI monitor's cached snapshot (`source: both`, the default): pipelines whose state is
+failure/error (not killed) with a full `owner/name` repository, with a hex commit, in the user's project scope (checked before the 100-row cap) and finished within `max_age_seconds` (default 6 h; rows with no timestamp are dropped). Only the scheduled runner uses this source: the manual/tool `watch_ci` path stays lineage-only. Both sources share one fingerprint (repo, run, head), so `both` never double-alerts, dedupe and proposal path.
+The repository must also be in `project_intelligence.webhook_projects` and in the user's scope, or the board refuses it
+(reported as a skipped reason, not an error).
+
+Per listed user a tick skips quietly (counted in status) when the assistant is disabled, project intelligence is
+disabled or on kill switch, the user has no `assistant_viewers["<tenant>/<user>"]` entry, or no enabled assistant
+exists (when `assistant_id` is omitted the oldest enabled one is used). A missing `watch_ci` grant logs one WARNING per
+user per hour and does nothing; with `auto_grant: true` the loop creates the standing grant itself (scope `*`, not
+preauthorized, at most `grant_max_ttl_seconds`; re-created, with an `auto_regranted` audit record, only after it EXPIRED. A revoked grant is never re-created: one hourly WARNING, skip reason `grant_revoked`) and writes an audit record
+`assistant.ci_watch.auto_granted` by `system:ci_watch`. One user failing never stops another; a tick has a time budget
+(`tick_budget_seconds`, default 60, also checked per row) and creates at most `max_new_per_tick` (default 10) proposals per user, the rest waiting for the next tick (`skipped_over_limit` in status); the thread stops with the server.
+
+Status: `GET /api/v1/intelligence/status` (operator) carries `ci_watch`: `last_at`, `ticks`, `created` (running total),
+`last_created`, `duplicates`, `skipped` (counts by fixed reason: `no_grant`, `no_scope`, `kill_switch`,
+`intelligence_disabled`, `assistant_disabled`, `no_assistant`, `budget_exceeded`, `error`), `last_error`
+(`user_failed` or `tick_failed`, never exception text) and a per-user result list.
+
+Restarts. Dedupe is by fingerprint over the assistant store. With `personal_assistant.persistence.dsn` set the proposals
+survive a restart and nothing is re-alerted. Without it the store is in memory and a restart can re-alert each current
+failure once. The board proposals themselves live in memory for 30 minutes by design, so a restart (or the lapse) means
+the board entry must be re-requested; the watch only does that for a failure it has not recorded.
+
+Turning it on for the dashboard user (the open tailnet listener is the principal `open-listener`, tenant `default`):
+
+```yaml
+control_plane:
+  personal_assistant:
+    enabled: true
+    ci_watch:
+      enabled: true
+      auto_grant: true          # or grant watch_ci (scope "*") once in the dashboard
+      users:
+        - {tenant_id: default, user_id: open-listener}
+  project_intelligence:
+    enabled: true
+    webhook_projects: {"owner/repo": ["project-id"]}
+    assistant_viewers:
+      "default/open-listener": {org_id: "<org>", projects: "*"}
+```
+
+For a Rakazo bridge account add `{tenant_id: default, user_id: "rakazo:<id>"}` and an `assistant_viewers` entry
+`"default/rakazo:<id>"`. The id is `rakazo:` plus the first 16 hex characters of
+`sha256("rakazo-bridge-account:" + lowercase(strip(email)))`. The server logs the ids at startup
+(`rakazo bridge assistant users: rakazo:...`, no email or secret), and an account must have created an assistant
+(opened the app once) before the watch has an assistant to act for. If `personal_assistant.tenancy.principals` maps the
+user to another tenant, use that tenant; the server logs a warning when the configured tenant disagrees.

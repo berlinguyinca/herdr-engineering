@@ -47,6 +47,7 @@ class IntelligenceRoutes:
         self.ci_rerun_fn = None     # set by the API glue: (repository, run) -> restarts that CI run
         self.poll_status_fn = None  # set by the API glue: () -> {client, last_error} for the PR poller
         self.single_operator_fn = lambda: False   # set by the API glue: the server runs in single-operator mode
+        self.ci_watch_status_fn = None            # set by the server: the scheduled CI watch's last-run summary
         self.last_reconcile: dict | None = None   # counters of the latest pass; a reason when it could not run
         self._executor = None
         self._decide_lock = threading.Lock()    # one decision at a time: approve/reject cannot interleave
@@ -163,6 +164,26 @@ class IntelligenceRoutes:
         viewer = self._viewer_from_entry(entry) if isinstance(entry, dict) else None
         return execute_read(ReadTools(self.store), viewer, payload)
 
+    def assistant_scope_state(self, tenant_id: str, user_id: str) -> str:
+        """Why the assistant CI watch can or cannot act for this user, as a fixed reason: ``ok``,
+        ``intelligence_disabled``, ``kill_switch`` or ``no_scope``. Reads configuration only."""
+        cfg, raw = self._cfg()
+        if not cfg["enabled"]:
+            return "intelligence_disabled"
+        if cfg["kill_switch"]:
+            return "kill_switch"
+        entry = (raw.get("assistant_viewers") or {}).get(f"{tenant_id}/{user_id}")
+        return "ok" if isinstance(entry, dict) and self._viewer_from_entry(entry) is not None else "no_scope"
+
+    def assistant_repo_in_scope(self, tenant_id: str, user_id: str, repo: str) -> bool:
+        """Would ``assistant_ci_repair`` accept this repository for this user? (Same rule, no side effect.)"""
+        cfg, raw = self._cfg()
+        entry = (raw.get("assistant_viewers") or {}).get(f"{tenant_id}/{user_id}")
+        viewer = self._viewer_from_entry(entry) if isinstance(entry, dict) else None
+        mapped = (raw.get("webhook_projects") or {}).get(repo) if isinstance(repo, str) else None
+        return bool(cfg["enabled"] and viewer is not None and isinstance(mapped, list) and mapped
+                    and (viewer.project_ids is None or set(mapped) <= viewer.project_ids))
+
     def assistant_ci_rerun(self, tenant_id: str, user_id: str, payload: dict, idempotency_key: str) -> dict:
         """Same scope rules as ``assistant_ci_repair``, queuing a ``ci_rerun`` proposal (restart that CI run)."""
         return self.assistant_ci_repair(tenant_id, user_id, payload, idempotency_key, action="ci_rerun")
@@ -270,6 +291,8 @@ class IntelligenceRoutes:
                     if self.poll_status_fn is not None:
                         poller.update(self.poll_status_fn())  # fixed reason strings (permission, not_configured ...)
                     out["poller"] = poller
+                    if self.ci_watch_status_fn is not None:
+                        out["ci_watch"] = self.ci_watch_status_fn()   # counts and fixed reasons only
                 return 200, out
             if parts in (["projects"], ["investigations"]):
                 kind = parts[0][:-1] if parts[0] == "projects" else "investigation"

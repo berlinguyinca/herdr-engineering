@@ -38,10 +38,10 @@ from .envelope import EnvelopeConflict
 from .events import SequenceCollision
 from .federation import kind_for_role
 from .graph import read_graph
-from .work_graph_service import handle as work_graph_handle
 from .ingest import INGEST_ENTITY_TYPES
 from .redact import redact_delivery, redact_ingest_body, redact_payload
 from .review_quorum import pr_review_quorum
+from .work_graph_service import handle as work_graph_handle
 
 log = logging.getLogger(__name__)
 
@@ -466,6 +466,8 @@ class ControlPlaneServer:
         # A bad section raises here, so an enabled but malformed bridge stops startup instead of running open.
         from .rakazo_bridge import PostgresTokenPersistence, RakazoBridge, rakazo_bridge_config
         _bridge_cfg = rakazo_bridge_config(rakazo_bridge)
+        if _bridge_cfg["enabled"]:       # the assistant user ids the bridge accounts act as (hashes, no email), for ci_watch.users
+            log.info("rakazo bridge assistant users: %s", ", ".join(a.principal_id for a in _bridge_cfg["accounts"]))
         self.rakazo = (RakazoBridge(_bridge_cfg, self.assistant, version=__version__,
                                     persistence=PostgresTokenPersistence(rakazo_bridge_dsn) if rakazo_bridge_dsn else None)
                        if _bridge_cfg["enabled"] else None)
@@ -638,6 +640,19 @@ class ControlPlaneServer:
             self.assistant.artifact_writer = draft_writer_hook(self)
             self.assistant.ci_board_request = self.intelligence.assistant_ci_repair
             self.assistant.ci_rerun_request = self.intelligence.assistant_ci_rerun
+            self.assistant.ci_repo_scope = self.intelligence.assistant_repo_in_scope
+            self.assistant.ci_snapshot = lambda: self.ci_monitor.snapshot(start=False)   # cache read, no provider call
+            from .assistant import ci_watch_config
+            from .ci_watch import CIWatchRunner
+            _cw = self.assistant.config.get("ci_watch") or ci_watch_config(None)
+            self.ci_watch = CIWatchRunner(self.assistant, self.intelligence.assistant_scope_state, _cw)
+            if _cw["enabled"]:
+                self.intelligence.ci_watch_status_fn = self.ci_watch.status
+                for _u in _cw["users"]:
+                    if _u["tenant_id"] != self.assistant.tenant_for(_u["user_id"]):
+                        log.warning("ci_watch: user %s is in tenant %s per personal_assistant.tenancy, not %s; "
+                                    "the watch will find no assistant for it", _u["user_id"],
+                                    self.assistant.tenant_for(_u["user_id"]), _u["tenant_id"])
             from .assistant_dispatch import DelegationConsumer
             self.delegation_consumer = DelegationConsumer(
                 self.assistant, self.handoffs,
@@ -1462,6 +1477,8 @@ class ControlPlaneServer:
             self._summary_scanner.start()
         self._start_background_thread(self._sweep_loop)
         self._start_background_thread(self._deployments_loop)
+        if getattr(self, "ci_watch", None) is not None and self.ci_watch.config["enabled"]:
+            self._start_background_thread(self.ci_watch.run)
         if self.collab is not None and self.collab.lineage_sink is not None:
             self._start_background_thread(self._link_flush_loop)
         self._ready.set()
@@ -1543,6 +1560,8 @@ class ControlPlaneServer:
         if self.gate_service is not None:
             self.gate_service.stop()
         self._deployments_stop.set()
+        if getattr(self, "ci_watch", None) is not None:
+            self.ci_watch.stop()
         if self._summary_scanner and self._summary_scanner.ident is not None:
             self._summary_scanner.join(timeout=2)
         if self.agent_summaries:
