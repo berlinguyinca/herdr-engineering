@@ -3854,6 +3854,9 @@ def _cmd_relay_status(args):
     left = int(client.state["expires_at"] - time.time())
     print(f"room {client.room_id}, agent {client.agent_id}, can post: {client.can_post}, "
           f"invite expires in {left // 3600} h" if left > 0 else "the invite has expired; ask the room owner for a new one")
+    return 0
+
+
 def _cmd_google_authorize(args):
     """Print Google's consent URL, read back the address the browser ends on, and store the refresh token. Only the two
     read-only scopes are requested. The code, the token and the client secret are never printed."""

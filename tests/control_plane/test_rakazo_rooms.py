@@ -335,3 +335,19 @@ def test_outside_bridges_are_the_apps_messaging_installations_and_can_be_cut_off
     gone = ok(world.api, "messaging/installations/remove", {"id": out["agent_id"]}, world.alice_t)
     validate("messaging/installations/remove", gone)
     assert ok(world.api, "messaging/installations/list", {}, world.alice_t)["installations"] == []
+
+
+def test_a_chat_only_account_neither_sees_nor_answers_proposal_and_steering_cards(world, monkeypatch):
+    from dataclasses import replace
+    req = {"steering_id": "st1", "status": "pending", "action": "pause", "instruction": "Stop", "digest": "dg",
+           "target": {"fence": "fn1"}, "proposed_at": "2026-10-30T10:00:00+00:00"}
+    monkeypatch.setattr(world.s, "list_steering", lambda pr, room, q: {"steering": [req]})
+    monkeypatch.setattr(world.s, "list_proposals", lambda pr, room: {"proposals": [], "enabled": True})
+    bridge = world.server.rakazo
+    acct = next(a for a in bridge._by_id.values() if a.email == "alice@example.com")
+    assert any(m["id"] == "steer:st1" for m in ok(world.api, "threads/get", {"groupId": world.room}, world.alice_t)["messages"])
+    bridge._by_id[acct.account_id] = replace(acct, role="family")
+    snap = ok(world.api, "threads/get", {"groupId": world.room}, world.alice_t)
+    assert not [m for m in snap["messages"] if m["id"].startswith(("steer:", "proposal:"))]
+    assert world.api.rpc("threads/answer", {"groupId": world.room, "messageId": "steer:st1", "answer": "allow"},
+                         world.alice_t)[0] == 404

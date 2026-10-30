@@ -360,8 +360,9 @@ class Rooms:
         msgs = [m for m in (self.message(e, pr.id, tid) for e in events["events"]) if m]
         page = msgs[-MAX_PAGE:]
         older = page[0]["seq"] if page and len(msgs) > len(page) else None
-        page += self.proposal_cards(pr, rid, tid, max(events["next_cursor"], 0))
-        page += self.steering_cards(pr, rid, tid, max(events["next_cursor"], 0))
+        if ctx.account.role == "operator":          # a chat-only account neither sees nor decides proposals or steering
+            page += self.proposal_cards(pr, rid, tid, max(events["next_cursor"], 0))
+            page += self.steering_cards(pr, rid, tid, max(events["next_cursor"], 0))
         return {"threadId": tid, "cursor": events["next_cursor"], "messages": page, "olderCursor": older,
                 "groupId": rid, "groupName": self._pref(ctx, NAME_KIND, rid, room["name"]),
                 "members": self.members(ctx, pr, rid), "run": None, "activeRuns": []}
@@ -427,6 +428,8 @@ class Rooms:
         pr = self.principal(ctx)
         room = self.room(ctx, pr, inp.get("groupId"))
         message_id, answer = inp.get("messageId"), inp.get("answer")
+        if ctx.account.role != "operator":
+            raise self.Error(404, "NOT_FOUND", "Not found.")
         if isinstance(message_id, str) and message_id.startswith(STEER_PREFIX) and not (inp.get("dismiss") or inp.get("fields")):
             return self._answer_steering(pr, room["room_id"], message_id[len(STEER_PREFIX):], answer)
         if not (isinstance(message_id, str) and message_id.startswith(PROPOSAL_PREFIX)) or inp.get("dismiss") or inp.get("fields"):

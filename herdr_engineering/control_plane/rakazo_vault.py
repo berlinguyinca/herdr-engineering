@@ -128,7 +128,7 @@ class Vault:
 
     def reveal(self, ctx, inp):
         self._need()
-        row = self._rows(ctx, self._space(ctx, inp.get("scope")), VAULT_KIND).get(inp.get("name"))
+        row = self._rows(ctx, self._space(ctx, inp.get("scope")), VAULT_KIND).get(inp["name"] if isinstance(inp.get("name"), str) else "")
         if row is None:
             raise self.Error(404, "NOT_FOUND", "Not found.")
         self.b._audit(ctx.account, "rakazo.bridge.vault_reveal")          # who looked, never what
@@ -170,5 +170,5 @@ class Vault:
         return {"id": key, "name": name, "createdAt": meta["createdAt"], "updatedAt": meta["updatedAt"]}
 
     def env_remove(self, ctx, inp):
-        self._wipe(ctx, "-", ENV_KIND, inp.get("id"))
+        self._wipe(ctx, "-", ENV_KIND, inp["id"] if isinstance(inp.get("id"), str) else "")
         return {"ok": True}

@@ -100,3 +100,13 @@ def test_local_accounts_never_go_to_cognito_and_an_outage_is_a_503(make_server):
     assert api.sign_in("alice@example.com", PW_A)[0] == 200 and not calls
     assert api.sign_in("alice@example.com", "wrong")[0] == 401 and not calls
     assert api.sign_in("carol@lab.example", "pw")[0] == 503 and len(calls) == 1
+
+
+def test_a_pool_sign_in_does_not_erase_failed_guesses_at_a_local_password(make_server):
+    server, api = make_server(bridge_section(cognito=CFG))
+    server.rakazo.cognito = signin(lambda *a: tokens())
+    for _ in range(4):
+        assert api.sign_in("alice@example.com", "wrong")[0] == 401
+    assert api.sign_in("carol@lab.example", "pw")[0] == 200       # a pool member from the same address
+    assert api.sign_in("alice@example.com", "wrong")[0] == 401    # the 5th failure still counts ...
+    assert api.sign_in("alice@example.com", PW_A)[0] == 429       # ... so the address is now locked out

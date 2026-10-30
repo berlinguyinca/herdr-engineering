@@ -66,7 +66,8 @@ class BridgeClient:
     def join(cls, base_url: str, code: str, state_path: str | Path, *, harness_type: str = "external-bridge",
              transport: Transport | None = None, clock: Callable[[], float] = time.time) -> BridgeClient:
         base = base_url.rstrip("/")
-        if not base.startswith("https://") and not base.startswith("http://127.0.0.1") and not base.startswith("http://localhost"):
+        parts = urllib.parse.urlsplit(base)
+        if parts.scheme != "https" and not (parts.scheme == "http" and parts.hostname in ("127.0.0.1", "localhost", "::1")):
             raise BridgeError(0, "the control plane URL must be https")
         status, out = (transport or urllib_transport)(
             "POST", base + API + "/agents/join", {"Content-Type": "application/json"},

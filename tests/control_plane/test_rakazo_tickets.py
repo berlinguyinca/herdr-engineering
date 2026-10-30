@@ -81,3 +81,16 @@ def test_onboarding_acknowledgements_and_survey(srv, alice):
         "botId": bot["id"], "provider": "gmail", "connectorId": "composio"}, alice))
     validate("onboarding/signupSurvey", api.ok("onboarding/signupSurvey", {"use": "work", "teamSize": "2-10"}, alice))
     assert rpc(api, "onboarding/signupSurvey", {"use": "nope"}, alice) == 400
+
+
+def test_concurrent_creates_never_share_a_ticket_number(srv, alice):
+    import threading
+    _, api = srv
+    results = []
+
+    def make(i):
+        results.append(api.ok("tickets/create", {"title": f"T{i}", "priority": "normal"}, alice)["number"])
+    threads = [threading.Thread(target=make, args=(i,)) for i in range(8)]
+    [t.start() for t in threads]
+    [t.join() for t in threads]
+    assert sorted(results) == list(range(1, 9))

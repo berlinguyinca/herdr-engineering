@@ -876,8 +876,7 @@ class RakazoBridge:
                 matched = account
         if matched is None and self.cognito is not None and email and password:
             member = self._cognito_account(email, password)
-            if member is not None:
-                self.limiter.success(ip)
+            if member is not None:           # no limiter.success(): it must not erase failed guesses at a local password
                 return self._finish_sign_in(member, ip)
         params = matched.params if matched is not None else self._dummy
         if not self._kdf_slots.acquire(timeout=15):

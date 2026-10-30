@@ -51,11 +51,10 @@ class Relay:
                 log.warning("external bridge: the invite expires within a day; ask the room owner for a new one")
             self._beat = self._clock()
         for event in self.client.events():
+            if event.get("event_type") == "message" and (event.get("sender") or {}).get("id") != self.client.agent_id:
+                self.adapter.send(f"{sender_label(event)}: {event.get('text', '')}")      # a failure here is retried next round
+                moved += 1
             self.client.advance(event["sequence"])
-            if event.get("event_type") != "message" or (event.get("sender") or {}).get("id") == self.client.agent_id:
-                continue
-            self.adapter.send(f"{sender_label(event)}: {event.get('text', '')}")
-            moved += 1
         for msg in self.adapter.poll(poll_timeout):
             if not self.client.can_post:
                 log.warning("external bridge: dropped a %s message, the invite is read-only", self.adapter.name)

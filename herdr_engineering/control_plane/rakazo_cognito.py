@@ -22,7 +22,7 @@ import urllib.request
 from collections.abc import Callable
 from typing import Any
 
-from .collab_cognito import CognitoAuthenticator, boto_group_lookup
+from .collab_cognito import CognitoAuthenticator
 
 log = logging.getLogger("herdr.rakazo.cognito")
 _POOL = re.compile(r"^([a-z]{2}-[a-z]+-\d)_[A-Za-z0-9]+$")
@@ -53,6 +53,24 @@ def cognito_config(raw: Any) -> dict[str, Any] | None:
     if role not in ("family", "operator"):
         raise ValueError(f"{where}.role must be family (chat only, the default) or operator")
     return {"pool_id": pool, "client_ids": tuple(clients), "required_group": group, "group_check": check, "role": role}
+
+
+def boto_member_lookup(pool_id: str, region: str) -> Callable[[str], list[str] | None]:
+    """Group names of an ENABLED pool user, else None. A disabled or deleted user has no groups here, so disabling someone
+    in Cognito ends their app session as removing them from the group does (needs cognito-idp:AdminGetUser and
+    AdminListGroupsForUser)."""
+    import boto3
+    client = boto3.client("cognito-idp", region_name=region)
+
+    def lookup(user: str) -> list[str] | None:
+        try:
+            if not client.admin_get_user(UserPoolId=pool_id, Username=user).get("Enabled", False):
+                return None
+            resp = client.admin_list_groups_for_user(UserPoolId=pool_id, Username=user)
+        except client.exceptions.UserNotFoundException:
+            return None
+        return [g["GroupName"] for g in resp.get("Groups", [])]
+    return lookup
 
 
 class CognitoUnavailable(Exception):
@@ -97,7 +115,7 @@ class CognitoSignIn:
         self.region = _POOL.match(cfg["pool_id"]).group(1)
         lookup = group_lookup
         if lookup is None and cfg["group_check"]:
-            lookup = boto_group_lookup(cfg["pool_id"], self.region)       # ImportError/credential errors fail at startup
+            lookup = boto_member_lookup(cfg["pool_id"], self.region)       # ImportError/credential errors fail at startup
         self.auth = authenticator or CognitoAuthenticator(
             pool_id=cfg["pool_id"], client_ids=list(cfg["client_ids"]), required_group=cfg["required_group"],
             jwks_fetch=jwks_fetch, group_lookup=lookup)

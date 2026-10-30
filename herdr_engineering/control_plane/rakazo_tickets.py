@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import re
 import secrets
+import threading
 from datetime import UTC, datetime
 from typing import Any
 
@@ -27,6 +28,7 @@ class Tickets:
         self.b = bridge
         self.Error = error_type
         self.prefs = bridge.prefs
+        self._create_lock = threading.Lock()
 
     def procs(self) -> dict[str, Any]:
         p = {"boards/list": self.boards_list, "boards/get": self.board_get, "boards/rename": self.board_rename,
@@ -90,9 +92,10 @@ class Tickets:
     def _find(self, ctx, inp):
         rows = self._all(ctx)
         key = inp.get("id") or inp.get("ticketId")
-        if key in rows:
+        if isinstance(key, str) and key in rows:
             return key, rows[key]
-        ref = (inp.get("ref") or "").upper()
+        ref = inp.get("ref")
+        ref = ref.upper() if isinstance(ref, str) else ""
         for k, r in rows.items():
             if ref and f"{r['prefix']}-{r['number']}".upper() == ref:
                 return k, r
@@ -134,13 +137,14 @@ class Tickets:
         assignee = self._assignee(ctx, inp.get("assigneeBotId"))
         if len(self._all(ctx)) >= MAX_TICKETS:
             raise self.Error(400, "BAD_REQUEST", "This board is full.")
-        _, board = self._board(ctx)
-        stamp, key = _now(), "tkt" + secrets.token_hex(8)
-        row = {"number": board["next"], "prefix": board["ticketPrefix"], "title": title, "description": description,
-               "status": "todo", "priority": priority, "assigneeBotId": assignee, "createdAt": stamp, "updatedAt": stamp,
-               "completedAt": None}
-        self.b.prefs_put(ctx.account.account_id, ctx.space, TICKET_KIND, key, row)
-        self.b.prefs_put(ctx.account.account_id, ctx.space, BOARD_KIND, "main", {**board, "next": board["next"] + 1})
+        with self._create_lock:                 # two creates must never read the same next number
+            _, board = self._board(ctx)
+            stamp, key = _now(), "tkt" + secrets.token_hex(8)
+            row = {"number": board["next"], "prefix": board["ticketPrefix"], "title": title, "description": description,
+                   "status": "todo", "priority": priority, "assigneeBotId": assignee, "createdAt": stamp, "updatedAt": stamp,
+                   "completedAt": None}
+            self.b.prefs_put(ctx.account.account_id, ctx.space, BOARD_KIND, "main", {**board, "next": board["next"] + 1})
+            self.b.prefs_put(ctx.account.account_id, ctx.space, TICKET_KIND, key, row)
         return self._view(ctx, key, row)
 
     def _save(self, ctx, key, row):

@@ -8,6 +8,7 @@ reports ``mcpStdioEnabled: false``). "Remove" archives the connector (it is disa
 from __future__ import annotations
 
 import re
+import socket
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -17,6 +18,24 @@ from .assistant import AssistantError
 _TRANSPORTS = ("streamable_http", "sse")
 _HEADER = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]{1,120}\Z")
 MAX_SERVERS = 50
+
+
+
+_resolve = socket.getaddrinfo          # tests replace this: no DNS in a unit test
+
+
+def _public_host(host: str) -> bool:
+    """True only when every address the name resolves to is a public one (no loopback, private, link-local, reserved or
+    multicast). The check runs when a server is saved; the operator's network policy still governs the request itself."""
+    import ipaddress
+    try:
+        addrs = {ipaddress.ip_address(host)}
+    except ValueError:
+        try:
+            addrs = {ipaddress.ip_address(i[4][0]) for i in _resolve(host, 443, proto=socket.IPPROTO_TCP)}
+        except (OSError, ValueError):
+            return False
+    return bool(addrs) and all(a.is_global for a in addrs)
 
 
 class Mcp:
@@ -64,6 +83,8 @@ class Mcp:
         parts = urlsplit(endpoint) if isinstance(endpoint, str) else None
         if parts is None or parts.scheme != "https" or not parts.hostname or parts.username or parts.password:
             raise self.Error(400, "BAD_REQUEST", "The endpoint must be an https address without a login.")
+        if not _public_host(parts.hostname):
+            raise self.Error(400, "BAD_REQUEST", "The endpoint must be a public address, not one on a private network.")
         headers = config.get("headers") or {}
         if (not isinstance(headers, dict) or len(headers) > 16
                 or not all(isinstance(k, str) and _HEADER.match(k) and isinstance(v, str) and len(v) <= 4096

@@ -80,10 +80,12 @@ class Rules:
     def set(self, ctx, inp):
         space = self._space(ctx, inp.get("scope"))
         effect, kind, value = inp.get("effect"), inp.get("matchKind"), inp.get("matchValue")
-        if effect not in ("always_allow", "deny") or kind not in KINDS:
+        if not isinstance(effect, str) or not isinstance(kind, str) or effect not in ("always_allow", "deny") or kind not in KINDS:
             raise self.Error(400, "BAD_REQUEST", "Choose always_allow or deny, for a tool, connector or site.")
         if not isinstance(value, str) or not value.strip() or len(value) > 253:
             raise self.Error(400, "BAD_REQUEST", "matchValue is required.")
+        if effect == "always_allow" and ctx.account.role != "operator":
+            raise self.Error(403, "FORBIDDEN", "Only the operator can skip approvals. A deny rule is always allowed.")
         value = value.strip().lower() if kind == "site" else value.strip()
         rows = self._rows(ctx.account.account_id, space)
         same = next(((k, r) for k, r in rows.items() if (r["matchKind"], r["matchValue"]) == (kind, value)), None)
@@ -96,7 +98,7 @@ class Rules:
 
     def remove(self, ctx, inp):
         space = self._space(ctx, inp.get("scope"))
-        if inp.get("id") not in self._rows(ctx.account.account_id, space):
+        if not isinstance(inp.get("id"), str) or inp["id"] not in self._rows(ctx.account.account_id, space):
             raise self.Error(404, "NOT_FOUND", "Not found.")
         self.b.prefs_put(ctx.account.account_id, space, RULE_KIND, inp["id"], {"removed": _now()})
         return {"ok": True}
@@ -104,11 +106,12 @@ class Rules:
     def preview(self, ctx, inp):
         space = self._space(ctx, inp.get("scope"))
         effect, tools = inp.get("effect"), (inp.get("sample") or {}).get("tools")
-        if effect not in ("always_allow", "deny", "remove") or not isinstance(tools, list) or not tools:
+        if (not isinstance(effect, str) or effect not in ("always_allow", "deny", "remove") or not isinstance(tools, list)
+                or not tools):
             raise self.Error(400, "BAD_REQUEST", "Provide an effect and a sample tool.")
         rows = self._rows(ctx.account.account_id, space)
         current = list(rows.values())
-        if inp.get("id") not in rows:
+        if not isinstance(inp.get("id"), str) or inp["id"] not in rows:
             raise self.Error(404, "NOT_FOUND", "Not found.")
         changed = [r for k, r in rows.items() if k != inp["id"]]
         if effect != "remove":
@@ -131,7 +134,8 @@ class Rules:
             return None
         space_rows = list(self._rows(account.account_id, space).values())
         account_rows = list(self._rows(account.account_id, "-").values())
-        return decide(space_rows, tool_id, scope) or decide(account_rows, tool_id, scope)
+        effect = decide(space_rows, tool_id, scope) or decide(account_rows, tool_id, scope)
+        return None if effect == "always_allow" and account.role != "operator" else effect
 
     # auto review --------------------------------------------------------------------------------------------
     def _review(self, ctx, scope) -> dict[str, Any]:

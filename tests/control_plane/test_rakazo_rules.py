@@ -1,5 +1,7 @@
 # ruff: noqa: F811  (pytest fixtures imported from the bridge suite are re-declared as test arguments)
 """Approval rules and auto review: stored per account/space, enforced through the assistant's rule_policy."""
+import pytest
+
 from herdr_engineering.control_plane import rakazo_rules as rr
 from tests.control_plane.test_rakazo_bridge import alice, make_server, srv  # noqa: F401
 from tests.control_plane.test_rakazo_contract import validate
@@ -82,7 +84,7 @@ def test_policy_deny_beats_a_grant_and_allow_never_creates_one():
     from tests.control_plane.test_assistant_service import make_service
     assert _run(make_service(), "browse", lambda *a: "deny").status == "denied"
     assert _run(make_service(), "browse", lambda *a: "always_allow", grant=False).status == "denied"
-    assert _run(make_service(), "browse", lambda *a: 1 / 0).status in ("authorized", "approved")
+    assert _run(make_service(), "browse", lambda *a: 1 / 0).status == "denied"       # a broken lookup fails closed
 
 
 def test_always_allow_skips_the_prompt_for_a_granted_sensitive_tool():
@@ -95,3 +97,45 @@ def test_always_allow_skips_the_prompt_for_a_granted_sensitive_tool():
     assert _run(make_service(), "delegate", lambda *a: "always_allow").status in ("authorized", "approved")
     with pytest.raises(ApprovalRequired):      # a tool that can never be preauthorized still asks
         _run(make_service(), "send_message", lambda *a: "always_allow")
+
+
+def _make_family(server, email="alice@example.com"):
+    from dataclasses import replace
+    bridge = server.rakazo
+    account = next(a for a in bridge._by_id.values() if a.email == email)
+    bridge._by_id[account.account_id] = replace(account, role="family")
+    bridge._by_principal[account.principal_id] = bridge._by_id[account.account_id]
+    return bridge._by_id[account.account_id]
+
+
+def test_a_family_account_may_deny_but_never_skip_approvals(srv, alice):
+    server, api = srv
+    allow = api.ok("approvalRules/set", {"effect": "always_allow", "matchKind": "tool", "matchValue": "delegate"}, alice)
+    account = _make_family(server)
+    assert api.rpc("approvalRules/set", {"effect": "always_allow", "matchKind": "tool", "matchValue": "edit_shared"}, alice)[0] == 403
+    assert api.ok("approvalRules/set", {"effect": "deny", "matchKind": "tool", "matchValue": "edit_shared"}, alice)["effect"] == "deny"
+    bridge = server.rakazo
+    tenant = bridge.svc.tenant_for(account.principal_id)
+    assert bridge.svc.rule_policy(tenant, account.principal_id, "delegate", "") is None       # an earlier allow no longer counts
+    assert bridge.svc.rule_policy(tenant, account.principal_id, "edit_shared", "") == "deny"
+    assert allow["id"]
+
+
+def test_a_deny_rule_also_stops_the_dry_run_and_an_approved_action_from_running():
+    from herdr_engineering.control_plane.assistant import AssistantForbidden
+    from tests.control_plane.test_assistant_service import make_service
+    svc = make_service()
+    a = svc.create_assistant(tenant_id="t1", user_id="u1", name="Helper")
+    svc.grant_tool(tenant_id="t1", user_id="u1", assistant_id=a.assistant_id, tool_id="browse", scope="*")
+    dry = lambda: svc.dry_run_tool_action(tenant_id="t1", user_id="u1", assistant_id=a.assistant_id,  # noqa: E731
+                                          tool_id="browse", scope="*", request_payload={})
+    assert dry()["granted"] is True
+    t = svc.create_thread(tenant_id="t1", user_id="u1", assistant_id=a.assistant_id)
+    run = svc.send_message(tenant_id="t1", user_id="u1", assistant_id=a.assistant_id, thread_id=t.thread_id, content="hi")
+    action = svc.request_tool_action(tenant_id="t1", user_id="u1", assistant_id=a.assistant_id, tool_id="browse", scope="*",
+                                     run_id=run.run_id, idempotency_key="k1", request_payload={}, actor="u1")
+    assert action.status in ("authorized", "approved")
+    svc.rule_policy = lambda *args: "deny"
+    assert dry()["granted"] is False
+    with pytest.raises(AssistantForbidden, match="deny rule"):
+        svc.execute_approved_action(action.action_id, tenant_id="t1", user_id="u1", actor="u1")

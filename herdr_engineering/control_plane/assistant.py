@@ -2222,6 +2222,25 @@ class AssistantService:
             out["approval_id"] = approval_id
         return out
 
+    def _rule(self, tenant_id: str, user_id: str, tool_id: str, scope: str) -> str | None:
+        """The person's own approval rule for this request: ``deny``, ``always_allow`` or None. A broken lookup fails closed."""
+        if self.rule_policy is None:
+            return None
+        try:
+            return self.rule_policy(tenant_id, user_id, tool_id, scope)
+        except Exception:  # noqa: BLE001 - a broken rule lookup must never loosen policy
+            return "deny"
+
+    def _apply_rule(self, tenant_id, user_id, tool_id, scope, grant, preauthorized):
+        """A rule can refuse a granted tool, or skip the prompt for a tool that is already granted (never for the tools that
+        can never be preauthorized). It never creates a grant."""
+        rule = self._rule(tenant_id, user_id, tool_id, scope)
+        if rule == "deny":
+            return None, preauthorized
+        if rule == "always_allow" and grant is not None and tool_id not in NEVER_PREAUTHORIZED:
+            return grant, True
+        return grant, preauthorized
+
     def dry_run_tool_action(self, *, tenant_id: str, user_id: str, assistant_id: str,
                             tool_id: str, scope: str, request_payload: dict[str, Any]) -> dict[str, Any]:
         """What WOULD happen, without creating an action, an approval or any side effect."""
@@ -2233,6 +2252,7 @@ class AssistantService:
                                    tenant_id=tenant_id, user_id=user_id)
         preauthorized = bool(grant and (grant.constraints or {}).get("preauthorized")
                              and tool_id not in NEVER_PREAUTHORIZED)
+        grant, preauthorized = self._apply_rule(tenant_id, user_id, tool_id, scope, grant, preauthorized)
         return {
             "dry_run": True, "tool_id": tool_id, "scope": scope,
             "description": describe_action(tool_id, scope, request_payload),
@@ -2297,16 +2317,7 @@ class AssistantService:
                                    scope=scope, tenant_id=tenant_id, user_id=user_id)
         preauthorized = bool(grant and (grant.constraints or {}).get("preauthorized")
                              and tool_id not in NEVER_PREAUTHORIZED)
-        rule = None
-        if self.rule_policy is not None:
-            try:
-                rule = self.rule_policy(tenant_id, user_id, tool_id, scope)
-            except Exception:  # noqa: BLE001 - a broken rule lookup must never loosen policy
-                rule = None
-        if rule == "deny":
-            grant = None
-        elif rule == "always_allow" and grant is not None and tool_id not in NEVER_PREAUTHORIZED:
-            preauthorized = True
+        grant, preauthorized = self._apply_rule(tenant_id, user_id, tool_id, scope, grant, preauthorized)
 
         # Reuse identity, but never reuse stale authorization.
         for existing in self.store.actions.values():
@@ -2528,6 +2539,10 @@ class AssistantService:
             raise AssistantError("this action is already running")
         if action.status == "failed":
             raise AssistantError("this action failed earlier and is not retried under the same key")
+        if self._rule(o_tenant, o_user, action.tool_id, action.scope) == "deny":
+            action.status = "denied"
+            self.store.put_action(action)
+            refuse("rule", "a deny rule now covers this tool")
         if action.status not in ("authorized", "approved"):
             refuse("status", f"the action is {action.status}; it has not been approved", AssistantError)
         if action.tool_id not in EXECUTABLE_AFTER_APPROVAL:

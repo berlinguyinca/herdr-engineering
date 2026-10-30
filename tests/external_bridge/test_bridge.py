@@ -170,3 +170,29 @@ def test_the_cli_joins_from_a_code_file_and_reports_status(world, capsys):
     assert "can post: True" in capsys.readouterr().out
     with pytest.raises(BridgeError):                                      # the code is single use
         cli._cmd_relay_join(argparse.Namespace(config=str(cfg), code_file=str(code)))
+
+
+def test_the_control_plane_url_is_judged_by_its_host_not_a_prefix(world):
+    for url in ("http://localhost.evil.example", "http://127.0.0.1.evil.example", "http://example.com", "ftp://x"):
+        with pytest.raises(BridgeError, match="https"):
+            BridgeClient.join(url, "hcj_x", world.tmp / "u.json")
+
+
+def test_a_failed_delivery_to_the_provider_is_retried_not_lost(world):
+    client = join(world)
+    world.s.post_message(world.alice, world.room, {"text": "important", "idempotency_key": "imp"})
+
+    class Flaky(FakeAdapter):
+        fail = True
+
+        def send(self, text):
+            if self.fail:
+                raise RuntimeError("provider down")
+            super().send(text)
+    adapter = Flaky()
+    relay = Relay(client, adapter)
+    with pytest.raises(RuntimeError):
+        relay.step(0)
+    adapter.fail = False
+    relay.step(0)
+    assert adapter.sent == ["user:alice: important"]
