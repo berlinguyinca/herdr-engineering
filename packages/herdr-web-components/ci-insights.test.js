@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {ciInsightsModel,renderCiInsights,filterCiObservations} from '../ci-insights.js';
+import {ciInsightsModel,renderCiInsights,filterCiObservations,ciRunOutcomeOverview} from '../ci-insights.js';
 const now=Date.parse('2026-10-22T12:00:00Z');
 const run=(run_number,state,extra={})=>({repository:'org/app',provider_repo_id:7,branch:'main',run_number,state,created_at:'2026-10-21T12:00:00Z',started_at:'2026-10-21T12:00:00Z',finished_at:'2026-10-21T12:01:00Z',...extra});
 const report=(run_number,total,tests=[],extra={})=>({...run(run_number,'success'),report_id:`r${run_number}`,reported_at:`2026-10-${run_number+18}T12:00:00Z`,summary:{total,passed:total,failed:0,errored:0,skipped:0},tests,...extra});
@@ -111,4 +111,15 @@ test('PR and bucket selection constrain Tests metrics and late report attempts b
  assert.deepEqual(model.pipelines.map(r=>r.run_number),[1]);
  assert.deepEqual(model.reports.map(r=>r.run_number),[1]);
  assert.equal(model.missingReports,0);
+});
+
+test('without test reports the overview counts successful and failed runs per repository and says so',()=>{
+ const run=(repository,run_number,state)=>({repository,provider_repo_id:repository==='org/a'?1:2,run_number,state,created_at:new Date().toISOString(),branch:'main'});
+ const m=ciInsightsModel({pipelines:[run('org/a',1,'success'),run('org/a',2,'failure'),run('org/a',3,'failure'),run('org/b',1,'success'),run('org/b',2,'running')],reports:[]},{});
+ const overview=ciRunOutcomeOverview(m);
+ assert.deepEqual(overview.map(r=>[r.repository,r.passed,r.failed]),[['org/a',1,2],['org/b',1,0]]);
+ const html=renderCiInsights(m,{});
+ assert.match(html,/Runs by repository/);assert.match(html,/No test reports are published yet/);
+ assert.match(html,/data-ci-test-repo="1"/);assert.doesNotMatch(html,/data-ci-investigate/);
+ assert.match(renderCiInsights(m,{selectedRepo:'1'}),/data-ci-investigate="failing"/);
 });
