@@ -76,7 +76,7 @@ def attention_config(raw):
     enabled = raw.get("enabled", True)
     if not isinstance(enabled, bool):
         raise ValueError("control_plane.attention.enabled must be true or false")
-    unknown = sorted(set(raw) - {"enabled", "snooze", "thresholds", "notify", "resolved"})
+    unknown = sorted(set(raw) - {"enabled", "snooze", "thresholds", "notify", "resolved", "expected_offline_hosts"})
     if unknown:
         raise ValueError(f"control_plane.attention has unknown keys: {', '.join(unknown)}")
     snooze = section("snooze", {"min_seconds": 3600, "max_seconds": 604800})
@@ -108,8 +108,14 @@ def attention_config(raw):
     resolved = section("resolved", {"keep_hours": 24, "max_items": 100})
     number("resolved.keep_hours", resolved["keep_hours"], 1)
     number("resolved.max_items", resolved["max_items"], 1, 1000)
+    expected = raw.get("expected_offline_hosts")
+    if expected is None:
+        expected = []
+    if (not isinstance(expected, list) or len(expected) > 200
+            or any(not isinstance(name, str) or not name.strip() or len(name) > 200 for name in expected)):
+        raise ValueError("control_plane.attention.expected_offline_hosts must be a list of host names or ids")
     return {"enabled": enabled, "snooze": snooze, "thresholds": thresholds, "notify": notify,
-            "resolved": resolved}
+            "resolved": resolved, "expected_offline_hosts": [name.strip() for name in expected]}
 
 
 def _norm(value):
@@ -386,14 +392,47 @@ class AttentionInbox:
                                    seen=_epoch(service.get("updated_at")), action="Open service"))
         return items
 
-    def _hosts(self, now):
+    def _expected_off(self, host):
+        """True when the operator listed this host (by id or name, any case) as expected to be offline."""
+        names = {n.lower() for n in self.config["expected_offline_hosts"]}
+        return bool(names) and any(isinstance(v, str) and v.strip().lower() in names
+                                   for v in (host.get("host_id"), host.get("host_name")))
+
+    def _host_down(self, host, now):
+        """"down", "stale" or None for a host that reports fine."""
         limit = float(self.config["thresholds"]["host_stale_seconds"])
+        seen = _epoch(host.get("last_seen") or host.get("updated_at"))
+        if str(host.get("status") or "").lower() in ("unavailable", "offline", "failed"):
+            return "down"
+        return "stale" if seen is None or now - seen > limit else None
+
+    def expected_off(self, now=None):
+        """Listed hosts that are offline right now: shown quietly, never as attention items. A listed host that
+        reports healthy is absent from this list and from the items alike. An unreadable host list gives []:
+        the hosts source already reports itself unavailable."""
+        now = self._now() if now is None else now
+        if not self.config["expected_offline_hosts"]:
+            return []
+        try:
+            hosts = list(self.repo.list_hosts())
+        except Exception:
+            return []
+        out = []
+        for host in hosts:
+            if host.get("host_id") and self._expected_off(host) and (state := self._host_down(host, now)):
+                seen = _epoch(host.get("last_seen") or host.get("updated_at"))
+                out.append({"host_id": host["host_id"], "name": _short(host.get("host_name") or host["host_id"], 120),
+                            "state": state, "last_seen": _iso(seen) if seen is not None else None})
+        return sorted(out, key=lambda h: h["name"].lower())
+
+    def _hosts(self, now):
         items = []
         for host in self.repo.list_hosts():
             hid = host.get("host_id")
             seen = _epoch(host.get("last_seen") or host.get("updated_at"))
-            down = str(host.get("status") or "").lower() in ("unavailable", "offline", "failed")
-            if hid and (down or seen is None or now - seen > limit):
+            state = self._host_down(host, now)
+            down = state == "down"
+            if hid and state and not self._expected_off(host):
                 items.append(_item(f"host:{hid}", "host_stale", "warning", host.get("host_name") or hid,
                                    "No recent healthy host report", f"#/hosts/{_enc(hid)}", "hosts",
                                    "down" if down else "stale", seen=seen, action="Open host"))
@@ -569,7 +608,7 @@ class AttentionInbox:
             capped.append(item)
         body = {"items": capped, "counts": counts, "partial": bool(unavailable), "unavailable": unavailable,
                 "truncated": len(capped) < len(shown), "generated_at": _iso(now),
-                "notify": copy.deepcopy(self.config["notify"])}
+                "notify": copy.deepcopy(self.config["notify"]), "expected_off": self.expected_off(now)}
         if state == "all":
             body["resolved"] = copy.deepcopy(resolved)
         return body
