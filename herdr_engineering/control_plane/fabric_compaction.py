@@ -133,4 +133,6 @@ class FabricCompactor:
             outcome += f", pruned {await rc.prune_checkpoints(conn, self.settings.keep_checkpoints)} old generations"
         except rc.CheckpointBuildInProgress:
             outcome += ", prune deferred"
+        except Exception as exc:    # the rebuild already succeeded: a failed prune retries on the next rebuild
+            outcome += f", prune failed ({type(exc).__name__})"
         return outcome
