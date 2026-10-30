@@ -38,8 +38,9 @@ class Provider:
             raise github_auth.GitHubAuthError(self.error, retry_s=30 if self.error == "rate_limited" else None)
         return "ghs_WRITE" + "w" * 20
 
-    def invalidate(self, owner):
+    def invalidate(self, owner, token=None):
         self.invalidated.append(owner)
+        self.rejected = token
 
 
 def client(provider, routes):
@@ -77,7 +78,7 @@ def test_a_write_uses_the_capability_token_and_a_401_drops_the_owners_cached_tok
     c, opener = client(p, {("PUT", "/repos/acme/widget/pulls/7/merge"): http_error(401)})
     with pytest.raises(GitHubAppError) as exc:
         c.merge_pr(REPO, 7, SHA)
-    assert exc.value.reason == "authentication" and p.invalidated == ["acme"]
+    assert exc.value.reason == "authentication" and p.invalidated == ["acme"] and p.rejected == "ghs_WRITE" + "w" * 20
     assert opener.requests[0].get_header("Authorization") == "Bearer ghs_WRITE" + "w" * 20
 
 

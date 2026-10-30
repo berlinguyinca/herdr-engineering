@@ -349,6 +349,16 @@ def test_invalidate_forces_a_new_token(gh, key_file):
     assert tokens.token_for("InferWeave") != first and len(gh.posts()) == 2
 
 
+def test_invalidate_with_a_token_keeps_a_fresher_cached_token(gh, key_file):
+    gh.token_route(11)
+    tokens = _tokens(gh, key_file)
+    current = tokens.token_for("InferWeave")
+    tokens.invalidate("inferweave", "some-older-rejected-token")
+    assert tokens.token_for("InferWeave") == current and len(gh.posts()) == 1
+    tokens.invalidate("inferweave", current)
+    assert tokens.token_for("InferWeave") != current and len(gh.posts()) == 2
+
+
 def test_a_current_long_installation_token_with_dash_and_dot_is_accepted(gh, key_file):
     # Real GitHub installation tokens are ~390 characters and contain "-" and ".".
     long_token = "ghs_" + "Ab9_-." * 64

@@ -241,14 +241,16 @@ class GitHubAppClient:
         elif not app_auth:
             bearer = self.installation_token()
         ok, payload = self._transport(method, path, body, bearer)
-        bearer = None  # keep credentials out of this frame before any raise
+        rejected, bearer = (bearer if shared_owner is not None else None), None  # keep credentials out of this frame before any raise
         if not ok:
             if payload.status == 401 and not app_auth:
                 if shared_owner is not None:
-                    self._credentials().invalidate(shared_owner)
+                    self._credentials().invalidate(shared_owner, rejected)
                 else:
                     self._token, self._token_expiry = None, 0.0
+            rejected = None
             raise payload
+        rejected = None
         return payload
 
     def _transport(self, method, path, body, bearer):

@@ -410,11 +410,12 @@ class GitHubAppTokens:
         key = (owner, tuple(sorted(perms.items())), repos)
         return self._single_flight(key, lambda: self._mint(owner, dict(perms), repos))
 
-    def invalidate(self, owner) -> None:
-        """Drop every cached token of ``owner`` (call on a 401 from GitHub with one of them)."""
+    def invalidate(self, owner, token=None) -> None:
+        """Drop the cached tokens of ``owner`` (call on a 401 from GitHub). With ``token`` only the entries
+        holding that rejected token go, so a fresher token another thread just minted survives."""
         owner = owner.lower() if isinstance(owner, str) else None
         with self._lock:
-            for key in [k for k in self._tokens if k[0] == owner]:
+            for key in [k for k in self._tokens if k[0] == owner and (token is None or self._tokens[k][0] == token)]:
                 del self._tokens[key]
 
     # -- single flight
@@ -644,7 +645,7 @@ class StaticToken:
     def capability_token_or_raise(self, owner, capability, repositories=None) -> str:
         raise GitHubAuthError("write_disabled")     # write capabilities exist only for a GitHub App
 
-    def invalidate(self, owner=None) -> None:
+    def invalidate(self, owner=None, token=None) -> None:
         return None
 
     def __repr__(self) -> str:
@@ -670,7 +671,7 @@ class NoCredentials:
     def capability_token_or_raise(self, owner, capability, repositories=None) -> str:
         raise GitHubAuthError("write_disabled")
 
-    def invalidate(self, owner=None) -> None:
+    def invalidate(self, owner=None, token=None) -> None:
         return None
 
 

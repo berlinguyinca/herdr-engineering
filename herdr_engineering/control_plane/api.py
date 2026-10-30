@@ -1162,6 +1162,10 @@ class ControlPlaneServer:
         if config.shared_app:
             from .. import github_auth
             app = github_app.GitHubAppClient(None, credentials=github_auth.credentials)   # the fleet's github.app
+            granted = getattr(getattr(github_auth.credentials(), "config", None), "write", ())
+            if config.enabled and "review_gate" not in granted:
+                log.warning("review_gate.app is 'shared' but github.app.write does not list review_gate: "
+                            "statuses, merges and branch updates will be refused (permission)")
         else:
             app = github_app.GitHubAppClient(config.app)  # one client for gate + coordinator
         self.gate_app = app
