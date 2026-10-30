@@ -8,7 +8,7 @@ import pytest
 from herdr_engineering.control_plane import google_workspace as gw
 from herdr_engineering.control_plane.app_credentials import AppsError, CredentialStore, SecretBox
 from herdr_engineering.control_plane.assistant_apps import AppsService
-from herdr_engineering.control_plane.google_oauth import SCOPES
+from herdr_engineering.control_plane.google_oauth import GMAIL_SCOPES, SCOPES
 
 from .test_google_workspace import Google
 
@@ -25,7 +25,7 @@ class Persist:
     def load_connections(self):
         if self.fail_all:
             raise OSError("db down")
-        return [("default", "u1", "google", "u1@x.org", json.dumps(list(SCOPES)), "connected", self.box.seal("r1"), "2026-10-30")]
+        return [("default", "u1", "google", "u1@x.org", json.dumps(list(SCOPES + GMAIL_SCOPES)), "connected", self.box.seal("r1"), "2026-10-30")]
 
     def load_blocked(self):
         if self.fail_blocked or self.fail_all:

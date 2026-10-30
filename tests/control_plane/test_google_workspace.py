@@ -15,7 +15,7 @@ from herdr_engineering.control_plane.assistant import (
     AssistantService,
     assistant_config,
 )
-from herdr_engineering.control_plane.google_oauth import SCOPES
+from herdr_engineering.control_plane.google_oauth import GMAIL_SCOPES, SCOPES
 
 REFRESH = "1//refresh-token-value"
 SECRET = "client-secret-value"
@@ -96,7 +96,7 @@ def store(tmp_path):
     key.write_bytes(os.urandom(32))
     st = CredentialStore(SecretBox(str(key)))
     st.put_client("google", "cid.apps.googleusercontent.com", SECRET)
-    st.put_connection("default", "u1", "google", account="u1@x.org", scopes=list(SCOPES), refresh_token=REFRESH)
+    st.put_connection("default", "u1", "google", account="u1@x.org", scopes=list(SCOPES + GMAIL_SCOPES), refresh_token=REFRESH)
     return st
 
 
@@ -331,3 +331,21 @@ def test_a_stale_revoked_refresh_does_not_mark_a_fresh_reconnect(store):
     with pytest.raises(gw.GoogleError) as exc:
         w.run("default", "u1", "search_email", {"query": "x"})
     assert exc.value.reason == "needs_attention" and store.get_connection("default", "u1", "google").status == "needs_attention"
+
+
+def test_gmail_tools_fail_before_any_request_when_gmail_was_not_granted(store):
+    # The deployment requests only identity + calendar scopes (Gmail is a restricted scope): a connection like that
+    # still serves the calendar, and every Gmail operation is refused locally, without touching Google.
+    store.put_connection("default", "u2", "google", account="u2@x.org", scopes=list(SCOPES), refresh_token=REFRESH)
+    w, g = ws(store)
+    for tool, payload in (("search_email", {"query": "x"}), ("read_email", {"message_id": "m1"})):
+        with pytest.raises(gw.GoogleError) as exc:
+            w.run("default", "u2", tool, payload)
+        assert exc.value.reason == "forbidden"
+    for call in (lambda: w.list_drafts("default", "u2"), lambda: w.delete_draft("default", "u2", "r1"),
+                 lambda: w.create_draft("default", "u2", "a@x.org", "s", "b")):
+        with pytest.raises(gw.GoogleError) as exc:
+            call()
+        assert exc.value.reason == "forbidden"
+    assert g.requests == []
+    assert w.run("default", "u2", "list_calendar_events", {"time_min": "2026-10-31"})["result"]

@@ -1,4 +1,4 @@
-# Connecting the assistant to Google (Gmail and Calendar)
+# Connecting the assistant to Google (Calendar)
 
 The dashboard already contains the whole Google sign-in flow (`/api/v1/assistant-apps/...`). `herdr-eng google` sets it up
 and re-sets it up from a terminal, through those same routes. Nothing about the secret is ever an argument or printed.
@@ -15,13 +15,17 @@ It warns when the downloaded client does not list the redirect URI the dashboard
 
 ## Google Cloud Console (cannot be automated)
 
-1. Enable the Gmail API and the Google Calendar API.
+1. Enable the Google Calendar API.
 2. Credentials: a **Web application** client whose Authorized redirect URI is exactly the one `status` prints
    (`<personal_assistant.apps.redirect_base>/api/v1/assistant-apps/google/callback`).
 3. OAuth consent screen > Audience: while in **Testing**, add each account that will connect under *Test users*, or Google
    refuses the sign-in. Testing mode expires refresh tokens after 7 days: switch to **In production** to keep them.
-4. Google shows "Google hasn't verified this app" for the Gmail scopes until the app is reviewed. For personal use click
-   *Advanced > Go to (app)*; review is not needed under 100 users.
+4. The requested scopes are `openid`, `userinfo.email`, `calendar.readonly` and `calendar.events`. Gmail is deliberately NOT
+   requested: `gmail.readonly` and `gmail.compose` are restricted scopes, which need verification plus a paid annual security
+   assessment. Calendar scopes are "sensitive": verification (homepage, privacy policy, scope justification, demo video) but no
+   assessment. Until verified, Google shows "Google hasn't verified this app".
+5. The Gmail tools stay in the code and answer `forbidden` unless a connection holds the Gmail scopes (see
+   `google_oauth.GMAIL_SCOPES`); the dashboard's Gmail card stays "not connected".
 
 ## Re-configuring
 

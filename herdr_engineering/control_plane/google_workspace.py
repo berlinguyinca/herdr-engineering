@@ -125,6 +125,14 @@ class GoogleWorkspace:
         if conn.status != "connected":
             raise GoogleError("needs_attention")
 
+    def _require_gmail(self, tenant: str, user: str) -> None:
+        """Gmail is a restricted scope this deployment does not request; without it the tools fail here, before any call."""
+        from .google_oauth import GMAIL_SCOPES
+        self._connection(tenant, user)
+        conn = self._store.get_connection(tenant, user, "google")
+        if conn is None or not set(GMAIL_SCOPES) <= set(conn.scopes):
+            raise GoogleError("forbidden")
+
     def invalidate(self, tenant: str, user: str) -> None:
         """Forget this person's cached access token, policy and resolved primary id (reconnect, disconnect, revoke)."""
         with self._lock:
@@ -282,6 +290,7 @@ class GoogleWorkspace:
                 for h in (msg.get("payload") or {}).get("headers") or [] if isinstance(h, dict)}
 
     def search_email(self, tenant: str, user: str, query: str, max_results: int = 5) -> list[dict]:
+        self._require_gmail(tenant, user)
         n = max(1, min(int(max_results), MAX_SEARCH))
         listing = self._get(tenant, user, f"{GMAIL}/messages", {"q": str(query)[:300], "maxResults": n})
         out = []
@@ -296,6 +305,7 @@ class GoogleWorkspace:
         return out
 
     def read_email(self, tenant: str, user: str, message_id: str) -> dict:
+        self._require_gmail(tenant, user)
         if not isinstance(message_id, str) or not _ID.fullmatch(message_id):
             raise GoogleError("bad_request")
         msg = self._get(tenant, user, f"{GMAIL}/messages/{message_id}", {"format": "full"})
@@ -512,6 +522,7 @@ class GoogleWorkspace:
             raise
 
     def create_draft(self, tenant: str, user: str, to: Any, subject: Any, body: Any) -> dict:
+        self._require_gmail(tenant, user)
         """Save a Gmail DRAFT in the person's own account. It is never delivered; the person reviews it in Gmail."""
         from email.message import EmailMessage
         addrs, subj, text = self.validate_draft(to, subject, body)
@@ -529,6 +540,7 @@ class GoogleWorkspace:
         return {"id": did}
 
     def list_drafts(self, tenant: str, user: str, max_results: int = 20) -> list[dict]:
+        self._require_gmail(tenant, user)
         n = max(1, min(int(max_results), 25))
         listing = self._get(tenant, user, f"{GMAIL}/drafts", {"maxResults": n})
         out = []
@@ -545,6 +557,7 @@ class GoogleWorkspace:
         return out
 
     def delete_draft(self, tenant: str, user: str, draft_id: Any) -> dict:
+        self._require_gmail(tenant, user)
         if not isinstance(draft_id, str) or not DRAFT_ID.fullmatch(draft_id):
             raise GoogleError("bad_request")
         self._write(tenant, user, "DELETE", f"{GMAIL}/drafts/{draft_id}")

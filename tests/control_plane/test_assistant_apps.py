@@ -38,8 +38,8 @@ class FakeGoogle:
         self.calls.append((url, req.data))
         if url.endswith("/token"):
             return Resp(self.token)
-        if url.endswith("/profile"):
-            return Resp({"emailAddress": "ann@example.com"})
+        if url.endswith("/userinfo"):
+            return Resp({"email": "ann@example.com", "email_verified": True})
         if url.endswith("/revoke"):
             if self.fail_revoke:
                 raise OSError("down")
@@ -75,7 +75,7 @@ def test_connect_start_url_has_four_scopes_pkce_and_state_and_no_secret(env):
     svc, *_ = env
     url = svc.connect_start("t", "u", "google")
     q = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
-    assert set(q["scope"][0].split()) == set(SCOPES) and len(SCOPES) == 4
+    assert set(q["scope"][0].split()) == set(SCOPES) and len(SCOPES) == 4 and not any('gmail' in x for x in SCOPES)  # Gmail is restricted: not requested
     assert q["code_challenge_method"] == ["S256"] and q["code_challenge"][0] and q["state"][0]
     assert q["redirect_uri"] == ["https://cp.example/api/v1/assistant-apps/google/callback"]
     assert q["client_id"] == ["cid.apps"] and SECRET not in url
@@ -177,7 +177,8 @@ def test_providers_listing_never_contains_secrets(env):
         assert s not in blob
     by = {r["id"]: r for r in rows}
     assert set(by) == {"gmail", "calendar", "github"}
-    assert by["gmail"]["connected"] and by["gmail"]["account"] == "ann@example.com" and by["gmail"]["client_configured"]
+    assert not by["gmail"]["connected"] and by["gmail"]["status"] == "not_connected"     # needs the restricted Gmail scopes
+    assert by["calendar"]["connected"] and by["calendar"]["account"] == "ann@example.com" and by["calendar"]["client_configured"]
     assert not svc.providers("t", "other")[0]["connected"]
 
 
@@ -228,3 +229,10 @@ def test_store_seal_pending_roundtrip_and_not_set_up(env, tmp_path):
     with pytest.raises(AppsError) as e:
         store.open_pending("garbage")
     assert e.value.reason == "unreadable"
+
+
+def test_callback_accepts_googles_short_form_of_the_email_scope(env):
+    svc, store, g, _ = env
+    g.token["scope"] = " ".join("email" if x.endswith("userinfo.email") else x for x in SCOPES)
+    svc.connect_callback("google", {"state": _state(svc.connect_start("t", "u", "google")), "code": "c"})
+    assert store.get_connection("t", "u", "google").account == "ann@example.com"
