@@ -2,6 +2,8 @@ import { escapeHtml as esc } from './herdr-web-components/util.js';
 import { skeleton } from './motion.js';
 import { morph } from './patch.js';
 import { pollWhileVisible } from './refresh-bus.js';
+import { mountSharePanel } from './artifact-share-panel.js';
+import { mountHistory } from './artifact-history.js';
 
 const humanSize = value => {
   const size = Number(value || 0);
@@ -131,7 +133,7 @@ async function renderReportReader(container, client, id, artifact, versions, { v
   const shell = document.createElement('div');
   shell.dataset.artifactDetail = id;
   // The app shell owns the "← Artifacts" back link.
-  shell.innerHTML = '<div data-artifact-header></div><div data-artifact-controls></div><div data-artifact-body><herdr-spinner label="Loading report"></herdr-spinner></div>';
+  shell.innerHTML = '<div data-artifact-header></div><div data-artifact-controls></div><div data-artifact-body><herdr-spinner label="Loading report"></herdr-spinner></div><section class="hd-card" data-artifact-share-card><h2>Share</h2><div data-artifact-share></div></section>';
   container.replaceChildren(shell);
   const header = shell.querySelector('[data-artifact-header]');
   const controls = shell.querySelector('[data-artifact-controls]');
@@ -354,6 +356,9 @@ async function renderReportReader(container, client, id, artifact, versions, { v
 
   // The artifact and its version summaries were read by the caller.
   const errors = [];
+  // The Share card lives outside the per-version body (replaced on every version switch); the route signal disposes it.
+  // Its errors stay inside the card and never reach the route's freshness errors.
+  if (!disposed) mountSharePanel(shell.querySelector('[data-artifact-share]'), client, id, { versions, headVersionId: artifact.current_version_id, signal: outer, allowEntry: false });
   try {
     header.innerHTML = `<h2>${esc(artifact.display_name || artifact.original_filename || id)}</h2><p class="hd-note">Report artifact ${esc(id)}</p>`;
     if (!versions.length) { body.innerHTML = '<p>No immutable report version has been committed yet.</p>'; return { errors }; }
@@ -386,7 +391,7 @@ export async function renderArtifactDetail(container, client, id, { signal, vers
   versionsRead.catch(() => {});
   const mime = artifact.mime_type || 'application/octet-stream';
   const url = client.artifactDownloadUrl(id);
-  container.innerHTML = `<h2>${esc(artifact.display_name || artifact.original_filename || id)}</h2><div class="hd-card"><h2>Preview</h2><div data-artifact-preview>${skeleton('preview', { rows: 1 })}</div></div><div class="hd-card"><dl><dt>Artifact ID</dt><dd><code>${esc(id)}</code></dd><dt>Type</dt><dd>${esc(artifact.artifact_type || 'other')}</dd><dt>MIME</dt><dd>${esc(mime)}</dd><dt>Status</dt><dd>${esc(artifact.status || 'unknown')}</dd><dt>SHA-256</dt><dd><code>${esc(artifact.sha256 || 'versioned blob')}</code></dd></dl></div><div class="hd-card"><h2>Versions</h2><div data-artifact-versions>${skeleton('versions', { rows: 1 })}</div></div><div class="hd-card"><h2>Review</h2><div data-artifact-reviews>${skeleton('reviews', { rows: 1 })}</div></div><div class="hd-card"><h2>Linked to</h2><div data-artifact-links>${skeleton('links', { rows: 1 })}</div></div>`;
+  container.innerHTML = `<h2>${esc(artifact.display_name || artifact.original_filename || id)}</h2><div class="hd-card"><h2>Preview</h2><div data-artifact-preview>${skeleton('preview', { rows: 1 })}</div></div><div class="hd-card"><dl><dt>Artifact ID</dt><dd><code>${esc(id)}</code></dd><dt>Type</dt><dd>${esc(artifact.artifact_type || 'other')}</dd><dt>MIME</dt><dd>${esc(mime)}</dd><dt>Status</dt><dd>${esc(artifact.status || 'unknown')}</dd><dt>SHA-256</dt><dd><code>${esc(artifact.sha256 || 'versioned blob')}</code></dd></dl></div><div class="hd-card"><h2>Versions</h2><div data-artifact-versions>${skeleton('versions', { rows: 1 })}</div></div><div class="hd-card" data-artifact-share-card><h2>Share</h2><div data-artifact-share></div></div><div class="hd-card"><h2>Review</h2><div data-artifact-reviews>${skeleton('reviews', { rows: 1 })}</div></div><div class="hd-card"><h2>Linked to</h2><div data-artifact-links>${skeleton('links', { rows: 1 })}</div></div>`;
   client.artifactLinks(id, { signal: bounded() }).then(({ links }) => {
     const section = container.querySelector('[data-artifact-links]');
     if (!section || signal?.aborted) return;
@@ -405,6 +410,11 @@ export async function renderArtifactDetail(container, client, id, { signal, vers
   if (results[0].status === 'fulfilled' && Array.isArray(results[0].value?.versions) && declaresReport(results[0].value.versions)) {
     return renderReportReader(container, client, id, artifact, results[0].value.versions, { signal, versionId });
   }
+  // Share card: its own list read and errors (kept out of the route's errors); the route signal disposes it.
+  const share = mountSharePanel(container.querySelector('[data-artifact-share]'), client, id, {
+    versions: results[0].status === 'fulfilled' && Array.isArray(results[0].value?.versions) ? results[0].value.versions : [],
+    headVersionId: artifact.current_version_id, signal,
+  });
   // Only a non-report artifact may fetch the download for its preview.
   container.querySelector('[data-artifact-preview]').innerHTML = mime === 'application/pdf' ? `<iframe title="PDF preview" src="${esc(url)}" style="width:100%;min-height:640px;border:0"></iframe>` : mime.startsWith('image/') ? `<img src="${esc(url)}" alt="${esc(artifact.original_filename || id)}" style="max-width:100%;max-height:640px;object-fit:contain">` : mime === 'text/html' ? `<iframe title="HTML preview" sandbox src="${esc(url)}" style="width:100%;min-height:640px;border:0"></iframe>` : mime.startsWith('text/') || mime === 'application/json' ? `<a class="hd-btn" href="${esc(url)}" target="_blank" rel="noopener">Open text artifact</a>` : `<a class="hd-btn" href="${esc(url)}" download>Download artifact</a>`;
   results.push((await Promise.allSettled([reviewsRead]))[0]);
@@ -420,10 +430,14 @@ export async function renderArtifactDetail(container, client, id, { signal, vers
       section.innerHTML = `<herdr-error message="${esc(message)}"></herdr-error><button type="button" data-route-retry>Retry</button>`;
     } else if (!items.length) {
       section.innerHTML = `<herdr-empty message="${key === 'versions' ? 'No version history available' : 'No review requested'}"></herdr-empty>`;
+    } else if (key === 'versions') {
+      // Restore re-reads the list and feeds the Share panel the same versions and head; the route signal disposes both.
+      mountHistory(section, client, id, {
+        versions: items, headVersionId: artifact.current_version_id, canRestore: true, signal,
+        onVersions: (nextVersions, nextHead) => share.setVersions(nextVersions, nextHead),
+      });
     } else {
-      section.innerHTML = `<ul>${items.map(item => key === 'versions'
-        ? `<li><strong>v${esc(item.version_number)}</strong> · ${esc(item.state || 'unknown')} · ${esc(item.version_id)}</li>`
-        : `<li><strong>${esc(item.state)}</strong> · ${esc(item.version_id)} · ${esc(item.reviewer || item.requested_by)}</li>`).join('')}</ul>`;
+      section.innerHTML = `<ul>${items.map(item => `<li><strong>${esc(item.state)}</strong> · ${esc(item.version_id)} · ${esc(item.reviewer || item.requested_by)}</li>`).join('')}</ul>`;
     }
   }
   return { errors };

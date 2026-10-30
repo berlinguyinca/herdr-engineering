@@ -3745,6 +3745,9 @@ def _make_handler(server, public=False, operator=False):
                 body = self._read_json() or {}
                 if "created_by" in body:
                     return self._json({"error": "created_by is derived from authentication"}, 400)
+                forged = sorted({"parent_version_ids", "created_via", "collaborator_agent_id"} & set(body))
+                if forged:   # merge parents and collaborator attribution come only from ArtifactStore.merge_commit
+                    return self._json({"error": f"{', '.join(forged)}: set only by collaboration"}, 400)
                 if body.get("report_descriptor") is not None and any(key in body for key in
                         {"validation", "job_id", "host_id", "agent_id", "session_id", "mission_id"}):
                     return self._json({"error": "report execution validation and context are worker-owned; use report checks for attestations"}, 400)

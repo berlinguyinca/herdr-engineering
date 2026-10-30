@@ -78,6 +78,26 @@ def test_new_version_updates_the_same_node_without_losing_history():
     assert attrs["version_number"] == 4 and attrs["parent_version_id"] == "ver_1"
 
 
+def test_merge_version_emits_a_supersession_edge_per_parent():
+    repo, svc = _world()
+    plain = {k: v for k, v in VERSION.items() if k not in ("session_id", "agent_id", "mission_id")}
+    emit_version_lineage(svc, {**plain, "version_id": "ver_a", "version_number": 1, "parent_version_id": None}, WRITER)
+    emit_version_lineage(svc, {**plain, "version_id": "ver_b", "version_number": 2, "parent_version_id": "ver_a",
+                               "parent_version_ids": ["ver_a"]}, WRITER)
+    merged = {**plain, "version_id": "ver_m", "version_number": 3, "parent_version_id": "ver_b",
+              "parent_version_ids": ["ver_b", "ver_a"]}
+    out = emit_version_lineage(svc, merged, WRITER)
+    assert out["error"] is None
+    view = repo.graph.neighborhood(WRITER, "artifact:art_1@ver_m", depth=1)
+    edges = sorted((e["edge_type"], e["from_id"], e["to_id"]) for e in view["edges"]
+                   if e["from_id"] == "artifact:art_1@ver_m")
+    assert edges == [("supersession", "artifact:art_1@ver_m", "artifact:art_1@ver_a"),
+                     ("supersession", "artifact:art_1@ver_m", "artifact:art_1@ver_b")]
+    before = repo.graph.snapshot()
+    assert emit_version_lineage(svc, merged, WRITER)["error"] is None
+    assert repo.graph.snapshot() == before
+
+
 def test_produced_edge_written_when_producer_node_is_writable():
     repo, svc = _world()
     Feed(svc).node("session:s1", label="S1")             # WRITER owns the producing session

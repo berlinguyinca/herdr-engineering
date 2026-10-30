@@ -143,3 +143,19 @@ def test_materialize_version_rejects_path_escape(tmp_path):
         _run(store.materialize_version(version["version_id"], host_id="host-b",
                                        session_id="session-b", target_dir=tmp_path / "checkout"))
 
+
+
+def test_version_summaries_select_author_and_parent():
+    seen = []
+
+    class _Conn:
+        async def fetch(self, sql, *args):
+            seen.append(sql)
+            return [{"version_id": "v2", "artifact_id": "a", "version_number": 2, "parent_version_id": "v1",
+                     "created_by": "alice", "state": "ready", "created_at": None, "committed_at": None,
+                     "is_report": False}]
+
+    rows = _run(ArtifactStore(_Conn(), _NoopRustFS()).list_version_summaries("a"))
+    select = seen[0].split(" FROM ")[0]
+    assert "created_by" in select and "parent_version_id" in select
+    assert rows[0]["created_by"] == "alice" and rows[0]["parent_version_id"] == "v1"
