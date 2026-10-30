@@ -299,3 +299,23 @@ def test_steering_requests_are_cards_that_an_owner_can_confirm_or_decline(world,
                          world.alice_t)[0] == 400
     assert world.api.rpc("threads/answer", {"groupId": world.room, "messageId": "steer:nope", "answer": "allow"},
                          world.alice_t)[0] == 404
+
+
+def test_auto_join_adds_own_agents_to_listed_rooms_only_when_the_operator_opts_in(world):
+    from herdr_engineering.control_plane.rakazo_bridge import rakazo_bridge_config
+    agent, info = world.agent("alice", name="newcomer", room=world.room2)
+
+    def members():
+        groups = ok(world.api, "groups/list", {}, world.alice_t)
+        return {g["id"]: {m["botId"] for m in g["members"] if m.get("botId")} for g in groups}
+    assert info["agent_id"] not in members().get(world.room, set())        # off by default
+    bridge = world.server.rakazo
+    bridge.auto_join_rooms = (world.room,)
+    joined = members()
+    assert info["agent_id"] in joined[world.room]
+    bridge.auto_join_rooms = ()
+    cfg = rakazo_bridge_config(bridge_section(accounts=[ACCOUNTS[0]], auto_join_rooms=[world.room]))
+    assert cfg["auto_join_rooms"] == (world.room,)
+    for bad in ("room", [1], ["x"] * 51, [""]):
+        with pytest.raises(ValueError, match="auto_join_rooms"):
+            rakazo_bridge_config(bridge_section(accounts=[ACCOUNTS[0]], auto_join_rooms=bad))

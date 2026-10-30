@@ -190,8 +190,29 @@ class Rooms:
         raise self.Error(404, "NOT_FOUND", "Not found.")
 
     # group procedures ---------------------------------------------------------------------------------------
+    def auto_join(self, ctx, pr) -> None:
+        """Operator opt-in (``rakazo_bridge.auto_join_rooms``): the person's own active agents are added to those rooms with
+        chat rights only, so a new agent shows up there without a tap. A room the person is not in is skipped; failures
+        never break the listing."""
+        wanted = set(getattr(self.b, "auto_join_rooms", ()))
+        if not wanted:
+            return
+        try:
+            mine = [a["agent_id"] for a in self.my_agents(ctx, pr)]
+            for room in self.call(self.collab.list_rooms, pr)["rooms"][:MAX_ROOMS]:
+                if room["room_id"] not in wanted:
+                    continue
+                have = {a["agent_id"] for a in self.call(self.collab.list_room_agents, pr, room["room_id"])["agents"]}
+                for bot_id in mine:
+                    if bot_id not in have:
+                        self.call(self.collab.grant_agent, pr, room["room_id"], {"agent_id": bot_id, "actions": CHAT_ACTIONS})
+        except Exception:  # noqa: BLE001 - best effort; the explicit group procedures remain the source of truth
+            return
+
     def groups_list(self, ctx, inp):
         pr = self.principal(ctx, required=False)
+        if pr is not None:
+            self.auto_join(ctx, pr)
         return [] if pr is None else [self.group_view(ctx, pr, r) for r in self.my_rooms(ctx, pr, archived=False)]
 
     def groups_list_archived(self, ctx, inp):

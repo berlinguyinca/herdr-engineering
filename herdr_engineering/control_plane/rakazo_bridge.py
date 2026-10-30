@@ -168,7 +168,7 @@ def rakazo_bridge_config(raw: Any, now: float | None = None) -> dict[str, Any]:
         return {"enabled": False}
     now = time.time() if now is None else now
     unknown = sorted(set(raw) - {"enabled", "accounts", "token_ttl_days", "max_tokens", "trusted_proxies",
-                                 "routine_runner_seconds", "hindsight", "vault_key_file"})
+                                 "routine_runner_seconds", "hindsight", "vault_key_file", "auto_join_rooms"})
     if unknown:
         raise ValueError(f"control_plane.rakazo_bridge has unknown keys: {', '.join(map(str, unknown))} "
                          "(accounts are listed under accounts: [{email, password_scrypt, role}])")
@@ -180,6 +180,10 @@ def rakazo_bridge_config(raw: Any, now: float | None = None) -> dict[str, Any]:
         return value
 
     runner = bounded("routine_runner_seconds", 0, 0, 3600)          # 0 = routines run only when tested from the app
+    auto_join = raw.get("auto_join_rooms", [])
+    if (not isinstance(auto_join, list) or len(auto_join) > 50
+            or not all(isinstance(r, str) and 0 < len(r) <= 200 for r in auto_join)):
+        raise ValueError("control_plane.rakazo_bridge.auto_join_rooms must be a list of up to 50 room ids")
     vault_key_file = raw.get("vault_key_file")
     if vault_key_file is not None and (not isinstance(vault_key_file, str) or not vault_key_file):
         raise ValueError("control_plane.rakazo_bridge.vault_key_file must be a file path")
@@ -227,7 +231,7 @@ def rakazo_bridge_config(raw: Any, now: float | None = None) -> dict[str, Any]:
         accounts.append(Account(account_id, email_n, f"rakazo:{account_id}", role, params, cutoff, link))
     return {"enabled": True, "token_ttl_days": ttl_days, "max_tokens": max_tokens, "accounts": accounts,
             "trusted_proxies": tuple(nets), "routine_runner_seconds": runner, "hindsight": hindsight,
-            "vault_key_file": vault_key_file}
+            "vault_key_file": vault_key_file, "auto_join_rooms": tuple(auto_join)}
 
 
 # --------------------------------------------------------------------------------------------- tokens
@@ -645,6 +649,7 @@ class RakazoBridge:
             "spaceSettings/setOverride": self._space_set_override, "notifications/registerPush": self._register_push,
             "notifications/unregisterPush": self._ok, "analytics/screen": self._ok,
         }
+        self.auto_join_rooms = tuple(config.get("auto_join_rooms", ()))
         self.rooms = rooms.Rooms(self, BridgeError)
         self._procs.update(self.rooms.procs())
         self.max_bots = MAX_BOTS

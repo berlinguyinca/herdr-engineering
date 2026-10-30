@@ -140,3 +140,10 @@ different owner than the proposer unless the operator allows self-confirm); Decl
 not read or confirm steering sees no cards or gets the collaboration service's refusal. The instruction is untrusted text and is
 only shown as a snippet. Auto-sync of running agents into rooms stays an explicit action by design: your own agents already
 appear live as bots, but adding one to a room is a permission grant.
+
+### Update 8
+
+Auto-join, as an operator opt-in. `control_plane.rakazo_bridge.auto_join_rooms: [room_id, ...]` (YAML only, empty by
+default, at most 50) makes `groups/list` add the signed-in person's own active agents to those rooms they already belong to,
+with chat rights only (`read`, `post`), through the normal `grant_agent` path (so room roles, the agent ceiling and approvals
+still apply). It is best effort and never breaks the listing. The grant stays a deliberate operator decision rather than a default.
