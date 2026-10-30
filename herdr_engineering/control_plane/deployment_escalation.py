@@ -759,7 +759,8 @@ class GitHubIssueSink:
     """``create_issue(repo, title, body, key, *, timeout)`` over the GitHub REST API with the
     GitHub App's ``escalations`` write capability (``github.app.write``) when enabled, else the
     server-held ``github.token`` (no gh CLI). An enabled capability that cannot mint a token fails
-    closed: it never falls back to the PAT. No redirects, bounded read, the token never in an error.
+    closed: it never falls back to the PAT. To stop escalation writes remove ``github.token`` as well as
+    the capability: the PAT remains the fallback while it is configured. The result names the credential. No redirects, bounded read, the token never in an error.
     Wired only with ``control_plane.deployment_escalation.issues: true``."""
 
     MAX_RESPONSE = 256 * 1024
@@ -802,6 +803,7 @@ class GitHubIssueSink:
         if not isinstance(repo, str) or not _REPO.fullmatch(repo):
             raise IssueRefused("invalid repository")
         token, app = self._app_token(repo)
+        source = "github_app" if token is not None else "github_token"
         if token is None:
             token = self._token_value()
         request = urllib.request.Request(
@@ -825,7 +827,7 @@ class GitHubIssueSink:
         if len(raw) > self.MAX_RESPONSE:
             raise RuntimeError("issue response too large")
         data = json.loads(raw)
-        return {"url": data.get("html_url"), "number": data.get("number")}
+        return {"url": data.get("html_url"), "number": data.get("number"), "credential": source}
 
 
 # -------------------------------------------------------------- attention

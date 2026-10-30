@@ -501,7 +501,7 @@ def test_the_github_sink_posts_to_the_rest_api():
     opener = Opener()
     sink = GitHubIssueSink(token="placeholder-token", opener=opener)
     out = sink(REPO, "title", "body", "k", timeout=5)
-    assert out == {"url": f"https://github.com/{REPO}/issues/9", "number": 9}
+    assert out == {"url": f"https://github.com/{REPO}/issues/9", "number": 9, "credential": "github_token"}
     request, timeout = opener.requests[0]
     assert request.full_url == f"https://api.github.com/repos/{REPO}/issues" and timeout == 5
     assert request.get_method() == "POST"
@@ -822,7 +822,8 @@ class _AppCreds:
 def test_issue_sink_prefers_the_app_escalations_capability():
     opener = Opener()
     creds = _AppCreds()
-    GitHubIssueSink(opener=opener, credentials=lambda: creds)(REPO, "t", "b", "k")
+    out = GitHubIssueSink(opener=opener, credentials=lambda: creds)(REPO, "t", "b", "k")
+    assert out["credential"] == "github_app"
     assert creds.asked == [(REPO.split("/")[0], "escalations", [REPO.split("/")[1]])]
     assert opener.requests[0][0].headers["Authorization"] == "Bearer app-installation-token"
 
