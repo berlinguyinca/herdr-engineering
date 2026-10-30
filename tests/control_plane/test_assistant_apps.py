@@ -75,7 +75,7 @@ def test_connect_start_url_has_four_scopes_pkce_and_state_and_no_secret(env):
     svc, *_ = env
     url = svc.connect_start("t", "u", "google")
     q = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
-    assert set(q["scope"][0].split()) == set(SCOPES) and len(SCOPES) == 4 and not any('gmail' in x for x in SCOPES)  # Gmail is restricted: not requested
+    assert set(q["scope"][0].split()) == set(SCOPES) and len(SCOPES) == 6 and any('gmail.compose' in x for x in SCOPES)
     assert q["code_challenge_method"] == ["S256"] and q["code_challenge"][0] and q["state"][0]
     assert q["redirect_uri"] == ["https://cp.example/api/v1/assistant-apps/google/callback"]
     assert q["client_id"] == ["cid.apps"] and SECRET not in url
@@ -177,7 +177,7 @@ def test_providers_listing_never_contains_secrets(env):
         assert s not in blob
     by = {r["id"]: r for r in rows}
     assert set(by) == {"gmail", "calendar", "github"}
-    assert not by["gmail"]["connected"] and by["gmail"]["status"] == "not_connected"     # needs the restricted Gmail scopes
+    assert by["gmail"]["connected"] and by["gmail"]["account"] == "ann@example.com"
     assert by["calendar"]["connected"] and by["calendar"]["account"] == "ann@example.com" and by["calendar"]["client_configured"]
     assert not svc.providers("t", "other")[0]["connected"]
 
@@ -236,3 +236,12 @@ def test_callback_accepts_googles_short_form_of_the_email_scope(env):
     g.token["scope"] = " ".join("email" if x.endswith("userinfo.email") else x for x in SCOPES)
     svc.connect_callback("google", {"state": _state(svc.connect_start("t", "u", "google")), "code": "c"})
     assert store.get_connection("t", "u", "google").account == "ann@example.com"
+
+
+def test_a_connection_without_the_gmail_scopes_shows_gmail_as_not_connected(env):
+    svc, store, g, _ = env
+    store.put_connection("t", "u", "google", account="ann@example.com", scopes=[x for x in SCOPES if "gmail" not in x],
+                         refresh_token=REFRESH)
+    by = {p["id"]: p for p in svc.providers("t", "u")}
+    assert not by["gmail"]["connected"] and by["gmail"]["status"] == "not_connected" and by["gmail"]["account"] == ""
+    assert by["calendar"]["connected"]

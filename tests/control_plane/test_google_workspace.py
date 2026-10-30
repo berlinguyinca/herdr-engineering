@@ -336,7 +336,8 @@ def test_a_stale_revoked_refresh_does_not_mark_a_fresh_reconnect(store):
 def test_gmail_tools_fail_before_any_request_when_gmail_was_not_granted(store):
     # The deployment requests only identity + calendar scopes (Gmail is a restricted scope): a connection like that
     # still serves the calendar, and every Gmail operation is refused locally, without touching Google.
-    store.put_connection("default", "u2", "google", account="u2@x.org", scopes=list(SCOPES), refresh_token=REFRESH)
+    narrow = [x for x in SCOPES if "gmail" not in x]
+    store.put_connection("default", "u2", "google", account="u2@x.org", scopes=narrow, refresh_token=REFRESH)
     w, g = ws(store)
     for tool, payload in (("search_email", {"query": "x"}), ("read_email", {"message_id": "m1"})):
         with pytest.raises(gw.GoogleError) as exc:
@@ -349,3 +350,59 @@ def test_gmail_tools_fail_before_any_request_when_gmail_was_not_granted(store):
         assert exc.value.reason == "forbidden"
     assert g.requests == []
     assert w.run("default", "u2", "list_calendar_events", {"time_min": "2026-10-31"})["result"]
+
+
+class SendGoogle(Google):
+    """The Google double, plus the one write the send path makes."""
+    def __call__(self, req, timeout):
+        if req.full_url == f"{gw.GMAIL}/messages/send":
+            self.requests.append(("POST", req.full_url, req.data))
+            return Resp({"id": "sent1", "threadId": "t9"})
+        return super().__call__(req, timeout)
+
+
+def test_send_email_delivers_one_validated_reply_in_its_thread(store):
+    import base64
+    import email
+    g = SendGoogle()
+    w = gw.GoogleWorkspace(store, opener=g)
+    out = w.write("default", "u1", "send_email", {"to": "a@x.org, b@x.org", "subject": "Re: Lunch", "body": "Yes, noon.",
+                                                  "thread_id": "t9", "in_reply_to": "<abc@mail.x.org>"})
+    assert out["sent"] == {"id": "sent1", "thread_id": "t9"}
+    [(method, url, data)] = [r for r in g.requests if r[1].endswith("/messages/send")]
+    body = json.loads(data)
+    assert body["threadId"] == "t9"
+    msg = email.message_from_bytes(base64.urlsafe_b64decode(body["raw"]))
+    assert msg["To"] == "a@x.org, b@x.org" and msg["In-Reply-To"] == "<abc@mail.x.org>" and msg["References"] == "<abc@mail.x.org>"
+    assert msg.get_payload().strip() == "Yes, noon."
+
+
+@pytest.mark.parametrize("bad", [
+    {"to": "nobody", "subject": "s", "body": "b"},
+    {"to": "a@x.org", "subject": "s\r\nBcc: evil@x.org", "body": "b"},                       # header injection
+    {"to": "a@x.org", "subject": "s", "body": "b", "in_reply_to": "<a@x>\r\nBcc: evil@x.org"},
+    {"to": "a@x.org", "subject": "s", "body": "b", "thread_id": "../x"},
+    {"to": "a@x.org", "subject": "s", "body": "x" * 801},
+])
+def test_send_email_refuses_invalid_content_before_any_request(store, bad):
+    g = SendGoogle()
+    w = gw.GoogleWorkspace(store, opener=g)
+    with pytest.raises(gw.GoogleError):
+        gw.validate_write("send_email", bad)
+    with pytest.raises(gw.GoogleError):
+        w.write("default", "u1", "send_email", bad)
+    assert g.requests == []
+
+
+def test_a_read_tool_cannot_send_and_send_needs_the_gmail_scopes(store):
+    narrow = [x for x in SCOPES if "gmail" not in x]
+    store.put_connection("default", "u2", "google", account="u2@x.org", scopes=narrow, refresh_token=REFRESH)
+    g = SendGoogle()
+    w = gw.GoogleWorkspace(store, opener=g)
+    with pytest.raises(gw.GoogleError) as exc:
+        w.run("default", "u1", "send_email", {"to": "a@x.org", "subject": "s", "body": "b"})
+    assert exc.value.reason == "bad_request"
+    with pytest.raises(gw.GoogleError) as exc:
+        w.write("default", "u2", "send_email", {"to": "a@x.org", "subject": "s", "body": "b"})
+    assert exc.value.reason == "forbidden"
+    assert g.requests == []

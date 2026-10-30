@@ -20,14 +20,14 @@ TIMEOUT = 20
 
 CONSOLE_STEPS = (
     "Google Cloud Console (console.cloud.google.com), the project that owns the OAuth client:",
-    "  1. APIs & Services > Library: enable the Google Calendar API (Gmail is not requested).",
+    "  1. APIs & Services > Library: enable the Gmail API and the Google Calendar API.",
     "  2. APIs & Services > Credentials: the client type is 'Web application' and 'Authorized redirect URIs' lists exactly:",
     "       {redirect}",
-    "  3. OAuth consent screen > Data Access: the scopes are exactly openid, .../auth/userinfo.email,",
-    "     .../auth/calendar.readonly and .../auth/calendar.events (calendar is 'sensitive': verification, no paid assessment).",
-    "     Audience: add every Google account that will connect under 'Test users' (while Testing).",
-    "     Testing mode expires refresh tokens after 7 days: set the publishing status to 'In production' to keep them.",
-    "     Google still shows 'Google hasn't verified this app' (click Advanced > Go to <app>); personal use needs no review.",
+    "  3. OAuth consent screen > Data Access: the scopes are openid, .../auth/userinfo.email, .../auth/calendar.readonly,",
+    "     .../auth/calendar.events, .../auth/gmail.readonly and .../auth/gmail.compose (compose also allows sending).",
+    "     Audience: add the Google account that will connect under 'Test users', then set the publishing status to",
+    "     'In production' (Testing expires refresh tokens after 7 days). Do NOT submit for verification: the app stays",
+    "     unverified (up to 100 users), so Google shows 'Google hasn't verified this app' once: Advanced > Go to <app>.",
     "  4. herdr-eng google set-client --json-file ~/Downloads/client_secret_....json   (Credentials > Download JSON)",
     "  5. herdr-eng google connect   and open the printed link in a browser on the tailnet.",
 )

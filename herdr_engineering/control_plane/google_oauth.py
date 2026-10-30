@@ -29,13 +29,13 @@ def default_opener(req, timeout):
 
 __all__ = ["SCOPES", "GMAIL_SCOPES", "CALENDAR_SCOPES", "IDENTITY_SCOPES", "normalize_scopes", "REVOKE_URL", "new_pkce", "authorization_url", "exchange_authorization_code", "account_address", "revoke", "default_opener"]
 
-# Requested scopes: who signed in (OpenID email) and the calendar. Gmail is deliberately NOT requested: Google classes
-# gmail.readonly / gmail.compose as restricted scopes, which need verification plus a paid annual security assessment. The
-# Gmail tools stay in the code and fail with "forbidden" unless the stored connection holds GMAIL_SCOPES.
+# Requested scopes: who signed in (OpenID email), the calendar, and Gmail read + compose (compose also allows sending, which the
+# assistant only does after a person approved the exact message). gmail.* are RESTRICTED scopes: the OAuth client stays
+# unverified (up to 100 users, a one-time warning screen) rather than paying for Google's annual security assessment.
 IDENTITY_SCOPES = ("openid", "https://www.googleapis.com/auth/userinfo.email")
 CALENDAR_SCOPES = ("https://www.googleapis.com/auth/calendar.readonly", "https://www.googleapis.com/auth/calendar.events")
 GMAIL_SCOPES = ("https://www.googleapis.com/auth/gmail.readonly", "https://www.googleapis.com/auth/gmail.compose")
-SCOPES = IDENTITY_SCOPES + CALENDAR_SCOPES
+SCOPES = IDENTITY_SCOPES + CALENDAR_SCOPES + GMAIL_SCOPES
 USERINFO_URL = "https://openidconnect.googleapis.com/v1/userinfo"
 
 

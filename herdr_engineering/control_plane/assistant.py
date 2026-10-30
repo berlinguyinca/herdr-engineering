@@ -873,6 +873,17 @@ TOOL_CATALOG: dict[str, dict[str, Any]] = {
             "to": {"type": "string", "description": "One or more plain addresses, comma separated (at most 10)."},
             "subject": {"type": "string"}, "body": {"type": "string", "description": "Plain text, at most 800 characters."}},
             "required": ["to", "subject", "body"]}},
+    "send_email": {
+        "sensitive": True,
+        "description": "SEND an email from the user's Gmail. A person must approve the exact recipient, subject and body "
+                       "first; nothing is delivered before that. For a reply give thread_id and in_reply_to (the Message-ID "
+                       "of the mail being answered) so it stays in the thread.",
+        "parameters": {"type": "object", "properties": {
+            "to": {"type": "string", "description": "One or more plain addresses, comma separated (at most 10)."},
+            "subject": {"type": "string"}, "body": {"type": "string", "description": "Plain text, at most 800 characters."},
+            "thread_id": {"type": "string", "description": "Gmail thread id of the mail being answered (optional)."},
+            "in_reply_to": {"type": "string", "description": "Message-ID header of that mail, e.g. <abc@mail.x> (optional)."}},
+            "required": ["to", "subject", "body"]}},
     "create_calendar_event": {
         "sensitive": True,
         "description": "Create a Google Calendar event (no attendees, no invitations) after a person approves its exact "
@@ -952,18 +963,18 @@ def tool_sensitive(tool_id: str) -> bool:
 
 
 # Tools whose every use needs an explicit approval: a grant may never carry ``preauthorized`` for them.
-NEVER_PREAUTHORIZED = frozenset({"send_message", "run_shell", "create_email_draft", "create_calendar_event"})
+NEVER_PREAUTHORIZED = frozenset({"send_message", "run_shell", "create_email_draft", "send_email", "create_calendar_event"})
 
 # Google writes: run through ``google_write`` only after approval. They are requested by the assistant (not the person), so
 # the person whose mailbox or calendar it is can approve them; ``send_message``/``run_shell`` still need a distinct approver.
-GOOGLE_WRITE_TOOLS = frozenset({"create_email_draft", "create_calendar_event"})
+GOOGLE_WRITE_TOOLS = frozenset({"create_email_draft", "send_email", "create_calendar_event"})
 
 # Tools the post-approval executor can run. Everything else (send_message, run_shell, edit_shared) is NOT here: an
 # approval for those stays a record, and ``execute_approved_action`` refuses them (fail closed). ``draft_email`` only
 # ever saves a draft; nothing in this set sends.
 EXECUTABLE_AFTER_APPROVAL = frozenset({"request_review", "propose_branch", "request_mission", "comment_on_node",
                                        "draft_email", "delegate", "connector_request",
-                                       "create_email_draft", "create_calendar_event"})
+                                       "create_email_draft", "send_email", "create_calendar_event"})
 
 
 def _validate_google_write(tool_id: str, payload: Any) -> None:
@@ -1030,6 +1041,9 @@ def describe_action(tool_id: str, scope: str, payload: dict[str, Any] | None) ->
     elif tool_id == "create_email_draft":
         return (f"Save a Gmail DRAFT (nothing is delivered) to {v('to', 300)} with subject {v('subject', 200)} and this "
                 f"body: {v('body', 800)}")[:_DRY_RUN_MAX_GOOGLE]
+    elif tool_id == "send_email":
+        return (f"SEND an email NOW from your Gmail account to {v('to', 300)} with subject {v('subject', 200)}"
+                + (" (a reply in its thread)" if p.get("thread_id") else "") + f" and this body: {v('body', 800)}")[:_DRY_RUN_MAX_GOOGLE]
     elif tool_id == "create_calendar_event":
         return (f"Create a calendar event \"{v('summary', 200)}\" from {v('start', 40)} to {v('end', 40)} on calendar "
                 f"{v('calendar_id', 256) if p.get('calendar_id') else 'primary'}"
