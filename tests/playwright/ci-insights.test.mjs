@@ -354,8 +354,14 @@ test('local application modules load once when the browser asset transport is di
 },{invalidateAssetTransport:true}));
 
 test('shared selection: PR scope and a day bucket narrow summary, Tests and Runs through real HTTP',()=>commandCenter(async({page,base})=>{
- const history=await (await fetch(`${base}/api/v1/ci/history`)).json();
- const runs=history.pipelines.filter(r=>r.repository==='org/app');
+ // The first history read after start-up answers `syncing` with no runs while the monitor's own refresh is still running, so the
+ // runs are waited for here; reading once posted no reports at all and left only run 3's, which made this test fail by timing.
+ let runs=[];
+ for(let attempt=0;attempt<100&&runs.length<4;attempt+=1){
+  runs=(await (await fetch(`${base}/api/v1/ci/history`)).json()).pipelines.filter(r=>r.repository==='org/app');
+  if(runs.length<4)await new Promise(resolve=>setTimeout(resolve,100));
+ }
+ assert.equal(runs.length,4,'the four org/app runs are in the history before reports are posted');
  for(const r of runs.filter(r=>r.run_number!==3)) {
   const response=await fetch(`${base}/api/v1/ci/reports`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({...r,xml:`<testsuite><testcase name="selected-${r.run_number}"><failure/></testcase></testsuite>`})});
   assert.equal(response.status,200);

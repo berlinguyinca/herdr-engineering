@@ -250,7 +250,7 @@ def _collab_ops(ev: dict) -> list[dict]:
                               "parent_task_id": _text(p.get("parent_task_id")), "depth": p.get("depth"),
                               "created_by_kind": _text(p.get("created_by_kind"), 32),
                               "created_by_id": _text(p.get("created_by_id")), "root_user_id": _text(p.get("root_user_id")),
-                              "room_task_ttl": "24h"}))
+                              "reviews_task_id": _text(p.get("reviews_task_id")), "room_task_ttl": "24h"}))
         ops.append(edge("contains", ("room", rid), ("task", tid), **sc))
         if pid:
             ops.append(edge("contains", ("project", pid), ("task", tid), **sc))
@@ -258,6 +258,9 @@ def _collab_ops(ev: dict) -> list[dict]:
             ops.append(edge("assigned_to", ("task", tid), ("agent", _text(p["target_agent_id"])), **sc))
         if _text(p.get("parent_task_id")):
             ops.append(edge("spawned", ("task", _text(p["parent_task_id"])), ("task", tid), **sc))
+        if _text(p.get("reviews_task_id")):
+            # a review depends on the work it reviews (dependent -> prerequisite); the attr tells it from other dependencies
+            ops.append(edge("depends_on", ("task", tid), ("task", _text(p["reviews_task_id"])), **sc))
     elif t in ("task_updated", "task_progress") and _text(p.get("task_id")):
         tid = _text(p["task_id"])
         sc = _scope("room", rooms=[rid] if rid else (), project=pid)

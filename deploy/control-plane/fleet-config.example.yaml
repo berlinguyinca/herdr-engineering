@@ -26,6 +26,23 @@ sections:
       minio_password: "REDACTED"
       rustfs_bucket: "REDACTED"
       ci_actions: false             # true lets operators retry/cancel CI pipelines
+      # OPTIONAL: hosts that are meant to be off (benchmark boxes, powered-off machines). They raise no host_stale item and
+      # are listed quietly as "Expected offline" on Attention. Host names or ids. Empty by default; REPLACE with your own.
+      # attention:
+      #   expected_offline_hosts: []     # e.g. ["beast", "bender"]
+      # OPTIONAL: prices for the Usage "Spend (est.)" tab and the PR trail cost figure, in dollars per million tokens.
+      # There are no built-in prices; without a table (or with any unpriced model) cost is shown as unknown.
+      # usage:
+      #   prices:
+      #     - {model: "claude-sonnet-*", input: 0.0, output: 0.0, cached: 0.0}   # REPLACE the zeros with your real prices
+      #     - {model: "qwen*", input: 0, output: 0}                              # self-hosted: say so with an explicit zero
+      # OPTIONAL: the Evolution tab's staleness limit (docs/agent-evolution.md) and the learning export
+      # (docs/learning-trails.md: records per merged PR, GET /api/v1/learning/trails). Both work with these defaults.
+      # evolution:
+      #   stale_after_minutes: 120
+      # learning:
+      #   enabled: true
+      #   require_role: operator          # operator | viewer; the export is fleet-wide
       # OPTIONAL: absolute path (as the web container sees it) to a checkout of InferWeave's
       # deploy/pipelines/*.yaml. Read live. Absent: no definitions, and any host token may report
       # deployment events for any component (the Deployments snapshot then carries a warning).
@@ -67,7 +84,9 @@ sections:
       # an unknown key is refused. Omit the whole block when collab is not used.
       collab:
         cognito_pool: "us-west-2_REDACTED"           # also read by collab-sync.sh
-        cognito_clients: ["REDACTED"]                # allowed app client ids (tokens)
+        # allowed app client ids (tokens). The pool is SHARED (e.g. with lc-binbase-scheduler): list only the
+        # clients whose tokens may sign in here AND open lab share links; a token of any listed client counts.
+        cognito_clients: ["REDACTED"]
         cognito_group: "local.dev"                   # required cognito:groups membership
         cognito_web_client: "REDACTED"               # browser page app client (Hosted UI, PKCE)
         cognito_domain: "https://REDACTED.auth.us-west-2.amazoncognito.com"
@@ -75,6 +94,9 @@ sections:
         operator_user: "REDACTED"                    # Cognito username the dashboard's no-sign-in
                                                      # collaboration acts as (required)
         # operator_email: "owner@example.test"       # optional, shown for the operator
+        # public_url must be a bare https origin (empty path or "/") when shares are enabled: links and the lab
+        # sign-in callback live at <public_url>/s/... and the web client needs <public_url>/s/callback as an
+        # allowed callback + logout URL (see COLLAB.md, "Share links").
         # T15 attention inbox, evidence-based progress, analytics (everything off unless enabled):
         # insights:
         #   enabled: false                 # kill_switch: true turns every route off at once
@@ -82,6 +104,21 @@ sections:
         #   evidence_writers: ["key:ci-service"]   # ONLY these writers' merged/validated marks count as evidence
         #   min_group_size: 5              # aggregates over fewer items are hidden
         #   reads_per_minute: 60
+      # OPTIONAL: artifact share links (/s/ on collab.public_url). OFF unless `enabled: true`, which needs the
+      # collab marker and a signing_secret: deploy.sh refuses otherwise. share-public gets only the serving keys
+      # below plus collab's cognito_pool/cognito_clients/cognito_web_client/cognito_domain/public_url (render-share).
+      # share:
+      #   enabled: false
+      #   signing_secret: "REDACTED"       # >= 32 bytes; generate locally, never commit or print it:
+      #                                    #   openssl rand -hex 32   (paste the output here)
+      #   session_seconds: 14400           # lab session lifetime cap; also never past the share's expiry NOR the
+      #                                    # Cognito access token's exp (~1 h with pool defaults), so ~1 h in practice
+      #   default_public_days: 30          # public links: 1-90 days
+      #   max_share_bytes: 536870912       # one bundle
+      #   max_total_bytes: 2147483648      # all live bundles
+      #   max_files: 20000                 # files per bundle
+      #   # container paths; keep the defaults with deploy.sh (its mounts are fixed):
+      #   # shares_dir: /shares   events_dir: /share-events   marker_dir: /var/lib/herdr/share-markers
       # OPTIONAL: lineage-graph evidence in the merge gate. OFF unless you uncomment AND set `enabled: true`.
       # It runs after decide_merge for every PR and can only withhold a merge. `evidence_writers` is REQUIRED and
       # must be explicit graph principal ids ("key:<12 hex of sha256(the CI reporter's API key)>"): an empty list,

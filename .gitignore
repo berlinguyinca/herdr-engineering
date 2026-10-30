@@ -49,3 +49,9 @@ tests/e2e/.run/
 
 # autospec / UI gate run output (never committed)
 .autospec/reports/
+
+# share-link browser harness: downloaded duckdb-wasm binaries (never commit them)
+scripts/.share-browser-cache/
+tests/share-fixtures/html-parquet-duckdb/vendor/*.wasm
+tests/share-fixtures/html-parquet-duckdb/vendor/*.worker.js
+tests/share-fixtures/html-parquet-duckdb/vendor/extensions/

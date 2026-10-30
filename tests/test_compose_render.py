@@ -59,7 +59,10 @@ def _config(central, envfile, *files, fmt=None, extra_env=None):
     env = dict(os.environ, HERDR_CP_FLEET_DIR=str(central.parent),
                HERDR_LLM_SLICE_DIR=str(central.parent / "llm-proxy"), HERDR_CP_IMAGE_TAG="t",
                HERDR_CP_GIT_COMMIT="t", HERDR_CP_GITHUB_APP_DIR=str(central.parent / "github-app"),
-               HERDR_CP_PIPELINES_DIR=str(central.parent / "pipelines"), **(extra_env or {}))
+               HERDR_CP_GOOGLE_DIR=str(central.parent / "google"),
+               HERDR_CP_PIPELINES_DIR=str(central.parent / "pipelines"),
+               HERDR_SHARES_DIR=str(central.parent / "shares"),
+               HERDR_SHARE_EVENTS_DIR=str(central.parent / "share-events"), **(extra_env or {}))
     return subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=60)
 
 
@@ -85,6 +88,7 @@ def test_rendered_env_validates_with_the_collab_overlay(tmp_path):
     fcc.render_collab(load_fleet_config(central), slice_)
     extra = {"HERDR_COLLAB_CONFIG_DIR": str(slice_.parent), "HERDR_COLLAB_DATA_DIR": str(tmp_path / "data"),
              "HERDR_COLLAB_SYNC_DIR": str(tmp_path / "sync"),
+             "HERDR_SHARE_CONFIG_DIR": str(tmp_path / "share"),
              "HERDR_COLLAB_EDGE_CONF": str(CP / "collab-edge" / "nginx.conf")}
     r = _config(central, envfile, "compose.yaml", "compose.collab.yaml", extra_env=extra)
     assert r.returncode == 0, r.stderr

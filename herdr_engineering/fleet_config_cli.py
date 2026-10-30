@@ -251,6 +251,147 @@ def render_collab(cfg: FleetConfig, out: Path) -> None:
 
 
 # --------------------------------------------------------------------------
+# share slice (the public share container's only configuration)
+# --------------------------------------------------------------------------
+
+SHARE_SECTION_KEY = "share"
+# control_plane.share as authored; an unknown key (which could be a secret meant elsewhere) is refused.
+SHARE_KEYS = frozenset({"enabled", "max_share_bytes", "max_total_bytes", "max_files", "default_public_days",
+                        "session_seconds", "signing_secret", "shares_dir", "events_dir", "marker_dir"})
+# What share-public gets: no directories (its mounts are fixed), nothing else from the central file.
+SHARE_SLICE_KEYS = ("enabled", "max_share_bytes", "max_total_bytes", "max_files", "default_public_days",
+                    "session_seconds", "signing_secret")
+# Cognito identifiers share-public needs for lab sign-in (public values; no group, no operator).
+SHARE_COLLAB_KEYS = ("cognito_pool", "cognito_clients", "cognito_web_client", "cognito_domain", "public_url")
+SHARE_FIXED_DIRS = {"shares_dir": "/shares", "events_dir": "/share-events",
+                    "marker_dir": "/var/lib/herdr/share-markers"}
+SHARE_CAP_DEFAULTS = {"max_share_bytes": 512 * 1024 * 1024, "max_files": 20000,
+                      "max_total_bytes": 2 * 1024 * 1024 * 1024, "default_public_days": 30}
+_SECRET_HINT = ("generate one locally (e.g. `openssl rand -hex 32`) and store it in the fleet YAML as "
+                "control_plane.share.signing_secret; it is never printed")
+
+
+def _share_mapping(cfg: FleetConfig) -> tuple[dict, dict]:
+    """(control_plane.share, control_plane.collab) as mappings; either may be empty."""
+    try:
+        values = cfg.section(CONTROL_PLANE_SECTION)
+    except FleetConfigError:
+        return {}, {}
+    share = values.get(SHARE_SECTION_KEY)
+    if share is None:
+        share = {}
+    if not isinstance(share, dict):
+        raise FleetConfigError("control_plane.share must be a mapping")
+    collab = values.get("collab") if isinstance(values.get("collab"), dict) else {}
+    return share, collab
+
+
+def share_enabled(cfg: FleetConfig) -> bool:
+    """True only when control_plane.share.enabled is exactly true."""
+    return _share_mapping(cfg)[0].get("enabled") is True
+
+
+def share_values(cfg: FleetConfig) -> dict:
+    """The validated share slice values ``{collab: {...}, share: {...}}``.
+
+    Disabled (the default): only ``share.enabled: false`` is rendered and nothing else is required. Enabled: needs a
+    signing secret of at least 32 bytes, an https ``control_plane.collab.public_url`` with no path (the viewer's
+    redirect is fixed at ``/s/callback``), the Cognito pool, and caps that the control plane itself accepts."""
+    share, collab = _share_mapping(cfg)
+    unknown = sorted(str(k) for k in set(share) - SHARE_KEYS)
+    if unknown:
+        raise FleetConfigError("control_plane.share: unknown keys: " + ", ".join(unknown))
+    for key, fixed in SHARE_FIXED_DIRS.items():
+        if key in share and share[key] != fixed:
+            raise FleetConfigError(f"control_plane.share.{key} must be {fixed} (or left out): it is a container "
+                                   f"path and deploy.sh's mounts are fixed")
+    if share.get("enabled") is not True:
+        return {"share": {"enabled": False}}
+    from .control_plane.share_session import MIN_SECRET_BYTES
+    secret = share.get("signing_secret")
+    if not isinstance(secret, str) or len(secret.encode("utf-8")) < MIN_SECRET_BYTES:
+        raise FleetConfigError(f"control_plane.share.enabled is true but control_plane.share.signing_secret is "
+                               f"missing or shorter than {MIN_SECRET_BYTES} bytes: {_SECRET_HINT}")
+    public_url = collab.get("public_url")
+    parts = urllib.parse.urlsplit(public_url.strip()) if isinstance(public_url, str) else None
+    if (parts is None or parts.scheme != "https" or not parts.netloc or parts.path not in ("", "/")
+            or parts.query or parts.fragment):
+        raise FleetConfigError("control_plane.share needs control_plane.collab.public_url to be an https origin "
+                               "with an empty path or '/' (share links and the lab sign-in callback /s/callback "
+                               "live at its root)")
+    if not isinstance(collab.get("cognito_pool"), str) or not collab.get("cognito_pool"):
+        raise FleetConfigError("control_plane.share needs control_plane.collab.cognito_pool")
+    # The caps the control plane enforces (artifact_share_api.DEFAULTS; a test keeps the two in step). Not imported:
+    # deploy.sh runs this on the host, where the control plane's database driver is not installed.
+    for name in SHARE_CAP_DEFAULTS:
+        value = share.get(name, SHARE_CAP_DEFAULTS[name])
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise FleetConfigError(f"control_plane.share.{name} must be a positive integer")
+    if share.get("default_public_days", SHARE_CAP_DEFAULTS["default_public_days"]) > 90:
+        raise FleetConfigError("control_plane.share.default_public_days must be 1-90")
+    seconds = share.get("session_seconds", 14400)
+    if isinstance(seconds, bool) or not isinstance(seconds, int) or seconds < 60:
+        raise FleetConfigError("control_plane.share.session_seconds must be an integer >= 60")
+    return {"collab": {k: collab[k] for k in SHARE_COLLAB_KEYS if k in collab},
+            "share": {k: share[k] for k in SHARE_SLICE_KEYS if k in share}}
+
+
+def render_share(cfg: FleetConfig, out: Path) -> None:
+    """Write the share slice (JSON, valid YAML, 0600): only control_plane.share's serving keys and the Cognito
+    identifiers share-public needs. Refuses (writing nothing) when share is enabled but incomplete."""
+    data = {"version": SCHEMA_VERSION,
+            "sections": {CONTROL_PLANE_SECTION: {"roles": ["control-plane"], "values": share_values(cfg)}},
+            "hosts": {}}
+    _parse(data)
+    write_private_file(Path(out), json.dumps(data, indent=2, sort_keys=True) + "\n")
+
+
+def check_share_slice(cfg: FleetConfig) -> None:
+    """Refuse anything but a share slice (share-public must never get the central file)."""
+    extra = sorted(set(cfg.section_names()) - {CONTROL_PLANE_SECTION})
+    values = cfg.section(CONTROL_PLANE_SECTION) if CONTROL_PLANE_SECTION in cfg.section_names() else {}
+    collab = values.get("collab") or {}
+    share = values.get(SHARE_SECTION_KEY) or {}
+    if (extra or set(values) - {"collab", SHARE_SECTION_KEY} or cfg.status()["hosts"]
+            or not isinstance(collab, dict) or set(collab) - set(SHARE_COLLAB_KEYS)
+            or not isinstance(share, dict) or set(share) - set(SHARE_SLICE_KEYS)):
+        raise FleetConfigError("share-public reads only the render-share slice (control_plane.share serving keys + "
+                               "Cognito identifiers); this file carries more (mount the slice, not the central file)")
+
+
+# Marker lines in collab-edge/nginx.conf replaced by the share snippets when shares are enabled. Disabled, the
+# rendered file is the template byte for byte (and names no share-public upstream nginx would have to resolve).
+EDGE_SHARE_MARKERS = {
+    "  # @share-http@ (deploy.sh: share-http.conf when control_plane.share.enabled)\n": "share-http.conf",
+    "    # @share-location@ (deploy.sh: share-location.conf when control_plane.share.enabled)\n": "share-location.conf"}
+
+
+def render_edge_conf(template: str, *, share: bool, snippets_dir: Path | None = None) -> str:
+    """The edge's nginx.conf: the template, plus the /s/ zones, upstream and location when ``share`` is true."""
+    if not share:
+        return template
+    base = Path(snippets_dir) if snippets_dir else (
+        Path(__file__).resolve().parents[1] / "deploy" / "control-plane" / "collab-edge")
+    out = template
+    for marker, name in EDGE_SHARE_MARKERS.items():
+        if out.count(marker) != 1:
+            raise FleetConfigError(f"edge template must hold the marker line {marker.strip()!r} exactly once")
+        out = out.replace(marker, (base / name).read_text(encoding="utf-8"))
+    return out
+
+
+def render_edge(cfg: FleetConfig, template: Path, out: Path) -> None:
+    """Write the edge nginx.conf (0644: it holds no secret) rendered for this fleet config."""
+    template = Path(template)
+    text = render_edge_conf(template.read_text(encoding="utf-8"), share=share_enabled(cfg),
+                            snippets_dir=template.parent)
+    out = Path(out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(text, encoding="utf-8")
+    out.chmod(0o644)
+
+
+# --------------------------------------------------------------------------
 # llm slice (the llm-proxy container's only configuration)
 # --------------------------------------------------------------------------
 
