@@ -61,7 +61,8 @@ _AGENT_POST = re.compile(r"^/api/v1/(?:llm/keys|reviews|llm/keys/[^/]+/revoke"
 # narrow role gate. This does not grant agents publication or generic mutation.
 _REPORT_AGENT_POST = re.compile(
     r"^/api/v1/(?:artifact-reports(?:/[^/]+/jobs)?|"
-    r"artifacts/[^/]+/(?:blobs|versions(?:/[^/]+/(?:feedback|checks))?))$")
+    r"artifacts/[^/]+/(?:blobs|links|versions(?:/[^/]+/(?:feedback|checks))?|"
+    r"uploads(?:/[^/]+/(?:parts/[0-9]+|complete|abort))?))$")
 # T12: the one POST an ingest key may make besides /api/v1/ingest: acknowledging a steering request addressed to it.
 _STEER_ACK = re.compile(r"^/api/v1/steering/[^/]+/ack$")
 # T16 gap C: the second: ask for a re-review of a PR whose head has no quorum (ingest-role key; scoped in the handler).
@@ -2715,6 +2716,9 @@ def _make_handler(server, public=False, operator=False):
                 from .artifact_report_api import route_report
                 if route_report(self, server, parts, resource):
                     return None
+                from .artifact_registry_api import route_registry
+                if route_registry(self, server, parts, resource):
+                    return None
                 from .skill_routes import route_skills
                 if route_skills(self, server, parts, resource):
                     return None
@@ -3551,8 +3555,12 @@ def _make_handler(server, public=False, operator=False):
                 committed = self._artifact_call("commit_version", parts[4], **body)
                 from .artifact_lineage import emit_version_lineage
                 from .artifact_scope import visibility_fields
-                emit_version_lineage(server.ingest, committed, self._principal(),
-                                     scope=visibility_fields(gated=server.artifact_graph_gate is not None))
+                linked = emit_version_lineage(server.ingest, committed, self._principal(),
+                                              scope=visibility_fields(gated=server.artifact_graph_gate is not None))
+                try:   # the ledger tells reconcile whether the graph edges still need to be (re)emitted
+                    self._artifact_call("mark_linked", committed["version_id"], error=(linked or {}).get("error"))
+                except Exception:   # noqa: BLE001 - the version is committed; reconcile repairs the ledger
+                    pass
                 return self._json(committed, 201)
             if resource == "artifact-jobs" and server.artifact_job_manager is not None:
                 if len(parts) == 4:
