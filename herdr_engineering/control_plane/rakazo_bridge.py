@@ -35,6 +35,7 @@ from . import rakazo_bots as bots
 from . import rakazo_events as ev
 from . import rakazo_memory as memory
 from . import rakazo_prefs as pf
+from . import rakazo_rest as rest
 from . import rakazo_rooms as rooms
 from . import rakazo_routines as routines
 from . import rakazo_spaces as sp
@@ -631,6 +632,8 @@ class RakazoBridge:
         self.routines = routines.Routines(self, BridgeError)
         for name, fn in {**self.bots.procs(), **self.memory.procs(), **self.routines.procs()}.items():
             self._procs[name] = fn
+        self.rest = rest.Rest(self, BridgeError, set(self._procs))
+        self._procs.update(self.rest.procs())
         self.routine_runner_seconds = int(config.get("routine_runner_seconds", 0))
         if self.routine_runner_seconds:
             threading.Thread(target=self._routine_loop, name="rakazo-routines", daemon=True).start()
@@ -904,7 +907,7 @@ class RakazoBridge:
         return {"ok": True}
 
     def _me(self, ctx, inp):
-        return ev.me_view(ctx.account, ctx.space)
+        return self.rest.me(ctx)
 
     def _in_space(self, ctx: _Ctx, space_id: str) -> _Ctx:
         return replace(ctx, space=space_id, tenant=sp.space_tenant(ctx.base_tenant, space_id))
