@@ -1,12 +1,5 @@
 {
  "defaults": {
-  "approvalRules/list": [],
-  "autoReview/get": {
-   "checkerAvailable": false,
-   "enabled": false,
-   "mode": "never",
-   "skipApprovals": false
-  },
   "availability/items": [],
   "capabilities/catalogSearch": {
    "enabled": false,

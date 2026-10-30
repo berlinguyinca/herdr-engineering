@@ -115,8 +115,19 @@ steering cards. Impossible without other infrastructure: push (APNs), voice/desk
 
 What remains, and why it is left alone rather than guessed at. These are the ones where acting autonomously would mean a
 security decision on the owner's behalf:
-- **Approval rules / auto review**: enforcing "always allow" would auto-approve agent actions. It must be wired into the
-  assistant's approval path by the owner, not inferred by the bridge.
+- **Approval rules / auto review**: built in Update 6 below, in the one direction that cannot widen authority.
 - **Auto-sync of running agents into rooms / steering cards**: grants room membership from host-registry proofs.
 - **Messaging channels, marketplace, computer/voice hosts, push**: need external accounts or infrastructure (Slack/Telegram
   apps, a registry, donbot/nibbler hosts, APNs) that do not exist yet.
+
+### Update 6
+
+Approval rules and auto review (`rakazo_rules.py`). The person's own rules (account-wide or per space, set from the app) are
+consulted by `AssistantService.rule_policy` inside `request_tool_action`:
+- `deny` makes the request fail as if no grant existed (stricter than default; wins over `always_allow`, and a space rule wins
+  over an account rule).
+- `always_allow` skips the approval prompt **only** for a tool that already holds an active grant and is not in
+  `NEVER_PREAUTHORIZED` (`send_message`, `run_shell`). It never creates authority.
+- A failing rule lookup means no rule. Removing a rule tombstones it. `approvalRules/preview` reports before/after for a sample tool.
+- `autoReview/get,set` store mode and enabled; `checkerAvailable` is false (no checker model runs here) and `skipApprovals` is
+  refused with a pointer to per-tool rules.

@@ -22,8 +22,6 @@ from urllib.parse import urlsplit
 from . import rakazo_events as ev
 
 READS = frozenset({
-    "approvalRules/list",
-    "autoReview/get",
     "availability/items",
     "capabilities/catalogSearch",
     "capabilities/list",
@@ -70,7 +68,7 @@ _REASONS = {
     "marketplace": "There is no marketplace on this server.", "capabilities": "Capabilities are managed by the operator.",
     "skills": "Taught skills are not available on this server.",
     "boards": "Boards cannot be added in this server.", "tickets": "That ticket action is not available.",
-    "approvalRules": "Approval rules are decided by the operator's policy.", "autoReview": "Auto review is decided by the operator.",
+
     "updater": "Updates are applied by the operator.", "deployment": "The deployment is configured by the operator.",
     "onboarding": "Onboarding is not needed on this server.", "availability": "Availability is managed by the operator.",
     "integrationSetup": "Integrations are managed by the operator.", "externalConversations": "External conversations are not enabled.",

@@ -1871,6 +1871,9 @@ class AssistantService:
         self._shell_runner = None  # injected in tests; default uses subprocess
         self._transport = None  # injected in tests; default uses urllib
         self._approval_ttl = timedelta(seconds=self.config["approval_ttl_seconds"])
+        # optional (tenant, user, tool, scope) -> "deny" | "always_allow" | None, set by the Rakazo bridge from the person's own
+        # approval rules. A rule can only tighten (deny) or skip the approval prompt for a tool that already has a grant.
+        self.rule_policy: Callable[[str, str, str, str], str | None] | None = None
 
     def tenant_for(self, principal_id: str | None) -> str:
         """The tenant an authenticated principal belongs to, from YAML only. Unlisted principals share the default
@@ -2218,6 +2221,16 @@ class AssistantService:
                                    scope=scope, tenant_id=tenant_id, user_id=user_id)
         preauthorized = bool(grant and (grant.constraints or {}).get("preauthorized")
                              and tool_id not in NEVER_PREAUTHORIZED)
+        rule = None
+        if self.rule_policy is not None:
+            try:
+                rule = self.rule_policy(tenant_id, user_id, tool_id, scope)
+            except Exception:  # noqa: BLE001 - a broken rule lookup must never loosen policy
+                rule = None
+        if rule == "deny":
+            grant = None
+        elif rule == "always_allow" and grant is not None and tool_id not in NEVER_PREAUTHORIZED:
+            preauthorized = True
 
         # Reuse identity, but never reuse stale authorization.
         for existing in self.store.actions.values():

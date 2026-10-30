@@ -28,7 +28,7 @@ SKIP = out of scope for a Herdr-backed server (answer "not offered" cleanly, hid
 | Memory | `memory/list,update,remove,exportMarkdown`, `memory/provider*` | **MAP** | `store/search/correct/forget/export_memory` (`export_memory` = `exportMarkdown`); provider* = STUB null |
 | Search (`search`) | `search/query` | MAP | `search_memory` over threads/messages/artifacts, merged server side |
 | Usage | `usage/summary,list` | MAP | `usage_spend.py`, `llm_stats.py` |
-| Approvals settings (`approvals`) | `approvalRules/list,set,remove,preview`, `autoReview/get,set`, `trustedLinkSites/*` | MAP (rules) / STUB (autoReview, trusted sites) | grants (`grant_tool`, `revoke_grant`, `list_grants`), `approval_view`, `evaluate_computer_policy` |
+| Approvals settings (`approvals`) | `approvalRules/list,set,remove,preview`, `autoReview/get,set`, `trustedLinkSites/*` | MAP (rules, autoReview settings; deny/always_allow enforced in `request_tool_action`) / STUB (trusted sites) | grants (`grant_tool`, `revoke_grant`, `list_grants`), `approval_view`, `evaluate_computer_policy` |
 | Skills (`skills`, `skill`, `plugin`) | `agentSkills/*`, `skills/*` (taught), `capabilities/*`, `marketplace/catalog` | MAP | `skill_registry.py` + `skill_routes.py` + `skill_transfer.py`; taught-skill recorder = SKIP |
 | Integrations (`integrations`, `integration-setup`) | `connections/*`, `integrationSetup/get`, `mcp/servers/*`, `mcp/assignments/*`, `mcp/oauth/begin` | MAP (connectors, MCP) / SKIP (Composio/Pipedream catalog) | `register/list/get/archive_connector`, `connector_request`, `collab_mcp.py`; catalog = Herdr connectors only |
 | Messaging (`messaging`) | `messaging/*` (Slack, Telegram etc.) | SKIP (return empty lists) | `collab_external.py` is the nearest, not 1:1 |

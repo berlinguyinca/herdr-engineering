@@ -42,6 +42,7 @@ from . import rakazo_prefs as pf
 from . import rakazo_rest as rest
 from . import rakazo_rooms as rooms
 from . import rakazo_routines as routines
+from . import rakazo_rules as rules
 from . import rakazo_skills as skills
 from . import rakazo_spaces as sp
 from . import rakazo_tickets as tickets
@@ -655,6 +656,9 @@ class RakazoBridge:
         self.skills = skills.Skills(self, BridgeError)
         self.mcp = mcp.Mcp(self, BridgeError)
         self.tickets = tickets.Tickets(self, BridgeError)
+        self.rules = rules.Rules(self, BridgeError)
+        if self.svc is not None:
+            self.svc.rule_policy = self.rules.effective
         self.vault = vault.Vault(self, BridgeError, vault.load_cipher(config.get("vault_key_file")))
         runner = getattr(self.svc, "runner", None)
         if hasattr(runner, "prompt_extras"):
@@ -662,7 +666,8 @@ class RakazoBridge:
         self.hindsight = hs.build(config.get("hindsight"))
         for name, fn in {**self.bots.procs(), **self.memory.procs(), **self.routines.procs(),
                          **self.artifacts.procs(), **self.models.procs(), **self.skills.procs(),
-                         **self.vault.procs(), **self.mcp.procs(), **self.tickets.procs()}.items():
+                         **self.vault.procs(), **self.mcp.procs(), **self.tickets.procs(),
+                         **self.rules.procs()}.items():
             self._procs[name] = fn
         self.rest = rest.Rest(self, BridgeError, set(self._procs))
         self._procs.update(self.rest.procs())
