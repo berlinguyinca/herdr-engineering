@@ -107,11 +107,17 @@ class ArtifactStore(ArtifactContextMixin, ArtifactUploadMixin, ArtifactLifecycle
             raise ArtifactError("created_via must be 'owner' or 'collaborator'")
         if created_via == "collaborator" and not collaborator_agent_id:
             raise ArtifactError("collaborator commits require a collaborator_agent_id")
+        if created_via == "owner" and collaborator_agent_id is not None:
+            raise ArtifactError("owner commits cannot carry a collaborator_agent_id")
+        if isinstance(parent_version_ids, (str, bytes)):
+            raise ArtifactError("parent_version_ids must be a list of version ids, not a single string")
         default_parents = [base_version_id] if base_version_id else []
         explicit_parents = parent_version_ids is not None
         parents = list(parent_version_ids) if explicit_parents else default_parents
         if any(not isinstance(parent, str) or not parent for parent in parents) or len(set(parents)) != len(parents):
             raise ArtifactError("parent_version_ids must be distinct nonempty version ids")
+        if explicit_parents and (parents != [] if base_version_id is None else parents[:1] != [base_version_id]):
+            raise ArtifactError("parent_version_ids must start with base_version_id (and be empty for a first version)")
         try:
             origin_columns = normalize_origin(origin)
         except ProvenanceError as exc:

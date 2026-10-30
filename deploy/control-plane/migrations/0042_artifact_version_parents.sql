@@ -15,6 +15,8 @@ ALTER TABLE artifact_versions
 
 -- artifact_versions_freeze (0031) rejects any update of version content, so the one-off backfill lifts it inside a
 -- single DO statement: it is atomic, so the trigger cannot be left disabled.  Re-running touches no rows.
+-- The trigger is re-enabled unconditionally at the end of the block.  DISABLE TRIGGER takes ACCESS EXCLUSIVE on
+-- artifact_versions, so the backfill blocks all readers and writers of the table for its duration.
 DO $$
 BEGIN
   ALTER TABLE artifact_versions DISABLE TRIGGER artifact_versions_freeze;
@@ -22,6 +24,17 @@ BEGIN
      SET parent_version_ids = ARRAY[parent_version_id]
    WHERE parent_version_id IS NOT NULL AND parent_version_ids = '{}';
   ALTER TABLE artifact_versions ENABLE TRIGGER artifact_versions_freeze;
+END $$;
+
+-- An owner commit carries no collaborator agent; a collaborator commit must name one.  Backfilled rows are 'owner'/NULL.
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'artifact_versions_created_via_agent'
+                 AND conrelid = 'artifact_versions'::regclass) THEN
+    ALTER TABLE artifact_versions ADD CONSTRAINT artifact_versions_created_via_agent CHECK (
+      (created_via = 'owner' AND collaborator_agent_id IS NULL)
+      OR (created_via = 'collaborator' AND collaborator_agent_id IS NOT NULL));
+  END IF;
 END $$;
 
 CREATE TABLE IF NOT EXISTS artifact_collab_attempts (

@@ -186,3 +186,63 @@ def test_idempotency_key_distinguishes_parent_lists(parents_postgres):
         with pytest.raises(ArtifactError, match="idempotency"):
             await commit(store, aid, second["version_id"], parent_version_ids=[second["version_id"]], **kw)
     run(parents_postgres, body)
+
+
+def test_parents_must_start_with_base(parents_postgres):
+    async def body(store, conn):
+        aid = await new_artifact(store)
+        v1 = await commit(store, aid, None)
+        v2 = await commit(store, aid, v1["version_id"])
+        h = v2["version_id"]
+        for base, parents in [(h, [v1["version_id"]]), (h, []), (h, [v1["version_id"], h])]:
+            with pytest.raises(ArtifactError, match="start with base_version_id"):
+                await commit(store, aid, base, parent_version_ids=parents)
+        other = await new_artifact(store)
+        with pytest.raises(ArtifactError, match="empty for a first version"):
+            await commit(store, other, None, parent_version_ids=[v1["version_id"]])
+        merged = await commit(store, aid, h, parent_version_ids=[h, v1["version_id"]])
+        assert merged["parent_version_ids"] == [h, v1["version_id"]]
+        assert len(await store.list_versions(aid)) == 3
+    run(parents_postgres, body)
+
+
+def test_owner_cannot_carry_agent_id_and_bare_string_parents_are_refused(parents_postgres):
+    async def body(store, conn):
+        aid = await new_artifact(store)
+        with pytest.raises(ArtifactError, match="owner commits cannot"):
+            await commit(store, aid, None, collaborator_agent_id="agent-1")
+        v1 = await commit(store, aid, None)
+        with pytest.raises(ArtifactError, match="not a single string"):
+            await commit(store, aid, v1["version_id"], parent_version_ids=v1["version_id"])
+        with pytest.raises(asyncpg.CheckViolationError):
+            await conn.execute("INSERT INTO artifact_versions (version_id,artifact_id,version_number,state,"
+                               "created_via,collaborator_agent_id) VALUES ('cv-a',$1,50,'ready','owner','x')", aid)
+        with pytest.raises(asyncpg.CheckViolationError):
+            await conn.execute("INSERT INTO artifact_versions (version_id,artifact_id,version_number,state,"
+                               "created_via) VALUES ('cv-b',$1,51,'ready','collaborator')", aid)
+    run(parents_postgres, body)
+
+
+def test_migrator_applies_0042_and_leaves_freeze_trigger_enabled(parents_postgres, tmp_path):
+    from herdr_engineering.control_plane.db import Migrator
+    for name in (*PREREQ, MIGRATION):
+        (tmp_path / name).write_text((MIGRATIONS / name).read_text())
+
+    async def go():
+        conn = await asyncpg.connect(parents_postgres)
+        try:
+            await conn.execute("CREATE SCHEMA mig")
+            await conn.execute("SET search_path TO mig")
+            assert MIGRATION in await Migrator(conn).apply(str(tmp_path))
+            enabled = await conn.fetchval(
+                "SELECT tgenabled FROM pg_trigger WHERE tgname='artifact_versions_freeze' "
+                "AND tgrelid='mig.artifact_versions'::regclass")
+            assert enabled in ("O", b"O")
+            await conn.execute("INSERT INTO artifacts (artifact_id,created_by) VALUES ('m','o')")
+            await conn.execute("INSERT INTO artifact_versions (version_id,artifact_id,version_number,state) "
+                               "VALUES ('m-1','m',1,'ready')")
+            with pytest.raises(asyncpg.ObjectNotInPrerequisiteStateError):
+                await conn.execute("UPDATE artifact_versions SET parent_version_ids=ARRAY['x'] WHERE version_id='m-1'")
+        finally:
+            await conn.close()
+    asyncio.run(go())
