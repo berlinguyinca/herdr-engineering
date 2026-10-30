@@ -5,6 +5,10 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Unified workspace P05 (partial, library only): team templates, task admission, reviewer separation, leases
+- New `herdr_engineering/control_plane/team_tasks.py`: `TeamTemplate` roles (planner, implementer(s), one independent read-only reviewer, optional coordinator) that cannot name a host; `admit` lets a task in only from an authorized human through the P01 broker (`submit_task`), never from a message or tainted content, with role-bounded actions, template budget, deadline, acyclic dependencies and reviewer independence; `LeaseStore` gives one lease per task with monotonic fencing tokens (exactly-once completion, crash takeover fences off the stale worker, abort or expiry authorizes nothing).
+- Nothing calls it yet: no routes, no persistence, no Pi mission admission, no `/assign`/`/tasks`/`/skill` wiring, no scheduler placement. Tests: `tests/control_plane/test_team_tasks.py` (18, each safeguard mutation-checked).
+
 ### Artifact registry: provenance, context lookup, resumable uploads, lifecycle (unified workspace P03 foundation)
 - Migration `0031_artifact_registry_extensions` (additive, idempotent, `-- DOWN:` in the file). Versions gain typed provenance (origin room/task/issue/project, session, agent, model, prompt/skill revision, commit, redacted inputs) with **no foreign keys**, and a trigger makes committed content and provenance immutable and undeletable. Bindings gain task/project/link kind so one artifact can belong to several tasks.
 - `GET /api/v1/artifacts/for/{project|task|issue|room}/{ref}`: artifacts for a work object, filtered by the registry ACL in SQL before counts, pagination and search; a missing context and a context with nothing visible are the same empty page. `GET|POST /artifacts/{id}/links` for post-hoc, idempotent links.
