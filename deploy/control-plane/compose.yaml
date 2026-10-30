@@ -135,6 +135,9 @@ services:
       # /etc/herdr/pipelines), kept current by the herdr-pipelines-sync timer and
       # validated by deploy.sh. Only this service reads deployment definitions.
       - ${HERDR_CP_PIPELINES_DIR:?run deploy.sh}:/etc/herdr/pipelines:ro
+      # Artifact share bundles (control_plane.share.shares_dir = /shares): the approve step writes them here;
+      # herdr-share-public serves them read-only. deploy.sh creates the host directory.
+      - ${HERDR_SHARES_DIR:?run deploy.sh}:/shares
     # The HerdR UI is served at dev.lan:<public-port> (default 80 = plain
     # http://dev.lan). Host bind is the Tailnet interface so only Tailnet
     # clients reach it; container keeps its internal 8080 listener.
@@ -175,6 +178,13 @@ services:
     # deploy.sh's temporary worktree and dangle after it is removed.
     volumes:
       - ${HERDR_CP_FLEET_DIR:?run deploy.sh}:/etc/herdr/fleet:ro
+      # Share housekeeping (control_plane.share): the expiry sweep removes bundles (rw), the audit ingest reads
+      # share-public's events file and rotates it (rw: rename to events.jsonl.1, deleted once drained; it opens
+      # only regular files, never through a symlink share-public could plant), and keeps its offset markers in a
+      # volume only the worker mounts (control_plane.share.marker_dir), so the public side cannot rewind them.
+      - ${HERDR_SHARES_DIR:?run deploy.sh}:/shares
+      - ${HERDR_SHARE_EVENTS_DIR:?run deploy.sh}:/share-events
+      - herdr-cp-share-markers:/var/lib/herdr/share-markers
     environment:
       HERDR_ENGINEERING_CONFIG: /app/control-plane/config.yaml
     command:
@@ -308,6 +318,7 @@ services:
 volumes:
   herdr-cp-pg:
   herdr-cp-rustfs:
+  herdr-cp-share-markers:     # the worker's share-events ingest marker (worker-private)
   # Pre-existing volume of the former `herdr-fabric` project (gateway leases);
   # kept by name so folding the projects together loses no state.
   herdr-state:

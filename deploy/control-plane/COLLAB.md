@@ -60,6 +60,80 @@ These were applied by hand on bender; reapply them on a new host.
    (repeatable allow-list), `--max-per-day` (default 5), `--ledger-dir`. The ledger
    (`~/.local/share/herdr-engineering/collab-provision/ledger.jsonl`) is the audit trail.
 
+## Share links (`/s/`)
+
+Artifact share links are served by `herdr-share-public` behind the same edge, under
+`control_plane.collab.public_url` (`https://localdev.mcp.metabolomics.us/s/<token>/`). Off unless
+`control_plane.share.enabled: true` in the central fleet config; enabling them needs the collab marker.
+
+```
+edge (nginx, location ^~ /s/ only) -> herdr-share-public:8083 (network `share`, internal; no DB, RustFS,
+                                       control plane or outbound route)
+```
+
+- Config: `deploy.sh` renders `herdr-eng fleet config render-share` to
+  `~/.config/herdr-engineering/share/share-config.json` (0600): only `control_plane.share`'s serving keys
+  and collab's `cognito_pool`, `cognito_clients`, `cognito_web_client`, `cognito_domain`, `public_url`.
+  share-public refuses any file carrying more.
+- Signing secret: `enabled: true` without `control_plane.share.signing_secret` (at least 32 bytes) is refused
+  before anything is built. Generate it on the control-plane host and paste it into the fleet YAML yourself:
+  `openssl rand -hex 32`. Never commit it, print it, or pass it as a flag or environment variable. Rotating it
+  ends every open lab session.
+- `public_url` must be a bare origin (empty path or `/`): the viewer's sign-in redirect is fixed at `/s/callback`.
+- Lab session lifetime: `control_plane.share.session_seconds` (default 14400 = 4 h) is only a cap. A session
+  also ends at the share's expiry and at the Cognito access token's `exp` (about 1 h with the pool's default
+  token validity), so recipients sign in again after ~1 h unless the app client's access-token validity is raised.
+- `cognito_clients`: the pool is shared with `lc-binbase-scheduler`. List only the app clients whose tokens may
+  sign in here and open lab shares; any listed client's token is accepted.
+- Mounts: bundles at `~/.local/share/herdr-engineering/shares` (web/worker read-write, share-public read-only);
+  share-public's audit file `~/.local/share/herdr-engineering/share-events/events.jsonl` (its only writable
+  mount, 0644; the worker mounts the directory read-write, ingests the file every minute and rotates it past
+  4 MiB: rename to `events.jsonl.1`, which is read to its end and deleted on a later sweep once it has not been
+  written for 30 s; share-public's own 8 MiB cap is only reached when the worker is not running. The worker keeps
+  its ingest markers in the worker-only volume `herdr-cp-share-markers`); the Cognito keys from the collab-sync
+  directory (read-only).
+- Operator listener: the `share` network has a fixed subnet (`172.31.251.0/28`, compose.collab.yaml) and the
+  edge's port-8082 server (the no-sign-in operator API) denies it, so share-public cannot reach the operator API
+  by setting `Host` itself. Keep the subnet and the `deny` in `collab-edge/nginx.conf` in step (a test checks it).
+  If a `herdr-control-plane_share` network already exists without that subnet, compose refuses to reuse it:
+  remove it (with collab-edge stopped) and redeploy.
+  `control_plane.share.shares_dir`, `events_dir` and `marker_dir` must stay at their defaults (`/shares`,
+  `/share-events`, `/var/lib/herdr/share-markers`) or be left out: render-share refuses other values.
+- Host permissions: the bundle tree is world-readable (0755 dirs, 0644 files) and the events file is 0644,
+  because three uids touch them (web/worker as container root, share-public as `HERDR_COLLAB_CERT_UID`) and a
+  tighter group scheme was not verified on bender. So `~/.local/share/herdr-engineering` (or the home directory
+  above it) must NOT be world-readable/traversable on the deploy host: keep it 0700/0750 for the deploying user.
+- Edge resilience: share-public is resolved at run time (`resolver 127.0.0.11`, `server ... resolve` in a
+  zoned upstream, `max_conns=100` under share-public's 128-connection cap), so the edge starts and reloads
+  (certificate renewals included) while share-public is down; `/s/` then answers 502.
+- Edge: with shares enabled the edge's `nginx.conf` gains exactly one location, `^~ /s/` (snippets
+  `collab-edge/share-http.conf` and `share-location.conf`): GET/HEAD/OPTIONS, plus POST only on
+  `/s/<token>/session` (the body-less lab sign-in exchange); any request with a body is refused; its own
+  `limit_req`/`limit_conn` zones; `proxy_buffering off`; `proxy_read_timeout 600s`; no access log (tokens and
+  session HMACs are in the path). Disabled, the edge conf is the repo file unchanged and a running
+  share-public is stopped (its bundles stay on disk).
+- Edge limits (trade-off): `/s/` allows 100 requests/s per client address with a burst of 300 (parquet range
+  reads come in bursts, and campus NAT puts many people behind one address) and 16 concurrent connections per
+  address. The total is capped only by the upstream's `max_conns=100` (share-public refuses past 128): a
+  handful of heavy clients can take most of it and other viewers then wait or get 502, without a log line
+  per refusal. Lower the rate in `collab-edge/share-http.conf` / `share-location.conf` if abuse shows up.
+- Edge logging: `/s/` has no access log, but a request nginx refuses before it reaches the `/s/` location
+  (malformed request line, oversized headers, TLS or PROXY-protocol errors) can appear in the edge's access or
+  error log with its request line, which may contain a token.
+- Rollback: the previous edge conf and share slice are restored first. When that conf routes `/s/` and the
+  previous commit defines share-public, share-public is recreated from that commit (and verified with the rest);
+  otherwise a running share-public is stopped.
+
+Browser check (not part of CI): `node scripts/share-browser-check.mjs --browser chromium|firefox|webkit` runs the
+real share server over the bundles in `tests/share-fixtures/` (see its README) and checks rendering, parquet range
+reads, the sandbox, CSP blocking, PDF display, revoke and lab sign-in against a fake Cognito.
+
+Operator step, once, before sending lab links (not done by `deploy.sh`): add
+`https://localdev.mcp.metabolomics.us/s/callback` to BOTH the CallbackURLs and the LogoutURLs of the
+`herdr-collab-web` app client (`aws cognito-idp update-user-pool-client` replaces the whole client: read it
+first with `describe-user-pool-client` and send every existing attribute back with the new URL added). Public
+links need no Cognito change.
+
 ## Verify
 
 ```
@@ -67,4 +141,5 @@ curl -s https://localdev.mcp.metabolomics.us/api/v1/collab/config        # 200
 curl -s -o /dev/null -w '%{http_code}' https://localdev.mcp.metabolomics.us/api/v1/collab/rooms   # 401
 curl -s -o /dev/null -w '%{http_code}' https://localdev.mcp.metabolomics.us/api/v1/hosts          # 404
 curl -s http://<tailnet-ip>:9482/api/v1/collab/config                    # operator block present
+curl -s -o /dev/null -w '%{http_code}' https://localdev.mcp.metabolomics.us/s/unknown/           # 404 (shares on or off)
 ```

@@ -182,7 +182,8 @@ PY
       keep=""
       for m in $(cat {missing}); do
         svc="$(case "$m" in herdr-cp-web) echo control-plane-web ;; herdr-cp-worker) echo control-plane-worker ;;
-          herdr-llm-proxy) echo llm-proxy ;; herdr-collab-public) echo collab-public ;; herdr-collab-edge) echo collab-edge ;; esac)"
+          herdr-llm-proxy) echo llm-proxy ;; herdr-collab-public) echo collab-public ;; herdr-collab-edge) echo collab-edge ;;
+          herdr-share-public) echo share-public ;; esac)"
         case " $* " in *" $svc "*) ;; *) keep="$keep $m" ;; esac
       done
       echo "$keep" > {missing}
@@ -193,7 +194,8 @@ PY
     python3 - "$pins" <<'PY'
 import json, os, pathlib, sys
 names = {{'control-plane-web':'herdr-cp-web', 'control-plane-worker':'herdr-cp-worker',
-         'llm-proxy':'herdr-llm-proxy', 'collab-public':'herdr-collab-public', 'collab-edge':'herdr-collab-edge'}}
+         'llm-proxy':'herdr-llm-proxy', 'collab-public':'herdr-collab-public', 'collab-edge':'herdr-collab-edge',
+         'share-public':'herdr-share-public'}}
 ids = {{v: 'sha256:' + 'b' * 64 for v in names.values()}}
 if sys.argv[1] and not os.environ.get('STUB_IGNORE_ROLLBACK_IMAGES'):
     ids.update({{names[k]: v['image'] for k,v in json.loads(pathlib.Path(sys.argv[1]).read_text())['services'].items()}})

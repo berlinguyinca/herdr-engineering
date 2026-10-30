@@ -209,7 +209,9 @@ def _build_parser() -> argparse.ArgumentParser:
                       ("revoke", "remove a host (its token stops working); backup first"),
                       ("render-compose", "write the compose env file (0600)"),
                       ("render-collab", "write the collab container's config slice (0600)"),
-                      ("render-llm", "write the llm-proxy container's config slice (0600)")):
+                      ("render-llm", "write the llm-proxy container's config slice (0600)"),
+                      ("render-share", "write the share-public container's config slice (0600)"),
+                      ("render-edge", "write the collab edge's nginx.conf (with /s/ when shares are enabled)")):
         sp = csub.add_parser(name, help=hlp)
         sp.add_argument("--path", default=FLEET_CONFIG_DEFAULT)
         if name == "init":
@@ -237,6 +239,13 @@ def _build_parser() -> argparse.ArgumentParser:
         if name == "render-llm":
             sp.add_argument("--out", required=True,
                             help="file to write (0600): only llm + control_plane.llm_proxy")
+        if name == "render-share":
+            sp.add_argument("--out", required=True,
+                            help="file to write (0600): only control_plane.share's serving keys and the Cognito "
+                                 "identifiers; refused when share is enabled but incomplete")
+        if name == "render-edge":
+            sp.add_argument("--template", required=True, help="collab-edge/nginx.conf (snippets beside it)")
+            sp.add_argument("--out", required=True, help="nginx.conf to write")
         sp.set_defaults(func=_cmd_fleet_config)
     pu = fsub.add_parser("update", help="self-update controller + every host, then "
                                         "report parity (one command)")
@@ -308,6 +317,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p2.set_defaults(func=_cmd_art_retention)
     from .artifact_reports_client import add_report_subparser
     add_report_subparser(asub)
+    from .artifact_shares_client import add_share_subparser
+    add_share_subparser(asub)
     # system-graph artifact (P5): deterministic sanitized snapshot renderer.
     ga = sub.add_parser("graph-artifact", help="render a graph snapshot to validated HTML (system-graph P5)")
     gas = ga.add_subparsers(dest="graph_artifact_command", required=True)
@@ -758,6 +769,18 @@ def _build_parser() -> argparse.ArgumentParser:
     p2.add_argument("--port", type=int, default=0)
     p2.add_argument("--fleet-config", default=FLEET_CONFIG_DEFAULT)
     p2.set_defaults(func=_cmd_cp_public_gateway)
+    p2 = csub.add_parser("share-public",
+                         help="serve artifact share links (/s/) from frozen bundles: no database, no API")
+    p2.add_argument("--host", default="127.0.0.1")
+    p2.add_argument("--port", type=int, default=8083)
+    p2.add_argument("--shares-dir", default="/shares", help="the shares volume (read-only)")
+    p2.add_argument("--events-dir", default="/share-events",
+                    help="directory of the append-only events.jsonl the worker ingests (the only writable path)")
+    p2.add_argument("--sync-dir", default="/sync", help="Cognito jwks.json written by collab-sync.sh")
+    p2.add_argument("--fleet-config", default="/etc/herdr/share/share-config.json",
+                    help="the render-share slice (control_plane.share serving keys + Cognito identifiers); "
+                         "the only source of configuration, refused when it carries more")
+    p2.set_defaults(func=_cmd_cp_share_public)
     p2 = csub.add_parser("worker", help="run the bounded background worker")
     p2.add_argument("--interval", type=float, default=30.0,
                     help="seconds between passes (default: 30)")
@@ -1172,6 +1195,14 @@ def _cmd_fleet_config(args) -> int:
         elif cmd == "render-llm":
             fcc.render_llm(load_fleet_config(path), Path(args.out).expanduser())
             print(f"wrote {args.out} (0600)")
+        elif cmd == "render-share":
+            cfg = load_fleet_config(path)
+            fcc.render_share(cfg, Path(args.out).expanduser())
+            # deploy.sh reads the last word: whether share-public runs and the edge routes /s/
+            print(f"wrote {args.out} (0600) share={'enabled' if fcc.share_enabled(cfg) else 'disabled'}")
+        elif cmd == "render-edge":
+            fcc.render_edge(load_fleet_config(path), Path(args.template).expanduser(), Path(args.out).expanduser())
+            print(f"wrote {args.out}")
     except FleetConfigError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
@@ -3088,6 +3119,31 @@ def _require_durable_review_gate(cp: dict, dsn) -> None:
                          "control_plane.pg_dsn, or disable the review gate")
 
 
+def _share_wiring(cp: dict, dsn: str | None):
+    """(share store adapter, shares root, settings) when control_plane.share.enabled is true, else three Nones.
+
+    Needs the registry database (shares live beside artifacts). Links are issued under control_plane.collab.public_url;
+    the bundle volume is control_plane.share.shares_dir (default /shares, the container mount). Caps come from the YAML.
+    """
+    share = cp.get("share") or {}
+    if not isinstance(share, dict) or share.get("enabled") is not True or not dsn:
+        return None, None, None
+    from .control_plane.artifact_share_api import share_settings_config
+    collab = cp.get("collab") if isinstance(cp.get("collab"), dict) else {}
+    try:
+        settings = share_settings_config(share, public_url=collab.get("public_url"))
+    except ValueError as exc:
+        raise SystemExit(f"fleet config {exc}") from None
+    from .control_plane import artifact_adapter
+    from .control_plane.artifact_shares import ShareStore
+
+    async def create_share_store():
+        import asyncpg
+        return ShareStore(await asyncpg.connect(dsn))
+
+    return artifact_adapter.SyncArtifactAdapter(create_share_store), Path(share.get("shares_dir") or "/shares"), settings
+
+
 def _cmd_cp_web(args) -> int:
     """Serve the control-plane UI + structured /api/v1 + SSE (private-by-default).
 
@@ -3263,6 +3319,7 @@ def _cmd_cp_web(args) -> int:
         artifact_acl.load(artifact_adapter("load_acl"))
         artifact_reviews.load(artifact_adapter("load_reviews"))
         artifact_jobs.load(artifact_adapter("load_jobs"))
+    share_store, shares_root, share_settings = _share_wiring(cp, dsn)
     collab = None
     if args.collab_cognito_pool:
         if args.collab_users_file:
@@ -3376,7 +3433,8 @@ def _cmd_cp_web(args) -> int:
                              operator_email=args.collab_operator_email,
                              operator_hosts=args.collab_operator_host,
                              collab_operator_url=args.collab_operator_url,
-                             collab_dashboard_hosts=args.collab_dashboard_host)
+                             collab_dashboard_hosts=args.collab_dashboard_host,
+                             share_store=share_store, shares_root=shares_root, share_settings=share_settings)
     if artifact_adapter is not None and svr.artifact_graph_gate is not None:
         # the lineage retraction set is server state kept in the registry: reload it before serving a single read
         svr.artifact_graph_gate.load_retractions(artifact_adapter("load_retractions"))
@@ -3403,6 +3461,8 @@ def _cmd_cp_web(args) -> int:
         svr.shutdown()
         if artifact_adapter is not None:
             artifact_adapter.close()
+        if share_store is not None:
+            share_store.close()
     return 0
 
 
@@ -3440,6 +3500,70 @@ def _cmd_cp_public_gateway(args) -> int:
         server.shutdown()
         server.server_close()
         adapter.close()
+    return 0
+
+
+def _share_lab_problems(collab: dict, share: dict) -> list[str]:
+    """Names (never values) of the lab settings that are missing or malformed."""
+    from .control_plane.share_session import MIN_SECRET_BYTES
+    problems = []
+    secret = share.get("signing_secret")
+    if not isinstance(secret, str) or len(secret.encode("utf-8")) < MIN_SECRET_BYTES:
+        problems.append(f"control_plane.share.signing_secret (at least {MIN_SECRET_BYTES} bytes)")
+    for key in ("cognito_web_client", "cognito_domain", "cognito_pool", "public_url"):
+        if not isinstance(collab.get(key), str) or not collab.get(key):
+            problems.append(f"control_plane.collab.{key}")
+    return problems
+
+
+def _share_public_server(fleet_config, *, shares_dir, events_dir, sync_dir, host, port):
+    """Build (not start) the share server from the render-share slice; logs once when lab links are off."""
+    from .control_plane.share_public import ShareConfig, make_share_server
+    from .fleet_config import FleetConfigError, load_fleet_config
+    from .fleet_config_cli import check_share_slice
+    log = logging.getLogger("herdr.share_public")
+    try:
+        cfg = load_fleet_config(Path(fleet_config).expanduser())
+        check_share_slice(cfg)
+    except FleetConfigError as exc:
+        raise SystemExit(f"--fleet-config: {exc}") from None
+    values = cfg.section("control_plane")
+    share, collab = values.get("share") or {}, values.get("collab") or {}
+    if share.get("enabled") is not True:
+        raise SystemExit("share-public: control_plane.share.enabled is not true in the slice; nothing to serve")
+    secret = share.get("signing_secret")
+    clients = collab.get("cognito_clients") or []
+    config = ShareConfig(
+        shares_root=Path(shares_dir), events_path=Path(events_dir) / "events.jsonl", sync_dir=Path(sync_dir),
+        pool_id=collab.get("cognito_pool"),
+        client_ids=tuple(c for c in clients if isinstance(c, str)) if isinstance(clients, list) else (),
+        web_client_id=collab.get("cognito_web_client"), cognito_domain=collab.get("cognito_domain"),
+        public_url=collab.get("public_url"),
+        signing_secret=secret.encode("utf-8") if isinstance(secret, str) else b"",
+        session_seconds=share.get("session_seconds", 14400))
+    server = make_share_server(config, host=host, port=port)
+    if server.lab is None:
+        problems = _share_lab_problems(collab, share)
+        log.warning("share-public: lab links are OFF (every lab link answers 404) because these settings are "
+                    "missing or invalid: %s; public links are served",
+                    ", ".join(problems) or "control_plane.collab Cognito identifiers (pool, web client, https "
+                                           "domain, https public_url)")
+    return server
+
+
+def _cmd_cp_share_public(args) -> int:
+    """Serve only /s/ share links from the read-only shares volume (database-free)."""
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    server = _share_public_server(args.fleet_config, shares_dir=args.shares_dir, events_dir=args.events_dir,
+                                  sync_dir=args.sync_dir, host=args.host, port=args.port)
+    logging.getLogger("herdr.share_public").info("share-public serving /s/ on %s:%s (lab links %s)", args.host,
+                                                 server.server_address[1], "on" if server.lab else "off")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
     return 0
 
 
@@ -3747,6 +3871,40 @@ def _fabric_compaction_settings(cp):
         keep_checkpoints=int(number("keep_checkpoints", 2, 1)))
 
 
+def _share_worker_settings(cp):
+    """``control_plane.share`` as the worker needs it.  Off unless ``enabled`` is exactly true; directories default to
+    the share container's mounts, and ``marker_dir`` is worker-private (the public container must not write there)."""
+    raw = (cp or {}).get("share") or {}
+    if not isinstance(raw, dict):
+        raise SystemExit("fleet config control_plane.share must be a mapping")
+    out = {"enabled": raw.get("enabled") is True}
+    for key, default in (("shares_dir", "/shares"), ("events_dir", "/share-events"),
+                         ("marker_dir", "/var/lib/herdr/share-markers")):
+        value = raw.get(key, default)
+        if not isinstance(value, str) or not value:
+            raise SystemExit(f"fleet config control_plane.share.{key} must be a non-empty string")
+        out[key] = value
+    return out
+
+
+def _worker_share_housekeeper(fleet_config_path):
+    """The share housekeeper when the fleet file enables shares, else None."""
+    from pathlib import Path
+
+    from .control_plane.worker import ShareHousekeeper
+    from .fleet_config import FleetConfigError, load_fleet_config
+    if not fleet_config_path or not Path(fleet_config_path).expanduser().exists():
+        return None
+    try:
+        cp = load_fleet_config(Path(fleet_config_path).expanduser()).section("control_plane")
+    except FleetConfigError as exc:
+        raise SystemExit(f"--fleet-config: {exc}") from None
+    settings = _share_worker_settings(cp)
+    if not settings["enabled"]:
+        return None
+    return ShareHousekeeper(settings["shares_dir"], settings["events_dir"], settings["marker_dir"])
+
+
 def _worker_fabric_compactor(fleet_config_path):
     """The fabric compactor when the fleet file enables it, else None."""
     from pathlib import Path
@@ -3872,13 +4030,14 @@ def _cmd_cp_worker(args) -> int:
             worker_id = args.host_id or socket.gethostname()
             snapshotter = _worker_snapshot_writer(getattr(args, "fleet_config", None))
             compactor = _worker_fabric_compactor(getattr(args, "fleet_config", None))
+            share_hk = _worker_share_housekeeper(getattr(args, "fleet_config", None))
             if args.once:
                 return await run_one_pass(conn, worker_id=worker_id,
                                           artifact_job_runner=runner, inspector_snapshotter=snapshotter,
-                                          fabric_compactor=compactor)
+                                          fabric_compactor=compactor, share_housekeeper=share_hk)
             await run_worker(conn, interval=args.interval, worker_id=worker_id,
                              artifact_job_runner=runner, inspector_snapshotter=snapshotter,
-                             fabric_compactor=compactor)
+                             fabric_compactor=compactor, share_housekeeper=share_hk)
             return None
         finally:
             await conn.close()

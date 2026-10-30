@@ -103,6 +103,56 @@ services:
       driver: json-file
       options: {max-size: "10m", max-file: "3"}
 
+  # Artifact share links (/s/): started by deploy.sh only when control_plane.share.enabled is true (and the edge
+  # routes /s/ only then). Database-free: frozen bundles from a read-only volume, an append-only events file the
+  # worker ingests, Cognito keys from the collab-sync files, and ONLY the render-share slice
+  # (control_plane.share serving keys + Cognito identifiers; the signing secret lives there, never in argv/env).
+  share-public:
+    image: herdr-engineering:${HERDR_CP_IMAGE_TAG:?run deploy.sh}
+    container_name: herdr-share-public
+    restart: unless-stopped
+    # Deliberately no env_file / environment.
+    user: "${HERDR_COLLAB_CERT_UID:-1000}:${HERDR_COLLAB_CERT_UID:-1000}"   # owner of the events dir and slice
+    command:
+      - "control-plane"
+      - "share-public"
+      - "--host"
+      - "0.0.0.0"
+      - "--port"
+      - "8083"
+      - "--shares-dir"
+      - "/shares"
+      - "--events-dir"
+      - "/share-events"
+      - "--sync-dir"
+      - "/sync"
+      - "--fleet-config"
+      - "/etc/herdr/share/share-config.json"
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    volumes:
+      - ${HERDR_SHARES_DIR:?run deploy.sh}:/shares:ro
+      - ${HERDR_SHARE_EVENTS_DIR:?run deploy.sh}:/share-events   # its only writable mount (events.jsonl)
+      - ${HERDR_COLLAB_SYNC_DIR:?run deploy.sh}:/sync:ro   # Cognito keys, written by collab-sync.sh
+      - ${HERDR_SHARE_CONFIG_DIR:?run deploy.sh}:/etc/herdr/share:ro   # holds only the render-share slice
+    # Internal network shared with the edge only: no route out, no postgres/rustfs/control plane.
+    networks: [share]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    pids_limit: 256
+    mem_limit: 512m
+    cpus: 1.0
+    healthcheck:
+      # Every unknown path is the server's single 404: a 404 means it answers.
+      test: ["CMD", "python3", "-c", "import urllib.request as u,urllib.error as e,sys\ntry: u.urlopen('http://127.0.0.1:8083/s/', timeout=3)\nexcept e.HTTPError as x: sys.exit(0 if x.code == 404 else 1)\nsys.exit(0)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "3"}
+
   # Public edge: the only container that publishes a port. Certificates come from the host's
   # certbot lineage (renewed by its timer, whose deploy hook also reloads this container).
   collab-edge:
@@ -111,6 +161,7 @@ services:
     restart: unless-stopped
     depends_on:
       - collab-public
+      - share-public       # deploy.sh starts it first (with --no-deps) when shares are enabled
     # Runs as the owner of the certbot files (0600): with all capabilities dropped,
     # root could not read them.
     user: "${HERDR_COLLAB_CERT_UID:-1000}:${HERDR_COLLAB_CERT_UID:-1000}"
@@ -126,7 +177,7 @@ services:
       - "${HERDR_COLLAB_EDGE_BIND:-127.0.0.1:18444}:8443"
       # Operator listener, tailnet interface only (like the dashboard): no sign-in, local owner.
       - "${HERDR_CP_WEB_BIND:-127.0.0.1}:${HERDR_COLLAB_OPERATOR_PORT:-9482}:8082"
-    networks: [collab, edge]      # edge: the bridge the published port lives on
+    networks: [collab, share, edge]      # edge: the bridge the published port lives on
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
     pids_limit: 128
@@ -138,4 +189,13 @@ services:
 networks:
   collab:
     internal: true
+  share:
+    internal: true
+    # Fixed so the edge can refuse it on the operator listener (8082, no sign-in): share-public shares this
+    # network with collab-edge and must never reach collab_operator by setting Host itself. High in the
+    # daemon's 172.16.0.0/12 pool (allocated bottom-up), next to the host's other fixed 172.31.250.0/29; a
+    # change here must match the `deny` in collab-edge/nginx.conf (a test keeps them in step).
+    ipam:
+      config:
+        - subnet: 172.31.251.0/28
   edge: {}

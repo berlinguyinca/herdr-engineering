@@ -301,7 +301,8 @@ class ControlPlaneServer:
                  request_workers=128, request_queue=256, single_operator=False,
                  assistant_service=None, assistant_config=None, fabric_resolver=None, fabric_services=None, fabric_names=None,
                  scheduler_admission=False, scheduler_limits=None, skill_registry=None,
-                 unified_workspace_config=None, rakazo_bridge=None, rakazo_bridge_dsn=None):
+                 unified_workspace_config=None, rakazo_bridge=None, rakazo_bridge_dsn=None,
+                 share_store=None, shares_root=None, share_settings=None):
         """
         Auth (Spec §104): either a single `api_key` (all-access) or a mapping
         `api_keys={key: role}` with roles "viewer" (read-only) / "operator"
@@ -434,6 +435,10 @@ class ControlPlaneServer:
         self.artifact_job_manager = artifact_job_manager
         self.artifact_review_manager = artifact_review_manager
         self.artifact_acl = artifact_acl
+        # Artifact share links (control_plane.share): all three or the share routes answer 503 "sharing is not enabled".
+        self.share_store = share_store
+        self.shares_root = shares_root
+        self.share_settings = share_settings
         self.attachment_dedupe: dict = {}      # redelivery guard for the email-attachment route; lost on restart
         from .artifact_scope import install_gate
         self.artifact_graph_gate = install_gate(repo.graph, artifact_acl)   # None without an ACL: nodes stay private
@@ -2728,6 +2733,9 @@ def _make_handler(server, public=False, operator=False):
             try:
                 from .artifact_report_api import route_report
                 if route_report(self, server, parts, resource):
+                    return None
+                from .artifact_share_api import route_share
+                if route_share(self, server, parts, resource):
                     return None
                 from .artifact_registry_api import route_registry
                 if route_registry(self, server, parts, resource):
