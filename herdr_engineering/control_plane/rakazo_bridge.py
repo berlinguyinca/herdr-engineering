@@ -33,6 +33,7 @@ from typing import Any
 
 from . import rakazo_bots as bots
 from . import rakazo_events as ev
+from . import rakazo_memory as memory
 from . import rakazo_prefs as pf
 from . import rakazo_rooms as rooms
 from . import rakazo_spaces as sp
@@ -623,7 +624,8 @@ class RakazoBridge:
         self._procs.update(self.rooms.procs())
         self.max_bots = MAX_BOTS
         self.bots = bots.Bots(self, BridgeError)
-        for name, fn in self.bots.procs().items():
+        self.memory = memory.Memory(self, BridgeError)
+        for name, fn in {**self.bots.procs(), **self.memory.procs()}.items():
             self._procs[name] = fn
         for name, group_fn in (("threads/head", self.rooms.head), ("threads/get", self.rooms.thread),
                                ("threads/messages", self.rooms.messages), ("threads/send", self.rooms.send),
