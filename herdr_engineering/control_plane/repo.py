@@ -1725,6 +1725,8 @@ class ControlPlaneRepo:
         branch=None,
         base=None,
         created_at=None,
+        merged_at=None,
+        closed_at=None,
     ):
         stamp = self._stamp()
         existing = self._pull_requests.get(pr_id)
@@ -1740,7 +1742,11 @@ class ControlPlaneRepo:
                 "base": base,
                 "created_at": created_at or stamp,
                 "updated_at": stamp,
+                "merged_at": None,
+                "closed_at": None,
+                "ended_source": None,
             }
+            self._stamp_pr_end(rec, status, merged_at, closed_at, stamp)
             self._pull_requests[pr_id] = rec
             self.record_event(
                 "pull_request",
@@ -1757,6 +1763,9 @@ class ControlPlaneRepo:
                         "branch",
                         "base",
                         "created_at",
+                        "merged_at",
+                        "closed_at",
+                        "ended_source",
                     )
                 },
                 mission_id=mission_id,
@@ -1766,6 +1775,10 @@ class ControlPlaneRepo:
             return _copy(rec)
         old_status = existing.get("status")
         existing["updated_at"] = stamp
+        existing.setdefault("merged_at", None)
+        existing.setdefault("closed_at", None)
+        existing.setdefault("ended_source", None)
+        self._stamp_pr_end(existing, status, merged_at, closed_at, stamp)
         for k, v in {
             "mission_id": mission_id,
             "repository": repository,
@@ -1793,6 +1806,9 @@ class ControlPlaneRepo:
                     "branch",
                     "base",
                     "created_at",
+                    "merged_at",
+                    "closed_at",
+                    "ended_source",
                 )
             },
             mission_id=existing["mission_id"],
@@ -1800,6 +1816,29 @@ class ControlPlaneRepo:
         if existing["status"] == "merged" and old_status != "merged":
             self._record_pr_merged(pr_id, existing)
         return _copy(existing)
+
+    @staticmethod
+    def _stamp_pr_end(rec, status, merged_at, closed_at, stamp):
+        """Keep when a pull request ended. A time the provider reported is kept as given (``ended_source`` "reported");
+        otherwise the first moment this server saw the PR merged or closed is used and labelled "observed", which can be
+        later than the real merge. A PR that is open again loses its end time; a time already stored is never overwritten
+        by a later observation."""
+        if status == "open":
+            rec["merged_at"] = rec["closed_at"] = rec["ended_source"] = None
+            return
+        def valid(value):
+            try:
+                return isinstance(value, str) and len(value) <= 64 and bool(_dt.datetime.fromisoformat(value.replace("Z", "+00:00")))
+            except ValueError:
+                return False
+        merged_at, closed_at = (merged_at if valid(merged_at) else None), (closed_at if valid(closed_at) else None)
+        if merged_at:
+            rec["merged_at"], rec["ended_source"] = merged_at, "reported"
+        if closed_at:
+            rec["closed_at"], rec["ended_source"] = closed_at, "reported"
+        if status in ("merged", "closed") and not (rec.get("merged_at") or rec.get("closed_at")):
+            rec["merged_at" if status == "merged" else "closed_at"] = stamp
+            rec["ended_source"] = "observed"
 
     def _record_pr_merged(self, pr_id, rec):
         self.record_event(
@@ -3772,6 +3811,8 @@ class ControlPlaneRepo:
                                 branch=payload.get("branch"),
                                 base=payload.get("base"),
                                 created_at=payload.get("created_at"),
+                                merged_at=payload.get("merged_at"),
+                                closed_at=payload.get("closed_at"),
                             )
                     except (ValueError, KeyError, TypeError):  # a bad row never blocks startup
                         continue

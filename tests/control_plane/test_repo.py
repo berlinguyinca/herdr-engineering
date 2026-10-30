@@ -518,3 +518,46 @@ def test_stage_replay_seeds_initial_stage_without_spurious_run():
     assert live["stages"]["implementation"]["runs"] == 1
     assert replay["stages"]["implementation"]["runs"] == 1
     assert live["stages"]["implementation"]["p50_ms"] == replay["stages"]["implementation"]["p50_ms"]
+
+
+def _pr(r, status, **extra):
+    return r.upsert_pull_request("pr-1", repository="org/app", number=7, branch="feat/x", status=status, **extra)
+
+
+def test_pull_request_open_has_no_end_time():
+    r = repo.ControlPlaneRepo()
+    pr = _pr(r, "open")
+    assert (pr["merged_at"], pr["closed_at"], pr["ended_source"]) == (None, None, None)
+
+
+def test_pull_request_merge_is_observed_when_provider_gives_no_time():
+    r = repo.ControlPlaneRepo()
+    _pr(r, "open")
+    pr = _pr(r, "merged")
+    assert pr["merged_at"] and pr["closed_at"] is None and pr["ended_source"] == "observed"
+    first = pr["merged_at"]
+    assert _pr(r, "merged")["merged_at"] == first, "a later observation never overwrites the stored time"
+
+
+def test_pull_request_reported_time_wins_and_bad_values_are_ignored():
+    r = repo.ControlPlaneRepo()
+    pr = _pr(r, "merged", merged_at="2026-10-01T10:00:00Z")
+    assert pr["merged_at"] == "2026-10-01T10:00:00Z" and pr["ended_source"] == "reported"
+    r2 = repo.ControlPlaneRepo()
+    pr = _pr(r2, "closed", closed_at="not a time")
+    assert pr["closed_at"] and pr["closed_at"] != "not a time" and pr["ended_source"] == "observed"
+    pr = _pr(r2, "closed", closed_at=123)
+    assert pr["ended_source"] == "observed"
+
+
+def test_pull_request_reopened_loses_its_end_time():
+    r = repo.ControlPlaneRepo()
+    _pr(r, "closed")
+    pr = _pr(r, "open")
+    assert (pr["merged_at"], pr["closed_at"], pr["ended_source"]) == (None, None, None)
+
+
+def test_pull_request_created_already_merged_is_observed():
+    r = repo.ControlPlaneRepo()
+    pr = _pr(r, "merged")
+    assert pr["merged_at"] and pr["ended_source"] == "observed"

@@ -163,3 +163,10 @@ def test_free_text_fields_are_redacted():
 
 
 # 11 -- covered by test_duration_needs_a_real_merge_time
+
+
+def test_duration_reason_says_when_the_end_time_was_only_observed():
+    observed = {**pull(merged=100), "ended_source": "observed"}
+    reported = {**pull(merged=100), "ended_source": "reported"}
+    assert "first observed" in trail(pull_requests=[observed])["signals"]["duration_s"]["reason"]
+    assert "first observed" not in trail(pull_requests=[reported])["signals"]["duration_s"]["reason"]
