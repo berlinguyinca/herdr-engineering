@@ -52,7 +52,8 @@ PUBLIC_MIN_DAYS, PUBLIC_MAX_DAYS = 1, 90
 # Callers compute "now + N days" slightly before create() reads the clock; tolerate that skew on the lower bound.
 _SKEW = timedelta(minutes=5)
 _HEX64 = re.compile(r"[0-9a-f]{64}\Z")
-_EMAIL = re.compile(r"[^@\s]+@[^@\s]+\Z")
+# ASCII only: ``str.lower`` folds e.g. U+212A KELVIN SIGN to "k", so a non-ASCII entry could match another address.
+_EMAIL = re.compile(r"[!-?A-~]+@[!-?A-~]+\Z", re.ASCII)   # printable ASCII except "@" and space
 _MAX_INGEST_BYTES = 16 * 1024 * 1024
 _MAX_LINE_BYTES = 16 * 1024
 _MAX_DETAIL_BYTES = 4096
@@ -118,9 +119,11 @@ def _clean_list(values: Any, what: str, pattern: re.Pattern | None = None, lower
     for value in values:
         if not isinstance(value, str) or not value.strip():
             raise ShareError(f"{what} contains an empty entry")
-        value = value.strip().lower() if lower else value.strip()
-        if pattern is not None and not pattern.match(value):
+        value = value.strip()
+        if pattern is not None and not pattern.match(value):   # before lower(): it folds some non-ASCII to ASCII
             raise ShareError(f"{what}: {value!r} is not valid")
+        if lower:
+            value = value.lower()
         if value not in out:
             out.append(value)
     return out

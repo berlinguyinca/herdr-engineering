@@ -103,6 +103,8 @@ def test_create_pending_validates_audience_rules(share_postgres):
         assert (await store.create(**kw(aid, vid, allow_emails=[], allow_groups=["g"])))["allow_groups"] == ["g"]
         assert (await store.create(**kw(aid, vid, expires_at=now + timedelta(days=400))))["state"] == "pending"
         for bad in (dict(allow_emails=[], allow_groups=[]), dict(allow_emails=["nope"]),
+                    # non-ASCII: .lower() folds U+212A KELVIN SIGN to "k", so it could match another address
+                    dict(allow_emails=["\u212aim@x.org"]), dict(allow_emails=["kim@\u0445.org"]),
                     dict(audience="private"), dict(expires_at=now - timedelta(days=1)),
                     dict(expires_at=datetime(2099, 1, 1)),  # naive
                     dict(version_id="version_missing")):

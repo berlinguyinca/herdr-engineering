@@ -114,6 +114,17 @@ def test_email_allows_without_any_group():
     assert got == {"identity": "alice", "email": "alice@lab.example", "exp": NOW0 + 3600}
 
 
+def test_non_ascii_emails_never_match():
+    """``str.lower`` folds U+212A KELVIN SIGN to ASCII "k": a non-ASCII address must never match an ASCII entry
+    (or a non-ASCII entry match anything)."""
+    state = {**LAB_STATE, "allow_emails": ["kim@lab.example", "\u212aim@lab.example"], "allow_groups": []}
+    for email in ("\u212aim@lab.example", "\u212aIM@LAB.example", "kim@lab.exampl\u0435"):
+        assert authorise_lab(state, access("kim"), ident("kim", email=email), authenticator()) is None, email
+    assert authorise_lab(state, access("kim"), ident("kim", email="KIM@lab.example"), authenticator()) is not None
+    only_kelvin = {**state, "allow_emails": ["\u212aim@lab.example"]}
+    assert authorise_lab(only_kelvin, access("kim"), ident("kim", email="kim@lab.example"), authenticator()) is None
+
+
 def test_group_claim_allows_and_is_case_sensitive():
     tok = access("dave", groups=("Readers",))
     got = authorise_lab(LAB_STATE, tok, ident("dave", email="dave@else.example"), authenticator())
