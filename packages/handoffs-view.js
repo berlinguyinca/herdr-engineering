@@ -34,17 +34,19 @@ const clip = (t, n) => { const x = String(t || '').replace(/\s+/g, ' ').trim(); 
 const who = (side) => `${side?.harness || 'unknown'}${side?.agent_id ? ` @${side.agent_id}` : side?.session_id ? ` ${side.session_id}` : ''}`;
 
 export function workspaceCard(w, open) {
-  const chips = Object.entries(w.states || {}).map(([s, n]) => `<span class="hd-chip hd-chip--${esc(s)}">${esc(s.replace('_', ' '))} ${n}</span>`).join(' ');
-  return `<article class="hd-card hd-ws" data-workspace="${esc(w.workspace)}"><button type="button" class="hd-ws__head" aria-expanded="${open ? 'true' : 'false'}">
-    <strong>${esc(w.workspace)}</strong><span>${w.total} handoff${w.total === 1 ? '' : 's'}</span>
-    ${w.attention ? `<span class="hd-badge hd-badge--attention">${w.attention} need attention</span>` : '<span class="hd-badge">all clear</span>'}
-    <small>${esc(ago(w.latest_at))}</small></button><div class="hd-ws__chips">${chips}</div><div class="hd-ws__body" ${open ? '' : 'hidden'}></div></article>`;
+  const chips = Object.entries(w.states || {}).map(([st, n]) => `<span class="hd-chip hd-chip--${esc(st)}">${esc(st.replace('_', ' '))} ${n}</span>`).join(' ');
+  return `<article class="hd-ws" data-workspace="${esc(w.workspace)}"><button type="button" class="hd-ws__head" aria-expanded="${open ? 'true' : 'false'}">
+    <strong>${esc(w.workspace)}</strong><span class="hd-ws__n">${w.total}</span>
+    ${w.attention ? `<span class="hd-badge hd-badge--attention">${w.attention} need attention</span>` : ''}
+    <span class="hd-ws__chips">${chips}</span><small>${esc(ago(w.latest_at))}</small></button><div class="hd-ws__body" ${open ? '' : 'hidden'}></div></article>`;
 }
 
 export function handoffCard(h) {
-  return `<button type="button" class="hd-card hd-row${h.attention ? ' hd-row--attention' : ''}" data-handoff="${esc(h.handoff_id)}">
-    <strong>${esc(who(h.source))} → ${esc(who(h.target))}</strong><span>${esc(h.state)}${h.stalled ? ' · stalled' : ''}</span>
-    <p>${esc(h.goal || '')}</p><small>${h.completed} done · ${h.remaining} left · ${esc(ago(h.updated_at))} · ${esc(h.handoff_id)}</small></button>`;
+  return `<button type="button" class="hd-row${h.attention ? ' hd-row--attention' : ''}" data-handoff="${esc(h.handoff_id)}" title="${esc(h.handoff_id)}">
+    <span class="hd-row__state hd-row__state--${esc(h.state)}">${esc(String(h.state).replace('_', ' '))}${h.stalled ? ' · stalled' : ''}</span>
+    <strong class="hd-row__who">${esc(agentName(h.source))} → ${esc(agentName(h.target))}</strong>
+    <span class="hd-row__goal">${esc(clip(h.goal, 140))}</span>
+    <small class="hd-row__meta">${h.completed} done · ${h.remaining} left · ${esc(ago(h.updated_at))}</small></button>`;
 }
 
 const list = (items) => (items && items.length ? `<ul>${items.map((i) => `<li>${esc(typeof i === 'string' ? i : JSON.stringify(i))}</li>`).join('')}</ul>` : '<p class="hd-muted">Nothing recorded.</p>');
@@ -66,19 +68,21 @@ export function handoffText(row) {
 }
 
 export function detailHtml(row, chain) {
-  const hopItem = (h, i) => `<li${i === chain.position ? ' aria-current="step"' : ''}><button type="button" class="hd-hop${i === chain.position ? ' hd-hop--here' : ''}" data-handoff="${esc(h.handoff_id)}"
+  const hopItem = (h, i) => `<li${i === chain.position ? ' aria-current="step"' : ''}${near(i) ? '' : ' class="hd-hop-far" hidden'}><button type="button" class="hd-hop${i === chain.position ? ' hd-hop--here' : ''}" data-handoff="${esc(h.handoff_id)}"
     ${i === chain.position ? 'aria-current="true"' : ''}><span class="hd-hop__who">${esc(agentName(h.source))} → ${esc(agentName(h.target))}</span><span class="hd-hop__state">${esc(String(h.state).replace('_', ' '))}</span>
     <small>${esc(clip(h.goal, 70))}${h.updated_at ? ` · ${esc(ago(h.updated_at))}` : ''}</small></button></li>`;
-  const hops = chain?.chain?.length > 1 ? (chain.more_before ? '<li class="hd-muted hd-hop-more">… earlier handoffs not shown</li>' : '') + chain.chain.map(hopItem).join('') + (chain.more_after ? '<li class="hd-muted hd-hop-more">… later handoffs not shown</li>' : '') : '';
+  const near = (i) => Math.abs(i - (chain?.position ?? 0)) <= 2;
+  const far = (chain?.chain || []).filter((_, i) => !near(i)).length;
+  const hops = chain?.chain?.length > 1 ? (chain.more_before ? '<li class="hd-muted hd-hop-more">… earlier handoffs not shown</li>' : '') + chain.chain.map(hopItem).join('') + (far ? `<li><button type="button" class="hd-linkish" data-chain-all>Show ${far} more hop${far === 1 ? '' : 's'}</button></li>` : '') + (chain.more_after ? '<li class="hd-muted hd-hop-more">… later handoffs not shown</li>' : '') : '';
   const history = (row.history || []).map((s) => `<li>${esc(s.state)} <small>${esc(ago(s.at))}${s.actor?.id ? ` · ${esc(s.actor.id)}` : ''}</small></li>`).join('');
   const hint = row.target?.model_hint;
   return `<section class="hd-detail" data-handoff-detail-body aria-label="Handoff ${esc(row.handoff_id)}">
     <header><h2>${esc(who(row.source))} → ${esc(who(row.target))}</h2>
     <p><span class="hd-badge">${esc(String(row.state).replace('_', ' '))}</span> ${esc(SENTENCE[row.state] || '')} · updated ${esc(ago(row.updated_at))}${hint ? ` · model hint <code>${esc(hint)}</code>` : ''}</p>
     ${row.mission_id ? `<p class="hd-muted">Mission <a href="#/missions/${encodeURIComponent(row.mission_id)}">${esc(row.mission_id)}</a></p>` : ''}</header>
-    ${hops ? `<h3>Where this sits in the work</h3><ol class="hd-chain" aria-label="Handoff chain, oldest first">${hops}</ol>` : ''}
     <h3>Handoff text — what the next agent was told</h3><p class="hd-goal" data-handoff-goal>${esc(row.goal || '')}</p>
     <div class="hd-cols"><div><h3>Accomplished</h3>${list(row.completed)}</div><div><h3>Missing / what happens next</h3>${list(row.remaining)}</div></div>
+    ${hops ? `<h3>Where this sits in the work</h3><ol class="hd-chain" aria-label="Handoff chain, oldest first">${hops}</ol>` : ''}
     ${(row.decisions || []).length ? `<h3>Decisions</h3>${list(row.decisions)}` : ''}
     ${(row.risks || []).length ? `<h3>Risks</h3>${list(row.risks)}` : ''}
     ${(row.validation || []).length ? `<h3>Validation</h3>${list(row.validation)}` : ''}
@@ -129,7 +133,7 @@ export function routesHtml(routes, active, limit = 12) {
 
 export function mountHandoffs(container, client, { freshness = () => null, open = '' } = {}) {
   let disposed = false, controller = null, loaded = false, signature = null, openWs = null, shown = null;
-  container.innerHTML = `<p class="hd-muted">The big picture: work passed between agents, grouped by workspace. Open a workspace to see its handoffs; open any handoff, box or arrow for what was accomplished, what is missing and what happens next. Handoff text is untrusted and escaped.</p>
+  container.innerHTML = `<p class="hd-muted hd-intro">Work passed between agents, by workspace. Open a workspace, then any handoff. ↑↓ moves through the list. Handoff text is untrusted and escaped.</p>
     <div data-handoff-summary role="status"></div>
     <div class="hd-layout"><div class="hd-main"><section data-handoff-attention aria-label="Needs attention"></section>
     <section data-handoff-list></section></div>
@@ -155,6 +159,14 @@ export function mountHandoffs(container, client, { freshness = () => null, open 
       if (!disposed && shown === id) detail.innerHTML = `<p class="hd-muted">Unable to load handoff ${esc(id)}: ${esc(error.message)}</p>`;
     }
   };
+  container.addEventListener('keydown', (ev) => {         // up/down walks the list; Enter or Space (a button click) opens it
+    if (ev.key !== 'ArrowDown' && ev.key !== 'ArrowUp') return;
+    const here = ev.target.closest?.('.hd-row, .hd-route, .hd-ws__head');
+    if (!here) return;
+    const items = [...container.querySelectorAll('.hd-row, .hd-route, .hd-ws__head')].filter((el) => el.offsetParent !== null);
+    const next = items[items.indexOf(here) + (ev.key === 'ArrowDown' ? 1 : -1)];
+    if (next) { ev.preventDefault(); next.focus(); }
+  });
   container.addEventListener('click', (ev) => {
     const hit = ev.target.closest?.('[data-handoff]');
     if (hit && container.contains(hit)) { void openHandoff(hit.dataset.handoff); return; }
@@ -166,6 +178,8 @@ export function mountHandoffs(container, client, { freshness = () => null, open 
       const done = () => { const note = copy.parentElement.querySelector('[data-handoff-copied]'); if (note) { note.hidden = false; setTimeout(() => { note.hidden = true; }, 2000); } };
       navigator.clipboard?.writeText(text).then(done, () => {}); return;
     }
+    const allHops = ev.target.closest?.('[data-chain-all]');
+    if (allHops) { allHops.closest('ol').querySelectorAll('.hd-hop-far').forEach((li) => { li.hidden = false; }); allHops.parentElement.remove(); return; }
     const route = ev.target.closest?.('[data-route]');
     if (route) { const card = route.closest('[data-workspace]'); card.__route = card.__route === route.dataset.route ? null : route.dataset.route; paint(card); return; }
     if (ev.target.closest?.('[data-route-clear]')) { const card = ev.target.closest('[data-workspace]'); card.__route = null; paint(card); return; }
@@ -197,7 +211,7 @@ export function mountHandoffs(container, client, { freshness = () => null, open 
     const ws = card.dataset.workspace;
     if (!cursor) body.innerHTML = skeleton('workspace handoffs');
     try {
-      const page = await client.pageHandoffs({ workspace: ws, cursor, limit: 50, signal: signalFor() });
+      const page = await client.pageHandoffs({ workspace: ws, cursor, limit: 25, signal: signalFor() });
       if (disposed) return;
       const rows = Array.isArray(page.handoffs) ? page.handoffs : [];
       card.__rows = (cursor ? card.__rows || [] : []).concat(rows);
@@ -210,6 +224,9 @@ export function mountHandoffs(container, client, { freshness = () => null, open 
   const toggleWorkspace = async (card) => {
     const body = card.querySelector('.hd-ws__body'), head = card.querySelector('.hd-ws__head');
     const open = body.hidden;
+    if (open) for (const other of wsList.querySelectorAll('.hd-ws__body:not([hidden])')) {      // one workspace at a time keeps the list short
+      other.hidden = true; other.closest('[data-workspace]').querySelector('.hd-ws__head').setAttribute('aria-expanded', 'false');
+    }
     body.hidden = !open; head.setAttribute('aria-expanded', open ? 'true' : 'false');
     openWs = open ? card.dataset.workspace : null;
     if (open) await loadPage(card);

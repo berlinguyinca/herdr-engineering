@@ -98,3 +98,26 @@ test('a workspace with many routes lists who hands to whom, and picking one filt
     await until(() => page.locator('[data-workspace="wide"] .hd-row').count().then((n) => n === 10), 'show all');
   });
 });
+
+test('the page stays short: one workspace open at a time, arrow keys walk the list, far chain hops fold away', async () => {
+  await withPage(async (page, base) => {
+    const long = Array.from({ length: 9 }, (_, i) => sum(`c${i}`));
+    await boot(page, base, '/handoffs', (p, url) => /\/chain$/.test(p) ? { handoff_id: 'c4', position: 4, chain: long } : api([])(p, url));
+    await page.locator('[data-workspace="org/app"] .hd-ws__head').click();
+    await until(() => page.locator('[data-workspace="org/app"] [data-handoff]').count().then((n) => n === 3), 'first workspace open');
+    await page.locator('[data-workspace="lib"] .hd-ws__head').click();
+    await until(() => page.locator('[data-workspace="lib"] [data-handoff]').count().then((n) => n === 1), 'second workspace open');
+    assert.equal(await page.locator('[data-workspace="org/app"] .hd-ws__body').isHidden(), true, 'the first one folded');
+    assert.equal(await page.locator('.hd-ws__body:not([hidden])').count(), 1);
+
+    await page.locator('[data-workspace="lib"] .hd-ws__head').focus();
+    await page.keyboard.press('ArrowDown');
+    assert.equal(await page.evaluate(() => document.activeElement.dataset.handoff), 'l1', 'ArrowDown moves from the header to the first row');
+    await page.keyboard.press('Enter');
+    await until(() => page.locator('[data-handoff-detail-body]').count().then((n) => n === 1), 'Enter opens the detail');
+
+    assert.equal(await page.locator('.hd-chain li:not([hidden]) .hd-hop').count(), 5, 'only the current hop and two either side show');
+    await page.locator('[data-chain-all]').click();
+    assert.equal(await page.locator('.hd-chain .hd-hop:visible').count(), 9);
+  });
+});
