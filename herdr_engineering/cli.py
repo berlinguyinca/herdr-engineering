@@ -319,6 +319,8 @@ def _build_parser() -> argparse.ArgumentParser:
     add_report_subparser(asub)
     from .artifact_shares_client import add_share_subparser
     add_share_subparser(asub)
+    from .artifact_browse_client import add_browse_subparsers
+    add_browse_subparsers(asub)
     # system-graph artifact (P5): deterministic sanitized snapshot renderer.
     ga = sub.add_parser("graph-artifact", help="render a graph snapshot to validated HTML (system-graph P5)")
     gas = ga.add_subparsers(dest="graph_artifact_command", required=True)

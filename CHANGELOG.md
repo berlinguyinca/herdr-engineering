@@ -5,6 +5,9 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Artifact registry: read-only CLI (unified workspace P03)
+- `herdr-eng artifacts show <id> [version]`, `versions <id>` and `for <kind> <ref> [--query --media-type --limit --cursor]` browse the versioned registry through the existing read routes. Nothing new is exposed server-side; an unreadable artifact answers "not found, or you cannot read it". The key is read from the environment variable named by `--api-key-env` and never printed.
+
 ### Artifact registry: scheduled reconcile (unified workspace P03)
 - The worker can now run the registry's reconcile pass on a schedule: `control_plane.artifact_reconcile: {enabled, interval_seconds, grace_seconds, orphan_ttl_hours, limit}` in the fleet file (YAML only, off unless `enabled` is exactly true). It marks orphan blobs (never deletes them), closes expired uploads and purges tombstones past their hold window; lineage re-emission is not part of the scheduled pass. A failing pass is logged and never stops the worker.
 
