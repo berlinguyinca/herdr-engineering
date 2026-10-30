@@ -18,6 +18,7 @@ _STEP_STATES = {'success', 'failure'}
 _PROVISIONAL_SECONDS = 3600     # a run that ended less than this long before it was read may still have been flushing logs
 _RETRY_SECONDS = 6 * 3600
 _ERROR_BACKOFF_SECONDS = 300
+MAX_ATTEMPTS = 5                # reads of one run's logs per process lifetime, failed or not; then it is left alone
 
 
 def log_tests_config(raw):
@@ -54,6 +55,10 @@ def _epoch(value):
     return None
 
 
+class _Stopped(Exception):
+    """The monitor is closing; abandon the run in hand without penalising it."""
+
+
 class LogTestCollector:
     """Analyses a bounded number of finished runs per poll cycle, newest first, each run once."""
 
@@ -66,6 +71,7 @@ class LogTestCollector:
         self._monotonic = monotonic
         self._memo = {}         # (provider_url, repo id, run) -> {'outcome', 'analysed', 'provisional'}
         self._cooldown = {}     # key -> monotonic time before which a failed read is not retried
+        self._attempts = {}     # key -> how many times this process has read the run
 
     @property
     def max_log_bytes(self):
@@ -92,7 +98,9 @@ class LogTestCollector:
     def candidates(self, pipelines):
         """Finished, in-window, not yet analysed runs, newest first."""
         horizon = self._wall() - self._cfg['window_days'] * 86400
-        rows = []
+        rows, live = [], set()
+        clock = self._monotonic()
+        self._cooldown = {key: until for key, until in self._cooldown.items() if until > clock}
         for group in pipelines.values():
             for row in group:
                 finished = _epoch(row.get('finished_at') or row.get('finished'))
@@ -101,9 +109,13 @@ class LogTestCollector:
                         or row.get('provider_repo_id') in (None, '') or not isinstance(row.get('run_number'), int)):
                     continue
                 key = (row['provider_url'], str(row['provider_repo_id']), row['run_number'])
-                if self._cooldown.get(key, 0) > self._monotonic() or not self._due(key, finished):
+                live.add(key)
+                if key in self._cooldown or self._attempts.get(key, 0) >= MAX_ATTEMPTS or not self._due(key, finished):
                     continue
                 rows.append((finished, key, row))
+        # Bookkeeping follows the runs the monitor still shows; a run that left the window takes its entries with it.
+        self._memo = {key: value for key, value in self._memo.items() if key in live}
+        self._attempts = {key: value for key, value in self._attempts.items() if key in live}
         rows.sort(key=lambda item: item[0], reverse=True)
         return rows
 
@@ -115,9 +127,13 @@ class LogTestCollector:
         for finished, key, row in self.candidates(pipelines)[:self._cfg['runs_per_cycle']]:
             if stop is not None and stop.is_set():
                 break
+            self._attempts[key] = self._attempts.get(key, 0) + 1
             try:
-                body = self.analyse(provider, key, row, finished)
+                body = self.analyse(provider, key, row, finished, stop)
                 self._ingest(body)
+            except _Stopped:
+                self._attempts[key] -= 1
+                break
             except Exception as exc:
                 self._cooldown[key] = self._monotonic() + _ERROR_BACKOFF_SECONDS
                 if getattr(exc, 'reason', '') == 'rate_limited':
@@ -127,18 +143,28 @@ class LogTestCollector:
             done += 1
         return done
 
-    def analyse(self, provider, key, row, finished):
+    def analyse(self, provider, key, row, finished, stop=None):
         provider_url, repo_id, number = key
         self._provider_call()
         detail = provider.pipeline(repo_id, number) or {}
         limit = self._cfg['max_log_mib'] * 1024 * 1024
         parsed, steps, skipped = [], [], []
+        unreadable = False
         for task in detail.get('tasks') or []:
             name = str(task.get('name') or '')
             if task.get('state') not in _STEP_STATES or task.get('id') in (None, '') or name == 'clone':
                 continue
+            if stop is not None and stop.is_set():
+                raise _Stopped
             self._provider_call()
-            fetched = provider.step_log_text(repo_id, number, str(task['id']), max_chars=limit)
+            try:
+                fetched = provider.step_log_text(repo_id, number, str(task['id']), max_chars=limit)
+            except Exception as exc:
+                if getattr(exc, 'reason', '') == 'rate_limited':
+                    raise               # the provider asked for less: stop this run and the cycle
+                skipped.append({'step': name, 'reason': 'read_failed'})     # one unreadable step must not hide the others
+                unreadable = True
+                continue
             if fetched is None:
                 continue
             text, truncated = fetched
@@ -157,7 +183,7 @@ class LogTestCollector:
                 'repository': row.get('repository') or repo_id,
                 'branch': row.get('branch') or row.get('ref') or 'unknown',
                 'revision': row.get('revision') or row.get('commit') or 'unknown',
-                'run_finished_at': row.get('finished_at') or '', 'provisional': age < _PROVISIONAL_SECONDS,
+                'run_finished_at': row.get('finished_at') or '', 'provisional': age < _PROVISIONAL_SECONDS or unreadable,
                 'steps': steps, 'skipped_steps': skipped}
         if combined is None:
             return {**body, 'outcome': 'no_tests'}

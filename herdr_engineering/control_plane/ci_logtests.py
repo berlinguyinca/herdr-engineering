@@ -6,11 +6,15 @@ by its own distinctive summary line, and output that matches no parser yields ``
 """
 from __future__ import annotations
 
+import bisect
 import re
+import time
 
 MAX_INDEX = 5000          # per-test entries kept for one step
 MAX_NAME = 300
-MAX_LINE = 4000
+MAX_LINE = 2000
+TAP_YAML_LINES = 80       # a TAP diagnostic block longer than this is not read to its end
+PARSE_SECONDS = 20.0      # per step: parsers run one after another and the rest are skipped once this is spent
 ANSI = re.compile(r'\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b[()][A-Z0-9]|\r')
 STATES = ('passed', 'failed', 'errored', 'skipped')
 
@@ -33,50 +37,72 @@ def _counts(**kw):
 # --- pytest -----------------------------------------------------------------------------------------------------------------
 _PYTEST_SUMMARY = re.compile(r'^=+ (.*?) in [\d.]+s?(?: \(.*?\))? =+$')
 _PYTEST_WORD = re.compile(r'(\d+) (passed|failed|errors?|skipped|xfailed|xpassed|deselected|warnings?|rerun)')
-_PYTEST_V = re.compile(r'^(\S+?::\S.*?) (PASSED|FAILED|SKIPPED|ERROR|XFAIL|XPASS)\b')
+_PYTEST_STATUS = re.compile(r' (PASSED|FAILED|SKIPPED|ERROR|XFAIL|XPASS)\b')
+_PYTEST_NODE = re.compile(r'::\S')
+
+
+def _pytest_verbose(text):
+    """(node id, status) of a `pytest -v` line, or None. Plain string steps: no regex backtracks over the whole line."""
+    if '::' not in text or text[:1].isspace():
+        return None
+    m = _PYTEST_STATUS.search(text)
+    if m is None or not _PYTEST_NODE.search(text[:m.start()].split(' ', 1)[0]):
+        return None
+    return text[:m.start()], m.group(1)
+
+
 _PYTEST_FAILED = re.compile(r'^(FAILED|ERROR) (\S+::\S.*?)(?: - .*)?$')
 _PYTEST_HEAD = re.compile(r'^_{3,} (.+?) _{3,}$')
 
 
 def parse_pytest(lines):
     totals = None
-    for text in reversed(lines):
+    for text in lines:                  # a step may run pytest more than once; each run prints its own summary
+        if not (text.startswith('=') and text.endswith('=')):
+            continue
         m = _PYTEST_SUMMARY.match(text.strip())
         if m and _PYTEST_WORD.search(m.group(1)):
             words = {}
             for count, word in _PYTEST_WORD.findall(m.group(1)):
                 words[word.rstrip('s') if word.startswith('error') else word] = int(count)
-            totals = _counts(passed=words.get('passed', 0) + words.get('xpassed', 0), failed=words.get('failed', 0),
-                             errored=words.get('error', 0), skipped=words.get('skipped', 0) + words.get('xfailed', 0))
-            break
+            run = _counts(passed=words.get('passed', 0) + words.get('xpassed', 0), failed=words.get('failed', 0),
+                          errored=words.get('error', 0), skipped=words.get('skipped', 0) + words.get('xfailed', 0))
+            totals = run if totals is None else {state: totals[state] + run[state] for state in STATES}
     if totals is None:
         return None
-    heads = [(i + 1, m.group(1)) for i, text in enumerate(lines) if (m := _PYTEST_HEAD.match(text))]
+    heads = [(i + 1, m.group(1)) for i, text in enumerate(lines) if text.startswith('___') and (m := _PYTEST_HEAD.match(text))]
     tests, seen = [], set()
     for i, text in enumerate(lines):
-        m = _PYTEST_V.match(text)
-        if m:
-            status = {'PASSED': 'passed', 'XPASS': 'passed', 'FAILED': 'failed', 'ERROR': 'errored'}.get(m.group(2), 'skipped')
-            seen.add(m.group(1))
-            tests.append(_entry(m.group(1).split('::', 1)[-1].replace('::', '.'), status, i + 1,
-                                suite=m.group(1).split('::', 1)[0]))
+        verbose = _pytest_verbose(text)
+        if verbose:
+            node, word = verbose
+            status = {'PASSED': 'passed', 'XPASS': 'passed', 'FAILED': 'failed', 'ERROR': 'errored'}.get(word, 'skipped')
+            seen.add(node)
+            tests.append(_entry(node.split('::', 1)[-1].replace('::', '.'), status, i + 1, suite=node.split('::', 1)[0]))
     for i, text in enumerate(lines):
-        m = _PYTEST_FAILED.match(text)
+        m = _PYTEST_FAILED.match(text) if text[:1] in 'FE' and text else None
         if m and m.group(2) not in seen:
             seen.add(m.group(2))
             tests.append(_entry(m.group(2).split('::', 1)[-1].replace('::', '.'),
                                 'failed' if m.group(1) == 'FAILED' else 'errored', i + 1, suite=m.group(2).split('::', 1)[0]))
     # A failing test's own output block (the `____ name ____` section) is the range worth reading.
+    def head_key(name):
+        short = name.split('.')[-1]
+        return short.split('[')[0], short.split('[')[-1]
+    by_key = {}
+    for index, (line, name) in enumerate(heads):
+        by_key.setdefault((name.split('.')[-1].split('[')[0], name.split('[')[-1]), index)
+    rules = [i + 1 for i, text in enumerate(lines) if text.startswith('=====')]       # 1-based, ascending
     for t in tests:
         if t['status'] in ('failed', 'errored'):
-            short = t['name'].split('.')[-1]
-            for index, (line, name) in enumerate(heads):
-                if name.split('.')[-1].split('[')[0] == short.split('[')[0] and name.split('[')[-1] == short.split('[')[-1]:
-                    nxt = heads[index + 1][0] if index + 1 < len(heads) else None
-                    if nxt is None:
-                        nxt = next((j + 1 for j in range(line, len(lines)) if lines[j].startswith('=====')), len(lines) + 1)
-                    t['line_start'], t['line_end'] = line, nxt - 1
-                    break
+            index = by_key.get(head_key(t['name']))
+            if index is not None:
+                line = heads[index][0]
+                nxt = heads[index + 1][0] if index + 1 < len(heads) else None
+                if nxt is None:
+                    at = bisect.bisect_right(rules, line)           # first rule below the head (0-based list index == line)
+                    nxt = rules[at] if at < len(rules) else len(lines) + 1
+                t['line_start'], t['line_end'] = line, nxt - 1
     total = sum(totals.values())
     return {'runner': 'pytest', 'counts': totals, 'tests': tests, 'complete': len(tests) == total}
 
@@ -104,12 +130,24 @@ def _tap_entries(lines):
         end, duration = i + 1, None
         j = i + 1
         if j < len(lines) and lines[j].strip() == '---':
-            while j < len(lines) and lines[j].strip() != '...':
-                m = re.match(r'^\s*duration_ms: ([\d.]+)', lines[j])
-                if m:
-                    duration = round(float(m.group(1)))
+            # The diagnostic block is indented under its result and closed by `...`. Stop at the first line that is not
+            # inside it (or after a bounded number of lines) so a missing `...` cannot make every result read to the end.
+            limit = min(len(lines), j + TAP_YAML_LINES)
+            j += 1
+            closed = False
+            while j < limit:
+                line = lines[j]
+                if line.strip() == '...':
+                    closed = True
+                    break
+                if line.strip() and len(line) - len(line.lstrip()) <= indent:
+                    break
+                if 'duration_ms:' in line:
+                    m = re.match(r'^\s*duration_ms: ([\d.]+)', line)
+                    if m:
+                        duration = round(float(m.group(1)))
                 j += 1
-            end = min(j + 1, len(lines))
+            end = min(j + 1, len(lines)) if closed else j
         tests.append(_entry(name or f'test {n + 1}', 'skipped' if directive else ('passed' if ok else 'failed'), i + 1, end,
                             duration_ms=duration))
     return tests
@@ -257,9 +295,22 @@ def parse_jest(lines):
 # --- JVM: surefire, ScalaTest/sbt, gradle -----------------------------------------------------------------------------------
 _SURE = re.compile(r'^(?:\[(?:INFO|ERROR|WARNING)\] )?Tests run: (\d+), Failures: (\d+), Errors: (\d+), Skipped: (\d+)\s*$')
 _SCALA = re.compile(r'^Tests: succeeded (\d+), failed (\d+), canceled (\d+), ignored (\d+), pending (\d+)')
-_SCALA_SUITE = re.compile(r'^([A-Z][\w.$]*):$')
+_SCALA_SUITE = re.compile(r'^([A-Z][\w$]*(?:\.[A-Za-z_][\w$]*)*):$')
 _SCALA_TEST = re.compile(r'^\s*- (.+?)( \*\*\* (FAILED|IGNORED) \*\*\*)?$')
-_SURE_FAIL = re.compile(r'^(?:\[(?:ERROR|WARNING)\] )?(\S.*?)\s+Time elapsed: ([\d.]+) s\s+<<< (FAILURE|ERROR)!')
+_SURE_ELAPSED = re.compile(r'Time elapsed: ([\d.]+) s\s+<<< (FAILURE|ERROR)!')
+_SURE_PREFIX = re.compile(r'^\[(?:ERROR|WARNING)\] ')
+
+
+def _sure_failure(text):
+    """(case, seconds, FAILURE|ERROR) of a surefire failure line. Split at the marker; no pattern scans the line twice."""
+    at = text.find(' Time elapsed: ')
+    if at < 1:
+        return None
+    m = _SURE_ELAPSED.match(text, at + 1)
+    name = _SURE_PREFIX.sub('', text[:at].rstrip(), count=1)
+    if m is None or not name or name[0].isspace():
+        return None
+    return name, m.group(1), m.group(2)
 _GRADLE_TEST = re.compile(r'^(\S+) > (.+?) (PASSED|FAILED|SKIPPED)$')
 _GRADLE = re.compile(r'^(\d+) tests completed, (\d+) failed(?:, (\d+) skipped)?')
 
@@ -276,10 +327,10 @@ def parse_jvm(lines):
             counts['errored'] += errs
             counts['skipped'] += skips
     for i, text in enumerate(lines):
-        f = _SURE_FAIL.match(text)       # surefire prints only the failing cases; the passing ones are counted, not named
+        f = _sure_failure(text)          # surefire prints only the failing cases; the passing ones are counted, not named
         if f:
-            tests.append(_entry(f.group(1), 'failed' if f.group(3) == 'FAILURE' else 'errored', i + 1,
-                                duration_ms=round(float(f.group(2)) * 1000)))
+            tests.append(_entry(f[0], 'failed' if f[2] == 'FAILURE' else 'errored', i + 1,
+                                duration_ms=round(float(f[1]) * 1000)))
     scala = [m for text in lines if (m := _SCALA.match(text))]
     if scala:
         runners.append('scalatest')
@@ -289,8 +340,9 @@ def parse_jvm(lines):
             counts['skipped'] += int(m.group(4)) + int(m.group(5))
         suite = ''
         for i, text in enumerate(lines):
-            s = _SCALA_SUITE.match(text)
-            if s:
+            s = _SCALA_SUITE.match(text) if text.endswith(':') else None
+            # A suite header is followed by its tests (` - name`), possibly after a scope line; any other `Word:` is prose.
+            if s and any(_SCALA_TEST.match(nxt) for nxt in lines[i + 1:i + 4]):
                 suite = s.group(1)
                 continue
             t = _SCALA_TEST.match(text)
@@ -387,12 +439,17 @@ def parse_step_log(text, step_name=''):
     """One step's tests: {runners, counts, tests, complete}, or None when no runner's summary is present."""
     lines = clean_lines(text)
     found = []
+    deadline = time.monotonic() + PARSE_SECONDS
+    exhausted = False
     for parser in PARSERS:
+        if time.monotonic() > deadline:
+            exhausted = True            # what the earlier parsers found stands; the rest are not attempted
+            break
         try:
             result = parser(lines)
         except Exception:           # a parser bug must never take the collector down
             result = None
-        if result and (sum(result['counts'].values()) > 0 or result['runner'] == 'go'):
+        if result and sum(result['counts'].values()) > 0:
             found.append(result)
     if not found:
         return None
@@ -403,15 +460,24 @@ def parse_step_log(text, step_name=''):
             counts[state] += result['counts'][state]
         tests.extend(result['tests'])
     return {'runners': [name for r in found for name in r['runner'].split('+')], 'counts': counts, 'tests': tests[:MAX_INDEX],
-            'complete': all(r['complete'] for r in found) and len(tests) <= MAX_INDEX, 'step': step_name}
+            'complete': all(r['complete'] for r in found) and len(tests) <= MAX_INDEX and not exhausted, 'step': step_name}
 
 
 def combine_steps(steps):
     """Sum the parsed steps of one run. `steps`: [(step_id, step_name, parsed)] with parsed from parse_step_log."""
     counts, runners, index, complete = _counts(), [], [], True
+    seen = set()
     for step_id, name, parsed in steps:
         if parsed is None:
             continue
+        # The same step listed twice (a restarted or duplicated workflow) prints the same tests twice. Only a step with the
+        # same name, runners, counts and identical named tests is taken for a repeat; anything less certain is summed.
+        fingerprint = (name, tuple(parsed['runners']), tuple(parsed['counts'].values()),
+                       tuple((t['suite'], t['name'], t['status']) for t in parsed['tests'])) if parsed['tests'] else None
+        if fingerprint is not None:
+            if fingerprint in seen:
+                continue
+            seen.add(fingerprint)
         for state in STATES:
             counts[state] += parsed['counts'][state]
         for runner in parsed['runners']:
