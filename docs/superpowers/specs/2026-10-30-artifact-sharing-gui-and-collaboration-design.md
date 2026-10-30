@@ -16,7 +16,8 @@ CLI, and wants outside parties to be able to *work on* an artifact, not just vie
 ## Goals
 
 * One **Share** panel on the artifact detail page covering viewer links, collaborators and activity.
-* A **collaborator** credential scoped to exactly one artifact, read-only or read+write, revocable at once.
+* A per-artifact **grant** to an existing collab agent (internal or external), read-only or read+write, revocable at
+  once, used through new tools on the collaboration MCP server.
 * **Git-like commit semantics**: every commit names the version it started from; a stale base is merged
   automatically when the changes do not overlap and rejected with a conflict report when they do.
 * **History is never lost**: merges become real versions with two parents; rejected pushes are logged, not stored as
@@ -26,10 +27,10 @@ CLI, and wants outside parties to be able to *work on* an artifact, not just vie
 ## Non-goals / anti-goals
 
 * Not real-time co-editing, not branches (one head per artifact), not a general permissions redesign.
-* Not merging binary files (PDF, images, parquet) or `report`-profile artifacts (structured descriptors): a stale
-  push to those is always a conflict in v1.
-* Collaborator tokens must never be able to reach anything but their one artifact's collaboration routes — no
-  sharing, no ACL changes, no other artifact, no other API.
+* Not writing binary files (PDF, images, parquet), `report`-profile or renderer-built artifacts via collaboration in
+  v1 (read-only grants are possible for them).
+* A grant must never allow more than the granted artifact's collaboration tools — no sharing, no ACL changes, no other
+  artifact, no registry access from the MCP process.
 * Anti-goal: silently overwriting either side. A merge that is not clean is never applied.
 * Existing share links stay frozen copies; a collaborator commit never changes a live share link.
 
