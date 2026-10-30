@@ -23,8 +23,10 @@ from .host_config import HostConfigUnavailable, exit_unavailable, resolve_contro
 from .service_metadata_feed import MetadataClient
 
 # The complete set of ai-sync invocations this module can make. Everything else is refused before a process exists.
-ALLOWED_COMMANDS = frozenset({("--version",), ("status",), ("env", "list")})
+ALLOWED_COMMANDS = frozenset({("--version",), ("status",), ("env", "list"), ("verify", "--json")})
 DRIFT_SAMPLE_MAX = 20
+VERIFY_SAMPLE_MAX = 10
+VERIFY_CHECKED_KEYS = ("skills", "agents", "commands", "hooks")
 REFRESH_SECONDS = 600
 _TOOL_TIMEOUT = 20.0
 _GIT_TIMEOUT = 10.0
@@ -45,6 +47,15 @@ class ParsedStatus:
     drifted_paths: list[str] = field(default_factory=list)
     drifted_count: int = 0
     skipped_links_count: int = 0
+
+
+@dataclass
+class ParsedVerify:
+    ok: bool
+    errors_count: int
+    warnings_count: int
+    checked: dict[str, int | None]
+    error_sample: list[str]
 
 
 def redact(text: str, limit: int = 200) -> str:
@@ -80,6 +91,53 @@ def parse_status(text: str) -> ParsedStatus:
     return ParsedStatus(drifted_paths=paths, drifted_count=max(len(paths), counters), skipped_links_count=skipped)
 
 
+def _verify_items(value) -> list[tuple[str, str]]:
+    if not isinstance(value, list):
+        return []
+    return [(i["path"], i["problem"]) for i in value
+            if isinstance(i, dict) and isinstance(i.get("path"), str) and isinstance(i.get("problem"), str)]
+
+
+def parse_verify(text: str) -> ParsedVerify | None:
+    """Defensively read ``ai-sync verify --json`` (single env or ``{"envs": [...]}``); None when not that contract.
+
+    Only counts and ``path: problem`` strings survive: configDir and any other member are dropped.
+    """
+    try:
+        doc = json.loads(text)
+    except ValueError:
+        return None
+    if not isinstance(doc, dict) or not isinstance(doc.get("ok"), bool):
+        return None
+    envs = doc.get("envs")
+    if envs is None:
+        models, multi = [doc], False
+    elif isinstance(envs, list) and all(isinstance(e, dict) for e in envs):
+        models, multi = envs, True
+    else:
+        return None
+    errors = warnings = 0
+    sample: list[str] = []
+    sums = dict.fromkeys(VERIFY_CHECKED_KEYS, 0)
+    invalid: set[str] = set()
+    for model in models:
+        bad = _verify_items(model.get("errors"))
+        errors += len(bad)
+        warnings += len(_verify_items(model.get("warnings")))
+        prefix = f"{model['env']}: " if multi and isinstance(model.get("env"), str) else ""
+        sample.extend(redact(f"{prefix}{path}: {problem}") for path, problem in bad[:VERIFY_SAMPLE_MAX])
+        checked = model.get("checked") if isinstance(model.get("checked"), dict) else {}
+        for key in VERIFY_CHECKED_KEYS:
+            n = checked.get(key)
+            if type(n) is int and 0 <= n < 2**31:
+                sums[key] += n
+            else:
+                invalid.add(key)
+    checked_totals = {key: None if key in invalid else n for key, n in sums.items()}
+    return ParsedVerify(ok=doc["ok"], errors_count=errors, warnings_count=warnings, checked=checked_totals,
+                        error_sample=sample[:VERIFY_SAMPLE_MAX])
+
+
 def parse_env_list(text: str) -> list[str]:
     return [m.group(1) for m in (_ENV_ENABLED.match(line) for line in text.splitlines()) if m]
 
@@ -92,7 +150,7 @@ def resolve_binary(explicit: str | None = None, home: Path | None = None) -> str
     return shutil.which("ai-sync", path=os.pathsep.join(filter(None, [os.environ.get("PATH"), extra])))
 
 
-def _run(argv: list[str], *, timeout: float, env: dict[str, str], label: str) -> str:
+def _spawn(argv: list[str], *, timeout: float, env: dict[str, str], label: str) -> tuple[int, str, str]:
     try:
         process = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                    env=env, text=True, errors="replace", start_new_session=True)
@@ -107,9 +165,18 @@ def _run(argv: list[str], *, timeout: float, env: dict[str, str], label: str) ->
             process.kill()
         process.communicate()
         raise AiSyncError(f"{label} timed out after {timeout:g}s") from None
-    if process.returncode != 0:
-        first = next((line for line in (err + out).splitlines() if line.strip()), "")
-        raise AiSyncError(f"{label} exited {process.returncode}: {redact(first)}")
+    return process.returncode, out, err
+
+
+def _exit_error(label: str, code: int, out: str, err: str) -> AiSyncError:
+    first = next((line for line in (err + out).splitlines() if line.strip()), "")
+    return AiSyncError(f"{label} exited {code}: {redact(first)}")
+
+
+def _run(argv: list[str], *, timeout: float, env: dict[str, str], label: str) -> str:
+    code, out, err = _spawn(argv, timeout=timeout, env=env, label=label)
+    if code != 0:
+        raise _exit_error(label, code, out, err)
     return out
 
 
@@ -122,12 +189,34 @@ def _env(home: Path, binary: str | None) -> dict[str, str]:
             "GIT_TERMINAL_PROMPT": "0", "NO_COLOR": "1"}
 
 
-def run_ai_sync(binary: str, args: tuple[str, ...], *, timeout: float, home: Path) -> str:
+def _checked_argv(binary: str, args: tuple[str, ...]) -> list[str]:
     if tuple(args) not in ALLOWED_COMMANDS:
         raise ValueError(f"ai-sync {' '.join(args)!r} is not a permitted read-only command")
-    # The updater is switched off so a status probe can never rewrite the installed tool.
-    return _run([binary, "--no-update-check", *args], timeout=timeout, env=_env(home, binary),
+    # The updater is switched off (global flag, before the subcommand) so a probe can never rewrite the tool.
+    return [binary, "--no-update-check", *args]
+
+
+def run_ai_sync(binary: str, args: tuple[str, ...], *, timeout: float, home: Path) -> str:
+    return _run(_checked_argv(binary, args), timeout=timeout, env=_env(home, binary),
                 label=f"ai-sync {' '.join(args)}")
+
+
+def run_verify(binary: str, *, timeout: float, home: Path) -> ParsedVerify | None:
+    """Run ``ai-sync verify --json``. Exit 1 means "found errors" and still carries JSON, so it is not a failure.
+
+    Returns None for an ai-sync that predates the command; raises AiSyncError for anything else unusable.
+    """
+    command = ("verify", "--json")
+    label = f"ai-sync {' '.join(command)}"
+    code, out, err = _spawn(_checked_argv(binary, command), timeout=timeout, env=_env(home, binary), label=label)
+    if code in (0, 1):
+        parsed = parse_verify(out)
+        if parsed is not None:
+            return parsed
+        if code == 1 and not out.strip() and "unknown command" in err.lower():
+            return None
+        raise AiSyncError(f"{label} output not understood") if code == 0 else _exit_error(label, code, out, err)
+    raise _exit_error(label, code, out, err)
 
 
 def _git(repo: Path, *args: str, home: Path, timeout: float = _GIT_TIMEOUT) -> str:
@@ -159,6 +248,7 @@ def collect_status(host_id: str, *, binary: str | None = None, home: Path | None
     home = Path(home) if home else Path.home()
     errors: list[str] = []
     version, envs, parsed = None, [], ParsedStatus()
+    verified: ParsedVerify | None = None
     exe = resolve_binary(binary, home)
     if exe is None:
         errors.append("ai-sync is not installed")
@@ -175,6 +265,10 @@ def collect_status(host_id: str, *, binary: str | None = None, home: Path | None
                 envs = parse_env_list(out)
             else:
                 parsed = parse_status(out)
+        try:
+            verified = run_verify(exe, timeout=timeout, home=home)
+        except AiSyncError as error:
+            errors.append(str(error))
     branch, ahead, behind, last, git_errors = _git_state(home / ".ai-sync", home)
     errors.extend(git_errors)
     return {
@@ -184,6 +278,12 @@ def collect_status(host_id: str, *, binary: str | None = None, home: Path | None
         "skipped_links_count": parsed.skipped_links_count,
         "last_error": "; ".join(errors)[:400] or None,
         "checked_at": datetime.now(UTC).isoformat(),
+        "verify_ok": verified.ok if verified else None,
+        "verify_errors_count": verified.errors_count if verified else None,
+        "verify_warnings_count": verified.warnings_count if verified else None,
+        "verify_checked": verified.checked if verified else None,
+        "verify_error_sample": verified.error_sample if verified else None,
+        "verify_checked_at": datetime.now(UTC).isoformat() if verified else None,
     }
 
 
@@ -201,7 +301,7 @@ class AiSyncFeed:
                        last_error=payload["last_error"])
         if dry_run:
             return summary
-        fingerprint = json.dumps({k: v for k, v in payload.items() if k != "checked_at"}, sort_keys=True)
+        fingerprint = json.dumps({k: v for k, v in payload.items() if k not in ("checked_at", "verify_checked_at")}, sort_keys=True)
         now = self.clock()
         if fingerprint == self.last_fingerprint and now - self.last_post < REFRESH_SECONDS:
             summary["unchanged"] = 1

@@ -5,14 +5,37 @@ Every fleet host runs `herdr_engineering.ai_sync_feed` (user unit `herdr-eng-ai-
 `site.yml`; enabled only where `ai-sync` is installed). It posts one `ai_sync` / `status` envelope per host to
 `POST /api/v1/ingest`; the dashboard reads `GET /api/v1/ai-sync` (latest per host, `?host_id=` filters) at `#/ai-sync`.
 
-Read-only by construction: the only commands it can run are `ai-sync --version`, `ai-sync status` and
-`ai-sync env list` (always with `--no-update-check`) plus `git rev-list/log/rev-parse` on `~/.ai-sync`. `ai-sync status`
+Read-only by construction: the only commands it can run are `ai-sync --version`, `ai-sync status`,
+`ai-sync env list` and `ai-sync verify --json` (always `ai-sync --no-update-check <subcommand>`, the global flag first) plus `git rev-list/log/rev-parse` on `~/.ai-sync`. `ai-sync status`
 itself runs a `git fetch`, which updates remote-tracking refs only. It never runs `pull`/`push`.
 
 Payload: `host_id, ai_sync_version, envs_enabled, last_sync_ts` (last commit time of the sync repo), `ahead, behind,
 branch, drifted_files_count, drift_sample` (<=20 relative paths, no contents), `skipped_links_count, last_error`
-(redacted, <=400 chars), `checked_at`. The control plane rejects any other field. The dashboard marks a host warn after 1 h
+(redacted, <=400 chars), `checked_at`, plus the optional verify fields below. The control plane rejects any other field. The dashboard marks a host warn after 1 h
 and stale after 24 h without a sync.
+
+## Config-loads check: `ai-sync verify --json`
+
+`verify` checks that the synced config really loads on the machine (skills, agents, commands, hooks, settings). It prints
+JSON (`{"ok", "env", "checked": {...}, "errors": [{"path","problem"}], "warnings": [...], "truncated"?}`, or
+`{"ok", "envs": [...]}` with several envs) and exits 0 (ok), 1 (errors found, JSON still printed) or 2 (failure). The feeder
+accepts exit 0 and 1, parses the JSON defensively and aggregates all envs. An `ai-sync` without the command ("unknown
+command") is not an error: the fields below are `null`. Any other failure (exit 2, timeout, unreadable output) is
+reported once in `last_error` and the fields stay `null`. Same timeout and process-group kill as the other commands.
+
+Optional payload fields (all may be absent or `null` = unknown; old payloads stay valid):
+
+| field | type |
+| --- | --- |
+| `verify_ok` | bool, all envs load |
+| `verify_errors_count`, `verify_warnings_count` | non-negative int; with `truncated` output the error count is a lower bound |
+| `verify_checked` | `{skills, agents, commands, hooks}`, each int or null, summed over envs |
+| `verify_error_sample` | <=10 strings `path: problem` (`env: path: problem` with several envs), each <=200 chars, redacted like `last_error` |
+| `verify_checked_at` | ISO timestamp of the run (does not by itself trigger a re-post) |
+
+Only counts and `path: problem` text are sent: `configDir`, file contents and any other member of the output are dropped.
+The control plane validates these strictly and returns them in `GET /api/v1/ai-sync`. The dashboard shows a **Loads**
+column (`OK`, `N errors` with the sample as a tooltip, `—` when unknown) and highlights a row when `verify_ok` is false.
 
 `ai-sync status` has no JSON mode; the plain output is parsed defensively (fixtures in `tests/fixtures/ai_sync`).
 

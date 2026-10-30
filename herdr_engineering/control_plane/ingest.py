@@ -63,8 +63,11 @@ def _git_identity(payload):
     return {"repository_id": next(iter(identities), None), "commit_sha": commit_sha}
 
 
-AI_SYNC_COUNTS = ("ahead", "behind", "drifted_files_count", "skipped_links_count")
-AI_SYNC_TEXT = {"ai_sync_version": 40, "last_sync_ts": 40, "branch": 200, "last_error": 500}
+AI_SYNC_COUNTS = ("ahead", "behind", "drifted_files_count", "skipped_links_count",
+                  "verify_errors_count", "verify_warnings_count")
+AI_SYNC_TEXT = {"ai_sync_version": 40, "last_sync_ts": 40, "branch": 200, "last_error": 500, "verify_checked_at": 40}
+AI_SYNC_VERIFY_CHECKED = ("skills", "agents", "commands", "hooks")
+AI_SYNC_VERIFY_SAMPLE = (10, 200)
 
 
 def validate_ai_sync(entity_id, event_type, payload) -> dict:
@@ -76,7 +79,8 @@ def validate_ai_sync(entity_id, event_type, payload) -> dict:
         raise ValueError("ai_sync event_type must be 'status'")
     if not isinstance(payload, dict):
         raise ValueError("ai_sync payload must be an object")
-    allowed = {"host_id", "envs_enabled", "drift_sample", "checked_at", *AI_SYNC_COUNTS, *AI_SYNC_TEXT}
+    allowed = {"host_id", "envs_enabled", "drift_sample", "checked_at", "verify_ok", "verify_checked",
+               "verify_error_sample", *AI_SYNC_COUNTS, *AI_SYNC_TEXT}
     unknown = sorted(set(payload) - allowed)
     if unknown:
         raise ValueError(f"unknown ai_sync field: {unknown[0]}")
@@ -103,6 +107,24 @@ def validate_ai_sync(entity_id, event_type, payload) -> dict:
                 or any(not isinstance(v, str) or len(v) > limit for v in values)):
             raise ValueError(f"ai_sync {key} must be a list of at most {count} strings of at most {limit} characters")
         clean[key] = list(values)
+    # Optional ai-sync verify result (absent/null = unknown): a verdict, counts and short "path: problem" strings.
+    verify_ok = payload.get("verify_ok")
+    if verify_ok is not None and type(verify_ok) is not bool:
+        raise ValueError("ai_sync verify_ok must be a boolean")
+    clean["verify_ok"] = verify_ok
+    checked = payload.get("verify_checked")
+    if checked is not None:
+        if (not isinstance(checked, dict) or set(checked) != set(AI_SYNC_VERIFY_CHECKED)
+                or any(v is not None and (type(v) is not int or not 0 <= v < 2**31) for v in checked.values())):
+            raise ValueError("ai_sync verify_checked must be skills/agents/commands/hooks non-negative integers")
+        checked = {key: checked[key] for key in AI_SYNC_VERIFY_CHECKED}
+    clean["verify_checked"] = checked
+    sample = payload.get("verify_error_sample")
+    count, limit = AI_SYNC_VERIFY_SAMPLE
+    if sample is not None and (not isinstance(sample, list) or len(sample) > count
+                               or any(not isinstance(v, str) or len(v) > limit for v in sample)):
+        raise ValueError(f"ai_sync verify_error_sample must be a list of at most {count} strings of at most {limit} characters")
+    clean["verify_error_sample"] = None if sample is None else list(sample)
     return clean
 
 

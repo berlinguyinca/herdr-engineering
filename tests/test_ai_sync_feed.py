@@ -22,12 +22,14 @@ from herdr_engineering.ai_sync_feed import (
     collect_status,
     parse_env_list,
     parse_status,
+    parse_verify,
     run_ai_sync,
 )
 
 FIXTURES = Path(__file__).parent / "fixtures" / "ai_sync"
 PAYLOAD_KEYS = {"host_id", "ai_sync_version", "envs_enabled", "last_sync_ts", "ahead", "behind", "branch",
-                "drifted_files_count", "drift_sample", "skipped_links_count", "last_error", "checked_at"}
+                "drifted_files_count", "drift_sample", "skipped_links_count", "last_error", "checked_at", "verify_ok", "verify_errors_count",
+                "verify_warnings_count", "verify_checked", "verify_error_sample", "verify_checked_at"}
 
 
 def fixture(name):
@@ -238,4 +240,128 @@ def test_dry_run_posts_nothing(tmp_path, cp):
 
 
 def test_allowed_commands_are_read_only():
-    assert feed.ALLOWED_COMMANDS == frozenset({("--version",), ("status",), ("env", "list")})
+    assert feed.ALLOWED_COMMANDS == frozenset({("--version",), ("status",), ("env", "list"), ("verify", "--json")})
+
+
+def test_verify_is_allowed_with_the_global_flag_before_it_and_pull_push_stay_refused(tmp_path):
+    binary = script(tmp_path, 'echo "$@"')
+    assert run_ai_sync(binary, ("verify", "--json"), timeout=2, home=tmp_path).split() == [
+        "--no-update-check", "verify", "--json"]
+    for forbidden in (("pull",), ("push",), ("verify",), ("verify", "--fix"), ("verify", "--json", "--fix")):
+        with pytest.raises(ValueError):
+            run_ai_sync(binary, forbidden, timeout=2, home=tmp_path)
+
+
+def test_parse_verify_ok_fixture():
+    v = parse_verify(fixture("verify-ok.json"))
+    assert (v.ok, v.errors_count, v.warnings_count) == (True, 0, 0)
+    assert v.checked == {"skills": 12, "agents": 4, "commands": 9, "hooks": 3} and v.error_sample == []
+
+
+def test_parse_verify_errors_fixture_builds_path_problem_sample():
+    v = parse_verify(fixture("verify-errors.json"))
+    assert (v.ok, v.errors_count, v.warnings_count) == (False, 2, 1)
+    assert v.error_sample == ["skills/x/SKILL.md: missing frontmatter field: description", "settings.json: invalid JSON at line 4"]
+
+
+def test_parse_verify_truncated_fixture_is_bounded_to_ten():
+    v = parse_verify(fixture("verify-truncated.json"))
+    assert v.ok is False and v.errors_count == 30 and len(v.error_sample) == 10
+
+
+def test_parse_verify_multi_env_aggregates_all_envs():
+    v = parse_verify(fixture("verify-multi-env.json"))
+    assert (v.ok, v.errors_count, v.warnings_count) == (False, 1, 1)
+    assert v.checked == {"skills": 14, "agents": 4, "commands": 10, "hooks": 3}
+    assert v.error_sample == ["pi: skills/y/SKILL.md: unreadable"]
+
+
+def test_parse_verify_redacts_and_bounds_samples():
+    secret = "https://alice:pw@github.com/x " + "A" * 40
+    doc = json.dumps({"ok": False, "checked": {}, "errors": [{"path": "a" * 150, "problem": secret + "z" * 300}]})
+    v = parse_verify(doc)
+    assert len(v.error_sample[0]) <= 200 and "alice" not in v.error_sample[0] and "AAAAAAAA" not in v.error_sample[0]
+
+
+@pytest.mark.parametrize("text", ["", "not json", "[]", "null", '{"ok":"yes"}', "{}", '{"ok":true,"envs":"x"}',
+                                  fixture("verify-unknown-command.txt")])
+def test_parse_verify_rejects_garbage_without_raising(text):
+    assert parse_verify(text) is None
+
+
+def test_parse_verify_tolerates_wrong_typed_members():
+    doc = '{"ok":false,"checked":{"skills":"x","agents":-1,"commands":true,"hooks":2},"errors":[1,{"path":3},{"path":"p","problem":"q"}],"warnings":"w"}'
+    v = parse_verify(doc)
+    assert v.checked == {"skills": None, "agents": None, "commands": None, "hooks": 2}
+    assert v.error_sample == ["p: q"] and v.warnings_count == 0
+
+
+def verify_binary(tmp_path, verify_body):
+    return script(tmp_path, f"""case "$2" in
+  --version) echo 1.2.3;;
+  status) echo clean;;
+  env) printf "  claude       Claude Code      enabled\\n";;
+  verify) {verify_body};;
+esac""")
+
+
+def test_collect_records_verify_from_exit_code_one_json(tmp_path):
+    binary = verify_binary(tmp_path, f'cat "{FIXTURES}/verify-errors.json"; exit 1')
+    payload = collect_status("h1", binary=binary, home=tmp_path)
+    assert payload["verify_ok"] is False and payload["verify_errors_count"] == 2 and payload["verify_warnings_count"] == 1
+    assert payload["verify_checked"] == {"skills": 12, "agents": 4, "commands": 9, "hooks": 3}
+    assert payload["verify_checked_at"].endswith("+00:00")
+    assert payload["last_error"] is None or "verify" not in payload["last_error"]
+
+
+def test_collect_with_ok_verify(tmp_path):
+    binary = verify_binary(tmp_path, f'cat "{FIXTURES}/verify-ok.json"')
+    payload = collect_status("h1", binary=binary, home=tmp_path)
+    assert payload["verify_ok"] is True and payload["verify_error_sample"] == []
+
+
+def test_older_ai_sync_without_verify_yields_null_fields_and_no_error(tmp_path):
+    binary = verify_binary(tmp_path, f'cat "{FIXTURES}/verify-unknown-command.txt" >&2; exit 1')
+    payload = collect_status("h1", binary=binary, home=tmp_path)
+    assert set(payload) == PAYLOAD_KEYS
+    for key in (k for k in PAYLOAD_KEYS if k.startswith("verify_")):
+        assert payload[key] is None, key
+    assert "verify" not in (payload["last_error"] or "")
+
+
+def test_verify_failure_exit_two_is_reported_once_and_leaves_fields_null(tmp_path):
+    binary = verify_binary(tmp_path, "echo boom >&2; exit 2")
+    payload = collect_status("h1", binary=binary, home=tmp_path)
+    assert payload["verify_ok"] is None and "verify" in payload["last_error"] and "exited 2" in payload["last_error"]
+
+
+def test_verify_garbage_output_is_not_trusted(tmp_path):
+    binary = verify_binary(tmp_path, "echo '<html>nope</html>'")
+    payload = collect_status("h1", binary=binary, home=tmp_path)
+    assert payload["verify_ok"] is None and payload["verify_error_sample"] is None
+
+
+def test_verify_timeout_is_bounded(tmp_path):
+    binary = verify_binary(tmp_path, "sleep 30")
+    started = time.monotonic()
+    payload = collect_status("h1", binary=binary, home=tmp_path, timeout=0.5)
+    assert time.monotonic() - started < 8 and payload["verify_ok"] is None and "timed out" in payload["last_error"]
+
+
+def test_verify_never_sends_file_contents(tmp_path):
+    doc = json.dumps({"ok": False, "checked": {"skills": 1}, "configDir": "/h", "contents": "SECRET-CONTENT-MARKER",
+                      "errors": [{"path": "a.md", "problem": "bad", "content": "SECRET-CONTENT-MARKER"}]})
+    (tmp_path / "v.json").write_text(doc)
+    payload = collect_status("h1", binary=verify_binary(tmp_path, f'cat "{tmp_path}/v.json"; exit 1'), home=tmp_path)
+    assert "SECRET-CONTENT-MARKER" not in json.dumps(payload) and "/h" not in json.dumps(payload["verify_error_sample"])
+
+
+def test_verify_change_alone_changes_the_fingerprint_but_its_timestamp_does_not(tmp_path, cp):
+    ticks = [0.0]
+    ok = verify_binary(tmp_path, f'cat "{FIXTURES}/verify-ok.json"')
+    agent = AiSyncFeed(feed.MetadataClient(cp, "k"), host_id="h1", binary=ok, home=tmp_path, clock=lambda: ticks[0])
+    assert agent.run_once()["posted"] == 1
+    ticks[0] = 60
+    assert agent.run_once()["unchanged"] == 1
+    agent.binary = verify_binary(tmp_path, f'cat "{FIXTURES}/verify-errors.json"; exit 1')
+    assert agent.run_once()["posted"] == 1

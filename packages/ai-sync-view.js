@@ -25,31 +25,45 @@ const ageText = (iso, now) => {
 const count = (v) => (Number.isInteger(v) && v >= 0 ? v : null);
 const strings = (v) => (Array.isArray(v) ? v.filter((x) => typeof x === 'string') : []);
 
+// ai-sync verify result: ok is true/false only when the host reported a real boolean, otherwise unknown.
+const verifyOf = (h) => {
+  const ok = typeof h.verify_ok === 'boolean' ? h.verify_ok : null;
+  return { ok, errors: count(h.verify_errors_count), sample: strings(h.verify_error_sample).slice(0, 10) };
+};
+const loadsCell = (v) => {
+  if (v.ok === null) return '<span class="ais-loads">—</span>';
+  if (v.ok) return '<span class="ais-loads ais-loads-ok">OK</span>';
+  const text = v.errors === null ? 'Fails' : `${v.errors} ${v.errors === 1 ? 'error' : 'errors'}`;
+  const tip = v.sample.length ? ` title="${v.sample.map(esc).join('&#10;')}"` : '';
+  return `<span class="ais-loads ais-loads-bad"${tip}>${text}</span>`;
+};
+
 export function aiSyncRows(data, now = Date.now()) {
   const hosts = Array.isArray(data?.hosts) ? data.hosts.filter((h) => h && typeof h === 'object') : [];
   return hosts.map((h) => {
     const state = ageState(h.last_sync_ts, now);
     return { host: String(h.host_id ?? ''), version: typeof h.ai_sync_version === 'string' ? h.ai_sync_version : '', envs: strings(h.envs_enabled),
       state, age: ageText(h.last_sync_ts, now), ahead: count(h.ahead), behind: count(h.behind), drift: count(h.drifted_files_count) ?? 0,
-      sample: strings(h.drift_sample).slice(0, 20), skipped: count(h.skipped_links_count) ?? 0,
+      sample: strings(h.drift_sample).slice(0, 20), skipped: count(h.skipped_links_count) ?? 0, verify: verifyOf(h),
       error: typeof h.last_error === 'string' ? h.last_error : '', checked: ageText(h.checked_at, now) };
   }).sort((a, b) => STATE_RANK[a.state] - STATE_RANK[b.state] || a.host.localeCompare(b.host));
 }
 
 export const AI_SYNC_STYLE = `<style>.ais-table{width:100%;border-collapse:collapse;font-size:.8125rem}.ais-table th,.ais-table td{text-align:left;padding:6px 8px;border-top:1px solid var(--border-subtle);overflow-wrap:anywhere;vertical-align:top}.ais-table th{color:var(--text-muted);font-weight:500;border-top:0}
 .ais-table tr[data-state=stale] td:first-child{border-left:4px solid var(--status-failed,#b42318)}.ais-table tr[data-state=warn] td:first-child{border-left:4px solid var(--status-attention,#9a6700)}
-.ais-err{color:var(--status-failed,#b42318)}.ais-drift{color:var(--status-attention,#9a6700);font-weight:600}.ais-sample{margin:4px 0 0;padding-left:16px;color:var(--text-muted);font-size:.75rem}</style>`;
+.ais-table tr[data-verify=failed]{background:color-mix(in srgb,var(--status-failed,#b42318) 8%,transparent)}.ais-loads-ok{color:var(--status-ok,#1a7f37)}.ais-loads-bad{color:var(--status-failed,#b42318);font-weight:600;cursor:help}.ais-err{color:var(--status-failed,#b42318)}.ais-drift{color:var(--status-attention,#9a6700);font-weight:600}.ais-sample{margin:4px 0 0;padding-left:16px;color:var(--text-muted);font-size:.75rem}</style>`;
 
 export function renderAiSync(data, now = Date.now()) {
   const rows = aiSyncRows(data, now);
   if (!rows.length) return '<herdr-empty message="No hosts have reported ai-sync status yet"></herdr-empty>';
-  const body = rows.map((r) => `<tr data-host-id="${esc(r.host)}" data-state="${r.state}">
+  const body = rows.map((r) => `<tr data-host-id="${esc(r.host)}" data-state="${r.state}"${r.verify.ok === false ? ' data-verify="failed"' : ''}>
     <td><strong>${esc(r.host)}</strong></td><td>${r.version ? esc(r.version) : '—'}</td><td>${r.envs.length ? esc(r.envs.join(', ')) : '—'}</td>
     <td><herdr-status stage="${STAGE[r.state]}"></herdr-status> <span title="${esc(STATE_TEXT[r.state])}">${esc(r.age)}</span></td>
     <td>${r.ahead === null ? '—' : `ahead ${r.ahead}`} / ${r.behind === null ? '—' : `behind ${r.behind}`}</td>
     <td><span${r.drift ? ' class="ais-drift"' : ''}>${r.drift}</span>${r.sample.length ? `<ul class="ais-sample">${r.sample.map((p) => `<li>${esc(p)}</li>`).join('')}</ul>` : ''}${r.skipped ? `<div class="ais-sample">${r.skipped} skipped</div>` : ''}</td>
+    <td>${loadsCell(r.verify)}</td>
     <td>${r.error ? `<span class="ais-err">${esc(r.error)}</span>` : '—'}</td></tr>`).join('');
-  return `<table class="ais-table"><thead><tr><th>Host</th><th>Version</th><th>Envs</th><th>Last sync</th><th>Ahead / behind</th><th>Drifted files</th><th>Last error</th></tr></thead><tbody>${body}</tbody></table>`;
+  return `<table class="ais-table"><thead><tr><th>Host</th><th>Version</th><th>Envs</th><th>Last sync</th><th>Ahead / behind</th><th>Drifted files</th><th>Loads</th><th>Last error</th></tr></thead><tbody>${body}</tbody></table>`;
 }
 
 export const AI_SYNC_POLL_MS = 30000;

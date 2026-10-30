@@ -43,6 +43,34 @@ test('hosts without ai-sync or data show dashes, and an empty fleet is explained
   assert.ok(renderAiSync(null, NOW).includes('No hosts have reported'));
 });
 
+const VERIFY_BAD = { verify_ok: false, verify_errors_count: 2, verify_warnings_count: 1, verify_error_sample: ['skills/x/SKILL.md: missing description', 'settings.json: invalid JSON'] };
+
+test('Loads column shows OK, N errors with a tooltip sample, and a dash when unknown', () => {
+  const html = renderAiSync({ hosts: [host({ host_id: 'good', verify_ok: true, verify_errors_count: 0 }), host({ host_id: 'bad', ...VERIFY_BAD }), host({ host_id: 'old' })] }, NOW);
+  assert.ok(html.includes('<th>Loads</th>'));
+  const row = (id) => html.split('<tr data-host-id=').find((r) => r.startsWith(`"${id}"`));
+  assert.match(row('good'), /class="ais-loads ais-loads-ok"[^>]*>OK</);
+  assert.match(row('bad'), /class="ais-loads ais-loads-bad" title="skills\/x\/SKILL\.md: missing description&#10;settings\.json: invalid JSON"[^>]*>2 errors</);
+  assert.match(row('old'), /class="ais-loads">—</);
+});
+
+test('a host whose config does not load is highlighted; unknown or OK is not', () => {
+  const html = renderAiSync({ hosts: [host({ host_id: 'bad', ...VERIFY_BAD }), host({ host_id: 'good', verify_ok: true }), host({ host_id: 'old' })] }, NOW);
+  const row = (id) => html.split('<tr data-host-id=').find((r) => r.startsWith(`"${id}"`));
+  assert.ok(row('bad').includes('data-verify="failed"') && !row('good').includes('data-verify="failed"') && !row('old').includes('data-verify="failed"'));
+  assert.equal(aiSyncRows({ hosts: [host(VERIFY_BAD)] }, NOW)[0].verify.ok, false);
+});
+
+test('verify wording and hostile sample text are safe', () => {
+  const one = renderAiSync({ hosts: [host({ verify_ok: false, verify_errors_count: 1, verify_error_sample: ['"><img src=x onerror=alert(1)>: <b>'] })] }, NOW);
+  assert.ok(one.includes('1 error<') && !one.includes('1 errors'));
+  assert.ok(!one.includes('<img') && !one.includes('<b>') && one.includes('&lt;img'));
+  const noCount = renderAiSync({ hosts: [host({ verify_ok: false, verify_errors_count: null })] }, NOW);
+  assert.ok(noCount.includes('>Fails<'));
+  const junk = renderAiSync({ hosts: [host({ verify_ok: 'yes', verify_errors_count: -3, verify_error_sample: [1, null] })] }, NOW);
+  assert.ok(junk.includes('class="ais-loads">—<'));
+});
+
 test('client lists ai-sync status from a real HTTP server', async () => {
   const seen = [];
   const server = createServer((req, res) => { seen.push(req.url); res.setHeader('Content-Type', 'application/json'); res.end(JSON.stringify({ hosts: [host()] })); });
