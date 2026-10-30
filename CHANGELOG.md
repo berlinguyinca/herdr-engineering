@@ -5,6 +5,9 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### CI page: the history report is built once per few seconds
+- `GET /api/v1/ci/reports` took about 5 s per call and 6, 12 and 17 s for three at once, because every open CI page rebuilt it on every refresh. Pages that gave up showed "CI history: Failed to fetch" and left broken-pipe tracebacks in the log (106 in 40 minutes). The first caller now builds it and concurrent callers wait for that one result; a result is reused for 15 s (the page refreshes every 20 s). A failed build is not cached. Data can therefore be up to 15 s old on this endpoint only.
+
 ### CI page: one attention item per repository
 - "Needs attention" on the CI page no longer lists the same repository once per pull request and branch. Unfixed failures of one repository are one row: the newest failure leads (its failing step and log load when the row is opened), and the other failing branches and pull requests are listed inside it, with a "N branches or PRs failing" chip. Each ref is still judged on its own, so a green main does not clear a red pull request, and a ref that gets a green run drops out of the row. The Overview badge counts repositories.
 
