@@ -2292,7 +2292,10 @@ def _make_handler(server, public=False, operator=False):
             return self._timed_request(self._mutate_verb)
 
         def do_PUT(self):
-            # PUT exists only for assistant-apps (client credentials, blocked calendars); everything else keeps its 501.
+            # PUT exists only for assistant-apps (client credentials, blocked calendars); everything else keeps its flat
+            # 501, decided before any listener-specific handler (operator/public/federation/collab) sees the request.
+            if operator or public or not self.path.startswith("/api/v1/assistant-apps/"):
+                return self._timed_request(lambda: self._send_json(501, {"error": "not implemented"}))
             return self._timed_request(self._mutate_verb)
 
         _ASSISTANT_MUTABLE_RESOURCES = {"assistants", "assistant-runs",
@@ -2334,6 +2337,8 @@ def _make_handler(server, public=False, operator=False):
                 if origin and (urlsplit(origin).netloc != self.headers.get("Host")
                                or urlsplit(origin).scheme not in {"http", "https"}):
                     return self._deny(403, "cross-origin app connection mutation refused")
+                if self.command == "PUT" and self.headers.get("Content-Type", "").split(";", 1)[0].strip() != "application/json":
+                    return self._deny(415, "app connection mutations require application/json")
             return self._route_api()
 
         # ------------------------------------------------ fleet config (hosts)
@@ -4042,6 +4047,8 @@ def _make_handler(server, public=False, operator=False):
             """Browser landing of the Google sign-in. Always a 302 back to the dashboard; the Location carries only a
             fixed reason string, never provider text, the code or the state."""
             from .app_credentials import AppsError
+            if self._rate_limit():
+                return None
             params = {k: v[0] for k, v in parse_qs(urlsplit(self.path).query).items() if v}
             result = "connected=google"
             try:
@@ -4090,6 +4097,7 @@ def _make_handler(server, public=False, operator=False):
             body = body if isinstance(body, dict) else {}
             try:
                 if tail == ["google", "client"]:
+                    # One GLOBAL Google OAuth client for the whole deployment (not per person); operator-only by design.
                     apps.save_client("google", body.get("client_id"), body.get("client_secret"))
                     return self._json({"ok": True})
                 if tail == ["google", "connect"]:

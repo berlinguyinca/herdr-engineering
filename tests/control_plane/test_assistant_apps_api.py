@@ -20,6 +20,7 @@ from herdr_engineering.control_plane.repo import ControlPlaneRepo
 
 KEY = "apps-test-operator-key"
 OTHER = "apps-test-other-key"
+VIEWER = "apps-test-viewer-key"
 SECRET = "client-secret-xyz"
 BASE = "/api/v1/assistant-apps"
 
@@ -49,7 +50,7 @@ def fake_google(req, timeout):
 def _serve(sink, apps):
     cfg = assistant_config({"personal_assistant": {"enabled": True, **({"apps": apps} if apps is not None else {})}})
     svr = ControlPlaneServer(ControlPlaneRepo(sink=sink), assistant_service=AssistantService(config=cfg),
-                             api_keys={KEY: "operator", OTHER: "operator"})
+                             api_keys={KEY: "operator", OTHER: "operator", VIEWER: "viewer"})
     threading.Thread(target=svr.serve, daemon=True).start()
     svr.wait_until_ready()
     return svr
@@ -190,3 +191,52 @@ def test_disconnect_and_unknown_routes(ready):
     assert call(ready, BASE + "/google", None, "DELETE") == (200, {"ok": True})
     assert call(ready, BASE + "/nope/connect", {}, "POST")[0] == 404
     assert call(ready, BASE + "/google/calendars")[0] == 404          # arrives with a later task
+
+
+def _raw(svr, method, path, headers=None, body=None):
+    conn = http.client.HTTPConnection("127.0.0.1", svr.port)
+    h = {"X-API-Key": KEY, "Content-Type": "application/json", **(headers or {})}
+    conn.request(method, path, body=body, headers=h)
+    r = conn.getresponse()
+    r.read()
+    return r.status
+
+
+def test_put_is_501_outside_assistant_apps(ready):
+    assert _raw(ready, "PUT", "/api/v1/assistant-memory/x", body=b"{}") == 501
+    assert _raw(ready, "PUT", "/api/v1/collab/rooms/r1/profile", body=b"{}") == 501
+    assert _raw(ready, "PUT", "/api/v1/assistant-apps", body=b"{}") == 501
+
+
+def test_cross_origin_and_wrong_content_type_mutations_are_refused(ready):
+    evil = {"Origin": "http://evil.example"}
+    assert _raw(ready, "PUT", BASE + "/google/client", evil, b'{"client_id":"a","client_secret":"b"}') == 403
+    assert _raw(ready, "DELETE", BASE + "/google", evil) == 403
+    assert _raw(ready, "POST", BASE + "/google/connect", evil, b"{}") == 403
+    assert _raw(ready, "PUT", BASE + "/google/client", {"Content-Type": "text/plain"}, b"{}") == 415
+
+
+def test_viewer_key_cannot_mutate(ready):
+    for method, path, payload in (("PUT", "/google/client", {"client_id": "a", "client_secret": "b"}),
+                                  ("POST", "/google/connect", {}), ("DELETE", "/google", None),
+                                  ("PUT", "/google/blocked-calendars", {"ids": ["x"]})):
+        assert call(ready, BASE + path, payload, method, key=VIEWER)[0] == 403
+
+
+def test_a_second_key_cannot_touch_another_persons_connection(ready):
+    call(ready, BASE + "/google/client", {"client_id": "cid.apps", "client_secret": SECRET}, "PUT")
+    url = call(ready, BASE + "/google/connect", {}, "POST")[1]["url"]
+    state = urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)["state"][0]
+    raw_get(ready, BASE + f"/google/callback?state={state}&code=c")
+    call(ready, BASE + "/google/blocked-calendars", {"ids": ["mine"]}, "PUT")
+    assert call(ready, BASE + "/google", None, "DELETE", key=OTHER)[0] == 200      # deletes OTHER's (nonexistent) own
+    call(ready, BASE + "/google/blocked-calendars", {"ids": ["theirs"]}, "PUT", key=OTHER)
+    mine = next(p for p in call(ready, BASE)[1]["providers"] if p["id"] == "gmail")
+    assert mine["connected"] is True
+    assert call(ready, BASE + "/google/blocked-calendars")[1] == {"ids": ["mine"]}
+
+
+def test_callback_variants_stay_safe(ready):
+    cb = BASE + "/google/callback"
+    for path in (cb + "/", cb + "/?state=x", cb + "?state=x&state=y&code=", cb + "?code=1&x=%00"):
+        assert raw_get(ready, path) == (302, "/#/personal-assistant?error=bad_state")
