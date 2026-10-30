@@ -16,7 +16,7 @@ from herdr_engineering.control_plane.collab_cognito import CognitoAuthenticator
 from herdr_engineering.control_plane.share_bundle import remove_state, write_state
 from herdr_engineering.control_plane.share_lab import authorise_lab
 from herdr_engineering.control_plane.share_session import check_session, mint_session
-from tests.control_plane.test_share_public import CSP, EXPOSE, FILES, OTHER_TOKEN, TOKEN, Env
+from tests.control_plane.test_share_public import EXPOSE, FILES, OTHER_TOKEN, TOKEN, Env
 
 POOL = "us-west-2_TestPool1"
 ISS = f"https://cognito-idp.us-west-2.amazonaws.com/{POOL}"
@@ -278,7 +278,9 @@ def test_session_flow_serves_files_under_the_session_base(lab, capfd):
     assert a.encode() not in body and i.encode() not in body
     status, h, body = lab.request("GET", got["base"] + "index.html")
     assert status == 200 and body == FILES["index.html"]
-    assert h["content-security-policy"] == CSP
+    # public_url is https://share.example/: the sandbox CSP also names this share's prefix, which covers k/<session>/f/
+    assert h["content-security-policy"] == share_public.sandbox_csp("https://share.example", TOKEN)
+    assert f"https://share.example/s/{TOKEN}/ " in h["content-security-policy"]
     assert h["access-control-allow-origin"] == "*" and h["access-control-expose-headers"] == EXPOSE
     status, h, body = lab.request("GET", got["base"] + "data/table.parquet", {"Range": "bytes=-10"})
     assert status == 206 and len(body) == 10

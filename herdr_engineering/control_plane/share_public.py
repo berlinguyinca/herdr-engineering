@@ -83,9 +83,11 @@ _SESSION_SEGMENT = re.compile(r"[A-Za-z0-9_.-]{1,512}")
 _HOST = re.compile(r"[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?(?::[0-9]{1,5})?")
 _CLIENT_ID = re.compile(r"[A-Za-z0-9_-]{1,128}")
 
-CSP = ("sandbox allow-scripts allow-downloads; default-src 'self'; script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval'; "
-       "style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self'; "
-       "worker-src 'self' blob:; object-src 'none'; base-uri 'self'; form-action 'none'; frame-ancestors 'none'")
+_CSP_TEMPLATE = ("sandbox allow-scripts allow-downloads; default-src {self}; script-src {self} 'unsafe-inline' "
+                 "'wasm-unsafe-eval'; style-src {self} 'unsafe-inline'; img-src {self} data: blob:; font-src {self} data:; "
+                 "connect-src {self}; worker-src {self} blob:; object-src 'none'; base-uri 'self'; form-action 'none'; "
+                 "frame-ancestors 'none'")
+CSP = _CSP_TEMPLATE.format(self="'self'")   # without a configured public origin
 PDF_CSP = "frame-ancestors 'none'"
 VIEWER_CSP = ("default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self' {origin}; img-src 'self' data:; "
               "frame-ancestors 'none'; base-uri 'none'; form-action 'none'")
@@ -141,6 +143,21 @@ def _https_origin(value) -> str | None:
             or parts.path not in ("", "/") or not _HOST.fullmatch(parts.netloc.lower())):
         return None
     return "https://" + parts.netloc.lower()
+
+
+def sandbox_csp(public_origin: str | None, token: str | None) -> str:
+    """The sandbox CSP for a bundle file of the share ``token``.
+
+    In the sandbox the page's origin is opaque. WebKit matches ``'self'`` against that opaque origin, so it refuses
+    every fetch to the bundle (Chromium and Firefox match ``'self'`` against the page URL). With a configured public
+    origin, each fetch directive therefore also names this share's own prefix ``<origin>/s/<token>/``: a CSP path
+    source ending in ``/`` matches by prefix, so it covers ``f/...`` and the lab ``k/<session>/f/...`` paths, and
+    nothing of any other share. Without one (``public_url`` unset or not a bare https origin) the policy keeps
+    ``'self'`` only: the request's Host header is never trusted.
+    """
+    if not public_origin or not isinstance(token, str) or not TOKEN_RE.fullmatch(token):
+        return CSP
+    return _CSP_TEMPLATE.format(self=f"'self' {public_origin}/s/{token}/")
 
 
 def lab_settings(config: ShareConfig) -> LabSettings | None:
@@ -552,13 +569,13 @@ def deny(handler, state: dict | None, reason: str, actor: str = "public") -> Non
     send_not_found(handler)
 
 
-def _content_headers(name: str, etag: str) -> list[tuple[str, str]]:
+def _content_headers(name: str, etag: str, csp: str = CSP) -> list[tuple[str, str]]:
     content_type = content_type_for(name)
     if content_type == "application/pdf":
         headers = [("Content-Type", "application/pdf"), ("Content-Disposition", "inline"),
                    ("X-Content-Type-Options", "nosniff"), ("Content-Security-Policy", PDF_CSP)]
     else:
-        headers = [("Content-Type", content_type), ("Content-Security-Policy", CSP),
+        headers = [("Content-Type", content_type), ("Content-Security-Policy", csp),
                    ("X-Content-Type-Options", "nosniff")]
     headers += [("Cache-Control", "private, no-cache"), ("Referrer-Policy", "no-referrer"),
                 ("X-Robots-Tag", "noindex"), ("ETag", etag), ("Accept-Ranges", "bytes")]
@@ -580,11 +597,13 @@ def _announces_body(handler) -> bool:
     return bool(lengths) and lengths != ["0"]
 
 
-def serve_bundle_file(handler, state: dict, rel_path: str, *, cors: bool = True, actor: str = "public") -> bool:
+def serve_bundle_file(handler, state: dict, rel_path: str, *, cors: bool = True, actor: str = "public",
+                      token: str | None = None) -> bool:
     """Serve ``rel_path`` (raw, still percent-encoded) from ``state``'s bundle; True when served, False after a 404.
 
     ``state`` is what ``load_state`` returned. Handles HEAD, If-Match (412), If-None-Match (304), If-Range and a single
     Range (206/416); a multi-range request gets the full 200. Streams in ``CHUNK_BYTES`` chunks with ``os.pread``.
+    ``token`` (the share's link token) scopes the sandbox CSP's explicit source; see ``sandbox_csp``.
     """
     index = getattr(state, "index", None)
     if index is None:
@@ -617,7 +636,7 @@ def serve_bundle_file(handler, state: dict, rel_path: str, *, cors: bool = True,
             deny(handler, state, "size_mismatch", actor)
             return False
         etag = '"%s"' % item["sha256"]
-        headers = _content_headers(name, etag)
+        headers = _content_headers(name, etag, sandbox_csp(getattr(handler.server, "public_origin", None), token))
         if _announces_body(handler):
             handler.close_connection = True
         if_match = handler.headers.get("If-Match")
@@ -789,7 +808,7 @@ class ShareHandler(BaseHTTPRequestHandler):
                                           ("Cache-Control", "no-store"), ("Referrer-Policy", "no-referrer"),
                                           ("X-Robots-Tag", "noindex"), ("X-Content-Type-Options", "nosniff")])
                 return None
-            serve_bundle_file(self, state, "/".join(parts[4:]))
+            serve_bundle_file(self, state, "/".join(parts[4:]), token=parts[2])
             return None
         if audience != "lab" or is_file:
             return deny(self, state, "audience")    # lab files only under a session; sessions only for lab shares
@@ -805,7 +824,7 @@ class ShareHandler(BaseHTTPRequestHandler):
             if _SESSION_SEGMENT.fullmatch(session) else None
         if got is None:
             return deny(self, state, "bad_session")
-        serve_bundle_file(self, state, "/".join(parts[6:]), actor=got["identity"])
+        serve_bundle_file(self, state, "/".join(parts[6:]), actor=got["identity"], token=parts[2])
         return None
 
     # -- lab: viewer page, static assets, session exchange
@@ -910,6 +929,7 @@ class ShareServer(ThreadingHTTPServer):
         self.now = now
         self.events = EventLog(config.events_path, now)
         self.lab = lab_settings(config)
+        self.public_origin = _https_origin(config.public_url)    # None: the sandbox CSP keeps 'self' only
         self.session_per_share = RateLimiter(SESSION_PER_SHARE_PER_MINUTE, now)
         self.session_global = RateLimiter(SESSION_GLOBAL_PER_MINUTE, now, max_keys=1)
         self._slots = threading.BoundedSemaphore(MAX_CONNECTIONS)
