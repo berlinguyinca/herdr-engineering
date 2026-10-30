@@ -282,7 +282,7 @@ export function mountOverview(container, client, { freshness = () => null } = {}
     hosts:signal=>client.listHosts({signal}),
     fleet:signal=>client.request('/api/v1/fleet/inventory',{signal}),
     activity:signal=>client.activity(50,{signal}),
-    health:signal=>client.health({signal}),
+    health:signal=>client.health({ probe: true, signal }),
     ci:signal=>client.getCi({signal}),
     reviews:signal=>client.listReviews({signal}),
     // Disabled on the server (404) is not an error: the browser projection stays, with no warning.
