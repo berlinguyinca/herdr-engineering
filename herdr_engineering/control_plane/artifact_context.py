@@ -94,6 +94,14 @@ class ArtifactContextMixin:
             "FROM artifact_bindings WHERE artifact_id=$1 AND ctx_key IS NOT NULL ORDER BY binding_id", artifact_id)
         return [self._jsonable(dict(row)) for row in rows]
 
+    async def room_artifact_ids(self, room_id: str) -> list[str]:
+        """Active artifacts bound to a room, for the room-membership grant sync (no principal filter: it only feeds grants)."""
+        _, room_id = validate_context("room", room_id)
+        rows = await self._conn.fetch(
+            "SELECT DISTINCT a.artifact_id FROM artifacts a JOIN artifact_bindings b ON b.artifact_id=a.artifact_id "
+            "WHERE b.room_id=$1 AND b.ctx_key IS NOT NULL AND a.lifecycle='active' ORDER BY a.artifact_id", room_id)
+        return [row["artifact_id"] for row in rows]
+
     async def list_by_context(self, *, principal_id: str, kind: str, ref: str, query: str | None = None,
                               media_type: str | None = None, limit: int = 50,
                               cursor: str | None = None) -> dict:
