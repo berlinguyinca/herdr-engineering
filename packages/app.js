@@ -37,6 +37,7 @@ import { noteStreamContact, freshnessSources } from './freshness.js';
 import { mountServices, mountServiceDetails } from './services-view.js';
 import { mountFabricServices } from './fabric-services-view.js';
 import { mountPrTrail } from './pr-trail-view.js';
+import { mountAgentEvolution, tabsHtml, TABS_STYLE, wireTabs } from './agent-evolution-view.js';
 import { mountCollab, completeSignInIfRedirected } from './collab-view.js';
 import { mountAttention, attentionBadge, POLL_MS as ATTENTION_POLL_MS } from './attention-view.js';
 import { createAttentionNotifier } from './attention-notify.js';
@@ -850,6 +851,7 @@ async function viewSession(parts, revision) {
     if (revision !== renderRevision || controller.signal.aborted) return;
     if (!s) { statusPage('<herdr-error message="Agent not found"></herdr-error>', true); return; }
     const outcome = recordOutcome(s);
+    const activeTab = route().query.get('tab') === 'evolution' ? 'evolution' : 'overview';
     const terminal = outcome === 'failed' || outcome === 'finished';
     const clip = value => typeof value === 'string' ? value.slice(0, 180) : '';
     const project = typeof s.cwd === 'string' ? s.cwd.replace(/\\/g, '/').split('/').filter(Boolean).pop() : '';
@@ -859,6 +861,8 @@ async function viewSession(parts, revision) {
       ${liveHead(`<h1 class="sd-title">${esc(clip(s.display_name || s.agent_role) || 'Agent')}${project ? ` · ${esc(clip(project))}` : ''}</h1>`)}
       <div class="sd-head"><strong data-session-head><span data-session-status>${esc(sessionStatusText(s))}</span> · <span data-session-updated>${esc(formatTimestamp(s.updated_at))}</span></strong><span class="sd-meta">${esc(s.host_id || 'Host not reported')} · ${esc(s.model || 'Model not reported')}</span></div>
        ${terminal ? `<p class="sd-meta">${outcome === 'failed' ? 'Failed' : 'Finished'} agent · recorded inspection remains available.</p>` : ''}
+       ${TABS_STYLE}${tabsHtml(activeTab)}
+      <div id="agent-panel-overview" role="tabpanel" aria-labelledby="agent-tab-overview"${activeTab === 'overview' ? '' : ' hidden'}>
        <div id="session-story"></div>
       ${s.mission_id || s.mission_key ? `<p class="sd-meta" id="session-mission">Mission association not resolved · ${esc(s.mission_key || s.mission_id)}</p>` : ''}
       <div id="related-panel"></div>
@@ -866,7 +870,9 @@ async function viewSession(parts, revision) {
       <details class="hd-card sd-details" id="session-details"><summary>Agent details</summary><dl>${fields.map(([label,value])=>`<dt>${esc(label)}</dt><dd>${esc(value)}</dd>`).join('')}</dl>${s.summary ? `<p>${esc(s.summary)}</p>` : ''}</details>
       <div id="session-workspace-host"></div>
       <details class="hd-card sd-details" id="advanced-inspector"><summary>Advanced inspection</summary><div id="inspector-host"></div></details>
-      <details class="hd-card sd-details" id="session-events"><summary>Recorded event stream</summary><div id="session-stream">${skeleton('recorded events', { rows: 2 })}</div></details>`;
+      <details class="hd-card sd-details" id="session-events"><summary>Recorded event stream</summary><div id="session-stream">${skeleton('recorded events', { rows: 2 })}</div></details>
+      </div>
+      <div id="agent-panel-evolution" role="tabpanel" aria-labelledby="agent-tab-evolution"${activeTab === 'evolution' ? '' : ' hidden'}></div>`;
     // The story shows how the agent began and any handoff in or out; without handoff data it is the start and the last report.
     const storyHost = document.getElementById('session-story');
     let storyTree = {}, storyLinks = client.getSessionCommits ? 'loading' : null;
@@ -883,7 +889,24 @@ async function viewSession(parts, revision) {
       else if (!advanced.open && disposeAdvanced) { disposeAdvanced(); disposeAdvanced = null; document.getElementById('inspector-host').replaceChildren(); }
     });
     const disposeTerminal = mountTerminalAttach(document.getElementById('session-terminal'), client, s, {copyText});
-    const disposeSession = combineDisposers(relatedDispose, disposeWorkspace, disposeTerminal, () => disposeAdvanced?.());
+    // Evolution is read from the server the first time its tab opens, not when the page loads.
+    let evolution = null;
+    const startEvolution = () => {
+      if (evolution) return;
+      evolution = mountAgentEvolution(document.getElementById('agent-panel-evolution'), client, {sessionId: s.session_id, isActive: () => !document.getElementById('agent-panel-evolution')?.hidden});
+    };
+    wireTabs(root, {
+      onSelect: key => { if (key === 'evolution') startEvolution(); },
+      // The address follows the tab without a re-render (replaceState raises no hashchange).
+      setQuery: key => {
+        const [base, query = ''] = location.hash.split('?');
+        const params = new URLSearchParams(query);
+        if (key === 'evolution') params.set('tab', key); else params.delete('tab');
+        history.replaceState(null, '', `${base}${params.toString() ? `?${params}` : ''}`);
+      },
+    });
+    if (activeTab === 'evolution') startEvolution();
+    const disposeSession = combineDisposers(relatedDispose, disposeWorkspace, disposeTerminal, () => disposeAdvanced?.(), () => evolution?.dispose());
     const missionElement = document.getElementById('session-mission');
     if (missionElement) {
       const contextController = new AbortController();

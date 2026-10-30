@@ -805,3 +805,30 @@ def test_scheduler_lease_heartbeat_route_renews_and_rejects_stale_token(server):
         "lease_id": lease["lease_id"], "generation": lease["generation"], "token": "wrong", "ttl": 120,
     })
     assert status == 409
+
+
+def test_agent_evolution_endpoint_serves_phases_and_a_learning_record_and_404s_for_an_unknown_agent(server):
+    c, repo = server
+    repo.upsert_session("sx", host_id="h", agent_role="pi", repository_id="github.com/org/app", branch="feat/x", status="finished")
+    repo.upsert_pull_request("pr-1", repository="github.com/org/app", number=7, status="open", branch="feat/x")
+    repo.inspector.ingest("sx", {"events": [{"kind": "tool", "call_id": "c1", "phase": "start", "tool": "bash", "args_preview": "pytest -q"},
+                                            {"kind": "tool", "call_id": "c1", "phase": "end", "output": "boom", "is_error": True, "exit_code": 1}]})
+    status, _, body = c.get("/api/v1/sessions/sx/evolution")
+    out = json.loads(body)
+    assert status == 200 and out["session_id"] == "sx"
+    assert [p["key"] for p in out["phases"]] == ["assigned", "worked", "handed_off", "produced", "verified", "outcome", "cost"]
+    lr = out["learning_record"]
+    assert lr["tool_calls"]["total"]["value"] == 1 and lr["tool_calls"]["failed"]["value"] == 1 and lr["outcome"]["value"] == "finished"
+    assert lr["cost_usd_estimate"]["value"] is None and "price table" in lr["cost_usd_estimate"]["reason"]
+    pr = next(i for p in out["phases"] if p["key"] == "produced" for i in p["items"] if i["kind"] == "pull_request")
+    assert pr["number"] == 7 and pr["trail"].startswith("#/pr/org/app/7")
+    assert c.get("/api/v1/sessions/nope/evolution")[0] == 404
+
+
+def test_agent_evolution_is_cached_briefly(server):
+    c, repo = server
+    repo.upsert_session("sx", host_id="h", agent_role="pi", status="running")
+    first = json.loads(c.get("/api/v1/sessions/sx/evolution")[2])
+    repo.upsert_session("sx", host_id="h", agent_role="pi", status="failed")
+    again = json.loads(c.get("/api/v1/sessions/sx/evolution")[2])
+    assert first["learning_record"]["outcome"]["value"] == again["learning_record"]["outcome"]["value"] == "running"
