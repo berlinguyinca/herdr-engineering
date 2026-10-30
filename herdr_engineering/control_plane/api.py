@@ -621,6 +621,8 @@ class ControlPlaneServer:
         from .intel_github import SharedCredentialPrLister
         self._pr_lister = SharedCredentialPrLister()
         self.intelligence.single_operator_fn = lambda: self.single_operator
+        if self.rakazo is not None:
+            self.rakazo.desk.routes = self.intelligence      # board proposals as phone cards (scope: assistant_viewers)
         self.intelligence.github_app_fn = lambda: getattr(self, "gate_app", None) or self._pr_lister
         self.intelligence.poll_status_fn = lambda: {"client": "review_gate" if getattr(self, "gate_app", None) else "shared",
                                                     "last_error": self._pr_lister.last_error}

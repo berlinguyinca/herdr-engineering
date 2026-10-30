@@ -156,7 +156,7 @@ class ActionBoard:
     def pending(self, org_id: str) -> list[Proposal]:
         """Awaiting proposals for an org; expired ones are marked and dropped from the list."""
         now, out = self._clock(), []
-        for p in self._p.values():
+        for p in list(self._p.values()):          # a snapshot: requests may insert from other threads
             if p.org_id != org_id:
                 continue
             if p.state == "awaiting_approval" and now > p.expires_at:

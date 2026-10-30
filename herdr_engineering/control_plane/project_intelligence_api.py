@@ -13,10 +13,21 @@ Fail-closed rules (DECISIONS D3/D9):
 from __future__ import annotations
 
 import json
+import threading
 
 from . import project_intelligence as pi
 
 READ_ROLES = frozenset({"viewer", "operator"})
+
+
+class ApprovalRefused(Exception):
+    """The deciding principal is not allowed to approve or reject proposals (HTTP 403)."""
+
+
+def proposal_visible(viewer: pi.Viewer, proposal) -> bool:
+    """The one scope rule for who may see (and so decide) a pending proposal: same org, and for a project-scoped
+    viewer only its own projects. Shared by the HTTP route and the Rakazo bridge so both show the same set."""
+    return viewer.project_ids is None or proposal.payload.get("project") in viewer.project_ids
 
 
 def _unwired():
@@ -39,6 +50,7 @@ class IntelligenceRoutes:
         self.ci_watch_status_fn = None            # set by the server: the scheduled CI watch's last-run summary
         self.last_reconcile: dict | None = None   # counters of the latest pass; a reason when it could not run
         self._executor = None
+        self._decide_lock = threading.Lock()    # one decision at a time: approve/reject cannot interleave
         from .intel_webhook import ReplayGuard
         self._replay = ReplayGuard()
 
@@ -198,6 +210,49 @@ class IntelligenceRoutes:
         return {"id": p.id, "expires_at": p.expires_at.isoformat(), "state": p.state,
                 "payload_sha256": p.payload_sha256}
 
+    def assistant_viewer(self, tenant_id: str, user_id: str) -> pi.Viewer | None:
+        """The scope of an assistant user: only YAML ``assistant_viewers: {"<tenant>/<user>": {...}}``. None when the
+        feature is off or the user has no (valid) entry: fail closed, never a default org."""
+        cfg, raw = self._cfg()
+        if not cfg["enabled"]:
+            return None
+        entry = (raw.get("assistant_viewers") or {}).get(f"{tenant_id}/{user_id}")
+        return self._viewer_from_entry(entry) if isinstance(entry, dict) else None
+
+    def visible_proposals(self, viewer: pi.Viewer) -> list:
+        return [p for p in self.board.pending(viewer.org_id) if proposal_visible(viewer, p)]
+
+    def decide_proposal(self, proposal_id: str, decision: str, *, viewer: pi.Viewer, actor: str, single: bool,
+                        open_listener: bool, payload_sha256=None, resource_version=None):
+        """Approve or reject one proposal and, once approved, hand it to the executor (a no-op unless the execute flag
+        is on). The ONE path for the dashboard route and the Rakazo bridge: flags, approver rules, project scope,
+        the exact payload hash + resource version, self-approval (``single`` allows it), audit.
+        Raises ``ApprovalRefused`` (403), ``pi.NotFound``, ``pi.Conflict`` or ``pi.IntelligenceError``."""
+        cfg, raw = self._cfg()
+        if not cfg["suggest"] or cfg["kill_switch"]:
+            raise pi.Conflict("proposals require the suggest flag and no kill switch")
+        approvers = raw.get("approvers")
+        if not single and (not isinstance(approvers, list) or actor not in [a for a in approvers if isinstance(a, str)]
+                           or open_listener):
+            # Only named principals decide. An absent list means nobody can; an open listener has no identity.
+            raise ApprovalRefused("this principal is not in project_intelligence.approvers")
+        with self._decide_lock:       # state check + transition + audit; the executor runs outside (it claims by itself)
+            known = self.board.get(proposal_id, viewer.org_id)
+            if not proposal_visible(viewer, known):
+                raise pi.NotFound("proposal")           # a project-scoped operator cannot act on another project's proposal
+            if decision == "reject":
+                p = self.board.reject(proposal_id, approver=actor, org_id=viewer.org_id)
+            else:
+                if not isinstance(payload_sha256, str) or not isinstance(resource_version, int) \
+                        or isinstance(resource_version, bool):
+                    raise pi.IntelligenceError("payload_sha256 (string) and resource_version (int) are required")
+                p = self.board.approve(proposal_id, approver=actor, org_id=viewer.org_id, payload_sha256=payload_sha256,
+                                       resource_version=resource_version, allow_self=single)
+            self.store.record_audit({"action": f"proposal_{p.state}", "id": p.id, "actor": actor})
+        if p.state == "approved":
+            p = self.executor.execute(p.id, viewer.org_id)     # no-op unless the execute flag is on
+        return p
+
     @staticmethod
     def _viewer_from_entry(entry: dict) -> pi.Viewer | None:
         projects, clearance = entry.get("projects"), entry.get("clearance", "internal")
@@ -259,8 +314,7 @@ class IntelligenceRoutes:
                     "version": r.version, "provisional": r.review_state == "provisional",
                     "evidence_refs": [e.as_dict() for e in r.evidence]} for r in self.store.neighbours(ref, viewer)]}
             if parts == ["proposals"]:
-                return 200, {"items": [self._proposal_view(p) for p in self.board.pending(viewer.org_id)
-                                       if viewer.project_ids is None or p.payload.get("project") in viewer.project_ids],
+                return 200, {"items": [self._proposal_view(p) for p in self.visible_proposals(viewer)],
                              "note": "An approved proposal is executed only when the execute flag is on; otherwise it records permission only."}
             if parts == ["findings"]:
                 return 200, {"items": self.store.findings(viewer)}
@@ -312,28 +366,11 @@ class IntelligenceRoutes:
                 self.store.record_audit({"action": "proposal_requested", "id": p.id, "actor": actor, "kind": p.action})
                 return 201, self._proposal_view(p)
             if len(parts) == 3 and parts[0] == "proposals" and parts[2] in ("approve", "reject"):
-                if not cfg["suggest"] or cfg["kill_switch"]:
-                    return 409, {"error": "proposals require the suggest flag and no kill switch"}
-                approvers = raw.get("approvers")
-                single = self.single_operator_fn() and principal.get("authenticated_by") == "open_listener"
-                if not single and (not isinstance(approvers, list) or actor not in [a for a in approvers if isinstance(a, str)]
-                                   or principal.get("authenticated_by") == "open_listener"):
-                    # Only named principals decide. An absent list means nobody can; an open listener has no identity.
-                    return 403, {"error": "this principal is not in project_intelligence.approvers"}
-                known = self.board.get(parts[1], viewer.org_id)
-                if viewer.project_ids is not None and known.payload.get("project") not in viewer.project_ids:
-                    return 404, {"error": "not found"}       # a project-scoped operator cannot act on another project's proposal
-                if parts[2] == "reject":
-                    p = self.board.reject(parts[1], approver=actor, org_id=viewer.org_id)
-                else:
-                    v = body.get("resource_version")
-                    if not isinstance(body.get("payload_sha256"), str) or not isinstance(v, int) or isinstance(v, bool):
-                        return 400, {"error": "payload_sha256 (string) and resource_version (int) are required"}
-                    p = self.board.approve(parts[1], approver=actor, org_id=viewer.org_id,
-                                           payload_sha256=body["payload_sha256"], resource_version=v, allow_self=single)
-                self.store.record_audit({"action": f"proposal_{p.state}", "id": p.id, "actor": actor})
-                if p.state == "approved":
-                    p = self.executor.execute(p.id, viewer.org_id)     # no-op unless the execute flag is on
+                p = self.decide_proposal(
+                    parts[1], parts[2], viewer=viewer, actor=actor,
+                    single=bool(self.single_operator_fn() and principal.get("authenticated_by") == "open_listener"),
+                    open_listener=principal.get("authenticated_by") == "open_listener",
+                    payload_sha256=body.get("payload_sha256"), resource_version=body.get("resource_version"))
                 return 200, self._proposal_view(p)
             if parts == ["webhooks", "reconcile"]:
                 if viewer.project_ids is not None:
@@ -348,6 +385,8 @@ class IntelligenceRoutes:
             return 503, {"error": "store unavailable"}
         except pi.Conflict as exc:
             return 409, {"error": str(exc)}
+        except ApprovalRefused as exc:
+            return 403, {"error": str(exc)}
         except pi.IntelligenceError as exc:
             return 400, {"error": str(exc)}
         return 404, {"error": "not found"}
