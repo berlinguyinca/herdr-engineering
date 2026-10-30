@@ -616,6 +616,7 @@ class ControlPlaneServer:
         self.intelligence.poll_status_fn = lambda: {"client": "review_gate" if getattr(self, "gate_app", None) else "shared",
                                                     "last_error": self._pr_lister.last_error}
         self.intelligence.ci_repair_fn = self._intelligence_ci_repair
+        self.intelligence.ci_rerun_fn = self._intelligence_ci_rerun
         if getattr(self, "assistant", None) is not None:
             self.assistant.intelligence_read = self.intelligence.assistant_read
             from .assistant_lineage import LineageReader, principal_resolver
@@ -655,6 +656,11 @@ class ControlPlaneServer:
         if self.ci_fix is None:
             raise ValueError("CI fix agents are not enabled (control_plane.ci_fix)")
         return self.ci_fix.request(self.ci_monitor, repository, run, operation_id, actor=actor)
+
+    def _intelligence_ci_rerun(self, repository, run):
+        """Executor hook for an approved ``ci_rerun``: the monitor's own retry, so ``control_plane.ci_actions`` and
+        Woodpecker's ``can_retry`` both still apply."""
+        return self.ci_monitor.action(repository, run, "retry")
 
     def _intelligence_metrics(self) -> dict:
         from collections import Counter
