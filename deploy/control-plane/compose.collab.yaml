@@ -45,6 +45,8 @@ services:
       - "/etc/herdr/fleet/fleet-config.yaml"
       - "--collab-operator-url"
       - "http://${HERDR_CP_WEB_BIND:-127.0.0.1}:${HERDR_COLLAB_OPERATOR_PORT:-9482}"
+    volumes:   # appended to compose.yaml's list: the Rakazo Cognito sign-in reads group membership here (read-only)
+      - ${HERDR_COLLAB_SYNC_DIR:?run deploy.sh}:/etc/herdr/collab-sync:ro
 
   collab-public:
     image: herdr-engineering:${HERDR_CP_IMAGE_TAG:?run deploy.sh}
