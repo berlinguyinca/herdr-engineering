@@ -83,8 +83,8 @@ def test_an_ended_pr_gets_one_record_with_signals_agents_and_sources():
     assert p["incomplete"] is False and p["missing_sources"] == []
     assert p["signals"]["merged_without_rework"] == sig(None, "CI data is unavailable.")
     assert p["sources"]["ci"] == "ok" and p["sources"]["agent_evolution"]["state"] == "ok"
-    assert [a["session_id"] for a in p["agents"]] == ["s1"] and p["agents"][0]["rule"] == "branch_window"
-    assert "prs" not in p["agents"][0]["learning_record"] and p["agents"][0]["learning_record"]["tool_calls"]["total"]["value"] is None
+    assert [a["session_id"] for a in p["agents"]["items"]] == ["s1"] and p["agents"]["items"][0]["rule"] == "branch_window"
+    assert "prs" not in p["agents"]["items"][0]["learning_record"] and p["agents"]["items"][0]["learning_record"]["tool_calls"]["total"]["value"] is None
     assert p["inferred_sessions_count"] == 1 and "timeline" not in p and "inferred_sessions" not in p
     assert p["pull_request"]["host"] == "github.com" and p["pull_request"]["repository"] == "org/app"
     assert calls == [("github.com", "org", "app", 7)] and event["entity_type"] == ENTITY
@@ -99,9 +99,9 @@ def test_only_an_allowlist_is_stored_no_goals_names_review_text_or_urls():
     text = json.dumps(p)
     for leaked in ("fix the parser", "alice@example.com", "Swift Amber", "carol", "ci.example", "agent_id"):
         assert leaked not in text, leaked
-    assert p["handoffs"][0]["from"] == {"harness": "pi", "session_id": "s1"} and p["handoffs"][0]["state"] == "accepted"
-    assert p["reviews"][0]["verdict"] == "approved" and "reviewer" not in p["reviews"][0]
-    assert p["ci_runs"][0]["run_number"] == 3 and "ci_url" not in p["ci_runs"][0]
+    assert p["handoffs"]["items"][0]["from"] == {"harness": "pi", "session_id": "s1"} and p["handoffs"]["items"][0]["state"] == "accepted"
+    assert p["reviews"]["items"][0]["verdict"] == "approved" and "reviewer" not in p["reviews"]["items"][0]
+    assert p["ci_runs"]["items"][0]["run_number"] == 3 and "ci_url" not in p["ci_runs"]["items"][0]
     assert "[REDACTED]" not in text, "no ordinary key was masked by the key hints"
 
 
@@ -157,13 +157,13 @@ def test_null_propagation_nothing_is_replaced_by_a_zero_and_unreadable_agents_ar
     records.sweep(force=True)
     p = stored(repo)[0]["payload"]
     assert p["signals"]["merged_without_rework"]["value"] is None
-    assert p["agents"][0]["learning_record"] is None and "could not be read" in p["agents"][0]["reason"]
+    assert p["agents"]["items"][0]["learning_record"] is None and "could not be read" in p["agents"]["items"][0]["reason"]
     assert p["sources"]["agent_evolution"]["state"] == "partial" and p["incomplete"] is True and p["missing_sources"] == ["agent_evolution"]
     unwired = world(evolution=None, ready_retry_minutes=0)
     end_pr(unwired[0])
     unwired[1].sweep(force=True)
     q = stored(unwired[0])[0]["payload"]
-    assert q["agents"] is None and q["sources"]["agent_evolution"]["state"] == "unavailable" and q["incomplete"] is True
+    assert q["agents"]["items"] is None and q["sources"]["agent_evolution"]["state"] == "unavailable" and q["incomplete"] is True
 
 
 def test_agents_are_capped_but_the_omission_is_recorded():
@@ -172,7 +172,7 @@ def test_agents_are_capped_but_the_omission_is_recorded():
     end_pr(repo)
     records.sweep(force=True)
     p = stored(repo)[0]["payload"]
-    assert len(p["agents"]) == 2 and p["omitted"]["agents"] == 3 and p["incomplete"] is False
+    assert len(p["agents"]["items"]) == 2 and p["agents"]["omitted"] == 3 and p["omitted"]["agents"] == 3 and p["incomplete"] is False
     assert p["sources"]["agent_evolution"]["state"] == "partial" and "max_agents" in p["sources"]["agent_evolution"]["reason"]
 
 
@@ -342,17 +342,38 @@ def test_long_free_text_is_clipped_with_a_visible_marker_and_named_in_trimmed():
 
 
 def test_the_size_cap_is_hard_and_whole_lists_become_an_omitted_marker_in_a_defined_order():
-    big = {"learning_record": {"blob": [1] * 5000}}
     many = fake_trail({"sessions": [{"session_id": f"s{i}", "rule": "commit"} for i in range(60)],
                        "ci_runs": [{"run_number": i, "state": "success"} for i in range(1500)]})
-    repo, records, _, _ = world(trail=many, evolution=lambda sid: {"sources": {}, **big}, max_agents=50)
+    repo, records, _, _ = world(trail=many, evolution=lambda sid: {"sources": {}, "learning_record": {"blob": [1] * 5000}}, max_agents=50)
     end_pr(repo)
     records.sweep(force=True)
     p = stored(repo)[0]["payload"]
     assert len(json.dumps(p, separators=(",", ":")).encode()) <= MAX_BYTES
-    assert p["ci_runs"] == {"omitted": 1500, "reason": f"dropped to keep the record under {MAX_BYTES} bytes"} and "ci_runs" in p["trimmed"]
-    assert p["agents"] == {"omitted": 50, "reason": f"dropped to keep the record under {MAX_BYTES} bytes"} and p["signals"]
-    assert p["pull_request"]["number"] == 7
+    assert p["ci_runs"] == {"items": [], "omitted": 1500, "reason": f"dropped to keep the record under {MAX_BYTES} bytes"} and "ci_runs" in p["trimmed"]
+    assert len(p["agents"]["items"]) == 50, "the agent allowlist leaves the 5000-element blob out, so agents still fit"
+    assert "blob" not in json.dumps(p) and p["pull_request"]["number"] == 7
+
+
+def test_every_list_field_has_one_shape_and_a_smaller_cap_drops_them_in_order(monkeypatch):
+    many = fake_trail({"sessions": [{"session_id": f"s{i}", "rule": "commit"} for i in range(30)],
+                       "ci_runs": [{"run_number": i, "state": "success"} for i in range(30)]})
+    repo, records, _, _ = world(trail=many, max_agents=30)
+    end_pr(repo)
+    records.sweep(force=True)
+    full = stored(repo)[0]["payload"]
+    for field in ("sessions", "ambiguous", "handoffs", "reviews", "ci_runs", "agents"):
+        assert set(full[field]) == {"items", "omitted", "reason"} and isinstance(full[field]["items"], list), field
+    monkeypatch.setattr(learning_trails, "MAX_BYTES", 6000)
+    repo2, records2, _, _ = world(trail=many, max_agents=30)
+    end_pr(repo2)
+    records2.sweep(force=True)
+    p = stored(repo2)[0]["payload"]
+    assert len(json.dumps(p, separators=(",", ":")).encode()) <= 6000
+    order = [f for f in ("ci_runs", "handoffs", "reviews", "ambiguous", "sessions", "agents") if full[f]["items"]]
+    dropped = [f for f in order if p[f]["items"] == [] and p[f]["omitted"] > 0]
+    assert dropped and dropped == order[:len(dropped)], "lists go in the defined order, never out of it"
+    for field in dropped:
+        assert set(p[field]) == {"items", "omitted", "reason"} and field in p["trimmed"]
 
 
 # ---------------------------------------------------------------- late evidence
@@ -540,11 +561,11 @@ def test_an_export_never_builds_a_trail():
 
 # ---------------------------------------------------------------- retention
 def test_retention_prunes_the_oldest_whole_prs_and_reports_where_the_export_now_starts():
-    repo, records, _, _ = world(max_records=100)
+    repo, records, _, _ = world(max_records=100, late_checks=0)
     for n in range(105):
         records._write(f"pr-{n}", {"kind": "pull_request_trail", "pr_id": f"pr-{n}", "end_seq": 1, "assembled_at": "2026-10-01T10:00:00+00:00"}, EVENT)
     assert records._prune() == 5
-    assert len(records._records) == 100 and repo.entity_ids(ENTITY)[0] == "pr-5"
+    assert len(records._records) == 100 and "pr-0" in repo.entity_ids(ENTITY), "the stored events are untouched; only the index and export are pruned"
     page = records.export(limit=3, cursor="s2")
     assert page["truncated_before"] == "s4" and page["cursor_truncated"] is True and page["records"][0]["learning_seq"] == 5
     assert records.export(limit=3, cursor="s9")["cursor_truncated"] is False
@@ -567,7 +588,7 @@ def test_config_defaults_and_repository_parsing():
     assert learning_config(None) == {"enabled": True, "max_agents": 12, "sweep_batch": 20, "page_default": 50, "page_max": 200,
                                      "max_records": 20000, "require_role": "operator", "warmup_minutes": 10, "retry_interval_minutes": 5,
                                      "ready_retry_minutes": 60, "low_confidence_after_minutes": 15, "late_checks": 3,
-                                     "late_window_hours": 24, "late_check_interval_minutes": 30}
+                                     "late_window_hours": 24, "late_check_interval_minutes": 30, "max_build_attempts": 12}
     assert parse_repository("github.com/org/app") == ("github.com", "org", "app")
     assert parse_repository("org/app") == (None, "org", "app")
     assert parse_repository("https://ghe.example/org/app.git") == ("ghe.example", "org", "app")
@@ -640,7 +661,7 @@ def test_the_export_is_redacted_once_at_write_time_and_not_again_when_ci_fix_is_
     assert "alice@example.com" not in text and "fix the parser" not in text
 
 
-@pytest.mark.parametrize("query", ["limit=0", "limit=4", "limit=abc", "limit=", "limit=-1", "since=yesterday", "since=", "cursor=zzz", "cursor=s"])
+@pytest.mark.parametrize("query", ["limit=0", "limit=4", "limit=abc", "limit=", "limit=-1", "since=yesterday", "since=", "ended_after=soon", "ended_after=", "cursor=zzz", "cursor=s"])
 def test_bad_parameters_are_400_on_both_forms(api, query):
     c, _, _ = api
     assert c.get(f"/api/v1/learning/trails?{query}")[0] == 400
@@ -710,3 +731,180 @@ def test_access_defaults_to_the_operator_role_and_can_be_opened_to_viewers(ackno
                 assert Client(svr.port, "opkey").get(path)[0] == 200
         finally:
             svr.shutdown()
+
+
+# ---------------------------------------------------------------- retention never re-assembles; fair batches; permanent failure
+def merged(repo, n, at="2026-10-01T10:00:00Z"):
+    repo.upsert_pull_request(f"pr-{n}", repository="github.com/org/app", number=100 + n, status="merged", merged_at=at)
+
+
+def test_pruned_prs_are_never_assembled_again_the_sequence_is_stable_and_a_restart_agrees():
+    repo, records, clock, calls = world(max_records=100, late_checks=0)
+    for n in range(120):
+        merged(repo, n)
+    for _ in range(12):
+        records.sweep(force=True)
+        clock[0] += 301
+    top, built = records._seq, len(calls)
+    assert top == 119 and len(records._records) == 100 and records.export(limit=1)["truncated_before"] == "s19"
+    for _ in range(6):
+        records.sweep(force=True)
+        clock[0] += 301
+    assert records._seq == top and len(calls) == built, "no pass writes or builds anything for a pruned PR"
+    assert records.export(limit=1, cursor="s5")["cursor_truncated"] is True
+    fresh = ControlPlaneRepo(now=lambda: clock[0])
+    fresh.import_state(repo.export_state())
+    for n in range(120):
+        merged(fresh, n)
+    calls2 = []
+    again = TrailRecords(fresh, learning_config({"warmup_minutes": 0, "max_records": 100, "late_checks": 0}), now=lambda: clock[0],
+                         trail_for=lambda *a: calls2.append(a) or fake_trail(), evolution_for=fake_evolution)
+    again.sweep(force=True)
+    assert again._seq == top and calls2 == [] and again.export(limit=1)["truncated_before"] == "s19"
+
+
+def test_an_end_older_than_what_retention_already_dropped_is_not_assembled():
+    repo, records, clock, calls = world(max_records=100, late_checks=0)
+    for n in range(101):
+        merged(repo, n, at="2026-10-05T10:00:00Z")
+    for _ in range(7):
+        records.sweep(force=True)
+        clock[0] += 301
+    assert len(records._records) == 100
+    repo.upsert_pull_request("old", repository="github.com/org/app", number=999, status="merged", merged_at="2026-09-01T10:00:00Z")
+    seen = len(calls)
+    records.sweep(force=True)
+    assert len(calls) == seen and not records._has_record("old", 1)
+
+
+def test_the_batch_is_fair_so_postponed_prs_never_starve_newer_ones():
+    unavailable = {**OK, "ci": "unavailable"}
+    repo, records, clock, calls = world(trail=fake_trail(sources=unavailable), sweep_batch=20, late_checks=0)
+    for n in range(200):
+        merged(repo, n)
+    for _ in range(10):
+        records.sweep(force=True)
+        clock[0] += 301
+    assert len({c[3] for c in calls}) == 200, "ten passes reach all 200 PRs once, oldest and newest alike"
+    assert len(calls) == 200
+
+
+def test_a_trail_that_can_never_be_built_is_given_up_on_and_the_tracking_maps_stay_bounded():
+    repo, records, clock, calls = world(trail=lambda: None, max_build_attempts=3)
+    merged(repo, 1)
+    for _ in range(8):
+        records.sweep(force=True)
+        clock[0] += 301
+    assert len(calls) == 3 and records.unbuildable() == {("pr-1", 1): "the trail could not be built in 3 attempts"}
+    assert repo.entity_ids(ENTITY) == [] and records._track == {}
+    repo._pull_requests.pop("pr-1")
+    records.sweep(force=True)
+    assert records.unbuildable() == {} and records._track == {}
+
+
+def test_without_a_ci_provider_ci_is_not_applicable_and_the_record_is_complete_at_once():
+    unavailable = {**OK, "ci": "unavailable"}
+    repo, records, _, _ = world(trail=fake_trail(sources=unavailable), evolution=lambda sid: fake_evolution(sid, {"ci": "unavailable"}))
+    records.ci_configured = lambda: False
+    end_pr(repo)
+    assert records.sweep(force=True) == 1
+    p = stored(repo)[0]["payload"]
+    assert p["sources"]["ci"] == "not_applicable" and p["incomplete"] is False and p["missing_sources"] == []
+    repo2, records2, _, _ = world(trail=fake_trail(sources=unavailable))
+    records2.ci_configured = lambda: True
+    end_pr(repo2)
+    assert records2.sweep(force=True) == 0, "a configured but unreadable CI still waits"
+
+
+# ---------------------------------------------------------------- scrub and allowlists
+@pytest.mark.parametrize("raw,gone", [
+    ("a%40b.com", "a%40b"), ("a＠b.com", "a"), ("a@localhost", "localhost"), ("/root/x", "/x"), ("%2Fhome%2Falice", "alice"),
+    ("~alice/x", "alice"), ("C:/Users/bob/x", "bob"), ("C:\\Users\\bob\\x", "bob"), ("%252Fhome%252Fcarol", "carol")])
+def test_scrub_bypasses_are_closed(raw, gone):
+    out = scrub(raw)
+    assert gone not in out.replace("[USER]", "").replace("[EMAIL]", ""), (raw, out)
+
+
+def test_text_that_needs_nothing_is_kept_verbatim_and_identifiers_like_branches_are_not_hashed():
+    for text in ("feat/john.smith", "fix/rootcause", "release-1.2", "ünïcode…ok"):
+        assert scrub(text) == text
+
+
+def test_a_cut_signal_reason_is_marked_and_named_in_trimmed():
+    repo, records, _, _ = world(trail=fake_trail({"signals": {"custom": sig(1, "r" * 900)}}))
+    end_pr(repo)
+    records.sweep(force=True)
+    p = stored(repo)[0]["payload"]
+    assert p["signals"]["custom"]["reason"].endswith("…[truncated]") and len(p["signals"]["custom"]["reason"]) <= 300
+    assert "text:reason" in p["trimmed"]
+
+
+def test_the_agent_record_is_an_allowlist_of_scalar_figures():
+    evolution = lambda sid: {"sources": {}, "learning_record": {  # noqa: E731
+        "session_id": sig("s1", "id"), "harness": sig("claude", "h"), "outcome": sig("finished", "o"),
+        "tool_calls": {"total": sig(3, "t"), "secret_extra": sig(1, "x")}, "notes": "free text carol@example.com",
+        "model": sig({"nested": "dict"}, "m"), "prs": [{"x": 1}], "handoffs_out": {"total": sig(1, "h"), "other": 5}}}
+    repo, records, _, _ = world(evolution=evolution)
+    end_pr(repo)
+    records.sweep(force=True)
+    rec = stored(repo)[0]["payload"]["agents"]["items"][0]["learning_record"]
+    assert set(rec) == {"session_id", "harness", "model", "role", "started_at", "ended_at", "duration_s", "cost_usd_estimate", "outcome",
+                        "tool_calls", "handoffs_in", "handoffs_out"}
+    none = {"value": None, "reason": "not recorded"}
+    assert rec["tool_calls"] == {"total": sig(3, "t"), "failed": none, "retried": none}
+    assert rec["model"] == {"value": None, "reason": "a non-scalar value was not stored"} and set(rec["handoffs_out"]) == {"total", "rejected", "failed"}
+    assert "carol" not in json.dumps(rec) and "secret_extra" not in json.dumps(rec)
+
+
+# ---------------------------------------------------------------- filters, locks, lifecycle
+def test_since_filters_on_assembly_time_and_ended_after_on_the_end_time():
+    repo, records, _ = seeded(1)
+    merged(repo, 50, at="2026-10-09T10:00:00Z")
+    records.sweep(force=True)
+    assert records.export(ended_after="2026-10-05T00:00:00Z")["count"] == 1
+    assert records.export(ended_after="2026-09-01T00:00:00Z")["count"] == 2
+    assert records.export(ended_after="2999-01-01T00:00:00Z")["records"] == []
+    with pytest.raises(ValueError):
+        records.export(ended_after="soon")
+
+
+def test_a_reader_is_not_blocked_by_a_slow_durable_write():
+    repo, records, _, _ = world()
+    end_pr(repo)
+    started, release = threading.Event(), threading.Event()
+    original = repo.record_event
+
+    def slow(*a, **k):
+        started.set()
+        release.wait(3)
+        return original(*a, **k)
+    repo.record_event = slow
+    worker = threading.Thread(target=lambda: records.sweep(force=True))
+    worker.start()
+    assert started.wait(2)
+    began = time.monotonic()
+    assert records.export()["records"] == [] and time.monotonic() - began < 0.5
+    release.set()
+    worker.join(5)
+    assert records.export()["count"] == 1
+
+
+def test_a_server_with_nothing_ended_does_no_work_and_a_close_stops_the_background_sweep(acknowledged_sink):
+    repo = ControlPlaneRepo(sink=acknowledged_sink)
+    svr = ControlPlaneServer(repo, scheduler_admission=True, learning={"warmup_minutes": 0})
+    built = []
+    svr.learning_trails.trail_for = lambda *a: built.append(a)
+    began = time.monotonic()
+    svr.sweep_once()
+    assert time.monotonic() - began < 2 and built == [] and svr.learning_trails.trigger_sweep() is False
+    assert not [t for t in threading.enumerate() if t.name == "learning-trails-sweep"]
+    merged(repo, 1)
+    release = threading.Event()
+    svr.learning_trails.trail_for = lambda *a: release.wait(5) or fake_trail()
+    svr.learning_trails.evolution_for = fake_evolution
+    svr.learning_trails._swept = 0.0
+    assert svr.learning_trails.trigger_sweep() is True
+    release.set()
+    svr.learning_trails.close()
+    assert svr.learning_trails._worker is not None and not svr.learning_trails._worker.is_alive()
+    assert svr.learning_trails.sweep(force=True) == 0 and svr.learning_trails.trigger_sweep() is False

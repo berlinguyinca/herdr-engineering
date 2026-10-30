@@ -20,22 +20,33 @@ One `PullRequestTrail` event on the `pr_trail` stream of the PR (kept out of the
 - `pull_request` (host, repository, number, status, branch, base, times)
 - `signals`: `merged_without_rework`, `ci_green_first_try`, `ci_reruns`, `cost_usd_estimate`, `duration_s`, `review_verdicts`,
   `handoff_problems`, each `{value, reason}`
-- `sessions`, `ambiguous`, `handoffs`, `reviews`, `ci_runs`: ids, states, counts, timestamps and rules only
-- `agents`: for each evidence-linked agent its `learning_record` from the Evolution tab (tool calls, handoffs, restarts, outcome, cost)
+- `sessions`, `ambiguous`, `handoffs`, `reviews`, `ci_runs`, `agents`: ids, states, counts, timestamps and rules only. **Every one of
+  these six fields always has the same shape**, `{"items": [...] | null, "omitted": n, "reason": str | null}` (`schema_version` 1):
+  `items` is the list, `[]` when it was cut for size, `null` when the source was unavailable; `omitted` counts what is not in `items`
+  (cap, size or source), `reason` says why. A consumer never has to branch on list-or-object
+- `agents.items[].learning_record`: an allowlist of the Evolution tab's figures: `session_id`, `harness`, `model`, `role`,
+  `started_at`, `ended_at`, `duration_s`, `cost_usd_estimate`, `outcome`, `tool_calls.{total,failed,retried}`, `handoffs_in`,
+  `handoffs_out.{total,rejected,failed}`, each `{value, reason}` with a scalar `value` (anything else becomes null). Its `prs` (the PR-wide
+  signals again) and any other field are not stored
 - `sources`: what was read and its state; `incomplete` and `missing_sources`; `omitted`; `trimmed`
 
 ### Privacy
 
 An allowlist is stored, not a copy of the trail. Handoff goals, agent names, reviewer names, CI URLs and agent ids are not stored.
 The remaining text is passed once, at write time, through the redactor (key-hint masking such as `password`/`token`), then scrubbed of
-e-mail addresses (`[EMAIL]`) and home paths (`/home/<u>`, `/Users/<u>`, `C:\Users\<u>` → `[USER]`), keys included. Free text such as a
-branch is cut to a short length with a visible `…[truncated]` marker and named in `trimmed` (`text:<field>`). The JSON and JSONL exports
+e-mail addresses (`[EMAIL]`, also `a%40b.com`, fullwidth `＠`, `a@localhost`) and home paths (`/home/<u>`, `/Users/<u>`, `/root`, `~<u>`,
+`C:\Users\<u>`, `C:/Users/<u>` → `[USER]`), keys included, after Unicode NFKC normalisation and URL-decoding (twice). Text that needs nothing is
+kept verbatim. Every string longer than 300 characters (200 for branches) is cut with a visible `…[truncated]` marker and named in
+`trimmed` (`text:<field>`), signal reasons and agent text included.
+
+**Branch names and similar identifiers (`fix/john.smith`) are kept as they are, by design:** hashing them would break joins with the
+PR, CI and commit data the pipeline already holds. A branch that contains an e-mail address or a home path is scrubbed. The JSON and JSONL exports
 return the stored record as is: they are identical in content and do not depend on any other redaction setting.
 
 ### Size
 
-A record is hard-capped at 128 KiB. When over, whole lists are replaced by `{"omitted": n, "reason": ...}` in this order: `ci_runs`,
-`handoffs`, `reviews`, `ambiguous`, `sessions`, `agents`; then signal reasons are shortened; as a last resort only the core fields stay.
+A record is hard-capped at 128 KiB. When over, whole lists are emptied (`items: []`, `omitted` = what was dropped, `reason` set) in this
+order: `ci_runs`, `handoffs`, `reviews`, `ambiguous`, `sessions`, `agents`; then signal reasons are shortened; as a last resort only the core fields stay.
 `trimmed` names what was dropped.
 
 ## When a record is written
@@ -51,11 +62,20 @@ re-reads the PR just before writing and skips the write if its status, times or 
 
 - the process is inside `warmup_minutes` after start (CI and event buffers refill after a restart);
 - the PR trail could not be built (for example the 2 s gate timeout);
-- a critical source (`ci`, `handoffs`, `reviews`, `plan_reviews`) is not `ok`, or an agent's Evolution sources (`ci`, `handoffs`,
+- a critical source (`ci`, `handoffs`, `reviews`, `plan_reviews`) is not `ok` (`ci` is `not_applicable`, null with a reason and not
+  waited for, when no CI provider is configured at all), or an agent's Evolution sources (`ci`, `handoffs`,
   `reviews`, `plan_reviews`, `event_stream`, `tools`) are not `ok`, or an agent's record could not be read.
 
-It is retried every `retry_interval_minutes`. After `ready_retry_minutes` without a complete read it is stored anyway with
-`incomplete: true` and `missing_sources` (for example `["ci"]`). Training code should filter on `incomplete`.
+It is retried every `retry_interval_minutes`. A pass builds at most `sweep_batch` trails, never-tried PRs first, then the least recently
+tried, so a backlog is worked through fairly and old not-ready PRs cannot starve newer ones. After `ready_retry_minutes` without a complete read it is stored anyway with
+`incomplete: true` and `missing_sources` (for example `["ci"]`). Training code should filter on `incomplete`. A PR whose trail cannot be built at all (no repository or number, or never readable) is given
+up on after `max_build_attempts` attempts: nothing is stored, a warning is logged, it is listed by `TrailRecords.unbuildable()`, and the
+bookkeeping is dropped once the PR changes or disappears. Retry clocks are in memory: a restart restarts them, and the warm-up plus the
+`sweep_batch` bound keep the restart from releasing a stampede.
+
+**Assembled once.** The set of ends ever assembled (rebuilt from the stored events at start) is separate from the export index. Retention
+never removes a key from it, so a pruned PR is never assembled again, and an end older than the newest end retention has already dropped
+is not assembled at all (it would be pruned immediately).
 
 **Late evidence.** A record is never rewritten. A provider-reported end time arriving after an observed one, or a signal that was `null`
 and is known on a later bounded re-check (`late_checks` times, `late_check_interval_minutes` apart, inside `late_window_hours`, only
@@ -72,7 +92,8 @@ gets 403; a missing or wrong key gets 401.
 | --- | --- |
 | `limit` | 1 to `page_max` (default `page_default`) |
 | `cursor` | the `next_cursor` of the previous page; records after it, oldest first |
-| `since` | an ISO 8601 time; only records assembled at or after it |
+| `since` | an ISO 8601 time; only lines **written** (`assembled_at`) at or after it. It is a pull cursor by time, not a business date |
+| `ended_after` | an ISO 8601 time; only records whose pull request `ended_at` is at or after it (late-evidence lines follow their record) |
 
 Answers `{schema_version, records, count, has_more, next_cursor, truncated_before, cursor_truncated}`. JSONL answers one JSON object
 per line (`application/x-ndjson`) with headers `X-Has-More`, `X-Next-Cursor`, `X-Truncated-Before`, `X-Cursor-Truncated`. A bad
@@ -80,7 +101,11 @@ parameter (including a blank one) is a 400; disabled is 404. Reads use an in-mem
 
 **Retention.** `max_records` (default 20000) bounds what is indexed and exported. The oldest PRs are dropped whole; `truncated_before`
 is the cursor before which nothing is available any more, and `cursor_truncated` tells a client its cursor pointed into pruned data.
-The durable log keeps the events; the same pruning is applied again after a restart.
+Pruning only trims the in-memory index and the export; the stored events are left alone, and at start the index is rebuilt from them and
+pruned the same way, so `truncated_before` is the same after a restart. Late evidence for a pruned record is refused.
+
+**Locks.** Writers take a writer lock (held across a durable write that waits for the sink); readers use only a short index lock, so a
+slow sink never blocks an export. A read starts a background sweep only when a record is actually due, and `shutdown()` stops and joins it.
 
 ## Configuration
 
@@ -103,6 +128,7 @@ control_plane:
     late_checks: 3                    # 0..20
     late_window_hours: 24             # 1..720
     late_check_interval_minutes: 30   # 1..1440
+    max_build_attempts: 12            # 1..1000, then an unreadable trail is given up on
 ```
 
 Unknown keys are refused at start.

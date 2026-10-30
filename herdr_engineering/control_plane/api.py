@@ -332,7 +332,8 @@ class ControlPlaneServer:
         self.learning_trails = TrailRecords(
             repo, self.learning,
             trail_for=lambda host, owner, name, number: _pull_trail(self, repo, owner, name, number, host, gated=True),
-            evolution_for=lambda session_id: _evolution_body(self, repo, session_id))
+            evolution_for=lambda session_id: _evolution_body(self, repo, session_id),
+            ci_configured=lambda: self.ci_monitor.configured())
         # control_plane.ci_fix (validated; None = defaults, which are disabled: the routes then 404).
         from .ci_fix import CIFixService, ci_fix_config
         self.ci_fix_config = ci_fix_config(ci_fix)
@@ -1562,6 +1563,7 @@ class ControlPlaneServer:
         return True
 
     def shutdown(self):
+        self.learning_trails.close()            # no new sweep starts; a running background one is waited for briefly
         if self.rakazo is not None:
             self.rakazo.close()                 # ends open event streams
         self._maintenance_stop.set()
@@ -4497,6 +4499,7 @@ def _make_handler(server, public=False, operator=False):
                 return self._json({"error": "limit must be a whole number"}, 400)
             try:
                 page = trails.export(since=query.get("since", [None])[0], cursor=query.get("cursor", [None])[0],
+                                     ended_after=query.get("ended_after", [None])[0],
                                      limit=int(raw_limit) if raw_limit is not None else None)
             except ValueError as exc:
                 return self._json({"error": str(exc)}, 400)

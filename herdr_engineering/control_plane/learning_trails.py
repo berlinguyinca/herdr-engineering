@@ -33,6 +33,8 @@ import json
 import logging
 import re
 import threading
+import unicodedata
+from urllib.parse import unquote
 
 from .project_links import canonical_repository
 from .redact import redact_payload, redact_text
@@ -55,17 +57,21 @@ _CRITICAL_TRAIL = ("ci", "handoffs", "reviews", "plan_reviews")
 _CRITICAL_AGENT = ("ci", "handoffs", "reviews", "plan_reviews", "event_stream")
 _END_TIME_SIGNALS = ("duration_s", "ci_green_first_try", "ci_reruns", "merged_without_rework")
 _TRIM_ORDER = ("ci_runs", "handoffs", "reviews", "ambiguous", "sessions", "agents")
-_EMAIL = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9\-]+(?:\.[A-Za-z0-9\-]+)*\.[A-Za-z]{2,}")
-_HOME = re.compile(r"(/home/|/Users/)[^/\s\"']+|([A-Za-z]:\\Users\\)[^\\\s\"']+", re.IGNORECASE)
+_AGENT_SCALARS = ("session_id", "harness", "model", "role", "started_at", "ended_at", "duration_s", "cost_usd_estimate", "outcome")
+_UNBUILDABLE_CAP = 5000
+_EMAIL = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9\-]+(?:\.[A-Za-z0-9\-]+)*")
+_HOME = re.compile(r"(/home/|/Users/|[A-Za-z]:[\\/]Users[\\/])[^/\\\s\"']+", re.IGNORECASE)
+_ROOT = re.compile(r"(?<![\w.-])/root(?=/|\s|$|[\"'])(?:/[^\s\"']*)?")
+_TILDE = re.compile(r"(?<![\w/~.-])~[A-Za-z_][\w.-]*")
 _ROLES = ("operator", "viewer")
 
 _DEFAULTS = {"enabled": True, "max_agents": 12, "sweep_batch": 20, "page_default": 50, "page_max": 200, "max_records": 20000,
              "require_role": "operator", "warmup_minutes": 10, "retry_interval_minutes": 5, "ready_retry_minutes": 60,
-             "low_confidence_after_minutes": 15, "late_checks": 3, "late_window_hours": 24, "late_check_interval_minutes": 30}
+             "low_confidence_after_minutes": 15, "late_checks": 3, "late_window_hours": 24, "late_check_interval_minutes": 30, "max_build_attempts": 12}
 _RANGES = {"max_agents": (1, 50), "sweep_batch": (1, 100), "page_default": (1, 500), "page_max": (1, 500), "max_records": (100, 1_000_000),
            "warmup_minutes": (0, 1440), "retry_interval_minutes": (1, 1440), "ready_retry_minutes": (0, 1440),
            "low_confidence_after_minutes": (1, 10080), "late_checks": (0, 20), "late_window_hours": (1, 720),
-           "late_check_interval_minutes": (1, 1440)}
+           "late_check_interval_minutes": (1, 1440), "max_build_attempts": (1, 1000)}
 
 
 def learning_config(raw):
@@ -98,28 +104,58 @@ def _parse(stamp):
     return (value if value.tzinfo else value.replace(tzinfo=dt.UTC)).timestamp()
 
 
-def scrub(text):
-    """Secret patterns, e-mail addresses and home-directory paths out of one string."""
+def _scrub_once(text):
     text = redact_text(text)
     text = _EMAIL.sub("[EMAIL]", text)
-    return _HOME.sub(lambda m: (m.group(1) or m.group(2)) + "[USER]", text)
+    text = _ROOT.sub("/root/[USER]", text)
+    text = _TILDE.sub("~[USER]", text)
+    return _HOME.sub(lambda m: m.group(1) + "[USER]", text)
 
 
-def _clean(value, depth=0):
-    """Key-hint masking first (``{"password": ...}``), then every string and every key through ``scrub``, bounded in depth and length."""
+def scrub(text):
+    """Secret patterns, e-mail addresses (also ``a%40b.com``, fullwidth ``＠``, ``a@localhost``) and home-directory paths (``/home/u``,
+    ``/Users/u``, ``/root``, ``~u``, ``C:\\Users\\u`` and ``C:/Users/u``, also percent-encoded) out of one string. Applied to the
+    NFKC-normalised text and to its URL-decoded form; when decoding exposes something, the decoded and scrubbed text is returned."""
+    original = str(text)
+    text = unicodedata.normalize("NFKC", original)
+    plain = _scrub_once(text)
+    if "%" in text:
+        decoded = unquote(unquote(text))
+        if decoded != text:
+            cleaned = _scrub_once(decoded)
+            if cleaned != decoded:
+                return cleaned
+    return original if plain == text else plain         # text that needed nothing is kept verbatim
+
+
+def _clean(value, trimmed, name="", depth=0):
+    """Key-hint masking first (``{"password": ...}``), then every string and every key through ``scrub``, bounded in depth and length.
+    A string or key that had to be cut is clipped with a visible marker and named in ``trimmed`` (``text:<field>``)."""
     if depth == 0:
         value = redact_payload(value)
     if depth > 8:
+        trimmed.add("depth")
         return None
+
+    def clip(text, limit, label):
+        text = scrub(text)
+        if len(text) > limit:
+            trimmed.add(f"text:{label}" if label else "text")
+            return text[:limit - len(_CLIP)] + _CLIP
+        return text
     if isinstance(value, str):
-        return scrub(value)[:_TEXT]
+        return clip(value, _TEXT, name)
     if isinstance(value, dict):
-        return {scrub(str(k))[:80]: _clean(v, depth + 1) for k, v in value.items()}
+        out = {}
+        for k, v in value.items():
+            key = clip(str(k), 80, "key")
+            out[key] = _clean(v, trimmed, key, depth + 1)
+        return out
     if isinstance(value, list | tuple):
-        return [_clean(v, depth + 1) for v in value]
+        return [_clean(v, trimmed, name, depth + 1) for v in value]
     if isinstance(value, bool | int | float) or value is None:
         return value
-    return scrub(str(value))[:_TEXT]
+    return clip(str(value), _TEXT, name)
 
 
 def parse_repository(value):
@@ -140,39 +176,57 @@ def _size(value):
 
 
 class TrailRecords:
-    """Assembles, stores and exports pull-request trails. ``trail_for(host, owner, name, number)`` returns a ``pr_trail`` body (or None)
-    and ``evolution_for(session_id)`` an ``agent_evolution`` body (or None); both are supplied by the server."""
+    """Assembles, stores and exports pull-request trails. ``trail_for(host, owner, name, number)`` returns a ``pr_trail`` body (or None),
+    ``evolution_for(session_id)`` an ``agent_evolution`` body (or None) and ``ci_configured()`` whether a CI provider is configured at
+    all; all three are supplied by the server.
 
-    def __init__(self, repo, config, *, trail_for=None, evolution_for=None, now=None):
+    Locks: ``_write_lock`` serialises writers (and is held across a durable write that may wait for the sink); ``_lock`` guards the
+    in-memory index and is only ever held briefly, so a reader never waits for a slow sink. Order: ``_write_lock`` then ``_lock``."""
+
+    def __init__(self, repo, config, *, trail_for=None, evolution_for=None, ci_configured=None, now=None):
         self.repo, self.config = repo, config
-        self.trail_for, self.evolution_for = trail_for, evolution_for
+        self.trail_for, self.evolution_for, self.ci_configured = trail_for, evolution_for, ci_configured
         self._now = now or repo._now
         self._started = self._now()
         self._lock = threading.RLock()
+        self._write_lock = threading.RLock()
         self._sweep_guard = threading.Lock()
         self._worker = None
+        self._closed = False
         self._swept = 0.0
         self._index_ready = False
         self._seq = -1
         self._seqs: list[int] = []
-        self._rows: list[tuple] = []          # (learning_seq, pr_id, event_type, payload, assembled_ts), ascending by seq
-        self._records: dict = {}              # (pr_id, end_seq) -> payload of the PullRequestTrail
+        self._rows: list[tuple] = []          # (learning_seq, pr_id, event_type, payload, assembled_ts, ended_ts), ascending by seq
+        self._records: dict = {}              # (pr_id, end_seq) -> payload; only the retained (exportable) records
+        self._ever: set = set()               # (pr_id, end_seq) ever assembled; pruning never removes a key, restart rebuilds it
         self._late_keys: set = set()          # (pr_id, "reported:<time>" | "digest:<hex>")
         self._pruned_through = -1
-        self._first_due: dict = {}
-        self._retry_at: dict = {}
+        self._horizon = None                  # the latest end time among pruned records: an older end is not assembled again
+        self._track: dict = {}                # key -> {"first", "retry_at", "last", "none"}; only keys of PRs still waiting
+        self._unbuildable: dict = {}          # key -> reason; trail never readable after max_build_attempts
         self._late_state: dict = {}
 
     @property
     def enabled(self):
-        return bool(self.config["enabled"])
+        return bool(self.config["enabled"]) and not self._closed
+
+    def close(self):
+        """Stop starting work and wait briefly for a background sweep that is running."""
+        self._closed = True
+        worker = self._worker
+        if worker is not None and worker.is_alive() and worker is not threading.current_thread():
+            worker.join(timeout=2)
 
     def _min(self, key):
         return float(self.config[key]) * 60
 
     # ------------------------------------------------------------------ index
     def _ensure_index(self):
-        """Built once, from the stored events (no copies); afterwards updated on every write. The counter is the highest stored seq."""
+        """Built once, from the stored events (no copies); afterwards updated on every write. The counter is the highest stored seq.
+        The retention limit is applied at once, so ``truncated_before`` is the same after a restart."""
+        if self._index_ready:
+            return
         with self._lock:
             if self._index_ready:
                 return
@@ -184,33 +238,42 @@ class TrailRecords:
                     payload = event.get("payload") or {}
                     seq = payload.get("learning_seq")
                     if event.get("event_type") in (EVENT, LATE) and isinstance(seq, int) and not isinstance(seq, bool):
-                        rows.append((seq, pr_id, event["event_type"], payload, _parse(payload.get("assembled_at")) or 0.0))
+                        rows.append((seq, pr_id, event["event_type"], payload))
             rows.sort(key=lambda r: r[0])
-            self._rows, self._seqs = rows, [r[0] for r in rows]
-            self._records, self._late_keys = {}, set()
-            for _, pr_id, event_type, payload, _ts in rows:
-                self._note(pr_id, event_type, payload)
+            self._rows, self._seqs, self._records, self._ever, self._late_keys = [], [], {}, set(), set()
+            for seq, pr_id, event_type, payload in rows:
+                self._add(seq, pr_id, event_type, payload)
             self._seq = self._seqs[-1] if self._seqs else -1
             self._index_ready = True
+            self._prune_locked()
 
-    def _note(self, pr_id, event_type, payload):
+    def _add(self, seq, pr_id, event_type, payload):
+        """Index one stored event. Caller holds ``_lock``."""
         if event_type == EVENT:
+            ended = _parse(payload.get("ended_at"))
             self._records[(pr_id, payload.get("end_seq"))] = payload
+            self._ever.add((pr_id, payload.get("end_seq")))
         else:
+            parent = self._records.get((pr_id, payload.get("end_seq")))
+            ended = _parse((parent or {}).get("ended_at"))
             evidence = payload.get("evidence") or {}
             if evidence.get("ended_at_reported"):
                 self._late_keys.add((pr_id, f"reported:{evidence['ended_at_reported']}"))
             if evidence.get("digest"):
                 self._late_keys.add((pr_id, f"digest:{evidence['digest']}"))
+        self._seqs.append(seq)
+        self._rows.append((seq, pr_id, event_type, payload, _parse(payload.get("assembled_at")) or 0.0, ended))
 
     def _write(self, pr_id, payload, event_type):
-        """Allocate the next seq and record the event in one critical section; the counter moves only if the event was recorded."""
-        with self._lock:
+        """Allocate the next seq and record the event under the writer lock; the counter and the index move only if the event was recorded.
+        The durable write (which may wait for the sink) holds the writer lock but not the index lock."""
+        with self._write_lock:
             self._ensure_index()
-            if self._seqs and self._seqs[-1] != self._seq:
-                log.warning("learning trail counter is behind the stored records; refusing to write")
-                return None
-            seq = self._seq + 1
+            with self._lock:
+                if self._seqs and self._seqs[-1] > self._seq:
+                    log.warning("learning trail counter is behind the stored records; refusing to write")
+                    return None
+                seq = self._seq + 1
             payload = {**payload, "learning_seq": seq}
             sink = self.repo._sink
             durable = sink is not None and callable(getattr(sink, "record_required", None))
@@ -221,24 +284,46 @@ class TrailRecords:
                 return None
             if not event:
                 return None
-            self._seq = seq
-            self._seqs.append(seq)
-            self._rows.append((seq, pr_id, event_type, payload, _parse(payload.get("assembled_at")) or 0.0))
-            self._note(pr_id, event_type, payload)
+            with self._lock:
+                self._seq = seq
+                self._add(seq, pr_id, event_type, payload)
             return payload
 
     def _has_record(self, pr_id, end_seq):
+        """Whether this end was ever assembled (pruned records included)."""
+        self._ensure_index()
         with self._lock:
-            self._ensure_index()
-            return (pr_id, end_seq) in self._records
+            return (pr_id, end_seq) in self._ever
 
     def _record_for(self, pr_id, end_seq):
+        self._ensure_index()
         with self._lock:
-            self._ensure_index()
             return self._records.get((pr_id, end_seq))
 
     # ------------------------------------------------------------------ assembly
-    def _agents(self, trail):
+    @staticmethod
+    def _signal(entry):
+        """``{value, reason}`` of one agent figure: a scalar value or null; anything else is dropped."""
+        if not isinstance(entry, dict):
+            return {"value": None, "reason": "not recorded"}
+        value = entry.get("value")
+        if not (value is None or isinstance(value, bool | int | float | str)):
+            return {"value": None, "reason": "a non-scalar value was not stored"}
+        return {"value": value, "reason": entry.get("reason") if isinstance(entry.get("reason"), str) else None}
+
+    def _agent_record(self, record):
+        """The allowlisted agent figures: scalars and their reasons only. Anything else in the evolution record (including its ``prs``,
+        which repeat the PR-wide signals) is not stored."""
+        sig = self._signal
+        calls, out_h = record.get("tool_calls"), record.get("handoffs_out")
+        calls = calls if isinstance(calls, dict) else {}
+        out_h = out_h if isinstance(out_h, dict) else {}
+        return {**{k: sig(record.get(k)) for k in _AGENT_SCALARS},
+                "tool_calls": {k: sig(calls.get(k)) for k in ("total", "failed", "retried")},
+                "handoffs_in": sig(record.get("handoffs_in")),
+                "handoffs_out": {k: sig(out_h.get(k)) for k in ("total", "rejected", "failed")}}
+
+    def _agents(self, trail, ci_na):
         sessions = [s for s in (trail.get("sessions") or []) if isinstance(s, dict) and s.get("session_id")]
         limit = int(self.config["max_agents"])
         missing = set()
@@ -258,13 +343,13 @@ class TrailRecords:
                 continue
             states = (body or {}).get("sources") or {}
             for name in _CRITICAL_AGENT:
+                if name == "ci" and ci_na:
+                    continue
                 if states.get(name) not in ("ok", None):
                     missing.add(f"agent_evolution.{name}")
             if states.get("tools") == "unavailable":
                 missing.add("agent_evolution.tools")
-            # the PR-wide signals are on the record's own ``signals``; repeating them per agent would multiply the size
-            agents.append({"session_id": session["session_id"], "rule": session.get("rule"),
-                           "learning_record": {k: v for k, v in record.items() if k != "prs"}})
+            agents.append({"session_id": session["session_id"], "rule": session.get("rule"), "learning_record": self._agent_record(record)})
         omitted = max(0, len(sessions) - limit)
         state = "ok" if not omitted and not missing else "partial"
         reason = None if state == "ok" else (f"{omitted} agents were not assembled (control_plane.learning.max_agents)" if omitted
@@ -298,16 +383,23 @@ class TrailRecords:
                      for a in trail.get("ambiguous") or [] if isinstance(a, dict)]
         return sessions, handoffs, reviews, runs, ambiguous
 
+    @staticmethod
+    def _listing(items, omitted=0, reason=None):
+        """Every list field has one shape, ``{"items": [...] | null, "omitted": n, "reason": str | null}``, whether or not it was cut."""
+        return {"items": items, "omitted": int(omitted), "reason": reason}
+
     def _fit(self, out):
-        """Hard cap: drop whole lists in a defined order (each becomes ``{"omitted": n, "reason": ...}``), then shorten signal reasons, and
-        last resort keep only the core. Aggregates and ``trimmed`` always remain."""
+        """Hard cap: empty whole lists in a defined order (``items`` becomes ``[]`` and ``omitted`` counts what was dropped), then shorten
+        signal reasons, and last resort keep only the core. Aggregates and ``trimmed`` always remain."""
         limit = MAX_BYTES - 512
         for field in _TRIM_ORDER:
             if _size(out) <= limit:
                 return out
-            value = out.get(field)
-            if isinstance(value, list) and value:
-                out[field] = {"omitted": len(value), "reason": f"dropped to keep the record under {MAX_BYTES} bytes"}
+            listing = out.get(field)
+            if isinstance(listing, dict) and listing.get("items"):
+                listing["omitted"] += len(listing["items"])
+                listing["items"] = []
+                listing["reason"] = f"dropped to keep the record under {MAX_BYTES} bytes"
                 out["trimmed"].append(field)
         if _size(out) > limit:
             for signal in (out.get("signals") or {}).values():
@@ -320,6 +412,13 @@ class TrailRecords:
             core.update(trimmed=[*out["trimmed"], "everything-but-core"], sources=out.get("sources"), omitted=out.get("omitted"))
             out = core
         return out
+
+    def _ci_not_applicable(self):
+        """True only when a CI provider is positively known not to be configured (then CI is null with a reason, not 'missing')."""
+        try:
+            return self.ci_configured is not None and self.ci_configured() is False
+        except Exception:  # noqa: BLE001
+            return False
 
     def _build(self, pr, now):
         """``(payload, missing_sources)`` for one ended pull request, or None when its trail cannot be built now."""
@@ -335,11 +434,15 @@ class TrailRecords:
         if not isinstance(trail, dict):
             return None
         sources = dict(trail.get("sources") or {})
-        missing = {k for k in _CRITICAL_TRAIL if sources.get(k) != "ok"}
-        agents, agents_source, agents_omitted, agent_missing = self._agents(trail)
+        ci_na = sources.get("ci") != "ok" and self._ci_not_applicable()
+        if ci_na:
+            sources["ci"] = "not_applicable"
+        missing = {k for k in _CRITICAL_TRAIL if sources.get(k) != "ok" and not (k == "ci" and ci_na)}
+        agents, agents_source, agents_omitted, agent_missing = self._agents(trail, ci_na)
         missing |= agent_missing
         trimmed: set = set()
         sessions, handoffs, reviews, runs, ambiguous = self._project(trail, trimmed)
+        cut = trail.get("omitted") or {}
         view = trail.get("pull_request") or {}
         ended_at = pr.get("merged_at") or pr.get("closed_at")
         ended_ts = _parse(ended_at)
@@ -355,6 +458,7 @@ class TrailRecords:
                 if key in signals:
                     signals[key] = {"value": None, "reason": why}
                     withheld.append(key)
+        listing = self._listing
         out = {
             "schema_version": SCHEMA, "kind": "pull_request_trail", "assembled_at": self.repo._stamp(),
             "pr_id": pr.get("pr_id"), "end_seq": pr.get("end_count") or 1, "ended_at": ended_at, "ended_source": pr.get("ended_source"),
@@ -366,19 +470,23 @@ class TrailRecords:
                              "merged_at": pr.get("merged_at"), "closed_at": pr.get("closed_at")},
             "state": trail.get("state"), "reason": self._clip(trail.get("reason"), _TEXT, "reason", trimmed),
             "sources": {**sources, "agent_evolution": agents_source},
-            "omitted": {**(trail.get("omitted") or {}), "agents": agents_omitted},
-            "signals": signals, "sessions": sessions, "ambiguous": ambiguous,
+            "omitted": {**cut, "agents": agents_omitted},
+            "signals": signals,
+            "sessions": listing(sessions, cut.get("sessions") or 0), "ambiguous": listing(ambiguous),
             "inferred_sessions_count": len(trail.get("inferred_sessions") or []),
-            "handoffs": handoffs, "reviews": reviews, "ci_runs": runs, "agents": agents,
-            "incomplete": False, "missing_sources": [], "trimmed": sorted(trimmed),
+            "handoffs": listing(handoffs, cut.get("handoffs") or 0), "reviews": listing(reviews, cut.get("reviews") or 0),
+            "ci_runs": listing(runs, cut.get("ci_runs") or 0),
+            "agents": listing(agents, agents_omitted, agents_source.get("reason") if agents is None else None),
+            "incomplete": False, "missing_sources": [], "trimmed": [],
         }
-        out = _clean(out)
+        out = _clean(out, trimmed)
+        out["trimmed"] = sorted(trimmed)
         return self._fit(out), missing
 
     # ------------------------------------------------------------------ sweep
     def sweep(self, *, force=False):
-        """Assemble the records that are due (at most ``sweep_batch``), re-check recent records for late evidence, prune. ``force`` skips the
-        five-minute throttle (tests, maintenance); the warm-up still applies. A second concurrent sweep returns at once."""
+        """Assemble the records that are due (at most ``sweep_batch`` builds), re-check recent records for late evidence, prune. ``force``
+        skips the five-minute throttle (tests, maintenance); the warm-up still applies. A second concurrent sweep returns at once."""
         if not self.enabled:
             return 0
         now = self._now()
@@ -398,10 +506,14 @@ class TrailRecords:
             self._sweep_guard.release()
 
     def trigger_sweep(self):
-        """A bounded, non-forced sweep in a background thread; never blocks the caller on a trail build. Returns whether one was started."""
+        """A bounded, non-forced sweep in a background thread, started only when a record is actually due; never blocks the caller on a
+        trail build. Returns whether one was started."""
         if not self.enabled or (self._worker is not None and self._worker.is_alive()):
             return False
-        if self._now() - self._swept < SWEEP_EVERY or self._now() - self._started < self._min("warmup_minutes"):
+        now = self._now()
+        if now - self._swept < SWEEP_EVERY or now - self._started < self._min("warmup_minutes"):
+            return False
+        if not self._candidates(now)[0]:
             return False
 
         def run():
@@ -409,7 +521,7 @@ class TrailRecords:
                 self.sweep()
             except Exception as exc:  # noqa: BLE001
                 log.warning("learning trail sweep failed: %s", type(exc).__name__)
-        self._worker = threading.Thread(target=run, daemon=True)
+        self._worker = threading.Thread(target=run, daemon=True, name="learning-trails-sweep")
         self._worker.start()
         return True
 
@@ -420,42 +532,74 @@ class TrailRecords:
         return (a.get("status") == b.get("status") and a.get("merged_at") == b.get("merged_at")
                 and a.get("closed_at") == b.get("closed_at") and (a.get("end_count") or 1) == (b.get("end_count") or 1))
 
-    def _assemble_due(self, now):
-        due = []
+    def _candidates(self, now):
+        """``(due, seen, recorded)``: the PRs whose end has no record yet and is not postponed, fairest first (never tried, then least
+        recently tried, then oldest end); every ended key seen; the PRs that already have a record. No trail is built here."""
+        self._ensure_index()
+        due, seen, recorded = [], set(), []
+        with self._lock:
+            horizon = self._horizon
+            ever = self._ever
         for pr in self.repo.list_pull_requests():
             if str(pr.get("status") or "").lower() not in _ENDED or not isinstance(pr.get("pr_id"), str):
                 continue
             if not (pr.get("merged_at") or pr.get("closed_at")):
                 continue
             key = (pr["pr_id"], pr.get("end_count") or 1)
-            if self._has_record(*key):
-                self._late_from_record(pr)
+            seen.add(key)
+            if key in ever:
+                recorded.append(pr)
                 continue
-            if self._retry_at.get(key, 0) > now:
+            if key in self._unbuildable:
                 continue
-            due.append((pr, key))
-            if len(due) >= int(self.config["sweep_batch"]):
-                break
+            ended = _parse(pr.get("merged_at") or pr.get("closed_at"))
+            if horizon is not None and ended is not None and ended < horizon:
+                continue                                        # older than what retention already dropped: it would be pruned at once
+            track = self._track.get(key)
+            if track and track["retry_at"] > now:
+                continue
+            due.append(((track["last"] if track else -1.0), ended or 0.0, pr, key))
+        due.sort(key=lambda d: (d[0], d[1]))
+        return due, seen, recorded
+
+    def _assemble_due(self, now):
+        due, seen, recorded = self._candidates(now)
+        for pr in recorded:
+            self._late_from_record(pr)
+        self._track = {k: v for k, v in self._track.items() if k in seen}          # the maps never outgrow the PRs that still wait
+        self._unbuildable = {k: v for k, v in self._unbuildable.items() if k in seen}
         written = 0
-        for pr, key in due:
-            first = self._first_due.setdefault(key, now)
-            built = self._build(pr, now)                      # outside the lock: it walks every session and handoff
+        for _, _, pr, key in due[:int(self.config["sweep_batch"])]:
+            track = self._track.setdefault(key, {"first": now, "retry_at": 0.0, "last": -1.0, "none": 0})
+            track["last"] = now
+            built = self._build(pr, now)                      # outside any lock: it walks every session and handoff
             if built is None:
-                self._retry_at[key] = now + self._min("retry_interval_minutes")
+                track["none"] += 1
+                if track["none"] >= int(self.config["max_build_attempts"]):
+                    self._unbuildable[key] = f"the trail could not be built in {track['none']} attempts"
+                    self._track.pop(key, None)
+                    log.warning("learning trail for %s is unbuildable; giving up", key[0])
+                    while len(self._unbuildable) > _UNBUILDABLE_CAP:
+                        self._unbuildable.pop(next(iter(self._unbuildable)))
+                else:
+                    track["retry_at"] = now + self._min("retry_interval_minutes")
                 continue
             payload, missing = built
-            if missing and now - first < self._min("ready_retry_minutes"):
-                self._retry_at[key] = now + self._min("retry_interval_minutes")
+            if missing and now - track["first"] < self._min("ready_retry_minutes"):
+                track["retry_at"] = now + self._min("retry_interval_minutes")
                 continue
             payload["incomplete"], payload["missing_sources"] = bool(missing), sorted(missing)
-            with self._lock:
+            with self._write_lock:
                 if self._has_record(*key) or not self._same_end(self.repo.get_pull_request(pr["pr_id"]), pr):
                     continue                                    # it moved while the trail was built: decide again next pass
                 if self._write(pr["pr_id"], payload, EVENT) is not None:
                     written += 1
-                    self._first_due.pop(key, None)
-                    self._retry_at.pop(key, None)
+                    self._track.pop(key, None)
         return written
+
+    def unbuildable(self):
+        """``{(pr_id, end_seq): reason}`` of the ends given up on (the trail was never readable)."""
+        return dict(self._unbuildable)
 
     # ------------------------------------------------------------------ late evidence
     def _late_from_record(self, pr):
@@ -466,17 +610,20 @@ class TrailRecords:
         if record is None or record.get("ended_source") != "observed":
             return
         reported = pr.get("merged_at") or pr.get("closed_at")
-        if reported == record.get("ended_at") or (pr["pr_id"], f"reported:{reported}") in self._late_keys:
+        with self._lock:
+            known = (pr["pr_id"], f"reported:{reported}") in self._late_keys
+        if reported == record.get("ended_at") or known:
             return
         self.late_evidence(pr["pr_id"], record["end_seq"], {"merged_at": pr.get("merged_at"), "closed_at": pr.get("closed_at"),
                                                            "ended_source": "reported"}, _reported=reported)
 
     def late_evidence(self, pr_id, end_seq, evidence, *, _reported=None):
-        """Append evidence that arrived after a record was written. Only the whitelisted keys are kept; the record itself is untouched."""
-        with self._lock:
+        """Append evidence that arrived after a record was written. Only the whitelisted keys are kept; the record itself is untouched.
+        Evidence for a record that retention has pruned is refused (KeyError)."""
+        with self._write_lock:
             if self._record_for(pr_id, end_seq) is None:
                 raise KeyError("no trail record for that end")
-            kept = {k: v for k, v in _clean({k: v for k, v in (evidence or {}).items() if k in _LATE_KEYS}).items()}
+            kept = _clean({k: v for k, v in (evidence or {}).items() if k in _LATE_KEYS}, set())
             if not kept:
                 raise ValueError("no recognised evidence")
             if _reported:
@@ -490,8 +637,8 @@ class TrailRecords:
         ``late_checks`` times per record, ``late_check_interval_minutes`` apart, inside ``late_window_hours``)."""
         if int(self.config["late_checks"]) <= 0:
             return
+        self._ensure_index()
         with self._lock:
-            self._ensure_index()
             candidates = [(key, rec) for key, rec in self._records.items()
                           if now - (_parse(rec.get("assembled_at")) or 0) <= float(self.config["late_window_hours"]) * 3600]
         done = 0
@@ -519,65 +666,83 @@ class TrailRecords:
             with self._lock:
                 if (key[0], f"digest:{digest}") in self._late_keys:
                     continue
+            try:
                 self.late_evidence(key[0], key[1], {"signals": changed, "digest": digest})
+            except (KeyError, ValueError):
+                continue                                         # pruned meanwhile
 
     # ------------------------------------------------------------------ retention
     def _prune(self):
-        """Keep at most ``max_records`` trail records in memory and in the export, dropping the oldest PRs whole. The durable log keeps them
-        (they are pruned again after a restart); ``export`` reports ``truncated_before`` so a reader knows."""
+        self._ensure_index()
         with self._lock:
-            self._ensure_index()
-            if len(self._records) <= int(self.config["max_records"]):
-                return 0
-            order = []
-            seen = set()
-            for seq, pr_id, *_ in self._rows:
-                if pr_id not in seen:
-                    seen.add(pr_id)
-                    order.append(pr_id)
-            drop, count = set(), len(self._records)
-            for pr_id in order:
-                if count <= int(self.config["max_records"]):
-                    break
-                drop.add(pr_id)
-                count -= sum(1 for k in self._records if k[0] == pr_id)
-            if not drop:
-                return 0
-            self._pruned_through = max([self._pruned_through] + [r[0] for r in self._rows if r[1] in drop])
-            with self.repo._event_lock:
-                for pr_id in drop:
-                    self.repo._events.pop((ENTITY, pr_id), None)
-            self._rows = [r for r in self._rows if r[1] not in drop]
-            self._seqs = [r[0] for r in self._rows]
-            self._records = {k: v for k, v in self._records.items() if k[0] not in drop}
-            self._late_keys = {k for k in self._late_keys if k[0] not in drop}
-            return len(drop)
+            return self._prune_locked()
+
+    def _prune_locked(self):
+        """Keep at most ``max_records`` trail records in memory and in the export, dropping the oldest PRs whole. The durable log keeps the
+        events and a restart reloads and prunes them again, to the same point. The set of ends ever assembled is not touched, so a pruned
+        PR is never assembled again; ``_horizon`` stops an end older than what was dropped from being assembled at all."""
+        limit = int(self.config["max_records"])
+        if len(self._records) <= limit:
+            return 0
+        per_pr: dict = {}
+        for pr_id, _ in self._records:
+            per_pr[pr_id] = per_pr.get(pr_id, 0) + 1
+        order, seen = [], set()
+        for row in self._rows:
+            if row[1] not in seen:
+                seen.add(row[1])
+                order.append(row[1])
+        drop, count = set(), len(self._records)
+        for pr_id in order:
+            if count <= limit:
+                break
+            drop.add(pr_id)
+            count -= per_pr.get(pr_id, 0)
+        if not drop:
+            return 0
+        gone = [r for r in self._rows if r[1] in drop]
+        self._pruned_through = max(self._pruned_through, max(r[0] for r in gone))
+        ends = [r[5] for r in gone if r[2] == EVENT and r[5] is not None]
+        if ends:
+            self._horizon = max([self._horizon or 0.0, *ends])
+        self._rows = [r for r in self._rows if r[1] not in drop]
+        self._seqs = [r[0] for r in self._rows]
+        self._records = {k: v for k, v in self._records.items() if k[0] not in drop}
+        self._late_keys = {k for k in self._late_keys if k[0] not in drop}
+        return len(drop)
 
     # ------------------------------------------------------------------ export
-    def export(self, *, since=None, cursor=None, limit=None):
-        """One page, oldest first, from the index (only the page is copied). Raises ValueError for bad parameters."""
+    def export(self, *, since=None, cursor=None, limit=None, ended_after=None):
+        """One page, oldest first, from the index (only the page is copied). ``since`` filters on ``assembled_at`` (when the line was
+        written), ``ended_after`` on the pull request's ``ended_at``. Raises ValueError for bad parameters."""
         page_max = int(self.config["page_max"])
         if limit is None:
             limit = int(self.config["page_default"])
         if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= page_max:
             raise ValueError(f"limit must be a whole number from 1 to {page_max}")
-        since_ts = None
+        since_ts = ended_ts = None
         if since is not None:
             since_ts = _parse(since)
             if since_ts is None:
                 raise ValueError("since must be an ISO 8601 time")
+        if ended_after is not None:
+            ended_ts = _parse(ended_after)
+            if ended_ts is None:
+                raise ValueError("ended_after must be an ISO 8601 time")
         after = -1
         if cursor is not None:
             if not isinstance(cursor, str) or not _CURSOR.fullmatch(cursor):
                 raise ValueError("cursor is not valid")
             after = int(cursor[1:])
+        self._ensure_index()
         with self._lock:
-            self._ensure_index()
             start = bisect.bisect_right(self._seqs, after)
             picked, has_more = [], False
             for index in range(start, len(self._rows)):
                 row = self._rows[index]
                 if since_ts is not None and row[4] < since_ts:
+                    continue
+                if ended_ts is not None and (row[5] is None or row[5] < ended_ts):
                     continue
                 if len(picked) == limit:
                     has_more = True
