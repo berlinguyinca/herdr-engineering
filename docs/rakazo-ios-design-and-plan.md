@@ -16,7 +16,7 @@ Goal: every feature of the app works against Herdr. Nothing is hidden. Where Her
 3. **Assign and remove bots from the app** = `grant_agent` / `remove_agent_from_room`. Removal revokes access, it never stops the session.
    External agents may join rooms or create new ones; those show up as groups.
 4. **A Rakazo space is a hard partition of one account's data** (bots, chats, memory, routines, computers, connections, credentials, skills,
-   artifacts). Maps to a Herdr project plus a `space_id` on assistant-side records. Account-level settings (models, voice, approvals, vault)
+   artifacts). Maps to a derived assistant tenant (see build step 1); collab projects attach to it in step 3. Account-level settings (models, voice, approvals, vault)
    stay global with optional per-space override. Cross-space bot talk is refused unless the bot's switch is on.
 5. **Authority is never widened by the phone.** Room access stays grant ∩ owner's room role ∩ agent ceiling; non-members get 404. Peer text
    is untrusted data: shown, never executed.
@@ -27,8 +27,11 @@ Goal: every feature of the app works against Herdr. Nothing is hidden. Where Her
 ## Build order (each step gets contract tests against `packages/contracts/src/rpc.ts`)
 
 0. **Contract harness.** Check every bridge response against the app's schemas.
-1. **Spaces.** `space_id` on assistants, memory, routines, connectors, threads; migration `0037`; `spaces/*` and `spaceSettings/*`.
-   Done first because everything else filters on it.
+1. **Spaces. DONE (branch `feat/rakazo-spaces`).** A space is a derived assistant tenant (`<account tenant>~<space id>`), not a new column:
+   the store already isolates every record by `(tenant_id, user_id)`, so the default space is the account's own tenant and nothing
+   moved. The app selects a space with the `x-rakazo-space-id` header; an unknown, foreign or deleted id is 404. New: `rakazo_spaces.py`
+   (registry), table `rakazo_spaces` (migration `0037`, registry only), `spaces/create|rename|remove`, `spaceSettings/overrides|setOverride`.
+   Removing a space archives its bots and tombstones the id; nothing is deleted.
 2. **Identity link.** Bridge accounts to collab users (`link_identity` / `authenticate`), so rooms resolve for the signed-in account.
 3. **Agent and room sync.** Sessions to agent bots, workspaces to rooms, stable ids; `bots/list`, `groups/list`, `groups/get`.
 4. **Group thread.** Room comments as thread messages, `@handle` addressing, `threads/subscribe` from `room_state`.

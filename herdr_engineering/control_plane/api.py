@@ -38,10 +38,10 @@ from .envelope import EnvelopeConflict
 from .events import SequenceCollision
 from .federation import kind_for_role
 from .graph import read_graph
-from .work_graph_service import handle as work_graph_handle
 from .ingest import INGEST_ENTITY_TYPES
 from .redact import redact_delivery, redact_ingest_body, redact_payload
 from .review_quorum import pr_review_quorum
+from .work_graph_service import handle as work_graph_handle
 
 log = logging.getLogger(__name__)
 
@@ -464,10 +464,16 @@ class ControlPlaneServer:
             self.assistant = assistant_service
         # control_plane.rakazo_bridge (off by default: nothing is constructed and /rpc/* + /api/auth/* answer 404).
         # A bad section raises here, so an enabled but malformed bridge stops startup instead of running open.
-        from .rakazo_bridge import PostgresTokenPersistence, RakazoBridge, rakazo_bridge_config
+        from .rakazo_bridge import (
+            PostgresSpacePersistence,
+            PostgresTokenPersistence,
+            RakazoBridge,
+            rakazo_bridge_config,
+        )
         _bridge_cfg = rakazo_bridge_config(rakazo_bridge)
         self.rakazo = (RakazoBridge(_bridge_cfg, self.assistant, version=__version__,
-                                    persistence=PostgresTokenPersistence(rakazo_bridge_dsn) if rakazo_bridge_dsn else None)
+                                    persistence=PostgresTokenPersistence(rakazo_bridge_dsn) if rakazo_bridge_dsn else None,
+                                    space_persistence=PostgresSpacePersistence(rakazo_bridge_dsn) if rakazo_bridge_dsn else None)
                        if _bridge_cfg["enabled"] else None)
         from .ingest import IngestService
         # operator YAML: {api key: {rooms: [...], missions: [...]}} -> principal ids (the key itself is never kept)

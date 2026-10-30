@@ -23,7 +23,7 @@ from tests.control_plane.test_rakazo_bridge import (  # noqa: F401
 CONTRACT = json.loads((Path(__file__).parent / "fixtures" / "rakazo_contract.json").read_text())
 PROCS = CONTRACT["procedures"]
 STREAMED = {"threads/subscribe"}          # an event stream, not a JSON body: covered by test_rakazo_bridge
-NEEDS_SETUP = {"threads/answer"}          # needs a pending approval: its own test below
+NEEDS_SETUP = {"threads/answer", "spaces/rename", "spaces/remove", "spaceSettings/setOverride"}   # own tests: test_rakazo_spaces
 
 
 def validate(proc, value):
@@ -35,6 +35,8 @@ def validate(proc, value):
 # proc -> input builder(ctx); ctx has api, token and a bot id. Inputs match what apps/mobile sends.
 CASES = {
     "me": lambda c: {},
+    "spaces/create": lambda c: {"name": "Contract space"},
+    "spaceSettings/overrides": lambda c: {},
     "spaces/list": lambda c: {},
     "bots/list": lambda c: {},
     "bots/get": lambda c: {"botId": c["bot"]},

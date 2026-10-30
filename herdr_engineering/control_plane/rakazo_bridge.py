@@ -27,11 +27,12 @@ import time
 import traceback
 from collections import OrderedDict
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from typing import Any
 
 from . import rakazo_events as ev
+from . import rakazo_spaces as sp
 from .assistant import (
     ApprovalRequired,
     AssistantError,
@@ -263,6 +264,22 @@ class PostgresTokenPersistence:
     def touch(self, digest: str, when: float, ip: str) -> None:
         self._run("UPDATE rakazo_bridge_tokens SET last_used_at = %s, last_ip = %s WHERE token_sha256 = %s",
                   (self._ts(when), ip, digest))
+
+
+class PostgresSpacePersistence(PostgresTokenPersistence):
+    """``rakazo_spaces`` (migration 0037): the registry of extra spaces. Same connection rules as the token table."""
+
+    def load(self) -> list[dict[str, Any]]:
+        rows = self._run("SELECT space_id, account_id, name, created_at, overrides, deleted FROM rakazo_spaces", fetch=True)
+        return [{"space_id": r[0], "account_id": r[1], "name": r[2], "created": r[3].timestamp(),
+                 "overrides": list(r[4] or ()), "deleted": bool(r[5])} for r in rows]
+
+    def upsert(self, row: dict[str, Any]) -> None:  # type: ignore[override]
+        self._run("INSERT INTO rakazo_spaces (space_id, account_id, name, created_at, overrides, deleted) "
+                  "VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT (space_id) DO UPDATE SET name = EXCLUDED.name, "
+                  "overrides = EXCLUDED.overrides, deleted = EXCLUDED.deleted",
+                  (row["space_id"], row["account_id"], row["name"], self._ts(row["created"]), row["overrides"],
+                   row["deleted"]))
 
 
 class TokenStore:
@@ -521,10 +538,12 @@ def _auth_error(status: int, code: str, message: str, headers: dict[str, str] | 
 @dataclass
 class _Ctx:
     account: Account
-    tenant: str
+    tenant: str            # the tenant of the ACTIVE space: the account's own for the default space
     user: str
     token: str
     accepts_stream: bool
+    space: str = sp.DEFAULT_SPACE_ID
+    base_tenant: str = ""
 
 
 # --------------------------------------------------------------------------------------------- the bridge
@@ -532,7 +551,7 @@ class RakazoBridge:
     """Dispatches ``/rpc/*`` and ``/api/auth/*``. ``handle`` returns a :class:`BridgeResponse`, or None for a path that is
     not the bridge's (the caller then answers exactly as it did before the bridge existed)."""
 
-    def __init__(self, config: dict[str, Any], assistant, *, version: str = "0", persistence=None,
+    def __init__(self, config: dict[str, Any], assistant, *, version: str = "0", persistence=None, space_persistence=None,
                  clock: Callable[[], float] = time.time, monotonic: Callable[[], float] = time.monotonic):
         if not config.get("enabled"):
             raise ValueError("RakazoBridge needs an enabled configuration")
@@ -546,6 +565,7 @@ class RakazoBridge:
         self.trusted_proxies = tuple(config.get("trusted_proxies", ()))
         self.limiter = SignInLimiter(monotonic)
         self.journals = ev.JournalRegistry(clock)
+        self.spaces = sp.SpaceRegistry(space_persistence, clock)
         self._kdf_slots = threading.BoundedSemaphore(2)
         self._streams = threading.BoundedSemaphore(MAX_STREAMS)
         self._sends = threading.BoundedSemaphore(MAX_SENDS)
@@ -565,7 +585,9 @@ class RakazoBridge:
             "threads/answer": self._threads_answer, "threads/stop": self._threads_stop,
             "threads/markRead": self._threads_mark_read, "threads/subscribe": self._threads_subscribe,
             "runs/list": self._runs_list, "aiConsent/status": self._consent, "aiConsent/allow": self._consent,
-            "aiConsent/revoke": self._consent, "notifications/registerPush": self._register_push,
+            "aiConsent/revoke": self._consent, "spaces/create": self._spaces_create, "spaces/rename": self._spaces_rename,
+            "spaces/remove": self._spaces_remove, "spaceSettings/overrides": self._space_overrides,
+            "spaceSettings/setOverride": self._space_set_override, "notifications/registerPush": self._register_push,
             "notifications/unregisterPush": self._ok, "analytics/screen": self._ok,
         }
         # a dummy for requests whose email matches no account, so a wrong email costs the same KDF as a wrong password
@@ -728,9 +750,14 @@ class RakazoBridge:
             inp = {}
         if not isinstance(inp, dict):
             raise BridgeError(400, "BAD_REQUEST", "The request input must be an object.")
-        tenant = self.svc.tenant_for(account.principal_id)
+        base = self.svc.tenant_for(account.principal_id)
+        space_id = headers.get("x-rakazo-space-id", "").strip() or sp.DEFAULT_SPACE_ID
+        if space_id != sp.DEFAULT_SPACE_ID and self.spaces.get(account.account_id, space_id) is None:
+            # another account's space, a deleted one and a made-up one all look the same: not found
+            raise BridgeError(404, "NOT_FOUND", "Not found")
+        tenant = sp.space_tenant(base, space_id)
         ctx = _Ctx(account, tenant, account.principal_id, token,
-                   "text/event-stream" in headers.get("accept", ""))
+                   "text/event-stream" in headers.get("accept", ""), space_id, base)
         try:
             self.svc.check_rate_limit(key=f"{tenant}:{ctx.user}")
             result = handler(ctx, inp)
@@ -793,7 +820,7 @@ class RakazoBridge:
     def _journal(self, ctx: _Ctx, assistant, thread):
         messages, runs, approvals = self._gather(ctx, assistant, thread)
         with self.journals.lock:
-            journal = self.journals.get(thread.thread_id, assistant.assistant_id)
+            journal = self.journals.get(thread.thread_id, assistant.assistant_id, ctx.space)
             journal.sync(messages, runs, approvals)
             return journal, runs
 
@@ -803,17 +830,65 @@ class RakazoBridge:
         visible = [m for m in messages if m.visibility == "visible"]
         active = any(ev.run_status(r.state) in ev.ACTIVE for r in runs)
         return ev.bot_view(assistant, thread.thread_id, ev.snippet(visible[-1].content, 120) if visible else "",
-                           "running" if active else "idle")
+                           "running" if active else "idle", ctx.space)
 
     # procedures ------------------------------------------------------------------------------------------------
     def _ok(self, ctx, inp):
         return {"ok": True}
 
     def _me(self, ctx, inp):
-        return ev.me_view(ctx.account)
+        return ev.me_view(ctx.account, ctx.space)
+
+    def _in_space(self, ctx: _Ctx, space_id: str) -> _Ctx:
+        return replace(ctx, space=space_id, tenant=sp.space_tenant(ctx.base_tenant, space_id))
+
+    def _space_entry(self, ctx: _Ctx, space_id: str, name: str, owned: bool) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        bots = self._bots(self._in_space(ctx, space_id))
+        return ev.space_view(space_id, name, bots, owned=owned), bots
 
     def _spaces_list(self, ctx, inp):
-        return ev.spaces_view(self._bots(ctx))
+        entries = [self._space_entry(ctx, sp.DEFAULT_SPACE_ID, sp.DEFAULT_SPACE_NAME, False)]
+        entries += [self._space_entry(ctx, s.space_id, s.name, True) for s in self.spaces.list(ctx.account.account_id)]
+        active = next(e for e in entries if e[0]["id"] == ctx.space)
+        return ev.spaces_view(active[0], [e[0] for e in entries], active[1])
+
+    def _space_call(self, fn, *args):
+        try:
+            return fn(*args)
+        except sp.SpaceError as exc:
+            code = {400: "BAD_REQUEST", 404: "NOT_FOUND", 503: "SERVICE_UNAVAILABLE"}.get(exc.status, "BAD_REQUEST")
+            raise BridgeError(exc.status, code, exc.message) from None
+
+    def _spaces_create(self, ctx, inp):
+        space = self._space_call(self.spaces.create, ctx.account.account_id, inp.get("name"))
+        return self._space_entry(ctx, space.space_id, space.name, True)[0]
+
+    def _spaces_rename(self, ctx, inp):
+        space = self._space_call(self.spaces.rename, ctx.account.account_id, inp.get("spaceId"), inp.get("name"))
+        return {"id": space.space_id, "name": space.name}
+
+    def _spaces_remove(self, ctx, inp):
+        """Archive every bot in the space, then tombstone it. Nothing is deleted: the records stay in their tenant."""
+        space_id = inp.get("spaceId")
+        if not isinstance(space_id, str) or self.spaces.get(ctx.account.account_id, space_id) is None:
+            if space_id == sp.DEFAULT_SPACE_ID:
+                raise BridgeError(400, "BAD_REQUEST", "The default space cannot be changed or deleted.")
+            raise BridgeError(404, "NOT_FOUND", "Not found.")
+        inner = self._in_space(ctx, space_id)
+        for assistant in self.svc.list_assistants(tenant_id=inner.tenant, user_id=ctx.user):
+            if assistant.enabled:
+                self.svc.archive_assistant(assistant.assistant_id, tenant_id=inner.tenant, user_id=ctx.user)
+        self._space_call(self.spaces.remove, ctx.account.account_id, space_id)
+        return {"ok": True, "activeSpaceId": sp.DEFAULT_SPACE_ID}
+
+    def _space_overrides(self, ctx, inp):
+        space = self.spaces.get(ctx.account.account_id, ctx.space)
+        return sorted(space.overrides) if space else []
+
+    def _space_set_override(self, ctx, inp):
+        space = self._space_call(self.spaces.set_override, ctx.account.account_id, ctx.space, inp.get("setting"),
+                                 inp.get("enabled"))
+        return sorted(space.overrides)
 
     def _bots(self, ctx: _Ctx) -> list[dict[str, Any]]:
         return [self._bot(ctx, a) for a in self.svc.list_assistants(tenant_id=ctx.tenant, user_id=ctx.user)]
@@ -1032,7 +1107,7 @@ class RakazoBridge:
 
     def _consent(self, ctx, inp):
         # No third-party AI recipients are named, so the app never asks for consent; this server's model is the operator's.
-        return {"scope": ev.SPACE_ID, "version": _CONSENT_VERSION, "recipients": []}
+        return {"scope": ctx.space, "version": _CONSENT_VERSION, "recipients": []}
 
     def _register_push(self, ctx, inp):
         token = inp.get("token")
