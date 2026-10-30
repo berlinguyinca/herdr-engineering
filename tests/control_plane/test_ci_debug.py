@@ -302,7 +302,7 @@ def test_test_handoff_refuses_when_the_excerpt_is_unavailable_and_sends_nothing(
         debug_ci(monitor, repo, None, "17", 12, "session", "op-t", mode="test", test=TEST)
 
 
-@pytest.mark.parametrize("bad", [None, {}, {**TEST, "step_id": "x"}, {**TEST, "line_start": 0}, {**TEST, "line_end": True}, {**TEST, "name": ""}])
+@pytest.mark.parametrize("bad", [None, {}, {**TEST, "step_id": "x"}, {**TEST, "line_start": 0}, {**TEST, "line_end": True}, {**TEST, "name": ""}, {**TEST, "line_end": 5}, {**TEST, "line_end": 5000}])
 def test_test_handoff_validates_the_test_before_reading_anything(bad):
     repo = ControlPlaneRepo()
     native_session(repo)

@@ -161,6 +161,8 @@ def _test_request(test):
         if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 10_000_000:
             raise ValueError("a valid line range is required")
         lines.append(value)
+    if lines[1] < lines[0] or lines[1] - lines[0] > 2000:
+        raise ValueError("a valid line range is required")
     suite = test.get("suite")
     if suite is not None and (not isinstance(suite, str) or len(suite) > 500):
         raise ValueError("test suite is invalid")
@@ -213,4 +215,4 @@ def _excerpt(monitor, repository, number, test, provider_url):
         reason = (result or {}).get("reason") or (result or {}).get("error") or "The log excerpt is unavailable."
         raise ValueError(f"The log excerpt for this test is unavailable: {reason}")
     text = "\n".join(str(line) for line in piece.get("lines", []))
-    return redact_text(text[:EXCERPT_LIMIT])[:EXCERPT_LIMIT]
+    return redact_text(text[-EXCERPT_LIMIT:])[-EXCERPT_LIMIT:]   # keep the tail: the assertion message follows the test line

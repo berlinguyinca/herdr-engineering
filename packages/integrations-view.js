@@ -459,9 +459,10 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
   }
   function explorerTest() {return explorerTests(cx.reports).find(t=>t.key===cx.selected)||null;}
   function selectExplorerTest(key) {
-    cx.selected=cx.selected===key?'':key;cx.slice=null;cx.sliceError='';cx.history=null;cx.historyError='';cx.sending=false;cx.sendMessage='';cx.sendOp='';
+    cx.selected=cx.selected===key?'':key;cx.slice=null;cx.sliceError='';cx.history=null;cx.historyError='';pending.get('cx-send')?.abort();pending.delete('cx-send');cx.sending=false;cx.sendMessage='';cx.sendOp='';cx.sessionId='';
     pending.get('cx-slice')?.abort();pending.delete('cx-slice');pending.get('cx-history')?.abort();pending.delete('cx-history');
     const t=explorerTest();
+    if(t&&Array.isArray(cx.sessions)){const onBranch=t.branch?cx.sessions.filter(x=>x.branch===t.branch):[];if(onBranch.length===1)cx.sessionId=onBranch[0].session_id;}
     if(t&&t.source==='log'&&t.step_id&&t.provider_url){
       const key0=cx.selected;
       request('cx-slice',signal=>client.getCiLogSlice(t.provider_repo_id,t.run_number,t.step_id,{start:t.line_start,end:t.line_end,expect:t.name,signal,providerUrl:t.provider_url}),response=>{
@@ -489,7 +490,7 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
   }
   // Pi agents the failing test can be sent to; loaded when the operator asks, and the one on the test's branch is preselected.
   function loadExplorerAgents() {
-    if(cx.sessions!==null||pending.has('cx-agents'))return;
+    if(cx.sessions!==null||pending.has('cx-agents')||document.hidden)return;
     const t=explorerTest();cx.sessions='loading';cx.sendMessage='';draw();
     request('cx-agents',signal=>client.listSessions(undefined,{signal}),response=>{
       cx.sessions=activePiSessions(response.sessions);
@@ -499,7 +500,7 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
   }
   function sendExplorerTest() {
     const t=explorerTest(),sessionId=cx.sessionId;
-    if(!t||!sessionId||cx.sending||!t.step_id||!t.provider_url)return;
+    if(!t||!sessionId||cx.sending||!t.step_id||!t.provider_url||document.hidden||pending.has('cx-send'))return;
     if(!cx.sendOp)cx.sendOp=newOperationId();
     const key0=cx.selected,operationId=cx.sendOp;cx.sending=true;cx.sendMessage='Sending the failure to the agent…';draw();
     request('cx-send',signal=>client.debugCi(t.provider_repo_id,t.run_number,sessionId,operationId,{signal,providerUrl:t.provider_url,mode:'test',test:{name:t.name,suite:t.suite||undefined,step_id:String(t.step_id),line_start:t.line_start,line_end:t.line_end}}),response=>{
