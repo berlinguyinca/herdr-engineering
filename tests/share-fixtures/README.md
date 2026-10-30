@@ -45,15 +45,28 @@ viewer. Playwright's Linux WebKit has no PDF viewer at all: the PDF display chec
   The first run therefore needs network access to registry.npmjs.org and extensions.duckdb.org; later runs use the
   cache. `vendor/duckdb.mjs` (committed) is built from the same duckdb-wasm version: bump both together.
 
-Licenses: hyparquet MIT (`LICENSE.hyparquet`), apache-arrow Apache-2.0 (`LICENSE.apache-arrow`), duckdb-wasm MIT
-(its npm package ships no LICENSE file).
+### Vendored files (committed)
+
+Resolved versions (from `build-vendor.sh`'s output; the bundles' contents come from esbuild's metafile) and the
+sha256 of each committed bundle. Every library inside a bundle has its licence file next to it.
+
+| File | Contains | sha256 |
+| --- | --- | --- |
+| `html-parquet-hyparquet/vendor/hyparquet.mjs` | hyparquet@1.32.0 (MIT, `LICENSE.hyparquet`) | `42c670df52f70656c5018b610c21c34e96602c8a395615d3ffd2c454ce95f58e` |
+| `html-parquet-duckdb/vendor/duckdb.mjs` | @duckdb/duckdb-wasm@1.33.1-dev57.0 (MIT, `LICENSE.duckdb-wasm`), apache-arrow@17.0.0 (Apache-2.0, `LICENSE.apache-arrow`), flatbuffers@24.12.23 (Apache-2.0, `LICENSE.flatbuffers`), tslib@2.8.1 (0BSD, `LICENSE.tslib`) | `1cbebabd31839c9660cd3c4dd2f773436ae0f06e147bc3720e4f4240c33207bf` |
+
+duckdb-wasm's npm package ships no LICENSE file; `LICENSE.duckdb-wasm` is the repository's LICENSE at the `v1.33.0`
+tag commit `fa1d47b38ed0821cecab0bdc331c48abd0f2cc65`. The run-time duckdb files are pinned by sha256 in
+`scripts/share-browser-check.mjs` (worker `fa889e60…`, wasm `3abdec74…`, parquet extension `4845705b…`) and checked on
+every cache reuse.
 
 Committed fixtures stay under ~3 MB; never commit the duckdb binaries (`.gitignore` refuses them).
 
 ## Guidance for artifact authors (what worked in the sandbox)
 
-The share CSP runs every page in an opaque-origin sandbox (`sandbox allow-scripts`, no `allow-same-origin`) with
-`connect-src 'self'` and `worker-src 'self' blob:`:
+The share CSP runs every page in an opaque-origin sandbox (`sandbox allow-scripts`, no `allow-same-origin`). Its fetch
+directives allow `'self'` plus the share's own prefix `<public origin>/s/<token>/` (WebKit needs the explicit prefix;
+see below), `worker-src` also `blob:`, and nothing from any other host:
 
 * No browser storage: `sessionStorage`, `localStorage`, IndexedDB, cookies and OPFS all throw. Keep state in memory.
 * Bundle everything; external URLs are blocked. Use relative URLs, and build absolute ones from `location.href` when a
