@@ -4,12 +4,17 @@ One interface, ``token_for(owner, permissions) -> str | None``, is what callers 
 Deployments release evidence and the GitHub issue/project cache). ``credentials()`` resolves it
 from the live configuration on every call:
 
-* ``github.app`` configured -> installation tokens of a GitHub App (read only). When
+* ``github.app`` configured -> installation tokens of a GitHub App (read only unless a write
+  capability is enabled, see below). When
   ``github.token`` is also set the App wins and one warning is logged.
 * otherwise ``github.token`` (a static personal token), for any owner, exactly as before.
 * neither -> no token (callers treat GitHub as unknown / not configured).
 
-``github.app`` is ``{app_id, private_key_file, installations: {<owner>: <installation_id> | auto}}``.
+``github.app`` is ``{app_id, private_key_file, installations: {<owner>: <installation_id> | auto}, write: [..]}``.
+``write`` lists the write capabilities (``WRITE_CAPABILITIES``) this deployment allows; it is empty by default and a
+capability's permission set is fixed here, never chosen by the caller: ``review_gate`` (commit statuses, merge,
+update-branch) and ``escalations`` (issue writes). A capability that is not listed is refused with ``write_disabled``
+before any call to GitHub.
 Only owners listed under ``installations`` ever get a token; ``auto`` finds that owner's
 installation id once via ``GET /app/installations`` (cached), it never adds an owner.
 
@@ -76,8 +81,18 @@ EVIDENCE_PERMISSIONS = {"contents": "read", "metadata": "read"}
 CATALOG_PERMISSIONS = {"issues": "read", "metadata": "read"}
 #: The GitHub cache's Projects v2 sync (organization projects; items reference issues).
 PROJECTS_PERMISSIONS = {"issues": "read", "metadata": "read", "organization_projects": "read"}
-#: The only permissions herdr ever requests, and only at ``read``.
-ALLOWED_PERMISSIONS = frozenset({"contents", "metadata", "issues", "organization_projects"})
+#: Project intelligence's PR poller: the open pull requests of a mapped repository.
+PULLS_PERMISSIONS = {"pull_requests": "read", "metadata": "read"}
+#: The review gate's reads: pull requests, their files and commits, compare.
+GATE_READ_PERMISSIONS = {"pull_requests": "read", "contents": "read", "metadata": "read"}
+#: The only permissions a read request may name, and only at ``read``.
+ALLOWED_PERMISSIONS = frozenset({"contents", "metadata", "issues", "organization_projects", "pull_requests"})
+#: Write capabilities: the exact, fixed permission set of each. Enabled per deployment in ``github.app.write``.
+WRITE_CAPABILITIES = {
+    "review_gate": {"contents": "write", "metadata": "read", "pull_requests": "write", "statuses": "write"},
+    "escalations": {"issues": "write", "metadata": "read"},
+}
+_RANK = {"read": 1, "write": 2}
 
 # GitHub's current installation tokens are ~390 chars and contain "-" and "." as well.
 _TOKEN = re.compile(r"ghs_[A-Za-z0-9_.-]{16,2000}")
@@ -86,6 +101,7 @@ _REPO_NAME = re.compile(r"[A-Za-z0-9_.-]{1,100}")
 MAX_REPOSITORIES = 100
 _MESSAGES = {
     "invalid_config": "github.app is invalid; fix the YAML configuration.",
+    "write_disabled": "This GitHub write capability is not enabled in github.app.write.",
     "key_permissions": "The GitHub App private key file must be a regular file with mode 0600.",
     "key_unreadable": "The GitHub App private key file could not be read.",
     "key_invalid": "The GitHub App private key could not sign a token.",
@@ -166,12 +182,25 @@ def _permissions(value) -> dict:
     return {name: "read" for name in sorted(value)}
 
 
+def _granted_within(granted, asked) -> bool:
+    """GitHub's answer never exceeds the request: a permission that was asked for comes back at most at the asked
+    level; one that was not asked for (GitHub adds ``metadata``) only at ``read``."""
+    if not isinstance(granted, dict):
+        return False
+    for name, level in granted.items():
+        limit = _RANK.get(asked.get(name, "read"))
+        if _RANK.get(level) is None or limit is None or _RANK[level] > limit:
+            return False
+    return True
+
+
 # ------------------------------------------------------------------ configuration
 @dataclass(frozen=True)
 class AppAuthConfig:
     app_id: int
     private_key_file: str
     installations: tuple  # ((owner_lower, installation_id | None for auto), ...) sorted
+    write: tuple = ()     # enabled write capabilities (names from WRITE_CAPABILITIES), sorted
 
     @property
     def owners(self) -> tuple:
@@ -193,7 +222,11 @@ def _positive_int(value):
 
 def parse_app_config(raw) -> AppAuthConfig:
     """Validate ``github.app``. Raises ``GitHubAuthError("invalid_config")`` (no value echoed)."""
-    if not isinstance(raw, dict) or set(raw) - {"app_id", "private_key_file", "installations"}:
+    if not isinstance(raw, dict) or set(raw) - {"app_id", "private_key_file", "installations", "write"}:
+        raise GitHubAuthError("invalid_config")
+    write = raw.get("write", [])
+    if (not isinstance(write, list) or len(set(write)) != len(write)
+            or any(not isinstance(w, str) or w not in WRITE_CAPABILITIES for w in write)):
         raise GitHubAuthError("invalid_config")
     app_id = _positive_int(raw.get("app_id"))
     path = raw.get("private_key_file")
@@ -211,7 +244,7 @@ def parse_app_config(raw) -> AppAuthConfig:
             table[owner.lower()] = iid
         else:
             raise GitHubAuthError("invalid_config")
-    return AppAuthConfig(app_id, os.path.normpath(path), tuple(sorted(table.items())))
+    return AppAuthConfig(app_id, os.path.normpath(path), tuple(sorted(table.items())), tuple(sorted(write)))
 
 
 KEY_MODES = (0o600, 0o400)
@@ -334,7 +367,7 @@ class GitHubAppTokens:
     @property
     def identity(self) -> str:
         """Stable across token rotations: the App id and the configured installations."""
-        material = json.dumps(["app", self.config.app_id, list(self.config.installations)])
+        material = json.dumps(["app", self.config.app_id, list(self.config.installations), list(self.config.write)])
         return hashlib.sha256(material.encode()).hexdigest()
 
     @property
@@ -361,6 +394,21 @@ class GitHubAppTokens:
             raise GitHubAuthError("unknown_owner")
         key = (owner, tuple(sorted(perms.items())), repos)
         return self._single_flight(key, lambda: self._mint(owner, perms, repos))
+
+    def capability_token_or_raise(self, owner, capability, repositories=None) -> str:
+        """A repo-scoped installation token with the fixed permission set of a write ``capability``. Refused
+        (``write_disabled``) unless ``github.app.write`` lists it; the caller never chooses the permissions."""
+        perms = WRITE_CAPABILITIES.get(capability)
+        if perms is None:
+            raise GitHubAuthError("invalid_config")
+        if capability not in self.config.write:
+            raise GitHubAuthError("write_disabled")
+        repos = _repositories(repositories)
+        owner = owner.lower() if isinstance(owner, str) else None
+        if owner not in dict(self.config.installations):
+            raise GitHubAuthError("unknown_owner")
+        key = (owner, tuple(sorted(perms.items())), repos)
+        return self._single_flight(key, lambda: self._mint(owner, dict(perms), repos))
 
     def invalidate(self, owner) -> None:
         """Drop every cached token of ``owner`` (call on a 401 from GitHub with one of them)."""
@@ -450,8 +498,7 @@ class GitHubAppTokens:
         granted = data.get("permissions") if isinstance(data, dict) else None
         if not isinstance(token, str) or not _TOKEN.fullmatch(token) or expires is None:
             raise GitHubAuthError("invalid_response")
-        if granted is not None and (not isinstance(granted, dict)
-                                    or any(level != "read" for level in granted.values())):
+        if granted is not None and not _granted_within(granted, perms):
             raise GitHubAuthError("invalid_response")  # a broader grant than asked: refuse it
         remaining = expires - self._wall()
         if remaining <= REFRESH_MARGIN_S or remaining > MAX_EXPIRES_AHEAD_S:
@@ -594,6 +641,9 @@ class StaticToken:
     def token_for(self, owner=None, permissions=None, repositories=None) -> str | None:
         return self._token
 
+    def capability_token_or_raise(self, owner, capability, repositories=None) -> str:
+        raise GitHubAuthError("write_disabled")     # write capabilities exist only for a GitHub App
+
     def invalidate(self, owner=None) -> None:
         return None
 
@@ -616,6 +666,9 @@ class NoCredentials:
 
     def token_for(self, owner=None, permissions=None, repositories=None):
         return None
+
+    def capability_token_or_raise(self, owner, capability, repositories=None) -> str:
+        raise GitHubAuthError("write_disabled")
 
     def invalidate(self, owner=None) -> None:
         return None

@@ -1159,7 +1159,11 @@ class ControlPlaneServer:
             ci_fix_caps={e.repo: e.ci_fix_cap for e in config.repos})
         # The queue's real lease and the lease a Claim reports must be one value.
         self.gate_queue = ReviewQueue(repo, lease_seconds=config.reviewer.lease_seconds)
-        app = github_app.GitHubAppClient(config.app)  # one client for gate + coordinator
+        if config.shared_app:
+            from .. import github_auth
+            app = github_app.GitHubAppClient(None, credentials=github_auth.credentials)   # the fleet's github.app
+        else:
+            app = github_app.GitHubAppClient(config.app)  # one client for gate + coordinator
         self.gate_app = app
         registry = AuthorRegistry(repo)
         notifier = AuthorNotifier(repo, config=config.notify, registry=registry,

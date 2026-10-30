@@ -197,6 +197,79 @@ def test_only_read_permissions_are_ever_requested(gh, key_file):
     assert gh.posts()[0][3] == {"permissions": {"issues": "read", "metadata": "read"}}
 
 
+# ------------------------------------------------------------------ write capabilities
+def _write_tokens(gh, key_file, write):
+    raw = {"app_id": APP_ID, "private_key_file": key_file, "installations": {"InferWeave": 11}}
+    if write is not None:
+        raw["write"] = write
+    return ga.GitHubAppTokens(ga.parse_app_config(raw), api=gh.base, clock=Clock(), wall=lambda: WALL0, timeout=2.0)
+
+
+def test_a_write_capability_is_refused_before_any_call_unless_it_is_listed(gh, key_file):
+    gh.token_route(11)
+    for write in (None, [], ["escalations"]):
+        tokens = _write_tokens(gh, key_file, write)
+        with pytest.raises(ga.GitHubAuthError) as exc:
+            tokens.capability_token_or_raise("InferWeave", "review_gate", ["repo"])
+        assert exc.value.reason == "write_disabled"
+    assert gh.requests == []
+    with pytest.raises(ga.GitHubAuthError) as exc:                         # unknown capability: also never a call
+        _write_tokens(gh, key_file, ["review_gate"]).capability_token_or_raise("InferWeave", "root", ["repo"])
+    assert exc.value.reason == "invalid_config" and gh.requests == []
+
+
+def test_a_listed_capability_asks_for_exactly_its_fixed_permissions_scoped_to_the_repository(gh, key_file):
+    gh.token_route(11)
+    tokens = _write_tokens(gh, key_file, ["review_gate", "escalations"])
+    assert tokens.capability_token_or_raise("InferWeave", "escalations", ["Repo"]).startswith("ghs_installation11")
+    assert gh.posts()[0][3] == {"permissions": {"issues": "write", "metadata": "read"}, "repositories": ["repo"]}
+    tokens.capability_token_or_raise("InferWeave", "review_gate", ["repo"])
+    assert gh.posts()[1][3]["permissions"] == {"contents": "write", "metadata": "read", "pull_requests": "write",
+                                               "statuses": "write"}
+    tokens.capability_token_or_raise("InferWeave", "escalations", ["repo"])      # cached per permission set
+    assert len(gh.posts()) == 2
+
+
+def test_the_write_list_is_validated_and_part_of_the_identity(gh, key_file):
+    base = {"app_id": APP_ID, "private_key_file": key_file, "installations": {"InferWeave": 11}}
+    for bad in ("review_gate", ["nope"], ["review_gate", "review_gate"], [7], {"review_gate": True}):
+        with pytest.raises(ga.GitHubAuthError):
+            ga.parse_app_config({**base, "write": bad})
+    read_only = ga.GitHubAppTokens(ga.parse_app_config(base), api=gh.base)
+    writer = ga.GitHubAppTokens(ga.parse_app_config({**base, "write": ["escalations"]}), api=gh.base)
+    assert read_only.identity != writer.identity
+
+
+def test_a_grant_broader_than_the_request_is_refused_and_metadata_may_ride_along(gh, key_file):
+    tokens = _write_tokens(gh, key_file, ["escalations"])
+    gh.token_route(11, permissions={"issues": "admin", "metadata": "read"})
+    with pytest.raises(ga.GitHubAuthError) as exc:
+        tokens.capability_token_or_raise("InferWeave", "escalations", ["repo"])
+    assert exc.value.reason == "invalid_response"
+    gh.token_route(11, permissions={"issues": "write", "metadata": "read", "contents": "write"})   # an unasked write
+    with pytest.raises(ga.GitHubAuthError):
+        _write_tokens(gh, key_file, ["escalations"]).capability_token_or_raise("InferWeave", "escalations", ["repo2"])
+    gh.token_route(11, permissions={"issues": "read", "metadata": "read"})                          # narrower is fine
+    assert _write_tokens(gh, key_file, ["escalations"]).capability_token_or_raise("InferWeave", "escalations", ["repo3"])
+
+
+def test_reads_stay_read_only_even_with_a_write_capability_enabled(gh, key_file):
+    gh.token_route(11)
+    tokens = _write_tokens(gh, key_file, ["review_gate", "escalations"])
+    for bad in ({"statuses": "write"}, {"contents": "write"}, {"pull_requests": "write"}, {"issues": "write"}):
+        with pytest.raises(ValueError):
+            tokens.token_for("InferWeave", bad)
+    assert tokens.token_for("InferWeave", ga.GATE_READ_PERMISSIONS, ["repo"])
+    assert gh.posts()[0][3]["permissions"] == {"contents": "read", "metadata": "read", "pull_requests": "read"}
+
+
+def test_a_static_token_or_no_credential_never_has_a_write_capability():
+    for provider in (ga.StaticToken("ghp_" + "x" * 30), ga.NoCredentials()):
+        with pytest.raises(ga.GitHubAuthError) as exc:
+            provider.capability_token_or_raise("o", "escalations", ["r"])
+        assert exc.value.reason == "write_disabled"
+
+
 # ------------------------------------------------------------------ owner selection
 def test_each_owner_uses_its_own_installation_and_auto_is_discovered_once(gh, key_file):
     for iid in (11, 22, 33, 44):
