@@ -153,3 +153,12 @@ test('the inspector says which handoff gave an agent its task, escaped, and omit
   const none = renderAttention({ body: body([item({ key: 'session:a', handoffs: [] })]), expanded: new Set(['session:a']) }, now);
   assert.doesNotMatch(none, /<ul class="at-handoffs"/);
 });
+
+test('hosts expected offline are named quietly and never counted', () => {
+  const html = renderAttention({ body: body([], { counts: { open: 0, acknowledged: 0, snoozed: 0, resolved: 0, critical: 0 },
+    expected_off: [{ host_id: 'h1', name: 'bender <1>', state: 'stale', last_seen: '2026-10-24T09:00:00Z' }, { host_id: 'h2', name: 'beast', state: 'down', last_seen: null }] }) }, now);
+  assert.match(html, /data-expected-off>Expected offline: bender &lt;1&gt; \(last seen [^)]+ ago\), beast\./);
+  assert.match(html, /<strong>0<\/strong> open/);
+  assert.doesNotMatch(renderAttention({ body: body() }, now), /data-expected-off/);
+  assert.doesNotMatch(renderAttention({ body: body([], { expected_off: [] }) }, now), /data-expected-off/);
+});
