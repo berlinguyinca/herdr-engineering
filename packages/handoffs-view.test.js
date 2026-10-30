@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { handoffGraphSummary, overviewSummary, detailHtml, handoffCard, workspaceCard, flowFromPage, routeTable, routesHtml } from './handoffs-view.js';
+import { handoffGraphSummary, overviewSummary, detailHtml, handoffCard, workspaceCard, flowFromPage, routeTable, routesHtml, modelText } from './handoffs-view.js';
 
 test('summarizes handoff lineage without trusting goal text as markup', () => {
   const summary = handoffGraphSummary({
@@ -90,4 +90,18 @@ test('the full handoff text carries every recorded field and nothing is trusted 
   for (const part of ['HANDOFF h1 · in progress', 'From: pi · @a · session s1', 'model qwen', 'Mission: m1', 'Continue the drain work.', '- parser', '- tests', 'art_1 @ ver_2', '- checkpoint: abc123', '- cause: context_pressure', 'queued at 2026-01-01T00:00:00Z by op']) assert.ok(text.includes(part), part);
   const html = detailHtml(row, null);
   assert.ok(!html.includes('<img'), 'escaped'); assert.match(html, /data-handoff-full/); assert.match(html, /data-handoff-copy/); assert.match(html, /Handoff text/);
+});
+
+test('a Pi handoff says what happened to the model, and the detail is honest about having no written summary', () => {
+  assert.equal(modelText({ origin: 'lineage', model_change: 'same', to_model: 'metabolomics/qwen3.8-27b-q8' }), 'same model · qwen3.8-27b-q8');
+  assert.equal(modelText({ origin: 'lineage', model_change: 'switched', from_model: 'a/x', to_model: 'b/y' }), 'model changed · x → y');
+  assert.equal(modelText({ origin: 'lineage', model_change: 'not_pinned', from_model: 'qwen' }), 'not pinned · was qwen · routed normally');
+  assert.equal(modelText({ origin: 'lineage', model_change: 'unknown' }), 'model not reported');
+  assert.equal(modelText({ origin: 'registry' }), '');
+  const lineage = { handoff_id: 'handoff:h1', origin: 'lineage', state: 'accepted', goal: 'Context pressure', cause: HOSTILE, checkpoint: 'abcdef1234567890', model_change: 'not_pinned', from_model: 'q',
+    source: { harness: 'pi', session_id: 's1' }, target: { harness: 'pi', session_id: 's2' }, completed: [], remaining: [], history: [] };
+  const html = detailHtml(lineage, null);
+  assert.match(html, /data-handoff-model/); assert.match(html, /not pinned/); assert.match(html, /abcdef123456/); assert.ok(!html.includes('<img'));
+  assert.ok(!html.includes('<h3>Accomplished</h3>'), 'no empty accomplished/missing columns for a handoff that has no written summary');
+  assert.match(handoffCard({ ...lineage, attention: true, attention_reason: 'successor not pinned', completed: 0, remaining: 0 }), /not pinned · was q/);
 });

@@ -5,6 +5,9 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Artifact gallery: filter by linked work (unified workspace P03)
+- The Artifacts page can list what is linked to a project, issue, task or room ("Linked to" + id, through `/api/v1/artifacts/for/<kind>/<ref>`, which already filters by what the signed-in user may read), and an artifact's page shows a "Linked to" section. Type and status filters apply to the full list only. The web client gains `artifactsForContext` and `artifactLinks`. No server change.
+
 ### Artifact registry: link from the CLI (unified workspace P03)
 - `herdr-eng artifacts links <id>` lists an artifact's bindings and `artifacts link <id> --project|--issue|--task|--room [--version V] [--link-kind origin|reference|derived]` adds one through the existing links route (idempotent; refused client-side with no target). Searching a project, issue, task or room is `artifacts for <kind> <ref> --query`. There is still no `diff`: the server has no diff route.
 

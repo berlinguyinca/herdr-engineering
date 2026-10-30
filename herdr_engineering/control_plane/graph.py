@@ -598,6 +598,7 @@ class _Claims:
         self.scope: str | None = None
         self.claim: tuple | None = None    # (rank, actor_id, is_operator) of the first admitted event
         self.first = self.last = None      # (rank, event_id)
+        self.first_at = self.last_at = None  # ingest time (epoch seconds) of the events behind first / last
         self.sources: set[tuple] = set()   # (source, actor) pairs that wrote a register
         self.attrs: dict[str, _Reg] = {}
         self._w: frozenset | None = None   # cached writers()
@@ -613,8 +614,10 @@ class _Claims:
             self._w = None
         if self.first is None or rank < self.first[0]:
             self.first = (rank, ev["event_id"])
+            self.first_at = _ts(ev) or None
         if self.last is None or rank > self.last[0]:
             self.last = (rank, ev["event_id"])
+            self.last_at = _ts(ev) or None
 
     def owner(self) -> str | None:
         """Actor of the FIRST admitted event, whatever its role (pinned: admission
@@ -1382,6 +1385,9 @@ class GraphProjection:
             "visibility_scope": _base(scope or "private"),
             "first_event_id": ids[0],
             "last_event_id": ids[1],
+            # when the control plane received those events; dropped together with the id by the history gates
+            "first_seen_at": self._at(node.first_at) if ids[0] and not node.commons else None,
+            "last_seen_at": self._at(node.last_at) if ids[1] and not node.commons else None,
             "source": ids[2],
         }
         if contrib:
@@ -1969,6 +1975,10 @@ class GraphProjection:
         return got[:LEDGER_SCAN_BUDGET][::-1], trimmed
 
     @staticmethod
+    def _at(epoch: float | None) -> str | None:
+        return datetime.fromtimestamp(epoch, UTC).isoformat() if epoch else None
+
+    @staticmethod
     def _iso(value: Any) -> str | None:
         if isinstance(value, datetime):
             return value.isoformat()
@@ -2202,9 +2212,9 @@ class GraphProjection:
                 if "admitted_at" in d:
                     d["admitted_at"] = None
         for n in out.get("nodes", ()):
-            for k in ("first_event_id", "last_event_id"):
+            for k, t in (("first_event_id", "first_seen_at"), ("last_event_id", "last_seen_at")):
                 if n.get(k) is not None and n[k] not in post:
-                    n[k] = None
+                    n[k] = n[t] = None
             f = n.get("fields") or {}
             for v in (f.get("label"), f.get("state"), *(f.get("attrs") or {}).values()):
                 fix(v)
@@ -2257,6 +2267,8 @@ class GraphProjection:
             for k in ("event_id", "first_event_id", "last_event_id"):
                 if d.get(k) is not None and pre(d[k]):
                     d[k] = None
+                    if k != "event_id":
+                        d["first_seen_at" if k == "first_event_id" else "last_seen_at"] = None
                     if k == "event_id":
                         for extra in ("admitted_at", "reason", "source_sequence"):
                             if extra in d:
