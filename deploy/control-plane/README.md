@@ -62,7 +62,10 @@ herdr-eng fleet config init --from-env ~/.config/herdr-engineering/control-plane
 #    the commit in the running image's receipt with THAT commit's compose files and
 #    says honestly whether the rollback came back healthy (exit 1) or not (exit 3);
 #    the very first deploy of the central config has no automatic rollback (see
-#    docs/operations/central-config-cutover.md)
+#    docs/operations/central-config-cutover.md). One deploy runs at a time
+#    (deploys/deploy.lock, --deploy-lock-wait); with collab it also holds collab-sync's
+#    lock (--collab-lock-wait) and recreates collab-public exactly once. A service
+#    container found missing is recreated, also by a rollback.
 deploy/control-plane/deploy.sh --dry-run        # validate, render to a temp dir, `docker compose config -q`
 deploy/control-plane/deploy.sh                  # --ref, --no-fetch, --fleet-config PATH
 
@@ -84,7 +87,7 @@ without them, and DB/object-store ports stay loopback-only.
 
 Settings of the reserved `control_plane` section the servers read: `pg_dsn`,
 `host_aliases`, `api_keys`, `rustfs_*`/`minio_*`, `self_host`, `web_port`,
-`ci_actions` (true enables CI retry/cancel), `deployment_definitions` (absolute path, as the
+`ci_actions` (true enables CI retry/cancel), `ci_log_tests` (test counts read from finished runs' CI logs; on by default, see `docs/ci-test-reports.md`), `deployment_definitions` (absolute path, as the
 web container sees it, to a checkout of InferWeave's `deploy/pipelines`; read live and validated with
 the same rules as its `validate.py`. Absent: no definitions, any host may report any component and the
 Deployments snapshot warns. Set: a host may report only components whose `host` is its fleet id, and
@@ -213,6 +216,72 @@ disabled by default and ordinary deploys never download or start it. See
 [agent summary model operations](../../docs/operations/agent-summary-model.md) for
 explicit provisioning, central configuration, health checks and removal.
 
+## Deployment definitions (`deploy/pipelines` sync)
+
+InferWeave owns the pipeline definitions (`deploy/pipelines/<component>.yaml` in `InferWeave/inferweave`).
+`control-plane-web`, their only reader, sees them read-only at `/etc/herdr/pipelines/`, bind-mounted from
+`~/.local/share/herdr-engineering/pipelines/` on the deploy host. Turn them on with one line under
+`sections.control_plane.values` of the central fleet file:
+
+```yaml
+sections:
+  control_plane:
+    values:
+      deployment_definitions: "/etc/herdr/pipelines"
+```
+
+The key is read live (no redeploy). A set loads all-or-nothing; an invalid one keeps the last good set in use.
+
+**Order matters:** deploy first, wait for the first sync (`pipelines.commit` exists and the directory lists
+the definitions), and only then add the line. The loader treats an EMPTY directory as a valid set of zero
+definitions: no warning, yet every host's deployment events are refused because no component is defined.
+deploy.sh creates the directory empty, and the sync never empties it (it refuses an empty set).
+
+- **deploy.sh** creates the directory empty (0755) on a real deploy, never on `--dry-run`, and refuses to deploy
+  unless it is a real directory owned by the deploying user, not writable by group/other, holding only regular
+  `*.yaml` files (no symlinks or subdirectories, at most 256, each at most 64 KiB, none group/other-writable).
+  Every real deploy installs (and a failed one restores) `pipelines-sync.sh`, a copy of the validator
+  `herdr_engineering/control_plane/deployment_definitions.py` from the deployed commit, and the user units
+  `herdr-pipelines-sync.service` + `.timer`.
+- **The timer** runs `pipelines-sync.sh once` about 20 s after it starts and then every 5 minutes. Runs never
+  overlap (`flock` on `pipelines.lock`); git calls are bounded with `timeout`, the unit with `TimeoutStartSec`.
+  Each run fetches `main` into a dedicated bare, blob-less clone
+  (`~/.local/share/herdr-engineering/inferweave-pipelines.git`; it never has a working tree, and only the
+  blobs of `deploy/pipelines` are downloaded). It takes ONLY the regular `*.yaml` files directly under
+  `deploy/pipelines/` (symlinks, subdirectories, `validate.py` and other files are skipped) and validates them
+  with herdr's own `validate_dir` in a staging directory next to the mount. Only a set that passes replaces
+  the mounted files: changed files are renamed in one at a time, then removed definitions are deleted. A failed
+  fetch, a file over 64 KiB, more than 256 files, an empty set or any validation error keeps the previous set
+  and fails the unit (see the journal). The mounted directory itself is never replaced, because a bind mount
+  pins its inode. The commit in use is written to `~/.local/share/herdr-engineering/pipelines.commit`.
+- **Authentication** is ssh as the deploying user: the remote is `git@github.com:InferWeave/inferweave.git`,
+  with `BatchMode=yes` and no prompts. No token is used or stored. The user's ssh key must be able to read the
+  repository without an agent or passphrase prompt (the timer has neither), and `github.com` must be in
+  `~/.ssh/known_hosts`. The lab `~/.gitconfig` rewrites https GitHub URLs to ssh, so an https remote ends up
+  on ssh as well. User timers run while the user is logged in unless lingering is on
+  (`loginctl enable-linger`).
+
+Verify after a deploy:
+
+```bash
+systemctl --user start herdr-pipelines-sync.service       # or wait for the timer
+journalctl --user -u herdr-pipelines-sync -n 20            # "pipelines: <commit> N definitions, ..."
+ls -l ~/.local/share/herdr-engineering/pipelines/          # only *.yaml, 0644
+docker exec herdr-cp-web ls /etc/herdr/pipelines           # the same files, read-only
+```
+
+On the **Deployments** page, the definitions status must say configured and loaded, with no warning, AND the
+component groups must list the definitions (an empty list with no warning is the empty-directory case above).
+`no deployment definitions loaded` means the key is not set. `configured but invalid` means no set was ever
+valid. `have errors: the last good set is still in use` means the current files fail and the page lists the
+errors. The component groups (stages) come from the definitions. The same status is in
+`GET /api/v1/deployments` under `definitions` (`configured`, `loaded`, `errors`, `warning`, and a non-empty
+`groups`).
+
+Run once by hand (same flags as the unit's `ExecStart`): `~/.local/share/herdr-engineering/pipelines-sync.sh once`.
+To roll back, drop `deployment_definitions` from the fleet file (the key is read live), then
+`systemctl --user disable --now herdr-pipelines-sync.timer`.
+
 ## Deployment actions (force redeploy, permit gate, ack)
 
 Hosts pull and herdr never holds a production credential: a force redeploy only **records a
@@ -254,8 +323,9 @@ request** that the host updater picks up on its next poll. The routes (each also
 - **Requests** are kept until cleared or for 24 h, at most 256 pending (more is refused with 429).
 - **Host token scope.** The host token grants only these host routes, and only for the components whose
   definition names that host. Every other route still answers 401.
-- **Release evidence comes from GitHub.** herdr reads it with the server-held `github.token` (read only is
-  enough; the repository is private, so a token is required):
+- **Release evidence comes from GitHub.** herdr reads it with the server-held GitHub credential (read only is
+  enough; the repository is private, so a credential is required): the `github.app` installation token of the
+  repository's owner when the App is configured (see "GitHub App authentication" below), else `github.token`:
   - **Published:** the `<follows.asset>.commit` asset of the `follows.tag` release (`node-ci-latest`) must hold
     the plan target. Every (tag, asset) a track's definitions name must carry the same 40-hex commit. The asset's
     redirect is followed by hand, without the token, and only to a `*.githubusercontent.com` download host.
@@ -304,6 +374,84 @@ request** that the host updater picks up on its next poll. The routes (each also
 - **While the fleet file is unusable** (deleted or unparseable after having been valid), the flag reads as off
   (fail closed) unless the last good file set `control_plane.config_failure_mode: last_good`. With `last_good`, a
   flag that was `true` keeps forces live: new force/ack requests are accepted and pending forces still permit.
+
+### GitHub App authentication (`github.app`)
+
+Every herdr GitHub **reader** (the release evidence above and the GitHub issue/project cache) can authenticate
+as a read-only GitHub App instead of the static `github.token`:
+
+```yaml
+github:
+  roles: [ci]
+  values:
+    app:
+      app_id: 123456
+      private_key_file: "/etc/herdr/github-app/github-app.pem"   # absolute, regular file, mode 0600
+      installations:                                        # one per repository owner herdr reads
+        InferWeave: 11111111
+        metabolomics-us: 22222222
+        berlinguyinca: auto                                 # looked up once via GET /app/installations
+```
+
+- **Required App permissions.** Repository: **Contents: read** (releases, release assets, compare),
+  **Metadata: read**, **Issues: read** (the GitHub cache). Organization: **Projects: read** only if the cache's
+  Projects v2 sync is used (GitHub may not expose a personal account's projects to an App; such an owner's
+  projects then read as unavailable, fail closed). **Commit statuses, Checks and Actions are not needed**: no herdr reader fetches them (CI green
+  comes from herdr's own CI record). Every token request names its permissions explicitly and only at `read`:
+  evidence `{contents, metadata}`, cache `{issues, metadata}`, Projects `{issues, metadata, organization_projects}`.
+  A grant broader than `read` in GitHub's answer is refused, and herdr can request nothing outside those four
+  permissions. The evidence token is further limited to the one repository it reads (`repositories: [<name>]`).
+- **Precedence.** With `app` set the App wins for every read and one warning is logged when `token` is also set.
+  An invalid `app` block means *no* credential (fail closed), never a silent fallback to `token`. Without `app`,
+  `github.token` works exactly as before. `deployment_escalation.issues` (an issue **write**) uses
+  `github.token` unless the `escalations` write capability is enabled (below); reads never get write access. While `github.token` is configured it stays the fallback, so to stop escalation writes remove both the capability and `github.token`; each filed issue records which credential made it.
+- **Owners.** A request uses the installation of the repository's owner. Only owners listed under
+  `installations` get a token (`auto` resolves an id, it never adds an owner); any other owner reads as unknown.
+  **Keep the App private** (installable only by its owning account): `auto` matches installations by account
+  login, so a public App installed by other accounts must never be relied on; prefer explicit ids.
+- **Tokens.** A RS256 JWT (`iat` backdated 60 s, 10 min span) is exchanged at
+  `POST /app/installations/{id}/access_tokens`; the token is cached per owner and permission set until 5 min
+  before it expires (validity anchored to the monotonic clock, capped at 1 h). Refreshes are single-flight, each
+  call is bounded to 10 s, redirects are never followed, the answer is validated (`ghs_` token, `expires_at`),
+  a 403/429 rate limit backs off for its reset (at most 15 min) and any other failure for 30 s. A 401 from a read
+  drops that owner's cached token. Any failure means no token: evidence is unknown, the cache reports GitHub
+  unavailable. No HTTP proxy is used (environment proxies are ignored), so no proxy sees the JWT or a token.
+- **Secrets.** The key is read from the file only when a JWT is minted. It is refused unless it is a regular
+  file of mode exactly 0600 or 0400, with no symlink anywhere in its path, owned by the reading process's uid;
+  root (the container under rootful docker) may read the key that keeps its host owner. The key, the JWT and installation tokens never reach a log, an error, the state or the UI. Both
+  readers run in `control-plane-web`, which alone mounts `~/.config/herdr-engineering/github-app/` read-only at
+  `/etc/herdr/github-app/` (the fleet directory may hold only `fleet-config.yaml`). `deploy.sh` refuses to deploy
+  unless that directory is a real 0700 directory owned by the deploying user holding nothing or exactly one
+  regular file `github-app.pem`, owned by that user, mode 0600 or 0400; a missing directory is
+  created empty. Like the fleet file, the key stays owner-only: the container runs as root (rootless docker: as
+  the deploying user), so it can read it; never loosen the mode. Needs `PyJWT[crypto]` (the image's `review-gate`/`collab` extras
+  already install it; without it every token fails as `jwt_library_missing`). The loader validates the block's structure (`herdr-eng fleet config validate`), not the
+  key file, which only the control-plane container can see.
+- **Write capabilities (`write: [...]`, off by default).** Reads stay read-only. A deployment may list, under
+  `github.app.write`, the write capabilities it allows; each has a fixed permission set that no caller can widen, and a
+  capability that is not listed is refused (`write_disabled`) before any call to GitHub:
+
+  | Capability | Used by | App permissions needed |
+  |---|---|---|
+  | `review_gate` | the review gate (`review_gate.app: shared`): commit statuses, merge, update-branch | Commit statuses: write, Contents: write, Pull requests: write (reads: Pull requests: read, Contents: read) |
+  | `escalations` | deployment escalation issues | Issues: write |
+
+  ```yaml
+  github:
+    values:
+      app:
+        app_id: 123456
+        private_key_file: "/etc/herdr/github-app/github-app.pem"
+        installations: {berlinguyinca: auto}
+        write: [review_gate]          # absent or [] = read-only App
+  ```
+
+  Tokens for a capability are repo-scoped, cached per permission set, and GitHub's answer is refused when it grants
+  more than was asked (`metadata: read` may ride along). The PR poller of project intelligence and the review gate's
+  reads need **Pull requests: read** on the App. A static `github.token` has no write capability.
+- **The cache under the App** lists each configured owner's repositories (`repositoryOwner`, not `viewer`), and
+  its catalog identity is the App's (not the hourly token), so token rotation does not purge it. Switching
+  between `token` and `app` re-syncs the catalog once.
 
 ### Cross-track order (`requires`)
 

@@ -26,8 +26,12 @@ from uuid import uuid4
 
 from ..host_policy import HostPolicy, HostSnapshot, PolicyMode, normalize_aliases
 from ..llm_session_id import dashboard_form
-from . import llm_stats
-from .agent_identity import AgentIdentityConflict, AgentIdentityRegistry
+from . import llm_stats, usage_spend
+from .agent_identity import (
+    AgentIdentityConflict,
+    AgentIdentityRegistry,
+    AgentIdentityVersionConflict,
+)
 from .deployment_actions import ENTITY_TYPE as DEPLOYMENT_REQUEST_ENTITY
 from .deployment_actions import ForceRequests
 from .deployment_coordinator import ENTITY_TYPE as DEPLOYMENT_PLAN_ENTITY
@@ -41,6 +45,7 @@ from .graph import GraphProjection
 from .graph import _lseq as _graph_lseq
 from .graph import _rank as _graph_rank
 from .graph import from_stored as _graph_from_stored
+from .history_cursor import fingerprint
 from .host_metrics_store import ENTITY_TYPE as HOST_METRICS_ENTITY
 from .host_metrics_store import STATE_KEYS as HOST_STATE_KEYS
 from .host_metrics_store import HostMetricsStore, clean_metrics, clean_state
@@ -66,6 +71,8 @@ from .service_catalog import (
 
 #: Hard bound on one durable deployment write made under a store lock (seconds).
 DEPLOYMENT_DURABLE_WRITE_TIMEOUT_S = 10
+
+_CI_EVENT_KINDS = frozenset({"ci_report", "ci_observation", "ci_telemetry", "ci_logtests"})
 
 _STAGES = {
     "planning", "specification", "ready", "implementation", "testing",
@@ -196,8 +203,10 @@ class ControlPlaneRepo:
         self._event_lock = threading.RLock()
         self._agent_projection_lock = threading.RLock()
         self._agent_records = {}
+        self._agent_identity_history = []
         self._agent_sequence = 0
         self._sink = sink
+        self._durable_history = None
         self._now = now or (lambda: time.time())
         self._missions = {}
         self._sessions = {}
@@ -233,7 +242,8 @@ class ControlPlaneRepo:
         self.collab_quarantine_reasons = []
         self.collab_quarantine = []  # foreign 'collab' rows found at startup (never replayed)
         self._collab_replay = []  # durable HCN events diverted out of the shared streams
-        self.agent_identities = AgentIdentityRegistry(persist=self._persist_agent_projection)
+        self.agent_identities = AgentIdentityRegistry(persist=self._persist_agent_projection,
+            verify_noop=bool(getattr(self._sink, "verify_agent_identity_noop", False)))
         # Agent inspector (spec 0200): bounded per-session detail projection.
         self.inspector = InspectorStore.from_config(inspector_limits, persist=self._persist_inspector)
         self.mission_activity = MissionActivityStore(now=self._now)
@@ -572,7 +582,7 @@ class ControlPlaneRepo:
             profile = self.agent_identities.get(record["session_id"])
             return {**record, "display_name": record["session_id"], "agent_handle": None,
                     "name_version": profile["version"],
-                    "name_error": "Saved agent name conflicts with another identity; using the session ID until renamed."}
+                    "name_error": "Saved agent name has conflicting reservations or versions; using the session ID until renamed."}
         return {**record, "display_name": profile["display_name"],
                 "agent_handle": profile["handle"], "name_version": profile["version"]}
 
@@ -596,9 +606,26 @@ class ControlPlaneRepo:
                 required = getattr(self._sink, "record_required", None)
                 if not callable(required):
                     raise RuntimeError("agent projections require acknowledged persistence")
-                required(event)
-            self._agent_sequence = sequence
-            self._agent_records[(event["entity_type"], event["entity_id"])] = event
+                try:
+                    acknowledged = required(event)
+                except AgentIdentityVersionConflict as error:
+                    current = getattr(error, "current_event", None)
+                    if isinstance(current, dict) and current.get("entity_id") == event["entity_id"]:
+                        self._remember_agent_projection(copy.deepcopy(current))
+                    raise
+                if event["entity_type"] == "agent_identity" and isinstance(acknowledged, dict):
+                    event = copy.deepcopy(acknowledged)
+                    sequence = int(event["sequence"])
+            self._remember_agent_projection(event)
+            if event["entity_type"] == "agent_identity":
+                return copy.deepcopy(event["payload"])
+
+    def _remember_agent_projection(self, event):
+        self._agent_sequence = max(self._agent_sequence, int(event["sequence"]))
+        self._agent_records[(event["entity_type"], event["entity_id"])] = event
+        if event["entity_type"] == "agent_identity":
+            if not any(old.get("event_id") == event.get("event_id") for old in self._agent_identity_history):
+                self._agent_identity_history.append(copy.deepcopy(event))
 
     def persist_agent_summary(self, event):
         sid = event["session_id"]
@@ -1961,7 +1988,7 @@ class ControlPlaneRepo:
             projected = copy.deepcopy(report)
             reconcile_report_identities([projected], history["pipelines"])
             attempts = [row.get("attempt", 1) for row in history["reports"]
-                        if (row.get("provider_url"), row.get("repository"), str(row.get("provider_repo_id")), row.get("run_number")) ==
+                        if row.get("source") != "log_parse" and (row.get("provider_url"), row.get("repository"), str(row.get("provider_repo_id")), row.get("run_number")) ==
                            (projected.get("provider_url"), projected["repository"], str(projected["provider_repo_id"]), projected["run_number"])]
             report["attempt"] = max(attempts, default=0) + 1
             report["ingested_at"] = self._stamp()
@@ -1969,6 +1996,60 @@ class ControlPlaneRepo:
                               require_durable=True)
             self._trim_ci_history("ci_report")
             return copy.deepcopy(report)
+
+    def ingest_ci_log_report(self, body, *, redact=None):
+        """Keep the tests parsed from one run's CI logs. A real uploaded report for the run always wins.
+
+        One record per run: analysing the run again replaces it. Records that found no tests are kept too, so a
+        collector does not fetch the same logs again; `ci_reports()` never shows them.
+        """
+        from .ci_reports import compact_log_report, normalize_log_report
+        with self._event_lock:
+            report = normalize_log_report(body, self._stamp(), redact=redact)
+            if self._junit_shadows(report):
+                # Remembered as a run with nothing to count, so a restart does not fetch its logs again.
+                marker = normalize_log_report({**body, 'outcome': 'no_tests', 'summary': {}, 'tests': [], 'runners': [],
+                                               'steps': [], 'provisional': False,
+                                               'skipped_steps': [{'step': '*', 'reason': 'junit_report_exists'}]},
+                                              self._stamp(), redact=redact)
+                self.record_event("ci_logtests", marker["run_key"], "CILogTestsAnalysed", marker, require_durable=True)
+                self._trim_ci_history("ci_logtests")
+                return {**{k: report[k] for k in ('run_key', 'outcome')}, 'skipped': 'junit_report_exists'}
+            # Only the compact form is persisted; the full per-test index lives in memory for the newest runs.
+            self.record_event("ci_logtests", report["run_key"], "CILogTestsAnalysed", compact_log_report(report),
+                              require_durable=True)
+            stream = self._events.get(("ci_logtests", report["run_key"]))
+            if report.get('tests') and stream:
+                stream[-1]['payload'] = report
+            self._trim_ci_history("ci_logtests")
+            return {k: report[k] for k in ('run_key', 'outcome', 'summary', 'runners')}
+
+    def _junit_shadows(self, log_report, pipelines=None):
+        from .ci_observability import bind_report_provider
+        if pipelines is None:
+            pipelines = [stream[-1]['payload'] for (kind, _), stream in self._events.items()
+                         if kind == 'ci_observation' and stream]
+        want = (log_report.get('provider_url'), str(log_report.get('provider_repo_id')), log_report['run_number'])
+        for (kind, _), stream in self._events.items():
+            if kind != 'ci_report' or not stream:
+                continue
+            row = bind_report_provider(stream[-1]['payload'], pipelines)
+            if (row.get('provider_url'), str(row.get('provider_repo_id')), row.get('run_number')) == want:
+                return True
+        return False
+
+    def ci_log_analysis(self, provider_url, provider_repo_id, run_number):
+        """What the collector already knows about one run's logs: {outcome, analysed_at} or None."""
+        from .ci_reports import log_run_key
+        with self._event_lock:
+            stream = self._events.get(("ci_logtests", log_run_key(provider_url, provider_repo_id, run_number)))
+            if not stream:
+                return None
+            payload = stream[-1]['payload']
+            if isinstance(payload, str):
+                payload = json.loads(payload)
+            return {'outcome': payload.get('outcome'), 'analysed_at': payload.get('analysed_at'),
+                    'provisional': payload.get('provisional') is True}
 
     def observe_ci_pipeline(self, row):
         from .ci_reports import normalize_provider_url
@@ -1990,12 +2071,22 @@ class ControlPlaneRepo:
     def _trim_ci_history(self, kind=None):
         from .ci_observability import _identity
         from .ci_performance import RECORD_LIMIT
-        from .ci_reports import HISTORY_BYTES, PIPELINE_LIMIT, REPORT_LIMIT
+        from .ci_reports import (
+            HISTORY_BYTES,
+            LOG_HISTORY_BYTES,
+            LOG_INDEX_RUNS,
+            LOG_NEGATIVE_LIMIT,
+            LOG_REPORT_LIMIT,
+            PIPELINE_LIMIT,
+            REPORT_LIMIT,
+            compact_log_report,
+            log_finished_epoch,
+        )
         keep = set()
-        kinds = {kind} if kind is not None else {"ci_report", "ci_observation", "ci_telemetry"}
+        kinds = {kind} if kind is not None else set(_CI_EVENT_KINDS)
         arrivals = {tuple(entry): index for index, entry in enumerate(self._event_order)}
         for kind, limit in (("ci_report", REPORT_LIMIT), ("ci_observation", PIPELINE_LIMIT),
-                            ("ci_telemetry", RECORD_LIMIT)):
+                            ("ci_telemetry", RECORD_LIMIT), ("ci_logtests", LOG_REPORT_LIMIT)):
             if kind not in kinds:
                 continue
             keys = [key for key in self._events if key[0] == kind]
@@ -2003,9 +2094,18 @@ class ControlPlaneRepo:
                 for event in self._events[key]:
                     if isinstance(event.get("payload"), str):
                         event["payload"] = json.loads(event["payload"])
-            keys.sort(key=lambda key: (self._events[key][-1].get("ingest_timestamp", ""),
-                                      arrivals.get((*key, self._events[key][-1]["sequence"]), -1)),
-                      reverse=True)
+            if kind == 'ci_logtests':
+                # Newest run first, by when the run finished and not by when it happened to be read: a backlog analysed
+                # today must not push out the runs that matter most.
+                keys.sort(key=lambda key: (log_finished_epoch(self._events[key][-1]['payload'],
+                                                              self._events[key][-1].get("ingest_timestamp", "")),
+                                           self._events[key][-1].get("ingest_timestamp", ""),
+                                           arrivals.get((*key, self._events[key][-1]["sequence"]), -1)),
+                          reverse=True)
+            else:
+                keys.sort(key=lambda key: (self._events[key][-1].get("ingest_timestamp", ""),
+                                          arrivals.get((*key, self._events[key][-1]["sequence"]), -1)),
+                          reverse=True)
             if kind == 'ci_observation' and any(not key[1].startswith('[') for key in keys):
                 # Upgrade may retain a legacy "repo_id:run" stream alongside
                 # a new provider-scoped stream. Supersede only exact full
@@ -2021,11 +2121,35 @@ class ControlPlaneRepo:
                         if identity is not None:
                             seen.add(identity)
                 keys = unique
-            size = 0
-            for key in keys[:limit]:
+            size, budget, ordered, indexed = 0, HISTORY_BYTES, keys[:limit], set()
+            if kind == 'ci_logtests':
+                budget = LOG_HISTORY_BYTES
+                # Runs with counts and runs with nothing to count are limited separately, so a long tail of the latter
+                # can never evict the former.
+                counted = [key for key in keys if self._events[key][-1]['payload'].get('outcome') == 'counted']
+                empty = [key for key in keys if self._events[key][-1]['payload'].get('outcome') != 'counted']
+                ordered = counted[:limit] + empty[:LOG_NEGATIVE_LIMIT]
+                # The per-test index stays in memory for the newest run of every repository and branch first, then for
+                # the newest of the rest, up to LOG_INDEX_RUNS; older runs keep their counts and failing tests.
+                withindex = [key for key in ordered if self._events[key][-1]['payload'].get('tests')
+                             and not self._events[key][-1]['payload'].get('index_dropped')]
+                seen = set()
+                for key in withindex:
+                    payload = self._events[key][-1]['payload']
+                    lane = (payload.get('provider_url'), str(payload.get('provider_repo_id')), payload.get('branch'))
+                    if lane not in seen and len(indexed) < LOG_INDEX_RUNS:
+                        seen.add(lane)
+                        indexed.add(key)
+                for key in withindex:
+                    if len(indexed) < LOG_INDEX_RUNS:
+                        indexed.add(key)
+            for key in ordered:
                 latest = self._events[key][-1]
+                if (kind == 'ci_logtests' and latest['payload'].get('tests') and not latest['payload'].get('index_dropped')
+                        and key not in indexed):
+                    latest['payload'] = compact_log_report(latest['payload'])
                 size += len(json.dumps(latest).encode())
-                if size > HISTORY_BYTES:
+                if size > budget:
                     break
                 self._events[key] = [latest]
                 keep.add(key)
@@ -2049,18 +2173,29 @@ class ControlPlaneRepo:
                 events.sort(key=lambda event: (event.get("ingest_timestamp", ""), arrivals.get(
                     (event["entity_type"], event["entity_id"], event["sequence"]), -1)), reverse=True)
                 payloads = [event['payload'] for event in events]
-                if kind == 'ci_report' and run is not None:
+                if kind == 'ci_logtests':
+                    payloads = [row for row in payloads if row.get('outcome') == 'counted']
+                if kind in ('ci_report', 'ci_logtests') and run is not None:
                     payloads = [row for row in payloads
                                 if (bound := bind_report_provider(row, pipelines)) and all(
                                     str(bound.get(key)) == str(value) for key, value in run.items())]
                 if compact:
-                    fields = ((*_REPORT_FIELDS, 'report_id', 'summary', 'attempt') if kind == 'ci_report'
+                    fields = ((*_REPORT_FIELDS, 'report_id', 'summary', 'attempt', 'source', 'runners',
+                               'index_complete', 'skipped_steps') if kind in ('ci_report', 'ci_logtests')
                               else (*_PIPELINE_FIELDS, 'event', 'ref', 'url', 'coverage', 'stale',
                                     'project_id', 'language', 'mission_id', 'mission_key', 'session_id'))
                     payloads = [{key: row[key] for key in fields if key in row} for row in payloads]
                 return copy.deepcopy(payloads)
             pipelines = rows("ci_observation")
             reports = rows("ci_report")
+            # Tests parsed from logs stand in only for runs with no uploaded report; a JUnit upload always wins.
+            shown = {(b.get('provider_url'), str(b.get('provider_repo_id')), b.get('run_number'))
+                     for b in (bind_report_provider(row, pipelines) for row in reports)}
+            parsed = [row for row in rows("ci_logtests")
+                      if (row.get('provider_url'), str(row.get('provider_repo_id')), row.get('run_number')) not in shown]
+            if parsed:
+                reports = sorted(reports + parsed, reverse=True,
+                                 key=lambda row: row.get('ingested_at') or row.get('reported_at') or '')
             from .ci_reports import reconcile_report_identities
             reconcile_report_identities(reports, pipelines)
             if compact:
@@ -2478,7 +2613,7 @@ class ControlPlaneRepo:
                 for event, feed, publish in pending_events:
                     key = (event["entity_type"], event["entity_id"])
                     self._events.setdefault(key, []).append(event)
-                    if event["entity_type"] in {"ci_report", "ci_observation", "ci_telemetry"}:
+                    if event["entity_type"] in _CI_EVENT_KINDS:
                         self._ci_sequence = max(self._ci_sequence, event["sequence"] + 1)
                     if feed:
                         self._event_order.append((*key, event["sequence"]))
@@ -2563,7 +2698,7 @@ class ControlPlaneRepo:
             if self._pending_scheduler_events is not None:
                 seq = max(seq, max((e["sequence"] + 1 for e, _, _ in self._pending_scheduler_events
                                    if (e["entity_type"], e["entity_id"]) == key), default=seq))
-            if entity_type in {"ci_report", "ci_observation", "ci_telemetry"}:
+            if entity_type in _CI_EVENT_KINDS:
                 seq = max(seq, self._ci_sequence)
             ev = {
                 "event_id": new_id("event"),
@@ -2602,7 +2737,7 @@ class ControlPlaneRepo:
                 try:
                     self._sink.record_required(ev)
                 except Exception:
-                    if entity_type in {"ci_report", "ci_observation", "ci_telemetry"} and not stream:
+                    if entity_type in _CI_EVENT_KINDS and not stream:
                         self._events.pop(key, None)
                     raise
             if self._pending_scheduler_events is not None:
@@ -2613,7 +2748,7 @@ class ControlPlaneRepo:
                         pass
                 self._pending_scheduler_events.append((ev, feed, publish))
                 return _copy(ev)
-            if entity_type in {"ci_report", "ci_observation", "ci_telemetry"}:
+            if entity_type in _CI_EVENT_KINDS:
                 self._ci_sequence = seq + 1
             stream.append(ev)
             if feed:
@@ -2683,6 +2818,8 @@ class ControlPlaneRepo:
                                             i['entity_id'] or ''))
 
     def stream(self, entity_type, entity_id):
+        if self._durable_history is not None and entity_type in {"host", "session", "service"}:
+            return self._durable_history.history_stream(entity_type, entity_id)
         return [_copy(e) for e in self._events.get((entity_type, entity_id), [])]
 
     def stream_page(self, entity_type, entity_id, *, limit=50, before=None):
@@ -2692,6 +2829,8 @@ class ControlPlaneRepo:
         the cursor stale instead of silently skipping history. Sequence numbers
         are metadata only: duplicates and gaps retain their stored ordering.
         """
+        if self._durable_history is not None and entity_type in {"host", "session", "service"}:
+            return self._durable_history.history_page(entity_type, entity_id, limit=limit, before=before)
         import base64
 
         if type(limit) is not int or not 1 <= limit <= 200:
@@ -2726,13 +2865,13 @@ class ControlPlaneRepo:
             stream = self._events.get((entity_type, entity_id), [])
             end = len(stream)
             if boundary is not None:
-                if boundary >= len(stream) or digest(stream[boundary]) != anchor:
+                if boundary >= len(stream) or fingerprint(stream[boundary]) != anchor:
                     raise ValueError("staleHistoryCursor")
                 end = boundary
             start = max(0, end - limit)
             next_cursor = None
             if start:
-                raw = json.dumps([1, start, identity, digest(stream[start])], separators=(",", ":")).encode()
+                raw = json.dumps([1, start, identity, fingerprint(stream[start])], separators=(",", ":")).encode()
                 next_cursor = base64.urlsafe_b64encode(raw).decode().rstrip("=")
             latest = stream[-1] if stream else {}
             return {"events": [_copy(event) for event in stream[start:end]],
@@ -3084,6 +3223,16 @@ class ControlPlaneRepo:
         points = llm_stats.timeseries(records, metric, since=since, until=now, step=step_s)
         return dict(meta, step=step, metric=metric, points=points)
 
+    def llm_spend(self, window="24h", prices=(), **filters):
+        """Priced estimate of the window's tokens (docs/usage-spend-estimate.md). Proxy traffic only unless a source is asked
+        for: a transcript and the proxy can describe the same call, so the two are never summed."""
+        source = filters.get("source") or "llm-proxy"
+        filters["source"] = source
+        if not prices:
+            return {"configured": False}
+        records, _, meta, _, _ = self._llm_window(window, filters)
+        return dict(meta, source=source, **usage_spend.estimate(records, prices))
+
     def llm_errors(self, window="24h", error_class=None, **filters):
         filters["source"] = "llm-proxy"   # a transcript carries no status, so it has no errors
         records, resolve, meta, _, _ = self._llm_window(window, filters)
@@ -3257,10 +3406,12 @@ class ControlPlaneRepo:
             "ci_sequence": self._ci_sequence,
             "ci_history_truncated": sorted(self._ci_history_truncated),
             "agent_projections": copy.deepcopy(list(self._agent_records.values())),
+            "agent_identity_history": copy.deepcopy(self._agent_identity_history),
         }
 
     def import_state(self, state):
         """Restore state from an export (used by restore tests / recovery)."""
+        self._durable_history = None
         phase = _BootPhases("import_state")
         self._missions = dict(state.get("missions", {}))
         self._sessions = dict(state.get("sessions", {}))
@@ -3331,7 +3482,7 @@ class ControlPlaneRepo:
         self._ci_sequence = max(int(state.get("ci_sequence", 0)),
                                 max((event.get("sequence", -1) + 1
                                      for key, stream in self._events.items()
-                                     if key[0] in {"ci_report", "ci_observation", "ci_telemetry"}
+                                     if key[0] in _CI_EVENT_KINDS
                                      for event in stream), default=0))
         self._ci_test_projection = None
         self._ci_history_truncated = set(state.get('ci_history_truncated', []))
@@ -3339,14 +3490,15 @@ class ControlPlaneRepo:
         phase("delivery and CI history")
         # Replay durable naming reservations before any session is presented.
         # Summary continuity lives outside transcript retention and public feeds.
-        projections = list(state.get("agent_projections", []))
+        projections = list(state.get("agent_identity_history", [])) + list(state.get("agent_projections", []))
         self._agent_records = {}
+        self._agent_identity_history = []
         self._agent_sequence = 0
-        self.agent_identities = AgentIdentityRegistry(persist=self._persist_agent_projection)
         private_types = {"agent_identity", "agent_summary"}
         for key in [k for k in self._events if k[0] in private_types]:
             projections.extend(self._events.pop(key))
         self._event_order = [row for row in self._event_order if row[0] not in private_types]
+        seen_identity_events = {}
         for event in projections:
             if event.get("entity_type") not in private_types:
                 continue
@@ -3354,8 +3506,30 @@ class ControlPlaneRepo:
             key = (event["entity_type"], event["entity_id"])
             self._agent_records[key] = event
             self._agent_sequence = max(self._agent_sequence, int(event.get("sequence") or 0))
-        self.agent_identities.hydrate([event for (kind, _), event in self._agent_records.items()
-                                       if kind == "agent_identity"], quarantine_conflicts=True)
+            if event["entity_type"] == "agent_identity":
+                identity_key = event.get("event_id") or json.dumps(event, sort_keys=True, default=str)
+                previous = seen_identity_events.get(identity_key)
+                if previous is not None:
+                    if previous != event:
+                        raise ValueError("divergent private identity event")
+                    continue
+                seen_identity_events[identity_key] = event
+                self._agent_identity_history.append(copy.deepcopy(event))
+        self.agent_identities = AgentIdentityRegistry(persist=self._persist_agent_projection,
+            verify_noop=bool(getattr(self._sink, "verify_agent_identity_noop", False)))
+        self.agent_identities.hydrate(self._agent_identity_history, quarantine_conflicts=True,
+                                     tolerate_version_resets=True)
+        # Keep the acknowledged canonical event, even if a later stale observation
+        # has a lower optimistic version. Full history remains private for audit.
+        for identity, record in self.agent_identities._records.items():
+            for event in reversed(self._agent_identity_history):
+                payload = event["payload"]
+                if event["entity_type"] == "agent_identity" and all(
+                    payload.get(field) == record[field]
+                    for field in ("identity", "display_name", "handle", "version")
+                ):
+                    self._agent_records[("agent_identity", identity)] = event
+                    break
         if self.agent_identities.conflict_count:
             logging.getLogger(__name__).error(
                 "restored sessions with %d ambiguous agent names; aliases remain blocked and stable session IDs are shown until renamed",

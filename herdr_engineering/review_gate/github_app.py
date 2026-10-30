@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Literal
 
+from herdr_engineering import github_auth
 from herdr_engineering.control_plane.project_links import canonical_repository
 from herdr_engineering.control_plane.redact import redact_text
 from herdr_engineering.github import _NoRedirect
@@ -142,7 +143,15 @@ def _number(value):
 
 
 class GitHubAppClient:
-    def __init__(self, config: AppConfig, *, client=None, now=time.time):
+    """``config`` is the legacy per-gate App (own JWT and installation token). With ``credentials`` (a zero-arg
+    provider such as ``github_auth.credentials``) every call instead uses the shared GitHub App: reads get a
+    repo-scoped read-only token, writes the ``review_gate`` capability token (refused unless ``github.app.write``
+    lists it). ``config`` is then unused."""
+
+    def __init__(self, config: AppConfig | None, *, client=None, now=time.time, credentials=None):
+        if config is None and credentials is None:
+            raise ValueError("GitHubAppClient needs an AppConfig or a shared credentials provider")
+        self._credentials = credentials
         self._config = config
         self._client = client or urllib.request.build_opener(_NoRedirect())
         self._now = now
@@ -198,16 +207,50 @@ class GitHubAppClient:
         return parsed[0]
 
     # -- transport ---------------------------------------------------------
+    def _shared_bearer(self, method, path):
+        """(token, owner) for a ``/repos/{owner}/{repo}/...`` call from the shared credential."""
+        parts = path.split("?", 1)[0].split("/")
+        if len(parts) < 4 or parts[1] != "repos":
+            raise GitHubAppError("invalid_response")
+        owner, repo = urllib.parse.unquote(parts[2]), urllib.parse.unquote(parts[3])
+        provider = self._credentials()
+        try:
+            if method == "GET":
+                reader = getattr(provider, "token_or_raise", None)
+                if reader is not None:    # real App: keep the precise reason (rate_limited, unknown_owner, ...)
+                    token = reader(owner, github_auth.GATE_READ_PERMISSIONS, [repo])
+                else:
+                    token = provider.token_for(owner, github_auth.GATE_READ_PERMISSIONS, [repo])
+                if not token:
+                    raise GitHubAppError(
+                        "permission" if getattr(provider, "reason", None) == "unknown_owner" else "authentication")
+                return token, owner
+            return provider.capability_token_or_raise(owner, "review_gate", [repo]), owner
+        except github_auth.GitHubAuthError as exc:
+            if exc.reason == "rate_limited":
+                raise GitHubAppError("rate_limited", retry_at=self._now() + (exc.retry_s or 60)) from None
+            raise GitHubAppError({"write_disabled": "permission", "unknown_owner": "permission",
+                                  "permission": "permission", "not_found": "not_found",
+                                  "authentication": "authentication"}.get(exc.reason, "unavailable")) from None
+
     def _send(self, method, path, *, body=None, bearer=None):
         app_auth = bearer is not None
-        if not app_auth:
+        shared_owner = None
+        if self._credentials is not None and not app_auth:
+            bearer, shared_owner = self._shared_bearer(method, path)
+        elif not app_auth:
             bearer = self.installation_token()
         ok, payload = self._transport(method, path, body, bearer)
-        bearer = None  # keep credentials out of this frame before any raise
+        rejected, bearer = (bearer if shared_owner is not None else None), None  # keep credentials out of this frame before any raise
         if not ok:
             if payload.status == 401 and not app_auth:
-                self._token, self._token_expiry = None, 0.0
+                if shared_owner is not None:
+                    self._credentials().invalidate(shared_owner, rejected)
+                else:
+                    self._token, self._token_expiry = None, 0.0
+            rejected = None
             raise payload
+        rejected = None
         return payload
 
     def _transport(self, method, path, body, bearer):

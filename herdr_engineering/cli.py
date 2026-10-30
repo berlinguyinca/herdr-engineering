@@ -769,6 +769,8 @@ def _build_parser() -> argparse.ArgumentParser:
                     help="control-plane base URL (default: host.json control_plane_url)")
     p2.add_argument("--interval", type=float, default=0,
                     help="seconds between snapshot reads (default: 0 = once)")
+    p2.add_argument('--allow-open', action='store_true',
+                    help='Allow publication without a key to an intentionally open trusted-network server')
     p2.set_defaults(func=_cmd_cp_feed_pi)
     p2 = csub.add_parser("mission-feed", help="publish read-only live Pi mission activity")
     p2.add_argument("--control-plane", default=None,
@@ -806,7 +808,7 @@ def _cmd_cp_feed_pi(args) -> int:
     from .control_plane.pi_snapshot import post_envelopes, snapshot_to_envelopes
     from .host_config import HostConfigUnavailable, resolve_control_plane
 
-    if not os.environ.get("HERDR_CP_INGEST_KEY", "").strip():
+    if not os.environ.get("HERDR_CP_INGEST_KEY", "").strip() and not args.allow_open:
         print("Set HERDR_CP_INGEST_KEY to an ingest-role API key", file=sys.stderr)
         return 2
     if not math.isfinite(args.interval) or args.interval < 0 or args.interval > 2 ** 31 - 1:
@@ -817,6 +819,7 @@ def _cmd_cp_feed_pi(args) -> int:
     except HostConfigUnavailable:
         print("Set --url or configure host.json control_plane_url", file=sys.stderr)
         return 2
+    previous_payloads = None
     while True:
         try:
             doc = json.loads(Path(args.snapshot).expanduser().read_text(encoding="utf-8"))
@@ -826,7 +829,11 @@ def _cmd_cp_feed_pi(args) -> int:
             print("Cannot read a valid Pi snapshot; check --snapshot and its schema", file=sys.stderr)
             return 2
         try:
-            posted = post_envelopes(url, None, envelopes)
+            payloads = [{key: value for key, value in envelope.items() if key != 'occurred_at'}
+                        for envelope in envelopes]
+            posted = (0 if previous_payloads == payloads else
+                      post_envelopes(url, None, envelopes, allow_open=args.allow_open))
+            previous_payloads = payloads
         except (ValueError, RuntimeError):
             print("Snapshot ingest failed; check --url and HERDR_CP_INGEST_KEY", file=sys.stderr)
             return 1
@@ -2906,11 +2913,17 @@ def _cp_config(fleet_config_path=None) -> dict:
         path = Path(fleet_config_path).expanduser()
         if path.exists():
             try:
-                dsn = load_fleet_config(path).section("control_plane").get("pg_dsn")
+                section = load_fleet_config(path).section("control_plane")
             except FleetConfigError as exc:
                 raise SystemExit(f"--fleet-config: {exc}") from None
+            dsn = section.get("pg_dsn")
             if dsn:
                 out["postgres_dsn"] = str(dsn)
+            # The worker writes render output to RustFS: take its endpoint and credentials from the
+            # fleet file too, or it falls back to the image's defaults and is refused (InvalidAccessKeyId).
+            for key in ("rustfs_endpoint", "rustfs_bucket", "rustfs_region", "minio_user", "minio_password"):
+                if section.get(key):
+                    out[key] = str(section[key])
     return out
 
 
@@ -3152,6 +3165,11 @@ def _cmd_cp_web(args) -> int:
         usage_retention = usage_retention_config(cp.get("llm_proxy"))
     except ValueError as exc:
         raise SystemExit(f"fleet config {exc}") from None
+    from .control_plane.usage_spend import usage_prices_config
+    try:
+        usage_prices = usage_prices_config(cp.get("usage"))
+    except ValueError as exc:
+        raise SystemExit(f"fleet config {exc}") from None
     from .control_plane.attention_inbox import attention_config
     try:
         attention = attention_config(cp.get("attention"))
@@ -3165,6 +3183,11 @@ def _cmd_cp_web(args) -> int:
     from .control_plane.ci_fix import ci_fix_config
     try:
         ci_fix = ci_fix_config(cp.get("ci_fix"))
+    except ValueError as exc:
+        raise SystemExit(f"fleet config {exc}") from None
+    from .control_plane.ci_logcollect import log_tests_config
+    try:
+        ci_log_tests = log_tests_config(cp.get("ci_log_tests"))
     except ValueError as exc:
         raise SystemExit(f"fleet config {exc}") from None
     _require_durable_review_gate(cp, dsn)
@@ -3317,11 +3340,11 @@ def _cmd_cp_web(args) -> int:
                              summary_config=cp.get("agent_summaries") or {},
                              summary_report_config=cp.get("summary_report") or {},
                              unified_workspace_config=cp.get("unified_workspace") if isinstance(cp.get("unified_workspace"), dict) else None,
-                             assistant_config={"personal_assistant": cp["personal_assistant"]}
-                                 if isinstance(cp.get("personal_assistant"), dict) else None,
+                             assistant_config=_assistant_config(cp),
                              review_quorum=_review_quorum_config(cp),
-                             usage_retention=usage_retention, attention=attention,
-                             ci_fix=ci_fix, missions=missions, github_pg_dsn=dsn,
+                             single_operator=cp.get("single_operator") is True,
+                             usage_retention=usage_retention, usage_prices=usage_prices, attention=attention,
+                             ci_fix=ci_fix, missions=missions, github_pg_dsn=dsn, ci_log_tests=ci_log_tests,
                              public_port=args.collab_public_port,
                              public_host=args.collab_public_host,
                              collab_only=args.collab_only,
@@ -3643,6 +3666,57 @@ def _inspector_snapshot_settings(cp) -> tuple[bool, float]:
     return raw.get("enabled") is True, float(interval)
 
 
+def _assistant_config(cp):
+    """``{"personal_assistant": ...}`` from the fleet section. In single-operator mode the owner's own approval of the
+    assistant's sensitive actions is allowed (there is only one person); otherwise the section is passed through."""
+    pa = cp.get("personal_assistant")
+    if not isinstance(pa, dict):
+        return None
+    if cp.get("single_operator") is True:
+        pa = {**pa, "actions": {**(pa.get("actions") or {}), "allow_self_approval": True}}
+    return {"personal_assistant": pa}
+
+
+def _fabric_compaction_settings(cp):
+    """``control_plane.fabric_compaction`` as CompactionSettings. Off unless ``enabled`` is exactly true, and a dry run
+    (counts only) unless ``dry_run`` is exactly false."""
+    from .control_plane.fabric_compaction import CompactionSettings
+    raw = (cp or {}).get("fabric_compaction") or {}
+    if not isinstance(raw, dict):
+        raise SystemExit("fleet config control_plane.fabric_compaction must be a mapping")
+
+    def number(key, default, minimum):
+        value = raw.get(key, default)
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or value < minimum:
+            raise SystemExit(f"fleet config control_plane.fabric_compaction.{key} must be a number >= {minimum}")
+        return float(value)
+    retention = raw.get("archive_retention_days", 30)
+    if retention is not None:
+        retention = number("archive_retention_days", 30, 1)
+    return CompactionSettings(
+        enabled=raw.get("enabled") is True, dry_run=raw.get("dry_run") is not False,
+        interval_seconds=number("interval_seconds", 3600, 60), min_age_days=number("min_age_days", 2, 1),
+        batch_rows=int(number("batch_rows", 250_000, 1000)), archive_retention_days=retention,
+        rebuild_checkpoint=raw.get("rebuild_checkpoint") is not False,
+        keep_checkpoints=int(number("keep_checkpoints", 2, 1)))
+
+
+def _worker_fabric_compactor(fleet_config_path):
+    """The fabric compactor when the fleet file enables it, else None."""
+    from pathlib import Path
+
+    from .control_plane.fabric_compaction import FabricCompactor
+    from .fleet_config import FleetConfigError, load_fleet_config
+    if not fleet_config_path or not Path(fleet_config_path).expanduser().exists():
+        return None
+    try:
+        cp = load_fleet_config(Path(fleet_config_path).expanduser()).section("control_plane")
+    except FleetConfigError as exc:
+        raise SystemExit(f"--fleet-config: {exc}") from None
+    settings = _fabric_compaction_settings(cp)
+    return FabricCompactor(settings) if settings.enabled else None
+
+
 def _maybe_pg_source(dsn, *, inspector_snapshots=False):
     """Build a PostgresSource from a DSN, or None if not provided."""
     if not dsn:
@@ -3751,11 +3825,14 @@ def _cmd_cp_worker(args) -> int:
             runner = render_runner if render_runner is not None else None
             worker_id = args.host_id or socket.gethostname()
             snapshotter = _worker_snapshot_writer(getattr(args, "fleet_config", None))
+            compactor = _worker_fabric_compactor(getattr(args, "fleet_config", None))
             if args.once:
                 return await run_one_pass(conn, worker_id=worker_id,
-                                          artifact_job_runner=runner, inspector_snapshotter=snapshotter)
+                                          artifact_job_runner=runner, inspector_snapshotter=snapshotter,
+                                          fabric_compactor=compactor)
             await run_worker(conn, interval=args.interval, worker_id=worker_id,
-                             artifact_job_runner=runner, inspector_snapshotter=snapshotter)
+                             artifact_job_runner=runner, inspector_snapshotter=snapshotter,
+                             fabric_compactor=compactor)
             return None
         finally:
             await conn.close()

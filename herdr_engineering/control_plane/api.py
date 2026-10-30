@@ -295,9 +295,9 @@ class ControlPlaneServer:
                  operator_port=None, operator_user=None, operator_email=None,
                  operator_hosts=(), collab_operator_url=None, collab_dashboard_hosts=(),
                  summary_config=None, summary_client=None, summary_report_config=None, usage_retention=None, lineage_key_scopes=None,
-                 review_quorum=None, system_graph: bool = False, attention=None, ci_fix=None, missions=None, github_pg_dsn=None,
+                 review_quorum=None, system_graph: bool = False, attention=None, ci_fix=None, missions=None, github_pg_dsn=None, ci_log_tests=None, usage_prices=None,
                  architecture_enabled=None, architecture_explain=None, architecture_options=None,
-                 request_workers=128, request_queue=256,
+                 request_workers=128, request_queue=256, single_operator=False,
                  assistant_service=None, assistant_config=None, fabric_resolver=None, fabric_services=None, fabric_names=None,
                  scheduler_admission=False, scheduler_limits=None, skill_registry=None,
                  unified_workspace_config=None):
@@ -321,6 +321,8 @@ class ControlPlaneServer:
         from .retention import usage_retention_config
         # control_plane.llm_proxy raw/rollup retention (validated; None = defaults).
         self.usage_retention = usage_retention_config(usage_retention)
+        # control_plane.usage.prices (validated by the caller; empty = no estimate).
+        self.usage_prices = list(usage_prices or [])
         # control_plane.ci_fix (validated; None = defaults, which are disabled: the routes then 404).
         from .ci_fix import CIFixService, ci_fix_config
         self.ci_fix_config = ci_fix_config(ci_fix)
@@ -329,7 +331,9 @@ class ControlPlaneServer:
         self.ci_monitor = CIMonitor(on_transition=lambda key, event, row:
                                     repo.record_event("ci_pipeline", key, event, row),
                                     actions_enabled=ci_actions,
-                                    on_observation=repo.observe_ci_pipeline)
+                                    on_observation=repo.observe_ci_pipeline,
+                                    on_log_report=lambda body: repo.ingest_ci_log_report(body),
+                                    log_known=repo.ci_log_analysis, log_tests=ci_log_tests)
         # control_plane.deployment_definitions: a checkout of InferWeave deploy/pipelines (read live;
         # absent = none, and deployment ingest stays accept-all with a warning). Targets come from the
         # CI monitor's last snapshot, never from a provider call here. It is only read once definitions
@@ -464,6 +468,12 @@ class ControlPlaneServer:
             self._keys[api_key] = "operator"
         self.api_key = api_key  # kept for backward compat / introspection
         self.allow_open = allow_open
+        # One person on a private tailnet: the open listener's caller is trusted as the operator for the assistant's
+        # preauthorized grants and for approving proposals (including their own). Off by default; incompatible with
+        # API keys, because with keys there are real identities and the normal rules apply.
+        self.single_operator = bool(single_operator)
+        if self.single_operator and self._keys:
+            raise ValueError("single_operator needs an open listener: remove control_plane.api_keys or turn it off")
         # Fail-closed (Spec §104): an unauthenticated server is only ever
         # allowed on a loopback bind unless the operator explicitly opts in
         # with allow_open (Tailnet trust boundary). Never silently exposed.
@@ -546,6 +556,10 @@ class ControlPlaneServer:
         self.request_metrics = RequestMetrics()
         self._ready = threading.Event()
         self._httpd = None
+        self._lifecycle_lock = threading.Lock()
+        self._maintenance_stop = threading.Event()
+        self._background_threads = []
+        self._serving_listeners = set()
         self.gate_service = self.gate_store = self.gate_queue = self.gate_main = None
         self.gate_coordinator = self.gate_reviewer_config = None
         self._start_review_gate(repo, fleet_config)
@@ -574,7 +588,13 @@ class ControlPlaneServer:
             repo, lambda: self._intelligence_section(fleet_config), github_pg_dsn)
         repo.egress_fn = lambda: self._intelligence_section(fleet_config).get("egress") or {}
         self.intelligence.metrics_fn = self._intelligence_metrics
-        self.intelligence.github_app_fn = lambda: getattr(self, "gate_app", None)
+        # The review gate's client when the gate is on, else the shared credential (github.app, then github.token).
+        from .intel_github import SharedCredentialPrLister
+        self._pr_lister = SharedCredentialPrLister()
+        self.intelligence.single_operator_fn = lambda: self.single_operator
+        self.intelligence.github_app_fn = lambda: getattr(self, "gate_app", None) or self._pr_lister
+        self.intelligence.poll_status_fn = lambda: {"client": "review_gate" if getattr(self, "gate_app", None) else "shared",
+                                                    "last_error": self._pr_lister.last_error}
         self.intelligence.ci_repair_fn = self._intelligence_ci_repair
         if getattr(self, "assistant", None) is not None:
             self.assistant.intelligence_read = self.intelligence.assistant_read
@@ -1154,7 +1174,15 @@ class ControlPlaneServer:
             ci_fix_caps={e.repo: e.ci_fix_cap for e in config.repos})
         # The queue's real lease and the lease a Claim reports must be one value.
         self.gate_queue = ReviewQueue(repo, lease_seconds=config.reviewer.lease_seconds)
-        app = github_app.GitHubAppClient(config.app)  # one client for gate + coordinator
+        if config.shared_app:
+            from .. import github_auth
+            app = github_app.GitHubAppClient(None, credentials=github_auth.credentials)   # the fleet's github.app
+            granted = getattr(getattr(github_auth.credentials(), "config", None), "write", ())
+            if config.enabled and "review_gate" not in granted:
+                log.warning("review_gate.app is 'shared' but github.app.write does not list review_gate: "
+                            "statuses, merges and branch updates will be refused (permission)")
+        else:
+            app = github_app.GitHubAppClient(config.app)  # one client for gate + coordinator
         self.gate_app = app
         registry = AuthorRegistry(repo)
         notifier = AuthorNotifier(repo, config=config.notify, registry=registry,
@@ -1171,6 +1199,7 @@ class ControlPlaneServer:
             main_verifier=self.gate_main,
             repair_gate=self._build_repair_gate(app, fleet_config, repo, registry),
             graph_gate=self._build_graph_gate(fleet_config),
+            evidence_hook=self._build_evidence_hook(fleet_config),
         )
         self.gate_reviewer_config = config.reviewer
         self.gate_coordinator = ReviewCoordinator(
@@ -1184,6 +1213,23 @@ class ControlPlaneServer:
         # starts the poller, so the server starts the shared monitor itself.
         self.ci_monitor.start()
         self.gate_service.start()
+
+    def _build_evidence_hook(self, fleet_config):
+        """``control_plane.graph_merge_gate.evidence_source`` (YAML, read on every PR; off unless ``enabled: true``). An
+        unreadable central config just means nothing is written; the gate then waits, it never passes."""
+        from ..fleet_config import FleetConfigError
+        from .graph_evidence_writer import GraphEvidenceWriter
+
+        def section():
+            if fleet_config is None:
+                return None
+            try:
+                return (fleet_config.current().section("control_plane") or {}).get("graph_merge_gate")
+            except FleetConfigError:
+                return None
+        self.graph_evidence_writer = GraphEvidenceWriter(ingest=self.ingest, section_fn=section,
+                                                      graph_fn=lambda: self.repo.graph)
+        return self.graph_evidence_writer.observe
 
     def _build_graph_gate(self, fleet_config):
         """``control_plane.graph_merge_gate`` (YAML, read on every PR so ``enabled: false`` is a hot kill switch). Once it
@@ -1328,7 +1374,29 @@ class ControlPlaneServer:
             self._subscribers.discard(q)
 
     # ------------------------------------------------------------- server
+    def _start_background_thread(self, target):
+        thread = threading.Thread(target=target, daemon=True)
+        thread.start()
+        self._background_threads.append(thread)
+
     def serve(self):
+        # Publish all listeners/workers before shutdown can snapshot and join them.
+        # Keep the primary listener locally: shutdown may clear self._httpd as
+        # soon as its serving loop returns.
+        with self._lifecycle_lock:
+            if self._maintenance_stop.is_set():
+                return
+            try:
+                httpd = self._start_server()
+            except BaseException:
+                self._maintenance_stop.set()
+                self._summary_stop.set()
+                self._shutdown_locked()
+                raise
+            self._serving_listeners.add(httpd)
+        httpd.serve_forever()
+
+    def _start_server(self):
         if self.collab_only:
             # No operator listener at all: this process serves the public collab surface only.
             self._httpd = _DaemonThreadingServer(
@@ -1338,10 +1406,10 @@ class ControlPlaneServer:
                 self._operator_httpd = _DaemonThreadingServer(
                     (self.public_host, self.operator_port), _make_handler(self, operator=True))
                 self.operator_port = self._operator_httpd.server_address[1]
-                threading.Thread(target=self._operator_httpd.serve_forever, daemon=True).start()
+                self._start_background_thread(self._operator_httpd.serve_forever)
+                self._serving_listeners.add(self._operator_httpd)
             self._ready.set()
-            self._httpd.serve_forever()
-            return
+            return self._httpd
         self._httpd = _DaemonThreadingServer(
             (self.host, self.port), _make_handler(self),
             request_workers=self.request_workers, request_queue=self.request_queue)
@@ -1350,23 +1418,24 @@ class ControlPlaneServer:
             self._public_httpd = _DaemonThreadingServer(
                 (self.public_host, self.public_port), _make_handler(self, public=True))
             self.public_port = self._public_httpd.server_address[1]
-            threading.Thread(target=self._public_httpd.serve_forever, daemon=True).start()
-        self._ready.set()
+            self._start_background_thread(self._public_httpd.serve_forever)
+            self._serving_listeners.add(self._public_httpd)
         if self.agent_summaries and self.agent_summaries.config.enabled:
             self.agent_summaries.start()
             self._summary_scanner = threading.Thread(target=self._summary_loop, daemon=True)
             self._summary_scanner.start()
-        threading.Thread(target=self._sweep_loop, daemon=True).start()
-        threading.Thread(target=self._deployments_loop, name="herdr-deployments-tick", daemon=True).start()
+        self._start_background_thread(self._sweep_loop)
+        self._start_background_thread(self._deployments_loop)
         if self.collab is not None and self.collab.lineage_sink is not None:
-            threading.Thread(target=self._link_flush_loop, daemon=True).start()
-        self._httpd.serve_forever()
+            self._start_background_thread(self._link_flush_loop)
+        self._ready.set()
+        return self._httpd
 
     def _sweep_loop(self, interval=300):
         """Periodic retention, starting at once so re-hydrated expired rows do not linger."""
-        while self._httpd is not None:
+        while not self._maintenance_stop.is_set():
             self.sweep_once()
-            time.sleep(interval)
+            self._maintenance_stop.wait(interval)
 
     def sweep_once(self):
         """Inspector age retention for idle sessions too (ingest only prunes the active
@@ -1390,12 +1459,12 @@ class ControlPlaneServer:
     def _link_flush_loop(self, interval=30):
         """T14: tell the lineage graph what it missed about cross-workspace links (a retraction the graph was down
         for), once at start and then on a timer. The pending set is derived from the durable link records."""
-        while self._httpd is not None:
+        while not self._maintenance_stop.is_set():
             try:
                 self.collab.maintain()
             except Exception:
                 pass
-            time.sleep(interval)
+            self._maintenance_stop.wait(interval)
 
     def wait_until_ready(self, timeout=5.0):
         self._ready.wait(timeout=timeout)
@@ -1426,25 +1495,36 @@ class ControlPlaneServer:
         return True
 
     def shutdown(self):
+        self._maintenance_stop.set()
+        self._summary_stop.set()
+        with self._lifecycle_lock:
+            self._shutdown_locked()
+
+    def _shutdown_locked(self):
+        """Release startup resources while holding the lifecycle lock."""
         if self.gate_service is not None:
             self.gate_service.stop()
-        self._summary_stop.set()
         self._deployments_stop.set()
-        if self._summary_scanner:
+        if self._summary_scanner and self._summary_scanner.ident is not None:
             self._summary_scanner.join(timeout=2)
         if self.agent_summaries:
             self.agent_summaries.close()
         self.ci_monitor.close()
         self.github_monitor.close()
-        if self._operator_httpd:
-            self._operator_httpd.shutdown()
-            self._operator_httpd.server_close()
-        if self._public_httpd:
-            self._public_httpd.shutdown()
-            self._public_httpd.server_close()
-        if self._httpd:
-            self._httpd.shutdown()
-            self._httpd.server_close()
+        for attr in ("_operator_httpd", "_public_httpd", "_httpd"):
+            listener = getattr(self, attr)
+            if listener is not None:
+                # BaseServer.shutdown waits forever if serve_forever was never
+                # started (e.g. a subsequent bind or thread startup failed).
+                if listener in self._serving_listeners:
+                    listener.shutdown()
+                listener.server_close()
+                setattr(self, attr, None)
+        self._serving_listeners.clear()
+        for thread in self._background_threads:
+            thread.join()
+        self._background_threads.clear()
+        self._ready.clear()
 
 
 def _fabric_session(repo, inst):
@@ -2922,6 +3002,13 @@ def _make_handler(server, public=False, operator=False):
                 return self._inspector_global_get(parts)
             if resource == "sessions" and len(parts) > 5 and parts[5] == "inspector":
                 return self._inspector_get(parts)
+            if resource == "sessions" and len(parts) == 6 and parts[5] == "commits":
+                from .session_commits import session_commits
+                session = r.get_session(parts[4])
+                if session is None:
+                    return self._json({"error": "agent not found"}, 404)
+                view = server.ci_monitor.snapshot(start=False) if server.ci_monitor is not None else {}
+                return self._json(session_commits(session, r.list_sessions(), view, pull_requests=r.list_pull_requests()))
             if resource == "sessions" and len(parts) == 6 and parts[5] == "summary":
                 if r.get_session(parts[4]) is None:
                     return self._json({"error": "agent not found"}, 404)
@@ -3137,7 +3224,7 @@ def _make_handler(server, public=False, operator=False):
                     return self._json({"keys": r.list_project_keys()})
                 if what == "models":
                     return self._json({"models": list(r.list_custom_models().values())})
-                if what in ("stats", "timeseries", "errors") and len(parts) == 5:
+                if what in ("stats", "timeseries", "errors", "spend") and len(parts) == 5:
                     return self._llm_stats(what)
                 return self._json({"error": "not found"}, 404)
             if resource == "graph":
@@ -3217,6 +3304,12 @@ def _make_handler(server, public=False, operator=False):
                 if what == "log":
                     return self._json(server.ci_monitor.log(
                         _q(self.path, "repository"), _q(self.path, "number"), _q(self.path, "step"),
+                        **({"provider_url": _q(self.path, "provider_url")} if _q(self.path, "provider_url") is not None else {})))
+                if what == "log-slice":
+                    return self._json(server.ci_monitor.log_slice(
+                        _q(self.path, "repository"), _q(self.path, "number"), _q(self.path, "step"),
+                        _qint(self.path, "start", 0), _qint(self.path, "end", 0),
+                        context=_qint(self.path, "context", 40), expect=(_q(self.path, "expect") or "")[:500],
                         **({"provider_url": _q(self.path, "provider_url")} if _q(self.path, "provider_url") is not None else {})))
                 if what == "fix" and server.ci_fix is not None and len(parts) in {5, 6}:
                     if len(parts) == 6 and parts[5] == "config":
@@ -3493,7 +3586,8 @@ def _make_handler(server, public=False, operator=False):
                                        body.get("repository"), body.get("number"),
                                        body.get("session_id"), body.get("operation_id"),
                                        **({"provider_url": body["provider_url"]} if "provider_url" in body else {}),
-                                       **({"mode": body["mode"]} if "mode" in body else {}))
+                                       **({"mode": body["mode"]} if "mode" in body else {}),
+                                       **({"test": body["test"]} if "test" in body else {}))
                 except HerdrEngineeringError as exc:
                     return self._json({"error": exc.message}, exc.http_status)
                 status = {"delivered": 200, "queued": 202}.get(receipt.get("status"), 502)
@@ -3911,7 +4005,7 @@ def _make_handler(server, public=False, operator=False):
                                                scope=body.get("scope", "*"),
                                                ttl_seconds=body.get("ttl_seconds"),
                                                preauthorized=bool(body.get("preauthorized", False)),
-                                               principal=self._principal())
+                                               principal=self._principal(), single_operator=server.single_operator)
                         return self._json(grant.as_dict(), 201)
                     if len(parts) == 7 and parts[5] == "permissions" and parts[6] == "revoke":
                         svc.revoke_grant(body.get("grant_id", parts[5]), tenant_id=tenant_id, user_id=user_id)
@@ -4182,6 +4276,8 @@ def _make_handler(server, public=False, operator=False):
                 if what == "stats":
                     return self._json(server.repo.llm_stats(
                         window, _q(self.path, "group") or "model", **filters))
+                if what == "spend":
+                    return self._json(server.repo.llm_spend(window, server.usage_prices, **filters))
                 if what == "timeseries":
                     return self._json(server.repo.llm_timeseries(
                         window, _q(self.path, "step") or "1h", _q(self.path, "metric") or "requests",
@@ -4796,7 +4892,10 @@ def _redact_event(event: dict) -> dict:
             payload = json.loads(payload)
         except ValueError:
             pass
-    ev["payload"] = redact_payload(payload)
+    # Count-key exceptions belong to delivery schemas, never arbitrary payloads.
+    redact = (redact_delivery if ev.get("entity_type") in
+              {"test_run", "build", "review", "review_finding", "pull_request"} else redact_payload)
+    ev["payload"] = redact(payload)
     return ev
 
 

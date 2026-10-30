@@ -29,7 +29,8 @@ PASS = frozenset({"pass", "passed", "success", "succeeded", "green"})
 FAIL = frozenset({"fail", "failed", "failure", "error", "red", "cancelled", "canceled", "timed_out", "timeout"})
 # an explicit graph principal id, "<kind>:<id>" (e.g. key:0123456789ab); no wildcard, no bare word
 _PRINCIPAL = re.compile(r"^[a-z][a-z0-9_-]{0,31}:[A-Za-z0-9_.@-][A-Za-z0-9_.:@-]{0,127}$")
-_KEYS = frozenset({"enabled", "evidence_writers", "required_checks", "require_review_quorum"})
+_KEYS = frozenset({"enabled", "evidence_writers", "required_checks", "require_review_quorum",
+                   "evidence_source"})
 
 
 @dataclass(frozen=True)
@@ -89,6 +90,8 @@ def validate_section(raw) -> GraphGateConfig | None:
         raise ValueError("graph_merge_gate.required_checks must be a non-empty list of check names")
     if not isinstance(raw.get("require_review_quorum", False), bool):
         raise ValueError("graph_merge_gate.require_review_quorum must be a boolean")
+    from .graph_evidence_writer import validate_evidence_source   # the writer's block is checked here too, enabled or not
+    validate_evidence_source(raw.get("evidence_source"))
     return config_from_section(raw)
 
 
@@ -100,7 +103,12 @@ def _status(conclusion) -> str:
 def graph_checks(graph, reader, pr_id: str, head_sha: str, writers: frozenset) -> tuple[list[CheckRun], dict]:
     """(checks bound to ``head_sha``, notes). Raises KeyError when the PR node is not visible to ``reader``."""
     head = head_sha.lower()
-    edges = graph.neighborhood(reader, pr_id, depth=1)["edges"]
+    # the configured writers' edges come from a direct, writer-filtered accessor, never from the budgeted neighbourhood
+    # read: any key may add `validated` edges into a PR, and a flood of them must not hide the writer's evidence.
+    # The neighbourhood read is kept only to count (best effort) the edges that are not trusted.
+    trusted = graph.edges_into_by_writers(reader, pr_id, "validated", writers)
+    around = graph.neighborhood(reader, pr_id, depth=1, direction="in", edge_types={"validated"})["edges"]
+    edges = trusted + [e for e in around if (e.get("provenance") or {}).get("writer") not in writers]
     best: dict[str, tuple[int, CheckRun]] = {}
     notes = {"stale": [], "untrusted": 0}
     for e in edges:

@@ -1,0 +1,16 @@
+[Unit]
+Description=Publish Pi orchestration mission records to HerdR
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/.local/share/herdr-engineering/pi-snapshot-feed/current
+ExecStart=%h/.venvs/herdr-engineering/bin/python -m herdr_engineering.cli control-plane feed-pi --snapshot %h/IdeaProjects/.pi-eng/orchestration-snapshot.json --interval 30 --allow-open
+Restart=on-failure
+RestartSec=15
+TimeoutStopSec=15
+UMask=0077
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

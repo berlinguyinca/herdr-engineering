@@ -303,6 +303,11 @@ export class HerdrClient {
     return this.request(`/api/v1/sessions/${encodeURIComponent(id)}`, { signal });
   }
 
+  // Commits and pull requests the server can attribute to this agent without guessing (state: linked | ambiguous | none).
+  getSessionCommits(id, { signal } = {}) {
+    return this.request(`/api/v1/sessions/${encodeURIComponent(id)}/commits`, { signal });
+  }
+
   getAgentSummary(id, { signal } = {}) {
     return this.request(`/api/v1/sessions/${encodeURIComponent(id)}/summary`, { signal });
   }
@@ -585,15 +590,21 @@ export class HerdrClient {
     return this.request(`/api/v1/ci/log?${query}`, { signal });
   }
 
+  // Lines of one step's live log around an indexed test; the server says plainly when the range is gone.
+  getCiLogSlice(repository, number, step, { start, end, context = 40, expect = '', signal, providerUrl } = {}) {
+    const query = new URLSearchParams({ repository, number: String(number), step: String(step), start: String(start), end: String(end), context: String(context), ...(expect ? { expect: String(expect).slice(0, 500) } : {}), ...(providerUrl!==undefined?{provider_url:providerUrl}:{}) });
+    return this.request(`/api/v1/ci/log-slice?${query}`, { signal });
+  }
+
   ciAction(repository, number, action, { signal, providerUrl } = {}) {
     return this.request('/api/v1/ci/actions', {
       method: 'POST', body: { repository, number, action, ...(providerUrl!==undefined?{provider_url:providerUrl}:{}) }, signal,
     });
   }
 
-  debugCi(repository, number, sessionId, operationId, { signal, providerUrl, mode } = {}) {
+  debugCi(repository, number, sessionId, operationId, { signal, providerUrl, mode, test } = {}) {
     return this.request('/api/v1/ci/debug', {
-      method: 'POST', body: { repository, number, session_id: sessionId, operation_id: operationId, ...(providerUrl!==undefined?{provider_url:providerUrl}:{}), ...(mode==='fix'?{mode}:{}) }, signal,
+      method: 'POST', body: { repository, number, session_id: sessionId, operation_id: operationId, ...(providerUrl!==undefined?{provider_url:providerUrl}:{}), ...(mode==='fix'||mode==='test'?{mode}:{}), ...(mode==='test'&&test?{test}:{}) }, signal,
     });
   }
 

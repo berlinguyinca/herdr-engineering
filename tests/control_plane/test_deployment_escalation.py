@@ -501,7 +501,7 @@ def test_the_github_sink_posts_to_the_rest_api():
     opener = Opener()
     sink = GitHubIssueSink(token="placeholder-token", opener=opener)
     out = sink(REPO, "title", "body", "k", timeout=5)
-    assert out == {"url": f"https://github.com/{REPO}/issues/9", "number": 9}
+    assert out == {"url": f"https://github.com/{REPO}/issues/9", "number": 9, "credential": "github_token"}
     request, timeout = opener.requests[0]
     assert request.full_url == f"https://api.github.com/repos/{REPO}/issues" and timeout == 5
     assert request.get_method() == "POST"
@@ -802,3 +802,60 @@ def test_the_server_escalates_only_a_confirmed_release(tmp_path):
         assert "repair" not in w.permit("hive-nodes")[1]
     finally:
         w.close()
+
+
+class _AppCreds:
+    def __init__(self, enabled=True, reason="write_disabled"):
+        self.enabled, self.reason, self.asked, self.invalidated = enabled, reason, [], []
+
+    def capability_token_or_raise(self, owner, capability, repositories=None):
+        from herdr_engineering.github_auth import GitHubAuthError
+        self.asked.append((owner, capability, repositories))
+        if not self.enabled:
+            raise GitHubAuthError(self.reason)
+        return "app-installation-token"
+
+    def invalidate(self, owner=None):
+        self.invalidated.append(owner)
+
+
+def test_issue_sink_prefers_the_app_escalations_capability():
+    opener = Opener()
+    creds = _AppCreds()
+    out = GitHubIssueSink(opener=opener, credentials=lambda: creds)(REPO, "t", "b", "k")
+    assert out["credential"] == "github_app"
+    assert creds.asked == [(REPO.split("/")[0], "escalations", [REPO.split("/")[1]])]
+    assert opener.requests[0][0].headers["Authorization"] == "Bearer app-installation-token"
+
+
+def test_issue_sink_falls_back_to_pat_only_when_capability_not_enabled(monkeypatch):
+    monkeypatch.setattr("herdr_engineering.host_config.host_value", lambda key: "pat-token")
+    opener = Opener()
+    GitHubIssueSink(opener=opener, credentials=lambda: _AppCreds(enabled=False))(REPO, "t", "b", "k")
+    assert opener.requests[0][0].headers["Authorization"] == "Bearer pat-token"
+
+
+def test_issue_sink_never_falls_back_to_pat_when_enabled_capability_fails(monkeypatch):
+    monkeypatch.setattr("herdr_engineering.host_config.host_value", lambda key: "pat-token")
+    opener = Opener()
+    with pytest.raises(IssueRefused):
+        GitHubIssueSink(opener=opener, credentials=lambda: _AppCreds(enabled=False, reason="backoff"))(REPO, "t", "b", "k")
+    assert not opener.requests
+
+
+def test_issue_sink_401_drops_cached_app_tokens():
+    creds = _AppCreds()
+    with pytest.raises(IssueRefused):
+        GitHubIssueSink(opener=Opener(401), credentials=lambda: creds)(REPO, "t", "b", "k")
+    assert creds.invalidated == [REPO.split("/")[0]]
+
+
+def test_issue_sink_does_not_fall_back_to_pat_when_github_app_is_invalid(monkeypatch):
+    from herdr_engineering.github_auth import NoCredentials
+    monkeypatch.setattr("herdr_engineering.host_config.host_value", lambda key: "pat-token")
+    opener = Opener()
+    with pytest.raises(IssueRefused):
+        GitHubIssueSink(opener=opener, credentials=lambda: NoCredentials("invalid_config"))(REPO, "t", "b", "k")
+    assert not opener.requests
+    GitHubIssueSink(opener=opener, credentials=lambda: NoCredentials("not_configured"))(REPO, "t", "b", "k")
+    assert opener.requests[0][0].headers["Authorization"] == "Bearer pat-token"

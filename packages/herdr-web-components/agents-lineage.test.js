@@ -40,3 +40,27 @@ test('an agent story names how it started, its handoffs, and its last report', (
   assert.match(t.steps[1].text, /Handed off \(queued\) to reviewer: review/);
   assert.equal(t.hasHandoff, true);
 });
+
+import { renderStory } from '../agents-lineage.js';
+
+test('the story lists the commits the server linked, or says plainly that none is recorded', () => {
+  const s = { session_id: 'a', created_at: '2026-10-28T10:00:00Z', updated_at: '2026-10-28T11:00:00Z' };
+  const linked = agentStory(s, {}, Date.now(), { state: 'linked', commits: [
+    { sha: 'abcdef1234567', run_number: 9, state: 'success', pull_request: 42, at: '2026-10-28T10:30:00Z', ci_url: 'https://ci.example/r/9' },
+    { sha: 'f'.repeat(40), run_number: 8, state: 'failure', match: 'commit', at: '2026-10-28T10:20:00Z', ci_url: 'javascript:alert(1)' }] });
+  assert.deepEqual(linked.steps.map(x => x.kind), ['start', 'commit', 'commit', 'now']);
+  assert.match(linked.steps[1].text, /Commit fffffff · CI run #8 failure \(the commit the agent reported\)/);
+  assert.match(linked.steps[2].text, /Commit abcdef1 · PR #42 · CI run #9 success/);
+  const html = renderStory(linked);
+  assert.match(html, /<a href="https:\/\/ci\.example\/r\/9"/);
+  assert.doesNotMatch(html, /javascript:/);
+  for (const state of ['none', 'ambiguous']) {
+    const out = agentStory(s, {}, Date.now(), { state, commits: [], reason: 'main is a shared branch <b>' });
+    const note = out.steps.find(x => x.kind === 'unlinked');
+    assert.match(note.text, /^No commit link recorded: main is a shared branch/);
+    assert.doesNotMatch(renderStory(out), /<b>/);
+  }
+  const prOnly = agentStory(s, {}, Date.now(), { state: 'linked', commits: [], pull_requests: [{ number: 7, status: 'open', url: 'https://github.com/o/r/pull/7', at: '2026-10-28T10:40:00Z' }] });
+  assert.deepEqual(prOnly.steps.map(x => x.text).slice(1, 2), ['PR #7 open']);
+  assert.deepEqual(agentStory(s, {}, Date.now(), null).steps.map(x => x.kind), ['start', 'now']);
+});

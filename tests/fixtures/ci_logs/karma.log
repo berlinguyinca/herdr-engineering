@@ -1,0 +1,12 @@
+Chrome Headless 156.0.0.0 (Linux 0.0.0): Executed 29 of 30 SUCCESS (0 secs / 0.682 secs)
+[1A[2KDEBUG: 'specie: Mouse - organ: undefined - matrix: mouse noorgan - clean: mouse_noorgan'
+Chrome Headless 156.0.0.0 (Linux 0.0.0): Executed 29 of 30 SUCCESS (0 secs / 0.682 secs)
+[1A[2KDEBUG: 'specie: undefined - organ: undefined - matrix: nospecies noorgan - clean: nospecies_noorgan'
+Chrome Headless 156.0.0.0 (Linux 0.0.0): Executed 29 of 30 SUCCESS (0 secs / 0.682 secs)
+[1A[2KDEBUG: 'specie: null - organ: null - matrix: nospecies noorgan - clean: nospecies_noorgan'
+Chrome Headless 156.0.0.0 (Linux 0.0.0): Executed 29 of 30 SUCCESS (0 secs / 0.682 secs)
+[1A[2KChrome Headless 156.0.0.0 (Linux 0.0.0): Executed 30 of 30 SUCCESS (0 secs / 0.683 secs)
+[1A[2KChrome Headless 156.0.0.0 (Linux 0.0.0): Executed 30 of 30 SUCCESS (0.72 secs / 0.683 secs)
+TOTAL: 30 SUCCESS
+✔ Browser application bundle generation complete.
+Backend validation dataset=upstream-canonical backend=3a65c3015d942da133c7e451dd5cc4532b334b07

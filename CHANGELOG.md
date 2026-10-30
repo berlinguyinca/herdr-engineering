@@ -13,6 +13,11 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 - `POST /artifacts/reconcile` (operator): re-emits lineage for versions committed but never linked, marks (never deletes) orphaned blobs, expires stale upload sessions, runs due purges. Rollback: deploy the previous control-plane image first (commit_version writes the new columns), then apply the DOWN block; the migration is additive, so leaving it applied under old code is harmless.
 - Design: `docs/specs/herdr-unified-workspace-20261028/design/ARTIFACT_INTEGRATION.md`.
 
+### CI test counts from logs, with no project setup
+- The control plane reads the step logs of recently finished Woodpecker runs and keeps what the test runners printed (pytest, `node --test`/TAP, cargo, `go test -v`, jest/vitest, ScalaTest, surefire, gradle, Karma, `unittest`): counts, runner names and, where the runner prints one line per test, an index of names, statuses and log line ranges. No log text is stored, a JUnit upload for the same run always wins, and no environment variables or pipeline changes are needed. `control_plane.ci_log_tests` (YAML: `enabled`, `runs_per_cycle`, `max_log_mib`, `window_days`) tunes it.
+- `GET /api/v1/ci/log-slice` returns the redacted live log lines around an indexed test, or says why it cannot.
+- The CI Tests tab bars use these counts and say where they come from; selecting a repository lists its tests (search, filter, sort) and opens a log excerpt with ways to keep investigating.
+
 ### Unified workspace P01: contracts, ids and the capability/action broker (library only, flag off)
 - New `schemas/workspace-v1.schema.json` (JSON Schema 2020-12) for project, team, room, mission, issue, task, agent, agent_session, host, artifact, artifact_version, review, decision, external_action, event and the 14 typed edges, with canonical ids `urn:herdr:<kind>:<uuid>` (uuid5 over the native id, so every host agrees), aliases, scope, version/ETag, trace/correlation/causation ids and reference URIs. Contract table and graph.py mapping: `docs/contracts/unified-workspace-v1.md`.
 - New `herdr_engineering/control_plane/workspace_contracts.py`: id/alias canonicalisation, validators, ETag compare-and-swap, idempotency tokens, a discover/authorize/approve/invoke broker (user role, agent delegation, room grant, artifact grant, account grant and risk policy are intersected; room membership never grants shell or external-account access), untrusted-content tainting, ACL re-check hooks for traversal, search, export and subscriptions, and the replay-cursor contract.
@@ -25,6 +30,23 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 - `control_plane.inspector_snapshots.enabled` lets the worker keep a replay snapshot of the inspector in the new `inspector_snapshots` table (migration 0030) so a boot replays only newer events instead of ~780k (about nine minutes). Off by default; any doubt makes the boot replay everything. See `deploy/control-plane/README.md`.
 - With a verified snapshot the boot also skips loading the inspector rows it covers (SQL filter on the watermark; the repo fetches them back if it refuses the snapshot).
 - Deploy health window 30 minutes (#373) and boot phase timings in the log; host-metrics rollups replay in linear time (#379).
+
+### Control plane: service-observation compaction (opt-in, dry run by default)
+- `control_plane.fabric_compaction` (YAML; `enabled: false`, `dry_run: true`, `interval_seconds`, `min_age_days`, `batch_rows`, `archive_retention_days`, `rebuild_checkpoint`) lets the worker move interior service observation rows out of `fabric_events` into the new `fabric_events_archive` table (migration 0035), one atomic statement per batch. Rule checked on the production journal: 1,762,189 service rows -> 349,664 with all 6,544 reconstructed services identical. Rows with a v2 envelope and rows younger than `min_age_days` are never touched. After a drain the job rebuilds the recovery checkpoint; the archive is purged after `archive_retention_days`. See docs/operations/recovery-checkpoints.md.
+
+### Deployment escalation issues can use the GitHub App (`escalations` capability)
+- With `github.app.write: [escalations]` (App permission Issues: write) escalation issues are created with a repo-scoped App token. Without it the server-held `github.token` is used as before; an enabled capability or an invalid `github.app` block that cannot mint a token fails closed and never falls back to the PAT.
+
+### GitHub App: write capabilities and the review gate on the shared App (opt-in)
+- `github.app.write: [review_gate, escalations]` (YAML, default none) enables fixed, repo-scoped write permission sets on the shared GitHub App; unlisted capabilities are refused before any call to GitHub, reads stay read-only, and a grant wider than the request is refused.
+- `review_gate.app: shared` makes the review gate use that App instead of its own JWT/installation-token code: reads get a read-only token, statuses/merge/update-branch the `review_gate` capability. The old per-gate `app:` block still works.
+
+### Project intelligence: shared-credential PR poller and single-operator mode (opt-in)
+- The outbound PR poller now works without the review gate: it reads open PRs through `github_auth.credentials()` (the GitHub App, `pull_requests: read` only, repo-scoped tokens). `github_auth` allows `pull_requests` at `read`; nothing writable. `/api/v1/intelligence/status` gains `poller` (counters and a fixed `last_error`).
+- `control_plane.single_operator: true` (YAML, default false; refused with `api_keys`) lets the open listener's caller preauthorize assistant tools and approve proposals, including their own. See the project-intelligence runbook for the residual risk.
+
+### Control plane: recovery checkpoint pruning
+- After the compaction job rebuilds the recovery checkpoint it deletes all but the newest `control_plane.fabric_compaction.keep_checkpoints` generations (default 2; the active one is always kept) under the builder's lock, so generations no longer pile up. `recovery_checkpoint.prune_checkpoints()` is the same operation for manual use.
 
 ### Dashboard: on-demand full `/summary` report
 - **Generate full report** on the agent page runs the `summary` skill on the session's recorded conversation and shows the result in the summary card; in the fullscreen workspace it gets its own column so the conversation and composer fit the viewport without page scrolling (the fullscreen panes were previously sized to the whole viewport and cut off the composer). Off by default: `summary_report.enabled` in the central YAML.

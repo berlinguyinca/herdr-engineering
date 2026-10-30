@@ -101,15 +101,7 @@
 /* ---- buttons and inputs ---- */
 /* the page itself and the dashboard-embedded view; never the rest of the dashboard */
 .cx-page button, .cx-embed button { font-family: var(--font-sans); font-size: .875rem; }
-.hd-btn { background: var(--accent); color: var(--text-on-accent); border: 1px solid transparent; padding: 8px 14px;
-  border-radius: var(--radius-sm); font-weight: 500; cursor: pointer; }
-.hd-btn:hover { background: var(--accent-hover); }
-.hd-btn--ghost { background: transparent; color: var(--text-secondary); border-color: var(--border); }
-.hd-btn--ghost:hover { background: var(--surface-hover); color: var(--text); }
-.hd-btn--danger { background: transparent; color: var(--status-failed); border-color: var(--border); }
-.hd-btn--danger:hover { background: var(--surface-hover); }
-.hd-btn--sm { padding: 4px 10px; font-size: .8125rem; }
-.hd-btn[disabled] { opacity: .55; cursor: default; }
+/* .hd-btn and its variants live in herdr-design-system/base.css */
 .cx-input, .cx-page input, .cx-embed input, .cx-page select, .cx-embed select { font: inherit; padding: 8px 10px; background: var(--surface);
   color: var(--text); border: 1px solid var(--border); border-radius: var(--radius-sm); min-width: 0; }
 .cx-field { display: flex; flex-direction: column; gap: 4px; font-size: .8125rem; color: var(--text-secondary); flex: 1 1 200px; }
@@ -157,12 +149,8 @@
 .cx-rtab--new { color: var(--accent); }
 .cx-roomhead { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 10px; }
 .cx-roomhead h1 { margin: 0; font-size: 1.35rem; }
-.cx-stabs { display: flex; gap: 4px; margin-bottom: 14px; flex-wrap: wrap; }
-.cx-stab { display: inline-flex; align-items: center; gap: 6px; border: 1px solid transparent; background: transparent; color: var(--text-secondary);
-  padding: 6px 14px; border-radius: 999px; cursor: pointer; }
-.cx-stab:hover { background: var(--surface-hover); color: var(--text); }
-.cx-stab[aria-selected=true] { background: var(--accent-weak); color: var(--accent); font-weight: 600; }
-.cx-badge { min-width: 18px; padding: 0 6px; border-radius: 999px; background: var(--accent); color: var(--text-on-accent);
+.cx-stabs { margin-bottom: 14px; }
+.cx-badge { display: inline-block; margin-left: 6px; vertical-align: middle; min-width: 18px; padding: 0 6px; border-radius: 999px; background: var(--accent); color: var(--text-on-accent);
   font-size: .6875rem; font-weight: 700; line-height: 18px; text-align: center; }
 .cx-badge[hidden], .cx-panel[hidden] { display: none; }
 .cx-cols { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 14px; align-items: start; }
@@ -259,11 +247,6 @@ textarea.cx-input { resize: vertical; font: inherit; }
 .cx-guide table { border-collapse: collapse; width: 100%; font-size: .9rem; }
 .cx-guide th, .cx-guide td { text-align: left; vertical-align: top; padding: 6px 10px; border-bottom: 1px solid var(--border, #d0d4da); }
 
-/* ---- dashboard-embedded view: the host page styles bare buttons green, so say what these are */
-.cx-embed .hd-btn--danger { background: transparent; color: var(--status-failed, #c0392b); border: 1px solid var(--border); }
-.cx-embed .hd-btn--danger:hover { background: var(--surface-hover); }
-.cx-embed .hd-btn--ghost { background: transparent; color: var(--text-secondary); border: 1px solid var(--border); }
-.cx-embed .hd-btn--ghost:hover { background: var(--surface-hover); color: var(--text); }
 #hcn-roomagents, #hcn-grant, #hcn-requests, #hcn-tasks { max-height: 560px; overflow-y: auto; }
 
 /* People: who asked to join, and what the operator did about it */
@@ -493,7 +476,7 @@ button.ctx-chip:focus-visible, .ctx-chip:focus-visible { outline: 2px solid curr
 .lin-filterbox[open] > summary::before, .lin-legend[open] > summary::before { content: '▾'; }
 
 /* Supporting room views sit after the four that carry the work, set quieter and divided from them. */
-.cx-stab--minor { font-size: .8125rem; padding-inline: 8px; }
-.cx-stab:not(.cx-stab--minor) + .cx-stab--minor { margin-left: 8px; border-left-color: var(--border); border-radius: 0 var(--radius-sm) var(--radius-sm) 0; }
+.cx-stabs .cx-stab--minor { font-size: 12px; }
+.cx-stab:not(.cx-stab--minor) + .cx-stab--minor { margin-left: 8px; }
 .cx-newroom > summary { cursor: pointer; font-weight: 600; font-size: 1rem; margin-bottom: 8px; }
 .cx-helpers-idle h2 { margin-bottom: 2px; }

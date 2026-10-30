@@ -5,7 +5,8 @@ import {safeServiceUrl} from './services-view.js';
 import {recordOutcome} from './record-state.js';
 import {ciRunKey} from './ci-performance.js';
 import {ciChartModel,renderCiCharts,ciChartStyles} from './ci-charts.js';
-import {ciInsightsModel,renderCiInsights,ciInsightStyles,renderCiRunReports} from './ci-insights.js';
+import {ciInsightsModel,renderCiInsights,ciInsightStyles,renderCiRunReports,ciExplorerTargets} from './ci-insights.js';
+import {renderTestExplorer,testExplorerStyles,explorerTests,testSource} from './ci-test-explorer.js';
 import {renderCiPipeline,renderCiDiagnosis,ciPipelineStyles,pipelineZoom,sameCiRepository,ciComparisonModel,renderCiComparison} from './ci-pipeline.js';
 import {mountCiObservability,ciProjectKey} from './ci-observability-view.js';
 import {ciRunInScope,ciRunInWindow,ciSelectRunWindow} from './ci-health.js';
@@ -24,6 +25,7 @@ const records = value => Array.isArray(value) ? value.filter(v=>v && typeof v===
 const short = (value, max=180) => text(value).replace(/\s+/g,' ').trim().slice(0,max);
 const stateOf = record => text(record.state || record.status || record.decision).toLowerCase().replaceAll('-','_');
 const human = value => text(value).replaceAll('_',' ');
+const WORKSPACES=['overview','health','runs','tests'];
 export function integrationTimestamp(value) {
   if (typeof value==='number') return value > 0 ? (value < 1e12 ? value*1000 : value) : 0;
   return value ? Date.parse(value) || 0 : 0;
@@ -154,17 +156,17 @@ function filterLink(repository,mission,session) {
 }
 
 const styles=`<style>
-.ig-intro,.ig-note{color:var(--text-secondary);font-size:12px;line-height:1.6}.ig-intro{font-size:13px;max-width:85ch}.ig-note{margin:7px 0}.ig-warning{color:var(--status-attention);font-size:13px;line-height:1.6;overflow-wrap:anywhere}.ig-tabs{display:flex;flex-wrap:wrap;gap:8px;margin:20px 0}.ig-tabs button{font:inherit;padding:10px 16px;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);color:var(--text);cursor:pointer}.ig-tabs button[aria-selected=true]{border-color:var(--accent);box-shadow:inset 0 -2px var(--accent)}.ig-tabs strong{margin-left:6px}.ig-controls{display:flex;flex-wrap:wrap;gap:12px;margin:18px 0}.ig-controls label{display:flex;flex-direction:column;gap:6px;font-size:13px}.ig-controls label:first-child{flex:1;min-width:160px}.ig-controls input,.ig-controls select{padding:9px;border:1px solid var(--border);border-radius:var(--radius-sm);font:inherit;color:var(--text);background:var(--surface);max-width:100%}.ig-layout{display:grid;grid-template-columns:minmax(0,1fr);gap:18px}.ig-layout:has(.ig-inspector:not([hidden])){grid-template-columns:minmax(0,1fr)}.ig-inspector{grid-row:1}.ig-group,.ig-inspector{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);min-width:0;overflow-wrap:anywhere}.ig-group{margin-bottom:12px}.ig-group h2{font-size:14px;margin:0;padding:12px 16px}.ig-row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:14px;padding:14px 16px;border-top:1px solid var(--border-subtle);overflow-wrap:anywhere}.ig-main{min-width:0}.ig-title{font-size:14px;font-weight:600;line-height:1.5;text-align:left}.ig-title:is(button){border:0;padding:0;background:none;color:var(--accent);cursor:pointer;font-family:inherit}.ig-title:is(button):hover{text-decoration:underline}.ig-state{display:flex;flex-direction:column;gap:5px;font-size:12px;line-height:1.5;max-width:170px}.ig-state strong{font-weight:500}.ig-state span{color:var(--text-secondary)}.ig-links{display:flex;flex-wrap:wrap;gap:12px;font-size:12px;align-items:center}.ig-debug{font-size:12px;margin:16px 0}.ig-debug summary{cursor:pointer;font-weight:600}.ig-debug select{display:block;padding:8px;max-width:100%;width:100%;margin:6px 0 10px;color:var(--text);background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-sm)}.ig-debug button:disabled{opacity:.45;cursor:default}.ig-review-details{margin-top:12px;font-size:12px}.ig-review-details summary{cursor:pointer}.ig-review-feedback{white-space:pre-wrap;overflow-wrap:anywhere}.ig-summary{font-size:12px;line-height:1.6;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}.ig-pages,.ig-heading{display:flex;align-items:center;justify-content:space-between;gap:12px}.ig-pages[hidden]{display:none}.ig-pages button:disabled{opacity:.45;cursor:default}.ig-pages{justify-content:flex-start;font-size:12px;margin:18px 0}.ig-inspector{padding:16px;align-self:start}.ig-heading h2{font-size:17px;margin:0}.ig-inspector h3{font-size:14px}.ig-sync{display:flex;flex-direction:column;gap:5px;font-size:12px}.ig-sync progress,.ig-inspector progress{width:100%;height:6px;accent-color:var(--accent)}.ig-steps{display:flex;flex-direction:column;margin:12px 0}.ig-steps button{font:inherit;display:flex;justify-content:space-between;gap:12px;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:10px;cursor:pointer;font-size:12px;overflow-wrap:anywhere}.ig-steps button[aria-pressed=true]{border-color:var(--accent)}.ig-steps small{display:block;color:var(--text-secondary);margin-top:4px}.ig-log{max-height:400px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;font-size:12px;line-height:1.6;background:var(--bg);border:1px solid var(--border-subtle);border-radius:var(--radius-sm);padding:12px}.ig-runners{margin:16px 0;color:var(--text-secondary);font-size:12px}.ig-runners summary{cursor:pointer}.ig-empty{padding:22px;color:var(--text-secondary);font-size:13px}
-.ig-controls[hidden]{display:none}.ci-workspace-tabs{position:sticky;top:0;z-index:5;background:var(--bg);padding:6px 0}.ci-workspace-tabs~[role=tabpanel][hidden]{display:none}.ci-pipeline-controls{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin:12px 0}.ci-pipeline-success summary{cursor:pointer;font-size:12px;padding:10px 0}.ci-comparison{margin:18px 0;min-width:0}.ci-comparison-scroll{overflow:auto;max-height:320px}.ci-comparison table{width:100%;border-collapse:collapse;font-size:12px}.ci-comparison th,.ci-comparison td{padding:8px;border-bottom:1px solid var(--border);text-align:left;min-width:90px;overflow-wrap:anywhere}.ci-comparison thead th{position:sticky;top:0;background:var(--surface)}.ig-active-pipeline,.ig-comparison-panel{min-width:0}.ci-compare-control{display:flex;flex-direction:column;gap:8px;font-size:12px;margin:16px 0}.ci-compare-control select{max-width:100%;padding:8px;background:var(--surface);color:var(--text);border:1px solid var(--border)}.ig-back-label{display:none}
-@media(min-width:1250px){.ig-inspector:has(.ci-comparison){display:grid;grid-template-columns:minmax(0,1fr) minmax(260px,.45fr);gap:18px}.ig-layout:has(.ig-inspector:not([hidden])){grid-template-columns:minmax(280px,.3fr) minmax(0,1fr);align-items:start}.ig-layout>.ig-inspector{grid-row:auto;grid-column:2;position:sticky;top:65px;max-height:calc(100dvh - 100px);overflow:auto}.ig-layout:has(.ig-inspector:not([hidden]))>#ig-results{max-height:calc(100dvh - 100px);overflow:auto;position:sticky;top:65px}.ci-health-pipeline-slot>.ig-inspector{position:sticky;top:65px;max-height:calc(100dvh - 100px);overflow:auto}.ci-health-lower{align-items:start}.ci-health-lower>.ci-health-tree{position:sticky;top:65px;max-height:calc(100dvh - 100px);overflow:auto}}
-@media(max-width:700px){[data-ci-focused=true] #ci-workspace-runs #ig-results,[data-ci-focused=true] #ci-workspace-runs>.ig-tabs,[data-ci-focused=true] #ci-workspace-runs>.ig-controls,[data-ci-focused=true] #ci-workspace-runs>.ig-pages,[data-ci-focused=true] [data-health-tree],[data-ci-focused=true] [data-health-map],[data-ci-focused=true] .ci-health-controls,[data-ci-focused=true] .ci-health-layout,[data-ci-focused=true] .ci-health-status,[data-ci-focused=true] .ci-health-selection{display:none}.ig-inspector .ig-heading{position:sticky;top:0;background:var(--surface);z-index:4;padding:8px 0}.ig-back-label{display:inline}.ig-close-label{display:none}.ci-pipeline-controls button{min-height:44px}}
-@media(max-width:900px){.ig-layout:has(.ig-inspector:not([hidden])){grid-template-columns:minmax(0,1fr)}.ig-inspector{grid-row:1}}@media(max-width:550px){.ig-row{grid-template-columns:minmax(0,1fr);gap:8px}.ig-state{max-width:none}.ig-tabs button{padding:9px 12px}}
+.ig-intro,.ig-note{color:var(--text-secondary);font-size:12px;line-height:1.6}.ig-intro{font-size:13px;max-width:85ch}.ig-note{margin:7px 0}.ig-warning{color:var(--status-attention);font-size:13px;line-height:1.6;overflow-wrap:anywhere}.ig-tabs{margin:20px 0}.ig-tabs strong{margin-left:2px}.ig-controls{display:flex;flex-wrap:wrap;gap:12px;margin:18px 0}.ig-controls label{display:flex;flex-direction:column;gap:6px;font-size:13px}.ig-controls label:first-child{flex:1;min-width:160px}.ig-controls input,.ig-controls select{padding:9px;border:1px solid var(--border);border-radius:var(--radius-sm);font:inherit;color:var(--text);background:var(--surface);max-width:100%}.ig-layout{display:grid;grid-template-columns:minmax(0,1fr);gap:18px}.ig-layout:has(.ig-inspector:not([hidden])){grid-template-columns:minmax(0,1fr)}.ig-inspector{grid-row:1}.ig-group,.ig-inspector{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);min-width:0;overflow-wrap:anywhere}.ig-group{margin-bottom:12px}.ig-group h2{font-size:14px;margin:0;padding:12px 16px}.ig-row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:14px;padding:14px 16px;border-top:1px solid var(--border-subtle);overflow-wrap:anywhere}.ig-main{min-width:0}.ig-title{font-size:14px;font-weight:600;line-height:1.5;text-align:left}.ig-title:is(button){border:0;padding:0;background:none;color:var(--accent);cursor:pointer;font-family:inherit}.ig-title:is(button):hover{text-decoration:underline}.ig-state{display:flex;flex-direction:column;gap:5px;font-size:12px;line-height:1.5;max-width:170px}.ig-state strong{font-weight:500}.ig-state span{color:var(--text-secondary)}.ig-links{display:flex;flex-wrap:wrap;gap:12px;font-size:12px;align-items:center}.ig-debug{font-size:12px;margin:16px 0}.ig-debug summary{cursor:pointer;font-weight:600}.ig-debug select{display:block;padding:8px;max-width:100%;width:100%;margin:6px 0 10px;color:var(--text);background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-sm)}.ig-debug button:disabled{opacity:.45;cursor:default}.ig-review-details{margin-top:12px;font-size:12px}.ig-review-details summary{cursor:pointer}.ig-review-feedback{white-space:pre-wrap;overflow-wrap:anywhere}.ig-summary{font-size:12px;line-height:1.6;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}.ig-pages,.ig-heading{display:flex;align-items:center;justify-content:space-between;gap:12px}.ig-pages[hidden]{display:none}.ig-pages button:disabled{opacity:.45;cursor:default}.ig-pages{justify-content:flex-start;font-size:12px;margin:18px 0}.ig-inspector{padding:16px;align-self:start}.ig-heading h2{font-size:17px;margin:0}.ig-inspector h3{font-size:14px}.ig-sync{display:flex;flex-direction:column;gap:5px;font-size:12px}.ig-sync progress,.ig-inspector progress{width:100%;height:6px;accent-color:var(--accent)}.ig-steps{display:flex;flex-direction:column;margin:12px 0}.ig-steps button{font:inherit;display:flex;justify-content:space-between;gap:12px;text-align:left;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:10px;cursor:pointer;font-size:12px;overflow-wrap:anywhere}.ig-steps button[aria-pressed=true]{border-color:var(--accent)}.ig-steps small{display:block;color:var(--text-secondary);margin-top:4px}.ig-log{max-height:400px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;font-size:12px;line-height:1.6;background:var(--bg);border:1px solid var(--border-subtle);border-radius:var(--radius-sm);padding:12px}.ig-runners{margin:16px 0;color:var(--text-secondary);font-size:12px}.ig-runners summary{cursor:pointer}.ig-empty{padding:22px;color:var(--text-secondary);font-size:13px}
+.ig-controls[hidden]{display:none}.ci-tab-badge{padding:0 8px;font-size:11px;font-weight:500;border:1px solid var(--border);border-radius:99px;color:var(--text-secondary)}.ci-workspace-tabs{position:sticky;top:0;z-index:5;background:var(--bg);padding:6px 0}.ci-workspace-tabs~[role=tabpanel][hidden]{display:none}.ci-pipeline-controls{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin:12px 0}.ci-pipeline-success summary{cursor:pointer;font-size:12px;padding:10px 0}.ci-comparison{margin:18px 0;min-width:0}.ci-comparison-scroll{overflow:auto;max-height:320px}.ci-comparison table{width:100%;border-collapse:collapse;font-size:12px}.ci-comparison th,.ci-comparison td{padding:8px;border-bottom:1px solid var(--border);text-align:left;min-width:90px;overflow-wrap:anywhere}.ci-comparison thead th{position:sticky;top:0;background:var(--surface)}.ig-active-pipeline,.ig-comparison-panel{min-width:0}.ci-compare-control{display:flex;flex-direction:column;gap:8px;font-size:12px;margin:16px 0}.ci-compare-control select{max-width:100%;padding:8px;background:var(--surface);color:var(--text);border:1px solid var(--border)}.ig-back-label{display:none}
+@media(min-width:1250px){.ig-inspector:has(.ci-comparison){display:grid;grid-template-columns:minmax(0,1fr) minmax(260px,.45fr);gap:18px}.ig-layout:has(.ig-inspector:not([hidden])){grid-template-columns:minmax(280px,.3fr) minmax(0,1fr);align-items:start}.ig-layout>.ig-inspector{grid-row:auto;grid-column:2;position:sticky;top:65px;max-height:calc(100dvh - 100px);overflow:auto}.ig-layout:has(.ig-inspector:not([hidden]))>#ig-results{max-height:calc(100dvh - 100px);overflow:auto;position:sticky;top:65px}.ci-health-pipeline-slot>.ig-inspector{position:sticky;top:65px;max-height:calc(100dvh - 100px);overflow:auto}.ci-health-lower{align-items:start}.ci-health-lower>.ci-health-detail{position:sticky;top:65px;max-height:calc(100dvh - 100px);overflow:auto}}
+@media(max-width:700px){[data-ci-focused=true] #ci-workspace-runs #ig-results,[data-ci-focused=true] #ci-workspace-runs>.ig-tabs,[data-ci-focused=true] #ci-workspace-runs>.ig-controls,[data-ci-focused=true] #ci-workspace-runs>.ig-pages,[data-ci-focused=true] [data-health-detail],[data-ci-focused=true] [data-health-map],[data-ci-focused=true] .ci-health-controls,[data-ci-focused=true] .ci-health-status,[data-ci-focused=true] .ci-health-selection{display:none}.ig-inspector .ig-heading{position:sticky;top:0;background:var(--surface);z-index:4;padding:8px 0}.ig-back-label{display:inline}.ig-close-label{display:none}.ci-pipeline-controls button{min-height:44px}}
+@media(max-width:900px){.ig-layout:has(.ig-inspector:not([hidden])){grid-template-columns:minmax(0,1fr)}.ig-inspector{grid-row:1}}@media(max-width:550px){.ig-row{grid-template-columns:minmax(0,1fr);gap:8px}.ig-state{max-width:none}}
 </style>`;
 const commandCenterStyles=`<style>
-.ci-workspace-tabs{margin:8px 0 20px;padding:5px;background:var(--surface);border:1px solid var(--border);border-radius:12px;box-shadow:var(--shadow-sm,0 2px 8px #0001)}.ci-workspace-tabs button{border:0!important;border-radius:8px!important;font-weight:650}.ci-workspace-tabs button[aria-selected=true]{background:var(--accent);color:var(--text-on-accent);box-shadow:0 2px 8px color-mix(in srgb,var(--accent) 30%,transparent)}.ig-group,.ig-inspector{box-shadow:var(--shadow-sm,0 2px 8px #0001)}.ig-inspector{border-top:3px solid var(--accent)}.ci-slot-detail{animation:ci-slot-in .18s ease-out}@keyframes ci-slot-in{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
+.ci-workspace-tabs{margin:8px 0 20px}.ig-group,.ig-inspector{box-shadow:var(--shadow)}.ig-inspector{border-top:3px solid var(--accent)}.ci-slot-detail{animation:ci-slot-in .18s ease-out}@keyframes ci-slot-in{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
 </style>`;
 
-export function mountIntegrations(container,client,{kind='ci',tab='current',search='',repository='',provider='',mission='',session=''}={}) {
+export function mountIntegrations(container,client,{kind='ci',tab='current',search='',repository='',provider='',mission='',session='',workspace:startWorkspace=''}={}) {
   const isCi=kind==='ci';
   const tabs=isCi ? [['current','Current'],['failed','Failed'],['finished','Finished']] : [['current','Current'],['changes','Changes requested'],['failed','Failed'],['finished','Finished']];
   const state={tab:tabs.some(([key])=>key===tab)?tab:'current',search,repository,provider,mission,session,page:0,group:'project',branch:'',days:isCi?14:0};
@@ -172,9 +174,11 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
   let timer=null,clock=null,signature='',detailSignature='',chartSignature='';
   let selectedReports=null,selectedReportsError='';
   let reportData=null,reportsError='',insightsSignature='',failurePage=0,testPage=0,testSearch='';
+  // The per-test explorer of the repository chosen in the overview: its latest reports, filters, the selected test and its excerpt.
+  let cx={repo:'',label:'',signature:'',reports:null,error:'',search:'',status:'all',sort:'failures',selected:'',slice:null,sliceError:'',history:null,historyError:'',sessions:null,sessionId:'',sending:false,sendMessage:'',ops:{},sent:{}};
   let debugSessions=null,debugSessionId='',debugMessage='',debugOperationId='',fixOperationId='';
   let fixAvailable=true,fix=null,fixMessage='',sandboxOperationId='',fixTerminal=null,fixTerminalError='';
-  let healthView=null,observabilityView=null,workspace=tab==='current'?'health':'runs',collapseSuccess=false,zoom=1,comparisonKey='',listScroll=0,healthOriginKey='';
+  let healthView=null,observabilityView=null,workspace=WORKSPACES.includes(startWorkspace)?startWorkspace:tab==='current'?'overview':'runs',collapseSuccess=false,zoom=1,comparisonKey='',listScroll=0,healthOriginKey='';
   const observedDetails=new Map(),repositoryChoices=new Map();
   let performanceData=null,performanceError='',performanceDays=14;
   const pending=new Map();
@@ -182,10 +186,10 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
   const reviewCache=new Map();
   const title=isCi?'CI':'Reviews';
   const chip=freshnessSources(()=>container.querySelector('herdr-freshness'));
-  container.innerHTML=`${styles}${isCi?ciChartStyles+ciInsightStyles+ciPipelineStyles+commandCenterStyles+'<style>'+ciFixStyles+'</style>':''}<div class="hd-live-head"><h1>${title}</h1><herdr-freshness interval="5000"></herdr-freshness></div><p class="ig-intro"${isCi?' hidden':''}>${isCi?'Follow builds from queue to finished steps. Inspect output and open the original run in Woodpecker.':'Review plans and code in Plannotator, with decisions linked to the mission and revision they belong to.'}</p>
+  container.innerHTML=`${styles}${isCi?ciChartStyles+ciInsightStyles+testExplorerStyles+ciPipelineStyles+commandCenterStyles+'<style>'+ciFixStyles+'</style>':''}<div class="hd-live-head"><h1>${title}</h1><herdr-freshness interval="5000"></herdr-freshness></div><p class="ig-intro"${isCi?' hidden':''}>${isCi?'Follow builds from queue to finished steps. Inspect output and open the original run in Woodpecker.':'Review plans and code in Plannotator, with decisions linked to the mission and revision they belong to.'}</p>
     <div data-ig-health role="status"></div><p data-ig-error class="ig-warning" role="status"></p>
     ${isCi?'<div data-ci-attention></div><div data-ci-observability></div><div data-ci-health></div>':''}
-    <div class="ig-tabs" role="tablist" aria-label="${title} outcome">${tabs.map(([key,label])=>`<button type="button" role="tab" id="ig-tab-${key}" data-tab="${key}" aria-controls="ig-results" aria-selected="${state.tab===key}" tabindex="${state.tab===key?0:-1}">${label} <strong data-count="${key}">…</strong></button>`).join('')}</div>
+    <div class="ig-tabs hd-tabs" role="tablist" aria-label="${title} outcome">${tabs.map(([key,label])=>`<button type="button" role="tab" id="ig-tab-${key}" data-tab="${key}" aria-controls="ig-results" aria-selected="${state.tab===key}" tabindex="${state.tab===key?0:-1}">${label} <strong data-count="${key}">…</strong></button>`).join('')}</div>
     <div class="ig-controls"><label>Search ${isCi?'runs':'reviews'}<input data-ig-search type="search" value="${esc(search)}" placeholder="Project, repository, branch or revision"></label><label>Group by<select data-ig-group><option value="project">Project / repository</option><option value="none">Most recent</option></select></label></div>
     ${isCi ? '<div class="ig-controls ci-report-filters"><label>Repository<select data-ci-repository><option value="">All repositories</option></select></label><label>Branch<select data-ci-branch><option value="">All branches</option></select></label><label>Period<select data-ci-period><option value="7">Last 7 days</option><option value="14" selected>Last 14 days</option><option value="30">Last 30 days</option></select></label></div><div data-ci-insights></div>' : ''}
     ${repository || mission || session ? `<p class="ig-note">Filtered to ${filterLink(repository,mission,session)} · <a href="#/${kind}">Clear context</a></p>` : ''}
@@ -194,7 +198,7 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
     <div class="ig-pages"><button type="button" class="hd-btn" data-page="previous">Previous</button><span data-ig-page></span><button type="button" class="hd-btn" data-page="next">Next</button></div><div data-ig-runners></div>${!isCi ? '<details class="ig-runners"><summary>Start a review</summary><p>Start Plannotator from the project workspace with <code>herdr-plannotator --help</code>. Its review link and upstream decision appear here when the launcher is connected to this control plane.</p></details>' : ''}`;
   const el=selector=>container.querySelector(selector);
   let attentionView=null;
-  if(isCi&&typeof client.getCi==='function'&&!(mission||session))attentionView=mountCiAttention(el('[data-ci-attention]'),client);
+  if(isCi&&typeof client.getCi==='function'&&!(mission||session))attentionView=mountCiAttention(el('[data-ci-attention]'),client,{onModel:m=>{const badge=(key,n)=>{const b=el(`[data-ci-badge="${key}"]`);if(!b)return;b.textContent=String(n||'');b.hidden=!n;};badge('overview',m.failures.length);badge('runs',m.running.length);}});
   if(isCi){
     healthView=mountCiHealth(el('[data-ci-health]'),client,{repository,mission,session,search:search || undefined,
       onContext:context=>{const next={days:['7','14','30'].includes(context.mode)?Number(context.mode):null,mode:['runs','hours'].includes(context.mode)?context.mode:'days',run_number:context.run_number,scope:context.scope,start:context.start,end:context.end,branch:context.branch,search:context.search,failuresOnly:context.failuresOnly,project:context.project};observabilityView?.setContext(next);if(observabilityView)applyCiContext(next);},
@@ -207,12 +211,13 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
     if(slot)slot.append(el('.ig-inspector'));
     if(typeof client.getCiSummary==='function') {
       observabilityView=mountCiObservability(el('[data-ci-observability]'),client,{repository,provider,mission,session,search:search||undefined,
+        onProjectPicked:()=>{workspace='health';draw();},
         onContext:context=>{
           healthView?.setObservabilityContext(context);
           applyCiContext(context);
         },
         onSelectRun:record=>{
-          workspace='health';healthView?.setLayout('pipeline');openCiRun(record);
+          workspace='health';openCiRun(record);
         }});
       const initial=observabilityView.getContext();
       healthView.setObservabilityContext(initial);applyCiContext(initial,{render:false});
@@ -220,15 +225,20 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
   }
   if(isCi){
     const panels={};
-    const nav=document.createElement('div');nav.className='ig-tabs ci-workspace-tabs';nav.setAttribute('role','tablist');nav.setAttribute('aria-label','CI workspace');
-    nav.innerHTML=['health','runs','tests'].map((key,index)=>`<button type="button" role="tab" data-ci-workspace="${key}" id="ci-workspace-tab-${key}" aria-controls="ci-workspace-${key}" aria-selected="${index===0}" tabindex="${index===0?0:-1}">${key[0].toUpperCase()+key.slice(1)}</button>`).join('');
-    el('[data-ci-health]').before(nav);
-    for(const key of ['health','runs','tests']){const panel=document.createElement('section');panel.id=`ci-workspace-${key}`;panel.setAttribute('role','tabpanel');panel.setAttribute('aria-labelledby',`ci-workspace-tab-${key}`);panel.hidden=key!=='health';panels[key]=panel;container.append(panel);}
-    panels.health.append(el('[data-ci-health]'));
+    const nav=document.createElement('div');nav.className='ig-tabs hd-tabs ci-workspace-tabs';nav.setAttribute('role','tablist');nav.setAttribute('aria-label','CI workspace');
+    // Four views instead of one long page. `health` keeps its key (it holds the run-health view and the pipeline slot) but is labelled Projects.
+    const LABELS={overview:'Overview',health:'Projects',runs:'Runs',tests:'Tests'};
+    nav.innerHTML=WORKSPACES.map((key,index)=>`<button type="button" role="tab" data-ci-workspace="${key}" id="ci-workspace-tab-${key}" aria-controls="ci-workspace-${key}" aria-selected="${index===0}" tabindex="${index===0?0:-1}">${LABELS[key]}<span class="ci-tab-badge" data-ci-badge="${key}" hidden></span></button>`).join('');
+    el('[data-ci-attention]').before(nav);
+    for(const key of WORKSPACES){const panel=document.createElement('section');panel.id=`ci-workspace-${key}`;panel.setAttribute('role','tabpanel');panel.setAttribute('aria-labelledby',`ci-workspace-tab-${key}`);panel.hidden=key!==workspace;panels[key]=panel;container.append(panel);}
+    panels.overview.append(el('[data-ci-attention]'),el('[data-ob-summary]'),el('[data-ob-worst]'));
+    panels.health.append(el('[data-ci-observability]'),el('[data-ci-health]'));
+    panels.tests.append(el('[data-ob-tests-block]'));
+    observabilityView?.adopt(el('[data-ob-summary]'));observabilityView?.adopt(el('[data-ob-worst]'));observabilityView?.adopt(el('[data-ob-tests-block]'));
     for(const selector of ['.ig-tabs:not(.ci-workspace-tabs)','.ig-controls:not(.ci-report-filters)','.ci-report-filters','[data-ci-insights]','[data-ci-charts]','[data-ig-count]','.ig-layout','.ig-pages','[data-ig-runners]']){
       const node=el(selector);if(!node)continue;if(selector==='.ci-report-filters'){nav.after(node);continue;}panels[selector==='[data-ci-insights]'?'tests':'runs'].append(node);
     }
-    nav.addEventListener('keydown',event=>{if(!['ArrowLeft','ArrowRight','Home','End'].includes(event.key))return;const keys=['health','runs','tests'],i=keys.indexOf(workspace);workspace=keys[event.key==='Home'?0:event.key==='End'?2:(i+(event.key==='ArrowRight'?1:2))%3];event.preventDefault();draw();el(`[data-ci-workspace="${workspace}"]`).focus();},{signal:listenerController.signal});
+    nav.addEventListener('keydown',event=>{if(!['ArrowLeft','ArrowRight','Home','End'].includes(event.key))return;const keys=WORKSPACES,i=keys.indexOf(workspace);workspace=keys[event.key==='Home'?0:event.key==='End'?keys.length-1:(i+(event.key==='ArrowRight'?1:keys.length-1))%keys.length];event.preventDefault();draw();el(`[data-ci-workspace="${workspace}"]`).focus();},{signal:listenerController.signal});
   }
   function applyCiContext(context,{render=true}={}) {
     const changed=state.branch!==context.branch||Number(state.days)!==context.days;
@@ -307,11 +317,13 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
     state.page=Math.min(state.page,Math.max(0,Math.ceil(filtered.length/pageSize)-1));
     // Clock advance can change membership even when every provider payload is unchanged.
     const windowMembership=isCi?all.map(entry=>ciRunInWindow(entry.record,state)):null;
-    const nextSignature=JSON.stringify([state,!!error,data,reportData,performanceData,performanceError,performanceDays,windowMembership,[...reviewCache]]);
+    const nextSignature=JSON.stringify([state,!!error,data,reportData,performanceData,performanceError,performanceDays,windowMembership,[...reviewCache],[cx.repo,cx.signature,cx.search,cx.status,cx.sort,cx.selected,cx.error]]);
     if(isCi) {
       const observations=ciObservations();
       const model=ciInsightsModel(observations,state);
-      const html=renderCiInsights(model,{loading:reportData===null&&!reportsError,error:reportsError,failurePage});
+      const selectedRepo=state.project?ciProjectKey(state.project):el('[data-ci-repository]')?.value||'';
+      syncExplorer(ciExplorerTargets(model,selectedRepo,state.branch||''),selectedRepo);
+      const html=renderCiInsights(model,{loading:reportData===null&&!reportsError,error:reportsError,failurePage,selectedRepo,explorer:renderTestExplorer(cx.repo?cx:null)});
       if(insightsSignature!==html){
         const host=el('[data-ci-insights]');
         const focus=[...host.querySelectorAll('details')].findIndex(d=>d.querySelector('summary')===document.activeElement);
@@ -334,6 +346,7 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
         if(selectedValue)values.set(selectedValue,values.get(selectedValue)||selectedValue);
         const options=`<option value="">${label}</option>`+[...values].sort((a,b)=>a[1].localeCompare(b[1])).map(([value,label])=>`<option value="${esc(value)}">${esc(label)}</option>`).join('');
         if(select.innerHTML!==options)morph(select,options);
+        // Shared selection can change while the available options stay identical.
         if(select.value!==selectedValue)select.value=selectedValue;
       }
     }
@@ -395,10 +408,10 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
     }
     const inspector=el('.ig-inspector');inspector.hidden=!selected;
     if(isCi){
-      for(const key of ['health','runs','tests']){el(`#ci-workspace-${key}`).hidden=workspace!==key;const button=el(`[data-ci-workspace="${key}"]`);button.setAttribute('aria-selected',String(workspace===key));button.tabIndex=workspace===key?0:-1;}
+      for(const key of WORKSPACES){el(`#ci-workspace-${key}`).hidden=workspace!==key;const button=el(`[data-ci-workspace="${key}"]`);button.setAttribute('aria-selected',String(workspace===key));button.tabIndex=workspace===key?0:-1;}
       const target=workspace==='runs'?el('.ig-layout'):el('[data-health-pipeline-slot]');if(target && inspector.parentNode!==target)target.append(inspector);
       container.dataset.ciFocused=selected?'true':'false';
-      el('.ci-report-filters').hidden=workspace==='health';
+      el('.ci-report-filters').hidden=workspace==='health'||workspace==='overview';
       el('[data-ci-insights]').hidden=false;el('[data-ci-charts]').hidden=false;
     }
     if(selected) {
@@ -420,6 +433,105 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
     try {const response=await fn(controller.signal);if(!disposed && !controller.signal.aborted)accept(response);}
     catch(err){if(!disposed && (!controller.signal.aborted || timeout))onError(err);}
     finally {clearTimeout(deadline);if(pending.get(key)===controller)pending.delete(key);draw();}
+  }
+  function resetExplorer(repo,label) {
+    for(const key of ['cx-reports','cx-slice','cx-history']){pending.get(key)?.abort();pending.delete(key);}
+    cx={...cx,repo,label,signature:'',reports:null,error:'',selected:'',slice:null,sliceError:'',history:null,historyError:'',sending:false,sendMessage:'',ops:{},sent:{}};
+  }
+  // Fetch the full reports (tests included) of the selected repository's latest runs whenever they change.
+  function syncExplorer(targets,repo) {
+    if(!repo){if(cx.repo)resetExplorer('','');return;}
+    if(cx.repo!==repo)resetExplorer(repo,targets[0]?.repository||repo);
+    const exact=targets.filter(r=>r.provider_url&&r.provider_repo_id!=null&&r.repository&&r.run_number);
+    const signature=JSON.stringify(exact.map(r=>[r.report_id,r.run_number]));
+    if(!targets.length&&cx.reports===null){cx.reports=[];cx.signature='';return;}      // the selected branch has no report in this repository
+    if(!exact.length){if(cx.reports===null&&targets.length){cx.reports=[];cx.error='These reports are not linked to a provider run yet, so their tests cannot be listed.';}return;}
+    if(signature===cx.signature||typeof client.getCiReports!=='function')return;
+    const repoAtStart=repo;
+    request('cx-reports',async signal=>Promise.all(exact.map(async r=>({label:r.label,wanted:r.report_id,response:await client.getCiReports({signal,provider_url:r.provider_url,provider_repo_id:r.provider_repo_id,repository:r.repository,run_number:r.run_number})}))),responses=>{
+      if(cx.repo!==repoAtStart)return;
+      cx.reports=responses.map(({label,wanted,response})=>{
+        if(!Array.isArray(response?.reports))throw new Error('Invalid test report response');
+        const list=response.reports;return {label,report:list.find(r=>r.report_id===wanted)||list[list.length-1]||null};
+      });
+      cx.signature=signature;cx.error='';
+    },()=>{if(cx.repo===repoAtStart){cx.error='The tests of the latest runs could not be loaded. Trying again in 30 seconds.';cx.signature=signature;setTimeout(()=>{if(!disposed&&cx.repo===repoAtStart&&cx.signature===signature&&cx.error){cx.signature='';draw();}},30000);}});
+  }
+  function explorerTest() {return explorerTests(cx.reports).find(t=>t.key===cx.selected)||null;}
+  function selectExplorerTest(key) {
+    cx.selected=cx.selected===key?'':key;cx.slice=null;cx.sliceError='';cx.history=null;cx.historyError='';pending.get('cx-send')?.abort();pending.delete('cx-send');cx.sending=false;cx.sendMessage='';cx.sessionId='';
+    pending.get('cx-slice')?.abort();pending.delete('cx-slice');pending.get('cx-history')?.abort();pending.delete('cx-history');
+    const t=explorerTest();
+    if(t&&Array.isArray(cx.sessions)){
+      const done=cx.sent[cx.selected],onBranch=t.branch?cx.sessions.filter(x=>x.branch===t.branch):[];
+      if(done){cx.sessionId=done.sessionId;cx.sendMessage=done.message;}else if(onBranch.length===1)cx.sessionId=onBranch[0].session_id;
+      refreshExplorerAgents();
+    }
+    if(t&&t.source==='log'&&t.step_id&&t.provider_url){
+      const key0=cx.selected;
+      request('cx-slice',signal=>client.getCiLogSlice(t.provider_repo_id,t.run_number,t.step_id,{start:t.line_start,end:t.line_end,expect:t.name,signal,providerUrl:t.provider_url}),response=>{
+        if(cx.selected!==key0)return;
+        if(response?.provider_url&&canonicalProvider(response.provider_url)!==canonicalProvider(t.provider_url))throw new Error('Log provider identity mismatch');
+        cx.slice=response;cx.sliceError='';
+      },()=>{if(cx.selected===key0)cx.sliceError='The log excerpt could not be read from CI.';});
+    }
+    draw();
+    // The opened foldout can sit below the fold of the scrolling list.
+    if(t)requestAnimationFrame(()=>container.querySelector?.('[data-cx-inspector]')?.scrollIntoView?.({block:'nearest'}));
+  }
+  // The same test (name, suite and step) in up to eight of the most recent runs of this repository, whatever the branch.
+  function loadExplorerHistory() {
+    const t=explorerTest();if(!t||pending.has('cx-history'))return;
+    const same=r=>r.provider_url===t.provider_url&&String(r.provider_repo_id)===String(t.provider_repo_id);
+    const runs=[...new Set(records(reportData?.reports).filter(same).map(r=>r.run_number))].sort((a,b)=>b-a).slice(0,8);
+    cx.history='loading';cx.historyError='';const key0=cx.selected;
+    request('cx-history',async signal=>Promise.all(runs.map(async number=>({number,response:await client.getCiReports({signal,provider_url:t.provider_url,provider_repo_id:t.provider_repo_id,repository:t.repository,run_number:number})}))),results=>{
+      if(cx.selected!==key0)return;
+      cx.history=results.map(({number,response})=>{
+        const report=(response.reports||[]).at(-1),match=explorerTests([{label:'',report}]).find(x=>x.name===t.name&&(x.suite||'')===(t.suite||'')&&(x.step||'')===(t.step||''));
+        return {run_number:number,branch:report?.branch||'',status:match?.status||'',source:report?testSource(report):'',unindexed:!!report?.index_dropped};
+      });
+    },()=>{if(cx.selected===key0){cx.history=[];cx.historyError='Earlier runs could not be loaded.';}});
+    draw();
+  }
+  // Pi agents the failing test can be sent to; loaded when the operator asks, and the one on the test's branch is preselected.
+  function loadExplorerAgents() {
+    if(cx.sessions!==null||pending.has('cx-agents')||document.hidden)return;
+    const t=explorerTest();cx.sessions='loading';cx.sendMessage='';draw();
+    request('cx-agents',signal=>client.listSessions(undefined,{signal}),response=>{
+      cx.sessions=activePiSessions(response.sessions);
+      const onBranch=t?.branch?cx.sessions.filter(x=>x.branch===t.branch):[];
+      if(!cx.sessionId&&onBranch.length===1)cx.sessionId=onBranch[0].session_id;
+    },()=>{cx.sessions=null;cx.sendMessage='Pi agents could not be loaded. Try again.';});
+  }
+  // Agents come and go: reload the list each time a test is opened, and drop a chosen agent that has since exited.
+  function refreshExplorerAgents() {
+    if(document.hidden||pending.has('cx-agents'))return;
+    request('cx-agents',signal=>client.listSessions(undefined,{signal}),response=>{
+      const list=activePiSessions(response.sessions);
+      cx.sessions=list;
+      if(cx.sessionId&&!list.some(x=>x.session_id===cx.sessionId)){cx.sessionId='';cx.sendMessage='The chosen Pi agent is no longer active. Choose another.';}
+    },()=>{});
+  }
+  function sendExplorerTest() {
+    const t=explorerTest(),sessionId=cx.sessionId;
+    if(!t||!sessionId||cx.sending||!t.step_id||!t.provider_url||document.hidden||pending.has('cx-send'))return;
+    const key0=cx.selected,opKey=`${key0}|${sessionId}`;
+    if(!cx.ops[opKey])cx.ops[opKey]=newOperationId();
+    const operationId=cx.ops[opKey];cx.sending=true;cx.sendMessage='Sending the failure to the agent…';draw();
+    request('cx-send',signal=>client.debugCi(t.provider_repo_id,t.run_number,sessionId,operationId,{signal,providerUrl:t.provider_url,mode:'test',test:{name:t.name,suite:t.suite||undefined,step_id:String(t.step_id),line_start:t.line_start,line_end:t.line_end}}),response=>{
+      if(cx.selected!==key0)return;
+      cx.sending=false;if(response.status==='delivered'||response.status==='queued'){delete cx.ops[opKey];}
+      cx.sendMessage=response.status==='delivered'?'Delivered to the selected Pi agent.':response.status==='queued'?'Queued for delivery to the selected Pi agent.':response.error||'The Pi agent did not receive the failure.';
+      if(response.status==='delivered'||response.status==='queued')cx.sent[key0]={sessionId,message:cx.sendMessage};
+    },err=>{if(cx.selected!==key0)return;cx.sending=false;cx.sendMessage=err.status===403?'Sending to Pi requires operator access.':err.status===400||err.status===409?(err.message||'This failure cannot be sent.'):'Delivery unconfirmed; sending again checks the same operation.';});
+  }
+  function openExplorerRun(number,{withStep=false}={}) {
+    const t=explorerTest();if(!t)return;
+    const record=records(reportData?.pipelines).find(r=>r.provider_url===t.provider_url&&String(r.provider_repo_id)===String(t.provider_repo_id)&&String(r.run_number)===String(number));
+    if(!record)return;
+    workspace='runs';openCiRun(record);
+    if(withStep&&t.step_id){pending.get('log')?.abort();pending.delete('log');step=String(t.step_id);log=null;logError='';draw();refreshDetail();}
   }
   function refreshRelated() {
     if(!selected || typeof client.related!=='function')return;
@@ -489,7 +601,7 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
     const entry=integrationEntries({pipelines:{history:[record]}})[0];
     if(!entry)return;
     if(selected?.id===entry.id&&selected.repository===record.repository){draw();focusInspector();return;}
-    listScroll=window.scrollY;healthOriginKey=document.activeElement?.dataset.healthRun||healthOriginKey;testPage=0;testSearch='';comparisonKey='';cancelDetail();selectedReports=null;selectedReportsError='';
+    listScroll=window.scrollY;healthOriginKey=document.activeElement?.dataset.healthSlotRun||healthOriginKey;testPage=0;testSearch='';comparisonKey='';cancelDetail();selectedReports=null;selectedReportsError='';
     selected={id:entry.id,repository:record.repository,providerId:record.provider_repo_id || record.repository,number:record.run_number,providerUrl:JSON.parse(entry.id)[0]};
     pipeline=selected.providerUrl?record:{...record,can_retry:false,can_cancel:false};debugSessions=null;debugSessionId='';debugMessage='';debugOperationId='';fixOperationId='';fix=null;fixMessage='';sandboxOperationId='';fixTerminal=null;fixTerminalError='';step='';log=null;logError='';detailError='';actionMessage='';detailSignature='';related=null;relatedFailed=false;
     // Start lazy I/O before rendering the synchronized run/health views.
@@ -502,14 +614,40 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
     if(button.hasAttribute('data-collapse-success')){collapseSuccess=!collapseSuccess;draw();return;}
     if(button.hasAttribute('data-pipeline-zoom')){zoom=pipelineZoom(button.dataset.pipelineZoom==='reset'?1:Math.round((zoom+(button.dataset.pipelineZoom==='in'?.25:-.25))*100)/100);draw();return;}
     if(button.dataset.ciTestPage){testPage=Math.max(0,testPage+(button.dataset.ciTestPage==='next'?1:-1));draw();}
+    if(button.hasAttribute('data-cx-test')){selectExplorerTest(button.dataset.cxTest);return;}
+    if(button.hasAttribute('data-cx-close')){selectExplorerTest(cx.selected);return;}
+    if(button.hasAttribute('data-cx-history')){loadExplorerHistory();return;}
+    if(button.hasAttribute('data-cx-agents')){loadExplorerAgents();return;}
+    if(button.hasAttribute('data-cx-send')){sendExplorerTest();return;}
+    if(button.hasAttribute('data-cx-open-run')){openExplorerRun(button.dataset.cxOpenRun);return;}
+    if(button.hasAttribute('data-cx-open-step')){const t=explorerTest();if(t)openExplorerRun(t.run_number,{withStep:true});return;}
+    if(button.hasAttribute('data-ci-test-repo')){
+      const select=el('[data-ci-repository]'),key=button.dataset.ciTestRepo;
+      const option=[...select.options].find(o=>o.value===key);
+      if(option){
+        const clearing=select.value===option.value;
+        select.value=clearing?'':option.value;select.dispatchEvent(new Event('change',{bubbles:true}));
+        setTimeout(()=>el(`[data-ci-test-repo="${CSS.escape(key)}"]`)?.focus({preventScroll:true}),0);
+      }
+      return;
+    }
+    if(button.hasAttribute('data-ci-investigate')){
+      const action=button.dataset.ciInvestigate;
+      if(action==='clear'){const select=el('[data-ci-repository]');select.value='';select.dispatchEvent(new Event('change',{bubbles:true}));setTimeout(()=>el('[data-ci-test-repo]')?.focus({preventScroll:true}),0);return;}
+      if(action==='runs'){workspace='runs';state.tab='failed';state.page=0;draw();return;}
+      if(action==='failing'||action==='slow'){const sort=el('[data-ob-test-sort]');if(sort){sort.value=action==='slow'?'duration':'failure';sort.dispatchEvent(new Event('change',{bubbles:true}));}}
+      const card=action==='history'?el('#ci-card-history'):el('[data-ob-tests]');
+      if(card){card.scrollIntoView({block:'start',behavior:window.matchMedia?.('(prefers-reduced-motion: reduce)').matches?'auto':'smooth'});card.setAttribute('tabindex','-1');card.focus({preventScroll:true});}
+      return;
+    }
     if(button.dataset.ciFailurePage){failurePage=Math.max(0,failurePage+(button.dataset.ciFailurePage==='next'?1:-1));draw();el(`[data-ci-failure-page="${button.dataset.ciFailurePage}"]`)?.focus();}
     if(button.dataset.tab){state.tab=button.dataset.tab;state.page=0;draw();}
     if(button.dataset.page){state.page+=button.dataset.page==='next'?1:-1;draw();}
     if(button.hasAttribute('data-run')) {testPage=0;testSearch='';
       const entry=entries().find(e=>e.id===button.dataset.run);if(!entry)return;
-      healthView?.setLayout?.('pipeline');openCiRun(entry.record);
+      openCiRun(entry.record);
     }
-    if(button.hasAttribute('data-close-inspector')){const lastRunId=selected?.id;cancelDetail();selected=null;pipeline=null;healthView?.selectedRun(null);healthView?.setLayout('split');draw();if(isCi && workspace==='health')[...container.querySelectorAll('[data-health-run]')].find(button=>button.dataset.healthRun===healthOriginKey)?.focus({preventScroll:true});window.scrollTo({top:listScroll});if(isCi && workspace==='runs')[...container.querySelectorAll('[data-run]')].find(button=>button.dataset.run===lastRunId)?.focus({preventScroll:true});}
+    if(button.hasAttribute('data-close-inspector')){const lastRunId=selected?.id;cancelDetail();selected=null;pipeline=null;healthView?.selectedRun(null);draw();if(isCi && workspace==='health')[...container.querySelectorAll('[data-health-run]')].find(button=>button.dataset.healthRun===healthOriginKey)?.focus({preventScroll:true});window.scrollTo({top:listScroll});if(isCi && workspace==='runs')[...container.querySelectorAll('[data-run]')].find(button=>button.dataset.run===lastRunId)?.focus({preventScroll:true});}
     if(button.hasAttribute('data-step')){pending.get('log')?.abort();pending.delete('log');step=button.dataset.step;log=null;logError='';draw();refreshDetail();}
     if(button.hasAttribute('data-fix-sandbox') && selected?.providerUrl && !pending.has('fix-start')){
       const target={...selected};
@@ -583,7 +721,7 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
       debugSessions=activePiSessions(response.sessions);debugMessage='';{const onBranch=selected?.branch?debugSessions.filter(x=>x.branch===selected.branch):[];if(!debugSessionId && onBranch.length===1){debugSessionId=onBranch[0].session_id;debugOperationId='';fixOperationId='';}}
     },()=>{if(selected?.id===key){debugSessions=[];debugMessage='Pi agents could not load. Reopen this run to retry.';}});
   },{capture:true,signal:listenerController.signal});
-  container.addEventListener('change',event=>{if(event.target.hasAttribute('data-ci-compare')){comparisonKey=event.target.value;draw();}if(event.target.hasAttribute('data-debug-session')){if(debugSessionId!==event.target.value){debugOperationId='';fixOperationId='';debugMessage='';}debugSessionId=event.target.value;draw();}},{signal:listenerController.signal});
+  container.addEventListener('change',event=>{if(event.target.hasAttribute('data-cx-session')){cx.sessionId=event.target.value;cx.sendMessage=cx.sent[cx.selected]?.sessionId===cx.sessionId?cx.sent[cx.selected].message:'';draw();return;}if(event.target.hasAttribute('data-cx-status')){cx.status=event.target.value;draw();return;}if(event.target.hasAttribute('data-cx-sort')){cx.sort=event.target.value;draw();return;}if(event.target.hasAttribute('data-ci-compare')){comparisonKey=event.target.value;draw();}if(event.target.hasAttribute('data-debug-session')){if(debugSessionId!==event.target.value){debugOperationId='';fixOperationId='';debugMessage='';}debugSessionId=event.target.value;draw();}},{signal:listenerController.signal});
   container.querySelector('.ig-tabs:not(.ci-workspace-tabs)').addEventListener('keydown',event=>{
     if(!['ArrowLeft','ArrowRight','Home','End'].includes(event.key))return;
     const index=tabs.findIndex(([key])=>key===state.tab);
@@ -598,7 +736,7 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
     }
     state[key]=event.target.value;state.page=0;if(key==='days'||key==='branch'){refreshPerformance(true);const context={branch:state.branch,start:null,end:null,run_number:null,...(key==='days'?{mode:'days'}:{}),...([7,14,30].includes(Number(state.days))?{days:Number(state.days)}:{})};state.start=null;state.end=null;state.run_number=null;if(key==='days')state.mode='days';observabilityView?.setContext(context);healthView?.setObservabilityContext(context);}draw();});
   if(isCi)el('[data-ci-performance-window]').addEventListener('change',event=>{performanceDays=Number(event.target.value);refreshPerformance(true);});
-  container.addEventListener('input',event=>{if(event.target.hasAttribute('data-ci-test-search')){testSearch=event.target.value;testPage=0;draw();}},{signal:listenerController.signal});
+  container.addEventListener('input',event=>{if(event.target.hasAttribute('data-cx-search')){cx.search=event.target.value;draw();return;}if(event.target.hasAttribute('data-ci-test-search')){testSearch=event.target.value;testPage=0;draw();}},{signal:listenerController.signal});
   el('[data-ig-search]').addEventListener('input',event=>{state.search=event.target.value;state.page=0;draw();});
   el('[data-ig-group]').addEventListener('change',event=>{state.group=event.target.value;draw();});
   function visibility() {
