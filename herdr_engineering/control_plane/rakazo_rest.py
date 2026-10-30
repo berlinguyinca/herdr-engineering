@@ -25,7 +25,6 @@ READS = frozenset({
     "approvalRules/list",
     "autoReview/get",
     "availability/items",
-    "boards/list",
     "capabilities/catalogSearch",
     "capabilities/list",
     "computer/status",
@@ -50,7 +49,6 @@ READS = frozenset({
     "paymentWallet/status",
     "security/events",
     "skills/list",
-    "tickets/list",
     "updater/status",
     "voice/catalog",
     "voice/credentials",
@@ -71,7 +69,7 @@ _REASONS = {
     "messaging": "Messaging channels are not set up on this server.",
     "marketplace": "There is no marketplace on this server.", "capabilities": "Capabilities are managed by the operator.",
     "skills": "Taught skills are not available on this server.",
-    "tickets": "The ticket board is not enabled on this server.", "boards": "Boards are not enabled on this server.",
+    "boards": "Boards cannot be added in this server.", "tickets": "That ticket action is not available.",
     "approvalRules": "Approval rules are decided by the operator's policy.", "autoReview": "Auto review is decided by the operator.",
     "updater": "Updates are applied by the operator.", "deployment": "The deployment is configured by the operator.",
     "onboarding": "Onboarding is not needed on this server.", "availability": "Availability is managed by the operator.",
@@ -220,6 +218,7 @@ class Rest:
     # preferences, billing, bootstrap, export ---------------------------------------------------------------
     def me(self, ctx):
         view = ev.me_view(ctx.account, ctx.space)
+        view["ticketBoardEnabled"] = True
         view.update(self.prefs.get(ctx.account.account_id, "-", PREFS_KIND, "me", {}) or {})
         return view
 

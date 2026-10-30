@@ -8,7 +8,6 @@
    "skipApprovals": false
   },
   "availability/items": [],
-  "boards/list": [],
   "capabilities/catalogSearch": {
    "enabled": false,
    "results": []
@@ -83,9 +82,6 @@
   },
   "security/events": [],
   "skills/list": [],
-  "tickets/list": {
-   "tickets": []
-  },
   "updater/status": {
    "branch": null,
    "canRollback": false,
