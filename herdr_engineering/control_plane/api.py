@@ -3064,10 +3064,22 @@ def _make_handler(server, public=False, operator=False):
                 return self._json(server.deployments_view())
             if resource == "handoffs":
                 if len(parts) == 5 and parts[4] == "tree":
-                    return self._json(server.handoffs.tree())
+                    return self._json(server.handoffs.tree(session_id=_q(self.path, "session_id")))
+                if len(parts) == 5 and parts[4] == "overview":
+                    return self._json(server.handoffs.overview())
+                if len(parts) == 6 and parts[5] == "chain":
+                    try:
+                        return self._json(server.handoffs.chain(parts[4]))
+                    except KeyError:
+                        return self._json({"error": "not found"}, 404)
                 if len(parts) == 5:
                     row = server.handoffs.get(parts[4])
                     return self._json(row) if row else self._json({"error": "not found"}, 404)
+                if any(_q(self.path, k) for k in ("cursor", "workspace", "attention", "limit")):
+                    return self._json(server.handoffs.page(
+                        state=_q(self.path, "state"), workspace=_q(self.path, "workspace"),
+                        attention=_q(self.path, "attention") == "1", cursor=_q(self.path, "cursor"),
+                        limit=_qint(self.path, "limit", 50)))
                 return self._json({"handoffs": server.handoffs.list(state=_q(self.path, "state"))})
             if resource == "scheduler":
                 if len(parts) == 4:
