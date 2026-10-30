@@ -166,8 +166,7 @@ export const DASHBOARD_SURFACES = [
     regions: [{ name: 'panel', selector: '#pa-notifications' }] },
   { slug: 'dashboard-assistant-approvals', app: 'dashboard', fullPage: true, skip: SKIP, hash: '/personal-assistant', proof: '[data-config]', steps: assistantTab('Approvals', 'Approving allows'),
     regions: [{ name: 'panel', selector: '#pa-approvals' }] },
-  { slug: 'dashboard-assistant-connectors', app: 'dashboard', fullPage: true, skip: SKIP, hash: '/personal-assistant', proof: '[data-config]', steps: connectorsTab,
-    regions: [{ name: 'panel', selector: '#pa-connectors' }] },
+  { slug: 'dashboard-assistant-connectors', app: 'dashboard', fullPage: true, skip: SKIP, hash: '/personal-assistant', proof: '[data-config]', steps: connectorsTab },
 ];
 
 async function connectorsTab(page) {
