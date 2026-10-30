@@ -374,9 +374,9 @@ function statusPage(html, ok, message) {
 // so the page does not jump on arrival.
 const BACK_LINK_SKELETON = '<div><span class="hd-skeleton hd-skeleton--line" style="display:inline-block;vertical-align:middle">&nbsp;</span></div>';
 function routeSkeleton(match, parts) {
-  const back = match.startsWith('/missions/:id') || match === '/herd/session/:id' ? BACK_LINK_SKELETON : match === '/llm/session/:id' ? '<p style="font-size:13px"><span class="hd-skeleton hd-skeleton--line" style="display:inline-block;vertical-align:middle">&nbsp;</span></p>' : '';
+  const back = match.startsWith('/missions/:id') || match === '/herd/session/:id' ? BACK_LINK_SKELETON : match === '/llm/session/:id' || match.startsWith('/analytics') ? '<p style="font-size:13px"><span class="hd-skeleton hd-skeleton--line" style="display:inline-block;vertical-align:middle">&nbsp;</span></p>' : '';
   const piMission = match === '/missions/:id' && (safeDecode(parts[1]) || '').startsWith('pi:');
-  const rows = piMission ? 1 : match === '/missions/:id/tests' || match === '/analytics/models' || match === '/analytics/hosts' || match === '/deployments' ? 2 : match === '/missions/:id/reviews' ? 4 : match === '/missions/:id' || match.startsWith('/llm') || match === '/herd/session/:id' || match === '/analytics' || match === '/analytics/missions' ? 8 : match.startsWith('/services') || match.endsWith('-services') ? 7 : 5;
+  const rows = piMission ? 1 : match === '/missions/:id/tests' || match === '/analytics/models' || match === '/analytics/hosts' || match === '/deployments' ? 2 : match === '/missions/:id/reviews' ? 4 : match === '/missions/:id' || match.startsWith('/llm') || match === '/herd/session/:id' || match === '/analytics' || match === '/analytics/missions' ? 8 : match === '/fabric-services' ? 2 : match.startsWith('/services') || match.endsWith('-services') ? 7 : 5;
   return `<div data-skeleton aria-busy="true" role="status" aria-label="Loading page">${back}<div class="hd-live-head"><div class="hd-skeleton hd-skeleton--title"></div></div>${skeleton('page content', { rows, height: 64, bare: true })}</div>`;
 }
 
@@ -952,7 +952,9 @@ async function viewServices(_parts, revision) {
 async function viewFabricServices(_parts, revision) {
   const data = await client.listFabricServices();
   if (revision !== renderRevision) return;
-  return mountFabricServices(root, client, data, { search: route().query.get('search') || '' });
+  const view = mountFabricServices(root, client, data, { search: route().query.get('search') || '' });
+  root.querySelector('herdr-freshness')?.touch?.(true);
+  return view;
 }
 
 async function viewService(parts, revision) {
