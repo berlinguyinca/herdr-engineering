@@ -53,7 +53,7 @@ function renderSend(ex,t) {
  if(sessions==='loading')return `${head}<span class="ig-note" role="status">Loading active Pi agents…</span></div>${msg}`;
  if(!sessions.length)return `${head}</div><p class="ig-note">No active Pi agents with a verified terminal are available.</p>${msg}`;
  const options=sessions.map(s=>`<option value="${esc(s.session_id)}"${s.session_id===ex.sessionId?' selected':''}>${esc(String(s.display_name||s.title||s.summary||s.cwd||s.session_id).slice(0,100))}${s.host_id?` · ${esc(String(s.host_id).slice(0,60))}`:''}${t.branch&&s.branch===t.branch?' · on this branch':''}</option>`).join('');
- return `${head}<label class="ig-note">Target Pi agent<select data-cx-session aria-label="Target Pi agent"><option value="">Choose an agent…</option>${options}</select></label><button type="button" class="hd-btn hd-btn--primary hd-btn--sm" data-cx-send${ex.sessionId&&!ex.sending?'':' disabled'}>Send this failure</button></div>${msg}`;
+ return `${head}<label class="ig-note">Target Pi agent<select data-cx-session aria-label="Target Pi agent"><option value="">Choose an agent…</option>${options}</select></label><button type="button" class="hd-btn hd-btn--primary hd-btn--sm" data-cx-send${ex.sessionId&&!ex.sending?'':' disabled'}>${ex.sent?.[t.key]?.sessionId===ex.sessionId&&ex.sessionId?'Send again':'Send this failure'}</button></div>${msg}`;
 }
 function renderHistory(ex) {
  if(ex.history===null)return '';
