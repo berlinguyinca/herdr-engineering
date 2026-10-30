@@ -519,11 +519,12 @@ def test_model_use_crosses_the_allowlist_and_unknown_fields_do_not():
         'modelUse': {
             'pin': 'gw/qwen3.8-27b', 'pinnedAt': '2026-10-30T00:00:00Z', 'elsewhere': 1,
             'agents': [{'workerId': 'W2', 'taskId': 'T2', 'role': 'reviewer', 'model': 'gw/deepseek',
-                        'state': 'running', 'onPin': False, 'rawPrompt': 'must not cross'}],
+                        'state': 'running', 'onPin': False, 'why': 'separation of duties', 'rawPrompt': 'must not cross'}],
         },
         'hiddenReasoning': 'must not cross',
     })
     use = clean['modelUse']
     assert use['pin'] == 'gw/qwen3.8-27b' and use['elsewhere'] == 1
     assert use['agents'][0]['role'] == 'reviewer' and use['agents'][0]['onPin'] is False
+    assert use['agents'][0]['why'] == 'separation of duties'
     assert 'rawPrompt' not in use['agents'][0] and 'hiddenReasoning' not in clean

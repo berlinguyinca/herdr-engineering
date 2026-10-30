@@ -49,7 +49,7 @@ noProgressSince activity errors example count category code firstAt lastAt recov
 attempt maxAttempts nextAction nextActionAt recoveryAttempt changes branch changedFiles commits
 integrationState artifacts task title weight units completedAt assignedWorkerId dependsOn tasks
 provider alias backingModel queuePosition queued admitted capacity retryAt retryInMs waitMs
-modelUse pin pinnedAt agents elsewhere role onPin
+modelUse pin pinnedAt agents elsewhere role onPin why
 '''.split())
 
 

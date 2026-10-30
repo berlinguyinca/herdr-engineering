@@ -67,7 +67,7 @@ function modelUseLine(u) {
 function modelUseAgents(u) {
   return records(u?.agents).slice(0, 100).map(x => row(
     [x.role, x.workerId].filter(Boolean).join(' · ') || 'Agent',
-    `${x.model || 'Model not reported'}${x.onPin === true ? ' · on pin' : x.onPin === false ? ' · other model' : ''}${x.state ? ` · ${human(x.state)}` : ''}`,
+    `${x.model || 'Model not reported'}${x.onPin === true ? ' · on pin' : x.onPin === false ? ` · other model${x.why ? ` (${text(x.why)})` : ''}` : ''}${x.state ? ` · ${human(x.state)}` : ''}`,
   )).join('');
 }
 function model(w) { return [w.route, w.model].filter(Boolean).join(' → ') || 'Model not reported'; }
