@@ -17,7 +17,7 @@ Mutation check: removing the token fence, the origin check, reviewer independenc
 each fails a test (run by hand, then restored).
 
 ## Wired: independent review at the real task chokepoint
-`CollabService.create_task` takes `reviews_task_id` and enforces reviewer independence against the room's real task records (`tests/control_plane/test_collab_review_independence.py`, 7 tests; each of the three rules mutation-checked; 1,626 collab tests pass). Not yet: the work graph does not draw a `reviews` edge from it, and the lease store is not used by accept/complete.
+`CollabService.create_task` takes `reviews_task_id` and enforces reviewer independence against the room's real task records (`tests/control_plane/test_collab_review_independence.py`, 7 tests; each of the three rules mutation-checked; 1,626 collab tests pass). The work graph shows it as a `depends_on` edge (review -> work) with a `reviews_task_id` attr (`test_a_review_task_depends_on_the_work_it_reviews...`). Not yet: the lease store is not used by accept/complete.
 
 ## Durable leases (migration 0040, `team_task_leases_pg.py`)
 The lease contract also runs against Postgres (`tests/control_plane/test_team_task_leases_pg.py`, 5 tests incl. a 12-way concurrent acquire with exactly one winner). Mutation check: making takeover unconditional fails 3 of 5. Rollback: `DROP TABLE team_task_leases` (see the migration's `-- DOWN:`).
@@ -34,12 +34,11 @@ UI. Agents stay unable to submit tasks (decision recorded in P01 answers).
 ## Rollback
 Delete `team_tasks.py` and its test; no schema, route or config was added.
 
-## Open design decisions (need an owner's call before the next P05 slice)
-1. **Review lineage in the work graph.** The contract maps `reviews` to the existing `reviewed` edge, whose identity includes a
-   binding (commit, else plan_digest) and whose staleness logic depends on it. A task-to-task review (`reviews_task_id`) has no
-   binding. Options: (a) a new unbound edge type `task_review` (recommended: no change to the evidence semantics of `reviewed`);
-   (b) reuse `reviewed` with `plan_digest` = the work task's id (overloads the binding); (c) store it only as a task attribute
-   (no traversal). Needs the graph vocabulary owner.
+## Design decisions (1 decided, 2-4 still need an owner's call)
+1. **Review lineage in the work graph: DECIDED and built.** Reusing the contract's own `depends_on` (graph `dependency`,
+   dependent -> prerequisite, no binding needed) between the review task and the work task, plus a `reviews_task_id` attr to tell it
+   from other dependencies. A new edge type (my first recommendation) would have inflated a versioned contract; the contract's
+   `reviews` edge is from a `review` entity and maps to the bound `reviewed` edge, which does not fit a task-to-task review.
 2. **Where the lease lives.** `CollabService` is synchronous and event-sourced (state is rebuilt from the log); `PgLeaseStore` is
    async Postgres. Options: (a) model the lease in the collab event log (a fencing token in `task_updated`, completion requires it;
    recommended: one source of truth, restart-safe by replay, no cross-store consistency problem); (b) call `PgLeaseStore` from a

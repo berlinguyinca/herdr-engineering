@@ -5,6 +5,9 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Unified workspace P05: review lineage in the work graph
+- A task created with `reviews_task_id` now folds into the work graph as a `depends_on` edge from the review task to the work task (the contract's existing edge, dependent -> prerequisite) and a `reviews_task_id` attr. No new edge type, no schema change.
+
 ### Unified workspace P05: independent review enforced where tasks are created
 - `POST /api/v1/collab/rooms/{id}/tasks` accepts an optional `reviews_task_id`. A review task is refused (400) when its reviewer is the agent that did the work or the agent that handed it out, and an agent cannot choose the reviewer of its own work; an unknown task or one from another room is a 404. The id is stored on the task and in the `task_created` event. Without the field nothing changes, and idempotency keys keep their meaning (the request digest only gains the id when it is present).
 
