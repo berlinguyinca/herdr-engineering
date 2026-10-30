@@ -26,7 +26,7 @@ export function renderFabricServices(data, search = '') {
 }
 
 export function mountFabricServices(root, client, data, { search = '' } = {}) {
-  root.innerHTML = `<section class="fabric-services-page"><h2>Fabric services</h2><p>Services exposed through the private fabric gateway. Only registered, authorised destinations appear here.</p><label>Search <input type="search" data-fabric-search value="${esc(search)}" placeholder="name, host, address, owner"></label><div data-fabric-list></div></section>`;
+  root.innerHTML = `<section class="fabric-services-page"><div class="hd-live-head"><h1>Fabric services</h1><herdr-freshness interval="30000"></herdr-freshness></div><p>Services exposed through the private fabric gateway. Only registered, authorised destinations appear here.</p><label>Search <input type="search" data-fabric-search value="${esc(search)}" placeholder="name, host, address, owner"></label><div data-fabric-list></div></section>`;
   const list = root.querySelector('[data-fabric-list]'), input = root.querySelector('[data-fabric-search]');
   const paint = () => { list.innerHTML = renderFabricServices(data, input.value); };
   input.addEventListener('input', paint);

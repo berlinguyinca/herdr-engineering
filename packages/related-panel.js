@@ -2,7 +2,7 @@
 // only through entity-links.js; labels are untrusted strings and are escaped. Groups with nothing
 // are omitted; a failed or partial answer says so instead of looking like "none".
 import { escapeHtml as esc } from './herdr-web-components/util.js';
-import { entityHref, forgePrUrl } from './entity-links.js';
+import { entityHref, forgePrUrl, prTrailHref } from './entity-links.js';
 
 const GROUPS = [
   ['mission', 'Mission', 'mission'], ['agents', 'Agents', 'session'], ['host', 'Host', 'host'], ['service', 'Services', 'service'],
@@ -22,8 +22,8 @@ function link(group, kind, item) {
   let href = null;
   if (kind === 'ci') href = entityHref('ci', item.run_number ?? item.id, { repository: item.repo_filter });
   else if (kind === 'pr') {
-    const url = forgePrUrl(item.repository, item.number);
-    return url ? `<span><a href="${esc(url)}" target="_blank" rel="noopener noreferrer">${label}</a> <span class="rel-state">external${item.state ? ` · ${esc(item.state)}` : ''}</span></span>` : `<span>${label}${state}</span>`;
+    const url = forgePrUrl(item.repository, item.number), trail = prTrailHref(item.repository, item.number);
+    return url ? `<span><a href="${esc(url)}" target="_blank" rel="noopener noreferrer">${label}</a> <span class="rel-state">external${item.state ? ` · ${esc(item.state)}` : ''}</span>${trail ? ` <a href="${esc(trail)}" data-pr-trail>trail</a>` : ''}</span>` : `<span>${label}${state}</span>`;
   } else href = entityHref(kind, item.id);
   return href ? `<span><a href="${esc(href)}">${label}</a>${state}${relation}</span>` : `<span>${label}${state}</span>`;
 }

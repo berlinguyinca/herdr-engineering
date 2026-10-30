@@ -188,6 +188,13 @@ class CIMonitor:
     def summary_snapshot(self, *, start=True):
         return self._history.summary_snapshot(start=start)
 
+    def configured(self):
+        """Whether a CI provider is configured at all (local configuration only, no request). ``None`` when that cannot be told."""
+        try:
+            return bool(self._factory().available)
+        except Exception:
+            return None
+
     def report_redactor(self):
         # Provider construction loads local configuration only. No availability
         # probe, inventory, detail, or log request is needed for report reads.

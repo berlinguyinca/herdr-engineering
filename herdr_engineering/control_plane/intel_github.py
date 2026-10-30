@@ -48,9 +48,19 @@ class SharedCredentialPrLister:
         self._opener = opener or urllib.request.build_opener(urllib.request.ProxyHandler({}), github_auth._NoRedirect())
         self._timeout = timeout
         self._lock = threading.Lock()
-        self.last_error: str | None = None          # fixed reason of the latest failed repo, None after a clean pass
+        self.last_error: str | None = None          # fixed reason of a repo that still fails, None when every repo is clean
+        self._repo_errors: dict[str, str] = {}      # repo -> reason; a clean repo clears only its own entry
 
     def open_prs(self, repo: str) -> list[OpenPr]:
+        key = str(repo)[:200]
+        try:
+            return self._open_prs(repo, key)
+        except PollError as exc:
+            with self._lock:
+                self._repo_errors[key] = exc.reason
+            raise
+
+    def _open_prs(self, repo: str, key: str) -> list[OpenPr]:
         owner = github_auth.owner_of(repo)
         name = repo.split("/", 1)[1] if isinstance(repo, str) and "/" in repo else None
         if owner is None or not name or not github_auth._REPO_NAME.fullmatch(name):
@@ -76,7 +86,8 @@ class SharedCredentialPrLister:
                 raise self._fail("invalid_response") from None
             if len(data) < PER_PAGE:
                 with self._lock:
-                    self.last_error = None
+                    self._repo_errors.pop(key, None)
+                    self.last_error = next(iter(self._repo_errors.values()), None)
                 return out
         raise self._fail("too_many_pull_requests")      # a full last page: never truncate silently
 

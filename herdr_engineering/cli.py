@@ -165,6 +165,13 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=_cmd_capabilities)
 
+    # bridge ---------------------------------------------------------------
+    p = sub.add_parser("bridge", help="Rakazo mobile bridge helpers (control_plane.rakazo_bridge)")
+    bsub = p.add_subparsers(dest="bridge_command", required=True)
+    bsub.add_parser("hash-password", help="read a password from the terminal (or stdin) and print the scrypt hash "
+                    "for control_plane.rakazo_bridge.accounts[].password_scrypt; the password is never an argument"
+                    ).set_defaults(func=_cmd_bridge_hash_password)
+
     # fleet ----------------------------------------------------------------
     p = sub.add_parser("fleet", help="one-command fleet onboarding + version sync")
     fsub = p.add_subparsers(dest="fleet_command", required=True)
@@ -3226,6 +3233,16 @@ def _cmd_cp_web(args) -> int:
         usage_prices = usage_prices_config(cp.get("usage"))
     except ValueError as exc:
         raise SystemExit(f"fleet config {exc}") from None
+    from .control_plane.agent_evolution import evolution_config
+    try:
+        evolution = evolution_config(cp.get("evolution"))
+    except ValueError as exc:
+        raise SystemExit(f"fleet config {exc}") from None
+    from .control_plane.learning_trails import learning_config
+    try:
+        learning = learning_config(cp.get("learning"))
+    except ValueError as exc:
+        raise SystemExit(f"fleet config {exc}") from None
     from .control_plane.attention_inbox import attention_config
     try:
         attention = attention_config(cp.get("attention"))
@@ -3375,7 +3392,13 @@ def _cmd_cp_web(args) -> int:
         collab.contextual = normalize_contextual(getattr(args, "collab_contextual", None))
         collab.insights = normalize_insights(getattr(args, "collab_insights", None))
         _wire_collab_switches(collab, switch_store, pinned=frozenset({"replay_history"}) if replay_flag else frozenset())
+    from .control_plane.rakazo_bridge import rakazo_bridge_config
+    try:
+        rakazo_bridge_config(cp.get("rakazo_bridge"))      # an enabled but malformed bridge stops startup here, clearly
+    except ValueError as exc:
+        raise SystemExit(f"fleet config {exc}") from None
     svr = ControlPlaneServer(repo, api_keys=api_keys, lineage_key_scopes=lineage_key_scopes,
+                             rakazo_bridge=cp.get("rakazo_bridge"), rakazo_bridge_dsn=dsn,
                              federation_source=federation_source,
                              system_graph=system_graph,
                              host=args.host, port=args.port, source=source,
@@ -3400,7 +3423,7 @@ def _cmd_cp_web(args) -> int:
                              assistant_config=_assistant_config(cp),
                              review_quorum=_review_quorum_config(cp),
                              single_operator=cp.get("single_operator") is True,
-                             usage_retention=usage_retention, usage_prices=usage_prices, attention=attention,
+                             usage_retention=usage_retention, usage_prices=usage_prices, evolution=evolution, learning=learning, attention=attention,
                              ci_fix=ci_fix, missions=missions, github_pg_dsn=dsn, ci_log_tests=ci_log_tests,
                              public_port=args.collab_public_port,
                              public_host=args.collab_public_host,
@@ -3790,6 +3813,26 @@ def _inspector_snapshot_settings(cp) -> tuple[bool, float]:
     return raw.get("enabled") is True, float(interval)
 
 
+def _cmd_bridge_hash_password(args):
+    """Print ``scrypt$N$r$p$salt$hash`` for a password read from a TTY prompt (asked twice) or from stdin. Nothing but the
+    hash reaches stdout; the password is never an argument, an environment variable or a file."""
+    import getpass
+
+    from .control_plane.rakazo_bridge import hash_password
+    if sys.stdin.isatty():
+        password = getpass.getpass("Password: ")
+        if getpass.getpass("Repeat password: ") != password:
+            print("the passwords differ", file=sys.stderr)
+            return 1
+    else:
+        password = sys.stdin.readline().rstrip("\r\n")
+    if len(password) < 12:
+        print("use a password of at least 12 characters", file=sys.stderr)
+        return 1
+    print(hash_password(password))
+    return 0
+
+
 def _assistant_config(cp):
     """``{"personal_assistant": ...}`` from the fleet section. In single-operator mode the owner's own approval of the
     assistant's sensitive actions is allowed (there is only one person); otherwise the section is passed through."""
@@ -3797,7 +3840,8 @@ def _assistant_config(cp):
     if not isinstance(pa, dict):
         return None
     if cp.get("single_operator") is True:
-        pa = {**pa, "actions": {**(pa.get("actions") or {}), "allow_self_approval": True}}
+        actions = pa.get("actions")
+        pa = {**pa, "actions": {**(actions if isinstance(actions, dict) else {}), "allow_self_approval": True}}
     return {"personal_assistant": pa}
 
 

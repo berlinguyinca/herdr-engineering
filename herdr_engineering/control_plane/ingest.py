@@ -581,6 +581,8 @@ class IngestService:
             verdict=payload.get("verdict"),
             started_at=payload.get("started_at"),
             completed_at=payload.get("completed_at"),
+            repository=payload.get("repository"),
+            pull_request_number=payload.get("pull_request_number"),
         )
 
     def _ingest_review_finding(self, entity_id, payload, source) -> dict:
@@ -615,6 +617,8 @@ class IngestService:
             branch=payload.get("branch"),
             base=payload.get("base"),
             created_at=payload.get("created_at"),
+            merged_at=payload.get("merged_at"),
+            closed_at=payload.get("closed_at"),
         )
 
     def _ingest_host(self, entity_id, event_type, payload, source="herdr") -> dict:

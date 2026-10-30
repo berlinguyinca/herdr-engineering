@@ -11,6 +11,10 @@ from pathlib import Path
 from typing import Any
 
 from . import ids
+from .artifact_context import ArtifactContextMixin
+from .artifact_lifecycle import ArtifactLifecycleMixin
+from .artifact_provenance import ProvenanceError, context_links, normalize_origin
+from .artifact_uploads import ArtifactUploadMixin
 from .rustfs import IntegrityError, RustFSClient
 
 __all__ = ["ArtifactStore", "ArtifactError", "ArtifactConflict", "IntegrityError"]
@@ -41,7 +45,7 @@ async def _transaction(conn: Any):
         yield conn
 
 
-class ArtifactStore:
+class ArtifactStore(ArtifactContextMixin, ArtifactUploadMixin, ArtifactLifecycleMixin):
     def __init__(self, conn: Any, rustfs: RustFSClient):
         self._conn = conn
         self._rf = rustfs
@@ -84,8 +88,18 @@ class ArtifactStore:
                              job_id: str | None = None,
                              idempotency_key: str | None = None,
                              report_descriptor: dict | None = None,
-                             validation: dict | None = None) -> dict:
-        """Commit one immutable version using compare-and-swap on the head."""
+                             validation: dict | None = None,
+                             origin: dict | None = None) -> dict:
+        """Commit one immutable version using compare-and-swap on the head.
+
+        ``origin`` carries P03 provenance (room/task/issue/project, session, agent, model, prompt/skill revision,
+        commit, inputs). It is validated and redacted here and committed with the version in one transaction, together
+        with the lookup bindings and the publish-ledger row that reconciliation repairs.
+        """
+        try:
+            origin_columns = normalize_origin(origin)
+        except ProvenanceError as exc:
+            raise ArtifactError(str(exc)) from exc
         if report_descriptor is not None:
             from .artifact_report_descriptor import validate_report_descriptor
             report_descriptor = validate_report_descriptor(report_descriptor, output_manifest)
@@ -103,6 +117,8 @@ class ArtifactStore:
             request_body["report_descriptor"] = report_descriptor
         if validation:
             request_body["validation"] = validation
+        if origin:
+            request_body["origin"] = origin
         request_sha = hashlib.sha256(
             json.dumps(request_body,
                        sort_keys=True, separators=(",", ":")).encode()
@@ -215,12 +231,29 @@ class ArtifactStore:
                 "INSERT INTO artifact_versions (version_id, artifact_id, version_number, "
                 "parent_version_id, base_version_id, state, source_manifest_blob, "
                 "output_manifest, provenance, created_by, agent_id, host_id, session_id, "
-                "mission_id, job_id, committed_at, report_descriptor, validation) VALUES "
-                "($1,$2,$3,$4,$5,'ready',$6,$7::jsonb,$8::jsonb,$9,$10,$11,$12,$13,$14,now(),$15::jsonb,$16::jsonb)",
+                "mission_id, job_id, committed_at, report_descriptor, validation, origin_room_id, origin_task_id, "
+                "origin_issue_ref, origin_project_id, origin_session_ref, origin_agent_ref, model_id, "
+                "prompt_revision, skill_revision, commit_sha, redacted_inputs) VALUES "
+                "($1,$2,$3,$4,$5,'ready',$6,$7::jsonb,$8::jsonb,$9,$10,$11,$12,$13,$14,now(),$15::jsonb,$16::jsonb,"
+                "$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27::jsonb)",
                 version_id, artifact_id, version_number, base_version_id, base_version_id,
                 source_manifest_blob, output_json, provenance_json, created_by, agent_id,
                 host_id, session_id, mission_id, job_id, report_json, validation_json,
+                origin_columns["origin_room_id"], origin_columns["origin_task_id"],
+                origin_columns["origin_issue_ref"], origin_columns["origin_project_id"],
+                origin_columns["origin_session_ref"], origin_columns["origin_agent_ref"],
+                origin_columns["model_id"], origin_columns["prompt_revision"], origin_columns["skill_revision"],
+                origin_columns["commit_sha"], json.dumps(origin_columns["redacted_inputs"]),
             )
+            links = context_links(origin_columns)
+            if any(links.values()):
+                await self._insert_link(
+                    artifact_id, created_by=created_by, task_id=links["task_id"], project_id=links["project_id"],
+                    issue_ref=links["issue_ref"], room_id=links["room_id"], link_kind="origin",
+                    version_id=version_id, source_event_id=f"art-{version_id}-links")
+            await self._conn.execute(
+                "INSERT INTO artifact_publish_ledger (version_id, artifact_id, source_event_id) VALUES ($1,$2,$3)",
+                version_id, artifact_id, f"art-{version_id}")
             await self._conn.execute(
                 "UPDATE artifacts SET current_version_id=$1, status='available' "
                 "WHERE artifact_id=$2", version_id, artifact_id,
@@ -260,6 +293,7 @@ class ArtifactStore:
             "job_id": job_id,
             "report_descriptor": report_descriptor,
             "validation": validation,
+            **{key: value for key, value in origin_columns.items() if value not in (None, [])},
         }
 
     async def report_permission(self, artifact_id: str, principal_id: str, permission: str) -> bool:
@@ -461,7 +495,7 @@ class ArtifactStore:
             return None
         value = dict(row) if not isinstance(row, dict) else row
         normalized = ArtifactStore._jsonable(value)
-        for key in ("output_manifest", "provenance", "validation", "report_descriptor", "payload",
+        for key in ("output_manifest", "provenance", "validation", "report_descriptor", "payload", "redacted_inputs",
                     "request", "permissions", "findings"):
             candidate = normalized.get(key)
             if isinstance(candidate, str):

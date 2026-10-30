@@ -525,3 +525,227 @@ Turn it on in this order: deploy with it off (the migration applies at boot), se
 wait for the worker log line `inspector snapshot written`, then redeploy once more and check
 `boot inspector replay: snapshot` and the phase timing. Rollback is `enabled: false`; the table can stay.
 If a redaction rule or inspector semantics change, bump `SNAPSHOT_VERSION` in `inspector.py`.
+
+## Rakazo mobile bridge (iPhone app against the Herdr assistant)
+
+The Rakazo mobile app can be registered as a **custom server** and then talks to the Herdr Personal Assistant: a Rakazo
+"bot" is a Herdr assistant, its one chat is the assistant's thread, a message is an assistant message, a run is an
+assistant run, and an approval card is an assistant approval. The bridge keeps no second assistant, task store, memory
+or scheduler. Code: `control_plane/rakazo_bridge.py` (auth, procedures) and `rakazo_events.py` (wire shapes, event stream).
+
+**Enable** (fleet YAML; the Personal Assistant must be enabled too, and the control plane restarted):
+
+```yaml
+control_plane:
+  rakazo_bridge:
+    enabled: true
+    token_ttl_days: 30        # default
+    max_tokens: 5             # live sessions per account, default
+    trusted_proxies: []       # addresses/CIDRs whose X-Forwarded-For is believed (loopback always is); see below
+    accounts:                 # reserved shape for a later multi-user mode; only role: operator exists today
+      - email: you@example.com
+        password_scrypt: "scrypt$32768$8$1$...$..."
+        role: operator
+        # tokens_valid_after: "2026-11-02T09:30:00Z"   # optional revocation cut-off, see "Revoking a lost phone"
+```
+
+`enabled: true` with no account, a malformed hash, an unknown key or any role but `operator` (`family` is reserved, not
+implemented) stops the control plane at startup with a message naming the field. Disabled (the default) leaves every
+`/rpc/*` and `/api/auth/*` path a 404, as before.
+
+**Make the hash** without putting the password on a command line (it prompts twice on a terminal, or reads one line from stdin):
+
+```bash
+herdr-eng bridge hash-password          # prints scrypt$32768$8$1$<salt>$<hash>; paste it as password_scrypt
+```
+
+**Persist sessions** by applying migration `0036_rakazo_bridge_tokens.sql` (`herdr-eng control-plane migrate`, done by the normal
+deploy). With `control_plane.pg_dsn` set the bridge stores only `sha256(token)` plus expiry, creation, last use and last
+address, so a restart does not sign the phone out; without a DSN, or if the table is unreadable at boot, restarting the
+control plane signs everyone out. If the table cannot be written, sign-in fails (no token is issued that would not
+survive). Database calls never run under the token lock and carry a 3 s connect, statement and lock timeout whatever the
+DSN says, so a stuck database costs a request seconds, not a hang.
+
+**Revoking a lost phone.** A token that is signed out, evicted, expired or cut off is dead in memory at once; the database
+delete follows, and one that fails is remembered and retried with backoff (5 s doubling to 5 min) on later token operations
+(sign-out then answers an error saying so). That memory is lost on a restart, so **deleting rows and restarting is a safe
+revocation only if the deletes succeeded** (check the control-plane log for `could not delete a revoked token row`). The safe
+procedure does not depend on the database:
+
+1. Set `accounts[].tokens_valid_after` to the current time (ISO-8601 with a zone, not in the future) and restart the control
+   plane. Every token created before that moment is rejected, loaded or not, and its row is deleted at the next boot.
+   Signing in again afterwards works (new tokens are newer than the cut-off).
+2. Change the password: generate a new hash with `herdr-eng bridge hash-password`, replace `password_scrypt`, restart.
+3. For a lockout of the whole account instead, remove the account from `accounts` and restart.
+
+**Register in the app**: the sign-in screen opens a Server page (it shows the current server; **Save** probes it): enter `https://local.metabolomics.us`. The app stores only scheme://host:port and
+calls `/rpc/*` and `/api/auth/*` at the origin root, so whatever fronts that name must forward those two prefixes to this
+listener unchanged (the apex upstream of the fabric gateway already forwards every path to `herdr-cp-web`) and must not
+buffer `text/event-stream` responses (`X-Accel-Buffering: no` is sent). Plain `http://` is accepted by the app only for
+private/Tailscale addresses. Then sign in with the email and password above and create a bot in the app; an assistant
+already made in the dashboard for the same account appears by itself.
+
+**Security model.** Sign-in checks the email (case-insensitive) and a scrypt hash in constant time and always spends one
+KDF, whether or not the email exists; the same `Invalid credentials` answer covers both (a body that is not a sign-in
+attempt gets a generic 400 and costs nothing). Each **source address** locks out after 5 failures for 30 s, doubling up to
+an hour (`429` with `Retry-After`, checked before any password work), and at most two KDFs run at once. There is
+**deliberately no lockout across all addresses**: it would let any device on the tailnet keep the owner out of sign-in. The
+cost of that choice is that guessing is limited per address, not globally, so use a long unique password (a scrypt hash only
+slows an offline attack on the YAML, not a stolen password). A global count of recent failures is logged
+(`failed sign-in from <address> (N from all addresses in 10 minutes)`) for monitoring. A token is 32 random bytes shown
+once. The password, tokens, hashes and request bodies are never logged or written to the audit trail; sign-in and sign-out
+are audited under the account's id, and everything the app does is audited as the account's own assistant user.
+
+**Which address is locked out.** The lockout keys on the address the control plane attributes to the request: the TCP peer,
+or the last `X-Forwarded-For` entry when the peer is loopback or inside `trusted_proxies` and the entry is an IP address.
+The fabric gateway terminates TLS and forwards to the apex upstream through `rewriting_pipe(..., forwarded_for=peer)`
+(`devfabric.py`, called from `fabric.py _proxy_one`), which **replaces** any client-supplied `X-Forwarded-For` with the real
+client address; but it connects to the control plane from the host or Docker bridge, not from loopback. So with the default
+`trusted_proxies: []` the control plane sees that connection's source (a non-loopback host/bridge address) and ignores the
+header: **every client then shares one lockout key**, one device's five bad guesses lock all sign-in for 30 s and the owner
+could be held out by repeating that. To key on the real client, list the address the control plane logs for a failed sign-in from the gateway
+(`failed sign-in from ...` shows the key; a bridge address such as `172.18.0.1` or the host's tailnet address) in
+`trusted_proxies`. I have not observed what the production gateway presents, so check the first failed sign-in after enabling
+and set it. Only list proxies that overwrite the header, as the gateway does; a device that reaches the listener directly can
+never choose its own key. Under `tailscale serve` the peer is loopback and the header is trusted without configuration.
+
+Each account is its own assistant user (`rakazo:<hash of the normalised email>`), so a second account gets separate bots,
+threads, memory, grants, approvals, audit identity and rate limit; the tenant still comes from
+`personal_assistant.tenancy`. Approvals answered in the app go through the same `decide_approval` path as the dashboard,
+with the same rules: the approver must differ from the requester for a sensitive tool unless
+`personal_assistant.actions.allow_self_approval` (or `control_plane.single_operator`) already allows it. **With
+`control_plane.single_operator` on, the bridge password alone is enough to approve that account's own sensitive tool
+requests** (send_message, run_shell and the like); there is no second person in the loop. Use a long, unique password.
+
+**Residual risk.** A token grants that account's full assistant access (its tools, grants and approvals) from anywhere that
+can reach the listener, i.e. the tailnet; there is no second factor and no device binding. Keep the password long and
+unique, keep `max_tokens` low, and see "Revoking a lost phone" if a phone is lost; nothing else is exposed (no control-plane API key route
+accepts a bridge token, and no bridge route accepts an API key).
+
+**Supported:** health probe, email/password sign-in and sign-out, `me`, `spaces/list` (one fixed space, "Herdr"),
+`bots/list|get|create` (at most 20 bots per account), `threads/get|head|messages|send|stop|markRead|subscribe` (live events: new messages, run
+started/waiting/completed/failed/cancelled, approval cards and their answers), `threads/answer` for approvals,
+`runs/list`, `aiConsent/*` (no recipients, so no prompt), `notifications/registerPush|unregisterPush` and
+`analytics/screen` (accepted and discarded). Sending runs on in the background so a slow model does not hit the app's 8 s
+timeout; the reply and any failure arrive as events.
+
+**Not supported** (answered `404 NOT_FOUND` in Rakazo's error shape so the app degrades per screen): push notifications
+(nothing is delivered while the app is closed), voice and calls, billing and the model/provider screens, groups,
+attachments, memory, routines, skills, connections, bot editing/archiving, and spaces other than "Herdr".
+`threads/send` does not deduplicate a retried `clientNonce`.
+
+### Board proposals on the phone (project intelligence)
+
+Pending project-intelligence **board proposals** (`ci_rerun`, `request_ci_repair`, `propose_issue`, `link_entities`,
+`pause_ingestion`) appear in the account's **first bot's thread** as an approve/reject card, so the operator can decide
+them from the phone. Code: `control_plane/rakazo_proposals.py` (`ProposalDesk`); the card and run shapes are in
+`rakazo_events.py`; the decision is `IntelligenceRoutes.decide_proposal`, the same function the dashboard route
+(`POST /intelligence/proposals/<id>/approve|reject`) calls, so flags, approver rules, project scope, the exact
+`payload_sha256` + `resource_version`, audit and the `ProposalExecutor` (a no-op unless `project_intelligence.execute`) are
+shared, not copied.
+
+**Fail closed.** Nothing is shown unless all of these hold, otherwise the app sees no card (the first reason that stops it
+is logged once per account, without ids or payload text):
+- `project_intelligence.enabled` and `suggest` are on and the kill switch is off;
+- the bridge account has a scope in `project_intelligence.assistant_viewers["<tenant>/rakazo:<account id>"]`
+  (`{org_id, projects, clearance}`), the scope its own assistant files proposals under. `default_org_id` is for the open
+  listener and is never used for the phone. Out-of-org and, for a project-scoped account, other-project proposals are never
+  listed and cannot be decided;
+- the account may decide: `control_plane.single_operator` is on, or the account's `rakazo:<account id>` is listed in
+  `project_intelligence.approvers`. Without single-operator mode the board's own rule still refuses a requester approving
+  its own proposal. In single-operator mode the bridge password alone approves, including a proposal that account's own
+  assistant filed (same trade-off as the tool approvals above).
+
+**Behaviour.** A cheap read of the in-memory board runs on every `threads/get|head|messages` and at most every 5 s while a
+`threads/subscribe` stream is open (no extra scheduler). One proposal is one card (keyed by proposal id). A new proposal
+also posts a short bot message in the thread. The card title is built only from fields that pass the executor's validation
+(for example `CI failed? Re-run owner/repo run 302`); anything that fails validation, any `propose_issue` body, and anything
+token-shaped is replaced by a generic line. The detail shows the expiry and whether approving runs the action. The app
+enables a card's buttons only while its run is `waiting_input`, so each pending card has a synthetic run
+(`run_proposal_<id>_<hash prefix>`); the answer must quote it, and the server uses the hash and version it recorded when it
+showed the card, never ones from the request. When a proposal is approved, rejected, expired, executed or failed the card
+turns answered, the run ends, and a one-line outcome (the recorded reason on failure) is posted. Answering the same way twice
+is a no-op ("Already approved"); the opposite answer after the fact, an expired proposal or a changed payload is refused
+(409).
+
+**Notes.** Names in `approvers` are matched against the bare principal id (`rakazo:<account id>`), not tenant-qualified. For
+`propose_issue` only the title reaches the phone (never the body), so approve issue proposals on the dashboard where the
+whole text is visible. A failed execution shows only the exception type and "see the dashboard", never its message. If the
+account loses its standing while a card is open (kill switch, `suggest` off, scope removed) the card is marked unavailable
+and its run ends. A request that wants a current view re-reads the board at most once a second.
+
+**Limits.** There is no push: a custom server cannot reach APNs, so the in-thread message appears the next time the thread is
+opened or streamed, not on the lock screen. Proposals live 30 minutes and the board and journal are both in memory, so a control-plane restart drops pending
+proposals (as on the dashboard). Only the first bot's thread carries cards. Approving executes in the request; a slow CI provider can outlast the app's
+8 s timeout, but execution is claimed once, so retrying is safe.
+attachments, memory, routines, skills, connections, bot editing/archiving, spaces other than "Herdr", and ActionBoard
+proposals (those stay on the dashboard). `threads/send` does not deduplicate a retried `clientNonce`.
+
+## Scheduled CI watch (assistant)
+
+`watch_ci` used to run only when the assistant model called it, so a failed CI run went unnoticed unless someone asked.
+`control_plane.personal_assistant.ci_watch` adds a deterministic server-side loop (no model, no routine) that calls it
+every `interval_seconds` (default 300, minimum 60; the first tick is jittered by up to 30 s) as the actor
+`system:ci_watch`. Each NEW failure becomes one `request_ci_repair` and one `ci_rerun` proposal on the intelligence board,
+one assistant `ci_repair` proposal and one dashboard notification; nothing is merged, pushed or restarted without an
+approval, and `project_intelligence.execute` still gates execution. Off unless `enabled: true`.
+
+Failure source. The deployed flow writes lineage `ci` nodes only from the graph merge gate's evidence writer, and those
+nodes carry a commit and a check but no repository or run number, so `watch_ci` could not alert from them. The watch
+therefore also reads the CI monitor's cached snapshot (`source: both`, the default): pipelines whose state is
+failure/error (not killed) with a full `owner/name` repository, with a hex commit, in the user's project scope (checked before the 100-row cap) and finished within `max_age_seconds` (default 6 h; rows with no timestamp are dropped). Only the scheduled runner uses this source: the manual/tool `watch_ci` path stays lineage-only. Both sources share one fingerprint (repo, run, head), so `both` never double-alerts, dedupe and proposal path.
+The repository must also be in `project_intelligence.webhook_projects` and in the user's scope, or the board refuses it
+(reported as a skipped reason, not an error).
+
+Per listed user a tick skips quietly (counted in status) when the assistant is disabled, project intelligence is
+disabled or on kill switch, the user has no `assistant_viewers["<tenant>/<user>"]` entry, or no enabled assistant
+exists (when `assistant_id` is omitted the oldest enabled one is used). A missing `watch_ci` grant logs one WARNING per
+user per hour and does nothing; with `auto_grant: true` the loop creates the standing grant itself (scope `*`, not
+preauthorized, at most `grant_max_ttl_seconds`; re-created, with an `auto_regranted` audit record, only after it EXPIRED. A revoked grant is never re-created: one hourly WARNING, skip reason `grant_revoked`) and writes an audit record
+`assistant.ci_watch.auto_granted` by `system:ci_watch`. One user failing never stops another; a tick has a time budget
+(`tick_budget_seconds`, default 60, also checked per row) and creates at most `max_new_per_tick` (default 10) proposals per user, the rest waiting for the next tick (`skipped_over_limit` in status); the thread stops with the server.
+
+Status: `GET /api/v1/intelligence/status` (operator) carries `ci_watch`: `last_at`, `ticks`, `created` (running total),
+`last_created`, `duplicates`, `skipped` (counts by fixed reason: `no_grant`, `no_scope`, `kill_switch`,
+`intelligence_disabled`, `assistant_disabled`, `no_assistant`, `budget_exceeded`, `error`), `last_error`
+(`user_failed` or `tick_failed`, never exception text) and a per-user result list.
+
+Restarts. Dedupe is by fingerprint over the assistant store. With `personal_assistant.persistence.dsn` set the proposals
+survive a restart and nothing is re-alerted. Without it the store is in memory and a restart can re-alert each current
+failure once. The board proposals themselves live in memory for 30 minutes by design, so a restart (or the lapse) means
+the board entry must be re-requested; the watch only does that for a failure it has not recorded.
+
+Turning it on for the dashboard user (the open tailnet listener is the principal `open-listener`, tenant `default`):
+
+```yaml
+control_plane:
+  personal_assistant:
+    enabled: true
+    ci_watch:
+      enabled: true
+      auto_grant: true          # or grant watch_ci (scope "*") once in the dashboard
+      users:
+        - {tenant_id: default, user_id: open-listener}
+  project_intelligence:
+    enabled: true
+    webhook_projects: {"owner/repo": ["project-id"]}
+    assistant_viewers:
+      "default/open-listener": {org_id: "<org>", projects: "*"}
+```
+
+For a Rakazo bridge account add `{tenant_id: default, user_id: "rakazo:<id>"}` and an `assistant_viewers` entry
+`"default/rakazo:<id>"`. The id is `rakazo:` plus the first 16 hex characters of
+`sha256("rakazo-bridge-account:" + lowercase(strip(email)))`. The server logs the ids at startup
+(`rakazo bridge assistant users: rakazo:...`, no email or secret), and an account must have created an assistant
+(opened the app once) before the watch has an assistant to act for. If `personal_assistant.tenancy.principals` maps the
+user to another tenant, use that tenant; the server logs a warning when the configured tenant disagrees.
+
+**Approving returns at once.** `threads/answer` records the decision and audit under the routes lock and returns
+`{"ok": true, "state": "approved"}` (the card shows "Allowed once", the outcome message says "Running now"); the executor
+(for a CI re-run, a Woodpecker restart that can take seconds) then runs on a daemon thread owned by the desk, at most 4 at a
+time with no queue behind them: a fifth approval while 4 run is refused with 429 before anything is decided. When the
+execution ends the same thread refreshes the journal, so the card turns Executed or Failed and the outcome is posted
+whether or not a stream is open. The executor claims the proposal itself, so a double answer, a racing dashboard approve or
+a late reject still cannot run it twice or after a reject. The board is in memory: a control-plane restart mid-execution
+drops the proposal with the rest of the board (nothing is left "executing"), and the action may or may not have reached
+the CI provider; check the dashboard or CI.

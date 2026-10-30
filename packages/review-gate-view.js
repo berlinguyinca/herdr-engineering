@@ -105,7 +105,7 @@ const styles=`<style>
 const errorText=e=>e&&e.name==='TimeoutError'?'request timed out':short(e&&e.body&&typeof e.body.error==='string'?e.body.error:e&&e.message,300)||'request failed';
 const SOURCES=[['prs','/api/v1/review-gate/prs'],['queue','/api/v1/review-gate/queue'],['notices','/api/v1/review-gate/notices'],['main','/api/v1/review-gate/main']];
 
-export function mountReviewGate(container,client,{intervalMs=5000,timers={setInterval,clearInterval},requestTimeoutMs=10000,timeout=ms=>AbortSignal.timeout(ms),onFreshness=()=>{}}={}) {
+export function mountReviewGate(container,client,{intervalMs=5000,timers={setInterval:(...a)=>setInterval(...a),clearInterval:(...a)=>clearInterval(...a)},requestTimeoutMs=10000,timeout=ms=>AbortSignal.timeout(ms),onFreshness=()=>{}}={}) {
  const panels={};for(const [name] of SOURCES)panels[name]={data:null,at:0,error:''};
  const linked=(a,b)=>{if(typeof AbortSignal.any==='function')return AbortSignal.any([a,b]);const c=new AbortController();for(const x of [a,b]){if(x.aborted)c.abort(x.reason);else x.addEventListener('abort',()=>c.abort(x.reason),{once:true});}return c.signal;};
  let epoch=0;
