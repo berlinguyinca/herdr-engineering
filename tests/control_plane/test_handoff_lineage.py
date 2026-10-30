@@ -29,6 +29,13 @@ def test_a_context_handoff_on_the_same_model_reads_as_same_and_quiet():
     assert reg._attention_reason(row, None) is None
 
 
+def test_a_lineage_row_takes_its_age_from_when_the_node_was_received():
+    timed = {**node("h4"), "first_seen_at": "2026-10-30T10:00:00+00:00", "last_seen_at": "2026-10-30T11:00:00+00:00"}
+    row = row_from_node(timed)
+    assert (row["created_at"], row["updated_at"]) == ("2026-10-30T10:00:00+00:00", "2026-10-30T11:00:00+00:00")
+    assert row_from_node(node("h5"))["updated_at"] == ""        # a reader without history gets no age
+
+
 def test_an_unpinned_successor_and_a_model_switch_both_ask_for_attention_with_a_reason():
     reg = HandoffRegistry(ControlPlaneRepo(), now=lambda: NOW)
     unpinned = row_from_node(node("h2", cause="context_pressure", from_model="qwen", to_model=None))

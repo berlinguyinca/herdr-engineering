@@ -3,8 +3,8 @@
 Pi reports every handoff as a ``handoff:<id>`` lineage node (state, cause, from/to model, checkpoint, from/to session) and, once a
 successor acknowledges, a ``handoff`` edge. The registry (``handoffs.py``) holds handoffs agents create over the API; this module
 turns the lineage nodes into the same row shape so one page can show both. Rows are only ever built from nodes the caller's
-principal may read (the graph's own visibility rules), and the node carries no timestamp, so ``updated_at`` stays empty rather
-than invented.
+principal may read (the graph's own visibility rules). Times are when the control plane received the node's first and last event
+(``first_seen_at`` / ``last_seen_at``), never Pi's own clock; a reader whose history is limited gets none, and the row then has no age.
 """
 from __future__ import annotations
 
@@ -56,7 +56,8 @@ def row_from_node(node):
     provenance = {k: v for k, v in {"cause": cause, "checkpoint": _text(attrs.get("checkpoint_sha")), "kind": _text(attrs.get("handoff_kind")),
                                     "from_model": from_model, "to_model": to_model, "lineage_state": raw_state,
                                     "from_generation": _text(attrs.get("from_generation")), "to_generation": _text(attrs.get("to_generation"))}.items() if v}
-    return {"handoff_id": node["id"], "origin": ORIGIN, "state": state, "schema_version": 1, "created_at": "", "updated_at": "",
+    return {"handoff_id": node["id"], "origin": ORIGIN, "state": state, "schema_version": 1,
+            "created_at": _text(node.get("first_seen_at")) or "", "updated_at": _text(node.get("last_seen_at")) or "",
             "created_by": "pi", "goal": CAUSE_TEXT.get(cause or "", goal) if not node.get("label") else goal,
             "source": {"harness": "pi", "agent_id": None, "session_id": _bare(attrs.get("from_session_id"))},
             "target": {"harness": "pi", "agent_id": None, "session_id": _bare(attrs.get("to_session_id")), "model_hint": to_model},

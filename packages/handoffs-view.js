@@ -57,7 +57,7 @@ export function handoffCard(h) {
     <span class="hd-row__state hd-row__state--${esc(h.state)}">${esc(String(h.state).replace('_', ' '))}${h.stalled ? ' · stalled' : ''}</span>
     <strong class="hd-row__who">${esc(agentName(h.source))} → ${esc(agentName(h.target))}</strong>
     <span class="hd-row__goal">${esc(h.origin === 'lineage' ? `${CAUSE[h.cause] || h.cause || 'handoff'} · ${modelText(h)}` : clip(h.goal, 140))}</span>
-    <small class="hd-row__meta">${h.origin === 'lineage' ? esc(h.attention_reason || '') : `${h.completed} done · ${h.remaining} left · ${esc(ago(h.updated_at))}`}</small></button>`;
+    <small class="hd-row__meta">${h.origin === 'lineage' ? esc([h.attention_reason, h.updated_at && ago(h.updated_at)].filter(Boolean).join(' · ')) : `${h.completed} done · ${h.remaining} left · ${esc(ago(h.updated_at))}`}</small></button>`;
 }
 
 const list = (items) => (items && items.length ? `<ul>${items.map((i) => `<li>${esc(typeof i === 'string' ? i : JSON.stringify(i))}</li>`).join('')}</ul>` : '<p class="hd-muted">Nothing recorded.</p>');
