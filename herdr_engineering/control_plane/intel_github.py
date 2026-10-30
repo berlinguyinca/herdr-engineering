@@ -57,7 +57,8 @@ class SharedCredentialPrLister:
             raise self._fail("invalid_repository")
         provider = self._credentials()
         try:
-            token = provider.token_for(owner, github_auth.PULLS_PERMISSIONS, [name])
+            reader = getattr(provider, "token_or_raise", None)     # the App keeps the precise reason
+            token = (reader or provider.token_for)(owner, github_auth.PULLS_PERMISSIONS, [name])
         except github_auth.GitHubAuthError as exc:
             raise self._fail(exc.reason) from None
         if not token:
