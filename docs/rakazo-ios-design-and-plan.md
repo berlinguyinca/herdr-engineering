@@ -108,3 +108,15 @@ Decisions made rather than left open, each implemented and contract-tested:
 Still answered with "nothing configured" or a reasoned refusal: MCP assignments/OAuth, other connectors, messaging, tickets,
 boards, onboarding, approval rules, voice and computer hosts, marketplace. Not started: auto-sync of running agents into rooms,
 steering cards. Impossible without other infrastructure: push (APNs), voice/desktop hosts.
+
+### Update 5
+
+#475: a per-space ticket board (boards, tickets, comments; `me.ticketBoardEnabled` is now true) and onboarding acknowledgements.
+
+What remains, and why it is left alone rather than guessed at. These are the ones where acting autonomously would mean a
+security decision on the owner's behalf:
+- **Approval rules / auto review**: enforcing "always allow" would auto-approve agent actions. It must be wired into the
+  assistant's approval path by the owner, not inferred by the bridge.
+- **Auto-sync of running agents into rooms / steering cards**: grants room membership from host-registry proofs.
+- **Messaging channels, marketplace, computer/voice hosts, push**: need external accounts or infrastructure (Slack/Telegram
+  apps, a registry, donbot/nibbler hosts, APNs) that do not exist yet.
