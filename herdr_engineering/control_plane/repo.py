@@ -54,6 +54,7 @@ from .ids import new_id, validate_mission_id
 from .inspector import REQUIRED_DURABLE_KINDS, InspectorStore
 from .mission_activity import MissionActivityStore
 from .redact import redact_payload
+from . import review_refs
 from .service_catalog import (
     INACTIVE,
     capture_service_origin,
@@ -1599,9 +1600,15 @@ class ControlPlaneRepo:
         verdict=None,
         started_at=None,
         completed_at=None,
+        repository=None,
+        pull_request_number=None,
     ):
+        repository = review_refs.repository(repository)
+        pull_request_number = review_refs.pull_request_number(pull_request_number)
         stamp = self._stamp()
         existing = self._reviews.get(review_id)
+        if pull_request_number is not None and not (repository or (existing or {}).get("repository")):
+            raise ValueError("pull_request_number needs the repository it belongs to")
         if existing is None:
             rec = {
                 "review_id": review_id,
@@ -1612,6 +1619,8 @@ class ControlPlaneRepo:
                 "verdict": verdict,
                 "started_at": started_at or stamp,
                 "completed_at": completed_at,
+                "repository": repository,
+                "pull_request_number": pull_request_number,
                 "findings": [],
                 "created_at": stamp,
                 "updated_at": stamp,
@@ -1631,6 +1640,8 @@ class ControlPlaneRepo:
                         "verdict",
                         "started_at",
                         "completed_at",
+                        "repository",
+                        "pull_request_number",
                     )
                 },
                 mission_id=mission_id,
@@ -1646,6 +1657,8 @@ class ControlPlaneRepo:
             "verdict": verdict,
             "started_at": started_at,
             "completed_at": completed_at,
+            "repository": repository,
+            "pull_request_number": pull_request_number,
         }.items():
             if v is not None:
                 existing[k] = v
@@ -1663,6 +1676,8 @@ class ControlPlaneRepo:
                     "verdict",
                     "started_at",
                     "completed_at",
+                    "repository",
+                    "pull_request_number",
                 )
             },
             mission_id=existing["mission_id"],
@@ -3798,6 +3813,8 @@ class ControlPlaneRepo:
                                     verdict=payload.get("verdict"),
                                     started_at=payload.get("started_at"),
                                     completed_at=payload.get("completed_at"),
+                                    repository=payload.get("repository"),
+                                    pull_request_number=payload.get("pull_request_number"),
                                 )
                         elif entity_type == "pull_request":
                             if event_type == "PullRequestMerged":
