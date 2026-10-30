@@ -454,3 +454,26 @@ def test_rotation_refuses_planted_symlinks(share_postgres, tmp_path):
         assert not os.path.lexists(rotated) and secret.exists()          # the link went, never its target
         assert _ns(await store.events(sid, limit=1000)) == []
     run(share_postgres, body)
+
+
+def test_rotated_file_survives_a_failed_open(share_postgres, tmp_path, monkeypatch):
+    """An open failure (EMFILE, EIO) on a regular .1 must keep it: its lines are read on the next call."""
+    async def body(store, conn):
+        aid, vid = await seed(conn)
+        sid = (await store.create(**kw(aid, vid)))["share_id"]
+        f, rotated = tmp_path / "events.jsonl", tmp_path / "events.jsonl.1"
+        marker = tmp_path / "m.json"
+        rotated.write_text(_gen_lines(sid, 1, 0, 3))
+        old = time.time() - 3600
+        os.utime(rotated, (old, old))
+        real = ShareStore._open_regular
+
+        def failing(path):
+            return None if Path(path) == rotated else real(path)
+        monkeypatch.setattr(ShareStore, "_open_regular", staticmethod(failing))
+        assert await store.ingest_and_rotate_events(f, marker_path=marker) == 0
+        assert rotated.exists()
+        monkeypatch.undo()
+        assert await store.ingest_and_rotate_events(f, marker_path=marker) == 3
+        assert not rotated.exists()
+    run(share_postgres, body)
