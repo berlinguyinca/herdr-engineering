@@ -19,9 +19,10 @@ from datetime import datetime
 from typing import Any
 
 from .assistant import redact_secrets
+from .rakazo_spaces import DEFAULT_SPACE_ID, DEFAULT_SPACE_NAME
 
-SPACE_ID = "herdr"
-SPACE_NAME = "Herdr"
+SPACE_ID = DEFAULT_SPACE_ID            # kept for callers that mean the default space
+SPACE_NAME = DEFAULT_SPACE_NAME
 _AVATAR = "#4f46e5"
 APPROVAL_PREFIX = "approval:"
 PROPOSAL_PREFIX = "proposal:"                # a project-intelligence board proposal shown as an ask card
@@ -49,16 +50,17 @@ def snippet(text: str, limit: int) -> str:
 
 
 # --------------------------------------------------------------------------------------------- bots, spaces, me
-def bot_view(assistant, thread_id: str, preview: str, status: str) -> dict[str, Any]:
+def bot_view(assistant, thread_id: str, preview: str, status: str, space_id: str = SPACE_ID) -> dict[str, Any]:
     """An assistant as a Rakazo ``Bot`` (domain.ts BotSchema). ``threadId`` is mandatory in Rakazo."""
     stamp = iso(assistant.updated_at)
     return {
-        "id": assistant.assistant_id, "spaceId": SPACE_ID, "name": assistant.name, "title": "",
+        "id": assistant.assistant_id, "spaceId": space_id, "name": assistant.name, "title": "",
         "description": "", "instructions": assistant.instructions, "color": _AVATAR, "avatarSet": "organic",
         "notifyOnFinish": False, "pinned": False, "sectionId": None, "archivedAt": None, "unread": False,
         "parentBotId": None, "memoryScope": None, "threadId": thread_id, "preview": preview, "status": status,
         "runErrorId": None, "computerMode": "team", "updatedAt": stamp, "createdAt": iso(assistant.created_at),
-        "voiceId": None, "autoSpeak": False, "modelProvider": None, "modelId": None, "thinkingLevel": None,
+        "voiceId": None, "autoSpeak": False, "modelProvider": None,
+        "modelId": (getattr(assistant, "model_policy", "") or "")[7:] if str(getattr(assistant, "model_policy", "")).startswith("manual:") else None, "thinkingLevel": None,
         "teamChatAmbientEnabled": False, "teamChatRules": "", "crossSpaceCommunication": False,
         "fleetManagement": False, "disabledBuiltinTools": [], "webhookConfigured": False, "spawnKey": None,
         "incomingCall": None,
@@ -73,24 +75,25 @@ def space_bot_view(bot: dict[str, Any]) -> dict[str, Any]:
     return {k: bot[k] for k in _SPACE_BOT_KEYS}
 
 
-def spaces_view(bots: list[dict[str, Any]]) -> dict[str, Any]:
-    """``spaces/list``: the one fixed space, in both the ``current`` and the ``spaces`` shapes."""
-    return {
-        "current": {"id": SPACE_ID, "name": SPACE_NAME, "bots": bots, "groups": [],
-                    "externalConversations": [], "botSections": []},
-        "spaces": [{"id": SPACE_ID, "name": SPACE_NAME, "isDefault": True, "hasContent": bool(bots),
-                    "canRename": False, "canDelete": False, "botCount": len(bots),
-                    "bots": [space_bot_view(b) for b in bots], "groups": [], "externalConversations": [],
-                    "botSections": []}],
-    }
+def space_view(space_id: str, name: str, bots: list[dict[str, Any]], *, owned: bool) -> dict[str, Any]:
+    """One entry of ``spaces/list`` (domain.ts SpaceSchema). Only a space the account created can be renamed or deleted."""
+    return {"id": space_id, "name": name, "isDefault": not owned, "hasContent": bool(bots), "canRename": owned,
+            "canDelete": owned, "botCount": len(bots), "bots": [space_bot_view(b) for b in bots], "groups": [],
+            "externalConversations": [], "botSections": []}
 
 
-def me_view(account) -> dict[str, Any]:
+def spaces_view(current: dict[str, Any], spaces: list[dict[str, Any]], bots: list[dict[str, Any]]) -> dict[str, Any]:
+    """``spaces/list``: the active space in full (``current``) and every space of the account in short form."""
+    return {"current": {"id": current["id"], "name": current["name"], "bots": bots, "groups": [],
+                        "externalConversations": [], "botSections": []}, "spaces": spaces}
+
+
+def me_view(account, space_id: str = SPACE_ID) -> dict[str, Any]:
     """``me`` (domain.ts MeSchema): every required field, with the features this bridge lacks switched off."""
     return {
         "ticketBoardEnabled": False, "phoneCallsEnabled": False, "navLinks": [],
         "userId": account.principal_id, "email": account.email, "name": account.email.split("@", 1)[0],
-        "spaceId": SPACE_ID, "isDeploymentOwner": False, "isAdmin": False, "needsModel": False,
+        "spaceId": space_id, "isDeploymentOwner": False, "isAdmin": False, "needsModel": False,
         "defaultProvider": None, "defaultModel": None, "hostCredentialProvider": None, "hostCredentialSource": None,
         "computerHost": None, "canChooseHostComputer": False, "sandboxProvider": "none", "mcpStdioEnabled": False,
         "avatarStyle": "robot", "timezone": None, "billingEnabled": False, "needsSignupSurvey": False,
@@ -341,15 +344,15 @@ class JournalRegistry:
     """One :class:`ThreadJournal` per thread, created on first use."""
 
     def __init__(self, clock: Callable[[], float] = time.time):
-        self._base = int(clock()) * 1000
+        self._base = int(clock() * 1000)          # millisecond resolution: two boots in one second must not share a base
         self._journals: dict[str, ThreadJournal] = {}
         self.lock = threading.RLock()
 
-    def get(self, thread_id: str, assistant_id: str) -> ThreadJournal:
+    def get(self, thread_id: str, assistant_id: str, space_id: str = SPACE_ID) -> ThreadJournal:
         with self.lock:
             journal = self._journals.get(thread_id)
             if journal is None:
-                journal = self._journals[thread_id] = ThreadJournal(thread_id, assistant_id, SPACE_ID, self._base)
+                journal = self._journals[thread_id] = ThreadJournal(thread_id, assistant_id, space_id, self._base)
             return journal
 
 

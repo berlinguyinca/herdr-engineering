@@ -696,3 +696,13 @@ def test_real_server_enrol_heartbeat_lineage_revoke_end_to_end(tmp_path):
         assert call("GET", f"/rooms/{rid}/externals", None, f"Bearer {tokens['bob']}")[1]["externals"][0]["state"] == "revoked"
     finally:
         srv.shutdown()
+
+
+def test_my_agents_reports_an_external_agent_online_only_while_its_heartbeat_is_fresh(w):
+    agent, _, _ = enroll(w, label="Dana")
+    mine = lambda: next(a for a in w.s.list_my_agents(w.alice)["agents"] if a["agent_id"] == agent.id)  # noqa: E731
+    assert mine()["external"] is True and mine()["online"] is False          # no heartbeat yet
+    w.s.external_heartbeat(agent, {"status": "idle", "activity": "ready"})
+    assert mine()["online"] is True
+    w.s.clock.t += ext.PRESENCE_STALE + 1
+    assert mine()["online"] is False

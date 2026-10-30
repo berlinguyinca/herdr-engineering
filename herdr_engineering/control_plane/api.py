@@ -481,14 +481,24 @@ class ControlPlaneServer:
             self.assistant = assistant_service
         # control_plane.rakazo_bridge (off by default: nothing is constructed and /rpc/* + /api/auth/* answer 404).
         # A bad section raises here, so an enabled but malformed bridge stops startup instead of running open.
-        from .rakazo_bridge import PostgresTokenPersistence, RakazoBridge, rakazo_bridge_config
+        from .rakazo_artifacts import RegistryBackend
+        from .rakazo_bridge import (
+            PostgresPrefsPersistence,
+            PostgresSpacePersistence,
+            PostgresTokenPersistence,
+            RakazoBridge,
+            rakazo_bridge_config,
+        )
         from .rakazo_push import PostgresPushPersistence
         _bridge_cfg = rakazo_bridge_config(rakazo_bridge)
         if _bridge_cfg["enabled"]:       # the assistant user ids the bridge accounts act as (hashes, no email), for ci_watch.users
             log.info("rakazo bridge assistant users: %s", ", ".join(a.principal_id for a in _bridge_cfg["accounts"]))
         self.rakazo = (RakazoBridge(_bridge_cfg, self.assistant, version=__version__,
                                     persistence=PostgresTokenPersistence(rakazo_bridge_dsn) if rakazo_bridge_dsn else None,
-                                    push_persistence=PostgresPushPersistence(rakazo_bridge_dsn) if rakazo_bridge_dsn else None)
+                                    space_persistence=PostgresSpacePersistence(rakazo_bridge_dsn) if rakazo_bridge_dsn else None,
+                                    prefs_persistence=PostgresPrefsPersistence(rakazo_bridge_dsn) if rakazo_bridge_dsn else None,
+                                    push_persistence=PostgresPushPersistence(rakazo_bridge_dsn) if rakazo_bridge_dsn else None,
+                                    collab=collab, artifacts_fn=lambda: RegistryBackend(self))
                        if _bridge_cfg["enabled"] else None)
         from .ingest import IngestService
         # operator YAML: {api key: {rooms: [...], missions: [...]}} -> principal ids (the key itself is never kept)
@@ -2199,7 +2209,6 @@ def _make_handler(server, public=False, operator=False):
         def _rakazo(self):
             """``/rpc/*`` and ``/api/auth/*`` for the Rakazo mobile app (only when control_plane.rakazo_bridge is on).
             Auth is the bridge's own bearer token, not X-API-Key; the request body is never logged."""
-            from .rakazo_bridge import MAX_BODY
             lengths = self.headers.get_all("Content-Length") or []
             if len(lengths) > 1 or "Transfer-Encoding" in self.headers:
                 return self._deny(400, "ambiguous request framing")
@@ -2207,11 +2216,12 @@ def _make_handler(server, public=False, operator=False):
                 length = int(lengths[0]) if lengths else 0
             except ValueError:
                 return self._deny(400, "bad length")
-            if length < 0 or length > MAX_BODY:
+            headers = {k.lower(): v for k, v in self.headers.items()}
+            if length < 0 or length > server.rakazo.body_limit(self.path, headers):
+                self.close_connection = True              # the unread body would otherwise be parsed as the next request
                 return self._deny(413, "body too large")
             body = self.rfile.read(length) if length else b""
-            response = server.rakazo.handle(self.command, self.path, {k.lower(): v for k, v in self.headers.items()},
-                                            body, self.client_address[0])
+            response = server.rakazo.handle(self.command, self.path, headers, body, self.client_address[0])
             if response is None:
                 return self._send_json(404, {"error": "not found"})
             try:
