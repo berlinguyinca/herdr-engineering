@@ -83,6 +83,13 @@ def _stamp(value: datetime) -> str:
     return value.astimezone(UTC).strftime("%H:%M UTC")
 
 
+class Busy(Exception):
+    """Too many approved proposals are executing at once; nothing was decided."""
+
+
+MAX_EXECUTING = 4
+
+
 class ProposalDesk:
     def __init__(self, *, monotonic: Callable[[], float], poll_seconds: float = 5.0, min_interval: float = 1.0,
                  clock: Callable[[], datetime] = lambda: datetime.now(UTC)):
@@ -93,6 +100,9 @@ class ProposalDesk:
         self._warned: set[tuple[str, str]] = set()
         self._polled: dict[str, float] = {}
         self._decide_lock = threading.Lock()
+        self._slots = threading.BoundedSemaphore(MAX_EXECUTING)    # executions in flight; no queue behind them
+        self._workers: set[threading.Thread] = set()
+        self._closed = False
 
     # access ----------------------------------------------------------------------------------------------------
     def _warn_once(self, user: str, reason: str) -> None:
@@ -122,11 +132,9 @@ class ProposalDesk:
 
     # cards -----------------------------------------------------------------------------------------------------
     def _card(self, p: Proposal, user: str, execute_on: bool, now: datetime) -> dict[str, Any]:
-        state = {"awaiting_approval": "pending", "executing": "pending", "executed": "executed", "failed": "failed",
+        state = {"awaiting_approval": "pending", "approved": "approved", "executing": "approved", "executed": "executed", "failed": "failed",
                  "refused": "rejected", "expired": "expired"}.get(p.state)
-        if p.state == "approved":
-            state = "pending" if execute_on else "approved"      # approved + execute on = the executor is running it
-        state = state or "expired"
+        state = state or "expired"        # approved/executing with execute on = being run now (see ``running``)
         last = redact_secrets(snippet(p.history[-1], 200)) if p.history else ""
         if p.state == "failed":      # an exception message can carry provider text: only its type reaches the phone
             kind = re.match(r"execution failed: (\w{1,60})", last)
@@ -135,7 +143,7 @@ class ProposalDesk:
         outcome = {
             "executed": f"Done: {title}. {last}".strip(),
             "failed": f"Approved, but it did not run: {title}. {last}".strip(),
-            "approved": f"Approved: {title}. Execution is off, so nothing was run.",
+            "approved": f"Approved: {title}. " + ("Running now." if execute_on else "Execution is off, so nothing was run."),
             "rejected": f"Rejected: {title}.",
             "expired": f"Expired without a decision: {title}.",
             "pending": "",
@@ -168,7 +176,7 @@ class ProposalDesk:
             seen.add(p.id)
             cards.append(self._card(p, user, execute_on, now))
         for pid, old in list(journal.proposals.items()):
-            if pid in seen or old["state"] != "pending":
+            if pid in seen or old["state"] not in ("pending", "approved"):      # approved: may still be running
                 continue
             try:
                 p = self.routes.board.get(pid, viewer.org_id)
@@ -195,7 +203,8 @@ class ProposalDesk:
         return proposal_visible(viewer, p)
 
     # answers ---------------------------------------------------------------------------------------------------
-    def answer(self, tenant: str, user: str, journal, message_id: str, run_id: Any, decision: str) -> dict[str, Any]:
+    def answer(self, tenant: str, user: str, journal, message_id: str, run_id: Any, decision: str,
+               on_done: Callable[[], None] | None = None) -> dict[str, Any]:
         """``decision`` is "approve" or "reject". Raises ``pi.NotFound``, ``pi.Conflict``, ``ApprovalRefused``,
         ``pi.IntelligenceError`` for the bridge to map. The hash and version come from the card this server showed,
         never from the request."""
@@ -208,19 +217,71 @@ class ProposalDesk:
         access = self.access(tenant, user)
         if access is None:
             raise ApprovalRefused("this account may not decide project-intelligence proposals")
-        viewer, single, _ = access
-        with self._decide_lock:
+        viewer, single, execute_on = access
+        run_exec = decision == "approve" and execute_on
+        if run_exec and not self._slots.acquire(blocking=False):
+            raise Busy("Several approved actions are still running. Try again in a moment.")
+        started = False
+        try:
+            with self._decide_lock:
+                try:
+                    p = self.routes.decide_proposal(pid, decision, viewer=viewer, actor=user, single=single,
+                                                    open_listener=False, payload_sha256=card["sha256"],
+                                                    resource_version=card["version"], execute=False)
+                except pi.Conflict as exc:
+                    current = self.routes.board.get(pid, viewer.org_id).state
+                    if (decision == "approve" and current in ("approved", "executing", "executed", "failed")) or \
+                            (decision == "reject" and current == "refused"):
+                        return {"ok": True, "message": f"Already {'approved' if decision == 'approve' else 'rejected'}; "
+                                                       "nothing more was done."}
+                    if current in ("approved", "executing", "executed", "failed", "refused", "expired"):
+                        raise pi.Conflict(f"This request was already settled ({current.replace('_', ' ')}).") from None
+                    raise exc
+            decided = p.state          # before the worker can claim it
+            if run_exec and decided == "approved":
+                started = self._start(pid, viewer.org_id, on_done)
+        finally:
+            if run_exec and not started:
+                self._slots.release()
+        return {"ok": True, "state": decided}
+
+    def _start(self, pid: str, org_id: str, on_done: Callable[[], None] | None) -> bool:
+        """Run the executor off the request thread. The decision is already recorded and the executor claims the
+        proposal itself, so it runs once. A daemon thread per job, at most ``MAX_EXECUTING``, no queue. When the
+        job ends (and the request thread is long gone) ``on_done`` refreshes the journal so the card turns
+        Executed/Failed and the outcome is posted even if no stream is open."""
+        def work() -> None:
             try:
-                p = self.routes.decide_proposal(pid, decision, viewer=viewer, actor=user, single=single,
-                                                open_listener=False, payload_sha256=card["sha256"],
-                                                resource_version=card["version"])
-            except pi.Conflict as exc:
-                current = self.routes.board.get(pid, viewer.org_id).state
-                if (decision == "approve" and current in ("approved", "executing", "executed", "failed")) or \
-                        (decision == "reject" and current == "refused"):
-                    return {"ok": True, "message": f"Already {'approved' if decision == 'approve' else 'rejected'}; "
-                                                   "nothing more was done."}
-                if current in ("approved", "executing", "executed", "failed", "refused", "expired"):
-                    raise pi.Conflict(f"This request was already settled ({current.replace('_', ' ')}).") from None
-                raise exc
-        return {"ok": True, "state": p.state}
+                self.routes.executor.execute(pid, org_id)
+            except Exception as exc:  # noqa: BLE001 - state is on the proposal; log the type only
+                log.warning("rakazo bridge: an approved proposal ended with %s", type(exc).__name__)
+            finally:
+                self._slots.release()
+                try:
+                    if on_done is not None:
+                        on_done()
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("rakazo bridge: refreshing after an execution failed with %s", type(exc).__name__)
+                with self._decide_lock:
+                    self._workers.discard(threading.current_thread())
+
+        worker = threading.Thread(target=work, name="rakazo-exec", daemon=True)
+        with self._decide_lock:
+            if self._closed:
+                return False
+            self._workers.add(worker)
+        try:
+            worker.start()
+        except RuntimeError:
+            with self._decide_lock:
+                self._workers.discard(worker)
+            return False
+        return True
+
+    def close(self, timeout: float = 5.0) -> None:
+        """Stop accepting work and give running executions a moment to finish (they are daemons)."""
+        with self._decide_lock:
+            self._closed = True
+            workers = list(self._workers)
+        for w in workers:
+            w.join(timeout)

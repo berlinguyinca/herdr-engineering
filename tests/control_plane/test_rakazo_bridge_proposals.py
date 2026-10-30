@@ -435,3 +435,101 @@ def test_reject_and_approve_racing_never_execute_after_a_reject(make_rig):
             assert len(rig.calls) - before == (1 if state == "executed" else 0), state
     finally:
         sys.setswitchinterval(old)
+
+
+# --------------------------------------------------------------------------------------------- async execution
+def _slow_hook(rig):
+    gate, started = threading.Event(), threading.Event()
+
+    def hook(repo, run):
+        started.set()
+        assert gate.wait(10)
+        rig.calls.append((repo, run))
+    rig.svr.intelligence.ci_rerun_fn = hook
+    return gate, started
+
+
+def _wait(cond, timeout=5):
+    import time
+    end = time.time() + timeout
+    while time.time() < end:
+        if cond():
+            return True
+        time.sleep(0.01)
+    return False
+
+
+def test_answer_returns_before_a_slow_executor_finishes_and_the_outcome_follows(make_rig):
+    import time
+    rig = make_rig()
+    gate, started = _slow_hook(rig)
+    p = rig.file()
+    [card] = rig.cards()
+    t0 = time.monotonic()
+    status, body, _ = rig.answer(card, "allow")
+    took = time.monotonic() - t0
+    assert status == 200 and body["json"] == {"ok": True, "state": "approved"} and took < 1.0, took
+    assert started.wait(5) and rig.calls == []
+    snap = rig.snap()
+    block = rig.cards(snap)[0]["blocks"][0]
+    assert block["status"] == "answered" and block["answer"] == "allow" and snap["activeRuns"] == []
+    assert "Running now" in rig.texts(ev.PROPOSAL_OUTCOME_PREFIX, snap)[0]["blocks"][0]["text"]
+    # a repeat answer and a reject while it runs change nothing
+    again = rig.answer(card, "allow")
+    assert again[0] == 200 and "Already approved" in again[1]["json"]["message"]
+    assert rig.answer(card, "deny")[0] == 409
+    gate.set()
+    # nobody reads the thread: the worker itself refreshes the journal
+    journal = rig.svr.rakazo.journals.get(rig.bot["threadId"], rig.bot["id"])
+    out = ev.PROPOSAL_OUTCOME_PREFIX + p.id
+    _wait(lambda: journal.messages[out]["blocks"][0]["text"].startswith("Done: "))
+    assert journal.messages[out]["blocks"][0]["text"].startswith("Done: "), (journal.messages[out], journal.proposals[p.id]["state"], rig.board.get(p.id, "org1").history)
+    assert rig.calls == [(REPO, 302)]
+    assert journal.messages[ev.PROPOSAL_OUTCOME_PREFIX + p.id]["blocks"][0]["text"].startswith("Done: ")
+    assert journal.messages[ev.PROPOSAL_PREFIX + p.id]["blocks"][0]["text"].startswith("Executed: ")
+
+
+def test_an_async_failure_is_still_reported(make_rig):
+    rig = make_rig()
+    rig.svr.intelligence.ci_rerun_fn = lambda repo, run: (_ for _ in ()).throw(RuntimeError("boom"))
+    p = rig.file()
+    assert rig.answer(rig.cards()[0], "allow")[0] == 200
+    journal = rig.svr.rakazo.journals.get(rig.bot["threadId"], rig.bot["id"])
+    assert _wait(lambda: journal.proposals[p.id]["state"] == "failed")
+    assert "boom" not in json.dumps(rig.snap())
+
+
+def test_at_most_four_executions_run_and_a_fifth_is_refused_undecided(make_rig):
+    rig = make_rig()
+    gate, _ = _slow_hook(rig)
+    ps = [rig.file(payload={**RERUN, "run": 400 + i}) for i in range(5)]
+    cards = {c["blocks"][0]["approvalEffectId"]: c for c in rig.cards()}
+    for p in ps[:4]:
+        assert rig.answer(cards[p.id], "allow")[0] == 200
+    status, _, hdrs = rig.answer(cards[ps[4].id], "allow")
+    assert status == 429 and rig.board.get(ps[4].id, "org1").state == "awaiting_approval"
+    gate.set()
+    journal = rig.svr.rakazo.journals.get(rig.bot["threadId"], rig.bot["id"])
+    assert _wait(lambda: all(journal.proposals[p.id]["state"] == "executed" for p in ps[:4]))
+    assert rig.answer(cards[ps[4].id], "allow")[0] == 200            # a slot is free again
+    assert _wait(lambda: len(rig.calls) == 5)
+
+
+def test_a_reject_never_lets_an_approved_proposal_run_twice_or_after(make_rig):
+    rig = make_rig()
+    p = rig.file()
+    [card] = rig.cards()
+    assert rig.answer(card, "deny")[0] == 200
+    assert rig.answer(card, "allow")[0] == 409
+    assert rig.calls == [] and rig.board.get(p.id, "org1").state == "refused"
+
+
+def test_close_waits_for_running_executions(make_rig):
+    rig = make_rig()
+    gate, started = _slow_hook(rig)
+    rig.file()
+    rig.answer(rig.cards()[0], "allow")
+    assert started.wait(5)
+    threading.Timer(0.2, gate.set).start()
+    rig.svr.rakazo.desk.close(timeout=5)
+    assert rig.calls == [(REPO, 302)]

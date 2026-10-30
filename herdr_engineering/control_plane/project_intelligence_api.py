@@ -223,10 +223,12 @@ class IntelligenceRoutes:
         return [p for p in self.board.pending(viewer.org_id) if proposal_visible(viewer, p)]
 
     def decide_proposal(self, proposal_id: str, decision: str, *, viewer: pi.Viewer, actor: str, single: bool,
-                        open_listener: bool, payload_sha256=None, resource_version=None):
+                        open_listener: bool, payload_sha256=None, resource_version=None, execute: bool = True):
         """Approve or reject one proposal and, once approved, hand it to the executor (a no-op unless the execute flag
         is on). The ONE path for the dashboard route and the Rakazo bridge: flags, approver rules, project scope,
         the exact payload hash + resource version, self-approval (``single`` allows it), audit.
+        ``execute=False`` records the decision only and returns the proposal ``approved``: the caller then runs
+        ``self.executor.execute`` itself, off its request thread (the executor claims the proposal, so it runs once).
         Raises ``ApprovalRefused`` (403), ``pi.NotFound``, ``pi.Conflict`` or ``pi.IntelligenceError``."""
         cfg, raw = self._cfg()
         if not cfg["suggest"] or cfg["kill_switch"]:
@@ -249,7 +251,7 @@ class IntelligenceRoutes:
                 p = self.board.approve(proposal_id, approver=actor, org_id=viewer.org_id, payload_sha256=payload_sha256,
                                        resource_version=resource_version, allow_self=single)
             self.store.record_audit({"action": f"proposal_{p.state}", "id": p.id, "actor": actor})
-        if p.state == "approved":
+        if p.state == "approved" and execute:
             p = self.executor.execute(p.id, viewer.org_id)     # no-op unless the execute flag is on
         return p
 
