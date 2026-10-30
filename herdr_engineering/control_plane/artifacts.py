@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import tempfile
+from collections.abc import Sequence
 from contextlib import asynccontextmanager
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -89,13 +90,28 @@ class ArtifactStore(ArtifactContextMixin, ArtifactUploadMixin, ArtifactLifecycle
                              idempotency_key: str | None = None,
                              report_descriptor: dict | None = None,
                              validation: dict | None = None,
-                             origin: dict | None = None) -> dict:
+                             origin: dict | None = None,
+                             parent_version_ids: Sequence[str] | None = None,
+                             created_via: str = "owner",
+                             collaborator_agent_id: str | None = None) -> dict:
         """Commit one immutable version using compare-and-swap on the head.
 
         ``origin`` carries P03 provenance (room/task/issue/project, session, agent, model, prompt/skill revision,
         commit, inputs). It is validated and redacted here and committed with the version in one transaction, together
         with the lookup bindings and the publish-ledger row that reconciliation repairs.
+
+        ``parent_version_ids`` is the ordered parent list (a merge has two); it defaults to ``[base_version_id]``, or
+        ``[]`` for the first version. Every parent must belong to this artifact. ``parent_version_id`` stays the first.
         """
+        if created_via not in ("owner", "collaborator"):
+            raise ArtifactError("created_via must be 'owner' or 'collaborator'")
+        if created_via == "collaborator" and not collaborator_agent_id:
+            raise ArtifactError("collaborator commits require a collaborator_agent_id")
+        default_parents = [base_version_id] if base_version_id else []
+        explicit_parents = parent_version_ids is not None
+        parents = list(parent_version_ids) if explicit_parents else default_parents
+        if any(not isinstance(parent, str) or not parent for parent in parents) or len(set(parents)) != len(parents):
+            raise ArtifactError("parent_version_ids must be distinct nonempty version ids")
         try:
             origin_columns = normalize_origin(origin)
         except ProvenanceError as exc:
@@ -119,6 +135,11 @@ class ArtifactStore(ArtifactContextMixin, ArtifactUploadMixin, ArtifactLifecycle
             request_body["validation"] = validation
         if origin:
             request_body["origin"] = origin
+        if parents != default_parents:
+            request_body["parent_version_ids"] = parents
+        if created_via != "owner":
+            request_body["created_via"] = created_via
+            request_body["collaborator_agent_id"] = collaborator_agent_id
         request_sha = hashlib.sha256(
             json.dumps(request_body,
                        sort_keys=True, separators=(",", ":")).encode()
@@ -221,6 +242,13 @@ class ArtifactStore(ArtifactContextMixin, ArtifactUploadMixin, ArtifactLifecycle
             current = artifact.get("current_version_id")
             if current != base_version_id:
                 raise ArtifactConflict(artifact_id, current)
+            if explicit_parents and parents:
+                known = {row["version_id"] for row in await self._conn.fetch(
+                    "SELECT version_id FROM artifact_versions WHERE artifact_id=$1 AND version_id = ANY($2::text[])",
+                    artifact_id, parents)}
+                missing = [parent for parent in parents if parent not in known]
+                if missing:
+                    raise ArtifactError(f"parent version does not belong to artifact {artifact_id}: {missing[0]}")
             number_row = await self._conn.fetchrow(
                 "SELECT COALESCE(MAX(version_number), 0) + 1 AS next_number "
                 "FROM artifact_versions WHERE artifact_id=$1", artifact_id,
@@ -233,10 +261,11 @@ class ArtifactStore(ArtifactContextMixin, ArtifactUploadMixin, ArtifactLifecycle
                 "output_manifest, provenance, created_by, agent_id, host_id, session_id, "
                 "mission_id, job_id, committed_at, report_descriptor, validation, origin_room_id, origin_task_id, "
                 "origin_issue_ref, origin_project_id, origin_session_ref, origin_agent_ref, model_id, "
-                "prompt_revision, skill_revision, commit_sha, redacted_inputs) VALUES "
+                "prompt_revision, skill_revision, commit_sha, redacted_inputs, parent_version_ids, created_via, "
+                "collaborator_agent_id) VALUES "
                 "($1,$2,$3,$4,$5,'ready',$6,$7::jsonb,$8::jsonb,$9,$10,$11,$12,$13,$14,now(),$15::jsonb,$16::jsonb,"
-                "$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27::jsonb)",
-                version_id, artifact_id, version_number, base_version_id, base_version_id,
+                "$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27::jsonb,$28::text[],$29,$30)",
+                version_id, artifact_id, version_number, parents[0] if parents else None, base_version_id,
                 source_manifest_blob, output_json, provenance_json, created_by, agent_id,
                 host_id, session_id, mission_id, job_id, report_json, validation_json,
                 origin_columns["origin_room_id"], origin_columns["origin_task_id"],
@@ -244,6 +273,7 @@ class ArtifactStore(ArtifactContextMixin, ArtifactUploadMixin, ArtifactLifecycle
                 origin_columns["origin_session_ref"], origin_columns["origin_agent_ref"],
                 origin_columns["model_id"], origin_columns["prompt_revision"], origin_columns["skill_revision"],
                 origin_columns["commit_sha"], json.dumps(origin_columns["redacted_inputs"]),
+                parents, created_via, collaborator_agent_id,
             )
             links = context_links(origin_columns)
             if any(links.values()):
@@ -279,7 +309,10 @@ class ArtifactStore(ArtifactContextMixin, ArtifactUploadMixin, ArtifactLifecycle
             "version_id": version_id,
             "artifact_id": artifact_id,
             "version_number": version_number,
-            "parent_version_id": base_version_id,
+            "parent_version_id": parents[0] if parents else None,
+            "parent_version_ids": parents,
+            "created_via": created_via,
+            "collaborator_agent_id": collaborator_agent_id,
             "base_version_id": base_version_id,
             "state": "ready",
             "source_manifest_blob": source_manifest_blob,
@@ -437,8 +470,8 @@ class ArtifactStore(ArtifactContextMixin, ArtifactUploadMixin, ArtifactLifecycle
 
     async def list_version_summaries(self, artifact_id: str) -> list[dict]:
         rows = await self._conn.fetch(
-            "SELECT version_id, artifact_id, version_number, parent_version_id, created_by, state, created_at, "
-            "committed_at, (report_descriptor IS NOT NULL) AS is_report FROM artifact_versions "
+            "SELECT version_id, artifact_id, version_number, parent_version_id, parent_version_ids, created_via, "
+            "collaborator_agent_id, created_by, state, created_at, committed_at, (report_descriptor IS NOT NULL) AS is_report FROM artifact_versions "
             "WHERE artifact_id=$1 ORDER BY version_number DESC", artifact_id)
         return [self._row(row) for row in rows]
 
