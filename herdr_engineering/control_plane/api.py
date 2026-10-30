@@ -3410,6 +3410,17 @@ def _make_handler(server, public=False, operator=False):
                 return self._json(server.fleet_config.status())
             if resource == "fleet" and len(parts) == 5 and parts[4] == "inventory":
                 return self._json(r.fleet_inventory())
+            if resource == "ai-sync" and parts[4:] == ["config"]:
+                # Read-only, from the central fleet YAML; an unusable or invalid section reads as not configured.
+                from .ai_sync_config import parse_ai_sync
+                raw = server._control_plane_value(server.fleet_config, "ai_sync")
+                try:
+                    return self._json(parse_ai_sync(raw)) if raw is not None else self._json(
+                        {"error": "not configured"}, 404)
+                except ValueError:
+                    return self._json({"error": "not configured"}, 404)
+            if resource == "ai-sync" and len(parts) == 4:
+                return self._etag_json({"hosts": r.list_ai_sync(_q(self.path, "host_id"))})
             if resource == "hosts":
                 if len(parts) > 5 and parts[5] == "telemetry":
                     rng = _q(self.path, "range")

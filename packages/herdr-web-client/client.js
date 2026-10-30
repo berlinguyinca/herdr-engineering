@@ -443,6 +443,10 @@ export class HerdrClient {
     return this.request('/api/v1/fabric/services', { signal });
   }
 
+  listAiSync({ signal } = {}) {
+    return this.request('/api/v1/ai-sync', { signal });
+  }
+
   listHosts({ signal } = {}) {
     return this.request('/api/v1/hosts', { signal });
   }
