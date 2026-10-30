@@ -217,8 +217,9 @@ def test_enabled_share_adds_exactly_the_s_location():
     # its own zones and upstream, keepalive pool well under share-public's 128 connections
     assert re.search(r"limit_req_zone \S+ zone=share_req:", conf)
     assert re.search(r"limit_conn_zone \S+ zone=share_conn:", conf)
-    upstream = re.search(r"upstream share \{ server share-public:8083; keepalive (\d+); \}", conf)
-    assert upstream and int(upstream.group(1)) <= 32
+    upstream = re.search(r"upstream share \{ zone share_up \d+k; server share-public:8083 resolve max_conns=(\d+); "
+                         r"keepalive (\d+); \}", conf)
+    assert upstream and int(upstream.group(1)) < 128 and int(upstream.group(2)) <= 32
     # server-level timeouts the /s/ location inherits
     assert "client_header_timeout 10s;" in conf and "client_body_timeout 10s;" in conf
     # the operator listener (tailnet) never gets /s/
@@ -234,16 +235,41 @@ def test_share_method_map_allows_reads_and_only_the_body_less_session_post():
     assert "default 0;" in m.group(1)
 
     def allowed(method, uri):
-        return any(re.search(r, f"{method}:{uri}") for r in rules)
+        # nginx's PCRE \z (end of subject) is Python's \Z
+        return any(re.search(r.replace("\\z", "\\Z"), f"{method}:{uri}") for r in rules)
     token = "A" * 43
     for method in ("GET", "HEAD", "OPTIONS"):
         assert allowed(method, f"/s/{token}/f/index.html")
     assert allowed("POST", f"/s/{token}/session")
     for method, uri in (("POST", f"/s/{token}/f/x"), ("POST", f"/s/{token}/session/x"), ("POST", "/s/short/session"),
+                        ("POST", f"/s/{token}/session\n"),
                         ("PUT", f"/s/{token}/session"), ("DELETE", f"/s/{token}/"), ("PATCH", f"/s/{token}/")):
         assert not allowed(method, uri), (method, uri)
     b = re.search(r'map "\$http_transfer_encoding:\$http_content_length" \$share_has_body \{\n(.*?)\n  \}', conf, re.S)
     assert b and "default 1;" in b.group(1) and '":" 0;' in b.group(1) and '":0" 0;' in b.group(1)
+
+
+def test_share_public_is_never_a_start_time_dependency_of_the_edge():
+    """nginx resolves a plain upstream host at start and at every reload: a down share-public would take the whole
+    collab edge (and its certificate reloads) down. share-public must be resolved at run time only."""
+    conf = fcc.render_edge_conf(EDGE.read_text(), share=True)
+    names = re.findall(r"server\s+share-public:\d+([^;]*);", conf)
+    assert names and all(" resolve" in rest for rest in names)
+    assert re.search(r"^\s*resolver 127\.0\.0\.11\b", conf, re.M)
+    assert re.search(r"upstream share \{ zone \S+ \d+k;", conf)          # resolve needs a shared zone
+    without_upstream = re.sub(r"upstream share \{[^}]*\}", "", conf)
+    assert "share-public" not in "".join(ln for ln in without_upstream.splitlines() if not ln.lstrip().startswith("#"))
+
+
+def test_share_dirs_are_fixed_container_paths(tmp_path):
+    for key, bad in (("shares_dir", "/data/shares"), ("events_dir", "/events"), ("marker_dir", "/tmp/m")):
+        central = _central(tmp_path / key, share={"enabled": False, key: bad})
+        with pytest.raises(FleetConfigError, match=f"control_plane.share.{key} must be"):
+            fcc.render_share(load_fleet_config(central), tmp_path / "out.json")
+    central = _central(tmp_path / "ok", share={"enabled": True, "signing_secret": SECRET, "shares_dir": "/shares",
+                                              "events_dir": "/share-events",
+                                              "marker_dir": "/var/lib/herdr/share-markers"})
+    fcc.render_share(load_fleet_config(central), tmp_path / "ok.json")
 
 
 # --------------------------------------------------------------------------------------- (c) compose lint
@@ -273,7 +299,7 @@ def test_share_public_is_isolated_like_collab_public():
     assert cmd[cmd.index("--fleet-config") + 1] == "/etc/herdr/share/share-config.json"
     assert cmd[cmd.index("--port") + 1] == "8083"
     assert "--signing-secret" not in cmd and not any(SECRET in a for a in cmd)
-    # a slice change recreates it: its hash is a label compose compares
+    # the edge reaches it on the shared internal network and lists it as a dependency
     edge = doc["services"]["collab-edge"]
     assert "share" in edge["networks"] and "collab" in edge["networks"]
     assert "share-public" in edge["depends_on"]
@@ -386,3 +412,58 @@ def test_real_deploy_with_share_disabled_leaves_the_edge_conf_as_the_repo_file(e
     ups = [ln for ln in env["log"].read_text().splitlines() if ln.startswith("docker compose") and " up " in ln]
     assert not any("share-public" in ln for ln in ups)
     assert not (env["home"] / ".config/herdr-engineering/share").exists()
+
+
+def test_disabling_shares_stops_share_public_even_without_collab(env):
+    _set_share(env, {"enabled": False}, collab=False)
+    env["env"]["STUB_RUNNING_IMAGE"] = "herdr-engineering:test"
+    r = _ds.deploy(env)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "docker stop herdr-share-public" in env["log"].read_text()
+
+
+def _rollback_target_with_share_public():
+    """A commit with HEAD's tree (so its compose.collab.yaml defines share-public) that is not HEAD: a dangling
+    commit object, never on a branch."""
+    tree = _ds._git("rev-parse", "HEAD^{tree}")
+    return _ds._git("-c", "user.name=t", "-c", "user.email=t@t", "commit-tree", tree, "-p", "HEAD",
+                    "-m", "rollback target (test)")
+
+
+def _seed_share_edge(e, with_s):
+    edge = e["home"] / ".config/herdr-engineering/collab-edge/nginx.conf"
+    edge.parent.mkdir(parents=True, exist_ok=True)
+    edge.write_text(fcc.render_edge_conf(EDGE.read_text(), share=with_s))
+    return edge
+
+
+def _log_pairs(e):
+    lines = e["log"].read_text().splitlines()
+    return list(zip(lines, lines[1:]))
+
+
+def test_rollback_recreates_share_public_from_the_previous_commit_when_its_edge_routes_s(env):
+    _set_share(env, {"enabled": True, "signing_secret": SECRET})
+    full, prev_tag = _ds._seed_previous(env, _rollback_target_with_share_public())
+    _seed_share_edge(env, with_s=True)
+    env["env"]["FAIL_COMPOSE_TAGS"] = _ds._head()
+    r = _ds.deploy(env)
+    assert r.returncode == 1 and "and healthy" in r.stderr, r.stdout + r.stderr
+    recreated = [nxt for cur, nxt in _log_pairs(env)
+                 if cur.startswith("docker compose") and cur.endswith("--force-recreate share-public")]
+    assert any(f" tag={prev_tag} " in n for n in recreated), recreated
+    assert "docker stop herdr-share-public" not in env["log"].read_text()
+    assert SECRET not in r.stdout + r.stderr
+
+
+def test_rollback_stops_share_public_when_the_restored_edge_does_not_route_s(env):
+    _set_share(env, {"enabled": True, "signing_secret": SECRET})
+    _, prev_tag = _ds._seed_previous(env, _rollback_target_with_share_public())
+    _seed_share_edge(env, with_s=False)
+    env["env"]["FAIL_COMPOSE_TAGS"] = _ds._head()
+    r = _ds.deploy(env)
+    assert r.returncode == 1 and "and healthy" in r.stderr, r.stdout + r.stderr
+    assert "docker stop herdr-share-public" in env["log"].read_text()
+    recreated = [nxt for cur, nxt in _log_pairs(env)
+                 if cur.startswith("docker compose") and cur.endswith("--force-recreate share-public")]
+    assert not any(f" tag={prev_tag} " in n for n in recreated)

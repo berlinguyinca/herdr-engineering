@@ -263,6 +263,8 @@ SHARE_SLICE_KEYS = ("enabled", "max_share_bytes", "max_total_bytes", "max_files"
                     "session_seconds", "signing_secret")
 # Cognito identifiers share-public needs for lab sign-in (public values; no group, no operator).
 SHARE_COLLAB_KEYS = ("cognito_pool", "cognito_clients", "cognito_web_client", "cognito_domain", "public_url")
+SHARE_FIXED_DIRS = {"shares_dir": "/shares", "events_dir": "/share-events",
+                    "marker_dir": "/var/lib/herdr/share-markers"}
 SHARE_CAP_DEFAULTS = {"max_share_bytes": 512 * 1024 * 1024, "max_files": 20000,
                       "max_total_bytes": 2 * 1024 * 1024 * 1024, "default_public_days": 30}
 _SECRET_HINT = ("generate one locally (e.g. `openssl rand -hex 32`) and store it in the fleet YAML as "
@@ -299,6 +301,10 @@ def share_values(cfg: FleetConfig) -> dict:
     unknown = sorted(str(k) for k in set(share) - SHARE_KEYS)
     if unknown:
         raise FleetConfigError("control_plane.share: unknown keys: " + ", ".join(unknown))
+    for key, fixed in SHARE_FIXED_DIRS.items():
+        if key in share and share[key] != fixed:
+            raise FleetConfigError(f"control_plane.share.{key} must be {fixed} (or left out): it is a container "
+                                   f"path and deploy.sh's mounts are fixed")
     if share.get("enabled") is not True:
         return {"share": {"enabled": False}}
     from .control_plane.share_session import MIN_SECRET_BYTES
@@ -326,9 +332,6 @@ def share_values(cfg: FleetConfig) -> dict:
     seconds = share.get("session_seconds", 14400)
     if isinstance(seconds, bool) or not isinstance(seconds, int) or seconds < 60:
         raise FleetConfigError("control_plane.share.session_seconds must be an integer >= 60")
-    for key in ("shares_dir", "events_dir", "marker_dir"):
-        if key in share and (not isinstance(share[key], str) or not share[key].startswith("/")):
-            raise FleetConfigError(f"control_plane.share.{key} must be an absolute path (in the container)")
     return {"collab": {k: collab[k] for k in SHARE_COLLAB_KEYS if k in collab},
             "share": {k: share[k] for k in SHARE_SLICE_KEYS if k in share}}
 

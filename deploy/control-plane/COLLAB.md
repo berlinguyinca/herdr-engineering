@@ -85,16 +85,25 @@ edge (nginx, location ^~ /s/ only) -> herdr-share-public:8083 (network `share`, 
 - Mounts: bundles at `~/.local/share/herdr-engineering/shares` (web/worker read-write, share-public read-only);
   share-public's audit file `~/.local/share/herdr-engineering/share-events/events.jsonl` (its only writable
   mount, 0644; the worker reads it read-only and keeps its ingest marker in the worker-only volume
-  `herdr-cp-share-markers`); the Cognito keys from the collab-sync directory (read-only). Keep
-  `control_plane.share.shares_dir`, `events_dir` and `marker_dir` at their defaults: the mounts are fixed.
+  `herdr-cp-share-markers`); the Cognito keys from the collab-sync directory (read-only).
+  `control_plane.share.shares_dir`, `events_dir` and `marker_dir` must stay at their defaults (`/shares`,
+  `/share-events`, `/var/lib/herdr/share-markers`) or be left out: render-share refuses other values.
+- Host permissions: the bundle tree is world-readable (0755 dirs, 0644 files) and the events file is 0644,
+  because three uids touch them (web/worker as container root, share-public as `HERDR_COLLAB_CERT_UID`) and a
+  tighter group scheme was not verified on bender. So `~/.local/share/herdr-engineering` (or the home directory
+  above it) must NOT be world-readable/traversable on the deploy host: keep it 0700/0750 for the deploying user.
+- Edge resilience: share-public is resolved at run time (`resolver 127.0.0.11`, `server ... resolve` in a
+  zoned upstream, `max_conns=100` under share-public's 128-connection cap), so the edge starts and reloads
+  (certificate renewals included) while share-public is down; `/s/` then answers 502.
 - Edge: with shares enabled the edge's `nginx.conf` gains exactly one location, `^~ /s/` (snippets
   `collab-edge/share-http.conf` and `share-location.conf`): GET/HEAD/OPTIONS, plus POST only on
   `/s/<token>/session` (the body-less lab sign-in exchange); any request with a body is refused; its own
   `limit_req`/`limit_conn` zones; `proxy_buffering off`; `proxy_read_timeout 600s`; no access log (tokens and
   session HMACs are in the path). Disabled, the edge conf is the repo file unchanged and a running
   share-public is stopped (its bundles stay on disk).
-- Rollback: share-public is started and checked by forward deploys only. A rollback restores the previous edge
-  conf; a share-public the failed deploy started keeps running but is unreachable when that conf has no `/s/`.
+- Rollback: the previous edge conf and share slice are restored first. When that conf routes `/s/` and the
+  previous commit defines share-public, share-public is recreated from that commit (and verified with the rest);
+  otherwise a running share-public is stopped.
 
 Operator step, once, before sending lab links (not done by `deploy.sh`): add
 `https://localdev.mcp.metabolomics.us/s/callback` to BOTH the CallbackURLs and the LogoutURLs of the

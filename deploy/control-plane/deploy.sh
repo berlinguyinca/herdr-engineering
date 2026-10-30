@@ -29,7 +29,8 @@
 #      signing_secret is refused before anything runs, the secret never printed). Only when it is enabled
 #      (which needs the collaboration marker) is its slice installed at a stable 0600 path, the edge
 #      nginx.conf rendered with the /s/ location, and share-public force-recreated once, before the edge;
-#      disabled, a running share-public is stopped and the edge conf is the repo file unchanged
+#      disabled, a running share-public is stopped and the edge conf is the repo file unchanged. A rollback
+#      recreates share-public from the previous commit when the restored edge conf routes /s/, else stops it
 #   5. waits for /api/v1/health to report the new commit AND for every recreated
 #      container (web, worker, llm-proxy, collab-public/edge) to be running, not
 #      restarting and not unhealthy. Nothing on the host changes before the image is
@@ -676,6 +677,13 @@ verify() {   # <commit>: the web reports it AND every recreated service is up
   healthy_commit "$1" && services_settled
 }
 
+stop_share_public() {   # never fatal; plain docker, so it works whichever compose files define the service
+  if docker inspect herdr-share-public >/dev/null 2>&1; then
+    docker stop herdr-share-public >/dev/null 2>&1 \
+      || echo "WARNING: could not stop herdr-share-public (the edge conf in place does not route /s/)" >&2
+  fi
+}
+
 forward() {
   install_private "$NEW_LLM" "$LLM_DIR/llm-config.json" || return 1
   # mount sources of web/worker (and share-public): created here, after the build, never before
@@ -722,10 +730,7 @@ forward() {
   if [ "$COLLAB" = 1 ]; then EDGE_CONF_CHANGED=1; reload_edge_if_changed || return 1; fi
   # Shares disabled: the edge no longer routes /s/; stop a share-public a previous deploy started (its
   # bundles stay on disk). Never fatal.
-  if [ "$COLLAB" = 1 ] && [ "$SHARE" = 0 ] && [ -n "$NEW_SHARE" ] && docker inspect herdr-share-public >/dev/null 2>&1; then
-    compose_run "$WORK" "$ENV_FILE" "$TAG" "$SHA" stop share-public >/dev/null 2>&1 \
-      || echo "WARNING: could not stop herdr-share-public (shares are disabled; the edge no longer routes /s/)" >&2
-  fi
+  if [ "$SHARE" = 0 ] && [ -n "$NEW_SHARE" ]; then stop_share_public; fi
   python3 "$STATE_HELPER" verify-forward "$ATTEMPT" || return 1
   verify "$SHA"
 }
@@ -762,9 +767,21 @@ if [ -z "$PREV_COMMIT" ]; then
 fi
 
 echo "rolling back to $PREVIOUS_IMAGE with the compose files and code of commit $PREV_SHA" >&2
-# share-public is forward-only: the previous commit may not define it, and its restored edge conf decides
-# whether /s/ is routed. A share-public this deploy started keeps running (unreachable without the route).
-SHARE_SERVICE=()
+# share-public follows the RESTORED edge conf: when it routes /s/ and the previous commit defines the service,
+# share-public is recreated from that commit with the restored slice (and verified with the rest); otherwise a
+# running one is stopped, so a rollback never reports healthy while /s/ points at the failed release.
+rollback_share() {
+  local conf="${HERDR_COLLAB_EDGE_CONF:-}"
+  SHARE_SERVICE=()
+  if [ "$COLLAB" = 1 ] && [ -f "$conf" ] && grep -q 'location ^~ /s/' "$conf" \
+      && grep -q '^  share-public:' "$PREV_WORK/deploy/control-plane/compose.collab.yaml" 2>/dev/null; then
+    SHARE_SERVICE=(share-public)
+    compose_up_retry "$PREV_WORK" "$PREV_ENV" "$PREV_TAG" "$PREV_SHA" \
+      up -d --no-deps --no-build --force-recreate share-public >/dev/null
+  else
+    stop_share_public
+  fi
+}
 PREV_CONFIG="$ATTEMPT/previous/fleet-config.yaml"
 FLEET_DIR="$(dirname "$PREV_CONFIG")"
 ROLLBACK_IMAGES="$ATTEMPT/rollback-images.json"
@@ -781,6 +798,7 @@ if [ "$RESTORED" = 1 ] \
     && git -C "$REPO" worktree add -q --detach "$PREV_WORK" "$PREV_COMMIT" >/dev/null 2>&1 \
     && prev_render \
     && compose_up "$PREV_WORK" "$PREV_ENV" "$PREV_TAG" "$PREV_SHA" >/dev/null \
+    && rollback_share \
     && { [ "$COLLAB" = 0 ] || { EDGE_CONF_CHANGED=1; reload_edge_if_changed || true; }; } \
     && python3 "$STATE_HELPER" verify-rollback "$ATTEMPT" \
     && verify "$PREV_SHA"; then
