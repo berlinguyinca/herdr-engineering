@@ -653,3 +653,18 @@ test('the mount routes a pending row click to resume and renders the pending sha
   assert.match(container.regions.review.html, /p@x\.org/);
   panel.dispose();
 });
+
+test('setVersions refreshes the version choices and keeps a still-valid selection', async () => {
+  const container = fakeContainer();
+  const panel = mountSharePanel(container, fakeClient(), 'art1', { versions, headVersionId: 'v2' });
+  await tick();
+  assert.doesNotMatch(container.regions.form.html, /value="v3"/);
+  panel.setVersions([{ version_id: 'v3', version_number: 3, state: 'ready' }, ...versions], 'v3');
+  assert.match(container.regions.form.html, /value="v3"/);
+  assert.equal(panel.controller.state.headVersionId, 'v3');
+  assert.equal(panel.controller.state.form.versionId, 'v2');
+  panel.controller.state.form.versionId = 'gone';
+  panel.setVersions([{ version_id: 'v3', version_number: 3, state: 'ready' }], 'v3');
+  assert.equal(panel.controller.state.form.versionId, 'v3');
+  panel.dispose();
+});

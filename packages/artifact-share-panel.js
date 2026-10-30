@@ -326,6 +326,18 @@ export function createShareController(client, artifactId, { versions = [], headV
     void ctrl.refresh();
   };
 
+  // The detail page re-reads the version list (after a restore); the form keeps its choice while it still exists.
+  ctrl.setVersions = (nextVersions, nextHead) => {
+    if (!live()) return;
+    state.versions = Array.isArray(nextVersions) ? nextVersions : [];
+    state.headVersionId = nextHead;
+    const nextReady = shareableVersions(state.versions);
+    if (!nextReady.some(version => version.version_id === state.form.versionId)) {
+      state.form.versionId = (nextReady.some(version => version.version_id === nextHead) ? nextHead : nextReady[0]?.version_id) || '';
+    }
+    changed('versions');
+  };
+
   ctrl.dispose = () => {
     if (ctrl.disposed) return;
     ctrl.disposed = true;
@@ -420,9 +432,10 @@ export function mountSharePanel(container, client, artifactId, { versions = [], 
     // Removing the panel removes the one-time URL with it.
     container.replaceChildren();
   };
-  if (signal?.aborted) { dispose(); return { dispose, controller: ctrl }; }
+  const setVersions = (nextVersions, nextHead) => { formKey = null; ctrl.setVersions(nextVersions, nextHead); };
+  if (signal?.aborted) { dispose(); return { dispose, controller: ctrl, setVersions }; }
   signal?.addEventListener?.('abort', dispose, { once: true });
   render();
   void ctrl.refresh();
-  return { dispose, controller: ctrl };
+  return { dispose, controller: ctrl, setVersions };
 }

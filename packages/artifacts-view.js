@@ -3,6 +3,7 @@ import { skeleton } from './motion.js';
 import { morph } from './patch.js';
 import { pollWhileVisible } from './refresh-bus.js';
 import { mountSharePanel } from './artifact-share-panel.js';
+import { mountHistory } from './artifact-history.js';
 
 const humanSize = value => {
   const size = Number(value || 0);
@@ -394,7 +395,7 @@ export async function renderArtifactDetail(container, client, id, { signal, vers
     return renderReportReader(container, client, id, artifact, results[0].value.versions, { signal, versionId });
   }
   // Share card: its own list read and errors (kept out of the route's errors); the route signal disposes it.
-  mountSharePanel(container.querySelector('[data-artifact-share]'), client, id, {
+  const share = mountSharePanel(container.querySelector('[data-artifact-share]'), client, id, {
     versions: results[0].status === 'fulfilled' && Array.isArray(results[0].value?.versions) ? results[0].value.versions : [],
     headVersionId: artifact.current_version_id, signal,
   });
@@ -413,10 +414,14 @@ export async function renderArtifactDetail(container, client, id, { signal, vers
       section.innerHTML = `<herdr-error message="${esc(message)}"></herdr-error><button type="button" data-route-retry>Retry</button>`;
     } else if (!items.length) {
       section.innerHTML = `<herdr-empty message="${key === 'versions' ? 'No version history available' : 'No review requested'}"></herdr-empty>`;
+    } else if (key === 'versions') {
+      // Restore re-reads the list and feeds the Share panel the same versions and head; the route signal disposes both.
+      mountHistory(section, client, id, {
+        versions: items, headVersionId: artifact.current_version_id, canRestore: true, signal,
+        onVersions: (nextVersions, nextHead) => share.setVersions(nextVersions, nextHead),
+      });
     } else {
-      section.innerHTML = `<ul>${items.map(item => key === 'versions'
-        ? `<li><strong>v${esc(item.version_number)}</strong> · ${esc(item.state || 'unknown')} · ${esc(item.version_id)}</li>`
-        : `<li><strong>${esc(item.state)}</strong> · ${esc(item.version_id)} · ${esc(item.reviewer || item.requested_by)}</li>`).join('')}</ul>`;
+      section.innerHTML = `<ul>${items.map(item => `<li><strong>${esc(item.state)}</strong> · ${esc(item.version_id)} · ${esc(item.reviewer || item.requested_by)}</li>`).join('')}</ul>`;
     }
   }
   return { errors };
