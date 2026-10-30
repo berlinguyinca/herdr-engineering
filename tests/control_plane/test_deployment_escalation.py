@@ -848,3 +848,14 @@ def test_issue_sink_401_drops_cached_app_tokens():
     with pytest.raises(IssueRefused):
         GitHubIssueSink(opener=Opener(401), credentials=lambda: creds)(REPO, "t", "b", "k")
     assert creds.invalidated == [REPO.split("/")[0]]
+
+
+def test_issue_sink_does_not_fall_back_to_pat_when_github_app_is_invalid(monkeypatch):
+    from herdr_engineering.github_auth import NoCredentials
+    monkeypatch.setattr("herdr_engineering.host_config.host_value", lambda key: "pat-token")
+    opener = Opener()
+    with pytest.raises(IssueRefused):
+        GitHubIssueSink(opener=opener, credentials=lambda: NoCredentials("invalid_config"))(REPO, "t", "b", "k")
+    assert not opener.requests
+    GitHubIssueSink(opener=opener, credentials=lambda: NoCredentials("not_configured"))(REPO, "t", "b", "k")
+    assert opener.requests[0][0].headers["Authorization"] == "Bearer pat-token"
