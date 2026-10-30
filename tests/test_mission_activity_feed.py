@@ -509,3 +509,21 @@ def test_unknown_platform_fails_closed_without_peer_credentials(monkeypatch):
         stack.enter_context(peer)
         with pytest.raises(ValueError, match='peer proof unavailable'):
             feed._verify_peer(client, os.getpid())
+
+
+def test_model_use_crosses_the_allowlist_and_unknown_fields_do_not():
+    from herdr_engineering.mission_activity_feed import _sanitize
+
+    clean = _sanitize({
+        'health': 'active',
+        'modelUse': {
+            'pin': 'gw/qwen3.8-27b', 'pinnedAt': '2026-10-30T00:00:00Z', 'elsewhere': 1,
+            'agents': [{'workerId': 'W2', 'taskId': 'T2', 'role': 'reviewer', 'model': 'gw/deepseek',
+                        'state': 'running', 'onPin': False, 'rawPrompt': 'must not cross'}],
+        },
+        'hiddenReasoning': 'must not cross',
+    })
+    use = clean['modelUse']
+    assert use['pin'] == 'gw/qwen3.8-27b' and use['elsewhere'] == 1
+    assert use['agents'][0]['role'] == 'reviewer' and use['agents'][0]['onPin'] is False
+    assert 'rawPrompt' not in use['agents'][0] and 'hiddenReasoning' not in clean
