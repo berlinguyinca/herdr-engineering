@@ -42,6 +42,7 @@ from dataclasses import dataclass, field, fields, replace
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+from .inference_models import RETRY_CODES, ModelResolver
 from .reminders import REMINDER_TOOLS, ReminderError
 from .reminders import run_tool as run_reminder_tool
 
@@ -87,6 +88,12 @@ _FEATURE_FLAG_KEY = "personal_assistant"
 
 
 _TENANT_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.\-]{0,63}\Z")
+
+
+def _model_preferences(value: Any) -> list[str]:
+    if not isinstance(value, list) or not all(isinstance(v, str) and v for v in value):
+        raise ValueError("control_plane.personal_assistant.inference.preferred_models must be a list of model ids or patterns")
+    return list(value)
 
 
 def _tenant_id(value: Any, where: str) -> str:
@@ -174,6 +181,7 @@ def assistant_config(cfg: dict[str, Any]) -> dict[str, Any]:
             "endpoint": str(inference.get("endpoint", "")),
             "timeout": int(inference.get("timeout", 60)),
             "model": str(inference.get("model", "")),
+            "preferred_models": _model_preferences(inference.get("preferred_models", [])),
             "api_key": str(inference.get("api_key", "")),  # never logged
         },
         # optional durable Postgres persistence (herdr_pa). When ``dsn`` is set,
@@ -1241,7 +1249,7 @@ class HttpModelRunnerAdapter(RuntimeAdapter):
     def __init__(self, store: AssistantStore, *, endpoint: str, timeout: int = 60,
                  model: str = "", api_key: str = "", context_provider: Any | None = None,
                  context_gate: Callable[[AssistantRun], bool] | None = None,
-                 urlopen: Callable | None = None):
+                 urlopen: Callable | None = None, resolver: ModelResolver | None = None):
         self.store = store
         self.endpoint = endpoint
         self.timeout = timeout
@@ -1250,6 +1258,7 @@ class HttpModelRunnerAdapter(RuntimeAdapter):
         self.context_provider = context_provider
         self.context_gate = context_gate
         self._urlopen = urlopen
+        self.resolver = resolver  # picks among the models the gateway serves; None sends ``model`` as configured
         # callables (run) -> text appended to the bot's own instructions, e.g. the app's agent skills; never raise
         self.prompt_extras: list[Callable[[AssistantRun], str]] = []
 
@@ -1284,8 +1293,22 @@ class HttpModelRunnerAdapter(RuntimeAdapter):
         return {"role": "system", "content": ctx} if ctx else None
 
     def _post(self, payload: dict[str, Any]) -> dict[str, Any]:
-        """Send one chat-completions request and return the parsed body.
-        Raises on transport failure; callers degrade to a safe reply."""
+        """Send one chat-completions request and return the parsed body. A gateway that has no capacity for (or no longer
+        serves) the model sends the request on to the next candidate. Raises on transport failure; callers degrade to a safe
+        reply."""
+        if self.resolver is None:
+            return self._post_one(payload)
+        last: Exception | None = None
+        for model in self.resolver.candidates(str(payload.get("model", ""))) or [payload.get("model", "")]:
+            try:
+                return self._post_one({**payload, "model": model})
+            except Exception as exc:  # noqa: BLE001
+                if getattr(exc, "code", None) not in RETRY_CODES:
+                    raise
+                last = exc
+        raise last  # type: ignore[misc]
+
+    def _post_one(self, payload: dict[str, Any]) -> dict[str, Any]:
         if self._urlopen:
             return self._urlopen(self.endpoint, payload, timeout=self.timeout)
         from urllib.request import Request, urlopen
@@ -2105,6 +2128,8 @@ class AssistantService:
                     timeout=int(inf.get("timeout", 60)),
                     model=str(inf.get("model", "")),
                     api_key=str(inf.get("api_key", "")),
+                    resolver=ModelResolver(inf["endpoint"], str(inf.get("api_key", "")),
+                                           list(inf.get("preferred_models") or [])),
                     context_provider=self.fleet_context,
                     context_gate=lambda run: self.fleet_allowed(run.user_id))
             else:
