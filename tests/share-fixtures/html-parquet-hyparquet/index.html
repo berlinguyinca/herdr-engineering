@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Share fixture: hyparquet</title>
+<style>body{font:14px system-ui,sans-serif;margin:24px}table{border-collapse:collapse}td,th{border:1px solid #999;padding:2px 6px}</style>
+<script>
+// Sandbox probes, run before anything else (an inline script: the share CSP allows 'unsafe-inline').
+// Results go to window.__probe and the #probe element; the browser harness reads them.
+window.__probe = { csp: [] };
+document.addEventListener('securitypolicyviolation', (e) => {
+  window.__probe.csp.push({ blockedURI: e.blockedURI, directive: e.effectiveDirective || e.violatedDirective });
+});
+try {
+  const value = window.sessionStorage.getItem('herdr-browser-check-sentinel');
+  window.__probe.sessionStorage = 'readable:' + String(value);
+} catch (e) {
+  window.__probe.sessionStorage = 'threw:' + e.name;
+}
+try { window.localStorage.length; window.__probe.localStorage = 'readable'; } catch (e) { window.__probe.localStorage = 'threw:' + e.name; }
+window.__probe.origin = String(self.origin);
+</script>
+<script src="https://cdn.jsdelivr.net/npm/hyparquet@1.32.0/src/index.js" type="module"></script>
+<script type="module" src="app.js"></script>
+</head>
+<body>
+<h1>Parquet via hyparquet</h1>
+<p id="status">loading</p>
+<table id="data"></table>
+</body>
+</html>
