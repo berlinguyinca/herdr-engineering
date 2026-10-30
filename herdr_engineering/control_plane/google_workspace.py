@@ -20,14 +20,15 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Callable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 log = logging.getLogger(__name__)
 
 # Why there is no scope guard here (the old one refused any token wider than read-only): the stored connection's scopes
 # legitimately include compose and event-writing now. Safety instead comes from the request surface: every method here
-# issues only GET requests to read URLs (the token endpoint POST is the one exception; a test asserts both).
+# issues only GET requests to read URLs. The two POSTs are the token endpoint and Calendar freeBusy, which only READS busy
+# intervals (a test allows exactly those two URLs as POST).
 
 SCOPES = ("https://www.googleapis.com/auth/gmail.readonly", "https://www.googleapis.com/auth/calendar.readonly")
 AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
@@ -37,6 +38,8 @@ CALENDAR_API = "https://www.googleapis.com/calendar/v3"
 TIMEOUT = 15
 MAX_RESPONSE = 2 * 1024 * 1024
 MAX_SEARCH, MAX_EVENTS, MAX_BODY = 10, 25, 4000
+MAX_SLOTS, MAX_WINDOW_DAYS = 5, 14
+FREEBUSY_URL = CALENDAR_API + "/freeBusy"
 _ID = re.compile(r"[A-Za-z0-9_\-]{1,64}")
 PRIMARY = "primary"
 _TIME = re.compile(r"\d{4}-\d{2}-\d{2}(T\d{2}:\d{2}(:\d{2})?(Z|[+-]\d{2}:\d{2})?)?")
@@ -220,6 +223,18 @@ class GoogleWorkspace:
     def _get(self, tenant: str, user: str, url: str, params: dict[str, Any]) -> dict:
         req = urllib.request.Request(url + "?" + urllib.parse.urlencode(params, doseq=True), method="GET",     # noqa: S310
                                      headers={"authorization": f"Bearer {self._access_token(tenant, user)}", "accept": "application/json"})
+        return self._send(tenant, user, req)
+
+    def _read_post(self, tenant: str, user: str, url: str, body: dict) -> dict:
+        """A POST that only READS (freeBusy takes its query as a body). Nothing else may use it."""
+        if url != FREEBUSY_URL:
+            raise GoogleError("bad_request")
+        req = urllib.request.Request(url, method="POST", data=json.dumps(body).encode(),     # noqa: S310
+                                     headers={"authorization": f"Bearer {self._access_token(tenant, user)}", "accept": "application/json",
+                                              "content-type": "application/json"})
+        return self._send(tenant, user, req)
+
+    def _send(self, tenant: str, user: str, req: urllib.request.Request) -> dict:
         try:
             with self._open(req, TIMEOUT) as resp:
                 raw = resp.read(MAX_RESPONSE + 1)
@@ -373,6 +388,50 @@ class GoogleWorkspace:
             raise GoogleError("bad_request")
         return self._event(self._get(tenant, user, f"{CALENDAR_API}/calendars/{urllib.parse.quote(cid, safe='')}/events/{event_id}", {}))
 
+    @staticmethod
+    def _instant(value: Any) -> datetime:
+        if not isinstance(value, str) or not _TIME.fullmatch(value):
+            raise GoogleError("bad_request")
+        if "T" not in value:
+            value += "T00:00:00Z"
+        try:
+            dt = datetime.fromisoformat(value)
+        except ValueError:
+            raise GoogleError("bad_request") from None
+        return dt.replace(tzinfo=UTC) if dt.tzinfo is None else dt.astimezone(UTC)
+
+    def find_free_time(self, tenant: str, user: str, duration_minutes: Any, time_min: Any, time_max: Any) -> dict:
+        """Up to 5 earliest free gaps (each >= duration) inside the window, over the person's NON-blocked calendars only."""
+        if isinstance(duration_minutes, bool) or not isinstance(duration_minutes, int) or not 5 <= duration_minutes <= 480:
+            raise GoogleError("bad_request")
+        lo, hi = self._instant(time_min), self._instant(time_max)
+        if hi <= lo or hi - lo > timedelta(days=MAX_WINDOW_DAYS):
+            raise GoogleError("bad_request")
+        data = self._get(tenant, user, f"{CALENDAR_API}/users/me/calendarList", {"fields": "items(id)", "maxResults": 250})
+        ids = [c["id"] for c in data.get("items") or [] if isinstance(c, dict) and isinstance(c.get("id"), str) and c["id"].strip()]
+        allowed = self.exclude_blocked(tenant, user, ids)       # the single choke point: blocked ids never reach freeBusy
+        if not allowed:
+            return {"slots": []}
+        fmt = "%Y-%m-%dT%H:%M:%SZ"
+        resp = self._read_post(tenant, user, FREEBUSY_URL, {"timeMin": lo.strftime(fmt), "timeMax": hi.strftime(fmt),
+                                                            "items": [{"id": c} for c in allowed]})
+        busy: list[tuple[datetime, datetime]] = []
+        for cal in (resp.get("calendars") or {}).values():
+            if not isinstance(cal, dict) or cal.get("errors"):
+                raise GoogleError("unavailable")        # an unreadable calendar must not be treated as free
+            for b in cal.get("busy") or []:
+                if isinstance(b, dict):
+                    busy.append((max(self._instant(b.get("start")), lo), min(self._instant(b.get("end")), hi)))
+        busy.sort()
+        need, slots, cursor = timedelta(minutes=duration_minutes), [], lo
+        for start, end in busy + [(hi, hi)]:
+            if start > cursor and start - cursor >= need:
+                slots.append({"start": cursor.strftime(fmt), "end": start.strftime(fmt)})
+                if len(slots) == MAX_SLOTS:
+                    break
+            cursor = max(cursor, end)
+        return {"slots": slots}
+
     # ---- the assistant's entry point --------------------------------------------------------------------
     def run(self, tenant_id: str, user_id: str, tool_id: str, payload: dict) -> dict:
         """One read for the calling person. Raises GoogleError with a fixed reason; the result is marked untrusted."""
@@ -384,6 +443,9 @@ class GoogleWorkspace:
         elif tool_id == "list_calendar_events":
             result = self.list_events(t, u, payload.get("time_min"), payload.get("time_max"), payload.get("max_results", 10),
                                       payload.get("calendar_id"))
+        elif tool_id == "find_free_time":     # only times and durations: no third-party text, so no untrusted marker
+            return {"ok": True, **self.find_free_time(t, u, payload.get("duration_minutes"), payload.get("time_min"),
+                                                      payload.get("time_max"))}
         else:
             raise GoogleError("bad_request")
         return {"ok": True, "untrusted_content": True,

@@ -41,6 +41,7 @@ class Google:
 
     def __init__(self):
         self.requests, self.fail, self.revoked, self.primary = [], {}, False, "ann@x.org"
+        self.busy = {}      # calendar id -> [(start, end)] reported by freeBusy
         b64 = base64.urlsafe_b64encode(b"Hello from the body").decode()
         self.msgs = {"m1": {"id": "m1", "snippet": "snip", "payload": {
             "headers": [{"name": "From", "value": "Alice <a@x.org>"}, {"name": "Subject", "value": "Lunch"},
@@ -60,6 +61,9 @@ class Google:
             who = urllib.parse.parse_qs(req.data.decode())["refresh_token"][0]
             return Resp({"access_token": "ya29.access." + who, "expires_in": 3600})
         path = urllib.parse.urlparse(url).path
+        if url == gw.FREEBUSY_URL:
+            ids = [i["id"] for i in json.loads(req.data)["items"]]
+            return Resp({"calendars": {i: {"busy": [{"start": a, "end": b} for a, b in self.busy.get(i, [])]} for i in ids}})
         if path.endswith("/messages"):
             return Resp({"messages": [{"id": "m1"}, {"id": "../bad"}]})
         if "/messages/" in path:
@@ -101,7 +105,8 @@ def test_search_read_and_events_return_trimmed_untrusted_data(store):
     assert mail["body"] == "Hello from the body" and mail["subject"] == "Lunch" and mail["truncated"] is False
     [ev] = w.run("default", "u1", "list_calendar_events", {"time_min": "2026-10-31"})["result"]
     assert ev["summary"] == "Standup" and ev["attendees"] == 2
-    assert all(r[0] in ("GET", "POST") for r in g.requests)
+    # reads are GET; the only POSTs are the token endpoint and freeBusy (a read that takes its query as a body)
+    assert all(r[0] == "GET" or (r[0] == "POST" and r[1] in (gw.TOKEN_URL, gw.FREEBUSY_URL)) for r in g.requests)
     assert sum(1 for r in g.requests if r[1] == gw.TOKEN_URL) == 1       # the access token is cached
 
 
@@ -174,3 +179,64 @@ def test_the_assistant_tools_dispatch_and_report_fixed_reasons(store):
     with pytest.raises(AssistantError, match="not connected"):
         svc.execute_tool(tenant_id="default", user_id="u1", assistant_id=a.assistant_id, tool_id="search_email",
                          payload={"query": "x"})
+
+
+WIN = {"time_min": "2026-11-02T08:00:00Z", "time_max": "2026-11-02T18:00:00Z"}
+
+
+def free(w, minutes=30, **win):
+    return w.run("default", "u1", "find_free_time", {"duration_minutes": minutes, **(win or WIN)})
+
+
+def test_free_time_ignores_blocked_calendars(store):
+    w, g = ws(store, blocked={("default", "u1"): ["secret@x.org"]})
+    g.busy = {"ann@x.org": [("2026-11-02T09:00:00Z", "2026-11-02T10:00:00Z")],
+              "secret@x.org": [("2026-11-02T12:00:00Z", "2026-11-02T16:00:00Z")]}     # must not reduce free time
+    out = free(w)
+    assert "untrusted_content" not in out
+    assert out["slots"] == [{"start": "2026-11-02T08:00:00Z", "end": "2026-11-02T09:00:00Z"},
+                            {"start": "2026-11-02T10:00:00Z", "end": "2026-11-02T18:00:00Z"}]
+    posts = [r for r in g.requests if r[1] == gw.FREEBUSY_URL]
+    assert len(posts) == 1 and sorted(i["id"] for i in json.loads(posts[0][3])["items"]) == ["ann@x.org", "team@x.org"]
+    assert all(b"secret@x.org" not in (r[3] or b"") for r in g.requests)
+
+
+def test_free_time_returns_at_most_five_slots_inside_the_window(store):
+    w, g = ws(store)
+    # busy every 30 min from 09:00 for 10 minutes, one overlapping/unsorted entry, and one spilling past the window
+    g.busy = {"ann@x.org": [(f"2026-11-02T{9 + i // 2:02d}:{30 * (i % 2):02d}:00Z", f"2026-11-02T{9 + i // 2:02d}:{30 * (i % 2) + 10:02d}:00Z")
+                            for i in range(12)][::-1] + [("2026-11-02T17:50:00Z", "2026-11-02T19:00:00Z")]}
+    slots = free(w, 15)["slots"]
+    assert len(slots) == 5 and slots == sorted(slots, key=lambda s: s["start"])
+    assert slots[0] == {"start": "2026-11-02T08:00:00Z", "end": "2026-11-02T09:00:00Z"}
+    assert all("2026-11-02T08:00:00Z" <= s["start"] < s["end"] <= "2026-11-02T18:00:00Z" for s in slots)
+    assert [s["end"] for s in free(w, 25)["slots"]] == [
+        "2026-11-02T09:00:00Z", "2026-11-02T17:50:00Z"]      # 20-minute gaps are too short for 25
+    assert all(g_["start"] < g_["end"] for g_ in free(w, 480, time_min="2026-11-02T00:00:00Z", time_max="2026-11-03T00:00:00Z")["slots"])
+
+
+def test_free_time_with_every_calendar_blocked_is_empty_and_asks_google_nothing(store):
+    w, g = ws(store, blocked={("default", "u1"): ["primary", "team@x.org", "secret@x.org"]})
+    assert free(w) == {"ok": True, "slots": []}
+    assert not [r for r in g.requests if r[1] == gw.FREEBUSY_URL]
+
+
+def test_free_time_primary_alias_block_hides_the_real_primary_id(store):
+    w, g = ws(store, blocked={("default", "u1"): ["primary"]})
+    g.busy = {"ann@x.org": [("2026-11-02T09:00:00Z", "2026-11-02T17:00:00Z")]}
+    assert free(w)["slots"] == [{"start": "2026-11-02T08:00:00Z", "end": "2026-11-02T18:00:00Z"}]
+    assert all(b"ann@x.org" not in (r[3] or b"") for r in g.requests)
+
+
+@pytest.mark.parametrize("minutes,win", [
+    (4, WIN), (481, WIN), (True, WIN), ("30", WIN), (30, {"time_min": "garbage", "time_max": "2026-11-02T18:00:00Z"}),
+    (30, {"time_min": "2026-11-02T18:00:00Z", "time_max": "2026-11-02T08:00:00Z"}),
+    (30, {"time_min": "2026-11-02T08:00:00Z", "time_max": "2026-11-02T08:00:00Z"}),
+    (30, {"time_min": "2026-11-01T00:00:00Z", "time_max": "2026-11-15T00:00:01Z"}),
+    (30, {"time_min": "2026-11-01"}), (30, {"time_min": 5, "time_max": 6})])
+def test_free_time_window_and_duration_are_validated(store, minutes, win):
+    w, g = ws(store)
+    with pytest.raises(gw.GoogleError) as exc:
+        w.run("default", "u1", "find_free_time", {"duration_minutes": minutes, **win})
+    assert exc.value.reason == "bad_request" and g.requests == []
+    assert free(w, 30, time_min="2026-11-01T00:00:00Z", time_max="2026-11-15T00:00:00Z")["slots"]      # exactly 14 days is fine

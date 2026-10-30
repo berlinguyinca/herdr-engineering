@@ -885,6 +885,15 @@ TOOL_CATALOG: dict[str, dict[str, Any]] = {
         "parameters": {"type": "object", "properties": {
             "time_min": {"type": "string", "description": "ISO date or datetime; default now."},
             "time_max": {"type": "string"}, "max_results": {"type": "integer"}}}},
+    "find_free_time": {
+        "sensitive": False,
+        "description": "Find up to 5 free time slots (earliest first) of at least duration_minutes inside a window of at most "
+                       "14 days, across the user's Google calendars the assistant may see. Read-only; returns RFC3339 UTC.",
+        "parameters": {"type": "object", "properties": {
+            "duration_minutes": {"type": "integer", "description": "5 to 480."},
+            "time_min": {"type": "string", "description": "RFC3339 start of the window."},
+            "time_max": {"type": "string", "description": "RFC3339 end of the window."}},
+            "required": ["duration_minutes", "time_min", "time_max"]}},
     "read_lineage": {
         "sensitive": False,
         "description": "Read the mission/agent lineage graph (sessions, handoffs, branches, reviews, PRs, CI, artifacts) "
@@ -3833,7 +3842,7 @@ class AssistantService:
                 return {"ok": True, "result": self.intelligence_read(tenant_id, user_id, payload)}
             except (ValueError, LookupError) as exc:
                 raise AssistantError(str(exc)) from exc
-        if tool_id in ("search_email", "read_email", "list_calendar_events"):
+        if tool_id in ("search_email", "read_email", "list_calendar_events", "find_free_time"):
             if self.google_read is None:
                 raise AssistantError("Google mail and calendar are not enabled")
             from .google_workspace import GoogleError
