@@ -22,6 +22,7 @@ from herdr_engineering.control_plane.share_bundle import (
 
 LIMITS = BundleLimits(max_bytes=1024, max_files=5)
 TOKEN_HASH = "ab" * 32
+LIMITS_BIG = BundleLimits(max_bytes=1 << 20, max_files=5)
 
 
 def _f(name, body=b"x", *, sha=None, size=None, chunks=None):
@@ -275,3 +276,30 @@ def test_concurrent_write_state_same_token(tmp_path):
     [t.join() for t in threads]
     assert errors == []
     assert [p.name for p in (tmp_path / "by-token" / TOKEN_HASH).iterdir()] == ["state.json"]
+
+
+def test_scan_finds_sri_stylesheet_link():
+    tag = (b'<link rel="stylesheet" integrity="sha384-' + b"A" * 64 + b'" crossorigin="anonymous" '
+           b'href="https://cdn.example/b.css">')
+    assert scan_external_references(tag) == ["https://cdn.example/b.css"]
+
+
+def test_benign_flood_cannot_hide_a_later_external_script():
+    body = b" /a" * 20001 + b'<script src="https://evil.example/x.js"></script>'
+    assert scan_external_references(body) == ["https://evil.example/x.js"]
+
+
+def test_cap_hit_emits_warning(tmp_path, monkeypatch):
+    from herdr_engineering.control_plane import share_bundle
+    monkeypatch.setattr(share_bundle, "MAX_CANDIDATES", 3)
+    body = b"".join(b'<script src="/p%d.js"></script>' % i for i in range(10))
+    index = build_bundle(tmp_path / "s", [_f("index.html", body)], entry=None, limits=LIMITS_BIG)
+    assert any("stopped after 3 candidates" in w for w in index.warnings)
+    assert sum("references" in w for w in index.warnings) == 3
+
+
+def test_many_distinct_loading_urls_are_fast():
+    body = b"".join(b'<script src="/p%d.js"></script>' % i for i in range(20000))
+    started = time.monotonic()
+    assert len(scan_external_references(body)) == 20000
+    assert time.monotonic() - started < 10.0

@@ -104,8 +104,8 @@ def content_type_for(name: str) -> str:
 # overlap), then a fixed-size look-back decides whether the context loads it. The number of candidates examined is capped,
 # so the cost of one scan is bounded whatever the content looks like.
 _CANDIDATE = re.compile(r"""(?<=[\s"'(=])((?:https?:)?//[^\s"'<>)]+|/[^/\s"'<>)][^\s"'<>)]*)""")
-_LOOKBACK = 120
-MAX_CANDIDATES = 20000
+_LOOKBACK = 400
+MAX_CANDIDATES = 20000  # distinct loading URLs recorded per scan
 MAX_BUNDLE_SCAN_BYTES = 16 * 1024 * 1024
 _ATTRS = {"src", "srcset", "poster", "data-src"}
 
@@ -137,17 +137,25 @@ def _loads_url(prefix: str) -> bool:
     return _trailing_word(prefix) in ("import", "from")
 
 
+def _scan(data: bytes) -> tuple[list[str], bool]:
+    """(urls, stopped): ``stopped`` when the cap of recorded URLs was hit, so the file may hold more."""
+    text = data[:MAX_SCAN_BYTES].decode("utf-8", "replace")
+    found: list[str] = []
+    seen: set[str] = set()
+    for match in _CANDIDATE.finditer(text):
+        url = match.group(1)
+        if url in seen or not _loads_url(text[max(0, match.start() - _LOOKBACK):match.start()]):
+            continue
+        if len(found) >= MAX_CANDIDATES:
+            return found, True
+        seen.add(url)
+        found.append(url)
+    return found, False
+
+
 def scan_external_references(html: bytes) -> list[str]:
     """URLs a page loads from another host or by absolute path (neither works from a frozen bundle). Relative and ``data:`` are fine."""
-    text = html[:MAX_SCAN_BYTES].decode("utf-8", "replace")
-    found: list[str] = []
-    for count, match in enumerate(_CANDIDATE.finditer(text)):
-        if count >= MAX_CANDIDATES:
-            break
-        url = match.group(1)
-        if url not in found and _loads_url(text[max(0, match.start() - _LOOKBACK):match.start()]):
-            found.append(url)
-    return found
+    return _scan(html)[0]
 
 
 def _fold(name: str) -> str:
@@ -264,7 +272,9 @@ def build_bundle(dest: Path, files: Iterable[tuple[str, str, int, Iterable[bytes
                 warnings.append("%s is over %d bytes; only the first %d were checked for external references"
                                 % (f.name, MAX_SCAN_BYTES, MAX_SCAN_BYTES))
             with open(base.joinpath(*f.name.split("/")), "rb") as handle:
-                refs = scan_external_references(handle.read(MAX_SCAN_BYTES))
+                refs, stopped = _scan(handle.read(MAX_SCAN_BYTES))
+            if stopped:
+                warnings.append("reference scan of %s stopped after %d candidates; file may contain more" % (f.name, MAX_CANDIDATES))
             warnings.extend("%s references %s" % (f.name, url) for url in refs[:20])
         if skipped:
             warnings.append("the scan budget (%d bytes) was used up; the remaining files were not checked for external references"
