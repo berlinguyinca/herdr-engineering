@@ -25,6 +25,11 @@
 #      path (reloading the edge when it changed), refreshes the Cognito key/membership
 #      files, the edge certificate and their timers (collab-sync.sh), and recreates
 #      collab-public + collab-edge
+#      Share links: control_plane.share is always validated (render-share; `enabled: true` without a
+#      signing_secret is refused before anything runs, the secret never printed). Only when it is enabled
+#      (which needs the collaboration marker) is its slice installed at a stable 0600 path, the edge
+#      nginx.conf rendered with the /s/ location, and share-public force-recreated once, before the edge;
+#      disabled, a running share-public is stopped and the edge conf is the repo file unchanged
 #   5. waits for /api/v1/health to report the new commit AND for every recreated
 #      container (web, worker, llm-proxy, collab-public/edge) to be running, not
 #      restarting and not unhealthy. Nothing on the host changes before the image is
@@ -268,6 +273,39 @@ if [ "$DRY" = 1 ]; then LLM_DIR="$(dirname "$NEW_LLM")"
 else LLM_DIR="$HOME/.config/herdr-engineering/llm-proxy"; only_file "$LLM_DIR" llm-config.json || exit 1; fi
 export HERDR_LLM_SLICE_DIR="$LLM_DIR"
 
+# Share links: share-public gets ONLY the render-share slice (control_plane.share serving keys + the Cognito
+# identifiers). The slice is always rendered (to validate), installed only when share is enabled. An older
+# candidate without the command has no share wiring at all.
+SHARE=0; NEW_SHARE=""
+if grep -q '"render-share"' "$WORK/herdr_engineering/cli.py" 2>/dev/null; then
+  NEW_SHARE="$ENV_DIR/new/share/share-config.json"
+  # render-share prints the reason (key names and how to fix it, never a value) on failure
+  if ! SHARE_OUT="$(herdr_eng fleet config render-share --path "$CENTRAL" --out "$NEW_SHARE")"; then
+    echo "control_plane.share is incomplete or invalid in $CENTRAL; nothing was changed" >&2
+    exit 1
+  fi
+  case "$SHARE_OUT" in *share=enabled) SHARE=1 ;; esac
+fi
+if [ "$SHARE" = 1 ] && [ "$COLLAB" = 0 ]; then
+  echo "control_plane.share.enabled is true but the collaboration network is off: share links are served behind" \
+       "the collab edge (create $COLLAB_MARKER), or set control_plane.share.enabled: false" >&2
+  exit 1
+fi
+if [ "$DRY" = 1 ]; then
+  SHARE_DIR="$ENV_DIR/new/share"
+  export HERDR_SHARES_DIR="$ENV_DIR/shares" HERDR_SHARE_EVENTS_DIR="$ENV_DIR/share-events"
+else
+  SHARE_DIR="$HOME/.config/herdr-engineering/share"
+  if [ "$SHARE" = 1 ]; then only_file "$SHARE_DIR" share-config.json || exit 1; fi
+  # bundles (web writes, worker sweeps, share-public reads) and share-public's events file (worker reads)
+  export HERDR_SHARES_DIR="$HOME/.local/share/herdr-engineering/shares"
+  export HERDR_SHARE_EVENTS_DIR="$HOME/.local/share/herdr-engineering/share-events"
+fi
+export HERDR_SHARE_CONFIG_DIR="$SHARE_DIR"
+SHARE_CONFIG="$SHARE_DIR/share-config.json"
+SHARE_SERVICE=()
+[ "$SHARE" = 0 ] || SHARE_SERVICE=(share-public)
+
 # The edge bind-mounts this single nginx.conf, so it is written IN PLACE (same inode): a
 # rename-replace would leave the running container reading the old file.
 EDGE_CONF_CHANGED=0
@@ -302,9 +340,17 @@ if [ "$COLLAB" = 1 ]; then
     exit 1
   fi
   export HERDR_COLLAB_CONFIG_DIR="$COLLAB_DIR"
+  # The edge conf for this config: the repo file, plus the /s/ location only when share is enabled.
+  NEW_EDGE="$ENV_DIR/new/collab-edge/nginx.conf"
+  EDGE_TEMPLATE="$WORK/deploy/control-plane/collab-edge/nginx.conf"
+  if [ -n "$NEW_SHARE" ]; then
+    herdr_eng fleet config render-edge --path "$CENTRAL" --template "$EDGE_TEMPLATE" --out "$NEW_EDGE" >/dev/null || exit 1
+  else
+    mkdir -p "$(dirname "$NEW_EDGE")" && cp "$EDGE_TEMPLATE" "$NEW_EDGE"
+  fi
   if [ "$DRY" = 1 ]; then
     # Placeholders so the offline compose validation can resolve the paths.
-    export HERDR_COLLAB_EDGE_CONF="$WORK/deploy/control-plane/collab-edge/nginx.conf"
+    export HERDR_COLLAB_EDGE_CONF="$NEW_EDGE"
     export HERDR_COLLAB_DATA_DIR="$ENV_DIR/collab-data"
     export HERDR_COLLAB_SYNC_DIR="$ENV_DIR/collab-sync"
   else
@@ -345,7 +391,10 @@ if [ "$DRY" = 1 ]; then
   if [ "$COLLAB" = 1 ]; then
     echo "[dry-run] rendered control_plane.collab to a temp slice; after the build would install it at ~/.config/herdr-engineering/collab/, the edge nginx.conf, and the collab-sync timer"
   fi
-  echo "[dry-run] would build herdr-engineering:$TAG and recreate ${APP_SERVICES[*]} ${EDGE_SERVICE[*]}"
+  if [ "$SHARE" = 1 ]; then
+    echo "[dry-run] share links enabled: rendered the share slice to a temp dir (would install it at ~/.config/herdr-engineering/share/), the edge conf gains /s/, share-public would be force-recreated before the edge"
+  fi
+  echo "[dry-run] would build herdr-engineering:$TAG and recreate ${APP_SERVICES[*]} ${EDGE_SERVICE[*]}${SHARE_SERVICE[*]:+ ${SHARE_SERVICE[*]}}"
   exit 0
 fi
 
@@ -422,6 +471,11 @@ if [ "$COLLAB" = 1 ]; then
          "(control_plane.compose.HERDR_COLLAB_CERT_UID); it will not be able to read its config." \
          "Fix: run deploy.sh as that user, or set HERDR_COLLAB_CERT_UID to $HAVE_UID." >&2
   fi
+  # share-public runs as the same uid: it reads its slice and writes the events directory
+  if [ "$SHARE" = 1 ] && [ "$(id -u)" != "$WANT_UID" ]; then
+    echo "WARNING: share-public runs as uid $WANT_UID (control_plane.compose.HERDR_COLLAB_CERT_UID) but this deploy" \
+         "creates $SHARE_DIR and $HERDR_SHARE_EVENTS_DIR as uid $(id -u); it will not be able to read or write them." >&2
+  fi
 fi
 
 # A failed build exits here: nothing on the host has been touched yet.
@@ -493,6 +547,7 @@ if [ "$COLLAB" = 1 ]; then
   backup_file "$SYNC_STABLE"
   for u in "${SYNC_UNITS[@]}"; do backup_file "$UNIT_DIR/$u"; done
 fi
+if [ "$SHARE" = 1 ]; then backup_file "$SHARE_CONFIG"; fi
 
 # restore_host_state: every backed-up file back to its pre-deploy content. nginx.conf in
 # place (same inode, then the edge reloads); the collab-sync units reload in systemd.
@@ -538,7 +593,7 @@ wait_removals() {
   local i svc st busy
   for i in $(seq 1 "$REMOVAL_POLLS"); do
     busy=""
-    for svc in "${APP_SERVICES[@]}" "${EDGE_SERVICE[@]}"; do
+    for svc in "${APP_SERVICES[@]}" "${EDGE_SERVICE[@]}" "${SHARE_SERVICE[@]}"; do
       st="$(docker inspect -f '{{.State.Status}}' "$(container_of "$svc")" 2>/dev/null || echo missing)"
       [ "${st%% *}" != removing ] || busy="$busy $svc"
     done
@@ -591,14 +646,14 @@ container_of() {
   case "$1" in
     control-plane-web) echo herdr-cp-web ;; control-plane-worker) echo herdr-cp-worker ;;
     llm-proxy) echo herdr-llm-proxy ;; collab-public) echo herdr-collab-public ;;
-    collab-edge) echo herdr-collab-edge ;; *) echo "$1" ;;
+    collab-edge) echo herdr-collab-edge ;; share-public) echo herdr-share-public ;; *) echo "$1" ;;
   esac
 }
 services_settled() {
   local i svc name st status restarting count health ok counts prev="" bad
   for i in $(seq 1 "$HEALTH_TRIES"); do
     ok=1; counts=""; bad=""
-    for svc in "${APP_SERVICES[@]}" "${EDGE_SERVICE[@]}"; do
+    for svc in "${APP_SERVICES[@]}" "${EDGE_SERVICE[@]}" "${SHARE_SERVICE[@]}"; do
       name="$(container_of "$svc")"
       st="$(docker inspect -f '{{.State.Status}} {{.State.Restarting}} {{.RestartCount}} {{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$name" 2>/dev/null || echo "missing false 0 none")"
       read -r status restarting count health <<< "$st"
@@ -623,6 +678,10 @@ verify() {   # <commit>: the web reports it AND every recreated service is up
 
 forward() {
   install_private "$NEW_LLM" "$LLM_DIR/llm-config.json" || return 1
+  # mount sources of web/worker (and share-public): created here, after the build, never before
+  mkdir -p "$HERDR_SHARES_DIR" "$HERDR_SHARE_EVENTS_DIR" && chmod 755 "$HERDR_SHARES_DIR" "$HERDR_SHARE_EVENTS_DIR" \
+    || return 1
+  if [ "$SHARE" = 1 ]; then install_private "$NEW_SHARE" "$SHARE_CONFIG" || return 1; fi
   # the deploy/pipelines refresh timer; its first run is the timer's (a fetch never fails a deploy)
   if [ -f "$PIPELINES_SYNC" ]; then
     "$PIPELINES_SYNC" install --dir "$PIPELINES_DIR" || return 1
@@ -642,7 +701,12 @@ forward() {
     "$WORK/deploy/control-plane/collab-sync.sh" install --config "$COLLAB_CONFIG" \
       --dir "$HERDR_COLLAB_SYNC_DIR" --data-dir "$HERDR_COLLAB_DATA_DIR" --cert-dir "$CERT_DIR_VALUE" "${held[@]}" || return 1
     mkdir -p "$(dirname "$HERDR_COLLAB_EDGE_CONF")" || return 1
-    write_edge_conf "$WORK/deploy/control-plane/collab-edge/nginx.conf" || return 1
+    write_edge_conf "$NEW_EDGE" || return 1
+  fi
+  if [ "$SHARE" = 1 ]; then
+    # Stateless and it reads its slice only at startup: recreated once, alone, BEFORE the edge (whose conf
+    # now names it as an upstream nginx resolves at start and reload).
+    compose_up_retry "$WORK" "$ENV_FILE" "$TAG" "$SHA" up -d --no-deps --no-build --force-recreate share-public >/dev/null || return 1
   fi
   if [ "$COLLAB" = 1 ] && [ "$COLLAB_HASH" != "$PREV_COLLAB_HASH" ]; then
     # A changed slice: collab-public reads it only at startup, so force ITS recreate -
@@ -656,6 +720,12 @@ forward() {
   # The edge resolves collab-public once, at (re)load: a recreated collab-public has a
   # new address, so reload the edge after every collab up, not only on a new conf.
   if [ "$COLLAB" = 1 ]; then EDGE_CONF_CHANGED=1; reload_edge_if_changed || return 1; fi
+  # Shares disabled: the edge no longer routes /s/; stop a share-public a previous deploy started (its
+  # bundles stay on disk). Never fatal.
+  if [ "$COLLAB" = 1 ] && [ "$SHARE" = 0 ] && [ -n "$NEW_SHARE" ] && docker inspect herdr-share-public >/dev/null 2>&1; then
+    compose_run "$WORK" "$ENV_FILE" "$TAG" "$SHA" stop share-public >/dev/null 2>&1 \
+      || echo "WARNING: could not stop herdr-share-public (shares are disabled; the edge no longer routes /s/)" >&2
+  fi
   python3 "$STATE_HELPER" verify-forward "$ATTEMPT" || return 1
   verify "$SHA"
 }
@@ -666,7 +736,7 @@ if forward; then
   python3 "$STATE_HELPER" receipt "$ATTEMPT" "$STATE_DIR/$SHA.json" "$REF" \
     "herdr-engineering:$TAG" "$PREVIOUS_IMAGE" "$COLLAB_HASH" "$(date -u +%FT%TZ)"
   python3 "$STATE_HELPER" outcome "$ATTEMPT" succeeded
-  echo "ok: ${APP_SERVICES[*]}${EDGE_SERVICE[*]:+ ${EDGE_SERVICE[*]}} running $SHA (receipt $STATE_DIR/$SHA.json)"
+  echo "ok: ${APP_SERVICES[*]}${EDGE_SERVICE[*]:+ ${EDGE_SERVICE[*]}}${SHARE_SERVICE[*]:+ ${SHARE_SERVICE[*]}} running $SHA (receipt $STATE_DIR/$SHA.json)"
   exit 0
 fi
 
@@ -692,6 +762,9 @@ if [ -z "$PREV_COMMIT" ]; then
 fi
 
 echo "rolling back to $PREVIOUS_IMAGE with the compose files and code of commit $PREV_SHA" >&2
+# share-public is forward-only: the previous commit may not define it, and its restored edge conf decides
+# whether /s/ is routed. A share-public this deploy started keeps running (unreachable without the route).
+SHARE_SERVICE=()
 PREV_CONFIG="$ATTEMPT/previous/fleet-config.yaml"
 FLEET_DIR="$(dirname "$PREV_CONFIG")"
 ROLLBACK_IMAGES="$ATTEMPT/rollback-images.json"
