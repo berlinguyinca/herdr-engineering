@@ -202,7 +202,9 @@ def _build_parser() -> argparse.ArgumentParser:
                       ("revoke", "remove a host (its token stops working); backup first"),
                       ("render-compose", "write the compose env file (0600)"),
                       ("render-collab", "write the collab container's config slice (0600)"),
-                      ("render-llm", "write the llm-proxy container's config slice (0600)")):
+                      ("render-llm", "write the llm-proxy container's config slice (0600)"),
+                      ("render-share", "write the share-public container's config slice (0600)"),
+                      ("render-edge", "write the collab edge's nginx.conf (with /s/ when shares are enabled)")):
         sp = csub.add_parser(name, help=hlp)
         sp.add_argument("--path", default=FLEET_CONFIG_DEFAULT)
         if name == "init":
@@ -230,6 +232,13 @@ def _build_parser() -> argparse.ArgumentParser:
         if name == "render-llm":
             sp.add_argument("--out", required=True,
                             help="file to write (0600): only llm + control_plane.llm_proxy")
+        if name == "render-share":
+            sp.add_argument("--out", required=True,
+                            help="file to write (0600): only control_plane.share's serving keys and the Cognito "
+                                 "identifiers; refused when share is enabled but incomplete")
+        if name == "render-edge":
+            sp.add_argument("--template", required=True, help="collab-edge/nginx.conf (snippets beside it)")
+            sp.add_argument("--out", required=True, help="nginx.conf to write")
         sp.set_defaults(func=_cmd_fleet_config)
     pu = fsub.add_parser("update", help="self-update controller + every host, then "
                                         "report parity (one command)")
@@ -753,6 +762,18 @@ def _build_parser() -> argparse.ArgumentParser:
     p2.add_argument("--port", type=int, default=0)
     p2.add_argument("--fleet-config", default=FLEET_CONFIG_DEFAULT)
     p2.set_defaults(func=_cmd_cp_public_gateway)
+    p2 = csub.add_parser("share-public",
+                         help="serve artifact share links (/s/) from frozen bundles: no database, no API")
+    p2.add_argument("--host", default="127.0.0.1")
+    p2.add_argument("--port", type=int, default=8083)
+    p2.add_argument("--shares-dir", default="/shares", help="the shares volume (read-only)")
+    p2.add_argument("--events-dir", default="/share-events",
+                    help="directory of the append-only events.jsonl the worker ingests (the only writable path)")
+    p2.add_argument("--sync-dir", default="/sync", help="Cognito jwks.json written by collab-sync.sh")
+    p2.add_argument("--fleet-config", default="/etc/herdr/share/share-config.json",
+                    help="the render-share slice (control_plane.share serving keys + Cognito identifiers); "
+                         "the only source of configuration, refused when it carries more")
+    p2.set_defaults(func=_cmd_cp_share_public)
     p2 = csub.add_parser("worker", help="run the bounded background worker")
     p2.add_argument("--interval", type=float, default=30.0,
                     help="seconds between passes (default: 30)")
@@ -1167,6 +1188,14 @@ def _cmd_fleet_config(args) -> int:
         elif cmd == "render-llm":
             fcc.render_llm(load_fleet_config(path), Path(args.out).expanduser())
             print(f"wrote {args.out} (0600)")
+        elif cmd == "render-share":
+            cfg = load_fleet_config(path)
+            fcc.render_share(cfg, Path(args.out).expanduser())
+            # deploy.sh reads the last word: whether share-public runs and the edge routes /s/
+            print(f"wrote {args.out} (0600) share={'enabled' if fcc.share_enabled(cfg) else 'disabled'}")
+        elif cmd == "render-edge":
+            fcc.render_edge(load_fleet_config(path), Path(args.template).expanduser(), Path(args.out).expanduser())
+            print(f"wrote {args.out}")
     except FleetConfigError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
@@ -3448,6 +3477,70 @@ def _cmd_cp_public_gateway(args) -> int:
         server.shutdown()
         server.server_close()
         adapter.close()
+    return 0
+
+
+def _share_lab_problems(collab: dict, share: dict) -> list[str]:
+    """Names (never values) of the lab settings that are missing or malformed."""
+    from .control_plane.share_session import MIN_SECRET_BYTES
+    problems = []
+    secret = share.get("signing_secret")
+    if not isinstance(secret, str) or len(secret.encode("utf-8")) < MIN_SECRET_BYTES:
+        problems.append(f"control_plane.share.signing_secret (at least {MIN_SECRET_BYTES} bytes)")
+    for key in ("cognito_web_client", "cognito_domain", "cognito_pool", "public_url"):
+        if not isinstance(collab.get(key), str) or not collab.get(key):
+            problems.append(f"control_plane.collab.{key}")
+    return problems
+
+
+def _share_public_server(fleet_config, *, shares_dir, events_dir, sync_dir, host, port):
+    """Build (not start) the share server from the render-share slice; logs once when lab links are off."""
+    from .control_plane.share_public import ShareConfig, make_share_server
+    from .fleet_config import FleetConfigError, load_fleet_config
+    from .fleet_config_cli import check_share_slice
+    log = logging.getLogger("herdr.share_public")
+    try:
+        cfg = load_fleet_config(Path(fleet_config).expanduser())
+        check_share_slice(cfg)
+    except FleetConfigError as exc:
+        raise SystemExit(f"--fleet-config: {exc}") from None
+    values = cfg.section("control_plane")
+    share, collab = values.get("share") or {}, values.get("collab") or {}
+    if share.get("enabled") is not True:
+        raise SystemExit("share-public: control_plane.share.enabled is not true in the slice; nothing to serve")
+    secret = share.get("signing_secret")
+    clients = collab.get("cognito_clients") or []
+    config = ShareConfig(
+        shares_root=Path(shares_dir), events_path=Path(events_dir) / "events.jsonl", sync_dir=Path(sync_dir),
+        pool_id=collab.get("cognito_pool"),
+        client_ids=tuple(c for c in clients if isinstance(c, str)) if isinstance(clients, list) else (),
+        web_client_id=collab.get("cognito_web_client"), cognito_domain=collab.get("cognito_domain"),
+        public_url=collab.get("public_url"),
+        signing_secret=secret.encode("utf-8") if isinstance(secret, str) else b"",
+        session_seconds=share.get("session_seconds", 14400))
+    server = make_share_server(config, host=host, port=port)
+    if server.lab is None:
+        problems = _share_lab_problems(collab, share)
+        log.warning("share-public: lab links are OFF (every lab link answers 404) because these settings are "
+                    "missing or invalid: %s; public links are served",
+                    ", ".join(problems) or "control_plane.collab Cognito identifiers (pool, web client, https "
+                                           "domain, https public_url)")
+    return server
+
+
+def _cmd_cp_share_public(args) -> int:
+    """Serve only /s/ share links from the read-only shares volume (database-free)."""
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    server = _share_public_server(args.fleet_config, shares_dir=args.shares_dir, events_dir=args.events_dir,
+                                  sync_dir=args.sync_dir, host=args.host, port=args.port)
+    logging.getLogger("herdr.share_public").info("share-public serving /s/ on %s:%s (lab links %s)", args.host,
+                                                 server.server_address[1], "on" if server.lab else "off")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
     return 0
 
 

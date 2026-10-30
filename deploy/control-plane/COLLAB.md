@@ -60,6 +60,48 @@ These were applied by hand on bender; reapply them on a new host.
    (repeatable allow-list), `--max-per-day` (default 5), `--ledger-dir`. The ledger
    (`~/.local/share/herdr-engineering/collab-provision/ledger.jsonl`) is the audit trail.
 
+## Share links (`/s/`)
+
+Artifact share links are served by `herdr-share-public` behind the same edge, under
+`control_plane.collab.public_url` (`https://localdev.mcp.metabolomics.us/s/<token>/`). Off unless
+`control_plane.share.enabled: true` in the central fleet config; enabling them needs the collab marker.
+
+```
+edge (nginx, location ^~ /s/ only) -> herdr-share-public:8083 (network `share`, internal; no DB, RustFS,
+                                       control plane or outbound route)
+```
+
+- Config: `deploy.sh` renders `herdr-eng fleet config render-share` to
+  `~/.config/herdr-engineering/share/share-config.json` (0600): only `control_plane.share`'s serving keys
+  and collab's `cognito_pool`, `cognito_clients`, `cognito_web_client`, `cognito_domain`, `public_url`.
+  share-public refuses any file carrying more.
+- Signing secret: `enabled: true` without `control_plane.share.signing_secret` (at least 32 bytes) is refused
+  before anything is built. Generate it on the control-plane host and paste it into the fleet YAML yourself:
+  `openssl rand -hex 32`. Never commit it, print it, or pass it as a flag or environment variable. Rotating it
+  ends every open lab session.
+- `public_url` must be a bare origin (empty path or `/`): the viewer's sign-in redirect is fixed at `/s/callback`.
+- `cognito_clients`: the pool is shared with `lc-binbase-scheduler`. List only the app clients whose tokens may
+  sign in here and open lab shares; any listed client's token is accepted.
+- Mounts: bundles at `~/.local/share/herdr-engineering/shares` (web/worker read-write, share-public read-only);
+  share-public's audit file `~/.local/share/herdr-engineering/share-events/events.jsonl` (its only writable
+  mount, 0644; the worker reads it read-only and keeps its ingest marker in the worker-only volume
+  `herdr-cp-share-markers`); the Cognito keys from the collab-sync directory (read-only). Keep
+  `control_plane.share.shares_dir`, `events_dir` and `marker_dir` at their defaults: the mounts are fixed.
+- Edge: with shares enabled the edge's `nginx.conf` gains exactly one location, `^~ /s/` (snippets
+  `collab-edge/share-http.conf` and `share-location.conf`): GET/HEAD/OPTIONS, plus POST only on
+  `/s/<token>/session` (the body-less lab sign-in exchange); any request with a body is refused; its own
+  `limit_req`/`limit_conn` zones; `proxy_buffering off`; `proxy_read_timeout 600s`; no access log (tokens and
+  session HMACs are in the path). Disabled, the edge conf is the repo file unchanged and a running
+  share-public is stopped (its bundles stay on disk).
+- Rollback: share-public is started and checked by forward deploys only. A rollback restores the previous edge
+  conf; a share-public the failed deploy started keeps running but is unreachable when that conf has no `/s/`.
+
+Operator step, once, before sending lab links (not done by `deploy.sh`): add
+`https://localdev.mcp.metabolomics.us/s/callback` to BOTH the CallbackURLs and the LogoutURLs of the
+`herdr-collab-web` app client (`aws cognito-idp update-user-pool-client` replaces the whole client: read it
+first with `describe-user-pool-client` and send every existing attribute back with the new URL added). Public
+links need no Cognito change.
+
 ## Verify
 
 ```
@@ -67,4 +109,5 @@ curl -s https://localdev.mcp.metabolomics.us/api/v1/collab/config        # 200
 curl -s -o /dev/null -w '%{http_code}' https://localdev.mcp.metabolomics.us/api/v1/collab/rooms   # 401
 curl -s -o /dev/null -w '%{http_code}' https://localdev.mcp.metabolomics.us/api/v1/hosts          # 404
 curl -s http://<tailnet-ip>:9482/api/v1/collab/config                    # operator block present
+curl -s -o /dev/null -w '%{http_code}' https://localdev.mcp.metabolomics.us/s/unknown/           # 404 (shares on or off)
 ```
