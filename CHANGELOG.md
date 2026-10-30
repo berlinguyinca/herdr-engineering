@@ -5,6 +5,9 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Unified workspace P05: durable task leases (migration 0040)
+- `team_task_leases` (additive, idempotent, `-- DOWN:`) and `team_task_leases_pg.PgLeaseStore`: the same fencing-token lease contract as the in-memory `LeaseStore`, every transition one conditional statement so two control-plane processes cannot both hold a task. Tests run the lease contract against Postgres plus a 12-way concurrent acquire (exactly one winner). Still not called by any route.
+
 ### Unified workspace P05 (partial, library only): team templates, task admission, reviewer separation, leases
 - New `herdr_engineering/control_plane/team_tasks.py`: `TeamTemplate` roles (planner, implementer(s), one independent read-only reviewer, optional coordinator) that cannot name a host; `admit` lets a task in only from an authorized human through the P01 broker (`submit_task`), never from a message or tainted content, with role-bounded actions, template budget, deadline, acyclic dependencies and reviewer independence; `LeaseStore` gives one lease per task with monotonic fencing tokens (exactly-once completion, crash takeover fences off the stale worker, abort or expiry authorizes nothing).
 - Nothing calls it yet: no routes, no persistence, no Pi mission admission, no `/assign`/`/tasks`/`/skill` wiring, no scheduler placement. Tests: `tests/control_plane/test_team_tasks.py` (18, each safeguard mutation-checked).

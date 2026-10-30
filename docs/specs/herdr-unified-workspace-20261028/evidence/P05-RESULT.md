@@ -16,15 +16,17 @@ execution does not leak privileges; task result links back to room/project/issue
 Mutation check: removing the token fence, the origin check, reviewer independence, or lease revocation on completion
 each fails a test (run by hand, then restored).
 
+## Durable leases (migration 0040, `team_task_leases_pg.py`)
+The lease contract also runs against Postgres (`tests/control_plane/test_team_task_leases_pg.py`, 5 tests incl. a 12-way concurrent acquire with exactly one winner). Mutation check: making takeover unconditional fails 3 of 5. Rollback: `DROP TABLE team_task_leases` (see the migration's `-- DOWN:`).
+
 ## Gate status
 Library-level gate behaviour is demonstrated by unit tests only. The gate as written is NOT met end to end:
-nothing routes a task through this, no persistence (the in-memory `LeaseStore` is the contract the Postgres store must
-match), and "task result links back to room/project/issue" is not implemented.
+nothing routes a task through this, no route uses either store, and "task result links back to room/project/issue" is not implemented.
 
 ## Not done
 `/assign`, `/tasks`, `/skill`, `/session attach`, steer, cancel; Pi authoritative mission admission; room-to-mission
 binding; session migration and fabric scheduler placement with exclusions; skill execution with audited artifacts;
-Postgres lease store and migration; UI. Agents stay unable to submit tasks (decision recorded in P01 answers).
+UI. Agents stay unable to submit tasks (decision recorded in P01 answers).
 
 ## Rollback
 Delete `team_tasks.py` and its test; no schema, route or config was added.
