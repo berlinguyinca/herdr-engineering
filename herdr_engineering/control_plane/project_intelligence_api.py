@@ -33,6 +33,9 @@ class IntelligenceRoutes:
         self.github_app_fn = None   # set by the API glue: () -> review-gate GitHub client or None
         self.metrics_fn = None      # set by the API glue: () -> dict of bridge counters and incident states
         self.ci_repair_fn = None    # set by the API glue: (repository, run, operation_id, actor) -> CI-fix request
+        self.poll_status_fn = None  # set by the API glue: () -> {client, last_error} for the PR poller
+        self.single_operator_fn = lambda: False   # set by the API glue: the server runs in single-operator mode
+        self.last_reconcile: dict | None = None   # counters of the latest pass; a reason when it could not run
         self._executor = None
         from .intel_webhook import ReplayGuard
         self._replay = ReplayGuard()
@@ -62,9 +65,12 @@ class IntelligenceRoutes:
         projects, org = raw.get("webhook_projects"), raw.get("default_org_id")
         if not (cfg["enabled"] and cfg["ingest"]) or cfg["kill_switch"] or app is None \
                 or not isinstance(projects, dict) or not projects or not isinstance(org, str):
+            self.last_reconcile = {"ran": False, "at": datetime.now(UTC).isoformat(timespec="seconds")}
             return None
-        return reconcile_open_prs(app, self.store, cfg, org_id=org, installation=str(raw.get("webhook_installation") or "github"),
-                                  repo_projects=projects, received_at=datetime.now(UTC))
+        out = reconcile_open_prs(app, self.store, cfg, org_id=org, installation=str(raw.get("webhook_installation") or "github"),
+                                 repo_projects=projects, received_at=datetime.now(UTC))
+        self.last_reconcile = {"ran": True, "at": datetime.now(UTC).isoformat(timespec="seconds"), **out}
+        return out
 
     def _cfg(self) -> tuple[dict, dict]:
         raw = self._section() or {}
@@ -197,6 +203,11 @@ class IntelligenceRoutes:
                        "schema_version": pi.SCHEMA_VERSION}
                 if role == "operator" and self.metrics_fn is not None:
                     out["metrics"] = self.metrics_fn()       # counters only: no content, ids or titles
+                if role == "operator":
+                    poller = dict(self.last_reconcile or {})
+                    if self.poll_status_fn is not None:
+                        poller.update(self.poll_status_fn())  # fixed reason strings (permission, not_configured ...)
+                    out["poller"] = poller
                 return 200, out
             if parts in (["projects"], ["investigations"]):
                 kind = parts[0][:-1] if parts[0] == "projects" else "investigation"
@@ -274,8 +285,9 @@ class IntelligenceRoutes:
                 if not cfg["suggest"] or cfg["kill_switch"]:
                     return 409, {"error": "proposals require the suggest flag and no kill switch"}
                 approvers = raw.get("approvers")
-                if (not isinstance(approvers, list) or actor not in [a for a in approvers if isinstance(a, str)]
-                        or principal.get("authenticated_by") == "open_listener"):
+                single = self.single_operator_fn() and principal.get("authenticated_by") == "open_listener"
+                if not single and (not isinstance(approvers, list) or actor not in [a for a in approvers if isinstance(a, str)]
+                                   or principal.get("authenticated_by") == "open_listener"):
                     # Only named principals decide. An absent list means nobody can; an open listener has no identity.
                     return 403, {"error": "this principal is not in project_intelligence.approvers"}
                 known = self.board.get(parts[1], viewer.org_id)
@@ -288,7 +300,7 @@ class IntelligenceRoutes:
                     if not isinstance(body.get("payload_sha256"), str) or not isinstance(v, int) or isinstance(v, bool):
                         return 400, {"error": "payload_sha256 (string) and resource_version (int) are required"}
                     p = self.board.approve(parts[1], approver=actor, org_id=viewer.org_id,
-                                           payload_sha256=body["payload_sha256"], resource_version=v)
+                                           payload_sha256=body["payload_sha256"], resource_version=v, allow_self=single)
                 self.store.record_audit({"action": f"proposal_{p.state}", "id": p.id, "actor": actor})
                 if p.state == "approved":
                     p = self.executor.execute(p.id, viewer.org_id)     # no-op unless the execute flag is on

@@ -302,3 +302,13 @@ def test_fabric_compaction_settings_default_to_off_and_dry_run():
     assert _fabric_compaction_settings({"fabric_compaction": {"enabled": "yes"}}).enabled is False
     with pytest.raises(SystemExit):
         _fabric_compaction_settings({"fabric_compaction": {"min_age_days": 0}})
+
+
+def test_single_operator_makes_the_assistant_allow_the_owners_own_approval_and_nothing_else_changes():
+    from herdr_engineering.cli import _assistant_config
+    pa = {"enabled": True, "actions": {"approvers": ["a"]}}
+    assert _assistant_config({}) is None
+    assert _assistant_config({"personal_assistant": pa}) == {"personal_assistant": pa}
+    on = _assistant_config({"personal_assistant": pa, "single_operator": True})["personal_assistant"]
+    assert on["actions"] == {"approvers": ["a"], "allow_self_approval": True} and "allow_self_approval" not in pa["actions"]
+    assert _assistant_config({"single_operator": True}) is None
