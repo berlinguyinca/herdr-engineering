@@ -112,7 +112,7 @@ def test_the_allow_list_is_exactly_what_the_dispatcher_handles_plus_plain_activi
     # and stored, not silently recorded as plain activity.
     assert DISPATCHED_ENTITY_TYPES == {"lineage", "host", "session", "mission", "service", "inspector",
                                        "mission_activity", "test_run", "build", "review",
-                                       "review_finding", "pull_request", "token_usage", "resource_usage"}
+                                       "review_finding", "pull_request", "token_usage", "resource_usage", "ai_sync"}
     assert INGEST_ENTITY_TYPES - DISPATCHED_ENTITY_TYPES == {"task", "note", "workspace", "ledger",
                                                                         "platform", "lifecycle",
                                                                         "repository", "request", "span"}
