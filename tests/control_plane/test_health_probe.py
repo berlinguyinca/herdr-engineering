@@ -35,10 +35,12 @@ def test_probe_is_lean_and_gate_compatible():
         # No key at all (the deploy.sh posture): probe answers, cheap shape.
         st, body = _get(srv, "/api/v1/health?probe=1")
         assert st == 200
-        assert set(body) == {"status", "version", "commit", "capabilities"}
         assert body["status"] == "ok"
         assert body["commit"] == _COMMIT            # deploy gate: status + commit present
-        assert isinstance(body["capabilities"], list)
+        # ...but a keyed server never lists its features to a caller without a key.
+        assert set(body) == {"status", "version", "commit"}
+        st, body = _get(srv, "/api/v1/health?probe=1", key="vk")
+        assert st == 200 and isinstance(body["capabilities"], list)
         # The heavy payload is deliberately absent from the probe.
         for heavy in ("performance", "inspector", "events", "missions", "sessions",
                       "hosts", "services", "by_route", "recent_requests"):
@@ -77,5 +79,15 @@ def test_probe_works_keyless_open_mode():
         st, body = _get(srv, "/api/v1/health?probe=1")
         assert st == 200 and set(body) == {"status", "version", "commit", "capabilities"}
         assert body["commit"] == _COMMIT
+    finally:
+        srv.shutdown()
+
+
+def test_probe_keeps_the_degraded_flags_the_deploy_gate_needs():
+    srv = _srv(api_keys={"vk": "viewer"})
+    try:
+        srv.collab = type("C", (), {"degraded": True})()
+        st, body = _get(srv, "/api/v1/health?probe=1")
+        assert st == 200 and body["collab_degraded"] is True
     finally:
         srv.shutdown()

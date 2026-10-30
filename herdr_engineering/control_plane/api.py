@@ -1436,14 +1436,22 @@ class ControlPlaneServer:
                 caps.append("architecture_explain_v1")
         return caps
 
-    def _health_probe(self):
+    def _health_probe(self, with_capabilities=True):
         """O(1) liveness + capability shape for the deploy gate and the dashboard nav
         probe. Deliberately excludes repo counters, the inspector's O(total-events)
         scan and the request-metrics snapshot -- those make full /health slow under
         load and are served by the default /health and /api/v1/metrics instead.
-        Preserves the status/version/commit fields deploy.sh's healthy_commit gate."""
-        return {"status": "ok", "version": __version__, "commit": _COMMIT,
-                "capabilities": self._capabilities()}
+        Preserves the status/version/commit fields deploy.sh's healthy_commit gate, and
+        the O(1) degraded flags the full /health reports, so a gate on the probe still
+        sees them. Capabilities are only for callers with a valid role."""
+        h = {"status": "ok", "version": __version__, "commit": _COMMIT}
+        if self.collab is not None and self.collab.degraded:
+            h["collab_degraded"] = True
+        if self.repo.agent_identities.conflict_count:
+            h["agent_identity_degraded"] = True
+        if with_capabilities:
+            h["capabilities"] = self._capabilities()
+        return h
 
     def _health(self):
         """Repo stats + deployment context (source backend, image version/commit)."""
@@ -2153,7 +2161,8 @@ def _make_handler(server, public=False, operator=False):
                 # no inspector O(total-events) scan, no metrics snapshot. Used by
                 # deploy.sh's health gate and the dashboard nav-capability probe so a
                 # loaded server cannot make the deploy/initial-render time out.
-                return self._json(server._health_probe())
+                # Keyed mode without a valid key gets liveness only, like plain /health.
+                return self._json(server._health_probe(with_capabilities=self._role() is not None))
             if self._path_only() == "/api/v1/health" and self._role() is None:
                 # Keyed mode without a valid key: liveness only (deploy.sh's health
                 # check needs status + commit), no counters, sources or capabilities.
