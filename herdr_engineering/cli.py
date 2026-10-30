@@ -3340,9 +3340,9 @@ def _cmd_cp_web(args) -> int:
                              summary_config=cp.get("agent_summaries") or {},
                              summary_report_config=cp.get("summary_report") or {},
                              unified_workspace_config=cp.get("unified_workspace") if isinstance(cp.get("unified_workspace"), dict) else None,
-                             assistant_config={"personal_assistant": cp["personal_assistant"]}
-                                 if isinstance(cp.get("personal_assistant"), dict) else None,
+                             assistant_config=_assistant_config(cp),
                              review_quorum=_review_quorum_config(cp),
+                             single_operator=cp.get("single_operator") is True,
                              usage_retention=usage_retention, usage_prices=usage_prices, attention=attention,
                              ci_fix=ci_fix, missions=missions, github_pg_dsn=dsn, ci_log_tests=ci_log_tests,
                              public_port=args.collab_public_port,
@@ -3664,6 +3664,17 @@ def _inspector_snapshot_settings(cp) -> tuple[bool, float]:
     if isinstance(interval, bool) or not isinstance(interval, (int, float)) or interval < 60:
         interval = 600
     return raw.get("enabled") is True, float(interval)
+
+
+def _assistant_config(cp):
+    """``{"personal_assistant": ...}`` from the fleet section. In single-operator mode the owner's own approval of the
+    assistant's sensitive actions is allowed (there is only one person); otherwise the section is passed through."""
+    pa = cp.get("personal_assistant")
+    if not isinstance(pa, dict):
+        return None
+    if cp.get("single_operator") is True:
+        pa = {**pa, "actions": {**(pa.get("actions") or {}), "allow_self_approval": True}}
+    return {"personal_assistant": pa}
 
 
 def _fabric_compaction_settings(cp):

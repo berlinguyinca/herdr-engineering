@@ -2027,7 +2027,7 @@ class AssistantService:
     def grant_tool(self, *, tenant_id: str, user_id: str, assistant_id: str,
                    tool_id: str, scope: str, ttl_seconds: int | None = None,
                    preauthorized: bool = False,
-                   principal: dict[str, Any] | None = None) -> AssistantGrant:
+                   principal: dict[str, Any] | None = None, single_operator: bool = False) -> AssistantGrant:
         """``preauthorized`` skips per-action approval, so it is the self-grant escape hatch: only an authenticated
         operator principal may create one (``principal`` is the server-authenticated caller, never a body field),
         and never for tools that must always be approved."""
@@ -2035,8 +2035,11 @@ class AssistantService:
         if not isinstance(tool_id, str) or tool_id not in TOOL_CATALOG:
             raise AssistantError("unknown tool")
         if preauthorized:
+            by = principal.get("authenticated_by") if isinstance(principal, dict) else None
+            # single_operator is the server's own setting (control_plane.single_operator), never a request field: it
+            # lets the open listener's caller act as the operator; tool_id rules below still apply.
             if (not isinstance(principal, dict) or principal.get("kind") != "operator"
-                    or principal.get("authenticated_by") != "api_key"):
+                    or not (by == "api_key" or (single_operator and by == "open_listener"))):
                 raise AssistantForbidden("preauthorized grants require an authenticated operator key")
             if tool_id in NEVER_PREAUTHORIZED:
                 raise AssistantForbidden(f"{tool_id} always needs an explicit approval; it cannot be preauthorized")

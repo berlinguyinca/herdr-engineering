@@ -76,8 +76,10 @@ EVIDENCE_PERMISSIONS = {"contents": "read", "metadata": "read"}
 CATALOG_PERMISSIONS = {"issues": "read", "metadata": "read"}
 #: The GitHub cache's Projects v2 sync (organization projects; items reference issues).
 PROJECTS_PERMISSIONS = {"issues": "read", "metadata": "read", "organization_projects": "read"}
+#: Project intelligence's PR poller: the open pull requests of a mapped repository.
+PULLS_PERMISSIONS = {"pull_requests": "read", "metadata": "read"}
 #: The only permissions herdr ever requests, and only at ``read``.
-ALLOWED_PERMISSIONS = frozenset({"contents", "metadata", "issues", "organization_projects"})
+ALLOWED_PERMISSIONS = frozenset({"contents", "metadata", "issues", "organization_projects", "pull_requests"})
 
 # GitHub's current installation tokens are ~390 chars and contain "-" and "." as well.
 _TOKEN = re.compile(r"ghs_[A-Za-z0-9_.-]{16,2000}")
