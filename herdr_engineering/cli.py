@@ -3081,6 +3081,31 @@ def _require_durable_review_gate(cp: dict, dsn) -> None:
                          "control_plane.pg_dsn, or disable the review gate")
 
 
+def _share_wiring(cp: dict, dsn: str | None):
+    """(share store adapter, shares root, settings) when control_plane.share.enabled is true, else three Nones.
+
+    Needs the registry database (shares live beside artifacts). Links are issued under control_plane.collab.public_url;
+    the bundle volume is control_plane.share.shares_dir (default /shares, the container mount). Caps come from the YAML.
+    """
+    share = cp.get("share") or {}
+    if not isinstance(share, dict) or share.get("enabled") is not True or not dsn:
+        return None, None, None
+    from .control_plane.artifact_share_api import share_settings_config
+    collab = cp.get("collab") if isinstance(cp.get("collab"), dict) else {}
+    try:
+        settings = share_settings_config(share, public_url=collab.get("public_url"))
+    except ValueError as exc:
+        raise SystemExit(f"fleet config {exc}") from None
+    from .control_plane import artifact_adapter
+    from .control_plane.artifact_shares import ShareStore
+
+    async def create_share_store():
+        import asyncpg
+        return ShareStore(await asyncpg.connect(dsn))
+
+    return artifact_adapter.SyncArtifactAdapter(create_share_store), Path(share.get("shares_dir") or "/shares"), settings
+
+
 def _cmd_cp_web(args) -> int:
     """Serve the control-plane UI + structured /api/v1 + SSE (private-by-default).
 
@@ -3246,6 +3271,7 @@ def _cmd_cp_web(args) -> int:
         artifact_acl.load(artifact_adapter("load_acl"))
         artifact_reviews.load(artifact_adapter("load_reviews"))
         artifact_jobs.load(artifact_adapter("load_jobs"))
+    share_store, shares_root, share_settings = _share_wiring(cp, dsn)
     collab = None
     if args.collab_cognito_pool:
         if args.collab_users_file:
@@ -3353,7 +3379,8 @@ def _cmd_cp_web(args) -> int:
                              operator_email=args.collab_operator_email,
                              operator_hosts=args.collab_operator_host,
                              collab_operator_url=args.collab_operator_url,
-                             collab_dashboard_hosts=args.collab_dashboard_host)
+                             collab_dashboard_hosts=args.collab_dashboard_host,
+                             share_store=share_store, shares_root=shares_root, share_settings=share_settings)
     if artifact_adapter is not None and svr.artifact_graph_gate is not None:
         # the lineage retraction set is server state kept in the registry: reload it before serving a single read
         svr.artifact_graph_gate.load_retractions(artifact_adapter("load_retractions"))
@@ -3380,6 +3407,8 @@ def _cmd_cp_web(args) -> int:
         svr.shutdown()
         if artifact_adapter is not None:
             artifact_adapter.close()
+        if share_store is not None:
+            share_store.close()
     return 0
 
 

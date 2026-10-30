@@ -310,6 +310,26 @@ class ArtifactStore:
             raise ArtifactError("report output media type differs from its scoped blob")
         return blob
 
+    async def verify_share_outputs(self, artifact_id: str, version_id: str) -> int:
+        """Re-run the commit-time scope rules on a version's outputs before they are copied into a share bundle.
+
+        Report versions need every output scoped to this artifact (``_report_scoped_blob``); other versions may use
+        legacy unscoped blobs but never one registered to another artifact (``_validate_existing_blob_scope``).
+        Returns the number of outputs checked; raises ``ArtifactError`` otherwise.
+        """
+        version = await self.get_version(version_id, artifact_id)
+        if version is None:
+            raise ArtifactError("no artifact version")
+        outputs = version.get("output_manifest") or []
+        check = self._report_scoped_blob if version.get("report_descriptor") else self._validate_existing_blob_scope
+        for output in outputs:
+            if not isinstance(output, dict):
+                raise ArtifactError("each output manifest entry must be an object")
+            await check(artifact_id, output.get("storage_key") or output.get("blob_sha256"),
+                        sha256=output.get("sha256") or output.get("blob_sha256"),
+                        size_bytes=output.get("size_bytes"), media_type=output.get("media_type"))
+        return len(outputs)
+
     async def register_report_blob(self, artifact_id: str, *, storage_key: str, sha256: str,
                                    size_bytes: int, media_type: str) -> dict:
         """Record bytes already verified by the scoped HTTP/worker upload boundary."""

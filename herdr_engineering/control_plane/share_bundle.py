@@ -193,7 +193,8 @@ def _write_file(base: Path, name: str, expected_sha: str, expected_size: int, ch
     return size
 
 
-def _choose_entry(entry: str | None, names: list[str]) -> str:
+def choose_entry(entry: str | None, names: list[str]) -> str:
+    """The bundle's entry: ``entry`` if given (must be in ``names``), else index.html, the single HTML, the single PDF."""
     if entry is not None:
         wanted = normalise_name(entry)
         if wanted not in names:
@@ -256,7 +257,7 @@ def build_bundle(dest: Path, files: Iterable[tuple[str, str, int, Iterable[bytes
         for name, sha, size, chunks in entries:
             total += _write_file(base, name, sha, size, chunks, limits.max_bytes - total)
             index_files.append(BundleFile(name, sha, size, content_type_for(name)))
-        chosen = _choose_entry(entry, [f.name for f in index_files])
+        chosen = choose_entry(entry, [f.name for f in index_files])
         warnings = []
         budget = MAX_BUNDLE_SCAN_BYTES
         skipped = False
