@@ -3366,6 +3366,8 @@ def _make_handler(server, public=False, operator=False):
                 return self._json(server.fleet_config.status())
             if resource == "fleet" and len(parts) == 5 and parts[4] == "inventory":
                 return self._json(r.fleet_inventory())
+            if resource == "ai-sync" and len(parts) == 4:
+                return self._etag_json({"hosts": r.list_ai_sync(_q(self.path, "host_id"))})
             if resource == "hosts":
                 if len(parts) > 5 and parts[5] == "telemetry":
                     rng = _q(self.path, "range")

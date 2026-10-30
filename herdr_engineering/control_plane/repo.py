@@ -2948,6 +2948,17 @@ class ControlPlaneRepo:
                     "has_more": start > 0, "next_cursor": next_cursor,
                     "latest_sequence": latest.get("sequence"), "last_event_id": latest.get("event_id")}
 
+    def list_ai_sync(self, host_id=None):
+        """Latest ai-sync status per host (newest ``status`` event of each ``ai_sync`` stream), sorted by host."""
+        latest = []
+        for eid in sorted(self.entity_ids("ai_sync")):
+            if host_id is not None and eid != host_id:
+                continue
+            stream = self.stream("ai_sync", eid)
+            if stream:
+                latest.append({k: v for k, v in stream[-1]["payload"].items() if not k.startswith("_")})
+        return latest
+
     def entity_ids(self, entity_type):
         """Ids of every entity of ``entity_type`` that has at least one event."""
         with self._event_lock:
