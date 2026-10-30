@@ -38,13 +38,14 @@ def activation(home: Path, harness: str) -> tuple[Path, str, str]:
     block = f"""{START}
 ## HerdR generated-file viewing
 
-At the start of each task that may create or update pictures or HTML, and when
+At the start of each task that may create or update pictures or HTML, or produce
+links the person will want to view (pull requests, deployed pages, dashboards), and when
 explicitly asked to open a file or website, read {json.dumps(str(skill))} and follow it automatically throughout that task.
 Use the bundled launcher {json.dumps(str(launcher))} with python3; it runs the
 maintained HerdR implementation even when the global herdr-eng command is older.
 Before generating output, take the task's baseline with `begin`. At task completion,
-run `discover` and offer the relevant generated files: open all, select files, or
-skip. Wait for the person's choice before transfer or viewer launch. Retain the
+run `discover`, passing each relevant link the task produced with `--url`, and offer
+the relevant generated files and links: open all, select, or skip. Wait for the person's choice before transfer or viewer launch. Retain the
 task state through continuations and avoid duplicate offers. Resolve the person's
 actual device automatically with the launcher; never ask which machine, SSH
 account, operating system, or viewer they use. Never assume the execution host

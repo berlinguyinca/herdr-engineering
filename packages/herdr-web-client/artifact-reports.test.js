@@ -102,3 +102,16 @@ test('bounded differences preserve complete category counts and disclose omitted
   assert.match(editorial, /omitted/);
   assert.match(rendered, /complete descriptors/);
 });
+
+test('context lookup and link reads encode ids and send only the named filters', async () => {
+  const calls = [];
+  const client = new HerdrClient('', { fetchImpl: async url => { calls.push(url); return response({ artifacts: [], links: [] }); } });
+  await client.artifactsForContext('issue', 'org/repo#7', { q: 'plot', limit: 25 });
+  await client.artifactsForContext('room', 'r1');
+  await client.artifactLinks('a/1');
+  assert.deepEqual(calls, [
+    '/api/v1/artifacts/for/issue/org%2Frepo%237?q=plot&limit=25',
+    '/api/v1/artifacts/for/room/r1',
+    '/api/v1/artifacts/a%2F1/links',
+  ]);
+});

@@ -170,7 +170,7 @@ root.addEventListener('hd-freshness', (event) => markAvailability(event.detail.o
 window.addEventListener('hashchange', applyRoutes);   // the entry you are on stays listed; leaving it lets it go
 applyRoutes();
 // Optional tabs appear once /api/v1/health advertises their capability; a failed probe keeps them hidden.
-client.health().then((h) => { capabilities = h?.capabilities || []; applyRoutes(); }).catch(() => { /* optional tabs stay hidden */ });
+client.health({ probe: true }).then((h) => { capabilities = h?.capabilities || []; applyRoutes(); }).catch(() => { /* optional tabs stay hidden */ });
 SHELL.setAttribute('brand', 'HerdR Dev Fabric');
 
 // The nav badge follows the server inbox on every page, so a new critical item is visible from anywhere.
@@ -425,7 +425,7 @@ async function viewPrTrail(parts) {
 
 async function viewHandoffs() {
   root.innerHTML = `${liveHead('<h1>Handoffs</h1>')}<div id="handoffs"></div>`;
-  return mountHandoffs(root.querySelector('#handoffs'), client, { freshness: chipIn(root) });
+  return mountHandoffs(root.querySelector('#handoffs'), client, { freshness: chipIn(root), open: route().query.get('open') || '' });
 }
 
 // ------------------------------------------------------------- topology
@@ -878,7 +878,7 @@ async function viewSession(parts, revision) {
     let storyTree = {}, storyLinks = client.getSessionCommits ? 'loading' : null;
     const drawStory = () => { if (storyHost.isConnected) storyHost.innerHTML = renderStory(agentStory(s, storyTree, Date.now(), storyLinks)); };
     drawStory();
-    client.getHandoffTree?.({signal: controller.signal}).then(tree => { storyTree = tree; drawStory(); }).catch(() => { /* the story keeps start and last report */ });
+    client.getHandoffTree?.({signal: controller.signal, sessionId: s.session_id}).then(tree => { storyTree = tree; drawStory(); }).catch(() => { /* the story keeps start and last report */ });
     client.getSessionCommits?.(s.session_id, {signal: controller.signal}).then(links => { storyLinks = links; drawStory(); }).catch(() => { storyLinks = 'error'; drawStory(); });
     const relatedDispose = showRelated('session', s.session_id, null, relatedIntegrationLinks(s,'session',s.session_id), { sessionId: s.session_id });
     const disposeWorkspace = mountSessionWorkspace(document.getElementById('session-workspace-host'), client, s, {onRename: profile => { s.display_name = profile.display_name; const title = root.querySelector('.sd-title'); if (title) title.textContent = `${profile.display_name}${project ? ` · ${clip(project)}` : ''}`; }});

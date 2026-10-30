@@ -2595,6 +2595,7 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                            and self._now() - r["created_epoch"] < REQUEST_TTL]
                 out.append({"agent_id": aid, "name": a["name"], "harness_type": a["harness_type"],
                             "instance_id": a.get("instance_id"), "external": bool(a.get("external")),
+                            "online": any(self._online(r["room_id"], "agent", aid) for r in rooms),
                             "status": a["status"], "expires_at": a["expires_at"], "rooms": rooms,
                             "pending": pending})
         return {"agents": out}
@@ -5307,6 +5308,34 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                 out.append({k: v for k, v in self._view(ev, viewer=pr, _ctx_cache=cache).items() if k != "project_id"})
                 nxt = ev["sequence"]
         return {"events": out, "next_cursor": nxt, "has_more": more}
+
+    def room_people(self, pr: Principal, room_id: str) -> list[dict]:
+        """Handles of the people in a room the caller may read (never emails); a guest sees no roster."""
+        with self._lock:
+            room, _ = self._authorize(pr, room_id, "read", "room.people")
+            if not pr.is_agent and (self._member(room, pr.id) or {}).get("role") == "guest":
+                return []
+            return [{"user_id": u, "handle": self._user_handle.get(u) or u.split("@")[0],
+                     "online": self._online(room_id, "person", u)}
+                    for u in room["members"] if self._member(room, u)]
+
+    def read_tail(self, pr: Principal, room_id: str, limit: int) -> dict:
+        """The newest ``limit`` events of a room the caller may read, oldest first, as ``read_events`` would show them."""
+        with self._lock:
+            room, first = self._authorize(pr, room_id, "read", "events.read")
+            guest = not pr.is_agent and (self._member(room, pr.id) or {}).get("role") == "guest"
+            feed, cache, out = self._by_room.get(room_id, []), {}, []
+            for ev in reversed(feed):
+                if ev["sequence"] < first or len(out) >= limit:
+                    break
+                if pr.external and ev["event_type"] != "message":
+                    continue
+                if guest and (ev["event_type"].startswith("helper_") or (
+                        ev["event_type"].startswith("agent_") and ev["payload"].get("agent_id") in self._helper_minted)):
+                    continue
+                out.append({k: v for k, v in self._view(ev, viewer=pr, _ctx_cache=cache).items() if k != "project_id"})
+            out.reverse()
+            return {"events": out, "next_cursor": out[-1]["sequence"] if out else 0}
 
     def audit(self, pr: Principal, project_id: str, cursor: int, limit: int) -> dict:
         self._require_user(pr)

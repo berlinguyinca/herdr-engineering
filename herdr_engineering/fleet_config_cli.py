@@ -193,7 +193,8 @@ COLLAB_KEYS = frozenset({"cognito_pool", "cognito_clients", "cognito_group", "co
                          "contextual", "insights",
                          "skills",
                          "summary_fix",   # summary_fix: ids of the operator's summary-fix room and agent, no secret
-                         "delegation_enabled"})
+                         "delegation_enabled",
+                         "task_lease_seconds"})   # a number of seconds, no secret
 
 
 def collab_values(cfg: FleetConfig) -> dict:
@@ -219,6 +220,9 @@ def collab_values(cfg: FleetConfig) -> dict:
     if not isinstance(user, str) or not user:
         raise FleetConfigError("control_plane.collab.operator_user is required (the Cognito username "
                                "the dashboard's no-sign-in collaboration acts as)")
+    lease = collab.get("task_lease_seconds")
+    if lease is not None and (isinstance(lease, bool) or not isinstance(lease, (int, float)) or not 60 <= lease <= 7 * 86400):
+        raise FleetConfigError("control_plane.collab.task_lease_seconds must be a number of seconds, 60 to 604800")
     history = collab.get("replay_history", "since_join")
     if history not in ("full", "since_join"):
         raise FleetConfigError("control_plane.collab.replay_history must be 'full' or 'since_join'")
@@ -240,11 +244,23 @@ def collab_values(cfg: FleetConfig) -> dict:
     return dict(collab)
 
 
+def _rakazo_slice(cfg: FleetConfig) -> dict:
+    """The Rakazo Cognito group collab-sync should mirror (only when it reads membership from files)."""
+    try:
+        bridge = cfg.section(CONTROL_PLANE_SECTION).get("rakazo_bridge")
+    except FleetConfigError:
+        return {}
+    cog = bridge.get("cognito") if isinstance(bridge, dict) else None
+    if isinstance(cog, dict) and cog.get("sync_dir") and cog.get("required_group"):
+        return {"rakazo_cognito_group": cog["required_group"]}
+    return {}
+
+
 def render_collab(cfg: FleetConfig, out: Path) -> None:
     """Write a minimal fleet file (JSON, valid YAML, 0600) holding only control_plane.collab."""
     data = {"version": SCHEMA_VERSION,
             "sections": {CONTROL_PLANE_SECTION: {"roles": ["control-plane"],
-                                                 "values": {"collab": collab_values(cfg)}}},
+                                                 "values": {"collab": collab_values(cfg), **_rakazo_slice(cfg)}}},
             "hosts": {}}
     _parse(data)
     write_private_file(Path(out), json.dumps(data, indent=2, sort_keys=True) + "\n")

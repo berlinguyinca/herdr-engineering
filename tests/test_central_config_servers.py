@@ -841,3 +841,33 @@ def test_web_starts_enabled_review_gate_with_a_dsn(tmp_path, monkeypatch, old_en
 def test_web_without_dsn_is_fine_when_review_gate_disabled(tmp_path, monkeypatch, old_env):
     path = make_file(tmp_path, pg_dsn=None, review_gate=_gate(tmp_path, enabled=False))
     assert "sink_dsn" not in _run_web(monkeypatch, path)
+
+
+# ------------------------------------------------- P05 crash takeover lease (YAML only, default off)
+def test_task_lease_is_a_validated_startup_collab_key_and_off_by_default():
+    import argparse
+    assert "task_lease_seconds" in fcc.COLLAB_KEYS and "task_lease_seconds" in cli.COLLAB_CONFIG_KEYS
+    assert "task_lease_seconds" in cli.STARTUP_ONLY_COLLAB_KEYS
+    assert cli._task_lease(argparse.Namespace(), {}) is None
+    assert cli._task_lease(argparse.Namespace(), {"collab": {"task_lease_seconds": 900}}) == 900.0
+    args = argparse.Namespace(collab_task_lease_seconds=None)
+    cli._apply_collab_config(args, {"collab": {"task_lease_seconds": 1800}})
+    assert args.collab_task_lease_seconds == 1800.0 and cli._task_lease(args, {}) == 1800.0
+    for bad in (True, "600", 10, 10 * 86400):
+        with pytest.raises(SystemExit):
+            cli._task_lease(argparse.Namespace(), {"collab": {"task_lease_seconds": bad}})
+
+
+def test_render_collab_slice_carries_the_rakazo_group_only_for_file_membership(tmp_path):
+    def slice_for(cognito, n=[0]):
+        n[0] += 1
+        d = tmp_path / f"c{n[0]}"
+        d.mkdir()
+        central = make_file(d, collab=dict(COLLAB), rakazo_bridge={"enabled": True, "cognito": cognito})
+        out = d / "s" / "collab-config.json"
+        fcc.render_collab(fcc.load_fleet_config(central), out)
+        return yaml.safe_load(out.read_text())["sections"]["control_plane"]["values"]
+
+    base = {"pool_id": "us-west-2_TESTPOOL", "client_ids": ["clientabc123456"], "required_group": "rakazo-users"}
+    assert slice_for({**base, "sync_dir": "/etc/herdr/collab-sync"})["rakazo_cognito_group"] == "rakazo-users"
+    assert "rakazo_cognito_group" not in slice_for(base)

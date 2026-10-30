@@ -1196,6 +1196,27 @@ class HttpModelRunnerAdapter(RuntimeAdapter):
         self.context_provider = context_provider
         self.context_gate = context_gate
         self._urlopen = urlopen
+        # callables (run) -> text appended to the bot's own instructions, e.g. the app's agent skills; never raise
+        self.prompt_extras: list[Callable[[AssistantRun], str]] = []
+
+    def _bot_prompt(self, run: AssistantRun | None) -> tuple[dict | None, str]:
+        """The bot's own instructions (plus any registered extras) as a system message, and its model: a bot set to
+        ``manual:<id>`` asks the gateway for that model, otherwise the configured one."""
+        if run is None:
+            return None, self.model
+        assistant = self.store.assistants.get(run.assistant_id)
+        if assistant is None:
+            return None, self.model
+        parts = [assistant.instructions.strip()] if assistant.instructions.strip() else []
+        for extra in self.prompt_extras:
+            try:
+                text = extra(run)
+            except Exception:  # noqa: BLE001 - extras must never break a reply
+                text = ""
+            if text:
+                parts.append(text)
+        model = assistant.model_policy[7:] if assistant.model_policy.startswith("manual:") else self.model
+        return ({"role": "system", "content": "\n\n".join(parts)} if parts else None), model or self.model
 
     def _system_message(self, run: AssistantRun | None = None) -> dict | None:
         if self.context_provider is None:
@@ -1226,8 +1247,11 @@ class HttpModelRunnerAdapter(RuntimeAdapter):
         sys = self._system_message(run)
         if sys:
             msgs = [sys] + msgs
+        bot, model = self._bot_prompt(run)
+        if bot:
+            msgs = [bot] + msgs
         return {
-            "model": self.model,
+            "model": model,
             "messages": msgs,
         }
 
@@ -1273,7 +1297,10 @@ class HttpModelRunnerAdapter(RuntimeAdapter):
         sys = self._system_message(run)
         if sys:
             msgs = [sys] + msgs
-        payload = {"model": self.model, "messages": msgs, "tools": tools,
+        bot, model = self._bot_prompt(run)
+        if bot:
+            msgs = [bot] + msgs
+        payload = {"model": model, "messages": msgs, "tools": tools,
                    "tool_choice": "auto"}
         try:
             return self._parse_step(self._post(payload))
@@ -1745,6 +1772,15 @@ class AssistantStore:
             self.runs[r.run_id] = r
         self._after_mutation()
 
+    def advance_run(self, run: AssistantRun, state: str) -> bool:
+        """Move a run to ``state`` unless it was cancelled meanwhile. False means: stop, the run is cancelled."""
+        with self._lock:
+            if run.state == "cancelled":
+                return False
+            run.state = state
+            self.put_run(run)
+            return True
+
     def get_run(self, run_id: str, *, tenant_id: str, user_id: str) -> AssistantRun:
         r = self.runs.get(run_id)
         if r is None or r.tenant_id != tenant_id or r.user_id != user_id:
@@ -2022,6 +2058,9 @@ class AssistantService:
         self._shell_runner = None  # injected in tests; default uses subprocess
         self._transport = None  # injected in tests; default uses urllib
         self._approval_ttl = timedelta(seconds=self.config["approval_ttl_seconds"])
+        # optional (tenant, user, tool, scope) -> "deny" | "always_allow" | None, set by the Rakazo bridge from the person's own
+        # approval rules. A rule can only tighten (deny) or skip the approval prompt for a tool that already has a grant.
+        self.rule_policy: Callable[[str, str, str, str], str | None] | None = None
 
     def tenant_for(self, principal_id: str | None) -> str:
         """The tenant an authenticated principal belongs to, from YAML only. Unlisted principals share the default
@@ -2185,28 +2224,35 @@ class AssistantService:
 
         # policy pipeline
         try:
-            run.state = "authorized"
-            self.store.put_run(run)
+            # a cancel (cancel_run) can arrive at any point: it wins, and a cancelled run is never moved on or completed
+            if not self.store.advance_run(run, "authorized"):
+                return run
             # read_memory requires a grant; if absent, the run fails closed but
             # still completes with the local runner (which returns no context).
-            run.state = "running"
-            self.store.put_run(run)
+            if not self.store.advance_run(run, "running"):
+                return run
             messages = self.store.list_messages(thread_id, tenant_id=tenant_id, user_id=user_id)
             reply = self._drive(run, messages)
-            self.store.put_message(AssistantMessage(
-                message_id=_new_id("msg"), thread_id=thread_id, role="assistant",
-                content=reply, provenance=run.run_id))
-            thread.last_activity_at = self.now()
-            run.state = "completed"
-            run.model_route = assistant.model_policy
-            self.store.put_run(run)
-            self.store.audit_record(tenant_id=tenant_id, user_id=user_id, actor=user_id,
-                                    action="assistant.run.completed", subject_id=run.run_id)
+            with self.store._lock:                  # the check and the writes are one step as far as cancel_run can see
+                if run.state == "cancelled":
+                    return run                      # the reply of a stopped run is discarded
+                self.store.put_message(AssistantMessage(
+                    message_id=_new_id("msg"), thread_id=thread_id, role="assistant",
+                    content=reply, provenance=run.run_id))
+                thread.last_activity_at = self.now()
+                run.state = "completed"
+                run.model_route = assistant.model_policy
+                self.store.put_run(run)
+                self.store.audit_record(tenant_id=tenant_id, user_id=user_id, actor=user_id,
+                                        action="assistant.run.completed", subject_id=run.run_id)
             return run
         except Exception as exc:  # noqa: BLE001 - surface as failed run, never crash
-            run.state = "failed"
-            run.error = str(exc)
-            self.store.put_run(run)
+            with self.store._lock:
+                if run.state == "cancelled":
+                    return run                      # stopped by the user: not a failure
+                run.state = "failed"
+                run.error = str(exc)
+                self.store.put_run(run)
             self.store.audit_record(tenant_id=tenant_id, user_id=user_id, actor=user_id,
                                     action="assistant.run.failed", subject_id=run.run_id,
                                     detail=str(exc))
@@ -2219,11 +2265,12 @@ class AssistantService:
     def cancel_run(self, run_id: str, *, tenant_id: str, user_id: str) -> AssistantRun:
         self._require_enabled()
         run = self.store.get_run(run_id, tenant_id=tenant_id, user_id=user_id)
-        if run.state not in ("submitted", "authorized", "running", "queued",
-                             "waiting_for_approval", "recovering"):
-            raise AssistantError(f"run not cancellable in state {run.state}")
-        run.state = "cancelled"
-        self.store.put_run(run)
+        with self.store._lock:
+            if run.state not in ("submitted", "authorized", "running", "queued",
+                                 "waiting_for_approval", "recovering"):
+                raise AssistantError(f"run not cancellable in state {run.state}")
+            run.state = "cancelled"
+            self.store.put_run(run)
         self.store.audit_record(tenant_id=tenant_id, user_id=user_id, actor=user_id,
                                 action="assistant.run.cancelled", subject_id=run_id)
         return run
@@ -2303,6 +2350,25 @@ class AssistantService:
             out["approval_id"] = approval_id
         return out
 
+    def _rule(self, tenant_id: str, user_id: str, tool_id: str, scope: str) -> str | None:
+        """The person's own approval rule for this request: ``deny``, ``always_allow`` or None. A broken lookup fails closed."""
+        if self.rule_policy is None:
+            return None
+        try:
+            return self.rule_policy(tenant_id, user_id, tool_id, scope)
+        except Exception:  # noqa: BLE001 - a broken rule lookup must never loosen policy
+            return "deny"
+
+    def _apply_rule(self, tenant_id, user_id, tool_id, scope, grant, preauthorized):
+        """A rule can refuse a granted tool, or skip the prompt for a tool that is already granted (never for the tools that
+        can never be preauthorized). It never creates a grant."""
+        rule = self._rule(tenant_id, user_id, tool_id, scope)
+        if rule == "deny":
+            return None, preauthorized
+        if rule == "always_allow" and grant is not None and tool_id not in NEVER_PREAUTHORIZED:
+            return grant, True
+        return grant, preauthorized
+
     def dry_run_tool_action(self, *, tenant_id: str, user_id: str, assistant_id: str,
                             tool_id: str, scope: str, request_payload: dict[str, Any]) -> dict[str, Any]:
         """What WOULD happen, without creating an action, an approval or any side effect."""
@@ -2315,6 +2381,7 @@ class AssistantService:
                                    tenant_id=tenant_id, user_id=user_id)
         preauthorized = bool(grant and (grant.constraints or {}).get("preauthorized")
                              and tool_id not in NEVER_PREAUTHORIZED)
+        grant, preauthorized = self._apply_rule(tenant_id, user_id, tool_id, scope, grant, preauthorized)
         return {
             "dry_run": True, "tool_id": tool_id, "scope": scope,
             "description": describe_action(tool_id, scope, request_payload),
@@ -2380,6 +2447,7 @@ class AssistantService:
                                    scope=scope, tenant_id=tenant_id, user_id=user_id)
         preauthorized = bool(grant and (grant.constraints or {}).get("preauthorized")
                              and tool_id not in NEVER_PREAUTHORIZED)
+        grant, preauthorized = self._apply_rule(tenant_id, user_id, tool_id, scope, grant, preauthorized)
 
         # Reuse identity, but never reuse stale authorization.
         for existing in self.store.actions.values():
@@ -2601,6 +2669,10 @@ class AssistantService:
             raise AssistantError("this action is already running")
         if action.status == "failed":
             raise AssistantError("this action failed earlier and is not retried under the same key")
+        if self._rule(o_tenant, o_user, action.tool_id, action.scope) == "deny":
+            action.status = "denied"
+            self.store.put_action(action)
+            refuse("rule", "a deny rule now covers this tool")
         if action.status not in ("authorized", "approved"):
             refuse("status", f"the action is {action.status}; it has not been approved", AssistantError)
         if action.tool_id not in EXECUTABLE_AFTER_APPROVAL:

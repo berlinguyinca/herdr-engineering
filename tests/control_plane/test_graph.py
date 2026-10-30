@@ -112,6 +112,16 @@ def test_out_of_order_last_writer_wins_per_field():
     assert (node["first_event_id"], node["last_event_id"]) == ("e1", "e3")
 
 
+def test_a_node_reports_when_its_first_and_last_events_were_received():
+    g = GraphProjection()
+    for seq, at in ((1, "2026-10-30T10:00:00+00:00"), (2, "2026-10-30T11:30:00+00:00")):
+        g.apply({"event_id": f"e{seq}", "source": "pi", "source_sequence": seq, "event_type": "node.upsert",
+                 "payload": {"node_type": "handoff", "node_id": "handoff:h", "state": "prepared" if seq == 1 else "acknowledged"},
+                 "visibility_scope": "org", "actor": WRITER, "ingest_timestamp": at, "source_timestamp": "1999-01-01T00:00:00Z"})
+    node = g.snapshot()["nodes"]["handoff:h"]
+    assert node["first_seen_at"] == "2026-10-30T10:00:00+00:00" and node["last_seen_at"] == "2026-10-30T11:30:00+00:00"
+
+
 def test_rebuild_from_events_equals_live_state():
     repo, svc, f = make()
     f.node("agent:a1", label="A", scope="room")

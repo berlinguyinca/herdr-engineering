@@ -165,6 +165,16 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=_cmd_capabilities)
 
+    # relay ----------------------------------------------------------------
+    p = sub.add_parser("relay", help="Join a collaboration room as an external agent (outbound bridges build on this)")
+    rsub = p.add_subparsers(dest="relay_command", required=True)
+    rp = rsub.add_parser("join", help="redeem a one-time invite code (read from a file or stdin, never an argument)")
+    rp.add_argument("--config", required=True)
+    rp.add_argument("--code-file", help="file holding the invite code; default is stdin")
+    rp.set_defaults(func=_cmd_relay_join)
+    rp = rsub.add_parser("status", help="show the room, agent, rights and expiry from the state file")
+    rp.add_argument("--config", required=True)
+    rp.set_defaults(func=_cmd_relay_status)
     # bridge ---------------------------------------------------------------
     p = sub.add_parser("bridge", help="Rakazo mobile bridge helpers (control_plane.rakazo_bridge)")
     bsub = p.add_subparsers(dest="bridge_command", required=True)
@@ -747,7 +757,7 @@ def _build_parser() -> argparse.ArgumentParser:
                     help="dashboard: forward /api/v1/collab/* to the operator listener of the "
                          "isolated collab service (e.g. http://100.64.0.1:8082)")
     # No flag on purpose: the T11 delegation kill switch is YAML only (control_plane.collab.delegation_enabled).
-    p2.set_defaults(collab_delegation_enabled=False)
+    p2.set_defaults(collab_delegation_enabled=False, collab_task_lease_seconds=None)
     p2.add_argument("--collab-dashboard-host", action="append", default=[],
                     help="extra DNS name the dashboard may be reached by for collaboration "
                          "(IP literals and localhost always work; repeatable; DNS-rebinding guard)")
@@ -3366,6 +3376,7 @@ def _cmd_cp_web(args) -> int:
         collab = CollabService(auth, sink=sink, public_config=public, approval=approval,
                                delegation_enabled=_delegation_switch(args, cp),
                                summary_fix=getattr(args, "collab_summary_fix", None))
+        collab.task_lease_seconds = _task_lease(args, cp)
         if args.collab_only:
             collab.hydrate_or_degrade(sink.load)       # T16 H1: any replay failure disables collaboration only
     elif args.collab_users_file:
@@ -3382,6 +3393,7 @@ def _cmd_cp_web(args) -> int:
                              "existing state; refusing to start empty over an existing log")
         collab = CollabService(StaticTokenAuthenticator(users), sink=sink,
                                delegation_enabled=_delegation_switch(args, cp))
+        collab.task_lease_seconds = _task_lease(args, cp)
     if collab is not None:
         history = getattr(args, "collab_replay_history", None) or "since_join"
         if history not in ("full", "since_join"):
@@ -3603,6 +3615,8 @@ COLLAB_CONFIG_KEYS = {
     "dashboard_hosts": ("collab_dashboard_host", list),   # names the private dashboard may be opened by
     # T11 kill switch: bounded task delegation + artifact proposals. Default false = the feature does not exist.
     "delegation_enabled": ("collab_delegation_enabled", bool),
+    # P05 crash takeover: seconds an accepted task may stay accepted before it is requeued (read once at startup)
+    "task_lease_seconds": ("collab_task_lease_seconds", float),
     "replay_history": ("collab_replay_history", str),     # lineage replay: since_join (default) | full
     "steering": ("collab_steering", dict),                # T12 comments + steering; YAML only, off by default
     "contextual": ("collab_contextual", dict),            # T14 context refs, consultation, cross links; YAML only, off by default
@@ -3648,6 +3662,8 @@ def _apply_collab_config(args, cp) -> None:
             except ValueError as exc:
                 raise SystemExit(f"fleet config {exc}") from None
             setattr(args, dest, dict(value))
+        elif kind is float:
+            setattr(args, dest, _task_lease_value(value))
         elif kind is bool:
             if not isinstance(value, bool):
                 raise SystemExit(f"fleet config control_plane.collab.{key} must be true or false")
@@ -3725,6 +3741,22 @@ def _wire_collab_switches(collab, store, pinned=frozenset()) -> None:
         except Exception as exc:   # noqa: BLE001
             logging.getLogger(__name__).error(
                 "control_plane.collab.%s is unusable (%s): the feature is OFF until the file is fixed", key, exc)
+
+
+def _task_lease_value(value) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not 60 <= value <= 7 * 86400:
+        raise SystemExit("fleet config control_plane.collab.task_lease_seconds must be a number of seconds, 60 to 604800")
+    return float(value)
+
+
+def _task_lease(args, cp):
+    """control_plane.collab.task_lease_seconds (YAML only, default off = None); the collab-only path already folded it into args."""
+    folded = getattr(args, "collab_task_lease_seconds", None)
+    if folded is not None:
+        return folded
+    collab = cp.get("collab") if isinstance(cp, dict) else None
+    value = collab.get("task_lease_seconds") if isinstance(collab, dict) else None
+    return None if value is None else _task_lease_value(value)
 
 
 def _delegation_switch(args, cp) -> bool:
@@ -3813,6 +3845,30 @@ def _inspector_snapshot_settings(cp) -> tuple[bool, float]:
     if isinstance(interval, bool) or not isinstance(interval, (int, float)) or interval < 60:
         interval = 600
     return raw.get("enabled") is True, float(interval)
+
+
+def _cmd_relay_join(args):
+    import sys
+
+    from .external_bridge import config as bcfg
+    from .external_bridge.client import BridgeClient
+    cfg = bcfg.load(args.config)
+    code = (Path(args.code_file).read_text() if args.code_file else sys.stdin.readline()).strip()
+    client = BridgeClient.join(cfg["control_plane_url"], code, cfg["state_file"])
+    print(f"joined room {client.room_id} as {client.agent_id}; can post: {client.can_post}")
+    return 0
+
+
+def _cmd_relay_status(args):
+    import time
+
+    from .external_bridge import config as bcfg
+    from .external_bridge.client import BridgeClient
+    client = BridgeClient(bcfg.load(args.config)["state_file"])
+    left = int(client.state["expires_at"] - time.time())
+    print(f"room {client.room_id}, agent {client.agent_id}, can post: {client.can_post}, "
+          f"invite expires in {left // 3600} h" if left > 0 else "the invite has expired; ask the room owner for a new one")
+    return 0
 
 
 def _cmd_bridge_hash_password(args):

@@ -315,3 +315,89 @@ def test_css_escaped_asset_names():
 
     assert css_unescape(r'my\ picture.png') == 'my picture.png'
     assert css_unescape(r'my\20 picture.png') == 'my picture.png'
+
+
+def test_hidden_directories_are_never_offered(tmp_path):
+    root, state = start(tmp_path)
+    for hidden in ('.pi-eng/cav/ui-test/out', '.worktrees/wt', '.cache'):
+        (root / hidden).mkdir(parents=True)
+        (root / hidden / 'screenshot.png').write_bytes(b'test-suite output')
+    (root / 'report.html').write_text('<p>deliverable</p>')
+    assert [x['name'] for x in oc.discover(state)['candidates']] == ['report.html']
+
+
+def test_identical_content_under_many_names_is_offered_once(tmp_path):
+    root, state = start(tmp_path)
+    for index in range(6):
+        (root / f'shot-{index}.png').write_bytes(b'the same pixels')
+    (root / 'other.png').write_bytes(b'different pixels')
+    result = oc.discover(state)
+    assert len(result['candidates']) == 2
+    assert result['duplicates_collapsed'] == 5
+    assert oc.discover(state)['candidates'] == [], 'collapsed copies are not re-offered later'
+
+
+def test_links_are_offered_with_files_and_only_once(tmp_path):
+    root, state = start(tmp_path)
+    (root / 'a.html').write_text('<p>a</p>')
+    result = oc.discover(state, ['https://github.com/o/r/pull/7', 'https://github.com/o/r/pull/7', 'https://ci.example.org/run/9'])
+    kinds = [x['kind'] for x in result['candidates']]
+    assert kinds.count('file') == 1 and kinds.count('url') == 2
+    assert result['prompt'] == 'There are 1 file and 2 links to open on your device. Open all, select, or skip?'
+    assert oc.discover(state, ['https://github.com/o/r/pull/7'])['candidates'] == []
+    (tmp_path / 'second').mkdir()
+    only_links = oc.discover(start(tmp_path / 'second')[1], ['https://github.com/o/r/pull/8'])
+    assert only_links['prompt'] == 'There are 1 link to open on your device. Open all, select, or skip?'
+
+
+def test_unsafe_links_are_reported_not_offered(tmp_path):
+    _, state = start(tmp_path)
+    result = oc.discover(state, ['http://localhost:3000', 'file:///etc/passwd', 'https://user:pw@example.org/x',
+                                 'http://127.0.0.1/', 'https://example.org/ok'])
+    assert [x['url'] for x in result['candidates']] == ['https://example.org/ok']
+    assert {x['url'] for x in result['skipped_urls']} == {
+        'http://localhost:3000', 'file:///etc/passwd', 'https://user:pw@example.org/x', 'http://127.0.0.1/'}
+    assert all(x['reason'] for x in result['skipped_urls'])
+
+
+def test_selected_link_opens_on_the_discovered_client(tmp_path, monkeypatch):
+    root, state = start(tmp_path)
+    (root / 'a.png').write_bytes(b'picture')
+    result = oc.discover(state, ['https://github.com/o/r/pull/7'])
+    link = next(x for x in result['candidates'] if x['kind'] == 'url')
+    calls = []
+    monkeypatch.setattr(oc, 'remote_request', lambda target, payload: calls.append((target, payload)) or {'dispatch': 'requested'})
+    shown = oc.show(state, [link['id']], target='me@macbook')
+    assert calls == [('me@macbook', {'url': 'https://github.com/o/r/pull/7'})]
+    assert shown['results'][0]['dispatch'] == 'requested'
+    assert json.loads(state.read_text())['pending'] == {}, 'skipping the file dropped it from the offer'
+
+
+def test_all_opens_files_and_links_of_the_current_offer(tmp_path, monkeypatch):
+    root, state = start(tmp_path)
+    (root / 'a.png').write_bytes(b'picture')
+    oc.discover(state, ['https://example.org/one'])
+    calls = []
+    monkeypatch.setattr(oc, 'remote_request', lambda target, payload: calls.append(payload) or {'dispatch': 'requested'})
+    oc.show(state, ['all'], target='macbook')
+    assert sorted('url' in payload for payload in calls) == [False, True], 'one file and one link, both in this offer'
+
+
+def test_dismiss_drops_pending_links(tmp_path):
+    _, state = start(tmp_path)
+    oc.discover(state, ['https://example.org/one'])
+    oc.dismiss(state)
+    assert json.loads(state.read_text())['pending'] == {}
+    assert oc.discover(state, ['https://example.org/one'])['candidates'] == [], 'a dismissed link is not asked again'
+
+
+def test_discover_cli_accepts_repeated_url_flags(tmp_path, capsys):
+    import argparse
+    root, state = start(tmp_path)
+    parser = argparse.ArgumentParser()
+    oc.register_parser(parser.add_subparsers())
+    args = parser.parse_args(['open-client', 'discover', '--state', str(state),
+                              '--url', 'https://example.org/a', '--url', 'https://example.org/b'])
+    assert oc._command(args) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert [x['url'] for x in out['candidates']] == ['https://example.org/a', 'https://example.org/b']

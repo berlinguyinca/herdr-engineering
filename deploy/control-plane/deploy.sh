@@ -495,7 +495,7 @@ if [ -z "$HEALTH_URL" ]; then
   BIND="$(grep -E '^HERDR_CP_WEB_BIND=' "$ENV_FILE" | cut -d= -f2- | tr -d "'\"")"
   PORT="$(grep -E '^HERDR_CP_WEB_PUBLIC_PORT=' "$ENV_FILE" | cut -d= -f2- | tr -d "'\"")"
   case "$BIND" in *:*) BIND="[$BIND]" ;; esac   # IPv6 literal
-  HEALTH_URL="http://${BIND:-127.0.0.1}:${PORT:-80}/api/v1/health"
+  HEALTH_URL="http://${BIND:-127.0.0.1}:${PORT:-80}/api/v1/health?probe=1"
 fi
 HEALTH_TRIES="${HERDR_CP_HEALTH_TRIES:-900}"
 HEALTH_INTERVAL="${HERDR_CP_HEALTH_INTERVAL:-2}"
