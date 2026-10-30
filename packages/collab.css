@@ -480,3 +480,25 @@ button.ctx-chip:focus-visible, .ctx-chip:focus-visible { outline: 2px solid curr
 .cx-stab:not(.cx-stab--minor) + .cx-stab--minor { margin-left: 8px; }
 .cx-newroom > summary { cursor: pointer; font-weight: 600; font-size: 1rem; margin-bottom: 8px; }
 .cx-helpers-idle h2 { margin-bottom: 2px; }
+
+/* Handoffs: workspace overview and click-through detail */
+.hd-ws__head { display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: baseline; width: 100%; background: none; border: 0; padding: 0; color: inherit; font: inherit; text-align: left; cursor: pointer; }
+.hd-ws__chips { margin-top: 6px; display: flex; flex-wrap: wrap; gap: 6px; }
+.hd-ws__body { margin-top: 10px; }
+.hd-chip { font-size: .75rem; padding: 1px 8px; border-radius: 999px; border: 1px solid var(--border-subtle); color: var(--text-muted); }
+.hd-chip--failed, .hd-chip--expired, .hd-chip--rejected { color: var(--status-failed, #c0392b); border-color: currentColor; }
+.hd-badge { font-size: .75rem; padding: 1px 8px; border-radius: 6px; background: var(--surface-raised, var(--surface)); border: 1px solid var(--border-subtle); }
+.hd-badge--attention { color: var(--status-failed, #c0392b); border-color: currentColor; }
+.hd-rows { display: grid; gap: 8px; margin-top: 8px; }
+.hd-row { display: block; width: 100%; text-align: left; cursor: pointer; font: inherit; color: inherit; }
+.hd-row--attention { border-left: 3px solid var(--status-failed, #c0392b); }
+.hd-row:hover, .hd-row:focus-visible { border-color: var(--accent, #1f7ae0); }
+.hd-detail { margin-top: 16px; padding: 16px; border: 1px solid var(--border); border-radius: 12px; background: var(--surface); }
+.hd-detail h2 { margin: 0 0 4px; font-size: 1.1rem; overflow-wrap: anywhere; }
+.hd-detail h3 { margin: 14px 0 4px; font-size: .8125rem; text-transform: uppercase; letter-spacing: .04em; color: var(--text-muted); }
+.hd-goal { white-space: pre-wrap; overflow-wrap: anywhere; }
+.hd-cols { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 16px; }
+.hd-chain { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin: 12px 0; }
+.hd-hop { display: inline-flex; flex-direction: column; padding: 4px 10px; border-radius: 8px; border: 1px solid var(--border-subtle); background: none; color: inherit; font: inherit; cursor: pointer; }
+.hd-hop--here { border-color: var(--accent, #1f7ae0); border-width: 2px; }
+.hd-history { padding-left: 18px; margin: 0; }

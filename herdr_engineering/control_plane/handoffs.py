@@ -4,7 +4,9 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import os
 import re
+from datetime import datetime, timedelta, timezone
 
 _HARNESS = {"pi", "claude", "codex", "opencode"}
 _TRANSITIONS = {
@@ -15,6 +17,23 @@ _TRANSITIONS = {
     "failed": {"queued", "cancelled"},
 }
 _ID = re.compile(r"^[A-Za-z0-9_.:-]{1,160}$")
+# A handoff needs a human when it ended badly, or when nobody has picked it up for this long.
+ATTENTION_STATES = {"failed", "expired", "rejected"}
+_PENDING = {"queued", "claimed"}
+STALL_AFTER = timedelta(minutes=15)
+PAGE_MAX = 200
+OVERVIEW_WORKSPACES = 100
+OVERVIEW_ATTENTION = 20
+CHAIN_MAX = 50
+UNASSIGNED = "Unassigned"
+
+
+def _when(text):
+    try:
+        value = datetime.fromisoformat(str(text).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
 
 
 class HandoffRegistry:
@@ -126,11 +145,16 @@ class HandoffRegistry:
             self._rows[handoff_id] = row
             return copy.deepcopy(row)
 
-    def tree(self):
+    def tree(self, session_id=None):
+        """Every handoff as nodes and edges; with ``session_id`` only those touching that session, newest ``PAGE_MAX``."""
         with self.repo._event_lock:
             nodes = {}
             edges = []
-            for row in self._rows.values():
+            rows = self._rows.values()
+            if session_id:
+                rows = sorted((r for r in rows if session_id in ((r.get("source") or {}).get("session_id"), (r.get("target") or {}).get("session_id"))),
+                              key=lambda r: (r.get("updated_at") or "", r["handoff_id"]), reverse=True)[:PAGE_MAX]
+            for row in rows:
                 source = self._node(nodes, row["source"], "source")
                 target = self._node(nodes, row["target"], "target")
                 edges.append({"handoff_id": row["handoff_id"], "from": source["id"],
@@ -148,3 +172,127 @@ class HandoffRegistry:
                                    "harness": descriptor.get("harness"),
                                    "model_hint": descriptor.get("model_hint")})
         return nodes[node_id]
+
+    # ---- read side for dashboards: bounded by construction, so hundreds of agents stay one screen -------------------
+
+    def _workspace(self, row):
+        """The group a handoff belongs to: its source session's repository, else working directory, else its mission."""
+        sid = (row.get("source") or {}).get("session_id")
+        session = self.repo.get_session(sid) if sid else None
+        if session:
+            if session.get("repository_id"):
+                return str(session["repository_id"])
+            if session.get("cwd"):
+                return os.path.basename(str(session["cwd"]).rstrip("/")) or UNASSIGNED
+        mission = self.repo.get_mission(row["mission_id"]) if row.get("mission_id") else None
+        if mission and mission.get("title"):
+            return str(mission["title"])
+        return UNASSIGNED
+
+    def _stalled(self, row, now):
+        updated = _when(row.get("updated_at"))
+        return row["state"] in _PENDING and updated is not None and now - updated > STALL_AFTER
+
+    def _needs_attention(self, row, now):
+        return row["state"] in ATTENTION_STATES or self._stalled(row, now)
+
+    def _summary(self, row, workspace, now):
+        source, target = row.get("source") or {}, row.get("target") or {}
+        return {"handoff_id": row["handoff_id"], "state": row["state"], "workspace": workspace,
+                "source": {k: source.get(k) for k in ("harness", "agent_id", "session_id")},
+                "target": {k: target.get(k) for k in ("harness", "agent_id", "session_id", "model_hint")},
+                "goal": str(row.get("goal") or "")[:240], "mission_id": row.get("mission_id"),
+                "updated_at": row.get("updated_at"), "created_at": row.get("created_at"),
+                "completed": len(row.get("completed") or []), "remaining": len(row.get("remaining") or []),
+                "attention": self._needs_attention(row, now), "stalled": self._stalled(row, now)}
+
+    def overview(self):
+        """Counts by workspace and the few handoffs that need a human; no rows beyond OVERVIEW_ATTENTION."""
+        with self.repo._event_lock:
+            now = _when(self.now()) or datetime.now(timezone.utc)
+            groups, attention, states = {}, [], {}
+            for row in self._rows.values():
+                ws = self._workspace(row)
+                g = groups.setdefault(ws, {"workspace": ws, "total": 0, "states": {}, "attention": 0, "stalled": 0, "latest_at": ""})
+                g["total"] += 1
+                g["states"][row["state"]] = g["states"].get(row["state"], 0) + 1
+                states[row["state"]] = states.get(row["state"], 0) + 1
+                g["latest_at"] = max(g["latest_at"], row.get("updated_at") or "")
+                if self._stalled(row, now):
+                    g["stalled"] += 1
+                if self._needs_attention(row, now):
+                    g["attention"] += 1
+                    attention.append((row.get("updated_at") or "", row["handoff_id"], ws, row))
+            ordered = sorted(groups.values(), key=lambda g: (g["attention"], g["latest_at"]), reverse=True)
+            attention.sort(key=lambda t: (t[0], t[1]), reverse=True)
+            return {"total": len(self._rows), "states": states,
+                    "attention_total": sum(g["attention"] for g in groups.values()),
+                    "workspaces": ordered[:OVERVIEW_WORKSPACES],
+                    "workspaces_omitted": max(0, len(ordered) - OVERVIEW_WORKSPACES),
+                    "attention": [self._summary(r, ws, now) for _, _, ws, r in attention[:OVERVIEW_ATTENTION]],
+                    "untrusted_text": True}
+
+    def page(self, *, state=None, workspace=None, attention=False, cursor=None, limit=50):
+        """Newest first, keyed on (updated_at, handoff_id) so equal timestamps never skip or repeat a row."""
+        limit = max(1, min(int(limit), PAGE_MAX))
+        with self.repo._event_lock:
+            now = _when(self.now()) or datetime.now(timezone.utc)
+            after = None
+            if cursor:
+                stamp, _, hid = str(cursor).partition("|")
+                after = (stamp, hid)
+            keyed = []
+            for row in self._rows.values():
+                if state and row["state"] != state:
+                    continue
+                if attention and not self._needs_attention(row, now):
+                    continue
+                key = (row.get("updated_at") or "", row["handoff_id"])
+                if after is not None and key >= after:
+                    continue
+                keyed.append((key, row))
+            keyed.sort(key=lambda t: t[0], reverse=True)
+            out, more = [], False
+            for key, row in keyed:
+                ws = self._workspace(row)
+                if workspace and ws != workspace:
+                    continue
+                if len(out) == limit:
+                    more = True
+                    break
+                out.append((key, self._summary(row, ws, now)))
+            return {"handoffs": [r for _, r in out],
+                    "next_cursor": f"{out[-1][0][0]}|{out[-1][0][1]}" if more and out else None,
+                    "untrusted_text": True}
+
+    def chain(self, handoff_id):
+        """The handoffs before and after this one, joined on recorded session ids (the same rule as the Usage tab)."""
+        with self.repo._event_lock:
+            row = self._rows.get(handoff_id)
+            if row is None:
+                raise KeyError(handoff_id)
+            now = _when(self.now()) or datetime.now(timezone.utc)
+            by_target, by_source = {}, {}
+            for r in self._rows.values():
+                t, sr = (r.get("target") or {}).get("session_id"), (r.get("source") or {}).get("session_id")
+                if t:
+                    by_target.setdefault(t, []).append(r)
+                if sr:
+                    by_source.setdefault(sr, []).append(r)
+
+            def walk(start, index, side, taken):
+                seen, found, frontier = {handoff_id} | taken, [], [start]
+                while frontier and len(found) < CHAIN_MAX:
+                    sid = ((frontier.pop(0).get(side) or {})).get("session_id")
+                    for r in sorted(index.get(sid, []), key=lambda r: (r.get("created_at") or "", r["handoff_id"])) if sid else []:
+                        if r["handoff_id"] not in seen and len(found) < CHAIN_MAX:
+                            seen.add(r["handoff_id"])
+                            found.append(r)
+                            frontier.append(r)
+                return found
+
+            before = walk(row, by_target, "source", set())
+            after = walk(row, by_source, "target", {r["handoff_id"] for r in before})
+            ordered = list(reversed(before)) + [row] + after
+            return {"handoff_id": handoff_id, "position": len(before),
+                    "chain": [self._summary(r, self._workspace(r), now) for r in ordered], "untrusted_text": True}

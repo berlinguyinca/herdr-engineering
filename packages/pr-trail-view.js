@@ -57,7 +57,8 @@ function line(e) {
   const label = `<span class="pt-tag">${esc(KIND_LABEL[e.kind] || e.kind)}</span> ${esc(text(e.text))}`;
   const why = e.rule ? ` <small>· via ${esc(RULE_TEXT[e.rule] || e.rule)}</small>` : '';
   const state = e.state && e.kind === 'handoff' ? ` <small>· ${esc(text(e.state))}</small>` : '';
-  const body = href ? `<a href="${esc(href)}" target="_blank" rel="noopener noreferrer">${label}</a>` : label;
+  const body = href ? `<a href="${esc(href)}" target="_blank" rel="noopener noreferrer">${label}</a>`
+    : e.kind === 'handoff' && text(e.ref) ? `<a href="#/handoffs?open=${encodeURIComponent(text(e.ref))}" data-handoff-link>${label}</a>` : label;
   return `<li data-kind="${esc(text(e.kind))}" data-problem="${e.problem ? 'true' : 'false'}"><time>${esc(when(e.at))}</time>${body}${state}${why}</li>`;
 }
 

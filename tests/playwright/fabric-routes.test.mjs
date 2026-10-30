@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { withPage } from './helpers/fixture.mjs';
 import { boot, until, sleep } from './helpers/live.mjs';
 
-const defaults = { items: [], status: 'ready', hosts: [], nodes: [], edges: [], artifacts: [], publications: [] };
+const defaults = { items: [], status: 'ready', hosts: [], nodes: [], edges: [], artifacts: [], publications: [], workspaces: [] };
 
 test('artifact and publication tables contain wide data on mobile', async () => {
   for (const route of ['/artifacts', '/publications']) await withPage(async (page, base) => {
@@ -87,17 +87,17 @@ test('scheduler preview keeps edited inputs and exposes progress and errors', as
 
 test('a stalled handoff read is bounded, retries, and stops polling on disposal', async () => withPage(async (page, base) => {
   let stalled = true;
-  const reads = await boot(page, base, '/handoffs', path => path === '/api/v1/handoffs/tree' && stalled ? { __hang: true } : defaults);
-  await until(() => reads['/api/v1/handoffs/tree'] === 1, 'handoff request started');
+  const reads = await boot(page, base, '/handoffs', path => path === '/api/v1/handoffs/overview' ? (stalled ? { __hang: true } : { workspaces: [] }) : defaults);
+  await until(() => reads['/api/v1/handoffs/overview'] === 1, 'handoff request started');
   await page.clock.runFor(16000);
   await until(() => page.locator('[data-handoff-retry]').isVisible(), 'bounded timeout');
   assert.equal(await page.locator('#view [data-skeleton]').count(), 0);
-  assert.equal(reads['/api/v1/handoffs/tree'], 1, 'one request while stalled');
+  assert.equal(reads['/api/v1/handoffs/overview'], 1, 'one request while stalled');
   stalled = false; await page.locator('[data-handoff-retry]').click();
-  await until(() => page.locator('[data-handoff-summary]').innerText().then(text => text === '0 handoffs · 0 endpoints'), 'recovered graph');
+  await until(() => page.locator('[data-handoff-summary]').innerText().then(text => text === '0 handoffs · 0 workspaces'), 'recovered graph');
   await page.evaluate(() => { location.hash = '#/scheduling'; }); await page.locator('[data-scheduler-plan]').waitFor();
   await page.clock.runFor(90000); await sleep(100);
-  assert.equal(reads['/api/v1/handoffs/tree'], 2);
+  assert.equal(reads['/api/v1/handoffs/overview'], 2);
 }));
 
 test('artifact detail errors are visible and late responses cannot replace another route', async () => withPage(async (page, base) => {
