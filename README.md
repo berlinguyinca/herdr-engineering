@@ -659,6 +659,9 @@ curl -X POST http://dev.lan/api/v1/llm/keys/<key_id>/revoke
 export OPENAI_BASE_URL=http://dev.lan:8088/v1 OPENAI_API_KEY=hk-...
 ```
 
+The Usage page can estimate spend from a price table you put in `control_plane.usage.prices`; see
+[docs/usage-spend-estimate.md](docs/usage-spend-estimate.md).
+
 Requests are forwarded to `llm.upstream_url` (e.g. `https://llm.metabolomics.us`) with the one
 dedicated lab key, `llm.upstream_key` in the central fleet file. `deploy/control-plane/deploy.sh`
 renders only the `llm` section and `control_plane.llm_proxy` into the proxy's 0600 slice

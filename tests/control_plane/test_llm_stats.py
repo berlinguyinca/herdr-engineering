@@ -201,8 +201,28 @@ def test_routes_on_the_operator_listener():
         svr.shutdown()
 
 
+def test_spend_route_is_off_without_a_price_table_and_priced_with_one():
+    repo, clock = _repo()
+    _seed(repo, clock, [_row()])
+    off = ControlPlaneServer(repo, host="127.0.0.1", port=0, allow_open=True)
+    on = ControlPlaneServer(repo, host="127.0.0.1", port=0, allow_open=True,
+                            usage_prices=[{"model": "*", "input": 1.0, "output": 1.0, "cached": None, "cached_in_input": False}])
+    for svr in (off, on):
+        threading.Thread(target=svr.serve, daemon=True).start()
+        svr.wait_until_ready()
+    try:
+        assert _get(off, "/api/v1/llm/spend?window=24h") == (200, {"configured": False})
+        st, body = _get(on, "/api/v1/llm/spend?window=24h")
+        assert st == 200 and body["configured"] and body["estimate"] and body["source"] == "llm-proxy"
+        assert body["unpriced"] == [] and body["days"] and body["total"] >= 0
+        assert _get(on, "/api/v1/llm/spend?window=2h")[0] == 400
+    finally:
+        off.shutdown()
+        on.shutdown()
+
+
 @pytest.mark.parametrize("path", ["/api/v1/llm/stats", "/api/v1/llm/stats?window=24h", "/api/v1/llm/timeseries",
-                                  "/api/v1/llm/errors", "/api/v1/llm/sessions/s-1", "/api/v1/llm/samples",
+                                  "/api/v1/llm/errors", "/api/v1/llm/spend", "/api/v1/llm/sessions/s-1", "/api/v1/llm/samples",
                                   "/llm-view.js", "/llm"])
 def test_llm_routes_do_not_exist_on_the_public_listener(stack, path):
     status, _ = stack.pub.call("GET", path)

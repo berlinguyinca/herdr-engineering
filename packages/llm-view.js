@@ -144,6 +144,39 @@ function modelsTable(models) {
     'No requests recorded in this window.');
 }
 
+/** Dollars for display; an exact zero is "$0.00" (a price of 0 is deliberate), a smaller-than-a-cent figure says so. */
+const usd = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' });
+export function money(v) {
+  const n = num(v);
+  if (n == null) return GAP;
+  return n > 0 && n < 0.01 ? '< $0.01' : usd.format(n);
+}
+const tokenSum = (t) => (num(t?.input) || 0) + (num(t?.output) || 0) + (num(t?.cache_read) || 0);
+
+/** The spend estimate: priced from the operator's table only, always labelled an estimate. `spend` is /api/v1/llm/spend. */
+export function spendPanel(spend) {
+  if (!spend || spend.configured === false) {
+    return `<p class="llm-note" data-llm-spend="off">Spend is not estimated because no price table is configured, so this page shows tokens only.
+      To enable it, list your prices in the control plane config (dollars per million tokens; the first matching model entry wins):</p>
+      <pre class="llm-code">control_plane:\n  usage:\n    prices:\n      - {model: "your-model-*", input: 3.0, output: 15.0, cached: 0.3}</pre>`;
+  }
+  const days = list(spend.days), models = list(spend.by_model), unpriced = list(spend.unpriced);
+  const note = `<p class="llm-note" data-llm-spend="on"><strong>Estimate, not a bill.</strong> Recorded tokens priced with the table in the control plane config
+    (${esc(spend.source || PROXY)} traffic only${spend.partial ? '; the window starts before the oldest retained record, so earlier spend is missing' : ''}).
+    Estimated total: <strong>${esc(money(spend.total))}</strong>${unpriced.length ? `, plus ${unpriced.length} unpriced model${unpriced.length === 1 ? '' : 's'} shown below` : ''}.</p>`;
+  const byModel = table(['Model', 'Price entry', 'Input', 'Output', 'Cache read', 'Estimated cost'],
+    models.map((m) => [esc(m.model), esc(m.match), esc(compact(m.tokens?.input)), esc(compact(m.tokens?.output)), esc(compact(m.tokens?.cache_read)), esc(money(m.cost))]),
+    'No priced usage in this window.');
+  const perDay = table(['Day (UTC)', 'Model', 'Input', 'Output', 'Cache read', 'Estimated cost'],
+    days.slice().reverse().flatMap((d) => list(d.models).map((m) => [esc(d.day), esc(m.model), esc(compact(m.tokens?.input)), esc(compact(m.tokens?.output)),
+      esc(compact(m.tokens?.cache_read)), m.cost == null ? 'unpriced' : esc(money(m.cost))])),
+    'No usage in this window.');
+  const missing = unpriced.length
+    ? `<p class="llm-note" data-llm-unpriced>No price entry matches ${unpriced.map((m) => `<code>${esc(m.model)}</code> (${esc(compact(tokenSum(m.tokens)))} tokens)`).join(', ')}.
+       They are left out of the total, not guessed. Add an entry to include them.</p>` : '';
+  return `${note}${missing}<h3 class="llm-sub">By model</h3>${byModel}<h3 class="llm-sub">By day</h3>${perDay}`;
+}
+
 function missionsTable(missions) {
   return table(['Mission', 'Source', 'Requests', 'Output tokens', 'Errors', 'Last seen'],
     list(missions?.groups).map((g) => [`<a href="${esc(`#/missions/${encodeURIComponent(g.key)}`)}">${esc(g.key)}</a>`, esc(sourceLabel(g)), esc(reqs(g)),
@@ -301,6 +334,7 @@ function controls(state, base = '#/llm') {
 }
 
 export const llmStyles = `<style>
+.llm-code{margin:8px 0;padding:8px 12px;overflow:auto;font-size:12px;background:var(--surface-2);border-radius:var(--radius-sm)}.llm-sub{font-size:13px;margin:16px 0 8px}
 .llm-controls{display:flex;flex-wrap:wrap;gap:12px 16px;align-items:center;margin:16px 0}.llm-controls select{padding:4px 12px;min-height:32px;border:1px solid var(--border);border-radius:var(--radius-sm);font:inherit;font-size:13px;color:var(--text-secondary);background:var(--surface);max-width:100%}.llm-controls select.llm-set{border-color:var(--accent);color:var(--text)}
 .llm-windows{display:inline-flex;border:1px solid var(--border);border-radius:var(--radius-sm);overflow:hidden}.llm-window{padding:4px 12px;min-height:32px;display:inline-flex;align-items:center;font-size:13px;text-decoration:none;color:var(--text-secondary);background:var(--surface);border-left:1px solid var(--border)}.llm-window:first-child{border-left:0}.llm-window[aria-current=page]{background:var(--surface-2);color:var(--text);font-weight:600}
 .llm-tiles{display:flex;flex-wrap:wrap;gap:12px;margin:12px 0}.llm-tile{flex:1 1 170px;border:1px solid var(--border);border-radius:var(--radius);background:var(--surface);padding:12px 14px;min-width:0}.llm-tile__label{font-size:12px;color:var(--text-secondary)}.llm-tile__value{font-size:20px;font-weight:600;margin-top:4px;overflow-wrap:anywhere}.llm-tile__note{font-size:11px;color:var(--text-secondary);margin-top:4px}
@@ -309,7 +343,7 @@ export const llmStyles = `<style>
 .llm-note{font-size:12px;line-height:1.6;color:var(--text-secondary);margin:6px 0}.llm-table{overflow:auto}.llm-table table{border-collapse:collapse;width:100%;font-size:13px}.llm-table th,.llm-table td{padding:7px 8px;text-align:left;border-bottom:1px solid var(--border-subtle);overflow-wrap:anywhere}.llm-table th{color:var(--text-secondary);font-weight:500}.llm-fixed{table-layout:fixed}.llm-fixed td:first-child,.llm-fixed th:first-child{width:34%}.llm-sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0)}
 .llm-badge{font-size:11px;font-weight:500;padding:2px 8px;border:1px solid var(--border);border-radius:99px;color:var(--text-secondary);vertical-align:middle}.llm-back{font-size:13px}.llm-data{font-size:12px;margin:8px 0 16px}.llm-data>summary{cursor:pointer}.llm-more>summary{cursor:pointer;padding:8px 0;color:var(--accent);font-size:13px}.llm-section h2{font-size:15px;margin:22px 0 6px}.llm-switch{position:relative;margin:16px 0;padding:12px 16px 16px}.llm-tabs{margin:0 0 12px}.llm-tab--empty{opacity:.6}.llm-tab__badge{font-size:11px;font-weight:500;padding:0 8px;border:1px solid var(--border);border-radius:99px}.llm-panel{display:none}.llm-ext{margin-left:4px;color:var(--text-muted);text-decoration:none}.llm-ext:hover{color:var(--accent)}.llm-switch .llm-section>.llm-table:first-child{margin-top:0}
 @media(max-width:650px){.llm-tile{flex-basis:140px}.llm-card svg text{font-size:16px}.llm-charts{grid-template-columns:minmax(0,1fr)}}
-${switchCss('llm-chart', 4)}${switchCss('llm-tab', 5)}</style>`;
+${switchCss('llm-chart', 4)}${switchCss('llm-tab', 6)}</style>`;
 
 /** Models, agents and problems share one card; a tab with nothing to show says so in its label and is not the one opened first. */
 function tables(id, defs) {
@@ -329,6 +363,7 @@ export function renderLlm(state, data) {
     ${tiles(pickTotal(d.total), pickTotal(d.previous), state.window)}${charts(d.series)}
     ${tables('llm-tab', [['Models', list(d.models?.groups).length, modelsTable(d.models)], ['Agents', list(d.agents?.groups).length, agentsTable(d.agents, state.names)],
       ['Missions', list(d.missions?.groups).length, missionsTable(d.missions)],
+      ['Spend (est.)', d.spend?.configured ? list(d.spend.by_model).length + list(d.spend.unpriced).length : 0, spendPanel(d.spend)],
       ['Handoffs', chains.length, chainsTable(chains, state.names)],
       ['Problems', list(d.problems?.problems).length, problemsTable(d.problems, state.names)]])}`;
 }
