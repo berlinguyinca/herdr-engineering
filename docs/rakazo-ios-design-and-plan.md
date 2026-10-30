@@ -49,3 +49,28 @@ Goal: every feature of the app works against Herdr. Nothing is hidden. Where Her
 - Voice and desktop: choose between donbot and nibbler per feature once step 11 starts.
 - APNs credentials must come from the operator.
 - Re-diff upstream `rpc.ts` against the pinned SHA before each release.
+
+## Status (2026-10-30, end of the first autonomous run)
+
+PR stack, each branch based on the one before it, none merged and nothing deployed:
+#445 bridge -> #446 spaces -> #452 groups and agent bots -> #453 bot management -> #454 memory/search/usage -> #455 routines
+-> #456 every remaining procedure answers -> #458 files.
+
+| Area | State |
+|---|---|
+| Chat, streaming, approvals, stop | Done (#445) |
+| Spaces (hard partitions) | Done (#446) |
+| Groups = collaboration rooms, agents as bots, people as members | Done (#452); needs account `collab_user` |
+| Bot edit/archive/restore/sections/instruction history | Done (#453); remove = archive |
+| Memory (assistant memory service), search, usage | Done (#454); remove hides; token counts unknown |
+| Routines | Done (#455); only schedules that map exactly to interval/daily; runner is opt-in (`routine_runner_seconds`) |
+| Files | Done (#458) against an in-memory registry; real registry path unverified |
+| Scratchpad, trusted sites, preferences, bootstrap, billing status, bot export | Done (#456) |
+| Skills, MCP, connectors, models, messaging, voice, computer, vault, tickets, boards, onboarding | Answered with "nothing configured" or a reasoned refusal (#456); NOT implemented |
+| Auto-sync of running agents into rooms; delegation/steering cards in groups; group `threads/answer` | Not started |
+| Push notifications | Impossible with a custom server (APNs belongs to the official app) |
+| Voice / graphical desktop hosts | Need donbot/nibbler infrastructure; not built |
+
+Known gaps in earlier work: review findings 8-10 on #445 (journal gaps after a quick restart, polling cost under the store
+lock, a false 500 on sign-out during a concurrent flush); real-Postgres paths and migrations 0037/0038 only exercised with
+fake tables; `threads/clear` and `threads/react` are refused because the store has no equivalent.
