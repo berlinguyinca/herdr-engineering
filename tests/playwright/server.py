@@ -206,8 +206,10 @@ def main():
     # A fixture price table for the Usage page's spend estimate (production reads control_plane.usage.prices from YAML).
     usage_prices = ([{"model": "qwen*", "input": 100.0, "output": 200.0, "cached": None, "cached_in_input": False}]
                     if os.environ.get("USAGE_PRICES_SEED") == "1" else None)
+    # No quiet hours: the production default (22:00-07:00 on the browser's clock) would hold notifications back, so
+    # a browser test would pass in the evening and fail at night.
     svr = ControlPlaneServer(repo, host="127.0.0.1", port=0, usage_prices=usage_prices,
-                             web_root=_REPO / "packages")
+                             attention={"notify": {"quiet_hours": None}}, web_root=_REPO / "packages")
     # Stricter than the production default (600/min): a throttled live-
     # refreshing dashboard must respect a finite per-IP budget. This makes the
     # rate-limit regression test fast and unambiguous (an un-throttled client
