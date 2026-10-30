@@ -404,7 +404,7 @@ github:
 - **Precedence.** With `app` set the App wins for every read and one warning is logged when `token` is also set.
   An invalid `app` block means *no* credential (fail closed), never a silent fallback to `token`. Without `app`,
   `github.token` works exactly as before. `deployment_escalation.issues` (an issue **write**) uses
-  `github.token` unless the `escalations` write capability is enabled (below); reads never get write access.
+  `github.token` unless the `escalations` write capability is enabled (below); reads never get write access. While `github.token` is configured it stays the fallback, so to stop escalation writes remove both the capability and `github.token`; each filed issue records which credential made it.
 - **Owners.** A request uses the installation of the repository's owner. Only owners listed under
   `installations` get a token (`auto` resolves an id, it never adds an owner); any other owner reads as unknown.
   **Keep the App private** (installable only by its owning account): `auto` matches installations by account

@@ -26,6 +26,9 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 ### Control plane: service-observation compaction (opt-in, dry run by default)
 - `control_plane.fabric_compaction` (YAML; `enabled: false`, `dry_run: true`, `interval_seconds`, `min_age_days`, `batch_rows`, `archive_retention_days`, `rebuild_checkpoint`) lets the worker move interior service observation rows out of `fabric_events` into the new `fabric_events_archive` table (migration 0035), one atomic statement per batch. Rule checked on the production journal: 1,762,189 service rows -> 349,664 with all 6,544 reconstructed services identical. Rows with a v2 envelope and rows younger than `min_age_days` are never touched. After a drain the job rebuilds the recovery checkpoint; the archive is purged after `archive_retention_days`. See docs/operations/recovery-checkpoints.md.
 
+### Deployment escalation issues can use the GitHub App (`escalations` capability)
+- With `github.app.write: [escalations]` (App permission Issues: write) escalation issues are created with a repo-scoped App token. Without it the server-held `github.token` is used as before; an enabled capability or an invalid `github.app` block that cannot mint a token fails closed and never falls back to the PAT.
+
 ### GitHub App: write capabilities and the review gate on the shared App (opt-in)
 - `github.app.write: [review_gate, escalations]` (YAML, default none) enables fixed, repo-scoped write permission sets on the shared GitHub App; unlisted capabilities are refused before any call to GitHub, reads stay read-only, and a grant wider than the request is refused.
 - `review_gate.app: shared` makes the review gate use that App instead of its own JWT/installation-token code: reads get a read-only token, statuses/merge/update-branch the `review_gate` capability. The old per-gate `app:` block still works.

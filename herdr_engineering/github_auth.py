@@ -669,7 +669,9 @@ class NoCredentials:
         return None
 
     def capability_token_or_raise(self, owner, capability, repositories=None) -> str:
-        raise GitHubAuthError("write_disabled")
+        # an invalid github.app block is a broken credential, not "no write capability": callers must not
+        # treat it as permission to use a different credential
+        raise GitHubAuthError("invalid_config" if self.reason == "invalid_config" else "write_disabled")
 
     def invalidate(self, owner=None, token=None) -> None:
         return None
