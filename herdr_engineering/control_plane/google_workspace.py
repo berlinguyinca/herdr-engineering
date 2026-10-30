@@ -168,6 +168,10 @@ class GoogleWorkspace:
                 code = exc.code
                 exc.close()
                 if revoked:
+                    with self._lock:
+                        stale = self._gen.get(key, 0) != gen     # reconnected while this refresh was in flight
+                    if stale:       # the revoked token is the old one: never mark the fresh connection
+                        raise GoogleError("unavailable") from None
                     self.invalidate(tenant, user)
                     self._store.set_status(tenant, user, "google", "needs_attention")
                     raise GoogleError("needs_attention") from None

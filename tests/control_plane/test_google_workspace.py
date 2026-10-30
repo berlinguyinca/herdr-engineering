@@ -305,3 +305,29 @@ def test_find_free_time_dispatches_through_the_assistant_service(store):
     g.fb_errors = {"ann@x.org"}
     with pytest.raises(AssistantError, match="find free time failed: unavailable"):
         svc.execute_tool(tenant_id="default", user_id="u1", assistant_id=a.assistant_id, tool_id="find_free_time", payload=payload)
+
+
+def test_a_stale_revoked_refresh_does_not_mark_a_fresh_reconnect(store):
+    g = Google()
+    g.revoked = True
+    holder = {}
+
+    def opener(req, timeout):
+        if req.full_url == gw.TOKEN_URL:
+            holder["w"].invalidate("default", "u1")       # the person reconnected while this refresh was in flight
+        return g(req, timeout)
+    w = gw.GoogleWorkspace(store, blocked_fn=lambda t, u: [], opener=opener)
+    holder["w"] = w
+    with pytest.raises(gw.GoogleError) as exc:
+        w.run("default", "u1", "search_email", {"query": "x"})
+    assert exc.value.reason == "unavailable"
+    assert store.get_connection("default", "u1", "google").status == "connected"
+    g.revoked = False
+    holder["w"] = w
+    w.run("default", "u1", "search_email", {"query": "x"})     # and a genuine revocation afterwards still flags it
+    g.revoked = True
+    w.invalidate("default", "u1")
+    holder["w"] = type("N", (), {"invalidate": staticmethod(lambda *a: None)})()
+    with pytest.raises(gw.GoogleError) as exc:
+        w.run("default", "u1", "search_email", {"query": "x"})
+    assert exc.value.reason == "needs_attention" and store.get_connection("default", "u1", "google").status == "needs_attention"
