@@ -32,6 +32,8 @@ from datetime import UTC, datetime
 from typing import Any
 
 from . import rakazo_events as ev
+from . import rakazo_prefs as pf
+from . import rakazo_rooms as rooms
 from . import rakazo_spaces as sp
 from .assistant import (
     ApprovalRequired,
@@ -48,6 +50,7 @@ log = logging.getLogger(__name__)
 SCRYPT_N, SCRYPT_R, SCRYPT_P, SALT_BYTES, HASH_BYTES = 2 ** 15, 8, 1, 16, 32
 _MAX_N = 2 ** 17                     # 128 MiB: a hash in the YAML cannot make one sign-in allocate more than this
 _EMAIL = re.compile(r"[^@\s]+@[^@\s]+\Z")
+_COLLAB_USER = re.compile(r"[A-Za-z0-9._@+:-]{1,200}\Z")
 _PROC = re.compile(r"[A-Za-z][A-Za-z0-9/]{0,63}\Z")
 _ROLES = ("operator",)
 _CONSENT_VERSION = "herdr-1"
@@ -115,6 +118,7 @@ class Account:
     role: str
     params: ScryptParams = field(repr=False)
     tokens_valid_after: float = 0.0     # epoch seconds: a token created before this is dead, whatever the database says
+    collab_user: str | None = None      # the collaboration user this account acts as (YAML only); None = no rooms or agents
 
 
 def normalize_email(email: str) -> str:
@@ -179,8 +183,8 @@ def rakazo_bridge_config(raw: Any, now: float | None = None) -> dict[str, Any]:
     accounts: list[Account] = []
     for i, row in enumerate(rows):
         where = f"control_plane.rakazo_bridge.accounts[{i}]"
-        if not isinstance(row, dict) or set(row) - {"email", "password_scrypt", "role", "tokens_valid_after"}:
-            raise ValueError(f"{where} must be a mapping with only email, password_scrypt, role and tokens_valid_after")
+        if not isinstance(row, dict) or set(row) - {"email", "password_scrypt", "role", "tokens_valid_after", "collab_user"}:
+            raise ValueError(f"{where} must be a mapping with only email, password_scrypt, role, tokens_valid_after and collab_user")
         email = row.get("email")
         if not isinstance(email, str) or not _EMAIL.match(normalize_email(email)) or len(email) > 254:
             raise ValueError(f"{where}.email must be an email address")
@@ -194,7 +198,10 @@ def rakazo_bridge_config(raw: Any, now: float | None = None) -> dict[str, Any]:
         account_id = hashlib.sha256(b"rakazo-bridge-account:" + email_n.encode()).hexdigest()[:16]
         if any(a.account_id == account_id for a in accounts):
             raise ValueError(f"{where}.email repeats an earlier account")
-        accounts.append(Account(account_id, email_n, f"rakazo:{account_id}", role, params, cutoff))
+        link = row.get("collab_user")
+        if link is not None and (not isinstance(link, str) or not _COLLAB_USER.match(link)):
+            raise ValueError(f"{where}.collab_user must be a collaboration user id (letters, digits and . _ @ + : -)")
+        accounts.append(Account(account_id, email_n, f"rakazo:{account_id}", role, params, cutoff, link))
     return {"enabled": True, "token_ttl_days": ttl_days, "max_tokens": max_tokens, "accounts": accounts,
             "trusted_proxies": tuple(nets)}
 
@@ -280,6 +287,25 @@ class PostgresSpacePersistence(PostgresTokenPersistence):
                   "overrides = EXCLUDED.overrides, deleted = EXCLUDED.deleted",
                   (row["space_id"], row["account_id"], row["name"], self._ts(row["created"]), row["overrides"],
                    row["deleted"]))
+
+
+class PostgresPrefsPersistence(PostgresTokenPersistence):
+    """``rakazo_prefs`` (migration 0038): small per-account, per-space settings."""
+
+    def load(self) -> list[dict[str, Any]]:
+        rows = self._run("SELECT account_id, space_id, kind, key, value FROM rakazo_prefs", fetch=True)
+        return [{"account_id": r[0], "space_id": r[1], "kind": r[2], "key": r[3],
+                 "value": r[4] if not isinstance(r[4], str) else json.loads(r[4])} for r in rows]
+
+    def upsert(self, row: dict[str, Any]) -> None:  # type: ignore[override]
+        self._run("INSERT INTO rakazo_prefs (account_id, space_id, kind, key, value, updated_at) "
+                  "VALUES (%s, %s, %s, %s, %s::jsonb, now()) ON CONFLICT (account_id, space_id, kind, key) "
+                  "DO UPDATE SET value = EXCLUDED.value, updated_at = now()",
+                  (row["account_id"], row["space_id"], row["kind"], row["key"], json.dumps(row["value"])))
+
+    def delete(self, account_id: str, space_id: str, kind: str, key: str) -> None:  # type: ignore[override]
+        self._run("DELETE FROM rakazo_prefs WHERE account_id = %s AND space_id = %s AND kind = %s AND key = %s",
+                  (account_id, space_id, kind, key))
 
 
 class TokenStore:
@@ -552,7 +578,7 @@ class RakazoBridge:
     not the bridge's (the caller then answers exactly as it did before the bridge existed)."""
 
     def __init__(self, config: dict[str, Any], assistant, *, version: str = "0", persistence=None, space_persistence=None,
-                 clock: Callable[[], float] = time.time, monotonic: Callable[[], float] = time.monotonic):
+                 prefs_persistence=None, collab=None, clock: Callable[[], float] = time.time, monotonic: Callable[[], float] = time.monotonic):
         if not config.get("enabled"):
             raise ValueError("RakazoBridge needs an enabled configuration")
         self.svc = assistant
@@ -566,6 +592,8 @@ class RakazoBridge:
         self.limiter = SignInLimiter(monotonic)
         self.journals = ev.JournalRegistry(clock)
         self.spaces = sp.SpaceRegistry(space_persistence, clock)
+        self.prefs = pf.PrefsStore(prefs_persistence)
+        self.collab = collab
         self._kdf_slots = threading.BoundedSemaphore(2)
         self._streams = threading.BoundedSemaphore(MAX_STREAMS)
         self._sends = threading.BoundedSemaphore(MAX_SENDS)
@@ -590,6 +618,13 @@ class RakazoBridge:
             "spaceSettings/setOverride": self._space_set_override, "notifications/registerPush": self._register_push,
             "notifications/unregisterPush": self._ok, "analytics/screen": self._ok,
         }
+        self.rooms = rooms.Rooms(self, BridgeError)
+        self._procs.update(self.rooms.procs())
+        for name, group_fn in (("threads/head", self.rooms.head), ("threads/get", self.rooms.thread),
+                               ("threads/messages", self.rooms.messages), ("threads/send", self.rooms.send),
+                               ("threads/stop", lambda c, i, **kw: {"ok": True}),
+                               ("threads/markRead", self.rooms.mark_read)):
+            self._procs[name] = self._grouped(self._procs[name], group_fn)
         # a dummy for requests whose email matches no account, so a wrong email costs the same KDF as a wrong password
         self._dummy = self.accounts[0].params
 
@@ -891,12 +926,51 @@ class RakazoBridge:
         return sorted(space.overrides)
 
     def _bots(self, ctx: _Ctx) -> list[dict[str, Any]]:
-        return [self._bot(ctx, a) for a in self.svc.list_assistants(tenant_id=ctx.tenant, user_id=ctx.user)]
+        return ([self._bot(ctx, a) for a in self.svc.list_assistants(tenant_id=ctx.tenant, user_id=ctx.user)]
+                + self.rooms.agent_bots(ctx))
+
+    def prefs_put(self, account: str, space: str, kind: str, key: str, value: Any) -> None:
+        try:
+            self.prefs.put(account, space, kind, key, value)
+        except pf.PrefsError as exc:
+            raise BridgeError(exc.status, "SERVICE_UNAVAILABLE" if exc.status == 503 else "BAD_REQUEST",
+                              exc.message) from None
+
+    def _group_target(self, ctx: _Ctx, inp: dict[str, Any]):
+        """(inp aimed at a room, agent) when the request names a group or one of the account's agent bots, else None."""
+        if inp.get("groupId"):
+            return inp, None
+        bot_id = inp.get("botId")
+        if not isinstance(bot_id, str) or not bot_id:
+            return None
+        try:
+            self.svc.get_assistant(bot_id, tenant_id=ctx.tenant, user_id=ctx.user)
+            return None
+        except KeyError:
+            pass
+        agent = self.rooms.find_agent(ctx, bot_id)
+        if agent is None:
+            return None
+        if not agent.get("rooms"):
+            raise BridgeError(400, "BAD_REQUEST", "This agent is not in a group yet. Add it to a group to talk to it.")
+        return {**inp, "groupId": agent["rooms"][0]["room_id"]}, agent
+
+    def _grouped(self, plain, group_fn):
+        def handler(ctx, inp):
+            target = self._group_target(ctx, inp)
+            if target is None:
+                return plain(ctx, inp)
+            routed, agent = target
+            return group_fn(ctx, routed, agent=agent) if group_fn == self.rooms.send else group_fn(ctx, routed)
+        return handler
 
     def _bots_list(self, ctx, inp):
         return self._bots(ctx)
 
     def _bots_get(self, ctx, inp):
+        agent = self.rooms.find_agent(ctx, inp.get("botId"))
+        if agent is not None and ctx.space == sp.DEFAULT_SPACE_ID:
+            return self.rooms.agent_bot(ctx, agent)
         return self._bot(ctx, self._assistant(ctx, inp.get("botId")))
 
     def _bots_create(self, ctx, inp):
@@ -1116,23 +1190,30 @@ class RakazoBridge:
         return {"ok": True}           # accepted and dropped: this server sends no push notifications
 
     def _threads_subscribe(self, ctx, inp):
-        assistant = self._target(ctx, inp)
         cursor = inp.get("cursor")
         if isinstance(cursor, bool) or not isinstance(cursor, int) or cursor < -1:
             raise BridgeError(400, "BAD_REQUEST", "cursor must be an integer of at least -1.")
         if not ctx.accepts_stream:
             raise BridgeError(400, "BAD_REQUEST", "Subscribe with accept: text/event-stream.")
-        thread = self._thread(ctx, assistant)
+        target = self._group_target(ctx, inp)
+        if target is not None:
+            fetch, gone = self.rooms.subscribe(ctx, target[0], cursor)
+        else:
+            assistant = self._target(ctx, inp)
+            thread = self._thread(ctx, assistant)
+
+            def fetch(after: int) -> list[dict[str, Any]]:
+                journal, _ = self._journal(ctx, assistant, thread)
+                with self.journals.lock:
+                    return journal.after(after)
+
+            def gone() -> bool:
+                return False
         if not self._streams.acquire(blocking=False):
             raise BridgeError(429, "TOO_MANY_REQUESTS", "Too many live connections.", {"Retry-After": "10"})
 
-        def fetch(after: int) -> list[dict[str, Any]]:
-            journal, _ = self._journal(ctx, assistant, thread)
-            with self.journals.lock:
-                return journal.after(after)
-
         frames = ev.event_stream(fetch, cursor, should_stop=lambda: self._closed.is_set() or not self.tokens.valid(
-            ctx.token), **self.stream_options)
+            ctx.token) or gone(), **self.stream_options)
         return BridgeResponse(200, headers={"Content-Type": "text/event-stream", "Cache-Control": "no-store",
                                             "X-Accel-Buffering": "no", "Connection": "close"},
                               frames=frames, on_close=self._streams.release)

@@ -5,6 +5,7 @@
 ``scripts/rakazo_contract_export.ts`` (zod 4 ``toJSONSchema``). A response that omits a field the app requires, or has the
 wrong type, fails here instead of on a phone. Adding a procedure to the bridge without a case in ``CASES`` fails too."""
 import json
+import re
 from pathlib import Path
 
 import jsonschema
@@ -23,7 +24,6 @@ from tests.control_plane.test_rakazo_bridge import (  # noqa: F401
 CONTRACT = json.loads((Path(__file__).parent / "fixtures" / "rakazo_contract.json").read_text())
 PROCS = CONTRACT["procedures"]
 STREAMED = {"threads/subscribe"}          # an event stream, not a JSON body: covered by test_rakazo_bridge
-NEEDS_SETUP = {"threads/answer", "spaces/rename", "spaces/remove", "spaceSettings/setOverride"}   # own tests: test_rakazo_spaces
 
 
 def validate(proc, value):
@@ -63,10 +63,19 @@ def test_the_contract_fixture_is_pinned_and_complete():
     assert len(PROCS) > 200 and PROCS["threads/send"]["output"] is not None
 
 
-def test_every_bridge_procedure_exists_upstream_and_has_a_contract_case(srv):
+def validated_elsewhere() -> set[str]:
+    """Procedures some test in the suite checks with ``validate("<proc>", ...)``: the guard below reads the source."""
+    found = set()
+    for path in Path(__file__).parent.glob("test_rakazo_*.py"):
+        found |= set(re.findall(r'validate\("([A-Za-z]+(?:/[A-Za-z]+)+)"', path.read_text()))
+    return found
+
+
+def test_every_bridge_procedure_exists_upstream_and_has_a_contract_check(srv):
     implemented = set(srv[0].rakazo._procs) - STREAMED
     assert implemented <= set(PROCS), f"the bridge answers procedures the app does not have: {implemented - set(PROCS)}"
-    assert implemented == set(CASES) | NEEDS_SETUP, f"add or remove contract cases: {implemented ^ (set(CASES) | NEEDS_SETUP)}"
+    unchecked = implemented - set(CASES) - validated_elsewhere()
+    assert not unchecked, f"no test validates the response of: {sorted(unchecked)}"
 
 
 @pytest.mark.parametrize("proc", sorted(CASES))

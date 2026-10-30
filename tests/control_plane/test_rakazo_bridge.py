@@ -610,8 +610,7 @@ def test_push_registration_is_accepted_and_nothing_is_stored(srv, alice):
     assert before.count("ExponentPushToken") == 0
 
 
-@pytest.mark.parametrize("proc", ["billing/status", "voice/status", "computer/status", "models/list", "groups/list",
-                                  "capabilities/list", "routines/list", "bots/update", "totally/unknown"])
+@pytest.mark.parametrize("proc", ["totally/unknown", "definitely/missing", "threads/teleport"])
 def test_unimplemented_procedures_answer_a_rakazo_shaped_404(srv, alice, proc):
     _, api = srv
     status, body, _ = api.rpc(proc, {}, alice)
