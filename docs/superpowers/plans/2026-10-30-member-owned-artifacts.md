@@ -41,7 +41,7 @@
 * Approve URL travels back once: a 0600 result file readable only by worker and `collab-public`, deleted on first read, swept after 60 s; never logged, never in the event log, never in the mirror or member view.
 * **Host and sessions:** new key `control_plane.share.public_host` (bare DNS name, e.g. `artifacts.metabolomics.us`; no scheme/port/path) — the host of new share links *and* of the member UI. Member sessions are signed with `control_plane.collab.members.session_secret` (≥ 32 bytes, YAML only, never printed), domain tag `herdr-member-session-v1`, so a share session can never be replayed as a member session or back. Configuration is YAML only; no new environment variables (operator rule).
 * No `iframe`, `frame`, `object` or `embed` in any new or touched page (lint test, Task 12).
-* Migration: `0046_member_artifacts.sql` (0043 is on this branch; 0044/0045 are reserved for plans 3/4). If main has moved past, take the next free number at implementation time.
+* Migration: `0047_member_artifacts.sql` (0043 is on this branch; 0045/0046 are reserved for plans 3/4). If main has moved past, take the next free number at implementation time.
 * Python style as surrounding code (`from __future__ import annotations`, asyncpg conn in stores, `ArtifactError`/`ShareError`, hand-validated MCP args with `additionalProperties: False`). Commit trailer: `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`.
 
 ## Consumed from plan 3 (bridge) — contract
@@ -73,9 +73,9 @@ Plan 3 (`2026-10-30-artifact-collaborators-mcp-bridge.md`, revised 2026-10-30 wi
 
 ---
 
-### Task 1: Member identity, accounting tables and migration 0046
+### Task 1: Member identity, accounting tables and migration 0047
 
-**Files:** Create `herdr_engineering/control_plane/artifact_members.py`, `deploy/control-plane/migrations/0046_member_artifacts.sql`; Test `tests/control_plane/test_artifact_members.py` (Postgres fixtures as in `test_share_store.py`).
+**Files:** Create `herdr_engineering/control_plane/artifact_members.py`, `deploy/control-plane/migrations/0047_member_artifacts.sql`; Test `tests/control_plane/test_artifact_members.py` (Postgres fixtures as in `test_share_store.py`).
 
 **Interfaces:**
 - Migration (additive, idempotent): `artifact_member_usage(member_principal text PK, max_artifact_bytes bigint NULL, max_member_bytes bigint NULL, max_artifacts int NULL, bytes_used bigint NOT NULL DEFAULT 0, bytes_retracted bigint NOT NULL DEFAULT 0, sharing_disabled boolean NOT NULL DEFAULT false, display_name text, last_used_at timestamptz, updated_at timestamptz NOT NULL DEFAULT now(), CHECK (bytes_used >= 0 AND bytes_retracted >= 0), CHECK (max_artifact_bytes IS NULL OR max_artifact_bytes > 0), CHECK (max_member_bytes IS NULL OR max_member_bytes > 0), CHECK (max_artifacts IS NULL OR max_artifacts > 0))` — NULL limit = inherit the YAML default (itself `null` = unlimited); `artifact_member_events(event_id bigserial PK, member_principal text NOT NULL, actor jsonb NOT NULL, action text NOT NULL, artifact_id text, share_id text, audience text, outcome text NOT NULL CHECK (outcome IN ('ok','refused','error')), code text, detail jsonb NOT NULL DEFAULT '{}', at timestamptz NOT NULL DEFAULT now())` + indexes `(member_principal, at DESC)` and `(audience, at DESC) WHERE share_id IS NOT NULL`; index `artifacts(created_by) WHERE created_by LIKE 'member:%'`; index `artifact_shares(created_by) WHERE created_by LIKE 'member:%'`.

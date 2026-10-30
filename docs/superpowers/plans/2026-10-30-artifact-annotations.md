@@ -236,7 +236,7 @@ Task 15 builds on these plan-3 names. If plan 3 changes them before it merges, f
   - `control_plane.share.annotations`: `enabled` (bool, default `true`) plus the Decision 6 limits. Added to `SHARE_KEYS` and `SHARE_SLICE_KEYS`.
   - `control_plane.share.owner_emails`: a list, default `[]`. Added to `SHARE_KEYS` only, NOT `SHARE_SLICE_KEYS`.
   - The edge certificate directory follows the compose pattern `control_plane.compose.HERDR_SHARE_CERT_DIR`.
-- **Migration.** Number `0045`: 0043 is taken by `feat/artifact-collab-gui`, 0044 is plan 3's and 0046 is plan 5's. Re-check `origin/main` and open branches before committing, and take the next free number. The migration must be additive and idempotent, with a `DOWN:` comment like 0043.
+- **Migration.** Number `0046`: 0043 is taken by `feat/artifact-collab-gui`, 0045 is plan 3's and 0047 is plan 5's. Re-check `origin/main` and open branches before committing, and take the next free number. The migration must be additive and idempotent, with a `DOWN:` comment like 0043.
 - **Never logged, and never stored outside the response that needs them:** tokens, sessions, CSRF tokens, nonces, `Authorization` and `X-Id-Token` values. Author emails reach only the owner API and the author's own projection, never the MCP mirror or an agent.
 - **Code style.**
   - Python: `from __future__ import annotations`, type hints, and the surrounding module's style.
@@ -347,9 +347,9 @@ Task 15 builds on these plan-3 names. If plan 3 changes them before it merges, f
 - [ ] **Step 4: Run** `python3 -m pytest tests/control_plane/test_jsonl_ingest.py tests/control_plane/test_share_store.py tests/control_plane/test_share_worker.py -q` → PASS, with no edits to the existing share tests.
 - [ ] **Step 5: Commit** `refactor(shares): extract the JSONL ingestor`.
 
-### Task 3: Migration 0045 and `AnnotationStore`
+### Task 3: Migration 0046 and `AnnotationStore`
 
-**Files:** Create `deploy/control-plane/migrations/0045_artifact_annotations.sql` and `herdr_engineering/control_plane/artifact_annotations.py`; Test `tests/control_plane/test_artifact_annotations_store.py` (Postgres fixtures as in `test_share_store.py`)
+**Files:** Create `deploy/control-plane/migrations/0046_artifact_annotations.sql` and `herdr_engineering/control_plane/artifact_annotations.py`; Test `tests/control_plane/test_artifact_annotations_store.py` (Postgres fixtures as in `test_share_store.py`)
 
 **Interfaces:**
 - **Migration** (additive and idempotent):
@@ -1180,7 +1180,7 @@ Task 15 builds on these plan-3 names. If plan 3 changes them before it merges, f
   3. Certificate: run `deploy/control-plane/collab-sync.sh install --cert-name artifacts.metabolomics.us --cert-dir <dir>`, and set `control_plane.compose.HERDR_SHARE_CERT_DIR: <dir>`.
   4. In Cognito app client `cognito_web_client`, set the callback URL `https://artifacts.metabolomics.us/s/callback` and the sign-out URL `https://artifacts.metabolomics.us/`. Remove the MCP host's `/s/callback` entry.
   5. In YAML, set `control_plane.share.public_url: https://artifacts.metabolomics.us`, plus optional `owner_emails` and `annotations` overrides.
-  6. Rebuild the image (new `nh3` dependency and vendored pdf.js). Redeploy collab-edge, share-public and the control plane, then apply migration 0045.
+  6. Rebuild the image (new `nh3` dependency and vendored pdf.js). Redeploy collab-edge, share-public and the control plane, then apply migration 0046.
   7. Smoke-check:
      - An MCP-host `/s/...` path no longer reaches share-public.
      - A lab link to an HTML artifact signs in and lands directly on the running page, with the Annotate link. Clicking it opens the annotation view, and Live returns to the page.
