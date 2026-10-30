@@ -175,7 +175,7 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
   let selectedReports=null,selectedReportsError='';
   let reportData=null,reportsError='',insightsSignature='',failurePage=0,testPage=0,testSearch='';
   // The per-test explorer of the repository chosen in the overview: its latest reports, filters, the selected test and its excerpt.
-  let cx={repo:'',label:'',signature:'',reports:null,error:'',search:'',status:'all',sort:'failures',selected:'',slice:null,sliceError:'',history:null,historyError:''};
+  let cx={repo:'',label:'',signature:'',reports:null,error:'',search:'',status:'all',sort:'failures',selected:'',slice:null,sliceError:'',history:null,historyError:'',sessions:null,sessionId:'',sending:false,sendMessage:'',sendOp:''};
   let debugSessions=null,debugSessionId='',debugMessage='',debugOperationId='',fixOperationId='';
   let fixAvailable=true,fix=null,fixMessage='',sandboxOperationId='',fixTerminal=null,fixTerminalError='';
   let healthView=null,observabilityView=null,workspace=WORKSPACES.includes(startWorkspace)?startWorkspace:tab==='current'?'overview':'runs',collapseSuccess=false,zoom=1,comparisonKey='',listScroll=0,healthOriginKey='';
@@ -436,7 +436,7 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
   }
   function resetExplorer(repo,label) {
     for(const key of ['cx-reports','cx-slice','cx-history']){pending.get(key)?.abort();pending.delete(key);}
-    cx={...cx,repo,label,signature:'',reports:null,error:'',selected:'',slice:null,sliceError:'',history:null,historyError:''};
+    cx={...cx,repo,label,signature:'',reports:null,error:'',selected:'',slice:null,sliceError:'',history:null,historyError:'',sending:false,sendMessage:'',sendOp:''};
   }
   // Fetch the full reports (tests included) of the selected repository's latest runs whenever they change.
   function syncExplorer(targets,repo) {
@@ -459,7 +459,7 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
   }
   function explorerTest() {return explorerTests(cx.reports).find(t=>t.key===cx.selected)||null;}
   function selectExplorerTest(key) {
-    cx.selected=cx.selected===key?'':key;cx.slice=null;cx.sliceError='';cx.history=null;cx.historyError='';
+    cx.selected=cx.selected===key?'':key;cx.slice=null;cx.sliceError='';cx.history=null;cx.historyError='';cx.sending=false;cx.sendMessage='';cx.sendOp='';
     pending.get('cx-slice')?.abort();pending.delete('cx-slice');pending.get('cx-history')?.abort();pending.delete('cx-history');
     const t=explorerTest();
     if(t&&t.source==='log'&&t.step_id&&t.provider_url){
@@ -486,6 +486,26 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
       });
     },()=>{if(cx.selected===key0){cx.history=[];cx.historyError='Earlier runs could not be loaded.';}});
     draw();
+  }
+  // Pi agents the failing test can be sent to; loaded when the operator asks, and the one on the test's branch is preselected.
+  function loadExplorerAgents() {
+    if(cx.sessions!==null||pending.has('cx-agents'))return;
+    const t=explorerTest();cx.sessions='loading';cx.sendMessage='';draw();
+    request('cx-agents',signal=>client.listSessions(undefined,{signal}),response=>{
+      cx.sessions=activePiSessions(response.sessions);
+      const onBranch=t?.branch?cx.sessions.filter(x=>x.branch===t.branch):[];
+      if(!cx.sessionId&&onBranch.length===1){cx.sessionId=onBranch[0].session_id;cx.sendOp='';}
+    },()=>{cx.sessions=null;cx.sendMessage='Pi agents could not be loaded. Try again.';});
+  }
+  function sendExplorerTest() {
+    const t=explorerTest(),sessionId=cx.sessionId;
+    if(!t||!sessionId||cx.sending||!t.step_id||!t.provider_url)return;
+    if(!cx.sendOp)cx.sendOp=newOperationId();
+    const key0=cx.selected,operationId=cx.sendOp;cx.sending=true;cx.sendMessage='Sending the failure to the agent…';draw();
+    request('cx-send',signal=>client.debugCi(t.provider_repo_id,t.run_number,sessionId,operationId,{signal,providerUrl:t.provider_url,mode:'test',test:{name:t.name,suite:t.suite||undefined,step_id:String(t.step_id),line_start:t.line_start,line_end:t.line_end}}),response=>{
+      if(cx.selected!==key0)return;
+      cx.sending=false;cx.sendMessage=response.status==='delivered'?'Delivered to the selected Pi agent.':response.status==='queued'?'Queued for delivery to the selected Pi agent.':response.error||'The Pi agent did not receive the failure.';
+    },err=>{if(cx.selected!==key0)return;cx.sending=false;cx.sendMessage=err.status===403?'Sending to Pi requires operator access.':err.status===400||err.status===409?(err.message||'This failure cannot be sent.'):'Delivery unconfirmed; sending again checks the same operation.';});
   }
   function openExplorerRun(number,{withStep=false}={}) {
     const t=explorerTest();if(!t)return;
@@ -578,6 +598,8 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
     if(button.hasAttribute('data-cx-test')){selectExplorerTest(button.dataset.cxTest);return;}
     if(button.hasAttribute('data-cx-close')){selectExplorerTest(cx.selected);return;}
     if(button.hasAttribute('data-cx-history')){loadExplorerHistory();return;}
+    if(button.hasAttribute('data-cx-agents')){loadExplorerAgents();return;}
+    if(button.hasAttribute('data-cx-send')){sendExplorerTest();return;}
     if(button.hasAttribute('data-cx-open-run')){openExplorerRun(button.dataset.cxOpenRun);return;}
     if(button.hasAttribute('data-cx-open-step')){const t=explorerTest();if(t)openExplorerRun(t.run_number,{withStep:true});return;}
     if(button.hasAttribute('data-ci-test-repo')){
@@ -680,7 +702,7 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
       debugSessions=activePiSessions(response.sessions);debugMessage='';{const onBranch=selected?.branch?debugSessions.filter(x=>x.branch===selected.branch):[];if(!debugSessionId && onBranch.length===1){debugSessionId=onBranch[0].session_id;debugOperationId='';fixOperationId='';}}
     },()=>{if(selected?.id===key){debugSessions=[];debugMessage='Pi agents could not load. Reopen this run to retry.';}});
   },{capture:true,signal:listenerController.signal});
-  container.addEventListener('change',event=>{if(event.target.hasAttribute('data-cx-status')){cx.status=event.target.value;draw();return;}if(event.target.hasAttribute('data-cx-sort')){cx.sort=event.target.value;draw();return;}if(event.target.hasAttribute('data-ci-compare')){comparisonKey=event.target.value;draw();}if(event.target.hasAttribute('data-debug-session')){if(debugSessionId!==event.target.value){debugOperationId='';fixOperationId='';debugMessage='';}debugSessionId=event.target.value;draw();}},{signal:listenerController.signal});
+  container.addEventListener('change',event=>{if(event.target.hasAttribute('data-cx-session')){cx.sessionId=event.target.value;cx.sendOp='';cx.sendMessage='';draw();return;}if(event.target.hasAttribute('data-cx-status')){cx.status=event.target.value;draw();return;}if(event.target.hasAttribute('data-cx-sort')){cx.sort=event.target.value;draw();return;}if(event.target.hasAttribute('data-ci-compare')){comparisonKey=event.target.value;draw();}if(event.target.hasAttribute('data-debug-session')){if(debugSessionId!==event.target.value){debugOperationId='';fixOperationId='';debugMessage='';}debugSessionId=event.target.value;draw();}},{signal:listenerController.signal});
   container.querySelector('.ig-tabs:not(.ci-workspace-tabs)').addEventListener('keydown',event=>{
     if(!['ArrowLeft','ArrowRight','Home','End'].includes(event.key))return;
     const index=tabs.findIndex(([key])=>key===state.tab);

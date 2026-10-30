@@ -47,6 +47,9 @@ test('log-parsed counts, a per-test list and the log lines around a test appear 
  const inspector=explorer.locator('[data-cx-inspector]');
  await inspector.locator('.cx-hit').first().waitFor();
  assert.match(await inspector.locator('.cx-log').innerText(),/expected 200, got 500/);
+ assert.equal(await explorer.locator('li:has([data-cx-test]) > [data-cx-inspector]').count(),1,'the log unfolds under the test that was clicked');
+ await inspector.locator('[data-cx-agents]').click();
+ await inspector.locator('[data-cx-session], :text("No active Pi agents")').first().waitFor();
  assert.match(await inspector.locator('.cx-hit').first().innerText(),/TestBeta/);
 assert.match(await inspector.innerText(),/parsed from the CI log, step Unit tests/);
  await inspector.locator('[data-cx-history]').click();

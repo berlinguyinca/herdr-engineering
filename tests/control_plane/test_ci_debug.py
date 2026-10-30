@@ -265,3 +265,48 @@ def test_unknown_mode_is_rejected_before_any_read():
         with pytest.raises(ValueError, match="mode"):
             debug_ci(SimpleNamespace(_factory=lambda: provider), repo, None, "17", 12, "session", "o", mode=mode)
     assert provider.reads == 0
+
+
+TEST = {"name": "tests/test_x.py::test_a", "step_id": "5", "line_start": 10, "line_end": 12, "suite": "tests.test_x"}
+
+
+class SliceMonitor(SimpleNamespace):
+    def log_slice(self, repository, number, step, start, end, **kwargs):
+        self.asked = (repository, number, step, start, end, kwargs.get("expect"))
+        return self.result
+
+
+def test_test_handoff_carries_the_server_read_excerpt_and_the_test(acknowledged_sink):
+    repo = ControlPlaneRepo(sink=acknowledged_sink)
+    native_session(repo)
+    monitor = SliceMonitor(_factory=Provider, result={"slice": {"lines": ["E   assert 1 == 2", "FAILED tests/test_x.py::test_a"]}})
+    sent = []
+    def dispatch(session, message, artifacts):
+        sent.append(message)
+        return {"status": "delivered"}
+    result = debug_ci(monitor, repo, dispatch, "17", 12, "session", "op-t", mode="test", test=TEST)
+    assert result["ok"] is True and result["handoff_type"] == "test-with-pi"
+    assert monitor.asked == ("17", 12, "5", 10, 12, "tests/test_x.py::test_a")
+    assert "failing test" in sent[0] and "untrusted" in sent[0]
+    context = json.loads(sent[0].split("CI_CONTEXT_JSON:\n", 1)[1])
+    assert context["failing_test"]["name"] == TEST["name"]
+    assert "assert 1 == 2" in context["log_excerpt"]
+    assert context["request"]["mode"] == "test"
+
+
+def test_test_handoff_refuses_when_the_excerpt_is_unavailable_and_sends_nothing():
+    repo = ControlPlaneRepo()
+    native_session(repo)
+    monitor = SliceMonitor(_factory=Provider, result={"slice": None, "reason": "The log no longer matches."})
+    with pytest.raises(ValueError, match="no longer matches"):
+        debug_ci(monitor, repo, None, "17", 12, "session", "op-t", mode="test", test=TEST)
+
+
+@pytest.mark.parametrize("bad", [None, {}, {**TEST, "step_id": "x"}, {**TEST, "line_start": 0}, {**TEST, "line_end": True}, {**TEST, "name": ""}])
+def test_test_handoff_validates_the_test_before_reading_anything(bad):
+    repo = ControlPlaneRepo()
+    native_session(repo)
+    provider = Provider()
+    with pytest.raises(ValueError):
+        debug_ci(SliceMonitor(_factory=lambda: provider, result={}), repo, None, "17", 12, "session", "op-t", mode="test", test=bad)
+    assert provider.reads == 0

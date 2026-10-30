@@ -87,3 +87,32 @@ test('excerpt numbers from the server are coerced, never written as markup',()=>
  const html=renderTestInspector(ex(null,{slice:hostile}),t);
  assert.doesNotMatch(html,/<img|<script|<b>/);
 });
+
+test('the selected test unfolds under its own row, not below the list',()=>{
+ const html=renderTestExplorer(ex([{label:'main',report:logReport([logTest('a','TestAlpha','failed'),logTest('b','TestBeta','passed')])}],{selected:'7:a',slice:{slice:{first:9,last:12,start:10,end:11,lines:['a','b','c','d']},total_lines:40}}));
+ const row=html.match(/<li>(?:(?!<\/li>)[\s\S])*TestAlpha[\s\S]*?<\/li>/)[0];
+ assert.match(row,/data-cx-inspector/);
+ assert.match(row,/cx-log/);
+ assert.equal(html.split('data-cx-inspector').length-1,1);
+ assert.doesNotMatch(html.match(/<li>(?:(?!<\/li>)[\s\S])*TestBeta[\s\S]*?<\/li>/)[0],/data-cx-inspector/);
+});
+
+test('a failing log test offers to send itself to a Pi agent; a passing one does not',()=>{
+ const report=logReport([logTest('a','TestAlpha','failed'),logTest('b','TestBeta','passed')]);
+ const failing=renderTestExplorer(ex([{label:'main',report}],{selected:'7:a'}));
+ assert.match(failing,/data-cx-agents/);
+ assert.doesNotMatch(renderTestExplorer(ex([{label:'main',report}],{selected:'7:b'})),/data-cx-agents|data-cx-send/);
+ const picked=renderTestExplorer(ex([{label:'main',report}],{selected:'7:a',sessions:[{session_id:'s1',display_name:'Pi <one>',branch:'main'}],sessionId:'s1',sendMessage:'Delivered.'}));
+ assert.match(picked,/data-cx-session/);
+ assert.match(picked,/<option value="s1" selected>Pi &lt;one&gt; · on this branch/);
+ assert.doesNotMatch(picked,/data-cx-send disabled/);
+ assert.match(picked,/data-cx-send-status[^>]*>Delivered\./);
+ assert.match(renderTestExplorer(ex([{label:'main',report}],{selected:'7:a',sessions:[{session_id:'s1'}],sessionId:''})),/data-cx-send disabled/);
+ assert.match(renderTestExplorer(ex([{label:'main',report}],{selected:'7:a',sessions:[]})),/No active Pi agents/);
+});
+
+test('a JUnit failure cannot be sent because the server has no log excerpt to read',()=>{
+ const html=renderTestExplorer(ex([{label:'main',report:junitReport([{id:'j',name:'TestJ',status:'failed',suite:'s',trace:'boom'}])}],{selected:'6:j'}));
+ assert.doesNotMatch(html,/data-cx-agents/);
+ assert.match(html,/needs the log excerpt/);
+});

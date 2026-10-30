@@ -3549,7 +3549,8 @@ def _make_handler(server, public=False, operator=False):
                                        body.get("repository"), body.get("number"),
                                        body.get("session_id"), body.get("operation_id"),
                                        **({"provider_url": body["provider_url"]} if "provider_url" in body else {}),
-                                       **({"mode": body["mode"]} if "mode" in body else {}))
+                                       **({"mode": body["mode"]} if "mode" in body else {}),
+                                       **({"test": body["test"]} if "test" in body else {}))
                 except HerdrEngineeringError as exc:
                     return self._json({"error": exc.message}, exc.http_status)
                 status = {"delivered": 200, "queued": 202}.get(receipt.get("status"), 502)
