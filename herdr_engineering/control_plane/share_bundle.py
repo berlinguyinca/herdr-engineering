@@ -99,26 +99,54 @@ def content_type_for(name: str) -> str:
     return _CONTENT_TYPES.get(os.path.splitext(name)[1].lower(), "application/octet-stream")
 
 
-_HOST_OR_ABS = r"((?:https?:)?//[^\s\"'<>)]+|/[^/\s\"'<>)][^\s\"'<>)]*)"
-# Every pattern is linear: no nested/adjacent unbounded repeats, and the one lookbehind-ish gap (import ... from) is bounded.
-_URL_PATTERNS = [
-    re.compile(r"""\b(?:src|srcset|poster|data-src)\s*=\s*["']?""" + _HOST_OR_ABS, re.I),
-    re.compile(r"""<link\b[^>]{0,300}?\bhref\s*=\s*["']?""" + _HOST_OR_ABS, re.I),
-    re.compile(r"""\burl\(\s*["']?""" + _HOST_OR_ABS, re.I),
-    re.compile(r"""\bimport\s*(?:\(\s*|[^"'\n;()]{0,200}?\bfrom\s*)?["']((?:https?:)?//[^"']+|/[^/"'][^"']*)["']""", re.I),
-    re.compile(r"""@import\s+["']((?:https?:)?//[^"']+|/[^/"'][^"']*)["']""", re.I),
-]
+# Detection is a single-pass scan: one regex finds candidate URLs by their own shape (a host-or-absolute path right after a
+# quote, "(", "=" or whitespace; no overlapping or nested quantifiers, so every failed start costs O(1) and matches never
+# overlap), then a fixed-size look-back decides whether the context loads it. The number of candidates examined is capped,
+# so the cost of one scan is bounded whatever the content looks like.
+_CANDIDATE = re.compile(r"""(?<=[\s"'(=])((?:https?:)?//[^\s"'<>)]+|/[^/\s"'<>)][^\s"'<>)]*)""")
+_LOOKBACK = 120
+MAX_CANDIDATES = 20000
+MAX_BUNDLE_SCAN_BYTES = 16 * 1024 * 1024
+_ATTRS = {"src", "srcset", "poster", "data-src"}
+
+
+def _trailing_word(prefix: str) -> str:
+    end = len(prefix)
+    i = end
+    while i > 0 and (prefix[i - 1].isalnum() or prefix[i - 1] in "_-"):
+        i -= 1
+    return prefix[i:end].lower()
+
+
+def _loads_url(prefix: str) -> bool:
+    """Does the text right before a candidate URL make it a load (src=, href= on <link>, url(), import, @import, from)?"""
+    if prefix and prefix[-1] in "\"'":
+        prefix = prefix[:-1]
+    prefix = prefix.rstrip()
+    if prefix.endswith("="):
+        prefix = prefix[:-1].rstrip()
+        word = _trailing_word(prefix)
+        if word in _ATTRS:
+            return True
+        if word == "href":
+            tag = prefix.rfind("<")
+            return tag >= 0 and ">" not in prefix[tag:] and prefix[tag + 1:tag + 5].lower() == "link"
+        return False
+    if prefix.endswith("("):
+        return _trailing_word(prefix[:-1].rstrip()) in ("url", "import")
+    return _trailing_word(prefix) in ("import", "from")
 
 
 def scan_external_references(html: bytes) -> list[str]:
     """URLs a page loads from another host or by absolute path (neither works from a frozen bundle). Relative and ``data:`` are fine."""
     text = html[:MAX_SCAN_BYTES].decode("utf-8", "replace")
     found: list[str] = []
-    for pattern in _URL_PATTERNS:
-        for match in pattern.finditer(text):
-            url = match.group(1)
-            if url not in found:
-                found.append(url)
+    for count, match in enumerate(_CANDIDATE.finditer(text)):
+        if count >= MAX_CANDIDATES:
+            break
+        url = match.group(1)
+        if url not in found and _loads_url(text[max(0, match.start() - _LOOKBACK):match.start()]):
+            found.append(url)
     return found
 
 
@@ -222,14 +250,25 @@ def build_bundle(dest: Path, files: Iterable[tuple[str, str, int, Iterable[bytes
             index_files.append(BundleFile(name, sha, size, content_type_for(name)))
         chosen = _choose_entry(entry, [f.name for f in index_files])
         warnings = []
+        budget = MAX_BUNDLE_SCAN_BYTES
+        skipped = False
         for f in index_files:
-            if os.path.splitext(f.name)[1].lower() in _SCANNED:
-                if f.size > MAX_SCAN_BYTES:
-                    warnings.append("%s is over %d bytes; only the first %d were checked for external references"
-                                    % (f.name, MAX_SCAN_BYTES, MAX_SCAN_BYTES))
-                with open(base.joinpath(*f.name.split("/")), "rb") as handle:
-                    refs = scan_external_references(handle.read(MAX_SCAN_BYTES))
-                warnings.extend("%s references %s" % (f.name, url) for url in refs[:20])
+            if os.path.splitext(f.name)[1].lower() not in _SCANNED:
+                continue
+            take = min(f.size, MAX_SCAN_BYTES)
+            if take > budget:
+                skipped = True
+                continue
+            budget -= take
+            if f.size > MAX_SCAN_BYTES:
+                warnings.append("%s is over %d bytes; only the first %d were checked for external references"
+                                % (f.name, MAX_SCAN_BYTES, MAX_SCAN_BYTES))
+            with open(base.joinpath(*f.name.split("/")), "rb") as handle:
+                refs = scan_external_references(handle.read(MAX_SCAN_BYTES))
+            warnings.extend("%s references %s" % (f.name, url) for url in refs[:20])
+        if skipped:
+            warnings.append("the scan budget (%d bytes) was used up; the remaining files were not checked for external references"
+                            % MAX_BUNDLE_SCAN_BYTES)
         return BundleIndex(chosen, index_files, total, warnings)
     except BaseException:
         if created:

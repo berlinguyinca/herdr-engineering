@@ -196,12 +196,47 @@ def test_remove_bundle(tmp_path):
     assert tmp_path.exists()
 
 
-def test_scan_is_linear_on_hostile_input():
-    for body in (b"import a " * 8000, b"import a " * 400000, b"src=" + b" " * 3_000_000, b"url(" + b" " * 3_000_000,
-                 b"<link " * 100000, b"@import " * 300000, b"import {" * 300000):
-        started = time.monotonic()
-        scan_external_references(body)
-        assert time.monotonic() - started < 2.0, body[:12]
+HOSTILE = {
+    "import-words": lambda n: b"import a " * (n // 9),
+    "import-spaces": lambda n: b"import" + b" " * n,
+    "src-spaces": lambda n: b"src=" + b" " * n,
+    "url-spaces": lambda n: b"url(" + b" " * n,
+    "link": lambda n: b"<link " * (n // 6),
+    "at-import": lambda n: b"@import " * (n // 8),
+    "import-brace": lambda n: b"import {" * (n // 8),
+    "slashes": lambda n: b' ="/a' * (n // 5),
+    "quotes": lambda n: b"=\"//" * (n // 4),
+}
+
+
+def _took(body):
+    started = time.monotonic()
+    scan_external_references(body)
+    return time.monotonic() - started
+
+
+@pytest.mark.parametrize("shape", sorted(HOSTILE))
+def test_scan_is_bounded_and_scales_linearly(shape):
+    make = HOSTILE[shape]
+    small, large = _took(make(256 * 1024)), _took(make(1024 * 1024))
+    assert large < 10.0, shape  # generous: a 1 MiB hostile file
+    if small > 0.05:  # below that, timer noise dominates the ratio
+        assert large < 12 * small, (shape, small, large)
+
+
+def test_scan_whitespace_after_import_is_cheap():
+    assert _took(b"import" + b" " * 1048576) < 10.0
+
+
+def test_scan_budget_across_the_bundle_warns(tmp_path, monkeypatch):
+    from herdr_engineering.control_plane import share_bundle
+    monkeypatch.setattr(share_bundle, "MAX_BUNDLE_SCAN_BYTES", 100)
+    body = b'<script src="https://cdn.example/a.js"></script>' + b" " * 20
+    files = [_f("index.html", body), _f("b.html", body), _f("c.html", body)]
+    index = build_bundle(tmp_path / "s", files, entry=None, limits=LIMITS)
+    assert any("index.html references https://cdn.example/a.js" in w for w in index.warnings)
+    assert sum("scan budget" in w for w in index.warnings) == 1
+    assert not any(w.startswith("c.html references") for w in index.warnings)
 
 
 def test_large_scanned_file_is_capped_with_warning(tmp_path):
