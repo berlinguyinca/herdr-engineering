@@ -1572,6 +1572,15 @@ class AssistantStore:
             self.runs[r.run_id] = r
         self._after_mutation()
 
+    def advance_run(self, run: AssistantRun, state: str) -> bool:
+        """Move a run to ``state`` unless it was cancelled meanwhile. False means: stop, the run is cancelled."""
+        with self._lock:
+            if run.state == "cancelled":
+                return False
+            run.state = state
+            self.put_run(run)
+            return True
+
     def get_run(self, run_id: str, *, tenant_id: str, user_id: str) -> AssistantRun:
         r = self.runs.get(run_id)
         if r is None or r.tenant_id != tenant_id or r.user_id != user_id:
@@ -1981,28 +1990,35 @@ class AssistantService:
 
         # policy pipeline
         try:
-            run.state = "authorized"
-            self.store.put_run(run)
+            # a cancel (cancel_run) can arrive at any point: it wins, and a cancelled run is never moved on or completed
+            if not self.store.advance_run(run, "authorized"):
+                return run
             # read_memory requires a grant; if absent, the run fails closed but
             # still completes with the local runner (which returns no context).
-            run.state = "running"
-            self.store.put_run(run)
+            if not self.store.advance_run(run, "running"):
+                return run
             messages = self.store.list_messages(thread_id, tenant_id=tenant_id, user_id=user_id)
             reply = self._drive(run, messages)
-            self.store.put_message(AssistantMessage(
-                message_id=_new_id("msg"), thread_id=thread_id, role="assistant",
-                content=reply, provenance=run.run_id))
-            thread.last_activity_at = self.now()
-            run.state = "completed"
-            run.model_route = assistant.model_policy
-            self.store.put_run(run)
-            self.store.audit_record(tenant_id=tenant_id, user_id=user_id, actor=user_id,
-                                    action="assistant.run.completed", subject_id=run.run_id)
+            with self.store._lock:                  # the check and the writes are one step as far as cancel_run can see
+                if run.state == "cancelled":
+                    return run                      # the reply of a stopped run is discarded
+                self.store.put_message(AssistantMessage(
+                    message_id=_new_id("msg"), thread_id=thread_id, role="assistant",
+                    content=reply, provenance=run.run_id))
+                thread.last_activity_at = self.now()
+                run.state = "completed"
+                run.model_route = assistant.model_policy
+                self.store.put_run(run)
+                self.store.audit_record(tenant_id=tenant_id, user_id=user_id, actor=user_id,
+                                        action="assistant.run.completed", subject_id=run.run_id)
             return run
         except Exception as exc:  # noqa: BLE001 - surface as failed run, never crash
-            run.state = "failed"
-            run.error = str(exc)
-            self.store.put_run(run)
+            with self.store._lock:
+                if run.state == "cancelled":
+                    return run                      # stopped by the user: not a failure
+                run.state = "failed"
+                run.error = str(exc)
+                self.store.put_run(run)
             self.store.audit_record(tenant_id=tenant_id, user_id=user_id, actor=user_id,
                                     action="assistant.run.failed", subject_id=run.run_id,
                                     detail=str(exc))
@@ -2015,11 +2031,12 @@ class AssistantService:
     def cancel_run(self, run_id: str, *, tenant_id: str, user_id: str) -> AssistantRun:
         self._require_enabled()
         run = self.store.get_run(run_id, tenant_id=tenant_id, user_id=user_id)
-        if run.state not in ("submitted", "authorized", "running", "queued",
-                             "waiting_for_approval", "recovering"):
-            raise AssistantError(f"run not cancellable in state {run.state}")
-        run.state = "cancelled"
-        self.store.put_run(run)
+        with self.store._lock:
+            if run.state not in ("submitted", "authorized", "running", "queued",
+                                 "waiting_for_approval", "recovering"):
+                raise AssistantError(f"run not cancellable in state {run.state}")
+            run.state = "cancelled"
+            self.store.put_run(run)
         self.store.audit_record(tenant_id=tenant_id, user_id=user_id, actor=user_id,
                                 action="assistant.run.cancelled", subject_id=run_id)
         return run

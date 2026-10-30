@@ -24,6 +24,8 @@ import re
 import secrets
 import threading
 import time
+import traceback
+from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -52,6 +54,7 @@ MAX_BODY = 1_000_000
 MAX_AUTH_BODY = 8_192
 MAX_STREAMS = 8
 MAX_SENDS = 4
+MAX_NONCES = 512
 MAX_BOTS = 20                        # assistants per account
 MAX_RUN_ROWS = 20
 MAX_ACTIVE_ROWS = 50
@@ -201,29 +204,35 @@ class TokenStoreError(Exception):
 
 
 DB_TIMEOUT_SECONDS = 3
+MAX_LIMITER_ENTRIES = 20_000
 
 
 class PostgresTokenPersistence:
     """``rakazo_bridge_tokens`` (migration 0036): the SHA-256 of each live token, never the token itself.
 
     Sync psycopg2 like the assistant's store; a connection factory is injectable for tests. Credentials come from the DSN
-    and are never logged. Every connection gets a connect timeout and a statement/lock timeout whatever the DSN says, so a
-    stuck database costs a request a few seconds, never a hang."""
+    and are never logged. Every connection gets a connect timeout, and every transaction a statement/lock timeout set with
+    SET LOCAL (safe behind PgBouncer), whatever the DSN says, so a stuck database costs a request a few seconds, never a
+    hang."""
 
     def __init__(self, dsn: str, connect: Callable | None = None):
         self._dsn = dsn
         self._connect = connect
 
     def _run(self, sql: str, args: tuple = (), fetch: bool = False):
+        timeouts = 0
         if self._connect is not None:
             conn = self._connect()
         else:
             import psycopg2
-            ms = DB_TIMEOUT_SECONDS * 1000
-            conn = psycopg2.connect(self._dsn, connect_timeout=DB_TIMEOUT_SECONDS,
-                                    options=f"-c statement_timeout={ms} -c lock_timeout={ms}")
+            conn = psycopg2.connect(self._dsn, connect_timeout=DB_TIMEOUT_SECONDS)
+            timeouts = DB_TIMEOUT_SECONDS * 1000
         try:
             with conn.cursor() as cur:
+                if timeouts:
+                    # SET LOCAL, not a startup option: PgBouncer rejects unknown startup parameters, and a plain SET would
+                    # outlive this transaction on a pooled server connection
+                    cur.execute(f"SET LOCAL statement_timeout = {timeouts}; SET LOCAL lock_timeout = {timeouts}")
                 cur.execute(sql, args)
                 rows = cur.fetchall() if fetch else None
             conn.commit()
@@ -437,15 +446,21 @@ class SignInLimiter:
             entry = None
         if entry is None:
             entry = self._state[key] = {"fails": 0, "until": 0.0, "last": now}
-            if len(self._state) > 2048:
-                for stale in sorted(self._state, key=lambda k: self._state[k]["last"])[:512]:
+            if len(self._state) > MAX_LIMITER_ENTRIES:
+                # forget quiet addresses first; a locked-out address is only dropped if nothing else can be, and then the
+                # one whose lock ends soonest, so flooding with new addresses cannot reset an active lockout
+                order = sorted((k for k in self._state if k != key),
+                               key=lambda k: (self._state[k]["until"] > now, self._state[k]["until"],
+                                              self._state[k]["last"]))
+                for stale in order[:MAX_LIMITER_ENTRIES // 4]:
                     del self._state[stale]
         return entry
 
     def retry_after(self, ip: str) -> int:
         now = self._clock()
-        with self._lock:
-            wait = self._entry(ip, now)["until"] - now
+        with self._lock:                  # a read: probing with new addresses must not allocate state
+            entry = self._state.get(ip)
+            wait = entry["until"] - now if entry is not None and now - entry["last"] <= self._forget else 0.0
         return int(wait) + 1 if wait > 0 else 0
 
     def failure(self, ip: str) -> int:
@@ -535,9 +550,13 @@ class RakazoBridge:
         self._streams = threading.BoundedSemaphore(MAX_STREAMS)
         self._sends = threading.BoundedSemaphore(MAX_SENDS)
         self._thread_lock = threading.Lock()
+        self._nonce_lock = threading.Lock()
+        self._nonces: OrderedDict[tuple, dict[str, Any]] = OrderedDict()      # recent sends, by clientNonce
         self._create_lock = threading.Lock()
         self._closed = threading.Event()
         self._monotonic = monotonic
+        self.thread_factory = threading.Thread      # tests swap it to make a thread start fail
+        self.send_wait = 5.0                  # seconds threads/send waits for the run to exist; tests shorten it
         self.stream_options: dict[str, Any] = {}      # tests shorten the poll/heartbeat/lifetime
         self._procs: dict[str, Callable[[_Ctx, dict[str, Any]], Any]] = {
             "me": self._me, "spaces/list": self._spaces_list, "bots/list": self._bots_list, "bots/get": self._bots_get,
@@ -553,6 +572,14 @@ class RakazoBridge:
         self._dummy = self.accounts[0].params
 
     # routing ---------------------------------------------------------------------------------------------------
+    def body_limit(self, path: str, headers: dict[str, str]) -> int:
+        """How much body the server will read BEFORE it knows who is asking: only a request carrying a live bearer token to
+        an ``/rpc/`` path may send the full ``MAX_BODY``; everything else (sign-in included) gets the small auth limit."""
+        token = self._bearer(headers)
+        if path.split("?", 1)[0].startswith("/rpc/") and token and self.tokens.valid(token):
+            return MAX_BODY
+        return MAX_AUTH_BODY
+
     @staticmethod
     def handles(path: str) -> bool:
         path = path.split("?", 1)[0]
@@ -707,7 +734,14 @@ class RakazoBridge:
         try:
             self.svc.check_rate_limit(key=f"{tenant}:{ctx.user}")
             result = handler(ctx, inp)
-        except (AssistantNotFound, KeyError):
+        except AssistantNotFound:
+            raise BridgeError(404, "NOT_FOUND", "Not found.") from None
+        except KeyError as exc:
+            # the assistant store signals a missing record with KeyError, so this is usually a plain not-found; but a bug
+            # in a view builder looks the same, so leave a trace (where, never the key or the request)
+            frame = traceback.extract_tb(exc.__traceback__)[-1]
+            log.warning("rakazo bridge: %s hit a KeyError at %s:%s", proc[:40], frame.filename.rsplit("/", 1)[-1],
+                        frame.lineno)
             raise BridgeError(404, "NOT_FOUND", "Not found.") from None
         except RateLimited as exc:
             raise BridgeError(429, "TOO_MANY_REQUESTS", str(exc), {"Retry-After": "30"}) from None
@@ -846,10 +880,24 @@ class RakazoBridge:
             raise BridgeError(400, "BAD_REQUEST", "This bot is disabled.")
         thread = self._thread(ctx, assistant)
         journal, runs = self._journal(ctx, assistant, thread)
-        known_runs, known_messages = {r.run_id for r in runs}, set(journal.messages)
+        nonce = inp.get("clientNonce")
+        key = (ctx.tenant, ctx.user, thread.thread_id, nonce) if isinstance(nonce, str) and 0 < len(nonce) <= 200 else None
+        entry: dict[str, Any] = {"known_runs": {r.run_id for r in runs}, "known_messages": set(journal.messages),
+                                 "result": None, "worker": None}
         if not self._sends.acquire(blocking=False):
             raise BridgeError(429, "TOO_MANY_REQUESTS", "Too many messages are being answered. Try again shortly.",
                               {"Retry-After": "5"})
+        if key is not None:
+            # the app retries a send it never saw an answer to: the same clientNonce must not send the message twice
+            with self._nonce_lock:
+                prior = self._nonces.get(key)
+                if prior is None:
+                    self._nonces[key] = entry
+                    while len(self._nonces) > MAX_NONCES:
+                        self._nonces.popitem(last=False)
+            if prior is not None:
+                self._sends.release()
+                return self._await_run(ctx, assistant, thread, prior, key)
         outcome: dict[str, BaseException] = {}
 
         def work() -> None:
@@ -864,24 +912,50 @@ class RakazoBridge:
             finally:
                 self._sends.release()
 
-        worker = threading.Thread(target=work, name="rakazo-send", daemon=True)
-        worker.start()
-        deadline = self._monotonic() + 5.0
+        worker = self.thread_factory(target=work, name="rakazo-send", daemon=True)
+        entry["worker"], entry["outcome"] = worker, outcome
+        try:
+            worker.start()
+        except BaseException:                  # a thread cap: the slot and the nonce must not stay taken
+            self._sends.release()
+            self._forget_nonce(key)
+            raise BridgeError(503, "SERVICE_UNAVAILABLE", "The server is too busy to start that. Try again shortly.",
+                              {"Retry-After": "5"}) from None
+        return self._await_run(ctx, assistant, thread, entry, key)
+
+    def _forget_nonce(self, key) -> None:
+        if key is not None:
+            with self._nonce_lock:
+                self._nonces.pop(key, None)
+
+    def _await_run(self, ctx, assistant, thread, entry: dict[str, Any], key) -> dict[str, Any]:
+        """The ``threads/send`` answer once the run exists. Gives up after 5 s with a retryable 503 (the same clientNonce
+        then returns this same run instead of sending again), or with the run's own refusal if it never started."""
+        if entry["result"] is not None:
+            return entry["result"]
+        deadline = self._monotonic() + self.send_wait
         run = None
         while run is None:
             _, current = self._journal(ctx, assistant, thread)
-            run = next((r for r in current if r.run_id not in known_runs), None)
-            if run is not None or not worker.is_alive() or self._monotonic() > deadline:
+            run = next((r for r in current if r.run_id not in entry["known_runs"]), None)
+            worker = entry["worker"]
+            if run is not None or (worker is not None and not worker.is_alive()) or self._monotonic() > deadline:
                 break
             time.sleep(0.01)
         if run is None:
-            error = outcome.get("error")
+            worker = entry["worker"]
+            if worker is None or worker.is_alive():
+                raise BridgeError(503, "SERVICE_UNAVAILABLE", "The message is still being started. Retry to see it.",
+                                  {"Retry-After": "2"})
+            self._forget_nonce(key)                 # it ended without a run: a retry may start afresh
+            error = entry.get("outcome", {}).get("error")
             if isinstance(error, AssistantError):
                 raise error
             raise BridgeError(500, "INTERNAL_SERVER_ERROR", "The message could not be started.")
         journal, _ = self._journal(ctx, assistant, thread)
-        sent = journal.user_message_after(known_messages)
-        return {"taskId": run.task_id, "runId": run.run_id, "seq": sent["seq"] if sent else journal.head}
+        sent = journal.user_message_after(entry["known_messages"])
+        entry["result"] = {"taskId": run.task_id, "runId": run.run_id, "seq": sent["seq"] if sent else journal.head}
+        return entry["result"]
 
     def _threads_answer(self, ctx, inp):
         assistant = self._target(ctx, inp)
