@@ -3231,7 +3231,7 @@ class ControlPlaneRepo:
         if not prices:
             return {"configured": False}
         records, _, meta, _, _ = self._llm_window(window, filters)
-        return dict(meta, source=source, **usage_spend.estimate(records, prices))
+        return dict(meta, source=source, **usage_spend.estimate(records, prices, source))
 
     def llm_errors(self, window="24h", error_class=None, **filters):
         filters["source"] = "llm-proxy"   # a transcript carries no status, so it has no errors
