@@ -128,7 +128,7 @@ def test_no_google_connection_needed():
 @pytest.mark.parametrize("text,expected", [
     ("in 20 minutes", NOW + timedelta(minutes=20)),
     ("In 2 hours", NOW + timedelta(hours=2)),
-    ("in 3 days", NOW + timedelta(days=3)),
+    ("in 3 days", datetime(2026, 11, 2, 13, 0, tzinfo=UTC)),   # same wall clock across the Nov 1 change
     ("2026-11-02T15:00:00Z", datetime(2026, 11, 2, 15, tzinfo=UTC)),
     ("2026-11-02 15:00+02:00", datetime(2026, 11, 2, 13, tzinfo=UTC)),
     ("2026-11-02 15:00", datetime(2026, 11, 2, 23, tzinfo=UTC)),          # naive = the person's zone (PST)
@@ -384,3 +384,69 @@ def test_delete_refuses_a_cross_origin_request(server):
     with pytest.raises(urllib.error.HTTPError) as err:
         urllib.request.urlopen(req)
     assert err.value.code == 403
+
+
+# ------------------------------------------------------------------------------ review fixes: lazy load, DST, logs
+def test_a_failed_startup_load_is_retried_and_cap_waits_for_it():
+    db = FakeDb()
+    seed = ReminderStore(PostgresReminderPersistence("dsn", db.connect))
+    for _ in range(rm.MAX_PENDING_PER_PERSON):
+        seed.add("t", "u", "saved", NOW + timedelta(hours=1))
+    real, fail = db.connect, [True]
+
+    def flaky():
+        if fail[0] and not db.sql[-1:] == ["x"]:
+            raise OSError("down")
+        return real()
+    store = ReminderStore(PostgresReminderPersistence("dsn", flaky))
+    assert store.list("t", "u") == [] and store._loaded is False
+    with pytest.raises(ReminderError, match="unavailable"):
+        store.add("t", "u", "new", NOW + timedelta(hours=1))
+    assert store.due(NOW + timedelta(hours=2)) == []
+    fail[0] = False                                              # the database is back: the next tick loads it
+    assert len(store.due(NOW + timedelta(hours=2))) == rm.MAX_PENDING_PER_PERSON and store._loaded
+    with pytest.raises(ReminderError, match="too many"):
+        store.add("t", "u", "new", NOW + timedelta(hours=1))
+
+
+def test_dst_gap_and_ambiguous_local_times_ask_for_an_offset():
+    before = datetime(2026, 3, 1, 12, 0, tzinfo=UTC)
+    with pytest.raises(ReminderError, match="explicit offset"):
+        parse_when("2026-03-08 02:30", before, LA)               # skipped hour
+    with pytest.raises(ReminderError, match="explicit offset"):
+        parse_when("2026-11-01 01:30", NOW, LA)                  # happens twice
+    assert parse_when("2026-11-01T01:30:00-07:00", NOW, LA) == datetime(2026, 11, 1, 8, 30, tzinfo=UTC)
+    assert parse_when("2026-03-08 03:30", before, LA) == datetime(2026, 3, 8, 10, 30, tzinfo=UTC)
+    sat = datetime(2026, 3, 7, 12, 0, tzinfo=UTC)                # 04:00 PST Saturday
+    with pytest.raises(ReminderError, match="explicit offset"):
+        parse_when("tomorrow 02:30", sat, LA)
+
+
+def test_in_n_days_and_tomorrow_keep_the_wall_clock_across_a_clock_change():
+    sat = datetime(2026, 11, 1, 3, 0, tzinfo=UTC)                # 20:00 PDT on Oct 31
+    assert parse_when("in 2 days", sat, LA) == datetime(2026, 11, 3, 4, 0, tzinfo=UTC)   # 20:00 PST, not 19:00
+    assert parse_when("in 24 hours", sat, LA) == sat + timedelta(hours=24)
+    assert parse_when("tomorrow morning", sat, LA) == datetime(2026, 11, 1, 17, 0, tzinfo=UTC)   # 09:00 PST
+
+
+def test_invalid_timezone_warns_once_and_falls_back(caplog):
+    rm._WARNED_ZONES.clear()
+    with caplog.at_level("WARNING"):
+        assert rm.zone("Mars/Base") is UTC and rm.zone("Mars/Base") is UTC
+    assert caplog.text.count("not valid") == 1 and "Mars" not in caplog.text
+
+
+def test_push_collapse_id_is_per_reminder_and_unreachable_reminders_are_logged(make_server_p, caplog):  # noqa: F811
+    svr, api, token, bot, sender = rig(make_server_p)
+    api.ok("notifications/registerPush", {"token": TOKEN}, token)
+    user = svr.rakazo.accounts[0].principal_id
+    tenant = svr.assistant.tenant_for(user)
+    r1, r2 = (svr.reminders.add(tenant, user, t, NOW) for t in ("one", "two"))
+    svr._deliver_reminder(r1, False)
+    svr._deliver_reminder(r2, False)
+    assert wait_for(lambda: len(sender.sent) == 2)
+    assert sender.sent[0][0]["collapseId"] != sender.sent[1][0]["collapseId"]
+    lost = svr.reminders.add("t", "nobody", "TOPSECRET", NOW)
+    with caplog.at_level("WARNING"):
+        svr._deliver_reminder(lost, True)
+    assert "neither a phone nor the chat" in caplog.text and "TOPSECRET" not in caplog.text

@@ -51,10 +51,16 @@ class Reminder:
                 "created_at": self.created_at.astimezone(UTC).isoformat()}
 
 
+_WARNED_ZONES: set[str] = set()
+
+
 def zone(name: str | None) -> tzinfo:
     try:
         return ZoneInfo(name) if name else UTC
     except Exception:  # noqa: BLE001 - an unknown zone is UTC rather than a failure
+        if name not in _WARNED_ZONES:
+            _WARNED_ZONES.add(name)
+            log.warning("reminders: the configured timezone is not valid; using UTC")
         return UTC
 
 
@@ -84,9 +90,11 @@ def parse_when(text, now: datetime, tz: tzinfo = UTC) -> datetime:
     fire: datetime
     if (m := _REL.fullmatch(s)):
         n, unit = int(m.group(1)), m.group(2).lower()
-        delta = (timedelta(minutes=n) if unit.startswith("m") else timedelta(hours=n) if unit.startswith("h")
-                 else timedelta(days=n))
-        fire = now + delta
+        if unit.startswith("d"):          # calendar days keep the wall-clock time across a clock change
+            wall = local_now.replace(tzinfo=None) + timedelta(days=n)
+            fire = _at(wall.date(), wall.hour, wall.minute, tz, strict=False).replace(second=local_now.second)
+        else:
+            fire = now + (timedelta(minutes=n) if unit.startswith("m") else timedelta(hours=n))
     elif _MORNING.fullmatch(s):
         fire = _at(local_now.date() + timedelta(days=1), 9, 0, tz)
     elif (m := _DAY.fullmatch(s)):
@@ -100,8 +108,11 @@ def parse_when(text, now: datetime, tz: tzinfo = UTC) -> datetime:
             parsed = datetime.fromisoformat(s.replace("z", "Z"))
         except ValueError:
             raise ReminderError(UNCLEAR) from None
-        fire = parsed.replace(tzinfo=tz) if parsed.tzinfo is None else parsed
-        fire = fire.astimezone(UTC)
+        if parsed.tzinfo is None:
+            _check_local(parsed, tz)
+            fire = parsed.replace(tzinfo=tz)
+        else:
+            fire = parsed
     else:
         raise ReminderError(UNCLEAR)
     fire = fire.astimezone(UTC)
@@ -112,7 +123,22 @@ def parse_when(text, now: datetime, tz: tzinfo = UTC) -> datetime:
     return fire
 
 
-def _at(day, hour: int, minute: int, tz: tzinfo) -> datetime:
+DST_ASK = ("That local time is skipped or happens twice when the clocks change. Give an explicit offset, "
+           "e.g. '2026-11-01T01:30-07:00', or another time.")
+
+
+def _check_local(naive: datetime, tz: tzinfo) -> None:
+    """Refuse a wall-clock time in a clock-change gap (does not exist) or fold (happens twice)."""
+    naive = naive.replace(tzinfo=None)
+    first, second = naive.replace(tzinfo=tz, fold=0), naive.replace(tzinfo=tz, fold=1)
+    gap = first.astimezone(UTC).astimezone(tz).replace(tzinfo=None) != naive
+    if gap or first.utcoffset() != second.utcoffset():
+        raise ReminderError(DST_ASK)
+
+
+def _at(day, hour: int, minute: int, tz: tzinfo, strict: bool = True) -> datetime:
+    if strict:
+        _check_local(datetime(day.year, day.month, day.day, hour, minute), tz)
     return datetime(day.year, day.month, day.day, hour, minute, tzinfo=tz)
 
 
@@ -160,21 +186,36 @@ def _utc(value: datetime) -> datetime:
 
 
 class ReminderStore:
-    """Memory is the working copy; Postgres (when given) is the authority for the fired/cancelled transitions."""
+    """Memory is the working copy; Postgres (when given) is the authority for the fired/cancelled transitions.
+
+    Deployment model: ONE control-plane instance. ``due``, ``list`` and ``cancel`` read the memory loaded from the database
+    (so a second instance would not see the first one's new reminders); ``mark_fired`` is atomic in the database, so a
+    brief overlap of two instances still fires each reminder once."""
 
     def __init__(self, persistence=None, clock: Callable[[], datetime] = lambda: datetime.now(UTC)):
         self._p, self._clock, self._lock = persistence, clock, threading.Lock()
         self._rows: dict[str, Reminder] = {}
-        if persistence is not None:
-            try:
-                for r in persistence.load():
-                    self._rows[r.id] = r
-            except Exception:  # noqa: BLE001 - start empty; the log says only that loading failed
-                log.warning("reminders: saved reminders could not be loaded")
+        self._loaded = persistence is None
+        self._load()
+
+    def _load(self) -> bool:
+        """Read the saved reminders once. A failure is retried on the next tick, add or list, so a database that is down at
+        startup does not lose the pending reminders in it."""
+        if self._loaded:
+            return True
+        try:
+            for r in self._p.load():
+                self._rows.setdefault(r.id, r)
+            self._loaded = True
+        except Exception:  # noqa: BLE001
+            log.warning("reminders: saved reminders could not be loaded")
+        return self._loaded
 
     def add(self, tenant: str, user: str, text: str, fire_at: datetime) -> Reminder:
         text = clean_text(text)
         with self._lock:
+            if not self._load():
+                raise ReminderError("Reminders are unavailable right now; nothing was set.")
             if sum(1 for r in self._rows.values() if r.tenant == tenant and r.user == user and r.state == "pending") >= MAX_PENDING_PER_PERSON:
                 raise ReminderError("You have too many pending reminders; cancel one first.")
             r = Reminder("rem_" + secrets.token_hex(8), tenant, user, text, fire_at.astimezone(UTC), "pending",
@@ -190,6 +231,7 @@ class ReminderStore:
 
     def due(self, now: datetime) -> list[Reminder]:
         with self._lock:
+            self._load()
             return sorted((r for r in self._rows.values() if r.state == "pending" and r.fire_at <= now),
                           key=lambda r: r.fire_at)
 
@@ -227,6 +269,7 @@ class ReminderStore:
 
     def list(self, tenant: str, user: str) -> list[Reminder]:
         with self._lock:
+            self._load()
             mine = [r for r in self._rows.values() if r.tenant == tenant and r.user == user]
         pending = sorted((r for r in mine if r.state == "pending"), key=lambda r: r.fire_at)
         fired = sorted((r for r in mine if r.state == "fired"), key=lambda r: r.fire_at, reverse=True)

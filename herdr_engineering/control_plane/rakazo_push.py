@@ -172,7 +172,7 @@ class PushNotifier:
         self._q.put(None)
 
     def notify(self, account_id: str, key: str, title: str, body: str, *, kind: str = "help",
-               priority: str = "urgent") -> bool:
+               priority: str = "urgent", collapse_id: str | None = None) -> bool:
         """True when queued. False when off, no device is registered, already notified, held for quiet hours, or full."""
         if not self.enabled or not self.registry.tokens(account_id):
             return False
@@ -185,7 +185,7 @@ class PushNotifier:
             while len(self._seen) > SEEN_LIMIT:
                 self._seen.pop(next(iter(self._seen)))
         try:
-            self._q.put_nowait((account_id, title, body, kind))
+            self._q.put_nowait((account_id, title, body, kind, collapse_id))
         except queue.Full:
             self.counters["dropped"] += 1
             return False
@@ -210,14 +210,14 @@ class PushNotifier:
                 self.counters["failed"] += 1
                 log.warning("rakazo push: a notification could not be sent")
 
-    def deliver(self, account_id: str, title: str, body: str, kind: str) -> None:
+    def deliver(self, account_id: str, title: str, body: str, kind: str, collapse_id: str | None = None) -> None:
         tokens = self.registry.tokens(account_id)
         target = self._target(account_id) or {}
         if not tokens or not target:
             return
         data = {"kind": kind, "deliveryId": uuid.uuid4().hex, **target}
         messages = [{"to": t, "title": _cap(title, MAX_TITLE), "body": _cap(body, MAX_BODY), "data": data,
-                     "collapseId": target.get("threadId"), "sound": "default"} for t in tokens]
+                     "collapseId": collapse_id or target.get("threadId"), "sound": "default"} for t in tokens]
         try:
             tickets = self._sender.send(messages)
         except OSError as exc:

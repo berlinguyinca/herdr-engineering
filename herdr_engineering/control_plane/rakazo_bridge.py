@@ -1126,7 +1126,7 @@ class RakazoBridge:
             for account in self.accounts:
                 if account.principal_id == user and self.svc.tenant_for(account.principal_id) == tenant:
                     if self.push.notify(account.account_id, f"{key}:{account.account_id}", title, body, kind="reminder",
-                                        priority=priority):
+                                        priority=priority, collapse_id=key):
                         queued += 1
         except Exception:  # noqa: BLE001
             log.warning("rakazo push: a person notification could not be queued")

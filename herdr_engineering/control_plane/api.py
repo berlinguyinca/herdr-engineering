@@ -1425,16 +1425,19 @@ class ControlPlaneServer:
         if late:
             when = reminder.fire_at.astimezone(UTC).strftime("%Y-%m-%d %H:%M UTC")
             body = "(late, was due " + when + ") " + body
-            chat += "\n(This was due at " + when + " and is late because the server was not running then.)"
+            chat += "\n(This was due at " + when + "; it fired late.)"
         pushed = 0
         if self.rakazo is not None:
             pushed = self.rakazo.notify_person(reminder.tenant, reminder.user, title, body,
                                                priority="urgent", key=f"reminder:{reminder.id}")
+        chatted = False
         try:
-            self.assistant.post_reminder_message(tenant_id=reminder.tenant, user_id=reminder.user, content=chat,
-                                                 provenance=f"reminder:{reminder.id}")
+            chatted = self.assistant.post_reminder_message(tenant_id=reminder.tenant, user_id=reminder.user, content=chat,
+                                                           provenance=f"reminder:{reminder.id}")
         except Exception:  # noqa: BLE001
             log.warning("reminders: the chat message could not be added")
+        if not pushed and not chatted:
+            log.warning("reminders: a fired reminder reached neither a phone nor the chat")
         return pushed
 
     def _build_assistant_apps(self, dsn):
