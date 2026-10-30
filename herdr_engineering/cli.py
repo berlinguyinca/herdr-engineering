@@ -166,15 +166,15 @@ def _build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=_cmd_capabilities)
 
     # relay ----------------------------------------------------------------
-    p = sub.add_parser("relay", help="Outbound bridge that joins a collaboration room as an external agent (Telegram)")
+    p = sub.add_parser("relay", help="Join a collaboration room as an external agent (outbound bridges build on this)")
     rsub = p.add_subparsers(dest="relay_command", required=True)
     rp = rsub.add_parser("join", help="redeem a one-time invite code (read from a file or stdin, never an argument)")
     rp.add_argument("--config", required=True)
     rp.add_argument("--code-file", help="file holding the invite code; default is stdin")
     rp.set_defaults(func=_cmd_relay_join)
-    rp = rsub.add_parser("run", help="bridge the provider and the room until revoked")
+    rp = rsub.add_parser("status", help="show the room, agent, rights and expiry from the state file")
     rp.add_argument("--config", required=True)
-    rp.set_defaults(func=_cmd_relay_run)
+    rp.set_defaults(func=_cmd_relay_status)
     # bridge ---------------------------------------------------------------
     p = sub.add_parser("bridge", help="Rakazo mobile bridge helpers (control_plane.rakazo_bridge)")
     bsub = p.add_subparsers(dest="bridge_command", required=True)
@@ -3701,12 +3701,15 @@ def _cmd_relay_join(args):
     return 0
 
 
-def _cmd_relay_run(args):
+def _cmd_relay_status(args):
+    import time
+
     from .external_bridge import config as bcfg
     from .external_bridge.client import BridgeClient
-    from .external_bridge.relay import Relay
-    cfg = bcfg.load(args.config)
-    Relay(BridgeClient(cfg["state_file"]), bcfg.build_adapter(cfg)).run()
+    client = BridgeClient(bcfg.load(args.config)["state_file"])
+    left = int(client.state["expires_at"] - time.time())
+    print(f"room {client.room_id}, agent {client.agent_id}, can post: {client.can_post}, "
+          f"invite expires in {left // 3600} h" if left > 0 else "the invite has expired; ask the room owner for a new one")
     return 0
 
 

@@ -173,8 +173,8 @@ Every member of `required_group` gets the `operator` role (the only role impleme
 ### Update 10
 
 Outside systems join through the existing external-agent path instead of provider code in the control plane (see
-`docs/operations/external-bridges.md`): a reference client, a relay loop and a Telegram adapter (`herdr_engineering/external_bridge/`,
-`herdr-eng relay join|run`). In the app, the sponsor's external agents already appear as agent bots; they now report online while
+`docs/operations/external-bridges.md`): a reference client and a relay loop (`herdr_engineering/external_bridge/`,
+`herdr-eng relay join|status`); no provider adapter ships yet. In the app, the sponsor's external agents already appear as agent bots; they now report online while
 their heartbeat is fresh (`list_my_agents.online`), and `messaging/status`, `messaging/installations/list` and
 `messaging/installations/remove` list and revoke them. `messaging/installations/start` stays refused: the invite code is a
-one-time secret created in the dashboard, not a URL. Slack, voice and desktop hosts would be further adapters on the same client.
+one-time secret created in the dashboard, not a URL. Any provider, voice or desktop host would be an adapter on the same client.

@@ -1,44 +1,32 @@
-# External bridges (Telegram first)
+# External bridges
 
-A bridge is a small process that joins ONE collaboration room as an external agent (`external-agents.md`) and relays chat
-between that room and an outside system. It is outbound-only, holds the provider's secret itself, and shows up in the
-Rakazo app as an agent bot (tagged "external") and as a messaging installation. The control plane stores no provider
-secret and has no provider code.
+A bridge is a small outbound-only process that joins ONE collaboration room as an external agent (`external-agents.md`) and
+relays chat between that room and an outside system. It holds any provider secret itself; the control plane stores none and
+has no provider code. In the Rakazo app the bridge shows up as an agent bot (tagged "external", running while its heartbeat is
+fresh) and as a messaging installation that can be listed and revoked.
 
-## Set up Telegram
-1. Create a bot with BotFather and save its token in a file only you can read (`chmod 600`). Find the numeric chat id(s)
-   that may be bridged.
-2. A room owner creates an invite with `post` allowed (dashboard: Tabs > Invite a remote agent, or
-   `POST /api/v1/collab/rooms/{room}/externals/invites`). Put the one-time `hcj_...` code in a file or pipe it to stdin;
-   it is never an argument.
-3. Write the bridge config (YAML only, no environment variables):
+No provider adapter ships yet. What exists is the generic part, in `herdr_engineering/external_bridge/`:
+- `client.py`: `BridgeClient` joins with the invite code, sends heartbeats, reads room chat from a cursor, posts
+  (idempotent per key) and replaces its secret daily. State, including the credential, is one file kept mode 0600.
+- `relay.py`: `Relay` moves messages both ways through an `Adapter` (`name`, `poll(timeout) -> list[Inbound]`, `send(text)`),
+  never echoes its own posts, drops inbound messages when the invite is read-only, and stops on a 401/403.
+- `config.py`: YAML only (`control_plane_url`, `state_file`) and `read_secret()` for provider tokens kept in 0600 files.
 
-       control_plane_url: https://local.metabolomics.us
-       state_file: /var/lib/herdr-bridge/telegram.json      # holds the credential: kept mode 0600
-       telegram:
-         token_file: /etc/herdr-bridge/telegram.token
-         chat_ids: [123456789]                              # ONLY these chats are bridged
+## Join
+A room owner creates an invite (dashboard: Tabs > Invite a remote agent, or
+`POST /api/v1/collab/rooms/{room}/externals/invites`), with `post` allowed if the bridge should speak. Then:
 
-4. `herdr-eng relay join --config bridge.yaml --code-file code.txt`, then `herdr-eng relay run --config bridge.yaml`
-   (run it under systemd; it exits on a 401/403, meaning revoked or expired).
+    herdr-eng relay join --config bridge.yaml --code-file code.txt      # or pipe the code on stdin; never an argument
+    herdr-eng relay status --config bridge.yaml
 
-## Behaviour
-- Telegram text from an allowed chat is posted to the room as `[telegram] <name>: <text>` (idempotent per update id, so a
-  retry never double-posts). Other chats are ignored. The name is a label, not an identity the room trusts.
-- Room chat from anyone else is sent to the chat as `user:<id>: <text>`; the bridge's own posts are never echoed back.
-- A read-only invite drops inbound Telegram messages (logged) and still relays room chat out.
-- Presence: a heartbeat every 30 s (the app shows the bot as running). The secret is rotated daily.
-- Revoke from the app (Settings > messaging installations > remove) or the dashboard: the next request is a 401.
+where `bridge.yaml` is `control_plane_url: https://...` and `state_file: /path/state.json`.
 
-## Limits worth knowing
-- Rotation does not extend the invite: credentials live at most 7 days (`credential_ttl_seconds`), so a long-running bridge
-  needs a fresh invite weekly. The relay logs a warning in the last day. If that is too short, raising the cap is a
-  deliberate change to `collab_external.py`, not a bridge setting.
-- External agents are chat-only: no tasks, shell, files or terminal. A bridge cannot be told to "do" something.
-- A room holds at most 25 externals, and an owner can create 10 invites an hour.
-- Not exercised against the real Telegram API yet; the tests use a fake Bot API against a real control plane.
+## Limits
+- Rotation does not extend the invite: credentials live at most 7 days, so a long-running bridge needs a fresh invite weekly.
+  The relay logs a warning in the last day. Raising the cap is a deliberate change in `collab_external.py`.
+- External agents are chat-only: no tasks, shell, files or terminal, and nothing from before they joined.
+- A room holds at most 25 externals; an owner can create 10 invites an hour.
 
-## Adding another provider
-Implement `Adapter` (`name`, `poll(timeout) -> list[Inbound]`, `send(text)`) in `herdr_engineering/external_bridge/` and
-register it in `config.py`. Voice and desktop hosts fit the same shape: the host does speech-to-text and text-to-speech
-itself and exchanges text with the room.
+## Adding a provider
+Write an adapter for the system you want (it decides which outside senders are allowed and how text is delivered), build
+`Relay(BridgeClient(state_file), adapter).run()` around it, and keep its secrets in files read with `read_secret()`.
