@@ -849,6 +849,8 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                 "status": "pending", "result": None, "depth": p["depth"], "parent": p.get("parent_task_id"),
                 "created_at": p["created_at"], "created_epoch": p["created_epoch"],
                 "updated_at": p["created_at"], "seq": seq}
+            if p.get("reviews_task_id"):
+                self._tasks[p["task_id"]]["reviews"] = p["reviews_task_id"]
             if p.get("bounds"):          # T11: a bounded delegation is this same task plus its bounds
                 self._tasks[p["task_id"]].update(bounds=p["bounds"], version=1, steps=0, tokens=0, proposals=0, turns=0)
                 if p.get("idempotency_key"):
@@ -4280,7 +4282,8 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
         gives work to ONE agent that the owner approved with "execute"."""
         with self._lock:
             room, _ = self._authorize(pr, room_id, "instruct" if pr.is_agent else "task", "task.create")
-            bad = [k for k in body if k not in ("target_agent_id", "text", "parent_task_id", "idempotency_key")]
+            bad = [k for k in body if k not in ("target_agent_id", "text", "parent_task_id", "idempotency_key",
+                                                "reviews_task_id")]
             if bad:
                 raise CollabError(400, "unknown field")
             tid_ = body.get("target_agent_id")
@@ -4290,12 +4293,17 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                 raise CollabError(404, "no such agent in this room")     # same answer for every miss
             if pr.is_agent and tid_ == pr.id:
                 raise CollabError(400, "an agent cannot give itself work")
+            reviews = body.get("reviews_task_id")
+            if reviews is not None:
+                self._check_independent_review(pr, room_id, tid_, reviews)
             text = self._task_text(body.get("text"), "text")
             ikey = body.get("idempotency_key")
             if ikey is not None and (not isinstance(ikey, str) or not _KEY_RE.match(ikey)):
                 raise CollabError(400, "invalid idempotency_key")
+            # the digest is unchanged for a task that reviews nothing, so existing keys keep their meaning
+            fp = _digest(json.dumps([room_id, tid_, text] + ([reviews] if reviews is not None else [])))
             if ikey is not None and (prior := self._idem.get((pr.key, room_id, "task:" + ikey))):
-                if prior[0] != _digest(json.dumps([room_id, tid_, text])):
+                if prior[0] != fp:
                     raise CollabError(409, "idempotency_key already used for a different task")
                 return {"task_id": prior[1], "status": "pending", "replayed": True}
             depth, parent, root = 0, body.get("parent_task_id"), pr.owner
@@ -4327,10 +4335,24 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                 target_agent_id=tid_, text=text, depth=depth, parent_task_id=parent,
                 created_by_kind=pr.kind, created_by_id=pr.id, created_epoch=now, root_user_id=root,
                 visibility_scope="room", action="task.create", outcome="allowed",
-                project_ids=[room["project_id"]], resource_id=task_id))
+                project_ids=[room["project_id"]], resource_id=task_id,
+                **({"reviews_task_id": reviews} if reviews is not None else {})))
             if ikey is not None:
-                self._idem[(pr.key, room_id, "task:" + ikey)] = (_digest(json.dumps([room_id, tid_, text])), task_id)
+                self._idem[(pr.key, room_id, "task:" + ikey)] = (fp, task_id)
         return {"task_id": task_id, "status": "pending", "event": self._view(ev)}
+
+    def _check_independent_review(self, pr: Principal, room_id: str, reviewer_id: str | None, reviews: Any) -> None:
+        """P05: a review task must be independent of the work it reviews. The reviewer is not the agent that did the
+        work, not the agent that handed the work out, and an agent cannot pick the reviewer of its own work."""
+        work = self._tasks.get(reviews) if isinstance(reviews, str) else None
+        if not work or work["room_id"] != room_id:
+            raise CollabError(404, "no such task in this room")
+        if reviewer_id == work["target"]:
+            raise CollabError(400, "a reviewer must not be the agent that did the work")
+        if work["by_kind"] == "agent" and reviewer_id == work["by_id"]:
+            raise CollabError(400, "a reviewer must not be the agent that handed out the work")
+        if pr.is_agent and pr.id == work["target"]:
+            raise CollabError(400, "an agent cannot choose the reviewer of its own work")
 
     def _grant_expiry(self, body: dict) -> float:
         """Every agent grant lapses: the owner may pick a date (up to a year), else the default."""

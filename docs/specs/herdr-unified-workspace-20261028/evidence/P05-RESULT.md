@@ -16,6 +16,9 @@ execution does not leak privileges; task result links back to room/project/issue
 Mutation check: removing the token fence, the origin check, reviewer independence, or lease revocation on completion
 each fails a test (run by hand, then restored).
 
+## Wired: independent review at the real task chokepoint
+`CollabService.create_task` takes `reviews_task_id` and enforces reviewer independence against the room's real task records (`tests/control_plane/test_collab_review_independence.py`, 7 tests; each of the three rules mutation-checked; 1,626 collab tests pass). Not yet: the work graph does not draw a `reviews` edge from it, and the lease store is not used by accept/complete.
+
 ## Durable leases (migration 0040, `team_task_leases_pg.py`)
 The lease contract also runs against Postgres (`tests/control_plane/test_team_task_leases_pg.py`, 5 tests incl. a 12-way concurrent acquire with exactly one winner). Mutation check: making takeover unconditional fails 3 of 5. Rollback: `DROP TABLE team_task_leases` (see the migration's `-- DOWN:`).
 
