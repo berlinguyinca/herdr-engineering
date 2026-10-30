@@ -179,10 +179,11 @@ services:
     volumes:
       - ${HERDR_CP_FLEET_DIR:?run deploy.sh}:/etc/herdr/fleet:ro
       # Share housekeeping (control_plane.share): the expiry sweep removes bundles (rw), the audit ingest reads
-      # share-public's events file (read-only: the container's own directory), and keeps its offset marker in a
-      # volume only the worker mounts (control_plane.share.marker_dir), so the public side cannot rewind it.
+      # share-public's events file and rotates it (rw: rename to events.jsonl.1, deleted once drained; it opens
+      # only regular files, never through a symlink share-public could plant), and keeps its offset markers in a
+      # volume only the worker mounts (control_plane.share.marker_dir), so the public side cannot rewind them.
       - ${HERDR_SHARES_DIR:?run deploy.sh}:/shares
-      - ${HERDR_SHARE_EVENTS_DIR:?run deploy.sh}:/share-events:ro
+      - ${HERDR_SHARE_EVENTS_DIR:?run deploy.sh}:/share-events
       - herdr-cp-share-markers:/var/lib/herdr/share-markers
     environment:
       HERDR_ENGINEERING_CONFIG: /app/control-plane/config.yaml

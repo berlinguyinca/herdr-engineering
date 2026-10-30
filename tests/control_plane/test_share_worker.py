@@ -96,6 +96,36 @@ def test_events_ingested_then_zero(share_postgres, tmp_path):
     run(share_postgres, body)
 
 
+def test_housekeeping_rotates_the_events_file(share_postgres, tmp_path, monkeypatch):
+    """share-public stops appending at its cap; the worker must rotate the file so a busy link cannot silence audit."""
+    from herdr_engineering.control_plane import artifact_shares
+    monkeypatch.setattr(artifact_shares, "EVENTS_ROTATE_BYTES", 300)
+
+    async def body(store, conn):
+        sid, _ = await live_share(store, conn, tmp_path / "shares")
+        d = tmp_path / "share-events"
+        d.mkdir()
+        events, rotated = d / "events.jsonl", d / "events.jsonl.1"
+        marker = tmp_path / "markers" / "m.json"
+        marker.parent.mkdir()
+
+        def lines(start, count):
+            return "".join(json.dumps({"share_id": sid, "kind": "opened", "actor": "a@x.org",
+                                       "at": datetime.now(UTC).isoformat(), "detail": {"n": start + i}}) + "\n"
+                           for i in range(count))
+        events.write_text(lines(0, 5))
+        t = time.time()
+        out = await share_housekeeping(store, tmp_path / "shares", events, t, marker_path=marker)
+        assert out["ingested"] == 5 and rotated.exists() and not events.exists()
+        events.write_text(lines(5, 1))
+        os.utime(rotated, (t - 3600, t - 3600))
+        out = await share_housekeeping(store, tmp_path / "shares", events, t + 60, marker_path=marker)
+        assert out["ingested"] == 1 and not rotated.exists()
+        ns = [e["detail"]["n"] for e in await store.events(sid, limit=100) if e["kind"] == "opened"]
+        assert sorted(ns) == list(range(6))
+    run(share_postgres, body)
+
+
 def test_missing_dirs_are_not_errors(share_postgres, tmp_path):
     async def body(store, conn):
         out = await share_housekeeping(store, tmp_path / "nope", tmp_path / "nope" / "e.jsonl", time.time())

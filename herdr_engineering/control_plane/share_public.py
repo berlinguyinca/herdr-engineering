@@ -228,8 +228,11 @@ class RateLimiter:
 class EventLog:
     """Append-only JSONL audit lines for the worker's ingest: one ``os.write`` per line under ``O_APPEND``.
 
-    Over ``EVENTS_MAX_BYTES`` lines are dropped and counted (never rotated: the ingest's marker is keyed to the file's
-    content). Lines only ever carry the share id, a kind, an actor, a timestamp and fixed reason codes or index names.
+    The path is opened (``O_CREAT``) per line, so when the worker rotates the file (renames it to ``events.jsonl.1``
+    once ingested past ``artifact_shares.EVENTS_ROTATE_BYTES``) the next line starts a fresh file. Over
+    ``EVENTS_MAX_BYTES`` (only reached when the worker is not rotating) lines are dropped and counted, with a
+    rate-limited warning. Lines only ever carry the share id, a kind, an actor, a timestamp and fixed reason codes or
+    index names.
     """
 
     def __init__(self, path: Path, now: Callable[[], float]):

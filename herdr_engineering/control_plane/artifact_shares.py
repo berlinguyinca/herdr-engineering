@@ -14,7 +14,8 @@ Conventions:
   ``by-token/<hash>`` projection path from it).  Every other method returns rows WITHOUT it.
 * The token itself never reaches this module; ``new_token`` returns it once for the caller to show.
 * ``ingest_events_file`` consumes the append-only ``events.jsonl`` written by the database-free (untrusted) share
-  container.  The file is never truncated (the container may be appending concurrently).  A marker file records
+  container.  The file is never truncated in place (the container may be appending concurrently); the worker rotates
+  it with ``ingest_and_rotate_events`` (rename to ``.1``, drained and deleted on a later sweep).  A marker file records
   ``{offset, fingerprint}`` of the consumed prefix; the fingerprint hashes the first and last bytes of that prefix, so a
   file that was deleted/recreated (even with a reused inode) or rewritten is detected and re-read from 0.  Every
   inserted row carries ``ingest_key = sha256(line):<offset>`` under a unique index, so replays (crash before the marker
@@ -31,7 +32,9 @@ import json
 import os
 import re
 import secrets
+import stat
 import tempfile
+import time
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -55,6 +58,13 @@ _MAX_LINE_BYTES = 16 * 1024
 _MAX_DETAIL_BYTES = 4096
 _MAX_ACTOR_CHARS = 200
 _FINGERPRINT_BYTES = 64
+# The worker renames events.jsonl to events.jsonl.1 once this much of it is ingested (share-public stops appending at
+# its own 8 MiB cap, so this must stay well under that).  The renamed file is deleted only once fully read AND not
+# written for ROTATED_GRACE_SECONDS: share-public opens the path per append, so a writer that opened the old inode
+# just before the rename can still land one line in it.
+EVENTS_ROTATE_BYTES = 4 * 1024 * 1024
+ROTATED_GRACE_SECONDS = 30.0
+_INGEST_ROUNDS = 64
 # The share container writes the events file, so it may only report what it observed; the lifecycle kinds
 # (created/approved/revoked/expired) are written by this store alone.
 INGESTIBLE_KINDS = ("opened", "denied")
@@ -266,15 +276,86 @@ class ShareStore:
         See the module docstring for the offset/fingerprint/idempotency design and why ``marker_path`` exists.
         Invalid lines (bad JSON, NUL/surrogates, forbidden kind, missing fields, unknown share_id, oversize) are
         skipped but consumed.  A line of at least ``_MAX_INGEST_BYTES`` without a newline is skipped through its end.
+        Only a regular file is read: a symlink or FIFO planted in the (public-writable) events directory is ignored.
         """
         path = Path(path)
         marker = Path(marker_path) if marker_path is not None else path.with_name(path.name + ".offset")
+        return (await self._ingest_once(path, marker))[0]
+
+    async def ingest_and_rotate_events(self, path: Path, *, marker_path: Path | None = None,
+                                       rotate_bytes: int | None = None, now: float | None = None,
+                                       grace: float | None = None) -> int:
+        """Ingest ``path`` (and a pending ``path.1``) and rotate ``path`` once ``rotate_bytes`` of it are consumed.
+
+        Per call: (1) a leftover ``.1`` (previous rotation, or a crash) is read to its end with its own marker; it is
+        deleted, then its marker, only when no complete line remains and it was not written for ``grace`` seconds.
+        (2) ``path`` is ingested as by ``ingest_events_file``.  (3) Only when no ``.1`` exists and at least
+        ``rotate_bytes`` of ``path`` were consumed, ``path`` is renamed to ``.1`` and its marker moved along (the bytes,
+        offsets and fingerprint are unchanged), so the rest is drained by (1) on a later call, never in the call that
+        renamed it.  Every step is crash-safe: a missing or stale marker re-reads from 0 and the ``ingest_key``
+        unique index (sha256(line):offset, preserved by the rename) drops the replays.  Returns rows inserted.
+        """
+        path = Path(path)
+        marker = Path(marker_path) if marker_path is not None else path.with_name(path.name + ".offset")
+        rotated = path.with_name(path.name + ".1")
+        rotated_marker = marker.with_name(marker.stem + ".rotated" + marker.suffix)
+        now = time.time() if now is None else now
+        rotate_bytes = EVENTS_ROTATE_BYTES if rotate_bytes is None else rotate_bytes
+        grace = ROTATED_GRACE_SECONDS if grace is None else grace
+        inserted = 0
+        if os.path.lexists(rotated):
+            count, drained, _, mtime = await self._drain(rotated, rotated_marker)
+            inserted += count
+            if mtime is None or (drained and now - mtime >= grace):   # not a regular file, or fully read and quiet
+                try:
+                    os.unlink(rotated)
+                    rotated_marker.unlink(missing_ok=True)
+                except OSError:
+                    pass                                                # a planted directory: left alone
+        count, _, offset, mtime = await self._drain(path, marker)
+        inserted += count
+        if mtime is not None and offset >= rotate_bytes and not os.path.lexists(rotated):
+            os.rename(path, rotated)
+            try:
+                os.replace(marker, rotated_marker)
+            except FileNotFoundError:
+                pass
+        return inserted
+
+    async def _drain(self, path: Path, marker: Path) -> tuple[int, bool, int, float | None]:
+        inserted, drained, offset, mtime = 0, False, 0, None
+        for _ in range(_INGEST_ROUNDS):
+            count, drained, offset, mtime = await self._ingest_once(path, marker)
+            inserted += count
+            if drained or mtime is None:
+                break
+        return inserted, drained, offset, mtime
+
+    @staticmethod
+    def _open_regular(path: Path):
+        """A read handle on ``path`` when it is a regular file (never through a symlink, never blocking on a FIFO)."""
         try:
-            handle = path.open("rb")
-        except FileNotFoundError:
-            return 0
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+        except OSError:
+            return None
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                os.close(fd)
+                return None
+        except OSError:
+            os.close(fd)
+            return None
+        return os.fdopen(fd, "rb")
+
+    async def _ingest_once(self, path: Path, marker: Path) -> tuple[int, bool, int, float | None]:
+        """One bounded pass: ``(inserted, drained, consumed_offset, mtime)``; mtime None when ``path`` is not a
+        regular file.  ``drained``: no complete line is left after the consumed offset (a torn tail may remain)."""
+        handle = self._open_regular(path)
+        if handle is None:
+            return 0, True, 0, None
         with handle:
-            size = os.fstat(handle.fileno()).st_size
+            st = os.fstat(handle.fileno())
+            size, mtime = st.st_size, st.st_mtime
             offset, skipping = self._read_marker(marker, handle, size)
             handle.seek(offset)
             chunk = handle.read(_MAX_INGEST_BYTES)
@@ -307,11 +388,12 @@ class ShareStore:
                 consumed = end
             elif end == 0 and start == 0 and full:  # one huge line with no newline: skip it
                 consumed, skipping = len(chunk), True
+            drained = not full and b"\n" not in chunk[consumed:]
             if consumed == 0 and not skipping:
-                return 0
+                return 0, drained, offset, mtime
             new_offset = offset + consumed
             self._write_marker(marker, handle, new_offset, skipping)
-        return inserted
+        return inserted, drained, new_offset, mtime
 
     @staticmethod
     def _clean(value: Any) -> bool:

@@ -6,6 +6,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -330,3 +331,124 @@ def test_migration_up_and_down_names():
     assert "token_hash" in text and "'pending', 'live', 'revoked'" in text
     assert not re.findall(r"CREATE (?:UNIQUE )?INDEX (?!IF NOT EXISTS)", text)
     assert not re.findall(r"CREATE TABLE (?!IF NOT EXISTS)", text)
+
+
+# ---------------------------------------------------------------------------- events file rotation (worker side)
+
+def _gen_lines(sid, gen, start, count):
+    """Distinct per generation: identical bytes at an identical offset would legitimately dedupe."""
+    return "".join(line(sid, n=start + i, gen=gen) for i in range(count))
+
+
+def _ns(evs):
+    return sorted(e["detail"]["n"] for e in evs if e["kind"] == "opened")
+
+
+def test_rotation_renames_over_threshold_and_drains_the_rest_later(share_postgres, tmp_path):
+    async def body(store, conn):
+        aid, vid = await seed(conn)
+        sid = (await store.create(**kw(aid, vid)))["share_id"]
+        d = tmp_path / "events"
+        d.mkdir()
+        f, rotated = d / "events.jsonl", d / "events.jsonl.1"
+        marker = tmp_path / "private" / "events.marker.json"
+        marker.parent.mkdir()
+        f.write_text(_gen_lines(sid, 1, 0, 30))
+        t0 = 1_000_000.0
+        # under the threshold: ingested, not rotated
+        assert await store.ingest_and_rotate_events(f, marker_path=marker, rotate_bytes=10 ** 6, now=t0) == 30
+        assert f.exists() and not rotated.exists()
+        # over the threshold: everything read, then renamed (the marker follows the bytes)
+        with f.open("a") as fh:
+            fh.write(_gen_lines(sid, 1, 30, 10))
+        assert await store.ingest_and_rotate_events(f, marker_path=marker, rotate_bytes=100, now=t0) == 10
+        assert rotated.exists() and not f.exists()
+        # a writer that had the old inode open appends after the rename; share-public's next append creates a
+        # new file (O_CREAT per append)
+        with rotated.open("a") as fh:
+            fh.write(_gen_lines(sid, 1, 40, 2))
+        f.write_text(_gen_lines(sid, 2, 100, 5))
+        os.utime(rotated, (t0, t0))
+        # the late lines of .1 and the new file are both ingested; .1 is old enough to delete
+        assert await store.ingest_and_rotate_events(f, marker_path=marker, rotate_bytes=10 ** 6, now=t0 + 3600) == 7
+        assert not rotated.exists() and f.exists()
+        assert not any(p.name.startswith("events.marker") and ".rotated" in p.name for p in marker.parent.iterdir())
+        assert await store.ingest_and_rotate_events(f, marker_path=marker, rotate_bytes=10 ** 6, now=t0 + 3601) == 0
+        assert _ns(await store.events(sid, limit=1000)) == list(range(42)) + list(range(100, 105))
+    run(share_postgres, body)
+
+
+def test_rotated_file_is_kept_while_recently_written(share_postgres, tmp_path):
+    async def body(store, conn):
+        aid, vid = await seed(conn)
+        sid = (await store.create(**kw(aid, vid)))["share_id"]
+        f, rotated = tmp_path / "events.jsonl", tmp_path / "events.jsonl.1"
+        marker = tmp_path / "m.json"
+        f.write_text(_gen_lines(sid, 1, 0, 5))
+        now = time.time()
+        assert await store.ingest_and_rotate_events(f, marker_path=marker, rotate_bytes=10, now=now) == 5
+        assert rotated.exists()
+        # same sweep time: the rename just happened, a writer may still hold the old inode
+        assert await store.ingest_and_rotate_events(f, marker_path=marker, rotate_bytes=10, now=now) == 0
+        assert rotated.exists()
+        with rotated.open("a") as fh:
+            fh.write(_gen_lines(sid, 1, 5, 1))
+        assert await store.ingest_and_rotate_events(f, marker_path=marker, rotate_bytes=10, now=now + 1) == 1
+        assert rotated.exists()
+        # no second rotation while .1 is pending, even over the threshold
+        f.write_text(_gen_lines(sid, 2, 50, 3))
+        assert await store.ingest_and_rotate_events(f, marker_path=marker, rotate_bytes=10, now=now + 2) == 3
+        assert f.exists() and rotated.exists()
+        assert _ns(await store.events(sid, limit=1000)) == [0, 1, 2, 3, 4, 5, 50, 51, 52]
+    run(share_postgres, body)
+
+
+def test_crash_leftovers_are_drained_without_duplicates(share_postgres, tmp_path):
+    async def body(store, conn):
+        aid, vid = await seed(conn)
+        sid = (await store.create(**kw(aid, vid)))["share_id"]
+        f, rotated = tmp_path / "events.jsonl", tmp_path / "events.jsonl.1"
+        marker = tmp_path / "m.json"
+        f.write_text(_gen_lines(sid, 1, 0, 8))
+        assert await store.ingest_events_file(f, marker_path=marker) == 8
+        # crash right after the rename, before the marker moved: .1 has no marker of its own
+        os.rename(f, rotated)
+        f.write_text(_gen_lines(sid, 2, 20, 2) + '{"share_id": "torn')
+        old = time.time() - 3600
+        os.utime(rotated, (old, old))
+        assert await store.ingest_and_rotate_events(f, marker_path=marker, rotate_bytes=10 ** 6) == 2
+        assert not rotated.exists()
+        assert _ns(await store.events(sid, limit=1000)) == list(range(8)) + [20, 21]
+        # crash after .1 was deleted but before its marker was: a stale rotated marker never skips new bytes
+        stale = [p for p in tmp_path.iterdir() if ".rotated" in p.name]
+        assert not stale
+        f.write_text(_gen_lines(sid, 3, 30, 4))
+        os.rename(f, rotated)
+        os.utime(rotated, (old, old))
+        assert await store.ingest_and_rotate_events(f, marker_path=marker, rotate_bytes=10 ** 6) == 4
+        # a .1 whose tail is torn (writer died mid-line) is still deleted once old
+        rotated.write_text(_gen_lines(sid, 4, 40, 1) + '{"torn')
+        os.utime(rotated, (old, old))
+        assert await store.ingest_and_rotate_events(f, marker_path=marker, rotate_bytes=10 ** 6) == 1
+        assert not rotated.exists()
+        assert _ns(await store.events(sid, limit=1000)) == list(range(8)) + [20, 21, 30, 31, 32, 33, 40]
+    run(share_postgres, body)
+
+
+def test_rotation_refuses_planted_symlinks(share_postgres, tmp_path):
+    async def body(store, conn):
+        aid, vid = await seed(conn)
+        sid = (await store.create(**kw(aid, vid)))["share_id"]
+        secret = tmp_path / "outside.jsonl"
+        secret.write_text(_gen_lines(sid, 9, 90, 3))
+        d = tmp_path / "events"
+        d.mkdir()
+        f, rotated = d / "events.jsonl", d / "events.jsonl.1"
+        f.symlink_to(secret)
+        rotated.symlink_to(secret)
+        marker = tmp_path / "m.json"
+        assert await store.ingest_events_file(f, marker_path=marker) == 0
+        assert await store.ingest_and_rotate_events(f, marker_path=marker, rotate_bytes=1) == 0
+        assert not os.path.lexists(rotated) and secret.exists()          # the link went, never its target
+        assert _ns(await store.events(sid, limit=1000)) == []
+    run(share_postgres, body)
