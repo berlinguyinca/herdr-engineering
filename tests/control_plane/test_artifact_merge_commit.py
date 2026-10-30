@@ -15,7 +15,7 @@ from herdr_engineering.control_plane.artifacts import (
 from tests.control_plane import test_artifact_version_parents as _parents
 
 _Blobs = _parents._Blobs
-parents_postgres = _parents.parents_postgres  # the isolated 0042 Postgres fixture, shared
+parents_postgres = _parents.parents_postgres  # the isolated 0043 Postgres fixture, shared
 
 AGENT = "agent-c"
 COLLAB = f"collab:{AGENT}"

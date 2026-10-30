@@ -1,4 +1,4 @@
-"""Parent lists, created_via and the attempt log (migration 0042) on an isolated, Unix-socket-only PostgreSQL."""
+"""Parent lists, created_via and the attempt log (migration 0043) on an isolated, Unix-socket-only PostgreSQL."""
 import asyncio
 import os
 import shutil
@@ -16,7 +16,7 @@ ROOT = Path(__file__).resolve().parents[2]
 MIGRATIONS = ROOT / "deploy/control-plane/migrations"
 PREREQ = ("0001_control_plane.sql", "0003_artifact_registry.sql", "0005_artifact_binding_context.sql",
           "0006_artifact_acl.sql", "0021_artifact_reports.sql", "0031_artifact_registry_extensions.sql")
-MIGRATION = "0042_artifact_version_parents.sql"
+MIGRATION = "0043_artifact_version_parents.sql"
 
 
 class _Blobs:
@@ -53,7 +53,7 @@ def parents_postgres():
                 try:
                     for name in PREREQ:
                         await conn.execute((MIGRATIONS / name).read_text())
-                    # A version that predates 0042, to prove the backfill.
+                    # A version that predates 0043, to prove the backfill.
                     await conn.execute("INSERT INTO artifacts (artifact_id,created_by) VALUES ('legacy','o')")
                     await conn.execute("INSERT INTO artifact_versions (version_id,artifact_id,version_number,state) "
                                        "VALUES ('legacy-1','legacy',1,'ready')")
@@ -223,7 +223,7 @@ def test_owner_cannot_carry_agent_id_and_bare_string_parents_are_refused(parents
     run(parents_postgres, body)
 
 
-def test_migrator_applies_0042_and_leaves_freeze_trigger_enabled(parents_postgres, tmp_path):
+def test_migrator_applies_0043_and_leaves_freeze_trigger_enabled(parents_postgres, tmp_path):
     from herdr_engineering.control_plane.db import Migrator
     for name in (*PREREQ, MIGRATION):
         (tmp_path / name).write_text((MIGRATIONS / name).read_text())

@@ -1,3 +1,4 @@
+-- Migration 0043 (0042 is taken by 0042_rakazo_push_tokens.sql on main).
 -- Git-style artifact history: a version records an ordered LIST of parents (a merge has two) instead of one, and says
 -- whether the owner or a collaborating agent committed it.  artifact_collab_attempts logs every collaborator
 -- submission, including the ones that conflicted and produced no version.

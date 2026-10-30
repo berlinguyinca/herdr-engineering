@@ -4,7 +4,7 @@
 
 **Goal:** Ship plan 1 (Share panel GUI with link tracking, history view, "Restore this version") and plan 2 (version parent graph + three-way text merge engine) of the artifact sharing / collaboration design.
 
-**Architecture:** Plan 1 is front end only: new web-client methods over the already-merged share routes, a `artifact-share-panel.js` component mounted as a card on the artifact detail page, and a restore action that re-commits an earlier version's manifests through the existing `POST /api/v1/artifacts/{id}/versions`. Plan 2 is backend only: a pure `artifact_merge.py` (diff3 text merge + manifest merge), migration `0042` adding a real parent list to versions, `ArtifactStore.commit_version` taking optional parents, and a store-level `merge_commit` that the later collaboration bridge (plan 3) will call.
+**Architecture:** Plan 1 is front end only: new web-client methods over the already-merged share routes, a `artifact-share-panel.js` component mounted as a card on the artifact detail page, and a restore action that re-commits an earlier version's manifests through the existing `POST /api/v1/artifacts/{id}/versions`. Plan 2 is backend only: a pure `artifact_merge.py` (diff3 text merge + manifest merge), migration `0043` adding a real parent list to versions, `ArtifactStore.commit_version` taking optional parents, and a store-level `merge_commit` that the later collaboration bridge (plan 3) will call.
 
 **Tech Stack:** Python 3.12 / asyncpg (control plane), plain ES-module JS web client (`packages/`), node:test for client unit tests, Playwright for UI tests, Postgres migrations in `deploy/control-plane/migrations`.
 
@@ -110,9 +110,9 @@
 - [ ] **Step 1: Write failing tests** covering every rule in Global Constraints and each `kind`, including: file added on one side only; deleted on one side and unchanged on the other; both sides delete; identical modification; modify/modify non-overlapping → merged text stored once via `store_text` and listed in `merged_names`; names differing only by case → `case_collision`; a text file over `max_text_bytes` → `oversize`; media type not text-like (`text/*`, `application/json|xml|yaml|javascript`, or names ending `.md .html .css .js .json .yaml .yml .xml .txt .csv .svg .py .ts`) → `binary`; result ordering is stable (sorted by name); `store_text` is never called when any conflict exists.
 - [ ] **Step 2: Run** → FAIL. **Step 3: Implement.** **Step 4: Run** → PASS. **Step 5: Commit** `feat(artifacts): three-way manifest merge`.
 
-### Task 7: Migration 0042 and parent-aware commits
+### Task 7: Migration 0043 and parent-aware commits
 
-**Files:** Create `deploy/control-plane/migrations/0042_artifact_version_parents.sql`; Modify `herdr_engineering/control_plane/artifacts.py` (`commit_version`, `get_version`, `list_versions`, `list_version_summaries` — wherever version rows are shaped); Test `tests/control_plane/test_artifact_version_parents.py` (use the Postgres fixtures the other `test_artifact_*postgres*` tests use)
+**Files:** Create `deploy/control-plane/migrations/0043_artifact_version_parents.sql`; Modify `herdr_engineering/control_plane/artifacts.py` (`commit_version`, `get_version`, `list_versions`, `list_version_summaries` — wherever version rows are shaped); Test `tests/control_plane/test_artifact_version_parents.py` (use the Postgres fixtures the other `test_artifact_*postgres*` tests use)
 
 **Interfaces:**
 - Migration (additive, idempotent, `IF NOT EXISTS`): `artifact_versions` gains `parent_version_ids text[] NOT NULL DEFAULT '{}'`, `created_via text NOT NULL DEFAULT 'owner' CHECK (created_via IN ('owner','collaborator'))`, `collaborator_agent_id text NULL`; backfill `parent_version_ids = ARRAY[parent_version_id]` where `parent_version_id IS NOT NULL AND parent_version_ids = '{}'`; create `artifact_collab_attempts(attempt_id text PK, artifact_id text NOT NULL REFERENCES artifacts, collaborator_agent_id text NOT NULL, base_version_id text, head_version_id text, conflict_names jsonb NOT NULL DEFAULT '[]', message text, created_at timestamptz NOT NULL DEFAULT now())` with an index on `(artifact_id, created_at DESC)`.
