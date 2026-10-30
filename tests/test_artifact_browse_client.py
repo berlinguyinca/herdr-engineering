@@ -27,6 +27,15 @@ def endpoint(monkeypatch):
             self.end_headers()
             self.wfile.write(raw)
 
+        def do_POST(self):
+            raw = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+            seen.append((self.path, json.loads(raw)))
+            body = json.dumps({"artifact_id": "a1", "linked": True}).encode()
+            self.send_response(201)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
     server = ThreadingHTTPServer(("127.0.0.1", 0), H)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     monkeypatch.setenv("HERDR_API_KEY", KEY)
@@ -68,3 +77,18 @@ def test_not_found_does_not_say_which(endpoint, capsys):
     base, _ = endpoint
     assert _run(base, "show", "missing") == 1
     assert "cannot read it" in capsys.readouterr().err
+
+
+def test_links_lists_and_link_posts_only_what_was_named(endpoint, capsys):
+    base, seen = endpoint
+    assert _run(base, "links", "a1") == 0
+    assert _run(base, "link", "a1", "--issue", "org/repo#7", "--link-kind", "origin") == 0
+    assert seen[0][0] == "/api/v1/artifacts/a1/links"
+    assert seen[1] == ("/api/v1/artifacts/a1/links", {"issue_ref": "org/repo#7", "link_kind": "origin"})
+    assert KEY not in capsys.readouterr().out
+
+
+def test_a_link_with_no_target_is_refused_before_any_request(endpoint, capsys):
+    base, seen = endpoint
+    assert _run(base, "link", "a1", "--link-kind", "reference") == 2
+    assert not seen and "needs --project" in capsys.readouterr().err
