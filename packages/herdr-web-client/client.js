@@ -160,6 +160,54 @@ export class HerdrClient {
     return this.request(`/api/v1/artifacts/${encodeURIComponent(id)}/versions/${encodeURIComponent(versionId)}`, { signal });
   }
 
+  artifactSharesPath(id, shareId) {
+    const base = `/api/v1/artifacts/${encodeURIComponent(id)}/shares`;
+    return shareId === undefined ? base : `${base}/${encodeURIComponent(shareId)}`;
+  }
+
+  listArtifactShares(id, { signal } = {}) {
+    return this.request(this.artifactSharesPath(id), { signal });
+  }
+
+  createArtifactShare(id, body, { signal } = {}) {
+    return this.request(this.artifactSharesPath(id), { method: 'POST', body, signal });
+  }
+
+  getArtifactShare(id, shareId, { signal } = {}) {
+    return this.request(this.artifactSharesPath(id, shareId), { signal });
+  }
+
+  approveArtifactShare(id, shareId, { signal } = {}) {
+    return this.request(`${this.artifactSharesPath(id, shareId)}/approve`, { method: 'POST', body: { confirm: true }, signal });
+  }
+
+  revokeArtifactShare(id, shareId, { signal } = {}) {
+    return this.request(`${this.artifactSharesPath(id, shareId)}/revoke`, { method: 'POST', signal });
+  }
+
+  artifactShareEvents(id, shareId, { signal } = {}) {
+    return this.request(`${this.artifactSharesPath(id, shareId)}/events`, { signal });
+  }
+
+  async restoreArtifactVersion(id, versionId, { signal } = {}) {
+    const unsupported = () => Object.assign(new Error('Restore is not supported for report artifacts'), { code: 'restore_unsupported' });
+    const artifact = await this.getArtifact(id, { signal });
+    if (artifact.artifact_type === 'report') throw unsupported();
+    const version = await this.artifactVersion(id, versionId, { signal });
+    if (version.report_descriptor) throw unsupported();
+    const head = artifact.current_version_id;
+    return this.request(`/api/v1/artifacts/${encodeURIComponent(id)}/versions`, {
+      method: 'POST', signal,
+      body: {
+        base_version_id: head,
+        source_manifest_blob: version.source_manifest_blob,
+        output_manifest: version.output_manifest,
+        provenance: { restored_from: versionId },
+        idempotency_key: `restore-${versionId}-${head}`,
+      },
+    });
+  }
+
   artifactReviews(id, { signal } = {}) {
     return this.request(`/api/v1/artifacts/${encodeURIComponent(id)}/reviews`, { signal });
   }
