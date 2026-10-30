@@ -167,6 +167,42 @@ check_github_app_dir() {   # nothing printed but names; never the key
 }
 check_github_app_dir || exit 1
 
+# Google mail/calendar credentials (optional, personal_assistant.google): their OWN read-only mount, like the App key.
+GOOGLE_DIR="$HOME/.config/herdr-engineering/google"
+check_google_dir() {   # names only, never content
+  local d="$GOOGLE_DIR" mode others f
+  [ -e "$d" ] || [ -L "$d" ] || return 0
+  if [ -L "$d" ] || [ ! -d "$d" ]; then
+    echo "$d must be a real directory (not a symlink or a file)" >&2; return 1
+  fi
+  if [ "$(stat -c %u "$d")" != "$(id -u)" ]; then
+    echo "$d must be owned by the deploying user (uid $(id -u))" >&2; return 1
+  fi
+  mode="$(stat -c %a "$d")"
+  if [ "$mode" != 700 ]; then
+    echo "$d must be mode 0700 (it is $mode): chmod 700 $d" >&2; return 1
+  fi
+  others="$(find "$d" -mindepth 1 -maxdepth 1 ! -name client_secret.json ! -name token.json -printf '%f ' 2>/dev/null || true)"
+  if [ -n "$others" ]; then
+    echo "$d must hold only client_secret.json and token.json (the directory is mounted into control-plane-web); also found: $others" >&2
+    return 1
+  fi
+  for f in "$d/client_secret.json" "$d/token.json"; do
+    [ -e "$f" ] || [ -L "$f" ] || continue
+    if [ -L "$f" ] || [ ! -f "$f" ]; then
+      echo "$f must be a regular file (not a symlink)" >&2; return 1
+    fi
+    if [ "$(stat -c %u "$f")" != "$(id -u)" ]; then
+      echo "$f must be owned by the deploying user (uid $(id -u))" >&2; return 1
+    fi
+    mode="$(stat -c %a "$f")"
+    if [ "$mode" != 600 ] && [ "$mode" != 400 ]; then
+      echo "$f must be mode 0600 or 0400 (it is $mode): chmod 600 $f" >&2; return 1
+    fi
+  done
+}
+check_google_dir || exit 1
+
 # Deployment definitions: their OWN read-only mount, refreshed by pipelines-sync.sh.
 PIPELINES_DIR="$HOME/.local/share/herdr-engineering/pipelines"
 check_pipelines_dir() {   # names only, never content
@@ -374,7 +410,7 @@ if [ "$DRY" = 1 ]; then
   if docker compose version >/dev/null 2>&1; then
     # -q prints nothing on success; errors are withheld so no value can leak.
     if HERDR_CP_FLEET_DIR="$FLEET_DIR" HERDR_CP_GITHUB_APP_DIR="$GITHUB_APP_DIR" \
-        HERDR_CP_PIPELINES_DIR="$PIPELINES_DIR" HERDR_CP_IMAGE_TAG="$TAG" HERDR_CP_GIT_COMMIT="$SHA" \
+        HERDR_CP_GOOGLE_DIR="$GOOGLE_DIR" HERDR_CP_PIPELINES_DIR="$PIPELINES_DIR" HERDR_CP_IMAGE_TAG="$TAG" HERDR_CP_GIT_COMMIT="$SHA" \
         docker compose --env-file "$ENV_FILE" -p "$PROJECT" "${COMPOSE_FILES[@]}" config -q >/dev/null 2>&1; then
       echo "[dry-run] docker compose config: valid"
     else
@@ -519,6 +555,10 @@ if [ ! -e "$GITHUB_APP_DIR" ]; then
   mkdir -p "$(dirname "$GITHUB_APP_DIR")" && mkdir -m 700 "$GITHUB_APP_DIR"
 fi
 check_github_app_dir || exit 1
+if [ ! -e "$GOOGLE_DIR" ]; then
+  mkdir -p "$(dirname "$GOOGLE_DIR")" && mkdir -m 700 "$GOOGLE_DIR"
+fi
+check_google_dir || exit 1
 if [ ! -e "$PIPELINES_DIR" ]; then
   mkdir -p "$(dirname "$PIPELINES_DIR")" && mkdir -m 755 "$PIPELINES_DIR"
 fi
@@ -583,7 +623,7 @@ compose_run() {
   if [ "$COLLAB" = 1 ]; then files+=(-f "$tree/deploy/control-plane/compose.collab.yaml"); fi
   if [ -n "$ROLLBACK_IMAGES" ]; then files+=(-f "$ROLLBACK_IMAGES"); fi
   HERDR_CP_FLEET_DIR="$FLEET_DIR" HERDR_LLM_SLICE_DIR="$LLM_DIR" \
-    HERDR_CP_GITHUB_APP_DIR="$GITHUB_APP_DIR" HERDR_CP_PIPELINES_DIR="$PIPELINES_DIR" HERDR_CP_IMAGE_TAG="$tag" HERDR_CP_GIT_COMMIT="$commit" \
+    HERDR_CP_GITHUB_APP_DIR="$GITHUB_APP_DIR" HERDR_CP_GOOGLE_DIR="$GOOGLE_DIR" HERDR_CP_PIPELINES_DIR="$PIPELINES_DIR" HERDR_CP_IMAGE_TAG="$tag" HERDR_CP_GIT_COMMIT="$commit" \
     docker compose --env-file "$envf" -p "$PROJECT" "${files[@]}" "$@"
 }
 
