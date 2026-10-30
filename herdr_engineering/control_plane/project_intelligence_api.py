@@ -151,7 +151,12 @@ class IntelligenceRoutes:
         viewer = self._viewer_from_entry(entry) if isinstance(entry, dict) else None
         return execute_read(ReadTools(self.store), viewer, payload)
 
-    def assistant_ci_repair(self, tenant_id: str, user_id: str, payload: dict, idempotency_key: str) -> dict:
+    def assistant_ci_rerun(self, tenant_id: str, user_id: str, payload: dict, idempotency_key: str) -> dict:
+        """Same scope rules as ``assistant_ci_repair``, queuing a ``ci_rerun`` proposal (restart that CI run)."""
+        return self.assistant_ci_repair(tenant_id, user_id, payload, idempotency_key, action="ci_rerun")
+
+    def assistant_ci_repair(self, tenant_id: str, user_id: str, payload: dict, idempotency_key: str,
+                            action: str = "request_ci_repair") -> dict:
         """Assistant CI watch entry: queue a ``request_ci_repair`` PROPOSAL on the existing board. Scope comes only
         from YAML ``assistant_viewers`` (as for reads). The requester is the user, so the board's own refusal of
         self-approval applies. Executing an approved proposal stays with the existing executor and its policy."""
@@ -167,7 +172,7 @@ class IntelligenceRoutes:
         if not (isinstance(mapped, list) and mapped) or (
                 viewer.project_ids is not None and not set(mapped) <= viewer.project_ids):
             raise pi.NotFound("the repository is outside this user's project scope")
-        p = self.board.request(org_id=viewer.org_id, requester=user_id, action="request_ci_repair",
+        p = self.board.request(org_id=viewer.org_id, requester=user_id, action=action,
                                payload=dict(payload), resource_version=1, idempotency_key=idempotency_key[:64])
         return {"id": p.id, "expires_at": p.expires_at.isoformat(), "state": p.state,
                 "payload_sha256": p.payload_sha256}
