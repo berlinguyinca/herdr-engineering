@@ -112,6 +112,19 @@ def test_cp_config_takes_dsn_from_fleet_file(tmp_path, old_env):
     assert cli._cp_config(str(path))["postgres_dsn"] == dsn
 
 
+def test_cp_config_takes_rustfs_endpoint_and_credentials_from_fleet_file(tmp_path, old_env):
+    path = make_file(tmp_path)
+    doc = yaml.safe_load(path.read_text())
+    values = doc["sections"]["control_plane"]["values"]
+    values.update({"rustfs_endpoint": "http://rustfs:9000", "rustfs_bucket": "b", "minio_user": "u", "minio_password": "p"})
+    path.write_text(yaml.safe_dump(doc))
+    path.chmod(0o600)
+    cfg = cli._cp_config(str(path))
+    assert (cfg["rustfs_endpoint"], cfg["rustfs_bucket"], cfg["minio_user"], cfg["minio_password"]) == (
+        "http://rustfs:9000", "b", "u", "p")
+    assert cli._cp_config(None).get("minio_user") is None     # no fleet file: no invented credentials
+
+
 # ------------------------------------------------------------------ web / rustfs
 
 def test_rustfs_client_not_built_from_env(old_env, monkeypatch):
@@ -828,3 +841,18 @@ def test_web_starts_enabled_review_gate_with_a_dsn(tmp_path, monkeypatch, old_en
 def test_web_without_dsn_is_fine_when_review_gate_disabled(tmp_path, monkeypatch, old_env):
     path = make_file(tmp_path, pg_dsn=None, review_gate=_gate(tmp_path, enabled=False))
     assert "sink_dsn" not in _run_web(monkeypatch, path)
+
+
+# ------------------------------------------------- P05 crash takeover lease (YAML only, default off)
+def test_task_lease_is_a_validated_startup_collab_key_and_off_by_default():
+    import argparse
+    assert "task_lease_seconds" in fcc.COLLAB_KEYS and "task_lease_seconds" in cli.COLLAB_CONFIG_KEYS
+    assert "task_lease_seconds" in cli.STARTUP_ONLY_COLLAB_KEYS
+    assert cli._task_lease(argparse.Namespace(), {}) is None
+    assert cli._task_lease(argparse.Namespace(), {"collab": {"task_lease_seconds": 900}}) == 900.0
+    args = argparse.Namespace(collab_task_lease_seconds=None)
+    cli._apply_collab_config(args, {"collab": {"task_lease_seconds": 1800}})
+    assert args.collab_task_lease_seconds == 1800.0 and cli._task_lease(args, {}) == 1800.0
+    for bad in (True, "600", 10, 10 * 86400):
+        with pytest.raises(SystemExit):
+            cli._task_lease(argparse.Namespace(), {"collab": {"task_lease_seconds": bad}})

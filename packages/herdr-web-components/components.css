@@ -160,6 +160,7 @@
 .hd-subnav { display: flex; gap: 2px; margin: -4px 0 14px; border-bottom: 1px solid var(--border-subtle); }
 .hd-subnav[hidden] { display: none; }
 .hd-subnav a { padding: 8px 14px; margin-bottom: -1px; font-size: .875rem; color: var(--text-secondary); text-decoration: none; border-bottom: 2px solid transparent; }
+@media (max-width: 900px) { .hd-subnav a { display: inline-flex; align-items: center; min-height: 44px; box-sizing: border-box; } }
 .hd-subnav a:hover { color: var(--text); }
 .hd-subnav a[aria-current=page] { color: var(--accent); border-bottom-color: var(--accent); font-weight: 500; }
 button.hd-linkbtn { box-shadow: none; font: inherit; font-size: .75rem; color: var(--accent); background: none; border: 0; padding: 2px 0; cursor: pointer; text-decoration: underline; }

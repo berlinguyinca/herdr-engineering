@@ -189,6 +189,10 @@ HELPER_ERRORS = frozenset({"failed", "timeout", "cancelled", "sandbox-error", "p
 _HELPER_BAD = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f\u2028\u2029]")   # all control chars but \t \n
 
 
+def _iso_epoch(value: str) -> float:
+    return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+
+
 class CollabError(Exception):
     def __init__(self, status: int, message: str, reason: str | None = None, code: str | None = None):
         super().__init__(message)
@@ -380,12 +384,16 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
         # The fabric lineage graph, attached by the combined (non collab-only) server. The graph never
         # calls back into this service: membership is handed to it as a per-request snapshot.
         self.graph_source = None      # callable returning the CURRENT projection (a rebuild replaces it)
+        self.work_graph_handle = None  # unified workspace P02: (principal, method, parts, query, body) -> (status, body, headers)
         # Writes an external agent's lineage through the ingest path (combined server only; None = refused).
         # Called with (envelope, principal); the envelope is built here, never taken from the request.
         self.lineage_sink = None
         self._users: dict[str, dict] = {}       # approval mode: user id -> {status, since, decided_by, decided_at, reason}
         self._sink = sink
         self._now = now or time.time
+        # P05 crash takeover: seconds an accepted task may stay accepted before it goes back to pending for its target
+        # agent to pick up again (an ``attempt`` counter fences the old run). None = off (the default).
+        self.task_lease_seconds: float | None = None
         self.enrollment_ttl = enrollment_ttl
         self.credential_ttl = credential_ttl
         self.remote_credential_ttl = remote_credential_ttl  # agents that connect over HTTP MCP
@@ -848,6 +856,8 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                 "status": "pending", "result": None, "depth": p["depth"], "parent": p.get("parent_task_id"),
                 "created_at": p["created_at"], "created_epoch": p["created_epoch"],
                 "updated_at": p["created_at"], "seq": seq}
+            if p.get("reviews_task_id"):
+                self._tasks[p["task_id"]]["reviews"] = p["reviews_task_id"]
             if p.get("bounds"):          # T11: a bounded delegation is this same task plus its bounds
                 self._tasks[p["task_id"]].update(bounds=p["bounds"], version=1, steps=0, tokens=0, proposals=0, turns=0)
                 if p.get("idempotency_key"):
@@ -858,6 +868,11 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
             tk = self._tasks.get(p["task_id"])
             if tk:
                 tk.update(status=p["status"], result=p.get("result"), updated_at=p["created_at"])
+                if p["status"] == "accepted":
+                    tk["accepted_epoch"] = _iso_epoch(p["created_at"])
+                if p.get("action") == "task.requeue":
+                    tk["attempt"] = tk.get("attempt", 1) + 1
+                    tk.pop("accepted_epoch", None)
                 if "bounds" in tk:
                     tk["version"] += 1
                     if str(p.get("action") or "").startswith("delegation.") and p.get("action") != "delegation.budget":
@@ -2580,6 +2595,7 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                            and self._now() - r["created_epoch"] < REQUEST_TTL]
                 out.append({"agent_id": aid, "name": a["name"], "harness_type": a["harness_type"],
                             "instance_id": a.get("instance_id"), "external": bool(a.get("external")),
+                            "online": any(self._online(r["room_id"], "agent", aid) for r in rooms),
                             "status": a["status"], "expires_at": a["expires_at"], "rooms": rooms,
                             "pending": pending})
         return {"agents": out}
@@ -4062,6 +4078,8 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
     def graph_read(self, pr: Principal, parts: list[str], query: dict) -> dict:
         """Lineage graph read for a signed-in person. Hidden, missing and 'no graph for you' all
         answer one 404; nothing here lets a read widen what the graph's own checks allow."""
+        if parts[:1] == ["work"]:
+            return self.work_graph_request(pr, "GET", parts[1:], query, None)
         graph = self.graph_source() if self.graph_source is not None else None
         access = self.graph_access(pr) if graph is not None else None
         if access is None:
@@ -4078,6 +4096,18 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
             return self.xlink_filter(out)
         except KeyError:
             raise CollabError(404, "not found") from None
+
+    def work_graph_request(self, pr: Principal, method: str, parts: list[str], query: dict, body: dict | None) -> dict:
+        """Unified workspace P02: the persistent Work Graph for a signed-in person. Guests, agents and people with no
+        non-guest membership get the same 404 as a missing route (``graph_access`` is None for them)."""
+        access = self.graph_access(pr)
+        if access is None or self.work_graph_handle is None:
+            raise CollabError(404, "not found")
+        principal = {"kind": "member", "id": f"user:{pr.id}", "authenticated_by": "collab", "access": access}
+        status, payload, _headers = self.work_graph_handle(principal, method, parts, query, body)
+        if status != 200:
+            raise CollabError(status, str(payload.get("error", "error")))
+        return payload
 
     def _join_times(self, pr: Principal, access: dict) -> dict | None:
         """T16 M2: the reader's join time in EVERY room they read through (``None`` = history is not restricted).
@@ -4265,7 +4295,8 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
         gives work to ONE agent that the owner approved with "execute"."""
         with self._lock:
             room, _ = self._authorize(pr, room_id, "instruct" if pr.is_agent else "task", "task.create")
-            bad = [k for k in body if k not in ("target_agent_id", "text", "parent_task_id", "idempotency_key")]
+            bad = [k for k in body if k not in ("target_agent_id", "text", "parent_task_id", "idempotency_key",
+                                                "reviews_task_id")]
             if bad:
                 raise CollabError(400, "unknown field")
             tid_ = body.get("target_agent_id")
@@ -4275,12 +4306,17 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                 raise CollabError(404, "no such agent in this room")     # same answer for every miss
             if pr.is_agent and tid_ == pr.id:
                 raise CollabError(400, "an agent cannot give itself work")
+            reviews = body.get("reviews_task_id")
+            if reviews is not None:
+                self._check_independent_review(pr, room_id, tid_, reviews)
             text = self._task_text(body.get("text"), "text")
             ikey = body.get("idempotency_key")
             if ikey is not None and (not isinstance(ikey, str) or not _KEY_RE.match(ikey)):
                 raise CollabError(400, "invalid idempotency_key")
+            # the digest is unchanged for a task that reviews nothing, so existing keys keep their meaning
+            fp = _digest(json.dumps([room_id, tid_, text] + ([reviews] if reviews is not None else [])))
             if ikey is not None and (prior := self._idem.get((pr.key, room_id, "task:" + ikey))):
-                if prior[0] != _digest(json.dumps([room_id, tid_, text])):
+                if prior[0] != fp:
                     raise CollabError(409, "idempotency_key already used for a different task")
                 return {"task_id": prior[1], "status": "pending", "replayed": True}
             depth, parent, root = 0, body.get("parent_task_id"), pr.owner
@@ -4312,10 +4348,24 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                 target_agent_id=tid_, text=text, depth=depth, parent_task_id=parent,
                 created_by_kind=pr.kind, created_by_id=pr.id, created_epoch=now, root_user_id=root,
                 visibility_scope="room", action="task.create", outcome="allowed",
-                project_ids=[room["project_id"]], resource_id=task_id))
+                project_ids=[room["project_id"]], resource_id=task_id,
+                **({"reviews_task_id": reviews} if reviews is not None else {})))
             if ikey is not None:
-                self._idem[(pr.key, room_id, "task:" + ikey)] = (_digest(json.dumps([room_id, tid_, text])), task_id)
+                self._idem[(pr.key, room_id, "task:" + ikey)] = (fp, task_id)
         return {"task_id": task_id, "status": "pending", "event": self._view(ev)}
+
+    def _check_independent_review(self, pr: Principal, room_id: str, reviewer_id: str | None, reviews: Any) -> None:
+        """P05: a review task must be independent of the work it reviews. The reviewer is not the agent that did the
+        work, not the agent that handed the work out, and an agent cannot pick the reviewer of its own work."""
+        work = self._tasks.get(reviews) if isinstance(reviews, str) else None
+        if not work or work["room_id"] != room_id:
+            raise CollabError(404, "no such task in this room")
+        if reviewer_id == work["target"]:
+            raise CollabError(400, "a reviewer must not be the agent that did the work")
+        if work["by_kind"] == "agent" and reviewer_id == work["by_id"]:
+            raise CollabError(400, "a reviewer must not be the agent that handed out the work")
+        if pr.is_agent and pr.id == work["target"]:
+            raise CollabError(400, "an agent cannot choose the reviewer of its own work")
 
     def _grant_expiry(self, body: dict) -> float:
         """Every agent grant lapses: the owner may pick a date (up to a year), else the default."""
@@ -4400,7 +4450,7 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                 "result": t["result"], "depth": t["depth"], "parent_task_id": t["parent"],
                 "requested_by": {"type": t["by_kind"], "id": t["by_id"], "owner_user_id": t["by_owner"]},
                 "started_by_user_id": t["root"],
-                "created_at": t["created_at"], "updated_at": t["updated_at"],
+                "created_at": t["created_at"], "updated_at": t["updated_at"], "attempt": t.get("attempt", 1),
                 **({"bounds": t["bounds"], "version": t["version"]} if bounds and "bounds" in t else {})}
 
     def list_tasks(self, pr: Principal, room_id: str, limit: int = 100) -> dict:
@@ -4433,11 +4483,33 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                 resource_id=task_id))
         return {"ok": True}
 
+    def _requeue_stale(self, pr: Principal) -> None:
+        """P05 crash takeover (rule A): an accepted task whose lease ran out goes back to pending, once per expiry.
+
+        Runs when the target agent polls its inbox, which is the only moment anyone could pick the task up. The
+        requeue is an event, so a restart replays it; ``attempt`` rises so the old run can no longer complete it."""
+        lease = self.task_lease_seconds
+        if not lease:
+            return
+        for tid in list(self._tasks_by_target.get(pr.id, ())):
+            t = self._tasks[tid]
+            if ("bounds" in t or t["status"] != "accepted" or self._task_status(t) != "accepted"
+                    or self._now() - t.get("accepted_epoch", self._now()) < lease):
+                continue
+            room = self._rooms.get(t["room_id"])
+            if not room:
+                continue
+            self._commit("task_updated", self._actor(
+                pr, project_id=room["project_id"], room_id=t["room_id"], task_id=tid, status="pending",
+                result=None, target_agent_id=pr.id, visibility_scope="room", action="task.requeue",
+                outcome="allowed", project_ids=[room["project_id"]], resource_id=tid))
+
     def task_inbox(self, pr: Principal, limit: int = 20) -> dict:
         """Open tasks addressed to this agent, only where it STILL holds "execute"."""
         if not pr.is_agent or pr.external:
             raise CollabError(403, "forbidden")
         with self._lock:
+            self._requeue_stale(pr)
             out = []
             for tid in list(self._tasks_by_target.get(pr.id, ())):
                 t = self._tasks[tid]
@@ -4465,9 +4537,17 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
             if (not t or t["target"] != pr.id or not eff or "execute" not in eff[0] or t["seq"] < eff[1]
                     or not self._creator_valid(t, room)):
                 raise CollabError(404, "not found")
-            bad = [k for k in body if k not in ("status", "result")]
+            bad = [k for k in body if k not in ("status", "result", "attempt")]
             status = body.get("status")
             cur = self._task_status(t)
+            if "attempt" in body and body["attempt"] != t.get("attempt", 1):
+                raise CollabError(409, "stale attempt: this task was requeued")
+            if not bad and status == cur and status in ("done", "failed"):
+                # P05: a retry of a completion that already happened (the answer was lost, the agent restarted) gets
+                # the recorded outcome and writes nothing; it cannot change a finished task's result. A repeated
+                # "accepted" stays a 400, as before.
+                if self._task_text(body.get("result"), "result", required=False) == t.get("result"):
+                    return {"task_id": task_id, "status": status, "replayed": True}
             allowed = {"pending": ("accepted", "failed"), "accepted": ("done", "failed")}.get(cur, ())
             if bad or status not in allowed:
                 raise CollabError(400, "invalid status change")
@@ -4478,7 +4558,7 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                 status=status, result=result, target_agent_id=pr.id, visibility_scope="room",
                 action="task.update", outcome="allowed", project_ids=[room["project_id"]],
                 resource_id=task_id))
-        return {"task_id": task_id, "status": status}
+        return {"task_id": task_id, "status": status, "attempt": t.get("attempt", 1)}
 
     # -- bounded delegation and artifact proposals (T11)
     # A delegation is a task in the SAME store with a ``bounds`` block, addressed to an external coworker agent
@@ -5229,6 +5309,34 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                 nxt = ev["sequence"]
         return {"events": out, "next_cursor": nxt, "has_more": more}
 
+    def room_people(self, pr: Principal, room_id: str) -> list[dict]:
+        """Handles of the people in a room the caller may read (never emails); a guest sees no roster."""
+        with self._lock:
+            room, _ = self._authorize(pr, room_id, "read", "room.people")
+            if not pr.is_agent and (self._member(room, pr.id) or {}).get("role") == "guest":
+                return []
+            return [{"user_id": u, "handle": self._user_handle.get(u) or u.split("@")[0],
+                     "online": self._online(room_id, "person", u)}
+                    for u in room["members"] if self._member(room, u)]
+
+    def read_tail(self, pr: Principal, room_id: str, limit: int) -> dict:
+        """The newest ``limit`` events of a room the caller may read, oldest first, as ``read_events`` would show them."""
+        with self._lock:
+            room, first = self._authorize(pr, room_id, "read", "events.read")
+            guest = not pr.is_agent and (self._member(room, pr.id) or {}).get("role") == "guest"
+            feed, cache, out = self._by_room.get(room_id, []), {}, []
+            for ev in reversed(feed):
+                if ev["sequence"] < first or len(out) >= limit:
+                    break
+                if pr.external and ev["event_type"] != "message":
+                    continue
+                if guest and (ev["event_type"].startswith("helper_") or (
+                        ev["event_type"].startswith("agent_") and ev["payload"].get("agent_id") in self._helper_minted)):
+                    continue
+                out.append({k: v for k, v in self._view(ev, viewer=pr, _ctx_cache=cache).items() if k != "project_id"})
+            out.reverse()
+            return {"events": out, "next_cursor": out[-1]["sequence"] if out else 0}
+
     def audit(self, pr: Principal, project_id: str, cursor: int, limit: int) -> dict:
         self._require_user(pr)
         with self._lock:
@@ -5461,6 +5569,8 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
             elif method in ("PUT", "POST") and n == 3 and parts[0] == "rooms" and parts[2] == "profile":
                 return 200, self.set_room_profile(pr, parts[1], body)
             elif method == "POST":
+                if parts[:2] == ["graph", "work"]:
+                    return 200, self.work_graph_request(pr, "POST", parts[2:], query, body)
                 if parts == ["me"]:
                     return 200, self.link_identity(pr, body)
                 if parts == ["agents", "connect"]:

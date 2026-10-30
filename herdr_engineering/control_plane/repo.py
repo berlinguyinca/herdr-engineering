@@ -26,7 +26,7 @@ from uuid import uuid4
 
 from ..host_policy import HostPolicy, HostSnapshot, PolicyMode, normalize_aliases
 from ..llm_session_id import dashboard_form
-from . import llm_stats
+from . import llm_stats, usage_spend
 from .agent_identity import (
     AgentIdentityConflict,
     AgentIdentityRegistry,
@@ -54,6 +54,7 @@ from .ids import new_id, validate_mission_id
 from .inspector import REQUIRED_DURABLE_KINDS, InspectorStore
 from .mission_activity import MissionActivityStore
 from .redact import redact_payload
+from . import review_refs
 from .service_catalog import (
     INACTIVE,
     capture_service_origin,
@@ -71,6 +72,8 @@ from .service_catalog import (
 
 #: Hard bound on one durable deployment write made under a store lock (seconds).
 DEPLOYMENT_DURABLE_WRITE_TIMEOUT_S = 10
+
+_CI_EVENT_KINDS = frozenset({"ci_report", "ci_observation", "ci_telemetry", "ci_logtests"})
 
 _STAGES = {
     "planning", "specification", "ready", "implementation", "testing",
@@ -222,6 +225,7 @@ class ControlPlaneRepo:
         self._test_runs = {}
         self._reviews = {}
         self._pull_requests = {}
+        self.pull_request_version = 0      # bumped on every change to a PR record: lets a consumer tell cheaply that nothing moved
         self._stage_runs = {}  # mission_key -> [open+closed stage runs, ...]
         self._token_usage = {}  # request_id -> token usage record (issue #36)
         self._resource_usage = {}  # (mission_id, kind) -> [resource usage record, ...]
@@ -1597,9 +1601,18 @@ class ControlPlaneRepo:
         verdict=None,
         started_at=None,
         completed_at=None,
+        repository=None,
+        pull_request_number=None,
     ):
+        repository = review_refs.repository(repository)
+        pull_request_number = review_refs.pull_request_number(pull_request_number)
         stamp = self._stamp()
         existing = self._reviews.get(review_id)
+        if pull_request_number is not None and not (repository or (existing or {}).get("repository")):
+            raise ValueError("pull_request_number needs the repository it belongs to")
+        if existing is not None:   # before anything is written: a stored reference is never changed or moved
+            repository, pull_request_number = review_refs.keep_reference(
+                existing.get("repository"), existing.get("pull_request_number"), repository, pull_request_number)
         if existing is None:
             rec = {
                 "review_id": review_id,
@@ -1610,6 +1623,8 @@ class ControlPlaneRepo:
                 "verdict": verdict,
                 "started_at": started_at or stamp,
                 "completed_at": completed_at,
+                "repository": repository,
+                "pull_request_number": pull_request_number,
                 "findings": [],
                 "created_at": stamp,
                 "updated_at": stamp,
@@ -1629,6 +1644,8 @@ class ControlPlaneRepo:
                         "verdict",
                         "started_at",
                         "completed_at",
+                        "repository",
+                        "pull_request_number",
                     )
                 },
                 mission_id=mission_id,
@@ -1644,6 +1661,8 @@ class ControlPlaneRepo:
             "verdict": verdict,
             "started_at": started_at,
             "completed_at": completed_at,
+            "repository": repository,
+            "pull_request_number": pull_request_number,
         }.items():
             if v is not None:
                 existing[k] = v
@@ -1661,6 +1680,8 @@ class ControlPlaneRepo:
                     "verdict",
                     "started_at",
                     "completed_at",
+                    "repository",
+                    "pull_request_number",
                 )
             },
             mission_id=existing["mission_id"],
@@ -1723,8 +1744,12 @@ class ControlPlaneRepo:
         branch=None,
         base=None,
         created_at=None,
+        merged_at=None,
+        closed_at=None,
+        ended_source=None,
     ):
         stamp = self._stamp()
+        self.pull_request_version += 1
         existing = self._pull_requests.get(pr_id)
         if existing is None:
             rec = {
@@ -1738,7 +1763,12 @@ class ControlPlaneRepo:
                 "base": base,
                 "created_at": created_at or stamp,
                 "updated_at": stamp,
+                "merged_at": None,
+                "closed_at": None,
+                "ended_source": None,
+                "end_count": 0,
             }
+            self._stamp_pr_end(rec, status, merged_at, closed_at, stamp, ended_source)
             self._pull_requests[pr_id] = rec
             self.record_event(
                 "pull_request",
@@ -1755,6 +1785,10 @@ class ControlPlaneRepo:
                         "branch",
                         "base",
                         "created_at",
+                        "merged_at",
+                        "closed_at",
+                        "ended_source",
+                        "end_count",
                     )
                 },
                 mission_id=mission_id,
@@ -1764,6 +1798,10 @@ class ControlPlaneRepo:
             return _copy(rec)
         old_status = existing.get("status")
         existing["updated_at"] = stamp
+        existing.setdefault("merged_at", None)
+        existing.setdefault("closed_at", None)
+        existing.setdefault("ended_source", None)
+        self._stamp_pr_end(existing, status, merged_at, closed_at, stamp, ended_source)
         for k, v in {
             "mission_id": mission_id,
             "repository": repository,
@@ -1791,6 +1829,10 @@ class ControlPlaneRepo:
                     "branch",
                     "base",
                     "created_at",
+                    "merged_at",
+                    "closed_at",
+                    "ended_source",
+                    "end_count",
                 )
             },
             mission_id=existing["mission_id"],
@@ -1798,6 +1840,36 @@ class ControlPlaneRepo:
         if existing["status"] == "merged" and old_status != "merged":
             self._record_pr_merged(pr_id, existing)
         return _copy(existing)
+
+    @staticmethod
+    def _stamp_pr_end(rec, status, merged_at, closed_at, stamp, ended_source=None):
+        """Keep when a pull request ended. A time the provider reported is kept as given (``ended_source`` "reported");
+        otherwise the first moment this server saw the PR merged or closed is used and labelled "observed", which can be
+        later than the real merge. A PR that is open again loses its end time; a time already stored is never overwritten
+        by a later observation. ``end_count`` counts ends (the first, and each after a reopen); a record that predates it but has an
+        end time has ended once. ``ended_source`` is passed only when rebuilding from the durable event log (an ingest request
+        never supplies it), so a restart keeps "observed" times observed."""
+        if (rec.get("merged_at") or rec.get("closed_at")) and not rec.get("end_count"):
+            rec["end_count"] = 1
+        if status == "open":
+            rec["merged_at"] = rec["closed_at"] = rec["ended_source"] = None
+            return
+        def valid(value):
+            try:
+                return isinstance(value, str) and len(value) <= 64 and bool(_dt.datetime.fromisoformat(value.replace("Z", "+00:00")))
+            except ValueError:
+                return False
+        merged_at, closed_at = (merged_at if valid(merged_at) else None), (closed_at if valid(closed_at) else None)
+        if status in ("merged", "closed") and not (rec.get("merged_at") or rec.get("closed_at")):
+            rec["end_count"] = (rec.get("end_count") or 0) + 1      # a new end (the first, or after a reopen), not a corrected time
+        label = "observed" if ended_source == "observed" else "reported"
+        if merged_at:
+            rec["merged_at"], rec["ended_source"] = merged_at, label
+        if closed_at:
+            rec["closed_at"], rec["ended_source"] = closed_at, label
+        if status in ("merged", "closed") and not (rec.get("merged_at") or rec.get("closed_at")):
+            rec["merged_at" if status == "merged" else "closed_at"] = stamp
+            rec["ended_source"] = "observed"
 
     def _record_pr_merged(self, pr_id, rec):
         self.record_event(
@@ -1986,7 +2058,7 @@ class ControlPlaneRepo:
             projected = copy.deepcopy(report)
             reconcile_report_identities([projected], history["pipelines"])
             attempts = [row.get("attempt", 1) for row in history["reports"]
-                        if (row.get("provider_url"), row.get("repository"), str(row.get("provider_repo_id")), row.get("run_number")) ==
+                        if row.get("source") != "log_parse" and (row.get("provider_url"), row.get("repository"), str(row.get("provider_repo_id")), row.get("run_number")) ==
                            (projected.get("provider_url"), projected["repository"], str(projected["provider_repo_id"]), projected["run_number"])]
             report["attempt"] = max(attempts, default=0) + 1
             report["ingested_at"] = self._stamp()
@@ -1994,6 +2066,60 @@ class ControlPlaneRepo:
                               require_durable=True)
             self._trim_ci_history("ci_report")
             return copy.deepcopy(report)
+
+    def ingest_ci_log_report(self, body, *, redact=None):
+        """Keep the tests parsed from one run's CI logs. A real uploaded report for the run always wins.
+
+        One record per run: analysing the run again replaces it. Records that found no tests are kept too, so a
+        collector does not fetch the same logs again; `ci_reports()` never shows them.
+        """
+        from .ci_reports import compact_log_report, normalize_log_report
+        with self._event_lock:
+            report = normalize_log_report(body, self._stamp(), redact=redact)
+            if self._junit_shadows(report):
+                # Remembered as a run with nothing to count, so a restart does not fetch its logs again.
+                marker = normalize_log_report({**body, 'outcome': 'no_tests', 'summary': {}, 'tests': [], 'runners': [],
+                                               'steps': [], 'provisional': False,
+                                               'skipped_steps': [{'step': '*', 'reason': 'junit_report_exists'}]},
+                                              self._stamp(), redact=redact)
+                self.record_event("ci_logtests", marker["run_key"], "CILogTestsAnalysed", marker, require_durable=True)
+                self._trim_ci_history("ci_logtests")
+                return {**{k: report[k] for k in ('run_key', 'outcome')}, 'skipped': 'junit_report_exists'}
+            # Only the compact form is persisted; the full per-test index lives in memory for the newest runs.
+            self.record_event("ci_logtests", report["run_key"], "CILogTestsAnalysed", compact_log_report(report),
+                              require_durable=True)
+            stream = self._events.get(("ci_logtests", report["run_key"]))
+            if report.get('tests') and stream:
+                stream[-1]['payload'] = report
+            self._trim_ci_history("ci_logtests")
+            return {k: report[k] for k in ('run_key', 'outcome', 'summary', 'runners')}
+
+    def _junit_shadows(self, log_report, pipelines=None):
+        from .ci_observability import bind_report_provider
+        if pipelines is None:
+            pipelines = [stream[-1]['payload'] for (kind, _), stream in self._events.items()
+                         if kind == 'ci_observation' and stream]
+        want = (log_report.get('provider_url'), str(log_report.get('provider_repo_id')), log_report['run_number'])
+        for (kind, _), stream in self._events.items():
+            if kind != 'ci_report' or not stream:
+                continue
+            row = bind_report_provider(stream[-1]['payload'], pipelines)
+            if (row.get('provider_url'), str(row.get('provider_repo_id')), row.get('run_number')) == want:
+                return True
+        return False
+
+    def ci_log_analysis(self, provider_url, provider_repo_id, run_number):
+        """What the collector already knows about one run's logs: {outcome, analysed_at} or None."""
+        from .ci_reports import log_run_key
+        with self._event_lock:
+            stream = self._events.get(("ci_logtests", log_run_key(provider_url, provider_repo_id, run_number)))
+            if not stream:
+                return None
+            payload = stream[-1]['payload']
+            if isinstance(payload, str):
+                payload = json.loads(payload)
+            return {'outcome': payload.get('outcome'), 'analysed_at': payload.get('analysed_at'),
+                    'provisional': payload.get('provisional') is True}
 
     def observe_ci_pipeline(self, row):
         from .ci_reports import normalize_provider_url
@@ -2015,12 +2141,22 @@ class ControlPlaneRepo:
     def _trim_ci_history(self, kind=None):
         from .ci_observability import _identity
         from .ci_performance import RECORD_LIMIT
-        from .ci_reports import HISTORY_BYTES, PIPELINE_LIMIT, REPORT_LIMIT
+        from .ci_reports import (
+            HISTORY_BYTES,
+            LOG_HISTORY_BYTES,
+            LOG_INDEX_RUNS,
+            LOG_NEGATIVE_LIMIT,
+            LOG_REPORT_LIMIT,
+            PIPELINE_LIMIT,
+            REPORT_LIMIT,
+            compact_log_report,
+            log_finished_epoch,
+        )
         keep = set()
-        kinds = {kind} if kind is not None else {"ci_report", "ci_observation", "ci_telemetry"}
+        kinds = {kind} if kind is not None else set(_CI_EVENT_KINDS)
         arrivals = {tuple(entry): index for index, entry in enumerate(self._event_order)}
         for kind, limit in (("ci_report", REPORT_LIMIT), ("ci_observation", PIPELINE_LIMIT),
-                            ("ci_telemetry", RECORD_LIMIT)):
+                            ("ci_telemetry", RECORD_LIMIT), ("ci_logtests", LOG_REPORT_LIMIT)):
             if kind not in kinds:
                 continue
             keys = [key for key in self._events if key[0] == kind]
@@ -2028,9 +2164,18 @@ class ControlPlaneRepo:
                 for event in self._events[key]:
                     if isinstance(event.get("payload"), str):
                         event["payload"] = json.loads(event["payload"])
-            keys.sort(key=lambda key: (self._events[key][-1].get("ingest_timestamp", ""),
-                                      arrivals.get((*key, self._events[key][-1]["sequence"]), -1)),
-                      reverse=True)
+            if kind == 'ci_logtests':
+                # Newest run first, by when the run finished and not by when it happened to be read: a backlog analysed
+                # today must not push out the runs that matter most.
+                keys.sort(key=lambda key: (log_finished_epoch(self._events[key][-1]['payload'],
+                                                              self._events[key][-1].get("ingest_timestamp", "")),
+                                           self._events[key][-1].get("ingest_timestamp", ""),
+                                           arrivals.get((*key, self._events[key][-1]["sequence"]), -1)),
+                          reverse=True)
+            else:
+                keys.sort(key=lambda key: (self._events[key][-1].get("ingest_timestamp", ""),
+                                          arrivals.get((*key, self._events[key][-1]["sequence"]), -1)),
+                          reverse=True)
             if kind == 'ci_observation' and any(not key[1].startswith('[') for key in keys):
                 # Upgrade may retain a legacy "repo_id:run" stream alongside
                 # a new provider-scoped stream. Supersede only exact full
@@ -2046,11 +2191,35 @@ class ControlPlaneRepo:
                         if identity is not None:
                             seen.add(identity)
                 keys = unique
-            size = 0
-            for key in keys[:limit]:
+            size, budget, ordered, indexed = 0, HISTORY_BYTES, keys[:limit], set()
+            if kind == 'ci_logtests':
+                budget = LOG_HISTORY_BYTES
+                # Runs with counts and runs with nothing to count are limited separately, so a long tail of the latter
+                # can never evict the former.
+                counted = [key for key in keys if self._events[key][-1]['payload'].get('outcome') == 'counted']
+                empty = [key for key in keys if self._events[key][-1]['payload'].get('outcome') != 'counted']
+                ordered = counted[:limit] + empty[:LOG_NEGATIVE_LIMIT]
+                # The per-test index stays in memory for the newest run of every repository and branch first, then for
+                # the newest of the rest, up to LOG_INDEX_RUNS; older runs keep their counts and failing tests.
+                withindex = [key for key in ordered if self._events[key][-1]['payload'].get('tests')
+                             and not self._events[key][-1]['payload'].get('index_dropped')]
+                seen = set()
+                for key in withindex:
+                    payload = self._events[key][-1]['payload']
+                    lane = (payload.get('provider_url'), str(payload.get('provider_repo_id')), payload.get('branch'))
+                    if lane not in seen and len(indexed) < LOG_INDEX_RUNS:
+                        seen.add(lane)
+                        indexed.add(key)
+                for key in withindex:
+                    if len(indexed) < LOG_INDEX_RUNS:
+                        indexed.add(key)
+            for key in ordered:
                 latest = self._events[key][-1]
+                if (kind == 'ci_logtests' and latest['payload'].get('tests') and not latest['payload'].get('index_dropped')
+                        and key not in indexed):
+                    latest['payload'] = compact_log_report(latest['payload'])
                 size += len(json.dumps(latest).encode())
-                if size > HISTORY_BYTES:
+                if size > budget:
                     break
                 self._events[key] = [latest]
                 keep.add(key)
@@ -2074,18 +2243,29 @@ class ControlPlaneRepo:
                 events.sort(key=lambda event: (event.get("ingest_timestamp", ""), arrivals.get(
                     (event["entity_type"], event["entity_id"], event["sequence"]), -1)), reverse=True)
                 payloads = [event['payload'] for event in events]
-                if kind == 'ci_report' and run is not None:
+                if kind == 'ci_logtests':
+                    payloads = [row for row in payloads if row.get('outcome') == 'counted']
+                if kind in ('ci_report', 'ci_logtests') and run is not None:
                     payloads = [row for row in payloads
                                 if (bound := bind_report_provider(row, pipelines)) and all(
                                     str(bound.get(key)) == str(value) for key, value in run.items())]
                 if compact:
-                    fields = ((*_REPORT_FIELDS, 'report_id', 'summary', 'attempt') if kind == 'ci_report'
+                    fields = ((*_REPORT_FIELDS, 'report_id', 'summary', 'attempt', 'source', 'runners',
+                               'index_complete', 'skipped_steps') if kind in ('ci_report', 'ci_logtests')
                               else (*_PIPELINE_FIELDS, 'event', 'ref', 'url', 'coverage', 'stale',
                                     'project_id', 'language', 'mission_id', 'mission_key', 'session_id'))
                     payloads = [{key: row[key] for key in fields if key in row} for row in payloads]
                 return copy.deepcopy(payloads)
             pipelines = rows("ci_observation")
             reports = rows("ci_report")
+            # Tests parsed from logs stand in only for runs with no uploaded report; a JUnit upload always wins.
+            shown = {(b.get('provider_url'), str(b.get('provider_repo_id')), b.get('run_number'))
+                     for b in (bind_report_provider(row, pipelines) for row in reports)}
+            parsed = [row for row in rows("ci_logtests")
+                      if (row.get('provider_url'), str(row.get('provider_repo_id')), row.get('run_number')) not in shown]
+            if parsed:
+                reports = sorted(reports + parsed, reverse=True,
+                                 key=lambda row: row.get('ingested_at') or row.get('reported_at') or '')
             from .ci_reports import reconcile_report_identities
             reconcile_report_identities(reports, pipelines)
             if compact:
@@ -2503,7 +2683,7 @@ class ControlPlaneRepo:
                 for event, feed, publish in pending_events:
                     key = (event["entity_type"], event["entity_id"])
                     self._events.setdefault(key, []).append(event)
-                    if event["entity_type"] in {"ci_report", "ci_observation", "ci_telemetry"}:
+                    if event["entity_type"] in _CI_EVENT_KINDS:
                         self._ci_sequence = max(self._ci_sequence, event["sequence"] + 1)
                     if feed:
                         self._event_order.append((*key, event["sequence"]))
@@ -2588,7 +2768,7 @@ class ControlPlaneRepo:
             if self._pending_scheduler_events is not None:
                 seq = max(seq, max((e["sequence"] + 1 for e, _, _ in self._pending_scheduler_events
                                    if (e["entity_type"], e["entity_id"]) == key), default=seq))
-            if entity_type in {"ci_report", "ci_observation", "ci_telemetry"}:
+            if entity_type in _CI_EVENT_KINDS:
                 seq = max(seq, self._ci_sequence)
             ev = {
                 "event_id": new_id("event"),
@@ -2627,7 +2807,7 @@ class ControlPlaneRepo:
                 try:
                     self._sink.record_required(ev)
                 except Exception:
-                    if entity_type in {"ci_report", "ci_observation", "ci_telemetry"} and not stream:
+                    if entity_type in _CI_EVENT_KINDS and not stream:
                         self._events.pop(key, None)
                     raise
             if self._pending_scheduler_events is not None:
@@ -2638,7 +2818,7 @@ class ControlPlaneRepo:
                         pass
                 self._pending_scheduler_events.append((ev, feed, publish))
                 return _copy(ev)
-            if entity_type in {"ci_report", "ci_observation", "ci_telemetry"}:
+            if entity_type in _CI_EVENT_KINDS:
                 self._ci_sequence = seq + 1
             stream.append(ev)
             if feed:
@@ -3113,6 +3293,16 @@ class ControlPlaneRepo:
         points = llm_stats.timeseries(records, metric, since=since, until=now, step=step_s)
         return dict(meta, step=step, metric=metric, points=points)
 
+    def llm_spend(self, window="24h", prices=(), **filters):
+        """Priced estimate of the window's tokens (docs/usage-spend-estimate.md). Proxy traffic only unless a source is asked
+        for: a transcript and the proxy can describe the same call, so the two are never summed."""
+        source = filters.get("source") or "llm-proxy"
+        filters["source"] = source
+        if not prices:
+            return {"configured": False}
+        records, _, meta, _, _ = self._llm_window(window, filters)
+        return dict(meta, source=source, **usage_spend.estimate(records, prices, source))
+
     def llm_errors(self, window="24h", error_class=None, **filters):
         filters["source"] = "llm-proxy"   # a transcript carries no status, so it has no errors
         records, resolve, meta, _, _ = self._llm_window(window, filters)
@@ -3313,6 +3503,10 @@ class ControlPlaneRepo:
         self._test_runs = dict(delivery.get("test_runs", {}))
         self._reviews = dict(delivery.get("reviews", {}))
         self._pull_requests = dict(delivery.get("pull_requests", {}))
+        for pull in self._pull_requests.values():      # a record stored before end_count existed has ended once if it has an end time
+            if isinstance(pull, dict) and (pull.get("merged_at") or pull.get("closed_at")) and not pull.get("end_count"):
+                pull["end_count"] = 1
+        self.pull_request_version += 1
         self._token_usage = dict(delivery.get("token_usage", {}))
         self._resource_usage = {tuple(json.loads(k)): [dict(x) for x in v]
                                 for k, v in delivery.get("resource_usage", {}).items()}
@@ -3362,7 +3556,7 @@ class ControlPlaneRepo:
         self._ci_sequence = max(int(state.get("ci_sequence", 0)),
                                 max((event.get("sequence", -1) + 1
                                      for key, stream in self._events.items()
-                                     if key[0] in {"ci_report", "ci_observation", "ci_telemetry"}
+                                     if key[0] in _CI_EVENT_KINDS
                                      for event in stream), default=0))
         self._ci_test_projection = None
         self._ci_history_truncated = set(state.get('ci_history_truncated', []))
@@ -3639,6 +3833,8 @@ class ControlPlaneRepo:
                                     verdict=payload.get("verdict"),
                                     started_at=payload.get("started_at"),
                                     completed_at=payload.get("completed_at"),
+                                    repository=payload.get("repository"),
+                                    pull_request_number=payload.get("pull_request_number"),
                                 )
                         elif entity_type == "pull_request":
                             if event_type == "PullRequestMerged":
@@ -3652,6 +3848,9 @@ class ControlPlaneRepo:
                                 branch=payload.get("branch"),
                                 base=payload.get("base"),
                                 created_at=payload.get("created_at"),
+                                merged_at=payload.get("merged_at"),
+                                closed_at=payload.get("closed_at"),
+                                ended_source=payload.get("ended_source"),
                             )
                     except (ValueError, KeyError, TypeError):  # a bad row never blocks startup
                         continue

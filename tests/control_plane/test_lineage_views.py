@@ -697,6 +697,7 @@ def test_replay_since_join_hides_the_pre_join_history_strictly(fab):
     old = next(n for n in head["nodes"] if n["id"] == "task:old")
     assert old["label"] == "current-label"                       # current values are shown...
     assert old["first_event_id"] is None and old["fields"]["label"]["event_id"] is None      # ...without history
+    assert old["first_seen_at"] is None                            # a time is history too
     assert old["fields"]["label"]["admitted_at"] is None
     assert lin(fab, fab.bob, step=0)["nodes"] == []                   # step 0 = nothing from before the join
     # non-monotonic stamps: filtering is per event, not a prefix slice

@@ -26,6 +26,23 @@ sections:
       minio_password: "REDACTED"
       rustfs_bucket: "REDACTED"
       ci_actions: false             # true lets operators retry/cancel CI pipelines
+      # OPTIONAL: hosts that are meant to be off (benchmark boxes, powered-off machines). They raise no host_stale item and
+      # are listed quietly as "Expected offline" on Attention. Host names or ids. Empty by default; REPLACE with your own.
+      # attention:
+      #   expected_offline_hosts: []     # e.g. ["beast", "bender"]
+      # OPTIONAL: prices for the Usage "Spend (est.)" tab and the PR trail cost figure, in dollars per million tokens.
+      # There are no built-in prices; without a table (or with any unpriced model) cost is shown as unknown.
+      # usage:
+      #   prices:
+      #     - {model: "claude-sonnet-*", input: 0.0, output: 0.0, cached: 0.0}   # REPLACE the zeros with your real prices
+      #     - {model: "qwen*", input: 0, output: 0}                              # self-hosted: say so with an explicit zero
+      # OPTIONAL: the Evolution tab's staleness limit (docs/agent-evolution.md) and the learning export
+      # (docs/learning-trails.md: records per merged PR, GET /api/v1/learning/trails). Both work with these defaults.
+      # evolution:
+      #   stale_after_minutes: 120
+      # learning:
+      #   enabled: true
+      #   require_role: operator          # operator | viewer; the export is fleet-wide
       # OPTIONAL: absolute path (as the web container sees it) to a checkout of InferWeave's
       # deploy/pipelines/*.yaml. Read live. Absent: no definitions, and any host token may report
       # deployment events for any component (the Deployments snapshot then carries a warning).
@@ -38,7 +55,9 @@ sections:
       # so a host updater with a gate URL (IW_DEPLOY_GATE_URL) stays on its running version.
       # A definition may carry `requires: [{repo, ci_context, stage}]` to hold its track until that
       # stage of another follows track is rolled out (see the README, "Cross-track order").
-      # deployment_definitions: "/srv/inferweave/deploy/pipelines"
+      # deploy.sh mounts ~/.local/share/herdr-engineering/pipelines (kept equal to InferWeave's
+      # deploy/pipelines on main by the herdr-pipelines-sync timer) at /etc/herdr/pipelines.
+      # deployment_definitions: "/etc/herdr/pipelines"
       # OPTIONAL: true enables the audited Deployments actions (POST /api/deployments/force and
       # /ack, operator role). Read live; anything but true is off. Force only records a request the
       # host updaters pick up; the host permit gate (GET /api/deployments/permit) works either way.
@@ -65,7 +84,9 @@ sections:
       # an unknown key is refused. Omit the whole block when collab is not used.
       collab:
         cognito_pool: "us-west-2_REDACTED"           # also read by collab-sync.sh
-        cognito_clients: ["REDACTED"]                # allowed app client ids (tokens)
+        # allowed app client ids (tokens). The pool is SHARED (e.g. with lc-binbase-scheduler): list only the
+        # clients whose tokens may sign in here AND open lab share links; a token of any listed client counts.
+        cognito_clients: ["REDACTED"]
         cognito_group: "local.dev"                   # required cognito:groups membership
         cognito_web_client: "REDACTED"               # browser page app client (Hosted UI, PKCE)
         cognito_domain: "https://REDACTED.auth.us-west-2.amazoncognito.com"
@@ -73,6 +94,9 @@ sections:
         operator_user: "REDACTED"                    # Cognito username the dashboard's no-sign-in
                                                      # collaboration acts as (required)
         # operator_email: "owner@example.test"       # optional, shown for the operator
+        # public_url must be a bare https origin (empty path or "/") when shares are enabled: links and the lab
+        # sign-in callback live at <public_url>/s/... and the web client needs <public_url>/s/callback as an
+        # allowed callback + logout URL (see COLLAB.md, "Share links").
         # T15 attention inbox, evidence-based progress, analytics (everything off unless enabled):
         # insights:
         #   enabled: false                 # kill_switch: true turns every route off at once
@@ -80,6 +104,21 @@ sections:
         #   evidence_writers: ["key:ci-service"]   # ONLY these writers' merged/validated marks count as evidence
         #   min_group_size: 5              # aggregates over fewer items are hidden
         #   reads_per_minute: 60
+      # OPTIONAL: artifact share links (/s/ on collab.public_url). OFF unless `enabled: true`, which needs the
+      # collab marker and a signing_secret: deploy.sh refuses otherwise. share-public gets only the serving keys
+      # below plus collab's cognito_pool/cognito_clients/cognito_web_client/cognito_domain/public_url (render-share).
+      # share:
+      #   enabled: false
+      #   signing_secret: "REDACTED"       # >= 32 bytes; generate locally, never commit or print it:
+      #                                    #   openssl rand -hex 32   (paste the output here)
+      #   session_seconds: 14400           # lab session lifetime cap; also never past the share's expiry NOR the
+      #                                    # Cognito access token's exp (~1 h with pool defaults), so ~1 h in practice
+      #   default_public_days: 30          # public links: 1-90 days
+      #   max_share_bytes: 536870912       # one bundle
+      #   max_total_bytes: 2147483648      # all live bundles
+      #   max_files: 20000                 # files per bundle
+      #   # container paths; keep the defaults with deploy.sh (its mounts are fixed):
+      #   # shares_dir: /shares   events_dir: /share-events   marker_dir: /var/lib/herdr/share-markers
       # OPTIONAL: lineage-graph evidence in the merge gate. OFF unless you uncomment AND set `enabled: true`.
       # It runs after decide_merge for every PR and can only withhold a merge. `evidence_writers` is REQUIRED and
       # must be explicit graph principal ids ("key:<12 hex of sha256(the CI reporter's API key)>"): an empty list,
@@ -91,6 +130,27 @@ sections:
       #   evidence_writers: ["key:<12-hex-of-the-ci-reporter-key>"]   # REPLACE: the placeholder is refused at startup
       #   required_checks: ["ci"]        # edges name their check in attrs.check (default "ci")
       #   require_review_quorum: false   # true also needs control_plane.review_quorum to be satisfied
+      #   evidence_source:               # OPTIONAL: the writer of the `validated` edges the gate reads (own switch, off by default)
+      #     enabled: false               # step 1 of the enable sequence; the gate's evidence_writers is step 3
+      #     principal: "ci-evidence:woodpecker"   # dedicated in-process id; must start with ci-evidence: (API-key ids are refused)
+      #     check: "ci"                  # the check name written to attrs.check
+      #     repos:                       # ONLY these repos / PRs get evidence (also enrolled in control_plane.review_gate)
+      #       - repo: github.com/<owner>/<name>
+      #         prs: [123]               # optional; omit for every open non-draft PR of the repo
+      # OPTIONAL: the Rakazo mobile bridge (off unless `enabled: true`; then /rpc/* and /api/auth/* serve the Rakazo
+      # iPhone app from the Personal Assistant below, which must be enabled too). Passwords are scrypt HASHES made
+      # with `herdr-eng bridge hash-password`; never put a password here. See deploy/control-plane/README.md.
+      # rakazo_bridge:
+      #   enabled: false
+      #   token_ttl_days: 30             # a signed-in phone stays signed in this long (1-365)
+      #   max_tokens: 5                  # live sessions per account; the oldest is dropped (1-50)
+      #   trusted_proxies: []            # proxies whose X-Forwarded-For is believed (loopback always); the fabric gateway's
+      #                                  # address as the control plane sees it goes here so lockout keys on the real client
+      #   accounts:                      # shape reserved for a later multi-user mode; today only role: operator
+      #     - email: "you@example.com"
+      #       password_scrypt: "scrypt$32768$8$1$<salt_b64>$<hash_b64>"
+      #       role: operator
+      #       # tokens_valid_after: "2026-11-02T09:30:00Z"   # revoke every token issued before this (lost phone)
       # OPTIONAL: the Personal Assistant (inert unless `enabled: true`). Nothing in
       # the assistant module runs while disabled; the /personal-assistant dashboard
       # view only appears when the `assistant_v1` capability is advertised (enabled).
@@ -107,6 +167,20 @@ sections:
       #   delegation_consumer:
       #     enabled: false
       #     source_harness: pi
+      #   # Scheduled CI watch: every interval the server looks for NEW failed CI runs and queues repair / re-run
+      #   # PROPOSALS (nothing is merged, pushed or run without an approval). Off by default. Needs, per listed
+      #   # user: project_intelligence.enabled (no kill switch), a project_intelligence.assistant_viewers
+      #   # "<tenant>/<user>" entry, an enabled assistant and an active watch_ci grant (scope "*").
+      #   ci_watch:
+      #     enabled: false
+      #     interval_seconds: 300          # minimum 60
+      #     auto_grant: false              # true = create the standing watch_ci grant (30 day max, audited as
+      #                                    # actor system:ci_watch) when missing; false = log a WARNING hourly
+      #     # source: both                 # monitor (CI monitor snapshot) | lineage (ci graph nodes) | both
+      #     # max_age_seconds: 21600       # ignore failures that finished longer ago than this
+      #     users:                         # tenant_id: from personal_assistant.tenancy (default tenant is "default")
+      #       - {tenant_id: default, user_id: open-listener}        # the dashboard / open tailnet listener
+      #       - {tenant_id: default, user_id: "rakazo:<16 hex>"}    # a Rakazo bridge account (see README)
       #   # Real inference. When `endpoint` is set the service uses an HTTP
       #   # chat-completions runner (OpenAI-compatible, incl. tool-calling); when
       #   # empty it falls back to a deterministic local runner (skeleton only).

@@ -63,7 +63,8 @@ def _snapshot(root: Path) -> dict:
     files = {}
     count = 0
     for directory, dirs, names in os.walk(root, followlinks=False):
-        dirs[:] = sorted(d for d in dirs if d not in EXCLUDED
+        # Hidden directories (.pi-eng test output, .worktrees, tool caches) are never deliverables.
+        dirs[:] = sorted(d for d in dirs if d not in EXCLUDED and not d.startswith('.')
                          and not (Path(directory) / d).is_symlink())
         for name in sorted(names):
             count += 1
@@ -93,30 +94,64 @@ def begin(root: Path, state: Path) -> dict:
     return {'state': str(state), 'root': str(root)}
 
 
-def discover(state: Path) -> dict:
+def discover(state: Path, urls: list[str] | tuple[str, ...] = ()) -> dict:
     state = Path(state)
     data = _load(state)
     candidates = []
     current = _snapshot(Path(data['root']))
     # Remove stale versions from pending, including files deleted after an offer.
     data['pending'] = {key: value for key, value in data['pending'].items()
-                       if current.get(value['name']) == value['sha256']}
+                       if value.get('kind') == 'url' or current.get(value['name']) == value['sha256']}
+    seen_content = set()
+    duplicates = 0
     for name, digest in sorted(current.items()):
         if data['baseline'].get(name) == digest:
             continue
         key = hashlib.sha256((name + '\0' + digest).encode()).hexdigest()[:16]
         if key in data['offered']:
             continue
-        item = {'id': key, 'name': name, 'sha256': digest}
+        data['offered'].append(key)
+        # The same bytes under several names are one thing to look at, not many.
+        if digest in seen_content:
+            duplicates += 1
+            continue
+        seen_content.add(digest)
+        item = {'id': key, 'kind': 'file', 'name': name, 'sha256': digest}
         candidates.append(item)
         data['pending'][key] = item
+    skipped_urls = []
+    for url in dict.fromkeys(urls):
+        key = 'u' + hashlib.sha256(url.encode()).hexdigest()[:15]
+        if key in data['offered']:
+            continue
+        try:
+            _check_url(url)
+        except ValueError as error:
+            skipped_urls.append({'url': url, 'reason': str(error)})
+            continue
         data['offered'].append(key)
+        item = {'id': key, 'kind': 'url', 'url': url}
+        candidates.append(item)
+        data['pending'][key] = item
     if candidates:
         data['pending'] = {item['id']: item for item in candidates}
     _save(state, data)
-    return {'candidates': candidates, 'prompt': (
-        f'There are {len(candidates)} files to view. Open all, select files, or skip?'
-        if candidates else None), 'destination': 'automatic'}
+    files = sum(1 for item in candidates if item['kind'] == 'file')
+    links = len(candidates) - files
+    if not candidates:
+        prompt = None
+    elif not links:
+        prompt = f'There are {files} files to view. Open all, select files, or skip?'
+    else:
+        what = ' and '.join(part for part in (f'{files} file{"s" * (files != 1)}' if files else '',
+                                              f'{links} link{"s" * (links != 1)}') if part)
+        prompt = f'There are {what} to open on your device. Open all, select, or skip?'
+    result = {'candidates': candidates, 'prompt': prompt, 'destination': 'automatic'}
+    if duplicates:
+        result['duplicates_collapsed'] = duplicates
+    if skipped_urls:
+        result['skipped_urls'] = skipped_urls
+    return result
 
 
 def dismiss(state: Path) -> dict:
@@ -215,10 +250,14 @@ def show(state: Path, selected: list[str], *, target: str | None = None) -> dict
     target = _destination(target)
     keys = list(data['pending']) if selected == ['all'] else list(dict.fromkeys(selected))
     if not keys or any(key not in data['pending'] for key in keys):
-        raise ValueError('selection must contain pending file IDs or all')
+        raise ValueError('selection must contain pending file or link IDs or all')
     prepared = []
     for key in keys:
         item = data['pending'][key]
+        if item.get('kind') == 'url':
+            _check_url(item['url'])
+            prepared.append((key, {'url': item['url']}))
+            continue
         content = _read(Path(data['root']), item['name'])
         if hashlib.sha256(content).hexdigest() != item['sha256']:
             raise ValueError('selected source changed; discover and ask again')
@@ -238,7 +277,8 @@ def show(state: Path, selected: list[str], *, target: str | None = None) -> dict
     return {'results': results}
 
 
-def open_url(url: str, *, target: str | None = None) -> dict:
+def _check_url(url: str) -> None:
+    """Raise ValueError unless `url` may be opened on the operator's device."""
     parts = urlsplit(url)
     if parts.scheme not in {'http', 'https'} or not parts.hostname or parts.username or parts.password:
         raise ValueError('only HTTP(S) URLs without embedded credentials may be opened')
@@ -257,6 +297,10 @@ def open_url(url: str, *, target: str | None = None) -> dict:
                          or (getattr(address, 'ipv4_mapped', None) and address.ipv4_mapped.is_loopback))
     if host == 'localhost' or host.endswith('.localhost') or local:
         raise ValueError('executor-local URL requires an existing client-reachable fabric URL')
+
+
+def open_url(url: str, *, target: str | None = None) -> dict:
+    _check_url(url)
     return remote_request(_destination(target), {'url': url})
 
 
@@ -272,6 +316,9 @@ def register_parser(sub) -> None:
             command.add_argument('--state', required=True, type=Path)
         if action == 'begin':
             command.add_argument('--root', required=True, type=Path)
+        if action == 'discover':
+            command.add_argument('--url', action='append', default=[],
+                                 help='a link this task produced; offered alongside generated files')
         if action == 'show':
             command.add_argument('--select', required=True, nargs='+')
             command.add_argument('--target')
@@ -282,7 +329,7 @@ def _command(args) -> int:
     if args.open_action == 'begin':
         result = begin(args.root, args.state)
     elif args.open_action == 'discover':
-        result = discover(args.state)
+        result = discover(args.state, args.url)
     elif args.open_action == 'dismiss':
         result = dismiss(args.state)
     elif args.open_action == 'show':

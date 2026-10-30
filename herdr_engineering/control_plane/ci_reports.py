@@ -169,6 +169,120 @@ def normalize_report(body, stamp, *, redact=None, _identity_version=2):
     return dict(values, report_id=digest, reported_at=reported, identity_version=_identity_version)
 
 
+LOG_SOURCE = 'log_parse'
+LOG_REPORT_LIMIT = 400          # analysed runs retained, separately from uploaded reports so they never evict a JUnit upload
+LOG_HISTORY_BYTES = 64 * 1024 * 1024
+LOG_NEGATIVE_LIMIT = 2000       # runs found to have no tests (a few hundred bytes each), kept apart so they never evict a count
+LOG_INDEX_RUNS = 40             # analysed runs that keep their per-test index in memory; the rest keep counts only
+LOG_PERSISTED_FAILURES = 50     # failing tests named in the durable record, whatever the size of the run
+LOG_OUTCOMES = ('counted', 'no_tests')
+
+
+def log_run_key(provider_url, provider_repo_id, run_number):
+    """Stable event id of one run's log analysis; re-analysing a run replaces its record."""
+    return hashlib.sha256(json.dumps([provider_url, str(provider_repo_id), int(run_number)],
+                                     separators=(',', ':')).encode()).hexdigest()
+
+
+def compact_log_report(report):
+    """The durable form of a log report: counts, runners, steps and a bounded list of the failing tests.
+
+    The full per-test index is thousands of rows (about 0.9 MB per 2,500 tests) and is rebuilt from the live log, so it is
+    kept in memory only. A record restored from storage says so with `index_dropped`.
+    """
+    if not report.get('tests'):
+        return report
+    failing = [t for t in report['tests'] if t.get('status') in ('failed', 'errored')][:LOG_PERSISTED_FAILURES]
+    return {**report, 'tests': failing, 'index_complete': False, 'index_dropped': True}
+
+
+def log_finished_epoch(report, fallback=''):
+    """When the run behind a log report finished (seconds), else when the report arrived; 0 if neither parses."""
+    for value in (report.get('run_finished_at'), fallback):
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return float(value)
+        if isinstance(value, str) and value:
+            try:
+                return float(value)
+            except ValueError:
+                pass
+            try:
+                return datetime.fromisoformat(value.replace('Z', '+00:00')).timestamp()
+            except ValueError:
+                continue
+    return 0.0
+
+
+def normalize_log_report(body, stamp, *, redact=None):
+    """A report built from CI log text: counts, runner names and a per-test index, never log text.
+
+    `body` carries the run identity and `steps`, the output of `ci_logtests.combine_steps`. Names are redacted and
+    bounded; the index shrinks until the record fits, and says so in `index_complete`.
+    """
+    if not isinstance(body, dict):
+        raise ValueError('Log report must be a JSON object')
+    values = {'provider_url': normalize_provider_url(body.get('provider_url'), redact=redact)}
+    for key in ('repository', 'branch', 'revision'):
+        value = body.get(key)
+        if not isinstance(value, str) or not value.strip() or len(value) > 500:
+            raise ValueError(f'{key} must be a nonempty string of at most 500 characters')
+        values[key] = _text(value, redact=redact)
+    number = body.get('run_number')
+    if isinstance(number, bool) or not isinstance(number, int) or number < 1:
+        raise ValueError('run_number must be a positive integer')
+    provider = body.get('provider_repo_id')
+    if isinstance(provider, bool) or not isinstance(provider, (str, int)) or not str(provider) or len(str(provider)) > 300:
+        raise ValueError('provider_repo_id must be a string or integer')
+    outcome = body.get('outcome')
+    if outcome not in LOG_OUTCOMES:
+        raise ValueError('outcome must be counted or no_tests')
+    summary = body.get('summary') or {}
+    counts = {state: max(0, int(summary.get(state, 0))) for state in ('passed', 'failed', 'errored', 'skipped')}
+    if outcome == 'no_tests':
+        counts = dict.fromkeys(counts, 0)
+    counts.update(total=sum(counts.values()), duration_ms=0)
+    seen, tests, occurrences = set(), [], {}
+    for raw in (body.get('tests') or [])[:MAX_CASES] if outcome == 'counted' else []:
+        label = [raw.get('step_id', ''), raw.get('suite', ''), raw.get('name', '')]
+        base = hashlib.sha256(json.dumps(label, ensure_ascii=True).encode()).hexdigest()
+        occurrences[base] = occurrences.get(base, 0) + 1
+        case_id = hashlib.sha256(f'{base}:{occurrences[base] - 1}'.encode()).hexdigest()[:24]
+        if case_id in seen or raw.get('status') not in ('passed', 'failed', 'errored', 'skipped'):
+            continue
+        seen.add(case_id)
+        ms = raw.get('duration_ms')
+        # Compact on purpose: a big suite is thousands of these. The step's name lives once in `steps`, and absent
+        # fields mean "none" (no message or trace is ever kept for a parsed test).
+        row = dict(id=case_id, name=_text(raw.get('name'), 500, redact=redact), status=raw['status'],
+                   duration_ms=int(ms) if isinstance(ms, (int, float)) and ms >= 0 else 0,
+                   step_id=_text(raw.get('step_id'), 40), line_start=max(1, int(raw.get('line_start') or 1)),
+                   line_end=max(1, int(raw.get('line_end') or raw.get('line_start') or 1)))
+        if raw.get('suite'):
+            row['suite'] = _text(raw.get('suite'), 500, redact=redact)
+        if isinstance(ms, (int, float)) and ms >= 0:
+            row['timed'] = True
+        if occurrences[base] > 1:
+            row['identity_ambiguous'] = True
+        tests.append(row)
+    steps = [{'step_id': _text(row.get('step_id'), 40), 'step': _text(row.get('step'), 200, redact=redact),
+              'runners': [_text(r, 40) for r in (row.get('runners') or [])][:8],
+              'indexed': bool(row.get('indexed'))} for row in (body.get('steps') or [])[:100]]
+    skipped = [{'step': _text(row.get('step'), 200, redact=redact), 'reason': _text(row.get('reason'), 80)}
+               for row in (body.get('skipped_steps') or [])[:100]]
+    complete = bool(body.get('index_complete')) and len(tests) == counts['total']
+    record = dict(values, provider_repo_id=provider if isinstance(provider, int) else _text(provider, redact=redact),
+                  run_number=number, source=LOG_SOURCE, outcome=outcome, summary=counts, tests=tests,
+                  runners=[_text(r, 40) for r in (body.get('runners') or [])][:16], steps=steps, skipped_steps=skipped,
+                  index_complete=complete, run_finished_at=_text(body.get('run_finished_at'), 40),
+                  provisional=body.get('provisional') is True)
+    while len(json.dumps(record).encode()) > MAX_XML_BYTES and record['tests']:
+        record['tests'] = record['tests'][:max(0, len(record['tests']) - max(1, len(record['tests']) // 8))]
+        record['index_complete'] = False
+    digest = hashlib.sha256(json.dumps(record, sort_keys=True).encode()).hexdigest()
+    return dict(record, report_id=digest, reported_at=stamp, ingested_at=stamp, analysed_at=stamp, identity_version=2,
+                run_key=log_run_key(values['provider_url'], provider, number))
+
+
 def matches_legacy_report(receipt, candidate):
     """Require the complete historical normalization, never display labels alone.
 

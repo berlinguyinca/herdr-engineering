@@ -354,8 +354,14 @@ test('local application modules load once when the browser asset transport is di
 },{invalidateAssetTransport:true}));
 
 test('shared selection: PR scope and a day bucket narrow summary, Tests and Runs through real HTTP',()=>commandCenter(async({page,base})=>{
- const history=await (await fetch(`${base}/api/v1/ci/history`)).json();
- const runs=history.pipelines.filter(r=>r.repository==='org/app');
+ // The first history read after start-up answers `syncing` with no runs while the monitor's own refresh is still running, so the
+ // runs are waited for here; reading once posted no reports at all and left only run 3's, which made this test fail by timing.
+ let runs=[];
+ for(let attempt=0;attempt<100&&runs.length<4;attempt+=1){
+  runs=(await (await fetch(`${base}/api/v1/ci/history`)).json()).pipelines.filter(r=>r.repository==='org/app');
+  if(runs.length<4)await new Promise(resolve=>setTimeout(resolve,100));
+ }
+ assert.equal(runs.length,4,'the four org/app runs are in the history before reports are posted');
  for(const r of runs.filter(r=>r.run_number!==3)) {
   const response=await fetch(`${base}/api/v1/ci/reports`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({...r,xml:`<testsuite><testcase name="selected-${r.run_number}"><failure/></testcase></testsuite>`})});
   assert.equal(response.status,200);
@@ -377,11 +383,9 @@ test('shared selection: PR scope and a day bucket narrow summary, Tests and Runs
  const summary=await (await summaryResponse).json(),tests=await (await testsResponse).json();
  assert.equal(summary.kpis.pipeline_count,1);assert.equal(tests.scope.report_count,1);
  assert.deepEqual(tests.tests.map(t=>t.name),['test_status']);
- await page.locator('[data-health-tree] [data-health-disclosure] > summary').first().click();
- await page.locator('[data-health-tree] [data-health-disclosure] [data-health-disclosure] > summary').first().click();
- await page.locator('[data-health-tree] [data-health-run]').first().waitFor({state:'attached'});
- assert.equal(await page.locator('[data-health-tree] [data-health-run]').count(),1);
- assert.match(await page.locator('[data-health-tree]').textContent(),/Run #3/);
+ await page.locator('[data-health-detail] [data-health-slot-run]').first().waitFor({state:'attached'});
+ assert.equal(await page.locator('[data-health-detail] [data-health-slot-run]').count(),1);
+ assert.match(await page.locator('[data-health-detail]').textContent(),/Run #3/);
  await page.waitForFunction(()=>document.querySelector('[data-ob-summary] .ci-ob-card:nth-child(3) strong')?.textContent==='1');
  assert.doesNotMatch(await page.locator('[data-ob-tests]').innerText(),/selected-[124]/);
  await page.locator('[data-ci-workspace="tests"]').click();
@@ -428,3 +432,23 @@ test('shared selection: last-24-runs exact old run reaches summary, Tests and Ru
  await page.locator('[data-ci-workspace="tests"]').click();
  assert.match(await page.locator('[data-ci-insights]').innerText(),/4 retained runs · 1 test report attempts/);
 },{oldRun:true}));
+
+test('All repositories shows a stacked passed/failed bar per repository; a bar selects it and offers investigation',()=>commandCenter(async({page})=>{
+ await page.locator('[data-ci-workspace="tests"]').click();
+ const row=page.locator('[data-ci-test-repo]').first();
+ await row.waitFor();
+ assert.match(await row.innerText(),/org\/app/);
+ assert.match(await row.innerText(),/[1-9]\d* failed/);
+ assert.ok(await row.locator('.ci-to-fail').count()>0,'failed segment drawn');
+ assert.equal(await page.locator('[data-ci-investigate]').count(),0,'no investigation options before a repository is chosen');
+ await row.click();
+ await page.locator('[data-ci-investigate="failing"]').waitFor();
+ assert.equal(await page.locator('[data-ci-repository]').evaluate(s=>s.selectedOptions[0].textContent.includes('org/app')),true);
+ assert.equal(await page.locator('[data-ci-test-repo]').first().getAttribute('aria-pressed'),'true');
+ await page.locator('[data-ci-investigate="failing"]').click();
+ await page.waitForFunction(()=>document.querySelector('[data-ob-test-sort]').value==='failure');
+ await page.locator('[data-ci-investigate="slow"]').click();
+ await page.waitForFunction(()=>document.querySelector('[data-ob-test-sort]').value==='duration');
+ await page.locator('[data-ci-investigate="clear"]').click();
+ await page.waitForFunction(()=>document.querySelectorAll('[data-ci-investigate]').length===0);
+}));

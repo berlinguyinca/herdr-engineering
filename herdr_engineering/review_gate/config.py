@@ -73,6 +73,7 @@ class ReviewGateConfig:
     app: AppConfig | None
     repos: tuple[RepoEnrollment, ...]
     poll_seconds: int = 15
+    shared_app: bool = False      # ``app: shared`` - use the fleet's ``github.app`` (and its write capability)
     reviewer: ReviewerConfig = ReviewerConfig()
     notify: NotifyConfig = NotifyConfig()
 
@@ -221,7 +222,11 @@ def parse_review_gate_section(raw, *, check_key_file=True) -> ReviewGateConfig:
     if not isinstance(enabled, bool):
         raise ValueError("review_gate: enabled must be a boolean")
     poll = _int(raw, "poll_seconds", "review_gate", 5) if "poll_seconds" in raw else 15
-    app = _app(raw["app"], check_key_file) if raw.get("app") is not None else None
+    shared_app = raw.get("app") == "shared"
+    if shared_app:
+        app = None
+    else:
+        app = _app(raw["app"], check_key_file) if raw.get("app") is not None else None
     repos_raw = raw.get("repos")
     if repos_raw is None:
         repos_raw = []
@@ -231,7 +236,7 @@ def parse_review_gate_section(raw, *, check_key_file=True) -> ReviewGateConfig:
     names = [r.repo for r in repos]
     if len(set(names)) != len(names):
         raise ValueError("review_gate.repos: duplicate repo")
-    if enabled and app is None:
+    if enabled and app is None and not shared_app:
         raise ValueError("review_gate: enabled requires app")
     reviewer = _reviewer(raw["reviewer"]) if raw.get("reviewer") is not None else ReviewerConfig()
     notify = _notify(raw["notify"]) if raw.get("notify") is not None else NotifyConfig()
@@ -242,6 +247,7 @@ def parse_review_gate_section(raw, *, check_key_file=True) -> ReviewGateConfig:
         poll_seconds=poll,
         reviewer=reviewer,
         notify=notify,
+        shared_app=shared_app,
     )
 
 

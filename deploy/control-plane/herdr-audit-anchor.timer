@@ -1,0 +1,13 @@
+# Every 15 minutes (anchoring detects truncation only back to the last anchor, so the interval is the exposure window).
+# Not enabled by anything: `systemctl enable --now herdr-audit-anchor.timer` is the operator's step.
+[Unit]
+Description=Anchor the assistant audit head every 15 minutes
+
+[Timer]
+OnCalendar=*:0/15
+Persistent=true
+AccuracySec=30s
+Unit=herdr-audit-anchor.service
+
+[Install]
+WantedBy=timers.target

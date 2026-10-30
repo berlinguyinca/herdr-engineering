@@ -5,6 +5,80 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Artifact gallery: filter by linked work (unified workspace P03)
+- The Artifacts page can list what is linked to a project, issue, task or room ("Linked to" + id, through `/api/v1/artifacts/for/<kind>/<ref>`, which already filters by what the signed-in user may read), and an artifact's page shows a "Linked to" section. Type and status filters apply to the full list only. The web client gains `artifactsForContext` and `artifactLinks`. No server change.
+
+### Artifact registry: link from the CLI (unified workspace P03)
+- `herdr-eng artifacts links <id>` lists an artifact's bindings and `artifacts link <id> --project|--issue|--task|--room [--version V] [--link-kind origin|reference|derived]` adds one through the existing links route (idempotent; refused client-side with no target). Searching a project, issue, task or room is `artifacts for <kind> <ref> --query`. There is still no `diff`: the server has no diff route.
+
+### Collaboration tasks: crash takeover (unified workspace P05)
+- `control_plane.collab.task_lease_seconds` (60 to 604800, YAML only, read at startup, absent = off) turns the lease on. A change needs a restart; it is not a hot switch.
+- `CollabService.task_lease_seconds` (default None = off): an accepted task whose lease ran out goes back to pending for its target agent when that agent polls its inbox, as a replayable `task.requeue` event. Each task carries an `attempt` (starts at 1); an update that names a stale `attempt` is refused with 409. No fleet-config key yet, so nothing changes in production.
+
+### Artifact registry: read-only CLI (unified workspace P03)
+- `herdr-eng artifacts show <id> [version]`, `versions <id>` and `for <kind> <ref> [--query --media-type --limit --cursor]` browse the versioned registry through the existing read routes. Nothing new is exposed server-side; an unreadable artifact answers "not found, or you cannot read it". The key is read from the environment variable named by `--api-key-env` and never printed.
+
+### Artifact registry: scheduled reconcile (unified workspace P03)
+- The worker can now run the registry's reconcile pass on a schedule: `control_plane.artifact_reconcile: {enabled, interval_seconds, grace_seconds, orphan_ttl_hours, limit}` in the fleet file (YAML only, off unless `enabled` is exactly true). It marks orphan blobs (never deletes them), closes expired uploads and purges tombstones past their hold window; lineage re-emission is not part of the scheduled pass. A failing pass is logged and never stops the worker.
+
+### Unified workspace P05: safe retry of a task completion
+- `POST /api/v1/collab/tasks/{id}/update`: repeating a `done`/`failed` update with the identical result now returns `{"status": ..., "replayed": true}` and writes no second event (the agent's answer was lost, or it restarted). A different result or outcome on a finished task is still a 400, and a repeated `accepted` is still a 400 as before.
+
+### Unified workspace P05: review lineage in the work graph
+- A task created with `reviews_task_id` now folds into the work graph as a `depends_on` edge from the review task to the work task (the contract's existing edge, dependent -> prerequisite) and a `reviews_task_id` attr. No new edge type, no schema change.
+
+### Unified workspace P05: independent review enforced where tasks are created
+- `POST /api/v1/collab/rooms/{id}/tasks` accepts an optional `reviews_task_id`. A review task is refused (400) when its reviewer is the agent that did the work or the agent that handed it out, and an agent cannot choose the reviewer of its own work; an unknown task or one from another room is a 404. The id is stored on the task and in the `task_created` event. Without the field nothing changes, and idempotency keys keep their meaning (the request digest only gains the id when it is present).
+
+### Unified workspace P05: durable task leases (migration 0040)
+- `team_task_leases` (additive, idempotent, `-- DOWN:`) and `team_task_leases_pg.PgLeaseStore`: the same fencing-token lease contract as the in-memory `LeaseStore`, every transition one conditional statement so two control-plane processes cannot both hold a task. Tests run the lease contract against Postgres plus a 12-way concurrent acquire (exactly one winner). Still not called by any route.
+
+### Unified workspace P05 (partial, library only): team templates, task admission, reviewer separation, leases
+- New `herdr_engineering/control_plane/team_tasks.py`: `TeamTemplate` roles (planner, implementer(s), one independent read-only reviewer, optional coordinator) that cannot name a host; `admit` lets a task in only from an authorized human through the P01 broker (`submit_task`), never from a message or tainted content, with role-bounded actions, template budget, deadline, acyclic dependencies and reviewer independence; `LeaseStore` gives one lease per task with monotonic fencing tokens (exactly-once completion, crash takeover fences off the stale worker, abort or expiry authorizes nothing).
+- Nothing calls it yet: no routes, no persistence, no Pi mission admission, no `/assign`/`/tasks`/`/skill` wiring, no scheduler placement. Tests: `tests/control_plane/test_team_tasks.py` (18, each safeguard mutation-checked).
+
+### Artifact registry: provenance, context lookup, resumable uploads, lifecycle (unified workspace P03 foundation)
+- Migration `0031_artifact_registry_extensions` (additive, idempotent, `-- DOWN:` in the file). Versions gain typed provenance (origin room/task/issue/project, session, agent, model, prompt/skill revision, commit, redacted inputs) with **no foreign keys**, and a trigger makes committed content and provenance immutable and undeletable. Bindings gain task/project/link kind so one artifact can belong to several tasks.
+- `GET /api/v1/artifacts/for/{project|task|issue|room}/{ref}`: artifacts for a work object, filtered by the registry ACL in SQL before counts, pagination and search; a missing context and a context with nothing visible are the same empty page. `GET|POST /artifacts/{id}/links` for post-hoc, idempotent links.
+- Resumable uploads proxied through the control plane (`POST /artifacts/{id}/uploads`, `.../parts/{n}`, `.../complete`, `.../abort`): whole-file SHA-256 and size verified, parts staged under `staging/` only. No browser-to-S3 traffic and no CSP change.
+- Lifecycle: `archive`, `restore`, `tombstone` (reason required, 30 day hold or legal hold) and a purge that deletes bytes only when no other live artifact shares the content-addressed key; rows, hashes and the append-only event trail remain.
+- `POST /artifacts/reconcile` (operator): re-emits lineage for versions committed but never linked, marks (never deletes) orphaned blobs, expires stale upload sessions, runs due purges. Rollback: deploy the previous control-plane image first (commit_version writes the new columns), then apply the DOWN block; the migration is additive, so leaving it applied under old code is harmless.
+- Design: `docs/specs/herdr-unified-workspace-20261028/design/ARTIFACT_INTEGRATION.md`.
+
+### Rakazo bridge: slow calls are logged
+- A bridge call that takes 300 ms or more logs `rakazo bridge: <procedure> took N ms (status S)` (a warning from 2 s). Only the procedure name and the duration are logged, never bodies, tokens or query strings. A stream's duration is its setup only.
+
+### Assistant: scheduled CI watch
+- `control_plane.personal_assistant.ci_watch` (YAML, off by default: `enabled`, `interval_seconds` min 60 default 300, `users: [{tenant_id, user_id, assistant_id?}]`, `auto_grant` default false, `source`, `max_age_seconds`, `tick_budget_seconds`) runs `watch_ci` periodically from a deterministic server thread (actor `system:ci_watch`, jittered start, time-budgeted, never raises, stops with the server). Per user it skips quietly when the assistant, project intelligence or scope is missing or the kill switch is on; a missing `watch_ci` grant logs one WARNING per user per hour unless `auto_grant: true`, which creates an audited standing grant.
+- `watch_ci` now also reads failed pipelines from the CI monitor's cached snapshot: the lineage `ci` nodes the deployed flow writes carry no repository or run number, so they could not alert. Only the scheduled runner uses it (the manual/tool path stays lineage-only); scope-filtered before a row cap, finite age bound (unknown time dropped), `killed` is not a failure, one `(repo, run, head)` fingerprint for both sources, at most `max_new_per_tick` (10) new proposals per user per tick, and `auto_grant` never re-creates a revoked grant.
+- `GET /api/v1/intelligence/status` (operator) reports `ci_watch` (last run, counts, fixed skip reasons). The server logs the Rakazo bridge assistant user ids at startup. See deploy/control-plane/README.md.
+
+### Rakazo mobile bridge (off by default)
+- `control_plane.rakazo_bridge` (YAML: `enabled: false`, `accounts: [{email, password_scrypt, role: operator}]`, `token_ttl_days: 30`, `max_tokens: 5`) lets the Rakazo iPhone app use the Herdr Personal Assistant as a custom server. `/rpc/*` and `/api/auth/*` serve the subset of Rakazo's protocol the app needs (sign-in, `me`, bots, threads with a live event stream, approvals via `threads/answer`, runs); everything else answers a Rakazo-shaped 404. Disabled, those paths stay 404. An enabled but malformed section stops startup.
+- Auth: email + scrypt-hash password (`herdr-eng bridge hash-password` reads the password from a prompt or stdin, never argv), constant-time compare with one KDF per attempt even for an unknown email, per-address and global exponential lockout, 32-byte bearer tokens of which only the SHA-256 is stored (migration `0036_rakazo_bridge_tokens.sql`, persisted when a Postgres DSN is configured), a per-account token cap, sign-out revokes. No password, token, hash or request body is logged or audited.
+- Each account is its own assistant user, so a second account (shape reserved for later multi-user; only `role: operator` exists, `family` is rejected) gets separate threads, memory, approvals, audit identity and rate limit. Approvals decided in the app use the existing `decide_approval` rules (approver must differ from requester unless YAML allows self-approval).
+- Hardening: revocation survives a failed database delete (in-memory tombstone, retried with backoff; sign-out reports it) and `accounts[].tokens_valid_after` cuts off older tokens independent of Postgres; no all-addresses lockout (per-address only, so a tailnet device cannot lock the owner out); database I/O runs outside the token lock with 3 s timeouts; `trusted_proxies` lets the lockout key on the real client behind the fabric gateway (which is not loopback); hostile bodies get a generic 400; `runs/list` is bounded and lock-safe; 20 bots per account.
+- Residual risk: a token is operator-level assistant access from anywhere that can reach the listener (the tailnet). No push, voice, billing or model screens. See deploy/control-plane/README.md.
+- Board proposals on the phone: pending project-intelligence proposals (`ci_rerun`, `request_ci_repair`, `propose_issue`, ...) in the account's scope (`assistant_viewers`) appear as approve/reject `ask` cards in its first bot's thread, with an in-thread notice, expiry, and an outcome message (executed / failed with the recorded reason / rejected / expired). `threads/answer` calls the new shared `IntelligenceRoutes.decide_proposal` (extracted from the dashboard route: flags, approvers, project scope, exact payload hash + version, audit, executor), so execution still needs `project_intelligence.execute`. Fail closed without a scope or approver standing; card text uses validated fields only. No push (custom server); see deploy/control-plane/README.md.
+- Phone approvals answer immediately: `threads/answer` for a proposal records the decision and returns, and the executor (e.g. the Woodpecker restart behind `ci_rerun`, several seconds) runs on a bounded background worker (4 at most, no queue; a fifth is refused with 429 undecided) that then updates the card and posts the outcome. `IntelligenceRoutes.decide_proposal` gained `execute=True` (the dashboard is unchanged).
+
+### Assistant: CI failures also queue a re-run proposal
+- When `watch_ci` sees a new CI failure it now queues, beside the repair proposal, a separate `ci_rerun` proposal on the same board (same scope rules, same one-time dedupe). The repair proposal records it as `rerun_proposal` and the notification says a plain re-run awaits approval. A refused or failing re-run request never hides the repair proposal. Approving it still needs `project_intelligence.execute: true`.
+
+### Project intelligence: `ci_rerun` action (ask mode)
+- A new approvable proposal action `ci_rerun` (`{repo: owner/name, run: N}`) restarts one Woodpecker pipeline run. It goes through the existing board: `suggest` to propose, an approver (or the single operator) to approve the exact payload, and `execute: true` before anything runs. Execution calls the CI monitor's own retry, so `control_plane.ci_actions` and Woodpecker's `can_retry` still decide; a refusal is recorded on the proposal and never retried. `execute` stays off by default.
+
+### Unified workspace P02: persistent Work Graph and reconciliation (flag off by default)
+- Migrations `0033_event_trace_id.sql` (nullable `fabric_events.trace_id`, `Event.trace_id`, envelope `trace_id`) and `0034_work_graph.sql` (`wg_*` tables: event ledger, assertions, entities + aliases, typed edges with intervals and unique `(type, from, to)`, historical facts, layouts, cursor, gaps). Additive, idempotent, `-- DOWN:`.
+- `work_graph_core` (pure fold: idempotent, order-tolerant, per-field merge, tombstones that cannot be resurrected, immutable artifact versions), `work_graph_store` (Postgres, ACL inside every statement, cursor paging, search, snapshot by root, `as_of`, facts, layouts with ETag/If-Match), `work_graph_sync` (sources, reconciler with orphan check in both directions, replay-from-clean with `snapshot_required`, worker), `work_graph_service` (sync facade + request handler).
+- New `GET/POST /api/v1/graph/work/*` and `/api/v1/collab/graph/work/*` behind `control_plane.unified_workspace.enabled`; 404 when off, 503 without Postgres. The lineage graph vocabulary gains the owned kinds `project team artifact_version external_action` and edges `contains derived_from discussed_in approved_by notified_via`.
+- Contract: `docs/contracts/work-graph-v1.md`; Pi session-ingest ids: `docs/specs/herdr-unified-workspace-20261028/contracts/PI_INGEST_FIELDS.md`.
+
+### CI test counts from logs, with no project setup
+- The control plane reads the step logs of recently finished Woodpecker runs and keeps what the test runners printed (pytest, `node --test`/TAP, cargo, `go test -v`, jest/vitest, ScalaTest, surefire, gradle, Karma, `unittest`): counts, runner names and, where the runner prints one line per test, an index of names, statuses and log line ranges. No log text is stored, a JUnit upload for the same run always wins, and no environment variables or pipeline changes are needed. `control_plane.ci_log_tests` (YAML: `enabled`, `runs_per_cycle`, `max_log_mib`, `window_days`) tunes it.
+- `GET /api/v1/ci/log-slice` returns the redacted live log lines around an indexed test, or says why it cannot.
+- The CI Tests tab bars use these counts and say where they come from; selecting a repository lists its tests (search, filter, sort) and opens a log excerpt with ways to keep investigating.
+
 ### Unified workspace P01: contracts, ids and the capability/action broker (library only, flag off)
 - New `schemas/workspace-v1.schema.json` (JSON Schema 2020-12) for project, team, room, mission, issue, task, agent, agent_session, host, artifact, artifact_version, review, decision, external_action, event and the 14 typed edges, with canonical ids `urn:herdr:<kind>:<uuid>` (uuid5 over the native id, so every host agrees), aliases, scope, version/ETag, trace/correlation/causation ids and reference URIs. Contract table and graph.py mapping: `docs/contracts/unified-workspace-v1.md`.
 - New `herdr_engineering/control_plane/workspace_contracts.py`: id/alias canonicalisation, validators, ETag compare-and-swap, idempotency tokens, a discover/authorize/approve/invoke broker (user role, agent delegation, room grant, artifact grant, account grant and risk policy are intersected; room membership never grants shell or external-account access), untrusted-content tainting, ACL re-check hooks for traversal, search, export and subscriptions, and the replay-cursor contract.
@@ -17,6 +91,23 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 - `control_plane.inspector_snapshots.enabled` lets the worker keep a replay snapshot of the inspector in the new `inspector_snapshots` table (migration 0030) so a boot replays only newer events instead of ~780k (about nine minutes). Off by default; any doubt makes the boot replay everything. See `deploy/control-plane/README.md`.
 - With a verified snapshot the boot also skips loading the inspector rows it covers (SQL filter on the watermark; the repo fetches them back if it refuses the snapshot).
 - Deploy health window 30 minutes (#373) and boot phase timings in the log; host-metrics rollups replay in linear time (#379).
+
+### Control plane: service-observation compaction (opt-in, dry run by default)
+- `control_plane.fabric_compaction` (YAML; `enabled: false`, `dry_run: true`, `interval_seconds`, `min_age_days`, `batch_rows`, `chunk_rows`, `chunk_pause_seconds`, `max_pass_seconds`, `archive_retention_days`, `rebuild_checkpoint`) lets the worker move interior service observation rows out of `fabric_events` into the new `fabric_events_archive` table (migration 0035), one atomic statement per chunk of `chunk_rows` (default 5,000; the pass lists candidates once, pauses `chunk_pause_seconds` between chunks and stops after `max_pass_seconds`, so a large backlog no longer stalls ingest). Rule checked on the production journal: 1,762,189 service rows -> 349,664 with all 6,544 reconstructed services identical. Rows with a v2 envelope and rows younger than `min_age_days` are never touched. After a drain the job rebuilds the recovery checkpoint; the archive is purged after `archive_retention_days`. See docs/operations/recovery-checkpoints.md.
+
+### Deployment escalation issues can use the GitHub App (`escalations` capability)
+- With `github.app.write: [escalations]` (App permission Issues: write) escalation issues are created with a repo-scoped App token. Without it the server-held `github.token` is used as before; an enabled capability or an invalid `github.app` block that cannot mint a token fails closed and never falls back to the PAT.
+
+### GitHub App: write capabilities and the review gate on the shared App (opt-in)
+- `github.app.write: [review_gate, escalations]` (YAML, default none) enables fixed, repo-scoped write permission sets on the shared GitHub App; unlisted capabilities are refused before any call to GitHub, reads stay read-only, and a grant wider than the request is refused.
+- `review_gate.app: shared` makes the review gate use that App instead of its own JWT/installation-token code: reads get a read-only token, statuses/merge/update-branch the `review_gate` capability. The old per-gate `app:` block still works.
+
+### Project intelligence: shared-credential PR poller and single-operator mode (opt-in)
+- The outbound PR poller now works without the review gate: it reads open PRs through `github_auth.credentials()` (the GitHub App, `pull_requests: read` only, repo-scoped tokens). `github_auth` allows `pull_requests` at `read`; nothing writable. `/api/v1/intelligence/status` gains `poller` (counters and a fixed `last_error`).
+- `control_plane.single_operator: true` (YAML, default false; refused with `api_keys`) lets the open listener's caller preauthorize assistant tools and approve proposals, including their own. See the project-intelligence runbook for the residual risk.
+
+### Control plane: recovery checkpoint pruning
+- After the compaction job rebuilds the recovery checkpoint it deletes all but the newest `control_plane.fabric_compaction.keep_checkpoints` generations (default 2; the active one is always kept) under the builder's lock, so generations no longer pile up. `recovery_checkpoint.prune_checkpoints()` is the same operation for manual use.
 
 ### Dashboard: on-demand full `/summary` report
 - **Generate full report** on the agent page runs the `summary` skill on the session's recorded conversation and shows the result in the summary card; in the fullscreen workspace it gets its own column so the conversation and composer fit the viewport without page scrolling (the fullscreen panes were previously sized to the whole viewport and cut off the composer). Off by default: `summary_report.enabled` in the central YAML.

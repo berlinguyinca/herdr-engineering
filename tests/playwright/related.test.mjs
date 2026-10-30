@@ -107,9 +107,11 @@ test('a mission links to its agent, host, review, pull request and CI run, and t
     await page.locator('.rel dl').waitFor({ timeout: 8000 });
     for (const title of ['Agents', 'Host', 'Reviews', 'Pull requests', 'CI runs']) await group(page, title).waitFor();
     assert.match(await group(page, 'Pull requests').textContent(), /org\/app #214.*external/);
-    const pr = group(page, 'Pull requests').locator('a');
+    const pr = group(page, 'Pull requests').locator('a[target="_blank"]');
     assert.equal(await pr.getAttribute('href'), 'https://github.com/org/app/pull/214');
     assert.equal(await pr.getAttribute('rel'), 'noopener noreferrer');
+    // the PR also links to its trail page (how the agents got there), an in-app route
+    assert.equal(await group(page, 'Pull requests').locator('a[data-pr-trail]').getAttribute('href'), '#/pr/org/app/214');
     await group(page, 'Agents').locator('a').first().click();
     await page.waitForURL(/#\/herd\/session\//);
     await page.locator('.rel dl').waitFor({ timeout: 8000 });

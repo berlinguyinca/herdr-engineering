@@ -2,6 +2,7 @@
 // and an arrow wherever a handoff moved work from one agent to another. Built from what the server reports; a lane with no
 // handoff edge simply shows its agents side by side, so the chart never implies a transfer that was not recorded.
 import { escapeHtml as esc } from './herdr-web-components/util.js';
+import { prTrailHref } from './entity-links.js';
 
 const MAX_LANES = 8;
 const MIN_SPAN_MS = 30 * 60 * 1000;
@@ -80,7 +81,26 @@ ${ticks}${rows}${arrows}</svg>${more}${note}</section>`;
 }
 
 // The story of one agent for its detail page: how it began, any handoff into or out of it, and where it stands now.
-export function agentStory(session, tree = {}, now = Date.now()) {
+// links: the server's session->commit record (GET /sessions/<id>/commits) or null while it is unknown. Never guessed client-side.
+export function commitSteps(links) {
+  if (links === 'loading') return [{ kind: 'unlinked', at: NaN, text: 'Checking which commits this agent produced…' }];
+  if (links === 'error') return [{ kind: 'unlinked', at: NaN, text: 'Commit links could not be loaded. Reopen this page to try again.' }];
+  if (!links || typeof links !== 'object') return [];
+  const list = Array.isArray(links.commits) ? links.commits : [];
+  const pulls = (Array.isArray(links.pull_requests) ? links.pull_requests : []).filter(p => Number.isInteger(p?.number));
+  if (links.state === 'linked' && (list.length || pulls.length)) {
+    const shown = list.slice(0, 5).map(c => ({ kind: 'commit', at: ms(c.at), text: `Commit ${text(c.sha).slice(0, 7) || 'unknown'}${c.pull_request ? ` · PR #${c.pull_request}` : ''} · CI run #${c.run_number ?? '?'} ${text(c.state) || 'unknown'}${c.match === 'commit' ? ' (the commit the agent reported)' : ''}`, url: text(c.ci_url), trail: c.pull_request ? prTrailHref(text(links.repository_id), c.pull_request) : null }));
+    const more = list.length - shown.length + (Number.isInteger(links.omitted) ? links.omitted : 0);
+    if (more > 0) shown.push({ kind: 'commit', at: NaN, text: `${more} more commits not listed` });
+    // A pull request already named on a commit line is not repeated.
+    const named = new Set(list.map(c => c.pull_request).filter(Boolean));
+    for (const p of pulls.filter(x => !named.has(x.number)).slice(0, 5)) shown.push({ kind: 'commit', at: ms(p.at), text: `PR #${p.number}${text(p.status) ? ` ${text(p.status)}` : ''}`, url: text(p.url), trail: prTrailHref(text(links.repository_id), p.number) });
+    return shown;
+  }
+  return [{ kind: 'unlinked', at: NaN, text: `No commit link recorded: ${text(links.reason) || 'the server found no matching CI run.'}` }];
+}
+
+export function agentStory(session, tree = {}, now = Date.now(), links = null) {
   const id = text(session.session_id);
   const nodes = Array.isArray(tree.nodes) ? tree.nodes : [], edges = Array.isArray(tree.edges) ? tree.edges : [];
   const mine = new Set(nodes.filter(n => text(n.session_id) === id || n.id === id).map(n => n.id));
@@ -89,15 +109,17 @@ export function agentStory(session, tree = {}, now = Date.now()) {
   const created = ms(session.created_at);
   const where = [text(session.host_id), text(session.cwd).split(/[\\/]/).filter(Boolean).at(-1)].filter(Boolean).join(' · ');
   const incoming = edges.filter(e => mine.has(e.to));
-  steps.push({ kind: 'start', at: created, text: incoming.length ? `Started by handoff from ${label(incoming[0].from)}${incoming[0].goal ? `: ${incoming[0].goal}` : ''}` : `Started${where ? ` on ${where}` : ''}`, handoff: !!incoming.length });
-  for (const e of edges.filter(x => mine.has(x.from))) steps.push({ kind: 'handoff', at: ms(e.updated_at), text: `Handed ${e.state === 'completed' || e.state === 'accepted' ? 'off' : `off (${text(e.state) || 'unknown'})`} to ${label(e.to)}${e.goal ? `: ${e.goal}` : ''}`, handoff: true });
+  steps.push({ kind: 'start', at: created, text: incoming.length ? `Started by handoff from ${label(incoming[0].from)}${incoming[0].goal ? `: ${incoming[0].goal}` : ''}` : `Started${where ? ` on ${where}` : ''}`, handoff: !!incoming.length, handoffId: incoming.length ? text(incoming[0].handoff_id) : '' });
+  for (const e of edges.filter(x => mine.has(x.from))) steps.push({ kind: 'handoff', at: ms(e.updated_at), text: `Handed ${e.state === 'completed' || e.state === 'accepted' ? 'off' : `off (${text(e.state) || 'unknown'})`} to ${label(e.to)}${e.goal ? `: ${e.goal}` : ''}`, handoff: true, handoffId: text(e.handoff_id) });
   const updated = ms(session.updated_at);
+  // Lines without a time of their own (unlinked, "more commits") sit just before the last report rather than after it.
+  steps.push(...commitSteps(links).map(c => Number.isFinite(c.at) ? c : { ...c, at: Number.isFinite(updated) ? updated - 1 : c.at }));
   steps.push({ kind: 'now', at: updated, text: text(session.summary) ? text(session.summary).replace(/\s+/g, ' ').slice(0, 140) : `Last report ${text(session.status) || 'unknown'}` });
   return { steps: steps.sort((a, b) => (Number.isFinite(a.at) ? a.at : Infinity) - (Number.isFinite(b.at) ? b.at : Infinity) || (a.kind === 'start' ? -1 : 0)), hasHandoff: steps.some(x => x.handoff), now };
 }
 
 export function renderStory(story) {
   const fmt = at => Number.isFinite(at) ? new Date(at).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : '';
-  return `<style>.as-story{list-style:none;margin:8px 0 14px;padding:0 0 0 14px;border-left:2px solid var(--border)}.as-story li{position:relative;padding:2px 0 8px 10px;font-size:13px;line-height:1.4;overflow-wrap:anywhere}.as-story li::before{content:"";position:absolute;left:-19px;top:7px;width:8px;height:8px;border-radius:50%;background:var(--text-muted)}.as-story li[data-kind=start]::before{background:var(--accent)}.as-story li[data-kind=now]::before{background:var(--status-ok,#2e9d5b)}.as-story time{display:block;font-size:11px;color:var(--text-secondary)}</style>
-<ol class="as-story" aria-label="How this agent started and proceeded">${story.steps.map(s => `<li data-kind="${esc(s.kind)}"><time>${esc(fmt(s.at))}</time>${esc(s.text)}</li>`).join('')}</ol>`;
+  return `<style>.as-story{list-style:none;margin:8px 0 14px;padding:0 0 0 14px;border-left:2px solid var(--border)}.as-story li{position:relative;padding:2px 0 8px 10px;font-size:13px;line-height:1.4;overflow-wrap:anywhere}.as-story li::before{content:"";position:absolute;left:-19px;top:7px;width:8px;height:8px;border-radius:50%;background:var(--text-muted)}.as-story li[data-kind=start]::before{background:var(--accent)}.as-story li[data-kind=now]::before{background:var(--status-ok,#2e9d5b)}.as-story li[data-kind=commit]::before{background:var(--accent)}.as-story li[data-kind=unlinked]{color:var(--text-secondary)}.as-story li[data-kind=unlinked]::before{background:transparent;border:1px solid var(--text-muted)}.as-story time{display:block;font-size:11px;color:var(--text-secondary)}</style>
+<ol class="as-story" aria-label="How this agent started and proceeded">${story.steps.map(s => `<li data-kind="${esc(s.kind)}"><time>${esc(fmt(s.at))}</time>${/^https:\/\//.test(s.url || '') ? `<a href="${esc(s.url)}" target="_blank" rel="noopener noreferrer">${esc(s.text)}</a>` : s.handoffId ? `<a href="#/handoffs?open=${encodeURIComponent(s.handoffId)}" data-handoff-link>${esc(s.text)}</a>` : esc(s.text)}${s.trail ? ` <a href="${esc(s.trail)}" data-pr-trail>how it got here</a>` : ''}</li>`).join('')}</ol>`;
 }

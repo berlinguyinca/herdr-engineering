@@ -127,8 +127,29 @@ export class HerdrClient {
     }
   }
 
-  getHandoffTree({ signal } = {}) {
-    return this.request('/api/v1/handoffs/tree', { signal });
+  getHandoffTree({ signal, sessionId } = {}) {
+    return this.request(`/api/v1/handoffs/tree${sessionId ? `?session_id=${encodeURIComponent(sessionId)}` : ''}`, { signal });
+  }
+
+  getHandoffOverview({ signal } = {}) {
+    return this.request('/api/v1/handoffs/overview', { signal });
+  }
+
+  pageHandoffs({ state, workspace, attention, cursor, limit = 50, signal } = {}) {
+    const query = new URLSearchParams({ limit: String(limit) });
+    if (state) query.set('state', state);
+    if (workspace) query.set('workspace', workspace);
+    if (attention) query.set('attention', '1');
+    if (cursor) query.set('cursor', cursor);
+    return this.request(`/api/v1/handoffs?${query}`, { signal });
+  }
+
+  getHandoff(id, { signal } = {}) {
+    return this.request(`/api/v1/handoffs/${encodeURIComponent(id)}`, { signal });
+  }
+
+  getHandoffChain(id, { signal } = {}) {
+    return this.request(`/api/v1/handoffs/${encodeURIComponent(id)}/chain`, { signal });
   }
 
   listHandoffs(state, { signal } = {}) {
@@ -142,6 +163,19 @@ export class HerdrClient {
       if (value != null && value !== '') query.set(key, String(value));
     }
     return this.request(`/api/v1/artifacts${query.size ? `?${query}` : ''}`, { signal });
+  }
+
+  // Artifacts bound to a project, issue, task or room (P03). The server filters by what the caller may read.
+  artifactsForContext(kind, ref, { q, mediaType, limit, cursor, signal } = {}) {
+    const query = new URLSearchParams();
+    for (const [key, value] of Object.entries({ q, media_type: mediaType, limit, cursor })) {
+      if (value != null && value !== '') query.set(key, String(value));
+    }
+    return this.request(`/api/v1/artifacts/for/${encodeURIComponent(kind)}/${encodeURIComponent(ref)}${query.size ? `?${query}` : ''}`, { signal });
+  }
+
+  artifactLinks(id, { signal } = {}) {
+    return this.request(`/api/v1/artifacts/${encodeURIComponent(id)}/links`, { signal });
   }
 
   getArtifact(id, { signal } = {}) {
@@ -301,6 +335,11 @@ export class HerdrClient {
 
   getSession(id, { signal } = {}) {
     return this.request(`/api/v1/sessions/${encodeURIComponent(id)}`, { signal });
+  }
+
+  // Commits and pull requests the server can attribute to this agent without guessing (state: linked | ambiguous | none).
+  getSessionCommits(id, { signal } = {}) {
+    return this.request(`/api/v1/sessions/${encodeURIComponent(id)}/commits`, { signal });
   }
 
   getAgentSummary(id, { signal } = {}) {
@@ -585,15 +624,21 @@ export class HerdrClient {
     return this.request(`/api/v1/ci/log?${query}`, { signal });
   }
 
+  // Lines of one step's live log around an indexed test; the server says plainly when the range is gone.
+  getCiLogSlice(repository, number, step, { start, end, context = 40, expect = '', signal, providerUrl } = {}) {
+    const query = new URLSearchParams({ repository, number: String(number), step: String(step), start: String(start), end: String(end), context: String(context), ...(expect ? { expect: String(expect).slice(0, 500) } : {}), ...(providerUrl!==undefined?{provider_url:providerUrl}:{}) });
+    return this.request(`/api/v1/ci/log-slice?${query}`, { signal });
+  }
+
   ciAction(repository, number, action, { signal, providerUrl } = {}) {
     return this.request('/api/v1/ci/actions', {
       method: 'POST', body: { repository, number, action, ...(providerUrl!==undefined?{provider_url:providerUrl}:{}) }, signal,
     });
   }
 
-  debugCi(repository, number, sessionId, operationId, { signal, providerUrl, mode } = {}) {
+  debugCi(repository, number, sessionId, operationId, { signal, providerUrl, mode, test } = {}) {
     return this.request('/api/v1/ci/debug', {
-      method: 'POST', body: { repository, number, session_id: sessionId, operation_id: operationId, ...(providerUrl!==undefined?{provider_url:providerUrl}:{}), ...(mode==='fix'?{mode}:{}) }, signal,
+      method: 'POST', body: { repository, number, session_id: sessionId, operation_id: operationId, ...(providerUrl!==undefined?{provider_url:providerUrl}:{}), ...(mode==='fix'||mode==='test'?{mode}:{}), ...(mode==='test'&&test?{test}:{}) }, signal,
     });
   }
 

@@ -185,3 +185,12 @@ def test_bundled_launcher_works_from_unrelated_cwd(tmp_path):
     assert result.returncode == 0, result.stderr
     assert "discover" in result.stdout
     assert "show" in result.stdout
+
+
+def test_activation_block_tells_agents_to_offer_links_too(tmp_path):
+    source = make_source(tmp_path)
+    home = tmp_path / "home"
+    assert run_install(home, source, "--harness", "claude", "--activate").returncode == 0
+    text = (home / ".claude" / "CLAUDE.md").read_text()
+    assert "`--url`" in text and "links" in text
+    assert "Never automatically offer Markdown" in text

@@ -1027,7 +1027,7 @@ export function renderLineage(m) {
     : `<div class="cx-row"><button type="button" class="hd-btn hd-btn--ghost hd-btn--sm" data-mode="${m.mode === 'table' ? 'visual' : 'table'}">${m.mode === 'table' ? 'Show graph' : 'Show as table'}</button><span class="cx-msg">${view.nodes.length} nodes, ${view.edges.length} links shown</span></div>${renderGraphLegend()}${trunc}${graphPane}`;
   return `${renderStatusStrip(a, { truncated: Boolean(m.graphTruncated) })}${renderReplay(m.asOf, { busy: m.busy, queued: m.queued })}${notice(m)}`
     + `<div class="lin-grid2"><div class="cx-stack">${renderFilters(a, m.filters, { open: m.filtersOpen !== false })}`
-    + `<div role="tablist" aria-label="Lineage views" class="cx-stabs">${tab('graph', 'Graph')}${tab('gantt', 'Gantt')}</div>`
+    + `<div role="tablist" aria-label="Lineage views" class="cx-stabs hd-tabs">${tab('graph', 'Graph')}${tab('gantt', 'Gantt')}</div>`
     + `<div role="tabpanel" aria-label="${m.view === 'gantt' ? 'Gantt' : 'Graph'}" class="cx-stack">${body}</div></div>`
     + `<aside class="cx-stack" aria-label="Inspector" aria-live="polite">${renderInspector(a, m.sel, m.timeline, { terminal: m.terminal, termAuth: m.termAuth })}${m.workbench || ''}</aside></div>`;
 }
