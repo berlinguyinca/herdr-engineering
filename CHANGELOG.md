@@ -5,6 +5,9 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Unified workspace P05: independent review enforced where tasks are created
+- `POST /api/v1/collab/rooms/{id}/tasks` accepts an optional `reviews_task_id`. A review task is refused (400) when its reviewer is the agent that did the work or the agent that handed it out, and an agent cannot choose the reviewer of its own work; an unknown task or one from another room is a 404. The id is stored on the task and in the `task_created` event. Without the field nothing changes, and idempotency keys keep their meaning (the request digest only gains the id when it is present).
+
 ### Unified workspace P05: durable task leases (migration 0040)
 - `team_task_leases` (additive, idempotent, `-- DOWN:`) and `team_task_leases_pg.PgLeaseStore`: the same fencing-token lease contract as the in-memory `LeaseStore`, every transition one conditional statement so two control-plane processes cannot both hold a task. Tests run the lease contract against Postgres plus a 12-way concurrent acquire (exactly one winner). Still not called by any route.
 
