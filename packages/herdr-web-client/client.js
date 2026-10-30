@@ -178,6 +178,23 @@ export class HerdrClient {
     return this.request(`/api/v1/artifacts/${encodeURIComponent(id)}/links`, { signal });
   }
 
+  // The persistent Work Graph (unified workspace P02/P06). 404 while control_plane.unified_workspace is off.
+  workGraphSnapshot(root, { depth = 2, maxNodes = 200, asOf, signal } = {}) {
+    const query = new URLSearchParams({ root, depth: String(depth), max_nodes: String(maxNodes) });
+    if (asOf) query.set('as_of', asOf);
+    return this.request(`/api/v1/graph/work/snapshot?${query}`, { signal });
+  }
+
+  workGraphLayout(ref, { which = 'effective', signal } = {}) {
+    return this.request(`/api/v1/graph/work/layout?${new URLSearchParams({ ref, which })}`, { signal });
+  }
+
+  saveWorkGraphLayout(ref, document, { shared = false, ifMatch, signal } = {}) {
+    return this.request('/api/v1/graph/work/layout', {
+      method: 'PUT', body: { ref, document, shared, ...(ifMatch ? { if_match: ifMatch } : {}) }, signal,
+    });
+  }
+
   getArtifact(id, { signal } = {}) {
     return this.request(`/api/v1/artifacts/${encodeURIComponent(id)}`, { signal });
   }
