@@ -53,3 +53,11 @@ test('an agent story names the handoff it started from and handed on, as links t
   const html = renderStory(story);
   assert.match(html, /href="#\/handoffs\?open=out2"/); assert.match(html, /open=in%3C1%3E/); assert.ok(!html.includes('in<1>'));
 });
+
+test('a cut chain says so on both ends, and the state badge reads as words', () => {
+  const hop = (id) => ({ handoff_id: id, state: 'completed', source: { harness: 'pi' }, target: { harness: 'pi' } });
+  const html = detailHtml({ handoff_id: 'b', state: 'in_progress', goal: 'g', source: {}, target: {}, completed: [], remaining: [], history: [] },
+    { position: 1, more_before: true, more_after: true, chain: [hop('a'), hop('b'), hop('c')] });
+  assert.equal((html.match(/…/g) || []).length, 2);
+  assert.match(html, /<span class="hd-badge">in progress<\/span>/);
+});

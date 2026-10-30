@@ -24,7 +24,7 @@ STALL_AFTER = timedelta(minutes=15)
 PAGE_MAX = 200
 OVERVIEW_WORKSPACES = 100
 OVERVIEW_ATTENTION = 20
-CHAIN_MAX = 50
+CHAIN_MAX = 10
 UNASSIGNED = "Unassigned"
 
 
@@ -266,12 +266,15 @@ class HandoffRegistry:
                     "untrusted_text": True}
 
     def chain(self, handoff_id):
-        """The handoffs before and after this one, joined on recorded session ids (the same rule as the Usage tab)."""
+        """The single path of handoffs through this one: backwards to the handoff that delivered the work to its source session,
+        forwards to the one that took it on from its target session (the same session ids the Usage tab joins on). A session that
+        received or gave many handoffs contributes only the nearest one in time, so the chain stays a path, not a blob."""
         with self.repo._event_lock:
             row = self._rows.get(handoff_id)
             if row is None:
                 raise KeyError(handoff_id)
             now = _when(self.now()) or datetime.now(timezone.utc)
+            key = lambda r: (r.get("created_at") or "", r["handoff_id"])
             by_target, by_source = {}, {}
             for r in self._rows.values():
                 t, sr = (r.get("target") or {}).get("session_id"), (r.get("source") or {}).get("session_id")
@@ -280,19 +283,29 @@ class HandoffRegistry:
                 if sr:
                     by_source.setdefault(sr, []).append(r)
 
-            def walk(start, index, side, taken):
-                seen, found, frontier = {handoff_id} | taken, [], [start]
-                while frontier and len(found) < CHAIN_MAX:
-                    sid = ((frontier.pop(0).get(side) or {})).get("session_id")
-                    for r in sorted(index.get(sid, []), key=lambda r: (r.get("created_at") or "", r["handoff_id"])) if sid else []:
-                        if r["handoff_id"] not in seen and len(found) < CHAIN_MAX:
-                            seen.add(r["handoff_id"])
-                            found.append(r)
-                            frontier.append(r)
-                return found
+            def step(current, index, side, later):
+                sid = (current.get(side) or {}).get("session_id")
+                pool = [r for r in index.get(sid, []) if (key(r) > key(current)) == later and r["handoff_id"] != current["handoff_id"]
+                        and (not current.get("mission_id") or r.get("mission_id") in (None, current["mission_id"]))] if sid else []
+                return (min if later else max)(pool, key=key) if pool else None
 
-            before = walk(row, by_target, "source", set())
-            after = walk(row, by_source, "target", {r["handoff_id"] for r in before})
+            def walk(index, side, later, taken):
+                found, current, more = [], row, False
+                while True:
+                    nxt = step(current, index, side, later)
+                    if nxt is None or nxt["handoff_id"] in taken:
+                        break
+                    if len(found) == CHAIN_MAX:
+                        more = True
+                        break
+                    taken.add(nxt["handoff_id"])
+                    found.append(nxt)
+                    current = nxt
+                return found, more
+
+            taken = {handoff_id}
+            before, before_more = walk(by_target, "source", False, taken)
+            after, after_more = walk(by_source, "target", True, taken)
             ordered = list(reversed(before)) + [row] + after
-            return {"handoff_id": handoff_id, "position": len(before),
+            return {"handoff_id": handoff_id, "position": len(before), "more_before": before_more, "more_after": after_more,
                     "chain": [self._summary(r, self._workspace(r), now) for r in ordered], "untrusted_text": True}

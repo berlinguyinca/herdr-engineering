@@ -48,13 +48,13 @@ export function handoffCard(h) {
 const list = (items) => (items && items.length ? `<ul>${items.map((i) => `<li>${esc(typeof i === 'string' ? i : JSON.stringify(i))}</li>`).join('')}</ul>` : '<p class="hd-muted">Nothing recorded.</p>');
 
 export function detailHtml(row, chain) {
-  const hops = (chain?.chain || []).map((h, i) => `<button type="button" class="hd-hop${i === chain.position ? ' hd-hop--here' : ''}" data-handoff="${esc(h.handoff_id)}"
-    ${i === chain.position ? 'aria-current="true"' : ''}>${esc(h.source?.harness || '?')} → ${esc(h.target?.harness || '?')}<small>${esc(h.state)}</small></button>`).join('<span aria-hidden="true">›</span>');
+  const hops = (chain?.more_before ? '<span class="hd-muted" title="Earlier handoffs not shown">…</span><span aria-hidden="true">›</span>' : '') + (chain?.chain || []).map((h, i) => `<button type="button" class="hd-hop${i === chain.position ? ' hd-hop--here' : ''}" data-handoff="${esc(h.handoff_id)}"
+    ${i === chain.position ? 'aria-current="true"' : ''}>${esc(h.source?.harness || '?')} → ${esc(h.target?.harness || '?')}<small>${esc(h.state)}</small></button>`).join('<span aria-hidden="true">›</span>') + (chain?.more_after ? '<span aria-hidden="true">›</span><span class="hd-muted" title="Later handoffs not shown">…</span>' : '');
   const history = (row.history || []).map((s) => `<li>${esc(s.state)} <small>${esc(ago(s.at))}${s.actor?.id ? ` · ${esc(s.actor.id)}` : ''}</small></li>`).join('');
   const hint = row.target?.model_hint;
   return `<section class="hd-detail" data-handoff-detail-body aria-label="Handoff ${esc(row.handoff_id)}">
     <header><h2>${esc(who(row.source))} → ${esc(who(row.target))}</h2>
-    <p><span class="hd-badge">${esc(row.state)}</span> ${esc(SENTENCE[row.state] || '')} · updated ${esc(ago(row.updated_at))}${hint ? ` · model hint <code>${esc(hint)}</code>` : ''}</p>
+    <p><span class="hd-badge">${esc(String(row.state).replace('_', ' '))}</span> ${esc(SENTENCE[row.state] || '')} · updated ${esc(ago(row.updated_at))}${hint ? ` · model hint <code>${esc(hint)}</code>` : ''}</p>
     ${row.mission_id ? `<p class="hd-muted">Mission <a href="#/missions/${encodeURIComponent(row.mission_id)}">${esc(row.mission_id)}</a></p>` : ''}</header>
     ${hops ? `<nav class="hd-chain" aria-label="Handoff chain">${hops}</nav>` : ''}
     <h3>Goal</h3><p class="hd-goal">${esc(row.goal || '')}</p>
@@ -89,9 +89,9 @@ export function mountHandoffs(container, client, { freshness = () => null, open 
   let disposed = false, controller = null, loaded = false, signature = null, openWs = null, shown = null;
   container.innerHTML = `<p class="hd-muted">The big picture: work passed between agents, grouped by workspace. Open a workspace to see its handoffs; open any handoff, box or arrow for what was accomplished, what is missing and what happens next. Handoff text is untrusted and escaped.</p>
     <div data-handoff-summary role="status"></div>
-    <section data-handoff-attention aria-label="Needs attention"></section>
-    <section data-handoff-list></section>
-    <section data-handoff-detail aria-live="polite"></section>
+    <div class="hd-layout"><div class="hd-main"><section data-handoff-attention aria-label="Needs attention"></section>
+    <section data-handoff-list></section></div>
+    <aside class="hd-side" aria-label="Handoff detail"><section data-handoff-detail aria-live="polite"><p class="hd-muted">Open a handoff, box or arrow to see what was accomplished, what is missing and what happens next.</p></section></aside></div>
     <button type="button" data-handoff-retry hidden>Retry</button>`;
   const summary = container.querySelector('[data-handoff-summary]');
   const attention = container.querySelector('[data-handoff-attention]');
@@ -108,7 +108,7 @@ export function mountHandoffs(container, client, { freshness = () => null, open 
       const [row, chain] = await Promise.all([client.getHandoff(id, { signal }), client.getHandoffChain(id, { signal }).catch(() => null)]);
       if (disposed || shown !== id) return;
       detail.innerHTML = detailHtml(row, chain);
-      detail.scrollIntoView?.({ block: 'nearest' });
+      if (!window.matchMedia?.('(min-width: 1100px)').matches) detail.scrollIntoView?.({ block: 'start' });   // beside the list on wide screens, so no scrolling
     } catch (error) {
       if (!disposed && shown === id) detail.innerHTML = `<p class="hd-muted">Unable to load handoff ${esc(id)}: ${esc(error.message)}</p>`;
     }

@@ -99,6 +99,36 @@ def test_a_straight_chain_reads_in_order_from_any_hop():
         assert out["chain"][out["position"]]["handoff_id"] == start
 
 
+def test_a_busy_session_contributes_only_its_nearest_handoff_to_a_chain():
+    clock = [NOW]
+    reg = registry(clock)[1]
+    for i in range(30):                               # one long-lived session handing work to many others
+        clock[0] = f"2026-10-30T10:{i:02d}:00+00:00"
+        make(reg, f"fan{i:02d}", src="busy", dst=f"leaf{i}")
+    clock[0] = "2026-10-30T11:00:00+00:00"
+    make(reg, "in", src="up", dst="busy")
+    clock[0] = "2026-10-30T11:05:00+00:00"
+    make(reg, "next", src="busy", dst="down")
+    out = reg.chain("in")
+    assert [r["handoff_id"] for r in out["chain"]] == ["in", "next"]
+    assert len(reg.chain("fan07")["chain"]) <= 3
+
+
+def test_a_long_chain_is_cut_with_explicit_more_markers_and_follows_the_mission():
+    clock = [NOW]
+    reg = registry(clock)[1]
+    for i in range(40):
+        clock[0] = f"2026-10-30T10:{i:02d}:00+00:00"
+        make(reg, f"L{i:02d}", src=f"t{i}", dst=f"t{i + 1}", mission_id="m-long")
+    clock[0] = "2026-10-30T11:00:00+00:00"
+    make(reg, "stranger", src="t21", dst="elsewhere", mission_id="m-other")
+    out = reg.chain("L20")
+    ids = [r["handoff_id"] for r in out["chain"]]
+    assert len(ids) == 21 and out["more_before"] and out["more_after"] and ids[out["position"]] == "L20"
+    assert "stranger" not in ids
+    assert not reg.chain("L00")["more_before"]
+
+
 def test_default_view_is_bounded_at_five_thousand_handoffs():
     clock = [NOW]
     repo, reg = registry(clock)

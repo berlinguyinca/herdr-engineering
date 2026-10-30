@@ -493,7 +493,10 @@ button.ctx-chip:focus-visible, .ctx-chip:focus-visible { outline: 2px solid curr
 .hd-row { display: block; width: 100%; text-align: left; cursor: pointer; font: inherit; color: inherit; }
 .hd-row--attention { border-left: 3px solid var(--status-failed, #c0392b); }
 .hd-row:hover, .hd-row:focus-visible { border-color: var(--accent, #1f7ae0); }
-.hd-detail { margin-top: 16px; padding: 16px; border: 1px solid var(--border); border-radius: 12px; background: var(--surface); }
+.hd-layout { display: grid; gap: 16px; margin-top: 12px; }
+.hd-side { order: -1; }
+@media (min-width: 1100px) { .hd-layout { grid-template-columns: minmax(0, 1fr) minmax(340px, 460px); align-items: start; } .hd-side { order: 0; position: sticky; top: 12px; max-height: calc(100vh - 24px); overflow: auto; } }
+.hd-detail { margin-top: 0; padding: 16px; border: 1px solid var(--border); border-radius: 12px; background: var(--surface); }
 .hd-detail h2 { margin: 0 0 4px; font-size: 1.1rem; overflow-wrap: anywhere; }
 .hd-detail h3 { margin: 14px 0 4px; font-size: .8125rem; text-transform: uppercase; letter-spacing: .04em; color: var(--text-muted); }
 .hd-goal { white-space: pre-wrap; overflow-wrap: anywhere; }
@@ -502,3 +505,5 @@ button.ctx-chip:focus-visible, .ctx-chip:focus-visible { outline: 2px solid curr
 .hd-hop { display: inline-flex; flex-direction: column; padding: 4px 10px; border-radius: 8px; border: 1px solid var(--border-subtle); background: none; color: inherit; font: inherit; cursor: pointer; }
 .hd-hop--here { border-color: var(--accent, #1f7ae0); border-width: 2px; }
 .hd-history { padding-left: 18px; margin: 0; }
+.hd-row > span { margin-left: 10px; color: var(--text-muted); font-size: .8125rem; }
+.hd-row p { margin: 4px 0; }
