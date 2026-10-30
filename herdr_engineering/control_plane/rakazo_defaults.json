@@ -1,6 +1,5 @@
 {
  "defaults": {
-  "agentSecrets/list": [],
   "approvalRules/list": [],
   "autoReview/get": {
    "checkerAvailable": false,
@@ -10,7 +9,6 @@
   },
   "availability/items": [],
   "boards/list": [],
-  "botSecrets/list": [],
   "capabilities/catalogSearch": {
    "enabled": false,
    "results": []
@@ -119,7 +117,6 @@
    "unsupportedReason": null,
    "version": ""
   },
-  "vault/list": [],
   "voice/catalog": [],
   "voice/credentials": [],
   "voice/status": {

@@ -43,6 +43,7 @@ from . import rakazo_rooms as rooms
 from . import rakazo_routines as routines
 from . import rakazo_skills as skills
 from . import rakazo_spaces as sp
+from . import rakazo_vault as vault
 from .assistant import (
     ApprovalRequired,
     AssistantError,
@@ -164,7 +165,7 @@ def rakazo_bridge_config(raw: Any, now: float | None = None) -> dict[str, Any]:
         return {"enabled": False}
     now = time.time() if now is None else now
     unknown = sorted(set(raw) - {"enabled", "accounts", "token_ttl_days", "max_tokens", "trusted_proxies",
-                                 "routine_runner_seconds", "hindsight"})
+                                 "routine_runner_seconds", "hindsight", "vault_key_file"})
     if unknown:
         raise ValueError(f"control_plane.rakazo_bridge has unknown keys: {', '.join(map(str, unknown))} "
                          "(accounts are listed under accounts: [{email, password_scrypt, role}])")
@@ -176,6 +177,9 @@ def rakazo_bridge_config(raw: Any, now: float | None = None) -> dict[str, Any]:
         return value
 
     runner = bounded("routine_runner_seconds", 0, 0, 3600)          # 0 = routines run only when tested from the app
+    vault_key_file = raw.get("vault_key_file")
+    if vault_key_file is not None and (not isinstance(vault_key_file, str) or not vault_key_file):
+        raise ValueError("control_plane.rakazo_bridge.vault_key_file must be a file path")
     hindsight = raw.get("hindsight")
     if hindsight is not None:
         if (not isinstance(hindsight, dict) or set(hindsight) != {"url", "token_file", "project", "cache_dir"}
@@ -219,7 +223,8 @@ def rakazo_bridge_config(raw: Any, now: float | None = None) -> dict[str, Any]:
             raise ValueError(f"{where}.collab_user must be a collaboration user id (letters, digits and . _ @ + : -)")
         accounts.append(Account(account_id, email_n, f"rakazo:{account_id}", role, params, cutoff, link))
     return {"enabled": True, "token_ttl_days": ttl_days, "max_tokens": max_tokens, "accounts": accounts,
-            "trusted_proxies": tuple(nets), "routine_runner_seconds": runner, "hindsight": hindsight}
+            "trusted_proxies": tuple(nets), "routine_runner_seconds": runner, "hindsight": hindsight,
+            "vault_key_file": vault_key_file}
 
 
 # --------------------------------------------------------------------------------------------- tokens
@@ -646,12 +651,14 @@ class RakazoBridge:
         self.artifacts = artifacts.Artifacts(self, BridgeError, artifacts_fn)
         self.models = models.Models(self, BridgeError)
         self.skills = skills.Skills(self, BridgeError)
+        self.vault = vault.Vault(self, BridgeError, vault.load_cipher(config.get("vault_key_file")))
         runner = getattr(self.svc, "runner", None)
         if hasattr(runner, "prompt_extras"):
             runner.prompt_extras.append(self.skills.prompt_for)
         self.hindsight = hs.build(config.get("hindsight"))
         for name, fn in {**self.bots.procs(), **self.memory.procs(), **self.routines.procs(),
-                         **self.artifacts.procs(), **self.models.procs(), **self.skills.procs()}.items():
+                         **self.artifacts.procs(), **self.models.procs(), **self.skills.procs(),
+                         **self.vault.procs()}.items():
             self._procs[name] = fn
         self.rest = rest.Rest(self, BridgeError, set(self._procs))
         self._procs.update(self.rest.procs())

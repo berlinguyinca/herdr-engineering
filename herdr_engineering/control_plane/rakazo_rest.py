@@ -22,12 +22,10 @@ from urllib.parse import urlsplit
 from . import rakazo_events as ev
 
 READS = frozenset({
-    "agentSecrets/list",
     "approvalRules/list",
     "autoReview/get",
     "availability/items",
     "boards/list",
-    "botSecrets/list",
     "capabilities/catalogSearch",
     "capabilities/list",
     "computer/status",
@@ -55,7 +53,6 @@ READS = frozenset({
     "skills/list",
     "tickets/list",
     "updater/status",
-    "vault/list",
     "voice/catalog",
     "voice/credentials",
     "voice/status",
@@ -65,8 +62,8 @@ PUBLIC = frozenset({"health"})          # answered before sign-in by the bridge 
 NOT_FOUND_TAILS = frozenset({"get", "getById", "comments", "readFile", "downloadFile", "listVersions", "tools", "files",
                              "pluginParts", "pluginPreview", "terminalUrl", "screenUrl", "commands", "voices"})
 _REASONS = {
-    "agentSecrets": "Agent secrets are not stored by this server.", "botSecrets": "Bot secrets are not stored by this server.",
-    "vault": "The vault is not enabled on this server.",
+
+
     "billing": "This server has no billing: it is free to use.", "paymentWallet": "Payment wallets are not available.",
     "voice": "Voice is not set up on this server.", "computer": "No computer host is attached to this server.",
     "models": "Models on this server are managed by the operator, not from the app.",
