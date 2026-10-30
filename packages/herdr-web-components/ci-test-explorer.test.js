@@ -116,3 +116,10 @@ test('a JUnit failure cannot be sent because the server has no log excerpt to re
  assert.doesNotMatch(html,/data-cx-agents/);
  assert.match(html,/needs the log excerpt/);
 });
+
+test('a test already sent to the chosen agent offers "Send again", not a silent resend',()=>{
+ const report=logReport([logTest('a','TestAlpha','failed')]);
+ const base={selected:'7:a',sessions:[{session_id:'s1'},{session_id:'s2'}],sent:{'7:a':{sessionId:'s1',message:'Delivered to the selected Pi agent.'}},sendMessage:'Delivered to the selected Pi agent.'};
+ assert.match(renderTestExplorer(ex([{label:'main',report}],{...base,sessionId:'s1'})),/data-cx-send>Send again/);
+ assert.match(renderTestExplorer(ex([{label:'main',report}],{...base,sessionId:'s2'})),/data-cx-send>Send this failure/);
+});
