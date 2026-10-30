@@ -1447,6 +1447,22 @@ class RakazoBridge:
         with self._accounts_lock:
             return list(self._by_id.values())
 
+    def canonical_person(self, tenant: str, user: str) -> tuple[str, str]:
+        """The single-operator rule: a Rakazo phone account whose role is ``operator`` is the same human as the dashboard
+        operator (``open-listener``), so its per-person DATA (Google connection, blocked calendars, reminders) is keyed
+        by ``(tenant, open-listener)``. Only the data key changes: approvals, audit and grants keep the real phone
+        principal. Fails closed: family/viewer/unknown roles, unknown ids and non-rakazo users are returned unchanged.
+        Looks accounts up the way ``_all_accounts`` does (configured plus Cognito, under the accounts lock)."""
+        if not isinstance(user, str) or not user.startswith("rakazo:"):
+            return tenant, user
+        try:
+            for account in self._all_accounts():
+                if account.principal_id == user:
+                    return (tenant, OPEN_LISTENER_USER) if account.role == "operator" else (tenant, user)
+        except Exception:  # noqa: BLE001 - never widen access on an error
+            log.warning("rakazo: canonical_person lookup failed; person left unchanged")
+        return tenant, user
+
     def _operator_accounts(self) -> list[Any]:
         """The accounts a board proposal (and, for the open-listener operator, a reminder) is pushed to."""
         return [a for a in self._all_accounts() if a.role == "operator"]

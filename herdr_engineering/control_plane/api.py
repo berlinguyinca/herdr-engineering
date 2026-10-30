@@ -502,6 +502,7 @@ class ControlPlaneServer:
                        if _bridge_cfg["enabled"] else None)
         self._build_assistant_apps(assistant_apps_dsn)
         self._build_reminders(assistant_apps_dsn)
+        self.assistant.canonical_person = self._canonical_person
         from .ingest import IngestService
         # operator YAML: {api key: {rooms: [...], missions: [...]}} -> principal ids (the key itself is never kept)
         scopes = {}
@@ -668,8 +669,9 @@ class ControlPlaneServer:
                 from .google_workspace import GoogleWorkspace
                 _gw = GoogleWorkspace(apps=self.apps)
                 self.apps.on_change = _gw.invalidate
-                self.assistant.google_read = _gw.run
-                self.assistant.google_write = _gw.write
+                # Single-operator rule: map the data key (never the approval actor) through the bridge when there is one.
+                self.assistant.google_read = lambda t, u, tool, payload: _gw.run(*self._canonical_person(t, u), tool, payload)
+                self.assistant.google_write = lambda t, u, tool, payload: _gw.write(*self._canonical_person(t, u), tool, payload)
                 self.google = _gw
             from .assistant_lineage import LineageReader, principal_resolver
             self.assistant.lineage_read = LineageReader(repo.graph, principal_resolver(self._keys)).read
@@ -1455,6 +1457,11 @@ class ControlPlaneServer:
         if matches[0].interactive_ready is False or matches[0].launch_pending:
             raise InvalidError("native agent is not ready for prompt delivery")
         return adapter.send_input(target, message, machine=machine, session=server)
+
+    def _canonical_person(self, tenant, user):
+        """Single-operator rule (RakazoBridge.canonical_person); identity when there is no bridge."""
+        rakazo = getattr(self, "rakazo", None)
+        return rakazo.canonical_person(tenant, user) if rakazo is not None else (tenant, user)
 
     def _build_reminders(self, dsn):
         """Reminders need an assistant and nothing else (no Google). Without an assistant there is no store and no scheduler."""
@@ -4251,6 +4258,7 @@ def _make_handler(server, public=False, operator=False):
                 return self._json({"error": "rate_limited"}, 429)
             if store is None:
                 return self._json({"error": "not_set_up"}, 409)
+            tenant, user = server._canonical_person(tenant, user)
             tz = zone(server.assistant.config["notifications"]["timezone"])
             if self.command == "GET" and len(parts) == 4:
                 return self._json({"reminders": [r.as_dict(tz) for r in store.list(tenant, user)], "timezone": str(tz)})
@@ -4272,6 +4280,7 @@ def _make_handler(server, public=False, operator=False):
                 server.assistant.check_rate_limit(key=f"{tenant}:{user}")
             except RateLimited:
                 return self._json({"error": "rate_limited"}, 429)
+            tenant, user = server._canonical_person(tenant, user)
             apps, command = server.apps, self.command
             tail = parts[4:]
             if tail == [] and command == "GET":
