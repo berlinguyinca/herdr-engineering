@@ -307,6 +307,7 @@ _TEXT_EXTENSIONS = (
 class FileConflict:
     name: str
     kind: str  # add_add | delete_modify | modify_modify_text | binary | oversize | not_utf8 | case_collision
+    # | validation (set by ArtifactStore.merge_commit when the merged result fails the manifest/blob checks)
     base_sha256: str | None
     theirs_sha256: str | None
     mine_sha256: str | None

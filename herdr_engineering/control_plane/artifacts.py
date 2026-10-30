@@ -1,8 +1,10 @@
 """Artifact model + bindings + materialization (Spec §56-74)."""
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
+import mimetypes
 import os
 import tempfile
 import uuid
@@ -15,6 +17,7 @@ from typing import Any
 from . import ids
 from .artifact_context import ArtifactContextMixin
 from .artifact_lifecycle import ArtifactLifecycleMixin
+from .artifact_merge import FileConflict, merge_manifests
 from .artifact_provenance import ProvenanceError, context_links, normalize_origin
 from .artifact_uploads import ArtifactUploadMixin
 from .rustfs import IntegrityError, RustFSClient
@@ -370,11 +373,19 @@ class ArtifactStore(ArtifactContextMixin, ArtifactUploadMixin, ArtifactLifecycle
         ``ArtifactMergeConflict``. The artifact row lock (as in ``commit_version``) is held from reading the head to
         committing, so the head cannot move in between. Idempotent per ``(created_by, idempotency_key)``.
 
-        ``read_text(entry) -> str`` and ``store_text(name, template) -> entry`` default to RustFS; ``store_text`` gets
-        ``{**head_entry, "text": merged}`` and must return a complete entry with a fresh sha256/size_bytes.
-        """
-        from .artifact_merge import merge_manifests
+        If the merged/contributed content fails the manifest and blob checks of ``commit_version`` (or the scoped blob
+        registration), that is a conflict of kind ``validation``: the savepoint is rolled back, one attempt row is
+        logged and ``ArtifactMergeConflict`` is raised. Refusals unrelated to content (retracted, not writable, unknown
+        base, idempotency key reuse, no effective change) stay plain ``ArtifactError``.
 
+        The attempt row is written in this method's own transaction, which commits before the conflict is raised. It
+        only persists if the caller does NOT wrap the call in an outer transaction of its own (that transaction would
+        roll it back together with everything else when the exception propagates).
+
+        ``read_text(entry) -> str`` and ``store_text(name, template) -> entry`` default to RustFS; ``store_text`` gets
+        ``{**head_entry, "text": merged}`` and must return a complete entry with a fresh sha256/size_bytes. The merge
+        runs in a worker thread (still under the row lock) so blob I/O does not block the event loop.
+        """
         if not isinstance(collaborator_agent_id, str) or not collaborator_agent_id:
             raise ArtifactError("merge commits require a collaborator_agent_id")
         if not isinstance(base_version_id, str) or not base_version_id:
@@ -430,33 +441,59 @@ class ArtifactStore(ArtifactContextMixin, ArtifactUploadMixin, ArtifactLifecycle
                     mine.pop(change["name"], None)
                 else:
                     mine[change["name"]] = change["entry"]
-            merge = merge_manifests(list(base_files.values()), list(head_files.values()), list(mine.values()),
-                                    read_text=read_text, store_text=store_text, max_text_bytes=max_text_bytes)
-            if merge.conflicts:
+            if {n: e["sha256"] for n, e in mine.items()} == {n: e["sha256"] for n, e in base_files.items()}:
+                raise ArtifactError("no changes")
+            merge = await asyncio.to_thread(
+                merge_manifests, list(base_files.values()), list(head_files.values()), list(mine.values()),
+                read_text=read_text, store_text=store_text, max_text_bytes=max_text_bytes)
+            conflicts = list(merge.conflicts)
+            if not conflicts:
+                fast_forward = head_id == base_version_id
+                try:
+                    # one savepoint: a failed check leaves neither scoped blob rows nor a version behind
+                    async with _transaction(self._conn):
+                        for entry in registrations:
+                            await self.register_report_blob(
+                                artifact_id, storage_key=entry["storage_key"], sha256=entry["sha256"],
+                                size_bytes=entry["size_bytes"], media_type=entry["media_type"])
+                        version = await self.commit_version(
+                            artifact_id, base_version_id=head_id, source_manifest_blob=None,
+                            output_manifest=merge.files,
+                            provenance={"message": message, "merged_names": merge.merged_names,
+                                        "collab_request_sha256": request_sha},
+                            created_by=created_by, idempotency_key=idempotency_key,
+                            parent_version_ids=[head_id] if fast_forward else [head_id, base_version_id],
+                            created_via="collaborator", collaborator_agent_id=collaborator_agent_id)
+                except ArtifactConflict:
+                    raise
+                except ArtifactError as exc:
+                    name = self._validation_culprit(str(exc), merge, normalized)
+                    conflicts = [FileConflict(
+                        name, "validation", (base_files.get(name) or {}).get("sha256"),
+                        (head_files.get(name) or {}).get("sha256"), (mine.get(name) or {}).get("sha256"), None)]
+            if conflicts:
                 await self._conn.execute(
                     "INSERT INTO artifact_collab_attempts (attempt_id, artifact_id, collaborator_agent_id, "
                     "base_version_id, head_version_id, conflict_names, message) VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7)",
                     str(uuid.uuid4()), artifact_id, collaborator_agent_id, base_version_id, head_id,
-                    json.dumps([{"name": c.name, "kind": c.kind} for c in merge.conflicts]), message)
+                    json.dumps([{"name": c.name, "kind": c.kind} for c in conflicts]), message)
                 # leave the block normally so the attempt row commits; raise once the transaction is closed
-                conflict = ArtifactMergeConflict(head_id, merge.conflicts, merge.clean_names)
-            else:
-                for entry in registrations:
-                    await self.register_report_blob(
-                        artifact_id, storage_key=entry["storage_key"], sha256=entry["sha256"],
-                        size_bytes=entry["size_bytes"], media_type=entry["media_type"])
-                fast_forward = head_id == base_version_id
-                version = await self.commit_version(
-                    artifact_id, base_version_id=head_id, source_manifest_blob=None, output_manifest=merge.files,
-                    provenance={"message": message, "merged_names": merge.merged_names,
-                                "collab_request_sha256": request_sha},
-                    created_by=created_by, idempotency_key=idempotency_key,
-                    parent_version_ids=[head_id] if fast_forward else [head_id, base_version_id],
-                    created_via="collaborator", collaborator_agent_id=collaborator_agent_id)
+                conflict = ArtifactMergeConflict(head_id, conflicts, merge.clean_names)
         if conflict is not None:
             raise conflict
         return {"result": "created" if fast_forward else "merged", "version": version,
                 "merged_names": list(merge.merged_names)}
+
+    @staticmethod
+    def _validation_culprit(error: str, merge, normalized: list[dict]) -> str:
+        """The file a failed manifest/blob check names (by storage key or digest), else the first merged or put name."""
+        for entry in merge.files:
+            for key in ("storage_key", "blob_sha256", "sha256"):
+                value = entry.get(key)
+                if isinstance(value, str) and value and value in error:
+                    return entry["name"]
+        candidates = list(merge.merged_names) + [c["name"] for c in normalized if c["op"] == "put"]
+        return candidates[0] if candidates else (normalized[0]["name"] if normalized else "*")
 
     async def _merge_replay(self, principal: str, idempotency_key: str | None, request_sha: str) -> dict | None:
         if not idempotency_key:
@@ -525,14 +562,21 @@ class ArtifactStore(ArtifactContextMixin, ArtifactUploadMixin, ArtifactLifecycle
         reference = entry.get("storage_key") or entry.get("blob_sha256")
         if isinstance(reference, str) and len(reference) == 64 and "/" not in reference:
             reference = f"sha256/{reference[:2]}/{reference[2:4]}/{reference}"
-        return self._rf.get(reference, entry["sha256"]).decode("utf-8")
+        try:
+            data = self._rf.get(reference, entry["sha256"])
+        except Exception as exc:                        # noqa: BLE001 - missing object, IntegrityError, transport
+            raise ArtifactError(f"cannot read artifact blob for {entry.get('name')}: {reference}") from exc
+        return data.decode("utf-8")                     # UnicodeDecodeError -> merge_manifests reports not_utf8
 
     def _store_blob_text(self, name: str, template: dict) -> dict:
         data = template["text"].encode("utf-8")
         key, digest = self._rf.put(data)
         entry = {k: v for k, v in template.items()
                  if k not in ("text", "storage_key", "blob_sha256", "sha256", "size_bytes")}
-        return {**entry, "name": name, "storage_key": key, "sha256": digest, "size_bytes": len(data)}
+        # one resolved media type for both the manifest entry and the scoped blob row, so later scope checks match
+        media_type = template.get("media_type") or mimetypes.guess_type(name)[0] or "text/plain"
+        return {**entry, "name": name, "media_type": media_type, "storage_key": key, "sha256": digest,
+                "size_bytes": len(data)}
 
     async def report_permission(self, artifact_id: str, principal_id: str, permission: str) -> bool:
         """Private report operations use durable owner/grant authority, not a guessed context."""

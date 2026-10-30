@@ -173,18 +173,26 @@ def test_delete_versus_modify_is_a_conflict(parents_postgres):
     run(parents_postgres, body)
 
 
-def test_delete_of_absent_name_is_a_no_op_and_put_needs_entry(parents_postgres):
+def test_no_effective_change_is_refused_and_put_needs_entry(parents_postgres):
     texts = Texts()
 
     async def body(store, conn):
         aid, v1 = await setup(store, texts)
-        out = await merge(store, texts, aid, v1["version_id"], [{"name": "ghost.md", "op": "delete"}])
-        assert [e["name"] for e in out["version"]["output_manifest"]] == ["doc.md"]
+        # deleting an absent name changes nothing, nor does re-putting the base content: refused, no version
+        with pytest.raises(ArtifactError, match="no changes"):
+            await merge(store, texts, aid, v1["version_id"], [{"name": "ghost.md", "op": "delete"}])
+        with pytest.raises(ArtifactError, match="no changes"):
+            await merge(store, texts, aid, v1["version_id"],
+                        [{"name": "doc.md", "op": "put", "entry": texts.entry("doc.md", BASE_DOC)}])
+        out = await merge(store, texts, aid, v1["version_id"],
+                          [{"name": "ghost.md", "op": "delete"}, {"name": "doc.md", "op": "delete"}])
+        assert out["version"]["output_manifest"] == []
         with pytest.raises(ArtifactError):
             await merge(store, texts, aid, out["version"]["version_id"], [{"name": "x.md", "op": "put"}])
         with pytest.raises(ArtifactError):
             await merge(store, texts, aid, out["version"]["version_id"],
                         [{"name": "x.md", "op": "put", "entry": texts.entry("y.md", "y\n")}])
+        assert len(await store.list_versions(aid)) == 2 and await attempts(conn, aid) == []
     run(parents_postgres, body)
 
 
@@ -268,3 +276,112 @@ def test_base_must_belong_to_the_artifact(parents_postgres):
         with pytest.raises(ArtifactError):
             await merge(store, texts, aid, o1["version_id"], [{"name": "doc.md", "op": "delete"}])
     run(parents_postgres, body)
+
+
+# -- the default (RustFS) adapters -------------------------------------------------------------------------
+
+
+class MemoryRustFS:
+    """Content-addressed in-memory stand-in for rustfs.RustFSClient (put/get/head)."""
+
+    def __init__(self):
+        self.objects = {}
+
+    def put(self, data):
+        digest = hashlib.sha256(data).hexdigest()
+        key = f"sha256/{digest[:2]}/{digest[2:4]}/{digest}"
+        self.objects[key] = data
+        return key, digest
+
+    def get(self, key, expected_sha256):
+        data = self.objects[key]
+        if hashlib.sha256(data).hexdigest() != expected_sha256:
+            raise RuntimeError("sha256 mismatch")
+        return data
+
+    def head(self, key):
+        return key in self.objects
+
+
+def rf_entry(rf, name, text, media_type=None):
+    key, digest = rf.put(text.encode())
+    entry = {"name": name, "sha256": digest, "size_bytes": len(text.encode()), "storage_key": key}
+    if media_type is not None:
+        entry["media_type"] = media_type
+    return entry
+
+
+def run_rf(dsn, body):
+    async def go():
+        conn = await asyncpg.connect(dsn)
+        try:
+            rf = MemoryRustFS()
+            return await body(ArtifactStore(conn, rf), conn, rf)
+        finally:
+            await conn.close()
+    return asyncio.run(go())
+
+
+async def rf_seed(store, rf, media_type=None):
+    aid = (await store.register_logical(original_filename="doc.md", created_by="owner"))["artifact_id"]
+    v1 = await owner_commit(store, aid, None, [rf_entry(rf, "doc.md", BASE_DOC, media_type)])
+    v2 = await owner_commit(store, aid, v1["version_id"],
+                            [rf_entry(rf, "doc.md", edit(BASE_DOC, 2, "owner"), media_type)])
+    return aid, v1, v2
+
+
+async def rf_merge(store, aid, base, changes):
+    return await store.merge_commit(aid, base_version_id=base, changes=changes, message="m",
+                                    created_by=COLLAB, collaborator_agent_id=AGENT)
+
+
+@pytest.mark.parametrize("media_type", [None, "text/markdown"])
+def test_default_adapters_merge_and_scope_the_merged_blob(parents_postgres, media_type):
+    async def body(store, conn, rf):
+        aid, v1, v2 = await rf_seed(store, rf, media_type)
+        mine = rf_entry(rf, "doc.md", edit(BASE_DOC, 9, "mine"), media_type)
+        out = await rf_merge(store, aid, v1["version_id"], [{"name": "doc.md", "op": "put", "entry": mine}])
+        assert out["result"] == "merged" and out["merged_names"] == ["doc.md"]
+        (entry,) = out["version"]["output_manifest"]
+        text = rf.get(entry["storage_key"], entry["sha256"]).decode()
+        assert "owner\n" in text and "mine\n" in text
+        assert entry["size_bytes"] == len(text.encode()) and entry["media_type"]
+        row = await conn.fetchrow("SELECT media_type, size_bytes FROM artifact_blobs WHERE scope=$1 AND blob_sha256=$2",
+                                  aid, entry["sha256"])
+        assert row["media_type"] == entry["media_type"] and row["size_bytes"] == entry["size_bytes"]
+        assert await store.verify_share_outputs(aid, out["version"]["version_id"]) == 1
+    run_rf(parents_postgres, body)
+
+
+def test_unverified_blob_is_a_validation_conflict(parents_postgres):
+    async def body(store, conn, rf):
+        aid, v1, v2 = await rf_seed(store, rf)
+        ghost = {"name": "new.md", "media_type": "text/markdown", "sha256": "a" * 64, "size_bytes": 3,
+                 "storage_key": f"sha256/aa/aa/{'a' * 64}"}
+        # a stale base with a clean text merge too, so a merged blob would be registered if the savepoint leaked
+        mine = rf_entry(rf, "doc.md", edit(BASE_DOC, 9, "mine"))
+        with pytest.raises(ArtifactMergeConflict) as caught:
+            await rf_merge(store, aid, v1["version_id"], [{"name": "doc.md", "op": "put", "entry": mine},
+                                                          {"name": "new.md", "op": "put", "entry": ghost}])
+        assert [(c.name, c.kind) for c in caught.value.conflicts] == [("new.md", "validation")]
+        assert caught.value.head_version_id == v2["version_id"]
+        (attempt,) = await attempts(conn, aid)
+        assert json.loads(attempt["conflict_names"]) == [{"name": "new.md", "kind": "validation"}]
+        assert len(await store.list_versions(aid)) == 2
+        assert await conn.fetchval("SELECT count(*) FROM artifact_blobs WHERE scope=$1", aid) == 0
+        assert (await conn.fetchrow("SELECT current_version_id FROM artifacts WHERE artifact_id=$1", aid)
+                )["current_version_id"] == v2["version_id"]
+    run_rf(parents_postgres, body)
+
+
+def test_unreadable_blob_is_a_plain_error(parents_postgres):
+    async def body(store, conn, rf):
+        aid, v1, v2 = await rf_seed(store, rf)
+        mine = rf_entry(rf, "doc.md", edit(BASE_DOC, 9, "mine"))
+        del rf.objects[v2["output_manifest"][0]["storage_key"]]
+        with pytest.raises(ArtifactError) as caught:
+            await rf_merge(store, aid, v1["version_id"], [{"name": "doc.md", "op": "put", "entry": mine}])
+        assert not isinstance(caught.value, ArtifactMergeConflict)
+        assert "cannot read" in str(caught.value)
+        assert await attempts(conn, aid) == [] and len(await store.list_versions(aid)) == 2
+    run_rf(parents_postgres, body)
