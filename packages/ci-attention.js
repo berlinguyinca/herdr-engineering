@@ -62,8 +62,21 @@ export function ciAttentionModel(ci, now = Date.now()) {
       age: now - finished(latest), sessions: ciRunSessions(latest) });
   }
   failures.sort((a, b) => Number(a.rerunning) - Number(b.rerunning) || a.age - b.age);
+  // One thing to look at per repository: an unfixed failure on main, on PR #1420 and on PR #1421 of the same repo is one
+  // problem. The newest failure leads (its step and log load when opened); the others are listed inside it. Each ref still
+  // counts on its own above, so a green main never clears a red PR.
+  const byRepo = new Map();
+  for (const f of failures) {
+    if (!byRepo.has(f.repository)) byRepo.set(f.repository, []);
+    byRepo.get(f.repository).push(f);
+  }
+  const combined = [...byRepo.entries()].map(([repository, refs]) => {
+    const lead = refs.reduce((a, b) => (b.age < a.age ? b : a));
+    return { ...lead, key: repository, refs: refs.slice().sort((a, b) => a.age - b.age) };
+  });
+  combined.sort((a, b) => Number(a.rerunning) - Number(b.rerunning) || a.age - b.age);
   running.sort((a, b) => Number(b.stuck) - Number(a.stuck) || Number(b.blocked) - Number(a.blocked) || b.age - a.age);
-  return { failures, running, merged, stuck: running.filter((r) => r.stuck).length };
+  return { failures: combined, refFailures: failures, running, merged, stuck: running.filter((r) => r.stuck).length };
 }
 
 const FAILURE_LINE = /^(not ok |(FAILED|ERROR) |=+ FAILURES =+|\+ exit [1-9]|Error:|AssertionError)/;
@@ -89,6 +102,7 @@ const sessionLink = (id) => `<a href="#/herd/session/${esc(encodeURIComponent(id
 function failureRow(f, open) {
   const r = f.run;
   const chips = [f.consecutive > 1 ? `<span class="cia-chip cia-chip--bad">${f.consecutive} failures in a row</span>` : '',
+    f.refs.length > 1 ? `<span class="cia-chip cia-chip--bad">${f.refs.length} branches or PRs failing</span>` : '',
     f.rerunning ? '<span class="cia-chip">re-running</span>' : '',
     f.sessions.length ? `<span class="cia-chip">agent: ${f.sessions.slice(0, 2).map(sessionLink).join(', ')}</span>` : ''].join('');
   return `<details class="cia-row" data-cia-row="${esc(f.key)}"${open ? ' open' : ''}><summary><span class="cia-dot cia-dot--bad" aria-hidden="true"></span>`
@@ -127,8 +141,11 @@ export function renderCiDetail(f, detail, logs, errors = {}) {
   const links = `<p class="cia-links"><a href="${esc(f.run.url || '#')}" target="_blank" rel="noopener noreferrer">Open run in Woodpecker ↗</a>${
     f.run.forge_url ? ` · <a href="${esc(f.run.forge_url)}" target="_blank" rel="noopener noreferrer">${esc(f.label)} on the forge ↗</a>` : ''}${
     f.sessions.length ? ` · agent ${f.sessions.map(sessionLink).join(', ')}` : ' · no agent session is linked to this commit'}</p>`;
-  if (errors.detail) return `${head}<p class="cia-note" role="status">${esc(errors.detail)}</p>${links}`;
-  if (!detail) return `${head}<p class="cia-note" role="status">Loading the failing step…</p>${links}`;
+  const also = list(f.refs).filter((x) => x !== f && x.run !== f.run);
+  const alsoBlock = also.length ? `<div class="cia-also"><p class="cia-note">Also failing in ${esc(f.repository)}:</p><ul>${also.map((x) =>
+    `<li>${esc(x.label)} · <a href="${esc(x.run.url || '#')}" target="_blank" rel="noopener noreferrer">run #${esc(x.run.run_number)}</a> · ${esc(ago(x.age))}${x.consecutive > 1 ? ` · ${x.consecutive} in a row` : ''}</li>`).join('')}</ul></div>` : '';
+  if (errors.detail) return `${head}<p class="cia-note" role="status">${esc(errors.detail)}</p>${links}${alsoBlock}`;
+  if (!detail) return `${head}<p class="cia-note" role="status">Loading the failing step…</p>${links}${alsoBlock}`;
   const body = (steps.length ? steps : []).slice(0, 2).map((s) => {
     const log = logs[s.id]; const ex = log ? failureExcerpt(log.log) : null;
     return `<div class="cia-step"><h3>${esc(s.workflow || 'step')} / ${esc(s.name)} <span class="cia-meta">${esc(s.state)}${s.exit_code != null ? ` · exit ${esc(s.exit_code)}` : ''}</span></h3>${
@@ -136,7 +153,7 @@ export function renderCiDetail(f, detail, logs, errors = {}) {
         : !log ? '<p class="cia-note" role="status">Loading the log…</p>'
           : `<pre class="cia-log" tabindex="0">${esc(ex.lines.join('\n'))}</pre><p class="cia-note">${ex.matched ? 'Lines around the failure' : 'No failure marker found; the last lines'}${log.truncated ? ' · the stored log is truncated' : ''}${ex.more ? ` · ${ex.more} more lines not shown` : ''}.</p>`}</div>`;
   }).join('') || '<p class="cia-note">No failed step is reported for this run (it may have been killed before a step started).</p>';
-  return `${head}${body}${links}`;
+  return `${head}${body}${links}${alsoBlock}`;
 }
 
 const styles = `.cia{margin:12px 0 20px;min-width:0}.cia h2{font-size:15px;margin:16px 0 6px;display:flex;align-items:center;gap:8px}.cia-count{font-size:12px;font-weight:500;padding:0 8px;border:1px solid var(--border);border-radius:99px;color:var(--text-secondary)}
@@ -145,7 +162,7 @@ const styles = `.cia{margin:12px 0 20px;min-width:0}.cia h2{font-size:15px;margi
 .cia-note{font-size:12px;color:var(--text-secondary);margin:4px 0 8px}.cia-row{border-bottom:1px solid var(--border-subtle)}.cia-row>summary{display:flex;flex-wrap:wrap;align-items:center;gap:4px 12px;padding:10px 4px;cursor:pointer;list-style:none;font-size:13px}.cia-row>summary::-webkit-details-marker{display:none}.cia-row>summary:hover{background:var(--surface-2)}
 .cia-dot{width:8px;height:8px;border-radius:50%;flex:none;background:var(--text-muted)}.cia-dot--bad{background:var(--status-failed)}.cia-dot--live{background:var(--status-active)}.cia-name{font-weight:600;overflow-wrap:anywhere}.cia-ref{color:var(--text-secondary)}.cia-meta{font-size:12px;color:var(--text-muted)}
 .cia-chip{font-size:11px;padding:0 8px;border:1px solid var(--border);border-radius:99px;color:var(--text-secondary)}.cia-chip--bad{border-color:var(--status-failed);color:var(--status-failed)}
-.cia-body{padding:4px 4px 16px 24px}.cia-who{font-size:13px;margin:4px 0 8px;overflow-wrap:anywhere}.cia-links{font-size:12px;margin:8px 0 0}.cia-step h3{font-size:13px;margin:8px 0 4px}
+.cia-also ul{margin:0;padding-left:18px;font-size:12px}.cia-body{padding:4px 4px 16px 24px}.cia-who{font-size:13px;margin:4px 0 8px;overflow-wrap:anywhere}.cia-links{font-size:12px;margin:8px 0 0}.cia-step h3{font-size:13px;margin:8px 0 4px}
 .cia-log{margin:4px 0;padding:12px;background:var(--surface-2);border:1px solid var(--border);border-radius:var(--radius-sm);font-size:12px;line-height:1.5;max-height:320px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere}
 .cia-runs{list-style:none;margin:0;padding:0}.cia-run{display:flex;flex-wrap:wrap;align-items:center;gap:4px 12px;padding:8px 4px;border-bottom:1px solid var(--border-subtle);font-size:13px}.cia-more{margin:8px 0}@media(max-width:900px){a.cia-name{display:inline-flex;align-items:center;min-height:44px}}`;
 
@@ -158,7 +175,7 @@ export function mountCiAttention(host, client, { intervalMs = 20000, now = () =>
   const detailHtml = (f) => renderCiDetail(f, details.get(f.key), logs.get(f.key) || {}, errors.get(f.key) || {});
   function paint() {
     if (disposed || !model) return;
-    const sig = JSON.stringify([model.failures.map((f) => [f.key, f.run.run_number, f.rerunning, f.consecutive]), model.running.map((r) => [r.key, r.stuck]), model.merged, showAll, runsOpen]);
+    const sig = JSON.stringify([model.failures.map((f) => [f.key, f.run.run_number, f.rerunning, f.consecutive, f.refs.map((x) => x.run.run_number)]), model.running.map((r) => [r.key, r.stuck]), model.merged, showAll, runsOpen]);
     if (sig !== signature) { signature = sig; host.innerHTML = renderCiAttention(model, { open, showAll, runsOpen }); }
     for (const f of model.failures) {
       const body = host.querySelector(`[data-cia-body="${CSS.escape(f.key)}"]`);
