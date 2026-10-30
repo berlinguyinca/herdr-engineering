@@ -395,6 +395,18 @@ def test_ingest_endpoint_upserts_host(server):
     assert [e["event_type"] for e in evs] == ["HostRegistered"]
 
 
+def test_ingest_review_names_its_pull_request_and_a_bad_number_is_a_400(server):
+    c, repo = server
+    ok = {"entity_type": "review", "entity_id": "rv-pr", "event_type": "review.started",
+          "payload": {"reviewer": "codex", "repository": "github.com/org/app", "pull_request_number": 7}}
+    status, _ = c.post("/api/v1/ingest", ok)
+    assert status == 200
+    assert repo.list_reviews()[0]["pull_request_number"] == 7
+    status, body = c.post("/api/v1/ingest", {**ok, "entity_id": "rv-bad", "payload": {**ok["payload"], "pull_request_number": "7"}})
+    assert status == 400, body
+    assert [r["review_id"] for r in repo.list_reviews()] == ["rv-pr"]
+
+
 def test_ingest_delivery_entities_via_http_preserves_counts(server):
     c, repo = server
     # A numeric ``passed`` count must survive ingest-body redaction (the key

@@ -50,7 +50,7 @@ SCRYPT_N, SCRYPT_R, SCRYPT_P, SALT_BYTES, HASH_BYTES = 2 ** 15, 8, 1, 16, 32
 _MAX_N = 2 ** 17                     # 128 MiB: a hash in the YAML cannot make one sign-in allocate more than this
 _EMAIL = re.compile(r"[^@\s]+@[^@\s]+\Z")
 _PROC = re.compile(r"[A-Za-z][A-Za-z0-9/]{0,63}\Z")
-_ROLES = ("operator",)
+_ROLES = ("operator", "family")
 _CONSENT_VERSION = "herdr-1"
 MAX_BODY = 1_000_000
 MAX_AUTH_BODY = 8_192
@@ -185,9 +185,9 @@ def rakazo_bridge_config(raw: Any, now: float | None = None) -> dict[str, Any]:
         if not isinstance(email, str) or not _EMAIL.match(normalize_email(email)) or len(email) > 254:
             raise ValueError(f"{where}.email must be an email address")
         role = row.get("role", "operator")
-        if role != "operator":
-            raise ValueError(f"{where}.role {role!r} is not supported: only 'operator' is implemented "
-                             "('family' is reserved for a later multi-user mode)")
+        if role not in _ROLES:
+            raise ValueError(f"{where}.role {role!r} is not supported: use one of {', '.join(_ROLES)} "
+                             "(family = chat only: no project data, proposals or approvals)")
         params = parse_scrypt(row.get("password_scrypt"), f"{where}.password_scrypt")
         cutoff = _cutoff(row.get("tokens_valid_after"), f"{where}.tokens_valid_after", now)
         email_n = normalize_email(email)
@@ -784,7 +784,7 @@ class RakazoBridge:
         with self.journals.lock:
             journal = self.journals.get(thread.thread_id, assistant.assistant_id)
             journal.sync(messages, runs, approvals)
-            if self._first_bot(ctx) == assistant.assistant_id:      # one card per proposal: the first bot's thread only
+            if ctx.account.role == "operator" and self._first_bot(ctx) == assistant.assistant_id:   # one card per proposal: the first bot's thread only
                 self.desk.refresh(ctx.tenant, ctx.user, journal, force=fresh, bypass=bypass)
             return journal, runs
 
@@ -964,8 +964,8 @@ class RakazoBridge:
         if decision is None:
             raise BridgeError(400, "BAD_REQUEST", "Answer allow or deny.")
         thread = self._thread(ctx, assistant)
-        if self._first_bot(ctx) != assistant.assistant_id:
-            raise BridgeError(404, "NOT_FOUND", "Not found.")
+        if ctx.account.role != "operator" or self._first_bot(ctx) != assistant.assistant_id:
+            raise BridgeError(404, "NOT_FOUND", "Not found.")      # a family account never sees or decides board proposals
         self._journal(ctx, assistant, thread, fresh=True)
         try:
             with self.journals.lock:

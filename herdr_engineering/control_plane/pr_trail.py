@@ -181,16 +181,26 @@ def _handoff_rows(rows, session_ids):
 
 def _names_this_pull(row, match, number):
     explicit = row.get("pull_request_number", row.get("pr_number"))
-    return explicit == number and match(row.get("repository"))
+    return type(explicit) is int and explicit == number and match(row.get("repository"))   # not a bool: True == 1
 
 
-def _review_rows(reviews, plan_reviews, session_ids, match, number):
+HOST_UNVERIFIED = ("The review names this repository without a forge host, so it cannot be shown to belong to the host this pull request is on; "
+                   "it is listed but feeds no signal.")
+
+
+def _review_rows(reviews, plan_reviews, session_ids, match, number, known_hosts=frozenset()):
+    """Reviews of the trail: by agent session, or by an explicit pull request reference. A reference whose repository has no forge host
+    attaches only when the pull request is on one host at most, and is then marked ``host_unverified``."""
     out = []
     for source, rows in (("review", reviews), ("plan_review", plan_reviews)):
         for row in rows or []:
             row = _dict(row)
             by_session = row.get("session_id") in session_ids
-            if not (by_session or _names_this_pull(row, match, number)):
+            by_reference = not by_session and _names_this_pull(row, match, number)
+            if not (by_session or by_reference):
+                continue
+            hostless = by_reference and (_key(row.get("repository")) or (1,))[0] is None
+            if hostless and len(known_hosts) > 1:
                 continue
             verdict = _verdict(row)
             kind = str(row.get("kind") or "code").lower()
@@ -200,7 +210,8 @@ def _review_rows(reviews, plan_reviews, session_ids, match, number):
                         "reviewer": _text(row.get("reviewer") or row.get("instance_id"), 80), "status": _text(row.get("status"), 40),
                         "verdict": _text(verdict, 40), "at": _iso(at), "completed_at": _iso(row.get("completed_at")),
                         "changes_requested": verdict in _CHANGES or str(row.get("status") or "").lower() in _CHANGES,
-                        "rule": "session" if by_session else "pull_request"})
+                        "rule": "session" if by_session else "pull_request",
+                        "host_unverified": bool(hostless and known_hosts), "host_unverified_reason": HOST_UNVERIFIED if hostless and known_hosts else None})
     out.sort(key=lambda r: _time(r.get("at")) or _LAST)
     return out
 
@@ -264,9 +275,9 @@ def build(owner, name, number, *, pull_requests, sessions, view, handoffs, revie
     pull_requests = [p for p in pull_requests if isinstance(p, dict)]
     sessions = [s for s in sessions if isinstance(s, dict)]
     ci_ok = bool(view) and view.get("available") is not False
+    known = _hosts(path, [*(p.get("repository") for p in pull_requests), *(s.get("repository_id") for s in sessions),
+                          *(_repository_ids(view).values() if ci_ok else ())])
     if not host:
-        known = _hosts(path, [*(p.get("repository") for p in pull_requests), *(s.get("repository_id") for s in sessions),
-                              *(_repository_ids(view).values() if ci_ok else ())])
         if len(known) > 1:
             return _empty(owner, name, number, "ambiguous",
                           f"{repository} exists on several forge hosts ({', '.join(sorted(known))}); open this page with ?host=<host> to choose one.")
@@ -300,7 +311,7 @@ def build(owner, name, number, *, pull_requests, sessions, view, handoffs, revie
     inferred.sort(key=lambda s: _time(s.get("created_at")) or _LAST)
 
     hand_all = _handoff_rows(handoffs, evidence_ids)
-    revs_all = _review_rows(reviews, plan_reviews, evidence_ids, match, number)
+    revs_all = _review_rows(reviews, plan_reviews, evidence_ids, match, number, known)
     session_rows = [_session_row(s, rule, False) for s, rule in evidence]
     omitted = {"sessions": max(0, len(session_rows) - MAX_SESSIONS), "inferred_sessions": max(0, len(inferred) - MAX_SESSIONS),
                "handoffs": max(0, len(hand_all) - MAX_HANDOFFS), "reviews": max(0, len(revs_all) - MAX_REVIEWS), "ci_runs": max(0, len(runs_all) - MAX_RUNS)}
@@ -328,6 +339,8 @@ def build(owner, name, number, *, pull_requests, sessions, view, handoffs, revie
     undated_runs = len(runs_all) - len(dated_runs)
     if status != "merged":
         merged_value, merged_why = None, "The pull request is not merged."
+    elif any(r["host_unverified"] for r in code):
+        merged_value, merged_why = None, "A code review names this repository without a forge host, so it cannot be shown to belong to this pull request's host."
     elif changed:
         merged_value, merged_why = False, f"{len(changed)} code review(s) asked for changes."
     elif sources["reviews"] != "ok":

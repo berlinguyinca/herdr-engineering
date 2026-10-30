@@ -89,7 +89,7 @@ def _review_identity(workdir, repository, project_id, revision):
 
 def run_review(*, kind, cwd, control_plane, plan_file=None, repository=None,
                project_id=None, revision=None, mission_id=None, session_id=None,
-               title=None, url_host=None, binary="plannotator", post=_post):
+               title=None, url_host=None, pull_request_number=None, binary="plannotator", post=_post):
     executable = shutil.which(binary)
     if not executable:
         raise ValueError("Plannotator CLI is not installed or is not on PATH")
@@ -112,6 +112,8 @@ def run_review(*, kind, cwd, control_plane, plan_file=None, repository=None,
     body = dict(binding, review_id=rid, kind=kind, title=title or f"{kind.title()} review",
                 repository=repository, project_id=project_id, mission_id=mission_id,
                 session_id=session_id, host_id=socket.gethostname(), plan=plan)
+    if pull_request_number is not None:   # only ever what the operator typed: no pull request is guessed from a branch
+        body["pull_request_number"] = pull_request_number
     # The registration must be acknowledged durably before launching a review.
     post(control_plane, "/api/v1/reviews", body)
     path = f"/api/v1/reviews/{rid}"
@@ -233,6 +235,8 @@ def main(argv=None):
                         help="control plane URL (default: host.json control_plane_url)")
     for option in ("repository", "project-id", "revision", "mission-id", "session-id", "title", "url-host"):
         parser.add_argument("--" + option)
+    parser.add_argument("--pr", dest="pull_request_number", type=int,
+                        help="number of the pull request this review is about (optional; never guessed)")
     try:
         args = vars(parser.parse_args(argv))
         args["control_plane"] = resolve_control_plane(args["control_plane"])
