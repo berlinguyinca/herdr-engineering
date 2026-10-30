@@ -24,7 +24,25 @@ everything the assistant is connected to.
   boss's calendar").
 - Connections belong to a **person**. Each person connects their own accounts and keeps their own blocked list. What one
   person connects is private to them.
+- **Reminders** (added on approval, 2026-10-30): the person can ask the assistant "remind me to X at 3pm" (or "tomorrow
+  morning", or a few minutes before a calendar event) and it will. A reminder is stored per person, delivered at its time as a
+  phone push notification and as a message in the assistant chat, and listed (with Cancel) in a Reminders list under the
+  personal assistant. Calendar events the assistant creates accept a reminder lead time ("10 minutes before"). *The
+  operator said only "please add reminders as well"; this reading is the designer's guess (assistant reminders delivered
+  through the push work already live, plus event reminder offsets). Not included unless asked: Google Tasks, recurring
+  reminders, snooze.*
 - One generic connector model so adding an app means adding a provider, not a new page and new plumbing.
+
+## Reminders: behaviour
+
+- Created by the assistant tool `set_reminder {text, when}` (not sensitive: it only notifies the person themself, so no
+  approval card), listed by `list_reminders`, removed by `cancel_reminder`. `when` is resolved in the person's timezone
+  (assistant notification settings already carry one); an unclear time makes the assistant ask rather than guess.
+- A server-side scheduler fires due reminders once (a missed one, after a restart, fires late and says so), sends the push
+  (title "Reminder", the text, tap opens the assistant chat) and adds the message to the chat. Quiet hours do not hold back a
+  reminder the person asked for by time.
+- Stored in Postgres with the person key, fire time, state (pending/fired/cancelled). Reminders never contain credentials.
+- No Google account is needed for reminders; they work before any connector is enabled.
 
 ## Non-goals (for this version)
 
