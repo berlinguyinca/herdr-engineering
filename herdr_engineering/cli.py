@@ -3180,6 +3180,11 @@ def _cmd_cp_web(args) -> int:
         ci_fix = ci_fix_config(cp.get("ci_fix"))
     except ValueError as exc:
         raise SystemExit(f"fleet config {exc}") from None
+    from .control_plane.ci_logcollect import log_tests_config
+    try:
+        ci_log_tests = log_tests_config(cp.get("ci_log_tests"))
+    except ValueError as exc:
+        raise SystemExit(f"fleet config {exc}") from None
     _require_durable_review_gate(cp, dsn)
     source = _maybe_pg_source(dsn, inspector_snapshots=_inspector_snapshot_settings(cp)[0])
     # When durable storage is wired, attach a write-through sink so every
@@ -3334,7 +3339,7 @@ def _cmd_cp_web(args) -> int:
                                  if isinstance(cp.get("personal_assistant"), dict) else None,
                              review_quorum=_review_quorum_config(cp),
                              usage_retention=usage_retention, attention=attention,
-                             ci_fix=ci_fix, missions=missions, github_pg_dsn=dsn,
+                             ci_fix=ci_fix, missions=missions, github_pg_dsn=dsn, ci_log_tests=ci_log_tests,
                              public_port=args.collab_public_port,
                              public_host=args.collab_public_host,
                              collab_only=args.collab_only,

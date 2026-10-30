@@ -295,7 +295,7 @@ class ControlPlaneServer:
                  operator_port=None, operator_user=None, operator_email=None,
                  operator_hosts=(), collab_operator_url=None, collab_dashboard_hosts=(),
                  summary_config=None, summary_client=None, summary_report_config=None, usage_retention=None, lineage_key_scopes=None,
-                 review_quorum=None, system_graph: bool = False, attention=None, ci_fix=None, missions=None, github_pg_dsn=None,
+                 review_quorum=None, system_graph: bool = False, attention=None, ci_fix=None, missions=None, github_pg_dsn=None, ci_log_tests=None,
                  architecture_enabled=None, architecture_explain=None, architecture_options=None,
                  request_workers=128, request_queue=256,
                  assistant_service=None, assistant_config=None, fabric_resolver=None, fabric_services=None, fabric_names=None,
@@ -329,7 +329,9 @@ class ControlPlaneServer:
         self.ci_monitor = CIMonitor(on_transition=lambda key, event, row:
                                     repo.record_event("ci_pipeline", key, event, row),
                                     actions_enabled=ci_actions,
-                                    on_observation=repo.observe_ci_pipeline)
+                                    on_observation=repo.observe_ci_pipeline,
+                                    on_log_report=lambda body: repo.ingest_ci_log_report(body),
+                                    log_known=repo.ci_log_analysis, log_tests=ci_log_tests)
         # control_plane.deployment_definitions: a checkout of InferWeave deploy/pipelines (read live;
         # absent = none, and deployment ingest stays accept-all with a warning). Targets come from the
         # CI monitor's last snapshot, never from a provider call here. It is only read once definitions
@@ -3293,6 +3295,12 @@ def _make_handler(server, public=False, operator=False):
                 if what == "log":
                     return self._json(server.ci_monitor.log(
                         _q(self.path, "repository"), _q(self.path, "number"), _q(self.path, "step"),
+                        **({"provider_url": _q(self.path, "provider_url")} if _q(self.path, "provider_url") is not None else {})))
+                if what == "log-slice":
+                    return self._json(server.ci_monitor.log_slice(
+                        _q(self.path, "repository"), _q(self.path, "number"), _q(self.path, "step"),
+                        _qint(self.path, "start", 0), _qint(self.path, "end", 0),
+                        context=_qint(self.path, "context", 40), expect=(_q(self.path, "expect") or "")[:500],
                         **({"provider_url": _q(self.path, "provider_url")} if _q(self.path, "provider_url") is not None else {})))
                 if what == "fix" and server.ci_fix is not None and len(parts) in {5, 6}:
                     if len(parts) == 6 and parts[5] == "config":

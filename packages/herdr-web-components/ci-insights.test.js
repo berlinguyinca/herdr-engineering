@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {ciInsightsModel,renderCiInsights,filterCiObservations,ciRunOutcomeOverview} from '../ci-insights.js';
+import {ciInsightsModel,renderCiInsights,filterCiObservations,ciRunOutcomeOverview,ciOverviewRows,ciExplorerTargets} from '../ci-insights.js';
 const now=Date.parse('2026-10-22T12:00:00Z');
 const run=(run_number,state,extra={})=>({repository:'org/app',provider_repo_id:7,branch:'main',run_number,state,created_at:'2026-10-21T12:00:00Z',started_at:'2026-10-21T12:00:00Z',finished_at:'2026-10-21T12:01:00Z',...extra});
 const report=(run_number,total,tests=[],extra={})=>({...run(run_number,'success'),report_id:`r${run_number}`,reported_at:`2026-10-${run_number+18}T12:00:00Z`,summary:{total,passed:total,failed:0,errored:0,skipped:0},tests,...extra});
@@ -119,7 +119,37 @@ test('without test reports the overview counts successful and failed runs per re
  const overview=ciRunOutcomeOverview(m);
  assert.deepEqual(overview.map(r=>[r.repository,r.passed,r.failed]),[['org/a',1,2],['org/b',1,0]]);
  const html=renderCiInsights(m,{});
- assert.match(html,/Runs by repository/);assert.match(html,/No test reports are published yet/);
+ assert.match(html,/Runs by repository/);assert.match(html,/No test counts were found/);
  assert.match(html,/data-ci-test-repo="1"/);assert.doesNotMatch(html,/data-ci-investigate/);
  assert.match(renderCiInsights(m,{selectedRepo:'1'}),/data-ci-investigate="failing"/);
+});
+
+test('counts parsed from logs get bars labelled with their source; run outcomes fill in only for repositories with no counts',()=>{
+ const parsed=report(4,12,[],{source:'log_parse',runners:['cargo','node-test'],summary:{total:12,passed:9,failed:3,errored:0,skipped:0}});
+ const upload=report(2,5,[],{provider_repo_id:8,repository:'org/up',summary:{total:5,passed:5,failed:0,errored:0,skipped:0}});
+ const bare={repository:'org/bare',provider_repo_id:9,branch:'main',run_number:1,state:'failure',created_at:'2026-10-21T12:00:00Z'};
+ const m=ciInsightsModel({pipelines:[run(4,'success'),run(2,'success',{provider_repo_id:8,repository:'org/up'}),bare],reports:[parsed,upload]},{},now);
+ const rows=ciOverviewRows(m);
+ assert.deepEqual(rows.map(r=>[r.repository,r.unit,r.passed,r.failed,r.sources.join('+')]),[['org/app','tests',9,3,'log_parse'],['org/up','tests',5,0,'junit'],['org/bare','runs',0,1,'runs']]);
+ const html=renderCiInsights(m,{});
+ assert.match(html,/Tests by repository/);assert.match(html,/1 repository is counted from CI logs/);assert.match(html,/1 from uploaded JUnit reports/);
+ assert.match(html,/1 show run outcomes only/);
+ assert.match(html,/data-ci-source="log_parse"[^>]*title="org\/app: parsed from CI logs \(cargo, node-test\) · run #4"/);
+ assert.match(html,/data-ci-source="junit"[^>]*title="org\/up: JUnit report · run #2"/);
+ assert.match(html,/data-ci-source="runs"[^>]*title="org\/bare: no test counts yet/);
+ assert.match(html,/9 passed<small>from CI logs<\/small>/);assert.match(html,/0 successful runs<small>run outcomes<\/small>/);
+});
+
+test('a repository whose big step could not be read says its total is a floor',()=>{
+ const m=ciInsightsModel({reports:[report(4,21,[],{source:'log_parse',runners:['unittest'],skipped_steps:[{step:'wcmc',reason:'log_too_large'}]})]},{},now);
+ const html=renderCiInsights(m,{});
+ assert.match(html,/1 step too large to count/);assert.match(html,/1 step not counted: log too large to read, so the total is a floor/);
+});
+
+test('the explorer targets are the latest report of each branch of the chosen repository',()=>{
+ const reports=[report(3,5,[],{provider_url:'https://ci.example.org'}),report(4,6,[],{provider_url:'https://ci.example.org',branch:'dev'}),report(5,7,[],{provider_repo_id:8,provider_url:'https://ci.example.org'})];
+ const m=ciInsightsModel({reports},{},now);
+ const key=ciOverviewRows(m).find(r=>r.repository==='org/app').key;
+ assert.deepEqual(ciExplorerTargets(m,key).map(r=>[r.branch,r.run_number]).sort(),[['dev',4],['main',3]]);
+ assert.match(renderCiInsights(m,{explorer:'<p id="slot"></p>'}),/id="slot"/);
 });

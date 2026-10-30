@@ -92,7 +92,8 @@ def bound_ci_provider(factory, provider_url=None):
 class CIMonitor:
     def __init__(self, *, provider_factory=None, interval=30, repo_limit=500,
                  budget=120, now=None, on_transition=None, actions_enabled=False,
-                 on_observation=None, max_in_flight=4, max_reads_per_refresh=600):
+                 on_observation=None, max_in_flight=4, max_reads_per_refresh=600,
+                 on_log_report=None, log_known=None, log_tests=None):
         from ..ci import _ProviderReadScheduler, _read_allowance
         self._scheduler = _ProviderReadScheduler(max_in_flight)
         self._max_reads_per_refresh = _read_allowance(max_reads_per_refresh)
@@ -116,6 +117,12 @@ class CIMonitor:
         self._last_success = None
         self._on_transition = on_transition
         self._on_observation = on_observation
+        #: control_plane.ci_log_tests: counts parsed from finished runs' logs. Needs somewhere to keep them.
+        from .ci_logcollect import LogTestCollector, log_tests_config
+        self._log_collector = LogTestCollector(
+            log_tests_config(log_tests), ingest=on_log_report or (lambda body: None),
+            known=log_known or (lambda *key: None), provider_call=self._measurements.provider_call,
+        ) if on_log_report is not None else None
         self._observation_fingerprints = {}
         self._observed = {}
         self._baselined = set()
@@ -209,10 +216,25 @@ class CIMonitor:
             reads = self._scheduler.refresh(budget=self._budget, max_reads=self._max_reads_per_refresh,
                                             now=self._now, measurements=self._measurements)
             self._collect(reads)
+            self._analyse_logs()
         finally:
             self._update(refreshing=False, checked_at=_stamp())
             self._measurements.refreshed(self._now() - started)
             self._refresh_lock.release()
+
+    def _analyse_logs(self):
+        # After the poll has published its view, so reading logs never delays what the pages show.
+        if self._log_collector is None or not self._log_collector.enabled or self._stop.is_set():
+            return
+        try:
+            provider = self._factory()
+            if not provider.available:
+                return
+            with self._lock:
+                pipelines = copy.deepcopy(self._view['pipelines'])
+            self._log_collector.run_cycle(provider, pipelines, self._stop)
+        except Exception:
+            pass        # a log that cannot be read leaves the run for the next cycle
 
     def _collect(self, reads):
         self._update(refreshing=True, stale=bool(self._view['pipelines']), error=None,
@@ -421,6 +443,46 @@ class CIMonitor:
                     'checked_at': _stamp()}
         except Exception as exc:
             return {'available': False, 'log': '', 'error': _error(exc)[1]}
+
+    def log_slice(self, repository, number, step, start, end, *, context=40, expect='', provider_url=None):
+        """Lines of one step's live log around an indexed test, redacted, or a plain statement of why not.
+
+        Line numbers are those of the log text as the collector read it. When the log is shorter than the range, or the
+        test's name is not where the index says it was, no slice is shown: a wrong slice would be worse than none.
+        """
+        repository, number = self._validate(repository, number)
+        if not isinstance(step, str) or not step.isascii() or not step.isdigit():
+            raise ValueError('a numeric step id is required')
+        start, end = int(start), int(end)
+        if start < 1 or end < start or end - start > 2000:
+            raise ValueError('a valid line range is required')
+        context = max(0, min(int(context), 200))
+        provider = bound_ci_provider(self._factory, provider_url)
+        limit = self._log_collector.max_log_bytes if self._log_collector else 4 * 1024 * 1024
+        base = {'provider_url': provider.base_url.rstrip('/')} if provider_url is not None else {}
+        try:
+            self._measurements.provider_call()
+            fetched = provider.step_log_text(repository, number, step, max_chars=limit)
+            if fetched is None:
+                return {'available': False, 'error': 'Step log is unavailable.', **base}
+            from .ci_logtests import clean_lines
+            lines = clean_lines(fetched[0])
+            truncated = fetched[1]
+            if end > len(lines):
+                reason = ('The log is too large to read in full, and this range lies beyond what was read.'
+                          if truncated else 'The log is shorter than the stored line range; it may have been replaced.')
+                return {'available': True, 'slice': None, 'reason': reason, 'truncated': truncated, 'total_lines': len(lines), **base}
+            import re
+            tokens = [t for t in re.split(r'[^A-Za-z0-9_]+', str(expect or '')) if len(t) >= 4]
+            if tokens and not any(max(tokens, key=len) in text for text in lines[max(0, start - 2):end + 1]):
+                return {'available': True, 'slice': None, 'truncated': truncated, 'total_lines': len(lines),
+                        'reason': 'The log no longer matches the stored line range, so no excerpt is shown.', **base}
+            first, last = max(1, start - 1), min(len(lines), end + context)
+            return {'available': True, 'truncated': truncated, 'total_lines': len(lines), 'checked_at': _stamp(),
+                    'slice': {'first': first, 'last': last, 'start': start, 'end': end,
+                              'lines': [redact_text(text[:2000]) for text in lines[first - 1:last]]}, **base}
+        except Exception as exc:
+            return {'available': False, 'error': _error(exc)[1], **base}
 
     def action(self, repository, number, action, *, provider_url=None):
         repository, number = self._validate(repository, number)
