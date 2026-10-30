@@ -182,7 +182,7 @@ export class HerdrClient {
   }
 
   revokeArtifactShare(id, shareId, { signal } = {}) {
-    return this.request(`${this.artifactSharesPath(id, shareId)}/revoke`, { method: 'POST', signal });
+    return this.request(`${this.artifactSharesPath(id, shareId)}/revoke`, { method: 'POST', body: {}, signal });
   }
 
   artifactShareEvents(id, shareId, { signal } = {}) {
@@ -196,6 +196,7 @@ export class HerdrClient {
     const version = await this.artifactVersion(id, versionId, { signal });
     if (version.report_descriptor) throw unsupported();
     const head = artifact.current_version_id;
+    if (!head) throw Object.assign(new Error('Artifact has no head version to restore onto'), { code: 'restore_no_head' });
     return this.request(`/api/v1/artifacts/${encodeURIComponent(id)}/versions`, {
       method: 'POST', signal,
       body: {

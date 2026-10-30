@@ -32,6 +32,7 @@ test('share methods hit the exact paths, methods and bodies with encoded ids', a
   ]);
   assert.deepEqual(calls[1].body, body);
   assert.deepEqual(calls[3].body, { confirm: true });
+  assert.deepEqual(calls[4].body, {});
   assert.equal(calls[3].signal, controller.signal);
 });
 
@@ -78,4 +79,23 @@ test('restoreArtifactVersion lets a stale-head 409 propagate', async () => {
     ok: false, status: 409, text: async () => JSON.stringify({ error: 'conflict' }),
   }) }));
   await assert.rejects(client.restoreArtifactVersion('a', 'v/old'), error => error.status === 409);
+});
+
+test('every share POST goes out as JSON, including revoke', async () => {
+  const seen = [];
+  const client = new HerdrClient('', { fetchImpl: async (url, options) => {
+    seen.push({ method: options.method, type: options.headers['Content-Type'], body: options.body });
+    return ok({});
+  } });
+  await client.revokeArtifactShare('a', 's');
+  await client.approveArtifactShare('a', 's');
+  assert.deepEqual(seen.map(c => [c.method, c.type, c.body]), [
+    ['POST', 'application/json', '{}'], ['POST', 'application/json', '{"confirm":true}'],
+  ]);
+});
+
+test('restoreArtifactVersion refuses an artifact with no head', async () => {
+  const { client, calls } = recorder(restoreHandler({ head: { artifact_type: 'other', current_version_id: null } }));
+  await assert.rejects(client.restoreArtifactVersion('a', 'v/old'), error => error.code === 'restore_no_head');
+  assert.ok(calls.every(c => c.method === 'GET'));
 });
