@@ -31,6 +31,7 @@ from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from typing import Any
 
+from . import rakazo_artifacts as artifacts
 from . import rakazo_bots as bots
 from . import rakazo_events as ev
 from . import rakazo_memory as memory
@@ -58,7 +59,7 @@ _COLLAB_USER = re.compile(r"[A-Za-z0-9._@+:-]{1,200}\Z")
 _PROC = re.compile(r"[A-Za-z][A-Za-z0-9/]{0,63}\Z")
 _ROLES = ("operator",)
 _CONSENT_VERSION = "herdr-1"
-MAX_BODY = 1_000_000
+MAX_BODY = 12_000_000          # an authenticated call may carry a file (artifacts/create: 8 MiB as base64)
 MAX_AUTH_BODY = 8_192
 MAX_STREAMS = 8
 MAX_SENDS = 4
@@ -584,7 +585,7 @@ class RakazoBridge:
     not the bridge's (the caller then answers exactly as it did before the bridge existed)."""
 
     def __init__(self, config: dict[str, Any], assistant, *, version: str = "0", persistence=None, space_persistence=None,
-                 prefs_persistence=None, collab=None, clock: Callable[[], float] = time.time, monotonic: Callable[[], float] = time.monotonic):
+                 prefs_persistence=None, collab=None, artifacts_fn=None, clock: Callable[[], float] = time.time, monotonic: Callable[[], float] = time.monotonic):
         if not config.get("enabled"):
             raise ValueError("RakazoBridge needs an enabled configuration")
         self.svc = assistant
@@ -630,7 +631,9 @@ class RakazoBridge:
         self.bots = bots.Bots(self, BridgeError)
         self.memory = memory.Memory(self, BridgeError)
         self.routines = routines.Routines(self, BridgeError)
-        for name, fn in {**self.bots.procs(), **self.memory.procs(), **self.routines.procs()}.items():
+        self.artifacts = artifacts.Artifacts(self, BridgeError, artifacts_fn)
+        for name, fn in {**self.bots.procs(), **self.memory.procs(), **self.routines.procs(),
+                         **self.artifacts.procs()}.items():
             self._procs[name] = fn
         self.rest = rest.Rest(self, BridgeError, set(self._procs))
         self._procs.update(self.rest.procs())

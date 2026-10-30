@@ -3,11 +3,6 @@
   "agentSecrets/list": [],
   "agentSkills/list": [],
   "approvalRules/list": [],
-  "artifacts/list": [],
-  "artifacts/listSpace": {
-   "items": [],
-   "nextCursor": null
-  },
   "autoReview/get": {
    "checkerAvailable": false,
    "enabled": false,

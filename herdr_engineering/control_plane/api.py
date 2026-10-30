@@ -464,6 +464,7 @@ class ControlPlaneServer:
             self.assistant = assistant_service
         # control_plane.rakazo_bridge (off by default: nothing is constructed and /rpc/* + /api/auth/* answer 404).
         # A bad section raises here, so an enabled but malformed bridge stops startup instead of running open.
+        from .rakazo_artifacts import RegistryBackend
         from .rakazo_bridge import (
             PostgresPrefsPersistence,
             PostgresSpacePersistence,
@@ -476,7 +477,7 @@ class ControlPlaneServer:
                                     persistence=PostgresTokenPersistence(rakazo_bridge_dsn) if rakazo_bridge_dsn else None,
                                     space_persistence=PostgresSpacePersistence(rakazo_bridge_dsn) if rakazo_bridge_dsn else None,
                                     prefs_persistence=PostgresPrefsPersistence(rakazo_bridge_dsn) if rakazo_bridge_dsn else None,
-                                    collab=collab)
+                                    collab=collab, artifacts_fn=lambda: RegistryBackend(self))
                        if _bridge_cfg["enabled"] else None)
         from .ingest import IngestService
         # operator YAML: {api key: {rooms: [...], missions: [...]}} -> principal ids (the key itself is never kept)

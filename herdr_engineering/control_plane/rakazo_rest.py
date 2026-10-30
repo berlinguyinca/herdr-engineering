@@ -25,8 +25,6 @@ READS = frozenset({
     "agentSecrets/list",
     "agentSkills/list",
     "approvalRules/list",
-    "artifacts/list",
-    "artifacts/listSpace",
     "autoReview/get",
     "availability/items",
     "boards/list",
@@ -84,7 +82,7 @@ _REASONS = {
     "onboarding": "Onboarding is not needed on this server.", "availability": "Availability is managed by the operator.",
     "integrationSetup": "Integrations are managed by the operator.", "externalConversations": "External conversations are not enabled.",
     "bots": "That bot action is not available on this server.", "threads": "That conversation action is not available on this server.",
-    "artifacts": "Files are not available on this server yet.", "security": "Security events are not recorded here.",
+    "security": "Security events are not recorded here.",
     "export": "That export is not available on this server.",
 }
 _DATA = json.loads((Path(__file__).with_name("rakazo_defaults.json")).read_text())
