@@ -84,10 +84,11 @@ def _stamp(value: datetime) -> str:
 
 
 class ProposalDesk:
-    def __init__(self, *, monotonic: Callable[[], float], poll_seconds: float = 5.0,
+    def __init__(self, *, monotonic: Callable[[], float], poll_seconds: float = 5.0, min_interval: float = 1.0,
                  clock: Callable[[], datetime] = lambda: datetime.now(UTC)):
         self.routes = None                      # IntelligenceRoutes; set by the API glue, None = surface nothing
-        self.poll_seconds = poll_seconds
+        self.poll_seconds = poll_seconds          # between reads while a stream is open
+        self.min_interval = min_interval          # floor for every read, forced or not: no client can trigger a scan loop
         self._monotonic, self._clock = monotonic, clock
         self._warned: set[tuple[str, str]] = set()
         self._polled: dict[str, float] = {}
@@ -127,6 +128,9 @@ class ProposalDesk:
             state = "pending" if execute_on else "approved"      # approved + execute on = the executor is running it
         state = state or "expired"
         last = redact_secrets(snippet(p.history[-1], 200)) if p.history else ""
+        if p.state == "failed":      # an exception message can carry provider text: only its type reaches the phone
+            kind = re.match(r"execution failed: (\w{1,60})", last)
+            last = f"Failed ({kind.group(1)}); see the dashboard." if kind else "Failed; see the dashboard."
         title = proposal_title(p)
         outcome = {
             "executed": f"Done: {title}. {last}".strip(),
@@ -144,15 +148,18 @@ class ProposalDesk:
                 "title": title, "detail": detail, "note": note, "outcome": snippet(outcome, 400), "user_id": user,
                 "created_at": now, "expires_at": p.expires_at}
 
-    def refresh(self, tenant: str, user: str, journal, *, force: bool) -> None:
-        """Bring ``journal`` up to date with the board. Call with the journal registry lock held."""
-        if not force:
+    def refresh(self, tenant: str, user: str, journal, *, force: bool, bypass: bool = False) -> None:
+        """Bring ``journal`` up to date with the board. Call with the journal registry lock held. ``force`` (a request
+        that wants it current) waits only ``min_interval``; a stream tick waits ``poll_seconds``; ``bypass`` is for the
+        read right after this server recorded a decision."""
+        if not bypass:
             now_m = self._monotonic()
-            if now_m - self._polled.get(journal.thread_id, -1e9) < self.poll_seconds:
+            if now_m - self._polled.get(journal.thread_id, -1e9) < (self.min_interval if force else self.poll_seconds):
                 return
             self._polled[journal.thread_id] = now_m
         access = self.access(tenant, user)
         if access is None:
+            self._withdraw(journal)
             return
         viewer, _single, execute_on = access
         now = self._clock()
@@ -173,6 +180,14 @@ class ProposalDesk:
             else:
                 cards.append(self._card(p, user, execute_on, now))
         journal.sync_proposals(cards, now)
+
+    def _withdraw(self, journal) -> None:
+        """The account lost its standing (kill switch, suggest off, scope removed): cards already shown stop looking
+        answerable and their waiting runs end."""
+        gone = [{**old, "state": "withdrawn", "outcome": snippet(f"No longer available: {old['title']}.", 400)}
+                for old in journal.proposals.values() if old["state"] == "pending"]
+        if gone:
+            journal.sync_proposals(gone, self._clock())
 
     @staticmethod
     def _visible(viewer, p) -> bool:

@@ -52,6 +52,7 @@ def make_rig(make_server_p):
         svr, api = make_server_p(bridge_section())
         svr.rakazo.stream_options = {"poll_seconds": 0.02, "heartbeat_seconds": 0.3, "max_seconds": 3.0}
         svr.rakazo.desk.poll_seconds = 0.0
+        svr.rakazo.desk.min_interval = 0.0
         token = api.login()
         bot = new_bot(api, token)
         user = svr.rakazo.accounts[0].principal_id
@@ -105,7 +106,7 @@ def test_a_pending_proposal_is_one_ask_card_with_a_waiting_run_and_one_note(make
     # the app enables the buttons only while the card's run is waiting_input
     [run] = snap["activeRuns"]
     assert run["id"] == card["runId"] and run["status"] == "waiting_input" and run["userId"] == rig.user
-    assert snap["run"]["id"] == run["id"]
+    assert snap["run"] is None            # `run` is always a real assistant run, never a proposal's
     [note] = rig.texts(ev.PROPOSAL_NOTE_PREFIX, snap)
     assert "needs your decision" in note["blocks"][0]["text"] and REPO in note["blocks"][0]["text"]
     assert len(rig.cards()) == 1
@@ -176,7 +177,9 @@ def test_a_failed_execution_is_reported_with_the_recorded_reason(make_rig):
     assert rig.answer(rig.cards()[0], "allow")[0] == 200
     assert rig.board.get(p.id, "org1").state == "failed"
     [outcome] = rig.texts(ev.PROPOSAL_OUTCOME_PREFIX)
-    assert "did not run" in outcome["blocks"][0]["text"] and "provider refused" in outcome["blocks"][0]["text"]
+    text = outcome["blocks"][0]["text"]
+    assert "did not run" in text and "RuntimeError" in text and "dashboard" in text
+    assert "provider refused" not in json.dumps(rig.snap())
     assert rig.cards()[0]["blocks"][0]["text"].startswith("Failed: ")
 
 
@@ -356,5 +359,79 @@ def test_no_secret_or_body_text_reaches_cards_notes_or_logs(make_rig, caplog):
     assert "Tidy docs" in wire and "Approve a propose issue request" in wire
     logged = "\n".join(r.getMessage() for r in caplog.records)
     assert TOKENISH not in logged and "hunter2" not in logged
-    # the executor has no issue hook wired in this rig: the failure is recorded without payload text
-    assert "no executor wired for propose_issue" in wire
+    # no issue hook is wired in this rig: the failure shows its type only, never the exception text
+    assert "no executor wired" not in wire and "IntelligenceError" in wire and "see the dashboard" in wire
+
+
+# --------------------------------------------------------------------------------------------- review follow-ups
+def test_a_real_running_run_is_never_hidden_behind_a_proposal_run(make_rig):
+    from herdr_engineering.control_plane.assistant import AssistantRun
+    rig = make_rig()
+    rig.snap()
+    rig.svr.assistant.store.put_run(AssistantRun(
+        run_id="run_live", thread_id=rig.bot["threadId"], assistant_id=rig.bot["id"], tenant_id="default",
+        user_id=rig.user, task_id="task_live", state="running"))
+    rig.file()
+    snap = rig.snap()
+    assert snap["run"]["id"] == "run_live" and snap["run"]["status"] == "running"
+    assert {r["id"] for r in snap["activeRuns"]} == {"run_live", rig.cards(snap)[0]["runId"]}
+
+
+def test_losing_standing_withdraws_cards_already_shown(make_rig):
+    rig = make_rig()
+    rig.file()
+    [card] = rig.cards()
+    rig.svr.intelligence._section()["kill_switch"] = True
+    snap = rig.snap()
+    block = rig.cards(snap)[0]["blocks"][0]
+    assert block["status"] == "answered" and block["text"].startswith("Unavailable: ")
+    assert snap["activeRuns"] == []
+    assert "No longer available" in rig.texts(ev.PROPOSAL_OUTCOME_PREFIX, snap)[0]["blocks"][0]["text"]
+    assert rig.answer(card, "allow")[0] == 403 and rig.calls == []
+
+
+def test_forced_refreshes_respect_the_minimum_interval(make_rig):
+    rig = make_rig()
+    desk = rig.svr.rakazo.desk
+    desk.min_interval = 60.0
+    scans = []
+    real = rig.svr.intelligence.visible_proposals
+    rig.svr.intelligence.visible_proposals = lambda v: scans.append(1) or real(v)
+    for _ in range(10):
+        rig.snap()
+    assert len(scans) == 1                       # ten get calls, one scan of the board
+    rig.file()
+    assert rig.cards() == []                     # still inside the interval: not yet shown
+    desk.min_interval = 0.0
+    assert len(rig.cards()) == 1
+
+
+def test_reject_and_approve_racing_never_execute_after_a_reject(make_rig):
+    import sys
+    rig = make_rig()
+    routes = rig.svr.intelligence
+    viewer = routes.assistant_viewer(rig.svr.assistant.tenant_for(rig.user), rig.user)
+    old = sys.getswitchinterval()
+    sys.setswitchinterval(1e-6)
+    try:
+        for _ in range(60):
+            p = rig.file()
+            before, errors = len(rig.calls), []
+
+            def go(decision, p=p):
+                try:
+                    routes.decide_proposal(p.id, decision, viewer=viewer, actor=rig.user, single=True,
+                                           open_listener=False, payload_sha256=p.payload_sha256, resource_version=1)
+                except pi.Conflict:
+                    pass
+                except Exception as exc:  # noqa: BLE001
+                    errors.append(exc)
+
+            ts = [threading.Thread(target=go, args=(d,)) for d in ("reject", "approve")]
+            [t.start() for t in ts]
+            [t.join() for t in ts]
+            state = rig.board.get(p.id, "org1").state
+            assert not errors and state in ("refused", "executed")
+            assert len(rig.calls) - before == (1 if state == "executed" else 0), state
+    finally:
+        sys.setswitchinterval(old)

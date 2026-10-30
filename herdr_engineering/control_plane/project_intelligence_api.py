@@ -13,6 +13,7 @@ Fail-closed rules (DECISIONS D3/D9):
 from __future__ import annotations
 
 import json
+import threading
 
 from . import project_intelligence as pi
 
@@ -48,6 +49,7 @@ class IntelligenceRoutes:
         self.single_operator_fn = lambda: False   # set by the API glue: the server runs in single-operator mode
         self.last_reconcile: dict | None = None   # counters of the latest pass; a reason when it could not run
         self._executor = None
+        self._decide_lock = threading.Lock()    # one decision at a time: approve/reject cannot interleave
         from .intel_webhook import ReplayGuard
         self._replay = ReplayGuard()
 
@@ -213,18 +215,19 @@ class IntelligenceRoutes:
                            or open_listener):
             # Only named principals decide. An absent list means nobody can; an open listener has no identity.
             raise ApprovalRefused("this principal is not in project_intelligence.approvers")
-        known = self.board.get(proposal_id, viewer.org_id)
-        if not proposal_visible(viewer, known):
-            raise pi.NotFound("proposal")           # a project-scoped operator cannot act on another project's proposal
-        if decision == "reject":
-            p = self.board.reject(proposal_id, approver=actor, org_id=viewer.org_id)
-        else:
-            if not isinstance(payload_sha256, str) or not isinstance(resource_version, int) \
-                    or isinstance(resource_version, bool):
-                raise pi.IntelligenceError("payload_sha256 (string) and resource_version (int) are required")
-            p = self.board.approve(proposal_id, approver=actor, org_id=viewer.org_id, payload_sha256=payload_sha256,
-                                   resource_version=resource_version, allow_self=single)
-        self.store.record_audit({"action": f"proposal_{p.state}", "id": p.id, "actor": actor})
+        with self._decide_lock:       # state check + transition + audit; the executor runs outside (it claims by itself)
+            known = self.board.get(proposal_id, viewer.org_id)
+            if not proposal_visible(viewer, known):
+                raise pi.NotFound("proposal")           # a project-scoped operator cannot act on another project's proposal
+            if decision == "reject":
+                p = self.board.reject(proposal_id, approver=actor, org_id=viewer.org_id)
+            else:
+                if not isinstance(payload_sha256, str) or not isinstance(resource_version, int) \
+                        or isinstance(resource_version, bool):
+                    raise pi.IntelligenceError("payload_sha256 (string) and resource_version (int) are required")
+                p = self.board.approve(proposal_id, approver=actor, org_id=viewer.org_id, payload_sha256=payload_sha256,
+                                       resource_version=resource_version, allow_self=single)
+            self.store.record_audit({"action": f"proposal_{p.state}", "id": p.id, "actor": actor})
         if p.state == "approved":
             p = self.executor.execute(p.id, viewer.org_id)     # no-op unless the execute flag is on
         return p

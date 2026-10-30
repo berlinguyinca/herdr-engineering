@@ -668,6 +668,12 @@ turns answered, the run ends, and a one-line outcome (the recorded reason on fai
 is a no-op ("Already approved"); the opposite answer after the fact, an expired proposal or a changed payload is refused
 (409).
 
+**Notes.** Names in `approvers` are matched against the bare principal id (`rakazo:<account id>`), not tenant-qualified. For
+`propose_issue` only the title reaches the phone (never the body), so approve issue proposals on the dashboard where the
+whole text is visible. A failed execution shows only the exception type and "see the dashboard", never its message. If the
+account loses its standing while a card is open (kill switch, `suggest` off, scope removed) the card is marked unavailable
+and its run ends. A request that wants a current view re-reads the board at most once a second.
+
 **Limits.** There is no push: a custom server cannot reach APNs, so the in-thread message appears the next time the thread is
 opened or streamed, not on the lock screen. Proposals live 30 minutes and the board and journal are both in memory, so a control-plane restart drops pending
 proposals (as on the dashboard). Only the first bot's thread carries cards. Approving executes in the request; a slow CI provider can outlast the app's

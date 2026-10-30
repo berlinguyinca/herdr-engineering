@@ -133,7 +133,7 @@ def approval_message(approval, action, seq: int, assistant_id: str, thread_id: s
 
 # Card states: pending | approved (recorded, execution off) | executed | failed | rejected | expired
 _CARD_PREFIX = {"approved": "Approved", "executed": "Executed", "failed": "Failed", "rejected": "Rejected",
-                "expired": "Expired"}
+                "expired": "Expired", "withdrawn": "Unavailable"}
 
 
 def proposal_run_id(card: dict[str, Any]) -> str:
@@ -303,7 +303,7 @@ class ThreadJournal:
             else:
                 self._card_event(card, now, created=False)
             if card["state"] != "pending" and (first or old["state"] == "pending"):
-                kind = "run.cancelled" if card["state"] in ("rejected", "expired") else "run.completed"
+                kind = "run.cancelled" if card["state"] in ("rejected", "expired", "withdrawn") else "run.completed"
                 self._emit(kind, now, {}, proposal_run_id(card))
                 self._text_note(PROPOSAL_OUTCOME_PREFIX + card["id"], card["outcome"], now)
 

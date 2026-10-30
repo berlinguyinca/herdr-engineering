@@ -544,6 +544,7 @@ class RakazoBridge:
         # Board proposals as ask cards. ``desk.routes`` (the IntelligenceRoutes) is set by the API glue; until then,
         # or without a project-intelligence scope for the account, no card is ever shown.
         self.desk = ProposalDesk(monotonic=monotonic)
+        self._first_bots: dict[str, tuple[float, str]] = {}
         self._procs: dict[str, Callable[[_Ctx, dict[str, Any]], Any]] = {
             "me": self._me, "spaces/list": self._spaces_list, "bots/list": self._bots_list, "bots/get": self._bots_get,
             "bots/create": self._bots_create, "threads/head": self._threads_head, "threads/get": self._threads_get,
@@ -761,7 +762,7 @@ class RakazoBridge:
                          and store.actions[a.action_id].run_id in run_ids]
         return messages, runs, approvals
 
-    def _journal(self, ctx: _Ctx, assistant, thread, fresh: bool = False):
+    def _journal(self, ctx: _Ctx, assistant, thread, fresh: bool = False, bypass: bool = False):
         """Bring the thread's journal up to date. Board proposals are re-read at most every ``desk.poll_seconds`` unless
         ``fresh`` (threads/get, head, messages, and right after an answer)."""
         messages, runs, approvals = self._gather(ctx, assistant, thread)
@@ -769,12 +770,20 @@ class RakazoBridge:
             journal = self.journals.get(thread.thread_id, assistant.assistant_id)
             journal.sync(messages, runs, approvals)
             if self._first_bot(ctx) == assistant.assistant_id:      # one card per proposal: the first bot's thread only
-                self.desk.refresh(ctx.tenant, ctx.user, journal, force=fresh)
+                self.desk.refresh(ctx.tenant, ctx.user, journal, force=fresh, bypass=bypass)
             return journal, runs
 
     def _first_bot(self, ctx: _Ctx) -> str | None:
+        """The account's oldest bot (bots are never deleted here, so the answer is cached for a few seconds)."""
+        now = self._monotonic()
+        hit = self._first_bots.get(ctx.user)
+        if hit is not None and now - hit[0] < 5.0:
+            return hit[1]
         bots = self.svc.list_assistants(tenant_id=ctx.tenant, user_id=ctx.user)
-        return min(bots, key=lambda a: (a.created_at, a.assistant_id)).assistant_id if bots else None
+        first = min(bots, key=lambda a: (a.created_at, a.assistant_id)).assistant_id if bots else None
+        if first is not None:
+            self._first_bots[ctx.user] = (now, first)
+        return first
 
     def _bot(self, ctx: _Ctx, assistant) -> dict[str, Any]:
         thread = self._thread(ctx, assistant)
@@ -830,9 +839,10 @@ class RakazoBridge:
         views = [ev.run_view(r, assistant.assistant_id) for r in sorted(runs, key=lambda r: r.created_at)]
         with self.journals.lock:
             waiting = journal.waiting_proposal_runs()
-        active = [v for v in views if v["status"] in ev.ACTIVE] + waiting
+        real_active = [v for v in views if v["status"] in ev.ACTIVE]
+        active = real_active + waiting       # proposal runs only enable their cards; `run` is always a real run
         latest = views[-1] if views else None
-        run = active[-1] if active else (latest if latest and latest["status"] == "failed" else None)
+        run = real_active[-1] if real_active else (latest if latest and latest["status"] == "failed" else None)
         with self.journals.lock:
             messages, older = journal.page()
         return {"threadId": thread.thread_id, "cursor": journal.head, "messages": messages, "olderCursor": older,
@@ -956,7 +966,7 @@ class RakazoBridge:
             raise BridgeError(400, "BAD_REQUEST", redact_secrets(str(exc)) or "The request was refused.") from None
         except pi.StoreUnavailable:
             raise BridgeError(503, "SERVICE_UNAVAILABLE", "The decision could not be recorded. Try again.") from None
-        self._journal(ctx, assistant, thread, fresh=True)       # the card turns answered and the outcome is posted
+        self._journal(ctx, assistant, thread, fresh=True, bypass=True)   # the card turns answered, the outcome is posted
         return result
 
     def _threads_stop(self, ctx, inp):
