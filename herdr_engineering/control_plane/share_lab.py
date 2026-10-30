@@ -25,7 +25,8 @@ def authorise(state, access_token, id_token, authenticator) -> tuple[dict | None
         emails, groups = state.get("allow_emails") or [], state.get("allow_groups") or []
         if not isinstance(emails, list) or not isinstance(groups, list):
             return None, "invalid_state", None
-        allow_emails = {e.strip().lower() for e in emails if isinstance(e, str) and e.strip()}
+        # ASCII only, both sides: str.lower folds U+212A KELVIN SIGN to "k" (create refuses non-ASCII entries too)
+        allow_emails = {e.strip().lower() for e in emails if isinstance(e, str) and e.strip() and e.isascii()}
         allow_groups = {g for g in groups if isinstance(g, str) and g}
         if not _token_ok(access_token) or not _token_ok(id_token):
             return None, "bad_token", None
@@ -38,6 +39,8 @@ def authorise(state, access_token, id_token, authenticator) -> tuple[dict | None
         email = authenticator.verify_id_token(id_token, user=user)
         if not isinstance(email, str) or not email:
             return None, "bad_id_token", user
+        if not email.isascii():
+            email = ""                                   # never matches an address; groups may still grant
         if email in allow_emails or any(isinstance(g, str) and g in allow_groups for g in token_groups):
             return {"identity": user, "email": email, "exp": exp}, "", user
         return None, "not_on_list", user

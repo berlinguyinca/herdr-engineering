@@ -109,7 +109,7 @@ class CognitoAuthenticator:
         return {"user": user, "exp": float(claims["exp"]), "groups": groups}
 
     def verify_id_token(self, token: str, *, user: str) -> str | None:
-        """Verified, lower-cased email from an ID token that belongs to ``user``.
+        """Verified, lower-cased, ASCII-only email from an ID token that belongs to ``user``.
 
         Used only to link a person's email to their (already authenticated) user id so
         they can be invited by email. The ID token must be ours (signature, issuer,
@@ -132,6 +132,8 @@ class CognitoAuthenticator:
         verified = claims.get("email_verified") in (True, "true")
         if (claims.get("token_use") != "id" or not verified or not isinstance(email, str)
                 or (claims.get("cognito:username") or claims.get("sub")) != user):
+            return None
+        if not email.isascii():   # str.lower folds e.g. U+212A KELVIN SIGN to "k": it could match another address
             return None
         return email.strip().lower()
 
