@@ -426,7 +426,9 @@ def test_collab_overlay_reads_only_the_collab_slice():
     doc = yaml.safe_load((ROOT / "deploy/control-plane/compose.collab.yaml").read_text())
     base = yaml.safe_load((ROOT / "deploy/control-plane/compose.yaml").read_text())
     web = doc["services"]["control-plane-web"]
-    assert set(web) == {"command"}
+    # plus one read-only mount: the Rakazo Cognito sign-in reads group membership from collab-sync's files
+    assert set(web) == {"command", "volumes"}
+    assert web["volumes"] == ["${HERDR_COLLAB_SYNC_DIR:?run deploy.sh}:/etc/herdr/collab-sync:ro"]
     wcmd = web["command"]
     i = wcmd.index("--collab-operator-url")
     assert wcmd[:i] + wcmd[i + 2:] == base["services"]["control-plane-web"]["command"]
