@@ -39,12 +39,12 @@
 .hd-shell { display: flex; min-height: 100vh; }
 .hd-shell__sidebar { width: var(--sidebar-width); background: var(--surface); flex-shrink: 0;
   border-right: 1px solid var(--border-subtle); display: flex; flex-direction: column; }
-.hd-shell__brand { display: flex; align-items: center; gap: 8px; padding: 16px; font-weight: 600;
+.hd-shell__brand { display: flex; align-items: center; gap: 10px; padding: 16px; font-weight: 600;
   font-size: .95rem; border-bottom: 1px solid var(--border-subtle); }
 .cx-logo { width: 26px; height: 26px; border-radius: 7px; background: var(--accent); color: var(--text-on-accent);
   display: grid; place-items: center; font-size: .9rem; }
 .hd-shell__nav { display: flex; flex-direction: column; gap: 2px; padding: 8px; }
-.hd-shell__link { display: flex; align-items: center; gap: 8px; padding: 8px 8px; border-radius: var(--radius-sm);
+.hd-shell__link { display: flex; align-items: center; gap: 8px; padding: 8px 10px; border-radius: var(--radius-sm);
   color: var(--text-secondary); text-decoration: none; font-size: .875rem; }
 .hd-shell__link:hover { background: var(--surface-hover); text-decoration: none; }
 .hd-shell__link.active { background: var(--accent-weak); color: var(--accent); font-weight: 500; }
@@ -91,7 +91,7 @@
 .cx-fleet-details[open] > summary::before { transform:rotate(90deg); }
 
 /* ---- pills (status is always text + colour) ---- */
-.hd-status { display: inline-flex; align-items: center; gap: 8px; padding: 2px 8px; border-radius: 999px;
+.hd-status { display: inline-flex; align-items: center; gap: 6px; padding: 2px 10px; border-radius: 999px;
   border: 1px solid var(--border-subtle); background: var(--surface-2); font-size: .75rem; font-weight: 500; white-space: nowrap; }
 .hd-status__dot { color: var(--sc, var(--text-muted)); font-weight: 700; }
 .hd-status__label { color: var(--text-secondary); }
@@ -111,7 +111,7 @@
 .cx-msg[role=alert] { color: var(--status-failed); }
 
 /* ---- empty / error ---- */
-.hd-empty, .hd-error { display: flex; align-items: center; justify-content: center; gap: 8px; padding: 24px;
+.hd-empty, .hd-error { display: flex; align-items: center; justify-content: center; gap: 10px; padding: 24px;
   border-radius: var(--radius); border: 1px dashed var(--border); color: var(--text-muted); text-align: center; }
 .hd-error { border-color: var(--status-failed); color: var(--status-failed); background: var(--error-bg); }
 
