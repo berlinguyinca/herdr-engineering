@@ -11,6 +11,8 @@ const failed=new Set(['failure','failed','error','errored','killed','timed_out',
 const otherTerminal=new Set(['cancelled','canceled','skipped','declined','finished','complete','completed']);
 const testFailed=t=>['failed','errored','error'].includes(t.status);
 const repoKey=r=>String(r.provider_repo_id??r.repository_id??r.repository??'unknown');
+// Bars use the same value as the repository select: the exact project key when the provider is known, else the plain id.
+const overviewKey=r=>r.provider_url&&r.provider_repo_id!=null&&r.repository?JSON.stringify([str(r.provider_url).trim().replace(/\/+$/,''),String(r.provider_repo_id),str(r.repository).trim()]):repoKey(r);
 const groupKey=r=>JSON.stringify([repoKey(r),r.branch||'']);
 const runKey=r=>JSON.stringify([repoKey(r),r.run_number]);
 const reportTime=r=>stamp(r.reported_at);
@@ -70,7 +72,7 @@ export function ciTestOverview(m) {
  const byRepo=new Map();
  for(const g of m.groups){
   const sum=g.latest?.summary||{};if(!Number.isFinite(sum.total))continue;
-  const key=repoKey(g.latest),row=byRepo.get(key)||{key,repository:g.latest.repository||`Repository ${key}`,passed:0,failed:0,skipped:0,total:0,branches:0};
+  const key=overviewKey(g.latest),row=byRepo.get(key)||{key,repository:g.latest.repository||`Repository ${repoKey(g.latest)}`,passed:0,failed:0,skipped:0,total:0,branches:0};
   row.passed+=Number(sum.passed)||0;row.failed+=(Number(sum.failed)||0)+(Number(sum.errored)||0);row.skipped+=Number(sum.skipped)||0;row.total+=sum.total;row.branches++;
   byRepo.set(key,row);
  }
@@ -81,7 +83,7 @@ export function ciRunOutcomeOverview(m) {
  const byRepo=new Map();
  for(const r of m.pipelines){
   const st=state(r),ok=passed.has(st),bad=failed.has(st);if(!ok&&!bad)continue;
-  const key=repoKey(r),row=byRepo.get(key)||{key,repository:r.repository||`Repository ${key}`,passed:0,failed:0,skipped:0,total:0,branches:0};
+  const key=overviewKey(r),row=byRepo.get(key)||{key,repository:r.repository||`Repository ${repoKey(r)}`,passed:0,failed:0,skipped:0,total:0,branches:0};
   if(ok)row.passed++;else row.failed++;row.total++;byRepo.set(key,row);
  }
  return [...byRepo.values()].sort((a,b)=>b.failed-a.failed||b.total-a.total||a.repository.localeCompare(b.repository));
@@ -91,12 +93,12 @@ function renderTestOverview(m,selected) {
  if(!repos.length)return '';
  const max=Math.max(1,...repos.map(r=>r.total));
  const seg=(cls,n,total)=>n>0?`<i class="${cls}" style="flex:${n}"></i>`:'';
- return `<article class="ci-insight-card ci-test-overview" aria-label="Test results by repository"><h3>${runsOnly?'Runs by repository':'Tests by repository'}</h3><p class="ig-note">${runsOnly?'No test reports are published yet, so this counts successful and failed runs. Publish a JUnit report from CI to see tests here.':'Latest report per branch, summed.'} Select a repository to investigate.</p><ul>${repos.map(r=>`<li><button type="button" class="ci-to-row" data-ci-test-repo="${esc(r.key)}" aria-pressed="${String(selected)===r.key}"><span class="ci-to-name">${esc(r.repository)}</span><span class="ci-to-track"><span class="ci-to-bar" role="img" aria-label="${r.passed} ${runsOnly?'successful':'passed'} ${unit}, ${r.failed} failed, ${r.skipped} skipped" style="width:${Math.max(2,r.total/max*100)}%">${seg('ci-to-pass',r.passed)}${seg('ci-to-fail',r.failed)}${seg('ci-to-skip',r.skipped)}</span></span><span class="ci-to-num">${r.failed?`<b>${r.failed} failed</b> · `:''}${r.passed} ${runsOnly?'successful':'passed'}${r.skipped?` · ${r.skipped} skipped`:''}</span></button></li>`).join('')}</ul><div class="ci-to-legend" aria-hidden="true"><span><i class="ci-to-pass"></i>${runsOnly?'Successful':'Passed'}</span><span><i class="ci-to-fail"></i>Failed or errored</span><span><i class="ci-to-skip"></i>Skipped</span></div></article>`;
+ return `<article class="ci-insight-card ci-test-overview" aria-label="Test results by repository"><h3>${runsOnly?'Runs by repository':'Tests by repository'}</h3><p class="ig-note">${runsOnly?'No test reports are published yet, so this counts successful and failed runs. Publish a JUnit report from CI to see tests here.':'Latest report per branch, summed.'} Select a repository to investigate.</p><ul>${repos.map(r=>`<li><button type="button" class="ci-to-row" data-ci-test-repo="${esc(r.key)}" aria-pressed="${String(selected)===r.key}"><span class="ci-to-name">${esc(r.repository)}</span><span class="ci-to-track"><span class="ci-to-bar" aria-hidden="true" style="width:${Math.max(2,r.total/max*100)}%">${seg('ci-to-pass',r.passed)}${seg('ci-to-fail',r.failed)}${seg('ci-to-skip',r.skipped)}</span></span><span class="ci-to-num">${r.failed?`<b>${r.failed} failed</b> · `:''}${r.passed} ${runsOnly?'successful':'passed'}${r.skipped?` · ${r.skipped} skipped`:''}</span></button></li>`).join('')}</ul><div class="ci-to-legend" aria-hidden="true"><span><i class="ci-to-pass"></i>${runsOnly?'Successful':'Passed'}</span><span><i class="ci-to-fail"></i>Failed or errored</span><span><i class="ci-to-skip"></i>Skipped</span></div></article>`;
 }
 function renderInvestigate(m,selected) {
  if(selected==='')return '';
  const b=(key,label)=>`<button type="button" class="hd-btn hd-btn--secondary hd-btn--sm" data-ci-investigate="${key}">${label}</button>`;
- return `<div class="ci-investigate" role="group" aria-label="Investigate these tests"><span>Investigate</span>${b('failing','Most failing tests')}${b('slow','Slowest tests')}${b('history','Test count history')}${b('runs','Failing runs')}${b('clear','All repositories')}</div>`;
+ return `<div class="ci-investigate" role="group" aria-label="Investigate these tests"><span>Investigate</span>${b('failing','Most failing tests')}${b('slow','Slowest tests')}${m.reports.length?b('history','Test count history'):''}${b('runs','Failing runs')}${b('clear','All repositories')}</div>`;
 }
 export function renderCiInsights(m,{loading=false,error='',failurePage=0,selectedRepo=''}={}) {
  const metric=(label,value,note)=>`<article class="ci-metric"><span>${label}</span><strong>${esc(value)}</strong><small>${esc(note)}</small></article>`;
