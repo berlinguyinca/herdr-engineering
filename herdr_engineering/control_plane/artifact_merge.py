@@ -51,10 +51,11 @@ from __future__ import annotations
 
 from bisect import bisect_left
 from collections import Counter
+from collections.abc import Callable
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 
-__all__ = ["TextMerge", "merge3_text"]
+__all__ = ["FileConflict", "ManifestMerge", "TextMerge", "merge3_text", "merge_manifests"]
 
 
 @dataclass(frozen=True)
@@ -279,3 +280,138 @@ def _terminated(lines: list[str], eol: str) -> list[str]:
         return [*lines[:-1], lines[-1] + eol]
     return lines
 
+
+
+# ---------------------------------------------------------------------------
+# Manifest merge (spec section B): per file name, three-way over manifests.
+#
+# A side "changed" a name when its sha256 differs from the base (absent counts
+# as None). One side changed -> take it; identical change -> take it; both
+# changed differently -> conflict, except modify/modify of a text file, which
+# goes through merge3_text (head is "ours", mine is "theirs"). In FileConflict
+# ``theirs_sha256`` is the head entry and ``mine_sha256`` the contributor's.
+# store_text receives ``{**head_entry, "text": merged_text}`` as template.
+# Nothing is stored unless the whole merge is conflict free.
+# ---------------------------------------------------------------------------
+
+_TEXT_MEDIA_TYPES = frozenset({
+    "application/json", "application/xml", "application/yaml", "application/javascript",
+})
+_TEXT_EXTENSIONS = (
+    ".md", ".html", ".css", ".js", ".json", ".yaml", ".yml", ".xml", ".txt", ".csv",
+    ".svg", ".py", ".ts",
+)
+
+
+@dataclass(frozen=True)
+class FileConflict:
+    name: str
+    kind: str  # add_add | delete_modify | modify_modify_text | binary | oversize | not_utf8 | case_collision
+    base_sha256: str | None
+    theirs_sha256: str | None
+    mine_sha256: str | None
+    merged_text: str | None
+
+
+@dataclass(frozen=True)
+class ManifestMerge:
+    files: list[dict]
+    merged_names: list[str]
+    clean_names: list[str]
+    conflicts: list[FileConflict]
+
+
+def _is_text_like(entry: dict) -> bool:
+    media = str(entry.get("media_type") or "").split(";", 1)[0].strip().lower()
+    if media.startswith("text/") or media in _TEXT_MEDIA_TYPES:
+        return True
+    return str(entry.get("name", "")).lower().endswith(_TEXT_EXTENSIONS)
+
+
+def merge_manifests(
+    base: list[dict],
+    head: list[dict],
+    mine: list[dict],
+    *,
+    read_text: Callable[[dict], str],
+    store_text: Callable[[str, dict], dict],
+    max_text_bytes: int = 2 * 1024 * 1024,
+) -> ManifestMerge:
+    b_map = {e["name"]: e for e in base}
+    h_map = {e["name"]: e for e in head}
+    m_map = {e["name"]: e for e in mine}
+    all_names = sorted(b_map.keys() | h_map.keys() | m_map.keys())
+
+    by_fold: dict[str, list[str]] = {}
+    for name in all_names:
+        by_fold.setdefault(name.casefold(), []).append(name)
+
+    def sha(entry: dict | None) -> str | None:
+        return None if entry is None else entry["sha256"]
+
+    conflicts: list[FileConflict] = []
+    chosen: dict[str, dict] = {}
+    clean: list[str] = []
+    pending: list[tuple[str, dict, str]] = []  # (name, head entry, merged text)
+
+    for name in all_names:
+        b, h, m = b_map.get(name), h_map.get(name), m_map.get(name)
+        bs, hs, ms = sha(b), sha(h), sha(m)
+
+        def conflict(kind: str, merged_text: str | None = None) -> None:
+            conflicts.append(FileConflict(name, kind, bs, hs, ms, merged_text))
+
+        if len(by_fold[name.casefold()]) > 1:
+            conflict("case_collision")
+            continue
+        if hs == ms or ms == bs:
+            winner = h
+        elif hs == bs:
+            winner = m
+        elif h is None or m is None:
+            conflict("delete_modify")  # base is present here: absent == base was handled above
+            continue
+        elif b is None:
+            conflict("add_add")
+            continue
+        else:
+            kind = _classify_text(b, h, m, max_text_bytes)
+            if kind is not None:
+                conflict(kind)
+                continue
+            try:
+                result = merge3_text(read_text(b), read_text(h), read_text(m))
+            except UnicodeDecodeError:
+                conflict("not_utf8")
+                continue
+            if result.conflicted:
+                conflict("modify_modify_text", result.text)
+            else:
+                pending.append((name, h, result.text))
+            continue
+        clean.append(name)
+        if winner is not None:
+            chosen[name] = winner
+
+    if conflicts:
+        return ManifestMerge(files=[], merged_names=[], clean_names=clean, conflicts=conflicts)
+
+    merged_names: list[str] = []
+    for name, template, text in pending:
+        chosen[name] = store_text(name, {**template, "text": text})
+        merged_names.append(name)
+    return ManifestMerge(
+        files=[chosen[n] for n in sorted(chosen)],
+        merged_names=merged_names,
+        clean_names=clean,
+        conflicts=[],
+    )
+
+
+def _classify_text(b: dict, h: dict, m: dict, max_text_bytes: int) -> str | None:
+    """Return a conflict kind when a modify/modify file cannot be text-merged."""
+    if not (_is_text_like(h) and _is_text_like(m) and _is_text_like(b)):
+        return "binary"
+    if any(int(e.get("size_bytes") or 0) > max_text_bytes for e in (b, h, m)):
+        return "oversize"
+    return None
