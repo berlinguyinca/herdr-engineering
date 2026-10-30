@@ -43,7 +43,7 @@ The operator needs to hand specific artifacts to specific audiences, tomorrow:
 * `collab-public` (internet-facing container behind the cubert SNI router and the bender nginx edge) deliberately has no database, AWS or blob access, and its edge allow-list 404s everything else. Keep it unchanged.
 * Cognito auth today is a bearer access token verified by `CognitoAuthenticator` (RS256, issuer, `token_use=access`, client allow-list, `cognito:groups` re-checked from `members.json`, JWKS refreshed by `collab-sync.sh` every minute). `verify_id_token` exists for the verified email claim. No server sessions or cookies; login is client-side against `us-west-2gjtcm0pcp.auth.us-west-2.amazoncognito.com`. Pool `us-west-2_GjtcM0PCp` (shared with `lc-binbase-scheduler` and the collaboration edge); web client `herdr-collab-web` (code flow, no secret, scopes openid+email).
 * Principals come only from `X-API-Key`; the open control plane makes everyone `operator`. `share` exists in the permission vocabulary but is enforced nowhere.
-* Latest migration is `0035`; next is `0036`. `publications` (0004/0009) is a tailnet exposure controller and is NOT reused.
+* Latest migration was `0036` (rakazo) at merge; ours is `0037`. `publications` (0004/0009) is a tailnet exposure controller and is NOT reused.
 * Version outputs live in RustFS (hash-verified on download); report previews link to authenticated asset URLs.
 
 ## The design
@@ -60,7 +60,7 @@ and writes `manifest.json` (path, size, sha256, content-type, entry path). Rules
 * The approve summary lists entry, file count, size, expiry, audience, and WARNINGS: HTML that references hosts other than the bundle itself, absolute paths, or a PDF/HTML entry that is missing.
 * The volume is mounted read-write on control-plane-web/worker and READ-ONLY on the share container. Revoke/expiry deletes the directory (the DB row stays for audit).
 
-### Data (migration `0036_artifact_shares.sql`)
+### Data (migration `0037_artifact_shares.sql`)
 
 * `artifact_shares`: `share_id`, `artifact_id`, `version_id`, `audience` (`lab`|`public`), `token_hash` (SHA-256 of a 256-bit random token; shown once), `allow_emails text[]`, `allow_groups text[]`, `state` (`pending`|`live`|`revoked`), `entry`, `file_count`, `total_bytes`, `title`, `expires_at`, `created_by`, `created_at`, `approved_by`, `approved_at`, `revoked_at`.
 * `artifact_share_events`: append-only `share_id`, `at`, `kind` (`created`|`approved`|`opened`|`denied`|`revoked`|`expired`), `actor` (principal; Cognito sub/email for lab opens; `public`), `detail` jsonb with no tokens or bodies.

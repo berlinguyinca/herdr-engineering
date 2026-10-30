@@ -50,10 +50,10 @@ def share_postgres():
             async def initialize():
                 conn = await asyncpg.connect(dsn)
                 try:
-                    for name in (*PREREQ, "0036_artifact_shares.sql"):
+                    for name in (*PREREQ, "0037_artifact_shares.sql"):
                         await conn.execute((MIGRATIONS / name).read_text())
                     # re-running must be a no-op (idempotent)
-                    await conn.execute((MIGRATIONS / "0036_artifact_shares.sql").read_text())
+                    await conn.execute((MIGRATIONS / "0037_artifact_shares.sql").read_text())
                 finally:
                     await conn.close()
 
@@ -214,7 +214,7 @@ def test_token_hash_unique_and_never_listed(share_postgres):
 
 
 def line(sid, kind="opened", actor="public", n=0, **extra):
-    return json.dumps({"share_id": sid, "kind": kind, "actor": actor, "at": f"2026-10-30T10:{n // 60:02d}:{n % 60:02d}Z",
+    return json.dumps({"share_id": sid, "kind": kind, "actor": actor, "at": f"2099-01-01T10:{n // 60:02d}:{n % 60:02d}Z",
                        "detail": {"n": n}, **extra}) + "\n"
 
 
@@ -230,7 +230,7 @@ def test_ingest_events_file_is_idempotent_and_tolerates_torn_line(share_postgres
         assert await store.ingest_events_file(f) == 0  # idempotent
         # the writer completes the torn line and appends more
         with f.open("a") as fh:
-            fh.write('nd": "opened", "actor": "public", "at": "2026-10-30T10:00:05Z"}\n' + line(sid, n=6))
+            fh.write('nd": "opened", "actor": "public", "at": "2099-01-01T10:00:05Z"}\n' + line(sid, n=6))
         assert await store.ingest_events_file(f) == 2
         assert await store.ingest_events_file(f) == 0
         evs = await store.events(sid)
@@ -263,7 +263,7 @@ def test_ingest_poison_forged_oversize_and_replaced_files(share_postgres, tmp_pa
         sur = line(sid, n=2).replace('"public"', '"\\ud800"')
         sur_detail = line(sid, n=3).replace('{"n": 3}', '{"k\\ud800": 1}')
         forged = line(sid, kind="approved", n=4) + line(sid, kind="revoked", n=5) + line(sid, kind="expired", n=6)
-        big = json.dumps({"share_id": sid, "kind": "opened", "actor": "x" * 500, "at": "2026-10-30T10:00:07Z",
+        big = json.dumps({"share_id": sid, "kind": "opened", "actor": "x" * 500, "at": "2099-01-01T10:00:07Z",
                           "detail": {"pad": "y" * 5000}}) + "\n"
         f.write_text(nul + sur + sur_detail + forged + big + line(sid, n=8))
         assert await store.ingest_events_file(f, marker_path=marker) == 2
@@ -323,8 +323,8 @@ def test_ingest_poison_forged_oversize_and_replaced_files(share_postgres, tmp_pa
 
 def test_migration_up_and_down_names():
     files = sorted(p.name for p in MIGRATIONS.glob("*.sql"))
-    assert [n for n in files if n.startswith("0036")] == ["0036_artifact_shares.sql"]
-    text = (MIGRATIONS / "0036_artifact_shares.sql").read_text()
+    assert [n for n in files if n.startswith("0037")] == ["0037_artifact_shares.sql"]
+    text = (MIGRATIONS / "0037_artifact_shares.sql").read_text()
     assert "-- DOWN:" in text
     down = text.split("-- DOWN:")[1].split("\n\n")[0]
     for table in ("artifact_share_events", "artifact_shares"):

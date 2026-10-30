@@ -42,7 +42,7 @@
 * Create `herdr_engineering/control_plane/share_static/{viewer.html,share.js,share.css}` — PKCE viewer.
 * Create `herdr_engineering/artifact_shares_client.py` — CLI `artifacts share ...`; register beside `add_report_subparser` (`cli.py:302`).
 * Modify `herdr_engineering/cli.py` (`control-plane share-public` command), `fleet_config_cli.py` (`render_share`), `deploy/control-plane/{compose.yaml,compose.collab.yaml,deploy.sh,collab-edge/nginx.conf,fleet-config.example.yaml,COLLAB.md}`, worker loop (`worker.py`) for sweep+ingest.
-* Create `deploy/control-plane/migrations/0036_artifact_shares.sql` (renumber if taken), tests under `tests/control_plane/test_share_*.py`, `tests/test_artifact_shares_client.py`, `scripts/share-browser-check.mjs` + `tests/share-fixtures/`, skill docs in `~/IdeaProjects/herdr-artifacts` (separate repo/PR).
+* Create `deploy/control-plane/migrations/0037_artifact_shares.sql` (renumber if taken), tests under `tests/control_plane/test_share_*.py`, `tests/test_artifact_shares_client.py`, `scripts/share-browser-check.mjs` + `tests/share-fixtures/`, skill docs in `~/IdeaProjects/herdr-artifacts` (separate repo/PR).
 
 ---
 
@@ -61,7 +61,7 @@
 
 ### Task 2: Migration and `ShareStore`
 
-**Files:** Create `deploy/control-plane/migrations/0036_artifact_shares.sql`, `herdr_engineering/control_plane/artifact_shares.py`; Test `tests/control_plane/test_share_store.py` (Postgres fixtures as in `test_artifact_report_postgres.py`)
+**Files:** Create `deploy/control-plane/migrations/0037_artifact_shares.sql`, `herdr_engineering/control_plane/artifact_shares.py`; Test `tests/control_plane/test_share_store.py` (Postgres fixtures as in `test_artifact_report_postgres.py`)
 
 **Interfaces:**
 * Consumes: `BundleIndex` (Task 1).
