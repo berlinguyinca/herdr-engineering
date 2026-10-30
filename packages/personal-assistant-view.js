@@ -13,6 +13,36 @@ function statusLabel(status) {
   return { ready: 'Ready', running: 'Running', disabled: 'Disabled', needs_attention: 'Needs attention' }[status] || status;
 }
 
+const SIGN_IN_ERRORS = {
+  bad_state: 'That sign-in link was not valid. Choose Enable to start again.',
+  expired: 'That sign-in took too long. Choose Enable to start again.',
+  denied: 'Google sign-in was cancelled, so nothing was connected.',
+  no_client: 'The Google client is not saved yet. Save it below, then choose Enable.',
+  exchange_failed: 'Google did not accept the sign-in. Choose Enable to try again.',
+  unexpected_scope: 'Google did not grant the permissions that were asked for. Choose Enable and approve them all.',
+  no_refresh_token: 'Google did not give long-lived access. Remove the app in your Google account settings, then choose Enable again.',
+  not_set_up: 'App connections are not set up. Ask the operator to create the encryption key.',
+};
+
+/** Reads ?connected= / ?error= from the hash (or the search) once, removes it from the address, returns a fixed-text flash. */
+function takeSignInReturn(win = typeof window === 'undefined' ? null : window) {
+  if (!win) return null;
+  try {
+    const loc = win.location, hashAt = loc.hash.indexOf('?');
+    const fromHash = hashAt >= 0;
+    const params = new URLSearchParams(fromHash ? loc.hash.slice(hashAt + 1) : loc.search);
+    const connected = params.get('connected'), error = params.get('error');
+    if (connected === null && error === null) return null;
+    params.delete('connected'); params.delete('error');
+    const rest = params.toString();
+    const next = fromHash ? `${loc.pathname}${loc.search}${loc.hash.slice(0, hashAt)}${rest ? `?${rest}` : ''}`
+      : `${loc.pathname}${rest ? `?${rest}` : ''}${loc.hash}`;
+    win.history.replaceState(win.history.state, '', next);
+    if (connected === 'google') return { text: 'Google connected.' };
+    return { error: true, text: SIGN_IN_ERRORS[error] || 'Google sign-in did not finish. Choose Enable to try again.' };
+  } catch { return null; }
+}
+
 export function mountPersonalAssistant(container, client, { onFreshness = () => {} } = {}) {
   let disposed = false;
   let state = { assistants: [], selectedId: null, tab: 'General' };
@@ -40,6 +70,11 @@ export function mountPersonalAssistant(container, client, { onFreshness = () => 
   const stamp = a => Date.parse(a.updated_at || a.created_at || '') || 0;
   const isActive = a => a.enabled !== false && !/archiv|disabled|deleted/i.test(String(a.status || ''));
   let showAll = false, configOpen = false, pending = [];
+  // Coming back from Google's sign-in (/#/personal-assistant?connected=google or ?error=<reason>): open the Connectors tab, say what
+  // happened in fixed words (never text from the URL), and drop the query so a reload does not repeat the message.
+  let appsFlash = null;
+  const ret = takeSignInReturn();
+  if (ret) { configOpen = true; state.tab = 'Connectors'; appsFlash = ret; }
   const offered = () => {
     const active = state.assistants.filter(isActive).sort((x, y) => stamp(y) - stamp(x));
     const list = showAll ? active : active.slice(0, 3);
@@ -164,7 +199,7 @@ export function mountPersonalAssistant(container, client, { onFreshness = () => 
     const routines = panel.querySelector('#pa-routines');
     if (routines) loadRoutines(routines, a);
     const connectors = panel.querySelector('#pa-connectors');
-    if (connectors) loadConnectors(connectors, a);
+    if (connectors) loadConnectorsTab(connectors, a);
     const delegations = panel.querySelector('#pa-delegations');
     if (delegations) loadDelegations(delegations, a);
     const approvals = panel.querySelector('#pa-approvals');
@@ -270,15 +305,223 @@ export function mountPersonalAssistant(container, client, { onFreshness = () => 
     } catch (error) { el.innerHTML = `<herdr-error message="${esc(error.message)}"></herdr-error>`; }
   };
 
+  // The Connectors tab: the Apps section first (one-click sign-in apps), then the drafts and reminders those apps produce, then the
+  // generic HTTP/OpenAPI/MCP connector list. Each section fails on its own.
+  const loadConnectorsTab = async (el, a) => {
+    el.innerHTML = `<section id="pa-apps" aria-labelledby="pa-apps-h"></section>
+      <section id="pa-drafts" aria-labelledby="pa-drafts-h" hidden></section>
+      <section id="pa-reminders" aria-labelledby="pa-reminders-h"></section>
+      <section id="pa-generic" aria-labelledby="pa-generic-h"><h3 id="pa-generic-h" class="pa-h3">Other connectors</h3><div id="pa-generic-body"></div></section>`;
+    const generic = el.querySelector('#pa-generic-body');
+    void loadConnectors(generic, a);
+    void loadReminders(el.querySelector('#pa-reminders'));
+    await loadApps(el);
+  };
+
+  const providerCard = (p, ready) => {
+    const name = esc(p.name);
+    if (p.kind === 'status') {
+      const on = p.connected;
+      return `<article class="pa-app" aria-label="${name}" data-app="${esc(p.id)}">
+        <div class="pa-app__head"><strong>${name}</strong> <span class="pa-badge ${on ? 'pa-badge--granted' : ''}">status only</span></div>
+        <p class="pa-muted pa-app__what">Pull requests and repositories, through the Herdr GitHub App.</p>
+        <div class="pa-app__state" data-app-state>${on ? `Connected${p.account ? ` · ${esc(p.account)}` : ''}` : 'Not connected'}</div>
+        <p class="pa-muted">Managed by the operator; there is nothing to enable here.</p></article>`;
+    }
+    const what = p.id === 'gmail' ? 'Search and read your mail. Drafts only; nothing is sent.' : 'See your upcoming events and find free time.';
+    const needs = p.connected && p.status === 'needs_attention';
+    let stateText, buttons = '';
+    if (!ready || !p.client_configured) {
+      stateText = 'Not set up';
+      buttons = ready ? `<button class="hd-btn hd-btn--sm" disabled aria-label="Enable ${name}" title="Save the Google client below first">Enable</button>` : '';
+    } else if (needs) {
+      stateText = `Needs attention${p.account ? ` · ${esc(p.account)}` : ''}`;
+      buttons = `<button class="hd-btn hd-btn--sm" data-app-enable="${esc(p.provider)}" aria-label="Sign in again for ${name}">Sign in again</button>
+        <button class="hd-btn hd-btn--ghost hd-btn--sm" data-app-disconnect="${esc(p.provider)}" aria-label="Disconnect ${name}">Disconnect</button>`;
+    } else if (p.connected) {
+      stateText = `Connected as ${esc(p.account || 'your Google account')}`;
+      buttons = `<button class="hd-btn hd-btn--ghost hd-btn--sm" data-app-disconnect="${esc(p.provider)}" aria-label="Disconnect ${name}">Disconnect</button>`;
+    } else {
+      stateText = 'Not connected';
+      buttons = `<button class="hd-btn hd-btn--sm" data-app-enable="${esc(p.provider)}" aria-label="Enable ${name}">Enable</button>`;
+    }
+    const cls = needs ? 'pa-status--needs' : p.connected ? 'pa-status--ready' : 'pa-status--disabled';
+    return `<article class="pa-app ${p.connected ? 'pa-app--on' : ''}" aria-label="${name}" data-app="${esc(p.id)}">
+      <div class="pa-app__head"><strong>${name}</strong> <span class="pa-badge">read-only</span></div>
+      <p class="pa-muted pa-app__what">${what}</p>
+      <div class="pa-app__state"><span class="pa-status ${cls}" data-app-state>${stateText}</span></div>
+      <div class="pa-row pa-app__actions">${buttons}</div></article>`;
+  };
+
+  const loadApps = async (root) => {
+    const el = root.querySelector('#pa-apps');
+    const heading = '<h3 id="pa-apps-h" class="pa-h3">Apps your assistant can use</h3>';
+    try {
+      const data = await client.listApps();
+      if (disposed) return;
+      const ready = data.ready === true;
+      const providers = Array.isArray(data.providers) ? data.providers : [];
+      const google = providers.find(p => p.provider === 'google');
+      const googleOn = !!(google && google.connected);
+      const flash = appsFlash;
+      const redirect = typeof data.redirect_uri === 'string' ? data.redirect_uri : '';
+      const saved = !!(google && google.client_configured);
+      const setup = !ready
+        ? '<p class="pa-muted" data-app-notready>Not set up — ask the operator to create the encryption key.</p>'
+        : `<div class="pa-setup" data-app-setup>
+            <h4 class="pa-h4">Google sign-in setup</h4>
+            <p class="pa-muted">Google needs an OAuth client, made once in the Google Cloud console. Add this redirect address to it:</p>
+            <div class="pa-row"><code class="pa-uri" data-redirect-uri>${esc(redirect)}</code>
+              <button class="hd-btn hd-btn--ghost hd-btn--sm" data-copy-uri aria-label="Copy redirect address">Copy</button>
+              <span class="pa-muted" data-copy-status role="status" aria-live="polite"></span></div>
+            ${saved ? '<p class="pa-state-ok" data-client-saved>Client saved</p>' : ''}
+            <details class="pa-details" ${saved ? '' : 'open'}><summary>${saved ? 'Replace the Google client' : 'Save the Google client'}</summary>
+              <form data-client-form autocomplete="off">
+                <div class="pa-field"><label for="pa-gcid">Client ID</label><input id="pa-gcid" data-client-id name="client_id" autocomplete="off" spellcheck="false" required></div>
+                <div class="pa-field"><label for="pa-gsec">Client secret</label><input id="pa-gsec" data-client-secret name="client_secret" type="password" autocomplete="new-password" spellcheck="false" required></div>
+                <div class="pa-row"><button class="hd-btn hd-btn--sm" type="submit">Save client</button></div>
+              </form></details></div>`;
+      el.innerHTML = `${heading}
+        <div class="pa-flash-slot" data-apps-flash>${flash ? flashHtml(flash) : flashHtml(null)}</div>
+        <div class="pa-apps">${providers.map(p => providerCard(p, ready)).join('')}
+          <article class="pa-app pa-app--soon" aria-label="More apps"><div class="pa-app__head"><strong>Slack, Notion …</strong></div>
+            <p class="pa-muted pa-app__what">Same card, same Enable button, once each is built.</p><div class="pa-app__state">Coming</div></article></div>
+        ${setup}
+        <div id="pa-blocked" data-blocked-section ${googleOn && google.status !== 'needs_attention' ? '' : 'hidden'}></div>`;
+      appsFlash = null;
+      const say = (f) => { el.querySelector('[data-apps-flash]').innerHTML = flashHtml(f); };
+      el.querySelectorAll('[data-app-enable]').forEach(b => b.addEventListener('click', async () => {
+        b.disabled = true;
+        try {
+          const { url } = await client.connectApp(b.dataset.appEnable);
+          if (typeof url === 'string' && /^https:\/\//.test(url)) { window.location.assign(url); return; }
+          say({ error: true, text: 'The sign-in address was not valid.' });
+        } catch (e) { say({ error: true, text: connectError(e) }); }
+        b.disabled = false;
+      }));
+      el.querySelectorAll('[data-app-disconnect]').forEach(b => b.addEventListener('click', async () => {
+        b.disabled = true;
+        try { await client.disconnectApp(b.dataset.appDisconnect); appsFlash = { text: 'Disconnected. Gmail and Google Calendar share one Google sign-in.' }; await loadApps(root); void loadDrafts(root, false); }
+        catch (e) { say({ error: true, text: errText(e) }); b.disabled = false; }
+      }));
+      el.querySelector('[data-copy-uri]')?.addEventListener('click', async () => {
+        const out = el.querySelector('[data-copy-status]');
+        try { await navigator.clipboard.writeText(redirect); out.textContent = 'Copied.'; }
+        catch { out.textContent = 'Copy failed; select the address and copy it.'; }
+      });
+      el.querySelector('[data-client-form]')?.addEventListener('submit', async (ev) => {
+        ev.preventDefault();
+        const form = ev.currentTarget, secret = form.querySelector('[data-client-secret]');
+        const btn = form.querySelector('button[type="submit"]');
+        btn.disabled = true;
+        try {
+          await client.saveAppClient('google', form.querySelector('[data-client-id]').value, secret.value);
+          secret.value = '';
+          appsFlash = { text: 'Client saved.' };
+          await loadApps(root);
+        } catch (e) { secret.value = ''; say({ error: true, text: e && e.body && e.body.error === 'bad_client' ? 'Both the client ID and the secret are needed.' : errText(e) }); btn.disabled = false; }
+      });
+      void loadBlocked(root.querySelector('#pa-blocked'), googleOn && google.status !== 'needs_attention', Array.isArray(data.blocked_calendars) ? data.blocked_calendars : []);
+      void loadDrafts(root, googleOn && google.status !== 'needs_attention');
+    } catch (error) { el.innerHTML = `${heading}<herdr-error message="${esc(error.message)}"></herdr-error>`; }
+  };
+
+  const connectError = (e) => {
+    const code = e && e.body && e.body.error;
+    if (code === 'no_client') return 'Save the Google client first.';
+    if (code === 'not_set_up') return 'App connections are not set up. Ask the operator to create the encryption key.';
+    return errText(e);
+  };
+
+  // Which calendars the assistant may never see. This list (blocked ones included) is shown to the owner only.
+  const loadBlocked = async (el, on, ids = []) => {
+    if (!el) return;
+    if (!on) { el.hidden = true; el.innerHTML = ''; return; }
+    el.hidden = false;
+    const head = '<h4 class="pa-h4" id="pa-blocked-h">Calendars the assistant must not see</h4>';
+    el.innerHTML = `${head}<p class="pa-muted">Checked calendars are hidden from your assistant: it cannot list, read, or schedule on them.</p><div class="pa-muted">Loading calendars…</div>`;
+    try {
+      const { calendars = [] } = await client.listCalendars('google');
+      if (disposed) return;
+      const listed = new Set(calendars.map(c => c.id));
+      const rows = [...calendars.map(c => ({ id: c.id, label: c.summary || c.id, primary: c.primary, blocked: c.blocked })),
+        ...ids.filter(i => !listed.has(i)).map(i => ({ id: i, label: i, primary: false, blocked: true, unlisted: true }))];
+      el.innerHTML = `${head}<p class="pa-muted">Checked calendars are hidden from your assistant: it cannot list, read, or schedule on them.</p>
+        <form data-blocked-form><fieldset class="pa-fieldset" aria-label="Blocked calendars">
+        ${rows.length ? rows.map((r, i) => `<label class="pa-check" for="pa-bc-${i}"><input type="checkbox" id="pa-bc-${i}" data-blocked-id="${esc(r.id)}" ${r.blocked ? 'checked' : ''}>
+          <span>${esc(r.label)}${r.primary ? ' <span class="pa-badge">primary</span>' : ''}${r.unlisted ? ' <span class="pa-muted">(not in your calendar list)</span>' : ''}
+          ${r.label !== r.id ? `<span class="pa-muted pa-check__id">${esc(r.id)}</span>` : ''}</span></label>`).join('') : '<div class="pa-muted">No calendars found.</div>'}
+        </fieldset><div class="pa-row"><button class="hd-btn hd-btn--sm" type="submit">Save blocked calendars</button>
+          <span class="pa-muted" data-blocked-status role="status" aria-live="polite"></span></div></form>`;
+      el.querySelector('[data-blocked-form]').addEventListener('submit', async (ev) => {
+        ev.preventDefault();
+        const out = el.querySelector('[data-blocked-status]'), btn = ev.currentTarget.querySelector('button[type="submit"]');
+        const chosen = [...el.querySelectorAll('[data-blocked-id]')].filter(x => x.checked).map(x => x.dataset.blockedId);
+        btn.disabled = true;
+        try { await client.setBlockedCalendars('google', chosen); out.textContent = chosen.length ? `Saved: ${chosen.length} calendar${chosen.length === 1 ? '' : 's'} hidden.` : 'Saved: no calendars hidden.'; }
+        catch (e) { out.textContent = `Not saved: ${errText(e)}`; }
+        btn.disabled = false;
+      });
+    } catch (e) { el.innerHTML = `${head}<div class="pa-muted" role="status">Calendars could not be loaded${e && e.body && e.body.error === 'needs_attention' ? '; sign in again first' : ''}.</div>`; }
+  };
+
+  const loadDrafts = async (root, on) => {
+    const el = root.querySelector('#pa-drafts');
+    if (!el) return;
+    if (!on) { el.hidden = true; el.innerHTML = ''; return; }
+    el.hidden = false;
+    const head = '<h3 id="pa-drafts-h" class="pa-h3">Drafts</h3>';
+    try {
+      const { drafts = [] } = await client.listDrafts('google');
+      if (disposed) return;
+      const link = (u) => typeof u === 'string' && /^https:\/\/mail\.google\.com\//.test(u) ? u : '';
+      el.innerHTML = `${head}<p class="pa-muted">Drafts your assistant saved in Gmail. Nothing here has been sent.</p><div role="status" aria-live="polite" data-drafts-status class="pa-flash"></div>
+        ${drafts.length ? drafts.map(d => `<article class="pa-msg" aria-label="Draft ${esc(d.subject || 'no subject')}" data-draft="${esc(d.id)}">
+          <div><strong>${esc(d.subject || '(no subject)')}</strong></div>
+          <div class="pa-muted">To ${esc(d.to || '(nobody yet)')}</div>
+          ${d.snippet ? `<div class="pa-snippet">${esc(d.snippet)}</div>` : ''}
+          <div class="pa-row" style="margin-top:6px">
+            ${link(d.gmail_url) ? `<a class="hd-btn hd-btn--ghost hd-btn--sm" href="${esc(link(d.gmail_url))}" target="_blank" rel="noopener" aria-label="Open draft ${esc(d.subject || 'no subject')} in Gmail">Open in Gmail</a>` : ''}
+            <button class="hd-btn hd-btn--danger hd-btn--sm" data-draft-discard="${esc(d.id)}" aria-label="Discard draft ${esc(d.subject || 'no subject')}">Discard</button>
+            <button class="hd-btn hd-btn--sm" disabled aria-disabled="true" data-draft-send title="Sending from here is not available yet">Send (coming soon)</button>
+          </div></article>`).join('') : '<div class="pa-muted">No drafts.</div>'}`;
+      el.querySelectorAll('[data-draft-discard]').forEach(b => b.addEventListener('click', async () => {
+        b.disabled = true;
+        try { await client.discardDraft('google', b.dataset.draftDiscard); await loadDrafts(root, true); root.querySelector('[data-drafts-status]').textContent = 'Draft discarded.'; }
+        catch (e) { el.querySelector('[data-drafts-status]').textContent = `Not discarded: ${errText(e)}`; b.disabled = false; }
+      }));
+    } catch (e) { el.innerHTML = `${head}<div class="pa-muted" role="status">Drafts could not be loaded${e && e.body && e.body.error === 'needs_attention' ? '; sign in again first' : ''}.</div>`; }
+  };
+
+  const loadReminders = async (el, flash = null) => {
+    const head = '<h3 id="pa-reminders-h" class="pa-h3">Reminders</h3>';
+    try {
+      const { reminders = [], timezone = '' } = await client.listReminders();
+      if (disposed) return;
+      const shown = reminders.filter(r => r.state !== 'cancelled');
+      const at = (r) => String(r.fire_at || '').replace('T', ' ').slice(0, 16);
+      el.innerHTML = `${head}${flashHtml(flash)}
+        ${shown.length ? shown.map(r => `<article class="pa-msg pa-msg--meta" aria-label="Reminder ${esc(r.text)}" data-reminder="${esc(r.id)}">
+          <div>${esc(r.text)}</div><div class="pa-muted">${esc(at(r))}${timezone ? ` (${esc(timezone)})` : ''} · ${esc(r.state)}</div>
+          ${r.state === 'pending' ? `<div class="pa-row" style="margin-top:6px"><button class="hd-btn hd-btn--danger hd-btn--sm" data-reminder-cancel="${esc(r.id)}" aria-label="Cancel reminder ${esc(r.text)}">Cancel</button></div>` : ''}
+          </article>`).join('') : '<div class="pa-muted">No reminders.</div>'}`;
+      el.querySelectorAll('[data-reminder-cancel]').forEach(b => b.addEventListener('click', async () => {
+        b.disabled = true;
+        try { await client.cancelReminder(b.dataset.reminderCancel); await loadReminders(el, { text: 'Reminder cancelled.' }); }
+        catch (e) { await loadReminders(el, { error: true, text: errText(e) }); }
+      }));
+    } catch (e) { el.innerHTML = `${head}<div class="pa-muted" role="status">${e && e.status === 409 ? 'Reminders are not set up.' : 'Reminders could not be loaded.'}</div>`; }
+  };
+
   const loadConnectors = async (el, a) => {
     try {
       const { connectors = [] } = await client.listConnectors();
       el.innerHTML = `
         <div class="pa-row">
-          <input data-cname placeholder="Name" style="flex:1">
-          <select data-ckind><option value="http">http</option><option value="openapi">openapi</option><option value="mcp">mcp</option></select>
-          <input data-curl placeholder="https://host" style="flex:1.4">
-          <input data-callow placeholder="Allowed host(s), comma-sep" style="flex:1.4">
+          <input data-cname placeholder="Name" aria-label="Connector name" style="flex:1">
+          <select data-ckind aria-label="Connector kind"><option value="http">http</option><option value="openapi">openapi</option><option value="mcp">mcp</option></select>
+          <input data-curl placeholder="https://host" aria-label="Connector base URL" style="flex:1.4">
+          <input data-callow placeholder="Allowed host(s), comma-sep" aria-label="Allowed hosts, comma separated" style="flex:1.4">
           <button class="hd-btn hd-btn--sm" data-ccreate>Register</button>
         </div>
         <div style="margin-top:8px">${connectors.length ? connectors.map(c => `

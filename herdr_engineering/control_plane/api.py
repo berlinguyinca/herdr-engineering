@@ -4158,6 +4158,8 @@ def _make_handler(server, public=False, operator=False):
                 return self._json({"ready": True, "redirect_uri": server.apps_redirect_uri,
                                    "providers": apps.providers(tenant, user),
                                    "blocked_calendars": apps.blocked_calendars(tenant, user)})
+            if tail == ["google", "calendars"] and command == "GET":
+                return self._google_calendars(tenant, user)
             if tail[:2] == ["google", "drafts"] and len(tail) <= 3 and command in ("GET", "DELETE") and (len(tail) == 2) == (command == "GET"):
                 return self._google_drafts(tenant, user, tail)
             known = {("PUT", ("google", "client")), ("POST", ("google", "connect")), ("DELETE", ("google",)),
@@ -4188,6 +4190,19 @@ def _make_handler(server, public=False, operator=False):
             except AppsError as exc:
                 status = {"not_set_up": 409, "no_client": 409, "unknown_provider": 404}.get(exc.reason, 400)
                 return self._json({"error": exc.reason if exc.reason in self._APPS_REASONS | {"bad_client"} else "failed"}, status)
+
+        def _google_calendars(self, tenant, user):
+            """GET .../google/calendars: the calling person's calendars for the blocked-calendars picker. Blocked ones are
+            listed too, flagged ``blocked``: this is the owner's own screen, never a model-facing result."""
+            from .google_workspace import GoogleError
+            gw = getattr(server, "google", None)
+            if gw is None:
+                return self._json({"error": "not_set_up"}, 409)
+            try:
+                return self._json({"calendars": gw.list_calendars_for_owner_ui(tenant, user)})
+            except GoogleError as exc:
+                status = {"not_connected": 409, "needs_attention": 409, "reconnect_needed": 409, "rate_limited": 429}.get(exc.reason, 502)
+                return self._json({"error": exc.reason if exc.reason in {"not_connected", "needs_attention", "reconnect_needed", "rate_limited"} else "unavailable"}, status)
 
         def _google_drafts(self, tenant, user, tail):
             """GET lists the calling person's Gmail drafts; DELETE discards one. Both use only that person's connection."""

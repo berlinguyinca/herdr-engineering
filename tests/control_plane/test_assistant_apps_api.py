@@ -190,7 +190,7 @@ def test_blocked_calendars_are_per_person_and_validated(ready):
 def test_disconnect_and_unknown_routes(ready):
     assert call(ready, BASE + "/google", None, "DELETE") == (200, {"ok": True})
     assert call(ready, BASE + "/nope/connect", {}, "POST")[0] == 404
-    assert call(ready, BASE + "/google/calendars")[0] == 404          # arrives with a later task
+    assert call(ready, BASE + "/google/nope")[0] == 404
 
 
 def _raw(svr, method, path, headers=None, body=None):
@@ -240,3 +240,24 @@ def test_callback_variants_stay_safe(ready):
     cb = BASE + "/google/callback"
     for path in (cb + "/", cb + "/?state=x", cb + "?state=x&state=y&code=", cb + "?code=1&x=%00"):
         assert raw_get(ready, path) == (302, "/#/personal-assistant?error=bad_state")
+
+
+def test_calendars_route_lists_blocked_ones_flagged_for_the_owner_only(ready):
+    assert call(ready, BASE + "/google/calendars") == (409, {"error": "not_connected"})
+    call(ready, BASE + "/google/client", {"client_id": "cid.apps", "client_secret": SECRET}, "PUT")
+    url = call(ready, BASE + "/google/connect", {}, "POST")[1]["url"]
+    state = urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)["state"][0]
+    raw_get(ready, BASE + f"/google/callback?state={state}&code=c")
+
+    from tests.control_plane.test_google_workspace import Google
+    fake = Google()
+    fake.primary = "ann@x.org"
+    ready.google._open = fake
+    call(ready, BASE + "/google/blocked-calendars", {"ids": ["secret@x.org"]}, "PUT")
+    status, body = call(ready, BASE + "/google/calendars")
+    assert status == 200
+    assert {c["id"]: c["blocked"] for c in body["calendars"]} == {"ann@x.org": False, "team@x.org": False, "secret@x.org": True}
+    assert SECRET not in json.dumps(body)
+    # the model-facing listing still omits the blocked calendar, and the assistant tool entry point has no way to this one
+    assert call(ready, BASE + "/google/calendars", key=None)[0] == 401
+    assert call(ready, BASE + "/google/calendars", key=OTHER)[0] == 409       # another person has no connection

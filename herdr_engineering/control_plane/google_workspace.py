@@ -391,6 +391,24 @@ class GoogleWorkspace:
                  "access_role": str(c.get("accessRole", ""))} for c in data.get("items") or [] if isinstance(c, dict)]
         return self.policy_for(tenant, user).filter(cals)
 
+    def list_calendars_for_owner_ui(self, tenant: str, user: str) -> list[dict]:
+        """OWNER-UI ONLY: every calendar of the calling person, blocked ones included and flagged ``blocked``.
+
+        This is the single place a blocked calendar is shown, and only to its owner in the dashboard's blocked-calendars
+        picker (GET /api/v1/assistant-apps/google/calendars). It is NOT reachable from the assistant tools: ``run`` has no
+        entry for it, and the model-facing ``list_calendars`` above still omits blocked calendars.
+        """
+        data = self._get(tenant, user, f"{CALENDAR_API}/users/me/calendarList", {"fields": "items(id,summary,primary,accessRole)"})
+        pol = self.policy_for(tenant, user)
+        out = []
+        for c in data.get("items") or []:
+            if not isinstance(c, dict) or not isinstance(c.get("id"), str) or not c["id"]:
+                continue
+            primary = c.get("primary") is True
+            out.append({"id": c["id"][:256], "summary": str(c.get("summary", ""))[:200], "primary": primary,
+                        "blocked": not pol.allows(c["id"]) or (primary and not pol.allows(PRIMARY))})
+        return out
+
     def list_events(self, tenant: str, user: str, time_min: str | None = None, time_max: str | None = None,
                     max_results: int = 10, calendar_id: str | None = None) -> list[dict]:
         cid = PRIMARY if calendar_id is None else self._calendar_id(calendar_id)

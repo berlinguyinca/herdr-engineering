@@ -776,4 +776,35 @@ export class HerdrClient {
   registerDelegationArtifact(delegationId, artifactRef) {
     return this.request(`/api/v1/assistant-delegations/${encodeURIComponent(delegationId)}/artifact`, { method: 'POST', body: { artifact_ref: artifactRef } });
   }
+  // ---- Assistant apps (Gmail, Google Calendar), drafts and reminders. The client secret goes out in saveAppClient and never comes back.
+  listApps() {
+    return this.request('/api/v1/assistant-apps');
+  }
+  saveAppClient(provider, clientId, clientSecret) {
+    return this.request(`/api/v1/assistant-apps/${encodeURIComponent(provider)}/client`, { method: 'PUT', body: { client_id: clientId, client_secret: clientSecret } });
+  }
+  connectApp(provider) {
+    return this.request(`/api/v1/assistant-apps/${encodeURIComponent(provider)}/connect`, { method: 'POST', body: {} });
+  }
+  disconnectApp(provider) {
+    return this.request(`/api/v1/assistant-apps/${encodeURIComponent(provider)}`, { method: 'DELETE' });
+  }
+  listCalendars(provider = 'google') {
+    return this.request(`/api/v1/assistant-apps/${encodeURIComponent(provider)}/calendars`);
+  }
+  setBlockedCalendars(provider, ids) {
+    return this.request(`/api/v1/assistant-apps/${encodeURIComponent(provider)}/blocked-calendars`, { method: 'PUT', body: { ids } });
+  }
+  listDrafts(provider = 'google') {
+    return this.request(`/api/v1/assistant-apps/${encodeURIComponent(provider)}/drafts`);
+  }
+  discardDraft(provider, draftId) {
+    return this.request(`/api/v1/assistant-apps/${encodeURIComponent(provider)}/drafts/${encodeURIComponent(draftId)}`, { method: 'DELETE' });
+  }
+  listReminders() {
+    return this.request('/api/v1/assistant-reminders');
+  }
+  cancelReminder(reminderId) {
+    return this.request(`/api/v1/assistant-reminders/${encodeURIComponent(reminderId)}`, { method: 'DELETE' });
+  }
 }
