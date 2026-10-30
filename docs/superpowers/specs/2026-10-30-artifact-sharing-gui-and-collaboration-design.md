@@ -22,7 +22,10 @@ CLI, and wants outside parties to be able to *work on* an artifact, not just vie
   automatically when the changes do not overlap and rejected with a conflict report when they do.
 * **History is never lost**: merges become real versions with two parents; rejected pushes are logged, not stored as
   versions; revert is a new version.
-* Everything is usable by a bot with only HTTP + a token, and by a `herdr-eng` CLI wrapper with `pull` / `push`.
+* Signed-in group members (lab viewers) can **annotate** shared content; an agent integrates open annotations into a
+  new revision.
+* Group members can **create and share their own artifacts** from the artifact skill in Claude, Codex, Pi and
+  OpenCode, through the collaboration MCP server. Members can share to the group only — never publicly.
 
 ## Non-goals / anti-goals
 
@@ -33,6 +36,9 @@ CLI, and wants outside parties to be able to *work on* an artifact, not just vie
   artifact, no registry access from the MCP process.
 * Anti-goal: silently overwriting either side. A merge that is not clean is never applied.
 * Existing share links stay frozen copies; a collaborator commit never changes a live share link.
+* Anonymous visitors (public links) have **no edit rights at all**: no annotations, no writes.
+* **Members can never create a public link** (server-enforced, not just hidden in the UI). Public links remain an
+  operator-only capability.
 
 ## Current state (what exists)
 
@@ -156,6 +162,64 @@ message, parents (merge marked), and a toggle for rejected attempts. Selecting a
 two-way diff against its first parent (reusing the existing text diff). Collaborator list shows last used, commit
 count, and a Revoke button.
 
+### D. Annotations by signed-in group members
+
+Only a signed-in lab viewer who passes the share's lab check (verified Cognito token, on the allow-list) and the
+artifact owner can annotate. Public/anonymous visitors cannot (the endpoint refuses them).
+
+* **Anchor.** HTML: W3C-style text-quote selector (exact text + short prefix/suffix) plus the file path within the
+  bundle; PDF: page number and optional quoted text; other types: whole-document comment. Parquet data views are not
+  annotatable in v1.
+* **Capture.** The lab viewer shell already hosts the content; for HTML the share server injects a small
+  selection script into served HTML (the sandboxed content cannot be touched from outside) that reports selections to
+  the viewer shell by `postMessage`. The shell shows an "Annotate" button and a comment box and posts to
+  `POST /s/<token>/k/<session>/annotations` (session-authenticated, body size-capped, rate-limited per user and per
+  share). The text is stored as plain text, never rendered as HTML.
+* **Write path.** `share-public` stays database-free: it appends the annotation (share id, version id, author email
+  and sub from the verified session, anchor, comment, time) to an append-only annotations file; the worker ingests it
+  into `artifact_annotations` (status `open` | `addressed` | `dismissed`, `addressed_in_version_id`). The usual
+  size/rotation rules of the audit events file apply.
+* **Owner view.** A **Feedback** tab in the Share panel lists annotations per artifact (author, version, anchor, comment,
+  status), with a Dismiss action and a link to the version that addressed it. Annotators see their own annotations
+  and the "addressed in version N" status when they reopen the link.
+* **Agent integration.** New MCP tools for granted agents: `artifact_annotations` (open annotations, wrapped
+  `untrusted=True`) and `artifact_annotation_resolve` (marks annotations addressed by a given version id the agent
+  just committed). The agent integrates them with the normal `artifact_commit` (section B). Annotation text is
+  untrusted input to the agent (prompt-injection risk): it is delivered as data with the `UNTRUSTED` notice, the
+  resulting revision is an ordinary attributed, revertible version, and nothing goes live automatically — a live
+  share link stays frozen on the version people saw until the owner shares the new one ("share latest" convenience is
+  a follow-up).
+
+### E. Members share their own artifacts
+
+Today the control plane is single-operator. This section makes it multi-user for artifacts, narrowly.
+
+* **Ownership.** `artifacts` gets an `owner_principal` (existing artifacts: the operator). A member sees and manages
+  only artifacts they own, plus artifacts explicitly granted to them (section B), plus artifacts shared with them via a
+  lab link (read-only viewing through the share page). The operator sees everything.
+* **Who is a member.** A collab agent whose owner is a user in the configured group (`collab.cognito_group`, as
+  already used by the collab service). Disabled users lose access immediately.
+* **MCP tools for members** (offered only to such agents, acting on the caller's own artifacts only):
+  `artifact_create`, `artifact_publish` (new version of an own artifact; chunked upload), `artifact_share_create`,
+  `artifact_share_approve`, `artifact_share_list`, `artifact_share_revoke`, `artifact_share_events`. Share creation
+  from a member accepts **only the lab audience** (group and/or listed emails of pool users); `audience: public` is
+  refused with a clear error and an audit row, regardless of caller. Expiry and the summary/confirm flow are the same
+  as for the operator; the member's agent shows the exact file list to its human before approving.
+* **Upload.** MCP requests are small, so file content goes in chunks (`artifact_upload_chunk`, ~512 KiB each,
+  hash-checked, assembled in a quarantine area by the worker); caps per member: 25 MiB per artifact, 200 MiB total,
+  20 artifacts live. Bundles larger than that are an operator action. Content types follow the share rules (PDF, HTML,
+  HTML + parquet); the same bundle scanner and sandbox CSP apply, and members' bundles get an extra warning banner
+  in the lab viewer ("shared by <name>").
+* **Writes go through the intents queue** (section B): intent → worker validates ownership/quotas against the
+  control-plane tables → applies as the member's principal → result file. Every action is audited; a revoked or
+  disabled member's pending intents are rejected.
+* **Skill.** The existing artifact skill (`skills/herdr-artifact`, installed for Claude, Codex, Pi and OpenCode) gets
+  an **MCP mode**: the same commands (`create`, `publish`, `share`, `list`, `revoke`) call the MCP tools when the
+  collaboration server is configured and the control-plane CLI is unreachable or not configured. The skill reference
+  and `packages/collab-guide.md` document the tool set; harness install/update paths stay as they are.
+* **Operator controls.** A Members panel (operator only): list members' artifacts and shares, revoke any share, set
+  per-member quotas, disable a member's sharing.
+
 ## Decisions made by me (operator may overrule)
 
 * Viewer-link URL is shown once (token stored hashed) — re-sharing means generating a new link.
@@ -167,6 +231,10 @@ count, and a Revoke button.
 * Conflicts are returned to the pushing contributor; the owner is not asked to resolve them in the GUI in v1.
 * "Group" in the GUI maps to the existing `lab` audience (Cognito groups and/or emails).
 * Default agent grant lifetime 30 days; commit rate 30/min.
+* Annotations: lab members and the owner only, text-quote anchored (HTML) or page anchored (PDF), shown in a Feedback
+  tab; the agent integrates them via MCP and a new revision never changes a live link by itself.
+* Members: group-only sharing, no public audience ever, 25 MiB/artifact and 200 MiB/member default caps, 20 live
+  artifacts, chunked upload through MCP. Operator public links are unchanged.
 
 ## Builder-check resolutions (my calls unless marked)
 
