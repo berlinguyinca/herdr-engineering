@@ -4,6 +4,7 @@ A live ControlPlaneServer is driven over HTTP with the exact request shapes the 
 with ``origin: rakazo://``, ``Authorization: Bearer``), and the response fields the app reads are asserted by name."""
 import http.client
 import io
+import itertools
 import json
 import logging
 import threading
@@ -133,8 +134,11 @@ def wait_idle(api, token, bot_id, timeout=5):
     raise AssertionError("the run never finished")
 
 
+_NONCE = itertools.count(1)             # the app sends a fresh clientNonce per message; a repeated one is a retry
+
+
 def send(api, token, bot_id, text):
-    out = api.ok("threads/send", {"botId": bot_id, "text": text, "clientNonce": "n1"}, token)
+    out = api.ok("threads/send", {"botId": bot_id, "text": text, "clientNonce": f"n{next(_NONCE)}"}, token)
     return out, wait_idle(api, token, bot_id)
 
 
@@ -605,8 +609,7 @@ def test_push_registration_is_accepted_and_nothing_is_stored(srv, alice):
     assert before.count("ExponentPushToken") == 0
 
 
-@pytest.mark.parametrize("proc", ["billing/status", "voice/status", "computer/status", "models/list", "groups/list",
-                                  "capabilities/list", "routines/list", "bots/update", "totally/unknown"])
+@pytest.mark.parametrize("proc", ["totally/unknown", "definitely/missing", "threads/teleport"])
 def test_unimplemented_procedures_answer_a_rakazo_shaped_404(srv, alice, proc):
     _, api = srv
     status, body, _ = api.rpc(proc, {}, alice)
@@ -1127,15 +1130,15 @@ def _try(fn):
         return exc
 
 
-def test_postgres_connections_always_carry_timeouts_even_if_the_dsn_says_otherwise(monkeypatch):
+def test_postgres_timeouts_are_set_local_not_startup_options_so_pgbouncer_accepts_them(monkeypatch):
     import sys
     import types
-    seen = {}
+    seen = {"sql": []}
 
     class Cur:
         def __enter__(self): return self
         def __exit__(self, *a): return False
-        def execute(self, sql, args=()): pass
+        def execute(self, sql, args=()): seen["sql"].append(sql)
         def fetchall(self): return []
 
     class Conn:
@@ -1148,8 +1151,10 @@ def test_postgres_connections_always_carry_timeouts_even_if_the_dsn_says_otherwi
         return Conn()
     monkeypatch.setitem(sys.modules, "psycopg2", types.SimpleNamespace(connect=connect))
     rb.PostgresTokenPersistence("postgresql://u:p@h/db?connect_timeout=999").delete("0" * 64)
-    assert seen["kw"]["connect_timeout"] == 3
-    assert "statement_timeout=3000" in seen["kw"]["options"] and "lock_timeout=3000" in seen["kw"]["options"]
+    assert seen["kw"] == {"connect_timeout": 3}                    # no `options` startup parameter: PgBouncer refuses it
+    first = seen["sql"][0]
+    assert "SET LOCAL statement_timeout = 3000" in first and "SET LOCAL lock_timeout = 3000" in first
+    assert seen["sql"][1].startswith("DELETE FROM rakazo_bridge_tokens")      # the timeouts come first, same transaction
 
 
 # --------------------------------------------------------------------------------------------- hostile input, bounds
@@ -1157,7 +1162,8 @@ def test_hostile_bodies_get_a_generic_400_without_error_logs(srv, alice, caplog)
     _, api = srv
     caplog.set_level(logging.DEBUG)
     deep = b"[" * 200_000
-    assert api.raw("POST", "/api/auth/sign-in/email", deep)[0] == 400
+    assert api.raw("POST", "/api/auth/sign-in/email", deep)[0] == 413          # over the pre-auth limit: never read
+    assert api.raw("POST", "/api/auth/sign-in/email", b"[" * 5000)[0] == 400
     status, body, _ = api.raw("POST", "/rpc/me", deep, {"authorization": f"Bearer {alice}"})
     assert status == 400 and json.loads(body)["json"]["code"] == "BAD_REQUEST"
     assert api.raw("POST", "/rpc/me", b"\xff\xfe", {"authorization": f"Bearer {alice}"})[0] == 400
@@ -1196,6 +1202,156 @@ def test_bots_per_account_are_capped_with_a_rakazo_shaped_error(srv):
     assert status == 400 and err["code"] == "BAD_REQUEST" and err["status"] == 400 and str(rb.MAX_BOTS) in err["message"]
     assert len(api.ok("bots/list", token=alice)) == rb.MAX_BOTS
     new_bot(api, bob)                                         # the cap is per account
+
+
+# --------------------------------------------------------------------------------------------- review fixes (PR #445)
+def test_stop_wins_over_a_reply_that_is_still_being_written(srv, alice):
+    svr, api = srv
+    bot = new_bot(api, alice)
+    entered, release = threading.Event(), threading.Event()
+    real = svr.assistant._drive
+
+    def slow(run, messages):
+        entered.set()
+        release.wait(5)
+        return real(run, messages)
+    svr.assistant._drive = slow
+    sent = api.ok("threads/send", {"botId": bot["id"], "text": "think hard", "clientNonce": "s1"}, alice)
+    assert entered.wait(5)
+    api.ok("threads/stop", {"botId": bot["id"]}, alice)
+    release.set()
+    deadline = time.time() + 5
+    while time.time() < deadline and svr.rakazo._sends._value < rb.MAX_SENDS:
+        time.sleep(0.02)                                           # the worker has finished
+    run = svr.assistant.store.runs[sent["runId"]]
+    assert run.state == "cancelled"                                # not overwritten with "completed"
+    snap = api.ok("threads/get", {"botId": bot["id"]}, alice)
+    assert [m["role"] for m in snap["messages"] if m["role"] == "bot" and m["blocks"][0]["kind"] == "text"] == []
+    assert "assistant.run.completed" not in [e["action"] for e in svr.assistant.store.audit]
+
+
+def test_a_retried_send_with_the_same_nonce_never_sends_twice(srv, alice):
+    svr, api = srv
+    svr.rakazo.send_wait = 0.2
+    bot = new_bot(api, alice)
+    gate = threading.Event()
+    real = svr.assistant.send_message
+
+    def held(**kw):
+        gate.wait(5)                                               # the run does not exist yet: the store is "slow"
+        return real(**kw)
+    svr.assistant.send_message = held
+    body = {"botId": bot["id"], "text": "once only", "clientNonce": "retry-1"}
+    first = api.rpc("threads/send", body, alice)
+    assert first[0] == 503 and first[1]["json"]["code"] == "SERVICE_UNAVAILABLE"
+    assert api.rpc("threads/send", body, alice)[0] == 503          # still starting: no second worker
+    gate.set()
+    done = None
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        status, out, _ = api.rpc("threads/send", body, alice)
+        if status == 200:
+            done = out["json"]
+            break
+        time.sleep(0.05)
+    assert done and done["runId"]
+    assert api.ok("threads/send", body, alice) == done             # and once the answer exists it is stable
+    wait_idle(api, alice, bot["id"])
+    texts = [m for m in svr.assistant.store.messages.values() if m.role == "user" and m.content == "once only"]
+    assert len(texts) == 1 and len(svr.assistant.store.runs) == 1
+
+
+def test_a_failed_worker_start_releases_the_slot_and_the_nonce(srv, alice):
+    svr, api = srv
+    bot = new_bot(api, alice)
+
+    class NoThreads:
+        def __init__(self, *a, **kw): pass
+        def start(self): raise RuntimeError("can't start new thread")
+    real = svr.rakazo.thread_factory
+    svr.rakazo.thread_factory = NoThreads
+    for i in range(rb.MAX_SENDS + 2):
+        status, body, _ = api.rpc("threads/send", {"botId": bot["id"], "text": "x", "clientNonce": f"f{i}"}, alice)
+        assert status == 503, (i, body)                            # never 429: no slot was leaked
+    svr.rakazo.thread_factory = real
+    out, _ = send(api, alice, bot["id"], "now it works")
+    assert out["runId"]
+    svr.rakazo.thread_factory = NoThreads
+    assert api.rpc("threads/send", {"botId": bot["id"], "text": "x", "clientNonce": "f0"}, alice)[0] == 503
+    svr.rakazo.thread_factory = real
+    assert api.ok("threads/send", {"botId": bot["id"], "text": "x", "clientNonce": "f0"}, alice)["runId"]   # nonce reusable
+
+
+def test_the_body_limit_before_authentication_is_small(srv, alice):
+    _, api = srv
+    big = json.dumps({"json": {"pad": "x" * 9000}}).encode()
+    assert api.raw("POST", "/api/auth/sign-in/email", big)[0] == 413
+    assert api.raw("POST", "/rpc/me", big)[0] == 413                             # no token
+    assert api.raw("POST", "/rpc/me", big, {"authorization": "Bearer " + "0" * 43})[0] == 413   # a token that is not live
+    assert api.raw("POST", "/rpc/me", big, {"authorization": f"Bearer {alice}"})[0] == 200       # a live token may
+    assert api.raw("POST", "/rpc/me", b"{}")[0] == 401
+
+
+def test_a_locked_out_address_survives_a_flood_of_new_ones(monkeypatch):
+    monkeypatch.setattr(rb, "MAX_LIMITER_ENTRIES", 40)
+    now = [0.0]
+    lim = rb.SignInLimiter(lambda: now[0])
+    for _ in range(5):
+        lim.failure("10.0.0.1")
+    assert lim.retry_after("10.0.0.1") > 0
+    for i in range(500):
+        now[0] += 0.01
+        lim.failure(f"10.1.{i // 250}.{i % 250}")                  # quiet, unlocked addresses
+    assert lim.retry_after("10.0.0.1") > 0 and len(lim._state) <= 41
+    before = len(lim._state)
+    for i in range(100):
+        assert lim.retry_after(f"192.168.0.{i}") == 0              # a read never allocates
+    assert len(lim._state) == before
+
+
+def test_an_unexpected_key_error_is_a_404_but_leaves_a_trace_without_the_key(srv, alice, caplog):
+    svr, api = srv
+
+    def broken(ctx, inp):
+        raise KeyError("sekrit-identifier")
+    svr.rakazo._procs["bots/list"] = broken
+    caplog.set_level(logging.WARNING)
+    status, body, _ = api.rpc("bots/list", {}, alice)
+    assert status == 404 and body["json"]["code"] == "NOT_FOUND"
+    logged = " ".join(r.getMessage() for r in caplog.records)
+    assert "KeyError" in logged and "bots/list" in logged and "sekrit-identifier" not in logged
+
+
+def test_two_boots_in_the_same_second_do_not_share_sequence_numbers():
+    first = ev.JournalRegistry(clock=lambda: 1_000_000.001)
+    second = ev.JournalRegistry(clock=lambda: 1_000_000.250)
+    assert second.get("t", "a").head > first.get("t", "a").head
+
+
+def test_a_sign_out_waits_for_a_concurrent_flush_instead_of_reporting_a_false_failure():
+    gate, deleted = threading.Event(), []
+
+    class Slow:
+        def load(self):
+            return []
+
+        def upsert(self, digest, record):
+            pass
+
+        def delete(self, digest):
+            gate.wait(2)
+            deleted.append(digest)
+
+    store = rb.TokenStore(3600, 5, Slow(), cutoffs={})
+    token = store.mint("acct", "1.2.3.4")
+    first = threading.Thread(target=lambda: store.revoke(token))
+    first.start()
+    time.sleep(0.1)
+    other = store.mint("acct", "1.2.3.4")
+    threading.Timer(0.2, gate.set).start()
+    known, durable = store.revoke(other)               # the first flush is still running: wait for it, do not give up
+    first.join()
+    assert known and durable and len(deleted) == 2
 
 
 def test_slow_calls_are_logged_by_name_and_duration_only(monkeypatch, caplog):

@@ -5,7 +5,11 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Artifact registry: link from the CLI (unified workspace P03)
+- `herdr-eng artifacts links <id>` lists an artifact's bindings and `artifacts link <id> --project|--issue|--task|--room [--version V] [--link-kind origin|reference|derived]` adds one through the existing links route (idempotent; refused client-side with no target). Searching a project, issue, task or room is `artifacts for <kind> <ref> --query`. There is still no `diff`: the server has no diff route.
+
 ### Collaboration tasks: crash takeover (unified workspace P05)
+- `control_plane.collab.task_lease_seconds` (60 to 604800, YAML only, read at startup, absent = off) turns the lease on. A change needs a restart; it is not a hot switch.
 - `CollabService.task_lease_seconds` (default None = off): an accepted task whose lease ran out goes back to pending for its target agent when that agent polls its inbox, as a replayable `task.requeue` event. Each task carries an `attempt` (starts at 1); an update that names a stale `attempt` is refused with 409. No fleet-config key yet, so nothing changes in production.
 
 ### Artifact registry: read-only CLI (unified workspace P03)
