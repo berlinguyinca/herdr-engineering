@@ -301,6 +301,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p2.set_defaults(func=_cmd_art_retention)
     from .artifact_reports_client import add_report_subparser
     add_report_subparser(asub)
+    from .artifact_shares_client import add_share_subparser
+    add_share_subparser(asub)
     # system-graph artifact (P5): deterministic sanitized snapshot renderer.
     ga = sub.add_parser("graph-artifact", help="render a graph snapshot to validated HTML (system-graph P5)")
     gas = ga.add_subparsers(dest="graph_artifact_command", required=True)
