@@ -94,3 +94,17 @@ Decision needed before more code (each would otherwise be a stored-but-inert fea
 - **MCP servers / connectors / messaging**: need an owner for the credentials the app would enter (the operator's vault policy).
 - **Vault**: allowed on the trusted network, but needs an encryption-at-rest choice (key source) first.
 - **Auto-sync of running agents into rooms**: needs the host-registry proofs reviewed, since it grants room membership.
+
+### Update 4 (decisions taken autonomously)
+
+Decisions made rather than left open, each implemented and contract-tested:
+- #469 **Agent skills** are stored per space and injected into the bot's system prompt. This also fixed a gap found on the way:
+  the model runner never sent a bot's instructions or its chosen model; it now does (bots/update instructions and modelId are real).
+- #472 **Vault, bot secrets, agent secrets**: Fernet at rest under an operator key file (`vault_key_file`; off and says so without
+  it). Stores and reveals; injecting credentials into agent requests is not part of the bridge.
+- #473 **Remote MCP servers** are assistant connectors (https only, per-origin allowlist, credentials never returned). `stdio`
+  is refused because it runs commands on this machine.
+
+Still answered with "nothing configured" or a reasoned refusal: MCP assignments/OAuth, other connectors, messaging, tickets,
+boards, onboarding, approval rules, voice and computer hosts, marketplace. Not started: auto-sync of running agents into rooms,
+steering cards. Impossible without other infrastructure: push (APNs), voice/desktop hosts.
