@@ -105,6 +105,10 @@ edge (nginx, location ^~ /s/ only) -> herdr-share-public:8083 (network `share`, 
   previous commit defines share-public, share-public is recreated from that commit (and verified with the rest);
   otherwise a running share-public is stopped.
 
+Browser check (not part of CI): `node scripts/share-browser-check.mjs --browser chromium|firefox|webkit` runs the
+real share server over the bundles in `tests/share-fixtures/` (see its README) and checks rendering, parquet range
+reads, the sandbox, CSP blocking, PDF display, revoke and lab sign-in against a fake Cognito.
+
 Operator step, once, before sending lab links (not done by `deploy.sh`): add
 `https://localdev.mcp.metabolomics.us/s/callback` to BOTH the CallbackURLs and the LogoutURLs of the
 `herdr-collab-web` app client (`aws cognito-idp update-user-pool-client` replaces the whole client: read it
