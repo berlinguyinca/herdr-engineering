@@ -255,6 +255,18 @@ class IntelligenceRoutes:
             p = self.executor.execute(p.id, viewer.org_id)     # no-op unless the execute flag is on
         return p
 
+    def mark_failed(self, proposal_id: str, org_id: str, reason: str, *, only: tuple[str, ...]) -> bool:
+        """Record that an approved proposal will not run (it could not be started, or its worker ended without a final
+        state). Only a proposal still in one of the ``only`` states changes; never one that already finished."""
+        with self._decide_lock:
+            p = self.board.get(proposal_id, org_id)
+            if p.state not in only:
+                return False
+            p.state = "failed"
+            p.history.append(f"execution failed: {reason}")
+        self.store.record_audit({"action": "proposal_failed", "id": p.id, "actor": p.approver, "kind": p.action})
+        return True
+
     @staticmethod
     def _viewer_from_entry(entry: dict) -> pi.Viewer | None:
         projects, clearance = entry.get("projects"), entry.get("clearance", "internal")

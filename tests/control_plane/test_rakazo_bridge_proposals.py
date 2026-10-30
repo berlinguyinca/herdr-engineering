@@ -533,3 +533,106 @@ def test_close_waits_for_running_executions(make_rig):
     threading.Timer(0.2, gate.set).start()
     rig.svr.rakazo.desk.close(timeout=5)
     assert rig.calls == [(REPO, 302)]
+
+
+# --------------------------------------------------------------------------------------------- review follow-ups (#451)
+def _journal(rig):
+    return rig.svr.rakazo.journals.get(rig.bot["threadId"], rig.bot["id"])
+
+
+def _outcome(rig, p):
+    return _journal(rig).messages[ev.PROPOSAL_OUTCOME_PREFIX + p.id]["blocks"][0]["text"]
+
+
+def test_a_running_card_is_closed_out_when_the_account_loses_standing(make_rig):
+    rig = make_rig()
+    gate, started = _slow_hook(rig)
+    p = rig.file()
+    assert rig.answer(rig.cards()[0], "allow")[0] == 200 and started.wait(5)
+    assert "Running now" in _outcome(rig, p)
+    rig.svr.intelligence._section()["kill_switch"] = True
+    rig.snap()
+    assert "Running now" not in _outcome(rig, p) and "dashboard" in _outcome(rig, p)
+    gate.set()
+
+
+def test_an_outcome_is_reposted_when_only_its_text_changes(make_rig):
+    rig = make_rig(execute=False)
+    p = rig.file()
+    assert rig.answer(rig.cards()[0], "allow")[0] == 200
+    assert "Execution is off" in _outcome(rig, p)
+    journal = _journal(rig)
+    card = dict(journal.proposals[p.id], outcome="Approved: changed.")
+    journal.sync_proposals([card], datetime.now(UTC))          # same state, new text
+    assert _outcome(rig, p) == "Approved: changed."
+
+
+def test_a_proposal_that_cannot_be_started_is_failed_and_says_so(make_rig, caplog):
+    rig = make_rig()
+    p = rig.file()
+    [card] = rig.cards()
+    rig.svr.rakazo.desk.close()                               # nothing can start any more
+    with caplog.at_level(logging.WARNING):
+        status, body, _ = rig.answer(card, "allow")
+    assert status == 200 and body["json"]["state"] == "failed" and "could not be started" in body["json"]["message"]
+    assert rig.board.get(p.id, "org1").state == "failed" and rig.calls == []
+    text = _outcome(rig, p)
+    assert "did not run" in text and "StartError" in text and "Running now" not in text
+    assert any("could not be started" in r.getMessage() for r in caplog.records)
+
+
+def test_a_repeat_answer_is_idempotent_even_when_all_workers_are_busy(make_rig):
+    rig = make_rig()
+    gate, started = _slow_hook(rig)
+    ps = [rig.file(payload={**RERUN, "run": 500 + i}) for i in range(5)]
+    cards = {c["blocks"][0]["approvalEffectId"]: c for c in rig.cards()}
+    for p in ps[:4]:
+        assert rig.answer(cards[p.id], "allow")[0] == 200
+    status, body, hdrs = rig.answer(cards[ps[4].id], "allow")
+    assert status == 429 and {k.lower(): v for k, v in hdrs.items()}["retry-after"] == "5"
+    again = rig.answer(cards[ps[0].id], "allow")             # settled: no slot needed
+    assert again[0] == 200 and "Already approved" in again[1]["json"]["message"]
+    gate.set()
+    assert _wait(lambda: len(rig.calls) == 4)
+
+
+def test_a_worker_that_ends_without_a_result_leaves_no_proposal_executing(make_rig, monkeypatch):
+    class Abort(BaseException):
+        pass
+    rig = make_rig()
+    ex = rig.svr.intelligence.executor
+    real = ex.execute
+
+    def leave_executing(pid, org):
+        rig.board.get(pid, org).state = "executing"
+        raise Abort()
+    monkeypatch.setattr(ex, "execute", leave_executing)
+    monkeypatch.setattr(threading, "excepthook", lambda args: None)
+    p = rig.file()
+    assert rig.answer(rig.cards()[0], "allow")[0] == 200
+    assert _wait(lambda: rig.board.get(p.id, "org1").state == "failed")
+    assert _wait(lambda: "WorkerAborted" in rig.board.get(p.id, "org1").history[-1])
+    assert _wait(lambda: "did not run" in _outcome(rig, p))
+    # and when execute() merely returns while still executing
+    monkeypatch.setattr(ex, "execute", lambda pid, org: setattr(rig.board.get(pid, org), "state", "executing"))
+    q = rig.file(payload={**RERUN, "run": 777})
+    assert rig.answer([c for c in rig.cards() if c["blocks"][0]["approvalEffectId"] == q.id][0], "allow")[0] == 200
+    assert _wait(lambda: rig.board.get(q.id, "org1").state == "failed")
+    assert real  # the real executor is untouched for other tests
+
+
+def test_concurrent_double_answers_through_the_bridge_execute_once(make_rig):
+    rig = make_rig()
+    gate, started = _slow_hook(rig)
+    rig.file()
+    [card] = rig.cards()
+    results = []
+    ts = [threading.Thread(target=lambda: results.append(rig.answer(card, "allow"))) for _ in range(6)]
+    [t.start() for t in ts]
+    [t.join() for t in ts]
+    assert all(r[0] == 200 for r in results)
+    assert sum(1 for r in results if r[1]["json"].get("state") == "approved") == 1
+    gate.set()
+    assert _wait(lambda: rig.calls == [(REPO, 302)])
+    assert _wait(lambda: rig.board.get(rig.cards()[0]["blocks"][0]["approvalEffectId"], "org1").state == "executed")
+    assert rig.calls == [(REPO, 302)]

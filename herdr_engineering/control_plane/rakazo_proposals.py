@@ -154,7 +154,8 @@ class ProposalDesk:
                 "Open the card below to approve or reject it.")
         return {"id": p.id, "sha256": p.payload_sha256, "version": p.resource_version, "state": state,
                 "title": title, "detail": detail, "note": note, "outcome": snippet(outcome, 400), "user_id": user,
-                "created_at": now, "expires_at": p.expires_at}
+                "created_at": now, "expires_at": p.expires_at,
+                "running": state == "approved" and execute_on}
 
     def refresh(self, tenant: str, user: str, journal, *, force: bool, bypass: bool = False) -> None:
         """Bring ``journal`` up to date with the board. Call with the journal registry lock held. ``force`` (a request
@@ -176,14 +177,14 @@ class ProposalDesk:
             seen.add(p.id)
             cards.append(self._card(p, user, execute_on, now))
         for pid, old in list(journal.proposals.items()):
-            if pid in seen or old["state"] not in ("pending", "approved"):      # approved: may still be running
+            if pid in seen or not (old["state"] == "pending" or old.get("running")):      # a running one may have finished
                 continue
             try:
                 p = self.routes.board.get(pid, viewer.org_id)
             except pi.NotFound:
                 p = None
             if p is None or not self._visible(viewer, p):
-                cards.append({**old, "state": "expired", "outcome": snippet(
+                cards.append({**old, "state": "expired", "running": False, "outcome": snippet(
                     f"Expired without a decision: {old['title']}.", 400)})
             else:
                 cards.append(self._card(p, user, execute_on, now))
@@ -192,8 +193,14 @@ class ProposalDesk:
     def _withdraw(self, journal) -> None:
         """The account lost its standing (kill switch, suggest off, scope removed): cards already shown stop looking
         answerable and their waiting runs end."""
-        gone = [{**old, "state": "withdrawn", "outcome": snippet(f"No longer available: {old['title']}.", 400)}
-                for old in journal.proposals.values() if old["state"] == "pending"]
+        gone = []
+        for old in journal.proposals.values():
+            if old["state"] == "pending":
+                gone.append({**old, "state": "withdrawn",
+                             "outcome": snippet(f"No longer available: {old['title']}.", 400)})
+            elif old.get("running"):      # approved and executing: its result can no longer be followed from here
+                gone.append({**old, "running": False, "outcome": snippet(
+                    f"Approved: {old['title']}. No longer available here; see the dashboard for the result.", 400)})
         if gone:
             journal.sync_proposals(gone, self._clock())
 
@@ -219,6 +226,12 @@ class ProposalDesk:
             raise ApprovalRefused("this account may not decide project-intelligence proposals")
         viewer, single, execute_on = access
         run_exec = decision == "approve" and execute_on
+        if run_exec:           # a repeat answer for a settled proposal is idempotent, so only a new decision needs a slot
+            try:
+                awaiting = self.routes.board.get(pid, viewer.org_id).state == "awaiting_approval"
+            except pi.NotFound:
+                awaiting = False
+            run_exec = awaiting
         if run_exec and not self._slots.acquire(blocking=False):
             raise Busy("Several approved actions are still running. Try again in a moment.")
         started = False
@@ -240,6 +253,13 @@ class ProposalDesk:
             decided = p.state          # before the worker can claim it
             if run_exec and decided == "approved":
                 started = self._start(pid, viewer.org_id, on_done)
+                if not started:
+                    log.warning("rakazo bridge: an approved proposal could not be started")
+                    self.routes.mark_failed(pid, viewer.org_id, "StartError: could not start", only=("approved",))
+                    if on_done is not None:
+                        on_done()
+                    return {"ok": True, "state": "failed",
+                            "message": "Approved, but it could not be started; see the dashboard."}
         finally:
             if run_exec and not started:
                 self._slots.release()
@@ -256,6 +276,10 @@ class ProposalDesk:
             except Exception as exc:  # noqa: BLE001 - state is on the proposal; log the type only
                 log.warning("rakazo bridge: an approved proposal ended with %s", type(exc).__name__)
             finally:
+                try:      # never leave it "executing": whatever ended the worker, the proposal gets a final state
+                    self.routes.mark_failed(pid, org_id, "WorkerAborted: ended without a result", only=("executing",))
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("rakazo bridge: could not close out a proposal (%s)", type(exc).__name__)
                 self._slots.release()
                 try:
                     if on_done is not None:

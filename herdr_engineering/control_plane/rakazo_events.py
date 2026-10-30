@@ -290,7 +290,7 @@ class ThreadJournal:
         approval, ``run.cancelled`` for a rejection or expiry) and a short outcome message is posted."""
         for card in cards:
             old = self.proposals.get(card["id"])
-            if old is not None and old["state"] == card["state"]:
+            if old is not None and old["state"] == card["state"] and old["outcome"] == card["outcome"]:
                 continue
             first = old is None
             self.proposals[card["id"]] = card
