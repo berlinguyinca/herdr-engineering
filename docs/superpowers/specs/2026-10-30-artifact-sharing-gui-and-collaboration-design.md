@@ -81,8 +81,7 @@ a static list in `collab_mcp.py`. Artifact collaboration is therefore added as M
 routes, and no new token type is introduced.
 
 **Who is a collaborator.** An existing collab *agent* (internal agent, or an external agent redeemed through an
-invite) that the owner grants access to one artifact. New table `artifact_collaborators(artifact_id, agent_id,
-permission read|write, granted_by, created_at, expires_at, revoked_at, last_used_at)`. The GUI's Collaborators section
+invite) that the owner grants access to one artifact. New table grants stored as `artifact_acl` rows for principal `collab:<agent_id>` (see second builder check). The GUI's Collaborators section
 lists the agents the owner can see, grants read or write per artifact, can create an external-agent invite and grant it
 in one step, and revokes. Revocation takes effect on the next request.
 
@@ -250,6 +249,40 @@ Today the control plane is single-operator. This section makes it multi-user for
   render jobs to collide); adopting merge there is a follow-up.
 * **Network reach (resolved by the operator):** harnesses use the existing collaboration MCP server and its
   agent credentials; nothing new is exposed at the edge.
+
+## Second builder check: resolutions (my calls; operator may overrule)
+
+* **Who is the authority (agents, grants).** `collab-public` is authoritative for *who an agent is* (it authenticates
+  `hca_` credentials, knows revoked/expired/disabled). The control plane is authoritative for *what that agent may do*
+  (grants, ownership, quotas). Grants and the member list are mirrored *into* `collab-public` (files under `/sync`-style
+  read-only mount) so `tools_for` and reads work; the worker re-checks grants on every intent, and every intent carries
+  a timestamp the worker rejects after 60 s. Honest promise: revocation/disabling takes effect within seconds, not
+  instantly. `collab-public` also writes a read-only `agents.json` feed (agent id → owner user, status, external flag,
+  group membership) that the worker uses to confirm an agent is still active when applying an intent.
+* **Members have no web UI.** Members use the artifact skill / MCP tools only (as the operator described). Members'
+  own Feedback and history are read through MCP tools (`artifact_annotations`, `artifact_history`). Members do not
+  grant collaborators in v1; the operator does.
+* **Share URL travels back once.** The approve result for a member is written to a 0600 result file on the volume
+  shared only by the worker and `collab-public`, deleted on first read by the MCP tool and swept after 60 s. The token is
+  never stored in plain text elsewhere (the share row still holds only its hash).
+* **Ownership and permissions reuse what exists.** No `owner_principal` column: an artifact's owner is its existing
+  `created_by`. Member principal = `member:<cognito sub>`; collaborator grants are rows in the existing
+  `artifact_acl` for principal `collab:<agent_id>` (with `expires_at`); `artifact_collaborators` is dropped. Quotas and
+  last-used tracking live in a small `artifact_member_usage` table.
+* **Owner annotations.** The owner annotates through the lab link like any lab member (sign in with Cognito, owner's
+  email is added to the share's allow-list automatically). A capture path in the dashboard preview is a follow-up.
+* **Mirror contents.** Head version files plus the previous 5 versions' text files; manifests for all versions.
+  `artifact_read` of an older, unmirrored version returns a clear "not mirrored" error.
+
+## Delivery order (five plans, each shippable on its own)
+
+1. **Share panel GUI** (section A) + history view + "Restore this version". Front end on existing routes.
+2. **History model and merge engine**: migration (`parent_version_ids`, `created_via`, `artifact_collab_attempts`),
+   diff3 merge in `ArtifactStore`, per-parent lineage edges. Backend only.
+3. **Bridge and collaborators** (section B): mirror, intents queue + fast loop, grants via ACL, read/commit MCP
+   tools, owner CLI, Collaborators and Activity tabs.
+4. **Annotations** (section D).
+5. **Member-owned artifacts** (section E), last: it is the riskiest and depends on the bridge.
 
 ## Open for the builder
 
