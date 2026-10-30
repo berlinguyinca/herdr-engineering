@@ -631,5 +631,111 @@ timeout; the reply and any failure arrive as events.
 
 **Not supported** (answered `404 NOT_FOUND` in Rakazo's error shape so the app degrades per screen): push notifications
 (nothing is delivered while the app is closed), voice and calls, billing and the model/provider screens, groups,
+attachments, memory, routines, skills, connections, bot editing/archiving, and spaces other than "Herdr".
+`threads/send` does not deduplicate a retried `clientNonce`.
+
+### Board proposals on the phone (project intelligence)
+
+Pending project-intelligence **board proposals** (`ci_rerun`, `request_ci_repair`, `propose_issue`, `link_entities`,
+`pause_ingestion`) appear in the account's **first bot's thread** as an approve/reject card, so the operator can decide
+them from the phone. Code: `control_plane/rakazo_proposals.py` (`ProposalDesk`); the card and run shapes are in
+`rakazo_events.py`; the decision is `IntelligenceRoutes.decide_proposal`, the same function the dashboard route
+(`POST /intelligence/proposals/<id>/approve|reject`) calls, so flags, approver rules, project scope, the exact
+`payload_sha256` + `resource_version`, audit and the `ProposalExecutor` (a no-op unless `project_intelligence.execute`) are
+shared, not copied.
+
+**Fail closed.** Nothing is shown unless all of these hold, otherwise the app sees no card (the first reason that stops it
+is logged once per account, without ids or payload text):
+- `project_intelligence.enabled` and `suggest` are on and the kill switch is off;
+- the bridge account has a scope in `project_intelligence.assistant_viewers["<tenant>/rakazo:<account id>"]`
+  (`{org_id, projects, clearance}`), the scope its own assistant files proposals under. `default_org_id` is for the open
+  listener and is never used for the phone. Out-of-org and, for a project-scoped account, other-project proposals are never
+  listed and cannot be decided;
+- the account may decide: `control_plane.single_operator` is on, or the account's `rakazo:<account id>` is listed in
+  `project_intelligence.approvers`. Without single-operator mode the board's own rule still refuses a requester approving
+  its own proposal. In single-operator mode the bridge password alone approves, including a proposal that account's own
+  assistant filed (same trade-off as the tool approvals above).
+
+**Behaviour.** A cheap read of the in-memory board runs on every `threads/get|head|messages` and at most every 5 s while a
+`threads/subscribe` stream is open (no extra scheduler). One proposal is one card (keyed by proposal id). A new proposal
+also posts a short bot message in the thread. The card title is built only from fields that pass the executor's validation
+(for example `CI failed? Re-run owner/repo run 302`); anything that fails validation, any `propose_issue` body, and anything
+token-shaped is replaced by a generic line. The detail shows the expiry and whether approving runs the action. The app
+enables a card's buttons only while its run is `waiting_input`, so each pending card has a synthetic run
+(`run_proposal_<id>_<hash prefix>`); the answer must quote it, and the server uses the hash and version it recorded when it
+showed the card, never ones from the request. When a proposal is approved, rejected, expired, executed or failed the card
+turns answered, the run ends, and a one-line outcome (the recorded reason on failure) is posted. Answering the same way twice
+is a no-op ("Already approved"); the opposite answer after the fact, an expired proposal or a changed payload is refused
+(409).
+
+**Notes.** Names in `approvers` are matched against the bare principal id (`rakazo:<account id>`), not tenant-qualified. For
+`propose_issue` only the title reaches the phone (never the body), so approve issue proposals on the dashboard where the
+whole text is visible. A failed execution shows only the exception type and "see the dashboard", never its message. If the
+account loses its standing while a card is open (kill switch, `suggest` off, scope removed) the card is marked unavailable
+and its run ends. A request that wants a current view re-reads the board at most once a second.
+
+**Limits.** There is no push: a custom server cannot reach APNs, so the in-thread message appears the next time the thread is
+opened or streamed, not on the lock screen. Proposals live 30 minutes and the board and journal are both in memory, so a control-plane restart drops pending
+proposals (as on the dashboard). Only the first bot's thread carries cards. Approving executes in the request; a slow CI provider can outlast the app's
+8 s timeout, but execution is claimed once, so retrying is safe.
 attachments, memory, routines, skills, connections, bot editing/archiving, spaces other than "Herdr", and ActionBoard
 proposals (those stay on the dashboard). `threads/send` does not deduplicate a retried `clientNonce`.
+
+## Scheduled CI watch (assistant)
+
+`watch_ci` used to run only when the assistant model called it, so a failed CI run went unnoticed unless someone asked.
+`control_plane.personal_assistant.ci_watch` adds a deterministic server-side loop (no model, no routine) that calls it
+every `interval_seconds` (default 300, minimum 60; the first tick is jittered by up to 30 s) as the actor
+`system:ci_watch`. Each NEW failure becomes one `request_ci_repair` and one `ci_rerun` proposal on the intelligence board,
+one assistant `ci_repair` proposal and one dashboard notification; nothing is merged, pushed or restarted without an
+approval, and `project_intelligence.execute` still gates execution. Off unless `enabled: true`.
+
+Failure source. The deployed flow writes lineage `ci` nodes only from the graph merge gate's evidence writer, and those
+nodes carry a commit and a check but no repository or run number, so `watch_ci` could not alert from them. The watch
+therefore also reads the CI monitor's cached snapshot (`source: both`, the default): pipelines whose state is
+failure/error (not killed) with a full `owner/name` repository, with a hex commit, in the user's project scope (checked before the 100-row cap) and finished within `max_age_seconds` (default 6 h; rows with no timestamp are dropped). Only the scheduled runner uses this source: the manual/tool `watch_ci` path stays lineage-only. Both sources share one fingerprint (repo, run, head), so `both` never double-alerts, dedupe and proposal path.
+The repository must also be in `project_intelligence.webhook_projects` and in the user's scope, or the board refuses it
+(reported as a skipped reason, not an error).
+
+Per listed user a tick skips quietly (counted in status) when the assistant is disabled, project intelligence is
+disabled or on kill switch, the user has no `assistant_viewers["<tenant>/<user>"]` entry, or no enabled assistant
+exists (when `assistant_id` is omitted the oldest enabled one is used). A missing `watch_ci` grant logs one WARNING per
+user per hour and does nothing; with `auto_grant: true` the loop creates the standing grant itself (scope `*`, not
+preauthorized, at most `grant_max_ttl_seconds`; re-created, with an `auto_regranted` audit record, only after it EXPIRED. A revoked grant is never re-created: one hourly WARNING, skip reason `grant_revoked`) and writes an audit record
+`assistant.ci_watch.auto_granted` by `system:ci_watch`. One user failing never stops another; a tick has a time budget
+(`tick_budget_seconds`, default 60, also checked per row) and creates at most `max_new_per_tick` (default 10) proposals per user, the rest waiting for the next tick (`skipped_over_limit` in status); the thread stops with the server.
+
+Status: `GET /api/v1/intelligence/status` (operator) carries `ci_watch`: `last_at`, `ticks`, `created` (running total),
+`last_created`, `duplicates`, `skipped` (counts by fixed reason: `no_grant`, `no_scope`, `kill_switch`,
+`intelligence_disabled`, `assistant_disabled`, `no_assistant`, `budget_exceeded`, `error`), `last_error`
+(`user_failed` or `tick_failed`, never exception text) and a per-user result list.
+
+Restarts. Dedupe is by fingerprint over the assistant store. With `personal_assistant.persistence.dsn` set the proposals
+survive a restart and nothing is re-alerted. Without it the store is in memory and a restart can re-alert each current
+failure once. The board proposals themselves live in memory for 30 minutes by design, so a restart (or the lapse) means
+the board entry must be re-requested; the watch only does that for a failure it has not recorded.
+
+Turning it on for the dashboard user (the open tailnet listener is the principal `open-listener`, tenant `default`):
+
+```yaml
+control_plane:
+  personal_assistant:
+    enabled: true
+    ci_watch:
+      enabled: true
+      auto_grant: true          # or grant watch_ci (scope "*") once in the dashboard
+      users:
+        - {tenant_id: default, user_id: open-listener}
+  project_intelligence:
+    enabled: true
+    webhook_projects: {"owner/repo": ["project-id"]}
+    assistant_viewers:
+      "default/open-listener": {org_id: "<org>", projects: "*"}
+```
+
+For a Rakazo bridge account add `{tenant_id: default, user_id: "rakazo:<id>"}` and an `assistant_viewers` entry
+`"default/rakazo:<id>"`. The id is `rakazo:` plus the first 16 hex characters of
+`sha256("rakazo-bridge-account:" + lowercase(strip(email)))`. The server logs the ids at startup
+(`rakazo bridge assistant users: rakazo:...`, no email or secret), and an account must have created an assistant
+(opened the app once) before the watch has an assistant to act for. If `personal_assistant.tenancy.principals` maps the
+user to another tenant, use that tenant; the server logs a warning when the configured tenant disagrees.
