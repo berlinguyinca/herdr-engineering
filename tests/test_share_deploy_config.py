@@ -310,7 +310,7 @@ def test_operator_listener_refuses_the_share_network(share):
     assert "if ($hcn_from_edge = 0) { return 444; }" in public
     assert re.search(r"map \$realip_remote_addr \$hcn_from_edge \{ default 0; 192\.168\.137\.250 1; \}", conf)
     assert re.findall(r"set_real_ip_from\s+([^;]+);", conf) == ["192.168.137.250"]
-    assert not ipaddress.ip_address("192.168.137.250") in subnet
+    assert ipaddress.ip_address("192.168.137.250") not in subnet
 
 
 # --------------------------------------------------------------------------------------- (c) compose lint
@@ -354,7 +354,9 @@ def test_web_and_worker_mount_the_shares_volume_and_the_command_stays_in_step():
     web, worker = base["services"]["control-plane-web"], base["services"]["control-plane-worker"]
     assert "${HERDR_SHARES_DIR:?run deploy.sh}:/shares" in web["volumes"]
     assert "${HERDR_SHARES_DIR:?run deploy.sh}:/shares" in worker["volumes"]
-    assert "${HERDR_SHARE_EVENTS_DIR:?run deploy.sh}:/share-events:ro" in worker["volumes"]
+    # read-write: the worker rotates share-public's events file (rename to .1, delete once drained)
+    assert "${HERDR_SHARE_EVENTS_DIR:?run deploy.sh}:/share-events" in worker["volumes"]
+    assert not any(v.startswith("${HERDR_SHARE_EVENTS_DIR") and v.endswith(":ro") for v in worker["volumes"])
     assert "herdr-cp-share-markers:/var/lib/herdr/share-markers" in worker["volumes"]
     assert "herdr-cp-share-markers" in base["volumes"]
     assert not any("/share-events" in v for v in web["volumes"])

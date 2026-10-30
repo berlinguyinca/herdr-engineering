@@ -84,8 +84,16 @@ edge (nginx, location ^~ /s/ only) -> herdr-share-public:8083 (network `share`, 
   sign in here and open lab shares; any listed client's token is accepted.
 - Mounts: bundles at `~/.local/share/herdr-engineering/shares` (web/worker read-write, share-public read-only);
   share-public's audit file `~/.local/share/herdr-engineering/share-events/events.jsonl` (its only writable
-  mount, 0644; the worker reads it read-only and keeps its ingest marker in the worker-only volume
-  `herdr-cp-share-markers`); the Cognito keys from the collab-sync directory (read-only).
+  mount, 0644; the worker mounts the directory read-write, ingests the file every minute and rotates it past
+  4 MiB: rename to `events.jsonl.1`, which is read to its end and deleted on a later sweep once it has not been
+  written for 30 s; share-public's own 8 MiB cap is only reached when the worker is not running. The worker keeps
+  its ingest markers in the worker-only volume `herdr-cp-share-markers`); the Cognito keys from the collab-sync
+  directory (read-only).
+- Operator listener: the `share` network has a fixed subnet (`172.31.251.0/28`, compose.collab.yaml) and the
+  edge's port-8082 server (the no-sign-in operator API) denies it, so share-public cannot reach the operator API
+  by setting `Host` itself. Keep the subnet and the `deny` in `collab-edge/nginx.conf` in step (a test checks it).
+  If a `herdr-control-plane_share` network already exists without that subnet, compose refuses to reuse it:
+  remove it (with collab-edge stopped) and redeploy.
   `control_plane.share.shares_dir`, `events_dir` and `marker_dir` must stay at their defaults (`/shares`,
   `/share-events`, `/var/lib/herdr/share-markers`) or be left out: render-share refuses other values.
 - Host permissions: the bundle tree is world-readable (0755 dirs, 0644 files) and the events file is 0644,

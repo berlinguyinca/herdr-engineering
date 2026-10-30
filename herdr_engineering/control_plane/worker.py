@@ -24,7 +24,6 @@ ARTIFACT_TTL = 3600.0
 
 SHARE_INTERVAL = 60.0
 SHARE_ORPHAN_GRACE = 3600.0  # never touch a share directory modified within this window (in-flight approve)
-_SHARE_INGEST_ROUNDS = 64  # each round reads at most 16 MiB
 _TOKEN_DIR = re.compile(r"[0-9a-f]{64}\Z")
 _SHARE_DIR = re.compile(r"share_[0-9a-f]{24}\Z")
 
@@ -94,11 +93,9 @@ async def share_housekeeping(store, shares_root: Path, events_path: Path, now: f
     result = {"expired": 0, "ingested": 0, "orphans_removed": 0}
     result["expired"] = await _sweep_expired(store, shares_root, now)
     try:
-        for _ in range(_SHARE_INGEST_ROUNDS):
-            count = await store.ingest_events_file(events_path, marker_path=marker_path)
-            if not count:
-                break
-            result["ingested"] += count
+        # reads events.jsonl (and a pending events.jsonl.1) to the end and rotates it past EVENTS_ROTATE_BYTES:
+        # share-public drops lines once the file reaches its cap, so an unrotated file would silence audit
+        result["ingested"] = await store.ingest_and_rotate_events(events_path, marker_path=marker_path, now=now)
     except Exception:  # noqa: BLE001
         log.exception("share events ingest failed")
     try:

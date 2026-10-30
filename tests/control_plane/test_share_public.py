@@ -612,6 +612,28 @@ def test_events_file_cap_drops_and_counts(env, monkeypatch):
     assert all(ShareStore._parse_line(raw) for raw in env.event_lines())
 
 
+def test_events_file_follows_the_workers_rotation(env, monkeypatch, caplog):
+    """The worker renames events.jsonl to .1; the next append creates a fresh, readable file (O_CREAT per append),
+    and a full file is reported through the rate-limited log, not once per dropped line."""
+    import stat as st
+    env.clock[0] += 1
+    env.request("GET", f("index.html"))
+    assert env.events.exists()
+    os.rename(env.events, env.events.with_name("events.jsonl.1"))
+    env.clock[0] += 1
+    env.request("GET", f("index.html"))
+    assert env.events.exists() and st.S_IMODE(env.events.stat().st_mode) == 0o644
+    assert len(env.event_lines()) == 1
+    monkeypatch.setattr(share_public, "EVENTS_MAX_BYTES", 1)
+    share_public._log_limiter._windows.clear()
+    with caplog.at_level("WARNING", logger="herdr.share_public"):
+        for _ in range(share_public.LOG_PER_MINUTE + 15):
+            env.clock[0] += 1
+            env.request("GET", f("index.html"))
+    full = [r for r in caplog.records if "events file is full" in r.getMessage()]
+    assert 0 < len(full) <= share_public.LOG_PER_MINUTE
+
+
 def test_errors_never_log_the_token(env, capfd, monkeypatch):
     def boom(*a, **k):
         raise RuntimeError("kaboom " + TOKEN)
