@@ -42,7 +42,7 @@ DEFAULTS = {"max_share_bytes": 512 * 1024 * 1024, "max_files": 20000, "max_total
 PREVIEW_NAME = "preview.html"
 LISTED_FILES = 200
 MAX_DAYS = 3650
-CREATE_FIELDS = {"version_id", "audience", "allow_emails", "allow_groups", "expires_in_days", "entry", "title"}
+CREATE_FIELDS = {"version_id", "audience", "allow_emails", "allow_groups", "expires_in_days", "entry", "title", "room_id"}
 # Serialises approvals in this process: the live-bytes budget is read, then spent, and a bundle directory is created.
 _APPROVE_LOCK = threading.Lock()
 
@@ -273,6 +273,22 @@ def approve_share(server, share: dict, *, approved_by: str | None = None) -> tup
 # ------------------------------------------------------------------------------------------------ routes
 
 
+def _room_emails(server, audience, room_id, extra):
+    """``room_id`` shares with the people in that room: their sign-in emails, as they are NOW, join the lab allow-list.
+    Nobody who joins later is added (create a new share); the link is still the lab link, behind Cognito sign-in."""
+    if audience != "lab":
+        raise ValueError("room_id only applies to a lab share")
+    if not isinstance(room_id, str) or not room_id:
+        raise ValueError("room_id must be a room id")
+    collab = getattr(server, "collab", None)
+    emails = collab.room_member_emails(room_id) if collab is not None else []
+    if not emails:
+        raise ValueError("that room has no members with a known email, or collaboration is off")
+    if extra is not None and not (isinstance(extra, list) and all(isinstance(e, str) for e in extra)):
+        raise ValueError("allow_emails must be a list of emails")
+    return sorted({*emails, *(extra or [])})
+
+
 def _create(handler, server, artifact_id):
     body = _share_body(handler, CREATE_FIELDS)
     version_id, audience = body.get("version_id"), body.get("audience")
@@ -289,9 +305,12 @@ def _create(handler, server, artifact_id):
         raise ValueError("entry must be a string")
     if title is not None and (not isinstance(title, str) or len(title) > 240):
         raise ValueError("title must be a string of up to 240 characters")
+    allow_emails = body.get("allow_emails")
+    if body.get("room_id") is not None:
+        allow_emails = _room_emails(server, audience, body["room_id"], allow_emails)
     files, chosen, warnings = _plan(server, artifact_id, version_id, entry)
     row = _call(server.share_store, "create", artifact_id=artifact_id, version_id=version_id, audience=audience,
-                allow_emails=body.get("allow_emails"), allow_groups=body.get("allow_groups"),
+                allow_emails=allow_emails, allow_groups=body.get("allow_groups"),
                 expires_at=expires_at, entry=entry, title=title, created_by=handler._resource_principal())
     handler._json({"share": _jsonable(row),
                    "summary": _summary(files, chosen, warnings, audience, row.get("expires_at"))}, 201)

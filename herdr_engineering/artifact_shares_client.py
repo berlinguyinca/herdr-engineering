@@ -199,8 +199,10 @@ def _check_pool(args, emails):
 
 def _validate_create(args):
     emails, groups = args.email or [], args.group or []
-    if args.audience == "lab" and not (emails or groups):
-        return "audience lab needs at least one --email or --group"
+    if args.room and args.audience != "lab":
+        return "--room only applies to --audience lab"
+    if args.audience == "lab" and not (emails or groups or args.room):
+        return "audience lab needs at least one --email, --group or --room"
     if args.audience == "public" and (emails or groups):
         return "audience public cannot have --email/--group; use --audience lab to restrict recipients"
     for e in emails:
@@ -256,6 +258,8 @@ def run_command(args):
                 body["allow_emails"] = args.email
             if args.group:
                 body["allow_groups"] = args.group
+            if args.room:
+                body["room_id"] = args.room
             if args.expires_in_days is not None:
                 body["expires_in_days"] = args.expires_in_days
             if args.entry:
@@ -356,6 +360,7 @@ def configure_parser(parser):
             c.add_argument("--audience", choices=("lab", "public"), required=True)
             c.add_argument("--email", action="append", help="lab recipient email (repeatable)")
             c.add_argument("--group", action="append", help="lab recipient group (repeatable)")
+            c.add_argument("--room", help="lab only: also allow the people in this room as they are now (not later joiners)")
             c.add_argument("--expires-in-days", type=int, help=f"1..{MAX_DAYS}; public links default to the server's 30")
             c.add_argument("--entry")
             c.add_argument("--title")

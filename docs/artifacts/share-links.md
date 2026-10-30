@@ -7,7 +7,7 @@ registry can open. Nothing is exposed until the owner approves it, and approval 
 
 - **private** (default): no share exists; only the registry's normal access rules apply.
 - **lab**: the link opens only after Cognito sign-in, and only for the emails and groups on the allow-list
-  (`--email`, `--group`, at least one required). Recipients see the Cognito sign-in page, then the artifact.
+  (`--email`, `--group` or `--room`, at least one required; `--room ROOM` adds the sign-in emails of the people in that room as they are when you create the share, nobody who joins later). Recipients see the Cognito sign-in page, then the artifact.
   They need a Cognito account; `--check-pool` warns about emails that have none (never blocks). Emails must be
   ASCII. A sign-in lasts until the recipient's Cognito access token expires (about 1 hour with the pool's
   defaults; `control_plane.share.session_seconds`, default 4 h, is only an upper cap), then they open the link
@@ -48,7 +48,7 @@ Commands (all take `--control-plane` and `--api-key-env`, the NAME of the variab
 
 | Command | Purpose |
 | --- | --- |
-| `share create ARTIFACT VERSION --audience lab\|public [--email E]... [--group G]... [--expires-in-days N] [--entry PATH] [--title T] [--check-pool [--pool-id ID \| --fleet-config FILE]] [--json]` | Make a pending share and print its exposure summary. |
+| `share create ARTIFACT VERSION --audience lab\|public [--email E]... [--group G]... [--room ROOM] [--expires-in-days N] [--entry PATH] [--title T] [--check-pool [--pool-id ID \| --fleet-config FILE]] [--json]` | Make a pending share and print its exposure summary. |
 | `share show ARTIFACT SHARE_ID [--json]` | Re-print the share and, while pending, the current exposure summary. |
 | `share approve ARTIFACT SHARE_ID [--yes] [--json]` | Print the summary, confirm, go live, print the URL once. |
 | `share list ARTIFACT` | JSON list of the artifact's shares. |
