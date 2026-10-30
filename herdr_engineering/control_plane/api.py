@@ -638,6 +638,7 @@ class ControlPlaneServer:
             self.assistant.artifact_writer = draft_writer_hook(self)
             self.assistant.ci_board_request = self.intelligence.assistant_ci_repair
             self.assistant.ci_rerun_request = self.intelligence.assistant_ci_rerun
+            self.assistant.ci_repo_scope = self.intelligence.assistant_repo_in_scope
             self.assistant.ci_snapshot = lambda: self.ci_monitor.snapshot(start=False)   # cache read, no provider call
             from .assistant import ci_watch_config
             from .ci_watch import CIWatchRunner

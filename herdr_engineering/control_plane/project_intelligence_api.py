@@ -163,6 +163,15 @@ class IntelligenceRoutes:
         entry = (raw.get("assistant_viewers") or {}).get(f"{tenant_id}/{user_id}")
         return "ok" if isinstance(entry, dict) and self._viewer_from_entry(entry) is not None else "no_scope"
 
+    def assistant_repo_in_scope(self, tenant_id: str, user_id: str, repo: str) -> bool:
+        """Would ``assistant_ci_repair`` accept this repository for this user? (Same rule, no side effect.)"""
+        cfg, raw = self._cfg()
+        entry = (raw.get("assistant_viewers") or {}).get(f"{tenant_id}/{user_id}")
+        viewer = self._viewer_from_entry(entry) if isinstance(entry, dict) else None
+        mapped = (raw.get("webhook_projects") or {}).get(repo) if isinstance(repo, str) else None
+        return bool(cfg["enabled"] and viewer is not None and isinstance(mapped, list) and mapped
+                    and (viewer.project_ids is None or set(mapped) <= viewer.project_ids))
+
     def assistant_ci_rerun(self, tenant_id: str, user_id: str, payload: dict, idempotency_key: str) -> dict:
         """Same scope rules as ``assistant_ci_repair``, queuing a ``ci_rerun`` proposal (restart that CI run)."""
         return self.assistant_ci_repair(tenant_id, user_id, payload, idempotency_key, action="ci_rerun")

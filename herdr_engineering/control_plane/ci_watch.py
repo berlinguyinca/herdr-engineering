@@ -36,10 +36,13 @@ class CIWatchRunner:
         self._rng = rng or random.Random()
         self.stop_event = threading.Event()
         self._lock = threading.Lock()
+        self._deadline = 0.0
+        self._over_limit = 0
+        self._stopped_early = False
         self._warned: dict[tuple[str, str, str], float] = {}
         self._status: dict[str, Any] = {"enabled": bool(config.get("enabled")), "interval_seconds": config["interval_seconds"],
                                          "auto_grant": config["auto_grant"], "last_at": None, "ticks": 0, "created": 0,
-                                         "duplicates": 0, "skipped": {}, "last_error": None, "users": []}
+                                         "duplicates": 0, "skipped": {}, "skipped_over_limit": 0, "last_error": None, "users": []}
 
     # ------------------------------------------------------------------ loop
     def run(self) -> None:
@@ -62,10 +65,12 @@ class CIWatchRunner:
     def tick(self) -> dict[str, Any]:
         """Run every configured user once. Never raises."""
         created = duplicates = 0
+        self._over_limit = 0
+        self._stopped_early = False
         skipped: dict[str, int] = {}
         per_user: list[dict[str, Any]] = []
         last_error: str | None = None
-        deadline = self._clock() + self.config["tick_budget_seconds"]
+        deadline = self._deadline = self._clock() + self.config["tick_budget_seconds"]
         try:
             for u in self.config["users"]:
                 if self.stop_event.is_set():
@@ -89,12 +94,15 @@ class CIWatchRunner:
         except Exception:  # noqa: BLE001 - never raise out of the loop
             last_error = "tick_failed"
             log.exception("ci_watch: tick failed")
+        if self._stopped_early and not self.stop_event.is_set():
+            skipped["budget_exceeded"] = skipped.get("budget_exceeded", 0) + 1
         with self._lock:
             st = self._status
             st.update(last_at=datetime.now(UTC).isoformat(timespec="seconds"), ticks=st["ticks"] + 1,
                       created=st["created"] + created, duplicates=duplicates, skipped=skipped,
                       last_error=last_error, users=per_user)
             st["last_created"] = created
+            st["skipped_over_limit"] = self._over_limit
         return self.status()
 
     def _warn_once(self, kind: str, u: dict[str, str], message: str) -> None:
@@ -125,12 +133,28 @@ class CIWatchRunner:
                 self._warn_once("grant", u, "ci_watch: %s/%s has no active watch_ci grant (scope *); grant it, or set "
                                             "ci_watch.auto_grant: true. Skipped")
                 return "no_grant", 0, 0
+            past = [g for g in svc.store.list_grants(tenant_id=tenant, user_id=user, assistant_id=aid)
+                    if g.tool_id == "watch_ci"]
+            if any(g.revoked_at is not None for g in past):
+                self._warn_once("revoked", u, "ci_watch: the watch_ci grant of %s/%s was revoked; auto_grant will not "
+                                              "re-create it. Grant it again by hand to resume. Skipped")
+                return "grant_revoked", 0, 0
             g = svc.grant_tool(tenant_id=tenant, user_id=user, assistant_id=aid, tool_id="watch_ci", scope="*")
-            svc.store.audit_record(tenant_id=tenant, user_id=user, actor=ACTOR, action="assistant.ci_watch.auto_granted",
-                                   subject_id=g.grant_id, detail="standing watch_ci grant created by ci_watch.auto_grant")
-            log.info("ci_watch: created a standing watch_ci grant for %s/%s (auto_grant)", tenant, user)
+            action = "assistant.ci_watch.auto_regranted" if past else "assistant.ci_watch.auto_granted"
+            svc.store.audit_record(tenant_id=tenant, user_id=user, actor=ACTOR, action=action,
+                                   subject_id=g.grant_id,
+                                   detail="standing watch_ci grant " + ("re-created after it expired" if past else "created")
+                                          + " by ci_watch.auto_grant")
+            log.info("ci_watch: %s a standing watch_ci grant for %s/%s (auto_grant)",
+                     "re-created" if past else "created", tenant, user)
+        deadline = self._deadline
         out = svc.watch_ci(tenant_id=tenant, user_id=user, assistant_id=aid, actor=ACTOR,
-                           source=self.config["source"], max_age_seconds=self.config["max_age_seconds"])
+                           source=self.config["source"], max_age_seconds=self.config["max_age_seconds"],
+                           max_new=self.config["max_new_per_tick"],
+                           should_stop=lambda: self.stop_event.is_set() or self._clock() > deadline)
+        self._over_limit += int(out.get("over_limit") or 0)
+        if out.get("stopped"):
+            self._stopped_early = True
         return "ok", len(out.get("created") or []), int(out.get("duplicates") or 0)
 
     def _assistant_id(self, u: dict[str, str]) -> str | None:

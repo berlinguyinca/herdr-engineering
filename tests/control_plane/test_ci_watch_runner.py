@@ -2,7 +2,7 @@
 import logging
 import threading
 import time
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -33,6 +33,7 @@ class World:
         self.svc = AssistantService(config=cfg, now=lambda: NOW)
         self.svc.ci_board_request = self.routes.assistant_ci_repair
         self.rows = [dict(FAILED)]
+        self.svc.ci_repo_scope = self.routes.assistant_repo_in_scope
         self.svc.ci_snapshot = lambda: {"pipelines": {"o/r": list(self.rows)}}
         self.assistants = {u: self.svc.create_assistant(tenant_id="t", user_id=u, name="A") for u in users}
         self.runner = CIWatchRunner(self.svc, self.routes.assistant_scope_state, cfg["ci_watch"])
@@ -231,3 +232,96 @@ def test_the_server_starts_the_watch_and_shutdown_joins_it_cleanly():
     started = time.monotonic()
     server.shutdown()
     assert server.ci_watch.stop_event.is_set() and time.monotonic() - started < 5
+
+
+# ---- review fixes ------------------------------------------------------------------------------------------------
+
+def test_the_manual_tool_path_ignores_the_monitor_snapshot():
+    cfg = assistant_config({"personal_assistant": {"enabled": True}})          # no ci_watch section
+    svc = AssistantService(config=cfg, now=lambda: NOW)
+    routes = IntelligenceRoutes(section_fn=lambda: {
+        "enabled": True, "webhook_projects": {"o/r": ["p1"]},
+        "assistant_viewers": {"t/key:u1": {"org_id": "org1", "projects": "*"}}})
+    svc.ci_board_request = routes.assistant_ci_repair
+    svc.lineage_read = lambda *_: {"data": {"nodes": []}}
+    old = NOW.timestamp() - 90 * 86400
+    svc.ci_snapshot = lambda: {"pipelines": {"o/r": [{**FAILED, "run_number": i, "finished": old} for i in range(5)]
+                                             + [dict(FAILED, run_number=99)]}}
+    a = svc.create_assistant(tenant_id="t", user_id="key:u1", name="A")
+    svc.grant_tool(tenant_id="t", user_id="key:u1", assistant_id=a.assistant_id, tool_id="watch_ci", scope="*")
+    out = svc.watch_ci(tenant_id="t", user_id="key:u1", assistant_id=a.assistant_id, actor="key:u1")
+    assert out["created"] == [] and not svc.store.proposals
+    # an explicit monitor request without max_age still gets a finite age bound
+    out = svc.watch_ci(tenant_id="t", user_id="key:u1", assistant_id=a.assistant_id, actor="x", source="monitor")
+    assert len(out["created"]) == 1 and out["scanned"] == 1
+
+
+def test_scope_is_applied_before_the_row_cap():
+    w = World()
+    w.grant()
+    w.section["webhook_projects"].update({f"o/x{i}": ["p9"] for i in range(150)})
+    w.section["assistant_viewers"]["t/key:u1"] = {"org_id": "org1", "projects": ["p1"]}
+    w.rows = [dict(FAILED, repository=f"o/x{i}", run_number=i + 1) for i in range(150)] + [dict(FAILED)]
+    st = w.runner.tick()
+    assert st["last_created"] == 1
+    (p,) = w.svc.store.proposals.values()
+    assert p.payload["repo"] == "o/r"
+
+
+def test_a_per_tick_create_limit_leaves_the_rest_for_the_next_tick():
+    w = World(max_new_per_tick=3)
+    w.grant()
+    w.rows = [dict(FAILED, run_number=i + 1) for i in range(5)]
+    st = w.runner.tick()
+    assert st["last_created"] == 3 and st["skipped_over_limit"] == 2
+    st = w.runner.tick()
+    assert st["last_created"] == 2 and st["skipped_over_limit"] == 0 and len(w.svc.store.proposals) == 5
+
+
+def test_auto_grant_does_not_undo_a_revocation(caplog):
+    w = World(auto_grant=True)
+    g = w.grant()
+    w.svc.revoke_grant(g.grant_id, tenant_id="t", user_id="key:u1")
+    with caplog.at_level(logging.WARNING):
+        w.runner.tick()
+        st = w.runner.tick()
+    assert st["skipped"] == {"grant_revoked": 1} and len(w.svc.store.grants) == 1 and not w.svc.store.proposals
+    assert len([r for r in caplog.records if "was revoked" in r.getMessage()]) == 1
+
+
+def test_auto_grant_recreates_an_expired_grant_with_an_audit_record():
+    clock = {"now": NOW}
+    w = World(auto_grant=True)
+    w.svc.now = lambda: clock["now"]
+    w.runner.tick()
+    (first,) = w.svc.store.grants.values()
+    clock["now"] = first.expires_at + timedelta(seconds=1)
+    w.rows = [dict(FAILED, finished=clock["now"].timestamp() - 5, run_number=40)]
+    w.runner.tick()
+    assert len(w.svc.store.grants) == 2
+    assert [e["action"] for e in w.svc.store.audit if e["action"].startswith("assistant.ci_watch.auto_")] == [
+        "assistant.ci_watch.auto_granted", "assistant.ci_watch.auto_regranted"]
+
+
+def test_both_sources_do_not_double_alert_and_bad_rows_are_dropped():
+    w = World()
+    w.grant()
+    w.svc.lineage_read = lambda *_: {"data": {"nodes": [
+        {"id": "ci:node", "state": "failed", "attrs": {"repo": "o/r", "run": 12, "head": "a" * 40}}]}}
+    w.rows = [dict(FAILED),                                              # same failure as the lineage node
+              dict(FAILED, run_number=20, finished=None, created=None),  # unknown time: too old
+              dict(FAILED, run_number=21, state="killed"),               # killed is not a failure
+              dict(FAILED, run_number=22, commit="not-hex!"),            # bad head
+              dict(FAILED, run_number=23, commit="a" * 65)]
+    st = w.runner.tick()
+    assert st["last_created"] == 1 and st["duplicates"] == 1 and len(w.svc.store.proposals) == 1
+
+
+def test_the_deadline_is_checked_inside_the_row_loop():
+    w = World()
+    w.grant()
+    w.rows = [dict(FAILED, run_number=i + 1) for i in range(5)]
+    seen = iter([False, False, True])
+    out = w.svc.watch_ci(tenant_id="t", user_id="key:u1", assistant_id=w.assistants["key:u1"].assistant_id,
+                         actor="x", source="monitor", should_stop=lambda: next(seen, True))
+    assert len(out["created"]) == 2 and out["stopped"] is True

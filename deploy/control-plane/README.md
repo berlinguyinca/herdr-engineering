@@ -646,8 +646,7 @@ approval, and `project_intelligence.execute` still gates execution. Off unless `
 Failure source. The deployed flow writes lineage `ci` nodes only from the graph merge gate's evidence writer, and those
 nodes carry a commit and a check but no repository or run number, so `watch_ci` could not alert from them. The watch
 therefore also reads the CI monitor's cached snapshot (`source: both`, the default): pipelines whose state is
-failure/error/killed with a full `owner/name` repository, finished within `max_age_seconds` (default 6 h, so turning it
-on does not alert on old history). Both sources share one fingerprint (node, repo, run, head), dedupe and proposal path.
+failure/error (not killed) with a full `owner/name` repository, with a hex commit, in the user's project scope (checked before the 100-row cap) and finished within `max_age_seconds` (default 6 h; rows with no timestamp are dropped). Only the scheduled runner uses this source: the manual/tool `watch_ci` path stays lineage-only. Both sources share one fingerprint (repo, run, head), so `both` never double-alerts, dedupe and proposal path.
 The repository must also be in `project_intelligence.webhook_projects` and in the user's scope, or the board refuses it
 (reported as a skipped reason, not an error).
 
@@ -655,9 +654,9 @@ Per listed user a tick skips quietly (counted in status) when the assistant is d
 disabled or on kill switch, the user has no `assistant_viewers["<tenant>/<user>"]` entry, or no enabled assistant
 exists (when `assistant_id` is omitted the oldest enabled one is used). A missing `watch_ci` grant logs one WARNING per
 user per hour and does nothing; with `auto_grant: true` the loop creates the standing grant itself (scope `*`, not
-preauthorized, at most `grant_max_ttl_seconds`, re-created after it lapses) and writes an audit record
+preauthorized, at most `grant_max_ttl_seconds`; re-created, with an `auto_regranted` audit record, only after it EXPIRED. A revoked grant is never re-created: one hourly WARNING, skip reason `grant_revoked`) and writes an audit record
 `assistant.ci_watch.auto_granted` by `system:ci_watch`. One user failing never stops another; a tick has a time budget
-(`tick_budget_seconds`, default 60); the thread stops with the server.
+(`tick_budget_seconds`, default 60, also checked per row) and creates at most `max_new_per_tick` (default 10) proposals per user, the rest waiting for the next tick (`skipped_over_limit` in status); the thread stops with the server.
 
 Status: `GET /api/v1/intelligence/status` (operator) carries `ci_watch`: `last_at`, `ticks`, `created` (running total),
 `last_created`, `duplicates`, `skipped` (counts by fixed reason: `no_grant`, `no_scope`, `kill_switch`,
