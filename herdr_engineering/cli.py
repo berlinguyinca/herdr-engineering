@@ -769,6 +769,8 @@ def _build_parser() -> argparse.ArgumentParser:
                     help="control-plane base URL (default: host.json control_plane_url)")
     p2.add_argument("--interval", type=float, default=0,
                     help="seconds between snapshot reads (default: 0 = once)")
+    p2.add_argument('--allow-open', action='store_true',
+                    help='Allow publication without a key to an intentionally open trusted-network server')
     p2.set_defaults(func=_cmd_cp_feed_pi)
     p2 = csub.add_parser("mission-feed", help="publish read-only live Pi mission activity")
     p2.add_argument("--control-plane", default=None,
@@ -806,7 +808,7 @@ def _cmd_cp_feed_pi(args) -> int:
     from .control_plane.pi_snapshot import post_envelopes, snapshot_to_envelopes
     from .host_config import HostConfigUnavailable, resolve_control_plane
 
-    if not os.environ.get("HERDR_CP_INGEST_KEY", "").strip():
+    if not os.environ.get("HERDR_CP_INGEST_KEY", "").strip() and not args.allow_open:
         print("Set HERDR_CP_INGEST_KEY to an ingest-role API key", file=sys.stderr)
         return 2
     if not math.isfinite(args.interval) or args.interval < 0 or args.interval > 2 ** 31 - 1:
@@ -817,6 +819,7 @@ def _cmd_cp_feed_pi(args) -> int:
     except HostConfigUnavailable:
         print("Set --url or configure host.json control_plane_url", file=sys.stderr)
         return 2
+    previous_payloads = None
     while True:
         try:
             doc = json.loads(Path(args.snapshot).expanduser().read_text(encoding="utf-8"))
@@ -826,7 +829,11 @@ def _cmd_cp_feed_pi(args) -> int:
             print("Cannot read a valid Pi snapshot; check --snapshot and its schema", file=sys.stderr)
             return 2
         try:
-            posted = post_envelopes(url, None, envelopes)
+            payloads = [{key: value for key, value in envelope.items() if key != 'occurred_at'}
+                        for envelope in envelopes]
+            posted = (0 if previous_payloads == payloads else
+                      post_envelopes(url, None, envelopes, allow_open=args.allow_open))
+            previous_payloads = payloads
         except (ValueError, RuntimeError):
             print("Snapshot ingest failed; check --url and HERDR_CP_INGEST_KEY", file=sys.stderr)
             return 1
@@ -2906,11 +2913,17 @@ def _cp_config(fleet_config_path=None) -> dict:
         path = Path(fleet_config_path).expanduser()
         if path.exists():
             try:
-                dsn = load_fleet_config(path).section("control_plane").get("pg_dsn")
+                section = load_fleet_config(path).section("control_plane")
             except FleetConfigError as exc:
                 raise SystemExit(f"--fleet-config: {exc}") from None
+            dsn = section.get("pg_dsn")
             if dsn:
                 out["postgres_dsn"] = str(dsn)
+            # The worker writes render output to RustFS: take its endpoint and credentials from the
+            # fleet file too, or it falls back to the image's defaults and is refused (InvalidAccessKeyId).
+            for key in ("rustfs_endpoint", "rustfs_bucket", "rustfs_region", "minio_user", "minio_password"):
+                if section.get(key):
+                    out[key] = str(section[key])
     return out
 
 
@@ -3643,6 +3656,45 @@ def _inspector_snapshot_settings(cp) -> tuple[bool, float]:
     return raw.get("enabled") is True, float(interval)
 
 
+def _fabric_compaction_settings(cp):
+    """``control_plane.fabric_compaction`` as CompactionSettings. Off unless ``enabled`` is exactly true, and a dry run
+    (counts only) unless ``dry_run`` is exactly false."""
+    from .control_plane.fabric_compaction import CompactionSettings
+    raw = (cp or {}).get("fabric_compaction") or {}
+    if not isinstance(raw, dict):
+        raise SystemExit("fleet config control_plane.fabric_compaction must be a mapping")
+
+    def number(key, default, minimum):
+        value = raw.get(key, default)
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or value < minimum:
+            raise SystemExit(f"fleet config control_plane.fabric_compaction.{key} must be a number >= {minimum}")
+        return float(value)
+    retention = raw.get("archive_retention_days", 30)
+    if retention is not None:
+        retention = number("archive_retention_days", 30, 1)
+    return CompactionSettings(
+        enabled=raw.get("enabled") is True, dry_run=raw.get("dry_run") is not False,
+        interval_seconds=number("interval_seconds", 3600, 60), min_age_days=number("min_age_days", 2, 1),
+        batch_rows=int(number("batch_rows", 250_000, 1000)), archive_retention_days=retention,
+        rebuild_checkpoint=raw.get("rebuild_checkpoint") is not False)
+
+
+def _worker_fabric_compactor(fleet_config_path):
+    """The fabric compactor when the fleet file enables it, else None."""
+    from pathlib import Path
+
+    from .control_plane.fabric_compaction import FabricCompactor
+    from .fleet_config import FleetConfigError, load_fleet_config
+    if not fleet_config_path or not Path(fleet_config_path).expanduser().exists():
+        return None
+    try:
+        cp = load_fleet_config(Path(fleet_config_path).expanduser()).section("control_plane")
+    except FleetConfigError as exc:
+        raise SystemExit(f"--fleet-config: {exc}") from None
+    settings = _fabric_compaction_settings(cp)
+    return FabricCompactor(settings) if settings.enabled else None
+
+
 def _maybe_pg_source(dsn, *, inspector_snapshots=False):
     """Build a PostgresSource from a DSN, or None if not provided."""
     if not dsn:
@@ -3751,11 +3803,14 @@ def _cmd_cp_worker(args) -> int:
             runner = render_runner if render_runner is not None else None
             worker_id = args.host_id or socket.gethostname()
             snapshotter = _worker_snapshot_writer(getattr(args, "fleet_config", None))
+            compactor = _worker_fabric_compactor(getattr(args, "fleet_config", None))
             if args.once:
                 return await run_one_pass(conn, worker_id=worker_id,
-                                          artifact_job_runner=runner, inspector_snapshotter=snapshotter)
+                                          artifact_job_runner=runner, inspector_snapshotter=snapshotter,
+                                          fabric_compactor=compactor)
             await run_worker(conn, interval=args.interval, worker_id=worker_id,
-                             artifact_job_runner=runner, inspector_snapshotter=snapshotter)
+                             artifact_job_runner=runner, inspector_snapshotter=snapshotter,
+                             fabric_compactor=compactor)
             return None
         finally:
             await conn.close()

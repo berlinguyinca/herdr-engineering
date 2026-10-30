@@ -58,7 +58,8 @@ def _config(central, envfile, *files, fmt=None, extra_env=None):
     cmd += ["config"] + (["--format", fmt] if fmt else ["-q"])
     env = dict(os.environ, HERDR_CP_FLEET_DIR=str(central.parent),
                HERDR_LLM_SLICE_DIR=str(central.parent / "llm-proxy"), HERDR_CP_IMAGE_TAG="t",
-               HERDR_CP_GIT_COMMIT="t", **(extra_env or {}))
+               HERDR_CP_GIT_COMMIT="t", HERDR_CP_GITHUB_APP_DIR=str(central.parent / "github-app"),
+               HERDR_CP_PIPELINES_DIR=str(central.parent / "pipelines"), **(extra_env or {}))
     return subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=60)
 
 

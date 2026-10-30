@@ -10,17 +10,25 @@ was ingested.
 """
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import secrets
 import threading
 from collections.abc import Callable
+from dataclasses import asdict
 from contextlib import contextmanager
 from dataclasses import replace
 from datetime import datetime
 from typing import Any
 
-from .bridge import _LoopRunner
+from .agent_identity import (
+    AGENT_IDENTITY_LOCK,
+    AgentIdentityConflict,
+    AgentIdentityRegistry,
+    AgentIdentityVersionConflict,
+)
+from .bridge import _LoopRunner, _rebuild_events
 from .events import V2_COLUMNS, Event, EventStore
 
 log = logging.getLogger(__name__)
@@ -72,6 +80,8 @@ class DurableEventSink:
     existing asyncpg ``conn`` plus ``run`` (tests).
     """
 
+    verify_agent_identity_noop = True
+
     def __init__(self, dsn: str | None = None, *, conn: Any = None,
                  run: Callable | None = None,
                  events_table: str = "fabric_events"):
@@ -100,12 +110,14 @@ class DurableEventSink:
             log.exception("durable sink failed to persist event %s",
                           ev.get("event_id"))
 
-    def record_required(self, ev: dict) -> None:
+    def record_required(self, ev: dict) -> dict | None:
         """Persist a command receipt, propagating failure before side effects."""
         # The synchronous web server has concurrent request threads; asyncpg
         # permits one operation per connection, including reconnection.
         with self._write_lock:
             self._ensure_store()
+            if ev.get("entity_type") == "agent_identity":
+                return self._run(self._record_agent_identity(ev))
             event = _dict_to_event(ev)
             if (event.entity_type in {"scheduler_reservation", "scheduler_lease", "scheduler_observation"}
                     or event.event_type == "HostPolicyChanged"):
@@ -118,6 +130,62 @@ class DurableEventSink:
                     "durable event insert was not acknowledged "
                     "(event_id already stored)")
 
+    async def _record_agent_identity(self, ev: dict) -> dict:
+        """Validate global reservations and publish on the same database cut.
+
+        Independent processes can have older in-memory registries. Return the
+        acknowledged durable event rather than publishing a tentative local name.
+        """
+        if ev.get("event_type") != "agent_identity.updated":
+            raise ValueError("invalid private agent identity event type")
+        AgentIdentityRegistry().hydrate([ev])
+        conn = self._store._conn
+        # A waiter must read AFTER the previous lock holder commits, even if
+        # the connection's default isolation is repeatable read.
+        async with conn.transaction(isolation="read_committed"):
+            await conn.execute("SET LOCAL lock_timeout='5s'")
+            await conn.execute("SELECT pg_advisory_xact_lock($1)", AGENT_IDENTITY_LOCK)
+            rows = await conn.fetch("""
+                SELECT * FROM fabric_events
+                WHERE entity_type = 'agent_identity'
+                ORDER BY ingest_timestamp, sequence, event_id
+            """)
+            streams, _ = _rebuild_events([dict(row) for row in rows])
+            history = [event for stream in streams.values() for event in stream]
+            registry = AgentIdentityRegistry()
+            registry.hydrate(history, quarantine_conflicts=True, tolerate_version_resets=True)
+            identity, proposed = ev["entity_id"], ev["payload"]
+
+            def current_event():
+                for event in reversed(history):
+                    if event["entity_type"] != "agent_identity" or event["entity_id"] != identity:
+                        continue
+                    candidate = AgentIdentityRegistry()
+                    candidate.hydrate([event])
+                    if candidate.get(identity) == registry.get(identity):
+                        return copy.deepcopy(event)
+                raise ValueError("canonical agent identity has no durable acknowledgement")
+
+            if proposed["version"] == 1 and registry.get(identity) is not None:
+                if registry.is_conflicted(identity):
+                    raise AgentIdentityConflict("saved agent name is ambiguous; use its stable identity")
+                return current_event()
+            if proposed["version"] == 1:
+                registry.allocate(identity, proposed["display_name"])
+            else:
+                try:
+                    registry.rename(identity, proposed["display_name"], proposed["version"] - 1)
+                except AgentIdentityVersionConflict as error:
+                    error.current_event = current_event()
+                    error.current_conflicted = registry.is_conflicted(identity)
+                    raise
+                if registry.get(identity)["version"] < proposed["version"]:
+                    return current_event()  # A globally verified no-op never appends another event.
+            stored = _dict_to_event({**ev, "payload": copy.deepcopy(registry._records[identity])})
+            if not await self._store.append(stored):
+                raise EventAlreadyStored("durable log already holds this identity event")
+            normalized, _ = _rebuild_events([asdict(stored)])
+            return next(iter(normalized.values()))[0]
     @contextmanager
     def scheduler_admission(self):
         """Serialize admission across control-plane processes in PostgreSQL."""

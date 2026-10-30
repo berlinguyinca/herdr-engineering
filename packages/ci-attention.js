@@ -10,7 +10,7 @@ export const STUCK_QUEUED_MS = 30 * 60 * 1000;
 const DECISIVE_FAIL = new Set(['failure', 'error', 'killed']);
 const DECISIVE = new Set(['success', ...DECISIVE_FAIL]);   // canceled and skipped runs say nothing about the code
 const ACTIVE = new Set(['running', 'pending', 'blocked']);
-const SHOWN = 8;
+const SHOWN = 5;
 
 const list = (v) => (Array.isArray(v) ? v : []);
 const time = (v) => { const t = Date.parse(v); return Number.isFinite(t) ? t : NaN; };
@@ -103,19 +103,19 @@ function runningRow(x) {
     + `<span class="cia-meta">run #${esc(r.run_number)} · ${esc(r.state)} for ${esc(formatDuration(x.age))}</span>${x.stuck ? '<span class="cia-chip cia-chip--bad">looks stuck</span>' : x.blocked ? '<span class="cia-chip">waiting on approval or a dependency</span>' : ''}</li>`;
 }
 
-export function renderCiAttention(model, { open = new Set(), showAll = false } = {}) {
+export function renderCiAttention(model, { open = new Set(), showAll = false, runsOpen = null } = {}) {
   const f = model.failures; const shown = showAll ? f : f.slice(0, SHOWN);
   const failBlock = f.length
-    ? `${shown.map((x) => failureRow(x, open.has(x.key))).join('')}${f.length > shown.length ? `<button type="button" class="cia-more" data-cia-more>Show ${f.length - shown.length} more</button>` : ''}`
+    ? `${shown.map((x) => failureRow(x, open.has(x.key))).join('')}${f.length > shown.length ? `<button type="button" class="hd-btn hd-btn--secondary hd-btn--sm cia-more" data-cia-more>Show ${f.length - shown.length} more</button>` : ''}`
     : '<p class="cia-note" data-cia-clear>No unresolved failures: the newest finished run of every branch and pull request passed.</p>';
   const runs = showAll ? model.running : model.running.slice(0, SHOWN);
   const runBlock = model.running.length
-    ? `<ul class="cia-runs">${runs.map(runningRow).join('')}</ul>${model.running.length > runs.length ? `<button type="button" class="cia-more" data-cia-more>Show ${model.running.length - runs.length} more</button>` : ''}`
+    ? `<ul class="cia-runs">${runs.map(runningRow).join('')}</ul>${model.running.length > runs.length ? `<button type="button" class="hd-btn hd-btn--secondary hd-btn--sm cia-more" data-cia-more>Show ${model.running.length - runs.length} more</button>` : ''}`
     : '<p class="cia-note">Nothing is running.</p>';
   return `<style>${styles}</style><section class="cia" aria-label="CI needs attention">
 <h2>Needs attention <span class="cia-count" data-cia-count>${f.length}</span></h2>
 <p class="cia-note">Failures that no later run has fixed${model.merged ? ` · ${model.merged} on merged pull requests are left out` : ''}.</p>${failBlock}
-<h2>Running now <span class="cia-count">${model.running.length}</span>${model.stuck ? ` <span class="cia-chip cia-chip--bad">${model.stuck} look stuck</span>` : ''}</h2>${runBlock}</section>`;
+<details class="cia-runsec" data-cia-runsec${(runsOpen ?? model.stuck > 0) ? ' open' : ''}><summary><span class="cia-h">Running now</span> <span class="cia-count">${model.running.length}</span>${model.stuck ? ` <span class="cia-chip cia-chip--bad">${model.stuck} look stuck</span>` : ' <span class="cia-meta">none look stuck</span>'}</summary>${runBlock}</details></section>`;
 }
 
 /** The opened row: who and what, the failing step(s), and the lines around the failure. */
@@ -140,24 +140,26 @@ export function renderCiDetail(f, detail, logs, errors = {}) {
 }
 
 const styles = `.cia{margin:12px 0 20px;min-width:0}.cia h2{font-size:15px;margin:16px 0 6px;display:flex;align-items:center;gap:8px}.cia-count{font-size:12px;font-weight:500;padding:0 8px;border:1px solid var(--border);border-radius:99px;color:var(--text-secondary)}
+.cia-row>summary::before,.cia-runsec>summary::before{content:'\\25B8';display:inline-block;width:12px;color:var(--text-muted);transition:transform .12s}.cia-row[open]>summary::before,.cia-runsec[open]>summary::before{transform:rotate(90deg)}
+.cia-runsec{margin-top:8px}.cia-runsec>summary{display:flex;align-items:center;gap:8px;cursor:pointer;padding:8px 0;list-style:none}.cia-runsec>summary::-webkit-details-marker{display:none}.cia-h{font-size:15px;font-weight:600}
 .cia-note{font-size:12px;color:var(--text-secondary);margin:4px 0 8px}.cia-row{border-bottom:1px solid var(--border-subtle)}.cia-row>summary{display:flex;flex-wrap:wrap;align-items:center;gap:4px 12px;padding:10px 4px;cursor:pointer;list-style:none;font-size:13px}.cia-row>summary::-webkit-details-marker{display:none}.cia-row>summary:hover{background:var(--surface-2)}
 .cia-dot{width:8px;height:8px;border-radius:50%;flex:none;background:var(--text-muted)}.cia-dot--bad{background:var(--status-failed)}.cia-dot--live{background:var(--status-active)}.cia-name{font-weight:600;overflow-wrap:anywhere}.cia-ref{color:var(--text-secondary)}.cia-meta{font-size:12px;color:var(--text-muted)}
 .cia-chip{font-size:11px;padding:0 8px;border:1px solid var(--border);border-radius:99px;color:var(--text-secondary)}.cia-chip--bad{border-color:var(--status-failed);color:var(--status-failed)}
 .cia-body{padding:4px 4px 16px 24px}.cia-who{font-size:13px;margin:4px 0 8px;overflow-wrap:anywhere}.cia-links{font-size:12px;margin:8px 0 0}.cia-step h3{font-size:13px;margin:8px 0 4px}
 .cia-log{margin:4px 0;padding:12px;background:var(--surface-2);border:1px solid var(--border);border-radius:var(--radius-sm);font-size:12px;line-height:1.5;max-height:320px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere}
-.cia-runs{list-style:none;margin:0;padding:0}.cia-run{display:flex;flex-wrap:wrap;align-items:center;gap:4px 12px;padding:8px 4px;border-bottom:1px solid var(--border-subtle);font-size:13px}.cia-more{margin:8px 0;padding:6px 12px;font:inherit;font-size:13px;color:var(--accent);background:none;border:1px solid var(--border);border-radius:var(--radius-sm);cursor:pointer}`;
+.cia-runs{list-style:none;margin:0;padding:0}.cia-run{display:flex;flex-wrap:wrap;align-items:center;gap:4px 12px;padding:8px 4px;border-bottom:1px solid var(--border-subtle);font-size:13px}.cia-more{margin:8px 0}`;
 
 /** Mounts the section into `host`; returns a disposer. Opened rows survive the refresh. */
-export function mountCiAttention(host, client, { intervalMs = 20000, now = () => Date.now() } = {}) {
+export function mountCiAttention(host, client, { intervalMs = 20000, now = () => Date.now(), onModel = () => {} } = {}) {
   const open = new Set(); const details = new Map(); const logs = new Map(); const errors = new Map();
-  let model = null; let showAll = false; let signature = ''; let disposed = false; let timer = null;
+  let model = null; let showAll = false; let runsOpen = null; let signature = ''; let disposed = false; let timer = null;
   const controller = new AbortController();
 
   const detailHtml = (f) => renderCiDetail(f, details.get(f.key), logs.get(f.key) || {}, errors.get(f.key) || {});
   function paint() {
     if (disposed || !model) return;
-    const sig = JSON.stringify([model.failures.map((f) => [f.key, f.run.run_number, f.rerunning, f.consecutive]), model.running.map((r) => [r.key, r.stuck]), model.merged, showAll]);
-    if (sig !== signature) { signature = sig; host.innerHTML = renderCiAttention(model, { open, showAll }); }
+    const sig = JSON.stringify([model.failures.map((f) => [f.key, f.run.run_number, f.rerunning, f.consecutive]), model.running.map((r) => [r.key, r.stuck]), model.merged, showAll, runsOpen]);
+    if (sig !== signature) { signature = sig; host.innerHTML = renderCiAttention(model, { open, showAll, runsOpen }); }
     for (const f of model.failures) {
       const body = host.querySelector(`[data-cia-body="${CSS.escape(f.key)}"]`);
       if (body && open.has(f.key)) body.innerHTML = detailHtml(f);
@@ -180,6 +182,8 @@ export function mountCiAttention(host, client, { intervalMs = 20000, now = () =>
     }));
   }
   host.addEventListener('toggle', (event) => {
+    const sec = event.target.closest?.('[data-cia-runsec]');
+    if (sec) { runsOpen = sec.open; return; }
     const row = event.target.closest?.('[data-cia-row]'); if (!row || !model) return;
     const key = row.dataset.ciaRow;
     if (row.open) { open.add(key); const f = model.failures.find((x) => x.key === key); if (f) { row.querySelector('[data-cia-body]').innerHTML = detailHtml(f); loadDetail(f); } } else open.delete(key);
@@ -188,7 +192,7 @@ export function mountCiAttention(host, client, { intervalMs = 20000, now = () =>
 
   async function refresh() {
     if (disposed) return;
-    try { model = ciAttentionModel(await client.getCi({ signal: controller.signal }), now()); paint(); }
+    try { model = ciAttentionModel(await client.getCi({ signal: controller.signal }), now()); paint(); onModel(model); }
     catch { if (!model && !disposed) host.innerHTML = '<p class="cia-note" role="status">CI status could not be loaded.</p>'; }
     if (!disposed) timer = setTimeout(refresh, intervalMs);
   }

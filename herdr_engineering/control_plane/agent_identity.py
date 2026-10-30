@@ -11,6 +11,7 @@ import re
 import threading
 import unicodedata
 
+AGENT_IDENTITY_LOCK = 0x48455244524E414D  # Shared durable naming transaction fence.
 # A quarantined reservation is unavailable even to its original claimants.
 _CONFLICTED = object()
 
@@ -77,12 +78,14 @@ class AgentIdentityRegistry:
     so an old reference is never reassigned to a different agent.
     """
 
-    def __init__(self, persist=None):
+    def __init__(self, persist=None, *, verify_noop=False):
         self._persist = persist
+        self._verify_noop = verify_noop
         self._lock = threading.RLock()
         self._records = {}
         self._names = {}
         self._handles = {}
+        self._conflicted_versions = {}
 
     def get(self, identity):
         with self._lock:
@@ -96,7 +99,8 @@ class AgentIdentityRegistry:
     def is_conflicted(self, identity):
         with self._lock:
             record = self._records.get(identity)
-            return record is not None and not self._available(identity, record['display_name'])
+            return record is not None and (identity in self._conflicted_versions
+                                            or not self._available(identity, record['display_name']))
 
     @property
     def conflict_count(self):
@@ -147,7 +151,7 @@ class AgentIdentityRegistry:
                 raise AgentIdentityVersionConflict('agent name has changed; refresh before renaming')
             if not self._available(identity, name):
                 raise AgentIdentityConflict('agent name is already reserved')
-            if previous['display_name'] == name:
+            if previous['display_name'] == name and not self.is_conflicted(identity) and not self._verify_noop:
                 return self._public(previous)
             return self._commit(identity, name, expected_version + 1)
 
@@ -159,8 +163,27 @@ class AgentIdentityRegistry:
                   'reserved_handles': sorted(set(previous.get('reserved_handles', [])) | {handle})}
         event = {'entity_type': 'agent_identity', 'entity_id': identity,
                  'event_type': 'agent_identity.updated', 'payload': copy.deepcopy(record)}
-        if self._persist is not None and self._persist(event) is False:
-            raise RuntimeError('agent identity persistence was not acknowledged')
+        if self._persist is not None:
+            try:
+                acknowledged = self._persist(event)
+            except AgentIdentityVersionConflict as error:
+                current = getattr(error, 'current_event', None)
+                if isinstance(current, dict) and current.get('entity_id') == identity:
+                    self.hydrate([current], quarantine_conflicts=True, tolerate_version_resets=True)
+                    if getattr(error, 'current_conflicted', False):
+                        self._conflicted_versions[identity] = self._records[identity]['version']
+                raise
+            if acknowledged is False:
+                raise RuntimeError('agent identity persistence was not acknowledged')
+            if isinstance(acknowledged, dict):
+                if acknowledged.get('identity') != identity:
+                    raise ValueError('acknowledged agent identity does not match request')
+                validator = AgentIdentityRegistry()
+                validator.hydrate([{**event, 'payload': acknowledged}])
+                if not self._available(identity, acknowledged['display_name']):
+                    raise AgentIdentityConflict('acknowledged current agent name is unavailable')
+                self._publish(copy.deepcopy(acknowledged))
+                return self.get(identity)
         self._publish(record)
         return self._public(record)
 
@@ -174,8 +197,10 @@ class AgentIdentityRegistry:
                 # from another identity or replace a previously blocked alias.
                 reservations[alias] = identity if owner in (None, identity) else _CONFLICTED
         self._records[identity] = record
+        if identity in self._conflicted_versions and record['version'] > self._conflicted_versions[identity]:
+            del self._conflicted_versions[identity]
 
-    def _hydrate_quarantined(self, events):
+    def _hydrate_quarantined(self, events, *, tolerate_version_resets=False):
         grouped = {}
         for event in events:
             if (event.get('entity_type') != 'agent_identity'
@@ -189,11 +214,31 @@ class AgentIdentityRegistry:
             grouped.setdefault(identity, []).append(event)
 
         validated = []
+        reset_conflicts = {}
         for identity, history in grouped.items():
             previous = self._records.get(identity)
             if previous is not None:
                 history.append({'entity_type': 'agent_identity', 'entity_id': identity,
                                 'event_type': 'agent_identity.updated', 'payload': previous})
+            if tolerate_version_resets:
+                normalized = []
+                for event in history:
+                    validator = AgentIdentityRegistry()
+                    validator.hydrate([event])
+                    normalized.append({**event, 'payload': validator._records[identity]})
+                winner = max(normalized, key=lambda event: (
+                    event['payload']['version'], str(event.get('ingest_timestamp') or ''),
+                    event.get('sequence') or 0, str(event.get('event_id') or ''),
+                    event['payload']['display_name'], event['payload']['handle']))
+                record = copy.deepcopy(winner['payload'])
+                heads = {tuple(self._public(event['payload']).items()) for event in normalized
+                         if event['payload']['version'] == record['version']}
+                if len(heads) > 1:
+                    reset_conflicts[identity] = record['version']
+                for field in ('reserved_names', 'reserved_handles'):
+                    record[field] = sorted({alias for event in normalized for alias in event['payload'][field]})
+                validated.append(record)
+                continue
             isolated = AgentIdentityRegistry()
             # Ascending versions also expose divergent older versions; global
             # collisions are the only validation failures quarantine tolerates.
@@ -201,10 +246,11 @@ class AgentIdentityRegistry:
             validated.append(isolated._records[identity])
         # Publish only after every identity has passed strict validation. The
         # cumulative reservations reconstruct blocked aliases from snapshots.
+        self._conflicted_versions.update(reset_conflicts)
         for record in validated:
             self._publish(record)
 
-    def hydrate(self, events, *, quarantine_conflicts=False):
+    def hydrate(self, events, *, quarantine_conflicts=False, tolerate_version_resets=False):
         """Replay ordered durable envelopes without generating new events.
 
         Duplicate/older versions are ignored. Conflicting or malformed identity
@@ -212,10 +258,15 @@ class AgentIdentityRegistry:
         Opt-in quarantine retains validated identities but blocks ambiguous
         reservations until operators explicitly rename the affected identities.
         Historical ambiguous aliases remain blocked after those renames.
+        Recovery can additionally quarantine well-formed legacy version resets;
+        their current label stays unresolved until an explicit higher-version
+        rename. Malformed envelopes still fail before any state is published.
         """
         with self._lock:
+            if tolerate_version_resets and not quarantine_conflicts:
+                raise ValueError('version-reset recovery requires explicit conflict quarantine')
             if quarantine_conflicts:
-                self._hydrate_quarantined(events)
+                self._hydrate_quarantined(events, tolerate_version_resets=tolerate_version_resets)
                 return
             for event in events:
                 if event.get('entity_type') != 'agent_identity':

@@ -160,8 +160,13 @@ def test_feed_pi_once_posts_snapshot(pi_feed_server, pi_feed_snapshot, monkeypat
     base, repo = pi_feed_server
     monkeypatch.setenv("HERDR_CP_INGEST_KEY", "cli-ingest-secret")
     before = pi_feed_snapshot.read_bytes()
+    real_sleep = time.sleep
+    cli_thread = threading.current_thread()
 
-    def no_sleep(_seconds):
+    def no_sleep(seconds):
+        # The HTTP server's maintenance threads still need their real sleeps.
+        if threading.current_thread() is not cli_thread:
+            return real_sleep(seconds)
         pytest.fail("once mode must not sleep")
 
     monkeypatch.setattr(time, "sleep", no_sleep)
@@ -214,9 +219,10 @@ def test_feed_pi_interval_rereads_snapshot(pi_feed_server, pi_feed_snapshot, mon
     monkeypatch.setenv("HERDR_CP_INGEST_KEY", "cli-ingest-secret")
     waits = []
     real_sleep = time.sleep
+    cli_thread = threading.current_thread()
 
     def next_cycle(seconds):
-        if threading.current_thread() is not threading.main_thread():
+        if threading.current_thread() is not cli_thread:
             return real_sleep(seconds)
         waits.append(seconds)
         if len(waits) == 2:
@@ -284,3 +290,15 @@ def test_feed_pi_invalid_url_is_sanitized(pi_feed_snapshot, monkeypatch, capsys)
     output = capsys.readouterr()
     assert "--url" in output.err
     assert "url-secret" not in output.out + output.err
+
+
+def test_fabric_compaction_settings_default_to_off_and_dry_run():
+    from herdr_engineering.cli import _fabric_compaction_settings
+    off = _fabric_compaction_settings({})
+    assert off.enabled is False and off.dry_run is True and off.rebuild_checkpoint is True
+    on = _fabric_compaction_settings({"fabric_compaction": {"enabled": True, "dry_run": False, "min_age_days": 5,
+                                                            "archive_retention_days": None}})
+    assert on.enabled and not on.dry_run and on.min_age_days == 5.0 and on.archive_retention_days is None
+    assert _fabric_compaction_settings({"fabric_compaction": {"enabled": "yes"}}).enabled is False
+    with pytest.raises(SystemExit):
+        _fabric_compaction_settings({"fabric_compaction": {"min_age_days": 0}})

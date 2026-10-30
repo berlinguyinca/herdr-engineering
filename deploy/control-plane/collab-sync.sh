@@ -15,8 +15,11 @@
 # Usage: collab-sync.sh once|install|renew-check [--config SLICE] [--dir SYNC_DIR] [--data-dir DIR]
 #          [--cert-dir DIR] [--cert-src LIVE_DIR] [--acme-dir DIR] [--certbot BIN] [--cert-name NAME]
 # Unless --certbot is explicit, Certbot is read from the ACME directory's sibling DIR-venv.
+# --lock-held: the caller (deploy.sh) already holds SYNC_DIR.lock for its whole container work,
+# which is what keeps the minute timer's run out of a deploy; without the flag this run would
+# see that lock and skip its own refresh. Never written into a unit.
 set -euo pipefail
-USAGE="usage: $0 once|install|renew-check [--config SLICE] [--dir SYNC_DIR] [--data-dir DIR] [--cert-dir DIR] [--cert-src LIVE_DIR] [--acme-dir DIR] [--certbot BIN] [--cert-name NAME]"
+USAGE="usage: $0 once|install|renew-check [--config SLICE] [--dir SYNC_DIR] [--data-dir DIR] [--cert-dir DIR] [--cert-src LIVE_DIR] [--acme-dir DIR] [--certbot BIN] [--cert-name NAME] [--lock-held]"
 ACTION="${1:-once}"; [ $# -gt 0 ] && shift
 CONFIG="$HOME/.config/herdr-engineering/collab/collab-config.json"
 DIR="$HOME/.local/share/herdr-engineering/collab-sync"
@@ -26,6 +29,7 @@ CERT_NAME="localdev.mcp.metabolomics.us"
 ACME="$HOME/.local/share/herdr-engineering/collab-acme"
 CERT_SRC=""
 CERTBOT=""
+LOCK_HELD=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --config) CONFIG="${2:?--config needs a value}"; shift 2 ;;
@@ -36,6 +40,7 @@ while [ $# -gt 0 ]; do
     --acme-dir) ACME="${2:?--acme-dir needs a value}"; shift 2 ;;
     --certbot) CERTBOT="${2:?--certbot needs a value}"; shift 2 ;;
     --cert-name) CERT_NAME="${2:?--cert-name needs a value}"; shift 2 ;;
+    --lock-held) LOCK_HELD=1; shift ;;
     *) echo "$USAGE" >&2; exit 2 ;;
   esac
 done
@@ -60,7 +65,9 @@ provision() {
 }
 
 once() {
-  exec 9>"${DIR}.lock"; flock -n 9 || { echo "another collab-sync is running" >&2; return 0; }   # no overlapping runs
+  if [ "$LOCK_HELD" = 0 ]; then   # no overlapping runs (deploy.sh holds this same lock while it recreates containers)
+    exec 9>"${DIR}.lock"; flock -n 9 || { echo "another collab-sync is running" >&2; return 0; }
+  fi
   provision
   mkdir -p "$DIR"; chmod 755 "$DIR"
   local tmp; tmp="$(mktemp -d "$DIR/.tmp.XXXXXX")"; trap 'rm -rf "$tmp"' RETURN

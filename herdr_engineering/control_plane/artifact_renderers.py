@@ -285,11 +285,11 @@ class RendererRegistry:
         if not isinstance(source, str) or not source.strip():
             raise ArtifactRendererError("presentation profile requires markdown slides separated by ---")
         slides = split_slides(source)
-        deck = (_PAGE_HEAD.replace("<style>", "<style>" + _DECK_CSS, 1)
+        deck = (_PAGE_HEAD.replace("</style>", _DECK_CSS + "</style>", 1)   # after the page rules, so the deck sizes win
                 + "".join(f"<section>{render_markdown(slide)}</section>\n" for slide in slides)
                 + "</body></html>\n")
         return RenderResult("presentation", source,
                             [{"name": "deck.html", "media_type": "text/html", "content": deck}],
                             {"status": "passed", "checks": ["markdown-slides"], "slide_count": len(slides)},
-                            {"renderer": "builtin-markdown-deck", "revision": "1"})
+                            {"renderer": "builtin-markdown-deck", "revision": "2"})
 

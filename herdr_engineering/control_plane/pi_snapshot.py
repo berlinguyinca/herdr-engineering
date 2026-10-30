@@ -64,7 +64,7 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
-def post_envelopes(base_url: str, api_key: str | None, envelopes: list[dict]) -> int:
+def post_envelopes(base_url: str, api_key: str | None, envelopes: list[dict], *, allow_open: bool = False) -> int:
     """POST each envelope and return the accepted count; stop on the first error.
 
     The caller may retry the snapshot after a partial failure: mission upserts
@@ -72,7 +72,7 @@ def post_envelopes(base_url: str, api_key: str | None, envelopes: list[dict]) ->
     are never included in diagnostics. Redirects fail without being followed.
     """
     key = os.environ.get("HERDR_CP_INGEST_KEY") if api_key is None else api_key
-    if not key or not key.strip():
+    if (not key or not key.strip()) and not allow_open:
         raise ValueError("Set HERDR_CP_INGEST_KEY to an ingest-role API key")
     try:
         parsed = urllib.parse.urlsplit(base_url)
@@ -87,7 +87,7 @@ def post_envelopes(base_url: str, api_key: str | None, envelopes: list[dict]) ->
         try:
             request = urllib.request.Request(
                 url, data=json.dumps(envelope).encode("utf-8"), method="POST",
-                headers={"Content-Type": "application/json", "X-API-Key": key},
+                headers={"Content-Type": "application/json", **({"X-API-Key": key} if key else {})},
             )
             with opener.open(request, timeout=10):
                 count += 1

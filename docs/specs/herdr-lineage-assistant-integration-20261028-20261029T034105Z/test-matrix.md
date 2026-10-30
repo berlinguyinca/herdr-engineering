@@ -19,7 +19,7 @@ Status key: **exists** (found, not run), **planned**, **blocked**. Nothing here 
 | Assistant observation | 7A, 10.3 | `read_lineage` tests | planned (S1) |
 | Assistant controlled delegation | 7B | grant/approval negative tests incl. self-approval | planned (S0, S6) |
 | Duplicate/out-of-order events | 10.8 | `test_graph.py:93,133,749` | exists |
-| Desktop/mobile UI | 6 | `tests/playwright` ui-gates (workbench, states, visual baselines); Missions page and assistant baselines still planned: the dashboard app is outside the visual harness | partial (S5): lineage/workbench done, Missions/assistant not |
+| Desktop/mobile UI | 6 | `tests/playwright` ui-gates (workbench, states, visual baselines); Missions page and assistant Proposals/Notifications/Approvals baselines (3 of 6 viewport/scheme combinations each, size cap) plus `ui-gates-dashboard-a11y.test.mjs` (ratchet over known findings) | partial (S5): lineage/workbench, Missions and assistant tabs have baselines; tablet, mobile dark, non-default Missions tabs and mission detail do not |
 | 60+ sessions bounded render | 10.9 | `ui-gates-perf` (2k-10k nodes, server-capped at 3,000 loaded), `ui-gates-workbench` 64-session chain, `tests/perf/lineage-scale.mjs` (5k/10k loaded in the client); numbers in `perf.md` | exists |
 
 ## How to run locally (bender)
