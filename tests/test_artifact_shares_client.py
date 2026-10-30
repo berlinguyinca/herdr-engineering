@@ -45,6 +45,9 @@ def endpoint():
             n = int(self.headers.get("Content-Length", "0"))
             raw = self.rfile.read(n)
             captured.append(("POST", self.path, dict(self.headers), json.loads(raw) if raw else None))
+            if state.get("post_delay"):
+                import time
+                time.sleep(state["post_delay"])
             if state["post"]:
                 return self._send(*state["post"])
             if self.path.endswith("/approve"):
@@ -149,6 +152,20 @@ def test_approve_conflict_and_gone(endpoint, status, word, capsys):
     state["post"] = (status, {"error": "whatever"})
     assert run(url, "approve", "a1", "s1", "--yes") == 1
     assert word in capsys.readouterr().err.lower()
+
+
+@pytest.mark.parametrize("as_json", [False, True])
+def test_approve_timeout_says_the_share_may_be_live(endpoint, monkeypatch, capsys, as_json):
+    """The server may have gone live before the answer was lost: never call that 'unreachable'."""
+    url, reqs, state = endpoint
+    monkeypatch.setattr(sc, "REQUEST_TIMEOUT", 0.3)
+    state["post_delay"] = 1.0
+    argv = ["approve", "a1", "s1", "--yes"] + (["--json"] if as_json else [])
+    assert run(url, *argv) == 1
+    assert reqs[-1][0] == "POST"
+    err = capsys.readouterr().err
+    assert "MAY already be live" in err and "unreachable" not in err
+    assert "herdr-eng artifacts share show a1 s1" in err and "share revoke a1 s1" in err
 
 
 def test_approve_non_pending_does_not_post(endpoint, capsys):

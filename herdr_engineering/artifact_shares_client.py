@@ -34,6 +34,9 @@ class PoolCheckSkipped(Exception):
     pass
 
 
+REQUEST_TIMEOUT = 120   # seconds; an approve copies the whole bundle before it answers
+
+
 class ShareClient(ReportClient):
     """ReportClient transport that keeps the server's short JSON error message and status."""
 
@@ -46,7 +49,7 @@ class ShareClient(ReportClient):
             headers["Content-Type"] = "application/json"
         req = Request(self.base + path, data=data, headers=headers, method="POST" if body is not None else "GET")
         try:
-            with self.opener.open(req, timeout=120) as response:
+            with self.opener.open(req, timeout=REQUEST_TIMEOUT) as response:
                 raw = response.read(4 * 1024 * 1024 + 1)
         except urllib.error.HTTPError as error:
             message = None
@@ -305,7 +308,18 @@ def run_command(args):
                 return 1
             if not _confirmed(args):
                 return 1
-            result = client.request(_path(aid, args.share_id, "approve"), {"confirm": True})
+            try:
+                result = client.request(_path(aid, args.share_id, "approve"), {"confirm": True})
+            except ShareError as error:
+                if error.status is not None:
+                    raise
+                # timeout or lost connection: the server may have finished the approval without us seeing it
+                _err(f"no answer to the approve request (timed out or the connection dropped); the share MAY "
+                     "already be live. Check with: "
+                     f"herdr-eng artifacts share show {aid} {args.share_id} (revoke it if unwanted: "
+                     f"herdr-eng artifacts share revoke {aid} {args.share_id}). The link is shown only once, so a "
+                     "share that went live this way needs a revoke and a new share to get a link.")
+                return 1
             link = result.get("url")
             if (not isinstance(link, str) or not link.startswith(("https://", "http://"))
                     or _UNSAFE.search(link) or any(c.isspace() for c in link)):
