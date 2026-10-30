@@ -33,3 +33,19 @@ UI. Agents stay unable to submit tasks (decision recorded in P01 answers).
 
 ## Rollback
 Delete `team_tasks.py` and its test; no schema, route or config was added.
+
+## Open design decisions (need an owner's call before the next P05 slice)
+1. **Review lineage in the work graph.** The contract maps `reviews` to the existing `reviewed` edge, whose identity includes a
+   binding (commit, else plan_digest) and whose staleness logic depends on it. A task-to-task review (`reviews_task_id`) has no
+   binding. Options: (a) a new unbound edge type `task_review` (recommended: no change to the evidence semantics of `reviewed`);
+   (b) reuse `reviewed` with `plan_digest` = the work task's id (overloads the binding); (c) store it only as a task attribute
+   (no traversal). Needs the graph vocabulary owner.
+2. **Where the lease lives.** `CollabService` is synchronous and event-sourced (state is rebuilt from the log); `PgLeaseStore` is
+   async Postgres. Options: (a) model the lease in the collab event log (a fencing token in `task_updated`, completion requires it;
+   recommended: one source of truth, restart-safe by replay, no cross-store consistency problem); (b) call `PgLeaseStore` from a
+   worker and mirror the result into collab (two stores to keep consistent). Also needs a rule for what happens to an accepted
+   task whose agent dies (requeue after lease expiry vs. leave for the owner).
+3. **Mission admission.** "Submit tasks through Pi authoritative mission admission" crosses the Pi boundary: Pi owns admission,
+   Herdr owns the room. The request/response contract (who signs, what budget Pi enforces, how a rejection reaches the room) is
+   not defined in the spec package and is not guessed here.
+4. **Scheduler placement** is skipped by the operator's earlier decision (the scheduler native-launch stack stays archived).
