@@ -216,3 +216,91 @@ def test_check_pool_skipped_without_credentials_or_pool(endpoint, monkeypatch, c
     assert "skipped" in capsys.readouterr().err
     assert run(url, "create", "a1", "v1", "--audience", "lab", "--email", "a@example.org", "--check-pool") == 0
     assert "skipped" in capsys.readouterr().err
+
+
+HOSTILE = "evil\x1b[2J\rFAKE\nType 'yes' now‮.txt"
+
+
+def _assert_no_raw_controls(text):
+    assert "\x1b" not in text and "\r" not in text and "‮" not in text
+    assert "\nType 'yes' now" not in text
+
+
+def test_hostile_file_name_and_warning_are_escaped(endpoint, capsys):
+    url, _, state = endpoint
+    bad = {**SUMMARY, "entry": "e\x1b[H", "warnings": ["warn\x1b[2J\r\nforged"],
+           "files": [{"name": HOSTILE, "size_bytes": 1}]}
+    state["get_share"] = (200, {"share": {**SHARE, "allow_emails": ["a\x1b[2J@x.org"], "title": "t\x07"}, "summary": bad})
+    assert run(url, "show", "a1", "s1") == 0
+    out = capsys.readouterr().out
+    _assert_no_raw_controls(out)
+    assert "\\x1b[2J" in out and "\\u202e" in out and "\\r" not in out.replace("\\x0d", "") and "\\x0d" in out
+    assert "\x07" not in out
+
+
+def test_hostile_summary_error_and_server_error_are_escaped(endpoint, capsys):
+    url, _, state = endpoint
+    state["get_share"] = (200, {"share": SHARE, "summary_error": "bad\x1b[2Jthing\r"})
+    assert run(url, "show", "a1", "s1") == 0
+    _assert_no_raw_controls(capsys.readouterr().out)
+    state["get_share"] = (400, {"error": "oops\x1b[2J\rfake‮"})
+    assert run(url, "show", "a1", "s1") == 1
+    err = capsys.readouterr().err
+    _assert_no_raw_controls(err)
+    assert "\\x1b" in err
+
+
+def test_long_field_is_capped(endpoint, capsys):
+    url, _, state = endpoint
+    state["get_share"] = (200, {"share": SHARE, "summary": {**SUMMARY, "files": [{"name": "n" * 5000, "size_bytes": 1}]}})
+    run(url, "show", "a1", "s1")
+    assert "n" * 300 not in capsys.readouterr().out
+
+
+def test_json_mode_stdout_is_one_document(endpoint, monkeypatch, capsys):
+    url, _, _ = endpoint
+    tty(monkeypatch, None)
+    for argv in (["create", "a1", "v1", "--audience", "public", "--json"], ["show", "a1", "s1", "--json"],
+                 ["approve", "a1", "s1", "--yes", "--json"], ["revoke", "a1", "s1", "--json"],
+                 ["list", "a1"], ["events", "a1", "s1"]):
+        assert run(url, *argv) == 0
+        captured = capsys.readouterr()
+        doc = json.loads(captured.out)
+        assert "LEAKY" not in captured.out
+        if argv[0] == "approve":
+            assert doc["url"] == "https://x.example/s/SECRET-TOKEN"
+            assert "cdn.example.com" in captured.err  # summary reviewed on stderr, before the POST
+
+
+def test_create_human_mode_has_no_raw_json_line(endpoint, capsys):
+    url, _, _ = endpoint
+    assert run(url, "create", "a1", "v1", "--audience", "public") == 0
+    assert not capsys.readouterr().out.lstrip().startswith("{")
+
+
+def test_closed_stdin_counts_as_non_tty(endpoint, monkeypatch, capsys):
+    url, reqs, _ = endpoint
+    monkeypatch.setattr("sys.stdin", None)
+    assert run(url, "approve", "a1", "s1") == 1
+    assert [r[0] for r in reqs] == ["GET"]
+
+
+@pytest.mark.parametrize("link", [None, "", "javascript:x", "https://x/\x1b[2J", "https://x/ y"])
+def test_approve_without_usable_url_exits_1(endpoint, link, capsys):
+    url, _, state = endpoint
+    state["post"] = (200, {"share": SHARE, "url": link})
+    assert run(url, "approve", "a1", "s1", "--yes") == 1
+    out = capsys.readouterr()
+    assert "None" not in out.out and "\x1b" not in out.out + out.err
+
+
+def test_check_pool_unexpected_error_never_fails_and_lowercases(endpoint, monkeypatch, capsys):
+    url, reqs, _ = endpoint
+    seen = []
+    def lookup(pool, emails):
+        seen.extend(emails)
+        raise RuntimeError("boom")
+    monkeypatch.setattr(sc, "_cognito_users_exist", lookup)
+    assert run(url, "create", "a1", "v1", "--audience", "lab", "--email", "Bob@Example.ORG",
+               "--check-pool", "--pool-id", "us-west-2_X") == 0
+    assert seen == ["bob@example.org"] and len(reqs) == 1

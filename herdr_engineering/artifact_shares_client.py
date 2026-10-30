@@ -89,28 +89,40 @@ def _strip_secrets(value):
     return value
 
 
+_UNSAFE = re.compile("[\x00-\x1f\x7f-\x9f\u2028\u2029\u200e\u200f\u202a-\u202e\u2066-\u2069\ufeff]")
+
+
+def _safe(value, limit=200):
+    """Server-derived text for a terminal: control and bidi characters become visible escapes, length is capped."""
+    text = str(value)
+    text = _UNSAFE.sub(lambda m: f"\\x{ord(m.group()):02x}" if ord(m.group()) < 256 else f"\\u{ord(m.group()):04x}", text)
+    return text if len(text) <= limit else text[:limit] + "..."
+
+
 def _clean_share(share):
     return {k: share[k] for k in SHARE_KEYS if isinstance(share, dict) and k in share}
 
 
 def render_summary(share, summary):
     s = _clean_share(share)
-    lines = [f"Share {s.get('share_id', '?')} ({s.get('state', '?')}) of artifact {s.get('artifact_id', '?')} "
-             f"version {s.get('version_id', '?')}"]
+    lines = [f"Share {_safe(s.get('share_id', '?'))} ({_safe(s.get('state', '?'))}) of artifact "
+             f"{_safe(s.get('artifact_id', '?'))} version {_safe(s.get('version_id', '?'))}"]
+    if s.get("title"):
+        lines.append(f"  title: {_safe(s['title'])}")
     if summary:
-        lines += [f"  audience: {summary.get('audience', s.get('audience'))}"]
+        lines += [f"  audience: {_safe(summary.get('audience', s.get('audience')))}"]
         recipients = (s.get("allow_emails") or []) + [f"group:{g}" for g in s.get("allow_groups") or []]
         if recipients:
-            lines.append("  allowed: " + ", ".join(str(r) for r in recipients))
-        lines += [f"  entry: {summary.get('entry')}",
-                  f"  exposes: {summary.get('file_count')} files, {_size(summary.get('total_bytes'))}",
-                  f"  expires: {summary.get('expires_at') or 'never'}"]
+            lines.append("  allowed: " + ", ".join(_safe(r) for r in recipients))
+        lines += [f"  entry: {_safe(summary.get('entry'))}",
+                  f"  exposes: {_safe(summary.get('file_count'))} files, {_safe(_size(summary.get('total_bytes')))}",
+                  f"  expires: {_safe(summary.get('expires_at') or 'never')}"]
         for warning in summary.get("warnings") or []:
-            lines.append(f"  WARNING: {warning}")
+            lines.append(f"  WARNING: {_safe(warning, 400)}")
         files = summary.get("files") or []
         for f in files[:SHOWN_FILES]:
             if isinstance(f, dict):
-                lines.append(f"    {f.get('name')}  ({_size(f.get('size_bytes'))})")
+                lines.append(f"    {_safe(f.get('name'))}  ({_safe(_size(f.get('size_bytes')))})")
         total = summary.get("file_count") if isinstance(summary.get("file_count"), int) else len(files)
         if total > min(len(files), SHOWN_FILES):
             lines.append(f"    ... and {total - min(len(files), SHOWN_FILES)} more")
@@ -118,7 +130,7 @@ def render_summary(share, summary):
 
 
 def _err(message):
-    print(f"herdr-eng: {message}", file=sys.stderr)
+    print(f"herdr-eng: {_safe(message, 400)}", file=sys.stderr)
 
 
 def _status_message(error):
@@ -170,12 +182,15 @@ def _check_pool(args, emails):
         _err("pool check skipped: no --pool-id (or readable --fleet-config with control_plane.collab.cognito_pool)")
         return
     try:
-        found = _cognito_users_exist(pool, emails)
+        found = _cognito_users_exist(pool, [e.lower() for e in emails])
     except PoolCheckSkipped as why:
         _err(f"pool check skipped: {why}")
         return
+    except Exception as why:  # a lookup problem must never fail the command
+        _err(f"pool check skipped: {type(why).__name__}")
+        return
     for email in emails:
-        if not found.get(email):
+        if not found.get(email.lower()):
             _err(f"warning: no Cognito account found for {email}; they must sign up before they can open the link")
 
 
@@ -193,14 +208,26 @@ def _validate_create(args):
     return None
 
 
+def _say_stream(args):
+    return sys.stderr if getattr(args, "json", False) else sys.stdout
+
+
+def _say(args, text):
+    print(text, file=_say_stream(args))
+
+
 def _confirmed(args):
     if args.yes:
         return True
-    if not sys.stdin.isatty():
+    try:
+        interactive = bool(sys.stdin and sys.stdin.isatty())
+    except (AttributeError, ValueError, OSError):
+        interactive = False
+    if not interactive:
         _err("refusing to approve without confirmation: stdin is not a terminal; re-run with --yes "
              "after reviewing the summary above")
         return False
-    print("Type 'yes' to expose exactly the files above: ", end="", flush=True)
+    print("Type 'yes' to expose exactly the files above: ", end="", file=_say_stream(args), flush=True)
     if sys.stdin.readline().strip().lower() == "yes":
         return True
     _err("not approved")
@@ -233,15 +260,17 @@ def run_command(args):
             if args.title:
                 body["title"] = args.title
             if args.check_pool and args.email:
-                _check_pool(args, args.email)
+                try:
+                    _check_pool(args, args.email)
+                except Exception:
+                    _err("pool check skipped: unexpected error")
             result = client.request(_path(aid), body)
             if args.json:
                 print(json.dumps(result))
             else:
-                print(json.dumps(_clean_share(result.get("share", {}))))
                 print(render_summary(result.get("share", {}), result.get("summary")))
-                print(f"Not live yet. Review, then: herdr-eng artifacts share approve {aid} "
-                      f"{result.get('share', {}).get('share_id', '<id>')}")
+                print(f"Not live yet. Review, then: herdr-eng artifacts share approve {_safe(aid)} "
+                      f"{_safe(result.get('share', {}).get('share_id', '<id>'))}")
         elif action == "show":
             result = client.request(_path(aid, args.share_id))
             if args.json:
@@ -249,7 +278,7 @@ def run_command(args):
             else:
                 print(render_summary(result.get("share", {}), result.get("summary")))
                 if result.get("summary_error"):
-                    print(f"  cannot be approved as is: {result['summary_error']}")
+                    print(f"  cannot be approved as is: {_safe(result['summary_error'], 400)}")
         elif action == "list":
             print(json.dumps(client.request(_path(aid))))
         elif action == "events":
@@ -259,29 +288,37 @@ def run_command(args):
             print(json.dumps(result))
         elif action == "revoke":
             result = client.request(_path(aid, args.share_id, "revoke"), {})
-            print(f"Share {args.share_id} is revoked (revoking again is harmless); its link no longer works.")
             if args.json:
+                _say(args, f"Share {_safe(args.share_id)} is revoked (revoking again is harmless); its link no longer works.")
                 print(json.dumps(result))
+            else:
+                print(f"Share {_safe(args.share_id)} is revoked (revoking again is harmless); its link no longer works.")
         elif action == "approve":
             current = client.request(_path(aid, args.share_id))
             share = current.get("share", {})
             if share.get("state") != "pending":
                 _err(f"share is {share.get('state')}, not pending; nothing to approve")
                 return 1
-            print(render_summary(share, current.get("summary")))
+            _say(args, render_summary(share, current.get("summary")))
             if not current.get("summary"):
                 _err(f"cannot approve: {current.get('summary_error') or 'no exposure summary available'}")
                 return 1
             if not _confirmed(args):
                 return 1
             result = client.request(_path(aid, args.share_id, "approve"), {"confirm": True})
+            link = result.get("url")
+            if (not isinstance(link, str) or not link.startswith(("https://", "http://"))
+                    or _UNSAFE.search(link) or any(c.isspace() for c in link)):
+                _err("approved, but the server returned no usable link; revoke this share and create a new one")
+                return 1
             if args.json:
+                _say(args, "Share is LIVE. The link is in the JSON on stdout and will not be shown again.")
                 print(json.dumps(result))
             else:
                 print("\nShare is LIVE. Anyone holding this link can open it; treat it like a password.")
-                print(f"\n    {result.get('url')}\n")
+                print(f"\n    {link}\n")
                 print("This link will not be shown again. Copy it now; revoke with: "
-                      f"herdr-eng artifacts share revoke {aid} {args.share_id}")
+                      f"herdr-eng artifacts share revoke {_safe(aid)} {_safe(args.share_id)}")
         return 0
     except ShareError as error:
         message = _status_message(error)
