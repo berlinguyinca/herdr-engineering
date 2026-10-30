@@ -631,6 +631,8 @@ timeout; the reply and any failure arrive as events.
 
 **Not supported** (answered `404 NOT_FOUND` in Rakazo's error shape so the app degrades per screen): push notifications
 (nothing is delivered while the app is closed), voice and calls, billing and the model/provider screens, groups,
+attachments, memory, routines, skills, connections, bot editing/archiving, spaces other than "Herdr", and ActionBoard
+proposals (those stay on the dashboard). `threads/send` does not deduplicate a retried `clientNonce`.
 attachments, memory, routines, skills, connections, bot editing/archiving, and spaces other than "Herdr".
 `threads/send` does not deduplicate a retried `clientNonce`.
 

@@ -59,6 +59,7 @@ def _config(central, envfile, *files, fmt=None, extra_env=None):
     env = dict(os.environ, HERDR_CP_FLEET_DIR=str(central.parent),
                HERDR_LLM_SLICE_DIR=str(central.parent / "llm-proxy"), HERDR_CP_IMAGE_TAG="t",
                HERDR_CP_GIT_COMMIT="t", HERDR_CP_GITHUB_APP_DIR=str(central.parent / "github-app"),
+               HERDR_CP_GOOGLE_DIR=str(central.parent / "google"),
                HERDR_CP_PIPELINES_DIR=str(central.parent / "pipelines"),
                HERDR_SHARES_DIR=str(central.parent / "shares"),
                HERDR_SHARE_EVENTS_DIR=str(central.parent / "share-events"), **(extra_env or {}))

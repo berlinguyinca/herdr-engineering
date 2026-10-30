@@ -83,3 +83,10 @@ test('a sub-cent cost is never shown as $0.00, and inferred agents are labelled 
 test('link targets in the timeline are at least 44px tall', () => {
   assert.match(renderTrail(trail), /\.pt-line a\{[^}]*min-height:44px/);
 });
+
+test('a handoff on the trail links to its detail, with the id encoded', async () => {
+  const { renderTrail } = await import('./pr-trail-view.js');
+  const html = renderTrail({ pull_request: { number: 1, repository: 'o/r', status: 'open' }, state: 'linked',
+    timeline: [{ at: '2026-01-01T00:00:00Z', kind: 'handoff', ref: 'h/1', text: 'pi → pi: go', state: 'queued' }] });
+  assert.match(html, /href="#\/handoffs\?open=h%2F1"/);
+});

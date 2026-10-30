@@ -481,12 +481,24 @@ class ControlPlaneServer:
             self.assistant = assistant_service
         # control_plane.rakazo_bridge (off by default: nothing is constructed and /rpc/* + /api/auth/* answer 404).
         # A bad section raises here, so an enabled but malformed bridge stops startup instead of running open.
-        from .rakazo_bridge import PostgresTokenPersistence, RakazoBridge, rakazo_bridge_config
+        from .rakazo_artifacts import RegistryBackend
+        from .rakazo_bridge import (
+            PostgresPrefsPersistence,
+            PostgresSpacePersistence,
+            PostgresTokenPersistence,
+            RakazoBridge,
+            rakazo_bridge_config,
+        )
+        from .rakazo_push import PostgresPushPersistence
         _bridge_cfg = rakazo_bridge_config(rakazo_bridge)
         if _bridge_cfg["enabled"]:       # the assistant user ids the bridge accounts act as (hashes, no email), for ci_watch.users
             log.info("rakazo bridge assistant users: %s", ", ".join(a.principal_id for a in _bridge_cfg["accounts"]))
         self.rakazo = (RakazoBridge(_bridge_cfg, self.assistant, version=__version__,
-                                    persistence=PostgresTokenPersistence(rakazo_bridge_dsn) if rakazo_bridge_dsn else None)
+                                    persistence=PostgresTokenPersistence(rakazo_bridge_dsn) if rakazo_bridge_dsn else None,
+                                    space_persistence=PostgresSpacePersistence(rakazo_bridge_dsn) if rakazo_bridge_dsn else None,
+                                    prefs_persistence=PostgresPrefsPersistence(rakazo_bridge_dsn) if rakazo_bridge_dsn else None,
+                                    push_persistence=PostgresPushPersistence(rakazo_bridge_dsn) if rakazo_bridge_dsn else None,
+                                    collab=collab, artifacts_fn=lambda: RegistryBackend(self))
                        if _bridge_cfg["enabled"] else None)
         from .ingest import IngestService
         # operator YAML: {api key: {rooms: [...], missions: [...]}} -> principal ids (the key itself is never kept)
@@ -640,6 +652,8 @@ class ControlPlaneServer:
         self.intelligence.single_operator_fn = lambda: self.single_operator
         if self.rakazo is not None:
             self.rakazo.desk.routes = self.intelligence      # board proposals as phone cards (scope: assistant_viewers)
+            self.intelligence.board.on_new = self.rakazo.notify_proposal      # and as push notifications
+            self.intelligence.push_status_fn = lambda: dict(self.rakazo.push.counters, enabled=self.rakazo.push.enabled)
         self.intelligence.github_app_fn = lambda: getattr(self, "gate_app", None) or self._pr_lister
         self.intelligence.poll_status_fn = lambda: {"client": "review_gate" if getattr(self, "gate_app", None) else "shared",
                                                     "last_error": self._pr_lister.last_error}
@@ -647,6 +661,10 @@ class ControlPlaneServer:
         self.intelligence.ci_rerun_fn = self._intelligence_ci_rerun
         if getattr(self, "assistant", None) is not None:
             self.assistant.intelligence_read = self.intelligence.assistant_read
+            _google = (self.assistant.config or {}).get("google") or {}
+            if _google.get("enabled"):      # read-only Gmail + Calendar for the listed users (personal_assistant.google)
+                from .google_workspace import GoogleWorkspace
+                self.assistant.google_read = GoogleWorkspace(_google).run
             from .assistant_lineage import LineageReader, principal_resolver
             self.assistant.lineage_read = LineageReader(repo.graph, principal_resolver(self._keys)).read
             from .assistant_adapters import comment_hook, draft_writer_hook, rereview_hook
@@ -1756,6 +1774,16 @@ def _make_handler(server, public=False, operator=False):
                     return role
             return None
 
+        def _lineage_handoffs(self):
+            """Pi's handoffs from the lineage graph, only those this caller's principal may read. (rows, status)."""
+            from .handoff_lineage import rows_from_nodes
+            try:
+                out = read_graph(server.repo.graph, self._principal(), ["nodes"],
+                                 lambda name: {"node_type": "handoff", "limit": "1000"}.get(name))
+                return rows_from_nodes(out.get("nodes")), ("truncated" if out.get("truncated") else "ok")
+            except Exception:                      # a graph that cannot answer must never take the registry view down with it
+                return [], "unavailable"
+
         def _principal(self):
             """Who the request authenticated as (server-side actor of ingest envelopes).
 
@@ -2191,7 +2219,6 @@ def _make_handler(server, public=False, operator=False):
         def _rakazo(self):
             """``/rpc/*`` and ``/api/auth/*`` for the Rakazo mobile app (only when control_plane.rakazo_bridge is on).
             Auth is the bridge's own bearer token, not X-API-Key; the request body is never logged."""
-            from .rakazo_bridge import MAX_BODY
             lengths = self.headers.get_all("Content-Length") or []
             if len(lengths) > 1 or "Transfer-Encoding" in self.headers:
                 return self._deny(400, "ambiguous request framing")
@@ -2199,11 +2226,12 @@ def _make_handler(server, public=False, operator=False):
                 length = int(lengths[0]) if lengths else 0
             except ValueError:
                 return self._deny(400, "bad length")
-            if length < 0 or length > MAX_BODY:
+            headers = {k.lower(): v for k, v in self.headers.items()}
+            if length < 0 or length > server.rakazo.body_limit(self.path, headers):
+                self.close_connection = True              # the unread body would otherwise be parsed as the next request
                 return self._deny(413, "body too large")
             body = self.rfile.read(length) if length else b""
-            response = server.rakazo.handle(self.command, self.path, {k.lower(): v for k, v in self.headers.items()},
-                                            body, self.client_address[0])
+            response = server.rakazo.handle(self.command, self.path, headers, body, self.client_address[0])
             if response is None:
                 return self._send_json(404, {"error": "not found"})
             try:
@@ -3046,10 +3074,36 @@ def _make_handler(server, public=False, operator=False):
                 return self._json(server.deployments_view())
             if resource == "handoffs":
                 if len(parts) == 5 and parts[4] == "tree":
-                    return self._json(server.handoffs.tree())
+                    return self._json(server.handoffs.tree(session_id=_q(self.path, "session_id")))
+                if len(parts) == 5 and parts[4] == "overview":
+                    extra, status = self._lineage_handoffs()
+                    out = server.handoffs.overview(extra=extra)
+                    out["sources"] = {"registry": "ok", "lineage": status}
+                    return self._json(out)
+                if len(parts) == 6 and parts[5] == "chain":
+                    extra, _ = self._lineage_handoffs()
+                    try:
+                        return self._json(server.handoffs.chain(parts[4], extra=extra))
+                    except KeyError:
+                        return self._json({"error": "not found"}, 404)
                 if len(parts) == 5:
-                    row = server.handoffs.get(parts[4])
+                    hid = parts[4]
+                    if hid.startswith("handoff:"):
+                        from .handoff_lineage import row_from_node
+                        try:
+                            node = read_graph(server.repo.graph, self._principal(), ["nodes", hid], lambda name: None)["node"]
+                        except KeyError:
+                            return self._json({"error": "not found"}, 404)
+                        row = row_from_node(node)
+                        return self._json(row) if row else self._json({"error": "not found"}, 404)
+                    row = server.handoffs.get(hid)
                     return self._json(row) if row else self._json({"error": "not found"}, 404)
+                if any(_q(self.path, k) for k in ("cursor", "workspace", "attention", "limit")):
+                    extra, _ = self._lineage_handoffs()
+                    return self._json(server.handoffs.page(
+                        state=_q(self.path, "state"), workspace=_q(self.path, "workspace"),
+                        attention=_q(self.path, "attention") == "1", cursor=_q(self.path, "cursor"),
+                        limit=_qint(self.path, "limit", 50), extra=extra))
                 return self._json({"handoffs": server.handoffs.list(state=_q(self.path, "state"))})
             if resource == "scheduler":
                 if len(parts) == 4:

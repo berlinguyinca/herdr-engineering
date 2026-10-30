@@ -5,6 +5,19 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Artifact gallery: filter by linked work (unified workspace P03)
+- The Artifacts page can list what is linked to a project, issue, task or room ("Linked to" + id, through `/api/v1/artifacts/for/<kind>/<ref>`, which already filters by what the signed-in user may read), and an artifact's page shows a "Linked to" section. Type and status filters apply to the full list only. The web client gains `artifactsForContext` and `artifactLinks`. No server change.
+
+### Artifact registry: link from the CLI (unified workspace P03)
+- `herdr-eng artifacts links <id>` lists an artifact's bindings and `artifacts link <id> --project|--issue|--task|--room [--version V] [--link-kind origin|reference|derived]` adds one through the existing links route (idempotent; refused client-side with no target). Searching a project, issue, task or room is `artifacts for <kind> <ref> --query`. There is still no `diff`: the server has no diff route.
+
+### Collaboration tasks: crash takeover (unified workspace P05)
+- `control_plane.collab.task_lease_seconds` (60 to 604800, YAML only, read at startup, absent = off) turns the lease on. A change needs a restart; it is not a hot switch.
+- `CollabService.task_lease_seconds` (default None = off): an accepted task whose lease ran out goes back to pending for its target agent when that agent polls its inbox, as a replayable `task.requeue` event. Each task carries an `attempt` (starts at 1); an update that names a stale `attempt` is refused with 409. No fleet-config key yet, so nothing changes in production.
+
+### Artifact registry: read-only CLI (unified workspace P03)
+- `herdr-eng artifacts show <id> [version]`, `versions <id>` and `for <kind> <ref> [--query --media-type --limit --cursor]` browse the versioned registry through the existing read routes. Nothing new is exposed server-side; an unreadable artifact answers "not found, or you cannot read it". The key is read from the environment variable named by `--api-key-env` and never printed.
+
 ### Artifact registry: scheduled reconcile (unified workspace P03)
 - The worker can now run the registry's reconcile pass on a schedule: `control_plane.artifact_reconcile: {enabled, interval_seconds, grace_seconds, orphan_ttl_hours, limit}` in the fleet file (YAML only, off unless `enabled` is exactly true). It marks orphan blobs (never deletes them), closes expired uploads and purges tombstones past their hold window; lineage re-emission is not part of the scheduled pass. A failing pass is logged and never stops the worker.
 

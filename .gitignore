@@ -55,3 +55,4 @@ scripts/.share-browser-cache/
 tests/share-fixtures/html-parquet-duckdb/vendor/*.wasm
 tests/share-fixtures/html-parquet-duckdb/vendor/*.worker.js
 tests/share-fixtures/html-parquet-duckdb/vendor/extensions/
+.superpowers/

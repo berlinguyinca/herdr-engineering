@@ -12,6 +12,7 @@ from __future__ import annotations
 import hashlib
 import json
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from urllib.parse import urlencode
@@ -94,6 +95,7 @@ class ActionBoard:
     def __init__(self, clock=lambda: datetime.now(UTC), ttl: timedelta = timedelta(minutes=30)):
         self._clock, self._ttl = clock, ttl
         self._p: dict[str, Proposal] = {}
+        self.on_new: Callable[[Proposal], None] | None = None     # told of each NEW proposal (never an idempotent repeat)
         self._idem: dict[tuple[str, str, str], str] = {}
 
     def request(self, *, org_id: str, requester: str, action: str, payload: dict, resource_version: int,
@@ -113,6 +115,11 @@ class ActionBoard:
         self._p[p.id] = p
         if idempotency_key is not None:
             self._idem[(org_id, requester, idempotency_key)] = p.id
+        if self.on_new is not None:
+            try:
+                self.on_new(p)
+            except Exception:  # noqa: BLE001 - a listener must never break filing a proposal
+                pass
         return p
 
     def approve(self, proposal_id: str, *, approver: str, org_id: str, payload_sha256: str, resource_version: int,

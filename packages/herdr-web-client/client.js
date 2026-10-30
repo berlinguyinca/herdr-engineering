@@ -127,8 +127,29 @@ export class HerdrClient {
     }
   }
 
-  getHandoffTree({ signal } = {}) {
-    return this.request('/api/v1/handoffs/tree', { signal });
+  getHandoffTree({ signal, sessionId } = {}) {
+    return this.request(`/api/v1/handoffs/tree${sessionId ? `?session_id=${encodeURIComponent(sessionId)}` : ''}`, { signal });
+  }
+
+  getHandoffOverview({ signal } = {}) {
+    return this.request('/api/v1/handoffs/overview', { signal });
+  }
+
+  pageHandoffs({ state, workspace, attention, cursor, limit = 50, signal } = {}) {
+    const query = new URLSearchParams({ limit: String(limit) });
+    if (state) query.set('state', state);
+    if (workspace) query.set('workspace', workspace);
+    if (attention) query.set('attention', '1');
+    if (cursor) query.set('cursor', cursor);
+    return this.request(`/api/v1/handoffs?${query}`, { signal });
+  }
+
+  getHandoff(id, { signal } = {}) {
+    return this.request(`/api/v1/handoffs/${encodeURIComponent(id)}`, { signal });
+  }
+
+  getHandoffChain(id, { signal } = {}) {
+    return this.request(`/api/v1/handoffs/${encodeURIComponent(id)}/chain`, { signal });
   }
 
   listHandoffs(state, { signal } = {}) {
@@ -142,6 +163,19 @@ export class HerdrClient {
       if (value != null && value !== '') query.set(key, String(value));
     }
     return this.request(`/api/v1/artifacts${query.size ? `?${query}` : ''}`, { signal });
+  }
+
+  // Artifacts bound to a project, issue, task or room (P03). The server filters by what the caller may read.
+  artifactsForContext(kind, ref, { q, mediaType, limit, cursor, signal } = {}) {
+    const query = new URLSearchParams();
+    for (const [key, value] of Object.entries({ q, media_type: mediaType, limit, cursor })) {
+      if (value != null && value !== '') query.set(key, String(value));
+    }
+    return this.request(`/api/v1/artifacts/for/${encodeURIComponent(kind)}/${encodeURIComponent(ref)}${query.size ? `?${query}` : ''}`, { signal });
+  }
+
+  artifactLinks(id, { signal } = {}) {
+    return this.request(`/api/v1/artifacts/${encodeURIComponent(id)}/links`, { signal });
   }
 
   getArtifact(id, { signal } = {}) {
