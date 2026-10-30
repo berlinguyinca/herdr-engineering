@@ -9,3 +9,8 @@ Pi: CLI only (`pi-engineering herdr ...`, `mission submit|observe|cancel`, `plan
 
 ## Missing for the spec (to be added by EXTENDING the above)
 teams list/summary; project/issue/task-centric graph reads (root + as_of); layout document GET/PUT; artifacts-by-{project,issue,task}; unified approvals queue; pi room history/list payloads (rooms/messages cursor reads exist and likely suffice).
+
+## Smoke-test corrections (2026-10-28, see SMOKE.md)
+- Artifacts are at `/api/v1/artifacts*` and attention at `/api/v1/attention*` (NOT `/api/v1/fabric/artifacts`, `/fabric/attention`; those 404 in production). Lineage graph reads are at `/api/v1/graph/{nodes,...}` (viewer-filtered; `node_type` required), not under `/collab/graph`.
+- Room attention (`rooms/{id}/attention`), `/progress`, `/members`, `/analytics`, `/architecture-links` returned 404 in production.
+- Fabric gateway control port (`:29999`) is not the dashboard API; the dashboard/API is `herdr-cp-web` on port 80 of the tailnet address.
