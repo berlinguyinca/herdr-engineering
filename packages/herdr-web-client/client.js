@@ -303,6 +303,11 @@ export class HerdrClient {
     return this.request(`/api/v1/sessions/${encodeURIComponent(id)}`, { signal });
   }
 
+  // Commits and pull requests the server can attribute to this agent without guessing (state: linked | ambiguous | none).
+  getSessionCommits(id, { signal } = {}) {
+    return this.request(`/api/v1/sessions/${encodeURIComponent(id)}/commits`, { signal });
+  }
+
   getAgentSummary(id, { signal } = {}) {
     return this.request(`/api/v1/sessions/${encodeURIComponent(id)}/summary`, { signal });
   }

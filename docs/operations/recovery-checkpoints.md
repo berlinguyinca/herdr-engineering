@@ -52,8 +52,10 @@ the actual deployment scale before cutover. Rebuild offline after bulk repair,
 retention, or a large tail, and when changing the compaction format. Do not lower
 readiness requirements or omit streams to make a deployment appear healthy.
 
-Old generations are retained for readers and rollback; no automatic pruning is
-performed. Keep the underlying journal for authoritative recovery and audit.
+Old generations are retained for readers and rollback. The compaction job prunes
+after each rebuild, keeping the newest `keep_checkpoints` (default 2, the active
+one always included); a manual builder run leaves older generations in place until
+the next job rebuild or `prune_checkpoints()`. Keep the underlying journal for authoritative recovery and audit.
 
 Projection compaction does not truncate history APIs. Host, session and service
 history reads use the raw PostgreSQL journal: indexed keyset pages for paginated

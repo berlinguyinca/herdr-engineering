@@ -26,7 +26,7 @@ from uuid import uuid4
 
 from ..host_policy import HostPolicy, HostSnapshot, PolicyMode, normalize_aliases
 from ..llm_session_id import dashboard_form
-from . import llm_stats
+from . import llm_stats, usage_spend
 from .agent_identity import (
     AgentIdentityConflict,
     AgentIdentityRegistry,
@@ -3222,6 +3222,16 @@ class ControlPlaneRepo:
         step_s = llm_stats.STEPS[step]
         points = llm_stats.timeseries(records, metric, since=since, until=now, step=step_s)
         return dict(meta, step=step, metric=metric, points=points)
+
+    def llm_spend(self, window="24h", prices=(), **filters):
+        """Priced estimate of the window's tokens (docs/usage-spend-estimate.md). Proxy traffic only unless a source is asked
+        for: a transcript and the proxy can describe the same call, so the two are never summed."""
+        source = filters.get("source") or "llm-proxy"
+        filters["source"] = source
+        if not prices:
+            return {"configured": False}
+        records, _, meta, _, _ = self._llm_window(window, filters)
+        return dict(meta, source=source, **usage_spend.estimate(records, prices))
 
     def llm_errors(self, window="24h", error_class=None, **filters):
         filters["source"] = "llm-proxy"   # a transcript carries no status, so it has no errors

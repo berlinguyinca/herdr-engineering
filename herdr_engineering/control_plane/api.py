@@ -294,9 +294,9 @@ class ControlPlaneServer:
                  operator_port=None, operator_user=None, operator_email=None,
                  operator_hosts=(), collab_operator_url=None, collab_dashboard_hosts=(),
                  summary_config=None, summary_client=None, summary_report_config=None, usage_retention=None, lineage_key_scopes=None,
-                 review_quorum=None, system_graph: bool = False, attention=None, ci_fix=None, missions=None, github_pg_dsn=None, ci_log_tests=None,
+                 review_quorum=None, system_graph: bool = False, attention=None, ci_fix=None, missions=None, github_pg_dsn=None, ci_log_tests=None, usage_prices=None,
                  architecture_enabled=None, architecture_explain=None, architecture_options=None,
-                 request_workers=128, request_queue=256,
+                 request_workers=128, request_queue=256, single_operator=False,
                  assistant_service=None, assistant_config=None, fabric_resolver=None, fabric_services=None, fabric_names=None,
                  scheduler_admission=False, scheduler_limits=None, skill_registry=None,
                  unified_workspace_config=None):
@@ -320,6 +320,8 @@ class ControlPlaneServer:
         from .retention import usage_retention_config
         # control_plane.llm_proxy raw/rollup retention (validated; None = defaults).
         self.usage_retention = usage_retention_config(usage_retention)
+        # control_plane.usage.prices (validated by the caller; empty = no estimate).
+        self.usage_prices = list(usage_prices or [])
         # control_plane.ci_fix (validated; None = defaults, which are disabled: the routes then 404).
         from .ci_fix import CIFixService, ci_fix_config
         self.ci_fix_config = ci_fix_config(ci_fix)
@@ -465,6 +467,12 @@ class ControlPlaneServer:
             self._keys[api_key] = "operator"
         self.api_key = api_key  # kept for backward compat / introspection
         self.allow_open = allow_open
+        # One person on a private tailnet: the open listener's caller is trusted as the operator for the assistant's
+        # preauthorized grants and for approving proposals (including their own). Off by default; incompatible with
+        # API keys, because with keys there are real identities and the normal rules apply.
+        self.single_operator = bool(single_operator)
+        if self.single_operator and self._keys:
+            raise ValueError("single_operator needs an open listener: remove control_plane.api_keys or turn it off")
         # Fail-closed (Spec §104): an unauthenticated server is only ever
         # allowed on a loopback bind unless the operator explicitly opts in
         # with allow_open (Tailnet trust boundary). Never silently exposed.
@@ -579,7 +587,13 @@ class ControlPlaneServer:
             repo, lambda: self._intelligence_section(fleet_config), github_pg_dsn)
         repo.egress_fn = lambda: self._intelligence_section(fleet_config).get("egress") or {}
         self.intelligence.metrics_fn = self._intelligence_metrics
-        self.intelligence.github_app_fn = lambda: getattr(self, "gate_app", None)
+        # The review gate's client when the gate is on, else the shared credential (github.app, then github.token).
+        from .intel_github import SharedCredentialPrLister
+        self._pr_lister = SharedCredentialPrLister()
+        self.intelligence.single_operator_fn = lambda: self.single_operator
+        self.intelligence.github_app_fn = lambda: getattr(self, "gate_app", None) or self._pr_lister
+        self.intelligence.poll_status_fn = lambda: {"client": "review_gate" if getattr(self, "gate_app", None) else "shared",
+                                                    "last_error": self._pr_lister.last_error}
         self.intelligence.ci_repair_fn = self._intelligence_ci_repair
         if getattr(self, "assistant", None) is not None:
             self.assistant.intelligence_read = self.intelligence.assistant_read
@@ -2984,6 +2998,13 @@ def _make_handler(server, public=False, operator=False):
                 return self._inspector_global_get(parts)
             if resource == "sessions" and len(parts) > 5 and parts[5] == "inspector":
                 return self._inspector_get(parts)
+            if resource == "sessions" and len(parts) == 6 and parts[5] == "commits":
+                from .session_commits import session_commits
+                session = r.get_session(parts[4])
+                if session is None:
+                    return self._json({"error": "agent not found"}, 404)
+                view = server.ci_monitor.snapshot(start=False) if server.ci_monitor is not None else {}
+                return self._json(session_commits(session, r.list_sessions(), view, pull_requests=r.list_pull_requests()))
             if resource == "sessions" and len(parts) == 6 and parts[5] == "summary":
                 if r.get_session(parts[4]) is None:
                     return self._json({"error": "agent not found"}, 404)
@@ -3199,7 +3220,7 @@ def _make_handler(server, public=False, operator=False):
                     return self._json({"keys": r.list_project_keys()})
                 if what == "models":
                     return self._json({"models": list(r.list_custom_models().values())})
-                if what in ("stats", "timeseries", "errors") and len(parts) == 5:
+                if what in ("stats", "timeseries", "errors", "spend") and len(parts) == 5:
                     return self._llm_stats(what)
                 return self._json({"error": "not found"}, 404)
             if resource == "graph":
@@ -3976,7 +3997,7 @@ def _make_handler(server, public=False, operator=False):
                                                scope=body.get("scope", "*"),
                                                ttl_seconds=body.get("ttl_seconds"),
                                                preauthorized=bool(body.get("preauthorized", False)),
-                                               principal=self._principal())
+                                               principal=self._principal(), single_operator=server.single_operator)
                         return self._json(grant.as_dict(), 201)
                     if len(parts) == 7 and parts[5] == "permissions" and parts[6] == "revoke":
                         svc.revoke_grant(body.get("grant_id", parts[5]), tenant_id=tenant_id, user_id=user_id)
@@ -4247,6 +4268,8 @@ def _make_handler(server, public=False, operator=False):
                 if what == "stats":
                     return self._json(server.repo.llm_stats(
                         window, _q(self.path, "group") or "model", **filters))
+                if what == "spend":
+                    return self._json(server.repo.llm_spend(window, server.usage_prices, **filters))
                 if what == "timeseries":
                     return self._json(server.repo.llm_timeseries(
                         window, _q(self.path, "step") or "1h", _q(self.path, "metric") or "requests",

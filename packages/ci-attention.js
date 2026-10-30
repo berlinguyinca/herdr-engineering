@@ -147,7 +147,7 @@ const styles = `.cia{margin:12px 0 20px;min-width:0}.cia h2{font-size:15px;margi
 .cia-chip{font-size:11px;padding:0 8px;border:1px solid var(--border);border-radius:99px;color:var(--text-secondary)}.cia-chip--bad{border-color:var(--status-failed);color:var(--status-failed)}
 .cia-body{padding:4px 4px 16px 24px}.cia-who{font-size:13px;margin:4px 0 8px;overflow-wrap:anywhere}.cia-links{font-size:12px;margin:8px 0 0}.cia-step h3{font-size:13px;margin:8px 0 4px}
 .cia-log{margin:4px 0;padding:12px;background:var(--surface-2);border:1px solid var(--border);border-radius:var(--radius-sm);font-size:12px;line-height:1.5;max-height:320px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere}
-.cia-runs{list-style:none;margin:0;padding:0}.cia-run{display:flex;flex-wrap:wrap;align-items:center;gap:4px 12px;padding:8px 4px;border-bottom:1px solid var(--border-subtle);font-size:13px}.cia-more{margin:8px 0}`;
+.cia-runs{list-style:none;margin:0;padding:0}.cia-run{display:flex;flex-wrap:wrap;align-items:center;gap:4px 12px;padding:8px 4px;border-bottom:1px solid var(--border-subtle);font-size:13px}.cia-more{margin:8px 0}@media(max-width:900px){a.cia-name{display:inline-flex;align-items:center;min-height:44px}}`;
 
 /** Mounts the section into `host`; returns a disposer. Opened rows survive the refresh. */
 export function mountCiAttention(host, client, { intervalMs = 20000, now = () => Date.now(), onModel = () => {} } = {}) {

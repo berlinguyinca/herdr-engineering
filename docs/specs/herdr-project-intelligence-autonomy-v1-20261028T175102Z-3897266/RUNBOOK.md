@@ -80,3 +80,20 @@ exact `payload_sha256` and `resource_version` it was shown. Proposals expire aft
 
 ## GitHub without a webhook (tailnet-only)
 GitHub cannot reach a tailnet, so use outbound polling: set `project_intelligence.reconcile_interval_seconds` (integer, at least 60; absent or anything else = off), plus `webhook_projects` (repo -> project ids) and `default_org_id`. Every interval the dashboard records open PR heads no event has recorded. It runs only while `enabled` and `ingest` are on and the kill switch is off. Latency is up to one interval; CI failures arrive through fabric events regardless. `POST /api/v1/intelligence/webhooks/reconcile` still runs one pass by hand.
+
+## Single-operator mode (one person, private tailnet)
+`control_plane.single_operator: true` (YAML, default false) lets the open listener's caller act as the operator: the
+assistant's `preauthorized` grants are accepted, a proposal can be approved or rejected without an `approvers` list, and the
+requester may approve their own proposal (the exact `payload_sha256` and `resource_version` are still required). It also
+turns on `personal_assistant.actions.allow_self_approval`. `send_message` and `run_shell` still always need an approval.
+The server refuses to start with `single_operator` and `api_keys` together; with keys the normal identity rules apply.
+
+Residual risk: on an open listener every process on the tailnet is "the operator", including coding agents, so any of them
+can grant a tool or click approve. Use it only while that is acceptable; the audit log still records each decision.
+
+## Pull-request polling without the review gate
+With `reconcile_interval_seconds` set, the poller uses the review gate's GitHub client when the gate is on, otherwise the
+shared credential (`github.app`, else `github.token`) with a repo-scoped `pull_requests: read` token. The GitHub App must have
+"Pull requests: Read-only" and the installation must accept it. `GET /api/v1/intelligence/status` (operator) shows
+`poller`: the latest pass counters and `last_error` (`permission`, `unknown_owner`, `not_configured`, `not_found`, ...).
+

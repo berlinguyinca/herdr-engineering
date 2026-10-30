@@ -36,6 +36,7 @@ class CompactionSettings:
     batch_rows: int = 250_000
     archive_retention_days: float | None = 30.0
     rebuild_checkpoint: bool = True
+    keep_checkpoints: int = 2
 
 
 # The candidate rows. Windows run over the whole stream so "first" and "last" are real, age is applied afterwards.
@@ -127,4 +128,11 @@ class FabricCompactor:
         except (rc.CheckpointUnavailable, rc.CheckpointBuildInProgress) as exc:
             return f"checkpoint rebuild deferred ({type(exc).__name__})"
         self._rebuild_pending = False
-        return f"checkpoint rebuilt ({report.get('selected_events')} rows selected)"
+        outcome = f"checkpoint rebuilt ({report.get('selected_events')} rows selected)"
+        try:
+            outcome += f", pruned {await rc.prune_checkpoints(conn, self.settings.keep_checkpoints)} old generations"
+        except rc.CheckpointBuildInProgress:
+            outcome += ", prune deferred"
+        except Exception as exc:    # the rebuild already succeeded: a failed prune retries on the next rebuild
+            outcome += f", prune failed ({type(exc).__name__})"
+        return outcome
