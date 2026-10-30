@@ -135,3 +135,18 @@ def test_sync_dir_membership_is_read_from_files_and_fails_closed(tmp_path):
     members.unlink()                                    # a missing file fails closed too
     sign.auth._checked.clear()
     assert sign.still_member("carol") is False
+
+
+def test_a_dead_sync_job_revokes_members_already_cached_as_allowed(tmp_path):
+    cfg = rc.cognito_config({**CFG, "group_check": True, "sync_dir": str(tmp_path)})
+    members = tmp_path / "members.json"
+    now = [time.time()]
+    members.write_text(json.dumps({"updated": now[0], "groups": {GROUP: ["carol"]}}))
+    sign = rc.CognitoSignIn(cfg, login=lambda *a: tokens(), jwks_fetch=jwks)
+    sign.auth._now = lambda: now[0]
+    assert sign.still_member("carol") is True           # cached as allowed
+    # The sync job dies: the file goes stale. Once the cached answer is due for a re-check,
+    # the member is out, with no extra grace on top of the file's own max age.
+    members.write_text(json.dumps({"updated": time.time() - 3600, "groups": {GROUP: ["carol"]}}))
+    now[0] += 3600
+    assert sign.still_member("carol") is False

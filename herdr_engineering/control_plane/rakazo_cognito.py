@@ -119,15 +119,17 @@ class CognitoSignIn:
         self.cfg = cfg
         self.region = _POOL.match(cfg["pool_id"]).group(1)
         lookup = group_lookup
+        grace = 5.0
         if lookup is None and cfg["group_check"] and cfg.get("sync_dir"):
             # Membership comes from files a host-side job refreshes (collab-sync.sh): no AWS credentials in this process.
             # A stale or missing file fails closed, so the people it lists are the only ones admitted.
             lookup = SyncedDirectory(cfg["sync_dir"], cfg["required_group"]).groups
+            grace = 0.0       # a stale file means the sync died: nobody is carried on a cached "allowed"
         elif lookup is None and cfg["group_check"]:
             lookup = boto_member_lookup(cfg["pool_id"], self.region)       # ImportError/credential errors fail at startup
         self.auth = authenticator or CognitoAuthenticator(
             pool_id=cfg["pool_id"], client_ids=list(cfg["client_ids"]), required_group=cfg["required_group"],
-            jwks_fetch=jwks_fetch, group_lookup=lookup)
+            jwks_fetch=jwks_fetch, group_lookup=lookup, lookup_grace=grace)
         self._login = login or initiate_auth
 
     def authenticate(self, email: str, password: str) -> dict[str, str] | None:
