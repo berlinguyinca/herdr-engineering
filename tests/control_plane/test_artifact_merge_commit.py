@@ -215,6 +215,51 @@ def test_replay_with_same_idempotency_key_returns_same_version(parents_postgres)
     run(parents_postgres, body)
 
 
+def test_replay_after_head_already_has_the_change_returns_the_stored_version(parents_postgres):
+    texts = Texts()
+
+    async def body(store, conn):
+        aid, v1 = await setup(store, texts)
+        changes = [{"name": "doc.md", "op": "put", "entry": texts.entry("doc.md", edit(BASE_DOC, 3, "mine"))}]
+        first = await merge(store, texts, aid, v1["version_id"], changes, idempotency_key="ff")
+        assert first["result"] == "created"
+        # the head now equals mine: re-running the same change set would change nothing, yet a replay is
+        # answered from the idempotency record (never "no changes", never a second version)
+        again = await merge(store, texts, aid, v1["version_id"], changes, idempotency_key="ff")
+        assert again["version"]["version_id"] == first["version"]["version_id"]
+        assert again["result"] == "created" and again["merged_names"] == []
+        assert len(await store.list_versions(aid)) == 2 and await attempts(conn, aid) == []
+    run(parents_postgres, body)
+
+
+def test_duplicate_names_in_a_stored_manifest_are_refused(parents_postgres):
+    texts = Texts()
+
+    async def body(store, conn):
+        aid, v1 = await setup(store, texts, [texts.entry("doc.md", "a\n"), texts.entry("doc.md", "b\n")])
+        with pytest.raises(ArtifactError, match="duplicate file name in manifest: doc.md"):
+            await merge(store, texts, aid, v1["version_id"], [{"name": "x.md", "op": "delete"},
+                                                              {"name": "doc.md", "op": "delete"}])
+        assert await attempts(conn, aid) == []
+    run(parents_postgres, body)
+
+
+def test_lying_size_bytes_is_an_oversize_conflict(parents_postgres):
+    texts = Texts()
+
+    async def body(store, conn):
+        aid, v1 = await setup(store, texts)
+        v2 = await owner_commit(store, aid, v1["version_id"],
+                                [{**texts.entry("doc.md", edit(BASE_DOC, 2, "owner")), "size_bytes": 1}])
+        mine = {**texts.entry("doc.md", edit(BASE_DOC, 9, "mine")), "size_bytes": 1}
+        with pytest.raises(ArtifactMergeConflict) as caught:
+            await merge(store, texts, aid, v1["version_id"], [{"name": "doc.md", "op": "put", "entry": mine}],
+                        max_text_bytes=40)
+        assert [(c.name, c.kind) for c in caught.value.conflicts] == [("doc.md", "oversize")]
+        assert caught.value.head_version_id == v2["version_id"] and len(await attempts(conn, aid)) == 1
+    run(parents_postgres, body)
+
+
 def test_concurrent_identical_calls_produce_one_version(parents_postgres):
     texts = Texts()
 

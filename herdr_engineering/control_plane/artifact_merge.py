@@ -215,6 +215,8 @@ def merge3_text(
     ours_label: str = "head",
     theirs_label: str = "mine",
 ) -> TextMerge:
+    if any("\r" in label or "\n" in label for label in (ours_label, theirs_label)):
+        raise ValueError("merge labels must not contain line breaks")
     if ours == theirs:
         return TextMerge(text=ours, conflicted=False, conflicts=0)
     if ours == base:
@@ -338,6 +340,11 @@ def merge_manifests(
     store_text: Callable[[str, dict], dict],
     max_text_bytes: int = 2 * 1024 * 1024,
 ) -> ManifestMerge:
+    for side, entries in (("base", base), ("head", head), ("mine", mine)):
+        names = [e["name"] for e in entries]
+        if len(names) != len(set(names)):
+            dup = next(n for n in names if names.count(n) > 1)
+            raise ValueError(f"duplicate file name in {side} manifest: {dup}")
     b_map = {e["name"]: e for e in base}
     h_map = {e["name"]: e for e in head}
     m_map = {e["name"]: e for e in mine}
@@ -381,10 +388,15 @@ def merge_manifests(
                 conflict(kind)
                 continue
             try:
-                result = merge3_text(read_text(b), read_text(h), read_text(m))
+                texts = [read_text(e) for e in (b, h, m)]
             except UnicodeDecodeError:
                 conflict("not_utf8")
                 continue
+            # the declared size_bytes may lie: the cap applies to what was actually read
+            if any(len(t.encode("utf-8")) > max_text_bytes for t in texts):
+                conflict("oversize")
+                continue
+            result = merge3_text(*texts)
             if result.conflicted:
                 conflict("modify_modify_text", result.text)
             else:

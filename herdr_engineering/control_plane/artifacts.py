@@ -555,6 +555,8 @@ class ArtifactStore(ArtifactContextMixin, ArtifactUploadMixin, ArtifactLifecycle
         for entry in manifest if isinstance(manifest, list) else []:
             if not isinstance(entry, dict) or not isinstance(entry.get("name"), str) or not entry["name"]:
                 raise ArtifactError("manifest entries need a name to merge")
+            if entry["name"] in files:
+                raise ArtifactError(f"duplicate file name in manifest: {entry['name']}")
             files[entry["name"]] = ArtifactStore._with_sha(entry)
         return files
 

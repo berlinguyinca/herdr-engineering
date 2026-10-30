@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import hashlib
 
+import pytest
+
 from herdr_engineering.control_plane.artifact_merge import (
     FileConflict,
     ManifestMerge,
@@ -145,6 +147,25 @@ def test_oversize_text() -> None:
     m, rec = merge([b], [h], [mi], max_text_bytes=40)
     assert [c.kind for c in m.conflicts] == ["oversize"]
     assert m.conflicts[0].merged_text is None and rec.calls == []
+
+
+def test_oversize_by_actual_length_when_size_bytes_lies() -> None:
+    b = entry("a.txt", "x\n" * 30)
+    h = entry("a.txt", "h\n" + "x\n" * 29, size_bytes=1)  # declared tiny, actually 60 bytes
+    mi = entry("a.txt", "x\n" * 29 + "m\n", size_bytes=1)
+    b["size_bytes"] = 1
+    m, rec = merge([b], [h], [mi], max_text_bytes=40)
+    assert [(c.name, c.kind) for c in m.conflicts] == [("a.txt", "oversize")]
+    assert m.files == [] and rec.calls == []
+
+
+@pytest.mark.parametrize("side", [0, 1, 2])
+def test_duplicate_names_within_a_manifest_are_refused(side) -> None:
+    a1, a2 = entry("a.md", "1\n"), entry("a.md", "2\n")
+    sides = [[a1], [a1], [a1]]
+    sides[side] = [a1, a2]
+    with pytest.raises(ValueError, match="duplicate file name"):
+        merge(*sides)
 
 
 def test_binary_by_media_type_and_name() -> None:

@@ -313,7 +313,11 @@ def test_fuzz_random_triples_sound_invariants():
         assert result.conflicted == (result.conflicts > 0)
         # deterministic and symmetric in conflict count
         assert merge3_text(base, ours, theirs) == result
-        assert merge3_text(base, theirs, ours).conflicts == result.conflicts
+        swapped = merge3_text(base, theirs, ours)
+        assert swapped.conflicts == result.conflicts
+        if not result.conflicted:
+            # a clean merge does not depend on which side is "head"
+            assert swapped.text == result.text, (base, ours, theirs)
         content = _strip_markers(result.text)
         ours_l, theirs_l = ours.splitlines(), theirs.splitlines()
         # no invented lines: every output line exists on one of the sides,
@@ -415,3 +419,10 @@ def test_identities_and_invariants_hold_on_coarse_fallback(monkeypatch):
         content = _strip_markers(result.text)
         for line in set(content):
             assert line in x.splitlines() or line in y.splitlines()
+
+
+@pytest.mark.parametrize("labels", [{"ours_label": "he\nad"}, {"theirs_label": "mi\rne"},
+                                    {"ours_label": "x\r\n"}])
+def test_labels_with_line_breaks_are_refused(labels):
+    with pytest.raises(ValueError, match="line breaks"):
+        merge3_text("a\n", "b\n", "c\n", **labels)
