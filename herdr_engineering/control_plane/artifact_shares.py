@@ -64,7 +64,14 @@ _COLUMNS = ("share_id, artifact_id, version_id, audience, allow_emails, allow_gr
 
 
 class ShareError(ValueError):
-    """A share request or transition that violates the rules (never a server fault)."""
+    """A share request or transition that violates the rules (never a server fault).
+
+    ``code`` is an optional machine-readable reason (``"expired"`` for a share whose expiry passed before approval).
+    """
+
+    def __init__(self, *args, code: str | None = None):
+        super().__init__(*args)
+        self.code = code
 
 
 def new_token() -> tuple[str, str]:
@@ -177,7 +184,7 @@ class ShareStore:
             if current["state"] != "pending":
                 raise ShareError(f"share is {current['state']}, not pending")
             if current["expires_at"] is not None and current["expires_at"] <= datetime.now(UTC):
-                raise ShareError("share has already expired")
+                raise ShareError("share has already expired", code="expired")
             if await conn.fetchval("SELECT 1 FROM artifact_shares WHERE token_hash=$1", token_hash) is not None:
                 raise ShareError("token hash already in use")
             try:

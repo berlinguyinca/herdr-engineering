@@ -136,6 +136,7 @@ class Shares:
         self.fail_mark_live = False
         self.counter = 0
         self.before_revoke = None
+        self.mark_live_error = None
 
     def sync_call(self, method, *args, **kwargs):
         return getattr(self, method)(*args, **kwargs)
@@ -180,10 +181,12 @@ class Shares:
         row = self.rows[share_id]
         if self.fail_mark_live:
             raise RuntimeError("database went away")
+        if self.mark_live_error is not None:
+            raise self.mark_live_error
         if row["state"] != "pending":
             raise ShareError(f"share is {row['state']}, not pending")
         if row["expires_at"] is not None and row["expires_at"] <= datetime.now(UTC):
-            raise ShareError("share has already expired")
+            raise ShareError("share has already expired", code="expired")
         row.update(state="live", token_hash=token_hash, entry=index.entry, file_count=len(index.files),
                    total_bytes=index.total_bytes, approved_by=approved_by, approved_at=datetime.now(UTC))
         self.event_rows.append({"share_id": share_id, "at": datetime.now(UTC), "kind": "approved",
@@ -658,3 +661,81 @@ def test_early_answers_to_posts_close_the_connection(tmp_path):
     with share_server(tmp_path / "off", enabled=False) as (base, *_):
         status, headers = headers_of(base, SHARES)
         assert status == 503 and headers.get("Connection", "").lower() == "close"
+
+
+# ----------------------------------------------------------------------------------------------- fix round 1
+
+
+def unsized_version(registry, vid="v_unsized"):
+    outputs = copy.deepcopy(registry.versions["v_html"]["output_manifest"])
+    for item in outputs:
+        item.pop("size_bytes")
+    registry.versions[vid] = {"version_id": vid, "artifact_id": AID, "state": "ready", "output_manifest": outputs}
+    return vid
+
+
+def test_measured_sizes_over_total_cap_are_refused_before_any_write(tmp_path, monkeypatch):
+    from herdr_engineering.control_plane import artifact_share_api
+    built = []
+    real = artifact_share_api.build_bundle
+    monkeypatch.setattr(artifact_share_api, "build_bundle", lambda *a, **k: built.append(a) or real(*a, **k))
+    with share_server(tmp_path, max_total_bytes=200) as (base, registry, shares, _, root):
+        share_id = create(base, version=unsized_version(registry))[1]["share"]["share_id"]
+        shares.live_bytes_extra = 150          # declared sizes are 0, so only the measured total exceeds the cap
+        status, body = approve(base, share_id)
+        assert status == 400 and "200 byte total cap" in body["error"]
+        assert built == [] and list(root.iterdir()) == []
+        assert shares.rows[share_id]["state"] == "pending"
+
+
+def test_get_share_returns_row_and_pending_summary_without_token(env):
+    base, registry, shares, _, _ = env
+    share_id = create(base)[1]["share"]["share_id"]
+    path = f"{SHARES}/{share_id}"
+    assert request(base, path, key="other-key")[0] == 404
+    status, data = request(base, path)
+    assert status == 200
+    body = json.loads(data)
+    assert body["share"]["share_id"] == share_id and body["share"]["state"] == "pending"
+    summary = body["summary"]
+    assert summary["entry"] == "index.html" and summary["file_count"] == 3 and summary["audience"] == "public"
+    assert summary["total_bytes"] > 0 and summary["expires_at"] and isinstance(summary["warnings"], list)
+    token = token_of(approve(base, share_id)[1]["url"])
+    status, data = request(base, path)
+    text = data.decode()
+    assert status == 200 and json.loads(data)["share"]["state"] == "live" and "summary" not in json.loads(data)
+    assert token not in text and "token_hash" not in text and shares.rows[share_id]["token_hash"] not in text
+    shares.rows[share_id]["artifact_id"] = "artifact_other"
+    assert request(base, path)[0] == 404
+    assert request(base, f"{SHARES}/share_unknown")[0] == 404
+    assert request(base, path, body={})[0] == 404            # GET only
+
+
+def test_expires_in_days_is_bounded_for_every_audience(env):
+    base, *_ = env
+    for days in (3651, 10 ** 12):
+        assert create(base, audience="lab", allow_emails=["a@x.org"], expires_in_days=days)[0] == 400
+    assert create(base, audience="lab", allow_emails=["a@x.org"], expires_in_days=3650)[0] == 201
+
+
+def test_create_refuses_duplicate_and_clashing_names(env):
+    base, registry, _, _, _ = env
+    index = registry.versions["v_html"]["output_manifest"][0]
+    registry.versions["v_dup"] = {"version_id": "v_dup", "artifact_id": AID, "state": "ready",
+                                  "output_manifest": [index, {**index, "name": "INDEX.html"}]}
+    status, body = create(base, version="v_dup")
+    assert status == 400 and "duplicate" in body["error"]
+    registry.versions["v_clash"] = {"version_id": "v_clash", "artifact_id": AID, "state": "ready",
+                                    "output_manifest": [index, {**index, "name": "index.html/inner.html"}]}
+    status, body = create(base, version="v_clash")
+    assert status == 400 and "both a file and a directory" in body["error"]
+
+
+def test_mark_live_expiry_maps_to_410_by_code_not_message(env):
+    base, _, shares, _, root = env
+    share_id = create(base)[1]["share"]["share_id"]
+    shares.mark_live_error = ShareError("too late", code="expired")
+    assert approve(base, share_id)[0] == 410
+    shares.mark_live_error = ShareError("token hash already in use")
+    assert approve(base, share_id)[0] == 409
+    assert list((root / "by-token").iterdir()) == [] and not (root / share_id).exists()

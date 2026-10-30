@@ -8,6 +8,8 @@ Routes (all need the ``share`` permission on the artifact; a denial is a non-dis
   ``<shares_root>/<share_id>/files/`` bundle, writes ``by-token/<sha256(token)>/state.json`` LAST, marks the share
   live and returns the link ONCE. Any failure removes what this call wrote and leaves the share ``pending``.
 * ``GET .../shares``, ``GET .../shares/{sid}/events``: never carry a token or its hash.
+* ``GET .../shares/{sid}``: the share and, while pending, the same dry-run summary create returned (for the CLI to
+  print what approve will expose before the separate confirmed call).
 * ``POST .../shares/{sid}/revoke`` removes ``state.json`` first (the next request already 404s), then the bundle.
 
 The token is never stored, logged or returned twice: only its sha256 reaches the store and the volume.
@@ -27,6 +29,7 @@ from .share_bundle import (
     BundleLimits,
     ShareBundleError,
     build_bundle,
+    check_names,
     choose_entry,
     normalise_name,
     remove_bundle,
@@ -38,6 +41,7 @@ DEFAULTS = {"max_share_bytes": 512 * 1024 * 1024, "max_files": 20000, "max_total
             "default_public_days": 30}
 PREVIEW_NAME = "preview.html"
 LISTED_FILES = 200
+MAX_DAYS = 3650
 CREATE_FIELDS = {"version_id", "audience", "allow_emails", "allow_groups", "expires_in_days", "entry", "title"}
 # Serialises approvals in this process: the live-bytes budget is read, then spent, and a bundle directory is created.
 _APPROVE_LOCK = threading.Lock()
@@ -161,6 +165,10 @@ def _plan(server, artifact_id: str, version_id: str, entry: str | None) -> tuple
             raise ShareHTTPError(400, f"output {position}: {exc}") from None
         files.append({**pinned, "name": name})
     names = [f["name"] for f in files]
+    try:
+        check_names(names)
+    except ShareBundleError as exc:
+        raise ShareHTTPError(400, str(exc)) from None
     if not any(n.lower().endswith((".html", ".pdf")) for n in names):
         raise ShareHTTPError(400, "version has no HTML or PDF output to share")
     if len(files) > settings["max_files"]:
@@ -228,6 +236,7 @@ def approve_share(server, share: dict, *, approved_by: str | None = None) -> tup
             if item["size_bytes"] is None:
                 item["size_bytes"] = _measure(server, item, budget)
                 budget -= item["size_bytes"]
+        over_total(sum(f["size_bytes"] for f in files))        # measured sizes, before anything is written
         dest = root / share_id
         if dest.exists() or dest.is_symlink():
             raise ShareHTTPError(409, "a bundle directory already exists for this share; revoke it and create a new share")
@@ -248,7 +257,7 @@ def approve_share(server, share: dict, *, approved_by: str | None = None) -> tup
                 _call(server.share_store, "mark_live", share_id, token_hash=token_hash, index=index,
                       approved_by=approved_by or "unknown")
             except ShareError as exc:
-                raise ShareHTTPError(410 if "expired" in str(exc) else 409, str(exc)) from None
+                raise ShareHTTPError(410 if exc.code == "expired" else 409, str(exc)) from None
         except BaseException:
             if token_hash is not None:
                 remove_state(root, token_hash)
@@ -270,8 +279,8 @@ def _create(handler, server, artifact_id):
     if not isinstance(version_id, str) or not version_id:
         raise ValueError("version_id is required")
     days = body.get("expires_in_days")
-    if days is not None and (isinstance(days, bool) or not isinstance(days, int) or days < 1):
-        raise ValueError("expires_in_days must be a positive integer")
+    if days is not None and (isinstance(days, bool) or not isinstance(days, int) or not 1 <= days <= MAX_DAYS):
+        raise ValueError(f"expires_in_days must be an integer from 1 to {MAX_DAYS}")
     if days is None and audience == "public":
         days = server.share_settings["default_public_days"]
     expires_at = datetime.now(UTC) + timedelta(days=days) if days is not None else None
@@ -286,6 +295,18 @@ def _create(handler, server, artifact_id):
                 expires_at=expires_at, entry=entry, title=title, created_by=handler._resource_principal())
     handler._json({"share": _jsonable(row),
                    "summary": _summary(files, chosen, warnings, audience, row.get("expires_at"))}, 201)
+
+
+def _show(handler, server, share):
+    """The share (never its token hash) and, while pending, the exposure summary approve would publish."""
+    out = {"share": _jsonable(share)}
+    if share.get("state") == "pending":
+        try:
+            files, entry, warnings = _plan(server, share["artifact_id"], share["version_id"], share.get("entry"))
+            out["summary"] = _summary(files, entry, warnings, share["audience"], share.get("expires_at"))
+        except ShareHTTPError as exc:      # the version changed since create: say what approve would refuse
+            out["summary_error"] = exc.message
+    handler._json(out)
 
 
 def _revoke(handler, server, share):
@@ -308,10 +329,11 @@ def route_share(handler, server, parts, resource) -> bool:
         return False
     method = handler.command
     listing = len(parts) == 6
+    single = len(parts) == 7 and method == "GET"
     action = parts[7] if len(parts) == 8 else None
     allowed = {"approve": "POST", "revoke": "POST", "events": "GET"}
     # Early answers leave a POST body unread: close the connection so its bytes are never parsed as a next request.
-    if not (listing and method in {"GET", "POST"}) and allowed.get(action) != method:
+    if not (listing and method in {"GET", "POST"}) and not single and allowed.get(action) != method:
         handler._deny(404, "not found")
         return True
     if (getattr(server, "share_store", None) is None or getattr(server, "shares_root", None) is None
@@ -333,6 +355,8 @@ def route_share(handler, server, parts, resource) -> bool:
             handler._json({"artifact_id": artifact_id, "shares": _jsonable(rows)})
         elif listing:
             _create(handler, server, artifact_id)
+        elif single:
+            _show(handler, server, _get_share(server, artifact_id, parts[6]))
         else:
             # Read (and validate) a POST body before any lookup can answer early.
             body = _share_body(handler, {"confirm"} if action == "approve" else set()) if method == "POST" else None

@@ -211,6 +211,43 @@ def choose_entry(entry: str | None, names: list[str]) -> str:
     raise ShareBundleError("no HTML or PDF entry in the bundle; files: %s" % ", ".join(sorted(names)[:10]))
 
 
+class _NameSet:
+    """Duplicate (case/Unicode-folded) and file-versus-directory rules over a bundle's normalised names."""
+
+    def __init__(self):
+        self.seen: dict[str, str] = {}
+        self.folded_dirs: set[str] = set()
+
+    def add(self, name: str) -> None:
+        key = _fold(name)
+        if key in self.seen:
+            raise ShareBundleError("duplicate name (case/Unicode-folded): %s and %s" % (self.seen[key], name))
+        self.seen[key] = name
+        parts = key.split("/")
+        for i in range(1, len(parts)):
+            self.folded_dirs.add("/".join(parts[:i]))
+
+    def check_clashes(self) -> None:
+        if self.folded_dirs & set(self.seen):
+            clash = sorted(self.seen[k] for k in self.folded_dirs & set(self.seen))
+            raise ShareBundleError("name is both a file and a directory: %s" % ", ".join(clash))
+
+    def __len__(self) -> int:
+        return len(self.seen)
+
+
+def check_names(names: Iterable[str]) -> list[str]:
+    """Normalise ``names`` and apply build_bundle's duplicate and file/directory rules without writing anything."""
+    rules = _NameSet()
+    out = []
+    for name in names:
+        name = normalise_name(name)
+        rules.add(name)
+        out.append(name)
+    rules.check_clashes()
+    return out
+
+
 def build_bundle(dest: Path, files: Iterable[tuple[str, str, int, Iterable[bytes]]], *, entry: str | None,
                  limits: BundleLimits) -> BundleIndex:
     """Verify and write ``files`` (name, sha256, size, chunks) under ``dest/files``. ``dest`` must not exist; on any error it is removed."""
@@ -219,8 +256,7 @@ def build_bundle(dest: Path, files: Iterable[tuple[str, str, int, Iterable[bytes
     created = False
     try:
         entries = []
-        seen: dict[str, str] = {}
-        folded_dirs: set[str] = set()
+        rules = _NameSet()
         total_declared = 0
         for name, sha, size, chunks in files:
             name = normalise_name(name)
@@ -228,14 +264,8 @@ def build_bundle(dest: Path, files: Iterable[tuple[str, str, int, Iterable[bytes
                 raise ShareBundleError("%s has no valid sha256" % name)
             if not isinstance(size, int) or isinstance(size, bool) or size < 0:
                 raise ShareBundleError("%s has no valid size" % name)
-            key = _fold(name)
-            if key in seen:
-                raise ShareBundleError("duplicate name (case/Unicode-folded): %s and %s" % (seen[key], name))
-            seen[key] = name
-            parts = key.split("/")
-            for i in range(1, len(parts)):
-                folded_dirs.add("/".join(parts[:i]))
-            if len(seen) > limits.max_files:
+            rules.add(name)
+            if len(rules) > limits.max_files:
                 raise ShareBundleError("more than %d files" % limits.max_files)
             total_declared += size
             if total_declared > limits.max_bytes:
@@ -243,9 +273,7 @@ def build_bundle(dest: Path, files: Iterable[tuple[str, str, int, Iterable[bytes
             entries.append((name, sha, size, chunks))
         if not entries:
             raise ShareBundleError("bundle has no files")
-        if folded_dirs & set(seen):
-            clash = sorted(seen[k] for k in folded_dirs & set(seen))
-            raise ShareBundleError("name is both a file and a directory: %s" % ", ".join(clash))
+        rules.check_clashes()
         dest.mkdir(parents=True)
         created = True
         os.chmod(dest, 0o755)

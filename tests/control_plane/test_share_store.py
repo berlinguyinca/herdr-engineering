@@ -155,8 +155,9 @@ def test_state_machine(share_postgres):
         e = await store.create(**kw(aid, vid, expires_at=datetime.now(UTC) + timedelta(days=1)))
         await conn.execute("UPDATE artifact_shares SET expires_at=now()-interval '1 minute' WHERE share_id=$1",
                            e["share_id"])
-        with pytest.raises(ShareError):
+        with pytest.raises(ShareError) as expired:
             await store.mark_live(e["share_id"], token_hash=new_token()[1], index=index(), approved_by="op")
+        assert expired.value.code == "expired"
     run(share_postgres, body)
 
 
