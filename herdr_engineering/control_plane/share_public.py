@@ -788,6 +788,13 @@ class ShareHandler(BaseHTTPRequestHandler):
                 return deny(self, None, "method")    # no preflight: a foreign origin cannot send Authorization here
             _send_headers(self, 204, PREFLIGHT_HEADERS)
             return None
+        if len(parts) == 3 and self.command in ("GET", "HEAD") and TOKEN_RE.fullmatch(parts[2]):
+            # a link pasted without its trailing slash: answered for ANY well-formed token without looking it up,
+            # so the redirect says nothing about which tokens exist
+            _send_headers(self, 302, [("Location", parts[2] + "/"), ("Content-Length", "0"),
+                                      ("Cache-Control", "no-store"), ("Referrer-Policy", "no-referrer"),
+                                      ("X-Robots-Tag", "noindex"), ("X-Content-Type-Options", "nosniff")])
+            return None
         if len(parts) < 4 or not TOKEN_RE.fullmatch(parts[2]):
             return deny(self, None, "bad_token")
         is_link = len(parts) == 4 and parts[3] == ""
