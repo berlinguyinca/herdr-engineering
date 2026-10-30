@@ -47,6 +47,7 @@ class IntelligenceRoutes:
         self.ci_rerun_fn = None     # set by the API glue: (repository, run) -> restarts that CI run
         self.poll_status_fn = None  # set by the API glue: () -> {client, last_error} for the PR poller
         self.single_operator_fn = lambda: False   # set by the API glue: the server runs in single-operator mode
+        self.push_status_fn = None                # set by the server: counters of the phone push notifier
         self.ci_watch_status_fn = None            # set by the server: the scheduled CI watch's last-run summary
         self.last_reconcile: dict | None = None   # counters of the latest pass; a reason when it could not run
         self._executor = None
@@ -333,6 +334,8 @@ class IntelligenceRoutes:
                         poller.update(self.poll_status_fn())  # fixed reason strings (permission, not_configured ...)
                     out["poller"] = poller
                     out["ledger"] = self.ledger.status(raw)
+                    if self.push_status_fn is not None:
+                        out["push"] = self.push_status_fn()
                     if self.ci_watch_status_fn is not None:
                         out["ci_watch"] = self.ci_watch_status_fn()   # counts and fixed reasons only
                 return 200, out
