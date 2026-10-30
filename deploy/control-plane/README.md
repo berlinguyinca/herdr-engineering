@@ -739,3 +739,13 @@ For a Rakazo bridge account add `{tenant_id: default, user_id: "rakazo:<id>"}` a
 (`rakazo bridge assistant users: rakazo:...`, no email or secret), and an account must have created an assistant
 (opened the app once) before the watch has an assistant to act for. If `personal_assistant.tenancy.principals` maps the
 user to another tenant, use that tenant; the server logs a warning when the configured tenant disagrees.
+
+**Approving returns at once.** `threads/answer` records the decision and audit under the routes lock and returns
+`{"ok": true, "state": "approved"}` (the card shows "Allowed once", the outcome message says "Running now"); the executor
+(for a CI re-run, a Woodpecker restart that can take seconds) then runs on a daemon thread owned by the desk, at most 4 at a
+time with no queue behind them: a fifth approval while 4 run is refused with 429 before anything is decided. When the
+execution ends the same thread refreshes the journal, so the card turns Executed or Failed and the outcome is posted
+whether or not a stream is open. The executor claims the proposal itself, so a double answer, a racing dashboard approve or
+a late reject still cannot run it twice or after a reject. The board is in memory: a control-plane restart mid-execution
+drops the proposal with the rest of the board (nothing is left "executing"), and the action may or may not have reached
+the CI provider; check the dashboard or CI.

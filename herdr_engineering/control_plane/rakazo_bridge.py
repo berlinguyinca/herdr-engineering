@@ -40,7 +40,7 @@ from .assistant import (
     RateLimited,
     redact_secrets,
 )
-from .rakazo_proposals import ProposalDesk
+from .rakazo_proposals import Busy, ProposalDesk
 
 log = logging.getLogger(__name__)
 SLOW_CALL_MS = 300           # a call slower than this is logged (name + duration only)
@@ -568,6 +568,7 @@ class RakazoBridge:
 
     def close(self) -> None:
         self._closed.set()
+        self.desk.close()
 
     def client_address(self, peer: str, forwarded_for: str = "") -> str:
         """The address a request is attributed to (lockout key, token bookkeeping). The last X-Forwarded-For entry is
@@ -969,7 +970,10 @@ class RakazoBridge:
         try:
             with self.journals.lock:
                 journal = self.journals.get(thread.thread_id, assistant.assistant_id)
-            result = self.desk.answer(ctx.tenant, ctx.user, journal, message_id, run_id, decision)
+            result = self.desk.answer(ctx.tenant, ctx.user, journal, message_id, run_id, decision,
+                                      on_done=lambda: self._journal(ctx, assistant, thread, fresh=True, bypass=True))
+        except Busy as exc:
+            raise BridgeError(429, "TOO_MANY_REQUESTS", str(exc), {"Retry-After": "5"}) from None
         except pi.NotFound:
             raise BridgeError(404, "NOT_FOUND", "Not found.") from None
         except ApprovalRefused as exc:
