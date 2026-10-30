@@ -65,6 +65,7 @@ def _dict_to_event(ev: dict) -> Event:
         event_type=ev.get("event_type", ""),
         payload=ev.get("payload") or {},
         **{name: ev.get(name) for name in V2_COLUMNS},
+        trace_id=ev.get("trace_id"),
     )
 
 

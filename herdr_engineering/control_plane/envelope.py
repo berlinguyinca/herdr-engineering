@@ -26,7 +26,7 @@ VISIBILITY_SCOPES = ("private", "mission", "room", "org")
 DEFAULT_FRESHNESS_SECONDS = 300
 MAX_EVIDENCE_REFS = 64
 _ID_FIELDS = ("mission_id", "org_id", "project_id", "room_id", "workspace_id",
-              "task_id", "agent_id", "correlation_id", "causation_id")
+              "task_id", "agent_id", "correlation_id", "causation_id", "trace_id")
 _SOURCE_RE = re.compile(r"[a-z][a-z0-9_-]{0,31}")
 _MAX_STR = 512
 
@@ -178,7 +178,7 @@ def envelope_event_fields(env: dict) -> dict:
     return {name: env.get(name) for name in (
         "source", "source_sequence", "causation_id", "correlation_id", "actor",
         "visibility_scope", "evidence_refs", "org_id", "project_id", "room_id",
-        "workspace_id", "task_id", "agent_id")}
+        "workspace_id", "task_id", "agent_id", "trace_id")}
 
 
 def _actor_id(actor: Any) -> str:
