@@ -35,7 +35,7 @@ def test_reads_answer_with_nothing_configured(srv, alice):
     for name in sorted(rr.READS):
         if name in ("artifacts/list",):
             continue
-        inp = {"botId": "b", "role": "chat", "limit": 5, "query": "q", "usePublicCatalog": False, "status": "open"}
+        inp = {"botId": "b", "role": "main", "limit": 5, "query": "q", "usePublicCatalog": False, "status": "open"}
         out = api.ok(name, inp, alice)
         validate(name, out)
 

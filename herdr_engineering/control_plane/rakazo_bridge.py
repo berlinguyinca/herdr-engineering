@@ -35,6 +35,7 @@ from . import rakazo_artifacts as artifacts
 from . import rakazo_bots as bots
 from . import rakazo_events as ev
 from . import rakazo_memory as memory
+from . import rakazo_models as models
 from . import rakazo_prefs as pf
 from . import rakazo_rest as rest
 from . import rakazo_rooms as rooms
@@ -632,8 +633,9 @@ class RakazoBridge:
         self.memory = memory.Memory(self, BridgeError)
         self.routines = routines.Routines(self, BridgeError)
         self.artifacts = artifacts.Artifacts(self, BridgeError, artifacts_fn)
+        self.models = models.Models(self, BridgeError)
         for name, fn in {**self.bots.procs(), **self.memory.procs(), **self.routines.procs(),
-                         **self.artifacts.procs()}.items():
+                         **self.artifacts.procs(), **self.models.procs()}.items():
             self._procs[name] = fn
         self.rest = rest.Rest(self, BridgeError, set(self._procs))
         self._procs.update(self.rest.procs())

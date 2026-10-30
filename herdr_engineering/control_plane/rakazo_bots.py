@@ -27,7 +27,6 @@ _META: dict[str, Any] = {
     "voiceId": lambda v: v is None or (isinstance(v, str) and len(v) <= 120),
     "autoSpeak": lambda v: isinstance(v, bool),
     "modelProvider": lambda v: v is None or (isinstance(v, str) and 0 < len(v) <= 80),
-    "modelId": lambda v: v is None or (isinstance(v, str) and 0 < len(v) <= 200),
     "thinkingLevel": lambda v: v in (None, "off", "minimal", "low", "medium", "high", "xhigh", "max"),
     "teamChatAmbientEnabled": lambda v: isinstance(v, bool),
     "teamChatRules": lambda v: isinstance(v, str) and len(v) <= 4000,
@@ -94,6 +93,11 @@ class Bots:
                 if not ok(inp[key]):
                     raise self.Error(400, "BAD_REQUEST", f"{key} is not a valid value.")
                 meta[key] = inp[key]
+        if "modelId" in inp:
+            model = inp["modelId"]
+            if model is not None and (not isinstance(model, str) or not 0 < len(model) <= 200):
+                raise self.Error(400, "BAD_REQUEST", "modelId is not a valid value.")
+            patch["model_policy"] = f"manual:{model}" if model else "auto"
         text = inp.get("instructions")
         if text is not None:
             if not isinstance(text, str) or len(text) > 20_000:
