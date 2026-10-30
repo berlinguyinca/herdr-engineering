@@ -80,6 +80,9 @@ edge (nginx, location ^~ /s/ only) -> herdr-share-public:8083 (network `share`, 
   `openssl rand -hex 32`. Never commit it, print it, or pass it as a flag or environment variable. Rotating it
   ends every open lab session.
 - `public_url` must be a bare origin (empty path or `/`): the viewer's sign-in redirect is fixed at `/s/callback`.
+- Lab session lifetime: `control_plane.share.session_seconds` (default 14400 = 4 h) is only a cap. A session
+  also ends at the share's expiry and at the Cognito access token's `exp` (about 1 h with the pool's default
+  token validity), so recipients sign in again after ~1 h unless the app client's access-token validity is raised.
 - `cognito_clients`: the pool is shared with `lc-binbase-scheduler`. List only the app clients whose tokens may
   sign in here and open lab shares; any listed client's token is accepted.
 - Mounts: bundles at `~/.local/share/herdr-engineering/shares` (web/worker read-write, share-public read-only);
@@ -109,6 +112,14 @@ edge (nginx, location ^~ /s/ only) -> herdr-share-public:8083 (network `share`, 
   `limit_req`/`limit_conn` zones; `proxy_buffering off`; `proxy_read_timeout 600s`; no access log (tokens and
   session HMACs are in the path). Disabled, the edge conf is the repo file unchanged and a running
   share-public is stopped (its bundles stay on disk).
+- Edge limits (trade-off): `/s/` allows 100 requests/s per client address with a burst of 300 (parquet range
+  reads come in bursts, and campus NAT puts many people behind one address) and 16 concurrent connections per
+  address. The total is capped only by the upstream's `max_conns=100` (share-public refuses past 128): a
+  handful of heavy clients can take most of it and other viewers then wait or get 502, without a log line
+  per refusal. Lower the rate in `collab-edge/share-http.conf` / `share-location.conf` if abuse shows up.
+- Edge logging: `/s/` has no access log, but a request nginx refuses before it reaches the `/s/` location
+  (malformed request line, oversized headers, TLS or PROXY-protocol errors) can appear in the edge's access or
+  error log with its request line, which may contain a token.
 - Rollback: the previous edge conf and share slice are restored first. When that conf routes `/s/` and the
   previous commit defines share-public, share-public is recreated from that commit (and verified with the rest);
   otherwise a running share-public is stopped.
