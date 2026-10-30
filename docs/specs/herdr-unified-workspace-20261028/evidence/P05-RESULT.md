@@ -34,12 +34,15 @@ UI. Agents stay unable to submit tasks (decision recorded in P01 answers).
 ## Rollback
 Delete `team_tasks.py` and its test; no schema, route or config was added.
 
-## Design decisions (1 decided, 2-4 still need an owner's call)
+## Design decisions (1 decided, 2 partly built, 3-4 still need an owner's call)
 1. **Review lineage in the work graph: DECIDED and built.** Reusing the contract's own `depends_on` (graph `dependency`,
    dependent -> prerequisite, no binding needed) between the review task and the work task, plus a `reviews_task_id` attr to tell it
    from other dependencies. A new edge type (my first recommendation) would have inflated a versioned contract; the contract's
    `reviews` edge is from a `review` entity and maps to the bound `reviewed` edge, which does not fit a task-to-task review.
-2. **Where the lease lives.** `CollabService` is synchronous and event-sourced (state is rebuilt from the log); `PgLeaseStore` is
+2. **Where the lease lives (retry half built; crash takeover not).** Built: a retried completion returns the recorded outcome and
+   writes nothing, and cannot rewrite a finished task (`test_a_retry_of_a_completion_gets_the_recorded_outcome...`); a repeated
+   accept stays a 400 (existing contract, `test_collab_tasks.py`). Not built: fencing across a crashed worker, i.e. lease expiry
+   and takeover of an accepted task, which needs the rule below. Original question: `CollabService` is synchronous and event-sourced (state is rebuilt from the log); `PgLeaseStore` is
    async Postgres. Options: (a) model the lease in the collab event log (a fencing token in `task_updated`, completion requires it;
    recommended: one source of truth, restart-safe by replay, no cross-store consistency problem); (b) call `PgLeaseStore` from a
    worker and mirror the result into collab (two stores to keep consistent). Also needs a rule for what happens to an accepted

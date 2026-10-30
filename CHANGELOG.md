@@ -5,6 +5,9 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Unified workspace P05: safe retry of a task completion
+- `POST /api/v1/collab/tasks/{id}/update`: repeating a `done`/`failed` update with the identical result now returns `{"status": ..., "replayed": true}` and writes no second event (the agent's answer was lost, or it restarted). A different result or outcome on a finished task is still a 400, and a repeated `accepted` is still a 400 as before.
+
 ### Unified workspace P05: review lineage in the work graph
 - A task created with `reviews_task_id` now folds into the work graph as a `depends_on` edge from the review task to the work task (the contract's existing edge, dependent -> prerequisite) and a `reviews_task_id` attr. No new edge type, no schema change.
 
