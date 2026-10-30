@@ -631,5 +631,44 @@ timeout; the reply and any failure arrive as events.
 
 **Not supported** (answered `404 NOT_FOUND` in Rakazo's error shape so the app degrades per screen): push notifications
 (nothing is delivered while the app is closed), voice and calls, billing and the model/provider screens, groups,
-attachments, memory, routines, skills, connections, bot editing/archiving, spaces other than "Herdr", and ActionBoard
-proposals (those stay on the dashboard). `threads/send` does not deduplicate a retried `clientNonce`.
+attachments, memory, routines, skills, connections, bot editing/archiving, and spaces other than "Herdr".
+`threads/send` does not deduplicate a retried `clientNonce`.
+
+### Board proposals on the phone (project intelligence)
+
+Pending project-intelligence **board proposals** (`ci_rerun`, `request_ci_repair`, `propose_issue`, `link_entities`,
+`pause_ingestion`) appear in the account's **first bot's thread** as an approve/reject card, so the operator can decide
+them from the phone. Code: `control_plane/rakazo_proposals.py` (`ProposalDesk`); the card and run shapes are in
+`rakazo_events.py`; the decision is `IntelligenceRoutes.decide_proposal`, the same function the dashboard route
+(`POST /intelligence/proposals/<id>/approve|reject`) calls, so flags, approver rules, project scope, the exact
+`payload_sha256` + `resource_version`, audit and the `ProposalExecutor` (a no-op unless `project_intelligence.execute`) are
+shared, not copied.
+
+**Fail closed.** Nothing is shown unless all of these hold, otherwise the app sees no card (the first reason that stops it
+is logged once per account, without ids or payload text):
+- `project_intelligence.enabled` and `suggest` are on and the kill switch is off;
+- the bridge account has a scope in `project_intelligence.assistant_viewers["<tenant>/rakazo:<account id>"]`
+  (`{org_id, projects, clearance}`), the scope its own assistant files proposals under. `default_org_id` is for the open
+  listener and is never used for the phone. Out-of-org and, for a project-scoped account, other-project proposals are never
+  listed and cannot be decided;
+- the account may decide: `control_plane.single_operator` is on, or the account's `rakazo:<account id>` is listed in
+  `project_intelligence.approvers`. Without single-operator mode the board's own rule still refuses a requester approving
+  its own proposal. In single-operator mode the bridge password alone approves, including a proposal that account's own
+  assistant filed (same trade-off as the tool approvals above).
+
+**Behaviour.** A cheap read of the in-memory board runs on every `threads/get|head|messages` and at most every 5 s while a
+`threads/subscribe` stream is open (no extra scheduler). One proposal is one card (keyed by proposal id). A new proposal
+also posts a short bot message in the thread. The card title is built only from fields that pass the executor's validation
+(for example `CI failed? Re-run owner/repo run 302`); anything that fails validation, any `propose_issue` body, and anything
+token-shaped is replaced by a generic line. The detail shows the expiry and whether approving runs the action. The app
+enables a card's buttons only while its run is `waiting_input`, so each pending card has a synthetic run
+(`run_proposal_<id>_<hash prefix>`); the answer must quote it, and the server uses the hash and version it recorded when it
+showed the card, never ones from the request. When a proposal is approved, rejected, expired, executed or failed the card
+turns answered, the run ends, and a one-line outcome (the recorded reason on failure) is posted. Answering the same way twice
+is a no-op ("Already approved"); the opposite answer after the fact, an expired proposal or a changed payload is refused
+(409).
+
+**Limits.** There is no push: a custom server cannot reach APNs, so the in-thread message appears the next time the thread is
+opened or streamed, not on the lock screen. Proposals live 30 minutes and the board and journal are both in memory, so a control-plane restart drops pending
+proposals (as on the dashboard). Only the first bot's thread carries cards. Approving executes in the request; a slow CI provider can outlast the app's
+8 s timeout, but execution is claimed once, so retrying is safe.

@@ -24,6 +24,9 @@ SPACE_ID = "herdr"
 SPACE_NAME = "Herdr"
 _AVATAR = "#4f46e5"
 APPROVAL_PREFIX = "approval:"
+PROPOSAL_PREFIX = "proposal:"                # a project-intelligence board proposal shown as an ask card
+PROPOSAL_NOTE_PREFIX = "proposal-note:"      # the in-thread "a request needs you" message for one proposal
+PROPOSAL_OUTCOME_PREFIX = "proposal-outcome:"
 
 # Assistant run state -> Rakazo RunStatus (packages/contracts/src/ids.ts)
 _RUN_STATUS = {"submitted": "queued", "authorized": "queued", "queued": "queued", "running": "running",
@@ -128,6 +131,41 @@ def approval_message(approval, action, seq: int, assistant_id: str, thread_id: s
             "createdAt": iso(approval.created_at)}
 
 
+# Card states: pending | approved (recorded, execution off) | executed | failed | rejected | expired
+_CARD_PREFIX = {"approved": "Approved", "executed": "Executed", "failed": "Failed", "rejected": "Rejected",
+                "expired": "Expired"}
+
+
+def proposal_run_id(card: dict[str, Any]) -> str:
+    """The synthetic run an ask card hangs on. The app answers a card only while its run is ``waiting_input``, so each
+    pending proposal gets one. It carries the payload hash prefix: a card for another payload has another run id."""
+    return f"run_proposal_{card['id']}_{card['sha256'][:12]}"
+
+
+def proposal_message(card: dict[str, Any], seq: int, assistant_id: str, thread_id: str) -> dict[str, Any]:
+    """A board proposal as an ``ask`` card with the same shape as a tool approval (``isApprovalAskBlock`` holds)."""
+    state = card["state"]
+    text = card["title"] if state == "pending" else f"{_CARD_PREFIX[state]}: {card['title']}"
+    block: dict[str, Any] = {
+        "kind": "ask", "text": snippet(text, 300), "approvalEffectId": card["id"],
+        "actions": [{"id": "allow", "label": "Approve"}, {"id": "deny", "label": "Reject"}],
+        "status": "pending", "detail": card["detail"],
+    }
+    if state != "pending":
+        block["status"] = "answered"
+        block["answer"] = "allow" if state in ("approved", "executed", "failed") else "deny"
+    return {"id": PROPOSAL_PREFIX + card["id"], "threadId": thread_id, "seq": seq, "role": "bot", "blocks": [block],
+            "botId": assistant_id, "runId": proposal_run_id(card), "createdAt": iso(card["created_at"])}
+
+
+def proposal_run_view(card: dict[str, Any], bot_id: str, thread_id: str) -> dict[str, Any]:
+    """The waiting run behind a pending card (domain.ts RunSchema)."""
+    return {"id": proposal_run_id(card), "userId": card["user_id"], "botId": bot_id, "threadId": thread_id,
+            "taskId": "task_" + card["id"], "status": "waiting_input", "trigger": "user", "routineId": None,
+            "modelProvider": None, "modelId": None, "error": None, "startedAt": iso(card["created_at"]),
+            "completedAt": None, "createdAt": iso(card["created_at"])}
+
+
 def run_view(run, bot_id: str) -> dict[str, Any]:
     """An assistant run as a Rakazo ``Run`` (domain.ts RunSchema)."""
     status = run_status(run.state)
@@ -152,6 +190,7 @@ class ThreadJournal:
         self.messages: dict[str, dict[str, Any]] = {}     # message id -> current view (carries its own seq)
         self._approval_sig: dict[str, str] = {}
         self._runs: dict[str, dict[str, bool]] = {}       # run id -> {"started", "waiting", "final"}
+        self.proposals: dict[str, dict[str, Any]] = {}    # proposal id -> the card as last journaled
 
     @property
     def head(self) -> int:
@@ -234,6 +273,51 @@ class ThreadJournal:
         if status == "failed":
             payload["error"] = snippet(redact_secrets(run.error) or "", 300) or "The run failed."
         self._emit("run." + status, run.updated_at, payload, run.run_id)
+
+    # board proposals --------------------------------------------------------------------------------------
+    def _text_note(self, mid: str, text: str, stamp: datetime | None) -> None:
+        old = self.messages.get(mid)
+        view = {"id": mid, "threadId": self.thread_id, "seq": old["seq"] if old else self.next_seq, "role": "bot",
+                "blocks": [{"kind": "text", "text": text}], "botId": self.assistant_id, "createdAt": iso(stamp) or ""}
+        self.messages[mid] = view
+        self._message_event("thread.message.updated" if old else "thread.message.created", view, stamp)
+
+    def sync_proposals(self, cards: list[dict[str, Any]], now: datetime) -> None:
+        """Number what changed on the board. One proposal is one card (keyed by id), however often this is called.
+
+        New: a bot text note (so the thread shows it even when the app was elsewhere), the ask card, and a waiting run
+        so the app enables the buttons. Resolved: the card turns ``answered``, the run ends (``run.completed`` for an
+        approval, ``run.cancelled`` for a rejection or expiry) and a short outcome message is posted."""
+        for card in cards:
+            old = self.proposals.get(card["id"])
+            if old is not None and old["state"] == card["state"]:
+                continue
+            first = old is None
+            self.proposals[card["id"]] = card
+            if first:
+                if card["state"] == "pending":
+                    self._text_note(PROPOSAL_NOTE_PREFIX + card["id"], card["note"], now)
+                self._card_event(card, now, created=True)
+                if card["state"] == "pending":
+                    self._emit("run.waiting_input", now, {"userId": card["user_id"]}, proposal_run_id(card))
+            else:
+                self._card_event(card, now, created=False)
+            if card["state"] != "pending" and (first or old["state"] == "pending"):
+                kind = "run.cancelled" if card["state"] in ("rejected", "expired") else "run.completed"
+                self._emit(kind, now, {}, proposal_run_id(card))
+                self._text_note(PROPOSAL_OUTCOME_PREFIX + card["id"], card["outcome"], now)
+
+    def _card_event(self, card: dict[str, Any], now: datetime, created: bool) -> None:
+        mid = PROPOSAL_PREFIX + card["id"]
+        old = self.messages.get(mid)
+        view = proposal_message(card, old["seq"] if old else self.next_seq, self.assistant_id, self.thread_id)
+        self.messages[mid] = view
+        self._message_event("thread.message.created" if created and old is None else "thread.message.updated", view,
+                            now)
+
+    def waiting_proposal_runs(self) -> list[dict[str, Any]]:
+        return [proposal_run_view(c, self.assistant_id, self.thread_id) for c in self.proposals.values()
+                if c["state"] == "pending"]
 
     # reads ------------------------------------------------------------------------------------------------
     def after(self, cursor: int) -> list[dict[str, Any]]:

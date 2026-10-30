@@ -29,6 +29,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
+from . import project_intelligence as pi
 from . import rakazo_events as ev
 from .assistant import (
     ApprovalRequired,
@@ -39,6 +40,7 @@ from .assistant import (
     RateLimited,
     redact_secrets,
 )
+from .rakazo_proposals import ProposalDesk
 
 log = logging.getLogger(__name__)
 
@@ -539,6 +541,9 @@ class RakazoBridge:
         self._closed = threading.Event()
         self._monotonic = monotonic
         self.stream_options: dict[str, Any] = {}      # tests shorten the poll/heartbeat/lifetime
+        # Board proposals as ask cards. ``desk.routes`` (the IntelligenceRoutes) is set by the API glue; until then,
+        # or without a project-intelligence scope for the account, no card is ever shown.
+        self.desk = ProposalDesk(monotonic=monotonic)
         self._procs: dict[str, Callable[[_Ctx, dict[str, Any]], Any]] = {
             "me": self._me, "spaces/list": self._spaces_list, "bots/list": self._bots_list, "bots/get": self._bots_get,
             "bots/create": self._bots_create, "threads/head": self._threads_head, "threads/get": self._threads_get,
@@ -756,12 +761,20 @@ class RakazoBridge:
                          and store.actions[a.action_id].run_id in run_ids]
         return messages, runs, approvals
 
-    def _journal(self, ctx: _Ctx, assistant, thread):
+    def _journal(self, ctx: _Ctx, assistant, thread, fresh: bool = False):
+        """Bring the thread's journal up to date. Board proposals are re-read at most every ``desk.poll_seconds`` unless
+        ``fresh`` (threads/get, head, messages, and right after an answer)."""
         messages, runs, approvals = self._gather(ctx, assistant, thread)
         with self.journals.lock:
             journal = self.journals.get(thread.thread_id, assistant.assistant_id)
             journal.sync(messages, runs, approvals)
+            if self._first_bot(ctx) == assistant.assistant_id:      # one card per proposal: the first bot's thread only
+                self.desk.refresh(ctx.tenant, ctx.user, journal, force=fresh)
             return journal, runs
+
+    def _first_bot(self, ctx: _Ctx) -> str | None:
+        bots = self.svc.list_assistants(tenant_id=ctx.tenant, user_id=ctx.user)
+        return min(bots, key=lambda a: (a.created_at, a.assistant_id)).assistant_id if bots else None
 
     def _bot(self, ctx: _Ctx, assistant) -> dict[str, Any]:
         thread = self._thread(ctx, assistant)
@@ -807,25 +820,28 @@ class RakazoBridge:
     def _threads_head(self, ctx, inp):
         assistant = self._target(ctx, inp)
         thread = self._thread(ctx, assistant)
-        journal, _ = self._journal(ctx, assistant, thread)
+        journal, _ = self._journal(ctx, assistant, thread, fresh=True)
         return {"threadId": thread.thread_id, "cursor": journal.head}
 
     def _threads_get(self, ctx, inp):
         assistant = self._target(ctx, inp)
         thread = self._thread(ctx, assistant)
-        journal, runs = self._journal(ctx, assistant, thread)
+        journal, runs = self._journal(ctx, assistant, thread, fresh=True)
         views = [ev.run_view(r, assistant.assistant_id) for r in sorted(runs, key=lambda r: r.created_at)]
-        active = [v for v in views if v["status"] in ev.ACTIVE]
+        with self.journals.lock:
+            waiting = journal.waiting_proposal_runs()
+        active = [v for v in views if v["status"] in ev.ACTIVE] + waiting
         latest = views[-1] if views else None
         run = active[-1] if active else (latest if latest and latest["status"] == "failed" else None)
-        messages, older = journal.page()
+        with self.journals.lock:
+            messages, older = journal.page()
         return {"threadId": thread.thread_id, "cursor": journal.head, "messages": messages, "olderCursor": older,
                 "botId": assistant.assistant_id, "run": run, "activeRuns": active}
 
     def _threads_messages(self, ctx, inp):
         assistant = self._target(ctx, inp)
         thread = self._thread(ctx, assistant)
-        journal, _ = self._journal(ctx, assistant, thread)
+        journal, _ = self._journal(ctx, assistant, thread, fresh=True)
         before = inp.get("before")
         if before is not None and (isinstance(before, bool) or not isinstance(before, int)):
             raise BridgeError(400, "BAD_REQUEST", "before must be an integer.")
@@ -888,6 +904,8 @@ class RakazoBridge:
         message_id, run_id, answer = inp.get("messageId"), inp.get("runId"), inp.get("answer")
         if inp.get("dismiss") or inp.get("fields") or inp.get("username"):
             raise BridgeError(400, "BAD_REQUEST", "Only approval answers are supported by this server.")
+        if isinstance(message_id, str) and message_id.startswith(ev.PROPOSAL_PREFIX):
+            return self._answer_proposal(ctx, assistant, message_id, run_id, answer)
         if not (isinstance(message_id, str) and message_id.startswith(ev.APPROVAL_PREFIX)):
             raise BridgeError(400, "BAD_REQUEST", "Only approval answers are supported by this server.")
         decision = {"allow": "approved", "deny": "denied"}.get(answer)
@@ -913,6 +931,33 @@ class RakazoBridge:
             except AssistantError as exc:        # the approval stands; the card shows the action did not run
                 log.info("rakazo bridge: approved action not executed: %s", redact_secrets(str(exc)))
         return {"ok": True}
+
+    def _answer_proposal(self, ctx, assistant, message_id: str, run_id: Any, answer: Any):
+        """A board proposal card, decided through the dashboard's own path (``decide_proposal``)."""
+        from .project_intelligence_api import ApprovalRefused
+        decision = {"allow": "approve", "deny": "reject"}.get(answer)
+        if decision is None:
+            raise BridgeError(400, "BAD_REQUEST", "Answer allow or deny.")
+        thread = self._thread(ctx, assistant)
+        if self._first_bot(ctx) != assistant.assistant_id:
+            raise BridgeError(404, "NOT_FOUND", "Not found.")
+        self._journal(ctx, assistant, thread, fresh=True)
+        try:
+            with self.journals.lock:
+                journal = self.journals.get(thread.thread_id, assistant.assistant_id)
+            result = self.desk.answer(ctx.tenant, ctx.user, journal, message_id, run_id, decision)
+        except pi.NotFound:
+            raise BridgeError(404, "NOT_FOUND", "Not found.") from None
+        except ApprovalRefused as exc:
+            raise BridgeError(403, "FORBIDDEN", str(exc)) from None
+        except pi.Conflict as exc:
+            raise BridgeError(409, "CONFLICT", redact_secrets(str(exc)) or "The request cannot be decided.") from None
+        except pi.IntelligenceError as exc:
+            raise BridgeError(400, "BAD_REQUEST", redact_secrets(str(exc)) or "The request was refused.") from None
+        except pi.StoreUnavailable:
+            raise BridgeError(503, "SERVICE_UNAVAILABLE", "The decision could not be recorded. Try again.") from None
+        self._journal(ctx, assistant, thread, fresh=True)       # the card turns answered and the outcome is posted
+        return result
 
     def _threads_stop(self, ctx, inp):
         assistant = self._target(ctx, inp)
