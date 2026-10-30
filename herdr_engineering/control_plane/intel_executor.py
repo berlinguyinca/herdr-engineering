@@ -16,6 +16,7 @@ from . import project_intelligence as pi
 from .intel_assistant import ActionBoard, Proposal, payload_hash
 
 _REF = re.compile(r"[A-Za-z0-9:_./#@\-]{1,200}")
+_OWNER_NAME = re.compile(r"[A-Za-z0-9_.\-]{1,100}/[A-Za-z0-9_.\-]{1,100}")
 
 
 def _text(payload: dict, key: str, pattern=_REF) -> str:
@@ -28,12 +29,13 @@ def _text(payload: dict, key: str, pattern=_REF) -> str:
 class ProposalExecutor:
     def __init__(self, board: ActionBoard, store, *, section_fn: Callable[[], dict],
                  ci_repair: Callable[[str, int, str, str], object] | None = None,
+                 ci_rerun: Callable[[str, int], object] | None = None,
                  create_issue: Callable[[str, str, str, str], object] | None = None):
         self._board, self._store, self._section = board, store, section_fn
         self._handlers: dict[str, Callable[[Proposal], str]] = {
             "link_entities": self._link, "pause_ingestion": self._pause,
-            "request_ci_repair": self._repair, "propose_issue": self._issue}
-        self._ci_repair, self._create_issue = ci_repair, create_issue
+            "request_ci_repair": self._repair, "ci_rerun": self._rerun, "propose_issue": self._issue}
+        self._ci_repair, self._ci_rerun, self._create_issue = ci_repair, ci_rerun, create_issue
         self._lock = threading.Lock()
 
     def execute(self, proposal_id: str, org_id: str) -> Proposal:
@@ -82,6 +84,18 @@ class ProposalExecutor:
             raise pi.IntelligenceError("run must be a positive integer")
         self._ci_repair(repository, run, p.id, p.approver or "approver")     # p.id is the idempotency key
         return f"CI repair requested for {repository}#{run}"
+
+    def _rerun(self, p: Proposal) -> str:
+        """Restart one CI pipeline run (Woodpecker). The CI provider decides whether this run may be restarted."""
+        if self._ci_rerun is None:
+            raise pi.IntelligenceError("no executor wired for ci_rerun")
+        repository, run = _text(p.payload, "repo", _OWNER_NAME), p.payload.get("run")
+        if repository.split("/")[0] in (".", "..") or repository.split("/")[1] in (".", ".."):
+            raise pi.IntelligenceError("repo is missing or malformed")
+        if isinstance(run, bool) or not isinstance(run, int) or run < 1:
+            raise pi.IntelligenceError("run must be a positive integer")
+        self._ci_rerun(repository, run)
+        return f"CI re-run requested for {repository}#{run}"
 
     def _issue(self, p: Proposal) -> str:
         if self._create_issue is None:

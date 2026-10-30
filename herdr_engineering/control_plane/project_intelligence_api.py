@@ -33,6 +33,7 @@ class IntelligenceRoutes:
         self.github_app_fn = None   # set by the API glue: () -> review-gate GitHub client or None
         self.metrics_fn = None      # set by the API glue: () -> dict of bridge counters and incident states
         self.ci_repair_fn = None    # set by the API glue: (repository, run, operation_id, actor) -> CI-fix request
+        self.ci_rerun_fn = None     # set by the API glue: (repository, run) -> restarts that CI run
         self.poll_status_fn = None  # set by the API glue: () -> {client, last_error} for the PR poller
         self.single_operator_fn = lambda: False   # set by the API glue: the server runs in single-operator mode
         self.last_reconcile: dict | None = None   # counters of the latest pass; a reason when it could not run
@@ -51,7 +52,8 @@ class IntelligenceRoutes:
         if self._executor is None:
             from .intel_executor import ProposalExecutor
             self._executor = ProposalExecutor(self.board, self.store, section_fn=self._section,
-                                              ci_repair=lambda *a: self.ci_repair_fn(*a) if self.ci_repair_fn else _unwired())
+                                              ci_repair=lambda *a: self.ci_repair_fn(*a) if self.ci_repair_fn else _unwired(),
+                                              ci_rerun=lambda *a: self.ci_rerun_fn(*a) if self.ci_rerun_fn else _unwired())
         return self._executor
 
     def reconcile_now(self) -> dict | None:

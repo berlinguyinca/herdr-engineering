@@ -87,7 +87,7 @@ class Proposal:
     history: list[str] = field(default_factory=list)
 
 
-ACTIONS = frozenset({"request_ci_repair", "propose_issue", "link_entities", "pause_ingestion"})
+ACTIONS = frozenset({"request_ci_repair", "ci_rerun", "propose_issue", "link_entities", "pause_ingestion"})
 
 
 class ActionBoard:

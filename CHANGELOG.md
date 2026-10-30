@@ -5,6 +5,9 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Project intelligence: `ci_rerun` action (ask mode)
+- A new approvable proposal action `ci_rerun` (`{repo: owner/name, run: N}`) restarts one Woodpecker pipeline run. It goes through the existing board: `suggest` to propose, an approver (or the single operator) to approve the exact payload, and `execute: true` before anything runs. Execution calls the CI monitor's own retry, so `control_plane.ci_actions` and Woodpecker's `can_retry` still decide; a refusal is recorded on the proposal and never retried. `execute` stays off by default.
+
 ### Unified workspace P02: persistent Work Graph and reconciliation (flag off by default)
 - Migrations `0033_event_trace_id.sql` (nullable `fabric_events.trace_id`, `Event.trace_id`, envelope `trace_id`) and `0034_work_graph.sql` (`wg_*` tables: event ledger, assertions, entities + aliases, typed edges with intervals and unique `(type, from, to)`, historical facts, layouts, cursor, gaps). Additive, idempotent, `-- DOWN:`.
 - `work_graph_core` (pure fold: idempotent, order-tolerant, per-field merge, tombstones that cannot be resurrected, immutable artifact versions), `work_graph_store` (Postgres, ACL inside every statement, cursor paging, search, snapshot by root, `as_of`, facts, layouts with ETag/If-Match), `work_graph_sync` (sources, reconciler with orphan check in both directions, replay-from-clean with `snapshot_required`, worker), `work_graph_service` (sync facade + request handler).
