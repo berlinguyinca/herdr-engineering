@@ -409,3 +409,32 @@ def test_the_approval_card_does_not_redact_what_will_be_written():
     assert describe_action("create_calendar_event", "x", {**EVENT, "summary": body})
     assert body in describe_action("create_calendar_event", "x", {**EVENT, "summary": body})
     assert body not in describe_action("draft_email", "x", {**DRAFT, "body": body, "subject": body})
+
+
+def _wrong_key(store, tmp_path):
+    other = tmp_path / "other-key"
+    other.write_bytes(os.urandom(32))
+    store._box = SecretBox(str(other))      # the key file was replaced: the saved client secret no longer opens
+
+
+def test_a_wrong_key_file_gives_not_set_up_and_a_gated_write_does_not_stay_executing(store, tmp_path):
+    svc, r1, _, w, g = wired(store)
+    _wrong_key(store, tmp_path)
+    for call_ in (lambda: w.run("t", "key:u1", "search_email", {"query": "x"}), lambda: w.list_drafts("t", "key:u1")):
+        with pytest.raises(gw.GoogleError) as exc:
+            call_()
+        assert exc.value.reason == "not_set_up"
+    assert g.requests == []
+    grant(svc, r1, "create_email_draft")
+    run_tool(svc, r1, "create_email_draft", DRAFT)
+    approve_pending(svc, r1)
+    out = run_tool(svc, r1, "create_email_draft", DRAFT)
+    assert "not set up" in out
+    assert g.writes == [] and all(a.status != "executing" for a in svc.store.actions.values())
+
+
+def test_a_wrong_key_file_gives_409_not_set_up_on_the_drafts_and_calendars_routes(connected, tmp_path):
+    _wrong_key(connected.apps.credentials, tmp_path)
+    assert call(connected, BASE + "/google/drafts") == (409, {"error": "not_set_up"})
+    assert call(connected, BASE + "/google/drafts/r-1", None, "DELETE") == (409, {"error": "not_set_up"})
+    assert call(connected, BASE + "/google/calendars") == (409, {"error": "not_set_up"})

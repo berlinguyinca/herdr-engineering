@@ -1919,6 +1919,8 @@ class AssistantStore:
 
 _GOOGLE_MESSAGES = {
     "not_connected": "Google is not connected for this person: ask them to connect it in the Connectors tab.",
+    "not_set_up": "Google connectors are not set up on this server: ask an operator to check the apps key and OAuth client.",
+    "unavailable": "Google is temporarily unavailable: try again shortly.",
     "needs_attention": "Google needs this person to sign in again in the Connectors tab.",
     "calendar_blocked": "That calendar is not available to the assistant.",
     "reconnect_needed": "Reconnect Google to allow drafts and events (the saved connection lacks write permission).",

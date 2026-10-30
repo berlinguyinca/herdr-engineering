@@ -143,7 +143,10 @@ class GoogleWorkspace:
                 cached, gen = self._access.get(key), self._gen.get(key, 0)
             if cached and cached[1] > self._clock() + 60:
                 return cached[0]
-            client = self._store.get_client("google")
+            try:
+                client = self._store.get_client("google")
+            except AppsError:       # wrong or missing key file: fixed reason, never the cause
+                raise GoogleError("not_set_up") from None
             try:
                 refresh = self._store.refresh_token(tenant, user, "google")
             except Exception:       # noqa: BLE001 - an unreadable secret must not leak through the message
