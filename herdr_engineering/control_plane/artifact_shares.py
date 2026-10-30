@@ -309,7 +309,13 @@ class ShareStore:
         if os.path.lexists(rotated):
             count, drained, _, mtime = await self._drain(rotated, rotated_marker)
             inserted += count
-            if mtime is None or (drained and now - mtime >= grace):   # not a regular file, or fully read and quiet
+            try:
+                regular = stat.S_ISREG(os.lstat(rotated).st_mode)
+            except OSError:
+                regular = True                                          # unknown: keep it
+            # a planted non-file goes at once; a regular file only once fully read and quiet (an open failure such
+            # as EMFILE leaves mtime None: it is kept and retried next sweep)
+            if not regular or (mtime is not None and drained and now - mtime >= grace):
                 try:
                     os.unlink(rotated)
                     rotated_marker.unlink(missing_ok=True)
