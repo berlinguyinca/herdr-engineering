@@ -3,7 +3,7 @@
 --
 -- DOWN:
 --   DROP TABLE IF EXISTS assistant_app_blocked;
---   DROP TABLE IF EXISTS assistant_app_state;
+--   DROP TABLE IF EXISTS assistant_app_state;   -- also drops its expires_at index
 --   DROP TABLE IF EXISTS assistant_app_connections;
 --   DROP TABLE IF EXISTS assistant_app_clients;
 
@@ -34,6 +34,8 @@ CREATE TABLE IF NOT EXISTS assistant_app_state (
   verifier_ct  text NOT NULL,
   expires_at   timestamptz NOT NULL
 );
+
+CREATE INDEX IF NOT EXISTS assistant_app_state_expires_idx ON assistant_app_state (expires_at);
 
 -- Calendars a person has blocked from the assistant. Separate from the connection so it survives disconnect and
 -- reconnect. Calendar ids are not secrets.

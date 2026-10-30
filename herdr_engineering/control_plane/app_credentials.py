@@ -106,7 +106,7 @@ class PostgresCredentialPersistence:
 
     def load_connections(self) -> list[tuple]:
         return [tuple(r) for r in self._run(
-            "SELECT tenant_id, user_id, provider, account, scopes::text, status, token_ct, created_at::text "
+            "SELECT tenant_id, user_id, provider, account, scopes::text, status, token_ct, created_at "
             "FROM assistant_app_connections", fetch=True)]
 
     def save_connection(self, tenant: str, user: str, provider: str, account: str, scopes: list[str],
@@ -141,26 +141,48 @@ class CredentialStore:
         self._box, self._p, self._lock = box, persistence, threading.Lock()
         self._clients: dict[str, tuple[str, str]] = {}      # provider -> (client_id, sealed secret)
         self._conns: dict[tuple[str, str, str], dict] = {}  # (tenant, user, provider) -> row with sealed token
+        self._tombstones: set[tuple[str, str, str]] = set()  # deletes the database has not confirmed yet
         self._blocked: dict[tuple[str, str, str], list[str]] = {}
         if persistence is not None:
             try:
                 for provider, client_id, ct in persistence.load_clients():
                     self._clients[provider] = (client_id, ct)
-                for t, u, p, account, scopes, status, ct, created in persistence.load_connections():
-                    self._conns[(t, u, p)] = {"account": account, "scopes": tuple(json.loads(scopes)),
-                                              "status": status, "token_ct": ct, "created_at": created}
+                for row in persistence.load_connections():
+                    try:
+                        t, u, p, account, scopes, status, ct, created = row
+                        if (t, u, p) in self._tombstones:
+                            continue
+                        self._conns[(t, u, p)] = {
+                            "account": account, "scopes": tuple(json.loads(scopes)), "status": status, "token_ct": ct,
+                            "created_at": created.isoformat() if hasattr(created, "isoformat") else str(created)}
+                    except Exception:  # noqa: BLE001 - one bad row must not hide the others
+                        log.warning("app credentials: a saved connection row was skipped")
                 for t, u, p, ids in persistence.load_blocked():
                     self._blocked[(t, u, p)] = list(json.loads(ids))
             except Exception:  # noqa: BLE001 - start empty; people reconnect
                 log.warning("app credentials: saved rows could not be loaded")
 
     def _persist(self, fn: Callable) -> None:
+        # Best effort and in call order: memory already changed, so a failed write is logged, never raised.
         if self._p is None:
             return
+        self._retry_tombstones()
         try:
             fn(self._p)
         except Exception:  # noqa: BLE001
             log.warning("app credentials: the database could not be updated")
+
+    def _retry_tombstones(self) -> None:
+        with self._lock:
+            pending = list(self._tombstones)
+        for key in pending:
+            try:
+                self._p.delete_connection(*key)
+            except Exception:  # noqa: BLE001
+                log.warning("app credentials: delete not persisted")
+                return
+            with self._lock:
+                self._tombstones.discard(key)
 
     # --- OAuth client (one per provider, shared by the whole deployment)
     def put_client(self, provider: str, client_id: str, client_secret: str) -> None:
@@ -178,10 +200,13 @@ class CredentialStore:
     def put_connection(self, tenant: str, user: str, provider: str, *, account: str, scopes: list[str],
                        refresh_token: str) -> None:
         ct = self._box.seal(refresh_token)
-        created = datetime.now(UTC).isoformat()
+        key = (tenant, user, provider)
         with self._lock:
-            self._conns[(tenant, user, provider)] = {"account": account, "scopes": tuple(scopes),
-                                                     "status": "connected", "token_ct": ct, "created_at": created}
+            old = self._conns.get(key)   # reconnecting keeps the first created_at, as the database upsert does
+            created = old["created_at"] if old else datetime.now(UTC).isoformat()
+            self._conns[key] = {"account": account, "scopes": tuple(scopes), "status": "connected",
+                                "token_ct": ct, "created_at": created}
+            self._tombstones.discard(key)
         self._persist(lambda p: p.save_connection(tenant, user, provider, account, list(scopes), "connected", ct, created))
 
     @staticmethod
@@ -191,7 +216,7 @@ class CredentialStore:
     def get_connection(self, tenant: str, user: str, provider: str) -> Connection | None:
         with self._lock:
             row = self._conns.get((tenant, user, provider))
-        return None if row is None else self._view(provider, row)
+            return None if row is None else self._view(provider, row)
 
     def list_connections(self, tenant: str, user: str) -> list[Connection]:
         with self._lock:
@@ -208,9 +233,13 @@ class CredentialStore:
         self._persist(lambda p: p.set_status(tenant, user, provider, status))
 
     def delete_connection(self, tenant: str, user: str, provider: str) -> None:
+        key = (tenant, user, provider)
         with self._lock:
-            self._conns.pop((tenant, user, provider), None)
-        self._persist(lambda p: p.delete_connection(tenant, user, provider))
+            self._conns.pop(key, None)
+            self._tombstones.add(key)
+        if self._p is None:
+            return
+        self._retry_tombstones()
 
     def refresh_token(self, tenant: str, user: str, provider: str) -> str | None:
         with self._lock:

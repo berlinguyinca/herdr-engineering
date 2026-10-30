@@ -13,8 +13,22 @@ def box(tmp_path):
 
 
 def test_seal_roundtrip_and_ciphertext_hides_plaintext(box):
+    import base64
     ct = box.seal("s3cret-token")
-    assert "s3cret" not in ct and box.open(ct) == "s3cret-token"
+    assert box.seal("s3cret-token") != ct
+    assert b"s3cret" not in base64.urlsafe_b64decode(ct) and "s3cret" not in ct
+    assert box.open(ct) == "s3cret-token"
+
+
+def test_tampered_or_foreign_ciphertext_is_unreadable(box, tmp_path):
+    ct = box.seal("x")
+    bad = ct[:-4] + ("AAAA" if not ct.endswith("AAAA") else "BBBB")
+    other = tmp_path / "k2"
+    other.write_bytes(os.urandom(32))
+    for b, c in ((box, bad), (SecretBox(str(other)), ct)):
+        with pytest.raises(AppsError) as e:
+            b.open(c)
+        assert e.value.reason == "unreadable"
 
 
 def test_missing_or_short_key_file_is_not_available_and_save_is_refused(tmp_path):
@@ -119,3 +133,84 @@ def test_blocked_calendars_are_per_person_and_survive_delete_connection(box):
     s.delete_connection("t", "ann", "calendar")
     assert s.get_blocked("t", "ann", "calendar") == ["work", "kids"]
     assert CredentialStore(box, p).get_blocked("t", "ann", "calendar") == ["work", "kids"]
+
+
+def test_failed_delete_is_retried_and_never_resurrects_the_token(box, caplog):
+    p = _Fake()
+    s = CredentialStore(box, p)
+    s.put_connection("t", "u", "gmail", account="a", scopes=[], refresh_token="r")
+    p.fail = True
+    with caplog.at_level("WARNING"):
+        s.delete_connection("t", "u", "gmail")
+    assert "delete not persisted" in caplog.text and ("t", "u", "gmail") in p.conn_rows
+    assert s.get_connection("t", "u", "gmail") is None
+    p.fail = False
+    s.set_blocked("t", "u", "gmail", ["c"])           # the next write retries the delete
+    assert ("t", "u", "gmail") not in p.conn_rows
+    assert CredentialStore(box, p).get_connection("t", "u", "gmail") is None
+
+
+def test_reconnect_after_failed_delete_cancels_the_tombstone(box):
+    p = _Fake()
+    s = CredentialStore(box, p)
+    s.put_connection("t", "u", "gmail", account="a", scopes=[], refresh_token="r1")
+    p.fail = True
+    s.delete_connection("t", "u", "gmail")
+    p.fail = False
+    s.put_connection("t", "u", "gmail", account="a", scopes=[], refresh_token="r2")
+    assert s.refresh_token("t", "u", "gmail") == "r2" and ("t", "u", "gmail") in p.conn_rows
+
+
+def test_malformed_saved_row_is_skipped_alone(box):
+    p = _Fake()
+    CredentialStore(box, p).put_connection("t", "ok", "gmail", account="a", scopes=[], refresh_token="r")
+    p.conn_rows[("t", "bad", "gmail")] = ("a", 5, "connected", "ct", "now")
+    s = CredentialStore(box, p)
+    assert s.get_connection("t", "ok", "gmail") and s.get_connection("t", "bad", "gmail") is None
+
+
+class _Cur:
+    def __init__(self, log, rows):
+        self.log, self.rows = log, rows
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def execute(self, sql, args):
+        self.log.append(("execute", sql, args))
+
+    def fetchall(self):
+        return self.rows
+
+
+class _Conn:
+    def __init__(self, log, rows=()):
+        self.log, self.rows = log, list(rows)
+
+    def cursor(self):
+        return _Cur(self.log, self.rows)
+
+    def commit(self):
+        self.log.append(("commit",))
+
+    def close(self):
+        self.log.append(("close",))
+
+
+def test_postgres_persistence_upserts_commits_closes_and_loads():
+    from herdr_engineering.control_plane.app_credentials import PostgresCredentialPersistence
+    log = []
+    p = PostgresCredentialPersistence("postgres://user:pw@h/db", connect=lambda: _Conn(log, [("t", "u", "gmail", "a", "[]", "connected", "ct", "now")]))
+    p.save_connection("t", "u", "gmail", "a", ["m"], "connected", "ct", "now")
+    kinds = [e[0] for e in log]
+    assert kinds == ["execute", "commit", "close"]
+    sql, args = log[0][1], log[0][2]
+    assert "ON CONFLICT (tenant_id, user_id, provider) DO UPDATE" in sql and "%s::jsonb" in sql
+    assert args[4] == '["m"]' and "pw" not in repr(args)
+    p.save_blocked("t", "u", "calendar", ["x"])
+    assert "assistant_app_blocked" in log[3][1] and "::jsonb" in log[3][1]
+    log.clear()
+    assert p.load_connections()[0][0] == "t" and [e[0] for e in log] == ["execute", "commit", "close"]
