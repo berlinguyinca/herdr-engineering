@@ -493,6 +493,11 @@ Connectors tab are never read, listed or written. Email **drafts** and calendar 
 person approves the exact content; the assistant **cannot send** mail. Reminders ("remind me in 20 minutes") need no
 Google account and work without any connector.
 
+Cleanup after the move: the old file-based token `~/.config/herdr-engineering/google/token.json` (from
+`herdr-eng google authorize`) is no longer used. Revoke it at Google (https://myaccount.google.com/permissions) and
+delete the file. The assistant's Gmail and Calendar tools also need grants: a connected account alone does not let an
+assistant use them until the person grants each tool in the assistant's Permissions.
+
 ### Cross-track order (`requires`)
 
 Components on another `follows` track (the zapp console follows `metabolomics-us/inferweave-gateway`) are staged by

@@ -477,12 +477,12 @@ export function mountPersonalAssistant(container, client, { onFreshness = () => 
     if (!el) return;
     if (!on) { el.hidden = true; el.innerHTML = ''; return; }
     el.hidden = false;
-    const head = '<h3 id="pa-drafts-h" class="pa-h3">Drafts</h3>';
+    const head = '<h3 id="pa-drafts-h" class="pa-h3">Gmail drafts</h3>';
     try {
       const { drafts = [] } = await client.listDrafts('google');
       if (disposed || gen !== draftsGen) return;
       const link = (u) => typeof u === 'string' && /^https:\/\/mail\.google\.com\//.test(u) ? u : '';
-      el.innerHTML = `${head}<p class="pa-muted">Drafts your assistant saved in Gmail. Nothing here has been sent.</p><div role="status" aria-live="polite" data-drafts-status class="pa-flash"></div>
+      el.innerHTML = `${head}<p class="pa-muted">Drafts in your Gmail account. Nothing here has been sent.</p><div role="status" aria-live="polite" data-drafts-status class="pa-flash"></div>
         ${drafts.length ? drafts.map(d => `<article class="pa-msg" aria-label="Draft ${esc(d.subject || 'no subject')}" data-draft="${esc(d.id)}">
           <div><strong>${esc(d.subject || '(no subject)')}</strong></div>
           <div class="pa-muted">To ${esc(d.to || '(nobody yet)')}</div>
@@ -493,6 +493,7 @@ export function mountPersonalAssistant(container, client, { onFreshness = () => 
             <button class="hd-btn hd-btn--sm" disabled aria-disabled="true" data-draft-send title="Sending from here is not available yet">Send (coming soon)</button>
           </div></article>`).join('') : '<div class="pa-muted">No drafts.</div>'}`;
       el.querySelectorAll('[data-draft-discard]').forEach(b => b.addEventListener('click', async () => {
+        if (!window.confirm('Discard this Gmail draft? It is deleted from your Gmail account.')) return;
         b.disabled = true;
         try { await client.discardDraft('google', b.dataset.draftDiscard); await loadDrafts(root, true); root.querySelector('[data-drafts-status]').textContent = 'Draft discarded.'; }
         catch (e) { el.querySelector('[data-drafts-status]').textContent = `Not discarded: ${errText(e)}`; b.disabled = false; }

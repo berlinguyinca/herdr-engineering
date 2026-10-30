@@ -219,9 +219,20 @@ test('drafts: listed with Open in Gmail and Discard; Send is visibly disabled; h
   assert.equal(await page.evaluate(() => window.pwned), undefined);
   assert.equal(await page.locator('#pa-drafts img').count(), 0);
   assert.equal(await page.locator('[data-draft="r-2"] a').count(), 0);                      // a javascript: address gets no link
+  const dialogs = [];
+  page.once('dialog', (d) => { dialogs.push(d.message()); d.accept(); });
   await page.getByRole('button', { name: 'Discard draft Lunch on Friday' }).click();
   await page.locator('[data-draft="r-1"]').waitFor({ state: 'detached' });
   assert.ok((await calls(page)).some((c) => c.method === 'DELETE' && c.path === '/api/v1/assistant-apps/google/drafts/r-1'));
+  assert.equal(dialogs.length, 1);
+}));
+
+test('drafts: dismissing the confirmation discards nothing', () => withPage('connected', async (page) => {
+  await page.locator('[data-draft="r-1"]').waitFor();
+  page.once('dialog', (d) => d.dismiss());
+  await page.getByRole('button', { name: 'Discard draft Lunch on Friday' }).click();
+  assert.equal(await page.locator('[data-draft="r-1"]').count(), 1);
+  assert.equal((await calls(page)).some((c) => c.method === 'DELETE'), false);
 }));
 
 test('reminders: pending ones can be cancelled', () => withPage('connected', async (page) => {
