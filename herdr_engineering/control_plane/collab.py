@@ -189,6 +189,10 @@ HELPER_ERRORS = frozenset({"failed", "timeout", "cancelled", "sandbox-error", "p
 _HELPER_BAD = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f\u2028\u2029]")   # all control chars but \t \n
 
 
+def _iso_epoch(value: str) -> float:
+    return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+
+
 class CollabError(Exception):
     def __init__(self, status: int, message: str, reason: str | None = None, code: str | None = None):
         super().__init__(message)
@@ -387,6 +391,9 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
         self._users: dict[str, dict] = {}       # approval mode: user id -> {status, since, decided_by, decided_at, reason}
         self._sink = sink
         self._now = now or time.time
+        # P05 crash takeover: seconds an accepted task may stay accepted before it goes back to pending for its target
+        # agent to pick up again (an ``attempt`` counter fences the old run). None = off (the default).
+        self.task_lease_seconds: float | None = None
         self.enrollment_ttl = enrollment_ttl
         self.credential_ttl = credential_ttl
         self.remote_credential_ttl = remote_credential_ttl  # agents that connect over HTTP MCP
@@ -861,6 +868,11 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
             tk = self._tasks.get(p["task_id"])
             if tk:
                 tk.update(status=p["status"], result=p.get("result"), updated_at=p["created_at"])
+                if p["status"] == "accepted":
+                    tk["accepted_epoch"] = _iso_epoch(p["created_at"])
+                if p.get("action") == "task.requeue":
+                    tk["attempt"] = tk.get("attempt", 1) + 1
+                    tk.pop("accepted_epoch", None)
                 if "bounds" in tk:
                     tk["version"] += 1
                     if str(p.get("action") or "").startswith("delegation.") and p.get("action") != "delegation.budget":
@@ -4437,7 +4449,7 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                 "result": t["result"], "depth": t["depth"], "parent_task_id": t["parent"],
                 "requested_by": {"type": t["by_kind"], "id": t["by_id"], "owner_user_id": t["by_owner"]},
                 "started_by_user_id": t["root"],
-                "created_at": t["created_at"], "updated_at": t["updated_at"],
+                "created_at": t["created_at"], "updated_at": t["updated_at"], "attempt": t.get("attempt", 1),
                 **({"bounds": t["bounds"], "version": t["version"]} if bounds and "bounds" in t else {})}
 
     def list_tasks(self, pr: Principal, room_id: str, limit: int = 100) -> dict:
@@ -4470,11 +4482,33 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                 resource_id=task_id))
         return {"ok": True}
 
+    def _requeue_stale(self, pr: Principal) -> None:
+        """P05 crash takeover (rule A): an accepted task whose lease ran out goes back to pending, once per expiry.
+
+        Runs when the target agent polls its inbox, which is the only moment anyone could pick the task up. The
+        requeue is an event, so a restart replays it; ``attempt`` rises so the old run can no longer complete it."""
+        lease = self.task_lease_seconds
+        if not lease:
+            return
+        for tid in list(self._tasks_by_target.get(pr.id, ())):
+            t = self._tasks[tid]
+            if ("bounds" in t or t["status"] != "accepted" or self._task_status(t) != "accepted"
+                    or self._now() - t.get("accepted_epoch", self._now()) < lease):
+                continue
+            room = self._rooms.get(t["room_id"])
+            if not room:
+                continue
+            self._commit("task_updated", self._actor(
+                pr, project_id=room["project_id"], room_id=t["room_id"], task_id=tid, status="pending",
+                result=None, target_agent_id=pr.id, visibility_scope="room", action="task.requeue",
+                outcome="allowed", project_ids=[room["project_id"]], resource_id=tid))
+
     def task_inbox(self, pr: Principal, limit: int = 20) -> dict:
         """Open tasks addressed to this agent, only where it STILL holds "execute"."""
         if not pr.is_agent or pr.external:
             raise CollabError(403, "forbidden")
         with self._lock:
+            self._requeue_stale(pr)
             out = []
             for tid in list(self._tasks_by_target.get(pr.id, ())):
                 t = self._tasks[tid]
@@ -4502,9 +4536,11 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
             if (not t or t["target"] != pr.id or not eff or "execute" not in eff[0] or t["seq"] < eff[1]
                     or not self._creator_valid(t, room)):
                 raise CollabError(404, "not found")
-            bad = [k for k in body if k not in ("status", "result")]
+            bad = [k for k in body if k not in ("status", "result", "attempt")]
             status = body.get("status")
             cur = self._task_status(t)
+            if "attempt" in body and body["attempt"] != t.get("attempt", 1):
+                raise CollabError(409, "stale attempt: this task was requeued")
             if not bad and status == cur and status in ("done", "failed"):
                 # P05: a retry of a completion that already happened (the answer was lost, the agent restarted) gets
                 # the recorded outcome and writes nothing; it cannot change a finished task's result. A repeated
@@ -4521,7 +4557,7 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                 status=status, result=result, target_agent_id=pr.id, visibility_scope="room",
                 action="task.update", outcome="allowed", project_ids=[room["project_id"]],
                 resource_id=task_id))
-        return {"task_id": task_id, "status": status}
+        return {"task_id": task_id, "status": status, "attempt": t.get("attempt", 1)}
 
     # -- bounded delegation and artifact proposals (T11)
     # A delegation is a task in the SAME store with a ``bounds`` block, addressed to an external coworker agent
