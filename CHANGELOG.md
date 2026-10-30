@@ -5,6 +5,9 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Collaboration tasks: crash takeover (unified workspace P05)
+- `CollabService.task_lease_seconds` (default None = off): an accepted task whose lease ran out goes back to pending for its target agent when that agent polls its inbox, as a replayable `task.requeue` event. Each task carries an `attempt` (starts at 1); an update that names a stale `attempt` is refused with 409. No fleet-config key yet, so nothing changes in production.
+
 ### Artifact registry: read-only CLI (unified workspace P03)
 - `herdr-eng artifacts show <id> [version]`, `versions <id>` and `for <kind> <ref> [--query --media-type --limit --cursor]` browse the versioned registry through the existing read routes. Nothing new is exposed server-side; an unreadable artifact answers "not found, or you cannot read it". The key is read from the environment variable named by `--api-key-env` and never printed.
 
