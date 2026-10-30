@@ -832,3 +832,27 @@ def test_agent_evolution_is_cached_briefly(server):
     repo.upsert_session("sx", host_id="h", agent_role="pi", status="failed")
     again = json.loads(c.get("/api/v1/sessions/sx/evolution")[2])
     assert first["learning_record"]["outcome"]["value"] == again["learning_record"]["outcome"]["value"] == "running"
+
+
+def test_agent_evolution_requires_a_viewer_key_like_commits(fc_server):
+    port, _, _ = fc_server
+    for path in ("/api/v1/sessions/nope/evolution", "/api/v1/sessions/nope/commits"):
+        assert _fc_req(port, "GET", path)[0] == 401
+        assert _fc_req(port, "GET", path, {"X-API-Key": "wrong"})[0] == 401
+        assert _fc_req(port, "GET", path, {"X-API-Key": "viewkey"})[0] == 404          # authorised, then the agent is unknown
+
+
+def test_agent_evolution_reports_an_absent_tool_ring_as_not_held_not_as_none(server):
+    c, repo = server
+    repo.upsert_session("sy", host_id="h", agent_role="pi", status="running")
+    out = json.loads(c.get("/api/v1/sessions/sy/evolution")[2])
+    total = out["learning_record"]["tool_calls"]["total"]
+    assert total["value"] is None and "evicted" in total["reason"]
+
+
+def test_evolution_config_is_validated():
+    from herdr_engineering.control_plane.agent_evolution import evolution_config
+    assert evolution_config(None) == {"stale_after_minutes": 120} and evolution_config({"stale_after_minutes": 30}) == {"stale_after_minutes": 30}
+    for bad in ([], {"stale_after_minutes": 0}, {"stale_after_minutes": True}, {"stale_after_minutes": "5"}, {"nope": 1}):
+        with pytest.raises(ValueError):
+            evolution_config(bad)

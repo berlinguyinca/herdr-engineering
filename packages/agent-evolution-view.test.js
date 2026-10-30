@@ -24,7 +24,7 @@ const data = {
       { kind: 'pull_request', number: 7, status: 'merged', url: 'http://insecure/x', trail: '#/pr/org/app/7?host=github.com', rule: 'session_commits' }] },
     { key: 'outcome', title: 'Outcome', state: 'recorded', reason: '', pr_signals_unreadable: true, items: [
       { kind: 'status', value: 'finished', last_reported_status: 'finished', at: '2026-10-29T13:00:00Z', rule: 'last_report' },
-      { kind: 'pull_request_outcome', ref: 'org/app#7', status: 'merged', trail_lists_this_agent: false, signals: { ci_green_first_try: { value: true, reason: 'ok' } }, rule: 'pr_trail' }] },
+      { kind: 'pull_request_outcome', ref: 'org/app#7', status: 'merged', trail_lists_this_agent: false, signals: null, caveat: 'The pull request trail does not list this agent, so its signals are not carried here.', rule: 'pr_trail' }] },
     { key: 'cost', title: 'Cost', state: 'unknown', reason: 'No price table is configured.', items: [] },
   ],
   hints: { same_mission_sessions: [{ session_id: 's<2>', name: 'Other' }] }, derived: { retries: 'a repeat of an errored call' },
@@ -108,4 +108,28 @@ test('the tabs are a proper tablist and arrows, Home and End move between them',
   assert.deepEqual(picked.slice(-2), ['evolution', 'overview']);
   handlers['overview:click']();
   assert.equal(queries.at(-1), 'overview');
+});
+
+
+test('withheld signals show the caveat and no cards; a hint without a session id is not a link', () => {
+  const html = renderItem({ kind: 'pull_request_outcome', ref: 'o/a#1', status: 'merged', signals: null, caveat: 'Not listed.', trail_lists_this_agent: false });
+  assert.match(html, /data-ev-caveat/);
+  assert.doesNotMatch(html, /data-signal=/);
+  const page = renderEvolution({ hints: { same_mission_sessions: [{ name: 'nameless' }] }, phases: [], learning_record: {} });
+  assert.doesNotMatch(page, /href=""/);
+  assert.match(page, /nameless/);
+});
+
+test('a stale outcome is labelled as reported, not as an outcome; a self handoff and a handoff out read correctly', () => {
+  const html = renderEvolution({ phases: [{ key: 'outcome', title: 'Outcome', state: 'recorded', items: [{ kind: 'status', value: 'running', last_reported_status: 'running', stale: true }] }], learning_record: {} });
+  assert.match(html, /Reported/);
+  assert.match(html, /not counted as an outcome/);
+  assert.doesNotMatch(html, /Handed on/);
+  assert.match(renderItem({ kind: 'handoff_out', self_handoff: true, state: 'accepted', from: {}, to: {} }), /to itself/);
+});
+
+test('tab panels are focusable only through the page markup; arrow keys move focus and the tablist keeps one tab stop', () => {
+  const html = tabsHtml('overview');
+  assert.match(html, /tabindex="0"[^>]*data-agent-tab="overview"/);
+  assert.match(html, /tabindex="-1"[^>]*data-agent-tab="evolution"/);
 });

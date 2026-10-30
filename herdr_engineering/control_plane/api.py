@@ -295,7 +295,7 @@ class ControlPlaneServer:
                  operator_port=None, operator_user=None, operator_email=None,
                  operator_hosts=(), collab_operator_url=None, collab_dashboard_hosts=(),
                  summary_config=None, summary_client=None, summary_report_config=None, usage_retention=None, lineage_key_scopes=None,
-                 review_quorum=None, system_graph: bool = False, attention=None, ci_fix=None, missions=None, github_pg_dsn=None, ci_log_tests=None, usage_prices=None,
+                 review_quorum=None, system_graph: bool = False, evolution=None, attention=None, ci_fix=None, missions=None, github_pg_dsn=None, ci_log_tests=None, usage_prices=None,
                  architecture_enabled=None, architecture_explain=None, architecture_options=None,
                  request_workers=128, request_queue=256, single_operator=False,
                  assistant_service=None, assistant_config=None, fabric_resolver=None, fabric_services=None, fabric_names=None,
@@ -323,6 +323,9 @@ class ControlPlaneServer:
         self.usage_retention = usage_retention_config(usage_retention)
         # control_plane.usage.prices (validated by the caller; empty = no estimate).
         self.usage_prices = list(usage_prices or [])
+        # control_plane.evolution (validated; None = defaults): how old a non-terminal status may be and still count as an outcome.
+        from .agent_evolution import evolution_config
+        self.evolution = evolution_config(evolution)
         # control_plane.ci_fix (validated; None = defaults, which are disabled: the routes then 404).
         from .ci_fix import CIFixService, ci_fix_config
         self.ci_fix_config = ci_fix_config(ci_fix)
@@ -4472,24 +4475,36 @@ def _make_handler(server, public=False, operator=False):
             except Exception:    # a source that cannot be read is reported as unavailable, never as empty
                 return None
 
-        def _pull_trail(self, server, r, owner, name, number, host):
-            """The cached PR trail for ``owner/name#number`` (or ``None`` when unknown); shared by the trail and agent evolution endpoints."""
+        def _pull_trail(self, server, r, owner, name, number, host, gated=False):
+            """The cached PR trail for ``owner/name#number`` (or ``None`` when unknown); shared by the trail and agent evolution endpoints.
+            ``gated`` bounds uncached builds: at most two run at once and a caller waits two seconds for a slot, then reports the trail unreadable."""
             from .pr_trail import TTLCache, build as build_pr_trail
-            from .reviews import ReviewService
             cache = server.__dict__.setdefault("_pr_trail_cache", TTLCache(ttl=5.0, size=64))
             cache_key = (owner.lower(), name.lower(), number, (host or "").lower())
             trail = cache.get(cache_key)
             if trail is None:
-                read = self._read_source
-                view = server.ci_monitor.snapshot(start=False) if server.ci_monitor is not None else {}
-                handoff_rows = read(lambda: server.handoffs.list(limit=1000))
-                trail = build_pr_trail(
-                    owner, name, number, pull_requests=r.list_pull_requests(), sessions=r.list_sessions(), view=view,
-                    handoffs=handoff_rows, handoffs_truncated=handoff_rows is not None and len(handoff_rows) >= 1000, host=host,
-                    reviews=read(r.list_reviews), plan_reviews=read(ReviewService(r).list_reviews), prices=bool(server.usage_prices),
-                    spend=lambda sid: read(lambda: r.llm_spend("30d", server.usage_prices, session=sid)))
+                gate = server.__dict__.setdefault("_trail_gate", threading.BoundedSemaphore(2)) if gated else None
+                if gate is not None and not gate.acquire(timeout=2.0):
+                    return None
+                try:
+                    trail = self._build_pull_trail(server, r, owner, name, number, host, build_pr_trail)
+                finally:
+                    if gate is not None:
+                        gate.release()
                 if trail is not None:
                     cache.put(cache_key, trail)
+            return trail
+
+        def _build_pull_trail(self, server, r, owner, name, number, host, build_pr_trail):
+            from .reviews import ReviewService
+            read = self._read_source
+            view = server.ci_monitor.snapshot(start=False) if server.ci_monitor is not None else {}
+            handoff_rows = read(lambda: server.handoffs.list(limit=1000))
+            trail = build_pr_trail(
+                owner, name, number, pull_requests=r.list_pull_requests(), sessions=r.list_sessions(), view=view,
+                handoffs=handoff_rows, handoffs_truncated=handoff_rows is not None and len(handoff_rows) >= 1000, host=host,
+                reviews=read(r.list_reviews), plan_reviews=read(ReviewService(r).list_reviews), prices=bool(server.usage_prices),
+                spend=lambda sid: read(lambda: r.llm_spend("30d", server.usage_prices, session=sid)))
             return trail
 
         def _agent_evolution(self, server, r, session_id):
@@ -4509,18 +4524,18 @@ def _make_handler(server, public=False, operator=False):
                 def tools():
                     try:
                         return r.inspector.query(session_id, "viewer", view="tools", limit=TOOL_LIMIT)
-                    except KeyError:            # nothing was ever recorded for this session: an empty ring, not an unreadable one
-                        return {"events": [], "has_more": False, "dropped": 0}
+                    except KeyError:            # the buffer holds nothing for this session; that is not proof it did nothing
+                        return {"events": [], "has_more": False, "dropped": 0, "absent": True}
 
                 def trail_for(host, owner, name, number):
-                    return read(lambda: self._pull_trail(server, r, owner, name, number, host))
+                    return read(lambda: self._pull_trail(server, r, owner, name, number, host, gated=True))
                 body = build_evolution(
                     session, sessions=r.list_sessions(), view=view, pull_requests=r.list_pull_requests(),
                     handoffs=handoff_rows, handoffs_truncated=handoff_rows is not None and len(handoff_rows) >= 1000,
                     reviews=read(r.list_reviews), plan_reviews=read(ReviewService(r).list_reviews),
                     stream=read(lambda: r.stream("session", session_id)), tools=read(tools),
                     prices=bool(server.usage_prices), spend=lambda sid: read(lambda: r.llm_spend("30d", server.usage_prices, session=sid)),
-                    trail_for=trail_for)
+                    trail_for=trail_for, stale_after_minutes=server.evolution["stale_after_minutes"])
                 cache.put(key, body)
             return self._json(body)
 

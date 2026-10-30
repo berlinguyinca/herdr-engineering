@@ -37,8 +37,8 @@ def call(seq, minutes, tool="bash", args="pytest -q", status="ok", agent="main",
     return {"seq": seq, "kind": "tool", "agent_id": agent, "ts": stamp(minutes), "data": data}
 
 
-def tools(*events, has_more=False, dropped=0):
-    return {"events": list(events), "has_more": has_more, "dropped": dropped}
+def tools(*events, has_more=False, dropped=0, retention_hours=24):
+    return {"events": list(events), "has_more": has_more, "dropped": dropped, "prefs": {"retention_hours": retention_hours}}
 
 
 def ev(minutes, status, kind="SessionUpdated", seq=0):
@@ -103,12 +103,12 @@ def test_tool_calls_total_failed_retried_with_a_documented_rule():
     rows = tools(call(1, 1, status="error"), call(2, 2), call(3, 3, args="ls"), call(4, 4, args="ls", agent="other"))
     out = evolve(tools=rows)["learning_record"]["tool_calls"]
     assert out["total"]["value"] == 4 and out["failed"]["value"] == 1
-    assert out["retried"]["value"] == 1 and "earlier errored call" in out["retried"]["reason"]      # call 2 repeats errored call 1; same args on another agent does not count
+    assert out["retried"]["value"] == 1 and "ended in an error" in out["retried"]["reason"]      # call 2 repeats errored call 1; same args on another agent does not count
     assert evolve(tools=tools(call(1, 1), call(2, 2)))["learning_record"]["tool_calls"]["retried"]["value"] == 0
 
 
 def test_tool_aggregates_are_null_when_the_ring_lost_events_or_nothing_is_recorded():
-    for rows, text in ((tools(call(1, 1), dropped=3), "evicted"), (tools(call(1, 1), has_more=True), "only the newest"), (tools(), "No tool call"), (None, "could not be read")):
+    for rows, text in ((tools(call(1, 1), dropped=3), "evicted"), (tools(call(1, 1), has_more=True), "only the newest"), (tools(), "No tool event"), (None, "could not be read")):
         calls = evolve(tools=rows)["learning_record"]["tool_calls"]
         assert calls["total"]["value"] is None and calls["failed"]["value"] is None and calls["retried"]["value"] is None
         assert text in calls["total"]["reason"]
@@ -172,7 +172,8 @@ def test_pull_request_signals_are_copied_from_the_trail_not_recomputed():
     assert seen == [("github.com", "org", "app", 7)]
     prs = out["learning_record"]["prs"]["value"]
     assert prs == [{"ref": "org/app#7", "status": "merged", "trail_lists_this_agent": True,
-                    "signals": {"merged_without_rework": {"value": True, "reason": "from the trail"}}}]
+                    "signals": {"merged_without_rework": {"value": True, "reason": "from the trail"}},
+                    "caveat": "Signals cover every agent on that pull request, not only this one."}]
     assert phase(out, "outcome")["items"][1]["kind"] == "pull_request_outcome"
 
 
@@ -191,9 +192,9 @@ def test_reviews_attach_by_session_id_and_reviews_unreadable_is_not_none():
 
 
 def test_outcome_and_duration_need_a_terminal_status_and_dates():
-    done = evolve()["learning_record"]
+    done = evolve(stream=[ev(0, "running", "SessionStarted", 1), ev(60, "finished", seq=2)])["learning_record"]
     assert done["outcome"]["value"] == "finished" and done["duration_s"]["value"] == 3600 and done["ended_at"]["value"]
-    running = evolve(session=session(status="running"))["learning_record"]
+    running = evolve(session=session(status="running", end=470))["learning_record"]
     assert running["outcome"]["value"] == "running" and running["duration_s"]["value"] is None and running["ended_at"]["value"] is None
     weird = evolve(session=session(status="mystery"))
     assert weird["learning_record"]["outcome"]["value"] is None and phase(weird, "outcome")["state"] == "unknown"
@@ -265,3 +266,114 @@ def test_a_repository_without_a_forge_host_still_links_to_its_trail_without_a_ho
     assert phase(out, "outcome")["items"][1]["trail_lists_this_agent"] is False       # the trail did not list this agent: said, not hidden
     bad = session(repository="not-a-repo")
     assert [i for i in phase(evolve(session=bad, sessions=[bad]), "produced")["items"] if i["kind"] == "pull_request"] == []
+
+
+# ---- independent review fixes -------------------------------------------------------------------------------------------------------
+
+def lr(**kw):
+    return evolve(**kw)["learning_record"]
+
+
+def test_an_undated_status_event_makes_restarts_unknown_not_zero():
+    out = evolve(stream=[ev(0, "running", "SessionStarted", 1), ev(10, "finished", seq=2), {**ev(0, "running", seq=3), "source_timestamp": None}])
+    assert out["restarts"]["value"] is None and "no usable time" in out["restarts"]["reason"]
+
+
+def test_out_of_order_or_repeated_sequences_make_restarts_unknown():
+    for stream in ([ev(0, "finished", seq=2), ev(1, "running", seq=1)], [ev(0, "finished", seq=1), ev(1, "running", seq=1)], [ev(0, "finished", seq=1), ev(1, "running", seq=None)]):
+        assert evolve(stream=stream)["restarts"]["value"] is None
+    assert evolve(stream=[ev(0, "running", seq=1), ev(5, "finished", seq=2), ev(9, "running", seq=3)])["restarts"]["value"] == 1
+
+
+def test_an_unclassified_status_makes_restarts_unknown_and_names_it():
+    out = evolve(stream=[ev(0, "finished", seq=1), ev(1, "wibble", seq=2)])
+    assert out["restarts"]["value"] is None and "wibble" in out["restarts"]["reason"]
+
+
+def test_every_terminal_status_counts_toward_restarts():
+    for status in ("failed", "stopped", "cancelled", "error"):
+        assert evolve(stream=[ev(0, "running", seq=1), ev(1, status, seq=2), ev(2, "running", seq=3)])["restarts"]["value"] == 1
+
+
+def test_handoffs_without_a_session_id_make_counts_unknown():
+    anon = {**handoff("h9", "x", "y"), "source": {"harness": "pi", "agent_id": "a-1"}, "target": {"harness": "claude", "agent_id": "a-2"}}
+    rec = lr(handoffs=[anon])
+    assert rec["handoffs_in"]["value"] is None and "no session" in rec["handoffs_in"]["reason"]
+    assert rec["handoffs_out"]["total"]["value"] is None and rec["handoffs_out"]["rejected"]["value"] is None
+    out = evolve(handoffs=[anon])
+    assert phase(out, "handed_off")["state"] == "unknown" and "may be this agent" in phase(out, "handed_off")["reason"]
+    assert "may be this agent" in phase(out, "assigned")["reason"]
+
+
+def test_an_agent_id_unique_to_this_session_attributes_a_handoff():
+    mine = {**session(), "agent_id": "a-me"}
+    other = {**session("s2"), "agent_id": "a-other"}
+    row = {**handoff("h1", "x", "y"), "source": {"agent_id": "a-other"}, "target": {"agent_id": "a-me"}}
+    out = evolve(session=mine, sessions=[mine, other], handoffs=[row])
+    assert out["learning_record"]["handoffs_in"]["value"] == 1 and out["learning_record"]["handoffs_out"]["total"]["value"] == 0
+    assert phase(out, "assigned")["items"][1]["rule"] == "agent_id_unique"
+    twin = {**session("s3"), "agent_id": "a-me"}                              # the same agent id on two sessions is ambiguous
+    assert evolve(session=mine, sessions=[mine, twin], handoffs=[row])["learning_record"]["handoffs_in"]["value"] is None
+
+
+def test_a_self_handoff_is_counted_once_and_flagged():
+    out = evolve(handoffs=[handoff("h1", "s1", "s1")])
+    assert out["learning_record"]["handoffs_in"]["value"] == 0 and out["learning_record"]["handoffs_out"]["total"]["value"] == 1
+    assert phase(out, "handed_off")["items"][0]["self_handoff"] is True
+
+
+def test_signals_are_withheld_when_the_trail_does_not_list_this_agent():
+    def trail_for(host, owner, name, number):
+        return {"pull_request": {"status": "merged"}, "sessions": [{"session_id": "someone-else"}], "signals": {"ci_green_first_try": {"value": True, "reason": "x"}}}
+    entry = lr(trail_for=trail_for)["prs"]["value"][0]
+    assert entry["signals"] is None and entry["trail_lists_this_agent"] is False and "does not list this agent" in entry["caveat"]
+
+
+def test_too_many_linked_pull_requests_make_the_figure_null():
+    prs = [pull(n, branch="feat/x") for n in range(1, 8)]
+    rec = lr(pull_requests=prs, trail_for=lambda *a: {"sessions": [{"session_id": "s1"}], "pull_request": {}, "signals": {}})
+    assert rec["prs"]["value"] is None and "more than" in rec["prs"]["reason"]
+
+
+def test_duration_comes_from_the_terminal_transition_not_updated_at():
+    stream = [ev(0, "running", "SessionStarted", 1), ev(30, "finished", seq=2)]
+    rec = lr(session=session(end=200), stream=stream)
+    assert rec["duration_s"]["value"] == 1800
+    assert lr(session=session(end=200), stream=[ev(0, "running", "SessionStarted", 1)])["duration_s"]["value"] is None
+    undated = [ev(0, "running", "SessionStarted", 1), {**ev(30, "finished", seq=2), "source_timestamp": None}]
+    assert lr(stream=undated)["ended_at"]["value"] is None
+
+
+def test_a_stale_running_status_is_not_an_outcome_but_the_page_still_shows_it():
+    stale = session(status="running", end=0)                                   # last report 8 hours before NOW
+    out = evolve(session=stale)
+    assert out["learning_record"]["outcome"]["value"] is None and "older than 120 minutes" in out["learning_record"]["outcome"]["reason"]
+    shown = phase(out, "outcome")["items"][0]
+    assert shown["stale"] is True and shown["last_reported_status"] == "running"
+    fresh = evolve(session=session(status="running", end=470))["learning_record"]["outcome"]
+    assert fresh["value"] == "running"
+    assert evolve(session=stale, stale_after_minutes=1000)["learning_record"]["outcome"]["value"] == "running"
+
+
+def test_unreadable_arguments_and_missing_sequence_make_retries_null():
+    for kind in ("truncated", "redacted", "sensitive"):
+        flagged = {**call(2, 2), kind: True}
+        r = lr(tools=tools(call(1, 1, status="error"), flagged))["tool_calls"]["retried"]
+        assert r["value"] is None and "truncated" in r["reason"]
+    unordered = {**call(2, 2), "seq": None}
+    assert lr(tools=tools(call(1, 1, status="error"), unordered))["tool_calls"]["retried"]["value"] is None
+    assert "status is error" in lr(tools=tools(call(1, 1)))["tool_calls"]["failed"]["reason"] or "error" in lr(tools=tools(call(1, 1)))["tool_calls"]["failed"]["reason"]
+
+
+def test_retries_follow_sequence_order_not_timestamp_order():
+    later_first = tools(call(2, 1), call(1, 5, status="error"))                  # seq 1 errored, seq 2 repeats it, though stamped earlier
+    assert lr(tools=later_first)["tool_calls"]["retried"]["value"] == 1
+
+
+def test_a_ring_that_cannot_be_shown_whole_makes_tool_figures_null():
+    old = session(start=-60 * 30, end=-60 * 29)
+    assert lr(session=old, sessions=[old], tools=tools(call(1, -60 * 29)))["tool_calls"]["total"]["value"] is None
+    bare = {"events": [call(1, 1)], "has_more": False, "dropped": 0}
+    rec = lr(tools=bare)["tool_calls"]["total"]
+    assert rec["value"] is None and "retention" in rec["reason"]
+    assert "restart" in lr(tools=tools())["tool_calls"]["total"]["reason"]

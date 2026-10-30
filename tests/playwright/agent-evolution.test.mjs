@@ -150,3 +150,35 @@ test('on a phone the tabs and phases fit with no sideways scroll and 44px target
     assert.deepEqual(small, []);
   }, { width: 390, height: 844 });
 });
+
+test('focus follows arrow keys, ?tab=evolution survives a route re-render, panels are focusable and coming back refetches when stale', async () => {
+  await withApp(async ({ page, base, id }) => {
+    const requests = [];
+    page.on('request', (r) => { if (/\/evolution$/.test(new URL(r.url()).pathname)) requests.push(Date.now()); });
+    await open(page, base, id, '?tab=evolution');
+    await page.locator('[data-phase="assigned"]').waitFor({ timeout: 10000 });
+    assert.equal(await page.locator('#agent-tab-evolution').getAttribute('aria-selected'), 'true');
+    assert.equal(await page.locator('#agent-panel-overview').isHidden(), true);
+    assert.equal(await page.locator('#agent-panel-evolution').getAttribute('tabindex'), '0');
+    assert.equal(await page.locator('#agent-panel-evolution').getAttribute('aria-busy'), null, 'not busy once loaded');
+    // A route re-render (the same address entered again) keeps the deep-linked tab.
+    await page.evaluate(() => { const h = location.hash; location.hash = '#/'; location.hash = h; });
+    await page.locator('[data-phase="assigned"]').waitFor({ timeout: 10000 });
+    assert.equal(await page.locator('#agent-tab-evolution').getAttribute('aria-selected'), 'true');
+    assert.match(page.url(), /tab=evolution/);
+    // Arrow keys move focus together with the selection.
+    await page.locator('#agent-tab-evolution').focus();
+    await page.keyboard.press('ArrowLeft');
+    assert.equal(await page.evaluate(() => document.activeElement?.id), 'agent-tab-overview');
+    assert.doesNotMatch(page.url(), /tab=/);
+    // Back to Evolution within five seconds reuses what is shown; after that it asks the server again.
+    const before = requests.length;
+    await page.keyboard.press('ArrowRight');
+    assert.equal(requests.length, before, 'a quick return does not refetch');
+    await page.keyboard.press('ArrowLeft');
+    await page.waitForTimeout(5300);
+    await page.keyboard.press('ArrowRight');
+    await page.waitForFunction((n) => performance.getEntriesByType('resource').filter((e) => /\/evolution$/.test(new URL(e.name).pathname)).length > n, before, { timeout: 5000 });
+    assert.ok(requests.length > before, 'a stale tab refetches on return');
+  });
+});

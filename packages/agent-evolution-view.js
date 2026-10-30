@@ -55,7 +55,7 @@ export function evolutionModel(data) {
   };
 }
 
-const STYLE = `<style>.ev-sig{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:12px;margin:12px 0}.ev-card{border:1px solid var(--border);border-radius:8px;padding:8px 12px}.ev-card b{display:block;font-size:16px}.ev-card span{font-size:12px;color:var(--text-secondary);overflow-wrap:anywhere}.ev-card[data-known=false] b{color:var(--text-secondary)}.ev-note{font-size:13px;color:var(--text-secondary);margin:8px 0;overflow-wrap:anywhere}.ev-phases{list-style:none;margin:16px 0;padding:0 0 0 16px;border-left:2px solid var(--border)}.ev-phase{position:relative;padding:0 0 16px 12px}.ev-phase::before{content:"";position:absolute;left:-21px;top:8px;width:8px;height:8px;border-radius:50%;background:var(--text-muted)}.ev-phase[data-state=recorded]::before{background:var(--accent)}.ev-phase h2{font-size:16px;margin:0 0 4px}.ev-phase h2 small{font-size:12px;font-weight:400;color:var(--text-secondary)}.ev-items{list-style:none;margin:8px 0;padding:0}.ev-items li{padding:4px 0 8px;font-size:13px;line-height:1.4;overflow-wrap:anywhere;border-top:1px solid var(--border-subtle)}.ev-items time{display:block;font-size:11px;color:var(--text-secondary)}.ev-items small{color:var(--text-secondary)}.ev-items li[data-problem=true]{border-left:4px solid var(--status-failed);padding-left:8px}.ev-tag{display:inline-block;min-width:80px;font-weight:600}.ev-chips{display:flex;flex-wrap:wrap;gap:4px;margin:4px 0}.ev-chip{border:1px solid var(--border);border-radius:4px;padding:0 8px;font-size:12px}.ev-sub{margin:4px 0 0;padding-left:16px;font-size:12px;color:var(--text-secondary)}.ev-items a{display:inline-flex;align-items:center;min-height:44px}.ev-retry{min-height:44px;min-width:44px}.ev-raw pre{overflow:auto;max-width:100%;font-size:12px}.ev-raw summary{min-height:44px;display:flex;align-items:center}</style>`;
+const STYLE = `<style>.ev-sig{display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:8px;align-items:start;margin:12px 0}.ev-card{border:1px solid var(--border);border-radius:8px;padding:8px 12px}.ev-card b{display:block;font-size:16px}.ev-card span{font-size:12px;color:var(--text-secondary);overflow-wrap:anywhere}.ev-card[data-known=false] b{color:var(--text-secondary)}.ev-note{font-size:13px;color:var(--text-secondary);margin:8px 0;overflow-wrap:anywhere}.ev-phases{list-style:none;margin:16px 0;padding:0 0 0 16px;border-left:2px solid var(--border)}.ev-phase{position:relative;padding:0 0 16px 12px}.ev-phase::before{content:"";position:absolute;left:-21px;top:8px;width:8px;height:8px;border-radius:50%;background:var(--text-muted)}.ev-phase[data-state=recorded]::before{background:var(--accent)}.ev-phase h2{font-size:16px;margin:0 0 4px}.ev-phase h2 small{font-size:12px;font-weight:400;color:var(--text-secondary)}.ev-items{list-style:none;margin:8px 0;padding:0}.ev-items li{padding:4px 0 8px;font-size:13px;line-height:1.4;overflow-wrap:anywhere;border-top:1px solid var(--border-subtle)}.ev-items time{display:block;font-size:11px;color:var(--text-secondary)}.ev-items small{color:var(--text-secondary)}.ev-items li[data-problem=true]{border-left:4px solid var(--status-failed);padding-left:8px}.ev-tag{display:inline-block;min-width:80px;font-weight:600}.ev-chips{display:flex;flex-wrap:wrap;gap:4px;margin:4px 0}.ev-chip{border:1px solid var(--border);border-radius:4px;padding:0 8px;font-size:12px}.ev-sub{margin:4px 0 0;padding-left:16px;font-size:12px;color:var(--text-secondary)}.ev-items a{display:inline-flex;align-items:center;min-height:44px}.ev-retry{min-height:44px;min-width:44px}.ev-raw pre{overflow:auto;max-width:100%;font-size:12px}.ev-raw summary{min-height:44px;display:flex;align-items:center}</style>`;
 
 const chips = (items) => `<span class="ev-chips">${items.map((c) => `<span class="ev-chip">${esc(c)}</span>`).join('')}</span>`;
 const why = (rule) => (rule ? ` <small>· via ${esc(RULE_TEXT[rule] || text(rule))}</small>` : '');
@@ -81,7 +81,7 @@ export function renderItem(item) {
   }
   if (kind === 'handoff_in' || kind === 'handoff_out') {
     const accept = Number.isFinite(i.time_to_accept_s) && i.time_to_accept_s > 0 ? ` · accepted after ${esc(formatDuration(i.time_to_accept_s * 1000))}` : '';
-    return li(`${stamp(i.at)}<span class="ev-tag">${kind === 'handoff_in' ? 'Handed to this agent' : 'Handed on'}</span> ${agentLink(i.from)} → ${agentLink(i.to)} · <strong>${esc(text(i.state))}</strong>${accept}`
+    return li(`${stamp(i.at)}<span class="ev-tag">${kind === 'handoff_in' ? 'Handed to this agent' : 'Handed to'}</span> ${agentLink(i.from)} → ${agentLink(i.to)} · <strong>${esc(text(i.state))}</strong>${i.self_handoff ? ' <small>(to itself)</small>' : ''}${accept}`
       + `${text(i.goal) ? `<div>${esc(text(i.goal))}</div>` : ''}${sub('Done', i.completed)}${sub('Remaining', i.remaining)}${sub('Decided', i.decisions)}${why(i.rule)}`, !!i.problem);
   }
   if (kind === 'run') {
@@ -110,9 +110,9 @@ export function renderItem(item) {
     return li(`${stamp(i.at)}<span class="ev-tag">Review</span> ${esc(text(i.review_kind) || 'code')} · ${esc(text(i.verdict) || text(i.status) || 'no verdict')}${text(i.reviewer) ? ` · ${esc(text(i.reviewer))}` : ''}${why(i.rule)}`, !!i.changes_requested);
   }
   if (kind === 'pull_request_outcome') {
-    const cards = signalCards(i.signals).map((c) => `<div class="ev-card" data-signal="${esc(c.key)}" data-known="${c.known}"><b>${esc(c.value)}</b><span>${esc(c.label)}${c.reason ? ` — ${esc(c.reason)}` : ''}</span></div>`).join('');
-    const own = i.trail_lists_this_agent === false ? '<p class="ev-note">The pull request trail does not list this agent, so these figures may describe other agents\' work.</p>' : '';
-    return li(`<span class="ev-tag">${esc(text(i.ref))}</span> ${esc(text(i.status) || 'unknown')} <small>· covers every agent on that pull request</small>${own}<div class="ev-sig">${cards}</div>${why(i.rule)}`);
+    const cards = i.signals ? signalCards(i.signals).map((c) => `<div class="ev-card" data-signal="${esc(c.key)}" data-known="${c.known}"><b>${esc(c.value)}</b><span>${esc(c.label)}${c.reason ? ` — ${esc(c.reason)}` : ''}</span></div>`).join('') : '';
+    const note = text(i.caveat) ? `<p class="ev-note" data-ev-caveat>${esc(text(i.caveat))}</p>` : '';
+    return li(`<span class="ev-tag">${esc(text(i.ref))}</span> ${esc(text(i.status) || 'unknown')}${note}${cards ? `<div class="ev-sig">${cards}</div>` : ''}${why(i.rule)}`);
   }
   if (kind === 'cost') {
     return li(`<span class="ev-tag">Cost</span> ${Number(i.usd) > 0 && Number(i.usd) < 0.01 ? '&lt;$0.01' : esc(`$${Number(i.usd).toFixed(2)}`)} <small>${esc(text(i.note))}</small>${why(i.rule)}`);
@@ -122,7 +122,7 @@ export function renderItem(item) {
 
 function renderOutcomeStatus(item) {
   const i = obj(item);
-  return `<li data-kind="status" data-problem="${/^failed$/.test(text(i.value)) ? 'true' : 'false'}"><time>${esc(when(i.at))}</time><span class="ev-tag">Last report</span> <strong>${esc(text(i.value) || 'unclassified')}</strong> <small>· reported status "${esc(text(i.last_reported_status))}"</small>${why(i.rule)}</li>`;
+  return `<li data-kind="status" data-problem="${/^failed$/.test(text(i.value)) ? 'true' : 'false'}"><time>${esc(when(i.at))}</time><span class="ev-tag">Reported</span> <strong>${esc(text(i.last_reported_status) || 'none')}</strong> <small>· ${i.stale ? 'last report is old, so this is not counted as an outcome' : `classed as ${esc(text(i.value) || 'unclassified')}`}</small>${why(i.rule)}</li>`;
 }
 
 export function renderEvolution(data) {
@@ -141,7 +141,7 @@ export function renderEvolution(data) {
       + `${items ? `<ul class="ev-items" aria-label="${esc(p.title)}">${items}</ul>` : ''}${more}</li>`;
   }).join('');
   const hints = list(obj(m.hints).same_mission_sessions);
-  const hint = hints.length ? `<p class="ev-note" data-ev-hints>Possibly related, because they share this agent's mission (not counted anywhere above): ${hints.map((h) => `<a href="${esc(sessionHref(obj(h).session_id))}">${esc(text(obj(h).name) || text(obj(h).session_id))}</a>`).join(', ')}.</p>` : '';
+  const hint = hints.length ? `<p class="ev-note" data-ev-hints>Possibly related, because they share this agent's mission (not counted anywhere above): ${hints.map((h) => { const label = esc(text(obj(h).name) || text(obj(h).session_id) || 'unnamed agent'), href = sessionHref(obj(h).session_id); return href ? `<a href="${esc(href)}">${label}</a>` : label; }).join(', ')}.</p>` : '';
   const derived = Object.entries(m.derived).map(([k, v]) => `${k}: ${v}`);
   const foot = derived.length ? `<p class="ev-note" data-ev-derived>Derived, not reported — ${esc(derived.join(' · '))}</p>` : '';
   const raw = `<details class="ev-raw" data-ev-raw><summary>Learning record (as stored for later analysis)</summary><pre>${esc(JSON.stringify(m.record, null, 2))}</pre></details>`;
@@ -149,8 +149,8 @@ export function renderEvolution(data) {
 }
 
 export function mountAgentEvolution(container, client, { sessionId, isActive = () => true } = {}) {
-  let disposed = false, controller = null, loaded = false, signature = null;
-  container.innerHTML = '<div class="ev-head"><herdr-freshness interval="30000"></herdr-freshness></div><div data-ev-body></div><p class="ev-note" data-ev-error hidden></p><button type="button" class="ev-retry" data-ev-retry hidden>Retry</button>';
+  let disposed = false, controller = null, loaded = false, signature = null, fetchedAt = 0;
+  container.innerHTML = '<div class="ev-head"><herdr-freshness interval="30000"></herdr-freshness></div><div data-ev-body></div><p class="ev-note" role="alert" data-ev-error hidden></p><button type="button" class="ev-retry" data-ev-retry hidden>Retry</button>';
   const body = container.querySelector('[data-ev-body]'), error = container.querySelector('[data-ev-error]'), retry = container.querySelector('[data-ev-retry]');
   const chip = container.querySelector('herdr-freshness');
   const path = `/api/v1/sessions/${encodeURIComponent(sessionId)}/evolution`;
@@ -159,6 +159,7 @@ export function mountAgentEvolution(container, client, { sessionId, isActive = (
     const request = new AbortController(); controller = request;
     const signal = AbortSignal.any([request.signal, AbortSignal.timeout(20000)]);
     if (!loaded) body.innerHTML = skeleton('agent evolution', { rows: 4, height: 64 });
+    container.setAttribute('aria-busy', 'true');
     error.hidden = true; retry.hidden = true;
     try {
       const data = await client.request(path, { signal });
@@ -166,7 +167,7 @@ export function mountAgentEvolution(container, client, { sessionId, isActive = (
       if (!data || typeof data !== 'object' || Array.isArray(data) || data.error) throw new Error(text(data?.error) || 'Invalid evolution response');
       const next = JSON.stringify(data);
       if (next !== signature) { body.innerHTML = renderEvolution(data); signature = next; }
-      loaded = true;
+      loaded = true; fetchedAt = Date.now();
       chip?.touch?.(true);
     } catch (err) {
       if (!disposed && !request.signal.aborted) {
@@ -176,12 +177,14 @@ export function mountAgentEvolution(container, client, { sessionId, isActive = (
         error.hidden = false; retry.hidden = false;
         chip?.touch?.(false, message);
       }
-    } finally { if (controller === request) controller = null; }
+    } finally { if (controller === request) controller = null; container.removeAttribute('aria-busy'); }
   };
   retry.addEventListener('click', refresh);
   const stop = pollWhileVisible(() => { if (isActive()) return refresh(); return undefined; }, 30000);
   void refresh();
-  return { refresh, dispose() { disposed = true; stop(); controller?.abort(); } };
+  // Coming back to the tab refetches when what is shown is older than the server's own cache.
+  const show = () => { if (Date.now() - fetchedAt > 5000) void refresh(); };
+  return { refresh, show, dispose() { disposed = true; stop(); controller?.abort(); } };
 }
 
 /** Tabs for the agent page: Overview (everything that was there) and Evolution (loaded the first time it is opened). */
