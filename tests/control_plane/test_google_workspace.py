@@ -1,19 +1,21 @@
 """Read-only Gmail + Calendar: refresh-token access, the allow-list, read-only scopes, and no credential in any error."""
 import base64
+import io
 import json
 import os
-import stat
 import urllib.error
 import urllib.parse
 
 import pytest
 
 from herdr_engineering.control_plane import google_workspace as gw
+from herdr_engineering.control_plane.app_credentials import CredentialStore, SecretBox
 from herdr_engineering.control_plane.assistant import (
     AssistantError,
     AssistantService,
     assistant_config,
 )
+from herdr_engineering.control_plane.google_oauth import SCOPES
 
 REFRESH = "1//refresh-token-value"
 SECRET = "client-secret-value"
@@ -37,7 +39,9 @@ class Google:
     """A fake Google: token endpoint + Gmail + Calendar, recording every request."""
 
     def __init__(self):
-        self.requests, self.fail = [], {}
+        self.requests, self.fail, self.revoked, self.primary = [], {}, False, "ann@x.org"
+        self.busy = {}      # calendar id -> [(start, end)] reported by freeBusy
+        self.extra, self.page, self.fb_omit, self.fb_errors, self.fb_groups = 0, 0, set(), set(), None
         b64 = base64.urlsafe_b64encode(b"Hello from the body").decode()
         self.msgs = {"m1": {"id": "m1", "snippet": "snip", "payload": {
             "headers": [{"name": "From", "value": "Alice <a@x.org>"}, {"name": "Subject", "value": "Lunch"},
@@ -52,12 +56,34 @@ class Google:
             if needle in url:
                 raise urllib.error.HTTPError(url, code, "x", {}, None)
         if url == gw.TOKEN_URL:
-            return Resp({"access_token": "ya29.access", "expires_in": 3600})
+            if self.revoked:
+                raise urllib.error.HTTPError(url, 400, "Bad Request", {}, io.BytesIO(b'{"error":"invalid_grant","error_description":"Token has been revoked ' + REFRESH.encode() + b'"}'))
+            who = urllib.parse.parse_qs(req.data.decode())["refresh_token"][0]
+            return Resp({"access_token": "ya29.access." + who, "expires_in": 3600})
         path = urllib.parse.urlparse(url).path
+        if url == gw.FREEBUSY_URL:
+            ids = [i["id"] for i in json.loads(req.data)["items"]]
+            assert len(ids) <= 50
+            out = {i: ({"errors": [{"reason": "notFound"}]} if i in self.fb_errors else
+                       {"busy": [{"start": a, "end": b} for a, b in self.busy.get(i, [])]}) for i in ids if i not in self.fb_omit}
+            return Resp({"calendars": out, **({"groups": self.fb_groups} if self.fb_groups else {})})
         if path.endswith("/messages"):
             return Resp({"messages": [{"id": "m1"}, {"id": "../bad"}]})
         if "/messages/" in path:
             return Resp(self.msgs[path.rsplit("/", 1)[1]])
+        if path.endswith("/calendarList"):
+            items = [{"id": "ann@x.org", "summary": "Ann", "primary": True}, {"id": "team@x.org", "summary": "Team"},
+                     {"id": "secret@x.org", "summary": "Private"}] + [{"id": f"x{i}@x.org"} for i in range(self.extra)]
+            if not self.page:
+                return Resp({"items": items})
+            q = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
+            at = int(q.get("pageToken", ["0"])[0])
+            more = at + self.page < len(items)
+            return Resp({"items": items[at:at + self.page], **({"nextPageToken": str(at + self.page)} if more else {})})
+        if path.endswith("/calendars/primary"):
+            return Resp({"id": self.primary})
+        if "/events/" in path:
+            return Resp({"id": "e1", "summary": "One", "start": {"date": "2026-10-31"}, "end": {"date": "2026-11-01"}})
         if "/events" in path:
             return Resp({"items": [{"id": "e1", "summary": "Standup", "start": {"dateTime": "2026-10-31T09:00:00-07:00"},
                                     "end": {"dateTime": "2026-10-31T09:15:00-07:00"}, "attendees": [{}, {}], "status": "confirmed"}]})
@@ -65,22 +91,22 @@ class Google:
 
 
 @pytest.fixture()
-def files(tmp_path):
-    client = tmp_path / "client.json"
-    client.write_text(json.dumps({"installed": {"client_id": "cid.apps.googleusercontent.com", "client_secret": SECRET}}))
-    token = tmp_path / "token.json"
-    gw.write_token_file(str(token), {"refresh_token": REFRESH, "scopes": list(gw.SCOPES)})
-    return str(client), str(token)
+def store(tmp_path):
+    key = tmp_path / "key"
+    key.write_bytes(os.urandom(32))
+    st = CredentialStore(SecretBox(str(key)))
+    st.put_client("google", "cid.apps.googleusercontent.com", SECRET)
+    st.put_connection("default", "u1", "google", account="u1@x.org", scopes=list(SCOPES), refresh_token=REFRESH)
+    return st
 
 
-def ws(files, users=("default/u1",), **kw):
+def ws(store, blocked=None, **kw):
     google = Google()
-    cfg = {"enabled": True, "client_secret_file": files[0], "token_file": files[1], "users": list(users)}
-    return gw.GoogleWorkspace(cfg, opener=google, **kw), google
+    return gw.GoogleWorkspace(store, blocked_fn=lambda t, u: list((blocked or {}).get((t, u), [])), opener=google, **kw), google
 
 
-def test_search_read_and_events_return_trimmed_untrusted_data(files):
-    w, g = ws(files)
+def test_search_read_and_events_return_trimmed_untrusted_data(store):
+    w, g = ws(store)
     out = w.run("default", "u1", "search_email", {"query": "from:alice", "max_results": 3})
     assert out["untrusted_content"] is True
     assert out["result"] == [{"id": "m1", "from": "Alice <a@x.org>", "subject": "Lunch", "date": "Fri", "snippet": "snip"}]
@@ -88,98 +114,220 @@ def test_search_read_and_events_return_trimmed_untrusted_data(files):
     assert mail["body"] == "Hello from the body" and mail["subject"] == "Lunch" and mail["truncated"] is False
     [ev] = w.run("default", "u1", "list_calendar_events", {"time_min": "2026-10-31"})["result"]
     assert ev["summary"] == "Standup" and ev["attendees"] == 2
-    assert all(r[0] in ("GET", "POST") for r in g.requests)
+    # reads are GET; the only POSTs are the token endpoint and freeBusy (a read that takes its query as a body)
+    assert all(r[0] == "GET" or (r[0] == "POST" and r[1] in (gw.TOKEN_URL, gw.FREEBUSY_URL)) for r in g.requests)
     assert sum(1 for r in g.requests if r[1] == gw.TOKEN_URL) == 1       # the access token is cached
 
 
-def test_only_listed_users_may_read_and_it_can_be_off(files):
-    w, _ = ws(files)
+def test_a_person_without_a_connection_or_needing_attention_gets_fixed_reasons(store):
+    w, g = ws(store)
     with pytest.raises(gw.GoogleError) as exc:
         w.run("default", "someone-else", "search_email", {"query": "x"})
-    assert exc.value.reason == "not_enabled_for_user"
-    w.config["enabled"] = False
-    with pytest.raises(gw.GoogleError):
-        w.run("default", "u1", "search_email", {"query": "x"})
-
-
-def test_a_token_with_any_write_scope_is_never_used(files):
-    gw.write_token_file(files[1], {"refresh_token": REFRESH, "scopes": [*gw.SCOPES, "https://mail.google.com/"]})
-    w, g = ws(files)
+    assert exc.value.reason == "not_connected" and g.requests == []
+    store.set_status("default", "u1", "google", "needs_attention")
     with pytest.raises(gw.GoogleError) as exc:
         w.run("default", "u1", "search_email", {"query": "x"})
-    assert exc.value.reason == "unexpected_scope" and g.requests == []
+    assert exc.value.reason == "needs_attention" and g.requests == []
 
 
-def test_failures_have_fixed_reasons_and_never_carry_a_credential(files):
-    w, g = ws(files)
+def test_failures_have_fixed_reasons_and_never_carry_a_credential(store):
+    w, g = ws(store)
     g.fail["/messages"] = 403
     with pytest.raises(gw.GoogleError) as exc:
         w.run("default", "u1", "search_email", {"query": "x"})
     assert exc.value.reason == "forbidden"
     for secret in (REFRESH, SECRET, "ya29.access"):
         assert secret not in repr(exc.value) and secret not in str(exc.value)
-    os.unlink(files[1])
-    w2, _ = ws(files)
-    with pytest.raises(gw.GoogleError) as exc2:
-        w2.run("default", "u1", "list_calendar_events", {})
-    assert exc2.value.reason == "not_connected"
 
 
-def test_ids_and_times_are_validated(files):
-    w, _ = ws(files)
+def test_ids_and_times_are_validated(store):
+    w, _ = ws(store)
     for bad in ("../x", "a b", "", None, 5):
         with pytest.raises(gw.GoogleError):
-            w.read_email(bad)
+            w.read_email("default", "u1", bad)
     with pytest.raises(gw.GoogleError):
-        w.list_events(time_min="tomorrow; drop")
+        w.list_events("default", "u1", time_min="tomorrow; drop")
 
 
-def test_config_validation():
-    assert gw.google_config(None)["enabled"] is False
-    with pytest.raises(ValueError, match="needs client_secret_file"):
-        gw.google_config({"enabled": True})
-    with pytest.raises(ValueError, match="unknown keys"):
-        gw.google_config({"enabled": False, "scope": "x"})
-    with pytest.raises(ValueError, match="users"):
-        gw.google_config({"users": ["no-slash"]})
+def test_the_retired_file_based_google_config_is_refused():
+    with pytest.raises(ValueError, match="replaced by personal_assistant.apps"):
+        assistant_config({"personal_assistant": {"enabled": True, "google": {"enabled": False}}})
+    assert "google" not in assistant_config({"personal_assistant": {"enabled": True}})
 
 
-def test_authorization_url_asks_for_read_only_scopes_with_pkce():
-    state, verifier, challenge = gw.new_pkce()
-    q = urllib.parse.parse_qs(urllib.parse.urlparse(gw.authorization_url("cid", "http://127.0.0.1:8765/", state, challenge)).query)
-    assert set(q["scope"][0].split()) == set(gw.SCOPES) and all(s.endswith(".readonly") for s in gw.SCOPES)
-    assert q["code_challenge_method"] == ["S256"] and q["access_type"] == ["offline"] and q["state"] == [state]
-    assert verifier not in json.dumps(q)
-
-
-def test_exchange_stores_a_private_token_and_refuses_wider_scopes(tmp_path):
-    class Tokens:
-        def __init__(self, scope):
-            self.scope = scope
-
-        def __call__(self, req, timeout):
-            return Resp({"refresh_token": REFRESH, "scope": self.scope, "access_token": "a"})
-    rec = gw.exchange_code(("cid", SECRET), "code", "ver", "http://127.0.0.1:8765/", Tokens(" ".join(gw.SCOPES)))
-    path = tmp_path / "t.json"
-    gw.write_token_file(str(path), rec)
-    assert stat.S_IMODE(os.stat(path).st_mode) == 0o600
-    with pytest.raises(gw.GoogleError) as exc:
-        gw.exchange_code(("cid", SECRET), "code", "ver", "http://127.0.0.1:8765/", Tokens("https://mail.google.com/"))
-    assert exc.value.reason == "unexpected_scope"
-
-
-def test_the_assistant_tools_dispatch_and_report_fixed_reasons(files):
+def test_the_assistant_tools_dispatch_and_report_fixed_reasons(store):
     svc = AssistantService(config=assistant_config({"personal_assistant": {"enabled": True}}))
     a = svc.create_assistant(tenant_id="default", user_id="u1", name="A")
     with pytest.raises(AssistantError, match="not enabled"):
         svc.execute_tool(tenant_id="default", user_id="u1", assistant_id=a.assistant_id, tool_id="search_email",
                          payload={"query": "x"})
-    w, _ = ws(files)
+    w, _ = ws(store)
     svc.google_read = w.run
     out = svc.execute_tool(tenant_id="default", user_id="u1", assistant_id=a.assistant_id, tool_id="search_email",
                            payload={"query": "x"})
     assert out["result"][0]["subject"] == "Lunch"
-    w.config["users"] = []
-    with pytest.raises(AssistantError, match="not_enabled_for_user"):
+    store.delete_connection("default", "u1", "google")
+    with pytest.raises(AssistantError, match="not connected"):
         svc.execute_tool(tenant_id="default", user_id="u1", assistant_id=a.assistant_id, tool_id="search_email",
                          payload={"query": "x"})
+
+
+WIN = {"time_min": "2026-11-02T08:00:00Z", "time_max": "2026-11-02T18:00:00Z"}
+
+
+def free(w, minutes=30, **win):
+    return w.run("default", "u1", "find_free_time", {"duration_minutes": minutes, **(win or WIN)})
+
+
+def test_free_time_ignores_blocked_calendars(store):
+    w, g = ws(store, blocked={("default", "u1"): ["secret@x.org"]})
+    g.busy = {"ann@x.org": [("2026-11-02T09:00:00Z", "2026-11-02T10:00:00Z")],
+              "secret@x.org": [("2026-11-02T12:00:00Z", "2026-11-02T16:00:00Z")]}     # must not reduce free time
+    out = free(w)
+    assert "untrusted_content" not in out
+    assert out["slots"] == [{"start": "2026-11-02T08:00:00Z", "end": "2026-11-02T09:00:00Z"},
+                            {"start": "2026-11-02T10:00:00Z", "end": "2026-11-02T18:00:00Z"}]
+    posts = [r for r in g.requests if r[1] == gw.FREEBUSY_URL]
+    assert len(posts) == 1 and sorted(i["id"] for i in json.loads(posts[0][3])["items"]) == ["ann@x.org", "team@x.org"]
+    assert all(b"secret@x.org" not in (r[3] or b"") for r in g.requests)
+
+
+def test_free_time_returns_at_most_five_slots_inside_the_window(store):
+    w, g = ws(store)
+    # busy every 30 min from 09:00 for 10 minutes, one overlapping/unsorted entry, and one spilling past the window
+    g.busy = {"ann@x.org": [(f"2026-11-02T{9 + i // 2:02d}:{30 * (i % 2):02d}:00Z", f"2026-11-02T{9 + i // 2:02d}:{30 * (i % 2) + 10:02d}:00Z")
+                            for i in range(12)][::-1] + [("2026-11-02T17:50:00Z", "2026-11-02T19:00:00Z")]}
+    slots = free(w, 15)["slots"]
+    assert len(slots) == 5 and slots == sorted(slots, key=lambda s: s["start"])
+    assert slots[0] == {"start": "2026-11-02T08:00:00Z", "end": "2026-11-02T09:00:00Z"}
+    assert all("2026-11-02T08:00:00Z" <= s["start"] < s["end"] <= "2026-11-02T18:00:00Z" for s in slots)
+    assert [s["end"] for s in free(w, 25)["slots"]] == [
+        "2026-11-02T09:00:00Z", "2026-11-02T17:50:00Z"]      # 20-minute gaps are too short for 25
+    assert all(g_["start"] < g_["end"] for g_ in free(w, 480, time_min="2026-11-02T00:00:00Z", time_max="2026-11-03T00:00:00Z")["slots"])
+
+
+def test_free_time_with_every_calendar_blocked_is_empty_and_asks_google_nothing(store):
+    w, g = ws(store, blocked={("default", "u1"): ["primary", "team@x.org", "secret@x.org"]})
+    assert free(w) == {"ok": True, "slots": []}
+    assert not [r for r in g.requests if r[1] == gw.FREEBUSY_URL]
+
+
+def test_free_time_primary_alias_block_hides_the_real_primary_id(store):
+    w, g = ws(store, blocked={("default", "u1"): ["primary"]})
+    g.busy = {"ann@x.org": [("2026-11-02T09:00:00Z", "2026-11-02T17:00:00Z")]}
+    assert free(w)["slots"] == [{"start": "2026-11-02T08:00:00Z", "end": "2026-11-02T18:00:00Z"}]
+    assert all(b"ann@x.org" not in (r[3] or b"") for r in g.requests)
+
+
+@pytest.mark.parametrize("minutes,win", [
+    (4, WIN), (481, WIN), (True, WIN), ("30", WIN), (30, {"time_min": "garbage", "time_max": "2026-11-02T18:00:00Z"}),
+    (30, {"time_min": "2026-11-02T18:00:00Z", "time_max": "2026-11-02T08:00:00Z"}),
+    (30, {"time_min": "2026-11-02T08:00:00Z", "time_max": "2026-11-02T08:00:00Z"}),
+    (30, {"time_min": "2026-11-01T00:00:00Z", "time_max": "2026-11-15T00:00:01Z"}),
+    (30, {"time_min": "2026-11-01"}), (30, {"time_min": 5, "time_max": 6}),
+    (30, {"time_min": "0001-01-01T00:00:00+23:59", "time_max": "2026-11-02T18:00:00Z"})])
+def test_free_time_window_and_duration_are_validated(store, minutes, win):
+    w, g = ws(store)
+    with pytest.raises(gw.GoogleError) as exc:
+        w.run("default", "u1", "find_free_time", {"duration_minutes": minutes, **win})
+    assert exc.value.reason == "bad_request" and g.requests == []
+
+
+def test_free_time_accepts_exactly_fourteen_days(store):
+    w, _ = ws(store)
+    assert free(w, 30, time_min="2026-11-01T00:00:00Z", time_max="2026-11-15T00:00:00Z")["slots"]
+
+
+def fails_unavailable(w):
+    with pytest.raises(gw.GoogleError) as exc:
+        free(w)
+    assert exc.value.reason == "unavailable"
+
+
+def test_free_time_fails_safe_when_google_cannot_vouch_for_a_calendar(store):
+    w, g = ws(store)
+    g.fb_errors = {"team@x.org"}
+    fails_unavailable(w)
+    g.fb_errors, g.fb_omit = set(), {"team@x.org"}
+    fails_unavailable(w)                                     # a calendar absent from the answer is not "free"
+    g.fb_omit, g.fb_groups = set(), {"g": {"errors": [{"reason": "x"}]}}
+    fails_unavailable(w)
+    g.fb_groups, g.busy = None, {"ann@x.org": [("garbage", "2026-11-02T10:00:00Z")]}
+    fails_unavailable(w)
+
+
+def test_free_time_pages_the_calendar_list_and_chunks_freebusy(store):
+    w, g = ws(store, blocked={("default", "u1"): ["x7@x.org"]})
+    g.extra, g.page = 120, 40
+    g.busy = {"x119@x.org": [("2026-11-02T09:00:00Z", "2026-11-02T10:00:00Z")]}      # on the last page
+    out = free(w)
+    assert out["slots"][0] == {"start": "2026-11-02T08:00:00Z", "end": "2026-11-02T09:00:00Z"}
+    lists = [r for r in g.requests if r[1].split("?")[0].endswith("/calendarList")]
+    assert len(lists) == 4 and all("showHidden=true" in r[1] for r in lists)
+    sizes = [len(json.loads(r[3])["items"]) for r in g.requests if r[1] == gw.FREEBUSY_URL]
+    assert sizes == [50, 50, 22] and sum(sizes) == 122      # 123 calendars minus the blocked x7
+    assert all(b"x7@x.org" not in (r[3] or b"") for r in g.requests)
+
+
+def test_free_time_refuses_to_truncate_an_endless_calendar_list(store):
+    w, g = ws(store)
+    g.extra, g.page = 5000, 100                                  # 51 pages > the cap
+    fails_unavailable(w)
+    assert not [r for r in g.requests if r[1] == gw.FREEBUSY_URL]
+
+
+def test_free_time_clamps_adjacent_outside_and_offset_intervals(store):
+    w, g = ws(store)
+    g.busy = {"ann@x.org": [("2026-11-02T06:00:00Z", "2026-11-02T08:00:00Z"),       # ends exactly at the window start
+                            ("2026-11-02T18:00:00Z", "2026-11-02T20:00:00Z"),       # starts exactly at the window end
+                            ("2026-11-02T01:00:00Z", "2026-11-02T03:00:00Z"),       # wholly before
+                            ("2026-11-02T09:00:00Z", "2026-11-02T10:00:00Z"),
+                            ("2026-11-02T10:00:00Z", "2026-11-02T11:00:00Z")],      # adjacent: merges, no sliver
+              "team@x.org": [("2026-11-02T07:00:00Z", "2026-11-02T08:30:00Z")]}     # straddles the start
+    assert free(w)["slots"] == [{"start": "2026-11-02T08:30:00Z", "end": "2026-11-02T09:00:00Z"},
+                                {"start": "2026-11-02T11:00:00Z", "end": "2026-11-02T18:00:00Z"}]
+    # the same window written with a -08:00 offset
+    out = free(w, time_min="2026-11-02T00:00:00-08:00", time_max="2026-11-02T10:00:00-08:00")
+    assert out["slots"][-1] == {"start": "2026-11-02T11:00:00Z", "end": "2026-11-02T18:00:00Z"}
+
+
+def test_find_free_time_dispatches_through_the_assistant_service(store):
+    svc = AssistantService(config=assistant_config({"personal_assistant": {"enabled": True}}))
+    a = svc.create_assistant(tenant_id="default", user_id="u1", name="A")
+    w, g = ws(store)
+    svc.google_read = w.run
+    payload = {"duration_minutes": 30, **WIN}
+    out = svc.execute_tool(tenant_id="default", user_id="u1", assistant_id=a.assistant_id, tool_id="find_free_time", payload=payload)
+    assert out["ok"] is True and out["slots"] == [{"start": "2026-11-02T08:00:00Z", "end": "2026-11-02T18:00:00Z"}]
+    with pytest.raises(AssistantError):
+        svc.execute_tool(tenant_id="default", user_id="u1", assistant_id=a.assistant_id, tool_id="find_free_time",
+                         payload={**payload, "duration_minutes": 1})
+    g.fb_errors = {"ann@x.org"}
+    with pytest.raises(AssistantError, match="find free time failed: unavailable"):
+        svc.execute_tool(tenant_id="default", user_id="u1", assistant_id=a.assistant_id, tool_id="find_free_time", payload=payload)
+
+
+def test_a_stale_revoked_refresh_does_not_mark_a_fresh_reconnect(store):
+    g = Google()
+    g.revoked = True
+    holder = {}
+
+    def opener(req, timeout):
+        if req.full_url == gw.TOKEN_URL:
+            holder["w"].invalidate("default", "u1")       # the person reconnected while this refresh was in flight
+        return g(req, timeout)
+    w = gw.GoogleWorkspace(store, blocked_fn=lambda t, u: [], opener=opener)
+    holder["w"] = w
+    with pytest.raises(gw.GoogleError) as exc:
+        w.run("default", "u1", "search_email", {"query": "x"})
+    assert exc.value.reason == "unavailable"
+    assert store.get_connection("default", "u1", "google").status == "connected"
+    g.revoked = False
+    holder["w"] = w
+    w.run("default", "u1", "search_email", {"query": "x"})     # and a genuine revocation afterwards still flags it
+    g.revoked = True
+    w.invalidate("default", "u1")
+    holder["w"] = type("N", (), {"invalidate": staticmethod(lambda *a: None)})()
+    with pytest.raises(gw.GoogleError) as exc:
+        w.run("default", "u1", "search_email", {"query": "x"})
+    assert exc.value.reason == "needs_attention" and store.get_connection("default", "u1", "google").status == "needs_attention"

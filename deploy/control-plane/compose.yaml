@@ -131,9 +131,9 @@ services:
       # /etc/herdr/github-app/github-app.pem): its own 0700 dir, validated by deploy.sh.
       # Only this service reads GitHub (release evidence + GitHub cache).
       - ${HERDR_CP_GITHUB_APP_DIR:?run deploy.sh}:/etc/herdr/github-app:ro
-      # Read-only Google mail/calendar (personal_assistant.google): client_secret.json and token.json in their own
-      # 0700 dir, validated by deploy.sh. The token is only ever read here; `herdr-eng google authorize` writes it.
-      - ${HERDR_CP_GOOGLE_DIR:?run deploy.sh}:/etc/herdr/google:ro
+      # Assistant app connections (personal_assistant.apps.key_file = /etc/herdr/apps/apps.key): the 32-byte key that
+      # encrypts stored Google tokens, alone in its own 0700 dir validated by deploy.sh. Only this service reads it.
+      - ${HERDR_CP_APPS_DIR:?run deploy.sh}:/etc/herdr/apps:ro
       # InferWeave deploy/pipelines/*.yaml (control_plane.deployment_definitions =
       # /etc/herdr/pipelines), kept current by the herdr-pipelines-sync timer and
       # validated by deploy.sh. Only this service reads deployment definitions.

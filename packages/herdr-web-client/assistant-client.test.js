@@ -151,3 +151,39 @@ test('proposal, execute and notification calls hit the documented routes', async
   ]);
   assert.equal(JSON.parse(calls[2].opts.body).decision, 'rejected');
 });
+
+test('assistant apps client: exact URL, verb and JSON body for every method', async () => {
+  const { calls, fetchImpl } = capture();
+  const c = new HerdrClient('', { fetchImpl });
+  await c.listApps();
+  await c.saveAppClient('google', 'cid.apps', 's3cret');
+  await c.connectApp('google');
+  await c.disconnectApp('google');
+  await c.listCalendars('google');
+  await c.setBlockedCalendars('google', ['a@x.org', 'b@x.org']);
+  await c.listDrafts('google');
+  await c.discardDraft('google', 'r-1');
+  await c.listReminders();
+  await c.cancelReminder('rem_1');
+  const seen = calls.map((x) => [x.opts.method, x.url, x.opts.body === undefined ? undefined : JSON.parse(x.opts.body)]);
+  assert.deepEqual(seen, [
+    ['GET', '/api/v1/assistant-apps', undefined],
+    ['PUT', '/api/v1/assistant-apps/google/client', { client_id: 'cid.apps', client_secret: 's3cret' }],
+    ['POST', '/api/v1/assistant-apps/google/connect', {}],
+    ['DELETE', '/api/v1/assistant-apps/google', undefined],
+    ['GET', '/api/v1/assistant-apps/google/calendars', undefined],
+    ['PUT', '/api/v1/assistant-apps/google/blocked-calendars', { ids: ['a@x.org', 'b@x.org'] }],
+    ['GET', '/api/v1/assistant-apps/google/drafts', undefined],
+    ['DELETE', '/api/v1/assistant-apps/google/drafts/r-1', undefined],
+    ['GET', '/api/v1/assistant-reminders', undefined],
+    ['DELETE', '/api/v1/assistant-reminders/rem_1', undefined],
+  ]);
+  assert.equal(calls[1].opts.headers['Content-Type'], 'application/json');
+});
+
+test('assistant apps client: ids are path-encoded', async () => {
+  const { calls, fetchImpl } = capture();
+  const c = new HerdrClient('', { fetchImpl });
+  await c.discardDraft('google', 'a/b');
+  assert.equal(calls[0].url, '/api/v1/assistant-apps/google/drafts/a%2Fb');
+});

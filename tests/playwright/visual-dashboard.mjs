@@ -94,6 +94,12 @@ const assistantDb = () => ({
   ],
 });
 
+// Gmail and Calendar connected, GitHub status, the Google client saved: the Connectors tab with everything on it.
+const APPS = { ready: true, redirect_uri: 'https://cp.example/api/v1/assistant-apps/google/callback', blocked_calendars: ['private@example.com'], providers: [
+  { id: 'gmail', name: 'Gmail', kind: 'oauth', provider: 'google', connected: true, account: 'ann@example.com', status: 'connected', scopes: [], client_configured: true },
+  { id: 'calendar', name: 'Google Calendar', kind: 'oauth', provider: 'google', connected: true, account: 'ann@example.com', status: 'connected', scopes: [], client_configured: true },
+  { id: 'github', name: 'GitHub', kind: 'status', provider: 'github', connected: true, account: 'berlinguyinca', status: 'connected', scopes: [], client_configured: false }] };
+
 /** The /api/v1 answers. Reads only: a surface never mutates anything. Unknown routes answer {} like the live-view tests do. */
 export function apiAnswer(pathname, method = 'GET') {
   const db = assistantDb();
@@ -107,6 +113,15 @@ export function apiAnswer(pathname, method = 'GET') {
     case '/api/v1/assistant-connectors': return { connectors: db.connectors };
     case '/api/v1/assistant-proposals': return { proposals: db.proposals };
     case '/api/v1/assistant-notifications': return { notifications: db.notifications };
+    case '/api/v1/assistant-apps': return APPS;
+    case '/api/v1/assistant-apps/google/calendars': return { calendars: [
+      { id: 'ann@example.com', summary: 'Ann Example', primary: true, blocked: false }, { id: 'team@example.com', summary: 'Team', primary: false, blocked: false },
+      { id: 'private@example.com', summary: 'Private', primary: false, blocked: true }] };
+    case '/api/v1/assistant-apps/google/drafts': return { drafts: [
+      { id: 'r-1', to: 'dan@example.com', subject: 'Lunch on Friday', snippet: 'Are you free at noon? I booked the corner table.', gmail_url: 'https://mail.google.com/mail/u/0/#drafts/m1' },
+      { id: 'r-2', to: 'team@example.com', subject: 'Notes from the review', snippet: 'Three follow-ups from today.', gmail_url: 'https://mail.google.com/mail/u/0/#drafts/m2' }] };
+    case '/api/v1/assistant-reminders': return { timezone: 'America/Los_Angeles', reminders: [
+      { id: 'rem_1', text: 'Call the dentist', fire_at: '2026-10-31T09:00:00-07:00', state: 'pending' }] };
     default:
       // the view opens a thread when the assistant has none: answer that one write with a fixed thread
       if (method === 'POST' && /\/threads$/.test(pathname)) return { thread_id: 'thr_1', title: 'New thread', created_at: created };
@@ -151,7 +166,15 @@ export const DASHBOARD_SURFACES = [
     regions: [{ name: 'panel', selector: '#pa-notifications' }] },
   { slug: 'dashboard-assistant-approvals', app: 'dashboard', fullPage: true, skip: SKIP, hash: '/personal-assistant', proof: '[data-config]', steps: assistantTab('Approvals', 'Approving allows'),
     regions: [{ name: 'panel', selector: '#pa-approvals' }] },
+  { slug: 'dashboard-assistant-connectors', app: 'dashboard', fullPage: true, skip: [...SKIP, 'mobile-light'],   // no mobile baseline: the 6144 KB cap; phone reflow is gated by ui-gates-dashboard-a11y and assistant-connectors.test.mjs
+     hash: '/personal-assistant', proof: '[data-config]', steps: connectorsTab },
 ];
+
+async function connectorsTab(page) {
+  await assistantTab('Connectors', 'Apps your assistant can use')(page);
+  for (const sel of ['[data-app="gmail"]', '[data-blocked-form]', '[data-draft="r-1"]', '[data-reminder="rem_1"]', '[data-cstatus]']) await page.locator(sel).first().waitFor({ state: 'attached' });
+  await page.waitForTimeout(100);
+}
 
 function assistantTab(name, text) {
   return async (page) => {

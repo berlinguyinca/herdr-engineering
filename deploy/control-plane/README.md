@@ -453,6 +453,51 @@ github:
   its catalog identity is the App's (not the hourly token), so token rotation does not purge it. Switching
   between `token` and `app` re-syncs the catalog once.
 
+### Assistant app connections: Gmail and Google Calendar (`personal_assistant.apps`)
+
+Each person connects their own Google account in the dashboard (Personal assistant > Connectors). The file-based
+`personal_assistant.google` block and `herdr-eng google authorize` are gone; a config that still has
+`personal_assistant.google` is refused at startup with a message pointing here.
+
+1. **Create the encryption key** (once; the command prints nothing, and `deploy.sh` never creates it):
+
+   ```bash
+   mkdir -p -m 700 ~/.config/herdr-engineering/apps
+   (umask 077; head -c 32 /dev/urandom > ~/.config/herdr-engineering/apps/apps.key)
+   chmod 600 ~/.config/herdr-engineering/apps/apps.key
+   ```
+
+   `deploy.sh` mounts that directory read-only at `/etc/herdr/apps` into `control-plane-web` only. It creates the
+   directory 0700 when missing and refuses to deploy unless the directory is mode 0700, holds only `apps.key`, and
+   `apps.key` is a regular file you own, mode 0600, exactly 32 bytes. It reports names and sizes, never content.
+   Losing or replacing the key makes stored Google tokens unreadable (people reconnect).
+2. **Fleet YAML** (`control_plane.personal_assistant`):
+
+   ```yaml
+   personal_assistant:
+     apps:
+       key_file: /etc/herdr/apps/apps.key
+       redirect_base: https://local.metabolomics.us
+   ```
+
+3. **Create the Google Cloud OAuth client**: type **Web application**. Enable the Gmail API and Google Calendar API.
+   Register the authorized redirect URI exactly:
+   `https://local.metabolomics.us/api/v1/assistant-apps/google/callback`.
+4. **Publish the consent screen** with status **In production**. In "Testing" Google expires refresh tokens after
+   7 days and people would need to reconnect weekly (the dashboard shows "needs attention").
+5. In the dashboard open **Personal assistant > Connectors**, paste the client id and client secret (stored encrypted,
+   never shown again) and press **Enable**. Then each person presses **Connect** on Gmail / Google Calendar.
+
+Behaviour: the assistant reads mail and calendars for the signed-in person only. Calendars a person blocks in the
+Connectors tab are never read, listed or written. Email **drafts** and calendar **events** are created only after a
+person approves the exact content; the assistant **cannot send** mail. Reminders ("remind me in 20 minutes") need no
+Google account and work without any connector.
+
+Cleanup after the move: the old file-based token `~/.config/herdr-engineering/google/token.json` (from
+`herdr-eng google authorize`) is no longer used. Revoke it at Google (https://myaccount.google.com/permissions) and
+delete the file. The assistant's Gmail and Calendar tools also need grants: a connected account alone does not let an
+assistant use them until the person grants each tool in the assistant's Permissions.
+
 ### Cross-track order (`requires`)
 
 Components on another `follows` track (the zapp console follows `metabolomics-us/inferweave-gateway`) are staged by

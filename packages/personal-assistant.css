@@ -61,3 +61,35 @@
 .pa-flash[role="alert"] { border-color: var(--status-attention); color: var(--status-attention); }
 .pa-approval, .pa-msg { overflow-wrap: anywhere; }
 .pa-msg + .pa-msg { margin-top: 8px; }
+
+/* Connectors tab: Apps, blocked calendars, Drafts, Reminders */
+.pa-h4 { font-size: 13px; margin: 12px 0 6px; color: var(--text-secondary); }
+.pa-apps { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 12px; margin-top: 8px; }
+.pa-app { border: 1px solid var(--border-color); border-radius: var(--radius); padding: 12px; background: var(--surface); display: flex; flex-direction: column; gap: 6px; min-width: 0; overflow-wrap: anywhere; }
+.pa-app--on { border-color: var(--status-ok); }
+.pa-app--soon { border-style: dashed; background: transparent; }
+.pa-app__head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.pa-app__what { margin: 0; }
+.pa-app__state { font-size: var(--text-sm, 13px); color: var(--text-secondary); }
+.pa-app__actions { margin-top: auto; }
+.pa-setup { margin-top: 14px; border: 1px solid var(--border-color); border-radius: var(--radius); padding: 12px; background: var(--surface); }
+.pa-setup .pa-h4 { margin-top: 0; }
+.pa-uri { font-family: var(--font-mono); font-size: 12px; padding: 4px 8px; border-radius: var(--radius-sm); background: var(--surface-2); color: var(--text); overflow-wrap: anywhere; min-width: 0; }
+.pa-state-ok { color: var(--status-ok); font-weight: 600; margin: 8px 0 0; }
+.pa-details { margin-top: 8px; }
+.pa-details summary { cursor: pointer; padding: 4px 0; color: var(--text-secondary); }
+.pa-details form { margin-top: 8px; max-width: 480px; }
+#pa-blocked { margin-top: 14px; }
+.pa-fieldset { border: 0; padding: 0; margin: 0 0 8px; display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.pa-check { display: flex; align-items: flex-start; gap: 8px; min-height: 28px; overflow-wrap: anywhere; }
+.pa-check input { margin-top: 3px; flex: none; }
+.pa-check__id { display: block; }
+.pa-snippet { color: var(--text-secondary); font-size: var(--text-sm, 13px); margin-top: 2px; }
+a.hd-btn { text-decoration: none; display: inline-flex; align-items: center; }
+@media (max-width: 480px) {
+  .pa-apps { grid-template-columns: 1fr; }
+  .pa-row a.hd-btn { width: 100%; justify-content: center; min-height: 40px; }
+}
+#pa-drafts .pa-msg, #pa-reminders .pa-msg { white-space: normal; }
+.pa-row--tight { margin-top: 6px; }
+.pa-fieldset legend { padding: 0; margin-bottom: 4px; }

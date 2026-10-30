@@ -42,7 +42,8 @@ from dataclasses import dataclass, field, fields, replace
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from .google_workspace import google_config
+from .reminders import REMINDER_TOOLS, ReminderError
+from .reminders import run_tool as run_reminder_tool
 
 _log = logging.getLogger(__name__)
 _SECRET_KEY_RE = re.compile(r"(?i)(api[_-]?key|token|passw(or)?d|secret|authorization|credential|private[_-]?key)")
@@ -127,6 +128,9 @@ def assistant_config(cfg: dict[str, Any]) -> dict[str, Any]:
     """
     section = cfg.get("personal_assistant") if isinstance(cfg, dict) else None
     section = section if isinstance(section, dict) else {}
+    if "google" in section:
+        raise ValueError("control_plane.personal_assistant.google is no longer supported and is replaced by "
+                         "personal_assistant.apps (connect Google per person in the dashboard Connectors tab)")
     computer = section.get("computer") if isinstance(section, dict) else None
     computer = computer if isinstance(computer, dict) else {}
     inference = section.get("inference") if isinstance(section, dict) else None
@@ -229,9 +233,31 @@ def assistant_config(cfg: dict[str, Any]) -> dict[str, Any]:
         },
         # Scheduled CI watch (ci_watch.py): a deterministic server-side loop, off unless enabled; YAML only.
         "ci_watch": ci_watch_config(section.get("ci_watch")),
-        # Read-only Gmail + Calendar (google_workspace.py): off unless enabled; files and the user list are YAML.
-        "google": google_config(section.get("google")),
+        # Per-person app connections (Gmail, Calendar) made from the dashboard: key file + public redirect base.
+        "apps": apps_config(section.get("apps")),
     }
+
+
+def apps_config(raw: Any) -> dict[str, Any]:
+    """``personal_assistant.apps``: ``{key_file, redirect_base}``. An absent block means "not set up", not an error;
+    an unknown key or a malformed value stops startup with a clear message."""
+    where = "control_plane.personal_assistant.apps"
+    if raw is None:
+        return {"present": False, "key_file": None, "redirect_base": None}
+    if not isinstance(raw, dict):
+        raise ValueError(f"{where} must be a mapping")
+    unknown = set(raw) - {"key_file", "redirect_base"}
+    if unknown:
+        raise ValueError(f"{where} has unknown keys: {sorted(unknown)}")
+    key_file = raw.get("key_file")
+    if key_file is not None and (not isinstance(key_file, str) or not key_file.strip()):
+        raise ValueError(f"{where}.key_file must be a path")
+    base = raw.get("redirect_base")
+    if base is not None:
+        if not isinstance(base, str) or not re.fullmatch(r"https?://[^\s/?#]+/?", base.strip()):
+            raise ValueError(f"{where}.redirect_base must be a base URL like https://host (no path)")
+        base = base.strip().rstrip("/")
+    return {"present": True, "key_file": key_file.strip() if key_file else None, "redirect_base": base}
 
 
 def ci_watch_config(raw: Any) -> dict[str, Any]:
@@ -839,6 +865,26 @@ TOOL_CATALOG: dict[str, dict[str, Any]] = {
             "to": {"type": "string"}, "subject": {"type": "string"}, "body": {"type": "string"},
             "artifact_id": {"type": "string", "description": "Existing draft artifact to add a version to (optional)"}},
             "required": ["to", "subject", "body"]}},
+    "create_email_draft": {
+        "sensitive": True,
+        "description": "Save a DRAFT in the user's Gmail drafts. A person must approve the exact recipient, subject and "
+                       "body first. It never delivers anything; the person reviews and sends it themselves in Gmail.",
+        "parameters": {"type": "object", "properties": {
+            "to": {"type": "string", "description": "One or more plain addresses, comma separated (at most 10)."},
+            "subject": {"type": "string"}, "body": {"type": "string", "description": "Plain text, at most 800 characters."}},
+            "required": ["to", "subject", "body"]}},
+    "create_calendar_event": {
+        "sensitive": True,
+        "description": "Create a Google Calendar event (no attendees, no invitations) after a person approves its exact "
+                       "details. Defaults to the user's primary calendar; blocked calendars are refused.",
+        "parameters": {"type": "object", "properties": {
+            "summary": {"type": "string"},
+            "start": {"type": "string", "description": "RFC3339 with offset, e.g. 2026-11-02T09:00:00-08:00."},
+            "end": {"type": "string", "description": "RFC3339 with offset, after start."},
+            "calendar_id": {"type": "string", "description": "Optional; the primary calendar when omitted."},
+            "location": {"type": "string"},
+            "reminder_minutes": {"type": "integer", "description": "Optional single popup reminder, 0 to 40320."}},
+            "required": ["summary", "start", "end"]}},
     "watch_ci": {
         "sensitive": False,
         "description": "Look for failed CI runs the user can see and surface each new one once as a repair proposal "
@@ -861,6 +907,31 @@ TOOL_CATALOG: dict[str, dict[str, Any]] = {
         "parameters": {"type": "object", "properties": {
             "time_min": {"type": "string", "description": "ISO date or datetime; default now."},
             "time_max": {"type": "string"}, "max_results": {"type": "integer"}}}},
+    "find_free_time": {
+        "sensitive": False,
+        "description": "Find up to 5 free time slots (earliest first) of at least duration_minutes inside a window of at most "
+                       "14 days, across the user's Google calendars the assistant may see. Read-only; returns RFC3339 UTC.",
+        "parameters": {"type": "object", "properties": {
+            "duration_minutes": {"type": "integer", "description": "5 to 480."},
+            "time_min": {"type": "string", "description": "RFC3339 start of the window."},
+            "time_max": {"type": "string", "description": "RFC3339 end of the window."}},
+            "required": ["duration_minutes", "time_min", "time_max"]}},
+    "set_reminder": {
+        "sensitive": False,
+        "description": "Remind the user at a time (a push to their phone and a message here). Only notifies them, needs no "
+                       "Google account. when: 'in 20 minutes', 'tomorrow 09:00', 'tomorrow morning', 'today 17:30' or an ISO "
+                       "date-time, in the user's timezone. If the time is unclear or past, ask the user; do not guess.",
+        "parameters": {"type": "object", "properties": {
+            "text": {"type": "string", "description": "What to remind them of, at most 500 characters."},
+            "when": {"type": "string"}}, "required": ["text", "when"]}},
+    "list_reminders": {
+        "sensitive": False,
+        "description": "List the user's pending reminders (and recently fired ones), in their timezone.",
+        "parameters": {"type": "object", "properties": {}}},
+    "cancel_reminder": {
+        "sensitive": False,
+        "description": "Cancel one pending reminder by id (from list_reminders).",
+        "parameters": {"type": "object", "properties": {"id": {"type": "string"}}, "required": ["id"]}},
     "read_lineage": {
         "sensitive": False,
         "description": "Read the mission/agent lineage graph (sessions, handoffs, branches, reviews, PRs, CI, artifacts) "
@@ -879,13 +950,29 @@ def tool_sensitive(tool_id: str) -> bool:
 
 
 # Tools whose every use needs an explicit approval: a grant may never carry ``preauthorized`` for them.
-NEVER_PREAUTHORIZED = frozenset({"send_message", "run_shell"})
+NEVER_PREAUTHORIZED = frozenset({"send_message", "run_shell", "create_email_draft", "create_calendar_event"})
+
+# Google writes: run through ``google_write`` only after approval. They are requested by the assistant (not the person), so
+# the person whose mailbox or calendar it is can approve them; ``send_message``/``run_shell`` still need a distinct approver.
+GOOGLE_WRITE_TOOLS = frozenset({"create_email_draft", "create_calendar_event"})
 
 # Tools the post-approval executor can run. Everything else (send_message, run_shell, edit_shared) is NOT here: an
 # approval for those stays a record, and ``execute_approved_action`` refuses them (fail closed). ``draft_email`` only
 # ever saves a draft; nothing in this set sends.
 EXECUTABLE_AFTER_APPROVAL = frozenset({"request_review", "propose_branch", "request_mission", "comment_on_node",
-                                       "draft_email", "delegate", "connector_request"})
+                                       "draft_email", "delegate", "connector_request",
+                                       "create_email_draft", "create_calendar_event"})
+
+
+def _validate_google_write(tool_id: str, payload: Any) -> None:
+    """Every route that can raise an approval card refuses invalid draft/event content first (no card, no approval)."""
+    if tool_id in GOOGLE_WRITE_TOOLS:
+        from .google_workspace import GoogleError, validate_write
+        try:
+            validate_write(tool_id, payload)
+        except GoogleError:
+            raise AssistantError("the draft or event details are invalid (check addresses, times with an offset, "
+                                 "lengths and special characters)") from None
 
 
 def canonical_json(obj: Any) -> str:
@@ -901,6 +988,7 @@ def request_digest(*, tenant_id: str, user_id: str, assistant_id: str, tool_id: 
 
 
 _DRY_RUN_MAX = 1200
+_DRY_RUN_MAX_GOOGLE = 3000      # the approval card for a Google write shows the FULL content a person is approving
 
 
 def describe_action(tool_id: str, scope: str, payload: dict[str, Any] | None) -> str:
@@ -908,10 +996,12 @@ def describe_action(tool_id: str, scope: str, payload: dict[str, Any] | None) ->
     hashed, redacted and bounded. It never executes anything."""
     p = payload if isinstance(payload, dict) else {}
 
+    exact = tool_id in GOOGLE_WRITE_TOOLS      # the card must show exactly what will be written: no redaction rewrite
+
     def v(key: str, limit: int = 200) -> str:
         val = p.get(key)
         text = val if isinstance(val, str) else canonical_json(val)
-        return (redact_secrets(text) or "")[:limit]
+        return (text if exact else (redact_secrets(text) or ""))[:limit]
 
     if tool_id == "run_shell":
         text = f"Run this shell command on an authorized host: {v('command')}"
@@ -935,6 +1025,16 @@ def describe_action(tool_id: str, scope: str, payload: dict[str, Any] | None) ->
     elif tool_id == "draft_email":
         text = (f"Save an email DRAFT to {v('to')} with subject {v('subject', 120)} as a private artifact. "
                 "Nothing is sent")
+    elif tool_id == "create_email_draft":
+        return (f"Save a Gmail DRAFT (nothing is delivered) to {v('to', 300)} with subject {v('subject', 200)} and this "
+                f"body: {v('body', 800)}")[:_DRY_RUN_MAX_GOOGLE]
+    elif tool_id == "create_calendar_event":
+        return (f"Create a calendar event \"{v('summary', 200)}\" from {v('start', 40)} to {v('end', 40)} on calendar "
+                f"{v('calendar_id', 256) if p.get('calendar_id') else 'primary'}"
+                + (f", location {v('location', 200)}" if p.get("location") else "")
+                + (f", popup reminder {v('reminder_minutes', 10)} minutes before" if p.get("reminder_minutes") is not None
+                   else ", default reminders")
+                + ". No attendees are invited")[:_DRY_RUN_MAX_GOOGLE]
     else:
         text = f"Use tool {tool_id} on {scope or 'default scope'} with fields {sorted(p)}"
     return text[:_DRY_RUN_MAX]
@@ -1853,6 +1953,15 @@ class AssistantStore:
 # ---------------------------------------------------------------------------
 
 
+_GOOGLE_MESSAGES = {
+    "not_connected": "Google is not connected for this person: ask them to connect it in the Connectors tab.",
+    "not_set_up": "Google connectors are not set up on this server: ask an operator to check the apps key and OAuth client.",
+    "needs_attention": "Google needs this person to sign in again in the Connectors tab.",
+    "calendar_blocked": "That calendar is not available to the assistant.",
+    "reconnect_needed": "Reconnect Google to allow drafts and events (the saved connection lacks write permission).",
+}
+
+
 class AssistantError(Exception):
     pass
 
@@ -1917,7 +2026,9 @@ class AssistantService:
             if (repo is not None and fc.get("enabled")) else None)
         # Set by the control-plane API when project intelligence is enabled: (tenant, user, payload) -> dict.
         self.intelligence_read = None
-        self.google_read = None       # (tenant, user, tool_id, payload) -> dict; set when personal_assistant.google is enabled
+        self.google_write = None      # (tenant, user, tool_id, payload) -> dict; runs ONLY an approved Google draft/event
+        self.reminders = None         # ReminderStore, set by the server; reminders need no Google account
+        self.google_read = None       # (tenant, user, tool_id, payload) -> dict; set when personal_assistant.apps is set up
         self.lineage_read = None
         # Thin adapters over EXISTING endpoints, all wired by the control-plane API and all optional. Absent = the
         # tool says it is not enabled; nothing falls back to doing the thing some other way.
@@ -2057,6 +2168,23 @@ class AssistantService:
         self._require_enabled()
         return self.store.list_threads(tenant_id=tenant_id, user_id=user_id,
                                        assistant_id=assistant_id)
+
+    def post_reminder_message(self, *, tenant_id: str, user_id: str, content: str, provenance: str) -> bool:
+        """Add a reminder to the person's chat: their first enabled assistant, its most recently active thread (one is
+        created when there is none). False when the person has no assistant to say it. Starts no run."""
+        self._require_enabled()
+        assistants = [a for a in self.store.list_assistants(tenant_id=tenant_id, user_id=user_id) if a.enabled]
+        if not assistants:
+            return False
+        a = assistants[0]
+        threads = self.store.list_threads(tenant_id=tenant_id, user_id=user_id, assistant_id=a.assistant_id)
+        thread = (threads[0] if threads else
+                  self.create_thread(tenant_id=tenant_id, user_id=user_id, assistant_id=a.assistant_id))
+        self.store.put_message(AssistantMessage(message_id=_new_id("msg"), thread_id=thread.thread_id, role="assistant",
+                                                content=content, provenance=provenance))
+        thread.last_activity_at = self.now()
+        self.store.put_thread(thread)
+        return True
 
     def get_thread(self, thread_id: str, *, tenant_id: str, user_id: str) -> AssistantThread:
         self._require_enabled()
@@ -2248,6 +2376,7 @@ class AssistantService:
         self.store.get_assistant(assistant_id, tenant_id=tenant_id, user_id=user_id)
         if not isinstance(tool_id, str) or tool_id not in TOOL_CATALOG:
             raise AssistantError("unknown tool")
+        _validate_google_write(tool_id, request_payload)
         grant = self._active_grant(assistant_id=assistant_id, tool_id=tool_id, scope=scope,
                                    tenant_id=tenant_id, user_id=user_id)
         preauthorized = bool(grant and (grant.constraints or {}).get("preauthorized")
@@ -2309,6 +2438,7 @@ class AssistantService:
         self.store.get_assistant(assistant_id, tenant_id=tenant_id, user_id=user_id)
         if not isinstance(tool_id, str) or tool_id not in TOOL_CATALOG:
             raise AssistantError("unknown tool")
+        _validate_google_write(tool_id, request_payload)
 
         request_hash = request_digest(tenant_id=tenant_id, user_id=user_id, assistant_id=assistant_id,
                                       tool_id=tool_id, scope=scope, payload=request_payload)
@@ -3737,6 +3867,13 @@ class AssistantService:
                      if target_field else tool_id)
             if not isinstance(scope, str):
                 return "[denied: tool target must be a string]"
+        if tool_id in GOOGLE_WRITE_TOOLS:
+            from .google_workspace import GoogleError, validate_write
+            try:
+                validate_write(tool_id, args)       # a person must never be asked to approve content that cannot run
+            except GoogleError:
+                return "[denied: the draft or event details are invalid (check addresses, times with an offset, lengths)]"
+            scope = tool_id
         idem = hashlib.sha256(
             f"{run.run_id}|{tool_id}|{sorted(args.items())!r}".encode()).hexdigest()[:24]
         try:
@@ -3746,7 +3883,7 @@ class AssistantService:
                 request_payload=args,
                 # the two tools that must always be approved are requested BY the person who instructed the run, so
                 # "approver differs from requester" binds them; for the rest the assistant asks and the owner decides
-                actor=run.user_id if tool_id in NEVER_PREAUTHORIZED else f"assistant:{run.assistant_id}")
+                actor=run.user_id if tool_id in NEVER_PREAUTHORIZED - GOOGLE_WRITE_TOOLS else f"assistant:{run.assistant_id}")
         except ApprovalRequired as ar:
             return f"[operator approval required: {ar.approval_id}: {ar.dry_run}]"
         except AssistantError as exc:
@@ -3874,14 +4011,34 @@ class AssistantService:
                 return {"ok": True, "result": self.intelligence_read(tenant_id, user_id, payload)}
             except (ValueError, LookupError) as exc:
                 raise AssistantError(str(exc)) from exc
-        if tool_id in ("search_email", "read_email", "list_calendar_events"):
+        if tool_id in ("search_email", "read_email", "list_calendar_events", "find_free_time"):
             if self.google_read is None:
                 raise AssistantError("Google mail and calendar are not enabled")
             from .google_workspace import GoogleError
             try:
                 return self.google_read(tenant_id, user_id, tool_id, payload)
             except GoogleError as exc:
-                raise AssistantError(f"Google {tool_id.replace('_', ' ')} failed: {exc.reason}") from None
+                raise AssistantError(_GOOGLE_MESSAGES.get(exc.reason) or
+                                     f"Google {tool_id.replace('_', ' ')} failed: {exc.reason}") from None
+        if tool_id in REMINDER_TOOLS:
+            if self.reminders is None:
+                raise AssistantError("reminders are not enabled")
+            try:
+                return run_reminder_tool(self.reminders, tool_id, tenant_id, user_id, payload, self.now(),
+                                         self.config["notifications"]["timezone"])
+            except ReminderError as exc:
+                raise AssistantError(str(exc)) from None
+        if tool_id in GOOGLE_WRITE_TOOLS:
+            # Reached only through the gate: request_tool_action raised ApprovalRequired until a person approved this
+            # exact payload, and execute_approved_action re-checks the approval and the payload hash before this runs.
+            if self.google_write is None:
+                raise AssistantError("Google mail and calendar are not enabled")
+            from .google_workspace import GoogleError
+            try:
+                return self.google_write(tenant_id, user_id, tool_id, payload)
+            except GoogleError as exc:
+                raise AssistantError(_GOOGLE_MESSAGES.get(exc.reason) or
+                                     f"Google {tool_id.replace('_', ' ')} failed: {exc.reason}") from None
         if tool_id == "read_lineage":
             if self.lineage_read is None:
                 raise AssistantError("lineage reading is not enabled")

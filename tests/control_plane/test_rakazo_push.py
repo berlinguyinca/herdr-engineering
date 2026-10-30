@@ -234,3 +234,37 @@ def test_a_family_account_is_never_pushed_a_proposal(make_server_p):
     svr.intelligence.board.request(org_id="org1", requester="x", action="ci_rerun", payload=dict(RERUN), resource_version=1)
     time.sleep(0.2)
     assert sender.sent == []
+
+
+def test_a_reminder_for_the_dashboard_operator_reaches_an_operator_phone(make_server_p):
+    svr, api, token, bot, sender = rig(make_server_p)
+    api.ok("notifications/registerPush", {"token": TOKEN}, token)
+    assert svr.rakazo.notify_person("default", rb.OPEN_LISTENER_USER, "Reminder", "Call Bob", key="r1") == 1
+    assert wait_for(lambda: sender.sent)
+    [msg] = sender.sent[0]
+    assert msg["to"] == TOKEN and msg["title"] == "Reminder"
+
+
+def test_a_family_phone_gets_no_reminder_for_the_dashboard_operator(make_server_p):
+    svr, api = make_server_p(bridge_section(accounts=[{**ACCOUNTS[0], "role": "family"}], push={"enabled": True}))
+    sender = FakeSender()
+    svr.rakazo.push._sender = sender
+    token = api.login()
+    new_bot(api, token)
+    api.ok("notifications/registerPush", {"token": TOKEN}, token)
+    assert svr.rakazo.notify_person("default", rb.OPEN_LISTENER_USER, "Reminder", "Call Bob", key="r2") == 0
+    time.sleep(0.2)
+    assert sender.sent == []
+    # ...but the family member still gets their own reminder
+    me = svr.rakazo.accounts[0]
+    assert svr.rakazo.notify_person(svr.assistant.tenant_for(me.principal_id), me.principal_id, "Reminder", "Mine", key="r3") == 1
+
+
+def test_accounts_added_after_start_are_found_through_the_same_lookup(make_server_p):
+    svr, api, token, bot, sender = rig(make_server_p)
+    import dataclasses
+    first = svr.rakazo.accounts[0]
+    late = dataclasses.replace(first, account_id="late-1", principal_id="rakazo:late-1", role="operator")
+    svr.rakazo._by_id[late.account_id] = late                     # added like a Cognito account: not in .accounts
+    svr.rakazo._by_principal[late.principal_id] = late
+    assert late.account_id in {a.account_id for a in svr.rakazo._operator_accounts()}
