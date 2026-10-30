@@ -166,6 +166,15 @@ def test_sessions_and_services(server):
     assert json.loads(body)["services"][0]["port"] == 8080
 
 
+def test_session_commits_endpoint_reports_a_state_and_404_for_an_unknown_agent(server):
+    c, repo = server
+    repo.upsert_session("sx", host_id="h", agent_role="pi", repository_id="github.com/org/app", branch="feat/x")
+    status, _, body = c.get("/api/v1/sessions/sx/commits")
+    out = json.loads(body)
+    assert status == 200 and out["state"] == "none" and out["session_id"] == "sx" and out["commits"] == []
+    assert c.get("/api/v1/sessions/nope/commits")[0] == 404
+
+
 def test_session_with_colon_id_fetches_percent_encoded(server):
     """Entity ids like ``w9:p5`` are percent-encoded by the web client
     (encodeURIComponent -> ``w9%3Ap5``); the server must URL-decode them so

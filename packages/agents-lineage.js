@@ -80,7 +80,23 @@ ${ticks}${rows}${arrows}</svg>${more}${note}</section>`;
 }
 
 // The story of one agent for its detail page: how it began, any handoff into or out of it, and where it stands now.
-export function agentStory(session, tree = {}, now = Date.now()) {
+// links: the server's session->commit record (GET /sessions/<id>/commits) or null while it is unknown. Never guessed client-side.
+export function commitSteps(links) {
+  if (!links || typeof links !== 'object') return [];
+  const list = Array.isArray(links.commits) ? links.commits : [];
+  const pulls = (Array.isArray(links.pull_requests) ? links.pull_requests : []).filter(p => Number.isInteger(p?.number));
+  if (links.state === 'linked' && (list.length || pulls.length)) {
+    const shown = list.slice(0, 5).map(c => ({ kind: 'commit', at: ms(c.at), text: `Commit ${text(c.sha).slice(0, 7) || 'unknown'}${c.pull_request ? ` · PR #${c.pull_request}` : ''} · CI run #${c.run_number ?? '?'} ${text(c.state) || 'unknown'}${c.match === 'commit' ? ' (the commit the agent reported)' : ''}`, url: text(c.ci_url) }));
+    if (list.length > shown.length) shown.push({ kind: 'commit', at: NaN, text: `${list.length - shown.length} more commits not listed` });
+    // A pull request already named on a commit line is not repeated.
+    const named = new Set(list.map(c => c.pull_request).filter(Boolean));
+    for (const p of pulls.filter(x => !named.has(x.number)).slice(0, 5)) shown.push({ kind: 'commit', at: ms(p.at), text: `PR #${p.number}${text(p.status) ? ` ${text(p.status)}` : ''}`, url: text(p.url) });
+    return shown;
+  }
+  return [{ kind: 'unlinked', at: NaN, text: `No commit link recorded: ${text(links.reason) || 'the server found no matching CI run.'}` }];
+}
+
+export function agentStory(session, tree = {}, now = Date.now(), links = null) {
   const id = text(session.session_id);
   const nodes = Array.isArray(tree.nodes) ? tree.nodes : [], edges = Array.isArray(tree.edges) ? tree.edges : [];
   const mine = new Set(nodes.filter(n => text(n.session_id) === id || n.id === id).map(n => n.id));
@@ -91,6 +107,7 @@ export function agentStory(session, tree = {}, now = Date.now()) {
   const incoming = edges.filter(e => mine.has(e.to));
   steps.push({ kind: 'start', at: created, text: incoming.length ? `Started by handoff from ${label(incoming[0].from)}${incoming[0].goal ? `: ${incoming[0].goal}` : ''}` : `Started${where ? ` on ${where}` : ''}`, handoff: !!incoming.length });
   for (const e of edges.filter(x => mine.has(x.from))) steps.push({ kind: 'handoff', at: ms(e.updated_at), text: `Handed ${e.state === 'completed' || e.state === 'accepted' ? 'off' : `off (${text(e.state) || 'unknown'})`} to ${label(e.to)}${e.goal ? `: ${e.goal}` : ''}`, handoff: true });
+  steps.push(...commitSteps(links));
   const updated = ms(session.updated_at);
   steps.push({ kind: 'now', at: updated, text: text(session.summary) ? text(session.summary).replace(/\s+/g, ' ').slice(0, 140) : `Last report ${text(session.status) || 'unknown'}` });
   return { steps: steps.sort((a, b) => (Number.isFinite(a.at) ? a.at : Infinity) - (Number.isFinite(b.at) ? b.at : Infinity) || (a.kind === 'start' ? -1 : 0)), hasHandoff: steps.some(x => x.handoff), now };
@@ -98,6 +115,6 @@ export function agentStory(session, tree = {}, now = Date.now()) {
 
 export function renderStory(story) {
   const fmt = at => Number.isFinite(at) ? new Date(at).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : '';
-  return `<style>.as-story{list-style:none;margin:8px 0 14px;padding:0 0 0 14px;border-left:2px solid var(--border)}.as-story li{position:relative;padding:2px 0 8px 10px;font-size:13px;line-height:1.4;overflow-wrap:anywhere}.as-story li::before{content:"";position:absolute;left:-19px;top:7px;width:8px;height:8px;border-radius:50%;background:var(--text-muted)}.as-story li[data-kind=start]::before{background:var(--accent)}.as-story li[data-kind=now]::before{background:var(--status-ok,#2e9d5b)}.as-story time{display:block;font-size:11px;color:var(--text-secondary)}</style>
-<ol class="as-story" aria-label="How this agent started and proceeded">${story.steps.map(s => `<li data-kind="${esc(s.kind)}"><time>${esc(fmt(s.at))}</time>${esc(s.text)}</li>`).join('')}</ol>`;
+  return `<style>.as-story{list-style:none;margin:8px 0 14px;padding:0 0 0 14px;border-left:2px solid var(--border)}.as-story li{position:relative;padding:2px 0 8px 10px;font-size:13px;line-height:1.4;overflow-wrap:anywhere}.as-story li::before{content:"";position:absolute;left:-19px;top:7px;width:8px;height:8px;border-radius:50%;background:var(--text-muted)}.as-story li[data-kind=start]::before{background:var(--accent)}.as-story li[data-kind=now]::before{background:var(--status-ok,#2e9d5b)}.as-story li[data-kind=commit]::before{background:var(--accent)}.as-story li[data-kind=unlinked]{color:var(--text-secondary)}.as-story li[data-kind=unlinked]::before{background:transparent;border:1px solid var(--text-muted)}.as-story time{display:block;font-size:11px;color:var(--text-secondary)}</style>
+<ol class="as-story" aria-label="How this agent started and proceeded">${story.steps.map(s => `<li data-kind="${esc(s.kind)}"><time>${esc(fmt(s.at))}</time>${/^https:\/\//.test(s.url || '') ? `<a href="${esc(s.url)}" target="_blank" rel="noopener noreferrer">${esc(s.text)}</a>` : esc(s.text)}</li>`).join('')}</ol>`;
 }

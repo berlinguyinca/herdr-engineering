@@ -203,7 +203,10 @@ def main():
     if os.environ.get("MISSION_STORY_SEED") == "1":
         _seed_missions(repo, _m1, _s1)
 
-    svr = ControlPlaneServer(repo, host="127.0.0.1", port=0,
+    # A fixture price table for the Usage page's spend estimate (production reads control_plane.usage.prices from YAML).
+    usage_prices = ([{"model": "qwen*", "input": 100.0, "output": 200.0, "cached": None, "cached_in_input": False}]
+                    if os.environ.get("USAGE_PRICES_SEED") == "1" else None)
+    svr = ControlPlaneServer(repo, host="127.0.0.1", port=0, usage_prices=usage_prices,
                              web_root=_REPO / "packages")
     # Stricter than the production default (600/min): a throttled live-
     # refreshing dashboard must respect a finite per-IP budget. This makes the

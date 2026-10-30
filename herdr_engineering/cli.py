@@ -3165,6 +3165,11 @@ def _cmd_cp_web(args) -> int:
         usage_retention = usage_retention_config(cp.get("llm_proxy"))
     except ValueError as exc:
         raise SystemExit(f"fleet config {exc}") from None
+    from .control_plane.usage_spend import usage_prices_config
+    try:
+        usage_prices = usage_prices_config(cp.get("usage"))
+    except ValueError as exc:
+        raise SystemExit(f"fleet config {exc}") from None
     from .control_plane.attention_inbox import attention_config
     try:
         attention = attention_config(cp.get("attention"))
@@ -3335,10 +3340,10 @@ def _cmd_cp_web(args) -> int:
                              summary_config=cp.get("agent_summaries") or {},
                              summary_report_config=cp.get("summary_report") or {},
                              unified_workspace_config=cp.get("unified_workspace") if isinstance(cp.get("unified_workspace"), dict) else None,
-                             assistant_config={"personal_assistant": cp["personal_assistant"]}
-                                 if isinstance(cp.get("personal_assistant"), dict) else None,
+                             assistant_config=_assistant_config(cp),
                              review_quorum=_review_quorum_config(cp),
-                             usage_retention=usage_retention, attention=attention,
+                             single_operator=cp.get("single_operator") is True,
+                             usage_retention=usage_retention, usage_prices=usage_prices, attention=attention,
                              ci_fix=ci_fix, missions=missions, github_pg_dsn=dsn, ci_log_tests=ci_log_tests,
                              public_port=args.collab_public_port,
                              public_host=args.collab_public_host,
@@ -3661,6 +3666,17 @@ def _inspector_snapshot_settings(cp) -> tuple[bool, float]:
     return raw.get("enabled") is True, float(interval)
 
 
+def _assistant_config(cp):
+    """``{"personal_assistant": ...}`` from the fleet section. In single-operator mode the owner's own approval of the
+    assistant's sensitive actions is allowed (there is only one person); otherwise the section is passed through."""
+    pa = cp.get("personal_assistant")
+    if not isinstance(pa, dict):
+        return None
+    if cp.get("single_operator") is True:
+        pa = {**pa, "actions": {**(pa.get("actions") or {}), "allow_self_approval": True}}
+    return {"personal_assistant": pa}
+
+
 def _fabric_compaction_settings(cp):
     """``control_plane.fabric_compaction`` as CompactionSettings. Off unless ``enabled`` is exactly true, and a dry run
     (counts only) unless ``dry_run`` is exactly false."""
@@ -3681,7 +3697,8 @@ def _fabric_compaction_settings(cp):
         enabled=raw.get("enabled") is True, dry_run=raw.get("dry_run") is not False,
         interval_seconds=number("interval_seconds", 3600, 60), min_age_days=number("min_age_days", 2, 1),
         batch_rows=int(number("batch_rows", 250_000, 1000)), archive_retention_days=retention,
-        rebuild_checkpoint=raw.get("rebuild_checkpoint") is not False)
+        rebuild_checkpoint=raw.get("rebuild_checkpoint") is not False,
+        keep_checkpoints=int(number("keep_checkpoints", 2, 1)))
 
 
 def _worker_fabric_compactor(fleet_config_path):

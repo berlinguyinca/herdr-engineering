@@ -196,6 +196,12 @@ export function renderAttention(model = {}, now = Date.now()) {
   const blocked = model.notify && (model.notify.status === 'blocked' || model.notify.status === 'unsupported')
     ? `<span class="at-bell" tabindex="0" role="img" aria-label="Browser notifications unavailable" title="${model.notify.status === 'blocked' ? "Browser notifications are blocked. Allow them in this site's settings to hear about new critical items." : 'Browser notifications are not supported in this browser.'}" data-notify-status="${esc(model.notify.status)}">${ICON_BELL_OFF}</span>` : '';
   const summary = `<div class="at-summary" role="status"><span><strong>${Number(counts.open) || 0}</strong> open</span>${chips}${quiet(counts.acknowledged, 'acknowledged')}${quiet(counts.snoozed, 'snoozed')}${kindSelect}${blocked}${partial ? `<span class="at-bell at-warn" tabindex="0" role="img" title="Partial: ${esc(unavailable.join(', ') || 'a source')} unavailable" aria-label="Partial: ${esc(unavailable.join(', ') || 'a source')} unavailable">${ICON_WARN}</span>` : ''}</div>`;
+  // Hosts the operator listed as expected offline: named quietly, never counted or alerted.
+  const off = records(body.expected_off).filter((h) => text(h.name));
+  const expectedOff = off.length ? `<p class="at-status at-expected" data-expected-off>Expected offline: ${off.map((h) => {
+    const at = Date.parse(h.last_seen);
+    return `${esc(text(h.name))}${Number.isFinite(at) ? ` (last seen ${esc(formatDuration(Math.max(0, now - at)))} ago)` : ''}`;
+  }).join(', ')}.</p>` : '';
   const stale = error ? '<p class="at-partial" role="status">Could not refresh; showing the last received list.</p>' : '';
   const trunc = body.truncated ? '<p class="at-status">Showing the first items only; the inbox is capped.</p>' : '';
   let list;
@@ -208,7 +214,7 @@ export function renderAttention(model = {}, now = Date.now()) {
   else if (partial) list = '<p class="at-status">Nothing is known to be open, but some sources could not be read.</p>';
   else list = '<p class="at-status">No attention items. Every source was read.</p>';
   const resolved = records(body.resolved);
-  return `${STYLES}${head}${summary}${message ? `<p class="at-status" role="status">${esc(message)}${model.undo ? ' <button type="button" class="hd-btn hd-btn--quiet at-btn" data-undo>Undo</button>' : ''}</p>` : ''}${blocked ? '' : notifyLine(model.notify)}${stale}${list}${trunc}
+  return `${STYLES}${head}${summary}${expectedOff}${message ? `<p class="at-status" role="status">${esc(message)}${model.undo ? ' <button type="button" class="hd-btn hd-btn--quiet at-btn" data-undo>Undo</button>' : ''}</p>` : ''}${blocked ? '' : notifyLine(model.notify)}${stale}${list}${trunc}
     <div data-state="acknowledged">${group('Acknowledged', acknowledged, (i) => row(i, now, rowOpts(i)))}</div>
     ${group('Snoozed', snoozed, (i) => row(i, now, rowOpts(i)))}
     ${group('Recently resolved', resolved, (i) => resolvedRow(i, now))}`;
