@@ -273,6 +273,46 @@ def test_share_dirs_are_fixed_container_paths(tmp_path):
     fcc.render_share(load_fleet_config(central), tmp_path / "ok.json")
 
 
+def _share_subnet() -> str:
+    ipam = yaml.safe_load((CP / "compose.collab.yaml").read_text())["networks"]["share"]["ipam"]
+    (entry,) = ipam["config"]
+    return entry["subnet"]
+
+
+def _server_block(conf: str, listen: str) -> str:
+    start = conf.index(listen)
+    start = conf.rindex("server {", 0, start)
+    depth, i = 0, start
+    while True:
+        ch = conf[i]
+        depth += ch == "{"
+        depth -= ch == "}"
+        i += 1
+        if depth == 0 and ch == "}":
+            return conf[start:i]
+
+
+@pytest.mark.parametrize("share", [False, True])
+def test_operator_listener_refuses_the_share_network(share):
+    """share-public sits on the share network with the edge: a compromised share-public must not reach the
+    no-sign-in operator listener (8082) by setting Host itself. The share subnet is fixed so the edge can deny it."""
+    import ipaddress
+    subnet = ipaddress.ip_network(_share_subnet())
+    assert subnet.is_private and subnet.prefixlen >= 24
+    assert not subnet.overlaps(ipaddress.ip_network("192.168.137.0/24"))     # the LAN the SNI edge lives on
+    assert not subnet.overlaps(ipaddress.ip_network("100.64.0.0/10"))        # tailnet
+    conf = fcc.render_edge_conf(EDGE.read_text(), share=share)
+    operator = _server_block(conf, "listen 8082;")
+    rules = re.findall(r"^\s*(allow|deny)\s+([^;]+);", operator, re.M)
+    assert rules and rules[0] == ("deny", str(subnet)), rules
+    # the public listener: only the LAN SNI edge's TCP address passes (never a PROXY-header claim)
+    public = _server_block(conf, "server_name localdev.mcp.metabolomics.us;")
+    assert "if ($hcn_from_edge = 0) { return 444; }" in public
+    assert re.search(r"map \$realip_remote_addr \$hcn_from_edge \{ default 0; 192\.168\.137\.250 1; \}", conf)
+    assert re.findall(r"set_real_ip_from\s+([^;]+);", conf) == ["192.168.137.250"]
+    assert not ipaddress.ip_address("192.168.137.250") in subnet
+
+
 # --------------------------------------------------------------------------------------- (c) compose lint
 
 def _collab_doc():
@@ -283,7 +323,9 @@ def test_share_public_is_isolated_like_collab_public():
     doc = _collab_doc()
     pub = doc["services"]["share-public"]
     assert pub["networks"] == ["share"]
-    assert doc["networks"]["share"] == {"internal": True}
+    net = doc["networks"]["share"]
+    assert net["internal"] is True and not net.get("enable_ipv6")
+    assert set(net) == {"internal", "ipam"} and _share_subnet()
     assert pub["read_only"] is True and pub["cap_drop"] == ["ALL"]
     assert "no-new-privileges:true" in pub["security_opt"]
     assert "env_file" not in pub and "environment" not in pub
