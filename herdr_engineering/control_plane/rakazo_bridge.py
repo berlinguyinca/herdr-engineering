@@ -1113,6 +1113,25 @@ class RakazoBridge:
         except Exception:  # noqa: BLE001
             log.warning("rakazo push: a proposal notification could not be queued")
 
+    def notify_person(self, tenant: str, user: str, title: str, body: str, *, priority: str = "urgent",
+                      key: str | None = None) -> int:
+        """Push to every account of one person (assistant tenant + user id). ``urgent`` bypasses quiet hours; ``key`` is the
+        once-only dedupe key (a fresh one per call when omitted). Returns how many accounts were queued, 0 when push is
+        off or no phone is registered. Never raises."""
+        if not self.push.enabled:
+            return 0
+        key = key or f"person:{secrets.token_hex(8)}"
+        queued = 0
+        try:
+            for account in self.accounts:
+                if account.principal_id == user and self.svc.tenant_for(account.principal_id) == tenant:
+                    if self.push.notify(account.account_id, f"{key}:{account.account_id}", title, body, kind="reminder",
+                                        priority=priority):
+                        queued += 1
+        except Exception:  # noqa: BLE001
+            log.warning("rakazo push: a person notification could not be queued")
+        return queued
+
     def _threads_subscribe(self, ctx, inp):
         assistant = self._target(ctx, inp)
         cursor = inp.get("cursor")

@@ -491,6 +491,7 @@ class ControlPlaneServer:
                                     push_persistence=PostgresPushPersistence(rakazo_bridge_dsn) if rakazo_bridge_dsn else None)
                        if _bridge_cfg["enabled"] else None)
         self._build_assistant_apps(assistant_apps_dsn)
+        self._build_reminders(assistant_apps_dsn)
         from .ingest import IngestService
         # operator YAML: {api key: {rooms: [...], missions: [...]}} -> principal ids (the key itself is never kept)
         scopes = {}
@@ -1405,6 +1406,37 @@ class ControlPlaneServer:
             raise InvalidError("native agent is not ready for prompt delivery")
         return adapter.send_input(target, message, machine=machine, session=server)
 
+    def _build_reminders(self, dsn):
+        """Reminders need an assistant and nothing else (no Google). Without an assistant there is no store and no scheduler."""
+        from .reminders import PostgresReminderPersistence, ReminderScheduler, ReminderStore
+        self.reminders, self.reminder_scheduler = None, None
+        if getattr(self, "assistant", None) is None or not getattr(self.assistant, "config", {}).get("enabled"):
+            return
+        self.reminders = ReminderStore(PostgresReminderPersistence(dsn) if dsn else None)
+        self.assistant.reminders = self.reminders
+        self.reminder_scheduler = ReminderScheduler(self.reminders, self._deliver_reminder)
+
+    def _deliver_reminder(self, reminder, late):
+        """Push to the person's phones and add the reminder to their chat. Either may fail alone; the text is never logged."""
+        from datetime import UTC
+        title = "Reminder"
+        body = reminder.text
+        chat = "Reminder: " + reminder.text
+        if late:
+            when = reminder.fire_at.astimezone(UTC).strftime("%Y-%m-%d %H:%M UTC")
+            body = "(late, was due " + when + ") " + body
+            chat += "\n(This was due at " + when + " and is late because the server was not running then.)"
+        pushed = 0
+        if self.rakazo is not None:
+            pushed = self.rakazo.notify_person(reminder.tenant, reminder.user, title, body,
+                                               priority="urgent", key=f"reminder:{reminder.id}")
+        try:
+            self.assistant.post_reminder_message(tenant_id=reminder.tenant, user_id=reminder.user, content=chat,
+                                                 provenance=f"reminder:{reminder.id}")
+        except Exception:  # noqa: BLE001
+            log.warning("reminders: the chat message could not be added")
+        return pushed
+
     def _build_assistant_apps(self, dsn):
         """personal_assistant.apps -> self.apps (an AppsService) or None. Never raises: without a usable key file the
         feature is simply "not set up" (reads say ready:false, writes answer 409)."""
@@ -1535,6 +1567,8 @@ class ControlPlaneServer:
         self._start_background_thread(self._deployments_loop)
         if getattr(self, "ci_watch", None) is not None and self.ci_watch.config["enabled"]:
             self._start_background_thread(self.ci_watch.run)
+        if getattr(self, "reminder_scheduler", None) is not None:
+            self.reminder_scheduler.start()
         if self.collab is not None and self.collab.lineage_sink is not None:
             self._start_background_thread(self._link_flush_loop)
         self._ready.set()
@@ -1623,6 +1657,8 @@ class ControlPlaneServer:
         self._deployments_stop.set()
         if getattr(self, "ci_watch", None) is not None:
             self.ci_watch.stop()
+        if getattr(self, "reminder_scheduler", None) is not None:
+            self.reminder_scheduler.stop()
         if self._summary_scanner and self._summary_scanner.ident is not None:
             self._summary_scanner.join(timeout=2)
         if self.agent_summaries:
@@ -2305,7 +2341,8 @@ def _make_handler(server, public=False, operator=False):
                                         "assistant-approvals", "assistant-memory",
                                         "assistant-routines", "assistant-connectors",
                                         "assistant-delegations", "assistant-proposals",
-                                        "assistant-notifications", "assistant-apps"}
+                                        "assistant-notifications", "assistant-apps",
+                                        "assistant-reminders"}
 
         def _mutate_verb(self):
             if operator:
@@ -2335,7 +2372,7 @@ def _make_handler(server, public=False, operator=False):
             err = self._require("operator")
             if err:
                 return err
-            if resource == "assistant-apps":
+            if resource in ("assistant-apps", "assistant-reminders"):
                 origin = self.headers.get("Origin")
                 if origin and (urlsplit(origin).netloc != self.headers.get("Host")
                                or urlsplit(origin).scheme not in {"http", "https"}):
@@ -3547,6 +3584,8 @@ def _make_handler(server, public=False, operator=False):
                 return self._review_gate_get(parts)
             if resource == "assistant-apps":
                 return self._assistant_apps(parts, None)
+            if resource == "assistant-reminders":
+                return self._assistant_reminders(parts)
             if resource in ("assistants", "assistant-runs", "assistant-approvals", "assistant-memory", "assistant-routines", "assistant-connectors", "assistant-delegations",
                             "assistant-proposals", "assistant-notifications", "assistant-audit"):
                 return self._assistant_get(parts, resource)
@@ -4006,6 +4045,8 @@ def _make_handler(server, public=False, operator=False):
                 return self._json({"ok": True, "entity": entity})
             if resource == "assistant-apps":
                 return self._assistant_apps(parts, body)
+            if resource == "assistant-reminders":
+                return self._assistant_reminders(parts)
             if resource in ("assistants", "assistant-runs", "assistant-approvals", "assistant-memory", "assistant-routines", "assistant-connectors", "assistant-delegations",
                             "assistant-proposals", "assistant-notifications"):
                 # the body is already read above (line ~2170) into the local
@@ -4071,6 +4112,29 @@ def _make_handler(server, public=False, operator=False):
             self.send_header("Connection", "close")
             self.end_headers()
             return None
+
+        def _assistant_reminders(self, parts):
+            """GET /api/v1/assistant-reminders: the calling person's reminders. DELETE .../<id>: cancel one of theirs."""
+            from .assistant import RateLimited
+            from .reminders import REMINDER_ID, zone
+            store = server.reminders
+            try:
+                tenant, user = self._assistant_scope()
+                server.assistant.check_rate_limit(key=f"{tenant}:{user}")
+            except RateLimited:
+                return self._json({"error": "rate_limited"}, 429)
+            if store is None:
+                return self._json({"error": "not_set_up"}, 409)
+            tz = zone(server.assistant.config["notifications"]["timezone"])
+            if self.command == "GET" and len(parts) == 4:
+                return self._json({"reminders": [r.as_dict(tz) for r in store.list(tenant, user)], "timezone": str(tz)})
+            if self.command == "DELETE" and len(parts) == 5:
+                if not REMINDER_ID.fullmatch(parts[4]):
+                    return self._json({"error": "bad_id"}, 400)
+                if not store.cancel(parts[4], tenant, user):
+                    return self._json({"error": "not found"}, 404)
+                return self._json({"ok": True, "id": parts[4]})
+            return self._json({"error": "not found"}, 404)
 
         def _assistant_apps(self, parts, body):
             """/api/v1/assistant-apps[...]: list, client credentials, connect, disconnect, blocked calendars. The

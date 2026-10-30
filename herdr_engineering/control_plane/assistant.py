@@ -43,6 +43,8 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from .google_workspace import google_config
+from .reminders import REMINDER_TOOLS, ReminderError
+from .reminders import run_tool as run_reminder_tool
 
 _log = logging.getLogger(__name__)
 _SECRET_KEY_RE = re.compile(r"(?i)(api[_-]?key|token|passw(or)?d|secret|authorization|credential|private[_-]?key)")
@@ -914,6 +916,22 @@ TOOL_CATALOG: dict[str, dict[str, Any]] = {
             "time_min": {"type": "string", "description": "RFC3339 start of the window."},
             "time_max": {"type": "string", "description": "RFC3339 end of the window."}},
             "required": ["duration_minutes", "time_min", "time_max"]}},
+    "set_reminder": {
+        "sensitive": False,
+        "description": "Remind the user at a time (a push to their phone and a message here). Only notifies them, needs no "
+                       "Google account. when: 'in 20 minutes', 'tomorrow 09:00', 'tomorrow morning', 'today 17:30' or an ISO "
+                       "date-time, in the user's timezone. If the time is unclear or past, ask the user; do not guess.",
+        "parameters": {"type": "object", "properties": {
+            "text": {"type": "string", "description": "What to remind them of, at most 500 characters."},
+            "when": {"type": "string"}}, "required": ["text", "when"]}},
+    "list_reminders": {
+        "sensitive": False,
+        "description": "List the user's pending reminders (and recently fired ones), in their timezone.",
+        "parameters": {"type": "object", "properties": {}}},
+    "cancel_reminder": {
+        "sensitive": False,
+        "description": "Cancel one pending reminder by id (from list_reminders).",
+        "parameters": {"type": "object", "properties": {"id": {"type": "string"}}, "required": ["id"]}},
     "read_lineage": {
         "sensitive": False,
         "description": "Read the mission/agent lineage graph (sessions, handoffs, branches, reviews, PRs, CI, artifacts) "
@@ -1972,6 +1990,7 @@ class AssistantService:
         # Set by the control-plane API when project intelligence is enabled: (tenant, user, payload) -> dict.
         self.intelligence_read = None
         self.google_write = None      # (tenant, user, tool_id, payload) -> dict; runs ONLY an approved Google draft/event
+        self.reminders = None         # ReminderStore, set by the server; reminders need no Google account
         self.google_read = None       # (tenant, user, tool_id, payload) -> dict; set when personal_assistant.google is enabled
         self.lineage_read = None
         # Thin adapters over EXISTING endpoints, all wired by the control-plane API and all optional. Absent = the
@@ -2109,6 +2128,23 @@ class AssistantService:
         self._require_enabled()
         return self.store.list_threads(tenant_id=tenant_id, user_id=user_id,
                                        assistant_id=assistant_id)
+
+    def post_reminder_message(self, *, tenant_id: str, user_id: str, content: str, provenance: str) -> bool:
+        """Add a reminder to the person's chat: their first enabled assistant, its most recently active thread (one is
+        created when there is none). False when the person has no assistant to say it. Starts no run."""
+        self._require_enabled()
+        assistants = [a for a in self.store.list_assistants(tenant_id=tenant_id, user_id=user_id) if a.enabled]
+        if not assistants:
+            return False
+        a = assistants[0]
+        threads = self.store.list_threads(tenant_id=tenant_id, user_id=user_id, assistant_id=a.assistant_id)
+        thread = (threads[0] if threads else
+                  self.create_thread(tenant_id=tenant_id, user_id=user_id, assistant_id=a.assistant_id))
+        self.store.put_message(AssistantMessage(message_id=_new_id("msg"), thread_id=thread.thread_id, role="assistant",
+                                                content=content, provenance=provenance))
+        thread.last_activity_at = self.now()
+        self.store.put_thread(thread)
+        return True
 
     def get_thread(self, thread_id: str, *, tenant_id: str, user_id: str) -> AssistantThread:
         self._require_enabled()
@@ -3911,6 +3947,14 @@ class AssistantService:
             except GoogleError as exc:
                 raise AssistantError(_GOOGLE_MESSAGES.get(exc.reason) or
                                      f"Google {tool_id.replace('_', ' ')} failed: {exc.reason}") from None
+        if tool_id in REMINDER_TOOLS:
+            if self.reminders is None:
+                raise AssistantError("reminders are not enabled")
+            try:
+                return run_reminder_tool(self.reminders, tool_id, tenant_id, user_id, payload, self.now(),
+                                         self.config["notifications"]["timezone"])
+            except ReminderError as exc:
+                raise AssistantError(str(exc)) from None
         if tool_id in GOOGLE_WRITE_TOOLS:
             # Reached only through the gate: request_tool_action raised ApprovalRequired until a person approved this
             # exact payload, and execute_approved_action re-checks the approval and the payload hash before this runs.
