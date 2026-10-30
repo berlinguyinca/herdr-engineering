@@ -525,3 +525,78 @@ Turn it on in this order: deploy with it off (the migration applies at boot), se
 wait for the worker log line `inspector snapshot written`, then redeploy once more and check
 `boot inspector replay: snapshot` and the phase timing. Rollback is `enabled: false`; the table can stay.
 If a redaction rule or inspector semantics change, bump `SNAPSHOT_VERSION` in `inspector.py`.
+
+## Rakazo mobile bridge (iPhone app against the Herdr assistant)
+
+The Rakazo mobile app can be registered as a **custom server** and then talks to the Herdr Personal Assistant: a Rakazo
+"bot" is a Herdr assistant, its one chat is the assistant's thread, a message is an assistant message, a run is an
+assistant run, and an approval card is an assistant approval. The bridge keeps no second assistant, task store, memory
+or scheduler. Code: `control_plane/rakazo_bridge.py` (auth, procedures) and `rakazo_events.py` (wire shapes, event stream).
+
+**Enable** (fleet YAML; the Personal Assistant must be enabled too, and the control plane restarted):
+
+```yaml
+control_plane:
+  rakazo_bridge:
+    enabled: true
+    token_ttl_days: 30        # default
+    max_tokens: 5             # live sessions per account, default
+    accounts:                 # reserved shape for a later multi-user mode; only role: operator exists today
+      - email: you@example.com
+        password_scrypt: "scrypt$32768$8$1$...$..."
+        role: operator
+```
+
+`enabled: true` with no account, a malformed hash, an unknown key or any role but `operator` (`family` is reserved, not
+implemented) stops the control plane at startup with a message naming the field. Disabled (the default) leaves every
+`/rpc/*` and `/api/auth/*` path a 404, as before.
+
+**Make the hash** without putting the password on a command line (it prompts twice on a terminal, or reads one line from stdin):
+
+```bash
+herdr-eng bridge hash-password          # prints scrypt$32768$8$1$<salt>$<hash>; paste it as password_scrypt
+```
+
+**Persist sessions** by applying migration `0036_rakazo_bridge_tokens.sql` (`herdr-eng control-plane migrate`, done by the normal
+deploy). With `control_plane.pg_dsn` set the bridge stores only `sha256(token)` plus expiry, creation, last use and last
+address, so a restart does not sign the phone out; without a DSN, or if the table is unreadable at boot, restarting the
+control plane signs everyone out. If the table cannot be written, sign-in fails (no token is issued that would not
+survive). Revoking a session is `sign out` in the app or `DELETE FROM rakazo_bridge_tokens WHERE account_id = ...`
+followed by a restart.
+
+**Register in the app**: the sign-in screen opens a Server page (it shows the current server; **Save** probes it): enter `https://local.metabolomics.us`. The app stores only scheme://host:port and
+calls `/rpc/*` and `/api/auth/*` at the origin root, so whatever fronts that name must forward those two prefixes to this
+listener unchanged (the apex upstream of the fabric gateway already forwards every path to `herdr-cp-web`) and must not
+buffer `text/event-stream` responses (`X-Accel-Buffering: no` is sent). Plain `http://` is accepted by the app only for
+private/Tailscale addresses. Then sign in with the email and password above and create a bot in the app; an assistant
+already made in the dashboard for the same account appears by itself.
+
+**Security model.** Sign-in checks the email (case-insensitive) and a scrypt hash in constant time and always spends one
+KDF, whether or not the email exists; the same `Invalid credentials` answer covers both. Each source address locks out for
+30 s after 5 failures and then doubles up to an hour, and the bridge as a whole locks after 40 failures from anywhere
+(`429` with `Retry-After`; the lock is checked before any password work). A token is 32 random bytes shown once. The
+password, tokens, hashes and request bodies are never logged or written to the audit trail; sign-in and sign-out are audited
+under the account's id, and everything the app does is audited as the account's own assistant user.
+
+Each account is its own assistant user (`rakazo:<hash of the normalised email>`), so a second account gets separate bots,
+threads, memory, grants, approvals, audit identity and rate limit; the tenant still comes from
+`personal_assistant.tenancy`. Approvals answered in the app go through the same `decide_approval` path as the dashboard,
+with the same rules: the approver must differ from the requester for a sensitive tool unless
+`personal_assistant.actions.allow_self_approval` (or `control_plane.single_operator`) already allows it.
+
+**Residual risk.** A token grants that account's full assistant access (its tools, grants and approvals) from anywhere that
+can reach the listener, i.e. the tailnet; there is no second factor and no device binding. Keep the password long, keep
+`max_tokens` low, and shorten `token_ttl_days` if a phone is lost; nothing else is exposed (no control-plane API key route
+accepts a bridge token, and no bridge route accepts an API key).
+
+**Supported:** health probe, email/password sign-in and sign-out, `me`, `spaces/list` (one fixed space, "Herdr"),
+`bots/list|get|create`, `threads/get|head|messages|send|stop|markRead|subscribe` (live events: new messages, run
+started/waiting/completed/failed/cancelled, approval cards and their answers), `threads/answer` for approvals,
+`runs/list`, `aiConsent/*` (no recipients, so no prompt), `notifications/registerPush|unregisterPush` and
+`analytics/screen` (accepted and discarded). Sending runs on in the background so a slow model does not hit the app's 8 s
+timeout; the reply and any failure arrive as events.
+
+**Not supported** (answered `404 NOT_FOUND` in Rakazo's error shape so the app degrades per screen): push notifications
+(nothing is delivered while the app is closed), voice and calls, billing and the model/provider screens, groups,
+attachments, memory, routines, skills, connections, bot editing/archiving, spaces other than "Herdr", and ActionBoard
+proposals (those stay on the dashboard). `threads/send` does not deduplicate a retried `clientNonce`.

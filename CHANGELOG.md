@@ -5,6 +5,12 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Rakazo mobile bridge (off by default)
+- `control_plane.rakazo_bridge` (YAML: `enabled: false`, `accounts: [{email, password_scrypt, role: operator}]`, `token_ttl_days: 30`, `max_tokens: 5`) lets the Rakazo iPhone app use the Herdr Personal Assistant as a custom server. `/rpc/*` and `/api/auth/*` serve the subset of Rakazo's protocol the app needs (sign-in, `me`, bots, threads with a live event stream, approvals via `threads/answer`, runs); everything else answers a Rakazo-shaped 404. Disabled, those paths stay 404. An enabled but malformed section stops startup.
+- Auth: email + scrypt-hash password (`herdr-eng bridge hash-password` reads the password from a prompt or stdin, never argv), constant-time compare with one KDF per attempt even for an unknown email, per-address and global exponential lockout, 32-byte bearer tokens of which only the SHA-256 is stored (migration `0036_rakazo_bridge_tokens.sql`, persisted when a Postgres DSN is configured), a per-account token cap, sign-out revokes. No password, token, hash or request body is logged or audited.
+- Each account is its own assistant user, so a second account (shape reserved for later multi-user; only `role: operator` exists, `family` is rejected) gets separate threads, memory, approvals, audit identity and rate limit. Approvals decided in the app use the existing `decide_approval` rules (approver must differ from requester unless YAML allows self-approval).
+- Residual risk: a token is operator-level assistant access from anywhere that can reach the listener (the tailnet). No push, voice, billing or model screens. See deploy/control-plane/README.md.
+
 ### Assistant: CI failures also queue a re-run proposal
 - When `watch_ci` sees a new CI failure it now queues, beside the repair proposal, a separate `ci_rerun` proposal on the same board (same scope rules, same one-time dedupe). The repair proposal records it as `rerun_proposal` and the notification says a plain re-run awaits approval. A refused or failing re-run request never hides the repair proposal. Approving it still needs `project_intelligence.execute: true`.
 

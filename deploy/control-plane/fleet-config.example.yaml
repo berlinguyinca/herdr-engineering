@@ -100,6 +100,17 @@ sections:
       #     repos:                       # ONLY these repos / PRs get evidence (also enrolled in control_plane.review_gate)
       #       - repo: github.com/<owner>/<name>
       #         prs: [123]               # optional; omit for every open non-draft PR of the repo
+      # OPTIONAL: the Rakazo mobile bridge (off unless `enabled: true`; then /rpc/* and /api/auth/* serve the Rakazo
+      # iPhone app from the Personal Assistant below, which must be enabled too). Passwords are scrypt HASHES made
+      # with `herdr-eng bridge hash-password`; never put a password here. See deploy/control-plane/README.md.
+      # rakazo_bridge:
+      #   enabled: false
+      #   token_ttl_days: 30             # a signed-in phone stays signed in this long (1-365)
+      #   max_tokens: 5                  # live sessions per account; the oldest is dropped (1-50)
+      #   accounts:                      # shape reserved for a later multi-user mode; today only role: operator
+      #     - email: "you@example.com"
+      #       password_scrypt: "scrypt$32768$8$1$<salt_b64>$<hash_b64>"
+      #       role: operator
       # OPTIONAL: the Personal Assistant (inert unless `enabled: true`). Nothing in
       # the assistant module runs while disabled; the /personal-assistant dashboard
       # view only appears when the `assistant_v1` capability is advertised (enabled).
