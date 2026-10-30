@@ -5,6 +5,9 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### CI page: one attention item per repository
+- "Needs attention" on the CI page no longer lists the same repository once per pull request and branch. Unfixed failures of one repository are one row: the newest failure leads (its failing step and log load when the row is opened), and the other failing branches and pull requests are listed inside it, with a "N branches or PRs failing" chip. Each ref is still judged on its own, so a green main does not clear a red pull request, and a ref that gets a green run drops out of the row. The Overview badge counts repositories.
+
 ### Artifact gallery: filter by linked work (unified workspace P03)
 - The Artifacts page can list what is linked to a project, issue, task or room ("Linked to" + id, through `/api/v1/artifacts/for/<kind>/<ref>`, which already filters by what the signed-in user may read), and an artifact's page shows a "Linked to" section. Type and status filters apply to the full list only. The web client gains `artifactsForContext` and `artifactLinks`. No server change.
 
