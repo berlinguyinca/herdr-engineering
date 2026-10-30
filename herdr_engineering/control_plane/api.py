@@ -300,7 +300,7 @@ class ControlPlaneServer:
                  request_workers=128, request_queue=256, single_operator=False,
                  assistant_service=None, assistant_config=None, fabric_resolver=None, fabric_services=None, fabric_names=None,
                  scheduler_admission=False, scheduler_limits=None, skill_registry=None,
-                 unified_workspace_config=None):
+                 unified_workspace_config=None, rakazo_bridge=None, rakazo_bridge_dsn=None):
         """
         Auth (Spec §104): either a single `api_key` (all-access) or a mapping
         `api_keys={key: role}` with roles "viewer" (read-only) / "operator"
@@ -462,6 +462,13 @@ class ControlPlaneServer:
                 config=_build_assistant_config(assistant_config or {}), repo=repo)
         else:
             self.assistant = assistant_service
+        # control_plane.rakazo_bridge (off by default: nothing is constructed and /rpc/* + /api/auth/* answer 404).
+        # A bad section raises here, so an enabled but malformed bridge stops startup instead of running open.
+        from .rakazo_bridge import PostgresTokenPersistence, RakazoBridge, rakazo_bridge_config
+        _bridge_cfg = rakazo_bridge_config(rakazo_bridge)
+        self.rakazo = (RakazoBridge(_bridge_cfg, self.assistant, version=__version__,
+                                    persistence=PostgresTokenPersistence(rakazo_bridge_dsn) if rakazo_bridge_dsn else None)
+                       if _bridge_cfg["enabled"] else None)
         from .ingest import IngestService
         # operator YAML: {api key: {rooms: [...], missions: [...]}} -> principal ids (the key itself is never kept)
         scopes = {}
@@ -1522,6 +1529,8 @@ class ControlPlaneServer:
         return True
 
     def shutdown(self):
+        if self.rakazo is not None:
+            self.rakazo.close()                 # ends open event streams
         self._maintenance_stop.set()
         self._summary_stop.set()
         with self._lifecycle_lock:
@@ -2045,6 +2054,8 @@ def _make_handler(server, public=False, operator=False):
                 return self._public()
             if self._is_federation_path():
                 return self._federation()
+            if server.rakazo is not None and server.rakazo.handles(self.path):
+                return self._rakazo()
             if self._is_collab_path():
                 return self._collab()
             if self._path_only() == _FLEET_CONFIG_PATH:
@@ -2077,6 +2088,8 @@ def _make_handler(server, public=False, operator=False):
                 return self._public()
             if self._is_federation_path():
                 return self._federation()        # read-only: answers the same 404 as everything else
+            if server.rakazo is not None and server.rakazo.handles(self.path):
+                return self._rakazo()
             # Unambiguous framing, as on the public/operator listeners: this server reads
             # only Content-Length, so a chunked or doubly-sized body would be parsed as
             # the next request on a keep-alive connection. Applies to collab paths too.
@@ -2131,6 +2144,48 @@ def _make_handler(server, public=False, operator=False):
             if self.path.startswith("/api/v1/"):
                 return self._route_api()
             return self._send_json(404, {"error": "not found"})
+
+        def _rakazo(self):
+            """``/rpc/*`` and ``/api/auth/*`` for the Rakazo mobile app (only when control_plane.rakazo_bridge is on).
+            Auth is the bridge's own bearer token, not X-API-Key; the request body is never logged."""
+            from .rakazo_bridge import MAX_BODY
+            lengths = self.headers.get_all("Content-Length") or []
+            if len(lengths) > 1 or "Transfer-Encoding" in self.headers:
+                return self._deny(400, "ambiguous request framing")
+            try:
+                length = int(lengths[0]) if lengths else 0
+            except ValueError:
+                return self._deny(400, "bad length")
+            if length < 0 or length > MAX_BODY:
+                return self._deny(413, "body too large")
+            body = self.rfile.read(length) if length else b""
+            response = server.rakazo.handle(self.command, self.path, {k.lower(): v for k, v in self.headers.items()},
+                                            body, self.client_address[0])
+            if response is None:
+                return self._send_json(404, {"error": "not found"})
+            try:
+                self.send_response(response.status)
+                for name, value in response.headers.items():
+                    self.send_header(name, value)
+                if response.frames is None:
+                    self.send_header("Content-Length", str(len(response.body)))
+                    self.end_headers()
+                    self.wfile.write(response.body)
+                    return None
+                self.end_headers()
+                self.close_connection = True
+                try:
+                    self.connection.settimeout(30)          # a client that stops reading cannot hold this thread
+                except OSError:
+                    pass
+                for frame in response.frames:
+                    self.wfile.write(frame)
+                    self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, TimeoutError, OSError):
+                self.close_connection = True
+            finally:
+                response.close()
+            return None
 
         def _intelligence_webhook(self):
             # HMAC-authenticated (no API key); 404 while unconfigured. Body is bounded before it is read.
