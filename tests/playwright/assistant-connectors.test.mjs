@@ -82,7 +82,7 @@ const FAKE_BACKEND = async ({ scenario, secret, googleUrl }) => {
         : { ready: false, redirect_uri: '', providers: [], blocked_calendars: [] });
     }
     if (method === 'PUT' && path === '/api/v1/assistant-apps/google/client') { db.secret = body.client_secret; db.clientSaved = true; return reply(200, { ok: true }); }
-    if (method === 'POST' && path === '/api/v1/assistant-apps/google/connect') return db.clientSaved ? reply(200, { url: googleUrl }) : reply(409, { error: 'no_client' });
+    if (method === 'POST' && path === '/api/v1/assistant-apps/google/connect') return db.clientSaved ? reply(200, { url: db.connectUrl || googleUrl }) : reply(409, { error: 'no_client' });
     if (method === 'DELETE' && path === '/api/v1/assistant-apps/google') { db.connection.connected = false; return reply(200, { ok: true }); }
     if (method === 'GET' && path === '/api/v1/assistant-apps/google/calendars') return reply(200, { calendars: db.calendars });
     if (method === 'PUT' && path === '/api/v1/assistant-apps/google/blocked-calendars') { db.blocked = body.ids; return reply(200, { ids: body.ids }); }
@@ -149,6 +149,19 @@ test('Enable (on either card) sends POST connect with a JSON body before navigat
   const c = recorded.filter((x) => x.path.endsWith('/google/connect'));
   assert.equal(c.length, 1);
   assert.equal(c[0].method, 'POST'); assert.deepEqual(c[0].body, {});
+}));
+
+test('Enable refuses any sign-in address that is not https://accounts.google.com and does not navigate', () => withPage('disconnected', async (page) => {
+  const before = page.url();
+  for (const bad of ['https://evil.example/', 'http://accounts.google.com/x', 'https://accounts.google.com.evil.example/', 'javascript:window.pwned=1', '//accounts.google.com/x', 'not a url']) {
+    await page.evaluate((u) => { window.__db.connectUrl = u; }, bad);
+    await page.getByRole('button', { name: 'Enable Gmail' }).click();
+    await page.locator('[data-apps-flash] [role="alert"]').filter({ hasText: 'sign-in address was not valid' }).waitFor();
+    await page.waitForTimeout(100);
+    assert.equal(page.url(), before, `navigated for ${bad}`);
+    assert.equal(await page.evaluate(() => window.pwned), undefined);
+    await page.evaluate(() => { document.querySelector('[data-apps-flash]').innerHTML = ''; });
+  }
 }));
 
 test('connected: the card shows the account and Disconnect; the blocked list is loaded', () => withPage('connected', async (page) => {
@@ -236,6 +249,12 @@ test('returning from Google: ?connected= and ?error= show fixed text and are rem
     assert.equal(await page.getByText('<b>x</b>').count(), 0);
     assert.equal(new URL(page.url()).search, '');
   }, { path: '/?error=%3Cb%3Ex%3C%2Fb%3E' });
+  for (const name of ['constructor', 'toString', '__proto__', 'hasOwnProperty']) {         // names from Object.prototype are not reasons
+    await withPage('disconnected', async (page) => {
+      await page.getByText('Google sign-in did not finish. Choose Enable to try again.').waitFor();
+      assert.equal(new URL(page.url()).search, '');
+    }, { path: `/?error=${name}` });
+  }
   await withPage('connected', async (page) => {                                              // the dashboard's own address form: #/route?query
     await page.getByText('Google connected.').waitFor();
     assert.equal(new URL(page.url()).hash, '#/personal-assistant');

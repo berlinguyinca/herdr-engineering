@@ -4195,6 +4195,8 @@ def _make_handler(server, public=False, operator=False):
             """GET .../google/calendars: the calling person's calendars for the blocked-calendars picker. Blocked ones are
             listed too, flagged ``blocked``: this is the owner's own screen, never a model-facing result."""
             from .google_workspace import GoogleError
+            if self._require("operator"):      # it names calendars the person has blocked: operator role, like the other apps routes
+                return None
             gw = getattr(server, "google", None)
             if gw is None:
                 return self._json({"error": "not_set_up"}, 409)

@@ -221,6 +221,7 @@ def test_viewer_key_cannot_mutate(ready):
                                   ("POST", "/google/connect", {}), ("DELETE", "/google", None),
                                   ("PUT", "/google/blocked-calendars", {"ids": ["x"]})):
         assert call(ready, BASE + path, payload, method, key=VIEWER)[0] == 403
+    assert call(ready, BASE + "/google/calendars", key=VIEWER)[0] == 403     # it names blocked calendars: operator only
 
 
 def test_a_second_key_cannot_touch_another_persons_connection(ready):
@@ -261,3 +262,27 @@ def test_calendars_route_lists_blocked_ones_flagged_for_the_owner_only(ready):
     # the model-facing listing still omits the blocked calendar, and the assistant tool entry point has no way to this one
     assert call(ready, BASE + "/google/calendars", key=None)[0] == 401
     assert call(ready, BASE + "/google/calendars", key=OTHER)[0] == 409       # another person has no connection
+
+
+def _connected_with_fake(ready):
+    from tests.control_plane.test_google_workspace import Google
+    call(ready, BASE + "/google/client", {"client_id": "cid.apps", "client_secret": SECRET}, "PUT")
+    url = call(ready, BASE + "/google/connect", {}, "POST")[1]["url"]
+    state = urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)["state"][0]
+    raw_get(ready, BASE + f"/google/callback?state={state}&code=c")
+    fake = Google()
+    ready.google._open = fake
+    return fake
+
+
+def test_calendars_route_maps_google_errors_like_its_siblings(ready):
+    fake = _connected_with_fake(ready)
+    fake.fail = {"calendarList": 429}
+    assert call(ready, BASE + "/google/calendars") == (429, {"error": "rate_limited"})
+    fake.fail = {"calendarList": 500}
+    assert call(ready, BASE + "/google/calendars") == (502, {"error": "unavailable"})
+    fake.fail = {}
+    fake.revoked = True
+    ready.google._access.clear()
+    status, body = call(ready, BASE + "/google/calendars")
+    assert (status, body) == (409, {"error": "needs_attention"})

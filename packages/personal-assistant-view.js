@@ -24,6 +24,11 @@ const SIGN_IN_ERRORS = {
   not_set_up: 'App connections are not set up. Ask the operator to create the encryption key.',
 };
 
+/** Only Google's own sign-in host may be navigated to; anything else the server (or a proxy) returns is refused. */
+function isGoogleSignInUrl(url) {
+  try { const u = new URL(url); return u.protocol === 'https:' && u.hostname === 'accounts.google.com'; } catch { return false; }
+}
+
 /** Reads ?connected= / ?error= from the hash (or the search) once, removes it from the address, returns a fixed-text flash. */
 function takeSignInReturn(win = typeof window === 'undefined' ? null : window) {
   if (!win) return null;
@@ -39,7 +44,7 @@ function takeSignInReturn(win = typeof window === 'undefined' ? null : window) {
       : `${loc.pathname}${rest ? `?${rest}` : ''}${loc.hash}`;
     win.history.replaceState(win.history.state, '', next);
     if (connected === 'google') return { text: 'Google connected.' };
-    return { error: true, text: SIGN_IN_ERRORS[error] || 'Google sign-in did not finish. Choose Enable to try again.' };
+    return { error: true, text: (error !== null && Object.hasOwn(SIGN_IN_ERRORS, error) ? SIGN_IN_ERRORS[error] : '') || 'Google sign-in did not finish. Choose Enable to try again.' };
   } catch { return null; }
 }
 
@@ -394,14 +399,14 @@ export function mountPersonalAssistant(container, client, { onFreshness = () => 
         b.disabled = true;
         try {
           const { url } = await client.connectApp(b.dataset.appEnable);
-          if (typeof url === 'string' && /^https:\/\//.test(url)) { window.location.assign(url); return; }
-          say({ error: true, text: 'The sign-in address was not valid.' });
+          if (isGoogleSignInUrl(url)) { window.location.assign(url); return; }
+          say({ error: true, text: 'The sign-in address was not valid, so nothing was opened.' });
         } catch (e) { say({ error: true, text: connectError(e) }); }
         b.disabled = false;
       }));
       el.querySelectorAll('[data-app-disconnect]').forEach(b => b.addEventListener('click', async () => {
         b.disabled = true;
-        try { await client.disconnectApp(b.dataset.appDisconnect); appsFlash = { text: 'Disconnected. Gmail and Google Calendar share one Google sign-in.' }; await loadApps(root); void loadDrafts(root, false); }
+        try { await client.disconnectApp(b.dataset.appDisconnect); appsFlash = { text: 'Disconnected. Gmail and Google Calendar share one Google sign-in.' }; await loadApps(root); }
         catch (e) { say({ error: true, text: errText(e) }); b.disabled = false; }
       }));
       el.querySelector('[data-copy-uri]')?.addEventListener('click', async () => {
@@ -447,7 +452,7 @@ export function mountPersonalAssistant(container, client, { onFreshness = () => 
       const rows = [...calendars.map(c => ({ id: c.id, label: c.summary || c.id, primary: c.primary, blocked: c.blocked })),
         ...ids.filter(i => !listed.has(i)).map(i => ({ id: i, label: i, primary: false, blocked: true, unlisted: true }))];
       el.innerHTML = `${head}<p class="pa-muted">Checked calendars are hidden from your assistant: it cannot list, read, or schedule on them.</p>
-        <form data-blocked-form><fieldset class="pa-fieldset" aria-label="Blocked calendars">
+        <form data-blocked-form><fieldset class="pa-fieldset"><legend class="pa-muted">Choose the calendars to hide</legend>
         ${rows.length ? rows.map((r, i) => `<label class="pa-check" for="pa-bc-${i}"><input type="checkbox" id="pa-bc-${i}" data-blocked-id="${esc(r.id)}" ${r.blocked ? 'checked' : ''}>
           <span>${esc(r.label)}${r.primary ? ' <span class="pa-badge">primary</span>' : ''}${r.unlisted ? ' <span class="pa-muted">(not in your calendar list)</span>' : ''}
           ${r.label !== r.id ? `<span class="pa-muted pa-check__id">${esc(r.id)}</span>` : ''}</span></label>`).join('') : '<div class="pa-muted">No calendars found.</div>'}
@@ -465,7 +470,9 @@ export function mountPersonalAssistant(container, client, { onFreshness = () => 
     } catch (e) { el.innerHTML = `${head}<div class="pa-muted" role="status">Calendars could not be loaded${e && e.body && e.body.error === 'needs_attention' ? '; sign in again first' : ''}.</div>`; }
   };
 
+  let draftsGen = 0;       // a slower, older drafts request must not redraw after a newer one (or a Disconnect) has run
   const loadDrafts = async (root, on) => {
+    const gen = ++draftsGen;
     const el = root.querySelector('#pa-drafts');
     if (!el) return;
     if (!on) { el.hidden = true; el.innerHTML = ''; return; }
@@ -473,14 +480,14 @@ export function mountPersonalAssistant(container, client, { onFreshness = () => 
     const head = '<h3 id="pa-drafts-h" class="pa-h3">Drafts</h3>';
     try {
       const { drafts = [] } = await client.listDrafts('google');
-      if (disposed) return;
+      if (disposed || gen !== draftsGen) return;
       const link = (u) => typeof u === 'string' && /^https:\/\/mail\.google\.com\//.test(u) ? u : '';
       el.innerHTML = `${head}<p class="pa-muted">Drafts your assistant saved in Gmail. Nothing here has been sent.</p><div role="status" aria-live="polite" data-drafts-status class="pa-flash"></div>
         ${drafts.length ? drafts.map(d => `<article class="pa-msg" aria-label="Draft ${esc(d.subject || 'no subject')}" data-draft="${esc(d.id)}">
           <div><strong>${esc(d.subject || '(no subject)')}</strong></div>
           <div class="pa-muted">To ${esc(d.to || '(nobody yet)')}</div>
           ${d.snippet ? `<div class="pa-snippet">${esc(d.snippet)}</div>` : ''}
-          <div class="pa-row" style="margin-top:6px">
+          <div class="pa-row pa-row--tight">
             ${link(d.gmail_url) ? `<a class="hd-btn hd-btn--ghost hd-btn--sm" href="${esc(link(d.gmail_url))}" target="_blank" rel="noopener" aria-label="Open draft ${esc(d.subject || 'no subject')} in Gmail">Open in Gmail</a>` : ''}
             <button class="hd-btn hd-btn--danger hd-btn--sm" data-draft-discard="${esc(d.id)}" aria-label="Discard draft ${esc(d.subject || 'no subject')}">Discard</button>
             <button class="hd-btn hd-btn--sm" disabled aria-disabled="true" data-draft-send title="Sending from here is not available yet">Send (coming soon)</button>
@@ -490,7 +497,7 @@ export function mountPersonalAssistant(container, client, { onFreshness = () => 
         try { await client.discardDraft('google', b.dataset.draftDiscard); await loadDrafts(root, true); root.querySelector('[data-drafts-status]').textContent = 'Draft discarded.'; }
         catch (e) { el.querySelector('[data-drafts-status]').textContent = `Not discarded: ${errText(e)}`; b.disabled = false; }
       }));
-    } catch (e) { el.innerHTML = `${head}<div class="pa-muted" role="status">Drafts could not be loaded${e && e.body && e.body.error === 'needs_attention' ? '; sign in again first' : ''}.</div>`; }
+    } catch (e) { if (gen !== draftsGen) return; el.innerHTML = `${head}<div class="pa-muted" role="status">Drafts could not be loaded${e && e.body && e.body.error === 'needs_attention' ? '; sign in again first' : ''}.</div>`; }
   };
 
   const loadReminders = async (el, flash = null) => {
@@ -503,7 +510,7 @@ export function mountPersonalAssistant(container, client, { onFreshness = () => 
       el.innerHTML = `${head}${flashHtml(flash)}
         ${shown.length ? shown.map(r => `<article class="pa-msg pa-msg--meta" aria-label="Reminder ${esc(r.text)}" data-reminder="${esc(r.id)}">
           <div>${esc(r.text)}</div><div class="pa-muted">${esc(at(r))}${timezone ? ` (${esc(timezone)})` : ''} · ${esc(r.state)}</div>
-          ${r.state === 'pending' ? `<div class="pa-row" style="margin-top:6px"><button class="hd-btn hd-btn--danger hd-btn--sm" data-reminder-cancel="${esc(r.id)}" aria-label="Cancel reminder ${esc(r.text)}">Cancel</button></div>` : ''}
+          ${r.state === 'pending' ? `<div class="pa-row pa-row--tight"><button class="hd-btn hd-btn--danger hd-btn--sm" data-reminder-cancel="${esc(r.id)}" aria-label="Cancel reminder ${esc(r.text)}">Cancel</button></div>` : ''}
           </article>`).join('') : '<div class="pa-muted">No reminders.</div>'}`;
       el.querySelectorAll('[data-reminder-cancel]').forEach(b => b.addEventListener('click', async () => {
         b.disabled = true;

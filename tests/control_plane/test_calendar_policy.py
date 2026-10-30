@@ -148,3 +148,19 @@ def test_person_a_tool_call_cannot_use_person_b_tokens(store):
     with pytest.raises(gw.GoogleError) as exc:
         w.run("default", "u3", "search_email", {"query": "x"})
     assert exc.value.reason == "not_connected"
+
+
+def test_owner_ui_listing_flags_blocked_calendars_and_the_model_facing_ones_stay_hidden(store):
+    from herdr_engineering.control_plane.assistant import TOOL_CATALOG
+    w, _ = ws(store, blocked={("default", "u1"): ["secret@x.org"]})
+    flagged = {c["id"]: c["blocked"] for c in w.list_calendars_for_owner_ui("default", "u1")}
+    assert flagged == {"ann@x.org": False, "team@x.org": False, "secret@x.org": True}
+    assert "secret@x.org" not in [c["id"] for c in w.list_calendars("default", "u1")]       # the model-facing listing omits it
+    # blocking the alias `primary` blocks the real primary calendar too
+    w2, _ = ws(store, blocked={("default", "u1"): ["primary"]})
+    assert {c["id"]: c["blocked"] for c in w2.list_calendars_for_owner_ui("default", "u1")}["ann@x.org"] is True
+    # no way from the assistant's entry point, and not a catalogued tool
+    with pytest.raises(gw.GoogleError) as exc:
+        w.run("default", "u1", "list_calendars_for_owner_ui", {})
+    assert exc.value.reason == "bad_request"
+    assert "list_calendars_for_owner_ui" not in TOOL_CATALOG

@@ -91,3 +91,5 @@ a.hd-btn { text-decoration: none; display: inline-flex; align-items: center; }
   .pa-row a.hd-btn { width: 100%; justify-content: center; min-height: 40px; }
 }
 #pa-drafts .pa-msg, #pa-reminders .pa-msg { white-space: normal; }
+.pa-row--tight { margin-top: 6px; }
+.pa-fieldset legend { padding: 0; margin-bottom: 4px; }
