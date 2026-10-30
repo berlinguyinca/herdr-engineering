@@ -26,6 +26,23 @@ sections:
       minio_password: "REDACTED"
       rustfs_bucket: "REDACTED"
       ci_actions: false             # true lets operators retry/cancel CI pipelines
+      # OPTIONAL: hosts that are meant to be off (benchmark boxes, powered-off machines). They raise no host_stale item and
+      # are listed quietly as "Expected offline" on Attention. Host names or ids. Empty by default; REPLACE with your own.
+      # attention:
+      #   expected_offline_hosts: []     # e.g. ["beast", "bender"]
+      # OPTIONAL: prices for the Usage "Spend (est.)" tab and the PR trail cost figure, in dollars per million tokens.
+      # There are no built-in prices; without a table (or with any unpriced model) cost is shown as unknown.
+      # usage:
+      #   prices:
+      #     - {model: "claude-sonnet-*", input: 0.0, output: 0.0, cached: 0.0}   # REPLACE the zeros with your real prices
+      #     - {model: "qwen*", input: 0, output: 0}                              # self-hosted: say so with an explicit zero
+      # OPTIONAL: the Evolution tab's staleness limit (docs/agent-evolution.md) and the learning export
+      # (docs/learning-trails.md: records per merged PR, GET /api/v1/learning/trails). Both work with these defaults.
+      # evolution:
+      #   stale_after_minutes: 120
+      # learning:
+      #   enabled: true
+      #   require_role: operator          # operator | viewer; the export is fleet-wide
       # OPTIONAL: absolute path (as the web container sees it) to a checkout of InferWeave's
       # deploy/pipelines/*.yaml. Read live. Absent: no definitions, and any host token may report
       # deployment events for any component (the Deployments snapshot then carries a warning).
