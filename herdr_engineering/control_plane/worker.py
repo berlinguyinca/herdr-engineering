@@ -132,6 +132,31 @@ class ShareHousekeeper:
             return "error"
 
 
+class ArtifactReconciler:
+    """Runs the artifact registry's idempotent repair pass (``reconcile``: orphan blobs marked, expired uploads closed,
+    held tombstones purged) at most once per ``interval`` seconds; never raises out of the worker pass.
+
+    The worker has no graph emitter, so lineage re-emission (``emit``) is not part of this scheduled pass; whatever holds
+    an emitter can still call ``reconcile(emit=...)``."""
+
+    def __init__(self, store_factory, *, interval: float = 300.0, grace_seconds: float = 60.0,
+                 orphan_ttl_seconds: float = 24 * 3600.0, limit: int = 100, clock=time.time):
+        self.store_factory, self.interval, self._clock = store_factory, interval, clock
+        self.kwargs = {"grace_seconds": grace_seconds, "orphan_ttl_seconds": orphan_ttl_seconds, "limit": limit}
+        self._last: float | None = None
+
+    async def tick(self, conn) -> dict | str:
+        now = self._clock()
+        if self._last is not None and now - self._last < self.interval:
+            return "skipped"
+        self._last = now
+        try:
+            return await self.store_factory(conn).reconcile(**self.kwargs)
+        except Exception:  # noqa: BLE001
+            log.exception("artifact reconcile failed")
+            return "error"
+
+
 async def _run_artifact_job_pass(conn, *, worker_id: str,
                                  runner, max_jobs: int = 1) -> dict:
     # Claim and mark running atomically; release the row lock before rendering.
@@ -181,7 +206,7 @@ async def run_one_pass(conn, *, mission_store=None, session_store=None,
                        artifact_ttl=ARTIFACT_TTL, worker_id=None,
                        artifact_job_runner=None, max_artifact_jobs=1,
                        inspector_snapshotter=None, fabric_compactor=None,
-                       share_housekeeper=None) -> dict:
+                       share_housekeeper=None, artifact_reconciler=None) -> dict:
     summary: dict[str, Any] = {}
 
     # Stale services -> unavailable (never delete).
@@ -237,6 +262,8 @@ async def run_one_pass(conn, *, mission_store=None, session_store=None,
         summary["fabric_compaction"] = await fabric_compactor.tick(conn)
     if conn is not None and share_housekeeper is not None:
         summary["share_housekeeping"] = await share_housekeeper.tick(conn)
+    if conn is not None and artifact_reconciler is not None:
+        summary["artifact_reconcile"] = await artifact_reconciler.tick(conn)
     return summary
 
 

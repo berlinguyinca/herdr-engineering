@@ -8,7 +8,7 @@ Deploys are the operator's step.
 | P00 Audit | Done, except baseline screenshots (no Python Playwright on the host) | `audit/*`, `evidence/P00-RESULT.md`, smoke against production (GET only) | screenshots |
 | P01 Contracts, ids, broker | Merged (library only, nothing calls the broker yet) | herdr-engineering #364 | route wiring is P05 |
 | P02 Persistent Work Graph | Merged, flag off | herdr-engineering #387 (migrations 0033, 0034); Pi ids in pi-engineering #474 | scheduled live reconcile in production; graph UI |
-| P03 Artifacts | Foundation merged | #380 (provenance, ACL-filtered lookups, resumable uploads, archive/tombstone/purge, reconcile; 0031) and #376 (skill registry) | share-link delivery, WebUI gallery, CLI/Pi `/artifact`, room-derived read access, scheduled reconcile trigger, agent-role skill install receipt |
+| P03 Artifacts | Foundation merged; scheduled reconcile in the worker (off by default) | #380 (provenance, ACL-filtered lookups, resumable uploads, archive/tombstone/purge, reconcile; 0031) and #376 (skill registry) | share-link delivery, WebUI gallery, CLI/Pi `/artifact`, room-derived read access, scheduled reconcile trigger, agent-role skill install receipt |
 | P04 Room client (Pi) | Partial | pi-engineering #521: `/room log` on the existing client | live follow (streaming), keychain storage, interactive composer, `@agent` completion, user Bearer mode; not tested against a live HCN |
 | P05-P09 | Not started | | broker routing, attention/approval consolidation across seven mechanisms, Rakazo as an HCN participant, email/calendar/GitHub connectors, E2E and chaos tests |
 

@@ -5,6 +5,9 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Artifact registry: scheduled reconcile (unified workspace P03)
+- The worker can now run the registry's reconcile pass on a schedule: `control_plane.artifact_reconcile: {enabled, interval_seconds, grace_seconds, orphan_ttl_hours, limit}` in the fleet file (YAML only, off unless `enabled` is exactly true). It marks orphan blobs (never deletes them), closes expired uploads and purges tombstones past their hold window; lineage re-emission is not part of the scheduled pass. A failing pass is logged and never stops the worker.
+
 ### Unified workspace P05: safe retry of a task completion
 - `POST /api/v1/collab/tasks/{id}/update`: repeating a `done`/`failed` update with the identical result now returns `{"status": ..., "replayed": true}` and writes no second event (the agent's answer was lost, or it restarted). A different result or outcome on a finished task is still a 400, and a repeated `accepted` is still a 400 as before.
 
