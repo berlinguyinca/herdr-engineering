@@ -130,6 +130,20 @@ sections:
       #   delegation_consumer:
       #     enabled: false
       #     source_harness: pi
+      #   # Scheduled CI watch: every interval the server looks for NEW failed CI runs and queues repair / re-run
+      #   # PROPOSALS (nothing is merged, pushed or run without an approval). Off by default. Needs, per listed
+      #   # user: project_intelligence.enabled (no kill switch), a project_intelligence.assistant_viewers
+      #   # "<tenant>/<user>" entry, an enabled assistant and an active watch_ci grant (scope "*").
+      #   ci_watch:
+      #     enabled: false
+      #     interval_seconds: 300          # minimum 60
+      #     auto_grant: false              # true = create the standing watch_ci grant (30 day max, audited as
+      #                                    # actor system:ci_watch) when missing; false = log a WARNING hourly
+      #     # source: both                 # monitor (CI monitor snapshot) | lineage (ci graph nodes) | both
+      #     # max_age_seconds: 21600       # ignore failures that finished longer ago than this
+      #     users:                         # tenant_id: from personal_assistant.tenancy (default tenant is "default")
+      #       - {tenant_id: default, user_id: open-listener}        # the dashboard / open tailnet listener
+      #       - {tenant_id: default, user_id: "rakazo:<16 hex>"}    # a Rakazo bridge account (see README)
       #   # Real inference. When `endpoint` is set the service uses an HTTP
       #   # chat-completions runner (OpenAI-compatible, incl. tool-calling); when
       #   # empty it falls back to a deterministic local runner (skeleton only).
