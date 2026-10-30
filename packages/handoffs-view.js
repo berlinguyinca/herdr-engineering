@@ -49,6 +49,22 @@ export function handoffCard(h) {
 
 const list = (items) => (items && items.length ? `<ul>${items.map((i) => `<li>${esc(typeof i === 'string' ? i : JSON.stringify(i))}</li>`).join('')}</ul>` : '<p class="hd-muted">Nothing recorded.</p>');
 
+const bullets = (items) => (items && items.length ? items.map((i) => `- ${typeof i === 'string' ? i : JSON.stringify(i)}`).join('\n') : '(none recorded)');
+
+// The handoff exactly as one document: what the next agent was told, plus every recorded field. Plain text, so it can be copied
+// into a new session, a PR comment or an issue.
+export function handoffText(row) {
+  const side = (x) => [x?.harness, x?.agent_id && `@${x.agent_id}`, x?.session_id && `session ${x.session_id}`, x?.model_hint && `model ${x.model_hint}`].filter(Boolean).join(' · ') || 'unknown';
+  const refs = (row.artifact_refs || []).map((r) => `- ${typeof r === 'string' ? r : [r.artifact_id, r.version_id].filter(Boolean).join(' @ ') || JSON.stringify(r)}`).join('\n') || '(none)';
+  const prov = Object.entries(row.provenance || {}).map(([k, v]) => `- ${k}: ${typeof v === 'string' ? v : JSON.stringify(v)}`).join('\n') || '(none)';
+  return [`HANDOFF ${row.handoff_id} · ${String(row.state).replace('_', ' ')}`, `From: ${side(row.source)}`, `To:   ${side(row.target)}`,
+    row.mission_id ? `Mission: ${row.mission_id}` : '', row.room_id ? `Room: ${row.room_id}` : '',
+    `Created: ${row.created_at || '?'}${row.created_by ? ` by ${typeof row.created_by === 'string' ? row.created_by : row.created_by.id || JSON.stringify(row.created_by)}` : ''} · updated ${row.updated_at || '?'}`,
+    '', 'GOAL', String(row.goal || ''), '', 'ACCOMPLISHED', bullets(row.completed), '', 'MISSING / NEXT', bullets(row.remaining),
+    '', 'DECISIONS', bullets(row.decisions), '', 'RISKS', bullets(row.risks), '', 'VALIDATION', bullets(row.validation),
+    '', 'ARTIFACTS', refs, '', 'PROVENANCE', prov, '', 'HISTORY', (row.history || []).map((h) => `- ${h.state} at ${h.at}${h.actor?.id ? ` by ${h.actor.id}` : ''}`).join('\n') || '(none)'].filter((l, i, a) => l !== '' || a[i - 1] !== '').join('\n');
+}
+
 export function detailHtml(row, chain) {
   const hopItem = (h, i) => `<li${i === chain.position ? ' aria-current="step"' : ''}><button type="button" class="hd-hop${i === chain.position ? ' hd-hop--here' : ''}" data-handoff="${esc(h.handoff_id)}"
     ${i === chain.position ? 'aria-current="true"' : ''}><span class="hd-hop__who">${esc(agentName(h.source))} → ${esc(agentName(h.target))}</span><span class="hd-hop__state">${esc(String(h.state).replace('_', ' '))}</span>
@@ -61,12 +77,13 @@ export function detailHtml(row, chain) {
     <p><span class="hd-badge">${esc(String(row.state).replace('_', ' '))}</span> ${esc(SENTENCE[row.state] || '')} · updated ${esc(ago(row.updated_at))}${hint ? ` · model hint <code>${esc(hint)}</code>` : ''}</p>
     ${row.mission_id ? `<p class="hd-muted">Mission <a href="#/missions/${encodeURIComponent(row.mission_id)}">${esc(row.mission_id)}</a></p>` : ''}</header>
     ${hops ? `<h3>Where this sits in the work</h3><ol class="hd-chain" aria-label="Handoff chain, oldest first">${hops}</ol>` : ''}
-    <h3>Goal</h3><p class="hd-goal">${esc(row.goal || '')}</p>
+    <h3>Handoff text — what the next agent was told</h3><p class="hd-goal" data-handoff-goal>${esc(row.goal || '')}</p>
     <div class="hd-cols"><div><h3>Accomplished</h3>${list(row.completed)}</div><div><h3>Missing / what happens next</h3>${list(row.remaining)}</div></div>
     ${(row.decisions || []).length ? `<h3>Decisions</h3>${list(row.decisions)}` : ''}
     ${(row.risks || []).length ? `<h3>Risks</h3>${list(row.risks)}` : ''}
     ${(row.validation || []).length ? `<h3>Validation</h3>${list(row.validation)}` : ''}
-    <h3>History</h3><ol class="hd-history">${history}</ol></section>`;
+    <h3>History</h3><ol class="hd-history">${history}</ol>
+    <details class="hd-full" data-handoff-full><summary>Full handoff as text</summary><p><button type="button" data-handoff-copy>Copy to clipboard</button> <small class="hd-muted" data-handoff-copied hidden>Copied</small></p><pre class="hd-pre">${esc(handoffText(row))}</pre></details></section>`;
 }
 
 // Nodes are endpoints (agent, else session, else harness); edges are the handoffs between them.
@@ -143,6 +160,12 @@ export function mountHandoffs(container, client, { freshness = () => null, open 
     if (hit && container.contains(hit)) { void openHandoff(hit.dataset.handoff); return; }
     const head = ev.target.closest?.('.hd-ws__head');
     if (head) void toggleWorkspace(head.closest('[data-workspace]'));
+    const copy = ev.target.closest?.('[data-handoff-copy]');
+    if (copy) {
+      const text = copy.closest('[data-handoff-full]')?.querySelector('pre')?.textContent || '';
+      const done = () => { const note = copy.parentElement.querySelector('[data-handoff-copied]'); if (note) { note.hidden = false; setTimeout(() => { note.hidden = true; }, 2000); } };
+      navigator.clipboard?.writeText(text).then(done, () => {}); return;
+    }
     const route = ev.target.closest?.('[data-route]');
     if (route) { const card = route.closest('[data-workspace]'); card.__route = card.__route === route.dataset.route ? null : route.dataset.route; paint(card); return; }
     if (ev.target.closest?.('[data-route-clear]')) { const card = ev.target.closest('[data-workspace]'); card.__route = null; paint(card); return; }

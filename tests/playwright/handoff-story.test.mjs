@@ -46,6 +46,10 @@ test('overview shows workspaces and attention; a handoff opens accomplished, mis
     for (const part of ['accomplished', 'wrote the parser', 'missing / what happens next', 'add tests', 'model hint', 'qwen']) assert.ok(text.includes(part), part);
     assert.equal(await page.locator('.hd-chain .hd-hop').count(), 3);
     assert.equal(await page.locator('.hd-hop--here').getAttribute('data-handoff'), 'h2');
+    await page.locator('[data-handoff-full] summary').click();
+    const full = await page.locator('[data-handoff-full] pre').innerText();
+    for (const part of ['HANDOFF h2', 'GOAL', 'goal h2', 'wrote the parser', 'add tests']) assert.ok(full.includes(part), `full text has ${part}`);
+    assert.equal(await page.locator('[data-handoff-copy]').count(), 1);
 
     await page.locator('.hd-chain [data-handoff="h4"]').click();
     await until(() => page.locator('[data-handoff-detail] h2').count().then((n) => n === 1) && page.locator('[data-handoff-detail-body]').getAttribute('aria-label').then((a) => a === 'Handoff h4'), 'next hop');

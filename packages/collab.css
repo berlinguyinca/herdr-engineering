@@ -523,3 +523,7 @@ button.ctx-chip:focus-visible, .ctx-chip:focus-visible { outline: 2px solid curr
 .hd-history { padding-left: 18px; margin: 0; }
 .hd-row > span { margin-left: 10px; color: var(--text-muted); font-size: .8125rem; }
 .hd-row p { margin: 4px 0; }
+.hd-full { margin-top: 14px; }
+.hd-full summary { cursor: pointer; font-weight: 600; }
+.hd-pre { white-space: pre-wrap; overflow-wrap: anywhere; font: .8125rem/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; padding: 12px; border-radius: 8px; border: 1px solid var(--border-subtle); background: var(--surface-raised, var(--surface)); max-height: 60vh; overflow: auto; }
+.hd-goal { padding: 10px 12px; border-left: 3px solid var(--accent, #1f7ae0); background: var(--surface-raised, var(--surface)); border-radius: 0 8px 8px 0; }

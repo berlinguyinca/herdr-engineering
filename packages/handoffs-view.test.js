@@ -79,3 +79,15 @@ test('a chain reads as a labelled path with agents, goals and the current step m
   assert.match(html, /<ol class="hd-chain"/); assert.match(html, /@one → @two/); assert.match(html, /first leg/);
   assert.equal((html.match(/aria-current="step"/g) || []).length, 1); assert.ok(!html.includes('<img'));
 });
+
+import { handoffText } from './handoffs-view.js';
+
+test('the full handoff text carries every recorded field and nothing is trusted as markup', () => {
+  const row = { handoff_id: 'h1', state: 'in_progress', goal: `Continue the drain work.\n\nContext: ${HOSTILE}`, mission_id: 'm1', created_at: '2026-01-01T00:00:00Z', created_by: { id: 'op' },
+    source: { harness: 'pi', agent_id: 'a', session_id: 's1' }, target: { harness: 'pi', agent_id: 'b', model_hint: 'qwen' }, completed: ['parser'], remaining: ['tests'], decisions: [], risks: ['r'], validation: [],
+    artifact_refs: [{ artifact_id: 'art_1', version_id: 'ver_2' }], provenance: { checkpoint: 'abc123', cause: 'context_pressure' }, history: [{ state: 'queued', at: '2026-01-01T00:00:00Z', actor: { id: 'op' } }] };
+  const text = handoffText(row);
+  for (const part of ['HANDOFF h1 · in progress', 'From: pi · @a · session s1', 'model qwen', 'Mission: m1', 'Continue the drain work.', '- parser', '- tests', 'art_1 @ ver_2', '- checkpoint: abc123', '- cause: context_pressure', 'queued at 2026-01-01T00:00:00Z by op']) assert.ok(text.includes(part), part);
+  const html = detailHtml(row, null);
+  assert.ok(!html.includes('<img'), 'escaped'); assert.match(html, /data-handoff-full/); assert.match(html, /data-handoff-copy/); assert.match(html, /Handoff text/);
+});
