@@ -94,7 +94,8 @@ sections:
       #   enabled: false
       #   signing_secret: "REDACTED"       # >= 32 bytes; generate locally, never commit or print it:
       #                                    #   openssl rand -hex 32   (paste the output here)
-      #   session_seconds: 14400           # lab session lifetime (never past the share's expiry)
+      #   session_seconds: 14400           # lab session lifetime cap; also never past the share's expiry NOR the
+      #                                    # Cognito access token's exp (~1 h with pool defaults), so ~1 h in practice
       #   default_public_days: 30          # public links: 1-90 days
       #   max_share_bytes: 536870912       # one bundle
       #   max_total_bytes: 2147483648      # all live bundles
