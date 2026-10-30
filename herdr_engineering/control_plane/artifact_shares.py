@@ -13,11 +13,16 @@ Conventions:
 * ``get`` and ``live_expired`` return the row INCLUDING ``token_hash`` (internal: the API/worker derive the
   ``by-token/<hash>`` projection path from it).  Every other method returns rows WITHOUT it.
 * The token itself never reaches this module; ``new_token`` returns it once for the caller to show.
-* ``ingest_events_file`` consumes the append-only ``events.jsonl`` written by the database-free share container.  The
-  file is never truncated (the container may be appending concurrently, and a truncate would lose those bytes).
-  Instead a sidecar ``<file>.offset`` records ``{inode, offset}`` of the last fully consumed line, and every inserted
-  row carries ``ingest_key = sha256(line):<offset>`` under a unique index, so a crash between the insert and the
-  sidecar write replays harmlessly.  A final line without a trailing newline is left for the next run.
+* ``ingest_events_file`` consumes the append-only ``events.jsonl`` written by the database-free (untrusted) share
+  container.  The file is never truncated (the container may be appending concurrently).  A marker file records
+  ``{offset, fingerprint}`` of the consumed prefix; the fingerprint hashes the first and last bytes of that prefix, so a
+  file that was deleted/recreated (even with a reused inode) or rewritten is detected and re-read from 0.  Every
+  inserted row carries ``ingest_key = sha256(line):<offset>`` under a unique index, so replays (crash before the marker
+  write, or a restart from 0) never double-insert.  A final line without a newline is left for the next run.  Each line
+  is inserted in its own savepoint and a line that cannot be stored is skipped AND consumed, so one poison line never
+  wedges ingestion.  Only ``opened``/``denied`` are accepted from the file.  The marker defaults to
+  ``<file>.offset``, but the events directory is shared with the container, so the worker should pass ``marker_path``
+  inside a directory only it can write.
 """
 from __future__ import annotations
 
@@ -32,6 +37,8 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+import asyncpg
+
 from .share_bundle import BundleIndex
 
 __all__ = ["ShareStore", "ShareError", "new_token"]
@@ -45,6 +52,12 @@ _HEX64 = re.compile(r"[0-9a-f]{64}\Z")
 _EMAIL = re.compile(r"[^@\s]+@[^@\s]+\Z")
 _MAX_INGEST_BYTES = 16 * 1024 * 1024
 _MAX_LINE_BYTES = 16 * 1024
+_MAX_DETAIL_BYTES = 4096
+_MAX_ACTOR_CHARS = 200
+_FINGERPRINT_BYTES = 64
+# The share container writes the events file, so it may only report what it observed; the lifecycle kinds
+# (created/approved/revoked/expired) are written by this store alone.
+INGESTIBLE_KINDS = ("opened", "denied")
 
 _COLUMNS = ("share_id, artifact_id, version_id, audience, allow_emails, allow_groups, state, entry, file_count, "
             "total_bytes, title, expires_at, created_by, created_at, approved_by, approved_at, revoked_at")
@@ -167,10 +180,13 @@ class ShareStore:
                 raise ShareError("share has already expired")
             if await conn.fetchval("SELECT 1 FROM artifact_shares WHERE token_hash=$1", token_hash) is not None:
                 raise ShareError("token hash already in use")
-            record = await conn.fetchrow(
-                "UPDATE artifact_shares SET state='live', token_hash=$2, entry=$3, file_count=$4, total_bytes=$5, "
-                f"approved_by=$6, approved_at=now() WHERE share_id=$1 RETURNING {_COLUMNS}",
-                share_id, token_hash, index.entry, len(index.files), index.total_bytes, approved_by)
+            try:
+                record = await conn.fetchrow(
+                    "UPDATE artifact_shares SET state='live', token_hash=$2, entry=$3, file_count=$4, "
+                    f"total_bytes=$5, approved_by=$6, approved_at=now() WHERE share_id=$1 RETURNING {_COLUMNS}",
+                    share_id, token_hash, index.entry, len(index.files), index.total_bytes, approved_by)
+            except asyncpg.UniqueViolationError as exc:
+                raise ShareError("token hash already in use") from exc
             await self._event(conn, share_id, "approved", approved_by,
                               {"file_count": len(index.files), "total_bytes": index.total_bytes})
         return _row(record)
@@ -226,54 +242,87 @@ class ShareStore:
             "WHERE share_id=$1 ORDER BY at, event_id LIMIT $2", share_id, max(1, int(limit)))
         return [{**dict(r), "detail": json.loads(r["detail"])} for r in records]
 
-    async def ingest_events_file(self, path: Path) -> int:
+    async def ingest_events_file(self, path: Path, *, marker_path: Path | None = None) -> int:
         """Ingest complete JSON lines appended to ``path`` since the last run; returns rows inserted.
 
-        See the module docstring for the offset/idempotency design.  Lines that are not valid events (bad JSON,
-        unknown kind, missing fields, unknown share_id, oversize) are skipped but still consumed.
+        See the module docstring for the offset/fingerprint/idempotency design and why ``marker_path`` exists.
+        Invalid lines (bad JSON, NUL/surrogates, forbidden kind, missing fields, unknown share_id, oversize) are
+        skipped but consumed.  A line of at least ``_MAX_INGEST_BYTES`` without a newline is skipped through its end.
         """
         path = Path(path)
-        marker = path.with_name(path.name + ".offset")
+        marker = Path(marker_path) if marker_path is not None else path.with_name(path.name + ".offset")
         try:
             handle = path.open("rb")
         except FileNotFoundError:
             return 0
         with handle:
-            stat = os.fstat(handle.fileno())
-            offset = self._read_marker(marker, stat.st_ino)
-            if offset > stat.st_size:  # truncated or replaced: start over
-                offset = 0
+            size = os.fstat(handle.fileno()).st_size
+            offset, skipping = self._read_marker(marker, handle, size)
             handle.seek(offset)
             chunk = handle.read(_MAX_INGEST_BYTES)
-        end = chunk.rfind(b"\n") + 1  # only complete lines; a torn tail waits for its newline
-        if end == 0:
-            return 0
-        inserted = 0
-        async with _transaction(self._conn) as conn:
-            position = offset
-            for raw in chunk[:end].splitlines(keepends=True):
-                parsed = self._parse_line(raw)
-                if parsed is not None:
-                    share_id, kind, actor, at, detail = parsed
-                    key = hashlib.sha256(raw).hexdigest() + f":{position}"
-                    if await self._event(conn, share_id, kind, actor, detail, at, key):
-                        inserted += 1
-                position += len(raw)
-        self._write_marker(marker, stat.st_ino, offset + end)
+            full = len(chunk) >= _MAX_INGEST_BYTES
+            consumed = 0
+            inserted = 0
+            if skipping:  # discard the rest of an oversize line
+                newline = chunk.find(b"\n")
+                if newline < 0:
+                    consumed, skipping = len(chunk), True
+                else:
+                    consumed, skipping = newline + 1, False
+            start = consumed
+            end = chunk.rfind(b"\n") + 1  # only complete lines; a torn tail waits for its newline
+            if end > start:
+                async with _transaction(self._conn) as conn:
+                    position = offset + start
+                    for raw in chunk[start:end].splitlines(keepends=True):
+                        parsed = self._parse_line(raw)
+                        if parsed is not None:
+                            share_id, kind, actor, at, detail = parsed
+                            key = hashlib.sha256(raw).hexdigest() + f":{position}"
+                            try:
+                                async with _transaction(conn):
+                                    if await self._event(conn, share_id, kind, actor, detail, at, key):
+                                        inserted += 1
+                            except (asyncpg.PostgresError, UnicodeError, ValueError):
+                                pass  # poison line: skipped, but consumed below
+                        position += len(raw)
+                consumed = end
+            elif end == 0 and start == 0 and full:  # one huge line with no newline: skip it
+                consumed, skipping = len(chunk), True
+            if consumed == 0 and not skipping:
+                return 0
+            new_offset = offset + consumed
+            self._write_marker(marker, handle, new_offset, skipping)
         return inserted
 
     @staticmethod
-    def _parse_line(raw: bytes):
+    def _clean(value: Any) -> bool:
+        """True when no string in ``value`` (keys included) holds NUL or a surrogate (Postgres/UTF-8 reject them)."""
+        stack = [value]
+        while stack:
+            item = stack.pop()
+            if isinstance(item, str):
+                if any(c == "\x00" or "\ud800" <= c <= "\udfff" for c in item):
+                    return False
+            elif isinstance(item, dict):
+                stack.extend(item.keys())
+                stack.extend(item.values())
+            elif isinstance(item, list):
+                stack.extend(item)
+        return True
+
+    @classmethod
+    def _parse_line(cls, raw: bytes):
         if len(raw) > _MAX_LINE_BYTES:
             return None
         try:
             obj = json.loads(raw)
         except ValueError:
             return None
-        if not isinstance(obj, dict):
+        if not isinstance(obj, dict) or not cls._clean(obj):
             return None
         share_id, kind, actor = obj.get("share_id"), obj.get("kind"), obj.get("actor")
-        if not (isinstance(share_id, str) and share_id and kind in EVENT_KINDS
+        if not (isinstance(share_id, str) and share_id and kind in INGESTIBLE_KINDS
                 and isinstance(actor, str) and actor and isinstance(obj.get("at"), str)):
             return None
         try:
@@ -283,24 +332,40 @@ class ShareStore:
         if at.tzinfo is None:
             at = at.replace(tzinfo=UTC)
         detail = obj.get("detail")
-        return share_id, kind, actor, at, detail if isinstance(detail, dict) else {}
+        if not isinstance(detail, dict) or len(json.dumps(detail)) > _MAX_DETAIL_BYTES:
+            detail = {}
+        return share_id[:200], kind, actor[:_MAX_ACTOR_CHARS], at, detail
 
     @staticmethod
-    def _read_marker(marker: Path, inode: int) -> int:
+    def _fingerprint(handle: Any, offset: int) -> str:
+        """sha256 over the first and last ``_FINGERPRINT_BYTES`` of the consumed prefix ``[0, offset)``."""
+        n = min(_FINGERPRINT_BYTES, offset)
+        handle.seek(0)
+        first = handle.read(n)
+        handle.seek(offset - n)
+        last = handle.read(n)
+        return hashlib.sha256(first + b"|" + last).hexdigest()
+
+    @classmethod
+    def _read_marker(cls, marker: Path, handle: Any, size: int) -> tuple[int, bool]:
         try:
             data = json.loads(marker.read_text())
-            if data.get("inode") == inode and isinstance(data.get("offset"), int) and data["offset"] >= 0:
-                return data["offset"]
-        except (OSError, ValueError, AttributeError):
+            offset, skipping = data["offset"], bool(data.get("skipping", False))
+            if not isinstance(offset, int) or offset < 0 or offset > size:
+                return 0, False
+            if offset == 0 or cls._fingerprint(handle, offset) == data.get("fp"):
+                return offset, skipping
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
             pass
-        return 0
+        return 0, False
 
-    @staticmethod
-    def _write_marker(marker: Path, inode: int, offset: int) -> None:
+    @classmethod
+    def _write_marker(cls, marker: Path, handle: Any, offset: int, skipping: bool) -> None:
+        fp = cls._fingerprint(handle, offset) if offset else ""
         fd, tmp = tempfile.mkstemp(prefix=marker.name + ".", suffix=".tmp", dir=marker.parent)
         try:
             with os.fdopen(fd, "w") as fh:
-                json.dump({"inode": inode, "offset": offset}, fh)
+                json.dump({"offset": offset, "fp": fp, "skipping": skipping}, fh)
                 fh.flush()
                 os.fsync(fh.fileno())
             os.replace(tmp, marker)

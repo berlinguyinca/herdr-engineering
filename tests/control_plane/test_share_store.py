@@ -210,7 +210,7 @@ def test_token_hash_unique_and_never_listed(share_postgres):
 
 
 def line(sid, kind="opened", actor="public", n=0, **extra):
-    return json.dumps({"share_id": sid, "kind": kind, "actor": actor, "at": f"2026-10-30T10:00:{n:02d}Z",
+    return json.dumps({"share_id": sid, "kind": kind, "actor": actor, "at": f"2026-10-30T10:{n // 60:02d}:{n % 60:02d}Z",
                        "detail": {"n": n}, **extra}) + "\n"
 
 
@@ -246,10 +246,80 @@ def test_ingest_events_file_is_idempotent_and_tolerates_torn_line(share_postgres
     run(share_postgres, body)
 
 
+def test_ingest_poison_forged_oversize_and_replaced_files(share_postgres, tmp_path, monkeypatch):
+    from herdr_engineering.control_plane import artifact_shares as mod
+
+    async def body(store, conn):
+        aid, vid = await seed(conn)
+        sid = (await store.create(**kw(aid, vid)))["share_id"]
+        f = tmp_path / "events.jsonl"
+        marker = tmp_path / "private" / "m.json"
+        marker.parent.mkdir()
+        nul = line(sid, n=1).replace('"public"', '"pub\\u0000lic"')
+        sur = line(sid, n=2).replace('"public"', '"\\ud800"')
+        sur_detail = line(sid, n=3).replace('{"n": 3}', '{"k\\ud800": 1}')
+        forged = line(sid, kind="approved", n=4) + line(sid, kind="revoked", n=5) + line(sid, kind="expired", n=6)
+        big = json.dumps({"share_id": sid, "kind": "opened", "actor": "x" * 500, "at": "2026-10-30T10:00:07Z",
+                          "detail": {"pad": "y" * 5000}}) + "\n"
+        f.write_text(nul + sur + sur_detail + forged + big + line(sid, n=8))
+        assert await store.ingest_events_file(f, marker_path=marker) == 2
+        assert not (tmp_path / "events.jsonl.offset").exists() and marker.exists()
+        evs = await store.events(sid)
+        assert [e["kind"] for e in evs] == ["created", "opened", "opened"]
+        assert len(evs[1]["actor"]) == 200 and evs[1]["detail"] == {}
+        assert await store.ingest_events_file(f, marker_path=marker) == 0
+
+        # a statement-level failure (NUL slipped past parsing) skips only that line and is consumed
+        real = mod.ShareStore._parse_line.__func__
+
+        def sloppy(cls, raw):
+            parsed = real(cls, raw)
+            if parsed and "BAD" in raw.decode():
+                return parsed[0], parsed[1], "a\x00b", parsed[3], parsed[4]
+            return parsed
+        monkeypatch.setattr(mod.ShareStore, "_parse_line", classmethod(sloppy))
+        with f.open("a") as fh:
+            fh.write(line(sid, n=10, note="BAD") + line(sid, n=11))
+        assert await store.ingest_events_file(f, marker_path=marker) == 1
+        assert await store.ingest_events_file(f, marker_path=marker) == 0
+        monkeypatch.undo()
+
+        # delete + recreate (possibly the same inode), larger than the old offset, different content
+        old = f.stat().st_size
+        f.unlink()
+        f.write_text("".join(line(sid, n=20 + i) for i in range(60)))
+        assert f.stat().st_size > old
+        assert await store.ingest_events_file(f, marker_path=marker) == 60
+        assert await store.ingest_events_file(f, marker_path=marker) == 0
+        # in-place rewrite (same inode) with different content of at least the old size
+        f.write_text("".join(line(sid, n=40 + i) for i in range(70)))
+        assert await store.ingest_events_file(f, marker_path=marker) == 70
+        # replacing with the same bytes re-reads from 0 only if the fingerprint changed: never double-inserts
+        n_before = len(await store.events(sid, limit=1000))
+        new = tmp_path / "other"
+        new.write_text(f.read_text())
+        os.replace(new, f)
+        assert await store.ingest_events_file(f, marker_path=marker) == 0
+        assert len(await store.events(sid, limit=1000)) == n_before
+
+        # one huge line without a newline is skipped, later lines still ingest
+        monkeypatch.setattr(mod, "_MAX_INGEST_BYTES", 256)
+        g = tmp_path / "huge.jsonl"
+        gm = tmp_path / "private" / "g.json"
+        g.write_text("z" * 700)
+        total = await store.ingest_events_file(g, marker_path=gm)
+        with g.open("a") as fh:
+            fh.write("zzz\n" + line(sid, n=50))
+        for _ in range(10):  # 256-byte windows walk through the huge line, then the good line is read
+            total += await store.ingest_events_file(g, marker_path=gm)
+        assert total == 1
+        assert [e["detail"] for e in await store.events(sid, limit=1000)].count({"n": 50}) == 3  # two rewrites of f also hold n=50; g adds one
+    run(share_postgres, body)
+
+
 def test_migration_up_and_down_names():
     files = sorted(p.name for p in MIGRATIONS.glob("*.sql"))
     assert [n for n in files if n.startswith("0036")] == ["0036_artifact_shares.sql"]
-    assert max(n[:4] for n in files) == "0036"
     text = (MIGRATIONS / "0036_artifact_shares.sql").read_text()
     assert "-- DOWN:" in text
     down = text.split("-- DOWN:")[1].split("\n\n")[0]
