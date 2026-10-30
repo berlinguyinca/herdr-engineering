@@ -34,6 +34,7 @@ from typing import Any
 from . import rakazo_artifacts as artifacts
 from . import rakazo_bots as bots
 from . import rakazo_events as ev
+from . import rakazo_hindsight as hs
 from . import rakazo_memory as memory
 from . import rakazo_models as models
 from . import rakazo_prefs as pf
@@ -162,7 +163,7 @@ def rakazo_bridge_config(raw: Any, now: float | None = None) -> dict[str, Any]:
         return {"enabled": False}
     now = time.time() if now is None else now
     unknown = sorted(set(raw) - {"enabled", "accounts", "token_ttl_days", "max_tokens", "trusted_proxies",
-                                 "routine_runner_seconds"})
+                                 "routine_runner_seconds", "hindsight"})
     if unknown:
         raise ValueError(f"control_plane.rakazo_bridge has unknown keys: {', '.join(map(str, unknown))} "
                          "(accounts are listed under accounts: [{email, password_scrypt, role}])")
@@ -174,6 +175,12 @@ def rakazo_bridge_config(raw: Any, now: float | None = None) -> dict[str, Any]:
         return value
 
     runner = bounded("routine_runner_seconds", 0, 0, 3600)          # 0 = routines run only when tested from the app
+    hindsight = raw.get("hindsight")
+    if hindsight is not None:
+        if (not isinstance(hindsight, dict) or set(hindsight) != {"url", "token_file", "project", "cache_dir"}
+                or not all(isinstance(v, str) and v for v in hindsight.values())):
+            raise ValueError("control_plane.rakazo_bridge.hindsight must be {url, token_file, project, cache_dir} "
+                             "(the herdr-memory service; the token stays in its file)")
     ttl_days = bounded("token_ttl_days", 30, 1, 365)
     max_tokens = bounded("max_tokens", 5, 1, 50)
     proxies = raw.get("trusted_proxies", [])
@@ -211,7 +218,7 @@ def rakazo_bridge_config(raw: Any, now: float | None = None) -> dict[str, Any]:
             raise ValueError(f"{where}.collab_user must be a collaboration user id (letters, digits and . _ @ + : -)")
         accounts.append(Account(account_id, email_n, f"rakazo:{account_id}", role, params, cutoff, link))
     return {"enabled": True, "token_ttl_days": ttl_days, "max_tokens": max_tokens, "accounts": accounts,
-            "trusted_proxies": tuple(nets), "routine_runner_seconds": runner}
+            "trusted_proxies": tuple(nets), "routine_runner_seconds": runner, "hindsight": hindsight}
 
 
 # --------------------------------------------------------------------------------------------- tokens
@@ -637,6 +644,7 @@ class RakazoBridge:
         self.routines = routines.Routines(self, BridgeError)
         self.artifacts = artifacts.Artifacts(self, BridgeError, artifacts_fn)
         self.models = models.Models(self, BridgeError)
+        self.hindsight = hs.build(config.get("hindsight"))
         for name, fn in {**self.bots.procs(), **self.memory.procs(), **self.routines.procs(),
                          **self.artifacts.procs(), **self.models.procs()}.items():
             self._procs[name] = fn

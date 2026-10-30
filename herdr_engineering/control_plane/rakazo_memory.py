@@ -73,13 +73,18 @@ class Memory:
         expected = inp.get("expectedRevision")
         if expected is not None and expected != m.revision:
             raise self.Error(409, "CONFLICT", "This memory changed since you opened it.")
-        return self._view(self.b.svc.correct_memory(m.memory_id, tenant_id=ctx.tenant, user_id=ctx.user,
-                                                    new_content=content, source_ref="rakazo-app"))
+        saved = self.b.svc.correct_memory(m.memory_id, tenant_id=ctx.tenant, user_id=ctx.user,
+                                          new_content=content, source_ref="rakazo-app")
+        if self.b.hindsight is not None:
+            self.b.hindsight.retain(m.memory_id, content)
+        return self._view(saved)
 
     def remove(self, ctx, inp):
         m = self._one(ctx, inp.get("documentId"))
         self.b.prefs_put(ctx.account.account_id, ctx.space, HIDDEN_KIND, m.memory_id,
                          datetime.now(UTC).isoformat())
+        if self.b.hindsight is not None:
+            self.b.hindsight.forget(m.memory_id)       # the person's own removal also forgets the shared copy
         return {"ok": True}
 
     def export_markdown(self, ctx, inp):
@@ -145,6 +150,9 @@ class Memory:
                         break
             if len(hits) >= MAX_HITS:
                 break
+        if self.b.hindsight is not None and len(hits) < MAX_HITS:
+            hits += [{"kind": "message", "title": "Memory", "snippet": ev.snippet(t, 160)}
+                     for t in self.b.hindsight.recall(q, MAX_HITS - len(hits))]
         return {"hits": hits[:MAX_HITS]}
 
     # usage --------------------------------------------------------------------------------------------------
