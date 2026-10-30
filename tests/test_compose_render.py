@@ -137,3 +137,33 @@ def test_hostile_secret_round_trips_through_rendered_file_and_compose(tmp_path, 
         return v.replace("$$", "$")
     assert real(svc["postgres"]["environment"]["POSTGRES_PASSWORD"]) == value
     assert real(svc["rustfs"]["environment"]["MINIO_ROOT_PASSWORD"]) == value
+
+
+# The compose.yaml of the release before the apps mount, reduced to the part that matters: it still REQUIRES
+# HERDR_CP_GOOGLE_DIR. Rolling back builds this file with compose_run's environment. Remove with the transition.
+_PREVIOUS_COMPOSE = """
+services:
+  control-plane-web:
+    image: x
+    volumes:
+      - ${HERDR_CP_GITHUB_APP_DIR:?run deploy.sh}:/etc/herdr/github-app:ro
+      - ${HERDR_CP_GOOGLE_DIR:?run deploy.sh}:/etc/herdr/google:ro
+"""
+
+
+def test_a_rollback_to_the_previous_compose_still_renders_with_compose_runs_environment(tmp_path):
+    import re
+    script = (CP / "deploy.sh").read_text()
+    body = script[script.index("compose_run() {"):]
+    body = body[:body.index("\n}\n")]
+    assert 'HERDR_CP_GOOGLE_DIR="$APPS_DIR"' in body and "HERDR_CP_APPS_DIR=" in body
+    m = re.search(r'HERDR_CP_GOOGLE_DIR="\$APPS_DIR"', body)
+    assert m
+    apps = tmp_path / "apps"
+    apps.mkdir()
+    old = tmp_path / "compose.yaml"
+    old.write_text(_PREVIOUS_COMPOSE)
+    env = dict(os.environ, HERDR_CP_GITHUB_APP_DIR=str(tmp_path), HERDR_CP_GOOGLE_DIR=str(apps))
+    r = subprocess.run(["docker", "compose", "-p", "t", "-f", str(old), "config", "-q"],
+                       env=env, capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, r.stderr

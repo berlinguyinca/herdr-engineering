@@ -426,6 +426,7 @@ if [ "$DRY" = 1 ]; then
   echo "[dry-run] would run: herdr-eng fleet config render-compose --path <central> --out <file>"
   echo "[dry-run] control-plane-web and worker mount $FLEET_DIR read-only; the file is $MOUNT_TARGET"
   echo "[dry-run] control-plane-web mounts $GITHUB_APP_DIR read-only at /etc/herdr/github-app$([ -d "$GITHUB_APP_DIR" ] || echo ' (would create it empty, 0700)')"
+  echo "[dry-run] control-plane-web mounts $APPS_DIR read-only at /etc/herdr/apps$([ -d "$APPS_DIR" ] || echo ' (missing: a real deploy makes it empty, 0700; the operator adds apps.key)')"
   echo "[dry-run] control-plane-web mounts $PIPELINES_DIR read-only at /etc/herdr/pipelines$([ -d "$PIPELINES_DIR" ] || echo ' (missing: a real deploy creates it empty, 0755)'); after the build would install the herdr-pipelines-sync timer"
   echo "[dry-run] llm-proxy mounts only the llm slice (rendered to a temp dir; would install it at ~/.config/herdr-engineering/llm-proxy/)"
   if [ "$COLLAB" = 1 ]; then
@@ -625,8 +626,11 @@ compose_run() {
   local files=(-f "$tree/deploy/control-plane/compose.yaml")
   if [ "$COLLAB" = 1 ]; then files+=(-f "$tree/deploy/control-plane/compose.collab.yaml"); fi
   if [ -n "$ROLLBACK_IMAGES" ]; then files+=(-f "$ROLLBACK_IMAGES"); fi
+  # TRANSITION: a rollback to the release BEFORE the apps mount builds that release's compose.yaml, which still
+  # requires HERDR_CP_GOOGLE_DIR (mounted at /etc/herdr/google:ro). Docker would create a missing bind source as
+  # root, so point it at $APPS_DIR (exists, read-only, harmless). Remove after the next release.
   HERDR_CP_FLEET_DIR="$FLEET_DIR" HERDR_LLM_SLICE_DIR="$LLM_DIR" \
-    HERDR_CP_GITHUB_APP_DIR="$GITHUB_APP_DIR" HERDR_CP_APPS_DIR="$APPS_DIR" HERDR_CP_PIPELINES_DIR="$PIPELINES_DIR" HERDR_CP_IMAGE_TAG="$tag" HERDR_CP_GIT_COMMIT="$commit" \
+    HERDR_CP_GITHUB_APP_DIR="$GITHUB_APP_DIR" HERDR_CP_APPS_DIR="$APPS_DIR" HERDR_CP_GOOGLE_DIR="$APPS_DIR" HERDR_CP_PIPELINES_DIR="$PIPELINES_DIR" HERDR_CP_IMAGE_TAG="$tag" HERDR_CP_GIT_COMMIT="$commit" \
     docker compose --env-file "$envf" -p "$PROJECT" "${files[@]}" "$@"
 }
 

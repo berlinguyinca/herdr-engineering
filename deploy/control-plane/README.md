@@ -463,7 +463,7 @@ Each person connects their own Google account in the dashboard (Personal assista
 
    ```bash
    mkdir -p -m 700 ~/.config/herdr-engineering/apps
-   head -c 32 /dev/urandom > ~/.config/herdr-engineering/apps/apps.key
+   (umask 077; head -c 32 /dev/urandom > ~/.config/herdr-engineering/apps/apps.key)
    chmod 600 ~/.config/herdr-engineering/apps/apps.key
    ```
 

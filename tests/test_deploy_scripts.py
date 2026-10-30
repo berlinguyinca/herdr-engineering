@@ -1830,7 +1830,6 @@ def test_compose_mounts_the_apps_dir_read_only_into_web_only():
             assert not any("/etc/herdr/apps" in str(v) for v in svc.get("volumes") or []), name
     text = (ROOT / "deploy/control-plane/compose.yaml").read_text()
     assert "/etc/herdr/google" not in text and "HERDR_CP_GOOGLE_DIR" not in text
-    assert "GOOGLE_DIR" not in (ROOT / "deploy/control-plane/deploy.sh").read_text()
 
 
 def test_deploy_creates_an_empty_0700_apps_dir_and_never_the_key(env):
