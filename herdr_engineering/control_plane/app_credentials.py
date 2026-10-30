@@ -3,7 +3,8 @@
 Refresh tokens, OAuth client secrets and PKCE verifiers are sealed with Fernet; the 32-byte key is a file on the control
 plane, never in the database or config. Without a usable key file nothing can be saved (``AppsError("not_set_up")``).
 Memory is authoritative and the optional Postgres persistence is best effort, so a database problem never loses a
-connection that was just made. Tokens are never logged, never in a ``repr``, and never on ``Connection``.
+connection that was just made. Known limitation (accepted): a delete the database refused is retried from memory only,
+so if the process restarts before a retry succeeds, the saved row returns on the next load. Tokens are never logged, never in a ``repr``, and never on ``Connection``.
 """
 from __future__ import annotations
 
@@ -136,9 +137,20 @@ class PostgresCredentialPersistence:
                   (tenant, user, provider, json.dumps(ids)))
 
 
+def _serialized(fn):
+    def wrapper(self, *a, **k):
+        with self._plock:
+            return fn(self, *a, **k)
+    wrapper.__name__, wrapper.__doc__ = fn.__name__, fn.__doc__
+    return wrapper
+
+
 class CredentialStore:
     def __init__(self, box: SecretBox, persistence=None):
         self._box, self._p, self._lock = box, persistence, threading.Lock()
+        # Writers hold _plock across "change memory, then persist" so a tombstone retry and an upsert for the same key
+        # cannot interleave. Lock order is always _plock then _lock; readers take only _lock, so there is no cycle.
+        self._plock = threading.RLock()
         self._clients: dict[str, tuple[str, str]] = {}      # provider -> (client_id, sealed secret)
         self._conns: dict[tuple[str, str, str], dict] = {}  # (tenant, user, provider) -> row with sealed token
         self._tombstones: set[tuple[str, str, str]] = set()  # deletes the database has not confirmed yet
@@ -150,11 +162,9 @@ class CredentialStore:
                 for row in persistence.load_connections():
                     try:
                         t, u, p, account, scopes, status, ct, created = row
-                        if (t, u, p) in self._tombstones:
-                            continue
                         self._conns[(t, u, p)] = {
                             "account": account, "scopes": tuple(json.loads(scopes)), "status": status, "token_ct": ct,
-                            "created_at": created.isoformat() if hasattr(created, "isoformat") else str(created)}
+                            "created_at": created.astimezone(UTC).isoformat() if hasattr(created, "astimezone") else str(created)}
                     except Exception:  # noqa: BLE001 - one bad row must not hide the others
                         log.warning("app credentials: a saved connection row was skipped")
                 for t, u, p, ids in persistence.load_blocked():
@@ -163,7 +173,7 @@ class CredentialStore:
                 log.warning("app credentials: saved rows could not be loaded")
 
     def _persist(self, fn: Callable) -> None:
-        # Best effort and in call order: memory already changed, so a failed write is logged, never raised.
+        # Best effort, serialized by _plock (held by every writer): memory already changed, so a failed write is only logged.
         if self._p is None:
             return
         self._retry_tombstones()
@@ -173,18 +183,17 @@ class CredentialStore:
             log.warning("app credentials: the database could not be updated")
 
     def _retry_tombstones(self) -> None:
-        with self._lock:
-            pending = list(self._tombstones)
-        for key in pending:
-            try:
-                self._p.delete_connection(*key)
-            except Exception:  # noqa: BLE001
-                log.warning("app credentials: delete not persisted")
-                return
-            with self._lock:
+        with self._plock:
+            for key in list(self._tombstones):
+                try:
+                    self._p.delete_connection(*key)
+                except Exception:  # noqa: BLE001
+                    log.warning("app credentials: delete not persisted")
+                    return
                 self._tombstones.discard(key)
 
     # --- OAuth client (one per provider, shared by the whole deployment)
+    @_serialized
     def put_client(self, provider: str, client_id: str, client_secret: str) -> None:
         ct = self._box.seal(client_secret)
         with self._lock:
@@ -197,6 +206,7 @@ class CredentialStore:
         return None if row is None else (row[0], self._box.open(row[1]))
 
     # --- per-person connections
+    @_serialized
     def put_connection(self, tenant: str, user: str, provider: str, *, account: str, scopes: list[str],
                        refresh_token: str) -> None:
         ct = self._box.seal(refresh_token)
@@ -222,6 +232,7 @@ class CredentialStore:
         with self._lock:
             return [self._view(k[2], v) for k, v in sorted(self._conns.items()) if k[:2] == (tenant, user)]
 
+    @_serialized
     def set_status(self, tenant: str, user: str, provider: str, status: str) -> None:
         if status not in STATUSES:
             raise AppsError("bad_status")
@@ -232,14 +243,15 @@ class CredentialStore:
             row["status"] = status
         self._persist(lambda p: p.set_status(tenant, user, provider, status))
 
+    @_serialized
     def delete_connection(self, tenant: str, user: str, provider: str) -> None:
         key = (tenant, user, provider)
         with self._lock:
             self._conns.pop(key, None)
-            self._tombstones.add(key)
-        if self._p is None:
-            return
-        self._retry_tombstones()
+            if self._p is not None:
+                self._tombstones.add(key)
+        if self._p is not None:
+            self._retry_tombstones()
 
     def refresh_token(self, tenant: str, user: str, provider: str) -> str | None:
         with self._lock:
@@ -251,6 +263,7 @@ class CredentialStore:
         with self._lock:
             return list(self._blocked.get((tenant, user, provider), []))
 
+    @_serialized
     def set_blocked(self, tenant: str, user: str, provider: str, ids: list[str]) -> None:
         clean = list(dict.fromkeys(str(i) for i in ids))
         with self._lock:

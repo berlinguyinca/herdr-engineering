@@ -214,3 +214,19 @@ def test_postgres_persistence_upserts_commits_closes_and_loads():
     assert "assistant_app_blocked" in log[3][1] and "::jsonb" in log[3][1]
     log.clear()
     assert p.load_connections()[0][0] == "t" and [e[0] for e in log] == ["execute", "commit", "close"]
+
+
+def test_created_at_from_database_is_normalised_to_utc(box):
+    from datetime import datetime, timedelta, timezone
+    p = _Fake()
+    p.conn_rows[("t", "u", "gmail")] = ("a", [], "connected", box.seal("r"),
+                                        datetime(2026, 1, 1, 12, 0, tzinfo=timezone(timedelta(hours=-8))))
+    s = CredentialStore(box, p)
+    assert s.get_connection("t", "u", "gmail").created_at == "2026-01-01T20:00:00+00:00"
+
+
+def test_no_tombstone_without_persistence(box):
+    s = CredentialStore(box)
+    s.put_connection("t", "u", "gmail", account="a", scopes=[], refresh_token="r")
+    s.delete_connection("t", "u", "gmail")
+    assert s._tombstones == set()
