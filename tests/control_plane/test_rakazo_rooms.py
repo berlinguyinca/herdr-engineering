@@ -319,3 +319,19 @@ def test_auto_join_adds_own_agents_to_listed_rooms_only_when_the_operator_opts_i
     for bad in ("room", [1], ["x"] * 51, [""]):
         with pytest.raises(ValueError, match="auto_join_rooms"):
             rakazo_bridge_config(bridge_section(accounts=[ACCOUNTS[0]], auto_join_rooms=bad))
+
+
+def test_outside_bridges_are_the_apps_messaging_installations_and_can_be_cut_off(world):
+    inv = world.s.create_external_invite(world.alice, world.room, {"label": "tg", "actions": ["read", "post"]})
+    out = world.s.redeem_join_token({"token": inv["code"]})
+    status = ok(world.api, "messaging/status", {}, world.alice_t)
+    validate("messaging/status", status)
+    assert [i["botId"] for i in status["identities"]] == [out["agent_id"]]
+    listed = ok(world.api, "messaging/installations/list", {}, world.alice_t)
+    validate("messaging/installations/list", listed)
+    assert listed["installations"][0]["id"] == out["agent_id"] and listed["available"] is True
+    assert ok(world.api, "messaging/status", {}, world.bob_t)["identities"] == []           # bob sponsors nothing
+    assert world.api.rpc("messaging/installations/remove", {"id": out["agent_id"]}, world.bob_t)[0] == 404
+    gone = ok(world.api, "messaging/installations/remove", {"id": out["agent_id"]}, world.alice_t)
+    validate("messaging/installations/remove", gone)
+    assert ok(world.api, "messaging/installations/list", {}, world.alice_t)["installations"] == []

@@ -52,16 +52,6 @@
   "mcp/assignments/list": [],
   "messaging/channels/list": [],
   "messaging/connections/list": [],
-  "messaging/installations/list": {
-   "available": false,
-   "installations": []
-  },
-  "messaging/status": {
-   "enabled": false,
-   "identities": [],
-   "openSignup": false,
-   "providers": []
-  },
   "models/backups": [],
   "models/credentials": [],
   "models/forRole": [],

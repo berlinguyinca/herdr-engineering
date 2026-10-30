@@ -59,7 +59,40 @@ class Rooms:
         return {"groups/list": self.groups_list, "groups/listArchived": self.groups_list_archived,
                 "groups/get": self.groups_get, "groups/create": self.groups_create, "groups/update": self.groups_update,
                 "groups/archive": self.groups_archive, "groups/restore": self.groups_restore,
-                "groups/remove": self.groups_remove, "groups/duplicate": self.groups_duplicate}
+                "groups/remove": self.groups_remove, "groups/duplicate": self.groups_duplicate,
+                "messaging/status": self.messaging_status, "messaging/installations/list": self.installations_list,
+                "messaging/installations/remove": self.installations_remove}
+
+    # outside bridges (external agents) as the app's messaging installations ------------------------------------------
+    def _externals(self, ctx) -> list[dict[str, Any]]:
+        pr = self.principal(ctx, required=False)
+        return [] if pr is None else [a for a in self.my_agents(ctx, pr) if a.get("external")]
+
+    @staticmethod
+    def _where(info: dict[str, Any]) -> str:
+        return (info.get("rooms") or [{"name": ""}])[0]["name"]
+
+    def messaging_status(self, ctx, inp):
+        return {"enabled": self.linked(ctx), "providers": [], "openSignup": False, "addresses": {},
+                "identities": [{"id": a["agent_id"], "provider": a.get("harness_type") or "external",
+                                "address": self._where(a), "botId": a["agent_id"], "botName": a["name"]}
+                               for a in self._externals(ctx)]}
+
+    def installations_list(self, ctx, inp):
+        return {"available": self.linked(ctx), "personalLinkAvailable": False,
+                "installations": [{"id": a["agent_id"], "provider": a.get("harness_type") or "external",
+                                   "workspaceName": self._where(a), "botId": a["agent_id"], "botName": a["name"]}
+                                  for a in self._externals(ctx)]}
+
+    def installations_remove(self, ctx, inp):
+        """Cut an outside bridge off (revokes its credential; what it already posted stays)."""
+        pr = self.principal(ctx)
+        mine = {a["agent_id"]: a for a in self._externals(ctx)}
+        info = mine.get(inp.get("id"))
+        if info is None or not info.get("rooms"):
+            raise self.Error(404, "NOT_FOUND", "Not found.")
+        self.call(self.collab.revoke_external, pr, info["rooms"][0]["room_id"], info["agent_id"])
+        return {"ok": True}
 
     def linked(self, ctx) -> bool:
         return bool(ctx.account.collab_user and self.collab is not None)

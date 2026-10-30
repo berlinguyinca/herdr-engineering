@@ -169,3 +169,12 @@ Two things this does NOT do, because they change the shared pool: it does not cr
 client has no `USER_PASSWORD_AUTH` flow listed (its flows are legacy defaults), so a dedicated app client with
 `ALLOW_USER_PASSWORD_AUTH`, and a group such as `rakazo-users`, should be created in the pool by you before enabling this.
 Every member of `required_group` gets the `operator` role (the only role implemented), so keep that group small.
+
+### Update 10
+
+Outside systems join through the existing external-agent path instead of provider code in the control plane (see
+`docs/operations/external-bridges.md`): a reference client, a relay loop and a Telegram adapter (`herdr_engineering/external_bridge/`,
+`herdr-eng relay join|run`). In the app, the sponsor's external agents already appear as agent bots; they now report online while
+their heartbeat is fresh (`list_my_agents.online`), and `messaging/status`, `messaging/installations/list` and
+`messaging/installations/remove` list and revoke them. `messaging/installations/start` stays refused: the invite code is a
+one-time secret created in the dashboard, not a URL. Slack, voice and desktop hosts would be further adapters on the same client.

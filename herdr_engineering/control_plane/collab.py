@@ -2581,6 +2581,7 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                            and self._now() - r["created_epoch"] < REQUEST_TTL]
                 out.append({"agent_id": aid, "name": a["name"], "harness_type": a["harness_type"],
                             "instance_id": a.get("instance_id"), "external": bool(a.get("external")),
+                            "online": any(self._online(r["room_id"], "agent", aid) for r in rooms),
                             "status": a["status"], "expires_at": a["expires_at"], "rooms": rooms,
                             "pending": pending})
         return {"agents": out}

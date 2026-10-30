@@ -165,6 +165,16 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=_cmd_capabilities)
 
+    # relay ----------------------------------------------------------------
+    p = sub.add_parser("relay", help="Outbound bridge that joins a collaboration room as an external agent (Telegram)")
+    rsub = p.add_subparsers(dest="relay_command", required=True)
+    rp = rsub.add_parser("join", help="redeem a one-time invite code (read from a file or stdin, never an argument)")
+    rp.add_argument("--config", required=True)
+    rp.add_argument("--code-file", help="file holding the invite code; default is stdin")
+    rp.set_defaults(func=_cmd_relay_join)
+    rp = rsub.add_parser("run", help="bridge the provider and the room until revoked")
+    rp.add_argument("--config", required=True)
+    rp.set_defaults(func=_cmd_relay_run)
     # bridge ---------------------------------------------------------------
     p = sub.add_parser("bridge", help="Rakazo mobile bridge helpers (control_plane.rakazo_bridge)")
     bsub = p.add_subparsers(dest="bridge_command", required=True)
@@ -3677,6 +3687,27 @@ def _inspector_snapshot_settings(cp) -> tuple[bool, float]:
     if isinstance(interval, bool) or not isinstance(interval, (int, float)) or interval < 60:
         interval = 600
     return raw.get("enabled") is True, float(interval)
+
+
+def _cmd_relay_join(args):
+    import sys
+
+    from .external_bridge import config as bcfg
+    from .external_bridge.client import BridgeClient
+    cfg = bcfg.load(args.config)
+    code = (Path(args.code_file).read_text() if args.code_file else sys.stdin.readline()).strip()
+    client = BridgeClient.join(cfg["control_plane_url"], code, cfg["state_file"])
+    print(f"joined room {client.room_id} as {client.agent_id}; can post: {client.can_post}")
+    return 0
+
+
+def _cmd_relay_run(args):
+    from .external_bridge import config as bcfg
+    from .external_bridge.client import BridgeClient
+    from .external_bridge.relay import Relay
+    cfg = bcfg.load(args.config)
+    Relay(BridgeClient(cfg["state_file"]), bcfg.build_adapter(cfg)).run()
+    return 0
 
 
 def _cmd_bridge_hash_password(args):

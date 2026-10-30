@@ -37,8 +37,6 @@ READS = frozenset({
     "mcp/assignments/list",
     "messaging/channels/list",
     "messaging/connections/list",
-    "messaging/installations/list",
-    "messaging/status",
     "models/backups",
     "models/credentials",
     "models/forRole",

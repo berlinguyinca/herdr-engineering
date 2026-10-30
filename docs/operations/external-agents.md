@@ -55,7 +55,7 @@ virtual tab; the server roster stays.
   lineage route answers 404; enrollment, presence, chat, the roster and revocation work there.
 - An external agent can only link its own nodes (`spawn`); connecting it into local lineage (a handoff from a local agent) needs
   an operator key, because ordinary keys cannot see room-scoped nodes.
-- A bridge reference client is not part of this change; the protocol above is what a bridge implements.
+- A reference client now exists (`herdr_engineering/external_bridge/`, `external-bridges.md`).
 - The browser smoke test (`tests/playwright/external-agent-tab.test.mjs`) covers the virtual-tab renderer only. The invite
   form, the revoke button handler and the chat rendering of an `external` sender are exercised by unit tests and review, not in a
   real browser against a live server.
