@@ -60,7 +60,7 @@ test('timeline renders, escapes untrusted titles, and shows evidence on selectio
     await page.locator('.pi-item[data-event="e2"]').click();
     const pane = await page.locator('.pi-pane').innerText();
     assert.match(pane, /github:acme\/app/); assert.match(pane, /aaaaaaaaaaaa/);
-    assert.equal(await page.locator('.pi-pane a[href^="#/reviews?search="]').count(), 1, 'PR entity links through entity-links.js');
+    assert.equal(await page.locator('.pi-pane a[href="#/pr/acme/app/7"]').count(), 1, 'PR entity links through entity-links.js to its trail');
     assert.match(await page.locator('.pi-list').innerText(), /late arrival/);
     await page.locator('.pi-item[data-event="e3"]').click();
     assert.match(await page.locator('.pi-pane').innerText(), /No evidence reference/);

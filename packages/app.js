@@ -36,6 +36,7 @@ import { flash, skeleton } from './motion.js';
 import { noteStreamContact, freshnessSources } from './freshness.js';
 import { mountServices, mountServiceDetails } from './services-view.js';
 import { mountFabricServices } from './fabric-services-view.js';
+import { mountPrTrail } from './pr-trail-view.js';
 import { mountCollab, completeSignInIfRedirected } from './collab-view.js';
 import { mountAttention, attentionBadge, POLL_MS as ATTENTION_POLL_MS } from './attention-view.js';
 import { createAttentionNotifier } from './attention-notify.js';
@@ -86,7 +87,7 @@ const NAV = [
   { group: 'Fabric', path: '/llm', label: 'Usage', match: ['/analytics'] },
   { group: 'Delivery', path: '/ci', label: 'CI', match: ['/deployments'] },
   { group: 'Delivery', path: '/reviews', label: 'Reviews', match: ['/review-gate'] },
-  { group: 'Delivery', path: '/github', label: 'Projects', match: ['/github/projects'] },
+  { group: 'Delivery', path: '/github', label: 'Projects', match: ['/github/projects', '/pr'] },
   { group: 'Code', path: '/architecture', label: 'Architecture', capability: 'architecture_v1' },
   { group: 'Code', path: '/artifacts', label: 'Artifacts', match: ['/publications'] },
   { group: 'Code', path: '/intelligence', label: 'Project intelligence', capability: 'project_intelligence_v1' },
@@ -222,6 +223,7 @@ const ROUTES = {
   '/system-services': viewServices,
   '/local-services': viewServices,
   '/fabric-services': viewFabricServices,
+  '/pr/:owner/:repo/:number': viewPrTrail,
   '/services/:id': viewService,
   '/hosts': viewHosts,
   '/personal-assistant': viewPersonalAssistant,
@@ -374,9 +376,9 @@ function statusPage(html, ok, message) {
 // so the page does not jump on arrival.
 const BACK_LINK_SKELETON = '<div><span class="hd-skeleton hd-skeleton--line" style="display:inline-block;vertical-align:middle">&nbsp;</span></div>';
 function routeSkeleton(match, parts) {
-  const back = match.startsWith('/missions/:id') || match === '/herd/session/:id' ? BACK_LINK_SKELETON : match === '/llm/session/:id' || match.startsWith('/analytics') ? '<p style="font-size:13px"><span class="hd-skeleton hd-skeleton--line" style="display:inline-block;vertical-align:middle">&nbsp;</span></p>' : '';
+  const back = match.startsWith('/missions/:id') || match === '/herd/session/:id' ? BACK_LINK_SKELETON : match === '/llm/session/:id' || match.startsWith('/analytics') || match.startsWith('/pr/') ? '<p style="font-size:13px"><span class="hd-skeleton hd-skeleton--line" style="display:inline-block;vertical-align:middle">&nbsp;</span></p>' : '';
   const piMission = match === '/missions/:id' && (safeDecode(parts[1]) || '').startsWith('pi:');
-  const rows = piMission ? 1 : match === '/missions/:id/tests' || match === '/analytics/models' || match === '/analytics/hosts' || match === '/deployments' ? 2 : match === '/missions/:id/reviews' ? 4 : match === '/missions/:id' || match.startsWith('/llm') || match === '/herd/session/:id' || match === '/analytics' || match === '/analytics/missions' ? 8 : match === '/fabric-services' ? 2 : match.startsWith('/services') || match.endsWith('-services') ? 7 : 5;
+  const rows = piMission ? 1 : match === '/missions/:id/tests' || match === '/analytics/models' || match === '/analytics/hosts' || match === '/deployments' ? 2 : match === '/missions/:id/reviews' ? 4 : match === '/missions/:id' || match.startsWith('/llm') || match === '/herd/session/:id' || match === '/analytics' || match === '/analytics/missions' ? 8 : match === '/fabric-services' || match.startsWith('/pr/') ? 2 : match.startsWith('/services') || match.endsWith('-services') ? 7 : 5;
   return `<div data-skeleton aria-busy="true" role="status" aria-label="Loading page">${back}<div class="hd-live-head"><div class="hd-skeleton hd-skeleton--title"></div></div>${skeleton('page content', { rows, height: 64, bare: true })}</div>`;
 }
 
@@ -412,6 +414,12 @@ async function viewScheduling() {
 async function viewDeployments() {
   root.innerHTML = `${liveHead('<h1>Deployments</h1>')}<div id="deployments"></div>`;
   return mountDeployments(root.querySelector('#deployments'), client, { freshness: chipIn(root) });
+}
+
+async function viewPrTrail(parts) {
+  const [, owner, repo, number] = parts.map((p) => safeDecode(p) || '');
+  root.innerHTML = `<p style="font-size:13px"><a href="#/github">← Projects</a></p>${liveHead('<h1>How this pull request got here</h1>')}<div id="pr-trail"></div>`;
+  return mountPrTrail(root.querySelector('#pr-trail'), client, { owner, repo, number, host: route().query.get('host') || '', freshness: chipIn(root) });
 }
 
 async function viewHandoffs() {

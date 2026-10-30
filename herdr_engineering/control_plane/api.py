@@ -3112,6 +3112,33 @@ def _make_handler(server, public=False, operator=False):
                     return self._json({"error": "agent not found"}, 404)
                 view = server.ci_monitor.snapshot(start=False) if server.ci_monitor is not None else {}
                 return self._json(session_commits(session, r.list_sessions(), view, pull_requests=r.list_pull_requests()))
+            if resource == "pull-requests" and len(parts) == 8 and parts[7] == "trail":
+                import re as _re
+                from .pr_trail import TTLCache, build as build_pr_trail
+                from .reviews import ReviewService
+                host = _q(self.path, "host") or None
+                if not (_re.fullmatch(r"[A-Za-z0-9_.-]{1,100}", parts[4]) and _re.fullmatch(r"[A-Za-z0-9_.-]{1,100}", parts[5])
+                        and _re.fullmatch(r"[1-9][0-9]{0,9}", parts[6]) and (host is None or _re.fullmatch(r"[A-Za-z0-9.-]{1,253}", host))):
+                    return self._json({"error": "invalid pull request"}, 400)
+                cache = server.__dict__.setdefault("_pr_trail_cache", TTLCache(ttl=5.0, size=64))
+                cache_key = (parts[4].lower(), parts[5].lower(), int(parts[6]), (host or "").lower())
+                trail = cache.get(cache_key)
+                if trail is None:
+                    def _read(read):
+                        try:
+                            return read()
+                        except Exception:    # a source that cannot be read is reported as unavailable, never as empty
+                            return None
+                    view = server.ci_monitor.snapshot(start=False) if server.ci_monitor is not None else {}
+                    handoff_rows = _read(lambda: server.handoffs.list(limit=1000))
+                    trail = build_pr_trail(
+                        parts[4], parts[5], int(parts[6]), pull_requests=r.list_pull_requests(), sessions=r.list_sessions(), view=view,
+                        handoffs=handoff_rows, handoffs_truncated=handoff_rows is not None and len(handoff_rows) >= 1000, host=host,
+                        reviews=_read(r.list_reviews), plan_reviews=_read(ReviewService(r).list_reviews), prices=bool(server.usage_prices),
+                        spend=lambda sid: _read(lambda: r.llm_spend("30d", server.usage_prices, session=sid)))
+                    if trail is not None:
+                        cache.put(cache_key, trail)
+                return self._json(trail) if trail is not None else self._json({"error": "pull request not found"}, 404)
             if resource == "sessions" and len(parts) == 6 and parts[5] == "summary":
                 if r.get_session(parts[4]) is None:
                     return self._json({"error": "agent not found"}, 404)
