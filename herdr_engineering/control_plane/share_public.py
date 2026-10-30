@@ -42,6 +42,7 @@ from .share_bundle import ShareBundleError, content_type_for, normalise_name
 log = logging.getLogger("herdr.share_public")
 
 CHUNK_BYTES = 1024 * 1024
+WRITE_SLICE_BYTES = 64 * 1024
 EVENTS_MAX_BYTES = 8 * 1024 * 1024
 STATE_MAX_BYTES = 64 * 1024 * 1024
 DENIED_PER_MINUTE = 20          # denied events per reason per minute (a scanner cannot fill the events file)
@@ -210,12 +211,26 @@ def _open_beneath(root: Path, parts: list[str], *, max_size: int | None = None) 
     return fd, st
 
 
+@dataclass(frozen=True)
+class _Prepared:
+    """A parsed ``state.json`` with everything that depends only on its content already checked (the cached unit)."""
+
+    raw: dict
+    state: ShareState | None
+    reason: str
+    expires: float | None
+
+
 _cache_lock = threading.Lock()
-_state_cache: OrderedDict[tuple, dict] = OrderedDict()
+_state_cache: OrderedDict[tuple, _Prepared] = OrderedDict()
 
 
-def _read_state(root: Path, token: str) -> dict | None:
-    """The raw ``state.json`` for ``token`` (any state), or None. Opens and fstat's on every call; caches the parse."""
+def _read_state(root: Path, token: str) -> _Prepared | None:
+    """The prepared ``state.json`` for ``token`` (any state), or None.
+
+    Opens and fstat's the file on EVERY call (so a revoke or a republish is seen by the very next request); only the
+    parse and the content checks are cached, keyed by (dev, inode, mtime, ctime, size).
+    """
     if not isinstance(token, str) or not TOKEN_RE.fullmatch(token):
         return None
     token_hash = hashlib.sha256(token.encode("ascii")).hexdigest()
@@ -247,11 +262,12 @@ def _read_state(root: Path, token: str) -> dict | None:
         os.close(fd)
     if not isinstance(raw, dict):
         return None
+    prepared = _prepare(raw)
     with _cache_lock:
-        _state_cache[key] = raw
+        _state_cache[key] = prepared
         while len(_state_cache) > STATE_CACHE_SIZE:
             _state_cache.popitem(last=False)
-    return raw
+    return prepared
 
 
 def _expiry(value) -> float | None:
@@ -284,41 +300,53 @@ def _build_index(files) -> dict[str, dict]:
     return index
 
 
-def _check_state(raw: dict, now: float) -> tuple[ShareState | None, str]:
-    """(state, "") for a live, unexpired, well-formed share; else (None, reason code)."""
+def _prepare(raw: dict) -> _Prepared:
+    """Every check that does not depend on the clock: live, well formed, a public share has an expiry."""
+    def bad(reason: str) -> _Prepared:
+        return _Prepared(raw, None, reason, None)
+
     if raw.get("state") != "live":
-        return None, "not_live"
+        return bad("not_live")
     try:
         expires = _expiry(raw.get("expires_at"))
     except (ValueError, TypeError, OverflowError):
-        return None, "invalid_state"
+        return bad("invalid_state")
     if expires is None and raw.get("audience") == "public":
-        return None, "invalid_state"       # public shares always expire: fail closed
-    if expires is not None and now >= expires:
-        return None, "expired"
+        return bad("invalid_state")       # public shares always expire: fail closed
     share_id = raw.get("share_id")
     if (not isinstance(share_id, str) or not _SHARE_ID.fullmatch(share_id) or share_id == "by-token"
             or raw.get("audience") not in ("public", "lab")):
-        return None, "invalid_state"
+        return bad("invalid_state")
     try:
         index = _build_index(raw.get("files"))
         entry = normalise_name(raw.get("entry"))
     except (ValueError, ShareBundleError, TypeError):
-        return None, "invalid_state"
+        return bad("invalid_state")
     if entry not in index:
-        return None, "invalid_state"
+        return bad("invalid_state")
     state = ShareState(raw)
     state["entry"] = entry
     state.index = index
+    return _Prepared(raw, state, "", expires)
+
+
+def _check_state(prepared: _Prepared, now: float) -> tuple[ShareState | None, str]:
+    """(state, "") for a live, unexpired, well-formed share; else (None, reason code). The expiry is checked here, per call."""
+    if prepared.state is None:
+        return None, prepared.reason
+    if prepared.expires is not None and now >= prepared.expires:
+        return None, "expired"
+    state = ShareState(prepared.state)      # a per-request copy: callers cannot alter the cached state
+    state.index = prepared.state.index      # shared, read-only by convention
     return state, ""
 
 
 def load_state(root: Path, token: str, now: float) -> ShareState | None:
     """The share's state when ``token`` is well formed and its state is ``live``, unexpired and well formed; else None."""
-    raw = _read_state(root, token)
-    if raw is None:
+    prepared = _read_state(root, token)
+    if prepared is None:
         return None
-    return _check_state(raw, now)[0]
+    return _check_state(prepared, now)[0]
 
 
 # ----------------------------------------------------------------------------- request paths
@@ -531,7 +559,9 @@ def serve_bundle_file(handler, state: dict, rel_path: str, *, cors: bool = True,
                 if not chunk:          # the file shrank underneath us: the length promised cannot be kept
                     handler.close_connection = True
                     break
-                handler.wfile.write(chunk)
+                view = memoryview(chunk)
+                for at in range(0, len(view), WRITE_SLICE_BYTES):   # the socket timeout applies per slice
+                    handler.wfile.write(view[at:at + WRITE_SLICE_BYTES])
                 offset += len(chunk)
                 remaining -= len(chunk)
         except (OSError, ValueError):
@@ -629,12 +659,12 @@ class ShareHandler(BaseHTTPRequestHandler):
         is_file = len(parts) >= 5 and parts[3] == "f"
         if not (is_link or is_file):
             return deny(self, None, "unknown_route")
-        raw_state = _read_state(self.server.config.shares_root, parts[2])
-        if raw_state is None:
+        prepared = _read_state(self.server.config.shares_root, parts[2])
+        if prepared is None:
             return deny(self, None, "unknown_token")
-        state, reason = _check_state(raw_state, self.server.now())
+        state, reason = _check_state(prepared, self.server.now())
         if state is None:
-            return deny(self, raw_state, reason)
+            return deny(self, prepared.raw, reason)
         if state.get("audience") != "public":
             return deny(self, state, "audience")    # lab shares get their viewer in the lab routes
         if is_link:

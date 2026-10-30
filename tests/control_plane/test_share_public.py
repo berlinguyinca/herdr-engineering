@@ -550,3 +550,27 @@ def test_errors_never_log_the_token(env, capfd, monkeypatch):
     assert out.startswith(b"HTTP/1.1 404 ") and out.endswith(share_public.NOT_FOUND_BODY)
     captured = capfd.readouterr()
     assert TOKEN not in captured.out and TOKEN not in captured.err
+
+
+def test_state_index_is_built_once_per_state_file(env, monkeypatch):
+    calls = []
+    real = share_public._build_index
+
+    def counting(files):
+        calls.append(1)
+        return real(files)
+    monkeypatch.setattr(share_public, "_build_index", counting)
+    share_public._state_cache.clear()
+    for _ in range(5):
+        status, _, _ = env.request("GET", f("data/table.parquet"), {"Range": "bytes=0-9"})
+        assert status == 206
+    assert len(calls) == 1
+    # a republish (new inode) is seen by the next request and rebuilds once
+    write_state(env.root, env.token_hash, dict(env.state, files=[x for x in env.state["files"] if x["name"] != "pic.svg"]))
+    assert env.request("GET", f("pic.svg"))[0] == 404
+    assert env.request("GET", f("index.html"))[0] == 200
+    assert len(calls) == 2
+    # the per-request state is a copy: mutating it does not touch the cache
+    state = load_state(env.root, TOKEN, env.clock[0])
+    state["entry"] = "mutated"
+    assert load_state(env.root, TOKEN, env.clock[0])["entry"] == "index.html"
