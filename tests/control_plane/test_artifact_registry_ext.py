@@ -248,39 +248,58 @@ def test_archive_restore_tombstone_and_purge_respect_sharing_and_keep_evidence(r
 
 
 def test_reconcile_relinks_a_crashed_publish_once_marks_orphans_and_expires_uploads(registry_pg):
+    # registry_pg is shared by the whole module, so other tests' ledger rows and blobs can be picked up by any
+    # reconcile pass: assert only on THIS test's version, ledger row and blob, never on global report counts.
     blobs = FakeBlobs()
     emitted = []
+
+    def record(v):
+        emitted.append(v["version_id"])
+        return {"error": None}
 
     async def body(store, connection):
         artifact_id, version = await publish(store, blobs, owner="o", name="a.md", media="text/markdown", data=b"a",
                                              origin={"task_id": uid("task")})
-        ledger = await connection.fetchrow("SELECT * FROM artifact_publish_ledger WHERE version_id=$1", version["version_id"])
-        assert ledger["state"] == "committed" and ledger["source_event_id"] == f"art-{version['version_id']}"
+        vid = version["version_id"]
+
+        async def ledger_state():
+            return (await connection.fetchrow("SELECT state FROM artifact_publish_ledger WHERE version_id=$1", vid))["state"]
+
+        ledger = await connection.fetchrow("SELECT * FROM artifact_publish_ledger WHERE version_id=$1", vid)
+        assert ledger["state"] == "committed" and ledger["source_event_id"] == f"art-{vid}"
         # Within the grace window nothing is touched (the request thread may still be emitting).
-        assert (await store.reconcile(emit=emitted.append, grace_seconds=3600))["relinked"] == 0
+        await store.reconcile(emit=record, grace_seconds=3600)
+        assert vid not in emitted and await ledger_state() == "committed"
         await connection.execute("UPDATE artifact_publish_ledger SET committed_at=now() - interval '1 hour' WHERE version_id=$1",
-                                 version["version_id"])
+                                 vid)
         failing = await store.reconcile(emit=lambda v: {"error": "graph down"}, grace_seconds=1)
         assert failing["relink_failed"] >= 1
-        row = await connection.fetchrow("SELECT state, last_error, attempts FROM artifact_publish_ledger WHERE version_id=$1", version["version_id"])
+        row = await connection.fetchrow("SELECT state, last_error, attempts FROM artifact_publish_ledger WHERE version_id=$1", vid)
         assert row["state"] == "committed" and row["last_error"] == "graph down"
-        ok = await store.reconcile(emit=lambda v: emitted.append(v["version_id"]) or {"error": None}, grace_seconds=1)
-        assert ok["relinked"] >= 1 and version["version_id"] in emitted
-        again = await store.reconcile(emit=lambda v: emitted.append(v["version_id"]) or {"error": None}, grace_seconds=1)
-        assert again["relinked"] == 0 and emitted.count(version["version_id"]) == 1       # no duplicate emission
-        await store.mark_linked(version["version_id"])
+        ok = await store.reconcile(emit=record, grace_seconds=1)
+        assert ok["relinked"] >= 1 and emitted.count(vid) == 1
+        relinked_state = await ledger_state()
+        assert relinked_state != "committed"
+        await store.reconcile(emit=record, grace_seconds=1)
+        assert emitted.count(vid) == 1 and await ledger_state() == relinked_state       # no duplicate emission
+        await store.mark_linked(vid)
         # Orphaned scoped blob: verified, old, referenced by no version.
         data = b"stray upload"
         key, sha = blobs.put(data)
         await store.register_report_blob(artifact_id, storage_key=key, sha256=sha, size_bytes=len(data), media_type="text/plain")
         await connection.execute("UPDATE artifact_blobs SET created_at=now() - interval '2 days' WHERE scope=$1 AND blob_sha256=$2",
                                  artifact_id, sha)
-        report = await store.reconcile(emit=emitted.append, orphan_ttl_seconds=3600)
-        assert report["orphans_marked"] == 1 and blobs.head(key)                 # marked, never deleted
-        assert [o["blob_sha256"] for o in await store.list_orphan_blobs() if o["artifact_id"] == artifact_id] == [sha]
+
+        async def orphan_marked():
+            return (await connection.fetchrow("SELECT orphan_marked_at FROM artifact_blobs WHERE scope=$1 AND blob_sha256=$2",
+                                              artifact_id, sha))["orphan_marked_at"] is not None
+
+        report = await store.reconcile(emit=None, orphan_ttl_seconds=3600)
+        assert report["orphans_marked"] >= 1 and await orphan_marked() and blobs.head(key)   # marked, never deleted
         _, v2 = await publish(store, blobs, owner="o", name="s.txt", media="text/plain", data=data,
-                              base=version["version_id"], artifact_id=artifact_id)
-        assert (await store.reconcile(emit=None, orphan_ttl_seconds=3600))["orphans_cleared"] == 1
+                              base=vid, artifact_id=artifact_id)
+        assert (await store.reconcile(emit=None, orphan_ttl_seconds=3600))["orphans_cleared"] >= 1
+        assert not await orphan_marked()
 
     run(with_store(registry_pg["dsn"], blobs, body))
 
