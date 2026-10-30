@@ -22,4 +22,4 @@ python -m pytest -q
 echo "== client tests =="
 npm ci --no-audit --no-fund       # the component tests import playwright
 npx playwright install chromium     # one component test drives a real browser; a no-op when cached
-node --test --test-timeout=300000 packages/herdr-web-client/*.test.js packages/herdr-web-components/*.test.js
+node --test --test-timeout=300000 packages/herdr-web-client/*.test.js packages/herdr-web-components/*.test.js packages/*.test.js

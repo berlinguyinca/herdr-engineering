@@ -3,17 +3,21 @@ import assert from 'node:assert/strict';
 import {
   renderShareForm, renderShareRow, renderSummary, renderEvents, renderLinkDialog,
   buildShareRequest, eventCounts, defaultForm, createShareController,
+  renderPendingReview, renderShareList, mountSharePanel,
 } from './artifact-share-panel.js';
 
 const IMG = '<img src=x onerror=alert(1)>';
 const SCRIPT = '"><script>alert(1)</script>';
-const HOSTILE = [IMG, SCRIPT];
+const QUOTE = '" autofocus onfocus="x';
+const HOSTILE = [IMG, SCRIPT, QUOTE];
 const SECRET_URL = 'https://share.example/s/TOKEN-abc123/';
 
 const assertInert = html => {
   assert.doesNotMatch(html, /<img/i);
   assert.doesNotMatch(html, /<script/i);
   assert.doesNotMatch(html, /"><script/);
+  assert.doesNotMatch(html, /" autofocus/);
+  assert.doesNotMatch(html, /onfocus="/);
 };
 
 const versions = [
@@ -37,10 +41,11 @@ test('the form offers Private / Group (lab) / Public and defaults to Private wit
   assert.match(html, /<button[^>]*data-share-action="review"[^>]*disabled/);
 });
 
-test('private stays disabled even with a reviewed share pending', () => {
+test('a pending share can be generated whatever the form audience shows', () => {
   const html = renderShareForm(formState({ audience: 'private' }, { pending: { shareId: 's1', summary: {} } }));
   assert.match(html, /No link is created/);
-  assert.match(html, /<button[^>]*data-share-action="generate"[^>]*disabled/);
+  assert.match(html, /<button[^>]*data-share-action="review"[^>]*disabled/);
+  assert.doesNotMatch(html, /<button[^>]*data-share-action="generate"[^>]*disabled/);
 });
 
 test('the public form shows a required expiry (default 30, 1-90) and no lab fields', () => {
@@ -85,7 +90,7 @@ test('the form escapes hostile values in every field and version id', () => {
       versions: [{ version_id: bad, version_number: bad, state: 'ready' }], headVersionId: bad,
     });
     assertInert(html);
-    assert.match(html, /&lt;/);
+    assert.match(html, /&lt;|&quot;/);
   }
 });
 
@@ -322,7 +327,9 @@ test('a failed Generate shows the escaped server error, no link, and refreshes t
   const before = client.count('list');
   await ctrl.generate();
   assert.equal(ctrl.state.link, null);
-  assert.equal(ctrl.state.error, SCRIPT);
+  assert.ok(ctrl.state.error.startsWith(SCRIPT));
+  assert.match(ctrl.state.error, /revoke it and generate a new one/);
+  assert.equal(ctrl.state.pending, null, 'a 409 means the share is no longer pending');
   assert.equal(ctrl.state.busy, false);
   assert.ok(client.count('list') > before);
 });
@@ -334,6 +341,7 @@ test('editing the form after Review drops the reviewed share, and a new Review c
   await ctrl.review();
   ctrl.setField('title', 'changed');
   assert.equal(ctrl.state.pending, null);
+  assert.match(ctrl.state.notice, /Review & generate/, 'the set-aside share is announced with its way back');
   await ctrl.generate();
   assert.equal(client.count('approve'), 0);
   await ctrl.review();
@@ -371,7 +379,7 @@ test('Revoke asks first, revokes once and refreshes', async () => {
   assert.ok(client.count('list') >= 1);
 });
 
-test('events load lazily once per share and the toggle closes them', async () => {
+test('events load lazily, dedupe in-flight reads and reload when reopened', async () => {
   const client = fakeClient({ events: { share_id: 'share_1', events: [{ kind: 'opened' }, { kind: 'denied' }] } });
   const ctrl = controller(client);
   // A quick open/close/open while the first read is in flight still reads once.
@@ -384,7 +392,7 @@ test('events load lazily once per share and the toggle closes them', async () =>
   assert.equal(ctrl.state.events.get('share_1').open, false);
   await ctrl.toggleEvents('share_1');
   assert.equal(ctrl.state.events.get('share_1').open, true);
-  assert.equal(client.count('events'), 1, 'reopening reuses the loaded events');
+  assert.equal(client.count('events'), 2, 'reopening reloads the events');
   assert.match(renderShareRow(liveShare, ctrl.state.events.get('share_1')), /1 opened · 1 denied/);
 });
 
@@ -406,4 +414,242 @@ test('an aborted route signal disposes the controller', async () => {
   const ctrl = controller(fakeClient(), { signal: route.signal });
   route.abort();
   assert.equal(ctrl.disposed, true);
+});
+
+// ------------------------------------------------------------------ fix round 1
+
+const pendingShare = { share_id: 'share_p', state: 'pending', audience: 'lab', allow_emails: ['p@x.org'], allow_groups: [], expires_at: '2026-12-24T00:00:00+00:00', version_id: 'v1' };
+const showPending = { share: pendingShare, summary: { file_count: 1, total_bytes: 9, files: [{ name: 'p.html', size_bytes: 9 }], warnings: [] } };
+const withShow = (client, show) => { client.getArtifactShare = (...args) => { client.calls.push(['show', ...args]); return typeof show === 'function' ? show(...args) : Promise.resolve(show); }; return client; };
+
+test('a pending row offers Review & generate, disabled (like Revoke) while a call is in flight', () => {
+  const html = renderShareRow(pendingShare);
+  assert.match(html, /<button[^>]*data-share-action="continue"[^>]*data-share-id="share_p"[^>]*>Review &amp; generate</);
+  assert.doesNotMatch(renderShareRow({ ...pendingShare, state: 'live' }), /data-share-action="continue"/);
+  const busy = renderShareRow(pendingShare, undefined, { busy: true });
+  assert.match(busy, /<button[^>]*data-share-action="continue"[^>]*disabled/);
+  assert.match(busy, /<button[^>]*data-share-action="revoke"[^>]*disabled/);
+  assert.doesNotMatch(renderShareRow(pendingShare), /data-share-action="revoke"[^>]*disabled/);
+});
+
+test('resume loads the pending share, shows its own audience, recipients and expiry, and generate approves it once', async () => {
+  const client = withShow(fakeClient(), showPending);
+  const ctrl = controller(client);
+  await ctrl.resume('share_p');
+  assert.deepEqual(client.calls.find(call => call[0] === 'show').slice(1, 3), ['art1', 'share_p']);
+  assert.equal(ctrl.state.pending.shareId, 'share_p');
+  assert.equal(ctrl.state.form.audience, 'private', 'the form is untouched');
+  const review = renderPendingReview(ctrl.state.pending);
+  assert.match(review, /Group \(lab\)/);
+  assert.match(review, /p@x\.org/);
+  assert.match(review, /2026-12-24/);
+  assert.match(review, /p\.html/);
+  assert.doesNotMatch(renderShareForm({ ...ctrl.state }), /<button[^>]*data-share-action="generate"[^>]*disabled/);
+  await Promise.all([ctrl.generate(), ctrl.generate()]);
+  assert.equal(client.count('approve'), 1);
+  assert.equal(client.calls.find(call => call[0] === 'approve')[2], 'share_p');
+  assert.equal(ctrl.state.link.url, SECRET_URL);
+  assert.equal(ctrl.state.pending, null);
+});
+
+test('resume with a summary_error shows it escaped and keeps Generate disabled', async () => {
+  const client = withShow(fakeClient(), { share: pendingShare, summary_error: IMG });
+  const ctrl = controller(client);
+  await ctrl.resume('share_p');
+  assert.equal(ctrl.state.pending, null);
+  assert.ok(ctrl.state.error.includes(IMG));
+  assert.match(renderShareForm({ ...ctrl.state }), /<button[^>]*data-share-action="generate"[^>]*disabled/);
+  const notPending = controller(withShow(fakeClient(), { share: { ...pendingShare, state: 'live' } }));
+  await notPending.resume('share_p');
+  assert.equal(notPending.state.pending, null);
+  assert.match(notPending.state.error, /live/);
+});
+
+test('a failed approve keeps the pending share so Retry works, and warns about a live link', async () => {
+  let fail = true;
+  const client = fakeClient({ approve: () => (fail ? Promise.reject(Object.assign(new Error('gateway timeout'), { status: 504 })) : Promise.resolve({ share: {}, url: SECRET_URL, summary: {} })) });
+  const ctrl = controller(client);
+  ctrl.setField('audience', 'public');
+  await ctrl.review();
+  await ctrl.generate();
+  assert.equal(ctrl.state.link, null);
+  assert.equal(ctrl.state.pending.shareId, 'share_new');
+  assert.match(ctrl.state.error, /gateway timeout/);
+  assert.match(ctrl.state.error, /If this link now shows as live, revoke it and generate a new one\./);
+  fail = false;
+  await ctrl.generate();
+  assert.equal(client.count('approve'), 2);
+  assert.equal(ctrl.state.link.url, SECRET_URL);
+});
+
+test('resume after a failed approve lets the retry succeed', async () => {
+  let fail = true;
+  const client = withShow(fakeClient({ approve: () => (fail ? Promise.reject(new Error('network')) : Promise.resolve({ share: {}, url: SECRET_URL, summary: {} })) }), showPending);
+  const ctrl = controller(client);
+  await ctrl.resume('share_p');
+  await ctrl.generate();
+  fail = false;
+  await ctrl.resume('share_p');
+  await ctrl.generate();
+  assert.equal(ctrl.state.link.url, SECRET_URL);
+});
+
+test('an approve the server refuses as no longer pending drops the pending share', async () => {
+  for (const status of [409, 410]) {
+    const client = withShow(fakeClient({ approve: () => Promise.reject(Object.assign(new Error('share is live; a link is issued only once'), { status })) }), showPending);
+    const ctrl = controller(client);
+    await ctrl.resume('share_p');
+    await ctrl.generate();
+    assert.equal(ctrl.state.pending, null);
+    assert.match(ctrl.state.error, /issued only once/);
+  }
+});
+
+test('create and approve get the long write deadline; reads keep the short one', async () => {
+  const deadlines = [];
+  const client = withShow(fakeClient(), showPending);
+  const ctrl = controller(client, { timeout: ms => { deadlines.push(ms); return new AbortController().signal; } });
+  await ctrl.refresh();
+  assert.deepEqual(deadlines, [15000]);
+  deadlines.length = 0;
+  ctrl.setField('audience', 'public');
+  await ctrl.review();
+  assert.equal(deadlines[0], 5 * 60 * 1000);
+  deadlines.length = 0;
+  await ctrl.generate();
+  assert.equal(deadlines[0], 5 * 60 * 1000);
+  // The default deadline factory never gives create or approve a 15 s timeout.
+  const real = fakeClient();
+  const signals = [];
+  real.approveArtifactShare = (id, sid, { signal }) => { signals.push(signal); return Promise.resolve({ share: {}, url: SECRET_URL, summary: {} }); };
+  const live = controller(real);
+  live.setField('audience', 'public');
+  await live.review();
+  await live.generate();
+  assert.equal(signals[0].aborted, false);
+});
+
+test('after each action the list is re-read and open drawers reload; the first 10 live rows get counts', async () => {
+  const shares = Array.from({ length: 12 }, (_, index) => ({ ...liveShare, share_id: `s${index}` }));
+  shares.push({ ...liveShare, share_id: 'r1', state: 'revoked' });
+  const client = fakeClient({ list: { shares }, events: (id, sid) => (sid === 's1' ? Promise.reject(new Error('quiet')) : Promise.resolve({ events: [{ kind: 'opened' }] })) });
+  const ctrl = controller(client);
+  await ctrl.refresh();
+  const eager = client.calls.filter(call => call[0] === 'events').map(call => call[2]);
+  assert.deepEqual(eager.sort(), Array.from({ length: 10 }, (_, index) => `s${index}`).sort());
+  assert.match(renderShareRow(shares[0], ctrl.state.events.get('s0')), /1 opened · 0 denied/);
+  assert.doesNotMatch(renderShareRow(shares[1], ctrl.state.events.get('s1')), /quiet|opened ·/, 'an eager failure stays silent');
+  await ctrl.toggleEvents('r1');
+  const before = client.calls.filter(call => call[0] === 'events' && call[2] === 'r1').length;
+  await ctrl.revoke('s0', () => true);
+  await tick(); await tick();
+  assert.ok(client.calls.filter(call => call[0] === 'events' && call[2] === 'r1').length > before, 'an open drawer reloads after an action');
+});
+
+test('a 404 or 503 list read is a quiet "not available" note without Retry', async () => {
+  for (const status of [404, 503]) {
+    const ctrl = controller(fakeClient({ list: () => Promise.reject(Object.assign(new Error(QUOTE), { status })) }));
+    await ctrl.refresh();
+    assert.equal(ctrl.state.listUnavailable, true);
+    const html = renderShareList(ctrl.state);
+    assert.match(html, /Sharing is not available for this artifact/);
+    assert.doesNotMatch(html, /data-share-action="retry"/);
+    assertInert(html);
+  }
+  const other = controller(fakeClient({ list: () => Promise.reject(Object.assign(new Error(QUOTE), { status: 500 })) }));
+  await other.refresh();
+  const html = renderShareList(other.state);
+  assert.match(html, /data-share-action="retry"/);
+  assertInert(html);
+});
+
+// A minimal fake DOM: the mount's regions are plain objects holding the HTML strings it writes, so the test can see
+// every string the panel ever renders and the one input whose .value carries the URL.
+function fakeContainer() {
+  const listeners = {};
+  const makeNode = () => {
+    const node = {
+      html: '', inputs: {}, buttons: {},
+      get innerHTML() { return node.html; },
+      set innerHTML(value) { node.html = String(value); node.inputs = {}; node.buttons = {}; written.push(node.html); },
+      replaceChildren() { node.innerHTML = ''; },
+      querySelector(selector) {
+        if (selector === '[data-share-url]') return node.html.includes('data-share-url') ? (node.inputs.url ||= { value: '', focus() {}, select() {} }) : null;
+        if (selector === '[data-share-copy-status]') return node.html.includes('data-share-copy-status') ? (node.inputs.copy ||= { textContent: '' }) : null;
+        const action = selector.match(/data-share-action="(\w+)"/)?.[1];
+        if (action) return node.html.includes(`data-share-action="${action}"`) ? (node.buttons[action] ||= { disabled: false }) : null;
+        return null;
+      },
+    };
+    return node;
+  };
+  const written = [];
+  const regions = {};
+  const container = makeNode();
+  Object.defineProperty(container, 'innerHTML', {
+    get() { return container.html + Object.values(regions).map(region => region.html).join(''); },
+    set(value) {
+      container.html = String(value); written.push(container.html);
+      for (const key of Object.keys(regions)) delete regions[key];
+      for (const [, name] of container.html.matchAll(/data-share-([a-z]+)(?:-region)?[=>\s]/g)) regions[name] ||= makeNode();
+    },
+  });
+  container.isConnected = true;
+  container.written = written;
+  container.regions = regions;
+  container.querySelector = selector => {
+    const named = selector.match(/^\[data-share-([a-z]+)(?:-region)?\]$/)?.[1];
+    if (named && regions[named]) return regions[named];
+    for (const region of Object.values(regions)) { const found = region.querySelector(selector); if (found) return found; }
+    return null;
+  };
+  container.replaceChildren = () => { container.innerHTML = ''; };
+  container.contains = () => true;
+  container.addEventListener = (type, fn) => { (listeners[type] ||= new Set()).add(fn); };
+  container.removeEventListener = (type, fn) => { listeners[type]?.delete(fn); };
+  container.click = (action, extra = {}) => { for (const fn of listeners.click || []) fn({ target: { closest: () => ({ dataset: { shareAction: action, ...extra }, disabled: false }) } }); };
+  container.listenerCount = () => Object.values(listeners).reduce((sum, set) => sum + set.size, 0);
+  return container;
+}
+
+test('the mount puts the URL only in the dialog input value and drops it on Close and on dispose', async () => {
+  const container = fakeContainer();
+  const client = fakeClient();
+  const panel = mountSharePanel(container, client, 'art1', { versions, headVersionId: 'v2' });
+  await tick();
+  assert.match(container.innerHTML, /data-share-action="review"/);
+  panel.controller.setField('audience', 'public');
+  await panel.controller.review();
+  assert.match(container.regions.review.html, /Review before generating/);
+  await panel.controller.generate();
+  await tick();
+  assert.equal(container.querySelector('[data-share-url]').value, SECRET_URL);
+  assert.match(container.regions.link.html, /This link cannot be shown again/);
+  container.click('close');
+  await tick();
+  assert.equal(container.regions.link.html, '');
+  assert.equal(container.querySelector('[data-share-url]'), null);
+  // Again, then dispose while the dialog is open.
+  await panel.controller.review();
+  await panel.controller.generate();
+  assert.equal(container.querySelector('[data-share-url]').value, SECRET_URL);
+  panel.dispose();
+  assert.equal(container.innerHTML, '');
+  assert.equal(container.querySelector('[data-share-url]'), null);
+  assert.equal(container.listenerCount(), 0);
+  assert.ok(container.written.length > 5);
+  for (const html of container.written) assert.doesNotMatch(html, /TOKEN-abc123/, 'no rendered string ever carried the URL');
+});
+
+test('the mount routes a pending row click to resume and renders the pending share review', async () => {
+  const container = fakeContainer();
+  const client = withShow(fakeClient({ list: { shares: [pendingShare] } }), showPending);
+  const panel = mountSharePanel(container, client, 'art1', { versions, headVersionId: 'v2' });
+  await tick(); await tick();
+  assert.match(container.regions.list.html, /data-share-action="continue"/);
+  container.click('continue', { shareId: 'share_p' });
+  await tick(); await tick();
+  assert.equal(client.count('show'), 1);
+  assert.match(container.regions.review.html, /p@x\.org/);
+  panel.dispose();
 });

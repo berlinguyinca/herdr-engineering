@@ -11,6 +11,13 @@ const AUDIENCE_LABEL = Object.fromEntries(AUDIENCES);
 const PUBLIC_DEFAULT_DAYS = '30';
 const REVOCABLE = new Set(['pending', 'live']);
 const MAX_LAB_DAYS = 3650;
+const READ_MS = 15000;
+// Create dry-runs and approve copies up to the share cap (512 MiB) before answering: a short client deadline could
+// abort a request the server completes, and the one-time URL in its answer would be lost.
+const WRITE_MS = 5 * 60 * 1000;
+const EAGER_COUNTS = 10;
+const LIVE_HINT = 'If this link now shows as live, revoke it and generate a new one.';
+const SET_ASIDE = 'The form changed, so the reviewed link was set aside. Review again, or use "Review & generate" on its row in the list.';
 
 const humanSize = value => {
   if (value === null || value === undefined || value === '') return 'size unknown';
@@ -33,11 +40,12 @@ export function defaultForm(headVersionId) {
 const shareableVersions = versions => (versions || []).filter(version => version && version.version_id && (!version.state || version.state === 'ready'));
 
 // Which form buttons are disabled; shared by the renderer and the mount (which updates them without re-rendering inputs).
+// Generate acts on the reviewed pending share shown in the review region, not on the form, so it does not depend on
+// the form's audience.
 export function formButtons(state) {
-  const privateAudience = state.form.audience === 'private';
   return {
-    review: Boolean(state.busy || privateAudience || !state.form.versionId),
-    generate: Boolean(state.busy || privateAudience || !state.pending),
+    review: Boolean(state.busy || state.form.audience === 'private' || !state.form.versionId),
+    generate: Boolean(state.busy || !state.pending),
   };
 }
 
@@ -112,16 +120,36 @@ export function renderEvents(events) {
   }).join('')}</ul>`;
 }
 
+const recipientsOf = share => (share.audience === 'public' ? ['Anyone with the link'] : [...(share.allow_emails || []), ...(share.allow_groups || [])]);
+
+// The reviewed pending share: its own audience, recipients and expiry (which may differ from the form) and the files.
+export function renderPendingReview(pending) {
+  if (!pending) return '';
+  const share = pending.share || {};
+  const recipients = recipientsOf(share);
+  return `<div class="hd-card" data-share-review style="${wrap}"><h3>Review before generating</h3><p>Share <code>${esc(pending.shareId)}</code> · ${esc(audienceLabel(share.audience ?? pending.summary?.audience))} · Recipients: ${recipients.map(item => esc(item)).join(', ') || 'none'} · Expires: ${share.expires_at ? esc(share.expires_at) : 'Never'}</p>${renderSummary(pending.summary)}<p>Generate link publishes exactly these files to these people.</p></div>`;
+}
+
 // eventsEntry: undefined (not loaded) or { open, loading, events, error } from the controller.
-export function renderShareRow(share, eventsEntry) {
-  const recipients = share.audience === 'public' ? ['Anyone with the link'] : [...(share.allow_emails || []), ...(share.allow_groups || [])];
+export function renderShareRow(share, eventsEntry, { busy = false } = {}) {
+  const recipients = recipientsOf(share);
+  const off = busy ? ' disabled' : '';
   const counts = Array.isArray(eventsEntry?.events) ? eventCounts(eventsEntry.events) : null;
   const id = esc(share.share_id);
   let drawer = '';
   if (eventsEntry?.open) {
     drawer = `<div data-share-events>${eventsEntry.loading ? '<p role="status">Loading events…</p>' : eventsEntry.error ? `<p role="alert">Events unavailable: ${esc(eventsEntry.error)}</p>` : renderEvents(eventsEntry.events)}</div>`;
   }
-  return `<li data-share-row data-share-id="${id}" style="${wrap}"><p><strong>${esc(share.title || share.share_id)}</strong> · ${esc(audienceLabel(share.audience))} · <span data-share-state>${esc(share.state || 'unknown')}</span></p><p>Recipients: ${recipients.map(item => esc(item)).join(', ') || 'none'} · Version <code>${esc(share.version_id || '')}</code> · Expires: ${share.expires_at ? esc(share.expires_at) : 'Never'}</p><p data-share-counts>${counts ? `${counts.opened} opened · ${counts.denied} denied` : 'Open the events to see opened/denied counts.'}</p><div class="hd-inline" style="flex-wrap:wrap"><button type="button" class="hd-btn" data-share-action="events" data-share-id="${id}" aria-expanded="${eventsEntry?.open ? 'true' : 'false'}">${eventsEntry?.open ? 'Hide events' : 'Events'}</button>${REVOCABLE.has(share.state) ? `<button type="button" class="hd-btn" data-share-action="revoke" data-share-id="${id}">Revoke</button>` : ''}</div>${drawer}</li>`;
+  return `<li data-share-row data-share-id="${id}" style="${wrap}"><p><strong>${esc(share.title || share.share_id)}</strong> · ${esc(audienceLabel(share.audience))} · <span data-share-state>${esc(share.state || 'unknown')}</span></p><p>Recipients: ${recipients.map(item => esc(item)).join(', ') || 'none'} · Version <code>${esc(share.version_id || '')}</code> · Expires: ${share.expires_at ? esc(share.expires_at) : 'Never'}</p><p data-share-counts>${counts ? `${counts.opened} opened · ${counts.denied} denied` : 'Open the events to see opened/denied counts.'}</p><div class="hd-inline" style="flex-wrap:wrap"><button type="button" class="hd-btn" data-share-action="events" data-share-id="${id}" aria-expanded="${eventsEntry?.open ? 'true' : 'false'}">${eventsEntry?.open ? 'Hide events' : 'Events'}</button>${share.state === 'pending' ? `<button type="button" class="hd-btn" data-share-action="continue" data-share-id="${id}"${off}>Review &amp; generate</button>` : ''}${REVOCABLE.has(share.state) ? `<button type="button" class="hd-btn" data-share-action="revoke" data-share-id="${id}"${off}>Revoke</button>` : ''}</div>${drawer}</li>`;
+}
+
+export function renderShareList(state) {
+  if (state.shares) {
+    return state.shares.length ? `<ul class="hd-share-list" style="list-style:none;padding:0">${state.shares.map(share => renderShareRow(share, state.events?.get(share.share_id), { busy: state.busy })).join('')}</ul>` : '<herdr-empty message="No links yet"></herdr-empty>';
+  }
+  if (state.listUnavailable) return '<p class="hd-note" data-share-unavailable>Sharing is not available for this artifact.</p>';
+  if (state.listError) return `<herdr-error message="${esc(`Links unavailable: ${state.listError}`)}"></herdr-error><button type="button" class="hd-btn" data-share-action="retry">Retry</button>`;
+  return '<p role="status">Loading links…</p>';
 }
 
 // The dialog holds an empty readonly input; the mount sets its .value so the URL never enters any HTML string.
@@ -131,12 +159,12 @@ export function renderLinkDialog(summary) {
 
 // ------------------------------------------------------------------------------------------------ controller
 
-export function createShareController(client, artifactId, { versions = [], headVersionId, allowEntry = true, signal, onChange = () => {} } = {}) {
+export function createShareController(client, artifactId, { versions = [], headVersionId, allowEntry = true, signal, onChange = () => {}, timeout = ms => AbortSignal.timeout(ms) } = {}) {
   const ready = shareableVersions(versions);
   const head = ready.some(version => version.version_id === headVersionId) ? headVersionId : ready[0]?.version_id;
   const state = {
     form: defaultForm(head), versions, headVersionId, allowEntry,
-    shares: null, listError: null, listLoading: false,
+    shares: null, listError: null, listUnavailable: false, listLoading: false,
     busy: false, pending: null, link: null, error: null, notice: '',
     events: new Map(),
   };
@@ -144,24 +172,60 @@ export function createShareController(client, artifactId, { versions = [], headV
   let listGeneration = 0, actionGeneration = 0;
   const ctrl = { state, disposed: false };
   const live = () => !ctrl.disposed;
-  const bounded = () => AbortSignal.any([aborter.signal, AbortSignal.timeout(15000)]);
+  const read = () => AbortSignal.any([aborter.signal, timeout(READ_MS)]);
+  const write = () => AbortSignal.any([aborter.signal, timeout(WRITE_MS)]);
   const changed = kind => { if (live()) onChange(kind); };
+
+  // One share's events; a read already in flight is reused. Errors are shown only in an open drawer.
+  const loadEvents = shareId => {
+    const entry = state.events.get(shareId) || { open: false };
+    state.events.set(shareId, entry);
+    if (entry.loading) return entry.loading;
+    entry.error = null;
+    entry.loading = (async () => {
+      try {
+        const result = await client.artifactShareEvents(artifactId, shareId, { signal: read() });
+        if (!live()) return;
+        if (!Array.isArray(result?.events)) throw new Error('Invalid events response');
+        entry.events = result.events;
+      } catch (error) {
+        if (live()) entry.error = message(error);
+      } finally {
+        entry.loading = null;
+        changed('events');
+      }
+    })();
+    changed('events');
+    return entry.loading;
+  };
 
   ctrl.refresh = async () => {
     if (!live()) return;
     const ticket = ++listGeneration;
     state.listLoading = true; changed('list');
+    let shares = null;
     try {
-      const result = await client.listArtifactShares(artifactId, { signal: bounded() });
+      const result = await client.listArtifactShares(artifactId, { signal: read() });
       if (!live() || ticket !== listGeneration) return;
       if (!Array.isArray(result?.shares)) throw new Error('Invalid share list response');
-      state.shares = result.shares; state.listError = null;
+      shares = result.shares;
+      state.shares = shares; state.listError = null; state.listUnavailable = false;
     } catch (error) {
       if (!live() || ticket !== listGeneration) return;
       state.shares = null; state.listError = message(error);
+      state.listUnavailable = error?.status === 404 || error?.status === 503;
     } finally {
       if (live() && ticket === listGeneration) { state.listLoading = false; changed('list'); }
     }
+    if (!shares) return;
+    // Cached events are stale after any change: keep only open drawers (reloaded) and counts for the first live rows.
+    const eager = shares.filter(share => share.state === 'live').slice(0, EAGER_COUNTS).map(share => share.share_id);
+    const reload = new Set(eager);
+    for (const [shareId, entry] of state.events) {
+      if (entry.open) reload.add(shareId);
+      else if (!reload.has(shareId) && !entry.loading) state.events.delete(shareId);
+    }
+    await Promise.allSettled([...reload].map(loadEvents));
   };
 
   // One state-changing call at a time; the flag is set before the first await so a double click is a no-op.
@@ -181,9 +245,10 @@ export function createShareController(client, artifactId, { versions = [], headV
     if (!live() || !(name in state.form)) return;
     state.form[name] = String(value ?? '');
     if (name === 'audience' && state.form.audience === 'public' && !state.form.publicDays) state.form.publicDays = PUBLIC_DEFAULT_DAYS;
-    // The reviewed summary no longer describes the form: Generate must wait for a new Review.
-    const hadPending = Boolean(state.pending);
-    state.pending = null;
+    // The reviewed summary no longer describes the form. The share stays pending on the server and can be resumed
+    // from its row ("Review & generate").
+    const hadPending = Boolean(state.pending) && !state.busy;
+    if (hadPending) { state.pending = null; state.notice = SET_ASIDE; }
     if (name === 'audience') changed('form');
     else if (hadPending) changed('pending');
   };
@@ -195,22 +260,44 @@ export function createShareController(client, artifactId, { versions = [], headV
     catch (error) { state.error = message(error); changed('error'); return; }
     state.link = null; state.pending = null;
     await action(async current => {
-      const result = await client.createArtifactShare(artifactId, body, { signal: bounded() });
+      const result = await client.createArtifactShare(artifactId, body, { signal: write() });
       if (!current()) return;
       if (!result?.share?.share_id) throw new Error('The server did not return the new share.');
-      state.pending = { shareId: result.share.share_id, summary: result.summary || null };
+      state.pending = { shareId: result.share.share_id, summary: result.summary || null, share: result.share };
     }, 'Checking what this link would expose…');
   };
 
-  ctrl.generate = async () => {
-    if (!live() || state.busy || !state.pending || state.form.audience === 'private') return;
-    // Take the reviewed share now: a failed or repeated click can never approve it (or another) twice.
-    const { shareId } = state.pending;
-    state.pending = null; state.link = null;
+  // Load a pending share created earlier (from its row) so it can be reviewed and generated.
+  ctrl.resume = async shareId => {
+    if (!live() || state.busy || !shareId) return;
     await action(async current => {
-      const result = await client.approveArtifactShare(artifactId, shareId, { signal: bounded() });
+      state.pending = null;
+      const result = await client.getArtifactShare(artifactId, shareId, { signal: read() });
       if (!current()) return;
-      if (typeof result?.url !== 'string' || !result.url) throw new Error('The server did not return a link.');
+      const share = result?.share;
+      if (share?.state !== 'pending') throw new Error(`This share is ${share?.state || 'unknown'}; a link is issued only once. Use Review to create a new one.`);
+      if (!result.summary) throw new Error(`This share cannot be generated: ${result.summary_error || 'the server returned no summary'}`);
+      state.pending = { shareId, summary: result.summary, share };
+    }, 'Loading the pending share…');
+  };
+
+  ctrl.generate = async () => {
+    if (!live() || state.busy || !state.pending) return;
+    const { shareId } = state.pending;
+    state.link = null;
+    await action(async current => {
+      let result;
+      try {
+        result = await client.approveArtifactShare(artifactId, shareId, { signal: write() });
+      } catch (error) {
+        // 409/410: the share is no longer pending (already live, revoked or expired), so it cannot be generated
+        // again. Any other failure keeps it: approve is retryable while the share is pending.
+        if (current() && (error?.status === 409 || error?.status === 410)) state.pending = null;
+        throw new Error(`${message(error)} ${LIVE_HINT}`);
+      }
+      if (!current()) return;
+      if (typeof result?.url !== 'string' || !result.url) throw new Error(`The server did not return a link. ${LIVE_HINT}`);
+      state.pending = null;
       state.link = { url: result.url, summary: result.summary || null };
     }, 'Generating the link…');
   };
@@ -218,28 +305,19 @@ export function createShareController(client, artifactId, { versions = [], headV
   ctrl.revoke = async (shareId, ask = text => globalThis.confirm?.(text) ?? false) => {
     if (!live() || state.busy || !shareId) return;
     if (!ask('Revoke this link? People who have it will no longer be able to open it.')) return;
-    await action(async () => { await client.revokeArtifactShare(artifactId, shareId, { signal: bounded() }); }, 'Revoking the link…');
+    await action(async () => { await client.revokeArtifactShare(artifactId, shareId, { signal: write() }); }, 'Revoking the link…');
   };
 
+  // Opening a drawer always re-reads its events (a read in flight is reused); closing keeps nothing stale for long:
+  // the next list refresh drops closed entries that are not eager-count rows.
   ctrl.toggleEvents = async shareId => {
     if (!live() || !shareId) return;
     const entry = state.events.get(shareId);
     if (entry?.open) { entry.open = false; changed('events'); return; }
-    if (entry) { entry.open = true; if (entry.loading || Array.isArray(entry.events)) { changed('events'); return; } }
     const next = entry || { open: true };
-    next.loading = true; next.error = null;
-    state.events.set(shareId, next); changed('events');
-    try {
-      const result = await client.artifactShareEvents(artifactId, shareId, { signal: bounded() });
-      if (!live()) return;
-      if (!Array.isArray(result?.events)) throw new Error('Invalid events response');
-      next.events = result.events;
-    } catch (error) {
-      if (!live()) return;
-      next.error = message(error);
-    } finally {
-      if (live()) { next.loading = false; changed('events'); }
-    }
+    next.open = true;
+    state.events.set(shareId, next);
+    await loadEvents(shareId);
   };
 
   ctrl.closeLink = () => {
@@ -281,7 +359,7 @@ export function mountSharePanel(container, client, artifactId, { versions = [], 
       }
     }
     status.innerHTML = state.error ? `<p role="alert">${esc(state.error)}</p>` : state.notice ? `<p>${esc(state.notice)}</p>` : '';
-    region('review').innerHTML = state.pending ? `<div class="hd-card" data-share-review><h3>Review before generating</h3>${renderSummary(state.pending.summary)}<p>Generate link publishes exactly these files.</p></div>` : '';
+    region('review').innerHTML = renderPendingReview(state.pending);
     if (state.link !== shownLink) {
       shownLink = state.link;
       const linkRegion = region('link');
@@ -292,14 +370,7 @@ export function mountSharePanel(container, client, artifactId, { versions = [], 
         linkRegion.replaceChildren();
       }
     }
-    const list = region('list');
-    if (state.shares) {
-      list.innerHTML = state.shares.length ? `<ul class="hd-share-list" style="list-style:none;padding:0">${state.shares.map(share => renderShareRow(share, state.events.get(share.share_id))).join('')}</ul>` : '<herdr-empty message="No links yet"></herdr-empty>';
-    } else if (state.listError) {
-      list.innerHTML = `<herdr-error message="${esc(`Links unavailable: ${state.listError}`)}"></herdr-error><button type="button" class="hd-btn" data-share-action="retry">Retry</button>`;
-    } else {
-      list.innerHTML = '<p role="status">Loading links…</p>';
-    }
+    region('list').innerHTML = renderShareList(state);
   };
 
   const ctrl = createShareController(client, artifactId, { versions, headVersionId, allowEntry, signal, onChange: render });
@@ -312,6 +383,7 @@ export function mountSharePanel(container, client, artifactId, { versions = [], 
       case 'review': void ctrl.review(); break;
       case 'generate': void ctrl.generate(); break;
       case 'revoke': void ctrl.revoke(id); break;
+      case 'continue': void ctrl.resume(id); break;
       case 'events': void ctrl.toggleEvents(id); break;
       case 'retry': void ctrl.refresh(); break;
       case 'close': ctrl.closeLink(); break;
@@ -348,9 +420,9 @@ export function mountSharePanel(container, client, artifactId, { versions = [], 
     // Removing the panel removes the one-time URL with it.
     container.replaceChildren();
   };
-  if (signal?.aborted) { dispose(); return { dispose }; }
+  if (signal?.aborted) { dispose(); return { dispose, controller: ctrl }; }
   signal?.addEventListener?.('abort', dispose, { once: true });
   render();
   void ctrl.refresh();
-  return { dispose };
+  return { dispose, controller: ctrl };
 }
