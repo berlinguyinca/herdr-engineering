@@ -225,6 +225,7 @@ class ControlPlaneRepo:
         self._test_runs = {}
         self._reviews = {}
         self._pull_requests = {}
+        self.pull_request_version = 0      # bumped on every change to a PR record: lets a consumer tell cheaply that nothing moved
         self._stage_runs = {}  # mission_key -> [open+closed stage runs, ...]
         self._token_usage = {}  # request_id -> token usage record (issue #36)
         self._resource_usage = {}  # (mission_id, kind) -> [resource usage record, ...]
@@ -1748,6 +1749,7 @@ class ControlPlaneRepo:
         ended_source=None,
     ):
         stamp = self._stamp()
+        self.pull_request_version += 1
         existing = self._pull_requests.get(pr_id)
         if existing is None:
             rec = {
@@ -1764,6 +1766,7 @@ class ControlPlaneRepo:
                 "merged_at": None,
                 "closed_at": None,
                 "ended_source": None,
+                "end_count": 0,
             }
             self._stamp_pr_end(rec, status, merged_at, closed_at, stamp, ended_source)
             self._pull_requests[pr_id] = rec
@@ -1785,6 +1788,7 @@ class ControlPlaneRepo:
                         "merged_at",
                         "closed_at",
                         "ended_source",
+                        "end_count",
                     )
                 },
                 mission_id=mission_id,
@@ -1828,6 +1832,7 @@ class ControlPlaneRepo:
                     "merged_at",
                     "closed_at",
                     "ended_source",
+                    "end_count",
                 )
             },
             mission_id=existing["mission_id"],
@@ -1841,8 +1846,11 @@ class ControlPlaneRepo:
         """Keep when a pull request ended. A time the provider reported is kept as given (``ended_source`` "reported");
         otherwise the first moment this server saw the PR merged or closed is used and labelled "observed", which can be
         later than the real merge. A PR that is open again loses its end time; a time already stored is never overwritten
-        by a later observation. ``ended_source`` is passed only when rebuilding from the durable event log (an ingest request
+        by a later observation. ``end_count`` counts ends (the first, and each after a reopen); a record that predates it but has an
+        end time has ended once. ``ended_source`` is passed only when rebuilding from the durable event log (an ingest request
         never supplies it), so a restart keeps "observed" times observed."""
+        if (rec.get("merged_at") or rec.get("closed_at")) and not rec.get("end_count"):
+            rec["end_count"] = 1
         if status == "open":
             rec["merged_at"] = rec["closed_at"] = rec["ended_source"] = None
             return
@@ -1852,6 +1860,8 @@ class ControlPlaneRepo:
             except ValueError:
                 return False
         merged_at, closed_at = (merged_at if valid(merged_at) else None), (closed_at if valid(closed_at) else None)
+        if status in ("merged", "closed") and not (rec.get("merged_at") or rec.get("closed_at")):
+            rec["end_count"] = (rec.get("end_count") or 0) + 1      # a new end (the first, or after a reopen), not a corrected time
         label = "observed" if ended_source == "observed" else "reported"
         if merged_at:
             rec["merged_at"], rec["ended_source"] = merged_at, label
@@ -3493,6 +3503,10 @@ class ControlPlaneRepo:
         self._test_runs = dict(delivery.get("test_runs", {}))
         self._reviews = dict(delivery.get("reviews", {}))
         self._pull_requests = dict(delivery.get("pull_requests", {}))
+        for pull in self._pull_requests.values():      # a record stored before end_count existed has ended once if it has an end time
+            if isinstance(pull, dict) and (pull.get("merged_at") or pull.get("closed_at")) and not pull.get("end_count"):
+                pull["end_count"] = 1
+        self.pull_request_version += 1
         self._token_usage = dict(delivery.get("token_usage", {}))
         self._resource_usage = {tuple(json.loads(k)): [dict(x) for x in v]
                                 for k, v in delivery.get("resource_usage", {}).items()}
