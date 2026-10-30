@@ -322,7 +322,7 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
       const observations=ciObservations();
       const model=ciInsightsModel(observations,state);
       const selectedRepo=state.project?ciProjectKey(state.project):el('[data-ci-repository]')?.value||'';
-      syncExplorer(ciExplorerTargets(model,selectedRepo),selectedRepo);
+      syncExplorer(ciExplorerTargets(model,selectedRepo,state.branch||''),selectedRepo);
       const html=renderCiInsights(model,{loading:reportData===null&&!reportsError,error:reportsError,failurePage,selectedRepo,explorer:renderTestExplorer(cx.repo?cx:null)});
       if(insightsSignature!==html){
         const host=el('[data-ci-insights]');
@@ -444,6 +444,7 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
     if(cx.repo!==repo)resetExplorer(repo,targets[0]?.repository||repo);
     const exact=targets.filter(r=>r.provider_url&&r.provider_repo_id!=null&&r.repository&&r.run_number);
     const signature=JSON.stringify(exact.map(r=>[r.report_id,r.run_number]));
+    if(!targets.length&&cx.reports===null){cx.reports=[];cx.signature='';return;}      // the selected branch has no report in this repository
     if(!exact.length){if(cx.reports===null&&targets.length){cx.reports=[];cx.error='These reports are not linked to a provider run yet, so their tests cannot be listed.';}return;}
     if(signature===cx.signature||typeof client.getCiReports!=='function')return;
     const repoAtStart=repo;
@@ -454,7 +455,7 @@ export function mountIntegrations(container,client,{kind='ci',tab='current',sear
         const list=response.reports;return {label,report:list.find(r=>r.report_id===wanted)||list[list.length-1]||null};
       });
       cx.signature=signature;cx.error='';
-    },()=>{if(cx.repo===repoAtStart){cx.error='The tests of the latest runs could not be loaded. Retrying automatically.';cx.signature=signature;}});
+    },()=>{if(cx.repo===repoAtStart){cx.error='The tests of the latest runs could not be loaded. Trying again in 30 seconds.';cx.signature=signature;setTimeout(()=>{if(!disposed&&cx.repo===repoAtStart&&cx.signature===signature&&cx.error){cx.signature='';draw();}},30000);}});
   }
   function explorerTest() {return explorerTests(cx.reports).find(t=>t.key===cx.selected)||null;}
   function selectExplorerTest(key) {

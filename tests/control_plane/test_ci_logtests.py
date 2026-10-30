@@ -1,6 +1,7 @@
 """Test counts read from CI log text. The excerpts in tests/fixtures/ci_logs are trimmed from real Woodpecker step logs
 (paths, hosts and organisation names replaced); the runners marked synthetic below are written from each runner's documented
 output because no log of them was available."""
+import time
 from pathlib import Path
 
 import pytest
@@ -124,3 +125,92 @@ def test_the_index_is_capped_and_says_so():
         'test result: ok. 6000 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n'
     result = parse_step_log(text, 'x')
     assert result['counts']['passed'] == 6000 and len(result['tests']) == MAX_INDEX and result['complete'] is False
+
+
+# --- adversarial input: a log is untrusted text, so every parser must stay linear -------------------------------------------
+def timed(text):
+    start = time.monotonic()
+    result = parse_step_log(text, 'step')
+    return result, time.monotonic() - start
+
+
+def test_tap_results_with_an_unclosed_yaml_block_do_not_rescan_the_log():
+    block = '\n'.join(f'ok {n} - case {n}\n  ---\n  duration_ms: 1.5' for n in range(1, 7000))        # no closing `...` ever
+    text = f'{block}\n# tests 6999\n# pass 6999\n# fail 0\n'
+    assert len(text) > 200_000
+    result, seconds = timed(text)
+    assert seconds < 3
+    assert result['counts']['passed'] == 6999
+    assert result['tests'][0]['line_end'] < 100
+
+
+def test_tap_yaml_block_ends_where_its_indentation_ends():
+    text = 'ok 1 - a\n  ---\n  duration_ms: 12\n  ...\nnot ok 2 - b\n  ---\n  duration_ms: 3\nok 3 - c\n# tests 3\n# pass 2\n# fail 1\n'
+    tests = parse_step_log(text, 's')['tests']
+    assert [(t['name'], t['duration_ms'], t['line_end']) for t in tests] == [('a', 12, 4), ('b', 3, 7), ('c', None, 8)]
+
+
+def test_surefire_marker_repeated_in_every_line_stays_fast():
+    line = '[ERROR] ' + 'x Time elapsed: 1 s ' * 90
+    text = '\n'.join([line] * 2000) + '\n[INFO] Tests run: 5, Failures: 0, Errors: 0, Skipped: 0\n'
+    result, seconds = timed(text)
+    assert seconds < 3
+    assert result['counts']['passed'] == 5 and result['tests'] == []
+
+
+def test_surefire_failure_still_names_the_case():
+    text = ('[ERROR] Tests run: 2, Failures: 1, Errors: 0, Skipped: 0, Time elapsed: 1 s\n'
+            '[ERROR] shouldAdd(com.acme.MathTest)  Time elapsed: 0.012 s  <<< FAILURE!\n'
+            '[ERROR] Tests run: 2, Failures: 1, Errors: 0, Skipped: 0\n')
+    result = parse_step_log(text, 's')
+    assert [(t['name'], t['status'], t['duration_ms']) for t in result['tests']] == [('shouldAdd(com.acme.MathTest)', 'failed', 12)]
+
+
+def test_pytest_verbose_lines_made_of_colons_stay_fast():
+    text = '\n'.join(['a' + '::' * 900 + ' nothing'] * 1500 + ['===== 1 passed in 0.10s ====='])
+    result, seconds = timed(text)
+    assert seconds < 3
+    assert result['counts']['passed'] == 1
+
+
+def test_pytest_with_thousands_of_failures_and_no_closing_rule_is_linear():
+    parts = ['============================ FAILURES ============================']
+    for n in range(4000):
+        parts.append(f'_____ test_{n} _____\ntraceback {n}')
+    parts += [f'FAILED t.py::test_{n} - boom' for n in range(4000)]
+    parts.append('===== 4000 failed in 3.00s =====')
+    result, seconds = timed('\n'.join(parts))
+    assert seconds < 3
+    assert result['counts']['failed'] == 4000
+    assert result['tests'][0]['line_start'] == 2
+
+
+def test_the_largest_log_the_collector_reads_is_parsed_in_seconds():
+    row = 'ok 1 - case\n  ---\n  duration_ms: 1\n'
+    text = row * (4 * 1024 * 1024 // len(row)) + '# tests 1\n# pass 1\n'
+    result, seconds = timed(text)
+    assert seconds < 15
+    assert result is not None
+
+
+def test_pytest_runs_in_one_step_are_summed():
+    text = '===== 3 passed in 0.10s =====\nnoise\n===== 2 passed, 1 failed in 0.20s =====\n'
+    assert parse_step_log(text, 's')['counts'] == {'passed': 5, 'failed': 1, 'errored': 0, 'skipped': 0}
+
+
+def test_scalatest_prose_lines_ending_in_a_colon_are_not_suites():
+    text = ('Note:\nsome words\nmore words\nmore words\nmore words\n - not a test\nFooSpec:\n- adds\n- subtracts *** FAILED ***\n'
+            'Tests: succeeded 1, failed 1, canceled 0, ignored 0, pending 0\n')
+    tests = parse_step_log(text, 's')['tests']
+    assert [(t['suite'], t['name']) for t in tests] == [('FooSpec', 'adds'), ('FooSpec', 'subtracts')]
+
+
+def test_go_output_without_verbose_lines_is_not_a_zero_count():
+    assert parse_step_log('ok  \texample.com/pkg\t0.012s\nFAIL\texample.com/other\t0.4s\n', 's') is None
+
+
+def test_the_same_step_listed_twice_is_counted_once_but_different_steps_are_summed():
+    one = parse_step_log('ok 1 - a\nok 2 - b\n# tests 2\n# pass 2\n', 'unit')
+    steps = [('1', 'unit', one), ('2', 'unit', one), ('3', 'unit-node20', one)]
+    combined = combine_steps(steps)
+    assert combined['summary']['total'] == 4

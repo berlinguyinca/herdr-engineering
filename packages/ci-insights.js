@@ -97,8 +97,9 @@ export function ciOverviewRows(m) {
  return [...reported,...ciRunOutcomeOverview(m).filter(r=>!have.has(r.key))];
 }
 // The latest report of each branch of one repository (its overview key), for the per-test explorer.
-export function ciExplorerTargets(m,key) {
- return m.groups.filter(g=>g.latest&&overviewKey(g.latest)===String(key)).map(g=>({...g.latest,label:g.label,branch:g.latest.branch||''}));
+const EXPLORER_BRANCHES=12;   // full reports fetched for one repository: the selected branch, else at most this many branches
+export function ciExplorerTargets(m,key,branch='') {
+ return m.groups.filter(g=>g.latest&&overviewKey(g.latest)===String(key)&&(!branch||(g.latest.branch||'')===branch)).slice(0,EXPLORER_BRANCHES).map(g=>({...g.latest,label:g.label,branch:g.latest.branch||''}));
 }
 const rowTitle=r=>r.unit==='runs'?`${r.repository}: no test counts yet, so this counts successful and failed runs`:
  `${r.repository}: ${r.sources.map(x=>SOURCE_LABEL[x]).join(' and ')}${r.runners.length?` (${r.runners.join(', ')})`:''} · run${r.runs.length>1?'s':''} ${r.runs.map(n=>`#${n}`).join(', ')}${r.notCounted?` · ${r.notCounted} step${r.notCounted===1?'':'s'} not counted: log too large to read, so the total is a floor`:''}`;

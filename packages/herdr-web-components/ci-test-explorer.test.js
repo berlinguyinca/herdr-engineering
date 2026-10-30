@@ -68,3 +68,22 @@ test('names are escaped',()=>{
  const html=renderTestExplorer(ex([{label:'m',report:logReport([logTest('x','<img src=x onerror=alert(1)>','failed')])}]));
  assert.doesNotMatch(html,/<img src=x/);
 });
+
+test('a run whose list was dropped says so instead of claiming the runner prints only totals',()=>{
+ const html=renderTestExplorer(ex([{label:'main',report:logReport([],{summary:{total:30},runners:['cargo'],index_dropped:true})}]));
+ assert.match(html,/The test list is no longer kept for 1 older run/);
+ assert.doesNotMatch(html,/print only totals/);
+});
+
+test('a step that could not be read is named as retried, and a junit marker adds no gap',()=>{
+ const html=renderTestExplorer(ex([{label:'main',report:logReport([logTest('a','TestAlpha','passed')],{summary:{total:1},skipped_steps:[{step:'lint',reason:'read_failed'},{step:'*',reason:'junit_report_exists'}]})}]));
+ assert.match(html,/Step lint is not counted yet: its log could not be read, and it will be tried again/);
+ assert.doesNotMatch(html,/Step \* /);
+});
+
+test('excerpt numbers from the server are coerced, never written as markup',()=>{
+ const t=explorerTests([{label:'m',report:logReport([logTest('b','TestBeta','failed')])}])[0];
+ const hostile={slice:{first:'1"><img src=x onerror=alert(1)>',last:'<b>',start:1,end:1,lines:['a']},total_lines:'<script>'};
+ const html=renderTestInspector(ex(null,{slice:hostile}),t);
+ assert.doesNotMatch(html,/<img|<script|<b>/);
+});
