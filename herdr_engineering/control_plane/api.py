@@ -628,6 +628,7 @@ class ControlPlaneServer:
             self.assistant.comment_poster = comment_hook(self)
             self.assistant.artifact_writer = draft_writer_hook(self)
             self.assistant.ci_board_request = self.intelligence.assistant_ci_repair
+            self.assistant.ci_rerun_request = self.intelligence.assistant_ci_rerun
             from .assistant_dispatch import DelegationConsumer
             self.delegation_consumer = DelegationConsumer(
                 self.assistant, self.handoffs,

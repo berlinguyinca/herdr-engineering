@@ -5,6 +5,9 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Assistant: CI failures also queue a re-run proposal
+- When `watch_ci` sees a new CI failure it now queues, beside the repair proposal, a separate `ci_rerun` proposal on the same board (same scope rules, same one-time dedupe). The repair proposal records it as `rerun_proposal` and the notification says a plain re-run awaits approval. A refused or failing re-run request never hides the repair proposal. Approving it still needs `project_intelligence.execute: true`.
+
 ### Project intelligence: `ci_rerun` action (ask mode)
 - A new approvable proposal action `ci_rerun` (`{repo: owner/name, run: N}`) restarts one Woodpecker pipeline run. It goes through the existing board: `suggest` to propose, an approver (or the single operator) to approve the exact payload, and `execute: true` before anything runs. Execution calls the CI monitor's own retry, so `control_plane.ci_actions` and Woodpecker's `can_retry` still decide; a refusal is recorded on the proposal and never retried. `execute` stays off by default.
 
