@@ -175,6 +175,19 @@ def test_session_commits_endpoint_reports_a_state_and_404_for_an_unknown_agent(s
     assert c.get("/api/v1/sessions/nope/commits")[0] == 404
 
 
+def test_pull_request_trail_endpoint_links_the_agent_and_rejects_bad_or_unknown_pull_requests(server):
+    c, repo = server
+    repo.upsert_session("sx", host_id="h", agent_role="pi", repository_id="github.com/org/app", branch="feat/x", status="active")
+    repo.upsert_pull_request("pr-1", repository="github.com/org/app", number=7, status="open", branch="feat/x")
+    status, _, body = c.get("/api/v1/pull-requests/org/app/7/trail")
+    out = json.loads(body)
+    assert status == 200 and out["pull_request"]["number"] == 7 and out["state"] == "linked"
+    assert [s["session_id"] for s in out["sessions"]] == ["sx"] and out["sources"]["ci"] == "unavailable"
+    assert out["signals"]["ci_green_first_try"]["value"] is None
+    assert c.get("/api/v1/pull-requests/org/app/8/trail")[0] == 404
+    assert c.get("/api/v1/pull-requests/org/app/0/trail")[0] == 400
+
+
 def test_session_with_colon_id_fetches_percent_encoded(server):
     """Entity ids like ``w9:p5`` are percent-encoded by the web client
     (encodeURIComponent -> ``w9%3Ap5``); the server must URL-decode them so

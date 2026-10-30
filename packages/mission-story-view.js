@@ -4,7 +4,7 @@
 // entity-links.js from structured refs, never from text.
 import { escapeHtml as esc } from './herdr-web-components/util.js';
 import { formatDuration, formatTimestamp } from './herdr-web-components/format.js';
-import { entityHref, forgePrUrl } from './entity-links.js';
+import { entityHref, forgePrUrl, prTrailHref } from './entity-links.js';
 
 const RESULT = {
   succeeded: ['Succeeded', 'ok'], failed: ['Failed', 'bad'], cancelled: ['Cancelled', 'warn'],
@@ -32,8 +32,8 @@ function refLink(ref, label) {
   let href = null;
   if (ref.kind === 'ci') href = entityHref('ci', ref.run_number ?? ref.id, { repository: ref.repo_filter });
   else if (ref.kind === 'pr') {
-    const url = forgePrUrl(ref.repository, ref.number);
-    return url ? `<a href="${esc(url)}" target="_blank" rel="noopener noreferrer">${esc(label)}</a> <span class="ms-note">external</span>` : esc(label);
+    const url = forgePrUrl(ref.repository, ref.number), trail = prTrailHref(ref.repository, ref.number);
+    return url ? `<a href="${esc(url)}" target="_blank" rel="noopener noreferrer">${esc(label)}</a> <span class="ms-note">external</span>${trail ? ` <a href="${esc(trail)}" data-pr-trail>trail</a>` : ''}` : esc(label);
   } else href = entityHref(ref.kind, ref.id);
   return href ? `<a href="${esc(href)}">${esc(label)}</a>` : esc(label);
 }

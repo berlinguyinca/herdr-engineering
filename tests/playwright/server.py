@@ -220,6 +220,17 @@ def main():
                 time.sleep(0.1)
             _seed_attention(repo)
         threading.Thread(target=_wait_for_trigger, daemon=True).start()
+    if os.environ.get("PR_TRAIL_SEED") == "1":
+        # org/app#214 (RELATED_SEED) was produced by the dashboard agent; it handed work to a Claude agent, which accepted, and a second
+        # handoff was rejected.
+        actor = {"actor_id": "fixture", "kind": "agent"}
+        base = {"source_harness": "pi", "target_harness": "claude", "source_session_id": _s1, "mission_id": _m1}
+        svr.handoffs.create({**base, "handoff_id": "h-ok", "target_session_id": "s-claude", "goal": "write the parser tests"}, actor)
+        for state in ("claimed", "accepted", "in_progress"):
+            svr.handoffs.transition("h-ok", state, actor)
+        svr.handoffs.create({**base, "handoff_id": "h-no", "target_session_id": "s-other", "goal": "port it to Rust"}, actor)
+        for state in ("claimed", "rejected"):
+            svr.handoffs.transition("h-no", state, actor)
     if os.environ.get("CI_OFFLINE") == "1":
         # The host may have a real Woodpecker token; a hermetic page must not list real runs.
         svr.ci_monitor._factory = lambda: type("Offline", (), {"available": False})()
