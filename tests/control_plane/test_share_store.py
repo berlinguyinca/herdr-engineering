@@ -226,7 +226,7 @@ def test_ingest_events_file_is_idempotent_and_tolerates_torn_line(share_postgres
         assert await store.ingest_events_file(f) == 0  # idempotent
         # the writer completes the torn line and appends more
         with f.open("a") as fh:
-            fh.write(f'nd": "opened", "actor": "public", "at": "2026-10-30T10:00:05Z"}}\n' + line(sid, n=6))
+            fh.write('nd": "opened", "actor": "public", "at": "2026-10-30T10:00:05Z"}\n' + line(sid, n=6))
         assert await store.ingest_events_file(f) == 2
         assert await store.ingest_events_file(f) == 0
         evs = await store.events(sid)
