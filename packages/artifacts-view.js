@@ -12,7 +12,7 @@ const humanSize = value => {
 
 export function mountArtifacts(container, client, { freshness = () => null } = {}) {
   let disposed = false, timer, controller, generation = 0, loaded = false;
-  container.innerHTML = '<div class="hd-card" data-artifact-registry><div class="hd-card__title">Artifact registry</div><div class="hd-inline"><input class="hd-input" data-artifact-query placeholder="Search artifacts" aria-label="Search artifacts"><select class="hd-input" data-artifact-type aria-label="Filter artifact type"><option value="">All types</option><option value="other">Other</option><option value="web">Web</option><option value="report">Report</option><option value="document">Document</option></select><select class="hd-input" data-artifact-status aria-label="Filter artifact status"><option value="">All statuses</option><option value="available">Available</option><option value="draft">Draft</option></select></div><p data-artifact-state role="status"></p><div data-artifact-results></div><button type="button" data-artifact-retry hidden>Retry</button></div>';
+  container.innerHTML = '<div class="hd-card" data-artifact-registry><div class="hd-card__title">Artifact registry</div><div class="hd-inline"><input class="hd-input" data-artifact-query placeholder="Search artifacts" aria-label="Search artifacts"><select class="hd-input" data-artifact-type aria-label="Filter artifact type"><option value="">All types</option><option value="other">Other</option><option value="web">Web</option><option value="report">Report</option><option value="document">Document</option></select><select class="hd-input" data-artifact-status aria-label="Filter artifact status"><option value="">All statuses</option><option value="available">Available</option><option value="draft">Draft</option></select><select class="hd-input" data-artifact-context-kind aria-label="Linked to"><option value="">Any work</option><option value="project">Project</option><option value="issue">Issue</option><option value="task">Task</option><option value="room">Room</option></select><input class="hd-input" data-artifact-context-ref placeholder="Project, issue, task or room id" aria-label="Linked work id"></div><p data-artifact-state role="status"></p><div data-artifact-results></div><button type="button" data-artifact-retry hidden>Retry</button></div>';
   const results = container.querySelector('[data-artifact-results]');
   const state = container.querySelector('[data-artifact-state]');
   const retry = container.querySelector('[data-artifact-retry]');
@@ -26,14 +26,20 @@ export function mountArtifacts(container, client, { freshness = () => null } = {
     state.textContent = loaded ? 'Refreshing artifacts…' : '';
     retry.hidden = true;
     try {
-      const { artifacts } = await client.listArtifacts({
-        q: container.querySelector('[data-artifact-query]').value,
-        type: container.querySelector('[data-artifact-type]').value,
-        status: container.querySelector('[data-artifact-status]').value, limit: 100, signal,
-      });
+      const contextKind = container.querySelector('[data-artifact-context-kind]').value;
+      const contextRef = container.querySelector('[data-artifact-context-ref]').value.trim();
+      const q = container.querySelector('[data-artifact-query]').value;
+      // A named piece of work asks the registry for what is linked to it; type and status do not apply there.
+      const { artifacts } = contextKind && contextRef
+        ? await client.artifactsForContext(contextKind, contextRef, { q, limit: 100, signal })
+        : await client.listArtifacts({
+          q,
+          type: container.querySelector('[data-artifact-type]').value,
+          status: container.querySelector('[data-artifact-status]').value, limit: 100, signal,
+        });
       if (disposed || current !== generation) return;
       if (!Array.isArray(artifacts)) throw new Error('Invalid artifact registry response');
-      morph(results, artifacts.length ? `<div class="hd-table-wrap"><table class="hd-table"><thead><tr><th>Name</th><th>Type</th><th>Size</th><th>Status</th><th>Created</th></tr></thead><tbody>${artifacts.map(artifact => `<tr><td><a href="#/artifacts/${encodeURIComponent(artifact.artifact_id)}">${esc(artifact.display_name || artifact.original_filename || artifact.artifact_id)}</a></td><td>${esc(artifact.artifact_type || 'other')}</td><td>${humanSize(artifact.size_bytes)}</td><td>${esc(artifact.status || 'unknown')}</td><td>${esc(artifact.created_at || 'unknown')}</td></tr>`).join('')}</tbody></table></div>` : '<herdr-empty message="No artifacts match the current filters"></herdr-empty>');
+      morph(results, artifacts.length ? `<div class="hd-table-wrap"><table class="hd-table"><thead><tr><th>Name</th><th>Type</th><th>Size</th><th>Status</th><th>Created</th></tr></thead><tbody>${artifacts.map(artifact => `<tr><td><a href="#/artifacts/${encodeURIComponent(artifact.artifact_id)}">${esc(artifact.display_name || artifact.original_filename || artifact.artifact_id)}</a></td><td>${esc(artifact.artifact_type || 'other')}</td><td>${artifact.size_bytes == null ? '—' : humanSize(artifact.size_bytes)}</td><td>${esc(artifact.status || '—')}</td><td>${esc(artifact.created_at || 'unknown')}</td></tr>`).join('')}</tbody></table></div>` : '<herdr-empty message="No artifacts match the current filters"></herdr-empty>');
       loaded = true;
       state.textContent = artifacts.length === 100 ? 'Showing the first 100 artifacts. Refine the search to narrow results.' : '';
       freshness()?.touch(true);
@@ -46,7 +52,7 @@ export function mountArtifacts(container, client, { freshness = () => null } = {
     } finally { if (controller === request) controller = null; }
   };
   const schedule = () => { clearTimeout(timer); timer = setTimeout(() => render({ replace: true }), 200); };
-  container.querySelectorAll('[data-artifact-query],[data-artifact-type],[data-artifact-status]').forEach(control => control.addEventListener('input', schedule));
+  container.querySelectorAll('[data-artifact-query],[data-artifact-type],[data-artifact-status],[data-artifact-context-kind],[data-artifact-context-ref]').forEach(control => control.addEventListener('input', schedule));
   retry.addEventListener('click', render);
   const stop = pollWhileVisible(render, 30000);
   void render();
@@ -380,7 +386,17 @@ export async function renderArtifactDetail(container, client, id, { signal, vers
   versionsRead.catch(() => {});
   const mime = artifact.mime_type || 'application/octet-stream';
   const url = client.artifactDownloadUrl(id);
-  container.innerHTML = `<h2>${esc(artifact.display_name || artifact.original_filename || id)}</h2><div class="hd-card"><h2>Preview</h2><div data-artifact-preview>${skeleton('preview', { rows: 1 })}</div></div><div class="hd-card"><dl><dt>Artifact ID</dt><dd><code>${esc(id)}</code></dd><dt>Type</dt><dd>${esc(artifact.artifact_type || 'other')}</dd><dt>MIME</dt><dd>${esc(mime)}</dd><dt>Status</dt><dd>${esc(artifact.status || 'unknown')}</dd><dt>SHA-256</dt><dd><code>${esc(artifact.sha256 || 'versioned blob')}</code></dd></dl></div><div class="hd-card"><h2>Versions</h2><div data-artifact-versions>${skeleton('versions', { rows: 1 })}</div></div><div class="hd-card"><h2>Review</h2><div data-artifact-reviews>${skeleton('reviews', { rows: 1 })}</div></div>`;
+  container.innerHTML = `<h2>${esc(artifact.display_name || artifact.original_filename || id)}</h2><div class="hd-card"><h2>Preview</h2><div data-artifact-preview>${skeleton('preview', { rows: 1 })}</div></div><div class="hd-card"><dl><dt>Artifact ID</dt><dd><code>${esc(id)}</code></dd><dt>Type</dt><dd>${esc(artifact.artifact_type || 'other')}</dd><dt>MIME</dt><dd>${esc(mime)}</dd><dt>Status</dt><dd>${esc(artifact.status || 'unknown')}</dd><dt>SHA-256</dt><dd><code>${esc(artifact.sha256 || 'versioned blob')}</code></dd></dl></div><div class="hd-card"><h2>Versions</h2><div data-artifact-versions>${skeleton('versions', { rows: 1 })}</div></div><div class="hd-card"><h2>Review</h2><div data-artifact-reviews>${skeleton('reviews', { rows: 1 })}</div></div><div class="hd-card"><h2>Linked to</h2><div data-artifact-links>${skeleton('links', { rows: 1 })}</div></div>`;
+  client.artifactLinks(id, { signal: bounded() }).then(({ links }) => {
+    const section = container.querySelector('[data-artifact-links]');
+    if (!section || signal?.aborted) return;
+    section.innerHTML = Array.isArray(links) && links.length
+      ? `<ul>${links.map(link => `<li><strong>${esc(link.link_kind || 'reference')}</strong> · ${esc(link.project_id ? `project ${link.project_id}` : link.issue_ref ? `issue ${link.issue_ref}` : link.task_id ? `task ${link.task_id}` : link.room_id ? `room ${link.room_id}` : 'unknown')}</li>`).join('')}</ul>`
+      : '<herdr-empty message="Not linked to any project, issue, task or room"></herdr-empty>';
+  }).catch(error => {
+    const section = container.querySelector('[data-artifact-links]');
+    if (section && !signal?.aborted) section.innerHTML = `<herdr-error message="Links unavailable: ${esc(error?.message || 'request failed')}"></herdr-error>`;
+  });
   const reviewsRead = client.artifactReviews(id, { signal: bounded() });
   reviewsRead.catch(() => {});
   const results = [(await Promise.allSettled([versionsRead]))[0]];
