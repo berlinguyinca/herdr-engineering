@@ -304,3 +304,12 @@ def test_check_pool_unexpected_error_never_fails_and_lowercases(endpoint, monkey
     assert run(url, "create", "a1", "v1", "--audience", "lab", "--email", "Bob@Example.ORG",
                "--check-pool", "--pool-id", "us-west-2_X") == 0
     assert seen == ["bob@example.org"] and len(reqs) == 1
+
+
+def test_share_docs_use_the_real_share_id_shape():
+    """The user doc's example ids must look like what ShareStore.create mints (``share_`` + 24 hex)."""
+    import re
+    from pathlib import Path
+    doc = (Path(__file__).resolve().parents[1] / "docs" / "artifacts" / "share-links.md").read_text()
+    ids = [a or b for a, b in re.findall(r"^Share (\S+) \(pending\)|approve A1 (\S+)", doc, re.M)]
+    assert len(ids) >= 3 and all(re.fullmatch(r"share_[0-9a-f]{24}", i) for i in ids), ids

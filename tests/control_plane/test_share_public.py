@@ -171,6 +171,21 @@ TRAVERSALS = [
 ]
 
 
+def test_link_without_trailing_slash_redirects_identically_for_any_token(env):
+    """``/s/<token>`` (a link pasted without its slash) gets 302 to ``<token>/`` for ANY well-formed token, live or
+    not, with byte-identical responses: the redirect reveals nothing about which tokens exist."""
+    seen = []
+    for token in (TOKEN, OTHER_TOKEN):
+        for method in ("GET", "HEAD"):
+            status, headers, body = env.request(method, "/s/%s?x=1" % token)
+            assert status == 302 and body == b"", (token, method)
+            assert headers["location"] == "%s/" % token
+            assert headers["cache-control"] == "no-store" and headers["referrer-policy"] == "no-referrer"
+            seen.append({k: v for k, v in headers.items() if k not in ("date", "location")})
+    assert all(h == seen[0] for h in seen)
+    assert len(env.event_lines()) == 0                                    # nothing about the token is recorded
+
+
 def test_every_failure_is_the_same_404_body(env, tmp_path):
     reference = _not_found(env)
     assert reference
@@ -180,7 +195,8 @@ def test_every_failure_is_the_same_404_body(env, tmp_path):
     cases.append(("GET", "/s/%s/f/index.html" % (TOKEN + "x")))          # malformed (long)
     cases.append(("GET", "/s/%s/f/index.html" % (TOKEN[:-1] + "%41")))   # token must not be percent-decoded
     cases.append(("GET", "/s/%s/f/index.html" % (TOKEN[:-1] + "!")))
-    cases.append(("GET", "/s/%s" % TOKEN))
+    cases.append(("POST", "/s/%s" % TOKEN))                               # the slash redirect is GET/HEAD only
+    cases.append(("GET", "/s/%s" % TOKEN[:-1]))                           # ... and well-formed tokens only
     cases.append(("GET", "/s/%s/x" % TOKEN))
     cases.append(("GET", "/s/"))
     cases.append(("GET", "/"))
