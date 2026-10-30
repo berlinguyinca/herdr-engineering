@@ -561,3 +561,12 @@ def test_pull_request_created_already_merged_is_observed():
     r = repo.ControlPlaneRepo()
     pr = _pr(r, "merged")
     assert pr["merged_at"] and pr["ended_source"] == "observed"
+
+
+def test_pull_request_end_count_counts_ends_not_corrected_times():
+    r = repo.ControlPlaneRepo()
+    assert _pr(r, "open")["end_count"] == 0
+    assert _pr(r, "merged")["end_count"] == 1
+    assert _pr(r, "merged", merged_at="2026-10-01T10:00:00Z")["end_count"] == 1, "a corrected time is not a new end"
+    assert _pr(r, "open")["end_count"] == 1
+    assert _pr(r, "closed")["end_count"] == 2, "ending again after a reopen is a new end"

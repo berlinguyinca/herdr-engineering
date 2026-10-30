@@ -1745,6 +1745,7 @@ class ControlPlaneRepo:
                 "merged_at": None,
                 "closed_at": None,
                 "ended_source": None,
+                "end_count": 0,
             }
             self._stamp_pr_end(rec, status, merged_at, closed_at, stamp)
             self._pull_requests[pr_id] = rec
@@ -1766,6 +1767,7 @@ class ControlPlaneRepo:
                         "merged_at",
                         "closed_at",
                         "ended_source",
+                        "end_count",
                     )
                 },
                 mission_id=mission_id,
@@ -1809,6 +1811,7 @@ class ControlPlaneRepo:
                     "merged_at",
                     "closed_at",
                     "ended_source",
+                    "end_count",
                 )
             },
             mission_id=existing["mission_id"],
@@ -1832,6 +1835,8 @@ class ControlPlaneRepo:
             except ValueError:
                 return False
         merged_at, closed_at = (merged_at if valid(merged_at) else None), (closed_at if valid(closed_at) else None)
+        if status in ("merged", "closed") and not (rec.get("merged_at") or rec.get("closed_at")):
+            rec["end_count"] = (rec.get("end_count") or 0) + 1      # a new end (the first, or after a reopen), not a corrected time
         if merged_at:
             rec["merged_at"], rec["ended_source"] = merged_at, "reported"
         if closed_at:

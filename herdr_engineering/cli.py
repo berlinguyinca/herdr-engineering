@@ -3182,6 +3182,11 @@ def _cmd_cp_web(args) -> int:
         evolution = evolution_config(cp.get("evolution"))
     except ValueError as exc:
         raise SystemExit(f"fleet config {exc}") from None
+    from .control_plane.learning_trails import learning_config
+    try:
+        learning = learning_config(cp.get("learning"))
+    except ValueError as exc:
+        raise SystemExit(f"fleet config {exc}") from None
     from .control_plane.attention_inbox import attention_config
     try:
         attention = attention_config(cp.get("attention"))
@@ -3361,7 +3366,7 @@ def _cmd_cp_web(args) -> int:
                              assistant_config=_assistant_config(cp),
                              review_quorum=_review_quorum_config(cp),
                              single_operator=cp.get("single_operator") is True,
-                             usage_retention=usage_retention, usage_prices=usage_prices, evolution=evolution, attention=attention,
+                             usage_retention=usage_retention, usage_prices=usage_prices, evolution=evolution, learning=learning, attention=attention,
                              ci_fix=ci_fix, missions=missions, github_pg_dsn=dsn, ci_log_tests=ci_log_tests,
                              public_port=args.collab_public_port,
                              public_host=args.collab_public_host,
