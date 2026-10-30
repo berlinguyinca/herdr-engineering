@@ -22,7 +22,8 @@
 import { execFileSync } from 'node:child_process';
 import { mkdirSync, readFileSync, writeFileSync, existsSync, readdirSync, statSync } from 'node:fs';
 import path from 'node:path';
-import { CFG, REPO, launch, openReal, openSub, startRealServer } from './ui-gates-lib.mjs';
+import { CFG, REPO, launch, openReal, openSub, startRealServer, scaled } from './ui-gates-lib.mjs';
+import { DASHBOARD_SURFACES, openDashboard } from './visual-dashboard.mjs';
 
 export const BASELINE_DIR = path.join(REPO, 'docs', 'assets', 'screenshots');
 export const REPORT_DIR = path.join(REPO, '.autospec', 'reports', 'visual');
@@ -47,12 +48,20 @@ export const SURFACES = [
       { name: 'wbcomments', selector: 'ul.wb-comments' }, { name: 'wbfork', selector: '.wb-table-wrap' }, { name: 'wbpropose', selector: 'form[data-wb-form="propose"]' }, { name: 'wbsteers', selector: 'ul.wb-steers' }] },
   { slug: 'collab-lineage-gantt', sub: 'lineage', proof: 'svg.lin-svg', resetScroll: true, steps: async (page) => { await page.locator('[data-view="gantt"]').click(); await page.locator('svg.lin-svg[role=img]').waitFor(); },
     regions: [{ name: 'gantt', selector: 'svg.lin-svg[role=img]' }] },
+  // The Mission Workbench scenario (a 12-session Pi chain, a Claude branch and a Pi continuation, PR, CI, reviews, artifacts, a blocked
+  // task and a merge gate): its own seeded room. The step goes to the newest end of the chain and selects the last session before the fork.
+  { slug: 'collab-workbench', sub: 'lineage', proof: 'svg.lin-svg g[data-node]', resetScroll: true, fixture: { empty: true, workbench: true },
+    // select through the table (every node is a button there), which also centres it in the graph when the graph is shown again
+    steps: async (page) => { await page.locator('[data-mode="table"]').first().click(); await page.locator('table.lin-table button[data-node="session:pi-12"]').click(); await page.locator('[data-mode="visual"]').first().click(); await page.locator('g[data-node="session:pi-12"]').waitFor(); await page.locator('.lin-facts').first().waitFor(); await page.locator('.wb').first().waitFor().catch(() => {}); await page.evaluate(() => document.activeElement?.blur()); },
+    regions: [{ name: 'status', selector: '.lin-status' }, { name: 'graph', selector: '.lin-viewport' }, { name: 'inspector', selector: '.lin-inspector' }] },
   { slug: 'collab-flow', sub: 'flow', proof: '#hcn-flow svg.cx-flow', regions: [{ name: 'flowhead', selector: '#hcn-p-flow .cx-row--between' }] },
   { slug: 'collab-attention', sub: 'attention', proof: '.cx-attn-item', regions: [{ name: 'item', selector: '.cx-attn-item' }] },
   { slug: 'collab-progress', sub: 'progress', proof: '#hcn-p-progress' },
   { slug: 'collab-links', sub: 'links', proof: '#hcn-links li' },
   { slug: 'collab-proposals', sub: 'proposals', proof: '[data-proposal]', steps: async (page) => { await page.locator('[data-proposal]').first().click(); await page.locator('#hcn-review [data-decide]').first().waitFor(); },
     regions: [{ name: 'review', selector: '#hcn-review' }] },
+  // The dashboard app (Missions, Personal Assistant tabs): served from packages/ over a stubbed API, no server process (visual-dashboard.mjs)
+  ...DASHBOARD_SURFACES,
 ];
 
 export const fileFor = (slug, viewport, scheme) => path.join(BASELINE_DIR, `${slug}__${viewport}${scheme === 'dark' ? '-dark' : ''}.png`);
@@ -68,8 +77,20 @@ const NORMALIZE = () => {
   let n; while ((n = walker.nextNode())) { let v = n.nodeValue; for (const [re, to] of rules) v = v.replace(re, to); if (v !== n.nodeValue) n.nodeValue = v; }
 };
 
-export async function newDeterministicServer() {
-  return startRealServer({ fixed_clock: true });
+export async function newDeterministicServer(extra = {}) {
+  return startRealServer({ fixed_clock: true, ...extra });
+}
+
+/** A surface may need its own seeded room (the Mission Workbench scenario): `fixture` is extra real_server.py config. Surfaces with
+ *  the same fixture share one server; the default surfaces use `defaultServer`. */
+export const fixtureKey = (surface) => (surface.fixture ? JSON.stringify(surface.fixture) : '');
+export async function serversFor(surfaces, defaultServer) {
+  const map = new Map([['', defaultServer]]);
+  for (const s of surfaces) {
+    const k = fixtureKey(s);
+    if (!map.has(k)) map.set(k, await newDeterministicServer(s.fixture));
+  }
+  return { infoFor: (s) => map.get(fixtureKey(s)).info, stop: () => { for (const [k, v] of map) if (k) v.stop(); } };
 }
 
 // ---- fonts -----------------------------------------------------------------------------------------------------------
@@ -127,13 +148,13 @@ export async function assertBundledFonts(page, ctx) {
 }
 
 /**
- * Wait until the page has stopped changing: no request in flight and no DOM mutation for `quietMs`. The proof element of a surface
+ * Wait until the page has stopped changing: no DOM mutation for `quietMs`. (Not `networkidle`: the page polls, so the network is never
+ * idle and every capture would sit out the whole cap.) The proof element of a surface
  * appears before its data does, so a fixed pause after it photographed a half-populated page on a slow or busy host (one page of 88,
  * 9% of its pixels, on the CI agent only). Bounded: a page that keeps redrawing on its poll is captured after `maxMs` anyway, and the
  * text it redraws is normalised afterwards.
  */
-async function settled(page, quietMs = 500, maxMs = 12000) {
-  await page.waitForLoadState('networkidle', { timeout: maxMs }).catch(() => {});
+async function settled(page, quietMs = 500, maxMs = 5000) {
   await page.evaluate(([quiet, max]) => new Promise((resolve) => {
     let timer; const done = () => { obs.disconnect(); clearTimeout(timer); clearTimeout(cap); resolve(); };
     const obs = new MutationObserver(() => { clearTimeout(timer); timer = setTimeout(done, quiet); });
@@ -147,13 +168,15 @@ async function settled(page, quietMs = 500, maxMs = 12000) {
  * `extraCss` is only for the gate's own "teeth" tests: it lets a test inject a defect and prove the compare notices it.
  */
 export async function capture(browser, info, surface, viewport, scheme, { extraCss = '', regions = viewport === 'desktop' } = {}) {
-  const { ctx, page } = await openReal(browser, info, 'alice', { viewport: CFG.viewports[viewport], colorScheme: scheme, reducedMotion: 'reduce', deviceScaleFactor: 1, bypassCSP: true });
+  const ctxOpts = { viewport: CFG.viewports[viewport], colorScheme: scheme, reducedMotion: 'reduce', deviceScaleFactor: 1, bypassCSP: true };
+  const dashboard = surface.app === 'dashboard';
+  const { ctx, page } = dashboard ? await openDashboard(browser, surface.hash, ctxOpts) : await openReal(browser, info, 'alice', ctxOpts);
   try {
-    await page.clock.setFixedTime(new Date(CFG.screenshots.fixed_clock));
+    if (!dashboard) await page.clock.setFixedTime(new Date(CFG.screenshots.fixed_clock));
     await page.addStyleTag({ content: bundledFontCss() });
-    if (surface.hash) { await page.evaluate((h) => { window.location.hash = h; }, surface.hash); } else { await openSub(page, surface.sub); }
-    await page.locator(surface.proof).first().waitFor({ timeout: 15000 });
-    if (surface.sub === 'chat') await page.locator('#hcn-empty').waitFor({ state: 'detached', timeout: 15000 });
+    if (dashboard) { /* already at its route */ } else if (surface.hash) { await page.evaluate((h) => { window.location.hash = h; }, surface.hash); } else { await openSub(page, surface.sub); }
+    await page.locator(surface.proof).first().waitFor({ timeout: scaled(15000) });
+    if (surface.sub === 'chat') await page.locator('#hcn-empty').waitFor({ state: 'detached', timeout: scaled(15000) });
     if (surface.steps) await surface.steps(page);
     await page.addStyleTag({ content: '*,*::before,*::after{animation:none!important;transition:none!important;caret-color:transparent!important;scroll-behavior:auto!important}' });
     if (extraCss) await page.addStyleTag({ content: extraCss });
@@ -170,7 +193,7 @@ export async function capture(browser, info, surface, viewport, scheme, { extraC
     const full = await page.evaluate(() => Math.max(document.documentElement.scrollHeight, innerHeight));
     if (full > MAX_HEIGHT) throw new Error(`${surface.slug} at ${viewport} is ${full}px tall, above the ${MAX_HEIGHT}px capture cap: the rest would never be compared`);
     const height = full;
-    const out = { page: await page.screenshot({ clip: { x: 0, y: 0, width: CFG.viewports[viewport].width, height }, animations: 'disabled', caret: 'hide' }), regions: {} };
+    const out = { page: await page.screenshot({ clip: { x: 0, y: 0, width: CFG.viewports[viewport].width, height }, fullPage: surface.fullPage === true, animations: 'disabled', caret: 'hide' }), regions: {} };
     if (regions) {
       for (const r of surface.regions || []) {
         // by bounding box, not locator.screenshot(): that waits for the element to be visible, which would make a test that hides
@@ -226,14 +249,18 @@ export const checkAgainstBaseline = (browser, png, slug, viewport, scheme) => ch
 export const checkRegion = (browser, png, slug, region, scheme) => checkFile(browser, png, regionFileFor(slug, region, scheme), CFG.screenshots.component_max_diff_pct);
 
 /** All (surface, viewport, scheme) combinations: light everywhere, dark at every viewport (autospec requires both themes). */
-export const combos = (filter = '') => SURFACES.filter((s) => s.slug.includes(filter)).flatMap((s) => VIEWPORTS.flatMap((v) => ['light', 'dark'].map((scheme) => ({ surface: s, viewport: v, scheme }))));
+// A surface may leave combinations out (`skip: ['mobile-dark']`, as "<viewport>-<scheme>") when its pages are large and the total size cap
+// (ui-gates.yaml screenshots.max_total_kb) would not allow all six. The omission is declared here, in one place, and listed in the test matrix.
+export const matrixOf = (s) => VIEWPORTS.flatMap((v) => ['light', 'dark'].map((scheme) => ({ viewport: v, scheme }))).filter((c) => !(s.skip || []).includes(`${c.viewport}-${c.scheme}`));
+export const combos = (filter = '') => SURFACES.filter((s) => s.slug.includes(filter)).flatMap((s) => matrixOf(s).map((c) => ({ surface: s, ...c })));
 
 /** Every PNG the suite owns: a page per (surface, viewport, scheme) and a component per (surface, region, scheme). */
 export function expectedBaselineFiles() {
   const out = new Set();
-  for (const s of SURFACES) for (const scheme of ['light', 'dark']) {
-    for (const v of VIEWPORTS) out.add(path.basename(fileFor(s.slug, v, scheme)));
-    for (const r of s.regions || []) out.add(path.basename(regionFileFor(s.slug, r.name, scheme)));
+  for (const s of SURFACES) for (const { viewport, scheme } of matrixOf(s)) {
+    out.add(path.basename(fileFor(s.slug, viewport, scheme)));
+    // components are captured at desktop only
+    if (viewport === 'desktop') for (const r of s.regions || []) out.add(path.basename(regionFileFor(s.slug, r.name, scheme)));
   }
   return out;
 }
@@ -277,13 +304,14 @@ async function main() {
   if (!combos(filter).length) { console.error(`no surface matches "${filter}" (surfaces: ${SURFACES.map((x) => x.slug).join(', ')})`); process.exit(2); }
   if (cmd === 'update') refuseUnlessAllowed(argv);
   const srv = await newDeterministicServer();
+  const servers = await serversFor(SURFACES.filter((x) => x.slug.includes(filter)), srv);
   const browser = await launch();
   let failed = 0;
   const pending = [];
   try {
     mkdirSync(BASELINE_DIR, { recursive: true });
     for (const { surface, viewport, scheme } of combos(filter)) {
-      const shot = await capture(browser, srv.info, surface, viewport, scheme);
+      const shot = await capture(browser, servers.infoFor(surface), surface, viewport, scheme);
       const targets = [[fileFor(surface.slug, viewport, scheme), shot.page, (png) => checkAgainstBaseline(browser, png, surface.slug, viewport, scheme)],
         ...Object.entries(shot.regions).map(([name, png]) => [regionFileFor(surface.slug, name, scheme), png, (p) => checkRegion(browser, p, surface.slug, name, scheme)])];
       for (const [file, png, compare] of targets) {
@@ -313,7 +341,7 @@ async function main() {
     const sz = baselineSizes();
     console.log(`${sz.count} baselines, ${(sz.totalKb).toFixed(0)} KB total (cap ${CFG.screenshots.max_total_kb} KB), biggest ${sz.biggest ? `${sz.biggest.f} ${sz.biggest.kb.toFixed(0)} KB` : 'none'}`);
     if (sz.totalKb > CFG.screenshots.max_total_kb) { console.error('the baselines exceed the total size cap'); failed += 1; }
-  } finally { await browser.close(); srv.stop(); }
+  } finally { await browser.close(); srv.stop(); servers.stop(); }
   if (failed) { console.error(`${failed} problem(s); diffs are in ${path.relative(REPO, REPORT_DIR)}`); process.exit(1); }
 }
 if (import.meta.url === `file://${process.argv[1]}`) main();

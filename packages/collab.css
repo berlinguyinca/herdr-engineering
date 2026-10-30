@@ -101,15 +101,7 @@
 /* ---- buttons and inputs ---- */
 /* the page itself and the dashboard-embedded view; never the rest of the dashboard */
 .cx-page button, .cx-embed button { font-family: var(--font-sans); font-size: .875rem; }
-.hd-btn { background: var(--accent); color: var(--text-on-accent); border: 1px solid transparent; padding: 8px 14px;
-  border-radius: var(--radius-sm); font-weight: 500; cursor: pointer; }
-.hd-btn:hover { background: var(--accent-hover); }
-.hd-btn--ghost { background: transparent; color: var(--text-secondary); border-color: var(--border); }
-.hd-btn--ghost:hover { background: var(--surface-hover); color: var(--text); }
-.hd-btn--danger { background: transparent; color: var(--status-failed); border-color: var(--border); }
-.hd-btn--danger:hover { background: var(--surface-hover); }
-.hd-btn--sm { padding: 4px 10px; font-size: .8125rem; }
-.hd-btn[disabled] { opacity: .55; cursor: default; }
+/* .hd-btn and its variants live in herdr-design-system/base.css */
 .cx-input, .cx-page input, .cx-embed input, .cx-page select, .cx-embed select { font: inherit; padding: 8px 10px; background: var(--surface);
   color: var(--text); border: 1px solid var(--border); border-radius: var(--radius-sm); min-width: 0; }
 .cx-field { display: flex; flex-direction: column; gap: 4px; font-size: .8125rem; color: var(--text-secondary); flex: 1 1 200px; }
@@ -157,12 +149,8 @@
 .cx-rtab--new { color: var(--accent); }
 .cx-roomhead { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 10px; }
 .cx-roomhead h1 { margin: 0; font-size: 1.35rem; }
-.cx-stabs { display: flex; gap: 4px; margin-bottom: 14px; flex-wrap: wrap; }
-.cx-stab { display: inline-flex; align-items: center; gap: 6px; border: 1px solid transparent; background: transparent; color: var(--text-secondary);
-  padding: 6px 14px; border-radius: 999px; cursor: pointer; }
-.cx-stab:hover { background: var(--surface-hover); color: var(--text); }
-.cx-stab[aria-selected=true] { background: var(--accent-weak); color: var(--accent); font-weight: 600; }
-.cx-badge { min-width: 18px; padding: 0 6px; border-radius: 999px; background: var(--accent); color: var(--text-on-accent);
+.cx-stabs { margin-bottom: 14px; }
+.cx-badge { display: inline-block; margin-left: 6px; vertical-align: middle; min-width: 18px; padding: 0 6px; border-radius: 999px; background: var(--accent); color: var(--text-on-accent);
   font-size: .6875rem; font-weight: 700; line-height: 18px; text-align: center; }
 .cx-badge[hidden], .cx-panel[hidden] { display: none; }
 .cx-cols { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 14px; align-items: start; }
@@ -259,11 +247,6 @@ textarea.cx-input { resize: vertical; font: inherit; }
 .cx-guide table { border-collapse: collapse; width: 100%; font-size: .9rem; }
 .cx-guide th, .cx-guide td { text-align: left; vertical-align: top; padding: 6px 10px; border-bottom: 1px solid var(--border, #d0d4da); }
 
-/* ---- dashboard-embedded view: the host page styles bare buttons green, so say what these are */
-.cx-embed .hd-btn--danger { background: transparent; color: var(--status-failed, #c0392b); border: 1px solid var(--border); }
-.cx-embed .hd-btn--danger:hover { background: var(--surface-hover); }
-.cx-embed .hd-btn--ghost { background: transparent; color: var(--text-secondary); border: 1px solid var(--border); }
-.cx-embed .hd-btn--ghost:hover { background: var(--surface-hover); color: var(--text); }
 #hcn-roomagents, #hcn-grant, #hcn-requests, #hcn-tasks { max-height: 560px; overflow-y: auto; }
 
 /* People: who asked to join, and what the operator did about it */
@@ -439,3 +422,61 @@ button.ctx-chip:focus-visible, .ctx-chip:focus-visible { outline: 2px solid curr
 .cx-m--mine .cx-mention--external::after { color: inherit; }
 .cx-mention__icon { font-size: .8em; margin-right: 2px; }
 .cx-m--mine .cx-mention { background: color-mix(in srgb, var(--text-on-accent) 18%, transparent); color: inherit; border-color: transparent; }
+
+/* ---- Mission Workbench: graph viewport, toolbar, status strip, inspector facts (S5) ---- */
+#hcn-lineage { container-type: inline-size; }
+@container (max-width: 760px) { .lin-grid2 { grid-template-columns: minmax(0, 1fr); } }
+.lin-viewport { overflow: hidden; position: relative; max-width: 100%; touch-action: pan-y; cursor: grab; }
+.lin-viewport--drag { cursor: grabbing; user-select: none; }
+.lin-viewport .lin-svg { max-width: 100%; height: auto; }
+.lin-viewport:focus-visible { outline: 2px solid var(--accent, #1f7ae0); outline-offset: 2px; }
+.lin-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.lin-tool { min-width: 44px; min-height: 44px; }
+.lin-zoom { min-width: 48px; text-align: center; font-size: .8125rem; color: var(--text-secondary, #555); }
+.lin-hint { margin: 4px 0 0; }
+.lin-badge { display: inline-flex; align-items: center; gap: 4px; padding: 4px 12px; border: 2px solid var(--text-secondary, #555); border-radius: 999px; font-size: .8125rem; font-weight: 600; color: var(--text, #1b1f24); background: var(--surface, #fff); }
+.lin-badge--live { border-style: solid; border-color: var(--status-ok, #1a9b6c); }
+.lin-badge--replay { border-style: dashed; border-color: var(--status-attention, #d89b1d); }
+.lin-status { display: grid; grid-template-columns: auto repeat(2, minmax(0, 1fr)); gap: 12px 24px; align-items: start; padding: 8px 0 12px; border-bottom: 1px solid var(--border-subtle, #d0d4da); }
+.lin-status ul { list-style: none; margin: 0; padding: 0; }
+.lin-status__counts { display: flex; flex-wrap: wrap; gap: 4px 12px; font-size: .8125rem; font-weight: 600; }
+.lin-status__h { margin: 0 0 4px; font-size: .8125rem; font-weight: 600; }
+.lin-status__list { display: grid; gap: 4px; }
+.lin-status p { margin: 0; }
+.lin-status > p { grid-column: 1 / -1; }
+.lin-facts { margin-bottom: 8px; }
+.lin-facts__list { list-style: none; margin: 0; padding: 0; display: grid; gap: 4px; }
+.lin-nr { color: var(--text-secondary, #555); font-style: italic; }
+.lin-terminal { display: grid; gap: 4px; }
+.lin-chip rect { fill: var(--text-secondary, #555); }
+.lin-chip text { font: 700 9px var(--font-sans, system-ui, sans-serif); fill: var(--surface, #fff); }
+.lin-k-agent .lin-box { stroke-width: 3; }
+.lin-k-session .lin-box { stroke-dasharray: 6 2; }
+.lin-lane-hl { fill: color-mix(in srgb, var(--accent, #1f7ae0) 14%, transparent); }
+@media (max-width: 640px) {
+  .lin-status { grid-template-columns: minmax(0, 1fr); }
+  .lin-toolbar .lin-tool { flex: 1 1 auto; }
+}
+@media (prefers-reduced-motion: reduce) { .lin-viewport { scroll-behavior: auto; } }
+.lin-status > div { min-width: 0; }
+.lin-status .hd-btn { max-width: 100%; height: auto; white-space: normal; text-align: left; overflow-wrap: anywhere; }
+/* filters disclosure + minimap (S5): the summary is a full-size target; nothing here animates */
+.lin-filterbox > summary, .lin-legend > summary { cursor: pointer; display: flex; align-items: center; min-height: 44px; font-weight: 600; }
+.lin-filterbox > summary:focus-visible, .lin-legend > summary:focus-visible { outline: 2px solid var(--accent, #1f7ae0); outline-offset: 2px; }
+.lin-minimap { margin: 8px 0 0; display: inline-block; }
+.lin-mm { display: block; max-width: 100%; height: auto; border: 1px solid var(--border, #8886); border-radius: 4px; background: var(--surface, transparent); cursor: crosshair; touch-action: manipulation; }
+.lin-mm-bar { fill: currentColor; opacity: .28; }
+.lin-mm-view { fill: color-mix(in srgb, var(--accent, #1f7ae0) 18%, transparent); stroke: var(--accent, #1f7ae0); stroke-width: 1.5; }
+.lin-minimap, .lin-mm, .lin-mm-view { transition: none; animation: none; }
+.lin-termauth .lin-tool { min-height: 44px; }
+/* display:flex drops the browser's disclosure marker: draw one (no animation) */
+.lin-filterbox > summary, .lin-legend > summary { list-style: none; gap: 8px; }
+.lin-filterbox > summary::-webkit-details-marker, .lin-legend > summary::-webkit-details-marker { display: none; }
+.lin-filterbox > summary::before, .lin-legend > summary::before { content: '▸'; display: inline-block; }
+.lin-filterbox[open] > summary::before, .lin-legend[open] > summary::before { content: '▾'; }
+
+/* Supporting room views sit after the four that carry the work, set quieter and divided from them. */
+.cx-stabs .cx-stab--minor { font-size: 12px; }
+.cx-stab:not(.cx-stab--minor) + .cx-stab--minor { margin-left: 8px; }
+.cx-newroom > summary { cursor: pointer; font-weight: 600; font-size: 1rem; margin-bottom: 8px; }
+.cx-helpers-idle h2 { margin-bottom: 2px; }

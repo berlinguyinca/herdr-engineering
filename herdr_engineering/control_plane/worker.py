@@ -48,7 +48,9 @@ async def _run_artifact_job_pass(conn, *, worker_id: str,
                 "UPDATE artifact_build_jobs SET status='failed', error=$1::jsonb, "
                 "completed_at=now() WHERE job_id=$2 AND status='running' "
                 "AND assigned_host_id=$3",
-                json.dumps({"message": str(exc)}), job_id, worker_id)
+                json.dumps({"message": str(exc),
+                            **({"code": exc.code} if getattr(exc, "code", None) else {})}),
+                job_id, worker_id)
             failed += int(updated == "UPDATE 1")
     return {"artifact_jobs_claimed": claimed,
             "artifact_jobs_completed": completed,
@@ -60,7 +62,8 @@ async def run_one_pass(conn, *, mission_store=None, session_store=None,
                        snapshot_store=None, artifact_store=None,
                        lease_ttl=LEASE_TTL, host_ttl=HOST_TTL,
                        artifact_ttl=ARTIFACT_TTL, worker_id=None,
-                       artifact_job_runner=None, max_artifact_jobs=1) -> dict:
+                       artifact_job_runner=None, max_artifact_jobs=1,
+                       inspector_snapshotter=None, fabric_compactor=None) -> dict:
     summary: dict[str, Any] = {}
 
     # Stale services -> unavailable (never delete).
@@ -110,6 +113,10 @@ async def run_one_pass(conn, *, mission_store=None, session_store=None,
         summary.update(await _run_artifact_job_pass(
             conn, worker_id=worker_id, runner=artifact_job_runner,
             max_jobs=max_artifact_jobs))
+    if conn is not None and inspector_snapshotter is not None:
+        summary["inspector_snapshot"] = await inspector_snapshotter.tick(conn)
+    if conn is not None and fabric_compactor is not None:
+        summary["fabric_compaction"] = await fabric_compactor.tick(conn)
     return summary
 
 

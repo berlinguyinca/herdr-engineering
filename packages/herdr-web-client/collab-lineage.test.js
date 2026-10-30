@@ -1,11 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  EDGE_STYLE, MAX_RENDER_NODES, buildGantt, filterGraph, fmtDuration, layoutGraph, mergePages, nextNode, pagesTruncated,
+  EDGE_STYLE, MAX_DRAWN_NODES, MAX_DRAWN_EDGES, NOT_REPORTED, buildGantt, centerOn, clampView, cullGraph, edgeLabel, fitView, focusSubgraph, inspectorFacts, isVisible, layoutCached, panBy, renderGraphToolbar, renderModeBadge, renderStatusStrip, statusSummary, viewportSize, visibleRect, zoomAt, filterGraph, fmtDuration, layoutGraph, mergePages, nextNode, pagesTruncated,
   renderGanttSvg, focusKey, focusSelector, focusSuccessor, renderGanttTable, renderGraphSvg, renderGraphTable, renderGraphLegend, renderInspector, renderLineage, renderReplay,
   nodeLabel, replayTarget, replayText, shapeOf, stateLook,
 } from '../collab-lineage.js';
 
+const ZOOM_MIN_FOR_TEST = 0.1;
 const node = (id, extra = {}) => ({ id, node_type: id.split(':')[0], label: extra.label ?? id.split(':')[1], state: extra.state ?? null, attrs: extra.attrs || {}, visibility_scope: 'room', ...extra });
 const edge = (t, a, b, extra = {}) => ({ edge_type: t, from_id: a, to_id: b, attrs: {}, stale: false, removed: false, ...extra });
 const HOSTILE = '<img src=x onerror=alert(1)>"onmouseover="x\'';
@@ -88,7 +89,7 @@ test('the SVG graph is escaped, labelled, keyboard operable and not colour-only'
   assert.match(html, /aria-pressed="true"/);
   assert.match(html, /aria-label="agent .*running, 1 outgoing and 0 incoming links\. Press Enter to inspect\./);
   assert.match(html, /stroke-dasharray="5 5"/, 'dependency is dashed');
-  assert.match(html, /needs \(stale\)/, 'text tag, not colour, says stale');
+  assert.match(html, /dependency \(stale\)/, 'text tag, not colour, says stale');
   assert.match(html, /●/);
   assert.match(html, /✕/);
   assert.match(html, /role="group" aria-label="Lineage graph: 2 nodes and 1 links/);
@@ -123,13 +124,17 @@ test('every link type has a distinct dash/tag pair and node types map to shapes'
   assert.equal(stateLook('weird').kind, 'other');
 });
 
-test('a very large graph is not drawn as SVG but stays fully available as a table', () => {
-  const nodes = Array.from({ length: MAX_RENDER_NODES + 5 }, (_, i) => node(`task:t${i}`));
-  const g = { nodes, edges: [] };
-  const svg = renderGraphSvg(g, layoutGraph(g));
-  assert.ok(!svg.includes('<svg'));
-  assert.match(svg, /more than the 300 drawn/);
-  assert.equal([...renderGraphTable(g).matchAll(/<tr/g)].length, nodes.length + 2 + 1, 'header rows plus a no-links row');
+test('a very large graph is drawn as a bounded viewport and stays fully available as a table', () => {
+  const nodes = Array.from({ length: 3000 }, (_, i) => node(`task:t${i}`, { state: i % 7 ? 'running' : 'done' }));
+  const edges = nodes.slice(1).map((n, i) => edge('dependency', nodes[Math.floor(i / 2)].id, n.id));
+  const g = { nodes, edges };
+  const layout = layoutGraph(g);
+  const zoomedOut = renderGraphSvg(g, layout, { vw: 960, vh: 480, view: { x: 0, y: 0, k: ZOOM_MIN_FOR_TEST } });
+  const drawn = [...zoomedOut.matchAll(/<g class="lin-node/g)].length;
+  assert.ok(drawn > 0 && drawn <= MAX_DRAWN_NODES + 2, `${drawn} nodes drawn of 3000 (cap ${MAX_DRAWN_NODES})`);
+  assert.ok([...zoomedOut.matchAll(/<g class="lin-edge/g)].length <= MAX_DRAWN_EDGES);
+  assert.match(zoomedOut, /nodes are in view; the 240 nearest the middle are drawn/);
+  assert.equal([...renderGraphTable(g).matchAll(/<tr/g)].length, 1000 + 2 + 1000 + 0, 'the table keeps its own row cap, with header rows');
 });
 
 test('the table view is a real table with captions, scopes and escaped cells', () => {

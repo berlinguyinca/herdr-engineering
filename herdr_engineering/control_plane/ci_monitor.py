@@ -15,6 +15,8 @@ from datetime import UTC, datetime
 from urllib.parse import urlsplit
 
 from .ci_observability import _Measurements
+from .redact import _BEGIN as _PEM_BEGIN
+from .redact import _END as _PEM_END
 from .redact import redact_payload, redact_text
 
 
@@ -89,10 +91,39 @@ def bound_ci_provider(factory, provider_url=None):
     return provider
 
 
+SLICE_TTL = 30              # seconds a step log read for an excerpt is reused
+SLICE_CACHE_LOGS = 4        # logs kept for that, each at most the collector's size cap
+SLICE_READS = 4             # excerpt reads that may be in flight at once
+_REDACTED_LINE = '[REDACTED]'
+
+
+def _private_key_lines(lines):
+    """Indexes of lines inside a PEM private-key block, found over the whole log.
+
+    Redacting an excerpt line by line cannot see a BEGIN line outside the excerpt, so the body of a key that starts above
+    it would be shown. An unterminated block runs to the end of the log, as `redact_text` treats it.
+    """
+    masked, inside = set(), False
+    for i, text in enumerate(lines):
+        if not inside and 'PRIVATE KEY-----' not in text:
+            continue
+        start = 0
+        if not inside:
+            begin = _PEM_BEGIN.search(text)
+            if begin is None:
+                continue
+            inside, start = True, begin.end()
+        masked.add(i)
+        if _PEM_END.search(text, start):
+            inside = False
+    return masked
+
+
 class CIMonitor:
     def __init__(self, *, provider_factory=None, interval=30, repo_limit=500,
                  budget=120, now=None, on_transition=None, actions_enabled=False,
-                 on_observation=None, max_in_flight=4, max_reads_per_refresh=600):
+                 on_observation=None, max_in_flight=4, max_reads_per_refresh=600,
+                 on_log_report=None, log_known=None, log_tests=None):
         from ..ci import _ProviderReadScheduler, _read_allowance
         self._scheduler = _ProviderReadScheduler(max_in_flight)
         self._max_reads_per_refresh = _read_allowance(max_reads_per_refresh)
@@ -113,9 +144,20 @@ class CIMonitor:
         self._refresh_lock = threading.Lock()
         self._stop = threading.Event()
         self._thread = None
+        self._log_thread = None
+        self._log_wake = threading.Event()
+        self._slice_cache = {}      # (provider, repository, run, step) -> (monotonic time, lines, truncated, masked line indexes)
+        self._slice_lock = threading.Lock()
+        self._slice_reads = threading.BoundedSemaphore(SLICE_READS)
         self._last_success = None
         self._on_transition = on_transition
         self._on_observation = on_observation
+        #: control_plane.ci_log_tests: counts parsed from finished runs' logs. Needs somewhere to keep them.
+        from .ci_logcollect import LogTestCollector, log_tests_config
+        self._log_collector = LogTestCollector(
+            log_tests_config(log_tests), ingest=on_log_report or (lambda body: None),
+            known=log_known or (lambda *key: None), provider_call=self._measurements.provider_call,
+        ) if on_log_report is not None else None
         self._observation_fingerprints = {}
         self._observed = {}
         self._baselined = set()
@@ -184,13 +226,19 @@ class CIMonitor:
                 self._view.update(refreshing=True, status='syncing')
                 self._thread = threading.Thread(target=self._loop, name='herdr-ci-poll', daemon=True)
                 self._thread.start()
+                if self._log_collector is not None:
+                    self._log_thread = threading.Thread(target=self._log_loop, name='herdr-ci-logs', daemon=True)
+                    self._log_thread.start()
 
     def close(self):
         self._stop.set()
+        self._log_wake.set()
         self._scheduler.close()
         self._history.close()
         if self._thread:
             self._thread.join(timeout=1)
+        if self._log_thread:
+            self._log_thread.join(timeout=1)
 
     def _loop(self):
         while not self._stop.is_set():
@@ -209,10 +257,33 @@ class CIMonitor:
             reads = self._scheduler.refresh(budget=self._budget, max_reads=self._max_reads_per_refresh,
                                             now=self._now, measurements=self._measurements)
             self._collect(reads)
+            self._log_wake.set()        # the log reader runs on its own thread: it must never hold up, or count in, a poll
         finally:
             self._update(refreshing=False, checked_at=_stamp())
             self._measurements.refreshed(self._now() - started)
             self._refresh_lock.release()
+
+    def _log_loop(self):
+        while not self._stop.is_set():
+            self._log_wake.wait()
+            self._log_wake.clear()
+            if not self._stop.is_set():
+                self._analyse_logs()
+
+    def _analyse_logs(self):
+        # Runs on its own thread after a poll has published its view, so reading logs never delays what the pages show,
+        # holds the refresh lock, or lengthens the measured refresh.
+        if self._log_collector is None or not self._log_collector.enabled or self._stop.is_set():
+            return
+        try:
+            provider = self._factory()
+            if not provider.available:
+                return
+            with self._lock:
+                pipelines = copy.deepcopy(self._view['pipelines'])
+            self._log_collector.run_cycle(provider, pipelines, self._stop)
+        except Exception:
+            pass        # a log that cannot be read leaves the run for the next cycle
 
     def _collect(self, reads):
         self._update(refreshing=True, stale=bool(self._view['pipelines']), error=None,
@@ -421,6 +492,76 @@ class CIMonitor:
                     'checked_at': _stamp()}
         except Exception as exc:
             return {'available': False, 'log': '', 'error': _error(exc)[1]}
+
+    def log_slice(self, repository, number, step, start, end, *, context=40, expect='', provider_url=None):
+        """Lines of one step's live log around an indexed test, redacted, or a plain statement of why not.
+
+        Line numbers are those of the log text as the collector read it. When the log is shorter than the range, or the
+        test's name is not where the index says it was, no slice is shown: a wrong slice would be worse than none.
+        """
+        repository, number = self._validate(repository, number)
+        if not isinstance(step, str) or not step.isascii() or not step.isdigit():
+            raise ValueError('a numeric step id is required')
+        start, end = int(start), int(end)
+        if start < 1 or end < start or end - start > 2000:
+            raise ValueError('a valid line range is required')
+        context = max(0, min(int(context), 200))
+        provider = bound_ci_provider(self._factory, provider_url)
+        limit = self._log_collector.max_log_bytes if self._log_collector else 4 * 1024 * 1024
+        base = {'provider_url': provider.base_url.rstrip('/')} if provider_url is not None else {}
+        try:
+            loaded = self._slice_log(provider, repository, number, step, limit)
+            if loaded is None:
+                return {'available': False, 'error': 'Step log is unavailable.', **base}
+            if loaded == 'busy':
+                return {'available': False, 'error': 'Several log excerpts are being read; try again in a moment.', **base}
+            lines, truncated, masked = loaded
+            if end > len(lines):
+                reason = ('The log is too large to read in full, and this range lies beyond what was read.'
+                          if truncated else 'The log is shorter than the stored line range; it may have been replaced.')
+                return {'available': True, 'slice': None, 'reason': reason, 'truncated': truncated, 'total_lines': len(lines), **base}
+            import re
+            tokens = [t for t in re.split(r'[^A-Za-z0-9_]+', str(expect or '')) if len(t) >= 4]
+            if tokens and not any(max(tokens, key=len) in text for text in lines[max(0, start - 2):end + 1]):
+                return {'available': True, 'slice': None, 'truncated': truncated, 'total_lines': len(lines),
+                        'reason': 'The log no longer matches the stored line range, so no excerpt is shown.', **base}
+            first, last = max(1, start - 1), min(len(lines), end + context)
+            return {'available': True, 'truncated': truncated, 'total_lines': len(lines), 'checked_at': _stamp(),
+                    'slice': {'first': first, 'last': last, 'start': start, 'end': end,
+                              'lines': [_REDACTED_LINE if first + i - 1 in masked else redact_text(text[:2000])
+                                        for i, text in enumerate(lines[first - 1:last])]}, **base}
+        except Exception as exc:
+            return {'available': False, 'error': _error(exc)[1], **base}
+
+    def _slice_log(self, provider, repository, number, step, limit):
+        """(lines, truncated, masked line indexes) of one step's log, read at most once per `SLICE_TTL` seconds.
+
+        Opening one test fires a request per click; the same log is read again for the next click on the same run.
+        """
+        key = (provider.base_url.rstrip('/'), repository, number, step, limit)
+        with self._slice_lock:
+            hit = self._slice_cache.get(key)
+            if hit and self._now() - hit[0] < SLICE_TTL:
+                return hit[1:]
+        if not self._slice_reads.acquire(timeout=5):
+            return 'busy'
+        try:
+            self._measurements.provider_call()
+            fetched = provider.step_log_text(repository, number, step, max_chars=limit)
+        finally:
+            self._slice_reads.release()
+        if fetched is None:
+            return None
+        from .ci_logtests import clean_lines
+        lines = clean_lines(fetched[0])
+        entry = (self._now(), lines, fetched[1], _private_key_lines(lines))
+        with self._slice_lock:
+            now = entry[0]
+            self._slice_cache = {k: v for k, v in self._slice_cache.items() if now - v[0] < SLICE_TTL}
+            while len(self._slice_cache) >= SLICE_CACHE_LOGS:
+                del self._slice_cache[min(self._slice_cache, key=lambda k: self._slice_cache[k][0])]
+            self._slice_cache[key] = entry
+        return entry[1:]
 
     def action(self, repository, number, action, *, provider_url=None):
         repository, number = self._validate(repository, number)

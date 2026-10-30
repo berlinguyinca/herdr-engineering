@@ -94,8 +94,7 @@ It reads Claude Code and Pi/Codex JSONL and OpenCode's SQLite database (opened
 
 ## Full report in the dashboard
 
-The agent page has a **Generate full report** button next to the model-written summary
-card. It runs the same `summary` skill the terminal uses and shows the result in the
+The agent page has a **Full report** button next to the model-written **Quick summary** button. It runs the same `summary` skill the terminal uses and shows the result in the
 summary card (a bounded, scrollable block) instead of the terminal. In the fullscreen
 workspace the summary and report sit in their own column beside the conversation and
 activity panes, so the panes and composer keep the whole viewport.
@@ -144,3 +143,38 @@ Limits (v1):
 - Roll the plugin (`deploy/deploy-fleet-agents.sh`) to every host that should be able to run reports.
 - `herdr-eng summary report --agent A --session ID [--harness claude]` prints the same
   result as JSON for use from a terminal.
+
+### Reading the report
+
+The report block opens with a strip: overall status, an **Evidence** badge (`complete`, `partial` or
+`limited`, copied from the report's own coverage verdict) and the **Resume point**. The numbered sections
+below are collapsible (outstanding work and next actions start open). When the conversation has moved on
+since the report was made, a **stale** badge shows how many newer messages exist and offers **Regenerate**.
+While a report runs the status line shows elapsed time. **Copy as markdown** copies the stored report;
+**Send to agent** posts the resume point and next actions to the agent as a message (confirmed first, and
+disabled once the agent has ended). Timestamps in the report that match a recorded turn jump to that turn
+(best effort: a timestamp with no turn within a day stays plain text). A failed or empty quick summary is
+reduced to one muted line once a full report exists. In the fullscreen workspace, token-usage rows are hidden
+from Activity unless **Show usage rows** is ticked, and **Hide activity** gives the conversation the full width.
+
+### Running `/summary` in a terminal
+
+In a Herdr pane, `/summary` (or `$summary` in Codex) no longer prints the whole report into the scrollback.
+It publishes the report and prints one line:
+
+- `herdr-eng summary publish --agent A --session ID` reads the report on stdin, validates and redacts it, and
+  writes `~/.cache/herdr-engineering/summary/<agent>-<session>.md` (mode 0600).
+- It posts the report to the control plane (`POST /api/v1/host/summary-reports/publish`, ingest role), where it
+  becomes the session's `full_report` with `source: "terminal"`. The dashboard names the agent by its recorded
+  identity; zero or several matching dashboard sessions are refused (`no_session`, `ambiguous_session`) rather
+  than guessed, and a running dashboard job is not cancelled.
+- It opens, or reuses, a read-only `less -R` side pane to the right of the agent (`--no-focus`), remembering
+  the pane in a sidecar file. `--no-pane` and `--no-dashboard` turn either half off.
+- If publishing fails, the skill prints the complete report so nothing is lost. Target mode and prepared
+  evidence runs never publish.
+
+### Work spread over several worktrees
+
+A session that moved into a different git worktree records every distinct `cwd` (latest last). The report's
+git facts come from the latest directory that is a repository; earlier distinct worktrees are listed as
+`other_worktrees` and reported as such, never merged into one state.

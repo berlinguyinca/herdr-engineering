@@ -35,7 +35,7 @@ class Client:
 @pytest.fixture()
 def server(acknowledged_sink):
     repo = ControlPlaneRepo(sink=acknowledged_sink)
-    svr = ControlPlaneServer(repo)
+    svr = ControlPlaneServer(repo, scheduler_admission=True)
     thread = threading.Thread(target=svr.serve, daemon=True)
     thread.start()
     svr.wait_until_ready()
@@ -164,6 +164,39 @@ def test_sessions_and_services(server):
     assert len(json.loads(body)["sessions"]) == 1
     status, _, body = c.get("/api/v1/services")
     assert json.loads(body)["services"][0]["port"] == 8080
+
+
+def test_session_commits_endpoint_reports_a_state_and_404_for_an_unknown_agent(server):
+    c, repo = server
+    repo.upsert_session("sx", host_id="h", agent_role="pi", repository_id="github.com/org/app", branch="feat/x")
+    status, _, body = c.get("/api/v1/sessions/sx/commits")
+    out = json.loads(body)
+    assert status == 200 and out["state"] == "unknown" and out["session_id"] == "sx" and out["commits"] == []
+    assert c.get("/api/v1/sessions/nope/commits")[0] == 404
+
+
+def test_pull_request_trail_endpoint_links_the_agent_and_rejects_bad_or_unknown_pull_requests(server):
+    c, repo = server
+    repo.upsert_session("sx", host_id="h", agent_role="pi", repository_id="github.com/org/app", branch="feat/x", status="active")
+    repo.upsert_pull_request("pr-1", repository="github.com/org/app", number=7, status="open", branch="feat/x")
+    status, _, body = c.get("/api/v1/pull-requests/org/app/7/trail")
+    out = json.loads(body)
+    assert status == 200 and out["pull_request"]["number"] == 7 and out["state"] == "linked"
+    assert [s["session_id"] for s in out["sessions"]] == ["sx"] and out["sources"]["ci"] == "unavailable"
+    assert out["signals"]["ci_green_first_try"]["value"] is None
+    assert c.get("/api/v1/pull-requests/org/app/8/trail")[0] == 404
+    assert c.get("/api/v1/pull-requests/org/app/0/trail")[0] == 400
+
+
+def test_pull_request_trail_is_cached_briefly_and_validates_the_host(server):
+    c, repo = server
+    repo.upsert_session("sx", host_id="h", agent_role="pi", repository_id="github.com/org/app", branch="feat/x", status="active")
+    repo.upsert_pull_request("pr-1", repository="github.com/org/app", number=7, status="open", branch="feat/x")
+    first = json.loads(c.get("/api/v1/pull-requests/org/app/7/trail")[2])
+    repo.upsert_pull_request("pr-1", repository="github.com/org/app", number=7, status="merged", branch="feat/x")
+    assert json.loads(c.get("/api/v1/pull-requests/org/app/7/trail")[2])["pull_request"]["status"] == first["pull_request"]["status"] == "open"
+    assert c.get("/api/v1/pull-requests/org/app/7/trail?host=github.com")[0] == 200
+    assert c.get("/api/v1/pull-requests/org/app/7/trail?host=bad%20host!")[0] == 400
 
 
 def test_session_with_colon_id_fetches_percent_encoded(server):
@@ -360,6 +393,18 @@ def test_ingest_endpoint_upserts_host(server):
     evs = json.loads(stream)["events"]
     # a routine heartbeat (same identity) records no HostHeartbeat event
     assert [e["event_type"] for e in evs] == ["HostRegistered"]
+
+
+def test_ingest_review_names_its_pull_request_and_a_bad_number_is_a_400(server):
+    c, repo = server
+    ok = {"entity_type": "review", "entity_id": "rv-pr", "event_type": "review.started",
+          "payload": {"reviewer": "codex", "repository": "github.com/org/app", "pull_request_number": 7}}
+    status, _ = c.post("/api/v1/ingest", ok)
+    assert status == 200
+    assert repo.list_reviews()[0]["pull_request_number"] == 7
+    status, body = c.post("/api/v1/ingest", {**ok, "entity_id": "rv-bad", "payload": {**ok["payload"], "pull_request_number": "7"}})
+    assert status == 400, body
+    assert [r["review_id"] for r in repo.list_reviews()] == ["rv-pr"]
 
 
 def test_ingest_delivery_entities_via_http_preserves_counts(server):
@@ -723,6 +768,7 @@ def test_fleet_config_takes_one_snapshot_per_request(tmp_path, acknowledged_sink
     store = FlippingStore()
     svr = ControlPlaneServer(ControlPlaneRepo(sink=acknowledged_sink), fleet_config=store)
     store.calls = 0  # construction reads the review_gate section once; count requests only
+    svr._deployments_stop.set()  # the deployment tick reads the config on its own thread; count requests only
     threading.Thread(target=svr.serve, daemon=True).start()
     svr.wait_until_ready()
     try:
@@ -771,3 +817,54 @@ def test_scheduler_lease_heartbeat_route_renews_and_rejects_stale_token(server):
         "lease_id": lease["lease_id"], "generation": lease["generation"], "token": "wrong", "ttl": 120,
     })
     assert status == 409
+
+
+def test_agent_evolution_endpoint_serves_phases_and_a_learning_record_and_404s_for_an_unknown_agent(server):
+    c, repo = server
+    repo.upsert_session("sx", host_id="h", agent_role="pi", repository_id="github.com/org/app", branch="feat/x", status="finished")
+    repo.upsert_pull_request("pr-1", repository="github.com/org/app", number=7, status="open", branch="feat/x")
+    repo.inspector.ingest("sx", {"events": [{"kind": "tool", "call_id": "c1", "phase": "start", "tool": "bash", "args_preview": "pytest -q"},
+                                            {"kind": "tool", "call_id": "c1", "phase": "end", "output": "boom", "is_error": True, "exit_code": 1}]})
+    status, _, body = c.get("/api/v1/sessions/sx/evolution")
+    out = json.loads(body)
+    assert status == 200 and out["session_id"] == "sx"
+    assert [p["key"] for p in out["phases"]] == ["assigned", "worked", "handed_off", "produced", "verified", "outcome", "cost"]
+    lr = out["learning_record"]
+    assert lr["tool_calls"]["total"]["value"] == 1 and lr["tool_calls"]["failed"]["value"] == 1 and lr["outcome"]["value"] == "finished"
+    assert lr["cost_usd_estimate"]["value"] is None and "price table" in lr["cost_usd_estimate"]["reason"]
+    pr = next(i for p in out["phases"] if p["key"] == "produced" for i in p["items"] if i["kind"] == "pull_request")
+    assert pr["number"] == 7 and pr["trail"].startswith("#/pr/org/app/7")
+    assert c.get("/api/v1/sessions/nope/evolution")[0] == 404
+
+
+def test_agent_evolution_is_cached_briefly(server):
+    c, repo = server
+    repo.upsert_session("sx", host_id="h", agent_role="pi", status="running")
+    first = json.loads(c.get("/api/v1/sessions/sx/evolution")[2])
+    repo.upsert_session("sx", host_id="h", agent_role="pi", status="failed")
+    again = json.loads(c.get("/api/v1/sessions/sx/evolution")[2])
+    assert first["learning_record"]["outcome"]["value"] == again["learning_record"]["outcome"]["value"] == "running"
+
+
+def test_agent_evolution_requires_a_viewer_key_like_commits(fc_server):
+    port, _, _ = fc_server
+    for path in ("/api/v1/sessions/nope/evolution", "/api/v1/sessions/nope/commits"):
+        assert _fc_req(port, "GET", path)[0] == 401
+        assert _fc_req(port, "GET", path, {"X-API-Key": "wrong"})[0] == 401
+        assert _fc_req(port, "GET", path, {"X-API-Key": "viewkey"})[0] == 404          # authorised, then the agent is unknown
+
+
+def test_agent_evolution_reports_an_absent_tool_ring_as_not_held_not_as_none(server):
+    c, repo = server
+    repo.upsert_session("sy", host_id="h", agent_role="pi", status="running")
+    out = json.loads(c.get("/api/v1/sessions/sy/evolution")[2])
+    total = out["learning_record"]["tool_calls"]["total"]
+    assert total["value"] is None and "evicted" in total["reason"]
+
+
+def test_evolution_config_is_validated():
+    from herdr_engineering.control_plane.agent_evolution import evolution_config
+    assert evolution_config(None) == {"stale_after_minutes": 120} and evolution_config({"stale_after_minutes": 30}) == {"stale_after_minutes": 30}
+    for bad in ([], {"stale_after_minutes": 0}, {"stale_after_minutes": True}, {"stale_after_minutes": "5"}, {"nope": 1}):
+        with pytest.raises(ValueError):
+            evolution_config(bad)

@@ -94,7 +94,8 @@ test('Overview caps active resources at four and shows slow progress and useful 
   assert.equal(await page.locator('[data-overview="sessions"] progress').count(), 0);
   assert.equal(await page.evaluate(() => window.reads.length), 5, 'one independent completion opens one slot');
   await page.evaluate(() => window.reads.find(r => r.key === 'services').reject(Object.assign(new Error('database unavailable'), { elapsedMs: 12050, requestId: 'req-123', retryAfterMs: 60000 })));
-  assert.match(await page.locator('[data-overview="services"]').innerText(), /database unavailable after 12.1s · Request req-123/);
+  assert.match(await page.locator('[data-overview="services"] .ov-stale').innerText(), /Could not refresh/);
+  assert.match(await page.locator('[data-overview="services"] .ov-stale').getAttribute('title'), /database unavailable after 12.1s · Request req-123/);
   assert.match(await page.locator('herdr-freshness').innerText(), /Services: database unavailable/);
   await page.evaluate(() => window.overview.dispose());
   const count = await page.evaluate(() => window.reads.length);

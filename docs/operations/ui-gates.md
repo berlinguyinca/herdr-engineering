@@ -50,7 +50,8 @@ start real Python servers, launch Chromium and push 10,000-node graphs with 600 
 | Surface | Gate |
 |---|---|
 | Rooms, chat, tabs, remote agent tabs (T08, T10) | accessibility audit (light and dark, owner and viewer), tablist arrow keys, no tab trap, screenshot at 3 viewports x 2 schemes |
-| Lineage, Gantt, replay (T09) | keyboard graph (one Tab stop, arrow keys), table alternative above the draw cap, replay by keyboard, stale-evidence edges drawn differently, perf at 2k to 10k nodes |
+| Mission Workbench (S5): inspector facts, pan/zoom/focus, status strip, 64-session chain, 1500 nodes, 375 and 320px | `ui-gates-workbench.test.mjs` on the `workbench` fixture (`real_server.py`), screenshots `collab-workbench*` |
+| Lineage, Gantt, replay (T09) | keyboard graph (one Tab stop, arrow keys), bounded graph viewport (at most 240 nodes drawn at any zoom) with the table alternative, replay by keyboard, stale-evidence edges drawn differently, perf at 2k to 10k nodes |
 | Comments, steering, forks (T12, T13) | keyboard-only comment, propose redirect, propose fork, owner confirms what was proposed by someone else; focus is never dropped to the body |
 | Proposals and quarantine (T11) | untrusted content is inert (hostile markup is text), reject by keyboard through the confirm dialog, focus kept |
 | Context, consult, links (T14) | audit, 320px reflow with 300-character unbroken labels, screenshot |
@@ -165,8 +166,10 @@ treat the numbers as an upper bound and re-measure on an idle machine or the CI 
 | 10,000 | 3.4 s | 896 ms | 458 / 1197 ms | 22 / 32 ms | 2 (323 ms) | 8 MB |
 
 (An earlier run on the same loaded host gave first renders of 473, 394 and 988 ms and key-to-frame p95 of 38, 108 and 40 ms; the
-spread between runs is the host load.) The first page is about 147 KB (200 nodes drawn as SVG). Above 300 loaded nodes the SVG is
-skipped (the page says "more than the 300 drawn") and the table alternative is shown, at most 1000 rows per table.
+spread between runs is the host load.) The first page is about 147 KB. These figures were measured when the SVG was skipped above 300
+loaded nodes; since the Mission Workbench change (S5) the graph is a viewport that draws at most 240 nodes and 480 links at any zoom, the
+table alternative is still at most 1000 rows per table, and the layout is cached by content (a pan, zoom or selection never lays it out
+again). The figures above have not been re-measured for the viewport.
 
 Before the fixes below, typing in the lineage filter took p50 482 ms / p95 611 ms per key at 2,000 nodes and p95 2417 ms at 10,000.
 
@@ -351,3 +354,29 @@ What the host must already have, because the screenshots are compared pixel for 
   fontconfig, so neither the host's fonts nor its rendering settings reach a screenshot.
 
 The suite takes about ten minutes on a workstation and runs one test at a time; give the step that much and one CPU core per Chromium.
+
+### Load tolerance
+
+The real-page gates wait for elements with Playwright's 30 s default and with explicit budgets (15 s for a room to open, 5-8 s in several
+interaction tests). `tests/playwright/ui-gates-lib.mjs` stretches both by the host's 1-minute load average per CPU (`loadScale`, clamped
+to 1x-3x): `openReal` sets the page default from it, and every explicit `waitFor`/`waitForFunction` budget in the harness is written
+`scaled(ms)`. Write new waits the same way: a bare `timeout: 5000` is the thing that flakes on a shared CI host (a page default does not
+override an explicit timeout, which is how the first version of this change missed most of the failures). On an idle host nothing changes. A pipeline that fails with a handful of 30-45 s `waitFor` timeouts and
+passes on a re-run of the same commit was load, not a regression; a failure that repeats on every run is not covered by this.
+A whole-suite retry was considered and rejected: it doubles the time of every failed run and can hide a real flaky test.
+
+### Time budgets and stale bases
+
+A healthy CI run is about 11 minutes (`ui-gates`) and the check itself is about a minute. `scripts/ci/ui-gates.sh` therefore fails fast:
+the suite has a 1500 s budget (`UI_GATES_SUITE_BUDGET_SECONDS`) and `baselines:check` has 300 s (`UI_GATES_BASELINES_BUDGET_SECONDS`).
+Exceeding a budget names the phase and exits non-zero. There is deliberately no per-test limit: `node --test --test-timeout` applies to
+each test *file* as a whole, and `tests/visual/ui-gates-visual.test.mjs` legitimately runs for several minutes (a 300 s limit cancelled
+it on the first attempt at this change). On 2026-10-28 a
+`networkidle` wait on a polling page added ~10 s to each of 268 captures: 11 min became 49 min, nothing failed, and the slowdown was
+mistaken for a contended host. A budget turns that into a clear red run the first time it happens.
+
+Each phase also prints `took Ns (budget Ms)`, so a creeping run is visible before it trips. Woodpecker checks out the PR head commit, not
+a merge with `main`, so a run measures the branch as it forked. The script therefore compares the fork point with the current `main` for
+the harness files (`.woodpecker`, `scripts/ci`, `tests/playwright/ui-gates-lib.mjs`, `tests/visual`, `package.json`) and prints a NOTICE
+listing what `main` has changed since. When a fix to the harness has merged, merge `main` into your branch and push before trusting a
+red or slow run: Woodpecker does not re-run a pipeline when only `main` moves.

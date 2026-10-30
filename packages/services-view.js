@@ -118,7 +118,7 @@ const styles = `<style>
 .sc-intro {color:var(--text-secondary); max-width:80ch; line-height:1.6}
 .sc-history>summary {cursor:pointer;color:var(--text-secondary);font-size:13px}.sc-history .sc-counts {margin:12px 0}
 .sc-counts {display:flex; flex-wrap:wrap; gap:8px; margin:12px 0}
-.sc-counts button {font:inherit;color:inherit;text-align:left;cursor:pointer;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:10px 14px;font-size:13px}
+.sc-counts button {font:inherit;color:inherit;text-align:left;cursor:pointer;background:var(--surface);border:1px solid var(--border);border-radius:var(--control-radius);padding:10px 14px;font-size:13px}
 .sc-counts strong {font-size:20px;margin-right:5px}
 .sc-controls {display:flex;flex-wrap:wrap;gap:10px;align-items:end;margin:12px 0}
 .sc-controls label {display:flex;flex-direction:column;gap:5px;font-size:13px}
@@ -224,7 +224,7 @@ export function mountServices(root, client, initial, {showAll = false, status, s
       <label>Group by<select id="sc-group"><option value="project">Project / repository</option><option value="host">Host</option><option value="type">Service type</option></select></label>
       <label class="sc-check"><input type="checkbox" id="sc-archived">Include archived</label>
     </div>
-    <div class="sc-toolbar"><span id="sc-result" role="status"></span><div><button class="hd-btn" id="sc-expand">Expand groups</button> <button class="hd-btn" id="sc-collapse">Collapse groups</button></div></div>
+    <div class="sc-toolbar"><span id="sc-result" role="status"></span><div><button class="hd-btn hd-btn--secondary" id="sc-expand">Expand groups</button> <button class="hd-btn hd-btn--secondary" id="sc-collapse">Collapse groups</button></div></div>
     <p id="sc-error" role="status" class="sc-meta"></p><div id="sc-results"></div>`;
   const el = id => root.querySelector(`#sc-${id}`);
   el('status').value = state.status; el('archived').checked = state.archived; el('group').value = state.group;

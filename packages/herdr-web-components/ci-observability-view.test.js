@@ -49,6 +49,8 @@ import {createServer} from 'node:http';
 import {readFile} from 'node:fs/promises';
 import path from 'node:path';
 import {chromium} from 'playwright';
+// The CI Health filter bar is a closed disclosure by default; tests that drive its controls open it first.
+const hf=async p=>{await p.locator('[data-health-filters]').waitFor({state:'attached',timeout:15000});await p.evaluate(()=>{const d=document.querySelector('[data-health-filters]');if(d)d.open=true;});};
 
 test('command center loads selected evidence lazily, rejects stale responses and retains UI state on outages',async()=>{
  const root=path.resolve(import.meta.dirname,'../..');
@@ -67,7 +69,8 @@ test('command center loads selected evidence lazily, rejects stale responses and
    },{onContext:context=>window.context=context});
   },{...summary,projects:[project(),project({provider_repo_id:'18'})]});
   await page.locator('[data-ob-project]').first().waitFor();
-  assert.deepEqual(await page.evaluate(()=>calls.map(c=>c[0])),['summary']);
+  assert.equal(await page.evaluate(()=>calls.filter(([kind,options])=>kind==='summary'&&!options.provider_repo_id).length),1);
+  assert.equal(await page.evaluate(()=>calls.some(c=>c[0]==='tests')),false,'test history still waits for a selection');
   await page.locator('[data-ob-project]').nth(1).click();
   await page.waitForFunction(()=>document.querySelector('[data-ob-tests]').textContent.includes('broken'));
   assert.equal(await page.evaluate(()=>calls.find(c=>c[0]==='tests')[1].provider_repo_id),'18');
@@ -121,7 +124,7 @@ test('CI page shares project context with the existing heatmap and inspector wit
     getCiReports:async options=>{calls.push(['reports',options]);return {reports:[],pipelines:[run]};},
     getCiPipeline:async(id,number)=>{calls.push(['pipeline',id,number]);return {pipeline:{...run,tasks:[{id:9,name:'Unit tests',state:'failure'}]},diagnosis:{evidence_availability:'unavailable',reason:'No validated report matches this run.',failed_steps:[{id:9,name:'Unit tests',state:'failure'}],failed_tests:[]}};},
     getCiLog:async(id,number,step)=>{calls.push(['log',id,number,step]);return {available:true,log:'Exact provider output',truncated:true};}
-   });
+   },{workspace:'health'});
   },{...summary,projects:[project(),project({provider_repo_id:'18'})]});
   await page.locator('[data-ob-project]').nth(1).waitFor();
   assert.doesNotMatch(await page.locator('main').innerText(),/\.ig-fix\{/,'styles must not leak into visible page text');
@@ -130,10 +133,8 @@ test('CI page shares project context with the existing heatmap and inspector wit
   await page.locator('[data-ob-project]').nth(1).click();
   assert.deepEqual(errors,[]);assert.equal(await page.locator('th[scope=row].ci-health-project').count(),1,await page.locator('[data-health-map]').textContent());
   assert.equal(await page.locator('[data-health-mode="14"]').getAttribute('aria-pressed'),'true');
-  await page.locator('button[data-health-layout="tree"]').click();
-  await page.locator('[data-health-tree] [data-health-disclosure] > summary').first().click();
-  await page.locator('[data-health-tree] [data-health-disclosure] [data-health-disclosure] > summary').first().click();
-  await page.locator('[data-health-run]').click();
+  await page.locator('[data-health-project][data-health-bucket]:not([data-health-bucket=""])').last().click();
+  await page.locator('[data-health-slot-run]').first().click();
   await page.locator('.ci-diagnosis').waitFor();
   assert.deepEqual(await page.evaluate(()=>{const c=calls.find(c=>c[0]==='reports'&&c[1].run_number);return c&&[c[1].provider_url,c[1].provider_repo_id,c[1].repository,c[1].run_number];}),['https://ci.example',18,'org/app',7]);
   assert.match(await page.locator('.ci-diagnosis').textContent(),/Test evidence unavailable/);
@@ -144,7 +145,7 @@ test('CI page shares project context with the existing heatmap and inspector wit
   await page.locator('[data-ob-days]').selectOption('7');
   assert.equal(await page.locator('[data-ci-period]').inputValue(),'7','legacy period reflects the shared window');
   assert.equal(await page.locator('[data-health-mode="7"]').getAttribute('aria-pressed'),'true');
-  await page.locator('[data-health-branch]').fill('feature');
+  await hf(page);await page.locator('[data-health-branch]').fill('feature');
   await page.waitForFunction(()=>document.querySelector('[data-ob-branch]').value==='feature');
   assert.equal(await page.locator('[data-ci-branch]').inputValue(),'feature','legacy branch reflects heatmap changes');
   for(const width of [390,1440,3840]){await page.setViewportSize({width,height:1000});assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true,`no page overflow at ${width}px`);}
@@ -177,7 +178,7 @@ async function reviewPage(run) {
     getCiPerformance:async({days})=>({schema_version:1,days,cache_groups:runs.map((r,i)=>({...r,kind:i?'Former cache':'Current cache',sample_count:5,restore_count:5,hit_count:3,hit_rate:.6})),execution_trends:[],alerts:[]}),
     getCiPipeline:async(id,number)=>({pipeline:{...runs.find(r=>r.run_number===number),tasks:[]},diagnosis:{evidence_availability:'unavailable'}})
    };
-   window.mount=()=>window.app=mountIntegrations(document.querySelector('main'),client);
+   window.mount=()=>window.app=mountIntegrations(document.querySelector('main'),client,{workspace:'health'});
   });
   await run(page);assert.deepEqual(errors,[]);
  }finally{await browser.close();server.closeAllConnections();await new Promise(resolve=>server.close(resolve));}
@@ -196,6 +197,7 @@ test('review: selected run report refresh retains evidence with a visible stale 
   mount();
  });
  await page.locator('[data-ob-project]').filter({hasText:'org/current'}).click();
+ await page.locator('[data-ci-workspace="tests"]').click();
  await page.locator('[data-ob-run]').click();
  const inspector=page.locator('.ig-inspector');
  const evidence=inspector.locator('.ci-insight-card').filter({hasText:'Test results'});
@@ -230,6 +232,25 @@ test('review: exact project identity reaches Runs, health, report and cache char
  assert.deepEqual(JSON.parse(value),['https://ci.example','17','org/current']);
 }));
 
+test('review: project selection synchronizes unchanged Runs options immediately, including clearing',()=>reviewPage(async page=>{
+ await page.evaluate(()=>mount());
+ await page.locator('[data-ob-project]').first().waitFor();
+ await page.waitForFunction(()=>document.querySelector('[data-ci-repository]').options.length===3);
+ const states=await page.evaluate(()=>{
+  const select=document.querySelector('[data-ci-repository]'),options=select.innerHTML;
+  return ['org/current','org/former',null].map(repository=>{
+   const button=repository?[...document.querySelectorAll('[data-ob-project]')].find(node=>node.textContent===repository):document.querySelector('[data-ob-clear]');
+   button.click();
+   return {value:select.value,sameNode:select===document.querySelector('[data-ci-repository]'),sameOptions:select.innerHTML===options};
+  });
+ });
+ assert.deepEqual(states,[
+  {value:JSON.stringify(['https://ci.example','17','org/current']),sameNode:true,sameOptions:true},
+  {value:JSON.stringify(['https://ci.example','17','org/former']),sameNode:true,sameOptions:true},
+  {value:'',sameNode:true,sameOptions:true},
+ ]);
+}));
+
 test('review: Runs repository selection updates command center and health with exact identity in both directions',()=>reviewPage(async page=>{
  await page.evaluate(()=>mount());await page.locator('[data-ob-project]').first().waitFor();
  await page.locator('[data-ci-workspace="runs"]').click();
@@ -240,6 +261,7 @@ test('review: Runs repository selection updates command center and health with e
  assert.deepEqual(await page.locator('th[scope=row].ci-health-project').allTextContents(),['org/former']);
  await page.waitForFunction(()=>calls.some(([key,o])=>key==='tests'&&o.repository==='org/former'&&o.provider_repo_id==='17'&&o.provider_url==='https://ci.example'));
  await page.locator('[data-ci-repository]').selectOption('');
+ await page.locator('[data-ci-workspace="health"]').click();
  assert.equal(await page.locator('[data-ob-clear]').isVisible(),false);
  await page.locator('[data-ob-project]').filter({hasText:'org/current'}).click();
  assert.equal(await page.locator('[data-ci-repository]').inputValue(),JSON.stringify(['https://ci.example','17','org/current']));
@@ -248,7 +270,7 @@ test('review: Runs repository selection updates command center and health with e
 test('review: representative runs activate and focus the inspector from every workspace, including reopening the same run',()=>reviewPage(async page=>{
  await page.evaluate(()=>mount());await page.locator('[data-ob-project]').first().waitFor();
  await page.locator('[data-ob-project]').filter({hasText:'org/current'}).click();
- for(const workspace of ['tests','health','runs','tests']) {
+ for(const workspace of ['tests','tests']) {      // representative runs live in the Tests workspace; the second pass reopens the same run
   await page.locator(`[data-ci-workspace="${workspace}"]`).click();
   await page.locator('[data-ob-run]').click();
   assert.equal(await page.locator('.ig-inspector').isVisible(),true,workspace);
@@ -285,6 +307,7 @@ test('review: mounting preserves existing saved health filters when no command-c
 test('review: mounted unavailable summaries show missing coverage instead of observed-zero cards',()=>reviewPage(async page=>{
  await page.evaluate(()=>{fixture={...fixture,available:false,projects:[],kpis:{project_count:0,success_count:0,failure_count:0,active_count:0},scope:{partial:true}};mount();});
  await page.waitForFunction(()=>calls.length>0);
+ await page.locator('[data-ci-workspace="overview"]').click();
  assert.match(await page.locator('[data-ob-summary]').textContent(),/unavailable/i);
  assert.match(await page.locator('[data-ob-status]').textContent(),/unavailable.*partial|partial.*unavailable/i);
  assert.equal(await page.locator('[data-ob-summary] .ci-ob-card').count(),0);
@@ -325,16 +348,14 @@ test('selected current-day bucket stays shared by Health, Tests and Runs after c
  await page.locator('[data-ci-workspace="tests"]').click();
  assert.match(await page.locator('[data-ci-insights]').textContent(),/1 retained runs · 1 test report attempts/);
  await page.locator('[data-ci-workspace="health"]').click();
- await page.locator('[data-health-tree] [data-health-disclosure] > summary').first().click();
- await page.locator('[data-health-tree] [data-health-disclosure] [data-health-disclosure] > summary').first().click();
- await page.locator('[data-health-tree] [data-health-run]').waitFor();
- assert.equal(await page.locator('[data-health-tree] [data-health-run]').count(),1);
+ await page.locator('[data-health-detail] [data-health-slot-run]').waitFor();
+ assert.equal(await page.locator('[data-health-detail] [data-health-slot-run]').count(),1);
 
  await page.clock.setFixedTime(new Date('2026-10-25T14:00:00Z'));
  await page.evaluate(()=>{calls=[];app.refresh();});
- await page.waitForFunction(()=>document.querySelectorAll('[data-health-tree] [data-health-run]').length===2);
+ await page.waitForFunction(()=>document.querySelectorAll('[data-health-detail] [data-health-slot-run]').length===2);
  await page.waitForFunction(()=>calls.some(([kind,o])=>kind==='tests'&&o.start));
- const refreshed=await page.evaluate(()=>calls.filter(([kind])=>kind==='tests'||kind==='summary').map(([,o])=>[o.start,o.end]));
+ const refreshed=await page.evaluate(()=>calls.filter(([kind,o])=>(kind==='tests'||kind==='summary')&&o.start!==null).map(([,o])=>[o.start,o.end]));
  assert.ok(refreshed.length>=3);
  for(const bounds of refreshed)assert.deepEqual(bounds,[initial.start,initial.end]);
  await page.locator('[data-ci-workspace="tests"]').click();
@@ -353,11 +374,11 @@ test('last-24-runs cell shares exact old run identity and mode with every consum
   mount();
  });
  await page.locator('[data-ob-project]').filter({hasText:'org/current'}).click();
- await page.locator('[data-health-mode="runs"]').click();
+ await hf(page);await page.locator('[data-health-mode="runs"]').click();
  await page.locator('[data-health-bucket]').last().click();
  await page.waitForFunction(()=>calls.some(([kind,o])=>kind==='tests'&&o.run_number===9));
  for(const kind of ['summary','tests']) {
-  const options=await page.evaluate(kind=>calls.findLast(([k,o])=>k===kind&&o.provider_repo_id)[1],kind);
+  const options=await page.evaluate(kind=>calls.findLast(([k,o])=>k===kind&&o.provider_repo_id&&o.run_number!=null)[1],kind);
   assert.equal(options.mode,'runs');assert.equal(options.run_number,9);
   assert.equal(options.days,null);
   assert.equal(options.provider_url,'https://ci.example');assert.equal(String(options.provider_repo_id),'17');assert.equal(options.repository,'org/current');
@@ -382,6 +403,7 @@ for(const origin of ['ob','health'])for(const control of ['search','failures'])t
  await page.locator('[data-health-bucket]').last().click();
  await page.waitForFunction(()=>calls.some(([kind,o])=>kind==='tests'&&o.start));
  await page.evaluate(()=>calls=[]);
+ await hf(page);
  if(control==='search')await page.locator(`[data-${origin}-search]`).fill('org/current');
  else await page.locator(`[data-${origin}-failures]`).check();
  await page.waitForFunction(()=>calls.some(([kind,o])=>kind==='tests'&&!o.start&&!o.end));
@@ -473,20 +495,18 @@ for(const [date,counts] of [['2026-10-25',[2,4,5,4,0]],['2026-10-24',[4,2,0,0,0]
   mount();
  },date);
  await page.locator('[data-ob-project]').filter({hasText:'org/current'}).click();
- await page.locator('[data-health-mode="hours"]').click();
+ await hf(page);await page.locator('[data-health-mode="hours"]').click();
  const bucket=`hour:${Date.parse(date+'T12:00:00Z')}`;
  await page.locator(`[data-health-bucket="${bucket}"]`).click();
  await page.waitForFunction(()=>calls.some(([kind,o])=>kind==='tests'&&o.start));
  const initial=await page.evaluate(()=>calls.findLast(([kind])=>kind==='tests')[1]);
- await page.locator('[data-health-tree] [data-health-disclosure] > summary').first().click();
- await page.locator('[data-health-tree] [data-health-disclosure] [data-health-disclosure] > summary').first().click();
  const clocks=['2026-10-25T12:30:00Z','2026-10-25T12:45:00Z','2026-10-25T13:00:00Z','2026-10-26T12:30:00Z','2026-10-26T13:00:00Z'];
  for(const [i,clock] of clocks.entries()) {
   await page.clock.setFixedTime(new Date(clock));
   await page.evaluate(()=>{calls=[];app.refresh();});
-  await page.waitForFunction(count=>document.querySelectorAll('[data-health-tree] [data-health-run]').length===count,counts[i]);
+  await page.waitForFunction(count=>document.querySelectorAll('[data-health-detail] [data-health-slot-run]').length===count,counts[i]);
   await page.waitForFunction(()=>calls.some(([kind])=>kind==='tests'));
-  for(const options of await page.evaluate(()=>calls.filter(([kind])=>kind==='summary'||kind==='tests').map(([,o])=>o))) {
+  for(const options of await page.evaluate(()=>calls.filter(([kind,o])=>(kind==='summary'||kind==='tests')&&o.start!==null).map(([,o])=>o))) {
    assert.equal(options.mode,'hours');assert.equal(options.days,null);
    assert.deepEqual([options.start,options.end],[initial.start,initial.end]);
   }
@@ -498,4 +518,17 @@ for(const [date,counts] of [['2026-10-25',[2,4,5,4,0]],['2026-10-24',[4,2,0,0,0]
  }
  assert.deepEqual([initial.start,initial.end],[`${date}T12:00:00.000Z`,`${date}T13:00:00.000Z`]);
  await page.evaluate(()=>app.dispose());
+}));
+
+test('overview lists the projects with the most failed runs; choosing one opens Projects with it selected, and the tiles say what they cover',()=>reviewPage(async page=>{
+ await page.evaluate(()=>{fixture.projects=fixture.projects.map((p,i)=>({...p,failure_count:i?1:9,completed_count:i?1:9}));});
+ await page.evaluate(async()=>{const {mountIntegrations}=await import('/packages/integrations-view.js');window.app=mountIntegrations(document.querySelector('main'),client);});
+ await page.locator('[data-ci-workspace="overview"][aria-selected="true"]').waitFor();
+ const worst=page.locator('[data-ob-worst] button');await worst.first().waitFor();
+ assert.equal(await worst.first().textContent(),'org/current','the project with the most failures is first');
+ assert.match(await page.locator('[data-ob-worst]').textContent(),/9 failed of 9/);
+ assert.match(await page.locator('[data-ob-caption]').textContent(),/Last 14 days.*Needs attention lists only failures no later run has fixed/);
+ await worst.first().click();
+ assert.equal(await page.locator('[data-ci-workspace="health"]').getAttribute('aria-selected'),'true');
+ assert.equal(await page.locator('[data-ob-project][aria-pressed="true"]').textContent(),'org/current');
 }));

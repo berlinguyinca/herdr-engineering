@@ -87,7 +87,7 @@ class Proposal:
     history: list[str] = field(default_factory=list)
 
 
-ACTIONS = frozenset({"request_ci_repair", "propose_issue", "link_entities", "pause_ingestion"})
+ACTIONS = frozenset({"request_ci_repair", "ci_rerun", "propose_issue", "link_entities", "pause_ingestion"})
 
 
 class ActionBoard:
@@ -115,7 +115,8 @@ class ActionBoard:
             self._idem[(org_id, requester, idempotency_key)] = p.id
         return p
 
-    def approve(self, proposal_id: str, *, approver: str, org_id: str, payload_sha256: str, resource_version: int) -> Proposal:
+    def approve(self, proposal_id: str, *, approver: str, org_id: str, payload_sha256: str, resource_version: int,
+                allow_self: bool = False) -> Proposal:
         p = self._p.get(proposal_id)
         if p is None or p.org_id != org_id:
             raise pi.NotFound("proposal")
@@ -126,7 +127,7 @@ class ActionBoard:
             raise pi.Conflict("approval window expired")
         # A bad attempt is recorded but never changes the state: otherwise any operator could kill a pending proposal
         # with one wrong hash. Only a matching approval by someone else, a rejection, or expiry ends it.
-        if approver == p.requester:
+        if approver == p.requester and not allow_self:     # allow_self: single-operator mode only
             p.history.append("self-approval refused")
             raise pi.Conflict("requester cannot approve their own proposal")
         if payload_sha256 != p.payload_sha256 or resource_version != p.resource_version:
@@ -155,7 +156,7 @@ class ActionBoard:
     def pending(self, org_id: str) -> list[Proposal]:
         """Awaiting proposals for an org; expired ones are marked and dropped from the list."""
         now, out = self._clock(), []
-        for p in self._p.values():
+        for p in list(self._p.values()):          # a snapshot: requests may insert from other threads
             if p.org_id != org_id:
                 continue
             if p.state == "awaiting_approval" and now > p.expires_at:

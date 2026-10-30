@@ -48,6 +48,17 @@ class RustFSClient:
         self._s3.put_object(Bucket=self._bucket, Key=key, Body=data)
         return key, digest
 
+    def put_at(self, key: str, data: bytes) -> str:
+        """Write a mutable staging object (resumable upload parts) under a ``staging/`` key.
+
+        Content-addressed keys are shared between artifacts and must never be rewritten or deleted per upload, so
+        staging data lives under its own prefix and is the only thing an upload may overwrite or delete.
+        """
+        if not key.startswith("staging/") or ".." in key.split("/"):
+            raise ValueError("put_at only writes under the staging/ prefix")
+        self._s3.put_object(Bucket=self._bucket, Key=key, Body=data)
+        return key
+
     @staticmethod
     def _key_for_digest(digest: str) -> str:
         return f"sha256/{digest[:2]}/{digest[2:4]}/{digest}"

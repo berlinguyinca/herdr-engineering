@@ -165,6 +165,13 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=_cmd_capabilities)
 
+    # bridge ---------------------------------------------------------------
+    p = sub.add_parser("bridge", help="Rakazo mobile bridge helpers (control_plane.rakazo_bridge)")
+    bsub = p.add_subparsers(dest="bridge_command", required=True)
+    bsub.add_parser("hash-password", help="read a password from the terminal (or stdin) and print the scrypt hash "
+                    "for control_plane.rakazo_bridge.accounts[].password_scrypt; the password is never an argument"
+                    ).set_defaults(func=_cmd_bridge_hash_password)
+
     # fleet ----------------------------------------------------------------
     p = sub.add_parser("fleet", help="one-command fleet onboarding + version sync")
     fsub = p.add_subparsers(dest="fleet_command", required=True)
@@ -299,6 +306,8 @@ def _build_parser() -> argparse.ArgumentParser:
     asub.add_parser("list", help="list stored artifacts").set_defaults(func=_cmd_art_list)
     p2 = asub.add_parser("retention", help="enforce retention policy")
     p2.set_defaults(func=_cmd_art_retention)
+    from .artifact_reports_client import add_report_subparser
+    add_report_subparser(asub)
     # system-graph artifact (P5): deterministic sanitized snapshot renderer.
     ga = sub.add_parser("graph-artifact", help="render a graph snapshot to validated HTML (system-graph P5)")
     gas = ga.add_subparsers(dest="graph_artifact_command", required=True)
@@ -335,6 +344,12 @@ def _build_parser() -> argparse.ArgumentParser:
     p2.add_argument("--harness", choices=("claude", "codex"), default="claude", help="summarizer harness")
     p2.add_argument("--timeout", type=int, default=300)
     p2.set_defaults(func=_cmd_summary_report)
+    p2 = smsub.add_parser("publish", help="publish a finished /summary report (stdin) to the dashboard and a side pane")
+    p2.add_argument("--agent", required=True, choices=("claude", "pi", "codex", "opencode"))
+    p2.add_argument("--session", required=True, help="session id of the summarized session")
+    p2.add_argument("--no-pane", action="store_true")
+    p2.add_argument("--no-dashboard", action="store_true")
+    p2.set_defaults(func=_cmd_summary_publish)
 
     # journal --------------------------------------------------------------
     p = sub.add_parser("journal", help="session journal & timeline (spec 0090)")
@@ -628,6 +643,15 @@ def _build_parser() -> argparse.ArgumentParser:
     p2.add_argument("--include-gap-tail", action="store_true",
                     help="also set aside every row after the first missing sequence (may drop genuine events)")
     p2.set_defaults(func=_cmd_cp_collab_repair)
+    p2 = csub.add_parser("assistant-audit", help="anchor the assistant audit head off the event store, or "
+                         "verify the stored chain against the last anchor (detects truncation/rollback)")
+    p2.add_argument("action", choices=["anchor", "verify"])
+    p2.add_argument("--fleet-config", default=FLEET_CONFIG_DEFAULT,
+                    help="central fleet config; control_plane.personal_assistant.audit.anchor_file names the file")
+    p2.add_argument("--control-plane", default=None, help="control-plane base URL (default: host.json)")
+    p2.add_argument("--api-key-file", required=True,
+                    help="PATH to a file holding the API key of a principal in the tenant to anchor (never the key itself)")
+    p2.set_defaults(func=_cmd_cp_assistant_audit)
     p2 = csub.add_parser("web", help="serve the control-plane UI + /api/v1 + SSE")
     p2.add_argument("--host", default="127.0.0.1",
                     help="bind host (default 127.0.0.1; private-by-default)")
@@ -752,6 +776,8 @@ def _build_parser() -> argparse.ArgumentParser:
                     help="control-plane base URL (default: host.json control_plane_url)")
     p2.add_argument("--interval", type=float, default=0,
                     help="seconds between snapshot reads (default: 0 = once)")
+    p2.add_argument('--allow-open', action='store_true',
+                    help='Allow publication without a key to an intentionally open trusted-network server')
     p2.set_defaults(func=_cmd_cp_feed_pi)
     p2 = csub.add_parser("mission-feed", help="publish read-only live Pi mission activity")
     p2.add_argument("--control-plane", default=None,
@@ -789,7 +815,7 @@ def _cmd_cp_feed_pi(args) -> int:
     from .control_plane.pi_snapshot import post_envelopes, snapshot_to_envelopes
     from .host_config import HostConfigUnavailable, resolve_control_plane
 
-    if not os.environ.get("HERDR_CP_INGEST_KEY", "").strip():
+    if not os.environ.get("HERDR_CP_INGEST_KEY", "").strip() and not args.allow_open:
         print("Set HERDR_CP_INGEST_KEY to an ingest-role API key", file=sys.stderr)
         return 2
     if not math.isfinite(args.interval) or args.interval < 0 or args.interval > 2 ** 31 - 1:
@@ -800,6 +826,7 @@ def _cmd_cp_feed_pi(args) -> int:
     except HostConfigUnavailable:
         print("Set --url or configure host.json control_plane_url", file=sys.stderr)
         return 2
+    previous_payloads = None
     while True:
         try:
             doc = json.loads(Path(args.snapshot).expanduser().read_text(encoding="utf-8"))
@@ -809,7 +836,11 @@ def _cmd_cp_feed_pi(args) -> int:
             print("Cannot read a valid Pi snapshot; check --snapshot and its schema", file=sys.stderr)
             return 2
         try:
-            posted = post_envelopes(url, None, envelopes)
+            payloads = [{key: value for key, value in envelope.items() if key != 'occurred_at'}
+                        for envelope in envelopes]
+            posted = (0 if previous_payloads == payloads else
+                      post_envelopes(url, None, envelopes, allow_open=args.allow_open))
+            previous_payloads = payloads
         except (ValueError, RuntimeError):
             print("Snapshot ingest failed; check --url and HERDR_CP_INGEST_KEY", file=sys.stderr)
             return 1
@@ -967,6 +998,18 @@ def _cmd_summary_report(args) -> int:
         _print_json({"ok": False, "error": exc.code, "detail": exc.detail})
         return 1
     return 0
+
+
+def _cmd_summary_publish(args) -> int:
+    from . import summary_report as sr
+    try:
+        out = sr.publish_report(args.agent, args.session, sys.stdin.read(),
+                                pane=not args.no_pane, dashboard=not args.no_dashboard)
+    except sr.ReportError as exc:
+        _print_json({"ok": False, "error": exc.code, "detail": exc.detail})
+        return 1
+    _print_json(out)
+    return 0 if out["ok"] else 1
 
 
 def _cmd_agent_mine(args) -> int:
@@ -2877,11 +2920,17 @@ def _cp_config(fleet_config_path=None) -> dict:
         path = Path(fleet_config_path).expanduser()
         if path.exists():
             try:
-                dsn = load_fleet_config(path).section("control_plane").get("pg_dsn")
+                section = load_fleet_config(path).section("control_plane")
             except FleetConfigError as exc:
                 raise SystemExit(f"--fleet-config: {exc}") from None
+            dsn = section.get("pg_dsn")
             if dsn:
                 out["postgres_dsn"] = str(dsn)
+            # The worker writes render output to RustFS: take its endpoint and credentials from the
+            # fleet file too, or it falls back to the image's defaults and is refused (InvalidAccessKeyId).
+            for key in ("rustfs_endpoint", "rustfs_bucket", "rustfs_region", "minio_user", "minio_password"):
+                if section.get(key):
+                    out[key] = str(section[key])
     return out
 
 
@@ -2906,6 +2955,56 @@ def _cmd_cp_migrate(args) -> int:
     applied = asyncio.run(_run())
     _print_json({"ok": True, "applied": applied, "migrations_dir": migrations})
     return 0
+
+
+def _cmd_cp_assistant_audit(args) -> int:
+    """``control-plane assistant-audit anchor|verify``: exit 0 only when the anchor was appended / the chain matches."""
+    import urllib.error
+    import urllib.request
+    from pathlib import Path
+    from urllib.parse import urlencode
+
+    from .control_plane import audit_anchor as aa
+    from .host_config import HostConfigUnavailable, exit_unavailable, resolve_control_plane
+
+    _, cp = _load_cp_fleet_config(args.fleet_config)
+    pa = cp.get("personal_assistant") if isinstance(cp.get("personal_assistant"), dict) else {}
+    anchor_file = str((pa.get("audit") or {}).get("anchor_file") or "") if isinstance(pa.get("audit"), dict) else ""
+    if not anchor_file:
+        print("control_plane.personal_assistant.audit.anchor_file is not set in the fleet config", file=sys.stderr)
+        return 2
+    try:
+        key = Path(args.api_key_file).expanduser().read_text().strip()
+        base = resolve_control_plane(args.control_plane)
+    except HostConfigUnavailable as exc:
+        return exit_unavailable(exc)
+    except OSError as exc:
+        print(f"cannot read --api-key-file: {exc.strerror}", file=sys.stderr)
+        return 2
+
+    def get(path):
+        req = urllib.request.Request(f"{base}{path}", headers={"X-API-Key": key})
+        with urllib.request.urlopen(req, timeout=30) as response:
+            return json.loads(response.read(1024 * 1024))
+    def server_check(seq, sha):
+        return get("/api/v1/assistant-audit/check?" + urlencode({"seq": seq, "sha256": sha}))
+    try:
+        head = get("/api/v1/assistant-audit/head")
+        if args.action == "anchor":
+            if not head.get("chain_intact"):
+                print("refusing to anchor: the stored chain does not verify internally", file=sys.stderr)
+                return 1
+            _print_json({"anchored": aa.anchor_checked(anchor_file, head, server_check), "file": anchor_file})
+            return 0
+        result = aa.verify_against_anchor(anchor_file, head.get("tenant_id", ""), server_check)
+        _print_json(result)
+        return 0 if result["ok"] else 1
+    except aa.AnchorError as exc:
+        print(f"audit anchor: {exc}", file=sys.stderr)
+        return 1
+    except (OSError, ValueError) as exc:
+        print(f"audit anchor: control plane request failed: {exc}", file=sys.stderr)
+        return 1
 
 
 def _cmd_cp_collab_repair(args) -> int:
@@ -3000,7 +3099,9 @@ def _cmd_cp_web(args) -> int:
     from .control_plane.repo import ControlPlaneRepo
     from .control_plane.sink import DurableEventSink
 
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")   # boot phase timings
     fleet_store, cp = _load_cp_fleet_config(getattr(args, "fleet_config", None))
+    _validate_graph_merge_gate(cp)
     switch_store = fleet_store
     replay_flag = getattr(args, "collab_replay_history", None)      # an explicit --collab-replay-history wins over the YAML
     api_keys = _parse_api_keys(args.api_key, args.api_keys)
@@ -3071,6 +3172,16 @@ def _cmd_cp_web(args) -> int:
         usage_retention = usage_retention_config(cp.get("llm_proxy"))
     except ValueError as exc:
         raise SystemExit(f"fleet config {exc}") from None
+    from .control_plane.usage_spend import usage_prices_config
+    try:
+        usage_prices = usage_prices_config(cp.get("usage"))
+    except ValueError as exc:
+        raise SystemExit(f"fleet config {exc}") from None
+    from .control_plane.agent_evolution import evolution_config
+    try:
+        evolution = evolution_config(cp.get("evolution"))
+    except ValueError as exc:
+        raise SystemExit(f"fleet config {exc}") from None
     from .control_plane.attention_inbox import attention_config
     try:
         attention = attention_config(cp.get("attention"))
@@ -3086,8 +3197,13 @@ def _cmd_cp_web(args) -> int:
         ci_fix = ci_fix_config(cp.get("ci_fix"))
     except ValueError as exc:
         raise SystemExit(f"fleet config {exc}") from None
+    from .control_plane.ci_logcollect import log_tests_config
+    try:
+        ci_log_tests = log_tests_config(cp.get("ci_log_tests"))
+    except ValueError as exc:
+        raise SystemExit(f"fleet config {exc}") from None
     _require_durable_review_gate(cp, dsn)
-    source = _maybe_pg_source(dsn)
+    source = _maybe_pg_source(dsn, inspector_snapshots=_inspector_snapshot_settings(cp)[0])
     # When durable storage is wired, attach a write-through sink so every
     # ingested event persists to Postgres instead of dying with the in-memory
     # repo on restart (Phase 1a). Best-effort; never blocks or breaks serving.
@@ -3214,7 +3330,13 @@ def _cmd_cp_web(args) -> int:
         collab.contextual = normalize_contextual(getattr(args, "collab_contextual", None))
         collab.insights = normalize_insights(getattr(args, "collab_insights", None))
         _wire_collab_switches(collab, switch_store, pinned=frozenset({"replay_history"}) if replay_flag else frozenset())
+    from .control_plane.rakazo_bridge import rakazo_bridge_config
+    try:
+        rakazo_bridge_config(cp.get("rakazo_bridge"))      # an enabled but malformed bridge stops startup here, clearly
+    except ValueError as exc:
+        raise SystemExit(f"fleet config {exc}") from None
     svr = ControlPlaneServer(repo, api_keys=api_keys, lineage_key_scopes=lineage_key_scopes,
+                             rakazo_bridge=cp.get("rakazo_bridge"), rakazo_bridge_dsn=dsn,
                              federation_source=federation_source,
                              system_graph=system_graph,
                              host=args.host, port=args.port, source=source,
@@ -3230,13 +3352,17 @@ def _cmd_cp_web(args) -> int:
                              collab_require_https=args.collab_require_https,
                              fleet_config=fleet_store, ci_actions=cp.get("ci_actions") is True,
                              fabric_resolver=_fabric_url_resolver(), fabric_services=_fabric_service_lister(), fabric_names=_fabric_names_getter(),
+                             scheduler_admission=cp.get("scheduler_admission") is True,
+                             scheduler_limits=cp.get("scheduler_limits") or {},
+                             skill_registry=cp.get("skill_registry"),
                              summary_config=cp.get("agent_summaries") or {},
                              summary_report_config=cp.get("summary_report") or {},
-                             assistant_config={"personal_assistant": cp["personal_assistant"]}
-                                 if isinstance(cp.get("personal_assistant"), dict) else None,
+                             unified_workspace_config=cp.get("unified_workspace") if isinstance(cp.get("unified_workspace"), dict) else None,
+                             assistant_config=_assistant_config(cp),
                              review_quorum=_review_quorum_config(cp),
-                             usage_retention=usage_retention, attention=attention,
-                             ci_fix=ci_fix, missions=missions, github_pg_dsn=dsn,
+                             single_operator=cp.get("single_operator") is True,
+                             usage_retention=usage_retention, usage_prices=usage_prices, evolution=evolution, attention=attention,
+                             ci_fix=ci_fix, missions=missions, github_pg_dsn=dsn, ci_log_tests=ci_log_tests,
                              public_port=args.collab_public_port,
                              public_host=args.collab_public_host,
                              collab_only=args.collab_only,
@@ -3246,6 +3372,9 @@ def _cmd_cp_web(args) -> int:
                              operator_hosts=args.collab_operator_host,
                              collab_operator_url=args.collab_operator_url,
                              collab_dashboard_hosts=args.collab_dashboard_host)
+    if artifact_adapter is not None and svr.artifact_graph_gate is not None:
+        # the lineage retraction set is server state kept in the registry: reload it before serving a single read
+        svr.artifact_graph_gate.load_retractions(artifact_adapter("load_retractions"))
     # Self-report the control-plane stack so the Services page has real data.
     try:
         if not args.collab_only:   # collab-only has no stack to report
@@ -3488,6 +3617,15 @@ def _review_quorum_config(cp):
         raise SystemExit(f"--fleet-config: {exc}") from None
 
 
+def _validate_graph_merge_gate(cp):
+    """Refuse to start on an enabled-but-invalid ``control_plane.graph_merge_gate`` (never enables anything)."""
+    from .control_plane.graph_merge_gate import validate_section
+    try:
+        validate_section((cp or {}).get("graph_merge_gate"))
+    except ValueError as exc:
+        raise SystemExit(f"--fleet-config: {exc}") from None
+
+
 def _load_cp_fleet_config(path_arg):
     """Return (FleetConfigStore, control_plane section) or (None, {}) when no file exists."""
     from pathlib import Path
@@ -3535,7 +3673,92 @@ def _maybe_rustfs_client(cp=None):
     return client
 
 
-def _maybe_pg_source(dsn):
+def _inspector_snapshot_settings(cp) -> tuple[bool, float]:
+    """``control_plane.inspector_snapshots: {enabled, interval_seconds}`` (off unless ``enabled`` is exactly true)."""
+    raw = (cp or {}).get("inspector_snapshots") or {}
+    if not isinstance(raw, dict):
+        raise SystemExit("fleet config control_plane.inspector_snapshots must be a mapping")
+    interval = raw.get("interval_seconds", 600)
+    if isinstance(interval, bool) or not isinstance(interval, (int, float)) or interval < 60:
+        interval = 600
+    return raw.get("enabled") is True, float(interval)
+
+
+def _cmd_bridge_hash_password(args):
+    """Print ``scrypt$N$r$p$salt$hash`` for a password read from a TTY prompt (asked twice) or from stdin. Nothing but the
+    hash reaches stdout; the password is never an argument, an environment variable or a file."""
+    import getpass
+
+    from .control_plane.rakazo_bridge import hash_password
+    if sys.stdin.isatty():
+        password = getpass.getpass("Password: ")
+        if getpass.getpass("Repeat password: ") != password:
+            print("the passwords differ", file=sys.stderr)
+            return 1
+    else:
+        password = sys.stdin.readline().rstrip("\r\n")
+    if len(password) < 12:
+        print("use a password of at least 12 characters", file=sys.stderr)
+        return 1
+    print(hash_password(password))
+    return 0
+
+
+def _assistant_config(cp):
+    """``{"personal_assistant": ...}`` from the fleet section. In single-operator mode the owner's own approval of the
+    assistant's sensitive actions is allowed (there is only one person); otherwise the section is passed through."""
+    pa = cp.get("personal_assistant")
+    if not isinstance(pa, dict):
+        return None
+    if cp.get("single_operator") is True:
+        actions = pa.get("actions")
+        pa = {**pa, "actions": {**(actions if isinstance(actions, dict) else {}), "allow_self_approval": True}}
+    return {"personal_assistant": pa}
+
+
+def _fabric_compaction_settings(cp):
+    """``control_plane.fabric_compaction`` as CompactionSettings. Off unless ``enabled`` is exactly true, and a dry run
+    (counts only) unless ``dry_run`` is exactly false."""
+    from .control_plane.fabric_compaction import CompactionSettings
+    raw = (cp or {}).get("fabric_compaction") or {}
+    if not isinstance(raw, dict):
+        raise SystemExit("fleet config control_plane.fabric_compaction must be a mapping")
+
+    def number(key, default, minimum):
+        value = raw.get(key, default)
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or value < minimum:
+            raise SystemExit(f"fleet config control_plane.fabric_compaction.{key} must be a number >= {minimum}")
+        return float(value)
+    retention = raw.get("archive_retention_days", 30)
+    if retention is not None:
+        retention = number("archive_retention_days", 30, 1)
+    return CompactionSettings(
+        enabled=raw.get("enabled") is True, dry_run=raw.get("dry_run") is not False,
+        interval_seconds=number("interval_seconds", 3600, 60), min_age_days=number("min_age_days", 2, 1),
+        batch_rows=int(number("batch_rows", 1_000_000, 1000)), chunk_rows=int(number("chunk_rows", 5000, 100)),
+        chunk_pause_seconds=number("chunk_pause_seconds", 0.25, 0), max_pass_seconds=number("max_pass_seconds", 300, 10),
+        archive_retention_days=retention,
+        rebuild_checkpoint=raw.get("rebuild_checkpoint") is not False,
+        keep_checkpoints=int(number("keep_checkpoints", 2, 1)))
+
+
+def _worker_fabric_compactor(fleet_config_path):
+    """The fabric compactor when the fleet file enables it, else None."""
+    from pathlib import Path
+
+    from .control_plane.fabric_compaction import FabricCompactor
+    from .fleet_config import FleetConfigError, load_fleet_config
+    if not fleet_config_path or not Path(fleet_config_path).expanduser().exists():
+        return None
+    try:
+        cp = load_fleet_config(Path(fleet_config_path).expanduser()).section("control_plane")
+    except FleetConfigError as exc:
+        raise SystemExit(f"--fleet-config: {exc}") from None
+    settings = _fabric_compaction_settings(cp)
+    return FabricCompactor(settings) if settings.enabled else None
+
+
+def _maybe_pg_source(dsn, *, inspector_snapshots=False):
     """Build a PostgresSource from a DSN, or None if not provided."""
     if not dsn:
         return None
@@ -3543,7 +3766,27 @@ def _maybe_pg_source(dsn):
 
     # Lazy: PostgresSource connects on its own persistent event loop when the
     # server first hydrates from Postgres, so connect+fetch share one loop.
-    return PostgresSource(dsn=dsn)
+    return PostgresSource(dsn=dsn, inspector_snapshots=inspector_snapshots)
+
+
+def _worker_snapshot_writer(fleet_config_path):
+    """The inspector snapshot writer when the fleet file enables it, else None."""
+    from pathlib import Path
+
+    from .control_plane.inspector import InspectorStore
+    from .control_plane.inspector_snapshot import SnapshotWriter
+    from .fleet_config import FleetConfigError, load_fleet_config
+    if not fleet_config_path or not Path(fleet_config_path).expanduser().exists():
+        return None
+    try:
+        cp = load_fleet_config(Path(fleet_config_path).expanduser()).section("control_plane")
+    except FleetConfigError as exc:
+        raise SystemExit(f"--fleet-config: {exc}") from None
+    enabled, interval = _inspector_snapshot_settings(cp)
+    if not enabled:
+        return None
+    limits = cp.get("inspector_limits") or {}
+    return SnapshotWriter(lambda: InspectorStore.from_config(limits), interval=interval)
 
 
 def _parse_api_keys(single_key, pairs_str):
@@ -3610,16 +3853,27 @@ def _cmd_cp_worker(args) -> int:
             migrations = args.migrations or _cp_migrations_dir()
             await Migrator(conn).apply(migrations)
             rustfs = _maybe_rustfs_client(cp)
+            from .config import load_config
+            from .control_plane.artifact_lineage import lineage_poster_from_section
+            try:
+                worker_cfg = ((load_config().get("control_plane") or {}).get("artifact_worker") or {})
+            except Exception:  # noqa: BLE001 - no readable config means no lineage poster, as before
+                worker_cfg = {}
             render_runner = (ArtifactRenderRunner(ArtifactStore(conn, rustfs),
-                                                   RendererRegistry())
+                                                   RendererRegistry(),
+                                                   lineage=lineage_poster_from_section(worker_cfg.get("lineage")))
                              if rustfs is not None else None)
             runner = render_runner if render_runner is not None else None
             worker_id = args.host_id or socket.gethostname()
+            snapshotter = _worker_snapshot_writer(getattr(args, "fleet_config", None))
+            compactor = _worker_fabric_compactor(getattr(args, "fleet_config", None))
             if args.once:
                 return await run_one_pass(conn, worker_id=worker_id,
-                                          artifact_job_runner=runner)
+                                          artifact_job_runner=runner, inspector_snapshotter=snapshotter,
+                                          fabric_compactor=compactor)
             await run_worker(conn, interval=args.interval, worker_id=worker_id,
-                             artifact_job_runner=runner)
+                             artifact_job_runner=runner, inspector_snapshotter=snapshotter,
+                             fabric_compactor=compactor)
             return None
         finally:
             await conn.close()

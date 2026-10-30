@@ -17,6 +17,12 @@ when:
     path:
       include: ['packages/**', 'tests/playwright/**', 'tests/visual/**', 'docs/assets/screenshots/**', 'scripts/ci/ui-gates.sh', 'package.json', 'package-lock.json', 'herdr_engineering/control_plane/**']
 
+# Only the hive `large` pool (metabolomicsgrp/high, 16 dedicated CPUs and 64 GB per agent) runs this. The gate renders ~270 pages in
+# Chromium and a shared 4-8 CPU agent host timed out under load (pipelines 113, 115, 121, 125); network/services/woodpecker-slurm
+# hive.env matches `label:cluster=hive` to that pool, the same way rust.yaml does.
+labels:
+  cluster: hive
+
 skip_clone: true
 
 steps:
@@ -27,7 +33,7 @@ steps:
       - 'test -r /etc/woodpecker-git-credentials || { echo "the job staged no forge credential" >&2; exit 1; }'
       - 'git init -q -b "${CI_COMMIT_BRANCH:-main}" .'
       - 'git remote add origin "https://github.com/${CI_REPO}.git"'
-      - 'git fetch --no-tags --depth=1 origin "$CI_COMMIT_SHA"'
+      - 'git fetch --no-tags --depth=200 origin "$CI_COMMIT_SHA"   # enough history for the stale-base notice in ui-gates.sh to find the fork point'
       - 'git checkout -q FETCH_HEAD'
       - 'git --no-pager log --oneline -1'
 

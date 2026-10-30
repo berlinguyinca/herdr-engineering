@@ -1,6 +1,7 @@
 """Dashboard full /summary report: a durable queue that the owning host's worker claims and finishes."""
 import json
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -219,12 +220,12 @@ def test_unsaved_outcome_stays_readable_and_does_not_block_a_retry(acknowledged_
 
 # -- HTTP ----------------------------------------------------------------------------------------
 class Http:
-    def __init__(self, sink, enabled=True):
+    def __init__(self, sink, enabled=True, **server_kwargs):
         self.repo = ControlPlaneRepo(sink=sink)
         native(self.repo)
         self.server = ControlPlaneServer(
-            self.repo, api_keys={'read': 'viewer', 'write': 'operator', 'host': 'ingest'},
-            summary_config={'enabled': False}, summary_report_config={'enabled': enabled})
+            self.repo, api_keys={'read': 'viewer', 'write': 'operator', 'host': 'ingest', **server_kwargs.pop('extra_keys', {})},
+            summary_config={'enabled': False}, summary_report_config={'enabled': enabled}, **server_kwargs)
         threading.Thread(target=self.server.serve, daemon=True).start()
         self.server.wait_until_ready()
 
@@ -277,6 +278,51 @@ def test_http_flow_auth_and_full_report_in_get(http):
     assert h.call(BASE, key='read', method='GET')[1]['capabilities']['summary_report'] is False
 
 
+def test_http_bound_keys_act_only_for_their_hosts(http):
+    h = http(architecture_options={'agent_hosts': {'host': ['bender'], 'agent-b': ['beast']},
+                                   'require_host_binding': True},
+             extra_keys={'agent-b': 'agent', 'agent-free': 'agent'})
+    assert h.call(BASE + '/summary/report')[1]['status'] == 'queued'
+    claim = '/api/v1/host/summary-reports/claim'
+    assert h.call(claim, {'host_id': 'bender'}, key='agent-b')[0] == 403          # bound to another host
+    assert h.call(claim, {'host_id': 'bender'}, key='agent-free')[0] == 403       # unbound agent key refused
+    assert h.call(claim, {'host_id': 'beast'}, key='host')[0] == 403              # bound ingest key, wrong host
+    for path in ('result', 'publish'):
+        assert h.call(f'/api/v1/host/summary-reports/{path}', {'host_id': 'bender'}, key='agent-b')[0] == 403
+    status, got = h.call(claim, {'host_id': 'bender'}, key='host')
+    assert status == 200 and len(got['jobs']) == 1                                # its own host works
+    assert h.call(claim, {'host_id': 'anything'}, key='write')[0] == 200          # operators stay trusted
+
+
+def test_concurrent_duplicate_results_store_once(acknowledged_sink):
+    repo = ControlPlaneRepo(sink=acknowledged_sink)
+    native(repo)
+    svc = service(repo)
+    svc.start(SID, actor=ACTOR)
+    (job,) = svc.claim('bender')
+    real = repo.record_event
+
+    def slow(*args, **kwargs):
+        time.sleep(0.05)                      # widen the window between adopting the job and storing its outcome
+        return real(*args, **kwargs)
+
+    repo.record_event = slow
+    results = []
+    gate = threading.Barrier(4)
+
+    def post():
+        gate.wait()
+        results.append(svc.finish('bender', ok(job))[1])
+
+    threads = [threading.Thread(target=post) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert [e['event_type'] for e in repo.stream('session', SID)].count('SummaryReportCompleted') == 1
+    assert sum(1 for r in results if r.get('status') == 'done') == 1
+
+
 def test_http_disabled_hides_the_feature(http):
     h = http(enabled=False)
     status, body = h.call(BASE + '/summary/report')
@@ -284,3 +330,72 @@ def test_http_disabled_hides_the_feature(http):
     assert h.call('/api/v1/host/summary-reports/claim', {'host_id': 'bender'}, key='host')[1] == {'ok': True, 'jobs': []}
     assert 'full_report' not in h.call(BASE + '/summary', key='read', method='GET')[1]
     assert h.call(BASE, key='write', method='GET')[1]['capabilities']['summary_report'] is False
+
+
+def test_report_records_how_much_of_the_session_it_covers(acknowledged_sink):
+    repo = ControlPlaneRepo(sink=acknowledged_sink)
+    native(repo)
+    repo.inspector.ingest(SID, {'kind': 'message', 'role': 'user', 'text': 'one', 'message_id': 'm0'})
+    repo.inspector.ingest(SID, {'kind': 'message', 'role': 'assistant', 'text': 'two', 'message_id': 'm1'})
+    svc = service(repo)
+    svc.start(SID, actor=ACTOR)
+    seq = repo.inspector.newest_seq(SID)
+    assert seq is not None and seq >= 1
+    (job,) = svc.claim('bender')
+    svc.finish('bender', ok(job))
+    assert svc.get(SID)['basis_seq'] == seq                 # the dashboard compares it with the newest event it sees
+    assert service(repo).get(SID)['basis_seq'] == seq        # and it survives a restart
+
+
+def test_terminal_publish_lands_on_the_matching_agent(acknowledged_sink):
+    repo = ControlPlaneRepo(sink=acknowledged_sink)
+    native(repo)
+    native(repo, 'other', agent_session={'agent': 'claude', 'kind': 'id', 'value': 'zzz'})
+    svc = service(repo)
+    status, body = svc.publish('bender', {'agent': 'claude', 'target': 'abc-123', 'report': REPORT})
+    assert status == 200 and body['session_id'] == SID
+    done = svc.get(SID)
+    assert done['state'] == 'done' and done['source'] == 'terminal' and done['report'] == STORED
+    assert svc.get('other')['state'] == 'idle'
+
+
+def test_terminal_publish_refusals(acknowledged_sink):
+    repo = ControlPlaneRepo(sink=acknowledged_sink)
+    native(repo)
+    native(repo, 'twin')                                      # same harness session on the same host
+    svc = service(repo)
+    for body, status in (({'agent': 'claude', 'target': 'abc-123', 'report': REPORT}, 409),
+                         ({'agent': 'claude', 'target': 'nope', 'report': REPORT}, 404),
+                         ({'agent': 'claude', 'target': 'abc-123', 'report': 'hi'}, 422),
+                         ({'agent': 'gemini', 'target': 'abc-123', 'report': REPORT}, 400),
+                         ({'agent': 'claude', 'target': '--x', 'report': REPORT}, 400)):
+        with pytest.raises(ReportRefused) as err:
+            svc.publish('bender', body)
+        assert err.value.status == status
+    with pytest.raises(ReportRefused):
+        svc.publish('beast', {'agent': 'claude', 'target': 'abc-123', 'report': REPORT})   # another host's agent
+    off = service(repo, enabled=False)
+    with pytest.raises(ReportRefused) as err:
+        off.publish('bender', {'agent': 'claude', 'target': 'abc-123', 'report': REPORT})
+    assert err.value.body['reason'] == 'reports_disabled'
+
+
+def test_terminal_publish_does_not_cancel_a_running_job(acknowledged_sink):
+    repo = ControlPlaneRepo(sink=acknowledged_sink)
+    native(repo)
+    svc = service(repo)
+    svc.start(SID, actor=ACTOR)
+    (job,) = svc.claim('bender')
+    svc.publish('bender', {'agent': 'claude', 'target': 'abc-123', 'report': REPORT})
+    assert svc.get(SID)['state'] == 'running'                  # the open run is still tracked
+    assert svc.finish('bender', ok(job))[1]['status'] == 'done'
+
+
+def test_http_terminal_publish_needs_a_host_token(http):
+    h = http()
+    body = {'host_id': 'bender', 'agent': 'claude', 'target': 'abc-123', 'report': REPORT}
+    assert h.call('/api/v1/host/summary-reports/publish', body, key='read')[0] == 403
+    status, out = h.call('/api/v1/host/summary-reports/publish', body, key='host')
+    assert status == 200 and out['session_id'] == SID
+    full = h.call(BASE + '/summary', key='read', method='GET')[1]['full_report']
+    assert full['state'] == 'done' and full['source'] == 'terminal'

@@ -626,6 +626,15 @@ Ansible deploys the same unit + script on the designated gateway host
 Design and deployment model:
 [`docs/architecture/dev-fabric-gateway.md`](docs/architecture/dev-fabric-gateway.md).
 
+## Lineage continuity, artifact visibility and delivery metrics
+
+The lineage graph (sessions, handoffs, branches, reviews, PRs, CI, artifacts) is a read model over stored events; Pi, AutoSpec and
+GitHub stay authoritative. Operator material: [runbook](docs/operations/lineage-continuity-runbook.md) (restart/replay, interrupted
+handoff, rollback, flags and grants), [release checklist](docs/operations/lineage-release-checklist.md), and the
+[contract section](docs/contracts/lineage-events.md) on artifact nodes, the ACL read gate and `delivery` metrics. Everything is
+off or additive by default; configuration is YAML only. Install and test: `pip install -e '.[dev,collab,review-gate,federation]'`, then
+`python3 -m pytest tests/control_plane/test_artifact_scope.py tests/control_plane/test_lineage_metrics.py -q`.
+
 ## Contributing
 
 See `CONTRIBUTING.md`. In short: run `scripts/validate.sh` (lint + tests +
@@ -649,6 +658,9 @@ curl -X POST http://dev.lan/api/v1/llm/keys -d '{"project":"my-project","label":
 curl -X POST http://dev.lan/api/v1/llm/keys/<key_id>/revoke
 export OPENAI_BASE_URL=http://dev.lan:8088/v1 OPENAI_API_KEY=hk-...
 ```
+
+The Usage page can estimate spend from a price table you put in `control_plane.usage.prices`; see
+[docs/usage-spend-estimate.md](docs/usage-spend-estimate.md).
 
 Requests are forwarded to `llm.upstream_url` (e.g. `https://llm.metabolomics.us`) with the one
 dedicated lab key, `llm.upstream_key` in the central fleet file. `deploy/control-plane/deploy.sh`

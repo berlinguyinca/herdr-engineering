@@ -16,11 +16,12 @@ export class ApiError extends Error {
 const CONDITIONAL_ENTRIES = 64;
 
 export class HerdrClient {
-  constructor(baseUrl = '', { fetchImpl = fetch, user = 'operator', tenant = 'default' } = {}) {
+  constructor(baseUrl = '', { fetchImpl = fetch, user = 'operator', tenant = 'default', headers = {} } = {}) {
     this.base = baseUrl.replace(/\/+$/, '');
     this.fetch = fetchImpl;
     this.user = user;
     this.tenant = tenant;
+    this.headers = { ...headers };  // extra headers (e.g. API key) sent on every request
     this.conditional = new Map();  // url -> { etag, text } (bounded by CONDITIONAL_ENTRIES)
   }
 
@@ -31,7 +32,7 @@ export class HerdrClient {
     const doFetch = this.fetch;
     for (let attempt = 0; attempt < 2; attempt++) {
       const held = attempt === 0 ? this.conditional.get(url) : undefined;
-      const headers = { Accept: 'application/json' };
+      const headers = { ...this.headers, Accept: 'application/json' };
       if (held) headers['If-None-Match'] = held.etag;
       const res = await doFetch(url, { method: 'GET', headers, signal });
       const current = () => this.conditional.get(url) === held;
@@ -65,7 +66,7 @@ export class HerdrClient {
   async request(path, { method = 'GET', body, signal = AbortSignal.timeout(15000) } = {}) {
     const startedAt = Date.now();
     const url = `${this.base}${path}`;
-    const headers = { Accept: 'application/json', 'X-Herdr-User': this.user, 'X-Herdr-Tenant': this.tenant };
+    const headers = { ...this.headers, Accept: 'application/json', 'X-Herdr-User': this.user, 'X-Herdr-Tenant': this.tenant };
     let payload;
     if (body !== undefined) {
       headers['Content-Type'] = 'application/json';
@@ -151,8 +152,8 @@ export class HerdrClient {
     return `${this.base}/api/v1/artifacts/${encodeURIComponent(id)}/download`;
   }
 
-  artifactVersions(id, { signal } = {}) {
-    return this.request(`/api/v1/artifacts/${encodeURIComponent(id)}/versions`, { signal });
+  artifactVersions(id, { signal, summary = false } = {}) {
+    return this.request(`/api/v1/artifacts/${encodeURIComponent(id)}/versions${summary ? '?summary=true' : ''}`, { signal });
   }
 
   artifactVersion(id, versionId, { signal } = {}) {
@@ -173,6 +174,61 @@ export class HerdrClient {
     return this.request(`/api/v1/artifact-reviews/${encodeURIComponent(reviewId)}/complete`, {
       method: 'POST', body: { decision, comments }, signal,
     });
+  }
+
+  artifactReport(id, versionId, { signal } = {}) {
+    return this.request(`${this.artifactReportPath(id, versionId)}/report`, { signal });
+  }
+
+  artifactReportPath(id, versionId) {
+    return `/api/v1/artifacts/${encodeURIComponent(id)}/versions/${encodeURIComponent(versionId)}`;
+  }
+
+  artifactReportDiff(id, versionId, baseVersionId, { signal } = {}) {
+    return this.request(`${this.artifactReportPath(id, versionId)}/diff?base_version_id=${encodeURIComponent(baseVersionId)}`, { signal });
+  }
+
+  artifactReportFeedback(id, versionId, { signal, limit, offset } = {}) {
+    const query = new URLSearchParams();
+    if (limit != null) query.set('limit', String(limit));
+    if (offset != null) query.set('offset', String(offset));
+    return this.request(`${this.artifactReportPath(id, versionId)}/feedback${query.size ? `?${query}` : ''}`, { signal });
+  }
+
+  addArtifactReportFeedback(id, versionId, body, { signal } = {}) {
+    return this.request(`${this.artifactReportPath(id, versionId)}/feedback`, { method: 'POST', body, signal });
+  }
+
+  recordArtifactReportCheck(id, versionId, body, { signal } = {}) {
+    return this.request(`${this.artifactReportPath(id, versionId)}/checks`, { method: 'POST', body, signal });
+  }
+
+  artifactReportAssetUrl(id, versionId, assetId) {
+    return `${this.base}${this.artifactReportPath(id, versionId)}/assets/${encodeURIComponent(assetId)}`;
+  }
+
+  artifactReportPreview(id, versionId, { signal } = {}) {
+    return this.artifactReportContent(`${this.artifactReportPath(id, versionId)}/preview`, 'text', signal);
+  }
+
+  downloadArtifactReportAsset(id, versionId, assetId, { signal } = {}) {
+    return this.artifactReportContent(`${this.artifactReportPath(id, versionId)}/assets/${encodeURIComponent(assetId)}`, 'blob', signal);
+  }
+
+  async artifactReportContent(path, kind, signal) {
+    const doFetch = this.fetch;
+    const response = await doFetch(`${this.base}${path}`, {
+      headers: { ...this.headers, 'X-Herdr-User': this.user, 'X-Herdr-Tenant': this.tenant, Accept: kind === 'text' ? 'text/html' : 'application/octet-stream' }, signal,
+    });
+    if (!response.ok) {
+      const text = await response.text();
+      let body;
+      try { body = JSON.parse(text); } catch { body = { raw: text }; }
+      const error = new ApiError(response.status, body, body?.error || `HTTP ${response.status}`);
+      error.requestId = response.headers?.get?.('X-Request-ID') || '';
+      throw error;
+    }
+    return kind === 'text' ? response.text() : response.blob();
   }
 
   listPublications({ signal } = {}) {
@@ -245,6 +301,11 @@ export class HerdrClient {
 
   getSession(id, { signal } = {}) {
     return this.request(`/api/v1/sessions/${encodeURIComponent(id)}`, { signal });
+  }
+
+  // Commits and pull requests the server can attribute to this agent without guessing (state: linked | ambiguous | none).
+  getSessionCommits(id, { signal } = {}) {
+    return this.request(`/api/v1/sessions/${encodeURIComponent(id)}/commits`, { signal });
   }
 
   getAgentSummary(id, { signal } = {}) {
@@ -477,6 +538,11 @@ export class HerdrClient {
     return this.request('/api/v1/ci', { signal });
   }
 
+  // -- deployments (read-only staged rollout view) --------------------------
+  getDeployments({ signal } = {}) {
+    return this.request('/api/v1/deployments', { signal });
+  }
+
   getCiReports({ signal, compact = false, provider_url, provider_repo_id, repository, run_number } = {}) {
     const query = new URLSearchParams();
     if (compact) query.set('compact', '1');
@@ -524,15 +590,21 @@ export class HerdrClient {
     return this.request(`/api/v1/ci/log?${query}`, { signal });
   }
 
+  // Lines of one step's live log around an indexed test; the server says plainly when the range is gone.
+  getCiLogSlice(repository, number, step, { start, end, context = 40, expect = '', signal, providerUrl } = {}) {
+    const query = new URLSearchParams({ repository, number: String(number), step: String(step), start: String(start), end: String(end), context: String(context), ...(expect ? { expect: String(expect).slice(0, 500) } : {}), ...(providerUrl!==undefined?{provider_url:providerUrl}:{}) });
+    return this.request(`/api/v1/ci/log-slice?${query}`, { signal });
+  }
+
   ciAction(repository, number, action, { signal, providerUrl } = {}) {
     return this.request('/api/v1/ci/actions', {
       method: 'POST', body: { repository, number, action, ...(providerUrl!==undefined?{provider_url:providerUrl}:{}) }, signal,
     });
   }
 
-  debugCi(repository, number, sessionId, operationId, { signal, providerUrl, mode } = {}) {
+  debugCi(repository, number, sessionId, operationId, { signal, providerUrl, mode, test } = {}) {
     return this.request('/api/v1/ci/debug', {
-      method: 'POST', body: { repository, number, session_id: sessionId, operation_id: operationId, ...(providerUrl!==undefined?{provider_url:providerUrl}:{}), ...(mode==='fix'?{mode}:{}) }, signal,
+      method: 'POST', body: { repository, number, session_id: sessionId, operation_id: operationId, ...(providerUrl!==undefined?{provider_url:providerUrl}:{}), ...(mode==='fix'||mode==='test'?{mode}:{}), ...(mode==='test'&&test?{test}:{}) }, signal,
     });
   }
 
@@ -660,6 +732,34 @@ export class HerdrClient {
   }
   archiveConnector(connectorId) {
     return this.request(`/api/v1/assistant-connectors/${encodeURIComponent(connectorId)}`, { method: 'DELETE' });
+  }
+  // The dashboard's connector check: the server opens its own bookkeeping run and takes the normal tool gate, so the
+  // answer is a result, a refusal, or a 403 ``approval_needed`` (with the approval id and the dry-run text).
+  testConnector(connectorId, body) {
+    return this.request(`/api/v1/assistant-connectors/${encodeURIComponent(connectorId)}/test`, { method: 'POST', body });
+  }
+  executeApproval(approvalId) {
+    return this.request(`/api/v1/assistant-approvals/${encodeURIComponent(approvalId)}/execute`, { method: 'POST', body: {} });
+  }
+  listProposals(status) {
+    const q = status ? `?status=${encodeURIComponent(status)}` : '';
+    return this.request(`/api/v1/assistant-proposals${q}`);
+  }
+  previewProposal(proposalId) {
+    return this.request(`/api/v1/assistant-proposals/${encodeURIComponent(proposalId)}/preview`);
+  }
+  decideProposal(proposalId, decision) {
+    return this.request(`/api/v1/assistant-proposals/${encodeURIComponent(proposalId)}/decision`, { method: 'POST', body: { decision } });
+  }
+  executeProposal(proposalId) {
+    return this.request(`/api/v1/assistant-proposals/${encodeURIComponent(proposalId)}/execute`, { method: 'POST', body: {} });
+  }
+  listNotifications(state) {
+    const q = state ? `?state=${encodeURIComponent(state)}` : '';
+    return this.request(`/api/v1/assistant-notifications${q}`);
+  }
+  ackNotification(notificationId) {
+    return this.request(`/api/v1/assistant-notifications/${encodeURIComponent(notificationId)}/ack`, { method: 'POST', body: {} });
   }
   connectorRequest(connectorId, body) {
     return this.request(`/api/v1/assistant-connectors/${encodeURIComponent(connectorId)}/request`, { method: 'POST', body });

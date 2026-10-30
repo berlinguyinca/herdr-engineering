@@ -1,0 +1,1062 @@
+"""Rakazo mobile bridge: the slice of the Rakazo server protocol the iPhone app needs, mapped onto the Herdr assistant.
+
+The Rakazo app stores only ``scheme://host:port`` for a custom server and then calls ``POST /rpc/<procedure>`` and
+``/api/auth/*`` at the origin root. This module answers those, and ONLY those, from the existing assistant service
+(:mod:`.assistant`): a Rakazo "bot" is an assistant, its single thread is an assistant thread, a message is an assistant
+message, a run is an assistant run and an approval card is an assistant approval decided through ``decide_approval``.
+It owns no assistant data. It owns exactly two things: the sign-in accounts/tokens, and an in-memory journal that numbers
+events for ``threads/subscribe`` (:mod:`.rakazo_events`).
+
+Off unless the fleet YAML ``control_plane.rakazo_bridge.enabled`` is true; then every ``/rpc/*`` and ``/api/auth/*`` path
+answers 404 exactly as before. Sign-in accepts only the configured accounts; the password is checked against a scrypt hash
+from the YAML (never a plaintext), a bearer token is 32 random bytes of which only the SHA-256 is kept, and neither the
+password, a token, a hash nor a request body is ever logged or written to the audit trail.
+"""
+from __future__ import annotations
+
+import base64
+import hashlib
+import hmac
+import ipaddress
+import json
+import logging
+import re
+import secrets
+import threading
+import time
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from typing import Any
+
+from . import project_intelligence as pi
+from . import rakazo_events as ev
+from .assistant import (
+    ApprovalRequired,
+    AssistantError,
+    AssistantForbidden,
+    AssistantNotFound,
+    AssistantUnavailable,
+    RateLimited,
+    redact_secrets,
+)
+from .rakazo_proposals import Busy, ProposalDesk
+
+log = logging.getLogger(__name__)
+SLOW_CALL_MS = 300           # a call slower than this is logged (name + duration only)
+VERY_SLOW_CALL_MS = 2000      # ... as a warning
+
+SCRYPT_N, SCRYPT_R, SCRYPT_P, SALT_BYTES, HASH_BYTES = 2 ** 15, 8, 1, 16, 32
+_MAX_N = 2 ** 17                     # 128 MiB: a hash in the YAML cannot make one sign-in allocate more than this
+_EMAIL = re.compile(r"[^@\s]+@[^@\s]+\Z")
+_PROC = re.compile(r"[A-Za-z][A-Za-z0-9/]{0,63}\Z")
+_ROLES = ("operator", "family")
+_CONSENT_VERSION = "herdr-1"
+MAX_BODY = 1_000_000
+MAX_AUTH_BODY = 8_192
+MAX_STREAMS = 8
+MAX_SENDS = 4
+MAX_BOTS = 20                        # assistants per account
+MAX_RUN_ROWS = 20
+MAX_ACTIVE_ROWS = 50
+
+
+# --------------------------------------------------------------------------------------------- password hashing
+@dataclass(frozen=True)
+class ScryptParams:
+    n: int
+    r: int
+    p: int
+    salt: bytes
+    digest: bytes
+
+
+def _derive(password: str, params: ScryptParams) -> bytes:
+    return hashlib.scrypt(password.encode("utf-8", "surrogatepass"), salt=params.salt, n=params.n, r=params.r,
+                          p=params.p, maxmem=256 * params.n * params.r + (1 << 20), dklen=len(params.digest))
+
+
+def hash_password(password: str, *, n: int = SCRYPT_N, r: int = SCRYPT_R, p: int = SCRYPT_P) -> str:
+    """``scrypt$N$r$p$salt_b64$hash_b64``: a fresh 16-byte salt and a 32-byte key. Only this string goes in the YAML."""
+    if not password:
+        raise ValueError("the password is empty")
+    salt = secrets.token_bytes(SALT_BYTES)
+    key = _derive(password, ScryptParams(n, r, p, salt, b"\0" * HASH_BYTES))
+    return "$".join(["scrypt", str(n), str(r), str(p), base64.b64encode(salt).decode(), base64.b64encode(key).decode()])
+
+
+def parse_scrypt(text: Any, where: str) -> ScryptParams:
+    """Parse ``scrypt$N$r$p$salt_b64$hash_b64``; anything else is an error naming ``where`` (never echoing the value)."""
+    if not isinstance(text, str):
+        raise ValueError(f"{where} must be a string of the form scrypt$N$r$p$salt_b64$hash_b64")
+    parts = text.split("$")
+    bad = ValueError(f"{where} is not a valid scrypt hash (expected scrypt$N$r$p$salt_b64$hash_b64; "
+                     "create one with `herdr-eng bridge hash-password`)")
+    if len(parts) != 6 or parts[0] != "scrypt":
+        raise bad
+    try:
+        n, r, p = int(parts[1]), int(parts[2]), int(parts[3])
+        salt = base64.b64decode(parts[4], validate=True)
+        digest = base64.b64decode(parts[5], validate=True)
+    except ValueError:
+        raise bad from None
+    if not (2 ** 14 <= n <= _MAX_N and n & (n - 1) == 0 and 1 <= r <= 16 and 1 <= p <= 4
+            and len(salt) >= 16 and 16 <= len(digest) <= 64):
+        raise bad
+    return ScryptParams(n, r, p, salt, digest)
+
+
+# --------------------------------------------------------------------------------------------- configuration
+@dataclass(frozen=True)
+class Account:
+    account_id: str          # stable: derived from the normalised email
+    email: str
+    principal_id: str        # the assistant user id for everything this account does
+    role: str
+    params: ScryptParams = field(repr=False)
+    tokens_valid_after: float = 0.0     # epoch seconds: a token created before this is dead, whatever the database says
+
+
+def normalize_email(email: str) -> str:
+    return email.strip().lower()
+
+
+def _cutoff(value: Any, where: str, now: float) -> float:
+    """``tokens_valid_after``: an ISO-8601 time with a zone (e.g. 2026-11-02T09:30:00Z). Not in the future."""
+    if value is None:
+        return 0.0
+    bad = ValueError(f"{where} must be an ISO-8601 timestamp with a time zone, not in the future "
+                     "(e.g. 2026-11-02T09:30:00Z)")
+    if isinstance(value, datetime):
+        stamp = value
+    elif isinstance(value, str):
+        try:
+            stamp = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+        except ValueError:
+            raise bad from None
+    else:
+        raise bad
+    if stamp.tzinfo is None or stamp.timestamp() > now + 300:
+        raise bad
+    return stamp.timestamp()
+
+
+def rakazo_bridge_config(raw: Any, now: float | None = None) -> dict[str, Any]:
+    """Validate ``control_plane.rakazo_bridge``. Disabled (and unchecked beyond its type) unless ``enabled`` is true;
+    when enabled, anything missing or malformed raises ValueError so the control plane refuses to start."""
+    if raw is None:
+        return {"enabled": False}
+    if not isinstance(raw, dict):
+        raise ValueError("control_plane.rakazo_bridge must be a mapping")
+    if raw.get("enabled") is not True:
+        return {"enabled": False}
+    now = time.time() if now is None else now
+    unknown = sorted(set(raw) - {"enabled", "accounts", "token_ttl_days", "max_tokens", "trusted_proxies"})
+    if unknown:
+        raise ValueError(f"control_plane.rakazo_bridge has unknown keys: {', '.join(map(str, unknown))} "
+                         "(accounts are listed under accounts: [{email, password_scrypt, role}])")
+
+    def bounded(key: str, default: int, low: int, high: int) -> int:
+        value = raw.get(key, default)
+        if isinstance(value, bool) or not isinstance(value, int) or not low <= value <= high:
+            raise ValueError(f"control_plane.rakazo_bridge.{key} must be an integer from {low} to {high}")
+        return value
+
+    ttl_days = bounded("token_ttl_days", 30, 1, 365)
+    max_tokens = bounded("max_tokens", 5, 1, 50)
+    proxies = raw.get("trusted_proxies", [])
+    if not isinstance(proxies, list):
+        raise ValueError("control_plane.rakazo_bridge.trusted_proxies must be a list of addresses or CIDR ranges")
+    nets = []
+    for i, item in enumerate(proxies):
+        try:
+            nets.append(ipaddress.ip_network(str(item).strip(), strict=False))
+        except ValueError:
+            raise ValueError(f"control_plane.rakazo_bridge.trusted_proxies[{i}] is not an address or CIDR range") from None
+    rows = raw.get("accounts")
+    if not isinstance(rows, list) or not rows:
+        raise ValueError("control_plane.rakazo_bridge.accounts must list at least one {email, password_scrypt, role}")
+    accounts: list[Account] = []
+    for i, row in enumerate(rows):
+        where = f"control_plane.rakazo_bridge.accounts[{i}]"
+        if not isinstance(row, dict) or set(row) - {"email", "password_scrypt", "role", "tokens_valid_after"}:
+            raise ValueError(f"{where} must be a mapping with only email, password_scrypt, role and tokens_valid_after")
+        email = row.get("email")
+        if not isinstance(email, str) or not _EMAIL.match(normalize_email(email)) or len(email) > 254:
+            raise ValueError(f"{where}.email must be an email address")
+        role = row.get("role", "operator")
+        if role not in _ROLES:
+            raise ValueError(f"{where}.role {role!r} is not supported: use one of {', '.join(_ROLES)} "
+                             "(family = chat only: no project data, proposals or approvals)")
+        params = parse_scrypt(row.get("password_scrypt"), f"{where}.password_scrypt")
+        cutoff = _cutoff(row.get("tokens_valid_after"), f"{where}.tokens_valid_after", now)
+        email_n = normalize_email(email)
+        account_id = hashlib.sha256(b"rakazo-bridge-account:" + email_n.encode()).hexdigest()[:16]
+        if any(a.account_id == account_id for a in accounts):
+            raise ValueError(f"{where}.email repeats an earlier account")
+        accounts.append(Account(account_id, email_n, f"rakazo:{account_id}", role, params, cutoff))
+    return {"enabled": True, "token_ttl_days": ttl_days, "max_tokens": max_tokens, "accounts": accounts,
+            "trusted_proxies": tuple(nets)}
+
+
+# --------------------------------------------------------------------------------------------- tokens
+class TokenStoreError(Exception):
+    """The persistent token table could not be written. Sign-in fails closed rather than issue an unrecorded token."""
+
+
+DB_TIMEOUT_SECONDS = 3
+
+
+class PostgresTokenPersistence:
+    """``rakazo_bridge_tokens`` (migration 0036): the SHA-256 of each live token, never the token itself.
+
+    Sync psycopg2 like the assistant's store; a connection factory is injectable for tests. Credentials come from the DSN
+    and are never logged. Every connection gets a connect timeout and a statement/lock timeout whatever the DSN says, so a
+    stuck database costs a request a few seconds, never a hang."""
+
+    def __init__(self, dsn: str, connect: Callable | None = None):
+        self._dsn = dsn
+        self._connect = connect
+
+    def _run(self, sql: str, args: tuple = (), fetch: bool = False):
+        if self._connect is not None:
+            conn = self._connect()
+        else:
+            import psycopg2
+            ms = DB_TIMEOUT_SECONDS * 1000
+            conn = psycopg2.connect(self._dsn, connect_timeout=DB_TIMEOUT_SECONDS,
+                                    options=f"-c statement_timeout={ms} -c lock_timeout={ms}")
+        try:
+            with conn.cursor() as cur:
+                cur.execute(sql, args)
+                rows = cur.fetchall() if fetch else None
+            conn.commit()
+            return rows
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _ts(epoch: float) -> datetime:
+        return datetime.fromtimestamp(epoch, UTC)
+
+    def load(self) -> list[dict[str, Any]]:
+        rows = self._run("SELECT token_sha256, account_id, created_at, expires_at, last_used_at, last_ip "
+                         "FROM rakazo_bridge_tokens WHERE expires_at > now()", fetch=True)
+        return [{"hash": r[0], "account_id": r[1], "created": r[2].timestamp(), "expires": r[3].timestamp(),
+                 "last_used": r[4].timestamp(), "last_ip": r[5] or ""} for r in rows]
+
+    def upsert(self, digest: str, rec: dict[str, Any]) -> None:
+        self._run("INSERT INTO rakazo_bridge_tokens (token_sha256, account_id, created_at, expires_at, last_used_at, "
+                  "last_ip) VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT (token_sha256) DO UPDATE SET "
+                  "expires_at = EXCLUDED.expires_at, last_used_at = EXCLUDED.last_used_at, last_ip = EXCLUDED.last_ip",
+                  (digest, rec["account_id"], self._ts(rec["created"]), self._ts(rec["expires"]),
+                   self._ts(rec["last_used"]), rec["last_ip"]))
+
+    def delete(self, digest: str) -> None:
+        self._run("DELETE FROM rakazo_bridge_tokens WHERE token_sha256 = %s", (digest,))
+
+    def touch(self, digest: str, when: float, ip: str) -> None:
+        self._run("UPDATE rakazo_bridge_tokens SET last_used_at = %s, last_ip = %s WHERE token_sha256 = %s",
+                  (self._ts(when), ip, digest))
+
+
+class TokenStore:
+    """Bearer tokens: 32 random bytes handed out once; only ``sha256(token)`` is kept, with expiry, creation, last use and
+    last address. At most ``max_tokens`` live per account (the oldest is evicted). Memory is authoritative; the optional
+    persistence lets tokens survive a restart.
+
+    Revocation never depends on the database. A token that is dropped (sign-out, eviction, expiry, cut-off) is dead in
+    memory at once; its row is deleted afterwards, outside the lock, and a delete that fails is remembered (a tombstone)
+    and retried with backoff on later operations. A tombstone lives only in memory, so if the process restarts before the
+    delete succeeded the row is loaded again: ``tokens_valid_after`` (per account, in the YAML) is the cut-off that kills
+    such tokens whatever the database holds. No database call happens while the lock is held."""
+
+    TOUCH_EVERY = 300.0
+    RETRY_MIN, RETRY_MAX = 5.0, 300.0
+
+    def __init__(self, ttl_seconds: float, max_tokens: int, persistence=None, clock: Callable[[], float] = time.time,
+                 cutoffs: dict[str, float] | None = None):
+        self.ttl, self.max_tokens, self._p, self._clock = ttl_seconds, max_tokens, persistence, clock
+        self._cutoffs = dict(cutoffs or {})
+        self._tokens: dict[str, dict[str, Any]] = {}
+        self._tomb: set[str] = set()          # rows whose durable delete is still owed
+        self._retry_at, self._backoff = 0.0, 0.0
+        self._lock = threading.Lock()
+        self._flush_lock = threading.Lock()
+        self._serial = 0                      # breaks ties between tokens minted in the same instant
+        if persistence is not None:
+            try:
+                for rec in persistence.load():
+                    digest = rec.pop("hash")
+                    if rec["created"] < self._cutoffs.get(rec["account_id"], 0.0):
+                        self._tomb.add(digest)            # revoked by the YAML cut-off: never live, delete the row
+                    elif digest not in self._tomb:
+                        self._tokens[digest] = {**rec, "persisted": rec["last_used"]}
+            except Exception as exc:  # noqa: BLE001 - fail closed: nobody is signed in until they sign in again
+                log.error("rakazo bridge: could not load persisted tokens (%s); all sessions are signed out",
+                          type(exc).__name__)
+        self._flush()
+
+    @staticmethod
+    def digest(token: str) -> str:
+        return hashlib.sha256(token.encode()).hexdigest()
+
+    @property
+    def pending_deletes(self) -> int:
+        with self._lock:
+            return len(self._tomb)
+
+    def _drop_locked(self, digest: str) -> None:
+        """Dead in memory now; the row's delete is owed (settled by ``_flush`` after the lock is released)."""
+        if self._tokens.pop(digest, None) is not None and self._p is not None:
+            self._tomb.add(digest)
+
+    def _flush(self, force: bool = False) -> bool:
+        """Settle owed deletes; True when none remain. A failure keeps the tombstones and backs off (5 s, doubling to 5 min)
+        before the next attempt, which any later token operation makes. Never called with the lock held."""
+        if self._p is None:
+            return True
+        now = self._clock()
+        with self._lock:
+            if not self._tomb:
+                return True
+            if not force and now < self._retry_at:
+                return False
+            batch = list(self._tomb)
+        if not self._flush_lock.acquire(blocking=False):
+            return False
+        try:
+            for digest in batch:
+                try:
+                    self._p.delete(digest)
+                except Exception as exc:  # noqa: BLE001 - the database is likely down: stop and back off
+                    log.warning("rakazo bridge: could not delete a revoked token row (%s); will retry",
+                                type(exc).__name__)
+                    with self._lock:
+                        self._backoff = min(self.RETRY_MAX, max(self.RETRY_MIN, self._backoff * 2))
+                        self._retry_at = now + self._backoff
+                    return False
+                with self._lock:
+                    self._tomb.discard(digest)
+            with self._lock:
+                self._backoff = 0.0
+            return True
+        finally:
+            self._flush_lock.release()
+
+    def mint(self, account_id: str, ip: str) -> str:
+        token = secrets.token_urlsafe(32)
+        now = self._clock()
+        digest = self.digest(token)
+        rec = {"account_id": account_id, "created": now, "expires": now + self.ttl, "last_used": now,
+               "last_ip": ip[:64], "persisted": now}
+        with self._lock:
+            self._serial += 1
+            rec["serial"] = self._serial
+            for d in [d for d, r in self._tokens.items() if r["expires"] <= now]:
+                self._drop_locked(d)
+            self._tokens[digest] = rec
+        if self._p is not None:
+            try:
+                self._p.upsert(digest, rec)
+            except Exception as exc:  # noqa: BLE001
+                log.error("rakazo bridge: token table write failed (%s)", type(exc).__name__)
+                with self._lock:
+                    self._tokens.pop(digest, None)
+                self._flush()
+                raise TokenStoreError from None
+        with self._lock:
+            # only after the new one is recorded: a failed write must not cost the account a working session
+            mine = sorted((r["created"], r.get("serial", 0), d) for d, r in self._tokens.items()
+                          if r["account_id"] == account_id)
+            for *_, d in mine[:max(0, len(mine) - self.max_tokens)]:
+                self._drop_locked(d)
+        self._flush()
+        return token
+
+    def lookup(self, token: str, ip: str = "") -> str | None:
+        """The account a live token belongs to, or None. Records last use and address."""
+        digest = self.digest(token)
+        now = self._clock()
+        touch = False
+        with self._lock:
+            rec = self._tokens.get(digest)
+            if rec is None:
+                account = None
+            elif rec["expires"] <= now or rec["created"] < self._cutoffs.get(rec["account_id"], 0.0):
+                self._drop_locked(digest)
+                account = None
+            else:
+                account = rec["account_id"]
+                rec["last_used"], rec["last_ip"] = now, ip[:64]
+                if self._p is not None and now - rec["persisted"] >= self.TOUCH_EVERY:
+                    rec["persisted"] = touch = now
+        if touch:
+            try:
+                self._p.touch(digest, touch, ip[:64])
+            except Exception as exc:  # noqa: BLE001 - bookkeeping only
+                log.warning("rakazo bridge: could not record token use (%s)", type(exc).__name__)
+        self._flush()
+        return account
+
+    def valid(self, token: str) -> bool:
+        with self._lock:
+            rec = self._tokens.get(self.digest(token))
+            return (rec is not None and rec["expires"] > self._clock()
+                    and rec["created"] >= self._cutoffs.get(rec["account_id"], 0.0))
+
+    def revoke(self, token: str) -> tuple[bool, bool]:
+        """(was it live, is its row gone). The token is dead in memory either way."""
+        digest = self.digest(token)
+        with self._lock:
+            known = digest in self._tokens
+            if known:
+                self._drop_locked(digest)
+        return known, self._flush(force=True)
+
+    def count(self, account_id: str | None = None) -> int:
+        with self._lock:
+            return sum(1 for r in self._tokens.values() if account_id in (None, r["account_id"]))
+
+
+# --------------------------------------------------------------------------------------------- sign-in limiter
+class SignInLimiter:
+    """Failed sign-ins lock a SOURCE ADDRESS out for exponentially longer: from the ``free``-th failure on the lock is
+    ``base * 2**(failures beyond that)`` seconds, up to ``cap``. A success clears that address; quiet time forgets it.
+    The lock is checked BEFORE any password work. There is deliberately no lock across all addresses: anyone on the
+    tailnet could then keep the owner out. The all-address failure count is for logging only."""
+
+    WINDOW = 600.0
+
+    def __init__(self, clock: Callable[[], float] = time.monotonic, *, free_ip: int = 5, base_ip: float = 30.0,
+                 cap: float = 3600.0, forget_after: float = 3600.0):
+        self._clock, self._cap, self._forget, self._free, self._base = clock, cap, forget_after, free_ip, base_ip
+        self._state: dict[str, dict[str, float]] = {}
+        self._recent: list[float] = []
+        self._lock = threading.Lock()
+
+    def _entry(self, key: str, now: float) -> dict[str, float]:
+        entry = self._state.get(key)
+        if entry is not None and now - entry["last"] > self._forget:
+            entry = None
+        if entry is None:
+            entry = self._state[key] = {"fails": 0, "until": 0.0, "last": now}
+            if len(self._state) > 2048:
+                for stale in sorted(self._state, key=lambda k: self._state[k]["last"])[:512]:
+                    del self._state[stale]
+        return entry
+
+    def retry_after(self, ip: str) -> int:
+        now = self._clock()
+        with self._lock:
+            wait = self._entry(ip, now)["until"] - now
+        return int(wait) + 1 if wait > 0 else 0
+
+    def failure(self, ip: str) -> int:
+        """Record a failure; returns how many failures (from any address) the last ten minutes saw, for logging."""
+        now = self._clock()
+        with self._lock:
+            entry = self._entry(ip, now)
+            entry["fails"] += 1
+            entry["last"] = now
+            if entry["fails"] >= self._free:
+                entry["until"] = now + min(self._cap, self._base * 2 ** (entry["fails"] - self._free))
+            self._recent = [t for t in self._recent if now - t < self.WINDOW] + [now]
+            return len(self._recent)
+
+    def success(self, ip: str) -> None:
+        with self._lock:
+            self._state.pop(ip, None)
+
+
+# --------------------------------------------------------------------------------------------- responses and errors
+class BridgeError(Exception):
+    def __init__(self, status: int, code: str, message: str, headers: dict[str, str] | None = None):
+        super().__init__(message)
+        self.status, self.code, self.message, self.headers = status, code, message, headers or {}
+
+
+@dataclass
+class BridgeResponse:
+    status: int
+    body: bytes = b""
+    headers: dict[str, str] = field(default_factory=dict)
+    frames: Any = None                       # an iterator of bytes for a server-sent-event stream
+    on_close: Callable[[], None] | None = None
+
+    def close(self) -> None:
+        if self.frames is not None and hasattr(self.frames, "close"):
+            self.frames.close()
+        if self.on_close is not None:
+            self.on_close()
+            self.on_close = None
+
+
+def _json_response(status: int, payload: Any, headers: dict[str, str] | None = None) -> BridgeResponse:
+    return BridgeResponse(status, json.dumps(payload, separators=(",", ":")).encode(),
+                          {"Content-Type": "application/json", "Cache-Control": "no-store", **(headers or {})})
+
+
+def _rpc_error(err: BridgeError) -> BridgeResponse:
+    """oRPC's failure shape, which the app reads: ``{"json": {code, status, message, data}}``."""
+    return _json_response(err.status, {"json": {"defined": False, "code": err.code, "status": err.status,
+                                                "message": err.message, "data": {}}}, err.headers)
+
+
+def _auth_error(status: int, code: str, message: str, headers: dict[str, str] | None = None) -> BridgeResponse:
+    return _json_response(status, {"message": message, "code": code}, headers)
+
+
+@dataclass
+class _Ctx:
+    account: Account
+    tenant: str
+    user: str
+    token: str
+    accepts_stream: bool
+
+
+# --------------------------------------------------------------------------------------------- the bridge
+class RakazoBridge:
+    """Dispatches ``/rpc/*`` and ``/api/auth/*``. ``handle`` returns a :class:`BridgeResponse`, or None for a path that is
+    not the bridge's (the caller then answers exactly as it did before the bridge existed)."""
+
+    def __init__(self, config: dict[str, Any], assistant, *, version: str = "0", persistence=None,
+                 clock: Callable[[], float] = time.time, monotonic: Callable[[], float] = time.monotonic):
+        if not config.get("enabled"):
+            raise ValueError("RakazoBridge needs an enabled configuration")
+        self.svc = assistant
+        self.version = version
+        self.accounts: list[Account] = list(config["accounts"])
+        self._by_principal = {a.principal_id: a for a in self.accounts}
+        self._by_id = {a.account_id: a for a in self.accounts}
+        self.tokens = TokenStore(config["token_ttl_days"] * 86400, config["max_tokens"], persistence, clock,
+                                 cutoffs={a.account_id: a.tokens_valid_after for a in self.accounts})
+        self.trusted_proxies = tuple(config.get("trusted_proxies", ()))
+        self.limiter = SignInLimiter(monotonic)
+        self.journals = ev.JournalRegistry(clock)
+        self._kdf_slots = threading.BoundedSemaphore(2)
+        self._streams = threading.BoundedSemaphore(MAX_STREAMS)
+        self._sends = threading.BoundedSemaphore(MAX_SENDS)
+        self._thread_lock = threading.Lock()
+        self._create_lock = threading.Lock()
+        self._closed = threading.Event()
+        self._monotonic = monotonic
+        self.stream_options: dict[str, Any] = {}      # tests shorten the poll/heartbeat/lifetime
+        # Board proposals as ask cards. ``desk.routes`` (the IntelligenceRoutes) is set by the API glue; until then,
+        # or without a project-intelligence scope for the account, no card is ever shown.
+        self.desk = ProposalDesk(monotonic=monotonic)
+        self._first_bots: dict[str, tuple[float, str]] = {}
+        self._procs: dict[str, Callable[[_Ctx, dict[str, Any]], Any]] = {
+            "me": self._me, "spaces/list": self._spaces_list, "bots/list": self._bots_list, "bots/get": self._bots_get,
+            "bots/create": self._bots_create, "threads/head": self._threads_head, "threads/get": self._threads_get,
+            "threads/messages": self._threads_messages, "threads/send": self._threads_send,
+            "threads/answer": self._threads_answer, "threads/stop": self._threads_stop,
+            "threads/markRead": self._threads_mark_read, "threads/subscribe": self._threads_subscribe,
+            "runs/list": self._runs_list, "aiConsent/status": self._consent, "aiConsent/allow": self._consent,
+            "aiConsent/revoke": self._consent, "notifications/registerPush": self._register_push,
+            "notifications/unregisterPush": self._ok, "analytics/screen": self._ok,
+        }
+        # a dummy for requests whose email matches no account, so a wrong email costs the same KDF as a wrong password
+        self._dummy = self.accounts[0].params
+
+    # routing ---------------------------------------------------------------------------------------------------
+    @staticmethod
+    def handles(path: str) -> bool:
+        path = path.split("?", 1)[0]
+        return path.startswith("/rpc/") or path.startswith("/api/auth/")
+
+    def close(self) -> None:
+        self._closed.set()
+        self.desk.close()
+
+    def client_address(self, peer: str, forwarded_for: str = "") -> str:
+        """The address a request is attributed to (lockout key, token bookkeeping). The last X-Forwarded-For entry is
+        believed only when the TCP peer is loopback or inside ``trusted_proxies``; anything else, or an entry that is not
+        an IP address, leaves the peer itself, so a caller cannot choose its own key."""
+        try:
+            addr = ipaddress.ip_address(peer)
+        except ValueError:
+            return peer[:64]
+        if addr.is_loopback or any(addr in net for net in self.trusted_proxies):
+            try:
+                return str(ipaddress.ip_address(forwarded_for.split(",")[-1].strip()))
+            except ValueError:
+                pass
+        return str(addr)
+
+    def handle(self, method: str, path: str, headers: dict[str, str], body: bytes, peer: str) -> BridgeResponse | None:
+        """``headers`` has lower-case names; ``peer`` is the TCP peer address. Never raises. Slow calls are logged by
+        procedure name and duration only (a stream's duration is just its setup), so a slow screen can be found."""
+        started = time.monotonic()
+        out = self._handle(method, path, headers, body, peer)
+        if out is not None:
+            ms = (time.monotonic() - started) * 1000
+            if ms >= SLOW_CALL_MS:
+                name = re.sub(r"[^A-Za-z0-9/_-]", "", path.split("?", 1)[0].split("/", 2)[-1])[:60]
+                (log.warning if ms >= VERY_SLOW_CALL_MS else log.info)(
+                    "rakazo bridge: %s took %.0f ms (status %s)", name, ms, getattr(out, "status", "?"))
+        return out
+
+    def _handle(self, method: str, path: str, headers: dict[str, str], body: bytes, peer: str) -> BridgeResponse | None:
+        path = path.split("?", 1)[0]
+        if not self.handles(path):
+            return None
+        ip = self.client_address(peer, headers.get("x-forwarded-for", ""))
+        try:
+            if path.startswith("/api/auth/"):
+                return self._auth(method, path[len("/api/auth/"):], headers, body, ip)
+            return self._rpc(method, path[len("/rpc/"):], headers, body, ip)
+        except BridgeError as err:
+            return _rpc_error(err) if path.startswith("/rpc/") else _auth_error(err.status, err.code, err.message,
+                                                                                 err.headers)
+        except Exception as exc:  # noqa: BLE001 - never echo internals, never log the request
+            log.error("rakazo bridge: %s failed (%s)", path.split("/", 3)[-1][:40], type(exc).__name__)
+            fail = BridgeError(500, "INTERNAL_SERVER_ERROR", "The server could not complete that request.")
+            return _rpc_error(fail) if path.startswith("/rpc/") else _auth_error(500, fail.code, fail.message)
+
+    # auth ------------------------------------------------------------------------------------------------------
+    def _auth(self, method: str, name: str, headers, body: bytes, ip: str) -> BridgeResponse:
+        if method == "GET" and name == "capabilities":
+            # email + password only: no sign-up, one-time codes, passkeys, SSO or reset mail
+            return _json_response(200, {"sso": None, "passwordAuth": True, "passwordReset": False, "resetUrl": None,
+                                        "emailCode": False, "billing": False, "passkeyRpId": None,
+                                        "nativePasskeys": {"ios": False, "android": False}, "crispWebsiteId": None})
+        if method == "POST" and name == "sign-in/email":
+            return self._sign_in(body, ip)
+        if method == "POST" and name == "sign-out":
+            token = self._bearer(headers)
+            account = self._by_id.get(self.tokens.lookup(token, ip) or "") if token else None
+            known, durable = self.tokens.revoke(token) if token else (False, True)
+            if known and account is not None:
+                self._audit(account, "rakazo.bridge.sign_out")
+            if not durable:
+                # dead in memory, but its database row is still owed a delete (retried; see tokens_valid_after)
+                log.warning("rakazo bridge: a sign-out could not delete its token row yet")
+                raise BridgeError(500, "INTERNAL_SERVER_ERROR",
+                                  "Signed out, but the server could not remove the session record yet.")
+            return _json_response(200, {"success": True})        # the same answer for any token: no oracle
+        raise BridgeError(404, "NOT_FOUND", "Not found")
+
+    @staticmethod
+    def _bearer(headers) -> str:
+        value = headers.get("authorization", "")
+        return value[7:].strip() if value[:7].lower() == "bearer " else ""
+
+    def _sign_in(self, body: bytes, ip: str) -> BridgeResponse:
+        wait = self.limiter.retry_after(ip)
+        if wait:
+            raise BridgeError(429, "TOO_MANY_REQUESTS", "Too many attempts. Try again in a few minutes.",
+                              {"Retry-After": str(wait)})
+        email = password = ""
+        try:
+            data = json.loads(body) if len(body) <= MAX_AUTH_BODY else None
+        except (ValueError, RecursionError):
+            data = None
+        if not isinstance(data, dict):               # not a sign-in attempt at all: no KDF, no failure counted
+            raise BridgeError(400, "BAD_REQUEST", "That request could not be read.")
+        if isinstance(data.get("email"), str) and len(data["email"]) <= 254:
+            email = normalize_email(data["email"])
+        if isinstance(data.get("password"), str) and len(data["password"]) <= 1024:
+            password = data["password"]
+        # Compare against EVERY account (no early exit) and ALWAYS run one KDF, against the matched account's salt or
+        # a configured account's when nothing matched, so neither timing nor the response tells a wrong email from a
+        # wrong password.
+        wanted = hashlib.sha256(email.encode()).digest()
+        matched: Account | None = None
+        for account in self.accounts:
+            if hmac.compare_digest(hashlib.sha256(account.email.encode()).digest(), wanted) and matched is None:
+                matched = account
+        params = matched.params if matched is not None else self._dummy
+        if not self._kdf_slots.acquire(timeout=15):
+            raise BridgeError(429, "TOO_MANY_REQUESTS", "Too many attempts. Try again in a few minutes.",
+                              {"Retry-After": "5"})
+        try:
+            derived = _derive(password, params)
+        finally:
+            self._kdf_slots.release()
+        good = hmac.compare_digest(derived, params.digest) & (matched is not None)
+        if not good or matched is None:
+            recent = self.limiter.failure(ip)
+            log.warning("rakazo bridge: failed sign-in from %s (%d from all addresses in 10 minutes)", ip[:64], recent)
+            raise BridgeError(401, "INVALID_EMAIL_OR_PASSWORD", "Invalid credentials")
+        self.limiter.success(ip)
+        try:
+            token = self.tokens.mint(matched.account_id, ip)
+        except TokenStoreError:
+            raise BridgeError(500, "INTERNAL_SERVER_ERROR", "Could not start a session. Try again later.") from None
+        self._audit(matched, "rakazo.bridge.sign_in")
+        return _json_response(200, {"token": token, "redirect": False,
+                                    "user": {"id": matched.principal_id, "email": matched.email,
+                                             "name": matched.email.split("@", 1)[0]}},
+                              {"set-auth-token": token})
+
+    def _audit(self, account: Account, action: str) -> None:
+        """Best effort: signing in must not depend on the audit store, but a refusal is logged (never any secret)."""
+        try:
+            self.svc.store.audit_record(tenant_id=self.svc.tenant_for(account.principal_id), user_id=account.principal_id,
+                                        actor=account.principal_id, action=action, subject_id=account.account_id)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("rakazo bridge: could not write the audit entry %s (%s)", action, type(exc).__name__)
+
+    # rpc -------------------------------------------------------------------------------------------------------
+    def _rpc(self, method: str, proc: str, headers, body: bytes, ip: str) -> BridgeResponse:
+        if method != "POST" or not _PROC.match(proc):
+            raise BridgeError(404, "NOT_FOUND", "Not found")
+        if proc == "health":
+            return _json_response(200, {"json": {"ok": True, "version": self.version}})
+        token = self._bearer(headers)
+        account_id = self.tokens.lookup(token, ip) if token else None
+        account = self._by_id.get(account_id or "")
+        if account is None:
+            raise BridgeError(401, "UNAUTHORIZED", "Sign in to continue.")
+        handler = self._procs.get(proc)
+        if handler is None:
+            raise BridgeError(404, "NOT_FOUND", "This server does not support that feature.")
+        try:
+            data = json.loads(body) if body.strip() else {}
+        except (ValueError, RecursionError):
+            raise BridgeError(400, "BAD_REQUEST", "The request body is not valid JSON.") from None
+        inp = data.get("json", {}) if isinstance(data, dict) else {}
+        if inp is None:
+            inp = {}
+        if not isinstance(inp, dict):
+            raise BridgeError(400, "BAD_REQUEST", "The request input must be an object.")
+        tenant = self.svc.tenant_for(account.principal_id)
+        ctx = _Ctx(account, tenant, account.principal_id, token,
+                   "text/event-stream" in headers.get("accept", ""))
+        try:
+            self.svc.check_rate_limit(key=f"{tenant}:{ctx.user}")
+            result = handler(ctx, inp)
+        except (AssistantNotFound, KeyError):
+            raise BridgeError(404, "NOT_FOUND", "Not found.") from None
+        except RateLimited as exc:
+            raise BridgeError(429, "TOO_MANY_REQUESTS", str(exc), {"Retry-After": "30"}) from None
+        except AssistantUnavailable:
+            raise BridgeError(400, "BAD_REQUEST", "The Herdr assistant is not enabled on this server.") from None
+        except AssistantForbidden as exc:
+            raise BridgeError(403, "FORBIDDEN", str(exc)) from None
+        except ApprovalRequired as exc:
+            raise BridgeError(409, "CONFLICT", str(exc)) from None
+        except AssistantError as exc:
+            raise BridgeError(400, "BAD_REQUEST", redact_secrets(str(exc)) or "The request was refused.") from None
+        if isinstance(result, BridgeResponse):
+            return result
+        return _json_response(200, {"json": result})
+
+    # helpers ---------------------------------------------------------------------------------------------------
+    def _assistant(self, ctx: _Ctx, bot_id: Any):
+        if not isinstance(bot_id, str) or not bot_id:
+            raise BridgeError(400, "BAD_REQUEST", "Provide exactly one of botId or groupId.")
+        return self.svc.get_assistant(bot_id, tenant_id=ctx.tenant, user_id=ctx.user)
+
+    def _target(self, ctx: _Ctx, inp: dict[str, Any]):
+        if inp.get("groupId"):
+            raise BridgeError(400, "BAD_REQUEST", "Groups are not supported by this server.")
+        return self._assistant(ctx, inp.get("botId"))
+
+    def _thread(self, ctx: _Ctx, assistant):
+        """The bot's one thread: the oldest of the assistant's threads (created on first use)."""
+        with self._thread_lock:
+            threads = self.svc.list_threads(tenant_id=ctx.tenant, user_id=ctx.user, assistant_id=assistant.assistant_id)
+            if threads:
+                return min(threads, key=lambda t: (t.created_at, t.thread_id))
+            return self.svc.create_thread(tenant_id=ctx.tenant, user_id=ctx.user, assistant_id=assistant.assistant_id,
+                                          title=assistant.name)
+
+    def _gather(self, ctx: _Ctx, assistant, thread):
+        store = self.svc.store
+        with store._lock:
+            messages = store.list_messages(thread.thread_id, tenant_id=ctx.tenant, user_id=ctx.user)
+            runs = [r for r in store.list_runs(tenant_id=ctx.tenant, user_id=ctx.user,
+                                               assistant_id=assistant.assistant_id)
+                    if r.thread_id == thread.thread_id]
+            run_ids = {r.run_id for r in runs}
+            approvals = [(a, store.actions[a.action_id]) for a in list(store.approvals.values())
+                         if a.tenant_id == ctx.tenant and a.user_id == ctx.user and a.action_id in store.actions
+                         and store.actions[a.action_id].run_id in run_ids]
+        return messages, runs, approvals
+
+    def _journal(self, ctx: _Ctx, assistant, thread, fresh: bool = False, bypass: bool = False):
+        """Bring the thread's journal up to date. Board proposals are re-read at most every ``desk.poll_seconds`` unless
+        ``fresh`` (threads/get, head, messages, and right after an answer)."""
+        messages, runs, approvals = self._gather(ctx, assistant, thread)
+        with self.journals.lock:
+            journal = self.journals.get(thread.thread_id, assistant.assistant_id)
+            journal.sync(messages, runs, approvals)
+            if ctx.account.role == "operator" and self._first_bot(ctx) == assistant.assistant_id:   # one card per proposal: the first bot's thread only
+                self.desk.refresh(ctx.tenant, ctx.user, journal, force=fresh, bypass=bypass)
+            return journal, runs
+
+    def _first_bot(self, ctx: _Ctx) -> str | None:
+        """The account's oldest bot (bots are never deleted here, so the answer is cached for a few seconds)."""
+        now = self._monotonic()
+        hit = self._first_bots.get(ctx.user)
+        if hit is not None and now - hit[0] < 5.0:
+            return hit[1]
+        bots = self.svc.list_assistants(tenant_id=ctx.tenant, user_id=ctx.user)
+        first = min(bots, key=lambda a: (a.created_at, a.assistant_id)).assistant_id if bots else None
+        if first is not None:
+            self._first_bots[ctx.user] = (now, first)
+        return first
+
+    def _bot(self, ctx: _Ctx, assistant) -> dict[str, Any]:
+        thread = self._thread(ctx, assistant)
+        messages, runs, _ = self._gather(ctx, assistant, thread)
+        visible = [m for m in messages if m.visibility == "visible"]
+        active = any(ev.run_status(r.state) in ev.ACTIVE for r in runs)
+        return ev.bot_view(assistant, thread.thread_id, ev.snippet(visible[-1].content, 120) if visible else "",
+                           "running" if active else "idle")
+
+    # procedures ------------------------------------------------------------------------------------------------
+    def _ok(self, ctx, inp):
+        return {"ok": True}
+
+    def _me(self, ctx, inp):
+        return ev.me_view(ctx.account)
+
+    def _spaces_list(self, ctx, inp):
+        return ev.spaces_view(self._bots(ctx))
+
+    def _bots(self, ctx: _Ctx) -> list[dict[str, Any]]:
+        return [self._bot(ctx, a) for a in self.svc.list_assistants(tenant_id=ctx.tenant, user_id=ctx.user)]
+
+    def _bots_list(self, ctx, inp):
+        return self._bots(ctx)
+
+    def _bots_get(self, ctx, inp):
+        return self._bot(ctx, self._assistant(ctx, inp.get("botId")))
+
+    def _bots_create(self, ctx, inp):
+        name = inp.get("name")
+        if not isinstance(name, str) or not name.strip() or len(name.strip()) > 80:
+            raise BridgeError(400, "BAD_REQUEST", "A bot needs a name of up to 80 characters.")
+        text = inp.get("instructions") or inp.get("description") or ""
+        if not isinstance(text, str) or len(text) > 20_000:
+            raise BridgeError(400, "BAD_REQUEST", "The instructions are too long.")
+        with self._create_lock:
+            if len(self.svc.list_assistants(tenant_id=ctx.tenant, user_id=ctx.user)) >= MAX_BOTS:
+                raise BridgeError(400, "BAD_REQUEST", f"This server allows at most {MAX_BOTS} bots per account.")
+            assistant = self.svc.create_assistant(tenant_id=ctx.tenant, user_id=ctx.user, name=name.strip(),
+                                                  instructions=text, enabled=True)
+        return self._bot(ctx, assistant)
+
+    def _threads_head(self, ctx, inp):
+        assistant = self._target(ctx, inp)
+        thread = self._thread(ctx, assistant)
+        journal, _ = self._journal(ctx, assistant, thread, fresh=True)
+        return {"threadId": thread.thread_id, "cursor": journal.head}
+
+    def _threads_get(self, ctx, inp):
+        assistant = self._target(ctx, inp)
+        thread = self._thread(ctx, assistant)
+        journal, runs = self._journal(ctx, assistant, thread, fresh=True)
+        views = [ev.run_view(r, assistant.assistant_id) for r in sorted(runs, key=lambda r: r.created_at)]
+        with self.journals.lock:
+            waiting = journal.waiting_proposal_runs()
+        real_active = [v for v in views if v["status"] in ev.ACTIVE]
+        active = real_active + waiting       # proposal runs only enable their cards; `run` is always a real run
+        latest = views[-1] if views else None
+        run = real_active[-1] if real_active else (latest if latest and latest["status"] == "failed" else None)
+        with self.journals.lock:
+            messages, older = journal.page()
+        return {"threadId": thread.thread_id, "cursor": journal.head, "messages": messages, "olderCursor": older,
+                "botId": assistant.assistant_id, "run": run, "activeRuns": active}
+
+    def _threads_messages(self, ctx, inp):
+        assistant = self._target(ctx, inp)
+        thread = self._thread(ctx, assistant)
+        journal, _ = self._journal(ctx, assistant, thread, fresh=True)
+        before = inp.get("before")
+        if before is not None and (isinstance(before, bool) or not isinstance(before, int)):
+            raise BridgeError(400, "BAD_REQUEST", "before must be an integer.")
+        messages, older = journal.page(before)
+        return {"threadId": thread.thread_id, "messages": messages, "olderCursor": older,
+                "coveredThroughSeq": max(0, journal.head)}
+
+    def _threads_send(self, ctx, inp):
+        assistant = self._target(ctx, inp)
+        text = inp.get("text")
+        if inp.get("artifactIds"):
+            raise BridgeError(400, "BAD_REQUEST", "Attachments are not supported by this server.")
+        if not isinstance(text, str) or not text.strip():
+            raise BridgeError(400, "BAD_REQUEST", "Provide text.")
+        if len(text) > 50_000:
+            raise BridgeError(400, "BAD_REQUEST", "The message is too long.")
+        if not assistant.enabled:
+            raise BridgeError(400, "BAD_REQUEST", "This bot is disabled.")
+        thread = self._thread(ctx, assistant)
+        journal, runs = self._journal(ctx, assistant, thread)
+        known_runs, known_messages = {r.run_id for r in runs}, set(journal.messages)
+        if not self._sends.acquire(blocking=False):
+            raise BridgeError(429, "TOO_MANY_REQUESTS", "Too many messages are being answered. Try again shortly.",
+                              {"Retry-After": "5"})
+        outcome: dict[str, BaseException] = {}
+
+        def work() -> None:
+            # The assistant answers synchronously and a model can take longer than the app's 8 s request timeout, so the
+            # run goes on in this thread while the reply to the app returns as soon as the run exists.
+            try:
+                self.svc.send_message(tenant_id=ctx.tenant, user_id=ctx.user, assistant_id=assistant.assistant_id,
+                                      thread_id=thread.thread_id, content=text)
+            except BaseException as exc:  # noqa: BLE001 - the run records its own failure; report it to a waiting caller
+                outcome["error"] = exc
+                log.warning("rakazo bridge: a run ended with %s", type(exc).__name__)
+            finally:
+                self._sends.release()
+
+        worker = threading.Thread(target=work, name="rakazo-send", daemon=True)
+        worker.start()
+        deadline = self._monotonic() + 5.0
+        run = None
+        while run is None:
+            _, current = self._journal(ctx, assistant, thread)
+            run = next((r for r in current if r.run_id not in known_runs), None)
+            if run is not None or not worker.is_alive() or self._monotonic() > deadline:
+                break
+            time.sleep(0.01)
+        if run is None:
+            error = outcome.get("error")
+            if isinstance(error, AssistantError):
+                raise error
+            raise BridgeError(500, "INTERNAL_SERVER_ERROR", "The message could not be started.")
+        journal, _ = self._journal(ctx, assistant, thread)
+        sent = journal.user_message_after(known_messages)
+        return {"taskId": run.task_id, "runId": run.run_id, "seq": sent["seq"] if sent else journal.head}
+
+    def _threads_answer(self, ctx, inp):
+        assistant = self._target(ctx, inp)
+        message_id, run_id, answer = inp.get("messageId"), inp.get("runId"), inp.get("answer")
+        if inp.get("dismiss") or inp.get("fields") or inp.get("username"):
+            raise BridgeError(400, "BAD_REQUEST", "Only approval answers are supported by this server.")
+        if isinstance(message_id, str) and message_id.startswith(ev.PROPOSAL_PREFIX):
+            return self._answer_proposal(ctx, assistant, message_id, run_id, answer)
+        if not (isinstance(message_id, str) and message_id.startswith(ev.APPROVAL_PREFIX)):
+            raise BridgeError(400, "BAD_REQUEST", "Only approval answers are supported by this server.")
+        decision = {"allow": "approved", "deny": "denied"}.get(answer)
+        if decision is None:
+            raise BridgeError(400, "BAD_REQUEST", "Answer allow or deny.")
+        approval_id = message_id[len(ev.APPROVAL_PREFIX):]
+        store = self.svc.store
+        approval = store.approvals.get(approval_id)
+        action = store.actions.get(approval.action_id) if approval is not None else None
+        thread = self._thread(ctx, assistant)
+        run = store.runs.get(run_id) if isinstance(run_id, str) else None
+        if (approval is None or action is None or approval.tenant_id != ctx.tenant or approval.user_id != ctx.user
+                or action.run_id != run_id or run is None or run.thread_id != thread.thread_id):
+            raise AssistantNotFound("approval not found")
+        # the EXISTING rules decide: owner/approver, expiry, and approver != requester for a sensitive tool unless the
+        # operator's YAML (allow_self_approval, or single_operator) says otherwise
+        decided = self.svc.decide_approval(approval_id, tenant_id=ctx.tenant, user_id=ctx.user, decision=decision,
+                                           actor=ctx.user)
+        if decided.decision == "approved" and self.svc.config["actions"]["auto_execute"]:
+            try:
+                self.svc.execute_approved_action(decided.action_id, tenant_id=ctx.tenant, user_id=ctx.user,
+                                                 actor=ctx.user)
+            except AssistantError as exc:        # the approval stands; the card shows the action did not run
+                log.info("rakazo bridge: approved action not executed: %s", redact_secrets(str(exc)))
+        return {"ok": True}
+
+    def _answer_proposal(self, ctx, assistant, message_id: str, run_id: Any, answer: Any):
+        """A board proposal card, decided through the dashboard's own path (``decide_proposal``)."""
+        from .project_intelligence_api import ApprovalRefused
+        decision = {"allow": "approve", "deny": "reject"}.get(answer)
+        if decision is None:
+            raise BridgeError(400, "BAD_REQUEST", "Answer allow or deny.")
+        thread = self._thread(ctx, assistant)
+        if ctx.account.role != "operator" or self._first_bot(ctx) != assistant.assistant_id:
+            raise BridgeError(404, "NOT_FOUND", "Not found.")      # a family account never sees or decides board proposals
+        self._journal(ctx, assistant, thread, fresh=True)
+        try:
+            with self.journals.lock:
+                journal = self.journals.get(thread.thread_id, assistant.assistant_id)
+            result = self.desk.answer(ctx.tenant, ctx.user, journal, message_id, run_id, decision,
+                                      on_done=lambda: self._journal(ctx, assistant, thread, fresh=True, bypass=True))
+        except Busy as exc:
+            raise BridgeError(429, "TOO_MANY_REQUESTS", str(exc), {"Retry-After": "5"}) from None
+        except pi.NotFound:
+            raise BridgeError(404, "NOT_FOUND", "Not found.") from None
+        except ApprovalRefused as exc:
+            raise BridgeError(403, "FORBIDDEN", str(exc)) from None
+        except pi.Conflict as exc:
+            raise BridgeError(409, "CONFLICT", redact_secrets(str(exc)) or "The request cannot be decided.") from None
+        except pi.IntelligenceError as exc:
+            raise BridgeError(400, "BAD_REQUEST", redact_secrets(str(exc)) or "The request was refused.") from None
+        except pi.StoreUnavailable:
+            raise BridgeError(503, "SERVICE_UNAVAILABLE", "The decision could not be recorded. Try again.") from None
+        self._journal(ctx, assistant, thread, fresh=True, bypass=True)   # the card turns answered, the outcome is posted
+        return result
+
+    def _threads_stop(self, ctx, inp):
+        assistant = self._target(ctx, inp)
+        thread = self._thread(ctx, assistant)
+        _, runs = self._journal(ctx, assistant, thread)
+        for run in runs:
+            if ev.run_status(run.state) in ev.ACTIVE:
+                try:
+                    self.svc.cancel_run(run.run_id, tenant_id=ctx.tenant, user_id=ctx.user)
+                except AssistantError:
+                    pass
+        return {"ok": True}
+
+    def _threads_mark_read(self, ctx, inp):
+        self._target(ctx, inp)
+        return {"ok": True, "unreadAfterSeq": None}
+
+    def _runs_list(self, ctx, inp):
+        mode = inp.get("filter")
+        if mode not in ("active", "recent"):
+            raise BridgeError(400, "BAD_REQUEST", "filter must be active or recent.")
+        store = self.svc.store
+        limit = MAX_RUN_ROWS if mode == "recent" else MAX_ACTIVE_ROWS
+        with store._lock:                  # the shared dicts change under concurrent runs: read them only while held
+            runs = [r for r in store.list_runs(tenant_id=ctx.tenant, user_id=ctx.user)
+                    if mode == "recent" or ev.run_status(r.state) in ev.ACTIVE][:limit]
+            threads = {r.thread_id for r in runs}
+            prompts: dict[str, list] = {}
+            for m in store.messages.values():            # one pass, only for the threads shown
+                if m.role == "user" and m.thread_id in threads:
+                    prompts.setdefault(m.thread_id, []).append(m)
+            names = {r.assistant_id: a.name for r in runs if (a := store.assistants.get(r.assistant_id))}
+        rows = []
+        for run in runs:
+            before = [m for m in prompts.get(run.thread_id, []) if m.created_at <= run.created_at]
+            prompt = max(before, key=lambda m: m.created_at).content if before else ""
+            rows.append({"runId": run.run_id, "botId": run.assistant_id, "botName": names.get(run.assistant_id, ""),
+                         "groupId": None, "groupName": None, "threadId": run.thread_id,
+                         "status": ev.run_status(run.state), "trigger": "user", "notificationsEnabled": False,
+                         "promptSnippet": ev.snippet(prompt, 120), "agentMessage": None,
+                         "updatedAt": ev.iso(run.updated_at)})
+        return {"runs": rows}
+
+    def _consent(self, ctx, inp):
+        # No third-party AI recipients are named, so the app never asks for consent; this server's model is the operator's.
+        return {"scope": ev.SPACE_ID, "version": _CONSENT_VERSION, "recipients": []}
+
+    def _register_push(self, ctx, inp):
+        token = inp.get("token")
+        if not isinstance(token, str) or not 8 <= len(token) <= 512 or re.search(r"\s", token):
+            raise BridgeError(400, "BAD_REQUEST", "That push token is not valid.")
+        return {"ok": True}           # accepted and dropped: this server sends no push notifications
+
+    def _threads_subscribe(self, ctx, inp):
+        assistant = self._target(ctx, inp)
+        cursor = inp.get("cursor")
+        if isinstance(cursor, bool) or not isinstance(cursor, int) or cursor < -1:
+            raise BridgeError(400, "BAD_REQUEST", "cursor must be an integer of at least -1.")
+        if not ctx.accepts_stream:
+            raise BridgeError(400, "BAD_REQUEST", "Subscribe with accept: text/event-stream.")
+        thread = self._thread(ctx, assistant)
+        if not self._streams.acquire(blocking=False):
+            raise BridgeError(429, "TOO_MANY_REQUESTS", "Too many live connections.", {"Retry-After": "10"})
+
+        def fetch(after: int) -> list[dict[str, Any]]:
+            journal, _ = self._journal(ctx, assistant, thread)
+            with self.journals.lock:
+                return journal.after(after)
+
+        frames = ev.event_stream(fetch, cursor, should_stop=lambda: self._closed.is_set() or not self.tokens.valid(
+            ctx.token), **self.stream_options)
+        return BridgeResponse(200, headers={"Content-Type": "text/event-stream", "Cache-Control": "no-store",
+                                            "X-Accel-Buffering": "no", "Connection": "close"},
+                              frames=frames, on_close=self._streams.release)

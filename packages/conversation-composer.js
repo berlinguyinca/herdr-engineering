@@ -35,10 +35,12 @@ export function mountComposer(host, options = {}) {
   host.innerHTML = `<form class="conversation-composer">
     <div class="conversation-editor-toolbar" aria-label="Message editor tools">
       <button type="button" data-expand aria-label="Expand editor" aria-expanded="false">Expand editor</button>
-      <button type="button" data-mode="edit" aria-pressed="true">Edit</button><button type="button" data-mode="preview" aria-pressed="false">Preview</button><button type="button" data-mode="split" aria-pressed="false">Split preview</button>
+      <button type="button" data-mode="edit" aria-pressed="true">Edit</button><button type="button" data-mode="preview" aria-pressed="false">Preview</button>
       <button type="button" data-edit="bold" aria-label="Bold">Bold</button><button type="button" data-edit="list" aria-label="Bulleted list">List</button><button type="button" data-edit="code" aria-label="Code block">Code</button>
-      <button type="button" data-edit="indent">Indent</button><button type="button" data-edit="outdent">Outdent</button><button type="button" data-edit="undo">Undo</button><button type="button" data-edit="redo">Redo</button>
-      <button type="button" data-find>Find and replace</button><button type="button" data-edit="json">Format JSON</button><button type="button" data-wrap aria-pressed="true">Wrap</button>
+      <details class="conversation-more"><summary>More</summary><span class="conversation-more-tools">
+        <button type="button" data-mode="split" aria-pressed="false">Split preview</button>
+        <button type="button" data-edit="indent">Indent</button><button type="button" data-edit="outdent">Outdent</button><button type="button" data-edit="undo">Undo</button><button type="button" data-edit="redo">Redo</button>
+        <button type="button" data-find>Find and replace</button><button type="button" data-edit="json">Format JSON</button><button type="button" data-wrap aria-pressed="true">Wrap</button></span></details>
     </div>
     <div class="conversation-find" hidden><label>Find text <input type="text" aria-label="Find text"></label><label>Replace with <input type="text" aria-label="Replace with"></label><button type="button" data-find-next>Find next</button><button type="button" data-replace>Replace all</button><button type="button" data-close-find>Close find</button></div>
     <div class="conversation-editor-body" data-mode="edit"><div class="conversation-input-wrap"><ul id="${id}-suggestions" class="conversation-suggestions" role="listbox" aria-label="References" hidden></ul>

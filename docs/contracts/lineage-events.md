@@ -24,6 +24,8 @@ Direction: `spawn` parent->child; `handoff` from->to; `delegation` delegator->de
 `dependency` dependent->prerequisite; `issue_link` any->issue/pr; `fork` origin->new approach; `supersession` new->old;
 `reviewed` reviewer->subject (attrs.commit / attrs.plan_digest REQUIRED = revision binding); `produced` producer->artifact;
 `validated` validator->subject (attrs.commit REQUIRED).
+Convention for CI evidence (the graph merge gate and its writer, `graph_evidence_writer.py`): `attrs` carry `commit` (the exact head
+SHA), `check` (name, default `ci`), `conclusion` (`success`|`failure`; anything unknown is pending, never a pass) and `run`.
 
 ## Rules
 - Every event carries the envelope `source`, `source_sequence`, `visibility_scope`; graph reads must filter by it.
@@ -504,22 +506,33 @@ Times are server receipt times; the emitter's claim (`occurred_at`, which falls 
 offers it as a separate choice. Nothing is inferred from chat, layout or timing, and no progress is invented.
 
 ### UI and accessibility
-Graph (layered SVG, no library), table view of the same data (always available; the only view above 300 nodes), Gantt (SVG +
+Graph (layered SVG viewport, no library; pan, zoom, fit, focus-lineage, only the nodes in view are in the DOM, at most 240 nodes and 480 links at any
+zoom), table view of the same data (always available, at most 1000 rows per table), Gantt (SVG +
 table), replay (range slider with spoken `aria-valuetext`, step buttons, Live), filters (search, node type, link type, state),
-inspector (read-only: fields, attributes as text, links in/out, state history, provenance). Keyboard: one tab stop in the graph,
-arrows/Home/End between nodes, Enter selects, Escape clears; arrow keys switch Graph/Gantt tabs. Nothing is encoded by colour alone:
+inspector (read-only: a Summary of measured facts, then fields, attributes as text, links in/out, state history, provenance).
+The Summary shows the mission status, blockers, next action, linked artifact versions and digests, the PR / CI / review within two links, the
+upstream and downstream counts and, for a session or a handoff record, the handoff from/to, checkpoint sha and cause. Each is taken from a node,
+an edge or an attribute of the response (`attrs.next_action`, `attrs.blockers`, `blocked_by` edges, `attrs.version_number`, `attrs.content_digests`,
+the handoff edge's `attrs.handoff_id` / `cause` and the handoff node's `attrs.checkpoint_sha`); a field the response does not carry reads
+"not reported". Nothing is estimated and no percentage is shown. An artifact's storage location (`uri`, `url`, `path`, `bucket`, `blob`...) is
+never printed. A status strip above the controls counts nodes by state and lists failed or blocked nodes and gates waiting for approval, so a
+phone shows status, attention and approvals first. Keyboard: one tab stop in the graph, arrows/Home/End between nodes (the view follows the
+focused node), Enter selects, Escape clears; + and - zoom, 0 fits, Shift+arrows (or arrows on the graph itself) pan; arrow keys switch Graph/Gantt tabs.
+Pointer: drag pans, the wheel with Ctrl, Cmd or Alt zooms (a plain wheel scrolls the page). Live and Replay are a word and a glyph in the replay bar. Nothing is encoded by colour alone:
 node types differ by shape, link types by dash pattern and a text tag (`stale` is struck through and says so), states by glyph and word,
 Gantt states by fill pattern and label, head changes by a letter. No animation (so nothing to reduce); forced-colors supported.
 Every id, label, attribute and reason is escaped for text and attribute contexts (unit and browser tested with hostile values).
 
 ### Not in this task / limitations
-- Click-to-inspect terminal is NOT offered (needs `authorize_workspace`; the inspector says so). No comments, fork, steer or retry.
+- Terminal click-through: the standalone page offers no terminal (the inspector says so). On the operator dashboard, for a `session:<id>` node whose id the
+  dashboard itself lists, the inspector links to `/#/herd/session/<id>`, the existing page whose Terminal button is the authorized route
+  (`docs/operations/terminal-attach.md`: operator only, live sessions only). The room's `authorize_workspace` terminal action is not used by this page.
 - T05 (canonical GitHub issue/PR linking and reconciliation) is not built: issue/PR nodes and `issue_link` edges are drawn when an
   emitter sends them, but no canonicalisation or reconciliation exists yet. T06's `review_quorum.py` is on this stack
   (see "Head-bound review quorum"); stale/head-change come from the T02 projection's own flags.
 - Replay cost is the reader's visible prefix (see budgets); beyond 25,000 visible events a past position answers 400. A busy room needs
-  the snapshot table mentioned above. Not load-tested at that size. No visual-regression suite exists; layout is checked by
-  unit tests and a browser smoke run against a mocked API plus one real-HTTP pytest of the routes, not by screenshots.
+  the snapshot table mentioned above. Not load-tested at that size. Layout is checked by unit tests, real-page gates
+  (`tests/playwright/ui-gates-workbench.test.mjs`, a 64-session chain and a 1500-node graph) and screenshot baselines (`collab-lineage*`, `collab-workbench*`).
 - There is no separate review/CI phase model. PR, review and CI objects appear as lanes of their node types (state spans from
   `node.state`), `reviewed`/`validated` edges as markers, and revision changes as `head_change` markers; nothing else is inferred.
 - The inspector shows the node as of the chosen position, from the page's own response; it does not fetch `graph/nodes/{id}`.
@@ -987,3 +1000,59 @@ Not fixed here: a per-API-key ingest limiter (M12's second half); compaction/sna
 pre-paid revocation only); the ids are
 remembered up to `FIRST_TS_MAX`, an evicted id is stripped; L3 (accepted), L4, L6-L9, L13 (a longer principal id would break configured key ids), L14.
 
+
+## Artifact nodes, ACL visibility and delivery metrics (lineage/assistant integration, 2026-10-29)
+
+Additive; no new node or edge kind, no `lineage.v3`. Code: `artifact_lineage.py`, `artifact_scope.py`, `lineage_metrics.py`.
+
+### Node ids and edges
+* `artifact:<artifact_id>` (commons) is the logical artifact: `attrs` carry the HEAD version's ids, number, parent and sorted
+  content digests (never blob locations or file names).
+* `artifact:<artifact_id>@<version_id>` (commons, same kind) is one immutable version. A version with a parent adds a
+  `supersession` edge new -> old (kind already in the vocabulary). A correction is therefore a new version; nothing is overwritten.
+* `produced` producer -> `artifact:<id>` as before (best effort).
+* `node.state` `retracted` (reason <= 200 characters) on the version node (and the logical node) is an AUDIT MARKER only.
+  What hides a retracted artifact or version is the read gate's retraction set (`ArtifactGraphGate.retract`, persisted in the
+  registry, reloaded at start), written by `POST /api/v1/artifacts/<id>/retract`; it hides the nodes and their edges from every
+  reader, in every replay. `emit_retraction` on its own leaves the version readable by its audience.
+* Event sources: real registry ids are longer than the 32 characters a source may have, and one writer may use only 4 distinct
+  sources on one node, so the logical node uses ONE stable source per artifact (`art-<sha256(artifact_id)[:20]>`) with
+  sequence `version_number*10+1`; objects that belong to one version use `artv-<sha256(version_id)[:20]>`; the backfill uses
+  `artbf`/`artbfv`; mail conversation nodes use `mail-<sha256(thread_node)[:20]>`. (Earlier code used `art-<version_id>`, which
+  the ingest refused for real ids: such commits recorded no lineage.)
+
+### Why a read-time gate (decision, replaces "private only")
+Scope never widens for an existing object, and for a COMMONS node a writer's labels only ever widen, so an ACL change cannot be
+expressed by re-stamping a label. The ACL is therefore applied at READ time, like room membership:
+* `GraphProjection.set_node_gate(node_type, fn)` registers `fn(principal, node) -> bool`, evaluated in `_node_visible` AND-ed with the
+  scope check. It can only narrow. Edges need both endpoints visible, so they follow. The gate is server configuration, not stored
+  state: the server installs it at start (`ControlPlaneServer.__init__`) and `_rebuild_graph` carries it over.
+* `ArtifactGraphGate` allows a principal iff the artifact's ACL holds a live `read` grant for it. Operators get no bypass (same as
+  the artifact HTTP reads). Identity mapping: a graph key principal `key:<12 hex>` matches the ACL id `api-key:<16 hex>:<role>` that
+  starts with the same 12 digits of the same key digest; a signed-in person `user:<id>` matches only an ACL grant naming exactly `user:<id>`.
+* Emission label: with a gate installed (`artifact_acl` configured) the commit route stamps `org` (fleet keys only, never a person);
+  a caller that knows the room/mission stamps that contextual label (`visibility_fields`) and a person then needs the membership AND the
+  ACL grant. Without a gate the label is `private` (committer only), as before. A scope the ingest refuses falls back to `private`, never wider.
+* Writes are gated too: `GraphProjection.set_write_gate('artifact', ...)` makes admission of any field-bearing write to an `artifact`
+  node require an ACL `edit` grant (an empty "ensure" is exempt). Without it any key could pre-create `artifact:<id>` and have its
+  forged label/version facts shown as the primary value to the real audience (found in independent review). Only the first
+  state-writer's state is primary on a commons node, so a retraction by another editor is reported as an error by
+  `emit_retraction(graph=...)` rather than silently ignored; `scope` is required for retractions.
+* Consequences: a grant shows the node on the next read; a revoke or expiry hides it on the next read, also after restart/rebuild.
+  Nodes emitted `private` before this change stay committer-only (no in-place widening; commit a new version to expose it).
+  Removing the gate code later would expose `org`-labelled artifact nodes to every fleet key: revoke grants instead of reverting the gate.
+
+### Delivery metrics (existing route)
+`GET /api/v1/collab/rooms/<room>/analytics` gains `delivery` (from `lineage_metrics.lineage_metrics`, over the SAME reader-filtered
+snapshot as the rest of the analytics): `accepted_changes`, `gate_failures` (only states from `insights.evidence_writers`; `count:
+"unknown"` when none is configured), `handoffs` (outcomes, success rate, recovery latency; self-reported), `rework` (stale reviews,
+supersessions, head changes after review), `review_findings` (total, open, severity cells, precision), `issue_lead_time`, `sessions`,
+`usage.tokens` / `usage.cost_usd` (summed only from nodes whose emitter reported `tokens`/`tokens_in`/`tokens_out`/`cost_usd`,
+otherwise `status: "unknown"`, never estimated). Rates, durations and usage over fewer than `min_group_size` items are `suppressed`.
+Times are server receipt times. No per-person or per-agent breakdown. Nothing is written.
+
+### Email attachment artifacts (control-plane function, not yet routed)
+`intel_attachment_artifact.attach_to_artifact` triages the bytes (`intel_attachments.triage`), stores an accepted attachment as a new
+version of a (new or given) logical artifact, grants `read` to the named mail audience only, records original message metadata as
+artifact provenance (inside the ACL boundary), writes a private `thread:` node plus a `produced` edge to the artifact, and writes an
+`issue_link` only for a project-intelligence relationship that a person confirmed (`confirmed` and `human_verified`).

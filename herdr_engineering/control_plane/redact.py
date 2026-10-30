@@ -6,6 +6,8 @@ secrets are not stored or rendered.
 """
 from __future__ import annotations
 
+import functools
+import math
 import re
 from typing import Any
 
@@ -88,6 +90,18 @@ def _redact_private_keys(text: str) -> str:
     return "".join(out)
 
 
+#: Bounded size of the ``redact_text`` memoization cache.
+_REDACT_CACHE_MAXSIZE = 8192
+
+# Redaction rules are module-level constants fixed at import (a rules change ships
+# as a new image / process, which starts a fresh cache). redact_text is pure and
+# deterministic, so memoizing it avoids re-running the regex scan over the same
+# message/payload text on every agent-summaries poll. Bounded so unique large
+# payloads (review bodies, github text) cannot grow memory without limit. Strings
+# are immutable, so sharing a cached result is safe. lru_cache is thread-safe,
+# which matters because the control-plane web redacts concurrently from many
+# request-handler threads (this was a GIL-bound hot path pegging a full core).
+@functools.lru_cache(maxsize=_REDACT_CACHE_MAXSIZE)
 def redact_text(text: str) -> str:
     """Replace secret-looking substrings in a string with [REDACTED]."""
     if not text:
@@ -98,28 +112,42 @@ def redact_text(text: str) -> str:
     return out
 
 
-def redact_payload(payload: Any, *, _seen=None) -> Any:
-    """Recursively redact secret values/keys inside an event payload / JSON."""
-    _seen = _seen if _seen is not None else set()
-    if id(payload) in _seen:
-        return payload
-    _seen.add(id(payload))
+def redact_text_cache_clear() -> None:
+    """Drop the ``redact_text`` memoization cache (tests / future rule hot-reload)."""
+    redact_text.cache_clear()
+
+
+def redact_payload(payload: Any, *, _seen=None, _memo=None) -> Any:
+    """Redact every occurrence, memoizing sanitized containers and masking cycles."""
     if isinstance(payload, str):
         return redact_text(payload)
-    if isinstance(payload, dict):
-        result = {}
-        for key, value in payload.items():
-            lk = str(key).lower()
-            if lk not in _PLAIN_KEYS and any(s in lk for s in _SECRET_KEY_HINTS):
-                result[key] = _REDACTED
-            else:
-                result[key] = redact_payload(value, _seen=_seen)
+    if not isinstance(payload, (dict, list, tuple)):
+        return payload
+    active = _seen if _seen is not None else set()
+    memo = _memo if _memo is not None else {}
+    identity = id(payload)
+    if identity in active:
+        return _REDACTED
+    if identity in memo:
+        return memo[identity]
+    active.add(identity)
+    try:
+        if isinstance(payload, dict):
+            result = {}
+            for key, value in payload.items():
+                lk = str(key).lower()
+                if lk not in _PLAIN_KEYS and any(s in lk for s in _SECRET_KEY_HINTS):
+                    result[key] = _REDACTED
+                else:
+                    result[key] = redact_payload(value, _seen=active, _memo=memo)
+        elif isinstance(payload, list):
+            result = [redact_payload(item, _seen=active, _memo=memo) for item in payload]
+        else:
+            result = tuple(redact_payload(item, _seen=active, _memo=memo) for item in payload)
+        memo[identity] = result
         return result
-    if isinstance(payload, list):
-        return [redact_payload(item, _seen=_seen) for item in payload]
-    if isinstance(payload, tuple):
-        return tuple(redact_payload(item, _seen=_seen) for item in payload)
-    return payload
+    finally:
+        active.remove(identity)
 
 
 def redact_values(payload: Any) -> Any:
@@ -137,8 +165,8 @@ def redact_values(payload: Any) -> Any:
 #: themselves carry a secret, so key-name redaction must not blank them. This
 #: is delivery-specific (unlike the global ``_PLAIN_KEYS``): the count fields
 #: ``passed``/``failed``/``skipped``/``total`` and ``url`` stay intact, while
-#: any string value (including a ``passed`` value that happens to be secret
-#: text) is still scanned by ``redact_text``.
+#: other string values are scanned by ``redact_text``. The hint-bearing
+#: ``passed`` exception is limited to nonnegative numeric counts or None.
 _DELIVERY_VALUE_KEYS = frozenset({
     "passed", "failed", "skipped", "total", "url", "status", "verdict",
     "reviewer", "repository", "branch", "base", "number", "severity",
@@ -152,8 +180,8 @@ def redact_delivery(payload: Any, *, _memo=None, _active=None) -> Any:
     """Redact a delivery record (tests/builds/reviews/pulls) for display.
 
     Numeric counts and structural fields survive; string values are scanned for
-    leaked secrets via ``redact_text``, so a secret in a ``passed`` value or a
-    finding ``summary`` is redacted while the count/url/status text is kept.
+    leaked secrets via ``redact_text``. Nonnumeric ``passed`` values are masked
+    wholesale so an unrecognized credential cannot bypass key-name redaction.
     Keys whose names hint at a secret (e.g. a ``token`` or ``api_key`` field)
     are redacted wholesale. Unlike ``redact_payload`` this never blanks the
     ``passed`` count key merely because it contains the substring ``pass``.
@@ -179,6 +207,12 @@ def redact_delivery(payload: Any, *, _memo=None, _active=None) -> Any:
         result = {}
         for key, value in payload.items():
             lk = str(key).lower()
+            if lk == "passed":
+                safe_count = (value is None or type(value) is int and value >= 0
+                              or type(value) is float and value >= 0 and math.isfinite(value))
+                if not safe_count:
+                    result[key] = _REDACTED
+                    continue
             if any(s in lk for s in _SECRET_KEY_HINTS) and lk not in _DELIVERY_VALUE_KEYS:
                 result[key] = _REDACTED
             else:
@@ -232,3 +266,13 @@ def redact_ingest_body(body: Any) -> Any:
         if key in payload:
             out["payload"][key] = redact_values(payload[key])
     return out
+
+
+def rules_fingerprint() -> str:
+    """Stable digest of every redaction rule. A stored projection built under different rules is stale."""
+    import hashlib
+    h = hashlib.sha256()
+    for pattern in _PATTERNS:
+        h.update(f"{pattern.flags}:{pattern.pattern}\0".encode())
+    h.update("|".join(_SECRET_KEY_HINTS).encode() + b"\0" + "|".join(sorted(_PLAIN_KEYS)).encode())
+    return h.hexdigest()

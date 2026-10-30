@@ -17,19 +17,24 @@ import re
 
 from ..host_policy import normalize_aliases
 from ..review_gate.entities import RESERVED_ENTITY_PREFIXES
-from .ids import validate_mission_id
-
-log = logging.getLogger(__name__)
 from .envelope import ENVELOPE_ONLY_TYPES, EnvelopeConflict, normalize_envelope
 from .events import SequenceCollision
 from .federation import (
-    clamp_for_principal, in_peer_namespace, is_peer_actor, is_peer_node, peer_fingerprint, peer_of,
+    clamp_for_principal,
+    in_peer_namespace,
+    is_peer_actor,
+    is_peer_node,
+    peer_fingerprint,
+    peer_of,
     policy_from_source,
 )
 from .graph import validate_lineage
 from .host_metrics_store import STATE_KEYS, clean_metrics, clean_state
+from .ids import validate_mission_id
 from .project_links import canonical_repository
 from .sink import EventAlreadyStored
+
+log = logging.getLogger(__name__)
 
 
 def _worktree_id(payload):
@@ -73,7 +78,10 @@ GENERIC_ENTITY_TYPES = frozenset({"task", "note", "workspace", "ledger", "platfo
 INGEST_ENTITY_TYPES = DISPATCHED_ENTITY_TYPES | GENERIC_ENTITY_TYPES
 # Event types the server itself writes for an allowed entity type: receipts other code trusts as idempotency
 # markers (repo.send_message, ci_debug, bridge). A client may not name them.
-SERVER_OWNED_EVENT_TYPES = {"session": frozenset({"SessionCommandQueued", "SessionCommandSettled"})}
+SERVER_OWNED_EVENT_TYPES = {
+    "session": frozenset({"SessionCommandQueued", "SessionCommandSettled"}),
+    "host": frozenset({"HostPolicyChanged"}),
+}
 
 # Sources whose host events prove the host is alive: its fabric agent, and the
 # herdr feed plugin on the host (deploy/herdr-cp-feed-plugin posts host.heartbeat
@@ -183,6 +191,19 @@ class IngestService:
         if not good:
             raise PermissionError("not permitted to modify this lineage object")
 
+    def _check_evidence_namespace(self, env: dict, event_type: str, payload: dict) -> None:
+        """CI evidence run nodes live under ``ci:ci-evidence:``. API keys are ``key:<hash>`` and rooms ``collab:...``, so
+        only the in-process evidence writer (a ``ci-evidence:`` principal) or an authenticated operator may create or
+        attach to a node there: a stranger cannot pre-create a predictable run id and make the writer's next write fail."""
+        actor = env.get("actor") or {}
+        if str(actor.get("id") or "").startswith("ci-evidence:") or (
+                actor.get("kind") == "operator" and actor.get("authenticated_by") not in (None, "none", "open_listener")):
+            return
+        ends = ((payload.get("from_id"), payload.get("to_id")) if event_type.startswith("edge.")
+                else (payload.get("node_id"),))
+        if any(isinstance(e, str) and e.startswith("ci:ci-evidence:") for e in ends):
+            raise PermissionError("not permitted to modify this lineage object")
+
     def _check_reserved_nodes(self, env: dict, event_type: str, payload: dict) -> None:
         """Only an external agent itself (or an authenticated operator key) may write a node or edge
         source inside that agent's namespace; anyone else is refused exactly like any lineage refusal."""
@@ -275,6 +296,7 @@ class IngestService:
             self._check_peer_namespace(env, event_type, payload, entity_id)
             self._check_lineage_scope(env)
             self._check_reserved_nodes(env, event_type, payload)
+            self._check_evidence_namespace(env, event_type, payload)
         self._prevalidate(entity_type, entity_id, payload, event_type, source)
         if env is None:
             return self._dispatch(entity_type, entity_id, event_type, payload, source)
@@ -559,6 +581,8 @@ class IngestService:
             verdict=payload.get("verdict"),
             started_at=payload.get("started_at"),
             completed_at=payload.get("completed_at"),
+            repository=payload.get("repository"),
+            pull_request_number=payload.get("pull_request_number"),
         )
 
     def _ingest_review_finding(self, entity_id, payload, source) -> dict:
@@ -593,6 +617,8 @@ class IngestService:
             branch=payload.get("branch"),
             base=payload.get("base"),
             created_at=payload.get("created_at"),
+            merged_at=payload.get("merged_at"),
+            closed_at=payload.get("closed_at"),
         )
 
     def _ingest_host(self, entity_id, event_type, payload, source="herdr") -> dict:
@@ -612,8 +638,7 @@ class IngestService:
         ip = payload.get("tailnet_ip") or payload.get("ip")
         inventory = payload.get("inventory")
         scheduler = {key: payload[key] for key in (
-            "host_uid", "aliases", "platform", "scheduler_owned", "scheduler_trusted",
-            "scheduler_policy", "scheduler_capacity",
+            "aliases", "platform",
         ) if payload.get(key) is not None}
         if "aliases" in scheduler:
             scheduler["aliases"] = normalize_aliases(scheduler["aliases"])

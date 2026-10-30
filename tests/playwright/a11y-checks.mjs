@@ -216,6 +216,7 @@ function staticInPage(arg, L) {
       const paint = svg && el.namespaceURI === 'http://www.w3.org/2000/svg' ? cs.fill : (cs.webkitTextFillColor && cs.webkitTextFillColor !== cs.color ? cs.webkitTextFillColor : cs.color);
       const fg = parse(paint);
       if (!fg) continue;                       // fill: none / a paint server (gradient): not judged
+      if (el.localName === 'herdr-freshness' && parseFloat(cs.textIndent) < -999) continue;   // the status dot: its label is moved off-screen on purpose, there is no visible text to judge
       const alpha = fg[3] * opacityOf(el);
       let bg;
       if (svg && el.namespaceURI === 'http://www.w3.org/2000/svg') {

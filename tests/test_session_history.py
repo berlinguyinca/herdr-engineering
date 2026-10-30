@@ -251,3 +251,12 @@ def test_session_id_without_agent_searches_every_store(tmp_path):
     claude_fixture(tmp_path, sid="only-here")
     res = sh.resolve(session="only-here", home=tmp_path, env={}, cwd="/somewhere/else")
     assert (res.agent, res.method) == ("claude", "explicit")
+
+
+def test_history_reports_every_recorded_cwd_latest_last(tmp_path):
+    rows = [{"type": "user", "timestamp": f"t{i}", "cwd": cwd, "message": {"content": "x"}}
+            for i, cwd in enumerate(["/work", "/work/wt-a", "/work", "/work/wt-b"])]
+    _jl(tmp_path / ".claude/projects/-work/multi.jsonl", rows)
+    out = sh.read_history(sh.resolve(agent="claude", session="multi", home=tmp_path), home=tmp_path)
+    assert out["cwd"] == "/work/wt-b"                       # where the session ended up
+    assert out["cwds"] == ["/work/wt-a", "/work", "/work/wt-b"]    # ordered by last use, no duplicates

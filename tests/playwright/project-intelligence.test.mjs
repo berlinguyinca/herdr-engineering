@@ -38,7 +38,7 @@ test('nav entry appears only with the capability', async () => {
   await withPage(async (page, base) => {
     await stub(page, { capabilities: [] });
     await page.goto(`${base}/#/overview`);
-    await page.waitForSelector('text=Handoffs');   // the nav (a shadow-DOM element) has rendered
+    await page.waitForSelector('text=Collaboration');   // the nav (a shadow-DOM element) has rendered
     assert.equal(await page.locator('text=Project intelligence').count(), 0);
   });
   await withPage(async (page, base) => {
@@ -60,7 +60,7 @@ test('timeline renders, escapes untrusted titles, and shows evidence on selectio
     await page.locator('.pi-item[data-event="e2"]').click();
     const pane = await page.locator('.pi-pane').innerText();
     assert.match(pane, /github:acme\/app/); assert.match(pane, /aaaaaaaaaaaa/);
-    assert.equal(await page.locator('.pi-pane a[href^="#/reviews?search="]').count(), 1, 'PR entity links through entity-links.js');
+    assert.equal(await page.locator('.pi-pane a[href="#/pr/acme/app/7"]').count(), 1, 'PR entity links through entity-links.js to its trail');
     assert.match(await page.locator('.pi-list').innerText(), /late arrival/);
     await page.locator('.pi-item[data-event="e3"]').click();
     assert.match(await page.locator('.pi-pane').innerText(), /No evidence reference/);
@@ -248,7 +248,10 @@ for (const [name, size, theme] of [['desktop light', [1280, 900], 'light'], ['de
       await page.waitForSelector('#pi-related li');
       const f = [...await staticAudit(page, '#view'), ...await focusIndicatorAudit(page, '#view')];
       assert.deepEqual(f, [], summarize(f));
-      assert.equal(overflowFailure(await overflowAudit(page)), '', 'overflow');
+      const audit = await overflowAudit(page);
+      // the freshness dot is an 8px box whose text label is moved off-screen on purpose (a text-indent technique): not content that is cut
+      audit.clipped = audit.clipped.filter((c) => !c.startsWith('herdr-freshness '));
+      assert.equal(overflowFailure(audit), '', 'overflow');
     });
   });
 }
