@@ -654,7 +654,9 @@ class ControlPlaneServer:
             self.assistant.intelligence_read = self.intelligence.assistant_read
             if getattr(self, "apps", None) is not None:      # per-person Gmail + Calendar through the Connectors tab
                 from .google_workspace import GoogleWorkspace
-                self.assistant.google_read = GoogleWorkspace(self.apps._store, self.apps).run
+                _gw = GoogleWorkspace(apps=self.apps)
+                self.apps.on_change = _gw.invalidate
+                self.assistant.google_read = _gw.run
             from .assistant_lineage import LineageReader, principal_resolver
             self.assistant.lineage_read = LineageReader(repo.graph, principal_resolver(self._keys)).read
             from .assistant_adapters import comment_hook, draft_writer_hook, rereview_hook

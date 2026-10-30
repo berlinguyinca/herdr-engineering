@@ -7,6 +7,7 @@ tokens never appear in a listing, an exception or a log line.
 from __future__ import annotations
 
 import hashlib
+import logging
 import threading
 import time
 from collections.abc import Callable
@@ -17,6 +18,7 @@ from herdr_engineering.control_plane.google_workspace import GoogleError
 
 STATE_TTL = 600
 MAX_PENDING_PER_PERSON = 5
+log = logging.getLogger(__name__)
 GOOGLE = "google"
 CALLBACK_PATH = "/api/v1/assistant-apps/google/callback"
 CARDS = (("gmail", "Gmail"), ("calendar", "Google Calendar"))
@@ -28,13 +30,26 @@ def _digest(state: str) -> str:
 
 class AppsService:
     def __init__(self, store: CredentialStore, *, redirect_base: str, opener: Callable | None = None,
-                 clock: Callable[[], float] = time.time, github_status_fn: Callable[[], dict] | None = None):
+                 clock: Callable[[], float] = time.time, github_status_fn: Callable[[], dict] | None = None,
+                 on_change: Callable[[str, str], None] | None = None):
         self._store, self._clock = store, clock
+        self.on_change = on_change      # (tenant, user): a person's connection was replaced or removed
         self._open = opener or google_oauth.default_opener
         self._redirect = redirect_base.rstrip("/") + CALLBACK_PATH
         self._github = github_status_fn
         self._pending: dict[str, tuple[str, str, str, str, float]] = {}
         self._lock = threading.Lock()
+
+    @property
+    def credentials(self) -> CredentialStore:
+        return self._store
+
+    def _changed(self, tenant: str, user: str) -> None:
+        if self.on_change is not None:
+            try:
+                self.on_change(tenant, user)
+            except Exception:  # noqa: BLE001 - a cache hook must never break sign-in or sign-out
+                log.warning("assistant apps: on_change hook failed")
 
     # --- listing
     def client_configured(self, provider: str) -> bool:
@@ -141,6 +156,7 @@ class AppsService:
         except GoogleError:
             raise AppsError("exchange_failed") from None
         self._store.put_connection(tenant, user, GOOGLE, account=account, scopes=sorted(granted), refresh_token=refresh)
+        self._changed(tenant, user)
         return tenant, user
 
     def disconnect(self, tenant: str, user: str, provider: str) -> None:
@@ -151,5 +167,6 @@ class AppsService:
         except AppsError:
             token = None
         self._store.delete_connection(tenant, user, GOOGLE)
+        self._changed(tenant, user)
         if token:
             google_oauth.revoke(self._open, token)

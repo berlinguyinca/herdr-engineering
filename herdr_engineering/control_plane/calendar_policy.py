@@ -12,27 +12,32 @@ from collections.abc import Callable, Iterable
 from .google_workspace import PRIMARY, GoogleError
 
 
+def norm(value: object) -> str:
+    """Ids compare trimmed and case-insensitively (Google treats calendar addresses as case-insensitive)."""
+    return str(value).strip().casefold()
+
+
 class CalendarPolicy:
     def __init__(self, blocked: Iterable[str], resolve_primary: Callable[[], str]):
-        self.blocked = {b.strip() for b in blocked if isinstance(b, str) and b.strip()}
+        self.normalized = frozenset(norm(b) for b in blocked if isinstance(b, str) and b.strip())
         self._resolve, self._primary = resolve_primary, None
         self._lock = threading.Lock()
 
     def _real_primary(self) -> str:
         with self._lock:
             if self._primary is None:
-                self._primary = str(self._resolve()).strip()     # a failure propagates: never fail open
+                self._primary = norm(self._resolve())      # a failure propagates: never fail open
             return self._primary
 
     def allows(self, calendar_id: str) -> bool:
-        if not self.blocked:
+        if not self.normalized:
             return True
-        cid = str(calendar_id).strip()
-        if cid in self.blocked:
+        cid = norm(calendar_id)
+        if cid in self.normalized:
             return False
-        if cid == PRIMARY or PRIMARY in self.blocked:       # the alias and the real id are one calendar
+        if cid == PRIMARY or PRIMARY in self.normalized:       # the alias and the real id are one calendar
             real = self._real_primary()
-            return not (real in self.blocked or (cid == real and PRIMARY in self.blocked))
+            return not (real in self.normalized or (cid == real and PRIMARY in self.normalized))
         return True
 
     def filter(self, calendars: list[dict]) -> list[dict]:

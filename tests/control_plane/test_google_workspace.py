@@ -40,7 +40,7 @@ class Google:
     """A fake Google: token endpoint + Gmail + Calendar, recording every request."""
 
     def __init__(self):
-        self.requests, self.fail, self.revoked = [], {}, False
+        self.requests, self.fail, self.revoked, self.primary = [], {}, False, "ann@x.org"
         b64 = base64.urlsafe_b64encode(b"Hello from the body").decode()
         self.msgs = {"m1": {"id": "m1", "snippet": "snip", "payload": {
             "headers": [{"name": "From", "value": "Alice <a@x.org>"}, {"name": "Subject", "value": "Lunch"},
@@ -68,7 +68,7 @@ class Google:
             return Resp({"items": [{"id": "ann@x.org", "summary": "Ann", "primary": True}, {"id": "team@x.org", "summary": "Team"},
                                    {"id": "secret@x.org", "summary": "Private"}]})
         if path.endswith("/calendars/primary"):
-            return Resp({"id": "ann@x.org"})
+            return Resp({"id": self.primary})
         if "/events/" in path:
             return Resp({"id": "e1", "summary": "One", "start": {"date": "2026-10-31"}, "end": {"date": "2026-11-01"}})
         if "/events" in path:

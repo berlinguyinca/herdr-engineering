@@ -25,6 +25,10 @@ from typing import Any
 
 log = logging.getLogger(__name__)
 
+# Why there is no scope guard here (the old one refused any token wider than read-only): the stored connection's scopes
+# legitimately include compose and event-writing now. Safety instead comes from the request surface: every method here
+# issues only GET requests to read URLs (the token endpoint POST is the one exception; a test asserts both).
+
 SCOPES = ("https://www.googleapis.com/auth/gmail.readonly", "https://www.googleapis.com/auth/calendar.readonly")
 AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 TOKEN_URL = "https://oauth2.googleapis.com/token"
@@ -139,11 +143,14 @@ def _urlopen(req, timeout):
 
 
 class GoogleWorkspace:
-    def __init__(self, store: Any, apps: Any = None, *, blocked_fn: Callable[[str, str], list[str]] | None = None,
+    def __init__(self, store: Any = None, apps: Any = None, *, blocked_fn: Callable[[str, str], list[str]] | None = None,
                  opener: Callable | None = None, clock: Callable[[], float] = time.time):
+        store = store if store is not None else apps.credentials
         self._store, self._open, self._clock = store, opener or _urlopen, clock
         self._blocked = blocked_fn or (apps.blocked_calendars if apps is not None else (lambda t, u: []))
         self._lock = threading.Lock()
+        self._key_locks: dict[tuple[str, str], threading.Lock] = {}
+        self._gen: dict[tuple[str, str], int] = {}
         self._access: dict[tuple[str, str], tuple[str, float]] = {}
         self._policies: dict[tuple[str, str], Any] = {}
 
@@ -155,11 +162,22 @@ class GoogleWorkspace:
         if conn.status != "connected":
             raise GoogleError("needs_attention")
 
+    def invalidate(self, tenant: str, user: str) -> None:
+        """Forget this person's cached access token, policy and resolved primary id (reconnect, disconnect, revoke)."""
+        with self._lock:
+            key = (tenant, user)
+            self._gen[key] = self._gen.get(key, 0) + 1
+            self._access.pop(key, None)
+            self._policies.pop(key, None)
+
     def _access_token(self, tenant: str, user: str) -> str:
         key = (tenant, user)
         with self._lock:
+            key_lock = self._key_locks.setdefault(key, threading.Lock())
+        with key_lock:                      # serialises refreshes for ONE person; others and the cache stay free
             self._connection(tenant, user)
-            cached = self._access.get(key)
+            with self._lock:
+                cached, gen = self._access.get(key), self._gen.get(key, 0)
             if cached and cached[1] > self._clock() + 60:
                 return cached[0]
             client = self._store.get_client("google")
@@ -181,18 +199,22 @@ class GoogleWorkspace:
                     revoked = exc.code in (400, 401) and json.loads(exc.read(4096)).get("error") == "invalid_grant"
                 except Exception:   # noqa: BLE001
                     pass
+                code = exc.code
                 exc.close()
                 if revoked:
-                    self._access.pop(key, None)
+                    self.invalidate(tenant, user)
                     self._store.set_status(tenant, user, "google", "needs_attention")
                     raise GoogleError("needs_attention") from None
-                raise GoogleError("unauthorized" if exc.code in (400, 401) else "unavailable") from None
+                raise GoogleError("unauthorized" if code in (400, 401) else "unavailable") from None
             except (urllib.error.URLError, OSError, ValueError):
                 raise GoogleError("unavailable") from None
-            token, ttl = data.get("access_token") if isinstance(data, dict) else None, data.get("expires_in") if isinstance(data, dict) else None
+            token = data.get("access_token") if isinstance(data, dict) else None
+            ttl = data.get("expires_in") if isinstance(data, dict) else None
             if not isinstance(token, str) or isinstance(ttl, bool) or not isinstance(ttl, (int, float)):
                 raise GoogleError("unavailable")
-            self._access[key] = (token, self._clock() + float(ttl))
+            with self._lock:
+                if self._gen.get(key, 0) == gen:        # not invalidated while the POST was in flight
+                    self._access[key] = (token, self._clock() + float(ttl))
             return token
 
     def _get(self, tenant: str, user: str, url: str, params: dict[str, Any]) -> dict:
@@ -220,26 +242,32 @@ class GoogleWorkspace:
 
     # ---- blocked calendars --------------------------------------------------------------------------------
     def policy_for(self, tenant: str, user: str) -> Any:
-        """The person's CalendarPolicy, built from their current blocked list (re-read each call so edits apply at once)."""
+        """The person's CalendarPolicy: their current blocked list, and a primary id tied to the connected account."""
         from .calendar_policy import (
             CalendarPolicy,  # deferred: calendar_policy imports GoogleError from here
         )
         blocked = self._blocked(tenant, user)
+        conn = self._store.get_connection(tenant, user, "google")
+        account = conn.account if conn is not None else ""
 
         def resolve() -> str:
+            # The one accepted exception to "no calendar data": GET calendars/primary?fields=id returns the identity of
+            # the primary calendar only (no event data), which is needed to compare the alias `primary` with blocked ids.
             data = self._get(tenant, user, f"{CALENDAR_API}/calendars/primary", {"fields": "id"})
             cid = data.get("id")
             if not isinstance(cid, str) or not cid:
                 raise GoogleError("unavailable")
             return cid
+        from .calendar_policy import norm
+        wanted = frozenset(norm(b) for b in blocked if isinstance(b, str) and b.strip())
         with self._lock:
             old = self._policies.get((tenant, user))
-            if old is not None and old.blocked == {b.strip() for b in blocked if isinstance(b, str) and b.strip()}:
-                return old
+            if old is not None and old[0] == account and old[1].normalized == wanted:
+                return old[1]
             pol = CalendarPolicy(blocked, resolve)
-            if old is not None:
-                pol._primary = old._primary
-            self._policies[(tenant, user)] = pol
+            if old is not None and old[0] == account:
+                pol._primary = old[1]._primary         # same account: the resolved id is still right
+            self._policies[(tenant, user)] = (account, pol)
             return pol
 
     def _calendars_allowed(self, tenant: str, user: str, calendar_ids: list[str]) -> list[str]:

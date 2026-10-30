@@ -43,7 +43,7 @@ def test_primary_alias_and_real_id_are_blocked_together():
         refuses(pol.require, "ann@x.org")
         assert [c["id"] for c in pol.filter([{"id": "ann@x.org", "primary": True}, {"id": "team@x.org"}])] == ["team@x.org"]
     pol = CalendarPolicy({"ann@x.org"}, resolve)
-    assert pol.allows("ANN@x.org")                                         # case-sensitive
+    assert not pol.allows("ANN@X.org") and not pol.allows(" Ann@x.org ")  # case-insensitive, trimmed
     assert len(calls) == 3                                                 # resolved once per policy, never for no blocks
     assert CalendarPolicy(set(), resolve).allows("primary") and len(calls) == 3
 
@@ -85,14 +85,66 @@ def test_revoked_refresh_token_marks_needs_attention_without_leaking(store):
     assert exc2.value.reason == "needs_attention"
 
 
+def test_case_variants_are_refused_on_list_and_read_paths(store):
+    w, g = ws(store, blocked={("default", "u1"): ["Secret@X.org"]})
+    refuses(w.list_events, "default", "u1", calendar_id="SECRET@x.org")
+    refuses(w.read_event, "default", "u1", " secret@x.ORG ", "e1")
+    assert [c["id"] for c in w.list_calendars("default", "u1")] == ["ann@x.org", "team@x.org"]
+    refuses(w._calendars_allowed, "default", "u1", ["secret@X.ORG"])
+
+
+def test_reconnect_with_a_different_account_reresolves_primary(store):
+    w, g = ws(store, blocked={("default", "u1"): ["new@x.org"]})
+    w.list_events("default", "u1")                       # primary resolves to ann@x.org: allowed, and cached
+    store.put_connection("default", "u1", "google", account="new@x.org", scopes=list(SCOPES), refresh_token=REFRESH)
+    g.primary = "new@x.org"
+    refuses(w.list_events, "default", "u1")              # even without invalidate(): the account changed
+    w2, g2 = ws(store, blocked={("default", "u1"): ["new@x.org"]})
+    w2.list_events("default", "u1", calendar_id="team@x.org")
+    w2.invalidate("default", "u1")
+    assert ("default", "u1") not in w2._policies and ("default", "u1") not in w2._access
+
+
+def test_primary_resolution_failure_fails_closed(store):
+    w, g = ws(store, blocked={("default", "u1"): ["secret@x.org"]})
+    g.fail["/calendars/primary"] = 500
+    before = len(g.requests)
+    with pytest.raises(gw.GoogleError):
+        w.list_events("default", "u1")
+    assert not any("/events" in r[1] for r in g.requests[before:])
+
+
+def test_every_request_is_a_get_to_a_read_url_except_the_token_post(store):
+    w, g = ws(store, blocked={("default", "u1"): ["secret@x.org"]})
+    w.run("default", "u1", "search_email", {"query": "x"})
+    w.run("default", "u1", "read_email", {"message_id": "m1"})
+    w.run("default", "u1", "list_calendar_events", {})
+    w.read_event("default", "u1", "team@x.org", "e1")
+    w.list_calendars("default", "u1")
+    for method, url, *_ in g.requests:
+        assert (method == "POST" and url == gw.TOKEN_URL) or (method == "GET" and url.startswith(
+            ("https://gmail.googleapis.com/gmail/v1/users/me/", "https://www.googleapis.com/calendar/v3/")))
+
+
+def test_apps_service_hook_invalidates_on_disconnect(store):
+    from herdr_engineering.control_plane.assistant_apps import AppsService
+    apps = AppsService(store, redirect_base="https://x", opener=lambda req, t: (_ for _ in ()).throw(OSError("x")))
+    w, g = ws(store)
+    apps.on_change = w.invalidate
+    w.run("default", "u1", "search_email", {"query": "x"})
+    assert ("default", "u1") in w._access
+    apps.disconnect("default", "u1", "google")
+    assert ("default", "u1") not in w._access
+    assert apps.credentials is store
+
+
 def test_person_a_tool_call_cannot_use_person_b_tokens(store):
     w, g = ws(store)
-    w.run("default", "u1", "search_email", {"query": "x"})
-    w.run("default", "u2", "search_email", {"query": "x"})
-    bearers = [r[2] for r in g.requests if r[0] == "GET"]
-    assert "Bearer ya29.access." + REFRESH in bearers and "Bearer ya29.access.2//other-refresh" in bearers
-    u1 = [r[2] for r in g.requests[: len(g.requests) // 2] if r[0] == "GET"]
-    assert all("other-refresh" not in b for b in u1)
+    for user, refresh in (("u1", REFRESH), ("u2", "2//other-refresh"), ("u1", REFRESH)):
+        start = len(g.requests)
+        w.run("default", user, "search_email", {"query": "x"})
+        gets = [r for r in g.requests[start:] if r[0] == "GET"]
+        assert gets and all(r[2] == "Bearer ya29.access." + refresh for r in gets)
     with pytest.raises(gw.GoogleError) as exc:
         w.run("default", "u3", "search_email", {"query": "x"})
     assert exc.value.reason == "not_connected"
