@@ -24,6 +24,41 @@ class LimitedInput:
         return value
 
 
+class PinnedOutputError(ValueError):
+    """A version output lacks hash-verifiable metadata, or its digest references disagree."""
+
+
+_MEDIA_TYPE = re.compile(r"[A-Za-z0-9!#$&^_.+-]+/[A-Za-z0-9!#$&^_.+-]+(?:;[^\r\n]*)?")
+
+
+def pinned_output(output, *, require_size=True):
+    """The content-addressed reference a registry output entry authorizes: storage_key, sha256, size_bytes, media_type, name.
+
+    Uses the reference the registry stored (``storage_key`` or ``blob_sha256``), never a second digest field that could
+    point at different bytes in the global content-addressed store. ``require_size=False`` lets a caller that measures
+    the verified download accept a missing ``size_bytes`` (returned as ``None``); a present size must still be valid.
+    """
+    if not isinstance(output, dict):
+        raise PinnedOutputError("pinned output lacks verifiable download metadata")
+    reference = output.get("storage_key") or output.get("blob_sha256")
+    digest = reference.rsplit("/", 1)[-1] if isinstance(reference, str) else None
+    size = output.get("size_bytes")
+    media_type = output.get("media_type", "application/octet-stream")
+    if media_type is None and not require_size:
+        media_type = "application/octet-stream"
+    if (not isinstance(digest, str) or not re.fullmatch(r"[a-f0-9]{64}", digest)
+            or not ((size is None and not require_size)
+                    or (not isinstance(size, bool) and isinstance(size, int) and 0 <= size <= MAX_ASSET_BYTES))
+            or not isinstance(media_type, str) or not _MEDIA_TYPE.fullmatch(media_type)):
+        raise PinnedOutputError("pinned output lacks verifiable download metadata")
+    key = f"sha256/{digest[:2]}/{digest[2:4]}/{digest}"
+    if (reference not in {key, digest}
+            or any(field in output and output[field] != digest for field in ("sha256", "blob_sha256"))):
+        raise PinnedOutputError("pinned output references disagree")
+    return {"storage_key": key, "sha256": digest, "size_bytes": size, "media_type": media_type,
+            "name": output.get("name", "output.bin")}
+
+
 def _body(handler, allowed):
     if handler.headers.get("Content-Type", "").split(";", 1)[0].strip().lower() != "application/json":
         raise ValueError("report mutations require application/json")
@@ -203,27 +238,12 @@ def route_report(handler, server, parts, resource):
         if index >= len(outputs):
             handler._json({"error": "not found"}, 404)
             return True
-        output = outputs[index]
-        # Use the reference the registry authorized, never a second digest field
-        # that could point at different bytes in the global content-addressed store.
-        reference = output.get("storage_key") or output.get("blob_sha256")
-        digest = reference.rsplit("/", 1)[-1] if isinstance(reference, str) else None
-        size = output.get("size_bytes")
-        media_type = output.get("media_type", "application/octet-stream")
-        if (not isinstance(digest, str) or not re.fullmatch(r"[a-f0-9]{64}", digest)
-                or isinstance(size, bool) or not isinstance(size, int) or not 0 <= size <= MAX_ASSET_BYTES
-                or not isinstance(media_type, str)
-                or not re.fullmatch(r"[A-Za-z0-9!#$&^_.+-]+/[A-Za-z0-9!#$&^_.+-]+(?:;[^\r\n]*)?", media_type)):
-            handler._json({"error": "pinned output lacks verifiable download metadata"}, 409)
+        try:
+            pinned = pinned_output(outputs[index])
+        except PinnedOutputError as exc:
+            handler._json({"error": str(exc)}, 409)
             return True
-        key = f"sha256/{digest[:2]}/{digest[2:4]}/{digest}"
-        if (reference not in {key, digest}
-                or any(field in output and output[field] != digest
-                       for field in ("sha256", "blob_sha256"))):
-            handler._json({"error": "pinned output references disagree"}, 409)
-            return True
-        _download(handler, server, {"storage_key": key, "sha256": digest, "size_bytes": size,
-                                   "media_type": media_type, "name": output.get("name", "output.bin")})
+        _download(handler, server, pinned)
         return True
     if action == "assets" and len(parts) == 9 and method == "GET":
         asset = handler._artifact_call("get_report_asset", artifact_id, version_id, parts[8])

@@ -2,6 +2,7 @@
 // and an arrow wherever a handoff moved work from one agent to another. Built from what the server reports; a lane with no
 // handoff edge simply shows its agents side by side, so the chart never implies a transfer that was not recorded.
 import { escapeHtml as esc } from './herdr-web-components/util.js';
+import { prTrailHref } from './entity-links.js';
 
 const MAX_LANES = 8;
 const MIN_SPAN_MS = 30 * 60 * 1000;
@@ -88,12 +89,12 @@ export function commitSteps(links) {
   const list = Array.isArray(links.commits) ? links.commits : [];
   const pulls = (Array.isArray(links.pull_requests) ? links.pull_requests : []).filter(p => Number.isInteger(p?.number));
   if (links.state === 'linked' && (list.length || pulls.length)) {
-    const shown = list.slice(0, 5).map(c => ({ kind: 'commit', at: ms(c.at), text: `Commit ${text(c.sha).slice(0, 7) || 'unknown'}${c.pull_request ? ` · PR #${c.pull_request}` : ''} · CI run #${c.run_number ?? '?'} ${text(c.state) || 'unknown'}${c.match === 'commit' ? ' (the commit the agent reported)' : ''}`, url: text(c.ci_url) }));
+    const shown = list.slice(0, 5).map(c => ({ kind: 'commit', at: ms(c.at), text: `Commit ${text(c.sha).slice(0, 7) || 'unknown'}${c.pull_request ? ` · PR #${c.pull_request}` : ''} · CI run #${c.run_number ?? '?'} ${text(c.state) || 'unknown'}${c.match === 'commit' ? ' (the commit the agent reported)' : ''}`, url: text(c.ci_url), trail: c.pull_request ? prTrailHref(text(links.repository_id), c.pull_request) : null }));
     const more = list.length - shown.length + (Number.isInteger(links.omitted) ? links.omitted : 0);
     if (more > 0) shown.push({ kind: 'commit', at: NaN, text: `${more} more commits not listed` });
     // A pull request already named on a commit line is not repeated.
     const named = new Set(list.map(c => c.pull_request).filter(Boolean));
-    for (const p of pulls.filter(x => !named.has(x.number)).slice(0, 5)) shown.push({ kind: 'commit', at: ms(p.at), text: `PR #${p.number}${text(p.status) ? ` ${text(p.status)}` : ''}`, url: text(p.url) });
+    for (const p of pulls.filter(x => !named.has(x.number)).slice(0, 5)) shown.push({ kind: 'commit', at: ms(p.at), text: `PR #${p.number}${text(p.status) ? ` ${text(p.status)}` : ''}`, url: text(p.url), trail: prTrailHref(text(links.repository_id), p.number) });
     return shown;
   }
   return [{ kind: 'unlinked', at: NaN, text: `No commit link recorded: ${text(links.reason) || 'the server found no matching CI run.'}` }];
@@ -120,5 +121,5 @@ export function agentStory(session, tree = {}, now = Date.now(), links = null) {
 export function renderStory(story) {
   const fmt = at => Number.isFinite(at) ? new Date(at).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : '';
   return `<style>.as-story{list-style:none;margin:8px 0 14px;padding:0 0 0 14px;border-left:2px solid var(--border)}.as-story li{position:relative;padding:2px 0 8px 10px;font-size:13px;line-height:1.4;overflow-wrap:anywhere}.as-story li::before{content:"";position:absolute;left:-19px;top:7px;width:8px;height:8px;border-radius:50%;background:var(--text-muted)}.as-story li[data-kind=start]::before{background:var(--accent)}.as-story li[data-kind=now]::before{background:var(--status-ok,#2e9d5b)}.as-story li[data-kind=commit]::before{background:var(--accent)}.as-story li[data-kind=unlinked]{color:var(--text-secondary)}.as-story li[data-kind=unlinked]::before{background:transparent;border:1px solid var(--text-muted)}.as-story time{display:block;font-size:11px;color:var(--text-secondary)}</style>
-<ol class="as-story" aria-label="How this agent started and proceeded">${story.steps.map(s => `<li data-kind="${esc(s.kind)}"><time>${esc(fmt(s.at))}</time>${/^https:\/\//.test(s.url || '') ? `<a href="${esc(s.url)}" target="_blank" rel="noopener noreferrer">${esc(s.text)}</a>` : esc(s.text)}</li>`).join('')}</ol>`;
+<ol class="as-story" aria-label="How this agent started and proceeded">${story.steps.map(s => `<li data-kind="${esc(s.kind)}"><time>${esc(fmt(s.at))}</time>${/^https:\/\//.test(s.url || '') ? `<a href="${esc(s.url)}" target="_blank" rel="noopener noreferrer">${esc(s.text)}</a>` : esc(s.text)}${s.trail ? ` <a href="${esc(s.trail)}" data-pr-trail>how it got here</a>` : ''}</li>`).join('')}</ol>`;
 }

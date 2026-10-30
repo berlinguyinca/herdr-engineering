@@ -182,7 +182,8 @@ PY
       keep=""
       for m in $(cat {missing}); do
         svc="$(case "$m" in herdr-cp-web) echo control-plane-web ;; herdr-cp-worker) echo control-plane-worker ;;
-          herdr-llm-proxy) echo llm-proxy ;; herdr-collab-public) echo collab-public ;; herdr-collab-edge) echo collab-edge ;; esac)"
+          herdr-llm-proxy) echo llm-proxy ;; herdr-collab-public) echo collab-public ;; herdr-collab-edge) echo collab-edge ;;
+          herdr-share-public) echo share-public ;; esac)"
         case " $* " in *" $svc "*) ;; *) keep="$keep $m" ;; esac
       done
       echo "$keep" > {missing}
@@ -193,7 +194,8 @@ PY
     python3 - "$pins" <<'PY'
 import json, os, pathlib, sys
 names = {{'control-plane-web':'herdr-cp-web', 'control-plane-worker':'herdr-cp-worker',
-         'llm-proxy':'herdr-llm-proxy', 'collab-public':'herdr-collab-public', 'collab-edge':'herdr-collab-edge'}}
+         'llm-proxy':'herdr-llm-proxy', 'collab-public':'herdr-collab-public', 'collab-edge':'herdr-collab-edge',
+         'share-public':'herdr-share-public'}}
 ids = {{v: 'sha256:' + 'b' * 64 for v in names.values()}}
 if sys.argv[1] and not os.environ.get('STUB_IGNORE_ROLLBACK_IMAGES'):
     ids.update({{names[k]: v['image'] for k,v in json.loads(pathlib.Path(sys.argv[1]).read_text())['services'].items()}})
@@ -1813,3 +1815,55 @@ def test_a_bad_pipelines_dir_is_refused_before_anything_runs(env, fault, needle)
     assert r.returncode != 0
     assert needle in r.stderr
     assert not env["log"].exists()
+
+
+def _google_dir(e):
+    return e["home"] / ".config/herdr-engineering/google"
+
+
+def test_compose_mounts_the_google_dir_read_only_into_web_only():
+    doc = yaml.safe_load((ROOT / "deploy/control-plane/compose.yaml").read_text())
+    mount = "${HERDR_CP_GOOGLE_DIR:?run deploy.sh}:/etc/herdr/google:ro"
+    assert mount in doc["services"]["control-plane-web"]["volumes"]
+    for name, svc in doc["services"].items():
+        if name != "control-plane-web":
+            assert not any("/etc/herdr/google" in str(v) for v in svc.get("volumes") or []), name
+
+
+def test_deploy_creates_an_empty_0700_google_dir(env):
+    env["env"]["FAIL_COMPOSE"] = "1"
+    deploy(env)
+    d = _google_dir(env)
+    assert d.is_dir() and (d.stat().st_mode & 0o777) == 0o700 and not list(d.iterdir())
+
+
+def test_valid_google_files_are_accepted_and_never_printed(env):
+    d = _google_dir(env)
+    d.mkdir(parents=True, mode=0o700)
+    d.chmod(0o700)
+    for name in ("client_secret.json", "token.json"):
+        (d / name).write_text('{"refresh_token": "PLACEHOLDERGOOGLESECRET"}')
+        (d / name).chmod(0o600)
+    r = deploy(env, "--dry-run")
+    assert r.returncode == 0, r.stderr
+    assert "PLACEHOLDERGOOGLESECRET" not in r.stdout + r.stderr
+
+
+@pytest.mark.parametrize("fault,needle", [
+    ("dir_mode", "must be mode 0700"),
+    ("extra_file", "must hold only client_secret.json and token.json"),
+    ("file_mode", "must be mode 0600 or 0400"),
+])
+def test_a_bad_google_dir_is_refused_before_anything_runs(env, fault, needle):
+    d = _google_dir(env)
+    d.mkdir(parents=True, mode=0o700)
+    d.chmod(0o700)
+    token = d / "token.json"
+    token.write_text("{}")
+    token.chmod(0o644 if fault == "file_mode" else 0o600)
+    if fault == "dir_mode":
+        d.chmod(0o755)
+    if fault == "extra_file":
+        (d / "notes.txt").write_text("x")
+    r = deploy(env, "--dry-run")
+    assert r.returncode != 0 and needle in r.stderr

@@ -202,3 +202,21 @@ def test_a_denied_app_permission_is_reported_as_permission_not_not_configured():
         lst.open_prs("acme/widget")
     assert str(exc.value) == "permission" or getattr(exc.value, "reason", None) == "permission"
     assert lst.last_error == "permission"
+
+
+def test_a_clean_repo_does_not_hide_another_repos_failure():
+    ls = lister(Opener([[pr(1)], [pr(2)]]))
+    with pytest.raises(PollError):
+        ls.open_prs("not a repo")
+    ls.open_prs("owner/good")
+    assert ls.last_error == "invalid_repository"        # the bad repo still fails; the good one only clears itself
+    ls._repo_errors.clear()
+    ls.open_prs("owner/good")
+    assert ls.last_error is None
+
+
+def test_non_mapping_assistant_actions_do_not_crash_single_operator_startup():
+    from herdr_engineering.cli import _assistant_config
+    for bad in ("x", ["y"], 3, None):
+        out = _assistant_config({"single_operator": True, "personal_assistant": {"actions": bad}})
+        assert out["personal_assistant"]["actions"] == {"allow_self_approval": True}

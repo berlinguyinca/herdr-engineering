@@ -48,4 +48,6 @@ addopts = "--import-mode=importlib -m 'not e2e and not integration'"
 integration = "requires a live Postgres (PA_PG_DSN); skipped by default"
 
 [tool.setuptools.package-data]
-herdr_engineering = ["control_plane/rakazo_defaults.json", "*.mjs", "skill_data/summary/*.md", "skill_data/summary/adapters/*.md"]
+herdr_engineering = ["control_plane/rakazo_defaults.json", "*.mjs", "skill_data/summary/*.md", "skill_data/summary/adapters/*.md",
+                     "control_plane/share_static/*.html", "control_plane/share_static/*.js",
+                     "control_plane/share_static/*.css"]

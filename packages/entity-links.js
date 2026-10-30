@@ -21,7 +21,7 @@ export const ENTITY_ROUTES = {
   service: (id, p) => `#/services/${enc(id)}${q(p)}`,
   ci: (id, p) => `#/ci${q({ search: id, ...p })}`,
   review: (id, p) => `#/reviews${q({ search: id, ...p })}`,
-  pr: (id, p) => `#/reviews${q({ search: id, ...p })}`,
+  pr: (id, p) => { const m = /^([\w.-]{1,100})\/([\w.-]{1,100})#([1-9]\d{0,9})$/.exec(id); return m ? `#/pr/${m[1]}/${m[2]}/${m[3]}${q(p)}` : `#/reviews${q({ search: id, ...p })}`; },
   project: (id, p) => `#/github${q({ repository: id, ...p })}`,
   'llm-session': (id, p) => `#/llm/session/${enc(id)}${q(p)}`,
   artifact: (id, p) => `#/artifacts/${enc(id)}${q(p)}`,
@@ -56,4 +56,13 @@ export function forgePrUrl(repository, number) {
   if (typeof repository !== 'string' || !/^[\w.-]{1,100}\/[\w.-]{1,100}$/.test(repository)) return null;
   if (!Number.isInteger(number) || number < 1) return null;
   return `https://github.com/${repository}/pull/${number}`;
+}
+
+// Internal "how did agents get here" page for a pull request, from structured fields only. The repository may carry a forge
+// host (github.com/org/app) or not (org/app); the page is addressed by owner/name/number.
+export function prTrailHref(repository, number) {
+  if (typeof repository !== 'string' || !Number.isInteger(number) || number < 1) return null;
+  const m = /^(?:[\w.-]+\.[\w.-]+\/)?([\w.-]{1,100})\/([\w.-]{1,100}?)(?:\.git)?$/.exec(repository.trim().replace(/^https?:\/\//, ''));
+  const host = /^(?:https?:\/\/)?([\w-]+(?:\.[\w-]+)+)\//.exec(repository.trim());
+  return m ? `#/pr/${m[1]}/${m[2]}/${number}${host ? `?host=${encodeURIComponent(host[1].toLowerCase())}` : ''}` : null;
 }

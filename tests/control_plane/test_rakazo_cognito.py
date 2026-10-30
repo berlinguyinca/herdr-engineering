@@ -49,7 +49,7 @@ def test_config_validation():
     assert rc.cognito_config(CFG)["required_group"] == GROUP
     for bad in ({**CFG, "required_group": ""}, {k: v for k, v in CFG.items() if k != "required_group"},
                 {**CFG, "pool_id": "nope"}, {**CFG, "client_ids": []}, {**CFG, "client_ids": ["a b"]},
-                {**CFG, "group_check": "yes"}, {**CFG, "extra": 1}, []):
+                {**CFG, "group_check": "yes"}, {**CFG, "role": "admin"}, {**CFG, "extra": 1}, []):
         with pytest.raises(ValueError, match="cognito"):
             rc.cognito_config(bad)
     assert rakazo_bridge_config(bridge_section(cognito=CFG))["cognito"]["pool_id"] == POOL
@@ -75,6 +75,7 @@ def test_bridge_signs_in_a_pool_member_and_revokes_when_they_leave_the_group(mak
     assert api.rpc("me", {}, token)[0] == 200
     account = server.rakazo._by_id[next(iter(server.rakazo._cognito_users))]
     assert account.collab_user == "carol" and account.principal_id.startswith("rakazo:")
+    assert account.role == "family"                              # chat only unless the operator configures role: operator
     groups.clear()                                              # removed from the group: the live session ends
     server.rakazo.cognito.auth._checked.clear()
     assert api.rpc("me", {}, token)[0] == 401

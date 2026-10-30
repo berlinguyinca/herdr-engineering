@@ -129,7 +129,7 @@ test('density preserves mobile controls and representative route containment at 
 test('populated tablet heatmap keeps touch targets within their own bucket columns', async () => {
   await withApp(async ({ page, base }) => {
     await page.setViewportSize({ width: 768, height: 1080 });
-    await page.goto(`${base}/#/ci`);
+    await page.goto(`${base}/#/ci?workspace=health`);
     await page.locator('.ci-health-cell').first().waitFor({ timeout: 45000 });
     for (const width of [768, 701, 900, 390]) {
       await page.setViewportSize({ width, height: 1080 });

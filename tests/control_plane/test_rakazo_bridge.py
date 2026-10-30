@@ -159,8 +159,7 @@ def test_disabled_means_404_everywhere(make_server, section):
     ({"enabled": True, "accounts": [{"email": "a@b.c", "password_scrypt": "plaintext"}]}, "scrypt"),
     ({"enabled": True, "accounts": [{"email": "a@b.c", "password_scrypt": "scrypt$1$1$1$AA==$AA=="}]}, "scrypt"),
     ({"enabled": True, "accounts": [{"email": "nope", "password_scrypt": HASH_A}]}, "email"),
-    ({"enabled": True, "accounts": [{"email": "a@b.c", "password_scrypt": HASH_A, "role": "family"}]}, "family"),
-    ({"enabled": True, "accounts": [{"email": "a@b.c", "password_scrypt": HASH_A, "role": "admin"}]}, "operator"),
+    ({"enabled": True, "accounts": [{"email": "a@b.c", "password_scrypt": HASH_A, "role": "admin"}]}, "family"),
     ({"enabled": True, "accounts": [{"email": "a@b.c", "password_scrypt": HASH_A},
                                     {"email": "A@B.c", "password_scrypt": HASH_B}]}, "repeats"),
     ({"enabled": True, "operator_email": "a@b.c", "password_scrypt": HASH_A}, "unknown keys"),
@@ -1353,3 +1352,17 @@ def test_a_sign_out_waits_for_a_concurrent_flush_instead_of_reporting_a_false_fa
     known, durable = store.revoke(other)               # the first flush is still running: wait for it, do not give up
     first.join()
     assert known and durable and len(deleted) == 2
+
+
+def test_slow_calls_are_logged_by_name_and_duration_only(monkeypatch, caplog):
+    import logging
+
+    from herdr_engineering.control_plane import rakazo_bridge as rb
+    monkeypatch.setattr(rb, "SLOW_CALL_MS", 0)
+    bridge = rb.RakazoBridge.__new__(rb.RakazoBridge)
+    monkeypatch.setattr(rb.RakazoBridge, "_handle", lambda *a, **k: rb.BridgeResponse(200, b"secret-body"))
+    with caplog.at_level(logging.INFO, logger=rb.log.name):
+        bridge.handle("POST", "/rpc/spaces/list?token=abc", {"authorization": "Bearer s3cr3t"}, b'{"x":1}', "1.2.3.4")
+    text = " ".join(r.getMessage() for r in caplog.records)
+    assert "spaces/list took" in text and "status 200" in text
+    assert "s3cr3t" not in text and "secret-body" not in text and "token=abc" not in text

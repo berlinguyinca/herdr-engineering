@@ -31,6 +31,7 @@ from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from typing import Any
 
+from . import project_intelligence as pi
 from . import rakazo_artifacts as artifacts
 from . import rakazo_bots as bots
 from . import rakazo_cognito as cognito
@@ -57,15 +58,19 @@ from .assistant import (
     RateLimited,
     redact_secrets,
 )
+from .rakazo_proposals import Busy, ProposalDesk
+from .rakazo_push import ExpoSender, PushNotifier, PushRegistry
 
 log = logging.getLogger(__name__)
+SLOW_CALL_MS = 300           # a call slower than this is logged (name + duration only)
+VERY_SLOW_CALL_MS = 2000      # ... as a warning
 
 SCRYPT_N, SCRYPT_R, SCRYPT_P, SALT_BYTES, HASH_BYTES = 2 ** 15, 8, 1, 16, 32
 _MAX_N = 2 ** 17                     # 128 MiB: a hash in the YAML cannot make one sign-in allocate more than this
 _EMAIL = re.compile(r"[^@\s]+@[^@\s]+\Z")
 _COLLAB_USER = re.compile(r"[A-Za-z0-9._@+:-]{1,200}\Z")
 _PROC = re.compile(r"[A-Za-z][A-Za-z0-9/]{0,63}\Z")
-_ROLES = ("operator",)
+_ROLES = ("operator", "family")
 _CONSENT_VERSION = "herdr-1"
 MAX_BODY = 12_000_000          # an authenticated call may carry a file (artifacts/create: 8 MiB as base64)
 MAX_AUTH_BODY = 8_192
@@ -169,7 +174,7 @@ def rakazo_bridge_config(raw: Any, now: float | None = None) -> dict[str, Any]:
         return {"enabled": False}
     now = time.time() if now is None else now
     unknown = sorted(set(raw) - {"enabled", "accounts", "token_ttl_days", "max_tokens", "trusted_proxies",
-                                 "routine_runner_seconds", "hindsight", "vault_key_file", "auto_join_rooms", "cognito"})
+                                 "routine_runner_seconds", "hindsight", "vault_key_file", "auto_join_rooms", "cognito", "push"})
     if unknown:
         raise ValueError(f"control_plane.rakazo_bridge has unknown keys: {', '.join(map(str, unknown))} "
                          "(accounts are listed under accounts: [{email, password_scrypt, role}])")
@@ -218,9 +223,9 @@ def rakazo_bridge_config(raw: Any, now: float | None = None) -> dict[str, Any]:
         if not isinstance(email, str) or not _EMAIL.match(normalize_email(email)) or len(email) > 254:
             raise ValueError(f"{where}.email must be an email address")
         role = row.get("role", "operator")
-        if role != "operator":
-            raise ValueError(f"{where}.role {role!r} is not supported: only 'operator' is implemented "
-                             "('family' is reserved for a later multi-user mode)")
+        if role not in _ROLES:
+            raise ValueError(f"{where}.role {role!r} is not supported: use one of {', '.join(_ROLES)} "
+                             "(family = chat only: no project data, proposals or approvals)")
         params = parse_scrypt(row.get("password_scrypt"), f"{where}.password_scrypt")
         cutoff = _cutoff(row.get("tokens_valid_after"), f"{where}.tokens_valid_after", now)
         email_n = normalize_email(email)
@@ -234,7 +239,39 @@ def rakazo_bridge_config(raw: Any, now: float | None = None) -> dict[str, Any]:
     return {"enabled": True, "token_ttl_days": ttl_days, "max_tokens": max_tokens, "accounts": accounts,
             "trusted_proxies": tuple(nets), "routine_runner_seconds": runner, "hindsight": hindsight,
             "vault_key_file": vault_key_file, "auto_join_rooms": tuple(auto_join),
-            "cognito": cognito_cfg}
+            "cognito": cognito_cfg, "push": _push_config(raw.get("push"))}
+
+
+def _push_config(raw: Any) -> dict[str, Any]:
+    """``control_plane.rakazo_bridge.push``: ``{enabled, quiet_hours: {start, end} (UTC hours), expo_access_token_file}``.
+    Off unless ``enabled`` is exactly true. The Expo token (only for projects with enhanced push security) is read from a
+    file at send time, never held in the YAML."""
+    if raw is None:
+        return {"enabled": False}
+    if not isinstance(raw, dict) or set(raw) - {"enabled", "quiet_hours", "expo_access_token_file"}:
+        raise ValueError("control_plane.rakazo_bridge.push must be a mapping with enabled, quiet_hours, expo_access_token_file")
+    quiet = raw.get("quiet_hours")
+    if quiet is not None:
+        ok = isinstance(quiet, dict) and set(quiet) == {"start", "end"} and all(
+            isinstance(quiet[k], int) and not isinstance(quiet[k], bool) and 0 <= quiet[k] <= 23 for k in quiet)
+        if not ok:
+            raise ValueError("control_plane.rakazo_bridge.push.quiet_hours must be {start: 0-23, end: 0-23} in UTC")
+        quiet = (quiet["start"], quiet["end"])
+    token_file = raw.get("expo_access_token_file")
+    if token_file is not None and not isinstance(token_file, str):
+        raise ValueError("control_plane.rakazo_bridge.push.expo_access_token_file must be a path")
+    return {"enabled": raw.get("enabled") is True, "quiet_hours": quiet, "expo_access_token_file": token_file}
+
+
+def _read_secret_file(path: str | None) -> str | None:
+    if not path:
+        return None
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return fh.read().strip() or None
+    except OSError:
+        log.warning("rakazo push: the Expo access token file could not be read")
+        return None
 
 
 # --------------------------------------------------------------------------------------------- tokens
@@ -243,6 +280,7 @@ class TokenStoreError(Exception):
 
 
 DB_TIMEOUT_SECONDS = 3
+_EXPO_TOKEN = re.compile(r"Expo(?:nent)?PushToken\[[A-Za-z0-9_\-]{8,200}\]")
 MAX_LIMITER_ENTRIES = 20_000
 
 
@@ -612,7 +650,8 @@ class RakazoBridge:
     not the bridge's (the caller then answers exactly as it did before the bridge existed)."""
 
     def __init__(self, config: dict[str, Any], assistant, *, version: str = "0", persistence=None, space_persistence=None,
-                 prefs_persistence=None, collab=None, artifacts_fn=None, cognito_signin=None, clock: Callable[[], float] = time.time, monotonic: Callable[[], float] = time.monotonic):
+                 prefs_persistence=None, collab=None, artifacts_fn=None, cognito_signin=None, push_persistence=None,
+                 push_sender=None, clock: Callable[[], float] = time.time, monotonic: Callable[[], float] = time.monotonic):
         if not config.get("enabled"):
             raise ValueError("RakazoBridge needs an enabled configuration")
         self.svc = assistant
@@ -643,6 +682,15 @@ class RakazoBridge:
         self.thread_factory = threading.Thread      # tests swap it to make a thread start fail
         self.send_wait = 5.0                  # seconds threads/send waits for the run to exist; tests shorten it
         self.stream_options: dict[str, Any] = {}      # tests shorten the poll/heartbeat/lifetime
+        # Board proposals as ask cards. ``desk.routes`` (the IntelligenceRoutes) is set by the API glue; until then,
+        # or without a project-intelligence scope for the account, no card is ever shown.
+        self.desk = ProposalDesk(monotonic=monotonic)
+        push_cfg = config.get("push") or {"enabled": False}
+        sender = push_sender or ExpoSender(_read_secret_file(push_cfg.get("expo_access_token_file")))
+        self.push = PushNotifier(PushRegistry(push_persistence), sender, self._push_target,
+                                 enabled=bool(push_cfg.get("enabled")), quiet_hours=push_cfg.get("quiet_hours"))
+        self.push.start()
+        self._first_bots: dict[str, tuple[float, str]] = {}
         self._procs: dict[str, Callable[[_Ctx, dict[str, Any]], Any]] = {
             "me": self._me, "spaces/list": self._spaces_list, "bots/list": self._bots_list, "bots/get": self._bots_get,
             "bots/create": self._bots_create, "threads/head": self._threads_head, "threads/get": self._threads_get,
@@ -653,7 +701,7 @@ class RakazoBridge:
             "aiConsent/revoke": self._consent, "spaces/create": self._spaces_create, "spaces/rename": self._spaces_rename,
             "spaces/remove": self._spaces_remove, "spaceSettings/overrides": self._space_overrides,
             "spaceSettings/setOverride": self._space_set_override, "notifications/registerPush": self._register_push,
-            "notifications/unregisterPush": self._ok, "analytics/screen": self._ok,
+            "notifications/unregisterPush": self._unregister_push, "analytics/screen": self._ok,
         }
         self.auto_join_rooms = tuple(config.get("auto_join_rooms", ()))
         self.rooms = rooms.Rooms(self, BridgeError)
@@ -709,6 +757,8 @@ class RakazoBridge:
 
     def close(self) -> None:
         self._closed.set()
+        self.desk.close()
+        self.push.close()
 
     def run_due_routines(self) -> int:
         """Fire every account's due routines (default space and the account's own spaces); returns how many started."""
@@ -743,7 +793,19 @@ class RakazoBridge:
         return str(addr)
 
     def handle(self, method: str, path: str, headers: dict[str, str], body: bytes, peer: str) -> BridgeResponse | None:
-        """``headers`` has lower-case names; ``peer`` is the TCP peer address. Never raises."""
+        """``headers`` has lower-case names; ``peer`` is the TCP peer address. Never raises. Slow calls are logged by
+        procedure name and duration only (a stream's duration is just its setup), so a slow screen can be found."""
+        started = time.monotonic()
+        out = self._handle(method, path, headers, body, peer)
+        if out is not None:
+            ms = (time.monotonic() - started) * 1000
+            if ms >= SLOW_CALL_MS:
+                name = re.sub(r"[^A-Za-z0-9/_-]", "", path.split("?", 1)[0].split("/", 2)[-1])[:60]
+                (log.warning if ms >= VERY_SLOW_CALL_MS else log.info)(
+                    "rakazo bridge: %s took %.0f ms (status %s)", name, ms, getattr(out, "status", "?"))
+        return out
+
+    def _handle(self, method: str, path: str, headers: dict[str, str], body: bytes, peer: str) -> BridgeResponse | None:
         path = path.split("?", 1)[0]
         if not self.handles(path):
             return None
@@ -856,7 +918,8 @@ class RakazoBridge:
         if who is None or not _COLLAB_USER.match(who["user"]):
             return None
         account_id = cognito.CognitoSignIn.account_id(who["email"])
-        account = Account(account_id, who["email"], f"rakazo:{account_id}", "operator", self._dummy, 0.0, who["user"])
+        account = Account(account_id, who["email"], f"rakazo:{account_id}", self.cognito.cfg.get("role", "family"), self._dummy,
+                          0.0, who["user"])
         with self._accounts_lock:
             self._by_id[account_id] = account
             self._by_principal[account.principal_id] = account
@@ -969,12 +1032,28 @@ class RakazoBridge:
                      and actions[a.action_id].run_id in run_ids]
         return messages, runs, approvals
 
-    def _journal(self, ctx: _Ctx, assistant, thread):
+    def _journal(self, ctx: _Ctx, assistant, thread, fresh: bool = False, bypass: bool = False):
+        """Bring the thread's journal up to date. Board proposals are re-read at most every ``desk.poll_seconds`` unless
+        ``fresh`` (threads/get, head, messages, and right after an answer)."""
         messages, runs, approvals = self._gather(ctx, assistant, thread)
         with self.journals.lock:
             journal = self.journals.get(thread.thread_id, assistant.assistant_id, ctx.space)
             journal.sync(messages, runs, approvals)
+            if ctx.account.role == "operator" and self._first_bot(ctx) == assistant.assistant_id:   # one card per proposal: the first bot's thread only
+                self.desk.refresh(ctx.tenant, ctx.user, journal, force=fresh, bypass=bypass)
             return journal, runs
+
+    def _first_bot(self, ctx: _Ctx) -> str | None:
+        """The account's oldest bot (bots are never deleted here, so the answer is cached for a few seconds)."""
+        now = self._monotonic()
+        hit = self._first_bots.get(ctx.user)
+        if hit is not None and now - hit[0] < 5.0:
+            return hit[1]
+        bots = self.svc.list_assistants(tenant_id=ctx.tenant, user_id=ctx.user)
+        first = min(bots, key=lambda a: (a.created_at, a.assistant_id)).assistant_id if bots else None
+        if first is not None:
+            self._first_bots[ctx.user] = (now, first)
+        return first
 
     def _bot(self, ctx: _Ctx, assistant) -> dict[str, Any]:
         thread = self._thread(ctx, assistant)
@@ -1109,25 +1188,29 @@ class RakazoBridge:
     def _threads_head(self, ctx, inp):
         assistant = self._target(ctx, inp)
         thread = self._thread(ctx, assistant)
-        journal, _ = self._journal(ctx, assistant, thread)
+        journal, _ = self._journal(ctx, assistant, thread, fresh=True)
         return {"threadId": thread.thread_id, "cursor": journal.head}
 
     def _threads_get(self, ctx, inp):
         assistant = self._target(ctx, inp)
         thread = self._thread(ctx, assistant)
-        journal, runs = self._journal(ctx, assistant, thread)
+        journal, runs = self._journal(ctx, assistant, thread, fresh=True)
         views = [ev.run_view(r, assistant.assistant_id) for r in sorted(runs, key=lambda r: r.created_at)]
-        active = [v for v in views if v["status"] in ev.ACTIVE]
+        with self.journals.lock:
+            waiting = journal.waiting_proposal_runs()
+        real_active = [v for v in views if v["status"] in ev.ACTIVE]
+        active = real_active + waiting       # proposal runs only enable their cards; `run` is always a real run
         latest = views[-1] if views else None
-        run = active[-1] if active else (latest if latest and latest["status"] == "failed" else None)
-        messages, older = journal.page()
+        run = real_active[-1] if real_active else (latest if latest and latest["status"] == "failed" else None)
+        with self.journals.lock:
+            messages, older = journal.page()
         return {"threadId": thread.thread_id, "cursor": journal.head, "messages": messages, "olderCursor": older,
                 "botId": assistant.assistant_id, "run": run, "activeRuns": active}
 
     def _threads_messages(self, ctx, inp):
         assistant = self._target(ctx, inp)
         thread = self._thread(ctx, assistant)
-        journal, _ = self._journal(ctx, assistant, thread)
+        journal, _ = self._journal(ctx, assistant, thread, fresh=True)
         before = inp.get("before")
         if before is not None and (isinstance(before, bool) or not isinstance(before, int)):
             raise BridgeError(400, "BAD_REQUEST", "before must be an integer.")
@@ -1230,6 +1313,8 @@ class RakazoBridge:
         message_id, run_id, answer = inp.get("messageId"), inp.get("runId"), inp.get("answer")
         if inp.get("dismiss") or inp.get("fields") or inp.get("username"):
             raise BridgeError(400, "BAD_REQUEST", "Only approval answers are supported by this server.")
+        if isinstance(message_id, str) and message_id.startswith(ev.PROPOSAL_PREFIX):
+            return self._answer_proposal(ctx, assistant, message_id, run_id, answer)
         if not (isinstance(message_id, str) and message_id.startswith(ev.APPROVAL_PREFIX)):
             raise BridgeError(400, "BAD_REQUEST", "Only approval answers are supported by this server.")
         decision = {"allow": "approved", "deny": "denied"}.get(answer)
@@ -1255,6 +1340,36 @@ class RakazoBridge:
             except AssistantError as exc:        # the approval stands; the card shows the action did not run
                 log.info("rakazo bridge: approved action not executed: %s", redact_secrets(str(exc)))
         return {"ok": True}
+
+    def _answer_proposal(self, ctx, assistant, message_id: str, run_id: Any, answer: Any):
+        """A board proposal card, decided through the dashboard's own path (``decide_proposal``)."""
+        from .project_intelligence_api import ApprovalRefused
+        decision = {"allow": "approve", "deny": "reject"}.get(answer)
+        if decision is None:
+            raise BridgeError(400, "BAD_REQUEST", "Answer allow or deny.")
+        thread = self._thread(ctx, assistant)
+        if ctx.account.role != "operator" or self._first_bot(ctx) != assistant.assistant_id:
+            raise BridgeError(404, "NOT_FOUND", "Not found.")      # a family account never sees or decides board proposals
+        self._journal(ctx, assistant, thread, fresh=True)
+        try:
+            with self.journals.lock:
+                journal = self.journals.get(thread.thread_id, assistant.assistant_id, ctx.space)
+            result = self.desk.answer(ctx.tenant, ctx.user, journal, message_id, run_id, decision,
+                                      on_done=lambda: self._journal(ctx, assistant, thread, fresh=True, bypass=True))
+        except Busy as exc:
+            raise BridgeError(429, "TOO_MANY_REQUESTS", str(exc), {"Retry-After": "5"}) from None
+        except pi.NotFound:
+            raise BridgeError(404, "NOT_FOUND", "Not found.") from None
+        except ApprovalRefused as exc:
+            raise BridgeError(403, "FORBIDDEN", str(exc)) from None
+        except pi.Conflict as exc:
+            raise BridgeError(409, "CONFLICT", redact_secrets(str(exc)) or "The request cannot be decided.") from None
+        except pi.IntelligenceError as exc:
+            raise BridgeError(400, "BAD_REQUEST", redact_secrets(str(exc)) or "The request was refused.") from None
+        except pi.StoreUnavailable:
+            raise BridgeError(503, "SERVICE_UNAVAILABLE", "The decision could not be recorded. Try again.") from None
+        self._journal(ctx, assistant, thread, fresh=True, bypass=True)   # the card turns answered, the outcome is posted
+        return result
 
     def _threads_stop(self, ctx, inp):
         assistant = self._target(ctx, inp)
@@ -1308,7 +1423,41 @@ class RakazoBridge:
         token = inp.get("token")
         if not isinstance(token, str) or not 8 <= len(token) <= 512 or re.search(r"\s", token):
             raise BridgeError(400, "BAD_REQUEST", "That push token is not valid.")
-        return {"ok": True}           # accepted and dropped: this server sends no push notifications
+        if self.push.enabled and _EXPO_TOKEN.fullmatch(token):
+            self.push.registry.add(ctx.account.account_id, token, self.tokens.digest(ctx.token))
+        return {"ok": True}           # without push enabled the token is accepted and dropped
+
+    def _unregister_push(self, ctx, inp):
+        self.push.registry.remove_session(ctx.account.account_id, self.tokens.digest(ctx.token))
+        return {"ok": True}
+
+    def _push_target(self, account_id: str) -> dict[str, str] | None:
+        """Where a tap should open: the account's first bot and its one thread."""
+        account = self._by_id.get(account_id)
+        if account is None:
+            return None
+        ctx = _Ctx(account, self.svc.tenant_for(account.principal_id), account.principal_id, "", False)
+        bot_id = self._first_bot(ctx)
+        if bot_id is None:
+            return None
+        return {"botId": bot_id, "spaceId": ev.SPACE_ID}
+
+    def notify_proposal(self, proposal) -> None:
+        """A new board proposal: push it to each operator phone that may see it. Never raises (it runs on the request that
+        filed the proposal)."""
+        if not self.push.enabled:
+            return
+        try:
+            from .rakazo_proposals import proposal_title
+            for account in self.accounts:
+                if account.role != "operator":
+                    continue
+                access = self.desk.access(self.svc.tenant_for(account.principal_id), account.principal_id)
+                if access is None or access[0].org_id != proposal.org_id or not self.desk._visible(access[0], proposal):
+                    continue
+                self.push.notify(account.account_id, f"proposal:{proposal.id}", "Approval needed", proposal_title(proposal))
+        except Exception:  # noqa: BLE001
+            log.warning("rakazo push: a proposal notification could not be queued")
 
     def _threads_subscribe(self, ctx, inp):
         cursor = inp.get("cursor")

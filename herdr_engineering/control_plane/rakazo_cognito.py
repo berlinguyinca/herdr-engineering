@@ -5,7 +5,8 @@ email is not one of the local accounts, the password is checked by Cognito (``In
 which needs no AWS credentials), and the returned access token must verify against the pool's JWKS (signature, issuer,
 expiry, app-client allowlist) AND carry the configured ``required_group``. The ID token supplies the verified email.
 
-Nothing here widens who may sign in beyond that one group, there is no default group, and with ``group_check`` on (the
+Pool members get the chat-only ``family`` role unless ``role: operator`` is configured. Nothing here widens who may sign in
+beyond that one group, there is no default group, and with ``group_check`` on (the
 default) membership is re-read from Cognito while the session lives, so removing someone from the group ends their
 session within about a minute. The person acts as the collaboration user named by their Cognito username, which is the
 same identity HCN gives them, so rooms and agents are exactly the ones they already have there.
@@ -27,7 +28,7 @@ log = logging.getLogger("herdr.rakazo.cognito")
 _POOL = re.compile(r"^([a-z]{2}-[a-z]+-\d)_[A-Za-z0-9]+$")
 _CLIENT = re.compile(r"^[A-Za-z0-9]{10,64}$")
 _GROUP = re.compile(r"^[A-Za-z0-9_.+=,@-]{1,128}$")
-KEYS = frozenset({"pool_id", "client_ids", "required_group", "group_check"})
+KEYS = frozenset({"pool_id", "client_ids", "required_group", "group_check", "role"})
 
 
 def cognito_config(raw: Any) -> dict[str, Any] | None:
@@ -48,7 +49,10 @@ def cognito_config(raw: Any) -> dict[str, Any] | None:
     check = raw.get("group_check", True)
     if not isinstance(check, bool):
         raise ValueError(f"{where}.group_check must be true or false")
-    return {"pool_id": pool, "client_ids": tuple(clients), "required_group": group, "group_check": check}
+    role = raw.get("role", "family")
+    if role not in ("family", "operator"):
+        raise ValueError(f"{where}.role must be family (chat only, the default) or operator")
+    return {"pool_id": pool, "client_ids": tuple(clients), "required_group": group, "group_check": check, "role": role}
 
 
 class CognitoUnavailable(Exception):

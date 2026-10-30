@@ -73,7 +73,7 @@ def report_postgres():
                 try:
                     for filename in ("0001_control_plane.sql", "0003_artifact_registry.sql",
                                      "0005_artifact_binding_context.sql", "0006_artifact_acl.sql",
-                                     "0021_artifact_reports.sql"):
+                                     "0021_artifact_reports.sql", "0031_artifact_registry_extensions.sql"):
                         await connection.execute((ROOT / "deploy/control-plane/migrations" / filename).read_text())
                 finally:
                     await connection.close()

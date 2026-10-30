@@ -15,6 +15,7 @@ from datetime import datetime
 from urllib.parse import urlsplit
 from uuid import uuid4
 
+from . import review_refs
 from .redact import redact_text
 
 ENTITY = "plannotator_review"
@@ -131,10 +132,16 @@ class ReviewService:
         }
         for key in ("repository", "project_id", "revision", "mission_id", "session_id", "candidate_id", "host_id"):
             record[key] = _text(payload.get(key), key)
+        # Optional and never guessed: absent means no pull request is named.
+        record["pull_request_number"] = review_refs.pull_request_number(payload.get("pull_request_number"))
+        if record["pull_request_number"] is not None:
+            if not record["repository"]:
+                raise ValueError("pull_request_number needs the repository it belongs to")
+            review_refs.repository(payload.get("repository"))   # a number is only kept with a repository the PR trail can read
         with self.repo._event_lock:
             existing = _snapshot(self.repo, rid)
             if existing:
-                fields = ("kind", "instance_id", "plan_digest", "repository", "revision", "project_id", "mission_id", "session_id")
+                fields = ("kind", "instance_id", "plan_digest", "repository", "revision", "project_id", "mission_id", "session_id", "pull_request_number")
                 if any(existing.get(k) != record.get(k) for k in fields):
                     raise ValueError("review_id already belongs to another launch or revision")
                 return self.get(rid)

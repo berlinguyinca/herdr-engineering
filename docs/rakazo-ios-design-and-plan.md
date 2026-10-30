@@ -168,7 +168,7 @@ web restart asks them to sign in again.
 Two things this does NOT do, because they change the shared pool: it does not create an app client or a group. The BinView web
 client has no `USER_PASSWORD_AUTH` flow listed (its flows are legacy defaults), so a dedicated app client with
 `ALLOW_USER_PASSWORD_AUTH`, and a group such as `rakazo-users`, should be created in the pool by you before enabling this.
-Every member of `required_group` gets the `operator` role (the only role implemented), so keep that group small.
+Members get the chat-only `family` role by default (`cognito.role: operator` is an explicit opt-in), so keep the group small either way.
 
 ### Update 10
 

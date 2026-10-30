@@ -61,7 +61,8 @@ _AGENT_POST = re.compile(r"^/api/v1/(?:llm/keys|reviews|llm/keys/[^/]+/revoke"
 # narrow role gate. This does not grant agents publication or generic mutation.
 _REPORT_AGENT_POST = re.compile(
     r"^/api/v1/(?:artifact-reports(?:/[^/]+/jobs)?|"
-    r"artifacts/[^/]+/(?:blobs|versions(?:/[^/]+/(?:feedback|checks))?))$")
+    r"artifacts/[^/]+/(?:blobs|links|versions(?:/[^/]+/(?:feedback|checks))?|"
+    r"uploads(?:/[^/]+/(?:parts/[0-9]+|complete|abort))?))$")
 # T12: the one POST an ingest key may make besides /api/v1/ingest: acknowledging a steering request addressed to it.
 _STEER_ACK = re.compile(r"^/api/v1/steering/[^/]+/ack$")
 # T16 gap C: the second: ask for a re-review of a PR whose head has no quorum (ingest-role key; scoped in the handler).
@@ -295,12 +296,13 @@ class ControlPlaneServer:
                  operator_port=None, operator_user=None, operator_email=None,
                  operator_hosts=(), collab_operator_url=None, collab_dashboard_hosts=(),
                  summary_config=None, summary_client=None, summary_report_config=None, usage_retention=None, lineage_key_scopes=None,
-                 review_quorum=None, system_graph: bool = False, attention=None, ci_fix=None, missions=None, github_pg_dsn=None, ci_log_tests=None, usage_prices=None,
+                 review_quorum=None, system_graph: bool = False, evolution=None, learning=None, attention=None, ci_fix=None, missions=None, github_pg_dsn=None, ci_log_tests=None, usage_prices=None,
                  architecture_enabled=None, architecture_explain=None, architecture_options=None,
                  request_workers=128, request_queue=256, single_operator=False,
                  assistant_service=None, assistant_config=None, fabric_resolver=None, fabric_services=None, fabric_names=None,
                  scheduler_admission=False, scheduler_limits=None, skill_registry=None,
-                 unified_workspace_config=None, rakazo_bridge=None, rakazo_bridge_dsn=None):
+                 unified_workspace_config=None, rakazo_bridge=None, rakazo_bridge_dsn=None,
+                 share_store=None, shares_root=None, share_settings=None):
         """
         Auth (Spec §104): either a single `api_key` (all-access) or a mapping
         `api_keys={key: role}` with roles "viewer" (read-only) / "operator"
@@ -323,6 +325,17 @@ class ControlPlaneServer:
         self.usage_retention = usage_retention_config(usage_retention)
         # control_plane.usage.prices (validated by the caller; empty = no estimate).
         self.usage_prices = list(usage_prices or [])
+        # control_plane.evolution (validated; None = defaults): how old a non-terminal status may be and still count as an outcome.
+        from .agent_evolution import evolution_config
+        self.evolution = evolution_config(evolution)
+        # control_plane.learning (validated; None = defaults): durable pull-request trail records and their export.
+        from .learning_trails import TrailRecords, learning_config
+        self.learning = learning_config(learning)
+        self.learning_trails = TrailRecords(
+            repo, self.learning,
+            trail_for=lambda host, owner, name, number: _pull_trail(self, repo, owner, name, number, host, gated=True),
+            evolution_for=lambda session_id: _evolution_body(self, repo, session_id),
+            ci_configured=lambda: self.ci_monitor.configured())
         # control_plane.ci_fix (validated; None = defaults, which are disabled: the routes then 404).
         from .ci_fix import CIFixService, ci_fix_config
         self.ci_fix_config = ci_fix_config(ci_fix)
@@ -422,6 +435,10 @@ class ControlPlaneServer:
         self.artifact_job_manager = artifact_job_manager
         self.artifact_review_manager = artifact_review_manager
         self.artifact_acl = artifact_acl
+        # Artifact share links (control_plane.share): all three or the share routes answer 503 "sharing is not enabled".
+        self.share_store = share_store
+        self.shares_root = shares_root
+        self.share_settings = share_settings
         self.attachment_dedupe: dict = {}      # redelivery guard for the email-attachment route; lost on restart
         from .artifact_scope import install_gate
         self.artifact_graph_gate = install_gate(repo.graph, artifact_acl)   # None without an ACL: nodes stay private
@@ -472,11 +489,15 @@ class ControlPlaneServer:
             RakazoBridge,
             rakazo_bridge_config,
         )
+        from .rakazo_push import PostgresPushPersistence
         _bridge_cfg = rakazo_bridge_config(rakazo_bridge)
+        if _bridge_cfg["enabled"]:       # the assistant user ids the bridge accounts act as (hashes, no email), for ci_watch.users
+            log.info("rakazo bridge assistant users: %s", ", ".join(a.principal_id for a in _bridge_cfg["accounts"]))
         self.rakazo = (RakazoBridge(_bridge_cfg, self.assistant, version=__version__,
                                     persistence=PostgresTokenPersistence(rakazo_bridge_dsn) if rakazo_bridge_dsn else None,
                                     space_persistence=PostgresSpacePersistence(rakazo_bridge_dsn) if rakazo_bridge_dsn else None,
                                     prefs_persistence=PostgresPrefsPersistence(rakazo_bridge_dsn) if rakazo_bridge_dsn else None,
+                                    push_persistence=PostgresPushPersistence(rakazo_bridge_dsn) if rakazo_bridge_dsn else None,
                                     collab=collab, artifacts_fn=lambda: RegistryBackend(self))
                        if _bridge_cfg["enabled"] else None)
         from .ingest import IngestService
@@ -629,6 +650,10 @@ class ControlPlaneServer:
         from .intel_github import SharedCredentialPrLister
         self._pr_lister = SharedCredentialPrLister()
         self.intelligence.single_operator_fn = lambda: self.single_operator
+        if self.rakazo is not None:
+            self.rakazo.desk.routes = self.intelligence      # board proposals as phone cards (scope: assistant_viewers)
+            self.intelligence.board.on_new = self.rakazo.notify_proposal      # and as push notifications
+            self.intelligence.push_status_fn = lambda: dict(self.rakazo.push.counters, enabled=self.rakazo.push.enabled)
         self.intelligence.github_app_fn = lambda: getattr(self, "gate_app", None) or self._pr_lister
         self.intelligence.poll_status_fn = lambda: {"client": "review_gate" if getattr(self, "gate_app", None) else "shared",
                                                     "last_error": self._pr_lister.last_error}
@@ -636,6 +661,10 @@ class ControlPlaneServer:
         self.intelligence.ci_rerun_fn = self._intelligence_ci_rerun
         if getattr(self, "assistant", None) is not None:
             self.assistant.intelligence_read = self.intelligence.assistant_read
+            _google = (self.assistant.config or {}).get("google") or {}
+            if _google.get("enabled"):      # read-only Gmail + Calendar for the listed users (personal_assistant.google)
+                from .google_workspace import GoogleWorkspace
+                self.assistant.google_read = GoogleWorkspace(_google).run
             from .assistant_lineage import LineageReader, principal_resolver
             self.assistant.lineage_read = LineageReader(repo.graph, principal_resolver(self._keys)).read
             from .assistant_adapters import comment_hook, draft_writer_hook, rereview_hook
@@ -646,6 +675,19 @@ class ControlPlaneServer:
             self.assistant.artifact_writer = draft_writer_hook(self)
             self.assistant.ci_board_request = self.intelligence.assistant_ci_repair
             self.assistant.ci_rerun_request = self.intelligence.assistant_ci_rerun
+            self.assistant.ci_repo_scope = self.intelligence.assistant_repo_in_scope
+            self.assistant.ci_snapshot = lambda: self.ci_monitor.snapshot(start=False)   # cache read, no provider call
+            from .assistant import ci_watch_config
+            from .ci_watch import CIWatchRunner
+            _cw = self.assistant.config.get("ci_watch") or ci_watch_config(None)
+            self.ci_watch = CIWatchRunner(self.assistant, self.intelligence.assistant_scope_state, _cw)
+            if _cw["enabled"]:
+                self.intelligence.ci_watch_status_fn = self.ci_watch.status
+                for _u in _cw["users"]:
+                    if _u["tenant_id"] != self.assistant.tenant_for(_u["user_id"]):
+                        log.warning("ci_watch: user %s is in tenant %s per personal_assistant.tenancy, not %s; "
+                                    "the watch will find no assistant for it", _u["user_id"],
+                                    self.assistant.tenant_for(_u["user_id"]), _u["tenant_id"])
             from .assistant_dispatch import DelegationConsumer
             self.delegation_consumer = DelegationConsumer(
                 self.assistant, self.handoffs,
@@ -1470,6 +1512,8 @@ class ControlPlaneServer:
             self._summary_scanner.start()
         self._start_background_thread(self._sweep_loop)
         self._start_background_thread(self._deployments_loop)
+        if getattr(self, "ci_watch", None) is not None and self.ci_watch.config["enabled"]:
+            self._start_background_thread(self.ci_watch.run)
         if self.collab is not None and self.collab.lineage_sink is not None:
             self._start_background_thread(self._link_flush_loop)
         self._ready.set()
@@ -1499,6 +1543,10 @@ class ControlPlaneServer:
             sweep_token_usage(self.repo, raw_retention_days=self.usage_retention["raw_retention_days"])
         except Exception as exc:
             log.warning("token_usage retention sweep failed: %s", type(exc).__name__)
+        try:
+            self.learning_trails.sweep()
+        except Exception as exc:
+            log.warning("learning trail sweep failed: %s", type(exc).__name__)
 
     def _link_flush_loop(self, interval=30):
         """T14: tell the lineage graph what it missed about cross-workspace links (a retraction the graph was down
@@ -1539,6 +1587,7 @@ class ControlPlaneServer:
         return True
 
     def shutdown(self):
+        self.learning_trails.close()            # no new sweep starts; a running background one is waited for briefly
         if self.rakazo is not None:
             self.rakazo.close()                 # ends open event streams
         self._maintenance_stop.set()
@@ -1551,6 +1600,8 @@ class ControlPlaneServer:
         if self.gate_service is not None:
             self.gate_service.stop()
         self._deployments_stop.set()
+        if getattr(self, "ci_watch", None) is not None:
+            self.ci_watch.stop()
         if self._summary_scanner and self._summary_scanner.ident is not None:
             self._summary_scanner.join(timeout=2)
         if self.agent_summaries:
@@ -2701,6 +2752,12 @@ def _make_handler(server, public=False, operator=False):
                 from .artifact_report_api import route_report
                 if route_report(self, server, parts, resource):
                     return None
+                from .artifact_share_api import route_share
+                if route_share(self, server, parts, resource):
+                    return None
+                from .artifact_registry_api import route_registry
+                if route_registry(self, server, parts, resource):
+                    return None
                 from .skill_routes import route_skills
                 if route_skills(self, server, parts, resource):
                     return None
@@ -3101,6 +3158,18 @@ def _make_handler(server, public=False, operator=False):
                     return self._json({"error": "agent not found"}, 404)
                 view = server.ci_monitor.snapshot(start=False) if server.ci_monitor is not None else {}
                 return self._json(session_commits(session, r.list_sessions(), view, pull_requests=r.list_pull_requests()))
+            if resource == "learning" and len(parts) == 5 and parts[4] in ("trails", "trails.jsonl"):
+                return self._learning_trails(server, parts[4].endswith(".jsonl"))
+            if resource == "pull-requests" and len(parts) == 8 and parts[7] == "trail":
+                import re as _re
+                host = _q(self.path, "host") or None
+                if not (_re.fullmatch(r"[A-Za-z0-9_.-]{1,100}", parts[4]) and _re.fullmatch(r"[A-Za-z0-9_.-]{1,100}", parts[5])
+                        and _re.fullmatch(r"[1-9][0-9]{0,9}", parts[6]) and (host is None or _re.fullmatch(r"[A-Za-z0-9.-]{1,253}", host))):
+                    return self._json({"error": "invalid pull request"}, 400)
+                trail = self._pull_trail(server, r, parts[4], parts[5], int(parts[6]), host)
+                return self._json(trail) if trail is not None else self._json({"error": "pull request not found"}, 404)
+            if resource == "sessions" and len(parts) == 6 and parts[5] == "evolution":
+                return self._agent_evolution(server, r, parts[4])
             if resource == "sessions" and len(parts) == 6 and parts[5] == "summary":
                 if r.get_session(parts[4]) is None:
                     return self._json({"error": "agent not found"}, 404)
@@ -3527,8 +3596,12 @@ def _make_handler(server, public=False, operator=False):
                 committed = self._artifact_call("commit_version", parts[4], **body)
                 from .artifact_lineage import emit_version_lineage
                 from .artifact_scope import visibility_fields
-                emit_version_lineage(server.ingest, committed, self._principal(),
-                                     scope=visibility_fields(gated=server.artifact_graph_gate is not None))
+                linked = emit_version_lineage(server.ingest, committed, self._principal(),
+                                              scope=visibility_fields(gated=server.artifact_graph_gate is not None))
+                try:   # the ledger tells reconcile whether the graph edges still need to be (re)emitted
+                    self._artifact_call("mark_linked", committed["version_id"], error=(linked or {}).get("error"))
+                except Exception:   # noqa: BLE001 - the version is committed; reconcile repairs the ledger
+                    pass
                 return self._json(committed, 201)
             if resource == "artifact-jobs" and server.artifact_job_manager is not None:
                 if len(parts) == 4:
@@ -4444,6 +4517,58 @@ def _make_handler(server, public=False, operator=False):
                 return self._json({"prefs": store.get_prefs(), "defaults": _defaults()})
             return self._json({"error": "not found"}, 404)
 
+        def _learning_trails(self, server, jsonl):
+            """The durable pull-request trail records, a page at a time: JSON, or one JSON object per line. The cursor of the next page is
+            the ``cursor`` of the last record (``X-Next-Cursor`` on the line form)."""
+            import re as _re
+            trails = server.learning_trails
+            if not trails.enabled:
+                return self._json({"error": "learning trails are disabled"}, 404)
+            # The export is fleet-wide (the control plane has no per-project key scope): it needs control_plane.learning.require_role.
+            if server.learning["require_role"] == "operator" and self._role() != "operator":
+                return self._json({"error": "operator role required"}, 403)
+            query = parse_qs(urlsplit(self.path).query, keep_blank_values=True)     # a blank value is a bad value, not an absent one
+            raw_limit = query.get("limit", [None])[0]
+            if raw_limit is not None and not _re.fullmatch(r"[0-9]{1,6}", raw_limit):
+                return self._json({"error": "limit must be a whole number"}, 400)
+            try:
+                page = trails.export(since=query.get("since", [None])[0], cursor=query.get("cursor", [None])[0],
+                                     ended_after=query.get("ended_after", [None])[0],
+                                     limit=int(raw_limit) if raw_limit is not None else None)
+            except ValueError as exc:
+                return self._json({"error": str(exc)}, 400)
+            trails.trigger_sweep()         # bounded and in the background: a read never waits for a trail build
+            # Records were redacted once, when written; neither form is redacted again, so both carry the same content.
+            if not jsonl:
+                return self._json(page, payload=json.dumps(page).encode())
+            payload = "".join(json.dumps(rec, separators=(",", ":")) + "\n" for rec in page["records"]).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/x-ndjson")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(payload)))
+            self.send_header("X-Has-More", "true" if page["has_more"] else "false")
+            if page["truncated_before"]:
+                self.send_header("X-Truncated-Before", page["truncated_before"])
+            self.send_header("X-Cursor-Truncated", "true" if page["cursor_truncated"] else "false")
+            self.send_header("X-Unbuildable-Count", str(page["unbuildable"]["count"]))
+            self.send_header("X-Skipped-By-Horizon", str(page["skipped_by_horizon"]))
+            if page["next_cursor"]:
+                self.send_header("X-Next-Cursor", page["next_cursor"])
+            if self.close_connection:
+                self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(payload)
+            return None
+
+        def _pull_trail(self, server, r, owner, name, number, host, gated=False):
+            return _pull_trail(server, r, owner, name, number, host, gated=gated)
+
+        def _agent_evolution(self, server, r, session_id):
+            session = r.get_session(session_id)
+            if session is None:
+                return self._json({"error": "agent not found"}, 404)
+            return self._json(_evolution_body(server, r, session_id, session))
+
         def _inspector_get(self, parts):
             store = server.repo.inspector
             sid = parts[4]
@@ -5098,6 +5223,79 @@ def _ci_observability_query(path, route):
     if 'provider_url' in filters:
         filters['provider_url'] = normalize_provider_url(filters['provider_url'])
     return filters
+
+
+def _read_source(read):
+    try:
+        return read()
+    except Exception:    # a source that cannot be read is reported as unavailable, never as empty
+        return None
+
+
+def _pull_trail(server, r, owner, name, number, host, gated=False):
+    """The cached PR trail for ``owner/name#number`` (or ``None`` when unknown); shared by the trail, agent evolution and learning endpoints.
+    ``gated`` bounds uncached builds: at most two run at once and a caller waits two seconds for a slot, then reports the trail unreadable."""
+    from .pr_trail import TTLCache, build as build_pr_trail
+    cache = server.__dict__.setdefault("_pr_trail_cache", TTLCache(ttl=5.0, size=64))
+    cache_key = (owner.lower(), name.lower(), number, (host or "").lower())
+    trail = cache.get(cache_key)
+    if trail is None:
+        gate = server.__dict__.setdefault("_trail_gate", threading.BoundedSemaphore(2)) if gated else None
+        if gate is not None and not gate.acquire(timeout=2.0):
+            return None
+        try:
+            trail = _build_pull_trail(server, r, owner, name, number, host, build_pr_trail)
+        finally:
+            if gate is not None:
+                gate.release()
+        if trail is not None:
+            cache.put(cache_key, trail)
+    return trail
+
+
+def _build_pull_trail(server, r, owner, name, number, host, build_pr_trail):
+    from .reviews import ReviewService
+    read = _read_source
+    view = server.ci_monitor.snapshot(start=False) if server.ci_monitor is not None else {}
+    handoff_rows = read(lambda: server.handoffs.list(limit=1000))
+    return build_pr_trail(
+        owner, name, number, pull_requests=r.list_pull_requests(), sessions=r.list_sessions(), view=view,
+        handoffs=handoff_rows, handoffs_truncated=handoff_rows is not None and len(handoff_rows) >= 1000, host=host,
+        reviews=read(r.list_reviews), plan_reviews=read(ReviewService(r).list_reviews), prices=bool(server.usage_prices),
+        spend=lambda sid: read(lambda: r.llm_spend("30d", server.usage_prices, session=sid)))
+
+
+def _evolution_body(server, r, session_id, session=None):
+    """The cached evolution body of one agent, or ``None`` when the agent is unknown."""
+    from .agent_evolution import TOOL_LIMIT, TTLCache, build as build_evolution
+    from .reviews import ReviewService
+    session = session or r.get_session(session_id)
+    if session is None:
+        return None
+    cache = server.__dict__.setdefault("_agent_evolution_cache", TTLCache(ttl=5.0, size=64))
+    body = cache.get(session_id)
+    if body is None:
+        read = _read_source
+        view = server.ci_monitor.snapshot(start=False) if server.ci_monitor is not None else {}
+        handoff_rows = read(lambda: server.handoffs.list(limit=1000))
+
+        def tools():
+            try:
+                return r.inspector.query(session_id, "viewer", view="tools", limit=TOOL_LIMIT)
+            except KeyError:            # the buffer holds nothing for this session; that is not proof it did nothing
+                return {"events": [], "has_more": False, "dropped": 0, "absent": True}
+
+        def trail_for(host, owner, name, number):
+            return read(lambda: _pull_trail(server, r, owner, name, number, host, gated=True))
+        body = build_evolution(
+            session, sessions=r.list_sessions(), view=view, pull_requests=r.list_pull_requests(),
+            handoffs=handoff_rows, handoffs_truncated=handoff_rows is not None and len(handoff_rows) >= 1000,
+            reviews=read(r.list_reviews), plan_reviews=read(ReviewService(r).list_reviews),
+            stream=read(lambda: r.stream("session", session_id)), tools=read(tools),
+            prices=bool(server.usage_prices), spend=lambda sid: read(lambda: r.llm_spend("30d", server.usage_prices, session=sid)),
+            trail_for=trail_for, stale_after_minutes=server.evolution["stale_after_minutes"])
+        cache.put(session_id, body)
+    return body
 
 
 def _q(path, key):
