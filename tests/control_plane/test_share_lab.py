@@ -281,6 +281,7 @@ def test_session_flow_serves_files_under_the_session_base(lab, capfd):
     # public_url is https://share.example/: the sandbox CSP also names this share's prefix, which covers k/<session>/f/
     assert h["content-security-policy"] == share_public.sandbox_csp("https://share.example", TOKEN)
     assert f"https://share.example/s/{TOKEN}/ " in h["content-security-policy"]
+    assert OTHER_TOKEN not in h["content-security-policy"] and "/k/" not in h["content-security-policy"]
     assert h["access-control-allow-origin"] == "*" and h["access-control-expose-headers"] == EXPOSE
     status, h, body = lab.request("GET", got["base"] + "data/table.parquet", {"Range": "bytes=-10"})
     assert status == 206 and len(body) == 10

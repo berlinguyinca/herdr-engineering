@@ -20,5 +20,17 @@ npx esbuild hyparquet-entry.js --bundle --format=esm --platform=browser --minify
   --outfile="$fixtures/html-parquet-hyparquet/vendor/hyparquet.mjs"
 npx esbuild duckdb-entry.js --bundle --format=esm --platform=browser --minify --legal-comments=eof \
   --outfile="$fixtures/html-parquet-duckdb/vendor/duckdb.mjs"
+# Licences of everything inside the two bundles (esbuild --metafile: hyparquet; duckdb-wasm, apache-arrow, flatbuffers,
+# tslib). duckdb-wasm's npm package ships no LICENSE file: take it from the v1.33.0 tag's commit (pinned).
 cp node_modules/hyparquet/LICENSE "$fixtures/html-parquet-hyparquet/vendor/LICENSE.hyparquet"
-cp node_modules/apache-arrow/LICENSE.txt "$fixtures/html-parquet-duckdb/vendor/LICENSE.apache-arrow" 2>/dev/null || true
+duckdb_vendor="$fixtures/html-parquet-duckdb/vendor"
+curl -sSfL -o "$duckdb_vendor/LICENSE.duckdb-wasm" \
+  "https://raw.githubusercontent.com/duckdb/duckdb-wasm/fa1d47b38ed0821cecab0bdc331c48abd0f2cc65/LICENSE"
+cp node_modules/apache-arrow/LICENSE.txt "$duckdb_vendor/LICENSE.apache-arrow"
+cp node_modules/flatbuffers/LICENSE "$duckdb_vendor/LICENSE.flatbuffers"
+cp node_modules/tslib/LICENSE.txt "$duckdb_vendor/LICENSE.tslib"
+# Record what was built (paste into ../README.md, "Vendored files").
+for pkg in hyparquet @duckdb/duckdb-wasm apache-arrow flatbuffers tslib; do
+  node -e "const p=require('./node_modules/$pkg/package.json');console.log(p.name+'@'+p.version+' '+p.license)"
+done
+sha256sum "$fixtures/html-parquet-hyparquet/vendor/hyparquet.mjs" "$duckdb_vendor/duckdb.mjs"

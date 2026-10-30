@@ -31,7 +31,11 @@ const CACHE = path.join(REPO, 'scripts', '.share-browser-cache');
 const DUCKDB_TARBALL = {
   url: 'https://registry.npmjs.org/@duckdb/duckdb-wasm/-/duckdb-wasm-1.33.1-dev57.0.tgz',
   integrity: 'sha512-ndn5l2EHq1PEMvCg8G6lRV0vjhSUcbqdM/niNBTTqH4/PyyUUVKbge0uUyCnj27b9SF/CiqBwDsgKLTqBvaxdw==',
-  files: ['duckdb-browser-eh.worker.js', 'duckdb-eh.wasm'],
+  // sha256 of each file taken from the tarball: checked after extraction AND every time the cache is reused.
+  files: {
+    'duckdb-browser-eh.worker.js': 'fa889e6068c40426dea67c08cf16ce0cad7404eae94f6a2522adcabb5898eb93',
+    'duckdb-eh.wasm': '3abdec74989dcc54d2f2ea5621f611f3c45db1e7dff2f408476014d82beb2029',
+  },
 };
 const DUCKDB_PARQUET_EXTENSION = {
   url: 'https://extensions.duckdb.org/v1.5.4/wasm_eh/parquet.duckdb_extension.wasm',
@@ -45,11 +49,15 @@ async function download(url) {
   return Buffer.from(await r.arrayBuffer());
 }
 
+const sha256File = (file) => crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
+
 // The pinned duckdb-wasm files, from the cache or freshly downloaded and verified. Returns {name: absolute path}.
 async function duckdbAssets() {
   const dir = path.join(CACHE, path.basename(DUCKDB_TARBALL.url, '.tgz'));
-  const out = Object.fromEntries(DUCKDB_TARBALL.files.map((f) => [f, path.join(dir, f)]));
-  if (!DUCKDB_TARBALL.files.every((f) => fs.existsSync(out[f]))) {
+  const names = Object.keys(DUCKDB_TARBALL.files);
+  const out = Object.fromEntries(names.map((f) => [f, path.join(dir, f)]));
+  const cached = (f) => fs.existsSync(out[f]) && sha256File(out[f]) === DUCKDB_TARBALL.files[f];
+  if (!names.every(cached)) {
     const tgz = await download(DUCKDB_TARBALL.url);
     const [algo, want] = DUCKDB_TARBALL.integrity.split('-');
     const got = crypto.createHash(algo).update(tgz).digest('base64');
@@ -57,17 +65,20 @@ async function duckdbAssets() {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'duckdb-wasm-'));
     try {
       fs.writeFileSync(path.join(tmp, 'pkg.tgz'), tgz);
-      execFileSync('tar', ['-xzf', path.join(tmp, 'pkg.tgz'), '-C', tmp,
-        ...DUCKDB_TARBALL.files.map((f) => `package/dist/${f}`)]);
+      execFileSync('tar', ['-xzf', path.join(tmp, 'pkg.tgz'), '-C', tmp, ...names.map((f) => `package/dist/${f}`)]);
       fs.mkdirSync(dir, { recursive: true });
-      for (const f of DUCKDB_TARBALL.files) fs.copyFileSync(path.join(tmp, 'package', 'dist', f), out[f]);
+      for (const f of names) {
+        const src = path.join(tmp, 'package', 'dist', f);
+        const sum = sha256File(src);
+        if (sum !== DUCKDB_TARBALL.files[f]) throw new Error(`${f} sha256 mismatch: ${sum}`);
+        fs.copyFileSync(src, out[f]);
+      }
     } finally {
       fs.rmSync(tmp, { recursive: true, force: true });
     }
   }
   const ext = path.join(CACHE, 'duckdb-extensions', DUCKDB_PARQUET_EXTENSION.dest);
-  const sha = (file) => crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
-  if (!fs.existsSync(ext) || sha(ext) !== DUCKDB_PARQUET_EXTENSION.sha256) {
+  if (!fs.existsSync(ext) || sha256File(ext) !== DUCKDB_PARQUET_EXTENSION.sha256) {
     const body = await download(DUCKDB_PARQUET_EXTENSION.url);
     const got = crypto.createHash('sha256').update(body).digest('hex');
     if (got !== DUCKDB_PARQUET_EXTENSION.sha256) throw new Error(`parquet extension sha256 mismatch: ${got}`);
@@ -117,15 +128,20 @@ async function startLauncher(fixtures) {
     cwd: REPO, stdio: ['pipe', 'pipe', 'pipe'],
   });
   proc.stderr.on('data', (d) => process.stderr.write(`[share-server] ${d}`));
-  const info = await new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error('share server start timeout')), 60_000);
-    readline.createInterface({ input: proc.stdout }).once('line', (line) => {
-      clearTimeout(timer);
-      try { resolve(JSON.parse(line)); } catch (e) { reject(e); }
+  try {
+    const info = await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('share server start timeout')), 60_000);
+      readline.createInterface({ input: proc.stdout }).once('line', (line) => {
+        clearTimeout(timer);
+        try { resolve(JSON.parse(line)); } catch (e) { reject(e); }
+      });
+      proc.once('exit', (code) => { clearTimeout(timer); reject(new Error(`share server exited (${code})`)); });
     });
-    proc.once('exit', (code) => { clearTimeout(timer); reject(new Error(`share server exited (${code})`)); });
-  });
-  return { proc, info };
+    return { proc, info };
+  } catch (e) {
+    proc.kill('SIGTERM');      // the launcher removes its own temp dir on SIGTERM
+    throw e;
+  }
 }
 
 // Thrown when the environment cannot show the property at all (reported as NOT VERIFIED, never as a pass).
@@ -170,6 +186,20 @@ async function waitForStatus(page) {
   }));
 }
 
+// The fixtures' parquet file size: a GET whose served bytes are the whole file is a whole-file read whatever its
+// status (a 200, an open-ended `bytes=0-`, a `bytes=0-<size-1 or more>` or a suffix of at least the size).
+const PARQUET_SIZE = fs.statSync(path.join(FIXTURES, 'html-parquet-hyparquet', 'data', 'table.parquet')).size;
+
+function coversWholeFile(entry, size) {
+  if (entry.method !== 'GET') return false;
+  if (entry.status === 200) return true;
+  if (entry.status !== 206) return false;
+  const m = /^bytes=(\d*)-(\d*)$/.exec(entry.range || '');
+  if (!m) return true;                      // a 206 for something we cannot parse: treat it as suspicious
+  if (m[1] === '') return Number(m[2]) >= size;
+  return Number(m[1]) === 0 && (m[2] === '' || Number(m[2]) >= size - 1);
+}
+
 function parquetLog(log, since) {
   return log.filter((e) => e.at >= since && e.path.endsWith('/data/table.parquet'));
 }
@@ -185,18 +215,23 @@ async function main() {
       results.push({ name, ok: e instanceof NotVerified ? null : false, detail: String(e && e.message || e) });
     }
   };
-  const fixtures = await assembleFixtures();
-  const { proc, info } = await startLauncher(fixtures);
-  const shareUrl = (id) => `${info.origin}/s/${info.tokens[id]}/`;
-  const launchOptions = { headless: true };
-  // The default headless shell has no PDF viewer; the full Chromium build in new headless mode does.
-  if (args.browser === 'chromium') launchOptions.channel = 'chromium';
-  if (args.browser === 'firefox') launchOptions.firefoxUserPrefs = { 'pdfjs.disabled': false };
-  const browser = await playwright[args.browser].launch(launchOptions);
-  const context = await browser.newContext({ ignoreHTTPSErrors: true, acceptDownloads: true,
-    viewport: { width: 1100, height: 800 } });
+  let fixtures = null;
+  let proc = null;
+  let browser = null;
+  let context = null;
   const shot = (page, name) => page.screenshot({ path: path.join(args.out, `${name}.png`), fullPage: false });
   try {
+    fixtures = await assembleFixtures();
+    let info;
+    ({ proc, info } = await startLauncher(fixtures));
+    const shareUrl = (id) => `${info.origin}/s/${info.tokens[id]}/`;
+    const launchOptions = { headless: true };
+    // The default headless shell has no PDF viewer; the full Chromium build in new headless mode does.
+    if (args.browser === 'chromium') launchOptions.channel = 'chromium';
+    if (args.browser === 'firefox') launchOptions.firefoxUserPrefs = { 'pdfjs.disabled': false };
+    browser = await playwright[args.browser].launch(launchOptions);
+    context = await browser.newContext({ ignoreHTTPSErrors: true, acceptDownloads: true,
+      viewport: { width: 1100, height: 800 } });
     // ---------------------------------------------------------------- the two parquet bundles (public)
     for (const [id, label] of [['pub-hyparquet', 'hyparquet'], ['pub-duckdb', 'duckdb']]) {
       const page = await context.newPage();
@@ -231,15 +266,17 @@ async function main() {
       });
       await check(`${label}: range requests seen by the server (incl. suffix + preflight)`, async () => {
         const log = parquetLog(await control(info, 'GET', '/log'), since);
-        const bounded = log.filter((e) => e.method === 'GET' && e.status === 206 && /^bytes=\d+-\d*$/.test(e.range || ''));
-        const suffix = log.filter((e) => e.method === 'GET' && e.status === 206 && /^bytes=-\d+$/.test(e.range || ''));
+        const gets = log.filter((e) => e.method === 'GET');           // HEAD transfers no body: it never counts
+        const bounded = gets.filter((e) => e.status === 206 && /^bytes=\d+-\d+$/.test(e.range || '')
+          && !coversWholeFile(e, PARQUET_SIZE));
+        const suffix = gets.filter((e) => e.status === 206 && /^bytes=-\d+$/.test(e.range || ''));
         const preflight = log.filter((e) => e.method === 'OPTIONS' && e.status === 204);
-        const whole = log.filter((e) => e.method === 'GET' && e.status === 200);
+        const whole = gets.filter((e) => coversWholeFile(e, PARQUET_SIZE));
         const summary = log.map((e) => `${e.method} ${e.status} ${e.range || '-'}`).join('; ');
         assert(bounded.length > 0, `no bounded 206 range read: ${summary}`);
         assert(suffix.length > 0, `no suffix 206 range read: ${summary}`);
         assert(preflight.length > 0, `no OPTIONS preflight answered 204: ${summary}`);
-        assert(whole.length === 0, `the whole file was fetched with a 200 GET: ${summary}`);
+        assert(whole.length === 0, `the whole file was read by one GET: ${summary}`);
         assert(status && status.probe.suffix && status.probe.suffix.status === 206
           && status.probe.suffix.magic === 'PAR1', `suffix read in page: ${JSON.stringify(status && status.probe.suffix)}`);
         return summary;
@@ -331,8 +368,10 @@ async function main() {
         const session = log.filter((e) => e.method === 'POST' && e.path === '/s/<token>/session');
         assert(session.length === 1 && session[0].status === 200, `session POST: ${JSON.stringify(session)}`);
         assert(status.state === 'ok' && status.rows === 20, `page: ${status.state} ${status.text}\n${diagnostics(seen)}`);
-        const ranged = parquetLog(log, since).filter((e) => e.path.includes('/k/<session>/f/') && e.status === 206);
+        const lab = parquetLog(log, since).filter((e) => e.path.includes('/k/<session>/f/'));
+        const ranged = lab.filter((e) => e.method === 'GET' && e.status === 206 && !coversWholeFile(e, PARQUET_SIZE));
         assert(ranged.length > 0, 'no range reads under the session path');
+        assert(!lab.some((e) => coversWholeFile(e, PARQUET_SIZE)), 'the whole file was read by one GET (lab)');
         assert(status.probe.sessionStorage === 'threw:SecurityError', `sessionStorage ${status.probe.sessionStorage}`);
         return `session minted; ${ranged.length} range reads under /k/<session>/f/`;
       } finally {
@@ -376,12 +415,14 @@ async function main() {
       return 'session URL and link are the uniform 404';
     });
   } finally {
-    await context.close().catch(() => {});
-    await browser.close().catch(() => {});
-    proc.stdin.end();
-    proc.kill('SIGTERM');
-    await new Promise((resolve) => (proc.exitCode !== null ? resolve() : proc.once('exit', resolve)));
-    fs.rmSync(fixtures, { recursive: true, force: true });
+    if (context) await context.close().catch(() => {});
+    if (browser) await browser.close().catch(() => {});
+    if (proc) {
+      proc.stdin.end();
+      proc.kill('SIGTERM');
+      await new Promise((resolve) => (proc.exitCode !== null ? resolve() : proc.once('exit', resolve)));
+    }
+    if (fixtures) fs.rmSync(fixtures, { recursive: true, force: true });
   }
 
   const version = browser.version();
