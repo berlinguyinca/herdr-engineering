@@ -652,10 +652,9 @@ class ControlPlaneServer:
         self.intelligence.ci_rerun_fn = self._intelligence_ci_rerun
         if getattr(self, "assistant", None) is not None:
             self.assistant.intelligence_read = self.intelligence.assistant_read
-            _google = (self.assistant.config or {}).get("google") or {}
-            if _google.get("enabled"):      # read-only Gmail + Calendar for the listed users (personal_assistant.google)
+            if getattr(self, "apps", None) is not None:      # per-person Gmail + Calendar through the Connectors tab
                 from .google_workspace import GoogleWorkspace
-                self.assistant.google_read = GoogleWorkspace(_google).run
+                self.assistant.google_read = GoogleWorkspace(self.apps._store, self.apps).run
             from .assistant_lineage import LineageReader, principal_resolver
             self.assistant.lineage_read = LineageReader(repo.graph, principal_resolver(self._keys)).read
             from .assistant_adapters import comment_hook, draft_writer_hook, rereview_hook
@@ -5352,7 +5351,8 @@ def _read_source(read):
 def _pull_trail(server, r, owner, name, number, host, gated=False):
     """The cached PR trail for ``owner/name#number`` (or ``None`` when unknown); shared by the trail, agent evolution and learning endpoints.
     ``gated`` bounds uncached builds: at most two run at once and a caller waits two seconds for a slot, then reports the trail unreadable."""
-    from .pr_trail import TTLCache, build as build_pr_trail
+    from .pr_trail import TTLCache
+    from .pr_trail import build as build_pr_trail
     cache = server.__dict__.setdefault("_pr_trail_cache", TTLCache(ttl=5.0, size=64))
     cache_key = (owner.lower(), name.lower(), number, (host or "").lower())
     trail = cache.get(cache_key)
@@ -5384,7 +5384,8 @@ def _build_pull_trail(server, r, owner, name, number, host, build_pr_trail):
 
 def _evolution_body(server, r, session_id, session=None):
     """The cached evolution body of one agent, or ``None`` when the agent is unknown."""
-    from .agent_evolution import TOOL_LIMIT, TTLCache, build as build_evolution
+    from .agent_evolution import TOOL_LIMIT, TTLCache
+    from .agent_evolution import build as build_evolution
     from .reviews import ReviewService
     session = session or r.get_session(session_id)
     if session is None:

@@ -1841,6 +1841,13 @@ class AssistantStore:
 # ---------------------------------------------------------------------------
 
 
+_GOOGLE_MESSAGES = {
+    "not_connected": "Google is not connected for this person: ask them to connect it in the Connectors tab.",
+    "needs_attention": "Google needs this person to sign in again in the Connectors tab.",
+    "calendar_blocked": "That calendar is not available to the assistant.",
+}
+
+
 class AssistantError(Exception):
     pass
 
@@ -3833,7 +3840,8 @@ class AssistantService:
             try:
                 return self.google_read(tenant_id, user_id, tool_id, payload)
             except GoogleError as exc:
-                raise AssistantError(f"Google {tool_id.replace('_', ' ')} failed: {exc.reason}") from None
+                raise AssistantError(_GOOGLE_MESSAGES.get(exc.reason) or
+                                     f"Google {tool_id.replace('_', ' ')} failed: {exc.reason}") from None
         if tool_id == "read_lineage":
             if self.lineage_read is None:
                 raise AssistantError("lineage reading is not enabled")
