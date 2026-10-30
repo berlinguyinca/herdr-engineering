@@ -223,6 +223,22 @@ def test_legacy_version_routes_cannot_bypass_report_scope_or_forge_worker_valida
     assert request(base, "/api/v1/artifacts/artifact_report/versions", body=body)[0] == 400
 
 
+@pytest.mark.parametrize("field, value", [("parent_version_ids", ["v1", "v0"]), ("created_via", "collaborator"),
+                                          ("collaborator_agent_id", "agent-x")])
+def test_version_route_refuses_collaboration_owned_fields(reports_server, field, value):
+    base, store, _ = reports_server
+    calls = []
+
+    async def commit_version(artifact_id, **kw):
+        calls.append(kw)
+        return {"version_id": "never", "artifact_id": artifact_id}
+    store.commit_version = commit_version
+    body = {"base_version_id": "v1", "source_manifest_blob": None, "output_manifest": [], field: value}
+    status, raw, _ = request(base, "/api/v1/artifacts/artifact_report/versions", body=body)
+    assert status == 400 and b"set only by collaboration" in raw and field.encode() in raw
+    assert calls == []
+
+
 def test_legacy_job_and_acl_routes_cannot_bypass_report_ownership(reports_server):
     base, store, _ = reports_server
     job = {"profile": "report", "artifact_id": "artifact_report", "base_version_id": "v1",
