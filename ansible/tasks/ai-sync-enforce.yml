@@ -1,0 +1,56 @@
+---
+# Package provisioning and the status reporter precede this include. Enforcement force-pulls the shared ai-sync standard over
+# local files, so it is OFF unless the inventory sets `ai_sync_enforce: true` for the host, and it is never enabled on the
+# publisher (`ai_sync_publisher: true`), which also gets the marker file the enforcer itself refuses on.
+- name: "Deploy ai-sync enforcement"
+  become: false
+  when: ansible_facts['system'] == 'Linux'
+  environment:
+    HOME: "{{ fleet_home }}"
+    XDG_RUNTIME_DIR: "/run/user/{{ ansible_user_uid }}"
+  vars:
+    enforce_wanted: "{{ (ai_sync_enforce | default(false) | bool) and not (ai_sync_publisher | default(false) | bool) }}"
+  block:
+    - name: "Detect whether ai-sync is installed for the fleet user"
+      ansible.builtin.shell: |
+        PATH="$HOME/.local/bin:$HOME/.npm-global/bin:$HOME/.volta/bin:$HOME/bin:$PATH"
+        command -v ai-sync >/dev/null 2>&1 && echo true || echo false
+      args:
+        executable: /bin/bash
+      register: ai_sync_present_for_enforce
+      changed_when: false
+      check_mode: false
+
+    - name: "Create the user unit and host config directories"
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0755"
+      loop:
+        - "{{ fleet_home }}/.config/systemd/user"
+        - "{{ fleet_home }}/.config/herdr-engineering"
+
+    - name: "Install the ai-sync enforcement service and timer"
+      ansible.builtin.copy:
+        content: "{{ lookup('file', herdr_engineering_repo_root ~ '/scripts/' ~ item) }}"
+        dest: "{{ fleet_home }}/.config/systemd/user/{{ item }}"
+        mode: "0644"
+      loop:
+        - herdr-eng-ai-sync-enforce.service
+        - herdr-eng-ai-sync-enforce.timer
+
+    - name: "Mark the publisher host (the enforcer refuses to run where this file exists)"
+      ansible.builtin.file:
+        path: "{{ fleet_home }}/.config/herdr-engineering/ai-sync-publisher"
+        state: "{{ 'touch' if (ai_sync_publisher | default(false) | bool) else 'absent' }}"
+        mode: "0644"
+        modification_time: preserve
+        access_time: preserve
+
+    - name: "Enable the enforcement timer only where it is wanted and ai-sync exists"
+      ansible.builtin.systemd_service:
+        name: herdr-eng-ai-sync-enforce.timer
+        scope: user
+        daemon_reload: true
+        enabled: "{{ enforce_wanted and ai_sync_present_for_enforce.stdout | trim == 'true' }}"
+        state: "{{ 'started' if (enforce_wanted and ai_sync_present_for_enforce.stdout | trim == 'true') else 'stopped' }}"

@@ -5,12 +5,15 @@ all:
         linux:
           hosts:
             fry: {}
-            beast: {}
+            beast:
+              ai_sync_publisher: true   # the one host that runs `ai-sync push`; enforcement never runs here
             # A host under maintenance is exempt from stale alarms; the fleet
             # update sends this flag (default false) on every run:
             # beast:
             #   maintenance: true
             bender: {}
+            # Opt a host into forced ai-sync convergence (publisher excluded), in its host_vars:
+            #   ai_sync_enforce: true
         macos:
           hosts:
             mac: {}

@@ -153,6 +153,8 @@
 
     - name: "Converge the read-only ai-sync status reporter"
       ansible.builtin.include_tasks: ../tasks/ai-sync-feed.yml
+    - name: "Converge ai-sync enforcement (opt-in per host, never on the publisher)"
+      ansible.builtin.include_tasks: ../tasks/ai-sync-enforce.yml
 
     # ----------------------------------------------------------------------
     # Build-storm prevention (all fleet hosts): install the pi build-gate

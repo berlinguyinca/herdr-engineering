@@ -68,3 +68,20 @@ fleet table; `join` GETs `/api/v1/ai-sync/config`, treats `404` as "this fabric 
 nothing), otherwise clones/points the local sync repo at `repo_url`@`branch`, enables `envs`, and honours
 `merge_enabled`. The client must re-validate every field (it is untrusted input) and never send credentials to the
 control plane. Hosts report back through the status feed above; `join` itself writes nothing to the control plane.
+
+## Enforcement: keep every host on the shared standard
+
+The status feed only observes. Enforcement acts: `python -m herdr_engineering.ai_sync_enforce --env claude` runs
+`ai-sync pull --force --env <env>` and then `ai-sync verify --env <env> --json`, and exits non-zero when either fails, so
+the unit shows as failed and the feed above reports the host as drifted or failing to load. ai-sync backs up whatever the
+forced pull overwrites. Only those two commands can be spawned; `push` and every other subcommand are impossible.
+
+- **Opt-in per host.** `herdr-eng-ai-sync-enforce.timer` (every 30 minutes, jittered) is enabled only when the inventory
+  sets `ai_sync_enforce: true` for the host and ai-sync is installed. Default is off.
+- **Never on the publisher.** Exactly one host publishes (`ai-sync push`). Set `ai_sync_publisher: true` for it: the
+  playbook then creates `~/.config/herdr-engineering/ai-sync-publisher`, never enables the timer, and the enforcer itself
+  refuses to run (exit 3) where the marker exists. A forced pull there would overwrite the files about to be pushed.
+- **Host-specific values do not survive.** A forced pull replaces local `CLAUDE.md` and `settings.json` edits, so anything a
+  host needs that the shared files lack must go into the shared repo first.
+- **Overlapping runs** are skipped under a lock, not stacked. `ai-sync` may also self-update on a pull (its normal daily check).
+- **Output.** One JSON line: `{"ok": bool, "envs": {"claude": {"pull_ok", "verify_ok", "errors", "warnings", "error_sample"}}}`.
