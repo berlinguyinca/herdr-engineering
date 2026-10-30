@@ -1727,6 +1727,7 @@ class ControlPlaneRepo:
         created_at=None,
         merged_at=None,
         closed_at=None,
+        ended_source=None,
     ):
         stamp = self._stamp()
         existing = self._pull_requests.get(pr_id)
@@ -1746,7 +1747,7 @@ class ControlPlaneRepo:
                 "closed_at": None,
                 "ended_source": None,
             }
-            self._stamp_pr_end(rec, status, merged_at, closed_at, stamp)
+            self._stamp_pr_end(rec, status, merged_at, closed_at, stamp, ended_source)
             self._pull_requests[pr_id] = rec
             self.record_event(
                 "pull_request",
@@ -1778,7 +1779,7 @@ class ControlPlaneRepo:
         existing.setdefault("merged_at", None)
         existing.setdefault("closed_at", None)
         existing.setdefault("ended_source", None)
-        self._stamp_pr_end(existing, status, merged_at, closed_at, stamp)
+        self._stamp_pr_end(existing, status, merged_at, closed_at, stamp, ended_source)
         for k, v in {
             "mission_id": mission_id,
             "repository": repository,
@@ -1818,11 +1819,12 @@ class ControlPlaneRepo:
         return _copy(existing)
 
     @staticmethod
-    def _stamp_pr_end(rec, status, merged_at, closed_at, stamp):
+    def _stamp_pr_end(rec, status, merged_at, closed_at, stamp, ended_source=None):
         """Keep when a pull request ended. A time the provider reported is kept as given (``ended_source`` "reported");
         otherwise the first moment this server saw the PR merged or closed is used and labelled "observed", which can be
         later than the real merge. A PR that is open again loses its end time; a time already stored is never overwritten
-        by a later observation."""
+        by a later observation. ``ended_source`` is passed only when rebuilding from the durable event log (an ingest request
+        never supplies it), so a restart keeps "observed" times observed."""
         if status == "open":
             rec["merged_at"] = rec["closed_at"] = rec["ended_source"] = None
             return
@@ -1832,10 +1834,11 @@ class ControlPlaneRepo:
             except ValueError:
                 return False
         merged_at, closed_at = (merged_at if valid(merged_at) else None), (closed_at if valid(closed_at) else None)
+        label = "observed" if ended_source == "observed" else "reported"
         if merged_at:
-            rec["merged_at"], rec["ended_source"] = merged_at, "reported"
+            rec["merged_at"], rec["ended_source"] = merged_at, label
         if closed_at:
-            rec["closed_at"], rec["ended_source"] = closed_at, "reported"
+            rec["closed_at"], rec["ended_source"] = closed_at, label
         if status in ("merged", "closed") and not (rec.get("merged_at") or rec.get("closed_at")):
             rec["merged_at" if status == "merged" else "closed_at"] = stamp
             rec["ended_source"] = "observed"
@@ -3813,6 +3816,7 @@ class ControlPlaneRepo:
                                 created_at=payload.get("created_at"),
                                 merged_at=payload.get("merged_at"),
                                 closed_at=payload.get("closed_at"),
+                                ended_source=payload.get("ended_source"),
                             )
                     except (ValueError, KeyError, TypeError):  # a bad row never blocks startup
                         continue
