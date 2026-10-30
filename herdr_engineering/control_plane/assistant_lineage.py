@@ -14,7 +14,7 @@ from datetime import UTC, datetime
 
 from .graph import MAX_DEPTH, MAX_NODES, GraphProjection, read_graph
 
-OPERATIONS = ("node", "neighborhood", "list")
+OPERATIONS = ("node", "neighborhood", "list", "task")
 SOURCE = "lineage graph projection"
 
 
@@ -47,8 +47,10 @@ class LineageReader:
         if principal is None:
             raise LookupError("not found")
         node_id = str(payload.get("node_id") or "")
-        if op in ("node", "neighborhood") and not node_id:
+        if op in ("node", "neighborhood", "task") and not node_id:
             raise ValueError("node_id is required")
+        if op == "task":
+            return self._task(principal, node_id)
         if op == "node":
             parts, query = ["nodes", node_id], {}
         elif op == "neighborhood":
@@ -63,6 +65,79 @@ class LineageReader:
             raise LookupError("not found") from None
         return {"source": SOURCE, "as_of": self.now(), "data": data,
                 "note": "Absent means not visible to you or not recorded; relationships are explicit graph edges only."}
+
+
+    def _task(self, principal: dict, node_id: str) -> dict:
+        """Fixed-field task projection. Same ``read_graph`` front door and principal as every other operation, so a
+        hidden node, an unknown id and a node that is not a task are one indistinguishable "not found"."""
+        if not node_id.startswith("task:"):
+            raise LookupError("not found")
+        try:
+            data = read_graph(self.graph, principal, ["nodes", node_id, "neighborhood"], {"depth": "2"}.get)
+        except KeyError:
+            raise LookupError("not found") from None
+        return {"source": SOURCE, "as_of": self.now(), "data": project_task(node_id, data),
+                "note": "Fixed fields only; absent means not visible to you or not recorded. Use the node operation "
+                        "to read the underlying node."}
+
+
+# --- fixed-field task projection ---------------------------------------------------------------------------------
+# Nothing here copies a label, summary, reason, title or arbitrary attr: every value is either an enum member, a
+# validated token/digest/id, a boolean or a count. A value that does not fit its pattern is dropped (None), never cut.
+_STATES = frozenset(
+    "open pending queued running working active in_progress started blocked review approved accepted done completed "
+    "success passed merged closed cancelled superseded failed error errored skipped draft".split())
+_DIGEST = re.compile(r"(sha256:)?[0-9a-f]{8,64}")
+_TOKEN = re.compile(r"[a-z0-9][a-z0-9._-]{0,47}")
+_REF = re.compile(r"[a-z]+:[A-Za-z0-9._/#-]{1,120}")
+_MAX_LINKED = 5
+
+
+def _state(value) -> str | None:
+    if not isinstance(value, str) or not value:
+        return None
+    return value if value in _STATES else "other"
+
+
+def _match(pattern: re.Pattern, value) -> str | None:
+    return value if isinstance(value, str) and pattern.fullmatch(value) else None
+
+
+def project_task(task_id: str, hood: dict) -> dict:
+    nodes = {n.get("id"): n for n in hood.get("nodes") or [] if isinstance(n, dict)}
+    task = nodes.get(task_id) or {}
+    attrs = task.get("attrs") if isinstance(task.get("attrs"), dict) else {}
+    edges = [e for e in hood.get("edges") or [] if isinstance(e, dict) and not e.get("removed")]
+    adj: dict[str, set[str]] = {}
+    for e in edges:
+        adj.setdefault(e.get("from_id"), set()).add(e.get("to_id"))
+        adj.setdefault(e.get("to_id"), set()).add(e.get("from_id"))
+
+    def linked(frm: str, kind: str) -> list[str]:
+        return sorted(i for i in adj.get(frm, ()) if isinstance(i, str) and i.startswith(kind + ":")
+                      and i in nodes and _match(_REF, i))
+
+    prs = linked(task_id, "pr")
+    cis = sorted({c for src in [task_id, *prs] for c in linked(src, "ci")})
+    hosts = linked(task_id, "host")
+    subjects = {task_id, *prs}
+    validated = [e for e in edges if e.get("edge_type") == "validated" and e.get("to_id") in subjects]
+    live = [e for e in validated if not e.get("stale")]
+    verification = "validated" if live else ("stale" if validated else "none")
+    host = _match(_TOKEN, attrs.get("host")) or (hosts[0].split(":", 1)[1].lower() if hosts else None)
+    return {
+        "task_id": task_id,
+        "state": _state(task.get("state")),
+        "plan_digest": _match(_DIGEST, attrs.get("plan_digest")),
+        "pull_requests": [{"id": i, "state": _state(nodes[i].get("state"))} for i in prs[:_MAX_LINKED]],
+        "ci": [{"id": i, "state": _state(nodes[i].get("state"))} for i in cis[:_MAX_LINKED]],
+        "links_omitted": max(0, len(prs) - _MAX_LINKED) + max(0, len(cis) - _MAX_LINKED),
+        "verification": {"state": verification, "current": len(live), "stale": len(validated) - len(live)},
+        "owner": _match(_TOKEN, attrs.get("owner")),
+        "host": _match(_TOKEN, host),
+        "partial": bool(hood.get("truncated")),
+        "open": {"operation": "node", "node_id": task_id},
+    }
 
 
 def principal_resolver(keys: dict[str, str]) -> Callable[[str], dict | None]:

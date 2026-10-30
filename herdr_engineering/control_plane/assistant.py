@@ -935,9 +935,11 @@ TOOL_CATALOG: dict[str, dict[str, Any]] = {
     "read_lineage": {
         "sensitive": False,
         "description": "Read the mission/agent lineage graph (sessions, handoffs, branches, reviews, PRs, CI, artifacts) "
-                       "as the calling user may see it. Read-only; returns freshness and source.",
+                       "as the calling user may see it. Read-only; returns freshness and source. operation=task (node_id=task:...) "
+                       "returns a fixed-field status card (state, plan digest, PR/CI/verification state, owner, host) with no "
+                       "free text.",
         "parameters": {"type": "object", "properties": {
-            "operation": {"type": "string", "enum": ["node", "neighborhood", "list"]},
+            "operation": {"type": "string", "enum": ["node", "neighborhood", "list", "task"]},
             "node_id": {"type": "string"}, "node_type": {"type": "string"},
             "depth": {"type": "integer"}, "limit": {"type": "integer"}},
             "required": ["operation"]}},
