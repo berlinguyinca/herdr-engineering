@@ -241,6 +241,7 @@ def test_share_method_map_allows_reads_and_only_the_body_less_session_post():
     token = "A" * 43
     for method in ("GET", "HEAD", "OPTIONS"):
         assert allowed(method, f"/s/{token}/f/index.html")
+        assert allowed(method, f"/s/{token}")             # no trailing slash: share-public redirects it
     assert allowed("POST", f"/s/{token}/session")
     for method, uri in (("POST", f"/s/{token}/f/x"), ("POST", f"/s/{token}/session/x"), ("POST", "/s/short/session"),
                         ("POST", f"/s/{token}/session\n"),
@@ -248,6 +249,17 @@ def test_share_method_map_allows_reads_and_only_the_body_less_session_post():
         assert not allowed(method, uri), (method, uri)
     b = re.search(r'map "\$http_transfer_encoding:\$http_content_length" \$share_has_body \{\n(.*?)\n  \}', conf, re.S)
     assert b and "default 1;" in b.group(1) and '":" 0;' in b.group(1) and '":0" 0;' in b.group(1)
+
+
+def test_share_rate_limit_tolerates_range_reads_and_campus_nat():
+    """A parquet viewer issues many small range requests, and a campus NAT puts many people behind one address."""
+    conf = fcc.render_edge_conf(EDGE.read_text(), share=True)
+    rate = re.search(r"limit_req_zone \$remote_addr zone=share_req:\d+m rate=(\d+)r/s;", conf)
+    burst = re.search(r"limit_req zone=share_req burst=(\d+) nodelay;", conf)
+    assert rate and int(rate.group(1)) >= 100
+    assert burst and int(burst.group(1)) >= 300
+    conn = re.search(r"limit_conn share_conn (\d+);", conf)
+    assert conn and int(conn.group(1)) == 16                 # per address; the upstream's max_conns caps the total
 
 
 def test_share_public_is_never_a_start_time_dependency_of_the_edge():
