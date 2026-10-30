@@ -121,3 +121,18 @@ test('the page stays short: one workspace open at a time, arrow keys walk the li
     assert.equal(await page.locator('.hd-chain .hd-hop:visible').count(), 9);
   });
 });
+
+test('a Pi handoff shows what happened to the model and lands in needs-attention when the successor was not pinned', async () => {
+  await withPage(async (page, base) => {
+    const pi = { ...sum('handoff:h7', { workspace: 'org/app', attention: true, attention_reason: 'successor not pinned to the same model' }), origin: 'lineage', cause: 'context_pressure', from_model: 'qwen', to_model: null, model_change: 'not_pinned', state: 'accepted' };
+    await boot(page, base, '/handoffs', (p, url) => p === '/api/v1/handoffs/overview' ? { ...OVERVIEW, attention: [pi] }
+      : decodeURIComponent(p) === '/api/v1/handoffs/handoff:h7' ? { ...pi, handoff_id: 'handoff:h7', goal: 'Context pressure: the session handed its work to a fresh session', provenance: { cause: 'context_pressure', checkpoint: 'abc123' }, checkpoint: 'abc123', completed: [], remaining: [], history: [], source: { harness: 'pi', session_id: 's1' }, target: { harness: 'pi', session_id: 's2' } }
+      : api([])(p, url));
+    await until(() => page.locator('[data-handoff-attention] [data-handoff="handoff:h7"]').count().then((n) => n === 1), 'attention row');
+    assert.match(await page.locator('[data-handoff="handoff:h7"]').first().innerText(), /context pressure · not pinned · was qwen · routed normally/);
+    await page.locator('[data-handoff="handoff:h7"]').first().click();
+    await until(() => page.locator('[data-handoff-model]').count().then((n) => n === 1), 'model block');
+    assert.match(await page.locator('[data-handoff-model]').innerText(), /not pinned.*cause context_pressure.*checkpoint abc123/is);
+    assert.equal(await page.locator('[data-handoff-detail] h3', { hasText: /accomplished/i }).count(), 0);
+  });
+});

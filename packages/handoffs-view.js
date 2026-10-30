@@ -41,12 +41,23 @@ export function workspaceCard(w, open) {
     <span class="hd-ws__chips">${chips}</span><small>${esc(ago(w.latest_at))}</small></button><div class="hd-ws__body" ${open ? '' : 'hidden'}></div></article>`;
 }
 
+const shortModel = (m) => String(m || '').split('/').pop();
+// What happened to the model across a Pi handoff (only lineage handoffs know): kept, switched, or the successor was not pinned.
+export function modelText(h) {
+  if (h.model_change === 'same') return `same model${h.to_model ? ` · ${shortModel(h.to_model)}` : ''}`;
+  if (h.model_change === 'switched') return `model changed · ${shortModel(h.from_model)} → ${shortModel(h.to_model)}`;
+  if (h.model_change === 'not_pinned') return `not pinned${h.from_model ? ` · was ${shortModel(h.from_model)}` : ''} · routed normally`;
+  return h.origin === 'lineage' ? 'model not reported' : '';
+}
+
+const CAUSE = { context_pressure: 'context pressure', quota_exhausted: 'quota exhausted', phase_transition: 'phase transition' };
+
 export function handoffCard(h) {
-  return `<button type="button" class="hd-row${h.attention ? ' hd-row--attention' : ''}" data-handoff="${esc(h.handoff_id)}" title="${esc(h.handoff_id)}">
+  return `<button type="button" class="hd-row${h.attention ? ' hd-row--attention' : ''}" data-handoff="${esc(h.handoff_id)}" title="${esc(h.attention_reason ? `${h.handoff_id} — ${h.attention_reason}` : h.handoff_id)}">
     <span class="hd-row__state hd-row__state--${esc(h.state)}">${esc(String(h.state).replace('_', ' '))}${h.stalled ? ' · stalled' : ''}</span>
     <strong class="hd-row__who">${esc(agentName(h.source))} → ${esc(agentName(h.target))}</strong>
-    <span class="hd-row__goal">${esc(clip(h.goal, 140))}</span>
-    <small class="hd-row__meta">${h.completed} done · ${h.remaining} left · ${esc(ago(h.updated_at))}</small></button>`;
+    <span class="hd-row__goal">${esc(h.origin === 'lineage' ? `${CAUSE[h.cause] || h.cause || 'handoff'} · ${modelText(h)}` : clip(h.goal, 140))}</span>
+    <small class="hd-row__meta">${h.origin === 'lineage' ? esc(h.attention_reason || '') : `${h.completed} done · ${h.remaining} left · ${esc(ago(h.updated_at))}`}</small></button>`;
 }
 
 const list = (items) => (items && items.length ? `<ul>${items.map((i) => `<li>${esc(typeof i === 'string' ? i : JSON.stringify(i))}</li>`).join('')}</ul>` : '<p class="hd-muted">Nothing recorded.</p>');
@@ -78,15 +89,17 @@ export function detailHtml(row, chain) {
   const hint = row.target?.model_hint;
   return `<section class="hd-detail" data-handoff-detail-body aria-label="Handoff ${esc(row.handoff_id)}">
     <header><h2>${esc(who(row.source))} → ${esc(who(row.target))}</h2>
-    <p><span class="hd-badge">${esc(String(row.state).replace('_', ' '))}</span> ${esc(SENTENCE[row.state] || '')} · updated ${esc(ago(row.updated_at))}${hint ? ` · model hint <code>${esc(hint)}</code>` : ''}</p>
+    <p><span class="hd-badge">${esc(String(row.state).replace('_', ' '))}</span> ${esc(SENTENCE[row.state] || '')}${ago(row.updated_at) ? ` · updated ${esc(ago(row.updated_at))}` : ''}${hint ? ` · model hint <code>${esc(hint)}</code>` : ''}</p>
     ${row.mission_id ? `<p class="hd-muted">Mission <a href="#/missions/${encodeURIComponent(row.mission_id)}">${esc(row.mission_id)}</a></p>` : ''}</header>
     <h3>Handoff text — what the next agent was told</h3><p class="hd-goal" data-handoff-goal>${esc(row.goal || '')}</p>
-    <div class="hd-cols"><div><h3>Accomplished</h3>${list(row.completed)}</div><div><h3>Missing / what happens next</h3>${list(row.remaining)}</div></div>
+    ${row.origin === 'lineage' ? `<h3>Model</h3><p data-handoff-model><strong>${esc(modelText(row))}</strong>${row.cause ? ` · cause <code>${esc(row.cause)}</code>` : ''}${row.checkpoint ? ` · checkpoint <code>${esc(String(row.checkpoint).slice(0, 12))}</code>` : ''}</p>
+      <p class="hd-muted">Pi records this handoff and its verified checkpoint, not a written summary: the work done so far is in the checkpoint, and the successor continues from it.</p>`
+      : `<div class="hd-cols"><div><h3>Accomplished</h3>${list(row.completed)}</div><div><h3>Missing / what happens next</h3>${list(row.remaining)}</div></div>`}
     ${hops ? `<h3>Where this sits in the work</h3><ol class="hd-chain" aria-label="Handoff chain, oldest first">${hops}</ol>` : ''}
     ${(row.decisions || []).length ? `<h3>Decisions</h3>${list(row.decisions)}` : ''}
     ${(row.risks || []).length ? `<h3>Risks</h3>${list(row.risks)}` : ''}
     ${(row.validation || []).length ? `<h3>Validation</h3>${list(row.validation)}` : ''}
-    <h3>History</h3><ol class="hd-history">${history}</ol>
+    ${history ? `<h3>History</h3><ol class="hd-history">${history}</ol>` : ''}
     <details class="hd-full" data-handoff-full><summary>Full handoff as text</summary><p><button type="button" data-handoff-copy>Copy to clipboard</button> <small class="hd-muted" data-handoff-copied hidden>Copied</small></p><pre class="hd-pre">${esc(handoffText(row))}</pre></details></section>`;
 }
 
