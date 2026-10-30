@@ -11,6 +11,7 @@ import pytest
 from cryptography.hazmat.primitives.asymmetric import rsa
 
 from herdr_engineering.control_plane import share_public
+from herdr_engineering.control_plane.artifact_shares import ShareStore
 from herdr_engineering.control_plane.collab_cognito import CognitoAuthenticator
 from herdr_engineering.control_plane.share_bundle import remove_state, write_state
 from herdr_engineering.control_plane.share_lab import authorise_lab
@@ -286,6 +287,7 @@ def test_session_flow_serves_files_under_the_session_base(lab, capfd):
     status, h, _ = lab.request("OPTIONS", got["base"] + "data/table.parquet",
                                {"Origin": "null", "Access-Control-Request-Method": "GET"})
     assert status == 204
+    assert all(ShareStore._parse_line(x) is not None for x in lab.event_lines())   # the worker ingests them
     events = [json.loads(x) for x in lab.event_lines()]
     opened = [e for e in events if e["kind"] == "opened"]
     assert opened and opened[0]["actor"] == "alice" and opened[0]["share_id"] == "shr-1"
@@ -321,6 +323,7 @@ def test_session_failures_are_the_uniform_404(lab, name, make):
     assert h["connection"] == "close"
     denied = [json.loads(x) for x in lab.event_lines() if json.loads(x)["kind"] == "denied"]
     assert denied and denied[-1]["share_id"] == "shr-1"
+    assert all(ShareStore._parse_line(x) is not None for x in lab.event_lines())
     text = lab.events.read_text()
     assert a not in text and i not in text
 
@@ -509,6 +512,13 @@ def test_session_attempts_are_rate_limited(lab, monkeypatch):
     assert open_session(lab)[0] == 404
     reasons = [json.loads(x)["detail"]["reason"] for x in lab.event_lines() if json.loads(x)["kind"] == "denied"]
     assert "rate_limited" in reasons
+
+
+def test_unknown_tokens_cannot_drain_the_global_session_budget(lab):
+    lab.server.session_global = share_public.RateLimiter(3, lambda: lab.clock[0])
+    for _ in range(20):
+        assert open_session(lab, token=OTHER_TOKEN)[0] == 404
+    assert open_session(lab)[0] == 200
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="node is not installed")

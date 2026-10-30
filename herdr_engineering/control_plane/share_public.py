@@ -67,7 +67,7 @@ MAX_CONNECTIONS = 128
 MAX_RAW_PATH = 8192
 STATE_CACHE_SIZE = 256
 SESSION_PER_SHARE_PER_MINUTE = 30   # session attempts per share per minute (blunts token guessing)
-SESSION_GLOBAL_PER_MINUTE = 600     # session attempts across all shares per minute
+SESSION_GLOBAL_PER_MINUTE = 600     # verified session attempts across all lab shares per minute (bounds JWT work)
 STATIC_MAX_BYTES = 1024 * 1024
 DEFAULT_STATIC_DIR = Path(__file__).resolve().parent / "share_static"
 VIEWER_FILE = "viewer.html"
@@ -775,8 +775,6 @@ class ShareHandler(BaseHTTPRequestHandler):
             return deny(self, None, "unknown_route")
         if (self.command == "POST") != is_session:
             return deny(self, None, "method")
-        if is_session and not self.server.session_global.allow("*"):
-            return deny(self, None, "rate_limited")
         prepared = _read_state(self.server.config.shares_root, parts[2])
         if prepared is None:
             return deny(self, None, "unknown_token")
@@ -865,6 +863,8 @@ class ShareHandler(BaseHTTPRequestHandler):
             return deny(self, state, "body")
         if not self.server.session_per_share.allow(share_id):
             return deny(self, state, "rate_limited")
+        if not self.server.session_global.allow("*"):     # charged only by resolved live lab shares: an unknown
+            return deny(self, state, "rate_limited")      # token cannot drain it and lock every share out
         authorization, id_token = self._single_header("Authorization"), self._single_header("X-Id-Token")
         if authorization is None or id_token is None:
             return deny(self, state, "bad_headers")
