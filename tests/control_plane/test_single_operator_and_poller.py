@@ -101,6 +101,16 @@ class Provider:
         return self._token
 
 
+class SwallowingApp(Provider):
+    """Like GitHubAppTokens: token_for hides the reason (returns None); token_or_raise keeps it."""
+
+    def token_for(self, owner, permissions=None, repositories=None):
+        return None
+
+    def token_or_raise(self, owner, permissions=None, repositories=None):
+        raise github_auth.GitHubAuthError("permission")
+
+
 class Opener:
     def __init__(self, pages=None, status=None):
         self.pages, self.status, self.requests = list(pages or []), status, []
@@ -184,3 +194,11 @@ def test_reconcile_records_the_pass_and_the_status_shows_why_it_could_not_run():
     st, body = r.get(["status"], {}, OPEN, "operator")
     assert st == 200 and body["poller"]["recorded"] == 1 and body["poller"]["client"] == "shared"
     assert body["poller"]["last_error"] == "permission"
+
+
+def test_a_denied_app_permission_is_reported_as_permission_not_not_configured():
+    lst = lister(Opener(), SwallowingApp())
+    with pytest.raises(PollError) as exc:
+        lst.open_prs("acme/widget")
+    assert str(exc.value) == "permission" or getattr(exc.value, "reason", None) == "permission"
+    assert lst.last_error == "permission"
