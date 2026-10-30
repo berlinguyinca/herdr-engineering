@@ -90,3 +90,4 @@ a.hd-btn { text-decoration: none; display: inline-flex; align-items: center; }
   .pa-apps { grid-template-columns: 1fr; }
   .pa-row a.hd-btn { width: 100%; justify-content: center; min-height: 40px; }
 }
+#pa-drafts .pa-msg, #pa-reminders .pa-msg { white-space: normal; }
