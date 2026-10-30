@@ -3711,7 +3711,8 @@ def _assistant_config(cp):
     if not isinstance(pa, dict):
         return None
     if cp.get("single_operator") is True:
-        pa = {**pa, "actions": {**(pa.get("actions") or {}), "allow_self_approval": True}}
+        actions = pa.get("actions")
+        pa = {**pa, "actions": {**(actions if isinstance(actions, dict) else {}), "allow_self_approval": True}}
     return {"personal_assistant": pa}
 
 
