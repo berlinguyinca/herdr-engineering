@@ -4088,7 +4088,7 @@ def _make_handler(server, public=False, operator=False):
                     "executed_at": action.executed_at.isoformat() if action.executed_at else None}
 
         _APPS_REASONS = frozenset({"bad_state", "expired", "denied", "no_client", "exchange_failed", "unexpected_scope",
-                                   "no_refresh_token", "not_set_up", "unknown_provider"})
+                                   "no_refresh_token", "not_set_up", "unknown_provider", "unavailable"})
 
         def _assistant_apps_callback(self):
             """Browser landing of the Google sign-in. Always a 302 back to the dashboard; the Location carries only a
@@ -4155,9 +4155,12 @@ def _make_handler(server, public=False, operator=False):
                 if apps is None:
                     return self._json({"ready": False, "redirect_uri": server.apps_redirect_uri,
                                        "providers": [], "blocked_calendars": []})
+                try:
+                    blocked = apps.blocked_calendars(tenant, user)
+                except AppsError:
+                    blocked = []      # the saved list could not be read: providers() reports "unavailable" and Save is refused
                 return self._json({"ready": True, "redirect_uri": server.apps_redirect_uri,
-                                   "providers": apps.providers(tenant, user),
-                                   "blocked_calendars": apps.blocked_calendars(tenant, user)})
+                                   "providers": apps.providers(tenant, user), "blocked_calendars": blocked})
             if tail == ["google", "calendars"] and command == "GET":
                 return self._google_calendars(tenant, user)
             if tail[:2] == ["google", "drafts"] and len(tail) <= 3 and command in ("GET", "DELETE") and (len(tail) == 2) == (command == "GET"):
@@ -4188,7 +4191,7 @@ def _make_handler(server, public=False, operator=False):
                 apps.set_blocked_calendars(tenant, user, ids)
                 return self._json({"ids": apps.blocked_calendars(tenant, user)})
             except AppsError as exc:
-                status = {"not_set_up": 409, "no_client": 409, "unknown_provider": 404}.get(exc.reason, 400)
+                status = {"not_set_up": 409, "no_client": 409, "unknown_provider": 404, "unavailable": 503}.get(exc.reason, 400)
                 return self._json({"error": exc.reason if exc.reason in self._APPS_REASONS | {"bad_client"} else "failed"}, status)
 
         def _google_calendars(self, tenant, user):

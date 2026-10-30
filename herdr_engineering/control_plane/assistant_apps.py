@@ -59,12 +59,13 @@ class AppsService:
             return False
 
     def providers(self, tenant: str, user: str) -> list[dict]:
+        down = self._store.unavailable()
         conn = self._store.get_connection(tenant, user, GOOGLE)
         configured = self.client_configured(GOOGLE)
         out = []
         for card_id, name in CARDS:
             out.append({"id": card_id, "name": name, "kind": "oauth", "provider": GOOGLE, "connected": conn is not None,
-                        "account": conn.account if conn else "", "status": conn.status if conn else "not_connected",
+                        "account": conn.account if conn else "", "status": conn.status if conn else ("unavailable" if down else "not_connected"),
                         "scopes": list(conn.scopes) if conn else [], "client_configured": configured})
         gh: dict = {}
         if self._github is not None:
@@ -100,6 +101,8 @@ class AppsService:
     def connect_start(self, tenant: str, user: str, provider: str) -> str:
         if provider != GOOGLE:
             raise AppsError("unknown_provider")
+        if self._store.unavailable():
+            raise AppsError("unavailable")
         client = self._store.get_client(GOOGLE)
         if client is None:
             raise AppsError("no_client")

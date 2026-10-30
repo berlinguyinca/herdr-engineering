@@ -12,6 +12,7 @@ import base64
 import json
 import logging
 import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -146,7 +147,7 @@ def _serialized(fn):
 
 
 class CredentialStore:
-    def __init__(self, box: SecretBox, persistence=None):
+    def __init__(self, box: SecretBox, persistence=None, *, retry_interval: float = 5.0):
         self._box, self._p, self._lock = box, persistence, threading.Lock()
         # Writers hold _plock across "change memory, then persist" so a tombstone retry and an upsert for the same key
         # cannot interleave. Lock order is always _plock then _lock; readers take only _lock, so there is no cycle.
@@ -155,22 +156,75 @@ class CredentialStore:
         self._conns: dict[tuple[str, str, str], dict] = {}  # (tenant, user, provider) -> row with sealed token
         self._tombstones: set[tuple[str, str, str]] = set()  # deletes the database has not confirmed yet
         self._blocked: dict[tuple[str, str, str], list[str]] = {}
-        if persistence is not None:
+        # Each section loads on its own; a section that failed stays "not loaded" and the whole load is retried lazily on use.
+        self._section_ok = {"clients": persistence is None, "connections": persistence is None, "blocked": persistence is None}
+        self._retry_after = 0.0
+        self._clock = time.monotonic
+        self.retry_interval = retry_interval
+        self._load()
+
+    @property
+    def loaded(self) -> bool:
+        return all(self._section_ok.values())
+
+    @property
+    def blocked_loaded(self) -> bool:
+        return self._section_ok["blocked"]
+
+    def _load(self) -> bool:
+        """Load what has not loaded yet (memory wins over rows). Rate limited once a try has failed. True when fully loaded."""
+        if self.loaded:
+            return True
+        with self._plock:
+            if self.loaded:
+                return True
+            now = self._clock()
+            if now < self._retry_after:
+                return False
+            self._retry_after = now + self.retry_interval
+            p = self._p
             try:
-                for provider, client_id, ct in persistence.load_clients():
-                    self._clients[provider] = (client_id, ct)
-                for row in persistence.load_connections():
-                    try:
-                        t, u, p, account, scopes, status, ct, created = row
-                        self._conns[(t, u, p)] = {
-                            "account": account, "scopes": tuple(json.loads(scopes)), "status": status, "token_ct": ct,
-                            "created_at": created.astimezone(UTC).isoformat() if hasattr(created, "astimezone") else str(created)}
-                    except Exception:  # noqa: BLE001 - one bad row must not hide the others
-                        log.warning("app credentials: a saved connection row was skipped")
-                for t, u, p, ids in persistence.load_blocked():
-                    self._blocked[(t, u, p)] = list(json.loads(ids))
-            except Exception:  # noqa: BLE001 - start empty; people reconnect
-                log.warning("app credentials: saved rows could not be loaded")
+                if not self._section_ok["clients"]:
+                    rows = p.load_clients()
+                    with self._lock:
+                        for provider, client_id, ct in rows:
+                            self._clients.setdefault(provider, (client_id, ct))
+                    self._section_ok["clients"] = True
+            except Exception:  # noqa: BLE001
+                log.warning("app credentials: saved clients could not be loaded")
+            try:
+                if not self._section_ok["connections"]:
+                    rows = p.load_connections()
+                    with self._lock:
+                        for row in rows:
+                            try:
+                                t, u, pr, account, scopes, status, ct, created = row
+                                if (t, u, pr) in self._tombstones:
+                                    continue
+                                self._conns.setdefault((t, u, pr), {
+                                    "account": account, "scopes": tuple(json.loads(scopes)), "status": status, "token_ct": ct,
+                                    "created_at": created.astimezone(UTC).isoformat() if hasattr(created, "astimezone") else str(created)})
+                            except Exception:  # noqa: BLE001 - one bad row must not hide the others
+                                log.warning("app credentials: a saved connection row was skipped")
+                    self._section_ok["connections"] = True
+            except Exception:  # noqa: BLE001
+                log.warning("app credentials: saved connections could not be loaded")
+            try:
+                if not self._section_ok["blocked"]:
+                    rows = p.load_blocked()
+                    parsed = {(t, u, pr): list(json.loads(ids)) for t, u, pr, ids in rows}
+                    with self._lock:
+                        for k, v in parsed.items():
+                            self._blocked.setdefault(k, v)
+                    self._section_ok["blocked"] = True
+            except Exception:  # noqa: BLE001
+                log.warning("app credentials: saved blocked calendars could not be loaded")
+            return self.loaded
+
+    def unavailable(self) -> bool:
+        """True while persistence is configured but its rows have not (all) loaded. Retries the load first."""
+        return self._p is not None and not self._load()
+
 
     def _persist(self, fn: Callable) -> None:
         # Best effort, serialized by _plock (held by every writer): memory already changed, so a failed write is only logged.
@@ -215,6 +269,8 @@ class CredentialStore:
     @_serialized
     def put_connection(self, tenant: str, user: str, provider: str, *, account: str, scopes: list[str],
                        refresh_token: str) -> None:
+        if self.unavailable():
+            raise AppsError("unavailable")
         ct = self._box.seal(refresh_token)
         key = (tenant, user, provider)
         with self._lock:
@@ -266,11 +322,15 @@ class CredentialStore:
 
     # --- blocked calendars (not secrets; kept apart from the connection so they survive reconnecting)
     def get_blocked(self, tenant: str, user: str, provider: str) -> list[str]:
+        if not self.blocked_loaded and not (self._load() and self.blocked_loaded):
+            raise AppsError("unavailable")     # fail closed: an unknown blocked list must never read as "nothing blocked"
         with self._lock:
             return list(self._blocked.get((tenant, user, provider), []))
 
     @_serialized
     def set_blocked(self, tenant: str, user: str, provider: str, ids: list[str]) -> None:
+        if not self.blocked_loaded and not (self._load() and self.blocked_loaded):
+            raise AppsError("unavailable")     # a Save must not overwrite a saved list that was never read
         clean = list(dict.fromkeys(str(i) for i in ids))
         with self._lock:
             self._blocked[(tenant, user, provider)] = clean

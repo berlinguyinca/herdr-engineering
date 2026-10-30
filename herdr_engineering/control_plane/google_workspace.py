@@ -23,6 +23,8 @@ from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+from .app_credentials import AppsError
+
 log = logging.getLogger(__name__)
 
 # Why there is no scope guard here (the old one refused any token wider than read-only): the stored connection's scopes
@@ -221,7 +223,10 @@ class GoogleWorkspace:
         from .calendar_policy import (
             CalendarPolicy,  # deferred: calendar_policy imports GoogleError from here
         )
-        blocked = self._blocked(tenant, user)
+        try:
+            blocked = self._blocked(tenant, user)
+        except AppsError:
+            raise GoogleError("unavailable") from None      # fail closed: no policy, so no Calendar request
         conn = self._store.get_connection(tenant, user, "google")
         account = conn.account if conn is not None else ""
 
@@ -319,10 +324,11 @@ class GoogleWorkspace:
 
     def list_calendars(self, tenant: str, user: str) -> list[dict]:
         """The person's calendars with blocked ones omitted."""
+        pol = self.policy_for(tenant, user)     # first: an unknown blocked list must mean no request at all
         data = self._get(tenant, user, f"{CALENDAR_API}/users/me/calendarList", {"fields": "items(id,summary,primary,accessRole)"})
         cals = [{"id": str(c.get("id", ""))[:256], "summary": str(c.get("summary", ""))[:200], "primary": c.get("primary") is True,
                  "access_role": str(c.get("accessRole", ""))} for c in data.get("items") or [] if isinstance(c, dict)]
-        return self.policy_for(tenant, user).filter(cals)
+        return pol.filter(cals)
 
     def list_calendars_for_owner_ui(self, tenant: str, user: str) -> list[dict]:
         """OWNER-UI ONLY: every calendar of the calling person, blocked ones included and flagged ``blocked``.
@@ -331,8 +337,8 @@ class GoogleWorkspace:
         picker (GET /api/v1/assistant-apps/google/calendars). It is NOT reachable from the assistant tools: ``run`` has no
         entry for it, and the model-facing ``list_calendars`` above still omits blocked calendars.
         """
-        data = self._get(tenant, user, f"{CALENDAR_API}/users/me/calendarList", {"fields": "items(id,summary,primary,accessRole)"})
         pol = self.policy_for(tenant, user)
+        data = self._get(tenant, user, f"{CALENDAR_API}/users/me/calendarList", {"fields": "items(id,summary,primary,accessRole)"})
         out = []
         for c in data.get("items") or []:
             if not isinstance(c, dict) or not isinstance(c.get("id"), str) or not c["id"]:
@@ -385,6 +391,7 @@ class GoogleWorkspace:
         lo, hi = self._instant(time_min), self._instant(time_max)
         if hi <= lo or hi - lo > timedelta(days=MAX_WINDOW_DAYS):
             raise GoogleError("bad_request")
+        self.policy_for(tenant, user)       # an unknown blocked list must mean no request at all (even the calendar list)
         ids: list[str] = []
         token = None
         for _ in range(MAX_CAL_PAGES):
