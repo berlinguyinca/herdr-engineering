@@ -3408,7 +3408,7 @@ def _cmd_cp_web(args) -> int:
     except ValueError as exc:
         raise SystemExit(f"fleet config {exc}") from None
     svr = ControlPlaneServer(repo, api_keys=api_keys, lineage_key_scopes=lineage_key_scopes,
-                             rakazo_bridge=cp.get("rakazo_bridge"), rakazo_bridge_dsn=dsn,
+                             rakazo_bridge=cp.get("rakazo_bridge"), rakazo_bridge_dsn=dsn, assistant_apps_dsn=dsn,
                              federation_source=federation_source,
                              system_graph=system_graph,
                              host=args.host, port=args.port, source=source,

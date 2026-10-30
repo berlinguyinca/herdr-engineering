@@ -301,7 +301,7 @@ class ControlPlaneServer:
                  request_workers=128, request_queue=256, single_operator=False,
                  assistant_service=None, assistant_config=None, fabric_resolver=None, fabric_services=None, fabric_names=None,
                  scheduler_admission=False, scheduler_limits=None, skill_registry=None,
-                 unified_workspace_config=None, rakazo_bridge=None, rakazo_bridge_dsn=None,
+                 unified_workspace_config=None, rakazo_bridge=None, rakazo_bridge_dsn=None, assistant_apps_dsn=None,
                  share_store=None, shares_root=None, share_settings=None):
         """
         Auth (Spec §104): either a single `api_key` (all-access) or a mapping
@@ -490,6 +490,7 @@ class ControlPlaneServer:
                                     persistence=PostgresTokenPersistence(rakazo_bridge_dsn) if rakazo_bridge_dsn else None,
                                     push_persistence=PostgresPushPersistence(rakazo_bridge_dsn) if rakazo_bridge_dsn else None)
                        if _bridge_cfg["enabled"] else None)
+        self._build_assistant_apps(assistant_apps_dsn)
         from .ingest import IngestService
         # operator YAML: {api key: {rooms: [...], missions: [...]}} -> principal ids (the key itself is never kept)
         scopes = {}
@@ -1401,6 +1402,33 @@ class ControlPlaneServer:
             raise InvalidError("native agent is not ready for prompt delivery")
         return adapter.send_input(target, message, machine=machine, session=server)
 
+    def _build_assistant_apps(self, dsn):
+        """personal_assistant.apps -> self.apps (an AppsService) or None. Never raises: without a usable key file the
+        feature is simply "not set up" (reads say ready:false, writes answer 409)."""
+        from .app_credentials import CredentialStore, PostgresCredentialPersistence, SecretBox
+        from .assistant_apps import CALLBACK_PATH, AppsService
+        cfg = (getattr(self.assistant, "config", None) or {}).get("apps") or {}
+        self.apps, self.apps_redirect_uri = None, ""
+        base = cfg.get("redirect_base")
+        if base:
+            self.apps_redirect_uri = base + CALLBACK_PATH
+        if not (cfg.get("present") and cfg.get("key_file") and base):
+            return
+        box = SecretBox(cfg["key_file"])
+        if not box.available:
+            log.warning("assistant apps: the key file is missing or unusable; app connections are not set up")
+            return
+
+        def github_status():
+            from .. import github_auth
+            kind = type(github_auth.credentials()).__name__
+            if kind == "NoCredentials":
+                return {"connected": False, "status": "not_connected"}
+            return {"connected": True, "status": "connected", "account": "GitHub App" if kind == "GitHubAppTokens" else "token"}
+
+        self.apps = AppsService(CredentialStore(box, PostgresCredentialPersistence(dsn) if dsn else None),
+                                redirect_base=base, github_status_fn=github_status)
+
     def _health(self):
         """Repo stats + deployment context (source backend, image version/commit)."""
         h = self.repo.health()
@@ -2118,6 +2146,9 @@ def _make_handler(server, public=False, operator=False):
                 # check needs status + commit), no counters, sources or capabilities.
                 h = server._health()
                 return self._json({k: h.get(k) for k in ("status", "version", "commit")})
+            if self._path_only() == "/api/v1/assistant-apps/google/callback":
+                # Google redirects the person's browser here with no API key: the one-time state is the credential.
+                return self._assistant_apps_callback()
             err = self._require("viewer")
             if err:
                 return err
@@ -2166,7 +2197,7 @@ def _make_handler(server, public=False, operator=False):
             # prefix test is bypassed by e.g. /api/v1/%72eview-gate/...
             segs = path.split("/")
             res = unquote(segs[3]) if len(segs) > 3 and segs[:3] == ["", "api", "v1"] else ""
-            if (res.startswith("reviews") or res in {"attention", "architecture", "scheduler"}
+            if (res.startswith("reviews") or res in {"attention", "architecture", "scheduler", "assistant-apps"}
                     or (res == "graph" and len(segs) > 4 and segs[4] == "work")
                     or (res in {"ci", "review-gate"} and len(segs) > 4) or _SUMMARY_FIX.match(path)
                     or _TERMINAL_ATTACH.match(path) or _STEER_ACK.match(path) or _is_rereview(path)):
@@ -2260,11 +2291,15 @@ def _make_handler(server, public=False, operator=False):
         def do_DELETE(self):
             return self._timed_request(self._mutate_verb)
 
+        def do_PUT(self):
+            # PUT exists only for assistant-apps (client credentials, blocked calendars); everything else keeps its 501.
+            return self._timed_request(self._mutate_verb)
+
         _ASSISTANT_MUTABLE_RESOURCES = {"assistants", "assistant-runs",
                                         "assistant-approvals", "assistant-memory",
                                         "assistant-routines", "assistant-connectors",
                                         "assistant-delegations", "assistant-proposals",
-                                        "assistant-notifications"}
+                                        "assistant-notifications", "assistant-apps"}
 
         def _mutate_verb(self):
             if operator:
@@ -2287,12 +2322,18 @@ def _make_handler(server, public=False, operator=False):
             segs = path.split("/")
             resource = unquote(segs[3]) if (len(segs) > 3 and segs[:3] == ["", "api", "v1"]
                                             and path.startswith("/api/v1/")) else ""
-            if resource not in self._ASSISTANT_MUTABLE_RESOURCES:
+            if resource not in self._ASSISTANT_MUTABLE_RESOURCES or (
+                    self.command == "PUT" and resource != "assistant-apps"):
                 # preserve the pre-existing 501 for PATCH/DELETE elsewhere
                 return self._send_json(501, {"error": "not implemented"})
             err = self._require("operator")
             if err:
                 return err
+            if resource == "assistant-apps":
+                origin = self.headers.get("Origin")
+                if origin and (urlsplit(origin).netloc != self.headers.get("Host")
+                               or urlsplit(origin).scheme not in {"http", "https"}):
+                    return self._deny(403, "cross-origin app connection mutation refused")
             return self._route_api()
 
         # ------------------------------------------------ fleet config (hosts)
@@ -3496,6 +3537,8 @@ def _make_handler(server, public=False, operator=False):
                                    "offset": offset, "checked_at": r._stamp()})
             if resource == "review-gate":
                 return self._review_gate_get(parts)
+            if resource == "assistant-apps":
+                return self._assistant_apps(parts, None)
             if resource in ("assistants", "assistant-runs", "assistant-approvals", "assistant-memory", "assistant-routines", "assistant-connectors", "assistant-delegations",
                             "assistant-proposals", "assistant-notifications", "assistant-audit"):
                 return self._assistant_get(parts, resource)
@@ -3953,6 +3996,8 @@ def _make_handler(server, public=False, operator=False):
                     if changed and r.get_session(sid) is not None:
                         server.agent_summaries.request(sid)
                 return self._json({"ok": True, "entity": entity})
+            if resource == "assistant-apps":
+                return self._assistant_apps(parts, body)
             if resource in ("assistants", "assistant-runs", "assistant-approvals", "assistant-memory", "assistant-routines", "assistant-connectors", "assistant-delegations",
                             "assistant-proposals", "assistant-notifications"):
                 # the body is already read above (line ~2170) into the local
@@ -3989,6 +4034,80 @@ def _make_handler(server, public=False, operator=False):
                                                     "pre-execution entry); nothing was run"}
             return {"status": action.status, "result": action.result or {},
                     "executed_at": action.executed_at.isoformat() if action.executed_at else None}
+
+        _APPS_REASONS = frozenset({"bad_state", "expired", "denied", "no_client", "exchange_failed", "unexpected_scope",
+                                   "no_refresh_token", "not_set_up", "unknown_provider"})
+
+        def _assistant_apps_callback(self):
+            """Browser landing of the Google sign-in. Always a 302 back to the dashboard; the Location carries only a
+            fixed reason string, never provider text, the code or the state."""
+            from .app_credentials import AppsError
+            params = {k: v[0] for k, v in parse_qs(urlsplit(self.path).query).items() if v}
+            result = "connected=google"
+            try:
+                if server.apps is None:
+                    raise AppsError("not_set_up")
+                server.apps.connect_callback("google", params)
+            except AppsError as exc:
+                result = "error=" + (exc.reason if exc.reason in self._APPS_REASONS else "failed")
+            except Exception:  # noqa: BLE001 - never a 500, never provider text in the redirect or the log
+                logging.getLogger(__name__).warning("assistant apps: sign-in callback failed")
+                result = "error=failed"
+            self.send_response(302)
+            self.send_header("Location", "/#/personal-assistant?" + result)
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Referrer-Policy", "no-referrer")
+            self.send_header("Content-Length", "0")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            return None
+
+        def _assistant_apps(self, parts, body):
+            """/api/v1/assistant-apps[...]: list, client credentials, connect, disconnect, blocked calendars. The
+            callback is routed separately (it has no API key)."""
+            from .app_credentials import AppsError
+            from .assistant import RateLimited
+            try:
+                tenant, user = self._assistant_scope()
+                server.assistant.check_rate_limit(key=f"{tenant}:{user}")
+            except RateLimited:
+                return self._json({"error": "rate_limited"}, 429)
+            apps, command = server.apps, self.command
+            tail = parts[4:]
+            if tail == [] and command == "GET":
+                if apps is None:
+                    return self._json({"ready": False, "redirect_uri": server.apps_redirect_uri,
+                                       "providers": [], "blocked_calendars": []})
+                return self._json({"ready": True, "redirect_uri": server.apps_redirect_uri,
+                                   "providers": apps.providers(tenant, user),
+                                   "blocked_calendars": apps.blocked_calendars(tenant, user)})
+            known = {("PUT", ("google", "client")), ("POST", ("google", "connect")), ("DELETE", ("google",)),
+                     ("GET", ("google", "blocked-calendars")), ("PUT", ("google", "blocked-calendars"))}
+            if (command, tuple(tail)) not in known:
+                return self._json({"error": "not found"}, 404)
+            if apps is None:
+                return self._json({"error": "not_set_up"}, 409)
+            body = body if isinstance(body, dict) else {}
+            try:
+                if tail == ["google", "client"]:
+                    apps.save_client("google", body.get("client_id"), body.get("client_secret"))
+                    return self._json({"ok": True})
+                if tail == ["google", "connect"]:
+                    return self._json({"url": apps.connect_start(tenant, user, "google")})
+                if tail == ["google"]:
+                    apps.disconnect(tenant, user, "google")
+                    return self._json({"ok": True})
+                if command == "GET":
+                    return self._json({"ids": apps.blocked_calendars(tenant, user)})
+                ids = body.get("ids")
+                if (not isinstance(ids, list) or len(ids) > 200
+                        or not all(isinstance(i, str) and 0 < len(i) <= 300 for i in ids)):
+                    return self._json({"error": "bad_ids"}, 400)
+                apps.set_blocked_calendars(tenant, user, ids)
+                return self._json({"ids": apps.blocked_calendars(tenant, user)})
+            except AppsError as exc:
+                status = {"not_set_up": 409, "no_client": 409, "unknown_provider": 404}.get(exc.reason, 400)
+                return self._json({"error": exc.reason if exc.reason in self._APPS_REASONS | {"bad_client"} else "failed"}, status)
 
         def _assistant_get(self, parts, resource):
             from .assistant import AssistantNotFound, AssistantUnavailable, RateLimited

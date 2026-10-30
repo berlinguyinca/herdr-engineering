@@ -231,7 +231,31 @@ def assistant_config(cfg: dict[str, Any]) -> dict[str, Any]:
         "ci_watch": ci_watch_config(section.get("ci_watch")),
         # Read-only Gmail + Calendar (google_workspace.py): off unless enabled; files and the user list are YAML.
         "google": google_config(section.get("google")),
+        # Per-person app connections (Gmail, Calendar) made from the dashboard: key file + public redirect base.
+        "apps": apps_config(section.get("apps")),
     }
+
+
+def apps_config(raw: Any) -> dict[str, Any]:
+    """``personal_assistant.apps``: ``{key_file, redirect_base}``. An absent block means "not set up", not an error;
+    an unknown key or a malformed value stops startup with a clear message."""
+    where = "control_plane.personal_assistant.apps"
+    if raw is None:
+        return {"present": False, "key_file": None, "redirect_base": None}
+    if not isinstance(raw, dict):
+        raise ValueError(f"{where} must be a mapping")
+    unknown = set(raw) - {"key_file", "redirect_base"}
+    if unknown:
+        raise ValueError(f"{where} has unknown keys: {sorted(unknown)}")
+    key_file = raw.get("key_file")
+    if key_file is not None and (not isinstance(key_file, str) or not key_file.strip()):
+        raise ValueError(f"{where}.key_file must be a path")
+    base = raw.get("redirect_base")
+    if base is not None:
+        if not isinstance(base, str) or not re.fullmatch(r"https?://[^\s/?#]+/?", base.strip()):
+            raise ValueError(f"{where}.redirect_base must be a base URL like https://host (no path)")
+        base = base.strip().rstrip("/")
+    return {"present": True, "key_file": key_file.strip() if key_file else None, "redirect_base": base}
 
 
 def ci_watch_config(raw: Any) -> dict[str, Any]:
